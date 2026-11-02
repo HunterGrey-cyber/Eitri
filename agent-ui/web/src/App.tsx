@@ -4558,6 +4558,8 @@ export default function App() {
               onCycleMode={() => post({ type: "cycle_mode" })}
               onReset={resetTab}
               onHint={requestHint}
+              // The dashboard's `p` item: the window opens its own chooser; the page names no path.
+              onChooseProject={() => postToRust({ type: "choose_project", request_id: nextRequestId() })}
               // The dashboard's `w` item: the same window-level
               // `tab_verb choose` `runPanelAction`'s `tab.choose` case posts for `prefix w`.
               onChooseSessions={() => postToRust({ type: "tab_verb", request_id: nextRequestId(), verb: "choose" })}

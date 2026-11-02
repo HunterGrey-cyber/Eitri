@@ -53,6 +53,20 @@ describe("dashItems", () => {
   });
 });
 
+describe("dashItems: the project row", () => {
+  it("the row shows with key p after sessions, only when the window can choose", () => {
+    expect(dashItems({ ...HELLO, canChooseProject: true })).toEqual(["new", "sessions", "project", "keys"]);
+    expect(dashItems({ ...HELLO, canChooseProject: false })).toEqual(["new", "sessions", "keys"]);
+    expect(DASH_ITEM_KEY.project).toBe("p");
+  });
+  it("the row is absent when the window cannot choose", () => {
+    const { container } = renderDash();
+    expect(container.textContent).not.toContain("Open another project");
+    const withRow = renderDash({ hello: { ...HELLO, canChooseProject: true } });
+    expect(withRow.container.textContent).toContain("Open another project");
+  });
+});
+
 describe("dashItems: restoring the last window's tabs", () => {
   const OFFER = { labels: ["api", "docs"], bypass: 0 };
   it("offers restore right after new, and only with something to bring back", () => {

@@ -510,6 +510,63 @@ describe("EmptyTab", () => {
       }
     });
 
+    it("the row shows with key p after sessions, and p runs it TYPING_GUARD_MS later", () => {
+      vi.useFakeTimers();
+      try {
+        const onChooseProject = vi.fn();
+        const rendered = renderEmpty({ hello: { ...HELLO, canChooseProject: true }, onChooseProject });
+        const { props } = rendered;
+        const root = toBrowse(rendered, props);
+        const keys = Array.from(root.querySelectorAll(".composer-key, .dash-key")).map((el) => el.textContent);
+        expect(keys).toEqual(["i", "r", "w", "p", "?"]);
+        expect(root.textContent).toContain("Open another project");
+        fireEvent.keyDown(root, { key: "p" });
+        expect(onChooseProject).not.toHaveBeenCalled();
+        act(() => vi.advanceTimersByTime(TYPING_GUARD_MS));
+        expect(onChooseProject).toHaveBeenCalledTimes(1);
+        // The callback carries nothing: the host picks the directory in its own chooser.
+        expect(onChooseProject).toHaveBeenCalledWith();
+      } finally {
+        vi.useRealTimers();
+      }
+    });
+
+    it("p is deferred in typed prose like w: \"pwd\" at 80 ms a key opens nothing, and the band names p", () => {
+      vi.useFakeTimers();
+      try {
+        const onChooseProject = vi.fn();
+        const onFlash = vi.fn();
+        const rendered = renderEmpty({ hello: { ...HELLO, canChooseProject: true }, onChooseProject, onFlash });
+        const { props } = rendered;
+        const root = toBrowse(rendered, props);
+        for (const key of ["p", "w", "d"]) {
+          fireEvent.keyDown(root, { key });
+          act(() => vi.advanceTimersByTime(80));
+        }
+        act(() => vi.advanceTimersByTime(TYPING_GUARD_MS * 4));
+        expect(onChooseProject).not.toHaveBeenCalled();
+        expect(onFlash).toHaveBeenCalledWith(tableKeyTypingFlash("p", "open another project"));
+      } finally {
+        vi.useRealTimers();
+      }
+    });
+
+    it("the row is absent when the window cannot choose, and p does nothing", () => {
+      vi.useFakeTimers();
+      try {
+        const onChooseProject = vi.fn();
+        const rendered = renderEmpty({ onChooseProject });
+        const { props } = rendered;
+        const root = toBrowse(rendered, props);
+        expect(root.textContent).not.toContain("Open another project");
+        fireEvent.keyDown(root, { key: "p" });
+        act(() => vi.advanceTimersByTime(TYPING_GUARD_MS * 4));
+        expect(onChooseProject).not.toHaveBeenCalled();
+      } finally {
+        vi.useRealTimers();
+      }
+    });
+
     /** An arrival lands this dashboard in BROWSE, and "run
      *  the tests" typed at once resumed the newest record into this tab on its own `r`. */
     it('"run" at 80 ms a key resumes nothing, and the band names r', () => {

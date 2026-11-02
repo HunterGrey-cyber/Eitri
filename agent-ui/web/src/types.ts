@@ -693,6 +693,7 @@ export type RestoreOffer = {
 };
 
 export type Hello = {
+  canChooseProject?: boolean;
   backend: BackendKind;
   projectDir: string;
   /** Only modes with genuinely distinct runtime behavior, and deliberately NOT narrowed by which

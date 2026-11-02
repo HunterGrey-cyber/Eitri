@@ -2726,7 +2726,7 @@ fn build_ui(
     };
     // The tray: a chip for every module off screen, one per module, in the order the
     // grid holds them. Its chips are top-bar items ahead of `↻`, for `h`/`l`, HINT and `Ctrl+k`; the
-    // workspace name, left of them on the bar, is the first item.
+    // project and workspace names, left of them on the bar, are the first items.
     let tray_modules: Vec<ModuleId> = grid.hosts().into_iter().map(|(id, _)| id).collect();
     let tray = tray::Tray::build(
         &eitri_core::wm::tray::chip_order(&tray_modules)
@@ -2744,7 +2744,8 @@ fn build_ui(
     if floating_strip.is_none() {
         top_bar.strip.append(prefix_strip.widget());
     }
-    let top_items: Vec<gtk4::Widget> = std::iter::once(top_bar.workspace.clone().upcast())
+    let top_items: Vec<gtk4::Widget> = std::iter::once(top_bar.project.clone().upcast())
+        .chain(std::iter::once(top_bar.workspace.clone().upcast()))
         .chain(tray.items())
         .chain(top_bar.items.iter().cloned())
         .collect();
@@ -3658,6 +3659,12 @@ fn build_ui(
     }
     {
         let driver = driver.clone();
+        panel_hooks.on_choose_project = Some(Box::new(move || {
+            driver.run(WinId::MAIN, Action::ProjectChoose, Origin::Chip)
+        }));
+    }
+    {
+        let driver = driver.clone();
         panel_hooks.on_edit_selection = Some(Box::new(move || {
             driver.post(HostEvent::Chat(ChatEvent::EditSelection { win: WinId::MAIN }));
         }));
@@ -4049,6 +4056,15 @@ fn build_ui(
             glib::Propagation::Stop
         });
         top_bar.widget.add_controller(controller);
+    }
+
+    {
+        let driver = Rc::downgrade(&driver);
+        top_bar.project.connect_clicked(move |_| {
+            if let Some(driver) = driver.upgrade() {
+                driver.run(WinId::MAIN, Action::ProjectChoose, Origin::Chip);
+            }
+        });
     }
 
     // The workspace name in the top bar, clicked or activated from the keyboard: the chooser, as

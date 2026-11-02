@@ -163,6 +163,9 @@ export type OutboundMessage =
    *  `command_result`, an error only if no hook is installed. `InboundMessage::PaneNav`,
    *  `core/src/agent_bridge.rs`. */
   | { type: "pane_nav"; request_id: string; direction: PaneDirection }
+  /** The empty tab's "Open another project" row (`p`) was used. It carries no path: the window opens its own
+   *  project chooser. Window-level; `InboundMessage::ChooseProject`, `core/src/agent_bridge.rs`. */
+  | { type: "choose_project"; request_id: string }
   /** The `?` overlay that `prefix ?` opened was closed. `opening` is the number its `open_keymap` carried, so a
    *  close that arrives after a newer `prefix ?` is told apart; `return_keys` is true only for the overlay's own
    *  keys (`?`, `Esc`, `q`) or a click outside it, never for a close another route forced. Window-level; the

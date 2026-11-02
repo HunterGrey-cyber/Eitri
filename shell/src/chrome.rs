@@ -21,6 +21,8 @@ pub(crate) struct TopBar {
     pub(crate) controls: gtk4::Widget,
     /// The `Eitri` label, drawn as a solid block while the `Ctrl+a` prefix waits (`prefix`).
     pub(crate) app_name: gtk4::Label,
+    /// The project name, opening the project chooser on click or keyboard activation.
+    pub(crate) project: gtk4::Button,
     /// Where the prefix strip goes, right of the app name (`prefix_strip`).
     pub(crate) strip: gtk4::Box,
     /// Where the tray goes, left of `↻` (`tray`). Its chips precede the other top-bar items;
@@ -104,10 +106,13 @@ pub(crate) fn show_mark(label: &gtk4::Label, text: Option<&str>) {
     label.set_visible(text.is_some());
 }
 
-/// Builds the top bar and returns the parts other modules use (`TopBar`).
-/// `Ctrl+k` reaches the bar from either pane because it is above both. `h` and `l` move
-/// between the tray chips and `↻`; `main.rs` joins the two lists. Window controls cannot take
-/// focus, so an accidental `Enter` after `Ctrl+k` cannot close the window.
+/// Builds the top bar. Returns the bar and the parts of it other modules act on (`TopBar`).
+///
+/// `Ctrl+k` reaches the top bar from either pane (2026-09-19): it is spatially above both, the
+/// same way `Ctrl+l` reaches the panel. The items are what `h`/`l` move between once there: `↻`
+/// here, with the project, workspace and tray's chips ahead of it (`main.rs` joins the lists).
+/// **The window controls are deliberately not items and cannot take focus at all** (see
+/// `build_window_controls`): a stray `Enter` after `Ctrl+k` must never be able to close the window.
 pub(crate) fn build_top_bar(window: &ApplicationWindow, project: &str) -> TopBar {
     let bar = gtk4::Box::new(gtk4::Orientation::Horizontal, 0);
     bar.add_css_class("topbar");
@@ -116,15 +121,22 @@ pub(crate) fn build_top_bar(window: &ApplicationWindow, project: &str) -> TopBar
     let app_name = gtk4::Label::new(Some("Eitri"));
     app_name.add_css_class("topbar-app-name");
 
-    let project_name = gtk4::Label::new(Some(project));
-    project_name.add_css_class("topbar-project-name");
-    project_name.set_hexpand(true);
+    let project_text: String = project.chars().map(|c| if c.is_control() { '?' } else { c }).collect();
+    let project_name = gtk4::Label::new(Some(&project_text));
     project_name.set_halign(gtk4::Align::Start);
     // Ellipsize the project name when the prefix strip needs room in a narrow window.
     // The strip's labels also ellipsize through `PrefixStrip::show`, so neither forces the bar
     // or window to fit the full text. Tray chips do not shrink, so many chips at a large zoom
     // can still increase the minimum width.
     project_name.set_ellipsize(gtk4::pango::EllipsizeMode::End);
+    let project = gtk4::Button::new();
+    project.set_child(Some(&project_name));
+    project.add_css_class("topbar-project-name");
+    project.add_css_class("topbar-item");
+    project.set_valign(gtk4::Align::Center);
+    project.set_focus_on_click(false);
+    let spacer = gtk4::Box::new(gtk4::Orientation::Horizontal, 0);
+    spacer.set_hexpand(true);
 
     // Reload the agent panel through the same `app.reload-agent-panel` action as `prefix r`.
     // The button lives in the window chrome so it remains available when the panel's page hangs.
@@ -186,7 +198,8 @@ pub(crate) fn build_top_bar(window: &ApplicationWindow, project: &str) -> TopBar
 
     bar.append(&app_name);
     bar.append(&strip);
-    bar.append(&project_name);
+    bar.append(&project);
+    bar.append(&spacer);
     bar.append(&workspace);
     bar.append(&rename);
     bar.append(&selection);
@@ -203,6 +216,7 @@ pub(crate) fn build_top_bar(window: &ApplicationWindow, project: &str) -> TopBar
         items: vec![reload_agent.upcast()],
         controls,
         app_name,
+        project,
         strip,
         tray,
         mark,
@@ -262,6 +276,41 @@ pub(crate) fn build_window_controls(window: &ApplicationWindow) -> gtk4::Widget 
 
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn the_project_name_is_a_button_and_an_item_ahead_of_the_workspace() {
+        use eitri_core::source_scan as scan;
+        let compact = |text: &str| text.split_whitespace().collect::<String>();
+        let chrome = scan::code_only(&scan::read_required("shell/src/chrome.rs").text);
+        let chrome = scan::without(&chrome, &scan::modules(&chrome, "tests"));
+        assert!(compact(&chrome).contains("pub(crate)project:gtk4::Button,"));
+        let bodies = scan::functions(&chrome, "build_top_bar");
+        assert_eq!(bodies.len(), 1, "the top bar is built in one place");
+        let bar = compact(bodies[0]);
+        assert!(bar.contains("letproject=gtk4::Button::new();"));
+        assert!(bar.contains("project.set_child(Some(&project_name));"));
+        assert!(bar.contains("bar.append(&project);bar.append(&spacer);bar.append(&workspace);"));
+        let (_, main) = scan::function_in(&scan::rust_sources(&["shell/src"]), "build_ui");
+        let main = compact(&main);
+        assert!(main.contains(
+            "lettop_items:Vec<gtk4::Widget>=std::iter::once(top_bar.project.clone().upcast()).chain(std::iter::once(top_bar.workspace.clone().upcast()))"
+        ));
+        assert!(main.contains("top_bar.project.connect_clicked("));
+        assert!(main.contains("driver.run(WinId::MAIN,Action::ProjectChoose,Origin::Chip);"));
+    }
+
+    #[test]
+    fn an_expanding_spacer_follows_it() {
+        use eitri_core::source_scan as scan;
+        let sources = [scan::read_required("shell/src/chrome.rs")];
+        let (_, bar) = scan::function_in(&sources, "build_top_bar");
+        let bar = bar.split_whitespace().collect::<String>();
+        assert!(bar.contains("letspacer=gtk4::Box::new(gtk4::Orientation::Horizontal,0);"));
+        assert!(bar.contains("spacer.set_hexpand(true);"));
+        assert!(bar.contains("bar.append(&project);bar.append(&spacer);"));
+        assert!(!bar.contains("project.set_hexpand(true)"));
+        assert!(!bar.contains("project_name.set_hexpand(true)"));
+    }
 
     /// The title is the label's twin: whichever function sets the workspace label sets the title in
     /// the same call, from the same text.

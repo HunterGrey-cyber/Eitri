@@ -97,7 +97,7 @@ use agent::setting_sources::ProjectTrust;
 use eitri_core::agent_backend::{AgentBackend, BackendError, BackendGreeting, BackendKind};
 use eitri_core::agent_bridge::{
     parse_inbound_message, serialize_command_result_for_js, serialize_confirm_restore_for_js, serialize_error_for_js,
-    serialize_hello_with_restore_for_js, serialize_nav_key_for_js, ChooserRecord, ChooserTab, DetailRow,
+    serialize_hello_with_project_for_js, serialize_nav_key_for_js, ChooserRecord, ChooserTab, DetailRow,
     InboundMessage, NavKeyDirection, PaneNavDirection, PanelKeys, SessionModeChoice, TabVerbWire,
 };
 use eitri_core::keymap::TabAction;
@@ -351,6 +351,9 @@ struct AgentPanelState {
     /// The editor's "edit the selection" key was pressed: the window puts the keys in the chat, then calls
     /// [`AgentPanelHandle::edit_selection`] for the view that took them.
     edit_selection_hook: Option<Rc<dyn Fn()>>,
+    /// The empty tab's "Open another project" row was used: the window opens its project chooser. Its presence is
+    /// what `hello` reports as `canChooseProject`.
+    choose_project_hook: Option<Rc<dyn Fn()>>,
     /// Teardowns and connects of tabs that left while the window stays open, so the window-close
     /// backstop covers them too. See [`Retiring`].
     retiring: Retiring,
@@ -637,6 +640,7 @@ impl AgentPanelState {
             editor_done_hook: None,
             edit_ask: edit_selection::EditAsk::default(),
             edit_selection_hook: None,
+            choose_project_hook: None,
             retiring: Retiring::default(),
             resume_after: std::collections::HashMap::new(),
             history_writer,

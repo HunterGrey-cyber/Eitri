@@ -539,6 +539,10 @@ pub enum InboundMessage {
         request_id: String,
         direction: PaneNavDirection,
     },
+    /// Requests the window's project chooser without passing project data to the page.
+    ChooseProject {
+        request_id: String,
+    },
     /// The `?` overlay that `prefix ?` opened was closed. `opening` is the number `open_keymap` carried, so a close
     /// that arrives after a newer `prefix ?` can be told apart; `return_keys` is true only for the overlay's own
     /// keys or a click outside it. Both are required: a message without either is malformed, never "close, no
@@ -706,6 +710,7 @@ impl InboundMessage {
             | InboundMessage::PanelKeys { .. }
             | InboundMessage::NavFallthrough { .. }
             | InboundMessage::PaneNav { .. }
+            | InboundMessage::ChooseProject { .. }
             | InboundMessage::KeymapClosed { .. }
             | InboundMessage::ViewExported { .. }
             | InboundMessage::ReviewRecover { .. }
@@ -967,6 +972,7 @@ impl InboundMessage {
             | InboundMessage::PanelKeys { request_id, .. }
             | InboundMessage::NavFallthrough { request_id, .. }
             | InboundMessage::PaneNav { request_id, .. }
+            | InboundMessage::ChooseProject { request_id }
             | InboundMessage::KeymapClosed { request_id, .. }
             | InboundMessage::ViewExported { request_id, .. }
             | InboundMessage::TrustAnswer { request_id, .. }
@@ -1143,8 +1149,18 @@ pub fn serialize_hello_with_restore_for_js(
     greeting: &crate::agent_backend::BackendGreeting,
     restore: Option<&crate::tab_restore::RestoreOffer>,
 ) -> String {
+    serialize_hello_with_project_for_js(greeting, restore, false)
+}
+
+/// The dashboard offers the project chooser only when its window installed a handler.
+pub fn serialize_hello_with_project_for_js(
+    greeting: &crate::agent_backend::BackendGreeting,
+    restore: Option<&crate::tab_restore::RestoreOffer>,
+    can_choose_project: bool,
+) -> String {
     json!({
         "kind": "hello",
+        "canChooseProject": can_choose_project,
         "backend": greeting.kind.as_str(),
         "projectDir": greeting.project_dir.to_string_lossy(),
         "permissionModes": greeting.permission_modes,
@@ -3012,6 +3028,28 @@ pub fn serialize_confirm_restore_for_js(prompt: &crate::tab_set::RestorePrompt) 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn choose_project_carries_nothing_but_its_request_id() {
+        let message = parse_inbound_message(r#"{"type":"choose_project","request_id":"p1"}"#).unwrap();
+        let InboundMessage::ChooseProject { request_id } = &message else {
+            panic!("the message requests the window's chooser");
+        };
+        assert_eq!(request_id, "p1");
+        assert_eq!(message.request_id(), "p1");
+        assert!(matches!(message.tab_ref(), TabRef::WindowLevel));
+        assert!(parse_inbound_message(r#"{"type":"choose_project"}"#).is_none());
+    }
+
+    #[test]
+    fn hello_says_can_choose_project_when_a_hook_is_installed() {
+        let greeting = greeting_with(Vec::new());
+        for installed in [false, true] {
+            let value: Value =
+                serde_json::from_str(&serialize_hello_with_project_for_js(&greeting, None, installed)).unwrap();
+            assert_eq!(value["canChooseProject"], installed);
+        }
+    }
 
     #[test]
     fn primary_copy_reads_only_its_own_kind_and_caps_the_text() {

@@ -328,6 +328,7 @@ fn no_panel_hook_decides_in_build_ui() {
         "on_review_open",
         "on_editor_done",
         "on_edit_selection",
+        "on_choose_project",
         "on_editor_request",
         "on_tab_verb",
     ] {
@@ -345,6 +346,11 @@ fn no_panel_hook_decides_in_build_ui() {
             assert!(
                 body.ends_with("drive_editor(Some(request))}))"),
                 "a local request returns the editor drive's outcome: {body}"
+            );
+        } else if hook == "on_choose_project" {
+            assert!(
+                body.contains("driver.run(WinId::MAIN,Action::ProjectChoose,Origin::Chip)"),
+                "the project row runs the window's chooser action"
             );
         } else {
             assert!(body.contains("HostEvent::Chat(ChatEvent::"), "{hook} posts its event");

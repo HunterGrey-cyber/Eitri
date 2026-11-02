@@ -96,6 +96,8 @@ pub(super) enum Effect {
     EditorDone(ViewId),
     /// The editor's "edit the selection" key was pressed: the window puts the keys in the chat.
     EditSelection,
+    /// The empty tab requests the window's project chooser.
+    ChooseProject,
     /// The editor opened a file for the review: the window brings the editor to the user.
     EditorOpened,
     /// One of the panel's HINT messages, for the window's HINT session.
@@ -296,6 +298,12 @@ impl Outbox {
                     let hook = state.borrow().editor_done_hook.clone();
                     if let Some(hook) = hook {
                         hook(view);
+                    }
+                }
+                Effect::ChooseProject => {
+                    let hook = state.borrow().choose_project_hook.clone();
+                    if let Some(hook) = hook {
+                        hook();
                     }
                 }
                 Effect::EditSelection => {

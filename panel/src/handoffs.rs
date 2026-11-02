@@ -222,6 +222,7 @@ pub(super) fn panel_tab_handoff(state: &AgentPanelState, tab: TabId) -> Result<P
         editor_done_hook: _,
         edit_ask: _,
         edit_selection_hook: _,
+        choose_project_hook: _,
         retiring: _,
         history_writer: _,
         rules_dir: _,
@@ -756,7 +757,17 @@ mod tests {
         let command = a_command();
         // The tab set's `open_sessions` includes a handed-off session.
         let open = vec![(AgentId::Claude, command.provider_session_id().to_string())];
-        let payloads = ready_payloads(greeting, &open, vec![], "{}".to_string(), vec![], None, None, None);
+        let payloads = ready_payloads(
+            greeting,
+            &open,
+            vec![],
+            "{}".to_string(),
+            vec![],
+            None,
+            None,
+            None,
+            false,
+        );
         let hello: serde_json::Value = serde_json::from_str(&payloads[0]).unwrap();
         let offered: Vec<&str> = hello["resumableSessions"]
             .as_array()

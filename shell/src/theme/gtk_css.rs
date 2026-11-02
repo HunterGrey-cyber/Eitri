@@ -69,8 +69,16 @@ window {{
 }}
 
 .topbar-project-name {{
+    background-color: transparent;
+    background-image: none;
+    border: none;
+    box-shadow: none;
     color: {bar_muted};
     font-size: 12px;
+    min-width: 0;
+    min-height: 0;
+    padding: 0;
+    border-radius: 3px;
 }}
 
 /* `marked: <title>` while a module is marked for `swap.marked`: text only, quiet like the project

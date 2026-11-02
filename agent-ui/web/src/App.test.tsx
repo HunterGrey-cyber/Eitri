@@ -15428,6 +15428,38 @@ describe("a route that hands the keys elsewhere ends every pending y/n prompt an
 /** Restoring the last window's tabs: `s` on the launch dashboard asks for them, and a saved tab that was in
  *  bypass is asked about first -- `y` gives it back in bypass, `n` in auto, anything else cancels. Rust owns
  *  every other rule (which tabs, which leases); what is checked here is what the page says and sends. */
+describe("the empty tab's project row", () => {
+  afterEach(() => vi.unstubAllGlobals());
+
+  function emptyTabWith(hello: Hello) {
+    const widen = stubBandWidth();
+    const { container } = render(<App />);
+    dispatch({ kind: "hello", ...hello });
+    dispatchEmptyTab();
+    dispatch({ kind: "arrive" });
+    act(() => widen(container));
+    return { container, root: container.querySelector(".empty-tab")! };
+  }
+
+  it("the message holds no path: a click posts choose_project with a request id and nothing else", () => {
+    const { container } = emptyTabWith({ ...HELLO, backend: "sidecar", canChooseProject: true });
+    const row = Array.from(container.querySelectorAll<HTMLElement>(".dash-item")).find((el) =>
+      el.textContent?.includes("Open another project"),
+    )!;
+    fireEvent.click(row);
+    const sent = lastOfType("choose_project")!;
+    expect(Object.keys(sent).sort()).toEqual(["request_id", "type"]);
+    expect(typeof sent.request_id).toBe("string");
+    expect(JSON.stringify(sent)).not.toContain(HELLO.projectDir);
+  });
+
+  it("the row is absent when the window cannot choose", () => {
+    const { container } = emptyTabWith({ ...HELLO, backend: "sidecar" });
+    expect(container.textContent).not.toContain("Open another project");
+    expect(lastOfType("choose_project")).toBeUndefined();
+  });
+});
+
 describe("restoring the last session's tabs", () => {
   afterEach(() => vi.unstubAllGlobals());
   const OFFER = { labels: ["api", "docs"], bypass: 1 };

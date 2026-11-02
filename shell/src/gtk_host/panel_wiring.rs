@@ -29,7 +29,7 @@ use crate::agent_panel::{AgentPanelHandle, ChatMoveEvent, HintInbound, ViewId};
 /// Every hook registration on the panel handle, in the order `wire_panel` makes them. Read by the
 /// tests that hold each window to what it leaves out.
 #[cfg_attr(not(test), allow(dead_code))]
-pub(crate) const HOOKS: [&str; 17] = [
+pub(crate) const HOOKS: [&str; 18] = [
     "on_hint",
     "on_attention",
     "on_toast",
@@ -41,6 +41,7 @@ pub(crate) const HOOKS: [&str; 17] = [
     "on_review_open",
     "on_editor_done",
     "on_edit_selection",
+    "on_choose_project",
     "on_view_empty",
     "on_nav_fallthrough",
     "on_keymap_closed",
@@ -53,9 +54,10 @@ pub(crate) const HOOKS: [&str; 17] = [
 /// no extra views and no `prefix ?` sheet of the window's own to give keys back from, so the attention,
 /// show-view, view-empty and keymap-closed hooks have nothing to act on; with one chat view that
 /// nothing can float over, there is no covered chat for an answer gate to refuse; and it is never one of a
-/// linked pair, so no chat moves out of it.
+/// linked pair, so no chat moves out of it. It cannot choose another project either.
 #[cfg_attr(not(test), allow(dead_code))]
 pub(crate) const COMPANION_OMITS: &[&str] = &[
+    "on_choose_project",
     "on_attention",
     "on_show_view",
     "on_view_empty",
@@ -92,6 +94,7 @@ pub(crate) struct PanelHooks {
     pub(crate) set_review_owner: Option<ReviewOwner>,
     pub(crate) on_review_open: Option<Box<dyn Fn()>>,
     pub(crate) on_editor_done: Option<Box<dyn Fn(ViewId)>>,
+    pub(crate) on_choose_project: Option<Box<dyn Fn()>>,
     pub(crate) on_edit_selection: Option<Box<dyn Fn()>>,
     pub(crate) on_view_empty: Option<Box<dyn Fn(ViewId)>>,
     pub(crate) on_nav_fallthrough: Option<Box<dyn Fn(ViewId, Direction)>>,
@@ -117,6 +120,7 @@ impl PanelHooks {
             self.on_review_open.is_some(),
             self.on_editor_done.is_some(),
             self.on_edit_selection.is_some(),
+            self.on_choose_project.is_some(),
             self.on_view_empty.is_some(),
             self.on_nav_fallthrough.is_some(),
             self.on_keymap_closed.is_some(),
@@ -148,6 +152,7 @@ pub(crate) fn wire_panel(panel: &AgentPanelHandle, hooks: PanelHooks) {
         on_review_open,
         on_editor_done,
         on_edit_selection,
+        on_choose_project,
         on_view_empty,
         on_nav_fallthrough,
         on_keymap_closed,
@@ -184,6 +189,9 @@ pub(crate) fn wire_panel(panel: &AgentPanelHandle, hooks: PanelHooks) {
     }
     if let Some(hook) = on_editor_done {
         panel.on_editor_done(hook);
+    }
+    if let Some(hook) = on_choose_project {
+        panel.on_choose_project(hook);
     }
     if let Some(hook) = on_edit_selection {
         panel.on_edit_selection(hook);
@@ -231,6 +239,16 @@ mod tests {
     fn sorted(mut names: Vec<&'static str>) -> Vec<&'static str> {
         names.sort_unstable();
         names
+    }
+
+    #[test]
+    fn the_companion_omits_the_hook() {
+        assert!(HOOKS.contains(&"on_choose_project"));
+        assert!(COMPANION_OMITS.contains(&"on_choose_project"));
+        let window = shell_code(&scan::read_required("shell/src/companion/window.rs").text);
+        let hooks = scan::functions(&window, "companion_hooks");
+        assert_eq!(hooks.len(), 1);
+        assert!(!hooks[0].contains("on_choose_project"));
     }
 
     #[test]

@@ -334,7 +334,10 @@ pub(super) fn send_hello_if_open_sessions_changed(state: &mut AgentPanelState, o
         record.last_open_ids = open;
         record.last_restore_offered = offered;
         record.last_hello_agent = agent;
-        out.send(view, serialize_hello_with_restore_for_js(&greeting, offer.as_ref()));
+        out.send(
+            view,
+            serialize_hello_with_project_for_js(&greeting, offer.as_ref(), state.choose_project_hook.is_some()),
+        );
     }
 }
 
@@ -508,13 +511,18 @@ pub(super) fn ready_payloads(
     theme: Option<&str>,
     keymap: Option<&str>,
     restore: Option<&RestoreOffer>,
+    can_choose_project: bool,
 ) -> Vec<String> {
     // No session open in any tab, or handed off from one, is offered for resume -- the
     // lease refuses a second driver, and a handed-off one has a CLI writing it.
     greeting
         .resumable
         .retain(|r| !eitri_core::tab_restore::is_open(open, r));
-    let mut payloads = vec![serialize_hello_with_restore_for_js(&greeting, restore)];
+    let mut payloads = vec![serialize_hello_with_project_for_js(
+        &greeting,
+        restore,
+        can_choose_project,
+    )];
     payloads.extend(theme.map(str::to_string));
     payloads.extend(keymap.map(str::to_string));
     // Window-level state (the history, then the editor context), before the tabs that use it.
@@ -547,6 +555,22 @@ pub(super) fn changed_envelope(last: &mut Option<String>, now: String, document_
 mod tests {
     use super::*;
     use crate::agent_panel::tests::*;
+
+    #[test]
+    fn hello_says_can_choose_project_when_a_hook_is_installed() {
+        for installed in [false, true] {
+            let (handle, page) = handle_with_strict_page();
+            page.inner.visible.set(true);
+            if installed {
+                handle.on_choose_project(|| {});
+            }
+            handle.page_message(ViewId::BASE, r#"{"type":"ready","request_id":"r1"}"#);
+            let sent = page.inner.sent.borrow();
+            let hello = sent.iter().find(|payload| kind_of(payload) == "hello").unwrap();
+            let hello: serde_json::Value = serde_json::from_str(hello).unwrap();
+            assert_eq!(hello["canChooseProject"], installed);
+        }
+    }
 
     #[test]
     fn ready_gets_its_envelopes_in_their_fixed_order() {
@@ -687,6 +711,7 @@ mod tests {
             Some(&theme),
             Some(&keymap),
             None,
+            false,
         );
         assert_eq!(
             kinds(&payloads),
@@ -730,6 +755,7 @@ mod tests {
             Some(&theme),
             Some(&keymap),
             None,
+            false,
         );
         assert_eq!(kinds(&payloads), vec!["hello", "theme", "keymap", "tabs", "snapshot"]);
     }
@@ -759,6 +785,7 @@ mod tests {
             None,
             None,
             None,
+            false,
         );
         let hello: serde_json::Value = serde_json::from_str(&payloads[0]).unwrap();
         let offered: Vec<&str> = hello["resumableSessions"]
@@ -793,6 +820,7 @@ mod tests {
             None,
             None,
             None,
+            false,
         );
         let hello: serde_json::Value = serde_json::from_str(&payloads[0]).unwrap();
         assert!(
@@ -821,7 +849,8 @@ mod tests {
                 vec![],
                 None,
                 None,
-                None
+                None,
+                false,
             )),
             vec!["hello", "tabs"]
         );
@@ -839,7 +868,8 @@ mod tests {
             vec![],
             None,
             None,
-            None
+            None,
+            false,
         ))
         .contains(&"chooser".to_string()));
     }
@@ -857,7 +887,8 @@ mod tests {
                 vec![],
                 Some(&theme),
                 None,
-                None
+                None,
+                false,
             )),
             vec!["hello", "theme", "tabs"]
         );
@@ -870,6 +901,7 @@ mod tests {
             Some(&theme),
             None,
             None,
+            false,
         );
         assert_eq!(kinds(&payloads), vec!["hello", "theme", "tabs", "snapshot"]);
     }
@@ -896,7 +928,8 @@ mod tests {
                 vec![],
                 Some(&theme),
                 Some(&keymap),
-                None
+                None,
+                false,
             )),
             vec!["hello", "theme", "keymap", "tabs"]
         );

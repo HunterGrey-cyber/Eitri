@@ -594,6 +594,7 @@ pub(super) fn handle_inbound_message(
                     Some(&theme),
                     state.keymap_help.as_deref(),
                     offer.as_ref(),
+                    state.choose_project_hook.is_some(),
                 );
                 // Why the folder is no boundary: a fact about the window, said again to every document,
                 // right after the greeting it belongs with.
@@ -1606,6 +1607,10 @@ pub(super) fn handle_inbound_message(
             Ok(()) => ok(&mut out),
             Err(why) => refuse(&mut out, why),
         },
+        InboundMessage::ChooseProject { .. } => {
+            out.effect(Effect::ChooseProject);
+            ok(&mut out);
+        }
         // The `?` overlay `prefix ?` opened was closed. With no hook (the companion window, `eitri-mac`) there is
         // nothing to give back, and the message is accepted all the same.
         InboundMessage::KeymapClosed {
@@ -1727,6 +1732,32 @@ pub(super) fn no_session_error() -> eitri_core::agent_backend::BackendError {
 mod tests {
     use super::*;
     use crate::agent_panel::tests::*;
+
+    #[test]
+    fn the_message_calls_the_hook_and_is_admitted_as_keymap_closed_is() {
+        let (handle, _page) = handle_with_strict_page();
+        let count = Rc::new(std::cell::Cell::new(0));
+        let counted = count.clone();
+        let state_for_hook = handle.state.clone();
+        handle.on_choose_project(move || {
+            let _state = state_for_hook.borrow_mut();
+            counted.set(counted.get() + 1);
+        });
+        let choose = parse_inbound_message(r#"{"type":"choose_project","request_id":"p1"}"#).unwrap();
+        let closed =
+            parse_inbound_message(r#"{"type":"keymap_closed","request_id":"k1","opening":1,"return_keys":true}"#)
+                .unwrap();
+        {
+            let state = handle.state.borrow();
+            assert_eq!(
+                admission(&state, &choose, ViewId::BASE, None),
+                admission(&state, &closed, ViewId::BASE, None)
+            );
+            assert_eq!(admission(&state, &choose, ViewId::BASE, None), Admission::Ungated);
+        }
+        handle.page_message(ViewId::BASE, r#"{"type":"choose_project","request_id":"p1"}"#);
+        assert_eq!(count.get(), 1);
+    }
 
     fn message(kind: &str, request_id: &str, tab: TabId, text: &str) -> String {
         serde_json::json!({ "type": kind, "request_id": request_id, "tab": tab.0, "text": text }).to_string()

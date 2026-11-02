@@ -193,6 +193,7 @@ pub(super) fn admission(
         | InboundMessage::PanelKeys { .. }
         | InboundMessage::NavFallthrough { .. }
         | InboundMessage::PaneNav { .. }
+        | InboundMessage::ChooseProject { .. }
         | InboundMessage::KeymapClosed { .. }
         | InboundMessage::ViewExported { .. }
         | InboundMessage::OpenUrl { .. }

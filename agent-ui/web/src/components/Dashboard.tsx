@@ -2,7 +2,7 @@ import type { EditorLink, Hello, PermissionModeChoice } from "../types";
 
 /** LazyVim-style dashboard rows: a centred name and one key per action. `"resume"` is the newest
  *  remembered session; the chooser (`w`/`prefix w`) lists every record. */
-export type DashItem = "new" | "restore" | "resume" | "sessions" | "mode" | "keys";
+export type DashItem = "new" | "restore" | "resume" | "sessions" | "project" | "mode" | "keys";
 
 /** The item's direct key, shared with `EmptyTab` so rendering and dispatch cannot disagree.
  *  The mode key is display-only: a bare `m` collides with prose such as "make" and "mode".
@@ -12,6 +12,7 @@ export const DASH_ITEM_KEY: Record<DashItem, string> = {
   restore: "s",
   resume: "r",
   sessions: "w",
+  project: "p",
   mode: "⇧Tab",
   keys: "?",
 };
@@ -27,7 +28,9 @@ export function dashItems(hello: Hello): DashItem[] {
   // action, so a later empty tab beside live ones never has it (Rust stops sending the offer).
   if ((hello.restore?.labels.length ?? 0) > 0) items.push("restore");
   if (hello.resumableSessions.length > 0) items.push("resume");
-  items.push("sessions", "keys");
+  items.push("sessions");
+  if (hello.canChooseProject) items.push("project");
+  items.push("keys");
   return items;
 }
 
@@ -69,6 +72,7 @@ function ItemIcon({ item }: { item: DashItem }) {
     restore: "M2.5 5.5h8v7h-8zM4.5 6V3.5h9v7H11",
     resume: "M3.5 8.5a5 5 0 1 0 1.46-3.54L3.5 6.5M3.5 3v3.5H7M8.5 5v3.5l2 1.5",
     sessions: "M6 4.5h8M6 8.5h8M6 12.5h8M2 4.5h2M2 8.5h2M2 12.5h2",
+    project: "M1.5 4.5h5l2-2h6v10h-13z",
     mode: "",
     keys: "M2.5 4.5h12v8h-12zM4 7.5h1M6 7.5h1M8 7.5h1M10 7.5h1M12 7.5h1M5 10.5h7",
   };
@@ -191,6 +195,8 @@ function ItemLabel({ item, hello, mode, agent }: { item: DashItem; hello: Hello;
     }
     case "sessions":
       return <>All sessions</>;
+    case "project":
+      return <>Open another project</>;
     case "mode":
       return <>Mode: {mode}</>;
     case "keys":

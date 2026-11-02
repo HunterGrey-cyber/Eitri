@@ -1852,6 +1852,12 @@ impl AgentPanelHandle {
         self.state.borrow_mut().editor_done_hook = Some(Rc::new(hook));
     }
 
+    /// Opens the window's project chooser when its empty tab requests it.
+    pub fn on_choose_project(&self, hook: impl Fn() + 'static) {
+        self.wake();
+        self.state.borrow_mut().choose_project_hook = Some(Rc::new(hook));
+    }
+
     /// Called when the editor's "edit the selection" key was pressed (the panel reads each press once): the
     /// window puts the keys in the chat and then calls [`edit_selection`](Self::edit_selection) for the view that
     /// took them. A window that installs none leaves the key doing nothing here.

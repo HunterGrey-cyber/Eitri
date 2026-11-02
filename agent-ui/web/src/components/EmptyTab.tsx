@@ -105,6 +105,7 @@ export type EmptyTabProps = {
    *  choose` a live tab's `prefix w` posts (`App.tsx`'s `runPanelAction`, `tab.choose`). Optional,
    *  like `onOpenKeymap` below, so this component's own tests need no stand-in. */
   onChooseSessions?: () => void;
+  onChooseProject?: () => void;
   /** Mirrors `Composer`'s own prop of the same name: this tab's
    *  draft is saved and restored across a switch like any other, so an empty tab's composer needs
    *  the same hook into it. */
@@ -516,6 +517,9 @@ export function EmptyTab(props: EmptyTabProps) {
         if (newest !== undefined) props.onResume(newest.providerSessionId);
         break;
       }
+      case "project":
+        props.onChooseProject?.();
+        break;
       case "sessions":
         props.onChooseSessions?.();
         break;
@@ -758,16 +762,21 @@ export function EmptyTab(props: EmptyTabProps) {
     } else if (
       (event.key === "r" && items.includes("resume")) ||
       (event.key === "s" && items.includes("restore")) ||
-      event.key === "w"
+      event.key === "w" ||
+      (event.key === "p" && items.includes("project"))
     ) {
       // Arrivals land in BROWSE: "run the tests" must not resume on `r`, nor "what's next" open
       // the chooser on `w` and feed it the rest. Defer by `TYPING_GUARD_MS` like `f` and `H`/`L`,
       // acting only if nothing else was typed and the dashboard remains in BROWSE.
       event.preventDefault();
-      const item: DashItem = event.key === "r" ? "resume" : event.key === "s" ? "restore" : "sessions";
+      const item: DashItem =
+        event.key === "r" ? "resume" : event.key === "s" ? "restore" : event.key === "p" ? "project" : "sessions";
       const flash = tableKeyTypingFlash(
         event.key,
-        item === "resume" ? "resume the newest session" : item === "restore" ? "restore the last session" : "all sessions",
+        item === "resume" ? "resume the newest session"
+          : item === "restore" ? "restore the last session"
+          : item === "project" ? "open another project"
+          : "all sessions",
       );
       const waiting = typingGuard.defer(
         typedAt,
