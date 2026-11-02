@@ -376,6 +376,36 @@ fn plain_window_moves_are_replaced_at_vimenter_and_after_verylazy() {
     nvim.quit();
 }
 
+/// Kickstart spells its moves `<C-w><C-h>`; that is a plain move like `<C-w>h` and gets the fallback,
+/// while `<C-w><C-w>` (next window) and `<C-w><C-x>` are not moves in a direction and stay the user's.
+#[test]
+#[ignore = "needs a real nvim on PATH; spends no tokens and needs no display"]
+fn kickstart_spelling_of_a_plain_move_is_replaced_and_other_ctrl_w_pairs_are_not() {
+    let mut nvim = Nvim::start(
+        "k",
+        Loader::Installed,
+        &[
+            "nnoremap <C-h> <C-w><C-h>",
+            "nnoremap <C-j> <C-w><C-J>",
+            "nnoremap <C-k> <C-w><C-w>",
+            "nnoremap <C-l> <C-w><C-x>",
+        ],
+        &[],
+    );
+    nvim.wait_for_fallback("<C-h>", "n", "left");
+    nvim.wait_for_fallback("<C-j>", "n", "down");
+    nvim.wait_for_all_fallbacks("x");
+    assert_eq!(
+        nvim.maparg("<C-k>", "n"),
+        (None, Some("<C-w><C-w>".to_string()), 0, false)
+    );
+    assert_eq!(
+        nvim.maparg("<C-l>", "n"),
+        (None, Some("<C-w><C-x>".to_string()), 0, false)
+    );
+    nvim.quit();
+}
+
 /// vim-tmux-navigator's own mapping, a Lua-callback mapping (a lazy.nvim key stub and
 /// smart-splits both have this shape), and `<C-W>K` -- which moves the *window*, not the cursor, so
 /// it is not a plain move even though only the letter's case differs -- are left alone in Normal

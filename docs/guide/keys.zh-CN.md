@@ -1,5 +1,5 @@
 [English](keys.md) | 简体中文
-<!-- translated-from: keys.md sha256=a5a49f8d0a92a3de065bca5ad640fd2ef243e0cf98f5495e4dcf96653f7291a2 -->
+<!-- translated-from: keys.md sha256=2c8b5d4e44a59a89239089106f036fd38fcf7a5e64eb413451a3b9e7e05d2b67 -->
 
 # 按键
 
@@ -258,7 +258,7 @@ k.set("prefix", "C-Space", "send-prefix")
 在 BROWSE 里，vim 的 `Ctrl+w h`、`Ctrl+w j`、`Ctrl+w k` 和 `Ctrl+w l` 做同样的移动；`Ctrl+w j` 永远是下面的模块，绝不是输入框。
 
 <a id="navigator-plugins-in-the-editor"></a>
-**编辑器里的导航插件。** 要不要做点什么，看插件。vim-tmux-navigator 和 Navigator.nvim 照原样就能用：它们发的 `select-pane` 由 Eitri 回答，所以在 Neovim 右边缘按 `Ctrl+l`，按键会到达那一侧的终端或面板。smart-splits.nvim 需要一个钩子。没有钩子时它不会把按键移出 Neovim（Neovim 是 GUI 时它会关掉自己的多路复用器支持，而这里的编辑器就是），所以在 `at_edge` 里把这次移动交给 Eitri：
+**编辑器里的导航插件。** 要不要做点什么，看插件。vim-tmux-navigator 和 Navigator.nvim 照原样就能用：它们发的 `select-pane` 由 Eitri 回答，所以在 Neovim 右边缘按 `Ctrl+l`，按键会到达那一侧的终端或面板。smart-splits.nvim（AstroNvim 的窗口导航插件）需要一个钩子。没有钩子时它不会把按键移出 Neovim（Neovim 是 GUI 时它会关掉自己的多路复用器支持，而这里的编辑器就是），所以在 `at_edge` 里把这次移动交给 Eitri：
 
 ```lua
 require("smart-splits").setup({

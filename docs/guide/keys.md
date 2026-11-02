@@ -424,7 +424,7 @@ module below, never the box.
 
 **Navigator plugins in the editor.** What you need depends on the plugin. vim-tmux-navigator and Navigator.nvim work
 as they are: Eitri answers the `select-pane` call they make, so `Ctrl+l` at Neovim's right edge reaches the terminal
-or panel on that side. smart-splits.nvim needs a hook. Without one it does not move the keys out of Neovim (it
+or panel on that side. smart-splits.nvim (AstroNvim's window-navigation plugin) needs a hook. Without one it does not move the keys out of Neovim (it
 switches its multiplexer support off when Neovim is a GUI, and the editor here is), so hand the move to Eitri from
 `at_edge`:
 

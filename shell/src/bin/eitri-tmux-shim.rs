@@ -37,12 +37,13 @@
 //!   it. (`agent-hook` blocks for a real decision because a permission answer is load-bearing;
 //!   nothing downstream of a `select-pane` call reads anything back.)
 //!
-//! Known, accepted limitation: `$TMUX` being set also makes Neovim's *clipboard* provider consider
-//! `tmux` as a fallback copy/paste backend (it is last in nvim's own provider list, after
-//! `wl-copy`/`xclip`/`xsel`), and this shim answers such a call with silence rather than real
-//! clipboard content. On this project's target (a Wayland session with `wl-clipboard` present)
-//! `wl-copy` wins long before that fallback is reached. Exiting 0 quietly is still the right
-//! failure mode: an unrecognized command must not break the plugin's own control flow.
+//! Clipboard calls. `$TMUX` being set makes Neovim's clipboard provider pick `tmux` when neither
+//! `wl-copy`, `xclip` nor `xsel` is installed (it is last in nvim's own list), and every starter
+//! sets `unnamedplus`, so every yank then calls `tmux load-buffer`. The shim has no clipboard to
+//! give, so it says so: `load-buffer` and `save-buffer` exit 1 with a hint on stderr, which nvim
+//! shows as `clipboard: error invoking tmux: ...`. Exiting 0 there would let `"+y` look like it
+//! worked while the text went nowhere. The full hint is printed once per Eitri window, later calls
+//! get a short line. Where a real clipboard tool exists nvim never reaches this provider.
 
 use std::ffi::OsStr;
 use std::io::{IsTerminal, Write};
@@ -67,6 +68,42 @@ fn direction_from_args(args: &[String]) -> Option<char> {
         "-D" => Some('D'),
         _ => None,
     })
+}
+
+/// Whether this is a clipboard call of nvim's `tmux` provider (`load-buffer` to copy,
+/// `save-buffer` to paste) rather than anything the pane-switch plugins send.
+fn is_clipboard_call(args: &[String]) -> bool {
+    args.iter().any(|arg| arg == "load-buffer" || arg == "save-buffer")
+}
+
+const CLIPBOARD_HINT: &str = "Eitri has no clipboard tool to hand nvim here: install wl-clipboard (Wayland) \
+     or xclip (X11), then restart the editor";
+const CLIPBOARD_HINT_SHORT: &str = "no clipboard tool (install wl-clipboard or xclip)";
+
+/// What a refused clipboard call tells nvim: the full hint the first time (`first`), the short line
+/// after. The text a person yanked is never part of it.
+fn clipboard_refusal(first: bool) -> &'static str {
+    if first {
+        CLIPBOARD_HINT
+    } else {
+        CLIPBOARD_HINT_SHORT
+    }
+}
+
+/// Whether this is the first refusal in this window: creates `told` exclusively (0600, in the
+/// window's private directory) and reports whether it did. When the marker cannot be made the
+/// answer is `true`, so the hint is never lost.
+fn first_clipboard_refusal(told: &Path) -> bool {
+    use std::os::unix::fs::OpenOptionsExt;
+    match std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(0o600)
+        .open(told)
+    {
+        Ok(_) => true,
+        Err(e) => e.kind() != std::io::ErrorKind::AlreadyExists,
+    }
 }
 
 /// Whether a typed `tmux` inside nvim's own `:terminal` deserves a message on
@@ -158,8 +195,15 @@ fn main() {
         std::process::exit(1);
     }
 
+    if is_clipboard_call(&args) {
+        let told = own_dir.parent().map(|dir| dir.join("clipboard-told"));
+        let first = told.as_deref().is_none_or(first_clipboard_refusal);
+        eprintln!("{}", clipboard_refusal(first));
+        std::process::exit(1);
+    }
+
     let Some(direction) = direction_from_args(&args) else {
-        // Not a pane-switch call (`display-message`, `run-shell`, a clipboard fallback, ...).
+        // Not a pane-switch call (`display-message`, `run-shell`, ...).
         // Exit 0 silently: the plugin's own control flow must never break on this.
         return;
     };
@@ -231,6 +275,15 @@ mod tests {
             None
         );
         assert_eq!(direction_from_args(&args(&["-S", "/s", "load-buffer", "-"])), None);
+        assert!(!is_clipboard_call(&args(&["-S", "/s", "display-message", "-p", "x"])));
+        assert!(!is_clipboard_call(&args(&[
+            "-S",
+            "/s",
+            "select-pane",
+            "-t",
+            "%0",
+            "-L"
+        ])));
         assert_eq!(direction_from_args(&[]), None);
     }
 
@@ -406,5 +459,31 @@ mod tests {
             own_dir_from(Some(OsStr::new("/t/nv-ps-9/s.sock")), Some("/x:/y")),
             PathBuf::from("/t/nv-ps-9/bin")
         );
+    }
+
+    #[test]
+    fn nvims_copy_and_paste_calls_are_clipboard_calls() {
+        assert!(is_clipboard_call(&args(&["load-buffer", "-w", "-"])));
+        assert!(is_clipboard_call(&args(&["-S", "/s", "load-buffer", "-"])));
+        assert!(is_clipboard_call(&args(&["save-buffer", "-"])));
+    }
+
+    /// The first refusal in a window carries the hint, the next ones a short line; neither can
+    /// carry yanked text, which the shim never reads.
+    #[test]
+    fn the_hint_is_full_once_and_short_after() {
+        let root = scratch_dir("told");
+        let told = root.join("clipboard-told");
+        assert!(first_clipboard_refusal(&told));
+        assert!(!first_clipboard_refusal(&told));
+        assert!(!first_clipboard_refusal(&told));
+        assert!(clipboard_refusal(true).contains("wl-clipboard"));
+        assert!(clipboard_refusal(true).contains("xclip"));
+        assert!(clipboard_refusal(false).len() < clipboard_refusal(true).len());
+        // A marker that cannot be made never hides the hint.
+        assert!(first_clipboard_refusal(
+            &root.join("no-such-dir").join("clipboard-told")
+        ));
+        let _ = std::fs::remove_dir_all(&root);
     }
 }

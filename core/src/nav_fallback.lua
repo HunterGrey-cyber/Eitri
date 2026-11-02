@@ -135,13 +135,15 @@ local function is_nvim_default(m, key)
 end
 
 -- A plain window move for the same direction -- stock LazyVim's `map("n", "<C-h>", "<C-w>h",
--- { remap = true })` is one. The fallback is a strict superset: it still moves between windows first.
+-- { remap = true })` is one, kickstart's `<C-w><C-h>` another (nvim reports `<C-w><C-j>` as `<C-w><NL>`). The fallback is a strict superset: it still moves between windows first.
 local function is_plain_move(m, key)
   if m.callback ~= nil or m.expr == 1 or m.rhs == nil then
     return false
   end
   local rhs = notation_lower(m.rhs)
   return rhs == "<c-w>" .. key.dir
+    or rhs == "<c-w><c-" .. key.dir .. ">"
+    or (key.dir == "j" and rhs == "<c-w><nl>")
     or rhs == "<cmd>wincmd " .. key.dir .. "<cr>"
     or rhs == ":wincmd " .. key.dir .. "<cr>"
 end
