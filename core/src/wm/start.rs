@@ -400,6 +400,7 @@ pub(super) fn event_window(event: &HostEvent) -> Option<WinId> {
         | HostEvent::GroupClosed { win }
         | HostEvent::AnswerRefused { win, .. }
         | HostEvent::OpenFile { win, .. }
+        | HostEvent::RaiseWindow { win, .. }
         | HostEvent::SurfaceEnded { win, .. }
         | HostEvent::TopBarEntry { win, .. }
         | HostEvent::Onboarding(
@@ -548,6 +549,55 @@ mod tests {
         assert_eq!(event_window(&failed), Some(win));
     }
 
+    /// The host takes nothing off the socket until the window can act on it, so a request waits there. What the
+    /// controller adds is that neither kind can be left unanswered, or reach a window that has no record yet.
+    #[test]
+    fn raise_during_start_waits_as_an_open_does() {
+        let win = WinId::MAIN;
+        let raise = |id| HostEvent::RaiseWindow { win, id, token: None };
+        let open = |id| HostEvent::OpenFile {
+            win,
+            id,
+            path: "/project/a.rs".into(),
+            line: None,
+            col: None,
+            token: None,
+        };
+        assert_eq!(event_window(&raise(1)), Some(win));
+
+        let (driver, host) = setup();
+        driver.start(win, StartStep::Feeds { spawn: spawn() });
+        driver.start(
+            win,
+            StartStep::Window {
+                spec: spec(EditorPresence::Owned),
+            },
+        );
+        driver.post(open(1));
+        driver.post(raise(2));
+        let refused = |id| HostOp::OpenAnswer { id, accepted: false };
+        assert_eq!(answers(&host), [refused(1), refused(2)]);
+        assert!(!ops(&host).iter().any(|op| matches!(op, HostOp::Present { .. })));
+        assert!(
+            driver.query(|c| c.start_notes().is_empty()),
+            "nothing here is a surprise"
+        );
+
+        driver.start(win, StartStep::Editor);
+        driver.start(win, StartStep::Kernel);
+        driver.start(win, config());
+        driver.start(
+            win,
+            StartStep::Layout {
+                parts: parts(),
+                own_window: None,
+                tiling: Tiling::Eitri,
+            },
+        );
+        driver.post(raise(3));
+        assert_eq!(answers(&host)[2..], [HostOp::OpenAnswer { id: 3, accepted: true }]);
+    }
+
     #[test]
     fn the_layout_phase_keeps_the_own_window_id() {
         let mut controller = Controller::new(FakeScheduler::new());
@@ -694,6 +744,11 @@ mod tests {
             },
         );
         driver.start(WinId::MAIN, StartStep::Requests);
+    }
+
+    fn answers(host: &FakeHost) -> Vec<HostOp> {
+        let answer = |op: &HostOp| matches!(op, HostOp::OpenAnswer { .. });
+        ops(host).into_iter().filter(answer).collect()
     }
 
     fn ops(host: &FakeHost) -> Vec<HostOp> {

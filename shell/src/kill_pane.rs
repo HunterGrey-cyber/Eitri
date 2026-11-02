@@ -160,6 +160,7 @@ mod tests {
             quit: EditorQuit::Window { confirmed: None },
             revealed: false,
             sent: true,
+            killed: false,
             lent_by: None,
         }
     }

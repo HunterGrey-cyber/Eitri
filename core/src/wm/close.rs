@@ -218,6 +218,17 @@ pub(super) fn ask_last_module(w: &mut Window, cx: &Cx, win: WinId, module: Modul
 }
 
 impl CloseFlow {
+    /// Whether this window is on its way out. A close that nvim was asked about and has not answered is held at nvim's
+    /// prompt, and one that nvim turned down or never took stays at [`CloseState::Quitting`] with the window still
+    /// here, so neither counts.
+    pub fn is_ending(&self, quit: &QuitFlow) -> bool {
+        match self.state {
+            CloseState::Idle | CloseState::Asking => false,
+            CloseState::Quitting => self.teardown.is_some() || quit.ends_the_window(),
+            CloseState::Moving | CloseState::TearingDown | CloseState::Closed => true,
+        }
+    }
+
     /// The pending action is taken before it runs, so a callback may ask a fresh question in the same batch.
     pub fn answer(&mut self, w: &mut Window, cx: &Cx, win: WinId, answer: PromptKey, batch: &mut Batch) {
         if answer == PromptKey::Ignore || self.state != CloseState::Asking {
@@ -1275,6 +1286,8 @@ pub struct Asked {
     /// and this is cleared. `false` for a quit joined to an nvim
     /// that had exited already, which has no request of its own.
     pub sent: bool,
+    /// nvim did not answer this quit and is being ended: the request stands, and no prompt can come of it.
+    pub killed: bool,
     /// A kill of the editor that sent nothing (nvim out of reach, or just exited) and joined an
     /// older window close nvim was sent and had not answered: the close wins ([`merge`]), and this
     /// is that close's generation, since its request -- not this quit's, which has none -- says
@@ -1590,7 +1603,28 @@ mod kill_tests {
             quit,
             revealed: false,
             sent: true,
+            killed: false,
             lent_by: None,
+        }
+    }
+
+    /// Every state past the question reads as ending, but `Quitting`, which also outlives a close nvim turned down.
+    #[test]
+    fn only_a_close_nothing_can_hold_is_ending() {
+        let quit = QuitFlow::default();
+        for (state, ending) in [
+            (CloseState::Idle, false),
+            (CloseState::Asking, false),
+            (CloseState::Quitting, false),
+            (CloseState::Moving, true),
+            (CloseState::TearingDown, true),
+            (CloseState::Closed, true),
+        ] {
+            let close = CloseFlow {
+                state,
+                ..CloseFlow::default()
+            };
+            assert_eq!(close.is_ending(&quit), ending, "{state:?}");
         }
     }
 

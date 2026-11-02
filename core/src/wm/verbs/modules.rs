@@ -911,6 +911,21 @@ pub fn open_file(
     batch.push_effect(HostOp::OpenAnswer { id, accepted });
 }
 
+/// Another process asks this window to come forward: it does, with `token`, and nothing in it moves. A window held at
+/// a question comes forward too, because that question is what the person needs to see; one on its way out answers
+/// `false`, and its client becomes a window of its own.
+pub fn raise_window(w: &mut Window, win: WinId, id: u64, token: Option<String>, batch: &mut Batch) {
+    let accepted = !w.close.is_ending(&w.quit);
+    if accepted {
+        w.say("[project] raised".into());
+        batch.push_effect(HostOp::Present {
+            win,
+            activation: token.map(ActivationToken),
+        });
+    }
+    batch.push_effect(HostOp::OpenAnswer { id, accepted });
+}
+
 fn take_open(w: &mut Window, cx: &Cx, win: WinId, file: QueuedOpen, token: Option<String>, batch: &mut Batch) -> bool {
     let editor = ModuleId::editor();
     if let Err(err) = reveal_and_focus(w, cx, win, &editor, batch) {
@@ -2112,6 +2127,16 @@ mod restart_tests {
                 token: token.map(str::to_string),
             });
         }
+        fn raise(&self, id: u64, token: Option<&str>) {
+            self.driver.post(HostEvent::RaiseWindow {
+                win: WIN,
+                id,
+                token: token.map(str::to_string),
+            });
+        }
+        fn notes(&self) -> Vec<String> {
+            self.driver.query(|c| c.notes(WIN))
+        }
         fn answers(&self) -> Vec<(u64, bool)> {
             self.ops()
                 .into_iter()
@@ -2275,6 +2300,230 @@ mod restart_tests {
         let at = r.ops().len();
         r.open(1, "a.rs");
         assert_eq!(r.ops()[at..], [HostOp::OpenAnswer { id: 1, accepted: false }]);
+    }
+
+    #[test]
+    fn raise_presents_with_the_token_and_answers() {
+        let r = Rig::new();
+        r.ready();
+        r.driver
+            .run(WIN, Action::Module(ModuleId::agent()), Origin::Key { keycode: 7 });
+        r.driver.run(WIN, Action::Zoom, Origin::Key { keycode: 7 });
+        let at = r.ops().len();
+        r.raise(7, Some("token"));
+        assert_eq!(
+            r.ops()[at..],
+            [
+                HostOp::Present {
+                    win: WIN,
+                    activation: Some(crate::wm::ActivationToken("token".into())),
+                },
+                HostOp::OpenAnswer { id: 7, accepted: true },
+            ],
+            "the window moves, and nothing in it does"
+        );
+        assert_eq!(r.layout.borrow().focus(), &ModuleId::agent());
+        assert!(r.layout.borrow().zoom().is_some());
+        assert_eq!(r.notes().iter().filter(|note| *note == "[project] raised").count(), 1);
+
+        let at = r.ops().len();
+        r.raise(8, None);
+        assert_eq!(
+            r.ops()[at..],
+            [
+                HostOp::Present {
+                    win: WIN,
+                    activation: None
+                },
+                HostOp::OpenAnswer { id: 8, accepted: true },
+            ]
+        );
+    }
+
+    /// What the window is held by is what the person needs to see, and the raise changes nothing about it.
+    #[test]
+    fn a_window_in_a_quit_prompt_comes_forward() {
+        let forward = |r: &Rig, id| {
+            let at = r.ops().len();
+            r.raise(id, None);
+            assert_eq!(
+                r.ops()[at..],
+                [
+                    HostOp::Present {
+                        win: WIN,
+                        activation: None
+                    },
+                    HostOp::OpenAnswer { id, accepted: true },
+                ]
+            );
+        };
+        // The window's own question.
+        let r = Rig::new();
+        r.ready();
+        r.host.set_chat_kill_counts(
+            ViewId::BASE,
+            ChatKillCounts {
+                running: 1,
+                ..Default::default()
+            },
+        );
+        r.driver.close_requested(WIN, CloseBy::User);
+        forward(&r, 1);
+        assert_eq!(
+            r.driver.query(|c| c.window(WIN).unwrap().close.state),
+            CloseState::Asking
+        );
+
+        // nvim's `:confirm qall`, for a close and for the editor's kill.
+        let r = Rig::new();
+        r.ready();
+        r.driver.close_requested(WIN, CloseBy::User);
+        assert!(r
+            .ops()
+            .iter()
+            .any(|op| matches!(op, HostOp::Editor(EditorCall::Quit { .. }))));
+        forward(&r, 2);
+
+        let r = Rig::new();
+        r.ready();
+        r.driver.run(WIN, Action::ModuleKill, Origin::Key { keycode: 7 });
+        r.answer("y");
+        forward(&r, 3);
+    }
+
+    #[test]
+    fn a_window_that_is_ending_does_not_come_forward() {
+        // No nvim holds this close, so it tears down at the next idle.
+        let r = Rig::new();
+        r.driver.close_requested(WIN, CloseBy::User);
+        assert_eq!(
+            r.driver.query(|c| c.window(WIN).unwrap().close.state),
+            CloseState::Quitting
+        );
+        let at = r.ops().len();
+        r.raise(1, Some("token"));
+        assert_eq!(r.ops()[at..], [HostOp::OpenAnswer { id: 1, accepted: false }]);
+
+        r.driver.post(HostEvent::EndSignal { name: "SIGTERM" });
+        assert_eq!(
+            r.driver.query(|c| c.window(WIN).unwrap().close.state),
+            CloseState::Closed
+        );
+        let at = r.ops().len();
+        r.raise(2, None);
+        assert_eq!(r.ops()[at..], [HostOp::OpenAnswer { id: 2, accepted: false }]);
+        assert!(!r.notes().iter().any(|note| note == "[project] raised"));
+    }
+
+    /// The nvim the rig's close asked, which has said nothing since.
+    fn nvim_quiet_since_asked(r: &Rig) {
+        r.host.set_editor_facts(EditorFacts {
+            running: true,
+            watch: Some(crate::wm::close::NvimAnswer {
+                sent_at: r.scheduler.now(),
+                done: false,
+                returned: false,
+                last: None,
+            }),
+            ..Default::default()
+        });
+    }
+
+    fn ends_nvim(ops: &[HostOp]) -> bool {
+        ops.iter()
+            .any(|op| matches!(op, HostOp::Editor(EditorCall::End { .. })))
+    }
+
+    #[test]
+    fn a_window_whose_nvim_is_being_ended_does_not_come_forward() {
+        let r = Rig::new();
+        r.ready();
+        r.driver.close_requested(WIN, CloseBy::User);
+        nvim_quiet_since_asked(&r);
+        r.scheduler.advance(crate::wm::close::NVIM_QUIT_PATIENCE);
+
+        // Quiet is not gone: it may still come back with its prompt.
+        r.raise(1, None);
+        assert_eq!(r.answers(), [(1, true)]);
+
+        let at = r.ops().len();
+        r.driver.close_requested(WIN, CloseBy::User);
+        assert!(ends_nvim(&r.ops()[at..]), "{:#?}", &r.ops()[at..]);
+
+        let at = r.ops().len();
+        r.raise(2, Some("token"));
+        assert_eq!(r.ops()[at..], [HostOp::OpenAnswer { id: 2, accepted: false }]);
+    }
+
+    #[test]
+    fn a_window_whose_nvim_is_out_of_reach_does_not_come_forward() {
+        let r = Rig::new();
+        r.ready();
+        r.host.set_editor_facts(EditorFacts {
+            exit_pending: true,
+            ..Default::default()
+        });
+        r.event(EditorEvent::Unreachable { win: WIN });
+
+        // Nothing has asked it to go yet, so the window stays.
+        r.raise(1, None);
+        assert_eq!(r.answers(), [(1, true)]);
+
+        let at = r.ops().len();
+        r.driver.close_requested(WIN, CloseBy::User);
+        assert!(ends_nvim(&r.ops()[at..]), "{:#?}", &r.ops()[at..]);
+
+        let at = r.ops().len();
+        r.raise(2, Some("token"));
+        assert_eq!(r.ops()[at..], [HostOp::OpenAnswer { id: 2, accepted: false }]);
+    }
+
+    #[test]
+    fn a_window_whose_close_nvim_turned_down_comes_forward() {
+        let r = Rig::new();
+        r.ready();
+        r.driver.close_requested(WIN, CloseBy::User);
+        let generation = r
+            .ops()
+            .iter()
+            .find_map(|op| match op {
+                HostOp::Editor(EditorCall::Quit { generation, .. }) => Some(*generation),
+                _ => None,
+            })
+            .expect("the close asks nvim");
+        r.event(EditorEvent::QuitCancelled {
+            win: WIN,
+            generation: u64::from(generation),
+        });
+
+        r.raise(1, None);
+        assert_eq!(
+            r.answers(),
+            [(1, true)],
+            "the window stays, so its client must not open a second one"
+        );
+    }
+
+    #[test]
+    fn a_raise_before_ready_comes_forward_and_leaves_the_editor_alone() {
+        let r = Rig::new();
+        let at = r.ops().len();
+        r.raise(1, None);
+        assert_eq!(r.ops().len(), at + 2);
+        assert_eq!(r.answers(), [(1, true)]);
+        r.ready();
+        assert!(r.opened().is_empty());
+    }
+
+    #[test]
+    fn a_raise_for_a_window_this_controller_does_not_hold_answers_busy() {
+        let r = Rig::new();
+        r.driver.post(HostEvent::RaiseWindow {
+            win: WinId(9),
+            id: 3,
+            token: None,
+        });
+        assert_eq!(r.answers(), [(3, false)]);
     }
 
     #[test]

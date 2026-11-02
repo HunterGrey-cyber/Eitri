@@ -399,6 +399,10 @@ fn main() -> glib::ExitCode {
                 ) {
                     return code;
                 }
+                // The same, for a window asked only to come forward.
+                if let Some(code) = open_requests::raise(&launch, want_clean, backend_kind, open_token.as_deref()) {
+                    return code;
+                }
                 (launch.root, eitri_core::project_root::nvim_open_args(&launch.open))
             }
             Err(message) => {
@@ -5450,6 +5454,7 @@ mod tests {
             at(concat!("companion::env::drop_inherited", "_editor_env()")),
             at(concat!("resolve_", "launch()")),
             at(concat!("open_requests::hand_", "over(")),
+            at(concat!("open_requests::", "raise(")),
             at(concat!("nvim_bin::", "resolve()")),
             at(concat!("build_", "application(kind)")),
         ];

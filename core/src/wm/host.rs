@@ -532,7 +532,8 @@ pub enum HostOp {
         win: WinId,
         activation: Option<ActivationToken>,
     },
-    /// What the window says to the [`HostEvent::OpenFile`] of this `id`: `false` sends its client to a new window.
+    /// What the window says to the [`HostEvent::OpenFile`] or [`HostEvent::RaiseWindow`] of this `id`: `false` sends
+    /// its client to a new window.
     OpenAnswer { id: u64, accepted: bool },
     /// Sets window presentation flags: the state the window's mode toggle (`window.immersive`) leads to. A host
     /// whose window also changes mode without the controller hearing (a bare F11, the editor's own setting, the
@@ -1226,6 +1227,14 @@ pub enum HostEvent {
         path: std::path::PathBuf,
         line: Option<u32>,
         col: Option<u32>,
+        /// The asking launcher's activation token, opaque.
+        token: Option<String>,
+    },
+    /// Another process asks this window to come forward. Always answered with one [`HostOp::OpenAnswer`] of this
+    /// `id`.
+    RaiseWindow {
+        win: WinId,
+        id: u64,
         /// The asking launcher's activation token, opaque.
         token: Option<String>,
     },

@@ -1,13 +1,15 @@
 //! The shell's two ends of the open socket (`eitri_core::open_socket`).
 //!
 //! **The launch.** `eitri FILE` asks before any GTK whether a running window will take the file, and exits if one
-//! does ([`hand_over`]). A terminal's shell tells it which window to ask first ([`shell_env`]).
+//! does ([`hand_over`]). A terminal's shell tells it which window to ask first ([`shell_env`]). `--raise` asks the same
+//! way whether the window of the root will come forward ([`raise`]).
 //!
 //! **The window.** A window that owns its editor holds the socket for as long as it lives ([`OpenRequests`]). A
-//! request reaches the GTK thread as one byte on a wake socket, becomes a `HostEvent::OpenFile` with an id of its own,
-//! and waits here until the controller's `HostOp::OpenAnswer` of that id says what the client is told. What became of
-//! the open itself comes later: the call goes to nvim and its answer is looked for from a bounded timer
-//! ([`watch_open`]), because at a blocking prompt nvim answers nothing until the prompt ends.
+//! request reaches the GTK thread as one byte on a wake socket, becomes a `HostEvent::OpenFile` or
+//! `HostEvent::RaiseWindow` with an id of its own, and waits here until the controller's `HostOp::OpenAnswer` of that
+//! id says what the client is told. What became of an open itself comes later: the call goes to nvim and its answer
+//! is looked for from a bounded timer ([`watch_open`]), because at a blocking prompt nvim answers nothing until the
+//! prompt ends.
 
 use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
@@ -19,7 +21,7 @@ use std::time::Duration;
 use eitri_core::agent_backend::BackendKind;
 use eitri_core::companion::env::OPEN_SOCKET_ENV;
 use eitri_core::nvim_rpc::Pending;
-use eitri_core::open_socket::{deliver, socket_path, Answer, Answering, Delivered, OpenServer};
+use eitri_core::open_socket::{deliver, socket_path, Answer, Answering, Delivered, OpenServer, Raised, Request};
 use eitri_core::project_root::Launch;
 use eitri_core::wm::{EditorEvent, HostEvent, HostSink, WinId};
 use gtk4::glib;
@@ -94,6 +96,27 @@ fn hand_over_in(
     }
 }
 
+/// Asks the running window of the launch's root to come forward. `Some` is how this process ends, and nothing of a
+/// window of its own has been started; `None` is a launch that goes on to be that window.
+pub(crate) fn raise(launch: &Launch, clean: bool, backend: BackendKind, token: Option<&str>) -> Option<glib::ExitCode> {
+    raise_in(&control_dir(), launch, clean, backend, token)
+}
+
+fn raise_in(
+    dir: &Path,
+    launch: &Launch,
+    clean: bool,
+    backend: BackendKind,
+    token: Option<&str>,
+) -> Option<glib::ExitCode> {
+    // `--clean` and the legacy backend ask for a window unlike the one running, as for a file.
+    if !launch.asks_for_a_raise() || clean || backend == BackendKind::Legacy {
+        return None;
+    }
+    // The window moving is the answer, so nothing is printed.
+    (eitri_core::open_socket::raise(&launch.root, dir, token) == Raised::Done).then_some(glib::ExitCode::SUCCESS)
+}
+
 /// What a launch says once a window took its files. It names a root only when that root's own socket was the one
 /// asked: the window behind a terminal's socket can be any window, and a client is not told the root of the window
 /// that answers.
@@ -125,7 +148,7 @@ fn shell_env_in(held: Option<&Path>, dir: &Path, root: &Path) -> Vec<(OsString, 
 pub(crate) struct OpenRequests {
     server: OpenServer,
     sink: Weak<dyn HostSink>,
-    /// Keyed by the id of the `HostEvent::OpenFile` each was posted as. Dropping one answers `busy`.
+    /// Keyed by the id of the event each was posted as. Dropping one answers `busy`.
     waiting: RefCell<HashMap<u64, Answering>>,
     last_id: Cell<u64>,
     /// Removed before the server closes: the watch reads the server's descriptor.
@@ -192,20 +215,27 @@ impl OpenRequests {
         };
         for request in incoming {
             // Its client may have been told `busy`, or left, and may have a new window by now.
-            let Some((open, answering)) = request.take() else {
+            let Some((request, answering)) = request.take() else {
                 continue;
             };
             let id = self.last_id.get() + 1;
             self.last_id.set(id);
             // Before the post: the batch it starts can answer before `post` returns.
             self.waiting.borrow_mut().insert(id, answering);
-            sink.post(HostEvent::OpenFile {
-                win: WinId::MAIN,
-                id,
-                path: open.path,
-                line: open.line,
-                col: open.col,
-                token: open.token,
+            sink.post(match request {
+                Request::Open(open) => HostEvent::OpenFile {
+                    win: WinId::MAIN,
+                    id,
+                    path: open.path,
+                    line: open.line,
+                    col: open.col,
+                    token: open.token,
+                },
+                Request::Raise { token } => HostEvent::RaiseWindow {
+                    win: WinId::MAIN,
+                    id,
+                    token,
+                },
             });
         }
     }
@@ -324,6 +354,7 @@ mod tests {
                     })
                     .collect(),
                 new_window: false,
+                raise: false,
                 notes: Vec::new(),
             }
         }
@@ -707,6 +738,102 @@ mod tests {
         ];
         for (launch, clean, backend) in cases {
             assert_eq!(hand_over_in(&scratch.dir, &launch, clean, backend, None, None), None);
+        }
+        assert_eq!(wakes_waiting(requests.server.wake_fd()), 0, "none of them asked");
+    }
+
+    fn raises(sink: &RecordingSink) -> Vec<(u64, Option<String>)> {
+        sink.events()
+            .into_iter()
+            .filter_map(|(_, event)| match event {
+                HostEvent::RaiseWindow { id, token, .. } => Some((id, token)),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// `raise_in` off the thread that plays the window, which waits for the request and answers it.
+    fn raised(
+        scratch: &Scratch,
+        requests: &OpenRequests,
+        sink: &RecordingSink,
+        accepted: bool,
+    ) -> Option<glib::ExitCode> {
+        let dir = scratch.dir.clone();
+        let launch = Launch {
+            raise: true,
+            ..scratch.launch(&[])
+        };
+        let client = std::thread::spawn(move || raise_in(&dir, &launch, false, BackendKind::Sidecar, Some("token")));
+        wait_until("a wake", || wakes_waiting(requests.server.wake_fd()) > 0);
+        requests.on_wake();
+        let (id, token) = raises(sink).pop().expect("the raise was posted");
+        assert_eq!(token.as_deref(), Some("token"));
+        requests.answer(id, accepted);
+        client.join().unwrap()
+    }
+
+    #[test]
+    fn a_raise_the_window_took_ends_with_success() {
+        let scratch = Scratch::new();
+        let sink = Rc::new(RecordingSink::default());
+        let requests = scratch.requests(&sink);
+        assert_eq!(raised(&scratch, &requests, &sink, true), Some(glib::ExitCode::SUCCESS));
+        assert!(opens(&sink).is_empty(), "a raise opens nothing");
+        assert!(requests.waiting.borrow().is_empty(), "an answered id is forgotten");
+    }
+
+    #[test]
+    fn a_raise_the_window_turned_down_goes_on_to_its_own_window() {
+        let scratch = Scratch::new();
+        let sink = Rc::new(RecordingSink::default());
+        let requests = scratch.requests(&sink);
+        assert_eq!(raised(&scratch, &requests, &sink, false), None);
+    }
+
+    #[test]
+    fn with_no_window_a_raise_goes_on_to_its_own() {
+        let scratch = Scratch::new();
+        let launch = Launch {
+            raise: true,
+            ..scratch.launch(&[])
+        };
+        assert_eq!(raise_in(&scratch.dir, &launch, false, BackendKind::Sidecar, None), None);
+    }
+
+    #[test]
+    fn only_a_plain_raise_with_no_file_asks_a_window() {
+        let scratch = Scratch::new();
+        let sink = Rc::new(RecordingSink::default());
+        let requests = scratch.requests(&sink);
+        let file = scratch.file("a");
+        let plain = Launch {
+            raise: true,
+            ..scratch.launch(&[])
+        };
+        let cases = [
+            (scratch.launch(&[]), false, BackendKind::Sidecar),
+            (
+                Launch {
+                    raise: true,
+                    ..scratch.launch(&[&file])
+                },
+                false,
+                BackendKind::Sidecar,
+            ),
+            (
+                Launch {
+                    new_window: true,
+                    ..plain.clone()
+                },
+                false,
+                BackendKind::Sidecar,
+            ),
+            (plain.clone(), true, BackendKind::Sidecar),
+            (plain, false, BackendKind::Legacy),
+        ];
+        for (launch, clean, backend) in cases {
+            assert_eq!(raise_in(&scratch.dir, &launch, clean, backend, None), None);
         }
         assert_eq!(wakes_waiting(requests.server.wake_fd()), 0, "none of them asked");
     }

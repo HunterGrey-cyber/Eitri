@@ -84,6 +84,14 @@ impl QuitFlow {
         self.in_flight.is_some()
     }
 
+    /// A window close is in flight that nvim cannot answer: it is gone or being ended, so no prompt of its can hold the
+    /// close, and its exit carries the close out.
+    pub fn ends_the_window(&self) -> bool {
+        self.in_flight
+            .as_ref()
+            .is_some_and(|asked| matches!(asked.quit, EditorQuit::Window { .. }) && (!asked.sent || asked.killed))
+    }
+
     /// Reveals and focuses the editor before sending an RPC quit, so its prompt can be answered.
     /// An unanswered older request is joined rather than nesting another confirmation dialog.
     pub fn ask(&mut self, world: &mut dyn QuitWorld, quit: EditorQuit, now: Instant) -> Result<AskedNvim, String> {
@@ -107,6 +115,9 @@ impl QuitFlow {
             QuitRequest::Ask => {}
             QuitRequest::Kill => {
                 self.join(quit);
+                if let Some(asked) = self.in_flight.as_mut() {
+                    asked.killed = true;
+                }
                 println!("[modules] editor: nvim has not answered since it was asked to quit; ending it");
                 world.end_nvim();
                 return Ok(AskedNvim::Ending);
@@ -129,6 +140,7 @@ impl QuitFlow {
             quit,
             revealed: reveal.rehide,
             sent: true,
+            killed: false,
             lent_by: None,
         });
         world.send_quit(kill_rules::editor_quit_lua(g), g);
@@ -194,6 +206,7 @@ impl QuitFlow {
             },
             revealed: older.as_ref().is_some_and(|o| o.revealed) || rehide,
             sent: false,
+            killed: false,
             lent_by,
         });
     }

@@ -42,8 +42,8 @@ const PROJECT_DIR_ENV: &str = "EITRI_PROJECT_DIR";
 /// it in every build lets that path report `LEGACY_NOT_IN_BUILD`, rather than an unrecognized
 /// option or a silently opened cwd.
 ///
-/// `--new-window` is read by [`resolve_launch_in`]; the directory-only resolvers step over it.
-const KNOWN_FLAGS: [&str; 4] = ["--clean", "--version", "--legacy", "--new-window"];
+/// `--new-window` and `--raise` are read by [`resolve_launch_in`]; the directory-only resolvers step over them.
+const KNOWN_FLAGS: [&str; 5] = ["--clean", "--version", "--legacy", "--new-window", "--raise"];
 
 /// The conventional end-of-flags separator. What follows it is read verbatim, so a path whose name
 /// really does begin with `-` is reachable.
@@ -361,6 +361,8 @@ pub struct Launch {
     pub open: Vec<OpenTarget>,
     /// `--new-window` before `--`.
     pub new_window: bool,
+    /// `--raise` before `--`: a window of this root, if one runs, is asked to come forward.
+    pub raise: bool,
     /// Sentences for stderr, without the `eitri: ` the caller puts in front: what was named and is not honoured in
     /// full.
     pub notes: Vec<String>,
@@ -369,6 +371,14 @@ pub struct Launch {
 /// How many repositories the search for a usable top looks at. A file under more unusable
 /// repositories than this roots at its folder.
 const GIT_TOP_ROUNDS: usize = 4;
+
+impl Launch {
+    /// Whether this launch is a request to a running window to come forward. `--new-window` says it wants a window of
+    /// its own, and a file goes the way every file goes, by a hand-over.
+    pub fn asks_for_a_raise(&self) -> bool {
+        self.raise && self.open.is_empty() && !self.new_window
+    }
+}
 
 /// [`resolve_launch_in`] from this process's arguments, environment, working directory and account.
 pub fn resolve_launch() -> Result<Launch, String> {
@@ -391,6 +401,9 @@ pub fn resolve_launch() -> Result<Launch, String> {
 /// usable or not, as `eitri DIR` always was, and every further path must be a file; a file starts
 /// file mode, the root comes from [`root_for_file`], and again every path must be a file. A name that
 /// does not exist yet is a file, when its parent does.
+///
+/// `--raise` takes exactly one path, after `--`, and that path must exist: it names a project someone
+/// picked, and a folder gone since then must not become a new buffer in a window rooted at its parent.
 pub fn resolve_launch_in(
     args: &[OsString],
     env: Option<OsString>,
@@ -399,6 +412,9 @@ pub fn resolve_launch_in(
     who: &Identity,
 ) -> Result<Launch, String> {
     let parsed = parse_launch_args(args)?;
+    if parsed.raise && !parsed.is_one_verbatim_path() {
+        return Err(String::from("--raise takes exactly one path after --"));
+    }
     if parsed.paths.is_empty() {
         if let Some(spec) = parsed.line_spec {
             return Err(needs_a_file(&spec.token));
@@ -408,6 +424,7 @@ pub fn resolve_launch_in(
             wider_roots: Vec::new(),
             open: Vec::new(),
             new_window: parsed.new_window,
+            raise: parsed.raise,
             notes: Vec::new(),
         });
     }
@@ -416,7 +433,7 @@ pub fn resolve_launch_in(
     let mut directory = None;
     let mut open = Vec::new();
     for (index, path) in parsed.paths.iter().enumerate() {
-        match classify(path, &cwd)? {
+        match classify(path, &cwd, parsed.raise)? {
             Named::File(target) => open.push(target),
             Named::Directory(found) if index == 0 => directory = Some(found),
             Named::Directory(_) => {
@@ -469,6 +486,7 @@ pub fn resolve_launch_in(
         wider_roots,
         open,
         new_window: parsed.new_window,
+        raise: parsed.raise,
         notes,
     })
 }
@@ -502,8 +520,16 @@ struct PathArg {
 
 struct ParsedLaunch {
     new_window: bool,
+    raise: bool,
     line_spec: Option<LineSpec>,
     paths: Vec<PathArg>,
+}
+
+impl ParsedLaunch {
+    /// One path after `--` and nothing that places a cursor, all a `--raise` may carry.
+    fn is_one_verbatim_path(&self) -> bool {
+        self.line_spec.is_none() && matches!(self.paths.as_slice(), [only] if only.verbatim)
+    }
 }
 
 /// The tokens, read with no filesystem call. Before `--` a `-...` token is a flag or an error wherever
@@ -512,6 +538,7 @@ struct ParsedLaunch {
 fn parse_launch_args(args: &[OsString]) -> Result<ParsedLaunch, String> {
     let mut parsed = ParsedLaunch {
         new_window: false,
+        raise: false,
         line_spec: None,
         paths: Vec::new(),
     };
@@ -524,6 +551,7 @@ fn parse_launch_args(args: &[OsString]) -> Result<ParsedLaunch, String> {
             Some(b'-') => {
                 check_flag(arg)?;
                 parsed.new_window |= arg == OsStr::new("--new-window");
+                parsed.raise |= arg == OsStr::new("--raise");
             }
             Some(b'+') => match line_of_spec(arg.as_bytes()) {
                 Some(line) if parsed.paths.is_empty() => {
@@ -593,8 +621,9 @@ fn anchored(name: &OsStr, cwd: &Result<PathBuf, String>) -> Result<PathBuf, Stri
 }
 
 /// Reads one path: stats it, follows it, and refuses what nvim cannot open. Nothing is opened, so a
-/// FIFO is refused without blocking on it.
-fn classify(arg: &PathArg, cwd: &Result<PathBuf, String>) -> Result<Named, String> {
+/// FIFO is refused without blocking on it. With `existing_only` a missing name is refused where it was
+/// found to be missing, so nothing stands between that look and what is done with it.
+fn classify(arg: &PathArg, cwd: &Result<PathBuf, String>, existing_only: bool) -> Result<Named, String> {
     // Joined to a cwd, an empty name would be the cwd.
     if arg.name.is_empty() {
         return Err(String::from("cannot open an empty path"));
@@ -617,7 +646,12 @@ fn classify(arg: &PathArg, cwd: &Result<PathBuf, String>) -> Result<Named, Strin
             }
             canonical
         }
-        Err(e) if e.kind() == io::ErrorKind::NotFound => new_file_path(&name, &path)?,
+        Err(e) if e.kind() == io::ErrorKind::NotFound => {
+            if existing_only {
+                return Err(format!("{name:?} is not there"));
+            }
+            new_file_path(&name, &path)?
+        }
         Err(e) => return Err(format!("cannot open {name:?}: {e}")),
     };
     if resolved.to_str().is_none() {
@@ -1853,6 +1887,105 @@ mod tests {
         assert!(!at(&home, &["a.rs", "--", "--new-window"], &home).unwrap().new_window);
         // The directory-only resolver steps over it the same way.
         assert_eq!(select(["--new-window", "/x"], None), Ok(argument("/x")));
+    }
+
+    #[test]
+    fn raise_is_a_flag_before_dashes_and_a_path_after() {
+        let (_s, home) = scratch_home("rl-raise");
+        let project = dir(home.join("project"));
+        let launch = at(&home, &["--raise", "--", text(&project)], &home).unwrap();
+        assert!(launch.raise && launch.asks_for_a_raise());
+        assert_eq!((launch.root, launch.open), (project.clone(), vec![]));
+        assert!(!at(&home, &[text(&project)], &home).unwrap().raise);
+        // After `--` it is a name like any other, and the launch a plain one.
+        let named = dir(home.join("--raise"));
+        let launch = at(&home, &["--", "--raise"], &home).unwrap();
+        assert_eq!((launch.root, launch.raise), (named, false));
+    }
+
+    #[test]
+    fn new_window_beats_raise() {
+        let (_s, home) = scratch_home("rl-raise-new");
+        let project = dir(home.join("project"));
+        for flags in [["--new-window", "--raise"], ["--raise", "--new-window"]] {
+            let args = [flags[0], flags[1], "--", text(&project)];
+            let launch = at(&home, &args, &home).unwrap();
+            assert!(launch.new_window, "{args:?}");
+            assert!(!launch.asks_for_a_raise(), "{args:?}");
+        }
+    }
+
+    #[test]
+    fn raise_takes_exactly_one_path() {
+        let (_s, home) = scratch_home("rl-raise-one");
+        let one = dir(home.join("one"));
+        let two = dir(home.join("two"));
+        let a = file(one.join("a.rs"));
+        let only_one = Err("--raise takes exactly one path after --".to_string());
+        assert_eq!(at(&home, &["--raise"], &home), only_one);
+        assert_eq!(at(&home, &["--raise", "--"], &home), only_one);
+        assert_eq!(at(&home, &["--raise", "--", text(&one), text(&two)], &home), only_one);
+        assert_eq!(at(&home, &["--raise", "--", text(&a), text(&a)], &home), only_one);
+        // Before `--` a name could read as a line or a `name:LINE`, and only Eitri itself writes this command.
+        assert_eq!(at(&home, &["--raise", text(&one)], &home), only_one);
+        assert_eq!(at(&home, &["+5", "--raise", "--", text(&a)], &home), only_one);
+        // The variable names no window to raise.
+        let launch = resolve_launch_in(
+            &os(&["--raise"]),
+            Some(one.clone().into_os_string()),
+            Ok(home.clone()),
+            Some(&home),
+            &me(),
+        );
+        assert_eq!(launch, only_one);
+    }
+
+    #[test]
+    fn raise_on_a_missing_name_with_a_living_parent_is_refused_in_the_not_found_branch() {
+        let (_s, home) = scratch_home("rl-raise-gone");
+        let parent = dir(home.join("parent"));
+        let gone = parent.join("gone");
+        let refused = format!("{:?} is not there", gone.as_os_str());
+        assert_eq!(at(&home, &["--raise", "--", text(&gone)], &home), Err(refused));
+        assert!(!gone.exists(), "resolving creates nothing");
+        // The one that would otherwise be a new buffer in a window rooted at the parent.
+        assert_eq!(at(&home, &[text(&gone)], &home).unwrap().root, parent);
+        // A name `new_file_path` has an answer of its own for never gets that far.
+        let slashed = format!("{}/", text(&gone));
+        let err = at(&home, &["--raise", "--", &slashed], &home).expect_err("still missing");
+        assert!(err.contains("is not there"), "got {err}");
+        // Taken whole, so a `name:LINE` that a plain launch would split is a missing name too.
+        let a = file(parent.join("a.rs"));
+        let with_line = format!("{}:5", text(&a));
+        let err = at(&home, &["--raise", "--", &with_line], &home).expect_err("no such name");
+        assert!(err.contains("is not there"), "got {err}");
+        // A link to nothing has no canonical path, under this flag as under any.
+        symlink(home.join("nowhere"), parent.join("link")).unwrap();
+        let link = parent.join("link");
+        assert!(at(&home, &["--raise", "--", text(&link)], &home).is_err());
+    }
+
+    #[test]
+    fn raise_on_a_file_keeps_the_root_rule() {
+        let (_s, home) = scratch_home("rl-raise-file");
+        let repo = dir(home.join("repo"));
+        fake_repo(&repo);
+        let lib = file(repo.join("src/lib.rs"));
+        let launch = at(&home, &["--raise", "--", text(&lib)], &home).unwrap();
+        assert_eq!(launch.root, repo);
+        assert_eq!(launch.open, [plain(lib)]);
+        assert!(launch.raise);
+        assert!(!launch.asks_for_a_raise(), "a file is handed over");
+    }
+
+    #[test]
+    fn the_directory_only_resolvers_step_over_raise() {
+        let real = std::env::temp_dir().canonicalize().expect("temp_dir exists");
+        assert_eq!(select(["--raise", "/x"], None), Ok(argument("/x")));
+        assert_eq!(select(["--raise"], None), Ok(RootSource::Cwd));
+        assert_eq!(select(["--", "--raise"], None), Ok(argument("--raise")));
+        let args = [OsString::from("--raise"), real.clone().into_os_string()];
+        assert_eq!(resolve_in(&args, None, Ok(PathBuf::from("/nowhere"))), Ok(real));
     }
 
     #[test]

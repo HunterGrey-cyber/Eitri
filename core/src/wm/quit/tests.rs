@@ -241,6 +241,56 @@ fn flow(fake: &Rc<Fake>) -> Flow {
 
 const RUNNING: &str = "close window? 1 running (y/n)";
 
+/// The watch of a request nvim has been silent on for as long as a second request waits.
+fn silent_watch() -> Option<NvimAnswer> {
+    Some(NvimAnswer {
+        sent_at: Instant::now() - super::super::close::NVIM_QUIT_PATIENCE,
+        done: false,
+        returned: false,
+        last: None,
+    })
+}
+
+#[test]
+fn a_close_ends_the_window_only_once_nvim_cannot_answer_it() {
+    // Sent: nvim may yet ask, and be told no.
+    let fake = Fake::new();
+    let quitting = flow(&fake);
+    quitting.window_close();
+    assert!(!quitting.flow.borrow().ends_the_window());
+    // Silent, and closed again: nvim is being ended.
+    *fake.watch.borrow_mut() = silent_watch();
+    quitting.window_close();
+    assert!(fake.log().contains(&"end_nvim".to_string()));
+    assert!(quitting.flow.borrow().ends_the_window());
+
+    // Out of reach: the close is unsent from the start.
+    let fake = Fake::new();
+    let quitting = flow(&fake);
+    fake.running.set(false);
+    fake.pending.set(true);
+    quitting.window_close();
+    assert!(quitting.flow.borrow().ends_the_window());
+}
+
+#[test]
+fn ending_the_editor_alone_never_ends_the_window() {
+    let fake = Fake::new();
+    let quitting = flow(&fake);
+    assert_eq!(quitting.kill_editor(KillScope::Module, None), Ok(()));
+    *fake.watch.borrow_mut() = silent_watch();
+    assert_eq!(quitting.kill_editor(KillScope::Module, None), Ok(()));
+    assert!(fake.log().contains(&"end_nvim".to_string()));
+    assert!(!quitting.flow.borrow().ends_the_window());
+
+    let fake = Fake::new();
+    let quitting = flow(&fake);
+    fake.running.set(false);
+    fake.pending.set(true);
+    assert_eq!(quitting.kill_editor(KillScope::Module, None), Ok(()));
+    assert!(!quitting.flow.borrow().ends_the_window());
+}
+
 /// A confirmed close must transfer its confirmation to nvim rather than leave it on the window.
 #[test]
 fn a_window_close_asks_nvim_and_takes_its_y_back() {

@@ -1,5 +1,5 @@
 //! The per-root open socket: how `eitri FILE` hands a file to a window that already holds that root,
-//! instead of starting another window.
+//! instead of starting another window, and how a launch asks that window to come forward ([`raise`]).
 //!
 //! A window that owns its editor binds `open-<16 hex project key>.sock` in the control directory. A
 //! client connects for each file and waits for `ready`, which the thread says when it turns to that
@@ -14,8 +14,10 @@
 //!   client checks the server the same way before it writes a path.
 //! - A request has one shape, one line of at most 4096 bytes within one second, and any other key is
 //!   refused. It carries no text that is executed.
-//! - The path must name a regular file inside the root, or a free name in a directory inside it, after
-//!   every link is resolved. What goes on is the canonical path.
+//! - An open's path must name a regular file inside the root, or a free name in a directory inside it,
+//!   after every link is resolved. What goes on is the canonical path.
+//! - A raise's path must be the root itself, spelt as this window spells it. Nothing on disk is looked
+//!   at for one, and it changes nothing in the window: it asks for less than an open.
 //! - Everything up to the hand-over happens on a thread of its own, parked in `poll(2)`, so a client
 //!   never holds the GTK thread and an idle window takes no wakeups from this.
 //!
@@ -72,10 +74,14 @@ pub const CLIENT_DEADLINE: Duration = Duration::from_millis(4500);
 
 /// What the thread says when it turns to a connection, before anything else is read or written.
 const READY: &str = "ready";
-/// The one protocol version. A new capability is a new version, never an extra key.
-const PROTOCOL: u64 = 1;
-/// The one operation.
+/// The protocol versions, one operation to each. A new capability is a new version, never an extra key, so a window
+/// older than a request refuses it by number, and `eitri FILE` still speaks the version such a window knows.
+const PROTOCOL_OPEN: u64 = 1;
+const PROTOCOL_RAISE: u64 = 2;
+/// The operation of [`PROTOCOL_OPEN`].
 const OP_OPEN: &str = "open";
+/// The operation of [`PROTOCOL_RAISE`].
+const OP_RAISE: &str = "raise";
 /// The longest activation token, in bytes.
 const MAX_TOKEN: usize = 512;
 /// How long a claim waits for another claimant's reclaim. With two [`RECHECK_AFTER`] pauses, one for
@@ -127,6 +133,17 @@ pub struct Open {
     pub token: Option<String>,
 }
 
+/// What a client asks of the window, validated on the listener thread.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Request {
+    Open(Open),
+    /// Come forward, and nothing else: no file, no editor, no module changes.
+    Raise {
+        /// The launcher's activation token, opaque.
+        token: Option<String>,
+    },
+}
+
 /// What the window says to a request it took.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Answer {
@@ -137,7 +154,7 @@ pub enum Answer {
 /// One validated request, handed over at most once; dropping it unanswered answers `busy`.
 #[derive(Debug)]
 pub struct Incoming {
-    open: Open,
+    request: Request,
     /// [`WAITING`] until the first of the GTK side and the thread moves it on.
     owner: Arc<AtomicU8>,
     answer: Sender<Answer>,
@@ -148,14 +165,14 @@ pub struct Incoming {
 impl Incoming {
     /// The request and the way to answer it, or `None` when the thread already gave up on it or its
     /// client has left, which may mean a new window already holds the file. Never blocks.
-    pub fn take(self) -> Option<(Open, Answering)> {
+    pub fn take(self) -> Option<(Request, Answering)> {
         if client_left(&self.client) {
             return None;
         }
         self.owner
             .compare_exchange(WAITING, TAKEN, Ordering::AcqRel, Ordering::Acquire)
             .ok()?;
-        Some((self.open, Answering { answer: self.answer }))
+        Some((self.request, Answering { answer: self.answer }))
     }
 }
 
@@ -206,11 +223,17 @@ struct Wire {
 /// The request one line says, or the reason it is refused (without the `refused: ` prefix).
 fn parse(line: &[u8]) -> Result<Wire, String> {
     let wire: Wire = serde_json::from_slice(line).map_err(|_| "malformed request".to_owned())?;
-    if wire.v != PROTOCOL {
+    if !matches!(wire.v, PROTOCOL_OPEN | PROTOCOL_RAISE) {
         return Err(format!("unsupported protocol version {}", wire.v));
     }
-    if wire.op != OP_OPEN {
-        return Err("unsupported op".to_owned());
+    match (wire.v, wire.op.as_str()) {
+        (PROTOCOL_OPEN, OP_OPEN) => {}
+        // A window has no position to go to.
+        (PROTOCOL_RAISE, OP_RAISE) if wire.line.is_some() || wire.col.is_some() => {
+            return Err("malformed request".to_owned());
+        }
+        (PROTOCOL_RAISE, OP_RAISE) => {}
+        _ => return Err("unsupported op".to_owned()),
     }
     if wire.token.as_ref().is_some_and(|token| token.len() > MAX_TOKEN) {
         return Err("token too long".to_owned());
@@ -368,10 +391,10 @@ impl Serving {
             Err(LineFail::Empty | LineFail::Io) => return,
         };
         match self.judge(&line) {
-            Ok(open) => {
+            Ok(request) => {
                 // A client killed or interrupted since it sent this is no longer asking.
                 if !client_left(&stream) {
-                    let reply = self.hand_over(open, &stream);
+                    let reply = self.hand_over(request, &stream);
                     let _ = reply_line(&stream, reply);
                 }
             }
@@ -381,18 +404,24 @@ impl Serving {
         }
     }
 
-    fn judge(&self, line: &[u8]) -> Result<Open, String> {
+    fn judge(&self, line: &[u8]) -> Result<Request, String> {
         let wire = parse(line)?;
-        Ok(Open {
+        if wire.op == OP_RAISE {
+            if Path::new(&wire.path) != self.root {
+                return Err("the path is not this window's root".to_owned());
+            }
+            return Ok(Request::Raise { token: wire.token });
+        }
+        Ok(Request::Open(Open {
             path: validated_path(Path::new(&wire.path), &self.root)?,
             line: wire.line,
             col: wire.col,
             token: wire.token,
-        })
+        }))
     }
 
-    /// Gives `open` to the GTK side and returns the reply that settles it.
-    fn hand_over(&self, open: Open, stream: &UnixStream) -> &'static str {
+    /// Gives `request` to the GTK side and returns the reply that settles it.
+    fn hand_over(&self, request: Request, stream: &UnixStream) -> &'static str {
         // A request the GTK side could not check for a hangup might open after its client left.
         let Ok(client) = stream.try_clone() else {
             return "busy";
@@ -400,7 +429,7 @@ impl Serving {
         let owner = Arc::new(AtomicU8::new(WAITING));
         let (answer, answers) = mpsc::channel();
         let incoming = Incoming {
-            open,
+            request,
             owner: Arc::clone(&owner),
             answer,
             client,
@@ -426,7 +455,7 @@ impl Serving {
         match settled {
             Ok(Answer::Accepted) => "ok",
             // No answer: the controller has the request and it will run, so `busy` could open the
-            // file twice.
+            // file twice, or start a second window of this root beside the one that comes forward.
             Err(RecvTimeoutError::Timeout) => "ok",
             // Dropped unanswered: the window is going.
             Ok(Answer::Busy) | Err(RecvTimeoutError::Disconnected) => "busy",
@@ -734,7 +763,7 @@ fn send(sock: &Path, target: &OpenTarget, token: Option<&str>, me: u32, within: 
         .to_str()
         .ok_or_else(|| format!("{} is not valid UTF-8", target.path.display()))?;
     let wire = Wire {
-        v: PROTOCOL,
+        v: PROTOCOL_OPEN,
         op: OP_OPEN.to_owned(),
         path: path.to_owned(),
         line: target.line,
@@ -810,6 +839,48 @@ fn deliver_with(
         };
     }
     Delivered::NotHere
+}
+
+/// What became of a raise.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Raised {
+    /// The window of the root took it and is coming forward.
+    Done,
+    /// No window of that root will: none runs, it is ending, it is of a build that has no raise, or it did not answer
+    /// in time. The launch becomes that window.
+    NotHere,
+}
+
+/// Asks the window of `root` to come forward. `root` must be canonical, as for [`OpenServer::claim`]. Only the root's
+/// own socket is asked: a window that found it taken is not looked up by root, for a raise as for a file.
+pub fn raise(root: &Path, dir: &Path, token: Option<&str>) -> Raised {
+    raise_with(root, dir, token, euid(), CLIENT_DEADLINE)
+}
+
+fn raise_with(root: &Path, dir: &Path, token: Option<&str>, me: u32, within: Duration) -> Raised {
+    match ask_to_raise(root, dir, token, me, within).as_deref() {
+        Ok("ok") => Raised::Done,
+        _ => Raised::NotHere,
+    }
+}
+
+/// The reply of the window of `root` to a raise. A root that is not text cannot be named on the wire.
+fn ask_to_raise(root: &Path, dir: &Path, token: Option<&str>, me: u32, within: Duration) -> Result<String, String> {
+    let sock = socket_path(dir, root).map_err(|e| e.to_string())?;
+    validate_nvim_addr(&sock, me)?;
+    let path = root
+        .to_str()
+        .ok_or_else(|| format!("{} is not valid UTF-8", root.display()))?;
+    let wire = Wire {
+        v: PROTOCOL_RAISE,
+        op: OP_RAISE.to_owned(),
+        path: path.to_owned(),
+        line: None,
+        col: None,
+        token: token.map(str::to_owned),
+    };
+    let line = serde_json::to_string(&wire).map_err(|e| e.to_string())?;
+    exchange(&sock, &format!("{line}\n"), me, within)
 }
 
 #[cfg(test)]
@@ -947,13 +1018,21 @@ mod tests {
         waiting.remove(0)
     }
 
+    /// The file a request names; a test that reads one has sent an open.
+    fn file_of(request: Request) -> Open {
+        match request {
+            Request::Open(open) => open,
+            Request::Raise { .. } => panic!("a raise where an open was sent"),
+        }
+    }
+
     /// `line` through a fresh server, accepted: what the window got and what the client read.
     fn handed_over(fixture: &Fixture, line: String) -> (Open, String) {
         let server = fixture.server();
         let client = ask_later(server.socket(), line);
-        let (open, answering) = next_request(&server).take().expect("nobody gave up on it");
+        let (request, answering) = next_request(&server).take().expect("nobody gave up on it");
         answering.answer(Answer::Accepted);
-        (open, client.join().unwrap())
+        (file_of(request), client.join().unwrap())
     }
 
     /// The reply to `line`, which must not reach the window.
@@ -1183,8 +1262,8 @@ mod tests {
             assert_eq!(refusal(&server, &line), "refused: malformed request", "{line}");
         }
         assert_eq!(
-            refusal(&server, &json!({ "v": 2, "op": "open", "path": file }).to_string()),
-            "refused: unsupported protocol version 2"
+            refusal(&server, &json!({ "v": 3, "op": "open", "path": file }).to_string()),
+            "refused: unsupported protocol version 3"
         );
         assert_eq!(
             refusal(&server, &json!({ "v": 1, "op": "close", "path": file }).to_string()),
@@ -1343,8 +1422,12 @@ mod tests {
         let (_, answering) = first.take().unwrap();
         answering.answer(Answer::Accepted);
         assert_eq!(client.join().unwrap(), "ok");
-        let (open, answering) = next_request(&server).take().unwrap();
-        assert_eq!(open.path, last, "the request of the client that left is skipped");
+        let (request, answering) = next_request(&server).take().unwrap();
+        assert_eq!(
+            file_of(request).path,
+            last,
+            "the request of the client that left is skipped"
+        );
         answering.answer(Answer::Accepted);
         assert_eq!(waiting.join().unwrap(), "ok");
     }
@@ -1591,7 +1674,10 @@ mod tests {
     /// What a drain on the GTK side would open.
     fn taken(server: &OpenServer) -> Vec<PathBuf> {
         let incoming = server.drain().into_iter();
-        incoming.filter_map(Incoming::take).map(|(open, _)| open.path).collect()
+        incoming
+            .filter_map(Incoming::take)
+            .map(|(request, _)| file_of(request).path)
+            .collect()
     }
 
     #[test]
@@ -1699,9 +1785,9 @@ mod tests {
             let wider = [wider.clone()];
             std::thread::spawn(move || deliver(&open, &root, &wider, &dir, None, None))
         };
-        let (open, answering) = next_request(&server).take().unwrap();
+        let (request, answering) = next_request(&server).take().unwrap();
         answering.answer(Answer::Accepted);
-        assert_eq!(open.path, file);
+        assert_eq!(file_of(request).path, file);
         assert_eq!(client.join().unwrap(), Delivered::Opened { root: Some(wider) });
     }
 
@@ -1907,9 +1993,9 @@ mod tests {
         let client = std::thread::spawn(move || deliver(&open, &root, &[], &dir, None, Some("token")));
         let mut seen = Vec::new();
         for _ in 0..3 {
-            let (open, answering) = next_request(&server).take().unwrap();
+            let (request, answering) = next_request(&server).take().unwrap();
             answering.answer(Answer::Accepted);
-            seen.push(open);
+            seen.push(file_of(request));
         }
         assert_eq!(client.join().unwrap(), fixture.opened());
         let token = Some("token".to_owned());
@@ -1945,8 +2031,8 @@ mod tests {
         let (_, answering) = next_request(&server).take().unwrap();
         answering.answer(Answer::Busy);
         // One failure does not stop the rest: the window may be free again.
-        let (open, answering) = next_request(&server).take().unwrap();
-        assert_eq!(open.path, a);
+        let (request, answering) = next_request(&server).take().unwrap();
+        assert_eq!(file_of(request).path, a);
         answering.answer(Answer::Accepted);
         assert_eq!(
             client.join().unwrap(),
@@ -1972,6 +2058,268 @@ mod tests {
             0,
             "nothing connected to the root's socket"
         );
+    }
+
+    /// A window's end of the protocol, as a window of some other build speaks it: says `greeting`, reads one line,
+    /// says `reply`. The thread returns the line.
+    fn stub_window(fixture: &Fixture, greeting: &'static str, reply: &'static str) -> JoinHandle<String> {
+        let listener = UnixListener::bind(fixture.root_socket()).unwrap();
+        listener.set_nonblocking(true).unwrap();
+        std::thread::spawn(move || {
+            let give_up = Instant::now() + PATIENCE;
+            let stream = loop {
+                match listener.accept() {
+                    Ok((stream, _)) => break stream,
+                    Err(e) if e.kind() == io::ErrorKind::WouldBlock && Instant::now() < give_up => {
+                        std::thread::sleep(Duration::from_millis(5));
+                    }
+                    Err(e) => return format!("no client came: {e}"),
+                }
+            };
+            stream.set_nonblocking(false).unwrap();
+            stream.set_read_timeout(Some(PATIENCE)).unwrap();
+            reply_line(&stream, greeting).unwrap();
+            let line = read_reply(&stream);
+            // A client that did not like the greeting has gone.
+            let _ = reply_line(&stream, reply);
+            line
+        })
+    }
+
+    fn raise_line(path: &Path) -> String {
+        json!({ "v": 2, "op": "raise", "path": path }).to_string()
+    }
+
+    fn raise_later(fixture: &Fixture, token: Option<&'static str>) -> JoinHandle<Raised> {
+        let (root, dir) = (fixture.root.clone(), fixture.dir.clone());
+        std::thread::spawn(move || raise(&root, &dir, token))
+    }
+
+    #[test]
+    fn version_2_raise_is_taken_and_answered() {
+        let fixture = fixture();
+        let server = fixture.server();
+        let client = raise_later(&fixture, Some("token"));
+        let (request, answering) = next_request(&server).take().expect("nobody gave up on it");
+        assert_eq!(
+            request,
+            Request::Raise {
+                token: Some("token".to_owned())
+            }
+        );
+        answering.answer(Answer::Accepted);
+        assert_eq!(client.join().unwrap(), Raised::Done);
+
+        // With no token, and as the wire has it.
+        let client = ask_later(server.socket(), raise_line(&fixture.root));
+        let (request, answering) = next_request(&server).take().unwrap();
+        assert_eq!(request, Request::Raise { token: None });
+        answering.answer(Answer::Accepted);
+        assert_eq!(client.join().unwrap(), "ok");
+    }
+
+    #[test]
+    fn a_version_1_open_is_still_served() {
+        let fixture = fixture();
+        let file = fixture.file("a.rs");
+        let (open, reply) = handed_over(&fixture, request(&file));
+        assert_eq!((open.path, reply.as_str()), (file.clone(), "ok"));
+
+        // And it is what a client still sends, so a window of an older build takes the file.
+        let window = stub_window(&fixture, READY, "ok");
+        let delivered = deliver(&[target(file)], &fixture.root, &[], &fixture.dir, None, None);
+        assert_eq!(delivered, fixture.opened());
+        let heard: serde_json::Value = serde_json::from_str(&window.join().unwrap()).unwrap();
+        assert_eq!((&heard["v"], &heard["op"]), (&json!(1), &json!("open")));
+    }
+
+    #[test]
+    fn each_version_has_its_one_operation() {
+        let fixture = fixture();
+        let file = fixture.file("a.rs");
+        let server = fixture.server();
+        for line in [
+            json!({ "v": 2, "op": "open", "path": file }),
+            json!({ "v": 1, "op": "raise", "path": fixture.root }),
+        ] {
+            assert_eq!(refusal(&server, &line.to_string()), "refused: unsupported op", "{line}");
+        }
+        assert_eq!(
+            refusal(
+                &server,
+                &json!({ "v": 3, "op": "raise", "path": fixture.root }).to_string()
+            ),
+            "refused: unsupported protocol version 3"
+        );
+    }
+
+    #[test]
+    fn a_raise_carries_no_position() {
+        let fixture = fixture();
+        let server = fixture.server();
+        for line in [
+            json!({ "v": 2, "op": "raise", "path": fixture.root, "line": 1 }),
+            json!({ "v": 2, "op": "raise", "path": fixture.root, "col": 1 }),
+            json!({ "v": 2, "op": "raise", "path": fixture.root, "run": "!sh" }),
+        ] {
+            assert_eq!(
+                refusal(&server, &line.to_string()),
+                "refused: malformed request",
+                "{line}"
+            );
+        }
+    }
+
+    #[test]
+    fn raise_of_another_root_is_refused() {
+        let fixture = fixture();
+        let server = fixture.server();
+        let below = fixture.below("sub");
+        let beside = fixture.base.join("root-2");
+        std::fs::create_dir(&beside).unwrap();
+        let spelt_otherwise = fixture.base.join("link");
+        symlink(&fixture.root, &spelt_otherwise).unwrap();
+        let file = fixture.file("a.rs");
+        for path in [below, beside, spelt_otherwise, file, PathBuf::from("root")] {
+            assert_eq!(
+                refusal(&server, &raise_line(&path)),
+                "refused: the path is not this window's root",
+                "{}",
+                path.display()
+            );
+        }
+    }
+
+    #[test]
+    fn a_raise_is_busy_when_the_window_ends() {
+        let fixture = fixture();
+        let server = fixture.server();
+
+        let client = raise_later(&fixture, None);
+        let (_, answering) = next_request(&server).take().unwrap();
+        answering.answer(Answer::Busy);
+        assert_eq!(client.join().unwrap(), Raised::NotHere);
+
+        let client = raise_later(&fixture, None);
+        drop(next_request(&server).take().unwrap());
+        assert_eq!(
+            client.join().unwrap(),
+            Raised::NotHere,
+            "a window going answers nothing"
+        );
+
+        let client = raise_later(&fixture, None);
+        drop(next_request(&server));
+        assert_eq!(client.join().unwrap(), Raised::NotHere);
+    }
+
+    #[test]
+    fn an_old_shape_server_reads_as_not_here() {
+        let fixture = fixture();
+        let window = stub_window(&fixture, READY, "refused: unsupported protocol version 2");
+        assert_eq!(raise(&fixture.root, &fixture.dir, None), Raised::NotHere);
+        let heard: serde_json::Value = serde_json::from_str(&window.join().unwrap()).unwrap();
+        assert_eq!(heard, json!({ "v": 2, "op": "raise", "path": fixture.root }));
+        std::fs::remove_file(fixture.root_socket()).unwrap();
+
+        // Nor does a server that never said it was ready get a request.
+        let window = stub_window(&fixture, "ok", "ok");
+        assert_eq!(raise(&fixture.root, &fixture.dir, None), Raised::NotHere);
+        assert_eq!(window.join().unwrap(), "", "nothing went to it");
+    }
+
+    #[test]
+    fn with_nothing_listening_a_raise_is_not_here() {
+        let fixture = fixture();
+        assert_eq!(raise(&fixture.root, &fixture.dir, None), Raised::NotHere);
+        // A crashed window's socket.
+        drop(UnixListener::bind(fixture.root_socket()).unwrap());
+        assert_eq!(raise(&fixture.root, &fixture.dir, None), Raised::NotHere);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_root_that_is_not_text_gets_a_window_of_its_own() {
+        use std::ffi::OsStr;
+
+        let fixture = fixture();
+        let root = fixture.base.join(OsStr::from_bytes(b"not-text-\xff"));
+        std::fs::create_dir(&root).unwrap();
+        let server = OpenServer::claim(&fixture.dir, &root).unwrap();
+        assert_eq!(raise(&root, &fixture.dir, None), Raised::NotHere);
+        assert_eq!(server.watch.polls.load(Ordering::SeqCst), 0, "nothing connected");
+    }
+
+    #[test]
+    fn a_token_past_the_cap_is_refused() {
+        let fixture = fixture();
+        let server = fixture.server();
+        let longest = json!({ "v": 2, "op": "raise", "path": fixture.root, "token": "t".repeat(MAX_TOKEN) });
+        let client = ask_later(server.socket(), longest.to_string());
+        let (request, answering) = next_request(&server).take().unwrap();
+        answering.answer(Answer::Accepted);
+        assert_eq!(client.join().unwrap(), "ok");
+        assert!(matches!(request, Request::Raise { token: Some(token) } if token.len() == MAX_TOKEN));
+
+        let over = json!({ "v": 2, "op": "raise", "path": fixture.root, "token": "t".repeat(MAX_TOKEN + 1) });
+        assert_eq!(refusal(&server, &over.to_string()), "refused: token too long");
+        let token = "t".repeat(MAX_TOKEN + 1);
+        assert_eq!(
+            raise(&fixture.root, &fixture.dir, Some(&token)),
+            Raised::NotHere,
+            "the launch gets a window of its own"
+        );
+        assert!(server.drain().is_empty());
+    }
+
+    #[test]
+    fn the_peer_uid_rule_holds_for_raise() {
+        let fixture = fixture();
+        let (requests, waiting) = mpsc::channel();
+        let (wake, _quiet) = UnixStream::pair().unwrap();
+        let serving = Serving {
+            root: fixture.root.clone(),
+            me: euid().wrapping_add(1),
+            waits: Waits::STANDARD,
+            requests,
+            wake,
+            watch: Arc::default(),
+        };
+        let (client, served) = UnixStream::pair().unwrap();
+        (&client)
+            .write_all(format!("{}\n", raise_line(&fixture.root)).as_bytes())
+            .unwrap();
+        serving.serve_one(served);
+        assert_eq!(read_reply(&client), "refused: not your process");
+        assert!(waiting.try_recv().is_err());
+
+        // The client looks at the server the same way, before it writes anything.
+        let server = fixture.server();
+        let other = euid().wrapping_add(1);
+        assert_eq!(
+            raise_with(&fixture.root, &fixture.dir, None, other, CLIENT_DEADLINE),
+            Raised::NotHere
+        );
+        assert_eq!(server.watch.polls.load(Ordering::SeqCst), 0, "nothing connected");
+    }
+
+    /// A look at whether the socket is alive, such as a claim's, is a connection that says nothing.
+    #[test]
+    fn a_probe_connect_that_sends_nothing_leaves_the_server_serving() {
+        let fixture = fixture();
+        let server = fixture.server_with(Waits {
+            read: Duration::from_millis(100),
+            ..Waits::STANDARD
+        });
+        drop(UnixStream::connect(server.socket()).unwrap());
+        // One that stays silent past the read deadline, then the next client.
+        let silent = served(server.socket());
+        assert_eq!(read_reply(&silent), "refused: request timed out");
+        let client = raise_later(&fixture, None);
+        let (request, answering) = next_request(&server).take().unwrap();
+        assert_eq!(request, Request::Raise { token: None });
+        answering.answer(Answer::Accepted);
+        assert_eq!(client.join().unwrap(), Raised::Done);
     }
 
     #[test]

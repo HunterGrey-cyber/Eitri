@@ -492,8 +492,8 @@ pub(crate) trait ServiceSet {
         let _ = op;
         Err(NOT_CARRIED_OUT.into())
     }
-    /// What the window decided about the open request `id`, for its client. A set that holds no open socket has no
-    /// request to answer.
+    /// What the window decided about the open or raise request `id`, for its client. A set that holds no open socket
+    /// has no request to answer.
     fn open_answer(&self, id: u64, accepted: bool) -> Result<(), String> {
         let _ = (id, accepted);
         Err(NOT_CARRIED_OUT.into())

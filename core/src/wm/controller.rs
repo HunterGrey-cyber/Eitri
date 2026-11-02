@@ -1577,9 +1577,9 @@ impl Controller {
 impl Decide for Controller {
     fn handle(&mut self, event: HostEvent) -> Batch {
         let mut batch = Batch::default();
-        // An open with no window to take it is still owed its answer: left unanswered, its client would be told the
+        // A request with no window to take it is still owed its answer: left unanswered, its client would be told the
         // window has it.
-        if let HostEvent::OpenFile { win, id, .. } = &event {
+        if let HostEvent::OpenFile { win, id, .. } | HostEvent::RaiseWindow { win, id, .. } = &event {
             if !self.windows.contains_key(win) {
                 batch.push_effect(HostOp::OpenAnswer {
                     id: *id,
@@ -1784,6 +1784,9 @@ impl Decide for Controller {
             } => self.modules_event(win, &mut batch, |w, cx, batch| {
                 let file = QueuedOpen { path, line, col };
                 module_verbs::open_file(w, cx, win, id, file, token, batch);
+            }),
+            HostEvent::RaiseWindow { win, id, token } => self.modules_event(win, &mut batch, |w, _, batch| {
+                module_verbs::raise_window(w, win, id, token, batch);
             }),
             HostEvent::Chat(ChatEvent::ReviewOpen { win }) => self.modules_event(win, &mut batch, |w, cx, batch| {
                 verbs::chat::review_open(w, cx, win, batch)
