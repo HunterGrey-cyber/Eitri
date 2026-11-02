@@ -1381,6 +1381,11 @@ pub enum EditorEvent {
     Leaving { win: WinId },
     /// A start found `count` project files with unsaved changes in swap files, `newest` the latest.
     Recoverable { win: WinId, count: u32, newest: String },
+    /// The embedded editor reported its reopen progress.
+    Reopen {
+        win: WinId,
+        line: crate::pane_switch::ReopenLine,
+    },
     /// This generation's quit request could not be sent.
     QuitNotSent { win: WinId, generation: u32 },
     /// The editor reported its scale.

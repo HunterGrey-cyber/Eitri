@@ -26,6 +26,7 @@ pub mod editor_feeds;
 pub mod editor_lines;
 pub mod editor_open;
 pub mod editor_record;
+pub mod editor_reopen;
 pub mod editor_rpc;
 pub mod editor_tools;
 pub mod hint;

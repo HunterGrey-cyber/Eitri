@@ -25,6 +25,7 @@
 //! `shell::pane_switch`'s own module doc, because it is about panes and focus, which this crate has
 //! neither of.
 
+use crate::editor_reopen::{EDITOR_REOPEN_CAPTURE_LUA, EDITOR_REOPEN_LUA, REOPEN_CAPTURE_NAME, REOPEN_LUA_NAME};
 use std::collections::VecDeque;
 use std::io::{ErrorKind, Read};
 use std::os::unix::net::{UnixListener, UnixStream};
@@ -128,6 +129,10 @@ pub(crate) const EDITOR_WATCH_LUA: &str = include_str!("editor_watch.lua");
 pub(crate) const WATCH_LOADER_CMD: &str =
     "lua local p = vim.env.EITRI_EDITOR_WATCH_LUA; if p and p ~= '' then pcall(dofile, p) end";
 
+/// The reopen loader runs only when its snippet was written successfully.
+pub(crate) const REOPEN_LOADER_CMD: &str =
+    "lua local p = vim.env.EITRI_REOPEN_LUA; if p and p ~= '' then pcall(dofile, p) end";
+
 /// The one `--cmd`, guarded the way `nvim_keys`'s loader is: the path is checked before
 /// `dofile`, because `dofile(nil)` reads stdin -- under `--embed`, the RPC pipe -- and the load is
 /// `pcall`ed, so a broken snippet costs the fallback, never the editor.
@@ -152,6 +157,7 @@ pub struct PaneSwitchChannel {
     /// `None` when the snippet could not be written: nvim then never says it is watched, and its exit
     /// is taken as a quit, as with no socket at all.
     watch_lua: Option<PathBuf>,
+    reopen_lua: Option<PathBuf>,
     listener: Option<UnixListener>,
     /// The clipboard socket's listener ([`crate::host_clipboard`]), bound only beside the shim (an nvim
     /// with no fake `tmux` never asks for it); `None` when it could not be bound, and nvim's `+`
@@ -286,6 +292,22 @@ impl PaneSwitchChannel {
             }
         };
 
+        let mut reopen_lua = None;
+        for (name, contents) in [
+            (REOPEN_LUA_NAME, EDITOR_REOPEN_LUA),
+            (REOPEN_CAPTURE_NAME, EDITOR_REOPEN_CAPTURE_LUA),
+        ] {
+            let path = dir.join(name);
+            match agent::private_fs::write_private(&path, contents.as_bytes()) {
+                Ok(()) => {
+                    if name == REOPEN_LUA_NAME {
+                        reopen_lua = Some(path);
+                    }
+                }
+                Err(e) => eprintln!("[pane_switch] could not write {}: {e}", path.display()),
+            }
+        }
+
         if shim.is_some() {
             println!(
                 "[pane_switch] fake tmux at {}, socket at {}",
@@ -300,6 +322,7 @@ impl PaneSwitchChannel {
             socket_path,
             nav_lua,
             watch_lua,
+            reopen_lua,
             listener: Some(listener),
             clipboard_listener,
             shim: shim.is_some(),
@@ -356,10 +379,13 @@ impl PaneSwitchChannel {
         if let Some(watch_lua) = &self.watch_lua {
             env.push(("EITRI_EDITOR_WATCH_LUA".to_string(), watch_lua.display().to_string()));
         }
+        if let Some(reopen_lua) = &self.reopen_lua {
+            env.push(("EITRI_REOPEN_LUA".to_string(), reopen_lua.display().to_string()));
+        }
         env
     }
 
-    /// The nav fallback's and the editor watch's `--cmd` loaders, for the nvim child only, beside the
+    /// The nav fallback, editor watch and reopen `--cmd` loaders, for the nvim child only, beside the
     /// theme, editor-context and nvim-keys feeds' own. Each is left out when its snippet could not be
     /// written.
     pub fn nvim_args(&self) -> Vec<String> {
@@ -369,6 +395,9 @@ impl PaneSwitchChannel {
         }
         if self.watch_lua.is_some() {
             args.extend(["--cmd".to_string(), WATCH_LOADER_CMD.to_string()]);
+        }
+        if self.reopen_lua.is_some() {
+            args.extend(["--cmd".to_string(), REOPEN_LOADER_CMD.to_string()]);
         }
         args
     }
@@ -398,6 +427,11 @@ impl PaneSwitchChannel {
     /// failures and callers that own the channel on the stack.
     pub fn cleanup(&self) {
         let _ = std::fs::remove_dir_all(&self.dir);
+    }
+
+    /// The private directory holding the channel's snippets and handoff files.
+    pub fn dir(&self) -> &Path {
+        &self.dir
     }
 
     /// The bound socket's path. Only the `TMUX`/`EITRI_PANE_SWITCH_SOCKET` env pairs need it in
@@ -445,12 +479,14 @@ impl Drop for PaneSwitchChannel {
 /// shim, a kill's generation from a cancelled `:confirm qall`
 /// ([`crate::layout::kill::editor_quit_lua`]), or the words of an `:Eitri` command, each one a
 /// [`is_verb_word`], 1 to [`VERB_MAX_WORDS`] of them, for [`crate::nvim_verbs::parse_words`], or
-/// what the editor watch reports.
+/// what the editor watch reports, or a restore report ([`ReopenLine`]: the `B`, `O`, `N` and `A`
+/// lines of the reopen feed).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum PaneMessage {
     Direction(char),
     QuitCancelled(u32),
     Verb(Vec<String>),
+    Reopen(ReopenLine),
     /// nvim will say when it leaves: from here an exit with no [`Self::EditorLeaving`] is a crash.
     EditorWatched,
     /// nvim is quitting on purpose, not on a deadly signal.
@@ -460,6 +496,91 @@ pub enum PaneMessage {
         count: u32,
         newest: String,
     },
+}
+
+/// A restore report from the embedded editor.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ReopenLine {
+    Began {
+        token: String,
+    },
+    Ended {
+        token: String,
+        opened: u32,
+        gone: u32,
+        failed: u32,
+        squeezed: u32,
+        micros: u64,
+    },
+    Name {
+        token: String,
+        gone: bool,
+        name: String,
+    },
+    Aside {
+        token: String,
+        word: AsideWord,
+    },
+}
+
+/// The closed set of reasons the editor can leave reopening to something else.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum AsideWord {
+    Off,
+    Args,
+    Screen,
+    ThisSession,
+    MiniSessions,
+    Persistence,
+    AutoSession,
+    Resession,
+    Possession,
+    NvimPossession,
+    SessionManager,
+    Persisted,
+    Startify,
+    Prosession,
+}
+
+impl AsideWord {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::Off => "off",
+            Self::Args => "args",
+            Self::Screen => "screen",
+            Self::ThisSession => "this_session",
+            Self::MiniSessions => "mini.sessions",
+            Self::Persistence => "persistence",
+            Self::AutoSession => "auto-session",
+            Self::Resession => "resession",
+            Self::Possession => "possession",
+            Self::NvimPossession => "nvim-possession",
+            Self::SessionManager => "session_manager",
+            Self::Persisted => "persisted",
+            Self::Startify => "startify",
+            Self::Prosession => "prosession",
+        }
+    }
+
+    fn parse(word: &str) -> Option<Self> {
+        match word {
+            "off" => Some(Self::Off),
+            "args" => Some(Self::Args),
+            "screen" => Some(Self::Screen),
+            "this_session" => Some(Self::ThisSession),
+            "mini.sessions" => Some(Self::MiniSessions),
+            "persistence" => Some(Self::Persistence),
+            "auto-session" => Some(Self::AutoSession),
+            "resession" => Some(Self::Resession),
+            "possession" => Some(Self::Possession),
+            "nvim-possession" => Some(Self::NvimPossession),
+            "session_manager" => Some(Self::SessionManager),
+            "persisted" => Some(Self::Persisted),
+            "startify" => Some(Self::Startify),
+            "prosession" => Some(Self::Prosession),
+            _ => None,
+        }
+    }
 }
 
 /// A file name in a `S` line takes at most this many bytes: what the snippet sends at most, 120
@@ -721,7 +842,16 @@ impl PaneSwitchReader {
 /// The `W` form is stricter still ([`parse_verb_line`]): no whitespace is trimmed but one trailing
 /// newline, and the line is dropped whole on the first byte out of place, so a partial or padded
 /// line never runs part of what it says.
+///
+/// The restore reports ([`parse_reopen_line`]) are `B <token>` (began), `O <token> <opened> <gone>
+/// <failed> <squeezed> <micros>` (ended), `N <token> <g|f> <name>` (a file that is gone or failed,
+/// by name) and `A <token> <word>` (the editor left reopening to [`AsideWord`]). The token is 16
+/// lowercase hex characters, the counts plain ASCII digits; a name keeps its spaces, as the `S`
+/// form's does.
 fn parse_message(line: &str) -> Option<PaneMessage> {
+    if let Some(report) = parse_reopen_line(line) {
+        return Some(PaneMessage::Reopen(report));
+    }
     if let Some(words) = parse_verb_line(line) {
         return Some(PaneMessage::Verb(words));
     }
@@ -743,6 +873,60 @@ fn parse_message(line: &str) -> Option<PaneMessage> {
         rest.parse::<u32>().ok().map(PaneMessage::QuitCancelled)
     } else {
         None
+    }
+}
+
+/// Reopen reports preserve all spacing except one optional final newline.
+fn parse_reopen_line(line: &str) -> Option<ReopenLine> {
+    let body = line.strip_suffix('\n').unwrap_or(line);
+    let (kind, rest) = body.split_once(' ')?;
+    let (token, fields) = rest
+        .split_once(' ')
+        .map_or((rest, None), |(token, fields)| (token, Some(fields)));
+    if token.len() != 16 || !token.bytes().all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b)) {
+        return None;
+    }
+    let token = token.to_string();
+    match (kind, fields) {
+        ("B", None) => Some(ReopenLine::Began { token }),
+        ("O", Some(fields)) => {
+            let parts: Vec<_> = fields.split(' ').collect();
+            if parts.len() != 5
+                || parts
+                    .iter()
+                    .any(|p| p.is_empty() || !p.bytes().all(|b| b.is_ascii_digit()))
+            {
+                return None;
+            }
+            Some(ReopenLine::Ended {
+                token,
+                opened: parts[0].parse().ok()?,
+                gone: parts[1].parse().ok()?,
+                failed: parts[2].parse().ok()?,
+                squeezed: parts[3].parse().ok()?,
+                micros: parts[4].parse().ok()?,
+            })
+        }
+        ("N", Some(fields)) => {
+            let (kind, name) = fields.split_once(' ')?;
+            if !matches!(kind, "g" | "f")
+                || name.is_empty()
+                || name.len() > RECOVERABLE_NAME_MAX_BYTES
+                || name.chars().any(char::is_control)
+            {
+                return None;
+            }
+            Some(ReopenLine::Name {
+                token,
+                gone: kind == "g",
+                name: name.to_string(),
+            })
+        }
+        ("A", Some(word)) => Some(ReopenLine::Aside {
+            token,
+            word: AsideWord::parse(word)?,
+        }),
+        _ => None,
     }
 }
 
@@ -784,6 +968,153 @@ mod tests {
     use std::io::Write;
     use std::os::unix::net::UnixStream;
     use std::time::Instant;
+
+    #[test]
+    fn a_name_keeps_a_space_at_either_end() {
+        let token = "0123456789abcdef";
+        for name in ["trailing ", " leading", "cut at 120 "] {
+            assert_eq!(
+                parse_message(&format!("N {token} g {name}")),
+                Some(PaneMessage::Reopen(ReopenLine::Name {
+                    token: token.into(),
+                    gone: true,
+                    name: name.into(),
+                })),
+                "{name:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn each_reopen_line_parses() {
+        let token = "0123456789abcdef";
+        let mut cases = vec![
+            (format!("B {token}"), ReopenLine::Began { token: token.into() }),
+            (
+                format!("O {token} 1 2 3 4 18446744073709551615"),
+                ReopenLine::Ended {
+                    token: token.into(),
+                    opened: 1,
+                    gone: 2,
+                    failed: 3,
+                    squeezed: 4,
+                    micros: u64::MAX,
+                },
+            ),
+            (
+                format!("N {token} g src/a b.rs"),
+                ReopenLine::Name {
+                    token: token.into(),
+                    gone: true,
+                    name: "src/a b.rs".into(),
+                },
+            ),
+            (
+                format!("N {token} f {}", "é".repeat(240)),
+                ReopenLine::Name {
+                    token: token.into(),
+                    gone: false,
+                    name: "é".repeat(240),
+                },
+            ),
+        ];
+        for (word, aside) in [
+            ("off", AsideWord::Off),
+            ("args", AsideWord::Args),
+            ("screen", AsideWord::Screen),
+            ("this_session", AsideWord::ThisSession),
+            ("mini.sessions", AsideWord::MiniSessions),
+            ("persistence", AsideWord::Persistence),
+            ("auto-session", AsideWord::AutoSession),
+            ("resession", AsideWord::Resession),
+            ("possession", AsideWord::Possession),
+            ("nvim-possession", AsideWord::NvimPossession),
+            ("session_manager", AsideWord::SessionManager),
+            ("persisted", AsideWord::Persisted),
+            ("startify", AsideWord::Startify),
+            ("prosession", AsideWord::Prosession),
+        ] {
+            assert_eq!(aside.as_str(), word);
+            cases.push((
+                format!("A {token} {word}"),
+                ReopenLine::Aside {
+                    token: token.into(),
+                    word: aside,
+                },
+            ));
+        }
+        for (line, expected) in cases {
+            for suffix in ["", "\n"] {
+                assert_eq!(
+                    parse_message(&format!("{line}{suffix}")),
+                    Some(PaneMessage::Reopen(expected.clone())),
+                    "{line:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn bad_reopen_lines_are_dropped() {
+        let token = "0123456789abcdef";
+        let mut bad = vec![
+            "B".into(),
+            format!("B  {token}"),
+            format!("B {token} "),
+            format!(" B {token}"),
+            "B 0123456789abcde".into(),
+            "B 0123456789abcdeF".into(),
+            format!("B {token}\n\n"),
+            format!("O {token} 1 2 3 4"),
+            format!("O {token} +1 2 3 4 5"),
+            format!("O {token} 1 2 3 4 -5"),
+            format!("O {token} 4294967296 2 3 4 5"),
+            format!("O {token} 1 2 3 4 18446744073709551616"),
+            format!("N {token} x name"),
+            format!("N {token} g "),
+            format!("N {token} g a\tb"),
+            format!("N {token} g {}", "a".repeat(481)),
+            format!("A {token} unknown"),
+        ];
+        for line in [
+            format!("O {token} 1 2 3 4 5"),
+            format!("N {token} g name"),
+            format!("A {token} off"),
+        ] {
+            bad.extend([format!(" {line}"), line.replacen(' ', "  ", 1)]);
+            // A space after an `N` line's name is part of the name, as in the `S` form.
+            if !line.starts_with("N ") {
+                bad.push(format!("{line} "));
+            }
+        }
+        for line in bad {
+            for suffix in ["", "\n"] {
+                assert_eq!(parse_message(&format!("{line}{suffix}")), None, "{line:?}");
+            }
+        }
+    }
+
+    #[test]
+    fn bind_writes_the_reopen_snippets_beside_the_watch() {
+        use crate::editor_reopen::*;
+        use std::os::unix::fs::PermissionsExt;
+        let channel = PaneSwitchChannel::bind_without_shim().expect("bind");
+        assert_eq!(channel.dir(), channel.socket_path().parent().unwrap());
+        assert!(channel.dir().join(WATCH_LUA_NAME).is_file());
+        for (name, contents) in [
+            (REOPEN_LUA_NAME, EDITOR_REOPEN_LUA),
+            (REOPEN_CAPTURE_NAME, EDITOR_REOPEN_CAPTURE_LUA),
+        ] {
+            let path = channel.dir().join(name);
+            assert_eq!(std::fs::read_to_string(&path).unwrap(), contents);
+            assert_eq!(std::fs::metadata(&path).unwrap().permissions().mode() & 0o777, 0o600);
+        }
+        let env: std::collections::HashMap<_, _> = channel.child_env().into_iter().collect();
+        assert_eq!(
+            env["EITRI_REOPEN_LUA"],
+            channel.dir().join(REOPEN_LUA_NAME).display().to_string()
+        );
+    }
 
     #[test]
     fn the_shims_four_letters_are_the_four_directions() {
@@ -970,6 +1301,7 @@ mod tests {
             socket_path: dir.join(SOCKET_NAME),
             nav_lua: Some(dir.join(NAV_LUA_NAME)),
             watch_lua: Some(dir.join(WATCH_LUA_NAME)),
+            reopen_lua: Some(dir.join(REOPEN_LUA_NAME)),
             dir: dir.clone(),
             listener: None,
             clipboard_listener: None,
@@ -1021,12 +1353,14 @@ mod tests {
             socket_path: dir.join(SOCKET_NAME),
             nav_lua: None,
             watch_lua: None,
+            reopen_lua: None,
             dir: dir.clone(),
             listener: None,
             clipboard_listener: None,
             shim: true,
         };
         assert!(channel.child_env().iter().all(|(k, _)| k != "EITRI_NAV_LUA"));
+        assert!(channel.child_env().iter().all(|(k, _)| k != "EITRI_REOPEN_LUA"));
         assert!(channel.nvim_args().is_empty());
         std::mem::forget(channel);
     }
@@ -1042,6 +1376,7 @@ mod tests {
             socket_path: dir.join(SOCKET_NAME),
             nav_lua: Some(dir.join(NAV_LUA_NAME)),
             watch_lua: Some(dir.join(WATCH_LUA_NAME)),
+            reopen_lua: Some(dir.join(REOPEN_LUA_NAME)),
             dir: dir.clone(),
             listener: None,
             clipboard_listener: None,
@@ -1126,7 +1461,15 @@ mod tests {
         assert_eq!(std::fs::read_to_string(&nav).unwrap(), NAV_FALLBACK_LUA);
         assert_eq!(
             channel.nvim_args(),
-            ["--cmd", NAV_LOADER_CMD, "--cmd", WATCH_LOADER_CMD].map(str::to_string)
+            [
+                "--cmd",
+                NAV_LOADER_CMD,
+                "--cmd",
+                WATCH_LOADER_CMD,
+                "--cmd",
+                REOPEN_LOADER_CMD
+            ]
+            .map(str::to_string)
         );
         channel.cleanup();
         assert!(!nav.exists());

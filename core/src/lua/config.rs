@@ -127,6 +127,13 @@ pub fn parse_window_restore(value: Option<&str>) -> Result<bool, String> {
     crate::config_switch::parse_switch(WINDOW_RESTORE_KEY, value, true)
 }
 
+/// Whether the editor reopens the files from its last run.
+pub const EDITOR_RESTORE_KEY: &str = "editor.restore";
+
+pub fn parse_editor_restore(value: Option<&str>) -> Result<bool, String> {
+    crate::config_switch::parse_switch(EDITOR_RESTORE_KEY, value, true)
+}
+
 /// The `init.lua` key: `eitri.config.set("terminal.claude_ide", true | false)`. Whether a `claude` started in this
 /// window's bottom terminal can attach to its editor through the CLI's IDE lock file.
 pub const TERMINAL_CLAUDE_IDE_KEY: &str = "terminal.claude_ide";
@@ -393,6 +400,22 @@ mod tests {
                 assert!(error.contains(word), "{error}");
             }
         }
+    }
+
+    #[test]
+    fn editor_restore_is_on_by_default_and_takes_both_spellings() {
+        assert_eq!(EDITOR_RESTORE_KEY, "editor.restore");
+        assert_eq!(parse_editor_restore(None), Ok(true));
+        for (value, expected) in [("true", true), ("on", true), ("false", false), ("off", false)] {
+            assert_eq!(parse_editor_restore(Some(value)), Ok(expected));
+        }
+    }
+
+    #[test]
+    fn editor_restore_refuses_offer_naming_the_key() {
+        let err = parse_editor_restore(Some("offer")).unwrap_err();
+        assert!(err.contains("\"editor.restore\""), "{err}");
+        assert!(err.contains("must be true or \"on\" / false or \"off\""), "{err}");
     }
 
     #[test]

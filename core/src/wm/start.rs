@@ -420,6 +420,7 @@ pub(super) fn event_window(event: &HostEvent) -> Option<WinId> {
             | EditorEvent::Watched { win }
             | EditorEvent::Leaving { win }
             | EditorEvent::Recoverable { win, .. }
+            | EditorEvent::Reopen { win, .. }
             | EditorEvent::QuitNotSent { win, .. }
             | EditorEvent::ScaleReported { win, .. }
             | EditorEvent::QuitAnswered { win, .. }

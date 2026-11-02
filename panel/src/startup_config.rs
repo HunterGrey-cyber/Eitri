@@ -80,6 +80,7 @@ fn checks<'a>(agents: &'a [&'a str]) -> Vec<(&'static str, Check<'a>)> {
         (cfg::TERMINAL_FONT_KEY, check(cfg::parse_terminal_font)),
         (cfg::TERMINAL_CLAUDE_IDE_KEY, check(cfg::parse_terminal_claude_ide)),
         (cfg::WINDOW_RESTORE_KEY, check(cfg::parse_window_restore)),
+        (cfg::EDITOR_RESTORE_KEY, check(cfg::parse_editor_restore)),
         (cfg::EDITOR_PRESENTATION_KEY, check(cfg::parse_editor_presentation)),
     ];
     for key in KIT_KEYS {

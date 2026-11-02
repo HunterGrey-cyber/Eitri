@@ -24,10 +24,11 @@ pub const EDITOR_RPC_ADDRESS: [&str; 2] = ["NVIM", "NVIM_LISTEN_ADDRESS"];
 /// of this window -- the sidecar and each agent tool, the bottom shell -- could write fake pane
 /// switches, key reports or editor context into that other window's sockets, and this window's own
 /// nvim would run the other window's Lua wherever this one has none of its own to set.
-pub const SET_ON_THE_NVIM_CHILD: [&str; 10] = [
+pub const SET_ON_THE_NVIM_CHILD: [&str; 11] = [
     "EITRI_PANE_SWITCH_SOCKET",
     "EITRI_NAV_LUA",
     "EITRI_EDITOR_WATCH_LUA",
+    "EITRI_REOPEN_LUA",
     "EITRI_THEME_SOCKET",
     "EITRI_THEME_LUA",
     "EITRI_KEYS_SOCKET",
@@ -159,7 +160,9 @@ mod tests {
                 }
             }
         }
-        assert!(found.len() >= 10, "{found:?}");
+        assert!(found.len() >= 11, "{found:?}");
+        assert_eq!(SET_ON_THE_NVIM_CHILD.len(), 11);
+        assert!(SET_ON_THE_NVIM_CHILD.contains(&"EITRI_REOPEN_LUA"));
         for name in &found {
             assert!(
                 SET_ON_THE_NVIM_CHILD

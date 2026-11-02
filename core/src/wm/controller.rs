@@ -1653,12 +1653,14 @@ impl Decide for Controller {
                 | EditorEvent::Watched { win }
                 | EditorEvent::Leaving { win }
                 | EditorEvent::Recoverable { win, .. }
+                | EditorEvent::Reopen { win, .. }
                 | EditorEvent::QuitCancelled { win, .. }
                 | EditorEvent::QuitNotSent { win, .. }
                 | EditorEvent::OpenFailed { win, .. }),
             ) => {
-                self.modules_event(win, &mut batch, |w, cx, batch| {
-                    super::close::editor_event(w, cx, win, event, batch)
+                self.modules_event(win, &mut batch, |w, cx, batch| match event {
+                    EditorEvent::Reopen { .. } => {}
+                    event => super::close::editor_event(w, cx, win, event, batch),
                 });
             }
             HostEvent::Terminal(TermEvent::Exited { win, module }) => {

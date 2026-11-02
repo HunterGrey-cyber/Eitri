@@ -3899,6 +3899,14 @@ fn build_ui(
                     }));
                 }
             }
+            pane_switch::PaneMessage::Reopen(line) => {
+                if let Some(driver) = driver.upgrade() {
+                    driver.post(HostEvent::Editor(eitri_core::wm::EditorEvent::Reopen {
+                        win: WinId::MAIN,
+                        line,
+                    }));
+                }
+            }
             // `:Eitri` in this window's nvim: the words are checked again here, whatever the snippet checked, since
             // the socket is only as private as its directory. A request is the controller's, as a Lua call's is.
             pane_switch::PaneMessage::Verb(words) => {
