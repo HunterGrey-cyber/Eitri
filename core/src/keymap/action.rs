@@ -95,6 +95,8 @@ pub enum Action {
     WorkspaceLast,
     /// tmux `choose-tree -s`: the host draws the chooser, then starts the prefix wait.
     WorkspaceChoose,
+    /// Open the project chooser in this window.
+    ProjectChoose,
     /// tmux's `rename-session` prompt.
     WorkspaceRename,
     WorkspaceSwitch {
@@ -379,6 +381,7 @@ pub const NAMES: &[&str] = &[
     "workspace.prev",
     "workspace.next",
     "workspace.last",
+    "project.choose",
     "workspace.choose",
     "workspace.rename",
     "workspace.new",
@@ -546,6 +549,7 @@ pub fn parse(name: &str, opts: &[(String, OptValue)], lua_panels: &[String]) -> 
         "workspace.prev" => (Action::WorkspaceStep { forward: false }, &[]),
         "workspace.next" => (Action::WorkspaceStep { forward: true }, &[]),
         "workspace.last" => (Action::WorkspaceLast, &[]),
+        "project.choose" => (Action::ProjectChoose, &[]),
         "workspace.choose" => (Action::WorkspaceChoose, &[]),
         "workspace.rename" => (Action::WorkspaceRename, &[]),
         "workspace.new" => (Action::WorkspaceNew, &[]),
@@ -729,7 +733,8 @@ pub fn parse(name: &str, opts: &[(String, OptValue)], lua_panels: &[String]) -> 
 impl Action {
     pub fn on_a_float(&self) -> FloatRule {
         match self {
-            Action::Even(_)
+            Action::ProjectChoose
+            | Action::Even(_)
             | Action::MainHorizontal
             | Action::MainVertical
             | Action::Tiled
@@ -794,7 +799,8 @@ impl Action {
 
     pub fn selection_rule(&self) -> SelectionRule {
         match self {
-            Action::Move(_)
+            Action::ProjectChoose
+            | Action::Move(_)
             | Action::MoveFar(_)
             | Action::Zoom
             | Action::ContainerTabbed
@@ -860,6 +866,7 @@ impl Action {
     /// What `eitri.layout.run` accepts; every new action must decide here whether it is layout.
     pub fn is_layout(&self) -> bool {
         match self {
+            Action::ProjectChoose => true,
             Action::Move(_)
             | Action::ContainerTabbed
             | Action::ContainerStacked
@@ -948,6 +955,7 @@ impl Action {
             Action::WorkspaceStep { forward: false } => "workspace.prev".into(),
             Action::WorkspaceStep { forward: true } => "workspace.next".into(),
             Action::WorkspaceLast => "workspace.last".into(),
+            Action::ProjectChoose => "project.choose".into(),
             Action::WorkspaceChoose => "workspace.choose".into(),
             Action::WorkspaceRename => "workspace.rename".into(),
             Action::WorkspaceSwitch { .. } => "workspace.switch".into(),
@@ -1094,6 +1102,7 @@ impl Action {
             Action::WorkspaceStep { forward: false } => "Switch to the previous workspace".into(),
             Action::WorkspaceStep { forward: true } => "Switch to the next workspace".into(),
             Action::WorkspaceLast => "Switch to the workspace used before this one".into(),
+            Action::ProjectChoose => "Open a project".into(),
             Action::WorkspaceChoose => {
                 "Choose a workspace: a digit switches, c makes a new one, x then a digit deletes one".into()
             }
@@ -1230,6 +1239,7 @@ impl Action {
             Action::WorkspaceStep { forward: true } => "next workspace",
             Action::WorkspaceStep { forward: false } => "previous workspace",
             Action::WorkspaceLast => "last workspace",
+            Action::ProjectChoose => "open a project",
             Action::WorkspaceChoose => "choose workspace",
             Action::WorkspaceRename => "rename workspace",
             Action::WorkspaceSwitch { .. } => "switch workspace",
@@ -1350,6 +1360,7 @@ mod tests {
             Action::WorkspaceStep { forward: true },
             Action::WorkspaceStep { forward: false },
             Action::WorkspaceLast,
+            Action::ProjectChoose,
             Action::WorkspaceChoose,
             Action::WorkspaceRename,
             Action::WorkspaceSwitch { name: "w".into() },
@@ -1514,6 +1525,7 @@ mod tests {
             | Action::ScratchpadMove
             | Action::WorkspaceStep { .. }
             | Action::WorkspaceLast
+            | Action::ProjectChoose
             | Action::WorkspaceChoose
             | Action::WorkspaceRename
             | Action::WorkspaceSwitch { .. }
@@ -1827,6 +1839,7 @@ mod tests {
     #[test]
     fn every_action_says_what_it_does_with_the_keys_on_a_float() {
         for action in [
+            Action::ProjectChoose,
             Action::Even(Axis::Row),
             Action::MainHorizontal,
             Action::MainVertical,
@@ -2119,6 +2132,7 @@ mod tests {
             Action::WorkspaceStep { forward: false },
             Action::WorkspaceStep { forward: true },
             Action::WorkspaceLast,
+            Action::ProjectChoose,
             Action::WorkspaceChoose,
             Action::WorkspaceRename,
             Action::WorkspaceSwitch { name: "x".into() },
@@ -2261,6 +2275,7 @@ mod tests {
     #[test]
     fn every_action_says_whether_it_takes_a_selection() {
         for action in [
+            Action::ProjectChoose,
             Action::Move(Direction::Left),
             Action::MoveFar(Direction::Up),
             Action::Zoom,
@@ -2322,5 +2337,17 @@ mod tests {
         ] {
             assert_eq!(action.selection_rule(), SelectionRule::Resets, "{action:?}");
         }
+    }
+
+    #[test]
+    fn project_choose_parses_and_prints_its_name() {
+        let parsed = parse("project.choose", &[], &[]).unwrap();
+        assert_eq!(parsed.action, Action::ProjectChoose);
+        assert!(!parsed.repeatable);
+        assert_eq!(parsed.action.name(), "project.choose");
+        assert_eq!(parsed.action.short_label(), "open a project");
+        assert!(parsed.action.options().is_empty());
+        assert!(parsed.action.is_layout());
+        assert!(parse("project.choose", &[("name".into(), OptValue::Str("x".into()))], &[]).is_err());
     }
 }

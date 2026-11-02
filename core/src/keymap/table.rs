@@ -372,6 +372,7 @@ fn default_bindings() -> Vec<Binding> {
     bind("(", Action::WorkspaceStep { forward: false }, false);
     bind(")", Action::WorkspaceStep { forward: true }, false);
     bind("L", Action::WorkspaceLast, false);
+    bind("O", Action::ProjectChoose, false);
     bind("s", Action::WorkspaceChoose, false);
     bind("$", Action::WorkspaceRename, false);
     bind("!", Action::TabBreak, false);
@@ -1267,6 +1268,7 @@ mod tests {
         ("(", "workspace.prev", false),
         (")", "workspace.next", false),
         ("L", "workspace.last", false),
+        ("O", "project.choose", false),
         ("s", "workspace.choose", false),
         ("$", "workspace.rename", false),
         ("!", "tab.break", false),
@@ -1457,7 +1459,8 @@ mod tests {
         // `H J K` are vim's `<C-w>H/J/K`; the Alt chords are i3's `$mod` chords after the prefix.
         // The float and scratchpad chords are i3's `$mod+Shift+space`, `$mod+minus` and
         // `$mod+Shift+minus` after the prefix.
-        const EITRI_ONLY: [&str; 27] = [
+        const EITRI_ONLY: [&str; 28] = [
+            "O",
             "C-l",
             "C-h",
             "C-j",
@@ -2290,5 +2293,41 @@ mod tests {
         let rows = root::user_help_rows(&map, |action| !matches!(action, Action::Zoom));
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].keys, "Alt+y");
+    }
+
+    #[test]
+    fn o_opens_a_project_and_survives_tmux_unbind_all() {
+        let map = Keymap::defaults();
+        let binding = map.lookup(&k("O")).unwrap();
+        assert_eq!(binding.action, Action::ProjectChoose);
+        assert!(!binding.repeatable);
+        assert!(!is_tmux_action(&binding.action));
+        let home = crate::test_scratch_dir::ScratchDir::new("eitri-project-key", "tmux");
+        std::fs::write(home.join(".tmux.conf"), "unbind -a\n").unwrap();
+        let read = crate::keymap::tmux::read(&crate::keymap::tmux::tests::env_for(&home));
+        let (map, _) = Keymap::with_tmux(&read, &crate::keymap::LuaClaims::default());
+        assert_eq!(map.lookup(&k("O")).unwrap().action, Action::ProjectChoose);
+        let taken = Keymap::apply_user(&[set("O", "zoom")], &[]).unwrap();
+        assert_eq!(taken.lookup(&k("O")).unwrap().action, Action::Zoom);
+        assert_eq!(taken.user_overrides(), ["prefix O (was project.choose)"]);
+    }
+
+    #[test]
+    fn o_is_no_stock_tmux_3_8_key() {
+        let probed = "Tab Space ! \" # $ % & ' ( ) * , - . / 0 1 2 3 4 5 6 7 8 9 : ; < = > ? @ \
+                      C D E L M T [ ] c d f g i l m n o p q r s t w x z { } ~ DC PPage BTab \
+                      Up Down Left Right M-1 M-2 M-3 M-4 M-5 M-6 M-7 M-n M-o M-p \
+                      M-Up M-Down M-Left M-Right C-b C-o C-z C-Up C-Down C-Left C-Right \
+                      S-Up S-Down S-Left S-Right";
+        assert!(!probed.split_whitespace().any(|key| key == "O"));
+    }
+
+    #[test]
+    fn o_is_no_root_chord() {
+        let map = Keymap::defaults();
+        assert!(map.root_lookup(&k("O")).is_none());
+        assert!(root::pressed_chords()
+            .iter()
+            .all(|(chord, _)| *chord != Chord::of(&k("O"))));
     }
 }

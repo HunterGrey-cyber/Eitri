@@ -8,6 +8,7 @@ pub mod focus;
 pub mod keys;
 pub mod module_windows;
 pub mod modules;
+pub mod project;
 pub mod tabs;
 pub mod text_size;
 pub mod tiling;
@@ -33,6 +34,8 @@ pub enum Family {
     Modules,
     /// Switching, making and naming workspaces.
     Workspaces,
+    /// Choosing another project.
+    Project,
     /// The linked pair's windows.
     Windows,
     /// Floats, focus mode and the scratchpad.
@@ -49,6 +52,7 @@ pub enum Family {
 /// and the editor's kill is its quit, which only [`family_of`] can tell.
 pub fn family(action: &Action) -> Family {
     match action {
+        Action::ProjectChoose => Family::Project,
         Action::MoveFar(_)
         | Action::ToggleSplit
         | Action::Rotate { .. }

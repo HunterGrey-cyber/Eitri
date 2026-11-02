@@ -123,6 +123,7 @@ pub trait GridObserve {
 
 #[derive(Debug)]
 pub enum EventMatch {
+    Project(ProjectEvent),
     NativeFocusOn(Option<ModuleId>),
     /// An unmap may clear focus or move it directly to another native destination.
     NativeFocusAwayFrom(ModuleId),
@@ -136,6 +137,7 @@ pub enum EventMatch {
 impl EventMatch {
     fn matches(&self, event: &HostEvent) -> bool {
         match (self, event) {
+            (Self::Project(expected), HostEvent::Project(actual)) => expected == actual,
             (Self::NativeFocusOn(expected), HostEvent::NativeFocus { owner, .. }) => match (expected, owner) {
                 (Some(a), Some(FocusOwner::Module(b))) => a == b,
                 (None, None) => true,
@@ -155,6 +157,99 @@ impl EventMatch {
             _ => false,
         }
     }
+}
+
+/// Project requests are answered with their window and serial intact; the chooser can take and return input.
+pub fn project_list_focus_and_close(win: WinId, rows: Vec<crate::project_chooser::Row>) -> Vec<Script> {
+    let requests = [
+        (
+            "project_list_answers_the_request",
+            ProjectOp::List { win, serial: 5 },
+            Some(ProjectEvent::Rows { win, serial: 5, rows }),
+        ),
+        (
+            "project_path_answers_the_request",
+            ProjectOp::Path {
+                win,
+                serial: 6,
+                text: "./other".into(),
+                base: "/work/current".into(),
+            },
+            Some(ProjectEvent::PathAnswer {
+                win,
+                serial: 6,
+                answer: crate::project_chooser::PathAnswer::Stuck,
+            }),
+        ),
+        (
+            "project_folder_dialog_answers_its_window",
+            ProjectOp::FolderDialog { win },
+            Some(ProjectEvent::Folder { win, path: None }),
+        ),
+        (
+            "project_open_is_carried_out",
+            ProjectOp::Open {
+                win,
+                target: "/work/other".into(),
+            },
+            None,
+        ),
+    ];
+    let mut scripts = Vec::new();
+    for (name, op, answer) in requests {
+        let mut expect = vec![
+            Expect::Answer {
+                op: 0,
+                applied: Applied::Done,
+            },
+            Expect::NotPosted(EventMatch::Refused(OpTag::Project)),
+        ];
+        if let Some(answer) = answer {
+            expect.push(Expect::PostedDuring {
+                op: 0,
+                event: EventMatch::Project(answer),
+            });
+        }
+        scripts.push(Script {
+            name,
+            ops: vec![HostOp::Project(op)],
+            expect,
+        });
+    }
+    scripts.push(Script {
+        name: "project_focus_and_close_report_the_keys",
+        ops: vec![
+            HostOp::Focus {
+                win,
+                to: FocusTo::ProjectChooser,
+                on_grab: vec![],
+            },
+            HostOp::Focus {
+                win,
+                to: FocusTo::Module(ModuleId::editor()),
+                on_grab: vec![],
+            },
+        ],
+        expect: vec![
+            Expect::Answer {
+                op: 0,
+                applied: Applied::Done,
+            },
+            Expect::PostedDuring {
+                op: 0,
+                event: EventMatch::NativeFocusOn(None),
+            },
+            Expect::Answer {
+                op: 1,
+                applied: Applied::Done,
+            },
+            Expect::PostedDuring {
+                op: 1,
+                event: EventMatch::NativeFocusOn(Some(ModuleId::editor())),
+            },
+        ],
+    });
+    scripts
 }
 
 /// One new module of every surface kind, none of them the fixture's: a host builds each, off screen.

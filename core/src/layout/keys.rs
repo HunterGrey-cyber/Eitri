@@ -835,4 +835,23 @@ mod tests {
             }
         }
     }
+
+    #[test]
+    fn a_lua_panel_with_module_key_o_is_reported_and_loses_it() {
+        let map = Keymap::defaults();
+        let (keys, errors) = ModuleKeys::build_settled(&[lua("notes", Some("O"))], &map);
+        assert!(keys.module('O').is_none());
+        assert_eq!(
+            errors,
+            [KeyError::Bound {
+                panel: "notes".into(),
+                key: 'O',
+                prefix: map.prefix().human(),
+                action: "project.choose".into(),
+                source: crate::keymap::Source::Default,
+            }]
+        );
+        let text = errors[0].to_string();
+        assert!(text.contains("notes") && text.contains("project.choose"), "{text}");
+    }
 }

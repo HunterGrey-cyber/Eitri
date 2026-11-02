@@ -51,6 +51,8 @@ pub struct FakeShell {
 }
 
 pub struct FakeHost {
+    project_rows: RefCell<Vec<crate::project_chooser::Row>>,
+    project_env: RefCell<Option<ChooserEnv>>,
     sink: RefCell<Option<Weak<dyn HostSink>>>,
     model: Cell<bool>,
     surfaces: RefCell<BTreeMap<(WinId, ModuleId), Surface>>,
@@ -148,6 +150,12 @@ impl Default for Reads {
 }
 
 impl FakeHost {
+    pub fn set_project_rows(&self, rows: Vec<crate::project_chooser::Row>) {
+        *self.project_rows.borrow_mut() = rows;
+    }
+    pub fn set_project_chooser_env(&self, env: ChooserEnv) {
+        *self.project_env.borrow_mut() = Some(env);
+    }
     pub fn set_tab_can_step(&self, delta: i32, answer: bool) {
         self.reads.borrow_mut().tab_steps.insert(delta, answer);
     }
@@ -197,6 +205,8 @@ impl FakeHost {
 
     pub fn new() -> Rc<Self> {
         Rc::new(Self {
+            project_rows: RefCell::default(),
+            project_env: RefCell::default(),
             sink: RefCell::new(None),
             model: Cell::new(true),
             surfaces: RefCell::new(BTreeMap::new()),
@@ -440,6 +450,25 @@ impl FakeHost {
             return self.refuse(op);
         }
         match op {
+            HostOp::Project(ProjectOp::List { win, serial }) => {
+                let rows = self.project_rows.borrow().clone();
+                self.post(HostEvent::Project(ProjectEvent::Rows {
+                    win: *win,
+                    serial: *serial,
+                    rows,
+                }));
+            }
+            HostOp::Project(ProjectOp::Path { win, serial, .. }) => {
+                self.post(HostEvent::Project(ProjectEvent::PathAnswer {
+                    win: *win,
+                    serial: *serial,
+                    answer: crate::project_chooser::PathAnswer::Stuck,
+                }));
+            }
+            HostOp::Project(ProjectOp::FolderDialog { win }) => {
+                self.post(HostEvent::Project(ProjectEvent::Folder { win: *win, path: None }));
+            }
+            HostOp::Project(ProjectOp::Open { .. }) => {}
             HostOp::Chat(ChatOp::Forget {
                 view, tab: Some(tab), ..
             }) if view.is_base() => {
@@ -556,7 +585,7 @@ impl FakeHost {
                     FocusTo::TopBarItem(_) => Some(FocusOwner::TopBar),
                     FocusTo::RenameEntry => Some(FocusOwner::RenameEntry),
                     // The host reports no owner for a screen that is not a module, as the toolkit's does.
-                    FocusTo::Onboarding | FocusTo::Nothing => None,
+                    FocusTo::Onboarding | FocusTo::ProjectChooser | FocusTo::Nothing => None,
                 };
                 self.native_focus(*win, owner);
             }
@@ -672,6 +701,12 @@ impl super::conformance::GridObserve for FakeHost {
 }
 
 impl HostReads for FakeHost {
+    fn project_chooser_env(&self, win: WinId) -> ChooserEnv {
+        self.project_env
+            .borrow()
+            .clone()
+            .unwrap_or_else(|| NoReads.project_chooser_env(win))
+    }
     fn compositor_name(&self) -> &'static str {
         self.compositor.get().unwrap_or("the compositor")
     }

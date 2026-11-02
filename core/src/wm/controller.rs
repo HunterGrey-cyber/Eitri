@@ -1430,6 +1430,7 @@ impl Controller {
                 if !*active {
                     super::grid::drag::release(w);
                     super::reopen::focus_out(w, win, batch);
+                    verbs::project::dismiss(w, win, batch);
                 }
                 super::focus::on_active(w, win, *active, batch);
             }
@@ -1588,7 +1589,13 @@ impl Decide for Controller {
                 return batch;
             }
         }
-        if super::start::event_window(&event).is_some_and(|win| self.awaiting_layout(win, &event)) {
+        if super::start::event_window(&event).is_some_and(|win| {
+            if matches!(&event, HostEvent::Project(_)) {
+                self.awaiting_layout(win, "project event")
+            } else {
+                self.awaiting_layout(win, &event)
+            }
+        }) {
             return batch;
         }
         // A view stays busy while another of its tabs runs, and a `tab.break` waits only for its own tab: the panel
@@ -1830,6 +1837,24 @@ impl Decide for Controller {
             HostEvent::TopBarEntry { win, ev } => {
                 if let Some(window) = self.windows.get_mut(&win) {
                     verbs::workspaces::entry(window, win, ev, &mut batch);
+                }
+            }
+            HostEvent::Project(event) => {
+                let win = event.win();
+                if let Some(window) = self.windows.get_mut(&win) {
+                    verbs::project::event(window, win, event, &mut batch);
+                }
+            }
+            HostEvent::Refused {
+                what: OpTag::Project,
+                why,
+                ..
+            } => {
+                for (win, window) in &mut self.windows {
+                    // A refused dialog cannot answer later, so release its input hold before dismissing.
+                    verbs::project::event(window, *win, ProjectEvent::Folder { win: *win, path: None }, &mut batch);
+                    verbs::project::dismiss(window, *win, &mut batch);
+                    window.refuse(*win, why.clone(), &mut batch);
                 }
             }
             HostEvent::Onboarding(event) => {
@@ -2175,6 +2200,9 @@ impl Decide for Controller {
         let Some(window) = self.windows.get_mut(&win) else {
             return (Verdict::PassThrough, batch);
         };
+        if window.project_chooser.is_some() {
+            return (Verdict::PassThrough, batch);
+        }
         match stage {
             KeyStage::Window => {
                 let (verdict, command) = super::keys::window_press(window, win, press, &mut batch);
@@ -2350,6 +2378,7 @@ impl Controller {
             verbs::Family::Focus => verbs::focus::run(window, &*reads, win, &action, &mut batch),
             verbs::Family::Keys => verbs::keys::run(window, win, &action, keycode, &keymap(), &mut batch),
             verbs::Family::Chrome => verbs::chrome::run(window, win, &action, &mut batch),
+            verbs::Family::Project => verbs::project::run(window, &*reads, win, &setup, &mut batch),
             verbs::Family::Workspaces => verbs::workspaces::run(window, &*reads, win, &action, &setup, &mut batch),
             verbs::Family::Floats => {
                 let keymap = keymap();

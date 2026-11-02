@@ -53,7 +53,8 @@ pub fn classify(action: &Action) -> CompanionVerb {
         Action::Hint => CompanionVerb::Hint,
         Action::SendPrefix | Action::SendKeys(_) => CompanionVerb::Literal,
         Action::Select(dir) => CompanionVerb::Select(*dir),
-        Action::FloatToggle
+        Action::ProjectChoose
+        | Action::FloatToggle
         | Action::FocusModeToggle
         | Action::ScratchpadShow { .. }
         | Action::ScratchpadMove
@@ -180,6 +181,7 @@ mod tests {
             (Action::WorkspaceStep { forward: false }, CompanionVerb::Refuse),
             (Action::WorkspaceStep { forward: true }, CompanionVerb::Refuse),
             (Action::WorkspaceLast, CompanionVerb::Refuse),
+            (Action::ProjectChoose, CompanionVerb::Refuse),
             (Action::WorkspaceChoose, CompanionVerb::Refuse),
             (Action::WorkspaceRename, CompanionVerb::Refuse),
             (Action::WorkspaceSwitch { name: "x".into() }, CompanionVerb::Refuse),

@@ -252,4 +252,10 @@ mod tests {
             );
         }
     }
+
+    #[test]
+    fn the_leader_group_lists_it() {
+        assert_eq!(key("O").words, ["project.choose"]);
+        assert_eq!(key("O").desc, "open a project");
+    }
 }

@@ -73,6 +73,8 @@ pub struct ChromeModel {
     /// the screen gave back. Set where it changes ([`touched`]), as the prompt is, so it has no field of its own
     /// among the derived ones.
     pub onboarding: Option<OnboardingView>,
+    /// The chooser's view, set where its model changes.
+    pub project_chooser: Option<crate::project_chooser::ChooserView>,
 }
 
 /// A y/n the window asks: its text, as plain text, and whether it is the window close's own question.

@@ -298,6 +298,12 @@ pub struct Window {
     pub(super) start_windows_idle: Option<TimerToken>,
     /// The first-start screen while one is up.
     pub(super) onboarding: Option<super::onboarding::OnboardingState>,
+    /// The project chooser while it owns the window's input.
+    pub(super) project_chooser: Option<super::verbs::project::ProjectChooserState>,
+    /// Each opening has its own request serial namespace.
+    pub(super) project_generation: u32,
+    /// The last launch failure already shown, cleared by a new launch.
+    pub(super) project_failure: Option<(std::path::PathBuf, Option<i32>)>,
     /// Compositor mode's first-start toast, until the screen is ruled out or has closed.
     pub(super) first_toast: Option<String>,
     /// How many times the window asked for the screen's check: the generation the next screen opens under. An
@@ -376,6 +382,9 @@ impl Window {
             restore_idle: None,
             start_windows_idle: None,
             onboarding: None,
+            project_chooser: None,
+            project_generation: 0,
+            project_failure: None,
             first_toast: None,
             onboarding_generation: 0,
             chrome: ChromeModel::default(),

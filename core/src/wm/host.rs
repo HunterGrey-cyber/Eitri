@@ -11,6 +11,7 @@ use crate::keymap::{
 use crate::layout::{kill::Reopen, Arrangement, Direction, Frame, ModuleId, Size};
 use crate::onboarding::screen::{CheckWhy, MarkerEvent};
 use crate::onboarding::{Found, Generated, Opening, WriteOutcome};
+use crate::project_chooser::{LineEv, PathAnswer, Row};
 use crate::tabs::{TabId, ViewId};
 use crate::window_link::moves::MoveId;
 use crate::window_link::names::WindowName;
@@ -240,6 +241,13 @@ pub struct EditorFacts {
 /// the controller: the grid's size and measures, the editor's cell and whether it runs, and whether a chat page
 /// claims a navigation key.
 pub trait HostReads {
+    /// Cached environment for the chooser; no environment or filesystem reads happen in the controller.
+    fn project_chooser_env(&self, _win: WinId) -> ChooserEnv {
+        ChooserEnv {
+            home: None,
+            lang: crate::onboarding::Lang::En,
+        }
+    }
     /// Terminals with a running foreground job, counted without waiting for a child.
     fn terminal_jobs(&self, win: WinId) -> usize {
         let _ = win;
@@ -525,6 +533,8 @@ pub trait Allocator {
 /// One complete native or service operation.
 #[derive(Debug, Clone, PartialEq)]
 pub enum HostOp {
+    /// Work performed outside the project chooser's model.
+    Project(ProjectOp),
     /// Creates a window without showing it.
     OpenWindow { win: WinId, spec: WindowSpec },
     /// Presents a window using optional native authorization.
@@ -789,6 +799,8 @@ pub struct RestackMove {
 /// The possible destinations for keys.
 #[derive(Debug, Clone, PartialEq)]
 pub enum FocusTo {
+    /// The project chooser's line, reported as non-module focus.
+    ProjectChooser,
     /// A module surface.
     Module(ModuleId),
     /// An indexed top-bar item.
@@ -1177,6 +1189,8 @@ pub enum TextSizeEvent {
 /// Facts posted by the native host and services.
 #[derive(Debug, Clone, PartialEq)]
 pub enum HostEvent {
+    /// Input and worker answers for the project chooser.
+    Project(ProjectEvent),
     /// A text-size action or service fact.
     TextSize(TextSizeEvent),
     /// A watched hardware key was released.
@@ -1283,6 +1297,84 @@ pub enum HostEvent {
         why: String,
         surface: Option<(WinId, ModuleId)>,
     },
+}
+
+/// The cached environment a host supplies when a project chooser opens.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ChooserEnv {
+    pub home: Option<PathBuf>,
+    pub lang: crate::onboarding::Lang,
+}
+
+/// Project work the host carries out without blocking its event thread.
+#[derive(Debug, Clone, PartialEq)]
+pub enum ProjectOp {
+    List {
+        win: WinId,
+        serial: u64,
+    },
+    Path {
+        win: WinId,
+        serial: u64,
+        text: String,
+        base: PathBuf,
+    },
+    FolderDialog {
+        win: WinId,
+    },
+    Open {
+        win: WinId,
+        target: PathBuf,
+    },
+}
+
+/// Project input and facts. Request serials distinguish replies from an earlier opening or line.
+#[derive(Debug, Clone, PartialEq)]
+pub enum ProjectEvent {
+    Rows {
+        win: WinId,
+        serial: u64,
+        rows: Vec<Row>,
+    },
+    PathAnswer {
+        win: WinId,
+        serial: u64,
+        answer: PathAnswer,
+    },
+    Line {
+        win: WinId,
+        ev: LineEv,
+    },
+    Pick {
+        win: WinId,
+        index: usize,
+    },
+    Dismiss {
+        win: WinId,
+    },
+    Folder {
+        win: WinId,
+        path: Option<PathBuf>,
+    },
+    OpenFailed {
+        win: WinId,
+        path: PathBuf,
+        code: Option<i32>,
+    },
+}
+
+impl ProjectEvent {
+    pub fn win(&self) -> WinId {
+        match self {
+            Self::Rows { win, .. }
+            | Self::PathAnswer { win, .. }
+            | Self::Line { win, .. }
+            | Self::Pick { win, .. }
+            | Self::Dismiss { win }
+            | Self::Folder { win, .. }
+            | Self::OpenFailed { win, .. } => *win,
+        }
+    }
 }
 
 /// What the first-start screen's workers and the shell report. Each carries the generation of the
@@ -1841,6 +1933,8 @@ impl PartialEq for Descriptors {
 /// The operation kind carried by a refusal.
 #[derive(Debug, Clone, PartialEq)]
 pub enum OpTag {
+    /// Identifies project chooser work.
+    Project,
     /// Identifies OpenWindow operations.
     OpenWindow,
     /// Identifies Present operations.
@@ -1930,6 +2024,7 @@ impl OpTag {
     /// Identifies an operation without retaining its payload.
     pub fn of(op: &HostOp) -> Self {
         match op {
+            HostOp::Project(_) => Self::Project,
             HostOp::OpenWindow { .. } => Self::OpenWindow,
             HostOp::Present { .. } => Self::Present,
             HostOp::OpenAnswer { .. } => Self::OpenAnswer,
@@ -2386,6 +2481,7 @@ mod tests {
         tag!(HostOp::Cleanup(CleanupOp::Feeds), Cleanup);
         tag!(HostOp::Pair(PairOp::Unrestored { win }), Pair);
         tag!(HostOp::Onboarding(OnboardingOp::OpenTutor { win }), Onboarding);
+        tag!(HostOp::Project(ProjectOp::List { win, serial: 1 }), Project);
         tag!(HostOp::Lua(emit("changed")), Lua);
     }
 }

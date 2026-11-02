@@ -676,4 +676,22 @@ mod tests {
         }
         assert!(words.contains(&"tab.break".to_string()));
     }
+
+    #[test]
+    fn eitri_runs_it_and_completion_lists_it() {
+        assert_eq!(request("project.choose"), LayoutRequest::Run(Action::ProjectChoose));
+        assert!(Action::ProjectChoose.is_layout());
+        assert_eq!(run_refusal("project.choose", &Action::ProjectChoose), None);
+        assert!(
+            completion_words(&NAMES.iter().map(|name| name.to_string()).collect::<Vec<_>>(), &[])
+                .first
+                .contains(&"project.choose".to_string())
+        );
+    }
+
+    #[test]
+    fn eitri_refuses_a_word_with_a_slash() {
+        assert!(refusal("project.choose /x").contains("characters A-Z"));
+        assert!(parse_words(&["project.choose".into(), "/x".into()], &[]).is_err());
+    }
 }

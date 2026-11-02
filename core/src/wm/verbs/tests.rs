@@ -209,6 +209,7 @@ fn decided_here(action: &Action) -> bool {
         | Action::WorkspaceLast
         | Action::WorkspaceNew
         | Action::WorkspaceSwitch { .. }
+        | Action::ProjectChoose
         | Action::WorkspaceChoose
         | Action::WorkspaceRename
         | Action::WindowNew
@@ -246,6 +247,7 @@ pub(super) fn one_of_each() -> Vec<Action> {
         Action::ScratchpadMove,
         Action::WorkspaceStep { forward: true },
         Action::WorkspaceLast,
+        Action::ProjectChoose,
         Action::WorkspaceChoose,
         Action::WorkspaceRename,
         Action::WorkspaceSwitch { name: "two".into() },
@@ -600,4 +602,41 @@ fn every_lua_request_is_decided_and_sent_to_the_controller() {
     r.controller.lua_request(WIN, LayoutRequest::Switch("two".into()));
     assert_eq!(r.controller.chrome(WIN).top_bar.workspace.as_deref(), Some("two"));
     assert!(r.controller.notes(WIN).contains(&"[workspace] made two".into()));
+}
+
+#[test]
+fn project_choose_runs_with_a_container_selected_and_leaves_it() {
+    let mut r = rig(three_with_a_container_selected());
+    let before = r.layout.borrow().clone();
+    assert_eq!(Action::ProjectChoose.selection_rule(), SelectionRule::Takes);
+    assert_eq!(
+        selection_gate(&Action::ProjectChoose, before.selection()),
+        SelectionGate::Run { reset: false }
+    );
+    r.run(Action::ProjectChoose);
+    assert_eq!(*r.layout.borrow(), before);
+    assert!(r
+        .controller
+        .notes(WIN)
+        .iter()
+        .any(|note| note == "[project] chooser open"));
+    assert!(r.controller.chrome(WIN).toast.is_none());
+}
+
+#[test]
+fn a_float_with_the_keys_does_not_stop_it() {
+    let mut r = rig(three(terminal()));
+    r.run(Action::FloatToggle);
+    let before = r.layout.borrow().clone();
+    assert!(before.is_floating(&terminal()));
+    assert_eq!(Action::ProjectChoose.on_a_float(), FloatRule::Tiles);
+    assert_eq!(float_gate(&Action::ProjectChoose, true), FloatGate::Run);
+    r.run(Action::ProjectChoose);
+    assert_eq!(*r.layout.borrow(), before);
+    assert!(r
+        .controller
+        .notes(WIN)
+        .iter()
+        .any(|note| note == "[project] chooser open"));
+    assert!(r.controller.chrome(WIN).toast.is_none());
 }

@@ -384,6 +384,7 @@ impl Controller {
 /// Every window-addressed fact is checked before any layout-dependent handler runs.
 pub(super) fn event_window(event: &HostEvent) -> Option<WinId> {
     let win = match event {
+        HostEvent::Project(event) => return Some(event.win()),
         HostEvent::KeyReleased { win, .. }
         | HostEvent::CtrlReleased { win }
         | HostEvent::Pointer { win, .. }

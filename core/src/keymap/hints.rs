@@ -46,12 +46,13 @@ pub struct HintGroup {
 }
 
 /// The groups in the order the panel shows them, each with the families whose bindings it lists.
-const GROUPS: [(&str, &[Family]); 6] = [
+const GROUPS: [(&str, &[Family]); 7] = [
     ("Tabs", &[Family::Panel]),
     ("Modules", &[Family::Modules, Family::Focus, Family::Close]),
     ("Layout", &[Family::Tiling]),
     ("Workspaces", &[Family::Floats, Family::Workspaces]),
     ("Windows", &[Family::Windows]),
+    ("Projects", &[Family::Project]),
     ("Other", &[Family::Keys, Family::Chrome, Family::TextSize]),
 ];
 
@@ -235,7 +236,7 @@ mod tests {
         let titles: Vec<&str> = groups.iter().map(|g| g.title).collect();
         assert_eq!(
             titles,
-            ["Tabs", "Modules", "Layout", "Workspaces", "Other"],
+            ["Tabs", "Modules", "Layout", "Workspaces", "Projects", "Other"],
             "no default binding is a Windows one, and an empty group is left out"
         );
         for binding in keymap.bindings() {
@@ -357,5 +358,21 @@ mod tests {
         assert_eq!(join_keys(&keys(&["1", "2", "3", "x"])), "1-3 x");
         assert_eq!(join_keys(&keys(&["1", "3", "4", "5"])), "1 3-5");
         assert_eq!(join_keys(&keys(&["M-1", "M-2", "M-3"])), "Alt+1 Alt+2 Alt+3");
+    }
+
+    #[test]
+    fn project_choose_has_its_own_family_and_group() {
+        assert_eq!(family(&Action::ProjectChoose), Family::Project);
+        assert_eq!(GROUPS[group_of(Family::Project)], ("Projects", &[Family::Project][..]));
+        let map = Keymap::defaults();
+        let groups = map.panel_groups(&plain_keys(&map), &title, |_| true);
+        let projects = groups.iter().find(|group| group.title == "Projects").unwrap();
+        assert_eq!(
+            projects.rows,
+            [HintRow {
+                keys: "O".into(),
+                label: "open a project".into()
+            }]
+        );
     }
 }

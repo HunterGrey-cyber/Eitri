@@ -56,7 +56,8 @@ pub fn classify_window1(action: &Action) -> HubVerb {
         | Action::WindowSetup
         | Action::ModuleHide
         | Action::ModuleHideByKey
-        | Action::ModuleKill => HubVerb::AsToday,
+        | Action::ModuleKill
+        | Action::ProjectChoose => HubVerb::AsToday,
         Action::Module(id) => match id.kind() {
             ModuleKind::Editor | ModuleKind::Terminal | ModuleKind::Canvas => HubVerb::AsToday,
             ModuleKind::Agent | ModuleKind::LuaWebview => HubVerb::RaiseOrSpawn(id.clone()),
@@ -121,7 +122,8 @@ pub fn classify_module(action: &Action) -> ModuleVerb {
         | Action::Hint
         | Action::SendPrefix
         | Action::SendKeys(_)
-        | Action::ModuleKill => ModuleVerb::AsToday,
+        | Action::ModuleKill
+        | Action::ProjectChoose => ModuleVerb::AsToday,
         Action::Select(dir) => ModuleVerb::EdgeToCompositor(*dir),
         Action::Module(id) => match id.kind() {
             ModuleKind::Editor => ModuleVerb::AsToday,
@@ -235,6 +237,7 @@ mod tests {
             Action::ScratchpadMove,
             Action::WorkspaceStep { forward: true },
             Action::WorkspaceLast,
+            Action::ProjectChoose,
             Action::WorkspaceChoose,
             Action::WorkspaceRename,
             Action::WorkspaceSwitch { name: "w".to_string() },
@@ -307,6 +310,8 @@ mod tests {
         let module = |action: Action, want: ModuleVerb| {
             assert_eq!(classify_module(&action), want, "module window: {action:?}");
         };
+        hub(Action::ProjectChoose, H::AsToday);
+        module(Action::ProjectChoose, M::AsToday);
         for dir in [Direction::Left, Direction::Down, Direction::Up, Direction::Right] {
             hub(Action::Select(dir), H::AsToday);
             module(Action::Select(dir), M::EdgeToCompositor(dir));
@@ -442,6 +447,7 @@ mod tests {
             Family::Keys,
             Family::Chrome,
             Family::Modules,
+            Family::Project,
             Family::Workspaces,
             Family::Windows,
             Family::Floats,

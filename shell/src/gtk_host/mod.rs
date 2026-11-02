@@ -1002,6 +1002,7 @@ impl GtkHost {
             FocusTo::TopBarItem(item) => return self.focus_top_bar(op, win, *item),
             FocusTo::RenameEntry => return self.focus_rename_entry(op, win),
             FocusTo::Onboarding => return self.focus_onboarding(op, win),
+            FocusTo::ProjectChooser => return self.refuse(op, NOT_CARRIED_OUT),
             FocusTo::Nothing => return self.refuse(op, NOT_CARRIED_OUT),
         };
         // Cloned out first: the function grabs, and GTK notifies the focus change from inside it.
@@ -1593,6 +1594,7 @@ impl Host for GtkHost {
             HostOp::Chrome { win, .. } => self.chrome(op, *win),
             HostOp::Hint(call) => self.hint(op, call),
             HostOp::Onboarding(call) => self.onboarding(op, call),
+            HostOp::Project(_) => self.refuse(op, NOT_CARRIED_OUT),
             HostOp::Editor(call @ EditorCall::Quit { win, generation, .. }) => {
                 let applied = self.service(op, |s| s.editor(call));
                 // A refusal names no call, so the quit that sent nothing is told as its own fact, with its

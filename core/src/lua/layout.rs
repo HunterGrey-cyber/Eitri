@@ -2339,4 +2339,15 @@ mod tests {
         live.borrow_mut().set_away(&t2, false).unwrap();
         assert_eq!(read(&lua).1, Vec::<String>::new(), "back, it is no longer away");
     }
+
+    #[test]
+    fn project_choose_queues_a_run_without_a_key_wait() {
+        let (lua, store, _) = attached(Layout::initial(&[]).unwrap());
+        assert_eq!(run_refusal("project.choose", &Action::ProjectChoose), None);
+        lua.load("eitri.layout.run('project.choose')").exec().unwrap();
+        assert_eq!(
+            store.borrow_mut().take_requests(),
+            [LayoutRequest::Run(Action::ProjectChoose)]
+        );
+    }
 }
