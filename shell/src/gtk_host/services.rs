@@ -303,6 +303,10 @@ pub(crate) struct Teardown {
     pub(crate) ide: Option<Rc<crate::ide_wiring::IdeWiring>>,
 }
 
+/// How long a close waits for its last activation to reach the lock: a mark in the recent list, so less than the pair
+/// file's last write gets.
+const LAST_STAMP_WAIT: std::time::Duration = std::time::Duration::from_millis(250);
+
 impl Teardown {
     /// The record's writer and the channel directory nvim leaves its last record in, when this window reopens.
     fn reopen(&self) -> Option<(&eitri_core::editor_record::RecordWriter, &std::path::Path)> {
@@ -341,6 +345,9 @@ impl Teardown {
         });
         if let Some(link) = pair.link() {
             link.close(&pair.closed_words());
+        }
+        if !pair.stamp().finish(LAST_STAMP_WAIT) {
+            eprintln!("[project] the last use was still being written; not waiting longer");
         }
     }
 

@@ -54,6 +54,7 @@ use super::registry::{ModuleLink, ModuleWindows, OpenModule, MODULE_WINDOWS_ARE_
 use super::relink::{self, HeldNow, OrphanSocket, Relinked};
 use super::{LinkEnd, WindowNew, WindowRole, KEPT_WORDS, NO_OTHER_WINDOW};
 use crate::agent_panel::TabAnswer;
+use crate::project_stamp::{ProjectStamp, StampSlot};
 use eitri_core::saved_tabs::{SavedTab, SavedTabs};
 
 /// Window 1's name on the link.
@@ -248,6 +249,8 @@ pub struct Pair {
     /// Window 2 and a module window: the pair lock their `welcome` carried, kept for as long as the window lives, so
     /// an orphan can hand a copy to the window 1 that comes back for it.
     second_lock: Rc<RefCell<Option<PairLock>>>,
+    /// What marks this window's activations on the lock, once it has a lock to mark.
+    stamp: Rc<StampSlot>,
     /// Window 2 only, while orphaned: the socket a new window 1 links through.
     orphan: RefCell<Option<Orphan>>,
     /// A window 1 that linked to an orphan before it was built: what the orphan said it holds, for the layout phase.
@@ -298,9 +301,11 @@ impl Pair {
         let hooks: Hooks = Rc::default();
         let lock: Rc<RefCell<Option<PairLock>>> = Rc::default();
         let name = WindowName::Second;
-        let link = link_second(sock, &name, linked_hook(&hooks, name.clone(), HUB_PEER), lock.clone())?;
-        // The link's handler fills the slot once `welcome` comes.
-        let pair = Pair::with_hooks(WindowRole::Second { link }, None, root, hooks, lock);
+        let stamp: Rc<StampSlot> = Rc::default();
+        let made = linked_hook(&hooks, name.clone(), HUB_PEER);
+        let link = link_second(sock, &name, made, lock.clone(), stamp.clone())?;
+        // The link's handler fills the slots once `welcome` comes.
+        let pair = Pair::with_hooks(WindowRole::Second { link }, None, root, hooks, lock, stamp);
         Ok(pair)
     }
 
@@ -308,13 +313,16 @@ impl Pair {
     pub fn module(sock: OwnedFd, name: WindowName, root: &Path) -> io::Result<Rc<Pair>> {
         let hooks: Hooks = Rc::default();
         let lock: Rc<RefCell<Option<PairLock>>> = Rc::default();
-        let link = link_second(sock, &name, linked_hook(&hooks, name.clone(), HUB_PEER), lock.clone())?;
+        let stamp: Rc<StampSlot> = Rc::default();
+        let made = linked_hook(&hooks, name.clone(), HUB_PEER);
+        let link = link_second(sock, &name, made, lock.clone(), stamp.clone())?;
         Ok(Pair::with_hooks(
             WindowRole::Module { name, link },
             None,
             root,
             hooks,
             lock,
+            stamp,
         ))
     }
 
@@ -402,7 +410,7 @@ impl Pair {
     }
 
     fn new(role: WindowRole, lock: Option<PairLock>, root: &Path) -> Rc<Pair> {
-        Pair::with_hooks(role, lock, root, Rc::default(), Rc::default())
+        Pair::with_hooks(role, lock, root, Rc::default(), Rc::default(), Rc::default())
     }
 
     fn with_hooks(
@@ -411,6 +419,7 @@ impl Pair {
         root: &Path,
         hooks: Hooks,
         second_lock: Rc<RefCell<Option<PairLock>>>,
+        stamp: Rc<StampSlot>,
     ) -> Rc<Pair> {
         let modules: Rc<RefCell<ModuleWindows>> = Rc::default();
         let pair = Rc::new(Pair {
@@ -438,6 +447,7 @@ impl Pair {
             module_failed: Rc::default(),
             closes: WindowCloses::new(Rc::downgrade(&modules)),
             second_lock,
+            stamp,
             orphan: RefCell::new(None),
             relinked: RefCell::new(None),
             relink_unannounced: std::cell::Cell::new(false),
@@ -688,6 +698,19 @@ impl Pair {
     /// Keeps `claim` until this window ends, whichever way it came to lead the group.
     pub fn hold_group_claim(&self, claim: Option<GroupClaim>) {
         *self.group_claim.borrow_mut() = claim;
+    }
+
+    /// Starts the stamp of the lock this window started with, if it has one: `root` for the window that took the lock,
+    /// `None` for one that adopted a copy. An unpaired or lone window has none and does nothing.
+    pub(crate) fn start_stamp(&self, root: Option<PathBuf>) {
+        if let Some(lock) = &self.lock {
+            self.stamp.fill(ProjectStamp::start(lock, root));
+        }
+    }
+
+    /// What this window's activations go to.
+    pub(crate) fn stamp(&self) -> Rc<StampSlot> {
+        self.stamp.clone()
     }
 
     /// Whether this window holds the project's pair lock as its window 1: the one that reads the pair file at
@@ -2345,12 +2368,13 @@ fn answer_hello(
 
 /// The window `name`, started by window 1: starts the link on its checked end, says `hello`, and links on `welcome`,
 /// adopting the pair lock it carries into `lock`, which the window keeps, so the lock is held for as long as this
-/// window lives, after the link ended too. `linked` runs once linked.
+/// window lives, after the link ended too, and starting `stamp` on it. `linked` runs once linked.
 pub fn link_second(
     sock: OwnedFd,
     name: &WindowName,
     linked: LinkMade,
     lock: Rc<RefCell<Option<PairLock>>>,
+    stamp: Rc<StampSlot>,
 ) -> io::Result<LinkDriver> {
     // SAFETY: neither call has preconditions or can fail.
     let (pid, parent) = unsafe { (libc::getpid(), libc::getppid()) };
@@ -2363,7 +2387,7 @@ pub fn link_second(
     {
         let lock = lock.clone();
         link.on("welcome", move |link, msg, fds| {
-            take_welcome(link, &msg, fds, parent, &lock, &linked);
+            take_welcome(link, &msg, fds, parent, &lock, &stamp, &linked);
         });
     }
     link.send(hello(crate::version::fingerprint(), name, pid, start), Vec::new())
@@ -2378,6 +2402,7 @@ fn take_welcome(
     fds: Vec<OwnedFd>,
     parent: u32,
     lock: &Rc<RefCell<Option<PairLock>>>,
+    stamp: &StampSlot,
     linked: &LinkMade,
 ) {
     if link.linked() {
@@ -2396,7 +2421,10 @@ fn take_welcome(
     // The link checked that `welcome` carries exactly one descriptor.
     let Some(fd) = fds.into_iter().next() else { return };
     match PairLock::adopt(fd) {
-        Ok(adopted) => *lock.borrow_mut() = Some(adopted),
+        Ok(adopted) => {
+            stamp.fill(ProjectStamp::start(&adopted, None));
+            *lock.borrow_mut() = Some(adopted);
+        }
         Err(err) => {
             let why = format!("the pair lock in welcome is not one ({err})");
             eprintln!("[link] {why}; the link is closed");
@@ -2692,6 +2720,61 @@ mod tests {
             let status = second.wait_reaped(Duration::from_secs(10)).expect("reaped");
             assert_eq!(signal_of(status), Some(libc::SIGKILL), "{status:?}");
         }
+    }
+
+    #[test]
+    fn only_a_window_with_the_lock_starts_a_stamp() {
+        let dir = crate::linked_window::tests::Scratch::new("stamp-roles");
+        let root = Path::new("/home/someone/project");
+        let lock = PairLock::try_take(&dir.0, root).unwrap().unwrap();
+        let path = dir.0.join(eitri_core::window_link::pair::pair_lock_name(root));
+
+        for taken in [Ok(None), Err(io::Error::other("no state directory"))] {
+            let pair = Pair::full(taken, root, false, false);
+            pair.start_stamp(Some(root.to_path_buf()));
+            assert!(
+                !pair.stamp().started(),
+                "an unpaired or lone window holds no descriptor"
+            );
+        }
+
+        let adopted = PairLock::adopt(lock.share().unwrap()).unwrap();
+        let pair = Pair::new(WindowRole::Main { link: None }, Some(adopted), root);
+        pair.start_stamp(None);
+        assert!(pair.stamp().started());
+        assert_eq!(
+            std::fs::read(&path).unwrap(),
+            b"",
+            "only the window that took the lock names the root"
+        );
+    }
+
+    /// A chat window's lock comes in `welcome`, after its window may already have taken activation.
+    #[test]
+    fn a_window_that_adopts_its_lock_in_welcome_stamps_its_activations() {
+        let dir = crate::linked_window::tests::Scratch::new("stamp-welcome");
+        let root = Path::new("/home/someone/project");
+        let lock = PairLock::try_take(&dir.0, root).unwrap().unwrap();
+        let path = dir.0.join(eitri_core::window_link::pair::pair_lock_name(root));
+        let (one, two) = fdpass::seqpacket_pair().unwrap();
+        let pair = Pair::module(two, WindowName::Chat(2), root).unwrap();
+        let at = std::time::SystemTime::now() + Duration::from_secs(3600);
+        pair.stamp().activated(at);
+        assert!(!pair.stamp().started());
+
+        let (handle, _inbound) = LinkHandle::start(one, PresenceFlag::default()).unwrap();
+        handle
+            .send(welcome(Default::default(), Vec::new()), vec![lock.share().unwrap()])
+            .unwrap();
+        let link = pair.link().unwrap();
+        assert!(pump_until(&link, || link.linked()));
+        assert!(pair.stamp().started());
+        let deadline = std::time::Instant::now() + Duration::from_secs(30);
+        while std::fs::metadata(&path).unwrap().modified().unwrap() < at - Duration::from_secs(1) {
+            assert!(std::time::Instant::now() < deadline, "the activation never landed");
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        assert_eq!(std::fs::read(&path).unwrap(), b"");
     }
 
     #[test]

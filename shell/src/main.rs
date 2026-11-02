@@ -40,6 +40,7 @@ mod plugin_page;
 mod plugin_panels;
 mod prefix_strip;
 mod process_memory;
+mod project_stamp;
 mod root_conflicts;
 mod sidecar_probe;
 mod terminal;
@@ -519,6 +520,7 @@ fn main() -> glib::ExitCode {
                 match relinked {
                     StartRelink::Window2(relinked) => {
                         let pair = linked_window::spawn::Pair::relinked(relinked, &project_root, legacy, want_clean);
+                        pair.start_stamp(None);
                         if let Some(link) = pair.link() {
                             link.watch();
                         }
@@ -527,6 +529,7 @@ fn main() -> glib::ExitCode {
                     StartRelink::Modules(group, claim) => {
                         let pair = linked_window::spawn::Pair::relinked_group(group, &project_root, legacy, want_clean);
                         pair.hold_group_claim(Some(claim));
+                        pair.start_stamp(None);
                         pair.watch_module_links();
                         pair
                     }
@@ -543,6 +546,7 @@ fn main() -> glib::ExitCode {
                         };
                         let pair = linked_window::spawn::Pair::full(taken, &project_root, legacy, want_clean);
                         pair.hold_group_claim(claim);
+                        pair.start_stamp(Some(project_root.to_path_buf()));
                         pair
                     }
                 }
@@ -4608,6 +4612,7 @@ fn build_ui(
             }
         });
     }
+    project_stamp::watch_activation(&window, pair.stamp());
     driver.start(
         WinId::MAIN,
         StartStep::Present {

@@ -1,13 +1,17 @@
 //! The files of a linked pair. Window 1 keeps today's names, so an older build still reads them; window 2 writes
 //! `-w2` files and a window that runs unpaired writes `-u` files. One linked pair per project: the window holding
 //! `<hex>.pair.lock` is the pair's, and only it reads and writes the pair file, which records which window holds
-//! which module and each window's monitor.
+//! which module and each window's monitor. The lock file also keeps the project's place in the recent list: its
+//! content is the root, written by the window that took it, and its mtime the last time a window of the project gained
+//! activation.
 
 use std::collections::BTreeMap;
 use std::io;
 use std::os::fd::{AsFd, AsRawFd, BorrowedFd, OwnedFd};
-use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
+use std::os::unix::ffi::OsStrExt;
+use std::os::unix::fs::{FileExt, MetadataExt, OpenOptionsExt};
 use std::path::{Path, PathBuf};
+use std::time::SystemTime;
 
 use serde::{Deserialize, Serialize};
 
@@ -106,6 +110,34 @@ impl PairLock {
     /// A copy of the descriptor, to pass in `welcome`.
     pub fn share(&self) -> io::Result<OwnedFd> {
         self.fd.try_clone()
+    }
+
+    /// Makes `root`'s bytes the whole content of the file. A project's bytes never change, so writing them first and
+    /// cutting to their length after leaves no moment with less in the file, once it has been written; a cut first
+    /// would. The bytes are raw, so a root that is not UTF-8 survives.
+    pub fn stamp_root(fd: &OwnedFd, root: &Path) -> io::Result<()> {
+        let bytes = root.as_os_str().as_bytes();
+        let file = std::fs::File::from(fd.try_clone()?);
+        file.write_all_at(bytes, 0)?;
+        file.set_len(bytes.len() as u64)
+    }
+
+    /// Moves the file's mtime to `at`, and only ever forward: the windows of a project write the same file from their
+    /// own threads, and one that stalled must not undo a newer use. The check and the set are two steps, so two
+    /// processes can still cross by microseconds, and the worst of that is one row out of order.
+    pub fn touch(fd: &OwnedFd, at: SystemTime) -> io::Result<()> {
+        let file = std::fs::File::from(fd.try_clone()?);
+        if file.metadata()?.modified()? < at {
+            file.set_modified(at)?;
+        }
+        Ok(())
+    }
+
+    /// Sets the file's mtime to `at`, back as well as forward, for the window that took the lock to date its own
+    /// [`PairLock::stamp_root`]: that write carries the moment it landed, and only this can replace that. Anything
+    /// later goes through [`PairLock::touch`].
+    pub fn date_stamp(fd: &OwnedFd, at: SystemTime) -> io::Result<()> {
+        std::fs::File::from(fd.try_clone()?).set_modified(at)
     }
 }
 
@@ -240,7 +272,9 @@ pub fn mark_taken(path: &Path) -> io::Result<PathBuf> {
 mod tests {
     use super::*;
     use crate::test_scratch_dir::ScratchDir;
+    use std::os::unix::ffi::OsStrExt;
     use std::os::unix::fs::PermissionsExt;
+    use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
     fn root() -> PathBuf {
         PathBuf::from("/home/someone/project")
@@ -337,6 +371,155 @@ mod tests {
         let dir = ScratchDir::new("nv-pair", "claim-link");
         std::os::unix::fs::symlink("/dev/null", dir.join(group_claim_name(&root()))).unwrap();
         assert!(GroupClaim::try_take(&dir, &root()).is_err());
+    }
+
+    fn lock_path(dir: &Path) -> PathBuf {
+        dir.join(pair_lock_name(&root()))
+    }
+
+    fn mtime(path: &Path) -> SystemTime {
+        std::fs::metadata(path).unwrap().modified().unwrap()
+    }
+
+    /// An hour ahead in whole seconds: past any mtime a write just left, and exact on a filesystem that keeps
+    /// coarser times than nanoseconds.
+    fn later() -> SystemTime {
+        let now = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs();
+        UNIX_EPOCH + Duration::from_secs(now + 3600)
+    }
+
+    #[test]
+    fn the_stamp_is_the_roots_bytes_and_moves_the_mtime() {
+        let dir = ScratchDir::new("nv-pair", "stamp");
+        let lock = PairLock::try_take(&dir, &root()).unwrap().unwrap();
+        let path = lock_path(&dir);
+        let long_ago = UNIX_EPOCH + Duration::from_secs(1_000_000_000);
+        std::fs::File::open(&path).unwrap().set_modified(long_ago).unwrap();
+
+        PairLock::stamp_root(&lock.share().unwrap(), &root()).unwrap();
+        assert_eq!(std::fs::read(&path).unwrap(), root().as_os_str().as_bytes());
+        assert!(mtime(&path) > long_ago);
+
+        std::fs::write(&path, "x".repeat(root().as_os_str().len() + 40)).unwrap();
+        let not_utf8 = PathBuf::from(std::ffi::OsStr::from_bytes(b"/home/\xff/project"));
+        PairLock::stamp_root(&lock.share().unwrap(), &not_utf8).unwrap();
+        assert_eq!(
+            std::fs::read(&path).unwrap(),
+            b"/home/\xff/project",
+            "the whole content is the root's bytes, whatever was there"
+        );
+    }
+
+    #[test]
+    fn a_second_stamp_never_leaves_short_content() {
+        let dir = ScratchDir::new("nv-pair", "stamp-race");
+        let lock = PairLock::try_take(&dir, &root()).unwrap().unwrap();
+        let fd = lock.share().unwrap();
+        let long_root = PathBuf::from(format!("/home/someone/{}", "long-name/".repeat(300)));
+        PairLock::stamp_root(&fd, &long_root).unwrap();
+
+        let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let reader = {
+            let (stop, path) = (stop.clone(), lock_path(&dir));
+            let want = long_root.as_os_str().as_bytes().to_vec();
+            std::thread::spawn(move || {
+                let mut reads = 0u64;
+                loop {
+                    assert_eq!(std::fs::read(&path).unwrap(), want, "a reader saw short content");
+                    reads += 1;
+                    if stop.load(std::sync::atomic::Ordering::SeqCst) {
+                        return reads;
+                    }
+                }
+            })
+        };
+        for _ in 0..2000 {
+            PairLock::stamp_root(&fd, &long_root).unwrap();
+        }
+        stop.store(true, std::sync::atomic::Ordering::SeqCst);
+        assert!(reader.join().unwrap() > 0);
+    }
+
+    #[test]
+    fn a_stamp_keeps_the_flock_held() {
+        let dir = ScratchDir::new("nv-pair", "stamp-held");
+        let lock = PairLock::try_take(&dir, &root()).unwrap().unwrap();
+        PairLock::stamp_root(&lock.share().unwrap(), &root()).unwrap();
+        PairLock::touch(&lock.share().unwrap(), later()).unwrap();
+        assert!(PairLock::try_take(&dir, &root()).unwrap().is_none());
+    }
+
+    #[test]
+    fn touch_sets_the_mtime_through_a_shared_copy() {
+        let dir = ScratchDir::new("nv-pair", "touch");
+        let lock = PairLock::try_take(&dir, &root()).unwrap().unwrap();
+        let copy = PairLock::adopt(lock.share().unwrap()).unwrap();
+        let at = later();
+        PairLock::touch(&copy.share().unwrap(), at).unwrap();
+        assert_eq!(mtime(&lock_path(&dir)), at);
+    }
+
+    #[test]
+    fn two_touches_land_in_order() {
+        let dir = ScratchDir::new("nv-pair", "touch-order");
+        let lock = PairLock::try_take(&dir, &root()).unwrap().unwrap();
+        let fd = lock.share().unwrap();
+        let first = later();
+        let second = first + Duration::from_secs(1);
+        PairLock::touch(&fd, first).unwrap();
+        assert_eq!(mtime(&lock_path(&dir)), first);
+        PairLock::touch(&fd, second).unwrap();
+        assert_eq!(mtime(&lock_path(&dir)), second);
+    }
+
+    #[test]
+    fn an_older_touch_does_not_move_the_mtime_back() {
+        let dir = ScratchDir::new("nv-pair", "touch-back");
+        let lock = PairLock::try_take(&dir, &root()).unwrap().unwrap();
+        let fd = lock.share().unwrap();
+        let newer = later();
+        PairLock::touch(&fd, newer).unwrap();
+        PairLock::touch(&fd, newer - Duration::from_secs(60)).unwrap();
+        assert_eq!(mtime(&lock_path(&dir)), newer);
+    }
+
+    #[test]
+    fn dating_the_stamp_can_move_the_mtime_back() {
+        let dir = ScratchDir::new("nv-pair", "date-stamp");
+        let lock = PairLock::try_take(&dir, &root()).unwrap().unwrap();
+        let fd = lock.share().unwrap();
+        let newer = later();
+        PairLock::touch(&fd, newer).unwrap();
+        let older = newer - Duration::from_secs(60);
+        PairLock::date_stamp(&fd, older).unwrap();
+        assert_eq!(mtime(&lock_path(&dir)), older);
+    }
+
+    #[test]
+    fn a_read_only_lock_file_is_an_error_and_nothing_panics() {
+        let dir = ScratchDir::new("nv-pair", "read-only");
+        let lock = PairLock::try_take(&dir, &root()).unwrap().unwrap();
+        let path = lock_path(&dir);
+        let read_only = OwnedFd::from(std::fs::File::open(&path).unwrap());
+        assert!(PairLock::stamp_root(&read_only, &root()).is_err());
+        assert_eq!(std::fs::read(&path).unwrap(), b"");
+
+        drop(lock);
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o400)).unwrap();
+        // Root opens any file for writing, so the mode only shuts out an ordinary user.
+        if agent::private_fs::euid() != 0 {
+            assert!(PairLock::try_take(&dir, &root()).is_err());
+        }
+    }
+
+    #[test]
+    fn an_adopted_lock_and_an_unpaired_window_write_no_content() {
+        let dir = ScratchDir::new("nv-pair", "no-content");
+        let holder = PairLock::try_take(&dir, &root()).unwrap().unwrap();
+        let adopted = PairLock::adopt(holder.share().unwrap()).unwrap();
+        assert!(PairLock::try_take(&dir, &root()).unwrap().is_none());
+        PairLock::touch(&adopted.share().unwrap(), later()).unwrap();
+        assert_eq!(std::fs::read(lock_path(&dir)).unwrap(), b"");
     }
 
     #[test]

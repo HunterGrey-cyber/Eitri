@@ -691,16 +691,30 @@ pub fn read_private_to_string_capped(path: &Path, max_bytes: u64) -> std::io::Re
 /// [`read_private_to_string_capped`] for a name another process could have put in place: a symbolic link there
 /// is refused (`O_NOFOLLOW`), never followed, so what is read is the file at that name or nothing.
 pub fn read_private_nofollow_capped(path: &Path, max_bytes: u64) -> std::io::Result<String> {
-    let file = std::fs::OpenOptions::new()
-        .read(true)
-        .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK | libc::O_CLOEXEC)
-        .open(path)?;
-    read_capped(file, path, max_bytes)
+    read_capped(open_nofollow(path)?, path, max_bytes)
 }
 
-/// Reads an open `file` whole as UTF-8 when it is a regular file of the euid no longer than `max_bytes`, checked on
-/// the handle before reading and enforced while reading, so a file that grows meanwhile is refused too.
+/// [`read_private_nofollow_capped`] with no UTF-8 step, for a record that keeps a path's raw bytes.
+pub fn read_private_nofollow_bytes_capped(path: &Path, max_bytes: u64) -> std::io::Result<Vec<u8>> {
+    read_capped_bytes(open_nofollow(path)?, path, max_bytes)
+}
+
+fn open_nofollow(path: &Path) -> std::io::Result<std::fs::File> {
+    std::fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK | libc::O_CLOEXEC)
+        .open(path)
+}
+
+/// [`read_capped_bytes`] as UTF-8.
 fn read_capped(file: std::fs::File, path: &Path, max_bytes: u64) -> std::io::Result<String> {
+    let bytes = read_capped_bytes(file, path, max_bytes)?;
+    String::from_utf8(bytes).map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))
+}
+
+/// Reads an open `file` whole when it is a regular file of the euid no longer than `max_bytes`, checked on the handle
+/// before reading and enforced while reading, so a file that grows meanwhile is refused too.
+fn read_capped_bytes(file: std::fs::File, path: &Path, max_bytes: u64) -> std::io::Result<Vec<u8>> {
     use std::io::{Error, ErrorKind, Read};
     let meta = file.metadata()?;
     if !meta.is_file() || meta.uid() != euid() {
@@ -723,7 +737,7 @@ fn read_capped(file: std::fs::File, path: &Path, max_bytes: u64) -> std::io::Res
     if bytes.len() as u64 > max_bytes {
         return Err(over_cap(bytes.len() as u64));
     }
-    String::from_utf8(bytes).map_err(|e| Error::new(ErrorKind::InvalidData, e))
+    Ok(bytes)
 }
 
 /// Why a user's configuration directory is not used. Every later step works from the handle a good
@@ -1325,6 +1339,74 @@ mod tests {
                 .unwrap_err()
                 .kind(),
             std::io::ErrorKind::NotFound
+        );
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    /// The raw form refuses what the text form refuses: a link is not followed, a FIFO does not hold it, and the cap
+    /// holds.
+    #[test]
+    fn bytes_reader_refuses_a_link_a_fifo_and_past_the_cap() {
+        let dir = scratch("bytes-refusals");
+        let file = dir.join("lock");
+        write_private(&file, b"/home/someone/project").unwrap();
+        assert_eq!(
+            read_private_nofollow_bytes_capped(&file, 256).unwrap(),
+            b"/home/someone/project"
+        );
+
+        let link = dir.join("link");
+        std::os::unix::fs::symlink(&file, &link).unwrap();
+        assert!(
+            read_private_nofollow_bytes_capped(&link, 256).is_err(),
+            "a link is not followed"
+        );
+
+        let fifo = dir.join("fifo");
+        let c_path = std::ffi::CString::new(fifo.as_os_str().as_bytes()).unwrap();
+        // SAFETY: the NUL-terminated path remains valid for the call.
+        assert_eq!(unsafe { libc::mkfifo(c_path.as_ptr(), 0o600) }, 0);
+        let (tx, rx) = std::sync::mpsc::channel();
+        let path = fifo.clone();
+        std::thread::spawn(move || {
+            let _ = tx.send(read_private_nofollow_bytes_capped(&path, 256).map_err(|e| e.kind()));
+        });
+        let read = rx
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .expect("the read blocked on a FIFO");
+        assert_eq!(read, Err(std::io::ErrorKind::PermissionDenied));
+
+        assert_eq!(
+            read_private_nofollow_bytes_capped(&file, 4).unwrap_err().kind(),
+            std::io::ErrorKind::InvalidData,
+            "over the cap"
+        );
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn bytes_reader_refuses_a_file_of_another_uid() {
+        assert_eq!(
+            read_private_nofollow_bytes_capped(Path::new("/etc/passwd"), 1 << 20)
+                .unwrap_err()
+                .kind(),
+            std::io::ErrorKind::PermissionDenied
+        );
+    }
+
+    #[test]
+    fn bytes_reader_reads_non_utf8() {
+        let dir = scratch("bytes-raw");
+        let file = dir.join("lock");
+        write_private(&file, b"/home/\xff/project").unwrap();
+        assert_eq!(
+            read_private_nofollow_bytes_capped(&file, 256).unwrap(),
+            b"/home/\xff/project"
+        );
+        assert_eq!(
+            read_private_nofollow_capped(&file, 256).unwrap_err().kind(),
+            std::io::ErrorKind::InvalidData,
+            "the text form still refuses it"
         );
         std::fs::remove_dir_all(dir).unwrap();
     }
