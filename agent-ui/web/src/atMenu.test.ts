@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { atInsertion, atToken } from "./atMenu";
+import { atInsertion, atToken, editorMentionHint, editorMentionRows, withEditorMentions } from "./atMenu";
 
 describe("atToken", () => {
   it("opens only after a boundary, anywhere in a multiline draft", () => {
@@ -26,5 +26,30 @@ describe("atInsertion", () => {
     expect(atInsertion("with space.txt")).toEqual({ text: '@"with space.txt" ', keepOpen: false });
     expect(atInsertion("sub/")).toEqual({ text: "@sub/", keepOpen: true });
     expect(atInsertion("my dir/")).toEqual({ text: '@"my dir/"', keepOpen: true });
+  });
+});
+
+describe("the editor's own sources", () => {
+  it("lead the menu for a query they start with, and only then", () => {
+    expect(editorMentionRows("")).toEqual(["buffers", "quickfix", "diagnostics"]);
+    expect(editorMentionRows("q")).toEqual(["quickfix"]);
+    expect(editorMentionRows("DIA")).toEqual(["diagnostics"]);
+    expect(editorMentionRows("bufx")).toEqual([]);
+    expect(editorMentionRows("sub/b")).toEqual([]);
+    expect(editorMentionRows("b/")).toEqual([]);
+    expect(editorMentionRows("with sp")).toEqual([]);
+  });
+  it("lead the files they start, follow the files of a bare @, and a file of the same name is not listed twice", () => {
+    expect(withEditorMentions("b", ["build.rs", "buffers"])).toEqual(["buffers", "build.rs"]);
+    expect(withEditorMentions("s", ["src/", "small.txt"])).toEqual(["src/", "small.txt"]);
+    expect(withEditorMentions("", ["src/", "small.txt"])).toEqual(["src/", "small.txt", "buffers", "quickfix", "diagnostics"]);
+    expect(withEditorMentions("", [])).toEqual(["buffers", "quickfix", "diagnostics"]);
+  });
+  it("complete as a word, not a directory", () => {
+    expect(atInsertion("buffers")).toEqual({ text: "@buffers ", keepOpen: false });
+    expect(atInsertion("buffers", true)).toEqual({ text: '@"buffers" ', keepOpen: false });
+    expect(atInsertion("small.txt", true)).toEqual({ text: "@small.txt ", keepOpen: false });
+    expect(editorMentionHint("buffers")).toBeDefined();
+    expect(editorMentionHint("build.rs")).toBeUndefined();
   });
 });

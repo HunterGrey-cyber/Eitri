@@ -27,7 +27,9 @@ function setup(overrides: Partial<Props> = {}) {
   function query(value: string, items: string[]) { type(value); wait(); reply(items); }
   return { ...view, props, textarea, type, wait, reply, query, onAtQuery, onSend };
 }
-const names = (c: HTMLElement) => Array.from(c.querySelectorAll('[role="option"]')).map((r) => r.textContent);
+const names = (c: HTMLElement) =>
+  Array.from(c.querySelectorAll('[role="option"] .slash-menu-name')).map((r) => r.textContent);
+const selectedName = (c: HTMLElement) => c.querySelector('[aria-selected="true"] .slash-menu-name')?.textContent;
 const menu = (c: HTMLElement) => c.querySelector('[aria-label="Files"]');
 const key = (el: HTMLTextAreaElement, value: string, extra = {}) => fireEvent.keyDown(el, { key: value, ...extra });
 
@@ -47,7 +49,8 @@ describe("path requests and replies", () => {
     const s = setup();
     for (const value of ["mail me@sm", "!cat @sm", "/cmd @sm"]) { s.type(value); s.wait(); }
     expect(s.onAtQuery).not.toHaveBeenCalled();
-    s.query("@", [".env", "sub/", "small.txt"]); expect(names(s.container)).toEqual([".env", "sub/", "small.txt"]);
+    s.query("@", [".env", "sub/", "small.txt"]);
+    expect(names(s.container)).toEqual([".env", "sub/", "small.txt", "buffers", "quickfix", "diagnostics"]);
     s.type("first line\nlook @sm"); s.wait(); expect(s.onAtQuery).toHaveBeenLastCalledWith("sm", 2);
     s.type('@"with sp'); s.wait(); expect(s.onAtQuery).toHaveBeenLastCalledWith("with sp", 3);
   });
@@ -60,6 +63,30 @@ describe("path requests and replies", () => {
     const s = setup(); s.type("@sm"); key(s.textarea, "r", { ctrlKey: true }); s.wait();
     expect(s.onAtQuery).not.toHaveBeenCalled(); cleanup();
     const other = setup(); other.type("/co"); other.wait(); expect(other.onAtQuery).not.toHaveBeenCalled();
+  });
+});
+
+describe("the editor's own sources", () => {
+  it("lead a query they start, with what each is, and complete as a word", () => {
+    const s = setup(); s.query("@d", ["docs/", "d.txt"]);
+    expect(names(s.container)).toEqual(["diagnostics", "docs/", "d.txt"]);
+    expect(s.container.querySelector('[role="option"]')?.textContent).toContain("language server problems");
+    key(s.textarea, "Tab"); expect(s.textarea.value).toBe("@diagnostics "); expect(menu(s.container)).toBeNull();
+  });
+  it("are not offered for a path, and Enter sends what was typed until a row is chosen", () => {
+    const s = setup(); s.query("@sub/b", ["sub/b.txt"]); expect(names(s.container)).toEqual(["sub/b.txt"]);
+    s.query("@bu", []); expect(names(s.container)).toEqual(["buffers"]);
+    key(s.textarea, "Enter"); expect(s.onSend).toHaveBeenCalledWith("@bu");
+  });
+  it("are not offered for a quoted word, which names a file", () => {
+    const s = setup(); s.query('@"buf', ["buffers"]); expect(names(s.container)).toEqual(["buffers"]);
+    key(s.textarea, "Tab"); expect(s.textarea.value).toBe('@"buffers" ');
+    expect(s.container.querySelector(".slash-menu-desc")).toBeNull();
+    s.query('@"quick', []); expect(menu(s.container)).toBeNull();
+  });
+  it("still ask the host about files, since a file may start with the same letters", () => {
+    const s = setup(); s.type("@q"); s.wait(); expect(s.onAtQuery).toHaveBeenLastCalledWith("q", 1);
+    expect(names(s.container)).toEqual(["quickfix"]);
   });
 });
 
@@ -89,9 +116,9 @@ describe("completing and moving", () => {
   it("wraps arrows and picker keys and windows rows with the selection", () => {
     const s = setup(); const paths = Array.from({ length: 12 }, (_, i) => `file${i}`); s.query("@", paths);
     expect(names(s.container)).toHaveLength(8); key(s.textarea, "ArrowUp");
-    expect(s.container.querySelector('[aria-selected="true"]')?.textContent).toBe("file11");
+    expect(selectedName(s.container)).toBe("diagnostics");
     key(s.textarea, "n", { ctrlKey: true });
-    expect(s.container.querySelector('[aria-selected="true"]')?.textContent).toBe("file0");
+    expect(selectedName(s.container)).toBe("file0");
     key(s.textarea, "Enter"); expect(s.textarea.value).toBe("@file0 ");
   });
   it("Esc stops before the panel and stays dismissed until text changes", () => {

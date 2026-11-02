@@ -18,8 +18,37 @@ export function atToken(draft: string, caret: number): { query: string; start: n
 }
 
 /** A directory keeps completing; a file leaves the caret after its separating space. */
-export function atInsertion(path: string): { text: string; keepOpen: boolean } {
+export function atInsertion(path: string, quoted = false): { text: string; keepOpen: boolean } {
   const keepOpen = path.endsWith("/");
-  const name = /\s/u.test(path) ? `"${path}"` : path;
+  // A file named like one of the editor's sources stays a file when the word was quoted: `@"buffers"`.
+  const name = /\s/u.test(path) || (quoted && EDITOR_MENTIONS.some((m) => m.name === path)) ? `"${path}"` : path;
   return { text: `@${name}${keepOpen ? "" : " "}`, keepOpen };
+}
+
+/** The editor's own sources, which are not files: the host reads them from nvim when the message is sent. */
+export const EDITOR_MENTIONS = [
+  { name: "buffers", hint: "open files, as on screen" },
+  { name: "quickfix", hint: "the quickfix list" },
+  { name: "diagnostics", hint: "language server problems" },
+] as const;
+
+/** The editor sources a query is the start of, ahead of the files. A path (`sub/`) or a quoted name is never one. */
+export function editorMentionRows(query: string): string[] {
+  if (query.includes("/") || query.includes('"')) return [];
+  const lower = query.toLowerCase();
+  return EDITOR_MENTIONS.filter((m) => m.name.startsWith(lower)).map((m) => m.name);
+}
+
+/** What the menu says beside a row, if the row is one of the editor's sources. */
+export function editorMentionHint(row: string): string | undefined {
+  return EDITOR_MENTIONS.find((m) => m.name === row)?.hint;
+}
+
+/** Where the editor's sources stand in the menu. A query one of them starts leads with it, as any match does. A bare `@`
+ *  keeps the first file first, as Claude Code's does (Tab takes it), so the sources come after the files: a person who
+ *  presses Up from the top wraps to them. */
+export function withEditorMentions(query: string, files: readonly string[]): string[] {
+  const own = editorMentionRows(query);
+  const rest = files.filter((file) => !own.includes(file));
+  return query === "" ? [...rest, ...own] : [...own, ...rest];
 }

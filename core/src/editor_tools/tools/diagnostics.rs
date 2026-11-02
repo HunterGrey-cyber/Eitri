@@ -334,7 +334,7 @@ pub fn send(rpc: &dyn EditorRpc, stamp: &Stamp, args: &DiagnosticsArgs) -> Pendi
     rpc.exec_lua(DIAGNOSTICS_LUA, vec![stamp.to_value(), Value::Map(fields)])
 }
 
-fn field<'a>(value: &'a Value, name: &str) -> Option<&'a Value> {
+pub(super) fn field<'a>(value: &'a Value, name: &str) -> Option<&'a Value> {
     value
         .as_map()?
         .iter()
@@ -342,12 +342,12 @@ fn field<'a>(value: &'a Value, name: &str) -> Option<&'a Value> {
         .map(|(_, value)| value)
 }
 
-fn count(value: &Value, name: &str) -> Option<u32> {
+pub(super) fn count(value: &Value, name: &str) -> Option<u32> {
     u32::try_from(field(value, name)?.as_u64()?).ok()
 }
 
 /// The bytes of a string the editor sent: it sends a Lua string as msgpack str whatever its bytes are.
-fn bytes_of(value: &Value) -> Option<&[u8]> {
+pub(super) fn bytes_of(value: &Value) -> Option<&[u8]> {
     match value {
         Value::String(text) => Some(text.as_bytes()),
         Value::Binary(bytes) => Some(bytes.as_slice()),
@@ -359,12 +359,12 @@ pub(super) fn name_of(value: &Value) -> Option<PathBuf> {
     Some(PathBuf::from(std::ffi::OsStr::from_bytes(bytes_of(value)?)))
 }
 
-fn text_of(value: &Value) -> Option<String> {
+pub(super) fn text_of(value: &Value) -> Option<String> {
     Some(String::from_utf8_lossy(bytes_of(value)?).into_owned())
 }
 
 /// A list the chunk built: an empty Lua table may arrive as either an array or a map.
-fn list<'a>(value: &'a Value, name: &str) -> Option<&'a [Value]> {
+pub(super) fn list<'a>(value: &'a Value, name: &str) -> Option<&'a [Value]> {
     match field(value, name)? {
         Value::Map(entries) if entries.is_empty() => Some(&[]),
         Value::Array(items) => Some(items),

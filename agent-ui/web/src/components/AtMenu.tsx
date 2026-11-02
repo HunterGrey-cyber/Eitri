@@ -1,3 +1,4 @@
+import { editorMentionHint } from "../atMenu";
 import { revealHidden } from "../revealHidden";
 import { Revealed } from "./Revealed";
 
@@ -35,6 +36,7 @@ export function AtMenu({ rows, firstIndex, total, selected, onPick, onWheel }: P
             onClick={() => onPick(index)}
           >
             <span className="slash-menu-name"><Revealed pieces={revealHidden(path)} /></span>
+            {editorMentionHint(path) !== undefined && <span className="slash-menu-desc">{editorMentionHint(path)}</span>}
           </div>
         );
       })}

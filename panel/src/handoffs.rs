@@ -152,6 +152,9 @@ pub(super) fn panel_tab_handoff(state: &AgentPanelState, tab: TabId) -> Result<P
         tabs,
         // The window's, not the tab's.
         path_menu: _,
+        // The window's: a held message answers to the page that sent it.
+        mentions: _,
+        mention_sections: _,
         document: _,
         host: _,
         backend_kind: _,

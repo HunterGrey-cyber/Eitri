@@ -48,6 +48,7 @@ pub mod hover;
 pub mod lsp;
 pub mod lsp_code_actions;
 pub mod lsp_rename;
+pub mod mention_reads;
 pub mod nvim_exec;
 pub mod open_file;
 pub mod read_buffer;
@@ -78,6 +79,8 @@ pub const CHUNKS: &[&str] = &[
     editor_state::EDITOR_STATE_LUA,
     read_buffer::READ_BUFFER_LUA,
     diagnostics::DIAGNOSTICS_LUA,
+    mention_reads::BUFFERS_LUA,
+    mention_reads::QUICKFIX_LUA,
     lsp::LSP_ASK_LUA,
     lsp::LSP_COLLECT_LUA,
 ];

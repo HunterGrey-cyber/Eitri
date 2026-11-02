@@ -796,13 +796,17 @@ pub struct ProposedEdit {
 /// been able to end one editor command and start another, a C1 control is a terminal's escape, a bidirectional control
 /// makes a name read as another, and no file name an agent shows needs one.
 pub fn path_holds_control(path: &str) -> bool {
-    path.chars().any(|c| {
-        c.is_control()
-            || matches!(
-                c,
-                '\u{61c}' | '\u{200e}' | '\u{200f}' | '\u{2028}' | '\u{2029}' | '\u{202a}'..='\u{202e}' | '\u{2066}'..='\u{2069}'
-            )
-    })
+    path.chars().any(is_control_like)
+}
+
+/// Whether `c` is a control character, a bidirectional control or a line or paragraph separator: what no file name and
+/// no line of a section may hold.
+pub fn is_control_like(c: char) -> bool {
+    c.is_control()
+        || matches!(
+            c,
+            '\u{61c}' | '\u{200e}' | '\u{200f}' | '\u{2028}' | '\u{2029}' | '\u{202a}'..='\u{202e}' | '\u{2066}'..='\u{2069}'
+        )
 }
 
 /// One question's answer in a `question_answer` or a chat `question_decline`. Every field is named on

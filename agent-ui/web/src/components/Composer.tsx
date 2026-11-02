@@ -26,7 +26,7 @@ import {
 } from "../slashCommands";
 import type { CompletionCommand, SlashAction } from "../slashCommands";
 import { HistorySearch } from "./HistorySearch";
-import { atToken, atInsertion } from "../atMenu";
+import { atToken, atInsertion, withEditorMentions } from "../atMenu";
 import { AtMenu } from "./AtMenu";
 import { SlashMenu } from "./SlashMenu";
 import { NO_TEXT_ASSIST } from "../textField";
@@ -349,11 +349,14 @@ export function Composer({
     }, 60);
     return () => clearTimeout(timer);
   }, [atQuery, mention?.start]);
-  const atItems = mention === null
+  const atFiles = mention === null
     ? []
     : atAsked?.query === mention.query && atPaths?.seq === atAsked?.seq
       ? atPaths?.items ?? []
       : atDirectory?.query === mention.query ? atDirectory.items : [];
+  // A quoted word names a file, whatever its letters spell.
+  const atQuoted = mention !== null && text[mention.start + 1] === '"';
+  const atItems = mention === null ? [] : atQuoted ? atFiles : withEditorMentions(mention.query, atFiles);
   const atOpen = atItems.length > 0;
   const atSelected = Math.min(atIndex, Math.max(0, atItems.length - 1));
   const atFrom = slashMenuWindow(atSelected, atTop, atItems.length);
@@ -364,7 +367,7 @@ export function Composer({
   }
   function completeAt(path: string) {
     if (mention === null) return;
-    const insertion = atInsertion(path);
+    const insertion = atInsertion(path, atQuoted);
     const rest = text.slice(mention.end);
     const head = text.slice(0, mention.start) + insertion.text;
     setBox(head + (insertion.keepOpen ? rest : rest.replace(/^ /, "")), head.length);

@@ -408,6 +408,8 @@ impl AgentPanelHandle {
                 state.tabs.drop_bypass_prompt_in(view);
             }
         }
+        // A message held for the editor answers a page that is gone; what was typed goes back to its tab.
+        self.run(|state, out| super::mentions::drop_view(state, view, out));
         let discarded = page.pacer().borrow_mut().discard_pending();
         trace_discarded_first_texts(&mut self.state.borrow_mut(), discarded);
         page.load_document(IDLE_DOCUMENT, PANEL_BASE_URI);
@@ -482,9 +484,50 @@ impl AgentPanelHandle {
             Admission::Gated(asked) => ask_gate(&self.state, *asked).err(),
         };
         self.run(|state, out| {
+            // A message that names the editor's own sources waits for its answer; it comes back through
+            // `replay_mentions` and this same call.
+            let (message, admitted) = match refused {
+                None => match super::mentions::hold(state, message, view, admitted) {
+                    super::mentions::Held::Held => return,
+                    super::mentions::Held::Goes(message, admitted) => (message, admitted),
+                },
+                Some(_) => (message, admitted),
+            };
             let owed = handle_inbound_message(state, message, view, admitted, refused, &screen, page.pacer());
             out.extend(owed);
         });
+    }
+
+    /// Sends the messages whose editor answers have come, each through the arm it was bound for with its sections in
+    /// the turn. A tab that closed meanwhile is told so; a page that went is not.
+    fn replay_mentions(&self) {
+        let ready = super::mentions::take_ready(&mut self.state.borrow_mut(), std::time::Instant::now());
+        for (message, view, admitted, gathered) in ready {
+            let Some(page) = self.pages.any(view) else {
+                eprintln!(
+                    "[agent_panel] view {}: a held message's page is gone; it was dropped",
+                    view.number()
+                );
+                continue;
+            };
+            let screen = Screen::read(&self.state, &self.pages);
+            self.run(|state, out| {
+                if !super::mentions::tab_is_still_here(state, &admitted) {
+                    out.send(
+                        view,
+                        serialize_command_result_for_js(
+                            message.request_id(),
+                            Err("the tab was closed before the editor answered"),
+                        ),
+                    );
+                    return;
+                }
+                state.mention_sections = Some(gathered);
+                let owed = handle_inbound_message(state, message, view, admitted, None, &screen, page.pacer());
+                state.mention_sections = None;
+                out.extend(owed);
+            });
+        }
     }
 
     /// `view`'s page came on screen, or a float stopped covering it: whatever finished in the tab it
@@ -890,6 +933,7 @@ impl AgentPanelHandle {
             }
         }
         self.run(|state, out| tick_send(state, &screen, pumped, attention_before, out));
+        self.replay_mentions();
         self.run(pair_outbound);
         true
     }
@@ -2499,9 +2543,11 @@ impl AgentPanelHandle {
         if state.shutting_down {
             return 0;
         }
+        // A message held for the editor has left the box and is not in a draft yet: it goes with the window too.
         state
             .tabs
             .unsaved_draft_count(state.restore_policy != RestorePolicy::Off)
+            + state.mentions.tabs_holding_words()
     }
 
     /// Tabs with live non-ambient background work across the window.

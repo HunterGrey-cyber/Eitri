@@ -168,7 +168,7 @@ pub const CLI_LOCAL_COMMANDS: &[&str] = &[
 /// CLI's own parse -- the text trimmed, a leading `/`, the name up to the first whitespace -- and
 /// its own exact match (`/Model` is not `/model` there, so not here). The picker sends commands
 /// with arguments, so exempting only bare `/model` and `/effort` would corrupt its choices too.
-fn names_a_cli_local_command(user_text: &str) -> bool {
+pub(crate) fn names_a_cli_local_command(user_text: &str) -> bool {
     let Some(rest) = user_text.trim().strip_prefix('/') else {
         return false;
     };

@@ -8,6 +8,10 @@
 
 use std::borrow::Cow;
 
+/// The words after `@` that name the editor's own sources (`eitri_core::mentions`), whose sections a turn carries and
+/// `history::composed_block` takes back off.
+pub const EDITOR_SOURCES: [&str; 3] = ["buffers", "quickfix", "diagnostics"];
+
 /// Comes before the `@`: it is not whitespace to the CLI's scan, and draws as nothing.
 const WORD_JOINER: char = '\u{2060}';
 
@@ -37,6 +41,39 @@ pub fn inert(text: &str) -> Cow<'_, str> {
     }
     out.push_str(&text[copied..]);
     Cow::Owned(out)
+}
+
+/// The editor's sources (`EDITOR_SOURCES`) a person's text names, in the order they first appear, each once: a word
+/// that starts after the start of the text or whitespace, and runs to the next whitespace, is read as the CLI reads a
+/// mention.
+pub fn editor_sources_named(text: &str) -> Vec<&'static str> {
+    let mut found: Vec<&'static str> = Vec::new();
+    let mut before = None;
+    let mut chars = text.char_indices().peekable();
+    while let Some((at, ch)) = chars.next() {
+        let opens = ch == '@' && before.is_none_or(opens_a_word);
+        before = Some(ch);
+        if !opens {
+            continue;
+        }
+        let word_start = at + ch.len_utf8();
+        let word_end = text[word_start..]
+            .find(char::is_whitespace)
+            .map_or(text.len(), |len| word_start + len);
+        if let Some(word) = EDITOR_SOURCES
+            .into_iter()
+            .find(|word| *word == &text[word_start..word_end])
+        {
+            if !found.contains(&word) {
+                found.push(word);
+            }
+        }
+        // The word is read whole; its characters are not the start of another mention.
+        while chars.peek().is_some_and(|(next, _)| *next < word_end) {
+            before = chars.next().map(|(_, c)| c);
+        }
+    }
+    found
 }
 
 #[cfg(test)]

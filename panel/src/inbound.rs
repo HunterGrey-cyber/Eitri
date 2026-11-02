@@ -516,6 +516,8 @@ pub(super) fn handle_inbound_message(
 
     match message {
         InboundMessage::Ready { .. } => {
+            // A held message of the document that was here answers a page that is gone.
+            super::mentions::drop_view(state, view, &mut out);
             // A stream envelope the typing cadence still holds is already in the snapshot below
             // (it was drained from the queue and folded into the projection before it was held);
             // sent after that snapshot it would draw the same text twice.
@@ -686,7 +688,7 @@ pub(super) fn handle_inbound_message(
                 // backends on purpose: the turn's String travels unmodified from here to
                 // `send_turn` on either path. A `None` context means the turn goes out exactly as
                 // the user typed it.
-                let composed = eitri_core::editor_context::compose_turn_text(&text, (state.editor_context)().as_ref());
+                let composed = super::mentions::compose(state, &text);
                 let moving = state.tabs.is_moving(tab);
                 let t = state.tabs.get_mut(tab).expect("resolved above");
                 if moving {
@@ -1252,7 +1254,7 @@ pub(super) fn handle_inbound_message(
         InboundMessage::QueueMessage { text, turn_id, .. } => {
             let tab = tab_of(target);
             // Captured now: what the editor shows when Enter is pressed.
-            let wire = eitri_core::editor_context::compose_turn_text(&text, (state.editor_context)().as_ref());
+            let wire = super::mentions::compose(state, &text);
             match state
                 .tabs
                 .queue_message(tab, &text, wire, now_ms(), true, agent::PromptOrigin::Typed)
@@ -1286,7 +1288,7 @@ pub(super) fn handle_inbound_message(
         }
         InboundMessage::SendNow { text, .. } => {
             let tab = tab_of(target);
-            let wire = eitri_core::editor_context::compose_turn_text(&text, (state.editor_context)().as_ref());
+            let wire = super::mentions::compose(state, &text);
             let result = state.tabs.send_now(tab, &text, wire, now_ms());
             if !text.trim().is_empty() {
                 remember_prompts(state, std::slice::from_ref(&text), &mut out);

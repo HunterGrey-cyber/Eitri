@@ -69,6 +69,7 @@ pub mod process_probe;
 pub mod project_boundary;
 pub mod provider_move;
 pub mod providers;
+pub mod read_deny;
 pub mod save_health;
 pub mod setting_sources;
 #[cfg(feature = "legacy-backend")]

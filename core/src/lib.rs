@@ -36,6 +36,7 @@ pub mod keymap;
 pub mod layout;
 pub mod line_feed;
 pub mod lua;
+pub mod mentions;
 pub mod nvim_bin;
 pub mod nvim_keys;
 pub mod nvim_rpc;

@@ -131,6 +131,15 @@ outside the project all work, and its own rules apply: a file your `deny` rules 
 with a space goes in quotes, `@"my file.txt"`. Text you did not type, such as lines selected in the editor, never makes
 Claude Code read a file.
 
+Three more names are the editor's own, and Eitri reads them from your Neovim when you send: `@buffers` gives Claude the
+open files of the project **as they are on screen**, unsaved changes included (a file with any is marked, and its text can
+differ from the file on disk); `@quickfix` gives the quickfix list; `@diagnostics` gives what your language servers had
+said at that moment, most severe first, with file and line. They are offered in the same list, after the files when you
+have typed only `@`. A file outside the project, or one your `deny` rules cover, is left out and only counted. A long
+list stops at a bound, and the message tells Claude where: 1000 lines and 32 KiB for a file and 96 KiB for all the
+buffers, 200 entries for the lists. If the editor does not answer in five seconds the message goes without the section
+and says so. A window that shows its editor in the other window attaches nothing.
+
 `!` at the start of the box runs the rest as your own shell command, in the project, with your shell's aliases and
 functions. The output shows under it and goes to Claude, which then answers, as in the terminal. It asks nothing in any
 mode, and no permission rule applies: it is you running a command. During a turn it waits for the turn's end. `Ctrl+c`

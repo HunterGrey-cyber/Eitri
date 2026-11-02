@@ -393,6 +393,7 @@ pub(super) fn needs_polling(state: &AgentPanelState) -> bool {
         || state.editor_tools.needs_polling()
         || !state.editor_follower.is_idle()
         || !state.client_call_reads.is_empty()
+        || state.mentions.is_waiting()
         || state.trust.is_busy()
         || state.history_writer.is_busy()
 }

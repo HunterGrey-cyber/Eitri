@@ -63,6 +63,8 @@ mod handoffs;
 mod inbound;
 #[path = "links.rs"]
 mod links;
+#[path = "mentions.rs"]
+mod mentions;
 #[path = "outbox.rs"]
 mod outbox;
 #[path = "pages.rs"]
@@ -164,6 +166,10 @@ struct AgentPanelState {
     backend_kind: BackendKind,
     project_dir: PathBuf,
     path_menu: path_menu::PathMenu,
+    /// Messages that name the editor's own sources and wait for its answer.
+    mentions: mentions::Desk,
+    /// The sections a replayed message sends, set only while `handle_inbound_message` runs it.
+    mention_sections: Option<eitri_core::mentions::gather::Gathered>,
     /// `project_dir.canonicalize()`, read once: the `canonical_cwd` a session lease is keyed on
     /// (`agent::lease::SessionLease::is_held`), for resume routing and the chooser.
     canonical_project_dir: String,
@@ -565,6 +571,8 @@ impl AgentPanelState {
             backend_kind,
             project_dir,
             path_menu: path_menu::PathMenu::default(),
+            mentions: mentions::Desk::default(),
+            mention_sections: None,
             canonical_project_dir,
             prefs_dir,
             supervisor,

@@ -66,13 +66,52 @@ fn selected_suffix() -> String {
 /// than papered over. A round trip "for any input" does not hold for the same reason; see this
 /// module's tests, which cover the compose→strip round trip over a matrix of real shapes.
 pub fn strip_composed_block(text: &str) -> &str {
-    if let Some(start) = selection_block_start(text) {
-        return before_block(text, start);
+    let without_context = if let Some(start) = selection_block_start(text) {
+        before_block(text, start)
+    } else if let Some(start) = opened_file_block_start(text) {
+        before_block(text, start)
+    } else {
+        text
+    };
+    strip_editor_sections(without_context)
+}
+
+/// Removes the sections `@buffers`, `@quickfix` and `@diagnostics` put in a turn (`eitri_core::mentions`), each a first
+/// line `[@name: ...]`, its body and a last line `[@name end]`, at a `"\n\n"` boundary. They come before the editor
+/// context block, so this runs on what is left of the text once that block is off. As with the block, an ambiguity
+/// resolves toward stripping less: a section is taken only whole.
+fn strip_editor_sections(mut text: &str) -> &str {
+    // The turn carries each source once, so a second section of a source is the person's own text.
+    let mut taken: Vec<&str> = Vec::new();
+    'sections: loop {
+        for word in crate::mention::EDITOR_SOURCES {
+            if taken.contains(&word) {
+                continue;
+            }
+            let closing = format!("[@{word} end]");
+            let Some(before_closing) = text.strip_suffix(closing.as_str()) else {
+                continue;
+            };
+            let Some(body_end) = before_closing.strip_suffix('\n') else {
+                continue;
+            };
+            let opening = format!("[@{word}: ");
+            for start in candidates_right_to_left(text, body_end.len(), &opening) {
+                if !is_block_boundary(text, start) {
+                    continue;
+                }
+                let first_line_ends_at = text[start..].find('\n').map(|at| start + at);
+                // The person's own words must name the source: a section nobody asked for is text they wrote.
+                let asked = crate::mention::editor_sources_named(&text[..start]).contains(&word);
+                if asked && first_line_ends_at.is_some_and(|end| end <= body_end.len() && text[..end].ends_with(']')) {
+                    text = before_block(text, start);
+                    taken.push(word);
+                    continue 'sections;
+                }
+            }
+        }
+        return text;
     }
-    if let Some(start) = opened_file_block_start(text) {
-        return before_block(text, start);
-    }
-    text
 }
 
 /// The block starts at `start`; everything before it is the user's own text, minus the `"\n\n"`
@@ -175,6 +214,70 @@ mod tests {
     fn strips_the_opened_file_block() {
         let composed = "what does this do?\n\nThe user opened the file /p/src/main.rs in the IDE. This may or may not be related to the current task.";
         assert_eq!(strip_composed_block(composed), "what does this do?");
+    }
+
+    #[test]
+    fn strips_the_editor_sections_and_then_the_context_block() {
+        let sections = "[@buffers: the editor's open files, 1 file]\n--- a.rs (1 line) ---\n1\tx\n[@buffers end]\n\n\
+                        [@diagnostics: not attached: the editor is not running]\n[@diagnostics end]";
+        let typed = "why @buffers and @diagnostics";
+        assert_eq!(strip_composed_block(&format!("{typed}\n\n{sections}")), typed);
+        let opened = "The user opened the file /p/a.rs in the IDE. This may or may not be related to the current task.";
+        assert_eq!(
+            strip_composed_block(&format!("{typed}\n\n{sections}\n\n{opened}")),
+            typed
+        );
+    }
+
+    #[test]
+    fn a_section_is_taken_only_when_the_words_before_it_name_its_source() {
+        let section = "[@buffers: the editor's open files]\n[@buffers end]";
+        // The person did not ask for it: it is theirs.
+        for typed in ["no names here", "me@buffers", "ask @quickfix", "`@buffers`"] {
+            let text = format!("{typed}\n\n{section}");
+            assert_eq!(strip_composed_block(&text), text, "{typed}");
+        }
+        // A section of another source than the one asked for stays, the asked one goes.
+        let both = format!("see @buffers\n\n[@quickfix: a quoted list]\n[@quickfix end]\n\n{section}");
+        assert_eq!(
+            strip_composed_block(&both),
+            "see @buffers\n\n[@quickfix: a quoted list]\n[@quickfix end]"
+        );
+    }
+
+    #[test]
+    fn a_frame_line_made_by_the_body_of_a_section_is_no_frame() {
+        // The sections the host writes indent every line of a list and number every line of a buffer, so a closing
+        // line or a blank line followed by an opening one cannot be reproduced by what is inside: strip takes the
+        // whole section by its real last line.
+        let section = "[@diagnostics: head]\n  a.rs:1:1 error: x\n    [@diagnostics end]\n  \n  [@diagnostics: y]\n[@diagnostics end]";
+        let text = format!("why @diagnostics\n\n{section}");
+        assert_eq!(strip_composed_block(&text), "why @diagnostics");
+        let quickfix = "[@quickfix: head]\n  \n  [@quickfix: x]\n  text\n[@quickfix end]";
+        assert_eq!(
+            strip_composed_block(&format!("see @quickfix\n\n{quickfix}")),
+            "see @quickfix"
+        );
+    }
+
+    #[test]
+    fn a_person_who_quotes_a_section_of_the_same_source_keeps_the_quote() {
+        let quoted = "Compare @buffers with this old snapshot:\n\n[@buffers: old]\n1\tx\n[@buffers end]";
+        let composed = format!("{quoted}\n\n[@buffers: the editor's open files]\n[@buffers end]");
+        assert_eq!(strip_composed_block(&composed), quoted);
+    }
+
+    #[test]
+    fn a_section_is_taken_only_whole_and_only_at_a_boundary() {
+        for text in [
+            "q\n\n[@buffers end]",
+            "q\n\n[@buffers: head\nbody with no closing line",
+            "q [@buffers: head]\nbody\n[@buffers end]",
+            "q\n\n[@buffers: head with no bracket\nbody\n[@buffers end]",
+            "q\n\n[@somewhere: head]\nbody\n[@somewhere end]",
+        ] {
+            assert_eq!(strip_composed_block(text), text, "input: {text:?}");
+        }
     }
 
     #[test]
