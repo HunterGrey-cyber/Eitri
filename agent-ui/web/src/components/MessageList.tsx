@@ -927,13 +927,15 @@ const TimelineRow = memo(function TimelineRow({
       const yankedClass = yanked ? "row-yanked" : undefined;
       const warning = item.notice.level === "warning" || item.notice.level === "suggestion" || ["hook_block", "model_fallback", "model_refusal", "peer_hold"].includes(item.notice.kind);
       const body = noticeBody(item.notice);
+      // What a person's `!` line printed: a program's text, opened where it is rather than repeated below.
+      const shell = item.notice.kind === "shell_output";
       return (
-        <Row kind="notice" sign={warning ? "⚠" : "·"} current={current} className={[yankedClass, warning ? "notice-prominent" : "", item.notice.kind === "compaction" ? "notice-compaction" : ""].filter(Boolean).join(" ")} navStop="row">
-          <div className="notice-text" data-notice-kind={item.notice.kind}>
+        <Row kind="notice" sign={warning ? "⚠" : shell ? "⎿" : "·"} current={current} className={[yankedClass, warning ? "notice-prominent" : "", item.notice.kind === "compaction" ? "notice-compaction" : ""].filter(Boolean).join(" ")} navStop="row">
+          <div className={shell && (expanded || detailed) ? "notice-text notice-open" : "notice-text"} data-notice-kind={item.notice.kind}>
             <Revealed pieces={revealHidden(noticeText(item.notice))} />
           </div>
           {body && <span className="fold-marker" aria-label={expanded ? "expanded" : "collapsed"}>{expanded ? "▾" : "▸"}</span>}
-          {body && (expanded || detailed) && <div className="wake-body"><Revealed pieces={revealHidden(body)} /></div>}
+          {body && !shell && (expanded || detailed) && <div className="wake-body"><Revealed pieces={revealHidden(body)} /></div>}
         </Row>
       );
     }

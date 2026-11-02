@@ -181,6 +181,10 @@ pub(super) fn send_queue(state: &AgentPanelState, tab: TabId, out: &mut Outbox) 
             t.steers(),
         ),
     );
+    out.send(
+        view,
+        eitri_core::agent_bridge::serialize_shell_running_for_js(tab, state.tabs.shell_line_runs(tab)),
+    );
 }
 
 /// A flush's outcome: the same benign/fatal split a command gets, with no request to

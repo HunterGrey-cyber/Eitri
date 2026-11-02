@@ -149,7 +149,9 @@ pub(super) fn admission(
         InboundMessage::TrustCancel { .. } => Admission::Ungated,
         // None of these answers a card or a question, or loosens a permission.
         InboundMessage::Ready { .. }
+        | InboundMessage::PathComplete { .. }
         | InboundMessage::SendMessage { .. }
+        | InboundMessage::RunShell { .. }
         | InboundMessage::Interrupt { .. }
         | InboundMessage::StopBackground { .. }
         | InboundMessage::TurnRendered { .. }

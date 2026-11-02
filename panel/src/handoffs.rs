@@ -151,6 +151,7 @@ pub(super) fn panel_tab_handoff(state: &AgentPanelState, tab: TabId) -> Result<P
         // The tab itself moves through the tab set's own record.
         tabs,
         // The window's, not the tab's.
+        path_menu: _,
         document: _,
         host: _,
         backend_kind: _,

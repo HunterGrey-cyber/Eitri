@@ -2154,6 +2154,17 @@ textarea,
   border-top: 1px solid var(--rule-soft);
   padding-top: 10px;
 }
+.notice-text[data-notice-kind="shell_output"] {
+  font-family: var(--nv-font-mono);
+  -webkit-line-clamp: 12;
+  line-clamp: 12;
+}
+.notice-text.notice-open {
+  display: block;
+}
+.composer-shell {
+  border-color: var(--nv-warn);
+}
 
 .tasks-line button, button.band-background {
   font: inherit;

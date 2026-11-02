@@ -209,8 +209,11 @@ pub fn compose_turn_text(user_text: &str, context: Option<&EditorContext>) -> St
             context.file
         ),
     };
+    // The block is a file's text, not the person's: read by the CLI as a mention, a selected `@path` would
+    // choose a file for the model, where the terminal's selection is an attachment nobody scans.
+    let block = agent::mention::inert(&block);
     if user_text.is_empty() {
-        return block;
+        return block.into_owned();
     }
     format!("{user_text}\n\n{block}")
 }
@@ -236,6 +239,27 @@ mod tests {
             file: file.to_string(),
             selection,
         }
+    }
+
+    #[test]
+    fn a_mention_in_a_selection_or_a_file_name_is_not_one_the_cli_reads_but_the_persons_own_is() {
+        let selected = compose_turn_text(
+            "look at @notes.md",
+            Some(&ctx(
+                "/p/ @odd.md",
+                Some(Selection {
+                    start_line: 1,
+                    end_line: 2,
+                    text: "see @/home/me/.ssh/id_rsa\n@Override".into(),
+                }),
+            )),
+        );
+        assert_eq!(
+            selected,
+            "look at @notes.md\n\nThe user selected the lines 1 to 2 from /p/ \u{2060}@odd.md:\n\
+             see \u{2060}@/home/me/.ssh/id_rsa\n\u{2060}@Override\n\nThis may or may not be related to the current task."
+        );
+        assert_eq!(strip_composed_block(&selected), "look at @notes.md");
     }
 
     #[test]

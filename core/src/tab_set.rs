@@ -28,6 +28,8 @@ pub use crate::tabs::ViewId;
 use crate::tabs::{self, TabFacts, TabId};
 
 mod moving;
+mod shell;
+pub use shell::{shell_command, ShellEnded};
 pub use moving::{FrozenChat, FrozenTab, MoveRefusedWhy, SendGate, Sent, TabHandoff};
 
 #[cfg(test)]
@@ -179,6 +181,13 @@ pub struct Queued {
     /// own. It stays, with the reason, until the person takes it back into the composer.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub refused: bool,
+    /// A `!` line the person entered, not yet run. Only the composer's `run_shell` sets it, and it does not
+    /// survive a restart: a restored queue holds words, and words are never run.
+    #[serde(skip)]
+    pub shell_line: bool,
+    /// What a `!` line printed, for the agent: its row is in the conversation already.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub shell_report: bool,
 }
 
 impl Queued {
@@ -195,11 +204,18 @@ impl Queued {
             behind_card: false,
             typed_by_person: false,
             refused: false,
+            shell_line: false,
+            shell_report: false,
         }
     }
 
     fn origin(&self) -> PromptOrigin {
         prompt_origin(self.typed_by_person)
+    }
+
+    /// Whether this item goes alone: a `!` line and its report are never read with a message around them.
+    fn is_shell(&self) -> bool {
+        self.shell_line || self.shell_report
     }
 
     pub fn is_held(&self) -> bool {
@@ -1549,6 +1565,8 @@ pub struct TabSet {
     /// What every live backend calls when it folded something, so the window need not poll for it
     /// ([`set_ui_wake`](Self::set_ui_wake)).
     ui_wake: Option<agent::UiWake>,
+    /// The `!` lines running, and where each tab's next one starts.
+    shells: shell::Shells,
     /// The extra chat views the window's layout holds, in any workspace ([`TabSet::set_layout_views`]):
     /// the only views a restored tab may come back into.
     layout_views: Vec<ViewId>,
@@ -1631,6 +1649,7 @@ impl TabSet {
             held_pump: None,
             flush_owed: BTreeSet::new(),
             ui_wake: None,
+            shells: shell::Shells::default(),
             layout_views: Vec::new(),
             #[cfg(test)]
             after_drain: None,
@@ -4500,6 +4519,8 @@ impl TabSet {
             behind_card: false,
             typed_by_person: origin == PromptOrigin::Typed,
             refused: false,
+            shell_line: false,
+            shell_report: false,
         });
         Ok(tab.session.queue.len())
     }
@@ -4630,7 +4651,7 @@ impl TabSet {
     /// a background agent's messages raise the same note, and holding for it would keep a message
     /// waiting for that agent's whole life; the sidecar takes a turn sent meanwhile.
     fn queue_can_go(&mut self, id: TabId) -> bool {
-        if self.moving.contains(&id.0) {
+        if self.moving.contains(&id.0) || self.shell_line_runs(id) {
             return false;
         }
         let Some(tab) = self.get_mut(id) else {
@@ -4687,10 +4708,28 @@ impl TabSet {
                     }
                 }
                 let turn = next_turn(&tab.session.queue, tab.reads_commands());
+                if let [index] = turn[..] {
+                    if tab.session.queue[index].shell_line {
+                        let item = tab.session.queue.remove(index);
+                        let outcome = self.start_shell_line(id, &item.text);
+                        self.end_start_of(&gate);
+                        return Some(Sent::Flushed {
+                            tab: id,
+                            flush: Flush {
+                                typed: item.text,
+                                outcome,
+                            },
+                        });
+                    }
+                }
                 let items = || turn.iter().map(|index| &tab.session.queue[*index]);
                 let wire = items().map(|q| q.wire.as_str()).collect::<Vec<_>>().join("\n\n");
                 let typed = items().map(|q| q.text.as_str()).collect::<Vec<_>>().join("\n\n");
-                let origin = prompt_origin(items().all(|item| item.typed_by_person));
+                let origin = if items().any(|item| item.shell_report) {
+                    PromptOrigin::ShellLine
+                } else {
+                    prompt_origin(items().all(|item| item.typed_by_person))
+                };
                 let trace = crate::turn_trace::TurnTrace::start();
                 let mode = tab.mode;
                 let outcome =
@@ -4734,7 +4773,13 @@ impl TabSet {
                 }
             }
             moving::TurnSend::First { request_id, turn } => {
-                let outcome = self.send_one(&gate, &turn);
+                let outcome = if self.shells.take_first(&request_id) {
+                    let outcome = self.start_shell_line(id, &turn.typed);
+                    self.end_start_of(&gate);
+                    outcome
+                } else {
+                    self.send_one(&gate, &turn)
+                };
                 Sent::First {
                     tab: id,
                     request_id,
@@ -6361,7 +6406,7 @@ fn reads_slash_commands(agent: &AgentId, projection: &agent::AgentSessionProject
 fn next_turn(queue: &[Queued], reads_commands: bool) -> Vec<usize> {
     let mut turn = Vec::new();
     for (index, item) in queue.iter().enumerate().filter(|(_, item)| !item.refused) {
-        if item.is_command(reads_commands) {
+        if item.is_command(reads_commands) || item.is_shell() {
             if turn.is_empty() {
                 turn.push(index);
             }

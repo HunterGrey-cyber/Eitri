@@ -25,6 +25,7 @@ pub(super) fn tick_collect(state: &mut AgentPanelState, screen: &Screen, out: &m
     restore_once_released(state, screen, out);
     collect_pending_handoffs(state, out);
     inbound::collect_task_commands(state, out);
+    super::path_menu::poll(state, out);
     report_sessions_that_never_opened(state, screen, out);
     for tab in state.retiring.poll() {
         state.tabs.retire_done(tab);
@@ -121,6 +122,17 @@ pub(super) fn tick_send(
     // Prompts a linked window held until its presence marked their turns as running.
     for sent in state.tabs.poll_turn_sends(std::time::Instant::now()) {
         apply_sent(state, screen, sent, out);
+    }
+    // The `!` lines that ended: each row went into its session, and its report goes out as a turn.
+    for ended in state.tabs.poll_shell_lines() {
+        let tab = ended.tab;
+        match ended.flush {
+            Some(flush) => apply_flush(state, screen, tab, flush, out),
+            None => send_queue(state, tab, out),
+        }
+        if let (Some(text), Some(view)) = (ended.put_back, state.page_of(tab)) {
+            out.send(view, eitri_core::agent_bridge::serialize_queue_taken_for_js(tab, &[text]));
+        }
     }
     // A held message whose tab left without `close_tab`, which answers it (the window closing), is
     // answered by no one.

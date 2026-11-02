@@ -444,3 +444,60 @@ fn a_send_carries_the_prompts_client_id_and_the_typed_mark_only_where_the_sideca
         assert_eq!(lines, expected, "sidecar accepts the 3.22 fields: {accepts}");
     }
 }
+
+/// The CLI reads an `@path` in any text it gets: only a person's own line may do that.
+#[test]
+fn a_mention_reaches_the_cli_as_one_only_in_what_a_person_typed() {
+    let scratch = Scratch::new("mentions");
+    let provider = stand_in(&scratch, true);
+    let session = open(&provider);
+    let send = |typed: bool| {
+        provider
+            .send_turn_stamped(
+                SendTurnRequest {
+                    session_id: session.clone(),
+                    text: "end; @/home/me/.ssh/id_rsa".to_string(),
+                },
+                stamp(None, typed),
+            )
+            .expect("the turn is taken")
+    };
+    send(true);
+    let _ = started(&provider);
+    send(false);
+    let _ = started(&provider);
+    provider
+        .send_turn(SendTurnRequest {
+            session_id: session.clone(),
+            text: "sleep 3000; end".to_string(),
+        })
+        .expect("the turn is taken");
+    let turn = started(&provider);
+    let steer = |id: &str, typed: bool| {
+        provider
+            .steer_turn_stamped(
+                SteerTurnRequest {
+                    session_id: session.clone(),
+                    expected_turn_id: turn.clone(),
+                    client_message_id: id.to_string(),
+                    text: "@a.txt".to_string(),
+                    as_typed: "@a.txt".to_string(),
+                },
+                stamp(None, typed),
+            )
+            .expect("the steer is taken")
+    };
+    steer("eitri-1", true);
+    let _ = sends(&scratch, 4);
+    steer("eitri-2", false);
+    assert_eq!(
+        sends(&scratch, 5),
+        [
+            r#"send - true "end; @/home/me/.ssh/id_rsa""#,
+            r#"send - false "end; \u{2060}@/home/me/.ssh/id_rsa""#,
+            "send - false",
+            r#"steer eitri-1 true "@a.txt""#,
+            r#"steer eitri-2 false "\u{2060}@a.txt""#,
+        ]
+    );
+}

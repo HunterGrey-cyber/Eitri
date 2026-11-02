@@ -118,6 +118,14 @@ pub enum InboundMessage {
         tab: Option<u64>,
         text: String,
     },
+    /// A `!` line the person entered in the composer. The only message that can run a command: no other
+    /// path reads a leading `!`.
+    RunShell {
+        request_id: String,
+        #[serde(default)]
+        tab: Option<u64>,
+        text: String,
+    },
     Interrupt {
         request_id: String,
         #[serde(default)]
@@ -151,6 +159,14 @@ pub enum InboundMessage {
         /// Where to start reading the whole output; absent reads the last bytes.
         #[serde(default)]
         offset: Option<u64>,
+    },
+    /// Project-relative names for a composer query. No session or file contents are needed.
+    PathComplete {
+        request_id: String,
+        #[serde(default)]
+        tab: Option<u64>,
+        query: String,
+        seq: u64,
     },
     /// The models the session's CLI offers, for the picker. No turn.
     ListModels {
@@ -698,11 +714,13 @@ impl InboundMessage {
             // These two name their tab as a plain number: a message without one does not parse.
             InboundMessage::TrustAnswer { tab, .. } | InboundMessage::TrustCancel { tab, .. } => Some(*tab),
             InboundMessage::SendMessage { tab, .. }
+            | InboundMessage::RunShell { tab, .. }
             | InboundMessage::Interrupt { tab, .. }
             | InboundMessage::StopBackground { tab, .. }
             | InboundMessage::ToggleFollowing { tab, .. }
             | InboundMessage::StopTask { tab, .. }
             | InboundMessage::TaskOutput { tab, .. }
+            | InboundMessage::PathComplete { tab, .. }
             | InboundMessage::ListModels { tab, .. }
             | InboundMessage::SetModel { tab, .. }
             | InboundMessage::ApplyEffort { tab, .. }
@@ -890,11 +908,13 @@ impl InboundMessage {
         match self {
             InboundMessage::Ready { request_id }
             | InboundMessage::SendMessage { request_id, .. }
+            | InboundMessage::RunShell { request_id, .. }
             | InboundMessage::Interrupt { request_id, .. }
             | InboundMessage::StopBackground { request_id, .. }
             | InboundMessage::ToggleFollowing { request_id, .. }
             | InboundMessage::StopTask { request_id, .. }
             | InboundMessage::TaskOutput { request_id, .. }
+            | InboundMessage::PathComplete { request_id, .. }
             | InboundMessage::ListModels { request_id, .. }
             | InboundMessage::SetModel { request_id, .. }
             | InboundMessage::ApplyEffort { request_id, .. }
@@ -1008,6 +1028,13 @@ pub fn is_primary_copy(raw: &str) -> bool {
         kind: String,
     }
     raw.contains("\"copy_primary\"") && serde_json::from_str::<Kind>(raw).is_ok_and(|m| m.kind == "copy_primary")
+}
+
+/// Names for the requesting page's current path query. Only the first fifty rows cross the bridge.
+pub fn serialize_path_completions_for_js(tab: crate::tabs::TabId, seq: u64, items: &[String]) -> String {
+    json!({"kind": "path_completions", "tab": tab.0, "seq": seq,
+        "items": items.iter().take(50).collect::<Vec<_>>()})
+    .to_string()
 }
 
 /// A read reply, correlated with its request and its tab even after a switch.
@@ -2805,6 +2832,11 @@ pub fn serialize_queue_for_js(
         .collect();
     json!({ "kind": "queue", "tab": tab.0, "items": items, "error": error, "note": note, "enterSteers": enter_steers })
         .to_string()
+}
+
+/// Whether a `!` line runs in `tab`: its composer behaves as in a running turn until it ends.
+pub fn serialize_shell_running_for_js(tab: crate::tabs::TabId, running: bool) -> String {
+    json!({ "kind": "shell_running", "tab": tab.0, "running": running }).to_string()
 }
 
 /// A tab's unsent draft, sent only when the panel's own copy is not the latest.

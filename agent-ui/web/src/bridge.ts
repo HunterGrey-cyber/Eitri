@@ -13,6 +13,8 @@ export type OutboundMessage =
   /** The mounted page has produced its first frame. The host reveals its view and answers nothing. */
   | { type: "painted" }
   | { type: "send_message"; request_id: string; tab: TabId; text: string }
+  /** A `!` line entered in the composer: the one message that runs a command. */
+  | { type: "run_shell"; request_id: string; tab: TabId; text: string }
   | { type: "question_answer"; request_id: string; tab: TabId; interaction_id: string; answers: QuestionAnswerWire[] }
   | { type: "question_decline"; request_id: string; tab: TabId; interaction_id: string; kind: "cancel" | "chat"; so_far?: QuestionAnswerWire[] }
   | { type: "question_draft"; request_id: string; tab: TabId; interaction_id: string; draft: unknown }
@@ -26,6 +28,8 @@ export type OutboundMessage =
   | { type: "stop_task"; request_id: string; tab: TabId; task_id: string }
   /** `offset` reads the whole output from there, where the session offers it; absent reads the last bytes. */
   | { type: "task_output"; request_id: string; tab: TabId; task_id: string; offset?: number }
+  /** Project-relative names only; the CLI expands completed mentions when the draft is sent. */
+  | { type: "path_complete"; request_id: string; tab: TabId; query: string; seq: number }
   /** The models the session's CLI offers, for the picker. No turn, so it works while one runs. */
   | { type: "list_models"; request_id: string; tab: TabId }
   /** A change of the running session's model, also during a turn. */
@@ -269,6 +273,8 @@ type InboundHandler = (
     | { kind: "command_result"; requestId: string; ok: false; error: string }
     /** Plain text: render through revealHidden, never as Markdown or HTML. */
     | { kind: "task_output_result"; requestId: string; tab: TabId; taskId: string; output: string; totalBytes: number; truncated: boolean; offset?: number }
+    /** Repository names are plain text, through revealHidden. */
+    | { kind: "path_completions"; tab: TabId; seq: number; items: string[] }
     /** Every word is the CLI's: plain text, through revealHidden. */
     | { kind: "models_result"; requestId: string; tab: TabId; models: ModelOption[]; applied: AppliedSettings }
     | { kind: "settings_result"; requestId: string; tab: TabId; applied: AppliedSettings }
@@ -397,6 +403,8 @@ type InboundHandler = (
     /** This tab's queue, its current refusal reason if the last flush was refused,
      *  and `note`: why its messages are held for the turn's end rather than in the turn. */
     | { kind: "queue"; tab: TabId; items: QueueItem[]; error: string | null; note?: string | null; enterSteers?: boolean | null }
+    /** Whether this tab's `!` line is running: its composer behaves as in a running turn. */
+    | { kind: "shell_running"; tab: TabId; running: boolean }
     /** Rust's mirror of the composer's own text, sent only on a switch, `ready`,
      *  a reset or a scratch-editor return -- never while the user is typing. `refused` names the send
      *  whose refusal this follows (a first message the trust question put off), which the page has put
@@ -512,7 +520,19 @@ export function installDispatch(handler: InboundHandler): void {
         console.warn("agent-ui: __eitriDispatch received a malformed editor_cards envelope", parsed);
         return;
       }
+      if (obj.kind === "path_completions") {
+        const value = parsed as Record<string, unknown>;
+        if (
+          !Number.isSafeInteger(value.tab) || !Number.isSafeInteger(value.seq) ||
+          (value.seq as number) < 0 || !Array.isArray(value.items) ||
+          !value.items.every((item) => typeof item === "string")
+        ) {
+          console.warn("agent-ui: malformed path_completions envelope", parsed);
+          return;
+        }
+      }
       if (
+        obj.kind === "path_completions" ||
         obj.kind === "hello" ||
         obj.kind === "command_result" ||
         obj.kind === "task_output_result" ||
@@ -553,6 +573,7 @@ export function installDispatch(handler: InboundHandler): void {
         obj.kind === "trust_prompt" ||
         obj.kind === "begin_rename" ||
         obj.kind === "queue" ||
+        obj.kind === "shell_running" ||
         obj.kind === "draft" ||
         obj.kind === "queue_taken" ||
         obj.kind === "history" ||

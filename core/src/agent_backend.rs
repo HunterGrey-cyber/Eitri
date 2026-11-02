@@ -1015,7 +1015,9 @@ impl AgentBackend {
         let after_revision = self.projection().last_revision;
         match self {
             AgentBackend::Legacy(session) => {
-                session.fold_locally(user_prompt_event(as_typed));
+                if origin != agent::PromptOrigin::ShellLine {
+                    session.fold_locally(user_prompt_event(as_typed));
+                }
                 session.send_turn(wire_text)?;
                 Ok(SubmittedPrompt {
                     client_message_id,
@@ -1027,14 +1029,19 @@ impl AgentBackend {
                 // Reaches the UI through the pump like every other event, because `fold_locally`
                 // queues it -- and it does so regardless of whether `send_turn` below succeeds,
                 // which is exactly what makes a rejected turn still show its prompt.
-                conversation.fold_locally(user_prompt_event(as_typed));
+                let row = origin != agent::PromptOrigin::ShellLine;
+                if row {
+                    conversation.fold_locally(user_prompt_event(as_typed));
+                }
                 let turn_id = match conversation.send_turn_as(wire_text, as_typed, origin, &client_message_id) {
                     Ok(turn_id) => turn_id,
                     Err(error) => {
                         // A turn was open that this side had not folded yet: the prompt it recorded was not
                         // put into any turn, and the tab holds the message to steer into the open one.
                         if matches!(error, ConversationError::TurnAlreadyActive) {
-                            conversation.fold_locally(AgentDomainEvent::UserPromptWithdrawn);
+                            if row {
+                                conversation.fold_locally(AgentDomainEvent::UserPromptWithdrawn);
+                            }
                             return Err(BackendError::turn_busy());
                         }
                         return Err(error.into());
@@ -1051,6 +1058,33 @@ impl AgentBackend {
                     after_revision,
                 })
             }
+        }
+    }
+
+    /// The row of a person's `!` line, before it runs: the turn that reports it comes after what it printed.
+    pub fn fold_shell_line(&mut self, text: &str) {
+        self.fold_row(user_prompt_event(text));
+    }
+
+    /// What a person's `!` line printed, under its row.
+    pub fn fold_shell_output(&mut self, text: String) {
+        self.fold_row(AgentDomainEvent::SessionNotice {
+            kind: agent::SessionNoticeKind::ShellOutput,
+            level: agent::NoticeLevel::Notice,
+            content: Some(text),
+            scalars: Default::default(),
+            task_id: None,
+            tool_use_id: None,
+            task_status: None,
+        });
+    }
+
+    fn fold_row(&mut self, event: AgentDomainEvent) {
+        match self {
+            AgentBackend::Legacy(session) => {
+                session.fold_locally(event);
+            }
+            AgentBackend::Conversation { conversation, .. } => conversation.fold_locally(event),
         }
     }
 

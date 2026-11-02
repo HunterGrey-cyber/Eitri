@@ -91,6 +91,7 @@ export type SessionNoticeKind =
   | "hook_block"
   | "peer_hold"
   | "rate_limit"
+  | "shell_output"
   | "unseen_turn";
 export type NoticeLevel = "info" | "notice" | "suggestion" | "warning";
 /** One notice row (Rust's `NoticeRecord`). `content` is the CLI's own words when it gave any; `scalars`

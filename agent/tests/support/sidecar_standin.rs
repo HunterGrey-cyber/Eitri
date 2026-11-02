@@ -26,7 +26,8 @@
 //!   dropped it;
 //! - `end-no-result`: the current turn ends without a result.
 //!
-//! `--record-sends <file>` appends a line per `SendTurn` and `SteerTurn` request:
+//! `--record-sends <file>` appends a line per `SendTurn` and `SteerTurn` request, with the text after it when it
+//! holds an `@`:
 //! `<rpc> <client id, or -> <typed_by_person>`.
 //!
 //! A steered message's text is the number of milliseconds after which it is delivered (500 if it is
@@ -297,9 +298,10 @@ impl Shared {
         }
     }
 
-    fn record_send(&self, rpc: &str, client_id: Option<&str>, typed: bool) {
+    fn record_send(&self, rpc: &str, client_id: Option<&str>, typed: bool, text: &str) {
         if let Some(file) = self.record_sends.lock().unwrap().as_mut() {
-            writeln!(file, "{rpc} {} {typed}", client_id.unwrap_or("-")).unwrap();
+            let mention = if text.contains('@') { format!(" {text:?}") } else { String::new() };
+            writeln!(file, "{rpc} {} {typed}{mention}", client_id.unwrap_or("-")).unwrap();
             file.flush().unwrap();
         }
     }
@@ -653,7 +655,12 @@ impl Service<http::Request<Body>> for StandIn {
                 }
                 "SendTurn" => {
                     unary(req, move |request: SendTurnRequest| async move {
-                        shared.record_send("send", request.client_message_id.as_deref(), request.typed_by_person);
+                        shared.record_send(
+                            "send",
+                            request.client_message_id.as_deref(),
+                            request.typed_by_person,
+                            &request.text,
+                        );
                         if let Some(session) = shared.sessions.lock().unwrap().get_mut(&request.session_id) {
                             session.last_client_id = request.client_message_id.clone();
                         }
@@ -674,7 +681,12 @@ impl Service<http::Request<Body>> for StandIn {
                 }
                 "SteerTurn" => {
                     unary(req, move |request: SteerTurnRequest| async move {
-                        shared.record_send("steer", Some(&request.client_message_id), request.typed_by_person);
+                        shared.record_send(
+                            "steer",
+                            Some(&request.client_message_id),
+                            request.typed_by_person,
+                            &request.text,
+                        );
                         let after = request.text.trim().parse().unwrap_or(500);
                         let turn_id = request.expected_turn_id.clone();
                         let shared = Arc::clone(&shared);

@@ -198,6 +198,8 @@ export type PageModel = {
   /** Whether Enter puts a message into the running turn, as the tab's latest queue envelope says (`null` before
    *  one came): it follows the agent live, which the snapshot's capability does not. */
   queueSteers: boolean | null;
+  /** Whether a `!` line of this tab is running. */
+  shellRunning: boolean;
   /** The shared prompt history; window-wide, like `editorContext`. */
   history: string[];
   ruleOffers: Record<string, string>;
@@ -232,7 +234,7 @@ export function initialPageModel(): PageModel {
     state: initialState(), hello: null, tabs: null, keptStates: new Map(), fatalError: null,
     handoff: null, handoffRequests: new Map(), commandNotice: null, rootNote: null, inFlight: new Map(),
     turnClock: null, turnDurations: NO_TURN_DURATIONS, thinkingDisplay: "collapsed", paneFocused: false,
-    queue: [], queueError: null, queueNote: null, queueSteers: null, history: [], ruleOffers: {},
+    queue: [], queueError: null, queueNote: null, queueSteers: null, shellRunning: false, history: [], ruleOffers: {},
     editorContext: null, editorLink: null, scratchEditing: false, review: null, reviewHints: {},
     reviewRecovery: [], reviewSettings: REVIEW_SETTINGS_OFF, chooser: null,
   };
@@ -366,7 +368,7 @@ function reduceEnvelope(model: PageModel, envelope: Envelope): PageModel {
         ...(switched ? {
           answerEpoch: model.answerEpoch + 1, queueTaken: null,
           turnClock: null, turnDurations: NO_TURN_DURATIONS, handoff: null, fatalError: null,
-          commandNotice: null, queue: [], queueError: null, queueNote: null, queueSteers: null,
+          commandNotice: null, queue: [], queueError: null, queueNote: null, queueSteers: null, shellRunning: false,
           ruleOffers: {}, scratchEditing: false, chooser: null,
         } : {}),
         state, keptStates,
@@ -494,6 +496,8 @@ function reduceEnvelope(model: PageModel, envelope: Envelope): PageModel {
     }
     case "queue":
       return { ...model, queue: envelope.items, queueError: envelope.error, queueNote: envelope.note ?? null, queueSteers: envelope.enterSteers ?? null };
+    case "shell_running":
+      return { ...model, shellRunning: envelope.running };
     case "history":
       return { ...model, history: envelope.entries };
     case "rule_offers":

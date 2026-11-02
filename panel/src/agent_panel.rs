@@ -67,6 +67,8 @@ mod outbox;
 mod pages;
 #[path = "pair_review.rs"]
 mod pair_review;
+#[path = "path_menu.rs"]
+mod path_menu;
 #[path = "restore.rs"]
 mod restore;
 #[path = "review_glue.rs"]
@@ -159,6 +161,7 @@ struct AgentPanelState {
     tabs: eitri_core::tab_set::TabSet,
     backend_kind: BackendKind,
     project_dir: PathBuf,
+    path_menu: path_menu::PathMenu,
     /// `project_dir.canonicalize()`, read once: the `canonical_cwd` a session lease is keyed on
     /// (`agent::lease::SessionLease::is_held`), for resume routing and the chooser.
     canonical_project_dir: String,
@@ -549,6 +552,7 @@ impl AgentPanelState {
             editor_context,
             backend_kind,
             project_dir,
+            path_menu: path_menu::PathMenu::default(),
             canonical_project_dir,
             prefs_dir,
             supervisor,

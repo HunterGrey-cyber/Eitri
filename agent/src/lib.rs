@@ -59,6 +59,7 @@ pub mod ingestion;
 pub mod jsonrpc_link;
 pub mod lease;
 mod move_seed;
+pub mod mention;
 pub mod permission_policy;
 pub mod permission_rules;
 pub mod persistence;

@@ -26,6 +26,8 @@ import {
 } from "../slashCommands";
 import type { CompletionCommand, SlashAction } from "../slashCommands";
 import { HistorySearch } from "./HistorySearch";
+import { atToken, atInsertion } from "../atMenu";
+import { AtMenu } from "./AtMenu";
 import { SlashMenu } from "./SlashMenu";
 import { NO_TEXT_ASSIST } from "../textField";
 import { runningPlaceholder } from "../queueLines";
@@ -79,6 +81,9 @@ type Props = {
    *  panel in an INPUT with nothing to type into. */
   hintTarget?: boolean;
   onSend: (text: string) => void;
+  /** Enter on a `!` line in a Claude tab: it runs as the person's own command. The one way a line runs; the
+   *  rest of the panel's paths send words. */
+  onRunShell?: (text: string) => void;
   /** Every change to the box's text, and once more with `""` right after a send: the host mirrors this into a ref so
    *  a tab switch can save the unsent draft. Optional so every existing caller (and this component's own tests) needs
    *  no stand-in. */
@@ -120,6 +125,8 @@ type Props = {
   /** The commands the `/` menu offers in this tab (`../slashCommands`' `completionSource`). `null`, or
    *  absent, is "no menu": an agent that reports no list (Codex) has nothing to complete. */
   slashCommands?: readonly CompletionCommand[] | null;
+  atPaths?: { items: string[]; seq: number } | null;
+  onAtQuery?: (query: string, seq: number) => void;
   /** The keys the `Ctrl+r` search stops before they bubble, handed
    *  to the host's typing guard (`HistorySearch`'s own `onLineKey`). */
   onLineKey?: (event: React.KeyboardEvent<HTMLInputElement | HTMLTextAreaElement>) => void;
@@ -167,6 +174,8 @@ export function Composer({
   claudeSlashCommands = true,
   onSlashAction,
   slashCommands = null,
+  atPaths = null,
+  onAtQuery,
   onLineKey,
   browseKey = "i",
   idleHint,
@@ -183,6 +192,14 @@ export function Composer({
   const [menuIndex, setMenuIndex] = useState(0);
   const [menuTop, setMenuTop] = useState(0);
   const [menuDismissed, setMenuDismissed] = useState(false);
+  const [atIndex, setAtIndex] = useState(0);
+  const [atTop, setAtTop] = useState(0);
+  const [atMoved, setAtMoved] = useState(false);
+  const [atDirectory, setAtDirectory] = useState<{ query: string; items: string[] } | null>(null);
+  const [atAsked, setAtAsked] = useState<{ query: string; seq: number } | null>(null);
+  const atSeq = useRef(0);
+  const atQueryCallback = useRef(onAtQuery);
+  atQueryCallback.current = onAtQuery;
   /* A local flash for a held-back slash command, drawn right here rather than
    *  through the shared footer/band -- see `Chooser`'s own identical `showFlash`/`flash` pair and
    *  its doc comment for why a local one exists at all (the window's own flash can sit behind
@@ -219,10 +236,14 @@ export function Composer({
   /** Puts `next` in the box. `recalled` is a draft the user did not type (history, the queue, a search
    *  result): a recalled `/command` must not open the menu, which would own `↑`/`↓` and stop the walk on it. */
   function setBox(next: string, caret: number | null = null, recalled = false) {
+    setAtDirectory(null);
     setText(next);
     onDraftChange?.(next);
     caretRef.current = caret;
     setCaret(caret ?? next.length);
+    setAtIndex(0);
+    setAtTop(0);
+    setAtMoved(false);
     setMenuIndex(0);
     setMenuTop(0);
     setMenuDismissed(recalled);
@@ -272,9 +293,13 @@ export function Composer({
     // This effect shows the host's text without mirroring it back. Tab switches and inbound `draft`
     // echoes also set `restoredDraft`; echoing them would post an unrequested draft back to Rust.
     // The host mirrors recovered text once, in its send-refusal handler.
+    setAtDirectory(null);
     setText(restoredDraft.text);
     caretRef.current = null;
     setCaret(restoredDraft.text.length);
+    setAtIndex(0);
+    setAtTop(0);
+    setAtMoved(false);
     setMenuIndex(0);
     setMenuTop(0);
     setMenuDismissed(true);
@@ -306,6 +331,50 @@ export function Composer({
   const selected = Math.min(menuIndex, Math.max(0, matches.length - 1));
   const shownFrom = slashMenuWindow(selected, menuTop, matches.length);
 
+  const mention =
+    onAtQuery !== undefined && claudeSlashCommands && mode === "input" && !disabled && !editingInNvim &&
+    !searching && !menuOpen && !menuDismissed ? atToken(text, caret) : null;
+  const atQuery = mention?.query;
+  useEffect(() => {
+    setAtIndex(0);
+    setAtTop(0);
+    setAtMoved(false);
+    setAtAsked(null);
+    if (atQuery === undefined || atQueryCallback.current === undefined) return;
+    const timer = setTimeout(() => {
+      const seq = ++atSeq.current;
+      setAtAsked({ query: atQuery, seq });
+      atQueryCallback.current?.(atQuery, seq);
+    }, 60);
+    return () => clearTimeout(timer);
+  }, [atQuery, mention?.start]);
+  const atItems = mention === null
+    ? []
+    : atAsked?.query === mention.query && atPaths?.seq === atAsked?.seq
+      ? atPaths?.items ?? []
+      : atDirectory?.query === mention.query ? atDirectory.items : [];
+  const atOpen = atItems.length > 0;
+  const atSelected = Math.min(atIndex, Math.max(0, atItems.length - 1));
+  const atFrom = slashMenuWindow(atSelected, atTop, atItems.length);
+  function selectAt(next: number) {
+    setAtIndex(next);
+    setAtTop(slashMenuWindow(next, atFrom, atItems.length));
+    setAtMoved(true);
+  }
+  function completeAt(path: string) {
+    if (mention === null) return;
+    const insertion = atInsertion(path);
+    const rest = text.slice(mention.end);
+    const head = text.slice(0, mention.start) + insertion.text;
+    setBox(head + (insertion.keepOpen ? rest : rest.replace(/^ /, "")), head.length);
+    setMenuDismissed(!insertion.keepOpen);
+    if (insertion.keepOpen) {
+      // Keep the chosen directory visible while its children are requested.
+      setAtDirectory({ query: path, items: atItems.filter((item) => item.startsWith(path)) });
+    }
+    textareaRef.current?.focus();
+  }
+
   function selectMenu(next: number) {
     setMenuIndex(next);
     setMenuTop(slashMenuWindow(next, shownFrom, matches.length));
@@ -324,6 +393,9 @@ export function Composer({
     textareaRef.current?.focus();
   }
 
+  /** What a `!` first turns the box into, as Claude Code's shell mode: Enter runs the line. */
+  const shellMode = claudeSlashCommands === true && text.startsWith("!");
+
   function submit(now: boolean) {
     if (disabled || editingInNvim) return;
     const body = text;
@@ -336,6 +408,14 @@ export function Composer({
         setBox("");
         setWalk({ index: null, stash: "" });
       }
+      return;
+    }
+    if (claudeSlashCommands && body.startsWith("!")) {
+      // `!` with nothing after it waits for the command, as Claude Code's shell mode does.
+      if (body.slice(1).trim() === "") return;
+      onRunShell?.(body);
+      setBox("");
+      setWalk({ index: null, stash: "" });
       return;
     }
     // A terminal-only command keeps its draft so the user can revise it.
@@ -392,6 +472,26 @@ export function Composer({
       if (e.key === "Escape" && !e.shiftKey && !e.ctrlKey) {
         // Closes the menu and nothing else: the key does not bubble to the panel's own Esc (back to
         // browsing). The typing guard is told of it, as the history search tells of its own.
+        e.preventDefault();
+        e.stopPropagation();
+        onLineKey?.(e);
+        setMenuDismissed(true);
+        return;
+      }
+    }
+    if (atOpen && !e.altKey && !e.metaKey) {
+      const step = e.shiftKey ? null : pickerStep(e);
+      if (step !== null) {
+        e.preventDefault();
+        selectAt((atSelected + step + atItems.length) % atItems.length);
+        return;
+      }
+      if (!e.shiftKey && !e.ctrlKey && (e.key === "Tab" || (e.key === "Enter" && atMoved))) {
+        e.preventDefault();
+        completeAt(atItems[atSelected]);
+        return;
+      }
+      if (e.key === "Escape" && !e.shiftKey && !e.ctrlKey) {
         e.preventDefault();
         e.stopPropagation();
         onLineKey?.(e);
@@ -480,7 +580,7 @@ export function Composer({
   }
 
   return (
-    <div className="composer" {...(hintTarget ? { [HINT_COMPOSER_ATTR]: "" } : {})}>
+    <div className={shellMode ? "composer composer-shell" : "composer"} {...(hintTarget ? { [HINT_COMPOSER_ATTR]: "" } : {})}>
       {closing && (
         <p className="composer-closing" role="status">
           This conversation is being closed so it can continue in a terminal. Anything still in the
@@ -519,6 +619,16 @@ export function Composer({
               onWheel={(by) => selectMenu(Math.max(0, Math.min(matches.length - 1, selected + by)))}
             />
           )}
+          {atOpen && (
+            <AtMenu
+              rows={atItems.slice(atFrom, atFrom + SLASH_MENU_ROWS)}
+              firstIndex={atFrom}
+              total={atItems.length}
+              selected={atSelected}
+              onPick={(i) => completeAt(atItems[i])}
+              onWheel={(by) => selectAt(Math.max(0, Math.min(atItems.length - 1, atSelected + by)))}
+            />
+          )}
           {/* No prompt glyph: the framed box the composer is drawn as (`index.css`) is its mark. */}
           <textarea
             ref={textareaRef}
@@ -534,9 +644,13 @@ export function Composer({
             readOnly={editingInNvim}
             autoFocus
             onChange={(e) => {
+              setAtDirectory(null);
               setText(e.target.value);
               onDraftChange?.(e.target.value);
               setCaret(e.target.selectionStart);
+              setAtIndex(0);
+              setAtTop(0);
+              setAtMoved(false);
               setMenuIndex(0);
               setMenuTop(0);
               setMenuDismissed(false);

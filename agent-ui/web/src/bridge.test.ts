@@ -433,3 +433,20 @@ describe("OutboundMessage: keymap_closed serialises exactly", () => {
     expect(JSON.stringify(message)).toBe(wire);
   });
 });
+
+describe("path completion envelopes", () => {
+  it("accepts only numeric tab/sequence and an array consisting entirely of strings", () => {
+    const handler = vi.fn();
+    const warning = vi.spyOn(console, "warn").mockImplementation(() => {});
+    installDispatch(handler);
+    const valid = { kind: "path_completions", tab: 1, seq: 2, items: ["sub/", "sub/file"] };
+    window.__eitriDispatch!(JSON.stringify(valid));
+    expect(handler).toHaveBeenLastCalledWith(valid);
+    for (const malformed of [
+      { ...valid, items: ["okay", 3] }, { ...valid, items: "file" }, { ...valid, items: null },
+      { ...valid, tab: "1" }, { ...valid, seq: "2" }, { ...valid, seq: -1 }, { ...valid, seq: 0.5 },
+    ]) window.__eitriDispatch!(JSON.stringify(malformed));
+    expect(handler).toHaveBeenCalledTimes(1);
+    warning.mockRestore();
+  });
+});

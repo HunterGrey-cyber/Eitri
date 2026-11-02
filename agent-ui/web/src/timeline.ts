@@ -190,8 +190,14 @@ export function wakeText(item: Extract<TimelineItem, { kind: "wake" }>): string 
 }
 
 export function noticeBody(notice: NoticeRecord): string | null {
+  if (notice.kind === "shell_output") {
+    return (notice.content?.split("\n").length ?? 0) > SHELL_ROW_LINES ? notice.content : null;
+  }
   return notice.kind === "compaction" ? notice.content : null;
 }
+
+/** The lines of a `!` line's output a closed row shows; `index.css` clamps to the same number. */
+export const SHELL_ROW_LINES = 12;
 
 /** The sentence a turn this panel never saw is introduced by: its answer follows as a reply of its own. */
 export const UNSEEN_TURN_TEXT = "Claude Code ran a turn this panel could not show; reopen the tab to see its steps";

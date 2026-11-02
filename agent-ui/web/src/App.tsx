@@ -558,7 +558,7 @@ export default function App() {
   }, []);
   const {
     state, hello, tabs, fatalError, handoff, handoffRequests, commandNotice, rootNote, turnClock, turnDurations, thinkingDisplay, paneFocused,
-    queue, queueError, queueNote, queueSteers, history, ruleOffers, editorContext, editorLink, scratchEditing,
+    queue, queueError, queueNote, queueSteers, shellRunning, history, ruleOffers, editorContext, editorLink, scratchEditing,
     review, reviewHints, reviewRecovery, reviewSettings, chooser,
     inputRequest, arriveRequest, permissionRequest, navKey, keymapHelp, heldTrust, confirm, renaming, queueTaken,
   } = page;
@@ -898,6 +898,8 @@ export default function App() {
   const [tasksInitialId, setTasksInitialId] = useState<string | null>(null);
   const tasksRef = useRef<TasksOverlayHandle>(null);
   const taskRequests = useRef(new Map<string, TabId>());
+  const [atPathsByTab, setAtPathsByTab] = useState<Record<number, { items: string[]; seq: number }>>({});
+  const atLastAsked = useRef(new Map<TabId, number>());
   const settingsRequests = useRef(new Map<string, SettingsRequest>());
   /** How many times `Ctrl+g` has viewed each broker card's proposal, by card id: the next press shows the next file. */
   const cardViews = useRef(new Map<string, number>());
@@ -2840,6 +2842,11 @@ export default function App() {
         answerSettings(request, payload);
         return;
       }
+      if (payload.kind === "path_completions") {
+        if (payload.seq !== atLastAsked.current.get(payload.tab)) return;
+        setAtPathsByTab((previous) => ({ ...previous, [payload.tab]: { items: payload.items, seq: payload.seq } }));
+        return;
+      }
       // Every session-scoped envelope names its tab, and the page keeps only the active tab's state, so one for
       // any other tab -- a batch still in flight when the user switched away -- is dropped before any arm below
       // can touch the page.
@@ -3822,6 +3829,18 @@ export default function App() {
 
   function interrupt() {
     post({ type: "interrupt" });
+  }
+
+  /** Enter on a `!` line: a refusal puts it back in the box, as a send's does. */
+  function runShell(text: string) {
+    const tab = activeTabRef.current;
+    if (tab === null) return;
+    const requestId = nextRequestId();
+    setPendingCommands((prev) => new Set(prev).add(requestId));
+    trackRequest(requestId, { kind: "send", tab, text });
+    setCommandNotice(null);
+    postToRust({ type: "run_shell", request_id: requestId, tab, text });
+    resumeFollowing(containerRef.current?.querySelector(".message-list"));
   }
 
   /** `r` on an ended tab (restart it, as Claude Code's resume would). `TabSet::reset` (Rust) folds
@@ -6757,6 +6776,13 @@ export default function App() {
         // none otherwise (`completionSource`). Withheld while a y/n question is up: an open menu
         // would take the `Esc` that answers it, and the question owns the keys.
         slashCommands={confirm !== null ? null : completionSource(activeTab?.agent, state.availableCommands)}
+        atPaths={activeTab === null ? null : atPathsByTab[activeTab.id] ?? null}
+        onAtQuery={confirm !== null || waitingQuestion ? undefined : (query, seq) => {
+          const tab = activeTabRef.current;
+          if (tab === null) return;
+          atLastAsked.current.set(tab, seq);
+          postToRust({ type: "path_complete", request_id: nextRequestId(), tab, query, seq });
+        }}
         // The raw `inputRequest` used to reach `Composer` directly here, so its own
         // `[focusRequest, mode]` effect (focusing the textarea whenever `mode === "input"`) had no
         // way to know an overlay was drawn over it. `composerFocusRequest` is bumped from the
@@ -6768,8 +6794,9 @@ export default function App() {
         hintTarget={!(sessionEnded || handingOff)}
         onModeChange={(next) => { if (!waitingQuestion) setMode(next); }}
         onSend={sendMessage}
+        onRunShell={runShell}
         onDraftChange={mirrorDraft}
-        running={turnInProgress}
+        running={turnInProgress || shellRunning}
         enterSteers={enterSteers}
         onQueue={queueMessage}
         onSendNow={(t) => {

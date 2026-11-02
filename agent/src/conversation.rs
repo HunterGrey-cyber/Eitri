@@ -65,11 +65,13 @@ use std::sync::Arc;
 /// Who wrote a message the host sends: the person, at the composer (`Typed`), or the host or a plugin
 /// (`Composed`: turn review's prompts, a plugin page's send, a companion send that came from no
 /// keyboard, a restored queue the person did not send again). Only a `Typed` message is marked as the
-/// person's to the agent.
+/// person's to the agent. `ShellLine` is the turn that tells the agent what a person's `!` line printed: the
+/// host wrote its words, and the conversation already shows the line, so it adds no row.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PromptOrigin {
     Typed,
     Composed,
+    ShellLine,
 }
 
 #[derive(Debug)]

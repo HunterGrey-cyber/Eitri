@@ -1321,6 +1321,18 @@ enum SteerFailure {
     Unknown(String),
 }
 
+/// What goes to the CLI for a message: as it is when a person typed it, whose `@path` the CLI reads; with
+/// every mention made plain otherwise, so that text no person typed never chooses a file to read.
+fn turn_text(text: String, typed_by_person: bool) -> String {
+    if typed_by_person {
+        return text;
+    }
+    match crate::mention::inert(&text) {
+        std::borrow::Cow::Borrowed(_) => text,
+        std::borrow::Cow::Owned(plain) => plain,
+    }
+}
+
 fn steer_failure(status: tonic::Status) -> SteerFailure {
     if let Some(detail) = error_detail(&status) {
         return SteerFailure::Refused(steer_refusal(detail));
@@ -1820,10 +1832,11 @@ impl AgentProvider for ClaudeSidecarProvider {
             self.events.note_sent(id, typed);
         }
         self.events.note_effort_ask(effort_reply::ask_of(&request.text));
+        let text = turn_text(request.text, stamp.typed_by_person);
         let proto_request = ProtoSendTurnRequest {
             session_id: request.session_id,
             command_id: uuid::Uuid::new_v4().to_string(),
-            text: request.text,
+            text,
             client_message_id: client_message_id.clone(),
             typed_by_person: stamp.typed_by_person && self.capabilities.human_origin,
         };
@@ -1875,7 +1888,7 @@ impl AgentProvider for ClaudeSidecarProvider {
             command_id: uuid::Uuid::new_v4().to_string(),
             expected_turn_id,
             client_message_id: client_message_id.clone(),
-            text,
+            text: turn_text(text, stamp.typed_by_person),
             typed_by_person: stamp.typed_by_person && self.capabilities.human_origin,
         };
         if let Some(now) = self.events.open_steer(&client_message_id, as_typed, proto_request)? {

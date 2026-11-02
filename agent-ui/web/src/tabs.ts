@@ -11,7 +11,7 @@ import type { PermissionModeChoice, TabId, TabInfo, TabMarker, TabsEnvelope } fr
  *  another is on screen. */
 const TAB_SCOPED = new Set([
   "events", "snapshot", "editor_cards", "handoff", "error", "focus_permission", "tab_detail", "confirm_close", "begin_rename",
-  "queue", "draft", "queue_taken", "rule_offers", "scratch", "review", "review_diff",
+  "queue", "shell_running", "draft", "queue_taken", "rule_offers", "scratch", "review", "review_diff",
   "review_draft", "review_send_preview", "trust_prompt",
 ]);
 

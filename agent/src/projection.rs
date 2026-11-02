@@ -1358,6 +1358,8 @@ pub enum SessionNoticeKind {
     PeerHold,
     /// The usage limit reset and the CLI went on by itself.
     RateLimit,
+    /// What a person's `!` line printed: Eitri's row, under the line.
+    ShellOutput,
     /// The CLI ran a turn this panel could not show.
     UnseenTurn,
 }

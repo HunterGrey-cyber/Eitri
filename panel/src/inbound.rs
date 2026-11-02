@@ -812,7 +812,9 @@ pub(super) fn handle_inbound_message(
         InboundMessage::Interrupt { .. } => {
             let tab = tab_of(target);
             // A frozen tab's turn moves as it runs: stopped here, the record would not say so.
-            let outcome = if state.tabs.is_moving(tab) {
+            let outcome = if state.tabs.interrupt_shell_line(tab) {
+                Ok(())
+            } else if state.tabs.is_moving(tab) {
                 Err(BackendError {
                     message: eitri_core::tab_set::MOVING.to_string(),
                     benign: true,
@@ -828,6 +830,15 @@ pub(super) fn handle_inbound_message(
             let tab = tab_of(target);
             let outcome = state.tabs.stop_background(tab, running);
             apply_command_outcome(state, screen, view, tab, &request_id, outcome, &mut out);
+        }
+        InboundMessage::PathComplete { query, seq, .. } => {
+            if let Some(tab) = target {
+                state.path_menu.ask(tab, view, query, seq);
+                super::path_menu::poll(state, &mut out);
+                ok(&mut out);
+            } else {
+                refuse(&mut out, "no tab for path completion");
+            }
         }
         message @ (InboundMessage::StopTask { .. } | InboundMessage::TaskOutput { .. }) => {
             let tab = tab_of(target);
@@ -1187,6 +1198,49 @@ pub(super) fn handle_inbound_message(
                     ok(&mut out);
                 }
                 Err(why) => refuse(&mut out, &why),
+            }
+        }
+        InboundMessage::RunShell { text, .. } => {
+            let tab = tab_of(target);
+            remember_prompts(state, std::slice::from_ref(&text), &mut out);
+            state.tabs.note_sent(tab);
+            let fresh = matches!(
+                state.tabs.get(tab).expect("resolved above").backend(),
+                TabBackend::NotStarted
+            );
+            if fresh && eitri_core::tab_set::shell_command(&text).is_some() {
+                // A tab with no session starts one first, trust question and all, as any first message does.
+                // Its words stand in as the first turn; the start runs the line instead of sending them.
+                state.tabs.note_first_shell_line(&request_id);
+                let start = DeferredStart::FirstSend {
+                    request_id: request_id.clone(),
+                    first_turn: FirstTurn {
+                        typed_by_person: false,
+                        wire: text.clone(),
+                        typed: text,
+                    },
+                };
+                match gate_start(state, tab, start) {
+                    Ok(()) => {
+                        note_start_page(state, tab, &request_id, view);
+                        send_tabs(state, &mut out)
+                    }
+                    Err(why) => {
+                        state.tabs.forget_first_shell_line(&request_id);
+                        refuse(&mut out, &why)
+                    }
+                }
+            } else {
+                match state.tabs.queue_shell_line(tab, &text, now_ms()) {
+                    Ok(()) => {
+                        match state.tabs.flush_queue(tab) {
+                            Some(flush) => apply_flush(state, screen, tab, flush, &mut out),
+                            None => send_queue(state, tab, &mut out),
+                        }
+                        ok(&mut out);
+                    }
+                    Err(why) => refuse(&mut out, &why),
+                }
             }
         }
         InboundMessage::OpenDetail { .. } => {
@@ -1665,6 +1719,105 @@ pub(super) fn no_session_error() -> eitri_core::agent_backend::BackendError {
 mod tests {
     use super::*;
     use crate::agent_panel::tests::*;
+
+    fn message(kind: &str, request_id: &str, tab: TabId, text: &str) -> String {
+        serde_json::json!({ "type": kind, "request_id": request_id, "tab": tab.0, "text": text }).to_string()
+    }
+
+    /// The page's one door to a command, and the same words through the others.
+    #[test]
+    fn only_run_shell_runs_a_line_and_the_same_words_elsewhere_are_words() {
+        agent::state_dirs::redirect_state_to_a_test_root();
+        let dir = agent::state_dirs::test_workspace_dir("panel-shell-door");
+        let (handle, page, _second) = handle_with_two_pages();
+        handle.state.borrow_mut().project_dir = dir.clone();
+        let (tab, provider) = live_tab(&handle, &dir);
+        let marker = dir.join("ran");
+        let line = format!("!touch {}", marker.display());
+        handle.tick();
+
+        handle.page_message(ViewId::BASE, &message("send_message", "s1", tab, &line));
+        tick_handle_until(&handle, "the message", || provider.turns().len() == 1);
+        assert_eq!(provider.turns(), [line.clone()], "it went to the model as text");
+        assert!(!handle.state.borrow().tabs.shell_line_runs(tab));
+        provider.queue(agent::AgentDomainEvent::TurnStarted { turn_id: "t1".into() });
+        tick_handle_until(&handle, "the turn", || {
+            handle.state.borrow().tabs.get(tab).unwrap().turn_running()
+        });
+        handle.page_message(ViewId::BASE, &message("queue_message", "q1", tab, &line));
+        handle.tick();
+        assert!(!handle.state.borrow().tabs.shell_line_runs(tab));
+        assert!(!marker.exists());
+        provider.queue(agent::AgentDomainEvent::TurnCompleted {
+            turn_id: "t1".into(),
+            outcome: agent::TurnOutcome::Completed,
+            result_text: String::new(),
+            stop_reason: None,
+            usage: None,
+            detail: Default::default(),
+        });
+        tick_handle_until(&handle, "the queue", || provider.turns().len() == 2);
+        assert_eq!(provider.turns()[1], line);
+        provider.queue(agent::AgentDomainEvent::TurnStarted { turn_id: "t2".into() });
+        provider.queue(agent::AgentDomainEvent::TurnCompleted {
+            turn_id: "t2".into(),
+            outcome: agent::TurnOutcome::Completed,
+            result_text: String::new(),
+            stop_reason: None,
+            usage: None,
+            detail: Default::default(),
+        });
+        tick_handle_until(&handle, "the turn's end", || {
+            !handle.state.borrow().tabs.get(tab).unwrap().turn_running()
+        });
+        assert!(!marker.exists());
+
+        handle.page_message(ViewId::BASE, &message("run_shell", "r1", tab, &line));
+        assert_eq!(result_for(&page.sent.borrow(), "r1"), Some(Ok(())));
+        tick_handle_until(&handle, "the line's report", || provider.turns().len() == 3);
+        assert!(marker.exists());
+        assert!(provider.turns()[2].starts_with("<bash-input>touch "));
+        let shown: Vec<serde_json::Value> = page.sent.borrow().iter().map(|p| json_of(p)).collect();
+        assert!(shown.iter().any(|v| v["kind"] == "shell_running" && v["running"] == true));
+        assert!(shown.iter().any(|v| v["kind"] == "shell_running" && v["running"] == false));
+        shut_down_every_tab(&handle);
+    }
+
+    #[test]
+    fn stopping_a_line_answers_the_interrupt_and_puts_it_back_in_the_box() {
+        agent::state_dirs::redirect_state_to_a_test_root();
+        let dir = agent::state_dirs::test_workspace_dir("panel-shell-stop");
+        let (handle, page, _second) = handle_with_two_pages();
+        handle.state.borrow_mut().project_dir = dir.clone();
+        let (tab, provider) = live_tab(&handle, &dir);
+        handle.tick();
+        handle.page_message(ViewId::BASE, &message("run_shell", "r1", tab, "!sleep 20"));
+        assert!(handle.state.borrow().tabs.shell_line_runs(tab));
+        let interrupt = serde_json::json!({ "type": "interrupt", "request_id": "i1", "tab": tab.0 }).to_string();
+        handle.page_message(ViewId::BASE, &interrupt);
+        assert_eq!(result_for(&page.sent.borrow(), "i1"), Some(Ok(())));
+        tick_handle_until(&handle, "the line back in the box", || {
+            page.sent.borrow().iter().map(|p| json_of(p)).any(|v| {
+                v["kind"] == "queue_taken" && v["texts"] == serde_json::json!(["!sleep 20"])
+            })
+        });
+        assert!(provider.turns().is_empty());
+        assert_eq!(provider.interrupts(), 0);
+        shut_down_every_tab(&handle);
+    }
+
+    #[test]
+    fn a_bang_with_no_command_is_refused() {
+        agent::state_dirs::redirect_state_to_a_test_root();
+        let dir = agent::state_dirs::test_workspace_dir("panel-shell-other");
+        let (handle, page, _second) = handle_with_two_pages();
+        let (tab, _provider) = live_tab(&handle, &dir);
+        handle.tick();
+        handle.page_message(ViewId::BASE, &message("run_shell", "r1", tab, "!"));
+        assert!(matches!(result_for(&page.sent.borrow(), "r1"), Some(Err(_))));
+        assert!(!handle.state.borrow().tabs.shell_line_runs(tab));
+        shut_down_every_tab(&handle);
+    }
 
     /// A permission answered after a switch reaches the tab
     /// that asked, not the one on screen.

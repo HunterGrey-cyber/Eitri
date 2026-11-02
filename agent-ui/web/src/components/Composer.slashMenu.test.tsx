@@ -472,3 +472,46 @@ describe("an agent's text", () => {
 function onCaret(textarea: HTMLTextAreaElement): number {
   return textarea.selectionStart;
 }
+
+describe("a `!` line", () => {
+  it("runs on Enter in a Claude tab, whatever the turn, and leaves the box empty", () => {
+    for (const running of [false, true]) {
+      const onRunShell = vi.fn();
+      const onQueue = vi.fn();
+      const { textarea, onSend, container } = renderComposer({ claudeSlashCommands: true, onRunShell, onQueue, running });
+      typed(textarea, "!echo hi");
+      expect(container.querySelector(".composer-shell")).not.toBeNull();
+      fireEvent.keyDown(textarea, { key: "Enter" });
+      expect(onRunShell).toHaveBeenCalledWith("!echo hi");
+      expect(onSend).not.toHaveBeenCalled();
+      expect(onQueue).not.toHaveBeenCalled();
+      expect(textarea.value).toBe("");
+      cleanup();
+    }
+  });
+
+  it("waits for a command when only the `!` is there", () => {
+    const onRunShell = vi.fn();
+    const { textarea, onSend } = renderComposer({ claudeSlashCommands: true, onRunShell });
+    typed(textarea, "!  ");
+    fireEvent.keyDown(textarea, { key: "Enter" });
+    expect(onRunShell).not.toHaveBeenCalled();
+    expect(onSend).not.toHaveBeenCalled();
+    expect(textarea.value).toBe("!  ");
+  });
+
+  it("is words in another agent's tab and anywhere but the start of the box", () => {
+    const onRunShell = vi.fn();
+    const other = renderComposer({ claudeSlashCommands: false, onRunShell });
+    typed(other.textarea, "!echo hi");
+    expect(other.container.querySelector(".composer-shell")).toBeNull();
+    fireEvent.keyDown(other.textarea, { key: "Enter" });
+    expect(other.onSend).toHaveBeenCalledWith("!echo hi");
+    cleanup();
+    const later = renderComposer({ claudeSlashCommands: true, onRunShell });
+    typed(later.textarea, " !echo hi");
+    fireEvent.keyDown(later.textarea, { key: "Enter" });
+    expect(later.onSend).toHaveBeenCalledWith(" !echo hi");
+    expect(onRunShell).not.toHaveBeenCalled();
+  });
+});
