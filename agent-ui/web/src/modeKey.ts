@@ -76,9 +76,11 @@ export function modeFixedMessage(resetKey: string): string {
  *  arriving". */
 export const BYPASS_YES_GUARD_MS = TYPING_GUARD_MS;
 
-/** No key waits this long in the queue of a page that keeps answering: every key lagging by more says the stamps are
- *  on another clock. */
+/** No key waits this long in the queue of a page that keeps answering, so a lag past it may be another clock. */
 export const OTHER_CLOCK_LAG_MS = 10_000;
+/** How closely two keys' lags agree when the lag is the clocks' offset and not a wait: keys held up by one stall lag by
+ *  different amounts, the time between their presses. */
+export const LAGS_AGREE_MS = 20;
 
 /** When each keydown was pressed, on `performance.now()`'s clock. A page that is busy queues keys, so the time a key is
  *  handled says nothing about what was on screen at the press; `event.timeStamp` does.
@@ -86,18 +88,23 @@ export const OTHER_CLOCK_LAG_MS = 10_000;
  *  The handling time stands in where a stamp cannot be this clock: none at all, or one in the future (a test's faked
  *  `Date`, or a compositor's clock running ahead). It does for a repeat too: GDK stamps every repeat of a held key with
  *  the press, so the stamp stands still while the key is held. A clock running behind is told by the keys themselves:
- *  when at least two have come and even the least lagged is past `OTHER_CLOCK_LAG_MS`, that lag is the clocks' offset
- *  and is taken off. One key's lag alone proves nothing, so a key held up by a long stall keeps its own press. */
+ *  when no key so far has lagged less than `OTHER_CLOCK_LAG_MS` and a key lags within `LAGS_AGREE_MS` of the least lag
+ *  so far, that least lag is the clocks' offset and is taken off. It is compared with the least and not the last, since
+ *  some keys are always handled late and the least is the one that is near the offset; and it is always the least,
+ *  since no key can lag less than the offset, so a press is never put after its own handling. Anything less proves
+ *  nothing, so a key held up by a long stall keeps its own press. */
 export class KeyClock {
   private leastLag = Infinity;
-  private keys = 0;
+  private otherClock = false;
 
   pressedAt(event: { timeStamp: number; repeat?: boolean }, handledAt: number): number {
     const stamp = event.timeStamp;
     if (event.repeat === true || stamp <= 0 || stamp > handledAt) return handledAt;
-    this.leastLag = Math.min(this.leastLag, handledAt - stamp);
-    this.keys += 1;
-    return this.keys >= 2 && this.leastLag > OTHER_CLOCK_LAG_MS ? stamp + this.leastLag : stamp;
+    const lag = handledAt - stamp;
+    if (Math.abs(lag - this.leastLag) <= LAGS_AGREE_MS) this.otherClock = true;
+    this.leastLag = Math.min(this.leastLag, lag);
+    if (this.leastLag <= OTHER_CLOCK_LAG_MS) this.otherClock = false;
+    return this.otherClock ? stamp + this.leastLag : stamp;
   }
 }
 

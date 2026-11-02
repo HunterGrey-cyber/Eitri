@@ -16,18 +16,36 @@ const macrotask = () =>
 const nextFrame = () => new Promise<void>((resolve) => requestAnimationFrame(() => resolve()));
 const HEX = "a".repeat(64);
 const SAMPLES = 15;
+/** The large shapes take long enough that a few samples say it. */
+const samplesOf = (shape: string) => (shape.startsWith("value-") || shape === "lines-long" ? 5 : SAMPLES);
 
 const TAB = {
   id: 1, number: 1, label: "1 new", name: null, state: "live", mode: "manual",
   marker: null, pending: 0, resumable: false, failure: null, title: null,
 };
 
+/** One item value at the 2 MiB bound in a first question, against a short one. */
+const VALUES: Record<string, () => string> = {
+  "value-small": () => "touch /tmp/marker",
+  "value-ascii": () => "word ".repeat(400_000),
+  "value-hidden": () => "\u200b".repeat(690_000),
+  "value-alternating": () => "a\u200b".repeat(500_000),
+};
+
 /** `rows` drawn rows of an instruction file. `wide` lines wrap to several screen lines each, near what 2 MiB allows;
- *  `escapes` puts all of 256 KiB of hidden characters on them, which the page turns into one plain line. */
+ *  `escapes` puts all of 256 KiB of hidden characters on them; `lines-long` makes them seven of 256 KiB each. */
 function prompt(rows: number, nonce: number, shape: string) {
+  if (VALUES[shape] !== undefined) {
+    return {
+      kind: "trust_prompt", tab: 1, nonce, agent: "Claude", root: "/project", top: "/project",
+      fingerprint: HEX, findingsDigest: HEX, state: "untrusted", remember: "yes", rememberNote: null, changed: null,
+      items: [{ what: "hook", file: ".claude/settings.json", label: "SessionStart", value: VALUES[shape](), outside: false }],
+    };
+  }
   const filler = shape === "wide" ? " and the rest of a long line that wraps".repeat(20) : "";
   const hidden = shape === "escapes" ? "\u0001".repeat(Math.floor(262_144 / rows)) : "";
-  const lines = Array.from({ length: rows }, (_, i) => ({ kind: "added", text: `rule ${i}: keep this as it is${filler}${hidden}` }));
+  const long = shape === "lines-long" ? "long line, ".repeat(23_800) : "";
+  const lines = Array.from({ length: shape === "lines-long" ? 7 : rows }, (_, i) => ({ kind: "added", text: `rule ${i}: keep this as it is${filler}${hidden}${long}` }));
   return {
     kind: "trust_prompt", tab: 1, nonce, agent: "Claude", root: "/project", top: "/project",
     fingerprint: HEX, findingsDigest: HEX, state: "changed", remember: "yes", rememberNote: null,
@@ -56,7 +74,7 @@ async function run(rows: number, shape: string) {
   const samples: number[] = [];
   let drawn = 0;
   let elements = 0;
-  for (let nonce = 1; nonce <= SAMPLES; nonce++) {
+  for (let nonce = 1; nonce <= samplesOf(shape); nonce++) {
     const message = prompt(rows, nonce, shape);
     const t0 = performance.now();
     dispatch(message);

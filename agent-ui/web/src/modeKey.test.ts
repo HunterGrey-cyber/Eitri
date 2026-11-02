@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { bypassYesCounts, isModeCycleKey, KeyClock, modeFixedMessage, modeKeyRoute, OTHER_CLOCK_LAG_MS } from "./modeKey";
+import { bypassYesCounts, isModeCycleKey, KeyClock, LAGS_AGREE_MS, modeFixedMessage, modeKeyRoute, OTHER_CLOCK_LAG_MS } from "./modeKey";
 
 const key = (over: Partial<Parameters<typeof isModeCycleKey>[0]> = {}) => ({
   key: "Tab", shiftKey: true, ctrlKey: false, altKey: false, metaKey: false, isComposing: false, ...over,
@@ -117,6 +117,54 @@ describe("KeyClock", () => {
     const now = clock.pressedAt({ timeStamp: 9_000 }, 9_001 + hour);
     expect(now).toBe(9_001 + hour);
     expect(bypassYesCounts({ now, openedAt: 8_000 + hour, lastKeyAt: 5_003 + hour })).toBe(true);
+  });
+
+  it("takes no offset from two keys held up by one stall, whose lags differ by the time between them", () => {
+    const stall = 2 * OTHER_CLOCK_LAG_MS;
+    const clock = new KeyClock();
+    expect(clock.pressedAt({ timeStamp: 1_000 }, 1_000 + stall)).toBe(1_000);
+    const second = 1_300;
+    expect(clock.pressedAt({ timeStamp: second }, 1_000 + stall + 1)).toBe(second);
+  });
+
+  it("lets lags agree to LAGS_AGREE_MS, and no further", () => {
+    const hour = 3_600_000;
+    const agreeing = new KeyClock();
+    agreeing.pressedAt({ timeStamp: 1_000 }, 1_000 + hour);
+    expect(agreeing.pressedAt({ timeStamp: 2_000 }, 2_000 + hour + LAGS_AGREE_MS)).toBe(2_000 + hour);
+    const apart = new KeyClock();
+    apart.pressedAt({ timeStamp: 1_000 }, 1_000 + hour);
+    expect(apart.pressedAt({ timeStamp: 2_000 }, 2_000 + hour + LAGS_AGREE_MS + 1)).toBe(2_000);
+  });
+
+  it("lowers an offset when a key lags less, so a press is never put after its own handling", () => {
+    const offset = 3_600_000;
+    const clock = new KeyClock();
+    clock.pressedAt({ timeStamp: 1_000 }, 1_000 + offset + 1_000);
+    clock.pressedAt({ timeStamp: 3_000 }, 3_000 + offset + 1_000);
+    const handled = 4_500 + offset + 300;
+    const now = clock.pressedAt({ timeStamp: 4_500 }, handled);
+    expect(now).toBeLessThanOrEqual(handled);
+    expect(now).toBe(handled);
+    const paintedJustBefore = handled - 100;
+    expect(bypassYesCounts({ now, openedAt: paintedJustBefore, lastKeyAt: 3_000 + offset })).toBe(false);
+  });
+
+  it("finds the offset through keys that are handled late by turns", () => {
+    const offset = 3_600_000;
+    const clock = new KeyClock();
+    clock.pressedAt({ timeStamp: 5_000 }, 5_000 + offset);
+    expect(clock.pressedAt({ timeStamp: 6_000 }, 6_000 + offset + LAGS_AGREE_MS + 5)).toBe(6_000);
+    expect(clock.pressedAt({ timeStamp: 7_000 }, 7_000 + offset)).toBe(7_000 + offset);
+  });
+
+  it("drops an offset for good once a key shows the clocks agree", () => {
+    const hour = 3_600_000;
+    const clock = new KeyClock();
+    clock.pressedAt({ timeStamp: 1_000 }, 1_000 + hour);
+    clock.pressedAt({ timeStamp: 2_000 }, 2_000 + hour);
+    expect(clock.pressedAt({ timeStamp: 5_000 + hour }, 5_003 + hour)).toBe(5_000 + hour);
+    expect(clock.pressedAt({ timeStamp: 6_000 + hour }, 6_000 + 2 * hour)).toBe(6_000 + hour);
   });
 
   it("makes a question not yet painted unanswerable", () => {

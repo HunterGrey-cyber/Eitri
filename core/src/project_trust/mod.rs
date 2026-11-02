@@ -45,7 +45,7 @@ pub use git_top::{git_top_level, GitWalk};
 pub use last_trusted::{ChangedText, Kept, NoDiff, MAX_KEPT_BYTES, MAX_KEPT_FILE_BYTES};
 pub use plan::{eitri_server_name, eitri_server_taken, trust_plan, EditorServerName, NonUtf8};
 pub use store::{civil_date, for_root, Diff, Remember, TrustState, TrustStore, DISCLOSURE};
-pub use text_diff::{text_diff, Budget, Hunk, LineKind, TextDiff, MAX_QUESTION_ROWS, MAX_QUESTION_STEPS};
+pub use text_diff::{question_diffs, FileDiff, Hunk, LineKind, TextDiff, MAX_QUESTION_ROWS};
 
 /// How much discovery may look at before it stops and says so.
 #[derive(Debug, Clone, PartialEq, Eq)]
