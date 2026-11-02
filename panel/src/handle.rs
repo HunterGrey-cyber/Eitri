@@ -523,7 +523,8 @@ impl AgentPanelHandle {
             // The host runs arbitrary code, so it is called with the state released.
             Some(url) => self.run(|_, out| out.effect(Effect::OpenExternal(url.to_string()))),
             None => {
-                eprintln!("[agent_panel] link click refused: {uri:?}");
+                let size = uri.map_or(0, str::len);
+                eprintln!("[agent_panel] link click refused: an address of {size} bytes");
                 page.send(&eitri_core::agent_bridge::serialize_notice_for_js(
                     "not opened: this link's address is not one Eitri opens",
                 ));

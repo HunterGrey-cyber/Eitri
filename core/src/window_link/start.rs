@@ -217,17 +217,10 @@ pub fn first_acts(args: &LinkedArgs) -> Result<OwnedFd, String> {
 /// Opens the log of window `window`, `<state_home>/eitri/log/window-<file form>-<16 hex>.log`, where `state_home` is
 /// `$XDG_STATE_HOME` (or `$HOME/.local/state`). The directory is made private; the previous run's log is renamed
 /// `<name>.1` (replacing an older one) and a new one is opened 0600, refusing a link in its place. The caller `dup2`s
-/// it onto 1 and 2.
-pub fn open_log(state_home: &Path, root: &Path, window: &WindowName) -> io::Result<File> {
+/// it onto 1 and 2, or gives it to the relay (`crash_trace::relay`).
+pub fn open_log(state_home: &Path, root: &Path, window: &WindowName) -> io::Result<(File, PathBuf)> {
     let dir = state_home.join("eitri").join("log");
-    crate::state_paths::create_state_dir(&dir)?;
-    let name = log_file_name_for(root, window);
-    let path = dir.join(&name);
-    match std::fs::rename(&path, dir.join(format!("{name}.{LOG_KEEP}"))) {
-        Err(e) if e.kind() != io::ErrorKind::NotFound => return Err(e),
-        _ => {}
-    }
-    agent::private_fs::open_private(&path)
+    crate::crash_trace::relay::open_log(&dir, &log_file_name_for(root, window))
 }
 
 /// Starts window 2 ([`spawn_linked`]).
@@ -867,10 +860,10 @@ mod tests {
 
         let state = ScratchDir::new("mw-start", "module-log");
         let dir = state.join("eitri").join("log");
-        let mut second = open_log(&state, root, &WindowName::Second).unwrap();
+        let (mut second, _) = open_log(&state, root, &WindowName::Second).unwrap();
         second.write_all(b"window 2\n").unwrap();
         drop(second);
-        let mut chat = open_log(&state, root, &WindowName::Chat(2)).unwrap();
+        let (mut chat, _) = open_log(&state, root, &WindowName::Chat(2)).unwrap();
         chat.write_all(b"chat 2\n").unwrap();
         drop(chat);
         assert_eq!(
@@ -888,13 +881,13 @@ mod tests {
         let dir = state.join("eitri").join("log");
         let name = log_file_name(root);
 
-        let mut first = open_log(&state, root, &WindowName::Second).unwrap();
+        let (mut first, _) = open_log(&state, root, &WindowName::Second).unwrap();
         first.write_all(b"first run\n").unwrap();
         drop(first);
-        let mut second = open_log(&state, root, &WindowName::Second).unwrap();
+        let (mut second, _) = open_log(&state, root, &WindowName::Second).unwrap();
         second.write_all(b"second run\n").unwrap();
         drop(second);
-        let mut third = open_log(&state, root, &WindowName::Second).unwrap();
+        let (mut third, _) = open_log(&state, root, &WindowName::Second).unwrap();
         third.write_all(b"third run\n").unwrap();
         assert!(fdpass::is_cloexec(third.as_fd()).unwrap());
         drop(third);
@@ -929,7 +922,7 @@ mod tests {
         let name = log_file_name(root);
         std::os::unix::fs::symlink(&target, dir.join(&name)).unwrap();
 
-        let mut log = open_log(&state, root, &WindowName::Second).unwrap();
+        let (mut log, _) = open_log(&state, root, &WindowName::Second).unwrap();
         log.write_all(b"run\n").unwrap();
         assert_eq!(std::fs::read_to_string(&target).unwrap(), "untouched");
         assert!(!std::fs::symlink_metadata(dir.join(&name))

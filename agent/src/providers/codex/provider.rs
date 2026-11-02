@@ -3651,7 +3651,10 @@ impl CodexProvider {
             // Codex refuses a thread another client holds open, among other things. Its own words are
             // what the user needs, shown as the verdict on the resume.
             Err(LinkError::Rpc { message, .. }) if resume.is_some() => {
-                eprintln!("agent: Codex refused to resume a session: {message}");
+                eprintln!(
+                    "agent: Codex refused to resume a session ({} bytes of reason)",
+                    message.len()
+                );
                 return Ok(self.resume_not_continued(
                     &req,
                     resume.unwrap_or_default(),

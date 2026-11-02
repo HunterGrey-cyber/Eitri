@@ -1,5 +1,5 @@
 [English](getting-started.md) | 简体中文
-<!-- translated-from: getting-started.md sha256=8603787e5c3df9b1b83e641f435cc3bacfd9e5c109fd114b1f3ef3e3d73175f1 -->
+<!-- translated-from: getting-started.md sha256=cd62d66a90af3b6b6a14c8e7ea1a9488cc1b5114bc0589b084d957a42cdd5e30 -->
 
 # 快速上手
 
@@ -166,5 +166,15 @@ Claude 回答时，回复会作为渲染好的 markdown 边流式输出边显示
 会话本身没了的时候，对话里会说出来。红色的 `This session was lost` 横幅表示连接断了，上面显示的内容可能不完整；安静的 `This session has ended (<reason>)` 表示它关闭了。无论哪种，在浏览模式里按 `r`，就会在这个标签页里开始一个新会话。回合运行时留着的消息，仍会在这个回合结束时发出，即使它是在碰到限制时结束的。
 
 Claude Code 自己更新之后面板出了问题，背后的 sidecar 可能也需要更新。`eitri sidecar check` 问有没有更新，`eitri sidecar update` 装上它，`eitri sidecar use bundled` 退回去。什么都不会自己检查，已经打开的标签页继续用它启动时的 sidecar。细节见[更新 sidecar](../../INSTALL.zh-CN.md#updating-the-sidecar)。
+
+## Eitri 自己崩溃时
+
+崩溃时会写一份记录到 `~/.local/state/eitri/log/crash-<时间>-<pid>.log`（设了 `$XDG_STATE_HOME` 就在它下面），只有你能读。下次启动时说一次，一行，带文件路径。要报告的话，把这个文件附到一个 [bug report](https://github.com/HunterGrey-cyber/eitri/issues/new?template=bug_report.yml) 里。你不附，什么都不会离开你的机器：Eitri 不往任何地方发东西。
+
+记录是纯文本：版本、构建、内核、线程、代码停在哪里、回溯，还有窗口最后打印的几行。里面没有提示词、对话或工具输出，崩溃本身的消息如果可能引用到这些内容，也会略去。路径是有的，你的主目录显示成 `~`，所以附之前先读一遍。
+
+从桌面启动的窗口，把打印的内容留在同一目录的 `main-<16 位十六进制>.log` 里；到 2 MiB 时这个文件移到 `.log.1`，新一次启动时上一次的也一样。从终端启动的窗口打印到那个终端，不留日志。磁盘满时这些行被丢掉，窗口继续运行。`EITRI_WINDOW_LOG=off` 关掉日志和记录。
+
+崩在原生库里（GTK、WebKit、显卡驱动）不会写记录。窗口到那一刻为止打印的内容在日志里。
 
 已知的毛边列在[已知问题](../known-issues.zh-CN.md)里。

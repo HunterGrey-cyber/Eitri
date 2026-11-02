@@ -1,5 +1,5 @@
 [English](configuration.md) | 简体中文
-<!-- translated-from: configuration.md sha256=a9b05b6dd764b3f998d0f5b99217a1622ae72b6947371c3acbd16f2a751553b2 -->
+<!-- translated-from: configuration.md sha256=17c736066f3d884fa94b02888fd1ab9b9dd04c29cc9bc42697c54ab085ffca70 -->
 
 # 配置
 
@@ -313,6 +313,7 @@ eitri.config.set("agent.default_mode", "auto")    -- "manual", "auto" (the defau
 | `EITRI_CONFIG_DIR` | 从这个目录读取 `init.lua` 和它的 `lua/` 模块，覆盖 Linux 的 XDG 配置目录或 `~/.config/eitri`。空值视为未设置，相对路径会拒绝启动。 |
 | `EITRI_FIRST_START` | `off` 让[首次启动界面](#first-start)不再自己打开。其他非空值会被忽略，并记一行日志。 |
 | `EITRI_AGENT_TRACE` | 设为 `1`，每个回合在 stderr 上打印一行 `[turn-trace]`，带着这个回合的耗时。 |
+| `EITRI_WINDOW_LOG` | 设为 `off`，不写崩溃记录，也不留窗口日志。见 [Eitri 自己崩溃时](getting-started.zh-CN.md#eitri-自己崩溃时)。 |
 | `EITRI_SUPERVISOR` | 设为 `1`、`true` 或 `yes`，允许窗口在没有运行时启动 `eitri-supervisor`，一个显示所有已打开窗口的 agent 状态的仪表盘。没设置时，窗口只会连接到你自己启动的那个。 |
 | `EITRI_SIDECAR_BINARY` | 运行 agent 会话所用的 sidecar 程序的路径，替代 `eitri setup` 构建的或软件包安装的那个，也替代任何 [sidecar 更新](../../INSTALL.zh-CN.md#updating-the-sidecar)：它优先于更新，也不会被自带的 sidecar 顶替。不是文件的路径会在会话启动时报错。 |
 | `EITRI_EDITOR_DMABUF` | 编辑器怎样把它的绘制交给 GTK。`0`、`off`、`false` 或 `no` 使用 GTK 自己的纹理路径；`1`、`on`、`true` 或 `yes` 即使在比 4.16 旧的 GTK 上也强制使用 Eitri 自己的缓冲区；其他任何值或不设置，则从 GTK 4.16 起使用 Eitri 自己的缓冲区。 |

@@ -299,7 +299,8 @@ impl SupervisorClient {
                     match serde_json::from_str::<SupervisorMessage>(trimmed) {
                         Ok(SupervisorMessage::Activate) => activated = true,
                         Err(e) => {
-                            eprintln!("shell: unparseable message from eitri-supervisor: {e} -- raw: {trimmed}");
+                            let (line, column) = (e.line(), e.column());
+                            eprintln!("shell: unparseable message from eitri-supervisor at {line}:{column}");
                         }
                     }
                     continue;

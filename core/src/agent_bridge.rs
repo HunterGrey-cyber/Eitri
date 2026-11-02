@@ -963,7 +963,12 @@ pub fn parse_inbound_message(json_str: &str) -> Option<InboundMessage> {
     match serde_json::from_str(json_str) {
         Ok(msg) => Some(msg),
         Err(e) => {
-            eprintln!("[agent_bridge] failed to parse inbound message: {e} -- raw: {json_str}");
+            // Only the place and the kind: the message is what the person typed, and `e` can quote it.
+            let (line, column, kind) = (e.line(), e.column(), e.classify());
+            eprintln!(
+                "[agent_bridge] failed to parse an inbound message of {} bytes: {kind:?} at {line}:{column}",
+                json_str.len()
+            );
             None
         }
     }

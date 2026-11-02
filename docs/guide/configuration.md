@@ -537,6 +537,7 @@ not settings and are not listed.
 | `EITRI_CONFIG_DIR` | The directory `init.lua` and its `lua/` modules are read from, overriding the Linux XDG directory or `~/.config/eitri`. Empty is unset; a relative value refuses to start. |
 | `EITRI_FIRST_START` | `off` stops the [first-start screen](#first-start) from opening by itself. Any other non-empty value is ignored with a log line. |
 | `EITRI_AGENT_TRACE` | Set to `1` to print one `[turn-trace]` line per turn on stderr, with the turn's timings. |
+| `EITRI_WINDOW_LOG` | Set to `off` for no crash record and no window log. See [When Eitri itself crashes](getting-started.md#when-eitri-itself-crashes). |
 | `EITRI_SUPERVISOR` | Set to `1`, `true` or `yes` to let a window start `eitri-supervisor`, a dashboard of the agent status of every open window, when none is running. Unset, a window only connects to one you started yourself. |
 | `EITRI_SIDECAR_BINARY` | The path of a sidecar program to run agent sessions with, instead of the one `eitri setup` built or the package installed, and instead of any [sidecar update](../../INSTALL.md#updating-the-sidecar): it wins over an update and is never replaced by the bundled one. A path that is not a file is an error when a session starts. |
 | `EITRI_EDITOR_DMABUF` | How the editor hands its drawing to GTK. `0`, `off`, `false` or `no` use GTK's own texture path; `1`, `on`, `true` or `yes` force Eitri's own buffers even on a GTK older than 4.16; anything else, or unset, uses Eitri's own buffers from GTK 4.16 on. |

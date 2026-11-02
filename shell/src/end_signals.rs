@@ -234,6 +234,9 @@ pub(crate) fn write_if_writable(fd: RawFd, bytes: &[u8]) -> bool {
     }
 }
 
+/// How long the hard end waits for what is on its way to the window's log.
+const RELAY_WAIT: Duration = Duration::from_millis(100);
+
 /// Ends the process now, after one write of why that is skipped if it could block and ignores its own failure.
 fn hard_exit(signal: i32, why: &str) -> ! {
     let line = format!(
@@ -241,6 +244,8 @@ fn hard_exit(signal: i32, why: &str) -> ! {
         128 + signal
     );
     write_if_writable(2, line.as_bytes());
+    // Bounded, and no teardown: only what the window already printed, on its way out through the relay.
+    eitri_core::crash_trace::relay::flush(RELAY_WAIT);
     // SAFETY: `_exit` runs nothing else.
     unsafe { libc::_exit(128 + signal) }
 }

@@ -305,4 +305,23 @@ When Claude Code has updated itself and the panel misbehaves, the sidecar behind
 back. Nothing checks by itself, and open tabs keep the sidecar they started with.
 [Updating the sidecar](../../INSTALL.md#updating-the-sidecar) has the details.
 
+## When Eitri itself crashes
+
+A crash writes a record to `~/.local/state/eitri/log/crash-<time>-<pid>.log` (under `$XDG_STATE_HOME` if you set
+it), readable only by you. The next start says so once, in one line with the file's path. To report it, attach
+that file to a [bug report](https://github.com/HunterGrey-cyber/eitri/issues/new?template=bug_report.yml). Nothing
+leaves your machine unless you attach it: Eitri sends nothing anywhere.
+
+The record is plain text: the version, the build, the kernel, the thread, where the code stopped, a backtrace and
+the last lines the window printed. It holds no prompt, conversation or tool output, and a crash's own message is
+left out when it could quote one. Paths are there, with your home shown as `~`, so read it before you attach it.
+
+A window started from the desktop keeps what it prints in `main-<16 hex>.log` in the same directory; at 2 MiB the
+file moves to `.log.1`, and so does the last run's when a new one starts. A window started from a terminal prints
+to that terminal instead, and keeps no log. When the disk is full the lines are dropped and the window goes on.
+`EITRI_WINDOW_LOG=off` turns the log and the records off.
+
+A crash inside a native library (GTK, WebKit, a graphics driver) writes no record. What the window printed up to
+that point is in the log.
+
 Known rough edges are listed in [Known issues](../known-issues.md).

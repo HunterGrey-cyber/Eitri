@@ -604,7 +604,7 @@ impl PaneSwitchReader {
                     let text = String::from_utf8_lossy(&bytes);
                     match parse_message(&text) {
                         Some(message) => messages.push(message),
-                        None => eprintln!("[pane_switch] ignoring unrecognized message {text:?}"),
+                        None => eprintln!("[pane_switch] ignoring an unrecognized message of {} bytes", text.len()),
                     }
                 }
             }

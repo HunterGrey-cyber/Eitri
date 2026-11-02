@@ -183,10 +183,9 @@ struct GtkPanelHost;
 
 impl PanelHost for GtkPanelHost {
     fn open_external(&self, url: &str) {
-        let shown = url.to_owned();
         gtk4::UriLauncher::new(url).launch(None::<&gtk4::Window>, None::<&gtk4::gio::Cancellable>, move |result| {
             if let Err(error) = result {
-                eprintln!("[agent_panel] opening {shown}: {error}");
+                eprintln!("[agent_panel] opening a link failed: {error}");
             }
         });
     }

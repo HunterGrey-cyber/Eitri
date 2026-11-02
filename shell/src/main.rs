@@ -52,6 +52,7 @@ mod webkit_sandbox;
 mod webkit_zoom;
 mod wheel_zoom;
 mod window_config;
+mod window_log;
 mod window_mode;
 // Kept beside `gtk_host` rather than declared inside it: `tests/gtk_host_conformance.rs` compiles
 // `gtk_host` on its own, and the wiring calls the window's own controllers, which only this binary has.
@@ -234,7 +235,11 @@ fn main() -> glib::ExitCode {
     // setenv is not thread-safe, so fill in the display before any thread or GTK code runs.
     if let Some(name) = eitri_core::display_env::wayland_display_fallback(|key| std::env::var_os(key), Path::exists) {
         std::env::set_var("WAYLAND_DISPLAY", name);
-        eprintln!("eitri: WAYLAND_DISPLAY was unset; using wayland-0 (the default libwayland connects to)");
+        // Not `eprintln!`: nothing keeps a failed write from being fatal yet.
+        let _ = std::io::Write::write_all(
+            &mut std::io::stderr(),
+            b"eitri: WAYLAND_DISPLAY was unset; using wayland-0 (the default libwayland connects to)\n",
+        );
     }
 
     // Collected once and consulted through `flag_given` -- never a raw
@@ -305,6 +310,12 @@ fn main() -> glib::ExitCode {
         return glib::ExitCode::SUCCESS;
     }
 
+    // From here a print cannot be fatal, and a panic leaves a record. Window 2 and a module window started theirs in
+    // `second_first_acts`.
+    if matches!(start, linked_window::WindowStart::Full) {
+        window_log::start_early();
+    }
+
     // Every plugin task this process starts runs under a guard of its own, so a task lives as long as whichever
     // window holds it and can move with its page. After the companion, `split` and `--version`, none of which
     // runs a plugin task: finding the helper spawns it and waits for its answer.
@@ -325,7 +336,7 @@ fn main() -> glib::ExitCode {
         }
     };
 
-    // First, before any thread or fd exists: a pipe, socket or file on stdin would be handed to the
+    // Before GTK and any child: a pipe, socket or file on stdin would be handed to the
     // embedded nvim by the Neovide fork, which reads it as a buffer and, for a pipe or socket whose
     // writer stays open, blocks until EOF with the editor blank (`neovide_editor::stdin`; the GUI
     // pass of 2026-09-23's defect 2). A terminal is left alone.
@@ -385,6 +396,9 @@ fn main() -> glib::ExitCode {
             }
         },
     };
+    if matches!(start, linked_window::WindowStart::Full) {
+        window_log::start_main(&project_root);
+    }
     println!("eitri: project root {}", project_root.display());
     // Once, before GTK: the `lstat` and the group files it reads belong off the GTK thread.
     let root_note = agent_panel::root_note_for(&project_root);
@@ -2721,6 +2735,14 @@ fn build_ui(
             }
         }
     }
+
+    // A panic in an earlier run says once where its record is. Nothing else about the window changes.
+    if let Some(line) = eitri_core::crash_trace::take_pending_notice() {
+        eprintln!("eitri: {line}");
+        toast.show_notice_when_free(line);
+    }
+    #[cfg(feature = "probe")]
+    window_log::probe::arm();
 
     // A root key of `init.lua` that an input method or the desktop may take first is logged, and toasted once per
     // change. Nothing starts when the root table is empty.

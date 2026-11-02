@@ -130,8 +130,7 @@ pub(super) fn answer_permission_response(
         match eitri_core::permission_store::add(dir, project_dir, &rule) {
             Ok(rules) => {
                 eprintln!(
-                    "[permission] rule saved: {} ({})",
-                    rule.to_rule_string(),
+                    "[permission] a rule saved ({})",
                     eitri_core::permission_store::path(dir, project_dir).display()
                 );
                 tabs.set_rules(rules);
@@ -1562,15 +1561,15 @@ pub(super) fn handle_inbound_message(
         }
         // `gx` -- a web link out to the system browser. The page's own check
         // (`nav.ts#webUrl`) is not trusted with what reaches the launcher: `web_url` decides again, and a
-        // refusal means a page/Rust mismatch or a page that should not be sending this, so it is logged
-        // (the address through `{:?}`, which escapes anything a terminal would act on).
+        // refusal means a page/Rust mismatch or a page that should not be sending this, so it is logged, without the
+        // address: it came from the conversation.
         InboundMessage::OpenUrl { url, .. } => match web_url(&url) {
             Some(url) => {
                 out.effect(Effect::OpenExternal(url.to_string()));
                 ok(&mut out);
             }
             None => {
-                eprintln!("[agent_panel] open_url refused: {url:?}");
+                eprintln!("[agent_panel] open_url refused: an address of {} bytes", url.len());
                 refuse(&mut out, "not a web link");
             }
         },

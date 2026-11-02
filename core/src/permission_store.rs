@@ -100,7 +100,7 @@ fn read(dir: &Path, project_root: &Path) -> Read {
             Ok(rule) => Line::Rule(rule),
             Err(why) => {
                 eprintln!(
-                    "[permissions] {}: {}; not applied, and kept in the file as written: {text:?}",
+                    "[permissions] {}: {}; not applied, and kept in the file as written",
                     file.display(),
                     why.describe()
                 );

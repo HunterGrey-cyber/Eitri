@@ -481,11 +481,11 @@ pub(crate) fn translate_wire_event(
             detail: "a PreToolUse hook call".to_string(),
         }],
         AgentEvent::ProcessStderr { line } => {
-            eprintln!("[agent] claude stderr: {line}");
+            eprintln!("[agent] claude wrote {} bytes on stderr", line.len());
             vec![]
         }
-        AgentEvent::RateLimit { raw } => {
-            eprintln!("[agent] rate limit notice: {raw}");
+        AgentEvent::RateLimit { .. } => {
+            eprintln!("[agent] a rate limit notice");
             vec![]
         }
         AgentEvent::ControlResponse { .. } | AgentEvent::Unknown { .. } => {

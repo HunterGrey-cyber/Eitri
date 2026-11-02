@@ -485,6 +485,25 @@ pub fn open_private(path: &Path) -> std::io::Result<std::fs::File> {
     Ok(file)
 }
 
+/// Makes `name` in `dir` as a new file, set to exactly 0600 on the handle whatever the umask: a name that already exists,
+/// a link included, is refused (`O_CREAT | O_EXCL`). Takes the name as a C string and allocates nothing on the way, so
+/// a panic hook can call it.
+pub fn create_private_file_at(dir: BorrowedFd<'_>, name: &CStr) -> std::io::Result<std::fs::File> {
+    let flags = libc::O_CREAT | libc::O_EXCL | libc::O_WRONLY | libc::O_NOFOLLOW | libc::O_NONBLOCK | libc::O_CLOEXEC;
+    // SAFETY: `name` is a NUL-terminated string that outlives the call, and `dir` is an open descriptor.
+    let fd = unsafe { libc::openat(dir.as_raw_fd(), name.as_ptr(), flags, PRIVATE_FILE_MODE as libc::c_uint) };
+    if fd < 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    // SAFETY: `openat` just returned this descriptor and nothing else owns it.
+    let file = std::fs::File::from(unsafe { OwnedFd::from_raw_fd(fd) });
+    // SAFETY: `file` is open for the call.
+    if unsafe { libc::fchmod(file.as_raw_fd(), PRIVATE_FILE_MODE as libc::mode_t) } != 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    Ok(file)
+}
+
 /// Reads `path` whole as UTF-8, but only when it is a regular file owned by this user; anything
 /// else is refused with `PermissionDenied` before a byte is read (a missing file is still
 /// `NotFound`). Every loader of Eitri's own state reads through this: those files decide what is
@@ -1679,6 +1698,24 @@ mod tests {
         let theirs = Path::new("/etc/passwd");
         assert!(open_private(theirs).is_err());
         assert!(std::fs::metadata(theirs).unwrap().len() > 0);
+    }
+
+    #[test]
+    fn a_new_file_by_name_is_private_and_never_opens_what_exists() {
+        let dir = scratch("create-at");
+        let handle = open_dir(&dir).unwrap();
+        let mut file = create_private_file_at(handle.as_fd(), c"record").unwrap();
+        file.write_all(b"written").unwrap();
+        assert_eq!(
+            std::fs::metadata(dir.join("record")).unwrap().mode() & 0o777,
+            PRIVATE_FILE_MODE
+        );
+        let again = create_private_file_at(handle.as_fd(), c"record").unwrap_err();
+        assert_eq!(again.kind(), std::io::ErrorKind::AlreadyExists);
+        assert_eq!(std::fs::read(dir.join("record")).unwrap(), b"written");
+        std::os::unix::fs::symlink(dir.join("record"), dir.join("link")).unwrap();
+        assert!(create_private_file_at(handle.as_fd(), c"link").is_err());
+        assert_eq!(std::fs::read(dir.join("record")).unwrap(), b"written");
     }
 
     /// A directory that belongs to another user is not ours to put records in, nor to tighten.

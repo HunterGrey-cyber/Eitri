@@ -1801,12 +1801,12 @@ impl NeovideEditorPane {
                             }
                             Ok(Err(err)) => {
                                 let elapsed = t0.elapsed();
-                                let raw = format!("{err:#}");
-                                println!("[live] LiveHarness::with_options failed after {elapsed:?}: {raw}");
+                                let chain = format!("{err:#}");
+                                println!("[live] LiveHarness::with_options failed after {elapsed:?}: {chain}");
                                 // The raw chain above is what stdout gets (unchanged); the
                                 // pane's own state, and what a host is handed, is the built message
                                 // -- what failed, the version floor, where to get a newer nvim.
-                                let message = build_start_failure_message(&raw);
+                                let message = build_start_failure_message(&chain);
                                 *live = LiveState::Failed(message.clone());
                                 start_failed_message = Some(message);
                             }
@@ -2534,7 +2534,7 @@ impl NeovideEditorPane {
             // Forwarded to nvim only; its reply requests the frame.
             session.harness.send_text_input(keys);
         } else {
-            println!("[live] send_keys({keys:?}) before nvim is ready -- dropped");
+            println!("[live] send_keys: {} bytes before nvim is ready -- dropped", keys.len());
         }
     }
 

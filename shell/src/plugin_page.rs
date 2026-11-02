@@ -293,15 +293,12 @@ pub(crate) fn build(spec: &PageSpec, hooks: PageHooks, theme: &PageTheme) -> Web
                     match target {
                         Ok(Some(target)) => download.set_destination(&target.to_string_lossy()),
                         Ok(None) => {
-                            eprintln!(
-                                "[plugin {id}] not saving {}: every name for it is taken",
-                                suggested.escape_debug()
-                            );
+                            eprintln!("[plugin {id}] not saving a download: every name for it is taken");
                             download.cancel();
                         }
                         // A worker that panicked leaves no destination; the download is not left waiting.
                         Err(_) => {
-                            eprintln!("[plugin {id}] not saving {}: no destination", suggested.escape_debug());
+                            eprintln!("[plugin {id}] not saving a download: no destination");
                             download.cancel();
                         }
                     }
@@ -456,13 +453,12 @@ impl PagePort for WebKitPluginPage {
 /// A clicked link, given the same check as a reply link in the chat before the desktop opens it.
 pub(crate) fn open_outside(url: &str) {
     let Some(url) = eitri_panel::agent_panel::clicked_link_url(url) else {
-        eprintln!("[plugin] not opening {}", url.escape_debug());
+        eprintln!("[plugin] not opening an address of {} bytes", url.len());
         return;
     };
-    let shown = url.to_owned();
     gtk4::UriLauncher::new(url).launch(None::<&gtk4::Window>, None::<&gio::Cancellable>, move |result| {
         if let Err(e) = result {
-            eprintln!("[plugin] opening {shown}: {e}");
+            eprintln!("[plugin] opening a link failed: {e}");
         }
     });
 }

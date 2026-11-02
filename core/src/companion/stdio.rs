@@ -87,6 +87,20 @@ pub fn leave_pipes(log_dir: Option<&Path>, project_root: &Path, before: &dyn Fn(
         },
     };
     before(path.as_deref());
+    // Through the relay when it can start: a write to the log can fail, and these are made on the GTK thread.
+    if let (Some(path), Ok(copy)) = (path.clone(), file.try_clone()) {
+        let (stdout, stderr) = (is_pipe(1), is_pipe(2));
+        let route = |pipe: bool, fd| match pipe {
+            true => crate::crash_trace::Route::Relay { tee: false },
+            false => crate::crash_trace::route_for(fd),
+        };
+        if crate::crash_trace::keep_output(Some((copy, path.clone())), route(stdout, 1), route(stderr, 2)) {
+            moved.stdout = stdout;
+            moved.stderr = stderr;
+            moved.log = Some(path);
+            return moved;
+        }
+    }
     moved.stdout = redirect_if_pipe(1, file.as_raw_fd()).unwrap_or(false);
     moved.stderr = redirect_if_pipe(2, file.as_raw_fd()).unwrap_or(false);
     moved.log = path;

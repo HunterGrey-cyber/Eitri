@@ -592,7 +592,12 @@ impl AcpProvider {
     /// The saved session the agent would not load, as events: the session opens so there is something to
     /// say the verdict on.
     fn resume_refused(&self, req: &ExternalStart, requested: &str, message: String) -> String {
-        eprintln!("agent: {} would not load a saved session: {message}", self.agent);
+        // Its words go on the page, not in the log: they can quote the session.
+        eprintln!(
+            "agent: {} would not load a saved session ({} bytes of reason)",
+            self.agent,
+            message.len()
+        );
         let mut st = lock(&self.state);
         st.loading = false;
         st.replaying = false;

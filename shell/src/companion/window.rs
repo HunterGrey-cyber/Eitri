@@ -249,9 +249,7 @@ pub(crate) fn build(app: &Application, start: &Start) -> Rc<CompanionWindow> {
     };
     // Every start-up failure is behind us, and nothing has started a child yet (the sidecar, the
     // window-manager tool, WebKit's processes), so none of them inherits a pipe from nvim.
-    if start.from_editor {
-        super::leave_editor_pipes(&start.project_root);
-    }
+    crate::window_log::start_companion(&start.project_root, start.from_editor);
 
     // How focus moves to another window, and how a window is brought forward: through the window
     // manager's own tool, run off the GTK thread.

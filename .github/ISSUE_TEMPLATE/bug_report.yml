@@ -114,12 +114,15 @@ body:
   - type: textarea
     id: logs
     attributes:
-      label: Output from the terminal
+      label: Crash record or log
       description: |
-        Eitri writes no log file. Start it from a terminal (`eitri ~/path/to/project`) and paste what that terminal
-        prints around the problem. For slow or odd agent replies, start it as `EITRI_AGENT_TRACE=1 eitri ...`,
-        which adds one timing line per agent turn.
-      render: shell
+        After a crash, attach the record: the next start names it, and it is
+        `~/.local/state/eitri/log/crash-<time>-<pid>.log`. Drag the file here. Without a crash, attach the window's
+        log from the same directory (`main-<16 hex>.log`, and `.log.1` for the run before), or, if you started Eitri
+        from a terminal, paste what that terminal printed around the problem. Both files are plain text and hold no
+        conversation, but they do name paths under your home, so read them first. Eitri sends neither anywhere. For
+        slow or odd agent replies, start it as `EITRI_AGENT_TRACE=1 eitri ...`, which adds one timing line per agent
+        turn.
   - type: checkboxes
     id: checks
     attributes:

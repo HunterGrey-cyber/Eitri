@@ -202,7 +202,7 @@ pub fn load(kernel: &Kernel, panels: &[LuaPanelMeta]) -> Result<WindowConfig, St
         eprintln!(
             "[agent] {} registered ({}; reads {})",
             registration.name,
-            registration.command.join(" "),
+            registration.command.first().map_or("", String::as_str),
             registration.project_files.join(", ")
         );
     }

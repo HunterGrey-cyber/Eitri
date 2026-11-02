@@ -2294,8 +2294,9 @@ fn decide(request: GateRequest<'_>, judge: Judge<'_>) -> Option<PlannedAnswer> {
         };
         let because = match allow_because {
             Ok(because) => because,
-            Err(why) => {
-                eprintln!("[permission] asking the user: {tool_name} (the CLI's own prompt: {why:?})");
+            // The CLI's reason can quote the command, so it goes on the card and not in the log.
+            Err(_) => {
+                eprintln!("[permission] asking the user: {tool_name} (the CLI's own prompt)");
                 return None;
             }
         };

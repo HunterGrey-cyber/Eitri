@@ -836,10 +836,10 @@ impl AgentProcess {
         let resolved_path = resolve_binary_absolute_path(binary)
             .map(|p| p.display().to_string())
             .unwrap_or_else(|| format!("<could not resolve {binary:?} on PATH>"));
-        let argv: Vec<String> = std::iter::once(binary.to_string())
-            .chain(cmd.get_args().map(|a| a.to_string_lossy().into_owned()))
-            .collect();
-        eprintln!("[agent] spawning resolved binary {resolved_path} -- argv: {argv:?}");
+        eprintln!(
+            "[agent] spawning resolved binary {resolved_path} with {} arguments",
+            cmd.get_args().len()
+        );
 
         let mut child = match cmd.spawn() {
             Ok(child) => child,

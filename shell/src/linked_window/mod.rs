@@ -206,14 +206,7 @@ pub fn second_first_acts(args: &[OsString]) -> Result<WindowStart, String> {
         std::env::var_os("XDG_STATE_HOME").as_deref(),
         std::env::var_os("HOME").as_deref(),
     );
-    if let Some(log) = home.and_then(|home| start::open_log(&home, &parsed.root, &parsed.name()).ok()) {
-        // SAFETY: `dup2` onto the standard descriptors, from a descriptor open for the call. Nothing else in the
-        // process runs yet, so nothing is writing to either.
-        unsafe {
-            libc::dup2(log.as_raw_fd(), libc::STDOUT_FILENO);
-            libc::dup2(log.as_raw_fd(), libc::STDERR_FILENO);
-        }
-    }
+    crate::window_log::start_linked(home.as_deref(), &parsed.root, &parsed.name());
     Ok(linked_start(parsed, sock))
 }
 
