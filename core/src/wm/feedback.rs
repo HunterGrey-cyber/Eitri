@@ -209,6 +209,9 @@ pub fn chrome(action: &Action, outcome: VerbOutcome<'_>) -> Option<Feedback> {
 /// window is not one the controller holds: the answer waits on its card, to be given again.
 pub const LAYOUT_CHANGING_TEXT: &str = "the layout is changing: answer again";
 
+/// A card answer while the project chooser covers the window; the answer waits on its card.
+pub const PROJECT_CHOOSER_COVERS_TEXT: &str = "close the project chooser to answer";
+
 /// A terminal key for a terminal this window's layout does not hold, and a card answer from a chat view it does not
 /// hold.
 pub fn not_in_window_text(id: &ModuleId) -> String {

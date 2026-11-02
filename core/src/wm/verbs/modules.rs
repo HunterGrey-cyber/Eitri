@@ -272,7 +272,8 @@ fn covered_refusal(w: &Window, cx: &Cx, layout: &Layout, chat: &ModuleId, top: &
 
 /// Whether a card answer from chat view `view` may be taken: `Ok` only when nothing covers the view, as far as the
 /// controller can tell. A layout being written right now, a window it does not hold, or a view this window's layout
-/// does not hold refuse, so an answer it cannot judge waits on its card.
+/// does not hold refuse, so an answer it cannot judge waits on its card. The project chooser covers every view of
+/// its window: it holds the keys, but a page's answer comes by message, and the person cannot see what it answers.
 pub fn answer_gate(w: Option<&Window>, cx: &Cx, win: WinId, view: ViewId) -> Result<(), String> {
     let Some(w) = w else {
         return Err(feedback::LAYOUT_CHANGING_TEXT.into());
@@ -284,10 +285,13 @@ pub fn answer_gate(w: Option<&Window>, cx: &Cx, win: WinId, view: ViewId) -> Res
     if !layout.contains(&chat) {
         return Err(feedback::not_in_window_text(&chat));
     }
-    match covering_now(&layout, cx.reads, win, &chat).last() {
-        None => Ok(()),
-        Some(top) => Err(covered_refusal(w, cx, &layout, &chat, top)),
+    if let Some(top) = covering_now(&layout, cx.reads, win, &chat).last() {
+        return Err(covered_refusal(w, cx, &layout, &chat, top));
     }
+    if w.project_chooser.is_some() {
+        return Err(feedback::PROJECT_CHOOSER_COVERS_TEXT.into());
+    }
+    Ok(())
 }
 
 /// A covered chat view revealed before something opens in it with the keys (`prefix ?`, `prefix :`) or a card

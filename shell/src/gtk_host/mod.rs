@@ -152,6 +152,8 @@ type OnboardingFn = dyn Fn(&OnboardingOp) -> Applied;
 /// The native project chooser and its asynchronous work, supplied without coupling the host to the binary.
 pub(crate) trait ProjectHost {
     fn apply(&self, op: &ProjectOp) -> Applied;
+    /// Carries out [`ProjectOp::Open`], with the activation token the started window comes forward with.
+    fn open(&self, win: WinId, target: &std::path::Path, token: Option<String>) -> Applied;
     fn focus(&self, win: WinId) -> bool;
     fn env(&self, win: WinId) -> ChooserEnv;
 }
@@ -1121,9 +1123,16 @@ impl GtkHost {
             return self.refuse(op, "no such window");
         }
         let host = self.project_host.borrow().clone();
-        match host {
-            Some(host) if host.apply(call) == Applied::Done => Applied::Done,
-            _ => self.refuse(op, NOT_CARRIED_OUT),
+        let applied = match (host, call) {
+            // The token names the input that asked, so it is taken here, before the start leaves this thread.
+            (Some(host), ProjectOp::Open { target, .. }) => host.open(win, target, self.activation_token(win)),
+            (Some(host), _) => host.apply(call),
+            (None, _) => Applied::Refused,
+        };
+        if applied == Applied::Done {
+            Applied::Done
+        } else {
+            self.refuse(op, NOT_CARRIED_OUT)
         }
     }
 

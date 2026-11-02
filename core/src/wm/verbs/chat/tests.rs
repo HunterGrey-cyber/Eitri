@@ -1036,6 +1036,22 @@ fn attention_toasts_when_a_float_still_covers_and_reveals_after_stowing_a_scratc
     }
 }
 
+/// The project chooser covers a view as a float does: stowing the scratch float leaves the card out of reach.
+#[test]
+fn attention_toasts_when_the_chooser_still_covers_after_a_scratch_float_is_stowed() {
+    use crate::attention::ChatOnPermission;
+    let cover = ModuleId::lua("cover");
+    let mut layout = three(editor());
+    layout.add_float(&cover, FloatRect::centred(GRID, 0.9), true).unwrap();
+    let r = driven(layout);
+    r.driver.run(WIN, Action::ProjectChoose, Origin::Lua);
+    assert_eq!(
+        attention_choice(&r, ChatOnPermission::Reveal, waiting_card()),
+        AttentionChoice::Toast
+    );
+    assert!(!r.layout.borrow().is_shown(&cover));
+}
+
 #[test]
 fn attention_reveals_a_tab_beside_the_keys_and_toasts_for_a_tab_behind_them() {
     use crate::attention::ChatOnPermission;

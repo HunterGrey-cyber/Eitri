@@ -64,11 +64,11 @@ pub fn attention(
 pub fn attention_revealed(w: &Window, cx: &Cx, event: &ChatEvent) -> AttentionChoice {
     let toast = match event {
         ChatEvent::Covered { win, view } => {
-            // Only scratch floats without the keys are put away; a float still over the view after that gets
-            // the toast the badge policy shows.
+            // Only scratch floats without the keys are put away; a float still over the view after that, or the
+            // project chooser, gets the toast the badge policy shows.
             let still = modules::answer_gate(Some(w), cx, *win, *view).is_err();
             if still {
-                println!("[attention] a float still covers {}; a toast instead", view.module());
+                println!("[attention] {} is still covered; a toast instead", view.module());
             }
             still
         }

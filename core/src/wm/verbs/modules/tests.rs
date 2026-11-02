@@ -1192,6 +1192,77 @@ fn a_reveal_stows_the_scratch_floats_over_the_chat_and_names_what_stays() {
     assert!(r.layout.borrow().is_shown(&notes), "a reveal never sinks a plain float");
 }
 
+fn gate(r: &Rig, view: ViewId) -> Result<(), String> {
+    r.driver
+        .query_or(Err(feedback::LAYOUT_CHANGING_TEXT.to_string()), move |c| {
+            c.answer_gate(WIN, view)
+        })
+}
+
+/// A page's answer arrives by message, not by key, so holding the keys is not enough: a chooser over the view
+/// refuses it as a float over the view does, and the refusal is drawn the same way.
+#[test]
+fn a_card_answer_is_refused_while_the_chooser_covers_the_view() {
+    let r = driven(three(editor()));
+    assert_eq!(gate(&r, ViewId::BASE), Ok(()));
+    r.driver.run(WIN, Action::ProjectChoose, Origin::Lua);
+    let text = "close the project chooser to answer".to_string();
+    assert_eq!(gate(&r, ViewId::BASE), Err(text.clone()));
+    r.host.post(HostEvent::AnswerRefused {
+        win: WIN,
+        text: text.clone(),
+    });
+    assert_eq!(r.chrome().toast.map(|toast| toast.text), Some(text));
+}
+
+/// Nothing about the refusal ends the chooser or the card: however the chooser closes, the same answer is taken.
+#[test]
+fn the_card_stays_and_can_be_answered_once_it_closes() {
+    let r = driven(three(editor()));
+    r.driver.run(WIN, Action::ProjectChoose, Origin::Lua);
+    assert!(gate(&r, ViewId::BASE).is_err());
+    assert!(r.chrome().project_chooser.is_some(), "a refused answer leaves it open");
+    r.host.post(HostEvent::Project(ProjectEvent::Line {
+        win: WIN,
+        ev: crate::project_chooser::LineEv::Escape,
+    }));
+    assert!(r.chrome().project_chooser.is_none());
+    assert_eq!(gate(&r, ViewId::BASE), Ok(()));
+
+    r.driver.run(WIN, Action::ProjectChoose, Origin::Lua);
+    assert!(gate(&r, ViewId::BASE).is_err(), "and it covers again when it is back");
+}
+
+/// With no chooser up every answer is judged as before, and with one up each earlier check still speaks first: the
+/// float over the chat is what the person has to clear, and a view the window does not hold stays that refusal.
+#[test]
+fn the_gate_is_as_it_was_with_no_chooser_up() {
+    let notes = ModuleId::lua("notes");
+    let keymap = Keymap::defaults();
+    let sink = super::super::key_text(&keymap, &Action::FloatToggle);
+    let covered = feedback::covered_text("agent", "notes", &sink, false);
+
+    let r = driven(agent_under(&notes, false, editor()));
+    assert_eq!(gate(&r, ViewId::BASE), Err(covered.clone()));
+    r.driver.run(WIN, Action::ProjectChoose, Origin::Lua);
+    assert_eq!(gate(&r, ViewId::BASE), Err(covered), "the float's refusal comes first");
+
+    let clear = driven(three(editor()));
+    let absent = ViewId::of_module(&agent2()).unwrap();
+    let away = gate(&clear, absent);
+    assert!(away.is_err());
+    clear.driver.run(WIN, Action::ProjectChoose, Origin::Lua);
+    assert_eq!(gate(&clear, absent), away, "a view not held is no cover's business");
+    {
+        let _writing = clear.layout.borrow_mut();
+        assert_eq!(
+            gate(&clear, ViewId::BASE),
+            Err(feedback::LAYOUT_CHANGING_TEXT.to_string()),
+            "a layout being written cannot be judged"
+        );
+    }
+}
+
 /// What a covered chat's reveal stows: every scratch float but the one with the keys; a plain float is never
 /// stowed and keeps the chat covered.
 #[test]

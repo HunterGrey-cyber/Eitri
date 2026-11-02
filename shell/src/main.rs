@@ -42,6 +42,7 @@ mod prefix_strip;
 mod process_memory;
 mod project_host;
 mod project_stamp;
+mod project_start;
 mod root_conflicts;
 mod sidecar_probe;
 mod terminal;
@@ -429,7 +430,8 @@ fn main() -> glib::ExitCode {
     // `eitri_core::nvim_bin`'s own module doc for the full reasoning, including why this is a
     // deliberate, narrow exception to `pane_switch`'s "never mutate this process's environment"
     // rule (unlike `TMUX`/`TMUX_PANE`, leaking `NEOVIM_BIN` to every other child is harmless: only
-    // Neovide reads it, and the bottom terminal's shell removes it itself).
+    // Neovide and `resolve` read it, the bottom terminal's shell removes it itself, and starting
+    // another project's window drops a private copy's path).
     // Window 2 never starts nvim: which one window 1 runs is window 1's, and a missing nvim is no reason for the
     // window without an editor not to open.
     let second = !matches!(start, linked_window::WindowStart::Full);

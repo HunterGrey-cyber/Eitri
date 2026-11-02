@@ -2,7 +2,7 @@
 
 use std::cell::RefCell;
 use std::collections::BTreeSet;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::rc::{Rc, Weak};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{mpsc, Arc};
@@ -16,15 +16,33 @@ use gtk4::glib;
 use gtk4::prelude::*;
 
 use crate::gtk_host::project_chooser::ProjectChooserView;
+use crate::project_start::{self, How};
 
 const POLL_EVERY: Duration = Duration::from_millis(10);
 static PATH_BUSY: AtomicBool = AtomicBool::new(false);
 
 #[derive(Debug)]
 pub(crate) enum WorkerAnswer {
-    Rows { serial: u64, rows: Vec<Row> },
-    Path { serial: u64, answer: PathAnswer },
+    Rows {
+        serial: u64,
+        rows: Vec<Row>,
+    },
+    Path {
+        serial: u64,
+        answer: PathAnswer,
+    },
     Folder(Option<PathBuf>),
+    /// A start's watch has ended; `failed` holds what the window has to say about it.
+    Started {
+        failed: Option<StartFailed>,
+    },
+}
+
+/// A project that could not be started, and the child's exit code when it got as far as having one.
+#[derive(Debug, PartialEq)]
+pub(crate) struct StartFailed {
+    path: PathBuf,
+    code: Option<i32>,
 }
 
 struct PathJob {
@@ -44,6 +62,8 @@ struct PendingPath {
 struct Carrier {
     lists: BTreeSet<u64>,
     path: Option<PendingPath>,
+    /// Starts still being watched.
+    opens: usize,
 }
 
 impl Carrier {
@@ -63,7 +83,7 @@ impl Carrier {
     }
 
     fn outstanding(&self) -> bool {
-        !self.lists.is_empty() || self.path.is_some()
+        !self.lists.is_empty() || self.path.is_some() || self.opens > 0
     }
 
     fn tick(
@@ -77,6 +97,10 @@ impl Carrier {
                 WorkerAnswer::Rows { serial, .. } if self.lists.remove(serial) => answers.push(answer),
                 WorkerAnswer::Path { serial, .. } if self.path.as_ref().is_some_and(|p| p.job.serial == *serial) => {
                     self.path = None;
+                    answers.push(answer);
+                }
+                WorkerAnswer::Started { .. } if self.opens > 0 => {
+                    self.opens -= 1;
                     answers.push(answer);
                 }
                 _ => {}
@@ -157,6 +181,37 @@ impl ProjectWorkers {
         if let Some(answer) = replaced {
             (self.inner.answer)(answer);
         }
+    }
+
+    /// Starts `target`'s window off this thread, and answers once the start has failed or its window has passed.
+    pub(crate) fn open(&self, target: PathBuf, token: Option<String>) {
+        let exe = || project_start::exe_to_start(std::env::current_exe(), &|path| path.exists());
+        self.open_with(exe, target, token, project_start::FAILED_WITHIN);
+    }
+
+    fn open_with(
+        &self,
+        exe: impl FnOnce() -> PathBuf + Send + 'static,
+        target: PathBuf,
+        token: Option<String>,
+        window: Duration,
+    ) {
+        self.inner.carrier.borrow_mut().opens += 1;
+        let path = target.clone();
+        let sender = self.inner.sender.clone();
+        if std::thread::Builder::new()
+            .name("project-open".into())
+            .spawn(move || {
+                let start = project_start::start(&exe(), &[], How::Raise(target.clone()), token.as_deref());
+                let failed = project_start::failure(start, window).map(|code| StartFailed { path: target, code });
+                let _ = sender.send(WorkerAnswer::Started { failed });
+            })
+            .is_err()
+        {
+            let failed = Some(StartFailed { path, code: None });
+            let _ = self.inner.sender.send(WorkerAnswer::Started { failed });
+        }
+        Workers::arm(&self.inner);
     }
 
     pub(crate) fn folder_dialog(&self, parent: &gtk4::Window) {
@@ -245,6 +300,19 @@ impl Drop for Workers {
     }
 }
 
+/// What the window hears of a worker's answer. A start that went well says nothing: the window moving is the answer.
+fn project_event(win: WinId, answer: WorkerAnswer) -> Option<ProjectEvent> {
+    Some(match answer {
+        WorkerAnswer::Rows { serial, rows } => ProjectEvent::Rows { win, serial, rows },
+        WorkerAnswer::Path { serial, answer } => ProjectEvent::PathAnswer { win, serial, answer },
+        WorkerAnswer::Folder(path) => ProjectEvent::Folder { win, path },
+        WorkerAnswer::Started { failed } => {
+            let StartFailed { path, code } = failed?;
+            ProjectEvent::OpenFailed { win, path, code }
+        }
+    })
+}
+
 /// The window's carrier: it keeps native objects here and only posts facts to the controller.
 pub(crate) struct WindowProjects {
     win: WinId,
@@ -272,12 +340,9 @@ impl WindowProjects {
                 let Some(sink) = sink.upgrade() else {
                     return;
                 };
-                let event = match answer {
-                    WorkerAnswer::Rows { serial, rows } => ProjectEvent::Rows { win, serial, rows },
-                    WorkerAnswer::Path { serial, answer } => ProjectEvent::PathAnswer { win, serial, answer },
-                    WorkerAnswer::Folder(path) => ProjectEvent::Folder { win, path },
-                };
-                sink.post(HostEvent::Project(event));
+                if let Some(event) = project_event(win, answer) {
+                    sink.post(HostEvent::Project(event));
+                }
             }),
         );
         Rc::new(Self {
@@ -308,6 +373,14 @@ impl crate::gtk_host::ProjectHost for WindowProjects {
             }
             _ => return Applied::Refused,
         }
+        Applied::Done
+    }
+
+    fn open(&self, win: WinId, target: &Path, token: Option<String>) -> Applied {
+        if win != self.win {
+            return Applied::Refused;
+        }
+        self.workers.open(target.to_path_buf(), token);
         Applied::Done
     }
 
@@ -448,6 +521,80 @@ mod tests {
             !PATH_BUSY.load(Ordering::Acquire),
             "the flag clears when the worker ends"
         );
+    }
+
+    #[test]
+    fn a_start_keeps_the_poll_until_it_has_answered() {
+        let now = Instant::now();
+        let mut carrier = Carrier {
+            opens: 2,
+            ..Carrier::default()
+        };
+        let quiet = || WorkerAnswer::Started { failed: None };
+        let (answers, _) = carrier.tick(now, [quiet()]);
+        assert_eq!(answers.len(), 1);
+        assert!(carrier.outstanding(), "the other start is still watched");
+        let (answers, _) = carrier.tick(now, [quiet()]);
+        assert_eq!(answers.len(), 1);
+        assert!(!carrier.outstanding());
+        let (answers, _) = carrier.tick(now, [quiet()]);
+        assert!(answers.is_empty(), "nothing is owed");
+    }
+
+    #[test]
+    fn a_failed_start_reaches_the_window_and_one_that_went_well_says_nothing() {
+        let win = WinId::MAIN;
+        let failed = Some(StartFailed {
+            path: "/work/app".into(),
+            code: Some(3),
+        });
+        assert_eq!(
+            project_event(win, WorkerAnswer::Started { failed }),
+            Some(ProjectEvent::OpenFailed {
+                win,
+                path: "/work/app".into(),
+                code: Some(3),
+            })
+        );
+        assert_eq!(project_event(win, WorkerAnswer::Started { failed: None }), None);
+    }
+
+    #[test]
+    fn a_start_answers_on_the_window_thread_and_the_poll_stops() {
+        let _turn = crate::layout_state::default_context_turn();
+        let context = glib::MainContext::default();
+        let _owner = context.acquire().unwrap();
+        let heard = Rc::new(RefCell::new(Vec::new()));
+        let workers = ProjectWorkers::new(
+            Sources {
+                layout: None,
+                tabs: None,
+                control: "/unused".into(),
+                home: None,
+            },
+            Rc::new({
+                let heard = heard.clone();
+                move |answer| heard.borrow_mut().push(answer)
+            }),
+        );
+        // The exit is known at once, so this wide a window would hang here if the worker sat it out.
+        workers.open_with(
+            || "/nonexistent/eitri".into(),
+            "/work/app".into(),
+            Some("token".into()),
+            Duration::from_secs(3600),
+        );
+        assert!(workers.inner.poll.borrow().is_some(), "armed while it is outstanding");
+        let until = Instant::now() + Duration::from_secs(30);
+        while heard.borrow().is_empty() && Instant::now() < until {
+            context.iteration(false);
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        assert!(matches!(
+            &heard.borrow()[..],
+            [WorkerAnswer::Started { failed: Some(StartFailed { path, code: None }) }] if path == Path::new("/work/app")
+        ));
+        assert!(workers.inner.poll.borrow().is_none(), "nothing is left to wait for");
     }
 
     #[test]

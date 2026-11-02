@@ -25,8 +25,10 @@
 //! before any other thread exists to race it. Unlike `TMUX`/`TMUX_PANE` (`pane_switch`'s own reason
 //! for never doing this), leaking `NEOVIM_BIN` into every other child of `shell` -- nvim's own
 //! `:terminal` jobs, the sidecar, `claude` and its Bash tool -- is harmless, because only Neovide
-//! ever reads it. The one child that must never see it is the bottom terminal's shell,
-//! which removes it itself (`eitri_terminal::pty::REMOVED_ENV`).
+//! and [`resolve`] ever read it. Two children must not see it: the bottom terminal's shell, which
+//! removes it itself (`eitri_terminal::pty::REMOVED_ENV`), and a window started for another
+//! project, whose own [`resolve`] would take the value for the user's, so the start drops a private
+//! copy's path ([`is_private_copy`]).
 
 use std::ffi::OsStr;
 use std::path::{Path, PathBuf};
@@ -273,6 +275,22 @@ pub fn private_nvim_root(xdg_data_home: Option<&OsStr>, home: Option<&OsStr>) ->
             _ => None,
         },
     }
+}
+
+/// `neovim_bin` is `<private root>/<X.Y.Z>/bin/nvim`, the one kind of path a window chooses for itself and leaves in
+/// [`NEOVIM_BIN_ENV`]. Its chat and page windows inherit that, so which process wrote the value cannot tell; a path of
+/// this shape can, and a person who exported one gets the order this module would choose anyway.
+pub fn is_private_copy(neovim_bin: &OsStr, xdg_data_home: Option<&OsStr>, home: Option<&OsStr>) -> bool {
+    let root = private_nvim_root(xdg_data_home, home);
+    let Some(rest) = root
+        .as_deref()
+        .and_then(|root| Path::new(neovim_bin).strip_prefix(root).ok())
+    else {
+        return false;
+    };
+    let mut parts = rest.components();
+    let version = parts.next().and_then(|part| part.as_os_str().to_str());
+    version.and_then(parse_version_dirname).is_some() && parts.as_path() == Path::new("bin/nvim")
 }
 
 /// Every directory directly under `root`, paired with the `bin/nvim` path inside it -- [`decide`]
@@ -712,6 +730,25 @@ mod tests {
             private_nvim_root(Some(OsStr::new("relative")), Some(OsStr::new("/home/x"))),
             Some(PathBuf::from("/home/x/.local/share/eitri/nvim"))
         );
+    }
+
+    #[test]
+    fn only_a_versioned_copy_under_the_private_root_is_a_private_copy() {
+        let home = Some(OsStr::new("/home/x"));
+        let private = |path: &str, data: Option<&str>| is_private_copy(OsStr::new(path), data.map(OsStr::new), home);
+        assert!(private("/data/eitri/nvim/0.11.4/bin/nvim", Some("/data")));
+        assert!(private("/home/x/.local/share/eitri/nvim/0.11.4/bin/nvim", None));
+        assert!(!private("/data/eitri/nvim/0.11.4/bin/nvim", None), "another root");
+        assert!(!private("/opt/nvim/bin/nvim", Some("/data")));
+        assert!(!private("nvim", Some("/data")));
+        assert!(!private("/data/eitri/nvim/nvim-linux-x86_64/bin/nvim", Some("/data")));
+        assert!(!private("/data/eitri/nvim/0.11.4/bin/nvim-wrapper", Some("/data")));
+        assert!(!private("/data/eitri/nvim/0.11.4/nvim", Some("/data")));
+        assert!(!is_private_copy(
+            OsStr::new("/data/eitri/nvim/0.11.4/bin/nvim"),
+            None,
+            None
+        ));
     }
 
     #[test]

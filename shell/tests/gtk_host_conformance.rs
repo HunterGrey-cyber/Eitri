@@ -159,6 +159,10 @@ impl gtk_host::ProjectHost for StubProjects {
         Applied::Done
     }
 
+    fn open(&self, _win: WinId, _target: &std::path::Path, _token: Option<String>) -> Applied {
+        Applied::Done
+    }
+
     fn focus(&self, _win: WinId) -> bool {
         self.entry.set_visible(true);
         self.entry.grab_focus()

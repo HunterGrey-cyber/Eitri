@@ -79,7 +79,7 @@ pub fn event(w: &mut Window, win: WinId, ev: ProjectEvent, batch: &mut Batch) {
             let code = code.map(|code| code.to_string()).unwrap_or_else(|| "unknown".into());
             w.say(format!("[project] start failed {code}"));
             let name = Row::new(path, None, String::new(), crate::project_chooser::Fact::Unknown).name;
-            w.refuse(win, format!("could not open {name}"), batch);
+            w.refuse(win, format!("could not open {name}: see the window log"), batch);
             return;
         }
     };
@@ -556,8 +556,7 @@ mod tests {
         };
         post(&mut r, failure.clone());
         let toast = r.said().toast.unwrap();
-        assert!(toast.1.contains("app?name"));
-        assert!(!toast.1.contains('\n'));
+        assert_eq!(toast.1, "could not open app?name: see the window log");
         post(&mut r, failure);
         assert_eq!(r.said().toast, Some(toast));
         assert_eq!(
