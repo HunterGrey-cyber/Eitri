@@ -255,6 +255,11 @@ impl Nvim {
                     stream.set_read_timeout(Some(DEADLINE)).expect("read timeout");
                     let mut line = String::new();
                     stream.read_to_string(&mut line).expect("read the letter");
+                    // The editor watch writes its own lines (`nvim-watched`, `nvim-leaving`) to the
+                    // same socket; they are not letters and are passed over.
+                    if line.starts_with("nvim-") {
+                        continue;
+                    }
                     return line;
                 }
                 Err(e) if e.kind() == ErrorKind::WouldBlock => {
@@ -805,6 +810,8 @@ fn the_letter_is_already_written_before_the_mapping_returns_even_if_nvim_dies_ri
         messages.extend(reader.poll());
         std::thread::sleep(Duration::from_millis(10));
     }
+    // The editor watch's own events travel the same socket; the assertion is about the letters.
+    messages.retain(|m| matches!(m, PaneMessage::Direction(_)));
     assert_eq!(
         messages,
         vec![PaneMessage::Direction('R')],
