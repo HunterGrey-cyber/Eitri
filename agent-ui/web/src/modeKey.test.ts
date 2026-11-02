@@ -158,6 +158,26 @@ describe("KeyClock", () => {
     expect(clock.pressedAt({ timeStamp: 7_000 }, 7_000 + offset)).toBe(7_000 + offset);
   });
 
+  it("marks the key that turns an offset on, and only that key", () => {
+    const hour = 3_600_000;
+    const clock = new KeyClock();
+    clock.pressedAt({ timeStamp: 1_000 }, 1_000 + hour);
+    expect(clock.turned).toBe(false);
+    clock.pressedAt({ timeStamp: 2_000 }, 2_000 + hour);
+    expect(clock.turned).toBe(true);
+    clock.pressedAt({ timeStamp: 3_000 }, 3_000 + hour);
+    expect(clock.turned).toBe(false);
+    clock.pressedAt({ timeStamp: 4_000, repeat: true }, 4_000 + hour);
+    expect(clock.turned).toBe(false);
+  });
+
+  it("takes no offset when the least lag is within the line, though this key's is past it", () => {
+    const clock = new KeyClock();
+    clock.pressedAt({ timeStamp: 1_000 }, 1_000 + OTHER_CLOCK_LAG_MS - 5);
+    expect(clock.pressedAt({ timeStamp: 2_000 }, 2_000 + OTHER_CLOCK_LAG_MS + 5)).toBe(2_000);
+    expect(clock.turned).toBe(false);
+  });
+
   it("drops an offset for good once a key shows the clocks agree", () => {
     const hour = 3_600_000;
     const clock = new KeyClock();

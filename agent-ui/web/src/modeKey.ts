@@ -92,18 +92,27 @@ export const LAGS_AGREE_MS = 20;
  *  so far, that least lag is the clocks' offset and is taken off. It is compared with the least and not the last, since
  *  some keys are always handled late and the least is the one that is near the offset; and it is always the least,
  *  since no key can lag less than the offset, so a press is never put after its own handling. Anything less proves
- *  nothing, so a key held up by a long stall keeps its own press. */
+ *  nothing, so a key held up by a long stall keeps its own press.
+ *
+ *  The key that turns the offset on is the one key with no time to compare: it is on the new clock and the key before it
+ *  on the old, an offset apart. So it answers nothing (`turned`), whatever it looks like, and the next key is judged
+ *  against it on one clock. */
 export class KeyClock {
   private leastLag = Infinity;
   private otherClock = false;
+  /** Whether the key just timed is the one that turned the offset on. */
+  turned = false;
 
   pressedAt(event: { timeStamp: number; repeat?: boolean }, handledAt: number): number {
+    const before = this.otherClock;
+    this.turned = false;
     const stamp = event.timeStamp;
     if (event.repeat === true || stamp <= 0 || stamp > handledAt) return handledAt;
     const lag = handledAt - stamp;
     if (Math.abs(lag - this.leastLag) <= LAGS_AGREE_MS) this.otherClock = true;
     this.leastLag = Math.min(this.leastLag, lag);
     if (this.leastLag <= OTHER_CLOCK_LAG_MS) this.otherClock = false;
+    this.turned = this.otherClock && !before;
     return this.otherClock ? stamp + this.leastLag : stamp;
   }
 }

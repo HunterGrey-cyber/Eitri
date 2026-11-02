@@ -230,6 +230,25 @@ describe("TrustPrompt", () => {
     expect(container.textContent!.match(/\u27e8U\+200B\u27e9/g)).toHaveLength(12_000);
   });
 
+  it("counts the remember note and a diff's path on that budget too", () => {
+    const value = "\u200b".repeat(MAX_QUESTION_ESCAPES);
+    const item = { what: "env", file: "s.json", label: "K", value, outside: false };
+    const late = { ...replacement("a\u200b.md", "old", "new") };
+    const spent = envelope({
+      state: "changed",
+      items: [item],
+      remember: "window",
+      rememberNote: "kept for this window\u200b",
+      changed: { added: [], removed: [], changed: [], texts: [late] },
+    });
+    const { container } = render(<TrustPrompt envelope={spent} />);
+    expect(container.querySelectorAll(".permission-card-escape")).toHaveLength(MAX_QUESTION_ESCAPES);
+    expect(container.querySelector(".trust-remember-note")!.childNodes).toHaveLength(1);
+    expect(container.querySelector(".trust-remember-note")!.textContent).toBe("kept for this window\u27e8U+200B\u27e9");
+    expect(container.querySelector(".trust-text-path")!.childNodes).toHaveLength(1);
+    expect(container.querySelector(".trust-text-path")!.textContent).toBe("a\u27e8U+200B\u27e9.md");
+  });
+
   it("lays a diff's text out in storage order on the text itself", () => {
     expect(css).toMatch(/\.trust-text-diff \.diff-text \{[^}]*unicode-bidi: bidi-override/);
   });

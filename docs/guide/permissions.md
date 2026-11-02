@@ -300,8 +300,8 @@ project cannot be trusted in Eitri at all.
   older version), over 256 KiB then or now, past the 1 MiB kept for a project, not text, or reached through a link gets
   one line saying so. At most 2,000 rows are drawn across all the files, smallest changes first, so a large change
   cannot push a small one off the screen: a file left out says `changed, not drawn` with how many lines were added and
-  removed, and one too long on its own says that. Near the question's own 2 MiB limit the diffs give way to those lines,
-  and at the very limit the section is left out.
+  removed, and one too long on its own says that. Near the question's own 2 MiB limit the largest diffs give way to the
+  same kind of line, one at a time, and at the very limit the section is left out.
   The question is the same question either way. Hooks, MCP servers and settings are always shown whole, so they need no diff.
 - **`n` is remembered only for this window**, for that same content, and only when Eitri could check everything
   (see the next point); otherwise the question comes back at the next start in the window. Another window asks

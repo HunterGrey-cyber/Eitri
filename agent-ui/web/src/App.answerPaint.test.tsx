@@ -171,6 +171,22 @@ describe("a key pressed before the question was painted", () => {
     expect(answers()).toHaveLength(0);
   });
 
+  it("takes no answer from the key that turns a clock offset on, however it times out", () => {
+    const { container } = mount();
+    const hour = 3_600_000;
+    clock.now += 2 * hour;
+    dispatch(trustPrompt(3));
+    frames(2);
+    pass(1_000);
+    press(container, "k", clock.now - hour);
+    pass(51);
+    press(container, "y", clock.now - hour);
+    expect(answers()).toHaveLength(0);
+    pass(1_000);
+    press(container, "y", clock.now - hour);
+    expect(answers()).toHaveLength(1);
+  });
+
   it("is not answered in a view that gets no frames", () => {
     const { container } = mount();
     vi.stubGlobal("requestAnimationFrame", () => 0);

@@ -1674,7 +1674,7 @@ export default function App() {
   /** What the answer guard needs of the key being handled, whose press the document-capture listener has recorded. */
   const answerClock = () => ({
     now: currentKeyAtRef.current,
-    openedAt: answerableFromRef.current,
+    openedAt: keyClockRef.current.turned ? Infinity : answerableFromRef.current,
     lastKeyAt: lastKeyAtRef.current,
   });
   /** The last non-modifier keydown seen ANYWHERE in the panel BEFORE the one currently being
