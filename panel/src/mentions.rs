@@ -27,17 +27,20 @@ pub(super) struct Desk {
 }
 
 impl Desk {
-    /// How many tabs have words of the person's waiting for the editor.
-    pub(super) fn tabs_holding_words(&self) -> usize {
-        let mut tabs: Vec<TabId> = self
-            .waiting
-            .iter()
-            .filter(|waiting| words_of(&waiting.message).is_some())
-            .map(|waiting| waiting.tab)
-            .collect();
-        tabs.sort();
-        tabs.dedup();
-        tabs.len()
+    /// The words each tab has waiting for the editor, oldest first and joined as a draft is: what the close question
+    /// asks about and what a close gives back.
+    pub(super) fn held_by_tab(&self) -> std::collections::BTreeMap<TabId, String> {
+        let mut held: std::collections::BTreeMap<TabId, String> = Default::default();
+        for waiting in &self.waiting {
+            if let Some(text) = held_words(&waiting.message) {
+                let entry = held.entry(waiting.tab).or_default();
+                if !entry.is_empty() {
+                    entry.push_str("\n\n");
+                }
+                entry.push_str(text);
+            }
+        }
+        held
     }
 
     /// Whether a message waits for the editor: the tick polls on its steady cadence until it goes.
@@ -48,18 +51,49 @@ impl Desk {
 
 /// Forgets what `view`'s page was waiting for: a page that went idle or was reloaded is a new document whose request
 /// numbers start again, and an answer to the old one could match a request of the new. What the person had typed is
-/// not lost with it: it is back in the tab's draft and in the prompt history (`↑`).
+/// not lost with it: it is back in the tab's draft, after what they typed since, and in the prompt history (`↑`).
 pub(super) fn drop_view(state: &mut AgentPanelState, view: ViewId, out: &mut Outbox) {
     let (dropped, kept): (Vec<Waiting>, Vec<Waiting>) = std::mem::take(&mut state.mentions.waiting)
         .into_iter()
         .partition(|waiting| waiting.view == view);
     state.mentions.waiting = kept;
-    for waiting in dropped {
-        let Some(text) = words_of(&waiting.message).map(str::to_owned) else {
+    give_back(state, dropped, out);
+}
+
+/// The same for every page: the window is closing, and what waits for the editor goes where queued words go.
+pub(super) fn drop_all(state: &mut AgentPanelState, out: &mut Outbox) {
+    let dropped = std::mem::take(&mut state.mentions.waiting);
+    give_back(state, dropped, out);
+}
+
+/// What was held is history and, joined, the tab's draft: the words that were held come first, the draft typed since
+/// after them, as a restored draft joins (`TabSet::give_restored_draft`).
+fn give_back(state: &mut AgentPanelState, dropped: Vec<Waiting>, out: &mut Outbox) {
+    let mut by_tab: Vec<(TabId, Vec<String>)> = Vec::new();
+    for waiting in &dropped {
+        let Some(text) = held_words(&waiting.message) else {
             continue;
         };
-        remember_prompts(state, std::slice::from_ref(&text), out);
-        state.tabs.set_draft(waiting.tab, &text);
+        match by_tab.iter_mut().find(|(tab, _)| *tab == waiting.tab) {
+            Some((_, texts)) => texts.push(text.to_owned()),
+            None => by_tab.push((waiting.tab, vec![text.to_owned()])),
+        }
+    }
+    for (tab, mut texts) in by_tab {
+        remember_prompts(state, &texts, out);
+        if let Some(open) = state.tabs.get(tab) {
+            if !open.draft().trim().is_empty() {
+                texts.push(open.draft().to_owned());
+            }
+            state.tabs.set_draft(tab, &texts.join("\n\n"));
+        }
+    }
+}
+
+/// A message of a tab that has gone while it waited keeps its words as history, as queued words of a closed tab do.
+pub(super) fn remember_closed(state: &mut AgentPanelState, message: &InboundMessage, out: &mut Outbox) {
+    if let Some(text) = held_words(message) {
+        remember_prompts(state, &[text.to_owned()], out);
     }
 }
 
@@ -88,6 +122,14 @@ fn words_of(message: &InboundMessage) -> Option<&str> {
     }
 }
 
+/// The words of a held message the person typed: a send's, and a `!` line's.
+fn held_words(message: &InboundMessage) -> Option<&str> {
+    match message {
+        InboundMessage::RunShell { text, .. } => Some(text),
+        other => words_of(other),
+    }
+}
+
 /// Whether a message of a tab must not overtake one held for it: what sends, queues, runs a line or takes the queue
 /// back.
 fn keeps_order(message: &InboundMessage) -> bool {
@@ -113,7 +155,10 @@ pub(super) fn hold(state: &mut AgentPanelState, message: InboundMessage, view: V
         return Held::Goes(message, admitted);
     }
     // The box was cleared at Enter: the host's mirror of it goes now, as it would have, and not when the message goes.
-    if matches!(message, InboundMessage::SendMessage { .. }) {
+    if matches!(
+        message,
+        InboundMessage::SendMessage { .. } | InboundMessage::RunShell { .. }
+    ) {
         state.tabs.note_sent(tab);
     }
     let gather = Gather::start(
@@ -615,5 +660,114 @@ mod tests {
             "a refusal is what puts the words back in the box: {answered:?}"
         );
         assert!(!views.handle.state.borrow().mentions.is_waiting());
+    }
+
+    /// The window's history made real, so that what goes to it can be read back.
+    fn with_history(r: &Ready) {
+        let dir = agent::state_dirs::test_workspace_dir("panel-mentions-history");
+        r.handle.state.borrow_mut().history_writer =
+            eitri_core::prompt_history::HistoryWriter::new(Some(dir), PathBuf::new());
+    }
+
+    fn draft_of(r: &Ready) -> String {
+        r.handle.state.borrow().tabs.get(r.tab).unwrap().draft().to_owned()
+    }
+
+    #[test]
+    fn what_is_typed_during_the_wait_is_still_in_the_box_after_the_message_goes() {
+        let r = ready("panel-mentions-typed-during");
+        r.handle
+            .page_message(ViewId::BASE, &send("send_message", "s1", r.tab, "see @buffers"));
+        // The page mirrors what the person types meanwhile.
+        r.handle.state.borrow_mut().tabs.set_draft(r.tab, "and then");
+        r.editor.answer_oldest(&buffer_reply(&r.dir.join("a.rs")));
+        tick_handle_until(&r.handle, "the turn", || r.provider.turns().len() == 1);
+        assert_eq!(draft_of(&r), "and then", "the replay does not wipe the box's mirror");
+        // A `!` line held behind a message does the same.
+        r.handle
+            .page_message(ViewId::BASE, &send("send_message", "s2", r.tab, "again @quickfix"));
+        r.handle
+            .page_message(ViewId::BASE, &send("run_shell", "r1", r.tab, "!true"));
+        r.handle
+            .state
+            .borrow_mut()
+            .tabs
+            .set_draft(r.tab, "typed after the line");
+        begin_turn(&r, "t1");
+        end_turn(&r, "t1");
+        r.editor.answer_oldest(&quickfix_reply());
+        tick_handle_until(&r.handle, "both", || !r.handle.state.borrow().mentions.is_waiting());
+        assert_eq!(draft_of(&r), "typed after the line");
+    }
+
+    #[test]
+    fn a_dropped_page_gives_every_held_word_back_ahead_of_what_was_typed_since() {
+        let r = ready("panel-mentions-give-back");
+        with_history(&r);
+        r.handle
+            .page_message(ViewId::BASE, &send("send_message", "s1", r.tab, "first @buffers"));
+        r.handle
+            .page_message(ViewId::BASE, &send("run_shell", "r1", r.tab, "!make test"));
+        r.handle
+            .page_message(ViewId::BASE, &send("queue_message", "q1", r.tab, "third"));
+        r.handle.state.borrow_mut().tabs.set_draft(r.tab, "typed since");
+        r.handle.page_message(ViewId::BASE, READY);
+        assert!(!r.handle.state.borrow().mentions.is_waiting());
+        assert_eq!(draft_of(&r), "first @buffers\n\n!make test\n\nthird\n\ntyped since");
+        let history = r.handle.state.borrow().history.clone();
+        for words in ["first @buffers", "!make test", "third"] {
+            assert!(
+                history.iter().any(|entry| entry == words),
+                "{words} is in the history: {history:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_close_gives_held_words_to_the_draft_and_the_history_and_the_question_counts_the_tab_once() {
+        let r = ready("panel-mentions-close");
+        with_history(&r);
+        r.handle
+            .page_message(ViewId::BASE, &send("send_message", "s1", r.tab, "see @buffers"));
+        r.handle.state.borrow_mut().tabs.set_draft(r.tab, "typed since");
+        assert_eq!(
+            r.handle.unsaved_draft_count(),
+            1,
+            "one tab, held words and a draft together"
+        );
+        let _ = r.handle.shutdown();
+        assert!(!r.handle.state.borrow().mentions.is_waiting());
+        let history = r.handle.state.borrow().history.clone();
+        assert!(history.iter().any(|entry| entry == "see @buffers"), "{history:?}");
+    }
+
+    #[test]
+    fn a_tab_that_closed_during_the_wait_keeps_the_words_as_history() {
+        let r = ready("panel-mentions-closed-history");
+        with_history(&r);
+        r.handle
+            .page_message(ViewId::BASE, &send("send_message", "s1", r.tab, "see @quickfix"));
+        r.handle.state.borrow_mut().tabs.remove(r.tab);
+        r.editor.answer_oldest(&quickfix_reply());
+        tick_handle_until(&r.handle, "the answer", || !results(&r.page, "s1").is_empty());
+        let history = r.handle.state.borrow().history.clone();
+        assert!(history.iter().any(|entry| entry == "see @quickfix"), "{history:?}");
+    }
+
+    #[test]
+    fn a_second_send_message_waits_behind_the_first_and_goes_after_its_turn() {
+        let r = ready("panel-mentions-second-send");
+        r.handle
+            .page_message(ViewId::BASE, &send("send_message", "s1", r.tab, "one @diagnostics"));
+        r.handle
+            .page_message(ViewId::BASE, &send("send_message", "s2", r.tab, "two"));
+        assert_eq!(r.handle.state.borrow().mentions.waiting.len(), 2);
+        r.editor.answer_oldest(&diagnostics_reply());
+        tick_handle_until(&r.handle, "the first", || !r.provider.turns().is_empty());
+        begin_turn(&r, "t1");
+        end_turn(&r, "t1");
+        tick_handle_until(&r.handle, "the second", || r.provider.turns().len() == 2);
+        assert!(r.provider.turns()[0].starts_with("one @diagnostics\n\n[@diagnostics: "));
+        assert_eq!(r.provider.turns()[1], "two");
     }
 }

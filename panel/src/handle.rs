@@ -513,6 +513,7 @@ impl AgentPanelHandle {
             let screen = Screen::read(&self.state, &self.pages);
             self.run(|state, out| {
                 if !super::mentions::tab_is_still_here(state, &admitted) {
+                    super::mentions::remember_closed(state, &message, out);
                     out.send(
                         view,
                         serialize_command_result_for_js(
@@ -1000,6 +1001,8 @@ impl AgentPanelHandle {
     /// the watch keeps alive belongs to the application that owns the loop this panel's timers run on.
     pub fn shutdown(&self) -> ShutdownWatch {
         self.wake();
+        // Words held for the editor go where a draft goes: the tab's, saved with it, and the history.
+        self.run(super::mentions::drop_all);
         // Queued words outlive the window as history: handed to the history's writer with whatever it
         // still holds, and its last write watched like the saved tabs' below.
         let history_write = {
@@ -2544,10 +2547,10 @@ impl AgentPanelHandle {
             return 0;
         }
         // A message held for the editor has left the box and is not in a draft yet: it goes with the window too.
-        state
-            .tabs
-            .unsaved_draft_count(state.restore_policy != RestorePolicy::Off)
-            + state.mentions.tabs_holding_words()
+        state.tabs.unsaved_draft_count(
+            state.restore_policy != RestorePolicy::Off,
+            &state.mentions.held_by_tab(),
+        )
     }
 
     /// Tabs with live non-ambient background work across the window.

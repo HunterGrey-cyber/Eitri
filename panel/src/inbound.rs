@@ -677,7 +677,10 @@ pub(super) fn handle_inbound_message(
             // A sent prompt is history whether or not the backend takes it, as in Claude Code.
             remember_prompts(state, std::slice::from_ref(&text), &mut out);
             // ...and no longer the tab's draft (a refusal puts it back in the box panel-side).
-            state.tabs.note_sent(tab);
+            // (A held message cleared it at Enter; what was typed since is the box's, not this message's.)
+            if state.mention_sections.is_none() {
+                state.tabs.note_sent(tab);
+            }
             enum Plan {
                 Send(FirstTurn),
                 Defer(FirstTurn),
@@ -1207,7 +1210,9 @@ pub(super) fn handle_inbound_message(
         InboundMessage::RunShell { text, .. } => {
             let tab = tab_of(target);
             remember_prompts(state, std::slice::from_ref(&text), &mut out);
-            state.tabs.note_sent(tab);
+            if state.mention_sections.is_none() {
+                state.tabs.note_sent(tab);
+            }
             let fresh = matches!(
                 state.tabs.get(tab).expect("resolved above").backend(),
                 TabBackend::NotStarted

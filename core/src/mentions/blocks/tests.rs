@@ -323,7 +323,7 @@ fn a_quickfix_list_is_told_in_order_and_bounded() {
         &scope(&project, &none),
     );
     assert!(is_framed(Kind::Quickfix, &section), "{section}");
-    assert!(section.starts_with("[@quickfix: the editor's quickfix list \":make\" when the message was sent: 3000 in the list, 200 below, in the list's order]\n"), "{section}");
+    assert!(section.starts_with("[@quickfix: the editor's quickfix list when the message was sent: 3000 in the list, 200 below, in the list's order]\n"), "{section}");
     assert!(
         section.contains("\n  src/a.rs:1:2 error problem 1\n  src/a.rs:2:2 error problem 2\n"),
         "{section}"
@@ -864,4 +864,75 @@ fn the_arabic_letter_mark_and_the_other_controls_a_name_may_not_hold_are_replace
         &scope(&project, &none),
     );
     assert!(section.contains("1\ta\u{fffd}b\u{fffd}c\u{fffd}d\n"), "{section}");
+}
+
+#[test]
+fn the_bounds_hold_after_every_mention_has_gained_its_joiner_and_every_newline_its_indent() {
+    let project = project("inert-count");
+    let none = ReadRules::default();
+    let a = project.root.join("src/a.rs");
+    // Each `@` after a blank is three bytes longer on the wire: 15 bytes of line become 27.
+    let mut dense = buffer(&a, &[]);
+    dense.text = vec!["@ @ @ @ @ @ @ @".to_owned(); 5000];
+    dense.lines = 5000;
+    let section = buffers(&answer(vec![dense.clone()]), &scope(&project, &none));
+    assert!(section.len() < BUFFER_BYTES_MAX as usize + 2048, "{}", section.len());
+    let many: Vec<BufferRead> = (0..8)
+        .map(|n| BufferRead {
+            path: project.root.join(format!("d{n}.rs")),
+            read_from: Some(project.root.join(format!("d{n}.rs"))),
+            ..dense.clone()
+        })
+        .collect();
+    let section = buffers(&answer(many), &scope(&project, &none));
+    assert!(section.len() < BUFFERS_TOTAL_MAX as usize + 8192, "{}", section.len());
+    // A list: a thousand diagnostics of 512 bytes of mentions.
+    let message = "@ ".repeat(300);
+    let entries: Vec<DiagnosticEntry> = (1..=200).map(|n| entry(&a, n, Severity::Hint, &message)).collect();
+    let section = diagnostics(
+        &DiagnosticsAnswer {
+            entries,
+            modified: vec![],
+            left_out: 0,
+        },
+        &scope(&project, &none),
+    );
+    assert!(section.len() < LIST_BYTES_MAX + 2048, "{}", section.len());
+    // An entry of 512 newlines is cut where it is told, with its indent.
+    let newlines = "\n".repeat(600);
+    let one = diagnostic_line("src/a.rs", &entry(&a, 1, Severity::Hint, &newlines));
+    assert!(one.len() < ENTRY_TEXT_MAX + 100, "{}", one.len());
+}
+
+#[test]
+fn a_title_is_left_out_when_entries_past_the_ones_read_may_have_been_dropped() {
+    let project = project("title-gap");
+    let none = ReadRules::default();
+    let item = QuickfixItem {
+        path: None,
+        read_from: None,
+        lnum: 0,
+        end_lnum: 0,
+        col: 0,
+        kind: String::new(),
+        valid: false,
+        text: "line".into(),
+    };
+    let told = |left_out| {
+        quickfix(
+            &QuickfixAnswer {
+                title: ":vimgrep /x/ big.log secret.env".into(),
+                size: 2001,
+                items: vec![item.clone()],
+                left_out,
+            },
+            &scope(&project, &none),
+        )
+    };
+    assert!(told(0).contains("vimgrep"));
+    assert!(
+        !told(2000).contains("vimgrep") && !told(2000).contains("secret.env"),
+        "{}",
+        told(2000)
+    );
 }

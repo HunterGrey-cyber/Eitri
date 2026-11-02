@@ -294,7 +294,8 @@ pub fn buffers(answer: &BuffersAnswer, scope: &Scope<'_>) -> String {
         // The bounds are about the text as it is told: the numbers and the replaced characters count.
         let (mut written, mut emitted, mut by_total) = (0, 0, false);
         for line in &buffer.text {
-            let text = format!("{}\t{}\n", emitted + 1, plain(line));
+            // Made inert before it is counted, as a list line is.
+            let text = agent::mention::inert(&format!("{}\t{}\n", emitted + 1, plain(line))).into_owned();
             if written + text.len() > BUFFER_BYTES_MAX as usize {
                 break;
             }
@@ -363,13 +364,14 @@ fn list_lines(lines: &[String]) -> (String, usize) {
     let mut body = String::new();
     let mut shown = 0;
     for line in lines.iter().take(LIST_ENTRIES_MAX) {
-        if body.len() + LIST_LINE_MARK.len() + line.len() + 1 > LIST_BYTES_MAX {
+        // Every line of a list starts with the same two spaces: no line of the editor's text can be a frame line, which
+        // starts at the left edge, or make a blank line that a reader of the frame would take as a boundary. Made
+        // inert here, before it is counted: a mention gains three bytes, and the bound is on what the model reads.
+        let told = agent::mention::inert(&format!("{LIST_LINE_MARK}{line}")).into_owned();
+        if body.len() + told.len() + 1 > LIST_BYTES_MAX {
             break;
         }
-        // Every line of a list starts with the same two spaces: no line of the editor's text can be a frame line, which
-        // starts at the left edge, or make a blank line that a reader of the frame would take as a boundary.
-        body.push_str(LIST_LINE_MARK);
-        body.push_str(line);
+        body.push_str(&told);
         body.push('\n');
         shown += 1;
     }
@@ -377,8 +379,9 @@ fn list_lines(lines: &[String]) -> (String, usize) {
 }
 
 fn entry_text(text: &str) -> String {
-    // The later lines of a text are indented past the mark, so they are no less a part of the entry.
-    cut_text(&plain(text), ENTRY_TEXT_MAX).replace('\n', "\n    ")
+    // The later lines of a text are indented past the mark, so they are no less a part of the entry; the bound is on
+    // the text as told, indent included.
+    cut_text(&plain(text).replace('\n', "\n    "), ENTRY_TEXT_MAX)
 }
 
 /// `@quickfix`: the editor's quickfix list, an entry to a line.
@@ -421,8 +424,9 @@ pub fn quickfix(answer: &QuickfixAnswer, scope: &Scope<'_>) -> String {
         });
     }
     let (body, shown) = list_lines(&lines);
-    // A title may name a file the list was made of (`:vimgrep /KEY/ .env`): with an entry dropped it is left out.
-    let title = if dropped == Dropped::default() {
+    // A title may name a file the list was made of (`:vimgrep /KEY/ .env`): with an entry dropped, or entries past the
+    // ones read that may be the dropped ones, it is left out.
+    let title = if dropped == Dropped::default() && answer.left_out == 0 {
         cut_text(&one_line(&answer.title), TITLE_MAX)
     } else {
         String::new()

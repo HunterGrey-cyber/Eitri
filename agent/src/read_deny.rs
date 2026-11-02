@@ -1,14 +1,21 @@
-//! Reads the CLI's `Read(...)` deny rules to filter files offered by the editor.
-//! This only narrows the list of sources inserted into a turn; the CLI still enforces its own
-//! permission gate. A file is left out whenever a deny rule might cover it.
-//! A pattern without a slash can match at any depth, folder rules cover their descendants,
-//! and `**` crosses folders. Relative, project-root and filesystem-root forms can be anchored.
-//! This reader checks every form both anchored and at any depth to avoid missing a deny.
-//! Names are case-sensitive. Bare `Read` covers all files; `Edit(...)` does not deny reads.
-//! `settings.json` and `settings.local.json` contribute rules. Symlinks are checked by name
-//! and destination.
-//! Every settings tier is read even if the session would not load it. An extra rule leaves
-//! a file out of the source list; a missed rule could include a file that should stay unread.
+//! The `Read(...)` deny rules of the CLI's settings, read so that a source the editor offers never reaches a file the
+//! CLI's own `@path` would skip.
+//!
+//! Only this narrows. The CLI is the one that enforces a rule; nothing here lets a call through that its gate refuses,
+//! and nothing consults it for a call. It answers one question for text Eitri itself puts in a turn: *might a deny rule
+//! cover this file?* Where it cannot tell it says yes, so a doubt leaves a file out and never puts one in.
+//!
+//! What the pinned CLI does with each written form was measured on it (CLI 2.1.311, `@path` through the SDK, one message
+//! naming four files and a link for each form, and read from the request the model got): a pattern with no slash names a file or a folder at any depth
+//! (`*.txt` kept out `sub/deep/leaf.txt`); a folder rule (`sub`, `./sub/`, `sub/*`) covers everything under it; `./x`,
+//! `/x` (from the project) and `//abs` (from the filesystem root) are anchored; `**` crosses folders; names are
+//! case-sensitive; a bare `Read` covers everything; `Edit(...)` rules do not stop a read; a rule in
+//! `settings.local.json` counts as one in `settings.json`; and a file reached through a link is held to the rules for
+//! its own name and for where it leads. This reader takes every written form as both anchored and at any depth, so it
+//! is never narrower than the CLI.
+//!
+//! Every tier is read whether or not the session will load it (an untrusted project's rules, a user tier switched
+//! off): a rule the CLI does not apply costs the person a file left out of a list, a rule missed costs a file read.
 
 use std::path::{Component, Path, PathBuf};
 
@@ -35,6 +42,20 @@ struct Rule {
     anchor: Anchor,
     /// The pattern's segments; `**` stands for any number of segments.
     segments: Vec<String>,
+    /// How many of them are not `**`: each takes one segment of a path, so a path with fewer has no match. Counted once,
+    /// here, since it is asked of every rule for every path.
+    fixed: usize,
+}
+
+impl Rule {
+    fn new(anchor: Anchor, segments: Vec<String>) -> Rule {
+        let fixed = segments.iter().filter(|segment| *segment != "**").count();
+        Rule {
+            anchor,
+            segments,
+            fixed,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -71,10 +92,36 @@ const ANCESTORS_MAX: usize = 64;
 /// The CLI's managed policy files: its Linux place and its macOS place, both read wherever this runs.
 const MANAGED_DIRS: [&str; 2] = ["/etc/claude-code", "/Library/Application Support/ClaudeCode"];
 
+/// Why a settings file was not read: the words for a person, and the kind of failure when the system gave one (matched,
+/// never its text, which is in the person's language).
+struct SettingsError {
+    why: String,
+    kind: Option<std::io::ErrorKind>,
+}
+
+impl SettingsError {
+    fn io(error: &std::io::Error) -> SettingsError {
+        SettingsError {
+            why: error.to_string(),
+            kind: Some(error.kind()),
+        }
+    }
+
+    fn other(why: String) -> SettingsError {
+        SettingsError { why, kind: None }
+    }
+}
+
+/// Whether a file that could not be read closes the reader: one of the project's own or the account's always does, one
+/// found in a folder above only when the reason is not that we may not look (the CLI could not read it either).
+fn closes(strict: bool, error: &SettingsError) -> bool {
+    strict || error.kind != Some(std::io::ErrorKind::PermissionDenied)
+}
+
 /// A settings file's bytes, or `None` when nothing is there. Opened without blocking, so a FIFO is not waited for, and
 /// looked at on the handle: only a regular file of at most [`FILE_MAX`] bytes is read, and a link to one is followed
 /// (a dotfile may be a link) while a link to `/dev/zero` is a device and refused unread.
-fn read_settings_file(path: &Path) -> Result<Option<Vec<u8>>, String> {
+fn read_settings_file(path: &Path) -> Result<Option<Vec<u8>>, SettingsError> {
     use std::io::Read as _;
     use std::os::unix::fs::OpenOptionsExt as _;
     let file = match std::fs::OpenOptions::new()
@@ -91,21 +138,22 @@ fn read_settings_file(path: &Path) -> Result<Option<Vec<u8>>, String> {
         {
             return Ok(None)
         }
-        Err(error) => return Err(error.to_string()),
+        Err(error) => return Err(SettingsError::io(&error)),
     };
-    let meta = file.metadata().map_err(|error| error.to_string())?;
+    let meta = file.metadata().map_err(|error| SettingsError::io(&error))?;
     if !meta.is_file() {
-        return Err("it is not a regular file".to_owned());
+        return Err(SettingsError::other("it is not a regular file".to_owned()));
     }
+    let too_large = || SettingsError::other(format!("it is larger than {} MiB", FILE_MAX / 1024 / 1024));
     if meta.len() > FILE_MAX {
-        return Err(format!("it is larger than {} MiB", FILE_MAX / 1024 / 1024));
+        return Err(too_large());
     }
     let mut bytes = Vec::new();
     file.take(FILE_MAX + 1)
         .read_to_end(&mut bytes)
-        .map_err(|error| error.to_string())?;
+        .map_err(|error| SettingsError::io(&error))?;
     if bytes.len() as u64 > FILE_MAX {
-        return Err(format!("it is larger than {} MiB", FILE_MAX / 1024 / 1024));
+        return Err(too_large());
     }
     Ok(Some(bytes))
 }
@@ -176,7 +224,7 @@ impl ReadRules {
             match read_settings_file(&file) {
                 Ok(Some(bytes)) => rules.add_settings(&bytes, root, home, &file),
                 Ok(None) => {}
-                Err(why) if strict || !why.contains("ermission denied") => rules.close(&file, &why),
+                Err(error) if closes(strict, &error) => rules.close(&file, &error.why),
                 Err(_) => {}
             }
         }
@@ -243,10 +291,10 @@ impl ReadRules {
             rules.extend(from_base.into_iter().filter_map(|rule| match rule.anchor {
                 Anchor::Anywhere => None,
                 Anchor::Absolute => Some(rule),
-                Anchor::Root => Some(Rule {
-                    anchor: Anchor::Absolute,
-                    segments: prefix.iter().cloned().chain(rule.segments).collect(),
-                }),
+                Anchor::Root => Some(Rule::new(
+                    Anchor::Absolute,
+                    prefix.iter().cloned().chain(rule.segments).collect(),
+                )),
             }));
         }
         // A rule that names the project's folder, or the filesystem's root, covers every file there is.
@@ -299,6 +347,9 @@ impl ReadRules {
                 Anchor::Root => (&below, false),
                 Anchor::Anywhere => (&below, true),
             };
+            if rule.fixed > haystack.len() {
+                return false;
+            }
             // A rule that covers a folder covers what is under it: it holds for any leading part of the path.
             (1..=haystack.len()).any(|len| {
                 let prefix = &haystack[..len];
@@ -332,7 +383,7 @@ fn rules_of(pattern: &str, root: &Path, home: Option<&Path>) -> (Vec<Rule>, bool
             covers_all = true;
             return;
         }
-        out.push(Rule { anchor, segments });
+        out.push(Rule::new(anchor, segments));
     };
     if let Some(rest) = pattern.strip_prefix("//") {
         push(Anchor::Absolute, rest);
@@ -375,6 +426,11 @@ fn lexical(path: &Path) -> PathBuf {
 /// the pattern and in the path at once, so a pattern with many `**` costs its length times the path's and no more:
 /// a project's settings are not trusted to keep it small.
 fn matches_segments(pattern: &[String], path: &[String]) -> bool {
+    // Each segment that is not `**` takes exactly one of the path's: a pattern with more of them than the path has
+    // matches nothing, and is not worked out.
+    if pattern.iter().filter(|segment| *segment != "**").count() > path.len() {
+        return false;
+    }
     let (rows, columns) = (pattern.len() + 1, path.len() + 1);
     // `reach[p][n]`: the first `p` segments of the pattern match the first `n` of the path.
     let mut reach = vec![vec![false; columns]; rows];
@@ -484,8 +540,8 @@ mod tests {
             .map(|name| rules.denies(Path::new(ROOT), &Path::new(ROOT).join(name)))
     }
 
-    /// Each row checks which of four files the pinned CLI excludes: small, secret, inner and leaf.
-    /// `true` means the file was kept out.
+    /// Each row is one of the forms measured on the pinned CLI and what it read there:
+    /// small, secret, inner, leaf. `true` is a file the CLI kept out.
     #[test]
     fn every_written_form_keeps_out_what_the_pinned_cli_keeps_out() {
         let none = [false, false, false, false];
@@ -544,10 +600,10 @@ mod tests {
     #[test]
     fn a_home_rule_and_a_parent_rule_are_anchored_where_they_say() {
         let home = rules(&["Read(~/notes/secret.txt)"]);
-        assert!(home.rules.contains(&Rule {
-            anchor: Anchor::Absolute,
-            segments: ["home", "me", "notes", "secret.txt"].map(String::from).to_vec()
-        }));
+        assert!(home.rules.contains(&Rule::new(
+            Anchor::Absolute,
+            ["home", "me", "notes", "secret.txt"].map(String::from).to_vec()
+        )));
         let parent = rules(&["Read(../project/secret.txt)"]);
         assert!(parent.denies(Path::new(ROOT), Path::new("/work/project/secret.txt")));
         let tilde = rules(&["Read(~/notes/*.md)"]);
@@ -801,5 +857,72 @@ mod tests {
         assert!(rules(&many)
             .closed()
             .is_some_and(|why| why.contains("more Read patterns")));
+    }
+
+    #[test]
+    fn a_folder_above_that_we_may_not_look_into_is_skipped_by_the_kind_of_the_error_and_not_by_its_words() {
+        let words_of_another_language = |kind| SettingsError {
+            why: "没有权限".to_owned(),
+            kind: Some(kind),
+        };
+        assert!(!closes(
+            false,
+            &words_of_another_language(std::io::ErrorKind::PermissionDenied)
+        ));
+        assert!(closes(
+            true,
+            &words_of_another_language(std::io::ErrorKind::PermissionDenied)
+        ));
+        assert!(closes(
+            false,
+            &words_of_another_language(std::io::ErrorKind::InvalidData)
+        ));
+        assert!(closes(
+            false,
+            &SettingsError::other("it is not a regular file".to_owned())
+        ));
+        // And really, in a folder above the project that denies us.
+        use std::os::unix::fs::PermissionsExt;
+        let dir = crate::state_dirs::test_workspace_dir("read-deny-eacces");
+        let (root, config) = (dir.join("above").join("project"), dir.join("config"));
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::create_dir_all(&config).unwrap();
+        let hidden = dir.join("above").join(".claude");
+        std::fs::create_dir_all(&hidden).unwrap();
+        std::fs::write(hidden.join("settings.json"), "{}").unwrap();
+        std::fs::set_permissions(&hidden, std::fs::Permissions::from_mode(0o000)).unwrap();
+        let rules = ReadRules::load(&root, Some(&config), None);
+        std::fs::set_permissions(&hidden, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let denied_to_us = std::fs::read(hidden.join("settings.json")).is_err();
+        // (A test run as root can look anyway, and then there is nothing to skip.)
+        assert!(rules.closed().is_none() || !denied_to_us, "{:?}", rules.closed());
+    }
+
+    #[test]
+    fn a_pattern_with_more_segments_than_the_path_is_not_worked_out() {
+        // Distinct, so that none is dropped as a repeat.
+        let many: Vec<String> = (0..62)
+            .map(|n| format!("Read(q{n}/{}x.txt)", "a/".repeat(2039)))
+            .collect();
+        let many: Vec<&str> = many.iter().map(String::as_str).collect();
+        let rules = rules(&many);
+        assert!(rules.closed().is_none());
+        let started = std::time::Instant::now();
+        for n in 0..50 {
+            assert!(!rules.denies(Path::new(ROOT), Path::new(&format!("/work/project/d/e/f{n}/g/h/i.txt"))));
+        }
+        assert!(
+            started.elapsed() < std::time::Duration::from_millis(500),
+            "{:?}",
+            started.elapsed()
+        );
+        assert!(matches_segments(
+            &["**".to_owned(), "x".to_owned()],
+            &["a".to_owned(), "x".to_owned()]
+        ));
+        assert!(!matches_segments(
+            &["a".to_owned(), "b".to_owned(), "c".to_owned()],
+            &["a".to_owned(), "b".to_owned()]
+        ));
     }
 }

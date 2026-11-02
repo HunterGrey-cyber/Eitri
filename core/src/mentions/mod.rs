@@ -1,15 +1,18 @@
-//! Expands `@buffers`, `@quickfix` and `@diagnostics` from the editor into the turn naming them.
+//! `@buffers`, `@quickfix` and `@diagnostics` in a Claude tab's composer: what the editor holds, put in the turn that
+//! names it.
 //!
-//! The CLI reads typed `@path` mentions itself; file mentions are not expanded here. These three
-//! names are editor data rather than files. When sending a message, the application reads nvim and
-//! appends each section between `[@name: ...]` and `[@name end]` lines.
+//! The CLI reads a typed `@path` itself, and Eitri has no expansion code for files. These
+//! three names are not files, so the CLI cannot read them, and the editor is the only place that has the answer: the
+//! host reads it from nvim when the message is sent and appends it to the turn as text, each section framed by a first
+//! line `[@name: ...]` and a last line `[@name end]`.
 //!
-//! Editor text passes through [`agent::mention::inert`] so embedded `@path` lines cannot become
-//! CLI mentions. It includes no file a direct `@file` mention could not read: files outside the
-//! project, files covered by CLI `Read` deny settings ([`agent::read_deny`]), and text read from
-//! a different path than the one named are excluded.
+//! That text is the editor's and not the person's, so two rules hold for all of it:
+//! - it passes through [`agent::mention::inert`], so a line of a buffer or a diagnostic's message that begins `@path`
+//!   is not read by the CLI as a mention;
+//! - it names no file `@file` could not read: nothing outside the project, nothing a `Read` deny rule of the CLI's
+//!   settings covers ([`agent::read_deny`]), nothing whose text was read from somewhere else than its name.
 //!
-//! [`blocks`] is pure: answers in, text out. [`gather`] asks the editor.
+//! [`blocks`] is pure: the answers in, the text out. [`gather`] asks the editor.
 
 pub mod blocks;
 pub mod gather;

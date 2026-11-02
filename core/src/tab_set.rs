@@ -5468,11 +5468,21 @@ impl TabSet {
 
     /// Tabs whose unsent text would go with the window: a tab that is not saved (it has no session yet, or `saving`
     /// says the window keeps no tabs), or text too long for the file. The window's close asks about these.
-    pub fn unsaved_draft_count(&self, saving: bool) -> usize {
+    ///
+    /// `held` is the words a tab has that are not in its draft yet (a message waiting for the editor), which a close
+    /// would put in the draft, after them what was typed since: the tab counts once.
+    pub fn unsaved_draft_count(&self, saving: bool, held: &std::collections::BTreeMap<TabId, String>) -> usize {
         self.tabs
             .iter()
-            .filter(|tab| !tab.draft().trim().is_empty())
-            .filter(|tab| !saving || !self.saves(tab) || crate::saved_tabs::draft_to_save(tab.draft()).is_none())
+            .filter_map(|tab| {
+                let text = match held.get(&tab.id) {
+                    Some(held) if !tab.draft().trim().is_empty() => format!("{held}\n\n{}", tab.draft()),
+                    Some(held) => held.clone(),
+                    None => tab.draft().to_owned(),
+                };
+                (!text.trim().is_empty()).then_some((tab, text))
+            })
+            .filter(|(tab, text)| !saving || !self.saves(tab) || crate::saved_tabs::draft_to_save(text).is_none())
             .count()
     }
 
@@ -13618,25 +13628,67 @@ mod tests {
             set.pump(&dir, true);
             set.get(tab).unwrap().provider_session_id().is_some()
         });
-        assert_eq!(set.unsaved_draft_count(true), 0);
+        assert_eq!(set.unsaved_draft_count(true, &Default::default()), 0);
         set.set_draft(tab, "still typing");
         let saved = set.saved_snapshot(PROJECT).unwrap();
         assert_eq!(saved.tabs[0].draft.as_deref(), Some("still typing"));
-        assert_eq!(set.unsaved_draft_count(true), 0, "`s` brings it back");
         assert_eq!(
-            set.unsaved_draft_count(false),
+            set.unsaved_draft_count(true, &Default::default()),
+            0,
+            "`s` brings it back"
+        );
+        assert_eq!(
+            set.unsaved_draft_count(false, &Default::default()),
             1,
             "a window that keeps no tabs loses it"
         );
         set.set_draft(tab, &"x".repeat(crate::saved_tabs::DRAFT_SAVE_MAX + 1));
         assert_eq!(set.saved_snapshot(PROJECT).unwrap().tabs[0].draft, None);
-        assert_eq!(set.unsaved_draft_count(true), 1, "too long for the file");
+        assert_eq!(
+            set.unsaved_draft_count(true, &Default::default()),
+            1,
+            "too long for the file"
+        );
         set.set_draft(tab, "   ");
-        assert_eq!(set.unsaved_draft_count(true), 0, "nothing was typed");
+        assert_eq!(
+            set.unsaved_draft_count(true, &Default::default()),
+            0,
+            "nothing was typed"
+        );
 
         let fresh = set.open(AgentId::Claude);
         set.set_draft(fresh, "no session yet");
-        assert_eq!(set.unsaved_draft_count(true), 1);
+        assert_eq!(set.unsaved_draft_count(true, &Default::default()), 1);
+        // Words held for the editor go to the draft at a close, ahead of what was typed since: one tab, counted once,
+        // and judged as the whole text, which can be too long for the file.
+        let held = std::collections::BTreeMap::from([(tab, "@buffers why".to_owned()), (fresh, "held".to_owned())]);
+        set.set_draft(tab, "and then");
+        assert_eq!(
+            set.unsaved_draft_count(true, &held),
+            1,
+            "`tab` is saved with both, `fresh` is not saved"
+        );
+        assert_eq!(
+            set.unsaved_draft_count(false, &held),
+            2,
+            "no saved tabs: both lose theirs"
+        );
+        // Each fits the file, both together do not: the tab is judged by what the close would save.
+        let half = "y".repeat(crate::saved_tabs::DRAFT_SAVE_MAX / 2 + 10);
+        set.set_draft(tab, &half);
+        let held = std::collections::BTreeMap::from([(tab, half.clone())]);
+        assert_eq!(
+            set.unsaved_draft_count(true, &held),
+            2,
+            "held words and draft are one text, too long: and `fresh`"
+        );
+        set.set_draft(tab, "   ");
+        let held = std::collections::BTreeMap::from([(tab, "x".repeat(crate::saved_tabs::DRAFT_SAVE_MAX + 1))]);
+        assert_eq!(
+            set.unsaved_draft_count(true, &held),
+            2,
+            "held words too long for the file, and `fresh`"
+        );
         shut_down_all(&mut set);
     }
 
