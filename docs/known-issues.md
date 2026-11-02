@@ -20,7 +20,12 @@ bug, and tell us if something here is wrong or has changed. The requirements are
 - **WebKitGTK 2.40 or newer** (the `webkitgtk-6.0` API) is required. The prebuilt binaries are built against
   glibc 2.39 and GTK 4.14; older versions are untested. Ubuntu 24.04, Debian 13, Fedora 40+, RHEL 10 and Arch
   meet this; Ubuntu 22.04 and Debian 12 do not.
-- **Neovim 0.10 or newer**: your own on `PATH`, or a private copy the installer offers to fetch.
+- **Neovim 0.10 or newer**: your own on `PATH`, or a private copy (0.12.6) the installer offers to fetch when
+  yours is older. A Neovim 0.11 on `PATH` is accepted and is not replaced, and three popular configurations still
+  fail on it: the current kickstart.nvim does not start (it uses `vim.pack`, new in 0.12), LazyVim loses Eitri's
+  `Ctrl+j` and `Ctrl+k` on the first start to its notification windows, and AstroNvim now and then keeps its own
+  `Ctrl+j` (seen once on 0.12.6 as well, so not tied to the version). The same LazyVim and kickstart checks pass on 0.12.6. If you
+  use one of them, keep 0.12 on `PATH` or point `EITRI_NVIM` at it.
 - **Claude Code**, installed and logged in, 2.1.252 or newer and below 3.0. Without it Eitri still opens and
   the editor works; the agent panel cannot run turns.
 - **Codex and other agents are optional.** A Codex tab needs `codex` 0.160.0 or newer, installed and signed in

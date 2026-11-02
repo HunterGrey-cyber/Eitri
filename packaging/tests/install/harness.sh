@@ -299,7 +299,7 @@ setup_skia_fixture() {
 # real hash, embedded by mk_release into RELEASE -- never the real pinned nvim's hash, since no test
 # unpacks the real nvim release.
 setup_nvim_fixtures() {
-	NVIM_FIXTURE_VERSION=0.11.2
+	NVIM_FIXTURE_VERSION=0.12.6
 	_nv_top=nvim-linux-x86_64
 	rm -rf "$S/fix/nvim-build"
 	mkdir -p "$S/fix/nvim-build/$_nv_top/bin"

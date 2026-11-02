@@ -196,7 +196,7 @@ _GOOD_RELEASE_FIELDS = {
     "NODE_VERSION": "v22.23.2",
     "NODE_SHA256_linux_x64": "e" * 64,
     "NODE_SHA256_linux_arm64": "f" * 64,
-    "NVIM_VERSION": "0.11.2",
+    "NVIM_VERSION": "0.12.6",
     "NVIM_SHA256_linux_x86_64": "0" * 64,
     "SKIA_BINARIES_ARCHIVE": "skia-binaries-0.153.3-x86_64-linux.tar.gz",
     "SKIA_BINARIES_SHA256": "1" * 64,
@@ -744,7 +744,7 @@ class RehearsalReleaseTests(unittest.TestCase):
         rc.validate_release(fields, rehearsal=True)
 
     def test_a_rehearsal_with_only_one_nvim_field_fails(self):
-        fields = self.rehearsal_fields(NVIM_VERSION="0.11.2")
+        fields = self.rehearsal_fields(NVIM_VERSION="0.12.6")
         with self.assertRaisesRegex(rc.ReleaseCheckError, "both nvim fields or neither"):
             rc.validate_release(fields, rehearsal=True)
 

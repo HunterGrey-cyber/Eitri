@@ -274,12 +274,12 @@ printf '%s\n' "$SC_VERSION" | sed -n 4p | grep -qFx 'executable sources served: 
 	fail "sidecar --version's 4th line is not 'executable sources served: host_cli'"
 
 say "=== nvim offer ==="
-NVIM_DIR="$XDG_DATA_HOME/eitri/nvim/0.11.2"
-[ -x "$NVIM_DIR/bin/nvim" ] || fail "the pinned nvim 0.11.2 was not fetched into $NVIM_DIR"
+NVIM_DIR="$XDG_DATA_HOME/eitri/nvim/0.12.6"
+[ -x "$NVIM_DIR/bin/nvim" ] || fail "the pinned nvim 0.12.6 was not fetched into $NVIM_DIR"
 if [ -x "$NVIM_DIR/bin/nvim" ]; then
 	NVOUT=$("$NVIM_DIR/bin/nvim" --version 2>&1 | head -n1)
 	say "private nvim --version: $NVOUT"
-	printf '%s\n' "$NVOUT" | grep -qF 'NVIM v0.11.2' || fail "the private nvim reports '$NVOUT', not NVIM v0.11.2"
+	printf '%s\n' "$NVOUT" | grep -qF 'NVIM v0.12.6' || fail "the private nvim reports '$NVOUT', not NVIM v0.12.6"
 	if ! ldd "$NVIM_DIR/bin/nvim" >ldd-nvim.log 2>&1; then
 		fail "ldd against the private nvim failed on this distro's glibc"
 	fi
