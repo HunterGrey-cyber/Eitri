@@ -1,6 +1,6 @@
-import { MAX_DIFF_LINES, type EditPreview } from "../diff";
+import { MAX_DIFF_LINES, type DiffLine, type EditPreview } from "../diff";
 import { useProjectRelative } from "../projectPath";
-import { countEscapes, revealHidden } from "../revealHidden";
+import { countEscapes, revealHidden, type RevealedPiece } from "../revealHidden";
 import { HiddenWarning, Revealed } from "./Revealed";
 
 /** What an `Edit`/`Write` call would do, shared by folded conversation rows (`maxLines`) and
@@ -98,31 +98,41 @@ export function EditDiff({
           than as part of a diff, because a diff missing lines is one you would approve anyway.
         </div>
       ) : (
-        <pre className="permission-card-diff">
-          {diff.map((line, i) => (
-            <div key={i} className={`diff-line diff-${line.kind}`}>
-              <span className="diff-gutter" aria-hidden="true">
-                {line.kind === "added" ? "+" : line.kind === "removed" ? "-" : " "}
-              </span>
-              <span className="diff-text">
-                <Revealed pieces={linePieces[i]} />
-              </span>
-            </div>
-          )).flatMap((row, i) =>
-            diff[i].noNewline === true
-              ? [
-                  row,
-                  <div key={`${i}-noeol`} className="diff-line diff-noeol">
-                    <span className="diff-gutter" aria-hidden="true">
-                      {" "}
-                    </span>
-                    <span className="diff-text">\ no line break at the end</span>
-                  </div>,
-                ]
-              : [row],
-          )}
-        </pre>
+        <DiffRows lines={diff} pieces={linePieces} />
       )}
     </div>
+  );
+}
+
+/** Shared text-only diff rows, including the mark for a missing final line break. */
+export function DiffRows({ lines, pieces = lines.map((line) => revealHidden(line.text)) }: {
+  lines: DiffLine[];
+  pieces?: RevealedPiece[][];
+}) {
+  return (
+    <pre className="permission-card-diff">
+      {lines.map((line, i) => (
+        <div key={i} className={`diff-line diff-${line.kind}`}>
+          <span className="diff-gutter" aria-hidden="true">
+            {line.kind === "added" ? "+" : line.kind === "removed" ? "-" : " "}
+          </span>
+          <span className="diff-text">
+            <Revealed pieces={pieces[i]} />
+          </span>
+        </div>
+      )).flatMap((row, i) =>
+        lines[i].noNewline === true
+          ? [
+              row,
+              <div key={`${i}-noeol`} className="diff-line diff-noeol">
+                <span className="diff-gutter" aria-hidden="true">
+                  {" "}
+                </span>
+                <span className="diff-text">\ no line break at the end</span>
+              </div>,
+            ]
+          : [row],
+      )}
+    </pre>
   );
 }

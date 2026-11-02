@@ -322,6 +322,68 @@ describe("installDispatch", () => {
       }
     });
 
+    it("accepts absent or well-formed instruction texts without changing their order", () => {
+      for (const texts of [undefined, [], [
+        { kind: "diff", path: "CLAUDE.md", added: 1, removed: 1, skippedAfter: 2, hunks: [
+          { skipped: 3, lines: [
+            { kind: "context", text: "same" }, { kind: "removed", text: "old" },
+            { kind: "added", text: "new", noNewline: true },
+          ] },
+        ] },
+        { kind: "plain", path: "AGENTS.md", line: "no earlier copy" },
+      ]]) {
+        const envelope = prompt({ changed: { added: [], removed: [], changed: [], texts } });
+        const { handler, warned } = dispatched(envelope);
+        expect(handler).toHaveBeenCalledWith(JSON.parse(JSON.stringify(envelope)));
+        expect(warned).toBe(false);
+      }
+    });
+
+    it("drops an envelope with malformed instruction texts", () => {
+      const line = { kind: "added", text: "new", noNewline: true };
+      const hunk = { skipped: 1, lines: [line] };
+      const diff = { kind: "diff", path: "CLAUDE.md", added: 1, removed: 0, skippedAfter: 1, hunks: [hunk] };
+      const plain = { kind: "plain", path: "AGENTS.md", line: "no earlier copy" };
+      const malformed: unknown[] = [null, {}, "text", 1, [null], ["text"], [1], [{}],
+        [{ kind: "diff", path: "old wire", before: "a", after: "b" }],
+        [{ ...diff, kind: "other" }], [{ ...plain, kind: undefined }],
+      ];
+      for (const entry of [diff, plain]) {
+        for (const field of Object.keys(entry).filter((key) => key !== "kind")) {
+          for (const value of [undefined, null, [], {}]) {
+            if (field === "hunks" && Array.isArray(value)) continue;
+            malformed.push([{ ...entry, [field]: value }]);
+          }
+          if (field === "path" || field === "line") {
+            for (const value of [1, true]) malformed.push([{ ...entry, [field]: value }]);
+          }
+        }
+      }
+      for (const field of ["added", "removed", "skippedAfter"]) {
+        for (const value of [-1, 0.5, "1", true]) malformed.push([{ ...diff, [field]: value }]);
+      }
+      for (const value of [undefined, null, -1, 0.5, "1", true, {}, []]) {
+        malformed.push([{ ...diff, hunks: [{ ...hunk, skipped: value }] }]);
+      }
+      for (const value of [null, 1, "hunk", [], {}]) malformed.push([{ ...diff, hunks: [value] }]);
+      for (const value of [undefined, null, 1, "lines", {}]) {
+        malformed.push([{ ...diff, hunks: [{ ...hunk, lines: value }] }]);
+      }
+      const badLines = [null, 1, "line", [], {},
+        ...[undefined, null, "other", 1, {}, []].map((kind) => ({ ...line, kind })),
+        ...[undefined, null, 1, true, {}, []].map((text) => ({ ...line, text })),
+        ...[null, false, 0, "true", {}, []].map((noNewline) => ({ ...line, noNewline })),
+      ];
+      for (const bad of badLines) malformed.push([{ ...diff, hunks: [{ ...hunk, lines: [bad] }] }]);
+      for (const texts of malformed) {
+        const { handler, warned } = dispatched(prompt({ changed: { added: [], removed: [], changed: [], texts } }));
+        expect(handler, JSON.stringify(texts)).not.toHaveBeenCalled();
+        expect(warned).toBe(true);
+      }
+      expect(dispatched(prompt({ changed: { added: [], removed: [], changed: [], texts: [diff, { ...plain, line: 1 }] } })).handler)
+        .not.toHaveBeenCalled();
+    });
+
     it("rejects a trust_prompt whose fingerprint or digest is not 64 hex digits", () => {
       const bad = [undefined, "", "a1".repeat(31), "A1".repeat(32), "zz".repeat(32), "a1".repeat(33), 5];
       for (const value of bad) {

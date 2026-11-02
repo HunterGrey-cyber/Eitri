@@ -162,6 +162,7 @@ mod tests {
                 .iter()
                 .map(|name| (name.to_string(), ServerDefinition::of(&toml::Value::Boolean(true))))
                 .collect(),
+            instructions: BTreeMap::new(),
         }
     }
 

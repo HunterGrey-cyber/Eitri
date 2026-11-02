@@ -1,6 +1,6 @@
 //! The walk over a root's configuration, and its fingerprint.
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::ffi::{OsStr, OsString};
 use std::os::unix::ffi::OsStrExt;
 use std::path::{Path, PathBuf};
@@ -13,6 +13,7 @@ use super::codex::{
 };
 use super::findings::{frontmatter_keys, mcp_findings, settings_findings};
 use super::git_top::git_top_level;
+use super::last_trusted::Kept;
 use super::nofollow::{follow_within, normalize_lexically, DirHandle, FileKind, Followed, Owner, Reached, Refusal};
 use super::{Discovery, Entry, EntryKind, Finding, Fingerprint, Limits, Profile, ProfileEnv};
 
@@ -179,6 +180,8 @@ struct Scan<'a> {
     project_servers: Vec<(String, ServerDefinition)>,
     /// The alternate names of `AGENTS.md` each project `.codex/config.toml` read gives.
     project_fallback_names: Vec<String>,
+    /// What can be compared later of each instruction file read.
+    instructions: BTreeMap<PathBuf, Kept>,
 }
 
 /// A size as a person reads it: `4 MiB`, `16 KiB`, `100 bytes`.
@@ -387,6 +390,15 @@ impl Scan<'_> {
             Ok(bytes) => {
                 self.total_bytes += bytes.len() as u64;
                 let sha256: [u8; 32] = Sha256::digest(&bytes).into();
+                if is_instruction_file(role, &path) {
+                    // The record names a file by its path as text: a name that is not UTF-8 can share
+                    // that text with another file, so it has no text here to be mistaken for that one's.
+                    let kept = match path.to_str() {
+                        Some(_) => Kept::of(&bytes, link.is_some()),
+                        None => Kept::NotText,
+                    };
+                    self.instructions.insert(path.clone(), kept);
+                }
                 match role {
                     Role::Settings => self.findings.extend(settings_findings(&path, &bytes)),
                     Role::Mcp => self.findings.extend(mcp_findings(&path, &bytes)),
@@ -1029,6 +1041,17 @@ fn plain_names(names: &[String], dirs_allowed: bool) -> (Vec<(OsString, bool)>, 
     (plain, refused)
 }
 
+/// Whether the agent puts this file's text into its prompt: a memory file, or Markdown in a walked
+/// `.claude/rules/`, which reaches the CLI as a memory file does though the prompt names it by size.
+fn is_instruction_file(role: Role, path: &Path) -> bool {
+    let in_claude_rules = || {
+        let names: Vec<&OsStr> = path.iter().collect();
+        path.extension() == Some(OsStr::new("md"))
+            && names.windows(2).any(|pair| pair[0] == ".claude" && pair[1] == "rules")
+    };
+    role == Role::Memory || (role == Role::ClaudeOther && in_claude_rules())
+}
+
 /// What a name directly in `.claude/` (depth 0) or below it means to the CLI.
 fn role_in(depth: usize, name: &OsStr) -> Role {
     if depth != 0 {
@@ -1144,6 +1167,7 @@ pub fn discover(root: &Path, home: Option<&Path>, limits: &Limits, profile: &Pro
         total_bytes: 0,
         project_servers: Vec::new(),
         project_fallback_names: Vec::new(),
+        instructions: BTreeMap::new(),
     };
     for finding in walk.findings {
         if let Finding::GitUnverified { path, reason, target } = finding {
@@ -1264,6 +1288,16 @@ pub fn discover(root: &Path, home: Option<&Path>, limits: &Limits, profile: &Pro
         findings.push(Finding::OverBudget { reason: reason.clone() });
     }
     let fingerprint = fingerprint(profile, root, &top, &entries, over_budget.as_deref());
+    // A file below a linked directory was reached through that link, as one behind a link of its own was.
+    let mut instructions = scan.instructions;
+    for link in entries
+        .iter()
+        .filter(|entry| matches!(entry.kind, EntryKind::Symlink { .. }))
+    {
+        for (_, kept) in instructions.iter_mut().filter(|(path, _)| path.starts_with(&link.path)) {
+            *kept = Kept::Link;
+        }
+    }
     Discovery {
         profile: profile.clone(),
         root: root.to_path_buf(),
@@ -1276,6 +1310,7 @@ pub fn discover(root: &Path, home: Option<&Path>, limits: &Limits, profile: &Pro
         user_mcp_servers: env.user_mcp_servers.clone(),
         user_mcp_names: env.user_mcp_names.clone(),
         project_mcp_servers: scan.project_servers,
+        instructions,
     }
 }
 
@@ -1312,6 +1347,7 @@ mod tests {
             total_bytes: 0,
             project_servers: Vec::new(),
             project_fallback_names: Vec::new(),
+            instructions: BTreeMap::new(),
         }
     }
 

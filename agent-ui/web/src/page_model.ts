@@ -73,9 +73,10 @@ export type CommandRecord = {
 
 /** The footer's y/n prompt, or `null` when none is open. It is drawn in place of the which-key strip and takes
  *  every key while it is open. Every kind that asks before something irreversible (`bypass`, `restore`, `trust`,
- *  `stop_background`) carries `openedAt`, stamped on the monotonic clock the moment its envelope is recorded, so
- *  it shares a clock with the guard that refuses a `y` given before the prompt had been on screen long enough. A
- *  second envelope while one is open replaces the whole object, restarting that wait along with everything else.
+ *  `stop_background`) carries `openedAt`, stamped on the monotonic clock the moment its envelope is recorded: it says
+ *  which asking this is, and each new one starts the guard over, from when it was painted (`App.tsx`'s
+ *  `answerableFromRef`), which refuses a `y` given before the prompt had been on screen long enough. A second
+ *  envelope while one is open replaces the whole object, restarting that wait along with everything else.
  *  Values that came from Rust (`tab`, `scope`, `nonce`, `lines`) are echoed back verbatim on the answer: this
  *  side never counts cards or invents a nonce. */
 export type Confirmation =

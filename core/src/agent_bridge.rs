@@ -2480,6 +2480,45 @@ pub struct TrustDiffView {
     pub added: Vec<String>,
     pub removed: Vec<String>,
     pub changed: Vec<String>,
+    /// What can be shown of the instruction files among them. Absent on the wire when empty.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub texts: Vec<TrustTextView>,
+}
+
+/// One instruction file at a question about a change: the rows of its diff as the worker folded them,
+/// or the line that says why there is none. Row text and `path` are repository text.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum TrustTextView {
+    Diff {
+        path: String,
+        added: usize,
+        removed: usize,
+        #[serde(rename = "skippedAfter")]
+        skipped_after: usize,
+        hunks: Vec<TrustHunkView>,
+    },
+    Plain {
+        path: String,
+        line: String,
+    },
+}
+
+/// A run of drawn rows, after `skipped` unchanged lines folded away.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct TrustHunkView {
+    pub skipped: usize,
+    pub lines: Vec<TrustLineView>,
+}
+
+/// One row: `kind` is `context`, `added` or `removed`. `noNewline` is left out unless the line ends its
+/// side with no line break where the other side has one.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct TrustLineView {
+    pub kind: &'static str,
+    pub text: String,
+    #[serde(rename = "noNewline", skip_serializing_if = "std::ops::Not::not")]
+    pub no_newline: bool,
 }
 
 /// One thing the prompt shows. `value` is the raw text and is shown whole: a value cut for display
@@ -9108,6 +9147,7 @@ mod tests {
             added: vec![".mcp.json".into()],
             removed: vec![],
             changed: vec![".claude/settings.json".into()],
+            texts: vec![],
         });
         let sent: Value = serde_json::from_str(&serialize_trust_prompt_for_js(&changed)).unwrap();
         assert_eq!(sent["state"], "changed");
@@ -9119,6 +9159,52 @@ mod tests {
         assert_eq!(
             sent["changed"],
             json!({"added": [".mcp.json"], "removed": [], "changed": [".claude/settings.json"]})
+        );
+
+        // What can be shown of an instruction file travels whole, each kind by name.
+        let mut texts = changed.clone();
+        texts.changed.as_mut().unwrap().texts = vec![
+            TrustTextView::Diff {
+                path: "CLAUDE.md".into(),
+                added: 1,
+                removed: 1,
+                skipped_after: 4,
+                hunks: vec![TrustHunkView {
+                    skipped: 2,
+                    lines: vec![
+                        TrustLineView {
+                            kind: "removed",
+                            text: "a".into(),
+                            no_newline: false,
+                        },
+                        TrustLineView {
+                            kind: "added",
+                            text: "b".into(),
+                            no_newline: true,
+                        },
+                    ],
+                }],
+            },
+            TrustTextView::Plain {
+                path: "AGENTS.md".into(),
+                line: "a link, so no diff".into(),
+            },
+        ];
+        let sent: Value = serde_json::from_str(&serialize_trust_prompt_for_js(&texts)).unwrap();
+        assert_eq!(
+            sent["changed"]["texts"],
+            json!([
+                {"kind": "diff", "path": "CLAUDE.md", "added": 1, "removed": 1, "skippedAfter": 4, "hunks": [{
+                    "skipped": 2,
+                    "lines": [{"kind": "removed", "text": "a"}, {"kind": "added", "text": "b", "noNewline": true}],
+                }]},
+                {"kind": "plain", "path": "AGENTS.md", "line": "a link, so no diff"},
+            ])
+        );
+        assert_ne!(
+            texts.findings_digest(),
+            changed.findings_digest(),
+            "an answer is bound to the diff it was shown beside"
         );
 
         let mut window = prompt();
@@ -9159,6 +9245,7 @@ mod tests {
                         added: vec!["a".into()],
                         removed: vec![],
                         changed: vec![],
+                        texts: vec![],
                     });
                 }),
             ),

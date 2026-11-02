@@ -26,9 +26,11 @@ mod codex;
 mod discover;
 mod findings;
 pub mod git_top;
+mod last_trusted;
 pub mod nofollow;
 mod plan;
 mod store;
+mod text_diff;
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
@@ -40,8 +42,10 @@ pub use codex::{
 pub use discover::discover;
 pub use findings::{mcp_findings, settings_findings};
 pub use git_top::{git_top_level, GitWalk};
+pub use last_trusted::{ChangedText, Kept, NoDiff, MAX_KEPT_BYTES, MAX_KEPT_FILE_BYTES};
 pub use plan::{eitri_server_name, eitri_server_taken, trust_plan, EditorServerName, NonUtf8};
 pub use store::{civil_date, for_root, Diff, Remember, TrustState, TrustStore, DISCLOSURE};
+pub use text_diff::{text_diff, Budget, Hunk, LineKind, TextDiff, MAX_QUESTION_ROWS, MAX_QUESTION_STEPS};
 
 /// How much discovery may look at before it stops and says so.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -203,6 +207,10 @@ pub struct Discovery {
     /// or parsed adds nothing here, and the entries and findings say so. Not part of the fingerprint,
     /// which already holds the files it is read from. Empty for every other profile.
     pub project_mcp_servers: Vec<(String, ServerDefinition)>,
+    /// What can be compared later of each instruction file read: the agent's memory files and
+    /// `.claude/rules/` Markdown, from the same read that hashed them, so this text is exactly what the
+    /// fingerprint covers. Shown at a later question and never part of the fingerprint.
+    pub instructions: BTreeMap<PathBuf, Kept>,
 }
 
 impl Discovery {

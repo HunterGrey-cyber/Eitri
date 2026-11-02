@@ -65,6 +65,23 @@ export function revealHidden(text: string): RevealedPiece[] {
   return pieces;
 }
 
+/** A path is one name, so even a newline or tab must stay visibly inside that name. */
+export function revealPath(text: string): RevealedPiece[] {
+  const pieces: RevealedPiece[] = [];
+  for (const piece of revealHidden(text)) {
+    if ("escape" in piece) {
+      pieces.push(piece);
+      continue;
+    }
+    const parts = piece.text.split(/([\n\t\r])/);
+    for (const part of parts) {
+      if (part === "\n" || part === "\t" || part === "\r") pieces.push({ escape: escapeOf(part) });
+      else if (part !== "") pieces.push({ text: part });
+    }
+  }
+  return pieces;
+}
+
 export function countEscapes(pieces: RevealedPiece[]): number {
   return pieces.filter((piece) => "escape" in piece).length;
 }

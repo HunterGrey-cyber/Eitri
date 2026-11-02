@@ -293,6 +293,14 @@ project cannot be trusted in Eitri at all.
   Claude Code's own "don't ask again", which writes `.claude/settings.local.json`. It is also tied to how much
   the question showed: when a release makes the question show more than before, every project you had trusted
   is asked once more, even if nothing in it changed.
+- **A change to an instruction file shows as a diff.** When `CLAUDE.md`, `CLAUDE.local.md`, `.claude/CLAUDE.md`, a
+  Markdown file under `.claude/rules/`, `AGENTS.md` or a registered agent's named file differs from what you last
+  trusted, the question shows the change below everything else it lists, with unchanged lines folded. Eitri compares
+  against a copy it kept at your last `y`. A file with no copy to compare (new since then, or you last answered on an
+  older version), over 256 KiB then or now, past the 1 MiB kept for a project, not text, or reached through a link gets
+  one line saying so. So does a change too long for the question: at most 2,000 rows are drawn across all the files.
+  Near the question's own 2 MiB limit the diffs give way to those lines, and at the very limit the section is left out.
+  The question is the same question either way. Hooks, MCP servers and settings are always shown whole, so they need no diff.
 - **`n` is remembered only for this window**, for that same content, and only when Eitri could check everything
   (see the next point); otherwise the question comes back at the next start in the window. Another window asks
   for itself.
@@ -319,7 +327,9 @@ project cannot be trusted in Eitri at all.
 it loaded.
 
 **Where it is kept.** One small record per project under `~/.local/state/eitri/trust/` (`$XDG_STATE_HOME/eitri/trust/` when that is
-set to an absolute path). Deleting that directory forgets every answer for windows started afterwards. A window
+set to an absolute path), and beside it a copy of the instruction files as you last trusted them, `CLAUDE.local.md`
+included: at most 1 MiB per project and agent, usually about the size of those files, readable only by you, and
+never sent anywhere. `:untrust` deletes both. Deleting that directory forgets every answer for windows started afterwards. A window
 that already has your answer keeps using it until you run `:untrust` or restart it. Eitri does not read the trust answer of terminal `claude` and terminal `claude` does not
 see Eitri's, so a project you trusted in a terminal asks once more here.
 

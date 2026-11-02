@@ -1794,7 +1794,14 @@ fn project_trust_touches_the_disk_only_through_nofollow() {
         "libc::",
         "permission_policy",
     ];
-    for name in ["mod.rs", "discover.rs", "findings.rs", "git_top.rs"] {
+    for name in [
+        "mod.rs",
+        "discover.rs",
+        "findings.rs",
+        "git_top.rs",
+        "last_trusted.rs",
+        "text_diff.rs",
+    ] {
         let source = std::fs::read_to_string(dir.join(name)).unwrap_or_else(|e| panic!("{name}: {e}"));
         assert!(source.len() > 200, "{name} is present");
         let squeezed: String = source.chars().filter(|c| !c.is_whitespace()).collect();

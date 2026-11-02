@@ -25,7 +25,8 @@ import type { KeyLike, PanelBinding, PanelMode, PendingPrefix, PluginKeysHelp } 
 import { advanceSequence, boxEntries, FIXED_PENDING_ENTRIES, sequenceTitle, startSequence, WHICH_KEY_DELAY_MS } from "./leader";
 import type { BoxEntry, SeqStep } from "./leader";
 import { isImeKey } from "./composerKeys";
-import { bypassYesCounts, isModeCycleKey, isShiftTab, modeFixedMessage, modeKeyRoute } from "./modeKey";
+import { afterPaint } from "./afterPaint";
+import { bypassYesCounts, isModeCycleKey, isShiftTab, KeyClock, modeFixedMessage, modeKeyRoute } from "./modeKey";
 import { heldKeyName, hintTypingFlash, isModifierKey, leaderTypingFlash, tableKeyTypingFlash, TYPE_HINT_FLASH, TYPING_GUARD_MS, TypingGuard } from "./typingGuard";
 import {
   caretModelOf,
@@ -1658,8 +1659,26 @@ export default function App() {
   chooserOpenRef.current = chooser !== null;
   const tabsRef = useRef<TabsEnvelope | null>(null);
   tabsRef.current = tabs;
+  /** When the y/n question on screen was painted, `Infinity` until it has been: the moment a `y` starts counting from,
+   *  so one pressed while the question was still being drawn answers nothing. Taken for each asking in a layout
+   *  effect, before any key can be handled against it. */
+  const answerableFromRef = useRef(Infinity);
+  const askedAt = confirm !== null && "openedAt" in confirm ? confirm.openedAt : null;
+  useLayoutEffect(() => {
+    answerableFromRef.current = Infinity;
+    if (askedAt === null) return;
+    return afterPaint(() => {
+      answerableFromRef.current = performance.now();
+    });
+  }, [askedAt]);
+  /** What the answer guard needs of the key being handled, whose press the document-capture listener has recorded. */
+  const answerClock = () => ({
+    now: currentKeyAtRef.current,
+    openedAt: answerableFromRef.current,
+    lastKeyAt: lastKeyAtRef.current,
+  });
   /** The last non-modifier keydown seen ANYWHERE in the panel BEFORE the one currently being
-   *  processed -- read by `answerConfirm`'s `bypassYesCounts` check. Deliberately one keystroke
+   *  processed, as pressed (`KeyClock`) -- read by `answerConfirm`'s `bypassYesCounts` check. Deliberately one keystroke
    *  BEHIND `currentKeyAtRef` (below): the document-capture effect that maintains both runs in the
    *  CAPTURE phase, which always fires before the bubble-phase `onKeyDown` that calls
    *  `answerConfirm` for the very same event -- so if this ref held the CURRENT keystroke's own
@@ -1671,6 +1690,7 @@ export default function App() {
   /** The running "most recent non-modifier keydown" clock `lastKeyAtRef` lags one keystroke behind;
    *  private to the document-capture effect below. */
   const currentKeyAtRef = useRef(-Infinity);
+  const keyClockRef = useRef(new KeyClock());
   /** The key `answerConfirm` last consumed from a y/n
    *  prompt -- answered or cancelled, either way -- so its own auto-repeats can be swallowed rather
    *  than falling through as an ordinary key once `confirm` is null again. Mirrors
@@ -2013,7 +2033,7 @@ export default function App() {
       // runs before the bubble-phase `answerConfirm` that would read it for THIS SAME keydown.
       if (!isModifierKey(event.key)) {
         lastKeyAtRef.current = currentKeyAtRef.current;
-        currentKeyAtRef.current = performance.now();
+        currentKeyAtRef.current = keyClockRef.current.pressedAt(event, performance.now());
       }
       if (!isModeCycleKey(event)) return;
       if (event.target instanceof Element && event.target.closest(".question-dock")) return;
@@ -4173,7 +4193,7 @@ export default function App() {
           if (
             plain &&
             !event.repeat &&
-            bypassYesCounts({ now: performance.now(), openedAt: confirm.openedAt, lastKeyAt: lastKeyAtRef.current })
+            bypassYesCounts(answerClock())
           ) {
             postToRust({
               type: "confirm_bypass",
@@ -4199,9 +4219,7 @@ export default function App() {
         const pendingG = trustPendingGRef.current;
         trustPendingGRef.current = false;
         const action = resolveTrustKey(event.nativeEvent as unknown as TrustKeyEvent, {
-          now: performance.now(),
-          openedAt: confirm.openedAt,
-          lastKeyAt: lastKeyAtRef.current,
+          ...answerClock(),
           pendingG,
           onlyN: confirm.view.state === "too_large",
         });
@@ -4249,7 +4267,7 @@ export default function App() {
             no ||
             (plain &&
               !event.repeat &&
-              bypassYesCounts({ now: performance.now(), openedAt: confirm.openedAt, lastKeyAt: lastKeyAtRef.current }));
+              bypassYesCounts(answerClock()));
           if (counts) {
             postToRust({
               type: "restore_answer",
@@ -4275,7 +4293,7 @@ export default function App() {
           if (
             !plain ||
             event.repeat ||
-            !bypassYesCounts({ now: performance.now(), openedAt: confirm.openedAt, lastKeyAt: lastKeyAtRef.current })
+            !bypassYesCounts(answerClock())
           ) {
             showFlash("y must be pressed on its own to stop them; nothing was stopped");
           } else if (activeTab?.id !== confirm.tab || activeTab?.state !== "live" || running === 0) {

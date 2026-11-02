@@ -1659,6 +1659,50 @@ pre {
   font-size: var(--fs-sm);
   line-height: 1.65;
 }
+.trust-text-diff {
+  border: 1px solid var(--rule-soft);
+  border-radius: 8px;
+  margin: 12px 0;
+  font-family: var(--nv-font-mono);
+}
+.trust-text-diff-head {
+  display: flex;
+  align-items: baseline;
+  gap: 12px;
+  border-bottom: 1px solid var(--rule-soft);
+  padding: 8px 12px;
+  font-size: var(--fs-sm);
+}
+.trust-text-path, .trust-text-line {
+  min-width: 0;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+  direction: ltr;
+  unicode-bidi: bidi-override;
+}
+.trust-text-line {
+  font-family: var(--nv-font-mono);
+  font-size: var(--fs-sm);
+}
+.trust-text-diff .permission-card-diff {
+  overflow: visible;
+  margin: 0;
+}
+.trust-text-diff .diff-line {
+  min-width: 0;
+}
+.trust-text-diff .diff-text {
+  /* A flex item starts its own run, so the override on the block above does not reach this text. */
+  unicode-bidi: bidi-override;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+}
+.trust-diff-gap {
+  padding: 6px 12px;
+  color: var(--nv-muted);
+  font-size: var(--fs-xs);
+  font-family: var(--nv-font-mono);
+}
 .trust-footer {
   border-top: 1px solid var(--rule-soft);
   padding-top: 16px;

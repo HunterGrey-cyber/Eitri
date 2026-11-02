@@ -76,11 +76,37 @@ export function modeFixedMessage(resetKey: string): string {
  *  arriving". */
 export const BYPASS_YES_GUARD_MS = TYPING_GUARD_MS;
 
-/** Both halves of that guard, pure and clock-injected (`performance.now()` at the call site, never
- *  `event.timeStamp`, so tests can control it). `lastKeyAt` is the last non-modifier keydown
- *  strictly BEFORE this one -- see `App.tsx`'s document-capture listener, which records it for every
- *  keydown in the panel before any routing, so a key typed into any handler (the composer, a card's
- *  reason box, the leader engine) counts, not just ones this module itself sees. */
+/** No key waits this long in the queue of a page that keeps answering: every key lagging by more says the stamps are
+ *  on another clock. */
+export const OTHER_CLOCK_LAG_MS = 10_000;
+
+/** When each keydown was pressed, on `performance.now()`'s clock. A page that is busy queues keys, so the time a key is
+ *  handled says nothing about what was on screen at the press; `event.timeStamp` does.
+ *
+ *  The handling time stands in where a stamp cannot be this clock: none at all, or one in the future (a test's faked
+ *  `Date`, or a compositor's clock running ahead). It does for a repeat too: GDK stamps every repeat of a held key with
+ *  the press, so the stamp stands still while the key is held. A clock running behind is told by the keys themselves:
+ *  when at least two have come and even the least lagged is past `OTHER_CLOCK_LAG_MS`, that lag is the clocks' offset
+ *  and is taken off. One key's lag alone proves nothing, so a key held up by a long stall keeps its own press. */
+export class KeyClock {
+  private leastLag = Infinity;
+  private keys = 0;
+
+  pressedAt(event: { timeStamp: number; repeat?: boolean }, handledAt: number): number {
+    const stamp = event.timeStamp;
+    if (event.repeat === true || stamp <= 0 || stamp > handledAt) return handledAt;
+    this.leastLag = Math.min(this.leastLag, handledAt - stamp);
+    this.keys += 1;
+    return this.keys >= 2 && this.leastLag > OTHER_CLOCK_LAG_MS ? stamp + this.leastLag : stamp;
+  }
+}
+
+/** Both halves of that guard, pure and clock-injected. `now` is this key's press (`KeyClock`), so a key pressed
+ *  before the question was painted never counts, however late it is handled. `openedAt` is when the question was
+ *  painted, `Infinity` until then (`App.tsx`'s `answerableFromRef`). `lastKeyAt` is the press of the last non-modifier
+ *  keydown strictly BEFORE this one -- see `App.tsx`'s document-capture listener, which records it for every keydown
+ *  in the panel before any routing, so a key typed into any handler (the composer, a card's reason box, the leader
+ *  engine) counts, not just ones this module itself sees. */
 export function bypassYesCounts({ now, openedAt, lastKeyAt }: { now: number; openedAt: number; lastKeyAt: number }): boolean {
   return now - openedAt >= BYPASS_YES_GUARD_MS && now - lastKeyAt >= BYPASS_YES_GUARD_MS;
 }

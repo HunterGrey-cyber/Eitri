@@ -1,5 +1,5 @@
 [English](permissions.md) | 简体中文
-<!-- translated-from: permissions.md sha256=c054e05dfa405d7a8850d895724771e40b54b07c3068eaefa2598b8861f889af -->
+<!-- translated-from: permissions.md sha256=e342df47e482e1e47e02d9f5b6b4109509dc1785bd348f36ab78b310c1efc4a3 -->
 
 # 权限与信任
 
@@ -149,6 +149,7 @@ Claude Code 的 `Workflow` 工具的卡片写着 `Run a dynamic workflow?`。它
 
 - `y` 信任这个项目并加载它的配置，但[不算边界的文件夹](#a-folder-that-is-no-boundary)里的 Codex 标签页除外，它仍然不带这份配置启动。`n` 不带它启动会话。`Esc` 把这个问题推后：第一条消息回到输入框里，继续一个会话则被丢弃，并给出一条 “not started: the trust question was put off” 的消息。以这种方式推后的恢复会保留它的会话：这些标签页会作为失败的标签页回来，仍然保存着各自的对话（在标签页里按 `r` 再次启动它），而你从空标签页的 `Restore last session` 那一行发起的恢复，只要那个标签页仍是空的，就仍然留在那里供你再选（否则它的标签页同样作为失败的标签页回来）。`y` 和 `n` 只有单独按下、并且在问题出现片刻之后按才算数；太早敲的键会闪出 “wait a moment, then y or n”。
 - **`y` 按项目记住，并且和你看到的内容严格绑定。** 这些文件的任何变化都会再问一次，并列出加了什么、去掉了什么、改了什么。这包括 agent 在 `.claude/` 下做的一次编辑，以及 Claude Code 自己的 “don't ask again”（它会写 `.claude/settings.local.json`）。它还和问题当时显示了多少内容绑定：某个版本让问题显示得比以前更多时，你信任过的每个项目都会再被问一次，即使项目里什么都没变。
+- **指令文件的变化以 diff 显示。** 当 `CLAUDE.md`、`CLAUDE.local.md`、`.claude/CLAUDE.md`、`.claude/rules/` 下的 Markdown 文件、`AGENTS.md` 或已注册 agent 指定的文件和你上次信任时不同，问题会在所列内容的最后显示改动，没变的行折叠起来。Eitri 比较的是你上次按 `y` 时留下的副本。没有副本可比（之后才新增，或你上次是在旧版本上回答的）、当时或现在超过 256 KiB、超出每个项目保留的 1 MiB、不是文本、或经由链接读到的文件，都只有一行说明。太长、放不进问题的改动也一样：所有文件加起来最多画 2,000 行。接近问题本身的 2 MiB 上限时，diff 会退成这些说明行，到了上限这一节就不显示。无论哪种情况，问的都是同一个问题。hook、MCP 服务器和设置总是完整显示，所以不需要 diff。
 - **`n` 只对这个窗口记住**，只针对同样的内容，并且只在 Eitri 能检查所有东西时才记住（见下一条）；否则这个问题会在这个窗口的下一次启动时回来。另一个窗口自己再问。
 - **Eitri 检查不了的东西，会让信任只持续一次启动。** 超过 4 MiB 的文件、读不了的文件、管道或其他特殊文件、不是合法 JSON 的设置文件或 `.mcp.json`（“could not be parsed for this check”）、Eitri 跟不过去的符号链接（顶替了某个配置文件，或在 `.claude/` 下）、仓库之上那些既不属于你也不属于 root 的文件，或者文件太多的项目，会在问题里被点名为 “cannot be checked”，这时 `y` 只覆盖这一次启动；什么都不保存，下一次启动再问。在 Claude 标签页里，`.claude/` 下的符号链接，或顶替 `CLAUDE.md`、`CLAUDE.local.md` 的符号链接，如果用相对路径指向仓库内部（项目不在仓库里时，指项目文件夹内部），Eitri 会跟过去；Codex 标签页里 `.codex/skills/` 内的符号链接也一样。Eitri 检查它指向的内容，并连同目标一起显示，所以在 `.claude/skills/` 和 `.codex/skills/` 之间链接的 skill、链接到 `AGENTS.md` 的 `CLAUDE.md` 都和其他文件一样会被记住。离开这个范围的链接、绝对路径和循环链接都检查不了。如果你的主目录在仓库里面，或者项目之上有 `.git` 但都无法验证，任何链接都不会被跟随。
 - **非常大的配置只对这个窗口记住。** 如果一次回答的记录会超过 1 MiB（大约 1,900 个长文件名的文件），问题里会这么说，`y` 只在这个窗口里有效；不写任何记录，所以新窗口会再问。
@@ -156,7 +157,7 @@ Claude Code 的 `Workflow` 工具的卡片写着 `Run a dynamic workflow?`。它
 
 **命令。** 面板命令行上的 `:trust`（在浏览模式里按 `:`；见[命令行](keys.zh-CN.md#the-command-line)）显示同样的问题，在你回答之前不记录任何东西。`:untrust` 立即忘掉这个回答，当前窗口里的也一样。两者都对之后启动的会话生效：正在运行的会话保留它已经加载的东西。
 
-**它存在哪里。** 每个项目一个小记录，位于 `~/.local/state/eitri/trust/` 下（`$XDG_STATE_HOME` 设为绝对路径时用 `$XDG_STATE_HOME/eitri/trust/`）。删掉这个目录，之后启动的窗口就忘掉每一个回答。已经拿到你回答的窗口会继续用它，直到你运行 `:untrust` 或重启它。Eitri 不读终端里 `claude` 的信任回答，终端里的 `claude` 也看不到 Eitri 的，所以你在终端里信任过的项目，在这里还要再问一次。
+**它存在哪里。** 每个项目一个小记录，位于 `~/.local/state/eitri/trust/` 下（`$XDG_STATE_HOME` 设为绝对路径时用 `$XDG_STATE_HOME/eitri/trust/`），旁边还有一份你上次信任时的指令文件副本，包括 `CLAUDE.local.md`：每个项目每个 agent 最多 1 MiB，通常和这些文件差不多大，只有你能读，不会发送到任何地方。`:untrust` 会把两者都删掉。删掉这个目录，之后启动的窗口就忘掉每一个回答。已经拿到你回答的窗口会继续用它，直到你运行 `:untrust` 或重启它。Eitri 不读终端里 `claude` 的信任回答，终端里的 `claude` 也看不到 Eitri 的，所以你在终端里信任过的项目，在这里还要再问一次。
 
 <a id="what-an-agent-session-loads"></a>
 ## 一个 agent 会话会加载什么

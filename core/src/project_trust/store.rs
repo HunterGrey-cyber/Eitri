@@ -6,6 +6,11 @@
 //! Trust is exact to the root and agent: parents, children and other agents have separate records.
 //! No other program's notion of trust is read.
 //!
+//! Beside a record lies `<record>~last-trusted`, the instruction files as that `y` saw them
+//! ([`super::last_trusted`]). It is written after the record, removed with it, and reads as nothing
+//! when it is missing or does not match: only the record decides. A profile's key never holds a `~`,
+//! so no agent's record can have that name.
+//!
 //! A record that cannot be used (missing, not JSON, another version, another root, owned by
 //! someone else, a link, a FIFO, or written after a prompt that showed less than this one does)
 //! reads as untrusted and stays in place: renaming a planted file aside only moves someone else's
@@ -27,6 +32,7 @@ use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 
+use super::last_trusted::{self, ChangedText, MAX_KEPT_BYTES};
 use super::nofollow::{read_regular_nofollow, Owner};
 use super::{discover, Discovery, EntryKind, Limits, Profile, ProfileEnv};
 use crate::state_paths;
@@ -45,6 +51,10 @@ const MAX_RECORD_BYTES: u64 = 1 << 20;
 /// the walk does not read, loads once Claude reads a file there.
 /// A lower or missing disclosure is unusable even when the fingerprint matches, so the project is
 /// asked about again. Raise this whenever the prompt starts showing something it hid before.
+///
+/// The diff of an instruction file does not count: it is shown only at a question about a changed
+/// configuration, which is asked anyway, so no record answered less than a prompt for the same
+/// configuration shows today.
 pub const DISCLOSURE: u32 = 5;
 
 /// What changed between the trusted configuration and the one found now, by path relative to the
@@ -85,6 +95,9 @@ pub enum TrustState {
         discovery: Discovery,
         diff: Diff,
         remember: Remember,
+        /// What can be shown of the instruction files `diff` names. Only for the person reading the
+        /// question: nothing decides by it.
+        texts: Vec<ChangedText>,
     },
 }
 
@@ -110,6 +123,13 @@ fn record_name(root: &Path, profile: &Profile) -> String {
         Profile::Claude => state_paths::file_name(root),
         other => format!("{}.{}", state_paths::file_name(root), other.key()),
     }
+}
+
+/// The copy of the instruction files beside the record at `record`.
+fn copy_path(record: &Path) -> PathBuf {
+    let mut name = record.file_name().expect("a record has a file name").to_os_string();
+    name.push("~last-trusted");
+    record.with_file_name(name)
 }
 
 fn record_temporary(path: &Path) -> PathBuf {
@@ -192,11 +212,21 @@ impl TrustStore {
             return TrustState::Untrusted { discovery, remember };
         }
         let diff = diff(&record.files, &discovery);
+        let copy = self.read_copy(&discovery);
+        let texts = last_trusted::compare(&record.files, copy.as_ref(), &discovery, &diff);
         TrustState::Changed {
             discovery,
             diff,
             remember,
+            texts,
         }
+    }
+
+    /// The copy kept at the last `y`, read as the record is, when it is one for this root and agent.
+    fn read_copy(&self, discovery: &Discovery) -> Option<last_trusted::KeptFiles> {
+        let record = self.record_path(&discovery.root, &discovery.profile)?;
+        let bytes = read_regular_nofollow(&copy_path(&record), MAX_KEPT_BYTES, Owner::Me).ok()?;
+        last_trusted::decode(&bytes, &discovery.root, profile_field(&discovery.profile))
     }
 
     fn remember_for(&self, discovery: &Discovery) -> Remember {
@@ -222,8 +252,9 @@ impl TrustStore {
     }
 
     /// Writes the record for `discovery`: a temporary file beside it, 0600, renamed over the
-    /// record. Refuses a discovery that could not hash everything, and a store with no directory,
-    /// writing nothing. A directory that cannot be created or used is the error.
+    /// record, and then the copy of its instruction files. Refuses a discovery that could not hash
+    /// everything, and a store with no directory, writing nothing. A directory that cannot be created
+    /// or used is the error; a copy that cannot be written is not.
     pub fn record(&self, discovery: &Discovery, now_unix: u64) -> io::Result<()> {
         if !discovery.fully_hashed() {
             return Err(io::Error::new(
@@ -250,13 +281,7 @@ impl TrustStore {
             ));
         }
         state_paths::create_state_dir(&dir)?;
-        let tmp = record_temporary(&path);
-        let written =
-            agent::private_fs::write_private(&tmp, text.as_bytes()).and_then(|()| std::fs::rename(&tmp, &path));
-        if let Err(err) = written {
-            let _ = std::fs::remove_file(&tmp);
-            return Err(err);
-        }
+        replace_private(&path, &text)?;
         // What `state` will read must be what was just written; anything else would tell the user
         // the project is trusted while the next start asks again.
         let fingerprint = discovery.fingerprint.hex();
@@ -268,40 +293,78 @@ impl TrustStore {
                 path.display()
             )));
         }
+        keep_copy(&path, discovery);
         Ok(())
     }
 
-    /// Removes this root's record for `profile` when it is a regular file the user owns; `true` if
-    /// one existed. A foreign file or a link is left in place and named in the error.
+    /// Removes this root's record for `profile` and the copy beside it when each is a regular file the
+    /// user owns; `true` if a record existed. A foreign file or a link is left in place and named in
+    /// the error. The copy is still removed when the record cannot be, and the other way round.
     pub fn forget(&self, root: &Path, profile: &Profile) -> io::Result<bool> {
         let Some(path) = self.record_path(root, profile) else {
             return Ok(false);
         };
-        let meta = match std::fs::symlink_metadata(&path) {
-            Ok(meta) => meta,
-            Err(err) if err.kind() == io::ErrorKind::NotFound => return Ok(false),
-            Err(err) => return Err(err),
-        };
-        let mine = {
-            use std::os::unix::fs::MetadataExt;
-            meta.uid() == agent::private_fs::current_uid()
-        };
-        if !meta.file_type().is_file() || !mine {
-            let what = if meta.file_type().is_symlink() {
-                "a link"
-            } else if !meta.file_type().is_file() {
-                "not a regular file"
-            } else {
-                "owned by another user"
-            };
-            return Err(io::Error::new(
-                io::ErrorKind::PermissionDenied,
-                format!("left in place: the record {} is {what}", path.display()),
-            ));
-        }
-        std::fs::remove_file(&path)?;
-        Ok(true)
+        let record = remove_own_file(&path, "record");
+        let copy = remove_own_file(&copy_path(&path), "copy of the instruction files");
+        let existed = record?;
+        copy?;
+        Ok(existed)
     }
+}
+
+/// Replaces `path` atomically: a temporary file beside it, 0600, renamed over it.
+fn replace_private(path: &Path, text: &str) -> io::Result<()> {
+    let tmp = record_temporary(path);
+    let written = agent::private_fs::write_private(&tmp, text.as_bytes()).and_then(|()| std::fs::rename(&tmp, path));
+    if written.is_err() {
+        let _ = std::fs::remove_file(&tmp);
+    }
+    written
+}
+
+/// Keeps what `discovery` read of the instruction files beside `record`, which has been written. The
+/// record is what trust rests on, so a copy that cannot be written costs only the next diff; the old
+/// one goes, since it no longer matches.
+fn keep_copy(record: &Path, discovery: &Discovery) {
+    let path = copy_path(record);
+    let kept = last_trusted::encode(discovery, profile_field(&discovery.profile));
+    let written = kept.is_some_and(|text| replace_private(&path, &text).is_ok());
+    // Another window's `:untrust` can have taken the record since it was read back; its text goes too.
+    let fingerprint = discovery.fingerprint.hex();
+    let record_stands =
+        read_usable_at(record, &discovery.root, &discovery.profile).is_some_and(|read| read.fingerprint == fingerprint);
+    if !written || !record_stands {
+        let _ = remove_own_file(&path, "copy of the instruction files");
+    }
+}
+
+/// Removes `path` when it is a regular file the user owns; `true` if one existed. `what` names it in
+/// the error when it is left in place.
+fn remove_own_file(path: &Path, what: &str) -> io::Result<bool> {
+    let meta = match std::fs::symlink_metadata(path) {
+        Ok(meta) => meta,
+        Err(err) if err.kind() == io::ErrorKind::NotFound => return Ok(false),
+        Err(err) => return Err(err),
+    };
+    let mine = {
+        use std::os::unix::fs::MetadataExt;
+        meta.uid() == agent::private_fs::current_uid()
+    };
+    if !meta.file_type().is_file() || !mine {
+        let kind = if meta.file_type().is_symlink() {
+            "a link"
+        } else if !meta.file_type().is_file() {
+            "not a regular file"
+        } else {
+            "owned by another user"
+        };
+        return Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            format!("left in place: the {what} {} is {kind}", path.display()),
+        ));
+    }
+    std::fs::remove_file(path)?;
+    Ok(true)
 }
 
 /// The record of `discovery` as written, trusted at `now_unix`.
@@ -509,6 +572,30 @@ mod path_tests {
             outside: false,
         };
         assert_ne!(value_of(&file), value_of(&dir));
+    }
+
+    /// What `record` is left with when another window's `:untrust` lands between the record and the
+    /// copy.
+    #[test]
+    fn a_copy_written_after_its_record_went_is_taken_back() {
+        let scratch = crate::plugin::test_support::Scratch::new("trust-copy-after-forget");
+        let root = scratch.0.join("root");
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::write(root.join("CLAUDE.md"), "instructions\n").unwrap();
+        let store = TrustStore::at(Some(scratch.0.join("trust")));
+        let found = discover(
+            &root,
+            Some(&scratch.0),
+            &Limits::default(),
+            &Profile::Claude,
+            &ProfileEnv::default(),
+        );
+        store.record(&found, 1).unwrap();
+        let record = store.record_path(&root, &Profile::Claude).unwrap();
+        assert!(copy_path(&record).is_file());
+        std::fs::remove_file(&record).unwrap();
+        keep_copy(&record, &found);
+        assert!(!copy_path(&record).exists());
     }
 
     #[test]

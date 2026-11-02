@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { bypassYesCounts, isModeCycleKey, modeFixedMessage, modeKeyRoute } from "./modeKey";
+import { bypassYesCounts, isModeCycleKey, KeyClock, modeFixedMessage, modeKeyRoute, OTHER_CLOCK_LAG_MS } from "./modeKey";
 
 const key = (over: Partial<Parameters<typeof isModeCycleKey>[0]> = {}) => ({
   key: "Tab", shiftKey: true, ctrlKey: false, altKey: false, metaKey: false, isComposing: false, ...over,
@@ -76,5 +76,50 @@ describe("bypassYesCounts", () => {
   it("counts only once BOTH rules clear, at exactly the guard", () => {
     expect(bypassYesCounts({ now: 1250, openedAt: 1000, lastKeyAt: 1000 })).toBe(true);
     expect(bypassYesCounts({ now: 1249, openedAt: 1000, lastKeyAt: 1000 })).toBe(false);
+  });
+});
+
+describe("KeyClock", () => {
+  it("is the press for a key the page handles later", () => {
+    expect(new KeyClock().pressedAt({ timeStamp: 1000 }, 1800)).toBe(1000);
+  });
+
+  it("is when it was handled where the stamp cannot be this clock", () => {
+    const clock = new KeyClock();
+    expect(clock.pressedAt({ timeStamp: 0 }, 1800)).toBe(1800);
+    expect(clock.pressedAt({ timeStamp: -5 }, 1800)).toBe(1800);
+    expect(clock.pressedAt({ timeStamp: 1_790_000_000_000 }, 1800)).toBe(1800);
+  });
+
+  it("does not take a repeat's stamp, which stands at the press while a key is held", () => {
+    expect(new KeyClock().pressedAt({ timeStamp: 1000, repeat: true }, 1800)).toBe(1800);
+  });
+
+  it("keeps the press of a key held up by a stall of any length", () => {
+    const clock = new KeyClock();
+    expect(clock.pressedAt({ timeStamp: 900 }, 905)).toBe(900);
+    const pressedDuringIt = 1100;
+    const handled = pressedDuringIt + 10 * OTHER_CLOCK_LAG_MS;
+    const now = clock.pressedAt({ timeStamp: pressedDuringIt }, handled);
+    expect(now).toBe(pressedDuringIt);
+    expect(bypassYesCounts({ now, openedAt: 1000, lastKeyAt: -Infinity })).toBe(false);
+  });
+
+  it("keeps it for the first key the page ever sees, too", () => {
+    const now = new KeyClock().pressedAt({ timeStamp: 1100 }, 1100 + 10 * OTHER_CLOCK_LAG_MS);
+    expect(bypassYesCounts({ now, openedAt: 1000, lastKeyAt: -Infinity })).toBe(false);
+  });
+
+  it("takes off a clock's offset once two keys show one, so a question stays answerable", () => {
+    const hour = 3_600_000;
+    const clock = new KeyClock();
+    clock.pressedAt({ timeStamp: 5_000 }, 5_003 + hour);
+    const now = clock.pressedAt({ timeStamp: 9_000 }, 9_001 + hour);
+    expect(now).toBe(9_001 + hour);
+    expect(bypassYesCounts({ now, openedAt: 8_000 + hour, lastKeyAt: 5_003 + hour })).toBe(true);
+  });
+
+  it("makes a question not yet painted unanswerable", () => {
+    expect(bypassYesCounts({ now: 5000, openedAt: Infinity, lastKeyAt: -Infinity })).toBe(false);
   });
 });

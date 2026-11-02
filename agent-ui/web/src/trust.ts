@@ -1,3 +1,4 @@
+import type { DiffLine } from "./diff";
 import { isPlainAnswerKey } from "./keymap";
 import type { KeyLike } from "./keymap";
 import { bypassYesCounts } from "./modeKey";
@@ -16,8 +17,15 @@ export type TrustItem = {
   outside: boolean;
 };
 
+/** A bounded instruction-file change prepared by the worker. Every string is repository text,
+ *  drawn as a text node with hidden characters revealed. */
+export type TrustDiffLine = DiffLine;
+export type TrustHunk = { skipped: number; lines: TrustDiffLine[] };
+export type TrustText =
+  | { kind: "diff"; path: string; added: number; removed: number; skippedAfter: number; hunks: TrustHunk[] }
+  | { kind: "plain"; path: string; line: string };
 /** Files that differ from what was trusted before, relative to the repository top. */
-export type TrustChanged = { added: string[]; removed: string[]; changed: string[] };
+export type TrustChanged = { added: string[]; removed: string[]; changed: string[]; texts?: TrustText[] };
 
 /** How long an answer is remembered: `yes` is a lasting record, `window` lasts until this window closes,
  *  `session` covers this one start only (something could not be checked). */

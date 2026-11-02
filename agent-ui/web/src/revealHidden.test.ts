@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { countEscapes, revealHidden } from "./revealHidden";
+import { countEscapes, revealHidden, revealPath } from "./revealHidden";
 
 /** What the pieces read as on screen, escapes and all. */
 function shown(text: string): string {
@@ -49,5 +49,23 @@ describe("revealHidden", () => {
   it("counts the escapes", () => {
     expect(countEscapes(revealHidden("a\u202Eb\u200Bc"))).toBe(2);
     expect(countEscapes(revealHidden("abc"))).toBe(0);
+  });
+});
+
+
+describe("revealPath", () => {
+  it("keeps a path on one line and counts newline, tab and carriage return escapes", () => {
+    expect(revealPath("a.md: no earlier copy to compare with\nb.md\t\r")).toEqual([
+      { text: "a.md: no earlier copy to compare with" }, { escape: "⟨U+000A⟩" },
+      { text: "b.md" }, { escape: "⟨U+0009⟩" }, { escape: "⟨U+000D⟩" },
+    ]);
+    expect(countEscapes(revealPath("a\nb\tc\r"))).toBe(3);
+    expect(revealHidden("a\nb\tc")).toEqual([{ text: "a\nb\tc" }]);
+  });
+
+  it("keeps all other hidden-character escapes, literal markup and ordinary path text", () => {
+    for (const text of ["", "a/b c.md", "<b>file</b>", "אב.md", "a\u200bb\u202ec\u{E0041}", "\uD800"]) {
+      expect(revealPath(text)).toEqual(revealHidden(text));
+    }
   });
 });

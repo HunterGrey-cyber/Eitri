@@ -4,14 +4,15 @@
 //! fake state directory and the projects; no test points discovery at an existing project or at
 //! the real home. `git` runs only to make fixtures, with no user or system configuration.
 
-use std::ffi::CString;
+use std::ffi::{CString, OsStr};
 use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::{symlink, MetadataExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
 use eitri_core::project_trust::{
-    civil_date, discover, Diff, Discovery, Limits, Profile, ProfileEnv, Remember, TrustState, TrustStore, DISCLOSURE,
+    civil_date, discover, ChangedText, Diff, Discovery, EntryKind, Kept, Limits, NoDiff, Profile, ProfileEnv, Remember,
+    TrustState, TrustStore, DISCLOSURE, MAX_KEPT_BYTES, MAX_KEPT_FILE_BYTES,
 };
 
 struct Fixture {
@@ -930,7 +931,18 @@ fn profiles_never_alias_records() {
     for file in [&claude_file, &codex_file, &acp_file] {
         assert!(file.is_file(), "{} missing", file.display());
     }
-    assert_eq!(std::fs::read_dir(fx.dir()).unwrap().count(), 3);
+    let records = std::fs::read_dir(fx.dir())
+        .unwrap()
+        .filter(|entry| {
+            !entry
+                .as_ref()
+                .unwrap()
+                .file_name()
+                .to_string_lossy()
+                .ends_with("~last-trusted")
+        })
+        .count();
+    assert_eq!(records, 3);
     for found in &found {
         assert!(matches!(store.state(found.clone()), TrustState::Trusted { .. }));
     }
@@ -1307,4 +1319,607 @@ fn a_record_over_the_cap_is_refused_before_anything_is_written() {
         .map(|entries| entries.flatten().map(|e| e.file_name()).collect())
         .unwrap_or_default();
     assert!(leftovers.is_empty(), "{leftovers:?}");
+}
+
+const MEMORY: &str = "CLAUDE.md";
+
+fn copy_file(fx: &Fixture, root: &Path) -> PathBuf {
+    let record = fx.record_file(root);
+    record.with_file_name(format!(
+        "{}~last-trusted",
+        record.file_name().unwrap().to_str().unwrap()
+    ))
+}
+
+/// A root whose `CLAUDE.md` holds `text`, trusted.
+fn trusted_memory(fx: &Fixture, name: &str, text: &[u8]) -> PathBuf {
+    let root = fx.root(name);
+    write(&root.join(MEMORY), text);
+    fx.store().record(&fx.discover(&root), 1).unwrap();
+    root
+}
+
+fn texts_of(fx: &Fixture, root: &Path) -> Vec<ChangedText> {
+    match fx.store().state(fx.discover(root)) {
+        TrustState::Changed { texts, .. } => texts,
+        other => panic!("{other:?}"),
+    }
+}
+
+fn no_diff(path: &str, why: NoDiff) -> ChangedText {
+    ChangedText::NoDiff {
+        path: PathBuf::from(path),
+        why,
+    }
+}
+
+#[test]
+fn a_changed_instruction_file_comes_with_its_trusted_text() {
+    let fx = Fixture::new("text");
+    let root = trusted_memory(&fx, "p", b"keep\nold\n");
+    write(&root.join(MEMORY), b"keep\nnew\n");
+    assert_eq!(
+        texts_of(&fx, &root),
+        vec![ChangedText::Diff {
+            path: PathBuf::from(MEMORY),
+            before: "keep\nold\n".into(),
+            after: "keep\nnew\n".into(),
+        }]
+    );
+}
+
+#[test]
+fn every_instruction_file_is_kept_and_nothing_else() {
+    let fx = Fixture::new("which");
+    let root = fx.root("p");
+    let instructions = [
+        "CLAUDE.md",
+        "CLAUDE.local.md",
+        ".claude/CLAUDE.md",
+        ".claude/rules/style.md",
+        ".claude/rules/deep/more.md",
+    ];
+    for file in instructions {
+        write(&root.join(file), b"before\n");
+    }
+    write(&root.join(SETTINGS), &hook("touch /tmp/a"));
+    write(&root.join(".claude/commands/go.md"), b"before\n");
+    write(&root.join(".claude/rules/data.txt"), b"before\n");
+    let found = fx.discover(&root);
+    let mut kept: Vec<_> = found.instructions.keys().map(|p| p.to_str().unwrap()).collect();
+    kept.sort();
+    let mut want = instructions.to_vec();
+    want.sort();
+    assert_eq!(kept, want);
+    fx.store().record(&found, 1).unwrap();
+    for file in instructions
+        .iter()
+        .chain(&[".claude/commands/go.md", ".claude/rules/data.txt"])
+    {
+        write(&root.join(file), b"after\n");
+    }
+    let texts = texts_of(&fx, &root);
+    assert_eq!(texts.len(), instructions.len(), "{texts:?}");
+    assert!(texts
+        .iter()
+        .all(|t| matches!(t, ChangedText::Diff { after, .. } if after == "after\n")));
+}
+
+/// The text kept is the text hashed, from the one read.
+#[test]
+fn the_text_kept_is_the_text_the_fingerprint_covers() {
+    let fx = Fixture::new("same-read");
+    let root = fx.root("p");
+    write(&root.join(MEMORY), b"hashed\n");
+    let found = fx.discover(&root);
+    let Kept::Text(text) = &found.instructions[Path::new(MEMORY)] else {
+        panic!("{:?}", found.instructions)
+    };
+    use sha2::{Digest, Sha256};
+    let sha256: [u8; 32] = Sha256::digest(text.as_bytes()).into();
+    assert!(found
+        .entries
+        .iter()
+        .any(|entry| entry.path == Path::new(MEMORY) && entry.kind == EntryKind::File { sha256, len: 7 }));
+}
+
+#[test]
+fn codex_and_a_registered_agent_keep_their_own_files_under_their_own_records() {
+    let fx = Fixture::new("profiles");
+    let root = fx.root("p");
+    write(&root.join("AGENTS.md"), b"codex old\n");
+    write(&root.join("GEM.md"), b"gem old\n");
+    write(&root.join(MEMORY), b"claude old\n");
+    let gem = Profile::Acp {
+        name: "gem".into(),
+        files: vec!["GEM.md".into()],
+    };
+    let store = fx.store();
+    for profile in [Profile::Claude, Profile::Codex, gem.clone()] {
+        store.record(&discover_as(&fx, &root, &profile), 1).unwrap();
+    }
+    write(&root.join("AGENTS.md"), b"codex new\n");
+    write(&root.join("GEM.md"), b"gem new\n");
+    let before_of = |profile: &Profile, file: &str| match store.state(discover_as(&fx, &root, profile)) {
+        TrustState::Changed { texts, .. } => match &texts[..] {
+            [ChangedText::Diff { path, before, .. }] if path == Path::new(file) => before.clone(),
+            other => panic!("{other:?}"),
+        },
+        other => panic!("{other:?}"),
+    };
+    assert_eq!(before_of(&Profile::Codex, "AGENTS.md"), "codex old\n");
+    assert_eq!(before_of(&gem, "GEM.md"), "gem old\n");
+
+    // Forgetting one agent leaves the other's copy.
+    assert!(store.forget(&root, &Profile::Codex).unwrap());
+    assert_eq!(before_of(&gem, "GEM.md"), "gem old\n");
+    assert!(fx
+        .dir()
+        .join(format!(
+            "{}.acp-gem~last-trusted",
+            fx.record_file(&root).file_name().unwrap().to_str().unwrap()
+        ))
+        .exists());
+    assert!(copy_file(&fx, &root).exists(), "Claude's copy stays");
+}
+
+/// A registered name can hold almost anything, and its record's file name holds its key: no name may
+/// reach the file another agent keeps its text in.
+#[test]
+fn no_registered_name_is_another_agents_copy() {
+    let fx = Fixture::new("names");
+    let root = fx.root("p");
+    write(&root.join("GEM.md"), b"old\n");
+    let agent = |name: &str| Profile::Acp {
+        name: name.into(),
+        files: vec!["GEM.md".into()],
+    };
+    let store = fx.store();
+    let (gem, beside) = (agent("gem"), agent("gem~last-trusted"));
+    let also = agent("gem.last-trusted");
+    for profile in [&gem, &beside, &also] {
+        store.record(&discover_as(&fx, &root, profile), 1).unwrap();
+    }
+    for profile in [&gem, &beside, &also] {
+        assert!(
+            matches!(
+                store.state(discover_as(&fx, &root, profile)),
+                TrustState::Trusted { .. }
+            ),
+            "{profile:?}"
+        );
+    }
+    write(&root.join("GEM.md"), b"new\n");
+    for profile in [&gem, &beside, &also] {
+        match store.state(discover_as(&fx, &root, profile)) {
+            TrustState::Changed { texts, .. } => {
+                assert!(
+                    matches!(&texts[..], [ChangedText::Diff { before, .. }] if before == "old\n"),
+                    "{texts:?}"
+                )
+            }
+            other => panic!("{other:?}"),
+        }
+    }
+}
+
+#[test]
+fn the_copy_is_private_and_moves_with_each_yes() {
+    let fx = Fixture::new("private");
+    let root = trusted_memory(&fx, "p", b"first\n");
+    let copy = copy_file(&fx, &root);
+    assert_eq!(std::fs::metadata(&copy).unwrap().mode() & 0o777, 0o600);
+    assert_eq!(std::fs::metadata(fx.dir()).unwrap().mode() & 0o777, 0o700);
+    assert!(std::fs::read_to_string(&copy).unwrap().contains("first"));
+
+    // An `n` or a question left open moves nothing: the comparison stays with the last `y`.
+    write(&root.join(MEMORY), b"second\n");
+    write(&root.join(MEMORY), b"third\n");
+    assert!(matches!(&texts_of(&fx, &root)[..], [ChangedText::Diff { before, .. }] if before == "first\n"));
+
+    fx.store().record(&fx.discover(&root), 2).unwrap();
+    assert!(!std::fs::read_to_string(&copy).unwrap().contains("first"));
+    write(&root.join(MEMORY), b"fourth\n");
+    assert!(matches!(&texts_of(&fx, &root)[..], [ChangedText::Diff { before, .. }] if before == "third\n"));
+
+    // A `y` to a configuration with no instruction file left leaves no text behind.
+    std::fs::remove_file(root.join(MEMORY)).unwrap();
+    write(&root.join(SETTINGS), &hook("touch /tmp/a"));
+    fx.store().record(&fx.discover(&root), 3).unwrap();
+    assert!(!copy.exists());
+}
+
+#[test]
+fn an_older_store_reads_as_it_did_with_a_line_for_the_file() {
+    let fx = Fixture::new("older");
+    let root = trusted_memory(&fx, "p", b"old\n");
+    std::fs::remove_file(copy_file(&fx, &root)).unwrap();
+    assert!(
+        matches!(fx.store().state(fx.discover(&root)), TrustState::Trusted { .. }),
+        "no copy is no reason to ask"
+    );
+    write(&root.join(MEMORY), b"new\n");
+    match fx.store().state(fx.discover(&root)) {
+        TrustState::Changed {
+            diff, remember, texts, ..
+        } => {
+            assert_eq!(diff.changed, vec![PathBuf::from(MEMORY)]);
+            assert_eq!(remember, Remember::Yes);
+            assert_eq!(texts, vec![no_diff(MEMORY, NoDiff::NoEarlierCopy)]);
+        }
+        other => panic!("{other:?}"),
+    }
+}
+
+/// The copy is read under the record's rules and only counts when its hash is the record's, so
+/// nothing in its place can draw a "before" that was not trusted.
+#[test]
+fn a_copy_that_is_not_the_trusted_text_shows_nothing() {
+    let fx = Fixture::new("forged");
+    let root = trusted_memory(&fx, "p", b"trusted\n");
+    let copy = copy_file(&fx, &root);
+    let good = std::fs::read_to_string(&copy).unwrap();
+    write(&root.join(MEMORY), b"changed\n");
+    let none = vec![no_diff(MEMORY, NoDiff::NoEarlierCopy)];
+
+    let forged = good.replace("trusted", "harmless");
+    assert_ne!(forged, good);
+    std::fs::write(&copy, &forged).unwrap();
+    assert_eq!(texts_of(&fx, &root), none, "another text under the path");
+
+    for bad in [
+        "not json".to_string(),
+        good.replace("\"version\":1", "\"version\":2"),
+        good.replace(root.to_str().unwrap(), "/elsewhere"),
+        good.replacen('{', "{\"profile\":\"codex\",", 1),
+        format!("{}{good}", " ".repeat(MAX_KEPT_BYTES as usize)),
+    ] {
+        assert_ne!(bad, good);
+        std::fs::write(&copy, &bad).unwrap();
+        assert_eq!(texts_of(&fx, &root), none, "{}", &bad[..bad.len().min(60)]);
+    }
+
+    std::fs::remove_file(&copy).unwrap();
+    let elsewhere = fx.outer.join("planted");
+    std::fs::write(&elsewhere, &good).unwrap();
+    symlink(&elsewhere, &copy).unwrap();
+    assert_eq!(texts_of(&fx, &root), none, "a link is not read");
+
+    std::fs::remove_file(&copy).unwrap();
+    mkfifo(&copy);
+    assert_eq!(texts_of(&fx, &root), none, "a FIFO is not waited on");
+}
+
+/// Nothing about the copy can make a changed configuration read as trusted, or an unchanged one as
+/// anything else.
+#[test]
+fn the_copy_never_decides() {
+    let fx = Fixture::new("decides");
+    let root = trusted_memory(&fx, "p", b"trusted\n");
+    let copy = copy_file(&fx, &root);
+    let good = std::fs::read_to_string(&copy).unwrap();
+    std::fs::write(&copy, good.replace("trusted", "other")).unwrap();
+    assert!(matches!(
+        fx.store().state(fx.discover(&root)),
+        TrustState::Trusted { .. }
+    ));
+
+    write(&root.join(MEMORY), b"other\n");
+    assert!(matches!(
+        fx.store().state(fx.discover(&root)),
+        TrustState::Changed { .. }
+    ));
+    let record: serde_json::Value = serde_json::from_slice(&std::fs::read(fx.record_file(&root)).unwrap()).unwrap();
+    assert_eq!(record["disclosure"], DISCLOSURE);
+    assert_eq!(
+        DISCLOSURE, 5,
+        "a diff at a question that is asked anyway asks nothing new"
+    );
+    assert!(record.get("texts").is_none() && !record.to_string().contains("trusted\\n"));
+}
+
+#[test]
+fn a_file_past_a_bound_is_marked_and_never_cut() {
+    let fx = Fixture::new("bounds");
+    let big = vec![b'x'; MAX_KEPT_FILE_BYTES as usize + 1];
+    let exactly = vec![b'x'; MAX_KEPT_FILE_BYTES as usize];
+
+    // Over the bound when it was trusted.
+    let root = trusted_memory(&fx, "was", &big);
+    write(&root.join(MEMORY), b"short\n");
+    assert_eq!(texts_of(&fx, &root), vec![no_diff(MEMORY, NoDiff::WasTooLong)]);
+    assert!(std::fs::metadata(copy_file(&fx, &root)).unwrap().len() < 4096);
+
+    // Over the bound now.
+    let root = trusted_memory(&fx, "now", b"short\n");
+    write(&root.join(MEMORY), &big);
+    assert_eq!(texts_of(&fx, &root), vec![no_diff(MEMORY, NoDiff::TooLong)]);
+
+    // At the bound it is kept whole.
+    let root = trusted_memory(&fx, "at", &exactly);
+    write(&root.join(MEMORY), b"short\n");
+    assert!(matches!(&texts_of(&fx, &root)[..], [ChangedText::Diff { before, .. }] if before.len() == exactly.len()));
+
+    // The whole copy: files in path order until no more fit; the file on disk stays under the bound.
+    let root = fx.root("many");
+    let files: Vec<String> = (0..6).map(|i| format!(".claude/rules/f{i}.md")).collect();
+    for file in &files {
+        write(&root.join(file), &vec![b'y'; 200 << 10]);
+    }
+    fx.store().record(&fx.discover(&root), 1).unwrap();
+    assert!(std::fs::metadata(copy_file(&fx, &root)).unwrap().len() <= MAX_KEPT_BYTES);
+    for file in &files {
+        write(&root.join(file), b"short\n");
+    }
+    let texts = texts_of(&fx, &root);
+    assert_eq!(texts.len(), 6);
+    let shown = texts.iter().filter(|t| matches!(t, ChangedText::Diff { .. })).count();
+    assert_eq!(shown, 5, "{}", texts.len());
+    assert_eq!(texts[5], no_diff(&files[5], NoDiff::NoRoom));
+
+    // Text that takes more room as JSON is measured as written.
+    let root = fx.root("escaped");
+    for file in &files {
+        write(&root.join(file), &vec![0x01; 100 << 10]);
+    }
+    fx.store().record(&fx.discover(&root), 1).unwrap();
+    assert!(std::fs::metadata(copy_file(&fx, &root)).unwrap().len() <= MAX_KEPT_BYTES);
+}
+
+#[test]
+fn a_binary_file_has_a_line_and_no_text() {
+    let fx = Fixture::new("binary");
+    for (name, bytes) in [("nul", &b"a\0b\n"[..]), ("latin", &b"caf\xe9\n"[..])] {
+        let root = trusted_memory(&fx, &format!("was-{name}"), bytes);
+        write(&root.join(MEMORY), b"text\n");
+        assert_eq!(texts_of(&fx, &root), vec![no_diff(MEMORY, NoDiff::WasNotText)]);
+
+        let root = trusted_memory(&fx, &format!("now-{name}"), b"text\n");
+        write(&root.join(MEMORY), bytes);
+        assert_eq!(texts_of(&fx, &root), vec![no_diff(MEMORY, NoDiff::NotText)]);
+    }
+}
+
+#[test]
+fn a_link_has_a_line_and_no_text() {
+    let fx = Fixture::new("link");
+    let root = fx.repo("p");
+    write(&root.join("AGENTS.md"), b"linked old\n");
+    symlink("AGENTS.md", root.join(MEMORY)).unwrap();
+    fx.store().record(&fx.discover(&root), 1).unwrap();
+    write(&root.join("AGENTS.md"), b"linked new\n");
+    assert_eq!(texts_of(&fx, &root), vec![no_diff(MEMORY, NoDiff::Link)]);
+
+    // A file that became a link says so; what it was still reads as what was trusted.
+    let root = fx.repo("q");
+    write(&root.join(MEMORY), b"plain\n");
+    write(&root.join("AGENTS.md"), b"plain\n");
+    fx.store().record(&fx.discover(&root), 1).unwrap();
+    std::fs::remove_file(root.join(MEMORY)).unwrap();
+    symlink("AGENTS.md", root.join(MEMORY)).unwrap();
+    assert_eq!(texts_of(&fx, &root), vec![no_diff(MEMORY, NoDiff::Link)]);
+}
+
+#[test]
+fn a_file_below_a_linked_directory_has_a_line_and_no_text() {
+    let fx = Fixture::new("linked-dir");
+    let root = fx.repo("p");
+    write(&root.join("shared/style.md"), b"old\n");
+    std::fs::create_dir_all(root.join(".claude")).unwrap();
+    symlink("../shared", root.join(".claude/rules")).unwrap();
+    let found = fx.discover(&root);
+    assert_eq!(found.instructions[Path::new(".claude/rules/style.md")], Kept::Link);
+    fx.store().record(&found, 1).unwrap();
+    write(&root.join("shared/style.md"), b"new\n");
+    assert_eq!(
+        texts_of(&fx, &root),
+        vec![no_diff(".claude/rules/style.md", NoDiff::Link)]
+    );
+}
+
+/// The record's keys are lossy, so `a\xff.md` and a file really named `a\u{fffd}.md` share one. The
+/// question must not draw one file's text under the other's change.
+#[test]
+fn a_file_name_that_is_not_utf8_never_lends_its_key_to_a_diff() {
+    let fx = Fixture::new("lossy");
+    let root = fx.root("p");
+    let plain = ".claude/rules/a\u{fffd}.md";
+    let raw = root.join(OsStr::from_bytes(b".claude/rules/a\xff.md"));
+    write(&root.join(plain), b"safe\n");
+    write(&raw, b"safe\n");
+    fx.store().record(&fx.discover(&root), 1).unwrap();
+    write(&raw, b"changed instructions\n");
+    assert_eq!(texts_of(&fx, &root), vec![no_diff(plain, NoDiff::NotText)]);
+}
+
+#[test]
+fn a_link_that_became_a_file_says_it_was_one() {
+    let fx = Fixture::new("was-link");
+    let root = fx.repo("p");
+    write(&root.join("AGENTS.md"), b"linked\n");
+    symlink("AGENTS.md", root.join(MEMORY)).unwrap();
+    fx.store().record(&fx.discover(&root), 1).unwrap();
+    std::fs::remove_file(root.join(MEMORY)).unwrap();
+    write(&root.join(MEMORY), b"a file now\n");
+    assert_eq!(texts_of(&fx, &root), vec![no_diff(MEMORY, NoDiff::WasLink)]);
+}
+
+/// Each reason in a person's words, the two about the past saying so.
+#[test]
+fn every_plain_line_says_what_is_true_of_the_file() {
+    let lines = [
+        (NoDiff::NoEarlierCopy, "no earlier copy to compare with"),
+        (NoDiff::TooLong, "over the 256 KiB kept of a file, so no diff"),
+        (NoDiff::WasTooLong, "was over the 256 KiB kept of a file, so no diff"),
+        (NoDiff::NotText, "not text, so no diff"),
+        (NoDiff::WasNotText, "was not text, so no diff"),
+        (NoDiff::Link, "a link, so no diff"),
+        (NoDiff::WasLink, "was a link, so no diff"),
+        (
+            NoDiff::NoRoom,
+            "did not fit in the 1 MiB kept for a project, so no diff",
+        ),
+    ];
+    for (why, line) in lines {
+        assert_eq!(why.line(), line);
+    }
+}
+
+/// The lines follow the paths, whichever list each file came from.
+#[test]
+fn the_texts_are_in_path_order() {
+    let fx = Fixture::new("order");
+    let root = fx.root("p");
+    write(&root.join(".claude/CLAUDE.md"), b"old\n");
+    fx.store().record(&fx.discover(&root), 1).unwrap();
+    write(&root.join(".claude/CLAUDE.md"), b"new\n");
+    write(&root.join("CLAUDE.md"), b"added\n");
+    write(&root.join("CLAUDE.local.md"), b"added\n");
+    let texts = texts_of(&fx, &root);
+    let paths: Vec<_> = texts
+        .iter()
+        .map(|text| match text {
+            ChangedText::Diff { path, .. } | ChangedText::NoDiff { path, .. } => path.to_str().unwrap(),
+        })
+        .collect();
+    assert_eq!(paths, [".claude/CLAUDE.md", "CLAUDE.local.md", "CLAUDE.md"]);
+}
+
+/// A name that is not UTF-8, alone, reaches the question: `diff` holds its lossy key.
+#[test]
+fn a_file_name_that_is_not_utf8_has_a_line() {
+    let fx = Fixture::new("lossy-alone");
+    let root = fx.root("p");
+    let raw = root.join(OsStr::from_bytes(b".claude/rules/a\xff.md"));
+    write(&raw, b"old\n");
+    fx.store().record(&fx.discover(&root), 1).unwrap();
+    write(&raw, b"new\n");
+    assert_eq!(
+        texts_of(&fx, &root),
+        vec![no_diff(".claude/rules/a\u{fffd}.md", NoDiff::NotText)]
+    );
+}
+
+#[test]
+fn a_new_file_has_a_line_and_a_removed_file_only_its_row() {
+    let fx = Fixture::new("added");
+    let root = trusted_memory(&fx, "p", b"old\n");
+    write(&root.join("CLAUDE.local.md"), b"mine\n");
+    std::fs::remove_file(root.join(MEMORY)).unwrap();
+    write(&root.join(SETTINGS), &hook("touch /tmp/a"));
+    match fx.store().state(fx.discover(&root)) {
+        TrustState::Changed { diff, texts, .. } => {
+            assert_eq!(diff.removed, vec![PathBuf::from(MEMORY)]);
+            assert_eq!(diff.added.len(), 2, "{diff:?}");
+            assert_eq!(texts, vec![no_diff("CLAUDE.local.md", NoDiff::NoEarlierCopy)]);
+        }
+        other => panic!("{other:?}"),
+    }
+}
+
+#[test]
+fn an_unread_file_says_what_its_row_says() {
+    let fx = Fixture::new("unread");
+    let root = trusted_memory(&fx, "p", b"old\n");
+    write(&root.join(MEMORY), &vec![b'x'; 5 << 20]);
+    match fx.store().state(fx.discover(&root)) {
+        TrustState::Changed { remember, texts, .. } => {
+            assert!(matches!(remember, Remember::SessionOnly(_)), "{remember:?}");
+            assert!(texts.is_empty(), "{texts:?}");
+        }
+        other => panic!("{other:?}"),
+    }
+}
+
+#[test]
+fn a_copy_that_cannot_be_written_is_not_a_failed_record() {
+    let fx = Fixture::new("copy-fails");
+    let root = fx.root("p");
+    write(&root.join(MEMORY), b"old\n");
+    let copy = copy_file(&fx, &root);
+    std::fs::create_dir_all(copy.join("in-the-way")).unwrap();
+    std::fs::set_permissions(fx.dir(), std::fs::Permissions::from_mode(0o700)).unwrap();
+    fx.store().record(&fx.discover(&root), 1).unwrap();
+    assert!(matches!(
+        fx.store().state(fx.discover(&root)),
+        TrustState::Trusted { .. }
+    ));
+    write(&root.join(MEMORY), b"new\n");
+    assert_eq!(texts_of(&fx, &root), vec![no_diff(MEMORY, NoDiff::NoEarlierCopy)]);
+}
+
+#[test]
+fn a_session_only_answer_keeps_no_copy() {
+    let fx = Fixture::new("session");
+    let root = fx.root("p");
+    write(&root.join(MEMORY), b"mine\n");
+    write(&root.join(SETTINGS), b"not json");
+    let found = fx.discover(&root);
+    assert!(!found.fully_hashed());
+    assert!(fx.store().record(&found, 1).is_err());
+    assert!(!copy_file(&fx, &root).exists());
+}
+
+#[test]
+fn forget_takes_the_copy_with_the_record() {
+    let fx = Fixture::new("forget-copy");
+    let root = trusted_memory(&fx, "p", b"old\n");
+    let other = trusted_memory(&fx, "q", b"old\n");
+    let store = fx.store();
+    let copy = copy_file(&fx, &root);
+    assert!(copy.exists());
+    assert!(store.forget(&root, &Profile::Claude).unwrap());
+    assert!(!copy.exists());
+    assert!(copy_file(&fx, &other).exists());
+
+    // A copy left with no record goes too, and is no record to report.
+    std::fs::write(&copy, b"left over").unwrap();
+    assert!(!store.forget(&root, &Profile::Claude).unwrap());
+    assert!(!copy.exists());
+
+    // A link in its place is left, and named; the record still goes.
+    store.record(&fx.discover(&root), 1).unwrap();
+    std::fs::remove_file(&copy).unwrap();
+    let target = fx.outer.join("target");
+    write(&target, b"keep");
+    symlink(&target, &copy).unwrap();
+    let err = store.forget(&root, &Profile::Claude).unwrap_err();
+    assert!(
+        err.to_string().contains("copy of the instruction files") && err.to_string().contains("a link"),
+        "{err}"
+    );
+    assert!(!fx.record_file(&root).exists());
+    assert!(target.exists());
+    assert!(matches!(store.state(fx.discover(&root)), TrustState::Untrusted { .. }));
+
+    // A record that cannot be removed does not keep the copy.
+    std::fs::remove_file(&copy).unwrap();
+    std::fs::write(&copy, b"left over").unwrap();
+    mkfifo(&fx.record_file(&root));
+    assert!(store.forget(&root, &Profile::Claude).is_err());
+    assert!(!copy.exists());
+}
+
+#[test]
+fn a_record_written_before_copies_existed_still_answers() {
+    let fx = Fixture::new("old-record");
+    let root = fx.root("p");
+    write(&root.join(MEMORY), b"old\n");
+    let found = fx.discover(&root);
+    let store = fx.store();
+    store.record(&found, 1).unwrap();
+    std::fs::remove_file(copy_file(&fx, &root)).unwrap();
+    let text = std::fs::read_to_string(fx.record_file(&root)).unwrap();
+    assert_eq!(
+        serde_json::from_str::<serde_json::Value>(&text)
+            .unwrap()
+            .as_object()
+            .unwrap()
+            .keys()
+            .map(String::as_str)
+            .collect::<std::collections::BTreeSet<_>>(),
+        ["disclosure", "files", "fingerprint", "root", "trusted_at", "version"].into(),
+        "the record's own shape did not move"
+    );
+    assert!(matches!(store.state(fx.discover(&root)), TrustState::Trusted { .. }));
 }

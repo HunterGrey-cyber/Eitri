@@ -470,6 +470,19 @@ export type InboundPayload = Parameters<InboundHandler>[0];
 
 function isWellFormedTrustPrompt(value: unknown): boolean {
   const o = value as Partial<Record<keyof TrustPromptEnvelope, unknown>>;
+  const changed = o.changed as { texts?: unknown } | null | undefined;
+  const texts = changed?.texts;
+  const count = (value: unknown) => typeof value === "number" && Number.isInteger(value) && value >= 0;
+  const hunk = (value: unknown) => {
+    if (value === null || typeof value !== "object") return false;
+    const h = value as Record<string, unknown>;
+    return count(h.skipped) && Array.isArray(h.lines) && h.lines.every((value: unknown) => {
+      if (value === null || typeof value !== "object") return false;
+      const line = value as Record<string, unknown>;
+      return (line.kind === "context" || line.kind === "added" || line.kind === "removed") &&
+        typeof line.text === "string" && (!("noNewline" in line) || line.noNewline === true);
+    });
+  };
   return (
     typeof o.tab === "number" &&
     typeof o.nonce === "number" &&
@@ -480,7 +493,16 @@ function isWellFormedTrustPrompt(value: unknown): boolean {
     isTrustRemember(o.remember) &&
     typeof o.root === "string" &&
     typeof o.top === "string" &&
-    Array.isArray(o.items)
+    Array.isArray(o.items) &&
+    (texts === undefined || (Array.isArray(texts) && texts.every((entry: unknown) => {
+      if (entry === null || typeof entry !== "object") return false;
+      const text = entry as Record<string, unknown>;
+      return typeof text.path === "string" && (
+        (text.kind === "diff" && count(text.added) && count(text.removed) && count(text.skippedAfter) &&
+          Array.isArray(text.hunks) && text.hunks.every(hunk)) ||
+        (text.kind === "plain" && typeof text.line === "string")
+      );
+    })))
   );
 }
 
