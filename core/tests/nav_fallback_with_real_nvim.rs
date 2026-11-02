@@ -256,8 +256,12 @@ impl Nvim {
                     let mut line = String::new();
                     stream.read_to_string(&mut line).expect("read the letter");
                     // The editor watch writes its own lines (`nvim-watched`, `nvim-leaving`) to the
-                    // same socket; they are not letters and are passed over.
-                    if line.starts_with("nvim-") {
+                    // same socket; they are not letters and are passed over. So are the reopen
+                    // snippet's `B`, `O`, `N` and `A` lines (`A <token> off` when no input was written).
+                    let reopen_line = line.len() > 2
+                        && matches!(line.as_bytes()[0], b'B' | b'O' | b'N' | b'A')
+                        && line.as_bytes()[1] == b' ';
+                    if line.starts_with("nvim-") || reopen_line {
                         continue;
                     }
                     return line;

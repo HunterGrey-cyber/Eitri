@@ -302,6 +302,17 @@ pub fn reopen_failed_text(name: &str) -> String {
     format!("could not reopen {name}")
 }
 
+/// [`reopen_gone_text`] before, or without, the first name: a name that could not travel costs only itself.
+pub fn reopen_gone_count_text(count: u32) -> String {
+    let verb = if count == 1 { "is" } else { "are" };
+    format!("{} from last time {verb} gone", file_count(count))
+}
+
+/// [`reopen_failed_text`] before, or without, the first name.
+pub fn reopen_failed_count_text(count: u32) -> String {
+    format!("could not reopen {}", file_count(count))
+}
+
 /// Windows the screen had no room for: their files were listed as buffers instead.
 pub fn reopen_squeezed_text(count: u32) -> String {
     let rest = if count == 1 { "it is" } else { "they are" };

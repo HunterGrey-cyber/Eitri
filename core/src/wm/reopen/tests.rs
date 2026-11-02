@@ -242,6 +242,11 @@ impl Rig {
         place.file().marker()
     }
 
+    /// nvim says it is quitting on purpose (its watch's `VimLeavePre`, which a deadly signal or a hang never runs).
+    fn leaving(&self) {
+        self.host.post(HostEvent::Editor(EditorEvent::Leaving { win: WIN }));
+    }
+
     /// nvim ends with nobody asking: a crash when `crashed`, else a `:qa`.
     fn exits(&self, crashed: bool) {
         if crashed {
@@ -618,7 +623,13 @@ fn a_captured_json_that_editor_record_refuses_is_logged_not_offered() {
 
 #[test]
 fn gone_failed_and_squeezed_toasts_use_the_exact_words() {
-    use crate::wm::feedback::{reopen_failed_text, reopen_gone_text, reopen_squeezed_text};
+    use crate::wm::feedback::{
+        reopen_failed_count_text, reopen_failed_text, reopen_gone_count_text, reopen_gone_text, reopen_squeezed_text,
+    };
+    assert_eq!(reopen_gone_count_text(2), "2 files from last time are gone");
+    assert_eq!(reopen_gone_count_text(1), "1 file from last time is gone");
+    assert_eq!(reopen_failed_count_text(2), "could not reopen 2 files");
+    assert_eq!(reopen_failed_count_text(1), "could not reopen 1 file");
     assert_eq!(
         reopen_gone_text(2, "src/old.rs"),
         "2 files from last time are gone: src/old.rs and 1 more"
@@ -652,8 +663,13 @@ fn gone_failed_and_squeezed_toasts_use_the_exact_words() {
     rig.ended(2, 1, 3);
     assert_eq!(
         rig.toast(),
-        Some((reopen_squeezed_text(3), ToastKind::Other)),
-        "what did not fit is said at once"
+        Some((
+            "2 files from last time are gone; could not reopen 1 file; 3 files from last time did not fit on screen; \
+             they are in :ls"
+                .to_string(),
+            ToastKind::Other
+        )),
+        "everything counted is said at once, the names when they come"
     );
     rig.name(true, "src/old.rs");
     rig.name(false, "src/x.rs");
@@ -674,9 +690,14 @@ fn gone_failed_and_squeezed_toasts_use_the_exact_words() {
     let rig = Rig::with(&place, None, false);
     rig.began();
     rig.ended(1, 0, 0);
-    assert_eq!(rig.toast(), None, "a gone file waits for its name");
+    let unnamed = Some((reopen_gone_count_text(1), ToastKind::Other));
+    assert_eq!(
+        rig.toast(),
+        unnamed,
+        "a name that never comes costs the toast only its name"
+    );
     rig.name(false, "src/x.rs");
-    assert_eq!(rig.toast(), None);
+    assert_eq!(rig.toast(), unnamed);
     rig.name(true, "src/old.rs");
     assert_eq!(
         rig.toast(),
@@ -936,7 +957,14 @@ fn quit_between_phases_writes_nothing() {
     let rig = Rig::with(&place, Some(&start), false);
     let before = std::fs::read(place.file().path()).unwrap();
     rig.began();
+    assert_eq!(rig.marker(&place), Some(rig.token.clone()));
     // `:qa` before the restore's end: nvim armed no handoff and left nothing, so none is read.
+    rig.leaving();
+    assert_eq!(
+        rig.state(),
+        Some(TokenState::Left),
+        "a restart after this restores, with no warning"
+    );
     rig.exits(false);
     rig.scheduler.advance(Duration::ZERO);
     assert!(rig.reads().is_empty());
@@ -948,6 +976,28 @@ fn quit_between_phases_writes_nothing() {
         "the record on disk is unchanged"
     );
     assert!(rig.captures().is_empty());
+    assert_eq!(
+        place.file().marker(),
+        None,
+        "an nvim that ran its quit was not stuck in its restore, so the next start restores"
+    );
+    let next = prepare_start(&place.start());
+    assert!(!next.skip);
+    assert_eq!(next.toast, None);
+}
+
+/// Only an nvim that said it is leaving on purpose proves it was not stuck in its restore: a crash, or an exit that
+/// said nothing, keeps the marker.
+#[test]
+fn a_crash_or_a_silent_exit_between_phases_keeps_the_marker() {
+    for crashed in [true, false] {
+        let place = Place::new(if crashed { "crash-between" } else { "silent-between" });
+        let rig = Rig::with(&place, Some(&one_file("/home/someone/project/a.rs")), false);
+        rig.began();
+        rig.exits(crashed);
+        rig.scheduler.advance(Duration::ZERO);
+        assert_eq!(rig.marker(&place), Some(rig.token.clone()), "crashed: {crashed}");
+    }
 }
 
 #[test]

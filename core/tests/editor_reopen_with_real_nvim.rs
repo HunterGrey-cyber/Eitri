@@ -388,6 +388,95 @@ fn sizes_follow_shares_and_one_later_resize() {
     assert_eq!(rig.ended().3, 0);
 }
 
+#[test]
+#[ignore = "needs a real nvim on PATH and a private pane-switch socket; no model or display"]
+fn a_nested_subtree_keeps_its_share_after_a_later_resize() {
+    let mut rig = Rig::new("nested-sizes");
+    let sized = |i: usize, cur: bool, w: u64, h: u64| {
+        let mut leaf = rig.leaf(i, cur);
+        leaf["leaf"]["w"] = json!(w);
+        leaf["leaf"]["h"] = json!(h);
+        leaf
+    };
+    let left = json!({"col": [{"row": [sized(0, true, 20, 20), sized(1, false, 19, 20)]}, sized(2, false, 40, 20)]});
+    let tree = json!({"row": [left, sized(3, false, 59, 41)]});
+    rig.input(rig.record(tree), false);
+    let mut nvim = rig.start("", &[]);
+    nvim.entered();
+    nvim.resize(200, 90);
+    nvim.done();
+    // A narrower grid takes its columns from the rightmost window; the shares are then applied once more.
+    nvim.resize(120, 50);
+    nvim.lua("vim.wait(200); return true");
+    let record = nvim.capture();
+    let w: Vec<f64> = leaves(&record["tabs"][0]["tree"])
+        .iter()
+        .map(|leaf| leaf["w"].as_f64().unwrap())
+        .collect();
+    assert_eq!(w.len(), 4, "{record}");
+    let (a, b, c, d) = (w[0], w[1], w[2], w[3]);
+    assert!(
+        (c - (c + d) * 40.0 / 99.0).abs() <= 1.0,
+        "the left subtree keeps its share of the row: {w:?}"
+    );
+    assert!((a - (a + b) * 20.0 / 39.0).abs() <= 1.0, "and its inner row too: {w:?}");
+    assert_eq!(rig.ended().3, 0);
+}
+
+/// A float (a progress or notification popup) or a tool's sidebar that the config opens after phase 1 is not the
+/// person at work: phase 2 still builds the record's windows.
+#[test]
+#[ignore = "needs a real nvim on PATH and a private pane-switch socket; no model or display"]
+fn a_float_or_a_sidebar_after_phase_one_leaves_phase_two_to_build() {
+    for (label, config) in [
+        (
+            "float",
+            "vim.api.nvim_create_autocmd('VimEnter', { callback = function() vim.api.nvim_open_win(\
+             vim.api.nvim_create_buf(false, true), false, { relative = 'editor', row = 1, col = 1, width = 10, \
+             height = 2 }) end })",
+        ),
+        (
+            "sidebar",
+            "vim.api.nvim_create_autocmd('VimEnter', { callback = function() vim.cmd('topleft vnew'); \
+             vim.bo.buftype = 'nofile' end })",
+        ),
+    ] {
+        let mut rig = Rig::new(label);
+        rig.simple();
+        let mut nvim = rig.start(config, &[]);
+        nvim.done();
+        let (opened, _, _, squeezed, _) = rig.ended();
+        assert_eq!((opened, squeezed), (2, 0), "{label}");
+        assert_eq!(
+            nvim.lua(
+                "local n = 0; for _, w in ipairs(vim.api.nvim_list_wins()) do \
+                 if vim.api.nvim_win_get_config(w).relative == '' and \
+                 vim.bo[vim.api.nvim_win_get_buf(w)].buftype == '' then n = n + 1 end end; return n"
+            ),
+            2,
+            "{label}"
+        );
+        assert_eq!(
+            nvim.lua("return vim.fn.fnamemodify(vim.api.nvim_buf_get_name(0), ':t')"),
+            "0.txt",
+            "the record's current window is current: {label}"
+        );
+    }
+}
+
+#[test]
+#[ignore = "needs a real nvim on PATH and a private pane-switch socket; no model or display"]
+fn a_split_between_phases_lists_the_rest() {
+    let mut rig = Rig::new("split");
+    rig.positive_control();
+    rig.simple();
+    let mut nvim = rig.start("", &[]);
+    nvim.entered();
+    nvim.call("nvim_command", vec!["vsplit".into()]);
+    nvim.done();
+    assert_eq!(rig.ended().3, 1);
+}
+
 fn grid(rig: &Rig, rows: usize, cols: usize) -> Value {
     json!({"col": (0..rows).map(|r| json!({"row": (0..cols).map(|c| rig.leaf(r*cols+c, r+c==0)).collect::<Vec<_>>()})).collect::<Vec<_>>()})
 }
@@ -816,8 +905,13 @@ fn the_handoff_is_written_on_qa_sigterm_sighup_and_stdin_close_and_parses() {
             let expected = leaves(&expected["tree"]);
             assert_eq!(actual.len(), expected.len(), "{how}");
             for (actual, expected) in actual.iter().zip(expected) {
-                for field in ["f", "lnum", "top"] {
+                for field in ["f", "lnum", "want", "top"] {
                     assert_eq!(actual[field], expected[field], "{how}: {field}");
+                }
+                // A signal ends nvim with its buffers unloaded and every cursor in column 0 before any autocommand
+                // runs; a closed stdin (how the window ends it) lets the UI leave first, and that answer is kept.
+                if how == "qa" || how == "stdin" {
+                    assert_eq!(actual["col"], expected["col"], "{how}: col");
                 }
             }
         }
@@ -826,6 +920,35 @@ fn the_handoff_is_written_on_qa_sigterm_sighup_and_stdin_close_and_parses() {
             assert_eq!(handoff["same"], true);
         }
     }
+}
+
+#[test]
+#[ignore = "needs a real nvim on PATH and a private pane-switch socket; no model or display"]
+fn a_change_after_a_ui_left_is_in_the_handoff() {
+    let rig = Rig::new("ui-left-change");
+    rig.simple();
+    let mut nvim = rig.start("vim.o.scrolloff=0", &[]);
+    nvim.done();
+    // Another UI leaving while the embedded one stays: nvim goes on, and what changes after it is the person's.
+    nvim.lua("vim.api.nvim_exec_autocmds('UILeave', {}) return true");
+    nvim.lua("vim.cmd.badd('7.txt') vim.cmd('wincmd r') return true");
+    nvim.quit();
+    let handoff = rig.handoff();
+    let record = &handoff["record"];
+    assert!(
+        record["bufs"].as_array().unwrap().contains(&json!(rig.name("7.txt"))),
+        "a buffer added after the UI left is listed: {record}"
+    );
+    let order: Vec<&Value> = leaves(&record["tabs"][0]["tree"])
+        .iter()
+        .map(|leaf| &leaf["f"])
+        .collect();
+    assert_eq!(
+        order,
+        vec![&json!(rig.name("1.txt")), &json!(rig.name("0.txt"))],
+        "the rotated order"
+    );
+    assert_eq!(handoff["same"], false);
 }
 
 #[test]

@@ -5,9 +5,10 @@
 //! [`EditorEvent::Captured`](super::host::EditorEvent::Captured).
 //!
 //! Each nvim the window starts has a token, and the lines it sends move that token's state only forward:
-//! `Started` -> `Aside` (final), or `Started` -> `Began` -> `Ended` (final). A line in any other order, or with
-//! another nvim's token, is dropped and logged, so a leftover descendant of an earlier nvim cannot speak for this one
-//! and a late `B` cannot set the marker again.
+//! `Started` -> `Aside` (final), or `Started` -> `Began` -> `Ended` or `Left` (final). A line in any other order, or
+//! with another nvim's token, is dropped and logged, so a leftover descendant of an earlier nvim cannot speak for this
+//! one and a late `B` cannot set the marker again. `Left` is nvim's own word that it is quitting on purpose, which an
+//! nvim stuck in its restore cannot say: its marker goes, so a quit before the restore's end is not taken for a crash.
 //!
 //! Once the restore has ended the window captures at once, then every [`CAPTURE_EVERY`] and when the window loses
 //! the keyboard (at most once per [`FOCUS_CAPTURE_EVERY`]); never two at a time, and never for an nvim that stood
@@ -49,6 +50,8 @@ pub enum TokenState {
     Began,
     /// The restore ended: captures run from here on.
     Ended,
+    /// nvim quit on purpose before its restore ended: it was not stuck in the restore, and armed no handoff.
+    Left,
 }
 
 /// A restart of nvim the window holds back until the new nvim's input is written from the newest record.
@@ -287,17 +290,22 @@ pub(super) fn line(w: &mut Window, win: WinId, line: ReopenLine, batch: &mut Bat
     }
 }
 
-/// Shows what the restore's end said, whole, on one toast: each part as its count and its first name have come.
+/// Shows what the restore's end said, whole, on one toast: every part counted at once, each with its first name once
+/// that has come, so a name that never arrives costs the toast only the name.
 fn show_told(w: &mut Window) {
     let Some(reopen) = w.reopen.as_ref() else {
         return;
     };
     let told = &reopen.told;
     let parts: Vec<String> = [
-        told.gone_name
-            .as_deref()
-            .map(|name| super::feedback::reopen_gone_text(told.gone, name)),
-        told.failed_name.as_deref().map(super::feedback::reopen_failed_text),
+        (told.gone > 0).then(|| match told.gone_name.as_deref() {
+            Some(name) => super::feedback::reopen_gone_text(told.gone, name),
+            None => super::feedback::reopen_gone_count_text(told.gone),
+        }),
+        (told.failed > 0).then(|| match told.failed_name.as_deref() {
+            Some(name) => super::feedback::reopen_failed_text(name),
+            None => super::feedback::reopen_failed_count_text(told.failed),
+        }),
         (told.squeezed > 0).then(|| super::feedback::reopen_squeezed_text(told.squeezed)),
     ]
     .into_iter()
@@ -426,6 +434,23 @@ pub(super) fn focus_out(w: &mut Window, win: WinId, batch: &mut Batch) {
     }
 }
 
+/// nvim said it is quitting on purpose, from the `VimLeavePre` that a deadly signal, a crash or a hang never runs. A
+/// restore that began and has not ended was therefore cut short by a quit, not stuck: its marker goes, and a restart
+/// after it restores as after any quit.
+pub(super) fn leaving(w: &mut Window) {
+    let Some(reopen) = w.reopen.as_mut() else {
+        return;
+    };
+    if reopen.state != TokenState::Began {
+        return;
+    }
+    reopen.state = TokenState::Left;
+    if !reopen.skip {
+        reopen.writer.clear_marker_if(reopen.token.clone());
+    }
+    w.say("[editor] reopen: nvim quits before its restore ended; the next start restores".into());
+}
+
 /// nvim ended and the window lives on (`:qa`, `ZZ`, a crash, a kill of the editor alone): the writer is told to read
 /// the last record it left, so that record is kept now rather than at the next restart or the close.
 pub(super) fn nvim_ended(w: &mut Window, win: WinId, batch: &mut Batch) {
@@ -487,7 +512,8 @@ pub(super) fn hold_restart(w: &mut Window, win: WinId, batch: &mut Batch) -> boo
 
 /// The ended nvim's last record is with the writer, or its wait is over: the new nvim gets a token and its input,
 /// written by the writer from the newest record once everything handed to it before is done. Its restore is skipped
-/// when the ended nvim's never said it ended, or when the last one that did not finish has had nothing written since.
+/// when the ended nvim's began and then neither ended nor quit on purpose, or when the last one that did not finish has
+/// had nothing written since.
 fn restart_input(w: &mut Window) {
     let Some(reopen) = w.reopen.as_mut() else {
         return;

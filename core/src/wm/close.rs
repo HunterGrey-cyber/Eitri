@@ -680,6 +680,7 @@ pub(super) fn editor_event(w: &mut Window, cx: &Cx, win: WinId, event: EditorEve
         }
         EditorEvent::Leaving { .. } => {
             w.nvim_said = NvimSaid::Leaving;
+            super::reopen::leaving(w);
             return;
         }
         EditorEvent::Reopen { line, .. } => {

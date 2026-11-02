@@ -19,7 +19,7 @@ use std::time::{Duration, Instant};
 
 use agent::save_health::{self, SaveKind};
 
-use super::{parse_handoff, write_input, Record, RecordFile, RECORD_MAX};
+use super::{parse_handoff, write_input, Record, RecordFile, INPUT_FILE_NAME, RECORD_MAX};
 use crate::state_paths::ON_A_WRITER_THREAD;
 use crate::wm::Waker;
 
@@ -32,7 +32,8 @@ pub enum WriterAnswer {
     /// The handoff of `token`'s nvim: the record it held, or `None` when none came within its wait or the one there
     /// could not be used. Answered once per token.
     Handoff { token: String, record: Option<Record> },
-    /// The input file for `token`'s nvim is in place (or, with the writer off, will not be: nothing waits on it).
+    /// The input file for `token`'s nvim is in place; or it could not be written and the one before it was removed, so
+    /// the new nvim finds none and restores nothing; or the writer is off and nothing waits on it.
     InputWritten { token: String },
     /// The record handed over with `seq` is on disk.
     Written { seq: u64 },
@@ -296,20 +297,6 @@ impl RecordWriter {
         true
     }
 
-    /// Stops all writing for good, what is queued included. A handoff read or an input still owed is answered
-    /// without touching the disk, so nothing waits on a writer that is off; one under way when this is called ends
-    /// at its next look.
-    pub fn disable(&self) {
-        let answers: Vec<WriterAnswer> = {
-            let mut state = self.shared().lock();
-            state.off = true;
-            let dropped = std::mem::take(&mut state.ops);
-            dropped.into_iter().filter_map(Op::unperformed).collect()
-        };
-        self.shared().ready.notify_all();
-        self.shared().answer(answers);
-    }
-
     fn push(&self, op: Op) {
         let mut state = self.shared().lock();
         if state.off {
@@ -426,7 +413,16 @@ impl Worker {
             } => {
                 let newest = shared.lock().newest.clone();
                 if let Err(e) = write_input(&channel_dir, &token, &self.root, &prefixes, newest.as_ref(), skip) {
-                    eprintln!("[editor] reopen: could not write the editor's input: {e}");
+                    eprintln!(
+                        "[editor] reopen: could not write the editor's input ({e}); the restarted nvim reopens nothing"
+                    );
+                    // The one before stays after a failed replace, and would hand the new nvim a token the window no
+                    // longer hears and the files it started from.
+                    match std::fs::remove_file(channel_dir.join(INPUT_FILE_NAME)) {
+                        Ok(()) => {}
+                        Err(e) if e.kind() == io::ErrorKind::NotFound => {}
+                        Err(e) => eprintln!("[editor] reopen: could not remove the editor's last input: {e}"),
+                    }
                 }
                 shared.answer(vec![WriterAnswer::InputWritten { token }]);
             }

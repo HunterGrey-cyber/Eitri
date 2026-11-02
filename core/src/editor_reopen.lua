@@ -70,7 +70,15 @@ api.nvim_create_autocmd('VimEnter', {
     if tool then aside(tool); return end
     local initial_win = api.nvim_get_current_win()
     if #api.nvim_list_tabpages() ~= 1 or not plain(api.nvim_get_current_buf()) then aside('screen'); return end
-    local initial_windows = api.nvim_tabpage_list_wins(0)
+    -- Floating windows (a progress popup, a notification) are not part of the screen's layout.
+    local function layout_windows()
+      local windows = {}
+      for _, win in ipairs(api.nvim_tabpage_list_wins(0)) do
+        if api.nvim_win_get_config(win).relative == '' then windows[#windows + 1] = win end
+      end
+      return windows
+    end
+    local initial_windows = layout_windows()
     local root = vim.base64.decode(input.root)
     local started, elapsed = uv.hrtime(), 0
     send('B ' .. token)
@@ -187,6 +195,10 @@ api.nvim_create_autocmd('VimEnter', {
       while not node.leaf do node = node.children[1] end
       return node
     end
+    local function last(node)
+      while not node.leaf do node = node.children[#node.children] end
+      return node
+    end
     local function current(node)
       local chosen
       visit(node, function(leaf) if leaf.leaf.cur then chosen = leaf end end)
@@ -205,10 +217,18 @@ api.nvim_create_autocmd('VimEnter', {
       if (dimension == 'w') == (node.kind == 'row') then return sum + #node.children - 1 end
       return maximum
     end
+    -- A child is sized by moving the separator after it, which nvim takes as the edge of the whole child; resizing
+    -- one window inside a child that is split itself would move a boundary inside that child instead. The move runs
+    -- in the window's own tab, since nvim walks the layout of the current one.
     local function set_size(node, dimension, size)
-      local win = first(node).win
-      if dimension == 'w' then api.nvim_win_set_width(win, size)
-      else api.nvim_win_set_height(win, size) end
+      local offset = size - measure(node, dimension, false)
+      if offset == 0 then return end
+      local win, moved = last(node).win, nil
+      api.nvim_win_call(win, function()
+        if dimension == 'w' then moved = vim.fn.win_move_separator(win, offset)
+        else moved = vim.fn.win_move_statusline(win, offset) end
+      end)
+      if moved ~= true and moved ~= 1 then error('a split could not be sized') end
     end
     local function shares(node)
       if node.leaf then return end
@@ -287,8 +307,28 @@ api.nvim_create_autocmd('VimEnter', {
     local phase_buffer = api.nvim_win_get_buf(initial_win)
     local completed = false
     local resize_id
+    -- The window ends nvim by closing its stdin. By VimLeavePre such an nvim has unloaded its buffers, which puts
+    -- every cursor in column 0; the UI leaving comes before that. The answer taken there lends its columns only when
+    -- the exit's own answer has every column 0 and is otherwise the same: a change made after a UI left (another UI
+    -- still attached) is then never lost to it.
+    local at_leave
+    local function columns_lost(fresh, kept, key)
+      if key == 'col' and type(fresh) == 'number' and type(kept) == 'number' then return fresh == 0 end
+      if type(fresh) ~= type(kept) then return false end
+      if type(fresh) ~= 'table' then return fresh == kept end
+      for k, v in pairs(fresh) do
+        if not columns_lost(v, kept[k], k) then return false end
+      end
+      for k in pairs(kept) do
+        if fresh[k] == nil then return false end
+      end
+      return true
+    end
     local function handoff()
       local answer = assert(loadfile(dir .. '/editor_reopen_capture.lua'))(input)
+      if answer and at_leave and columns_lost(vim.json.decode(answer.json), vim.json.decode(at_leave.json)) then
+        answer = at_leave
+      end
       if not answer then return end
       local content = vim.json.encode({ same = answer.same, record = vim.json.decode(answer.json) })
       if #content > 256 * 1024 then return end
@@ -328,6 +368,10 @@ api.nvim_create_autocmd('VimEnter', {
       if not success or not answer then state.done = nil; return end
       state.restored = answer.json
       api.nvim_create_autocmd('VimLeavePre', { group = group, callback = function() pcall(handoff) end })
+      api.nvim_create_autocmd('UILeave', { group = group, callback = function()
+        local ok, answer = pcall(function() return assert(loadfile(dir .. '/editor_reopen_capture.lua'))(input) end)
+        at_leave = ok and answer or nil
+      end })
       send(('O %s %d %d %d %d %.0f'):format(token, opened, gone, failed, squeezed,
         math.max(1, math.floor((elapsed + uv.hrtime() - started) / 1000))))
       notice('g', first_gone)
@@ -340,13 +384,19 @@ api.nvim_create_autocmd('VimEnter', {
         end
       end
     end
+    -- The person is at work once phase 1's window shows another buffer, that buffer changed, a window from before
+    -- went, or a window of a file came. A float, or a tool's window (a buffer with a 'buftype') that the config
+    -- opened after phase 1, is not the person.
     local function untouched()
       if #api.nvim_list_tabpages() ~= 1 or not api.nvim_win_is_valid(initial_win)
         or api.nvim_win_get_buf(initial_win) ~= phase_buffer or vim.bo[phase_buffer].modified then return false end
-      local windows = api.nvim_tabpage_list_wins(0)
-      if #windows ~= #initial_windows then return false end
-      for i, win in ipairs(windows) do if win ~= initial_windows[i] then return false end end
-      return true
+      local before, kept = {}, 0
+      for _, win in ipairs(initial_windows) do before[win] = true end
+      for _, win in ipairs(layout_windows()) do
+        if before[win] then kept = kept + 1
+        elseif vim.bo[api.nvim_win_get_buf(win)].buftype == '' then return false end
+      end
+      return kept == #initial_windows
     end
     local function phase_two()
       if completed then return end
@@ -367,6 +417,8 @@ api.nvim_create_autocmd('VimEnter', {
       else
         opened = 0
         for _, tab in ipairs(tabs) do visit(tab.tree, function(leaf) leaf.opened = false end) end
+        -- A tool's window that opened after phase 1 may have taken the focus; the first tab builds into phase 1's.
+        api.nvim_set_current_win(initial_win)
         for _, tab in ipairs(tabs) do
           local success = true
           if #restored > 0 then

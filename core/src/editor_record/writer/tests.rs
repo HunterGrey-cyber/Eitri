@@ -410,22 +410,30 @@ fn write_input_uses_newest_and_answers() {
     assert_eq!(input["record"], want);
 }
 
+/// The restarted nvim would read the ended one's input, with a token the window no longer hears and the record it
+/// started from: when the new input cannot be written, the old one goes, so the new nvim finds none.
 #[test]
-fn disable_drops_what_is_queued_and_still_answers() {
-    let dir = ScratchDir::new("nv-record-writer", "disable");
+fn a_failed_input_write_leaves_no_stale_input() {
+    let dir = ScratchDir::new("nv-record-writer", "input-fails");
     let file = file_in(&dir);
     let channel = channel(&dir);
-    let writer = RecordWriter::start(file.clone(), root(), None);
-    writer.disable();
-    writer.offer(1, rec("a.rs"), false);
-    writer.read_handoff(2, T1.to_string(), put_handoff(&channel, T1, &rec("b.rs"), false), LONG);
+    let writer = RecordWriter::start(file, root(), Some(rec("seed.rs")));
+    writer.write_input(channel.clone(), T1.to_string(), Vec::new(), false);
+    assert!(writer.flush(LONG));
+    assert!(channel.join(INPUT_FILE_NAME).exists());
+    // The temporary name is taken by a directory, so the write fails and leaves the old file in place.
+    let blocker = channel.join(format!("{INPUT_FILE_NAME}.{}.tmp", std::process::id()));
+    std::fs::create_dir(&blocker).unwrap();
     writer.write_input(channel.clone(), T2.to_string(), Vec::new(), false);
     assert!(writer.flush(LONG));
-    assert_eq!(on_disk(&file), None);
-    assert!(!channel.join(INPUT_FILE_NAME).exists());
-    let answers = writer.take_answers();
-    assert_eq!(handoffs(&answers), [(T1.to_string(), None)]);
-    assert!(answers.contains(&WriterAnswer::InputWritten { token: T2.to_string() }));
+    std::fs::remove_dir(&blocker).unwrap();
+    assert!(
+        !channel.join(INPUT_FILE_NAME).exists(),
+        "the ended nvim's input is not left for the new one"
+    );
+    assert!(writer
+        .take_answers()
+        .contains(&WriterAnswer::InputWritten { token: T2.to_string() }));
 }
 
 #[test]
