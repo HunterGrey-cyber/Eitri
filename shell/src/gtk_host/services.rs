@@ -882,6 +882,11 @@ impl ServiceSet for Services {
                 }
                 Ok(())
             }
+            // The editor's "edit the selection" key: the keys are in the view, and its shown tab opens the composer.
+            ChatOp::EditSelection { view, .. } => {
+                self.agent.edit_selection(*view);
+                Ok(())
+            }
             // Each chat view's page is told for itself, so exactly one is told it has the keys.
             ChatOp::PaneFocused { view, focused, .. } => {
                 self.agent.set_pane_focused(*view, *focused);

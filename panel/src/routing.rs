@@ -107,11 +107,13 @@ pub(super) fn send_tabs_if_changed(state: &mut AgentPanelState, out: &mut Outbox
 
 /// V1: the editor context's summary, to each live page whose last one differs.
 pub(super) fn send_context_if_changed(state: &mut AgentPanelState, out: &mut Outbox) {
+    let context = (state.editor_context)();
+    super::edit_selection::poll(state, context.as_ref(), out);
     let views = live_views(state);
     if views.is_empty() {
         return;
     }
-    let summary = eitri_core::agent_bridge::context_summary((state.editor_context)().as_ref(), &state.project_dir);
+    let summary = eitri_core::agent_bridge::context_summary(context.as_ref(), &state.project_dir);
     let now = eitri_core::agent_bridge::serialize_editor_context_for_js(summary.as_ref());
     for view in views {
         let ready = state.ready(view);

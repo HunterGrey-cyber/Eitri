@@ -3479,6 +3479,7 @@ mod tests {
                     end_line: 4,
                     text: "fn main() {}".into(),
                 }),
+                edit_request: None,
             }),
         );
         assert!(

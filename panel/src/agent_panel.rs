@@ -49,6 +49,8 @@ mod detail;
 #[cfg(test)]
 #[path = "detail_sidecar_row.rs"]
 mod detail_sidecar_row;
+#[path = "edit_selection.rs"]
+mod edit_selection;
 #[path = "editor_glue.rs"]
 mod editor_glue;
 #[path = "hand_over.rs"]
@@ -338,6 +340,11 @@ struct AgentPanelState {
     /// An edit came back (or was discarded): the keys return to the chat, in INPUT, in the view of the
     /// edit's tab.
     editor_done_hook: Option<Rc<dyn Fn(ViewId)>>,
+    /// Which presses of the editor's "edit the selection" key this panel has answered.
+    edit_ask: edit_selection::EditAsk,
+    /// The editor's "edit the selection" key was pressed: the window puts the keys in the chat, then calls
+    /// [`AgentPanelHandle::edit_selection`] for the view that took them.
+    edit_selection_hook: Option<Rc<dyn Fn()>>,
     /// Teardowns and connects of tabs that left while the window stays open, so the window-close
     /// backstop covers them too. See [`Retiring`].
     retiring: Retiring,
@@ -615,6 +622,8 @@ impl AgentPanelState {
             review_editor: crate::review_editor::ReviewEditor::default(),
             pair_outbound_hook: None,
             editor_done_hook: None,
+            edit_ask: edit_selection::EditAsk::default(),
+            edit_selection_hook: None,
             retiring: Retiring::default(),
             resume_after: std::collections::HashMap::new(),
             history_writer,

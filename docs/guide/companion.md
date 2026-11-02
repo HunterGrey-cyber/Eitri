@@ -10,8 +10,10 @@ it, how focus moves between the two windows, and what each desktop needs. The wi
 
 The panel attaches to your Neovim over its RPC socket and installs a little glue inside it: the file you have
 open and your Visual selection go to the agent, the panel takes your colorscheme and shows your which-key keys,
-buffers reload after the agent edits them, a file opens at a line from the panel, and `Ctrl+g` edits a draft in
-Neovim. It removes all of it again when the panel goes away. Nothing is written to your Neovim configuration.
+buffers reload after the agent edits them, a file opens at a line from the panel, `Ctrl+g` edits a draft in
+Neovim, and `<leader>ae` in Visual mode sends you to the panel's box with the selection attached and
+`Edit the selection: ` ready to finish (where the window manager can be asked to bring the panel forward; elsewhere use your
+desktop's own window keys). It removes all of it again when the panel goes away. Nothing is written to your Neovim configuration.
 Your editor keeps its own speed and keys, and your window manager arranges the two windows.
 
 Plain `eitri` on Hyprland, sway or niri also puts its chats and pages in windows of their own, around Eitri's editor

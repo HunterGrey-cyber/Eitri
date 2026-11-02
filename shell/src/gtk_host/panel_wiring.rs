@@ -29,7 +29,7 @@ use crate::agent_panel::{AgentPanelHandle, ChatMoveEvent, HintInbound, ViewId};
 /// Every hook registration on the panel handle, in the order `wire_panel` makes them. Read by the
 /// tests that hold each window to what it leaves out.
 #[cfg_attr(not(test), allow(dead_code))]
-pub(crate) const HOOKS: [&str; 15] = [
+pub(crate) const HOOKS: [&str; 16] = [
     "on_hint",
     "on_attention",
     "on_toast",
@@ -39,6 +39,7 @@ pub(crate) const HOOKS: [&str; 15] = [
     "set_review_owner",
     "on_review_open",
     "on_editor_done",
+    "on_edit_selection",
     "on_view_empty",
     "on_nav_fallthrough",
     "on_keymap_closed",
@@ -89,6 +90,7 @@ pub(crate) struct PanelHooks {
     pub(crate) set_review_owner: Option<ReviewOwner>,
     pub(crate) on_review_open: Option<Box<dyn Fn()>>,
     pub(crate) on_editor_done: Option<Box<dyn Fn(ViewId)>>,
+    pub(crate) on_edit_selection: Option<Box<dyn Fn()>>,
     pub(crate) on_view_empty: Option<Box<dyn Fn(ViewId)>>,
     pub(crate) on_nav_fallthrough: Option<Box<dyn Fn(ViewId, Direction)>>,
     pub(crate) on_keymap_closed: Option<Box<dyn Fn(u64, bool)>>,
@@ -111,6 +113,7 @@ impl PanelHooks {
             self.set_review_owner.is_some(),
             self.on_review_open.is_some(),
             self.on_editor_done.is_some(),
+            self.on_edit_selection.is_some(),
             self.on_view_empty.is_some(),
             self.on_nav_fallthrough.is_some(),
             self.on_keymap_closed.is_some(),
@@ -140,6 +143,7 @@ pub(crate) fn wire_panel(panel: &AgentPanelHandle, hooks: PanelHooks) {
         set_review_owner,
         on_review_open,
         on_editor_done,
+        on_edit_selection,
         on_view_empty,
         on_nav_fallthrough,
         on_keymap_closed,
@@ -173,6 +177,9 @@ pub(crate) fn wire_panel(panel: &AgentPanelHandle, hooks: PanelHooks) {
     }
     if let Some(hook) = on_editor_done {
         panel.on_editor_done(hook);
+    }
+    if let Some(hook) = on_edit_selection {
+        panel.on_edit_selection(hook);
     }
     if let Some(hook) = on_view_empty {
         panel.on_view_empty(hook);
@@ -288,6 +295,7 @@ mod tests {
             review_open: Rc::new(|| {}),
             editor_request: Rc::new(|_: &ScratchRequest| Ok(())),
             editor_done: Rc::new(|| {}),
+            edit_selection: Rc::new(|| {}),
         });
         assert_eq!(sorted(hooks.missing()), sorted(COMPANION_OMITS.to_vec()));
         assert!(

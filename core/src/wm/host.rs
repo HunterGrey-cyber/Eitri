@@ -854,6 +854,9 @@ pub enum ChatOp {
     PaneFocused { win: WinId, view: ViewId, focused: bool },
     /// Notifies a shown page.
     PageShown { win: WinId, view: ViewId },
+    /// The keys are in the chat after the editor's "edit the selection" key: its shown tab opens the composer with
+    /// the edit prompt ready, where an arrival would land in BROWSE.
+    EditSelection { win: WinId, view: ViewId },
     /// Completes arrival in a view. With `card_first` (a module key, a strip entry, a HINT landing, the window's
     /// first focus) the view's oldest pending card takes the keys if one waits; without it (`Ctrl+h/j/k/l`,
     /// `select.last`, `select.next`, a digit) the view lands where its reader left it, card or not.
@@ -1428,6 +1431,8 @@ pub enum ChatEvent {
     ReviewOpen { win: WinId },
     /// An editor action finished.
     EditorDone { win: WinId, view: ViewId },
+    /// The editor's "edit the selection" key was pressed: the chat takes the keys with its composer open.
+    EditSelection { win: WinId },
     /// A chat supplied hint text.
     Hint { win: WinId, message: String },
     /// A chat supplied a toast: `Attention` for a hidden chat's waiting card, which a refusal does not erase.

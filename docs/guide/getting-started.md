@@ -140,7 +140,9 @@ text back. Until you answer, the panel says "Waiting for your answer to the trus
 started". What the question shows and what each answer means is in
 [Trusting a project](permissions.md#trusting-a-project). Each message also carries the name of the file open in the editor, or the lines you had
 selected there in Visual mode. A selection is what points the agent at a particular piece of code, so select
-the function in the editor first when you say "fix this function"; a cursor position alone is not sent.
+the function in the editor first when you say "fix this function"; a cursor position alone is not sent. With lines selected,
+`<leader>ae` in the editor does the first step for you: the keys go to the panel with the box open and `Edit the selection: `
+in it, and what you type after it is an ordinary message ([Keys](keys.md#editing-the-selection-from-neovim) has the details).
 
 While Claude answers, the reply appears as rendered markdown as it streams in. Each tool the agent runs is a
 quiet line of its own, with a mark in front saying whether it finished (`✓`), failed (`✗`) or is still running

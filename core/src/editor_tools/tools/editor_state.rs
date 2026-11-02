@@ -497,6 +497,7 @@ mod tests {
                 end_line: 5,
                 text: text.to_owned(),
             }),
+            edit_request: None,
         }
     }
 
@@ -651,6 +652,7 @@ mod tests {
         let nothing = EditorContext {
             file: p.root.join("src/a.rs").to_str().unwrap().to_owned(),
             selection: None,
+            edit_request: None,
         };
         let (_, json) = told(&p, EditorReach::Own, Some(&nothing), &reply(vec![], 0, None));
         assert!(json["selection"].is_null(), "{json}");

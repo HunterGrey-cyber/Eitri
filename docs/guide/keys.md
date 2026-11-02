@@ -503,6 +503,18 @@ installs none of the group and says so once, naming what is in the way, so choos
 your plugin manager finishes loading. A plugin that maps one of Eitri's keys later wins that key, and Eitri does not
 put its own back; the rest of the group stays.
 
+### Editing the selection from Neovim
+
+In Visual mode, `<leader>ae` (your `mapleader`; `\` when you have not set one) puts the keys in the
+agent panel with the lines you selected attached and `Edit the selection: ` already in the box, the caret after it. Type what you
+want changed and press `Enter`: that is an ordinary message, so the edit comes back as the agent's usual edit card, and turn
+review shows it afterwards. Nothing is written into your buffer by Eitri. The selection stays selected in Neovim, and the box
+keeps whatever you had already typed instead of the prompt. The message goes to the chat tab the panel shows (`prefix a` finds
+the chat view that has the keys, else the one you used last, and brings it back if it was hidden), and the file and lines are
+named in the status line under the box before you send. The key is put in only where nothing of yours maps it, and Neovim itself maps
+nothing under `<leader>`. For a key of your own, `vim.keymap.set("x", "<leader>k", function() require("eitri").edit_selection() end)`
+does the same and `edit_selection()` returns `false` when no Eitri window or panel is attached.
+
 ## Keys without the prefix
 
 By default the only keys Eitri takes without the prefix are the ones in the table above. `eitri.keymap.set("root", ...)`

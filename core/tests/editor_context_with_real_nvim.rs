@@ -922,3 +922,177 @@ fn a_selection_of_long_lines_fetches_no_more_than_it_sends() {
     }
     std::fs::remove_dir_all(dir).unwrap();
 }
+
+/// The edit-the-selection key, driven in a real nvim: `commands` run after the feed's snippet loaded, then
+/// `doautocmd VimEnter` (the `-c` commands run before that event fires, and the key is put in at it), then
+/// `after`. Returns the update nvim sent last.
+fn drive_edit_key(
+    file: &std::path::Path,
+    commands: &[&str],
+    after: &[&str],
+) -> Option<eitri_core::editor_context::feed::FeedUpdate> {
+    let mut feed = EditorContextFeed::new().expect("the feed must bind");
+    let mut reader = EditorContextReader::new(feed.take_listener().unwrap());
+    let mut all: Vec<&str> = commands.to_vec();
+    all.extend(["doautocmd VimEnter", "sleep 100m"]);
+    all.extend(after);
+    let update = drive_nvim_update(&feed, &mut reader, file, &["--clean"], &all);
+    feed.cleanup();
+    update
+}
+
+fn edit_file(body: &str) -> (std::path::PathBuf, std::path::PathBuf) {
+    let dir = std::env::temp_dir().join(format!("nv-w1-edit-{}", uuid::Uuid::new_v4().simple()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let file = dir.join("t.txt");
+    std::fs::write(&file, body).unwrap();
+    (dir, file)
+}
+
+const PRESS: &str = r#"lua vim.api.nvim_feedkeys(vim.keycode("\\ae"), "x", false)"#;
+
+#[test]
+#[ignore = "needs a real nvim on PATH; spends no tokens and needs no display"]
+fn the_edit_key_stamps_the_line_that_carries_the_selection_and_leaves_visual_mode_on() {
+    let (dir, file) = edit_file("alpha\nbravo\ncharlie\n");
+    let update = drive_edit_key(&file, &["normal! gglvj"], &[PRESS]).expect("an update must arrive");
+    let selection = update
+        .context
+        .selection
+        .expect("the selection is still live after the key");
+    assert_eq!((selection.start_line, selection.end_line), (1, 2));
+    let ask = update.context.edit_request.expect("the line says the key was pressed");
+    // Milliseconds since the epoch, nvim's clock: after 2026-01-01 and not in the future.
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_millis() as u64;
+    assert!((1_767_225_600_000..=now + 1000).contains(&ask), "{ask} vs {now}");
+    std::fs::remove_dir_all(dir).unwrap();
+}
+
+#[test]
+#[ignore = "needs a real nvim on PATH; spends no tokens and needs no display"]
+fn without_the_key_no_line_says_it_was_pressed() {
+    let (dir, file) = edit_file("alpha\nbravo\n");
+    let update = drive_edit_key(&file, &["normal! gglvj"], &[]).expect("an update must arrive");
+    assert!(update.context.selection.is_some());
+    assert_eq!(update.context.edit_request, None);
+    std::fs::remove_dir_all(dir).unwrap();
+}
+
+#[test]
+#[ignore = "needs a real nvim on PATH; spends no tokens and needs no display"]
+fn the_key_follows_the_leader_the_person_set() {
+    let (dir, file) = edit_file("alpha\nbravo\n");
+    let press = r#"lua vim.api.nvim_feedkeys(vim.keycode("<Space>ae"), "x", false)"#;
+    let update = drive_edit_key(&file, &["let mapleader = ' '", "normal! gglvj"], &[press]).expect("an update");
+    assert!(update.context.edit_request.is_some(), "<Space>ae pressed");
+    std::fs::remove_dir_all(dir).unwrap();
+}
+
+#[test]
+#[ignore = "needs a real nvim on PATH; spends no tokens and needs no display"]
+fn a_key_the_person_already_mapped_is_left_theirs() {
+    let (dir, file) = edit_file("alpha\nbravo\n");
+    let theirs = r#"lua vim.keymap.set("x", "\\ae", function() vim.g.theirs = 1 end)"#;
+    let report = format!(
+        "lua vim.fn.writefile({{tostring(vim.g.theirs)}}, '{}')",
+        dir.join("theirs").display()
+    );
+    let update = drive_edit_key(&file, &[theirs, "normal! gglvj"], &[PRESS, &report]).expect("an update");
+    assert_eq!(update.context.edit_request, None, "their mapping ran, not ours");
+    assert_eq!(std::fs::read_to_string(dir.join("theirs")).unwrap().trim(), "1");
+    std::fs::remove_dir_all(dir).unwrap();
+}
+
+#[test]
+#[ignore = "needs a real nvim on PATH; spends no tokens and needs no display"]
+fn the_edit_function_is_there_for_a_key_of_their_own_and_the_default_shadows_no_stock_mapping() {
+    let (dir, file) = edit_file("alpha\nbravo\n");
+    let report = format!(
+        "lua vim.fn.writefile({{tostring(vim.fn.maparg('\\\\ae', 'x')), tostring(vim.fn.maparg('\\\\ae', 'n')), \
+         tostring(type(_G.__eitri_edit_selection))}}, '{}')",
+        dir.join("report").display()
+    );
+    drive_edit_key(&file, &["normal! gglvj"], &[&report]).expect("an update");
+    let report = std::fs::read_to_string(dir.join("report")).unwrap();
+    let lines: Vec<&str> = report.lines().collect();
+    assert_eq!(lines.len(), 3, "{report:?}");
+    assert_ne!(lines[0], "", "the key is mapped in Visual mode");
+    assert_eq!(lines[1], "", "and only there");
+    assert_eq!(lines[2], "function");
+    std::fs::remove_dir_all(dir).unwrap();
+}
+
+#[test]
+#[ignore = "needs a real nvim on PATH; spends no tokens and needs no display"]
+fn a_torn_down_snippet_takes_its_key_and_its_function_away() {
+    let (dir, file) = edit_file("alpha\n");
+    let lua = dir.join("snippet.lua");
+    std::fs::write(&lua, include_str!("../src/editor_context/nvim_editor_context.lua")).unwrap();
+    let report = dir.join("report");
+    let status = std::process::Command::new("nvim")
+        .args(["--headless", "--clean"])
+        .args(["-c", &format!("edit {}", file.display())])
+        .args([
+            "-c",
+            &format!(
+                "lua _G.td = loadfile('{}')({{ socket = '{}' }})",
+                lua.display(),
+                dir.join("none.sock").display()
+            ),
+        ])
+        .args(["-c", "doautocmd VimEnter", "-c", "sleep 100m"])
+        .args([
+            "-c",
+            "lua _G.before = {vim.fn.maparg('\\\\ae', 'x') ~= '', type(_G.__eitri_edit_selection)}",
+        ])
+        .args(["-c", "lua _G.td()"])
+        .args([
+            "-c",
+            &format!(
+                "lua vim.fn.writefile({{tostring(_G.before[1]), _G.before[2], tostring(vim.fn.maparg('\\\\ae', 'x') ~= ''), \
+                 type(_G.__eitri_edit_selection)}}, '{}')",
+                report.display()
+            ),
+        ])
+        .args(["-c", "qa!"])
+        .stdin(std::process::Stdio::null())
+        .status()
+        .expect("nvim must be on PATH for this test");
+    assert!(status.success());
+    let report = std::fs::read_to_string(&report).unwrap();
+    assert_eq!(report.lines().collect::<Vec<_>>(), ["true", "function", "false", "nil"]);
+    std::fs::remove_dir_all(dir).unwrap();
+}
+
+#[test]
+#[ignore = "needs a real nvim on PATH; spends no tokens and needs no display"]
+fn a_leader_that_changes_later_moves_only_the_snippets_own_mapping() {
+    let (dir, file) = edit_file("alpha\nbravo\n");
+    let theirs = r#"lua vim.keymap.set("x", "\\ae", function() vim.g.theirs = 1 end, { desc = "mine" })"#;
+    let report = format!(
+        "lua vim.fn.writefile({{tostring(vim.fn.maparg('\\\\ae', 'x', false, true).desc), \
+         tostring(vim.fn.maparg(' ae', 'x', false, true).desc)}}, '{}')",
+        dir.join("report").display()
+    );
+    drive_edit_key(
+        &file,
+        &["normal! gglvj"],
+        // nvim takes ten -c commands at most.
+        &[
+            theirs,
+            "let mapleader = ' ' | doautocmd User LazyLoad | sleep 100m",
+            &report,
+        ],
+    )
+    .expect("an update");
+    let report = std::fs::read_to_string(dir.join("report")).unwrap();
+    assert_eq!(
+        report.lines().collect::<Vec<_>>(),
+        ["mine", "eitri: edit the selection with the agent"],
+        "their mapping at the old key stays, and the snippet's is at the new one"
+    );
+    std::fs::remove_dir_all(dir).unwrap();
+}

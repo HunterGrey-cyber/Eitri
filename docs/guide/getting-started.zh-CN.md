@@ -1,5 +1,5 @@
 [English](getting-started.md) | 简体中文
-<!-- translated-from: getting-started.md sha256=63d53f1d81691d4914b850d03a916a634d104f038be1f07afc91cc625199c6e8 -->
+<!-- translated-from: getting-started.md sha256=cd95286f5b066f409c9d50c65a944d60c96045edab51e67dfb4a43e4ef7bfe67 -->
 
 # 快速上手
 
@@ -74,7 +74,7 @@ eitri DIR FILE
 <a id="your-first-turn"></a>
 ## 你的第一个回合
 
-按 `Ctrl+l` 把焦点移到面板，再按 `i`（或 `Ctrl+j`）输入你的提示。如果你重新绑定了模块焦点键，就用那个键代替 `Ctrl+l`。`Enter` 发送；`Shift+Enter` 换行，`Alt+Enter` 以及反斜杠加 `Enter` 也一样。会话在你发出第一条消息时才启动，不会更早；而且在一个自带 Claude Code 配置（`.claude/`、`.mcp.json` 或 `CLAUDE.md`）的项目里，要等你回答一个问题才会启动：Eitri 会先扣住这次启动，问是否信任那份配置。`y` 加载它，`n` 不加载它而启动会话，`Esc` 把这次启动推迟并把你的文字还给你。在你回答之前，面板会写 “Waiting for your answer to the trust question — nothing has started”。问题显示什么、每个回答意味着什么，见[信任一个项目](permissions.zh-CN.md#trusting-a-project)。每条消息还会带上编辑器里打开的文件名，或者你在那里用 Visual 模式选中的行。选区才是让 agent 指向某一段代码的方式，所以说“修好这个函数”之前，先在编辑器里把那个函数选上；光标位置本身不会被发送。
+按 `Ctrl+l` 把焦点移到面板，再按 `i`（或 `Ctrl+j`）输入你的提示。如果你重新绑定了模块焦点键，就用那个键代替 `Ctrl+l`。`Enter` 发送；`Shift+Enter` 换行，`Alt+Enter` 以及反斜杠加 `Enter` 也一样。会话在你发出第一条消息时才启动，不会更早；而且在一个自带 Claude Code 配置（`.claude/`、`.mcp.json` 或 `CLAUDE.md`）的项目里，要等你回答一个问题才会启动：Eitri 会先扣住这次启动，问是否信任那份配置。`y` 加载它，`n` 不加载它而启动会话，`Esc` 把这次启动推迟并把你的文字还给你。在你回答之前，面板会写 “Waiting for your answer to the trust question — nothing has started”。问题显示什么、每个回答意味着什么，见[信任一个项目](permissions.zh-CN.md#trusting-a-project)。每条消息还会带上编辑器里打开的文件名，或者你在那里用 Visual 模式选中的行。选区才是让 agent 指向某一段代码的方式，所以说“修好这个函数”之前，先在编辑器里把那个函数选上；光标位置本身不会被发送。选中了行之后，在编辑器里按 `<leader>ae` 就替你做了第一步：按键交给面板，输入框打开，里面已有 `Edit the selection: `，你接着输入的就是一条普通消息（细节见[按键](keys.zh-CN.md#editing-the-selection-from-neovim)）。
 
 Claude 回答时，回复会作为渲染好的 markdown 边流式输出边显示。agent 运行的每个工具是单独一行安静的文字，前面的标记说明它已完成（`✓`）、失败（`✗`）还是仍在运行（`◐`）：一条命令、一个读过的文件、一次搜索。每一次文件编辑是一张小卡片，写着文件名和增删的行数，diff 就在卡片里。
 

@@ -1835,6 +1835,7 @@ mod tests {
                 end_line: 3,
                 text: "two\nthree".into(),
             }),
+            edit_request: None,
         }
     }
 

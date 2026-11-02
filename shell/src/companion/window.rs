@@ -170,6 +170,9 @@ pub(crate) struct CompanionHookParts {
     pub(crate) editor_request: EditorRequest,
     /// An edit came back: the keys return to the panel.
     pub(crate) editor_done: Rc<dyn Fn()>,
+    /// The editor's "edit the selection" key: the window comes forward with the keys in the panel and its
+    /// composer open.
+    pub(crate) edit_selection: Rc<dyn Fn()>,
 }
 
 /// The companion's panel hooks: every one the main window installs but the five in
@@ -186,6 +189,7 @@ pub(crate) fn companion_hooks(parts: CompanionHookParts) -> PanelHooks {
         review_open,
         editor_request,
         editor_done,
+        edit_selection,
     } = parts;
     PanelHooks {
         on_hint: Some(Box::new(move |message: HintInbound| hint(message))),
@@ -195,6 +199,7 @@ pub(crate) fn companion_hooks(parts: CompanionHookParts) -> PanelHooks {
         set_review_owner: Some(Box::new(move || review_owner())),
         on_review_open: Some(Box::new(move || review_open())),
         on_editor_done: Some(Box::new(move |_view: ViewId| editor_done())),
+        on_edit_selection: Some(Box::new(move || edit_selection())),
         // The page's stale-mirror recovery and its `pane_nav` ask for the move the chord would have made.
         on_nav_fallthrough: Some(Box::new(move |_view: ViewId, direction: Direction| {
             move_focus(&ModuleId::agent(), direction);
@@ -729,6 +734,18 @@ pub(crate) fn build(app: &Application, start: &Start) -> Rc<CompanionWindow> {
             }
         })
     };
+    // The editor's "edit the selection" key: this window is the chat, so it comes forward (where the compositor
+    // lets it, as for an edit that came back), takes the keys and opens its composer.
+    let edit_selection: Rc<dyn Fn()> = {
+        let agent_for_edit = agent.clone();
+        let focus_module = focus_module.clone();
+        let runner = runner.clone();
+        Rc::new(move || {
+            focus_module(&ModuleId::agent());
+            runner.raise_pid(std::process::id());
+            agent_for_edit.edit_selection(ViewId::BASE);
+        })
+    };
     // Every hook the panel gets here, registered once its last one is built. Nothing above can make
     // the panel call one: the window is still being built, and no page message is read before the
     // main loop runs again.
@@ -744,6 +761,7 @@ pub(crate) fn build(app: &Application, start: &Start) -> Rc<CompanionWindow> {
             review_open,
             editor_request,
             editor_done,
+            edit_selection,
         }),
     );
 

@@ -146,6 +146,7 @@ impl Scratch {
             context: Some(EditorContext {
                 file: file.to_str().unwrap().to_owned(),
                 selection,
+                edit_request: None,
             }),
             facts: PushFacts {
                 cursor_line: Some(2),

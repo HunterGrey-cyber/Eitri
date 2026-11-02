@@ -44,6 +44,7 @@ mod tests {
         EditorContext {
             file: file.to_owned(),
             selection: None,
+            edit_request: None,
         }
     }
 

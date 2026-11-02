@@ -1,5 +1,5 @@
 [English](keys.md) | 简体中文
-<!-- translated-from: keys.md sha256=87f3e5fb11bc078cb63b6005e54cd8685202795cf3f6cd3f12e6020b96c2f132 -->
+<!-- translated-from: keys.md sha256=3dfae981f5d68462966798c93d8d16c246668b351545e7666a562ab7aa9a4f44 -->
 
 # 按键
 
@@ -309,6 +309,11 @@ vim.api.nvim_create_autocmd("User", {
 **一个 leader 组。** `eitri.config.set("keymap.nvim_prefix", "<leader>W")` 在 Normal 模式里，把你生效的前缀表里的布局键映射到这个左端之下：`<leader>Wz` 放大，每个分割键成为一个组（`<leader>W%t` 在右边放一个终端，`<leader>W"e` 在下面放一个编辑器）。描述写成 `Eitri: zoom`，所以 which-key 把它们列在一个组 “Eitri window” 下。你在前缀之后学到的，就是在 `<leader>W` 之后要按的；tmux 导入和 `init.lua` 里的改动也一并带过来，因为这个组就是从那张表生成的。默认是 `"off"`。值是一个 Neovim 的左端，最长 16 个字符，可以用 `<leader>` 和 `<localleader>`。
 
 如果那个左端本身或它之下已经有映射（LazyVim 把 `<leader>w` 当作它的窗口组），Eitri 一个都不装，并说一次是什么挡了路，所以请换一个。插件管理器加载完之后，Eitri 会再看一遍。之后有插件映射了 Eitri 的某个键，这个键以插件的为准，Eitri 不会把自己的放回去；组里其余的键不变。
+
+<a id="editing-the-selection-from-neovim"></a>
+### 从 Neovim 编辑选区
+
+在 Visual 模式里按 `<leader>ae`（你的 `mapleader`；没设过就是 `\`），按键就交给 agent 面板：你选中的行带在消息上，输入框里已经写好 `Edit the selection: `，光标在它后面。写下想改什么，按 `Enter`：这是一条普通消息，所以修改以 agent 平常的编辑卡片回来，之后可以在 turn review 里看。Eitri 不会往你的缓冲区里写任何东西。选区在 Neovim 里保持选中；输入框里如果已经有你打的字，就保留它们，不再放这句提示。消息发给面板正显示的那个聊天标签（`prefix a` 找的聊天视图：有按键的那个，否则是你最近用的那个，它被隐藏了就带回来），发送前，输入框下面的状态行已经写出了文件和行号。这个键只在你没有映射它的地方才会装上，而 Neovim 自己在 `<leader>` 之下什么也没映射。想用自己的键：`vim.keymap.set("x", "<leader>k", function() require("eitri").edit_selection() end)` 效果一样，没有 Eitri 窗口或面板附着时 `edit_selection()` 返回 `false`。
 
 <a id="keys-without-the-prefix"></a>
 ## 不带前缀的键

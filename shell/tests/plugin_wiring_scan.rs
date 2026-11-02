@@ -327,6 +327,7 @@ fn no_panel_hook_decides_in_build_ui() {
         "on_view_empty",
         "on_review_open",
         "on_editor_done",
+        "on_edit_selection",
         "on_editor_request",
         "on_tab_verb",
     ] {

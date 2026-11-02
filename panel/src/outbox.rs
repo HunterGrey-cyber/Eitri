@@ -92,6 +92,8 @@ pub(super) enum Effect {
     Busy { changed: Vec<(ViewId, bool)> },
     /// A draft edited in nvim came back: the keys return to this chat view.
     EditorDone(ViewId),
+    /// The editor's "edit the selection" key was pressed: the window puts the keys in the chat.
+    EditSelection,
     /// The editor opened a file for the review: the window brings the editor to the user.
     EditorOpened,
     /// One of the panel's HINT messages, for the window's HINT session.
@@ -286,6 +288,12 @@ impl Outbox {
                     let hook = state.borrow().editor_done_hook.clone();
                     if let Some(hook) = hook {
                         hook(view);
+                    }
+                }
+                Effect::EditSelection => {
+                    let hook = state.borrow().edit_selection_hook.clone();
+                    if let Some(hook) = hook {
+                        hook();
                     }
                 }
                 Effect::PairOutbound(outbound) => {

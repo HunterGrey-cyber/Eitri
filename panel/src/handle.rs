@@ -1792,6 +1792,25 @@ impl AgentPanelHandle {
         self.state.borrow_mut().editor_done_hook = Some(Rc::new(hook));
     }
 
+    /// Called when the editor's "edit the selection" key was pressed (the panel reads each press once): the
+    /// window puts the keys in the chat and then calls [`edit_selection`](Self::edit_selection) for the view that
+    /// took them. A window that installs none leaves the key doing nothing here.
+    pub fn on_edit_selection(&self, hook: impl Fn() + 'static) {
+        self.wake();
+        self.state.borrow_mut().edit_selection_hook = Some(Rc::new(hook));
+    }
+
+    /// The keys are in `view` after the editor's "edit the selection" key: the tab it shows opens its composer,
+    /// with the edit prompt in it when the draft was empty, the caret at its end. Safe before the page loads
+    /// (the dispatch is guarded), as [`enter_input`](Self::enter_input) is.
+    pub fn edit_selection(&self, view: ViewId) {
+        self.wake();
+        if self.closing() {
+            return;
+        }
+        self.run(|state, out| super::edit_selection::open_composer(state, view, out));
+    }
+
     /// Called with the value before and after whenever [`AgentPanelHandle::attention`] changes, or
     /// one tab's own attention does ([`AgentPanelHandle::attention_of`] for its view) -- the one place
     /// that knows both, so `main.rs` keeps no copy of its own to drift -- with the views handed a card

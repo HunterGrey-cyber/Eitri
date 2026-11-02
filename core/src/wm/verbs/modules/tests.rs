@@ -643,6 +643,110 @@ fn a_split_key_on_an_existing_module_places_it_and_arrives_only_if_the_grab_took
     }
 }
 
+/// The editor's edit key puts the keys in the chat and opens its composer: the grab's tail is the composer's
+/// opening, not the reader's arrival, and a grab the host refuses opens nothing.
+#[test]
+fn the_edit_key_gives_the_chat_the_keys_and_opens_its_composer_instead_of_arriving() {
+    let edit = HostOp::Chat(ChatOp::EditSelection {
+        win: WIN,
+        view: ViewId::BASE,
+    });
+    for grab_takes in [true, false] {
+        let without = if grab_takes { vec![] } else { vec![agent()] };
+        let r = driven_without(three(editor()), &without);
+        r.native(&editor());
+        let mark = r.mark();
+        r.driver.post(HostEvent::Chat(ChatEvent::EditSelection { win: WIN }));
+        let applied = r.applied_since(mark);
+        let grab = applied
+            .iter()
+            .position(|(op, _)| {
+                matches!(op, HostOp::Focus { to: FocusTo::Module(m), on_grab, .. } if *m == agent() && *on_grab == vec![edit.clone()])
+            })
+            .unwrap_or_else(|| panic!("the chat is given the keys, the composer its tail: {applied:?}"));
+        assert!(
+            !applied
+                .iter()
+                .any(|(op, _)| matches!(op, HostOp::Chat(ChatOp::Arrive { .. }))),
+            "the composer replaces the arrival: {applied:?}"
+        );
+        let opened = applied.iter().position(|(op, _)| *op == edit);
+        if grab_takes {
+            assert_eq!(applied[grab].1, Applied::Done);
+            assert_eq!(opened, Some(grab + 1), "the composer opens after the grab that took");
+        } else {
+            assert_eq!(applied[grab].1, Applied::Refused);
+            assert_eq!(opened, None, "a refused grab opens nothing");
+        }
+    }
+}
+
+/// A chat that is hidden comes back, and one the keys are already in is not hidden by a second press: the edit
+/// key never toggles.
+#[test]
+fn the_edit_key_shows_a_hidden_chat_and_never_hides_one() {
+    let edit = HostOp::Chat(ChatOp::EditSelection {
+        win: WIN,
+        view: ViewId::BASE,
+    });
+    let mut layout = three(editor());
+    crate::layout::hide(&mut layout, &agent(), &Frame::new(GRID, 1)).unwrap();
+    let r = driven(layout);
+    assert!(!r.layout.borrow().is_shown(&agent()));
+    r.driver.post(HostEvent::Chat(ChatEvent::EditSelection { win: WIN }));
+    assert!(r.layout.borrow().is_shown(&agent()), "the chat is shown");
+    assert_eq!(r.layout.borrow().focus(), &agent(), "and holds the keys");
+
+    for _ in 0..2 {
+        let mark = r.mark();
+        r.driver.post(HostEvent::Chat(ChatEvent::EditSelection { win: WIN }));
+        assert!(
+            r.layout.borrow().is_shown(&agent()),
+            "a press with the keys there hides nothing"
+        );
+        assert!(r.ops_since(mark).contains(&edit), "and opens the composer again");
+    }
+}
+
+/// A chat in the other window of a pair is that window's: that window is raised, as the chat's key raises it (its own
+/// panel hears the same press and opens the composer), and this window takes none of it.
+#[test]
+fn the_edit_key_raises_the_other_window_for_a_chat_that_lives_there() {
+    let r = driven(three(editor()));
+    r.layout.borrow_mut().set_away(&agent(), true).unwrap();
+    let mark = r.mark();
+    r.driver.post(HostEvent::Chat(ChatEvent::EditSelection { win: WIN }));
+    assert_eq!(
+        r.refusals_since(mark),
+        vec!["'agent' is in the other window".to_string()],
+        "with no window there, the key says where the chat is, as the chat's key does"
+    );
+    assert!(
+        !r.ops_since(mark)
+            .iter()
+            .any(|op| matches!(op, HostOp::Chat(ChatOp::EditSelection { .. }))),
+        "and opens no composer"
+    );
+
+    r.driver
+        .attach_peer(WIN, PeerId(1), WindowName::Second, crate::wm::fake::FakePeerPort::new());
+    let mark = r.mark();
+    r.driver.post(HostEvent::Chat(ChatEvent::EditSelection { win: WIN }));
+    let ops = r.ops_since(mark);
+    assert!(
+        ops.contains(&HostOp::RaisePeer {
+            win: WIN,
+            peer: PeerId(1)
+        }),
+        "the window holding the chat comes forward: {ops:?}"
+    );
+    assert!(
+        !ops.iter()
+            .any(|op| matches!(op, HostOp::Chat(ChatOp::EditSelection { .. }))),
+        "and this window opens no composer of its own: {ops:?}"
+    );
+}
+
 /// While the kill's y/n is shown, the window stage answers it before the prefix: the prefix key closes it without
 /// arming the prefix and kills nothing, and `y` kills.
 #[test]

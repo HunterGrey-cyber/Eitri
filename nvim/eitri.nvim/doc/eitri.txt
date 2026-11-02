@@ -105,6 +105,23 @@ outside that is refused with an error message and nothing is sent. Returns
 true when the line was sent, false in any other nvim (including a terminal
 nvim that only has the panel attached) or when it could not be sent.
 
+                                                        *eitri.edit_selection()*
+require("eitri").edit_selection()
+
+Asks Eitri to put the keys in the agent panel with your Visual selection
+attached and `Edit the selection: ` in the message box. The nvim of an Eitri
+window and a terminal nvim with a panel attached both have it in Visual mode as
+`<leader>ae`, put in only where nothing of yours holds that key. Call this from
+a key of your own instead:
+>lua
+  vim.keymap.set("x", "<leader>k", function()
+    require("eitri").edit_selection()
+  end, { desc = "Eitri: edit the selection" })
+<
+Visual mode is not left, so the selection goes with the message you type next.
+Returns true when the ask was sent, false in an nvim with no Eitri window or
+panel attached.
+
 ==============================================================================
 5. INSIDE TMUX                                                     *eitri-tmux*
 

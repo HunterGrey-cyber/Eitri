@@ -190,6 +190,18 @@ pub fn land_by_key(w: &mut Window, win: WinId, to: &ModuleId, batch: &mut Batch)
 /// way to being refused; a zoom ends only when it would keep `to` off screen, so landing on the zoomed module
 /// itself keeps it.
 pub fn focus_and_arrive(w: &mut Window, win: WinId, to: &ModuleId, batch: &mut Batch) -> Result<(), LayoutError> {
+    focus_then(w, win, to, arrive_tail(win, to, true), batch)
+}
+
+/// [`focus_and_arrive`] with the grab's tail `on_grab` in place of the arrival: a route whose landing is not the
+/// reader's place (the editor's "edit the selection" key lands in the composer).
+pub fn focus_then(
+    w: &mut Window,
+    win: WinId,
+    to: &ModuleId,
+    on_grab: Vec<HostOp>,
+    batch: &mut Batch,
+) -> Result<(), LayoutError> {
     let layout = w.layout.clone();
     let zoom_hides = match layout.try_borrow() {
         Ok(layout) => {
@@ -204,7 +216,7 @@ pub fn focus_and_arrive(w: &mut Window, win: WinId, to: &ModuleId, batch: &mut B
     if zoom_hides {
         unzoom(w, win, batch);
     }
-    give_keys(w, win, to, arrive_tail(win, to, true), batch);
+    give_keys(w, win, to, on_grab, batch);
     Ok(())
 }
 

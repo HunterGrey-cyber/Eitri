@@ -73,4 +73,15 @@ function M.edge(direction)
   return false
 end
 
+-- Asks Eitri to put the keys in the chat with the Visual selection attached and the edit prompt ready, as
+-- `<leader>ae` does in Visual mode where nothing of yours holds that key (`vim.keymap.set("x", "<leader>k",
+-- function() require("eitri").edit_selection() end)`). False when no Eitri window or panel is attached to this nvim.
+function M.edit_selection()
+  local ask = rawget(_G, "__eitri_edit_selection")
+  if type(ask) ~= "function" then
+    return false
+  end
+  return ask() == true
+end
+
 return M

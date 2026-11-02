@@ -8690,6 +8690,7 @@ mod tests {
         let inside = EditorContext {
             file: "/home/user/project/src/parser.rs".into(),
             selection: None,
+            edit_request: None,
         };
         assert_eq!(
             context_summary(Some(&inside), root),
@@ -8705,6 +8706,7 @@ mod tests {
                 end_line: 9,
                 text: "x".into(),
             }),
+            edit_request: None,
         };
         assert_eq!(
             context_summary(Some(&selected), root),
@@ -8716,6 +8718,7 @@ mod tests {
         let unnamed = EditorContext {
             file: String::new(),
             selection: None,
+            edit_request: None,
         };
         assert_eq!(
             context_summary(Some(&unnamed), root),

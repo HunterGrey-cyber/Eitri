@@ -3552,6 +3552,12 @@ fn build_ui(
     }
     {
         let driver = driver.clone();
+        panel_hooks.on_edit_selection = Some(Box::new(move || {
+            driver.post(HostEvent::Chat(ChatEvent::EditSelection { win: WinId::MAIN }));
+        }));
+    }
+    {
+        let driver = driver.clone();
         panel_hooks.on_view_empty = Some(Box::new(move |view: ViewId| {
             driver.post(HostEvent::Chat(ChatEvent::ViewEmpty { win: WinId::MAIN, view }));
         }));

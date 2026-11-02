@@ -665,6 +665,7 @@ mod tests {
                 end_line: 60,
                 text: "x".repeat(2000),
             }),
+            edit_request: None,
         };
         handle.state.borrow_mut().editor_context = Rc::new(move || Some(context.clone()));
         handle.state.borrow_mut().project_dir = PathBuf::from("/p");

@@ -12,6 +12,7 @@ page lists only what differs or crosses between the two windows.
 | nvim | `Ctrl+h/j/k/l` at the edge of nvim's own windows | nvim hands the move to the panel, which asks the window manager to focus the neighbouring window. Eitri's fallback binds a key only where your configuration has left it empty or at nvim's default |
 | nvim | smart-splits `at_edge` hook | `require("eitri").edge(ctx.direction)` hands the move over; it returns `false` when no panel is attached |
 | nvim | vim-tmux-navigator maps, nvim outside tmux | treated as plain window moves while a panel is attached; nothing to configure |
+| nvim | `<leader>ae` in Visual mode | puts the keys in the panel's message box with the selection attached and `Edit the selection: ` in it (only where nothing of yours holds the key; `require("eitri").edit_selection()` is the call for a key of your own). On sway, Hyprland and niri the panel's window is brought forward; elsewhere use your desktop's window keys |
 | nvim | `:EitriPanel [dir]` | opens the panel for `dir` (default: the working directory), or attaches and raises the one already open for the project |
 | panel | `Ctrl+h`, `Ctrl+l` | always leave the window (the window manager moves focus) |
 | panel | `Ctrl+k` | leaves the window from BROWSE; in INPUT it switches to BROWSE |

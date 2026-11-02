@@ -1,5 +1,7 @@
 -- Eitri editor-context feed (wire 1). Loaded by `shell` with `--cmd`, before the user's own
--- config, so it only installs autocommands and a timer; it changes no setting and no keymap.
+-- config, so at load it only installs autocommands and a timer; it changes no setting. Its one
+-- keymap, `<leader>ae` in Visual mode, is put in after startup and only where nothing holds the
+-- key (see `edit_selection`).
 --
 -- It writes one JSON line per update to EITRI_EDITOR_SOCKET: which file is focused, what its text
 -- was read from, where the cursor is, and -- only while a visual selection is actually live -- the
@@ -47,6 +49,11 @@ local CONTENT_BYTES = 4 * (CONTENT_LIMIT + 1) + 8
 
 -- Whether something changed since the last send; the timer is armed exactly while it is set.
 local dirty = false
+-- When the person last asked to edit the selection (milliseconds since the epoch), or nil. Every
+-- line from then on carries it as `edit`, so a line the host does not read (it keeps only the
+-- newest) cannot lose the ask: whichever line it reads says that one was made, and a value it has
+-- not seen is a new ask.
+local edit_asked = nil
 -- Set first thing by the teardown: a send the timer queued just before it must write nothing.
 local torn = false
 
@@ -249,6 +256,7 @@ local function send()
       read_from = vim.b[buf].eitri_read_from,
       line = vim.fn.line("."),
       selection = selection(),
+      edit = edit_asked,
     })
   end)
   if not ok or not payload then
@@ -286,7 +294,93 @@ local function changed()
   timer:start(INTERVAL_MS, 0, fire)
 end
 
+-- Asks the host to put the keys in the composer with the selection attached. The mode is not
+-- left, as for the nav keys at nvim's edge: the host reads the selection from the line this sends,
+-- and a Visual selection that ended here would be gone from the next one. The line goes out now, not
+-- on the timer, so the ask and the selection it is about travel together.
+local function edit_selection()
+  if torn then
+    return false
+  end
+  local sec, usec = vim.uv.gettimeofday()
+  local now = sec * 1000 + math.floor(usec / 1000)
+  -- Strictly later than the last ask, so two asks in one millisecond are still two.
+  edit_asked = (edit_asked and now <= edit_asked) and edit_asked + 1 or now
+  dirty = false
+  timer:stop()
+  send()
+  return true
+end
+
+-- Whoever maps their own key calls this (`require("eitri").edit_selection()`).
+_G.__eitri_edit_selection = edit_selection
+
+-- Visual-mode `<leader>ae`: stock Vim and Neovim map nothing under `<leader>`, so the key shadows no
+-- default. It is put in after startup (the person's `mapleader` is set by then) and only where nothing
+-- global holds the key; one that does is theirs, and `edit_selection` is there for the key they would
+-- rather use.
+local EDIT_SUFFIX = "ae"
+local EDIT_DESC = "eitri: edit the selection with the agent"
+
+local function leader()
+  local value = vim.g.mapleader
+  if type(value) ~= "string" or value == "" then
+    return "\\"
+  end
+  return value
+end
+
+local installed_lhs = nil
+
+-- Whether the Visual mapping of `lhs` is this snippet's own: one the person or a plugin put there since is theirs.
+local function owns(lhs)
+  for _, m in ipairs(vim.api.nvim_get_keymap("x")) do
+    if m.lhsraw == lhs and m.desc == EDIT_DESC then
+      return true
+    end
+  end
+  return false
+end
+
+local function check_edit_key()
+  if torn then
+    return
+  end
+  local lhs = leader() .. EDIT_SUFFIX
+  if installed_lhs == lhs then
+    return
+  end
+  for _, m in ipairs(vim.api.nvim_get_keymap("x")) do
+    if m.lhsraw == lhs then
+      return
+    end
+  end
+  if installed_lhs and owns(installed_lhs) then
+    pcall(vim.keymap.del, "x", installed_lhs)
+  end
+  installed_lhs = lhs
+  vim.keymap.set("x", lhs, edit_selection, { desc = EDIT_DESC, silent = true })
+end
+
+local pending_check = false
+local function schedule_check()
+  if pending_check then
+    return
+  end
+  pending_check = true
+  vim.schedule(function()
+    pending_check = false
+    pcall(check_edit_key)
+  end)
+end
+
 local group = vim.api.nvim_create_augroup("EitriEditorContext", { clear = true })
+vim.api.nvim_create_autocmd("VimEnter", { group = group, callback = schedule_check })
+vim.api.nvim_create_autocmd("User", { group = group, pattern = { "VeryLazy", "LazyLoad" }, callback = schedule_check })
+-- Injected into a running nvim, no startup event is left to come.
+if vim.v.vim_did_enter == 1 then
+  schedule_check()
+end
 vim.api.nvim_create_autocmd(
   { "CursorMoved", "CursorMovedI", "ModeChanged", "BufEnter", "BufFilePost", "VimEnter" },
   {
@@ -356,6 +450,12 @@ changed()
 return function()
   torn = true
   pcall(vim.api.nvim_del_augroup_by_id, group)
+  if rawget(_G, "__eitri_edit_selection") == edit_selection then
+    _G.__eitri_edit_selection = nil
+  end
+  if installed_lhs and owns(installed_lhs) then
+    pcall(vim.keymap.del, "x", installed_lhs)
+  end
   for _, buf in ipairs(vim.api.nvim_list_bufs()) do
     pcall(vim.api.nvim_buf_del_var, buf, "eitri_read_from")
     pcall(vim.api.nvim_buf_del_var, buf, "eitri_diagnostics_stood")

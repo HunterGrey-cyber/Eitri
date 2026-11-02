@@ -575,6 +575,55 @@ pub(in crate::wm) fn reveal_and_focus(
     }
 }
 
+/// The editor's "edit the selection" key. The chat the chat key reaches (the one with the keys, else the most recent)
+/// is brought on screen as a tray chip brings it -- shown when hidden, placed when this workspace lacks it, never
+/// hidden -- and given the keys; once they are there the panel opens its composer with the edit prompt ready
+/// ([`ChatOp::EditSelection`]), where an ordinary arrival would land on the reader's place. A chat that lives in the
+/// other window of a linked pair is that window's: the window is raised, as the chat's key raises it, and its own
+/// panel, told the same ask, opens the composer there.
+pub fn edit_selection(w: &mut Window, cx: &Cx, win: WinId, batch: &mut Batch) {
+    let agent = ModuleId::agent();
+    let layout = w.layout.clone();
+    let Ok(layout) = layout.try_borrow() else {
+        w.warn("[wm] BUG: the layout was borrowed when the edit key ran".into());
+        return;
+    };
+    let target = layout::module_target(&layout, &agent);
+    let others = layout.is_away(&target) || (!layout.contains(&target) && w.held_by(&target).is_some());
+    let action = layout::key_action(&layout, &target, false);
+    drop(layout);
+    // That window's own panel reads the same press and opens its composer; this window brings it forward, as the
+    // chat's key would, since keys given to a window nobody looks at are no use.
+    if others {
+        if !peer_key(w, cx, win, &target, batch) {
+            w.say(format!("[modules] {target}: the edit ask is the other window's"));
+        }
+        return;
+    }
+    if !has_host(w, &target) {
+        let text = feedback::not_here_yet_text(&target);
+        w.say(format!("[modules] {text}"));
+        w.refuse(win, text, batch);
+        return;
+    }
+    let Some(view) = ViewId::of_module(&target) else {
+        w.warn(format!("[wm] BUG: {target} is a chat with no view"));
+        return;
+    };
+    w.say(format!("[modules] {target}: {action:?}, for the edit key"));
+    let tail = vec![HostOp::Chat(ChatOp::EditSelection { win, view })];
+    let result = match action {
+        KeyAction::ShowAndFocus => {
+            show_on_screen(w, cx, win, &target, batch).and_then(|()| focus::focus_then(w, win, &target, tail, batch))
+        }
+        KeyAction::Focus | KeyAction::Hide => focus::focus_then(w, win, &target, tail, batch),
+        KeyAction::Place => place_then(w, cx, win, &target, Axis::Row, tail, batch),
+    };
+    if let Err(err) = result {
+        refuse_layout(w, win, &err, batch);
+    }
+}
+
 /// A module key's four cases for `id`; a refusal flashes the app name and the toast says why. A plugin module that
 /// starts hidden is opened by its own rule rather than split beside the keys, and takes the keys as every module key
 /// gives them.
@@ -970,6 +1019,19 @@ pub fn place_and_arrive(
     axis: Axis,
     batch: &mut Batch,
 ) -> Result<(), LayoutError> {
+    place_then(w, cx, win, id, axis, arrive_tail(win, id, true), batch)
+}
+
+/// [`place_and_arrive`] with the grab's tail `on_grab` in place of the arrival.
+pub fn place_then(
+    w: &mut Window,
+    cx: &Cx,
+    win: WinId,
+    id: &ModuleId,
+    axis: Axis,
+    on_grab: Vec<HostOp>,
+    batch: &mut Batch,
+) -> Result<(), LayoutError> {
     placeable_by_id(id, !idle(w, id))?;
     if !has_host(w, id) {
         return Err(LayoutError::NotInTree(id.clone()));
@@ -993,7 +1055,7 @@ pub fn place_and_arrive(
             workspaces.add_everywhere_at(id, placement);
         }
     }
-    change_then_give(w, win, true, id, arrive_tail(win, id, true), batch);
+    change_then_give(w, win, true, id, on_grab, batch);
     Ok(())
 }
 

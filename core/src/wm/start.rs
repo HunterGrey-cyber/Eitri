@@ -444,6 +444,7 @@ pub(super) fn event_window(event: &HostEvent) -> Option<WinId> {
             | ChatEvent::NavFallthrough { win, .. }
             | ChatEvent::ReviewOpen { win }
             | ChatEvent::EditorDone { win, .. }
+            | ChatEvent::EditSelection { win }
             | ChatEvent::Hint { win, .. }
             | ChatEvent::Toast { win, .. }
             | ChatEvent::KeymapClosed { win, .. }

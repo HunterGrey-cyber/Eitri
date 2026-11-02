@@ -51,6 +51,7 @@ mod tests {
                 end_line,
                 text: text.into(),
             }),
+            edit_request: None,
         }
     }
 
@@ -126,6 +127,7 @@ mod tests {
         let context = EditorContext {
             file: "/project/a.rs".into(),
             selection: None,
+            edit_request: None,
         };
         assert_eq!(
             params(&context, None, None),
@@ -142,6 +144,7 @@ mod tests {
         let context = EditorContext {
             file: "/project/a.rs".into(),
             selection: None,
+            edit_request: None,
         };
         let inside = Path::new(std::ffi::OsStr::from_bytes(b"/p/caf\xe9.rs"));
         let value = selection_params(Some(&context), &PushFacts::default(), Some(inside));
@@ -159,6 +162,7 @@ mod tests {
         let context = EditorContext {
             file: "/outside/secret".into(),
             selection: None,
+            edit_request: None,
         };
         assert_eq!(selection_params(Some(&context), &facts, None), empty());
         assert_eq!(

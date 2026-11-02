@@ -1759,6 +1759,9 @@ impl Decide for Controller {
                     verbs::chat::editor_done(w, cx, win, view, batch)
                 })
             }
+            HostEvent::Chat(ChatEvent::EditSelection { win }) => self.modules_event(win, &mut batch, |w, cx, batch| {
+                module_verbs::edit_selection(w, cx, win, batch)
+            }),
             // The chat calls that name a module when refused are a join back and a move's freeze.
             HostEvent::Refused {
                 what: OpTag::Chat,

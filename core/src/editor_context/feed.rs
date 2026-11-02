@@ -254,6 +254,16 @@ fn parse_facts(value: &serde_json::Value) -> PushFacts {
     }
 }
 
+/// The `edit` field: whole milliseconds, which Lua's JSON writes as an integer (a float that is whole is taken
+/// too). Anything else is no ask, as an absent field is.
+fn parse_edit_request(value: &serde_json::Value) -> Option<u64> {
+    let edit = value.get("edit")?;
+    edit.as_u64().or_else(|| {
+        let float = edit.as_f64()?;
+        (float >= 0.0 && float.fract() == 0.0 && float < 9_007_199_254_740_992.0).then_some(float as u64)
+    })
+}
+
 fn parse_update(line: &str) -> Result<FeedUpdate, String> {
     let value: serde_json::Value = serde_json::from_str(line.trim()).map_err(|e| format!("not JSON: {e}"))?;
     let version = value.get("v").and_then(serde_json::Value::as_u64);
@@ -285,7 +295,11 @@ fn parse_update(line: &str) -> Result<FeedUpdate, String> {
         }
     };
     Ok(FeedUpdate {
-        context: EditorContext { file, selection },
+        context: EditorContext {
+            file,
+            selection,
+            edit_request: parse_edit_request(&value),
+        },
         facts: parse_facts(&value),
     })
 }
@@ -314,7 +328,8 @@ mod tests {
                 update.context,
                 EditorContext {
                     file: "/p/a.rs".into(),
-                    selection
+                    selection,
+                    edit_request: None,
                 }
             );
             assert_eq!(
@@ -327,6 +342,28 @@ mod tests {
                 }
             );
         }
+    }
+
+    #[test]
+    fn an_edit_ask_is_whole_milliseconds_and_anything_else_is_none() {
+        let ask = |edit: serde_json::Value| {
+            let line = serde_json::json!({"v": 1, "file": "/p/a.rs", "edit": edit}).to_string();
+            parse_update(&line).unwrap().context.edit_request
+        };
+        assert_eq!(ask(serde_json::json!(1_788_000_000_123_u64)), Some(1_788_000_000_123));
+        assert_eq!(ask(serde_json::json!(1_788_000_000_123.0)), Some(1_788_000_000_123));
+        for not_an_ask in [
+            serde_json::json!(-1),
+            serde_json::json!(1.5),
+            serde_json::json!("7"),
+            serde_json::json!(true),
+            serde_json::json!(null),
+            serde_json::json!(1e300),
+        ] {
+            assert_eq!(ask(not_an_ask.clone()), None, "{not_an_ask}");
+        }
+        let line = r#"{"v":1,"file":"/p/a.rs"}"#;
+        assert_eq!(parse_update(line).unwrap().context.edit_request, None);
     }
 
     #[test]

@@ -31,6 +31,11 @@ pub struct EditorContext {
     /// [`compose_turn_text`] checks it rather than assuming a name exists.
     pub file: String,
     pub selection: Option<Selection>,
+    /// The time (milliseconds since the epoch, nvim's clock) of the editor's latest "edit the selection" key, or
+    /// `None` before the first. It is not part of what a turn says -- [`compose_turn_text`] never reads it -- only
+    /// news for the panel: a value it has not seen is a new ask.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub edit_request: Option<u64>,
 }
 
 /// The CLI's own cap on how much selected text it forwards, and its own marker.
@@ -238,6 +243,7 @@ mod tests {
         EditorContext {
             file: file.to_string(),
             selection,
+            edit_request: None,
         }
     }
 
