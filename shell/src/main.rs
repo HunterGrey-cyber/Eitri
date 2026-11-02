@@ -40,6 +40,7 @@ mod plugin_page;
 mod plugin_panels;
 mod prefix_strip;
 mod process_memory;
+mod project_host;
 mod project_stamp;
 mod root_conflicts;
 mod sidecar_probe;
@@ -2792,6 +2793,46 @@ fn build_ui(
     // under it.
     let onboarding_screen = gtk_host::onboarding::OnboardingScreen::new();
     hint_overlay.add_overlay(onboarding_screen.widget());
+    let project_chooser = Rc::new(gtk_host::project_chooser::ProjectChooserView::new(Rc::new({
+        let sink: Rc<dyn eitri_core::wm::HostSink> = driver.clone();
+        let sink = Rc::downgrade(&sink);
+        move |report| {
+            use eitri_core::wm::ProjectEvent;
+            use gtk_host::project_chooser::ChooserReport;
+            let Some(sink) = sink.upgrade() else {
+                return;
+            };
+            let win = eitri_core::wm::WinId::MAIN;
+            let event = match report {
+                ChooserReport::Line(ev) => ProjectEvent::Line { win, ev },
+                ChooserReport::Pick(index) => ProjectEvent::Pick { win, index },
+                ChooserReport::Dismiss => ProjectEvent::Dismiss { win },
+                ChooserReport::Folder(path) => ProjectEvent::Folder { win, path },
+            };
+            sink.post(eitri_core::wm::HostEvent::Project(event));
+        }
+    })));
+    hint_overlay.add_overlay(project_chooser.widget());
+    {
+        let control = eitri_core::panel_control::control_dir(
+            std::env::var_os("XDG_RUNTIME_DIR").as_deref(),
+            &std::env::temp_dir(),
+        );
+        let sources = eitri_core::recent_projects::Sources::from_env(
+            std::env::var_os("XDG_STATE_HOME").as_deref(),
+            std::env::var_os("HOME").as_deref(),
+            control,
+        );
+        let sink: Rc<dyn eitri_core::wm::HostSink> = driver.clone();
+        wm_host.set_project_host(project_host::WindowProjects::new(
+            eitri_core::wm::WinId::MAIN,
+            window.upcast_ref(),
+            project_chooser.clone(),
+            sources,
+            Rc::downgrade(&sink),
+        ));
+    }
+
     // A window 1 an orphaned window 2 refused runs unpaired: the user sees why, and the refusal says what brings the
     // pair back.
     // The mode's own notes follow it: they are said once, and a toast that replaced the relink's would hide it.
@@ -3163,6 +3204,10 @@ fn build_ui(
                         move || prompt.hide_model()
                     }),
                 },
+                project_chooser: Box::new({
+                    let chooser = project_chooser.clone();
+                    move |view| chooser.show(view)
+                }),
                 // The first-start screen, drawn from the model's view; the host logs each change when asked to.
                 onboarding: Box::new({
                     let screen = onboarding_screen.clone();

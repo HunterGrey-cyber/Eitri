@@ -244,3 +244,8 @@ harness = false
 [[test]]
 name = "grid_unrealize_line"
 harness = false
+
+# GTK owns the main thread; the opt-in placement checks use their own isolated Xvfb.
+[[test]]
+name = "project_chooser_placement"
+harness = false

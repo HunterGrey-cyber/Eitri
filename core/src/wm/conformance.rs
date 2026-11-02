@@ -219,6 +219,10 @@ pub fn project_list_focus_and_close(win: WinId, rows: Vec<crate::project_chooser
     scripts.push(Script {
         name: "project_focus_and_close_report_the_keys",
         ops: vec![
+            HostOp::Map {
+                win,
+                module: ModuleId::editor(),
+            },
             HostOp::Focus {
                 win,
                 to: FocusTo::ProjectChooser,
@@ -232,19 +236,19 @@ pub fn project_list_focus_and_close(win: WinId, rows: Vec<crate::project_chooser
         ],
         expect: vec![
             Expect::Answer {
-                op: 0,
+                op: 1,
                 applied: Applied::Done,
             },
             Expect::PostedDuring {
-                op: 0,
+                op: 1,
                 event: EventMatch::NativeFocusOn(None),
             },
             Expect::Answer {
-                op: 1,
+                op: 2,
                 applied: Applied::Done,
             },
             Expect::PostedDuring {
-                op: 1,
+                op: 2,
                 event: EventMatch::NativeFocusOn(Some(ModuleId::editor())),
             },
         ],
@@ -335,7 +339,7 @@ pub fn scripts(f: &Fixture) -> Vec<Script> {
     create_expect.push(Expect::NotPosted(EventMatch::Refused(OpTag::CreateSurface)));
     let panel = ModuleId::lua("panel");
     let instance = ModuleId::instance(ModuleKind::Terminal, 3).expect("a terminal's number");
-    vec![
+    let mut scripts = vec![
         Script {
             name: "create_surface_of_each_kind_answers_done_and_registers_it",
             ops: create_ops,
@@ -742,7 +746,9 @@ pub fn scripts(f: &Fixture) -> Vec<Script> {
                 Expect::WindowClosed,
             ],
         },
-    ]
+    ];
+    scripts.extend(project_list_focus_and_close(f.win, Vec::new()));
+    scripts
 }
 
 /// A failed join reports the service's exact refusal while its op applies.

@@ -130,6 +130,48 @@ impl gtk_host::SurfaceMaker for StubMaker {
     }
 }
 
+/// Answers project work without filesystem or dialog activity.
+struct StubProjects {
+    sink: Weak<dyn HostSink>,
+    entry: gtk4::Entry,
+}
+
+impl gtk_host::ProjectHost for StubProjects {
+    fn apply(&self, op: &eitri_core::wm::ProjectOp) -> Applied {
+        use eitri_core::wm::{HostEvent, ProjectEvent, ProjectOp};
+        let answer = match op {
+            ProjectOp::List { win, serial } => Some(ProjectEvent::Rows {
+                win: *win,
+                serial: *serial,
+                rows: Vec::new(),
+            }),
+            ProjectOp::Path { win, serial, .. } => Some(ProjectEvent::PathAnswer {
+                win: *win,
+                serial: *serial,
+                answer: eitri_core::project_chooser::PathAnswer::Stuck,
+            }),
+            ProjectOp::FolderDialog { win } => Some(ProjectEvent::Folder { win: *win, path: None }),
+            ProjectOp::Open { .. } => None,
+        };
+        if let (Some(sink), Some(answer)) = (self.sink.upgrade(), answer) {
+            sink.post(HostEvent::Project(answer));
+        }
+        Applied::Done
+    }
+
+    fn focus(&self, _win: WinId) -> bool {
+        self.entry.set_visible(true);
+        self.entry.grab_focus()
+    }
+
+    fn env(&self, _win: WinId) -> eitri_core::wm::ChooserEnv {
+        eitri_core::wm::ChooserEnv {
+            home: None,
+            lang: eitri_core::onboarding::Lang::En,
+        }
+    }
+}
+
 /// Carries out every service op by doing nothing.
 struct StubServices;
 
@@ -354,6 +396,7 @@ fn recording_widgets(
                 move || say("rename closed".into())
             }),
         },
+        project_chooser: Box::new(|_| {}),
         onboarding: Box::new({
             let screen = screen.clone();
             move |view| screen.show(view)
@@ -396,6 +439,13 @@ fn stage(f: &Fixture) -> Result<Stage, String> {
         let screen = screen.clone();
         host.set_onboarding_focus(Rc::new(move |_| screen.grab_keys()));
     }
+    let project_entry = gtk4::Entry::new();
+    project_entry.set_visible(false);
+    column.append(&project_entry);
+    host.set_project_host(Rc::new(StubProjects {
+        sink: Rc::downgrade(&erased),
+        entry: project_entry,
+    }));
     host.set_chrome_widgets(f.win, recording_widgets(&chrome, &screen));
     window.set_child(Some(&column));
     host.adopt_window(f.win, &window);

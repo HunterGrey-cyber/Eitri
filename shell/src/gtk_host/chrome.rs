@@ -21,6 +21,7 @@
 //! once it shows its text (a hidden label measures nothing).
 
 use eitri_core::onboarding::OnboardingView;
+use eitri_core::project_chooser::ChooserView;
 use eitri_core::wm::chrome::{Chip, ChromeModel, FloatLabel, StripLabels, Toast};
 use eitri_core::wm::close::prompt_origin;
 use eitri_core::wm::prefix_panel::PrefixPanel;
@@ -40,6 +41,7 @@ type PiecesSetter = Box<dyn Fn(Option<&[StripPiece]>)>;
 type PanelSetter = Box<dyn Fn(Option<&PrefixPanel>)>;
 /// Draws the first-start screen, or takes it down.
 type OnboardingSetter = Box<dyn Fn(Option<&OnboardingView>)>;
+type ProjectChooserSetter = Box<dyn Fn(Option<&ChooserView>)>;
 
 /// What the y/n prompt is placed by, read from the shell's widgets once it shows its text.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -110,6 +112,7 @@ pub(crate) struct ChromeWidgets {
     /// The first-start screen, or nothing while the model has none. The keys reach it through the host's `Focus` op,
     /// which comes before the `Chrome` op that fills it.
     pub(crate) onboarding: OnboardingSetter,
+    pub(crate) project_chooser: ProjectChooserSetter,
 }
 
 impl ChromeWidgets {
@@ -191,6 +194,11 @@ pub(crate) fn reconcile(widgets: &ChromeWidgets, last: &mut Option<ChromeModel>,
     // Last: the screen draws over everything else the model shows.
     if was.map_or(now.onboarding.is_some(), |model| model.onboarding != now.onboarding) {
         (widgets.onboarding)(now.onboarding.as_ref());
+    }
+    if was.map_or(now.project_chooser.is_some(), |model| {
+        model.project_chooser != now.project_chooser
+    }) {
+        (widgets.project_chooser)(now.project_chooser.as_ref());
     }
     *last = Some(now.clone());
 }
@@ -289,6 +297,7 @@ mod tests {
                     move || say("rename closes".into())
                 }),
             },
+            project_chooser: Box::new(|_| {}),
             onboarding: Box::new({
                 let say = say(&heard);
                 move |view| say(format!("onboarding {:?}", view.map(|view| view.step.clone())))

@@ -103,6 +103,7 @@ pub(crate) mod keys;
 pub(crate) mod onboarding;
 pub(crate) mod peer;
 pub(crate) mod prefix_panel;
+pub(crate) mod project_chooser;
 pub(crate) mod scheduler;
 
 use std::cell::{Cell, RefCell};
@@ -117,9 +118,10 @@ use eitri_core::window_link::names::WindowName;
 use eitri_core::window_link::Msg;
 use eitri_core::wm::chrome::ChromeModel;
 use eitri_core::wm::{
-    ActivationToken, Applied, ChatKillCounts, ChatOp, CleanupOp, CloseBy, CloseVerdict, DropWhy, EditorCall,
-    EditorEvent, FocusChain, FocusOwner, FocusTo, HintOp, Host, HostEvent, HostOp, HostReads, HostSink, LuaOp, Monitor,
-    MonitorId, NoReads, OnboardingOp, OpTag, PeerEvent, PeerId, PluginOp, SurfaceKind, TermOp, WinId, WindowSpec,
+    ActivationToken, Applied, ChatKillCounts, ChatOp, ChooserEnv, CleanupOp, CloseBy, CloseVerdict, DropWhy,
+    EditorCall, EditorEvent, FocusChain, FocusOwner, FocusTo, HintOp, Host, HostEvent, HostOp, HostReads, HostSink,
+    LuaOp, Monitor, MonitorId, NoReads, OnboardingOp, OpTag, PeerEvent, PeerId, PluginOp, ProjectOp, SurfaceKind,
+    TermOp, WinId, WindowSpec,
 };
 use gtk4::prelude::*;
 use gtk4::{gdk, glib};
@@ -146,6 +148,13 @@ type OnboardingFocusFn = dyn Fn(WinId) -> bool;
 /// What carries out the first-start screen's own ops (the checks, the detection, the write, the marker, the editor):
 /// the shell's `OnboardingHost`. It answers each as a fact later, through the driver.
 type OnboardingFn = dyn Fn(&OnboardingOp) -> Applied;
+
+/// The native project chooser and its asynchronous work, supplied without coupling the host to the binary.
+pub(crate) trait ProjectHost {
+    fn apply(&self, op: &ProjectOp) -> Applied;
+    fn focus(&self, win: WinId) -> bool;
+    fn env(&self, win: WinId) -> ChooserEnv;
+}
 
 /// What reads a window's chrome model from the controller; nothing for a window it does not hold.
 type ChromeModelFn = dyn Fn(WinId) -> Option<ChromeModel>;
@@ -605,6 +614,7 @@ pub(crate) struct GtkHost {
     rename_entry_fn: RefCell<Option<Rc<RenameEntryFn>>>,
     onboarding_focus_fn: RefCell<Option<Rc<OnboardingFocusFn>>>,
     onboarding_fn: RefCell<Option<Rc<OnboardingFn>>>,
+    project_host: RefCell<Option<Rc<dyn ProjectHost>>>,
     chrome_model: RefCell<Option<Rc<ChromeModelFn>>>,
     /// Each window's chrome widgets, with the model last drawn on them.
     chrome: RefCell<BTreeMap<WinId, Rc<ChromeDrawn>>>,
@@ -645,6 +655,7 @@ impl GtkHost {
             rename_entry_fn: RefCell::new(None),
             onboarding_focus_fn: RefCell::new(None),
             onboarding_fn: RefCell::new(None),
+            project_host: RefCell::new(None),
             chrome_model: RefCell::new(None),
             chrome: RefCell::new(BTreeMap::new()),
             chat_claims_fn: RefCell::new(None),
@@ -804,6 +815,10 @@ impl GtkHost {
     /// What carries out the first-start screen's ops. Until it is set, they are not carried out.
     pub(crate) fn set_onboarding(&self, carry: Rc<OnboardingFn>) {
         *self.onboarding_fn.borrow_mut() = Some(carry);
+    }
+
+    pub(crate) fn set_project_host(&self, host: Rc<dyn ProjectHost>) {
+        *self.project_host.borrow_mut() = Some(host);
     }
 
     /// Where a `Chrome` op reads the window's model. Until it is set, a `Chrome` is not carried out.
@@ -1002,7 +1017,7 @@ impl GtkHost {
             FocusTo::TopBarItem(item) => return self.focus_top_bar(op, win, *item),
             FocusTo::RenameEntry => return self.focus_rename_entry(op, win),
             FocusTo::Onboarding => return self.focus_onboarding(op, win),
-            FocusTo::ProjectChooser => return self.refuse(op, NOT_CARRIED_OUT),
+            FocusTo::ProjectChooser => return self.focus_project_chooser(op, win),
             FocusTo::Nothing => return self.refuse(op, NOT_CARRIED_OUT),
         };
         // Cloned out first: the function grabs, and GTK notifies the focus change from inside it.
@@ -1079,6 +1094,36 @@ impl GtkHost {
                 _ => self.refuse(op, "the first-start screen's work was not started"),
             },
             None => self.refuse(op, NOT_CARRIED_OUT),
+        }
+    }
+
+    fn focus_project_chooser(&self, op: &HostOp, win: WinId) -> Applied {
+        let host = self.project_host.borrow().clone();
+        let reports = self.focus_reports.get();
+        if host.is_some_and(|host| host.focus(win)) {
+            if self.focus_reports.get() == reports {
+                self.report_focus(win);
+            }
+            Applied::Done
+        } else {
+            self.refuse(op, "the project chooser did not take the keys")
+        }
+    }
+
+    fn project(&self, op: &HostOp, call: &ProjectOp) -> Applied {
+        let win = match call {
+            ProjectOp::List { win, .. }
+            | ProjectOp::Path { win, .. }
+            | ProjectOp::FolderDialog { win }
+            | ProjectOp::Open { win, .. } => *win,
+        };
+        if self.window(win).is_none() {
+            return self.refuse(op, "no such window");
+        }
+        let host = self.project_host.borrow().clone();
+        match host {
+            Some(host) if host.apply(call) == Applied::Done => Applied::Done,
+            _ => self.refuse(op, NOT_CARRIED_OUT),
         }
     }
 
@@ -1594,7 +1639,7 @@ impl Host for GtkHost {
             HostOp::Chrome { win, .. } => self.chrome(op, *win),
             HostOp::Hint(call) => self.hint(op, call),
             HostOp::Onboarding(call) => self.onboarding(op, call),
-            HostOp::Project(_) => self.refuse(op, NOT_CARRIED_OUT),
+            HostOp::Project(call) => self.project(op, call),
             HostOp::Editor(call @ EditorCall::Quit { win, generation, .. }) => {
                 let applied = self.service(op, |s| s.editor(call));
                 // A refusal names no call, so the quit that sent nothing is told as its own fact, with its
@@ -1726,6 +1771,11 @@ impl Host for GtkHost {
 /// Every read answers at once from the window's grid and editor, and calls nothing that could reach the
 /// controller; a window that has given neither answers as [`NoReads`] does.
 impl HostReads for GtkHost {
+    fn project_chooser_env(&self, win: WinId) -> ChooserEnv {
+        let host = self.project_host.borrow().clone();
+        host.map_or_else(|| NoReads.project_chooser_env(win), |host| host.env(win))
+    }
+
     /// The name of the window manager this window's moves go through, which `companion.wm` picks.
     fn compositor_name(&self) -> &'static str {
         let wm = self.placer.borrow().as_ref().map(|placer| placer.wm());
