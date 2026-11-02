@@ -591,6 +591,7 @@ pub(super) fn model_list(value: wire::ListModelsResponse) -> crate::ModelList {
             })
             .collect(),
         applied: applied_settings(applied),
+        efforts: Vec::new(),
     }
 }
 /// `StopTask` answers with nothing: a stop the sidecar accepted is the call's success.

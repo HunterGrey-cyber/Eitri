@@ -23,9 +23,10 @@
 use super::history::History;
 use super::translate::{self, Fold};
 use super::wire::{
-    self, method, ChunkKind, InitializeResponse, ModeReport, OptionKind, PermissionRequest, ToolCallFields, Update,
+    self, method, ChunkKind, ConfigOption, InitializeResponse, ModeReport, OptionKind, PermissionRequest,
+    ToolCallFields, Update,
 };
-use crate::external::{ContextGauge, ExternalProvider, ExternalStart, TurnPolicy, ANSWERED_BY_EITRI};
+use crate::external::{ContextGauge, ExternalProvider, ExternalStart, ListedSession, TurnPolicy, ANSWERED_BY_EITRI};
 use crate::external_link::{self, link_error, lock, provider_error, ClosingNotice};
 use crate::jsonrpc_link::{
     resolve_program, Framing, Incoming, JsonRpcLink, LinkError, LinkHandoff, LinkSpec, OverCapReply, Pending, Skipped,
@@ -33,9 +34,9 @@ use crate::jsonrpc_link::{
 };
 use crate::projection::{AgentDomainEvent, PermissionOutcome, ResumeStatus, SlashCommand, TurnEndDetail, TurnOutcome};
 use crate::provider::{
-    AgentProvider, CloseSessionRequest, CreateSessionRequest, InterruptTurnRequest, PermissionDecision,
-    ProviderCapabilities, ProviderError, ProviderErrorCode, ProviderInfo, ResolvePermissionRequest,
-    ResumeSessionRequest, SendTurnRequest,
+    AgentProvider, AppliedSettings, CloseSessionRequest, CreateSessionRequest, EffortChoice, InterruptTurnRequest,
+    ModelList, ModelOption, PermissionDecision, ProviderCapabilities, ProviderError, ProviderErrorCode, ProviderInfo,
+    ResolvePermissionRequest, ResumeSessionRequest, SendTurnRequest, TaskReply,
 };
 use crate::provider_move::{forget_unclaimed, handed_ids, MovedAnswer, START_WAIT};
 use crate::MoveRefusedWhy;
@@ -46,6 +47,7 @@ use std::ffi::OsString;
 use std::io;
 use std::os::fd::OwnedFd;
 use std::path::PathBuf;
+use std::sync::mpsc::Sender;
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
@@ -160,9 +162,32 @@ struct ActiveTurn {
     interrupting: bool,
 }
 
+/// A change of the model or the effort sent to the agent and not answered yet.
+struct PendingSetting {
+    pending: Pending,
+    /// Where the caller waits for what the agent says it now runs.
+    reply: Sender<Result<AppliedSettings, ProviderError>>,
+    /// The option changed and the value asked for, to set locally when the agent's answer lists no options.
+    config_id: String,
+    value: String,
+    /// When to stop waiting for the agent.
+    deadline: Instant,
+}
+
 #[derive(Default)]
 struct State {
     session_id: Option<String>,
+    /// The selectable options the agent last listed (`configOptions`); empty before any list. Only the model's
+    /// and the effort's are ever shown or set.
+    options: Vec<ConfigOption>,
+    /// Changes of the model or the effort the agent has not answered. `pump` takes the answers.
+    settings: Vec<PendingSetting>,
+    /// The directory the session runs in, which the agent's list of sessions is asked for.
+    cwd: Option<String>,
+    /// The sessions the agent last listed as its own; empty before an answer.
+    listed: Vec<ListedSession>,
+    /// A `session/list` the agent has not answered, and when to stop waiting for it.
+    listing: Option<(Pending, Instant)>,
     model: Option<String>,
     events: VecDeque<AgentDomainEvent>,
     turn: Option<ActiveTurn>,
@@ -201,6 +226,8 @@ struct State {
 #[derive(Default)]
 struct Boot {
     mode: Option<ModeReport>,
+    /// The latest option list the agent sent before the session was open.
+    options: Option<Vec<ConfigOption>>,
     /// The latest command list the agent sent before the session was open.
     commands: Option<Vec<SlashCommand>>,
     history: Option<History>,
@@ -218,6 +245,8 @@ pub struct AcpProvider {
     pid: u32,
     load_session: bool,
     close_session: bool,
+    /// The agent lists its own sessions (`sessionCapabilities.list`).
+    list_sessions: bool,
     /// What the agent calls itself and its version, for the panel.
     label: Option<String>,
 }
@@ -230,6 +259,91 @@ fn note_commands(st: &mut State, commands: Vec<SlashCommand>) {
     }
     st.commands = commands.clone();
     st.events.push_back(AgentDomainEvent::CommandsAvailable { commands });
+}
+
+/// Keeps the agent's option list and tells the host what the model and the effort now are when either differs
+/// from what it last heard.
+fn note_options(st: &mut State, options: Vec<ConfigOption>) {
+    let current =
+        |list: &[ConfigOption], is: fn(&ConfigOption) -> bool| list.iter().find(|o| is(o)).map(|o| o.current.clone());
+    let was = (
+        current(&st.options, ConfigOption::is_model),
+        current(&st.options, ConfigOption::is_effort),
+    );
+    let now = (
+        current(&options, ConfigOption::is_model),
+        current(&options, ConfigOption::is_effort),
+    );
+    st.options = options;
+    if now.0 != was.0 {
+        if let Some(model) = now.0 {
+            st.model = Some(model.clone());
+            st.events.push_back(AgentDomainEvent::ModelReported { model });
+        }
+    }
+    if now.1 != was.1 {
+        st.events.push_back(AgentDomainEvent::EffortReported { effort: now.1 });
+    }
+}
+
+/// A change the agent cannot make, in words shown as they stand.
+fn setting_refused(message: String) -> ProviderError {
+    provider_error(ProviderErrorCode::SettingRefused, message)
+}
+
+/// What the agent says it runs, from its option list: the model's and the effort's current values, each empty
+/// when the agent lists no such option.
+fn applied_of(options: &[ConfigOption]) -> AppliedSettings {
+    let current = |is: fn(&ConfigOption) -> bool| {
+        options
+            .iter()
+            .find(|o| is(o))
+            .map_or(String::new(), |o| o.current.clone())
+    };
+    AppliedSettings {
+        model: current(ConfigOption::is_model),
+        effort: current(ConfigOption::is_effort),
+    }
+}
+
+/// The picker's lists from the agent's own options. An effort the agent lists is offered to the model it is
+/// listed for, which is the one it says it runs.
+fn model_list_of(options: &[ConfigOption]) -> ModelList {
+    let applied = applied_of(options);
+    let efforts: Vec<EffortChoice> = options
+        .iter()
+        .find(|o| o.is_effort())
+        .map(|o| {
+            o.choices
+                .iter()
+                .map(|c| EffortChoice {
+                    value: c.value.clone(),
+                    display_name: c.name.clone(),
+                    description: c.description.clone(),
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+    let models = options
+        .iter()
+        .find(|o| o.is_model())
+        .map(|o| {
+            o.choices
+                .iter()
+                .map(|c| ModelOption {
+                    value: c.value.clone(),
+                    display_name: c.name.clone(),
+                    description: c.description.clone(),
+                    ..Default::default()
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+    ModelList {
+        models,
+        applied,
+        efforts,
+    }
 }
 
 /// A mode as a sentence for the tab.
@@ -300,6 +414,7 @@ impl AcpProvider {
             pid,
             load_session: init.load_session,
             close_session: init.close_session,
+            list_sessions: init.list_sessions,
             label: init.agent_label,
         })
     }
@@ -442,8 +557,14 @@ impl AcpProvider {
                     return;
                 };
                 match &update {
-                    Update::Mode(mode) | Update::Options { mode: Some(mode) } => {
-                        boot.mode = Some(ModeReport::Known(mode.clone()));
+                    Update::Mode(mode) => boot.mode = Some(ModeReport::Known(mode.clone())),
+                    Update::Options { mode, options } => {
+                        if let Some(mode) = mode {
+                            boot.mode = Some(ModeReport::Known(mode.clone()));
+                        }
+                        if options.is_some() {
+                            boot.options.clone_from(options);
+                        }
                     }
                     Update::UnreadableMode => boot.mode = Some(ModeReport::Unreadable),
                     Update::Commands(commands) => boot.commands = Some(commands.clone()),
@@ -491,6 +612,7 @@ impl AcpProvider {
         }
         let mut boot = Boot {
             mode: None,
+            options: None,
             commands: None,
             history: Some(History::default()),
             closed: None,
@@ -560,14 +682,24 @@ impl AcpProvider {
         st.loading = false;
         st.replaying = false;
         st.session_id = Some(session_id.clone());
-        st.model = setup.current_model.clone();
+        st.cwd = Some(cwd.clone());
+        // A list that came after the answer is the newer one.
+        st.options = boot.options.take().or(setup.config_options).unwrap_or_default();
+        let model = setup
+            .current_model
+            .or_else(|| st.options.iter().find(|o| o.is_model()).map(|o| o.current.clone()));
+        st.model.clone_from(&model);
         st.history = history;
         st.events.push_back(AgentDomainEvent::SessionOpened {
             session_id: session_id.clone(),
             provider_session_id: session_id.clone(),
-            model: setup.current_model.unwrap_or_default(),
+            model: model.unwrap_or_default(),
             cwd,
         });
+        if let Some(effort) = st.options.iter().find(|o| o.is_effort()).map(|o| o.current.clone()) {
+            st.events
+                .push_back(AgentDomainEvent::EffortReported { effort: Some(effort) });
+        }
         if let Some(requested) = resumed {
             st.events.push_back(AgentDomainEvent::ResumeOutcome {
                 requested_provider_session_id: requested,
@@ -586,7 +718,50 @@ impl AcpProvider {
         if let Some(reason) = boot.closed.take() {
             self.on_closed(&mut st, &reason);
         }
+        self.start_listing(&mut st);
         Ok(session_id)
+    }
+
+    /// Asks the agent for its sessions when it lists them and can load one: the chooser offers them beside
+    /// Eitri's own, and a pick of one is a resume. Nothing waits for the answer; `pump` takes it.
+    fn start_listing(&self, st: &mut State) {
+        if !self.list_sessions
+            || !self.load_session
+            || st.listing.is_some()
+            || st.closed
+            || st.dead
+            || st.blocked.is_some()
+        {
+            return;
+        }
+        let Some(cwd) = st.cwd.clone() else { return };
+        if let Ok(pending) = self.request(method::SESSION_LIST, wire::session_list_params(&cwd)) {
+            st.listing = Some((pending, Instant::now() + START_TIMEOUT));
+        }
+    }
+
+    /// Takes the agent's list of sessions once it has come. A refusal keeps the list held and says so once,
+    /// by kind alone.
+    fn collect_listing(&self, st: &mut State) {
+        let Some((pending, deadline)) = st.listing.as_mut() else {
+            return;
+        };
+        let answered = pending.try_take();
+        if answered.is_none() && Instant::now() < *deadline {
+            return;
+        }
+        st.listing = None;
+        match answered {
+            Some(Ok(answer)) => {
+                let cwd = st.cwd.clone().unwrap_or_default();
+                match wire::parse_session_list(&answer, &cwd) {
+                    Some(list) => st.listed = list,
+                    None => note_unknown(st, "a session list", "without sessions"),
+                }
+            }
+            Some(Err(LinkError::Closed)) | None => {}
+            Some(Err(_)) => note_unknown(st, "an error to", method::SESSION_LIST),
+        }
     }
 
     /// The saved session the agent would not load, as events: the session opens so there is something to
@@ -638,6 +813,113 @@ impl AcpProvider {
         let Some(want) = &self.auto_mode else { return };
         if !matches!(reported, ModeReport::Known(mode) if mode == want) {
             self.trip(st, mode_words(want), mode_report_words(reported));
+        }
+    }
+
+    // ------------------------------------------------------------ the model and the effort
+
+    /// Sets the option `effort` or `model` names to the choice `wanted` names, by `session/set_config_option`.
+    /// Only an option the agent listed as the model's or the effort's is ever sent, and only one of the values
+    /// it offered, so this never reaches the mode. The answer arrives through `pump`.
+    fn change_setting(
+        &self,
+        session_id: &str,
+        effort: bool,
+        wanted: &str,
+    ) -> Result<TaskReply<AppliedSettings>, ProviderError> {
+        let (reply, answer) = std::sync::mpsc::channel();
+        let mut st = lock(&self.state);
+        self.require_open(&st)?;
+        self.require_session(&st, session_id)?;
+        let kind = if effort { "effort" } else { "model" };
+        let refused = |why: String| {
+            let _ = reply.send(Err(setting_refused(why)));
+        };
+        if let Some(why) = st.blocked {
+            refused(format!("{}: {why}", self.agent));
+            return Ok(answer);
+        }
+        let Some(option) = st
+            .options
+            .iter()
+            .find(|o| if effort { o.is_effort() } else { o.is_model() })
+        else {
+            refused(format!("{} reports no {kind} to choose", self.agent));
+            return Ok(answer);
+        };
+        let Some(choice) = option.choice_named(wanted) else {
+            let offered = option
+                .choices
+                .iter()
+                .take(12)
+                .map(|c| c.value.as_str())
+                .collect::<Vec<_>>()
+                .join(", ");
+            refused(format!(
+                "{} offers no {kind} {}; it offers {offered}",
+                self.agent,
+                wire::one_line(wanted, 40)
+            ));
+            return Ok(answer);
+        };
+        let (config_id, value) = (option.id.clone(), choice.value.clone());
+        let pending = self.request(
+            method::SESSION_SET_CONFIG_OPTION,
+            wire::set_config_option_params(session_id, &config_id, &value),
+        )?;
+        st.settings.push(PendingSetting {
+            pending,
+            reply,
+            config_id,
+            value,
+            deadline: Instant::now() + START_TIMEOUT,
+        });
+        Ok(answer)
+    }
+
+    /// Takes the answers to changes of the model or the effort that have come. An answer lists the agent's
+    /// options as they are now, which replaces what is held; one that lists none means the change was taken as
+    /// asked. The mode an answer reports is held to the registered one like any other report of it.
+    fn collect_settings(&self, st: &mut State) {
+        let mut at = 0;
+        while at < st.settings.len() {
+            let answered = st.settings[at].pending.try_take();
+            let timed_out = answered.is_none() && Instant::now() >= st.settings[at].deadline;
+            if answered.is_none() && !timed_out {
+                at += 1;
+                continue;
+            }
+            let waiting = st.settings.remove(at);
+            let result = match answered {
+                None => Err(setting_refused(format!(
+                    "{} did not answer the change in time",
+                    self.agent
+                ))),
+                Some(Ok(answer)) => {
+                    let listed = answer.get("configOptions");
+                    if let Some(report) = wire::mode_from_options(listed) {
+                        self.check_mode(st, &report);
+                    }
+                    match wire::parse_config_options(listed) {
+                        Some(options) => note_options(st, options),
+                        None => {
+                            let mut options = st.options.clone();
+                            if let Some(option) = options.iter_mut().find(|o| o.id == waiting.config_id) {
+                                option.current.clone_from(&waiting.value);
+                            }
+                            note_options(st, options);
+                        }
+                    }
+                    Ok(applied_of(&st.options))
+                }
+                Some(Err(LinkError::Rpc { message, .. })) => Err(setting_refused(format!(
+                    "{} would not make that change: {}",
+                    self.agent,
+                    wire::one_line(&message, wire::MAX_COMMAND_TEXT_CHARS)
+                ))),
+                Some(Err(e)) => Err(self.failure(e, "the change")),
+            };
+            let _ = waiting.reply.send(result);
         }
     }
 
@@ -717,6 +999,11 @@ impl AcpProvider {
         st.dead = true;
         // Nothing can answer what waited any more.
         self.drop_cards(st, PermissionOutcome::ProviderFailed, false);
+        for waiting in std::mem::take(&mut st.settings) {
+            let _ = waiting
+                .reply
+                .send(Err(setting_refused(format!("{} ended before it answered", self.agent))));
+        }
         // The end of the output stream can be read a moment before the last of stderr; the notice waits a
         // short while for it so it says why the child went. `pump` finishes it: waiting here would hold this
         // state, which the UI thread's calls (a card's answer, Esc, a send, the gauge) take.
@@ -743,11 +1030,17 @@ impl AcpProvider {
         match update {
             Update::Context { used, size } => st.context = Some(ContextGauge { used, size }),
             Update::Commands(commands) => note_commands(st, commands),
-            Update::Mode(mode) | Update::Options { mode: Some(mode) } => {
-                self.check_mode(st, &ModeReport::Known(mode));
+            Update::Mode(mode) => self.check_mode(st, &ModeReport::Known(mode)),
+            Update::Options { mode, options } => {
+                if let Some(mode) = mode {
+                    self.check_mode(st, &ModeReport::Known(mode));
+                }
+                if let Some(options) = options {
+                    note_options(st, options);
+                }
             }
             Update::UnreadableMode => self.check_mode(st, &ModeReport::Unreadable),
-            Update::Options { mode: None } | Update::Ignored(_) => {}
+            Update::Ignored(_) => {}
             Update::Unknown(kind) => note_unknown(st, "an update", &kind),
             // The live stream carries no user messages: only a replay does.
             Update::Chunk {
@@ -980,9 +1273,19 @@ pub struct AcpProviderHandoff {
     auto_mode: Option<String>,
     load_session: bool,
     close_session: bool,
+    #[serde(default)]
+    list_sessions: bool,
     label: Option<String>,
     session_id: Option<String>,
     model: Option<String>,
+    /// The agent's selectable options as last listed.
+    #[serde(default)]
+    options: Vec<ConfigOption>,
+    #[serde(default)]
+    cwd: Option<String>,
+    /// The sessions the agent last listed as its own.
+    #[serde(default)]
+    listed: Vec<ListedSession>,
     /// Folded already and not pumped yet when the chat froze.
     events: VecDeque<AgentDomainEvent>,
     turn: Option<MovedTurn>,
@@ -1064,6 +1367,12 @@ impl AcpProvider {
         } else if st.loading && st.replaying {
             // A replay can run far past the start's short wait, so it is refused at once.
             Some(MoveRefusedWhy::HistoryLoading)
+        } else if !st.settings.is_empty() {
+            // A change of the model or the effort waits for its answer on this link, which the move would stop, and
+            // only `pump` takes the answer, so waiting here would not help: refused at once.
+            Some(MoveRefusedWhy::Link(
+                "a change of the model or the effort is waiting for the agent's answer".to_string(),
+            ))
         } else if st.loading || st.session_id.is_none() {
             Some(MoveRefusedWhy::Starting)
         } else if st.turn.is_some() && !self.live_move() {
@@ -1135,11 +1444,19 @@ impl AcpProvider {
             pid: _,
             load_session,
             close_session,
+            list_sessions,
             label,
         } = self;
         let State {
             session_id,
             model,
+            options,
+            // A freeze is refused while one waits, so it is empty.
+            settings: _,
+            cwd,
+            listed,
+            // A list asked for and not answered is asked again on the next chooser.
+            listing: _,
             events,
             turn,
             turn_seq,
@@ -1167,9 +1484,13 @@ impl AcpProvider {
             auto_mode: auto_mode.clone(),
             load_session: *load_session,
             close_session: *close_session,
+            list_sessions: *list_sessions,
             label: label.clone(),
             session_id,
             model,
+            options,
+            cwd,
+            listed,
             events,
             turn: turn.map(ActiveTurn::into_moved),
             turn_seq,
@@ -1231,6 +1552,7 @@ impl AcpProvider {
             pid: _,
             load_session: _,
             close_session: _,
+            list_sessions: _,
             label: _,
         } = Self::rebuilt(handoff, link, pid, &handed)?;
         let mut st = lock(&self.state);
@@ -1247,9 +1569,13 @@ impl AcpProvider {
             auto_mode,
             load_session,
             close_session,
+            list_sessions,
             label,
             session_id,
             model,
+            options,
+            cwd,
+            listed,
             events,
             turn,
             turn_seq,
@@ -1281,6 +1607,11 @@ impl AcpProvider {
         let state = State {
             session_id,
             model,
+            options,
+            settings: Vec::new(),
+            cwd,
+            listed,
+            listing: None,
             events,
             turn,
             turn_seq,
@@ -1308,6 +1639,7 @@ impl AcpProvider {
             pid,
             load_session,
             close_session,
+            list_sessions,
             label,
         })
     }
@@ -1352,6 +1684,33 @@ impl AgentProvider for AcpProvider {
         }
         self.interrupt_running(&mut st);
         Ok(())
+    }
+
+    /// The model and effort choices the agent itself lists. Needs no turn and no round trip: the list is the one the
+    /// agent last sent.
+    fn list_models(&self, session_id: &str) -> Result<TaskReply<ModelList>, ProviderError> {
+        let st = lock(&self.state);
+        self.require_open(&st)?;
+        self.require_session(&st, session_id)?;
+        let (reply, answer) = std::sync::mpsc::channel();
+        let _ = reply.send(Ok(model_list_of(&st.options)));
+        Ok(answer)
+    }
+
+    fn set_model(&self, session_id: &str, model: &str) -> Result<TaskReply<AppliedSettings>, ProviderError> {
+        self.change_setting(session_id, false, model)
+    }
+
+    fn apply_effort(&self, session_id: &str, effort: &str) -> Result<TaskReply<AppliedSettings>, ProviderError> {
+        if effort.is_empty() {
+            let (reply, answer) = std::sync::mpsc::channel();
+            let _ = reply.send(Err(setting_refused(format!(
+                "{} has no default effort to go back to",
+                self.agent
+            ))));
+            return Ok(answer);
+        }
+        self.change_setting(session_id, true, effort)
     }
 
     fn resolve_permission(&self, request: ResolvePermissionRequest) -> Result<(), ProviderError> {
@@ -1454,6 +1813,9 @@ impl AgentProvider for AcpProvider {
                 }
             }
             let read_to_end = self.drain(&mut st);
+            // After the queue: a list the agent sent ahead of its answer is in by now.
+            self.collect_settings(&mut st);
+            self.collect_listing(&mut st);
             if read_to_end && st.turn.as_ref().is_some_and(|t| t.response.is_some()) {
                 self.finish_turn(&mut st);
             }
@@ -1480,6 +1842,17 @@ impl ExternalProvider for AcpProvider {
 
     fn context_gauge(&self) -> Option<ContextGauge> {
         AcpProvider::context_gauge(self)
+    }
+
+    fn listed_sessions(&self) -> Vec<ListedSession> {
+        lock(&self.state).listed.clone()
+    }
+
+    fn refresh_sessions(&self) {
+        let mut st = lock(&self.state);
+        if !st.awaiting_commit {
+            self.start_listing(&mut st);
+        }
     }
 
     /// An ACP agent loads its own configuration, so the trust plan and the policy of the tab's mode are not

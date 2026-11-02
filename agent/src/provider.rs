@@ -386,6 +386,19 @@ pub struct ModelOption {
 pub struct ModelList {
     pub models: Vec<ModelOption>,
     pub applied: AppliedSettings,
+    /// The effort levels an agent that lists them apart from its models offers, in its order. Empty for Claude,
+    /// whose levels belong to each model row.
+    pub efforts: Vec<EffortChoice>,
+}
+
+/// One effort level an agent offers, in its own words.
+#[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct EffortChoice {
+    /// What [`AgentProvider::apply_effort`] takes.
+    pub value: String,
+    pub display_name: String,
+    pub description: String,
 }
 
 /// What a provider can actually do, as reported by the provider itself -- never inferred from a
@@ -572,6 +585,9 @@ pub enum ProviderErrorCode {
     ClientToolCallNotFound,
     /// An answer named a call that is already over: answered first, or settled some other way.
     ClientToolCallAlreadyAnswered,
+    /// A change of the model or the effort that the agent cannot or will not make; the message says why in
+    /// words fit to show as they stand.
+    SettingRefused,
 }
 
 impl ProviderErrorCode {
@@ -597,6 +613,7 @@ impl ProviderErrorCode {
                 | ProviderErrorCode::InteractionAnswerRefused
                 | ProviderErrorCode::ClientToolCallNotFound
                 | ProviderErrorCode::ClientToolCallAlreadyAnswered
+                | ProviderErrorCode::SettingRefused
         )
     }
 }

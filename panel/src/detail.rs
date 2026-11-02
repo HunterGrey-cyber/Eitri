@@ -44,6 +44,33 @@ pub(super) fn send_chooser_titles_if_changed(state_ref: &mut AgentPanelState, ou
     );
 }
 
+/// `records` with the sessions the agent lists as its own, when a tab of that agent is running (`prefer`'s first):
+/// read as the agent last listed them, and with `ask_again` the agent is asked once more, so the next chooser has
+/// the newest. An agent with no tab running is not started to be asked, so nothing is added.
+pub(super) fn with_running_agents_sessions(
+    state: &AgentPanelState,
+    prefer: Option<TabId>,
+    agent: &AgentId,
+    records: Vec<agent::ResumableSession>,
+    ask_again: bool,
+) -> Vec<agent::ResumableSession> {
+    if !matches!(agent, AgentId::Acp(_)) {
+        return records;
+    }
+    let running = prefer
+        .and_then(|tab| state.tabs.get(tab))
+        .into_iter()
+        .chain(state.tabs.tabs().iter())
+        .find(|t| t.agent() == agent && t.live().is_some());
+    let Some(backend) = running.and_then(|t| t.live()) else {
+        return records;
+    };
+    if ask_again {
+        backend.refresh_listed_sessions();
+    }
+    eitri_core::agent_backend::with_listed_sessions(agent, records, backend.listed_sessions())
+}
+
 /// The chooser's envelope (`prefix w` in `view`'s page): every open tab in number order, a tab bound
 /// to an extra view naming it, then every record open in no tab, each marked if another window holds
 /// its lease. Also each record listed with the title shown.
@@ -58,6 +85,14 @@ pub(super) fn chooser_payload(state: &AgentPanelState, view: ViewId) -> (String,
         eitri_core::agent_backend::Titles::Cached(&state.titles),
     );
     let lease_name = agent.record_name();
+    let mut greeting = greeting;
+    greeting.resumable = with_running_agents_sessions(
+        state,
+        state.tab_of_page(view),
+        &agent,
+        std::mem::take(&mut greeting.resumable),
+        true,
+    );
     let open: Vec<ChooserTab> = state
         .tabs
         .tabs()
@@ -1378,6 +1413,79 @@ mod tests {
             }
         }
         assert!(handle.state.borrow().tabs.get(other).is_some());
+    }
+
+    #[test]
+    fn the_chooser_of_a_running_acp_tab_lists_the_agents_own_sessions_and_asks_for_them_again() {
+        agent::state_dirs::redirect_state_to_a_test_root();
+        let dir = agent::state_dirs::test_workspace_dir("chooser-agent-listed");
+        let (handle, base, _host) = handle_with_recording_page();
+        handle.page_message(ViewId::BASE, READY);
+        let gem = AgentId::Acp("gem".into());
+        let provider = std::sync::Arc::new(eitri_core::test_providers::ExternalRecordingProvider::named(
+            "acp:gem", true,
+        ));
+        provider.list_sessions(vec![
+            agent::ListedSession {
+                session_id: "from-its-cli".into(),
+                title: Some("fix the build".into()),
+                updated_at_ms: Some(5_000),
+            },
+            agent::ListedSession {
+                session_id: "older".into(),
+                title: None,
+                updated_at_ms: Some(1_000),
+            },
+        ]);
+        let backend = AgentBackend::start_external_with(
+            gem.clone(),
+            provider.clone(),
+            &dir,
+            eitri_core::test_providers::empty_trust_plan(),
+            eitri_core::agent_bridge::SessionModeChoice::Auto,
+            None,
+        )
+        .unwrap();
+        let tab = {
+            let mut state = handle.state.borrow_mut();
+            let tab = state.tabs.open(gem);
+            state.tabs.get_mut(tab).unwrap().set_backend(TabBackend::Live(backend));
+            tab
+        };
+        clear(&[&base]);
+        handle.open_chooser(ViewId::BASE);
+        let chooser = base
+            .sent
+            .borrow()
+            .iter()
+            .map(|e| json_of(e))
+            .find(|v| v["kind"] == "chooser")
+            .expect("the chooser");
+        let ids: Vec<&str> = chooser["records"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|r| r["providerSessionId"].as_str().unwrap())
+            .collect();
+        assert_eq!(ids, ["from-its-cli", "older"], "the agent's own sessions, newest first");
+        assert_eq!(chooser["records"][0]["title"], "fix the build");
+        assert_eq!(provider.refreshes(), 1, "asked again for the next chooser");
+
+        // A tab of another agent, or one that is not running, asks nobody and lists nothing of the sort.
+        let other = handle.state.borrow_mut().tabs.open(AgentId::Acp("other".into()));
+        clear(&[&base]);
+        handle.open_chooser(ViewId::BASE);
+        let chooser = base
+            .sent
+            .borrow()
+            .iter()
+            .map(|e| json_of(e))
+            .find(|v| v["kind"] == "chooser")
+            .expect("the chooser");
+        assert!(chooser["records"].as_array().unwrap().is_empty());
+        assert_eq!(provider.refreshes(), 1);
+        assert!(handle.state.borrow().tabs.get(other).is_some() && handle.state.borrow().tabs.get(tab).is_some());
+        shut_down_every_tab(&handle);
     }
 
     #[test]

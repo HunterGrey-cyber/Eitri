@@ -64,10 +64,11 @@ pub(super) fn resume_in(
         state.project_dir.clone(),
         eitri_core::agent_backend::Titles::Cached(&state.titles),
     );
+    // A session the agent listed itself is named by the title it listed.
+    let sessions = super::detail::with_running_agents_sessions(state, Some(tab), &agent, greeting.resumable, false);
     // The rename and the title separately: the label puts a rename first, and folding the two into the
     // title lost the rename whenever the record had both.
-    let (resumed_title, resumed_name) = greeting
-        .resumable
+    let (resumed_title, resumed_name) = sessions
         .iter()
         .find(|r| r.provider_session_id == provider_session_id)
         .map(|r| (r.title.clone(), r.name.clone()))

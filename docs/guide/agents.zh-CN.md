@@ -1,5 +1,5 @@
 [English](agents.md) | 简体中文
-<!-- translated-from: agents.md sha256=3f45c0ccd7d073a3e8eee5e0f3679a301afcb6ce06e59988b4e10f74f9451672 -->
+<!-- translated-from: agents.md sha256=6da4a2b80109bdb5f8f791d38cd36f22cf32a06eab9c024dc82d18ac66918bdd -->
 
 # Codex 与其他 agent
 
@@ -241,10 +241,17 @@ Eitri 的 Auto 和 Bypass 是 Eitri 自己的：它们立即决定 Eitri 怎样�
 
 只有当 agent 表示它能加载已保存的会话时，ACP 标签页才可以恢复，才会跟其他标签页一起保存。保存的标签页回来时带着它的恢复信息，要等它自己那个 agent 的问题被 `y` 回答后才启动。名字已经不在 `init.lua` 里注册的已保存标签页会被跳过。
 
+选择器（`prefix w`）还会列出 agent 自己列出的会话，包括你在它自己的命令行里开始的那些，条件是 agent 表示它会列出会话、也能加载一个，并且这个 agent 的标签页正在运行。它们和 Eitri 记录的会话排在一起，最新的在前，标题用 agent 自己的；选其中一个，恢复方式和别的行一样，包括启动 agent 之前的那个问题。每次打开选择器都会再问 agent 一次，所以这期间新开始的会话，下次打开时才会出现。这个 agent 的标签页一个都没在运行时，选择器只列 Eitri 的记录：Eitri 不会为了问这个而启动 agent。
+
+<a id="model-and-effort"></a>
+### 模型和推理力度
+
+当 agent 在它的选项里列出模型、推理力度，或者两者都有时，Claude 标签页的按键就能用来选：`<leader>M` 和 `<leader>E`、点击状态带的模型或推理力度、单独的 `/model` 或 `/effort`，它们会打开一个用 agent 自己的名字的选择器。`/model <名称>` 和 `/effort <级别>` 立刻设置，回合运行时也可以，而且不会作为文字发给 agent。名称可以是 agent 的值，或者在只有一个选项有这个显示名时用显示名。设置之后，状态带显示 agent 说它现在运行的是什么。agent 没列出任何选项时，状态带会这么说；agent 没列出的名称会被拒绝，并说明它列出了什么。agent 归在模式下的选项，Eitri 一个也不设置；模式只是注册里点名的那一个（见上文“模式”）。
+
 <a id="what-an-acp-tab-does-not-have"></a>
 ### ACP 标签页没有什么
 
-ACP 没有办法把消息插进正在运行的回合，所以回合运行时按 `Enter`，消息会留到回合结束再发。ACP agent 可能发来的计划、会话标题和其他更新都不显示；这类标签页没有速率限制、没有上下文条，也没有模型选择器。agent 报告的命令列表就是输入框里的 `/` 菜单（见[输入框的按键](keys.zh-CN.md)）：名字和说明都按纯文本绘制，agent 还没报告过命令的标签页没有菜单。agent 报告上下文有多满时，`prefix i` 有一行 `context`，agent 报告之后它显示 agent 的上下文有多满。token 不带费用。
+ACP 没有办法把消息插进正在运行的回合，所以回合运行时按 `Enter`，消息会留到回合结束再发。ACP agent 可能发来的计划、会话标题和其他更新都不显示；这类标签页没有速率限制，也没有上下文条。agent 报告的命令列表就是输入框里的 `/` 菜单（见[输入框的按键](keys.zh-CN.md)）：名字和说明都按纯文本绘制，agent 还没报告过命令的标签页没有菜单。agent 报告上下文有多满时，`prefix i` 有一行 `context`，agent 报告之后它显示 agent 的上下文有多满。token 不带费用。
 
 ## 从 agent 标签页使用你的编辑器
 

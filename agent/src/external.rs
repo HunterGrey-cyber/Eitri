@@ -94,6 +94,17 @@ pub struct ContextGauge {
     pub size: u64,
 }
 
+/// One session an agent lists as its own (ACP `session/list`), for the session chooser: the agent's id for it,
+/// a title in the agent's words and when it was last active. Untrusted text, already bounded where it was read.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct ListedSession {
+    /// Only `[A-Za-z0-9_-]`, at most 128 bytes: an id Eitri can keep a record and a review track under.
+    pub session_id: String,
+    pub title: Option<String>,
+    /// Milliseconds since the epoch.
+    pub updated_at_ms: Option<u64>,
+}
+
 /// A provider that is not the Claude sidecar. Its plain `AgentProvider` session and turn methods
 /// answer `UnsupportedCapability("external")`.
 pub trait ExternalProvider: AgentProvider {
@@ -124,6 +135,16 @@ pub trait ExternalProvider: AgentProvider {
     fn context_gauge(&self) -> Option<ContextGauge> {
         None
     }
+    /// The sessions the agent last listed as its own, including ones started in its own CLI; empty for an agent
+    /// that lists none or has not answered yet.
+    fn listed_sessions(&self) -> Vec<ListedSession> {
+        Vec::new()
+    }
+    /// Asks the agent for its list of sessions again. Returns at once; the answer is [`listed_sessions`] a moment
+    /// later. An agent that lists none is not asked.
+    ///
+    /// [`listed_sessions`]: ExternalProvider::listed_sessions
+    fn refresh_sessions(&self) {}
     /// Whether the session ended because the provider stopped it itself with its conversation whole (what
     /// the agent left running, or kept running after an interrupt, was stopped with it), so continuing it is
     /// what the user is offered next. False while it runs and after any other end.

@@ -1,5 +1,5 @@
 import { shortModel } from "./band";
-import type { AppliedSettings, ModelOption } from "./types";
+import type { AppliedSettings, EffortChoice, ModelOption } from "./types";
 
 /** Parses the headless CLI's own reply to a bare `/model` or `/effort` into the
  *  options `../components/SlashPicker` shows. Deliberately never a hard-coded model/effort list --
@@ -75,15 +75,21 @@ export type DirectPicker = { options: string[]; current: string | null; labels: 
 /** The model picker from the CLI's list, in its order. `current` is the row whose id is the one the CLI says it
  *  will use: the named row when one is, since `default` resolves to the same id as the row it stands for. A model
  *  that cannot run auto says so on its row, because choosing it ends auto for the session. */
-export function modelPicker(models: ModelOption[], applied: AppliedSettings): DirectPicker | null {
+export function modelPicker(models: ModelOption[], applied: AppliedSettings, agentLists = false): DirectPicker | null {
   if (models.length === 0) return null;
   const running = models.filter((row) => runsOn(row, applied));
   const current = running.find((row) => row.value !== "default") ?? running[0];
   return {
     options: models.map((row) => row.value),
     current: current?.value ?? null,
-    labels: Object.fromEntries(models.map((row) => [row.value, modelRowWords(row)])),
+    // An agent that lists its own choices has no auto mode of ours to name.
+    labels: Object.fromEntries(models.map((row) => [row.value, agentLists ? agentRowWords(row.value, row.displayName) : modelRowWords(row)])),
   };
+}
+
+/** A row of an agent's own list: its name for the value, and the value itself when that is all there is. */
+function agentRowWords(value: string, name: string): string {
+  return name === "" || name === value ? value : `${name} (${value})`;
 }
 
 /** Whether the session runs on this row. An empty `applied.model` is a read that did not answer, and names no row. */
@@ -101,7 +107,21 @@ export const EFFORT_FROM_SETTINGS = "auto";
 
 /** The effort picker for the model the session runs on: `null` when that model takes no level. A list that does
  *  not name the model offers the levels the rows have in common with it, the union of the list. */
-export function effortPicker(models: ModelOption[], applied: AppliedSettings): DirectPicker | null {
+export function effortPicker(
+  models: ModelOption[],
+  applied: AppliedSettings,
+  agentEfforts: EffortChoice[] | null = null,
+): DirectPicker | null {
+  if (agentEfforts !== null) {
+    // An agent lists its levels itself; there is no setting to go back to.
+    if (agentEfforts.length === 0) return null;
+    const values = agentEfforts.map((level) => level.value);
+    return {
+      options: values,
+      current: values.includes(applied.effort) ? applied.effort : null,
+      labels: Object.fromEntries(agentEfforts.map((level) => [level.value, agentRowWords(level.value, level.displayName)])),
+    };
+  }
   const running = models.find((row) => runsOn(row, applied));
   if (running !== undefined && !running.supportsEffort) return null;
   const levels = running?.supportedEffortLevels ?? [...new Set(models.flatMap((row) => row.supportedEffortLevels))];
@@ -117,7 +137,10 @@ export function settingsChangedWords(
   applied: AppliedSettings,
   chosen: string,
   running: { model: string | null } | null,
+  agentLists = false,
 ): string {
+  // The agent says what it now runs; when it takes the change is its own matter.
+  if (agentLists) return kind === "effort" ? `effort: ${applied.effort === "" ? chosen : applied.effort}` : `model: ${applied.model === "" ? chosen : applied.model}`;
   if (kind === "effort") {
     // A read that answered always names the model, so an empty model is no answer, and says nothing of the level.
     const level = applied.model === "" ? chosen : applied.effort === "" ? "none on this model" : applied.effort;

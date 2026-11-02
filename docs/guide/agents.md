@@ -427,11 +427,28 @@ An ACP tab can be resumed and saved with the tabs only when its agent says it ca
 tab comes back holding its resume and starts when its own agent's question is answered with `y`. A saved tab
 whose name `init.lua` no longer registers is skipped.
 
+The chooser (`prefix w`) also lists the sessions the agent itself lists, the ones you started in its own command
+line included, when the agent says it lists sessions and can load one and a tab of that agent is running. They sit
+among the sessions Eitri recorded, newest first, with the agent's own title; picking one resumes it as any other
+row does, including the question before the agent starts. The agent is asked each time the chooser opens, so a
+session started meanwhile shows the next time it opens. With none of that agent's tabs running, the chooser lists
+Eitri's records only: Eitri does not start the agent to ask.
+
+### Model and effort
+
+When the agent lists a model, a reasoning effort or both among its options, the keys of a Claude tab choose them:
+`<leader>M` and `<leader>E`, a click on the band's model or effort, and a bare `/model` or `/effort`, which open
+a picker with the agent's own names. `/model <name>` and `/effort <level>` set one at once, also while a turn
+runs, and are never sent to the agent as text. A name is the agent's value, or its display name when only one
+choice has it. The band shows what the agent says it runs after the change. An agent that lists none says so
+in the band, and a name the agent did not list is refused with what it did list. Eitri sets no option the agent
+files under its mode; the mode is the one the registration names (see "Mode" above).
+
 ### What an ACP tab does not have
 
 ACP has no way to put a message into a running turn, so `Enter` while one runs holds the message until the turn
 ends. Plans, session titles and other updates an ACP agent may send are not shown; Eitri has no rate
-limits, no context bar and no model picker for these tabs. The command list an agent reports is the `/` menu in
+limits and no context bar for these tabs. The command list an agent reports is the `/` menu in
 its composer (see [the composer's keys](keys.md)): the names and descriptions are drawn as plain text, and a tab
 whose agent has reported none has no menu. `prefix i` has a `context` row,
 which shows how full the agent's context is once the agent reports it. Tokens come without a cost.

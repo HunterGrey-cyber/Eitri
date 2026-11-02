@@ -69,6 +69,11 @@ export function isExternalAgent(agent: string | undefined): boolean {
   return agent !== undefined && agent !== "claude";
 }
 
+/** Whether a tab runs an ACP agent (`acp:<name>`), which lists its own model and effort choices. */
+export function isAcpAgent(agent: string | undefined): boolean {
+  return agent !== undefined && agent.startsWith("acp:");
+}
+
 /** The word a non-Claude tab shows in its label and in what is said about it: `codex`, or the name an
  *  `acp:<name>` agent was registered under. `null` for a Claude tab. */
 export function agentWord(agent: string | undefined): string | null {

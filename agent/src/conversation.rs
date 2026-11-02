@@ -969,6 +969,19 @@ impl AgentConversation {
         self.external.as_ref().and_then(|e| e.context_gauge())
     }
 
+    /// The sessions the agent itself lists, including ones started in its own CLI: only an external provider that
+    /// lists them.
+    pub fn listed_sessions(&self) -> Vec<crate::external::ListedSession> {
+        self.external.as_ref().map_or_else(Vec::new, |e| e.listed_sessions())
+    }
+
+    /// Asks the agent for its list of sessions again (`ExternalProvider::refresh_sessions`).
+    pub fn refresh_listed_sessions(&self) {
+        if let Some(external) = &self.external {
+            external.refresh_sessions();
+        }
+    }
+
     /// What the tab should say about editor tools its session was left without
     /// (`ExternalProvider::editor_note`), handed over once; nothing for a Claude session.
     pub fn editor_note(&self) -> Option<String> {

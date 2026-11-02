@@ -638,11 +638,12 @@ box or a conversation:
 The first four clear the draft. None of these sends a message to Claude. Other slash commands keep
 their usual behavior: `/clear`, `/compact`, `/cost`, `/context`, `/usage`, `/model`, `/mcp`, `/agents`,
 `/doctor` and `/output-style` show an effect; a bare `/model` or `/effort` opens a picker, also while a turn runs, and
-`/model <name>` is sent as a message. `/login` and
+`/model <name>` is sent as a message (in an ACP tab it sets the model the agent lists). `/login` and
 `/config`, and `/resume` with arguments, need a full terminal and are refused with a message. Other
 words, including prompt templates and your own commands, are sent as typed. `?` lists the working
-CLI commands. In a Codex tab or a tab of an agent you registered, all seven words are sent as text:
-there are no Claude command holdbacks or pickers.
+CLI commands. In a Codex tab, all seven words are sent as text: there are no Claude command holdbacks or pickers. In a tab
+of an agent you registered, `/model` and `/effort` choose from the options the agent lists (see
+[agents](agents.md#model-and-effort)) and the other five are sent as text.
 
 ### In BROWSE
 
@@ -699,8 +700,8 @@ After it, a short list of what can follow appears. These keys work in BROWSE.
 | `<leader>i` | this tab's details |
 | `<leader>t` | continue this conversation in a terminal (Claude tabs; a Codex or registered agent's tab says it is not available yet) |
 | `<leader>m` | cycle the tab's mode (as `Shift+Tab`) |
-| `<leader>M` | choose the model (as a click on the band's model), also while a turn runs: the running response finishes on the old model, and the next request uses the new one. Claude tabs only; a Codex or registered agent's tab says it is not available. |
-| `<leader>E` | choose the effort (as a click on the band's effort), also while a turn runs: it holds from the next request. Claude tabs only; a Codex or registered agent's tab says it is not available. |
+| `<leader>M` | choose the model (as a click on the band's model), also while a turn runs: the running response finishes on the old model, and the next request uses the new one. Claude tabs, and a registered agent's tab from the models the agent lists; a Codex tab says it is not available. |
+| `<leader>E` | choose the effort (as a click on the band's effort), also while a turn runs: it holds from the next request. Claude tabs, and a registered agent's tab from the effort levels the agent lists; a Codex tab says it is not available. |
 | `<leader>k` | in a Claude tab, stop every background task after a `y/n` question that names them (`Stop 2 shells, 1 monitor? y/n`); the conversation goes on, and it works only while no turn runs. In a Codex tab, stop the commands it left running in the background, which ends its session (it can be resumed), after a `y/n` question |
 | `Space e` (`<leader>e`) | toggle following the agent in the editor for this tab; off by default, never moves your cursor |
 | `<leader>?` | the list of keys |

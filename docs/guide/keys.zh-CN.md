@@ -1,5 +1,5 @@
 [English](keys.md) | 简体中文
-<!-- translated-from: keys.md sha256=dbcbf4712d6a037dd16313bc63c6471d40daa909712ece2acf46dd7146f0c2a8 -->
+<!-- translated-from: keys.md sha256=87f3e5fb11bc078cb63b6005e54cd8685202795cf3f6cd3f12e6020b96c2f132 -->
 
 # 按键
 
@@ -400,7 +400,7 @@ end
 | `/tasks`（或 `/bashes`） | 打开[后台任务列表](#the-background-tasks-list) |
 | `/workflows` | 打开后台任务列表，并定位到动态工作流 |
 
-前四个操作会清空草稿。这些词都不会给 Claude 发送消息。其他斜杠命令的行为不变：`/clear`、`/compact`、`/cost`、`/context`、`/usage`、`/model`、`/mcp`、`/agents`、`/doctor` 和 `/output-style` 会产生效果；单独的 `/model` 或 `/effort` 会打开选择器，回合运行时也可以，`/model <名称>` 作为消息发送。`/login` 和 `/config`，以及带参数的 `/resume`，需要完整终端，会被拒绝并显示消息。其他词，包括提示词模板和你自己的命令，按输入的原样发出。`?` 列出能用的 CLI 命令。在 Codex 标签页或你注册的 agent 的标签页中，这七个词都作为文字发出，没有 Claude 命令的拦截或选择器。
+前四个操作会清空草稿。这些词都不会给 Claude 发送消息。其他斜杠命令的行为不变：`/clear`、`/compact`、`/cost`、`/context`、`/usage`、`/model`、`/mcp`、`/agents`、`/doctor` 和 `/output-style` 会产生效果；单独的 `/model` 或 `/effort` 会打开选择器，回合运行时也可以，`/model <名称>` 作为消息发送（ACP 标签页里它设置 agent 列出的模型）。`/login` 和 `/config`，以及带参数的 `/resume`，需要完整终端，会被拒绝并显示消息。其他词，包括提示词模板和你自己的命令，按输入的原样发出。`?` 列出能用的 CLI 命令。在 Codex 标签页中，这七个词都作为文字发出，没有 Claude 命令的拦截或选择器。在你注册的 agent 的标签页中，`/model` 和 `/effort` 从 agent 列出的选项里选（见[agents](agents.zh-CN.md#model-and-effort)），其余五个作为文字发出。
 
 ### 在 BROWSE 里
 
@@ -454,8 +454,8 @@ end
 | `<leader>i` | 这个标签页的详情 |
 | `<leader>t` | 在终端里继续这个对话（Claude 标签页；Codex 或已注册 agent 的标签页会提示这还不可用） |
 | `<leader>m` | 轮换标签页的模式（和 `Shift+Tab` 一样） |
-| `<leader>M` | 选择模型（和点击状态带的模型一样），回合运行时也可以：正在生成的回复按旧模型结束，下一个请求就用新模型。仅限 Claude 标签页；Codex 或已注册代理的标签页会提示此功能不可用。 |
-| `<leader>E` | 选择推理力度（和点击状态带的推理力度一样），回合运行时也可以：从下一个请求起生效。仅限 Claude 标签页；Codex 或已注册代理的标签页会提示此功能不可用。 |
+| `<leader>M` | 选择模型（和点击状态带的模型一样），回合运行时也可以：正在生成的回复按旧模型结束，下一个请求就用新模型。Claude 标签页可用，已注册 agent 的标签页从 agent 列出的模型里选；Codex 标签页会提示此功能不可用。 |
+| `<leader>E` | 选择推理力度（和点击状态带的推理力度一样），回合运行时也可以：从下一个请求起生效。Claude 标签页可用，已注册 agent 的标签页从 agent 列出的推理力度里选；Codex 标签页会提示此功能不可用。 |
 | `<leader>k` | 在 Claude 标签页里，先问一个列出任务的 `y/n`（`Stop 2 shells, 1 monitor? y/n`），然后停掉所有后台任务，对话继续；只在没有回合运行时可用。在 Codex 标签页里，停止它留在后台运行的命令，这会结束它的会话（之后可以恢复），会先问一个 `y/n` |
 | `Space e`（`<leader>e`） | 为当前标签页开关编辑器跟随；默认关闭，不会移动你的光标 |
 | `<leader>?` | 按键列表 |

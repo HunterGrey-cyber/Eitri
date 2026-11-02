@@ -69,7 +69,8 @@ pub(super) fn admission(
             Admission::Ungated
         }
         // A change of the model or the effort reaches the running session, also during a turn: only from the
-        // page showing the tab, never on a tab that is moving, and only on a Claude session. It widens nothing
+        // page showing the tab, never on a tab that is moving, and only on a Claude or an ACP session (an ACP
+        // agent offers what it lists itself). It widens nothing
         // by itself; the mode the CLI moves to arrives on the session's stream.
         InboundMessage::ListModels { .. } | InboundMessage::SetModel { .. } | InboundMessage::ApplyEffort { .. } => {
             let Some(tab) = target else {
@@ -84,8 +85,10 @@ pub(super) fn admission(
             let Some(backend) = state.tabs.get(tab).and_then(|t| t.live()) else {
                 return Admission::Refused("no active session".into());
             };
-            if backend.agent() != AgentId::Claude {
-                return Admission::Refused("the model and the effort are only changed here for Claude".into());
+            if !matches!(backend.agent(), AgentId::Claude | AgentId::Acp(_)) {
+                return Admission::Refused(
+                    "the model and the effort are only changed here for Claude and ACP agents".into(),
+                );
             }
             Admission::Ungated
         }
@@ -488,6 +491,39 @@ mod tests {
             let message = parse_inbound_message(&raw.to_string()).unwrap();
             assert!(
                 admission(&handle.state.borrow(), &message, ViewId::BASE, Some(tab)) == Admission::Ungated,
+                "{raw}"
+            );
+        }
+        // An ACP agent's session offers what that agent lists, so the same controls reach it.
+        let acp_agent = AgentId::Acp("gem".into());
+        let acp = std::sync::Arc::new(eitri_core::test_providers::ExternalRecordingProvider::named(
+            "acp:gem", true,
+        ));
+        let backend = AgentBackend::start_external_with(
+            acp_agent.clone(),
+            acp,
+            &dir,
+            eitri_core::test_providers::empty_trust_plan(),
+            SessionModeChoice::Auto,
+            None,
+        )
+        .unwrap();
+        let acp_tab = handle.state.borrow_mut().tabs.open(acp_agent);
+        handle
+            .state
+            .borrow_mut()
+            .tabs
+            .get_mut(acp_tab)
+            .unwrap()
+            .set_backend(TabBackend::Live(backend));
+        for raw in [
+            serde_json::json!({"type": "list_models", "request_id": "m", "tab": acp_tab.0}),
+            serde_json::json!({"type": "set_model", "request_id": "m", "tab": acp_tab.0, "model": "x"}),
+            serde_json::json!({"type": "apply_effort", "request_id": "m", "tab": acp_tab.0, "effort": "low"}),
+        ] {
+            let message = parse_inbound_message(&raw.to_string()).unwrap();
+            assert!(
+                admission(&handle.state.borrow(), &message, ViewId::BASE, Some(acp_tab)) == Admission::Ungated,
                 "{raw}"
             );
         }

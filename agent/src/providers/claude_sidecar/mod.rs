@@ -1751,6 +1751,10 @@ pub fn task_refusal(error: ProviderError) -> String {
             code: ProviderErrorCode::TaskOutputUnavailable,
             ..
         } => "task output is not available".into(),
+        ProviderError::Provider {
+            code: ProviderErrorCode::SettingRefused,
+            message,
+        } => message,
         other => other.to_string(),
     };
     translate_322::bound(&text, 2000)

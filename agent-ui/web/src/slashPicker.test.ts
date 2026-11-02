@@ -155,3 +155,36 @@ describe("what the band says of a change", () => {
     expect(settingsChangedWords("effort", { model: "", effort: "" }, "low", null)).toBe("effort: low, from the next request");
   });
 });
+
+describe("the pickers of an agent that lists its own choices", () => {
+  const rowOf = (value: string, displayName: string): ModelOption => ({
+    value, resolvedModel: "", displayName, description: "", supportsEffort: false, supportedEffortLevels: [], supportsAutoMode: false,
+  });
+  const applied = { model: "b", effort: "high" };
+
+  it("names a row by the agent's name and value, with no word about an auto mode", () => {
+    const picker = modelPicker([rowOf("a", "Alpha"), rowOf("b", "b")], applied, true);
+    expect(picker?.options).toEqual(["a", "b"]);
+    expect(picker?.labels).toEqual({ a: "Alpha (a)", b: "b" });
+    expect(picker?.current).toBe("b");
+  });
+
+  it("lists the agent's levels with no row for going back to the settings", () => {
+    const picker = effortPicker([], applied, [
+      { value: "low", displayName: "Low", description: "" },
+      { value: "high", displayName: "High", description: "" },
+    ]);
+    expect(picker?.options).toEqual(["low", "high"]);
+    expect(picker?.options).not.toContain(EFFORT_FROM_SETTINGS);
+    expect(picker?.current).toBe("high");
+  });
+
+  it("is null when the agent listed no levels", () => {
+    expect(effortPicker([], applied, [])).toBeNull();
+  });
+
+  it("says what the agent reports, with no claim about when it takes effect", () => {
+    expect(settingsChangedWords("model", { model: "b", effort: "" }, "x", { model: "a" }, true)).toBe("model: b");
+    expect(settingsChangedWords("effort", { model: "b", effort: "low" }, "x", null, true)).toBe("effort: low");
+  });
+});

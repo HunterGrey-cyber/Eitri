@@ -1,5 +1,5 @@
 [English](known-issues.md) | 简体中文
-<!-- translated-from: known-issues.md sha256=616d6d61c4bec1022c7cbac459e4461782a4993d90101c672060180d39767708 -->
+<!-- translated-from: known-issues.md sha256=29ee0da25172e0186731ab5a4a23b05ad1ef1c8a2d5f360b9d25e0434c9c8ada -->
 
 # 已知问题与限制
 
@@ -109,7 +109,7 @@ Codex 的标签页，以及用 `eitri.agent.register` 注册的 agent 的标签�
 - **你的钩子可能抢先回答。** 你自己的 Codex 配置里的 `PermissionRequest` 钩子，可能在 Eitri 看到请求之前就回答了它。没有测过的有：钩子在批准之后改写命令、每种 MCP 批准模式的行为、来自市场清单的插件在已信任的项目里加载、恢复一个有真实 Codex 客户端占着的线程、子 agent 的文件改动批准，以及沙箱能不能够到你的会话总线、tmux 或 nvim。
 - **这些 agent 没有 Eitri 一侧的分类器或保存的规则。** 到达 Eitri 的每个请求，在 Manual 和 Auto 下是一张卡片，在 Bypass 下由 Eitri 批准。
 - **ACP agent 只在 `y` 之后才启动**，因为 Eitri 没法不让它加载项目自己的配置；`n` 什么也不启动，也不会被记住。`project_files` 是你的清单：Eitri 只对你在那里点名的东西做哈希。Eitri 不清理 agent 的环境，所以把环境变量里的相对路径当作配置目录的 agent，会去读项目的目录。
-- **ACP agent 不经询问运行什么，是 agent 自己的事。** Eitri 显示它收到的请求，只设置注册里点名的那个模式。这类标签页没有速率限制、上下文条、斜杠命令列表或模型选择器，`<leader>t`（在终端里继续）对它们也还不可用。
+- **ACP agent 不经询问运行什么，是 agent 自己的事。** Eitri 显示它收到的请求，只设置注册里点名的那个模式。这类标签页没有速率限制、上下文条或斜杠命令列表（模型和推理力度从 agent 自己列出的选项里选），`<leader>t`（在终端里继续）对它们也还不可用。
 - **标签页详情的最后一行「Continue in a terminal…」只适用于 Claude 标签页。** `prefix i` 在 Codex 和 ACP 标签页上也会显示它。在这类已有会话的标签页上选它，会在 Eitri 里结束这个会话，并打印一条打不开它的 `claude --resume` 命令。请不要在这类标签页上用它；`<leader>t` 已经会拒绝它们。下一个版本里，这一行不再对它们显示。
 
 <a id="turn-review"></a>

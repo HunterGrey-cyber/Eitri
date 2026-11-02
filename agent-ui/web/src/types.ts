@@ -387,6 +387,9 @@ export type Capabilities = {
 /** What the CLI says it will use. Each is empty when it did not say. */
 export type AppliedSettings = { model: string; effort: string };
 
+/** One effort level an agent that lists them apart from its models offers (an ACP agent). Every word is the agent's. */
+export type EffortChoice = { value: string; displayName: string; description: string };
+
 /** One model the session's CLI offers. Every word is the CLI's. */
 export type ModelOption = {
   value: string;

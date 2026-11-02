@@ -78,7 +78,7 @@ import type { PathRef } from "./paths";
 import { PathPick } from "./components/PathPick";
 import { LinkPick } from "./components/LinkPick";
 import { isExternalTool, agentTitle } from "./externalTools";
-import { acceptsEnvelope, activeTabInfo, agentWord, countedTabTarget, exportView, forgetClosed, importView, isExternalAgent, saveView, tabPermissionModes, takeView } from "./tabs";
+import { acceptsEnvelope, activeTabInfo, agentWord, countedTabTarget, exportView, forgetClosed, importView, isAcpAgent, isExternalAgent, saveView, tabPermissionModes, takeView } from "./tabs";
 import type { TabViewState } from "./tabs";
 import { EmptyTab } from "./components/EmptyTab";
 import type { NavKeyRequest } from "./components/EmptyTab";
@@ -137,7 +137,7 @@ import { cardSummary, liveTasks, shortModel, usageSegment } from "./band";
 import { latestTurnEnding } from "./turnEnding";
 import type { TurnDurations } from "./turnTimes";
 import type { ApproveFact, BandFacts } from "./band";
-import type { AgentUiState, AppliedSettings, DetailRow, ModelOption, TabId, TabsEnvelope, ContextSummary, ProviderInfo } from "./types";
+import type { AgentUiState, AppliedSettings, DetailRow, EffortChoice, ModelOption, TabId, TabsEnvelope, ContextSummary, ProviderInfo } from "./types";
 import { applyTheme } from "./theme";
 import { applyEditorTyping } from "./typingCadence";
 import { copyToPrimary } from "./primaryCopy";
@@ -301,7 +301,7 @@ type SettingsRequest =
 
 /** What answers a `SettingsRequest`. */
 type SettingsAnswer =
-  | { kind: "models_result"; models: ModelOption[]; applied: AppliedSettings }
+  | { kind: "models_result"; models: ModelOption[]; applied: AppliedSettings; efforts?: EffortChoice[] }
   | { kind: "settings_result"; applied: AppliedSettings }
   | { kind: "command_result"; ok: true }
   | { kind: "command_result"; ok: false; error: string };
@@ -1228,7 +1228,7 @@ export default function App() {
       case "effort.pick": {
         const thing = binding.action === "model.pick" ? "model" : "effort";
         const other = agentWord(activeTabInfo(tabsRef.current)?.agent);
-        if (other !== null) {
+        if (other !== null && !isAcpAgent(activeTabInfo(tabsRef.current)?.agent)) {
           showFlash(`Choosing the ${thing} of a ${other} session is not available`);
           break;
         }
@@ -3646,6 +3646,7 @@ export default function App() {
       askForPicker(bare);
       return;
     }
+    if (!options?.fromPicker && isAcpAgent(activeTabInfo(tabsRef.current)?.agent) && settingRunsNow(text)) return;
     const requestId = nextRequestId();
     setPendingCommands((prev) => new Set(prev).add(requestId));
     // The text is kept so a refusal can put it back (ordinary sends only -- `"picker-send"`'s own
@@ -3671,7 +3672,14 @@ export default function App() {
 
   /** Whether this tab's session changes its model and effort directly, with no turn. */
   function picksDirectly(): boolean {
-    return stateRef.current.capabilities.directSettings === true && !isExternalAgent(activeTabInfo(tabsRef.current)?.agent);
+    const agent = activeTabInfo(tabsRef.current)?.agent;
+    // An ACP agent lists its own choices and the answer to the list says when it has none, so its tab always asks.
+    return isAcpAgent(agent) || (stateRef.current.capabilities.directSettings === true && !isExternalAgent(agent));
+  }
+
+  /** Whether `tab` runs an ACP agent: its choices are the agent's own, in the agent's words. */
+  function tabListsItsOwn(tab: TabId): boolean {
+    return isAcpAgent(tabsRef.current?.tabs.find((t) => t.id === tab)?.agent);
   }
 
   /** Asks for what the picker lists. It opens on the answer, also while a turn runs, and no turn is started. */
@@ -3695,12 +3703,18 @@ export default function App() {
       return;
     }
     if (payload.kind === "settings_result") {
-      if (request.what === "change") showFlash(revealedText(settingsChangedWords(request.kind, payload.applied, request.chosen, request.running)));
+      if (request.what === "change") showFlash(revealedText(settingsChangedWords(request.kind, payload.applied, request.chosen, request.running, tabListsItsOwn(request.tab))));
       return;
     }
-    const picker = request.kind === "model" ? modelPicker(payload.models, payload.applied) : effortPicker(payload.models, payload.applied);
+    const own = tabListsItsOwn(request.tab);
+    const picker = request.kind === "model"
+      ? modelPicker(payload.models, payload.applied, own)
+      : effortPicker(payload.models, payload.applied, own ? (payload.efforts ?? []) : null);
     if (picker === null) {
-      showFlash(request.kind === "model" ? "the session lists no models" : "this model takes no effort level");
+      const who = agentWord(activeTabInfo(tabsRef.current)?.agent) ?? "the agent";
+      showFlash(own
+        ? revealedText(`${who} reports no ${request.kind === "model" ? "models" : "effort levels"} to choose from`)
+        : request.kind === "model" ? "the session lists no models" : "this model takes no effort level");
       return;
     }
     setSlashReply({ kind: request.kind, ...picker, direct: true });
@@ -3710,9 +3724,14 @@ export default function App() {
    *  that did not answer, leave it what any command typed during a turn is: queued, and the CLI answers at the
    *  turn's end, since the session takes an unknown level with no word and runs on. */
   function answerTypedEffort(request: Extract<SettingsRequest, { what: "typed-effort" }>, payload: SettingsAnswer) {
-    const picker = payload.kind === "models_result" ? effortPicker(payload.models, payload.applied) : null;
+    const own = tabListsItsOwn(request.tab);
+    const picker = payload.kind === "models_result" ? effortPicker(payload.models, payload.applied, own ? (payload.efforts ?? []) : null) : null;
     if (picker?.options.includes(request.level)) {
       changeSetting(request.tab, "effort", request.level, picker.labels?.[request.level] ?? request.level);
+    } else if (own) {
+      // The agent takes the words it listed and nothing else: say so rather than send the text to it as a prompt.
+      const who = agentWord(activeTabInfo(tabsRef.current)?.agent) ?? "the agent";
+      showFlash(revealedText(picker === null ? `${who} reports no effort levels to choose from` : `${who} offers ${picker.options.join(", ")}`));
     } else {
       queueInto(request.tab, request.text);
     }
@@ -3725,7 +3744,7 @@ export default function App() {
     settingsRequests.current.set(requestId, { what: "change", tab, kind, chosen, running });
     postToRust(kind === "model"
       ? { type: "set_model", request_id: requestId, tab, model: value }
-      : { type: "apply_effort", request_id: requestId, tab, effort: value === EFFORT_FROM_SETTINGS ? "" : value });
+      : { type: "apply_effort", request_id: requestId, tab, effort: value === EFFORT_FROM_SETTINGS && !tabListsItsOwn(tab) ? "" : value });
   }
 
   /** A typed `/model <name>` or `/effort <level>` during a turn runs at once and is never held, as Claude Code runs
@@ -3734,7 +3753,9 @@ export default function App() {
   function settingRunsNow(text: string): boolean {
     const setting = settingCommand(text);
     const tab = activeTabRef.current;
-    if (setting === null || tab === null || !picksDirectly() || stateRef.current.activeTurnId === null) return false;
+    // An ACP agent has no command of ours to take these between turns, so they never go to it as a prompt.
+    const between = isAcpAgent(activeTabInfo(tabsRef.current)?.agent);
+    if (setting === null || tab === null || !picksDirectly() || (stateRef.current.activeTurnId === null && !between)) return false;
     postToRust({ type: "history_push", request_id: nextRequestId(), text });
     if (setting.kind === "model") {
       changeSetting(tab, "model", setting.value, setting.value);
@@ -4651,7 +4672,7 @@ export default function App() {
      refuse every command until that finishes. The composer must reflect that rather than accepting
      input it cannot deliver. */
   const handingOff = tabs !== null && handoffRequests.has(tabs.active);
-  const bandPicks = !isExternalAgent(activeTab?.agent) && !sessionEnded && !handingOff;
+  const bandPicks = (!isExternalAgent(activeTab?.agent) || isAcpAgent(activeTab?.agent)) && !sessionEnded && !handingOff;
 
   /** `a`/`d`/`D` on a card, and Enter on a card's own button. `stillThere` says whether the card the key was aimed at
    *  can still take it, or is `null` when there is no card for the cursor (the "no card here" flash). The answer runs
@@ -6942,7 +6963,7 @@ export default function App() {
         onOpenDetail={() => post({ type: "open_detail" })}
         onOpenTasks={() => openTasksOverlay()}
         onJump={() => unreadJumpRef.current()}
-        // `/model` and `/effort` are Claude's. Another agent's tab shows what it reports and offers no choice.
+        // `/model` and `/effort` are Claude's and an ACP agent's own list. A Codex tab shows what it reports and offers no choice.
         onPickModel={bandPicks ? () => askBandPicker("/model") : undefined}
         onPickEffort={bandPicks ? () => askBandPicker("/effort") : undefined}
       />

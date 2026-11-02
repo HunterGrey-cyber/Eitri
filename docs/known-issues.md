@@ -256,8 +256,9 @@ adapter; they have not been tried on every setup.
   what you name there. Eitri does not scrub the agent's environment, so an agent that reads a relative-path
   variable as its configuration directory would read the project's directory.
 - **What an ACP agent runs without asking is the agent's own.** Eitri shows the requests it receives and sets
-  only the mode the registration names. Eitri has no rate limits, context bar, slash-command list or model picker
-  for these tabs, and `<leader>t` (continue in a terminal) is not available for them yet.
+  only the mode the registration names. Eitri has no rate limits, context bar or slash-command list
+  for these tabs (the model and the effort are chosen from what the agent lists), and `<leader>t` (continue in a
+  terminal) is not available for them yet.
 - **The last row of a tab's details, "Continue in a terminal…", is for Claude tabs only.** `prefix i` draws it on
   Codex and ACP tabs too. Choosing it there, on a tab with a session, ends that session in Eitri and prints a
   `claude --resume` command that cannot open it. Do not use it on these tabs; `<leader>t` already refuses them. The

@@ -1,4 +1,4 @@
-import type { AppliedSettings, ModelOption, AgentDomainEvent, AgentUiSnapshot, ChooserEnvelope, ContextSummary, DetailRow, EditorCardWire, EditorLinkState, HandoffCommand, Hello, QueueItem, ReviewDiffEnvelope, ReviewDraftEnvelope, ReviewEnvelope, ReviewHintEnvelope, ReviewRecoveryEnvelope, ReviewScope, ReviewSendPreviewEnvelope, TabId, TabsEnvelope, ThinkingDisplay, TurnTimeWire } from "./types";
+import type { AppliedSettings, EffortChoice, ModelOption, AgentDomainEvent, AgentUiSnapshot, ChooserEnvelope, ContextSummary, DetailRow, EditorCardWire, EditorLinkState, HandoffCommand, Hello, QueueItem, ReviewDiffEnvelope, ReviewDraftEnvelope, ReviewEnvelope, ReviewHintEnvelope, ReviewRecoveryEnvelope, ReviewScope, ReviewSendPreviewEnvelope, TabId, TabsEnvelope, ThinkingDisplay, TurnTimeWire } from "./types";
 import type { KeymapHelp, PaneDirection, PluginKeysHelp } from "./keymap";
 import { isEditorCardWire } from "./editorCardWire";
 import { isHex64, isTrustRemember } from "./trust";
@@ -276,7 +276,7 @@ type InboundHandler = (
     /** Repository names are plain text, through revealHidden. */
     | { kind: "path_completions"; tab: TabId; seq: number; items: string[] }
     /** Every word is the CLI's: plain text, through revealHidden. */
-    | { kind: "models_result"; requestId: string; tab: TabId; models: ModelOption[]; applied: AppliedSettings }
+    | { kind: "models_result"; requestId: string; tab: TabId; models: ModelOption[]; applied: AppliedSettings; efforts?: EffortChoice[] }
     | { kind: "settings_result"; requestId: string; tab: TabId; applied: AppliedSettings }
     | {
         kind: "events";

@@ -84,7 +84,8 @@ pub use conversation::{conversation_id_for_cwd, AgentConversation, ConversationE
 #[cfg(feature = "legacy-backend")]
 pub use event::{AgentEvent, PermissionSource};
 pub use external::{
-    DirTrust, EditorServerSpec, ExternalProvider, ExternalStart, Reviewer, Sandbox, TrustPlan, TurnPolicy,
+    DirTrust, EditorServerSpec, ExternalProvider, ExternalStart, ListedSession, Reviewer, Sandbox, TrustPlan,
+    TurnPolicy,
 };
 pub use ingestion::{IngestStats, ProjectionGuard, RevisedDelivery, UiDelivery, UiWake, UI_EVENT_QUEUE_CAPACITY};
 pub use move_seed::{
@@ -135,11 +136,11 @@ pub use projection::{
 };
 pub use provider::{
     AgentProvider, AppliedSettings, ClientCallRef, ClientToolAnswer, ClientToolCallState, ClientToolDecl,
-    ClientToolSet, CloseSessionRequest, CreateSessionRequest, EventSignal, InteractionReply, InteractionResolution,
-    InteractionSend, InteractionState, InterruptTurnRequest, ModelList, ModelOption, PermissionDecision,
-    ProviderCapabilities, ProviderError, ProviderErrorCode, ProviderInfo, QuestionAnswer, QuestionDeclineKind,
-    ResolveInteractionRequest, ResolvePermissionRequest, ResumeSessionRequest, SendTurnRequest, SteerTurnRequest,
-    StreamingPreference, TaskOutput, TaskReply, TurnStamp,
+    ClientToolSet, CloseSessionRequest, CreateSessionRequest, EffortChoice, EventSignal, InteractionReply,
+    InteractionResolution, InteractionSend, InteractionState, InterruptTurnRequest, ModelList, ModelOption,
+    PermissionDecision, ProviderCapabilities, ProviderError, ProviderErrorCode, ProviderInfo, QuestionAnswer,
+    QuestionDeclineKind, ResolveInteractionRequest, ResolvePermissionRequest, ResumeSessionRequest, SendTurnRequest,
+    SteerTurnRequest, StreamingPreference, TaskOutput, TaskReply, TurnStamp,
 };
 pub use providers::claude_sidecar::{
     claude_cli_missing, claude_cli_missing_here, failure_names_missing_cli, sidecar_availability,

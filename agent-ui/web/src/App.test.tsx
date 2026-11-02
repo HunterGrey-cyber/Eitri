@@ -2707,7 +2707,7 @@ describe("the leader", () => {
       expect(posted.filter((m) => m.type === "send_message")).toEqual([]);
     });
 
-    it.each([["codex", "codex"], ["acp:goose", "goose"]])("names the unavailable %s agent", (agent, word) => {
+    it.each([["codex", "codex"]])("names the unavailable %s agent", (agent, word) => {
       const { container } = pickerSetup();
       dispatch({ kind: "tabs", active: 1, tabs: [{ ...LIVE_TAB, agent }] });
       choose();
@@ -2715,6 +2715,14 @@ describe("the leader", () => {
       expect(container.querySelector(".band-message")!.textContent).toBe(
         `Choosing the ${thing} of a ${word} session is not available`,
       );
+    });
+
+    it("asks an ACP agent's own session for what it lists, with no message sent (App.acpControls.test.tsx has the rest)", () => {
+      pickerSetup();
+      dispatch({ kind: "tabs", active: 1, tabs: [{ ...LIVE_TAB, agent: "acp:goose" }] });
+      choose();
+      expect(posted.filter((m) => m.type === "send_message")).toEqual([]);
+      expect(posted.filter((m) => m.type === "list_models")).toHaveLength(1);
     });
 
     it.each(["ended", "not_started"] as const)("refuses a %s tab without starting a session", (state) => {

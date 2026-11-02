@@ -1053,7 +1053,7 @@ pub fn serialize_task_output_for_js(
 /// The models a session's CLI offers, answering `list_models`.
 pub fn serialize_models_for_js(request_id: &str, tab: crate::tabs::TabId, list: &agent::ModelList) -> String {
     json!({ "kind": "models_result", "requestId": request_id, "tab": tab.0,
-        "models": list.models, "applied": list.applied })
+        "models": list.models, "applied": list.applied, "efforts": list.efforts })
     .to_string()
 }
 
@@ -8196,6 +8196,7 @@ mod tests {
                 ..Default::default()
             }],
             applied,
+            efforts: Vec::new(),
         };
         let wire: Value = serde_json::from_str(&serialize_models_for_js("q1", TabId(4), &list)).unwrap();
         assert_eq!(wire["kind"], "models_result");

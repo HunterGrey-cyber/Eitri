@@ -403,6 +403,7 @@ impl agent::AgentProvider for RecordingProvider {
                 model: "claude-opus-5-5".into(),
                 effort: "medium".into(),
             },
+            efforts: Vec::new(),
         }))
         .unwrap();
         Ok(rx)
@@ -548,6 +549,9 @@ pub struct ExternalRecordingProvider {
     steer_refusal: std::sync::Mutex<Option<agent::ProviderErrorCode>>,
     /// What `editor_note` hands over next.
     editor_note: std::sync::Mutex<Option<String>>,
+    /// The sessions the agent lists as its own, and how many times it was asked for them again.
+    listed: std::sync::Mutex<Vec<agent::ListedSession>>,
+    refreshes: std::sync::atomic::AtomicU32,
 }
 
 impl ExternalRecordingProvider {
@@ -572,7 +576,19 @@ impl ExternalRecordingProvider {
             steers: std::sync::Mutex::new(Vec::new()),
             steer_refusal: std::sync::Mutex::new(None),
             editor_note: std::sync::Mutex::new(None),
+            listed: std::sync::Mutex::new(Vec::new()),
+            refreshes: std::sync::atomic::AtomicU32::new(0),
         }
+    }
+
+    /// Lists `sessions` as the agent's own.
+    pub fn list_sessions(&self, sessions: Vec<agent::ListedSession>) {
+        *self.listed.lock().unwrap() = sessions;
+    }
+
+    /// How many times the agent was asked for its list of sessions again.
+    pub fn refreshes(&self) -> u32 {
+        self.refreshes.load(std::sync::atomic::Ordering::SeqCst)
     }
 
     /// Has `editor_note` hand `note` over, as a provider that left the session's tool server out.
@@ -696,6 +712,12 @@ impl agent::AgentProvider for ExternalRecordingProvider {
 impl agent::ExternalProvider for ExternalRecordingProvider {
     fn name(&self) -> &'static str {
         self.name
+    }
+    fn listed_sessions(&self) -> Vec<agent::ListedSession> {
+        self.listed.lock().unwrap().clone()
+    }
+    fn refresh_sessions(&self) {
+        self.refreshes.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
     }
     fn resumes(&self) -> bool {
         self.resumes

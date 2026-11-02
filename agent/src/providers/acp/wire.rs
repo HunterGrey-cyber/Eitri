@@ -13,7 +13,7 @@
 //! Nothing under `_meta` and none of the `_auth/*` notifications is read: they carry the account's
 //! details, which are not Eitri's to keep or to log.
 
-use crate::external::EditorServerSpec;
+use crate::external::{EditorServerSpec, ListedSession};
 use crate::projection::SlashCommand;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
@@ -27,6 +27,8 @@ pub mod method {
     pub const SESSION_CANCEL: &str = "session/cancel";
     pub const SESSION_CLOSE: &str = "session/close";
     pub const SESSION_SET_MODE: &str = "session/set_mode";
+    pub const SESSION_SET_CONFIG_OPTION: &str = "session/set_config_option";
+    pub const SESSION_LIST: &str = "session/list";
 
     pub const SESSION_UPDATE: &str = "session/update";
     pub const REQUEST_PERMISSION: &str = "session/request_permission";
@@ -129,6 +131,17 @@ pub fn set_mode_params(session_id: &str, mode_id: &str) -> Value {
     json!({ "sessionId": session_id, "modeId": mode_id })
 }
 
+/// `session/set_config_option`: one of the agent's own selectable options set to one of the values it listed. Only
+/// the model's and the effort's are ever sent; the mode is never set this way.
+pub fn set_config_option_params(session_id: &str, config_id: &str, value: &str) -> Value {
+    json!({ "sessionId": session_id, "configId": config_id, "value": value })
+}
+
+/// `session/list`, for the sessions of one project directory.
+pub fn session_list_params(cwd: &str) -> Value {
+    json!({ "cwd": cwd })
+}
+
 /// The answer to a permission request that selects one of the agent's own options.
 pub fn selected_outcome(option_id: &str) -> Value {
     json!({ "outcome": { "outcome": "selected", "optionId": option_id } })
@@ -154,6 +167,8 @@ pub struct InitializeResponse {
     pub load_session: bool,
     /// `sessionCapabilities.close`: the agent takes `session/close`.
     pub close_session: bool,
+    /// `sessionCapabilities.list`: the agent lists its sessions (`session/list`).
+    pub list_sessions: bool,
     /// What the agent calls itself, for the panel: its title or name, with the version when it gave one.
     pub agent_label: Option<String>,
 }
@@ -174,6 +189,10 @@ impl InitializeResponse {
                 .and_then(|c| c.get("sessionCapabilities"))
                 .and_then(|c| c.get("close"))
                 .is_some_and(|close| !close.is_null()),
+            list_sessions: capabilities
+                .and_then(|c| c.get("sessionCapabilities"))
+                .and_then(|c| c.get("list"))
+                .is_some_and(|list| !list.is_null()),
             agent_label: match (name, version) {
                 (Some(name), Some(version)) => Some(format!("{name} {version}")),
                 (Some(name), None) => Some(name),
@@ -192,6 +211,8 @@ pub struct SessionSetup {
     pub current_mode: Option<ModeReport>,
     /// `models.currentModelId`, for the panel's model line.
     pub current_model: Option<String>,
+    /// The agent's selectable options, as it listed them; `None` when the answer carried no list.
+    pub config_options: Option<Vec<ConfigOption>>,
 }
 
 impl SessionSetup {
@@ -206,6 +227,7 @@ impl SessionSetup {
                 mode_from_options(value.get("configOptions")),
             ),
             current_model: value.get("models").and_then(|m| text_of(m, "currentModelId")),
+            config_options: parse_config_options(value.get("configOptions")),
         }
     }
 }
@@ -234,6 +256,254 @@ pub fn mode_from_options(options: Option<&Value>) -> Option<ModeReport> {
 pub enum ModeReport {
     Known(String),
     Unreadable,
+}
+
+/// The most sessions one list keeps.
+pub const MAX_LISTED_SESSIONS: usize = 50;
+/// The longest title kept, in characters; a longer one is cut with `…`.
+pub const MAX_SESSION_TITLE_CHARS: usize = 120;
+/// The most entries of one answer that are read at all; the newest [`MAX_LISTED_SESSIONS`] of them stay.
+pub const MAX_SESSIONS_READ: usize = 500;
+
+/// The sessions in a `session/list` answer, newest first: `None` when it carries no list. Only a session whose id
+/// Eitri can keep a record under is kept, one that names another directory than `cwd` is dropped (an agent may
+/// ignore the directory it was asked for), and at most [`MAX_LISTED_SESSIONS`] stay.
+pub fn parse_session_list(value: &Value, cwd: &str) -> Option<Vec<ListedSession>> {
+    let list = value.get("sessions")?.as_array()?;
+    let same_dir = |theirs: &str| theirs.trim_end_matches('/') == cwd.trim_end_matches('/');
+    let mut out: Vec<ListedSession> = Vec::new();
+    // Only the first entries are looked at, so a list of any length costs the same.
+    for item in list.iter().take(MAX_SESSIONS_READ) {
+        let Some(session_id) = text_of(item, "sessionId").filter(|id| {
+            !id.is_empty() && id.len() <= 128 && id.chars().all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-')
+        }) else {
+            continue;
+        };
+        if text_of(item, "cwd").is_some_and(|theirs| !same_dir(&theirs))
+            || out.iter().any(|s| s.session_id == session_id)
+        {
+            continue;
+        }
+        out.push(ListedSession {
+            session_id,
+            // The chooser draws a title as it stands, so a character that changes how a line reads goes.
+            title: text_of(item, "title")
+                .map(|t| {
+                    one_line(
+                        &t.chars().filter(|c| !is_invisible_char(*c)).collect::<String>(),
+                        MAX_SESSION_TITLE_CHARS,
+                    )
+                })
+                .filter(|t| !t.is_empty()),
+            updated_at_ms: text_of(item, "updatedAt").and_then(|t| rfc3339_ms(&t)),
+        });
+    }
+    out.sort_by(|a, b| b.updated_at_ms.cmp(&a.updated_at_ms));
+    out.truncate(MAX_LISTED_SESSIONS);
+    Some(out)
+}
+
+/// An RFC 3339 time (`2026-11-02T05:00:00.000Z`, or with an offset) as milliseconds since the epoch; `None` for
+/// anything else or a time before 1970.
+pub fn rfc3339_ms(text: &str) -> Option<u64> {
+    let (date, rest) = text.split_once(['T', 't'])?;
+    let mut ymd = date.split('-');
+    let (year, month, day): (i64, i64, i64) = (
+        ymd.next()?.parse().ok()?,
+        ymd.next()?.parse().ok()?,
+        ymd.next()?.parse().ok()?,
+    );
+    // Years the epoch can count in milliseconds without the arithmetic below going out of range.
+    if ymd.next().is_some() || !(1970..=9999).contains(&year) || !(1..=12).contains(&month) || !(1..=31).contains(&day)
+    {
+        return None;
+    }
+    let split = rest.find(['Z', 'z', '+', '-']).unwrap_or(rest.len());
+    let (clock, zone) = rest.split_at(split);
+    let mut hms = clock.split(':');
+    let hour: i64 = hms.next()?.parse().ok()?;
+    let minute: i64 = hms.next()?.parse().ok()?;
+    let seconds = hms.next().unwrap_or("0");
+    let (whole, fraction) = seconds.split_once('.').unwrap_or((seconds, ""));
+    if !fraction.chars().all(|c| c.is_ascii_digit()) {
+        return None;
+    }
+    let second: i64 = whole.parse().ok()?;
+    let millis: i64 = format!("{fraction:0<3}")[..3].parse().ok()?;
+    if hms.next().is_some() || hour > 23 || minute > 59 || second > 60 {
+        return None;
+    }
+    let offset_minutes = match zone {
+        "" | "Z" | "z" => 0,
+        _ => {
+            let sign = if zone.starts_with('-') { -1 } else { 1 };
+            let (h, m) = zone[1..].split_once(':')?;
+            let (h, m): (i64, i64) = (h.parse().ok()?, m.parse().ok()?);
+            if !(0..=23).contains(&h) || !(0..=59).contains(&m) {
+                return None;
+            }
+            sign * (h * 60 + m)
+        }
+    };
+    // Days from the civil date (proleptic Gregorian), as in Howard Hinnant's algorithm.
+    let y = if month <= 2 { year - 1 } else { year };
+    let era = y.div_euclid(400);
+    let yoe = y - era * 400;
+    let doy = (153 * (if month > 2 { month - 3 } else { month + 9 }) + 2) / 5 + day - 1;
+    let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
+    let days = era * 146_097 + doe - 719_468;
+    let total = ((days * 24 + hour) * 60 + minute - offset_minutes) * 60 + second;
+    u64::try_from(total * 1000 + millis).ok()
+}
+
+/// The most options one list keeps.
+pub const MAX_CONFIG_OPTIONS: usize = 32;
+/// The most choices one option keeps; the rest are dropped.
+pub const MAX_CONFIG_CHOICES: usize = 200;
+/// The longest option id or choice value kept, in characters. A longer one is dropped, not cut: a cut value
+/// would be sent back as a value the agent never listed.
+pub const MAX_CONFIG_VALUE_CHARS: usize = 128;
+/// The longest choice name kept, in characters; a longer one is cut with `…`.
+pub const MAX_CONFIG_NAME_CHARS: usize = 80;
+
+/// One choice of a selectable option, in the agent's words: untrusted text, folded to one line and bounded.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ConfigChoice {
+    /// What `session/set_config_option` takes back.
+    pub value: String,
+    /// The name shown; the value when the agent gave none.
+    pub name: String,
+    pub description: String,
+}
+
+/// One selectable option the agent reports (`configOptions`), as far as Eitri reads it: its id, its category,
+/// the value it holds and the values it offers. An option that is not a select with a string value is not kept.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ConfigOption {
+    pub id: String,
+    pub category: Option<String>,
+    pub current: String,
+    pub choices: Vec<ConfigChoice>,
+}
+
+impl ConfigOption {
+    /// The option that holds the mode, which Eitri sets once and never through this list
+    /// ([`mode_from_options`] names it the same way).
+    pub fn is_mode(&self) -> bool {
+        self.category.as_deref() == Some("mode") || self.id == "mode"
+    }
+
+    /// The option that holds the model.
+    pub fn is_model(&self) -> bool {
+        !self.is_mode() && (self.category.as_deref() == Some("model") || self.id == "model")
+    }
+
+    /// The option that holds the reasoning effort.
+    pub fn is_effort(&self) -> bool {
+        !self.is_mode()
+            && (self.category.as_deref() == Some("thought_level")
+                || matches!(self.id.as_str(), "thought_level" | "reasoning_effort" | "effort"))
+    }
+
+    /// The choice that `wanted` names: its value exactly, else the one choice whose value or name matches in
+    /// any letter case. `None` when nothing matches or several do.
+    pub fn choice_named(&self, wanted: &str) -> Option<&ConfigChoice> {
+        if let Some(exact) = self.choices.iter().find(|c| c.value == wanted) {
+            return Some(exact);
+        }
+        let mut loose = self
+            .choices
+            .iter()
+            .filter(|c| c.value.eq_ignore_ascii_case(wanted) || c.name.eq_ignore_ascii_case(wanted));
+        match (loose.next(), loose.next()) {
+            (Some(only), None) => Some(only),
+            _ => None,
+        }
+    }
+}
+
+/// A value or id Eitri will compare and send back: non-empty, short and showing nothing hidden.
+fn plain_token(text: &str) -> bool {
+    !text.is_empty() && text.chars().count() <= MAX_CONFIG_VALUE_CHARS && !text.chars().any(is_hidden_char)
+}
+
+/// The choices of one option's `options` array, a flat list or groups of them, bounded and without repeats.
+fn parse_choices(list: &[Value], out: &mut Vec<ConfigChoice>) {
+    for item in list {
+        if out.len() >= MAX_CONFIG_CHOICES {
+            return;
+        }
+        if let Some(group) = item.get("options").and_then(Value::as_array) {
+            parse_choices(group, out);
+            continue;
+        }
+        let Some(value) = text_of(item, "value").filter(|v| plain_token(v)) else {
+            continue;
+        };
+        if out.iter().any(|c| c.value == value) {
+            continue;
+        }
+        let name = text_of(item, "name")
+            .map(|n| one_line(&n, MAX_CONFIG_NAME_CHARS))
+            .filter(|n| !n.is_empty())
+            .unwrap_or_else(|| value.clone());
+        let description = text_of(item, "description")
+            .map(|d| one_line(&d, MAX_COMMAND_TEXT_CHARS))
+            .unwrap_or_default();
+        out.push(ConfigChoice {
+            value,
+            name,
+            description,
+        });
+    }
+}
+
+/// The selectable options in a `configOptions` value: `None` when it is not a list, so an answer that carries
+/// none leaves what was known as it was. At most [`MAX_CONFIG_OPTIONS`] are kept.
+pub fn parse_config_options(options: Option<&Value>) -> Option<Vec<ConfigOption>> {
+    let list = options?.as_array()?;
+    let is_mode = |item: &Value| {
+        text_of(item, "category").as_deref() == Some("mode") || text_of(item, "id").as_deref() == Some("mode")
+    };
+    // `session/set_config_option` names an option by its id alone, so an id the agent also gives its mode option
+    // is never offered for anything else: setting it could set the mode.
+    let mode_ids: Vec<String> = list
+        .iter()
+        .filter(|item| is_mode(item))
+        .filter_map(|item| text_of(item, "id"))
+        .collect();
+    let mut out: Vec<ConfigOption> = Vec::new();
+    for item in list {
+        if out.len() >= MAX_CONFIG_OPTIONS {
+            break;
+        }
+        if item.get("type").is_some_and(|t| t.as_str() != Some("select")) {
+            continue;
+        }
+        let Some(id) = text_of(item, "id").filter(|id| plain_token(id)) else {
+            continue;
+        };
+        if !is_mode(item) && mode_ids.contains(&id) {
+            continue;
+        }
+        let Some(current) = text_of(item, "currentValue") else {
+            continue;
+        };
+        if out.iter().any(|o| o.id == id) {
+            continue;
+        }
+        let mut choices = Vec::new();
+        if let Some(offered) = item.get("options").and_then(Value::as_array) {
+            parse_choices(offered, &mut choices);
+        }
+        out.push(ConfigOption {
+            id,
+            category: text_of(item, "category"),
+            current,
+            choices,
+        });
+    }
+    Some(out)
 }
 
 /// A tool call as an update or a permission request describes it. Every field but the id is optional,
@@ -370,9 +640,10 @@ pub enum Update {
     Mode(String),
     /// A mode update that carries no readable mode id.
     UnreadableMode,
-    /// `config_option_update`: the mode, when the options carry one.
+    /// `config_option_update`: the mode, when the options carry one, and the whole list of options.
     Options {
         mode: Option<String>,
+        options: Option<Vec<ConfigOption>>,
     },
     /// `available_commands_update`: the whole list of commands the agent accepts, bounded and cleaned
     /// (`parse_commands`).
@@ -416,9 +687,15 @@ pub fn parse_update(params: &Value) -> Option<(String, Update)> {
         },
         "current_mode_update" => text_of(update, "currentModeId").map_or(Update::UnreadableMode, Update::Mode),
         "config_option_update" => match mode_from_options(update.get("configOptions")) {
-            Some(ModeReport::Known(mode)) => Update::Options { mode: Some(mode) },
+            Some(ModeReport::Known(mode)) => Update::Options {
+                mode: Some(mode),
+                options: parse_config_options(update.get("configOptions")),
+            },
             Some(ModeReport::Unreadable) => Update::UnreadableMode,
-            None => Update::Options { mode: None },
+            None => Update::Options {
+                mode: None,
+                options: parse_config_options(update.get("configOptions")),
+            },
         },
         "plan" => Update::Ignored("plan"),
         "available_commands_update" => match update.get("availableCommands").and_then(Value::as_array) {
@@ -500,7 +777,7 @@ pub fn is_invisible_char(c: char) -> bool {
 /// Cuts `text` to `max` characters with `…`, with control characters (newlines included) turned into
 /// spaces and runs of whitespace folded, so a description is always one plain line. Other invisible
 /// characters are kept: the page draws them as visible escapes (`revealHidden`) rather than hiding them.
-fn one_line(text: &str, max: usize) -> String {
+pub fn one_line(text: &str, max: usize) -> String {
     let folded = text
         .chars()
         .map(|c| if c.is_control() { ' ' } else { c })
@@ -742,7 +1019,14 @@ mod tests {
             ]
         }}))
         .unwrap();
-        assert_eq!(update, Update::Options { mode: None });
+        assert_eq!(
+            update,
+            Update::Options {
+                mode: None,
+                options: Some(vec![])
+            },
+            "an option without a readable value is not kept"
+        );
     }
 
     #[test]
@@ -866,5 +1150,63 @@ mod tests {
         ))
         .unwrap();
         assert_eq!(empty, Update::Commands(vec![]));
+    }
+
+    #[test]
+    fn rfc3339_times_read_as_epoch_milliseconds() {
+        assert_eq!(rfc3339_ms("1970-01-01T00:00:00Z"), Some(0));
+        assert_eq!(rfc3339_ms("2026-11-02T05:00:00.250Z"), Some(1_793_595_600_250));
+        assert_eq!(rfc3339_ms("2026-11-02T13:00:00+08:00"), Some(1_793_595_600_000));
+        assert_eq!(rfc3339_ms("2026-11-02T05:00:00-01:30"), Some(1_793_601_000_000));
+        assert_eq!(rfc3339_ms("2000-02-29T00:00:00Z"), Some(951_782_400_000), "a leap day");
+        for bad in [
+            "",
+            "yesterday",
+            "2026-13-01T00:00:00Z",
+            "2026-11-02",
+            "2026-11-02T25:00:00Z",
+            "1969-12-31T23:59:59Z",
+            "2026-11-02T05:00:00.é9Z",
+        ] {
+            assert_eq!(rfc3339_ms(bad), None, "{bad:?}");
+        }
+    }
+
+    #[test]
+    fn a_time_out_of_range_is_no_time_and_never_overflows() {
+        for bad in [
+            "2026-11-02T05:00:00+9223372036854775807:00",
+            "2026-11-02T05:00:00+24:00",
+            "2026-11-02T05:00:00+01:60",
+            "99999999999999999-11-02T05:00:00Z",
+            "10000-01-01T00:00:00Z",
+        ] {
+            assert_eq!(rfc3339_ms(bad), None, "{bad:?}");
+        }
+        assert_eq!(rfc3339_ms("9999-12-31T23:59:59Z"), Some(253_402_300_799_000));
+    }
+
+    #[test]
+    fn a_huge_session_list_is_read_in_bounded_work() {
+        let many: Vec<Value> = (0..100_000)
+            .map(|n| json!({"sessionId": format!("s{n}"), "updatedAt": "2026-11-02T00:00:00Z"}))
+            .collect();
+        let listed = parse_session_list(&json!({"sessions": many}), "/work").unwrap();
+        assert_eq!(listed.len(), MAX_LISTED_SESSIONS);
+    }
+
+    #[test]
+    fn an_id_the_agent_also_gives_its_mode_is_not_offered_for_anything_else() {
+        let options = json!([
+            {"id": "shared", "category": "model", "type": "select", "currentValue": "a", "options": [{"value": "a"}]},
+            {"id": "shared", "category": "mode", "type": "select", "currentValue": "ask", "options": [{"value": "ask"}]},
+            {"id": "model", "category": "model", "type": "select", "currentValue": "m", "options": [{"value": "m"}]}
+        ]);
+        let parsed = parse_config_options(Some(&options)).unwrap();
+        let ids: Vec<_> = parsed
+            .iter()
+            .map(|o| (o.id.as_str(), o.is_mode(), o.is_model()))
+            .collect();
+        assert_eq!(ids, [("shared", true, false), ("model", false, true)]);
     }
 }

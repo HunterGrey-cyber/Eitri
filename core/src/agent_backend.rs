@@ -1273,7 +1273,7 @@ impl AgentBackend {
     pub fn list_models(&mut self) -> Result<agent::TaskReply<agent::ModelList>, BackendError> {
         match self {
             AgentBackend::Conversation {
-                agent: AgentId::Claude,
+                agent: AgentId::Claude | AgentId::Acp(_),
                 conversation,
             } => conversation.list_models().map_err(task_command_error),
             _ => Err(BackendError {
@@ -1286,7 +1286,7 @@ impl AgentBackend {
     pub fn set_model(&mut self, model: &str) -> Result<agent::TaskReply<agent::AppliedSettings>, BackendError> {
         match self {
             AgentBackend::Conversation {
-                agent: AgentId::Claude,
+                agent: AgentId::Claude | AgentId::Acp(_),
                 conversation,
             } => conversation.set_model(model).map_err(task_command_error),
             _ => Err(BackendError {
@@ -1299,13 +1299,30 @@ impl AgentBackend {
     pub fn apply_effort(&mut self, effort: &str) -> Result<agent::TaskReply<agent::AppliedSettings>, BackendError> {
         match self {
             AgentBackend::Conversation {
-                agent: AgentId::Claude,
+                agent: AgentId::Claude | AgentId::Acp(_),
                 conversation,
             } => conversation.apply_effort(effort).map_err(task_command_error),
             _ => Err(BackendError {
                 message: "this agent cannot change its effort here".into(),
                 benign: true,
             }),
+        }
+    }
+
+    /// The sessions the agent of this tab lists as its own, including ones started in its own CLI: an ACP agent
+    /// that lists them; none otherwise.
+    pub fn listed_sessions(&self) -> Vec<agent::ListedSession> {
+        match self {
+            AgentBackend::Conversation { conversation, .. } => conversation.listed_sessions(),
+            AgentBackend::Legacy(_) => Vec::new(),
+        }
+    }
+
+    /// Asks the agent for its list of sessions again; the answer shows in [`listed_sessions`](Self::listed_sessions)
+    /// a moment later.
+    pub fn refresh_listed_sessions(&self) {
+        if let AgentBackend::Conversation { conversation, .. } = self {
+            conversation.refresh_listed_sessions();
         }
     }
 
@@ -2732,6 +2749,38 @@ pub fn external_sessions(project_dir: &Path) -> Vec<ResumableSession> {
                 .collect()
         })
         .unwrap_or_default()
+}
+
+/// `sessions` with the ones an agent lists as its own added, newest first: the session list a person already
+/// uses, with the sessions the agent started in its own CLI beside the ones Eitri recorded. A listed session
+/// Eitri already has a record of keeps the record's row (its name and its dates); the rest are rows with the
+/// agent's title and its last-active time.
+pub fn with_listed_sessions(
+    agent: &AgentId,
+    mut sessions: Vec<ResumableSession>,
+    listed: Vec<agent::ListedSession>,
+) -> Vec<ResumableSession> {
+    let name = agent.record_name();
+    for session in listed {
+        if sessions
+            .iter()
+            .any(|s| s.provider == name && s.provider_session_id == session.session_id)
+        {
+            continue;
+        }
+        let stamp = session.updated_at_ms.map_or_else(String::new, |ms| ms.to_string());
+        sessions.push(ResumableSession {
+            provider: name.clone(),
+            provider_session_id: session.session_id,
+            created_at: stamp.clone(),
+            updated_at: stamp,
+            title: session.title,
+            name: None,
+        });
+    }
+    let rank = |s: &ResumableSession| s.updated_at.parse::<u128>().ok();
+    sessions.sort_by_key(|s| std::cmp::Reverse(rank(s)));
+    sessions
 }
 
 /// The sessions of `sessions` that `agent` itself recorded, in their order: what a tab of that agent
@@ -6772,6 +6821,59 @@ mod external_tests {
         let conversation = AgentConversation::create_external(provider, start, &dir).unwrap();
         let refused = ExternalConversation::new(AgentId::Acp("gemini".into()), conversation);
         assert!(refused.is_err(), "a codex session is not an ACP tab's");
+    }
+
+    #[test]
+    fn an_agents_own_sessions_join_the_records_without_repeating_one() {
+        let gem = AgentId::Acp("gem".into());
+        let recorded = |id: &str, updated: &str| ResumableSession {
+            provider: "acp:gem".into(),
+            provider_session_id: id.into(),
+            created_at: "1".into(),
+            updated_at: updated.into(),
+            title: Some(format!("record of {id}")),
+            name: Some("my name".into()),
+        };
+        let listed = |id: &str, ms: Option<u64>| agent::ListedSession {
+            session_id: id.into(),
+            title: Some(format!("agent's {id}")),
+            updated_at_ms: ms,
+        };
+        let merged = with_listed_sessions(
+            &gem,
+            vec![recorded("both", "3000"), recorded("mine", "1000")],
+            vec![
+                listed("both", Some(9000)),
+                listed("theirs", Some(2000)),
+                listed("untimed", None),
+            ],
+        );
+        let ids: Vec<&str> = merged.iter().map(|s| s.provider_session_id.as_str()).collect();
+        assert_eq!(
+            ids,
+            ["both", "theirs", "mine", "untimed"],
+            "newest first, a session with no time last"
+        );
+        assert_eq!(
+            merged[0].name.as_deref(),
+            Some("my name"),
+            "a recorded session keeps its record's row"
+        );
+        assert_eq!(merged[0].updated_at, "3000");
+        assert_eq!(merged[1].title.as_deref(), Some("agent's theirs"));
+        assert_eq!(merged[1].provider, "acp:gem");
+        assert_eq!(
+            (merged[1].created_at.as_str(), merged[1].updated_at.as_str()),
+            ("2000", "2000")
+        );
+        assert_eq!(merged[3].updated_at, "");
+        // Another agent's record of the same id is a different session.
+        let other = ResumableSession {
+            provider: "acp:other".into(),
+            ..recorded("theirs", "5")
+        };
+        let merged = with_listed_sessions(&gem, vec![other], vec![listed("theirs", Some(2000))]);
+        assert_eq!(merged.len(), 2);
     }
 
     #[test]
