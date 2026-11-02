@@ -1,20 +1,26 @@
-//! Filters Super and Hyper chords before they reach web content.
+//! No web module's page -- the agent panel, or a Lua or plugin page -- sees a key pressed with Super or
+//! Hyper held.
 //!
-//! WebKitGTK 2.52.6 does not expose these modifiers on the page's `KeyboardEvent`,
-//! so `isPlainAnswerKey` cannot distinguish `Super+a` from a permission-card answer.
-//! The page tracks Super keydown and keyup, but that misses a modifier held across
-//! a focus change or a press consumed by GTK's HINT controller. GDK receives the
-//! current modifiers when focus arrives and can catch these cases.
-//! `gtk_host::keys::key_press` sets `super_or_hyper` for `SUPER_MASK` or `HYPER_MASK`.
-//! The window controller's module stage consumes the chord before WebKit receives it,
-//! via `gtk_host::keys::module_key`. If the window is gone or has no layout yet,
-//! `wire_host` still keeps the chord from the page.
-//! The panel binds neither modifier, and `keys.declare` refuses them for plugin pages.
-//! Window shortcuts run earlier in the window's capture phase. Lua and plugin pages
-//! use the same filter to avoid seeing only part of a chord.
+//! The 2026-09-28 sandbox pass of the v1 audit fixes found `Super+a` answering a permission card:
+//! WebKitGTK 2.52.6 puts no modifier on the page's `KeyboardEvent` for Super or Hyper, so the
+//! panel's own check (`agent-ui/web/src/keymap.ts`, `isPlainAnswerKey`) cannot see one. The panel
+//! now also tracks Super's own keydown/keyup (`agent-ui/web/src/heldSuper.ts`), but a tracker made of
+//! key events misses Super held across a focus change, or a Super press GTK consumes before the page
+//! (the HINT capture controller). GDK's modifier state has neither gap: the compositor sends the
+//! current modifiers whenever focus arrives. So a key press carrying `SUPER_MASK` or `HYPER_MASK` is
+//! translated with `super_or_hyper` set (`gtk_host::keys::key_press`), and the window controller's
+//! module stage (`eitri_core::wm::keys::module_press`, asked from each web module's host by
+//! `gtk_host::keys::module_key`) consumes it before WebKit gets it; when the stage cannot decide (the
+//! window torn down, or not yet laid out), `wire_host` still keeps the chord from the page, so the rule
+//! fails toward the card rather than open. The panel binds nothing with Super
+//! or Hyper, and a plugin page may not act on a Super or Hyper chord either (`keys.declare` refuses
+//! such a key), so nothing any page binds is lost; window-level shortcuts run in the window's own
+//! capture phase, before this, and are unaffected. A Lua or plugin page gets the same rule so a page
+//! never sees half of a chord the window or the compositor owns.
 //!
-//! When GDK does not report Super, this filter cannot detect it. The page-side
-//! tracker remains necessary for that case.
+//! **Where GDK does not report Super, this does nothing** -- the headless sway sandbox is one such
+//! place, which is why the page-side tracker stays too.
+//! Whether a real GNOME session reports it is on the real-hardware checklist.
 
 #[cfg(test)]
 mod tests {

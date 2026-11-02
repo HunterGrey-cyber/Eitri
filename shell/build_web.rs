@@ -42,7 +42,7 @@ const LOCK_SHA_REL: &str = "node_modules/.eitri-lock-sha256";
 
 /// What `ensure_web_bundle_built` decided, from facts it already gathered off the filesystem --
 /// this function itself touches nothing, which is what makes it the thing a test drives directly
-/// for the plan's eight cases rather than having to reproduce every filesystem state by hand.
+/// for the eight cases rather than having to reproduce every filesystem state by hand.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct WebBuildPlan {
     npm_ci: bool,

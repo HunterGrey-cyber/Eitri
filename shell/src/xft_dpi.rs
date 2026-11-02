@@ -71,6 +71,6 @@ mod tests {
         assert_eq!(xft_dpi_fallback(-1), Some(GTK_DEFAULT_XFT_DPI));
         assert_eq!(xft_dpi_fallback(0), Some(GTK_DEFAULT_XFT_DPI));
         assert_eq!(xft_dpi_fallback(98304), None);
-        assert_eq!(xft_dpi_fallback(147456), None);
+        assert_eq!(xft_dpi_fallback(147456), None); // a typical HiDPI settings.ini
     }
 }

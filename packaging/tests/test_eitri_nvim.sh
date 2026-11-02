@@ -9,7 +9,7 @@ PLUGIN="$(cd "$HERE/../../nvim/eitri.nvim" && pwd)"
 
 command -v nvim >/dev/null || { echo "SKIP - no nvim on PATH"; exit 0; }
 
-# Use scratch XDG directories to keep the user's config and state untouched.
+# Scratch XDG dirs, never the user's own config or state.
 SCRATCH="$(mktemp -d "${TMPDIR:-$HOME/.cache}/eitri-nvim-test-XXXXXX")"
 trap 'rm -rf "$SCRATCH"' EXIT
 export XDG_CONFIG_HOME="$SCRATCH/config" XDG_DATA_HOME="$SCRATCH/data" XDG_STATE_HOME="$SCRATCH/state" XDG_CACHE_HOME="$SCRATCH/cache"

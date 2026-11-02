@@ -371,7 +371,7 @@ t_dry_run_fresh() {
 	expect_out 'would download http'
 	expect_out '/SHA256SUMS.sig and check it with ssh-keygen -Y verify'
 	expect_out 'dry run: nothing was changed'
-	# Without a key (the harness's unkeyed installer; the real one lists a release key), no .sig is fetched,
+	# Without a key (the harness's unkeyed installer; the real one lists the maintainer's), no .sig is fetched,
 	# and it says so.
 	inst -- --base-url "http://127.0.0.1:$PORT" --dry-run
 	expect_rc 0

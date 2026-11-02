@@ -757,7 +757,7 @@ fn probe(sock: &Path, pid_file: &Path, request: Option<&Request>) -> Result<Prob
 
 /// Becomes the panel for `project_root`, or finds the one that already is.
 ///
-/// `request` is what a caller that is not the owner wants the owner to do; `None` sends
+/// `request` is what a caller that does not hold the claim wants the holder to do; `None` sends
 /// [`Request::Raise`]. When this returns [`Claim::Ours`] nothing was sent: the caller acts on its
 /// own request.
 pub fn claim(dir: &Path, project_root: &Path, request: Option<&Request>) -> Result<Claim, String> {

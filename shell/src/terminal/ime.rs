@@ -152,7 +152,7 @@ impl ImeGate {
             return Commit::Dropped("it was empty");
         }
         // A line break makes it a paste: a multi-line commit is
-        // text not typed line by line -- fcitx5's clipboard history -- and a shell runs
+        // text the user did not type line by line -- fcitx5's clipboard history -- and a shell runs
         // each unbracketed line as it arrives.
         if text.contains(['\n', '\r']) {
             return Commit::Send(normalize_paste(text));

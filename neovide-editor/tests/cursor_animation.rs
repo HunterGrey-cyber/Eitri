@@ -14,7 +14,7 @@
 //! that is not `HEADLESS-<n>` (`require_headless_outputs`): a real screen, or a window on one, as a
 //! nested compositor's output is. And it runs GTK's own input method, never an inherited
 //! `GTK_IM_MODULE`: with `fcitx` the pane's input context reached for fcitx5 over the session bus as
-//! soon as it took focus -- on the live desktop's bus.
+//! soon as it took focus -- on the desktop's bus, the user's live one.
 //! Checking outputs only after `gtk4::init()` connects would let a
 //! desktop whose runtime directory is not `/run/user/` (`/tmp/runtime-<user>`) be connected to before
 //! it was refused. Now, before GTK, the process listening on the socket is found through `/proc`
@@ -1428,11 +1428,16 @@ fn run(
     failures
 }
 
-/// Accept only a sandbox Wayland socket outside the desktop runtime directory.
-/// The sandbox compositor uses its own `XDG_RUNTIME_DIR`; desktop sockets live under
-/// `/run/user/<uid>/`. Resolve `WAYLAND_DISPLAY` as an absolute path or relative to
-/// `XDG_RUNTIME_DIR`, following symlinks, and require an existing socket outside `/run/user/`.
-/// Reject `DISPLAY`: an XWayland name such as `:0` cannot distinguish a sandbox from a desktop.
+/// The Wayland socket this test may draw on: the headless-sway sandbox's, never the desktop's.
+///
+/// "Run ONLY in the isolated GUI sandbox" was a sentence in this file's header until 2026-09-29,
+/// when a sibling test that said the same (`shell/tests/panel_stream_scroll.rs`) was run without its
+/// wrapper and opened its windows on the user's own screen. Every sandbox harness in use starts its
+/// compositor with a private `XDG_RUNTIME_DIR` of its own (`<harness>/run`), and a desktop session's
+/// sockets live in the login runtime directory, `/run/user/<uid>/`. So the socket `WAYLAND_DISPLAY`
+/// names -- an absolute path, or relative to `XDG_RUNTIME_DIR`, as libwayland resolves it -- must
+/// exist and must resolve (symlinks followed) outside `/run/user/`. `DISPLAY` is not accepted at all:
+/// XWayland's `:0` cannot be told apart from an X server of the test's own by its name.
 fn sandbox_wayland_socket() -> Result<PathBuf, String> {
     let name = std::env::var_os("WAYLAND_DISPLAY")
         .filter(|name| !name.is_empty())
@@ -1836,10 +1841,11 @@ fn socket_holders(inodes: &[u32]) -> (Vec<u32>, Vec<String>) {
     (owners, unreadable)
 }
 
-/// Require GTK's compositor to expose only wlroots `HEADLESS-<n>` outputs.
-/// Check immediately after `gtk4::init()`, before creating any surface. Desktop outputs and
-/// nested `WL-<n>` or `X11-<n>` outputs can display windows on a real screen, regardless of
-/// the socket path checked by `sandbox_wayland_socket`.
+/// The compositor GTK connected to has only headless outputs (wlroots' `HEADLESS-<n>`, what every
+/// sandbox harness here runs): no real screen, and no window on one. Checked right after
+/// `gtk4::init()`, before any surface exists. A desktop -- or a compositor nested in one, whose
+/// output (`WL-<n>`, `X11-<n>`) is a window on the user's screen -- is refused whatever its socket's
+/// path, which the checks in `sandbox_wayland_socket` cannot establish on their own.
 fn require_headless_outputs() -> Result<Vec<String>, String> {
     let display = gtk4::gdk::Display::default().ok_or("GTK has no default display")?;
     let monitors = display.monitors();
@@ -2348,7 +2354,7 @@ fn main() {
     // GTK's own input method, as `own_x_server::isolate` sets: an inherited `GTK_IM_MODULE=fcitx`
     // makes the pane's input context reach for fcitx5 over the session bus the moment it takes focus
     // (seen 2026-09-29 on a private bus: `GetNameOwner("org.fcitx.Fcitx5")` and a `NameOwnerChanged`
-    // match for it). On the desktop's bus that is the live desktop fcitx5, and this test's focus-in
+    // match for it). On the desktop's bus that is the user's live fcitx5, and this test's focus-in
     // would reach it.
     for var in ["GTK_IM_MODULE", "XMODIFIERS"] {
         if let Some(inherited) = std::env::var_os(var) {

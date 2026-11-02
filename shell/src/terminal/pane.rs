@@ -1,55 +1,73 @@
-//! The bottom terminal's `GtkGLArea` paints the session's latest frame and handles keyboard,
-//! click, focus and resize events. The session thread handles terminal bytes, parsing,
-//! encoding and rendering. The pane keeps the latest `PaintList` and the GL surface.
+//! The bottom terminal's widget: a `GtkGLArea` that paints its session's latest frame, and the
+//! keyboard, click, focus and resize wiring around it.
 //!
-//! The shell starts lazily. `start` marks it as wanted; the session spawns at the first
-//! allocation with area. That allocation is kept in [`State::allocation`] and used to build
-//! the metrics. The first resize can arrive before metrics exist, and GTK sends no second
-//! resize for the same allocation, so a 1x1 placeholder would leave the PTY at the wrong size.
+//! From the frozen `terminal-pane/src/pane.rs` which had no
+//! session at all; what changed is what the frozen pane's callbacks are now connected to. The pane
+//! owns no terminal semantics: bytes, parsing, encoding and rendering are `eitri-terminal`'s, on
+//! the session thread. What it keeps is the latest `PaintList` and the GL surface to paint it on.
 //!
-//! The session wakes the main loop through a channel awaited by a `glib::spawn_future_local`
-//! future. There is no polling timer to delay echo or wake an idle terminal. When unmapped,
-//! the pane tells the session it is hidden, so output in a hidden terminal renders nothing.
+//! **The shell starts lazily**: `start` only says a shell is wanted, and the session is
+//! spawned at the first allocation with area, so it never starts at 1x1 and redraws its prompt.
+//! That allocation is **kept** ([`State::allocation`]) and the lazily built metrics are built AT it
+//! (GUI pass 2026-09-23, defect 1): the first `resize` arrives before any metrics exist, so it has
+//! nothing to resize, and GTK sends no second one for the same allocation. Before this, the metrics
+//! were built at a 1x1 placeholder and the first `Ctrl+a t` spawned the shell on a 1x1 PTY, blank
+//! but for one cursor cell, until something happened to resize the pane.
 //!
-//! If `$SHELL` cannot start, startup falls back to the passwd entry's shell and then `/bin/sh`.
-//! If none starts, the pane displays the failure and waits for Enter instead of retrying
-//! on every resize.
+//! **Woken, never polled.** The session calls a waker from its own thread; the waker sends on a
+//! channel whose receiver a `glib::spawn_future_local` future awaits on the main loop. No timer:
+//! a 33 ms poll like the agent panel's steady tick would add up to 33ms to every echo, and an idle terminal costs no
+//! wake-ups at all (tested in `eitri-terminal`'s `idle_renders_nothing`). Hidden (unmapped), the
+//! pane tells the session so, and a program printing away in a hidden terminal renders nothing.
 //!
-//! Chinese input uses `ime.rs` and a `GtkIMMulticontext` on the key controller. Commits go
-//! through [`submit`]; unfinished composition is drawn at `Update::cursor`. The input method
-//! is pointed at its caret on `preedit-*`, on gaining focus, and when a frame moves the cursor
-//! while focused. GTK's key controller manages input-method focus and can focus it out before
-//! the focus report arrives, causing fcitx5 to commit. [`connect_ime`] checks GTK focus so
-//! composition interrupted by leaving the terminal is discarded. [`TerminalPane::start`]
-//! sets the client widget, so an unused terminal creates no input-method client.
-//! No `RefCell` borrow is held across `reset`, `set_cursor_location` or `set_client_widget`:
-//! `reset` can emit signals whose handlers borrow the state before the call returns.
+//! **A shell that will not start** (a stale `$SHELL`) falls back to the passwd entry's shell and
+//! then `/bin/sh`; if none starts, the pane says so in its own frame and waits for Enter, rather
+//! than trying again on every resize.
 //!
-//! All input for the shell goes through [`submit`]: typed keys, prefix literals, clipboard
-//! paste and input-method commits. Clipboard reads are asynchronous. `input_queue` keeps
-//! later input behind a pending paste so Enter cannot overtake the text it should run.
-//! Middle click pastes the primary selection through the same path (`paste_primary`).
+//! **Chinese input (bottom-terminal phase 2)** is `ime.rs`'s: a `GtkIMMulticontext` on this widget's
+//! key controller, its commits through [`submit`], its unfinished composition drawn over the frame
+//! at the cursor the session reports (`Update::cursor`), and the input method pointed at its caret
+//! on every `preedit-*`, when the terminal gains the keys, and when a frame moves the cursor while
+//! it has them. **GTK's key controller owns the input method's focus** (`set_im_context`) and
+//! focuses it out from inside a focus change, before the focus report says anything -- which is when
+//! fcitx5 commits whatever was being composed. So the commit handler asks GTK whether the terminal
+//! still has the keys ([`connect_ime`]), and a composition cut off by the keys leaving is dropped,
+//! never typed (`ime.rs`'s module doc has the sources). Its client widget is set by
+//! [`TerminalPane::start`], so a window whose terminal is never shown creates no input-method client.
+//! **No `RefCell` borrow is held across a call into the input method** (`reset`,
+//! `set_cursor_location`, `set_client_widget`): `reset` can emit `commit` or `preedit-changed` before
+//! it returns, and those handlers borrow the state.
 //!
-//! `connect_pointer` maps clicks and motion to `SelectCommand`s with `pointer::cell_at` and
-//! `kind_for`. Releasing a selection copies its text to the clipboard and primary selection
-//! through `pump`'s `events.selection` handling. `Ctrl+Shift+C` copies `State::last_selection`
-//! again through `copy_selection`.
+//! **Everything bound for the shell goes through one door, [`submit`]** (bottom-terminal phase 2):
+//! typed keys, the prefix's literals, `Ctrl+Shift+V`'s text and input-method commits. A paste reads
+//! the clipboard asynchronously, and what is typed while it is read waits behind it (`input_queue`),
+//! so an Enter can never overtake the text it was meant to run. A middle click pastes the primary
+//! selection through the same door (`paste_primary`).
 //!
-//! OSC 52 copies reach GTK's clipboard (`c`) or primary selection (`p`/`s`), even while hidden.
-//! `Term` refuses clipboard reads. A bell briefly tints the pane through `bell.rs`; bells
-//! received while hidden are not flashed when it returns. Program titles have no header
-//! to display in.
+//! **Selection: drag, double/triple click, and copy.** `connect_pointer` turns the primary button's click count and motion into
+//! `eitri_terminal::SelectCommand`s (`pointer::cell_at`/`kind_for`); a release copies the
+//! finished text to both the clipboard and the primary selection at once (`pump`'s own
+//! `events.selection` handling), and `Ctrl+Shift+C` copies it again from `State::last_selection`
+//! (`copy_selection`) -- it is no longer held back the way it was through phase 2.
 //!
-//! Font metrics are lazy. [`ensure_session`] builds `TerminalMetrics` when starting the shell,
-//! so [`TerminalPane::new`] never touches a font manager. If no usable monospace font exists,
-//! the pane displays its failure frame instead of letting a font-manager panic close the process.
+//! **A program's copy lands on the desktop, and its bell flashes the pane** (bottom-terminal phase
+//! 2). An OSC 52 copy goes to GTK's clipboard (`c`) or primary selection (`p`/`s`), hidden or not; a
+//! read is still refused, by `Term` itself. A bell tints the pane for a moment (`bell.rs`), and a
+//! bell rung while the terminal was hidden is not flashed when it comes back. The title a program
+//! sets has nowhere to go: the terminal's title rule sends it to the pane's header "when one exists", and none does.
 //!
-//! `super::TerminalFace`, [`TerminalPane::set_face`] and [`TerminalPane::set_zoom`] use the
-//! editor's `guifont` unless `terminal.font` overrides it, at the window's terminal zoom.
-//! The controller changes that zoom with `g:neovide_scale_factor` or independently.
-//! A face or zoom change rebuilds metrics at the pane's size and sends the resulting grid
-//! to the PTY as a resize. A larger font therefore gives the shell a smaller grid.
-//! Before metrics exist, only the face is kept.
+//! **The font metrics are lazy too, and never panic.** A
+//! window whose terminal is never shown never touches a font manager: `TerminalMetrics` is built
+//! by [`ensure_session`], the same gate that lazily spawns the shell, not at [`TerminalPane::new`].
+//! A machine with no usable monospace font shows the pane's own failure frame -- the same one a
+//! shell that would not start shows -- rather than panicking the whole process.
+//!
+//! **The face and the text size are the window's** (`super::TerminalFace`, [`TerminalPane::set_face`],
+//! [`TerminalPane::set_zoom`]): the editor's `guifont` unless `terminal.font` says otherwise, at the
+//! window's terminal zoom, which the controller moves with the editor's `g:neovide_scale_factor` or alone.
+//! A change rebuilds the metrics at the pane's size, and the grid that comes back reaches the PTY the
+//! way a pane resize does, so a larger font is a smaller grid the shell is told about. Before the
+//! metrics exist the face is only kept.
 
 use std::cell::RefCell;
 use std::ffi::OsString;
@@ -114,8 +132,9 @@ impl<F: Fn() -> Vec<(OsString, OsString)> + ?Sized> ShellEnvSource for Rc<F> {
 
 struct State {
     skia: Option<SkiaState>,
-    /// `None` until [`ensure_session`] is about to spawn a shell. Delaying metrics construction
-    /// avoids a font manager and fontconfig match for windows whose terminal is never shown.
+    /// `None` until [`ensure_session`] builds it, the first time a shell is actually about to
+    /// spawn. Never built at construction: a window whose terminal is never
+    /// shown must not pay for a font manager and a fontconfig match at every launch.
     metrics: Option<TerminalMetrics>,
     /// The last allocation with area the GLArea was given; `None` until the first. What the
     /// metrics are built at when a shell is first wanted (GUI pass 2026-09-23, defect 1).
@@ -139,7 +158,7 @@ struct State {
     /// The input method's composition and what of it may reach the shell (phase 2).
     ime: ImeGate,
     repeats: RepeatTracker,
-    /// Keyvals whose presses this pane forwarded, used to forward only their matching releases.
+    /// Keyvals whose press this pane forwarded, so it knows which releases are its to forward too.
     delivered: DeliveredKeys,
     /// What is bound for the shell and waits behind a paste still being read (phase 2).
     queue: InputQueue,
@@ -215,8 +234,10 @@ enum CommitRoute {
 }
 
 impl State {
-    /// Constructs the state used by `TerminalPane::new`. GTK fields start as `None`, so tests can
-    /// check the initial state, including absent metrics, without a display or `gtk4::init`.
+    /// The construction seam `TerminalPane::new` uses. Deliberately GTK-free (no field here holds
+    /// a `gtk4` type instantiated by anything but `None`), so a test can assert what a pane's state
+    /// looks like the instant it exists -- in particular, that it holds no metrics -- with no
+    /// display and no `gtk4::init`.
     fn new(cwd: PathBuf) -> Self {
         State {
             skia: None,
@@ -963,15 +984,19 @@ const NO_METRICS_SIZE: PtySize = PtySize {
     cell_height_px: 0,
 };
 
-/// Builds font metrics at `allocation` and catches font-manager panics. If no usable monospace
-/// font exists, the pane can show a failure message instead of crashing the window.
+/// Builds the pane's font metrics at `allocation`, containing a font-manager panic rather than
+/// letting it take the whole process down: a machine with no
+/// usable monospace font must fail with a message in the pane, like a shell that would not start,
+/// not crash the window.
 ///
-/// Use the actual allocation rather than a 1x1 placeholder. With lazy metrics, the first resize
-/// arrives before they exist, and GTK sends no second resize until the pane changes size.
-/// Building at a placeholder would therefore spawn the shell with the wrong PTY dimensions.
+/// **At the allocation, never at a placeholder** (GUI pass 2026-09-23, defect 1). The first version
+/// built these at 1x1, "exactly as `TerminalPane::new` used to build it eagerly", trusting the next
+/// resize to correct cols/rows. Eagerly, that was true: the first resize found metrics and sized
+/// them before the spawn. Lazily it is not: the first resize is the one that finds none, the spawn
+/// follows it at 1x1, and there is no next resize until the pane's size changes.
 ///
-/// Uses `face` at `zoom`: the face's size times the window's terminal zoom, in logical pixels.
-/// The metrics scale that size to device pixels.
+/// In `face` at `zoom`: the face's size times the window's terminal zoom, in logical pixels (the metrics
+/// scale it to device pixels).
 fn build_metrics(allocation: Allocation, face: &TerminalFace, zoom: f32) -> Result<TerminalMetrics, String> {
     let Allocation { width, height, scale } = allocation;
     let size = face.base_px * zoom;
@@ -1219,7 +1244,7 @@ fn pump(state: &RefCell<State>, area: &GLArea, im: &IMMulticontext, on_screen: b
             }
         });
     }
-    // `update.events.title` has nowhere to go: the spec gives it to the pane's header "when one
+    // `update.events.title` has nowhere to go: the title rule gives it to the pane's header "when one
     // exists", and the terminal has no header yet.
 
     // Last, with nothing borrowed: the hook kills the module, unmapping this pane, whose handler
@@ -1795,9 +1820,10 @@ fn connect_keyboard(area: &GLArea, state: &Rc<RefCell<State>>, im: &IMMulticonte
                 }
                 None => {}
             }
-            // Remember delivery before forwarding the press. Forward a release only if its press reached
-            // this pane. Do not infer delivery from release modifiers: Shift may have been released
-            // before the letter in a clipboard chord.
+            // Recorded before delivery: a release is forwarded only for a keyval whose press
+            // reached here, never re-derived from the release's own
+            // modifier state, which can have changed (Shift let go before a clipboard chord's
+            // letter, for one).
             state.borrow_mut().delivered.mark(keyval);
             deliver(&state, raw_key(&area, keyval, keycode, modifier, true, repeat));
             // Claimed unconditionally: every key that reaches the terminal is the child's. The keys
@@ -1809,8 +1835,9 @@ fn connect_keyboard(area: &GLArea, state: &Rc<RefCell<State>>, im: &IMMulticonte
         let state = state.clone();
         keys.connect_key_released(move |controller, keyval, keycode, modifier| {
             state.borrow_mut().repeats.release(keyval);
-            // A release can arrive without its press, such as the key that moved focus here, a prefix
-            // literal's physical key, or a HINT label. Forward only releases for delivered presses.
+            // A release reaches this pane for a keyval whose press never did -- the key that moved
+            // focus in, the real key behind a `Ctrl+a Ctrl+a`/`Ctrl+a Ctrl+l` literal, a HINT label.
+            // Forward only what was actually delivered.
             let was_delivered = state.borrow_mut().delivered.take(keyval);
             if !was_delivered {
                 return;

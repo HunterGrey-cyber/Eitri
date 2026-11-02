@@ -5,7 +5,7 @@
 //! **Why (2026-09-29).** `panel_stream_scroll`'s header said "never the real desktop", and nothing in
 //! it enforced that: a GUI pass ran `cargo test -p shell --test panel_stream_scroll -- --ignored`
 //! without the `xvfb-run` wrapper its header names, `gtk4::init()` took the inherited
-//! `WAYLAND_DISPLAY=wayland-0`, and its WebViews opened, one after another, on the desktop
+//! `WAYLAND_DISPLAY=wayland-0`, and its WebViews opened, one after another, on the user's own
 //! screen until the run was killed. `band_xft_zoom`, `close_prompt_placement` and
 //! `hidden_widget_restyle` checked only `GDK_BACKEND=x11`, which XWayland's `DISPLAY=:0` on that same
 //! desktop satisfies, and the headless `LiveHarness` tests (`neovide-editor`'s `fullscreen_setting`,
@@ -25,7 +25,7 @@
 //! run from an agent shell with a network namespace of its own, where the desktop's abstract
 //! `@/tmp/.X11-unix/X0` is invisible but `/tmp` is shared, `-displayfd` found `:0` "free",
 //! **unlinked the desktop's `/tmp/.X11-unix/X0`** (xtrans unlinks the path before binding), bound
-//! its own there and removed that on exit: the session's XWayland lost its socket file for the rest
+//! its own there and removed that on exit: the user's XWayland lost its socket file for the rest
 //! of the session.
 //!
 //! **Nor does it share a number with anything that does.** Without a
@@ -53,13 +53,13 @@
 //! winit has any other display to fall back to. An inherited `DISPLAY` -- `xvfb-run`'s included --
 //! is ignored, and said so. The desktop's input method is replaced with GTK's own (`GTK_IM_MODULE`,
 //! `XMODIFIERS`): an inherited `GTK_IM_MODULE=fcitx` would route this window's keys through the
-//! session's live fcitx5 daemon over the session bus, whose candidate window draws on the desktop.
+//! user's live fcitx5 daemon over the session bus, whose candidate window draws on their screen.
 //! [`init_gtk`] does that, initialises GTK, and refuses to go on unless every X connection in the
 //! process is to this server.
 //!
 //! **Nor does it reach the session bus.** A bare run on the desktop's own
 //! bus asked it for `org.a11y.Bus.GetAddress`, and D-Bus-activated `org.freedesktop.portal.Desktop` and
-//! `org.gtk.vfs.Daemon` -- services that then run with the session's real `HOME` (measured on a private bus under
+//! `org.gtk.vfs.Daemon` -- services that then run with the user's real `HOME` (measured on a private bus under
 //! `dbus-monitor`, 2026-09-29). So `DBUS_SESSION_BUS_ADDRESS` is pointed at
 //! [`NO_SESSION_BUS`], a socket path that cannot exist, and `AT_SPI_BUS_ADDRESS` (which GTK would
 //! use before asking the session bus) is removed ([`cut_session_bus`]; `cursor_animation` calls it

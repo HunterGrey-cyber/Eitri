@@ -7,8 +7,8 @@
 //! (`Source/WebKit/UIProcess/gtk/SystemSettingsManagerProxyGtk.cpp`). It is a *page* zoom
 //! (`setPageZoomFactor`), so one CSS px is `page scale` GTK logical px, and `devicePixelRatio` is the
 //! widget's integer scale factor times it (`LocalDOMWindow::devicePixelRatio`). That is what the
-//! measurements showed: `gtk-xft-dpi=147456` (a 144 dpi
-//! value) gave 1.5 at scale 1 and 3 at scale 2, and 98304 gave 1 and 2. The monitor's scale does
+//! v1-scale sandbox pass measured (2026-09-27): `gtk-xft-dpi=147456` (144 dpi, a common
+//! HiDPI value) gave 1.5 at scale 1 and 3 at scale 2, and 98304 gave 1 and 2. The monitor's scale does
 //! not enter the page zoom: `refreshInternalScaling` also runs on a scale or monitor change, but
 //! with the same `fontDPI()`, and `xft_dpi::ensure_xft_dpi` never leaves the setting unset -- the
 //! one case where `fontDPI()` would read the monitor instead.
@@ -163,7 +163,7 @@ mod tests {
     }
 
     const DPI_96: i32 = 96 * 1024;
-    const DPI_144: i32 = 147_456; // 144 dpi in `gtk-xft-dpi` units
+    const DPI_144: i32 = 147_456; // a common `gtk-xft-dpi`
 
     fn close(a: f32, b: f32) -> bool {
         (a - b).abs() < 1e-4

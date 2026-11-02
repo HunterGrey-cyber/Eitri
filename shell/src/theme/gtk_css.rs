@@ -391,8 +391,7 @@ window.editor-hole, window.editor-hole .shell-root, window.editor-hole .content-
 }}
 
 /* The `Ctrl+a` prefix is waiting for its next key (`eitri_core::wm::keys`). The same solid block as the top
-   bar's own cursor -- the pair is surface_fg behind surface text, guarded at 4.5:1 -- as a
-   tmux theme highlights its session name while the prefix is down. */
+   bar's own cursor -- the pair is surface_fg behind surface text, guarded at 4.5:1 -- as a tmux theme often highlights its session name while the prefix is down. */
 .topbar-app-name.prefix-armed {{
     background-color: {bar_fg};
     color: {bar};
@@ -749,8 +748,8 @@ mod tests {
         assert!(t.surface_fg.contrast(t.surface) >= 4.5);
     }
 
-    /// Focus is shown by cursors, never by chrome around the panes. The design considers a
-    /// frame ugly and a line under the pane a stopgap; any rule on `.pane` would also risk taking
+    /// Focus is shown by cursors, never by chrome around the panes (2026-09-19). A
+    /// frame around the pane and a line under it were both rejected; any rule on `.pane` would also risk taking
     /// layout space and resizing nvim's grid on every focus change. The top bar's own cursor is the
     /// guarded chrome pair, reversed.
     #[test]

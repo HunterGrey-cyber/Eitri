@@ -23,7 +23,7 @@ set -u
 
 HERE=$(cd "$(dirname "$0")" && pwd)
 PKG=$(cd "$HERE/../.." && pwd)
-# REAL_INSTALLER is packaging/install.sh as committed, with the release key embedded. Tests
+# REAL_INSTALLER is packaging/install.sh as committed, with the maintainer's release key embedded. Tests
 # that read the source (the embedded block, the pinned verify line) and the one test of the real
 # key's own behaviour use it. INSTALLER, which every other test runs, copies into a fixture release
 # or compares with an installed eitri-setup, is REAL_INSTALLER with the key lines taken out of its
@@ -133,7 +133,7 @@ setup_keys() {
 	SIGNERS=$S/keys/signers-release
 	# The installer with no key embedded (a fixture of this harness, never shipped): install.sh with
 	# every key line of its embedded signers block removed, so that "no key built in" stays
-	# deterministic now that the real file lists the release key. Only key lines may go.
+	# deterministic now that the real file lists the maintainer's release key. Only key lines may go.
 	mkdir -p "$S/unkeyed"
 	awk '
 		/^[[:space:]]*cat <<.EITRI_RELEASE_SIGNERS.$/ { inside = 1; print; next }
@@ -152,7 +152,7 @@ setup_keys() {
 	INSTALLER=$S/unkeyed/install.sh
 	# The installer with the test key embedded in its signers block, as every final release's
 	# installer carries one: the branch that runs with no --release-signers. The
-	# unkeyed copy plus one line, so it carries the test key and never the release key.
+	# unkeyed copy plus one line, so it carries the test key and never the maintainer's.
 	awk -v key="$(cat "$SIGNERS")" '/^EITRI_RELEASE_SIGNERS$/ { print key } { print }' \
 		"$INSTALLER" >"$S/install-keyed.sh"
 	KEYED_INSTALLER=$S/install-keyed.sh
@@ -368,7 +368,7 @@ mk_release() {
 	mk_plugin_tree "$b/lib/eitri/plugins/markdown" "$v"
 	# The fixture release's eitri-setup and install.sh are the unkeyed copy, not the real file: the
 	# tests run them (the tarball's eitri-setup after an install, `eitri setup`) and compare the
-	# installed eitri-setup with $INSTALLER, and none of them may depend on the real release key.
+	# installed eitri-setup with $INSTALLER, and none of them may depend on the maintainer's real key.
 	# Nothing here stands in for what the real release ships; t_real_installer_* test that file.
 	cp "$INSTALLER" "$b/lib/eitri/eitri-setup"
 	chmod 0755 "$b/lib/eitri/eitri-setup"

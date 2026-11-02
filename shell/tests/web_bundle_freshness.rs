@@ -7,7 +7,7 @@
 //! Every case asserts exactly which npm commands the *second* call made, against a fixture that a
 //! first call already fully installed and built (see [`Fixture::installed`]) -- that first call is
 //! itself always `ci` then `run build` (nothing is installed yet), which is not one of the eight
-//! cases the plan lists and is discarded before each test's own mutation and assertion.
+//! cases and is discarded before each test's own mutation and assertion.
 
 include!("../build_web.rs");
 
@@ -130,7 +130,7 @@ impl Fixture {
     /// A fixture that has already been through one successful `ensure_web_bundle_built` call (so
     /// `node_modules/`, `dist/index.html` and both state files all exist and agree with the
     /// fixture's current, unmodified content) -- the "installed and built, nothing changed since"
-    /// starting point every one of the plan's eight cases mutates from.
+    /// starting point every one of the eight cases mutates from.
     fn installed(label: &str) -> Self {
         let fixture = Self::new(label);
         fixture.run_and_log(false);
@@ -214,7 +214,7 @@ fn index_html_or_a_vite_or_tsconfig_file_alone_reruns_the_build_only() {
     }
 }
 
-/// `vitest.config.ts` is not one of the fingerprinted inputs (the plan names `vite.config.*` and
+/// `vitest.config.ts` is not one of the fingerprinted inputs (`vite.config.*` and
 /// `tsconfig*.json` only) -- changing it must not trigger a rebuild at all.
 #[test]
 fn vitest_config_is_not_a_watched_input() {

@@ -133,7 +133,7 @@ mod tests {
         }
     }
 
-    /// A flash-end timer remainder that must round up: `until - now` is 149.95 ms,
+    /// The exact case that broke the flash-end timer: `until - now` is 149.95 ms,
     /// which `Duration::as_millis()` truncates to 149 -- firing the timer 50 us before `until`, while
     /// the flash was still active. Rounding up must give 150, not 149.
     #[test]

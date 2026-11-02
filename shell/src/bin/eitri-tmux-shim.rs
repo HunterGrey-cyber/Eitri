@@ -4,7 +4,7 @@
 //!
 //! # Why this exists
 //!
-//! `christoomey/vim-tmux-navigator` maps `<C-h>`/`<C-l>` to
+//! A common setup is `christoomey/vim-tmux-navigator`, which maps `<C-h>`/`<C-l>` to
 //! `TmuxNavigateLeft`/`TmuxNavigateRight`. Those commands (see the plugin's own
 //! `s:TmuxAwareNavigate`) always try a real `wincmd h`/`wincmd l` first, compare `winnr()` before
 //! and after, and only if Neovim had nowhere left to move -- i.e. the cursor is genuinely at a

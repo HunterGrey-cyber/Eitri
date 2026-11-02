@@ -224,7 +224,7 @@ fn main() {
     }
     println!("ok: an unchanged variable leaves the editor alone (resync counter held at {resyncs_before_idle})");
 
-    // 5. g:neovide is truthy in this embedded session -- zoom mappings in a user's
+    // 5. g:neovide is truthy in this embedded session -- the user's own zoom mappings in
     //    init.lua live under `if vim.g.neovide`, so this is what makes them reachable at all.
     //    Waits on the SCALE VALUE (2.0, what set_scale_factor_setting(2.0) above just assigned),
     //    not on a cell width -- an earlier revision of this probe compared scale_factor_setting()

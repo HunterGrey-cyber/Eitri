@@ -3033,7 +3033,7 @@ mod tests {
         assert_eq!(file_text(&dir), written_by(&layout));
     }
 
-    /// A file deleted while the window is open -- resetting a project's layout -- is not
+    /// A file deleted while the window is open -- the user resetting a project's layout -- is not
     /// written again for a click; the next arrangement change writes one.
     #[test]
     fn a_deleted_file_is_not_written_again_for_a_click() {

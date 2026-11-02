@@ -116,22 +116,29 @@ impl RepeatTracker {
     }
 }
 
-/// Tracks keyvals whose presses this pane forwarded, so only their releases are sent.
+/// Which keyvals this pane has actually forwarded a press for -- so it forwards their release,
+/// and only theirs.
 ///
-/// A release can arrive without a forwarded press: the key may have moved focus here,
-/// `control_letter` may already have sent a synthesized press and release, or a
-/// clipboard chord's press may have been swallowed before Shift was released.
-/// Remembering delivered presses handles all three without checking modifiers again
-/// at release time.
+/// A `key-released` event reaches this pane's controller for a keyval whose PRESS never did, in
+/// three real shapes: the key that moved focus in (`Ctrl+j`'s `j`, `Ctrl+a t`'s `t`, a HINT
+/// label); the physical `a`/`l` release after `Ctrl+a Ctrl+a`/`Ctrl+a Ctrl+l` already sent a
+/// synthesized press+release pair through [`control_letter`]; and `Ctrl+Shift+C`/`V` when Shift is
+/// let go before the letter, so [`clipboard_chord`] no longer matches at release time even though
+/// it correctly swallowed the press. Gating the release on "was the press actually delivered"
+/// fixes all three at once, and does not depend on re-reading the modifier state at release time
+/// the way re-checking `clipboard_chord` there did.
 ///
-/// A forwarded press can also have a different keyval from its release. GDK uses the
-/// modifiers held at each event: releasing Shift before the letter changes `X` to `x`,
-/// even while Ctrl stays held. Matching raw keyvals would drop that release and leave
-/// the child's key state out of sync under the kitty keyboard protocol.
-/// [`mark`](Self::mark) and [`take`](Self::take) use `keyval.to_lower()` so both events
-/// match, as [`clipboard_chord`] also does.
+/// **A fourth shape:** a release whose press WAS forwarded can
+/// still arrive under a different keyval than the press. GDK derives a release's keyval from the
+/// modifier state at release time, not the press's -- a forwarded `Ctrl+Shift+x` whose Shift is
+/// let go before the letter reports the press as the shifted keyval (`X`) and the release as the
+/// unshifted one (`x`), Ctrl still held throughout. Matching the raw keyval missed this and
+/// silently dropped the release, desyncing the child's view of which keys are down under the
+/// kitty keyboard protocol's key-release reporting. [`mark`](Self::mark)/[`take`](Self::take) key
+/// on `keyval.to_lower()` for exactly this reason -- the same normalisation [`clipboard_chord`]
+/// already applies to its own match, for the same underlying GDK behaviour.
 ///
-/// A small `Vec` suffices because only a handful of keys can be down at once.
+/// A small `Vec`, not a `HashSet`: at most a handful of keys are ever down on a keyboard at once.
 #[derive(Debug, Default)]
 pub struct DeliveredKeys {
     held: Vec<GdkKey>,
@@ -818,10 +825,10 @@ pub(crate) enum ClipboardChord {
     Paste,
 }
 
-/// `Ctrl+Shift+C` or `Ctrl+Shift+V`: foot's copy and paste, so hands used to foot press them
-/// here too. The pane never passes either on: the encoder would turn
-/// `Ctrl+Shift+C` into 0x03 -- SIGINT to whatever is running -- and `Ctrl+Shift+V` into 0x16,
-/// zsh's `quoted-insert`. `Paste` pastes and `Copy` copies.
+/// `Ctrl+Shift+C` or `Ctrl+Shift+V`: foot's copy and paste, which a foot user's `foot.ini` keeps, so
+/// their hands will press them here. The pane never passes either on: the encoder would turn
+/// `Ctrl+Shift+C` into 0x03 -- SIGINT to whatever is running -- and `Ctrl+Shift+V` into 0x16, zsh's
+/// `quoted-insert`. `Paste` pastes and `Copy` copies.
 pub(crate) fn clipboard_chord(keyval: GdkKey, state: ModifierType) -> Option<ClipboardChord> {
     let others = ModifierType::ALT_MASK | ModifierType::SUPER_MASK | ModifierType::META_MASK;
     if !state.contains(ModifierType::CONTROL_MASK | ModifierType::SHIFT_MASK) || state.intersects(others) {
@@ -893,7 +900,7 @@ pub(crate) fn literal(key: &eitri_core::keymap::KeySpec) -> Option<Vec<Normalize
     if key.meta {
         mods |= ModifiersState::ALT;
     }
-    // A named key carries its Shift in the spec; a capital letter or a shifted symbol is its base
+    // A named key carries its Shift in the key spec; a capital letter or a shifted symbol is its base
     // key with Shift down.
     if key.shift || matches!(key.key, KeyName::Char(c) if unshifted(c).is_some()) {
         mods |= ModifiersState::SHIFT;

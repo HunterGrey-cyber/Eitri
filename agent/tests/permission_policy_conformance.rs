@@ -34,7 +34,7 @@
 //!
 //! # Running it
 //!
-//! Real turns, real money, on the TEST Claude profile -- never a personal login:
+//! Real turns, real money, on the TEST Claude profile -- never the user's own login:
 //!
 //! ```sh
 //! claude --version    # record the build; nothing prints it for you
@@ -55,7 +55,7 @@
 //! them new for the cards added then (`find -files0-from`, `wc --files0-from`, `diff` of two
 //! directories, read-only git in a project inside a larger repository). Nothing was more permissive;
 //! five calls were stricter -- the four new ones, all of which the CLI ran, and the old piped
-//! `grep`. Run with `XDG_STATE_HOME=$HOME/.cache/nv-policy/state` so test state stays separate.
+//! `grep`. Run with `XDG_STATE_HOME=$HOME/.cache/nv-policy/state` so no state lands in the user's own.
 //!
 //! **2026-09-28 (config reads and option-shaped paths), CLI 2.1.283 on the TEST profile: passed** with fourteen probes,
 //! two more covering indirect reads -- `git blame` in a repo whose config reads an outside file
@@ -976,7 +976,7 @@ fn run_the_cli(workspace: &Path, prompt: &str, extra_args: &[&str]) -> Vec<Obser
         // `project,local`, the product's `agent.user_settings = false` selection, and not the user
         // tier, which a default product session loads: this oracle compares the policy with the CLI's
         // own rules and has to be independent of whoever runs it. On 2026-09-25 the TEST
-        // profile's user settings carried an `rtk hook claude`
+        // profile's user settings (shared with the user's own) carried an `rtk hook claude`
         // `PreToolUse` hook that rewrote `ls` to `rtk ls`, which the CLI then refused as not
         // read-only -- a refusal of a command nobody asked for, reported as the CLI refusing `ls`.
         // The user tier can also carry `permissions.allow`, which would make the oracle more

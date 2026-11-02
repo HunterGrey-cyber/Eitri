@@ -2813,9 +2813,8 @@ fn build_ui(
         })
     };
 
-    // F11 fullscreen and `prefix F11` immersive both follow `g:neovide_fullscreen`.
-    // `return_to_pane` restores focus when the top bar hides while focused; focusing a top-bar
-    // item can reveal it.
+    // F11 fullscreen, `prefix F11` immersive, both following g:neovide_fullscreen (the window modes). Needs `return_to_pane` for a top bar that hides while
+    // it holds focus, and gives a top-bar item's focus its reveal.
     let window_modes = window_mode::WindowModes::install(app, &window, &top_bar, pane.clone(), return_to_pane.clone());
 
     // The first-start screen's work: the checks, the detection and the write on worker threads, the marker, and what

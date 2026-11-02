@@ -325,8 +325,8 @@ def strings_a(data: bytes) -> list[str]:
 def find_home_paths_in_elves(files: Iterable[tuple[str, str]]) -> dict[str, list[str]]:
     """{relpath: [matched substrings]} for every extracted ELF file whose strings contain a
     /home/.../Users/.../root/... path (M3). A non-ELF file carrying the identical text is
-    deliberately not reported here -- that is exactly M3's narrowing from the spec's "every
-    extracted shipped file" to "every extracted ELF", since a text file (a doc, a licence, this
+    deliberately not reported here -- that is why this checks every extracted ELF rather than
+    every extracted shipped file, since a text file (a doc, a licence, this
     project's own install.sh) legitimately mentions such paths in prose and examples."""
     hits: dict[str, list[str]] = {}
     for rel, path in files:

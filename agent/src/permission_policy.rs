@@ -6527,7 +6527,7 @@ mod tests {
         );
     }
 
-    /// The other side of the allowlist: the exact config key sets found in local repositories
+    /// The other side of the allowlist: the exact config key sets a developer's own repositories hold
     /// -- and what `git init`/`git clone` write -- read without a card. Built from
     /// `git config --local --list --name-only` on this host, 2026-09-28.
     #[test]
@@ -6761,7 +6761,7 @@ mod tests {
             let cards = mismatches(&reads, root, PermissionVerdict::AllowWithoutAsking);
             assert!(cards.is_empty(), "{label}: carded: {cards:#?}");
         };
-        // A worktree at `<repo>/.worktrees/<lane>` uses the git directory
+        // The layout this project's own lanes use: `<repo>/.worktrees/<lane>`, with the git directory at
         // `<repo>/.git/worktrees/<lane>`.
         let repo = Workspace::new();
         let lane = repo.path().join(".worktrees/lane");

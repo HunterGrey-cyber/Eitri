@@ -500,7 +500,7 @@ preflight() {
 		# --rehearsal is exempt (it always runs --unsigned, line above, and is never published);
 		# fill_notes gives it its own text -- no signature, and this build's installer refuses it.
 		if [ "$RS_UNSIGNED" = 1 ] && [ "$RS_REHEARSAL" = 0 ]; then
-			die "packaging/release-signers already holds a release key: $RS_VERSION must be signed with --sign (a throwaway --release-signers build is only for before the key is embedded); pass --rehearsal for a trial that is never published"
+			die "packaging/release-signers already holds a release key: $RS_VERSION must be signed with --sign (a throwaway --release-signers build is only for before the maintainer embeds the key); pass --rehearsal for a trial that is never published"
 		fi
 	fi
 

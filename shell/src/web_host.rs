@@ -1,8 +1,8 @@
-//! Every web module's `WebView` sits at (0,0) of a one-child host of its own.
+//! Every web module's `WebView` sits at (0,0) of a one-child host of its own (2026-09-29).
 //!
-//! **What went wrong.** On GNOME Wayland (fcitx5 through `GTK_IM_MODULE=fcitx`,
+//! **What went wrong.** On a GNOME Wayland, fcitx5 through `GTK_IM_MODULE=fcitx`,
 //! candidates drawn by kimpanel) the candidate window for the agent panel's composer opened far right
-//! of the caret. A sandbox pass measured it (fcitx5-gtk's own in-process panel, not
+//! of the caret. A sandbox pass measured it the same day (fcitx5-gtk's own in-process panel, not
 //! kimpanel): the rectangle sent to fcitx5 was off by exactly the `WebView`'s position in the module
 //! grid times the output scale -- 761 logical px in the default split, at scale 1 and 1.5 and at 96 and
 //! 144 dpi, on the empty tab and a live one -- and by nothing whenever the panel sat at x=0 (a zoom).

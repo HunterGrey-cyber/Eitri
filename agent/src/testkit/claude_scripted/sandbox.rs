@@ -38,8 +38,8 @@ const UNROUTED: &str = "192.0.2.1:9";
 /// and Eitri configuration a session could pick up.
 const HOME_PATHS: &[&str] = &[".claude", ".claude.json", ".ssh", ".config/eitri", ".config/nvim"];
 
-/// File system types that reach another machine or mount on demand. Synced trees and shares are
-/// mounted that way; none may be in view, and an automount must not be triggered from inside.
+/// File system types that reach another machine or mount on demand. A developer's synced trees and shares are
+/// often mounted that way; none may be in view, and an automount must not be triggered from inside.
 const REMOTE_FS: &[&str] = &[
     "nfs",
     "nfs4",

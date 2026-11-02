@@ -111,9 +111,9 @@ pub(crate) fn install(
     window.connect_notify_local(Some("is-active"), move |window, _| on_active(window));
 }
 
-/// The module holding the window's focus widget, or `None` for the top bar or no focus widget.
-/// This is where a key typed now would go, rather than the last focused module. `Ctrl+a Ctrl+a`
-/// forwards its `Ctrl+a` here.
+/// The module holding the window's focus widget right now, or `None` (the top bar, or nothing).
+/// Unlike the remembered owner, this is where a key typed now would go -- what `Ctrl+a Ctrl+a`
+/// hands its `Ctrl+a` to.
 pub(crate) fn focused_module(
     window: &gtk4::ApplicationWindow,
     modules: &[(ModuleId, gtk4::Widget)],

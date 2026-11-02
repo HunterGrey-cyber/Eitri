@@ -248,7 +248,7 @@ t_missing_ssh_keygen_no_embedded_key() {
 TESTS="$TESTS t_no_embedded_key"
 t_no_embedded_key() {
 	# $INSTALLER is the harness's unkeyed copy (setup_keys): the committed release-signers lists the
-	# release key, so the real install.sh carries one; this is the branch without a key.
+	# maintainer's release key, so the real install.sh carries one; this is the branch without a key.
 	serve 1.0.0
 	rm "$(served 1.0.0)/SHA256SUMS.sig"
 	srv_mark
@@ -286,7 +286,7 @@ t_embedded_signers_byte_equal() {
 		'4 release@eitri namespaces="eitri-release,eitri-sidecar-release" ssh-ed25519' "the shape of the key line"
 }
 
-# The real install.sh, the file every release ships and the only one that holds the release key:
+# The real install.sh, the file every release ships and the only one that holds the maintainer's key:
 # the keys its embedded block lists are exactly the key lines of packaging/release-signers, and run
 # with no --release-signers it checks a release against them alone. The harness's test key signs
 # every fixture release, so a release it signed must be refused, and so must an unsigned one.

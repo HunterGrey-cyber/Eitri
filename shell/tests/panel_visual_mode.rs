@@ -2562,10 +2562,10 @@ fn main() {
     // The harness refuses a DISPLAY it did not start -- so it starts one, and nothing below
     // ever reads the inherited one. GTK's own built-in input method, never the one the desktop session
     // names: an inherited `GTK_IM_MODULE=fcitx` routed every key of this window through
-    // the session's live fcitx5 daemon over the session bus -- asynchronously, so a `/` search's `Return`
+    // the user's live fcitx5 daemon over the session bus -- asynchronously, so a `/` search's `Return`
     // still sat in flight when the next key arrived (W6/W7 failed intermittently, about one run in
     // three, with the search prompt still open and the following `v` typed into it), and with the
-    // session's rime switched on a letter would have been composed, not typed. The IME half is the GUI
+    // a user's rime switched on a letter would have been composed, not typed. The IME half is the GUI
     // pass's. `init_gtk` sets both, and refuses unless GDK opened this server's display.
     let server = own_x_server::init_gtk("panel_visual_mode", "1280x900x24");
     // After `init_gtk`, not before (since 2026-09-29): the probe then inherits this test's own
