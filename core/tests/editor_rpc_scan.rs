@@ -824,7 +824,8 @@ const CARD_GLUE: &str = "panel/src/editor_glue.rs";
 const CARD_ARM: &str = "panel/src/inbound.rs";
 /// The function of [`CARD_ARM`] holding the one call of `TabSet::answer_card`, on a provider's cards.
 const PROVIDER_ANSWER: &str = "answer_permission_response";
-/// A test module of `tab_set.rs` kept in a file of its own, whose calls are `TabSet::answer_card` on a local `set`.
+/// A test module of `tab_set.rs` kept in a file of its own, whose calls are `TabSet::answer_card` on a local `set`
+/// (as are the files under `core/src/tab_set/tests/` and the `*_tests.rs` beside it).
 const TAB_SET_TESTS: &str = "core/src/tab_set/move_tests.rs";
 
 /// Every file that may evaluate text in the editor, and how. Reviewed: `nvim_exec.lua` takes only the text of an
@@ -1423,13 +1424,17 @@ fn no_other_tool_chunk_builds_source() {
 
 #[test]
 fn only_the_card_path_answers_a_broker_card() {
-    assert!(
-        squeeze(&source_scan::read_required("core/src/tab_set.rs").text).contains("#[cfg(test)]modmove_tests;"),
-        "{TAB_SET_TESTS} is no longer a test module, so it is read as product code"
-    );
-    let read: Vec<Source> = source_scan::rust_sources(&["core/src", "panel/src", "shell/src"])
+    let all = source_scan::rust_sources(&["core/src", "panel/src", "shell/src"]);
+    let test_only = source_scan::test_only_files(&all);
+    for file in [TAB_SET_TESTS, "core/src/tab_set/tests/bypass.rs"] {
+        assert!(
+            test_only.contains(file),
+            "{file} is no longer a test module, so it is read as product code"
+        );
+    }
+    let read: Vec<Source> = all
         .into_iter()
-        .filter(|source| source.path != TAB_SET_TESTS)
+        .filter(|source| !test_only.contains(&source.path))
         .collect();
     assert_eq!(card_path_wrong(&read), Vec::<String>::new());
 }

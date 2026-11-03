@@ -225,9 +225,9 @@ fn unescape(body: &str) -> String {
     out
 }
 
-/// Where the test code starts: the first `#[cfg(test)]` or `#[cfg(all(test` in real code.
+/// Where the test code starts: the first `#[cfg(test)]`, `#[cfg(all(test` or file-wide `#![cfg(test)]` in real code.
 fn test_start(code: &str) -> usize {
-    ["#[cfg(test)]", "#[cfg(all(test"]
+    ["#[cfg(test)]", "#[cfg(all(test", "#![cfg(test)]"]
         .iter()
         .filter_map(|marker| code.find(marker))
         .min()
@@ -355,6 +355,10 @@ fn f() {}"
 mod tests { const X: &str = \"qa!\"; }"
     )
     .is_empty());
+    assert!(
+        found("#![cfg(test)]\nfn f() { g(\"qa!\"); }").is_empty(),
+        "a file that is test code throughout"
+    );
     assert_eq!(
         found("fn f() { send_ui(ParallelCommand::Quit, h); }"),
         ["ParallelCommand::Quit"]

@@ -423,6 +423,115 @@ pub fn modules<'a>(code: &'a str, name: &str) -> Vec<&'a str> {
         .collect()
 }
 
+/// The paths of the files in `sources` that exist only under `cfg(test)`: a file its parent declares with
+/// `#[cfg(test)] mod name;`, and every file such a file declares in turn. A scan that skips an inline `mod tests
+/// { .. }` skips these too, since a module moved into a file of its own is no longer inside the text it cut.
+/// A child is found as `dir/name.rs` or `dir/name/mod.rs` for `mod name;` in `dir.rs`, `dir/mod.rs`, `lib.rs`
+/// or `main.rs`, or where `#[path = ".."]` points (relative to the declaring file's directory). Only a plain
+/// `#[cfg(test)]` counts; `#[cfg(all(test, ..))]` and `#[cfg(any(test, ..))]` are read as product code.
+///
+/// # Panics
+/// On a `#[cfg(test)] mod name;` inside an inline module, whose file the name alone does not give: a scan
+/// that cannot tell which file is test-only must not guess. A declaration inside an inline module without
+/// that attribute is not followed.
+pub fn test_only_files(sources: &[Source]) -> std::collections::BTreeSet<String> {
+    // The files `source` declares as `mod name;`: where each may be (first existing wins), and whether
+    // `#[cfg(test)]` is on it.
+    let declared = |source: &Source| -> Vec<(Vec<String>, bool)> {
+        let code = code_only(&source.text);
+        let (dir, own_dir) = match source.path.rsplit_once('/') {
+            Some((dir, file)) if matches!(file, "mod.rs" | "lib.rs" | "main.rs") => (dir.to_owned(), dir.to_owned()),
+            Some((dir, file)) => (format!("{dir}/{}", file.trim_end_matches(".rs")), dir.to_owned()),
+            None => (source.path.trim_end_matches(".rs").to_owned(), String::new()),
+        };
+        let mut found = Vec::new();
+        let (mut depth, mut seen) = (0_i32, 0);
+        for after in word_ends(&code, "mod") {
+            depth += code[seen..after].matches('{').count() as i32 - code[seen..after].matches('}').count() as i32;
+            seen = after;
+            let rest = code[after..].trim_start();
+            let name_len = rest
+                .find(|c: char| !c.is_alphanumeric() && c != '_')
+                .unwrap_or(rest.len());
+            let (name, tail) = rest.split_at(name_len);
+            if name.is_empty() || !tail.trim_start().starts_with(';') {
+                continue;
+            }
+            let head = &code[..after - 3];
+            let from = head.rfind([';', '{', '}']).map_or(0, |at| at + 1);
+            let squeezed: String = head[from..].chars().filter(|c| !c.is_whitespace()).collect();
+            let gated = squeezed.contains("#[cfg(test)]");
+            if depth > 0 {
+                assert!(
+                    !gated,
+                    "{}: `#[cfg(test)] mod {name};` inside an inline module: test_only_files does not follow it",
+                    source.path
+                );
+                continue;
+            }
+            // The attribute's path is a literal, blanked in `code`; the text has it at the same offsets.
+            let attributes = &source.text[from..after - 3];
+            let path_attr = attributes.find("#[path").and_then(|at| {
+                let quoted = &attributes[at..];
+                let open = quoted.find('"')? + 1;
+                Some(&quoted[open..open + quoted[open..].find('"')?])
+            });
+            let candidates = match (squeezed.contains("#[path="), path_attr) {
+                (true, Some(path)) => vec![normalized(&format!("{own_dir}/{path}"))],
+                (true, None) => continue,
+                _ => vec![format!("{dir}/{name}.rs"), format!("{dir}/{name}/mod.rs")],
+            };
+            found.push((candidates, gated));
+        }
+        found
+    };
+    let by_path: std::collections::BTreeMap<&str, Vec<(Vec<String>, bool)>> = sources
+        .iter()
+        .map(|source| (source.path.as_str(), declared(source)))
+        .collect();
+    let resolve = |candidates: &[String]| {
+        candidates
+            .iter()
+            .find(|path| by_path.contains_key(path.as_str()))
+            .cloned()
+    };
+    let mut only = std::collections::BTreeSet::new();
+    let mut work = Vec::new();
+    for (candidates, gated) in by_path.values().flatten() {
+        if let Some(path) = resolve(candidates).filter(|_| *gated) {
+            if only.insert(path.clone()) {
+                work.push(path);
+            }
+        }
+    }
+    // What a test-only file declares is test-only whatever its own attributes say.
+    while let Some(path) = work.pop() {
+        for (candidates, _) in &by_path[path.as_str()] {
+            if let Some(child) = resolve(candidates) {
+                if only.insert(child.clone()) {
+                    work.push(child);
+                }
+            }
+        }
+    }
+    only
+}
+
+/// `path` without its `.` and `x/..` segments.
+fn normalized(path: &str) -> String {
+    let mut out: Vec<&str> = Vec::new();
+    for part in path.split('/') {
+        match part {
+            "" | "." => {}
+            ".." => {
+                out.pop();
+            }
+            part => out.push(part),
+        }
+    }
+    out.join("/")
+}
+
 /// `code` with every one of `bodies` (slices of `code`) blanked.
 pub fn without(code: &str, bodies: &[&str]) -> String {
     let mut out = code.to_owned();
@@ -449,6 +558,69 @@ pub fn calls(code: &str, name: &str) -> usize {
 #[cfg(test)]
 mod walker_tests {
     use super::*;
+
+    #[test]
+    fn test_only_files_follow_cfg_test_declarations_down_the_tree() {
+        let file = |path: &str, text: &str| Source {
+            path: path.into(),
+            text: text.into(),
+        };
+        let sources = [
+            file(
+                "core/src/lib.rs",
+                "mod set;\n#[cfg(test)]\nmod doubles;\n// #[cfg(test)] mod ghost;\nconst T: &str = \"#[cfg(test)] mod text;\";",
+            ),
+            file(
+                "core/src/set.rs",
+                "mod moving;\n#[cfg(test)] mod tests;\n#[cfg(test)]\n#[allow(dead_code)]\npub(crate) mod frozen;\nmod next { }",
+            ),
+            file("core/src/set/moving.rs", "fn shipped() {}"),
+            file("core/src/set/tests.rs", "mod nested;\nfn a() {}"),
+            file("core/src/set/tests/nested.rs", "fn b() {}"),
+            file("core/src/set/frozen/mod.rs", "mod leaf;"),
+            file("core/src/set/frozen/leaf.rs", "fn c() {}"),
+            file("core/src/doubles.rs", ""),
+            file("core/src/ghost.rs", ""),
+            file("core/src/text.rs", ""),
+        ];
+        let test_only = |sources: &[Source]| test_only_files(sources).into_iter().collect::<Vec<_>>();
+        assert_eq!(
+            test_only(&sources),
+            [
+                "core/src/doubles.rs",
+                "core/src/set/frozen/leaf.rs",
+                "core/src/set/frozen/mod.rs",
+                "core/src/set/tests.rs",
+                "core/src/set/tests/nested.rs",
+            ]
+        );
+
+        // A `#[path]` points where it says; the production file of the same name stays product code.
+        let with_path = [
+            file(
+                "core/src/lib.rs",
+                "#[cfg(not(test))] mod live;\n#[cfg(test)]\n#[path = \"../tests/support/live.rs\"]\nmod live;\n#[path = \"other.rs\"] mod shipped;",
+            ),
+            file("core/src/live.rs", ""),
+            file("core/src/other.rs", ""),
+            file("core/tests/support/live.rs", ""),
+        ];
+        assert_eq!(test_only(&with_path), ["core/tests/support/live.rs"]);
+
+        // Inside an inline module the name alone does not say which file: an ungated declaration is not
+        // followed, a gated one is refused rather than guessed.
+        let nested = |text: &str| {
+            [
+                file("core/src/lib.rs", text),
+                file("core/src/live.rs", ""),
+                file("core/src/inner/live.rs", ""),
+            ]
+        };
+        assert!(test_only(&nested("mod live;\nmod inner { mod live; }")).is_empty());
+        let refused =
+            std::panic::catch_unwind(|| test_only_files(&nested("mod live;\nmod inner { #[cfg(test)] mod live; }")));
+        assert!(refused.is_err());
+    }
 
     #[test]
     fn impl_blocks_finds_only_the_named_self_type_across_headers_and_bodies() {

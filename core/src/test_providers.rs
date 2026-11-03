@@ -149,7 +149,7 @@ impl RecordingProvider {
     /// that: the ingestion thread can drain and fold the prefix alone, the instant after it is
     /// pushed and long before the filler loop finishes pushing the rest, so a test's `until` on the
     /// prefix's own effect can succeed before the batch has actually overflowed. Measured 11/60
-    /// failures of `tab_set::tests::a_resync` at `--test-threads=8` under load with `queue`;
+    /// failures of the `a_resync…` tests of `tab_set::tests` at `--test-threads=8` under load with `queue`;
     /// 0/100 with every such prefix+filler sequence switched to this instead, because `pump` (a
     /// single `mem::take`) then either sees none of the batch or all of it, and `IngestState::fold`
     /// runs the whole batch under one lock hold -- so nothing outside can observe the prefix's
