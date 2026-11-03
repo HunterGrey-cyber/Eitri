@@ -152,6 +152,16 @@ pub fn run_beside(w: &mut Window, win: WinId, action: &Action, batch: &mut Batch
             beside_module_key(w, action, id, batch);
             return true;
         }
+        // The keys sheet is drawn in a chat's page, which this window has none of, and no host call opens the page's
+        // own sheet: every press says where the keys are listed.
+        Action::PanelKeymap => {
+            w.say(format!(
+                "[keys] {}: the page lists its own keys on its ?",
+                action.name()
+            ));
+            chrome::show_toast(w, feedback::BESIDE_PAGE_KEYS_TEXT.to_owned(), ToastKind::Other);
+            return true;
+        }
         _ => {}
     }
     if matches!(classify_window1(action), HubVerb::ToLastChat) {

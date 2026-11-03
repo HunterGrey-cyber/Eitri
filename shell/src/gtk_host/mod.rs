@@ -200,6 +200,14 @@ pub(crate) trait PairRaise {
     fn move_focus(&self, direction: Direction, on_none: &dyn Fn(&str)) -> bool;
 }
 
+/// What carries out a [`eitri_core::wm::BesideOp`] in a page window beside the person's own nvim: the shell binary's
+/// page window, by the nvim it follows. A host without it carries none out.
+pub(crate) trait BesidePort {
+    /// Carries `op` out: an `Err` is the reason it was refused now; one a worker finds later is handed to `later`,
+    /// on the main loop. Never waits.
+    fn carry_out(&self, op: &eitri_core::wm::BesideOp, later: Box<dyn FnOnce(String)>) -> Result<(), String>;
+}
+
 /// What starts the project's second window for `OpenLinkedWindow`: the pair's own code, which belongs to the shell's
 /// binary. A host without it cannot start one.
 pub(crate) trait LinkedWindows {
@@ -629,6 +637,7 @@ pub(crate) struct GtkHost {
     hints: RefCell<Option<Rc<dyn HintPort>>>,
     linked_windows: RefCell<Option<Rc<dyn LinkedWindows>>>,
     pair_raise: RefCell<Option<Rc<dyn PairRaise>>>,
+    beside: RefCell<Option<Rc<dyn BesidePort>>>,
     placer: RefCell<Option<Rc<dyn MonitorPlacer>>>,
     grids: RefCell<BTreeMap<WinId, Rc<dyn GridPort>>>,
     editors: RefCell<BTreeMap<WinId, Rc<dyn EditorReads>>>,
@@ -669,6 +678,7 @@ impl GtkHost {
             hints: RefCell::new(None),
             linked_windows: RefCell::new(None),
             pair_raise: RefCell::new(None),
+            beside: RefCell::new(None),
             placer: RefCell::new(None),
             grids: RefCell::new(BTreeMap::new()),
             editors: RefCell::new(BTreeMap::new()),
@@ -898,6 +908,12 @@ impl GtkHost {
     /// Presents a paired window through its compositor adapter, including its first show.
     pub(crate) fn set_pair_raise(&self, raise: Rc<dyn PairRaise>) {
         *self.pair_raise.borrow_mut() = Some(raise);
+    }
+
+    /// What carries out the ops of a page window beside nvim, in that window only.
+    #[allow(dead_code)] // Set by the shell binary's page window; the tests that include this file set none.
+    pub(crate) fn set_beside(&self, port: Rc<dyn BesidePort>) {
+        *self.beside.borrow_mut() = Some(port);
     }
 
     /// What `PlaceWindow` moves this window through. Until it is set, every move is refused.
@@ -1507,6 +1523,29 @@ impl GtkHost {
         }
     }
 
+    /// A beside op, through the page window's carrier: refused now, or later by a worker, as [`OpTag::Beside`].
+    fn beside(&self, op: &HostOp, beside: &eitri_core::wm::BesideOp) -> Applied {
+        let port = self.beside.borrow().clone();
+        let Some(port) = port else {
+            eprintln!("[page] {beside:?}: no window beside nvim here to carry it out");
+            return self.refuse(op, NOT_CARRIED_OUT);
+        };
+        let me = self.me.clone();
+        let later = Box::new(move |why: String| {
+            if let Some(host) = me.upgrade() {
+                host.post(HostEvent::Refused {
+                    what: OpTag::Beside,
+                    why,
+                    surface: None,
+                });
+            }
+        });
+        match port.carry_out(beside, later) {
+            Ok(()) => Applied::Done,
+            Err(why) => self.refuse(op, &why),
+        }
+    }
+
     fn start_editor_window(&self, op: &HostOp, win: WinId) -> Applied {
         if self.window(win).is_none() {
             return self.refuse(op, "no such window");
@@ -1716,11 +1755,8 @@ impl Host for GtkHost {
             HostOp::PeerRun { win, peer, name, opts } => self.peer_run(op, *win, *peer, name, opts),
             HostOp::CompositorFocus { direction, .. } => self.compositor_focus(op, *direction),
             HostOp::HubAsk { win, ask } => self.hub_ask(op, *win, ask),
-            // Only a window beside nvim carries these out, by the nvim it follows; this host has none to go by.
-            HostOp::Beside(beside) => {
-                eprintln!("[page] {beside:?}: no window beside nvim here to carry it out");
-                self.refuse(op, NOT_CARRIED_OUT)
-            }
+            // Only a window beside nvim carries these out, by the nvim it follows.
+            HostOp::Beside(beside) => self.beside(op, beside),
             HostOp::BuildBasePage { .. } => {
                 // Cloned out first: the page's build reaches the panel, and through it the host again.
                 let maker = self.base_page_maker.borrow().clone();

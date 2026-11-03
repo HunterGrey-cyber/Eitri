@@ -442,16 +442,26 @@ impl Kernel {
 
     /// Runs `text` as one chunk under `init.lua`'s rules, with no file behind it: `Err` is the refusal the chunk
     /// caused, caught or not, or else its Lua error. A refusal it did not catch is a Lua error too, and the refusal's
-    /// own text is the one that names the call.
+    /// own text is the one that names the call. A refusal made before this chunk is not its own: in a kernel that has
+    /// none, the refusal named is the one a strict host would name ([`InitRefusals::first`]); after earlier ones, the
+    /// first this chunk made.
     pub fn run_checked_text(&self, name: &str, text: &str) -> Result<(), String> {
-        {
+        let before = {
             let mut refusals = self.init_refusals.borrow_mut();
             refusals.accepting = true;
             refusals.path = None;
-        }
+            refusals.refused.len()
+        };
         let ran = self.lua.load(text).set_name(name).exec();
-        self.init_refusals.borrow_mut().accepting = false;
-        self.init_refusal().map_or(ran.map_err(|error| error.to_string()), Err)
+        let caused = {
+            let mut refusals = self.init_refusals.borrow_mut();
+            refusals.accepting = false;
+            match before {
+                0 => refusals.first(),
+                _ => refusals.refused.get(before).map(|(_, error)| error.clone()),
+            }
+        };
+        caused.map_or(ran.map_err(|error| error.to_string()), Err)
     }
 
     /// The shared startup refusal, including the init.lua path once it has been loaded.
@@ -592,6 +602,31 @@ mod tests {
             .run_checked_text("=text", "eitri.config.set({}, true)")
             .unwrap_err();
         assert_eq!(error, "eitri.config.set: the key must be a string");
+    }
+
+    /// A refusal an earlier text made, of a higher rank, is not this text's: a later text that refuses nothing runs
+    /// clean, and one that refuses names its own refusal.
+    #[test]
+    fn checked_text_names_only_a_refusal_it_made_itself() {
+        let kernel = Kernel::new(PathBuf::from("/nonexistent/eitri-kernel-test"), refuse_panels).unwrap();
+        let earlier = kernel
+            .run_checked_text(
+                "=init",
+                "pcall(eitri.command.register, { id = 'a b', title = 't', action = function() end })",
+            )
+            .unwrap_err();
+        assert!(
+            earlier.starts_with("eitri.command.register: invalid command id"),
+            "{earlier}"
+        );
+        assert_eq!(
+            kernel.run_checked_text("=text", "eitri.config.set('a.key', 'b')"),
+            Ok(())
+        );
+        assert_eq!(
+            kernel.run_checked_text("=text", "pcall(eitri.config.set, {}, true)"),
+            Err("eitri.config.set: the key must be a string".to_owned())
+        );
     }
 
     #[test]

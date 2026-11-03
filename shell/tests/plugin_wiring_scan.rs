@@ -841,9 +841,16 @@ fn the_follow_feed_is_wired_only_for_plugins_that_want_it() {
 
     let listen = code.find("feed_pump.listen_follow(").expect("the follow listener");
     let closure = scan::braced(&code, listen + code[listen..].find('{').unwrap());
-    let apply = closure.find("apply_follow_commands(").expect("the commands applied");
-    let route = closure.find("plugin_panels.route_follow(").expect("the lines routed");
-    assert!(apply < route, "the routed commands are what is applied");
+    let route = closure
+        .find("letcommands=plugin_panels.route_follow(")
+        .expect("the lines routed");
+    let apply = closure
+        .find("plugin_panels::apply_follow_commands(&window,commands)")
+        .expect("the commands applied");
+    assert!(route < apply, "the routed commands are what is applied");
+    // Beside nvim the same routed commands go to the controller one by one, unsorted.
+    assert!(closure.contains("forcmdincommands{") || closure.contains("for(module,cmd)incommands{"));
+    assert!(closure.contains("window.command(&module,cmd);"), "{closure}");
 
     // Each host is told whether its module is drawn by the controller's lifecycle, after every change.
     assert!(
@@ -1730,11 +1737,11 @@ fn the_links_end_and_the_restore_of_window_2_are_carried_out_by_the_window() {
     );
     assert!(
         code.contains(concat!(
-            "pair_raise.used_for_window(pair.holds_pair()||pair.is_second(),",
+            "pair_raise.used_for_window(pair.holds_pair()||pair.is_second()||pair.is_beside(),",
             "pair.restored()||module_window.is_some(),incoming_opens.is_some(),)"
         )),
-        "a restored window 2's first show keeps window 1's keys, so does a module window's, and a window holding the \
-         open socket can be raised"
+        "a restored window 2's first show keeps window 1's keys, so does a module window's (one beside nvim too, \
+         which presents through the same raise), and a window holding the open socket can be raised"
     );
 }
 

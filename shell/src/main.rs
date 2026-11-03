@@ -35,6 +35,7 @@ mod nvim_verbs;
 mod onboarding_detect;
 mod onboarding_host;
 mod open_requests;
+mod page_window;
 mod pane_switch;
 mod panel_super;
 mod plugin_page;
@@ -137,7 +138,8 @@ impl AppKind {
             linked_window::WindowStart::Module {
                 name: WindowName::Page(_),
                 ..
-            } => AppKind::Page,
+            }
+            | linked_window::WindowStart::Beside { .. } => AppKind::Page,
             _ => AppKind::Main,
         }
     }
@@ -300,6 +302,10 @@ fn main() -> glib::ExitCode {
     if early_args.first().is_some_and(|a| a == "split") {
         return companion::run_split(early_args[1..].to_vec());
     }
+    // `eitri page` too: it reads `$NVIM` as its default address, and its plugin id is no directory.
+    if early_args.first().is_some_and(|a| a == "page") {
+        return page_window::run_args(&early_args[1..]);
+    }
     if early_args.first().is_some_and(|a| a == "--sidecar-probe") {
         return sidecar_probe::run(&early_args[1..]);
     }
@@ -391,9 +397,9 @@ fn main() -> glib::ExitCode {
     // What the command line names to open comes out of the same resolution as nvim's own arguments; window 2 and a
     // module window have no editor and carry none.
     let (project_root, open) = match &start {
-        linked_window::WindowStart::Second { root, .. } | linked_window::WindowStart::Module { root, .. } => {
-            (root.clone(), Vec::new())
-        }
+        linked_window::WindowStart::Second { root, .. }
+        | linked_window::WindowStart::Module { root, .. }
+        | linked_window::WindowStart::Beside { root, .. } => (root.clone(), Vec::new()),
         linked_window::WindowStart::Full => match eitri_core::project_root::resolve_launch() {
             Ok(launch) => {
                 for note in &launch.notes {
@@ -598,6 +604,12 @@ fn main() -> glib::ExitCode {
                 backend_kind,
                 want_clean,
             ),
+            // `eitri page` returned above with its own window; nothing here starts one.
+            linked_window::WindowStart::Beside { .. } => {
+                eprintln!("eitri: a page window starts through `eitri page`");
+                app.quit();
+                return;
+            }
         };
         build_ui(
             app,
@@ -609,6 +621,7 @@ fn main() -> glib::ExitCode {
             pair,
             start_note,
             open.clone(),
+            None,
         )
     });
     app.run_with_args::<&str>(&[])
@@ -675,12 +688,19 @@ fn linked_pair(
     }
 }
 
+/// Whether the first-start screen and its onboarding may open in this window: a full window's only, never one another
+/// window started, one beside a person's nvim or one whose pair another window holds.
+fn onboarding_full_window(pair: &linked_window::spawn::Pair) -> bool {
+    !pair.is_second() && !pair.is_unpaired() && !pair.is_beside()
+}
+
 /// What this window's start knows of itself before `init.lua` runs.
 fn early_facts(pair: &linked_window::spawn::Pair, shows_chat: bool) -> eitri_core::wm::start::EarlyFacts {
     let env = |name: &str| std::env::var_os(name);
     let module_orphans = pair.relinked_module_windows();
     eitri_core::wm::start::EarlyFacts {
-        started: pair.is_second(),
+        // Window 1 started it, or it is a page window beside nvim: its mode is not in question either way.
+        started: pair.is_second() || pair.is_beside(),
         shows_chat,
         mac: cfg!(target_os = "macos"),
         wayland: eitri_core::compositor::mode::wayland_session(&env),
@@ -704,6 +724,7 @@ fn build_ui(
     pair: Rc<linked_window::spawn::Pair>,
     start_note: Option<String>,
     open: Vec<String>,
+    beside: Option<page_window::BesideStart>,
 ) {
     use eitri_core::theme::start::{StartReport, StartTheme};
     use eitri_core::theme::store::ThemeWriter;
@@ -751,7 +772,12 @@ fn build_ui(
     // nvim only at spawn. `None` (logged) leaves the window on its start colours.
     // One timer for the four feeds below; each is read once its consumer calls `listen_*`.
     let feed_pump = editor_feeds::FeedPump::start();
-    let mut theme_feed = owns_editor.then(theme::feed::ThemeFeed::new).flatten();
+    // A beside window's feed was bound before its link, whose install hands the socket to the page slot's theme part.
+    let mut beside = beside;
+    let mut theme_feed = match beside.as_mut() {
+        Some(start) => start.theme_feed.take(),
+        None => owns_editor.then(theme::feed::ThemeFeed::new).flatten(),
+    };
     let theme_writer = (owns_editor && !want_clean).then(|| {
         Rc::new(RefCell::new(ThemeWriter::new(
             theme_dir.clone(),
@@ -917,13 +943,21 @@ fn build_ui(
     }
 
     let config_dir = config_dir();
-    let lua_engine = Rc::new(
-        LuaEngine::showing(
+    let lua_engine = Rc::new(match (&beside, &module_window) {
+        // A page window beside nvim builds its one plugin, by its id, whatever else `init.lua` loads.
+        (Some(start), Some((WindowName::Page(id), _))) => {
+            LuaEngine::for_page(config_dir.clone(), id).unwrap_or_else(|text| {
+                start.starter.say(&text);
+                eprintln!("{text}");
+                std::process::exit(1);
+            })
+        }
+        _ => LuaEngine::showing(
             config_dir.clone(),
             module_window.as_ref().map(|(_, module)| module.clone()),
         )
         .expect("LuaEngine construction must not fail"),
-    );
+    });
     // `eitri.window` names this window before `init.lua` runs, so a config both windows run can keep a side
     // effect to one of them.
     let named = match &module_window {
@@ -1055,6 +1089,14 @@ fn build_ui(
         lua_engine.panels.borrow_mut().hold_views();
     }
     driver.start(WinId::MAIN, StartStep::Kernel);
+    // A page window's own plugin, loaded by its id when `init.lua` did not load it; nothing in any other window.
+    if let Err(message) = lua_engine.settle_page() {
+        if let Some(start) = &beside {
+            start.starter.say(&format!("eitri page: {message}"));
+        }
+        eprintln!("eitri: {message}");
+        std::process::exit(1);
+    }
 
     // The window config, the keymap, the plugins' panels, the module keys and the keys help; the config phase is
     // told what they built at the end of the block.
@@ -1154,6 +1196,22 @@ fn build_ui(
             if let Some(driver) = driver.upgrade() {
                 driver.post(event);
             }
+        }));
+    }
+    // Beside the person's nvim: the agent window's drafts live under the same temporary prefix as this window's, and
+    // neither is followed; a follow snippet the editor refuses closes the window, with no second try.
+    if let Some(start) = &beside {
+        plugin_panels.set_scratch_prefix(Some(std::env::temp_dir().join("nv-sc-")));
+        let driver = Rc::downgrade(&driver);
+        let starter = start.starter.clone();
+        plugin_panels.on_follow_refused(Rc::new(move || {
+            let (driver, starter) = (driver.clone(), starter.clone());
+            // Not from inside the host's own call: the close goes through the controller.
+            glib::idle_add_local_once(move || {
+                if let Some(driver) = driver.upgrade() {
+                    page_window::follow_refused(&driver, &starter);
+                }
+            });
         }));
     }
     if let Some(one) = &window1_editor {
@@ -1440,6 +1498,8 @@ fn build_ui(
         .entries()
         .iter()
         .map(|entry| (ModuleId::lua(&entry.id), entry.key.clone()))
+        // A page window beside nvim builds one page; another page's key starts or raises that page's own window.
+        .chain(lua_engine.other_page_keys())
         .collect();
     let module_keys = {
         let (keys, refused) = ModuleKeys::build_settled(&lua_keys, &keymap);
@@ -2129,6 +2189,10 @@ fn build_ui(
     if let Some((name, _)) = &module_window {
         driver.set_module_name(WinId::MAIN, name.clone());
     }
+    // Its keys, follow commands and close are the beside verdicts, not a group's.
+    if pair.is_beside() {
+        driver.set_module_kind(WinId::MAIN, eitri_core::wm::ModuleWindowKind::Beside);
+    }
     // Every module's host, added once and never reparented (`module_grid`'s module doc). It arranges through
     // the controller, which holds the window's layout from the phase above, and the host drives and reads it.
     let grid = ModuleGrid::new(module_layout.clone());
@@ -2358,7 +2422,11 @@ fn build_ui(
                 editor_visible,
             ))
         }
-        None => Rc::new(linked_window::NoEditor),
+        // A page window beside nvim asks the person's nvim through its own link, which holds the page's slot there.
+        None => match pair.beside_link() {
+            Some(link) => link as Rc<dyn eitri_core::editor_rpc::EditorRpc>,
+            None => Rc::new(linked_window::NoEditor),
+        },
     };
     wm_host.set_services(Rc::new(PanelServices {
         cm_session: cm_session.clone().map(|session| (session, app.clone())),
@@ -3273,7 +3341,7 @@ fn build_ui(
         clean: want_clean,
         config_dir_env: std::env::var_os("EITRI_CONFIG_DIR"),
         first_start_env: std::env::var_os("EITRI_FIRST_START"),
-        full_window: !pair.is_second() && !pair.is_unpaired(),
+        full_window: onboarding_full_window(&pair),
         own_window: has_own_window,
         opens_files,
         config_dir: config_dir.clone(),
@@ -3515,13 +3583,24 @@ fn build_ui(
         };
         let plugin_panels = plugin_panels.clone();
         let one = window1_editor.clone();
+        let beside = pair.is_beside();
         feed_pump.listen_follow(socket, move |batch| {
             // The lines for a page window 2 holds go there; nvim's side of them stays here.
             let batch = match &one {
                 Some(one) => one.route_follow(batch),
                 None => batch,
             };
-            plugin_panels::apply_follow_commands(&window, plugin_panels.route_follow(batch, std::time::Instant::now()));
+            let commands = plugin_panels.route_follow(batch, std::time::Instant::now());
+            if beside {
+                // Beside nvim every command goes to the controller as it came: a show of a page on screen still
+                // raises the window, and an auto never becomes a show.
+                use plugin_panels::FollowWindow;
+                for (module, cmd) in commands {
+                    window.command(&module, cmd);
+                }
+            } else {
+                plugin_panels::apply_follow_commands(&window, commands);
+            }
         });
     }
     // Window 2's pages follow window 1's editor through the lines window 1 sends them.
@@ -3573,12 +3652,28 @@ fn build_ui(
     // start's token: the compositor's own focus follows once it is mapped (the new module window's placement), so it
     // comes forward once.
     let raises = pair_raise.used_for_window(
-        pair.holds_pair() || pair.is_second(),
+        pair.holds_pair() || pair.is_second() || pair.is_beside(),
         pair.restored() || module_window.is_some(),
         incoming_opens.is_some(),
     );
     // A window put back on its monitor moves through the same adapter, whatever its part in a pair.
     wm_host.set_monitor_placer(Rc::new(pair_raise.clone()));
+    // Beside the person's nvim: the window lives as long as its link, serves raises from a second `eitri page`, and
+    // carries out what its keys ask of the windows around it.
+    if let (Some(start), Some(link)) = (beside.take(), pair.beside_link()) {
+        page_window::wire(page_window::Wiring {
+            app: app.clone(),
+            window: window.clone(),
+            driver: driver.clone(),
+            wm_host: wm_host.clone(),
+            plugin_panels: plugin_panels.clone(),
+            link,
+            start,
+            project: project_root.to_path_buf(),
+            pair_raise: pair_raise.clone(),
+            wm: config.companion_wm,
+        });
+    }
     if raises {
         // Every present of a window of the pair goes through this raise, the startup's first show included: there
         // too sway, Hyprland and niri focus the window by its pid, unless that show keeps the keys (a window 2
@@ -4657,7 +4752,8 @@ fn build_ui(
             }));
         }
     }
-    if module_window.is_some() {
+    // A page window beside nvim has no window 1 to hold its tabs or run its actions.
+    if module_window.is_some() && !pair.is_beside() {
         // What window 1 asks of this window's tabs in a hand-over.
         pair.set_tab_holder(Rc::new(linked_window::hand_over::PanelTabs::new(
             agent_panel_handle.clone(),
@@ -4873,6 +4969,12 @@ impl plugin_panels::FollowWindow for GridFollowWindow {
 
     fn hide(&self, module: &ModuleId) {
         self.follow(module, false);
+    }
+
+    fn command(&self, module: &ModuleId, cmd: eitri_core::plugin::follow_feed::FollowCmd) {
+        if let Some(driver) = self.driver.upgrade() {
+            driver.follow_cmd(WinId::MAIN, module, cmd);
+        }
     }
 }
 
@@ -5249,6 +5351,80 @@ mod tests {
         assert_eq!(AppKind::of(&module(WindowName::Page("markdown".into()))), AppKind::Page);
         assert_eq!(AppKind::of(&module(WindowName::Second)), AppKind::Main);
         assert_eq!(AppKind::of(&linked_window::WindowStart::Full), AppKind::Main);
+        assert_eq!(
+            AppKind::of(&linked_window::WindowStart::Beside {
+                name: WindowName::Page("notes".into()),
+                nvim: PathBuf::from("/run/user/1/nvim.7.0"),
+                root: PathBuf::from("/p"),
+            }),
+            AppKind::Page,
+            "a page window beside nvim is a page window to the compositor's rules"
+        );
+    }
+
+    fn beside_pair() -> Rc<linked_window::spawn::Pair> {
+        linked_window::spawn::Pair::beside(
+            WindowName::Page("notes".into()),
+            Path::new("/p"),
+            linked_window::spawn::tests::idle_beside_link("notes"),
+        )
+    }
+
+    /// No window 1 started a beside window, yet its mode is not in question: it is a module window from its start,
+    /// never a hub, so the start reads no mode and asks the compositor nothing.
+    #[test]
+    fn early_facts_of_a_beside_window_rule_out_a_hub() {
+        let facts = early_facts(&beside_pair(), false);
+        assert!(facts.started, "the mode is not in question");
+        assert!(!facts.shows_chat);
+        assert!(!facts.unpaired && !facts.alone && !facts.window2_orphan && !facts.module_orphans);
+        let full =
+            linked_window::spawn::Pair::full(Err(std::io::Error::other("no state")), Path::new("/p"), false, false);
+        assert!(
+            !early_facts(&full, true).started,
+            "a full window's mode is still decided"
+        );
+    }
+
+    /// The first-start screen and its onboarding belong to a full window; a page window beside nvim offers neither.
+    #[test]
+    fn a_beside_window_runs_no_onboarding() {
+        assert!(!onboarding_full_window(&beside_pair()));
+        let alone =
+            linked_window::spawn::Pair::full(Err(std::io::Error::other("no state")), Path::new("/p"), false, false);
+        assert!(onboarding_full_window(&alone), "a full window still offers it");
+        let unpaired = linked_window::spawn::Pair::full(Ok(None), Path::new("/p"), false, false);
+        assert!(!onboarding_full_window(&unpaired));
+        // The first show presents a beside window through the pair's raise, as a module window's is.
+        let src = include_str!("main.rs");
+        assert!(src.contains(concat!(
+            "pair_raise.used_for_window(\n        pair.holds_pair() || pair.is_second() || pair.",
+            "is_beside(),"
+        )));
+    }
+
+    /// `eitri page` reads `$NVIM` and its own arguments before the scrub, and never reaches the project resolver,
+    /// which would read `page` as a directory.
+    #[test]
+    fn the_page_subcommand_is_dispatched_before_the_project_resolver() {
+        // Split literals, so this test's own text is not counted.
+        let src = include_str!("main.rs");
+        let start = src.find(concat!("fn main() -> glib", "::ExitCode {")).expect("main");
+        let end = start
+            + src[start..]
+                .find(concat!("fn build_", "application"))
+                .expect("build_application");
+        let body = &src[start..end];
+        let at = |needle: &str| body.find(needle).unwrap_or_else(|| panic!("{needle} in main"));
+        let order = [
+            at(concat!("args_os().skip(1)", ".collect()")),
+            at(concat!("companion::run(", "early_args")),
+            at(concat!("page_window::run_", "args(&early_args[1..])")),
+            at(concat!("drop_inherited", "_editor_env()")),
+            at(concat!("tasks::install", "_guard(")),
+            at(concat!("project_root::", "resolve_launch()")),
+        ];
+        assert!(order.windows(2).all(|w| w[0] < w[1]), "{order:?}");
     }
 
     /// A chat or page window shows one module: `build_ui` makes no editor for it, reads and writes no layout file,

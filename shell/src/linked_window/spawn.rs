@@ -309,6 +309,12 @@ impl Pair {
         Ok(pair)
     }
 
+    /// The page window `name` beside the person's own nvim (`eitri page`), with `link` to that nvim: no window 1, no
+    /// pair lock and no link to another window of Eitri's, so nothing on the pair's side is wired.
+    pub fn beside(name: WindowName, root: &Path, link: Rc<eitri_core::companion::link::CompanionLink>) -> Rc<Pair> {
+        Pair::new(WindowRole::Beside { name, link }, None, root)
+    }
+
     /// The module window `name`, on its checked link end: says `hello` under that name at once and links on `welcome`.
     pub fn module(sock: OwnedFd, name: WindowName, root: &Path) -> io::Result<Rc<Pair>> {
         let hooks: Hooks = Rc::default();
@@ -761,10 +767,24 @@ impl Pair {
         )
     }
 
-    /// The name of the chat or page window this is; `None` in every other window, window 2 included.
+    /// The name of the chat or page window this is, a group's or one beside nvim; `None` in every other window,
+    /// window 2 included.
     pub fn module_window(&self) -> Option<WindowName> {
         match &*self.role.borrow() {
-            WindowRole::Module { name, .. } => Some(name.clone()),
+            WindowRole::Module { name, .. } | WindowRole::Beside { name, .. } => Some(name.clone()),
+            WindowRole::Alone | WindowRole::Main { .. } | WindowRole::Second { .. } | WindowRole::Unpaired => None,
+        }
+    }
+
+    /// Whether this is a page window beside the person's own nvim: no window 1 started it, and it starts none.
+    pub fn is_beside(&self) -> bool {
+        self.role.borrow().is_beside()
+    }
+
+    /// A beside window's link to the person's nvim; `None` in every other window.
+    pub fn beside_link(&self) -> Option<Rc<eitri_core::companion::link::CompanionLink>> {
+        match &*self.role.borrow() {
+            WindowRole::Beside { link, .. } => Some(link.clone()),
             _ => None,
         }
     }
@@ -803,8 +823,10 @@ impl Pair {
     /// The started window at the end of [`Pair::link`]: this window, when it is one, else window 2.
     fn link_name(&self) -> WindowName {
         match &*self.role.borrow() {
-            WindowRole::Module { name, .. } => name.clone(),
-            _ => WindowName::Second,
+            WindowRole::Module { name, .. } | WindowRole::Beside { name, .. } => name.clone(),
+            WindowRole::Alone | WindowRole::Main { .. } | WindowRole::Second { .. } | WindowRole::Unpaired => {
+                WindowName::Second
+            }
         }
     }
 
@@ -2441,7 +2463,7 @@ fn take_welcome(
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use crate::ide_wiring::ShellPort;
     use crate::linked_window::driver::tests::{pair, pump_until};
@@ -2775,6 +2797,55 @@ mod tests {
             std::thread::sleep(Duration::from_millis(1));
         }
         assert_eq!(std::fs::read(&path).unwrap(), b"");
+    }
+
+    /// A link to no nvim yet: a beside pair for a test that never polls it.
+    pub(crate) fn idle_beside_link(id: &str) -> Rc<eitri_core::companion::link::CompanionLink> {
+        Rc::new(eitri_core::companion::link::CompanionLink::new(
+            None,
+            eitri_core::companion::Sockets::default(),
+            eitri_core::companion::InstallKind::Page { id: id.into() },
+        ))
+    }
+
+    /// A window beside nvim belongs to no pair: none of the verbs that reach another window of a group can act, and
+    /// each says so rather than doing something else.
+    #[test]
+    fn a_beside_pair_refuses_start_editor_send_to_hub_send_and_focus_other() {
+        use crate::gtk_host::LinkedWindows;
+        use eitri_core::wm::WinId;
+        let pair = Pair::beside(
+            WindowName::Page("notes".into()),
+            Path::new("/p"),
+            idle_beside_link("notes"),
+        );
+        assert!(pair.is_beside() && !pair.is_second() && !pair.is_module());
+        assert_eq!(
+            LinkedWindows::start_editor(&*pair, WinId::MAIN),
+            Err("only window 2 starts the editor window".to_string())
+        );
+        assert_eq!(
+            LinkedWindows::send_to_hub(&*pair, WinId::MAIN, Msg::WindowFocused {}),
+            Err("window 1 has no window 1 to ask".to_string())
+        );
+        for peer in [HUB_PEER, SECOND_PEER] {
+            assert_eq!(
+                LinkedWindows::send(&*pair, WinId::MAIN, peer, Msg::WindowFocused {}),
+                Err(NO_OTHER_WINDOW.to_string()),
+                "{peer:?}"
+            );
+        }
+        assert_eq!(pair.window_other(None), Err(NO_OTHER_WINDOW.to_string()));
+        assert_eq!(
+            pair.window_new(None),
+            Err(crate::linked_window::BESIDE_REFUSAL.to_string())
+        );
+        assert_eq!(
+            pair.open_module(WindowName::Chat(2), None).map(|_| ()),
+            Err(MODULE_WINDOWS_ARE_WINDOW_1S.to_string())
+        );
+        assert!(pair.link().is_none(), "no link to a window 1");
+        assert!(!pair.holds_pair() && !pair.keeps_pair_file());
     }
 
     #[test]

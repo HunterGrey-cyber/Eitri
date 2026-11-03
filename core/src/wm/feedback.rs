@@ -864,6 +864,8 @@ pub const BESIDE_NO_CHAT_TEXT: &str = "no chat here: press the prefix and a to o
 /// The editor key in a window beside an nvim that runs inside tmux: what holds that nvim is the tmux server, not a
 /// window Eitri could bring forward.
 pub const BESIDE_TMUX_TEXT: &str = "your nvim runs inside tmux: use your window manager's keys to reach it";
+/// `<prefix> ?` in a page window beside nvim: the keys sheet is a chat's, and the page lists its own keys on its `?`.
+pub const BESIDE_PAGE_KEYS_TEXT: &str = "the page's own ? lists its keys";
 
 /// What a window verb that needs the other window says while none is attached: in window 2, that its window 1 is
 /// gone; anywhere else, that there is no second window yet.

@@ -110,6 +110,12 @@ name = "core_wm_acceptance"
 name = "sidecar_probe"
 harness = false
 
+# `eitri page` beside a real nvim, end to end: a plain `main`, because `own_display_scan` requires a test that starts
+# the product binary to isolate its display in `main`. Opt-in with `-- --ignored` (nvim, Xvfb, WebKitGTK).
+[[test]]
+name = "page_window_start"
+harness = false
+
 # Guards the rule that every test opening a display starts its own
 # display (2026-09-29): reads `tests/` here and in `neovide-editor` as text, and fails on a file that
 # opens a display without `tests/support/own_x_server.rs`. A plain #[test] harness that opens nothing,

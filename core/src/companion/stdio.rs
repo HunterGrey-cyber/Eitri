@@ -64,8 +64,13 @@ pub struct Moved {
 /// Where the output would go: the log file, created 0600 (truncated) in a 0700 directory. `None`
 /// when no directory is known or it cannot be made.
 pub fn open_log(dir: &Path, project_root: &Path) -> Option<(std::fs::File, PathBuf)> {
+    open_named_log(dir, &log_file_name(project_root))
+}
+
+/// [`open_log`] for a log named `file_name` in `dir`.
+pub fn open_named_log(dir: &Path, file_name: &str) -> Option<(std::fs::File, PathBuf)> {
     crate::state_paths::create_state_dir(dir).ok()?;
-    let path = dir.join(log_file_name(project_root));
+    let path = dir.join(file_name);
     let file = agent::private_fs::open_private(&path).ok()?;
     Some((file, path))
 }
@@ -74,6 +79,11 @@ pub fn open_log(dir: &Path, project_root: &Path) -> Option<(std::fs::File, PathB
 /// with the log's path, just before stdout or stderr moves, while stderr still reaches the starter.
 /// Nothing is created when no stream is a pipe.
 pub fn leave_pipes(log_dir: Option<&Path>, project_root: &Path, before: &dyn Fn(Option<&Path>)) -> Moved {
+    leave_pipes_to(log_dir, &log_file_name(project_root), before)
+}
+
+/// [`leave_pipes`] into the log `file_name`: a page window's log is named for its control key, not its project.
+pub fn leave_pipes_to(log_dir: Option<&Path>, file_name: &str, before: &dyn Fn(Option<&Path>)) -> Moved {
     let mut moved = Moved::default();
     if is_pipe(0) {
         if let Ok(null) = std::fs::File::open("/dev/null") {
@@ -83,7 +93,7 @@ pub fn leave_pipes(log_dir: Option<&Path>, project_root: &Path, before: &dyn Fn(
     if !is_pipe(1) && !is_pipe(2) {
         return moved;
     }
-    let log = log_dir.and_then(|dir| open_log(dir, project_root));
+    let log = log_dir.and_then(|dir| open_named_log(dir, file_name));
     let (file, path) = match log {
         Some((file, path)) => (file, Some(path)),
         None => match std::fs::OpenOptions::new().write(true).open("/dev/null") {

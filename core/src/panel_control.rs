@@ -785,6 +785,34 @@ pub fn claim(dir: &Path, project_root: &Path, request: Option<&Request>) -> Resu
     claim_for(dir, &ControlKey::Project(project_root), request)
 }
 
+/// What [`forward`] found at a control socket.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Forwarded {
+    /// A running holder answered.
+    Answered(Reply),
+    /// No socket, or one nothing listens on: there is no holder to ask.
+    NoneListening,
+}
+
+/// Sends `request` to whoever holds `control_key`'s socket, never binding, reclaiming or removing anything: for a
+/// caller that wants a running window to act and starts one itself when none runs. A socket that is not this user's is
+/// refused, and one that has a listener which does not answer is an `Err`.
+pub fn forward(dir: &Path, control_key: &ControlKey<'_>, request: &Request) -> Result<Forwarded, String> {
+    let sock = socket_path_for(dir, control_key).map_err(|e| e.to_string())?;
+    match sock.symlink_metadata() {
+        Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(Forwarded::NoneListening),
+        Ok(meta) if meta.file_type().is_socket() && meta.uid() == euid() => {}
+        _ => return Err(format!("{} is not this user's socket; not touching it", sock.display())),
+    }
+    match send(&sock, request, FORWARD_DEADLINE) {
+        Ok(reply) => Ok(Forwarded::Answered(reply)),
+        Err(why) => match crate::instance_dir::nonblocking_connect_outcome(&sock) {
+            ConnectOutcome::NoListener => Ok(Forwarded::NoneListening),
+            ConnectOutcome::Listener | ConnectOutcome::Unknown => Err(why),
+        },
+    }
+}
+
 /// Claims or forwards to a companion or page, with identical ownership and stale-socket checks.
 pub fn claim_for(dir: &Path, control_key: &ControlKey<'_>, request: Option<&Request>) -> Result<Claim, String> {
     ensure_dir(dir)?;

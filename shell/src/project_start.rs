@@ -107,7 +107,33 @@ fn command(exe: &Path, flags: &[OsString], how: How, token: Option<&str>) -> Com
         .stdout(Stdio::null())
         .stderr(Stdio::null())
         .process_group(0);
+    // A window started from a `setsid nohup` launch ignores SIGHUP, SIGINT and SIGQUIT, and an ignored signal stays
+    // ignored across exec: the child starts with every disposition the default and no signal blocked.
+    // SAFETY: between fork and exec the closure calls only `sigemptyset`, `sigprocmask` and `signal`, which are
+    // async-signal-safe, and touches no memory of the parent's but its own stack.
+    unsafe {
+        command.pre_exec(|| {
+            reset_signals();
+            Ok(())
+        });
+    }
     command
+}
+
+/// Every signal's disposition back to the default and an empty signal mask, for a child about to exec. A number the
+/// C library keeps for itself, or one that cannot be caught, is refused by `signal` and left as it is.
+fn reset_signals() {
+    // SAFETY: a zeroed `sigset_t` is a valid buffer for `sigemptyset` to fill; the calls take no other memory.
+    unsafe {
+        let mut none: libc::sigset_t = std::mem::zeroed();
+        libc::sigemptyset(&mut none);
+        libc::sigprocmask(libc::SIG_SETMASK, &none, std::ptr::null_mut());
+        for sig in 1..=64 {
+            if sig != libc::SIGKILL && sig != libc::SIGSTOP {
+                libc::signal(sig, libc::SIG_DFL);
+            }
+        }
+    }
 }
 
 /// Starts `exe` detached from this process. It blocks on the spawn, so it runs off the GTK thread. The spawn happens
@@ -383,6 +409,62 @@ mod tests {
             .unwrap();
         assert!(status.success());
         scratch.lines("seen").remove(0)
+    }
+
+    /// A starter launched as `setsid nohup` ignores `SIGHUP`, `SIGINT` and `SIGQUIT`, and a starter may block signals;
+    /// a window it starts must not inherit either, or a later Ctrl+C or end signal would not reach it.
+    #[test]
+    fn a_started_child_has_default_signals() {
+        let scratch = Scratch::new();
+        let stub = scratch.stub(&format!(
+            // A command's own status, not the shell's: bash ignores SIGQUIT in itself and gives its commands what
+            // it was started with.
+            "grep -E '^Sig(Ign|Blk):' /proc/self/status > '{0}.part'\nmv '{0}.part' '{0}'\n",
+            scratch.path("seen").display()
+        ));
+        let mut helper = Command::new(std::env::current_exe().unwrap());
+        helper
+            .args([
+                "project_start::tests::a_helper_that_starts_a_stub_and_stays",
+                "--exact",
+                "--nocapture",
+            ])
+            .env(HELPER_STUB, &stub)
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null());
+        // SAFETY: between fork and exec only async-signal-safe calls: signal, sigemptyset, sigaddset, sigprocmask.
+        unsafe {
+            helper.pre_exec(|| {
+                for sig in [libc::SIGHUP, libc::SIGINT, libc::SIGQUIT] {
+                    libc::signal(sig, libc::SIG_IGN);
+                }
+                let mut blocked: libc::sigset_t = std::mem::zeroed();
+                libc::sigemptyset(&mut blocked);
+                libc::sigaddset(&mut blocked, libc::SIGUSR1);
+                libc::sigprocmask(libc::SIG_BLOCK, &blocked, std::ptr::null_mut());
+                Ok(())
+            });
+        }
+        assert!(helper.status().unwrap().success());
+        let mask = |name: &str| -> u64 {
+            let line = scratch
+                .lines("seen")
+                .into_iter()
+                .find(|line| line.starts_with(name))
+                .unwrap_or_else(|| panic!("no {name} line"));
+            u64::from_str_radix(line.split_whitespace().nth(1).unwrap(), 16).unwrap()
+        };
+        let bit = |sig: libc::c_int| 1u64 << (sig - 1);
+        let ignored = mask("SigIgn:");
+        for sig in [libc::SIGHUP, libc::SIGINT, libc::SIGQUIT] {
+            assert_eq!(
+                ignored & bit(sig),
+                0,
+                "signal {sig} is ignored in the child: {ignored:#x}"
+            );
+        }
+        assert_eq!(mask("SigBlk:"), 0, "the child starts with no signal blocked");
     }
 
     #[test]

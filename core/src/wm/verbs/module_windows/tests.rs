@@ -1488,7 +1488,6 @@ fn beside_chat_keys_toast_once_then_log() {
         Action::Tab(TabAction::New),
         Action::PanelReload,
         Action::PanelCommandLine,
-        Action::PanelKeymap,
         Action::Tab(TabAction::Next),
     ] {
         assert!(ops(&r.run(action.clone())).is_empty(), "{action:?}");
@@ -1502,6 +1501,30 @@ fn beside_chat_keys_toast_once_then_log() {
     // Its own text: an off key after it still says why once.
     r.run(Action::Zoom);
     assert_eq!(toast(&r).as_deref(), Some(BESIDE_OFF_TEXT));
+}
+
+/// `<prefix> ?` in a beside window: the keys sheet lives in a chat's page, which this window has none of, and the
+/// host has no call that opens a page's own sheet, so every press says where the keys are listed instead: the
+/// page's own `?`. Never the no-chat text, which would send the person to the agent for the page's keys.
+#[test]
+fn prefix_question_mark_reaches_the_pages_keys_sheet_or_toasts() {
+    use crate::wm::feedback::BESIDE_PAGE_KEYS_TEXT;
+    assert_eq!(BESIDE_PAGE_KEYS_TEXT, "the page's own ? lists its keys");
+    let mut r = beside();
+    assert!(
+        ops(&r.run(Action::PanelKeymap)).is_empty(),
+        "nothing to open, nothing to ask"
+    );
+    let first = r.said().toast.expect("the press is answered");
+    assert_eq!(first.1, BESIDE_PAGE_KEYS_TEXT);
+    r.run(Action::PanelKeymap);
+    let second = r.said().toast.expect("and again");
+    assert_eq!(second.1, BESIDE_PAGE_KEYS_TEXT);
+    assert_ne!(second.0, first.0, "each press is answered, as a question is");
+    assert_eq!(said(&r, "[keys] panel.keymap: the page lists its own keys on its ?"), 2);
+    // A chat key after it still says there is no chat, once.
+    r.run(Action::PanelReload);
+    assert_eq!(toast(&r).as_deref(), Some(BESIDE_NO_CHAT_TEXT));
 }
 
 #[test]

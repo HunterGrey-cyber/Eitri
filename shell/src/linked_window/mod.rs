@@ -48,6 +48,8 @@ pub const UNLINKED_NOTE: &str = "the editor window is closed";
 pub const ORPHAN_NOTE: &str = eitri_core::wm::feedback::ORPHAN_TEXT;
 /// What `window.other` says when there is no other window to go to.
 pub const NO_OTHER_WINDOW: &str = "this project has no second window open";
+/// What `window.new` says in a page window beside the person's own nvim: it belongs to no pair.
+pub const BESIDE_REFUSAL: &str = eitri_core::wm::feedback::BESIDE_OFF_TEXT;
 
 /// The window's place in the project's pair, held by `build_ui` for the window's life.
 pub enum WindowRole {
@@ -61,6 +63,12 @@ pub enum WindowRole {
     Module { name: WindowName, link: LinkDriver },
     /// A full window on a project whose pair another window holds.
     Unpaired,
+    /// A page window beside the person's own nvim, started by `eitri page`: no window 1, no pair, no editor of its
+    /// own. `link` is its connection to that nvim, which holds the page's slot there.
+    Beside {
+        name: WindowName,
+        link: Rc<eitri_core::companion::link::CompanionLink>,
+    },
 }
 
 /// What `window.new` does in this window, decided before anything is started.
@@ -91,7 +99,10 @@ impl WindowRole {
 
     /// Whether this window builds and owns the editor: every window but those window 1 started.
     pub fn owns_editor(&self) -> bool {
-        !matches!(self, WindowRole::Second { .. } | WindowRole::Module { .. })
+        !matches!(
+            self,
+            WindowRole::Second { .. } | WindowRole::Module { .. } | WindowRole::Beside { .. }
+        )
     }
 
     /// Whether this window reads and writes the project's plain layout and tabs files. Window 2 and an unpaired
@@ -105,7 +116,7 @@ impl WindowRole {
         match self {
             WindowRole::Main { link } => link.as_ref(),
             WindowRole::Second { link } | WindowRole::Module { link, .. } => Some(link),
-            WindowRole::Alone | WindowRole::Unpaired => None,
+            WindowRole::Alone | WindowRole::Unpaired | WindowRole::Beside { .. } => None,
         }
     }
 
@@ -117,6 +128,7 @@ impl WindowRole {
             WindowRole::Main { .. } => WindowNew::Spawn,
             // Window 2's other window is window 1, which is already there; so is a module window's.
             WindowRole::Second { .. } | WindowRole::Module { .. } => WindowNew::Raise,
+            WindowRole::Beside { .. } => WindowNew::Refuse(BESIDE_REFUSAL),
         }
     }
 
@@ -125,7 +137,8 @@ impl WindowRole {
         use eitri_core::window_link::pair::Role;
         match self {
             WindowRole::Alone | WindowRole::Main { .. } => Role::Main,
-            WindowRole::Second { .. } | WindowRole::Module { .. } => Role::Second,
+            // A beside window keeps no layout, tabs or pair file: the role that reads none of window 1's.
+            WindowRole::Second { .. } | WindowRole::Module { .. } | WindowRole::Beside { .. } => Role::Second,
             WindowRole::Unpaired => Role::Unpaired,
         }
     }
@@ -137,8 +150,14 @@ impl WindowRole {
             WindowRole::Second { .. } | WindowRole::Module { .. } => {
                 (WmRole::Linked { side: LinkSide::Second }, EditorPresence::None)
             }
-            _ => (WmRole::Main, EditorPresence::Owned),
+            WindowRole::Beside { .. } => (WmRole::Companion, EditorPresence::None),
+            WindowRole::Alone | WindowRole::Main { .. } | WindowRole::Unpaired => (WmRole::Main, EditorPresence::Owned),
         }
+    }
+
+    /// Whether this is a page window beside the person's own nvim.
+    pub fn is_beside(&self) -> bool {
+        matches!(self, WindowRole::Beside { .. })
     }
 }
 
@@ -183,6 +202,12 @@ pub enum WindowStart {
         restore: bool,
         /// The port window 1's editor listens on (`--ide-port`), for this window's shells from the first.
         ide_port: Option<u16>,
+    },
+    /// `eitri page <id> ...`: the page window `name` beside the nvim listening on `nvim`, for the project `root`.
+    Beside {
+        name: WindowName,
+        nvim: PathBuf,
+        root: PathBuf,
     },
     /// `eitri linked-window --module ...`: the chat or page window `name`, its link end checked and owned.
     Module {
@@ -785,6 +810,50 @@ pub(crate) mod tests {
                 eitri_core::wm::EditorPresence::None
             )
         );
+    }
+
+    /// A page window beside the person's nvim: no editor of its own, none of the pair's files, no link to a window
+    /// 1, never a window that window 1 started, and the controller's companion role with no editor.
+    #[test]
+    fn beside_role_predicates() {
+        use eitri_core::window_link::pair::Role;
+        let name = WindowName::Page("notes".into());
+        let link = spawn::tests::idle_beside_link("notes");
+        let role = WindowRole::Beside {
+            name: name.clone(),
+            link: link.clone(),
+        };
+        assert!(role.is_beside());
+        assert!(!role.owns_editor());
+        assert!(!role.writes_main_files());
+        assert!(role.link().is_none());
+        assert_eq!(role.window_new(), WindowNew::Refuse(BESIDE_REFUSAL));
+        assert_eq!(BESIDE_REFUSAL, "not here: your window manager arranges this window");
+        assert_eq!(
+            role.pair_role(),
+            Role::Second,
+            "no layout, tabs or pair file of window 1's"
+        );
+        assert_eq!(
+            role.wm_spec_role(),
+            (
+                eitri_core::wm::WindowRole::Companion,
+                eitri_core::wm::EditorPresence::None
+            )
+        );
+        for other in [WindowRole::Alone, WindowRole::Unpaired, WindowRole::Main { link: None }] {
+            assert!(!other.is_beside());
+        }
+
+        let pair = spawn::Pair::beside(name.clone(), Path::new("/p"), link.clone());
+        assert!(pair.is_beside());
+        assert!(!pair.is_second(), "window 1 did not start it");
+        assert!(!pair.is_module() && !pair.is_unpaired() && !pair.is_alone());
+        assert_eq!(pair.module_window(), Some(name));
+        assert!(!pair.owns_editor());
+        assert!(pair.beside_link().is_some_and(|held| Rc::ptr_eq(&held, &link)));
+        let full = spawn::Pair::full(Ok(None), Path::new("/p"), false, false);
+        assert!(!full.is_beside() && full.beside_link().is_none());
     }
 
     #[test]

@@ -678,6 +678,10 @@ pub(crate) trait FollowWindow {
     fn show(&self, module: &ModuleId);
     /// Hides it; if it held the keys they go where a hide sends them.
     fn hide(&self, module: &ModuleId);
+    /// Gives the controller the command as nvim sent it, sorted by nothing here: what a window beside nvim is given,
+    /// since only the controller knows what each command means there. Group windows use
+    /// [`apply_follow_commands`] instead.
+    fn command(&self, module: &ModuleId, cmd: FollowCmd);
 }
 
 /// Applies the commands in order, each reading the window at its own turn, so several in one batch end where as
@@ -1338,6 +1342,23 @@ impl PluginPanels {
         let now = Instant::now();
         for (_, pump) in self.held_hosts() {
             pump.host.editor_session(now);
+        }
+    }
+
+    /// Excludes every Eitri scratch directory under `prefix` from following, the agent window's drafts among them, for
+    /// every host that follows the editor.
+    pub(crate) fn set_scratch_prefix(&self, prefix: Option<PathBuf>) {
+        for (_, pump) in self.hosts() {
+            if pump.host.wants_follow_feed() {
+                pump.host.set_scratch_prefix(prefix.clone());
+            }
+        }
+    }
+
+    /// What runs when the editor refuses a host's follow snippet: the hosts never try it again themselves.
+    pub(crate) fn on_follow_refused(&self, hook: Rc<dyn Fn()>) {
+        for (_, pump) in self.hosts() {
+            pump.host.on_follow_refused(hook.clone());
         }
     }
 
@@ -2593,6 +2614,10 @@ mod tests {
         fn hide(&self, _module: &ModuleId) {
             self.calls.borrow_mut().push("hide");
             self.shown.set(false);
+        }
+
+        fn command(&self, _module: &ModuleId, _cmd: FollowCmd) {
+            self.calls.borrow_mut().push("command");
         }
     }
 
