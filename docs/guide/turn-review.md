@@ -188,17 +188,59 @@ overlay: an `]h` of another plugin (gitsigns, for example) is put aside there an
 closes. A revert made this way is added to the draft; undoing it in the buffer takes it out again. Saving
 the file is up to you.
 
+## Live drawings
+
+With `review.live` turned on (the [Configuration](configuration.md) page says whether it is on until you set it), a file
+the agent edits is drawn in your editor as the edit lands, without your pressing `o`. It works for a file that is
+shown in a Neovim window of the editor (in the full window or a companion window), for every kind of agent tab, and
+for a tab in a second window. The drawing is the same as the one `o` makes: added lines highlighted, removed lines
+shown above or below them as text that is not in the buffer.
+
+What a drawing never does: open a file or a window, move your cursor or the view, take focus, change the mode, or
+say anything. It is drawn over a buffer only when the buffer is unmodified; a buffer you are typing in, or one with
+reverted hunks waiting to be saved, is left exactly as it is, and so is an overlay you opened with `o`. A file that is
+not in a window gets nothing (`o` in the review still draws it on request), and neither does a file in a float, such as
+a picker's preview. A file the agent changed with a shell command, a file your ignore rules keep out of the snapshots,
+a binary file, a file over 8 MiB and a change of more than 2,000 lines of patch are not drawn.
+
+When the turn ends, every file it edited is drawn again from the turn's snapshots, with the same hunks the review
+panel and the draft use, or the drawing is taken off where that cannot be done. A drawing stays until you dismiss it:
+a new turn does not remove it unless that turn edits the same file, and then it is replaced by the new turn's changes.
+Two agents editing the same file at overlapping times are not drawn at all for that file, because each one's diff would
+hold the other's edits; the review panel's `c` lists the overlap.
+
+In a buffer with a drawing:
+
+| key or command | what it does |
+|---|---|
+| `]h` / `[h` | next / previous hunk (a count moves several) |
+| `<localleader>a` or `:EitriReviewKeep` | keep all: take the drawing off this buffer and remember its hunks as kept, so the same turn does not draw them again. It writes nothing; the review panel is unchanged |
+| `<localleader>d` or `:EitriReviewUndo` | undo all: revert every drawn hunk in this buffer, as one step that a single `u` brings back. The buffer is changed and left unsaved; `:w` writes it |
+| `<localleader>r` | revert the hunk under the cursor in this buffer only, as in the review's overlay |
+| `<localleader>q` | close the drawing without remembering anything |
+| `:EitriReviewClear` | take every live drawing off, in all buffers |
+
+While the turn is still running, undo all and revert say so and do nothing (`Esc` in the panel interrupts the turn).
+Undo all is all or nothing: if a change cannot be undone in the buffer (it creates or empties the file, changes its line
+endings, or is too large) or if some of the turn's changes are not drawn there, it changes nothing and tells you to use
+`x` in the panel. Both keep and undo act on the buffer you are in, not on the whole turn.
+
+The drawing never takes over a key you already use: where something maps the same key (gitsigns' `]h`, for example), that
+key is left to it and the command still works. `<localleader>` is your Neovim `maplocalleader` (`\` by default).
+
 ## Turning it off
 
-Two settings in your `init.lua` (see [Configuration](configuration.md)):
+Three settings in your `init.lua` (see [Configuration](configuration.md)):
 
 ```lua
 eitri.config.set("review.enabled", false) -- take no snapshots at all; `c` says turn review is off
 eitri.config.set("review.hint", true)     -- say "N files changed · c to review" in the status band after a turn
+eitri.config.set("review.live", true)     -- draw an agent's edits in your editor as they land (see Live drawings)
 ```
 
-`review.enabled` is `true` and `review.hint` is `false` by default. Anything but `true` or `false` is a
-startup error that names the key. With review off, no snapshot is taken and no review can be opened, and
+The default of each is in the [Configuration](configuration.md) table. Anything but `true` or `false` is listed at
+startup, naming the key, and the setting keeps its default; `review.live` also says it has no effect while `review.enabled` is
+`false`. With review off, no snapshot is taken and no review can be opened, and
 neither the status band nor the line above the input box says anything about a turn's changes, whatever
 `review.hint` is.
 

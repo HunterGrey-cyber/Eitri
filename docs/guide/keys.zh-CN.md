@@ -1,5 +1,5 @@
 [English](keys.md) | 简体中文
-<!-- translated-from: keys.md sha256=9325a9c7b9e5f305372031ab0fe6c4df94ce81fd0a8a1c3aead41a84641121b1 -->
+<!-- translated-from: keys.md sha256=6dd3669263a0f3045d8621282772f23b1f728bc309cca18c32ffdefc16b69cea -->
 
 # 按键
 
@@ -351,6 +351,11 @@ vim.api.nvim_create_autocmd("User", {
 ### 从 Neovim 编辑选区
 
 在 Visual 模式里按 `<leader>ae`（你的 `mapleader`；没设过就是 `\`），按键就交给 agent 面板：你选中的行带在消息上，输入框里已经写好 `Edit the selection: `，光标在它后面。写下想改什么，按 `Enter`：这是一条普通消息，所以修改以 agent 平常的编辑卡片回来，之后可以在 turn review 里看。Eitri 不会往你的缓冲区里写任何东西。选区在 Neovim 里保持选中；输入框里如果已经有你打的字，就保留它们，不再放这句提示。消息发给面板正显示的那个聊天标签（`prefix a` 找的聊天视图：有按键的那个，否则是你最近用的那个，它被隐藏了就带回来），发送前，输入框下面的状态行已经写出了文件和行号。这个键只在你没有映射它的地方才会装上，而 Neovim 自己在 `<leader>` 之下什么也没映射。想用自己的键：`vim.keymap.set("x", "<leader>k", function() require("eitri").edit_selection() end)` 效果一样，没有 Eitri 窗口或面板附着时 `edit_selection()` 返回 `false`。
+
+<a id="keep-or-undo-live-drawings"></a>
+### 保留或撤回实时画面
+
+`review.live` 打开时（见[配置](configuration.zh-CN.md)），agent 编辑的文件会在改动落地时就被画在你的编辑器里，画着东西的缓冲区里这些键可用：`<localleader>a`（或 `:EitriReviewKeep`）保留这个缓冲区里的全部改动，`<localleader>d`（或 `:EitriReviewUndo`）在缓冲区里把它们全部撤回，作为一步，`u` 能全部带回来，`]h` 和 `[h` 在 hunk 之间移动，`<localleader>r` 还原一个，`<localleader>q` 关掉这层画面，`:EitriReviewClear` 把所有画面取下来。`<localleader>` 是你的 `maplocalleader`（没设过就是 `\`）。你自己已经映射了的键，留给你的映射，命令仍然可用。它们都不会写文件。完整的说明，包括画什么、不画什么，在[实时画出改动](turn-review.zh-CN.md#live-drawings)。
 
 <a id="keys-without-the-prefix"></a>
 ## 不带前缀的键

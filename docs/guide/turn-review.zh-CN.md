@@ -1,5 +1,5 @@
 [English](turn-review.md) | 简体中文
-<!-- translated-from: turn-review.md sha256=84d4f68d2c000e65c1f2f1569261eca86f0d69c49ba72d4410aca7dbae4539f4 -->
+<!-- translated-from: turn-review.md sha256=56107ffbc1bf33f595d6e5c5ea1d8761c4a8f792638927e5ecf6618e534670a3 -->
 
 # 审阅一个回合
 
@@ -124,17 +124,42 @@ Comments:
 
 `<localleader>` 是你 Neovim 的 `maplocalleader`（默认是 `\`）。这些键只存在于显示着叠加层的缓冲区里：另一个插件的 `]h`（比如 gitsigns）在那里被放到一边，叠加层关闭时再回来。这样做的还原会被加进草稿；在缓冲区里撤销它，就把它再取出来。要不要保存文件，由你决定。
 
+<a id="live-drawings"></a>
+## 实时画出改动
+
+打开 `review.live` 之后（它在你设置之前是开还是关，见[配置](configuration.zh-CN.md)页），agent 编辑的文件会在编辑落地时就被画在你的编辑器里，不用你按 `o`。它对显示在编辑器某个 Neovim 窗口里的文件起作用（完整窗口或 companion 窗口都行），对每一种 agent 标签页都一样，第二个窗口里的标签页也一样。画出来的和 `o` 画的是同一种：新增的行高亮，被删除的行显示在它们上方或下方，作为不在缓冲区里的文字。
+
+画图从不做这些事：打开文件或窗口，移动你的光标或视图，抢焦点，改变模式，或者说一句话。只有缓冲区没有被修改过时才会画；你正在里面输入的缓冲区，或者带着等待保存的还原的缓冲区，原样不动，你用 `o` 打开的叠加层也一样。不在任何窗口里的文件什么也得不到（审阅里按 `o` 仍然可以按需画出），浮动窗口里的文件（比如选择器的预览）也一样。agent 用 shell 命令改的文件、被你的忽略规则挡在快照之外的文件、二进制文件、超过 8 MiB 的文件、补丁超过 2,000 行的改动，都不画。
+
+回合结束时，它编辑过的每个文件都按这个回合的快照重新画一遍，用的是审阅面板和草稿所用的同一些 hunk；做不到的地方就把画出的东西取下来。画出的东西一直留到你关掉它：新回合不会移除它，除非那个回合编辑了同一个文件，这时它被新回合的改动替换。两个 agent 在重叠的时间里编辑同一个文件，这个文件就完全不画，因为每一方的 diff 里都会带着对方的编辑；审阅面板的 `c` 会列出这种重叠。
+
+在画着东西的缓冲区里：
+
+| 按键或命令 | 作用 |
+|---|---|
+| `]h` / `[h` | 下一个 / 上一个 hunk（带数字则移动好几个） |
+| `<localleader>a` 或 `:EitriReviewKeep` | 全部保留：把画出的东西从这个缓冲区取下来，并把它的 hunk 记为已保留，同一个回合不会再画它们。它什么也不写；审阅面板不变 |
+| `<localleader>d` 或 `:EitriReviewUndo` | 全部撤回：把这个缓冲区里画出的每个 hunk 都还原，作为一步，一个 `u` 就全部带回来。缓冲区被改动但不保存；`:w` 才会写入 |
+| `<localleader>r` | 只在这个缓冲区里还原光标下的 hunk，和审阅叠加层里一样 |
+| `<localleader>q` | 关掉这层画出的东西，什么也不记 |
+| `:EitriReviewClear` | 把所有缓冲区里的实时画面都取下来 |
+
+回合还在运行时，全部撤回和还原会说明这一点然后什么也不做（在面板里按 `Esc` 会打断这个回合）。全部撤回要么全做要么不做：如果有一处改动在缓冲区里撤不了（它创建或清空文件、改变行尾、或太大），或者这个回合有些改动没有画在那里，它什么也不改，并告诉你到面板里用 `x`。保留和撤回都作用于你所在的缓冲区，不是整个回合。
+
+画出的东西从不抢你已经在用的键：别的东西映射了同一个键的地方（比如 gitsigns 的 `]h`），那个键留给它，命令仍然可用。`<localleader>` 是你 Neovim 的 `maplocalleader`（默认是 `\`）。
+
 <a id="turning-it-off"></a>
 ## 关掉它
 
-你的 `init.lua` 里的两个设置（见[配置](configuration.zh-CN.md)）：
+你的 `init.lua` 里的三个设置（见[配置](configuration.zh-CN.md)）：
 
 ```lua
 eitri.config.set("review.enabled", false) -- take no snapshots at all; `c` says turn review is off
 eitri.config.set("review.hint", true)     -- say "N files changed · c to review" in the status band after a turn
+eitri.config.set("review.live", true)     -- draw an agent's edits in your editor as they land (see Live drawings)
 ```
 
-`review.enabled` 默认是 `true`，`review.hint` 默认是 `false`。`true` 或 `false` 之外的任何值都是启动错误，并点出这个键。审阅关闭时，不拍任何快照，也打不开任何审阅；不管 `review.hint` 是什么，状态条和输入框上方的那一行都不会提回合的改动。
+每一个的默认值在[配置](configuration.zh-CN.md)的表里。`true` 或 `false` 之外的任何值会在启动时被列出来，并点出这个键，这个设置保持它的默认值；`review.enabled` 是 `false` 时，`review.live` 也会说它没有效果。审阅关闭时，不拍任何快照，也打不开任何审阅；不管 `review.hint` 是什么，状态条和输入框上方的那一行都不会提回合的改动。
 
 ## 快照存在哪里
 

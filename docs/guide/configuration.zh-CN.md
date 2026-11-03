@@ -1,5 +1,5 @@
 [English](configuration.md) | 简体中文
-<!-- translated-from: configuration.md sha256=8b960f0783899ad914569efe346ac179ca21f39c8e59a053f2ab9740e78cc3ab -->
+<!-- translated-from: configuration.md sha256=9937e2263b968b89c20ae6670c11921a91f12e529dd46d8c45b390c617d74ba8 -->
 
 # 配置
 
@@ -49,6 +49,7 @@ Eitri 说的方式是右上角的一条提示：有几个问题，以及前五�
 | `modules.chat.on_permission` | `"badge"` 或 `"reveal"` | `"badge"` | agent 面板被隐藏时来了一张权限卡片，会怎样。`"badge"` 在顶栏显示 `agent ⚑N` 并弹出一条提示；`"reveal"` 把面板带回它原来的位置，但不移动按键焦点。当另一个窗格被放大时，`"reveal"` 改为显示标记，因为显示面板并不会让它出现在屏幕上。companion 窗口从不隐藏它的面板，所以这个键在那里不起作用。 |
 | `review.enabled` | `true` / `"on"` 或 `false` / `"off"` | `true` | [回合审阅](turn-review.zh-CN.md)是否运行。`false` 不拍快照，也不提供审阅。 |
 | `review.hint` | `true` / `"on"` 或 `false` / `"off"` | `false` | 一个编辑过文件的回合结束后，是否在状态条里加一行提示，以及回合进行期间是否在输入框上方用一行统计它的编辑。无论如何，审阅都只差一个键。 |
+| `review.live` | `true` / `"on"` 或 `false` / `"off"` | `false` | agent 编辑的文件是否在编辑落地时就画在你的编辑器里，回合结束时再画一遍，并在缓冲区里提供全部保留和全部撤回（[实时画出改动](turn-review.zh-CN.md#live-drawings)）。启动时读取一次；`review.enabled` 是 `false` 时它不起作用，Eitri 会在启动时说明。 |
 | `terminal.font` | `guifont` 格式的字体，`"<字体>:h<磅数>"` | 你的 `guifont` | 终端的字体，窗口里每个终端都用它：`"Iosevka:h12"` 同时设字体和字号，`"Iosevka"` 只设字体（字号仍跟着你的 `guifont`），`":h12"` 只设字号。多个字体用逗号分开、按顺序尝试，`_` 或 `\ ` 表示空格，和 `guifont` 一样。不设置时，终端用编辑器的字体和字号，这样编辑器下面的终端看起来和编辑器一致；`guifont` 为空时用 `monospace`。字号和编辑器一起缩放，见[按键](keys.zh-CN.md)。 |
 | `terminal.claude_ide` | `true` / `"on"` 或 `false` / `"off"` | `false` | 你在底部终端里运行的 `claude` 能否连上本窗口的编辑器：打开后 Eitri 在 `127.0.0.1` 上监听，运行期间写下 `~/.claude/ide/<port>.lock`，并在终端的 shell 里设置 `CLAUDE_CODE_SSE_PORT`。由持有编辑器的窗口读取一次，第二个窗口跟随它。见[终端里的 `claude`](terminal-claude.zh-CN.md)。 |
 | `keymap.from_tmux` | `true` / `"on"` 或 `false` / `"off"` | `"on"` | Eitri 是否从你的 tmux 配置里读取你的 tmux 前缀和前缀表按键。见[按键](#keys)。 |

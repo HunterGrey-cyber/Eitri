@@ -556,6 +556,16 @@ named in the status line under the box before you send. The key is put in only w
 nothing under `<leader>`. For a key of your own, `vim.keymap.set("x", "<leader>k", function() require("eitri").edit_selection() end)`
 does the same and `edit_selection()` returns `false` when no Eitri window or panel is attached.
 
+### Keep or undo live drawings
+
+When `review.live` is on (see [Configuration](configuration.md)), a file the agent edits is drawn in your editor as it
+changes, and these keys work in that buffer while a drawing is on it: `<localleader>a` (or `:EitriReviewKeep`) keeps all
+the changes in this buffer, `<localleader>d` (or `:EitriReviewUndo`) undoes all of them in the buffer as one step that `u`
+brings back, `]h` and `[h` move between hunks, `<localleader>r` reverts one, `<localleader>q` closes the drawing and
+`:EitriReviewClear` takes every drawing off. `<localleader>` is your `maplocalleader` (`\` when you have not set one). A key
+that something of yours already maps is left to it, and the commands still work. None of them writes a file. The full
+account, including what is and is not drawn, is in [Live drawings](turn-review.md#live-drawings).
+
 ## Keys without the prefix
 
 By default the only keys Eitri takes without the prefix are the ones in the table above. `eitri.keymap.set("root", ...)`
