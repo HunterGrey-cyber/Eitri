@@ -553,8 +553,8 @@ fn fork_root() -> PathBuf {
 
 /// The fork's lifecycle code: the harness Eitri embeds never sends nvim the fork's quit, which is
 /// `:qa!` with `confirm_quit` off; the one quit nvim itself can still trigger there (`<D-q>`, from
-/// the fork's `lua/init.lua`) confirms; and the only `qa!` left in the fork's Lua is stock
-/// Neovide's, which an embedding never reaches.
+/// the fork's `lua/init.lua`, on macOS only) confirms; and the only `qa!` left in the fork's Lua is
+/// stock Neovide's, which an embedding never reaches.
 #[test]
 fn the_pinned_forks_harness_never_force_quits_nvim() {
     let fork = fork_root();
@@ -591,4 +591,80 @@ fn the_pinned_forks_harness_never_force_quits_nvim() {
         vec![format!("{}: qa!", fork.join("lua/exit_handler.lua").display())],
         "stock Neovide's own unconfirmed quit is the only one left"
     );
+}
+
+/// Loads the fork's `lua/init.lua` into a real nvim as the bridge does, with `has("macunix")`
+/// answering `macunix`, presses `<D-q>` (Super+q on Linux), and returns what the map table and the
+/// fork's notifications show: `(modes mapping <D-q>, whether the quit handler was asked)`.
+fn super_q_in_the_forks_lua(macunix: u8) -> (Vec<String>, bool) {
+    const PROBE: &str = r#"
+local init, macunix = arg[1], tonumber(arg[2])
+local real_has = vim.fn.has
+vim.fn.has = function(feature)
+  if feature == "macunix" then return macunix end
+  return real_has(feature)
+end
+local asked = {}
+vim.rpcnotify = function(_, method) asked[#asked + 1] = method end
+vim.rpcrequest = function(_, method) asked[#asked + 1] = method end
+assert(loadfile(init))({
+  neovide_channel_id = 0, neovide_version = "probe", config_path = "", register_clipboard = false,
+  register_right_click = false, remote = false, enable_focus_command = false,
+  global_variable_settings = {}, option_settings = {},
+})
+local mapped = {}
+for _, mode in ipairs({ "n", "i", "c", "v", "o", "t", "l" }) do
+  if vim.fn.maparg("<D-q>", mode) ~= "" or next(vim.fn.maparg("<D-q>", mode, false, true)) ~= nil then
+    mapped[#mapped + 1] = mode
+  end
+end
+vim.api.nvim_feedkeys(vim.api.nvim_replace_termcodes("<D-q>", true, false, true), "xt", false)
+local quit = false
+for _, method in ipairs(asked) do
+  if method == "neovide.exec_detach_handler" then quit = true end
+end
+io.stdout:write(table.concat(mapped, ",") .. "|" .. tostring(quit) .. "\n")
+io.stdout:flush()
+os.exit(0)
+"#;
+    let init = fork_root().join("lua/init.lua");
+    let probe = Path::new(env!("CARGO_TARGET_TMPDIR")).join(format!("fork-super-q-{}.lua", std::process::id()));
+    std::fs::write(&probe, PROBE).expect("write the probe");
+    let output = Command::new("nvim")
+        .args(["--clean", "--headless", "-l"])
+        .arg(&probe)
+        .arg(&init)
+        .arg(macunix.to_string())
+        .output()
+        .expect("nvim runs");
+    let _ = std::fs::remove_file(&probe);
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        output.status.success(),
+        "the probe nvim failed: {stdout}{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let line = stdout.lines().last().unwrap_or_default();
+    let (modes, quit) = line
+        .split_once('|')
+        .unwrap_or_else(|| panic!("no probe answer in {stdout:?}"));
+    let modes = modes.split(',').filter(|m| !m.is_empty()).map(str::to_owned).collect();
+    (modes, quit == "true")
+}
+
+/// Super+q reaches nvim as `<D-q>` (the editor's key adapter sends GTK's SUPER modifier as `D-`). The
+/// fork's Lua maps it to its quit handler for Command+Q, which must happen only where `has("macunix")`
+/// answers 1: `has()` returns 0 elsewhere, and 0 is true in Lua.
+#[test]
+fn super_q_quits_only_on_macos() {
+    let (modes, quit) = super_q_in_the_forks_lua(0);
+    assert_eq!(modes, Vec::<String>::new(), "off macOS nothing maps <D-q>");
+    assert!(!quit, "off macOS Super+q does not ask the fork to quit");
+    let (modes, quit) = super_q_in_the_forks_lua(1);
+    assert_eq!(
+        modes,
+        ["n", "i", "c", "v", "o", "t", "l"],
+        "on macOS Command+Q is mapped in every mode"
+    );
+    assert!(quit, "on macOS Command+Q asks the fork's quit handler, which confirms");
 }
