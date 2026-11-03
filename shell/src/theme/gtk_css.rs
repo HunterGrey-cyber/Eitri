@@ -435,6 +435,10 @@ window.editor-hole, window.editor-hole .shell-root, window.editor-hole .content-
     padding: 0 8px;
 }}
 
+.project-chooser-line.list-keys {{
+    caret-color: transparent;
+}}
+
 .project-chooser-line placeholder {{
     color: {muted};
     opacity: 1;

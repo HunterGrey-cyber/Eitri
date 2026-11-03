@@ -3,7 +3,9 @@ use crate::onboarding::Lang;
 pub(super) struct Text {
     pub title: &'static str,
     pub placeholder: &'static str,
+    pub placeholder_list: &'static str,
     pub footer: &'static str,
+    pub footer_list: &'static str,
     pub folder: &'static str,
     pub home: &'static str,
     pub empty: &'static str,
@@ -17,7 +19,9 @@ pub(super) fn text(lang: Lang) -> Text {
         Lang::En => Text {
             title: "Open a project",
             placeholder: "filter, or a path: ~/src/app",
-            footer: "Enter open · ↑↓ move · Tab complete · Esc cancel",
+            placeholder_list: "press / to filter or type a path",
+            footer: "Enter open · ↑↓ move · Tab complete · Ctrl+o folder · Esc list",
+            footer_list: "Enter open · j k move · gg G ends · / filter · Ctrl+o folder · q Esc close",
             folder: "Choose a folder…",
             home: "Home folder",
             empty: "No recent projects",
@@ -28,7 +32,9 @@ pub(super) fn text(lang: Lang) -> Text {
         Lang::ZhCn => Text {
             title: "打开项目",
             placeholder: "筛选，或输入路径：~/src/app",
-            footer: "Enter 打开 · ↑↓ 移动 · Tab 补全 · Esc 取消",
+            placeholder_list: "按 / 筛选或输入路径",
+            footer: "Enter 打开 · ↑↓ 移动 · Tab 补全 · Ctrl+o 文件夹 · Esc 返回列表",
+            footer_list: "Enter 打开 · j k 移动 · gg G 首尾 · / 筛选 · Ctrl+o 文件夹 · q Esc 关闭",
             folder: "选择文件夹…",
             home: "主目录",
             empty: "没有最近的项目",

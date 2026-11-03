@@ -16,6 +16,8 @@ const NAME_CHARS: i32 = 26;
 /// The panel's distance from the top of the window, and the least it leaves below it.
 const TOP_MARGIN: i32 = 48;
 const BOTTOM_MARGIN: i32 = 16;
+/// The line's class while the list has the keys: the theme hides the caret then.
+const LIST_KEYS_CLASS: &str = "list-keys";
 
 pub(crate) enum ChooserReport {
     Line(LineEv),
@@ -32,6 +34,8 @@ pub(crate) struct ProjectChooserView {
     message: gtk4::Label,
     footer: gtk4::Label,
     filling: Rc<Cell<bool>>,
+    /// The line has the keys; otherwise the list does and the entry takes no text.
+    in_line: Rc<Cell<bool>>,
     scroll_pending: Rc<Cell<bool>>,
     panel: gtk4::Box,
     scroll: gtk4::ScrolledWindow,
@@ -108,31 +112,40 @@ impl ProjectChooserView {
             move |_| report(ChooserReport::Line(LineEv::Enter))
         });
         // The default bubble phase leaves preedit keys to the entry's input method first.
+        let in_line = Rc::new(Cell::new(false));
         let keys = gtk4::EventControllerKey::new();
         keys.connect_key_pressed({
             let report = report.clone();
             move |_, key, _, mods| {
-                let ctrl = mods.contains(gdk::ModifierType::CONTROL_MASK);
-                let plain = !mods.intersects(
-                    gdk::ModifierType::CONTROL_MASK | gdk::ModifierType::ALT_MASK | gdk::ModifierType::SUPER_MASK,
-                );
-                let ev = match key {
-                    gdk::Key::Down if plain => LineEv::Step(1),
-                    gdk::Key::Up if plain => LineEv::Step(-1),
-                    gdk::Key::n | gdk::Key::j if ctrl => LineEv::Step(1),
-                    gdk::Key::p | gdk::Key::k if ctrl => LineEv::Step(-1),
-                    gdk::Key::o if ctrl => LineEv::ChooseFolder,
-                    gdk::Key::Tab if plain => LineEv::Tab,
-                    // Shift+Tab has no meaning here; left alone it would walk the window's focus away.
-                    gdk::Key::ISO_Left_Tab => return glib::Propagation::Stop,
-                    gdk::Key::Escape => LineEv::Escape,
-                    _ => return glib::Propagation::Proceed,
-                };
-                report(ChooserReport::Line(ev));
-                glib::Propagation::Stop
+                if let Some(ev) = mapped_key(key, mods) {
+                    report(ChooserReport::Line(ev));
+                    return glib::Propagation::Stop;
+                }
+                // Shift+Tab has no meaning here; left alone it would walk the window's focus away.
+                if key == gdk::Key::ISO_Left_Tab {
+                    return glib::Propagation::Stop;
+                }
+                glib::Propagation::Proceed
             }
         });
         entry.add_controller(keys);
+        // While the list has the keys every key is the list's: a plain printable one is a command and never the entry's
+        // text, and any other is reported too (the entry would act on Backspace and the arrows), so the controller runs
+        // ahead of the entry (capture) and answers only then.
+        let list_keys = gtk4::EventControllerKey::new();
+        list_keys.set_propagation_phase(gtk4::PropagationPhase::Capture);
+        list_keys.connect_key_pressed({
+            let report = report.clone();
+            let in_line = in_line.clone();
+            move |_, key, _, mods| match list_ev(key, mods) {
+                Some(ev) if !in_line.get() => {
+                    report(ChooserReport::Line(ev));
+                    glib::Propagation::Stop
+                }
+                _ => glib::Propagation::Proceed,
+            }
+        });
+        entry.add_controller(list_keys);
         let focus = gtk4::EventControllerFocus::new();
         focus.connect_leave({
             let report = report.clone();
@@ -163,6 +176,7 @@ impl ProjectChooserView {
             message,
             footer,
             filling,
+            in_line,
             scroll_pending,
             panel,
             scroll,
@@ -237,9 +251,18 @@ impl ProjectChooserView {
             }
             self.entry.set_sensitive(true);
             self.list.set_sensitive(true);
+            self.in_line.set(false);
             return;
         };
         self.filling.set(true);
+        self.in_line.set(view.in_line);
+        self.entry.set_editable(view.in_line);
+        // The list has no caret: the line is not taking text.
+        if view.in_line {
+            self.entry.remove_css_class(LIST_KEYS_CLASS);
+        } else {
+            self.entry.add_css_class(LIST_KEYS_CLASS);
+        }
         if self.entry.text().as_str() != view.line {
             self.entry.set_text(&view.line);
             self.entry.set_position(-1);
@@ -301,6 +324,77 @@ impl ProjectChooserView {
     }
 }
 
+/// The character a plain printable key types: Shift counts as plain (`G`, `~`), Ctrl, Alt and Super do not. Enter, Esc,
+/// Tab, Backspace and the arrows are not printable and keep their own meaning. A dead tilde (US-international and
+/// similar layouts, where `~` is a dead key) is the `~` it will type.
+fn list_key(key: gdk::Key, mods: gdk::ModifierType) -> Option<char> {
+    let plain =
+        !mods.intersects(gdk::ModifierType::CONTROL_MASK | gdk::ModifierType::ALT_MASK | gdk::ModifierType::SUPER_MASK);
+    if key == gdk::Key::dead_tilde {
+        return plain.then_some('~');
+    }
+    key.to_unicode().filter(|c| plain && !c.is_control())
+}
+
+/// What a key means in both states: the four step keys, `Ctrl+o`, `Tab` and `Esc`.
+fn mapped_key(key: gdk::Key, mods: gdk::ModifierType) -> Option<LineEv> {
+    let ctrl = mods.contains(gdk::ModifierType::CONTROL_MASK);
+    let plain =
+        !mods.intersects(gdk::ModifierType::CONTROL_MASK | gdk::ModifierType::ALT_MASK | gdk::ModifierType::SUPER_MASK);
+    Some(match key {
+        gdk::Key::Down if plain => LineEv::Step(1),
+        gdk::Key::Up if plain => LineEv::Step(-1),
+        gdk::Key::n | gdk::Key::j if ctrl => LineEv::Step(1),
+        gdk::Key::p | gdk::Key::k if ctrl => LineEv::Step(-1),
+        gdk::Key::o if ctrl => LineEv::ChooseFolder,
+        gdk::Key::Tab if plain => LineEv::Tab,
+        gdk::Key::Escape => LineEv::Escape,
+        _ => return None,
+    })
+}
+
+/// What the list hears of a key: a command for a plain printable one, the mapped keys, and `Other` for every key left
+/// (it does nothing, and still ends a waiting `g`). `Enter` is the entry's own `activate`, and a bare modifier is no
+/// key after the `g`: both are left alone (`None`).
+fn list_ev(key: gdk::Key, mods: gdk::ModifierType) -> Option<LineEv> {
+    if let Some(c) = list_key(key, mods) {
+        return Some(LineEv::Key(c));
+    }
+    if let Some(ev) = mapped_key(key, mods) {
+        return Some(ev);
+    }
+    if is_modifier(key) || matches!(key, gdk::Key::Return | gdk::Key::KP_Enter | gdk::Key::ISO_Enter) {
+        return None;
+    }
+    Some(LineEv::Other)
+}
+
+fn is_modifier(key: gdk::Key) -> bool {
+    use gdk::Key;
+    [
+        Key::Shift_L,
+        Key::Shift_R,
+        Key::Control_L,
+        Key::Control_R,
+        Key::Alt_L,
+        Key::Alt_R,
+        Key::Meta_L,
+        Key::Meta_R,
+        Key::Super_L,
+        Key::Super_R,
+        Key::Hyper_L,
+        Key::Hyper_R,
+        Key::Caps_Lock,
+        Key::Shift_Lock,
+        Key::Num_Lock,
+        Key::Scroll_Lock,
+        Key::ISO_Level3_Shift,
+        Key::ISO_Level5_Shift,
+        Key::Mode_switch,
+    ]
+    .contains(&key)
+}
+
 /// How tall the list may be in a window `height` tall, when the rest of the panel takes `chrome`.
 fn list_room(height: i32, chrome: i32) -> i32 {
     (height - TOP_MARGIN - BOTTOM_MARGIN - chrome).clamp(0, MOST_ROWS * ROW_HEIGHT)
@@ -339,15 +433,21 @@ fn set_text(label: &gtk4::Label, text: &str) {
 
 #[cfg(test)]
 mod tests {
-    use super::{list_room, scrolled_to_show, BOTTOM_MARGIN, ROW_HEIGHT, TOP_MARGIN};
+    use super::{is_modifier, list_ev, list_key, list_room, scrolled_to_show, BOTTOM_MARGIN, ROW_HEIGHT, TOP_MARGIN};
+    use eitri_core::project_chooser::LineEv;
     use eitri_core::source_scan as scan;
+    use gtk4::gdk::{Key, ModifierType};
 
     fn code() -> String {
         let source = scan::read_required("shell/src/gtk_host/project_chooser.rs");
         let sources = [source];
         let (_, constructor) = scan::function_in(&sources, "new");
         let (_, show) = scan::function_in(&sources, "show");
-        format!("{constructor}{show}").split_whitespace().collect()
+        let (_, mapped) = scan::function_in(&sources, "mapped_key");
+        let (_, list) = scan::function_in(&sources, "list_ev");
+        format!("{constructor}{show}{mapped}{list}")
+            .split_whitespace()
+            .collect()
     }
 
     #[test]
@@ -405,12 +505,116 @@ mod tests {
         let code = code();
         assert!(code.contains("EventControllerKey::new()"));
         assert!(code.contains("entry.add_controller(keys)"));
-        assert!(!code.contains("set_propagation_phase("));
+        // Only the list's controller runs ahead of the entry; the line's stays in the bubble phase.
+        assert_eq!(code.matches("set_propagation_phase(").count(), 1);
+        assert!(code.contains("list_keys.set_propagation_phase(gtk4::PropagationPhase::Capture)"));
+        assert!(code.contains("Some(ev)if!in_line.get()=>"));
+        assert!(code.contains("LineEv::Key(c)"));
+        assert!(code.contains("entry.set_editable(view.in_line)"));
+        assert!(code.contains("entry.add_css_class(LIST_KEYS_CLASS)"));
+        assert_eq!(super::LIST_KEYS_CLASS, "list-keys");
+        assert!(code.contains("LineEv::Other"));
         assert!(code.contains("entry.connect_activate("));
         assert!(code.contains("LineEv::Step("));
         assert!(code.contains("LineEv::Tab"));
         assert!(code.contains("LineEv::Escape"));
         assert!(code.contains("LineEv::ChooseFolder"));
         assert!(code.contains("LineEv::Enter"));
+    }
+
+    #[test]
+    fn a_bare_modifier_is_no_key_after_a_waiting_g() {
+        for key in [
+            Key::Shift_L,
+            Key::Control_R,
+            Key::Alt_L,
+            Key::Super_L,
+            Key::Caps_Lock,
+            Key::ISO_Level3_Shift,
+        ] {
+            assert!(is_modifier(key), "{key:?}");
+        }
+        for key in [Key::BackSpace, Key::Left, Key::Home, Key::F1, Key::j, Key::Delete] {
+            assert!(!is_modifier(key), "{key:?}");
+        }
+    }
+
+    #[test]
+    fn a_dead_tilde_in_the_list_is_a_tilde() {
+        let none = ModifierType::empty();
+        for mods in [none, ModifierType::SHIFT_MASK] {
+            assert_eq!(list_key(Key::dead_tilde, mods), Some('~'), "{mods:?}");
+            assert_eq!(list_ev(Key::dead_tilde, mods), Some(LineEv::Key('~')), "{mods:?}");
+        }
+        for mods in [
+            ModifierType::CONTROL_MASK,
+            ModifierType::ALT_MASK,
+            ModifierType::SUPER_MASK,
+        ] {
+            assert_eq!(list_key(Key::dead_tilde, mods), None, "{mods:?}");
+        }
+        for dead in [Key::dead_acute, Key::dead_grave, Key::dead_circumflex] {
+            assert_ne!(list_ev(dead, none), Some(LineEv::Key('~')), "{dead:?} is not a tilde");
+        }
+    }
+
+    #[test]
+    fn every_key_in_the_list_is_a_command_or_other_but_enter_and_modifiers() {
+        let none = ModifierType::empty();
+        let ctrl = ModifierType::CONTROL_MASK;
+        for (key, mods, expected) in [
+            (Key::j, none, Some(LineEv::Key('j'))),
+            (Key::G, ModifierType::SHIFT_MASK, Some(LineEv::Key('G'))),
+            (Key::j, ctrl, Some(LineEv::Step(1))),
+            (Key::k, ctrl, Some(LineEv::Step(-1))),
+            (Key::n, ctrl, Some(LineEv::Step(1))),
+            (Key::p, ctrl, Some(LineEv::Step(-1))),
+            (Key::Down, none, Some(LineEv::Step(1))),
+            (Key::Up, none, Some(LineEv::Step(-1))),
+            (Key::o, ctrl, Some(LineEv::ChooseFolder)),
+            (Key::Tab, none, Some(LineEv::Tab)),
+            (Key::Escape, none, Some(LineEv::Escape)),
+            (Key::BackSpace, none, Some(LineEv::Other)),
+            (Key::Delete, none, Some(LineEv::Other)),
+            (Key::Left, none, Some(LineEv::Other)),
+            (Key::Home, none, Some(LineEv::Other)),
+            (Key::F1, none, Some(LineEv::Other)),
+            (Key::g, ctrl, Some(LineEv::Other)),
+            (Key::ISO_Left_Tab, ModifierType::SHIFT_MASK, Some(LineEv::Other)),
+            (Key::Return, none, None),
+            (Key::KP_Enter, none, None),
+            (Key::Shift_L, ModifierType::SHIFT_MASK, None),
+            (Key::Control_L, ctrl, None),
+        ] {
+            assert_eq!(list_ev(key, mods), expected, "{key:?} {mods:?}");
+        }
+    }
+
+    #[test]
+    fn the_list_takes_plain_printable_keys_and_leaves_the_rest() {
+        let none = ModifierType::empty();
+        for (key, mods, expected) in [
+            (Key::j, none, Some('j')),
+            (Key::k, none, Some('k')),
+            (Key::g, none, Some('g')),
+            (Key::G, ModifierType::SHIFT_MASK, Some('G')),
+            (Key::slash, none, Some('/')),
+            (Key::q, none, Some('q')),
+            (Key::asciitilde, ModifierType::SHIFT_MASK, Some('~')),
+            (Key::x, none, Some('x')),
+            (Key::space, none, Some(' ')),
+            (Key::j, ModifierType::CONTROL_MASK, None),
+            (Key::o, ModifierType::CONTROL_MASK, None),
+            (Key::g, ModifierType::ALT_MASK, None),
+            (Key::g, ModifierType::SUPER_MASK, None),
+            (Key::Return, none, None),
+            (Key::Escape, none, None),
+            (Key::Tab, none, None),
+            (Key::BackSpace, none, None),
+            (Key::Down, none, None),
+            (Key::Shift_L, ModifierType::SHIFT_MASK, None),
+        ] {
+            assert_eq!(list_key(key, mods), expected, "{key:?} {mods:?}");
+        }
     }
 }

@@ -115,6 +115,10 @@ pub enum LineEv {
     Tab,
     ChooseFolder,
     KeysLost,
+    /// A plain printable key pressed while the list has the keys (the entry is not taking text).
+    Key(char),
+    /// Any other key (but a bare modifier) pressed while the list has the keys: it does nothing and ends a waiting `g`.
+    Other,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -155,6 +159,8 @@ pub struct ChooserView {
     pub message: Option<String>,
     pub footer: String,
     pub opening: bool,
+    /// The line has the keys (typing filters or types a path); otherwise the list does.
+    pub in_line: bool,
 }
 
 #[derive(Clone)]
@@ -176,6 +182,10 @@ pub struct Chooser {
     line: String,
     answer: Option<PathAnswer>,
     selected: Option<usize>,
+    /// The line has the keys. The chooser opens with the list, which holds the vim keys.
+    in_line: bool,
+    /// A lone `g` is waiting for the key that completes `gg` or cancels it.
+    pending_g: bool,
     held_enter: bool,
     dialog: bool,
     opening: bool,
@@ -197,6 +207,8 @@ impl Chooser {
             line: String::new(),
             answer: None,
             selected: Some(0),
+            in_line: false,
+            pending_g: false,
             held_enter: false,
             dialog: false,
             opening: false,
@@ -224,6 +236,27 @@ impl Chooser {
         // A start and the native dialog own input until they end, but a worker reply still lands: dropped, its request
         // would stay pending for good and a held Enter would wait on it once a start had failed.
         let reply = matches!(ev, Ev::Rows { .. } | Ev::PathAnswer { .. });
+        // A waiting `g` takes the next key whole: it completes `gg` or it ends the wait and does nothing else, so `gx`
+        // and `g<Enter>` never act.
+        if matches!(ev, Ev::Line(_)) && std::mem::take(&mut self.pending_g) {
+            match ev {
+                Ev::Line(LineEv::Key('g')) => {
+                    self.held_enter = false;
+                    self.selected = Some(0);
+                    return vec![];
+                }
+                Ev::Line(
+                    LineEv::Key(_)
+                    | LineEv::Other
+                    | LineEv::Step(_)
+                    | LineEv::Enter
+                    | LineEv::Escape
+                    | LineEv::Tab
+                    | LineEv::ChooseFolder,
+                ) => return vec![],
+                _ => {}
+            }
+        }
         if (self.opening && !reply) || (self.dialog && !reply && !matches!(ev, Ev::Folder(_))) {
             return vec![];
         }
@@ -253,7 +286,12 @@ impl Chooser {
                 }
                 vec![]
             }
-            Ev::Line(LineEv::Changed(text)) => self.changed(text),
+            Ev::Line(LineEv::Changed(text)) => {
+                // Text that arrives is typing, whichever state the chooser thought it was in.
+                self.in_line |= text != self.line;
+                self.changed(text)
+            }
+            Ev::Line(LineEv::Key(c)) => self.key(c),
             Ev::Line(LineEv::Enter) => {
                 if (is_path(&self.line) && self.path_serial.is_some())
                     || (!is_path(&self.line) && self.list_serial.is_some())
@@ -264,17 +302,20 @@ impl Chooser {
                     self.activate()
                 }
             }
-            Ev::Line(LineEv::Step(step)) => {
+            Ev::Line(LineEv::Step(step)) => self.step(step),
+            Ev::Line(LineEv::Escape) if self.in_line => {
+                // The line gives the keys back to the list, emptied, as the session chooser's filter does.
+                self.in_line = false;
                 self.held_enter = false;
-                let last = self.items().len().saturating_sub(1);
-                self.selected =
-                    Some((self.selected.unwrap_or(0) as i64 + i64::from(step)).clamp(0, last as i64) as usize);
-                vec![]
+                self.message = None;
+                self.selected = Some(0);
+                self.changed(String::new())
             }
             Ev::Line(LineEv::Tab) => self.complete(),
             Ev::Line(LineEv::ChooseFolder) => self.folder_dialog(),
             Ev::Pick(index) if index < self.items().len() => {
                 self.held_enter = false;
+                self.pending_g = false;
                 self.selected = Some(index);
                 if matches!(self.items().get(index), Some(Item::Folder)) {
                     self.folder_dialog()
@@ -282,17 +323,64 @@ impl Chooser {
                     self.activate()
                 }
             }
-            Ev::Dismiss | Ev::Line(LineEv::Escape | LineEv::KeysLost) => {
-                self.closed = true;
-                self.held_enter = false;
-                vec![Effect::Close]
-            }
+            Ev::Dismiss | Ev::Line(LineEv::Escape | LineEv::KeysLost) => self.close(),
             Ev::Folder(path) if self.dialog => {
                 self.dialog = false;
                 path.map(|path| vec![Effect::Open(path)]).unwrap_or_default()
             }
             _ => vec![],
         }
+    }
+
+    fn step(&mut self, step: i32) -> Vec<Effect> {
+        self.held_enter = false;
+        let last = self.items().len().saturating_sub(1);
+        self.selected = Some((self.selected.unwrap_or(0) as i64 + i64::from(step)).clamp(0, last as i64) as usize);
+        vec![]
+    }
+
+    /// A plain printable key. In the list it is a command; keys that are no command do nothing. In the line a key is
+    /// text the entry took, so one that arrives here (the view and the model briefly disagreed) is appended.
+    fn key(&mut self, c: char) -> Vec<Effect> {
+        if self.in_line {
+            let mut next = self.line.clone();
+            next.push(c);
+            let mut effects = self.changed(next.clone());
+            effects.insert(0, Effect::SetLine(next));
+            return effects;
+        }
+        match c {
+            'j' => self.step(1),
+            'k' => self.step(-1),
+            'g' => {
+                self.pending_g = true;
+                vec![]
+            }
+            'G' => {
+                self.held_enter = false;
+                self.selected = Some(self.items().len().saturating_sub(1));
+                vec![]
+            }
+            '/' => {
+                self.in_line = true;
+                vec![]
+            }
+            // A path is the one thing typed without a filter key.
+            '~' => {
+                self.in_line = true;
+                let mut effects = self.changed("~".into());
+                effects.insert(0, Effect::SetLine("~".into()));
+                effects
+            }
+            'q' => self.close(),
+            _ => vec![],
+        }
+    }
+
+    fn close(&mut self) -> Vec<Effect> {
+        self.closed = true;
+        self.held_enter = false;
+        vec![Effect::Close]
     }
 
     fn changed(&mut self, text: String) -> Vec<Effect> {
@@ -462,14 +550,20 @@ impl Chooser {
         ChooserView {
             title: text.title.into(),
             line: self.line.clone(),
-            placeholder: text.placeholder.into(),
+            placeholder: if self.in_line {
+                text.placeholder
+            } else {
+                text.placeholder_list
+            }
+            .into(),
             selected: self.selected.filter(|i| *i < rows.len()),
             rows,
             message: self.message.clone().or_else(|| {
                 (self.list_serial.is_none() && self.rows.is_empty() && self.line.is_empty()).then(|| text.empty.into())
             }),
-            footer: text.footer.into(),
+            footer: if self.in_line { text.footer } else { text.footer_list }.into(),
             opening: self.opening,
+            in_line: self.in_line,
         }
     }
 

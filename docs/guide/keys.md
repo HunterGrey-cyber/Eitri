@@ -58,16 +58,31 @@ would rather see the keys than remember them, [The hint panel](#the-hint-panel) 
 **Projects.** `<prefix> O` (also `:Eitri project.choose`, a click on the project's name in the top bar, or `p` on an empty
 chat tab) lays a list over the window: your other projects, the one you used last first, with a line to filter it or to
 type a path. It works in every window, the chat and page windows of [compositor windows](compositor-windows.md) included,
-and it changes nothing in the window: `Esc` closes it and the keys go back to where they were.
+and it changes nothing in the window: `Esc` or `q` closes it and the keys go back to where they were.
 
-| keys | what they do |
+It opens on the list, with the keys of the session list (`<prefix> w`): the line is not taking text yet, and its
+placeholder says `/` filters or types a path.
+
+| keys in the list | what they do |
+|---|---|
+| `j`, `Down`, `Ctrl+n`, `Ctrl+j` / `k`, `Up`, `Ctrl+p`, `Ctrl+k` | move down / up the list (it does not wrap) |
+| `gg` / `G` | the first / the last row (a `g` waits for the next key; any other key ends the wait and does nothing) |
+| `Enter` | go to the selected row |
+| `/` | go to the line, empty, to filter |
+| `~` | go to the line with `~` already typed, to type a path |
+| `Ctrl+o` | `Choose a folder…`, the system's folder dialog |
+| `Esc`, `q` | close the list; nothing happened |
+
+Any other plain key does nothing. In the line:
+
+| keys in the line | what they do |
 |---|---|
 | typing | filters by name and path, ignoring case; text that starts with `/`, `~`, `./` or `../` is read as a path instead |
-| `Down`, `Ctrl+n`, `Ctrl+j` / `Up`, `Ctrl+p`, `Ctrl+k` | move down / up the list (it does not wrap) |
+| `Down`, `Ctrl+n`, `Ctrl+j` / `Up`, `Ctrl+p`, `Ctrl+k` | move down / up the list (`j` and `k` are typed here) |
 | `Enter` | go to the selected row |
 | `Tab` | complete a typed path as far as the folders agree |
 | `Ctrl+o` | `Choose a folder…`, the system's folder dialog |
-| `Esc` | close the list; nothing happened |
+| `Esc` | empty the line and go back to the list (a second `Esc` closes it) |
 
 A row shows the folder's name, its path (`~` for your home folder) and, on the right, `open` when a window already holds
 the project, `gone` when the folder is no longer there, and otherwise how long ago you last used the project (`5 m`, `2 h`,

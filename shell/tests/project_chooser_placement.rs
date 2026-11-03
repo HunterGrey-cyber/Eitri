@@ -41,6 +41,7 @@ fn view() -> ChooserView {
         message: None,
         footer: "Enter open · ↑↓ move · Tab complete · Esc cancel".into(),
         opening: false,
+        in_line: true,
     }
 }
 
@@ -283,6 +284,77 @@ fn shift_tab_stays_in_the_line(display: &str) {
         .any(|r| matches!(r, ChooserReport::Line(LineEv::KeysLost))));
 }
 
+fn entry_text(stage: &Stage) -> String {
+    let entry = stage
+        .widgets()
+        .into_iter()
+        .find_map(|w| w.downcast::<gtk4::Entry>().ok())
+        .unwrap();
+    entry.text().to_string()
+}
+
+fn keys_of(stage: &Stage) -> Vec<char> {
+    stage
+        .reports
+        .borrow()
+        .iter()
+        .filter_map(|r| match r {
+            ChooserReport::Line(LineEv::Key(c)) => Some(*c),
+            _ => None,
+        })
+        .collect()
+}
+
+/// While the list has the keys a plain printable key is reported as a command and the entry stays empty; the other
+/// keys keep their meaning, and once the line has the keys the same key is text.
+fn the_list_reports_plain_keys_and_the_line_takes_text(display: &str) {
+    let stage = Stage::new();
+    stage.overlay.add_overlay(stage.chooser.widget());
+    stage.chooser.focus();
+    let mut list = view();
+    list.in_line = false;
+    list.placeholder = "press / to filter or type a path".into();
+    stage.chooser.show(Some(&list));
+    pump();
+    focus_window(display, "eitri-project-placement");
+    for key in ["j", "k", "g", "shift+g", "slash", "q", "shift+grave"] {
+        xdo(display, &["key", "--clearmodifiers", key]);
+        pump();
+    }
+    assert_eq!(keys_of(&stage), vec!['j', 'k', 'g', 'G', '/', 'q', '~']);
+    assert_eq!(entry_text(&stage), "", "the list's keys are not the entry's text");
+    xdo(display, &["key", "--clearmodifiers", "BackSpace"]);
+    xdo(display, &["key", "--clearmodifiers", "Left"]);
+    pump();
+    let others = |stage: &Stage| {
+        stage
+            .reports
+            .borrow()
+            .iter()
+            .filter(|r| matches!(r, ChooserReport::Line(LineEv::Other)))
+            .count()
+    };
+    assert_eq!(others(&stage), 2, "a key that is no command still ends a waiting g");
+    xdo(display, &["key", "--clearmodifiers", "ctrl+n"]);
+    xdo(display, &["key", "--clearmodifiers", "Return"]);
+    xdo(display, &["key", "--clearmodifiers", "Escape"]);
+    pump();
+    let reports = stage.reports.borrow();
+    assert!(reports
+        .iter()
+        .any(|r| matches!(r, ChooserReport::Line(LineEv::Step(1)))));
+    assert!(reports.iter().any(|r| matches!(r, ChooserReport::Line(LineEv::Enter))));
+    assert!(reports.iter().any(|r| matches!(r, ChooserReport::Line(LineEv::Escape))));
+    drop(reports);
+    stage.chooser.show(Some(&view()));
+    pump();
+    xdo(display, &["key", "--clearmodifiers", "j"]);
+    pump();
+    assert_eq!(entry_text(&stage), "j", "in the line a plain key is text");
+    assert_eq!(keys_of(&stage).len(), 7, "and no command");
+    assert_eq!(others(&stage), 2, "and no other-key report");
+}
+
 fn updates_over(stage: &Stage, millis: u64) -> u32 {
     let clock = stage.window.frame_clock().unwrap();
     let count = Rc::new(std::cell::Cell::new(0u32));
@@ -378,6 +450,9 @@ fn main() {
         the_keys_going_to_another_widget_while_active_report_lost,
     );
     run(f, "shift_tab_stays_in_the_line", || shift_tab_stays_in_the_line(d));
+    run(f, "the_list_reports_plain_keys_and_the_line_takes_text", || {
+        the_list_reports_plain_keys_and_the_line_takes_text(d)
+    });
     run(
         f,
         "the_frame_tick_runs_only_while_the_chooser_is_up",

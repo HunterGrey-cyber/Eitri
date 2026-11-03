@@ -432,8 +432,8 @@ fn every_string_has_both_languages() {
         (
             Lang::En,
             "Open a project",
-            "filter, or a path: ~/src/app",
-            "Enter open · ↑↓ move · Tab complete · Esc cancel",
+            "press / to filter or type a path",
+            "Enter open · j k move · gg G ends · / filter · Ctrl+o folder · q Esc close",
             "Choose a folder…",
             "Home folder",
             "No recent projects",
@@ -445,8 +445,8 @@ fn every_string_has_both_languages() {
         (
             Lang::ZhCn,
             "打开项目",
-            "筛选，或输入路径：~/src/app",
-            "Enter 打开 · ↑↓ 移动 · Tab 补全 · Esc 取消",
+            "按 / 筛选或输入路径",
+            "Enter 打开 · j k 移动 · gg G 首尾 · / 筛选 · Ctrl+o 文件夹 · q Esc 关闭",
             "选择文件夹…",
             "主目录",
             "没有最近的项目",
@@ -465,6 +465,24 @@ fn every_string_has_both_languages() {
         assert_eq!(v.rows[0].name, choose);
         assert_eq!(v.rows[1].name, home);
         assert_eq!(v.message.as_deref(), Some(empty));
+        c.event(Ev::Line(LineEv::Key('/')));
+        let v = c.view();
+        assert_eq!(
+            v.placeholder,
+            if lang == Lang::En {
+                "filter, or a path: ~/src/app"
+            } else {
+                "筛选，或输入路径：~/src/app"
+            }
+        );
+        assert_eq!(
+            v.footer,
+            if lang == Lang::En {
+                "Enter open · ↑↓ move · Tab complete · Ctrl+o folder · Esc list"
+            } else {
+                "Enter 打开 · ↑↓ 移动 · Tab 补全 · Ctrl+o 文件夹 · Esc 返回列表"
+            }
+        );
         list(&mut c, vec![row("/a", Fact::Open), row("/b", Fact::Gone)]);
         assert_eq!(c.view().rows[0].right, open);
         assert_eq!(c.view().rows[1].right, gone);
@@ -685,4 +703,435 @@ fn a_failed_start_says_a_gone_folder_as_a_gone_row_does_and_else_points_at_its_l
     let mut zh = Chooser::new(Mode::Launch, None, Lang::ZhCn, 1);
     zh.start_failed("/srv/app".into(), true);
     assert_eq!(zh.view().message.as_deref(), Some("/srv/app 不在了"));
+}
+
+// The list state (the state the chooser opens in) and the line state.
+
+fn key(c: &mut Chooser, ch: char) -> Vec<Effect> {
+    c.event(Ev::Line(LineEv::Key(ch)))
+}
+fn esc(c: &mut Chooser) -> Vec<Effect> {
+    c.event(Ev::Line(LineEv::Escape))
+}
+fn three() -> Chooser {
+    let mut c = window();
+    list(
+        &mut c,
+        vec![
+            row("/a", Fact::Present),
+            row("/b", Fact::Present),
+            row("/c", Fact::Present),
+        ],
+    );
+    c
+}
+
+#[test]
+fn it_opens_in_the_list_with_the_list_keys_and_a_placeholder_that_names_the_slash() {
+    for mode in [Mode::Launch, Mode::Window { root: "/here".into() }] {
+        let mut c = chooser(mode);
+        c.shown();
+        let v = c.view();
+        assert!(!v.in_line);
+        assert_eq!(v.placeholder, "press / to filter or type a path");
+        assert!(v.footer.contains("j k move") && v.footer.contains("q Esc close"));
+    }
+}
+
+#[test]
+fn j_k_and_the_four_step_keys_move_the_list_without_wrapping() {
+    let mut c = three();
+    key(&mut c, 'j');
+    key(&mut c, 'j');
+    assert_eq!(c.view().selected, Some(2));
+    c.event(Ev::Line(LineEv::Step(1)));
+    key(&mut c, 'j');
+    key(&mut c, 'j');
+    assert_eq!(
+        c.view().selected,
+        Some(3),
+        "the folder row is the last, and nothing wraps"
+    );
+    key(&mut c, 'k');
+    c.event(Ev::Line(LineEv::Step(-1)));
+    assert_eq!(c.view().selected, Some(1));
+    for _ in 0..9 {
+        key(&mut c, 'k');
+    }
+    assert_eq!(c.view().selected, Some(0));
+    assert!(!c.view().in_line);
+}
+
+#[test]
+fn gg_goes_to_the_first_row_and_capital_g_to_the_last() {
+    let mut c = three();
+    assert!(key(&mut c, 'G').is_empty());
+    assert_eq!(c.view().selected, Some(3));
+    assert_eq!(c.view().rows[3].name, "Choose a folder…");
+    key(&mut c, 'g');
+    assert_eq!(c.view().selected, Some(3), "a lone g only waits");
+    key(&mut c, 'g');
+    assert_eq!(c.view().selected, Some(0));
+    // The wait ends with the second g: the next g waits again rather than going anywhere.
+    key(&mut c, 'j');
+    key(&mut c, 'g');
+    key(&mut c, 'j');
+    assert_eq!(c.view().selected, Some(1), "g then j is swallowed");
+}
+
+#[test]
+fn capital_g_on_a_launch_first_run_lands_on_the_last_row() {
+    let mut c = chooser(Mode::Launch);
+    list(&mut c, vec![]);
+    key(&mut c, 'G');
+    assert_eq!(c.view().rows[c.view().selected.unwrap()].name, "Home folder");
+    assert_eq!(enter(&mut c), vec![Effect::Open("/home/me".into())]);
+    key(&mut c, 'j');
+    let mut c = chooser(Mode::Launch);
+    list(&mut c, vec![]);
+    key(&mut c, 'j');
+    assert_eq!(c.view().selected, Some(1));
+    key(&mut c, 'g');
+    key(&mut c, 'g');
+    assert_eq!(c.view().rows[c.view().selected.unwrap()].name, "Choose a folder…");
+}
+
+/// The key after a waiting `g` does nothing else, whatever it is: `gx`, `g<Enter>`, `g<Esc>` and `g<Down>` act as
+/// nothing, and the wait is over.
+#[test]
+fn the_key_after_a_waiting_g_is_swallowed() {
+    for next in [
+        Ev::Line(LineEv::Key('x')),
+        Ev::Line(LineEv::Other),
+        Ev::Line(LineEv::Key('j')),
+        Ev::Line(LineEv::Key('q')),
+        Ev::Line(LineEv::Key('/')),
+        Ev::Line(LineEv::Key('~')),
+        Ev::Line(LineEv::Enter),
+        Ev::Line(LineEv::Escape),
+        Ev::Line(LineEv::Step(1)),
+        Ev::Line(LineEv::Tab),
+        Ev::Line(LineEv::ChooseFolder),
+    ] {
+        let mut c = three();
+        key(&mut c, 'j');
+        let before = c.view();
+        key(&mut c, 'g');
+        assert!(c.event(next.clone()).is_empty(), "{next:?}");
+        assert_eq!(c.view(), before, "{next:?}");
+        // The wait is over: a later g waits afresh, and j moves.
+        key(&mut c, 'j');
+        assert_eq!(c.view().selected, Some(2), "{next:?}");
+    }
+}
+
+#[test]
+fn another_key_does_nothing_and_ends_a_waiting_g() {
+    let mut c = three();
+    key(&mut c, 'j');
+    let before = c.view();
+    assert!(c.event(Ev::Line(LineEv::Other)).is_empty());
+    assert_eq!(c.view(), before);
+    // g, Backspace, `/`: the Backspace ended the wait, so the slash goes to the line.
+    key(&mut c, 'g');
+    c.event(Ev::Line(LineEv::Other));
+    key(&mut c, '/');
+    assert!(c.view().in_line);
+    // g, Backspace, Esc closes: the wait is over when Esc comes.
+    let mut c = three();
+    key(&mut c, 'g');
+    c.event(Ev::Line(LineEv::Other));
+    assert_eq!(esc(&mut c), vec![Effect::Close]);
+}
+
+#[test]
+fn a_click_ends_a_waiting_g() {
+    let mut c = three();
+    key(&mut c, 'g');
+    assert!(c.event(Ev::Pick(2)).len() == 1, "the click opens its row");
+    let mut c = three();
+    key(&mut c, 'g');
+    c.event(Ev::Pick(99));
+    key(&mut c, 'j');
+    assert_eq!(
+        c.view().selected,
+        Some(0),
+        "a click on no row is not a key, and the wait stands"
+    );
+    let mut c = three();
+    key(&mut c, 'g');
+    c.event(Ev::Line(LineEv::Changed("a".into())));
+    assert!(c.view().in_line);
+    c.event(Ev::Line(LineEv::Step(1)));
+    assert_eq!(c.view().selected, Some(1), "typing ends the wait");
+}
+
+#[test]
+fn a_dismiss_or_lost_keys_still_close_while_g_waits() {
+    for ev in [Ev::Dismiss, Ev::Line(LineEv::KeysLost)] {
+        let mut c = three();
+        key(&mut c, 'g');
+        assert_eq!(c.event(ev), vec![Effect::Close]);
+    }
+}
+
+#[test]
+fn enter_in_the_list_opens_the_selected_row() {
+    let mut c = three();
+    key(&mut c, 'j');
+    assert_eq!(enter(&mut c), vec![Effect::Open("/b".into())]);
+    let mut c = three();
+    key(&mut c, 'G');
+    assert_eq!(enter(&mut c), vec![Effect::FolderDialog]);
+}
+
+#[test]
+fn slash_goes_to_the_empty_line_and_typing_filters_there() {
+    let mut c = three();
+    assert!(key(&mut c, '/').is_empty());
+    let v = c.view();
+    assert!(v.in_line);
+    assert_eq!(v.line, "");
+    assert_eq!(v.placeholder, "filter, or a path: ~/src/app");
+    assert_eq!(v.rows.len(), 4);
+    line(&mut c, "b");
+    assert_eq!(c.view().rows.len(), 2);
+    assert_eq!(c.view().rows[0].name, "b");
+    // In the line the four step keys, Tab and Enter work as before.
+    c.event(Ev::Line(LineEv::Step(1)));
+    assert_eq!(c.view().selected, Some(1));
+    c.event(Ev::Line(LineEv::Step(-1)));
+    assert_eq!(enter(&mut c), vec![Effect::Open("/b".into())]);
+}
+
+#[test]
+fn esc_in_the_line_clears_it_and_returns_to_the_list_and_a_second_esc_closes() {
+    for typed in ["b", "~/x", ""] {
+        let mut c = three();
+        key(&mut c, '/');
+        if !typed.is_empty() {
+            line(&mut c, typed);
+        }
+        c.event(Ev::Line(LineEv::Step(1)));
+        let effects = esc(&mut c);
+        assert!(!effects.contains(&Effect::Close), "{typed}");
+        let v = c.view();
+        assert!(!v.in_line, "{typed}");
+        assert_eq!(v.line, "", "{typed}");
+        assert_eq!(v.rows.len(), 4, "the whole list is back: {typed}");
+        assert_eq!(v.selected, Some(0), "{typed}");
+        assert_eq!(v.placeholder, "press / to filter or type a path");
+        assert_eq!(esc(&mut c), vec![Effect::Close], "{typed}");
+    }
+}
+
+#[test]
+fn esc_in_the_line_drops_a_pending_path_and_a_held_enter() {
+    let mut c = window();
+    let Effect::List { serial } = c.shown()[0] else {
+        unreachable!()
+    };
+    let effects = line(&mut c, "~/x");
+    let Effect::Path { serial: path, .. } = effects[0] else {
+        panic!("a path request")
+    };
+    assert!(enter(&mut c).is_empty(), "held for the path answer");
+    assert!(esc(&mut c).is_empty());
+    assert!(c
+        .event(Ev::PathAnswer {
+            serial: path,
+            answer: found(Some(PathKind::Dir), &[], "")
+        })
+        .is_empty());
+    assert!(c
+        .event(Ev::Rows {
+            serial,
+            rows: vec![row("/a", Fact::Present)]
+        })
+        .is_empty());
+    assert_eq!(c.view().rows[0].name, "a");
+    assert!(!c.view().in_line);
+}
+
+#[test]
+fn q_and_esc_close_the_list_with_nothing_opened() {
+    for ch in [Some('q'), None] {
+        let mut c = three();
+        key(&mut c, 'j');
+        let effects = match ch {
+            Some(ch) => key(&mut c, ch),
+            None => esc(&mut c),
+        };
+        assert_eq!(effects, vec![Effect::Close]);
+        assert!(c.event(Ev::Line(LineEv::Enter)).is_empty(), "closed for good");
+    }
+}
+
+#[test]
+fn a_tilde_in_the_list_goes_to_the_line_with_it_typed() {
+    for (mode, base) in [
+        (Mode::Window { root: "/here".into() }, "/here"),
+        (Mode::Launch, "/home/me"),
+    ] {
+        let mut c = chooser(mode);
+        list(&mut c, vec![row("/a", Fact::Present)]);
+        let effects = key(&mut c, '~');
+        let Effect::Path { serial, .. } = effects[1] else {
+            panic!("a path request: {effects:?}")
+        };
+        assert_eq!(
+            effects,
+            vec![
+                Effect::SetLine("~".into()),
+                Effect::Path {
+                    serial,
+                    text: "~".into(),
+                    base: base.into()
+                }
+            ]
+        );
+        let v = c.view();
+        assert!(v.in_line);
+        assert_eq!(v.line, "~");
+        // The entry reporting the same text changes nothing.
+        assert!(line(&mut c, "~").is_empty());
+        line(&mut c, "~/");
+        assert!(c.view().in_line);
+    }
+}
+
+#[test]
+fn other_plain_keys_in_the_list_do_nothing() {
+    let mut c = three();
+    key(&mut c, 'j');
+    let before = c.view();
+    for ch in "abcdefhilmnoprstuvwxyz0123456789 .,:;!?-_=+*#@$%^&()[]{}<>|\\'\"ABCDEFHIJKLMNOPQRSTUVWXYZ中".chars() {
+        assert!(key(&mut c, ch).is_empty(), "{ch}");
+        assert_eq!(c.view(), before, "{ch}");
+    }
+    assert!(!c.view().in_line);
+}
+
+#[test]
+fn tab_does_nothing_in_the_list_and_ctrl_o_asks_the_dialog_in_both_states() {
+    let mut c = three();
+    assert!(c.event(Ev::Line(LineEv::Tab)).is_empty());
+    assert_eq!(c.event(Ev::Line(LineEv::ChooseFolder)), vec![Effect::FolderDialog]);
+    // A cancelled dialog leaves the state where it was.
+    assert!(c.event(Ev::Folder(None)).is_empty());
+    assert!(!c.view().in_line);
+    key(&mut c, 'j');
+    assert_eq!(c.view().selected, Some(1));
+    key(&mut c, '/');
+    assert_eq!(c.event(Ev::Line(LineEv::ChooseFolder)), vec![Effect::FolderDialog]);
+    assert!(c.event(Ev::Folder(None)).is_empty());
+    assert!(c.view().in_line);
+    let mut c = three();
+    c.event(Ev::Line(LineEv::ChooseFolder));
+    assert_eq!(
+        c.event(Ev::Folder(Some("/picked".into()))),
+        vec![Effect::Open("/picked".into())]
+    );
+}
+
+#[test]
+fn text_that_reaches_the_model_in_the_list_is_typing() {
+    let mut c = three();
+    line(&mut c, "b");
+    assert!(c.view().in_line);
+    assert_eq!(c.view().rows.len(), 2);
+}
+
+#[test]
+fn a_command_key_that_arrives_in_the_line_is_text() {
+    let mut c = three();
+    key(&mut c, '/');
+    line(&mut c, "a");
+    let effects = key(&mut c, 'j');
+    assert_eq!(effects, vec![Effect::SetLine("aj".into())]);
+    assert_eq!(c.view().line, "aj");
+    assert!(c.view().in_line);
+}
+
+#[test]
+fn enter_before_the_rows_arrive_is_held_in_the_list_and_runs_on_the_first_row() {
+    for mode in [Mode::Launch, Mode::Window { root: "/here".into() }] {
+        let mut c = chooser(mode);
+        let Effect::List { serial } = c.shown()[0] else {
+            unreachable!()
+        };
+        assert!(enter(&mut c).is_empty());
+        assert_eq!(
+            c.event(Ev::Rows {
+                serial,
+                rows: vec![row("/last", Fact::Present), row("/older", Fact::Present)]
+            }),
+            vec![Effect::Open("/last".into())]
+        );
+    }
+}
+
+#[test]
+fn a_list_key_before_the_rows_arrive_drops_the_held_enter() {
+    for ch in ['j', 'G'] {
+        let mut c = window();
+        let Effect::List { serial } = c.shown()[0] else {
+            unreachable!()
+        };
+        key(&mut c, ch);
+        assert!(enter(&mut c).is_empty());
+        assert!(key(&mut c, 'k').is_empty());
+        assert!(
+            c.event(Ev::Rows {
+                serial,
+                rows: vec![row("/a", Fact::Present)]
+            })
+            .is_empty(),
+            "{ch}"
+        );
+    }
+}
+
+#[test]
+fn one_esc_from_the_opening_state_leaves_nothing_changed() {
+    for mode in [Mode::Launch, Mode::Window { root: "/here".into() }] {
+        let mut c = chooser(mode);
+        list(&mut c, vec![row("/a", Fact::Present)]);
+        assert_eq!(esc(&mut c), vec![Effect::Close]);
+    }
+}
+
+#[test]
+fn a_launch_first_run_works_with_the_same_keys() {
+    let mut c = chooser(Mode::Launch);
+    list(&mut c, vec![]);
+    assert_eq!(c.view().selected, Some(0));
+    assert_eq!(c.view().rows[0].name, "Choose a folder…");
+    key(&mut c, 'j');
+    assert_eq!(c.view().rows[1].name, "Home folder");
+    assert_eq!(c.view().selected, Some(1));
+    key(&mut c, 'k');
+    assert_eq!(enter(&mut c), vec![Effect::FolderDialog]);
+    assert!(c.event(Ev::Folder(None)).is_empty());
+    key(&mut c, '/');
+    line(&mut c, "zzz");
+    assert_eq!(c.view().rows.len(), 1);
+    assert_eq!(esc(&mut c).len(), 0);
+    assert_eq!(c.view().rows.len(), 2);
+    assert_eq!(esc(&mut c), vec![Effect::Close]);
+}
+
+#[test]
+fn list_keys_are_ignored_while_a_start_is_under_way() {
+    let mut c = three();
+    c.opening("a");
+    for ev in [
+        Ev::Line(LineEv::Key('j')),
+        Ev::Line(LineEv::Key('q')),
+        Ev::Line(LineEv::Key('/')),
+    ] {
+        assert!(c.event(ev).is_empty());
+    }
+    assert!(c.view().opening);
+    assert!(!c.view().in_line);
 }
