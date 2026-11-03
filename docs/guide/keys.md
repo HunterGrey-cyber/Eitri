@@ -55,6 +55,32 @@ would rather see the keys than remember them, [The hint panel](#the-hint-panel) 
 | `<prefix> w` | choose a session: `Restore last session` first while the last window's tabs are on offer (the way to take it from the editor, where `s` is nvim's), then the open tabs, then saved ones to resume |
 | `<prefix> i` | this session's details |
 
+**Projects.** `<prefix> O` (also `:Eitri project.choose`, a click on the project's name in the top bar, or `p` on an empty
+chat tab) lays a list over the window: your other projects, the one you used last first, with a line to filter it or to
+type a path. It works in every window, the chat and page windows of [compositor windows](compositor-windows.md) included,
+and it changes nothing in the window: `Esc` closes it and the keys go back to where they were.
+
+| keys | what they do |
+|---|---|
+| typing | filters by name and path, ignoring case; text that starts with `/`, `~`, `./` or `../` is read as a path instead |
+| `Down`, `Ctrl+n`, `Ctrl+j` / `Up`, `Ctrl+p`, `Ctrl+k` | move down / up the list (it does not wrap) |
+| `Enter` | go to the selected row |
+| `Tab` | complete a typed path as far as the folders agree |
+| `Ctrl+o` | `Choose a folder…`, the system's folder dialog |
+| `Esc` | close the list; nothing happened |
+
+A row shows the folder's name, its path (`~` for your home folder) and, on the right, `open` when a window already holds
+the project, `gone` when the folder is no longer there, and otherwise how long ago you last used the project (`5 m`, `2 h`,
+`3 d`, `4 w`). The window's own project is left out, so `<prefix> O` then `Enter` goes to the project you used before
+this one, as `<prefix> L` goes to the workspace you were on before. Your home folder and `/` come after every other
+project, and a project whose folder is gone comes last (at most 30 projects and 5 gone ones are listed). `Enter` on a
+project that has a window brings that window forward, across workspaces where your window manager allows it; on any other
+project it opens a new window. A typed path opens a folder, or a file the way `eitri FILE` does; a name that does not
+exist shows `no such folder: <path>` and nothing is created, and a `gone` row shows `<path> is not there` and stays.
+Eitri builds the list from its own records of your projects (the layout and tabs it saves, and a note each window keeps
+of its project and when you last used it) and reads nothing else on your disk; a project you opened and left alone is in
+it. The list is never sent to the agent panel, an agent or Neovim, and there is no key to remove a row. While it is open
+a running turn goes on, but its permission cards wait for the list to close: `Enter` in the list cannot answer one.
 **Modules.** The window is made of modules: the editor, the agent panel and the bottom terminal.
 
 | keys | what they do |

@@ -58,6 +58,7 @@ account when one is configured, and a short menu:
 | `s` | restore the tabs the last window on this project had open (shown only when there are some) |
 | `r` | resume the most recent saved conversation (shown only when there is one) |
 | `w` | choose among every saved session |
+| `p` | open another project (the list of your other projects; [Keys](keys.md#the-prefix)) |
 | `Shift+Tab` | cycle the mode (Manual, Auto, Bypass) before you start (the mode is shown at the bottom of the panel) |
 | `?` | list all the keys |
 
@@ -66,6 +67,19 @@ account when one is configured, and a short menu:
 Two options are worth knowing. `eitri --version` prints the version and exits. `eitri --clean` starts the
 editor's Neovim with `nvim --clean`, that is without your configuration and plugins, which is the quickest way
 to tell whether a problem comes from your own setup.
+
+**Another project.** Press `<prefix> O` in any window (or `p` on an empty tab, or click the project's name in the top bar) to
+see the projects you opened before, newest first, and go to one: a project that already has a window comes forward, any
+other opens in a new window. You can filter the list or type a path (`~/src/app`; `Tab` completes it). The keys are in
+[Keys](keys.md#the-prefix).
+
+**From the desktop icon.** Starting Eitri from the desktop with no file or folder does not open your home folder. It shows
+the same list in a small window of its own before anything starts: no Neovim, no question about trusting a folder.
+Choosing a project opens its window and the small one goes; `Esc` closes it and leaves nothing running. The first time
+there is nothing in the list, so the window offers `Choose a folder…` and `Home folder`, and the first-start screen then
+opens in the window you chose. [`window.desktop_start`](configuration.md#settings) changes this: `"last"` opens the project
+you used most recently without showing the list, and `"cwd"` brings back the old behaviour, the directory the launcher ran
+in. Running `eitri` in a terminal is unchanged.
 
 ## Open a file
 
