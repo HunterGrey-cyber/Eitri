@@ -458,6 +458,14 @@ impl FakeHost {
                     rows,
                 }));
             }
+            HostOp::Project(ProjectOp::Read { win, serial, dir, .. }) => {
+                self.post(HostEvent::Project(ProjectEvent::Listing {
+                    win: *win,
+                    serial: *serial,
+                    dir: dir.clone(),
+                    listing: crate::project_chooser::Listing::Stuck,
+                }));
+            }
             HostOp::Project(ProjectOp::Path { win, serial, .. }) => {
                 self.post(HostEvent::Project(ProjectEvent::PathAnswer {
                     win: *win,
@@ -465,7 +473,7 @@ impl FakeHost {
                     answer: crate::project_chooser::PathAnswer::Stuck,
                 }));
             }
-            HostOp::Project(ProjectOp::FolderDialog { win }) => {
+            HostOp::Project(ProjectOp::FolderDialog { win, .. }) => {
                 self.post(HostEvent::Project(ProjectEvent::Folder { win: *win, path: None }));
             }
             HostOp::Project(ProjectOp::Open { .. }) => {}

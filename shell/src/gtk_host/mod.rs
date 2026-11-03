@@ -1116,7 +1116,8 @@ impl GtkHost {
         let win = match call {
             ProjectOp::List { win, .. }
             | ProjectOp::Path { win, .. }
-            | ProjectOp::FolderDialog { win }
+            | ProjectOp::Read { win, .. }
+            | ProjectOp::FolderDialog { win, .. }
             | ProjectOp::Open { win, .. } => *win,
         };
         if self.window(win).is_none() {

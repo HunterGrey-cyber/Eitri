@@ -25,6 +25,19 @@ pub fn display_text(s: &str) -> String {
     out
 }
 
+/// Escape invisible characters in a name without cutting it. Layout may ellipsize the label independently.
+pub fn display_name(s: &str) -> String {
+    let mut out = String::new();
+    for c in s.chars() {
+        if is_hidden(c) {
+            out.extend(c.escape_unicode());
+        } else {
+            out.push(c);
+        }
+    }
+    out
+}
+
 /// Whether `c` changes what a line looks like without looking like anything itself: the set the panel's
 /// `revealHidden` escapes (control and format characters, line and paragraph separators, every space but the plain
 /// one, and the characters that render blank), with newline and tab included, since a label is one line.
@@ -79,6 +92,13 @@ pub(crate) fn is_hidden(c: char) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn display_name_escapes_format_and_control_characters_and_does_not_cut() {
+        assert_eq!(display_name("a\u{202e}\u{200b}\nb"), "a\\u{202e}\\u{200b}\\u{a}b");
+        assert_eq!(display_name(&"名".repeat(200)), "名".repeat(200));
+        assert_eq!(display_name("plain <b> name"), "plain <b> name");
+    }
 
     #[test]
     fn a_bidi_override_is_shown_as_an_escape() {

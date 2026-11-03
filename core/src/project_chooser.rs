@@ -1,10 +1,15 @@
 //! A chooser's state and requests. The host supplies facts and performs every effect.
 
+use std::cell::RefCell;
+use std::ffi::OsString;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use std::time::SystemTime;
 
 use crate::onboarding::Lang;
 
+pub mod listing;
+pub use listing::*;
 pub mod path;
 
 #[cfg(test)]
@@ -112,6 +117,9 @@ pub enum LineEv {
     Enter,
     Escape,
     Step(i32),
+    Side(i32),
+    Up,
+    DeleteSegment,
     Tab,
     ChooseFolder,
     KeysLost,
@@ -123,19 +131,68 @@ pub enum LineEv {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Ev {
-    Rows { serial: u64, rows: Vec<Row> },
-    PathAnswer { serial: u64, answer: PathAnswer },
+    Rows {
+        serial: u64,
+        rows: Vec<Row>,
+    },
+    PathAnswer {
+        serial: u64,
+        answer: PathAnswer,
+    },
     Line(LineEv),
-    Pick(usize),
+    Listing {
+        serial: u64,
+        /// The walked folder named by the request, independent of the physical folder in the listing.
+        dir: PathBuf,
+        listing: Listing,
+    },
+    Later {
+        serial: u64,
+        git: Vec<OsString>,
+        links: Vec<(OsString, LinkKind)>,
+    },
+    Slow {
+        serial: u64,
+    },
+    Stuck {
+        serial: u64,
+    },
+    Freed {
+        mount: PathBuf,
+    },
+    Pick {
+        index: usize,
+        rows_rev: u64,
+    },
+    PickTwice {
+        index: usize,
+        rows_rev: u64,
+    },
     Dismiss,
     Folder(Option<PathBuf>),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Effect {
-    List { serial: u64 },
-    Path { serial: u64, text: String, base: PathBuf },
-    FolderDialog,
+    List {
+        serial: u64,
+    },
+    Path {
+        serial: u64,
+        text: String,
+        base: PathBuf,
+    },
+    Read {
+        serial: u64,
+        /// The walked folder; the listing's own path is physical.
+        dir: PathBuf,
+        filter: Option<String>,
+        debounce: bool,
+        near: Option<OsString>,
+    },
+    FolderDialog {
+        at: Option<PathBuf>,
+    },
     SetLine(String),
     Open(PathBuf),
     Close,
@@ -147,6 +204,7 @@ pub struct RowView {
     pub shown: String,
     pub right: String,
     pub dimmed: bool,
+    pub kind: RowKind,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -154,7 +212,10 @@ pub struct ChooserView {
     pub title: String,
     pub line: String,
     pub placeholder: String,
-    pub rows: Vec<RowView>,
+    pub rows: Arc<[RowView]>,
+    pub rows_rev: u64,
+    pub browsing: bool,
+    pub hidden: bool,
     pub selected: Option<usize>,
     pub message: Option<String>,
     pub footer: String,
@@ -179,6 +240,9 @@ pub struct Chooser {
     list_serial: Option<u64>,
     path_serial: Option<u64>,
     rows: Vec<Row>,
+    rows_rev: u64,
+    /// A view borrows the model immutably; only its derived rows are cached through interior mutability.
+    cached_rows: RefCell<Option<(u64, Arc<[RowView]>)>>,
     line: String,
     answer: Option<PathAnswer>,
     selected: Option<usize>,
@@ -204,6 +268,8 @@ impl Chooser {
             list_serial: None,
             path_serial: None,
             rows: Vec::new(),
+            rows_rev: u64::from(generation) << 32,
+            cached_rows: RefCell::new(None),
             line: String::new(),
             answer: None,
             selected: Some(0),
@@ -222,7 +288,12 @@ impl Chooser {
         (u64::from(self.generation) << 32) | u64::from(self.counter)
     }
 
+    fn rows_changed(&mut self) {
+        self.rows_rev = self.rows_rev.checked_add(1).expect("chooser rows revision exhausted");
+    }
+
     pub fn shown(&mut self) -> Vec<Effect> {
+        self.rows_changed();
         let serial = self.serial();
         self.list_serial = Some(serial);
         self.held_enter = false;
@@ -249,6 +320,9 @@ impl Chooser {
                     LineEv::Key(_)
                     | LineEv::Other
                     | LineEv::Step(_)
+                    | LineEv::Side(_)
+                    | LineEv::Up
+                    | LineEv::DeleteSegment
                     | LineEv::Enter
                     | LineEv::Escape
                     | LineEv::Tab
@@ -262,6 +336,7 @@ impl Chooser {
         }
         match ev {
             Ev::Rows { serial, rows } if self.list_serial == Some(serial) => {
+                self.rows_changed();
                 self.list_serial = None;
                 self.rows = rows
                     .into_iter()
@@ -276,6 +351,7 @@ impl Chooser {
                 vec![]
             }
             Ev::PathAnswer { serial, answer } if self.path_serial == Some(serial) => {
+                self.rows_changed();
                 self.path_serial = None;
                 self.answer = Some(answer);
                 self.selected = Some(0);
@@ -313,7 +389,7 @@ impl Chooser {
             }
             Ev::Line(LineEv::Tab) => self.complete(),
             Ev::Line(LineEv::ChooseFolder) => self.folder_dialog(),
-            Ev::Pick(index) if index < self.items().len() => {
+            Ev::Pick { index, rows_rev } if rows_rev == self.rows_rev && index < self.items().len() => {
                 self.held_enter = false;
                 self.pending_g = false;
                 self.selected = Some(index);
@@ -378,6 +454,7 @@ impl Chooser {
     }
 
     fn close(&mut self) -> Vec<Effect> {
+        self.rows_changed();
         self.closed = true;
         self.held_enter = false;
         vec![Effect::Close]
@@ -387,6 +464,7 @@ impl Chooser {
         if text == self.line {
             return vec![];
         }
+        self.rows_changed();
         self.line = text;
         self.held_enter = false;
         self.answer = None;
@@ -413,7 +491,7 @@ impl Chooser {
     fn folder_dialog(&mut self) -> Vec<Effect> {
         self.held_enter = false;
         self.dialog = true;
-        vec![Effect::FolderDialog]
+        vec![Effect::FolderDialog { at: None }]
     }
 
     fn activate(&mut self) -> Vec<Effect> {
@@ -519,34 +597,42 @@ impl Chooser {
 
     pub fn view(&self) -> ChooserView {
         let text = text::text(self.lang);
-        let rows: Vec<_> = self
-            .items()
-            .into_iter()
-            .map(|item| match item {
-                Item::Project(row) => RowView {
-                    name: clean(&row.name),
-                    shown: clean(&row.shown),
-                    right: match row.fact {
-                        Fact::Open => text.open.into(),
-                        Fact::Gone => text.gone.into(),
-                        _ => clean(&row.age),
+        let mut cached = self.cached_rows.borrow_mut();
+        if cached.as_ref().is_none_or(|(rev, _)| *rev != self.rows_rev) {
+            let rows: Arc<[RowView]> = self
+                .items()
+                .into_iter()
+                .map(|item| match item {
+                    Item::Project(row) => RowView {
+                        kind: RowKind::Project,
+                        name: clean(&row.name),
+                        shown: clean(&row.shown),
+                        right: match row.fact {
+                            Fact::Open => text.open.into(),
+                            Fact::Gone => text.gone.into(),
+                            _ => clean(&row.age),
+                        },
+                        dimmed: row.fact == Fact::Gone,
                     },
-                    dimmed: row.fact == Fact::Gone,
-                },
-                Item::Folder => RowView {
-                    name: text.folder.into(),
-                    shown: String::new(),
-                    right: String::new(),
-                    dimmed: false,
-                },
-                Item::Home(path) => RowView {
-                    name: text.home.into(),
-                    shown: Row::new(path, self.home.as_deref(), String::new(), Fact::Present).shown,
-                    right: String::new(),
-                    dimmed: false,
-                },
-            })
-            .collect();
+                    Item::Folder => RowView {
+                        kind: RowKind::Action,
+                        name: text.folder.into(),
+                        shown: String::new(),
+                        right: String::new(),
+                        dimmed: false,
+                    },
+                    Item::Home(path) => RowView {
+                        kind: RowKind::Action,
+                        name: text.home.into(),
+                        shown: Row::new(path, self.home.as_deref(), String::new(), Fact::Present).shown,
+                        right: String::new(),
+                        dimmed: false,
+                    },
+                })
+                .collect();
+            *cached = Some((self.rows_rev, rows));
+        }
+        let rows = cached.as_ref().expect("rows cached at the current revision").1.clone();
         ChooserView {
             title: text.title.into(),
             line: self.line.clone(),
@@ -558,6 +644,9 @@ impl Chooser {
             .into(),
             selected: self.selected.filter(|i| *i < rows.len()),
             rows,
+            rows_rev: self.rows_rev,
+            browsing: false,
+            hidden: false,
             message: self.message.clone().or_else(|| {
                 (self.list_serial.is_none() && self.rows.is_empty() && self.line.is_empty()).then(|| text.empty.into())
             }),
@@ -568,12 +657,14 @@ impl Chooser {
     }
 
     pub fn opening(&mut self, name: &str) {
+        self.rows_changed();
         self.opening = true;
         self.held_enter = false;
         self.message = Some(text::opening(self.lang, &clean(name)));
     }
 
     pub fn failed(&mut self, message: String) {
+        self.rows_changed();
         self.opening = false;
         self.held_enter = false;
         self.message = Some(clean(&message));

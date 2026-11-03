@@ -163,6 +163,23 @@ impl EventMatch {
 pub fn project_list_focus_and_close(win: WinId, rows: Vec<crate::project_chooser::Row>) -> Vec<Script> {
     let requests = [
         (
+            "project_read_answers",
+            ProjectOp::Read {
+                win,
+                serial: 7,
+                dir: "/walked".into(),
+                filter: Some("a".into()),
+                debounce: true,
+                near: Some("abc".into()),
+            },
+            Some(ProjectEvent::Listing {
+                win,
+                serial: 7,
+                dir: "/walked".into(),
+                listing: crate::project_chooser::Listing::Stuck,
+            }),
+        ),
+        (
             "project_list_answers_the_request",
             ProjectOp::List { win, serial: 5 },
             Some(ProjectEvent::Rows { win, serial: 5, rows }),
@@ -183,7 +200,7 @@ pub fn project_list_focus_and_close(win: WinId, rows: Vec<crate::project_chooser
         ),
         (
             "project_folder_dialog_answers_its_window",
-            ProjectOp::FolderDialog { win },
+            ProjectOp::FolderDialog { win, at: None },
             Some(ProjectEvent::Folder { win, path: None }),
         ),
         (

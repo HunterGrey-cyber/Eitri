@@ -67,7 +67,15 @@ pub fn event(w: &mut Window, win: WinId, ev: ProjectEvent, batch: &mut Batch) {
         ProjectEvent::Rows { serial, rows, .. } => Ev::Rows { serial, rows },
         ProjectEvent::PathAnswer { serial, answer, .. } => Ev::PathAnswer { serial, answer },
         ProjectEvent::Line { ev, .. } => Ev::Line(ev),
-        ProjectEvent::Pick { index, .. } => Ev::Pick(index),
+        ProjectEvent::Listing {
+            serial, dir, listing, ..
+        } => Ev::Listing { serial, dir, listing },
+        ProjectEvent::Later { serial, git, links, .. } => Ev::Later { serial, git, links },
+        ProjectEvent::Slow { serial, .. } => Ev::Slow { serial },
+        ProjectEvent::Stuck { serial, .. } => Ev::Stuck { serial },
+        ProjectEvent::Freed { mount, .. } => Ev::Freed { mount },
+        ProjectEvent::Pick { index, rows_rev, .. } => Ev::Pick { index, rows_rev },
+        ProjectEvent::PickTwice { index, rows_rev, .. } => Ev::PickTwice { index, rows_rev },
         ProjectEvent::Dismiss { .. } => Ev::Dismiss,
         ProjectEvent::Folder { path, .. } => Ev::Folder(path),
         ProjectEvent::OpenFailed { path, code, gone, .. } => {
@@ -126,7 +134,23 @@ fn carry(w: &mut Window, win: WinId, effects: Vec<Effect>, batch: &mut Batch) {
                     base,
                 }));
             }
-            Effect::FolderDialog => batch.push_effect(HostOp::Project(ProjectOp::FolderDialog { win })),
+            Effect::Read {
+                serial,
+                dir,
+                filter,
+                debounce,
+                near,
+            } => {
+                batch.push_effect(HostOp::Project(ProjectOp::Read {
+                    win,
+                    serial,
+                    dir,
+                    filter,
+                    debounce,
+                    near,
+                }));
+            }
+            Effect::FolderDialog { at } => batch.push_effect(HostOp::Project(ProjectOp::FolderDialog { win, at })),
             // Completion already changed the model's line; the chrome carries it to the entry.
             Effect::SetLine(_) => {}
             Effect::Open(target) => open(w, win, target, batch),
@@ -319,7 +343,7 @@ mod tests {
         let batch = line(&mut r, LineEv::ChooseFolder);
         assert!(batch
             .ops()
-            .any(|op| matches!(op, HostOp::Project(ProjectOp::FolderDialog { win: WIN }))));
+            .any(|op| matches!(op, HostOp::Project(ProjectOp::FolderDialog { win: WIN, at: None }))));
         r.controller.handle(HostEvent::Active {
             win: WIN,
             active: false,
@@ -438,7 +462,7 @@ mod tests {
                 rows: vec![row("/work/current"), row("/work/beta"), row("/work/gamma")],
             },
         );
-        let names: Vec<_> = view(&r).rows.into_iter().map(|row| row.name).collect();
+        let names: Vec<_> = view(&r).rows.iter().map(|row| row.name.clone()).collect();
         assert_eq!(names[..2], ["beta", "gamma"]);
         let lines: Vec<_> = r
             .controller
@@ -537,7 +561,15 @@ mod tests {
                 rows: vec![row(target)],
             },
         );
-        let batch = post(&mut r, ProjectEvent::Pick { win: WIN, index: 0 });
+        let rows_rev = view(&r).rows_rev;
+        let batch = post(
+            &mut r,
+            ProjectEvent::Pick {
+                win: WIN,
+                index: 0,
+                rows_rev,
+            },
+        );
         assert!(r.controller.chrome(WIN).project_chooser.is_none());
         let ops = batch.ops().collect::<Vec<_>>();
         let focus = ops
@@ -727,7 +759,11 @@ mod tests {
                 win: WIN,
                 ev: LineEv::Changed("/private/project".into()),
             },
-            ProjectEvent::Pick { win: WIN, index: 0 },
+            ProjectEvent::Pick {
+                win: WIN,
+                index: 0,
+                rows_rev: 0,
+            },
             ProjectEvent::Dismiss { win: WIN },
             ProjectEvent::Folder {
                 win: WIN,
@@ -747,5 +783,114 @@ mod tests {
         }
         assert_eq!(controller.start_notes().len(), 7);
         assert!(controller.start_notes().iter().all(|note| !note.contains("/private")));
+    }
+
+    use crate::project_chooser::{LinkKind, Listing};
+
+    #[test]
+    fn a_read_effect_becomes_a_read_op_with_debounce_and_near() {
+        let mut r = rig();
+        show(&mut r);
+        let mut batch = Batch::default();
+        carry(
+            r.controller.window_mut(WIN).unwrap(),
+            WIN,
+            vec![Effect::Read {
+                serial: 19,
+                dir: "/walked".into(),
+                filter: Some("ab".into()),
+                debounce: true,
+                near: Some("abc".into()),
+            }],
+            &mut batch,
+        );
+        assert!(batch.ops().any(|op| *op
+            == HostOp::Project(ProjectOp::Read {
+                win: WIN,
+                serial: 19,
+                dir: "/walked".into(),
+                filter: Some("ab".into()),
+                debounce: true,
+                near: Some("abc".into()),
+            })));
+    }
+
+    #[test]
+    fn listing_later_slow_stuck_and_freed_reach_the_model() {
+        let mut r = rig();
+        show(&mut r);
+        let before = view(&r);
+        for ev in [
+            ProjectEvent::Listing {
+                win: WIN,
+                serial: 19,
+                dir: "/walked".into(),
+                listing: Listing::Stuck,
+            },
+            ProjectEvent::Later {
+                win: WIN,
+                serial: 19,
+                git: vec!["abc".into()],
+                links: vec![("link".into(), LinkKind::Dir)],
+            },
+            ProjectEvent::Slow { win: WIN, serial: 19 },
+            ProjectEvent::Stuck { win: WIN, serial: 19 },
+            ProjectEvent::Freed {
+                win: WIN,
+                mount: "/physical".into(),
+            },
+        ] {
+            assert_eq!(ev.win(), WIN);
+            let batch = post(&mut r, ev);
+            assert!(!batch.ops().any(|op| matches!(op, HostOp::Project(_))));
+            assert_eq!(view(&r), before);
+        }
+    }
+
+    #[test]
+    fn pick_and_pick_twice_carry_rows_rev_to_the_model() {
+        let mut r = rig();
+        let (serial, _) = show(&mut r);
+        let old = view(&r).rows_rev;
+        post(
+            &mut r,
+            ProjectEvent::Rows {
+                win: WIN,
+                serial,
+                rows: vec![row("/app")],
+            },
+        );
+        let current = view(&r).rows_rev;
+        for ev in [
+            ProjectEvent::Pick {
+                win: WIN,
+                index: 0,
+                rows_rev: old,
+            },
+            ProjectEvent::PickTwice {
+                win: WIN,
+                index: 0,
+                rows_rev: old,
+            },
+            ProjectEvent::PickTwice {
+                win: WIN,
+                index: 0,
+                rows_rev: current,
+            },
+        ] {
+            post(&mut r, ev);
+            assert!(r.controller.chrome(WIN).project_chooser.is_some());
+        }
+        let batch = post(
+            &mut r,
+            ProjectEvent::Pick {
+                win: WIN,
+                index: 0,
+                rows_rev: current,
+            },
+        );
+        assert!(batch.ops().any(
+            |op| matches!(op, HostOp::Project(ProjectOp::Open { target, .. }) if target == std::path::Path::new("/app"))
+        ));
     }
 }

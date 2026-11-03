@@ -507,6 +507,60 @@ mod tests {
     use std::rc::Rc;
 
     #[test]
+    fn project_read_answers_are_routed_before_a_layout_exists() {
+        use crate::project_chooser::{LinkKind, Listing};
+        let win = WinId::MAIN;
+        let mut controller = Controller::new(FakeScheduler::new());
+        controller.declare_window(win, spec(EditorPresence::Owned));
+        let events = [
+            ProjectEvent::Listing {
+                win,
+                serial: 8,
+                dir: "/walked".into(),
+                listing: Listing::Read {
+                    dir: "/physical".into(),
+                    entries: vec![],
+                    capped: None,
+                    exact: None,
+                },
+            },
+            ProjectEvent::Later {
+                win,
+                serial: 8,
+                git: vec!["folder".into()],
+                links: vec![("link".into(), LinkKind::Dir)],
+            },
+            ProjectEvent::Slow { win, serial: 8 },
+            ProjectEvent::Stuck { win, serial: 8 },
+            ProjectEvent::Freed {
+                win,
+                mount: "/physical".into(),
+            },
+            ProjectEvent::Pick {
+                win,
+                index: 0,
+                rows_rev: 12,
+            },
+            ProjectEvent::PickTwice {
+                win,
+                index: 0,
+                rows_rev: 12,
+            },
+        ];
+        let count = events.len();
+        for event in events {
+            let event = HostEvent::Project(event);
+            assert_eq!(event_window(&event), Some(win));
+            assert!(controller.handle(event).is_empty());
+        }
+        assert_eq!(controller.start_notes().len(), count);
+        assert!(controller
+            .start_notes()
+            .iter()
+            .all(|note| !note.contains("/walked") && !note.contains("/physical")));
+    }
+
+    #[test]
     fn a_hub_set_at_the_layout_step_reaches_the_window() {
         for tiling in [Tiling::Eitri, Tiling::Hub, Tiling::ModuleWindow] {
             let mut controller = Controller::new(FakeScheduler::new());

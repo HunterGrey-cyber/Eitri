@@ -145,12 +145,18 @@ impl gtk_host::ProjectHost for StubProjects {
                 serial: *serial,
                 rows: Vec::new(),
             }),
+            ProjectOp::Read { win, serial, dir, .. } => Some(ProjectEvent::Listing {
+                win: *win,
+                serial: *serial,
+                dir: dir.clone(),
+                listing: eitri_core::project_chooser::Listing::Stuck,
+            }),
             ProjectOp::Path { win, serial, .. } => Some(ProjectEvent::PathAnswer {
                 win: *win,
                 serial: *serial,
                 answer: eitri_core::project_chooser::PathAnswer::Stuck,
             }),
-            ProjectOp::FolderDialog { win } => Some(ProjectEvent::Folder { win: *win, path: None }),
+            ProjectOp::FolderDialog { win, .. } => Some(ProjectEvent::Folder { win: *win, path: None }),
             ProjectOp::Open { .. } => None,
         };
         if let (Some(sink), Some(answer)) = (self.sink.upgrade(), answer) {

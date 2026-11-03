@@ -2815,7 +2815,8 @@ fn build_ui(
             let win = eitri_core::wm::WinId::MAIN;
             let event = match report {
                 ChooserReport::Line(ev) => ProjectEvent::Line { win, ev },
-                ChooserReport::Pick(index) => ProjectEvent::Pick { win, index },
+                ChooserReport::Pick { index, rows_rev } => ProjectEvent::Pick { win, index, rows_rev },
+                ChooserReport::PickTwice { index, rows_rev } => ProjectEvent::PickTwice { win, index, rows_rev },
                 ChooserReport::Dismiss => ProjectEvent::Dismiss { win },
                 ChooserReport::Folder(path) => ProjectEvent::Folder { win, path },
             };

@@ -11,7 +11,7 @@ use crate::keymap::{
 use crate::layout::{kill::Reopen, Arrangement, Direction, Frame, ModuleId, Size};
 use crate::onboarding::screen::{CheckWhy, MarkerEvent};
 use crate::onboarding::{Found, Generated, Opening, WriteOutcome};
-use crate::project_chooser::{LineEv, PathAnswer, Row};
+use crate::project_chooser::{LineEv, LinkKind, Listing, PathAnswer, Row};
 use crate::tabs::{TabId, ViewId};
 use crate::window_link::moves::MoveId;
 use crate::window_link::names::WindowName;
@@ -19,6 +19,7 @@ use crate::window_link::{FocusTarget, HubAsk, Msg, Shape, Summary};
 use std::any::Any;
 use std::cell::RefCell;
 use std::collections::BTreeSet;
+use std::ffi::OsString;
 use std::fmt;
 use std::io;
 use std::os::fd::{OwnedFd, RawFd};
@@ -1319,8 +1320,18 @@ pub enum ProjectOp {
         text: String,
         base: PathBuf,
     },
+    Read {
+        win: WinId,
+        serial: u64,
+        /// Walked folder, preserved in the reply envelope.
+        dir: PathBuf,
+        filter: Option<String>,
+        debounce: bool,
+        near: Option<OsString>,
+    },
     FolderDialog {
         win: WinId,
+        at: Option<PathBuf>,
     },
     Open {
         win: WinId,
@@ -1331,6 +1342,31 @@ pub enum ProjectOp {
 /// Project input and facts. Request serials distinguish replies from an earlier opening or line.
 #[derive(Debug, Clone, PartialEq)]
 pub enum ProjectEvent {
+    Listing {
+        win: WinId,
+        serial: u64,
+        /// Walked folder; the listing may name a different physical folder.
+        dir: PathBuf,
+        listing: Listing,
+    },
+    Later {
+        win: WinId,
+        serial: u64,
+        git: Vec<OsString>,
+        links: Vec<(OsString, LinkKind)>,
+    },
+    Slow {
+        win: WinId,
+        serial: u64,
+    },
+    Stuck {
+        win: WinId,
+        serial: u64,
+    },
+    Freed {
+        win: WinId,
+        mount: PathBuf,
+    },
     Rows {
         win: WinId,
         serial: u64,
@@ -1348,6 +1384,12 @@ pub enum ProjectEvent {
     Pick {
         win: WinId,
         index: usize,
+        rows_rev: u64,
+    },
+    PickTwice {
+        win: WinId,
+        index: usize,
+        rows_rev: u64,
     },
     Dismiss {
         win: WinId,
@@ -1369,7 +1411,13 @@ pub enum ProjectEvent {
 impl ProjectEvent {
     pub fn win(&self) -> WinId {
         match self {
-            Self::Rows { win, .. }
+            Self::Listing { win, .. }
+            | Self::Later { win, .. }
+            | Self::Slow { win, .. }
+            | Self::Stuck { win, .. }
+            | Self::Freed { win, .. }
+            | Self::PickTwice { win, .. }
+            | Self::Rows { win, .. }
             | Self::PathAnswer { win, .. }
             | Self::Line { win, .. }
             | Self::Pick { win, .. }

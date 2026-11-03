@@ -9,7 +9,7 @@ use std::sync::{mpsc, Arc};
 use std::time::{Duration, Instant};
 
 use eitri_core::project_chooser::path::{ANSWER_WITHIN, DEBOUNCE};
-use eitri_core::project_chooser::{PathAnswer, Row};
+use eitri_core::project_chooser::{Listing, PathAnswer, Row};
 use eitri_core::recent_projects::Sources;
 use eitri_core::wm::{Applied, ChooserEnv, HostEvent, HostSink, ProjectEvent, ProjectOp, WinId};
 use gtk4::glib;
@@ -30,6 +30,11 @@ pub(crate) enum WorkerAnswer {
     Path {
         serial: u64,
         answer: PathAnswer,
+    },
+    Listing {
+        serial: u64,
+        dir: PathBuf,
+        listing: Listing,
     },
     Folder(Option<PathBuf>),
     /// A start's watch has ended; `failed` holds what the window has to say about it.
@@ -224,9 +229,13 @@ impl ProjectWorkers {
         Workers::arm(&self.inner);
     }
 
-    pub(crate) fn folder_dialog(&self, parent: &gtk4::Window) {
+    pub(crate) fn folder_dialog(&self, parent: &gtk4::Window, at: Option<&Path>) {
         let answer = self.inner.answer.clone();
-        gtk4::FileDialog::new().select_folder(Some(parent), None::<&gtk4::gio::Cancellable>, move |result| {
+        let dialog = gtk4::FileDialog::new();
+        if let Some(at) = at {
+            dialog.set_initial_folder(Some(&gtk4::gio::File::for_path(at)));
+        }
+        dialog.select_folder(Some(parent), None::<&gtk4::gio::Cancellable>, move |result| {
             answer(WorkerAnswer::Folder(result.ok().and_then(|file| file.path())));
         });
     }
@@ -315,6 +324,12 @@ fn project_event(win: WinId, answer: WorkerAnswer) -> Option<ProjectEvent> {
     Some(match answer {
         WorkerAnswer::Rows { serial, rows } => ProjectEvent::Rows { win, serial, rows },
         WorkerAnswer::Path { serial, answer } => ProjectEvent::PathAnswer { win, serial, answer },
+        WorkerAnswer::Listing { serial, dir, listing } => ProjectEvent::Listing {
+            win,
+            serial,
+            dir,
+            listing,
+        },
         WorkerAnswer::Folder(path) => ProjectEvent::Folder { win, path },
         WorkerAnswer::Started { failed } => {
             let StartFailed { path, code, gone } = failed?;
@@ -375,11 +390,18 @@ impl crate::gtk_host::ProjectHost for WindowProjects {
                 text,
                 base,
             } if *win == self.win => self.workers.path(*serial, text.clone(), base.clone()),
-            ProjectOp::FolderDialog { win } if *win == self.win => {
+            ProjectOp::Read { win, serial, dir, .. } if *win == self.win => {
+                (self.workers.inner.answer)(WorkerAnswer::Listing {
+                    serial: *serial,
+                    dir: dir.clone(),
+                    listing: Listing::Stuck,
+                });
+            }
+            ProjectOp::FolderDialog { win, at } if *win == self.win => {
                 let Some(window) = self.window.upgrade() else {
                     return Applied::Refused;
                 };
-                self.workers.folder_dialog(&window);
+                self.workers.folder_dialog(&window, at.as_deref());
             }
             _ => return Applied::Refused,
         }
@@ -413,6 +435,17 @@ impl crate::gtk_host::ProjectHost for WindowProjects {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn folder_dialog_starts_at_the_given_folder() {
+        use eitri_core::source_scan::{code_only, functions, read_required};
+        let source = code_only(&read_required("shell/src/project_host.rs").text);
+        let bodies = functions(&source, "folder_dialog");
+        assert_eq!(bodies.len(), 1);
+        let compact: String = bodies[0].chars().filter(|c| !c.is_whitespace()).collect();
+        assert!(compact.contains("ifletSome(at)=at"));
+        assert!(compact.contains("dialog.set_initial_folder(Some(&gtk4::gio::File::for_path(at)))"));
+    }
 
     #[test]
     fn a_path_op_always_answers() {

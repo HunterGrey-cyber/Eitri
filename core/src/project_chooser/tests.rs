@@ -360,7 +360,10 @@ fn the_folder_row_is_last_but_for_a_launch_first_run_and_choose_folder_asks_the_
         let mut c = chooser(mode);
         list(&mut c, rows);
         assert_eq!(c.view().rows[at].name, "Choose a folder…");
-        assert_eq!(c.event(Ev::Line(LineEv::ChooseFolder)), vec![Effect::FolderDialog]);
+        assert_eq!(
+            c.event(Ev::Line(LineEv::ChooseFolder)),
+            vec![Effect::FolderDialog { at: None }]
+        );
     }
 }
 #[test]
@@ -512,7 +515,10 @@ fn a_list_that_lands_during_a_start_is_there_when_the_start_fails() {
         panic!("expected a list request")
     };
     assert_eq!(
-        c.event(Ev::Pick(1)),
+        c.event(Ev::Pick {
+            index: 1,
+            rows_rev: c.view().rows_rev
+        }),
         vec![Effect::Open("/home/me".into())],
         "the home row"
     );
@@ -540,7 +546,10 @@ fn a_path_answer_that_lands_during_a_start_is_there_when_the_start_fails() {
     let Effect::Path { serial, .. } = effects[0] else {
         panic!("expected a path request")
     };
-    assert_eq!(c.event(Ev::Line(LineEv::ChooseFolder)), vec![Effect::FolderDialog]);
+    assert_eq!(
+        c.event(Ev::Line(LineEv::ChooseFolder)),
+        vec![Effect::FolderDialog { at: None }]
+    );
     assert_eq!(
         c.event(Ev::Folder(Some("/picked".into()))),
         vec![Effect::Open("/picked".into())]
@@ -642,7 +651,13 @@ fn folder_clicks_work_while_a_path_answer_is_pending_or_missing() {
             c.event(Ev::PathAnswer { serial, answer });
         }
         let index = c.view().rows.len() - 1;
-        assert_eq!(c.event(Ev::Pick(index)), vec![Effect::FolderDialog]);
+        assert_eq!(
+            c.event(Ev::Pick {
+                index,
+                rows_rev: c.view().rows_rev
+            }),
+            vec![Effect::FolderDialog { at: None }]
+        );
     }
 }
 #[test]
@@ -848,10 +863,21 @@ fn another_key_does_nothing_and_ends_a_waiting_g() {
 fn a_click_ends_a_waiting_g() {
     let mut c = three();
     key(&mut c, 'g');
-    assert!(c.event(Ev::Pick(2)).len() == 1, "the click opens its row");
+    assert!(
+        c.event(Ev::Pick {
+            index: 2,
+            rows_rev: c.view().rows_rev
+        })
+        .len()
+            == 1,
+        "the click opens its row"
+    );
     let mut c = three();
     key(&mut c, 'g');
-    c.event(Ev::Pick(99));
+    c.event(Ev::Pick {
+        index: 99,
+        rows_rev: c.view().rows_rev,
+    });
     key(&mut c, 'j');
     assert_eq!(
         c.view().selected,
@@ -882,7 +908,7 @@ fn enter_in_the_list_opens_the_selected_row() {
     assert_eq!(enter(&mut c), vec![Effect::Open("/b".into())]);
     let mut c = three();
     key(&mut c, 'G');
-    assert_eq!(enter(&mut c), vec![Effect::FolderDialog]);
+    assert_eq!(enter(&mut c), vec![Effect::FolderDialog { at: None }]);
 }
 
 #[test]
@@ -1016,14 +1042,20 @@ fn other_plain_keys_in_the_list_do_nothing() {
 fn tab_does_nothing_in_the_list_and_ctrl_o_asks_the_dialog_in_both_states() {
     let mut c = three();
     assert!(c.event(Ev::Line(LineEv::Tab)).is_empty());
-    assert_eq!(c.event(Ev::Line(LineEv::ChooseFolder)), vec![Effect::FolderDialog]);
+    assert_eq!(
+        c.event(Ev::Line(LineEv::ChooseFolder)),
+        vec![Effect::FolderDialog { at: None }]
+    );
     // A cancelled dialog leaves the state where it was.
     assert!(c.event(Ev::Folder(None)).is_empty());
     assert!(!c.view().in_line);
     key(&mut c, 'j');
     assert_eq!(c.view().selected, Some(1));
     key(&mut c, '/');
-    assert_eq!(c.event(Ev::Line(LineEv::ChooseFolder)), vec![Effect::FolderDialog]);
+    assert_eq!(
+        c.event(Ev::Line(LineEv::ChooseFolder)),
+        vec![Effect::FolderDialog { at: None }]
+    );
     assert!(c.event(Ev::Folder(None)).is_empty());
     assert!(c.view().in_line);
     let mut c = three();
@@ -1111,7 +1143,7 @@ fn a_launch_first_run_works_with_the_same_keys() {
     assert_eq!(c.view().rows[1].name, "Home folder");
     assert_eq!(c.view().selected, Some(1));
     key(&mut c, 'k');
-    assert_eq!(enter(&mut c), vec![Effect::FolderDialog]);
+    assert_eq!(enter(&mut c), vec![Effect::FolderDialog { at: None }]);
     assert!(c.event(Ev::Folder(None)).is_empty());
     key(&mut c, '/');
     line(&mut c, "zzz");
@@ -1134,4 +1166,111 @@ fn list_keys_are_ignored_while_a_start_is_under_way() {
     }
     assert!(c.view().opening);
     assert!(!c.view().in_line);
+}
+
+#[test]
+fn rows_rev_moves_when_rows_arrive_and_not_on_a_step() {
+    let mut c = window();
+    let effects = c.shown();
+    let Effect::List { serial } = effects[0] else {
+        panic!("expected a list request")
+    };
+    let before = c.view().rows_rev;
+    c.event(Ev::Rows {
+        serial,
+        rows: vec![row("/a", Fact::Present), row("/b", Fact::Present)],
+    });
+    let arrived = c.view().rows_rev;
+    assert!(arrived > before);
+    c.event(Ev::Line(LineEv::Step(1)));
+    assert_eq!(c.view().rows_rev, arrived);
+    line(&mut c, "a");
+    assert!(c.view().rows_rev > arrived);
+}
+
+#[test]
+fn the_rows_arc_is_reused_after_a_step() {
+    let mut c = window();
+    list(&mut c, vec![row("/a", Fact::Present), row("/b", Fact::Present)]);
+    let first = c.view().rows;
+    for key in ['j', 'G'] {
+        c.event(Ev::Line(LineEv::Key(key)));
+        assert!(std::sync::Arc::ptr_eq(&first, &c.view().rows));
+    }
+}
+
+#[test]
+fn a_pick_with_an_old_rows_rev_is_dropped() {
+    let mut c = window();
+    let effects = c.shown();
+    let Effect::List { serial } = effects[0] else {
+        panic!("expected a list request")
+    };
+    let old = c.view().rows_rev;
+    c.event(Ev::Rows {
+        serial,
+        rows: vec![row("/a", Fact::Present)],
+    });
+    let before = c.view();
+    assert_ne!(old, before.rows_rev);
+    assert!(c
+        .event(Ev::Pick {
+            index: 0,
+            rows_rev: old
+        })
+        .is_empty());
+    assert_eq!(c.view(), before);
+    assert_eq!(
+        c.event(Ev::Pick {
+            index: 0,
+            rows_rev: before.rows_rev
+        }),
+        vec![Effect::Open("/a".into())]
+    );
+}
+
+#[test]
+fn rows_rev_changes_for_path_answers_and_opening_state() {
+    let mut c = window();
+    list(&mut c, vec![row("/a", Fact::Present)]);
+    let before = c.view();
+    let effects = line(&mut c, "./app");
+    let [Effect::Path { serial, .. }] = effects[..] else {
+        panic!("a path asks for its answer");
+    };
+    let waiting = c.view();
+    assert!(waiting.rows_rev > before.rows_rev);
+    assert!(!std::sync::Arc::ptr_eq(&before.rows, &waiting.rows));
+    c.event(Ev::PathAnswer {
+        serial: serial + 1,
+        answer: PathAnswer::Missing,
+    });
+    assert_eq!(c.view().rows_rev, waiting.rows_rev);
+    c.event(Ev::PathAnswer {
+        serial,
+        answer: found(Some(PathKind::Dir), &[], ""),
+    });
+    let answered = c.view();
+    assert!(answered.rows_rev > waiting.rows_rev);
+    c.opening("app");
+    let opening = c.view();
+    assert!(opening.rows_rev > answered.rows_rev);
+    c.failed("could not start".into());
+    assert!(c.view().rows_rev > opening.rows_rev);
+}
+
+#[test]
+fn a_pick_from_a_previous_opening_is_stale() {
+    let mut old = Chooser::new(Mode::Launch, None, Lang::En, 1);
+    let mut current = Chooser::new(Mode::Launch, None, Lang::En, 2);
+    list(&mut old, vec![row("/a", Fact::Present)]);
+    list(&mut current, vec![row("/b", Fact::Present)]);
+    let before = current.view();
+    assert!(current
+        .event(Ev::Pick {
+            index: 0,
+            rows_rev: old.view().rows_rev
+        })
+        .is_empty());
+    assert_eq!(current.view(), before);
 }

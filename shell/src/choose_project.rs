@@ -248,7 +248,8 @@ fn view_event(report: ChooserReport) -> Option<Ev> {
     match report {
         ChooserReport::Line(LineEv::KeysLost) | ChooserReport::Dismiss => None,
         ChooserReport::Line(ev) => Some(Ev::Line(ev)),
-        ChooserReport::Pick(index) => Some(Ev::Pick(index)),
+        ChooserReport::Pick { index, rows_rev } => Some(Ev::Pick { index, rows_rev }),
+        ChooserReport::PickTwice { index, rows_rev } => Some(Ev::PickTwice { index, rows_rev }),
         ChooserReport::Folder(path) => Some(Ev::Folder(path)),
     }
 }
@@ -258,6 +259,7 @@ fn worker_event(answer: WorkerAnswer) -> Option<Ev> {
     match answer {
         WorkerAnswer::Rows { serial, rows } => Some(Ev::Rows { serial, rows }),
         WorkerAnswer::Path { serial, answer } => Some(Ev::PathAnswer { serial, answer }),
+        WorkerAnswer::Listing { serial, dir, listing } => Some(Ev::Listing { serial, dir, listing }),
         WorkerAnswer::Folder(path) => Some(Ev::Folder(path)),
         WorkerAnswer::Started { .. } => None,
     }
@@ -416,7 +418,12 @@ impl LaunchWindow {
             match effect {
                 Effect::List { serial } => self.workers.list(serial),
                 Effect::Path { serial, text, base } => self.workers.path(serial, text, base),
-                Effect::FolderDialog => self.workers.folder_dialog(self.window.upcast_ref()),
+                Effect::Read { serial, dir, .. } => self.feed(Ev::Listing {
+                    serial,
+                    dir,
+                    listing: eitri_core::project_chooser::Listing::Stuck,
+                }),
+                Effect::FolderDialog { at } => self.workers.folder_dialog(self.window.upcast_ref(), at.as_deref()),
                 // Completion already changed the model's line; drawing it carries it to the entry.
                 Effect::SetLine(_) => {}
                 Effect::Open(target) => self.start(target),
@@ -800,6 +807,18 @@ mod tests {
     }
 
     #[test]
+    fn view_event_maps_both_pick_reports() {
+        assert_eq!(
+            view_event(ChooserReport::Pick { index: 2, rows_rev: 31 }),
+            Some(Ev::Pick { index: 2, rows_rev: 31 })
+        );
+        assert_eq!(
+            view_event(ChooserReport::PickTwice { index: 3, rows_rev: 29 }),
+            Some(Ev::PickTwice { index: 3, rows_rev: 29 })
+        );
+    }
+
+    #[test]
     fn a_click_beside_the_panel_and_a_focus_change_end_nothing() {
         assert_eq!(view_event(ChooserReport::Dismiss), None);
         assert_eq!(view_event(ChooserReport::Line(LineEv::KeysLost)), None);
@@ -808,7 +827,10 @@ mod tests {
             Some(Ev::Line(LineEv::Escape)),
             "Esc is the way out"
         );
-        assert_eq!(view_event(ChooserReport::Pick(2)), Some(Ev::Pick(2)));
+        assert_eq!(
+            view_event(ChooserReport::Pick { index: 2, rows_rev: 7 }),
+            Some(Ev::Pick { index: 2, rows_rev: 7 })
+        );
         assert_eq!(view_event(ChooserReport::Folder(None)), Some(Ev::Folder(None)));
     }
 

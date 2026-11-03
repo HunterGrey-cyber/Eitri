@@ -5,7 +5,7 @@ use std::process::Command;
 use std::rc::Rc;
 use std::time::{Duration, Instant};
 
-use eitri_core::project_chooser::{ChooserView, LineEv, RowView};
+use eitri_core::project_chooser::{ChooserView, LineEv, RowKind, RowView};
 use gtk4::prelude::*;
 
 #[path = "support/own_x_server.rs"]
@@ -35,6 +35,7 @@ fn view() -> ChooserView {
                 shown: "/a/very/long/path".repeat(80),
                 right: "open".into(),
                 dimmed: false,
+                kind: RowKind::Project,
             })
             .collect(),
         selected: Some(0),
@@ -42,6 +43,9 @@ fn view() -> ChooserView {
         footer: "Enter open · ↑↓ move · Tab complete · Esc cancel".into(),
         opening: false,
         in_line: true,
+        browsing: false,
+        hidden: false,
+        rows_rev: 1,
     }
 }
 
@@ -193,7 +197,7 @@ fn a_row_click_reports_a_pick_and_the_line_keeps_the_keys(display: &str) {
         .reports
         .borrow()
         .iter()
-        .any(|r| matches!(r, ChooserReport::Pick(0))));
+        .any(|r| matches!(r, ChooserReport::Pick { index: 0, .. })));
     assert!(stage.entry_has_keys());
     xdo(display, &["key", "--clearmodifiers", "ctrl+n"]);
     pump();

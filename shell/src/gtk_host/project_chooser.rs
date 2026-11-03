@@ -21,7 +21,8 @@ const LIST_KEYS_CLASS: &str = "list-keys";
 
 pub(crate) enum ChooserReport {
     Line(LineEv),
-    Pick(usize),
+    Pick { index: usize, rows_rev: u64 },
+    PickTwice { index: usize, rows_rev: u64 },
     Dismiss,
     Folder(Option<PathBuf>),
 }
@@ -36,6 +37,7 @@ pub(crate) struct ProjectChooserView {
     filling: Rc<Cell<bool>>,
     /// The line has the keys; otherwise the list does and the entry takes no text.
     in_line: Rc<Cell<bool>>,
+    rows_rev: Rc<Cell<u64>>,
     scroll_pending: Rc<Cell<bool>>,
     panel: gtk4::Box,
     scroll: gtk4::ScrolledWindow,
@@ -167,7 +169,16 @@ impl ProjectChooserView {
             }
         });
         entry.add_controller(focus);
-        list.connect_row_activated(move |_, row| report(ChooserReport::Pick(row.index() as usize)));
+        let rows_rev = Rc::new(Cell::new(0));
+        list.connect_row_activated({
+            let rows_rev = rows_rev.clone();
+            move |_, row| {
+                report(ChooserReport::Pick {
+                    index: row.index() as usize,
+                    rows_rev: rows_rev.get(),
+                })
+            }
+        });
         ProjectChooserView {
             root,
             entry,
@@ -177,6 +188,7 @@ impl ProjectChooserView {
             footer,
             filling,
             in_line,
+            rows_rev,
             scroll_pending,
             panel,
             scroll,
@@ -256,6 +268,7 @@ impl ProjectChooserView {
         };
         self.filling.set(true);
         self.in_line.set(view.in_line);
+        self.rows_rev.set(view.rows_rev);
         self.entry.set_editable(view.in_line);
         // The list has no caret: the line is not taking text.
         if view.in_line {
@@ -275,7 +288,7 @@ impl ProjectChooserView {
         while let Some(row) = self.list.first_child() {
             self.list.remove(&row);
         }
-        for row in &view.rows {
+        for row in view.rows.iter() {
             let item = gtk4::ListBoxRow::new();
             item.add_css_class("project-chooser-row");
             item.set_focusable(false);
