@@ -144,8 +144,9 @@ pub(super) fn tick_send(
         Owed::HeldPrompt(tab) => tabs.send_is_held(tab),
         _ => true,
     });
-    // A turn ended in these tabs; their queued messages go out now.
+    // A turn ended in these tabs; their queued messages go out now, and the window hears of each end.
     for tab in pumped.turn_ended {
+        out.effect(Effect::TurnEnded);
         if let Some(flush) = state.tabs.flush_queue(tab) {
             apply_flush(state, screen, tab, flush, out);
         }
@@ -311,10 +312,24 @@ pub(super) fn report_attention(
     out.effect(Effect::Attention { before, after, handed });
 }
 
+/// Whether any tab has a turn running (one Claude Code started itself, whose start the panel never folded,
+/// included), a session connecting, a question waiting or background work running. A session closed or
+/// unavailable mid-turn drops out of the counts without a turn end.
+pub(super) fn tabs_busy(tabs: &eitri_core::tab_set::TabSet) -> bool {
+    tabs.running_count() > 0 || tabs.background_count() > 0 || tabs.tabs().iter().any(|tab| tab.cli_unseen_busy())
+}
+
 /// Running-tab and queue counts invalidate the window's counts even when no attention mark moved.
 pub(super) fn report_busy(state: &mut AgentPanelState, out: &mut Outbox) {
     if state.shutting_down {
         return;
+    }
+    // The aggregate is read before the per-view comparison below returns early: a background task starting or
+    // ending moves no view's running count.
+    let busy = tabs_busy(&state.tabs);
+    if busy != state.reported_busy {
+        state.reported_busy = busy;
+        out.effect(Effect::BusyChanged(busy));
     }
     let (now, turns) = state.tabs.activity_and_turns();
     if now == state.reported_activity && turns == state.reported_turns {
@@ -1488,5 +1503,213 @@ mod tests {
                 last / first.max(1e-6)
             );
         }
+    }
+
+    /// What a tab of one agent kind is driven through: a way to queue its provider's events.
+    struct Driven {
+        tab: TabId,
+        queue: Box<dyn Fn(agent::AgentDomainEvent)>,
+    }
+
+    impl Driven {
+        fn start(&self, turn: &str) {
+            (self.queue)(agent::AgentDomainEvent::TurnStarted { turn_id: turn.into() });
+        }
+
+        fn end(&self, turn: &str, outcome: agent::TurnOutcome) {
+            (self.queue)(agent::AgentDomainEvent::TurnCompleted {
+                turn_id: turn.into(),
+                outcome,
+                result_text: String::new(),
+                stop_reason: None,
+                usage: None,
+                detail: Default::default(),
+            });
+        }
+
+        fn background(&self, running: u32) {
+            (self.queue)(agent::AgentDomainEvent::BackgroundCalls { running });
+        }
+    }
+
+    /// A tab of `agent` in the base view, over a scripted provider of that kind.
+    fn driven_tab(handle: &AgentPanelHandle, dir: &std::path::Path, agent: AgentId) -> Driven {
+        match agent {
+            AgentId::Claude => {
+                let (tab, provider) = live_tab(handle, dir);
+                Driven {
+                    tab,
+                    queue: Box::new(move |event| provider.queue(event)),
+                }
+            }
+            other => {
+                use eitri_core::test_providers::{empty_trust_plan, ExternalRecordingProvider};
+                let provider = std::sync::Arc::new(match &other {
+                    AgentId::Codex => ExternalRecordingProvider::codex(),
+                    AgentId::Acp(_) => ExternalRecordingProvider::named("acp:gem", false),
+                    AgentId::Claude => unreachable!(),
+                });
+                let backend = AgentBackend::start_external_with(
+                    other.clone(),
+                    provider.clone(),
+                    dir,
+                    empty_trust_plan(),
+                    SessionModeChoice::Auto,
+                    None,
+                )
+                .expect("a scripted external start succeeds");
+                let mut state = handle.state.borrow_mut();
+                let tab = state.tabs.open(other);
+                state.tabs.get_mut(tab).unwrap().set_backend(TabBackend::Live(backend));
+                Driven {
+                    tab,
+                    queue: Box::new(move |event| provider.inner.queue(event)),
+                }
+            }
+        }
+    }
+
+    /// A panel with the two activity hooks recording what they hear.
+    fn hooked_panel() -> (AgentPanelHandle, Rc<RefCell<Vec<bool>>>, Rc<std::cell::Cell<usize>>) {
+        let (handle, _page) = settled_panel();
+        let busy = Rc::new(RefCell::new(Vec::new()));
+        let ends = Rc::new(std::cell::Cell::new(0));
+        handle.on_busy_changed({
+            let busy = busy.clone();
+            let state = Rc::downgrade(&handle.state);
+            move |on| {
+                assert!(
+                    state.upgrade().unwrap().try_borrow_mut().is_ok(),
+                    "the step has released its state"
+                );
+                busy.borrow_mut().push(on);
+            }
+        });
+        handle.on_turn_ended({
+            let ends = ends.clone();
+            move || ends.set(ends.get() + 1)
+        });
+        handle.tick();
+        busy.borrow_mut().clear();
+        ends.set(0);
+        (handle, busy, ends)
+    }
+
+    fn tick_a_few(handle: &AgentPanelHandle) {
+        for _ in 0..4 {
+            handle.tick();
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+    }
+
+    #[test]
+    fn busy_changes_fire_once_for_claude_codex_and_acp_tabs() {
+        for (label, agent) in [
+            ("claude", AgentId::Claude),
+            ("codex", AgentId::Codex),
+            ("acp", AgentId::Acp("gem".into())),
+        ] {
+            let dir = agent::state_dirs::test_workspace_dir(&format!("panel-busy-edge-{label}"));
+            let (handle, busy, ends) = hooked_panel();
+            let tab = driven_tab(&handle, &dir, agent);
+            assert!(!handle.busy(), "{label}: idle before a turn");
+            tab.start("t1");
+            tick_handle_until(&handle, "the busy edge", || !busy.borrow().is_empty());
+            tick_a_few(&handle);
+            assert_eq!(*busy.borrow(), [true], "{label}: one edge for the turn's start");
+            assert!(handle.busy(), "{label}: the getter agrees");
+            tab.end("t1", agent::TurnOutcome::Completed);
+            tick_handle_until(&handle, "the idle edge", || busy.borrow().len() == 2);
+            tick_a_few(&handle);
+            assert_eq!(*busy.borrow(), [true, false], "{label}: one edge for the turn's end");
+            assert!(!handle.busy(), "{label}: idle again");
+            assert_eq!(ends.get(), 1, "{label}: one turn end");
+            let _ = handle.shutdown();
+        }
+    }
+
+    /// Claude's tasks list and Codex's calls left running report background work, which keeps the panel busy
+    /// after its turn ended; an ACP agent reports none, so its tab is busy only while a turn runs.
+    #[test]
+    fn background_work_keeps_busy_after_the_turn_ends() {
+        for (label, agent) in [("claude", AgentId::Claude), ("codex", AgentId::Codex)] {
+            let dir = agent::state_dirs::test_workspace_dir(&format!("panel-busy-background-{label}"));
+            let (handle, busy, ends) = hooked_panel();
+            let tab = driven_tab(&handle, &dir, agent);
+            tab.start("t1");
+            tab.background(1);
+            tick_handle_until(&handle, "the busy edge", || !busy.borrow().is_empty());
+            tab.end("t1", agent::TurnOutcome::Completed);
+            tick_handle_until(&handle, "the turn's end", || ends.get() == 1);
+            tick_a_few(&handle);
+            assert_eq!(
+                *busy.borrow(),
+                [true],
+                "{label}: the background work keeps it busy after the turn"
+            );
+            assert!(handle.busy(), "{label}");
+            tab.background(0);
+            tick_handle_until(&handle, "the idle edge", || busy.borrow().len() == 2);
+            tick_a_few(&handle);
+            assert_eq!(*busy.borrow(), [true, false], "{label}: idle once the last task ended");
+            assert_eq!(ends.get(), 1, "{label}: the background edge is no turn end");
+            let _ = handle.shutdown();
+        }
+    }
+
+    /// A turn Claude Code started itself runs where the panel cannot show it: the panel is busy until the
+    /// completion that closes it, which is a turn end.
+    #[test]
+    fn a_turn_the_cli_started_itself_keeps_the_panel_busy() {
+        let dir = agent::state_dirs::test_workspace_dir("panel-busy-cli-unseen");
+        let (handle, busy, ends) = hooked_panel();
+        let tab = driven_tab(&handle, &dir, AgentId::Claude);
+        (tab.queue)(agent::AgentDomainEvent::CliWorkUnseen);
+        tick_handle_until(&handle, "the busy edge", || !busy.borrow().is_empty());
+        assert!(handle.busy());
+        assert_eq!(handle.running_count(), 0, "the panel runs no turn of its own");
+        tab.end(agent::NO_OPEN_TURN_ID, agent::TurnOutcome::Completed);
+        tick_handle_until(&handle, "the idle edge", || busy.borrow().len() == 2);
+        tick_a_few(&handle);
+        assert_eq!(*busy.borrow(), [true, false]);
+        assert_eq!(ends.get(), 1, "the closing completion is a turn end");
+        assert!(!handle.busy());
+        let _ = handle.shutdown();
+    }
+
+    #[test]
+    fn turn_end_fires_once_per_tab() {
+        let dir = agent::state_dirs::test_workspace_dir("panel-turn-end-per-tab");
+        let (handle, busy, ends) = hooked_panel();
+        let first = driven_tab(&handle, &dir, AgentId::Claude);
+        let second = driven_tab(&handle, &dir, AgentId::Codex);
+        assert_ne!(first.tab, second.tab);
+        first.start("t1");
+        second.start("t2");
+        tick_handle_until(&handle, "both running", || handle.running_count() == 2);
+        // One completes, one is interrupted: both are turn ends.
+        first.end("t1", agent::TurnOutcome::Completed);
+        second.end("t2", agent::TurnOutcome::Interrupted);
+        tick_handle_until(&handle, "both ends", || ends.get() == 2);
+        tick_a_few(&handle);
+        assert_eq!(ends.get(), 2, "once per tab, interrupts included");
+        assert_eq!(*busy.borrow(), [true, false], "and the aggregate flipped once each way");
+        let _ = handle.shutdown();
+    }
+
+    #[test]
+    fn a_session_closed_mid_turn_ends_busy_without_a_turn_end() {
+        let dir = agent::state_dirs::test_workspace_dir("panel-closed-mid-turn");
+        let (handle, busy, ends) = hooked_panel();
+        let tab = driven_tab(&handle, &dir, AgentId::Claude);
+        tab.start("t1");
+        tick_handle_until(&handle, "the busy edge", || !busy.borrow().is_empty());
+        (tab.queue)(agent::AgentDomainEvent::SessionClosed { reason: "gone".into() });
+        tick_handle_until(&handle, "the idle edge", || busy.borrow().len() == 2);
+        tick_a_few(&handle);
+        assert_eq!(*busy.borrow(), [true, false]);
+        assert_eq!(ends.get(), 0, "a session that closed ended no turn");
+        assert!(!handle.busy());
+        let _ = handle.shutdown();
     }
 }

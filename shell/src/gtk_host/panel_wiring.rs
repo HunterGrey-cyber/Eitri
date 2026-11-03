@@ -29,7 +29,7 @@ use crate::agent_panel::{AgentPanelHandle, ChatMoveEvent, HintInbound, ViewId};
 /// Every hook registration on the panel handle, in the order `wire_panel` makes them. Read by the
 /// tests that hold each window to what it leaves out.
 #[cfg_attr(not(test), allow(dead_code))]
-pub(crate) const HOOKS: [&str; 18] = [
+pub(crate) const HOOKS: [&str; 20] = [
     "on_hint",
     "on_attention",
     "on_toast",
@@ -48,6 +48,8 @@ pub(crate) const HOOKS: [&str; 18] = [
     "on_show_view",
     "on_tab_verb",
     "on_chat_move",
+    "on_busy_changed",
+    "on_turn_ended",
 ];
 
 /// The registrations the companion window leaves out. It has no tray, no chat view but the base one,
@@ -102,6 +104,10 @@ pub(crate) struct PanelHooks {
     pub(crate) on_show_view: Option<Box<dyn Fn(ViewId)>>,
     pub(crate) on_tab_verb: Option<Box<dyn Fn(ViewId, TabAction)>>,
     pub(crate) on_chat_move: Option<Box<dyn Fn(ChatMoveEvent)>>,
+    /// The window's aggregate busy state flipped (a turn or background work running in any tab).
+    pub(crate) on_busy_changed: Option<Box<dyn Fn(bool)>>,
+    /// One tab's turn ended.
+    pub(crate) on_turn_ended: Option<Box<dyn Fn()>>,
 }
 
 impl PanelHooks {
@@ -127,6 +133,8 @@ impl PanelHooks {
             self.on_show_view.is_some(),
             self.on_tab_verb.is_some(),
             self.on_chat_move.is_some(),
+            self.on_busy_changed.is_some(),
+            self.on_turn_ended.is_some(),
         ];
         HOOKS
             .iter()
@@ -159,6 +167,8 @@ pub(crate) fn wire_panel(panel: &AgentPanelHandle, hooks: PanelHooks) {
         on_show_view,
         on_tab_verb,
         on_chat_move,
+        on_busy_changed,
+        on_turn_ended,
     } = hooks;
     if let Some(hook) = on_hint {
         panel.on_hint(hook);
@@ -213,6 +223,12 @@ pub(crate) fn wire_panel(panel: &AgentPanelHandle, hooks: PanelHooks) {
     }
     if let Some(hook) = on_chat_move {
         panel.on_chat_move(hook);
+    }
+    if let Some(hook) = on_busy_changed {
+        panel.on_busy_changed(hook);
+    }
+    if let Some(hook) = on_turn_ended {
+        panel.on_turn_ended(hook);
     }
 }
 
@@ -321,8 +337,17 @@ mod tests {
             editor_request: Rc::new(|_: &ScratchRequest| Ok(())),
             editor_done: Rc::new(|| {}),
             edit_selection: Rc::new(|| {}),
+            reload: crate::companion::window::ReloadCalls::new(|| false),
         });
         assert_eq!(sorted(hooks.missing()), sorted(COMPANION_OMITS.to_vec()));
+        for name in ["on_busy_changed", "on_turn_ended"] {
+            assert!(HOOKS.contains(&name), "{name} is a hook every window accounts for");
+            assert!(
+                !COMPANION_OMITS.contains(&name),
+                "the companion wires {name}: it drives the reload"
+            );
+            assert!(!hooks.missing().contains(&name), "the companion's hooks set {name}");
+        }
         assert!(
             hooks.missing().contains(&"set_answer_gate"),
             "the companion installs no answer gate"
@@ -349,6 +374,9 @@ mod tests {
             }
         }
         assert_eq!(missing, Vec::<&str>::new(), "the main window leaves no hook out");
+        for name in ["on_busy_changed", "on_turn_ended"] {
+            assert!(HOOKS.contains(&name), "{name} is a hook the main window accounts for");
+        }
         assert_eq!(
             PanelHooks::default().missing(),
             HOOKS.to_vec(),

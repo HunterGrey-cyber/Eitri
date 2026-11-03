@@ -23,6 +23,9 @@ pub mod stdio;
 /// The installer: `nvim_exec_lua(INSTALL_LUA, install_args(...))`.
 pub const INSTALL_LUA: &str = include_str!("install.lua");
 
+/// Activity-driven buffer reloads for an agent slot.
+pub const RELOAD_PART_LUA: &str = include_str!("reload_part.lua");
+
 /// Run the teardown of the install made by channel `...` (the one argument), if it is still the
 /// current one. `true` when it ran, `false` when another channel's install holds the nvim or
 /// nothing is installed.
@@ -179,7 +182,7 @@ pub fn install_args(channel_id: u64, sockets: &Sockets, kind: &InstallKind) -> V
     }
     // An empty table, not nil: a snippet given a table never reads `vim.env`.
     parts.push(part("scratch", crate::scratch::NVIM_SCRATCH_LUA, vec![]));
-    parts.push(part("buffer_reload", crate::buffer_reload::BUFFER_RELOAD_LUA, vec![]));
+    parts.push(part("buffer_reload", RELOAD_PART_LUA, vec![]));
     let extra = match &sockets.pane_switch {
         Some(socket) => map(vec![("edge_socket", path_value(socket))]),
         None => map(vec![]),
@@ -374,7 +377,7 @@ mod tests {
             crate::nvim_keys::feed::NVIM_KEYS_LUA,
             crate::pane_switch::NAV_FALLBACK_LUA,
             crate::scratch::NVIM_SCRATCH_LUA,
-            crate::buffer_reload::BUFFER_RELOAD_LUA,
+            RELOAD_PART_LUA,
         ];
         for (part, source) in parts.iter().zip(sources) {
             assert_eq!(get(part, "src").as_str(), Some(source));

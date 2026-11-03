@@ -1895,6 +1895,30 @@ impl AgentPanelHandle {
         self.state.borrow_mut().busy_hook = Some(Rc::new(hook));
     }
 
+    /// Called with the new value whenever the window's aggregate busy state flips: any tab with a
+    /// running turn (or a connect, or a waiting question) or running background work. It fires on a
+    /// change only, once the step has released its state; [`AgentPanelHandle::busy`] reads the value
+    /// now. `main.rs` and the companion window install this once.
+    pub fn on_busy_changed(&self, hook: impl Fn(bool) + 'static) {
+        self.wake();
+        self.state.borrow_mut().busy_changed_hook = Some(Rc::new(hook));
+    }
+
+    /// Called once for each tab's turn end (a completed turn, an interrupted one included), once the
+    /// step has released its state. A tab closed mid-turn ends no turn.
+    pub fn on_turn_ended(&self, hook: impl Fn() + 'static) {
+        self.wake();
+        self.state.borrow_mut().turn_ended_hook = Some(Rc::new(hook));
+    }
+
+    /// Whether any tab has a running turn (one Claude Code started itself included) or running background
+    /// work, counted now: it can be ahead of what [`AgentPanelHandle::on_busy_changed`] last told, until the
+    /// next tick reports it. `false` once the panel shuts down.
+    pub fn busy(&self) -> bool {
+        let state = self.state.borrow();
+        !state.shutting_down && super::tick::tabs_busy(&state.tabs)
+    }
+
     /// Where a `tab_verb` message's mapped `TabAction` goes: the same code the prefix's own
     /// `Action::Tab` arm runs (`main.rs`'s `run_tab_action`). `None`
     /// until `main.rs` installs one, which is why `InboundMessage::TabVerb` can be refused.
@@ -3045,6 +3069,7 @@ mod tests {
             "tab_place",
             "newest_card_label_in",
             "running_count",
+            "busy",
             "unsaved_draft_count",
             "background_count",
             "view_background_count",

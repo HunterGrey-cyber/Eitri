@@ -3950,6 +3950,11 @@ fn build_ui(
             }
         }
     }));
+    // The panel's activity is what an attached companion editor's reload follows. This window's own nvim keeps
+    // the unconditional 1 s timer its `--cmd` installs (focus events never reach an embedded nvim), so the
+    // two hooks have nothing to drive here.
+    panel_hooks.on_busy_changed = Some(Box::new(|_busy: bool| {}));
+    panel_hooks.on_turn_ended = Some(Box::new(|| {}));
     // Every hook is built: the panel gets them all at once. Nothing since the first was built can
     // have made the panel call one, since the window is still being built and no page message is
     // read before the main loop runs again.

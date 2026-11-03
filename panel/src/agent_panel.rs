@@ -267,6 +267,14 @@ struct AgentPanelState {
     reported_activity: Vec<(ViewId, eitri_core::tab_set::ViewActivity)>,
     /// Which tabs ran a turn when the hook was last told, each in its view (`report_busy`).
     reported_turns: BTreeSet<(ViewId, TabId)>,
+    /// Told when the window's aggregate busy state flips: any tab with a running turn or running
+    /// background work (`AgentPanelHandle::on_busy_changed`). Called after the step releases its state.
+    busy_changed_hook: Option<Rc<dyn Fn(bool)>>,
+    /// Told once per tab's turn end (`AgentPanelHandle::on_turn_ended`); called after the step releases
+    /// its state.
+    turn_ended_hook: Option<Rc<dyn Fn()>>,
+    /// The aggregate busy state as `busy_changed_hook` was last told it (`report_busy`).
+    reported_busy: bool,
     /// Every tab's attention as the hook was last told it (`report_attention`).
     reported_tabs: Vec<eitri_core::tabs::TabAttention>,
     /// The per-window scratch directory, `None` if it could not be made.
@@ -607,6 +615,9 @@ impl AgentPanelState {
             busy_hook: None,
             reported_activity: Vec::new(),
             reported_turns: BTreeSet::new(),
+            busy_changed_hook: None,
+            turn_ended_hook: None,
+            reported_busy: false,
             reported_tabs: Vec::new(),
             scratch,
             pending_edits: Vec::new(),

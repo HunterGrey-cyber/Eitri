@@ -39,6 +39,19 @@ use eitri_core::source_scan::{self, word_ends, Source};
 
 const ANNOTATION: &str = "// editor-rpc-scan: forwards a caller's constant";
 
+const RELOAD_PART: &str = "core/src/companion/reload_part.lua";
+
+#[test]
+fn the_agent_reload_part_comes_from_its_compile_time_constant() {
+    let module = source_scan::read_required("core/src/companion/mod.rs");
+    let (_, body) = source_scan::function_in(&[module], "install_args");
+    assert!(squeeze(&body).contains("part(,RELOAD_PART_LUA,"));
+    assert_eq!(
+        eitri_core::companion::RELOAD_PART_LUA,
+        source_scan::read_required(RELOAD_PART).text
+    );
+}
+
 /// Every annotated forwarder, by file (relative to the workspace root) and count. Reviewed: each passes on a
 /// `code` its own caller gave it, and that caller's call is checked here in turn.
 const EXPECTED_FORWARDERS: &[(&str, usize)] = &[

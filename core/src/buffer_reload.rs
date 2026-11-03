@@ -85,6 +85,13 @@ pub fn nvim_args() -> Vec<String> {
 mod tests {
     use super::*;
 
+    #[test]
+    fn reload_cmd_and_its_snippet_are_byte_identical_to_today() {
+        const SNIPPET: &str = r#"_G.eitri_reload_timer = vim.uv.new_timer(); local t = _G.eitri_reload_timer; _G.eitri_reload_timer:start(1000, 1000, function() vim.schedule(function() pcall(vim.cmd, 'checktime') end) end); return function() if not t:is_closing() then t:stop(); t:close() end; if _G.eitri_reload_timer == t then _G.eitri_reload_timer = nil end end"#;
+        assert_eq!(include_str!("buffer_reload.lua").as_bytes(), SNIPPET.as_bytes());
+        assert_eq!(RELOAD_CMD.as_bytes(), [b"lua ".as_slice(), SNIPPET.as_bytes()].concat());
+    }
+
     /// `--cmd` carries one command, and a trailing `--` comment would swallow nothing but also
     /// could never be told apart from code in `ps`: the chunk stays one comment-free line.
     #[test]

@@ -92,6 +92,11 @@ pub(super) enum Effect {
     },
     /// Running or queued work changed in these views.
     Busy { changed: Vec<(ViewId, bool)> },
+    /// The window's aggregate busy state flipped: some tab has a running turn or running background
+    /// work, or none has any more.
+    BusyChanged(bool),
+    /// One tab's turn ended.
+    TurnEnded,
     /// A draft edited in nvim came back: the keys return to this chat view.
     EditorDone(ViewId),
     /// The editor's "edit the selection" key was pressed: the window puts the keys in the chat.
@@ -292,6 +297,18 @@ impl Outbox {
                     let hook = state.borrow().busy_hook.clone();
                     if let Some(hook) = hook {
                         hook(&changed);
+                    }
+                }
+                Effect::BusyChanged(busy) => {
+                    let hook = state.borrow().busy_changed_hook.clone();
+                    if let Some(hook) = hook {
+                        hook(busy);
+                    }
+                }
+                Effect::TurnEnded => {
+                    let hook = state.borrow().turn_ended_hook.clone();
+                    if let Some(hook) = hook {
+                        hook();
                     }
                 }
                 Effect::EditorDone(view) => {

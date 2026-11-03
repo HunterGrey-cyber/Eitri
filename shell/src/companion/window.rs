@@ -2,7 +2,7 @@
 //! Eitri's own. A skeleton that the attach, the control socket and the close prompt build on.
 
 use std::cell::{Cell, RefCell};
-use std::rc::Rc;
+use std::rc::{Rc, Weak};
 
 use gtk4::prelude::*;
 use gtk4::{Application, ApplicationWindow};
@@ -38,6 +38,91 @@ type MoveFocus = Rc<dyn Fn(&ModuleId, Direction) -> bool>;
 
 /// Hands a draft or a `gf` to the attached editor; `Err` says why it could not.
 type EditorRequest = Rc<dyn Fn(&ScratchRequest) -> Result<(), String>>;
+
+/// What the window needs of its link to reach the agent slot's parts in the attached nvim.
+pub(crate) trait SlotCalls {
+    /// One named call to the slot's part, guarded by the channel the link is attached on now; `Err` says
+    /// why it went nowhere (not attached).
+    fn slot_call(&self, name: &str, args: Vec<rmpv::Value>) -> Result<(), String>;
+}
+
+impl SlotCalls for CompanionLink {
+    fn slot_call(&self, name: &str, args: Vec<rmpv::Value>) -> Result<(), String> {
+        CompanionLink::slot_call(self, name, args)
+    }
+}
+
+/// The panel's activity, carried to the reload part in the attached nvim: the busy state when it flips and
+/// again for each editor that attaches (the part starts idle), `now` at each turn end.
+pub(crate) struct ReloadCalls {
+    link: RefCell<Option<Weak<dyn SlotCalls>>>,
+    /// The panel's busy state now.
+    busy: Box<dyn Fn() -> bool>,
+    /// The channel the busy state was last sent to, so a repeated report of the same attachment sends once.
+    announced: Cell<Option<u64>>,
+    /// Where the busy edges are said, one line each: the companion's stdout in the product.
+    say: Box<dyn Fn(&str)>,
+}
+
+impl ReloadCalls {
+    pub(crate) fn new(busy: impl Fn() -> bool + 'static) -> Rc<ReloadCalls> {
+        Self::with_log(busy, |line| println!("{line}"))
+    }
+
+    fn with_log(busy: impl Fn() -> bool + 'static, say: impl Fn(&str) + 'static) -> Rc<ReloadCalls> {
+        Rc::new(ReloadCalls {
+            link: RefCell::new(None),
+            busy: Box::new(busy),
+            announced: Cell::new(None),
+            say: Box::new(say),
+        })
+    }
+
+    /// The link the calls go through, held weakly: the link's own poll holds this window's callbacks.
+    pub(crate) fn bind(&self, link: Weak<dyn SlotCalls>) {
+        *self.link.borrow_mut() = Some(link);
+    }
+
+    /// The panel's busy state flipped: said as `[reload] busy on` or `[reload] busy off` (the window pass
+    /// reads these), then sent on.
+    pub(crate) fn busy_changed(&self, on: bool) {
+        (self.say)(if on { "[reload] busy on" } else { "[reload] busy off" });
+        self.call("busy", vec![rmpv::Value::from(on)]);
+    }
+
+    /// One tab's turn ended.
+    pub(crate) fn turn_ended(&self) {
+        self.call("now", Vec::new());
+    }
+
+    /// The link's state changed: an editor that has just attached is told the busy state the panel has now,
+    /// once its install has answered (the link is `Attached` only then). A state that is not attached forgets
+    /// the channel, so the next attachment is told again; so does a connect that began in this report, because
+    /// it may have attached a different editor whose channel has the same number (a connect and its install can
+    /// finish within one poll, with no other state reported between). Nothing is sent to a channel that has
+    /// gone, because the link only calls through the channel it is attached on.
+    pub(crate) fn link_changed(&self, state: &LinkState, connect_began: bool) {
+        if connect_began {
+            self.announced.set(None);
+        }
+        match state {
+            LinkState::Attached { channel, .. } => {
+                if self.announced.replace(Some(*channel)) != Some(*channel) {
+                    self.call("busy", vec![rmpv::Value::from((self.busy)())]);
+                }
+            }
+            _ => self.announced.set(None),
+        }
+    }
+
+    fn call(&self, name: &str, args: Vec<rmpv::Value>) {
+        let link = self.link.borrow().as_ref().and_then(Weak::upgrade);
+        if let Some(link) = link {
+            // With no editor attached there is no part to tell: the next attachment is sent the state.
+            let _ = link.slot_call(name, args);
+        }
+    }
+}
 
 /// Everything the later steps of a companion window reach into.
 #[allow(dead_code)] // read by the attach and the window-manager moves, which come next
@@ -173,6 +258,8 @@ pub(crate) struct CompanionHookParts {
     /// The editor's "edit the selection" key: the window comes forward with the keys in the panel and its
     /// composer open.
     pub(crate) edit_selection: Rc<dyn Fn()>,
+    /// The attached editor's reload part, told the panel's activity.
+    pub(crate) reload: Rc<ReloadCalls>,
 }
 
 /// The companion's panel hooks: every one the main window installs but the five in
@@ -190,6 +277,7 @@ pub(crate) fn companion_hooks(parts: CompanionHookParts) -> PanelHooks {
         editor_request,
         editor_done,
         edit_selection,
+        reload,
     } = parts;
     PanelHooks {
         on_hint: Some(Box::new(move |message: HintInbound| hint(message))),
@@ -209,6 +297,11 @@ pub(crate) fn companion_hooks(parts: CompanionHookParts) -> PanelHooks {
             move_focus(&ModuleId::agent(), direction);
         })),
         on_tab_verb: Some(Box::new(move |_view: ViewId, action: TabAction| run_tab(action))),
+        on_busy_changed: Some(Box::new({
+            let reload = reload.clone();
+            move |busy: bool| reload.busy_changed(busy)
+        })),
+        on_turn_ended: Some(Box::new(move || reload.turn_ended())),
         ..PanelHooks::default()
     }
 }
@@ -629,8 +722,13 @@ pub(crate) fn build(app: &Application, start: &Start) -> Rc<CompanionWindow> {
 
     // Where the panel stands with the user's nvim. The first call of `on_change` is at once, so the
     // band says what is true from the first `ready`.
+    let reload = ReloadCalls::new({
+        let agent = agent.clone();
+        move || agent.busy()
+    });
     let link = {
         let attached = attached.clone();
+        let reload = reload.clone();
         let agent_for_change = agent.clone();
         let agent_for_cancel = agent.clone();
         let runner_for_change = runner.clone();
@@ -666,6 +764,7 @@ pub(crate) fn build(app: &Application, start: &Start) -> Rc<CompanionWindow> {
                 }
                 println!("[companion] link: {} {}", band.state, band.text);
                 agent_for_change.set_editor_link(band);
+                reload.link_changed(state, connect_began);
             },
             move || {
                 let cut = agent_for_cancel.editor_detached();
@@ -676,6 +775,11 @@ pub(crate) fn build(app: &Application, start: &Start) -> Rc<CompanionWindow> {
             },
         )
     };
+
+    {
+        let calls: Rc<dyn SlotCalls> = link.clone();
+        reload.bind(Rc::downgrade(&calls));
+    }
 
     // Turn review asks the attached nvim through the same link, and polls its answers.
     let review_owner: Rc<dyn Fn() -> Option<Owner>> = {
@@ -768,6 +872,7 @@ pub(crate) fn build(app: &Application, start: &Start) -> Rc<CompanionWindow> {
             editor_request,
             editor_done,
             edit_selection,
+            reload,
         }),
     );
 
@@ -953,4 +1058,155 @@ pub(crate) fn build(app: &Application, start: &Start) -> Rc<CompanionWindow> {
         link,
         pane_switch,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::path::PathBuf;
+
+    /// A link that records every call it takes, by the channel it was attached on when it took it.
+    #[derive(Default)]
+    struct FakeLink {
+        channel: Cell<Option<u64>>,
+        taken: RefCell<Vec<(u64, String, Vec<rmpv::Value>)>>,
+    }
+
+    impl FakeLink {
+        fn calls_on(&self, channel: u64) -> Vec<(String, Vec<rmpv::Value>)> {
+            self.taken
+                .borrow()
+                .iter()
+                .filter(|(on, _, _)| *on == channel)
+                .map(|(_, name, args)| (name.clone(), args.clone()))
+                .collect()
+        }
+    }
+
+    impl SlotCalls for FakeLink {
+        fn slot_call(&self, name: &str, args: Vec<rmpv::Value>) -> Result<(), String> {
+            let channel = self.channel.get().ok_or("not attached")?;
+            self.taken.borrow_mut().push((channel, name.to_owned(), args));
+            Ok(())
+        }
+    }
+
+    fn attached(channel: u64) -> LinkState {
+        LinkState::Attached {
+            addr: PathBuf::from("/run/nvim.sock"),
+            channel,
+            nvim_pid: 1,
+            in_tmux: false,
+        }
+    }
+
+    fn busy_arg(call: &(String, Vec<rmpv::Value>)) -> Option<bool> {
+        assert_eq!(call.0, "busy");
+        call.1.first().and_then(rmpv::Value::as_bool)
+    }
+
+    /// The link and the calls over it, with a busy state the test sets.
+    fn calls_over_fake() -> (Rc<FakeLink>, Rc<ReloadCalls>, Rc<Cell<bool>>) {
+        let busy = Rc::new(Cell::new(false));
+        let calls = ReloadCalls::new({
+            let busy = busy.clone();
+            move || busy.get()
+        });
+        let link = Rc::new(FakeLink::default());
+        let dynamic: Rc<dyn SlotCalls> = link.clone();
+        calls.bind(Rc::downgrade(&dynamic));
+        (link, calls, busy)
+    }
+
+    #[test]
+    fn busy_is_sent_again_after_a_reattach_and_never_to_the_old_channel() {
+        let (link, calls, busy) = calls_over_fake();
+
+        // The first editor attaches while the panel is idle, then a turn starts.
+        link.channel.set(Some(3));
+        calls.link_changed(&attached(3), false);
+        assert_eq!(link.calls_on(3).iter().map(busy_arg).collect::<Vec<_>>(), [Some(false)]);
+        busy.set(true);
+        calls.busy_changed(true);
+        assert_eq!(
+            link.calls_on(3).iter().map(busy_arg).collect::<Vec<_>>(),
+            [Some(false), Some(true)]
+        );
+
+        // The editor goes away mid-turn: nothing is sent while there is no channel, so nothing reaches channel 3.
+        link.channel.set(None);
+        calls.link_changed(&LinkState::NoEditor, false);
+        calls.turn_ended();
+        calls.busy_changed(true);
+        assert_eq!(link.calls_on(3).len(), 2, "the old channel heard nothing after it went");
+
+        // A second editor attaches mid-turn and is told the busy state the panel has now.
+        link.channel.set(Some(4));
+        calls.link_changed(&attached(4), false);
+        assert_eq!(link.calls_on(4).iter().map(busy_arg).collect::<Vec<_>>(), [Some(true)]);
+        assert_eq!(link.calls_on(3).len(), 2, "and the old channel still heard nothing");
+
+        // A repeated report of the same attachment sends nothing more.
+        calls.link_changed(&attached(4), false);
+        assert_eq!(link.calls_on(4).len(), 1);
+    }
+
+    #[test]
+    fn a_connect_that_attached_another_editor_on_the_same_channel_number_is_told_the_busy_state() {
+        let (link, calls, busy) = calls_over_fake();
+        link.channel.set(Some(3));
+        calls.link_changed(&attached(3), false);
+        busy.set(true);
+        calls.busy_changed(true);
+        assert_eq!(link.calls_on(3).len(), 2);
+
+        // A second nvim answers its install within the poll that began its connect: the link reports
+        // `Attached` on the same channel number with nothing reported between, and its part starts idle.
+        calls.link_changed(&attached(3), true);
+        let heard = link.calls_on(3).iter().map(busy_arg).collect::<Vec<_>>();
+        assert_eq!(heard, [Some(false), Some(true), Some(true)]);
+
+        // The same editor reported again, with no connect, is not told twice.
+        calls.link_changed(&attached(3), false);
+        assert_eq!(link.calls_on(3).len(), 3);
+    }
+
+    #[test]
+    fn the_busy_edges_are_said_in_the_lines_the_window_pass_reads() {
+        let said = Rc::new(RefCell::new(Vec::<String>::new()));
+        let calls = ReloadCalls::with_log(|| false, {
+            let said = said.clone();
+            move |line| said.borrow_mut().push(line.to_owned())
+        });
+        calls.busy_changed(true);
+        calls.busy_changed(false);
+        assert_eq!(*said.borrow(), ["[reload] busy on", "[reload] busy off"]);
+    }
+
+    #[test]
+    fn a_turn_end_reloads_through_the_attached_channel_only() {
+        let (link, calls, _busy) = calls_over_fake();
+        calls.turn_ended();
+        assert!(link.taken.borrow().is_empty(), "no editor, no call");
+        link.channel.set(Some(7));
+        calls.link_changed(&attached(7), false);
+        calls.turn_ended();
+        let on_seven = link.calls_on(7);
+        assert_eq!(on_seven.last(), Some(&("now".to_owned(), Vec::new())));
+    }
+
+    #[test]
+    fn a_dropped_link_takes_no_call() {
+        let calls = ReloadCalls::new(|| true);
+        {
+            let link = Rc::new(FakeLink::default());
+            link.channel.set(Some(1));
+            let dynamic: Rc<dyn SlotCalls> = link;
+            calls.bind(Rc::downgrade(&dynamic));
+        }
+        // Nothing to call, and nothing panics.
+        calls.busy_changed(true);
+        calls.link_changed(&attached(1), false);
+        calls.turn_ended();
+    }
 }
