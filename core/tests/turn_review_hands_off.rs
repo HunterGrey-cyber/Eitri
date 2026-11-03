@@ -12,7 +12,7 @@ use std::path::Path;
 
 /// What reading the review's state looks like in source: the installed review's field and every
 /// type it hands out.
-const FORBIDDEN: [&str; 4] = ["turn_review", "TurnReview", "TurnRecord", "ReviewHint"];
+const FORBIDDEN: [&str; 5] = ["turn_review", "TurnReview", "TurnRecord", "ReviewHint", "live_edits"];
 
 /// `text` with every comment, string literal and character literal replaced by spaces (line breaks
 /// kept), so neither a brace nor a word inside one counts.

@@ -64,6 +64,7 @@ fn checks<'a>(agents: &'a [&'a str]) -> Vec<(&'static str, Check<'a>)> {
         (eitri_core::compositor::mode::TILING_KEY, Box::new(tiling_check)),
         (prefs::REVIEW_ENABLED_KEY, check(prefs::parse_review_enabled)),
         (prefs::REVIEW_HINT_KEY, check(prefs::parse_review_hint)),
+        (prefs::REVIEW_LIVE_KEY, check(prefs::parse_review_live)),
         (prefs::THINKING_KEY, check(prefs::parse_thinking_display)),
         (
             eitri_core::editor_tools::switches::TOOLS_KEY,
@@ -252,6 +253,21 @@ pub fn settle(kernel: &Kernel) {
             kernel.report_problem(format!("init.lua: {key} could not be stored ({why}); {said}"));
         }
     }
+    {
+        use eitri_core::agent_prefs as prefs;
+        let config = kernel.config.borrow();
+        if config.get(prefs::REVIEW_LIVE_KEY).is_some()
+            && prefs::parse_review_live(config.get(prefs::REVIEW_LIVE_KEY)) == Ok(true)
+            && prefs::parse_review_enabled(config.get(prefs::REVIEW_ENABLED_KEY)) == Ok(false)
+        {
+            let why = "review.live has no effect while review.enabled is false";
+            let origin = config.origin(prefs::REVIEW_LIVE_KEY).unwrap_or("init.lua");
+            let problem = format!("{origin}: {why}");
+            if !kernel.startup_problems().contains(&problem) {
+                kernel.report_problem(problem);
+            }
+        }
+    }
     let refused_tools = kernel.config.borrow().refusals_under(TOOL_KEY_PREFIX);
     for (key, why) in refused_tools {
         let known_name = Switches::parse(None, &[(key.clone(), "on".to_string())]).is_ok();
@@ -275,6 +291,42 @@ mod tests {
         settle(&kernel);
         let problems = kernel.startup_problems();
         (kernel, problems)
+    }
+
+    #[test]
+    fn a_bad_review_live_opens_on_the_default_and_is_said() {
+        use eitri_core::agent_prefs::{parse_review_live, REVIEW_LIVE_DEFAULT, REVIEW_LIVE_KEY};
+        let (kernel, problems) = settled("eitri.config.set('review.live', 'perhaps')\n");
+        assert_eq!(
+            parse_review_live(kernel.config.borrow().get(REVIEW_LIVE_KEY)),
+            Ok(REVIEW_LIVE_DEFAULT)
+        );
+        assert_eq!(problems.len(), 1, "{problems:?}");
+        assert!(problems[0].contains("review.live") && problems[0].contains("the default is used"));
+        assert!(problems[0].contains("init.lua:1:"));
+    }
+
+    #[test]
+    fn review_live_set_with_review_off_is_said_once() {
+        for value in ["true", "on"] {
+            let (kernel, problems) = settled(&format!(
+                "eitri.config.set('review.enabled', false)\neitri.config.set('review.live', '{value}')\n"
+            ));
+            assert_eq!(problems.len(), 1, "{problems:?}");
+            assert!(problems[0].ends_with("review.live has no effect while review.enabled is false"));
+            assert!(problems[0].contains("init.lua:2:"));
+            settle(&kernel);
+            assert_eq!(kernel.startup_problems(), problems);
+        }
+        let (_, problems) =
+            settled("eitri.config.set('review.enabled', false)\neitri.config.set('review.live', false)\n");
+        assert!(problems.is_empty(), "{problems:?}");
+    }
+
+    #[test]
+    fn review_live_unset_with_review_off_says_nothing() {
+        let (_, problems) = settled("eitri.config.set('review.enabled', false)\n");
+        assert!(problems.is_empty(), "{problems:?}");
     }
 
     #[test]

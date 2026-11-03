@@ -716,7 +716,11 @@ pub(super) mod tests {
             home: None,
             canonical_root: root,
         };
-        state.borrow_mut().apply_review(ReviewConfig { enabled, hint: false });
+        state.borrow_mut().apply_review(ReviewConfig {
+            enabled,
+            hint: false,
+            live: false,
+        });
         let state = state.borrow();
         assert_eq!(state.tabs.turn_review().is_some(), enabled);
 

@@ -27,6 +27,8 @@ use crate::tab_restore::{PlannedTab, RestorePlan, RestoreRun, Skipped};
 pub use crate::tabs::ViewId;
 use crate::tabs::{self, TabFacts, TabId};
 
+mod live_edits;
+pub use live_edits::LiveEdit;
 mod moving;
 mod shell;
 pub use moving::{FrozenChat, FrozenTab, MoveRefusedWhy, SendGate, Sent, TabHandoff};
@@ -565,6 +567,8 @@ struct ClientCalls {
     news: Vec<ClientCallNews>,
     /// Successful edits for the follower, separate from the broker's call lifecycle.
     edited: Vec<PathBuf>,
+    live_edits: Vec<live_edits::QueuedLiveEdit>,
+    live_edits_on: bool,
     /// The position of the newest interrupted turn already reported.
     last_interrupt: Option<u64>,
 }
@@ -1492,6 +1496,7 @@ pub struct TabSet {
     kind: BackendKind,
     default_mode: SessionModeChoice,
     following_default: bool,
+    live_edits: bool,
     /// The agent a tab the set opens by itself runs (the base view's fresh tab once its last one
     /// left): Claude until `agent.default` is applied ([`TabSet::apply_configured_agent`]).
     configured_agent: AgentId,
@@ -1638,6 +1643,7 @@ impl TabSet {
             kind,
             default_mode,
             following_default: false,
+            live_edits: false,
             configured_agent: AgentId::Claude,
             pending_bypass: None,
             next_nonce: 1,
@@ -2180,6 +2186,7 @@ impl TabSet {
         };
         let calls = &mut tab.session.client_calls;
         calls.edited.clear();
+        calls.live_edits.clear();
         let mut unreported = Vec::new();
         for news in std::mem::take(&mut calls.news) {
             if let ClientCallNews::Opened(call) = news {
@@ -2345,8 +2352,9 @@ impl TabSet {
         } else {
             agent.offered_mode(self.default_mode)
         };
-        self.tabs
-            .push(Tab::new(id, number, mode, agent, self.following_default));
+        let mut tab = Tab::new(id, number, mode, agent, self.following_default);
+        tab.session.client_calls.live_edits_on = self.live_edits;
+        self.tabs.push(tab);
         self.tabs.sort_by_key(|t| t.number);
         id
     }
@@ -3508,6 +3516,7 @@ impl TabSet {
                 in_a_page,
                 on_screen: in_a_page && mapped(tab.view),
             };
+            tab.session.client_calls.live_edits_on = self.live_edits;
             Self::pump_tab(tab, &mut tick, review.as_deref_mut(), place, &mut out);
         }
         for id in self.steer_waiting(wall_clock_ms()) {
@@ -3665,6 +3674,7 @@ impl TabSet {
         }
         let resynced = matches!(delivery, RevisedDelivery::Resync);
         let mut live = LiveTab {
+            live_edits: tab.session.client_calls.live_edits_on,
             following: tab.following,
             id: tab.id,
             mode: tab.mode,
@@ -3790,24 +3800,7 @@ impl TabSet {
             .map_or(through_revision, |(revision, _)| revision.saturating_sub(1));
         let (revisions, events): (Vec<u64>, Vec<AgentDomainEvent>) = tagged.into_iter().unzip();
         let (in_snapshot, fresh) = events.split_at(shown);
-        if live.following {
-            for event in &events {
-                let mut event = event;
-                while let AgentDomainEvent::SubagentFrame { frame, .. } = event {
-                    event = frame.as_ref();
-                }
-                if let AgentDomainEvent::ToolCallCompleted {
-                    tool_use_id,
-                    is_error: false,
-                    ..
-                } = event
-                {
-                    // Release the projection's guard before touching any other backend state.
-                    let paths = live.backend.edited_by(tool_use_id);
-                    live.session.client_calls.edited.extend(paths);
-                }
-            }
-        }
+        live_edits::collect(live, &events);
         for event in &events {
             match event {
                 AgentDomainEvent::TurnStarted { .. } => live.session.was_running = true,
@@ -6416,6 +6409,7 @@ struct PumpPlace {
 
 /// The parts of a live tab a pump arm works on, borrowed apart so the backend is used beside them.
 struct LiveTab<'a> {
+    live_edits: bool,
     following: bool,
     id: TabId,
     mode: SessionModeChoice,

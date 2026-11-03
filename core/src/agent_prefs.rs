@@ -134,6 +134,14 @@ pub const REVIEW_ENABLED_KEY: &str = "review.enabled";
 /// The `init.lua` key: `eitri.config.set("review.hint", true | false)`.
 pub const REVIEW_HINT_KEY: &str = "review.hint";
 
+/// Whether completed agent edits are drawn in buffers shown in the editor.
+pub const REVIEW_LIVE_KEY: &str = "review.live";
+pub const REVIEW_LIVE_DEFAULT: bool = false;
+
+pub fn parse_review_live(value: Option<&str>) -> Result<bool, String> {
+    crate::config_switch::parse_switch(REVIEW_LIVE_KEY, value, REVIEW_LIVE_DEFAULT)
+}
+
 /// [`REVIEW_ENABLED_KEY`]: whether turn review runs at all. Unset means it does.
 pub fn parse_review_enabled(value: Option<&str>) -> Result<bool, String> {
     crate::config_switch::parse_switch(REVIEW_ENABLED_KEY, value, true)
@@ -661,6 +669,21 @@ mod tests {
             assert_eq!(parse_user_settings(Some(value)), Ok(expected));
             assert_eq!(parse_review_enabled(Some(value)), Ok(expected));
             assert_eq!(parse_review_hint(Some(value)), Ok(expected));
+        }
+    }
+
+    #[test]
+    fn review_live_defaults_to_the_constant_and_parses_a_switch() {
+        assert_eq!(parse_review_live(None), Ok(REVIEW_LIVE_DEFAULT));
+        for (value, expected) in [("true", true), ("on", true), ("false", false), (" off ", false)] {
+            assert_eq!(parse_review_live(Some(value)), Ok(expected));
+        }
+        for bad in ["", "yes", "1", "TRUE"] {
+            let why = parse_review_live(Some(bad)).unwrap_err();
+            assert!(
+                why.contains(REVIEW_LIVE_KEY) && why.contains(&format!("{bad:?}")),
+                "{why}"
+            );
         }
     }
 

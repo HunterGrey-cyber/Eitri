@@ -50,8 +50,7 @@ pub struct WindowConfig {
     pub companion_wm: eitri_core::compositor::WmChoice,
     /// `window.tiling`: whether chats and pages open as windows of the compositor.
     pub tiling: eitri_core::compositor::mode::TilingChoice,
-    /// `review.enabled` and `review.hint`: whether turn review runs, and whether a finished turn
-    /// puts a hint in the status band.
+    /// Whether turn review runs, shows a finished-turn hint, and draws completed edits live.
     pub review: ReviewConfig,
     /// `agent.editor.follow`: following for new tabs, off by default.
     pub editor_follow: bool,
@@ -338,14 +337,18 @@ fn read(kernel: &Kernel, panels: &[LuaPanelMeta]) -> Result<WindowConfig, String
     // Whether turn review runs (`review.enabled`, default true) and whether a finished turn puts a
     // hint in the status band (`review.hint`, default false). Anything but true/false is a startup
     // failure naming the key, like `agent.user_settings` above.
-    let review = ReviewConfig {
+    let mut review = ReviewConfig {
         enabled: eitri_core::agent_prefs::parse_review_enabled(
             kernel.config.borrow().get(eitri_core::agent_prefs::REVIEW_ENABLED_KEY),
         )?,
         hint: eitri_core::agent_prefs::parse_review_hint(
             kernel.config.borrow().get(eitri_core::agent_prefs::REVIEW_HINT_KEY),
         )?,
+        live: eitri_core::agent_prefs::parse_review_live(
+            kernel.config.borrow().get(eitri_core::agent_prefs::REVIEW_LIVE_KEY),
+        )?,
     };
+    review.live &= review.enabled;
 
     // How the panel shows the agent's thinking (`agent.thinking`: "collapsed", the default, "preview",
     // "expanded" or "hidden"). Anything else is a startup failure naming the key, like the keys above.
@@ -414,6 +417,7 @@ impl WindowConfig {
         panel.set_review(ReviewConfig {
             enabled: self.review.enabled,
             hint: self.review.hint,
+            live: self.review.live,
         });
         panel.set_editor_follow(self.editor_follow);
         panel.set_thinking_display(self.thinking_display);
@@ -723,6 +727,25 @@ mod tests {
             Some(eitri_core::agent_bridge::SessionModeChoice::Bypass)
         );
         assert!(problems.is_empty(), "a good value is the person's own: {problems:#?}");
+    }
+
+    #[test]
+    fn review_live_reaches_the_window_only_when_review_is_enabled() {
+        use eitri_core::agent_prefs::REVIEW_LIVE_DEFAULT;
+        assert_eq!(load_from("", &[]).unwrap().review.live, REVIEW_LIVE_DEFAULT);
+        let config = load_from("eitri.config.set('review.live', true)", &[]).unwrap();
+        assert!(config.review.live);
+        let config = load_from("eitri.config.set('review.live', false)", &[]).unwrap();
+        assert!(!config.review.live);
+        let config = load_from(
+            "eitri.config.set('review.enabled', false)\neitri.config.set('review.live', true)",
+            &[],
+        )
+        .unwrap();
+        assert!(!config.review.live);
+        let (config, problems) = settled_from("eitri.config.set('review.live', 'perhaps')");
+        assert_eq!(config.review.live, REVIEW_LIVE_DEFAULT);
+        assert_eq!(problems.len(), 1, "{problems:?}");
     }
 
     #[test]

@@ -16,10 +16,11 @@ pub(super) struct ReviewRoots {
     pub(super) canonical_root: PathBuf,
 }
 
-/// `init.lua`'s two review keys, applied once after it ran.
+/// `init.lua`'s review keys, applied once after it ran.
 pub struct ReviewConfig {
     pub enabled: bool,
     pub hint: bool,
+    pub live: bool,
 }
 
 impl AgentPanelState {
@@ -42,6 +43,7 @@ impl AgentPanelState {
             self.tabs.turn_review_off();
             eprintln!("[review] turn review is off (init.lua's review.enabled = false)");
         }
+        self.tabs.set_live_edits(self.review_enabled && review.live);
     }
 }
 
@@ -766,6 +768,7 @@ mod tests {
         handle.set_review(ReviewConfig {
             enabled: true,
             hint: true,
+            live: false,
         });
         assert_eq!(settings(&page.inner.sent), vec![(false, false), (true, true)]);
         handle.page_message(ViewId::BASE, r#"{"type":"ready","request_id":"r2"}"#);
@@ -776,6 +779,7 @@ mod tests {
         handle.set_review(ReviewConfig {
             enabled: false,
             hint: true,
+            live: false,
         });
         assert_eq!(settings(&page.inner.sent).last(), Some(&(false, true)));
     }
@@ -1146,6 +1150,7 @@ mod tests {
         state.borrow_mut().apply_review(ReviewConfig {
             enabled: true,
             hint: false,
+            live: false,
         });
         assert!(state.borrow().tabs.turn_review().is_some());
         assert!(state.borrow().review_enabled);
@@ -1153,6 +1158,7 @@ mod tests {
         state.borrow_mut().apply_review(ReviewConfig {
             enabled: true,
             hint: true,
+            live: false,
         });
         assert!(state.borrow().review_hint);
 
@@ -1161,6 +1167,7 @@ mod tests {
         state.borrow_mut().apply_review(ReviewConfig {
             enabled: true,
             hint: true,
+            live: false,
         });
         assert!(state.borrow().tabs.turn_review().is_none());
         assert!(!state.borrow().review_enabled);
@@ -1169,6 +1176,7 @@ mod tests {
         state.borrow_mut().apply_review(ReviewConfig {
             enabled: false,
             hint: true,
+            live: false,
         });
         let state = state.borrow();
         assert!(state.tabs.turn_review().is_none());
