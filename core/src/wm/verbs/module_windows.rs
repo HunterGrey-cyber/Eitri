@@ -8,6 +8,10 @@
 //! never link to each other, so the session goes by resume: the source lets go of it and the target takes it up. A tab
 //! with no session has nothing to resume: its `tab.break` asks for the next free chat window instead, which is what
 //! opens a new, empty chat window from the default keys.
+//!
+//! A page window beside the person's own nvim (`ModuleWindowKind::Beside`) is a module window with no window 1: it
+//! asks no hub, runs nothing in a peer and starts no window of a group. Its keys and follow commands become
+//! [`HostOp::Beside`] ops the host carries out by the nvim it follows, a close, a compositor focus move, or one toast.
 
 use super::super::chrome;
 use super::super::close;
@@ -23,6 +27,7 @@ use crate::agent_backend::AgentId;
 use crate::keymap::action::{parse, Action, OptValue};
 use crate::keymap::compositor::{classify_module, classify_window1, off_hint, HubVerb, ModuleVerb};
 use crate::layout::{ModuleId, ModuleKind};
+use crate::plugin::follow_feed::FollowCmd;
 use crate::tabs::TabId;
 use crate::window_link::names::WindowName;
 use crate::window_link::{FocusTarget, HubAsk};
@@ -90,6 +95,9 @@ pub fn run_hub(w: &mut Window, reads: &dyn HostReads, win: WinId, action: &Actio
 
 /// A module window's verdict on `action`.
 pub fn run_module(w: &mut Window, reads: &dyn HostReads, win: WinId, action: &Action, batch: &mut Batch) -> bool {
+    if w.is_beside() {
+        return run_beside(w, win, action, batch);
+    }
     if in_a_page_window(w) && matches!(classify_window1(action), HubVerb::ToLastChat) {
         w.say(format!(
             "[keys] {}: this window has no chat; asks window 1",
@@ -120,6 +128,102 @@ pub fn run_module(w: &mut Window, reads: &dyn HostReads, win: WinId, action: &Ac
         ModuleVerb::Off => off(w, reads, action),
     }
     true
+}
+
+/// Which of a beside window's texts it has shown: each is toasted on its first press in the window, then only logged.
+#[derive(Debug, Default)]
+pub struct BesideToasts {
+    off: bool,
+    no_chat: bool,
+    tmux: bool,
+}
+
+/// A beside window's verdict on `action`: `true` when it was decided here, `false` when it goes on to the family
+/// routing as in any module window (text size, `f`, the send-prefix, the kill that closes the window). Nothing it
+/// decides reaches another window by a link: there is none.
+pub fn run_beside(w: &mut Window, win: WinId, action: &Action, batch: &mut Batch) -> bool {
+    match action {
+        // `tab.break` has no tab to move and no chat window to move it to.
+        Action::TabBreak | Action::InstanceNew { .. } | Action::ProjectChoose => {
+            beside_off(w, action);
+            return true;
+        }
+        Action::Module(id) => {
+            beside_module_key(w, action, id, batch);
+            return true;
+        }
+        _ => {}
+    }
+    if matches!(classify_window1(action), HubVerb::ToLastChat) {
+        let name = action.name();
+        w.say(format!("[keys] {name}: no chat in a window beside nvim"));
+        if !w.beside_toasts.no_chat {
+            w.beside_toasts.no_chat = true;
+            chrome::show_toast(w, feedback::BESIDE_NO_CHAT_TEXT.to_owned(), ToastKind::Other);
+        }
+        return true;
+    }
+    match classify_module(action) {
+        ModuleVerb::AsToday => return false,
+        ModuleVerb::EdgeToCompositor(direction) => {
+            w.say(format!("[keys] {}: the compositor moves the focus", action.name()));
+            batch.push_effect(HostOp::CompositorFocus { win, direction });
+        }
+        ModuleVerb::AskHub | ModuleVerb::TabBreak | ModuleVerb::Off => beside_off(w, action),
+        ModuleVerb::LogOnly => w.say(format!("[keys] {}: nothing to act on in this window", action.name())),
+    }
+    true
+}
+
+/// A module key in a beside window: the agent's window and another page's window are the host's to raise or start,
+/// the editor's is the window holding the nvim this one follows. A terminal or a canvas has no window here.
+fn beside_module_key(w: &mut Window, action: &Action, id: &ModuleId, batch: &mut Batch) {
+    let name = action.name();
+    match id.kind() {
+        ModuleKind::Agent => {
+            w.say(format!("[keys] {name}: the agent window comes forward, or one starts"));
+            batch.push_effect(HostOp::Beside(BesideOp::Agent));
+        }
+        ModuleKind::Editor => beside_raise_editor(w, &name, batch),
+        ModuleKind::LuaWebview => match WindowName::for_module(id) {
+            Some(page) if w.module_name.as_ref() == Some(&page) => {
+                w.say(format!("[keys] {name}: this window shows it"));
+            }
+            Some(WindowName::Page(page)) => {
+                w.say(format!("[keys] {name}: its page window comes forward, or one starts"));
+                batch.push_effect(HostOp::Beside(BesideOp::Page(page)));
+            }
+            Some(WindowName::Chat(_) | WindowName::Second) | None => no_page_window(w, id),
+        },
+        ModuleKind::Terminal | ModuleKind::Canvas => beside_off(w, action),
+    }
+}
+
+/// The window holding the nvim a beside window follows comes forward, for `what`: a key or a page's focus.
+pub fn beside_raise_editor(w: &mut Window, what: &str, batch: &mut Batch) {
+    w.say(format!("[keys] {what}: the editor's window comes forward"));
+    batch.push_effect(HostOp::Beside(BesideOp::RaiseEditor));
+}
+
+/// A key a beside window has no use for: the first press says why on the toast, every press on the log.
+fn beside_off(w: &mut Window, action: &Action) {
+    w.say(format!("[keys] {}: off in a window beside nvim", action.name()));
+    if !w.beside_toasts.off {
+        w.beside_toasts.off = true;
+        chrome::show_toast(w, feedback::BESIDE_OFF_TEXT.to_owned(), ToastKind::Other);
+    }
+}
+
+/// The host could not carry out a beside op. Inside tmux the editor's window cannot be reached, which is said once
+/// and then only logged, as an off key is; any other reason is a refusal, shown each time.
+pub fn beside_refused(w: &mut Window, win: WinId, why: String, batch: &mut Batch) {
+    w.say(format!("[window] beside: {why}"));
+    if why != feedback::BESIDE_TMUX_TEXT {
+        w.refuse(win, why, batch);
+    } else if !w.beside_toasts.tmux {
+        w.beside_toasts.tmux = true;
+        chrome::show_toast(w, why, ToastKind::Other);
+    }
 }
 
 /// A page window holds one page and no chat, so a chat key has nothing to act on there.
@@ -185,17 +289,38 @@ pub fn hide_key_of_a_window(w: &mut Window, module: &ModuleId) -> bool {
 }
 
 /// A plugin's follow command, in a window where plugin pages are windows of their own; `false` where they are tiles.
-/// Window 1 opens a page that has no window yet, leaving the keys where they are as a follow command does in `eitri`
-/// mode. Once a page has its window the command reaches that window, which keeps it: only the compositor closes it.
-pub fn follow(w: &mut Window, win: WinId, module: &ModuleId, show: bool, batch: &mut Batch) -> bool {
+/// Window 1 opens a page that has no window yet on a `Show`, leaving the keys where they are as a follow command does
+/// in `eitri` mode. Once a page has its window in a group the command reaches that window, which keeps it: only the
+/// compositor closes it. A window beside nvim has no window 1 to open it, so it answers every command itself.
+pub fn follow(w: &mut Window, cx: &Cx, win: WinId, module: &ModuleId, cmd: FollowCmd, batch: &mut Batch) -> bool {
     match w.tiling {
         Tiling::Eitri => return false,
-        Tiling::Hub if show => follow_opens(w, win, module, batch),
+        Tiling::ModuleWindow if w.is_beside() => follow_beside(w, cx, win, module, cmd, batch),
+        Tiling::Hub if cmd == FollowCmd::Show => follow_opens(w, win, module, batch),
         Tiling::Hub | Tiling::ModuleWindow => w.say(format!(
             "[modules] {module}: the editor's follow command leaves the window as it is, the compositor's"
         )),
     }
     true
+}
+
+/// A follow command in a window beside nvim, which is open exactly while its page is shown. `Show` brings it
+/// forward; `Hide` and `Toggle` close it, asking nothing; `Auto` fires on every buffer of a followed filetype the
+/// person enters, so it never raises the window or takes the keyboard from nvim.
+fn follow_beside(w: &mut Window, cx: &Cx, win: WinId, module: &ModuleId, cmd: FollowCmd, batch: &mut Batch) {
+    match cmd {
+        FollowCmd::Show => {
+            w.say(format!("[modules] {module}: shown, so this window comes forward"));
+            batch.push_effect(HostOp::Beside(BesideOp::RaiseSelf));
+        }
+        FollowCmd::Hide | FollowCmd::Toggle => {
+            w.say(format!("[modules] {module}: {cmd:?} closes this window"));
+            close::request(w, cx, win, close::CloseCause::User, batch);
+        }
+        FollowCmd::Auto => w.say(format!(
+            "[modules] {module}: a followed buffer was entered; this window stays where it is"
+        )),
+    }
 }
 
 fn follow_opens(w: &mut Window, win: WinId, module: &ModuleId, batch: &mut Batch) {

@@ -619,6 +619,9 @@ pub enum HostOp {
     CompositorFocus { win: WinId, direction: Direction },
     /// A module window asks window 1 for another window of its own.
     HubAsk { win: WinId, ask: HubAsk },
+    /// What a window beside the person's own nvim asks of the windows around it: it belongs to no group, so the
+    /// host carries it out on its own, by the nvim the window follows.
+    Beside(BesideOp),
     /// Builds the window's base chat page, once, at the start step the mode's facts allow. The only way one comes to
     /// exist: a window that shows no chat of its own never gets this op.
     BuildBasePage { win: WinId },
@@ -693,6 +696,20 @@ pub enum HostOp {
     Onboarding(OnboardingOp),
     /// Runs Lua after all other operations.
     Lua(LuaOp),
+}
+
+/// What a window beside the person's own nvim asks the host for. Each is carried out off the UI thread, and a
+/// refusal comes back as [`HostEvent::Refused`] with [`OpTag::Beside`], its text the reason.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum BesideOp {
+    /// The project's agent window comes forward, or one is started for the nvim this window follows.
+    Agent,
+    /// The page window of this plugin id, for the same nvim, is started or comes forward.
+    Page(String),
+    /// The window that holds the nvim this window follows comes forward.
+    RaiseEditor,
+    /// This window comes forward.
+    RaiseSelf,
 }
 
 /// What the first-start screen asks the host to do. Every op of a screen carries the generation the controller
@@ -2012,6 +2029,8 @@ pub enum OpTag {
     CompositorFocus,
     /// Identifies HubAsk operations.
     HubAsk,
+    /// Identifies Beside operations.
+    Beside,
     /// Identifies BuildBasePage operations.
     BuildBasePage,
     /// Identifies HandOverTab operations.
@@ -2083,6 +2102,7 @@ impl OpTag {
             HostOp::PeerRun { .. } => Self::PeerRun,
             HostOp::CompositorFocus { .. } => Self::CompositorFocus,
             HostOp::HubAsk { .. } => Self::HubAsk,
+            HostOp::Beside(..) => Self::Beside,
             HostOp::BuildBasePage { .. } => Self::BuildBasePage,
             HostOp::HandOverTab { .. } => Self::HandOverTab,
             HostOp::KeepTab { .. } => Self::KeepTab,
@@ -2487,6 +2507,7 @@ mod tests {
             OrderBaseTabs
         );
         tag!(HostOp::EndPeer { win, peer: PeerId(2) }, EndPeer);
+        tag!(HostOp::Beside(BesideOp::RaiseSelf), Beside);
         tag!(map(module.clone()), Map);
         tag!(
             HostOp::Unmap {

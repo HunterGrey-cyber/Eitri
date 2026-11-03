@@ -132,12 +132,23 @@ pub fn request(w: &mut Window, cx: &Cx, win: WinId, cause: CloseCause, batch: &m
     if ended(w) {
         return;
     }
+    let beside = w.is_beside();
     // The signal's own handler has said so, through a write that never blocks; a group's close was asked in window 1.
     if matches!(cause, CloseCause::Signal(_) | CloseCause::GroupClosed) {
-        if matches!(cause, CloseCause::Signal(_)) && w.tiling == Tiling::ModuleWindow {
+        // A group's window keeps its place for the group's next start; a window beside nvim is in no group.
+        if matches!(cause, CloseCause::Signal(_)) && w.tiling == Tiling::ModuleWindow && !beside {
             batch.push_effect(HostOp::Cleanup(CleanupOp::KeepThisWindow));
         }
         teardown(w, win, batch);
+        return;
+    }
+    // A window beside nvim holds no tab and no turn, and the nvim it shows is the person's own, which its close must
+    // never ask to quit: it tears down from an idle, as a close nothing holds does, with no question.
+    if beside {
+        if w.close.teardown.is_none() {
+            w.close.state = CloseState::Quitting;
+            w.close.teardown = Some(w.arm_idle());
+        }
         return;
     }
     // Whatever it answers; a `y` has been counted already, as the ask it answers.

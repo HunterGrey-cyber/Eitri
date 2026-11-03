@@ -7,7 +7,7 @@ use crate::wm::fake::{FakeHost, FakeScheduler, Logged};
 use crate::wm::host::*;
 use crate::wm::persist::Saver;
 use crate::wm::verbs::rig::{decl, rig_with, WIN};
-use crate::wm::window::Tiling;
+use crate::wm::window::{ModuleWindowKind, Tiling, WindowRole};
 use crate::wm::Driver;
 use std::cell::RefCell;
 use std::path::Path;
@@ -1696,4 +1696,97 @@ fn a_declined_close_after_a_hubs_nvim_exited_leaves_the_terminal_and_the_way_bac
         r.ops()
     );
     assert!(r.layout.borrow().is_shown(&ModuleId::editor()));
+}
+
+/// A page window beside the person's own nvim, driven: a module window of no group, with no window 1 and no link.
+fn beside_window() -> Rig {
+    let page = ModuleId::lua("notes");
+    let only = Layout::new(Node::Leaf(page.clone()), page.clone()).unwrap();
+    let mut r = rig_with(only, |_, _| None);
+    let w = r.controller.window_mut(WIN).unwrap();
+    w.tiling = Tiling::ModuleWindow;
+    w.spec.role = WindowRole::Companion;
+    let r = driven_rig(r);
+    r.driver.set_module_name(WIN, WindowName::for_module(&page).unwrap());
+    r.driver.set_module_kind(WIN, ModuleWindowKind::Beside);
+    r
+}
+
+/// What a close of a beside window must never send: a quit or an end, which would reach the person's own nvim.
+fn asks_an_editor(op: &HostOp) -> bool {
+    matches!(
+        op,
+        HostOp::Editor(EditorCall::Quit { .. } | EditorCall::End { .. } | EditorCall::Reveal { .. })
+    )
+}
+
+#[test]
+fn a_signal_keeps_no_beside_window() {
+    let r = beside_window();
+    r.signal();
+    assert!(
+        !r.ops().contains(&HostOp::Cleanup(CleanupOp::KeepThisWindow)),
+        "no group keeps a place for it"
+    );
+    assert_eq!(r.close_count(), 1);
+    assert!(!r.ops().iter().any(asks_an_editor), "{:?}", r.ops());
+
+    // A page window of a group still keeps its place.
+    let page = ModuleId::lua("notes");
+    let r = driven_tiled(
+        Layout::new(Node::Leaf(page.clone()), page.clone()).unwrap(),
+        Tiling::ModuleWindow,
+    );
+    r.driver.set_module_name(WIN, WindowName::for_module(&page).unwrap());
+    r.signal();
+    assert!(r.ops().contains(&HostOp::Cleanup(CleanupOp::KeepThisWindow)));
+}
+
+#[test]
+fn a_user_close_of_a_beside_window_asks_nothing() {
+    let busy = |r: &Rig| {
+        r.running();
+        r.host.set_editor_facts(EditorFacts {
+            running: true,
+            ..Default::default()
+        });
+    };
+    for by in [CloseBy::User, CloseBy::Compositor] {
+        let r = beside_window();
+        busy(&r);
+        let at = r.ops().len();
+        assert_eq!(r.driver.close_requested(WIN, by.clone()), CloseVerdict::Stop);
+        assert_eq!(
+            r.ops().len(),
+            at,
+            "{by:?}: torn down from an idle, never inside the request"
+        );
+        assert!(
+            r.driver.query(|c| c.chrome(WIN).prompt.is_none()),
+            "{by:?}: no question"
+        );
+        r.advance();
+        assert_eq!(r.close_count(), 1, "{by:?}");
+        assert!(!r.ops().iter().any(asks_an_editor), "{by:?}: {:?}", r.ops());
+        assert!(
+            r.driver.query(|c| c.chrome(WIN).prompt.is_none()),
+            "{by:?}: no question"
+        );
+    }
+    // The kill key closes it the same way.
+    let r = beside_window();
+    busy(&r);
+    r.driver
+        .run(WIN, crate::keymap::Action::ModuleKill, Origin::Key { keycode: 7 });
+    r.advance();
+    assert_eq!(r.close_count(), 1);
+    assert!(!r.ops().iter().any(asks_an_editor), "{:?}", r.ops());
+    assert!(r.driver.query(|c| c.chrome(WIN).prompt.is_none()));
+
+    // A second close while the first tears down closes once.
+    let r = beside_window();
+    r.driver.close_requested(WIN, CloseBy::User);
+    r.driver.close_requested(WIN, CloseBy::User);
+    r.advance();
+    assert_eq!(r.close_count(), 1);
 }

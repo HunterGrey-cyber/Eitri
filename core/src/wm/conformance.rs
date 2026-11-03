@@ -854,6 +854,21 @@ pub fn pair_refusal_scripts(f: &Fixture) -> Vec<Script> {
                 },
             ],
         },
+        // A host with no window beside nvim has no nvim to carry a beside op out by.
+        Script {
+            name: "a_refused_beside_op_is_posted_refused",
+            ops: vec![HostOp::Beside(BesideOp::RaiseEditor)],
+            expect: vec![
+                Expect::Answer {
+                    op: 0,
+                    applied: Applied::Refused,
+                },
+                Expect::PostedDuring {
+                    op: 0,
+                    event: EventMatch::Refused(OpTag::Beside),
+                },
+            ],
+        },
         Script {
             name: "a_refused_compositor_focus_is_posted_refused",
             ops: vec![HostOp::CompositorFocus {
@@ -1069,6 +1084,7 @@ mod tests {
                         | HostOp::PeerRun { .. }
                         | HostOp::HubAsk { .. }
                         | HostOp::CompositorFocus { .. }
+                        | HostOp::Beside(_)
                 )
             });
             let sink = Rc::new(RecordingSink::default());

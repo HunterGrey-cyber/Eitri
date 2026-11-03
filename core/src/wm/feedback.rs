@@ -857,6 +857,14 @@ pub fn off_in_compositor_mode_log(action: &str) -> String {
     format!("[keys] {action}: off in compositor mode")
 }
 
+/// A layout, window or pair key in a window beside the person's own nvim: no Eitri layout is there to change.
+pub const BESIDE_OFF_TEXT: &str = "not here: your window manager arranges this window";
+/// A chat key in a window beside the person's own nvim, which holds no chat.
+pub const BESIDE_NO_CHAT_TEXT: &str = "no chat here: press the prefix and a to open the agent";
+/// The editor key in a window beside an nvim that runs inside tmux: what holds that nvim is the tmux server, not a
+/// window Eitri could bring forward.
+pub const BESIDE_TMUX_TEXT: &str = "your nvim runs inside tmux: use your window manager's keys to reach it";
+
 /// What a window verb that needs the other window says while none is attached: in window 2, that its window 1 is
 /// gone; anywhere else, that there is no second window yet.
 pub fn no_other_window_text(role: &super::window::WindowRole) -> &'static str {

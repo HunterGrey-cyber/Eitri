@@ -358,6 +358,13 @@ impl Driver<Controller> {
         self.submit(batch);
     }
 
+    /// A plugin's follow command for its module, as nvim sent it ([`Controller::follow_cmd`]): what a window beside
+    /// nvim is given, unsorted, since only the controller knows what each command means there.
+    pub fn follow_cmd(&self, win: WinId, module: &ModuleId, cmd: crate::plugin::follow_feed::FollowCmd) {
+        let batch = self.decide.borrow_mut().follow_cmd(win, module, cmd);
+        self.submit(batch);
+    }
+
     /// Returns an editor request's outcome to its caller, so a linked panel receives refusals in its own window.
     /// A borrowed controller refuses because the request cannot be checked while another decision is in progress.
     pub fn editor_request(&self, win: WinId, keys: String) -> Result<(), String> {
@@ -423,6 +430,12 @@ impl Driver<Controller> {
     /// Which chat or page window `win` is ([`Controller::set_module_name`]).
     pub fn set_module_name(&self, win: WinId, name: crate::window_link::names::WindowName) {
         self.decide.borrow_mut().set_module_name(win, name);
+    }
+
+    /// Whether `win` is a group's module window or one beside the person's own nvim
+    /// ([`Controller::set_module_kind`]).
+    pub fn set_module_kind(&self, win: WinId, kind: super::window::ModuleWindowKind) {
+        self.decide.borrow_mut().set_module_kind(win, kind);
     }
 
     /// What `win`'s start knows so far ([`Controller::set_early_facts`]).

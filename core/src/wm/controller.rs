@@ -27,13 +27,15 @@ use super::module::{Lifecycle, SurfaceDecl};
 use super::verbs::modules::{self as module_verbs, ModuleSetup};
 use super::verbs::{self, FloatGate, SelectionGate};
 use super::window::{
-    EditorPresence, Monitor, PeerId, QueuedOpen, Timers, WinId, Window, WindowParts, WindowPlacement, WindowSpec,
+    EditorPresence, ModuleWindowKind, Monitor, PeerId, QueuedOpen, Timers, WinId, Window, WindowParts, WindowPlacement,
+    WindowSpec,
 };
 use crate::keymap::action::Action;
 use crate::keymap::prefix::{Prefix, PrefixCommand, Press};
 use crate::keymap::Keymap;
 use crate::layout::{Arrangement, Con, ModuleId, ModuleKeys, Size};
 use crate::lua::layout::LayoutRequest;
+use crate::plugin::follow_feed::FollowCmd;
 use crate::tabs::ViewId;
 use crate::window_link::names::WindowName;
 use std::cell::Cell;
@@ -324,6 +326,13 @@ impl Controller {
         }
     }
 
+    /// Whether this module window belongs to a group or stands beside the person's own nvim.
+    pub fn set_module_kind(&mut self, win: WinId, kind: ModuleWindowKind) {
+        if let Some(window) = self.windows.get_mut(&win) {
+            window.module_kind = kind;
+        }
+    }
+
     /// The host could not start or raise the other window. The refusal names no window: a raise's goes to the
     /// window that asked for one, a start's to every window that can have a second one (one per process).
     fn window_op_refused(&mut self, what: OpTag, why: &str, batch: &mut Batch) {
@@ -430,14 +439,34 @@ impl Controller {
     }
 
     /// A plugin's follow command for `module`, through the runner's gates as the module key (a show) or
-    /// `module.hide` (a hide) meets them, then shown with the keys where they are or hidden as any hide is.
+    /// `module.hide` (a hide) meets them, then shown with the keys where they are or hidden as any hide is: what
+    /// [`Controller::follow_cmd`] does with `Show` or `Hide`.
     pub fn follow(&mut self, win: WinId, module: &ModuleId, show: bool) -> Batch {
-        let action = if show {
-            Action::Module(module.clone())
-        } else {
-            Action::ModuleHide
+        let cmd = if show { FollowCmd::Show } else { FollowCmd::Hide };
+        self.follow_cmd(win, module, cmd)
+    }
+
+    /// A plugin's follow command for `module`, as nvim sent it. A window beside nvim decides every command itself.
+    /// Any other window is given `Show` and `Hide` only, which the shell sorts out of the four by what the window
+    /// shows (a show of a page on screen dropped, an `Auto` only for a hidden one), so a `Toggle` or an `Auto` that
+    /// reaches one is logged and dropped rather than read as a show.
+    pub fn follow_cmd(&mut self, win: WinId, module: &ModuleId, cmd: FollowCmd) -> Batch {
+        let beside = self.windows.get(&win).is_some_and(Window::is_beside);
+        let action = match cmd {
+            FollowCmd::Hide => Action::ModuleHide,
+            FollowCmd::Show => Action::Module(module.clone()),
+            // Never run as an action: the beside verdict answers it before the family routing.
+            FollowCmd::Toggle | FollowCmd::Auto if beside => Action::Module(module.clone()),
+            FollowCmd::Toggle | FollowCmd::Auto => {
+                if let Some(window) = self.windows.get_mut(&win) {
+                    window.say(format!(
+                        "[modules] {module}: a {cmd:?} follow command is sorted by the shell in this window; dropped"
+                    ));
+                }
+                return Batch::default();
+            }
         };
-        let mut batch = self.run_gated(win, action, Origin::Follow, Some(module));
+        let mut batch = self.run_gated(win, action, Origin::Follow, Some((module, cmd)));
         self.settle_chrome(&mut batch);
         batch
     }
@@ -447,6 +476,15 @@ impl Controller {
     /// lands. The answer the page is given: the refusal's text, or `Ok`.
     pub fn plugin_focus(&mut self, win: WinId, module: &ModuleId) -> (Result<(), String>, Batch) {
         let mut batch = Batch::default();
+        // A window beside nvim holds no editor: the editor is the person's own nvim, in a window of its own, which
+        // comes forward as the editor key brings it.
+        if *module == ModuleId::editor() {
+            if let Some(window) = self.windows.get_mut(&win).filter(|window| window.is_beside()) {
+                verbs::module_windows::beside_raise_editor(window, "layout.focus", &mut batch);
+                self.settle_chrome(&mut batch);
+                return (Ok(()), batch);
+            }
+        }
         let mut answer = Err(super::feedback::LAYOUT_CHANGING_TEXT.to_string());
         self.modules_event(win, &mut batch, |w, cx, batch| {
             answer = module_verbs::show_on_screen(w, cx, win, module, batch)
@@ -2115,6 +2153,18 @@ impl Decide for Controller {
                     }
                 }
             }
+            // A beside window's ops name no window: only a beside window asks for one.
+            HostEvent::Refused {
+                what: OpTag::Beside,
+                why,
+                ..
+            } => {
+                for (win, window) in &mut self.windows {
+                    if window.is_beside() {
+                        verbs::module_windows::beside_refused(window, *win, why.clone(), &mut batch);
+                    }
+                }
+            }
             // The compositor's own verbs refused: the refusal's text is what the user is shown, or the flash alone.
             HostEvent::Refused {
                 what:
@@ -2321,7 +2371,13 @@ impl Controller {
 
     /// [`Controller::run_action`], with `subject` the module a follow command names: its gates are the action's,
     /// and its operation is the follow's own on `subject`.
-    fn run_gated(&mut self, win: WinId, action: Action, origin: Origin, subject: Option<&ModuleId>) -> Batch {
+    fn run_gated(
+        &mut self,
+        win: WinId,
+        action: Action,
+        origin: Origin,
+        subject: Option<(&ModuleId, FollowCmd)>,
+    ) -> Batch {
         let mut batch = Batch::default();
         if self.awaiting_layout(win, ("run", &action, &origin)) {
             return batch;
@@ -2337,6 +2393,8 @@ impl Controller {
         }
         let setup = self.setups.get(&win).cloned().unwrap_or_default();
         let keymap = self.keymaps.get(&win).map(|(keymap, _)| keymap.clone());
+        // A follow command's own operation may close the window, which reads the keymap as any close does.
+        let follow_keymap = subject.map(|_| keymap.clone().unwrap_or_else(|| Rc::new(Keymap::defaults())));
         let keymap = || keymap.unwrap_or_else(|| Rc::new(Keymap::defaults()));
         let reads = self.reads.clone();
         let window = self.windows.get_mut(&win).expect("checked above");
@@ -2348,12 +2406,16 @@ impl Controller {
         } else {
             verbs::module_windows::gate
         };
-        let decided = match subject {
-            Some(module) => {
-                let show = matches!(action, Action::Module(_));
-                verbs::module_windows::follow(window, win, module, show, &mut batch)
+        let decided = match (subject, &follow_keymap) {
+            (Some((module, cmd)), Some(keymap)) => {
+                let cx = module_verbs::Cx {
+                    reads: &*reads,
+                    keymap,
+                    setup: &setup,
+                };
+                verbs::module_windows::follow(window, &cx, win, module, cmd, &mut batch)
             }
-            None => module_gate(window, &*reads, win, &action, &mut batch),
+            _ => module_gate(window, &*reads, win, &action, &mut batch),
         };
         if decided {
             return batch;
@@ -2422,7 +2484,7 @@ impl Controller {
                     setup: &setup,
                 };
                 match subject {
-                    Some(module) => {
+                    Some((module, _)) => {
                         let show = matches!(action, Action::Module(_));
                         module_verbs::follow(window, &cx, win, module, show, &mut batch);
                     }
@@ -2522,6 +2584,83 @@ mod tests {
             driver.test_batch(|c| c.lua_request(WinId::MAIN, request));
         }
         lua_ops(&host, from)
+    }
+
+    /// A page window beside the person's own nvim, driven, with every op the host applies logged.
+    fn beside_driver() -> (
+        Rc<super::super::Driver>,
+        Rc<super::super::fake::FakeHost>,
+        Rc<FakeScheduler>,
+    ) {
+        use crate::layout::{Layout, Node};
+        use crate::wm::verbs::rig::{decl, rig, WIN};
+        let page = ModuleId::lua("notes");
+        let mut r = rig(Layout::new(Node::Leaf(page.clone()), page.clone()).unwrap());
+        let window = r.controller.window_mut(WIN).unwrap();
+        window.tiling = super::super::window::Tiling::ModuleWindow;
+        window.spec.role = WindowRole::Companion;
+        r.controller
+            .set_module_name(WIN, WindowName::for_module(&page).unwrap());
+        r.controller.set_module_kind(WIN, ModuleWindowKind::Beside);
+        r.host.with_surface(WIN, page.clone(), decl(&page).kind, false);
+        let driver = super::super::Driver::new(r.controller, r.host.clone(), r.scheduler.clone());
+        let sink: Rc<dyn HostSink> = driver.clone();
+        r.host.attach(Rc::downgrade(&sink));
+        r.scheduler.attach(Rc::downgrade(&sink));
+        driver.test_batch(|_| r.first);
+        (driver, r.host, r.scheduler)
+    }
+
+    #[test]
+    fn beside_follow_cmd_through_the_driver_show_raises_hide_and_toggle_close_auto_only_logs() {
+        let page = ModuleId::lua("notes");
+        let after = |cmd: FollowCmd| {
+            let (driver, host, scheduler) = beside_driver();
+            let from = host.log().len();
+            driver.follow_cmd(WinId::MAIN, &page, cmd);
+            scheduler.advance(Duration::ZERO);
+            let mut ops = lua_ops(&host, from);
+            ops.retain(|op| !matches!(op, HostOp::Chrome { .. }));
+            let chrome = driver.query(|c| c.chrome(WinId::MAIN));
+            (ops, chrome)
+        };
+        let closes = |ops: &[HostOp]| ops.iter().any(|op| matches!(op, HostOp::CloseWindow { .. }));
+        let (ops, _) = after(FollowCmd::Show);
+        assert_eq!(
+            ops,
+            vec![HostOp::Beside(BesideOp::RaiseSelf)],
+            "a page already on screen comes forward"
+        );
+        for cmd in [FollowCmd::Hide, FollowCmd::Toggle] {
+            let (ops, chrome) = after(cmd);
+            assert!(closes(&ops), "{cmd:?}: {ops:?}");
+            assert!(chrome.prompt.is_none(), "{cmd:?} asks nothing");
+            assert!(!ops.iter().any(|op| matches!(op, HostOp::Beside(_))), "{cmd:?}");
+        }
+        let (ops, chrome) = after(FollowCmd::Auto);
+        assert!(ops.is_empty(), "no raise, no focus, no close: {ops:?}");
+        assert!(chrome.toast.is_none());
+        assert!(chrome.prompt.is_none());
+    }
+
+    #[test]
+    fn a_beside_plugin_focus_on_the_editor_raises_the_editor_window() {
+        let (driver, host, _) = beside_driver();
+        let from = host.log().len();
+        assert_eq!(driver.plugin_focus(WinId::MAIN, &ModuleId::editor()), Ok(()));
+        let mut ops = lua_ops(&host, from);
+        ops.retain(|op| !matches!(op, HostOp::Chrome { .. }));
+        assert_eq!(ops, vec![HostOp::Beside(BesideOp::RaiseEditor)]);
+
+        // In a window of a group nothing changes: it has no editor, so the page is told so.
+        let (driver, host) = {
+            let (driver, host, _) = beside_driver();
+            driver.set_module_kind(WinId::MAIN, ModuleWindowKind::InGroup);
+            (driver, host)
+        };
+        let from = host.log().len();
+        assert!(driver.plugin_focus(WinId::MAIN, &ModuleId::editor()).is_err());
+        assert!(!lua_ops(&host, from).iter().any(|op| matches!(op, HostOp::Beside(_))));
     }
 
     #[test]

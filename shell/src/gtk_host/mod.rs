@@ -1716,6 +1716,11 @@ impl Host for GtkHost {
             HostOp::PeerRun { win, peer, name, opts } => self.peer_run(op, *win, *peer, name, opts),
             HostOp::CompositorFocus { direction, .. } => self.compositor_focus(op, *direction),
             HostOp::HubAsk { win, ask } => self.hub_ask(op, *win, ask),
+            // Only a window beside nvim carries these out, by the nvim it follows; this host has none to go by.
+            HostOp::Beside(beside) => {
+                eprintln!("[page] {beside:?}: no window beside nvim here to carry it out");
+                self.refuse(op, NOT_CARRIED_OUT)
+            }
             HostOp::BuildBasePage { .. } => {
                 // Cloned out first: the page's build reaches the panel, and through it the host again.
                 let maker = self.base_page_maker.borrow().clone();

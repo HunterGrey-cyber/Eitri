@@ -7,11 +7,13 @@ use crate::keymap::prefix::{Press, Waiting};
 use crate::keymap::{KeySpec, Keymap};
 use crate::layout::{Axis, Direction, Layout, ModuleId, ModuleKeys, ModuleKind, Node};
 use crate::lua::layout::LayoutRequest;
+use crate::plugin::follow_feed::FollowCmd;
 use crate::tabs::{TabId, ViewId};
 use crate::window_link::names::WindowName;
 use crate::window_link::HubAsk;
 use crate::wm::fake::FakePeerPort;
-use crate::wm::window::Tiling;
+use crate::wm::feedback::{BESIDE_NO_CHAT_TEXT, BESIDE_OFF_TEXT, BESIDE_TMUX_TEXT};
+use crate::wm::window::{ModuleWindowKind, Tiling};
 use crate::wm::*;
 use std::rc::Rc;
 
@@ -1299,4 +1301,333 @@ fn a_request_for_what_is_off_in_a_hub_changes_nothing_and_hints_once() {
     ] {
         assert_eq!(said(&r, &format!("[keys] {line}: off in compositor mode")), 1, "{line}");
     }
+}
+
+/// The page a beside window shows in these tests.
+fn own_page() -> ModuleId {
+    ModuleId::lua("notes")
+}
+
+/// A page window beside the person's own nvim: a module window of no group, showing `notes`.
+fn beside() -> Rig {
+    let page = own_page();
+    let mut r = rig_in(
+        Tiling::ModuleWindow,
+        Layout::new(Node::Leaf(page.clone()), page.clone()).unwrap(),
+    );
+    r.controller.window_mut(WIN).unwrap().spec.role = WindowRole::Companion;
+    r.controller
+        .set_module_name(WIN, WindowName::for_module(&page).unwrap());
+    r.controller.set_module_kind(WIN, ModuleWindowKind::Beside);
+    r
+}
+
+/// Each variant of `Action` by its own number. No catch-all: a new action does not compile until it is numbered
+/// here, and [`every_action`]'s count then fails until it has a sample.
+fn action_number(action: &Action) -> usize {
+    match action {
+        Action::Move(_) => 0,
+        Action::ContainerTabbed => 1,
+        Action::ContainerStacked => 2,
+        Action::FocusParent => 3,
+        Action::FocusChild => 4,
+        Action::InstanceNew { .. } => 5,
+        Action::FloatToggle => 6,
+        Action::FocusModeToggle => 7,
+        Action::ScratchpadShow { .. } => 8,
+        Action::ScratchpadMove => 9,
+        Action::WorkspaceStep { .. } => 10,
+        Action::WorkspaceLast => 11,
+        Action::WorkspaceChoose => 12,
+        Action::ProjectChoose => 13,
+        Action::WorkspaceRename => 14,
+        Action::WorkspaceSwitch { .. } => 15,
+        Action::WorkspaceNew => 16,
+        Action::TabBreak => 17,
+        Action::WindowNew => 18,
+        Action::WindowOther => 19,
+        Action::MoveToWindow { .. } => 20,
+        Action::WorkspaceToWindow { .. } => 21,
+        Action::WorkspaceSwapWindow => 22,
+        Action::MoveFar(_) => 23,
+        Action::ToggleSplit => 24,
+        Action::Rotate { .. } => 25,
+        Action::Flip(_) => 26,
+        Action::MainHorizontal => 27,
+        Action::MainVertical => 28,
+        Action::Tiled => 29,
+        Action::CycleLayout { .. } => 30,
+        Action::Spread => 31,
+        Action::LayoutUndo => 32,
+        Action::MarkToggle => 33,
+        Action::MarkClear => 34,
+        Action::SwapMarked => 35,
+        Action::SelectNumber => 36,
+        Action::SendPrefix => 37,
+        Action::SendKeys(_) => 38,
+        Action::Split { .. } => 39,
+        Action::Zoom => 40,
+        Action::Resize { .. } => 41,
+        Action::Select(_) => 42,
+        Action::SelectLast => 43,
+        Action::SelectNext => 44,
+        Action::Swap(_) => 45,
+        Action::Even(_) => 46,
+        Action::ModuleHide => 47,
+        Action::ModuleHideByKey => 48,
+        Action::ModuleKill => 49,
+        Action::Module(_) => 50,
+        Action::Tab(_) => 51,
+        Action::Hint => 52,
+        Action::PanelReload => 53,
+        Action::PanelKeymap => 54,
+        Action::PanelCommandLine => 55,
+        Action::WindowImmersive => 56,
+        Action::WindowSetup => 57,
+        Action::Text(_) => 58,
+        Action::TextAll(_) => 59,
+        Action::CopyMode { .. } => 60,
+    }
+}
+
+const ACTION_VARIANTS: usize = 61;
+
+/// One action of every variant, and every kind of module key and `instance.new`, which a beside window tells apart.
+fn every_action() -> Vec<Action> {
+    let mut all = one_of_each();
+    all.extend([
+        Action::TextAll(crate::keymap::action::TextChange::Larger),
+        Action::Tab(TabAction::New),
+        Action::Select(Direction::Right),
+        Action::InstanceNew {
+            kind: ModuleKind::Agent,
+        },
+        Action::Module(ModuleId::editor()),
+        Action::Module(ModuleId::terminal()),
+        Action::Module(ModuleId::parse("canvas").unwrap()),
+        Action::Module(ModuleId::parse("agent#2").unwrap()),
+        Action::Module(own_page()),
+        Action::Module(ModuleId::lua("sketch")),
+    ]);
+    let numbers: std::collections::BTreeSet<usize> = all.iter().map(action_number).collect();
+    assert_eq!(numbers.len(), ACTION_VARIANTS, "a sample of every action");
+    all
+}
+
+/// An op that reaches another window of a group or starts one: a beside window has neither.
+fn reaches_a_group(op: &HostOp) -> bool {
+    matches!(
+        op,
+        HostOp::HubAsk { .. }
+            | HostOp::PeerRun { .. }
+            | HostOp::RaisePeer { .. }
+            | HostOp::ForwardRaise { .. }
+            | HostOp::HandOverTab { .. }
+            | HostOp::KeepTab { .. }
+            | HostOp::OpenModuleWindow { .. }
+            | HostOp::OpenLinkedWindow { .. }
+            | HostOp::RestoreLinkedWindow { .. }
+            | HostOp::StartEditorWindow { .. }
+    )
+}
+
+#[test]
+fn a_beside_window_emits_no_hub_ask_peer_run_raise_peer_or_window_start() {
+    for action in every_action() {
+        let mut r = beside();
+        let all = ops(&r.run(action.clone()));
+        assert!(!all.iter().any(reaches_a_group), "{action:?}: {all:?}");
+        let notes = r.controller.notes(WIN);
+        assert!(!notes.iter().any(|n| n.contains("BUG")), "{action:?}: {notes:?}");
+    }
+}
+
+#[test]
+fn beside_agent_editor_and_page_keys_map_to_beside_ops() {
+    let beside_ops = |action: Action| {
+        let mut r = beside();
+        ops(&r.run(action))
+    };
+    assert_eq!(
+        beside_ops(Action::Module(agent())),
+        vec![HostOp::Beside(BesideOp::Agent)]
+    );
+    assert_eq!(
+        beside_ops(Action::Module(ModuleId::parse("agent#2").unwrap())),
+        vec![HostOp::Beside(BesideOp::Agent)],
+        "one agent window answers for every chat key"
+    );
+    assert_eq!(
+        beside_ops(Action::Module(ModuleId::editor())),
+        vec![HostOp::Beside(BesideOp::RaiseEditor)]
+    );
+    assert_eq!(
+        beside_ops(Action::Module(ModuleId::lua("sketch"))),
+        vec![HostOp::Beside(BesideOp::Page("sketch".into()))]
+    );
+    let mut r = beside();
+    assert!(
+        ops(&r.run(Action::Module(own_page()))).is_empty(),
+        "its own page is here"
+    );
+    assert_eq!(toast(&r), None);
+    // Past the window's edge the compositor moves the focus, as in any module window.
+    assert_eq!(
+        beside_ops(Action::Select(Direction::Left)),
+        vec![HostOp::CompositorFocus {
+            win: WIN,
+            direction: Direction::Left
+        }]
+    );
+}
+
+#[test]
+fn beside_chat_keys_toast_once_then_log() {
+    let mut r = beside();
+    for action in [
+        Action::Tab(TabAction::New),
+        Action::PanelReload,
+        Action::PanelCommandLine,
+        Action::PanelKeymap,
+        Action::Tab(TabAction::Next),
+    ] {
+        assert!(ops(&r.run(action.clone())).is_empty(), "{action:?}");
+    }
+    let first = r.said().toast.expect("the first chat key toasts");
+    assert_eq!(first.1, BESIDE_NO_CHAT_TEXT);
+    let serial = first.0;
+    r.run(Action::PanelReload);
+    assert_eq!(r.said().toast.map(|t| t.0), Some(serial), "toasted once in the window");
+    assert_eq!(said(&r, "[keys] panel.reload: no chat in a window beside nvim"), 2);
+    // Its own text: an off key after it still says why once.
+    r.run(Action::Zoom);
+    assert_eq!(toast(&r).as_deref(), Some(BESIDE_OFF_TEXT));
+}
+
+#[test]
+fn beside_off_keys_toast_once_then_log() {
+    let mut r = beside();
+    let off = [
+        Action::Zoom,
+        Action::WindowNew,
+        Action::WindowOther,
+        Action::MoveToWindow {
+            module: None,
+            follow: false,
+        },
+        Action::WorkspaceNew,
+        Action::FloatToggle,
+        Action::ProjectChoose,
+        Action::InstanceNew {
+            kind: ModuleKind::Agent,
+        },
+        Action::InstanceNew {
+            kind: ModuleKind::Terminal,
+        },
+        Action::TabBreak,
+        Action::Module(ModuleId::terminal()),
+    ];
+    let mut pressed = std::collections::BTreeMap::<String, usize>::new();
+    for action in &off {
+        assert!(ops(&r.run(action.clone())).is_empty(), "{action:?}");
+        let times = pressed.entry(action.name()).or_default();
+        *times += 1;
+        assert_eq!(
+            said(&r, &format!("[keys] {}: off in a window beside nvim", action.name())),
+            *times,
+            "{action:?} is logged"
+        );
+    }
+    let first = r.said().toast.expect("the first off key toasts");
+    assert_eq!(first.1, BESIDE_OFF_TEXT);
+    r.run(Action::Zoom);
+    assert_eq!(r.said().toast, Some(first), "toasted once in the window");
+    assert_eq!(said(&r, "[keys] zoom: off in a window beside nvim"), 2);
+    assert_ne!(
+        BESIDE_OFF_TEXT,
+        off_hint("niri"),
+        "not the hub's text: no Eitri layout comes back here"
+    );
+}
+
+/// The host's refusal to reach the editor's window inside tmux is said once, then logged; any other refusal of a
+/// beside op is shown each time.
+#[test]
+fn a_refused_raise_of_the_editor_inside_tmux_toasts_once_then_logs() {
+    let mut r = beside();
+    let refused = |why: &str| HostEvent::Refused {
+        what: OpTag::Beside,
+        why: why.into(),
+        surface: None,
+    };
+    r.controller.handle(refused(BESIDE_TMUX_TEXT));
+    let first = r.said();
+    assert_eq!(first.toast.as_ref().map(|t| t.1.as_str()), Some(BESIDE_TMUX_TEXT));
+    r.controller.handle(refused(BESIDE_TMUX_TEXT));
+    assert_eq!(r.said(), first, "nothing more on screen");
+    assert_eq!(said(&r, &format!("[window] beside: {BESIDE_TMUX_TEXT}")), 2);
+    r.controller.handle(refused("eitri could not be started"));
+    r.controller.handle(refused("eitri could not be started"));
+    assert_eq!(r.said().flash, first.flash + 2, "a refusal flashes each time");
+
+    // A window of a group never hears it.
+    let mut r = module_window(WindowName::Chat(2));
+    let before = r.said();
+    r.controller.handle(refused("eitri could not be started"));
+    assert_eq!(r.said(), before);
+}
+
+#[test]
+fn in_group_and_hub_follow_results_are_unchanged() {
+    let page = ModuleId::lua("notes");
+    let name = WindowName::for_module(&page).unwrap();
+    let in_group = || {
+        let mut r = rig_in(
+            Tiling::ModuleWindow,
+            Layout::new(Node::Leaf(page.clone()), page.clone()).unwrap(),
+        );
+        r.controller.set_module_name(WIN, name.clone());
+        r
+    };
+    let eitri = || {
+        let r = rig_in(Tiling::Eitri, three(ModuleId::terminal()));
+        r.host
+            .with_surface(WIN, page.clone(), crate::wm::verbs::rig::decl(&page).kind, false);
+        r
+    };
+    let rigs: [(&str, &dyn Fn() -> Rig); 3] = [("hub", &hub), ("in a group", &in_group), ("eitri", &eitri)];
+    for (what, make) in rigs {
+        for show in [true, false, true] {
+            let (mut by_bool, mut by_cmd) = (make(), make());
+            let cmd = if show { FollowCmd::Show } else { FollowCmd::Hide };
+            let a = ops(&by_bool.controller.follow(WIN, &page, show));
+            let b = ops(&by_cmd.controller.follow_cmd(WIN, &page, cmd));
+            assert_eq!(a, b, "{what}: {cmd:?}");
+            assert_eq!(
+                by_bool.controller.notes(WIN),
+                by_cmd.controller.notes(WIN),
+                "{what}: {cmd:?}"
+            );
+            assert!(!a.iter().any(|op| matches!(op, HostOp::Beside(_))), "{what}");
+        }
+        // The shell sorts these for a window of a group: one that arrives is dropped, never read as a show.
+        for cmd in [FollowCmd::Toggle, FollowCmd::Auto] {
+            let mut r = make();
+            assert!(
+                ops(&r.controller.follow_cmd(WIN, &page, cmd)).is_empty(),
+                "{what}: {cmd:?}"
+            );
+        }
+    }
+    // Window 1 still opens the page's window on a show, and only then.
+    let mut r = hub();
+    assert_eq!(
+        ops(&r.controller.follow_cmd(WIN, &page, FollowCmd::Show)),
+        vec![HostOp::OpenModuleWindow {
+            win: WIN,
+            name,
+            token: None,
+            keep_keys: true,
+        }]
+    );
 }

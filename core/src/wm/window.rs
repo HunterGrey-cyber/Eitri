@@ -53,6 +53,17 @@ pub enum Tiling {
     ModuleWindow,
 }
 
+/// How a module window (`Tiling::ModuleWindow`) stands to the windows around it.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum ModuleWindowKind {
+    /// One of a group's windows, started and linked by its window 1.
+    #[default]
+    InGroup,
+    /// A page window beside the person's own nvim: no window 1, no link, no group. Its keys, follow commands and
+    /// close are decided by `verbs::module_windows`'s beside verdicts.
+    Beside,
+}
+
 /// A key action waiting for a module window that is starting: its name and the options that rebuild it.
 pub type PendingRun = (String, Vec<(String, serde_json::Value)>);
 
@@ -217,6 +228,10 @@ pub struct Window {
     pub own_window: Option<String>,
     /// How the window takes part in the compositor's tiling.
     pub tiling: Tiling,
+    /// What kind of module window this is; read only where `tiling` is `ModuleWindow`.
+    pub module_kind: ModuleWindowKind,
+    /// Which of a beside window's texts it has toasted: each is shown on its first press, then only logged.
+    pub(super) beside_toasts: super::verbs::module_windows::BesideToasts,
     pub(super) close: super::close::CloseFlow,
     pub(super) quit: super::quit::QuitFlow,
     pub(super) quit_timer: Option<(TimerToken, u32)>,
@@ -339,6 +354,8 @@ impl Window {
         Window {
             own_window: None,
             tiling: Tiling::default(),
+            module_kind: ModuleWindowKind::default(),
+            beside_toasts: Default::default(),
             close: Default::default(),
             quit: Default::default(),
             quit_timer: None,
@@ -403,6 +420,11 @@ impl Window {
             #[cfg(test)]
             notes: vec![],
         }
+    }
+
+    /// A page window beside the person's own nvim: a module window of no group.
+    pub fn is_beside(&self) -> bool {
+        self.tiling == Tiling::ModuleWindow && self.module_kind == ModuleWindowKind::Beside
     }
 
     /// Prints a verb's line on stdout.
