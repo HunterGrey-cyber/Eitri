@@ -30,7 +30,7 @@ use crate::wm::PeerId;
 pub const REVIEW_LUA: &str = concat!(include_str!("find_buf.lua"), include_str!("review.lua"));
 
 /// Bumped whenever `find_buf.lua` or `review.lua` changes.
-pub const REVIEW_LUA_VERSION: i64 = 9;
+pub const REVIEW_LUA_VERSION: i64 = 10;
 
 /// Every call into an installed module first checks that one is there, and answers
 /// `{ missing = true }` when it is not (another panel's teardown, or nvim restarted) rather than
@@ -44,22 +44,31 @@ macro_rules! guarded {
     };
 }
 
+/// A standalone query of buffers shown in non-floating windows; args `([abs_path: bin])`.
+pub const LIVE_SHOWN_LUA: &str = concat!(include_str!("find_buf.lua"), include_str!("live_shown.lua"));
+/// Draws into an already shown, unmodified buffer; args `(abs_path: bin, meta: map, hunks: [map])`.
+pub const LIVE_SHOW_LUA: &str = guarded!("return r.live_show(...)");
+/// Removes only a live overlay; args `(abs_path: bin)`.
+pub const LIVE_CLEAR_LUA: &str = guarded!("return r.live_clear(...)");
+/// The largest batch of paths queried in one editor call.
+pub const MAX_SHOWN_PATHS: usize = 256;
+
 /// Args `(abs_path: bin, meta: map, hunks: [map])`: draws into the buffer showing the file, if one
-/// is loaded. Answers `{drawn, kept, skipped, notice?, active}`; `kept` also counts hunks reverted
+/// is loaded. Answers `{drawn, kept, skipped, notice?, active, pending, live_only}`; `kept` also counts hunks reverted
 /// in the buffer that the editor still follows. A hunk drawn over text that is its new side and
 /// not its old one is also queued as an `unrevert` event, behind any earlier event, since it may
 /// have been reverted while no overlay followed it.
 pub const SHOW_LUA: &str = guarded!("return r.show(...)");
 /// Args `(abs_path: bin, line: int|nil, meta: map, hunks: [map]|nil)`: opens the file (a split
 /// when the current buffer cannot be left), puts the cursor on `line` and shows `hunks`. Answers
-/// `{opened, error?, drawn?, skipped?, notice?, active}`.
+/// `{opened, error?, drawn?, skipped?, notice?, active, pending, live_only}`.
 pub const OPEN_AND_SHOW_LUA: &str = guarded!("return r.open_and_show(...)");
-/// Args `(abs_path: bin)`: takes the file's overlay off, with no event. Answers `{active}`.
+/// Args `(abs_path: bin)`: takes the file's overlay off, with no event. Answers `{active, pending, live_only}`.
 pub const CLEAR_LUA: &str = guarded!("return r.clear(...)");
-/// No args: takes every overlay off, with no event. Answers `{active}`.
+/// No args: takes every overlay off, with no event. Answers `{active, pending, live_only}`.
 pub const CLEAR_ALL_LUA: &str = guarded!("return r.clear_all()");
 /// No args: the oldest events since the last call, in order, as many as fit in one answer (at
-/// least one), and how many buffers have an overlay. Answers `{events, active, more}`; `more`
+/// least one), and how many buffers have an overlay. Answers `{events, active, more, pending, live_only}`; `more`
 /// says events are still waiting. An event is a `revert` or an `unrevert` (a hunk's lines, as
 /// [`parse_revert_event`] and [`parse_unrevert_event`] read them) or an `off`.
 pub const TAKE_EVENTS_LUA: &str = guarded!("return r.take_events()");
@@ -94,6 +103,29 @@ pub struct ShowMeta {
     pub session: String,
     pub turn: u32,
     pub scope: Scope,
+}
+
+/// The turn and disk line count a live drawing was computed from.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LiveMeta {
+    pub tab: u64,
+    pub session: String,
+    pub turn_id: String,
+    pub turn: u32,
+    pub running: bool,
+    pub read_lines: u64,
+}
+
+/// A live drawing's result, including whether an existing overlay was left alone.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LiveShowAnswer {
+    pub drawn: u32,
+    pub shown: bool,
+    pub left: bool,
+    pub skipped: u32,
+    pub active: u64,
+    pub pending: u64,
+    pub live_only: bool,
 }
 
 /// One hunk as nvim gets it: the counts of its `@@` header and both sides as buffer lines.
@@ -221,6 +253,60 @@ pub fn show_args(abs_path: &Path, meta: &ShowMeta, hunks: &[ShowHunk]) -> Vec<Va
         meta_value(meta),
         Value::Array(hunks.iter().map(hunk_value).collect()),
     ]
+}
+
+/// The arguments of [`LIVE_SHOWN_LUA`], bounded to one batch.
+pub fn live_shown_args(abs_paths: &[PathBuf]) -> Vec<Value> {
+    vec![Value::Array(
+        abs_paths.iter().take(MAX_SHOWN_PATHS).map(|p| path_arg(p)).collect(),
+    )]
+}
+
+/// The arguments of [`LIVE_SHOW_LUA`]. Live drawings always belong to one turn.
+pub fn live_show_args(abs_path: &Path, meta: &LiveMeta, hunks: &[ShowHunk]) -> Vec<Value> {
+    vec![
+        path_arg(abs_path),
+        map(vec![
+            ("tab", Value::from(meta.tab)),
+            ("session", Value::from(meta.session.as_str())),
+            ("turn_id", Value::from(meta.turn_id.as_str())),
+            ("turn", Value::from(meta.turn)),
+            ("scope", Value::from("turn")),
+            ("running", Value::from(meta.running)),
+            ("read_lines", Value::from(meta.read_lines)),
+        ]),
+        Value::Array(hunks.iter().map(hunk_value).collect()),
+    ]
+}
+
+/// Reads exactly one boolean for every path sent in the bounded query.
+pub fn parse_live_shown(answer: &Value, asked: usize) -> Result<Vec<bool>, String> {
+    let shown = list(answer, "shown")?;
+    if shown.len() != asked.min(MAX_SHOWN_PATHS) {
+        return Err("the shown list differs in length from the query".to_owned());
+    }
+    shown
+        .iter()
+        .map(|v| v.as_bool().ok_or_else(|| "a shown entry is not a boolean".to_owned()))
+        .collect()
+}
+
+/// Reads every field of a live drawing's answer without guessing missing values.
+pub fn parse_live_show(answer: &Value) -> Result<LiveShowAnswer, String> {
+    let boolean = |name| {
+        field(answer, name)?
+            .as_bool()
+            .ok_or_else(|| format!("`{name}` is not a boolean"))
+    };
+    Ok(LiveShowAnswer {
+        drawn: integer(answer, "drawn")?,
+        shown: boolean("shown")?,
+        left: boolean("left")?,
+        skipped: integer(answer, "skipped")?,
+        active: integer(answer, "active")?,
+        pending: integer(answer, "pending")?,
+        live_only: boolean("live_only")?,
+    })
 }
 
 /// The arguments of [`OPEN_AND_SHOW_LUA`]; `hunks: None` only opens the file.
@@ -373,8 +459,9 @@ pub fn overlay_hunks(binary: bool, hunks: Option<Vec<ShowHunk>>) -> Option<Vec<S
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct OffEvent {
     pub path: String,
-    /// `user`, `reload`, `closed` or `replaced` (the module's own, or another window drawing over
-    /// the file), or `reported` when the editor's window passed it on without saying why.
+    /// `user`, `reload`, `closed`, `edited` (a live drawing whose hunks were all edited away) or
+    /// `replaced` (the module's own, or another window drawing over the file), or `reported` when
+    /// the editor's window passed it on without saying why.
     pub why: String,
 }
 

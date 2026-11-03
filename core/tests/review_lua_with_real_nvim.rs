@@ -2114,6 +2114,107 @@ fn a_line_added_around_a_reverted_hunk_does_not_strand_its_undo_tracking() {
 
 #[test]
 #[ignore = "needs a real nvim on PATH; spends no tokens and needs no display"]
+fn follow_edits_cost_does_not_grow_with_reverted_hunks() {
+    const TIME_FOLLOW_LUA: &str = r#"
+local best = math.huge
+for _ = 1, 5 do
+  collectgarbage('collect')
+  local start = vim.uv.hrtime()
+  vim.api.nvim_exec_autocmds('TextChanged', { buffer = 0 })
+  best = math.min(best, vim.uv.hrtime() - start)
+end
+return best
+"#;
+    let mut fx = Fx::new("follow-cost");
+    let base: Vec<u8> = (1..=10000)
+        .flat_map(|i| {
+            format!("line {i:05} old word with enough surrounding text to fill about seventy bytes\n").into_bytes()
+        })
+        .collect();
+    let mut measure = |n: u32| {
+        let mut lines = as_lines(&base);
+        for i in 1..=n {
+            let row = (i * 50 - 1) as usize;
+            lines[row] = String::from_utf8(lines[row].clone())
+                .unwrap()
+                .replace("old", "new")
+                .into_bytes();
+        }
+        let end = numbered(
+            &lines
+                .iter()
+                .map(|l| std::str::from_utf8(l).unwrap())
+                .collect::<Vec<_>>(),
+        );
+        let hunks: Vec<_> = (1..=n)
+            .map(|i| hunk_of(i, &base, &end, (i * 50, 1), (i * 50, 1)))
+            .collect();
+        let path = fx.file(&format!("hunks-{n}.txt"), &end);
+        fx.open(&path);
+        assert_eq!(count(&fx.show(&path, &meta(2), &hunks), "drawn"), i64::from(n));
+        for i in (1..=n).rev() {
+            fx.cursor(i64::from(i * 50));
+            fx.feed(",r");
+        }
+        assert_eq!(fx.events().len(), n as usize);
+        assert_eq!(fx.lines(), as_lines(&base));
+        let elapsed = int(&fx.nvim.lua(TIME_FOLLOW_LUA, vec![]));
+        fx.nvim.lua(CLEAR_LUA, clear_args(&path));
+        fx.write();
+        elapsed
+    };
+    let t200 = measure(200);
+    let t20 = measure(20);
+    eprintln!("TextChanged best of 5: 200 reverted hunks {t200} ns; 20 reverted hunks {t20} ns");
+    assert!(
+        t200 <= 4 * t20,
+        "search shares buffer work across hunks: t200={t200} ns, t20={t20} ns"
+    );
+    fx.nvim.quit();
+}
+
+#[test]
+#[ignore = "needs a real nvim on PATH; spends no tokens and needs no display"]
+fn a_reverted_hunk_found_by_search_is_still_unreverted() {
+    let mut fx = Fx::new("undo-search");
+    let base = numbered(&["a", "OLD", "c"]);
+    let end = numbered(&["a", "NEW", "c"]);
+    let hunk = hunk_of(1, &base, &end, (1, 3), (1, 3));
+    let mut moved = vec!["padding"; 100];
+    moved.extend(["a", "NEW", "c"]);
+    moved.extend(["tail"; 100]);
+    let path = fx.file("f.txt", &numbered(&moved));
+    fx.open(&path);
+    let mut relocated = hunk.clone();
+    relocated.old_start = 101;
+    relocated.new_start = 101;
+    assert_eq!(count(&fx.show(&path, &meta(2), &[relocated]), "drawn"), 1);
+    fx.cursor(102);
+    fx.feed(",r");
+    assert_eq!(fx.event_kinds(), vec!["revert"]);
+    // A whole-buffer edit leaves the two tracking marks at its boundaries. Undo must find the
+    // hunk in the middle again, even though neither mark points to its first line. Restoring
+    // the new text and replacing it before TextChanged leaves the hunk reverted throughout.
+    fx.nvim.lua(
+        "vim.cmd('undo') vim.api.nvim_buf_set_lines(0, 0, -1, true, { 'a', 'OLD', 'c' }) \
+         vim.api.nvim_exec_autocmds('TextChanged', { buffer = 0 })",
+        vec![],
+    );
+    assert!(fx.events().is_empty());
+    assert_eq!(fx.marks().count, 2, "only the two tracking marks remain");
+    fx.feed("u");
+    fx.wait_for_events(1);
+    let events = fx.events();
+    let back = parse_unrevert_event(&events[0]).expect("an unrevert event");
+    assert_eq!(back.at_line, 101);
+    assert_eq!(back.hunk.new_lines, hunk.new_lines);
+    assert_eq!(fx.marks().trackers.len(), 1);
+    assert!(fx.events().is_empty(), "the hunk is reported once");
+    fx.nvim.quit();
+}
+
+#[test]
+#[ignore = "needs a real nvim on PATH; spends no tokens and needs no display"]
 fn a_whole_buffer_replacement_that_moves_the_text_is_searched_for_the_hunk() {
     let base = numbered(&["a", "OLD", "c"]);
     let end = numbered(&["a", "NEW", "c"]);
@@ -2168,4 +2269,1017 @@ fn a_whole_buffer_replacement_that_moves_the_text_is_searched_for_the_hunk() {
     std::thread::sleep(std::time::Duration::from_millis(300));
     assert!(fx.events().is_empty());
     fx.nvim.quit();
+}
+
+fn live_meta(turn_id: &str, read_lines: u64) -> eitri_core::review_editor::LiveMeta {
+    eitri_core::review_editor::LiveMeta {
+        tab: 4,
+        session: "sess-1".to_owned(),
+        turn_id: turn_id.to_owned(),
+        turn: 2,
+        running: false,
+        read_lines,
+    }
+}
+
+fn live_show(fx: &mut Fx, path: &Path, turn_id: &str, read_lines: u64, hunks: &[ShowHunk]) -> Value {
+    use eitri_core::review_editor::{live_show_args, parse_live_show, LIVE_SHOW_LUA};
+    let answer = fx.nvim.lua(
+        LIVE_SHOW_LUA,
+        live_show_args(path, &live_meta(turn_id, read_lines), hunks),
+    );
+    parse_live_show(&answer).expect("a complete live drawing answer");
+    answer
+}
+
+fn live_two(fx: &mut Fx) -> (PathBuf, TwoHunks) {
+    let two = two_hunks();
+    let path = fx.file("live.txt", &two.end);
+    fx.open(&path);
+    fx.nvim.command("setlocal autoread");
+    (path, two)
+}
+
+const EDITOR_POSITION_LUA: &str = "return { vim.api.nvim_get_current_win(), vim.api.nvim_get_current_buf(), \
+    vim.api.nvim_win_get_cursor(0), vim.api.nvim_get_mode() }";
+const OVERLAY_SNAPSHOT_LUA: &str = r#"
+local b = vim.api.nvim_get_current_buf()
+return vim.inspect({ vim.api.nvim_buf_get_extmarks(b, _G.__eitri_review.ns, 0, -1, { details = true }),
+  vim.api.nvim_buf_get_keymap(b, 'n'), _G.__eitri_review.overlays[b] })
+"#;
+
+#[test]
+#[ignore = "needs nvim"]
+fn shown_answers_only_for_a_buffer_in_a_non_floating_window() {
+    use eitri_core::review_editor::{live_shown_args, parse_live_shown, LIVE_SHOWN_LUA};
+    let mut fx = Fx::bare("shown-windows");
+    let hidden = fx.file("hidden.txt", b"hidden\n");
+    let floating = fx.file("float.txt", b"float\n");
+    let split = fx.file("split.txt", b"split\n");
+    fx.nvim.lua(
+        r#"local hidden, floating, split = ...
+        vim.fn.bufload(vim.fn.bufadd(hidden))
+        local b = vim.fn.bufadd(floating) vim.fn.bufload(b)
+        vim.api.nvim_open_win(b, false, { relative = 'editor', row = 1, col = 1, width = 10, height = 2 })
+        vim.cmd.tabnew()
+        vim.api.nvim_cmd({ cmd = 'split', args = { split }, magic = { file = false } }, {})
+        vim.cmd.tabprevious()"#,
+        vec![
+            Value::from(hidden.to_str().unwrap()),
+            Value::from(floating.to_str().unwrap()),
+            Value::from(split.to_str().unwrap()),
+        ],
+    );
+    let answer = fx.nvim.lua(LIVE_SHOWN_LUA, live_shown_args(&[hidden, floating, split]));
+    assert_eq!(parse_live_shown(&answer, 3).unwrap(), vec![false, false, true]);
+    assert!(fx
+        .nvim
+        .lua("return _G.__eitri_review == nil", vec![])
+        .as_bool()
+        .unwrap());
+}
+
+#[test]
+#[ignore = "needs nvim"]
+fn live_show_draws_into_a_shown_buffer_and_changes_no_window_cursor_or_mode() {
+    let mut fx = Fx::new("live-position");
+    let (path, two) = live_two(&mut fx);
+    fx.cursor(15);
+    for insert in [false, true] {
+        fx.nvim.lua(CLEAR_ALL_LUA, vec![]);
+        if insert {
+            fx.nvim.input("i");
+            fx.nvim.wait_until("insert mode", |n| {
+                get(&n.request("nvim_get_mode", vec![]), "mode").as_str() == Some("i")
+            });
+        }
+        let before = fx.nvim.lua(EDITOR_POSITION_LUA, vec![]);
+        assert_eq!(count(&live_show(&mut fx, &path, "t1", 32, &two.hunks), "drawn"), 2);
+        assert_eq!(fx.nvim.lua(EDITOR_POSITION_LUA, vec![]), before);
+        if insert {
+            fx.nvim.input("<Esc>");
+        }
+    }
+    // Drawing into another shown buffer must leave the active window alone too.
+    fx.nvim.command("new");
+    for insert in [false, true] {
+        if insert {
+            fx.nvim.input("i");
+            fx.nvim.wait_until("insert mode in the other window", |n| {
+                get(&n.request("nvim_get_mode", vec![]), "mode").as_str() == Some("i")
+            });
+        }
+        let before = fx.nvim.lua(EDITOR_POSITION_LUA, vec![]);
+        assert_eq!(count(&live_show(&mut fx, &path, "t1", 32, &two.hunks), "drawn"), 2);
+        assert_eq!(fx.nvim.lua(EDITOR_POSITION_LUA, vec![]), before);
+        if insert {
+            fx.nvim.input("<Esc>");
+        }
+    }
+}
+
+#[test]
+#[ignore = "needs nvim"]
+fn live_show_reloads_an_unmodified_buffer_first() {
+    let mut fx = Fx::new("live-reload");
+    let two = two_hunks();
+    let path = fx.file("reload.txt", &two.base);
+    fx.open(&path);
+    fx.nvim.command("setlocal autoread");
+    std::fs::write(&path, &two.end).unwrap();
+    let answer = live_show(&mut fx, &path, "t1", 32, &two.hunks);
+    assert_eq!(count(&answer, "drawn"), 2);
+    assert_eq!(fx.lines(), as_lines(&two.end));
+    assert!(!fx.modified());
+}
+
+#[test]
+#[ignore = "needs nvim"]
+fn live_show_leaves_a_modified_buffer_and_its_overlay_alone() {
+    let mut fx = Fx::new("live-modified");
+    let (path, two) = live_two(&mut fx);
+    fx.show(&path, &meta(2), &two.hunks);
+    fx.cursor(5);
+    fx.feed(",r");
+    fx.wait_for_events(1);
+    assert!(fx.modified());
+    fx.nvim.input("i");
+    fx.nvim.wait_until("insert mode", |n| {
+        get(&n.request("nvim_get_mode", vec![]), "mode").as_str() == Some("i")
+    });
+    let before = fx.nvim.lua(OVERLAY_SNAPSHOT_LUA, vec![]);
+    let position = fx.nvim.lua(EDITOR_POSITION_LUA, vec![]);
+    let answer = live_show(&mut fx, &path, "t2", 32, &two.hunks);
+    assert_eq!(get(&answer, "left"), &Value::from(true));
+    assert_eq!(fx.nvim.lua(OVERLAY_SNAPSHOT_LUA, vec![]), before);
+    assert_eq!(fx.nvim.lua(EDITOR_POSITION_LUA, vec![]), position);
+    fx.nvim.input("<Esc>");
+    fx.feed("u");
+    fx.wait_for_events(2);
+    assert_eq!(fx.event_kinds(), vec!["revert", "unrevert"]);
+}
+
+#[test]
+#[ignore = "needs nvim"]
+fn live_show_never_replaces_an_overlay_that_is_not_live() {
+    let mut fx = Fx::new("live-explicit");
+    let (path, two) = live_two(&mut fx);
+    fx.show(&path, &meta(2), &two.hunks);
+    assert!(!fx.modified());
+    let before = fx.nvim.lua(OVERLAY_SNAPSHOT_LUA, vec![]);
+    let answer = live_show(&mut fx, &path, "t1", 32, &two.hunks);
+    assert_eq!(get(&answer, "left"), &Value::from(true));
+    assert_eq!(fx.nvim.lua(OVERLAY_SNAPSHOT_LUA, vec![]), before);
+}
+
+#[test]
+#[ignore = "needs nvim"]
+fn live_show_with_autoread_off_runs_no_checktime() {
+    let mut fx = Fx::new("live-no-autoread");
+    let (path, two) = live_two(&mut fx);
+    fx.nvim.lua(
+        "vim.bo.autoread = false vim.g.changed = 0 vim.api.nvim_create_autocmd('FileChangedShell', \
+        { callback = function() vim.g.changed = vim.g.changed + 1 end })",
+        vec![],
+    );
+    std::fs::write(&path, &two.base).unwrap();
+    assert_eq!(count(&live_show(&mut fx, &path, "t1", 32, &two.hunks), "drawn"), 0);
+    assert_eq!(fx.nvim.eval("g:changed"), Value::from(0));
+    assert_eq!(fx.lines(), as_lines(&two.end));
+    assert_eq!(fx.marks().count, 0);
+}
+
+#[test]
+#[ignore = "needs nvim"]
+fn live_show_draws_nothing_when_the_line_count_differs() {
+    let mut fx = Fx::new("live-line-count");
+    let (path, two) = live_two(&mut fx);
+    assert_eq!(count(&live_show(&mut fx, &path, "t1", 33, &two.hunks), "drawn"), 0);
+    assert_eq!(fx.marks().count, 0);
+    assert!(fx.review_maps().is_empty());
+}
+
+#[test]
+#[ignore = "needs nvim"]
+fn live_show_skips_kept_hunks_of_the_same_turn_only() {
+    let mut fx = Fx::new("live-kept");
+    let (path, two) = live_two(&mut fx);
+    assert_eq!(count(&live_show(&mut fx, &path, "t1", 32, &two.hunks), "drawn"), 2);
+    fx.nvim.lua("_G.__eitri_review.keep_current()", vec![]);
+    assert_eq!(fx.marks().count, 0);
+    assert!(fx.review_maps().is_empty());
+    assert_eq!(count(&live_show(&mut fx, &path, "t1", 32, &two.hunks), "drawn"), 0);
+    assert_eq!(count(&live_show(&mut fx, &path, "t2", 32, &two.hunks), "drawn"), 2);
+    let mut changed = two.hunks.clone();
+    changed[0].old_lines[0].text = b"another base".to_vec();
+    let answer = live_show(&mut fx, &path, "t1", 32, &changed);
+    assert_eq!(count(&answer, "drawn"), 1);
+    assert_eq!(count(&answer, "skipped"), 0, "kept hunks are deliberately excluded");
+    assert_eq!(count(&fx.show(&path, &meta(2), &two.hunks), "drawn"), 2);
+}
+
+#[test]
+#[ignore = "needs nvim"]
+fn an_emptied_file_counts_as_one_line() {
+    let mut fx = Fx::new("live-empty");
+    let path = fx.file("empty.txt", b"");
+    fx.open(&path);
+    fx.nvim.command("setlocal autoread");
+    let hunk = hunk_of(1, b"gone\n", b"", (1, 1), (0, 0));
+    assert_eq!(count(&live_show(&mut fx, &path, "t1", 0, &[hunk]), "drawn"), 1);
+    assert_eq!(fx.marks().virt, vec![(0, true, vec!["gone".to_owned()])]);
+}
+
+#[test]
+#[ignore = "needs nvim"]
+fn an_emptied_file_is_not_drawn_over_a_buffer_that_holds_text() {
+    let mut fx = Fx::new("live-empty-text");
+    let path = fx.file("rewritten.txt", b"rewritten after the read\n");
+    fx.open(&path);
+    fx.nvim.command("setlocal autoread");
+    let hunk = hunk_of(1, b"gone\n", b"", (1, 1), (0, 0));
+    let answer = live_show(&mut fx, &path, "t1", 0, &[hunk]);
+    assert_eq!(count(&answer, "drawn"), 0);
+    assert_eq!(count(&answer, "skipped"), 1);
+    assert_eq!(fx.marks().count, 0);
+    assert!(fx.review_maps().is_empty());
+}
+
+#[test]
+#[ignore = "needs nvim"]
+fn live_show_says_not_shown_for_a_hidden_buffer_and_a_float_only_one() {
+    let mut fx = Fx::new("live-not-shown");
+    let two = two_hunks();
+    let hidden = fx.file("hidden.txt", &two.end);
+    let floating = fx.file("float.txt", &two.end);
+    fx.nvim.command("set hidden");
+    fx.open(&hidden);
+    fx.nvim.command("enew");
+    fx.nvim.lua(
+        r#"local b = vim.fn.bufadd(...) vim.fn.bufload(b)
+        vim.api.nvim_open_win(b, false, { relative = 'editor', row = 1, col = 1, width = 10, height = 2 })"#,
+        vec![Value::from(floating.to_str().unwrap())],
+    );
+    for path in [&hidden, &floating] {
+        let answer = live_show(&mut fx, path, "t1", 32, &two.hunks);
+        assert_eq!(get(&answer, "shown"), &Value::from(false), "{answer:?}");
+        assert_eq!(count(&answer, "drawn"), 0);
+        assert_eq!(get(&answer, "left"), &Value::from(false));
+    }
+    assert!(fx
+        .nvim
+        .lua("return next(_G.__eitri_review.overlays) == nil", vec![])
+        .as_bool()
+        .unwrap());
+}
+
+#[test]
+#[ignore = "needs nvim"]
+fn live_show_reloads_a_changed_file_while_its_window_is_in_insert_mode() {
+    let mut fx = Fx::new("live-reload-insert");
+    let two = two_hunks();
+    let path = fx.file("reload-insert.txt", &two.base);
+    fx.open(&path);
+    fx.nvim.command("setlocal autoread");
+    fx.nvim.input("i");
+    fx.nvim.wait_until("insert mode", |n| {
+        get(&n.request("nvim_get_mode", vec![]), "mode").as_str() == Some("i")
+    });
+    let before = fx.nvim.lua(EDITOR_POSITION_LUA, vec![]);
+    std::fs::write(&path, &two.end).unwrap();
+    assert_eq!(count(&live_show(&mut fx, &path, "t1", 32, &two.hunks), "drawn"), 2);
+    assert_eq!(fx.nvim.lua(EDITOR_POSITION_LUA, vec![]), before);
+    assert_eq!(fx.lines(), as_lines(&two.end));
+    assert!(!fx.modified());
+    fx.nvim.input("<Esc>");
+}
+
+#[test]
+#[ignore = "needs nvim"]
+fn typing_in_a_big_buffer_reads_it_whole_only_when_a_search_is_due() {
+    let mut fx = Fx::new("live-read-cost");
+    let (path, two) = live_two(&mut fx);
+    assert_eq!(count(&live_show(&mut fx, &path, "t1", 32, &two.hunks), "drawn"), 2);
+    let marks_before = fx.marks().count;
+    assert!(marks_before > 0);
+    let full_reads = |fx: &mut Fx| {
+        fx.nvim
+            .lua("local n = _G.__full _G.__full = 0 return n", vec![])
+            .as_i64()
+            .unwrap()
+    };
+    fx.nvim.lua(
+        "_G.__full = 0 local orig = vim.api.nvim_buf_get_lines \
+        vim.api.nvim_buf_get_lines = function(b, s, e, strict) \
+          if s == 0 and e == -1 then _G.__full = _G.__full + 1 end \
+          return orig(b, s, e, strict) end",
+        vec![],
+    );
+    // Typing in a line the drawing does not cover reads only the rows each comparison needs.
+    fx.nvim.lua(
+        "vim.api.nvim_buf_set_lines(0, 9, 10, true, { 'typed' }) \
+        vim.api.nvim_exec_autocmds('TextChangedI', { buffer = 0 })",
+        vec![],
+    );
+    assert_eq!(full_reads(&mut fx), 0);
+    assert_eq!(fx.marks().count, marks_before, "the drawing is still up");
+    // A reverted hunk whose text may be back is searched for in one read of the buffer.
+    fx.cursor(5);
+    fx.feed(",r");
+    full_reads(&mut fx);
+    fx.nvim
+        .lua("vim.api.nvim_exec_autocmds('TextChanged', { buffer = 0 })", vec![]);
+    assert_eq!(full_reads(&mut fx), 1);
+}
+
+#[test]
+#[ignore = "needs nvim"]
+fn a_second_live_draw_keeps_its_keys() {
+    let mut fx = Fx::new("live-second");
+    let (path, two) = live_two(&mut fx);
+    live_show(&mut fx, &path, "t1", 32, &two.hunks);
+    let keys = fx.review_maps();
+    assert!(keys.contains(&",a".to_owned()));
+    assert!(keys.contains(&"]h".to_owned()));
+    assert_eq!(count(&live_show(&mut fx, &path, "t1", 32, &two.hunks), "drawn"), 2);
+    assert_eq!(fx.review_maps(), keys);
+}
+
+#[test]
+#[ignore = "needs nvim"]
+fn live_clear_clears_a_live_overlay_and_never_an_o_one() {
+    use eitri_core::review_editor::LIVE_CLEAR_LUA;
+    let mut fx = Fx::new("live-clear");
+    let (path, two) = live_two(&mut fx);
+    live_show(&mut fx, &path, "t1", 32, &two.hunks);
+    let answer = fx.nvim.lua(LIVE_CLEAR_LUA, clear_args(&path));
+    assert_eq!(get(&answer, "cleared"), &Value::from(true));
+    assert_eq!(fx.marks().count, 0);
+    assert!(fx.review_maps().is_empty());
+    fx.show(&path, &meta(2), &two.hunks);
+    let before = fx.nvim.lua(OVERLAY_SNAPSHOT_LUA, vec![]);
+    let answer = fx.nvim.lua(LIVE_CLEAR_LUA, clear_args(&path));
+    assert_eq!(get(&answer, "cleared"), &Value::from(false));
+    assert_eq!(fx.nvim.lua(OVERLAY_SNAPSHOT_LUA, vec![]), before);
+}
+
+#[test]
+#[ignore = "needs nvim"]
+fn no_message_from_a_live_draw_a_skip_or_a_timer_reload() {
+    let mut fx = Fx::new("live-quiet");
+    let (path, two) = live_two(&mut fx);
+    fx.nvim.command("messages clear");
+    let mut hunks = two.hunks.clone();
+    hunks[1].new_lines[0].text = b"mismatch".to_vec();
+    let answer = live_show(&mut fx, &path, "t1", 32, &hunks);
+    assert_eq!(count(&answer, "drawn"), 1);
+    assert_eq!(count(&answer, "skipped"), 1);
+    assert!(get(&answer, "notice").is_nil());
+    // A reload within live_show must not queue an off event for the drawing it replaces.
+    std::fs::write(&path, &two.base).unwrap();
+    let answer = live_show(&mut fx, &path, "t1", 30, &[]);
+    assert_eq!(count(&answer, "pending"), 0);
+    std::fs::write(&path, &two.end).unwrap();
+    live_show(&mut fx, &path, "t1", 32, &two.hunks);
+    std::fs::write(&path, &two.base).unwrap();
+    fx.nvim.command("checktime");
+    assert_eq!(fx.marks().count, 0);
+    let events = fx.events();
+    assert_eq!(events.len(), 1);
+    assert_eq!(text(get(&events[0], "why")), "reload");
+    assert!(fx.said().is_empty());
+    assert_eq!(
+        fx.nvim.lua(
+            "return vim.api.nvim_exec2('messages', { output = true }).output",
+            vec![]
+        ),
+        Value::from("")
+    );
+}
+
+#[test]
+#[ignore = "needs nvim"]
+fn an_empty_live_overlay_is_removed_with_its_keys() {
+    let mut fx = Fx::new("live-empty-overlay");
+    let (path, two) = live_two(&mut fx);
+    let mut hunks = two.hunks.clone();
+    for h in &mut hunks {
+        h.new_lines[0].text = b"mismatch".to_vec();
+    }
+    assert_eq!(count(&live_show(&mut fx, &path, "t1", 32, &hunks), "active"), 0);
+    assert!(fx.review_maps().is_empty());
+    live_show(&mut fx, &path, "t1", 32, &two.hunks);
+    fx.nvim.lua(
+        "vim.api.nvim_buf_set_lines(0, 0, -1, true, { 'edited elsewhere' }) \
+        vim.api.nvim_exec_autocmds('TextChanged', { buffer = 0 })",
+        vec![],
+    );
+    assert_eq!(fx.marks().count, 0);
+    assert!(fx.review_maps().is_empty());
+    assert_eq!(fx.nvim.footprint(&["eitri_review"]).autocmds, 0);
+}
+
+#[test]
+#[ignore = "needs nvim"]
+fn a_live_drawing_maps_no_key_another_map_holds() {
+    let mut fx = Fx::new("live-held-keys");
+    let (path, two) = live_two(&mut fx);
+    fx.nvim.lua(
+        "vim.keymap.set('n', ']h', 'zz', { buffer = true, desc = 'existing local' }) \
+        vim.keymap.set('n', '<localleader>q', 'gg', { desc = 'existing global' })",
+        vec![],
+    );
+    let maps = "return vim.inspect({ vim.fn.maparg(']h', 'n', false, true), vim.fn.maparg('<localleader>q', 'n', false, true) })";
+    let before = fx.nvim.lua(maps, vec![]);
+    live_show(&mut fx, &path, "t1", 32, &two.hunks);
+    assert_eq!(fx.nvim.lua(maps, vec![]), before);
+    assert!(fx.review_maps().contains(&",a".to_owned()));
+    fx.show(&path, &meta(2), &two.hunks);
+    assert_ne!(fx.nvim.lua(maps, vec![]), before);
+    fx.nvim.lua(CLEAR_LUA, clear_args(&path));
+    assert_eq!(fx.nvim.lua(maps, vec![]), before);
+}
+
+#[test]
+#[ignore = "needs nvim"]
+fn every_answer_carries_pending_and_live_only() {
+    use eitri_core::review_editor::LIVE_CLEAR_LUA;
+    let mut fx = Fx::new("live-answers");
+    let (path, two) = live_two(&mut fx);
+    let assert_status = |v: &Value, pending: u64, live: bool| {
+        assert_eq!(get(v, "pending").as_u64(), Some(pending), "{v:?}");
+        assert_eq!(get(v, "live_only").as_bool(), Some(live), "{v:?}");
+    };
+    assert_status(&fx.show(&path, &meta(2), &two.hunks), 0, false);
+    assert_status(
+        &fx.nvim
+            .lua(OPEN_AND_SHOW_LUA, open_and_show_args(&path, None, &meta(2), None)),
+        0,
+        false,
+    );
+    assert_status(&fx.nvim.lua(CLEAR_LUA, clear_args(&path)), 0, true);
+    assert_status(&live_show(&mut fx, &path, "t1", 32, &two.hunks), 0, true);
+    fx.feed(",q");
+    assert_status(&fx.nvim.lua(LIVE_CLEAR_LUA, clear_args(&path)), 1, true);
+    assert_status(&fx.nvim.lua(CLEAR_ALL_LUA, vec![]), 1, true);
+    assert_status(&fx.nvim.lua(TAKE_EVENTS_LUA, vec![]), 0, true);
+    let missing = fx.file("not-open.txt", b"x\n");
+    assert_status(&fx.show(&missing, &meta(2), &[]), 0, true);
+    let absent = fx.scratch.0.join("absent.txt");
+    assert_status(
+        &fx.nvim
+            .lua(OPEN_AND_SHOW_LUA, open_and_show_args(&absent, None, &meta(2), None)),
+        0,
+        true,
+    );
+}
+
+#[test]
+#[ignore = "needs nvim"]
+fn live_show_takes_a_path_with_spaces_cjk_and_newline() {
+    let mut fx = Fx::new("live-path");
+    let two = two_hunks();
+    let path = fx.file("space 中\nfile.txt", &two.end);
+    fx.open(&path);
+    fx.nvim.command("setlocal autoread");
+    assert_eq!(count(&live_show(&mut fx, &path, "t1", 32, &two.hunks), "drawn"), 2);
+    assert_eq!(fx.lines(), as_lines(&two.end));
+    assert!(fx.said().is_empty());
+}
+
+#[test]
+fn live_arguments_bound_paths_and_preserve_turn_metadata() {
+    use eitri_core::review_editor::{live_show_args, live_shown_args, MAX_SHOWN_PATHS};
+    let paths: Vec<_> = (0..MAX_SHOWN_PATHS + 1)
+        .map(|i| PathBuf::from(format!("/file {i}")))
+        .collect();
+    let args = live_shown_args(&paths);
+    assert_eq!(args.len(), 1);
+    assert_eq!(items(&args[0]).len(), MAX_SHOWN_PATHS);
+    assert_eq!(items(&args[0])[0], Value::Binary(b"/file 0".to_vec()));
+    let meta = live_meta("stable-turn", 0);
+    let args = live_show_args(Path::new("/space 中\nfile"), &meta, &[]);
+    assert_eq!(args[0], Value::Binary("/space 中\nfile".as_bytes().to_vec()));
+    assert_eq!(get(&args[1], "scope"), &Value::from("turn"));
+    assert_eq!(get(&args[1], "turn_id"), &Value::from("stable-turn"));
+    assert_eq!(get(&args[1], "running"), &Value::from(meta.running));
+    assert_eq!(get(&args[1], "read_lines"), &Value::from(meta.read_lines));
+}
+
+#[test]
+fn live_answer_parsers_refuse_incomplete_or_malformed_answers() {
+    use eitri_core::review_editor::{parse_live_show, parse_live_shown};
+    let shown = |values| opts_map(&[("shown", Value::Array(values))]);
+    assert_eq!(
+        parse_live_shown(&shown(vec![Value::from(false), Value::from(true)]), 2).unwrap(),
+        vec![false, true]
+    );
+    assert!(parse_live_shown(&shown(vec![Value::from(true)]), 2).is_err());
+    assert!(parse_live_shown(&shown(vec![Value::from(1)]), 1).is_err());
+    assert_eq!(
+        parse_live_shown(&opts_map(&[("shown", Value::Map(vec![]))]), 0).unwrap(),
+        Vec::<bool>::new()
+    );
+    let answer = opts_map(&[
+        ("drawn", Value::from(1)),
+        ("shown", Value::from(true)),
+        ("left", Value::from(false)),
+        ("skipped", Value::from(0)),
+        ("active", Value::from(1)),
+        ("pending", Value::from(2)),
+        ("live_only", Value::from(true)),
+    ]);
+    assert_eq!(parse_live_show(&answer).unwrap().pending, 2);
+    let entries = answer.as_map().unwrap();
+    for i in 0..entries.len() {
+        let mut bad = entries.clone();
+        bad.remove(i);
+        assert!(parse_live_show(&Value::Map(bad)).is_err());
+    }
+    for name in ["drawn", "skipped"] {
+        let mut bad = entries.clone();
+        bad.iter_mut().find(|(k, _)| k.as_str() == Some(name)).unwrap().1 = Value::from(u64::MAX);
+        assert!(parse_live_show(&Value::Map(bad)).is_err());
+    }
+}
+
+#[test]
+#[ignore = "needs nvim"]
+fn live_show_uses_the_global_autoread_value_when_the_buffer_inherits_it() {
+    let mut fx = Fx::new("live-global-autoread");
+    let (path, two) = live_two(&mut fx);
+    fx.nvim.command("setglobal noautoread");
+    fx.nvim.command("setlocal autoread<");
+    assert_eq!(count(&live_show(&mut fx, &path, "t1", 32, &two.hunks), "drawn"), 0);
+    fx.nvim.command("setglobal autoread");
+    fx.nvim.command("setlocal autoread<");
+    assert_eq!(count(&live_show(&mut fx, &path, "t1", 32, &two.hunks), "drawn"), 2);
+}
+
+#[test]
+#[ignore = "needs nvim"]
+fn live_show_leaves_saved_reverted_hunks_followed() {
+    let mut fx = Fx::new("live-saved-ghost");
+    let (path, two) = live_two(&mut fx);
+    live_show(&mut fx, &path, "t1", 32, &two.hunks);
+    fx.cursor(5);
+    fx.feed(",r");
+    fx.wait_for_events(1);
+    fx.write();
+    assert!(!fx.modified());
+    let before = fx.nvim.lua(OVERLAY_SNAPSHOT_LUA, vec![]);
+    std::fs::write(&path, &two.end).unwrap();
+    let answer = live_show(&mut fx, &path, "t2", 32, &two.hunks);
+    assert_eq!(get(&answer, "left"), &Value::from(true));
+    assert_eq!(fx.nvim.lua(OVERLAY_SNAPSHOT_LUA, vec![]), before);
+    fx.feed("u");
+    fx.wait_for_events(2);
+    assert_eq!(fx.event_kinds(), vec!["revert", "unrevert"]);
+}
+
+#[test]
+#[ignore = "needs nvim"]
+fn live_show_kept_fingerprints_drop_the_oldest_turn_at_the_bound() {
+    use eitri_core::review_editor::live_show_args;
+    let mut fx = Fx::new("live-kept-bound");
+    let path = fx.file("kept.txt", b"new\n");
+    let other = fx.file("other.txt", b"new\n");
+    fx.open(&path);
+    fx.nvim.command("setlocal autoread");
+    fx.nvim.lua(
+        "local p = ... vim.api.nvim_cmd({ cmd = 'split', args = { p } }, {}) vim.bo.autoread = true",
+        vec![Value::from(other.to_str().unwrap())],
+    );
+    let hunk = hunk_of(1, b"old\n", b"new\n", (1, 1), (1, 1));
+    let mut args = live_show_args(&path, &live_meta("start", 1), &[hunk]);
+    args.push(Value::from(other.to_str().unwrap()));
+    let result = fx.nvim.lua(
+        r#"
+        local path, meta, hunks, other = ...
+        local r = _G.__eitri_review
+        local function drawn(file, turn)
+          meta.turn_id = tostring(turn)
+          hunks[1].old_lines[1] = 'old' .. turn
+          return r.live_show(file, meta, hunks).drawn
+        end
+        local function keep(file, turn)
+          assert(drawn(file, turn) == 1)
+          vim.api.nvim_buf_call(vim.fn.bufnr(file), r.keep_current)
+        end
+        for turn = 1, 4095 do keep(path, turn) end
+        -- A later keep of the oldest turn on another file belongs to that same record.
+        keep(other, 1)
+        keep(path, 4096)
+        return { drawn(path, 1), drawn(other, 1), drawn(path, 2), drawn(path, 4096) }
+        "#,
+        args,
+    );
+    assert_eq!(
+        items(&result),
+        vec![Value::from(1), Value::from(1), Value::from(0), Value::from(0)]
+    );
+}
+
+fn three_hunks() -> TwoHunks {
+    let base = edited(50, &[]);
+    let end = edited(
+        50,
+        &[(5, &["X5", "X5b"]), (20, &["Y20", "Y20b"]), (40, &["Z40", "Z40b"])],
+    );
+    let hunks = vec![
+        hunk_of(1, &base, &end, (2, 7), (2, 8)),
+        hunk_of(2, &base, &end, (17, 7), (18, 8)),
+        hunk_of(3, &base, &end, (37, 7), (39, 8)),
+    ];
+    TwoHunks { base, end, hunks }
+}
+
+const REVIEW_COMMANDS_LUA: &str = r#"
+local local_commands = vim.api.nvim_buf_get_commands(0, {})
+local global_commands = vim.api.nvim_get_commands({})
+return { local_commands.EitriReviewKeep ~= nil, local_commands.EitriReviewUndo ~= nil,
+  global_commands.EitriReviewClear ~= nil }
+"#;
+
+fn assert_review_commands(fx: &mut Fx, local: bool, global: bool) {
+    assert_eq!(
+        items(&fx.nvim.lua(REVIEW_COMMANDS_LUA, vec![])),
+        vec![Value::from(local), Value::from(local), Value::from(global)]
+    );
+}
+
+#[test]
+#[ignore = "needs nvim"]
+fn keep_takes_the_drawing_off_and_remembers_it() {
+    for command in [false, true] {
+        let mut fx = Fx::new("keep-all");
+        let (path, two) = live_two(&mut fx);
+        live_show(&mut fx, &path, "t1", 32, &two.hunks);
+        let before = fx.lines();
+        assert_eq!(
+            fx.nvim
+                .lua("return vim.fn.maparg('<localleader>a', 'n', false, true).desc", vec![]),
+            Value::from("eitri review: keep all changes in this buffer")
+        );
+        if command {
+            fx.nvim.command("EitriReviewKeep");
+        } else {
+            fx.feed(",a");
+        }
+        assert_eq!(fx.marks().count, 0);
+        assert!(fx.review_maps().is_empty());
+        assert_eq!(fx.lines(), before);
+        assert!(!fx.modified());
+        assert_eq!(std::fs::read(&path).unwrap(), two.end);
+        assert_eq!(fx.event_kinds(), vec!["off"]);
+        assert!(fx.said().is_empty());
+        assert_eq!(count(&live_show(&mut fx, &path, "t1", 32, &two.hunks), "drawn"), 0);
+        assert_eq!(count(&live_show(&mut fx, &path, "t2", 32, &two.hunks), "drawn"), 2);
+    }
+}
+
+#[test]
+#[ignore = "needs nvim"]
+fn close_takes_it_off_and_remembers_nothing() {
+    let mut fx = Fx::new("close-live");
+    let (path, two) = live_two(&mut fx);
+    live_show(&mut fx, &path, "t1", 32, &two.hunks);
+    fx.feed(",q");
+    assert_eq!(fx.marks().count, 0);
+    assert!(fx.review_maps().is_empty());
+    assert_eq!(fx.lines(), as_lines(&two.end));
+    assert!(!fx.modified());
+    assert_eq!(fx.event_kinds(), vec!["off"]);
+    assert_eq!(count(&live_show(&mut fx, &path, "t1", 32, &two.hunks), "drawn"), 2);
+}
+
+#[test]
+#[ignore = "needs nvim"]
+fn undo_all_reverts_every_drawn_hunk_bottom_up_and_one_u_restores_all() {
+    for command in [false, true] {
+        let mut fx = Fx::new("undo-all");
+        let three = three_hunks();
+        let path = fx.file("three.txt", &three.end);
+        fx.open(&path);
+        fx.nvim.command("setlocal autoread");
+        let mut reversed = three.hunks.clone();
+        reversed.reverse();
+        assert_eq!(count(&live_show(&mut fx, &path, "t1", 53, &reversed), "drawn"), 3);
+        assert_eq!(
+            fx.nvim
+                .lua("return vim.fn.maparg('<localleader>d', 'n', false, true).desc", vec![]),
+            Value::from("eitri review: undo all changes in this buffer")
+        );
+        if command {
+            fx.nvim.command("EitriReviewUndo");
+        } else {
+            fx.feed(",d");
+        }
+        assert_eq!(fx.lines(), as_lines(&three.base));
+        assert!(fx.modified());
+        assert_eq!(std::fs::read(&path).unwrap(), three.end);
+        let events = fx.events();
+        assert_eq!(events.len(), 3);
+        for (event, hunk) in events.iter().zip(&three.hunks) {
+            let parsed = parse_revert_event(event).expect("a buffer revert");
+            assert_eq!(&parsed.hunk, hunk);
+            // The events run top to bottom, so each one is placed where its lines start once the
+            // hunks above it are already reverted: the base's own line.
+            assert_eq!(parsed.at_line, hunk.old_start);
+            assert_eq!(parsed.meta.scope, Scope::Turn);
+        }
+        fx.feed("u");
+        fx.wait_for_events(3);
+        assert_eq!(fx.lines(), as_lines(&three.end), "one undo restores every hunk");
+        let events = fx.events();
+        let mut restored: Vec<_> = events
+            .iter()
+            .map(|e| parse_unrevert_event(e).expect("a buffer undo").hunk.id)
+            .collect();
+        restored.sort_unstable();
+        assert_eq!(restored, vec![1, 2, 3]);
+    }
+}
+
+#[test]
+#[ignore = "needs nvim"]
+fn undo_all_answers_the_count_in_the_exact_words() {
+    for (count_hunks, expected) in [
+        (
+            3,
+            "3 changes undone in this buffer only; :w writes them, u brings them back",
+        ),
+        (
+            1,
+            "1 change undone in this buffer only; :w writes them, u brings them back",
+        ),
+    ] {
+        let mut fx = Fx::new("undo-count");
+        let three = three_hunks();
+        let path = fx.file("count.txt", &three.end);
+        fx.open(&path);
+        fx.nvim.command("setlocal autoread");
+        live_show(&mut fx, &path, "t1", 53, &three.hunks[..count_hunks]);
+        fx.feed(",d");
+        assert_eq!(fx.said(), vec![expected]);
+        assert_eq!(fx.events().len(), count_hunks);
+    }
+}
+
+#[test]
+#[ignore = "needs nvim"]
+fn undo_all_refuses_and_changes_nothing() {
+    let two = two_hunks();
+    let mut ending_hunks = two.hunks.clone();
+    ending_hunks[1].old_lines[0].eol = eitri_core::editor_lines::Eol::Missing;
+    let wide_base = wide(b'o', 2_200_000);
+    let wide_end = wide(b'n', 2_200_000);
+    let mut wide_hunks = vec![
+        hunk_of(1, &wide_base, &wide_end, (1, 1), (1, 1)),
+        hunk_of(2, &wide_base, &wide_end, (12, 7), (12, 7)),
+    ];
+    wide_hunks[0].old_lines[0].text = b"before".to_vec();
+    let mut skipped_hunks = two.hunks.clone();
+    skipped_hunks[1].new_lines[0].text = b"not in the buffer".to_vec();
+    let cases = [
+        (
+            b"new\n".to_vec(),
+            vec![hunk_of(1, b"", b"new\n", (0, 0), (1, 1))],
+            "this change creates or empties the file; undo it in the panel (x)",
+        ),
+        (
+            b"".to_vec(),
+            vec![hunk_of(1, b"old\n", b"", (1, 1), (0, 0))],
+            "this change creates or empties the file; undo it in the panel (x)",
+        ),
+        (
+            two.end.clone(),
+            ending_hunks,
+            "this change alters the file's line endings; undo it in the panel (x)",
+        ),
+        (
+            wide_end,
+            wide_hunks,
+            "this change is too large to undo here; undo it in the panel (x)",
+        ),
+        (
+            two.end.clone(),
+            skipped_hunks,
+            "1 changes of this turn are not drawn here; undo them in the panel (x)",
+        ),
+    ];
+    for (end, hunks, expected) in cases {
+        let mut fx = Fx::new("undo-refuse");
+        let path = fx.file("refuse.txt", &end);
+        fx.open(&path);
+        fx.nvim.command("setlocal autoread");
+        let line_count = as_lines(&end).len() as u64;
+        assert!(count(&live_show(&mut fx, &path, "t1", line_count, &hunks), "drawn") > 0);
+        let before_lines = fx.lines();
+        let before = fx.nvim.lua(OVERLAY_SNAPSHOT_LUA, vec![]);
+        fx.feed(",d");
+        assert_eq!(fx.said(), vec![expected]);
+        assert_eq!(fx.lines(), before_lines);
+        assert!(!fx.modified());
+        assert_eq!(std::fs::read(&path).unwrap(), end);
+        assert!(fx.events().is_empty());
+        assert_eq!(fx.nvim.lua(OVERLAY_SNAPSHOT_LUA, vec![]), before);
+    }
+}
+
+#[test]
+#[ignore = "needs nvim"]
+fn undo_all_refuses_after_a_hunk_was_edited_away() {
+    let mut fx = Fx::new("undo-dropped");
+    let (path, two) = live_two(&mut fx);
+    let mut hunks = two.hunks.clone();
+    hunks.push(hunk_of(3, b"before\n", b"absent\n", (1, 1), (1, 1)));
+    assert_eq!(count(&live_show(&mut fx, &path, "t1", 32, &hunks), "skipped"), 1);
+    fx.nvim.lua(
+        "vim.api.nvim_buf_set_lines(0, 4, 5, true, { 'personal edit' }) \
+        vim.api.nvim_exec_autocmds('TextChanged', { buffer = 0 })",
+        vec![],
+    );
+    assert!(fx.events().is_empty());
+    let before = fx.lines();
+    fx.feed(",d");
+    assert_eq!(
+        fx.said(),
+        vec!["2 changes of this turn are not drawn here; undo them in the panel (x)"]
+    );
+    assert_eq!(fx.lines(), before);
+    assert!(fx.events().is_empty());
+}
+
+#[test]
+#[ignore = "needs nvim"]
+fn a_live_revert_round_trips_through_parse_revert_event() {
+    let mut fx = Fx::new("live-revert-event");
+    let (path, two) = live_two(&mut fx);
+    live_show(&mut fx, &path, "stable-turn", 32, &two.hunks);
+    fx.feed(",d");
+    let events = fx.events();
+    assert_eq!(events.len(), 2);
+    let event = parse_revert_event(&events[0]).expect("live events carry turn scope");
+    assert_eq!(event.meta, meta(2));
+    assert_eq!(event.meta.scope, Scope::Turn);
+    assert_eq!(event.hunk, two.hunks[0]);
+    assert_eq!(event.path, path.to_str().unwrap());
+}
+
+fn draw_running(fx: &mut Fx, path: &Path, hunks: &[ShowHunk]) {
+    use eitri_core::review_editor::{live_show_args, LIVE_SHOW_LUA};
+    let mut meta = live_meta("t1", 32);
+    meta.running = true;
+    fx.nvim.lua(LIVE_SHOW_LUA, live_show_args(path, &meta, hunks));
+}
+
+#[test]
+#[ignore = "needs nvim"]
+fn undo_and_revert_refuse_while_running() {
+    let mut fx = Fx::new("undo-running");
+    let (path, two) = live_two(&mut fx);
+    draw_running(&mut fx, &path, &two.hunks);
+    fx.cursor(5);
+    let before = fx.nvim.lua(OVERLAY_SNAPSHOT_LUA, vec![]);
+    fx.feed(",r");
+    fx.feed(",d");
+    fx.nvim.command("EitriReviewUndo");
+    assert_eq!(
+        fx.said(),
+        vec!["the turn is still running; undo when it ends (Esc in the panel interrupts it)"; 3]
+    );
+    assert_eq!(fx.lines(), as_lines(&two.end));
+    assert!(!fx.modified());
+    assert!(fx.events().is_empty());
+    assert_eq!(fx.nvim.lua(OVERLAY_SNAPSHOT_LUA, vec![]), before);
+    fx.feed(",a");
+    assert_eq!(fx.marks().count, 0, "keep is available while running");
+}
+
+#[test]
+#[ignore = "needs nvim"]
+fn work_after_a_running_false_draw() {
+    for all in [false, true] {
+        let mut fx = Fx::new("undo-settled");
+        let (path, two) = live_two(&mut fx);
+        draw_running(&mut fx, &path, &two.hunks);
+        live_show(&mut fx, &path, "t1", 32, &two.hunks);
+        fx.cursor(5);
+        fx.feed(if all { ",d" } else { ",r" });
+        assert!(fx.modified());
+        assert_eq!(fx.events().len(), if all { 2 } else { 1 });
+        if all {
+            assert_eq!(fx.lines(), as_lines(&two.base));
+        }
+    }
+}
+
+#[test]
+#[ignore = "needs nvim"]
+fn clear_command_takes_every_live_drawing_off_and_no_o_overlay() {
+    let mut fx = Fx::new("clear-live-command");
+    let (path, two) = live_two(&mut fx);
+    live_show(&mut fx, &path, "t1", 32, &two.hunks);
+    for (name, explicit) in [("second.txt", false), ("explicit.txt", true)] {
+        let other = fx.file(name, &two.end);
+        fx.nvim.lua(
+            "local p = ... vim.api.nvim_cmd({ cmd = 'split', args = { p } }, {}) vim.bo.autoread = true",
+            vec![Value::from(other.to_str().unwrap())],
+        );
+        if explicit {
+            fx.show(&other, &meta(2), &two.hunks);
+        } else {
+            live_show(&mut fx, &other, "t1", 32, &two.hunks);
+        }
+    }
+    let before = fx.nvim.lua(OVERLAY_SNAPSHOT_LUA, vec![]);
+    let position = fx.nvim.lua(EDITOR_POSITION_LUA, vec![]);
+    fx.nvim.command("EitriReviewClear");
+    assert_eq!(fx.nvim.lua(OVERLAY_SNAPSHOT_LUA, vec![]), before);
+    assert_eq!(fx.nvim.lua(EDITOR_POSITION_LUA, vec![]), position);
+    assert_review_commands(&mut fx, false, false);
+    assert_eq!(fx.review_maps(), vec![",q", ",r", "[h", "]h"]);
+    let events = fx.events();
+    assert_eq!(events.len(), 2);
+    assert!(events.iter().all(|e| text(get(e, "kind")) == "off"));
+    fx.open(&path);
+    assert_eq!(fx.marks().count, 0);
+    assert!(fx.review_maps().is_empty());
+    assert_eq!(count(&live_show(&mut fx, &path, "t1", 32, &two.hunks), "drawn"), 2);
+    assert_eq!(fx.lines(), as_lines(&two.end));
+    assert!(!fx.modified());
+}
+
+#[test]
+#[ignore = "needs nvim"]
+fn commands_go_with_the_last_live_overlay() {
+    for remove in [",q", ",a", "clear", "replace", "teardown", "wipe"] {
+        let mut fx = Fx::new("live-command-lifetime");
+        assert_review_commands(&mut fx, false, false);
+        let (path, two) = live_two(&mut fx);
+        live_show(&mut fx, &path, "t1", 32, &two.hunks);
+        assert_review_commands(&mut fx, true, true);
+        match remove {
+            "clear" => {
+                fx.nvim.lua(CLEAR_LUA, clear_args(&path));
+            }
+            "replace" => {
+                fx.show(&path, &meta(2), &two.hunks);
+            }
+            "teardown" => {
+                fx.nvim.lua("_G.__eitri_review.teardown()", vec![]);
+            }
+            "wipe" => fx.nvim.command("bwipeout!"),
+            keys => fx.feed(keys),
+        }
+        assert_review_commands(&mut fx, false, false);
+    }
+    let mut fx = Fx::new("live-command-last-buffer");
+    let (path, two) = live_two(&mut fx);
+    live_show(&mut fx, &path, "t1", 32, &two.hunks);
+    let other = fx.file("other-live.txt", &two.end);
+    fx.nvim.lua(
+        "local p = ... vim.api.nvim_cmd({ cmd = 'split', args = { p } }, {}) vim.bo.autoread = true",
+        vec![Value::from(other.to_str().unwrap())],
+    );
+    live_show(&mut fx, &other, "t1", 32, &two.hunks);
+    fx.nvim.command("EitriReviewKeep");
+    assert_review_commands(&mut fx, false, true);
+    assert_eq!(fx.marks().count, 0);
+    fx.open(&path);
+    assert_review_commands(&mut fx, true, true);
+    assert!(fx.marks().count > 0, "keeping another buffer leaves this drawing up");
+    fx.nvim.command("EitriReviewUndo");
+    assert_eq!(fx.lines(), as_lines(&two.base));
+    assert_review_commands(&mut fx, true, true);
+    fx.nvim.command("EitriReviewClear");
+    assert_review_commands(&mut fx, false, false);
+    fx.open(&other);
+    assert_eq!(fx.lines(), as_lines(&two.end), "undo affects only its buffer");
+
+    let mut fx = Fx::new("live-command-ownership");
+    let (path, two) = live_two(&mut fx);
+    live_show(&mut fx, &path, "t1", 32, &two.hunks);
+    fx.nvim.lua(
+        "vim.api.nvim_create_user_command('EitriReviewClear', function() end, { desc = 'personal clear' }) \
+        vim.api.nvim_buf_create_user_command(0, 'EitriReviewKeep', function() end, { desc = 'personal keep' })",
+        vec![],
+    );
+    fx.feed(",q");
+    assert_eq!(
+        fx.nvim.lua(
+            "return { vim.api.nvim_get_commands({}).EitriReviewClear.definition, \
+        vim.api.nvim_buf_get_commands(0, {}).EitriReviewKeep.definition }",
+            vec![]
+        ),
+        Value::Array(vec![Value::from("personal clear"), Value::from("personal keep")])
+    );
+    assert_eq!(
+        fx.nvim.lua(
+            "return vim.api.nvim_buf_get_commands(0, {}).EitriReviewUndo == nil",
+            vec![]
+        ),
+        Value::from(true)
+    );
 }

@@ -7,8 +7,9 @@
 -- are compared with buffer lines or set as buffer lines, never run, and a file is opened only
 -- through `nvim_cmd` with the path as a structured argument and file-name expansion off.
 --
--- Nothing here reads or writes a file. A revert changes the buffer only (undoable with `u`, and
--- left unsaved) and is queued as an event, which the host takes by polling. The module then keeps
+-- A live draw lets nvim reload an unmodified buffer through checktime. A revert changes the
+-- buffer only (undoable with `u`, and left unsaved) and is queued as an event, which the host
+-- takes by polling. The module then keeps
 -- following the reverted hunk: its text coming back (`u`, or typing it) is an `unrevert` event, and
 -- the base text coming back over a drawn hunk (`Ctrl-r`, or typing it) is a `revert` event.
 --
@@ -60,6 +61,14 @@ local DESC = {
   ['<localleader>r'] = 'eitri review: revert the hunk under the cursor',
   ['<localleader>q'] = 'eitri review: close the review overlay',
 }
+local LIVE_KEYS = { ']h', '[h', '<localleader>r', '<localleader>q', '<localleader>a', '<localleader>d' }
+DESC['<localleader>a'] = 'eitri review: keep all changes in this buffer'
+DESC['<localleader>d'] = 'eitri review: undo all changes in this buffer'
+local COMMANDS = {
+  EitriReviewKeep = DESC['<localleader>a'],
+  EitriReviewUndo = DESC['<localleader>d'],
+}
+local CLEAR_DESC = 'eitri review: clear all live drawings'
 local EOLS = { lf = true, crlf = true, missing = true }
 local PRIORITY = 90
 -- Bound the bytes tokenised for one line.
@@ -84,6 +93,11 @@ local state = {
   augroup = nil,
   events = {},
   overlays = {},
+  kept = {},
+  kept_order = {},
+  kept_turns = {},
+  kept_count = 0,
+  reloading = {},
   -- Hunks reverted in a buffer whose overlay went away before their text came back, so nothing
   -- followed them: `{ path, meta, hunk }`, oldest first. A later show that draws one over its new
   -- text learns the revert was undone (`take_forgotten`).
@@ -102,6 +116,33 @@ local function active_count()
     n = n + 1
   end
   return n
+end
+
+-- Every answer reports both drawings and events still waiting for the host.
+local function status(answer)
+  answer.active = active_count()
+  answer.pending = #state.events
+  answer.live_only = true
+  for _, ov in pairs(state.overlays) do
+    if not ov.live then
+      answer.live_only = false
+      break
+    end
+  end
+  return answer
+end
+
+local function is_shown(buf)
+  if not buf or not api.nvim_buf_is_loaded(buf) then
+    return false
+  end
+  for _, win in ipairs(api.nvim_list_wins()) do
+    local config = api.nvim_win_get_config(win)
+    if api.nvim_win_get_buf(win) == buf and config.relative == '' and not config.external then
+      return true
+    end
+  end
+  return false
 end
 
 -- The text a buffer of 'fileformat' `ff` holds for a file line of `text` ended by `eol`, or nil
@@ -181,22 +222,23 @@ end
 -- ending) as this buffer would hold the file's lines, final newline included:
 -- a line without one must be the buffer's last with
 -- 'eol' off, and a last line with one needs 'eol' on. A 'binary' buffer is never compared.
-local function holds_side(buf, row, n, lines, eols)
-  if vim.bo[buf].binary then
+local function holds_side(buf, row, n, lines, eols, snapshot)
+  if (snapshot and snapshot.binary) or (not snapshot and vim.bo[buf].binary) then
     return false
   end
-  local count = api.nvim_buf_line_count(buf)
+  local count = snapshot and #snapshot or api.nvim_buf_line_count(buf)
   if row < 0 or row + n > count then
     return false
   end
-  local ff = vim.bo[buf].fileformat
+  local ff = snapshot and snapshot.ff or vim.bo[buf].fileformat
   local ends = row + n == count
-  local eol = vim.bo[buf].eol
-  local got = api.nvim_buf_get_lines(buf, row, row + n, true)
+  local eol = snapshot and snapshot.eol
+  if not snapshot then eol = vim.bo[buf].eol end
+  local got = snapshot or api.nvim_buf_get_lines(buf, row, row + n, true)
   for i = 1, n do
     local e = eols[i]
     local want = expected(lines[i], e, ff)
-    if want == nil or got[i] ~= want then
+    if want == nil or got[snapshot and row + i or i] ~= want then
       return false
     end
     if e == 'missing' and not (i == n and ends and not eol) then
@@ -209,8 +251,8 @@ local function holds_side(buf, row, n, lines, eols)
   return true
 end
 
-local function holds_new_side(buf, row, h)
-  return holds_side(buf, row, h.new_len, h.new_lines, h.new_eols)
+local function holds_new_side(buf, row, h, snapshot)
+  return holds_side(buf, row, h.new_len, h.new_lines, h.new_eols, snapshot)
 end
 
 -- The tracker's current start row and last row, and whether it still spans whole lines.
@@ -251,6 +293,15 @@ local function keyed(lines, eols)
     parts[i] = eols[i] .. '\1' .. lines[i] .. '\n'
   end
   return table.concat(parts)
+end
+
+local function fingerprint(h)
+  return vim.fn.sha256(keyed(h.old_lines, h.old_eols) .. '\0' .. keyed(h.new_lines, h.new_eols))
+end
+
+local function kept_hunks(path, meta)
+  local turns = state.kept[path]
+  return turns and turns[meta.session .. ':' .. meta.turn_id]
 end
 
 -- What a removed line looks like in a virtual line: control characters made printable, so a raw
@@ -383,17 +434,62 @@ end
 
 local remove_overlay, watch, unwatch
 
+-- Commands belong to the live drawings and leave with them. A command replaced by the person's
+-- configuration keeps its new definition, just as a mapping replaced over ours does.
+local function remove_commands(buf)
+  local ok, commands = pcall(api.nvim_buf_get_commands, buf, {})
+  if ok then
+    for name, desc in pairs(COMMANDS) do
+      if commands[name] and commands[name].definition == desc then
+        pcall(api.nvim_buf_del_user_command, buf, name)
+      end
+    end
+  end
+  for _, ov in pairs(state.overlays) do
+    if ov.live then return end
+  end
+  local command = api.nvim_get_commands({}).EitriReviewClear
+  if command and command.definition == CLEAR_DESC then
+    pcall(api.nvim_del_user_command, 'EitriReviewClear')
+  end
+end
+
+local function clear_live()
+  if state.torn then return end
+  for buf, ov in pairs(state.overlays) do
+    if ov.live then remove_overlay(buf, 'user') end
+  end
+end
+
+local function set_commands(buf, actions)
+  local commands = api.nvim_buf_get_commands(buf, {})
+  local callbacks = {
+    EitriReviewKeep = actions['<localleader>a'],
+    EitriReviewUndo = actions['<localleader>d'],
+  }
+  for name, desc in pairs(COMMANDS) do
+    if not commands[name] then
+      api.nvim_buf_create_user_command(buf, name, callbacks[name], { desc = desc })
+    end
+  end
+  if not api.nvim_get_commands({}).EitriReviewClear then
+    api.nvim_create_user_command('EitriReviewClear', clear_live, { desc = CLEAR_DESC })
+  end
+end
+
 -- The buffer-local maps of `lhs` that the overlay's keys shadow are saved and come back when it
 -- goes; `maparg` also reports global maps, which are left alone, and `maparg`/`mapset` work on the
 -- current buffer, hence `nvim_buf_call`.
 local function set_keys(buf, ov, actions)
   api.nvim_buf_call(buf, function()
-    for _, lhs in ipairs(KEYS) do
+    for _, lhs in ipairs(ov.live and LIVE_KEYS or KEYS) do
       local was = vim.fn.maparg(lhs, 'n', false, true)
-      local saved = (type(was) == 'table' and was.buffer == 1) and was or nil
-      vim.keymap.set('n', lhs, actions[lhs], { buffer = buf, desc = DESC[lhs], silent = true })
-      local mine = vim.fn.maparg(lhs, 'n', false, true)
-      ov.keys[#ov.keys + 1] = { ours = mine.lhs, desc = DESC[lhs], saved = saved }
+      if not ov.live or type(was) ~= 'table' or next(was) == nil then
+        local saved = (type(was) == 'table' and was.buffer == 1) and was or nil
+        vim.keymap.set('n', lhs, actions[lhs], { buffer = buf, desc = DESC[lhs], silent = true })
+        local mine = vim.fn.maparg(lhs, 'n', false, true)
+        ov.keys[#ov.keys + 1] = { ours = mine.lhs, desc = DESC[lhs], saved = saved }
+      end
     end
   end)
 end
@@ -433,12 +529,61 @@ remove_overlay = function(buf, why)
   end
   pcall(api.nvim_buf_clear_namespace, buf, state.ns, 0, -1)
   restore_keys(buf, ov)
+  if ov.live then remove_commands(buf) end
   if why then
     state.events[#state.events + 1] = { kind = 'off', path = ov.path, why = why }
   end
   if active_count() == 0 then
     unwatch()
   end
+end
+
+function state.keep_current()
+  if state.torn then return end
+  local buf = api.nvim_get_current_buf()
+  local ov = state.overlays[buf]
+  if not ov then return end
+  if ov.meta.turn_id then
+    local turns = state.kept[ov.path]
+    if not turns then
+      turns = {}
+      state.kept[ov.path] = turns
+    end
+    local key = ov.meta.session .. ':' .. ov.meta.turn_id
+    local record = turns[key]
+    if not record then
+      record = {}
+      turns[key] = record
+    end
+    local turn = state.kept_turns[key]
+    if not turn then
+      turn = { paths = {}, count = 0 }
+      state.kept_turns[key] = turn
+      state.kept_order[#state.kept_order + 1] = key
+    end
+    turn.paths[ov.path] = true
+    for _, d in ipairs(ov.hunks) do
+      if d.alive or d.ghost then
+        local fp = fingerprint(d.hunk)
+        if not record[fp] then
+          record[fp] = true
+          state.kept_count = state.kept_count + 1
+          turn.count = turn.count + 1
+        end
+      end
+    end
+    while state.kept_count > 4096 do
+      local oldest = table.remove(state.kept_order, 1)
+      local old_turn = state.kept_turns[oldest]
+      for path in pairs(old_turn.paths) do
+        state.kept[path][oldest] = nil
+        if next(state.kept[path]) == nil then state.kept[path] = nil end
+      end
+      state.kept_count = state.kept_count - old_turn.count
+      state.kept_turns[oldest] = nil
+    end
+  end
+  remove_overlay(buf, 'user')
 end
 
 local function jump(forward)
@@ -576,6 +721,10 @@ local function revert()
   if not ov then
     return
   end
+  if ov.running then
+    warn('the turn is still running; undo when it ends (Esc in the panel interrupts it)')
+    return
+  end
   local cur = api.nvim_win_get_cursor(0)[1] - 1
   local found, at, len = nil, nil, nil
   for _, d in ipairs(ov.hunks) do
@@ -616,28 +765,117 @@ local function revert()
   state.events[#state.events + 1] = event
 end
 
+local function undo_all()
+  if state.torn then return end
+  local buf = api.nvim_get_current_buf()
+  local ov = state.overlays[buf]
+  if not ov or not ov.live then return end
+  if ov.running then
+    warn('the turn is still running; undo when it ends (Esc in the panel interrupts it)')
+    return
+  end
+  local plans, missing = {}, ov.skipped
+  local kept = kept_hunks(ov.path, ov.meta)
+  for _, d in ipairs(ov.hunks) do
+    local h = d.hunk
+    if d.alive then
+      local at, _, len = tracked(buf, d)
+      if at ~= nil and len == h.new_len and holds_new_side(buf, at, h) then
+        plans[#plans + 1] = { drawing = d, at = at }
+      else
+        missing = missing + 1
+      end
+    elseif not d.ghost and not (kept and kept[fingerprint(h)]) then
+      missing = missing + 1
+    end
+  end
+  if missing > 0 then
+    warn(missing .. ' changes of this turn are not drawn here; undo them in the panel (x)')
+    return
+  end
+  table.sort(plans, function(a, b) return a.at < b.at end)
+  -- Validate every replacement and event before touching any line. Reverted hunks are followed
+  -- by their ghosts and need no second replacement. Each event is read from the top down, as the
+  -- reverts of the hunks above it already stand, so its line is its row less what they shifted.
+  local shift = 0
+  for _, plan in ipairs(plans) do
+    local h = plan.drawing.hunk
+    if h.old_len == 0 or h.new_len == 0 then
+      warn('this change creates or empties the file; undo it in the panel (x)')
+      return
+    end
+    plan.lines = revert_plan(buf, plan.at, h, h.new_len)
+    if not plan.lines then
+      warn("this change alters the file's line endings; undo it in the panel (x)")
+      return
+    end
+    plan.event = hunk_event('revert', ov, h, plan.at - shift)
+    if event_size(plan.event) > MAX_REVERT_EVENT_BYTES then
+      warn('this change is too large to undo here; undo it in the panel (x)')
+      return
+    end
+    shift = shift + h.new_len - h.old_len
+  end
+  if #plans == 0 then return end
+  -- All replacements run in this one key press or command, so nvim records one undo step.
+  -- Starting at the bottom preserves every earlier replacement's validated line range.
+  for i = #plans, 1, -1 do
+    local plan = plans[i]
+    local d = plan.drawing
+    local ok, err = pcall(api.nvim_buf_set_lines, buf, plan.at, plan.at + d.hunk.new_len, true, plan.lines)
+    if not ok then
+      warn('the changes could not be undone: ' .. tostring(err))
+      return
+    end
+    drop_marks(buf, d)
+    make_ghost(buf, d, plan.at)
+  end
+  -- Events describe the buffer from top to bottom, whatever order the hunks arrived in.
+  for _, plan in ipairs(plans) do
+    state.events[#state.events + 1] = plan.event
+  end
+  local noun = #plans == 1 and ' change' or ' changes'
+  vim.notify(#plans .. noun .. ' undone in this buffer only; :w writes them, u brings them back', vim.log.levels.INFO)
+end
+state.undo_current = undo_all
+
 -- After an edit of `buf`: a hunk whose lines were changed is no longer drawn, unless the change
 -- put the base text back (a redo of a revert, or the user typing it), which reads as the revert;
 -- and a hunk reverted here whose own text is back (an undo, or typing it again) is drawn again and
 -- reported, so that the revert recorded for it can be dropped.
 local MAX_SEARCH_LINES = 20000
 
--- The one row where `h`'s new side is in `buf` and its old side is not, or nil when there is none
+-- The one row where `h`'s new side is in the snapshot and its old side is not, or nil when there is none
 -- or more than one place (an edit that moved whole text, such as a formatter or `:%!`, left both
 -- marks elsewhere; two places cannot be told apart). A large buffer is not searched.
-local function find_new_side(buf, h)
-  local count = api.nvim_buf_line_count(buf)
-  if count > MAX_SEARCH_LINES or h.new_len == 0 then
+local function find_new_side(lines, ff, h)
+  if lines.binary or h.new_len == 0 then
     return nil
   end
-  local first = expected(h.new_lines[1], h.new_eols[1], vim.bo[buf].fileformat)
+  local first = expected(h.new_lines[1], h.new_eols[1], ff)
   if first == nil then
     return nil
   end
+  local function holds(row, n, side, eols)
+    if row + n - 1 > #lines then
+      return false
+    end
+    local ends = row + n - 1 == #lines
+    for i = 1, n do
+      local want = expected(side[i], eols[i], ff)
+      if want == nil or lines[row + i - 1] ~= want then
+        return false
+      end
+      if eols[i] == 'missing' and not (i == n and ends and not lines.eol) then
+        return false
+      end
+    end
+    return not (n > 0 and ends and eols[n] ~= 'missing' and not lines.eol)
+  end
   local found = nil
-  for row, line in ipairs(api.nvim_buf_get_lines(buf, 0, -1, true)) do
-    if line == first and holds_new_side(buf, row - 1, h)
-      and not holds_side(buf, row - 1, h.old_len, h.old_lines, h.old_eols) then
+  for _, row in ipairs(lines.rows[first] or {}) do
+    if holds(row, h.new_len, h.new_lines, h.new_eols)
+      and not holds(row, h.old_len, h.old_lines, h.old_eols) then
       if found then
         return nil
       end
@@ -654,6 +892,11 @@ local function follow_edits(buf, search)
   if not ov then
     return
   end
+  -- The buffer's bytes are read whole only once a search needs them (and then once for the call);
+  -- until then each comparison reads just its own rows, so typing costs nothing that grows with the file.
+  local snapshot
+  local lines, ff
+  local searched = false
   for i, d in ipairs(ov.hunks) do
     local h = d.hunk
     if d.ghost then
@@ -661,12 +904,36 @@ local function follow_edits(buf, search)
       -- file) holds both at once; its text cannot be told from the revert, so it stays reverted.
       local back = nil
       for _, s in ipairs(ghost_rows(buf, d)) do
-        if back == nil and holds_new_side(buf, s, h) and not holds_side(buf, s, h.old_len, h.old_lines, h.old_eols) then
+        if back == nil and holds_new_side(buf, s, h, snapshot)
+          and not holds_side(buf, s, h.old_len, h.old_lines, h.old_eols, snapshot) then
           back = s
         end
       end
       if back == nil and search then
-        back = find_new_side(buf, h)
+        if not searched then
+          searched = true
+          if api.nvim_buf_line_count(buf) <= MAX_SEARCH_LINES then
+            -- All searches in this call share the buffer bytes, options and first-line index.
+            lines = api.nvim_buf_get_lines(buf, 0, -1, true)
+            ff = vim.bo[buf].fileformat
+            lines.ff = ff
+            lines.eol = vim.bo[buf].eol
+            lines.binary = vim.bo[buf].binary
+            snapshot = lines
+            lines.rows = {}
+            for row, line in ipairs(lines) do
+              local rows = lines.rows[line]
+              if not rows then
+                rows = {}
+                lines.rows[line] = rows
+              end
+              rows[#rows + 1] = row
+            end
+          end
+        end
+        if lines then
+          back = find_new_side(lines, ff, h)
+        end
       end
       if back then
         pcall(api.nvim_buf_del_extmark, buf, state.ns, d.ghost)
@@ -680,13 +947,13 @@ local function follow_edits(buf, search)
       if intact then
         d.row = s
       end
-      if not intact or not holds_new_side(buf, s, h) then
+      if not intact or not holds_new_side(buf, s, h, snapshot) then
         -- Where the base text may have come back: where the tracker is, and where the hunk was
         -- last seen intact (an edit that replaced the whole hunk left the tracker at its end).
         local back = nil
         for _, at in ipairs({ s or d.row, d.row }) do
           if back == nil and at < api.nvim_buf_line_count(buf) and revert_plan(buf, at, h, h.old_len)
-            and holds_side(buf, at, h.old_len, h.old_lines, h.old_eols) then
+            and holds_side(buf, at, h.old_len, h.old_lines, h.old_eols, snapshot) then
             back = at
           end
         end
@@ -698,6 +965,12 @@ local function follow_edits(buf, search)
         end
       end
     end
+  end
+  if ov.live then
+    for _, d in ipairs(ov.hunks) do
+      if d.alive or d.ghost then return end
+    end
+    remove_overlay(buf, 'edited')
   end
 end
 
@@ -717,11 +990,10 @@ local ACTIONS = {
   end,
   ['<localleader>r'] = revert,
   ['<localleader>q'] = close,
+  ['<localleader>a'] = state.keep_current,
+  ['<localleader>d'] = undo_all,
 }
 
--- Draws `hunks` into `buf`, replacing the overlay it had (no event: the host asked). A hunk whose
--- new side is not in the buffer as given is skipped, never drawn over other text; one with no new
--- lines has nothing to draw over.
 -- Removes and returns whether `path` had `hunk` of review `meta` among the forgotten reverts.
 local function take_forgotten(path, meta, hunk)
   for i, f in ipairs(state.forgotten) do
@@ -734,11 +1006,13 @@ local function take_forgotten(path, meta, hunk)
   return false
 end
 
+-- Draws into a loaded buffer, replacing its overlay. Only a live draw includes a wholly emptied
+-- file; an explicit drawing keeps its existing treatment of hunks with no new lines.
 -- A hunk reverted here, whose overlay then went away, and which is drawn again over its new text
 -- (and not over its old one) has had its revert undone: an `unrevert` event says so, queued behind
 -- the events the host has not taken yet, so it never overtakes the revert it undoes. A hunk that
 -- was not reverted here says nothing.
-local function show_into(buf, path, meta, hunks)
+local function show_into(buf, path, meta, hunks, live)
   -- A hunk reverted in this buffer under the same review is carried over to the new overlay (the
   -- panel redraws it when the user opens another hunk of the file), so that its text coming back
   -- is still noticed; it is not drawn, since its new side is not in the buffer.
@@ -758,7 +1032,7 @@ local function show_into(buf, path, meta, hunks)
   local drawn, skipped, list, back = 0, 0, {}, {}
   local ok, err = pcall(function()
     for _, h in ipairs(hunks) do
-      if h.new_len > 0 then
+      if h.new_len > 0 or live then
         local row = start_row(h)
         if holds_new_side(buf, row, h) then
           list[#list + 1] = draw_hunk(buf, row, h)
@@ -792,9 +1066,11 @@ local function show_into(buf, path, meta, hunks)
   -- An overlay whose hunks are all reverted stays, so the text of those coming back is still
   -- followed; it goes like any other, and takes its marks and the module's autocommands with it.
   if #list > 0 then
-    local ov = { path = path, meta = meta, hunks = list, keys = {} }
+    local ov = { path = path, meta = meta, hunks = list, keys = {},
+      live = live == true, running = live and meta.running or false, skipped = skipped }
     state.overlays[buf] = ov
     set_keys(buf, ov, ACTIONS)
+    if ov.live then set_commands(buf, ACTIONS) end
     watch()
     for _, b in ipairs(back) do
       if take_forgotten(path, meta, b.h) then
@@ -805,13 +1081,12 @@ local function show_into(buf, path, meta, hunks)
     -- Nothing is drawn or followed, so nothing is kept.
     pcall(api.nvim_buf_clear_namespace, buf, state.ns, 0, -1)
   end
-  return {
+  return status({
     drawn = drawn,
     kept = #list,
     skipped = skipped,
     notice = notice,
-    active = active_count(),
-  }
+  })
 end
 
 -- Only into a buffer that is already loaded: loading one here could stop at a swap-file prompt,
@@ -822,7 +1097,7 @@ function state.show(path, meta, hunks)
   check_hunks(hunks)
   local buf = find_buf(path)
   if not buf or not api.nvim_buf_is_loaded(buf) then
-    return { drawn = 0, skipped = 0, notice = 'the file is not open in the editor', active = active_count() }
+    return status({ drawn = 0, skipped = 0, notice = 'the file is not open in the editor' })
   end
   return show_into(buf, path, meta, hunks)
 end
@@ -844,7 +1119,7 @@ function state.open_and_show(path, line, meta, hunks)
   end
   local buf = find_buf(path)
   if buf == nil and not vim.uv.fs_stat(path) then
-    return { opened = false, error = 'the file does not exist', active = active_count() }
+    return status({ opened = false, error = 'the file does not exist' })
   end
   -- Editing the current file again would read it again and clear its overlay as "reloaded".
   if buf ~= api.nvim_get_current_buf() then
@@ -855,7 +1130,7 @@ function state.open_and_show(path, line, meta, hunks)
       ok, err = pcall(api.nvim_cmd, cmd, {})
     end
     if not ok then
-      return { opened = false, error = tostring(err), active = active_count() }
+      return status({ opened = false, error = tostring(err) })
     end
   end
   local cur = api.nvim_get_current_buf()
@@ -870,7 +1145,76 @@ function state.open_and_show(path, line, meta, hunks)
       answer[k] = v
     end
   end
-  return answer
+  return status(answer)
+end
+
+local function must_leave(buf)
+  if vim.bo[buf].modified then return true end
+  local ov = state.overlays[buf]
+  if ov then
+    if not ov.live then return true end
+    for _, d in ipairs(ov.hunks) do
+      if d.ghost then return true end
+    end
+  end
+  return false
+end
+
+function state.live_show(path, meta, hunks)
+  check_path(path)
+  check_meta(meta)
+  check_hunks(hunks)
+  if type(meta.turn_id) ~= 'string' or type(meta.running) ~= 'boolean'
+    or type(meta.read_lines) ~= 'number' or meta.read_lines < 0 or meta.read_lines % 1 ~= 0
+    or meta.scope ~= 'turn' then
+    error('eitri review: malformed live meta')
+  end
+  local buf = find_buf(path)
+  local answer = { drawn = 0, shown = is_shown(buf), left = false, skipped = 0 }
+  if not answer.shown then return status(answer) end
+  if must_leave(buf) then
+    answer.left = true
+    return status(answer)
+  end
+  local autoread = api.nvim_get_option_value('autoread', { buf = buf })
+  if autoread == nil or autoread == -1 then autoread = vim.o.autoread end
+  if autoread then
+    state.reloading[buf] = true
+    pcall(api.nvim_cmd, { cmd = 'checktime', args = { tostring(buf) } }, {})
+    state.reloading[buf] = nil
+  end
+  -- Reload autocommands belong to the person's configuration and can change either buffer state.
+  answer.shown = is_shown(buf)
+  if not answer.shown then return status(answer) end
+  if must_leave(buf) then
+    answer.left = true
+    return status(answer)
+  end
+  remove_overlay(buf, nil)
+  local filtered = {}
+  local kept = kept_hunks(path, meta)
+  for _, h in ipairs(hunks) do
+    if not kept or not kept[fingerprint(h)] then filtered[#filtered + 1] = h end
+  end
+  -- A file the job read as empty is one empty line here; a line with text means it was written since.
+  local emptied_over_text = meta.read_lines == 0 and api.nvim_buf_get_lines(buf, 0, 1, true)[1] ~= ''
+  if not autoread or api.nvim_buf_line_count(buf) ~= math.max(1, meta.read_lines) or emptied_over_text then
+    answer.skipped = #filtered
+    return status(answer)
+  end
+  local drawn = show_into(buf, path, meta, filtered, true)
+  answer.drawn = drawn.drawn
+  answer.skipped = drawn.skipped
+  return status(answer)
+end
+
+function state.live_clear(path)
+  check_path(path)
+  local buf = find_buf(path)
+  local ov = buf and state.overlays[buf]
+  local cleared = ov ~= nil and ov.live == true
+  if cleared then remove_overlay(buf, nil) end
+  return status({ cleared = cleared })
 end
 
 function state.clear(path)
@@ -879,14 +1223,14 @@ function state.clear(path)
   if buf then
     remove_overlay(buf, nil)
   end
-  return { active = active_count() }
+  return status({})
 end
 
 function state.clear_all()
   for buf in pairs(state.overlays) do
     remove_overlay(buf, nil)
   end
-  return { active = active_count() }
+  return status({})
 end
 
 -- The oldest events, in order, as many as fit in one answer (at least one); `more` says some wait.
@@ -907,7 +1251,7 @@ function state.take_events()
     rest[#rest + 1] = all[i]
   end
   state.events = rest
-  return { events = out, active = active_count(), more = #rest > 0 }
+  return status({ events = out, more = #rest > 0 })
 end
 
 -- One set of autocommands for the whole module, never one per buffer; each returns at once for a
@@ -940,8 +1284,12 @@ watch = function()
       if state.torn or not state.overlays[args.buf] then
         return
       end
-      remove_overlay(args.buf, 'reload')
-      vim.notify('the review overlay was cleared: the file was reloaded', vim.log.levels.INFO)
+      local live = state.overlays[args.buf].live
+      local why = not state.reloading[args.buf] and 'reload' or nil
+      remove_overlay(args.buf, why)
+      if not live then
+        vim.notify('the review overlay was cleared: the file was reloaded', vim.log.levels.INFO)
+      end
     end,
   })
 
@@ -991,6 +1339,10 @@ local function teardown()
     pcall(remove_overlay, buf, nil)
   end
   state.overlays = {}
+  state.kept = {}
+  state.kept_order = {}
+  state.kept_turns = {}
+  state.kept_count = 0
   unwatch()
   if rawget(_G, '__eitri_review') == state then
     _G.__eitri_review = nil
