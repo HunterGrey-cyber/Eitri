@@ -1100,3 +1100,65 @@ fn a_teardown_before_the_scheduled_check_installs_nothing() {
     assert_eq!(before, after, "every slot must hold what it held before");
     t.finish();
 }
+
+#[test]
+#[ignore = "needs a real nvim on PATH and a pane-switch socket; no display"]
+fn normal_ctrl_l_moves_into_a_right_split_and_sends_nothing() {
+    let mut nvim = Nvim::start("normal-right-split", Loader::Installed, &[], &[]);
+    nvim.wait_for_all_fallbacks("n");
+    nvim.command("vsplit");
+    assert_eq!(nvim.winnr(), 1);
+    nvim.input("<C-l>");
+    nvim.wait_until("the right split", |nvim| nvim.winnr() == 2);
+    nvim.input("<C-k>");
+    assert_eq!(nvim.wait_for_letter(), "U\n", "only the top edge sends a letter");
+    assert_eq!(nvim.mode(), "n");
+    nvim.quit();
+}
+
+#[test]
+#[ignore = "needs a real nvim on PATH and a pane-switch socket; no display"]
+fn normal_ctrl_l_at_the_edge_sends_r() {
+    let mut nvim = Nvim::start("normal-right-edge", Loader::Installed, &[], &[]);
+    nvim.wait_for_all_fallbacks("n");
+    nvim.input("<C-l>");
+    assert_eq!(nvim.wait_for_letter(), "R\n");
+    assert_eq!(nvim.mode(), "n");
+    assert_eq!(nvim.winnr(), 1);
+    nvim.quit();
+}
+
+#[test]
+#[ignore = "needs a real nvim on PATH and a pane-switch socket; no display"]
+fn visual_at_the_edge_sends_and_keeps_the_selection() {
+    let mut nvim = Nvim::start("visual-right-edge", Loader::Installed, &[], &[]);
+    nvim.wait_for_all_fallbacks("x");
+    nvim.lua("vim.fn.setline(1, { 'one', 'two', 'three' })", vec![]);
+    nvim.input("vj<C-l>");
+    assert_eq!(nvim.wait_for_letter(), "R\n");
+    assert_eq!(nvim.mode(), "v");
+    assert_eq!(
+        nvim.eval("[line('v'), line('.')]"),
+        Value::from(vec![Value::from(1), Value::from(2)])
+    );
+    nvim.quit();
+}
+
+#[test]
+#[ignore = "needs a real nvim on PATH and a pane-switch socket; no display"]
+fn insert_ctrl_l_ends_insert_then_moves_as_normal() {
+    let mut nvim = Nvim::start("insert-right-split", Loader::Installed, &[], &[]);
+    nvim.wait_for_fallback("<C-l>", "i", "right");
+    nvim.wait_for_all_fallbacks("n");
+    nvim.command("vsplit");
+    nvim.input("ihello<C-l>");
+    nvim.wait_until("Normal mode in the right split", |nvim| {
+        nvim.mode() == "n" && nvim.winnr() == 2
+    });
+    nvim.input("<C-k>");
+    assert_eq!(nvim.wait_for_letter(), "U\n");
+    assert_eq!(nvim.eval("getline(1)").as_str(), Some("hello"));
+    nvim.input("<C-l>");
+    assert_eq!(nvim.wait_for_letter(), "R\n");
+    nvim.quit();
+}

@@ -11,6 +11,7 @@ mod panel;
 pub(crate) use eitri_core::lua::panel::PanelSlot;
 pub(crate) use panel::{install_crash_recovery_into, PanelEntry, PanelRegistry};
 
+use eitri_core::keymap::KeySpec;
 use eitri_core::layout::ModuleId;
 use eitri_core::lua::kernel::Kernel;
 use std::cell::RefCell;
@@ -26,6 +27,7 @@ pub(crate) struct LuaEngine {
     pub(crate) panels: Rc<RefCell<PanelRegistry>>,
     /// In a page window beside nvim: the one plugin it builds, and what `init.lua` asked of the others.
     page: Option<Rc<PageLoads>>,
+    recorded_keys: Rc<RefCell<Vec<(String, KeySpec)>>>,
 }
 
 /// What a page window's `init.lua` loaded: its own plugin through the real call, every other load only counted, with
@@ -82,6 +84,7 @@ impl LuaEngine {
             kernel,
             panels,
             page: None,
+            recorded_keys: Rc::default(),
         })
     }
 
@@ -127,6 +130,7 @@ impl LuaEngine {
             kernel,
             panels: Rc::new(RefCell::new(PanelRegistry::default())),
             page: Some(page),
+            recorded_keys: Rc::default(),
         })
     }
 
@@ -223,20 +227,47 @@ impl LuaEngine {
         loaded
     }
 
-    /// The engine for a window that shows no plugin pages (the companion window): panels are still
-    /// recorded so the window can say how many it ignores, but `eitri.plugin.load` logs once and does
-    /// nothing, so it neither fails the start nor writes anything under a plugin's state directory.
+    /// The plugin ids and module keys recorded without loading plugins, in init.lua order.
+    pub(crate) fn recorded_plugin_keys(&self) -> Vec<(String, KeySpec)> {
+        self.recorded_keys.borrow().clone()
+    }
+
+    /// The companion records page keys while loading no plugin code and writing no plugin state.
     pub(crate) fn without_plugins(config_dir: PathBuf) -> mlua::Result<Self> {
         let panels = Rc::new(RefCell::new(PanelRegistry::default()));
         let for_panels = panels.clone();
+        let recorded_keys = Rc::new(RefCell::new(Vec::new()));
+        let keys = recorded_keys.clone();
         let kernel = Kernel::new(config_dir.clone(), move |lua, eitri| {
             panel::install(lua, eitri, for_panels, config_dir, None)?;
-            eitri_core::lua::plugin::refuse_plugins(lua, eitri)
+            let load = lua.create_function(move |_, (arg, opts): (mlua::Value, mlua::Value)| {
+                let mlua::Value::String(id) = arg else { return Ok(()) };
+                let id = id.to_str()?.to_string();
+                if !eitri_core::plugin::manifest::id_ok(&id) {
+                    return Ok(());
+                }
+                let mlua::Value::Table(opts) = opts else { return Ok(()) };
+                let Some(key) = opts.get::<Option<String>>("key").ok().flatten() else {
+                    return Ok(());
+                };
+                if let Ok(key) = KeySpec::parse(&key) {
+                    // The first load of an id decides its key, as in the window that builds a page.
+                    let mut keys = keys.borrow_mut();
+                    if !keys.iter().any(|(known, _)| *known == id) {
+                        keys.push((id, key));
+                    }
+                }
+                Ok(())
+            })?;
+            let plugin = lua.create_table()?;
+            plugin.set("load", load)?;
+            eitri.set("plugin", plugin)
         })?;
         Ok(Self {
             kernel,
             panels,
             page: None,
+            recorded_keys,
         })
     }
 }
@@ -410,6 +441,38 @@ mod tests {
         assert!(engine.panels.borrow().entries().is_empty());
         assert!(engine.commands.borrow().is_empty());
         assert!(engine.config.borrow().get("agent.font_size").is_none());
+    }
+
+    #[test]
+    fn without_plugins_records_ids_and_keys_and_loads_nothing() {
+        let scratch = eitri_core::plugin::test_support::Scratch::new("companion-plugin-keys");
+        let config = scratch.0.join("config");
+        std::fs::create_dir_all(&config).unwrap();
+        let init = config.join("init.lua");
+        std::fs::write(
+            &init,
+            r#"
+            eitri.plugin.load("notes", { key = "m" })
+            eitri.plugin.load("other", { key = "p" })
+            eitri.plugin.load("unkeyed")
+            eitri.plugin.load("/missing/path", { key = "z" })
+            eitri.plugin.load("notes", { key = "q" })
+        "#,
+        )
+        .unwrap();
+        let engine = LuaEngine::without_plugins(config).unwrap();
+        assert_eq!(engine.run_and_check_init_file(&init), Ok(()));
+        assert_eq!(
+            engine.recorded_plugin_keys(),
+            vec![
+                ("notes".into(), eitri_core::keymap::KeySpec::char('m', false, false)),
+                ("other".into(), eitri_core::keymap::KeySpec::char('p', false, false)),
+            ]
+        );
+        assert!(engine.plugins.borrow().plugins().is_empty());
+        assert!(engine.plugins.borrow().refused().is_none());
+        assert!(engine.panels.borrow().entries().is_empty());
+        assert!(!scratch.0.join("state").exists());
     }
 
     /// A plugin load that would fail under the real call (no such directory) and one naming a real

@@ -276,7 +276,8 @@ impl Shared {
                 }
                 None => crate::log_line!("[mac] prefix: nothing {direction:?} of the {pane:?}"),
             },
-            CompanionVerb::Refuse => {
+            // This host has no page windows.
+            CompanionVerb::Page(_) | CompanionVerb::Refuse => {
                 crate::log_line!("[mac] prefix: {action:?} refused");
                 self.actions.toast(NOT_IN_THIS_WINDOW);
             }

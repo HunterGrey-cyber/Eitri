@@ -1,12 +1,12 @@
 //! What the prefix does in a companion window. The window holds one agent panel and nothing to lay
 //! out, so the prefix keeps what concerns the panel (tab verbs, reload, the key help, the `:` line,
 //! text size, HINT, a literal prefix key, and a move to the neighbouring window) and refuses every
-//! other action with a toast. The tab chords are not layout, and they are how a tmux user drives the
-//! tabs from the keyboard.
+//! other action with a single toast per window. Page keys open pages beside the attached editor.
+//! The tab chords are how a tmux user drives the tabs from the keyboard.
 
 use super::prefix::Waiting;
 use super::{Action, Keymap, TabAction, TextChange};
-use crate::layout::Direction;
+use crate::layout::{Direction, ModuleId, ModuleKeys, ModuleKind};
 
 /// One piece of the strip the armed prefix shows in the top bar, left to right.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -20,10 +20,10 @@ pub enum StripPiece {
 }
 
 /// The toast for an action a companion window does not have.
-pub const REFUSED_TEXT: &str = "not in a companion window";
+pub use crate::wm::feedback::BESIDE_OFF_TEXT;
 
 /// What a companion window does with one prefix action.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum CompanionVerb {
     Tab(TabAction),
     Reload,
@@ -35,7 +35,9 @@ pub enum CompanionVerb {
     Literal,
     /// A move toward the window on that side, done by the window manager.
     Select(Direction),
-    /// Answered with [`REFUSED_TEXT`].
+    /// Open or raise the page beside the attached nvim.
+    Page(ModuleId),
+    /// Answered with [`BESIDE_OFF_TEXT`].
     Refuse,
 }
 
@@ -53,6 +55,7 @@ pub fn classify(action: &Action) -> CompanionVerb {
         Action::Hint => CompanionVerb::Hint,
         Action::SendPrefix | Action::SendKeys(_) => CompanionVerb::Literal,
         Action::Select(dir) => CompanionVerb::Select(*dir),
+        Action::Module(id) if id.kind() == ModuleKind::LuaWebview => CompanionVerb::Page(id.clone()),
         Action::ProjectChoose
         | Action::FloatToggle
         | Action::FocusModeToggle
@@ -126,12 +129,36 @@ pub fn beside_keep(action: &Action) -> bool {
 }
 
 /// What the armed prefix shows in a companion window: the keys that do something here, as the
-/// effective keymap binds them. After a split key or the hide key (the two waits for a module key) it
-/// says why nothing will happen.
+/// effective keymap binds them. With no pages, module waits explain why nothing will happen.
 pub fn strip_pieces(waiting: Waiting, keymap: &Keymap) -> Vec<StripPiece> {
+    strip_pieces_with_pages(waiting, keymap, &ModuleKeys::built_in())
+}
+
+/// The strip with the page keys recorded from init.lua, in registration order.
+pub fn strip_pieces_with_pages(waiting: Waiting, keymap: &Keymap, pages: &ModuleKeys) -> Vec<StripPiece> {
     match waiting {
         Waiting::No | Waiting::Number | Waiting::Workspace { .. } => Vec::new(),
-        Waiting::Module(_) | Waiting::Hide => vec![StripPiece::Heading(REFUSED_TEXT.to_string())],
+        Waiting::Module(_) => {
+            let mut pieces = Vec::new();
+            for (key, id) in pages
+                .entries()
+                .iter()
+                .filter(|(_, id)| id.kind() == ModuleKind::LuaWebview)
+            {
+                if !pieces.is_empty() {
+                    pieces.push(StripPiece::Dot);
+                }
+                pieces.push(StripPiece::Run {
+                    text: format!("{key} {}", id.as_str().trim_start_matches("lua:")),
+                    dimmed: false,
+                });
+            }
+            if pieces.is_empty() {
+                pieces.push(StripPiece::Heading(BESIDE_OFF_TEXT.to_string()));
+            }
+            pieces
+        }
+        Waiting::Hide => vec![StripPiece::Heading(BESIDE_OFF_TEXT.to_string())],
         Waiting::Command => {
             let verbs = [
                 (Action::Tab(TabAction::New), "new tab"),
@@ -165,7 +192,27 @@ pub fn strip_pieces(waiting: Waiting, keymap: &Keymap) -> Vec<StripPiece> {
 mod tests {
     use super::*;
     use crate::keymap::{KeySpec, SwapTarget};
-    use crate::layout::{Axis, ModuleId};
+    use crate::layout::Axis;
+
+    #[test]
+    fn classify_maps_a_page_module_to_page() {
+        let id = ModuleId::lua("notes");
+        assert_eq!(classify(&Action::Module(id.clone())), CompanionVerb::Page(id));
+        assert_eq!(classify(&Action::Module(ModuleId::editor())), CompanionVerb::Refuse);
+    }
+
+    #[test]
+    fn strip_after_a_split_key_lists_page_keys() {
+        let keymap = Keymap::defaults();
+        let pages = ModuleKeys::build(&[(ModuleId::lua("notes"), Some("g".into()))], &keymap).unwrap();
+        assert_eq!(
+            strip_pieces_with_pages(Waiting::Module(Axis::Row), &keymap, &pages),
+            vec![StripPiece::Run {
+                text: "g notes".into(),
+                dimmed: false
+            }]
+        );
+    }
 
     /// One action of every family, so a new variant that is mapped wrongly shows up here as well as
     /// failing to compile in `classify`.
@@ -297,11 +344,11 @@ mod tests {
         assert_eq!(strip_pieces(Waiting::Number, &keymap), vec![]);
         assert_eq!(
             strip_pieces(Waiting::Module(Axis::Row), &keymap),
-            vec![StripPiece::Heading(REFUSED_TEXT.to_string())]
+            vec![StripPiece::Heading(BESIDE_OFF_TEXT.to_string())]
         );
         assert_eq!(
             strip_pieces(Waiting::Hide, &keymap),
-            vec![StripPiece::Heading(REFUSED_TEXT.to_string())],
+            vec![StripPiece::Heading(BESIDE_OFF_TEXT.to_string())],
             "a hide key waits as a split key does, with no layout to hide from"
         );
         assert_eq!(classify(&Action::ModuleHideByKey), CompanionVerb::Refuse);

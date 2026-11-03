@@ -33,6 +33,47 @@ use crate::web_host::WebHost;
 use crate::window_config::{self, WindowConfig};
 use eitri_core::keymap::companion::{self as companion_prefix, CompanionVerb};
 
+/// A window explains unavailable layout keys once; later presses leave a log line.
+#[derive(Default)]
+struct RefusedKeys(Cell<bool>);
+
+impl RefusedKeys {
+    fn say(&self, action: &str, toast: impl FnOnce(&str), log: impl FnOnce(&str)) {
+        if self.0.replace(true) {
+            log(&format!("[companion] prefix: {action} refused"));
+        } else {
+            toast(companion_prefix::BESIDE_OFF_TEXT);
+        }
+    }
+}
+
+/// A page follows only the editor attached when its key was pressed.
+fn page_context(
+    state: &LinkState,
+    project: &std::path::Path,
+    exe: &std::path::Path,
+    control_dir: &std::path::Path,
+) -> Result<crate::page_window::BesideCtx, String> {
+    let LinkState::Attached {
+        addr,
+        in_tmux,
+        nvim_pid,
+        ..
+    } = state
+    else {
+        return Err("no editor attached: run :EitriPanel in nvim".to_owned());
+    };
+    Ok(crate::page_window::BesideCtx {
+        nvim: addr.clone(),
+        project: project.to_owned(),
+        in_tmux: *in_tmux,
+        nvim_pid: Some(*nvim_pid),
+        control_dir: control_dir.to_owned(),
+        exe: exe.to_owned(),
+        exe_args: Vec::new(),
+    })
+}
+
 /// Moves the keys toward the window on one side of the panel; `false` when nothing was claimed.
 type MoveFocus = Rc<dyn Fn(&ModuleId, Direction) -> bool>;
 
@@ -337,17 +378,20 @@ pub(crate) fn build(app: &Application, start: &Start) -> Rc<CompanionWindow> {
     for line in config.keymap.dropped_for_root() {
         eprintln!("[keymap] {line}");
     }
-    // The companion window's prefix runs outside the window controller, so there is no hint panel to time.
-    if config.which_key_delay.is_some() {
-        eprintln!("[keymap] keymap.which_key_delay: the companion window shows no hint panel yet");
-    }
-    // The prefix. A companion window has no Lua panels, so the module keys are the built-in ones.
-    let module_keys = match ModuleKeys::build(&[], &config.keymap) {
-        Ok(keys) => Rc::new(keys),
-        Err(err) => {
-            eprintln!("eitri: {err}");
-            std::process::exit(1);
+    // Page keys name separate windows; no plugin is loaded into this panel.
+    let page_keys: Vec<_> = lua
+        .recorded_plugin_keys()
+        .into_iter()
+        .map(|(id, key)| (ModuleId::lua(&id), Some(key.to_string())))
+        .collect();
+    // As in the full window, a page key that cannot be one is reported and the page has no key; it never keeps
+    // the window from opening.
+    let module_keys = {
+        let (keys, refused) = ModuleKeys::build_settled(&page_keys, &config.keymap);
+        for error in refused {
+            eprintln!("[companion] {error}; the page has no key");
         }
+        Rc::new(keys)
     };
     // Every start-up failure is behind us, and nothing has started a child yet (the sidecar, the
     // window-manager tool, WebKit's processes), so none of them inherits a pipe from nvim.
@@ -573,6 +617,7 @@ pub(crate) fn build(app: &Application, start: &Start) -> Rc<CompanionWindow> {
             agent.set_theme(&panel_tokens);
         });
     }
+    let page_link: Rc<RefCell<Option<Weak<CompanionLink>>>> = Rc::default();
     {
         let keymap = config.keymap.clone();
         let agent = agent.clone();
@@ -583,6 +628,15 @@ pub(crate) fn build(app: &Application, start: &Start) -> Rc<CompanionWindow> {
         let text_size = text_size.clone();
         let hint = hint.clone();
         let move_focus = move_focus.clone();
+        let refused = RefusedKeys::default();
+        let page_link_for_key = page_link.clone();
+        let page_project = start.project_root.clone();
+        let page_exe = std::env::current_exe().expect("the running executable has a path");
+        let page_control_dir = eitri_core::panel_control::control_dir(
+            std::env::var_os("XDG_RUNTIME_DIR").as_deref(),
+            &std::env::temp_dir(),
+        );
+        let strip_modules = module_keys.clone();
         let strip_keymap = config.keymap.clone();
         let strip = strip.clone();
         let strip_frame = strip_frame.clone();
@@ -591,28 +645,28 @@ pub(crate) fn build(app: &Application, start: &Start) -> Rc<CompanionWindow> {
             keymap.clone(),
             module_keys,
             move |command, keycode| {
+                let refuse = |action: String| refused.say(&action, |text| toast.show(text), |line| println!("{line}"));
                 let action = match command {
                     super::prefix::PrefixCommand::Number(digit) => {
-                        println!("[companion] prefix: number {digit} refused");
-                        toast.show(companion_prefix::REFUSED_TEXT);
+                        refuse(format!("number {digit}"));
                         return;
                     }
                     super::prefix::PrefixCommand::Workspace(pick) => {
-                        println!("[companion] prefix: workspace {pick:?} refused");
-                        toast.show(companion_prefix::REFUSED_TEXT);
+                        refuse(format!("workspace {pick:?}"));
                         return;
                     }
                     super::prefix::PrefixCommand::Run(action) => action,
-                    // A module key after a split key: there is nothing to place.
                     super::prefix::PrefixCommand::Place { module, axis, cwd: _ } => {
-                        println!("[companion] prefix: place {module} {axis:?} refused");
-                        toast.show(companion_prefix::REFUSED_TEXT);
-                        return;
+                        if module.kind() == ModuleKind::LuaWebview {
+                            eitri_core::keymap::Action::Module(module)
+                        } else {
+                            refuse(format!("place {module} {axis:?}"));
+                            return;
+                        }
                     }
                     // A module key after the hide key: there is no layout to hide it from.
                     super::prefix::PrefixCommand::Hide { module } => {
-                        println!("[companion] prefix: hide {module} refused");
-                        toast.show(companion_prefix::REFUSED_TEXT);
+                        refuse(format!("hide {module}"));
                         return;
                     }
                 };
@@ -637,14 +691,42 @@ pub(crate) fn build(app: &Application, start: &Start) -> Rc<CompanionWindow> {
                     CompanionVerb::Select(direction) => {
                         move_focus(&ModuleId::agent(), direction);
                     }
-                    CompanionVerb::Refuse => {
-                        println!("[companion] prefix: {action:?} refused");
-                        toast.show(companion_prefix::REFUSED_TEXT);
+                    CompanionVerb::Page(id) => {
+                        let link = page_link_for_key.borrow().as_ref().and_then(Weak::upgrade);
+                        let (state, peer) = link.as_ref().map_or((LinkState::NoEditor, None), |link| {
+                            let (state, _, peer) = link.snapshot();
+                            (state, peer)
+                        });
+                        if let Err(why) = page_context(&state, &page_project, &page_exe, &page_control_dir) {
+                            toast.show(&why);
+                            return;
+                        }
+                        let (project, exe, control_dir) =
+                            (page_project.clone(), page_exe.clone(), page_control_dir.clone());
+                        let carrier = crate::page_window::Carrier {
+                            ctx: Rc::new(move || {
+                                let mut ctx = page_context(&state, &project, &exe, &control_dir)
+                                    .expect("the key captured an attached editor");
+                                ctx.nvim_pid = peer.or(ctx.nvim_pid);
+                                ctx
+                            }),
+                            raise_editor: Rc::new(|_| {}),
+                            raise_self: Rc::new(|| {}),
+                        };
+                        let later_toast = toast.clone();
+                        if let Err(why) = crate::gtk_host::BesidePort::carry_out(
+                            &carrier,
+                            &eitri_core::wm::BesideOp::Page(id.as_str().trim_start_matches("lua:").to_owned()),
+                            Box::new(move |why| later_toast.show(&why)),
+                        ) {
+                            toast.show(&why);
+                        }
                     }
+                    CompanionVerb::Refuse => refuse(format!("{action:?}")),
                 }
             },
             move |waiting| {
-                let pieces = companion_prefix::strip_pieces(waiting, &strip_keymap);
+                let pieces = companion_prefix::strip_pieces_with_pages(waiting, &strip_keymap, &strip_modules);
                 strip.show(&pieces);
                 strip_frame.set_visible(!pieces.is_empty());
             },
@@ -775,6 +857,8 @@ pub(crate) fn build(app: &Application, start: &Start) -> Rc<CompanionWindow> {
             },
         )
     };
+
+    *page_link.borrow_mut() = Some(Rc::downgrade(&link));
 
     {
         let calls: Rc<dyn SlotCalls> = link.clone();
@@ -1064,6 +1148,58 @@ pub(crate) fn build(app: &Application, start: &Start) -> Rc<CompanionWindow> {
 mod tests {
     use super::*;
     use std::path::PathBuf;
+
+    #[test]
+    fn refused_keys_toast_once_then_log() {
+        let refused = RefusedKeys::default();
+        let mut toasts = Vec::new();
+        let mut logs = Vec::new();
+        for action in ["zoom", "hide", "zoom"] {
+            refused.say(
+                action,
+                |text| toasts.push(text.to_owned()),
+                |line| logs.push(line.to_owned()),
+            );
+        }
+        assert_eq!(toasts, [companion_prefix::BESIDE_OFF_TEXT]);
+        assert_eq!(
+            logs,
+            ["[companion] prefix: hide refused", "[companion] prefix: zoom refused"]
+        );
+        let another = RefusedKeys::default();
+        another.say("zoom", |text| toasts.push(text.to_owned()), |_| {});
+        assert_eq!(toasts.len(), 2);
+    }
+
+    #[test]
+    fn a_page_key_with_no_editor_attached_says_so() {
+        for state in [
+            LinkState::NoEditor,
+            LinkState::Connecting {
+                addr: PathBuf::from("/run/nvim.sock"),
+            },
+        ] {
+            let result = page_context(
+                &state,
+                &PathBuf::from("/project"),
+                &PathBuf::from("/eitri"),
+                &PathBuf::from("/run"),
+            );
+            assert_eq!(
+                result.err().as_deref(),
+                Some("no editor attached: run :EitriPanel in nvim")
+            );
+        }
+        let ctx = page_context(
+            &attached(3),
+            &PathBuf::from("/project"),
+            &PathBuf::from("/eitri"),
+            &PathBuf::from("/run"),
+        )
+        .unwrap();
+        assert_eq!(ctx.nvim, PathBuf::from("/run/nvim.sock"));
+        assert_eq!(ctx.project, PathBuf::from("/project"));
+    }
 
     /// A link that records every call it takes, by the channel it was attached on when it took it.
     #[derive(Default)]
