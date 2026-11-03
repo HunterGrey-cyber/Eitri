@@ -8,6 +8,15 @@ use eitri_core::project_chooser::{ChooserView, LineEv};
 use gtk4::prelude::*;
 use gtk4::{gdk, glib};
 
+/// What a row asks for; the list shows sixteen of them at most.
+const ROW_HEIGHT: i32 = 32;
+const MOST_ROWS: i32 = 16;
+/// The widest the name column asks to be: a long name yields to the path, which is what tells two like names apart.
+const NAME_CHARS: i32 = 26;
+/// The panel's distance from the top of the window, and the least it leaves below it.
+const TOP_MARGIN: i32 = 48;
+const BOTTOM_MARGIN: i32 = 16;
+
 pub(crate) enum ChooserReport {
     Line(LineEv),
     Pick(usize),
@@ -26,6 +35,8 @@ pub(crate) struct ProjectChooserView {
     scroll_pending: Rc<Cell<bool>>,
     panel: gtk4::Box,
     scroll: gtk4::ScrolledWindow,
+    /// The names of the rows on show, so their paths start on one column.
+    names: gtk4::SizeGroup,
     /// The frame tick that fits the panel again; it runs only while the chooser is up.
     tick: RefCell<Option<gtk4::TickCallbackId>>,
 }
@@ -55,13 +66,17 @@ impl ProjectChooserView {
         let panel = gtk4::Box::new(gtk4::Orientation::Vertical, 8);
         panel.add_css_class("project-chooser-panel");
         panel.set_halign(gtk4::Align::Center);
-        panel.set_valign(gtk4::Align::Center);
+        panel.set_valign(gtk4::Align::Start);
+        panel.set_margin_top(TOP_MARGIN);
         let title = capped_label();
         title.add_css_class("project-chooser-title");
         panel.append(&title);
         let entry = gtk4::Entry::new();
         entry.add_css_class("project-chooser-line");
         panel.append(&entry);
+        let message = capped_label();
+        message.add_css_class("project-chooser-message");
+        panel.append(&message);
         let list = gtk4::ListBox::new();
         list.add_css_class("project-chooser-list");
         list.set_focusable(false);
@@ -70,12 +85,9 @@ impl ProjectChooserView {
         let scroll = gtk4::ScrolledWindow::new();
         scroll.set_policy(gtk4::PolicyType::Never, gtk4::PolicyType::Automatic);
         scroll.set_propagate_natural_height(true);
-        scroll.set_max_content_height(16 * 36);
+        scroll.set_max_content_height(MOST_ROWS * ROW_HEIGHT);
         scroll.set_child(Some(&list));
         panel.append(&scroll);
-        let message = capped_label();
-        message.add_css_class("project-chooser-message");
-        panel.append(&message);
         let footer = capped_label();
         footer.add_css_class("project-chooser-footer");
         panel.append(&footer);
@@ -154,6 +166,7 @@ impl ProjectChooserView {
             scroll_pending,
             panel,
             scroll,
+            names: gtk4::SizeGroup::new(gtk4::SizeGroupMode::Horizontal),
             tick: RefCell::new(None),
         }
     }
@@ -174,7 +187,12 @@ impl ProjectChooserView {
                 if panel.width_request() != width {
                     panel.set_size_request(width, -1);
                 }
-                let height = (root.height() - 160).clamp(0, 16 * 36);
+                // The panel's whole box: its own height leaves out the padding and the border. One not allocated yet
+                // has none, which only means the first frame offers the most.
+                let outer = panel
+                    .compute_bounds(root)
+                    .map_or(0, |bounds| bounds.height().ceil() as i32);
+                let height = list_room(root.height(), outer - scroll.height());
                 if scroll.max_content_height() != height {
                     scroll.set_max_content_height(height);
                 }
@@ -188,12 +206,12 @@ impl ProjectChooserView {
                                 let adjustment = scroll.vadjustment();
                                 let top = f64::from(bounds.y());
                                 let bottom = top + f64::from(bounds.height());
-                                let value = adjustment.value();
-                                if top < value {
-                                    adjustment.set_value(top);
-                                } else if bottom > value + adjustment.page_size() {
-                                    adjustment.set_value(bottom - adjustment.page_size());
-                                }
+                                adjustment.set_value(scrolled_to_show(
+                                    top,
+                                    bottom,
+                                    adjustment.value(),
+                                    adjustment.page_size(),
+                                ));
                                 scroll_pending.set(false);
                             }
                         }
@@ -242,9 +260,11 @@ impl ProjectChooserView {
                 item.add_css_class("dimmed");
             }
             let contents = gtk4::Box::new(gtk4::Orientation::Horizontal, 12);
-            contents.set_height_request(36);
+            contents.set_height_request(ROW_HEIGHT);
             let name = label();
             name.add_css_class("project-chooser-name");
+            name.set_max_width_chars(NAME_CHARS);
+            self.names.add_widget(&name);
             set_text(&name, &row.name);
             let shown = label();
             shown.add_css_class("project-chooser-path");
@@ -253,6 +273,7 @@ impl ProjectChooserView {
             set_text(&shown, &row.shown);
             let right = label();
             right.add_css_class("project-chooser-right");
+            right.set_xalign(1.0);
             set_text(&right, &row.right);
             contents.append(&name);
             contents.append(&shown);
@@ -280,6 +301,23 @@ impl ProjectChooserView {
     }
 }
 
+/// How tall the list may be in a window `height` tall, when the rest of the panel takes `chrome`.
+fn list_room(height: i32, chrome: i32) -> i32 {
+    (height - TOP_MARGIN - BOTTOM_MARGIN - chrome).clamp(0, MOST_ROWS * ROW_HEIGHT)
+}
+
+/// Where a list at `value` with `page` showing goes to show the row from `top` to `bottom`. A row taller than the page
+/// shows its top.
+fn scrolled_to_show(top: f64, bottom: f64, value: f64, page: f64) -> f64 {
+    if top < value || bottom - top > page {
+        top
+    } else if bottom > value + page {
+        bottom - page
+    } else {
+        value
+    }
+}
+
 fn label() -> gtk4::Label {
     let label = gtk4::Label::new(None);
     label.set_xalign(0.0);
@@ -301,6 +339,7 @@ fn set_text(label: &gtk4::Label, text: &str) {
 
 #[cfg(test)]
 mod tests {
+    use super::{list_room, scrolled_to_show, BOTTOM_MARGIN, ROW_HEIGHT, TOP_MARGIN};
     use eitri_core::source_scan as scan;
 
     fn code() -> String {
@@ -309,6 +348,45 @@ mod tests {
         let (_, constructor) = scan::function_in(&sources, "new");
         let (_, show) = scan::function_in(&sources, "show");
         format!("{constructor}{show}").split_whitespace().collect()
+    }
+
+    #[test]
+    fn the_list_takes_what_the_window_leaves_up_to_sixteen_rows() {
+        assert_eq!(list_room(900, 130), 16 * ROW_HEIGHT);
+        let short = 400;
+        assert_eq!(list_room(short, 130), short - TOP_MARGIN - BOTTOM_MARGIN - 130);
+        assert_eq!(
+            list_room(100, 130),
+            0,
+            "a window too short for the list has no room, never less"
+        );
+    }
+
+    #[test]
+    fn a_row_is_brought_into_view_by_the_least_move() {
+        assert_eq!(scrolled_to_show(40.0, 72.0, 32.0, 80.0), 32.0, "already in view");
+        assert_eq!(scrolled_to_show(0.0, 32.0, 32.0, 80.0), 0.0, "above the page");
+        assert_eq!(scrolled_to_show(64.0, 96.0, 0.0, 80.0), 16.0, "below the page");
+    }
+
+    /// The list is at its shortest on the frame before the panel has been fitted, so a page shorter than a row is only
+    /// a moment: moving by the row's bottom would leave the first row cut for good.
+    #[test]
+    fn a_page_shorter_than_the_row_shows_its_top() {
+        assert_eq!(scrolled_to_show(0.0, 32.0, 0.0, 28.0), 0.0);
+        assert_eq!(scrolled_to_show(32.0, 64.0, 0.0, 28.0), 32.0);
+    }
+
+    /// A word about the typed text stays beside the text, however many rows follow it, and the panel keeps its place as
+    /// the rows come and go.
+    #[test]
+    fn the_message_is_under_the_line_and_the_panel_stands_near_the_top() {
+        let code = code();
+        let at = |what: &str| code.find(what).unwrap_or_else(|| panic!("no {what}"));
+        assert!(at("panel.append(&entry)") < at("panel.append(&message)"));
+        assert!(at("panel.append(&message)") < at("panel.append(&scroll)"));
+        assert!(code.contains("panel.set_valign(gtk4::Align::Start)"));
+        assert!(code.contains("panel.set_margin_top(TOP_MARGIN)"));
     }
 
     #[test]

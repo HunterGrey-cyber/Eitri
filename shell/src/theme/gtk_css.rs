@@ -14,10 +14,12 @@ pub(crate) fn gtk_css(tokens: &ThemeTokens) -> String {
     // panel, the toast, the prompts, the first-start screen). It stands on `surface`, from the scheme's own
     // `NormalFloat`/`Normal`, never on the `chrome` token: that is `StatusLine`, which a plugin may repaint while
     // nvim runs, and the bar moves only when the colour scheme does. Every text colour drawn on it comes from a
-    // token guarded against `surface`; the bg-guarded `muted` and the unguarded `mode_browse` are never used here.
+    // token guarded against `surface`; the unguarded `mode_browse` is never used here, and `muted`, guarded against
+    // `bg` and `cursorline`, only on those two fills.
     let bar = tokens.surface.hex();
     let bar_fg = tokens.surface_fg.hex();
     let bar_muted = tokens.surface_muted.hex();
+    let muted = tokens.muted.hex();
     let border = tokens.border.hex();
     let hover = tokens.cursorline.hex();
     let error = tokens.error.hex();
@@ -387,6 +389,145 @@ window.editor-hole, window.editor-hole .shell-root, window.editor-hole .content-
     box-shadow: none;
 }}
 
+/* The project chooser (`gtk_host::project_chooser`): one panel in the top bar's own guarded pair, opaque so it reads the
+   same over any module and the editor's subsurface never shows through. The line is the place typing goes, so it stands
+   on the content's own pair, as the rename entry does, and shows no focus ring: the caret says where the keys are. A
+   row's name is the text to find, its path and its right-hand word (`open`, `gone`, an age) are quiet; `gone` also takes
+   the name to the muted token, never opacity, and stays a word. Title, message, footer and row text share one left edge,
+   the line's own text: its 8px of padding and 1px of border. */
+.project-chooser-panel {{
+    background-color: {bar};
+    color: {bar_fg};
+    border: 1px solid {border};
+    border-radius: 8px;
+    padding: 12px;
+    font-size: 13px;
+}}
+
+.project-chooser-title {{
+    color: {bar_fg};
+    font-weight: 700;
+    padding: 0 9px;
+}}
+
+.project-chooser-message {{
+    color: {bar_fg};
+    font-size: 12px;
+    padding: 0 9px;
+}}
+
+.project-chooser-footer {{
+    color: {bar_muted};
+    font-size: 12px;
+    padding: 0 9px;
+}}
+
+.project-chooser-line {{
+    background-color: {bg};
+    background-image: none;
+    color: {fg};
+    caret-color: {fg};
+    border: 1px solid {border};
+    border-radius: 4px;
+    box-shadow: none;
+    outline-width: 0;
+    min-height: 32px;
+    padding: 0 8px;
+}}
+
+.project-chooser-line placeholder {{
+    color: {muted};
+    opacity: 1;
+}}
+
+.project-chooser-line selection {{
+    background-color: {fg};
+    color: {bg};
+}}
+
+.project-chooser-list {{
+    background-color: transparent;
+    background-image: none;
+}}
+
+/* A scrolled list is never shorter than its scrollbar, so the slider's own minimum stays under one row: a list of one
+   row would otherwise end in an empty band. */
+.project-chooser-panel scrollbar {{
+    background-color: transparent;
+    background-image: none;
+    border: none;
+}}
+
+.project-chooser-panel scrollbar slider {{
+    background-color: {border};
+    border: none;
+    min-height: 24px;
+}}
+
+.project-chooser-row {{
+    background-color: transparent;
+    background-image: none;
+    border-radius: 4px;
+    outline-width: 0;
+    min-height: 0;
+    padding: 0 9px;
+}}
+
+.project-chooser-name {{
+    color: {bar_fg};
+    font-weight: 600;
+}}
+
+.project-chooser-path {{
+    color: {bar_muted};
+    font-size: 12px;
+}}
+
+.project-chooser-right {{
+    color: {bar_muted};
+    font-size: 12px;
+}}
+
+.project-chooser-row.dimmed .project-chooser-name {{
+    color: {bar_muted};
+    font-weight: 400;
+}}
+
+/* `cursorline` is guarded against `fg` and `muted`, not against the bar's pair, so the row under the pointer changes its
+   text with its fill. */
+.project-chooser-row:hover {{
+    background-color: {hover};
+}}
+
+.project-chooser-row:hover .project-chooser-name {{
+    color: {fg};
+}}
+
+.project-chooser-row:hover .project-chooser-path {{
+    color: {muted};
+}}
+
+.project-chooser-row:hover .project-chooser-right {{
+    color: {muted};
+}}
+
+/* The selected row is the window's cursor, the guarded pair reversed. Last, so it stays the cursor under the pointer. */
+.project-chooser-row:selected {{
+    background-color: {bar_fg};
+}}
+
+.project-chooser-row:selected .project-chooser-name {{
+    color: {bar};
+}}
+
+.project-chooser-row:selected .project-chooser-path {{
+    color: {bar};
+}}
+
+.project-chooser-row:selected .project-chooser-right {{
+    color: {bar};
+}}
+
 /* The top bar's keyboard cursor. `Ctrl+k` brings focus here, and the focused item is drawn the
    way every other cursor in this window is: a solid block with the glyph knocked out. The editor's
    block is Neovide's own, the panel's is its current row's sign cell. That is the whole focus
@@ -675,6 +816,135 @@ mod tests {
         }
     }
 
+    /// Every text of the project chooser is paired with the fill it stands on, so it reads the same over any module and
+    /// in any scheme. The selected row is the guarded pair reversed, the window's solid cursor; the row under the pointer
+    /// and the line take the pairs guarded against their own fills.
+    #[test]
+    fn the_project_chooser_reads_on_every_fill_it_has() {
+        for t in [dawn(), lunaperche(), ThemeTokens::fallback(), zaibatsu()] {
+            let css = gtk_css(&t);
+            for (selector, colour, fill) in [
+                (".project-chooser-panel", t.surface_fg, t.surface),
+                (".project-chooser-title", t.surface_fg, t.surface),
+                (".project-chooser-message", t.surface_fg, t.surface),
+                (".project-chooser-footer", t.surface_muted, t.surface),
+                (".project-chooser-name", t.surface_fg, t.surface),
+                (".project-chooser-path", t.surface_muted, t.surface),
+                (".project-chooser-right", t.surface_muted, t.surface),
+                (
+                    ".project-chooser-row.dimmed .project-chooser-name",
+                    t.surface_muted,
+                    t.surface,
+                ),
+                (".project-chooser-line", t.fg, t.bg),
+                (".project-chooser-line placeholder", t.muted, t.bg),
+                (".project-chooser-line selection", t.bg, t.fg),
+                (".project-chooser-row:hover .project-chooser-name", t.fg, t.cursorline),
+                (
+                    ".project-chooser-row:hover .project-chooser-path",
+                    t.muted,
+                    t.cursorline,
+                ),
+                (
+                    ".project-chooser-row:hover .project-chooser-right",
+                    t.muted,
+                    t.cursorline,
+                ),
+                (
+                    ".project-chooser-row:selected .project-chooser-name",
+                    t.surface,
+                    t.surface_fg,
+                ),
+                (
+                    ".project-chooser-row:selected .project-chooser-path",
+                    t.surface,
+                    t.surface_fg,
+                ),
+                (
+                    ".project-chooser-row:selected .project-chooser-right",
+                    t.surface,
+                    t.surface_fg,
+                ),
+            ] {
+                let body = rule(&css, selector);
+                assert!(
+                    body.contains(&format!("\n    color: {};", colour.hex())),
+                    "{selector}: {body}"
+                );
+                assert!(colour.contrast(fill) >= 4.5, "{selector} is unreadable on its fill");
+            }
+            for (selector, fill) in [
+                (".project-chooser-panel", t.surface),
+                (".project-chooser-line", t.bg),
+                (".project-chooser-row:hover", t.cursorline),
+                (".project-chooser-row:selected", t.surface_fg),
+            ] {
+                let body = rule(&css, selector);
+                assert!(
+                    body.contains(&format!("\n    background-color: {};", fill.hex())),
+                    "{selector}: {body}"
+                );
+            }
+        }
+    }
+
+    /// Hover and the selection are as specific as the row's own text, so the later rule wins: the selected row stays the
+    /// cursor under the pointer and on a project that is gone.
+    #[test]
+    fn the_selected_row_wins_over_hover_and_a_gone_row() {
+        let css = gtk_css(&ThemeTokens::fallback());
+        let at = |selector: &str| {
+            css.find(&format!("\n{selector} {{"))
+                .unwrap_or_else(|| panic!("no rule {selector}"))
+        };
+        let name = at(".project-chooser-row:selected .project-chooser-name");
+        assert!(at(".project-chooser-row:hover .project-chooser-name") < name);
+        assert!(at(".project-chooser-row.dimmed .project-chooser-name") < name);
+        assert!(at(".project-chooser-row:hover") < at(".project-chooser-row:selected"));
+    }
+
+    /// The chooser's fills and text all come from the scheme: a colour left to GTK's default theme would be a pale entry
+    /// or a blue row in a window that has neither.
+    #[test]
+    fn the_project_chooser_has_no_colour_of_its_own() {
+        let t = dawn();
+        let css = gtk_css(&t);
+        let tokens = [
+            t.bg,
+            t.fg,
+            t.surface,
+            t.surface_fg,
+            t.surface_muted,
+            t.muted,
+            t.border,
+            t.cursorline,
+        ]
+        .map(|c| c.hex());
+        let mut seen = 0;
+        for block in css.split("\n.project-chooser").skip(1) {
+            let body = &block[..block.find('}').unwrap()];
+            for word in body.split(|c: char| c.is_whitespace() || c == ';') {
+                assert!(
+                    !word.starts_with('#') || tokens.iter().any(|token| token == word),
+                    "{word}: {body}"
+                );
+            }
+            assert!(!body.contains("rgb") && !body.contains("alpha("), "{body}");
+            seen += 1;
+        }
+        assert!(seen >= 10, "the chooser's rules were not found");
+        assert!(rule(&css, ".project-chooser-list").contains("\n    background-color: transparent;"));
+        assert!(rule(&css, ".project-chooser-row").contains("\n    background-color: transparent;"));
+    }
+
+    /// GTK's scrollbar asks for more than one row by default, and a scrolled list is never shorter than its scrollbar.
+    #[test]
+    fn a_list_of_one_row_is_one_row_tall() {
+        let css = gtk_css(&ThemeTokens::fallback());
+        let slider = rule(&css, ".project-chooser-panel scrollbar slider");
+        assert!(slider.contains("\n    min-height: 24px;"), "{slider}");
+    }
+
     /// A plugin that repaints `StatusLine` while nvim runs, or a scheme that gives it a loud colour, moves the status
     /// band and nothing of the window's own chrome: every rule of the stylesheet is the same either way.
     #[test]
@@ -861,6 +1131,40 @@ mod tests {
                 "the armed rule must come after the base rule"
             );
         }
+    }
+
+    /// A scheme whose floating fill is far from `Normal`'s, measured 1.0:1 for `fg` on `surface`: the line stands on `bg`
+    /// and everything else on `surface`, and neither pair may stand in for the other.
+    fn zaibatsu() -> ThemeTokens {
+        ThemeTokens::derive(&NvimThemePayload {
+            v: PAYLOAD_VERSION,
+            groups: [
+                (
+                    "Normal".to_string(),
+                    HlAttrs {
+                        fg: Some(0xffffff),
+                        bg: Some(0x0e0024),
+                        reverse: false,
+                    },
+                ),
+                (
+                    "NormalFloat".to_string(),
+                    HlAttrs {
+                        fg: Some(0x0e0024),
+                        bg: Some(0xffffff),
+                        reverse: false,
+                    },
+                ),
+            ]
+            .into(),
+            options: NvimOptions {
+                background: "dark".into(),
+                guifont: String::new(),
+                colors_name: "zaibatsu".into(),
+                cmdheight: None,
+                start_scale: None,
+            },
+        })
     }
 
     fn lunaperche() -> ThemeTokens {
