@@ -291,6 +291,9 @@ pub struct Window {
     pub(super) monitor_memory: crate::window_link::edge::MonitorMemory,
     pub(super) placement_role: PlacementRole,
     pub(super) placement_focus_pending: bool,
+    /// The keys this window holds until they are its own, when it started to leave them elsewhere
+    /// (`start_keys`).
+    pub(super) start_keys: super::start_keys::StartKeys,
     /// Window 2 is started again after this window's start: the idle armed for it, until it fires.
     pub(super) restore_second: bool,
     pub(super) restore_idle: Option<TimerToken>,
@@ -378,6 +381,7 @@ impl Window {
             monitor_memory: crate::window_link::edge::MonitorMemory::new(None),
             placement_role: PlacementRole::Main,
             placement_focus_pending: false,
+            start_keys: super::start_keys::StartKeys::Free,
             restore_second: false,
             restore_idle: None,
             start_windows_idle: None,
@@ -616,6 +620,7 @@ impl Window {
             placement.role,
             PlacementRole::RestoredSecond { .. } | PlacementRole::NewModule
         );
+        self.start_keys = super::start_keys::for_role(placement.role);
     }
 
     /// Asks the window's remembered output whether it is to move there now: only once it is on an output (so it is
@@ -639,6 +644,7 @@ impl Window {
                 monitor,
                 role: self.placement_role,
             });
+            super::start_keys::placement_asked(self);
         }
         // Only the first mapped placement decision may focus; an output appearing later must not take the keys.
         self.placement_role = PlacementRole::Main;

@@ -1687,6 +1687,7 @@ fn focus_intent(
     token: Option<String>,
     batch: &mut Batch,
 ) {
+    super::start_keys::chosen(w, "the other window gave it the keys");
     batch.push_layout(HostOp::Present {
         win,
         activation: token.map(ActivationToken),

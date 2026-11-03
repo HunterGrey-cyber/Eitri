@@ -25,6 +25,7 @@ pub mod prefix_strip;
 pub mod quit;
 pub mod reopen;
 pub mod start;
+pub mod start_keys;
 pub mod terminal_at;
 pub mod text_size;
 pub mod titles;

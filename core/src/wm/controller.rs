@@ -1189,13 +1189,18 @@ impl Controller {
                     super::keys::ctrl_released(window);
                 }
             }
-            HostEvent::Active { win, active: false }
-            | HostEvent::Pointer {
+            HostEvent::Active { win, active: false } => {
+                if let Some(window) = self.windows.get_mut(win) {
+                    super::keys::cancel(window, batch);
+                }
+            }
+            HostEvent::Pointer {
                 win,
                 ev: PointerEv::Press { .. },
                 ..
             } => {
                 if let Some(window) = self.windows.get_mut(win) {
+                    super::start_keys::chosen(window, "a click in it");
                     super::keys::cancel(window, batch);
                 }
             }
@@ -1318,6 +1323,13 @@ impl Controller {
             }
             Some(_) => return,
         }
+        if self
+            .windows
+            .values_mut()
+            .any(|window| super::start_keys::timer_fired(window, token))
+        {
+            return;
+        }
         if let Some((win, window)) = self
             .windows
             .iter_mut()
@@ -1432,6 +1444,7 @@ impl Controller {
                     super::reopen::focus_out(w, win, batch);
                     verbs::project::dismiss(w, win, batch);
                 }
+                super::start_keys::on_active(w, *active);
                 super::focus::on_active(w, win, *active, batch);
             }
             HostEvent::Chat(ChatEvent::KeymapClosed {
@@ -2154,6 +2167,9 @@ impl Decide for Controller {
     /// every key, builds nothing on its way.
     fn key(&mut self, win: WinId, stage: &KeyStage, press: &KeyPress) -> (Verdict, Batch) {
         let mut batch = Batch::default();
+        if *stage == KeyStage::Window && self.windows.get_mut(&win).is_some_and(super::start_keys::holds) {
+            return (Verdict::Consumed, batch);
+        }
         if self.awaiting_layout(win, ("key", stage, press)) {
             return (Verdict::PassThrough, batch);
         }
