@@ -239,6 +239,16 @@ struct Browse {
     classified: Option<OsString>,
 }
 
+impl Browse {
+    /// The folder shown is one that does not answer (stuck, too many stuck) or was never read: `Enter` and `l` on any of
+    /// its rows answer with a message and act on nothing. A read still under way is not refused, its `Enter`s wait.
+    fn refuses_enter(&self) -> bool {
+        let stuck = self.shown == Shown::Stuck
+            || (self.shown == Shown::Done && matches!(self.listing, Some(Listing::Stuck | Listing::TooManyStuck)));
+        stuck || (self.serial.is_none() && !readable(self.listing.as_ref()))
+    }
+}
+
 #[derive(Clone)]
 struct FolderShown {
     dir: PathBuf,
@@ -850,27 +860,21 @@ impl Chooser {
         let Place::Folder(b) = &mut self.place else {
             return vec![];
         };
-        if b.shown == Shown::Stuck
-            || (b.shown == Shown::Done && matches!(b.listing, Some(Listing::Stuck | Listing::TooManyStuck)))
-        {
-            b.held_enters = 0;
-            let shown = Row::new(b.dir.clone(), self.home.as_deref(), String::new(), Fact::Present).shown;
-            self.message = Some(text::cannot_read(self.lang, &shown));
-            return vec![];
-        }
-        if b.serial.is_some() {
-            b.held_enters = b.held_enters.saturating_add(1).min(2);
-            return vec![];
-        }
-        if !readable(b.listing.as_ref()) {
+        if b.refuses_enter() {
             let shown = Row::new(b.dir.clone(), self.home.as_deref(), String::new(), Fact::Present).shown;
             self.message = Some(match b.listing {
+                _ if b.shown == Shown::Stuck => text::cannot_read(self.lang, &shown),
+                Some(Listing::Stuck | Listing::TooManyStuck) => text::cannot_read(self.lang, &shown),
                 Some(Listing::Missing) => text::missing(self.lang, &display_name(&self.line)),
                 Some(Listing::Loop) => beside(text::text(self.lang).looped, shown),
                 Some(Listing::NotAFolder) => text::text(self.lang).not_folder.into(),
                 _ => text::cannot_read(self.lang, &display_name(&self.line)),
             });
             b.held_enters = 0;
+            return vec![];
+        }
+        if b.serial.is_some() {
+            b.held_enters = b.held_enters.saturating_add(1).min(2);
             return vec![];
         }
         match self.selected.and_then(|i| self.items.get(i)).cloned() {
@@ -1367,6 +1371,7 @@ impl Chooser {
         let footer = if let Place::Folder(b) = &self.place {
             let item = self.selected.and_then(|i| self.items.get(i));
             let (name, enter) = match item {
+                _ if b.refuses_enter() => (String::new(), text::Enter::Inert),
                 Some(Item::Entry(e)) if is_file(e) => (display_name(&e.raw.to_string_lossy()), text::Enter::OpenFile),
                 Some(Item::Entry(e))
                     if matches!(
@@ -1380,6 +1385,7 @@ impl Chooser {
                     (display_name(&e.raw.to_string_lossy()), text::Enter::Inert)
                 }
                 Some(Item::Entry(e)) => (display_name(&e.raw.to_string_lossy()), text::Enter::Into),
+                None => (String::new(), text::Enter::Inert),
                 _ => (
                     display_name(&b.dir.file_name().unwrap_or(b.dir.as_os_str()).to_string_lossy()),
                     text::Enter::Open,

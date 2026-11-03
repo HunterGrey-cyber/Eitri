@@ -2895,3 +2895,107 @@ fn a_classification_keeps_the_whole_listing_and_its_marks() {
         ["odd/", "odds/", "other/"]
     );
 }
+/// A folder whose answer is `reply` (`None`: still being read, or stuck once `stuck` is set), in the language asked
+/// for: typed (`in_line`), or walked into with `l` from a folder that read fine, so the browse state shows it.
+fn folder_in(lang: Lang, reply: Option<Listing>, stuck: bool, in_line: bool) -> Chooser {
+    let mut c = Chooser::new(Mode::Window { root: "/here".into() }, Some("/home/me".into()), lang, 7);
+    let effects = if in_line {
+        line(&mut c, "/probe/")
+    } else {
+        browse(&mut c, "~/", &["src"]);
+        esc(&mut c);
+        c.event(Ev::Line(LineEv::Step(1)));
+        key(&mut c, 'l')
+    };
+    match reply {
+        Some(reply) => {
+            deliver(&mut c, &effects, reply);
+        }
+        None if stuck => {
+            let (serial, _) = read_request(&effects);
+            c.event(Ev::Stuck { serial });
+        }
+        None => {}
+    }
+    assert!(c.view().browsing && c.view().in_line == in_line);
+    c
+}
+fn offers_enter(footer: &str) -> bool {
+    footer.contains("Enter")
+}
+#[test]
+fn the_footer_offers_enter_exactly_when_enter_acts() {
+    let states: [(&str, Option<Listing>, bool); 9] = [
+        ("read", Some(listing(&["src"])), false),
+        ("empty", Some(listing(&[])), false),
+        ("denied", Some(Listing::Denied { exact: None }), false),
+        ("missing", Some(Listing::Missing), false),
+        ("not a folder", Some(Listing::NotAFolder), false),
+        ("loop", Some(Listing::Loop), false),
+        ("stuck listing", Some(Listing::Stuck), false),
+        ("too many stuck", Some(Listing::TooManyStuck), false),
+        ("stuck while reading", None, true),
+    ];
+    for lang in [Lang::En, Lang::ZhCn] {
+        for (name, reply, stuck) in &states {
+            for in_line in [true, false] {
+                let mut c = folder_in(lang, reply.clone(), *stuck, in_line);
+                let footer = c.view().footer;
+                let acts = !enter(&mut c).is_empty();
+                assert_eq!(
+                    offers_enter(&footer),
+                    acts,
+                    "{name} {lang:?} in_line={in_line}: {footer}"
+                );
+                if !acts {
+                    // `l` goes where `Enter` goes, so it is not offered either.
+                    assert!(
+                        !footer.contains("l in") && !footer.contains("l 进入"),
+                        "{name}: {footer}"
+                    );
+                }
+            }
+        }
+    }
+}
+#[test]
+fn a_missing_folder_footer_names_no_enter_in_both_languages_and_states() {
+    for (lang, up, back) in [
+        (Lang::En, "h up ·", "Tab complete"),
+        (Lang::ZhCn, "h 上一级 ·", "Tab 补全"),
+    ] {
+        let browse = folder_in(lang, Some(Listing::Missing), false, false).view().footer;
+        assert!(browse.starts_with(up), "{browse}");
+        assert!(
+            !offers_enter(&browse) && !browse.contains("l in") && !browse.contains("l 进入"),
+            "{browse}"
+        );
+        let typing = folder_in(lang, Some(Listing::Missing), false, true).view().footer;
+        assert!(typing.starts_with(back), "{typing}");
+        assert!(!offers_enter(&typing), "{typing}");
+    }
+}
+#[test]
+fn a_read_in_progress_still_offers_the_enter_it_holds() {
+    for lang in [Lang::En, Lang::ZhCn] {
+        let mut c = folder_in(lang, None, false, true);
+        assert!(offers_enter(&c.view().footer));
+        assert!(enter(&mut c).is_empty());
+    }
+}
+#[test]
+fn a_filter_that_matches_nothing_offers_no_enter() {
+    for lang in [Lang::En, Lang::ZhCn] {
+        for in_line in [true, false] {
+            let mut c = Chooser::new(Mode::Window { root: "/here".into() }, Some("/home/me".into()), lang, 7);
+            let effects = line(&mut c, "/probe/zzz");
+            deliver(&mut c, &effects, listing(&["src"]));
+            if !in_line {
+                esc(&mut c);
+            }
+            let footer = c.view().footer;
+            let acts = !enter(&mut c).is_empty();
+            assert_eq!(offers_enter(&footer), acts, "{lang:?} in_line={in_line}: {footer}");
+        }
+    }
+}
