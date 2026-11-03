@@ -14,6 +14,7 @@ use crate::onboarding::{
 pub mod listing;
 pub use listing::*;
 pub mod path;
+pub mod read;
 
 #[cfg(test)]
 mod tests;

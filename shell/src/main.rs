@@ -42,6 +42,7 @@ mod plugin_panels;
 mod prefix_strip;
 mod process_memory;
 mod project_host;
+mod project_reader;
 mod project_stamp;
 mod project_start;
 mod root_conflicts;

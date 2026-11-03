@@ -13,8 +13,8 @@ use std::ffi::OsString;
 use std::io;
 use std::path::{Path, PathBuf};
 use std::rc::{Rc, Weak};
-use std::sync::mpsc;
-use std::time::{Duration, Instant};
+use std::sync::{Arc, OnceLock};
+use std::time::Duration;
 
 use eitri_core::lua::config::{parse_desktop_start, DesktopStart, DESKTOP_START_KEY};
 use eitri_core::lua::kernel::{refuse_panels, Kernel};
@@ -23,11 +23,13 @@ use eitri_core::project_chooser::{start_failed_line, Chooser, Effect, Ev, Fact, 
 use eitri_core::recent_projects::{self, Sources};
 use eitri_core::theme::start::{StartReport, StartTheme};
 use eitri_core::theme::store::Loaded;
+use futures_channel::mpsc::{unbounded, UnboundedSender};
 use gtk4::glib;
 use gtk4::prelude::*;
 
 use crate::gtk_host::project_chooser::{ChooserReport, ProjectChooserView};
 use crate::project_host::{ProjectWorkers, WorkerAnswer};
+use crate::project_reader::ReadJob;
 use crate::project_start::{self, How};
 
 pub(crate) const SUBCOMMAND: &str = "choose-project";
@@ -36,7 +38,6 @@ pub(crate) const SUBCOMMAND: &str = "choose-project";
 const USAGE: u8 = 64;
 /// How long the window waits for a new window that never takes the keys: a compositor may give it no focus at all.
 const HAND_OVER_WITHIN: Duration = Duration::from_secs(10);
-const POLL_EVERY: Duration = Duration::from_millis(10);
 const WIDTH: i32 = 720;
 const HEIGHT: i32 = 520;
 /// The launcher's words for a directory that cannot be resolved.
@@ -260,6 +261,10 @@ fn worker_event(answer: WorkerAnswer) -> Option<Ev> {
         WorkerAnswer::Rows { serial, rows } => Some(Ev::Rows { serial, rows }),
         WorkerAnswer::Path { serial, answer } => Some(Ev::PathAnswer { serial, answer }),
         WorkerAnswer::Listing { serial, dir, listing } => Some(Ev::Listing { serial, dir, listing }),
+        WorkerAnswer::Later { serial, git, links } => Some(Ev::Later { serial, git, links }),
+        WorkerAnswer::Slow { serial } => Some(Ev::Slow { serial }),
+        WorkerAnswer::Stuck { serial } => Some(Ev::Stuck { serial }),
+        WorkerAnswer::Freed { mount } => Some(Ev::Freed { mount }),
         WorkerAnswer::Folder(path) => Some(Ev::Folder(path)),
         WorkerAnswer::Started { .. } => None,
     }
@@ -273,12 +278,16 @@ fn activation_token(window: &gtk4::ApplicationWindow) -> Option<String> {
         .filter(|token| !token.is_empty())
 }
 
-/// Starts the child off the GTK thread, since the start stats and blocks on the spawn, and sends its exit: the code, or
-/// `None` when it died by a signal or never started, and on a failure whether the folder is gone, which is asked here
-/// because it stats. A reaper that went away with no message says nothing about the child, so nothing is sent and the
-/// other ends decide.
-fn start_child(flags: Vec<OsString>, target: PathBuf, token: Option<String>, exit: mpsc::Sender<Exit>) {
-    let failed = exit.clone();
+/// How a child went, written before the window is woken to hear it: whichever end the window hears first then reads a
+/// failure already known.
+type Exited = Arc<OnceLock<Exit>>;
+
+/// Starts the child off the GTK thread, since the start stats and blocks on the spawn, and writes its exit: the code,
+/// or `None` when it died by a signal or never started, and on a failure whether the folder is gone, which is asked here
+/// because it stats. A reaper that went away with no message says nothing about the child, so nothing is written and
+/// the other ends decide.
+fn start_child(flags: Vec<OsString>, target: PathBuf, token: Option<String>, exit: Exited, wake: UnboundedSender<()>) {
+    let (failed, woken) = (exit.clone(), wake.clone());
     let spawned = std::thread::Builder::new().name("project-open".into()).spawn(move || {
         let code = match project_start::start(&exe_to_start(), &flags, How::Raise(target.clone()), token.as_deref()) {
             Ok(started) => match started.ended.recv() {
@@ -288,22 +297,48 @@ fn start_child(flags: Vec<OsString>, target: PathBuf, token: Option<String>, exi
             Err(_) => None,
         };
         let gone = code != Some(0) && project_start::not_there(&target);
-        let _ = exit.send(Exit { code, gone });
+        let _ = exit.set(Exit { code, gone });
+        let _ = wake.unbounded_send(());
     });
     if spawned.is_err() {
-        let _ = failed.send(Exit {
+        let _ = failed.set(Exit {
             code: None,
             gone: false,
         });
+        let _ = woken.unbounded_send(());
     }
 }
 
-/// A start under way.
+/// A start under way, and what has been heard of it so far.
 struct Watch {
+    /// Which start: a fact about an earlier one is not this one's.
+    id: u64,
     target: PathBuf,
-    exit: mpsc::Receiver<Exit>,
+    exit: Exited,
     lost_activation: Cell<bool>,
-    deadline: Instant,
+    past_deadline: Cell<bool>,
+}
+
+impl Watch {
+    fn new(id: u64, target: PathBuf) -> Watch {
+        Watch {
+            id,
+            target,
+            exit: Exited::default(),
+            lost_activation: Cell::new(false),
+            past_deadline: Cell::new(false),
+        }
+    }
+
+    /// The end, from all that is known now: an exit the reaper wrote counts even if the window has not been woken
+    /// for it yet.
+    fn end(&self) -> Option<Ends> {
+        ends(
+            self.exit.get().copied(),
+            self.lost_activation.get(),
+            self.past_deadline.get(),
+        )
+    }
 }
 
 /// The window, with the chooser as all it holds, and the small carrier of the chooser's effects.
@@ -315,6 +350,7 @@ struct LaunchWindow {
     chooser: RefCell<Chooser>,
     flags: Vec<OsString>,
     watch: RefCell<Option<Watch>>,
+    starts: Cell<u64>,
 }
 
 impl LaunchWindow {
@@ -369,6 +405,7 @@ impl LaunchWindow {
                 chooser: RefCell::new(chooser),
                 flags,
                 watch: RefCell::new(None),
+                starts: Cell::new(0),
             }
         });
         window.set_child(Some(this.view.widget()));
@@ -384,8 +421,9 @@ impl LaunchWindow {
                 return;
             }
             if let Some(this) = me.upgrade() {
-                if let Some(watch) = this.watch.borrow().as_ref() {
-                    watch.lost_activation.set(true);
+                let id = this.watch.borrow().as_ref().map(|watch| watch.id);
+                if let Some(id) = id {
+                    this.heard(id, |watch| watch.lost_activation.set(true));
                 }
             }
         });
@@ -418,11 +456,21 @@ impl LaunchWindow {
             match effect {
                 Effect::List { serial } => self.workers.list(serial),
                 Effect::Path { serial, text, base } => self.workers.path(serial, text, base),
-                Effect::Read { serial, dir, .. } => self.feed(Ev::Listing {
+                Effect::Read {
                     serial,
                     dir,
-                    listing: eitri_core::project_chooser::Listing::Stuck,
-                }),
+                    filter,
+                    debounce,
+                    near,
+                } => self.workers.read(
+                    ReadJob {
+                        serial,
+                        dir,
+                        filter,
+                        near,
+                    },
+                    debounce,
+                ),
                 Effect::FolderDialog { at } => self.workers.folder_dialog(self.window.upcast_ref(), at.as_deref()),
                 // Completion already changed the model's line; drawing it carries it to the entry.
                 Effect::SetLine(_) => {}
@@ -445,37 +493,42 @@ impl LaunchWindow {
         self.chooser.borrow_mut().opening(&name);
         // The token names the input that picked, so it is taken here, before the start leaves this thread.
         let token = activation_token(&self.window);
-        let (exit, watched) = mpsc::channel();
-        start_child(self.flags.clone(), target.clone(), token, exit);
-        *self.watch.borrow_mut() = Some(Watch {
-            target,
-            exit: watched,
-            lost_activation: Cell::new(false),
-            deadline: Instant::now() + HAND_OVER_WITHIN,
+        let id = self.starts.get() + 1;
+        self.starts.set(id);
+        let watch = Watch::new(id, target.clone());
+        let (wake, mut woken) = unbounded();
+        start_child(self.flags.clone(), target, token, watch.exit.clone(), wake);
+        *self.watch.borrow_mut() = Some(watch);
+        let me = self.me.clone();
+        glib::spawn_future_local(async move {
+            // A reaper that went away with no message says nothing about the child: the other ends decide.
+            if woken.recv().await.is_ok() {
+                if let Some(this) = me.upgrade() {
+                    this.heard(id, |_| {});
+                }
+            }
         });
         let me = self.me.clone();
-        glib::timeout_add_local(POLL_EVERY, move || {
-            let Some(this) = me.upgrade() else {
-                return glib::ControlFlow::Break;
-            };
-            match this.end_so_far() {
-                Some(end) => {
-                    this.finish(end);
-                    glib::ControlFlow::Break
-                }
-                None => glib::ControlFlow::Continue,
+        glib::timeout_add_local_once(HAND_OVER_WITHIN, move || {
+            if let Some(this) = me.upgrade() {
+                this.heard(id, |watch| watch.past_deadline.set(true));
             }
         });
     }
 
-    fn end_so_far(&self) -> Option<Ends> {
-        let watch = self.watch.borrow();
-        let watch = watch.as_ref()?;
-        ends(
-            watch.exit.try_recv().ok(),
-            watch.lost_activation.get(),
-            Instant::now() >= watch.deadline,
-        )
+    /// A fact about start `id`; once the facts settle the start, it ends.
+    fn heard(&self, id: u64, fact: impl FnOnce(&Watch)) {
+        let end = {
+            let watch = self.watch.borrow();
+            let Some(watch) = watch.as_ref().filter(|watch| watch.id == id) else {
+                return;
+            };
+            fact(watch);
+            watch.end()
+        };
+        if let Some(end) = end {
+            self.finish(end);
+        }
     }
 
     fn finish(&self, end: Ends) {
@@ -798,6 +851,32 @@ mod tests {
     }
 
     #[test]
+    fn a_failure_already_written_wins_over_an_end_heard_first() {
+        let lost: fn(&Watch) = |watch| watch.lost_activation.set(true);
+        let late: fn(&Watch) = |watch| watch.past_deadline.set(true);
+        for (fact, name) in [(lost, "lost activation"), (late, "deadline")] {
+            let watch = Watch::new(1, "/work/app".into());
+            // The reaper has written the failure; the future that wakes the window for it has not run yet.
+            watch
+                .exit
+                .set(Exit {
+                    code: Some(3),
+                    gone: false,
+                })
+                .unwrap();
+            fact(&watch);
+            assert_eq!(watch.end(), Some(exited(Some(3))), "{name}");
+        }
+        let watch = Watch::new(2, "/work/app".into());
+        watch.lost_activation.set(true);
+        assert_eq!(
+            watch.end(),
+            Some(Ends::LostActivation),
+            "nothing written: the other end decides"
+        );
+    }
+
+    #[test]
     fn a_child_that_left_no_code_failed() {
         let exit = Exit {
             code: None,
@@ -847,6 +926,38 @@ mod tests {
             })
         );
         assert_eq!(worker_event(WorkerAnswer::Started { failed: None }), None);
+    }
+
+    #[test]
+    fn the_readers_answers_reach_the_chooser() {
+        assert_eq!(
+            worker_event(WorkerAnswer::Slow { serial: 4 }),
+            Some(Ev::Slow { serial: 4 })
+        );
+        assert_eq!(
+            worker_event(WorkerAnswer::Stuck { serial: 4 }),
+            Some(Ev::Stuck { serial: 4 })
+        );
+        assert_eq!(
+            worker_event(WorkerAnswer::Freed {
+                mount: "/mnt/nas".into()
+            }),
+            Some(Ev::Freed {
+                mount: "/mnt/nas".into()
+            })
+        );
+        assert_eq!(
+            worker_event(WorkerAnswer::Later {
+                serial: 4,
+                git: vec!["app".into()],
+                links: vec![],
+            }),
+            Some(Ev::Later {
+                serial: 4,
+                git: vec!["app".into()],
+                links: vec![],
+            })
+        );
     }
 
     #[test]
