@@ -68,12 +68,15 @@ placeholder says `/` filters or types a path.
 | `j`, `Down`, `Ctrl+n`, `Ctrl+j` / `k`, `Up`, `Ctrl+p`, `Ctrl+k` | move down / up the list (it does not wrap) |
 | `gg` / `G` | the first / the last row (a `g` waits for the next key; any other key ends the wait and does nothing) |
 | `Enter` | go to the selected row |
+| `h`, `Left` | look around the folder that holds the selected project, with the project selected |
+| `l`, `Right` | look inside the selected project |
+| `-` | look around the folder above this window's project (in the small start window, your home folder) |
+| `~` | look around your home folder |
 | `/` | go to the line, empty, to filter |
-| `~` | go to the line with `~` already typed, to type a path |
-| `Ctrl+o` | `Choose a folder…`, the system's folder dialog |
+| `Ctrl+o` | the system's folder dialog |
 | `Esc`, `q` | close the list; nothing happened |
 
-Any other plain key does nothing. In the line:
+The last row, `Browse folders…`, does what `-` does. Any other plain key does nothing. In the line:
 
 | keys in the line | what they do |
 |---|---|
@@ -81,8 +84,40 @@ Any other plain key does nothing. In the line:
 | `Down`, `Ctrl+n`, `Ctrl+j` / `Up`, `Ctrl+p`, `Ctrl+k` | move down / up the list (`j` and `k` are typed here) |
 | `Enter` | go to the selected row |
 | `Tab` | complete a typed path as far as the folders agree |
-| `Ctrl+o` | `Choose a folder…`, the system's folder dialog |
+| `Ctrl+o` | the system's folder dialog |
 | `Esc` | empty the line and go back to the list (a second `Esc` closes it) |
+
+**Browsing folders.** A path typed in the line, or any of `h`, `l`, `-` and `~` in the list, shows the subfolders of
+a folder as rows, so you can walk to a project Eitri has not opened before. The line holds the path of the folder you
+are in, and the first row, `.`, is that folder itself. A folder that is a git repository is marked `git`, a link
+`link`, a mount point `mount`, and a file you named exactly `file`. Nothing is read until you ask for a folder: opening the
+list reads no folder, and typing letters after the last `/` only filters what is shown.
+
+| keys while browsing | what they do |
+|---|---|
+| `j`, `k`, `Down`, `Up`, `Ctrl+n`, `Ctrl+p`, `Ctrl+j`, `Ctrl+k` | move |
+| `gg` / `G` | the first / the last row |
+| `l`, `Right`, `Enter` on a folder | go into it, with the cursor on `.` |
+| `Enter` on `.` | open this folder as a project: the same as a project row, a new window and its trust question |
+| `Enter` on the `file` row | open the file |
+| `h`, `Left`, `-`, `Backspace` | go up one folder, with the cursor on the folder you left |
+| `~`, `gh` | your home folder |
+| `.` | show or hide folders that start with a dot |
+| `/` | edit the path in the line: the text after the last `/` filters, a change before it reads another folder |
+| `Tab` (in the line) | complete the folders' shared prefix; with one left, go into it |
+| `Ctrl+w` (in the line) | delete back to the previous `/` |
+| `Ctrl+o` | the system's folder dialog, starting at this folder |
+| `Esc` | go back (from the line to browsing, from browsing to the list) |
+| `q` | close |
+
+`Enter` on a folder goes into it and `Enter` on `.` opens it, so a folder seen from its parent takes `l`, then `Enter`
+(and a typed path ending in `/` opens with one `Enter`). The footer says what `Enter` will do to the selected row. A click
+selects a row, and a double-click does what `Enter` does on it. Only a folder Eitri has read is ever opened. A folder on a
+network share or other mount that does not answer says `not answering` within two seconds; the other keys keep working,
+and `h` goes back. A folder with more than 2000 subfolders shows the first 2000 and says so, and `/` searches all of them.
+Names are shown as text: a control character, a right-to-left override or a zero-width space appears as a `\u{...}`
+escape, and `Enter` still opens the folder by its real name. Like the list of projects, what you browse is shown in
+this chooser only and is never sent to the agent panel, an agent or Neovim.
 
 A row shows the folder's name, its path (`~` for your home folder) and, on the right, `open` when a window already holds
 the project, `gone` when the folder is no longer there, and otherwise how long ago you last used the project (`5 m`, `2 h`,
@@ -90,7 +125,7 @@ the project, `gone` when the folder is no longer there, and otherwise how long a
 this one, as `<prefix> L` goes to the workspace you were on before. Your home folder and `/` come after every other
 project, and a project whose folder is gone comes last (at most 30 projects and 5 gone ones are listed). `Enter` on a
 project that has a window brings that window forward, across workspaces where your window manager allows it, as it is and
-on the account it started with; on any other project it opens a new window, on this window's account. A typed path opens a folder, or a file the way `eitri FILE` does; a name that does not
+on the account it started with; on any other project it opens a new window, on this window's account. A typed path that names a file opens it the way `eitri FILE` does; a name that does not
 exist shows `no such folder: <path>` and nothing is created, and a `gone` row shows `<path> is not there` and stays.
 Eitri builds the list from its own records of your projects (the layout and tabs it saves, and a note each window keeps
 of its project and when you last used it) and reads nothing else on your disk; a project you opened and left alone is in

@@ -766,6 +766,90 @@ fn the_path_label_ellipsizes_at_the_start_and_the_action_words_stay() {
     }
 }
 
+// Share the production copy so this measurement follows changes in either language.
+mod onboarding {
+    pub use eitri_core::onboarding::Lang;
+}
+#[allow(dead_code)]
+#[path = "../../core/src/project_chooser/text.rs"]
+mod chooser_text;
+
+fn every_footer_fits_640_px_in_both_languages_with_the_longest_name() {
+    use chooser_text::Enter;
+    use onboarding::Lang;
+
+    // Match the shipped panel's text metrics and padding without depending on its colour tokens. The copy comes from
+    // `text.rs` itself (a path-included module, so it must keep to `core::` imports this shim provides), and the
+    // numbers below restate `theme/gtk_css.rs`: they must move together.
+    let css = gtk4::CssProvider::new();
+    css.load_from_string(
+        ".project-chooser-panel { padding: 12px; border: 1px solid; font-size: 13px; }
+         .project-chooser-footer { font-size: 12px; padding: 0 9px; }",
+    );
+    let display = gtk4::gdk::Display::default().unwrap();
+    gtk4::style_context_add_provider_for_display(&display, &css, gtk4::STYLE_PROVIDER_PRIORITY_APPLICATION);
+    let stage = Stage::sized(720);
+    stage.overlay.add_overlay(stage.chooser.widget());
+    stage.chooser.focus();
+    let mut failures = Vec::new();
+    for lang in [Lang::En, Lang::ZhCn] {
+        let copy = chooser_text::text(lang);
+        let mut footers = vec![copy.footer_list.to_owned(), copy.footer.to_owned()];
+        // Wide glyphs exercise the name cap in both scripts, including a name shortened in the middle.
+        for name in ["W".repeat(24), "宽".repeat(24), "W".repeat(48)] {
+            for (enter, in_line) in [
+                (Enter::Open, false),
+                (Enter::Into, false),
+                (Enter::OpenFile, false),
+                (Enter::Inert, false),
+                (Enter::Into, true),
+                (Enter::Open, true),
+                (Enter::OpenFile, true),
+                (Enter::Inert, true),
+            ] {
+                footers.push(chooser_text::footer(lang, &name, enter, in_line));
+            }
+        }
+        for footer in footers {
+            let mut view = folders(1);
+            view.footer = footer.clone();
+            stage.chooser.show(Some(&view));
+            pump();
+            let panel = stage
+                .widgets()
+                .into_iter()
+                .find(|w| w.has_css_class("project-chooser-panel"))
+                .unwrap();
+            // `width()` is the content box: the 640 px request includes the 12 px padding and 1 px border on each side.
+            assert_eq!(panel.width_request(), 640, "the measurement uses the full panel width");
+            assert_eq!(panel.width(), 640 - 2 * 12 - 2, "the panel is laid out at its request");
+            let label = stage.labelled("project-chooser-footer");
+            // The rule is about the action words before the first `·`: the label ends in an ellipsis when the keys
+            // after them do not fit, and that is fine as long as the action words and the ellipsis fit together.
+            let action = footer.split('·').next().unwrap().trim_end();
+            let action_width = label.create_pango_layout(Some(action)).pixel_size().0;
+            let ellipsized = label.layout().is_ellipsized();
+            let ellipsis_width = if ellipsized {
+                label.create_pango_layout(Some("\u{2026}")).pixel_size().0
+            } else {
+                0
+            };
+            if action_width + ellipsis_width > label.width() {
+                failures.push(format!(
+                    "{footer:?}: action {action_width} px, label {} px, ellipsized {ellipsized}",
+                    label.width()
+                ));
+            }
+        }
+    }
+    gtk4::style_context_remove_provider_for_display(&display, &css);
+    assert!(
+        failures.is_empty(),
+        "footers must fit and keep their action words whole:\n{}",
+        failures.join("\n")
+    );
+}
+
 fn run(filter: &Option<String>, name: &str, check: impl FnOnce()) {
     if filter.as_ref().is_some_and(|f| !name.contains(f.as_str())) {
         return;
@@ -784,6 +868,11 @@ fn main() {
     let server = own_x_server::init_gtk("project_chooser_placement", "1024x768x24");
     let d = server.display();
     let f = &filter;
+    run(
+        f,
+        "every_footer_fits_640_px_in_both_languages_with_the_longest_name",
+        every_footer_fits_640_px_in_both_languages_with_the_longest_name,
+    );
     run(
         f,
         "it_never_raises_the_windows_minimum",

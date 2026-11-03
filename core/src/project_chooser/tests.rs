@@ -1866,9 +1866,9 @@ fn the_footer_says_into_on_a_folder_and_open_on_here() {
             if !in_line {
                 esc(&mut c);
             }
-            assert!(c.view().footer.starts_with("Enter open me ·"));
+            assert!(c.view().footer.starts_with("Enter open \u{2068}me\u{2069} ·"));
             c.event(Ev::Line(LineEv::Step(1)));
-            assert!(c.view().footer.starts_with("Enter into src/ ·"));
+            assert!(c.view().footer.starts_with("Enter into \u{2068}src\u{2069}/ ·"));
         }
     }
 }
@@ -1879,7 +1879,12 @@ fn name_in_the_footer_is_capped_at_24_with_a_middle_ellipsis() {
     browse(&mut c, "~/", &[name]);
     c.event(Ev::Line(LineEv::Step(1)));
     let footer = c.view().footer;
-    let shown = footer.strip_prefix("Enter into ").unwrap().split("/ ·").next().unwrap();
+    let shown = footer
+        .strip_prefix("Enter into \u{2068}")
+        .unwrap()
+        .split("\u{2069}/ ·")
+        .next()
+        .unwrap();
     assert_eq!(shown.chars().count(), 24);
     assert!(shown.contains('…'));
     assert!(shown.starts_with("abcdef") && shown.ends_with("uvwxyz"));
@@ -2028,12 +2033,13 @@ fn every_new_string_has_both_languages() {
         ] {
             let effects = line(&mut c, &format!("/folder{i}/"));
             deliver(&mut c, &effects, reply);
-            assert_eq!(c.view().message.as_deref(), Some(expected));
+            let message = c.view().message.unwrap();
+            assert_eq!(message.split('\t').next(), Some(expected));
         }
         let effects = line(&mut c, "/last/");
         let (serial, _) = read_request(&effects);
         c.event(Ev::Slow { serial });
-        assert_eq!(c.view().message.as_deref(), Some(reading));
+        assert_eq!(c.view().message.as_deref(), Some(format!("{reading}\t/last").as_str()));
     }
 }
 
@@ -2488,10 +2494,10 @@ fn all_browse_marks_caps_and_dynamic_copy_have_both_languages() {
             ],
             "no folder matches \"app\"",
             "cannot read /dir now",
-            "Enter open app · l in · h up · / filter · . hidden · Esc back · q close",
-            "Enter into app/ · h up · / filter · . hidden · Esc back · q close",
-            "Enter open app · Tab complete · ↑↓ move · Ctrl+w up · Esc clear",
-            "Enter into app/ · Tab complete · ↑↓ move · Ctrl+w up · Esc clear",
+            "Enter open \u{2068}app\u{2069} · l in · h up · / filter · . hidden · Esc back · q close",
+            "Enter into \u{2068}app\u{2069}/ · h up · / filter · . hidden · Esc back · q close",
+            "Enter open \u{2068}app\u{2069} · Tab complete · ↑↓ move · Ctrl+w up · Esc clear",
+            "Enter into \u{2068}app\u{2069}/ · Tab complete · ↑↓ move · Ctrl+w up · Esc clear",
         ),
         (
             Lang::ZhCn,
@@ -2499,10 +2505,10 @@ fn all_browse_marks_caps_and_dynamic_copy_have_both_languages() {
             ["只显示前 2000 个文件夹 · / 搜索整个文件夹", "只读了前 50 000 项"],
             "没有匹配“app”的文件夹",
             "现在读不了 /dir",
-            "Enter 打开 app · l 进入 · h 上一级 · / 筛选 · . 隐藏 · Esc 返回 · q 关闭",
-            "Enter 进入 app/ · h 上一级 · / 筛选 · . 隐藏 · Esc 返回 · q 关闭",
-            "Enter 打开 app · Tab 补全 · ↑↓ 移动 · Ctrl+w 上一级 · Esc 清除",
-            "Enter 进入 app/ · Tab 补全 · ↑↓ 移动 · Ctrl+w 上一级 · Esc 清除",
+            "Enter 打开 \u{2068}app\u{2069} · l 进入 · h 上一级 · / 筛选 · . 隐藏 · Esc 返回 · q 关闭",
+            "Enter 进入 \u{2068}app\u{2069}/ · h 上一级 · / 筛选 · . 隐藏 · Esc 返回 · q 关闭",
+            "Enter 打开 \u{2068}app\u{2069} · Tab 补全 · ↑↓ 移动 · Ctrl+w 上一级 · Esc 清除",
+            "Enter 进入 \u{2068}app\u{2069}/ · Tab 补全 · ↑↓ 移动 · Ctrl+w 上一级 · Esc 清除",
         ),
     ] {
         let t = text::text(lang);
@@ -2582,7 +2588,7 @@ fn the_footer_names_only_the_keys_that_work_on_the_row() {
     esc(&mut c);
     // `.` opens and `l` goes in; a dead link has no Enter action at all.
     assert_eq!(selected_name(&c), ".");
-    assert!(c.view().footer.starts_with("Enter open me · l in ·"));
+    assert!(c.view().footer.starts_with("Enter open \u{2068}me\u{2069} · l in ·"));
     c.event(Ev::Line(LineEv::Step(1)));
     assert_eq!(selected_name(&c), "x/");
     assert!(c.view().rows[c.view().selected.unwrap()].dimmed);
@@ -2604,7 +2610,10 @@ fn the_footer_names_only_the_keys_that_work_on_the_row() {
         },
     );
     assert_eq!(selected_name(&c), "notes.md");
-    assert!(c.view().footer.starts_with("Enter open notes.md · Tab complete"));
+    assert!(c
+        .view()
+        .footer
+        .starts_with("Enter open \u{2068}notes.md\u{2069} · Tab complete"));
     for lang in [Lang::En, Lang::ZhCn] {
         let footer = text::footer(lang, "notes.md", text::Enter::OpenFile, false);
         assert!(
@@ -2663,5 +2672,226 @@ fn the_dialog_starts_at_a_folder_only_when_its_fresh_read_has_answered() {
     assert_eq!(
         c.event(Ev::Line(LineEv::ChooseFolder)),
         vec![Effect::FolderDialog { at: None }]
+    );
+}
+
+fn link_entry(name: &str, kind: LinkKind) -> Entry {
+    Entry {
+        kind: EntryKind::Link {
+            target: "target".into(),
+            kind,
+        },
+        ..entry(name)
+    }
+}
+fn read_of(entries: Vec<Entry>, exact: Option<Entry>) -> Listing {
+    Listing::Read {
+        dir: "/physical".into(),
+        entries,
+        capped: None,
+        exact,
+    }
+}
+fn exact_read<'a>(effects: &'a [Effect]) -> Option<(&'a Path, &'a str)> {
+    effects.iter().find_map(|effect| match effect {
+        Effect::Read {
+            dir,
+            filter: Some(filter),
+            debounce: false,
+            ..
+        } => Some((dir.as_path(), filter.as_str())),
+        _ => None,
+    })
+}
+
+#[test]
+fn going_up_out_of_a_dot_folder_lands_on_it_with_hidden_folders_off() {
+    for mode in modes() {
+        let mut c = chooser(mode);
+        browse(&mut c, "~/.config/", &["nvim"]);
+        esc(&mut c);
+        let effects = key(&mut c, 'h');
+        assert_eq!(read_request(&effects).1, PathBuf::from("/home/me"));
+        deliver(&mut c, &effects, listing(&[".cache", ".config", "src"]));
+        assert!(!c.view().hidden);
+        assert_eq!(selected_name(&c), ".config/");
+        assert!(
+            !c.view().rows.iter().any(|r| r.name == ".cache/"),
+            "other hidden folders stay hidden"
+        );
+        let effects = enter(&mut c);
+        assert_eq!(read_request(&effects).1, PathBuf::from("/home/me/.config"));
+    }
+}
+#[test]
+fn h_on_a_dot_named_project_lands_on_it_in_its_parent() {
+    for mode in modes() {
+        let mut c = chooser(mode);
+        list(&mut c, vec![row("/home/me/.dotfiles", Fact::Present)]);
+        let effects = key(&mut c, 'h');
+        deliver(&mut c, &effects, listing(&[".cache", ".dotfiles", "src"]));
+        assert_eq!(selected_name(&c), ".dotfiles/");
+        assert!(!c.view().rows.iter().any(|r| r.name == ".cache/"));
+    }
+}
+#[test]
+fn reading_stuck_denied_and_loop_messages_name_their_folder_after_a_tab() {
+    for (typed, folder) in [("/mnt/nas/", "/mnt/nas"), ("~/nas/", "~/nas")] {
+        let words =
+            |message: Option<String>| message.map(|m| m.split_once('\t').map(|(w, p)| (w.to_owned(), p.to_owned())));
+        let mut c = window();
+        let effects = line(&mut c, typed);
+        let (serial, _) = read_request(&effects);
+        c.event(Ev::Slow { serial });
+        assert_eq!(words(c.view().message), Some(Some(("reading".into(), folder.into()))));
+        c.event(Ev::Stuck { serial });
+        assert_eq!(
+            words(c.view().message),
+            Some(Some(("not answering · h goes back".into(), folder.into())))
+        );
+        for (reply, expected) in [
+            (Listing::Stuck, "not answering · h goes back"),
+            (
+                Listing::Denied { exact: None },
+                "cannot read: permission denied · h goes back",
+            ),
+            (Listing::Loop, "cannot read: too many links"),
+        ] {
+            let mut c = window();
+            answer(&mut c, typed, reply.clone());
+            assert_eq!(words(c.view().message), Some(Some((expected.into(), folder.into()))));
+            if reply == Listing::Loop {
+                assert!(enter(&mut c).is_empty());
+                assert_eq!(words(c.view().message), Some(Some((expected.into(), folder.into()))));
+            }
+        }
+    }
+}
+#[test]
+fn messages_without_a_folder_have_no_tab() {
+    for reply in [Listing::TooManyStuck, Listing::NotAFolder, Listing::Missing] {
+        let mut c = window();
+        answer(&mut c, "/mnt/nas/", reply);
+        assert!(!c.view().message.unwrap().contains('\t'));
+    }
+}
+#[test]
+fn the_footers_name_sits_in_its_own_isolate() {
+    let mut c = window();
+    browse(&mut c, "~/", &["שלום"]);
+    esc(&mut c);
+    assert!(c.view().footer.starts_with("Enter open \u{2068}me\u{2069} · l in ·"));
+    c.event(Ev::Line(LineEv::Step(1)));
+    assert!(c.view().footer.starts_with("Enter into \u{2068}שלום\u{2069}/ · h up ·"));
+}
+#[test]
+fn a_held_enter_on_an_exactly_typed_link_has_it_classified_then_opens_a_file() {
+    for mode in modes() {
+        let mut c = chooser(mode);
+        let effects = line(&mut c, "~/link.md");
+        assert!(enter(&mut c).is_empty());
+        let effects = deliver(
+            &mut c,
+            &effects,
+            read_of(vec![link_entry("link.md", LinkKind::Unknown), entry("link.md.d")], None),
+        );
+        assert_eq!(exact_read(&effects), Some((Path::new("/home/me"), "link.md")));
+        assert!(!effects
+            .iter()
+            .any(|e| matches!(e, Effect::Read { dir, .. } if dir.ends_with("link.md"))));
+        let file = link_entry("link.md", LinkKind::File);
+        assert_eq!(
+            deliver(&mut c, &effects, read_of(vec![file.clone()], Some(file))),
+            vec![Effect::Open("/home/me/link.md".into())]
+        );
+    }
+}
+#[test]
+fn an_enter_before_the_links_kind_is_known_has_it_classified_first() {
+    let mut c = window();
+    let effects = line(&mut c, "~/x/link.md");
+    deliver(
+        &mut c,
+        &effects,
+        read_of(vec![link_entry("link.md", LinkKind::Unknown)], None),
+    );
+    let effects = enter(&mut c);
+    assert_eq!(exact_read(&effects), Some((Path::new("/home/me/x"), "link.md")));
+    let file = link_entry("link.md", LinkKind::File);
+    assert_eq!(
+        deliver(&mut c, &effects, read_of(vec![file.clone()], Some(file))),
+        vec![Effect::Open("/home/me/x/link.md".into())]
+    );
+}
+#[test]
+fn a_classified_folder_link_is_entered_with_both_held_enters_kept() {
+    let mut c = window();
+    let effects = line(&mut c, "~/data");
+    enter(&mut c);
+    enter(&mut c);
+    let effects = deliver(
+        &mut c,
+        &effects,
+        read_of(vec![link_entry("data", LinkKind::Unknown)], None),
+    );
+    assert_eq!(exact_read(&effects), Some((Path::new("/home/me"), "data")));
+    let dir = link_entry("data", LinkKind::Dir);
+    let effects = deliver(&mut c, &effects, read_of(vec![dir.clone()], Some(dir)));
+    assert_eq!(read_request(&effects).1, PathBuf::from("/home/me/data"));
+    assert_eq!(
+        deliver(&mut c, &effects, listing(&[])),
+        vec![Effect::Open("/home/me/data".into())]
+    );
+}
+#[test]
+fn a_link_still_unknown_after_its_classification_is_entered_and_not_asked_again() {
+    let mut c = window();
+    let effects = line(&mut c, "~/nas");
+    enter(&mut c);
+    let effects = deliver(
+        &mut c,
+        &effects,
+        read_of(vec![link_entry("nas", LinkKind::Unknown)], None),
+    );
+    assert!(exact_read(&effects).is_some());
+    let unknown = link_entry("nas", LinkKind::Unknown);
+    let effects = deliver(&mut c, &effects, read_of(vec![unknown.clone()], Some(unknown)));
+    assert_eq!(read_request(&effects).1, PathBuf::from("/home/me/nas"));
+    assert!(exact_read(&effects).is_none());
+}
+#[test]
+fn a_classification_keeps_the_whole_listing_and_its_marks() {
+    let mut c = window();
+    let effects = line(&mut c, "~/odd");
+    deliver(
+        &mut c,
+        &effects,
+        read_of(
+            vec![link_entry("odd", LinkKind::Unknown), entry("odds"), entry("other")],
+            None,
+        ),
+    );
+    let effects = enter(&mut c);
+    let (serial, _) = read_request(&effects);
+    let other = link_entry("odd", LinkKind::Other);
+    assert!(deliver(&mut c, &effects, read_of(vec![other.clone()], Some(other))).is_empty());
+    assert_eq!(c.view().message.as_deref(), Some("not a folder"));
+    c.event(Ev::Later {
+        serial,
+        git: vec!["odds".into()],
+        links: vec![],
+    });
+    assert!(c
+        .view()
+        .rows
+        .iter()
+        .any(|r| r.name == "odds/" && r.right.contains("git")));
+    assert!(
+        line(&mut c, "~/o").is_empty(),
+        "the whole folder is still held: a shorter filter reads nothing"
+    );
+    assert_eq!(
+        c.view().rows.iter().map(|r| r.name.as_str()).collect::<Vec<_>>(),
+        ["odd/", "odds/", "other/"]
     );
 }

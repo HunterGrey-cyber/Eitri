@@ -65,7 +65,6 @@ pub fn event(w: &mut Window, win: WinId, ev: ProjectEvent, batch: &mut Batch) {
     );
     let ev = match ev {
         ProjectEvent::Rows { serial, rows, .. } => Ev::Rows { serial, rows },
-        ProjectEvent::PathAnswer { serial, answer, .. } => Ev::PathAnswer { serial, answer },
         ProjectEvent::Line { ev, .. } => Ev::Line(ev),
         ProjectEvent::Listing {
             serial, dir, listing, ..
@@ -126,14 +125,6 @@ fn carry(w: &mut Window, win: WinId, effects: Vec<Effect>, batch: &mut Batch) {
     for effect in effects {
         match effect {
             Effect::List { serial } => batch.push_effect(HostOp::Project(ProjectOp::List { win, serial })),
-            Effect::Path { serial, text, base } => {
-                batch.push_effect(HostOp::Project(ProjectOp::Path {
-                    win,
-                    serial,
-                    text,
-                    base,
-                }));
-            }
             Effect::Read {
                 serial,
                 dir,
@@ -196,7 +187,7 @@ mod tests {
     use crate::keymap::prefix::{Press, Waiting};
     use crate::keymap::{Action, KeySpec, Keymap};
     use crate::layout::{Axis, Layout, ModuleId, ModuleKeys, Node};
-    use crate::project_chooser::{Fact, LineEv, PathAnswer, Row};
+    use crate::project_chooser::{Fact, LineEv, Row};
     use crate::wm::chrome::Prompt;
     use crate::wm::conformance::{self, RecordingSink};
     use crate::wm::host::*;
@@ -760,10 +751,11 @@ mod tests {
                 serial: 1,
                 rows: vec![row("/private/project")],
             },
-            ProjectEvent::PathAnswer {
+            ProjectEvent::Listing {
                 win: WIN,
                 serial: 2,
-                answer: PathAnswer::Missing,
+                dir: path.clone(),
+                listing: crate::project_chooser::Listing::Missing,
             },
             ProjectEvent::Line {
                 win: WIN,

@@ -70,7 +70,12 @@ to tell whether a problem comes from your own setup.
 
 **Another project.** Press `<prefix> O` in any window (or `p` on an empty tab, or click the project's name in the top bar) to
 see the projects you opened before, newest first, and go to one: a project that already has a window comes forward, any
-other opens in a new window. You can filter the list or type a path (`~/src/app`; `Tab` completes it). The keys are in
+other opens in a new window. You can filter the list or type a path (`~/src/app`; `Tab` completes it).
+
+To look for a project that is not in the list, press `h` on one to see the folder that holds it, and its sibling folders,
+with the project selected. `l` or `Enter` goes into a folder, `h` goes back up, and `Enter` on the `.` row opens the
+folder you are in as a project. A path typed in the line shows that folder's subfolders the same way, and a folder on a
+network share that does not answer says so instead of making the window wait. The keys are in
 [Keys](keys.md#the-prefix). A window that comes forward stays as it was, on the Claude account it started with, even when
 you chose it from a window or a desktop entry on another account; `eitri --account <name> --new-window <dir>` gives the
 project a second window on that account. When a new window cannot start, a short message says the folder is not there, or
@@ -79,7 +84,7 @@ sends you to that project's window log, described in [When Eitri itself crashes]
 **From the desktop icon.** Starting Eitri from the desktop with no file or folder does not open your home folder. It shows
 the same list in a small window of its own before anything starts: no Neovim, no question about trusting a folder.
 Choosing a project opens its window and the small one goes; `Esc` closes it and leaves nothing running. The first time
-there is nothing in the list, so the window offers `Choose a folder…` and `Home folder`, and the first-start screen then
+there is nothing in the list, so the window offers `Browse folders…` and `Home folder`, and the first-start screen then
 opens in the window you chose. [`window.desktop_start`](configuration.md#settings) changes this: `"last"` opens the project
 you used most recently without showing the list, and `"cwd"` brings back the old behaviour, the directory the launcher ran
 in. Running `eitri` in a terminal is unchanged.

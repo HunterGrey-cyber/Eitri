@@ -1115,7 +1115,6 @@ impl GtkHost {
     fn project(&self, op: &HostOp, call: &ProjectOp) -> Applied {
         let win = match call {
             ProjectOp::List { win, .. }
-            | ProjectOp::Path { win, .. }
             | ProjectOp::Read { win, .. }
             | ProjectOp::FolderDialog { win, .. }
             | ProjectOp::Open { win, .. } => *win,

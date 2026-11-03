@@ -466,13 +466,6 @@ impl FakeHost {
                     listing: crate::project_chooser::Listing::Stuck,
                 }));
             }
-            HostOp::Project(ProjectOp::Path { win, serial, .. }) => {
-                self.post(HostEvent::Project(ProjectEvent::PathAnswer {
-                    win: *win,
-                    serial: *serial,
-                    answer: crate::project_chooser::PathAnswer::Stuck,
-                }));
-            }
             HostOp::Project(ProjectOp::FolderDialog { win, .. }) => {
                 self.post(HostEvent::Project(ProjectEvent::Folder { win: *win, path: None }));
             }

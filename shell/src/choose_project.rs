@@ -259,7 +259,6 @@ fn view_event(report: ChooserReport) -> Option<Ev> {
 fn worker_event(answer: WorkerAnswer) -> Option<Ev> {
     match answer {
         WorkerAnswer::Rows { serial, rows } => Some(Ev::Rows { serial, rows }),
-        WorkerAnswer::Path { serial, answer } => Some(Ev::PathAnswer { serial, answer }),
         WorkerAnswer::Listing { serial, dir, listing } => Some(Ev::Listing { serial, dir, listing }),
         WorkerAnswer::Later { serial, git, links } => Some(Ev::Later { serial, git, links }),
         WorkerAnswer::Slow { serial } => Some(Ev::Slow { serial }),
@@ -455,7 +454,6 @@ impl LaunchWindow {
         for effect in effects {
             match effect {
                 Effect::List { serial } => self.workers.list(serial),
-                Effect::Path { serial, text, base } => self.workers.path(serial, text, base),
                 Effect::Read {
                     serial,
                     dir,
@@ -546,7 +544,6 @@ impl LaunchWindow {
 mod tests {
     use super::*;
     use eitri_core::plugin::test_support::Scratch;
-    use eitri_core::project_chooser::PathAnswer;
     use eitri_core::recent_projects::Probe;
     use eitri_core::source_scan::{code_only, functions, read_required};
     use eitri_core::state_paths::project_key;
@@ -916,13 +913,13 @@ mod tests {
     #[test]
     fn a_workers_answers_reach_the_chooser_and_its_starts_do_not() {
         assert_eq!(
-            worker_event(WorkerAnswer::Path {
+            worker_event(WorkerAnswer::Rows {
                 serial: 3,
-                answer: PathAnswer::Missing
+                rows: vec![]
             }),
-            Some(Ev::PathAnswer {
+            Some(Ev::Rows {
                 serial: 3,
-                answer: PathAnswer::Missing
+                rows: vec![]
             })
         );
         assert_eq!(worker_event(WorkerAnswer::Started { failed: None }), None);

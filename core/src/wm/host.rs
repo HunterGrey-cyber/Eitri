@@ -11,7 +11,7 @@ use crate::keymap::{
 use crate::layout::{kill::Reopen, Arrangement, Direction, Frame, ModuleId, Size};
 use crate::onboarding::screen::{CheckWhy, MarkerEvent};
 use crate::onboarding::{Found, Generated, Opening, WriteOutcome};
-use crate::project_chooser::{LineEv, LinkKind, Listing, PathAnswer, Row};
+use crate::project_chooser::{LineEv, LinkKind, Listing, Row};
 use crate::tabs::{TabId, ViewId};
 use crate::window_link::moves::MoveId;
 use crate::window_link::names::WindowName;
@@ -1314,12 +1314,6 @@ pub enum ProjectOp {
         win: WinId,
         serial: u64,
     },
-    Path {
-        win: WinId,
-        serial: u64,
-        text: String,
-        base: PathBuf,
-    },
     Read {
         win: WinId,
         serial: u64,
@@ -1372,11 +1366,6 @@ pub enum ProjectEvent {
         serial: u64,
         rows: Vec<Row>,
     },
-    PathAnswer {
-        win: WinId,
-        serial: u64,
-        answer: PathAnswer,
-    },
     Line {
         win: WinId,
         ev: LineEv,
@@ -1418,7 +1407,6 @@ impl ProjectEvent {
             | Self::Freed { win, .. }
             | Self::PickTwice { win, .. }
             | Self::Rows { win, .. }
-            | Self::PathAnswer { win, .. }
             | Self::Line { win, .. }
             | Self::Pick { win, .. }
             | Self::Dismiss { win }

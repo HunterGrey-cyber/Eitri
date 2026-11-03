@@ -137,8 +137,9 @@ pub(super) enum Enter {
     Inert,
 }
 
+/// The name sits in a first-strong isolate, so a right-to-left name cannot reorder the action words around it.
 pub(super) fn footer(lang: Lang, name: &str, enter: Enter, in_line: bool) -> String {
-    let name = short_name(name);
+    let name = format!("\u{2068}{}\u{2069}", short_name(name));
     let action = match (lang, enter) {
         (Lang::En, Enter::Open | Enter::OpenFile) => Some(format!("Enter open {name}")),
         (Lang::En, Enter::Into) => Some(format!("Enter into {name}/")),

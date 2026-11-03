@@ -93,24 +93,6 @@ pub enum Mode {
     Launch,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum PathKind {
-    Dir,
-    File,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum PathAnswer {
-    Found {
-        path: PathBuf,
-        exact: Option<PathKind>,
-        folders: Vec<PathBuf>,
-        common: String,
-    },
-    Missing,
-    Stuck,
-}
-
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum LineEv {
     Changed(String),
@@ -134,10 +116,6 @@ pub enum Ev {
     Rows {
         serial: u64,
         rows: Vec<Row>,
-    },
-    PathAnswer {
-        serial: u64,
-        answer: PathAnswer,
     },
     Line(LineEv),
     Listing {
@@ -176,11 +154,6 @@ pub enum Ev {
 pub enum Effect {
     List {
         serial: u64,
-    },
-    Path {
-        serial: u64,
-        text: String,
-        base: PathBuf,
     },
     Read {
         serial: u64,
@@ -260,6 +233,10 @@ struct Browse {
     git: BTreeSet<OsString>,
     left: Option<OsString>,
     held_enters: u8,
+    /// The exactly named link whose kind a read of this folder with that name is finding out.
+    classifying: Option<OsString>,
+    /// The link whose kind that read answered; it is not asked about again until a fresh listing.
+    classified: Option<OsString>,
 }
 
 #[derive(Clone)]
@@ -569,6 +546,8 @@ impl Chooser {
                             git: BTreeSet::new(),
                             left: None,
                             held_enters: 0,
+                            classifying: None,
+                            classified: None,
                         }));
                         self.line = last.typed;
                     }
@@ -658,6 +637,8 @@ impl Chooser {
                 git: BTreeSet::new(),
                 left: None,
                 held_enters: 0,
+                classifying: None,
+                classified: None,
             }));
             self.rebuild();
             return vec![];
@@ -702,6 +683,8 @@ impl Chooser {
             git: BTreeSet::new(),
             left: near,
             held_enters: 0,
+            classifying: None,
+            classified: None,
         }));
         self.selected = Some(0);
         self.message = None;
@@ -719,6 +702,7 @@ impl Chooser {
         b.requested_filter = filter.clone();
         b.serial = Some(serial);
         b.later_serial = None;
+        b.classifying = None;
         b.shown = Shown::Waiting;
         if !self.opening {
             self.message = None;
@@ -844,6 +828,9 @@ impl Chooser {
 
     fn activate(&mut self) -> Vec<Effect> {
         if matches!(self.place, Place::Folder(_)) {
+            if self.exact_link_unknown() {
+                return self.classify(1);
+            }
             return self.activate_folder();
         }
         match self.selected.and_then(|i| self.items.get(i)).cloned() {
@@ -876,9 +863,10 @@ impl Chooser {
             return vec![];
         }
         if !readable(b.listing.as_ref()) {
+            let shown = Row::new(b.dir.clone(), self.home.as_deref(), String::new(), Fact::Present).shown;
             self.message = Some(match b.listing {
                 Some(Listing::Missing) => text::missing(self.lang, &display_name(&self.line)),
-                Some(Listing::Loop) => text::text(self.lang).looped.into(),
+                Some(Listing::Loop) => beside(text::text(self.lang).looped, shown),
                 Some(Listing::NotAFolder) => text::text(self.lang).not_folder.into(),
                 _ => text::cannot_read(self.lang, &display_name(&self.line)),
             });
@@ -911,6 +899,69 @@ impl Chooser {
             }
             _ => vec![],
         }
+    }
+
+    /// The selected row is a link named exactly by the filter whose kind is not known yet. A listing names a link's
+    /// kind only after its marks, so `Enter` there first asks for it: a link to a file then opens the file, as a typed
+    /// path to one does, rather than being read as a folder.
+    fn exact_link_unknown(&self) -> bool {
+        let Place::Folder(b) = &self.place else { return false };
+        if b.serial.is_some() || b.shown != Shown::Done || b.filter.is_empty() {
+            return false;
+        }
+        matches!(
+            self.selected.and_then(|i| self.items.get(i)),
+            Some(Item::Entry(Entry {
+                raw,
+                kind: EntryKind::Link {
+                    kind: LinkKind::Unknown,
+                    ..
+                },
+                ..
+            })) if raw.as_os_str() == std::ffi::OsStr::new(&b.filter) && b.classified.as_ref() != Some(raw)
+        )
+    }
+
+    /// Reads this folder again with the link's name, which the reader resolves exactly; the listing shown stays, with
+    /// that link's kind filled in, and the `Enter`s wait for it.
+    fn classify(&mut self, held: u8) -> Vec<Effect> {
+        let serial = self.serial();
+        let Place::Folder(b) = &mut self.place else {
+            return vec![];
+        };
+        b.serial = Some(serial);
+        b.classifying = Some(OsString::from(&b.filter));
+        b.shown = Shown::Waiting;
+        b.held_enters = held;
+        vec![Effect::Read {
+            serial,
+            dir: b.dir.clone(),
+            filter: Some(b.filter.clone()),
+            debounce: false,
+            near: b.left.clone(),
+        }]
+    }
+
+    /// Runs the held `Enter`s, in order, on what is shown now.
+    fn replay(&mut self, held: u8) -> Vec<Effect> {
+        if self.opening || self.dialog {
+            return vec![];
+        }
+        for remaining in (0..held).rev() {
+            if self.exact_link_unknown() {
+                return self.classify(remaining + 1);
+            }
+            let effects = self.activate_folder();
+            if !effects.is_empty() {
+                if effects.iter().any(|e| matches!(e, Effect::Read { .. })) {
+                    if let Place::Folder(b) = &mut self.place {
+                        b.held_enters = remaining;
+                    }
+                }
+                return effects;
+            }
+        }
+        vec![]
     }
 
     fn complete(&mut self) -> Vec<Effect> {
@@ -977,6 +1028,27 @@ impl Chooser {
             return vec![];
         }
         let held = std::mem::take(&mut b.held_enters);
+        if let Some(name) = b.classifying.take() {
+            b.serial = None;
+            // Asking cancelled the marks of the listing shown; this read's marks cover every row the filter shows.
+            b.later_serial = Some(serial);
+            b.shown = Shown::Done;
+            let found = match &listing {
+                Listing::Read { entries, exact, .. } => exact.iter().chain(entries).find(|e| e.raw == name),
+                Listing::Denied { exact } => exact.iter().find(|e| e.raw == name),
+                _ => None,
+            };
+            if let (Some(EntryKind::Link { kind, .. }), Some(shown)) = (found.map(|e| &e.kind), &mut b.listing) {
+                update_links(shown, &[(name.clone(), *kind)]);
+            }
+            b.classified = Some(name);
+            if !self.opening {
+                self.message = None;
+            }
+            self.remember_shown();
+            self.rebuild_keep_selection();
+            return self.replay(held);
+        }
         let selected = self
             .selected
             .and_then(|i| self.items.get(i))
@@ -998,6 +1070,7 @@ impl Chooser {
         }
         let reread = b.needs_filter && !b.filter.is_empty() && b.requested_filter.as_deref() != Some(&b.filter);
         b.listing = Some(listing);
+        b.classified = None;
         b.git.clear();
         if !self.opening {
             self.message = None;
@@ -1017,21 +1090,7 @@ impl Chooser {
             }
             return effects;
         }
-        if self.opening || self.dialog {
-            return vec![];
-        }
-        for remaining in (0..held).rev() {
-            let effects = self.activate_folder();
-            if !effects.is_empty() {
-                if effects.iter().any(|e| matches!(e, Effect::Read { .. })) {
-                    if let Place::Folder(b) = &mut self.place {
-                        b.held_enters = remaining;
-                    }
-                }
-                return effects;
-            }
-        }
-        vec![]
+        self.replay(held)
     }
 
     fn remember_shown(&mut self) {
@@ -1115,7 +1174,11 @@ impl Chooser {
                     .chain(exact)
                     .filter(|e| {
                         let name = e.raw.to_string_lossy();
-                        (!name.starts_with('.') || self.hidden || needle.starts_with('.'))
+                        // The folder just left stays a row, hidden or not, so going up lands on it.
+                        (!name.starts_with('.')
+                            || self.hidden
+                            || needle.starts_with('.')
+                            || b.left.as_ref() == Some(&e.raw))
                             && if is_file(e) {
                                 !b.filter.is_empty() && name == b.filter
                             } else {
@@ -1273,15 +1336,15 @@ impl Chooser {
                 (self.list_serial.is_none() && self.rows.is_empty() && self.line.is_empty()).then(|| t.empty.into())
             }
             Place::Folder(b) => match b.shown {
-                Shown::Slow => Some(t.reading.into()),
-                Shown::Stuck => Some(t.stuck.into()),
+                Shown::Slow => Some(beside(t.reading, self.displayed_path(&b.dir))),
+                Shown::Stuck => Some(beside(t.stuck, self.displayed_path(&b.dir))),
                 Shown::Waiting => None,
                 Shown::Done => match &b.listing {
-                    Some(Listing::Denied { .. }) => Some(t.denied.into()),
+                    Some(Listing::Denied { .. }) => Some(beside(t.denied, self.displayed_path(&b.dir))),
                     Some(Listing::Missing) => Some(text::missing(self.lang, &display_name(&self.line))),
                     Some(Listing::NotAFolder) => Some(t.not_folder.into()),
-                    Some(Listing::Loop) => Some(t.looped.into()),
-                    Some(Listing::Stuck) => Some(t.stuck.into()),
+                    Some(Listing::Loop) => Some(beside(t.looped, self.displayed_path(&b.dir))),
+                    Some(Listing::Stuck) => Some(beside(t.stuck, self.displayed_path(&b.dir))),
                     Some(Listing::TooManyStuck) => Some(t.too_many.into()),
                     Some(Listing::Read {
                         capped: Some(Cap::Folders),
@@ -1370,6 +1433,12 @@ impl Chooser {
         let row = Row::new(path, self.home.as_deref(), String::new(), Fact::Unknown);
         self.failed(start_failed_text(self.lang, &row, gone));
     }
+}
+
+/// A message about a folder: its words, then the folder after a tab, which the view shows in a label of its own. The
+/// folder is display text, so it holds no tab of its own.
+fn beside(words: &str, folder: String) -> String {
+    format!("{words}\t{folder}")
 }
 
 fn limited(listing: Option<&Listing>) -> bool {

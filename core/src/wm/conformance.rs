@@ -185,20 +185,6 @@ pub fn project_list_focus_and_close(win: WinId, rows: Vec<crate::project_chooser
             Some(ProjectEvent::Rows { win, serial: 5, rows }),
         ),
         (
-            "project_path_answers_the_request",
-            ProjectOp::Path {
-                win,
-                serial: 6,
-                text: "./other".into(),
-                base: "/work/current".into(),
-            },
-            Some(ProjectEvent::PathAnswer {
-                win,
-                serial: 6,
-                answer: crate::project_chooser::PathAnswer::Stuck,
-            }),
-        ),
-        (
             "project_folder_dialog_answers_its_window",
             ProjectOp::FolderDialog { win, at: None },
             Some(ProjectEvent::Folder { win, path: None }),

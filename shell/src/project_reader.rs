@@ -1476,57 +1476,62 @@ mod tests {
         }
     }
 
-    /// Answers reach the main loop through a channel a `spawn_future_local` future awaits, and the carriers' timers
-    /// are one-shot. The typed path's poll is the one repeating timer left.
+    /// Answers reach the main loop through a channel a `spawn_future_local` future awaits, and every timer in the
+    /// carriers is one-shot: neither carrier keeps a repeating poll.
     #[test]
     fn answers_reach_the_loop_through_spawn_future_local() {
-        use eitri_core::source_scan::{code_only, functions, read_required, without};
-        let host = code_only(&read_required("shell/src/project_host.rs").text);
-        let host = &host[..host.find("mod tests").expect("the test module")];
-        let [poll] = functions(host, "arm")[..] else {
-            panic!("one poll for the typed path");
+        use eitri_core::source_scan::{code_only, functions, read_required};
+        let compact = |code: &str| code.chars().filter(|c| !c.is_whitespace()).collect::<String>();
+        let carrier_of = |path: &str| {
+            let code = code_only(&read_required(path).text);
+            code[..code.find("mod tests").expect("the test module")].to_owned()
         };
-        let rest = without(host, &[poll]);
-        for banned in ["timeout_add_local(", "try_iter(", "try_recv("] {
-            assert!(!rest.contains(banned), "{banned} outside the typed path's poll");
+        let host = carrier_of("shell/src/project_host.rs");
+        let launch = carrier_of("shell/src/choose_project.rs");
+        for (path, carrier) in [
+            ("shell/src/project_host.rs", &host),
+            ("shell/src/choose_project.rs", &launch),
+        ] {
+            let carrier = compact(carrier);
+            for banned in ["timeout_add_local(", "try_iter(", "try_recv(", "POLL_EVERY"] {
+                assert!(!carrier.contains(banned), "{banned} in {path}");
+            }
         }
-        let [listen] = functions(host, "listen")[..] else {
+        let [listen] = functions(&host, "listen")[..] else {
             panic!("one listen");
         };
+        let listen = compact(listen);
         assert!(listen.contains("glib::spawn_future_local") && listen.contains(".recv().await"));
         for name in ["list", "open_with"] {
-            let [body] = functions(host, name)[..] else {
+            let [body] = functions(&host, name)[..] else {
                 panic!("one {name}");
             };
+            let body = compact(body);
             assert!(body.contains("unbounded_send(") && body.contains("listen("), "{name}");
-            assert!(!body.contains("arm("), "{name} needs no poll");
         }
-        let [start] = functions(host, "start_read")[..] else {
+        let [start] = functions(&host, "start_read")[..] else {
             panic!("one start_read");
         };
+        let start = compact(start);
         assert!(start.contains(".request(") && start.contains("listen("));
         assert!(
             start.contains("timeout_add_local_once(READ_SLOW") && start.contains("timeout_add_local_once(READ_STUCK")
         );
-        let [read] = functions(host, "read")[..] else {
+        let [read] = functions(&host, "read")[..] else {
             panic!("one read");
         };
-        assert!(read.contains("timeout_add_local_once(READ_DEBOUNCE"));
+        assert!(compact(read).contains("timeout_add_local_once(READ_DEBOUNCE"));
 
-        let launch = code_only(&read_required("shell/src/choose_project.rs").text);
-        let launch = &launch[..launch.find("mod tests").expect("the test module")];
-        for banned in ["timeout_add_local(", "try_recv(", "POLL_EVERY"] {
-            assert!(!launch.contains(banned), "{banned} in the launch window's carrier");
-        }
-        let [start] = functions(launch, "start")[..] else {
+        let [start] = functions(&launch, "start")[..] else {
             panic!("one start");
         };
+        let start = compact(start);
         assert!(
             start.contains("glib::spawn_future_local") && start.contains(".recv().await"),
             "the child's exit"
         );
         assert!(
-            launch.contains("self.workers.read("),
+            compact(&launch).contains("self.workers.read("),
             "the launch window's reads go to the reader"
         );
     }
