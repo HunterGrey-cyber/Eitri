@@ -1675,10 +1675,13 @@ impl NeovideEditorPane {
                             ..Default::default()
                         },
                     );
+                    // Top row first in the buffer, so the child needs no buffer transform: the viewport crops a buffer
+                    // larger than the frame, and Hyprland 0.56 shows a flipped buffer as if it cropped before it
+                    // transformed: the frame sat shifted up by the buffer's spare rows.
                     let surface = surfaces::wrap_backend_render_target(
                         &mut state.gr_context,
                         &target,
-                        SurfaceOrigin::BottomLeft,
+                        SurfaceOrigin::TopLeft,
                         skia_safe::ColorType::RGBA8888,
                         None,
                         None,

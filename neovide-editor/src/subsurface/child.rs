@@ -2,8 +2,8 @@
 
 use wayland_client::{
     protocol::{
-        wl_buffer::WlBuffer, wl_callback::WlCallback, wl_compositor::WlCompositor, wl_output::Transform,
-        wl_region::WlRegion, wl_subcompositor::WlSubcompositor, wl_subsurface::WlSubsurface, wl_surface::WlSurface,
+        wl_buffer::WlBuffer, wl_callback::WlCallback, wl_compositor::WlCompositor, wl_region::WlRegion,
+        wl_subcompositor::WlSubcompositor, wl_subsurface::WlSubsurface, wl_surface::WlSurface,
     },
     Dispatch, Proxy, QueueHandle,
 };
@@ -26,7 +26,6 @@ pub(crate) trait ChildRequests {
     fn place_below(&mut self, parent: &WlSurface);
     fn set_input_region_empty(&mut self) -> bool;
     fn set_opaque_region_all(&mut self) -> bool;
-    fn set_buffer_transform_flipped(&mut self);
     fn set_sync(&mut self);
     fn set_desync(&mut self);
     fn set_position(&mut self, x: i32, y: i32);
@@ -152,12 +151,6 @@ where
         region.destroy();
         true
     }
-    fn set_buffer_transform_flipped(&mut self) {
-        // GL stores the image bottom row first. This flip leaves viewport coordinates at the content's top left.
-        if let Some(surface) = self.surface() {
-            surface.set_buffer_transform(Transform::Flipped180);
-        }
-    }
     fn set_sync(&mut self) {
         if let Some(subsurface) = self.subsurface() {
             subsurface.set_sync();
@@ -282,8 +275,9 @@ impl<R: ChildRequests> Child<R> {
             requests.place_below(parent);
             ready = requests.set_input_region_empty();
         }
+        // No buffer transform: the frame is rendered top row first (`SurfaceOrigin::TopLeft`), so the viewport's source
+        // rectangle names the same pixels whichever order a compositor applies a transform and a crop in.
         if ready {
-            requests.set_buffer_transform_flipped();
             ready = !chosen.opaque_region_needed || requests.set_opaque_region_all();
         }
         if ready {
@@ -459,7 +453,6 @@ mod tests {
         PlaceBelow,
         EmptyInput,
         Opaque(i32, i32, i32, i32),
-        Flip,
         Sync,
         Desync,
         Position(i32, i32),
@@ -506,9 +499,6 @@ mod tests {
         fn set_opaque_region_all(&mut self) -> bool {
             self.sent.borrow_mut().push(Opaque(0, 0, i32::MAX, i32::MAX));
             true
-        }
-        fn set_buffer_transform_flipped(&mut self) {
-            self.sent.borrow_mut().push(Flip);
         }
         fn set_sync(&mut self) {
             self.sent.borrow_mut().push(Sync);
@@ -707,7 +697,7 @@ mod tests {
     }
 
     #[test]
-    fn creation_places_below_flips_and_has_an_empty_input_region_and_desync() {
+    fn creation_places_below_sets_no_transform_and_has_an_empty_input_region_and_desync() {
         let o = Objects::new();
         let child = setup(&o, true, false, true);
         assert!(child.is_ready());
@@ -719,7 +709,6 @@ mod tests {
                 GetSubsurface,
                 PlaceBelow,
                 EmptyInput,
-                Flip,
                 GetViewport,
                 Desync
             ]
@@ -898,7 +887,6 @@ mod tests {
                 GetSubsurface,
                 PlaceBelow,
                 EmptyInput,
-                Flip,
                 Opaque(0, 0, i32::MAX, i32::MAX),
                 GetViewport,
                 Desync
@@ -1101,7 +1089,6 @@ mod tests {
         requests.place_below(&o.parent);
         assert!(!requests.set_input_region_empty());
         assert!(!requests.set_opaque_region_all());
-        requests.set_buffer_transform_flipped();
         requests.set_source(0, 0, 10, 10);
         requests.set_destination(10, 10);
         requests.set_buffer_scale(1);
