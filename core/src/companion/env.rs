@@ -4,6 +4,7 @@
 //! every host that starts children uses the same lists.
 
 use std::ffi::{OsStr, OsString};
+use std::os::unix::ffi::OsStrExt;
 
 /// What a panel started by nvim's `jobstart` inherits from that nvim. Left in this process's
 /// environment, every sidecar and every agent tool command would inherit `$NVIM` and could drive the
@@ -47,6 +48,39 @@ pub const OPEN_SOCKET_ENV: &str = "EITRI_OPEN_SOCKET";
 /// Eitri started from such a terminal -- the sidecar and each agent tool, its own shells -- could open
 /// files in the window that holds that terminal.
 pub const SET_ON_THE_TERMINAL_CHILD: [&str; 1] = [OPEN_SOCKET_ENV];
+
+/// The prefix of every variable the pinned Neovide fork's command line reads (`NEOVIDE_SERVER`, `NEOVIDE_FORK`,
+/// `NEOVIDE_CHDIR`, `NEOVIDE_NO_MULTIGRID`, `NEOVIDE_VSYNC`, ...; about thirty, each also a flag) and its
+/// configuration path (`NEOVIDE_CONFIG`). They belong to a person's Neovide, not to Eitri's embedded editor.
+const NEOVIDE_ENV_PREFIX: &[u8] = b"NEOVIDE_";
+
+/// The `NEOVIDE_`-prefixed variables that are Eitri's own debug switches, read by `neovide-editor`'s keyboard
+/// path (`NEOVIDE_EDITOR_LOG_IME`, `NEOVIDE_EDITOR_LOG_KEYS`): the one place the prefix means Eitri. They stay.
+pub const NEOVIDE_ENV_OF_EITRI: [&str; 2] = ["NEOVIDE_EDITOR_LOG_IME", "NEOVIDE_EDITOR_LOG_KEYS"];
+
+/// Whether `name` is a variable meant for a person's Neovide that this process must not obey: it starts with
+/// `NEOVIDE_` (byte-wise, so a name that is not UTF-8 counts) and is not one of [`NEOVIDE_ENV_OF_EITRI`].
+///
+/// The embedded editor builds its settings through the fork's own command-line parser, which reads these
+/// from the process environment whatever arguments it is given. Left in place, `NEOVIDE_SERVER` makes every
+/// editor attach to that server instead of starting its own nvim (and close it, or the process it names,
+/// when the window ends), and `NEOVIDE_FORK`, `NEOVIDE_CHDIR`, `NEOVIDE_NO_MULTIGRID` or `NEOVIDE_VSYNC`
+/// change the editor in ways nothing here expects. Eitri's own settings are `eitri.config`, so none of them
+/// has a meaning for it.
+pub fn is_neovide_env(name: &OsStr) -> bool {
+    name.as_bytes().starts_with(NEOVIDE_ENV_PREFIX) && !NEOVIDE_ENV_OF_EITRI.iter().any(|own| name == *own)
+}
+
+/// Every name in `names` (a process's environment) for which [`is_neovide_env`] holds, each once.
+pub fn neovide_env_names(names: impl Iterator<Item = OsString>) -> Vec<OsString> {
+    let mut found: Vec<OsString> = Vec::new();
+    for name in names {
+        if is_neovide_env(&name) && !found.contains(&name) {
+            found.push(name);
+        }
+    }
+    found
+}
 
 /// The `TMUX`/`TMUX_PANE` pair a window's nvim child gets for the pane-switch shim, recognised by
 /// `TMUX`'s socket field (tmux's own `<socket>,<pid>,<session>` shape, the socket possibly holding a
@@ -110,15 +144,21 @@ pub fn split_scrub_names(get: &dyn Fn(&str) -> Option<OsString>) -> Vec<&'static
 /// embedded nvim -- would inherit it in turn and could drive the outer editor over RPC. When that
 /// nvim is another window's, it also carries that window's socket variables
 /// ([`SET_ON_THE_NVIM_CHILD`]) and the shim's `TMUX`; from a bottom terminal, it inherits
-/// [`OPEN_SOCKET_ENV`]. Nothing after this call reads any of them, so they are removed from this
-/// process. `main` calls this before any thread or child exists.
+/// [`OPEN_SOCKET_ENV`]. Whatever Neovide variables a person's shell exports ([`is_neovide_env`]) are
+/// removed too, since the fork's parser would obey them. Nothing after this call reads any of them, so they
+/// are removed from this process. `main` calls this before any thread or child exists.
 pub fn drop_inherited_editor_env() {
     let names = inherited_editor_env(&|name| std::env::var_os(name));
-    scrub(&names, &|name| {
+    let neovide = neovide_env_names(std::env::vars_os().map(|(name, _)| name));
+    let remove = |name: &OsStr| {
         // SAFETY: `main` calls this on its only thread, before GTK, the backend check, the nvim probe or
         // any child has started, so nothing else can be reading the environment.
         unsafe { std::env::remove_var(name) }
-    });
+    };
+    scrub(&names, &|name| remove(OsStr::new(name)));
+    for name in &neovide {
+        remove(name);
+    }
 }
 
 #[cfg(test)]
@@ -259,5 +299,72 @@ mod tests {
             scrub(names, &|name| seen.borrow_mut().push(name.to_string()));
             assert_eq!(seen.into_inner(), names.to_vec());
         }
+    }
+
+    #[test]
+    fn every_variable_the_forks_command_line_reads_is_a_neovide_variable_to_drop() {
+        // The names the pinned fork's parser reads (`cmd_line.rs` at the pinned rev), as `env = "..."`.
+        for name in [
+            "NEOVIDE_SERVER",
+            "NEOVIDE_FORK",
+            "NEOVIDE_CHDIR",
+            "NEOVIDE_NO_MULTIGRID",
+            "NEOVIDE_VSYNC",
+            "NEOVIDE_SRGB",
+            "NEOVIDE_FRAME",
+            "NEOVIDE_WSL",
+            "NEOVIDE_IDLE",
+            "NEOVIDE_GRID",
+            "NEOVIDE_SIZE",
+            "NEOVIDE_MAXIMIZED",
+            "NEOVIDE_TABS",
+            "NEOVIDE_OPENGL",
+            "NEOVIDE_APP_ID",
+            "NEOVIDE_ICON",
+            "NEOVIDE_SYSTEM_QUIT_HOTKEY",
+            "NEOVIDE_CONFIG",
+            "NEOVIDE_FORKED_FROM_TTY",
+            "NEOVIDE_BACKTRACES",
+        ] {
+            assert!(is_neovide_env(OsStr::new(name)), "{name}");
+        }
+    }
+
+    #[test]
+    fn only_the_neovide_prefix_counts_and_eitris_own_debug_switches_stay() {
+        for name in [
+            "NEOVIDEX",
+            "NEOVIDE",
+            "XNEOVIDE_SERVER",
+            "neovide_server",
+            "NEOVIM_BIN",
+            "EITRI_NEOVIDE",
+            "HOME",
+        ] {
+            assert!(!is_neovide_env(OsStr::new(name)), "{name}");
+        }
+        for name in NEOVIDE_ENV_OF_EITRI {
+            assert!(!is_neovide_env(OsStr::new(name)), "{name}");
+        }
+        // Only those two names: a longer one with the same stem is Neovide's namespace again.
+        assert!(is_neovide_env(OsStr::new("NEOVIDE_EDITOR_LOG_KEYS_X")));
+        assert!(is_neovide_env(OsStr::new("NEOVIDE_EDITOR")));
+    }
+
+    #[test]
+    fn a_name_that_is_not_utf8_is_dropped_and_each_name_is_listed_once() {
+        use std::os::unix::ffi::OsStringExt;
+        let odd = OsString::from_vec(b"NEOVIDE_\xff".to_vec());
+        let found = neovide_env_names(
+            [
+                odd.clone(),
+                OsString::from("NEOVIDE_SERVER"),
+                OsString::from("PATH"),
+                OsString::from("NEOVIDE_SERVER"),
+                OsString::from("NEOVIDE_EDITOR_LOG_IME"),
+            ]
+            .into_iter(),
+        );
+        assert_eq!(found, [odd, OsString::from("NEOVIDE_SERVER")]);
     }
 }

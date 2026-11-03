@@ -12,7 +12,7 @@ use std::os::fd::{AsRawFd, IntoRawFd, RawFd};
 use std::os::unix::ffi::OsStrExt;
 use std::path::{Path, PathBuf};
 
-use eitri_core::companion::env::SET_ON_THE_NVIM_CHILD;
+use eitri_core::companion::env::{is_neovide_env, SET_ON_THE_NVIM_CHILD};
 use eitri_core::project_root::{resolve_in, select_root_source, RootSource};
 use eitri_core::split::NEOVIDE_ENV_REMOVED;
 
@@ -25,7 +25,8 @@ const NVIM_SOCKET: &str = "n.sock";
 /// The variables this process must not hand on to Neovide, to its nvim, or to anything either starts, among
 /// `vars` (the process's environment): only names that are present in it are returned, each once.
 ///
-/// - Everything Neovide's own start reads (`NEOVIDE_*`, byte-wise, so a name that is not UTF-8 counts) and
+/// - Everything Neovide's own start reads (`NEOVIDE_*`, byte-wise, so a name that is not UTF-8 counts;
+///   `eitri_core::companion::env::is_neovide_env`, the rule the Linux window applies too) and
 ///   what `eitri split` removes from its Neovide: an outer editor's address, and `TMUX`/`TMUX_PANE`, since
 ///   Neovide is never inside tmux and an nvim that believes it is leaves `Ctrl+h/j/k/l` to tmux.
 /// - What a window of Eitri sets on its own nvim child alone: when present here it came from another
@@ -44,14 +45,13 @@ pub fn neovide_vars_to_remove(vars: impl Iterator<Item = (OsString, OsString)>) 
     let started_by_an_editor = names.iter().any(|name| name == "NVIM");
     let mut removed: Vec<OsString> = Vec::new();
     for name in names {
-        let bytes = name.as_bytes();
         let listed = NEOVIDE_ENV_REMOVED
             .iter()
             .chain(&SET_ON_THE_NVIM_CHILD)
             .any(|listed| name == *listed);
         let runtime = started_by_an_editor && ["MYVIMRC", "VIMRUNTIME", "VIM"].iter().any(|n| name == *n);
         let tmpdir = relative_tmpdir && name == "TMPDIR";
-        if (listed || bytes.starts_with(b"NEOVIDE_") || runtime || tmpdir) && !removed.contains(&name) {
+        if (listed || is_neovide_env(&name) || runtime || tmpdir) && !removed.contains(&name) {
             removed.push(name);
         }
     }
@@ -513,6 +513,7 @@ mod tests {
             ("VIMRUNTIME", "/opt/nvim/share"),
             ("HOME", "/Users/u"),
             ("NEOVIDEX", "kept"),
+            ("NEOVIDE_EDITOR_LOG_KEYS", "1"),
         ];
         let removed = neovide_vars_to_remove(vars(&all));
         for name in [
@@ -529,7 +530,10 @@ mod tests {
             assert!(removed.contains(&OsString::from(name)), "{name}");
         }
         assert!(!removed.contains(&OsString::from("HOME")));
-        assert!(!removed.contains(&OsString::from("NEOVIDEX"))); // only the NEOVIDE_ prefix
+        // Only the NEOVIDE_ prefix counts, and Eitri's own debug switch, which the editor's keyboard path reads,
+        // is not a Neovide setting.
+        assert!(!removed.contains(&OsString::from("NEOVIDEX")));
+        assert!(!removed.contains(&OsString::from("NEOVIDE_EDITOR_LOG_KEYS")));
     }
 
     #[test]
