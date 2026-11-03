@@ -20,8 +20,8 @@ use eitri_core::agent_bridge::{parse_inbound_message, InboundMessage, SessionMod
 use eitri_core::editor_rpc::EditorRpc;
 use eitri_core::nvim_rpc::{Answer, Pending};
 use eitri_core::review_editor::{
-    editor_event_to_wire, parse_revert_event, EventKind, Owner, RemoteOverlay, CLEAR_LUA, OPEN_AND_SHOW_LUA,
-    REVIEW_LUA, SHOW_LUA, TAKE_EVENTS_LUA,
+    editor_event_to_wire, parse_revert_event, EventKind, Owner, RemoteOverlay, CLEAR_LUA, LIVE_CLEAR_LUA,
+    LIVE_SHOWN_LUA, LIVE_SHOW_LUA, OPEN_AND_SHOW_LUA, REVIEW_LUA, SHOW_LUA, TAKE_EVENTS_LUA,
 };
 use eitri_core::tab_set::{TabBackend, TabSet};
 use eitri_core::tabs::TabId;
@@ -1569,6 +1569,13 @@ struct ScriptedEditor {
     target: Cell<Option<u64>>,
     /// What the editor says when it opens a file.
     opened: RefCell<Value>,
+    /// Files no window shows, as the shown question is answered.
+    hidden: RefCell<Vec<PathBuf>>,
+    /// A live drawing finds an overlay it may not replace, and leaves it.
+    left: Cell<bool>,
+    /// Calls whose answers wait in `held` until [`ScriptedEditor::release`].
+    hold: RefCell<Vec<&'static str>>,
+    held: RefCell<Vec<(Answer, Value)>>,
 }
 
 fn vmap(pairs: Vec<(&str, Value)>) -> Value {
@@ -1587,6 +1594,17 @@ impl ScriptedEditor {
                 ("skipped", Value::from(0)),
                 ("active", Value::from(1)),
             ])),
+            hidden: RefCell::new(Vec::new()),
+            left: Cell::new(false),
+            hold: RefCell::new(Vec::new()),
+            held: RefCell::new(Vec::new()),
+        }
+    }
+
+    /// Gives every held answer, in the order the calls came.
+    fn release(&self) {
+        for (reply, answer) in self.held.borrow_mut().drain(..) {
+            reply.send(Ok(answer));
         }
     }
 
@@ -1617,7 +1635,7 @@ impl ScriptedEditor {
 
 impl EditorRpc for ScriptedEditor {
     fn exec_lua(&self, code: &'static str, args: Vec<Value>) -> Pending {
-        self.asked.borrow_mut().push((code, args));
+        self.asked.borrow_mut().push((code, args.clone()));
         let answer = if code == REVIEW_LUA {
             vmap(vec![("installed", Value::from(true)), ("replaced", Value::from(false))])
         } else if code == OPEN_AND_SHOW_LUA {
@@ -1629,11 +1647,47 @@ impl EditorRpc for ScriptedEditor {
         } else if code == TAKE_EVENTS_LUA {
             let events: Vec<Value> = self.events.borrow_mut().drain(..).collect();
             vmap(vec![("events", Value::Array(events)), ("active", Value::from(1))])
+        } else if code == LIVE_SHOWN_LUA {
+            let hidden = self.hidden.borrow();
+            let shown = match &args[0] {
+                Value::Array(paths) => paths
+                    .iter()
+                    .map(|path| {
+                        let bytes = path.as_slice().unwrap_or_default();
+                        Value::from(!hidden.iter().any(|h| h.as_os_str().as_encoded_bytes() == bytes))
+                    })
+                    .collect(),
+                _ => Vec::new(),
+            };
+            vmap(vec![("shown", Value::Array(shown))])
+        } else if code == LIVE_SHOW_LUA {
+            let hunks = args[2].as_array().map_or(0, Vec::len) as u64;
+            let left = self.left.get();
+            vmap(vec![
+                ("drawn", Value::from(if left { 0 } else { hunks })),
+                ("shown", Value::from(true)),
+                ("left", Value::from(left)),
+                ("skipped", Value::from(0)),
+                ("active", Value::from(1)),
+                ("pending", Value::from(0)),
+                ("live_only", Value::from(!left)),
+            ])
+        } else if code == LIVE_CLEAR_LUA {
+            vmap(vec![
+                ("cleared", Value::from(true)),
+                ("active", Value::from(0)),
+                ("pending", Value::from(0)),
+                ("live_only", Value::from(false)),
+            ])
         } else {
             Value::Nil
         };
         let (reply, pending) = Pending::pair();
-        reply.send(Ok(answer));
+        if self.hold.borrow().contains(&code) {
+            self.held.borrow_mut().push((reply, answer));
+        } else {
+            reply.send(Ok(answer));
+        }
         pending
     }
 
@@ -2536,4 +2590,864 @@ fn an_editor_revert_from_window_1_finds_its_tab_by_session_not_by_number() {
         "recorded in the tab that holds the session"
     );
     f.shut_down();
+}
+
+// ---- live drawings ---------------------------------------------------------------------------------
+
+/// The agent's edits drawn over the file as they land, and again from the snapshots when the turn
+/// ends. Every clock here is frozen unless a test moves it, so no limit runs out on a slow machine.
+mod live_review {
+    use super::*;
+    use eitri_core::turn_review::flow::LiveAsk;
+    use eitri_core::turn_review::live_contest::TurnKey;
+    use std::collections::BTreeMap;
+
+    /// A window with review.live on and its editor embedded.
+    fn live(name: &str) -> Fixture {
+        let mut f = Fixture::new(name);
+        f.tabs.set_live_edits(true);
+        embedded(&mut f);
+        f
+    }
+
+    /// A second tab of the window, holding `session`.
+    fn second_tab(f: &mut Fixture, session: &str) -> (TabId, Arc<RecordingProvider>) {
+        let tab = f.tabs.open(eitri_core::tab_set::AgentId::Claude);
+        let (provider, backend) = live_backend(&f.project);
+        f.tabs.get_mut(tab).unwrap().set_backend(TabBackend::Live(backend));
+        provider.open_session(session, &f.project);
+        until("the second session", || {
+            f.pump();
+            f.tabs.get(tab).unwrap().provider_session_id().as_deref() == Some(session)
+        });
+        (tab, provider)
+    }
+
+    fn record(f: &Fixture, session: &str, turn_id: &str) -> Option<eitri_core::turn_review::TurnRecord> {
+        f.tabs
+            .turn_review()
+            .unwrap()
+            .turns(session)
+            .into_iter()
+            .find(|r| r.turn_id == turn_id)
+    }
+
+    /// Starts `turn_id` of `session` and waits for its base.
+    fn begin(f: &mut Fixture, provider: &RecordingProvider, session: &str, turn_id: &str) -> u32 {
+        provider.queue(AgentDomainEvent::TurnStarted {
+            turn_id: turn_id.to_owned(),
+        });
+        until("the turn's base", || {
+            f.pump();
+            record(f, session, turn_id).is_some_and(|r| matches!(r.base, Snap::Taken { .. }))
+        });
+        record(f, session, turn_id).unwrap().n
+    }
+
+    /// Ends `turn_id` of `session` and waits for its end snapshot.
+    fn finish(f: &mut Fixture, provider: &RecordingProvider, session: &str, turn_id: &str) {
+        provider.queue(AgentDomainEvent::TurnCompleted {
+            turn_id: turn_id.to_owned(),
+            outcome: TurnOutcome::Completed,
+            result_text: String::new(),
+            stop_reason: None,
+            usage: None,
+            detail: Default::default(),
+        });
+        until("the turn's end", || {
+            f.pump();
+            record(f, session, turn_id).is_some_and(|r| matches!(r.end, Snap::Taken { .. }))
+        });
+    }
+
+    /// Writes `bytes` to `rel` and reports it as `tab`'s completed `Edit` in `turn_id`; waits until
+    /// the pump has read the call's end.
+    fn edit_by(f: &mut Fixture, tab: TabId, provider: &RecordingProvider, turn_id: &str, rel: &str, bytes: &[u8]) {
+        f.write(rel, bytes, 0o644);
+        let id = format!("edit-{}", uuid::Uuid::new_v4().simple());
+        provider.queue_all(vec![
+            AgentDomainEvent::ToolCallStarted {
+                turn_id: turn_id.to_owned(),
+                tool_use_id: id.clone(),
+                name: "Edit".to_owned(),
+                input: json!({"file_path": f.file(rel).to_str().unwrap()}),
+            },
+            AgentDomainEvent::ToolCallCompleted {
+                turn_id: turn_id.to_owned(),
+                tool_use_id: id.clone(),
+                content: json!("ok"),
+                is_error: false,
+            },
+        ]);
+        until("the edit's end", || {
+            f.pump();
+            f.tabs.get(tab).and_then(|t| t.live()).is_some_and(|b| {
+                b.projection()
+                    .tool_calls
+                    .iter()
+                    .any(|c| c.tool_use_id == id && c.result.is_some())
+            })
+        });
+    }
+
+    /// The fixture's own tab's edit in its running turn.
+    fn edit(f: &mut Fixture, rel: &str, bytes: &[u8]) {
+        let (tab, provider, turn) = (f.tab, f.provider.clone(), format!("t{}", f.turns));
+        edit_by(f, tab, &provider, &turn, rel, bytes);
+    }
+
+    /// One pump, one live tick and one tick of the flow, all at `at`.
+    fn step(f: &mut Fixture, rpc: Option<&dyn EditorRpc>, at: Instant) -> Vec<Out> {
+        f.pump();
+        f.flow.live_tick(&mut f.tabs, rpc, at);
+        f.flow.tick(&mut f.tabs, rpc, at)
+    }
+
+    /// Steps at `at` until `done` holds; returns what the flow's ticks gave meanwhile.
+    fn live_until(
+        f: &mut Fixture,
+        editor: &ScriptedEditor,
+        at: Instant,
+        what: &str,
+        done: impl Fn(&Fixture, &ScriptedEditor) -> bool,
+    ) -> Vec<Out> {
+        let mut all = Vec::new();
+        let deadline = Instant::now() + Duration::from_secs(20);
+        loop {
+            all.extend(step(f, editor.rpc(), at));
+            if done(f, editor) {
+                return all;
+            }
+            assert!(Instant::now() < deadline, "timed out waiting for {what}");
+            std::thread::sleep(Duration::from_millis(5));
+        }
+    }
+
+    /// Steps at `at` until the window has no live work left.
+    fn live_settled(f: &mut Fixture, editor: &ScriptedEditor, at: Instant) {
+        live_until(f, editor, at, "the live drawings to settle", |f, _| {
+            f.flow.live_is_idle()
+        });
+        // And a few more, so anything those last steps queued has gone out and been answered.
+        for _ in 0..10 {
+            step(f, editor.rpc(), at);
+            std::thread::sleep(Duration::from_millis(5));
+        }
+    }
+
+    fn bytes_of(value: &Value) -> Vec<u8> {
+        value.as_slice().expect("a path travels as bytes").to_vec()
+    }
+
+    fn path_bytes(path: &Path) -> Vec<u8> {
+        path.as_os_str().as_encoded_bytes().to_vec()
+    }
+
+    fn meta_field(args: &[Value], name: &str) -> Value {
+        args[1]
+            .as_map()
+            .expect("the meta is a map")
+            .iter()
+            .find(|(k, _)| k.as_str() == Some(name))
+            .unwrap_or_else(|| panic!("the meta has no {name}"))
+            .1
+            .clone()
+    }
+
+    /// Every live draw sent, as (path, turn id, running).
+    fn live_shows(editor: &ScriptedEditor) -> Vec<(Vec<u8>, String, bool)> {
+        (0..editor.count(LIVE_SHOW_LUA))
+            .map(|i| {
+                let args = editor.args(LIVE_SHOW_LUA, i);
+                (
+                    bytes_of(&args[0]),
+                    meta_field(&args, "turn_id").as_str().unwrap().to_owned(),
+                    meta_field(&args, "running").as_bool().unwrap(),
+                )
+            })
+            .collect()
+    }
+
+    fn live_clears(editor: &ScriptedEditor) -> Vec<Vec<u8>> {
+        (0..editor.count(LIVE_CLEAR_LUA))
+            .map(|i| bytes_of(&editor.args(LIVE_CLEAR_LUA, i)[0]))
+            .collect()
+    }
+
+    fn panel_hunks(f: &Fixture, session: &str, turn: u32, rel: &str) -> Vec<eitri_core::turn_review::ExactHunk> {
+        f.tabs
+            .turn_review()
+            .unwrap()
+            .exact_hunks_job(session, turn, Scope::Turn, rel)
+            .run()
+            .unwrap()
+            .hunks
+            .unwrap()
+    }
+
+    const FOUR: &[u8] = b"one\ntwo\nthree\nfour\n";
+    const FOUR_EDITED: &[u8] = b"one\nTWO\nthree\nfour\n";
+
+    #[test]
+    fn an_edit_of_a_shown_file_is_drawn_live() {
+        let mut f = live("live-drawn");
+        f.write("a.txt", FOUR, 0o644);
+        f.start_turn();
+        let editor = ScriptedEditor::new();
+        edit(&mut f, "a.txt", FOUR_EDITED);
+        let at = Instant::now();
+        live_until(&mut f, &editor, at, "the live drawing", |_, e| {
+            e.count(LIVE_SHOW_LUA) == 1
+        });
+
+        assert_eq!(editor.count(LIVE_SHOWN_LUA), 1, "asked once whether the file is shown");
+        let asked = editor.args(LIVE_SHOWN_LUA, 0);
+        let asked: Vec<Vec<u8>> = asked[0].as_array().unwrap().iter().map(bytes_of).collect();
+        assert_eq!(asked, vec![path_bytes(&f.file("a.txt"))]);
+        let args = editor.args(LIVE_SHOW_LUA, 0);
+        assert_eq!(bytes_of(&args[0]), path_bytes(&f.file("a.txt")));
+        assert_eq!(meta_field(&args, "running"), Value::from(true), "the turn still runs");
+        assert_eq!(meta_field(&args, "session"), Value::from(SESSION));
+        assert_eq!(meta_field(&args, "turn_id"), Value::from("t1"));
+        assert_eq!(
+            meta_field(&args, "read_lines"),
+            Value::from(4),
+            "the lines the disk read held"
+        );
+        let hunks = args[2].as_array().unwrap();
+        assert_eq!(hunks.len(), 1);
+        assert_eq!(editor.count(REVIEW_LUA), 1, "the module is installed for the draw");
+        f.end_turn();
+        f.shut_down();
+    }
+
+    #[test]
+    fn an_edit_of_a_file_not_shown_runs_no_job() {
+        let mut f = live("live-hidden");
+        f.write("a.txt", FOUR, 0o644);
+        f.start_turn();
+        let editor = ScriptedEditor::new();
+        editor.hidden.borrow_mut().push(f.file("a.txt"));
+        edit(&mut f, "a.txt", FOUR_EDITED);
+        let at = Instant::now();
+        live_until(&mut f, &editor, at, "the shown question", |_, e| {
+            e.count(LIVE_SHOWN_LUA) == 1
+        });
+        for _ in 0..20 {
+            step(&mut f, editor.rpc(), at);
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        assert_eq!(f.flow.jobs_started(), 0, "no git work for a file nobody sees");
+
+        // Asked once more a little after the edit, in case following opened it meanwhile; then never.
+        let later = at + Duration::from_secs(2);
+        live_until(&mut f, &editor, later, "the second question", |_, e| {
+            e.count(LIVE_SHOWN_LUA) == 2
+        });
+        for _ in 0..20 {
+            step(&mut f, editor.rpc(), later);
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        assert_eq!(editor.count(LIVE_SHOWN_LUA), 2);
+        assert_eq!(f.flow.jobs_started(), 0);
+        assert_eq!(editor.count(LIVE_SHOW_LUA), 0);
+        assert_eq!(editor.count(REVIEW_LUA), 0, "nothing drawn, so nothing installed");
+        f.end_turn();
+        f.shut_down();
+    }
+
+    /// A turn that drew `a.txt` live and settled; returns its number.
+    fn settled_once(f: &mut Fixture, editor: &ScriptedEditor, at: Instant) -> u32 {
+        f.write("a.txt", FOUR, 0o644);
+        let n = f.start_turn();
+        edit(f, "a.txt", FOUR_EDITED);
+        live_until(f, editor, at, "the live drawing", |_, e| e.count(LIVE_SHOW_LUA) == 1);
+        f.end_turn();
+        live_until(f, editor, at, "the settle's drawing", |_, e| {
+            e.count(LIVE_SHOW_LUA) == 2
+        });
+        n
+    }
+
+    #[test]
+    fn the_settle_redraws_from_the_snapshots_with_the_panels_headers() {
+        let mut f = live("live-settle");
+        let editor = ScriptedEditor::new();
+        let at = Instant::now();
+        let n = settled_once(&mut f, &editor, at);
+        let args = editor.args(LIVE_SHOW_LUA, 1);
+        assert_eq!(meta_field(&args, "running"), Value::from(false), "the turn has ended");
+        assert_eq!(meta_field(&args, "turn"), Value::from(n));
+        assert_eq!(
+            meta_field(&args, "read_lines"),
+            Value::from(4),
+            "the end snapshot's lines"
+        );
+        let panel = panel_hunks(&f, SESSION, n, "a.txt");
+        let drawn = args[2].as_array().unwrap();
+        assert_eq!(drawn.len(), panel.len(), "the panel's hunks, from the snapshots");
+        let id_of = |hunk: &Value| {
+            hunk.as_map()
+                .unwrap()
+                .iter()
+                .find(|(k, _)| k.as_str() == Some("id"))
+                .unwrap()
+                .1
+                .clone()
+        };
+        let ids: Vec<Value> = drawn.iter().map(id_of).collect();
+        let panel_ids: Vec<Value> = panel.iter().map(|h| Value::from(h.id)).collect();
+        assert_eq!(ids, panel_ids);
+        f.shut_down();
+    }
+
+    #[test]
+    fn an_editor_revert_after_the_settle_lands_under_the_panels_header() {
+        let mut f = live("live-settle-revert");
+        let editor = ScriptedEditor::new();
+        let at = Instant::now();
+        let n = settled_once(&mut f, &editor, at);
+        // Let the settle's answer reach the flow.
+        for _ in 0..10 {
+            step(&mut f, editor.rpc(), at);
+        }
+        let panel = panel_hunks(&f, SESSION, n, "a.txt").remove(0);
+        assert_ne!(
+            panel.header, "@@ -2 +2 @@",
+            "the panel's header is not the one counts would give"
+        );
+        editor.queue_event(revert_event(&f, n, "a.txt", panel.id, 2, "two", "TWO", "lf"));
+        tick_until(&mut f, &editor, "the revert", |outs| {
+            shape(outs).iter().any(|w| w.starts_with("review_draft"))
+        });
+        let records = f.draft().reverts();
+        assert_eq!(records.len(), 1);
+        assert_eq!(records[0].new.hunk.as_ref().unwrap().1, panel.header);
+        f.shut_down();
+    }
+
+    #[test]
+    fn an_o_overlays_revert_keeps_its_header_after_a_settle_of_another_turn() {
+        let mut f = live("live-keeps-o");
+        let editor = ScriptedEditor::new();
+        let at = Instant::now();
+        f.write(
+            "a.txt",
+            b"one\ntwo\nthree\nfour\nfive\nsix\nseven\neight\nnine\n",
+            0o644,
+        );
+        let first = f.turn(|f| {
+            f.write(
+                "a.txt",
+                b"one\nTWO\nthree\nfour\nfive\nsix\nseven\neight\nnine\n",
+                0o644,
+            )
+        });
+        f.run(editor.rpc(), "o1", open_in_editor("o1", f.tab, first, "a.txt"));
+        let panel = panel_hunks(&f, SESSION, first, "a.txt").remove(0);
+
+        // The `o` drawing is up, so every live drawing of the next turn leaves it.
+        editor.left.set(true);
+        let second = f.start_turn();
+        edit(
+            &mut f,
+            "a.txt",
+            b"one\nTWO\nthree\nfour\nfive\nsix\nseven\nEIGHT\nnine\n",
+        );
+        live_until(&mut f, &editor, at, "the live drawing", |_, e| {
+            e.count(LIVE_SHOW_LUA) == 1
+        });
+        f.end_turn();
+        live_until(&mut f, &editor, at, "the settle's drawing", |_, e| {
+            e.count(LIVE_SHOW_LUA) == 2
+        });
+        live_settled(&mut f, &editor, at);
+        let other = panel_hunks(&f, SESSION, second, "a.txt").remove(0);
+        assert_ne!(other.header, panel.header, "the two turns' hunks differ");
+
+        editor.queue_event(revert_event(&f, first, "a.txt", panel.id, 2, "two", "TWO", "lf"));
+        tick_until(&mut f, &editor, "the revert", |outs| {
+            shape(outs).iter().any(|w| w.starts_with("review_draft"))
+        });
+        let records = f.draft().reverts();
+        assert_eq!(records.len(), 1);
+        assert_eq!(
+            records[0].new.hunk.as_ref().unwrap().1,
+            panel.header,
+            "recorded under the header of the turn `o` drew"
+        );
+        f.shut_down();
+    }
+
+    #[test]
+    fn a_later_turn_of_another_tab_draws_after_both_ended() {
+        let mut f = live("live-later-turn");
+        let editor = ScriptedEditor::new();
+        let at = Instant::now();
+        f.write("a.txt", FOUR, 0o644);
+        let (other, provider) = second_tab(&mut f, "other-session");
+        let (me, mine) = (f.tab, f.provider.clone());
+        begin(&mut f, &mine, SESSION, "a1");
+        begin(&mut f, &provider, "other-session", "b1");
+        edit_by(&mut f, me, &mine, "a1", "a.txt", b"one\nTWO\nthree\nfour\n");
+        live_until(&mut f, &editor, at, "the first drawing", |_, e| {
+            e.count(LIVE_SHOW_LUA) == 1
+        });
+        edit_by(&mut f, other, &provider, "b1", "a.txt", b"one\nTWO\nTHREE\nfour\n");
+        live_until(&mut f, &editor, at, "the contest's clear", |_, e| {
+            e.count(LIVE_CLEAR_LUA) >= 1
+        });
+        finish(&mut f, &mine, SESSION, "a1");
+        finish(&mut f, &provider, "other-session", "b1");
+        live_settled(&mut f, &editor, at);
+        let before = editor.count(LIVE_SHOW_LUA);
+
+        begin(&mut f, &provider, "other-session", "b2");
+        edit_by(&mut f, other, &provider, "b2", "a.txt", b"one\nTWO\nTHREE\nFOUR\n");
+        live_until(&mut f, &editor, at, "the later turn's drawing", |_, e| {
+            e.count(LIVE_SHOW_LUA) > before
+        });
+        let (path, turn, running) = live_shows(&editor).pop().unwrap();
+        assert_eq!(path, path_bytes(&f.file("a.txt")));
+        assert_eq!(turn, "b2", "a turn neither of the two ends the contest");
+        assert!(running);
+        finish(&mut f, &provider, "other-session", "b2");
+        f.shut_down();
+    }
+
+    #[test]
+    fn a_contested_path_is_cleared_at_settle() {
+        let mut f = live("live-contested");
+        let editor = ScriptedEditor::new();
+        let at = Instant::now();
+        f.write("a.txt", FOUR, 0o644);
+        let (other, provider) = second_tab(&mut f, "other-session");
+        let (me, mine) = (f.tab, f.provider.clone());
+        begin(&mut f, &mine, SESSION, "a1");
+        begin(&mut f, &provider, "other-session", "b1");
+        edit_by(&mut f, me, &mine, "a1", "a.txt", b"one\nTWO\nthree\nfour\n");
+        live_until(&mut f, &editor, at, "the first drawing", |_, e| {
+            e.count(LIVE_SHOW_LUA) == 1
+        });
+
+        // The other tab's turn, running at the same time, edits the same file: neither draws it.
+        edit_by(&mut f, other, &provider, "b1", "a.txt", b"one\nTWO\nTHREE\nfour\n");
+        live_until(&mut f, &editor, at, "the contest's clear", |_, e| {
+            e.count(LIVE_CLEAR_LUA) >= 1
+        });
+        finish(&mut f, &mine, SESSION, "a1");
+        // The other turn still runs, so its live work goes on: the first turn settles meanwhile.
+        let first = TurnKey {
+            session: SESSION.to_owned(),
+            turn_id: "a1".to_owned(),
+        };
+        live_until(&mut f, &editor, at, "the first turn's settle", |f, _| {
+            !f.flow.live_follows(&first)
+        });
+        edit_by(&mut f, other, &provider, "b1", "a.txt", b"one\nTWO\nTHREE\nFOUR\n");
+        finish(&mut f, &provider, "other-session", "b1");
+        live_settled(&mut f, &editor, at);
+
+        let shows = live_shows(&editor);
+        assert_eq!(
+            shows,
+            vec![(path_bytes(&f.file("a.txt")), "a1".to_owned(), true)],
+            "only the first turn's drawing, before the file was contested"
+        );
+        assert!(
+            live_clears(&editor).iter().all(|p| *p == path_bytes(&f.file("a.txt"))),
+            "only the contested file is cleared"
+        );
+        assert!(f.flow.jobs_started() > 0, "the settles ran, and drew nothing");
+        f.shut_down();
+    }
+
+    /// A turn that changed `a.txt` and ended, then a running turn drawing its own edit of it live.
+    fn drawn_while_running(f: &mut Fixture, editor: &ScriptedEditor, at: Instant) -> (u32, u32) {
+        f.write(
+            "a.txt",
+            b"one\ntwo\nthree\nfour\nfive\nsix\nseven\neight\nnine\n",
+            0o644,
+        );
+        let first = f.turn(|f| {
+            f.write(
+                "a.txt",
+                b"one\nTWO\nthree\nfour\nfive\nsix\nseven\neight\nnine\n",
+                0o644,
+            )
+        });
+        let second = f.start_turn();
+        edit(f, "a.txt", b"one\nTWO\nthree\nfour\nfive\nsix\nseven\nEIGHT\nnine\n");
+        live_until(f, editor, at, "the live drawing", |_, e| e.count(LIVE_SHOW_LUA) == 1);
+        for _ in 0..10 {
+            step(f, editor.rpc(), at);
+        }
+        (first, second)
+    }
+
+    #[test]
+    fn panel_shows_leaves_a_live_drawing_of_another_turn() {
+        let mut f = live("live-panel-leaves");
+        let editor = ScriptedEditor::new();
+        let at = Instant::now();
+        let (first, _) = drawn_while_running(&mut f, &editor, at);
+        let jobs = f.flow.jobs_started();
+        f.flow.panel_shows(&f.tabs, f.tab, first, Scope::Turn, "a.txt");
+        assert_eq!(
+            f.flow.jobs_started(),
+            jobs,
+            "nothing is read for a file drawn live for another turn"
+        );
+        for _ in 0..20 {
+            step(&mut f, editor.rpc(), at);
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        assert_eq!(editor.count(SHOW_LUA), 0, "the live drawing stays");
+        f.end_turn();
+        f.shut_down();
+    }
+
+    #[test]
+    fn panel_shows_replaces_it_for_the_same_turn() {
+        let mut f = live("live-panel-replaces");
+        let editor = ScriptedEditor::new();
+        let at = Instant::now();
+        let n = settled_once(&mut f, &editor, at);
+        for _ in 0..10 {
+            step(&mut f, editor.rpc(), at);
+        }
+        // The same turn, seen in the session's scope: the panel's drawing replaces the live one.
+        let jobs = f.flow.jobs_started();
+        f.flow.panel_shows(&f.tabs, f.tab, n, Scope::Session, "a.txt");
+        assert_eq!(f.flow.jobs_started(), jobs + 1, "the panel's own turn is redrawn");
+        live_until(&mut f, &editor, at, "the panel's drawing", |_, e| {
+            e.count(SHOW_LUA) == 1
+        });
+        let args = editor.args(SHOW_LUA, 0);
+        assert_eq!(meta_field(&args, "turn"), Value::from(n));
+        assert_eq!(meta_field(&args, "scope"), Value::from("session"));
+        f.shut_down();
+    }
+
+    #[test]
+    fn panel_shows_of_the_running_turn_leaves_its_live_drawing() {
+        let mut f = live("live-panel-running");
+        let editor = ScriptedEditor::new();
+        let at = Instant::now();
+        let (_, second) = drawn_while_running(&mut f, &editor, at);
+        let before = editor.asked.borrow().len();
+        // The running turn has no end snapshot, so the panel has no hunks to draw in its place.
+        let jobs = f.flow.jobs_started();
+        f.flow.panel_shows(&f.tabs, f.tab, second, Scope::Turn, "a.txt");
+        assert_eq!(f.flow.jobs_started(), jobs + 1, "the panel's own turn is read");
+        for _ in 0..40 {
+            step(&mut f, editor.rpc(), at);
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        let after: Vec<&str> = editor.asked.borrow()[before..].iter().map(|(code, _)| *code).collect();
+        assert!(
+            !after
+                .iter()
+                .any(|code| [CLEAR_LUA, LIVE_CLEAR_LUA, SHOW_LUA].contains(code)),
+            "the live drawing is neither cleared nor replaced"
+        );
+        f.end_turn();
+        f.shut_down();
+    }
+
+    #[test]
+    fn panel_shows_of_another_turn_drops_an_older_redraw_of_the_file() {
+        let mut f = live("live-panel-drops");
+        let editor = ScriptedEditor::new();
+        let at = Instant::now();
+        f.write("a.txt", FOUR, 0o644);
+        let earlier = f.turn(|f| f.write("a.txt", b"ONE\ntwo\nthree\nfour\n", 0o644));
+        let n = settled_once(&mut f, &editor, at);
+        for _ in 0..10 {
+            step(&mut f, editor.rpc(), at);
+        }
+        let jobs = f.flow.jobs_started();
+        // The live drawing's own turn, in the session's scope: read to replace it.
+        f.flow.panel_shows(&f.tabs, f.tab, n, Scope::Session, "a.txt");
+        assert_eq!(f.flow.jobs_started(), jobs + 1);
+        // Then another turn, before that read is in: the live drawing stays, and so does nothing else.
+        f.flow.panel_shows(&f.tabs, f.tab, earlier, Scope::Turn, "a.txt");
+        for _ in 0..40 {
+            step(&mut f, editor.rpc(), at);
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        assert_eq!(editor.count(SHOW_LUA), 0, "the read the panel left never draws");
+        f.shut_down();
+    }
+
+    #[test]
+    fn an_o_drawing_on_its_way_keeps_its_headers_from_an_earlier_live_answer() {
+        let mut f = live("live-o-on-its-way");
+        let editor = ScriptedEditor::new();
+        let at = Instant::now();
+        let (first, second) = drawn_while_running(&mut f, &editor, at);
+        // The settle's drawing goes out, and its answer waits.
+        editor.hold.borrow_mut().push(LIVE_SHOW_LUA);
+        f.end_turn();
+        live_until(&mut f, &editor, at, "the settle's drawing", |_, e| {
+            e.count(LIVE_SHOW_LUA) == 2
+        });
+        assert!(!live_shows(&editor)[1].2, "the settle");
+        let panel = panel_hunks(&f, SESSION, first, "a.txt").remove(0);
+        let other = panel_hunks(&f, SESSION, second, "a.txt").remove(0);
+        assert_ne!(other.header, panel.header, "the two turns' hunks differ");
+
+        // `o` on the first turn queues behind it.
+        let abs = f.file("a.txt");
+        let mut outs = f.handle(editor.rpc(), open_in_editor("o1", f.tab, first, "a.txt"));
+        let deadline = Instant::now() + Duration::from_secs(20);
+        while !f.flow.local_overlay().unwrap().draws_pending(&abs) {
+            assert!(Instant::now() < deadline, "the open never queued");
+            outs.extend(step(&mut f, editor.rpc(), at));
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        // The settle's answer comes in; the open goes out and its own answer waits.
+        editor.hold.borrow_mut().clear();
+        editor.hold.borrow_mut().push(OPEN_AND_SHOW_LUA);
+        editor.release();
+        for _ in 0..10 {
+            outs.extend(step(&mut f, editor.rpc(), at));
+        }
+        assert_eq!(editor.count(OPEN_AND_SHOW_LUA), 1, "the open is out");
+        editor.hold.borrow_mut().clear();
+        editor.release();
+        while !answered(&outs, "o1") {
+            assert!(Instant::now() < deadline, "the open was never answered");
+            outs.extend(step(&mut f, editor.rpc(), at));
+            std::thread::sleep(Duration::from_millis(5));
+        }
+
+        editor.queue_event(revert_event(&f, first, "a.txt", panel.id, 2, "two", "TWO", "lf"));
+        tick_until(&mut f, &editor, "the revert", |outs| {
+            shape(outs).iter().any(|w| w.starts_with("review_draft"))
+        });
+        let records = f.draft().reverts();
+        assert_eq!(records.len(), 1);
+        assert_eq!(
+            records[0].new.hunk.as_ref().unwrap().1,
+            panel.header,
+            "recorded under the header of the turn `o` drew"
+        );
+        f.shut_down();
+    }
+
+    #[test]
+    fn a_new_editor_keeps_the_contested_paths() {
+        let mut f = live("live-contest-kept");
+        let editor = ScriptedEditor::new();
+        let at = Instant::now();
+        f.write("a.txt", FOUR, 0o644);
+        let (other, provider) = second_tab(&mut f, "other-session");
+        let (me, mine) = (f.tab, f.provider.clone());
+        begin(&mut f, &mine, SESSION, "a1");
+        begin(&mut f, &provider, "other-session", "b1");
+        edit_by(&mut f, me, &mine, "a1", "a.txt", b"one\nTWO\nthree\nfour\n");
+        live_until(&mut f, &editor, at, "the first drawing", |_, e| {
+            e.count(LIVE_SHOW_LUA) == 1
+        });
+        edit_by(&mut f, other, &provider, "b1", "a.txt", b"one\nTWO\nTHREE\nfour\n");
+        live_until(&mut f, &editor, at, "the contest's clear", |_, e| {
+            e.count(LIVE_CLEAR_LUA) >= 1
+        });
+        let abs = f.file("a.txt");
+        assert!(f.flow.local_overlay().unwrap().is_contested(&abs));
+
+        // The companion detaches and attaches again: another editor, the same turns' edits.
+        f.flow.set_editor_owner(None);
+        f.flow.set_editor_owner(Some(Owner::Companion { channel: 9 }));
+        assert!(
+            f.flow.local_overlay().unwrap().is_contested(&abs),
+            "the new editor's driver knows the file is contested"
+        );
+        let before = editor.count(LIVE_SHOW_LUA);
+        edit_by(&mut f, me, &mine, "a1", "a.txt", b"one\nTWO\nTHREE\nFOUR\n");
+        finish(&mut f, &mine, SESSION, "a1");
+        finish(&mut f, &provider, "other-session", "b1");
+        live_settled(&mut f, &editor, at);
+        assert_eq!(
+            editor.count(LIVE_SHOW_LUA),
+            before,
+            "only one turn edited it since the new editor came, and it is still not drawn"
+        );
+        f.shut_down();
+    }
+
+    #[test]
+    fn a_following_tabs_file_is_drawn_once_the_follow_opened_it() {
+        let mut f = live("live-follow");
+        f.write("a.txt", FOUR, 0o644);
+        f.start_turn();
+        let editor = ScriptedEditor::new();
+        editor.hidden.borrow_mut().push(f.file("a.txt"));
+        edit(&mut f, "a.txt", FOUR_EDITED);
+        let at = Instant::now();
+        live_until(&mut f, &editor, at, "the shown question", |_, e| {
+            e.count(LIVE_SHOWN_LUA) == 1
+        });
+        for _ in 0..20 {
+            step(&mut f, editor.rpc(), at);
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        assert_eq!(editor.count(LIVE_SHOW_LUA), 0, "not shown yet");
+
+        // Following opened the file in a split: its end asks again at once, not a second later.
+        editor.hidden.borrow_mut().clear();
+        f.flow.follow_ends().ended(f.tab.0, PathBuf::from("a.txt"));
+        live_until(&mut f, &editor, at, "the drawing", |_, e| e.count(LIVE_SHOW_LUA) == 1);
+        assert_eq!(editor.count(LIVE_SHOWN_LUA), 2);
+        f.end_turn();
+        f.shut_down();
+    }
+
+    #[test]
+    fn closing_a_tab_clears_its_live_drawings() {
+        let mut f = live("live-closed");
+        f.write("a.txt", FOUR, 0o644);
+        f.start_turn();
+        let editor = ScriptedEditor::new();
+        edit(&mut f, "a.txt", FOUR_EDITED);
+        let at = Instant::now();
+        live_until(&mut f, &editor, at, "the live drawing", |_, e| {
+            e.count(LIVE_SHOW_LUA) == 1
+        });
+        let spare = f.tabs.open(eitri_core::tab_set::AgentId::Claude);
+        let mut closed = f.tabs.remove(f.tab).expect("the tab was open");
+        if let Some(retired) = closed.retired.take() {
+            retired.into_backend().shutdown();
+        }
+        f.tab = spare;
+        live_until(&mut f, &editor, at, "the clear", |_, e| e.count(LIVE_CLEAR_LUA) == 1);
+        assert_eq!(live_clears(&editor), vec![path_bytes(&f.file("a.txt"))]);
+        f.shut_down();
+    }
+
+    #[test]
+    fn a_moved_chats_live_drawings_are_cleared_at_the_move() {
+        let mut f = live("live-moved");
+        f.write("a.txt", FOUR, 0o644);
+        f.start_turn();
+        let editor = ScriptedEditor::new();
+        edit(&mut f, "a.txt", FOUR_EDITED);
+        let at = Instant::now();
+        live_until(&mut f, &editor, at, "the live drawing", |_, e| {
+            e.count(LIVE_SHOW_LUA) == 1
+        });
+        f.tabs.freeze_for_move(f.tab).expect("the chat can move");
+        live_until(&mut f, &editor, at, "the clear", |_, e| e.count(LIVE_CLEAR_LUA) == 1);
+        assert_eq!(live_clears(&editor), vec![path_bytes(&f.file("a.txt"))]);
+        f.tabs.unfreeze(f.tab);
+        f.shut_down();
+    }
+
+    #[test]
+    fn review_live_false_does_nothing() {
+        let mut f = Fixture::new("live-off");
+        f.tabs.set_live_edits(false);
+        embedded(&mut f);
+        f.write("a.txt", FOUR, 0o644);
+        f.start_turn();
+        let editor = ScriptedEditor::new();
+        edit(&mut f, "a.txt", FOUR_EDITED);
+        let at = Instant::now();
+        for _ in 0..20 {
+            step(&mut f, editor.rpc(), at);
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        f.end_turn();
+        for _ in 0..20 {
+            step(&mut f, editor.rpc(), at);
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        assert_eq!(editor.count(LIVE_SHOWN_LUA), 0, "no shown question");
+        assert_eq!(editor.count(REVIEW_LUA), 0, "no module installed");
+        assert!(editor.asked.borrow().is_empty(), "the editor is never asked anything");
+        assert_eq!(f.flow.jobs_started(), 0, "no job");
+        assert!(f.flow.live_is_idle());
+        f.shut_down();
+    }
+
+    /// A note as window 1 got it: the turn, its end once it ended, the paths.
+    type Note = (TurnKey, Option<u64>, Vec<PathBuf>);
+
+    /// Window 2's way to window 1: every note recorded, and a running turn's note answered with
+    /// every path shown.
+    #[derive(Default)]
+    struct Asked {
+        notes: RefCell<Vec<Note>>,
+        answers: RefCell<BTreeMap<u64, Vec<bool>>>,
+        next: Cell<u64>,
+    }
+
+    struct SharedAsk(Rc<Asked>);
+
+    impl LiveAsk for SharedAsk {
+        fn note(&self, key: &TurnKey, _started_ns: u64, ended_ns: Option<u64>, abs_paths: &[PathBuf]) -> Option<u64> {
+            self.0
+                .notes
+                .borrow_mut()
+                .push((key.clone(), ended_ns, abs_paths.to_vec()));
+            if ended_ns.is_some() {
+                return None;
+            }
+            let id = self.0.next.get() + 1;
+            self.0.next.set(id);
+            self.0.answers.borrow_mut().insert(id, vec![true; abs_paths.len()]);
+            Some(id)
+        }
+
+        fn take_shown(&self, op_id: u64) -> Option<Result<Vec<bool>, String>> {
+            self.0.answers.borrow_mut().remove(&op_id).map(Ok)
+        }
+    }
+
+    #[test]
+    fn live_window_2_notes_and_asks_through_window_1() {
+        let mut f = Fixture::new("live-window-2");
+        f.tabs.set_live_edits(true);
+        f.write("a.txt", FOUR, 0o644);
+        let _sent = as_window_2(&mut f, None);
+        let asked = Rc::new(Asked::default());
+        f.flow.set_live_ask(Box::new(SharedAsk(asked.clone())));
+        f.start_turn();
+        edit(&mut f, "a.txt", FOUR_EDITED);
+        let at = Instant::now();
+        let deadline = Instant::now() + Duration::from_secs(20);
+        while f.flow.jobs_started() == 0 {
+            assert!(Instant::now() < deadline, "the live job never ran");
+            step(&mut f, None, at);
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        let key = TurnKey {
+            session: SESSION.to_owned(),
+            turn_id: "t1".to_owned(),
+        };
+        assert!(
+            asked
+                .notes
+                .borrow()
+                .iter()
+                .any(|(k, end, paths)| *k == key && end.is_none() && *paths == [f.file("a.txt")]),
+            "the edit is noted through window 1: {:?}",
+            asked.notes.borrow()
+        );
+        assert!(asked.answers.borrow().is_empty(), "every answer was taken");
+        f.end_turn();
+        let deadline = Instant::now() + Duration::from_secs(20);
+        while !asked
+            .notes
+            .borrow()
+            .iter()
+            .any(|(k, end, _)| *k == key && end.is_some())
+        {
+            assert!(Instant::now() < deadline, "the turn's end was never noted");
+            step(&mut f, None, at);
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        f.shut_down();
+    }
 }

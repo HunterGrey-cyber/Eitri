@@ -9,12 +9,14 @@ pub(super) use eitri_core::editor_tools::bridge_host::{BridgeHost, BridgeName, B
 use eitri_core::editor_tools::broker::{Broker, BrokerEnv, BrokerOut, Caller, TabFacts};
 use eitri_core::editor_tools::cards::{CardDecision, CardOrigin};
 use eitri_core::editor_tools::catalog::{self, ToolRow};
-use eitri_core::editor_tools::step::ToolResult;
+use eitri_core::editor_tools::follow::FollowRun;
+use eitri_core::editor_tools::step::{Step, StepEvent, ToolCx, ToolResult, ToolRun};
 use eitri_core::editor_tools::tools::tool_named;
-use eitri_core::editor_tools::way::{EditorWay, LocalWay};
+use eitri_core::editor_tools::way::{EditorCall, EditorWay, LocalWay};
 use eitri_core::editor_tools::words;
 use eitri_core::project_trust::EditorServerName;
 use eitri_core::tab_set::{ClientCallNews, TabSet, NAME_TAKEN_LINE, NAME_UNKNOWN_LINE};
+use eitri_core::turn_review::flow::FollowEnds;
 use eitri_core::turn_review::{review_dir_for, ProposalWriter, TurnReview};
 use std::collections::BTreeSet;
 #[cfg(not(target_os = "linux"))]
@@ -379,6 +381,7 @@ pub(super) fn poll(state: &mut AgentPanelState, out: &mut Outbox) {
         home,
         editor_context,
         review_roots,
+        review_flow,
         ..
     } = state;
     let local = || {
@@ -414,12 +417,59 @@ pub(super) fn poll(state: &mut AgentPanelState, out: &mut Outbox) {
             .ok()
             .map(|(review, session)| review.first_change_job(&session))
     };
+    let follow_ends = review_flow.follow_ends();
     for (tab, run) in editor_follower.poll(project_dir, home.as_deref(), &first_change, now) {
+        let run = FollowEnding::new(run, tab, project_dir, follow_ends.clone());
         editor_tools.submit_run(TabId(tab), Box::new(run), now);
     }
     outs.extend(editor_tools.tick(&env, now));
     route(state, outs, out);
     end_sockets_of_ended_sessions(state);
+}
+
+/// A follow run that, when it ends, tells the review flow's live drawings which file it opened: a file the editor did not
+/// show when the edit landed may show now, in the split the run opened.
+pub(super) struct FollowEnding {
+    run: FollowRun,
+    tab: u64,
+    root: PathBuf,
+    /// The file the run asked the editor to open, relative to the project.
+    opened: Option<PathBuf>,
+    ends: FollowEnds,
+}
+
+impl FollowEnding {
+    pub(super) fn new(run: FollowRun, tab: u64, root: &Path, ends: FollowEnds) -> FollowEnding {
+        FollowEnding {
+            run,
+            tab,
+            root: root.to_path_buf(),
+            opened: None,
+            ends,
+        }
+    }
+}
+
+impl ToolRun for FollowEnding {
+    fn step(&mut self, event: StepEvent, cx: &ToolCx<'_>) -> Step {
+        let step = self.run.step(event, cx);
+        if let Step::Call {
+            call: EditorCall::OpenFile { path, .. },
+            ..
+        } = &step
+        {
+            self.opened = path.strip_prefix(&self.root).ok().map(Path::to_path_buf);
+        }
+        step
+    }
+}
+
+impl Drop for FollowEnding {
+    fn drop(&mut self) {
+        if let Some(rel) = self.opened.take() {
+            self.ends.ended(self.tab, rel);
+        }
+    }
 }
 
 /// A call that waited in the channel while its tab went or started another session is left out: under the tab's id it
@@ -1393,6 +1443,86 @@ pub(super) mod tests {
         let mut out = Outbox::default();
         tab_leaving(&mut panel.handle.state.borrow_mut(), panel.tab, &mut out);
         assert!(panel.handle.state.borrow().editor_follower.is_idle());
+    }
+
+    /// The end of a follow run reaches the review flow's live drawings with the file it opened, so a file the editor
+    /// did not show at the edit is asked about again once following has opened it.
+    #[test]
+    fn live_a_follow_runs_end_tells_the_review_flow_the_file_it_opened() {
+        use eitri_core::editor_tools::follow::{FollowRun, FollowTarget};
+        use eitri_core::editor_tools::memory::Memory;
+        use eitri_core::editor_tools::step::{AgentCall, EditorReach, EditorSight, Step, StepEvent, ToolCx, ToolRun};
+        let flow = eitri_core::turn_review::ReviewFlow::new();
+        let ends = flow.follow_ends();
+        let root = PathBuf::from("/project");
+        let memory = Memory::default();
+        let cx = ToolCx {
+            root: &root,
+            home: None,
+            memory: &memory,
+            trust: ProjectTrust::Trusted,
+            mode: agent::PermissionMode::Bypass,
+            reach: EditorReach::Own,
+            sight: EditorSight::OnScreen,
+            context: None,
+            tab: 3,
+            session: "s1",
+            call: "follow",
+            agent_call: AgentCall::Host,
+        };
+        let target = |rel: &str| FollowTarget {
+            rel: PathBuf::from(rel),
+            line: None,
+        };
+
+        let never_started = FollowEnding::new(FollowRun::new(&root, target("b.rs")), 3, &root, ends.clone());
+        drop(never_started);
+        assert!(ends.take().is_empty(), "a run that opened nothing tells nothing");
+
+        let mut run = FollowEnding::new(FollowRun::new(&root, target("src/a.rs")), 3, &root, ends.clone());
+        assert!(matches!(run.step(StepEvent::Start, &cx), Step::Call { .. }));
+        assert!(ends.take().is_empty(), "nothing is told while the run is out");
+        drop(run);
+        assert_eq!(ends.take(), vec![(3, PathBuf::from("src/a.rs"))]);
+    }
+
+    /// The follow runs the glue's poll starts are the ones that tell the review flow, at their end, the file they
+    /// opened.
+    #[test]
+    fn live_the_follow_runs_poll_starts_tell_the_review_flow_where_they_end() {
+        use eitri_core::editor_tools::tools::open_file::OPEN_FILE_LUA;
+        let panel = fixture("glue-follow-ends");
+        let ends = panel.handle.state.borrow().review_flow.follow_ends();
+        let path = panel.handle.state.borrow().project_dir.join("edited.rs");
+        std::fs::write(&path, "changed\n").unwrap();
+        panel
+            .handle
+            .state
+            .borrow_mut()
+            .editor_follower
+            .edited(panel.tab.0, path);
+        // The glue's own poll alone: the panel's tick would hand the end to the live drawings at once.
+        let poll_once = || poll(&mut panel.handle.state.borrow_mut(), &mut Outbox::default());
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(15);
+        while panel.editor.asked().is_empty() {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the follow never reached the editor"
+            );
+            poll_once();
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        assert_eq!(panel.editor.asked(), [OPEN_FILE_LUA]);
+        assert!(ends.take().is_empty(), "nothing is told while the run is out");
+        panel.editor.answer_oldest(&json!({"needs_load":true}));
+        let mut told = Vec::new();
+        while told.is_empty() {
+            assert!(std::time::Instant::now() < deadline, "the follow's end was never told");
+            poll_once();
+            told.extend(ends.take());
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        assert_eq!(told, vec![(panel.tab.0, PathBuf::from("edited.rs"))]);
     }
 
     #[test]

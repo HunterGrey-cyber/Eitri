@@ -29,8 +29,15 @@
 //! the link. Window 2's flow drives a [`RemoteOverlay`] instead, and asks window 1's editor about a
 //! buffer through a [`RemoteAsk`]; everything else here is the same in both windows. An editor
 //! event finds its tab by the session it names, since tab numbers are each window's own.
+//!
+//! **Live drawings.** With `review.live` on, [`ReviewFlow::live_tick`] takes the edits the tab set's
+//! pump listed and works them through the window's [`LiveDraws`]: it asks the editor which edited
+//! files a window shows, runs a worker per shown file, and turns each answer into a live draw or
+//! clear on the same driver. Window 1 asks its own editor and notes each turn's edits in its own
+//! driver's contested-paths table; window 2 does both through window 1 ([`LiveAsk`]).
 
-use std::collections::{BTreeMap, VecDeque};
+use std::cell::RefCell;
+use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::path::{Component, Path, PathBuf};
 use std::rc::Rc;
 use std::sync::mpsc;
@@ -44,10 +51,11 @@ use crate::agent_bridge::{
 use crate::editor_rpc::EditorRpc;
 use crate::nvim_rpc::Pending;
 use crate::review_editor::{
-    overlay_hunks, EditorOverlay, EditorRevertEvent, LinkedEvent, OffEvent, Overlay, OverlayCall, OverlayOutcome,
-    Owner, RemoteOverlay, Routed, ShowHunk, ShowMeta,
+    live_shown_args, overlay_hunks, parse_live_shown, EditorOverlay, EditorRevertEvent, LinkedEvent, LiveMeta,
+    OffEvent, Overlay, OverlayCall, OverlayOutcome, Owner, RemoteOverlay, Routed, ShowHunk, ShowMeta, Window,
+    LIVE_SHOWN_LUA,
 };
-use crate::tab_set::{Flush, ReviewTicket, Tab, TabBackend, TabSet};
+use crate::tab_set::{Flush, LiveEdit, ReviewTicket, Tab, TabBackend, TabSet};
 use crate::tabs::TabId;
 use crate::wm::PeerId;
 use serde::{Deserialize, Serialize};
@@ -55,6 +63,9 @@ use serde::{Deserialize, Serialize};
 use super::draft::{check_reverts, NewRevert, RevertShape, RevertSource, ReviewDraft, UndoData, UndoState};
 use super::journal::JournalEntry;
 use super::lifecycle::{ReviewError, Scope};
+use super::live_contest::{LiveContest, TurnKey};
+use super::live_draws::{LiveDraws, LiveRecords, LiveStep};
+use super::live_job::{LiveHunks, LiveRecord, LiveSettle, LiveSkip};
 use super::message::{compose, Preview};
 use super::presence::{Blocked, PresenceGuard};
 use super::revert::{
@@ -103,6 +114,83 @@ pub enum Out {
     EditorOpened,
 }
 
+/// A linked window's way to window 1 for its live drawings: window 1's driver keeps the one
+/// contested-paths table and window 1's editor answers which files are shown.
+pub trait LiveAsk {
+    /// Tells window 1 that the turn `key`, running from `started_ns` (until `ended_ns` once it
+    /// ended), edited `abs_paths`. While the turn runs window 1 also asks its editor which of them
+    /// a window shows: the operation's id is returned, and [`take_shown`](Self::take_shown) gives
+    /// the answer. `None`: nothing was asked (the turn ended, or there is no link).
+    fn note(&self, key: &TurnKey, started_ns: u64, ended_ns: Option<u64>, abs_paths: &[PathBuf]) -> Option<u64>;
+    /// The answer to the note `op_id`, one entry per path, once window 1 gave it.
+    fn take_shown(&self, op_id: u64) -> Option<Result<Vec<bool>, String>>;
+}
+
+/// Where a follow run that opened a file tells the live drawings it ended: `(tab, path relative to
+/// the project)`. A file not shown at the edit may be shown now.
+#[derive(Clone, Default)]
+pub struct FollowEnds(Rc<RefCell<Vec<(u64, PathBuf)>>>);
+
+impl FollowEnds {
+    pub fn ended(&self, tab: u64, rel: PathBuf) {
+        self.0.borrow_mut().push((tab, rel));
+    }
+
+    /// Every end told since the last take, in order.
+    pub fn take(&self) -> Vec<(u64, PathBuf)> {
+        std::mem::take(&mut *self.0.borrow_mut())
+    }
+
+    fn is_empty(&self) -> bool {
+        self.0.borrow().is_empty()
+    }
+}
+
+/// The one shown question out for the live drawings.
+enum LiveQuestion {
+    /// To this window's own editor.
+    Local {
+        asked: Vec<PathBuf>,
+        pending: Pending,
+        since: Instant,
+    },
+    /// Through window 1, one note per turn the paths were last named by.
+    Remote {
+        asked: Vec<PathBuf>,
+        parts: Vec<RemotePart>,
+        since: Instant,
+    },
+}
+
+struct RemotePart {
+    paths: Vec<PathBuf>,
+    /// `None`: nothing could be asked, so the paths count as not shown.
+    op: Option<u64>,
+    shown: Option<Vec<bool>>,
+}
+
+/// A live drawing's worker job.
+struct LiveJob {
+    key: TurnKey,
+    tab: u64,
+    path: PathBuf,
+    rx: LiveRx,
+}
+
+enum LiveRx {
+    Live(mpsc::Receiver<Result<Result<LiveHunks, LiveSkip>, ReviewError>>),
+    Settle(mpsc::Receiver<Result<LiveSettle, ReviewError>>),
+}
+
+/// The records of a window with no review: every turn is gone.
+struct NoRecords;
+
+impl LiveRecords for NoRecords {
+    fn live_record(&self, _session: &str, _turn_id: &str) -> Option<LiveRecord> {
+        None
+    }
+}
+
 /// One window's review requests in flight.
 #[derive(Default)]
 pub struct ReviewFlow {
@@ -136,6 +224,26 @@ pub struct ReviewFlow {
     /// What a write finished with for a session whose chat moves, or moved, to another window: its
     /// record belongs in the draft the chat took along.
     for_holder: BTreeMap<String, VecDeque<serde_json::Value>>,
+    /// The window's live drawings and what is out for them.
+    live: LiveDraws,
+    live_question: Option<LiveQuestion>,
+    live_jobs: Vec<LiveJob>,
+    /// The session each tab that edited live held when last seen: a tab that closes, moves away or
+    /// changes session takes its drawings with it.
+    live_tabs: BTreeMap<u64, String>,
+    /// A settled drawing's meta and its hunks' headers, from the draw until the editor's answer.
+    live_headers: BTreeMap<PathBuf, (ShowMeta, BTreeMap<u32, String>)>,
+    /// Window 2's way to window 1 for its live drawings; `None` in any other window.
+    live_ask: Option<Box<dyn LiveAsk>>,
+    /// The contested-paths table while the window has no editor: the next driver takes it over.
+    parked_contest: LiveContest,
+    /// Window 2: the turn that last named each path (with its start), and each ended turn's end,
+    /// so a shown question can name the turn its paths belong to.
+    live_named: BTreeMap<PathBuf, (TurnKey, u64)>,
+    live_ends: HashMap<TurnKey, u64>,
+    /// Window 2: notes whose shown answer nobody waits for, taken when they come.
+    live_unread: Vec<(u64, Instant)>,
+    follow_ends: FollowEnds,
 }
 
 /// A file prepared on a worker: its resolved absolute path and the turn's hunks over it.
@@ -266,6 +374,22 @@ impl ReviewFlow {
             && self.early.is_empty()
             && self.linked_out.is_empty()
             && !self.overlay.as_ref().is_some_and(Overlay::wants_ticks)
+            && self.live_is_idle()
+    }
+
+    /// The live drawings have nothing to follow, ask, run or hand out.
+    pub fn live_is_idle(&self) -> bool {
+        !self.live.wants_ticks()
+            && self.live_question.is_none()
+            && self.live_jobs.is_empty()
+            && self.live_unread.is_empty()
+            && self.follow_ends.is_empty()
+    }
+
+    /// Whether the live drawings still follow the turn `key`: it runs, or its drawings are not
+    /// settled yet.
+    pub fn live_follows(&self, key: &TurnKey) -> bool {
+        self.live.follows(key)
     }
 
     /// Who owns the review module in this window's editor: the integrated window's own nvim, or the
@@ -278,9 +402,19 @@ impl ReviewFlow {
             return;
         }
         self.overlay_owner = owner;
-        self.overlay = owner.map(|owner| Overlay::Local(EditorOverlay::new(owner)));
+        // Which paths two running turns both edited is decided from their edits, not from the
+        // editor: the table goes on to the next driver, so a turn that edits again stays contested.
+        let contest = match self.overlay.take() {
+            Some(Overlay::Local(overlay)) => overlay.into_contest(),
+            _ => std::mem::take(&mut self.parked_contest),
+        };
+        match owner {
+            Some(owner) => self.overlay = Some(Overlay::Local(EditorOverlay::with_contest(owner, contest))),
+            None => self.parked_contest = contest,
+        }
         self.shown.clear();
         self.redraws.clear();
+        self.live_editor_lost();
         // A file still being read was asked for the old editor; sending it to the new one would show
         // a request nobody made of it.
         self.fail_opens("the editor changed before the file was ready; nothing was opened");
@@ -295,6 +429,7 @@ impl ReviewFlow {
         }
         self.shown.clear();
         self.redraws.clear();
+        self.live_editor_lost();
         self.fail_opens("the editor went away before the file was ready; nothing was opened");
         self.fail_awaiting("the editor went away before it answered; nothing was opened");
         std::mem::take(&mut self.early)
@@ -306,8 +441,11 @@ impl ReviewFlow {
         self.overlay_owner = None;
         self.overlay = Some(Overlay::Remote(overlay));
         self.remote_ask = Some(Rc::new(ask));
+        // Window 1's driver keeps the one table now.
+        self.parked_contest = LiveContest::new();
         self.shown.clear();
         self.redraws.clear();
+        self.live_editor_lost();
         self.fail_opens("the editor changed before the file was ready; nothing was opened");
         self.fail_awaiting("the editor changed before it answered; nothing was opened");
     }
@@ -359,20 +497,28 @@ impl ReviewFlow {
     /// The panel asked for another turn's diff of `path`. When the editor draws that file's review,
     /// the new turn replaces the old one; nothing is read when no file is drawn.
     pub fn panel_shows(&mut self, tabs: &TabSet, tab: TabId, turn: u32, scope: Scope, path: &str) {
-        let drawn = self.overlay.as_ref().is_some_and(|o| !o.active_paths().is_empty());
-        if !drawn || check_relative(path).is_err() {
+        let Some(overlay) = self.overlay.as_ref().filter(|o| !o.active_paths().is_empty()) else {
             return;
-        }
-        // The newest request for a file is the one the panel shows; an older one still being read
-        // must not land after it and draw the turn the panel has left.
-        self.redraws.retain(|work| work.path != path);
-        if self.redraws.len() >= MAX_EDITOR_JOBS {
+        };
+        if check_relative(path).is_err() {
             return;
         }
         let Ok((review, session)) = tabs.review_session(tab) else {
             return;
         };
         let root = review.project_root().to_path_buf();
+        // The newest request for a file is the one the panel shows; an older one still being read
+        // must not land after it and draw the turn the panel has left, even when this one draws
+        // nothing.
+        self.redraws.retain(|work| work.path != path);
+        // A live drawing is the agent's edits as they land: the panel looking at another turn of the
+        // file leaves it, and only the panel's own turn of it may replace it.
+        if live_of_another_turn(overlay, &root.join(path), &session, turn) {
+            return;
+        }
+        if self.redraws.len() >= MAX_EDITOR_JOBS {
+            return;
+        }
         let job = review.exact_hunks_job(&session, turn, scope, path);
         let worker_path = path.to_string();
         if let Ok(rx) = spawn("eitri-review-redraw", move || prepare_file(&root, &worker_path, job)) {
@@ -1109,6 +1255,10 @@ impl ReviewFlow {
             if !overlay.active_paths().contains(&abs) {
                 continue;
             }
+            // Drawn live for another turn while the file was being read: the live drawing stays.
+            if live_of_another_turn(overlay, &abs, &work.session, work.turn) {
+                continue;
+            }
             let meta = ShowMeta {
                 tab: work.tab.0,
                 session: work.session,
@@ -1130,6 +1280,9 @@ impl ReviewFlow {
                     );
                     overlay.call(rpc, OverlayCall::Show { path: abs, meta, hunks }, now);
                 }
+                // Nothing to put in its place (a running turn has no end snapshot yet): the agent's
+                // edits stay drawn as they landed.
+                None if overlay.live_drawings().contains_key(&abs) => {}
                 None => {
                     self.shown.remove(&abs);
                     overlay.call(rpc, OverlayCall::Clear { path: abs }, now);
@@ -1175,12 +1328,420 @@ impl ReviewFlow {
                 OverlayOutcome::Off(offs) => {
                     for OffEvent { path, .. } in offs {
                         self.shown.remove(Path::new(&path));
+                        self.live.off(Path::new(&path));
                     }
                 }
-                // Nothing asks for a live drawing yet.
-                OverlayOutcome::LiveDrawn { .. } => {}
+                OverlayOutcome::LiveDrawn {
+                    path,
+                    meta,
+                    drawn,
+                    left,
+                } => {
+                    let headers = match self.live_headers.get(&path) {
+                        Some((shown, _))
+                            if !meta.running && shown.session == meta.session && shown.turn == meta.turn =>
+                        {
+                            self.live_headers.remove(&path)
+                        }
+                        _ => None,
+                    };
+                    // Only a drawing that is up, and is still this turn's live one, says what the
+                    // file shows: an `o` drawing that took the file meanwhile keeps its own headers,
+                    // and so does one still on its way, whose headers are in `shown` already.
+                    let live_now = (meta.session.clone(), meta.turn);
+                    let up = drawn > 0
+                        && !left
+                        && self.overlay.as_ref().is_some_and(|o| {
+                            o.live_drawings().get(&path) == Some(&live_now) && !o.draws_pending(&path)
+                        });
+                    if !up {
+                        continue;
+                    }
+                    match headers {
+                        Some((meta, headers)) => {
+                            self.shown.insert(path, Shown { meta, headers });
+                        }
+                        // A running turn's drawing has no hunk to revert, so no header to keep.
+                        None => {
+                            self.shown.remove(&path);
+                        }
+                    }
+                }
             }
         }
+    }
+
+    // ---- live drawings -------------------------------------------------------------------------
+
+    /// Makes window 2's live drawings go through window 1: its notes and shown questions are `ask`'s.
+    pub fn set_live_ask(&mut self, ask: Box<dyn LiveAsk>) {
+        self.live_ask = Some(ask);
+        self.live_editor_lost();
+    }
+
+    /// Where a follow run tells this window's live drawings that it opened a file.
+    pub fn follow_ends(&self) -> FollowEnds {
+        self.follow_ends.clone()
+    }
+
+    /// The editor the drawings were made in is gone or replaced: nothing out for it will be used.
+    fn live_editor_lost(&mut self) {
+        self.live.editor_lost();
+        self.live_question = None;
+        self.live_jobs.clear();
+        self.live_headers.clear();
+    }
+
+    /// One round of the live drawings: the tabs' new edits, the editor's and the workers' answers,
+    /// and what follows from them, each a call on the driver, a question or a worker. Reads memory
+    /// only; never waits.
+    pub fn live_tick(&mut self, tabs: &mut TabSet, rpc: Option<&dyn EditorRpc>, now: Instant) {
+        let edits = tabs.take_live_edits();
+        let follows = self.follow_ends.take();
+        let gone: Vec<u64> = self
+            .live_tabs
+            .iter()
+            .filter(|(tab, session)| !holds_session(tabs, **tab, session))
+            .map(|(tab, _)| *tab)
+            .collect();
+        if edits.is_empty() && follows.is_empty() && gone.is_empty() && self.live_is_idle() {
+            return;
+        }
+        let review = tabs.turn_review();
+        let records: &dyn LiveRecords = match review {
+            Some(review) => review,
+            None => &NoRecords,
+        };
+        let root = review.map(|review| review.project_root().to_path_buf());
+
+        for tab in gone {
+            self.live_tabs.remove(&tab);
+            self.live.tab_gone(tab);
+            // Their answers would be dropped; the slots are freed now.
+            self.live_jobs.retain(|job| job.tab != tab);
+        }
+        let edits: Vec<LiveEdit> = edits
+            .into_iter()
+            .filter(|edit| holds_session(tabs, edit.tab.0, &edit.session))
+            .filter_map(|mut edit| {
+                edit.path = live_path(root.as_deref()?, &edit.path)?;
+                Some(edit)
+            })
+            .collect();
+        for edit in &edits {
+            self.live_tabs.insert(edit.tab.0, edit.session.clone());
+        }
+        if !edits.is_empty() {
+            self.live.edits(edits, records, now);
+        }
+        for (tab, rel) in follows {
+            if let Some(abs) = root.as_deref().and_then(|root| live_path(root, &rel)) {
+                self.live.follow_ended(tab, &abs, now);
+            }
+        }
+
+        self.poll_live_question(now);
+        self.poll_live_jobs();
+        self.poll_live_unread(now);
+        let steps = self.live.steps(records, self.live_jobs.len(), now);
+        for step in steps {
+            match step {
+                LiveStep::AskShown { paths } => self.ask_shown(paths, rpc, now),
+                LiveStep::Note {
+                    key,
+                    started_ns,
+                    ended_ns,
+                    paths,
+                } => self.note_live(&key, started_ns, ended_ns, &paths, now),
+                LiveStep::RunLive { key, tab, path } => {
+                    let job = root.as_deref().zip(review).and_then(|(root, review)| {
+                        let rel = path.strip_prefix(root).ok()?.to_str()?;
+                        Some(review.live_hunks_job(&key.session, &key.turn_id, rel))
+                    });
+                    match job.map(|job| spawn("eitri-review-live", move || job.run())) {
+                        Some(Ok(rx)) => {
+                            self.jobs_started += 1;
+                            self.live_jobs.push(LiveJob {
+                                key,
+                                tab,
+                                path,
+                                rx: LiveRx::Live(rx),
+                            });
+                        }
+                        _ => self.live.live_done(&key, &path, Err(no_worker())),
+                    }
+                }
+                LiveStep::RunSettle { key, tab, turn, path } => {
+                    let job = root.as_deref().zip(review).and_then(|(root, review)| {
+                        let rel = path.strip_prefix(root).ok()?.to_str()?;
+                        Some(review.live_settle_job(&key.session, turn, rel))
+                    });
+                    match job.map(|job| spawn("eitri-review-settle", move || job.run())) {
+                        Some(Ok(rx)) => {
+                            self.jobs_started += 1;
+                            self.live_jobs.push(LiveJob {
+                                key,
+                                tab,
+                                path,
+                                rx: LiveRx::Settle(rx),
+                            });
+                        }
+                        _ => self.live.settle_done(&key, &path, Err(no_worker())),
+                    }
+                }
+                LiveStep::Draw {
+                    path,
+                    key,
+                    tab,
+                    turn,
+                    running,
+                    read_lines,
+                    hunks,
+                    headers,
+                } => {
+                    let meta = LiveMeta {
+                        tab,
+                        session: key.session,
+                        turn_id: key.turn_id,
+                        turn,
+                        running,
+                        read_lines,
+                    };
+                    self.live_draw(path, meta, &hunks, headers, rpc, now);
+                }
+                LiveStep::Clear { path } => self.live_clear(path, rpc, now),
+            }
+        }
+        if self.live_ask.is_some() && !self.live.wants_ticks() && self.live_question.is_none() {
+            // Nothing will be asked for these turns' paths again.
+            self.live_named.clear();
+            self.live_ends.clear();
+        }
+    }
+
+    /// Asks which of `paths` a window shows: this window's editor, or window 1's for window 2. With
+    /// no editor to ask, none is.
+    fn ask_shown(&mut self, paths: Vec<PathBuf>, rpc: Option<&dyn EditorRpc>, now: Instant) {
+        if let Some(ask) = self.live_ask.as_deref() {
+            // Grouped by the turn that last named each path: window 1 answers a turn's note.
+            let mut groups: Vec<(TurnKey, u64, Vec<PathBuf>)> = Vec::new();
+            let mut parts = Vec::new();
+            for path in &paths {
+                match self.live_named.get(path) {
+                    Some((key, started_ns)) => match groups.iter_mut().find(|(k, _, _)| k == key) {
+                        Some((_, _, group)) => group.push(path.clone()),
+                        None => groups.push((key.clone(), *started_ns, vec![path.clone()])),
+                    },
+                    None => parts.push(RemotePart {
+                        paths: vec![path.clone()],
+                        op: None,
+                        shown: Some(vec![false]),
+                    }),
+                }
+            }
+            for (key, started_ns, group) in groups {
+                let op = ask.note(&key, started_ns, None, &group);
+                // A turn that already ended is told so again, so the question does not reopen it.
+                if let Some(&ended_ns) = self.live_ends.get(&key) {
+                    if let Some(extra) = ask.note(&key, started_ns, Some(ended_ns), &group) {
+                        self.live_unread.push((extra, now));
+                    }
+                }
+                let shown = op.is_none().then(|| vec![false; group.len()]);
+                parts.push(RemotePart {
+                    paths: group,
+                    op,
+                    shown,
+                });
+            }
+            self.live_question = Some(LiveQuestion::Remote {
+                asked: paths,
+                parts,
+                since: now,
+            });
+            return;
+        }
+        match (self.overlay.as_ref(), rpc) {
+            (Some(Overlay::Local(_)), Some(rpc)) => {
+                let pending = rpc.exec_lua(LIVE_SHOWN_LUA, live_shown_args(&paths));
+                self.live_question = Some(LiveQuestion::Local {
+                    asked: paths,
+                    pending,
+                    since: now,
+                });
+            }
+            _ => self.live.shown(paths, Vec::new(), now),
+        }
+    }
+
+    /// The shown question's answer, once it is in; past [`BUFFER_ANSWER_WAIT`] what is missing
+    /// counts as not shown.
+    fn poll_live_question(&mut self, now: Instant) {
+        let Some(question) = self.live_question.take() else {
+            return;
+        };
+        match question {
+            LiveQuestion::Local { asked, pending, since } => match pending.try_take() {
+                None if now.saturating_duration_since(since) < BUFFER_ANSWER_WAIT => {
+                    self.live_question = Some(LiveQuestion::Local { asked, pending, since });
+                }
+                Some(Ok(answer)) => {
+                    let shown = parse_live_shown(&answer, asked.len()).unwrap_or_default();
+                    self.live.shown(asked, shown, now);
+                }
+                _ => self.live.shown(asked, Vec::new(), now),
+            },
+            LiveQuestion::Remote {
+                asked,
+                mut parts,
+                since,
+            } => {
+                if let Some(ask) = self.live_ask.as_deref() {
+                    for part in parts.iter_mut().filter(|part| part.shown.is_none()) {
+                        let Some(op) = part.op else { continue };
+                        match ask.take_shown(op) {
+                            Some(Ok(shown)) if shown.len() == part.paths.len() => part.shown = Some(shown),
+                            Some(_) => part.shown = Some(vec![false; part.paths.len()]),
+                            None => {}
+                        }
+                    }
+                }
+                let waiting = parts.iter().any(|part| part.shown.is_none());
+                if waiting && now.saturating_duration_since(since) < BUFFER_ANSWER_WAIT {
+                    self.live_question = Some(LiveQuestion::Remote { asked, parts, since });
+                    return;
+                }
+                for part in &parts {
+                    if let (None, Some(op)) = (&part.shown, part.op) {
+                        self.live_unread.push((op, now));
+                    }
+                }
+                let answered: BTreeMap<&PathBuf, bool> = parts
+                    .iter()
+                    .filter_map(|part| Some(part.paths.iter().zip(part.shown.as_ref()?.iter().copied())))
+                    .flatten()
+                    .collect();
+                let shown = asked
+                    .iter()
+                    .map(|path| answered.get(path).copied().unwrap_or(false))
+                    .collect();
+                self.live.shown(asked, shown, now);
+            }
+        }
+    }
+
+    /// Workers that finished hand their answers to the live drawings.
+    fn poll_live_jobs(&mut self) {
+        let mut waiting = Vec::new();
+        for job in std::mem::take(&mut self.live_jobs) {
+            match &job.rx {
+                LiveRx::Live(rx) => match rx.try_recv() {
+                    Err(mpsc::TryRecvError::Empty) => waiting.push(job),
+                    Err(mpsc::TryRecvError::Disconnected) => self.live.live_done(&job.key, &job.path, Err(no_worker())),
+                    Ok(result) => self.live.live_done(&job.key, &job.path, result),
+                },
+                LiveRx::Settle(rx) => match rx.try_recv() {
+                    Err(mpsc::TryRecvError::Empty) => waiting.push(job),
+                    Err(mpsc::TryRecvError::Disconnected) => {
+                        self.live.settle_done(&job.key, &job.path, Err(no_worker()))
+                    }
+                    Ok(result) => self.live.settle_done(&job.key, &job.path, result),
+                },
+            }
+        }
+        self.live_jobs = waiting;
+    }
+
+    /// Window 2: takes the answers to notes nobody waits for, so none is kept; one that never comes
+    /// is let go after [`BUFFER_ANSWER_WAIT`].
+    fn poll_live_unread(&mut self, now: Instant) {
+        let Some(ask) = self.live_ask.as_deref() else {
+            self.live_unread.clear();
+            return;
+        };
+        self.live_unread.retain(|(op, since)| {
+            ask.take_shown(*op).is_none() && now.saturating_duration_since(*since) < BUFFER_ANSWER_WAIT
+        });
+    }
+
+    /// Tells the contested-paths table that `key` edited `paths`: window 1's own driver, or window 1
+    /// through window 2's link.
+    fn note_live(&mut self, key: &TurnKey, started_ns: u64, ended_ns: Option<u64>, paths: &[PathBuf], now: Instant) {
+        if let Some(ask) = self.live_ask.as_deref() {
+            for path in paths {
+                self.live_named.insert(path.clone(), (key.clone(), started_ns));
+            }
+            if let Some(ended_ns) = ended_ns {
+                self.live_ends.insert(key.clone(), ended_ns);
+            }
+            // A running turn's note also asks what is shown; the question for these paths is asked
+            // on its own, so this answer is only taken out of the way.
+            if let Some(op) = ask.note(key, started_ns, ended_ns, paths) {
+                self.live_unread.push((op, now));
+            }
+        } else {
+            match self.overlay.as_mut() {
+                Some(Overlay::Local(overlay)) => overlay.note_live(Window::One, key, started_ns, ended_ns, paths),
+                // No editor now: nothing is drawn to clear, and the next driver takes the table.
+                None => {
+                    for path in paths {
+                        self.parked_contest.note_edit(key, started_ns, path);
+                    }
+                    if let Some(ended_ns) = ended_ns {
+                        self.parked_contest.note_end(key, ended_ns);
+                    }
+                }
+                Some(Overlay::Remote(_)) => {}
+            }
+        }
+    }
+
+    /// A live draw of `path`. A settled draw's headers wait for the editor's answer: only a drawing
+    /// that went up is what a revert in the editor is recorded under.
+    fn live_draw(
+        &mut self,
+        path: PathBuf,
+        meta: LiveMeta,
+        hunks: &[ExactHunk],
+        headers: BTreeMap<u32, String>,
+        rpc: Option<&dyn EditorRpc>,
+        now: Instant,
+    ) {
+        let Some(overlay) = self.overlay.as_mut().filter(|overlay| overlay.reachable(rpc)) else {
+            return;
+        };
+        let Some(hunks) = overlay_hunks(false, Some(hunks.iter().map(show_hunk).collect())) else {
+            // Longer than the overlay draws: what was drawn of the file is no longer this turn's.
+            overlay.call(rpc, OverlayCall::LiveClear { path }, now);
+            return;
+        };
+        if !meta.running {
+            let shown = ShowMeta {
+                tab: meta.tab,
+                session: meta.session.clone(),
+                turn: meta.turn,
+                scope: Scope::Turn,
+            };
+            self.live_headers.insert(path.clone(), (shown, headers));
+        }
+        overlay.call(rpc, OverlayCall::LiveShow { path, meta, hunks }, now);
+    }
+
+    /// Takes `path`'s live drawing off, and with it what the flow kept of that drawing.
+    fn live_clear(&mut self, path: PathBuf, rpc: Option<&dyn EditorRpc>, now: Instant) {
+        let Some(overlay) = self.overlay.as_mut().filter(|overlay| overlay.reachable(rpc)) else {
+            return;
+        };
+        if let Some((session, turn)) = overlay.live_drawings().get(&path) {
+            if self
+                .shown
+                .get(&path)
+                .is_some_and(|shown| shown.meta.session == *session && shown.meta.turn == *turn)
+            {
+                self.shown.remove(&path);
+            }
+        }
+        overlay.call(rpc, OverlayCall::LiveClear { path }, now);
     }
 
     /// Hunks reverted in the editor become reverts of their tab's draft, in the order they
@@ -1824,6 +2385,47 @@ fn may_write(tabs: &TabSet) -> Result<PresenceGuard, String> {
     }
     tabs.presence_guard()
         .ok_or_else(|| Blocked::NotHeld("no state directory".to_string()).to_string())
+}
+
+/// Whether `tab` is still here, staying, and holding `session`: otherwise its live drawings go.
+fn holds_session(tabs: &TabSet, tab: u64, session: &str) -> bool {
+    !tabs.is_moving(TabId(tab))
+        && tabs
+            .get(TabId(tab))
+            .is_some_and(|found| found.provider_session_id().as_deref() == Some(session))
+}
+
+/// The absolute path of a file an edit call named (absolute, or relative to the project root), when
+/// it names one inside the project in UTF-8; decided from the text alone, on the GTK thread. The
+/// worker's read checks the file itself from the project root.
+fn live_path(root: &Path, named: &Path) -> Option<PathBuf> {
+    let rel = if named.is_absolute() {
+        named.strip_prefix(root).ok()?
+    } else {
+        named
+    };
+    let mut clean = PathBuf::new();
+    for component in rel.components() {
+        match component {
+            Component::Normal(part) => clean.push(part),
+            Component::CurDir => {}
+            _ => return None,
+        }
+    }
+    check_relative(clean.to_str()?).ok()?;
+    Some(root.join(clean))
+}
+
+/// Whether `abs` is drawn live for another turn than `session`'s `turn`.
+fn live_of_another_turn(overlay: &Overlay, abs: &Path, session: &str, turn: u32) -> bool {
+    overlay
+        .live_drawings()
+        .get(abs)
+        .is_some_and(|(drawn_session, drawn_turn)| drawn_session != session || *drawn_turn != turn)
+}
+
+fn no_worker() -> ReviewError {
+    ReviewError::Unavailable("the worker could not be started or stopped".to_string())
 }
 
 /// A path from the panel names a file inside the project: relative, with no `..`, no root and no

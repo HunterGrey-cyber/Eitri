@@ -601,6 +601,16 @@ pub(super) fn poll_review_flow(state: &mut AgentPanelState, screen: &Screen, out
     dispatch_review_outs(state, screen, outs, out);
 }
 
+/// The tick's half of the live drawings: the edits the pump listed since the last tick, and the editor's and the
+/// workers' answers for them. Nothing here answers a page; what the editor reports back comes through
+/// [`poll_review_flow`], which runs after this.
+pub(super) fn poll_live_review(state: &mut AgentPanelState) {
+    state.review_editor.sync(&mut state.review_flow);
+    state
+        .review_flow
+        .live_tick(&mut state.tabs, state.editor_rpc.as_deref(), std::time::Instant::now());
+}
+
 /// The return half of a scratch edit: every edit whose marker appeared goes back to the tab it came from,
 /// told to the page that shows it, and the keys return to the chat view of the last such tab.
 pub(super) fn poll_scratch_edits(state: &mut AgentPanelState, out: &mut Outbox) {

@@ -921,6 +921,40 @@ impl EditorOverlay {
         &self.live_drawings
     }
 
+    /// A driver for `owner` that keeps `contest`, the table an earlier driver of this window built:
+    /// which paths are contested is decided from edits, not from the editor that showed them.
+    pub fn with_contest(owner: Owner, contest: LiveContest) -> EditorOverlay {
+        EditorOverlay {
+            contest,
+            ..EditorOverlay::new(owner)
+        }
+    }
+
+    /// The contested-paths table, for the driver that replaces this one.
+    pub fn into_contest(self) -> LiveContest {
+        self.contest
+    }
+
+    /// Whether two turns running at once both edited `path`.
+    pub fn is_contested(&self, path: &Path) -> bool {
+        self.contest.is_contested(path)
+    }
+
+    /// Whether a call other than a live one, queued or waiting for its answer, draws over or clears
+    /// `path`: what its answer leaves there replaces what any earlier answer drew.
+    pub fn draws_pending(&self, path: &Path) -> bool {
+        self.queue
+            .iter()
+            .chain(self.in_flight.iter().map(|flight| &flight.queued))
+            .any(|queued| match &queued.call {
+                OverlayCall::OpenAndShow { path: over, .. }
+                | OverlayCall::Show { path: over, .. }
+                | OverlayCall::Clear { path: over } => over == path,
+                OverlayCall::ClearAll => true,
+                OverlayCall::LiveShow { .. } | OverlayCall::LiveClear { .. } => false,
+            })
+    }
+
     fn forget_live(&mut self, path: &Path) {
         self.live_drawings.remove(path);
         self.live_windows.remove(path);
@@ -1908,6 +1942,14 @@ impl Overlay {
             Overlay::Local(overlay) => overlay.live_drawings(),
             // A linked window is told of no live drawing yet.
             Overlay::Remote(_) => &NO_LIVE_DRAWINGS,
+        }
+    }
+
+    /// See [`EditorOverlay::draws_pending`]; a linked window's calls wait in window 1's driver.
+    pub fn draws_pending(&self, path: &Path) -> bool {
+        match self {
+            Overlay::Local(overlay) => overlay.draws_pending(path),
+            Overlay::Remote(_) => false,
         }
     }
 

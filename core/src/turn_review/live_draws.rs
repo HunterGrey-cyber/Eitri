@@ -518,6 +518,11 @@ impl LiveDraws {
         steps
     }
 
+    /// Whether the turn `key` is followed: it runs, or its drawings are not settled yet.
+    pub fn follows(&self, key: &TurnKey) -> bool {
+        self.turns.iter().any(|turn| turn.key == *key)
+    }
+
     /// True while a turn is followed or a step waits to be given out.
     pub fn wants_ticks(&self) -> bool {
         !self.turns.is_empty() || !self.out.is_empty() || self.asking

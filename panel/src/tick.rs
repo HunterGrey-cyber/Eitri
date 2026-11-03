@@ -172,6 +172,9 @@ pub(super) fn tick_send(
     for (view, hint) in &hints {
         out.send(*view, eitri_core::agent_bridge::serialize_review_hint_for_js(hint));
     }
+    // The agent's edits drawn in the editor as they land: before the flow's own tick, which takes what the editor
+    // answers to them.
+    poll_live_review(state);
     // A shown tab's offers changed (a card arrived or went): its page's third buttons follow.
     for tab in pumped.offers_changed {
         let payload = state.page_of(tab).and_then(|view| {
