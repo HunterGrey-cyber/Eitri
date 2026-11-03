@@ -496,25 +496,26 @@ mod tests {
             },
         );
         assert_eq!(view(&r).rows[0].name, "right");
-        let batch = line(&mut r, LineEv::Changed("./a".into()));
+        let batch = line(&mut r, LineEv::Changed("./a/x".into()));
         let serial = batch
             .ops()
             .find_map(|op| match op {
-                HostOp::Project(ProjectOp::Path { serial, base, .. }) => {
-                    assert_eq!(base, &PathBuf::from("/work/current"));
+                HostOp::Project(ProjectOp::Read { serial, dir, .. }) => {
+                    assert_eq!(dir, &PathBuf::from("/work/current/a"));
                     Some(*serial)
                 }
                 _ => None,
             })
             .unwrap();
-        line(&mut r, LineEv::Changed("./b".into()));
+        line(&mut r, LineEv::Changed("./b/x".into()));
         let before = view(&r);
         post(
             &mut r,
-            ProjectEvent::PathAnswer {
+            ProjectEvent::Listing {
                 win: WIN,
                 serial,
-                answer: PathAnswer::Missing,
+                dir: "/work/current/a".into(),
+                listing: crate::project_chooser::Listing::Missing,
             },
         );
         assert_eq!(view(&r), before);
@@ -610,7 +611,7 @@ mod tests {
         };
         post(&mut r, failure.clone());
         let toast = r.said().toast.unwrap();
-        assert_eq!(toast.1, "could not open app?name: see its window log");
+        assert_eq!(toast.1, "could not open app\\u{a}name: see its window log");
         post(&mut r, failure);
         assert_eq!(r.said().toast, Some(toast));
         assert_eq!(
@@ -710,24 +711,33 @@ mod tests {
         let serial = batch
             .ops()
             .find_map(|op| match op {
-                HostOp::Project(ProjectOp::Path { serial, .. }) => Some(*serial),
+                HostOp::Project(ProjectOp::Read { serial, dir, .. }) => {
+                    assert_eq!(dir, &PathBuf::from("/home/u"));
+                    Some(*serial)
+                }
                 _ => None,
             })
             .unwrap();
         post(
             &mut r,
-            ProjectEvent::PathAnswer {
+            ProjectEvent::Listing {
                 win: WIN,
                 serial,
-                answer: PathAnswer::Found {
-                    path: "/home/u/other".into(),
-                    exact: Some(crate::project_chooser::PathKind::Dir),
-                    folders: vec![],
-                    common: "~/other/".into(),
+                dir: "/home/u".into(),
+                listing: crate::project_chooser::Listing::Read {
+                    dir: "/home/u".into(),
+                    entries: vec![crate::project_chooser::Entry {
+                        raw: "other".into(),
+                        name: "other".into(),
+                        kind: crate::project_chooser::EntryKind::Dir { mount_point: false },
+                        physical: Some("/home/u/other".into()),
+                    }],
+                    capped: None,
+                    exact: None,
                 },
             },
         );
-        assert_eq!(view(&r).rows[0].shown, "~/other");
+        assert_eq!(view(&r).rows[0].name, "other/");
         line(&mut r, LineEv::Tab);
         assert_eq!(view(&r).line, "~/other/");
     }

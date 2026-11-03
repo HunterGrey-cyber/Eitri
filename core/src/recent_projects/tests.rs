@@ -311,8 +311,8 @@ fn a_name_with_a_newline_and_markup_is_one_row() {
     let found = rows(&f, FakeProbe::default());
     assert_eq!(found.len(), 1);
     assert_eq!(found[0].path, root);
-    assert_eq!(found[0].name, "中文 <b>app?next");
-    assert!(found[0].shown.contains("中文 <b>app?next"));
+    assert_eq!(found[0].name, "中文 <b>app\\u{a}next");
+    assert!(found[0].shown.contains("中文 <b>app\\u{a}next"));
     assert!(!found[0].shown.chars().any(char::is_control));
 }
 

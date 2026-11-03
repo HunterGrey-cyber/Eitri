@@ -22,20 +22,9 @@ fn line(c: &mut Chooser, text: &str) -> Vec<Effect> {
 fn enter(c: &mut Chooser) -> Vec<Effect> {
     c.event(Ev::Line(LineEv::Enter))
 }
-fn answer(c: &mut Chooser, text: &str, answer: PathAnswer) -> Vec<Effect> {
+fn answer(c: &mut Chooser, text: &str, answer: Listing) -> Vec<Effect> {
     let effects = line(c, text);
-    let Effect::Path { serial, .. } = effects[0] else {
-        panic!("expected a path request")
-    };
-    c.event(Ev::PathAnswer { serial, answer })
-}
-fn found(exact: Option<PathKind>, folders: &[&str], common: &str) -> PathAnswer {
-    PathAnswer::Found {
-        path: "/absolute/target".into(),
-        exact,
-        folders: folders.iter().map(PathBuf::from).collect(),
-        common: common.into(),
-    }
+    deliver(c, &effects, answer)
 }
 
 #[test]
@@ -160,40 +149,23 @@ fn held_enter_is_dropped_when_the_line_changed_or_no_project_row_arrived() {
 }
 #[test]
 fn a_stale_serial_changes_nothing() {
-    for path_reply in [false, true] {
-        let mut c = window();
-        let Effect::List { serial } = c.shown()[0] else {
-            unreachable!()
-        };
-        let before = c.view();
-        let ev = if path_reply {
-            Ev::PathAnswer {
-                serial: serial + 1,
-                answer: PathAnswer::Missing,
-            }
-        } else {
-            Ev::Rows {
-                serial: serial + 1,
-                rows: vec![row("/a", Fact::Open)],
-            }
-        };
-        assert!(c.event(ev).is_empty());
-        assert_eq!(c.view(), before);
-    }
     let mut c = window();
-    let Effect::Path { serial, .. } = line(&mut c, "/old")[0] else {
+    let Effect::List { serial } = c.shown()[0] else {
         unreachable!()
     };
-    line(&mut c, "/new");
     let before = c.view();
-    assert!(c
-        .event(Ev::PathAnswer {
-            serial,
-            answer: found(Some(PathKind::Dir), &[], "")
-        })
-        .is_empty());
+    c.event(Ev::Rows {
+        serial: serial + 1,
+        rows: vec![row("/a", Fact::Open)],
+    });
+    assert_eq!(c.view(), before);
+    let old = line(&mut c, "/old/");
+    line(&mut c, "/new/");
+    let before = c.view();
+    assert!(deliver(&mut c, &old, listing(&["old"])).is_empty());
     assert_eq!(c.view(), before);
 }
+
 #[test]
 fn a_reply_to_an_earlier_chooser_is_dropped() {
     for generation in [8, 9] {
@@ -214,132 +186,145 @@ fn a_reply_to_an_earlier_chooser_is_dropped() {
     }
 }
 #[test]
-fn path_text_asks_for_a_path_answer_and_filter_text_does_not() {
-    for (mode, base) in [
-        (Mode::Launch, "/home/me"),
-        (Mode::Window { root: "/here".into() }, "/here"),
-    ] {
-        let mut c = chooser(mode);
-        assert!(line(&mut c, "app").is_empty());
-        for text in ["~/app", "/app", "./app", "../app"] {
-            assert!(
-                matches!(line(&mut c, text).as_slice(), [Effect::Path { text: t, base: b, .. }] if t == text && b == Path::new(base))
-            );
+fn path_text_asks_for_a_listing_and_filter_text_does_not() {
+    for mode in modes() {
+        for typed in ["~/app", "/app", "./app", "../app"] {
+            let mut c = chooser(mode.clone());
+            assert!(line(&mut c, "app").is_empty());
+            let effects = line(&mut c, typed);
+            let (_, dir) = read_request(&effects);
+            let expected = match typed {
+                "~/app" => PathBuf::from("/home/me"),
+                "/app" => PathBuf::from("/"),
+                "./app" => {
+                    if mode == Mode::Launch {
+                        "/home/me".into()
+                    } else {
+                        "/here".into()
+                    }
+                }
+                _ => {
+                    if mode == Mode::Launch {
+                        "/home/me/..".into()
+                    } else {
+                        "/here/..".into()
+                    }
+                }
+            };
+            assert_eq!(dir, expected);
         }
     }
 }
+
 #[test]
-fn enter_on_a_found_dir_or_file_opens_the_answers_absolute_path() {
-    for kind in [PathKind::Dir, PathKind::File] {
+fn a_found_dir_is_entered_and_a_found_file_opens_by_its_walked_path() {
+    for kind in [EntryKind::Dir { mount_point: false }, EntryKind::File] {
         let mut c = window();
-        answer(&mut c, "~/target", found(Some(kind), &[], ""));
-        assert_eq!(enter(&mut c), vec![Effect::Open("/absolute/target".into())]);
-    }
-}
-#[test]
-fn enter_on_a_listed_folder_opens_its_absolute_path() {
-    for index in [0, 1] {
-        let mut c = window();
-        answer(&mut c, "~/t", found(None, &["/absolute/one", "/absolute/two"], "~/t"));
-        c.event(Ev::Line(LineEv::Step(index)));
-        assert_eq!(
-            enter(&mut c),
-            vec![Effect::Open(PathBuf::from(if index == 0 {
-                "/absolute/one"
-            } else {
-                "/absolute/two"
-            }))]
+        let effects = line(&mut c, "~/target");
+        let mut e = entry("target");
+        e.kind = kind.clone();
+        deliver(
+            &mut c,
+            &effects,
+            Listing::Read {
+                dir: "/physical".into(),
+                entries: vec![e],
+                capped: None,
+                exact: None,
+            },
         );
+        if kind == EntryKind::File {
+            assert_eq!(enter(&mut c), vec![Effect::Open("/home/me/target".into())]);
+        } else {
+            let effects = enter(&mut c);
+            assert_eq!(read_request(&effects).1, PathBuf::from("/home/me/target"));
+            deliver(&mut c, &effects, listing(&[]));
+            assert_eq!(enter(&mut c), vec![Effect::Open("/home/me/target".into())]);
+        }
     }
 }
+
+#[test]
+fn enter_on_a_listed_folder_enters_before_opening_its_walked_path() {
+    for (index, name) in [(0, "target1"), (1, "target2")] {
+        let mut c = window();
+        browse(&mut c, "~/t", &["target1", "target2"]);
+        c.event(Ev::Line(LineEv::Step(index)));
+        let effects = enter(&mut c);
+        deliver(&mut c, &effects, listing(&[]));
+        assert_eq!(enter(&mut c), vec![Effect::Open(PathBuf::from("/home/me").join(name))]);
+    }
+}
+
 #[test]
 fn enter_on_missing_says_no_such_folder_and_stays() {
     for (lang, message) in [
         (Lang::En, "no such folder: ~/lost"),
         (Lang::ZhCn, "没有这个文件夹：~/lost"),
     ] {
-        let mut c = Chooser::new(Mode::Launch, None, lang, 1);
-        answer(&mut c, "~/lost", PathAnswer::Missing);
+        let mut c = Chooser::new(Mode::Launch, Some("/home/me".into()), lang, 1);
+        answer(&mut c, "~/lost", Listing::Missing);
         assert!(enter(&mut c).is_empty());
         assert_eq!(c.view().message.as_deref(), Some(message));
     }
 }
+
 #[test]
-fn enter_held_for_a_path_answer_runs_on_it_and_stuck_says_cannot_read() {
-    for (reply, expected) in [
-        (
-            found(Some(PathKind::Dir), &[], ""),
-            vec![Effect::Open("/absolute/target".into())],
-        ),
-        (PathAnswer::Stuck, vec![]),
-    ] {
+fn enter_held_for_a_listing_runs_on_it_and_stuck_says_cannot_read() {
+    for reply in [listing(&[]), Listing::Stuck] {
         let mut c = window();
-        let Effect::Path { serial, .. } = line(&mut c, "/a")[0] else {
-            unreachable!()
+        let effects = line(&mut c, "/a/");
+        enter(&mut c);
+        let expected = if reply == Listing::Stuck {
+            vec![]
+        } else {
+            vec![Effect::Open("/a".into())]
         };
-        assert!(enter(&mut c).is_empty());
-        assert_eq!(c.event(Ev::PathAnswer { serial, answer: reply }), expected);
+        assert_eq!(deliver(&mut c, &effects, reply), expected);
         if expected.is_empty() {
-            assert_eq!(c.view().message.as_deref(), Some("cannot read that folder now"));
+            assert_eq!(c.view().message.as_deref(), Some("cannot read /a now"));
         }
     }
 }
+
 #[test]
 fn tab_sets_the_line_to_the_common_prefix_and_adds_a_slash_on_one_match() {
-    for (folders, common, expected) in [
-        (vec!["/one"], "~/one", "~/one/"),
-        (vec!["/one", "/only"], "~/on", "~/on"),
-        (vec!["/one"], "~/one/", "~/one/"),
-    ] {
+    for (names, expected) in [(vec!["one"], "~/one/"), (vec!["one", "only"], "~/on")] {
         let mut c = window();
-        answer(&mut c, "~/o", found(None, &folders, common));
+        browse(&mut c, "~/o", &names);
         let effects = c.event(Ev::Line(LineEv::Tab));
         assert!(effects.contains(&Effect::SetLine(expected.into())));
         assert_eq!(c.view().line, expected);
     }
 }
+
 #[test]
 fn tab_keeps_the_typed_form_of_the_line_and_extends_it_from_the_absolute_answer() {
-    for (typed, folders, common, expected) in [
-        ("~/b", vec!["/home/me/beta"], "/home/me/beta", "~/beta/"),
-        ("~/b", vec!["/home/me/beta", "/home/me/bin"], "/home/me/b", "~/b"),
-        ("~/.c", vec!["/home/me/.config"], "/home/me/.config", "~/.config/"),
-        ("~/..", vec!["/home/me/../you"], "/home/me/../you", "~/../you/"),
-        ("~", vec!["/home/me"], "/home/me", "~/"),
-        // A sibling of home alone (home missing, or past the entry cap) cannot be written from `~`.
-        ("~", vec!["/home/me-old"], "/home/me-old", "/home/me-old/"),
-        (
-            "./nested/ap",
-            vec!["/w/nested/apple", "/w/nested/apricot"],
-            "/w/nested/ap",
-            "./nested/ap",
-        ),
-        (
-            "./nested/ap",
-            vec!["/w/nested/apple"],
-            "/w/nested/apple",
-            "./nested/apple/",
-        ),
-        ("../sib", vec!["/w/../sibling"], "/w/../sibling", "../sibling/"),
-        ("./", vec!["/w/a", "/w/b"], "/w/", "./"),
-        ("/u", vec!["/usr"], "/usr", "/usr/"),
-        (
-            "~/应",
-            vec!["/home/me/应用甲", "/home/me/应用乙"],
-            "/home/me/应用",
-            "~/应用",
-        ),
+    for (typed, names, expected) in [
+        ("~/b", vec!["beta"], "~/beta/"),
+        ("~/b", vec!["beta", "bin"], "~/b"),
+        ("~/.c", vec![".config"], "~/.config/"),
+        ("~/..", vec!["you"], "~/../you/"),
+        ("~", vec!["me"], "~/"),
+        ("~", vec!["me-old"], "/home/me-old/"),
+        ("./nested/ap", vec!["apple", "apricot"], "./nested/ap"),
+        ("./nested/ap", vec!["apple"], "./nested/apple/"),
+        ("../sib", vec!["sibling"], "../sibling/"),
+        ("./", vec!["a", "b"], "./"),
+        ("/u", vec!["usr"], "/usr/"),
+        ("~/应", vec!["应用甲", "应用乙"], "~/应用"),
     ] {
         let mut c = window();
-        answer(&mut c, typed, found(None, &folders, common));
+        browse(&mut c, typed, &names);
         let effects = c.event(Ev::Line(LineEv::Tab));
         assert!(
             effects.contains(&Effect::SetLine(expected.into())),
             "{typed}: {effects:?}"
         );
-        assert_eq!(c.view().line, expected, "{typed}");
+        assert_eq!(c.view().line, expected);
     }
 }
+
 #[test]
 fn tab_in_a_filter_does_nothing() {
     for text in ["", "app", "a/b"] {
@@ -359,7 +344,7 @@ fn the_folder_row_is_last_but_for_a_launch_first_run_and_choose_folder_asks_the_
     ] {
         let mut c = chooser(mode);
         list(&mut c, rows);
-        assert_eq!(c.view().rows[at].name, "Choose a folder…");
+        assert_eq!(c.view().rows[at].name, "Browse folders…");
         assert_eq!(
             c.event(Ev::Line(LineEv::ChooseFolder)),
             vec![Effect::FolderDialog { at: None }]
@@ -406,7 +391,7 @@ fn launch_first_run_selects_choose_a_folder_above_home_folder() {
         let mut c = Chooser::new(Mode::Launch, home.clone(), Lang::En, 1);
         list(&mut c, vec![]);
         assert_eq!(c.view().selected, Some(0));
-        assert_eq!(c.view().rows[0].name, "Choose a folder…");
+        assert_eq!(c.view().rows[0].name, "Browse folders…");
         assert_eq!(c.view().message.as_deref(), Some("No recent projects"));
         if home.is_some() {
             assert_eq!(c.view().rows[1].name, "Home folder");
@@ -436,27 +421,27 @@ fn every_string_has_both_languages() {
             Lang::En,
             "Open a project",
             "press / to filter or type a path",
-            "Enter open · j k move · gg G ends · / filter · Ctrl+o folder · q Esc close",
-            "Choose a folder…",
+            "Enter open · j k move · h l browse · / filter · Ctrl+o dialog · q close",
+            "Browse folders…",
             "Home folder",
             "No recent projects",
             "open",
             "gone",
             "Opening app…",
-            "cannot read that folder now",
+            "cannot read / now",
         ),
         (
             Lang::ZhCn,
             "打开项目",
             "按 / 筛选或输入路径",
-            "Enter 打开 · j k 移动 · gg G 首尾 · / 筛选 · Ctrl+o 文件夹 · q Esc 关闭",
-            "选择文件夹…",
+            "Enter 打开 · j k 移动 · h l 浏览 · / 筛选 · Ctrl+o 对话框 · q 关闭",
+            "浏览文件夹…",
             "主目录",
             "没有最近的项目",
             "已打开",
             "不在了",
             "正在打开 app…",
-            "现在读不了这个文件夹",
+            "现在读不了 /",
         ),
     ] {
         let mut c = Chooser::new(Mode::Launch, Some("/home/me".into()), lang, 1);
@@ -489,7 +474,7 @@ fn every_string_has_both_languages() {
         list(&mut c, vec![row("/a", Fact::Open), row("/b", Fact::Gone)]);
         assert_eq!(c.view().rows[0].right, open);
         assert_eq!(c.view().rows[1].right, gone);
-        answer(&mut c, "/bad", PathAnswer::Stuck);
+        answer(&mut c, "/bad", Listing::Stuck);
         enter(&mut c);
         assert_eq!(c.view().message.as_deref(), Some(stuck));
         c.opening("app");
@@ -539,33 +524,21 @@ fn a_list_that_lands_during_a_start_is_there_when_the_start_fails() {
     );
 }
 #[test]
-fn a_path_answer_that_lands_during_a_start_is_there_when_the_start_fails() {
+fn a_listing_that_lands_during_a_start_is_there_when_the_start_fails() {
     let mut c = chooser(Mode::Launch);
     list(&mut c, vec![]);
-    let effects = line(&mut c, "/wo");
-    let Effect::Path { serial, .. } = effects[0] else {
-        panic!("expected a path request")
-    };
-    assert_eq!(
-        c.event(Ev::Line(LineEv::ChooseFolder)),
-        vec![Effect::FolderDialog { at: None }]
-    );
+    let effects = line(&mut c, "/work/");
+    c.event(Ev::Line(LineEv::ChooseFolder));
     assert_eq!(
         c.event(Ev::Folder(Some("/picked".into()))),
         vec![Effect::Open("/picked".into())]
     );
     c.opening("picked");
-
-    let answer = found(Some(PathKind::Dir), &[], "");
-    assert_eq!(
-        c.event(Ev::PathAnswer { serial, answer }),
-        vec![],
-        "an answer starts nothing"
-    );
-
+    assert!(deliver(&mut c, &effects, listing(&[])).is_empty());
     c.failed("failed".into());
-    assert_eq!(enter(&mut c), vec![Effect::Open("/absolute/target".into())]);
+    assert_eq!(enter(&mut c), vec![Effect::Open("/work".into())]);
 }
+
 #[test]
 fn step_keys_match_the_session_chooser() {
     use crate::source_scan::{code_only, read_required};
@@ -613,7 +586,7 @@ fn step_keys_match_the_session_chooser() {
 #[test]
 fn row_labels_are_safe_text_and_paths_keep_their_bytes() {
     for (path, name, shown) in [
-        ("/home/me/<b> 中文\n", "<b> 中文?", "~/<b> 中文?"),
+        ("/home/me/<b> 中文\n", "<b> 中文\\u{a}", "~/<b> 中文\\u{a}"),
         ("/home/me", "me", "~"),
         ("/home/mesh/app", "app", "/home/mesh/app"),
         ("/", "/", "/"),
@@ -641,58 +614,41 @@ fn ages_use_minutes_hours_days_and_weeks_with_future_times_clamped() {
 }
 
 #[test]
-fn folder_clicks_work_while_a_path_answer_is_pending_or_missing() {
-    for reply in [None, Some(PathAnswer::Missing), Some(PathAnswer::Stuck)] {
+fn the_dialog_works_while_a_listing_is_pending_or_missing() {
+    for reply in [None, Some(Listing::Missing), Some(Listing::Stuck)] {
         let mut c = window();
-        let Effect::Path { serial, .. } = line(&mut c, "/absent")[0] else {
-            unreachable!()
-        };
-        if let Some(answer) = reply {
-            c.event(Ev::PathAnswer { serial, answer });
+        let effects = line(&mut c, "/absent");
+        if let Some(reply) = reply {
+            deliver(&mut c, &effects, reply);
         }
-        let index = c.view().rows.len() - 1;
         assert_eq!(
-            c.event(Ev::Pick {
-                index,
-                rows_rev: c.view().rows_rev
-            }),
+            c.event(Ev::Line(LineEv::ChooseFolder)),
             vec![Effect::FolderDialog { at: None }]
         );
     }
 }
+
 #[test]
-fn held_enter_never_opens_a_dialog_for_an_empty_path_answer() {
+fn held_enter_never_opens_a_dialog_for_an_empty_listing() {
     let mut c = window();
-    let Effect::Path { serial, .. } = line(&mut c, "/absent")[0] else {
-        unreachable!()
-    };
+    let effects = line(&mut c, "/absent");
     enter(&mut c);
-    assert!(c
-        .event(Ev::PathAnswer {
-            serial,
-            answer: found(None, &[], "")
-        })
-        .is_empty());
+    assert!(deliver(&mut c, &effects, listing(&[])).is_empty());
 }
+
 #[test]
-fn a_new_filter_invalidates_a_pending_path_and_held_enter() {
-    for next in ["/other", "app"] {
+fn a_new_folder_or_projects_filter_invalidates_a_pending_read_and_held_enter() {
+    for next in ["/other/", "app"] {
         let mut c = window();
-        let Effect::Path { serial, .. } = line(&mut c, "/first")[0] else {
-            unreachable!()
-        };
+        let effects = line(&mut c, "/first/");
         enter(&mut c);
         line(&mut c, next);
         let before = c.view();
-        assert!(c
-            .event(Ev::PathAnswer {
-                serial,
-                answer: found(Some(PathKind::Dir), &[], "")
-            })
-            .is_empty());
+        assert!(deliver(&mut c, &effects, listing(&[])).is_empty());
         assert_eq!(c.view(), before);
     }
 }
+
 #[test]
 fn a_failed_start_logs_its_code_or_unknown_and_never_a_path() {
     assert_eq!(start_failed_line(Some(1)), "[project] start failed 1");
@@ -749,7 +705,7 @@ fn it_opens_in_the_list_with_the_list_keys_and_a_placeholder_that_names_the_slas
         let v = c.view();
         assert!(!v.in_line);
         assert_eq!(v.placeholder, "press / to filter or type a path");
-        assert!(v.footer.contains("j k move") && v.footer.contains("q Esc close"));
+        assert!(v.footer.contains("j k move") && v.footer.contains("q close"));
     }
 }
 
@@ -782,7 +738,7 @@ fn gg_goes_to_the_first_row_and_capital_g_to_the_last() {
     let mut c = three();
     assert!(key(&mut c, 'G').is_empty());
     assert_eq!(c.view().selected, Some(3));
-    assert_eq!(c.view().rows[3].name, "Choose a folder…");
+    assert_eq!(c.view().rows[3].name, "Browse folders…");
     key(&mut c, 'g');
     assert_eq!(c.view().selected, Some(3), "a lone g only waits");
     key(&mut c, 'g');
@@ -808,7 +764,7 @@ fn capital_g_on_a_launch_first_run_lands_on_the_last_row() {
     assert_eq!(c.view().selected, Some(1));
     key(&mut c, 'g');
     key(&mut c, 'g');
-    assert_eq!(c.view().rows[c.view().selected.unwrap()].name, "Choose a folder…");
+    assert_eq!(c.view().rows[c.view().selected.unwrap()].name, "Browse folders…");
 }
 
 /// The key after a waiting `g` does nothing else, whatever it is: `gx`, `g<Enter>`, `g<Esc>` and `g<Down>` act as
@@ -908,7 +864,8 @@ fn enter_in_the_list_opens_the_selected_row() {
     assert_eq!(enter(&mut c), vec![Effect::Open("/b".into())]);
     let mut c = three();
     key(&mut c, 'G');
-    assert_eq!(enter(&mut c), vec![Effect::FolderDialog { at: None }]);
+    let effects = enter(&mut c);
+    assert_eq!(read_request(&effects).1, PathBuf::from("/"));
 }
 
 #[test]
@@ -952,23 +909,15 @@ fn esc_in_the_line_clears_it_and_returns_to_the_list_and_a_second_esc_closes() {
 }
 
 #[test]
-fn esc_in_the_line_drops_a_pending_path_and_a_held_enter() {
+fn esc_in_the_line_drops_a_pending_read_and_a_held_enter() {
     let mut c = window();
     let Effect::List { serial } = c.shown()[0] else {
         unreachable!()
     };
     let effects = line(&mut c, "~/x");
-    let Effect::Path { serial: path, .. } = effects[0] else {
-        panic!("a path request")
-    };
-    assert!(enter(&mut c).is_empty(), "held for the path answer");
-    assert!(esc(&mut c).is_empty());
-    assert!(c
-        .event(Ev::PathAnswer {
-            serial: path,
-            answer: found(Some(PathKind::Dir), &[], "")
-        })
-        .is_empty());
+    enter(&mut c);
+    esc(&mut c);
+    assert!(deliver(&mut c, &effects, listing(&[])).is_empty());
     assert!(c
         .event(Ev::Rows {
             serial,
@@ -994,44 +943,11 @@ fn q_and_esc_close_the_list_with_nothing_opened() {
 }
 
 #[test]
-fn a_tilde_in_the_list_goes_to_the_line_with_it_typed() {
-    for (mode, base) in [
-        (Mode::Window { root: "/here".into() }, "/here"),
-        (Mode::Launch, "/home/me"),
-    ] {
-        let mut c = chooser(mode);
-        list(&mut c, vec![row("/a", Fact::Present)]);
-        let effects = key(&mut c, '~');
-        let Effect::Path { serial, .. } = effects[1] else {
-            panic!("a path request: {effects:?}")
-        };
-        assert_eq!(
-            effects,
-            vec![
-                Effect::SetLine("~".into()),
-                Effect::Path {
-                    serial,
-                    text: "~".into(),
-                    base: base.into()
-                }
-            ]
-        );
-        let v = c.view();
-        assert!(v.in_line);
-        assert_eq!(v.line, "~");
-        // The entry reporting the same text changes nothing.
-        assert!(line(&mut c, "~").is_empty());
-        line(&mut c, "~/");
-        assert!(c.view().in_line);
-    }
-}
-
-#[test]
 fn other_plain_keys_in_the_list_do_nothing() {
     let mut c = three();
     key(&mut c, 'j');
     let before = c.view();
-    for ch in "abcdefhilmnoprstuvwxyz0123456789 .,:;!?-_=+*#@$%^&()[]{}<>|\\'\"ABCDEFHIJKLMNOPQRSTUVWXYZ中".chars() {
+    for ch in "abcdefimnoprstuvwxyz0123456789 .,:;!?_=+*#@$%^&()[]{}<>|\\'\"ABCDEFHIJKLMNOPQRSTUVWXYZ中".chars() {
         assert!(key(&mut c, ch).is_empty(), "{ch}");
         assert_eq!(c.view(), before, "{ch}");
     }
@@ -1138,13 +1054,14 @@ fn a_launch_first_run_works_with_the_same_keys() {
     let mut c = chooser(Mode::Launch);
     list(&mut c, vec![]);
     assert_eq!(c.view().selected, Some(0));
-    assert_eq!(c.view().rows[0].name, "Choose a folder…");
+    assert_eq!(c.view().rows[0].name, "Browse folders…");
     key(&mut c, 'j');
     assert_eq!(c.view().rows[1].name, "Home folder");
     assert_eq!(c.view().selected, Some(1));
     key(&mut c, 'k');
-    assert_eq!(enter(&mut c), vec![Effect::FolderDialog { at: None }]);
-    assert!(c.event(Ev::Folder(None)).is_empty());
+    let effects = enter(&mut c);
+    deliver(&mut c, &effects, listing(&[]));
+    esc(&mut c);
     key(&mut c, '/');
     line(&mut c, "zzz");
     assert_eq!(c.view().rows.len(), 1);
@@ -1230,26 +1147,22 @@ fn a_pick_with_an_old_rows_rev_is_dropped() {
 }
 
 #[test]
-fn rows_rev_changes_for_path_answers_and_opening_state() {
+fn rows_rev_changes_for_listing_answers_and_opening_state() {
     let mut c = window();
     list(&mut c, vec![row("/a", Fact::Present)]);
     let before = c.view();
-    let effects = line(&mut c, "./app");
-    let [Effect::Path { serial, .. }] = effects[..] else {
-        panic!("a path asks for its answer");
-    };
+    let effects = line(&mut c, "./app/");
+    let (serial, dir) = read_request(&effects);
     let waiting = c.view();
     assert!(waiting.rows_rev > before.rows_rev);
-    assert!(!std::sync::Arc::ptr_eq(&before.rows, &waiting.rows));
-    c.event(Ev::PathAnswer {
+    assert!(!Arc::ptr_eq(&before.rows, &waiting.rows));
+    c.event(Ev::Listing {
         serial: serial + 1,
-        answer: PathAnswer::Missing,
+        dir,
+        listing: Listing::Missing,
     });
     assert_eq!(c.view().rows_rev, waiting.rows_rev);
-    c.event(Ev::PathAnswer {
-        serial,
-        answer: found(Some(PathKind::Dir), &[], ""),
-    });
+    deliver(&mut c, &effects, listing(&["x"]));
     let answered = c.view();
     assert!(answered.rows_rev > waiting.rows_rev);
     c.opening("app");
@@ -1273,4 +1186,1482 @@ fn a_pick_from_a_previous_opening_is_stale() {
         })
         .is_empty());
     assert_eq!(current.view(), before);
+}
+
+fn modes() -> [Mode; 2] {
+    [Mode::Launch, Mode::Window { root: "/here".into() }]
+}
+fn entry(name: &str) -> Entry {
+    Entry {
+        raw: name.into(),
+        name: name.into(),
+        kind: EntryKind::Dir { mount_point: false },
+        physical: Some(PathBuf::from("/physical").join(name)),
+    }
+}
+fn read_request(effects: &[Effect]) -> (u64, PathBuf) {
+    effects
+        .iter()
+        .find_map(|effect| match effect {
+            Effect::Read { serial, dir, .. } => Some((*serial, dir.clone())),
+            _ => None,
+        })
+        .expect("a folder read was requested")
+}
+fn deliver(c: &mut Chooser, effects: &[Effect], listing: Listing) -> Vec<Effect> {
+    let (serial, dir) = read_request(effects);
+    c.event(Ev::Listing { serial, dir, listing })
+}
+fn listing(names: &[&str]) -> Listing {
+    Listing::Read {
+        dir: "/physical".into(),
+        entries: names.iter().map(|name| entry(name)).collect(),
+        capped: None,
+        exact: None,
+    }
+}
+fn browse(c: &mut Chooser, path: &str, names: &[&str]) {
+    let effects = line(c, path);
+    deliver(c, &effects, listing(names));
+}
+fn side(c: &mut Chooser, direction: i32) -> Vec<Effect> {
+    c.event(Ev::Line(LineEv::Side(direction)))
+}
+fn selected_name(c: &Chooser) -> String {
+    let view = c.view();
+    view.rows[view.selected.unwrap()].name.clone()
+}
+
+macro_rules! transition_project {
+    ($name:ident, $key:expr, $dir:expr, $cursor:expr) => {
+        #[test]
+        fn $name() {
+            for mode in modes() {
+                let mut c = chooser(mode);
+                list(&mut c, vec![row("/projects/app", Fact::Present)]);
+                let effects = c.event(Ev::Line($key));
+                assert_eq!(read_request(&effects).1, PathBuf::from($dir));
+                assert!(c.view().browsing);
+                assert!(!c.view().in_line);
+                deliver(&mut c, &effects, listing(&["app", "other"]));
+                assert_eq!(selected_name(&c), $cursor);
+            }
+        }
+    };
+}
+transition_project!(
+    transition_list_h_on_project_browses_parent_cursor_on_project,
+    LineEv::Key('h'),
+    "/projects",
+    "app/"
+);
+transition_project!(
+    transition_list_left_on_project_browses_parent_cursor_on_project,
+    LineEv::Side(-1),
+    "/projects",
+    "app/"
+);
+transition_project!(
+    transition_list_l_on_project_browses_project_cursor_on_here,
+    LineEv::Key('l'),
+    "/projects/app",
+    "."
+);
+transition_project!(
+    transition_list_right_on_project_browses_project_cursor_on_here,
+    LineEv::Side(1),
+    "/projects/app",
+    "."
+);
+transition_project!(
+    transition_list_tilde_browses_home_cursor_on_here,
+    LineEv::Key('~'),
+    "/home/me",
+    "."
+);
+
+#[test]
+fn transition_list_minus_in_launch_browses_home() {
+    for mode in modes() {
+        for ev in [LineEv::Key('-'), LineEv::Enter, LineEv::Key('l'), LineEv::Side(1)] {
+            let mut c = chooser(mode.clone());
+            list(&mut c, vec![]);
+            let expected = if mode == Mode::Launch { "/home/me" } else { "/" };
+            let effects = c.event(Ev::Line(ev));
+            assert_eq!(read_request(&effects).1, PathBuf::from(expected));
+        }
+    }
+}
+#[test]
+fn transition_list_h_on_browse_stays_in_the_list() {
+    for mode in modes() {
+        let mut c = chooser(mode);
+        list(&mut c, vec![]);
+        assert!(key(&mut c, 'h').is_empty());
+        assert!(!c.view().browsing);
+    }
+}
+#[test]
+fn transition_list_side_on_home_browses_home_or_its_parent() {
+    for (direction, expected, cursor) in [(-1, "/home", "me/"), (1, "/home/me", ".")] {
+        let mut c = chooser(Mode::Launch);
+        list(&mut c, vec![]);
+        c.event(Ev::Line(LineEv::Step(1)));
+        let effects = side(&mut c, direction);
+        assert_eq!(read_request(&effects).1, PathBuf::from(expected));
+        deliver(&mut c, &effects, listing(&["me"]));
+        assert_eq!(selected_name(&c), cursor);
+    }
+}
+#[test]
+fn transition_filter_typing_a_path_browses_the_folder_and_filters() {
+    for mode in modes() {
+        for typed in ["~/s", "/mnt/", "./", "../"] {
+            let mut c = chooser(mode.clone());
+            list(&mut c, vec![]);
+            key(&mut c, '/');
+            let effects = line(&mut c, typed);
+            assert!(c.view().browsing && c.view().in_line);
+            assert!(effects.iter().any(|e| matches!(e, Effect::Read { debounce: true, .. })));
+        }
+    }
+}
+#[test]
+fn transition_path_non_path_text_goes_to_the_projects_filter() {
+    for mode in modes() {
+        let mut c = chooser(mode);
+        list(&mut c, vec![row("/kv", Fact::Open)]);
+        browse(&mut c, "~/", &["src"]);
+        assert!(line(&mut c, "kv").is_empty());
+        assert!(!c.view().browsing);
+        assert!(c.view().in_line);
+        assert_eq!(selected_name(&c), "kv");
+    }
+}
+#[test]
+fn transition_path_backspace_past_tilde_slash_lists_homes_parent_filtered_by_its_name() {
+    for mode in modes() {
+        let mut c = chooser(mode);
+        browse(&mut c, "~/", &[]);
+        let effects = line(&mut c, "~");
+        assert_eq!(read_request(&effects).1, PathBuf::from("/home"));
+        deliver(&mut c, &effects, listing(&["me", "you"]));
+        assert_eq!(selected_name(&c), "me/");
+    }
+}
+#[test]
+fn transition_path_trailing_dot_dot_names_the_parent() {
+    for mode in modes() {
+        for (typed, expected) in [("~/src/..", "/home/me/src/.."), ("~/src/.", "/home/me/src")] {
+            let mut c = chooser(mode.clone());
+            let effects = line(&mut c, typed);
+            assert_eq!(read_request(&effects).1, PathBuf::from(expected));
+            deliver(&mut c, &effects, listing(&[]));
+            assert_eq!(selected_name(&c), ".");
+        }
+    }
+}
+#[test]
+fn transition_path_esc_returns_to_the_folder_last_shown() {
+    for mode in modes() {
+        let mut c = chooser(mode);
+        browse(&mut c, "~/", &["src"]);
+        line(&mut c, "~/missing/half");
+        esc(&mut c);
+        assert!(c.view().browsing && !c.view().in_line);
+        assert_eq!(c.view().line, "~/");
+        assert_eq!(selected_name(&c), ".");
+    }
+}
+#[test]
+fn transition_path_esc_with_no_folder_shown_returns_to_the_list() {
+    for mode in modes() {
+        let mut c = chooser(mode);
+        let effects = line(&mut c, "/missing/");
+        deliver(&mut c, &effects, Listing::Missing);
+        esc(&mut c);
+        assert!(!c.view().browsing && !c.view().in_line);
+        assert_eq!(c.view().line, "");
+    }
+}
+#[test]
+fn transition_browse_slash_edits_the_path_and_esc_returns_to_browse() {
+    for mode in modes() {
+        let mut c = chooser(mode);
+        let effects = key(&mut c, '~');
+        deliver(&mut c, &effects, listing(&["src"]));
+        assert!(key(&mut c, '/').is_empty());
+        assert!(c.view().in_line);
+        line(&mut c, "~/sr");
+        esc(&mut c);
+        assert_eq!(c.view().line, "~/");
+        assert!(!c.view().in_line);
+        assert_eq!(selected_name(&c), ".");
+        esc(&mut c);
+        assert!(!c.view().browsing);
+        assert_eq!(c.view().line, "");
+    }
+}
+#[test]
+fn transition_browse_here_right_does_nothing_and_home_keys_browse_home() {
+    for mode in modes() {
+        let mut c = chooser(mode);
+        browse(&mut c, "/else/", &[]);
+        esc(&mut c);
+        assert!(side(&mut c, 1).is_empty());
+        key(&mut c, 'g');
+        let effects = key(&mut c, 'h');
+        assert_eq!(read_request(&effects).1, PathBuf::from("/home/me"));
+        deliver(&mut c, &effects, listing(&[]));
+        assert_eq!(selected_name(&c), ".");
+        assert_eq!(key(&mut c, 'q'), vec![Effect::Close]);
+    }
+}
+#[test]
+fn transition_browse_up_keys_browse_parent_cursor_on_folder_left() {
+    for mode in modes() {
+        for ev in [LineEv::Key('h'), LineEv::Side(-1), LineEv::Key('-'), LineEv::Up] {
+            let mut c = chooser(mode.clone());
+            browse(&mut c, "/parent/child/", &[]);
+            esc(&mut c);
+            let effects = c.event(Ev::Line(ev.clone()));
+            assert_eq!(read_request(&effects).1, PathBuf::from("/parent"));
+            deliver(&mut c, &effects, listing(&["child"]));
+            assert_eq!(selected_name(&c), "child/");
+        }
+        let mut c = chooser(mode);
+        browse(&mut c, "/", &[]);
+        esc(&mut c);
+        assert!(key(&mut c, 'h').is_empty());
+    }
+}
+#[test]
+fn enter_on_a_folder_goes_in_and_lands_on_here() {
+    for mode in modes() {
+        for in_line in [false, true] {
+            let mut c = chooser(mode.clone());
+            browse(&mut c, "~/", &["src"]);
+            if !in_line {
+                esc(&mut c);
+            }
+            c.event(Ev::Line(LineEv::Step(1)));
+            let effects = enter(&mut c);
+            assert_eq!(read_request(&effects).1, PathBuf::from("/home/me/src"));
+            assert!(!effects.iter().any(|e| matches!(e, Effect::Open(_))));
+            deliver(&mut c, &effects, listing(&[]));
+            assert_eq!(selected_name(&c), ".");
+            assert_eq!(c.view().in_line, in_line);
+        }
+    }
+}
+#[test]
+fn enter_on_here_opens_only_after_read_or_denied() {
+    for mode in modes() {
+        for reply in [listing(&[]), Listing::Denied { exact: None }] {
+            let mut c = chooser(mode.clone());
+            browse(&mut c, "~/", &[]);
+            let effects = line(&mut c, "~/src/");
+            assert!(enter(&mut c).is_empty());
+            assert_eq!(
+                deliver(&mut c, &effects, reply),
+                vec![Effect::Open("/home/me/src".into())]
+            );
+        }
+    }
+}
+#[test]
+fn enter_on_here_while_stuck_says_cannot_read_and_stays() {
+    for reply in [
+        Listing::Stuck,
+        Listing::Missing,
+        Listing::Loop,
+        Listing::TooManyStuck,
+        Listing::NotAFolder,
+    ] {
+        let mut c = window();
+        let effects = line(&mut c, "/blocked/");
+        deliver(&mut c, &effects, reply.clone());
+        assert!(enter(&mut c).is_empty());
+        assert!(c.view().browsing);
+        if reply == Listing::Stuck {
+            assert_eq!(c.view().message.as_deref(), Some("cannot read /blocked now"));
+        }
+    }
+}
+#[test]
+fn held_enter_on_here_waits_for_the_listing() {
+    let mut c = window();
+    let effects = line(&mut c, "/read/");
+    assert!(enter(&mut c).is_empty());
+    let (serial, _) = read_request(&effects);
+    c.event(Ev::Slow { serial });
+    assert!(c.view().message.as_deref().unwrap().contains("reading"));
+    assert_eq!(
+        deliver(&mut c, &effects, listing(&[])),
+        vec![Effect::Open("/read".into())]
+    );
+}
+#[test]
+fn two_held_enters_go_in_then_open() {
+    for mode in modes() {
+        let mut c = chooser(mode);
+        let effects = line(&mut c, "~/src/li");
+        enter(&mut c);
+        enter(&mut c);
+        let effects = deliver(&mut c, &effects, listing(&["linux", "little"]));
+        assert_eq!(read_request(&effects).1, PathBuf::from("/home/me/src/linux"));
+        assert_eq!(
+            deliver(&mut c, &effects, listing(&[])),
+            vec![Effect::Open("/home/me/src/linux".into())]
+        );
+    }
+}
+#[test]
+fn a_third_enter_is_not_held_and_a_move_drops_what_is_held() {
+    for move_cursor in [false, true] {
+        let mut c = window();
+        let effects = line(&mut c, "~/src/li");
+        enter(&mut c);
+        enter(&mut c);
+        enter(&mut c);
+        assert!(matches!(&c.place, Place::Folder(b) if b.held_enters == 2));
+        if move_cursor {
+            c.event(Ev::Line(LineEv::Step(1)));
+        }
+        let effects = deliver(&mut c, &effects, listing(&["linux"]));
+        if move_cursor {
+            assert!(effects.is_empty());
+        } else {
+            assert_eq!(
+                deliver(&mut c, &effects, listing(&[])),
+                vec![Effect::Open("/home/me/src/linux".into())]
+            );
+            assert!(deliver(&mut c, &effects, listing(&[])).is_empty());
+        }
+    }
+}
+#[test]
+fn a_typed_folder_with_a_slash_opens_on_one_enter() {
+    let mut c = window();
+    browse(&mut c, "~/src/", &[]);
+    assert_eq!(enter(&mut c), vec![Effect::Open("/home/me/src".into())]);
+}
+#[test]
+fn enter_on_a_mount_or_unknown_link_row_goes_in_and_never_opens() {
+    for kind in [
+        EntryKind::Dir { mount_point: true },
+        EntryKind::Link {
+            target: "/mount".into(),
+            kind: LinkKind::Unknown,
+        },
+    ] {
+        let mut c = window();
+        let effects = line(&mut c, "/mnt/");
+        let mut e = entry("remote");
+        e.kind = kind;
+        deliver(
+            &mut c,
+            &effects,
+            Listing::Read {
+                dir: "/mnt".into(),
+                entries: vec![e],
+                capped: None,
+                exact: None,
+            },
+        );
+        c.event(Ev::Line(LineEv::Step(1)));
+        let effects = enter(&mut c);
+        assert_eq!(read_request(&effects).1, PathBuf::from("/mnt/remote"));
+        assert!(!effects.iter().any(|e| matches!(e, Effect::Open(_))));
+        deliver(&mut c, &effects, Listing::Stuck);
+        assert!(enter(&mut c).is_empty());
+    }
+}
+#[test]
+fn the_file_row_appears_only_on_an_exact_name_and_opens() {
+    for filter in ["", "note", "notes.md", "NOTES.MD"] {
+        let mut c = window();
+        let effects = line(&mut c, &format!("~/notes/{filter}"));
+        let mut file = entry("notes.md");
+        file.kind = EntryKind::File;
+        deliver(
+            &mut c,
+            &effects,
+            Listing::Read {
+                dir: "/physical".into(),
+                entries: vec![file],
+                capped: None,
+                exact: None,
+            },
+        );
+        let exact = filter == "notes.md";
+        assert_eq!(c.view().rows.iter().any(|r| r.kind == RowKind::File), exact);
+        if exact {
+            assert_eq!(enter(&mut c), vec![Effect::Open("/home/me/notes/notes.md".into())]);
+        }
+    }
+}
+#[test]
+fn a_link_to_a_file_is_the_file_row() {
+    let mut c = window();
+    let effects = line(&mut c, "~/link.md");
+    let mut e = entry("link.md");
+    e.kind = EntryKind::Link {
+        target: "notes.md".into(),
+        kind: LinkKind::Unknown,
+    };
+    let (serial, _) = read_request(&effects);
+    deliver(
+        &mut c,
+        &effects,
+        Listing::Read {
+            dir: "/physical".into(),
+            entries: vec![e],
+            capped: None,
+            exact: None,
+        },
+    );
+    c.event(Ev::Later {
+        serial,
+        git: vec![],
+        links: vec![("link.md".into(), LinkKind::File)],
+    });
+    assert_eq!(c.view().rows[0].kind, RowKind::File);
+    assert_eq!(enter(&mut c), vec![Effect::Open("/home/me/link.md".into())]);
+}
+#[test]
+fn filter_order_is_equal_then_prefix_then_contains_case_insensitive() {
+    let mut c = window();
+    browse(&mut c, "~/APP", &["xAPP", "app10", "App", "app2", "apple", "other"]);
+    assert_eq!(
+        c.view().rows.iter().map(|r| r.name.as_str()).collect::<Vec<_>>(),
+        ["App/", "app2/", "app10/", "apple/", "xAPP/"]
+    );
+}
+#[test]
+fn hidden_toggle_and_a_dot_filter_read_nothing() {
+    let mut c = window();
+    browse(&mut c, "~/", &[".config", "src"]);
+    esc(&mut c);
+    assert!(!c.view().hidden);
+    assert!(key(&mut c, '.').is_empty());
+    assert!(c.view().hidden);
+    assert_eq!(c.view().rows.len(), 3);
+    key(&mut c, '.');
+    key(&mut c, '/');
+    assert!(line(&mut c, "~/.c").is_empty());
+    assert_eq!(selected_name(&c), ".config/");
+}
+#[test]
+fn typing_after_the_last_slash_reads_nothing() {
+    let mut c = window();
+    browse(&mut c, "~/src/", &["linux"]);
+    for typed in ["~/src/l", "~/src/li", "~/src/LIN", "~/src/"] {
+        assert!(line(&mut c, typed).is_empty());
+    }
+}
+#[test]
+fn a_change_to_the_folder_part_asks_one_debounced_read() {
+    let mut c = window();
+    browse(&mut c, "~/", &["src"]);
+    let effects = line(&mut c, "~/src/");
+    assert!(matches!(
+        effects.as_slice(),
+        [Effect::Read {
+            debounce: true,
+            filter: None,
+            ..
+        }]
+    ));
+}
+#[test]
+fn moves_ask_reads_that_are_not_debounced() {
+    for mode in modes() {
+        for key_event in [
+            LineEv::Key('h'),
+            LineEv::Key('l'),
+            LineEv::Key('~'),
+            LineEv::Key('-'),
+            LineEv::Side(1),
+        ] {
+            let mut c = chooser(mode.clone());
+            list(&mut c, vec![row("/projects/app", Fact::Open)]);
+            let effects = c.event(Ev::Line(key_event.clone()));
+            assert!(effects
+                .iter()
+                .any(|e| matches!(e, Effect::Read { debounce: false, .. })));
+        }
+    }
+}
+#[test]
+fn going_up_asks_with_near_the_folder_left() {
+    let mut c = window();
+    browse(&mut c, "~/src/", &[]);
+    esc(&mut c);
+    let effects = key(&mut c, 'h');
+    assert!(effects
+        .iter()
+        .any(|e| matches!(e, Effect::Read { near: Some(name), .. } if name == "src")));
+}
+#[test]
+fn ctrl_w_deletes_back_to_the_previous_slash() {
+    let mut c = window();
+    browse(&mut c, "~/src/li", &["linux"]);
+    for expected in ["~/src/", "~/", ""] {
+        c.event(Ev::Line(LineEv::DeleteSegment));
+        assert_eq!(c.view().line, expected);
+    }
+}
+#[test]
+fn tab_completes_and_goes_in_on_one_match() {
+    let mut c = window();
+    browse(&mut c, "~/src/li", &["linux"]);
+    let effects = c.event(Ev::Line(LineEv::Tab));
+    assert!(effects.contains(&Effect::SetLine("~/src/linux/".into())));
+    assert_eq!(read_request(&effects).1, PathBuf::from("/home/me/src/linux"));
+    assert!(effects
+        .iter()
+        .any(|e| matches!(e, Effect::Read { debounce: false, .. })));
+}
+#[test]
+fn the_cache_shows_a_folder_at_once_and_reads_it_again_keeping_the_cursor_by_name() {
+    let mut c = window();
+    browse(&mut c, "~/", &["src", "z"]);
+    esc(&mut c);
+    c.event(Ev::Line(LineEv::Step(1)));
+    let effects = enter(&mut c);
+    deliver(&mut c, &effects, listing(&[]));
+    let effects = key(&mut c, 'h');
+    assert_eq!(selected_name(&c), "src/");
+    assert!(c.view().rows.iter().any(|r| r.name == "z/"));
+    deliver(&mut c, &effects, listing(&["aaa", "src", "z"]));
+    assert_eq!(selected_name(&c), "src/");
+}
+#[test]
+fn the_cache_holds_eight_folders() {
+    let mut c = window();
+    for i in 0..9 {
+        browse(&mut c, &format!("/folder{i}/"), &["child"]);
+    }
+    let effects = line(&mut c, "/folder1/");
+    assert!(c.view().rows.iter().any(|r| r.name == "child/"));
+    deliver(&mut c, &effects, listing(&["child"]));
+    line(&mut c, "/folder0/");
+    assert!(!c.view().rows.iter().any(|r| r.name == "child/"));
+}
+#[test]
+fn stuck_keeps_the_serial_and_a_late_listing_on_it_fills_the_rows() {
+    let mut c = window();
+    let effects = line(&mut c, "/slow/");
+    let (serial, _) = read_request(&effects);
+    c.event(Ev::Stuck { serial });
+    assert!(c.view().message.as_deref().unwrap().contains("not answering"));
+    assert!(enter(&mut c).is_empty());
+    deliver(&mut c, &effects, listing(&["recovered"]));
+    assert!(c.view().rows.iter().any(|r| r.name == "recovered/"));
+    assert!(c.view().message.as_deref().is_none_or(|s| !s.contains("cannot read")));
+}
+#[test]
+fn a_listing_stuck_closes_the_serial() {
+    let mut c = window();
+    let effects = line(&mut c, "/slow/");
+    deliver(&mut c, &effects, Listing::Stuck);
+    let before = c.view();
+    deliver(&mut c, &effects, listing(&["late"]));
+    assert_eq!(c.view(), before);
+}
+#[test]
+fn any_freed_rereads_a_shown_stuck_folder() {
+    for reply in [Listing::Stuck, Listing::TooManyStuck] {
+        let mut c = window();
+        let effects = line(&mut c, "~/slow/");
+        deliver(&mut c, &effects, reply);
+        let effects = c.event(Ev::Freed {
+            mount: "/unrelated/physical/mount".into(),
+        });
+        assert_eq!(read_request(&effects).1, PathBuf::from("/home/me/slow"));
+        assert!(c
+            .event(Ev::Freed {
+                mount: "/another".into()
+            })
+            .is_empty());
+    }
+}
+#[test]
+fn rows_rev_moves_with_the_folder_rows_and_not_on_a_step() {
+    let mut c = window();
+    browse(&mut c, "~/", &["a", "b", ".h"]);
+    esc(&mut c);
+    let before = c.view();
+    key(&mut c, 'j');
+    let after = c.view();
+    assert_eq!(after.rows_rev, before.rows_rev);
+    assert!(Arc::ptr_eq(&after.rows, &before.rows));
+    key(&mut c, '.');
+    assert!(c.view().rows_rev > after.rows_rev);
+}
+#[test]
+fn a_pick_twice_with_the_first_press_rev_is_dropped_after_the_rows_changed() {
+    let mut c = chooser(Mode::Launch);
+    list(&mut c, vec![]);
+    let rev = c.view().rows_rev;
+    let effects = c.event(Ev::Pick {
+        index: 0,
+        rows_rev: rev,
+    });
+    assert!(c
+        .event(Ev::PickTwice {
+            index: 0,
+            rows_rev: rev
+        })
+        .is_empty());
+    deliver(&mut c, &effects, listing(&[]));
+    let rev = c.view().rows_rev;
+    assert_eq!(
+        c.event(Ev::PickTwice {
+            index: 0,
+            rows_rev: rev
+        }),
+        vec![Effect::Open("/home/me".into())]
+    );
+}
+#[test]
+fn open_and_age_match_recent_rows_by_physical_path() {
+    let mut c = window();
+    list(
+        &mut c,
+        vec![
+            row("/physical/open", Fact::Open),
+            row("/physical/old", Fact::Present),
+            row("/home/me/walked", Fact::Open),
+        ],
+    );
+    browse(&mut c, "~/", &["open", "old", "walked"]);
+    assert_eq!(c.view().rows.iter().find(|r| r.name == "open/").unwrap().right, "open");
+    assert_eq!(c.view().rows.iter().find(|r| r.name == "old/").unwrap().right, "2 h");
+    assert_eq!(c.view().rows.iter().find(|r| r.name == "walked/").unwrap().right, "");
+}
+#[test]
+fn the_windows_own_root_reads_open() {
+    let mut c = window();
+    let effects = line(&mut c, "~/alias/");
+    deliver(
+        &mut c,
+        &effects,
+        Listing::Read {
+            dir: "/here".into(),
+            entries: vec![],
+            capped: None,
+            exact: None,
+        },
+    );
+    assert!(c.view().rows[0].right.contains("open"));
+}
+#[test]
+fn the_footer_says_into_on_a_folder_and_open_on_here() {
+    for mode in modes() {
+        for in_line in [false, true] {
+            let mut c = chooser(mode.clone());
+            browse(&mut c, "~/", &["src"]);
+            if !in_line {
+                esc(&mut c);
+            }
+            assert!(c.view().footer.starts_with("Enter open me ·"));
+            c.event(Ev::Line(LineEv::Step(1)));
+            assert!(c.view().footer.starts_with("Enter into src/ ·"));
+        }
+    }
+}
+#[test]
+fn name_in_the_footer_is_capped_at_24_with_a_middle_ellipsis() {
+    let mut c = window();
+    let name = "abcdefghijklmno这是很长的文件夹pqrstuvwxyz";
+    browse(&mut c, "~/", &[name]);
+    c.event(Ev::Line(LineEv::Step(1)));
+    let footer = c.view().footer;
+    let shown = footer.strip_prefix("Enter into ").unwrap().split("/ ·").next().unwrap();
+    assert_eq!(shown.chars().count(), 24);
+    assert!(shown.contains('…'));
+    assert!(shown.starts_with("abcdef") && shown.ends_with("uvwxyz"));
+}
+#[test]
+fn an_edited_escaped_line_reads_as_typed_and_answers_missing() {
+    let mut c = window();
+    browse(&mut c, "~/", &["bad\u{202e}\u{200b}\n<b>"]);
+    c.event(Ev::Line(LineEv::Step(1)));
+    let effects = enter(&mut c);
+    assert_eq!(
+        read_request(&effects).1,
+        PathBuf::from("/home/me/bad\u{202e}\u{200b}\n<b>")
+    );
+    deliver(&mut c, &effects, listing(&[]));
+    let shown = c.view().line;
+    assert!(shown.contains("\\u{202e}\\u{200b}\\u{a}<b>"));
+    assert!(!shown.contains('\u{2068}') && !shown.contains('\u{2069}'));
+    let edited = format!("{}x/", shown.trim_end_matches('/'));
+    let effects = line(&mut c, &edited);
+    assert_eq!(
+        read_request(&effects).1,
+        PathBuf::from(edited.replacen("~/", "/home/me/", 1))
+    );
+    deliver(&mut c, &effects, Listing::Missing);
+    assert!(enter(&mut c).is_empty());
+    assert_eq!(c.view().message, Some(format!("no such folder: {edited}")));
+}
+#[test]
+fn a_non_utf8_row_opens_by_its_raw_bytes() {
+    use std::os::unix::ffi::OsStringExt;
+    let mut c = window();
+    let effects = line(&mut c, "~/");
+    let raw = OsString::from_vec(vec![b'a', 0xff]);
+    let mut e = entry("a�");
+    e.raw = raw.clone();
+    deliver(
+        &mut c,
+        &effects,
+        Listing::Read {
+            dir: "/physical".into(),
+            entries: vec![e],
+            capped: None,
+            exact: None,
+        },
+    );
+    c.event(Ev::Line(LineEv::Step(1)));
+    let effects = enter(&mut c);
+    assert_eq!(read_request(&effects).1, PathBuf::from("/home/me").join(&raw));
+    deliver(&mut c, &effects, listing(&[]));
+    assert_eq!(enter(&mut c), vec![Effect::Open(PathBuf::from("/home/me").join(raw))]);
+}
+#[test]
+fn browse_folders_replaces_choose_a_folder_and_ctrl_o_still_asks_the_dialog() {
+    for mode in modes() {
+        let mut c = chooser(mode);
+        list(&mut c, vec![]);
+        assert!(c.view().rows.iter().any(|r| r.name == "Browse folders…"));
+        assert_eq!(
+            c.event(Ev::Line(LineEv::ChooseFolder)),
+            vec![Effect::FolderDialog { at: None }]
+        );
+        c.event(Ev::Folder(None));
+        let effects = enter(&mut c);
+        assert!(effects.iter().any(|e| matches!(e, Effect::Read { .. })));
+    }
+}
+#[test]
+fn esc_esc_from_browse_in_a_first_run_launch_window_returns_to_its_two_rows_then_closes() {
+    let mut c = chooser(Mode::Launch);
+    list(&mut c, vec![]);
+    let effects = enter(&mut c);
+    deliver(&mut c, &effects, listing(&[]));
+    esc(&mut c);
+    assert_eq!(c.view().rows.len(), 2);
+    assert_eq!(c.view().rows[0].name, "Browse folders…");
+    assert_eq!(esc(&mut c), vec![Effect::Close]);
+}
+#[test]
+fn ctrl_o_starts_the_dialog_at_a_folder_only_if_it_answered() {
+    for reply in [
+        None,
+        Some(listing(&[])),
+        Some(Listing::Denied { exact: None }),
+        Some(Listing::Stuck),
+        Some(Listing::Missing),
+    ] {
+        let mut c = window();
+        let effects = line(&mut c, "~/src/");
+        let answered = matches!(reply, Some(Listing::Read { .. } | Listing::Denied { .. }));
+        if let Some(reply) = reply {
+            deliver(&mut c, &effects, reply);
+        }
+        assert_eq!(
+            c.event(Ev::Line(LineEv::ChooseFolder)),
+            vec![Effect::FolderDialog {
+                at: answered.then(|| PathBuf::from("/home/me/src"))
+            }]
+        );
+    }
+}
+#[test]
+fn every_new_string_has_both_languages() {
+    for (lang, title, hidden, here, empty, denied, looped, too_many, not_folder, reading, stuck) in [
+        (
+            Lang::En,
+            "Browse folders",
+            " · hidden shown",
+            "this folder",
+            "no folders here · Enter opens this folder",
+            "cannot read: permission denied · h goes back",
+            "cannot read: too many links",
+            "too many folders not answering · Ctrl+o for the system dialog",
+            "not a folder",
+            "reading",
+            "not answering · h goes back",
+        ),
+        (
+            Lang::ZhCn,
+            "浏览文件夹",
+            " · 显示隐藏",
+            "此文件夹",
+            "这里没有文件夹 · Enter 打开此文件夹",
+            "读不了：没有权限 · h 返回",
+            "读不了：链接太多",
+            "太多文件夹没有响应 · Ctrl+o 用系统对话框",
+            "不是文件夹",
+            "正在读取",
+            "没有响应 · h 返回",
+        ),
+    ] {
+        let mut c = Chooser::new(Mode::Launch, Some("/home/me".into()), lang, 1);
+        browse(&mut c, "~/", &[]);
+        assert_eq!(c.view().title, title);
+        assert_eq!(c.view().rows[0].right, here);
+        assert_eq!(c.view().message.as_deref(), Some(empty));
+        esc(&mut c);
+        key(&mut c, '.');
+        assert_eq!(c.view().title, format!("{title}{hidden}"));
+        for (i, reply, expected) in [
+            (0, Listing::Denied { exact: None }, denied),
+            (1, Listing::Loop, looped),
+            (2, Listing::TooManyStuck, too_many),
+            (3, Listing::NotAFolder, not_folder),
+            (4, Listing::Stuck, stuck),
+        ] {
+            let effects = line(&mut c, &format!("/folder{i}/"));
+            deliver(&mut c, &effects, reply);
+            assert_eq!(c.view().message.as_deref(), Some(expected));
+        }
+        let effects = line(&mut c, "/last/");
+        let (serial, _) = read_request(&effects);
+        c.event(Ev::Slow { serial });
+        assert_eq!(c.view().message.as_deref(), Some(reading));
+    }
+}
+
+#[test]
+fn capped_and_denied_listings_reread_with_the_current_filter_and_keep_held_enters() {
+    for reply in [
+        Listing::Read {
+            dir: "/physical".into(),
+            entries: vec![],
+            capped: Some(Cap::Folders),
+            exact: None,
+        },
+        Listing::Denied { exact: None },
+    ] {
+        let mut c = window();
+        let effects = line(&mut c, "~/src/proj");
+        enter(&mut c);
+        enter(&mut c);
+        let effects = deliver(&mut c, &effects, reply);
+        assert!(effects
+            .iter()
+            .any(|effect| matches!(effect, Effect::Read { filter: Some(f), debounce: false, .. } if f == "proj")));
+        let effects = deliver(
+            &mut c,
+            &effects,
+            Listing::Denied {
+                exact: Some(entry("proj")),
+            },
+        );
+        assert_eq!(read_request(&effects).1, PathBuf::from("/home/me/src/proj"));
+        assert_eq!(
+            deliver(&mut c, &effects, Listing::Denied { exact: None }),
+            vec![Effect::Open("/home/me/src/proj".into())]
+        );
+    }
+}
+#[test]
+fn typing_in_a_capped_folder_rereads_and_filtered_answers_are_not_cached() {
+    let mut c = window();
+    let effects = line(&mut c, "~/src/");
+    deliver(
+        &mut c,
+        &effects,
+        Listing::Read {
+            dir: "/physical".into(),
+            entries: vec![entry("first")],
+            capped: Some(Cap::Folders),
+            exact: None,
+        },
+    );
+    let effects = line(&mut c, "~/src/last");
+    assert!(
+        matches!(effects.as_slice(), [Effect::Read { filter: Some(filter), debounce: true, .. }] if filter == "last")
+    );
+    deliver(&mut c, &effects, listing(&["last"]));
+    line(&mut c, "/else/");
+    let effects = line(&mut c, "~/src/");
+    assert!(c.view().rows.iter().any(|row| row.name == "first/"));
+    assert!(!c.view().rows.iter().any(|row| row.name == "last/"));
+    assert!(effects
+        .iter()
+        .any(|effect| matches!(effect, Effect::Read { filter: None, .. })));
+}
+#[test]
+fn a_filter_changed_during_a_capped_read_is_used_for_the_next_read() {
+    let mut c = window();
+    let effects = line(&mut c, "/capped/");
+    deliver(
+        &mut c,
+        &effects,
+        Listing::Read {
+            dir: "/physical".into(),
+            entries: vec![],
+            capped: Some(Cap::Scanned),
+            exact: None,
+        },
+    );
+    let old = line(&mut c, "/capped/old");
+    let newer = line(&mut c, "/capped/new");
+    assert!(newer
+        .iter()
+        .any(|e| matches!(e, Effect::Read { filter: Some(f), .. } if f == "new")));
+    let before = c.view();
+    assert!(deliver(&mut c, &old, listing(&["old"])).is_empty());
+    assert_eq!(c.view(), before);
+}
+#[test]
+fn a_stuck_timer_drops_held_enters_and_late_rows_never_open_by_themselves() {
+    let mut c = window();
+    let effects = line(&mut c, "/slow/");
+    let (serial, _) = read_request(&effects);
+    enter(&mut c);
+    enter(&mut c);
+    c.event(Ev::Stuck { serial });
+    assert!(deliver(&mut c, &effects, listing(&[])).is_empty());
+    assert_eq!(enter(&mut c), vec![Effect::Open("/slow".into())]);
+}
+#[test]
+fn the_listing_envelope_matches_the_walked_folder_and_rejects_the_physical_folder() {
+    let mut c = window();
+    let effects = line(&mut c, "~/link/");
+    let (serial, _) = read_request(&effects);
+    let before = c.view();
+    c.event(Ev::Listing {
+        serial,
+        dir: "/physical".into(),
+        listing: listing(&["wrong"]),
+    });
+    assert_eq!(c.view(), before);
+    deliver(&mut c, &effects, listing(&["right"]));
+    assert!(c.view().rows.iter().any(|r| r.name == "right/"));
+}
+#[test]
+fn editing_only_the_filter_of_an_escaped_folder_keeps_its_raw_path() {
+    let mut c = window();
+    browse(&mut c, "~/", &["a\n"]);
+    c.event(Ev::Line(LineEv::Step(1)));
+    let effects = enter(&mut c);
+    deliver(&mut c, &effects, listing(&["child"]));
+    assert!(line(&mut c, "~/a\\u{a}/ch").is_empty());
+    let effects = enter(&mut c);
+    assert_eq!(read_request(&effects).1, PathBuf::from("/home/me/a\n/child"));
+}
+#[test]
+fn a_broken_link_says_not_a_folder_and_its_target_is_safe_text() {
+    let mut c = window();
+    let effects = line(&mut c, "~/");
+    let mut e = entry("bad\u{202e}");
+    e.kind = EntryKind::Link {
+        target: "<b>\n\u{200b}".into(),
+        kind: LinkKind::Other,
+    };
+    deliver(
+        &mut c,
+        &effects,
+        Listing::Read {
+            dir: "/physical".into(),
+            entries: vec![e],
+            capped: None,
+            exact: None,
+        },
+    );
+    assert_eq!(c.view().rows[1].shown, "-> <b>\\u{a}\\u{200b}");
+    assert!(c.view().rows[1].dimmed);
+    c.event(Ev::Line(LineEv::Step(1)));
+    assert!(enter(&mut c).is_empty());
+    assert_eq!(c.view().message.as_deref(), Some("not a folder"));
+}
+#[test]
+fn exact_file_rows_in_denied_and_capped_folders_open_by_the_raw_path() {
+    for denied in [false, true] {
+        let mut c = window();
+        let initial = line(&mut c, "/private/");
+        deliver(
+            &mut c,
+            &initial,
+            if denied {
+                Listing::Denied { exact: None }
+            } else {
+                Listing::Read {
+                    dir: "/physical".into(),
+                    entries: vec![],
+                    capped: Some(Cap::Scanned),
+                    exact: None,
+                }
+            },
+        );
+        let effects = line(&mut c, "/private/notes.md");
+        let mut e = entry("notes.md");
+        e.kind = EntryKind::File;
+        deliver(
+            &mut c,
+            &effects,
+            if denied {
+                Listing::Denied { exact: Some(e) }
+            } else {
+                Listing::Read {
+                    dir: "/physical".into(),
+                    entries: vec![],
+                    capped: Some(Cap::Scanned),
+                    exact: Some(e),
+                }
+            },
+        );
+        assert_eq!(selected_name(&c), "notes.md");
+        assert_eq!(enter(&mut c), vec![Effect::Open("/private/notes.md".into())]);
+    }
+}
+#[test]
+fn later_marks_and_link_kinds_keep_the_cursor_and_ignore_old_requests() {
+    let mut c = window();
+    let effects = line(&mut c, "~/");
+    let (serial, _) = read_request(&effects);
+    deliver(&mut c, &effects, listing(&["a", "b"]));
+    c.event(Ev::Line(LineEv::Step(2)));
+    let before = c.view();
+    c.event(Ev::Later {
+        serial: serial + 1,
+        git: vec!["b".into()],
+        links: vec![],
+    });
+    assert_eq!(c.view(), before);
+    c.event(Ev::Later {
+        serial,
+        git: vec!["b".into()],
+        links: vec![],
+    });
+    assert_eq!(selected_name(&c), "b/");
+    assert_eq!(c.view().rows[2].right, "git");
+}
+
+macro_rules! folder_transition {
+    ($name:ident, $event:expr) => {
+        #[test]
+        fn $name() {
+            for mode in modes() {
+                for in_line in [false, true] {
+                    let mut c = chooser(mode.clone());
+                    browse(&mut c, "~/src/", &["app"]);
+                    if !in_line {
+                        esc(&mut c);
+                    }
+                    c.event(Ev::Line(LineEv::Step(1)));
+                    let effects = c.event($event(c.view().rows_rev));
+                    assert_eq!(read_request(&effects).1, PathBuf::from("/home/me/src/app"));
+                    deliver(&mut c, &effects, listing(&[]));
+                    assert_eq!(selected_name(&c), ".");
+                    assert_eq!(c.view().in_line, in_line);
+                }
+            }
+        }
+    };
+}
+folder_transition!(transition_browse_enter_on_folder_enters_cursor_on_here, |_| Ev::Line(
+    LineEv::Enter
+));
+folder_transition!(transition_browse_double_click_on_folder_enters_cursor_on_here, |rev| {
+    Ev::PickTwice {
+        index: 1,
+        rows_rev: rev,
+    }
+});
+#[test]
+fn transition_browse_l_on_folder_enters_cursor_on_here() {
+    for mode in modes() {
+        for ev in [LineEv::Key('l'), LineEv::Side(1)] {
+            let mut c = chooser(mode.clone());
+            browse(&mut c, "~/src/", &["app"]);
+            esc(&mut c);
+            c.event(Ev::Line(LineEv::Step(1)));
+            let effects = c.event(Ev::Line(ev.clone()));
+            assert_eq!(read_request(&effects).1, PathBuf::from("/home/me/src/app"));
+        }
+    }
+}
+#[test]
+fn transition_browse_click_selects_and_double_click_on_here_opens() {
+    for mode in modes() {
+        let mut c = chooser(mode);
+        browse(&mut c, "~/src/", &["app"]);
+        esc(&mut c);
+        c.event(Ev::Line(LineEv::Step(1)));
+        let rev = c.view().rows_rev;
+        assert!(c
+            .event(Ev::Pick {
+                index: 0,
+                rows_rev: rev
+            })
+            .is_empty());
+        assert_eq!(selected_name(&c), ".");
+        assert_eq!(
+            c.event(Ev::PickTwice {
+                index: 0,
+                rows_rev: rev
+            }),
+            vec![Effect::Open("/home/me/src".into())]
+        );
+    }
+}
+#[test]
+fn transition_list_click_on_browse_browses_without_opening_home() {
+    for mode in modes() {
+        let mut c = chooser(mode.clone());
+        list(&mut c, vec![]);
+        let effects = c.event(Ev::Pick {
+            index: 0,
+            rows_rev: c.view().rows_rev,
+        });
+        assert_eq!(
+            read_request(&effects).1,
+            PathBuf::from(if mode == Mode::Launch { "/home/me" } else { "/" })
+        );
+        assert!(!effects.iter().any(|e| matches!(e, Effect::Open(_))));
+    }
+}
+#[test]
+fn transition_filter_esc_returns_to_the_list() {
+    for mode in modes() {
+        let mut c = chooser(mode);
+        list(&mut c, vec![row("/app", Fact::Present)]);
+        key(&mut c, '/');
+        line(&mut c, "ap");
+        esc(&mut c);
+        assert!(!c.view().browsing && !c.view().in_line);
+        assert_eq!(c.view().line, "");
+    }
+}
+#[test]
+fn transition_list_slash_edits_the_projects_filter() {
+    for mode in modes() {
+        let mut c = chooser(mode);
+        assert!(key(&mut c, '/').is_empty());
+        assert!(c.view().in_line && !c.view().browsing);
+        assert_eq!(c.view().line, "");
+    }
+}
+#[test]
+fn transition_list_esc_or_q_closes() {
+    for mode in modes() {
+        for ev in [LineEv::Escape, LineEv::Key('q')] {
+            let mut c = chooser(mode.clone());
+            assert_eq!(c.event(Ev::Line(ev.clone())), vec![Effect::Close]);
+        }
+    }
+}
+#[test]
+fn transition_any_dismiss_or_lost_keys_closes() {
+    for mode in modes() {
+        for in_line in [false, true] {
+            for ev in [Ev::Dismiss, Ev::Line(LineEv::KeysLost)] {
+                let mut c = chooser(mode.clone());
+                browse(&mut c, "~/", &[]);
+                if !in_line {
+                    esc(&mut c);
+                }
+                assert_eq!(c.event(ev.clone()), vec![Effect::Close]);
+            }
+        }
+    }
+}
+
+#[test]
+fn another_filter_after_a_filtered_listing_still_searches_the_whole_folder() {
+    let mut c = window();
+    let effects = line(&mut c, "/capped/");
+    deliver(
+        &mut c,
+        &effects,
+        Listing::Read {
+            dir: "/physical".into(),
+            entries: vec![entry("first")],
+            capped: Some(Cap::Folders),
+            exact: None,
+        },
+    );
+    let effects = line(&mut c, "/capped/one");
+    deliver(&mut c, &effects, listing(&["one"]));
+    let effects = line(&mut c, "/capped/two");
+    assert!(
+        matches!(effects.as_slice(), [Effect::Read { filter: Some(filter), debounce: true, .. }] if filter == "two")
+    );
+}
+#[test]
+fn esc_from_a_filtered_read_restores_the_full_cached_listing_and_refreshes_it() {
+    let mut c = window();
+    let effects = line(&mut c, "/capped/");
+    deliver(
+        &mut c,
+        &effects,
+        Listing::Read {
+            dir: "/physical".into(),
+            entries: vec![entry("first")],
+            capped: Some(Cap::Folders),
+            exact: None,
+        },
+    );
+    let effects = line(&mut c, "/capped/last");
+    deliver(&mut c, &effects, listing(&["last"]));
+    let effects = esc(&mut c);
+    assert_eq!(c.view().line, "/capped/");
+    assert_eq!(selected_name(&c), ".");
+    assert!(c.view().rows.iter().any(|r| r.name == "first/"));
+    assert!(effects.iter().any(|e| matches!(
+        e,
+        Effect::Read {
+            filter: None,
+            debounce: false,
+            ..
+        }
+    )));
+}
+
+#[test]
+fn a_double_click_in_projects_is_already_handled_by_its_first_press() {
+    let mut c = three();
+    let before = c.view();
+    assert!(c
+        .event(Ev::PickTwice {
+            index: 0,
+            rows_rev: before.rows_rev
+        })
+        .is_empty());
+    assert_eq!(c.view(), before);
+}
+#[test]
+fn a_late_listing_and_timers_keep_the_opening_message() {
+    for capped in [false, true] {
+        let mut c = window();
+        let effects = line(&mut c, "/work/app");
+        let (serial, _) = read_request(&effects);
+        c.opening("picked");
+        for ev in [Ev::Slow { serial }, Ev::Stuck { serial }] {
+            c.event(ev);
+            assert_eq!(c.view().message.as_deref(), Some("Opening picked…"));
+        }
+        deliver(
+            &mut c,
+            &effects,
+            Listing::Read {
+                dir: "/physical".into(),
+                entries: vec![entry("app")],
+                capped: capped.then_some(Cap::Folders),
+                exact: None,
+            },
+        );
+        assert_eq!(c.view().message.as_deref(), Some("Opening picked…"));
+    }
+}
+#[test]
+fn typing_a_trailing_dot_rereads_the_folder_and_keeps_an_escaped_prefix_raw() {
+    let mut c = window();
+    browse(&mut c, "~/", &["a\n"]);
+    c.event(Ev::Line(LineEv::Step(1)));
+    let effects = enter(&mut c);
+    deliver(&mut c, &effects, listing(&[]));
+    let effects = line(&mut c, "~/a\\u{a}/.");
+    assert_eq!(read_request(&effects).1, PathBuf::from("/home/me/a\n"));
+    assert!(effects.iter().any(|e| matches!(e, Effect::Read { debounce: true, .. })));
+    deliver(&mut c, &effects, listing(&[]));
+    let effects = line(&mut c, "~/a\\u{a}/./..");
+    assert_eq!(read_request(&effects).1, PathBuf::from("/home/me/a\n/.."));
+}
+#[test]
+fn all_browse_marks_caps_and_dynamic_copy_have_both_languages() {
+    for (lang, marks, caps, no_match, cannot_read, browse_open, browse_into, path_open, path_into) in [
+        (
+            Lang::En,
+            ["git", "link", "mount", "file"],
+            [
+                "first 2000 folders shown · / searches the whole folder",
+                "first 50 000 entries read",
+            ],
+            "no folder matches \"app\"",
+            "cannot read /dir now",
+            "Enter open app · l in · h up · / filter · . hidden · Esc back · q close",
+            "Enter into app/ · h up · / filter · . hidden · Esc back · q close",
+            "Enter open app · Tab complete · ↑↓ move · Ctrl+w up · Esc clear",
+            "Enter into app/ · Tab complete · ↑↓ move · Ctrl+w up · Esc clear",
+        ),
+        (
+            Lang::ZhCn,
+            ["git", "链接", "挂载点", "文件"],
+            ["只显示前 2000 个文件夹 · / 搜索整个文件夹", "只读了前 50 000 项"],
+            "没有匹配“app”的文件夹",
+            "现在读不了 /dir",
+            "Enter 打开 app · l 进入 · h 上一级 · / 筛选 · . 隐藏 · Esc 返回 · q 关闭",
+            "Enter 进入 app/ · h 上一级 · / 筛选 · . 隐藏 · Esc 返回 · q 关闭",
+            "Enter 打开 app · Tab 补全 · ↑↓ 移动 · Ctrl+w 上一级 · Esc 清除",
+            "Enter 进入 app/ · Tab 补全 · ↑↓ 移动 · Ctrl+w 上一级 · Esc 清除",
+        ),
+    ] {
+        let t = text::text(lang);
+        assert_eq!([t.git, t.link, t.mount, t.file], marks);
+        assert_eq!([t.folders_cap, t.scanned_cap], caps);
+        assert_eq!(text::no_match(lang, "app"), no_match);
+        assert_eq!(text::cannot_read(lang, "/dir"), cannot_read);
+        assert_eq!(text::footer(lang, "app", text::Enter::Open, false), browse_open);
+        assert_eq!(text::footer(lang, "app", text::Enter::Into, false), browse_into);
+        assert_eq!(text::footer(lang, "app", text::Enter::Open, true), path_open);
+        assert_eq!(text::footer(lang, "app", text::Enter::Into, true), path_into);
+    }
+}
+
+#[test]
+fn a_cached_refresh_keeps_here_selected_when_the_cursor_moved_off_the_near_folder() {
+    let mut c = window();
+    browse(&mut c, "~/", &["src", "z"]);
+    esc(&mut c);
+    c.event(Ev::Line(LineEv::Step(1)));
+    let effects = enter(&mut c);
+    deliver(&mut c, &effects, listing(&[]));
+    let effects = key(&mut c, 'h');
+    assert_eq!(selected_name(&c), "src/");
+    key(&mut c, 'k');
+    assert_eq!(selected_name(&c), ".");
+    deliver(&mut c, &effects, listing(&["src", "z"]));
+    assert_eq!(selected_name(&c), ".");
+}
+#[test]
+fn tab_completes_a_shared_prefix_without_case() {
+    let mut c = window();
+    browse(&mut c, "~/AP", &["AppOne", "appTwo"]);
+    c.event(Ev::Line(LineEv::Tab));
+    assert_eq!(c.view().line, "~/App");
+}
+#[test]
+fn a_launch_without_home_can_still_browse_the_root() {
+    let mut c = Chooser::new(Mode::Launch, None, Lang::En, 1);
+    list(&mut c, vec![]);
+    let effects = enter(&mut c);
+    assert_eq!(read_request(&effects).1, PathBuf::from("/"));
+}
+#[test]
+fn going_up_from_a_folder_reached_by_dot_dot_walks_one_more_dot_dot() {
+    for mode in modes() {
+        for up in [LineEv::Key('h'), LineEv::Key('-'), LineEv::Side(-1), LineEv::Up] {
+            let mut c = chooser(mode.clone());
+            browse(&mut c, "~/src/..", &["a"]);
+            esc(&mut c);
+            let effects = c.event(Ev::Line(up.clone()));
+            let (_, dir) = read_request(&effects);
+            assert_eq!(dir, PathBuf::from("/home/me/src/../.."), "{up:?}");
+            assert!(effects.iter().any(|e| matches!(e, Effect::Read { near: None, .. })));
+        }
+    }
+}
+#[test]
+fn the_footer_names_only_the_keys_that_work_on_the_row() {
+    let mut c = window();
+    let effects = line(&mut c, "~/");
+    let mut dead = entry("x");
+    dead.kind = EntryKind::Link {
+        target: "nowhere".into(),
+        kind: LinkKind::Other,
+    };
+    deliver(
+        &mut c,
+        &effects,
+        Listing::Read {
+            dir: "/physical".into(),
+            entries: vec![dead],
+            capped: None,
+            exact: None,
+        },
+    );
+    esc(&mut c);
+    // `.` opens and `l` goes in; a dead link has no Enter action at all.
+    assert_eq!(selected_name(&c), ".");
+    assert!(c.view().footer.starts_with("Enter open me · l in ·"));
+    c.event(Ev::Line(LineEv::Step(1)));
+    assert_eq!(selected_name(&c), "x/");
+    assert!(c.view().rows[c.view().selected.unwrap()].dimmed);
+    assert!(c.view().footer.starts_with("h up ·"), "{}", c.view().footer);
+    assert!(!c.view().footer.contains("Enter"));
+    // A file opens, but `l` does nothing on it.
+    let mut c = window();
+    let effects = line(&mut c, "~/notes.md");
+    let mut file = entry("notes.md");
+    file.kind = EntryKind::File;
+    deliver(
+        &mut c,
+        &effects,
+        Listing::Read {
+            dir: "/physical".into(),
+            entries: vec![],
+            capped: None,
+            exact: Some(file),
+        },
+    );
+    assert_eq!(selected_name(&c), "notes.md");
+    assert!(c.view().footer.starts_with("Enter open notes.md · Tab complete"));
+    for lang in [Lang::En, Lang::ZhCn] {
+        let footer = text::footer(lang, "notes.md", text::Enter::OpenFile, false);
+        assert!(
+            footer.contains("h ") && !footer.contains("l in") && !footer.contains("l 进入"),
+            "{footer}"
+        );
+        assert_ne!(footer, text::footer(lang, "notes.md", text::Enter::Open, false));
+    }
+}
+#[test]
+fn tab_does_not_write_hidden_characters_back_as_a_filter() {
+    let mut c = window();
+    browse(&mut c, "~/", &["a\u{200b}x", "a\u{200b}y"]);
+    let effects = c.event(Ev::Line(LineEv::Tab));
+    assert!(effects.contains(&Effect::SetLine("~/a".into())));
+    let view = c.view();
+    assert_eq!(view.line, "~/a");
+    assert_eq!(view.rows.len(), 2);
+    assert!(view.message.as_deref().is_none_or(|m| !m.contains("no folder matches")));
+}
+#[test]
+fn a_later_with_nothing_to_add_keeps_the_rows_and_their_revision() {
+    let mut c = window();
+    let effects = line(&mut c, "~/");
+    let (serial, _) = read_request(&effects);
+    deliver(&mut c, &effects, listing(&["a", "b"]));
+    esc(&mut c);
+    let before = c.view();
+    c.event(Ev::Later {
+        serial,
+        git: vec![],
+        links: vec![],
+    });
+    let after = c.view();
+    assert_eq!(after.rows_rev, before.rows_rev);
+    assert!(Arc::ptr_eq(&after.rows, &before.rows));
+    c.event(Ev::Later {
+        serial,
+        git: vec!["a".into()],
+        links: vec![],
+    });
+    assert!(c.view().rows_rev > before.rows_rev);
+    assert!(c.view().rows.iter().any(|r| r.right.contains("git")));
+}
+#[test]
+fn the_dialog_starts_at_a_folder_only_when_its_fresh_read_has_answered() {
+    let mut c = window();
+    browse(&mut c, "~/", &["src"]);
+    esc(&mut c);
+    c.event(Ev::Line(LineEv::Step(1)));
+    let effects = enter(&mut c);
+    deliver(&mut c, &effects, listing(&[]));
+    // Back in `~/`, shown from the cache while its re-read is still out.
+    let reread = key(&mut c, 'h');
+    assert!(reread.iter().any(|e| matches!(e, Effect::Read { .. })));
+    assert_eq!(
+        c.event(Ev::Line(LineEv::ChooseFolder)),
+        vec![Effect::FolderDialog { at: None }]
+    );
 }
