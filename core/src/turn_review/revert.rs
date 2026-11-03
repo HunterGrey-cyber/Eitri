@@ -40,7 +40,7 @@ use crate::editor_rpc::EditorRpc;
 use crate::nvim_rpc::{Pending, RpcError};
 use crate::window_link::EditorOp;
 
-use super::diff::{file_hunks, Side};
+use super::diff::{file_hunks, Hunk, Side};
 use super::journal::{Journal, JournalClaim, JournalEntry, JournalNote};
 use super::lifecycle::{
     check_unambiguous, resolve_compare, Resolved, ReviewError, Scope, ShadowSpec, TurnRecord, TurnRef,
@@ -670,9 +670,14 @@ impl RecoverJob {
 
 impl ExactHunksJob {
     pub fn run(self) -> Result<ExactHunks, ReviewError> {
-        let unavailable = |e: ShadowError| ReviewError::Unavailable(e.to_string());
         let shadow = self.spec.open().map_err(ReviewError::Unavailable)?;
         let resolved = resolve_compare(&shadow, &self.session, &self.records, TurnRef::N(self.turn), self.scope)?;
+        self.run_resolved(&shadow, &resolved)
+    }
+
+    /// [`run`](Self::run) for a caller that has already opened the shadow and resolved the compare.
+    pub(super) fn run_resolved(self, shadow: &Shadow, resolved: &Resolved) -> Result<ExactHunks, ReviewError> {
+        let unavailable = |e: ShadowError| ReviewError::Unavailable(e.to_string());
         let Side::Snapshot(end_commit) = &resolved.to else {
             // The lines must come from a snapshot, never from a disk that may be changing.
             return Err(ReviewError::NotReady("this turn has no end snapshot yet".into()));
@@ -680,13 +685,13 @@ impl ExactHunksJob {
         if resolved.too_large.contains(&self.path) {
             return Err(ReviewError::TooLarge(self.path));
         }
-        check_unambiguous(&shadow, &resolved.from, &resolved.to, &self.path)?;
+        check_unambiguous(shadow, &resolved.from, &resolved.to, &self.path)?;
         // Held across the patch and the reads, so retention cannot remove a side in between.
         let _lock = shadow
             .lock_shared_until(Instant::now() + READ_TIMEOUT)
             .map_err(unavailable)?;
         let diff = file_hunks(
-            &shadow,
+            shadow,
             &resolved.from,
             &resolved.to,
             &self.path,
@@ -714,32 +719,42 @@ impl ExactHunksJob {
         }
         let base_lines = base.map_or_else(Vec::new, |e| lines_of(&e.bytes));
         let end_lines = end.map_or_else(Vec::new, |e| lines_of(&e.bytes));
-        let mismatch = || ReviewError::Unavailable("the patch does not match the snapshots".into());
-        let mut hunks = Vec::with_capacity(diff.hunks.len());
-        for h in diff.hunks {
-            let old_lines = region(&base_lines, (h.old_start, h.old_len))
-                .ok_or_else(mismatch)?
-                .to_vec();
-            let new_lines = region(&end_lines, (h.new_start, h.new_len))
-                .ok_or_else(mismatch)?
-                .to_vec();
-            hunks.push(ExactHunk {
-                id: h.id,
-                header: h.header,
-                old_start: h.old_start,
-                old_len: h.old_len,
-                new_start: h.new_start,
-                new_len: h.new_len,
-                old_lines,
-                new_lines,
-            });
-        }
+        let hunks = exact_hunks(diff.hunks, &base_lines, &end_lines)?;
         Ok(ExactHunks {
             path,
             binary: false,
             hunks: Some(hunks),
         })
     }
+}
+
+/// Each parsed hunk with both sides' lines taken from the files' own lines; a hunk that does not fit
+/// them is `Unavailable`.
+pub(super) fn exact_hunks(
+    hunks: Vec<Hunk>,
+    base_lines: &[Vec<u8>],
+    end_lines: &[Vec<u8>],
+) -> Result<Vec<ExactHunk>, ReviewError> {
+    let mismatch = || ReviewError::Unavailable("the patch does not match the compared bytes".into());
+    hunks
+        .into_iter()
+        .map(|h| {
+            Ok(ExactHunk {
+                old_lines: region(base_lines, (h.old_start, h.old_len))
+                    .ok_or_else(mismatch)?
+                    .to_vec(),
+                new_lines: region(end_lines, (h.new_start, h.new_len))
+                    .ok_or_else(mismatch)?
+                    .to_vec(),
+                id: h.id,
+                header: h.header,
+                old_start: h.old_start,
+                old_len: h.old_len,
+                new_start: h.new_start,
+                new_len: h.new_len,
+            })
+        })
+        .collect()
 }
 
 impl RevertJob {
@@ -1478,7 +1493,7 @@ fn region(lines: &[Vec<u8>], (start, len): (u32, u32)) -> Option<&[Vec<u8>]> {
 }
 
 /// A file's lines, each with its terminator (the last may have none).
-fn lines_of(bytes: &[u8]) -> Vec<Vec<u8>> {
+pub(super) fn lines_of(bytes: &[u8]) -> Vec<Vec<u8>> {
     bytes.split_inclusive(|b| *b == b'\n').map(<[u8]>::to_vec).collect()
 }
 

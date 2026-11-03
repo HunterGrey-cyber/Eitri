@@ -33,6 +33,7 @@ pub mod flow;
 pub mod git;
 pub mod journal;
 pub mod lifecycle;
+pub mod live_job;
 pub mod message;
 pub mod presence;
 pub mod proposal_write;
@@ -61,6 +62,7 @@ pub use lifecycle::{
     ReviewHandoff, ReviewHint, ReviewOptions, Scope, Snap, TurnRecord, TurnRef, TurnReview, TurnState, Unbound,
     MAX_OVERVIEW_DIFF_LINES, SOLE_PARTNER,
 };
+pub use live_job::{LiveHunks, LiveHunksJob, LiveRecord, LiveSettle, LiveSettleJob, LiveSkip};
 pub use message::{compose, Preview};
 pub use presence::{
     busy_elsewhere, Blocked, Busy, Decision, GroupGuard, Held, Partner, Presence, PresenceFallback, PresenceGuard,

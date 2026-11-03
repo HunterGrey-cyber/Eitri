@@ -30,6 +30,7 @@ use crate::window_link::{EdgeKind, TurnEdge};
 
 use super::attribution::{origin, NamedPaths, Origin};
 use super::diff::{changed_files, file_hunks, Hunk, Side};
+use super::live_job::{LiveHunksJob, LiveRecord, LiveSettleJob};
 use super::presence::PresenceGuard;
 use super::revert::{
     AnchorJob, EditorClear, ExactHunksJob, RecoverAnswer, RecoverJob, RecoveriesJob, RevertJob, RevertTarget, Saved,
@@ -493,6 +494,17 @@ struct SessionTrack {
 }
 
 impl SessionTrack {
+    /// What is added to a turn's position to give its number. Until the worker has read how far
+    /// earlier runs numbered (one tick, normally), a number would be a guess: `None`. If it cannot
+    /// read that at all, no snapshot was written either, and the turns are numbered by position.
+    fn known_offset(&self) -> Option<u32> {
+        match self.offset {
+            Some(offset) => Some(offset),
+            None if self.numbering_failed => Some(0),
+            None => None,
+        }
+    }
+
     fn record_mut(&mut self, position: u32) -> Option<&mut Rec> {
         self.records.iter_mut().find(|r| r.position == position)
     }
@@ -1821,13 +1833,8 @@ impl TurnReview {
         let Some(track) = self.sessions.get(session) else {
             return Vec::new();
         };
-        // Until the worker has read how far earlier runs numbered (one tick, normally), a number
-        // would be a guess. If it cannot read that at all, no snapshot was written either, and the
-        // turns are listed by position.
-        let offset = match track.offset {
-            Some(offset) => offset,
-            None if track.numbering_failed => 0,
-            None => return Vec::new(),
+        let Some(offset) = track.known_offset() else {
+            return Vec::new();
         };
         track
             .records
@@ -1838,6 +1845,52 @@ impl TurnReview {
                 record
             })
             .collect()
+    }
+
+    /// The one turn with this provider id, numbered as [`turns`](Self::turns) numbers it, without
+    /// copying the session's other records.
+    fn numbered_turn(&self, session: &str, turn_id: &str) -> Option<TurnRecord> {
+        let track = self.sessions.get(session)?;
+        let offset = track.known_offset()?;
+        let rec = track.records.iter().find(|r| r.record.turn_id == turn_id)?;
+        let mut record = rec.record.clone();
+        record.n = offset + rec.position;
+        Some(record)
+    }
+
+    /// One turn's live drawing facts, found by its provider id. Reads memory only.
+    pub fn live_record(&self, session: &str, turn_id: &str) -> Option<LiveRecord> {
+        let track = self.sessions.get(session)?;
+        let rec = track.records.iter().find(|r| r.record.turn_id == turn_id)?;
+        Some(LiveRecord {
+            tab: rec.record.tab,
+            n: match track.offset {
+                Some(offset) => offset + rec.position,
+                None if track.numbering_failed => rec.position,
+                None => 0,
+            },
+            started_ns: rec.started_ns,
+            ended_ns: rec.ended_ns,
+            ended: rec.ended,
+            state: rec.record.state(),
+            late: rec.record.late,
+        })
+    }
+
+    /// Compare one current file with this turn's base on a worker. Built without I/O.
+    pub fn live_hunks_job(&self, session: &str, turn_id: &str, path: &str) -> LiveHunksJob {
+        LiveHunksJob {
+            spec: self.spec.clone(),
+            record: self.numbered_turn(session, turn_id),
+            path: PathBuf::from(path),
+        }
+    }
+
+    /// Exact turn hunks and their end snapshot's line count, built without I/O.
+    pub fn live_settle_job(&self, session: &str, turn: u32, path: &str) -> LiveSettleJob {
+        LiveSettleJob {
+            exact: self.exact_hunks_job(session, turn, Scope::Turn, path),
+        }
     }
 
     /// A review of `session` at `turn` in `scope`, attributing with `named` (the tab's own edit
@@ -3346,6 +3399,41 @@ mod tests {
             std::thread::sleep(Duration::from_millis(5));
         }
         (dir, review)
+    }
+
+    #[test]
+    fn live_record_finds_a_running_and_an_ended_turn_by_its_id() {
+        let (_dir, mut review) = first_change_fixture("live-record");
+        review.sessions.get_mut("s1").unwrap().offset = None;
+        assert_eq!(review.live_record("s1", "t1").unwrap().n, 0);
+        review.sessions.get_mut("s1").unwrap().offset = Some(40);
+        let running = review.live_record("s1", "t1").unwrap();
+        assert_eq!(running.tab, 1);
+        assert_eq!(running.n, 41);
+        assert!(!running.ended);
+        assert_eq!(running.ended_ns, None);
+        assert_eq!(running.state, TurnState::Pending);
+        assert!(!running.late);
+        assert_eq!(review.live_record("other", "t1"), None);
+        assert_eq!(review.live_record("s1", "other"), None);
+        review.end_active(1, 2, false);
+        let ended = review.live_record("s1", "t1").unwrap();
+        assert!(ended.ended);
+        assert_eq!(ended.started_ns, running.started_ns);
+        assert!(ended.ended_ns.is_some_and(|end| end >= running.started_ns));
+        assert_eq!(ended.state, TurnState::Pending);
+        let rec = &mut review.sessions.get_mut("s1").unwrap().records[0];
+        rec.record.end = taken("end");
+        rec.record.late = true;
+        let ready = review.live_record("s1", "t1").unwrap();
+        assert_eq!(ready.state, TurnState::Ok);
+        assert!(ready.late);
+        review.start_turn(1, "t2", 3, false);
+        assert_eq!(review.live_record("s1", "t1"), Some(ready));
+        let next = review.live_record("s1", "t2").unwrap();
+        assert_eq!(next.n, 42);
+        assert!(!next.ended);
+        assert_eq!(next.state, TurnState::Pending);
     }
 
     #[test]

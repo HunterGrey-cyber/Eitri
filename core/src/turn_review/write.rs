@@ -328,6 +328,30 @@ impl ProjectDir {
             rel: rel.to_path_buf(),
         })
     }
+
+    /// Whether a directory strictly between the project root and `rel`'s leaf holds a `.git`: the
+    /// file is then inside a nested repository, whose contents the project's own history does not
+    /// track. Directories are opened as [`target`](Self::target) opens them; one that is missing, a
+    /// link or not a directory ends the walk with `false`.
+    pub fn inside_nested_repository(&self, rel: &Path) -> io::Result<bool> {
+        let git = c_name(b".git")?;
+        let mut dir = self.root.try_clone()?;
+        let mut parts: Vec<&[u8]> = rel.as_os_str().as_bytes().split(|&b| b == b'/').collect();
+        parts.pop();
+        for part in parts {
+            dir = match open_dir_at(&dir, &c_name(part)?) {
+                Ok(next) => next,
+                Err(e) if e.raw_os_error() == Some(libc::ENOENT) || is_link_or_not_dir(&e) => return Ok(false),
+                Err(e) => return Err(e),
+            };
+            match stat_at(&dir, &git) {
+                Ok(_) => return Ok(true),
+                Err(e) if e.raw_os_error() == Some(libc::ENOENT) => {}
+                Err(e) => return Err(e),
+            }
+        }
+        Ok(false)
+    }
 }
 
 /// What `target` is on disk now, read through its parent's descriptor without following a link.

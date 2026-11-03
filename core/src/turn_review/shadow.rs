@@ -1134,6 +1134,13 @@ impl Shadow {
     /// What `path` (relative to the work tree) is in snapshot `commit`: its kind, its mode and its
     /// bytes. `None` when the snapshot has nothing there, or only a directory.
     pub fn read_entry(&self, commit: &str, path: &Path) -> Result<Option<Entry>, ShadowError> {
+        Ok(self.read_entry_with_id(commit, path)?.map(|(entry, _)| entry))
+    }
+
+    /// [`read_entry`](Self::read_entry) with the id of the object the snapshot holds at `path` (a
+    /// blob's, or the nested repository's commit), so a caller can name the bytes to git without
+    /// storing them again.
+    pub fn read_entry_with_id(&self, commit: &str, path: &Path) -> Result<Option<(Entry, String)>, ShadowError> {
         if !is_hex_id(commit) {
             return Err(ShadowError::NoSuchCommit(commit.to_owned()));
         }
@@ -1172,11 +1179,14 @@ impl Shadow {
         let (kind, mode) = match mode.as_slice() {
             b"120000" => (EntryKind::Symlink, 0o777),
             b"160000" => {
-                return Ok(Some(Entry {
-                    mode: 0,
-                    kind: EntryKind::Gitlink,
-                    bytes: id.into_bytes(),
-                }))
+                return Ok(Some((
+                    Entry {
+                        mode: 0,
+                        kind: EntryKind::Gitlink,
+                        bytes: id.clone().into_bytes(),
+                    },
+                    id,
+                )))
             }
             b"100755" => (EntryKind::Blob, 0o755),
             m if m.starts_with(b"100") => (EntryKind::Blob, 0o644),
@@ -1185,7 +1195,7 @@ impl Shadow {
         let mut cat = self.git(None);
         cat.args(["cat-file", "blob", &id]);
         let bytes = self.run_ok("cat-file", cat, None, deadline)?.stdout;
-        Ok(Some(Entry { mode, kind, bytes }))
+        Ok(Some((Entry { mode, kind, bytes }, id)))
     }
 
     /// Keeps the blobs a revert wrote over (`pre`) and wrote (`post`) for as long as retention keeps

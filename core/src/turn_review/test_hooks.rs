@@ -9,6 +9,8 @@ use std::thread::LocalKey;
 pub(crate) type Hook = RefCell<Option<Box<dyn FnOnce()>>>;
 
 thread_local! {
+    /// In a live drawing's worker, after storing the disk bytes and before diffing them.
+    pub(crate) static AFTER_LIVE_STORE: Hook = const { RefCell::new(None) };
     /// In [`Shadow::trim`](super::shadow::Shadow::trim)'s second step, with the store lock held
     /// shared, right before its `git gc`.
     pub(crate) static BEFORE_GC: Hook = const { RefCell::new(None) };

@@ -1,10 +1,10 @@
-//! A revert, an undo, a recovery and an applied proposal reach project files only through
+//! Reverts, undos, recoveries, applied proposals and live drawings reach project files only through
 //! `write::ProjectDir`'s directory descriptors, never by a path string: a path string is resolved by
 //! the kernel again on every call, through whatever links a directory on it has become since it was
 //! checked.
 //!
-//! This reads `turn_review/write.rs`, `revert.rs` and `proposal_write.rs` as source text and fails on
-//! anything outside `#[cfg(test)]` that takes a path: `std::fs`, `File::…`, `OpenOptions`, the
+//! This reads `turn_review/write.rs`, `revert.rs`, `proposal_write.rs` and `live_job.rs` as source text
+//! and fails on anything outside `#[cfg(test)]` that takes a path: `std::fs`, `File::…`, `OpenOptions`, the
 //! `Path` methods that touch the disk, and the libc calls that take a path rather than a directory
 //! descriptor. A line may carry such a token only with `// containment-scan: <why this is not a
 //! project path>`. Comments and string literals are blanked first, and whitespace between tokens is
@@ -284,7 +284,7 @@ fn project_files_are_reached_only_through_directory_descriptors() {
         "write.rs no longer opens anything relative to a directory; is this scanning the right file?"
     );
     let mut problems = Vec::new();
-    for name in ["write.rs", "revert.rs", "proposal_write.rs"] {
+    for name in ["write.rs", "revert.rs", "proposal_write.rs", "live_job.rs"] {
         // A file that went missing would pass on nothing, silently.
         let source = std::fs::read_to_string(dir.join(name)).unwrap_or_else(|e| panic!("{name}: {e}"));
         for v in violations(&source) {
