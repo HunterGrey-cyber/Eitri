@@ -597,7 +597,7 @@ fi
 
 echo "== eitri panel: the companion window's command line =="
 # `eitri panel --nvim ADDR [DIR]` hands the address and the realpath of the project to `shell panel`;
-# `--nvim` exists in panel mode only, and the one-window-only flags are refused there.
+# `--nvim` also exists in page mode; the one-window-only flags are refused in both.
 reset_state
 EXTRA_ENV=()
 out="$(run_launcher panel --quiet --nvim /r/n.sock "$PROJECT_DIR")"
@@ -626,7 +626,7 @@ out="$(run_launcher panel --quiet --clean)"
 assert_contains "$out" "eitri panel: unknown option --clean" "panel refuses --clean by name"
 
 out="$(run_launcher --nvim x "$PROJECT_DIR")"
-assert_contains "$out" "eitri: unknown option --nvim" "--nvim outside panel mode is an unknown option"
+assert_contains "$out" "eitri: unknown option --nvim" "--nvim in the integrated window mode is an unknown option"
 (cd "$PROJECT_DIR" && env -i HOME="$FAKE_HOME" PATH="$PATH" "$ROOT/bin/eitri" --nvim x >/dev/null 2>&1)
 assert_eq "$?" "64" "eitri --nvim x exits 64"
 
@@ -693,6 +693,40 @@ assert_contains "$out" "STUB_ARG:$(realpath -e -- "$SPACED")" "a project path wi
 out="$(env -i HOME="$FAKE_HOME" PATH="$PATH" "$ROOT/bin/eitri" split 2>&1 </dev/null; true)"
 assert_contains "$out" "project" "split without --quiet prints the startup banner too"
 
+echo "== eitri page: the page window's command line =="
+reset_state
+EXTRA_ENV=()
+out="$(run_launcher page notes --nvim "/r/编辑 器.sock" "$SPACED")"
+args="$(grep '^STUB_ARG:' <<<"$out" | tr '\n' ' ')"
+assert_eq "$args" "STUB_ARG:page STUB_ARG:notes STUB_ARG:--nvim STUB_ARG:/r/编辑 器.sock STUB_ARG:-- STUB_ARG:$(realpath -e -- "$SPACED") " "page passes the id, address and canonical directory separately"
+assert_not_contains "$out" "account" "a page has no agent account banner"
+assert_not_contains "$out" "no sidecar" "a page needs no agent sidecar"
+out="$(run_launcher page --list)"
+args="$(grep '^STUB_ARG:' <<<"$out" | tr '\n' ' ')"
+assert_eq "$args" "STUB_ARG:page STUB_ARG:--list " "listing pages reaches shell without a project"
+assert_not_contains "$out" "project" "listing pages prints no project banner"
+for opt in --clean --legacy --new-window --quiet --account; do
+    out="$(run_launcher page notes "$opt")"
+    rc=$?
+    assert_eq "$rc" "64" "page $opt exits 64"
+    assert_contains "$out" "eitri page: unknown option $opt" "page refuses $opt by name"
+    assert_not_contains "$out" "STUB_ARG" "page $opt never reaches shell"
+done
+out="$(run_launcher page notes --nvim)"
+assert_eq "$?" "64" "page --nvim without an address exits 64"
+assert_not_contains "$out" "STUB_ARG" "a missing address never reaches shell"
+out="$(run_launcher page notes --nvim /r/n.sock -- "$PROJECT_DIR")"
+args="$(grep '^STUB_ARG:' <<<"$out" | tr '\n' ' ')"
+assert_eq "$args" "STUB_ARG:page STUB_ARG:notes STUB_ARG:--nvim STUB_ARG:/r/n.sock STUB_ARG:-- STUB_ARG:$REAL_PROJECT " "a page directory after -- is resolved"
+for invalid in "" "Notes" "../notes" "notes-"; do
+    run_launcher page "$invalid" >/dev/null
+    assert_eq "$?" "64" "page refuses an invalid or missing id"
+done
+run_launcher page notes "$PROJECT_DIR" "$PROJECT_DIR" >/dev/null
+assert_eq "$?" "64" "page refuses a second directory"
+run_launcher page --list notes >/dev/null
+assert_eq "$?" "64" "page listing refuses a positional id"
+
 echo "== -h lists the panel and split subcommands =="
 out="$(run_launcher -h)"
 assert_contains "$out" "eitri panel" "the help text names eitri panel"
@@ -730,7 +764,7 @@ out="$(run_in_filedir --quiet --account x a.rs)"
 assert_eq "$(args_of "$out")" "--new-window|a.rs" "--account as a flag asks for a new window"
 assert_contains "$out" "STUB_ARG:--new-window" "and the stub saw it"
 mkdir -p "$FILEDIR/choose-project"
-for sub in panel split run-guard linked-window choose-project; do
+for sub in panel split page run-guard linked-window choose-project; do
 	out="$(run_in_filedir --quiet "$sub")"
 	assert_eq "$(args_of "$out")" "./$sub" "a path named $sub is not read as the $sub subcommand"
 	out="$(run_in_filedir --quiet "$sub" b.rs)"

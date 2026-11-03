@@ -49,6 +49,7 @@ use std::fmt;
 use std::fs::DirBuilder;
 use std::io::{self, Read, Write};
 use std::os::fd::AsRawFd;
+use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::{DirBuilderExt, FileTypeExt, MetadataExt, OpenOptionsExt, PermissionsExt};
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
@@ -63,6 +64,8 @@ pub const PROTOCOL_V1: u64 = 1;
 /// The version of an attach that carries `close_with`. A request with a `v` other than these two is
 /// refused by name.
 pub const PROTOCOL_V2: u64 = 2;
+/// A page remains attached to the editor that opened it.
+pub const PAGE_ATTACH_REFUSED: &str = "refused: a page window follows the nvim it started with";
 /// How many ancestors of a sender are recorded with its attach. A process tree deeper than this is
 /// not one an editor window is found in.
 const SENDER_CHAIN_MAX: usize = 32;
@@ -157,9 +160,32 @@ fn key(project_root: &Path) -> String {
     crate::state_paths::project_key(project_root)
 }
 
+/// A companion is shared by project; a page is shared only by editor address and plugin id.
+#[derive(Debug, Clone, Copy)]
+pub enum ControlKey<'a> {
+    Project(&'a Path),
+    Page { addr: &'a Path, id: &'a str },
+}
+
+/// A checked socket path in the project's or page's namespace. Address aliases name the same page.
+pub fn socket_path_for(dir: &Path, control_key: &ControlKey<'_>) -> io::Result<PathBuf> {
+    match control_key {
+        ControlKey::Project(root) => agent::socket_path::in_dir(dir, &format!("p-{}.sock", key(root))),
+        ControlKey::Page { addr, id } => {
+            use sha2::{Digest, Sha256};
+            let canonical = std::fs::canonicalize(addr)?;
+            let mut hash = Sha256::new();
+            hash.update(canonical.as_os_str().as_bytes());
+            hash.update(b"\0");
+            hash.update(id.as_bytes());
+            agent::socket_path::in_dir(dir, &format!("g-{}.sock", &format!("{:x}", hash.finalize())[..16]))
+        }
+    }
+}
+
 /// `dir/p-<16 hex>.sock`, checked against the 103-byte socket path limit macOS has.
 pub fn socket_path(dir: &Path, project_root: &Path) -> io::Result<PathBuf> {
-    agent::socket_path::in_dir(dir, &format!("p-{}.sock", key(project_root)))
+    socket_path_for(dir, &ControlKey::Project(project_root))
 }
 
 /// `dir/split-<16 hex>-<pid>-<8 hex nonce>.sock`, where `eitri split` asks the editor it starts to
@@ -174,11 +200,6 @@ pub fn split_socket_path(dir: &Path, project_root: &Path, pid: u32, nonce: u32) 
 /// the socket.
 pub fn pid_path(dir: &Path, project_root: &Path) -> PathBuf {
     dir.join(format!("p-{}.pid", key(project_root)))
-}
-
-/// `dir/p-<16 hex>.lock`, the file claimants take an exclusive lock on while they reclaim.
-fn lock_path(dir: &Path, project_root: &Path) -> PathBuf {
-    dir.join(format!("p-{}.lock", key(project_root)))
 }
 
 /// This process's effective uid: what a socket file's owner and a peer's credentials both carry.
@@ -761,17 +782,23 @@ fn probe(sock: &Path, pid_file: &Path, request: Option<&Request>) -> Result<Prob
 /// [`Request::Raise`]. When this returns [`Claim::Ours`] nothing was sent: the caller acts on its
 /// own request.
 pub fn claim(dir: &Path, project_root: &Path, request: Option<&Request>) -> Result<Claim, String> {
+    claim_for(dir, &ControlKey::Project(project_root), request)
+}
+
+/// Claims or forwards to a companion or page, with identical ownership and stale-socket checks.
+pub fn claim_for(dir: &Path, control_key: &ControlKey<'_>, request: Option<&Request>) -> Result<Claim, String> {
     ensure_dir(dir)?;
-    let sock = socket_path(dir, project_root).map_err(|e| e.to_string())?;
-    let pid_file = pid_path(dir, project_root);
-    let lock_file = lock_path(dir, project_root);
+    let sock = socket_path_for(dir, control_key).map_err(|e| e.to_string())?;
+    let pid_file = sock.with_extension("pid");
+    let lock_file = sock.with_extension("lock");
+    let page = matches!(control_key, ControlKey::Page { .. });
     // Taken the first time the socket is found occupied and held until this claim returns, so a
     // reclaim, its bind and its pid write are never interleaved with another claimant's.
     let mut lock = None;
     let mut reclaimed = false;
     for _ in 0..MAX_CLAIM_ROUNDS {
         match UnixListener::bind(&sock) {
-            Ok(listener) => return serve(listener, sock, pid_file).map(Claim::Ours),
+            Ok(listener) => return serve(listener, sock, pid_file, page).map(Claim::Ours),
             Err(e) if e.kind() == io::ErrorKind::AddrInUse => {}
             Err(e) => return Err(format!("could not bind {}: {e}", sock.display())),
         }
@@ -833,7 +860,7 @@ mod between_removals {
 }
 
 /// The bound socket's side of a won claim: finishes setting it up and starts the thread.
-fn serve(listener: UnixListener, sock: PathBuf, pid_file: PathBuf) -> Result<ControlServer, String> {
+fn serve(listener: UnixListener, sock: PathBuf, pid_file: PathBuf, page: bool) -> Result<ControlServer, String> {
     let bound = identity(&sock).ok_or_else(|| format!("could not read {}", sock.display()))?;
     let started = (|| -> Result<ControlServer, String> {
         listener
@@ -858,7 +885,7 @@ fn serve(listener: UnixListener, sock: PathBuf, pid_file: PathBuf) -> Result<Con
         std::thread::Builder::new()
             .name("eitri-panel-control".into())
             .spawn(move || {
-                run(listener, &thread_stop, &requests_tx, &thread_accepted);
+                run(listener, &thread_stop, &requests_tx, &thread_accepted, page);
                 let _ = done_tx.send(());
             })
             .map_err(|e| {
@@ -884,11 +911,11 @@ fn serve(listener: UnixListener, sock: PathBuf, pid_file: PathBuf) -> Result<Con
 
 /// The server thread: accept, serve one connection at a time, stop when told to. It never waits for
 /// the GTK side and never touches the files.
-fn run(listener: UnixListener, stop: &AtomicBool, requests: &Sender<Received>, accepted: &AtomicU64) {
+fn run(listener: UnixListener, stop: &AtomicBool, requests: &Sender<Received>, accepted: &AtomicU64, page: bool) {
     let me = euid();
     while !stop.load(Ordering::Acquire) {
         match listener.accept() {
-            Ok((stream, _)) => serve_one(stream, requests, accepted, me),
+            Ok((stream, _)) => serve_one(stream, requests, accepted, me, page),
             // Nothing waiting, or a transient failure (descriptors exhausted, a connection that
             // went away): either way, never spin.
             Err(_) => std::thread::sleep(IDLE_SLEEP),
@@ -901,7 +928,7 @@ pub(crate) fn reply_line(stream: &UnixStream, line: &str) -> io::Result<()> {
     writer.write_all(format!("{line}\n").as_bytes())
 }
 
-fn serve_one(stream: UnixStream, requests: &Sender<Received>, accepted: &AtomicU64, me: u32) {
+fn serve_one(stream: UnixStream, requests: &Sender<Received>, accepted: &AtomicU64, me: u32, page: bool) {
     // A socket accepted from a non-blocking listener inherits that flag on macOS and the BSDs, and
     // every read below would then fail at once.
     if stream.set_nonblocking(false).is_err() || stream.set_write_timeout(Some(Duration::from_secs(1))).is_err() {
@@ -936,6 +963,10 @@ fn serve_one(stream: UnixStream, requests: &Sender<Received>, accepted: &AtomicU
             return;
         }
     };
+    if page && matches!(&request, Request::Attach { .. }) {
+        let _ = reply_line(&stream, PAGE_ATTACH_REFUSED);
+        return;
+    }
     let sender_chain = match &request {
         Request::Raise => Vec::new(),
         Request::Attach { addr, close_with } => {
@@ -1087,6 +1118,161 @@ mod tests {
     }
 
     #[test]
+    fn control_key_hashes_canonical_bytes() {
+        use sha2::{Digest, Sha256};
+        use std::os::unix::ffi::{OsStrExt, OsStringExt};
+        let scratch = ScratchDir::new("eitri-pc", "keys");
+        let real = scratch.join("编辑 器");
+        std::fs::create_dir(&real).unwrap();
+        let link = scratch.join("alias");
+        symlink(&real, &link).unwrap();
+        let addr = real.join(std::ffi::OsString::from_vec(b"nvim-\xff".to_vec()));
+        std::fs::write(&addr, b"").unwrap();
+        let canonical = std::fs::canonicalize(&addr).unwrap();
+        let mut hash = Sha256::new();
+        hash.update(canonical.as_os_str().as_bytes());
+        hash.update(b"\0notes");
+        let hex = format!("{:x}", hash.finalize());
+        let dir = Path::new("/runtime/eitri");
+        let page = ControlKey::Page {
+            addr: &addr,
+            id: "notes",
+        };
+        let sock = socket_path_for(&dir, &page).unwrap();
+        assert_eq!(sock.file_stem().unwrap(), OsStr::new(&format!("g-{}", &hex[..16])));
+        assert_eq!(sock.extension(), Some(OsStr::new("sock")));
+        let alias_addr = link.join(addr.file_name().unwrap());
+        assert_eq!(
+            socket_path_for(
+                &dir,
+                &ControlKey::Page {
+                    addr: &alias_addr,
+                    id: "notes"
+                }
+            )
+            .unwrap(),
+            sock
+        );
+        assert_ne!(
+            socket_path_for(
+                &dir,
+                &ControlKey::Page {
+                    addr: &addr,
+                    id: "other"
+                }
+            )
+            .unwrap(),
+            sock
+        );
+        let other_addr = real.join("another");
+        std::fs::write(&other_addr, b"").unwrap();
+        assert_ne!(
+            socket_path_for(
+                &dir,
+                &ControlKey::Page {
+                    addr: &other_addr,
+                    id: "notes"
+                }
+            )
+            .unwrap(),
+            sock
+        );
+        assert_eq!(
+            socket_path_for(&dir, &ControlKey::Project(&root())).unwrap(),
+            socket_path(&dir, &root()).unwrap()
+        );
+        let long_dir = PathBuf::from(format!("/{}", "x".repeat(103)));
+        assert!(socket_path_for(&long_dir, &page).is_err());
+    }
+
+    #[test]
+    fn a_page_claim_refuses_attach_and_answers_raise() {
+        let scratch = ScratchDir::new("eitri-pc", "page");
+        let dir = scratch.join("c");
+        let (addr, _listener) = fake_nvim(&scratch);
+        let key = ControlKey::Page {
+            addr: &addr,
+            id: "notes",
+        };
+        let server = ours(claim_for(&dir, &key, None));
+        let sock = socket_path_for(&dir, &key).unwrap();
+        assert_eq!(mode(&sock), 0o600);
+        assert_eq!(mode(&sock.with_extension("pid")), 0o600);
+        let inode = identity(&sock);
+        for request in [
+            attach(&addr),
+            attach(Path::new("relative")),
+            Request::Attach {
+                addr: addr.clone(),
+                close_with: Some(CloseWith { pid: 1, start: 0 }),
+            },
+        ] {
+            assert_eq!(
+                raw(&sock, encode(&request).unwrap().as_bytes(), false),
+                format!("{PAGE_ATTACH_REFUSED}\n")
+            );
+            assert!(server.requests().try_recv().is_err());
+            assert_eq!(server.accepted(), 0);
+        }
+        assert!(matches!(claim_for(&dir, &key, Some(&attach(&addr))),
+            Ok(Claim::Forwarded(Reply::Refused(why))) if format!("refused: {why}") == PAGE_ATTACH_REFUSED));
+        assert_eq!(identity(&sock), inode);
+        assert!(matches!(claim_for(&dir, &key, None), Ok(Claim::Forwarded(Reply::Ok))));
+        assert_eq!(
+            server.requests().recv_timeout(Duration::from_secs(2)).unwrap().request,
+            Request::Raise
+        );
+        assert_eq!(server.accepted(), 1);
+        assert_eq!(
+            raw(
+                &sock,
+                br#"{"v":2,"raise":true}
+"#,
+                false
+            ),
+            "refused: malformed request\n"
+        );
+        let other = ours(claim_for(
+            &dir,
+            &ControlKey::Page {
+                addr: &addr,
+                id: "other",
+            },
+            None,
+        ));
+        other.cleanup();
+        server.cleanup();
+        assert!(!sock.exists() && !sock.with_extension("pid").exists());
+        assert!(sock.with_extension("lock").exists());
+        // A dead holder's files use the same reclaim checks as a project's.
+        drop(UnixListener::bind(&sock).unwrap());
+        std::fs::write(sock.with_extension("pid"), format!("{}\n", i32::MAX)).unwrap();
+        let reclaimed = ours(claim_for(&dir, &key, None));
+        reclaimed.cleanup();
+    }
+
+    #[test]
+    fn claim_for_project_is_todays_claim() {
+        let scratch = ScratchDir::new("eitri-pc", "project-key");
+        let dir = scratch.join("c");
+        let server = ours(claim_for(&dir, &ControlKey::Project(&root()), None));
+        assert!(matches!(claim(&dir, &root(), None), Ok(Claim::Forwarded(Reply::Ok))));
+        assert_eq!(
+            server.requests().recv_timeout(Duration::from_secs(2)).unwrap().request,
+            Request::Raise
+        );
+        assert_eq!(server.socket, socket_path(&dir, &root()).unwrap());
+        assert_eq!(server.pid_file, pid_path(&dir, &root()));
+        server.cleanup();
+        let server = ours(claim(&dir, &root(), None));
+        assert!(matches!(
+            claim_for(&dir, &ControlKey::Project(&root()), None),
+            Ok(Claim::Forwarded(Reply::Ok))
+        ));
+        server.cleanup();
+    }
+
+    #[test]
     fn the_control_dir_prefers_xdg_runtime_dir_and_falls_back_to_tmp() {
         let tmp = Path::new("/tmp");
         assert_eq!(
@@ -1129,7 +1315,7 @@ mod tests {
     fn a_first_claim_owns_the_socket_and_writes_its_pid_0600() {
         let scratch = ScratchDir::new("eitri-pc", "first");
         let dir = scratch.join("c");
-        let server = ours(claim(&dir, &root(), None));
+        let server = ours(claim_for(&dir, &ControlKey::Project(&root()), None));
         assert_eq!(mode(&dir), 0o700);
         let sock = socket_path(&dir, &root()).unwrap();
         let pid_file = pid_path(&dir, &root());
@@ -1147,9 +1333,9 @@ mod tests {
     fn a_second_claim_forwards_its_attach_and_the_first_receives_it() {
         let scratch = ScratchDir::new("eitri-pc", "attach");
         let dir = scratch.join("c");
-        let first = ours(claim(&dir, &root(), None));
+        let first = ours(claim_for(&dir, &ControlKey::Project(&root()), None));
         let (nvim, _listener) = fake_nvim(&scratch);
-        let second = claim(&dir, &root(), Some(&attach(&nvim)));
+        let second = claim_for(&dir, &ControlKey::Project(&root()), Some(&attach(&nvim)));
         assert!(matches!(second, Ok(Claim::Forwarded(Reply::Ok))), "{second:?}");
         assert_eq!(
             first
@@ -1164,18 +1350,22 @@ mod tests {
     fn a_request_is_counted_before_its_sender_can_read_ok() {
         let scratch = ScratchDir::new("eitri-pc", "counted");
         let dir = scratch.join("c");
-        let first = ours(claim(&dir, &root(), None));
+        let first = ours(claim_for(&dir, &ControlKey::Project(&root()), None));
         assert_eq!(first.accepted(), 0);
         let (nvim, _listener) = fake_nvim(&scratch);
         // `claim` returns once the reply was read: nothing of the request has been taken yet, and
         // the count must already say it is coming.
-        let second = claim(&dir, &root(), Some(&attach(&nvim)));
+        let second = claim_for(&dir, &ControlKey::Project(&root()), Some(&attach(&nvim)));
         assert!(matches!(second, Ok(Claim::Forwarded(Reply::Ok))), "{second:?}");
         assert_eq!(first.accepted(), 1);
         assert!(first.requests().recv_timeout(Duration::from_secs(2)).is_ok());
         assert_eq!(first.accepted(), 1, "taking it does not change the count");
         // A refused request is never counted.
-        let refused = claim(&dir, &root(), Some(&attach(Path::new("localhost:6666"))));
+        let refused = claim_for(
+            &dir,
+            &ControlKey::Project(&root()),
+            Some(&attach(Path::new("localhost:6666"))),
+        );
         assert!(
             matches!(refused, Ok(Claim::Forwarded(Reply::Refused(_)))),
             "{refused:?}"
@@ -1187,8 +1377,8 @@ mod tests {
     fn a_second_claim_without_an_address_sends_raise() {
         let scratch = ScratchDir::new("eitri-pc", "raise");
         let dir = scratch.join("c");
-        let first = ours(claim(&dir, &root(), None));
-        let second = claim(&dir, &root(), None);
+        let first = ours(claim_for(&dir, &ControlKey::Project(&root()), None));
+        let second = claim_for(&dir, &ControlKey::Project(&root()), None);
         assert!(matches!(second, Ok(Claim::Forwarded(Reply::Ok))), "{second:?}");
         assert_eq!(
             first
@@ -1204,9 +1394,9 @@ mod tests {
         let scratch = ScratchDir::new("eitri-pc", "starting");
         let dir = scratch.join("c");
         // The winner's own side never polls `requests()`: the answer comes from the server thread.
-        let _first = ours(claim(&dir, &root(), None));
+        let _first = ours(claim_for(&dir, &ControlKey::Project(&root()), None));
         let started = Instant::now();
-        let second = claim(&dir, &root(), None);
+        let second = claim_for(&dir, &ControlKey::Project(&root()), None);
         assert!(matches!(second, Ok(Claim::Forwarded(Reply::Ok))), "{second:?}");
         assert!(started.elapsed() < Duration::from_secs(2));
     }
@@ -1215,8 +1405,12 @@ mod tests {
     fn a_refused_attach_is_reported_back_and_never_delivered() {
         let scratch = ScratchDir::new("eitri-pc", "refused");
         let dir = scratch.join("c");
-        let first = ours(claim(&dir, &root(), None));
-        let second = claim(&dir, &root(), Some(&attach(Path::new("localhost:6666"))));
+        let first = ours(claim_for(&dir, &ControlKey::Project(&root()), None));
+        let second = claim_for(
+            &dir,
+            &ControlKey::Project(&root()),
+            Some(&attach(Path::new("localhost:6666"))),
+        );
         match second {
             Ok(Claim::Forwarded(Reply::Refused(why))) => assert!(why.contains("TCP"), "{why}"),
             other => panic!("{other:?}"),
@@ -1245,7 +1439,7 @@ mod tests {
         ensure_dir(&dir).unwrap();
         mode(0o777);
         assert!(ensure_dir(&dir).is_err(), "one that exists there is no better");
-        assert!(claim(&dir, &root(), None).is_err());
+        assert!(claim_for(&dir, &ControlKey::Project(&root()), None).is_err());
 
         mode(0o700);
         ensure_dir(&dir).unwrap();
@@ -1268,13 +1462,13 @@ mod tests {
         drop(UnixListener::bind(&sock).unwrap());
         // A pid far above any real pid_max: `kill` answers ESRCH, and the probe does not pre-reject it.
         std::fs::write(pid_path(&dir, &root()), format!("{}\n", i32::MAX)).unwrap();
-        let server = ours(claim(&dir, &root(), None));
+        let server = ours(claim_for(&dir, &ControlKey::Project(&root()), None));
         assert_eq!(read_pid(&pid_path(&dir, &root())), Some(std::process::id()));
         server.cleanup();
 
         // The same with no pid file at all: stale only after the recheck.
         drop(UnixListener::bind(&sock).unwrap());
-        let server = ours(claim(&dir, &root(), None));
+        let server = ours(claim_for(&dir, &ControlKey::Project(&root()), None));
         server.cleanup();
     }
 
@@ -1299,7 +1493,7 @@ mod tests {
                 *held.borrow_mut() = Some(listener);
             }
         }));
-        let claimed = claim(&dir, &root(), None);
+        let claimed = claim_for(&dir, &ControlKey::Project(&root()), None);
         let recorded = read_pid(&pid_file);
         if intruder.borrow().is_some() {
             assert_eq!(
@@ -1321,7 +1515,7 @@ mod tests {
     fn the_pid_file_names_the_winner_by_pid_and_start_time() {
         let scratch = ScratchDir::new("eitri-pc", "pidstart");
         let dir = scratch.join("c");
-        let server = ours(claim(&dir, &root(), None));
+        let server = ours(claim_for(&dir, &ControlKey::Project(&root()), None));
         let own = std::process::id();
         let start = crate::split::proc_start_time(own).unwrap();
         assert_eq!(
@@ -1395,7 +1589,7 @@ mod tests {
 
         drop(UnixListener::bind(&sock).unwrap());
         std::fs::write(&pid_file, format!("{own} {start}\n")).unwrap();
-        let claimed = claim(&dir, &root(), None);
+        let claimed = claim_for(&dir, &ControlKey::Project(&root()), None);
         assert!(
             matches!(claimed, Ok(Claim::Unresponsive { pid }) if pid == own),
             "{claimed:?}"
@@ -1403,7 +1597,7 @@ mod tests {
         assert!(sock.exists() && pid_file.exists());
 
         std::fs::write(&pid_file, format!("{own} {}\n", start + 1)).unwrap();
-        let server = ours(claim(&dir, &root(), None));
+        let server = ours(claim_for(&dir, &ControlKey::Project(&root()), None));
         server.cleanup();
     }
 
@@ -1418,7 +1612,7 @@ mod tests {
         let own = std::process::id();
         std::fs::write(&pid_file, format!("{own}\n")).unwrap();
         let started = Instant::now();
-        let claimed = claim(&dir, &root(), None);
+        let claimed = claim_for(&dir, &ControlKey::Project(&root()), None);
         assert!(
             matches!(claimed, Ok(Claim::Unresponsive { pid }) if pid == own),
             "{claimed:?}"
@@ -1439,7 +1633,7 @@ mod tests {
         // A live listener with no pid file whose mode forbids even its owner: connect says EACCES.
         let _listener = UnixListener::bind(&sock).unwrap();
         std::fs::set_permissions(&sock, std::fs::Permissions::from_mode(0o000)).unwrap();
-        let claimed = claim(&dir, &root(), None);
+        let claimed = claim_for(&dir, &ControlKey::Project(&root()), None);
         assert!(matches!(claimed, Ok(Claim::Unresponsive { pid: 0 })), "{claimed:?}");
         assert!(sock.symlink_metadata().unwrap().file_type().is_socket());
     }
@@ -1459,7 +1653,7 @@ mod tests {
                     let (dir, barrier) = (dir.clone(), Arc::clone(&barrier));
                     std::thread::spawn(move || {
                         barrier.wait();
-                        claim(&dir, &root(), None)
+                        claim_for(&dir, &ControlKey::Project(&root()), None)
                     })
                 })
                 .collect();
@@ -1486,7 +1680,7 @@ mod tests {
         std::fs::set_permissions(&real, std::fs::Permissions::from_mode(0o700)).unwrap();
         let link = scratch.join("link");
         symlink(&real, &link).unwrap();
-        let err = claim(&link, &root(), None).unwrap_err();
+        let err = claim_for(&link, &ControlKey::Project(&root()), None).unwrap_err();
         assert!(
             err.contains("not a private directory") && err.contains("symbolic link"),
             "{err}"
@@ -1496,7 +1690,7 @@ mod tests {
         let open = scratch.join("open");
         std::fs::create_dir(&open).unwrap();
         std::fs::set_permissions(&open, std::fs::Permissions::from_mode(0o770)).unwrap();
-        let err = claim(&open, &root(), None).unwrap_err();
+        let err = claim_for(&open, &ControlKey::Project(&root()), None).unwrap_err();
         assert!(err.contains("not a private directory"), "{err}");
         assert_eq!(mode(&open), 0o770);
     }
@@ -1514,7 +1708,7 @@ mod tests {
         let pid_file = pid_path(&dir, &root());
         std::fs::write(&sock, b"not a socket").unwrap();
         std::fs::write(&pid_file, b"1\n").unwrap();
-        let err = claim(&dir, &root(), None).unwrap_err();
+        let err = claim_for(&dir, &ControlKey::Project(&root()), None).unwrap_err();
         assert!(err.contains("not this user's socket"), "{err}");
         assert!(sock.exists() && pid_file.exists());
     }
@@ -1536,7 +1730,7 @@ mod tests {
     fn malformed_oversized_and_wrong_version_requests_are_refused_with_reasons() {
         let scratch = ScratchDir::new("eitri-pc", "badreq");
         let dir = scratch.join("c");
-        let server = ours(claim(&dir, &root(), None));
+        let server = ours(claim_for(&dir, &ControlKey::Project(&root()), None));
         let sock = socket_path(&dir, &root()).unwrap();
         let cases: [(&[u8], &str); 6] = [
             (b"not json\n", "refused: malformed request\n"),
@@ -1629,7 +1823,7 @@ mod tests {
     fn cleanup_leaves_files_a_newer_panel_wrote() {
         let scratch = ScratchDir::new("eitri-pc", "newer");
         let dir = scratch.join("c");
-        let server = ours(claim(&dir, &root(), None));
+        let server = ours(claim_for(&dir, &ControlKey::Project(&root()), None));
         let pid_file = pid_path(&dir, &root());
         std::fs::write(&pid_file, b"1\n").unwrap();
         server.cleanup();
@@ -1641,7 +1835,7 @@ mod tests {
     fn cleanup_leaves_a_socket_it_did_not_bind() {
         let scratch = ScratchDir::new("eitri-pc", "rebound");
         let dir = scratch.join("c");
-        let server = ours(claim(&dir, &root(), None));
+        let server = ours(claim_for(&dir, &ControlKey::Project(&root()), None));
         let sock = socket_path(&dir, &root()).unwrap();
         // The server still holds its socket, so the replacement cannot reuse its inode number.
         std::fs::remove_file(&sock).unwrap();
@@ -1792,7 +1986,7 @@ mod tests {
     fn an_attach_carries_its_senders_chain() {
         let scratch = ScratchDir::new("eitri-pc", "chain");
         let dir = scratch.join("c");
-        let server = ours(claim(&dir, &root(), None));
+        let server = ours(claim_for(&dir, &ControlKey::Project(&root()), None));
         let sock = socket_path(&dir, &root()).unwrap();
         let (nvim, _listener) = fake_nvim(&scratch);
         let received = exchange(&sock, &server, &attach(&nvim)).unwrap();
@@ -1813,7 +2007,7 @@ mod tests {
     fn a_close_with_that_is_not_the_senders_child_is_refused() {
         let scratch = ScratchDir::new("eitri-pc", "closewith");
         let dir = scratch.join("c");
-        let server = ours(claim(&dir, &root(), None));
+        let server = ours(claim_for(&dir, &ControlKey::Project(&root()), None));
         let sock = socket_path(&dir, &root()).unwrap();
         let (nvim, _listener) = fake_nvim(&scratch);
         let start_of = |pid: u32| {
@@ -1852,7 +2046,7 @@ mod tests {
     fn a_server_dropped_without_cleanup_still_removes_its_files() {
         let scratch = ScratchDir::new("eitri-pc", "dropped");
         let dir = scratch.join("c");
-        drop(ours(claim(&dir, &root(), None)));
+        drop(ours(claim_for(&dir, &ControlKey::Project(&root()), None)));
         assert!(!socket_path(&dir, &root()).unwrap().exists());
         assert!(!pid_path(&dir, &root()).exists());
     }

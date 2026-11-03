@@ -186,6 +186,65 @@ pub fn parse_panel_args(args: &[OsString], nvim_env: Option<OsString>) -> Result
 
 const TWO_PROJECTS: &str = "eitri panel: takes at most one project directory";
 
+/// `eitri page`'s own options. The caller resolves the directory and supplies `$NVIM` when needed.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PageArgs {
+    pub id: String,
+    pub nvim: Option<PathBuf>,
+    pub dir: Option<PathBuf>,
+    pub list: bool,
+}
+
+/// Parses a plugin id and an optional directory without converting path bytes to text.
+pub fn parse_page_args(args: &[OsString]) -> Result<PageArgs, String> {
+    let mut page = PageArgs {
+        id: String::new(),
+        nvim: None,
+        dir: None,
+        list: false,
+    };
+    let mut positional = Vec::new();
+    let mut args = args.iter();
+    while let Some(arg) = args.next() {
+        if arg == OsStr::new(END_OF_FLAGS) {
+            positional.extend(args);
+            break;
+        }
+        if arg == OsStr::new("--nvim") {
+            let value = args
+                .next()
+                .filter(|value| !value.is_empty())
+                .ok_or_else(|| "eitri page: --nvim needs an address".to_owned())?;
+            page.nvim = Some(PathBuf::from(value));
+        } else if arg == OsStr::new("--list") {
+            page.list = true;
+        } else if arg.as_bytes().first() == Some(&b'-') {
+            return Err(format!("eitri page: unknown option {}", arg.to_string_lossy()));
+        } else {
+            positional.push(arg);
+        }
+    }
+    if page.list {
+        if !positional.is_empty() {
+            return Err("eitri page: --list takes no plugin id or directory".to_owned());
+        }
+        return Ok(page);
+    }
+    let id = positional
+        .first()
+        .and_then(|id| id.to_str())
+        .filter(|id| crate::plugin::manifest::id_ok(id))
+        .ok_or_else(|| {
+            "eitri page: needs a plugin id of 1 to 40 lower-case letters, digits or internal dashes".to_owned()
+        })?;
+    if positional.len() > 2 {
+        return Err("eitri page: takes a plugin id and an optional directory".to_owned());
+    }
+    page.id = id.to_owned();
+    page.dir = positional.get(1).map(PathBuf::from);
+    Ok(page)
+}
+
 /// What `eitri split` took from its own command line: the project directory, in the form
 /// [`resolve_args`] reads.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -794,6 +853,59 @@ mod tests {
     use crate::project_trust::nofollow::tests::{canonical_scratch, mkfifo};
     use agent::project_boundary::NotABoundary;
     use std::os::unix::fs::{symlink, PermissionsExt};
+
+    #[test]
+    fn page_args_defaults_and_refusals() {
+        assert_eq!(
+            parse_page_args(&os(&["notes"])),
+            Ok(PageArgs {
+                id: "notes".into(),
+                nvim: None,
+                dir: None,
+                list: false,
+            })
+        );
+        let listed = parse_page_args(&os(&["--list"])).unwrap();
+        assert!(listed.list);
+        assert!(listed.id.is_empty() && listed.nvim.is_none() && listed.dir.is_none());
+        for flag in ["--account", "--quiet", "--clean", "--legacy", "--new-window", "--bogus"] {
+            let err = parse_page_args(&os(&["notes", flag])).unwrap_err();
+            assert!(err.contains(flag), "{err}");
+        }
+        for args in [
+            vec![],
+            vec!["../notes"],
+            vec!["Notes"],
+            vec!["-notes"],
+            vec!["notes-"],
+            vec!["notes", "one", "two"],
+            vec!["notes", "--nvim"],
+            vec!["--list", "notes"],
+        ] {
+            assert!(parse_page_args(&os(&args)).is_err(), "{args:?}");
+        }
+        assert!(parse_page_args(&[OsString::from("a".repeat(41))]).is_err());
+        assert!(parse_page_args(&[OsString::from("a".repeat(40))]).is_ok());
+        assert_eq!(
+            parse_page_args(&os(&["notes", "--", "--clean"])).unwrap().dir,
+            Some("--clean".into())
+        );
+    }
+
+    #[test]
+    fn page_args_take_a_path_with_spaces_and_chinese() {
+        let page = parse_page_args(&os(&["notes", "--nvim", "/tmp/编辑 器.addr", "/work/中文 项目"])).unwrap();
+        assert_eq!(page.id, "notes");
+        assert_eq!(page.nvim, Some(PathBuf::from("/tmp/编辑 器.addr")));
+        assert_eq!(page.dir, Some(PathBuf::from("/work/中文 项目")));
+        use std::os::unix::ffi::OsStringExt;
+        let bytes = OsString::from_vec(b"/work/invalid-\xff".to_vec());
+        assert_eq!(
+            parse_page_args(&["notes".into(), bytes.clone()]).unwrap().dir,
+            Some(PathBuf::from(bytes))
+        );
+        assert!(parse_page_args(&[OsString::from_vec(vec![0xff])]).is_err());
+    }
 
     /// `select_root_source` over `&str` literals, which is what almost every case below wants.
     fn select<'a>(args: impl IntoIterator<Item = &'a str>, env: Option<&str>) -> Result<RootSource, String> {

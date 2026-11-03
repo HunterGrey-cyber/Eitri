@@ -23,6 +23,11 @@ pub fn log_file_name(project_root: &Path) -> String {
     format!("{}.log", crate::state_paths::project_key(project_root))
 }
 
+/// A page's log uses the same 16 hex digits as its control socket, in a separate namespace.
+pub fn page_log_file_name(key_hex: &str) -> String {
+    format!("page-{key_hex}.log")
+}
+
 /// Whether `fd` is a pipe or a socket, which is what a job of nvim's gets; never a terminal or a file.
 pub fn is_pipe(fd: RawFd) -> bool {
     // SAFETY: `stat` is a plain buffer `fstat` fills in; an fd that is not open makes it fail.
@@ -121,6 +126,15 @@ mod tests {
 
     fn scratch(label: &str) -> crate::test_scratch_dir::ScratchDir {
         crate::test_scratch_dir::ScratchDir::new("companion-stdio", label)
+    }
+
+    #[test]
+    fn page_logs_are_named_for_the_control_key() {
+        assert_eq!(page_log_file_name("0123456789abcdef"), "page-0123456789abcdef.log");
+        assert_ne!(
+            page_log_file_name("0123456789abcdef"),
+            log_file_name(Path::new("/some/project"))
+        );
     }
 
     #[test]

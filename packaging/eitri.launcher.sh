@@ -11,6 +11,8 @@
 #   eitri --account work   bill a specific Claude account (and read its history)
 #   eitri panel --nvim ADDR [DIR]
 #                          open the agent panel beside the nvim at ADDR (:EitriPanel runs this)
+#   eitri page ID [--nvim ADDR] [DIR]
+#                          open a plugin page beside nvim (--list lists the available page ids)
 #   eitri split [DIR]      open the editor (Neovide) and the agent panel as two windows (needs Neovide)
 #   eitri --version        print the version and exit
 #   eitri sidecar status   what new tabs run, what is bundled, what is kept; no network
@@ -134,6 +136,9 @@ elif [[ "${1:-}" == split ]]; then
 	# options and nothing else, like `panel`: the in-process editor's own flags do not apply.
 	MODE=split
 	shift
+elif [[ "${1:-}" == page ]]; then
+	MODE=page
+	shift
 fi
 
 ACCOUNT="${VERDANDI_CLAUDE_ACCOUNT:-}"
@@ -151,10 +156,13 @@ AFTER=()
 SAW_DASHES=""
 SHELL_ARGS=()
 PANEL_ARGS=()
+PAGE_POSITIONALS=()
+PAGE_LIST=""
 # What an unknown option is reported as: `eitri: ...` for the window, `eitri panel: ...` for the panel.
 CMD_NAME=eitri
 [[ $MODE == panel ]] && CMD_NAME="eitri panel"
 [[ $MODE == split ]] && CMD_NAME="eitri split"
+[[ $MODE == page ]] && CMD_NAME="eitri page"
 
 while [[ $# -gt 0 ]]; do
 	case "$1" in
@@ -167,9 +175,13 @@ while [[ $# -gt 0 ]]; do
 		           SHELL_ARGS+=(--clean); shift ;;
 		# The panel attaches to an nvim that is already running; there is nothing to attach to in the
 		# one-window mode, which starts its own.
-		--nvim)    [[ $MODE == panel ]] || { echo "$CMD_NAME: unknown option --nvim" >&2; exit 64; }
-		           PANEL_ARGS+=(--nvim "${2:?--nvim needs an address}"); shift 2 ;;
-		--version) exec "$LIBDIR/shell" --version ;;
+		--nvim)    [[ $MODE == panel || $MODE == page ]] || { echo "$CMD_NAME: unknown option --nvim" >&2; exit 64; }
+		           [[ -n "${2:-}" ]] || { echo "$CMD_NAME: --nvim needs an address" >&2; exit 64; }
+		           PANEL_ARGS+=(--nvim "$2"); shift 2 ;;
+		--list)    [[ $MODE == page ]] || { echo "$CMD_NAME: unknown option --list" >&2; exit 64; }
+		           PAGE_LIST=1; shift ;;
+		--version) [[ $MODE != page ]] || { echo "$CMD_NAME: unknown option --version" >&2; exit 64; }
+		           exec "$LIBDIR/shell" --version ;;
 		# Opening a file reuses a running window of its project; this opts out. `--account` implies it
 		# below: reusing a window would drop the account the flag selects.
 		--new-window) [[ $MODE == window ]] || { echo "$CMD_NAME: unknown option --new-window" >&2; exit 64; }
@@ -177,21 +189,39 @@ while [[ $# -gt 0 ]]; do
 		# Only the desktop entry passes this, in front of its `%F` list: see the end of this file.
 		--from-desktop) [[ $MODE == window ]] || { echo "$CMD_NAME: unknown option --from-desktop" >&2; exit 64; }
 		           FROM_DESKTOP=1; shift ;;
-		--account) ACCOUNT="${2:?--account needs a name}"; ACCOUNT_FROM_FLAG=1; shift 2 ;;
-		--quiet)   QUIET=1; shift ;;
-		-h|--help) sed -n '2,25p' "$0" | sed 's/^# \?//'; exit 0 ;;
+		--account) [[ $MODE != page ]] || { echo "$CMD_NAME: unknown option --account" >&2; exit 64; }
+		           ACCOUNT="${2:?--account needs a name}"; ACCOUNT_FROM_FLAG=1; shift 2 ;;
+		--quiet)   [[ $MODE != page ]] || { echo "$CMD_NAME: unknown option --quiet" >&2; exit 64; }
+		           QUIET=1; shift ;;
+		-h|--help) sed -n '2,27p' "$0" | sed 's/^# \?//'; exit 0 ;;
 		--) SAW_DASHES=1; shift
-		    if [[ $MODE == window ]]; then AFTER=("$@"); FIRST="${FIRST:-${1:-}}"; else PROJECT="${1:-}"; fi
+		    if [[ $MODE == window ]]; then AFTER=("$@"); FIRST="${FIRST:-${1:-}}"
+		    elif [[ $MODE == page ]]; then PAGE_POSITIONALS+=("$@")
+		    else PROJECT="${1:-}"; fi
 		    break ;;
 		-*) echo "$CMD_NAME: unknown option $1" >&2; exit 64 ;;
 		*)  if [[ $MODE == window ]]; then
 		        BEFORE+=("$1")
 		        # The banner names the first thing to open, not a `+N` line spec.
 		        [[ -z "$FIRST" && $1 != +* ]] && FIRST="$1"
+		    elif [[ $MODE == page ]]; then PAGE_POSITIONALS+=("$1")
 		    else PROJECT="$1"; fi
 		    shift ;;
 	esac
 done
+if [[ $MODE == page ]]; then
+	if [[ -n "$PAGE_LIST" ]]; then
+		[[ ${#PAGE_POSITIONALS[@]} -eq 0 ]] || { echo 'eitri page: --list takes no plugin id or directory' >&2; exit 64; }
+		exec "$LIBDIR/shell" page "${PANEL_ARGS[@]}" --list
+	fi
+	PAGE_ID="${PAGE_POSITIONALS[0]:-}"
+	if [[ ${#PAGE_ID} -gt 40 || ! "$PAGE_ID" =~ ^[a-z0-9]([a-z0-9-]*[a-z0-9])?$ ]]; then
+		echo 'eitri page: needs a plugin id of 1 to 40 lower-case letters, digits or internal dashes' >&2
+		exit 64
+	fi
+	[[ ${#PAGE_POSITIONALS[@]} -le 2 ]] || { echo 'eitri page: takes a plugin id and an optional directory' >&2; exit 64; }
+	PROJECT="${PAGE_POSITIONALS[1]:-}"
+fi
 [[ $MODE == window && -n "$ACCOUNT_FROM_FLAG" ]] && NEW_WINDOW=1
 if [[ -n "$FROM_DESKTOP" && ${#BEFORE[@]} -eq 0 && ${#AFTER[@]} -eq 0 ]]; then
 	# The chooser needs no project yet, and must also start when the current directory is gone.
@@ -200,6 +230,10 @@ elif [[ $MODE != window || (${#BEFORE[@]} -eq 0 && ${#AFTER[@]} -eq 0) ]]; then
 	# No positional (or panel/split, which take a directory only): the one directory, resolved here.
 	PROJECT="$(realpath -e -- "${PROJECT:-$PWD}" 2>/dev/null)" || { echo "eitri: no such directory" >&2; exit 1; }
 	[[ $MODE == window ]] && BEFORE=("$PROJECT") && SAW_DASHES=""
+fi
+
+if [[ $MODE == page ]]; then
+	exec "$LIBDIR/shell" page "$PAGE_ID" "${PANEL_ARGS[@]}" -- "$PROJECT"
 fi
 
 # Use the same account for CLI authentication, transcript writes and resume discovery (agent::account),
@@ -344,7 +378,7 @@ fi
 # same directory.
 if [[ ${#SHELL_ARGS[@]} -eq 0 && ${#BEFORE[@]} -gt 0 ]]; then
 	case "${BEFORE[0]}" in
-		panel | split | run-guard | linked-window | choose-project) BEFORE[0]="./${BEFORE[0]}" ;;
+		panel | split | page | run-guard | linked-window | choose-project) BEFORE[0]="./${BEFORE[0]}" ;;
 	esac
 fi
 if [[ -n "$SAW_DASHES" ]]; then

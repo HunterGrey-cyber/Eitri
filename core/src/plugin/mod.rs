@@ -2,6 +2,7 @@
 //! capabilities its manifest declares, plus the processes, files and editor calls those capabilities
 //! reach. Nothing here touches a toolkit; `shell` builds the page and wires the window to the host.
 
+pub mod beside;
 pub mod doc_route;
 pub mod editor;
 pub mod follow;
