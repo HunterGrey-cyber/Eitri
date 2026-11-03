@@ -34,6 +34,7 @@ pub mod git;
 pub mod journal;
 pub mod lifecycle;
 pub mod live_contest;
+pub mod live_draws;
 pub mod live_job;
 pub mod message;
 pub mod presence;
