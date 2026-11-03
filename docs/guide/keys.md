@@ -74,8 +74,8 @@ the project, `gone` when the folder is no longer there, and otherwise how long a
 `3 d`, `4 w`). The window's own project is left out, so `<prefix> O` then `Enter` goes to the project you used before
 this one, as `<prefix> L` goes to the workspace you were on before. Your home folder and `/` come after every other
 project, and a project whose folder is gone comes last (at most 30 projects and 5 gone ones are listed). `Enter` on a
-project that has a window brings that window forward, across workspaces where your window manager allows it; on any other
-project it opens a new window. A typed path opens a folder, or a file the way `eitri FILE` does; a name that does not
+project that has a window brings that window forward, across workspaces where your window manager allows it, as it is and
+on the account it started with; on any other project it opens a new window, on this window's account. A typed path opens a folder, or a file the way `eitri FILE` does; a name that does not
 exist shows `no such folder: <path>` and nothing is created, and a `gone` row shows `<path> is not there` and stays.
 Eitri builds the list from its own records of your projects (the layout and tabs it saves, and a note each window keeps
 of its project and when you last used it) and reads nothing else on your disk; a project you opened and left alone is in

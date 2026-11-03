@@ -299,6 +299,48 @@ fn tab_sets_the_line_to_the_common_prefix_and_adds_a_slash_on_one_match() {
     }
 }
 #[test]
+fn tab_keeps_the_typed_form_of_the_line_and_extends_it_from_the_absolute_answer() {
+    for (typed, folders, common, expected) in [
+        ("~/b", vec!["/home/me/beta"], "/home/me/beta", "~/beta/"),
+        ("~/b", vec!["/home/me/beta", "/home/me/bin"], "/home/me/b", "~/b"),
+        ("~/.c", vec!["/home/me/.config"], "/home/me/.config", "~/.config/"),
+        ("~/..", vec!["/home/me/../you"], "/home/me/../you", "~/../you/"),
+        ("~", vec!["/home/me"], "/home/me", "~/"),
+        // A sibling of home alone (home missing, or past the entry cap) cannot be written from `~`.
+        ("~", vec!["/home/me-old"], "/home/me-old", "/home/me-old/"),
+        (
+            "./nested/ap",
+            vec!["/w/nested/apple", "/w/nested/apricot"],
+            "/w/nested/ap",
+            "./nested/ap",
+        ),
+        (
+            "./nested/ap",
+            vec!["/w/nested/apple"],
+            "/w/nested/apple",
+            "./nested/apple/",
+        ),
+        ("../sib", vec!["/w/../sibling"], "/w/../sibling", "../sibling/"),
+        ("./", vec!["/w/a", "/w/b"], "/w/", "./"),
+        ("/u", vec!["/usr"], "/usr", "/usr/"),
+        (
+            "~/应",
+            vec!["/home/me/应用甲", "/home/me/应用乙"],
+            "/home/me/应用",
+            "~/应用",
+        ),
+    ] {
+        let mut c = window();
+        answer(&mut c, typed, found(None, &folders, common));
+        let effects = c.event(Ev::Line(LineEv::Tab));
+        assert!(
+            effects.contains(&Effect::SetLine(expected.into())),
+            "{typed}: {effects:?}"
+        );
+        assert_eq!(c.view().line, expected, "{typed}");
+    }
+}
+#[test]
 fn tab_in_a_filter_does_nothing() {
     for text in ["", "app", "a/b"] {
         let mut c = window();
@@ -617,4 +659,30 @@ fn a_new_filter_invalidates_a_pending_path_and_held_enter() {
             .is_empty());
         assert_eq!(c.view(), before);
     }
+}
+#[test]
+fn a_failed_start_logs_its_code_or_unknown_and_never_a_path() {
+    assert_eq!(start_failed_line(Some(1)), "[project] start failed 1");
+    assert_eq!(start_failed_line(Some(-9)), "[project] start failed -9");
+    assert_eq!(start_failed_line(None), "[project] start failed unknown");
+}
+#[test]
+fn a_failed_start_says_a_gone_folder_as_a_gone_row_does_and_else_points_at_its_log() {
+    let mut c = chooser(Mode::Launch);
+    c.opening("app");
+    c.start_failed("/home/me/src/app".into(), true);
+    let view = c.view();
+    assert!(!view.opening, "the keys are back");
+    assert_eq!(view.message.as_deref(), Some("~/src/app is not there"));
+
+    c.opening("app");
+    c.start_failed("/home/me/src/app".into(), false);
+    assert_eq!(
+        c.view().message.as_deref(),
+        Some("could not open app: see its window log")
+    );
+
+    let mut zh = Chooser::new(Mode::Launch, None, Lang::ZhCn, 1);
+    zh.start_failed("/srv/app".into(), true);
+    assert_eq!(zh.view().message.as_deref(), Some("/srv/app 不在了"));
 }

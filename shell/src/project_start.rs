@@ -52,6 +52,15 @@ impl Started {
     }
 }
 
+/// Whether `path` is not there for a start to open: nothing under that name, a link to nothing, or a parent that is a
+/// file. Asked once a start has failed, so the reason the child had can be said; it stats, so never on the GTK thread.
+pub(crate) fn not_there(path: &Path) -> bool {
+    match std::fs::metadata(path) {
+        Ok(_) => false,
+        Err(error) => error.kind() == io::ErrorKind::NotFound || error.raw_os_error() == Some(libc::ENOTDIR),
+    }
+}
+
 /// What the child is asked to do with its path.
 pub(crate) enum How {
     /// Bring the path's running window forward, or be that window: `--raise -- <path>`.
@@ -131,6 +140,22 @@ pub(crate) fn start(exe: &Path, flags: &[OsString], how: How, token: Option<&str
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_folder_is_not_there_when_it_its_link_or_its_parent_is_missing() {
+        let scratch = Scratch::new();
+        let folder = scratch.0.join("app");
+        std::fs::create_dir(&folder).unwrap();
+        let file = scratch.0.join("file");
+        std::fs::write(&file, b"").unwrap();
+        let dangling = scratch.0.join("link");
+        std::os::unix::fs::symlink(scratch.0.join("away"), &dangling).unwrap();
+        assert!(!not_there(&folder));
+        assert!(!not_there(&file), "a file is there; the child says what it makes of it");
+        assert!(not_there(&scratch.0.join("away")));
+        assert!(not_there(&dangling));
+        assert!(not_there(&file.join("app")));
+    }
 
     /// How long any one step may take on a loaded machine; a test that passes never waits it out.
     const PATIENCE: Duration = Duration::from_secs(30);

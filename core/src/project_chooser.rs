@@ -46,6 +46,26 @@ impl Row {
     }
 }
 
+/// The log line of a start that failed: the child's exit code, or `unknown` when there is none (the spawn failed, or a
+/// signal ended it). It carries no path, as no log line does.
+pub fn start_failed_line(code: Option<i32>) -> String {
+    match code {
+        Some(code) => format!("[project] start failed {code}"),
+        None => "[project] start failed unknown".into(),
+    }
+}
+
+/// What a window says of a project it could not start. A folder that was not there when the start ended is said as a
+/// `gone` row is. Any other reason is in the log the started window keeps for its own project, since what it printed
+/// went nowhere else.
+pub fn start_failed_text(lang: Lang, row: &Row, gone: bool) -> String {
+    if gone {
+        text::gone(lang, &row.shown)
+    } else {
+        format!("could not open {}: see its window log", row.name)
+    }
+}
+
 fn clean(text: &str) -> String {
     text.chars().map(|c| if c.is_control() { '?' } else { c }).collect()
 }
@@ -341,7 +361,7 @@ impl Chooser {
         if common.is_empty() {
             return vec![];
         }
-        let mut next = common.clone();
+        let mut next = typed_completion(&self.line, common, self.home.as_deref()).unwrap_or_else(|| common.clone());
         if folders.len() == 1 && !next.ends_with('/') {
             next.push('/');
         }
@@ -404,6 +424,11 @@ impl Chooser {
         items
     }
 
+    /// The recent projects the chooser holds, after leaving out the window's own: what its rows log line counts.
+    pub fn projects(&self) -> usize {
+        self.rows.len()
+    }
+
     pub fn view(&self) -> ChooserView {
         let text = text::text(self.lang);
         let rows: Vec<_> = self
@@ -459,6 +484,34 @@ impl Chooser {
         self.held_enter = false;
         self.message = Some(clean(&message));
     }
+
+    /// A start of `path` failed: the keys come back with what is known of why.
+    pub fn start_failed(&mut self, path: PathBuf, gone: bool) {
+        let row = Row::new(path, self.home.as_deref(), String::new(), Fact::Unknown);
+        let message = start_failed_text(self.lang, &row, gone);
+        self.failed(message);
+    }
+}
+
+/// The line as typed, extended by what the folders' shared prefix adds to its last segment. The answer is absolute,
+/// and the line keeps its own form (`~/`, `./`, `../`, a `..` in the middle). Every folder of an answer sits in the one
+/// directory the line names, so the shared prefix ends in a separator followed by the names' common start. `None`
+/// when the typed segment is not the start of that common part.
+fn typed_completion(line: &str, common: &str, home: Option<&Path>) -> Option<String> {
+    let (_, shared) = common.rsplit_once('/')?;
+    let (mut next, typed) = match line.rsplit_once('/') {
+        // `..` names the directory itself, whose children are offered.
+        Some((_, "..")) => (format!("{line}/"), ""),
+        Some((_, segment)) => (line.to_owned(), segment),
+        // A bare `~` is the home folder among its siblings, and only home itself can be written from it.
+        None if line == "~" => {
+            let name = home?.file_name()?.to_str()?;
+            return (shared == name).then(|| line.to_owned());
+        }
+        None => return None,
+    };
+    next.push_str(shared.strip_prefix(typed)?);
+    Some(next)
 }
 
 pub fn is_path(text: &str) -> bool {

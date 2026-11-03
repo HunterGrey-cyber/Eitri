@@ -19,7 +19,7 @@ use std::time::{Duration, Instant};
 use eitri_core::lua::config::{parse_desktop_start, DesktopStart, DESKTOP_START_KEY};
 use eitri_core::lua::kernel::{refuse_panels, Kernel};
 use eitri_core::onboarding::Lang;
-use eitri_core::project_chooser::{Chooser, Effect, Ev, Fact, LineEv, Mode, Row};
+use eitri_core::project_chooser::{start_failed_line, Chooser, Effect, Ev, Fact, LineEv, Mode, Row};
 use eitri_core::recent_projects::{self, Sources};
 use eitri_core::theme::start::{StartReport, StartTheme};
 use eitri_core::theme::store::Loaded;
@@ -41,8 +41,6 @@ const WIDTH: i32 = 720;
 const HEIGHT: i32 = 520;
 /// The launcher's words for a directory that cannot be resolved.
 const NO_DIRECTORY: &str = "eitri: no such directory";
-/// A child that left no exit code: it died by a signal, or it was never started. No process exits with this.
-const NO_CODE: i32 = -1;
 
 /// Whether a command line, with the program's own name left off, is this subcommand's.
 pub(crate) fn named(args: &[OsString]) -> bool {
@@ -75,16 +73,24 @@ pub(crate) fn next(start: DesktopStart, rows: &[Row]) -> Next {
 pub(crate) enum Ends {
     /// The new window took the keys.
     LostActivation,
-    ChildExited(i32),
+    ChildExited(Exit),
     /// The new window has not taken the keys in time, and it runs on without this one.
     Deadline,
 }
 
+/// How a started child ended: its exit code, `None` when a signal ended it or it never started, and whether its folder
+/// was gone by then, which is then the reason said.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct Exit {
+    code: Option<i32>,
+    gone: bool,
+}
+
 /// The end of a start, from all that has been seen of it. How the child went comes first, because a failure is the one
 /// end the person has to hear about.
-fn ends(exit: Option<Option<i32>>, lost_activation: bool, past_deadline: bool) -> Option<Ends> {
-    if let Some(code) = exit {
-        return Some(Ends::ChildExited(code.unwrap_or(NO_CODE)));
+fn ends(exit: Option<Exit>, lost_activation: bool, past_deadline: bool) -> Option<Ends> {
+    if let Some(exit) = exit {
+        return Some(Ends::ChildExited(exit));
     }
     if lost_activation {
         return Some(Ends::LostActivation);
@@ -93,19 +99,15 @@ fn ends(exit: Option<Option<i32>>, lost_activation: bool, past_deadline: bool) -
 }
 
 /// Puts `end` on the chooser, and says whether the window stays for it.
-fn settle(chooser: &mut Chooser, end: Ends, name: &str) -> bool {
+fn settle(chooser: &mut Chooser, end: Ends, target: &Path) -> bool {
     match end {
-        Ends::ChildExited(0) | Ends::LostActivation | Ends::Deadline => false,
-        Ends::ChildExited(code) => {
-            println!("[project] start failed {code}");
-            chooser.failed(failed_text(name));
+        Ends::ChildExited(Exit { code: Some(0), .. }) | Ends::LostActivation | Ends::Deadline => false,
+        Ends::ChildExited(Exit { code, gone }) => {
+            println!("{}", start_failed_line(code));
+            chooser.start_failed(target.to_path_buf(), gone);
             true
         }
     }
-}
-
-fn failed_text(name: &str) -> String {
-    format!("could not open {name}: see the window log")
 }
 
 /// The flags to hand on: they mean nothing here and are only the child's. Anything else is not this subcommand.
@@ -166,7 +168,8 @@ struct Shown {
     sources: Sources,
     home: Option<PathBuf>,
     theme: StartTheme,
-    message: Option<String>,
+    /// A start made before the window, which failed: its folder, and whether that folder was gone.
+    failed: Option<(PathBuf, bool)>,
 }
 
 /// The subcommand. Everything up to [`show`] runs before GTK, so it may wait on the disk and on a child.
@@ -201,19 +204,20 @@ pub(crate) fn run(args: &[OsString]) -> glib::ExitCode {
             }
         },
     };
-    let mut message = None;
+    let mut failed = None;
     if let Some(how) = how {
-        let name = project_name(match &how {
-            How::Raise(path) | How::Plain(path) => path,
-        });
+        let target = match &how {
+            How::Raise(path) | How::Plain(path) => path.clone(),
+        };
         // No window is up to say a failure, so the child's first seconds are waited for here: a desktop launch must
         // not end in nothing, and the chooser is what is left to offer.
         let start = project_start::start(&exe_to_start(), &flags, how, token.as_deref());
         let Some(code) = project_start::failure(start, project_start::FAILED_WITHIN) else {
             return glib::ExitCode::SUCCESS;
         };
-        println!("[project] start failed {}", code.unwrap_or(NO_CODE));
-        message = Some(failed_text(&name));
+        println!("{}", start_failed_line(code));
+        let gone = project_start::not_there(&target);
+        failed = Some((target, gone));
     }
     let home = canonical_home(sources.home.as_deref());
     let theme = start_theme(&sources);
@@ -222,7 +226,7 @@ pub(crate) fn run(args: &[OsString]) -> glib::ExitCode {
         sources,
         home,
         theme,
-        message,
+        failed,
     })
 }
 
@@ -268,31 +272,34 @@ fn activation_token(window: &gtk4::ApplicationWindow) -> Option<String> {
 }
 
 /// Starts the child off the GTK thread, since the start stats and blocks on the spawn, and sends its exit: the code, or
-/// `None` when it died by a signal or never started. A reaper that went away with no message says nothing about the
-/// child, so nothing is sent and the other ends decide.
-fn start_child(flags: Vec<OsString>, target: PathBuf, token: Option<String>, exit: mpsc::Sender<Option<i32>>) {
+/// `None` when it died by a signal or never started, and on a failure whether the folder is gone, which is asked here
+/// because it stats. A reaper that went away with no message says nothing about the child, so nothing is sent and the
+/// other ends decide.
+fn start_child(flags: Vec<OsString>, target: PathBuf, token: Option<String>, exit: mpsc::Sender<Exit>) {
     let failed = exit.clone();
     let spawned = std::thread::Builder::new().name("project-open".into()).spawn(move || {
-        match project_start::start(&exe_to_start(), &flags, How::Raise(target), token.as_deref()) {
-            Ok(started) => {
-                if let Ok(code) = started.ended.recv() {
-                    let _ = exit.send(code);
-                }
-            }
-            Err(_) => {
-                let _ = exit.send(None);
-            }
-        }
+        let code = match project_start::start(&exe_to_start(), &flags, How::Raise(target.clone()), token.as_deref()) {
+            Ok(started) => match started.ended.recv() {
+                Ok(code) => code,
+                Err(_) => return,
+            },
+            Err(_) => None,
+        };
+        let gone = code != Some(0) && project_start::not_there(&target);
+        let _ = exit.send(Exit { code, gone });
     });
     if spawned.is_err() {
-        let _ = failed.send(None);
+        let _ = failed.send(Exit {
+            code: None,
+            gone: false,
+        });
     }
 }
 
 /// A start under way.
 struct Watch {
-    name: String,
-    exit: mpsc::Receiver<Option<i32>>,
+    target: PathBuf,
+    exit: mpsc::Receiver<Exit>,
     lost_activation: Cell<bool>,
     deadline: Instant,
 }
@@ -315,7 +322,7 @@ impl LaunchWindow {
             sources,
             home,
             theme,
-            message,
+            failed,
         } = shown;
         crate::xft_dpi::ensure_xft_dpi();
         gtk4::Window::set_default_icon_name(crate::APP_ID);
@@ -329,8 +336,8 @@ impl LaunchWindow {
 
         let lang = Lang::from_env(&|name| std::env::var_os(name));
         let mut chooser = Chooser::new(Mode::Launch, home, lang, 1);
-        if let Some(message) = message {
-            chooser.failed(message);
+        if let Some((target, gone)) = failed {
+            chooser.start_failed(target, gone);
         }
         let window = gtk4::ApplicationWindow::new(app);
         window.set_default_size(WIDTH, HEIGHT);
@@ -389,18 +396,16 @@ impl LaunchWindow {
     }
 
     fn feed(&self, ev: Ev) {
-        let count = match &ev {
-            Ev::Rows { rows, .. } => Some(rows.len()),
-            _ => None,
-        };
         let (effects, changed) = {
             let mut chooser = self.chooser.borrow_mut();
-            let before = count.map(|_| chooser.view());
+            let before = matches!(ev, Ev::Rows { .. }).then(|| chooser.view());
             let effects = chooser.event(ev);
-            let changed = before.is_some_and(|before| before != chooser.view());
+            let changed = before
+                .is_some_and(|before| before != chooser.view())
+                .then(|| chooser.projects());
             (effects, changed)
         };
-        if let Some(count) = count.filter(|_| changed) {
+        if let Some(count) = changed {
             println!("[project] rows {count}");
         }
         self.carry(effects);
@@ -434,9 +439,9 @@ impl LaunchWindow {
         // The token names the input that picked, so it is taken here, before the start leaves this thread.
         let token = activation_token(&self.window);
         let (exit, watched) = mpsc::channel();
-        start_child(self.flags.clone(), target, token, exit);
+        start_child(self.flags.clone(), target.clone(), token, exit);
         *self.watch.borrow_mut() = Some(Watch {
-            name,
+            target,
             exit: watched,
             lost_activation: Cell::new(false),
             deadline: Instant::now() + HAND_OVER_WITHIN,
@@ -468,7 +473,7 @@ impl LaunchWindow {
 
     fn finish(&self, end: Ends) {
         let Some(watch) = self.watch.take() else { return };
-        if settle(&mut self.chooser.borrow_mut(), end, &watch.name) {
+        if settle(&mut self.chooser.borrow_mut(), end, &watch.target) {
             self.draw();
             self.view.focus();
         } else {
@@ -693,28 +698,36 @@ mod tests {
         assert_eq!(desktop_start(&scratch.0), DesktopStart::Choose);
     }
 
+    fn exited(code: Option<i32>) -> Ends {
+        Ends::ChildExited(Exit { code, gone: false })
+    }
+
     #[test]
     fn the_small_window_ends_on_each_of_the_four() {
+        let exit = |code| {
+            Some(Exit {
+                code: Some(code),
+                gone: false,
+            })
+        };
         assert_eq!(ends(None, false, false), None, "a start with nothing to show goes on");
         assert_eq!(ends(None, true, false), Some(Ends::LostActivation));
-        assert_eq!(ends(Some(Some(0)), false, false), Some(Ends::ChildExited(0)));
-        assert_eq!(ends(Some(Some(3)), false, false), Some(Ends::ChildExited(3)));
+        assert_eq!(ends(exit(0), false, false), Some(exited(Some(0))));
+        assert_eq!(ends(exit(3), false, false), Some(exited(Some(3))));
         assert_eq!(ends(None, false, true), Some(Ends::Deadline));
         assert_eq!(
-            ends(Some(Some(3)), true, true),
-            Some(Ends::ChildExited(3)),
+            ends(exit(3), true, true),
+            Some(exited(Some(3))),
             "a failure is heard, whatever else came with it"
         );
         assert_eq!(ends(None, true, true), Some(Ends::LostActivation));
 
         let mut chooser = opening();
-        for end in [Ends::LostActivation, Ends::ChildExited(0), Ends::Deadline] {
-            assert!(!settle(&mut chooser, end, "app"), "{end:?} ends the window");
+        let app = Path::new("/work/app");
+        for end in [Ends::LostActivation, exited(Some(0)), Ends::Deadline] {
+            assert!(!settle(&mut chooser, end, app), "{end:?} ends the window");
         }
-        assert!(
-            settle(&mut chooser, Ends::ChildExited(3), "app"),
-            "and this one does not"
-        );
+        assert!(settle(&mut chooser, exited(Some(3)), app), "and this one does not");
     }
 
     fn opening() -> Chooser {
@@ -735,17 +748,39 @@ mod tests {
 
     #[test]
     fn child_failure_brings_the_chooser_back_with_the_message() {
-        for code in [1, NO_CODE] {
+        for (exit, said) in [
+            (
+                Exit {
+                    code: Some(1),
+                    gone: false,
+                },
+                "could not open app: see its window log",
+            ),
+            (
+                Exit {
+                    code: None,
+                    gone: false,
+                },
+                "could not open app: see its window log",
+            ),
+            (
+                Exit {
+                    code: Some(1),
+                    gone: true,
+                },
+                "/work/app is not there",
+            ),
+        ] {
             let mut chooser = opening();
             assert!(chooser.view().opening);
             assert!(chooser.view().message.is_some_and(|text| text.contains("Opening app")));
             assert_eq!(chooser.event(Ev::Line(LineEv::Enter)), vec![], "a start is under way");
 
-            assert!(settle(&mut chooser, Ends::ChildExited(code), "app"));
+            assert!(settle(&mut chooser, Ends::ChildExited(exit), Path::new("/work/app")));
 
             let view = chooser.view();
             assert!(!view.opening, "the keys are back");
-            assert_eq!(view.message.as_deref(), Some("could not open app: see the window log"));
+            assert_eq!(view.message.as_deref(), Some(said), "{exit:?}");
             assert_eq!(view.rows[0].name, "app", "the list is still there");
             assert_eq!(
                 chooser.event(Ev::Line(LineEv::Enter)),
@@ -757,7 +792,11 @@ mod tests {
 
     #[test]
     fn a_child_that_left_no_code_failed() {
-        assert_eq!(ends(Some(None), false, false), Some(Ends::ChildExited(NO_CODE)));
+        let exit = Exit {
+            code: None,
+            gone: false,
+        };
+        assert_eq!(ends(Some(exit), false, false), Some(Ends::ChildExited(exit)));
     }
 
     #[test]

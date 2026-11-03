@@ -71,7 +71,10 @@ to tell whether a problem comes from your own setup.
 **Another project.** Press `<prefix> O` in any window (or `p` on an empty tab, or click the project's name in the top bar) to
 see the projects you opened before, newest first, and go to one: a project that already has a window comes forward, any
 other opens in a new window. You can filter the list or type a path (`~/src/app`; `Tab` completes it). The keys are in
-[Keys](keys.md#the-prefix).
+[Keys](keys.md#the-prefix). A window that comes forward stays as it was, on the Claude account it started with, even when
+you chose it from a window or a desktop entry on another account; `eitri --account <name> --new-window <dir>` gives the
+project a second window on that account. When a new window cannot start, a short message says the folder is not there, or
+sends you to that project's window log, described in [When Eitri itself crashes](#when-eitri-itself-crashes).
 
 **From the desktop icon.** Starting Eitri from the desktop with no file or folder does not open your home folder. It shows
 the same list in a small window of its own before anything starts: no Neovim, no question about trusting a folder.
@@ -397,9 +400,9 @@ The record is plain text: the version, the build, the kernel, the thread, where 
 the last lines the window printed. It holds no prompt, conversation or tool output, and a crash's own message is
 left out when it could quote one. Paths are there, with your home shown as `~`, so read it before you attach it.
 
-A window started from the desktop keeps what it prints in `main-<16 hex>.log` in the same directory; at 2 MiB the
-file moves to `.log.1`, and so does the last run's when a new one starts. A window started from a terminal prints
-to that terminal instead, and keeps no log. When the disk is full the lines are dropped and the window goes on.
+A window started from the desktop, or from the project list, keeps what it prints in `main-<16 hex>.log` in the
+same directory, one name per project; at 2 MiB the file moves to `.log.1`, and so does the last run's when a new one
+starts. A window started from a terminal prints to that terminal instead, and keeps no log. When the disk is full the lines are dropped and the window goes on.
 `EITRI_WINDOW_LOG=off` turns the log and the records off.
 
 A crash inside a native library (GTK, WebKit, a graphics driver) writes no record. What the window printed up to

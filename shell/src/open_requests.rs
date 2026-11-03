@@ -44,10 +44,24 @@ pub(crate) fn hint_from_env() -> Option<PathBuf> {
         .map(PathBuf::from)
 }
 
-/// The launcher's activation token, for the window that comes forward. For `main` to read before GTK, which takes it
-/// out of the environment.
+/// The launcher's activation token, for the window that comes forward. GTK's library constructor copies both
+/// variables and takes them out of the environment as the binary loads, before `main` runs, and keeps its copy
+/// private. So they are read from the environment the process was started with, which the kernel keeps unchanged in
+/// `/proc/self/environ`; the live environment is read only where that file cannot be.
 pub(crate) fn token_from_env() -> Option<String> {
-    activation_token(&|name| std::env::var(name).ok())
+    match std::fs::read("/proc/self/environ") {
+        Ok(block) => activation_token(&|name| initial_var(&block, name)),
+        Err(_) => activation_token(&|name| std::env::var(name).ok()),
+    }
+}
+
+/// The value of `name` in an environment block as `/proc/<pid>/environ` holds it: the first entry of that exact name,
+/// and only as text.
+fn initial_var(block: &[u8], name: &str) -> Option<String> {
+    block
+        .split(|byte| *byte == 0)
+        .find_map(|entry| entry.strip_prefix(name.as_bytes())?.strip_prefix(b"="))
+        .and_then(|value| String::from_utf8(value.to_vec()).ok())
 }
 
 fn activation_token(get: &dyn Fn(&str) -> Option<String>) -> Option<String> {
@@ -589,6 +603,48 @@ mod tests {
             shell_env_in(None, &too_long, &scratch.root).is_empty(),
             "a path no socket can have is not handed on"
         );
+    }
+
+    /// Set in the copy of this test binary the test below starts; unset, the test starts that copy.
+    const TOKEN_CHILD: &str = "EITRI_TEST_LAUNCH_TOKEN_CHILD";
+
+    #[test]
+    fn the_launch_token_is_read_although_gtk_takes_it_out_of_the_environment_as_the_binary_loads() {
+        if std::env::var_os(TOKEN_CHILD).is_some() {
+            // This binary links GTK, whose library constructor has run by now, as in a window's process.
+            assert_eq!(
+                std::env::var_os("XDG_ACTIVATION_TOKEN"),
+                None,
+                "GTK took the variable as the binary loaded"
+            );
+            assert_eq!(token_from_env().as_deref(), Some("launch-token"));
+            return;
+        }
+        let status = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "open_requests::tests::the_launch_token_is_read_although_gtk_takes_it_out_of_the_environment_as_the_binary_loads",
+                "--test-threads=1",
+            ])
+            .env(TOKEN_CHILD, "1")
+            .env("XDG_ACTIVATION_TOKEN", "launch-token")
+            .env_remove("DESKTOP_STARTUP_ID")
+            .stdout(std::process::Stdio::null())
+            .status()
+            .unwrap();
+        assert!(
+            status.success(),
+            "the started copy could not read the token it was started with"
+        );
+    }
+
+    #[test]
+    fn the_initial_environment_is_read_by_exact_name_first_entry_first() {
+        let block = b"XDG_ACTIVATION_TOKEN_X=no\0XDG_ACTIVATION_TOKEN=yes\0XDG_ACTIVATION_TOKEN=later\0EMPTY=\0";
+        assert_eq!(initial_var(block, "XDG_ACTIVATION_TOKEN").as_deref(), Some("yes"));
+        assert_eq!(initial_var(block, "EMPTY").as_deref(), Some(""));
+        assert_eq!(initial_var(block, "DESKTOP_STARTUP_ID"), None);
+        assert_eq!(initial_var(b"BAD=\xff\0", "BAD"), None, "a token is text");
     }
 
     #[test]

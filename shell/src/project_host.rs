@@ -38,11 +38,13 @@ pub(crate) enum WorkerAnswer {
     },
 }
 
-/// A project that could not be started, and the child's exit code when it got as far as having one.
+/// A project that could not be started, the child's exit code when it got as far as having one, and whether the folder
+/// was gone by the time the start ended.
 #[derive(Debug, PartialEq)]
 pub(crate) struct StartFailed {
     path: PathBuf,
     code: Option<i32>,
+    gone: bool,
 }
 
 struct PathJob {
@@ -203,12 +205,20 @@ impl ProjectWorkers {
             .name("project-open".into())
             .spawn(move || {
                 let start = project_start::start(&exe(), &[], How::Raise(target.clone()), token.as_deref());
-                let failed = project_start::failure(start, window).map(|code| StartFailed { path: target, code });
+                let failed = project_start::failure(start, window).map(|code| StartFailed {
+                    gone: project_start::not_there(&target),
+                    path: target,
+                    code,
+                });
                 let _ = sender.send(WorkerAnswer::Started { failed });
             })
             .is_err()
         {
-            let failed = Some(StartFailed { path, code: None });
+            let failed = Some(StartFailed {
+                path,
+                code: None,
+                gone: false,
+            });
             let _ = self.inner.sender.send(WorkerAnswer::Started { failed });
         }
         Workers::arm(&self.inner);
@@ -307,8 +317,8 @@ fn project_event(win: WinId, answer: WorkerAnswer) -> Option<ProjectEvent> {
         WorkerAnswer::Path { serial, answer } => ProjectEvent::PathAnswer { win, serial, answer },
         WorkerAnswer::Folder(path) => ProjectEvent::Folder { win, path },
         WorkerAnswer::Started { failed } => {
-            let StartFailed { path, code } = failed?;
-            ProjectEvent::OpenFailed { win, path, code }
+            let StartFailed { path, code, gone } = failed?;
+            ProjectEvent::OpenFailed { win, path, code, gone }
         }
     })
 }
@@ -547,6 +557,7 @@ mod tests {
         let failed = Some(StartFailed {
             path: "/work/app".into(),
             code: Some(3),
+            gone: true,
         });
         assert_eq!(
             project_event(win, WorkerAnswer::Started { failed }),
@@ -554,6 +565,7 @@ mod tests {
                 win,
                 path: "/work/app".into(),
                 code: Some(3),
+                gone: true,
             })
         );
         assert_eq!(project_event(win, WorkerAnswer::Started { failed: None }), None);
@@ -592,7 +604,7 @@ mod tests {
         }
         assert!(matches!(
             &heard.borrow()[..],
-            [WorkerAnswer::Started { failed: Some(StartFailed { path, code: None }) }] if path == Path::new("/work/app")
+            [WorkerAnswer::Started { failed: Some(StartFailed { path, code: None, gone: true }) }] if path == Path::new("/work/app")
         ));
         assert!(workers.inner.poll.borrow().is_none(), "nothing is left to wait for");
     }

@@ -1356,10 +1356,13 @@ pub enum ProjectEvent {
         win: WinId,
         path: Option<PathBuf>,
     },
+    /// A start of `path` that did not come to a window: `code` is the child's exit code, `None` when it never started or
+    /// a signal ended it, and `gone` says the folder was not there once the child had ended.
     OpenFailed {
         win: WinId,
         path: PathBuf,
         code: Option<i32>,
+        gone: bool,
     },
 }
 

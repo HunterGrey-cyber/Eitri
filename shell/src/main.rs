@@ -307,7 +307,8 @@ fn main() -> glib::ExitCode {
     // RPC address -- and, if it is another window's nvim, that window's socket variables -- to the
     // agent, its tools and the bottom shell.
     //
-    // What a launch hands a file over with is read first: the scrub takes the one, GTK the other.
+    // What a launch hands a file over with is read first: the scrub takes the socket; GTK took the token out of the
+    // environment as the binary loaded, so `token_from_env` reads the one the process was started with.
     let open_hint = open_requests::hint_from_env();
     let open_token = open_requests::token_from_env();
     eitri_core::companion::env::drop_inherited_editor_env();

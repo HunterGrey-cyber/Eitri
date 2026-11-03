@@ -70,34 +70,32 @@ pub fn event(w: &mut Window, win: WinId, ev: ProjectEvent, batch: &mut Batch) {
         ProjectEvent::Pick { index, .. } => Ev::Pick(index),
         ProjectEvent::Dismiss { .. } => Ev::Dismiss,
         ProjectEvent::Folder { path, .. } => Ev::Folder(path),
-        ProjectEvent::OpenFailed { path, code, .. } => {
+        ProjectEvent::OpenFailed { path, code, gone, .. } => {
             let failure = (path.clone(), code);
             if w.project_failure.as_ref() == Some(&failure) {
                 return;
             }
             w.project_failure = Some(failure);
-            let code = code.map(|code| code.to_string()).unwrap_or_else(|| "unknown".into());
-            w.say(format!("[project] start failed {code}"));
-            let name = Row::new(path, None, String::new(), crate::project_chooser::Fact::Unknown).name;
-            w.refuse(win, format!("could not open {name}: see the window log"), batch);
+            w.say(crate::project_chooser::start_failed_line(code));
+            let row = Row::new(path, None, String::new(), crate::project_chooser::Fact::Unknown);
+            // Toasts are English whatever the chooser's language.
+            let text = crate::project_chooser::start_failed_text(crate::onboarding::Lang::En, &row, gone);
+            w.refuse(win, text, batch);
             return;
         }
     };
     let Some(state) = w.project_chooser.as_mut() else {
         return;
     };
-    let count = match &ev {
-        Ev::Rows { rows, .. } => Some(rows.len()),
-        _ => None,
-    };
-    let before = count.map(|_| state.chooser.view());
+    let before = matches!(ev, Ev::Rows { .. }).then(|| state.chooser.view());
     let effects = state.chooser.event(ev);
     // The keys are already with the module that took them; closing must not hand them back to the old holder.
     // A dialog ignores the event, and then the chooser stays and still owns the return.
     if keys_taken && effects.iter().any(|effect| matches!(effect, Effect::Close)) {
         state.held_module = None;
     }
-    if let Some(count) = count.filter(|_| before.as_ref() != Some(&state.chooser.view())) {
+    if before.is_some_and(|before| before != state.chooser.view()) {
+        let count = state.chooser.projects();
         w.say(format!("[project] rows {count}"));
     }
     carry(w, win, effects, batch);
@@ -429,6 +427,29 @@ mod tests {
     }
 
     #[test]
+    fn the_rows_line_counts_the_projects_listed_not_the_window_s_own() {
+        let mut r = rig();
+        let (serial, _) = show(&mut r);
+        post(
+            &mut r,
+            ProjectEvent::Rows {
+                win: WIN,
+                serial,
+                rows: vec![row("/work/current"), row("/work/beta"), row("/work/gamma")],
+            },
+        );
+        let names: Vec<_> = view(&r).rows.into_iter().map(|row| row.name).collect();
+        assert_eq!(names[..2], ["beta", "gamma"]);
+        let lines: Vec<_> = r
+            .controller
+            .notes(WIN)
+            .into_iter()
+            .filter(|note| note.starts_with("[project] rows"))
+            .collect();
+        assert_eq!(lines, ["[project] rows 2"]);
+    }
+
+    #[test]
     fn a_stale_serial_is_dropped() {
         let mut r = rig();
         let (serial, _) = show(&mut r);
@@ -553,10 +574,11 @@ mod tests {
             win: WIN,
             path: "/work/app\nname".into(),
             code: Some(7),
+            gone: false,
         };
         post(&mut r, failure.clone());
         let toast = r.said().toast.unwrap();
-        assert_eq!(toast.1, "could not open app?name: see the window log");
+        assert_eq!(toast.1, "could not open app?name: see its window log");
         post(&mut r, failure);
         assert_eq!(r.said().toast, Some(toast));
         assert_eq!(
@@ -567,6 +589,26 @@ mod tests {
                 .count(),
             1
         );
+    }
+
+    #[test]
+    fn a_start_whose_folder_went_says_so_and_one_with_no_code_logs_unknown() {
+        let mut r = rig();
+        post(
+            &mut r,
+            ProjectEvent::OpenFailed {
+                win: WIN,
+                path: "/work/away".into(),
+                code: None,
+                gone: true,
+            },
+        );
+        assert_eq!(r.said().toast.unwrap().1, "/work/away is not there");
+        assert!(r
+            .controller
+            .notes(WIN)
+            .iter()
+            .any(|line| line == "[project] start failed unknown"));
     }
 
     #[test]
@@ -695,6 +737,7 @@ mod tests {
                 win: WIN,
                 path,
                 code: None,
+                gone: true,
             },
         ];
         for event in events {
