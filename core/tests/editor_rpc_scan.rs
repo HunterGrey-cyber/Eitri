@@ -674,11 +674,13 @@ fn a_dispatcher_naming_an_unlisted_tool_function_fails() {
 }
 
 /// Window 2 reaches the editor only through the editor-op dispatcher, so the dispatcher's product code may name
-/// exactly one Lua constant (the buffer-state chunk, sent by its one `exec_lua` call), the plugin host's editor
-/// functions of its table and the agent tools' functions of theirs, and nothing else that runs in the editor: no follow
-/// teardown (the snippet and its commands are window 1's, whatever window 2's page does), no review chunk (the review
-/// ops become calls on window 1's own review driver), no scratch call, no event drain, no navigation fallback, and no
-/// pane kill. Comments and literals are blanked and whitespace is dropped, so formatting changes nothing.
+/// exactly two Lua constants (the buffer-state chunk and the standalone shown question, each sent by its one
+/// `exec_lua` call with arguments its own builder makes), the plugin host's editor functions of its table and the
+/// agent tools' functions of theirs, and nothing else that runs in the editor: no follow teardown (the snippet and its
+/// commands are window 1's, whatever window 2's page does), no review chunk (the review ops, live ones included,
+/// become calls on window 1's own review driver, of the five kinds its table names), no scratch call, no event drain,
+/// no navigation fallback, and no pane kill. Comments and literals are blanked and whitespace is dropped, so
+/// formatting changes nothing.
 #[test]
 fn the_editor_op_dispatcher_names_only_its_table() {
     use eitri_core::source_scan::{code_only, modules, read_required, without};
@@ -716,6 +718,8 @@ fn the_editor_op_dispatcher_names_only_its_table() {
         "OPEN_AND_SHOW_LUA",
         "CLEAR_LUA",
         "CLEAR_ALL_LUA",
+        "LIVE_SHOW_LUA",
+        "LIVE_CLEAR_LUA",
         "PLUGIN_OPEN_LUA",
         "PLUGIN_ASSIST_LUA",
         "AGENT_EXEC_LUA",
@@ -724,8 +728,53 @@ fn the_editor_op_dispatcher_names_only_its_table() {
     }
     assert_eq!(
         constants,
-        BTreeSet::from(["BUFFER_STATE_LUA"]),
+        BTreeSet::from(["BUFFER_STATE_LUA", "LIVE_SHOWN_LUA"]),
         "the dispatcher names a Lua constant outside its table"
+    );
+
+    // The review ops, the live ones too, become calls on window 1's own driver, of these kinds only: never a
+    // clear of every window's overlays.
+    let overlay_calls: BTreeSet<String> = squeezed
+        .match_indices("OverlayCall::")
+        .map(|(at, _)| {
+            squeezed[at + "OverlayCall::".len()..]
+                .chars()
+                .take_while(|c| is_ident(*c))
+                .collect()
+        })
+        .collect();
+    assert_eq!(
+        overlay_calls,
+        ["OpenAndShow", "Show", "Clear", "LiveShow", "LiveClear"]
+            .iter()
+            .map(|name| name.to_string())
+            .collect(),
+        "the dispatcher makes an overlay call outside its table"
+    );
+    let review_ops: BTreeSet<String> = squeezed
+        .match_indices("EditorOp::Review")
+        .map(|(at, _)| {
+            squeezed[at + "EditorOp::".len()..]
+                .chars()
+                .take_while(|c| is_ident(*c))
+                .collect()
+        })
+        .collect();
+    assert_eq!(
+        review_ops,
+        [
+            "ReviewShow",
+            "ReviewOpenAndShow",
+            "ReviewClear",
+            "ReviewClearMine",
+            "ReviewLiveNote",
+            "ReviewLiveShow",
+            "ReviewLiveClear"
+        ]
+        .iter()
+        .map(|name| name.to_string())
+        .collect(),
+        "the dispatcher's review ops are not the table's"
     );
 
     // The plugin host's functions are named by their full path at each call, so an alias cannot hide another.
@@ -795,12 +844,16 @@ fn the_editor_op_dispatcher_names_only_its_table() {
 
     assert_eq!(
         squeezed.matches("exec_lua(").count(),
-        1,
-        "the dispatcher sends Lua other than through its one buffer-state call"
+        2,
+        "the dispatcher sends Lua other than through its buffer-state call and its shown question"
     );
     assert!(
-        squeezed.contains("exec_lua(BUFFER_STATE_LUA,"),
-        "the dispatcher's one `exec_lua` call does not send the buffer-state chunk"
+        squeezed.contains("exec_lua(BUFFER_STATE_LUA,buffer_state_args("),
+        "the dispatcher's buffer-state call does not send the buffer-state chunk with its own arguments"
+    );
+    assert!(
+        squeezed.contains("exec_lua(LIVE_SHOWN_LUA,live_shown_args("),
+        "the dispatcher's shown question does not send the shown chunk with arguments it builds itself"
     );
 
     // Neither the op's type nor its dispatcher has a way to carry code to run.

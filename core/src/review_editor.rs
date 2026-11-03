@@ -7,10 +7,11 @@
 //! guesses an ending: [`ShowHunk`] is built from file lines by [`crate::editor_lines`] and turned
 //! back into file bytes by the same module.
 
+use std::cell::{Cell, RefCell};
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::ffi::OsStr;
 use std::os::unix::ffi::OsStrExt;
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
 use std::time::{Duration, Instant};
 
 use rmpv::Value;
@@ -19,8 +20,10 @@ use serde::{Deserialize, Serialize};
 use crate::editor_lines::{to_buffer_lines, to_file_bytes, BufferLine, Eol};
 use crate::editor_rpc::EditorRpc;
 use crate::nvim_rpc::{Pending, RpcError};
+use crate::turn_review::flow::LiveAsk;
 use crate::turn_review::live_contest::{LiveContest, TurnKey};
 use crate::turn_review::{Scope, MAX_OVERVIEW_DIFF_LINES};
+use crate::window_link::editor_op::WireLiveMeta;
 use crate::window_link::{Drawn, EditorOp, WireHunk, WireMeta};
 use crate::wm::PeerId;
 
@@ -547,8 +550,8 @@ pub enum Window {
 pub enum LinkedEvent {
     /// The answer to one of that window's opens, under the id of the operation that asked for it.
     Answered { op_id: u64, result: Result<String, String> },
-    /// What became of a file drawn for that window. `op_id` is the window's open this is the outcome of;
-    /// `None` for its other calls, and when another call or the editor took the file away.
+    /// What became of a file drawn for that window. `op_id` is the window's open or live call this is the
+    /// outcome of; `None` for its other calls, and when another call or the editor took the file away.
     Drawn {
         op_id: Option<u64>,
         path: PathBuf,
@@ -676,6 +679,8 @@ struct Queued {
     retried: bool,
     /// The window that asked: what the call comes to goes back to it.
     from: Window,
+    /// The linked window's operation that asked for the call, when one did.
+    op_id: Option<u64>,
 }
 
 struct InFlight {
@@ -783,9 +788,6 @@ enum Due {
 
 /// What a window that drew nothing has drawn.
 static NOTHING_DRAWN: BTreeSet<PathBuf> = BTreeSet::new();
-
-/// What a window that draws nothing live has drawn live.
-static NO_LIVE_DRAWINGS: BTreeMap<PathBuf, (String, u32)> = BTreeMap::new();
 
 fn lookup<'a>(value: &'a Value, name: &str) -> Option<&'a Value> {
     value
@@ -993,7 +995,20 @@ impl EditorOverlay {
     /// each: no other window's overlays are its to take off. For the same reason a clear of a linked
     /// window's goes to the editor only if that window still holds the file when the clear's turn
     /// comes: a draw of another window's queued before it may have taken the file meanwhile.
-    pub fn call_for(&mut self, rpc: &dyn EditorRpc, call: OverlayCall, from: Window, _now: Instant) {
+    pub fn call_for(&mut self, rpc: &dyn EditorRpc, call: OverlayCall, from: Window, now: Instant) {
+        self.call_for_op(rpc, call, from, None, now);
+    }
+
+    /// [`call_for`](Self::call_for), for the linked window's operation `op_id`: what a live call of that
+    /// window's comes to is reported to it under that id, so it knows which of its live draws went up.
+    pub fn call_for_op(
+        &mut self,
+        rpc: &dyn EditorRpc,
+        call: OverlayCall,
+        from: Window,
+        op_id: Option<u64>,
+        _now: Instant,
+    ) {
         if let Window::Linked(peer) = from {
             self.gone.remove(&peer);
             if matches!(call, OverlayCall::ClearAll) {
@@ -1047,11 +1062,15 @@ impl EditorOverlay {
         self.poll_in_flight();
         self.poll_install();
         self.sync_target(rpc);
-        self.enqueue(call, from);
+        self.enqueue_op(call, from, op_id);
         self.advance(rpc);
     }
 
     fn enqueue(&mut self, call: OverlayCall, from: Window) {
+        self.enqueue_op(call, from, None);
+    }
+
+    fn enqueue_op(&mut self, call: OverlayCall, from: Window, op_id: Option<u64>) {
         let seq = self.next_seq;
         self.next_seq += 1;
         self.queue.push_back(Queued {
@@ -1059,6 +1078,7 @@ impl EditorOverlay {
             call,
             retried: false,
             from,
+            op_id,
         });
     }
 
@@ -1397,7 +1417,10 @@ impl EditorOverlay {
                     }
                     self.requeue(queued);
                 }
-                Some(Ok(answer)) => self.answered(flight.queued.from, flight.queued.call, &answer),
+                Some(Ok(answer)) => {
+                    let Queued { from, op_id, call, .. } = flight.queued;
+                    self.answered(from, op_id, call, &answer);
+                }
                 Some(Err(error)) => {
                     if is_gone(&error) {
                         self.forget_install();
@@ -1409,7 +1432,9 @@ impl EditorOverlay {
         self.in_flight = waiting;
     }
 
-    fn answered(&mut self, from: Window, call: OverlayCall, answer: &Value) {
+    /// `op_id` goes into what a live call of a linked window's is reported as; every other report stays
+    /// as it was, an open's carrying the id of its own request.
+    fn answered(&mut self, from: Window, op_id: Option<u64>, call: OverlayCall, answer: &Value) {
         self.answer_off_seq = lookup(answer, "off_seq").and_then(Value::as_u64);
         let was_drawn = self.active > 0;
         self.note_active(answer);
@@ -1468,12 +1493,12 @@ impl EditorOverlay {
                 self.forget_linked_paths();
                 self.forget_live_drawings();
             }
-            OverlayCall::LiveShow { path, meta, .. } => self.live_answered(from, path, meta, answer),
+            OverlayCall::LiveShow { path, meta, .. } => self.live_answered(from, op_id, path, meta, answer),
             OverlayCall::LiveClear { path } => {
                 // Not cleared: the overlay there is not live (any more), and the drawing it stands
                 // for is someone else's to take off.
                 if lookup(answer, "cleared").and_then(Value::as_bool) == Some(true) {
-                    self.undraw(path, from, None);
+                    self.undraw(path, from, op_id);
                 } else {
                     self.forget_live(&path);
                 }
@@ -1483,7 +1508,7 @@ impl EditorOverlay {
 
     /// A live draw's answer. Left, or not shown, nothing in the editor changed and neither does who
     /// holds the file; otherwise the old drawing went and the live one, if any hunk was drawn, is up.
-    fn live_answered(&mut self, from: Window, path: PathBuf, meta: LiveMeta, answer: &Value) {
+    fn live_answered(&mut self, from: Window, op_id: Option<u64>, path: PathBuf, meta: LiveMeta, answer: &Value) {
         let live = match parse_live_show(answer) {
             Ok(live) => live,
             Err(why) => {
@@ -1493,12 +1518,12 @@ impl EditorOverlay {
         };
         if live.shown && !live.left {
             if live.drawn > 0 {
-                self.draw(path.clone(), from, None, Drawn::Drawn);
+                self.draw(path.clone(), from, op_id, Drawn::Drawn);
                 self.live_drawings
                     .insert(path.clone(), (meta.session.clone(), meta.turn));
                 self.live_windows.insert(path.clone(), from);
             } else {
-                self.undraw(path.clone(), from, None);
+                self.undraw(path.clone(), from, op_id);
             }
         }
         if from == Window::One {
@@ -1735,10 +1760,19 @@ impl EditorOverlay {
     }
 }
 
+/// The most live draws a linked window keeps waiting for window 1's report on. A draw nvim left
+/// (an `o` drawing or a modified buffer kept the file) is never reported; a later report on its file
+/// lets it go, and past this many the oldest goes.
+const MAX_LIVE_SENT: usize = 256;
+
 /// Window 2's driver: window 2 has no editor of its own, so its overlay calls go to window 1's
 /// driver as editor operations, and what is drawn is known from what window 1 reports back
 /// (`review_drawn`, `review_idle`), as the driver knows it from the editor's answers. Paths on the
 /// link are relative to the project root; here they are absolute, as the flow uses them.
+///
+/// A live draw is known to be up when window 1 reports its file drawn under the id of the operation
+/// that asked for it: window 1 answers this window's operations in the order they were sent, so a
+/// report under a later operation's id, or under none, says the file holds something else.
 pub struct RemoteOverlay {
     root: PathBuf,
     send: Box<dyn Fn(EditorOp) -> u64>,
@@ -1746,6 +1780,11 @@ pub struct RemoteOverlay {
     opens: BTreeMap<u64, String>,
     active_paths: BTreeSet<PathBuf>,
     done: Vec<OverlayOutcome>,
+    /// Live draws sent and not reported yet: the operation's id to the file, the drawing's meta and
+    /// how many hunks went.
+    live_sent: BTreeMap<u64, (PathBuf, LiveMeta, u32)>,
+    /// The files this window drew live, each with the session and turn it shows.
+    live_drawings: BTreeMap<PathBuf, (String, u32)>,
 }
 
 impl RemoteOverlay {
@@ -1757,6 +1796,8 @@ impl RemoteOverlay {
             opens: BTreeMap::new(),
             active_paths: BTreeSet::new(),
             done: Vec::new(),
+            live_sent: BTreeMap::new(),
+            live_drawings: BTreeMap::new(),
         }
     }
 
@@ -1792,14 +1833,34 @@ impl RemoteOverlay {
             }),
             OverlayCall::Clear { path } => self.relative(path).map(|path| EditorOp::ReviewClear { path }),
             OverlayCall::ClearAll => Ok(EditorOp::ReviewClearMine {}),
-            // A linked window draws nothing live through window 1 yet: nothing goes out.
-            OverlayCall::LiveShow { .. } | OverlayCall::LiveClear { .. } => return,
+            OverlayCall::LiveShow { path, meta, hunks } => self.relative(path).map(|path| EditorOp::ReviewLiveShow {
+                path,
+                meta: WireLiveMeta::from(meta),
+                hunks: hunks.iter().map(WireHunk::from).collect(),
+            }),
+            OverlayCall::LiveClear { path } => {
+                // Nothing of this window's is live there, drawn or on its way: there is nothing to take off.
+                let live = self.live_drawings.contains_key(path) || self.live_sent.values().any(|(p, ..)| p == path);
+                if !live {
+                    return;
+                }
+                self.relative(path).map(|path| EditorOp::ReviewLiveClear { path })
+            }
         };
         match op {
             Ok(op) => {
                 let id = (self.send)(op);
-                if let OverlayCall::OpenAndShow { request_id, .. } = call {
-                    self.opens.insert(id, request_id);
+                match call {
+                    OverlayCall::OpenAndShow { request_id, .. } => {
+                        self.opens.insert(id, request_id);
+                    }
+                    OverlayCall::LiveShow { path, meta, hunks } => {
+                        self.live_sent.insert(id, (path, meta, hunks.len() as u32));
+                        while self.live_sent.len() > MAX_LIVE_SENT {
+                            self.live_sent.pop_first();
+                        }
+                    }
+                    _ => {}
                 }
             }
             Err(why) => {
@@ -1824,24 +1885,62 @@ impl RemoteOverlay {
     /// `review_drawn`: what window 1's driver now knows of a file this window drew; `path` is
     /// relative to the project root, as the link carries it.
     pub fn review_drawn(&mut self, path: &str, state: Drawn) {
-        let inside = !path.is_empty()
-            && Path::new(path)
-                .components()
-                .all(|c| matches!(c, std::path::Component::Normal(_)));
+        self.review_drawn_by(None, path, state);
+    }
+
+    /// [`review_drawn`](Self::review_drawn) with the id of the operation whose outcome it is, when
+    /// window 1 named one: a live draw of this window's is up only when its own id comes back.
+    pub fn review_drawn_by(&mut self, op_id: Option<u64>, path: &str, state: Drawn) {
+        let inside = !path.is_empty() && Path::new(path).components().all(|c| matches!(c, Component::Normal(_)));
         if !inside {
             eprintln!("eitri: window 1 reported a review drawn over a path outside the project: {path:?}");
             return;
         }
         let abs = self.root.join(path);
+        let live = op_id
+            .and_then(|id| self.live_sent.remove(&id))
+            .filter(|(sent, ..)| *sent == abs);
+        if let Some(id) = op_id {
+            // Window 1 answered every earlier operation of this window first: a live draw of the
+            // file sent before this one that has not been reported never will be.
+            self.live_sent
+                .retain(|sent_id, (sent, ..)| *sent_id > id || *sent != abs);
+        }
         match state {
             Drawn::Drawn | Drawn::Kept => {
-                self.active_paths.insert(abs);
+                self.active_paths.insert(abs.clone());
+                match live {
+                    Some((_, meta, hunks)) => {
+                        self.live_drawings
+                            .insert(abs.clone(), (meta.session.clone(), meta.turn));
+                        // Window 1 says that hunks went up, not how many: those sent, at least one.
+                        self.done.push(OverlayOutcome::LiveDrawn {
+                            path: abs,
+                            meta,
+                            drawn: hunks.max(1),
+                            left: false,
+                        });
+                    }
+                    None => {
+                        self.live_drawings.remove(&abs);
+                    }
+                }
             }
             Drawn::Cleared => {
                 self.active_paths.remove(&abs);
+                self.live_drawings.remove(&abs);
+                if let Some((_, meta, _)) = live {
+                    self.done.push(OverlayOutcome::LiveDrawn {
+                        path: abs,
+                        meta,
+                        drawn: 0,
+                        left: false,
+                    });
+                }
             }
             Drawn::Off => {
                 self.active_paths.remove(&abs);
+                self.live_drawings.remove(&abs);
                 push_off(&mut self.done, off_for(&abs, "reported"));
             }
         }
@@ -1850,6 +1949,7 @@ impl RemoteOverlay {
     /// `review_idle`: window 1's driver reports none of this window's files drawn.
     pub fn review_idle(&mut self) {
         self.active_paths.clear();
+        self.live_drawings.clear();
     }
 
     /// `review_events`: reverts made in the editor, and their undos, for a session this window
@@ -1874,14 +1974,161 @@ impl RemoteOverlay {
         self.opens.clear();
         self.active_paths.clear();
         self.done.clear();
+        self.live_sent.clear();
+        self.live_drawings.clear();
     }
 
     pub fn active_paths(&self) -> &BTreeSet<PathBuf> {
         &self.active_paths
     }
 
+    /// The files this window drew live, each with the session and turn it shows.
+    pub fn live_drawings(&self) -> &BTreeMap<PathBuf, (String, u32)> {
+        &self.live_drawings
+    }
+
     pub fn wants_ticks(&self) -> bool {
         !self.done.is_empty()
+    }
+}
+
+/// The most notes a linked window keeps waiting for their shown answer. The flow takes each answer
+/// or lets it go after a while; past this many the oldest is dropped unread.
+const MAX_LIVE_QUESTIONS: usize = 64;
+
+/// Window 2's way to window 1 for its live drawings: each note goes as an [`EditorOp::ReviewLiveNote`]
+/// naming its files relative to the project root, at most [`MAX_SHOWN_PATHS`] an operation, and window
+/// 1's editor's answer to which of them a window shows is the reply. A file that cannot be named to
+/// window 1 (outside the project, not UTF-8) is not sent and counts as not shown.
+pub struct RemoteLiveAsk {
+    root: PathBuf,
+    send: Box<dyn Fn(EditorOp) -> Option<Pending>>,
+    next: Cell<u64>,
+    asked: RefCell<BTreeMap<u64, ShownAsked>>,
+}
+
+/// One note's question: how many paths it named, and its operations' answers.
+struct ShownAsked {
+    len: usize,
+    parts: Vec<ShownPart>,
+}
+
+/// One operation of a note: the places of its paths in the note, and its answer once in.
+struct ShownPart {
+    at: Vec<usize>,
+    pending: Pending,
+    answer: Option<Result<Vec<bool>, String>>,
+}
+
+impl RemoteLiveAsk {
+    /// `send` hands an operation to window 1 and returns its answer to come, or `None` while the
+    /// windows are not linked.
+    pub fn new(root: &Path, send: Box<dyn Fn(EditorOp) -> Option<Pending>>) -> RemoteLiveAsk {
+        RemoteLiveAsk {
+            root: root.to_path_buf(),
+            send,
+            next: Cell::new(1),
+            asked: RefCell::new(BTreeMap::new()),
+        }
+    }
+
+    /// `abs` as window 1 takes it: relative to the project root, in UTF-8, plain names only.
+    fn relative(&self, abs: &Path) -> Option<String> {
+        let rel = abs.strip_prefix(&self.root).ok()?.to_str()?;
+        let plain = !rel.is_empty()
+            && !rel.contains('\0')
+            && Path::new(rel).components().all(|c| matches!(c, Component::Normal(_)));
+        plain.then(|| rel.to_owned())
+    }
+}
+
+impl LiveAsk for RemoteLiveAsk {
+    fn note(&self, key: &TurnKey, started_ns: u64, ended_ns: Option<u64>, abs_paths: &[PathBuf]) -> Option<u64> {
+        let named: Vec<(usize, String)> = abs_paths
+            .iter()
+            .enumerate()
+            .filter_map(|(at, abs)| Some((at, self.relative(abs)?)))
+            .collect();
+        let asking = ended_ns.is_none() && !named.is_empty();
+        if !asking && ended_ns.is_none() {
+            return None;
+        }
+        // An end is told even with no path to name: it ends the turn in window 1's table.
+        let batches: Vec<&[(usize, String)]> = if named.is_empty() {
+            vec![&[]]
+        } else {
+            named.chunks(MAX_SHOWN_PATHS).collect()
+        };
+        let mut parts = Vec::new();
+        for batch in batches {
+            let pending = (self.send)(EditorOp::ReviewLiveNote {
+                session: key.session.clone(),
+                turn_id: key.turn_id.clone(),
+                started_ns,
+                ended_ns,
+                paths: batch.iter().map(|(_, rel)| rel.clone()).collect(),
+            })?;
+            parts.push(ShownPart {
+                at: batch.iter().map(|(at, _)| *at).collect(),
+                pending,
+                answer: None,
+            });
+        }
+        if !asking {
+            return None;
+        }
+        let id = self.next.get();
+        self.next.set(id + 1);
+        let mut asked = self.asked.borrow_mut();
+        asked.insert(
+            id,
+            ShownAsked {
+                len: abs_paths.len(),
+                parts,
+            },
+        );
+        while asked.len() > MAX_LIVE_QUESTIONS {
+            asked.pop_first();
+        }
+        Some(id)
+    }
+
+    fn take_shown(&self, op_id: u64) -> Option<Result<Vec<bool>, String>> {
+        let mut asked = self.asked.borrow_mut();
+        let question = asked.get_mut(&op_id)?;
+        for part in question.parts.iter_mut().filter(|part| part.answer.is_none()) {
+            part.answer = part.pending.try_take().map(|reply| {
+                reply
+                    .map_err(|e| e.to_string())
+                    .and_then(|answer| parse_live_shown(&answer, part.at.len()))
+            });
+        }
+        if question.parts.iter().any(|part| part.answer.is_none()) {
+            return None;
+        }
+        let question = asked.remove(&op_id)?;
+        let mut shown = vec![false; question.len];
+        let mut answered = false;
+        let mut failed = None;
+        for part in question.parts {
+            match part.answer {
+                Some(Ok(list)) => {
+                    answered = true;
+                    for (at, is_shown) in part.at.into_iter().zip(list) {
+                        shown[at] = is_shown;
+                    }
+                }
+                Some(Err(why)) => {
+                    failed.get_or_insert(why);
+                }
+                None => {}
+            }
+        }
+        // A batch that failed counts as not shown; only when none was answered is the question failed.
+        Some(match (answered, failed) {
+            (false, Some(why)) => Err(why),
+            _ => Ok(shown),
+        })
     }
 }
 
@@ -1940,8 +2187,7 @@ impl Overlay {
     pub fn live_drawings(&self) -> &BTreeMap<PathBuf, (String, u32)> {
         match self {
             Overlay::Local(overlay) => overlay.live_drawings(),
-            // A linked window is told of no live drawing yet.
-            Overlay::Remote(_) => &NO_LIVE_DRAWINGS,
+            Overlay::Remote(overlay) => overlay.live_drawings(),
         }
     }
 
@@ -3634,5 +3880,277 @@ mod tests {
         let routed = ticks(&mut overlay, &nvim, &mut at);
         assert!(has_off(&routed.mine), "{routed:?}");
         assert!(overlay.active_paths().is_empty());
+    }
+
+    // ---- a linked window's live drawings ------------------------------------------------------------
+
+    #[test]
+    fn a_linked_live_draw_is_reported_under_its_operation() {
+        let nvim = Nvim::new();
+        let mut overlay = EditorOverlay::new(Owner::Embedded);
+        let mut at = Instant::now();
+        overlay.call_for_op(&nvim, show("/p/a", "s2"), TWO, Some(4), at);
+        overlay.call_for_op(&nvim, live_show("/p/b", "s2", 1), TWO, Some(5), at);
+        let routed = ticks(&mut overlay, &nvim, &mut at);
+        assert_eq!(
+            for_two(&routed),
+            [
+                LinkedEvent::Drawn {
+                    op_id: None,
+                    path: PathBuf::from("/p/a"),
+                    state: Drawn::Drawn,
+                },
+                LinkedEvent::Drawn {
+                    op_id: Some(5),
+                    path: PathBuf::from("/p/b"),
+                    state: Drawn::Drawn,
+                },
+            ],
+            "a show's report is as it was; a live draw's names its operation"
+        );
+        assert_eq!(drawings(&overlay), vec![("/p/b", ("s2", 1))]);
+        overlay.call_for_op(&nvim, live_clear("/p/b"), TWO, Some(6), at);
+        let routed = ticks(&mut overlay, &nvim, &mut at);
+        assert_eq!(
+            for_two(&routed),
+            [LinkedEvent::Drawn {
+                op_id: Some(6),
+                path: PathBuf::from("/p/b"),
+                state: Drawn::Cleared,
+            }]
+        );
+        assert!(overlay.live_drawings().is_empty());
+    }
+
+    fn remote_at_p() -> (RemoteOverlay, Rc<RefCell<Vec<EditorOp>>>) {
+        let sent: Rc<RefCell<Vec<EditorOp>>> = Rc::default();
+        let log = sent.clone();
+        let remote = RemoteOverlay::new(
+            Path::new("/p"),
+            Box::new(move |op| {
+                log.borrow_mut().push(op);
+                log.borrow().len() as u64
+            }),
+        );
+        (remote, sent)
+    }
+
+    #[test]
+    fn a_linked_windows_live_drawing_is_known_only_from_its_own_report() {
+        let (mut remote, sent) = remote_at_p();
+        let at = Instant::now();
+        remote.call(show("/p/a", "s2"), at);
+        remote.call(live_show("/p/a", "s2", 3), at);
+        assert_eq!(
+            sent.borrow()[1],
+            EditorOp::ReviewLiveShow {
+                path: "a".to_owned(),
+                meta: WireLiveMeta::from(&live_meta("s2", 3)),
+                hunks: vec![WireHunk::from(&hunk())],
+            }
+        );
+        // The show's report: the live draw behind it was left (an `o` drawing holds the file).
+        remote.review_drawn_by(None, "a", Drawn::Drawn);
+        assert!(remote.active_paths().contains(Path::new("/p/a")));
+        assert!(
+            remote.live_drawings().is_empty(),
+            "the show's drawing is not a live one"
+        );
+        assert!(remote.tick(at).is_empty());
+
+        remote.call(live_show("/p/a", "s2", 4), at);
+        remote.review_drawn_by(Some(3), "a", Drawn::Drawn);
+        assert_eq!(
+            remote.live_drawings(),
+            &BTreeMap::from([(PathBuf::from("/p/a"), ("s2".to_owned(), 4))])
+        );
+        assert_eq!(
+            remote.tick(at),
+            vec![OverlayOutcome::LiveDrawn {
+                path: PathBuf::from("/p/a"),
+                meta: live_meta("s2", 4),
+                drawn: 1,
+                left: false,
+            }]
+        );
+
+        // An `o` drawing over it: no live drawing of this window's is there, so a live clear has
+        // nothing to take off.
+        remote.call(show("/p/a", "s2"), at);
+        remote.review_drawn_by(None, "a", Drawn::Drawn);
+        assert!(remote.live_drawings().is_empty());
+        let before = sent.borrow().len();
+        remote.call(live_clear("/p/a"), at);
+        assert_eq!(sent.borrow().len(), before, "nothing of this window's is live there");
+
+        // Window 1 takes a live drawing off (a live clear of this window's, or a contest's).
+        remote.call(live_show("/p/b", "s2", 4), at);
+        let id = sent.borrow().len() as u64;
+        remote.review_drawn_by(Some(id), "b", Drawn::Drawn);
+        remote.call(live_clear("/p/b"), at);
+        assert_eq!(
+            sent.borrow().last(),
+            Some(&EditorOp::ReviewLiveClear { path: "b".to_owned() })
+        );
+        remote.review_drawn_by(Some(id + 1), "b", Drawn::Cleared);
+        assert!(remote.live_drawings().is_empty());
+        assert!(!remote.active_paths().contains(Path::new("/p/b")));
+
+        // The editor or another window took it, or nothing of this window's is drawn any more.
+        remote.call(live_show("/p/c", "s2", 4), at);
+        let id = sent.borrow().len() as u64;
+        remote.review_drawn_by(Some(id), "c", Drawn::Drawn);
+        remote.review_drawn_by(None, "c", Drawn::Off);
+        assert!(remote.live_drawings().is_empty());
+        remote.call(live_show("/p/c", "s2", 5), at);
+        let id = sent.borrow().len() as u64;
+        remote.review_drawn_by(Some(id), "c", Drawn::Drawn);
+        assert_eq!(remote.live_drawings().len(), 1);
+        remote.review_idle();
+        assert!(remote.live_drawings().is_empty());
+        remote.editor_lost();
+        assert!(remote.tick(at).is_empty());
+
+        // Through the window's overlay, as the flow reads it.
+        let (mut remote, _) = remote_at_p();
+        remote.call(live_show("/p/d", "s2", 6), at);
+        remote.review_drawn_by(Some(1), "d", Drawn::Drawn);
+        let overlay = Overlay::Remote(remote);
+        assert_eq!(
+            overlay.live_drawings(),
+            &BTreeMap::from([(PathBuf::from("/p/d"), ("s2".to_owned(), 6))])
+        );
+    }
+
+    #[test]
+    fn a_report_under_a_later_operation_lets_an_unreported_live_draw_go() {
+        let (mut remote, sent) = remote_at_p();
+        let at = Instant::now();
+        remote.call(live_show("/p/a", "s2", 1), at);
+        remote.call(live_show("/p/a", "s2", 2), at);
+        // The first was left and never reported; the second went up.
+        remote.review_drawn_by(Some(2), "a", Drawn::Drawn);
+        assert_eq!(remote.live_drawings()[Path::new("/p/a")], ("s2".to_owned(), 2));
+        // The first's id coming back now would be a report of no draw of this window's.
+        remote.review_drawn_by(Some(1), "a", Drawn::Drawn);
+        assert!(
+            remote.live_drawings().is_empty(),
+            "a report under an id no live draw waits for is not a live drawing"
+        );
+        assert_eq!(sent.borrow().len(), 2);
+    }
+
+    type NoteSent = Rc<RefCell<Vec<(EditorOp, Option<crate::nvim_rpc::Answer>)>>>;
+
+    fn live_ask_at_p() -> (RemoteLiveAsk, NoteSent) {
+        let sent: NoteSent = Rc::default();
+        let log = sent.clone();
+        let ask = RemoteLiveAsk::new(
+            Path::new("/p"),
+            Box::new(move |op| {
+                let (answer, pending) = Pending::pair();
+                log.borrow_mut().push((op, Some(answer)));
+                Some(pending)
+            }),
+        );
+        (ask, sent)
+    }
+
+    fn shown_answer(shown: &[bool]) -> Value {
+        Value::Map(vec![(
+            Value::from("shown"),
+            Value::Array(shown.iter().map(|s| Value::from(*s)).collect()),
+        )])
+    }
+
+    fn note_paths(op: &EditorOp) -> (Option<u64>, Vec<String>) {
+        match op {
+            EditorOp::ReviewLiveNote {
+                session,
+                turn_id,
+                started_ns,
+                ended_ns,
+                paths,
+            } => {
+                assert_eq!((session.as_str(), turn_id.as_str(), *started_ns), ("s2", "t1", 5));
+                (*ended_ns, paths.clone())
+            }
+            other => panic!("not a note: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_linked_windows_note_goes_in_batches_and_its_answer_comes_back_by_place() {
+        let (ask, sent) = live_ask_at_p();
+        let mut abs: Vec<PathBuf> = (0..300).map(|n| PathBuf::from(format!("/p/f{n}"))).collect();
+        abs.insert(1, PathBuf::from("/elsewhere/x"));
+        let id = ask
+            .note(&key("s2", "t1"), 5, None, &abs)
+            .expect("a running turn's note asks");
+        {
+            let sent = sent.borrow();
+            assert_eq!(sent.len(), 2, "one batch an operation");
+            let (end, first) = note_paths(&sent[0].0);
+            assert_eq!(end, None);
+            assert_eq!(first.len(), MAX_SHOWN_PATHS);
+            assert_eq!(first[0], "f0");
+            assert_eq!(first[1], "f1", "the path outside the project is not named");
+            assert_eq!(note_paths(&sent[1].0).1.len(), 300 - MAX_SHOWN_PATHS);
+        }
+        assert_eq!(ask.take_shown(id), None, "nothing answered yet");
+        let mut answers: Vec<_> = sent.borrow_mut().iter_mut().map(|(_, a)| a.take().unwrap()).collect();
+        let second = answers.pop().unwrap();
+        answers.pop().unwrap().send(Ok(shown_answer(&[true; MAX_SHOWN_PATHS])));
+        assert_eq!(ask.take_shown(id), None, "one batch is still out");
+        let rest: Vec<bool> = (0..300 - MAX_SHOWN_PATHS).map(|n| n % 2 == 0).collect();
+        second.send(Ok(shown_answer(&rest)));
+        let shown = ask.take_shown(id).expect("both answered").expect("answered");
+        let mut expected = vec![true; MAX_SHOWN_PATHS + 1];
+        expected[1] = false;
+        expected.extend(rest);
+        assert_eq!(shown, expected, "each answer in the place of its path");
+        assert_eq!(ask.take_shown(id), None, "an answer is taken once");
+
+        // An ended turn's note asks nothing, and is told even when it names no path.
+        sent.borrow_mut().clear();
+        assert_eq!(ask.note(&key("s2", "t1"), 5, Some(9), &abs[..3]), None);
+        assert_eq!(ask.note(&key("s2", "t1"), 5, Some(9), &[]), None);
+        let ends: Vec<_> = sent.borrow().iter().map(|(op, _)| note_paths(op)).collect();
+        assert_eq!(
+            ends,
+            vec![(Some(9), vec!["f0".to_owned(), "f1".to_owned()]), (Some(9), Vec::new())]
+        );
+        // A running note with nothing window 1 could be asked about sends nothing.
+        sent.borrow_mut().clear();
+        assert_eq!(
+            ask.note(&key("s2", "t1"), 5, None, &[PathBuf::from("/elsewhere/x")]),
+            None
+        );
+        assert!(sent.borrow().is_empty());
+    }
+
+    #[test]
+    fn a_linked_windows_note_with_a_failed_batch_counts_its_paths_not_shown() {
+        let (ask, sent) = live_ask_at_p();
+        let abs: Vec<PathBuf> = (0..MAX_SHOWN_PATHS + 1)
+            .map(|n| PathBuf::from(format!("/p/f{n}")))
+            .collect();
+        let id = ask.note(&key("s2", "t1"), 5, None, &abs).unwrap();
+        let mut answers: Vec<_> = sent.borrow_mut().iter_mut().map(|(_, a)| a.take().unwrap()).collect();
+        answers.pop().unwrap().send(Err(RpcError::Nvim("no editor".into())));
+        answers.pop().unwrap().send(Ok(shown_answer(&[true; MAX_SHOWN_PATHS])));
+        let shown = ask.take_shown(id).unwrap().unwrap();
+        assert_eq!(shown.iter().filter(|s| **s).count(), MAX_SHOWN_PATHS);
+        assert!(!shown[MAX_SHOWN_PATHS]);
+
+        // Every batch failed, or the answer was not a shown list: the question failed.
+        let id = ask.note(&key("s2", "t1"), 5, None, &abs[..1]).unwrap();
+        let answer = sent.borrow_mut().last_mut().unwrap().1.take().unwrap();
+        answer.send(Ok(Value::Nil));
+        assert!(ask.take_shown(id).unwrap().is_err());
+
+        // Not linked: nothing is asked.
+        let unlinked = RemoteLiveAsk::new(Path::new("/p"), Box::new(|_| None));
+        assert_eq!(unlinked.note(&key("s2", "t1"), 5, None, &abs[..1]), None);
     }
 }

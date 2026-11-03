@@ -237,6 +237,8 @@ pub struct ReviewFlow {
     live_ask: Option<Box<dyn LiveAsk>>,
     /// The contested-paths table while the window has no editor: the next driver takes it over.
     parked_contest: LiveContest,
+    /// Window 1: the running turns each linked window noted, so their ends are noted when its link ends.
+    linked_live: HashMap<TurnKey, PeerId>,
     /// Window 2: the turn that last named each path (with its start), and each ended turn's end,
     /// so a shown question can name the turn its paths belong to.
     live_named: BTreeMap<PathBuf, (TurnKey, u64)>,
@@ -443,6 +445,7 @@ impl ReviewFlow {
         self.remote_ask = Some(Rc::new(ask));
         // Window 1's driver keeps the one table now.
         self.parked_contest = LiveContest::new();
+        self.linked_live.clear();
         self.shown.clear();
         self.redraws.clear();
         self.live_editor_lost();
@@ -1680,20 +1683,77 @@ impl ReviewFlow {
                 self.live_unread.push((op, now));
             }
         } else {
-            match self.overlay.as_mut() {
-                Some(Overlay::Local(overlay)) => overlay.note_live(Window::One, key, started_ns, ended_ns, paths),
-                // No editor now: nothing is drawn to clear, and the next driver takes the table.
-                None => {
-                    for path in paths {
-                        self.parked_contest.note_edit(key, started_ns, path);
-                    }
-                    if let Some(ended_ns) = ended_ns {
-                        self.parked_contest.note_end(key, ended_ns);
-                    }
-                }
-                Some(Overlay::Remote(_)) => {}
+            // A turn a linked window noted is this window's now that its session is here: its end
+            // comes from this window, and the link's end must not move it.
+            self.linked_live.remove(key);
+            self.note_contest(Window::One, key, started_ns, ended_ns, paths);
+        }
+    }
+
+    /// Window 1: a linked window's note, into the driver's table, or the parked one while the window
+    /// has no editor. False in window 2, which has no table.
+    pub fn note_linked_live(
+        &mut self,
+        peer: PeerId,
+        key: &TurnKey,
+        started_ns: u64,
+        ended_ns: Option<u64>,
+        paths: &[PathBuf],
+    ) -> bool {
+        if !self.note_contest(Window::Linked(peer), key, started_ns, ended_ns, paths) {
+            return false;
+        }
+        // The window that noted a running turn last holds its session: a session that moved between
+        // linked windows takes the turn along.
+        match ended_ns {
+            None => {
+                self.linked_live.insert(key.clone(), peer);
+            }
+            Some(_) => {
+                self.linked_live.remove(key);
             }
         }
+        true
+    }
+
+    /// Window 1: the link to `peer` ended, so nobody will say when the turns it noted as running end;
+    /// they end at `at_ns`.
+    pub fn linked_live_gone(&mut self, peer: PeerId, at_ns: u64) {
+        let gone: Vec<TurnKey> = self
+            .linked_live
+            .iter()
+            .filter(|(_, held_by)| **held_by == peer)
+            .map(|(key, _)| key.clone())
+            .collect();
+        for key in gone {
+            self.linked_live.remove(&key);
+            self.note_contest(Window::Linked(peer), &key, 0, Some(at_ns), &[]);
+        }
+    }
+
+    /// Window 1's table: its driver's, or the parked one while it has no editor (nothing is drawn to
+    /// clear, and the next driver takes the table). False in window 2.
+    fn note_contest(
+        &mut self,
+        from: Window,
+        key: &TurnKey,
+        started_ns: u64,
+        ended_ns: Option<u64>,
+        paths: &[PathBuf],
+    ) -> bool {
+        match self.overlay.as_mut() {
+            Some(Overlay::Local(overlay)) => overlay.note_live(from, key, started_ns, ended_ns, paths),
+            None => {
+                for path in paths {
+                    self.parked_contest.note_edit(key, started_ns, path);
+                }
+                if let Some(ended_ns) = ended_ns {
+                    self.parked_contest.note_end(key, ended_ns);
+                }
+            }
+            Some(Overlay::Remote(_)) => return false,
+        }
+        true
     }
 
     /// A live draw of `path`. A settled draw's headers wait for the editor's answer: only a drawing

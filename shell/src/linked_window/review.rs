@@ -28,6 +28,12 @@
 //! flow drives an overlay proxy that keeps what is drawn from those, and asks window 1's nvim about a buffer through
 //! the same editor operations.
 //!
+//! **Live drawings.** A linked window's live notes (a running turn's edited files, and its end) go into window 1's
+//! driver as that window's, and while the turn runs window 1's nvim answers which of the files a window shows, as the
+//! note's reply. Its live draws are queued on the driver under their operation's id, which window 1 reports back with
+//! what the draw came to. A turn a linked window noted as running ends in window 1's table when its link ends: nobody
+//! else will say so.
+//!
 //! **Window 1 decides.** A module window is linked to window 1 alone, so it cannot tell another module window's
 //! presence from a stranger's. Its revert's worker, after its own checks, asks window 1 with `revert_guard` and waits
 //! for `guard` (`HubGuard`); window 1 answers from its own check, which skips every linked partner, on a thread of
@@ -49,7 +55,7 @@ use std::sync::{mpsc, Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use eitri_core::nvim_rpc::Pending;
-use eitri_core::review_editor::{LinkedEvent, OverlayCall, RemoteOverlay, Window};
+use eitri_core::review_editor::{LinkedEvent, OverlayCall, RemoteLiveAsk, RemoteOverlay, Window};
 use eitri_core::turn_review::{GroupGuard, Held, Partner, RemoteAsk, SOLE_PARTNER};
 use eitri_core::window_link::link::LinkSender;
 use eitri_core::window_link::{EdgeKind, EditorOp, Msg, ReplyResult, TurnEdge};
@@ -280,7 +286,7 @@ impl GroupReview {
     /// every call of its own. An open is answered by the driver once it has the outcome; the others at once.
     fn serve_linked_windows(&self, editor: &Window1Editor) {
         let side = Rc::downgrade(&self.side);
-        editor.set_overlay(Rc::new(move |peer: PeerId, _id: u64, calls: Vec<OverlayCall>| {
+        editor.set_overlay(Rc::new(move |peer: PeerId, id: u64, calls: Vec<OverlayCall>| {
             let side = side.upgrade()?;
             let opens = calls.iter().any(|call| matches!(call, OverlayCall::OpenAndShow { .. }));
             let mut calls = Some(calls);
@@ -289,7 +295,7 @@ impl GroupReview {
                 if let (Some(overlay), Some(rpc), Some(calls)) = (flow.local_overlay(), rpc, calls.take()) {
                     let now = Instant::now();
                     for call in calls {
-                        overlay.call_for(rpc, call, Window::Linked(peer), now);
+                        overlay.call_for_op(rpc, call, Window::Linked(peer), Some(id), now);
                     }
                     queued = true;
                 }
@@ -302,6 +308,16 @@ impl GroupReview {
             } else {
                 Some(ReplyResult::Ok { value: Value::Null })
             }
+        }));
+        let side = Rc::downgrade(&self.side);
+        editor.set_live_note(Rc::new(move |peer: PeerId, note| {
+            let Some(side) = side.upgrade() else { return false };
+            let mut taken = false;
+            side.with(&mut |flow, _, _| {
+                taken = flow.note_linked_live(peer, &note.key, note.started_ns, note.ended_ns, &note.paths);
+                ReviewSettled::default()
+            });
+            taken
         }));
         let side = Rc::downgrade(&self.side);
         editor.set_drawn_for(Rc::new(move |peer: PeerId| {
@@ -342,10 +358,16 @@ impl GroupReview {
             &self.root,
             Box::new(move |op: EditorOp| asking.is_linked().then(|| asking.send(op))),
         );
-        let mut parts = Some((overlay, ask));
+        let noting = ops.clone();
+        let live_ask = RemoteLiveAsk::new(
+            &self.root,
+            Box::new(move |op: EditorOp| noting.is_linked().then(|| noting.send(op))),
+        );
+        let mut parts = Some((overlay, ask, live_ask));
         self.side.with(&mut |flow, _, _| {
-            if let Some((overlay, ask)) = parts.take() {
+            if let Some((overlay, ask, live_ask)) = parts.take() {
                 flow.link_to_window_1(overlay, ask);
+                flow.set_live_ask(Box::new(live_ask));
             }
             ReviewSettled::default()
         });
@@ -602,8 +624,8 @@ impl GroupReview {
     fn take_window_1_reports(&self, link: &LinkDriver) {
         let me = self.me.clone();
         link.on("review_drawn", move |_, msg, _| {
-            if let (Some(me), Msg::ReviewDrawn { path, state, .. }) = (me.upgrade(), msg) {
-                me.with_remote(|overlay| overlay.review_drawn(&path, state));
+            if let (Some(me), Msg::ReviewDrawn { id, path, state }) = (me.upgrade(), msg) {
+                me.with_remote(|overlay| overlay.review_drawn_by(id, &path, state));
             }
         });
         let me = self.me.clone();
@@ -773,6 +795,7 @@ impl GroupReview {
                 if let Some(overlay) = flow.local_overlay() {
                     overlay.linked_gone(peer);
                 }
+                flow.linked_live_gone(peer, at_ns);
                 Vec::new()
             } else {
                 flow.editor_lost()
@@ -1038,10 +1061,14 @@ mod tests {
     use eitri_core::agent_backend::{AgentBackend, AgentId, BackendKind};
     use eitri_core::agent_bridge::{parse_inbound_message, InboundMessage, SessionModeChoice};
     use eitri_core::editor_rpc::EditorRpc;
-    use eitri_core::review_editor::{Owner, CLEAR_LUA, OPEN_AND_SHOW_LUA, REVIEW_LUA, SHOW_LUA, TAKE_EVENTS_LUA};
+    use eitri_core::review_editor::{
+        Owner, CLEAR_LUA, LIVE_CLEAR_LUA, LIVE_SHOWN_LUA, LIVE_SHOW_LUA, OPEN_AND_SHOW_LUA, REVIEW_LUA, SHOW_LUA,
+        TAKE_EVENTS_LUA,
+    };
     use eitri_core::tab_set::{FirstTurn, Sent, TabBackend, TabSet, ViewId};
     use eitri_core::tabs::TabId;
     use eitri_core::test_providers::RecordingProvider;
+    use eitri_core::turn_review::live_contest::TurnKey;
     use eitri_core::turn_review::revert::BUFFER_STATE_LUA;
     use eitri_core::turn_review::{
         review_dir_for, Out, PresenceHolder, ReviewFlow, ReviewOptions, Scope, SlotBusy, Snap, TurnReview, WriteSlot,
@@ -1135,6 +1162,30 @@ mod tests {
             };
             if code == REVIEW_LUA {
                 vmap(vec![("installed", M::from(true))])
+            } else if code == LIVE_SHOWN_LUA {
+                // Every file asked about is shown in a window.
+                let asked = args[0].as_array().map_or(0, Vec::len);
+                vmap(vec![("shown", M::Array(vec![M::from(true); asked]))])
+            } else if code == LIVE_SHOW_LUA {
+                let hunks = args[2].as_array().map_or(0, Vec::len) as u64;
+                self.drawn.borrow_mut().insert(path());
+                vmap(vec![
+                    ("drawn", M::from(hunks)),
+                    ("shown", M::from(true)),
+                    ("left", M::from(false)),
+                    ("skipped", M::from(0)),
+                    ("active", self.active()),
+                    ("pending", M::from(0)),
+                    ("live_only", M::from(true)),
+                ])
+            } else if code == LIVE_CLEAR_LUA {
+                let cleared = self.drawn.borrow_mut().remove(&path());
+                vmap(vec![
+                    ("cleared", M::from(cleared)),
+                    ("active", self.active()),
+                    ("pending", M::from(0)),
+                    ("live_only", M::from(false)),
+                ])
             } else if code == SHOW_LUA {
                 self.drawn.borrow_mut().insert(path());
                 vmap(vec![
@@ -2987,5 +3038,96 @@ mod tests {
             !g.one.provider.turns().is_empty()
         });
         g.shut_down();
+    }
+
+    // ---- live drawings ------------------------------------------------------------------------------------------
+
+    /// Both windows' live rounds (as the panel's tick runs them before its own), then a step of the pair, until `done`.
+    fn live_settle(p: &Pair, what: &str, done: impl Fn(&Pair) -> bool) {
+        let deadline = Instant::now() + Duration::from_secs(20);
+        loop {
+            for win in [&p.one, &p.two] {
+                let mut tabs = win.side.tabs.borrow_mut();
+                let mut flow = win.side.flow.borrow_mut();
+                tabs.pump(&win.project, true);
+                flow.set_editor_owner(win.side.owner);
+                flow.live_tick(&mut tabs, win.side.rpc.as_deref(), Instant::now());
+            }
+            p.step();
+            if done(p) {
+                return;
+            }
+            assert!(Instant::now() < deadline, "timed out waiting for {what}");
+            std::thread::sleep(Duration::from_millis(5));
+        }
+    }
+
+    fn two_live_drawings(p: &Pair) -> BTreeMap<PathBuf, (String, u32)> {
+        let mut flow = p.two.side.flow.borrow_mut();
+        flow.remote_overlay()
+            .map(|overlay| overlay.live_drawings().clone())
+            .unwrap_or_default()
+    }
+
+    #[test]
+    fn a_live_edit_in_window_2_is_drawn_in_window_1s_nvim_and_its_turn_ends_with_the_link() {
+        let mut p = Pair::new("live-linked", false);
+        p.two.side.tabs.borrow_mut().set_live_edits(true);
+        let (turn_id, n) = p.start_turn(Window::Two);
+        let abs = p.project.join("a.txt");
+        std::fs::write(&abs, CHANGED).unwrap();
+        p.two.provider.queue_all(vec![
+            AgentDomainEvent::ToolCallStarted {
+                turn_id: turn_id.clone(),
+                tool_use_id: "edit-1".into(),
+                name: "Edit".into(),
+                input: json!({ "file_path": abs.to_str().unwrap() }),
+            },
+            AgentDomainEvent::ToolCallCompleted {
+                turn_id: turn_id.clone(),
+                tool_use_id: "edit-1".into(),
+                content: json!("ok"),
+                is_error: false,
+            },
+        ]);
+        live_settle(&p, "window 2's live drawing, known in both windows", |p| {
+            two_live_drawings(p).contains_key(&abs)
+        });
+        let bytes = M::Binary(abs.as_os_str().as_encoded_bytes().to_vec());
+        assert!(
+            p.nvim
+                .asked(LIVE_SHOWN_LUA)
+                .iter()
+                .all(|args| args[0] == M::Array(vec![bytes.clone()])),
+            "window 1's nvim is asked by window 1's own path"
+        );
+        let shows = p.nvim.asked(LIVE_SHOW_LUA);
+        assert_eq!(shows.len(), 1);
+        assert_eq!(shows[0][0], bytes);
+        assert_eq!(
+            two_live_drawings(&p),
+            BTreeMap::from([(abs.clone(), (p.two.session.clone(), n))]),
+            "window 2 knows its drawing is live, for its turn"
+        );
+
+        // The link ends while window 2's turn still runs: its turn ends in window 1's table then, so a turn of
+        // window 1's that starts later and edits the file does not contest it.
+        p.one_review.unlinked(SECOND_PEER);
+        let later = TurnKey {
+            session: "s-one".into(),
+            turn_id: "s-one-later".into(),
+        };
+        let mut flow = p.one.side.flow.borrow_mut();
+        let driver = flow.local_overlay().expect("window 1 has a driver");
+        driver.note_live(
+            eitri_core::review_editor::Window::One,
+            &later,
+            eitri_core::turn_review::monotonic_ns() + 1,
+            None,
+            std::slice::from_ref(&abs),
+        );
+        assert!(!driver.is_contested(&abs), "window 2's turn ended with its link");
+        drop(flow);
+        p.shut_down();
     }
 }

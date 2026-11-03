@@ -32,7 +32,7 @@ use eitri_core::review_editor::OverlayCall;
 use eitri_core::scratch::{EditDone, PendingEdit, ScratchDir, ScratchRequest};
 use eitri_core::tabs::TabId;
 use eitri_core::theme::payload::NvimThemePayload;
-use eitri_core::window_link::editor_ops::{dispatch, Dispatch, OpContext};
+use eitri_core::window_link::editor_ops::{dispatch, Dispatch, LiveNote, OpContext};
 use eitri_core::window_link::names::WindowName;
 use eitri_core::window_link::{DraftEnd, EditorOp, EditorRequest, LinkError, Msg, ReplyResult};
 use eitri_core::wm::PeerId;
@@ -549,6 +549,9 @@ pub type OverlayHook = Rc<dyn Fn(PeerId, u64, Vec<OverlayCall>) -> Option<ReplyR
 /// The files window 1's review driver last heard were drawn for the window at this peer: the only ones it may clear.
 pub type DrawnFor = Rc<dyn Fn(PeerId) -> Vec<PathBuf>>;
 
+/// Where a linked window's live note goes: window 1's own review driver, as that window's. Whether a driver took it.
+pub type LiveNoteHook = Rc<dyn Fn(PeerId, LiveNote) -> bool>;
+
 /// A draft edit for a tab that is in this window now ended in nvim: its session, and how it ended. Called for every
 /// end, a discarded or failed one too, since the tab is still marked as editing until it hears.
 pub type DraftHere = Rc<dyn Fn(Option<String>, EditDone)>;
@@ -609,6 +612,7 @@ pub struct Window1Editor {
     plugin_follows: RefCell<BTreeMap<String, eitri_core::window_link::editor_ops::FollowConfig>>,
     drawn_for: RefCell<Option<DrawnFor>>,
     overlay: RefCell<Option<OverlayHook>>,
+    live_note: RefCell<Option<LiveNoteHook>>,
     drive: RefCell<Option<Drive>>,
     draft_here: RefCell<Option<DraftHere>>,
     token: RefCell<Option<TokenSource>>,
@@ -637,6 +641,7 @@ impl Window1Editor {
             plugin_follows: RefCell::default(),
             drawn_for: RefCell::default(),
             overlay: RefCell::default(),
+            live_note: RefCell::default(),
             drive: RefCell::default(),
             draft_here: RefCell::default(),
             token: RefCell::default(),
@@ -677,6 +682,10 @@ impl Window1Editor {
 
     pub fn set_drawn_for(&self, drawn: DrawnFor) {
         *self.drawn_for.borrow_mut() = Some(drawn);
+    }
+
+    pub fn set_live_note(&self, hook: LiveNoteHook) {
+        *self.live_note.borrow_mut() = Some(hook);
     }
 
     /// What the plugin `owner` follows in this window's editor (its socket, its filetypes and commands), kept for
@@ -896,6 +905,26 @@ impl Window1Editor {
                 };
                 if let Some(result) = result {
                     self.reply(peer, id, result);
+                }
+            }
+            // The note goes into the driver's table first; the editor's answer to which files are shown is
+            // the reply, and an ended turn's note, which asks nothing, is answered at once.
+            Ok(Dispatch::LiveNote { note, shown }) => {
+                let hook = self.live_note.borrow().clone();
+                let taken = hook.is_some_and(|hook| hook(peer, note));
+                match (taken, shown) {
+                    (false, _) => self.reply(
+                        peer,
+                        id,
+                        ReplyResult::Err {
+                            why: "this window's review driver takes no notes from the other window".into(),
+                        },
+                    ),
+                    (true, Some(pending)) => {
+                        self.inflight.borrow_mut().push((peer, id, pending));
+                        self.poll_soon();
+                    }
+                    (true, None) => self.reply(peer, id, ReplyResult::Ok { value: Value::Null }),
                 }
             }
         }

@@ -3450,4 +3450,515 @@ mod live_review {
         }
         f.shut_down();
     }
+
+    // ---- linked windows --------------------------------------------------------------------------------
+
+    use eitri_core::nvim_rpc::RpcError;
+    use eitri_core::review_editor::{
+        EditorOverlay, LinkedEvent, LiveMeta, OverlayCall, OverlayOutcome, RemoteLiveAsk, ShowHunk, Window,
+    };
+    use eitri_core::window_link::editor_ops::{dispatch, Dispatch, OpContext};
+    use eitri_core::wm::PeerId;
+
+    /// The linked window, as window 1 numbers it.
+    const PEER: PeerId = PeerId(2);
+    /// The session of a tab of window 1's own.
+    const HUB_SESSION: &str = "hub-session";
+
+    /// An operation of the linked window, with where its reply goes when one is waited for.
+    type Sent = (u64, EditorOp, Option<Answer>);
+
+    /// Window 1 as the linked window reaches it: its review driver over a scripted editor, each of
+    /// the linked window's operations dispatched as window 1's link does it, and what the driver
+    /// finds for that window handed to its overlay. Its clock runs a second ahead at each round, so
+    /// the module's events are drained.
+    struct Hub {
+        root: PathBuf,
+        editor: ScriptedEditor,
+        overlay: EditorOverlay,
+        sent: Rc<RefCell<Vec<Sent>>>,
+        /// The name of every operation dispatched, in order.
+        ops: Vec<&'static str>,
+        /// Window 1's own outcomes, in order.
+        mine: Vec<OverlayOutcome>,
+        clock: Instant,
+    }
+
+    struct HubCtx<'a> {
+        root: &'a Path,
+        drawn: Vec<PathBuf>,
+    }
+
+    impl OpContext for HubCtx<'_> {
+        fn project_root(&self) -> &Path {
+            self.root
+        }
+        fn peer(&self) -> PeerId {
+            PEER
+        }
+        fn session_in_window2(&self, session: &str) -> bool {
+            session != HUB_SESSION
+        }
+        fn plugin_roots_in_window2(&self, _plugin: &str) -> Option<BTreeMap<String, PathBuf>> {
+            None
+        }
+        fn drawn_for_window2(&self) -> Vec<PathBuf> {
+            self.drawn.clone()
+        }
+    }
+
+    /// Makes the fixture's flow a linked window's, reaching `Hub`'s editor; review.live is on.
+    fn linked(f: &mut Fixture) -> Hub {
+        f.tabs.set_live_edits(true);
+        let sent: Rc<RefCell<Vec<Sent>>> = Rc::default();
+        let next = Rc::new(Cell::new(0u64));
+        let (ops, ids) = (sent.clone(), next.clone());
+        let overlay = RemoteOverlay::new(
+            &f.project,
+            Box::new(move |op| {
+                let id = ids.get() + 1;
+                ids.set(id);
+                ops.borrow_mut().push((id, op, None));
+                id
+            }),
+        );
+        let ask = RemoteAsk::new(&f.project, Box::new(|_| None));
+        let (ops, ids) = (sent.clone(), next);
+        let live_ask = RemoteLiveAsk::new(
+            &f.project,
+            Box::new(move |op| {
+                let id = ids.get() + 1;
+                ids.set(id);
+                let (answer, pending) = Pending::pair();
+                ops.borrow_mut().push((id, op, Some(answer)));
+                Some(pending)
+            }),
+        );
+        f.flow.link_to_window_1(overlay, ask);
+        f.flow.set_live_ask(Box::new(live_ask));
+        Hub {
+            root: f.project.clone(),
+            editor: ScriptedEditor::new(),
+            overlay: EditorOverlay::new(Owner::Embedded),
+            sent,
+            ops: Vec::new(),
+            mine: Vec::new(),
+            clock: Instant::now(),
+        }
+    }
+
+    impl Hub {
+        /// One round of window 1: the linked window's operations, a tick of the driver, and its
+        /// reports handed to the linked window's overlay.
+        fn serve(&mut self, f: &mut Fixture) {
+            self.clock += Duration::from_secs(1);
+            let at = self.clock;
+            let sent: Vec<Sent> = std::mem::take(&mut *self.sent.borrow_mut());
+            for (id, op, answer) in sent {
+                self.ops.push(op.name());
+                let ctx = HubCtx {
+                    root: &self.root,
+                    drawn: self.overlay.linked_paths(PEER).iter().cloned().collect(),
+                };
+                match dispatch(id, op, &ctx, &self.editor) {
+                    Ok(Dispatch::Overlay(calls)) => {
+                        for call in calls {
+                            self.overlay
+                                .call_for_op(&self.editor, call, Window::Linked(PEER), Some(id), at);
+                        }
+                    }
+                    Ok(Dispatch::LiveNote { note, shown }) => {
+                        self.overlay.note_live(
+                            Window::Linked(PEER),
+                            &note.key,
+                            note.started_ns,
+                            note.ended_ns,
+                            &note.paths,
+                        );
+                        if let Some(answer) = answer {
+                            answer.send(match shown {
+                                Some(shown) => shown.wait(Duration::from_secs(5)).expect("the editor answers"),
+                                None => Ok(Value::Nil),
+                            });
+                        }
+                    }
+                    Ok(Dispatch::Rpc(_)) => {}
+                    Err(refused) => {
+                        if let Some(answer) = answer {
+                            answer.send(Err(RpcError::Nvim(refused.to_string())));
+                        }
+                    }
+                }
+            }
+            let routed = self.overlay.tick(&self.editor, at);
+            self.mine.extend(routed.mine);
+            let remote = f.flow.remote_overlay().expect("the fixture is a linked window");
+            for (peer, events) in routed.linked {
+                assert_eq!(peer, PEER);
+                for event in events {
+                    match event {
+                        LinkedEvent::Answered { op_id, result } => remote.answered(op_id, result),
+                        LinkedEvent::Drawn { op_id, path, state } => {
+                            let rel = path.strip_prefix(&self.root).unwrap().to_str().unwrap();
+                            remote.review_drawn_by(op_id, rel, state);
+                        }
+                        LinkedEvent::Events { session, events } => remote.review_events(&session, events),
+                        LinkedEvent::Idle => remote.review_idle(),
+                    }
+                }
+            }
+        }
+
+        /// The linked window's live drawings, as its overlay knows them.
+        fn remote_drawings(f: &mut Fixture) -> BTreeMap<PathBuf, (String, u32)> {
+            f.flow.remote_overlay().unwrap().live_drawings().clone()
+        }
+    }
+
+    /// Steps the linked window (no editor of its own, its clock at `at`) and window 1 until `done`.
+    fn both_until(f: &mut Fixture, hub: &mut Hub, at: Instant, what: &str, done: impl Fn(&mut Fixture, &Hub) -> bool) {
+        let deadline = Instant::now() + Duration::from_secs(20);
+        loop {
+            step(f, None, at);
+            hub.serve(f);
+            if done(f, hub) {
+                return;
+            }
+            assert!(Instant::now() < deadline, "timed out waiting for {what}");
+            std::thread::sleep(Duration::from_millis(5));
+        }
+    }
+
+    fn both_for(f: &mut Fixture, hub: &mut Hub, at: Instant, rounds: usize) {
+        for _ in 0..rounds {
+            step(f, None, at);
+            hub.serve(f);
+            std::thread::sleep(Duration::from_millis(5));
+        }
+    }
+
+    /// The linked window's running turn's edit of `a.txt`, drawn in window 1's editor; its number.
+    fn linked_drawn_live(f: &mut Fixture, hub: &mut Hub, at: Instant) -> u32 {
+        let n = f.start_turn();
+        edit(f, "a.txt", FOUR_EDITED);
+        let abs = f.file("a.txt");
+        both_until(f, hub, at, "the linked window's live drawing", |f, _| {
+            Hub::remote_drawings(f).contains_key(&abs)
+        });
+        n
+    }
+
+    #[test]
+    fn linked_live_window_2s_edit_is_drawn_in_window_1s_editor() {
+        let mut f = Fixture::new("linked-live-drawn");
+        f.write("a.txt", FOUR, 0o644);
+        let mut hub = linked(&mut f);
+        let at = Instant::now();
+        let n = linked_drawn_live(&mut f, &mut hub, at);
+        let abs = f.file("a.txt");
+
+        // Asked by the shown question and by the edit's note, each one operation that also notes the turn.
+        assert!(hub.editor.count(LIVE_SHOWN_LUA) >= 1, "window 1's editor was asked");
+        for n in 0..hub.editor.count(LIVE_SHOWN_LUA) {
+            assert_eq!(
+                hub.editor.args(LIVE_SHOWN_LUA, n)[0],
+                Value::Array(vec![Value::Binary(path_bytes(&abs))]),
+                "by window 1's own absolute path"
+            );
+        }
+        assert_eq!(live_shows(&hub.editor), vec![(path_bytes(&abs), "t1".to_owned(), true)]);
+        let args = hub.editor.args(LIVE_SHOW_LUA, 0);
+        assert_eq!(meta_field(&args, "session"), Value::from(SESSION));
+        assert_eq!(meta_field(&args, "turn"), Value::from(n));
+        let note = hub.ops.iter().position(|op| *op == "review_live_note");
+        let show = hub.ops.iter().position(|op| *op == "review_live_show");
+        assert!(note.is_some() && note < show, "noted, then drawn: {:?}", hub.ops);
+
+        // Window 1's driver drew it for the linked window, which holds the session, and both know it is live.
+        assert!(hub.overlay.linked_paths(PEER).contains(&abs));
+        assert_eq!(hub.overlay.holder(SESSION), Window::Linked(PEER));
+        let live = BTreeMap::from([(abs.clone(), (SESSION.to_owned(), n))]);
+        assert_eq!(hub.overlay.live_drawings(), &live);
+        assert_eq!(Hub::remote_drawings(&mut f), live);
+        assert!(
+            !hub.mine.iter().any(|o| matches!(o, OverlayOutcome::LiveDrawn { .. })),
+            "the linked window's drawing is its own news, not window 1's"
+        );
+        f.end_turn();
+        f.shut_down();
+    }
+
+    #[test]
+    fn linked_live_two_windows_editing_one_file_contest_it() {
+        let mut f = Fixture::new("linked-live-contest");
+        f.write("a.txt", FOUR, 0o644);
+        let mut hub = linked(&mut f);
+        let abs = f.file("a.txt");
+        // Window 1's own turn, running since before the linked window's, has its edit of the file drawn live.
+        let mine = TurnKey {
+            session: HUB_SESSION.to_owned(),
+            turn_id: "h1".to_owned(),
+        };
+        hub.overlay
+            .note_live(Window::One, &mine, 1, None, std::slice::from_ref(&abs));
+        let meta = LiveMeta {
+            tab: 1,
+            session: HUB_SESSION.to_owned(),
+            turn_id: "h1".to_owned(),
+            turn: 1,
+            running: true,
+            read_lines: 4,
+        };
+        let hunk = ShowHunk::from_file_lines(1, (2, 1), (2, 1), &[b"two\n".to_vec()], &[b"TWO\n".to_vec()]);
+        hub.overlay.call(
+            &hub.editor,
+            OverlayCall::LiveShow {
+                path: abs.clone(),
+                meta,
+                hunks: vec![hunk],
+            },
+            hub.clock,
+        );
+        let at = Instant::now();
+        both_until(&mut f, &mut hub, at, "window 1's own live drawing", |_, hub| {
+            hub.overlay.live_drawings().contains_key(&abs)
+        });
+
+        // The linked window's turn edits the same file while window 1's runs.
+        f.start_turn();
+        edit(&mut f, "a.txt", FOUR_EDITED);
+        both_until(&mut f, &mut hub, at, "the linked window's live draw", |_, hub| {
+            hub.ops.contains(&"review_live_show")
+        });
+        both_for(&mut f, &mut hub, at, 10);
+        assert!(hub.overlay.is_contested(&abs));
+        assert_eq!(
+            live_shows(&hub.editor).len(),
+            1,
+            "only window 1's own drawing went up; the linked window's draw of a contested file is not sent"
+        );
+        assert_eq!(
+            live_clears(&hub.editor),
+            vec![path_bytes(&abs)],
+            "window 1's drawing is taken off"
+        );
+        assert!(hub.overlay.live_drawings().is_empty());
+        assert!(Hub::remote_drawings(&mut f).is_empty());
+        f.end_turn();
+        f.shut_down();
+    }
+
+    #[test]
+    fn linked_live_gone_clears_window_2s_drawings() {
+        let mut f = Fixture::new("linked-live-gone");
+        f.write("a.txt", FOUR, 0o644);
+        let mut hub = linked(&mut f);
+        let at = Instant::now();
+        linked_drawn_live(&mut f, &mut hub, at);
+        let abs = f.file("a.txt");
+        let clears = hub.editor.count(CLEAR_LUA);
+        hub.overlay.linked_gone(PEER);
+        for _ in 0..10 {
+            hub.clock += Duration::from_secs(1);
+            hub.overlay.tick(&hub.editor, hub.clock);
+        }
+        assert_eq!(hub.editor.count(CLEAR_LUA), clears + 1);
+        assert_eq!(
+            hub.editor.args(CLEAR_LUA, clears)[0],
+            Value::Binary(path_bytes(&abs)),
+            "the gone window's live drawing is taken off"
+        );
+        assert!(hub.overlay.live_drawings().is_empty());
+        assert!(hub.overlay.linked_paths(PEER).is_empty());
+        f.end_turn();
+        f.shut_down();
+    }
+
+    #[test]
+    fn linked_live_reverts_go_to_the_window_holding_the_session() {
+        let mut f = Fixture::new("linked-live-reverts");
+        f.write("a.txt", FOUR, 0o644);
+        let mut hub = linked(&mut f);
+        let at = Instant::now();
+        let n = linked_drawn_live(&mut f, &mut hub, at);
+        f.end_turn();
+        both_until(&mut f, &mut hub, at, "the settle's drawing", |_, hub| {
+            hub.editor.count(LIVE_SHOW_LUA) == 2
+        });
+        // Let the settle's report reach the linked window's flow.
+        both_for(&mut f, &mut hub, at, 10);
+        let abs = f.file("a.txt");
+        assert_eq!(
+            meta_field(&hub.editor.args(LIVE_SHOW_LUA, 1), "running"),
+            Value::from(false)
+        );
+        assert_eq!(Hub::remote_drawings(&mut f)[&abs], (SESSION.to_owned(), n));
+
+        let panel = panel_hunks(&f, SESSION, n, "a.txt").remove(0);
+        assert_ne!(
+            panel.header, "@@ -2 +2 @@",
+            "the panel's header is not the one counts would give"
+        );
+        hub.editor
+            .queue_event(revert_event(&f, n, "a.txt", panel.id, 2, "two", "TWO", "lf"));
+        both_until(
+            &mut f,
+            &mut hub,
+            at,
+            "the revert in the linked window's draft",
+            |f, _| !f.draft().reverts().is_empty(),
+        );
+        let records = f.draft().reverts();
+        assert_eq!(records.len(), 1);
+        assert_eq!(
+            records[0].new.hunk.as_ref().unwrap().1,
+            panel.header,
+            "recorded under the panel's header, which the settle's drawing carried"
+        );
+        assert!(
+            !hub.mine
+                .iter()
+                .any(|o| matches!(o, OverlayOutcome::Reverts(_) | OverlayOutcome::Unreverts(_))),
+            "window 1 got none of it"
+        );
+        f.shut_down();
+    }
+
+    #[test]
+    fn linked_live_panel_shows_leaves_window_1s_live_drawing() {
+        let mut f = Fixture::new("linked-live-panel");
+        f.write(
+            "a.txt",
+            b"one\ntwo\nthree\nfour\nfive\nsix\nseven\neight\nnine\n",
+            0o644,
+        );
+        let first = f.turn(|f| {
+            f.write(
+                "a.txt",
+                b"one\nTWO\nthree\nfour\nfive\nsix\nseven\neight\nnine\n",
+                0o644,
+            )
+        });
+        let mut hub = linked(&mut f);
+        let at = Instant::now();
+        let second = f.start_turn();
+        edit(
+            &mut f,
+            "a.txt",
+            b"one\nTWO\nthree\nfour\nfive\nsix\nseven\nEIGHT\nnine\n",
+        );
+        let abs = f.file("a.txt");
+        both_until(&mut f, &mut hub, at, "the linked window's live drawing", |f, _| {
+            Hub::remote_drawings(f).contains_key(&abs)
+        });
+
+        // The linked window's panel looks at the first turn of the file drawn live for the second.
+        let jobs = f.flow.jobs_started();
+        f.flow.panel_shows(&f.tabs, f.tab, first, Scope::Turn, "a.txt");
+        assert_eq!(
+            f.flow.jobs_started(),
+            jobs,
+            "nothing is read for a file drawn live for another turn"
+        );
+        both_for(&mut f, &mut hub, at, 20);
+        assert!(!hub.ops.contains(&"review_show"), "{:?}", hub.ops);
+        assert_eq!(
+            hub.editor.count(SHOW_LUA),
+            0,
+            "the live drawing in window 1's editor stays"
+        );
+        assert_eq!(hub.overlay.live_drawings()[&abs], (SESSION.to_owned(), second));
+        f.end_turn();
+        f.shut_down();
+    }
+
+    #[test]
+    fn linked_live_a_turn_that_moved_to_window_1_keeps_its_end_when_the_link_ends() {
+        let mut f = live("linked-live-moved");
+        let editor = ScriptedEditor::new();
+        let at = Instant::now();
+        f.write("a.txt", FOUR, 0o644);
+        let abs = f.file("a.txt");
+        let (me, mine) = (f.tab, f.provider.clone());
+        // The linked window noted a1 as running; then its session came to window 1, which runs the turn
+        // to its end.
+        let moved = TurnKey {
+            session: SESSION.to_owned(),
+            turn_id: "a1".to_owned(),
+        };
+        let started_ns = eitri_core::turn_review::monotonic_ns();
+        assert!(f
+            .flow
+            .note_linked_live(PEER, &moved, started_ns, None, std::slice::from_ref(&abs)));
+        begin(&mut f, &mine, SESSION, "a1");
+        edit_by(&mut f, me, &mine, "a1", "a.txt", b"one\nTWO\nthree\nfour\n");
+        live_until(&mut f, &editor, at, "a1's drawing", |_, e| e.count(LIVE_SHOW_LUA) == 1);
+        finish(&mut f, &mine, SESSION, "a1");
+        live_settled(&mut f, &editor, at);
+
+        // Another tab's turn edits the file after a1 ended.
+        let (other, provider) = second_tab(&mut f, "other-session");
+        begin(&mut f, &provider, "other-session", "b1");
+        edit_by(&mut f, other, &provider, "b1", "a.txt", b"one\nTWO\nTHREE\nfour\n");
+        live_until(&mut f, &editor, at, "b1's drawing", |_, e| e.count(LIVE_SHOW_LUA) == 2);
+        assert!(!f.flow.local_overlay().unwrap().is_contested(&abs));
+
+        // The link ends: a1 is window 1's now, and its end stays the one window 1 noted.
+        f.flow.linked_live_gone(PEER, eitri_core::turn_review::monotonic_ns());
+        assert!(
+            !f.flow.local_overlay().unwrap().is_contested(&abs),
+            "a1 ended before b1 began, whatever the link's end says"
+        );
+        finish(&mut f, &provider, "other-session", "b1");
+        f.shut_down();
+    }
+
+    #[test]
+    fn linked_live_a_note_while_window_1_has_no_editor_reaches_the_next_driver() {
+        let mut f = live("linked-live-parked");
+        let editor = ScriptedEditor::new();
+        let at = Instant::now();
+        f.write("a.txt", FOUR, 0o644);
+        let abs = f.file("a.txt");
+        let linked = TurnKey {
+            session: "linked-session".to_owned(),
+            turn_id: "l1".to_owned(),
+        };
+        let started_ns = eitri_core::turn_review::monotonic_ns();
+        assert!(f
+            .flow
+            .note_linked_live(PEER, &linked, started_ns, None, std::slice::from_ref(&abs)));
+
+        // The editor goes; the linked turn ends meanwhile, and a second one starts and the link ends.
+        f.flow.set_editor_owner(None);
+        assert!(
+            f.flow.note_linked_live(
+                PEER,
+                &linked,
+                started_ns,
+                Some(eitri_core::turn_review::monotonic_ns()),
+                &[]
+            ),
+            "a window without an editor still takes the note"
+        );
+        let gone = TurnKey {
+            session: "linked-session".to_owned(),
+            turn_id: "l2".to_owned(),
+        };
+        let started_ns = eitri_core::turn_review::monotonic_ns();
+        assert!(f
+            .flow
+            .note_linked_live(PEER, &gone, started_ns, None, std::slice::from_ref(&abs)));
+        f.flow.linked_live_gone(PEER, eitri_core::turn_review::monotonic_ns());
+        f.flow.set_editor_owner(Some(Owner::Embedded));
+
+        // A later turn of window 1's that edits the file contests neither.
+        let (me, mine) = (f.tab, f.provider.clone());
+        begin(&mut f, &mine, SESSION, "a1");
+        edit_by(&mut f, me, &mine, "a1", "a.txt", b"one\nTWO\nthree\nfour\n");
+        live_until(&mut f, &editor, at, "a1's drawing", |_, e| e.count(LIVE_SHOW_LUA) == 1);
+        assert!(!f.flow.local_overlay().unwrap().is_contested(&abs));
+        finish(&mut f, &mine, SESSION, "a1");
+        f.shut_down();
+    }
 }

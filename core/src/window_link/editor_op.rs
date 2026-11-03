@@ -8,7 +8,7 @@ use crate::editor_lines::{BufferLine, Eol};
 use crate::editor_tools::stamp::Stamp;
 use crate::editor_tools::tools::diagnostics::Severity;
 use crate::editor_tools::tools::lsp::{LspKind, UsagePart};
-use crate::review_editor::{ShowHunk, ShowMeta};
+use crate::review_editor::{LiveMeta, ShowHunk, ShowMeta};
 use crate::turn_review::Scope;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -34,6 +34,29 @@ pub enum EditorOp {
     /// Clear every file window 2 drew, and nothing window 1 drew. A struct variant with no fields, not a unit
     /// variant: serde ignores extra fields on an internally tagged unit variant, and an op must refuse them.
     ReviewClearMine {},
+    /// The turn `turn_id` of a session window 2 holds edited `paths` while it ran from `started_ns`, and until
+    /// `ended_ns` once it ended (`CLOCK_MONOTONIC` nanoseconds: both windows run on one boot). Window 1 keeps the
+    /// one table of files two turns running at once both edited; while the turn runs it also answers which of the
+    /// files a window of its editor shows, one boolean each, as the op's reply. At most
+    /// [`MAX_SHOWN_PATHS`](crate::review_editor::MAX_SHOWN_PATHS) paths, each relative to the project root.
+    ReviewLiveNote {
+        session: String,
+        turn_id: String,
+        started_ns: u64,
+        ended_ns: Option<u64>,
+        paths: Vec<String>,
+    },
+    /// Draw a turn's hunks over a file a window of the editor shows, as the agent's edits land; nvim leaves a
+    /// drawing it may not replace, and a modified buffer, as they are.
+    ReviewLiveShow {
+        path: String,
+        meta: WireLiveMeta,
+        hunks: Vec<WireHunk>,
+    },
+    /// Take window 2's live drawing of a file off: no other drawing over it, and no other window's.
+    ReviewLiveClear {
+        path: String,
+    },
     /// Whether a file (or a range of its lines, start and count) has unsaved changes in the editor.
     BufferState {
         path: String,
@@ -159,6 +182,9 @@ impl EditorOp {
             EditorOp::ReviewOpenAndShow { .. } => "review_open_and_show",
             EditorOp::ReviewClear { .. } => "review_clear",
             EditorOp::ReviewClearMine {} => "review_clear_mine",
+            EditorOp::ReviewLiveNote { .. } => "review_live_note",
+            EditorOp::ReviewLiveShow { .. } => "review_live_show",
+            EditorOp::ReviewLiveClear { .. } => "review_live_clear",
             EditorOp::BufferState { .. } => "buffer_state",
             EditorOp::PluginOpen { .. } => "plugin_open",
             EditorOp::PluginAssistApply { .. } => "plugin_assist_apply",
@@ -297,6 +323,19 @@ pub struct WireMeta {
     pub scope: WireScope,
 }
 
+/// A live drawing's meta as it travels: the turn by its id and its number, whether it still runs, and how many
+/// lines the file had when its hunks were made.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct WireLiveMeta {
+    pub tab: u64,
+    pub session: String,
+    pub turn_id: String,
+    pub turn: u32,
+    pub running: bool,
+    pub read_lines: u64,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum WireEol {
@@ -349,6 +388,32 @@ impl From<WireMeta> for ShowMeta {
                 WireScope::Turn => Scope::Turn,
                 WireScope::Session => Scope::Session,
             },
+        }
+    }
+}
+
+impl From<&LiveMeta> for WireLiveMeta {
+    fn from(meta: &LiveMeta) -> Self {
+        WireLiveMeta {
+            tab: meta.tab,
+            session: meta.session.clone(),
+            turn_id: meta.turn_id.clone(),
+            turn: meta.turn,
+            running: meta.running,
+            read_lines: meta.read_lines,
+        }
+    }
+}
+
+impl From<WireLiveMeta> for LiveMeta {
+    fn from(meta: WireLiveMeta) -> Self {
+        LiveMeta {
+            tab: meta.tab,
+            session: meta.session,
+            turn_id: meta.turn_id,
+            turn: meta.turn,
+            running: meta.running,
+            read_lines: meta.read_lines,
         }
     }
 }
@@ -420,6 +485,17 @@ mod tests {
         }
     }
 
+    fn live_meta() -> WireLiveMeta {
+        WireLiveMeta {
+            tab: 4,
+            session: "s-1".into(),
+            turn_id: "t-9".into(),
+            turn: 2,
+            running: true,
+            read_lines: 40,
+        }
+    }
+
     fn stamp() -> WireStamp {
         WireStamp {
             deadline_ms: 1_700_000_000_000,
@@ -470,6 +546,28 @@ mod tests {
                 path: "src/a.rs".into(),
             },
             EditorOp::ReviewClearMine {},
+            EditorOp::ReviewLiveNote {
+                session: "s-1".into(),
+                turn_id: "t-9".into(),
+                started_ns: 10,
+                ended_ns: None,
+                paths: vec!["src/a.rs".into(), "dir with space/\u{4e2d}.rs".into()],
+            },
+            EditorOp::ReviewLiveNote {
+                session: "s-1".into(),
+                turn_id: "t-9".into(),
+                started_ns: 10,
+                ended_ns: Some(20),
+                paths: vec![],
+            },
+            EditorOp::ReviewLiveShow {
+                path: "src/a.rs".into(),
+                meta: live_meta(),
+                hunks: vec![hunk()],
+            },
+            EditorOp::ReviewLiveClear {
+                path: "src/a.rs".into(),
+            },
             EditorOp::BufferState {
                 path: "src/a.rs".into(),
                 lines: Some((3, 2)),
@@ -564,6 +662,9 @@ mod tests {
             r#"{"op":"exec_lua","code":"os.exit()"}"#,
             r#"{"op":"review_clear","path":"a","code":"x"}"#,
             r#"{"op":"review_clear_mine","lua":"x"}"#,
+            r#"{"op":"review_live_note","session":"s","turn_id":"t","started_ns":1,"ended_ns":null,"paths":[],"lua":"x"}"#,
+            r#"{"op":"review_live_clear","path":"a","code":"x"}"#,
+            r#"{"op":"review_live_show","path":"a","meta":{"tab":1,"session":"s","turn_id":"t","turn":1,"running":true,"read_lines":1,"lua":"x"},"hunks":[]}"#,
             r#"{"path":"a"}"#,
             r#"{"op":"plugin_open","plugin":"demo","path":"a.rs","line":null,"col":null}"#,
             r#"{"op":"agent_open","session":"s","path":"a","line":null,"end_line":null,"load":false,"stamp":{"deadline_ms":1,"scope":"a","seq":1},"lua":"x"}"#,
@@ -662,5 +763,7 @@ mod tests {
         let m: ShowMeta = session.clone().into();
         assert_eq!(m.scope, Scope::Session);
         assert_eq!(WireMeta::from(&m), session);
+        let live: LiveMeta = live_meta().into();
+        assert_eq!(WireLiveMeta::from(&live), live_meta());
     }
 }

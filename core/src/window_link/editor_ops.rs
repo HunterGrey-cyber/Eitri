@@ -9,20 +9,23 @@
 //! nothing here: the session, each path, the stamp and, for a load, the file are all checked again, so this window
 //! admits only project paths that follow no link, however the tab's own judgement went.
 //!
-//! The only constant named here is the buffer-state chunk; the plugin ops go through the plugin host's own
-//! functions and the agent ops through their tools' own `send`, `ask` or `collect`. A scan in
-//! `core/tests/editor_rpc_scan.rs` holds this file to that.
+//! The only constants named here are the buffer-state chunk and the standalone shown question a live note asks;
+//! the plugin ops go through the plugin host's own functions and the agent ops through their tools' own `send`,
+//! `ask` or `collect`. A scan in `core/tests/editor_rpc_scan.rs` holds this file to that.
 
 use std::collections::BTreeMap;
 use std::fmt;
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
 use std::time::Duration;
 
 use crate::editor_rpc::EditorRpc;
 use crate::editor_tools::stamp::{wall_ms, Stamp};
 use crate::nvim_rpc::Pending;
 use crate::plugin::roots::{file_inside, Roots};
-use crate::review_editor::{linked_request_id, OverlayCall, ShowHunk, ShowMeta};
+use crate::review_editor::{
+    linked_request_id, live_shown_args, LiveMeta, OverlayCall, ShowHunk, ShowMeta, LIVE_SHOWN_LUA, MAX_SHOWN_PATHS,
+};
+use crate::turn_review::live_contest::TurnKey;
 use crate::turn_review::revert::{buffer_state_args, BUFFER_STATE_LUA};
 use crate::turn_review::write::ProjectDir;
 use crate::wm::PeerId;
@@ -74,12 +77,25 @@ pub struct FollowConfig {
     pub auto: bool,
 }
 
+/// A linked window's turn and the files it edited, for window 1's driver to note as that window's.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LiveNote {
+    pub key: TurnKey,
+    pub started_ns: u64,
+    pub ended_ns: Option<u64>,
+    /// Window 1's absolute paths.
+    pub paths: Vec<PathBuf>,
+}
+
 /// What an accepted op became.
 pub enum Dispatch {
     /// Calls for window 1's own review driver, to be tagged as window 2's before they are queued.
     Overlay(Vec<OverlayCall>),
     /// A Lua call window 1 sent; its answer is the op's reply.
     Rpc(Pending),
+    /// A note for window 1's driver, and, while the turn runs, the editor's answer to which of its files a
+    /// window shows, which is the op's reply.
+    LiveNote { note: LiveNote, shown: Option<Pending> },
 }
 
 impl fmt::Debug for Dispatch {
@@ -87,6 +103,11 @@ impl fmt::Debug for Dispatch {
         match self {
             Dispatch::Overlay(calls) => f.debug_tuple("Overlay").field(calls).finish(),
             Dispatch::Rpc(_) => f.write_str("Rpc(..)"),
+            Dispatch::LiveNote { note, shown } => f
+                .debug_struct("LiveNote")
+                .field("note", note)
+                .field("shown", &shown.as_ref().map(|_| ".."))
+                .finish(),
         }
     }
 }
@@ -162,6 +183,54 @@ pub fn dispatch(id: u64, op: EditorOp, ctx: &dyn OpContext, rpc: &dyn EditorRpc)
                 .map(|path| OverlayCall::Clear { path })
                 .collect(),
         )),
+        // The paths are checked by their text alone: this runs on window 1's GTK thread for up to a batch of
+        // paths, and nvim answers which are shown from its own buffer list, opening nothing.
+        EditorOp::ReviewLiveNote {
+            session,
+            turn_id,
+            started_ns,
+            ended_ns,
+            paths,
+        } => {
+            held_session(ctx, &session)?;
+            if paths.len() > MAX_SHOWN_PATHS {
+                return Err(OpRefused::Outside(format!(
+                    "a note names {} paths, more than {MAX_SHOWN_PATHS}",
+                    paths.len()
+                )));
+            }
+            let paths = paths
+                .iter()
+                .map(|rel| lexical_project_path(ctx, rel))
+                .collect::<Result<Vec<_>, _>>()?;
+            // Only a running turn's edits may still be drawn: an ended one's note asks nothing.
+            let shown = (ended_ns.is_none() && !paths.is_empty())
+                .then(|| rpc.exec_lua(LIVE_SHOWN_LUA, live_shown_args(&paths)));
+            Ok(Dispatch::LiveNote {
+                note: LiveNote {
+                    key: TurnKey { session, turn_id },
+                    started_ns,
+                    ended_ns,
+                    paths,
+                },
+                shown,
+            })
+        }
+        EditorOp::ReviewLiveShow { path, meta, hunks } => {
+            held_session(ctx, &meta.session)?;
+            let path = project_path(ctx, &path)?;
+            Ok(Dispatch::Overlay(vec![OverlayCall::LiveShow {
+                path,
+                meta: LiveMeta::from(meta),
+                hunks: hunks.into_iter().map(ShowHunk::from).collect(),
+            }]))
+        }
+        // Names no session: window 1's driver takes off only a live drawing this window made, and a live clear
+        // leaves any other drawing there.
+        EditorOp::ReviewLiveClear { path } => {
+            let path = project_path(ctx, &path)?;
+            Ok(Dispatch::Overlay(vec![OverlayCall::LiveClear { path }]))
+        }
         EditorOp::BufferState { path, lines } => {
             let path = project_path(ctx, &path)?;
             Ok(Dispatch::Rpc(
@@ -490,6 +559,18 @@ fn project_path(ctx: &dyn OpContext, rel: &str) -> Result<PathBuf, OpRefused> {
     }
 }
 
+/// A project path from window 2 by its text alone: relative, plain names only, no NUL. Nothing on disk is looked at.
+fn lexical_project_path(ctx: &dyn OpContext, rel: &str) -> Result<PathBuf, OpRefused> {
+    let plain = !rel.is_empty()
+        && !rel.contains('\0')
+        && Path::new(rel).components().all(|c| matches!(c, Component::Normal(_)));
+    if plain {
+        Ok(ctx.project_root().join(rel))
+    } else {
+        Err(OpRefused::Outside(format!("{rel:?} is not a path inside the project")))
+    }
+}
+
 /// A file of a plugin's work tree, canonical. The lexical and parent checks come first; then the path is
 /// canonicalised with the tree as the only root, which resolves the last component too, so a link there that
 /// leads out of the tree, or to anything but a regular file, is refused. The canonical path is what the editor
@@ -516,7 +597,9 @@ mod tests {
     use crate::nvim_rpc::RpcError;
     use crate::plugin::editor::{PLUGIN_ASSIST_LUA, PLUGIN_OPEN_LUA};
     use crate::test_scratch_dir::ScratchDir;
-    use crate::window_link::editor_op::{WireEol, WireHunk, WireLine, WireMeta, WireScope, WireUsagePart};
+    use crate::window_link::editor_op::{
+        WireEol, WireHunk, WireLine, WireLiveMeta, WireMeta, WireScope, WireUsagePart,
+    };
     use rmpv::Value;
     use std::cell::RefCell;
     use std::os::unix::fs::symlink;
@@ -1860,5 +1943,200 @@ mod tests {
             .1
             .as_u64();
         assert_eq!(limit, Some(u64::from(DIAGNOSTICS_LIMIT_MAX)));
+    }
+
+    // ---- live drawings ---------------------------------------------------------------------------------------
+
+    fn live_note(session: &str, ended_ns: Option<u64>, paths: &[&str]) -> EditorOp {
+        EditorOp::ReviewLiveNote {
+            session: session.into(),
+            turn_id: "t-3".into(),
+            started_ns: 100,
+            ended_ns,
+            paths: paths.iter().map(|p| p.to_string()).collect(),
+        }
+    }
+
+    fn live_meta(session: &str) -> WireLiveMeta {
+        WireLiveMeta {
+            tab: 3,
+            session: session.into(),
+            turn_id: "t-3".into(),
+            turn: 2,
+            running: true,
+            read_lines: 1,
+        }
+    }
+
+    fn noted(result: Result<Dispatch, OpRefused>) -> (LiveNote, Option<Pending>) {
+        match result {
+            Ok(Dispatch::LiveNote { note, shown }) => (note, shown),
+            other => panic!("expected a live note, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn live_note_refuses_a_session_not_held_a_path_outside_and_257_paths() {
+        let f = fixture("live-note-refused");
+        let rpc = Recorder::default();
+        assert_eq!(
+            dispatch(1, live_note("s-other", None, &["src/a.rs"]), &f.ctx, &rpc).unwrap_err(),
+            OpRefused::SessionNotHeld("s-other".into())
+        );
+        for path in ["../x", "/etc/passwd", "", "./src/a.rs", "src/../a/b", "a\0b"] {
+            let result = dispatch(1, live_note("s-held", None, &["src/a.rs", path]), &f.ctx, &rpc);
+            assert!(
+                matches!(result, Err(OpRefused::Outside(_))),
+                "a note naming {path:?} was not refused as outside: {result:?}"
+            );
+        }
+        let many: Vec<String> = (0..=MAX_SHOWN_PATHS).map(|n| format!("src/{n}.rs")).collect();
+        let many: Vec<&str> = many.iter().map(String::as_str).collect();
+        assert!(matches!(
+            dispatch(1, live_note("s-held", None, &many), &f.ctx, &rpc),
+            Err(OpRefused::Outside(_))
+        ));
+        assert!(rpc.calls().is_empty(), "a refused note reached the editor");
+
+        // One batch is what a note may carry; window 1 asks about all of it.
+        let (note, shown) = noted(dispatch(1, live_note("s-held", None, &many[1..]), &f.ctx, &rpc));
+        assert_eq!(note.paths.len(), MAX_SHOWN_PATHS);
+        assert!(shown.is_some());
+        let calls = rpc.calls();
+        assert_eq!(calls.len(), 1);
+        assert!(std::ptr::eq(calls[0].0, LIVE_SHOWN_LUA));
+        assert_eq!(calls[0].1, live_shown_args(&note.paths));
+
+        // The live draw and clear are a review's: the session, then the path, as a show's are.
+        let show = EditorOp::ReviewLiveShow {
+            path: "src/a.rs".into(),
+            meta: live_meta("s-other"),
+            hunks: vec![hunk()],
+        };
+        assert_eq!(
+            dispatch(1, show, &f.ctx, &rpc).unwrap_err(),
+            OpRefused::SessionNotHeld("s-other".into())
+        );
+        for path in ["../x", "out/passwd", "src/secret.rs", "src/alias.rs", ""] {
+            let show = EditorOp::ReviewLiveShow {
+                path: path.into(),
+                meta: live_meta("s-held"),
+                hunks: vec![hunk()],
+            };
+            let clear = EditorOp::ReviewLiveClear { path: path.into() };
+            for op in [show, clear] {
+                let name = op.name();
+                let result = dispatch(1, op, &f.ctx, &rpc);
+                assert!(
+                    matches!(result, Err(OpRefused::Outside(_))),
+                    "{name} of {path:?} was not refused as outside: {result:?}"
+                );
+            }
+        }
+        assert_eq!(rpc.calls().len(), 1, "a refused live op reached the editor");
+    }
+
+    #[test]
+    fn live_note_after_the_end_asks_nothing() {
+        let f = fixture("live-note-ended");
+        let rpc = Recorder::default();
+        let (note, shown) = noted(dispatch(
+            1,
+            live_note("s-held", Some(250), &["src/a.rs", "a/b"]),
+            &f.ctx,
+            &rpc,
+        ));
+        assert!(shown.is_none(), "an ended turn's note asks the editor nothing");
+        assert!(rpc.calls().is_empty());
+        assert_eq!(
+            note,
+            LiveNote {
+                key: TurnKey {
+                    session: "s-held".into(),
+                    turn_id: "t-3".into(),
+                },
+                started_ns: 100,
+                ended_ns: Some(250),
+                paths: vec![f.ctx.root.join("src/a.rs"), f.ctx.root.join("a/b")],
+            }
+        );
+
+        // While the turn runs the same note asks, and the arguments are window 1's own.
+        let (note, shown) = noted(dispatch(1, live_note("s-held", None, &["src/a.rs"]), &f.ctx, &rpc));
+        assert!(shown.is_some());
+        assert_eq!(note.ended_ns, None);
+        let calls = rpc.calls();
+        assert_eq!(calls.len(), 1);
+        assert!(std::ptr::eq(calls[0].0, LIVE_SHOWN_LUA));
+        assert_eq!(calls[0].1, live_shown_args(&[f.ctx.root.join("src/a.rs")]));
+
+        // A running turn's note with no path has nothing to ask.
+        let (_, shown) = noted(dispatch(1, live_note("s-held", None, &[]), &f.ctx, &rpc));
+        assert!(shown.is_none());
+        assert_eq!(rpc.calls().len(), 1);
+    }
+
+    #[test]
+    fn live_note_touches_no_file_system() {
+        // A root that is not there at all: a check that looked at the disk would refuse every path.
+        let f = fixture("live-note-no-disk");
+        let ctx = Ctx {
+            root: f.ctx.root.join("not-here"),
+            sessions: f.ctx.sessions.clone(),
+            plugins: BTreeMap::new(),
+            drawn: vec![],
+        };
+        let rpc = Recorder::default();
+        let paths = [
+            "missing/dir/file.rs",
+            "out/passwd",
+            "src/secret.rs",
+            ".git/config",
+            "dir with space/\u{4e2d}.rs",
+            "new\nline.rs",
+        ];
+        let (note, shown) = noted(dispatch(1, live_note("s-held", None, &paths), &ctx, &rpc));
+        assert!(shown.is_some(), "answered, not refused");
+        assert_eq!(
+            note.paths,
+            paths.iter().map(|p| ctx.root.join(p)).collect::<Vec<_>>(),
+            "each path is the project's by its text alone"
+        );
+    }
+
+    #[test]
+    fn live_show_and_clear_become_window_1s_driver_calls() {
+        let f = fixture("live-overlay");
+        let rpc = Recorder::default();
+        let abs = f.ctx.root.join("src/a.rs");
+        let show = EditorOp::ReviewLiveShow {
+            path: "src/a.rs".into(),
+            meta: live_meta("s-held"),
+            hunks: vec![hunk()],
+        };
+        assert_eq!(
+            overlay(dispatch(5, show, &f.ctx, &rpc)),
+            vec![OverlayCall::LiveShow {
+                path: abs.clone(),
+                meta: LiveMeta::from(live_meta("s-held")),
+                hunks: vec![ShowHunk::from(hunk())],
+            }]
+        );
+        // A clear names no session: window 1's driver takes off only a live drawing this window made.
+        assert_eq!(
+            overlay(dispatch(
+                6,
+                EditorOp::ReviewLiveClear {
+                    path: "src/a.rs".into()
+                },
+                &f.ctx,
+                &rpc
+            )),
+            vec![OverlayCall::LiveClear { path: abs }]
+        );
+        assert!(
+            rpc.calls().is_empty(),
+            "the live draw and clear send no Lua of their own"
+        );
     }
 }
