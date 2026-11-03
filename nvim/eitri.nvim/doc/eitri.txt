@@ -1,4 +1,4 @@
-*eitri.nvim*  Eitri's agent panel beside your terminal nvim
+*eitri.nvim*  Eitri's agent panel and pages beside your nvim
 
 ==============================================================================
 CONTENTS                                                        *eitri-contents*
@@ -9,13 +9,14 @@ CONTENTS                                                        *eitri-contents*
   4. Navigators ......................... |eitri.edge()|
   5. Inside tmux ........................ |eitri-tmux|
   6. Window manager ..................... |eitri-wm|
+  7. Health check ....................... |eitri-health|
 
 ==============================================================================
 1. INSTALL                                                      *eitri-install*
 
-The plugin is a thin launcher: it starts `eitri panel` and tells it which nvim
-to attach to. Everything the panel needs inside nvim, it installs itself when
-it attaches, so the plugin and the installed Eitri never have to match
+The plugin is a thin launcher: it starts `eitri panel` or `eitri page` and
+tells it which nvim to attach to. Each window installs the glue it needs
+when it attaches, so the plugin and the installed Eitri never have to match
 versions.
 
 Eitri ships the plugin with its packages and its tarball installer. With
@@ -51,6 +52,21 @@ Without a plugin manager, add the directory to 'runtimepath':
                         panel is already attached to, it only raises the
                         panel: drafts being edited here stay open.
 
+                                                                  *:EitriPage*
+:EitriPage {id} [dir]   Open a plugin page beside this nvim, following its
+                        buffer. Completion lists the available page ids.
+                        [dir] defaults to the current working directory.
+                        A server address is started when needed. Closing this
+                        nvim closes its page windows; closing a page leaves
+                        nvim running. In Eitri's own nvim, use the prefix and
+                        the page's key instead.
+
+                                                                *eitri.page()*
+require("eitri").page({id}, {dir})
+
+The Lua form of :EitriPage; {dir} is optional. An older Eitri that has no page
+windows shows an update message and opens nothing.
+
 If `eitri` cannot be run, or the panel refuses, the reason is shown as an
 error message. Once the panel is up it writes its output to a log file of its
 own (under `~/.local/state/eitri/companion/`), so it keeps running after this
@@ -59,11 +75,14 @@ nvim quits; if it fails later, the message names that log.
 ==============================================================================
 3. SETUP                                                         *eitri-setup*
 
-Calling setup is optional.
+Calling setup is optional.                       *eitri-page_mappings*
 >lua
   require("eitri").setup({
     cmd = "eitri",      -- the launcher to run
     mapping = "<leader>ep",  -- a normal-mode map for :EitriPanel; none by default
+    page_mappings = {        -- normal-mode maps; empty by default
+      ["<leader>em"] = "markdown",
+    },
   })
 <
 ==============================================================================
@@ -82,6 +101,18 @@ window's own tiling (the next module, or the neighbouring window). Any other
 word than the four directions returns false and sends nothing. If both a panel
 and a window are there, the panel is asked first.
 
+edge() does not look at nvim's own windows. Call it only at nvim's edge.
+Without a navigator plugin, move within nvim first and hand off only when the
+window number did not change:
+>lua
+  vim.keymap.set("n", "<C-l>", function()
+    local before = vim.fn.winnr()
+    vim.cmd.wincmd("l")
+    if vim.fn.winnr() == before then
+      require("eitri").edge("right")
+    end
+  end)
+<
 For smart-splits.nvim, call it from the `at_edge` callback:
 >lua
   require("smart-splits").setup({
@@ -156,5 +187,17 @@ panel or in its editor.
 To start Neovide and the panel together, run `eitri split [DIR]` in a shell:
 it starts Neovide with nvim on a private socket and attaches the panel to it.
 The panel closes when that Neovide exits; closing the panel leaves Neovide.
+
+==============================================================================
+7. HEALTH CHECK                                                *eitri-health*
+
+:checkhealth eitri
+
+Finds the configured cmd (or eitri on PATH), prints its version, and lists the
+page ids returned by `eitri page --list`. It reports an older Eitri without
+page support. The health module loads only when called. Eager loading the
+plugin registers two commands and one loaded flag; no maps, autocommands or
+timers are installed until requested. Nothing of Eitri runs in this nvim
+until a command is used.
 
 vim:tw=78:ts=8:ft=help:norl:

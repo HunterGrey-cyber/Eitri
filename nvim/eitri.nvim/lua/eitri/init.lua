@@ -1,10 +1,91 @@
 local M = {}
-local config = { cmd = "eitri", mapping = nil }
+local config = { cmd = "eitri", mapping = nil, page_mappings = {} }
+local torn = false
+local page_ids, completion_leave
+
+function M.teardown()
+  torn = true
+  page_ids = nil
+  if completion_leave then
+    pcall(vim.api.nvim_del_autocmd, completion_leave)
+    completion_leave = nil
+  end
+end
+
+function M.program()
+  return config.cmd
+end
 
 function M.setup(opts)
   config = vim.tbl_extend("force", config, opts or {})
   if config.mapping then
     vim.keymap.set("n", config.mapping, function() M.panel() end, { desc = "Eitri: agent panel" })
+  end
+  for lhs, id in pairs(config.page_mappings) do
+    vim.keymap.set("n", lhs, function() M.page(id) end, { desc = "Eitri: page " .. id })
+  end
+end
+
+-- Completion asks the installed program, so the launcher keeps no plugin catalogue of its own.
+function M.complete_pages(lead, line, pos)
+  if torn then return {} end
+  if line:sub(1, pos):match("^%s*EitriPage%s+%S+%s+") then
+    return vim.fn.getcompletion(lead, "dir")
+  end
+  if page_ids == nil then
+    local ok, ids = pcall(vim.fn.systemlist, { config.cmd, "page", "--list" })
+    page_ids = ok and vim.v.shell_error == 0 and ids or {}
+    completion_leave = vim.api.nvim_create_autocmd("CmdlineLeave", {
+      once = true,
+      callback = function()
+        if torn then return end
+        page_ids, completion_leave = nil, nil
+      end,
+    })
+  end
+  local matches = {}
+  for _, id in ipairs(page_ids) do
+    if id:sub(1, #lead) == lead then table.insert(matches, id) end
+  end
+  return matches
+end
+
+function M.page(id, dir)
+  if type(rawget(_G, "__eitri_window")) == "table" then
+    vim.notify("this window opens pages itself: press the prefix and the page's key", vim.log.levels.ERROR)
+    return
+  end
+  local addr = vim.v.servername
+  if addr == nil or addr == "" then
+    addr = vim.fn.serverstart()
+  end
+  local stderr = {}
+  local ok, job = pcall(vim.fn.jobstart, { config.cmd, "page", id, "--nvim", addr, "--", dir or vim.fn.getcwd() }, {
+    detach = true,
+    stderr_buffered = true,
+    on_stderr = function(_, data)
+      if torn then return end
+      stderr = data or {}
+    end,
+    on_exit = function(_, code)
+      if torn then return end
+      if code ~= 0 then
+        vim.schedule(function()
+          if torn then return end
+          local text = vim.trim(table.concat(stderr, "\n"))
+          if code == 64 and text:find("unknown option --nvim", 1, true) then
+            vim.notify("eitri page: this Eitri has no page windows yet; update Eitri", vim.log.levels.ERROR)
+            return
+          end
+          text = text:match("([^\n]+)$") or ("exited with code " .. code)
+          if not text:find("^eitri page:") then text = "eitri page: " .. text end
+          vim.notify(text, vim.log.levels.ERROR)
+        end)
+      end
+    end,
+  })
+  if not ok or job <= 0 then
+    vim.notify("eitri: could not run `" .. config.cmd .. "`", vim.log.levels.ERROR)
   end
 end
 
@@ -19,10 +100,15 @@ function M.panel(dir)
   local ok, job = pcall(vim.fn.jobstart, { config.cmd, "panel", "--nvim", addr, "--", dir or vim.fn.getcwd() }, {
     detach = true,
     stderr_buffered = true,
-    on_stderr = function(_, data) stderr = data or {} end,
+    on_stderr = function(_, data)
+      if torn then return end
+      stderr = data or {}
+    end,
     on_exit = function(_, code)
+      if torn then return end
       if code ~= 0 then
         vim.schedule(function()
+          if torn then return end
           local text = vim.trim(table.concat(stderr, "\n"))
           if text == "" then
             text = "exited with code " .. code
