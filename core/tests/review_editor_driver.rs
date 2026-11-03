@@ -1120,6 +1120,7 @@ fn kinds(out: &[OverlayOutcome]) -> Vec<&'static str> {
             OverlayOutcome::Unreverts(_) => "unrevert",
             OverlayOutcome::Off(_) => "off",
             OverlayOutcome::Answered { .. } => "answered",
+            OverlayOutcome::LiveDrawn { .. } => "live_drawn",
         })
         .collect()
 }
@@ -1166,8 +1167,15 @@ fn an_undo_made_after_the_overlay_closed_reaches_the_host_after_the_revert_it_un
     assert_eq!(nvim.eval("getline(3)").as_str(), Some("X3"));
     overlay.call(rpc, show(&hunk), Instant::now());
     let out = collect(&mut overlay, rpc, "the events", |o| kinds(o).contains(&"unrevert"));
-    assert_eq!(kinds(&out), vec!["revert", "off", "unrevert"], "{out:?}");
-    match (&out[0], &out[2]) {
+    // The close is heard only if a drain took it before the draw that followed it was answered;
+    // either way the file is drawn.
+    let out: Vec<OverlayOutcome> = out
+        .into_iter()
+        .filter(|o| !matches!(o, OverlayOutcome::Off(_)))
+        .collect();
+    assert_eq!(kinds(&out), vec!["revert", "unrevert"], "{out:?}");
+    assert!(overlay.active_paths().contains(&path));
+    match (&out[0], &out[1]) {
         (OverlayOutcome::Reverts(r), OverlayOutcome::Unreverts(u)) => {
             assert_eq!(r[0].hunk, hunk);
             assert_eq!(u[0].hunk, hunk);
@@ -1221,11 +1229,17 @@ fn a_trailing_deletion_reverted_and_drawn_again_without_an_undo_stays_reverted()
         Instant::now(),
     );
     // The new side is still there, as the old side's start, and so is the old side: nothing says
-    // the revert was undone.
-    let out = collect(&mut overlay, rpc, "the events", |o| kinds(o).contains(&"off"));
-    assert_eq!(kinds(&out), vec!["revert", "off"], "{out:?}");
+    // the revert was undone. The close is heard only if a drain took it before the draw again was
+    // answered; either way the file is drawn.
+    let mut out = collect(&mut overlay, rpc, "the events", |o| kinds(o).contains(&"revert"));
     std::thread::sleep(Duration::from_millis(700));
-    assert!(overlay.tick(rpc, Instant::now()).mine.is_empty());
+    out.extend(overlay.tick(rpc, Instant::now()).mine);
+    assert_eq!(
+        kinds(&out).into_iter().filter(|k| *k != "off").collect::<Vec<_>>(),
+        vec!["revert"],
+        "{out:?}"
+    );
+    assert!(overlay.active_paths().contains(&path));
     drop(nvim);
     let _ = std::fs::remove_dir_all(&dir);
 }

@@ -2659,6 +2659,32 @@ fn no_message_from_a_live_draw_a_skip_or_a_timer_reload() {
 
 #[test]
 #[ignore = "needs nvim"]
+fn a_reload_in_a_live_draw_that_then_leaves_the_file_says_the_old_drawing_went() {
+    let mut fx = Fx::new("live-reload-left");
+    let (path, two) = live_two(&mut fx);
+    assert_eq!(count(&live_show(&mut fx, &path, "t1", 32, &two.hunks), "drawn"), 2);
+    // The person's own autocommand modifies the buffer once it is reloaded, so the new drawing is
+    // not made.
+    fx.nvim.lua(
+        "vim.api.nvim_create_autocmd('FileChangedShellPost', { once = true, callback = function(a) \
+         vim.api.nvim_buf_set_lines(a.buf, 0, 0, false, { 'added' }) end })",
+        vec![],
+    );
+    std::fs::write(&path, &two.base).unwrap();
+    let answer = live_show(&mut fx, &path, "t1", 30, &[]);
+    assert_eq!(get(&answer, "left"), &Value::from(true));
+    assert_eq!(fx.marks().count, 0);
+    let events = fx.events();
+    assert_eq!(events.len(), 1);
+    assert_eq!(text(get(&events[0], "kind")), "off");
+    assert_eq!(text(get(&events[0], "why")), "reload");
+    // Its number is the answer's: an answer that drew the file after it would carry a later one.
+    assert_eq!(get(&events[0], "seq"), get(&answer, "off_seq"));
+    assert_eq!(get(&answer, "off_seq"), &Value::from(1));
+}
+
+#[test]
+#[ignore = "needs nvim"]
 fn an_empty_live_overlay_is_removed_with_its_keys() {
     let mut fx = Fx::new("live-empty-overlay");
     let (path, two) = live_two(&mut fx);

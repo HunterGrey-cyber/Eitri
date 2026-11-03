@@ -98,6 +98,9 @@ local state = {
   kept_turns = {},
   kept_count = 0,
   reloading = {},
+  -- How many `off` events were ever queued. Each carries its number and every answer the latest, so
+  -- the host can tell an `off` queued before an answer that drew the file again from one after it.
+  off_seq = 0,
   -- Hunks reverted in a buffer whose overlay went away before their text came back, so nothing
   -- followed them: `{ path, meta, hunk }`, oldest first. A later show that draws one over its new
   -- text learns the revert was undone (`take_forgotten`).
@@ -122,6 +125,7 @@ end
 local function status(answer)
   answer.active = active_count()
   answer.pending = #state.events
+  answer.off_seq = state.off_seq
   answer.live_only = true
   for _, ov in pairs(state.overlays) do
     if not ov.live then
@@ -512,6 +516,11 @@ local function restore_keys(buf, ov)
   end)
 end
 
+local function queue_off(path, why)
+  state.off_seq = state.off_seq + 1
+  state.events[#state.events + 1] = { kind = 'off', path = path, why = why, seq = state.off_seq }
+end
+
 -- Takes the overlay off `buf`. With `why`, an `off` event says so; without, the host asked for it.
 remove_overlay = function(buf, why)
   local ov = state.overlays[buf]
@@ -531,7 +540,7 @@ remove_overlay = function(buf, why)
   restore_keys(buf, ov)
   if ov.live then remove_commands(buf) end
   if why then
-    state.events[#state.events + 1] = { kind = 'off', path = ov.path, why = why }
+    queue_off(ov.path, why)
   end
   if active_count() == 0 then
     unwatch()
@@ -1178,6 +1187,7 @@ function state.live_show(path, meta, hunks)
   end
   local autoread = api.nvim_get_option_value('autoread', { buf = buf })
   if autoread == nil or autoread == -1 then autoread = vim.o.autoread end
+  local before = state.overlays[buf]
   if autoread then
     state.reloading[buf] = true
     pcall(api.nvim_cmd, { cmd = 'checktime', args = { tostring(buf) } }, {})
@@ -1185,9 +1195,10 @@ function state.live_show(path, meta, hunks)
   end
   -- Reload autocommands belong to the person's configuration and can change either buffer state.
   answer.shown = is_shown(buf)
-  if not answer.shown then return status(answer) end
-  if must_leave(buf) then
-    answer.left = true
+  if not answer.shown or must_leave(buf) then
+    answer.left = answer.shown
+    -- The reload took the old drawing off without an event, as one replacing it was due; none is.
+    if before and not state.overlays[buf] then queue_off(before.path, 'reload') end
     return status(answer)
   end
   remove_overlay(buf, nil)

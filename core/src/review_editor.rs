@@ -19,6 +19,7 @@ use serde::{Deserialize, Serialize};
 use crate::editor_lines::{to_buffer_lines, to_file_bytes, BufferLine, Eol};
 use crate::editor_rpc::EditorRpc;
 use crate::nvim_rpc::{Pending, RpcError};
+use crate::turn_review::live_contest::{LiveContest, TurnKey};
 use crate::turn_review::{Scope, MAX_OVERVIEW_DIFF_LINES};
 use crate::window_link::{Drawn, EditorOp, WireHunk, WireMeta};
 use crate::wm::PeerId;
@@ -30,7 +31,7 @@ use crate::wm::PeerId;
 pub const REVIEW_LUA: &str = concat!(include_str!("find_buf.lua"), include_str!("review.lua"));
 
 /// Bumped whenever `find_buf.lua` or `review.lua` changes.
-pub const REVIEW_LUA_VERSION: i64 = 10;
+pub const REVIEW_LUA_VERSION: i64 = 11;
 
 /// Every call into an installed module first checks that one is there, and answers
 /// `{ missing = true }` when it is not (another panel's teardown, or nvim restarted) rather than
@@ -486,6 +487,17 @@ pub enum OverlayCall {
         path: PathBuf,
     },
     ClearAll,
+    /// Draws a turn's hunks over the file as the agent's edits land, if the editor shows the file and
+    /// nothing there may not be replaced.
+    LiveShow {
+        path: PathBuf,
+        meta: LiveMeta,
+        hunks: Vec<ShowHunk>,
+    },
+    /// Takes the file's drawing off only if it is a live one.
+    LiveClear {
+        path: PathBuf,
+    },
 }
 
 /// What the driver hands back from [`EditorOverlay::tick`].
@@ -502,10 +514,25 @@ pub enum OverlayOutcome {
     Unreverts(Vec<EditorRevertEvent>),
     /// Buffers that stopped showing a review.
     Off(Vec<OffEvent>),
+    /// What a [`OverlayCall::LiveShow`] of this window's came to: `drawn` hunks are up, or none and
+    /// `left` says a drawing the live one may not replace, or a modified buffer, kept the file.
+    /// Not every live draw ends in one: a draw of a contested file is skipped or sent as a live clear,
+    /// one over a path that is not UTF-8 is refused, and one the editor twice answered without the
+    /// module fails, all without this outcome.
+    LiveDrawn {
+        path: PathBuf,
+        meta: LiveMeta,
+        drawn: u32,
+        left: bool,
+    },
 }
 
 /// How often the module's events are asked for while any buffer shows a review.
 const DRAIN_EVERY: Duration = Duration::from_millis(500);
+
+/// How often they are asked for while only live drawings are up and the module held no event at its
+/// last answer: such drawings stay until dismissed, and nothing about them is urgent.
+pub const LIVE_DRAIN_EVERY: Duration = Duration::from_secs(5);
 
 /// Which window asked for a call, drew a file or holds a session: the window that runs the driver, or the
 /// window linked to it as that peer. A window with no partner is window 1 throughout.
@@ -686,6 +713,12 @@ enum Install {
 /// drain. Each outcome goes to exactly one window ([`Routed`]): an open's answer to the window that
 /// asked, a revert or its undo to the window holding the event's session, a buffer going off to the
 /// window that drew the file.
+///
+/// **Live drawings.** A [`OverlayCall::LiveShow`] draws an agent's edits as they land; nvim keeps it
+/// off a file whose overlay is not live or follows reverted hunks, and off a modified buffer. The
+/// driver also keeps, for every window, which paths two turns running at once both edited
+/// ([`EditorOverlay::note_live`]): such a path is contested, its live drawing is cleared and no
+/// other goes out, since each turn's diff would show the other agent's change as its own.
 pub struct EditorOverlay {
     owner: Owner,
     install: Install,
@@ -721,10 +754,38 @@ pub struct EditorOverlay {
     /// Outcomes decided between two ticks.
     done: Vec<OverlayOutcome>,
     linked: BTreeMap<PeerId, Vec<LinkedEvent>>,
+    /// The paths each turn edited while it ran, from every window's notes.
+    contest: LiveContest,
+    /// The drawn files whose drawing is a live one, with the session and turn it shows.
+    live_drawings: BTreeMap<PathBuf, (String, u32)>,
+    /// The window that drew each of `live_drawings`.
+    live_windows: BTreeMap<PathBuf, Window>,
+    /// The module's last answer said every overlay up is a live one.
+    live_only: bool,
+    /// How many events the module held at its last answer.
+    pending: u64,
+    /// For each file an answer drew or cleared, how many `off` events the module had queued by then:
+    /// one numbered up to that is about a drawing that answer already replaced or took off.
+    off_seq_at: BTreeMap<PathBuf, u64>,
+    /// The `off` count in the call answer being handled.
+    answer_off_seq: Option<u64>,
+}
+
+/// What becomes of a queued call when its turn to go out comes.
+enum Due {
+    Send,
+    /// A live draw of a contested file whose live drawing is this window's: that drawing goes instead.
+    ClearInstead,
+    /// Nothing to send: a live draw of a contested file, or a live clear of a file this window has no
+    /// live drawing over.
+    Skip,
 }
 
 /// What a window that drew nothing has drawn.
 static NOTHING_DRAWN: BTreeSet<PathBuf> = BTreeSet::new();
+
+/// What a window that draws nothing live has drawn live.
+static NO_LIVE_DRAWINGS: BTreeMap<PathBuf, (String, u32)> = BTreeMap::new();
 
 fn lookup<'a>(value: &'a Value, name: &str) -> Option<&'a Value> {
     value
@@ -754,6 +815,8 @@ fn send(rpc: &dyn EditorRpc, call: &OverlayCall) -> Pending {
         OverlayCall::Show { path, meta, hunks } => rpc.exec_lua(SHOW_LUA, show_args(path, meta, hunks)),
         OverlayCall::Clear { path } => rpc.exec_lua(CLEAR_LUA, clear_args(path)),
         OverlayCall::ClearAll => rpc.exec_lua(CLEAR_ALL_LUA, Vec::new()),
+        OverlayCall::LiveShow { path, meta, hunks } => rpc.exec_lua(LIVE_SHOW_LUA, live_show_args(path, meta, hunks)),
+        OverlayCall::LiveClear { path } => rpc.exec_lua(LIVE_CLEAR_LUA, clear_args(path)),
     }
 }
 
@@ -789,6 +852,98 @@ impl EditorOverlay {
             gone: BTreeSet::new(),
             done: Vec::new(),
             linked: BTreeMap::new(),
+            contest: LiveContest::new(),
+            live_drawings: BTreeMap::new(),
+            live_windows: BTreeMap::new(),
+            live_only: false,
+            pending: 0,
+            off_seq_at: BTreeMap::new(),
+            answer_off_seq: None,
+        }
+    }
+
+    /// Notes that the turn `key` edited `paths` while it ran from `started_ns`, and until `ended_ns`
+    /// once it ended. Every window's notes go into one table, whichever window `from` sent them: a
+    /// file two turns running at once both edited is contested, and its live drawing, drawn or on its
+    /// way, is cleared by the next tick. The table is decided from edits, so the editor going away
+    /// leaves it as it was.
+    pub fn note_live(
+        &mut self,
+        _from: Window,
+        key: &TurnKey,
+        started_ns: u64,
+        ended_ns: Option<u64>,
+        paths: &[PathBuf],
+    ) {
+        let paths: BTreeSet<&PathBuf> = paths.iter().collect();
+        let before: BTreeSet<&PathBuf> = paths
+            .iter()
+            .copied()
+            .filter(|path| self.contest.is_contested(path))
+            .collect();
+        for path in &paths {
+            self.contest.note_edit(key, started_ns, path);
+        }
+        if let Some(ended_ns) = ended_ns {
+            self.contest.note_end(key, ended_ns);
+        }
+        for path in paths {
+            if !before.contains(path) && self.contest.is_contested(path) {
+                self.clear_contested(path);
+            }
+        }
+    }
+
+    /// Queues a live clear of `path` for each window that drew it live or has a live draw of it
+    /// in flight: that answer may still put a drawing up. A live draw still queued is stopped when
+    /// its turn comes ([`Due`]).
+    fn clear_contested(&mut self, path: &Path) {
+        let mut windows: BTreeSet<Window> = self.live_windows.get(path).copied().into_iter().collect();
+        for flight in &self.in_flight {
+            if let OverlayCall::LiveShow { path: drawn, .. } = &flight.queued.call {
+                if drawn == path {
+                    windows.insert(flight.queued.from);
+                }
+            }
+        }
+        for window in windows {
+            self.enqueue(
+                OverlayCall::LiveClear {
+                    path: path.to_path_buf(),
+                },
+                window,
+            );
+        }
+    }
+
+    /// The files drawn live, each with the session and turn it shows, whichever window drew it.
+    pub fn live_drawings(&self) -> &BTreeMap<PathBuf, (String, u32)> {
+        &self.live_drawings
+    }
+
+    fn forget_live(&mut self, path: &Path) {
+        self.live_drawings.remove(path);
+        self.live_windows.remove(path);
+    }
+
+    fn forget_live_drawings(&mut self) {
+        self.live_drawings.clear();
+        self.live_windows.clear();
+    }
+
+    /// Whether `queued` goes out as it is when its turn comes. Every call before it is answered by
+    /// then, so which window's live drawing is over a file is known.
+    fn due(&self, queued: &Queued) -> Due {
+        match &queued.call {
+            OverlayCall::LiveShow { path, .. } if self.contest.is_contested(path) => {
+                if self.live_windows.get(path) == Some(&queued.from) {
+                    Due::ClearInstead
+                } else {
+                    Due::Skip
+                }
+            }
+            OverlayCall::LiveClear { path } if self.live_windows.get(path) != Some(&queued.from) => Due::Skip,
+            _ => Due::Send,
         }
     }
 
@@ -825,14 +980,19 @@ impl EditorOverlay {
             OverlayCall::OpenAndShow {
                 path, hunks: Some(_), ..
             }
-            | OverlayCall::Show { path, .. } => Some(path),
+            | OverlayCall::Show { path, .. }
+            | OverlayCall::LiveShow { path, .. } => Some(path),
             _ => None,
         };
         if let Some(path) = drawn_over.filter(|path| path.to_str().is_none()) {
-            eprintln!(
-                "eitri: the review is not drawn over {}: its path is not UTF-8",
-                path.display()
-            );
+            // A live draw is asked for at every edit of the file, unasked by the person: one line
+            // per edit would say nothing new.
+            if !matches!(call, OverlayCall::LiveShow { .. }) {
+                eprintln!(
+                    "eitri: the review is not drawn over {}: its path is not UTF-8",
+                    path.display()
+                );
+            }
             self.fail(
                 from,
                 call,
@@ -842,8 +1002,13 @@ impl EditorOverlay {
         }
         // The window that draws a session's turn holds that session; a move changes it only when
         // the move is decided (`release_session`).
-        if let OverlayCall::OpenAndShow { meta, .. } | OverlayCall::Show { meta, .. } = &call {
-            self.holders.insert(meta.session.clone(), from);
+        let session = match &call {
+            OverlayCall::OpenAndShow { meta, .. } | OverlayCall::Show { meta, .. } => Some(&meta.session),
+            OverlayCall::LiveShow { meta, .. } => Some(&meta.session),
+            _ => None,
+        };
+        if let Some(session) = session {
+            self.holders.insert(session.clone(), from);
         }
         self.poll_in_flight();
         self.poll_install();
@@ -902,8 +1067,11 @@ impl EditorOverlay {
         self.active = 0;
         self.more_events = false;
         self.drain_owed = false;
+        self.live_only = false;
+        self.pending = 0;
         self.active_paths.clear();
         self.forget_linked_paths();
+        self.forget_live_drawings();
         self.done.clear();
     }
 
@@ -998,8 +1166,12 @@ impl EditorOverlay {
         self.active = 0;
         self.more_events = false;
         self.drain_owed = false;
+        self.live_only = false;
+        self.pending = 0;
+        self.off_seq_at.clear();
         self.active_paths.clear();
         self.forget_linked_paths();
+        self.forget_live_drawings();
     }
 
     fn forget_linked_paths(&mut self) {
@@ -1080,7 +1252,10 @@ impl EditorOverlay {
     }
 
     /// `path` is drawn now by the window `by`; what another window drew there is gone.
+    /// A live drawing over `path` is put back after this by the caller that drew it.
     fn draw(&mut self, path: PathBuf, by: Window, op_id: Option<u64>, state: Drawn) {
+        self.forget_live(&path);
+        self.settled(&path);
         let had_it = self.take_linked_path(&path);
         match by {
             Window::One => {
@@ -1109,6 +1284,8 @@ impl EditorOverlay {
 
     /// Nothing is drawn over `path` after a call of the window `by`.
     fn undraw(&mut self, path: PathBuf, by: Window, op_id: Option<u64>) {
+        self.forget_live(&path);
+        self.settled(&path);
         let was_mine = self.active_paths.remove(&path);
         let had_it = self.take_linked_path(&path);
         match by {
@@ -1136,6 +1313,13 @@ impl EditorOverlay {
         }
     }
 
+    /// The answer being handled said what is over `path`: an `off` queued before it is old news.
+    fn settled(&mut self, path: &Path) {
+        if let Some(seq) = self.answer_off_seq {
+            self.off_seq_at.insert(path.to_path_buf(), seq);
+        }
+    }
+
     fn requeue(&mut self, queued: Queued) {
         let at = self
             .queue
@@ -1151,8 +1335,12 @@ impl EditorOverlay {
             if n == 0 {
                 self.active_paths.clear();
                 self.forget_linked_paths();
+                self.forget_live_drawings();
             }
         }
+        // An answer that does not say counts as one that needs the fast drain.
+        self.live_only = lookup(answer, "live_only").and_then(Value::as_bool) == Some(true);
+        self.pending = lookup(answer, "pending").and_then(Value::as_u64).unwrap_or(0);
     }
 
     fn poll_in_flight(&mut self) {
@@ -1188,6 +1376,7 @@ impl EditorOverlay {
     }
 
     fn answered(&mut self, from: Window, call: OverlayCall, answer: &Value) {
+        self.answer_off_seq = lookup(answer, "off_seq").and_then(Value::as_u64);
         let was_drawn = self.active > 0;
         self.note_active(answer);
         if was_drawn && self.active == 0 {
@@ -1243,7 +1432,48 @@ impl EditorOverlay {
             OverlayCall::ClearAll => {
                 self.active_paths.clear();
                 self.forget_linked_paths();
+                self.forget_live_drawings();
             }
+            OverlayCall::LiveShow { path, meta, .. } => self.live_answered(from, path, meta, answer),
+            OverlayCall::LiveClear { path } => {
+                // Not cleared: the overlay there is not live (any more), and the drawing it stands
+                // for is someone else's to take off.
+                if lookup(answer, "cleared").and_then(Value::as_bool) == Some(true) {
+                    self.undraw(path, from, None);
+                } else {
+                    self.forget_live(&path);
+                }
+            }
+        }
+    }
+
+    /// A live draw's answer. Left, or not shown, nothing in the editor changed and neither does who
+    /// holds the file; otherwise the old drawing went and the live one, if any hunk was drawn, is up.
+    fn live_answered(&mut self, from: Window, path: PathBuf, meta: LiveMeta, answer: &Value) {
+        let live = match parse_live_show(answer) {
+            Ok(live) => live,
+            Err(why) => {
+                eprintln!("eitri: the editor's answer to a live drawing was not understood: {why}");
+                return;
+            }
+        };
+        if live.shown && !live.left {
+            if live.drawn > 0 {
+                self.draw(path.clone(), from, None, Drawn::Drawn);
+                self.live_drawings
+                    .insert(path.clone(), (meta.session.clone(), meta.turn));
+                self.live_windows.insert(path.clone(), from);
+            } else {
+                self.undraw(path.clone(), from, None);
+            }
+        }
+        if from == Window::One {
+            self.done.push(OverlayOutcome::LiveDrawn {
+                path,
+                meta,
+                drawn: live.drawn,
+                left: live.left,
+            });
         }
     }
 
@@ -1315,7 +1545,9 @@ impl EditorOverlay {
                     Err(why) => eprintln!("eitri: a review event from the editor was dropped: {why}"),
                 },
                 Some("off") => match (text(item, "path"), text(item, "why")) {
-                    (Ok(path), Ok(why)) => self.route_off(OffEvent { path, why }),
+                    (Ok(path), Ok(why)) => {
+                        self.route_off(OffEvent { path, why }, lookup(item, "seq").and_then(Value::as_u64))
+                    }
                     _ => eprintln!("eitri: a review event from the editor was dropped: unreadable off event"),
                 },
                 _ => {}
@@ -1339,9 +1571,18 @@ impl EditorOverlay {
         }
     }
 
-    /// A buffer that stopped showing a review is news for the window that drew it.
-    fn route_off(&mut self, off: OffEvent) {
+    /// A buffer that stopped showing a review is news for the window that drew it, unless a call's
+    /// answer drew or cleared the file after the event was queued: the drawing it is about is gone
+    /// already, and the one up now, if any, stays.
+    fn route_off(&mut self, off: OffEvent, seq: Option<u64>) {
         let path = PathBuf::from(OsStr::from_bytes(off.path.as_bytes()));
+        if let (Some(seq), Some(at)) = (seq, self.off_seq_at.get(&path)) {
+            if seq <= *at {
+                return;
+            }
+        }
+        self.off_seq_at.remove(&path);
+        self.forget_live(&path);
         if let Some(holder) = self.take_linked_path(&path) {
             self.push_off(holder, path);
         } else {
@@ -1374,6 +1615,13 @@ impl EditorOverlay {
         match self.install {
             Install::Installing { .. } => {}
             Install::None => {
+                // Nothing is drawn while nothing is installed: a live clear has nothing to take off
+                // and a contested live draw nothing to clear, so calls that are only these install
+                // nothing. Behind any other call they wait: a live draw put back ahead of them may
+                // still draw what they clear.
+                if self.queue.iter().all(|queued| matches!(self.due(queued), Due::Skip)) {
+                    self.queue.clear();
+                }
                 if !self.queue.is_empty() {
                     let target = rpc.target();
                     let pending = rpc.exec_lua(REVIEW_LUA, install_args(self.owner));
@@ -1384,7 +1632,7 @@ impl EditorOverlay {
                 if !self.in_flight.is_empty() {
                     return;
                 }
-                while let Some(queued) = self.queue.pop_front() {
+                while let Some(mut queued) = self.queue.pop_front() {
                     // Every call before this one is answered, so who holds the file is known: a
                     // file the asking window no longer holds has nothing of that window's to clear,
                     // and the editor's clear would take the holder's overlay off.
@@ -1400,6 +1648,15 @@ impl EditorOverlay {
                                 },
                             );
                             continue;
+                        }
+                    }
+                    match self.due(&queued) {
+                        Due::Send => {}
+                        Due::Skip => continue,
+                        Due::ClearInstead => {
+                            if let OverlayCall::LiveShow { path, .. } = queued.call {
+                                queued.call = OverlayCall::LiveClear { path };
+                            }
                         }
                     }
                     let pending = send(rpc, &queued.call);
@@ -1421,13 +1678,20 @@ impl EditorOverlay {
         {
             return;
         }
+        // Only live drawings up, no event waiting at the last answer and no call on its way: the
+        // drawings stay until dismissed, and a revert there can wait a few seconds.
+        let every = if self.live_only && self.pending == 0 && self.queue.is_empty() && self.in_flight.is_empty() {
+            LIVE_DRAIN_EVERY
+        } else {
+            DRAIN_EVERY
+        };
         // Events left waiting by a full answer, or owed after the last overlay went, are asked for
         // at once, not half a second later.
         if !self.more_events
             && !self.drain_owed
             && self
                 .last_drain
-                .is_some_and(|at| now.saturating_duration_since(at) < DRAIN_EVERY)
+                .is_some_and(|at| now.saturating_duration_since(at) < every)
         {
             return;
         }
@@ -1494,6 +1758,8 @@ impl RemoteOverlay {
             }),
             OverlayCall::Clear { path } => self.relative(path).map(|path| EditorOp::ReviewClear { path }),
             OverlayCall::ClearAll => Ok(EditorOp::ReviewClearMine {}),
+            // A linked window draws nothing live through window 1 yet: nothing goes out.
+            OverlayCall::LiveShow { .. } | OverlayCall::LiveClear { .. } => return,
         };
         match op {
             Ok(op) => {
@@ -1634,6 +1900,14 @@ impl Overlay {
         match self {
             Overlay::Local(overlay) => overlay.active_paths(),
             Overlay::Remote(overlay) => overlay.active_paths(),
+        }
+    }
+
+    pub fn live_drawings(&self) -> &BTreeMap<PathBuf, (String, u32)> {
+        match self {
+            Overlay::Local(overlay) => overlay.live_drawings(),
+            // A linked window is told of no live drawing yet.
+            Overlay::Remote(_) => &NO_LIVE_DRAWINGS,
         }
     }
 
@@ -1931,9 +2205,10 @@ mod tests {
 
     use crate::nvim_rpc::Answer;
 
-    /// An nvim that keeps what is drawn as the module would (one overlay per file), queues the
-    /// events a test gives it, and answers each call when it is made or, while `hold` is set, when
-    /// the test releases it.
+    /// An nvim that keeps what is drawn as the module would (one overlay per file, live or not),
+    /// queues the events a test gives it, and answers each call when it is made or, while `hold` is
+    /// set, when the test releases it. Every answer says what the module's status does: how many
+    /// overlays are up, how many events wait, and whether every overlay is live.
     struct Nvim {
         serial: Cell<u64>,
         sent: RefCell<Vec<(&'static str, Vec<Value>)>>,
@@ -1941,6 +2216,16 @@ mod tests {
         hold: Cell<bool>,
         drawn: RefCell<BTreeSet<Vec<u8>>>,
         events: RefCell<Vec<Value>>,
+        /// The drawn files whose overlay is a live one.
+        live: RefCell<BTreeSet<Vec<u8>>>,
+        /// Files whose buffer is modified: a live drawing leaves them.
+        modified: RefCell<BTreeSet<Vec<u8>>>,
+        /// Files loaded in no window.
+        hidden: RefCell<BTreeSet<Vec<u8>>>,
+        /// The module is in this nvim; without it every guarded call answers `missing`.
+        module: Cell<bool>,
+        /// How many `off` events were queued.
+        off_seq: Cell<u64>,
     }
 
     impl Nvim {
@@ -1952,11 +2237,43 @@ mod tests {
                 hold: Cell::new(false),
                 drawn: RefCell::new(BTreeSet::new()),
                 events: RefCell::new(Vec::new()),
+                live: RefCell::new(BTreeSet::new()),
+                modified: RefCell::new(BTreeSet::new()),
+                hidden: RefCell::new(BTreeSet::new()),
+                module: Cell::new(false),
+                off_seq: Cell::new(0),
             }
         }
 
-        fn active(&self) -> Value {
-            Value::from(self.drawn.borrow().len() as u64)
+        fn status(&self, mut pairs: Vec<(&str, Value)>) -> Value {
+            let drawn = self.drawn.borrow();
+            let live = self.live.borrow();
+            pairs.push(("active", Value::from(drawn.len() as u64)));
+            pairs.push(("pending", Value::from(self.events.borrow().len() as u64)));
+            pairs.push(("live_only", Value::from(drawn.iter().all(|p| live.contains(p)))));
+            pairs.push(("off_seq", Value::from(self.off_seq.get())));
+            map(pairs)
+        }
+
+        /// The person took the drawing over `path` off: an `off` event, numbered, waits.
+        fn dismiss(&self, path: &str) {
+            self.drawn.borrow_mut().remove(&bytes_of(path));
+            self.live.borrow_mut().remove(&bytes_of(path));
+            self.off_seq.set(self.off_seq.get() + 1);
+            self.events.borrow_mut().push(map(vec![
+                ("kind", Value::from("off")),
+                ("path", Value::from(path)),
+                ("why", Value::from("user")),
+                ("seq", Value::from(self.off_seq.get())),
+            ]));
+        }
+
+        /// The nvim restarted behind the same handle: no module, nothing drawn.
+        fn restart(&self) {
+            self.module.set(false);
+            self.drawn.borrow_mut().clear();
+            self.live.borrow_mut().clear();
+            self.off_seq.set(0);
         }
 
         fn reply(&self, code: &'static str, args: &[Value]) -> Value {
@@ -1965,33 +2282,66 @@ mod tests {
                 other => panic!("a path travels as bytes: {other}"),
             };
             if code == REVIEW_LUA {
-                map(vec![("installed", Value::from(true))])
-            } else if code == SHOW_LUA {
+                self.module.set(true);
+                return map(vec![("installed", Value::from(true))]);
+            }
+            if !self.module.get() {
+                return map(vec![("missing", Value::from(true))]);
+            }
+            if code == SHOW_LUA {
                 self.drawn.borrow_mut().insert(path());
-                map(vec![
-                    ("drawn", Value::from(1)),
-                    ("kept", Value::from(1)),
-                    ("active", self.active()),
-                ])
+                self.live.borrow_mut().remove(&path());
+                self.status(vec![("drawn", Value::from(1)), ("kept", Value::from(1))])
             } else if code == OPEN_AND_SHOW_LUA {
                 if args[3] != Value::Nil {
                     self.drawn.borrow_mut().insert(path());
+                    self.live.borrow_mut().remove(&path());
                 }
-                map(vec![
+                self.status(vec![
                     ("opened", Value::from(true)),
                     ("drawn", Value::from(1)),
                     ("kept", Value::from(1)),
-                    ("active", self.active()),
                 ])
             } else if code == CLEAR_LUA {
                 self.drawn.borrow_mut().remove(&path());
-                map(vec![("active", self.active())])
+                self.live.borrow_mut().remove(&path());
+                self.status(Vec::new())
             } else if code == CLEAR_ALL_LUA {
                 self.drawn.borrow_mut().clear();
-                map(vec![("active", Value::from(0))])
+                self.live.borrow_mut().clear();
+                self.status(Vec::new())
+            } else if code == LIVE_SHOW_LUA {
+                let p = path();
+                let hunks = args[2].as_array().map_or(0, Vec::len) as u64;
+                let shown = !self.hidden.borrow().contains(&p);
+                let held = self.drawn.borrow().contains(&p) && !self.live.borrow().contains(&p);
+                let left = shown && (held || self.modified.borrow().contains(&p));
+                let mut drawn = 0;
+                if shown && !left {
+                    self.drawn.borrow_mut().remove(&p);
+                    self.live.borrow_mut().remove(&p);
+                    if hunks > 0 {
+                        self.drawn.borrow_mut().insert(p.clone());
+                        self.live.borrow_mut().insert(p);
+                        drawn = hunks;
+                    }
+                }
+                self.status(vec![
+                    ("drawn", Value::from(drawn)),
+                    ("shown", Value::from(shown)),
+                    ("left", Value::from(left)),
+                    ("skipped", Value::from(0)),
+                ])
+            } else if code == LIVE_CLEAR_LUA {
+                let p = path();
+                let cleared = self.live.borrow_mut().remove(&p);
+                if cleared {
+                    self.drawn.borrow_mut().remove(&p);
+                }
+                self.status(vec![("cleared", Value::from(cleared))])
             } else if code == TAKE_EVENTS_LUA {
                 let events: Vec<Value> = self.events.borrow_mut().drain(..).collect();
-                map(vec![("events", Value::Array(events)), ("active", self.active())])
+                self.status(vec![("events", Value::Array(events))])
             } else {
                 panic!("an unexpected call")
             }
@@ -2732,5 +3082,515 @@ mod tests {
         remote.review_events("s2", vec![wire.clone()]);
         remote.review_events("other", vec![wire]);
         assert!(matches!(remote.tick(at).as_slice(), [OverlayOutcome::Reverts(events)] if events.len() == 1));
+    }
+
+    // ---- live drawings -----------------------------------------------------------------------------
+
+    fn live_meta(session: &str, turn: u32) -> LiveMeta {
+        LiveMeta {
+            tab: 7,
+            session: session.to_owned(),
+            turn_id: format!("t{turn}"),
+            turn,
+            running: true,
+            read_lines: 10,
+        }
+    }
+
+    fn live_show(path: &str, session: &str, turn: u32) -> OverlayCall {
+        OverlayCall::LiveShow {
+            path: PathBuf::from(path),
+            meta: live_meta(session, turn),
+            hunks: vec![hunk()],
+        }
+    }
+
+    fn live_clear(path: &str) -> OverlayCall {
+        OverlayCall::LiveClear {
+            path: PathBuf::from(path),
+        }
+    }
+
+    fn key(session: &str, turn_id: &str) -> TurnKey {
+        TurnKey {
+            session: session.to_owned(),
+            turn_id: turn_id.to_owned(),
+        }
+    }
+
+    fn paths(list: &[&str]) -> Vec<PathBuf> {
+        list.iter().map(PathBuf::from).collect()
+    }
+
+    fn bytes_of(path: &str) -> Vec<u8> {
+        path.as_bytes().to_vec()
+    }
+
+    /// The paths of every call with `code`, in the order they were sent.
+    fn sent_paths(nvim: &Nvim, code: &str) -> Vec<String> {
+        nvim.calls()
+            .into_iter()
+            .filter(|(c, _)| *c == code)
+            .filter_map(|(_, path)| path)
+            .collect()
+    }
+
+    fn live_drawn(outcomes: &[OverlayOutcome]) -> Vec<(PathBuf, u32, u32, bool)> {
+        outcomes
+            .iter()
+            .filter_map(|outcome| match outcome {
+                OverlayOutcome::LiveDrawn {
+                    path,
+                    meta,
+                    drawn,
+                    left,
+                } => Some((path.clone(), meta.turn, *drawn, *left)),
+                _ => None,
+            })
+            .collect()
+    }
+
+    fn has_off(outcomes: &[OverlayOutcome]) -> bool {
+        outcomes.iter().any(|o| matches!(o, OverlayOutcome::Off(_)))
+    }
+
+    fn drawings(overlay: &EditorOverlay) -> Vec<(&str, (&str, u32))> {
+        overlay
+            .live_drawings()
+            .iter()
+            .map(|(path, (session, turn))| (path.to_str().unwrap(), (session.as_str(), *turn)))
+            .collect()
+    }
+
+    #[test]
+    fn a_live_show_goes_out_behind_queued_calls() {
+        let nvim = Nvim::new();
+        nvim.hold.set(true);
+        let mut overlay = EditorOverlay::new(Owner::Embedded);
+        let mut at = Instant::now();
+        overlay.call(
+            &nvim,
+            OverlayCall::Clear {
+                path: PathBuf::from("/p/a"),
+            },
+            at,
+        );
+        overlay.call_for(&nvim, show("/p/b", "s2"), TWO, at);
+        overlay.call(&nvim, live_show("/p/c", "s1", 3), at);
+        overlay.call(&nvim, show("/p/d", "s1"), at);
+        for _ in 0..12 {
+            assert!(nvim.calls_in_flight() <= 1, "one call in flight: {:?}", nvim.calls());
+            nvim.release();
+            at += Duration::from_secs(1);
+            overlay.tick(&nvim, at);
+        }
+        assert_eq!(
+            nvim.calls(),
+            vec![
+                (REVIEW_LUA, None),
+                (CLEAR_LUA, Some("/p/a".to_owned())),
+                (SHOW_LUA, Some("/p/b".to_owned())),
+                (LIVE_SHOW_LUA, Some("/p/c".to_owned())),
+                (SHOW_LUA, Some("/p/d".to_owned())),
+            ],
+            "the live draw waits its turn like any other call"
+        );
+        assert_eq!(drawings(&overlay), vec![("/p/c", ("s1", 3))]);
+    }
+
+    #[test]
+    fn a_contested_live_show_is_not_sent() {
+        // Two turns running at once both edit /p/a; only /p/b is theirs alone.
+        let nvim = Nvim::new();
+        let mut overlay = EditorOverlay::new(Owner::Embedded);
+        let mut at = Instant::now();
+        overlay.note_live(Window::One, &key("s1", "t1"), 10, None, &paths(&["/p/a", "/p/b"]));
+        overlay.note_live(TWO, &key("s2", "t9"), 20, None, &paths(&["/p/a"]));
+        overlay.call(&nvim, live_show("/p/a", "s1", 1), at);
+        overlay.call_for(&nvim, live_show("/p/a", "s2", 9), TWO, at);
+        overlay.call(&nvim, live_show("/p/b", "s1", 1), at);
+        let routed = ticks(&mut overlay, &nvim, &mut at);
+        assert_eq!(sent_paths(&nvim, LIVE_SHOW_LUA), vec!["/p/b".to_owned()]);
+        assert_eq!(nvim.drawn.borrow().iter().collect::<Vec<_>>(), vec![&bytes_of("/p/b")]);
+        assert_eq!(drawings(&overlay), vec![("/p/b", ("s1", 1))]);
+        assert!(for_two(&routed).is_empty(), "{routed:?}");
+
+        // A contested draw alone installs nothing.
+        let quiet = Nvim::new();
+        let mut alone = EditorOverlay::new(Owner::Embedded);
+        alone.note_live(Window::One, &key("s1", "t1"), 10, None, &paths(&["/p/a"]));
+        alone.note_live(Window::One, &key("s2", "t2"), 20, None, &paths(&["/p/a"]));
+        alone.call(&quiet, live_show("/p/a", "s1", 1), at);
+        ticks(&mut alone, &quiet, &mut at);
+        assert!(quiet.sent.borrow().is_empty(), "{:?}", quiet.calls());
+
+        // Both turns end; a later turn that edits the file alone draws it again.
+        overlay.note_live(Window::One, &key("s1", "t1"), 10, Some(30), &paths(&["/p/a", "/p/b"]));
+        overlay.note_live(TWO, &key("s2", "t9"), 20, Some(40), &paths(&["/p/a"]));
+        overlay.call(&nvim, live_show("/p/a", "s1", 1), at);
+        ticks(&mut overlay, &nvim, &mut at);
+        assert_eq!(
+            sent_paths(&nvim, LIVE_SHOW_LUA).len(),
+            1,
+            "still contested after the ends"
+        );
+        overlay.note_live(Window::One, &key("s1", "t2"), 50, None, &paths(&["/p/a"]));
+        overlay.call(&nvim, live_show("/p/a", "s1", 2), at);
+        ticks(&mut overlay, &nvim, &mut at);
+        assert_eq!(
+            sent_paths(&nvim, LIVE_SHOW_LUA),
+            vec!["/p/b".to_owned(), "/p/a".to_owned()]
+        );
+        assert_eq!(drawings(&overlay), vec![("/p/a", ("s1", 2)), ("/p/b", ("s1", 1))]);
+    }
+
+    #[test]
+    fn a_note_that_contests_a_drawn_path_clears_it() {
+        let nvim = Nvim::new();
+        let mut overlay = EditorOverlay::new(Owner::Embedded);
+        let mut at = Instant::now();
+        overlay.note_live(Window::One, &key("s1", "t1"), 10, None, &paths(&["/p/a", "/p/c"]));
+        overlay.note_live(TWO, &key("s2", "t2"), 15, None, &paths(&["/p/b"]));
+        overlay.call(&nvim, live_show("/p/a", "s1", 1), at);
+        overlay.call_for(&nvim, live_show("/p/b", "s2", 2), TWO, at);
+        overlay.call(&nvim, show("/p/o", "s1"), at);
+        ticks(&mut overlay, &nvim, &mut at);
+        assert_eq!(drawings(&overlay), vec![("/p/a", ("s1", 1)), ("/p/b", ("s2", 2))]);
+
+        // /p/c's live draw is still out when a third turn's note contests all three files.
+        nvim.hold.set(true);
+        overlay.call(&nvim, live_show("/p/c", "s1", 1), at);
+        assert_eq!(nvim.calls_in_flight(), 1);
+        overlay.note_live(
+            Window::One,
+            &key("s3", "t3"),
+            20,
+            None,
+            &paths(&["/p/a", "/p/b", "/p/c", "/p/o"]),
+        );
+        nvim.hold.set(false);
+        nvim.release();
+        let routed = ticks(&mut overlay, &nvim, &mut at);
+
+        let mut cleared = sent_paths(&nvim, LIVE_CLEAR_LUA);
+        cleared.sort();
+        assert_eq!(cleared, vec!["/p/a".to_owned(), "/p/b".to_owned(), "/p/c".to_owned()]);
+        assert_eq!(
+            nvim.drawn.borrow().iter().collect::<Vec<_>>(),
+            vec![&bytes_of("/p/o")],
+            "only the drawing that was not live stays"
+        );
+        assert!(overlay.live_drawings().is_empty(), "{:?}", overlay.live_drawings());
+        assert_eq!(
+            overlay.active_paths().iter().collect::<Vec<_>>(),
+            vec![Path::new("/p/o")]
+        );
+        assert!(overlay.linked_paths(PEER_2).is_empty());
+        assert!(for_two(&routed).contains(&LinkedEvent::Drawn {
+            op_id: None,
+            path: PathBuf::from("/p/b"),
+            state: Drawn::Cleared,
+        }));
+        assert!(!has_off(&routed.mine), "a contested clear says nothing: {routed:?}");
+    }
+
+    #[test]
+    fn a_left_answer_keeps_the_owner_of_the_file() {
+        let nvim = Nvim::new();
+        let mut overlay = EditorOverlay::new(Owner::Embedded);
+        let mut at = Instant::now();
+        // Window 2 asked for a review over /p/a; window 1's live draw finds it there.
+        overlay.call_for(&nvim, show("/p/a", "s2"), TWO, at);
+        ticks(&mut overlay, &nvim, &mut at);
+        overlay.call(&nvim, live_show("/p/a", "s1", 1), at);
+        let routed = ticks(&mut overlay, &nvim, &mut at);
+        assert!(overlay.linked_paths(PEER_2).contains(Path::new("/p/a")));
+        assert!(overlay.active_paths().is_empty());
+        assert!(overlay.live_drawings().is_empty());
+        assert!(for_two(&routed).is_empty(), "window 2 keeps its drawing: {routed:?}");
+        assert!(nvim.drawn.borrow().contains(&bytes_of("/p/a")) && nvim.live.borrow().is_empty());
+
+        // Window 1's own live drawing over a buffer the person has since modified stays as it was.
+        overlay.call(&nvim, live_show("/p/b", "s1", 1), at);
+        ticks(&mut overlay, &nvim, &mut at);
+        nvim.modified.borrow_mut().insert(bytes_of("/p/b"));
+        overlay.call(&nvim, live_show("/p/b", "s1", 2), at);
+        ticks(&mut overlay, &nvim, &mut at);
+        assert_eq!(drawings(&overlay), vec![("/p/b", ("s1", 1))]);
+        assert!(overlay.active_paths().contains(Path::new("/p/b")));
+    }
+
+    #[test]
+    fn live_clear_never_clears_an_o_drawing() {
+        for clear_first in [false, true] {
+            let nvim = Nvim::new();
+            let mut overlay = EditorOverlay::new(Owner::Embedded);
+            let mut at = Instant::now();
+            overlay.call(&nvim, live_show("/p/a", "s1", 1), at);
+            ticks(&mut overlay, &nvim, &mut at);
+            nvim.hold.set(true);
+            if clear_first {
+                overlay.call(&nvim, live_clear("/p/a"), at);
+                overlay.call(&nvim, show("/p/a", "s1"), at);
+            } else {
+                overlay.call(&nvim, show("/p/a", "s1"), at);
+                overlay.call(&nvim, live_clear("/p/a"), at);
+            }
+            nvim.hold.set(false);
+            nvim.release();
+            let routed = ticks(&mut overlay, &nvim, &mut at);
+            assert!(
+                nvim.drawn.borrow().contains(&bytes_of("/p/a")),
+                "clear first: {clear_first}"
+            );
+            assert!(nvim.live.borrow().is_empty(), "clear first: {clear_first}");
+            assert!(
+                overlay.active_paths().contains(Path::new("/p/a")),
+                "clear first: {clear_first}"
+            );
+            assert!(overlay.live_drawings().is_empty(), "clear first: {clear_first}");
+            assert!(!has_off(&routed.mine), "clear first: {clear_first}: {routed:?}");
+        }
+    }
+
+    #[test]
+    fn a_live_show_sets_the_sessions_holder() {
+        let nvim = Nvim::new();
+        let mut overlay = EditorOverlay::new(Owner::Embedded);
+        let mut at = Instant::now();
+        overlay.call_for(&nvim, live_show("/p/a", "s2", 1), TWO, at);
+        ticks(&mut overlay, &nvim, &mut at);
+        assert_eq!(overlay.holder("s2"), TWO);
+        nvim.events.borrow_mut().push(revert_of("/p/a", "s2"));
+        let routed = ticks(&mut overlay, &nvim, &mut at);
+        assert_eq!(window2_events(&routed, "s2").len(), 1);
+        assert!(sessions_of(&routed.mine).is_empty(), "{routed:?}");
+    }
+
+    #[test]
+    fn live_drawn_is_reported_with_left() {
+        let nvim = Nvim::new();
+        let mut overlay = EditorOverlay::new(Owner::Embedded);
+        let mut at = Instant::now();
+        overlay.call(&nvim, live_show("/p/a", "s1", 1), at);
+        let routed = ticks(&mut overlay, &nvim, &mut at);
+        assert_eq!(live_drawn(&routed.mine), vec![(PathBuf::from("/p/a"), 1, 1, false)]);
+        assert!(routed.mine.contains(&OverlayOutcome::LiveDrawn {
+            path: PathBuf::from("/p/a"),
+            meta: live_meta("s1", 1),
+            drawn: 1,
+            left: false,
+        }));
+
+        nvim.modified.borrow_mut().insert(bytes_of("/p/a"));
+        overlay.call(&nvim, live_show("/p/a", "s1", 2), at);
+        let routed = ticks(&mut overlay, &nvim, &mut at);
+        assert_eq!(live_drawn(&routed.mine), vec![(PathBuf::from("/p/a"), 2, 0, true)]);
+
+        nvim.hidden.borrow_mut().insert(bytes_of("/p/b"));
+        overlay.call(&nvim, live_show("/p/b", "s1", 2), at);
+        let routed = ticks(&mut overlay, &nvim, &mut at);
+        assert_eq!(live_drawn(&routed.mine), vec![(PathBuf::from("/p/b"), 2, 0, false)]);
+        assert!(!overlay.live_drawings().contains_key(Path::new("/p/b")));
+
+        // Another window's live draw is that window's news.
+        overlay.call_for(&nvim, live_show("/p/c", "s2", 1), TWO, at);
+        let routed = ticks(&mut overlay, &nvim, &mut at);
+        assert!(live_drawn(&routed.mine).is_empty(), "{routed:?}");
+    }
+
+    /// Ticks every 100 ms for `span` and gives the offsets from the start at which a drain went out.
+    fn drains_over(overlay: &mut EditorOverlay, nvim: &Nvim, at: &mut Instant, span: Duration) -> Vec<Duration> {
+        let start = *at;
+        let mut drains = Vec::new();
+        while *at - start < span {
+            *at += Duration::from_millis(100);
+            let before = nvim.count(TAKE_EVENTS_LUA);
+            overlay.tick(nvim, *at);
+            if nvim.count(TAKE_EVENTS_LUA) > before {
+                drains.push(*at - start);
+            }
+        }
+        drains
+    }
+
+    #[test]
+    fn the_drain_slows_with_only_idle_live_drawings_and_speeds_up_on_pending() {
+        let nvim = Nvim::new();
+        let mut overlay = EditorOverlay::new(Owner::Embedded);
+        let mut at = Instant::now();
+        overlay.call(&nvim, live_show("/p/a", "s1", 1), at);
+        let drains = drains_over(&mut overlay, &nvim, &mut at, Duration::from_secs(12));
+        assert_eq!(drains.len(), 3, "{drains:?}");
+        assert!(drains.windows(2).all(|w| w[1] - w[0] >= LIVE_DRAIN_EVERY), "{drains:?}");
+
+        // A revert waits in the module; the next answer says so and the drain comes at the fast rate.
+        nvim.events.borrow_mut().push(revert_of("/p/a", "s1"));
+        overlay.call(&nvim, live_show("/p/b", "s1", 1), at);
+        let drains = drains_over(&mut overlay, &nvim, &mut at, Duration::from_secs(1));
+        assert!(!drains.is_empty(), "a pending event is asked for within 500 ms");
+        assert!(drains[0] <= DRAIN_EVERY, "{drains:?}");
+        // That drain emptied the queue: back to the slow rate.
+        let drains = drains_over(&mut overlay, &nvim, &mut at, Duration::from_millis(3500));
+        assert!(drains.is_empty(), "{drains:?}");
+
+        // A drawing that is not live (`o`) puts the drain back to 500 ms.
+        overlay.call(&nvim, show("/p/c", "s1"), at);
+        let drains = drains_over(&mut overlay, &nvim, &mut at, Duration::from_secs(3));
+        assert!(drains.len() >= 5, "{drains:?}");
+    }
+
+    #[test]
+    fn a_missing_module_drops_live_state_quietly() {
+        let nvim = Nvim::new();
+        let mut overlay = EditorOverlay::new(Owner::Embedded);
+        let mut at = Instant::now();
+        overlay.call(&nvim, live_show("/p/a", "s1", 1), at);
+        overlay.call_for(&nvim, live_show("/p/b", "s2", 1), TWO, at);
+        ticks(&mut overlay, &nvim, &mut at);
+        assert_eq!(overlay.live_drawings().len(), 2);
+
+        nvim.restart();
+        let routed = ticks(&mut overlay, &nvim, &mut at);
+        assert!(overlay.live_drawings().is_empty());
+        assert!(overlay.active_paths().is_empty());
+        assert!(overlay.linked_paths(PEER_2).is_empty());
+        assert!(routed.mine.is_empty(), "nothing is said: {routed:?}");
+        assert_eq!(for_two(&routed), vec![LinkedEvent::Idle]);
+        assert_eq!(nvim.count(REVIEW_LUA), 1, "nothing asked to put the module back");
+
+        // A clear of what was drawn there neither installs nor goes out.
+        overlay.call(&nvim, live_clear("/p/a"), at);
+        let routed = ticks(&mut overlay, &nvim, &mut at);
+        assert_eq!(nvim.count(REVIEW_LUA), 1);
+        assert_eq!(nvim.count(LIVE_CLEAR_LUA), 0);
+        assert!(routed.mine.is_empty() && routed.linked.is_empty(), "{routed:?}");
+
+        // A live draw found the module gone in flight: installed again, drawn, and nothing said.
+        overlay.call(&nvim, live_show("/p/c", "s1", 2), at);
+        ticks(&mut overlay, &nvim, &mut at);
+        nvim.restart();
+        overlay.call(&nvim, live_show("/p/c", "s1", 3), at);
+        let routed = ticks(&mut overlay, &nvim, &mut at);
+        assert_eq!(drawings(&overlay), vec![("/p/c", ("s1", 3))]);
+        assert!(!has_off(&routed.mine), "{routed:?}");
+        assert!(!routed.mine.iter().any(|o| matches!(o, OverlayOutcome::Answered { .. })));
+
+        // A clear queued behind a live draw that found the module gone still takes that drawing off.
+        nvim.restart();
+        nvim.hold.set(true);
+        overlay.call(&nvim, live_show("/p/d", "s1", 3), at);
+        overlay.call(&nvim, live_clear("/p/d"), at);
+        nvim.hold.set(false);
+        nvim.release();
+        ticks(&mut overlay, &nvim, &mut at);
+        assert_eq!(sent_paths(&nvim, LIVE_CLEAR_LUA), vec!["/p/d".to_owned()]);
+        assert!(!nvim.drawn.borrow().contains(&bytes_of("/p/d")));
+        assert!(overlay.live_drawings().is_empty(), "{:?}", overlay.live_drawings());
+    }
+
+    #[test]
+    fn a_non_utf8_live_path_is_skipped_quietly() {
+        let nvim = Nvim::new();
+        let mut overlay = EditorOverlay::new(Owner::Embedded);
+        let mut at = Instant::now();
+        let bad = PathBuf::from(OsStr::from_bytes(b"/p/\xff.rs"));
+        overlay.call_for(
+            &nvim,
+            OverlayCall::LiveShow {
+                path: bad,
+                meta: live_meta("s2", 1),
+                hunks: vec![hunk()],
+            },
+            TWO,
+            at,
+        );
+        let routed = ticks(&mut overlay, &nvim, &mut at);
+        assert!(nvim.sent.borrow().is_empty(), "{:?}", nvim.calls());
+        assert_eq!(routed, Routed::default());
+        assert_eq!(overlay.holder("s2"), Window::One, "a refused draw holds no session");
+        assert!(overlay.live_drawings().is_empty());
+
+        // Spaces and CJK are only bytes of a path.
+        overlay.call(&nvim, live_show("/p/a b/文件.rs", "s1", 1), at);
+        ticks(&mut overlay, &nvim, &mut at);
+        assert_eq!(drawings(&overlay), vec![("/p/a b/文件.rs", ("s1", 1))]);
+    }
+
+    #[test]
+    fn live_drawings_are_kept_per_path_with_session_and_turn() {
+        let nvim = Nvim::new();
+        let mut overlay = EditorOverlay::new(Owner::Embedded);
+        let mut at = Instant::now();
+        overlay.call(&nvim, live_show("/p/a", "s1", 3), at);
+        overlay.call_for(&nvim, live_show("/p/b", "s2", 5), TWO, at);
+        overlay.call(&nvim, live_show("/p/c", "s1", 3), at);
+        ticks(&mut overlay, &nvim, &mut at);
+        assert_eq!(
+            drawings(&overlay),
+            vec![("/p/a", ("s1", 3)), ("/p/b", ("s2", 5)), ("/p/c", ("s1", 3))]
+        );
+
+        // The same file drawn for a later turn replaces the earlier turn's drawing.
+        overlay.call(&nvim, live_show("/p/a", "s1", 4), at);
+        // A review asked for over a live drawing is not live.
+        overlay.call(&nvim, show("/p/b", "s1"), at);
+        ticks(&mut overlay, &nvim, &mut at);
+        assert_eq!(drawings(&overlay), vec![("/p/a", ("s1", 4)), ("/p/c", ("s1", 3))]);
+
+        // The module took /p/c's drawing off.
+        nvim.drawn.borrow_mut().remove(&bytes_of("/p/c"));
+        nvim.live.borrow_mut().remove(&bytes_of("/p/c"));
+        nvim.events.borrow_mut().push(map(vec![
+            ("kind", Value::from("off")),
+            ("path", Value::from("/p/c")),
+            ("why", Value::from("user")),
+        ]));
+        ticks(&mut overlay, &nvim, &mut at);
+        assert_eq!(drawings(&overlay), vec![("/p/a", ("s1", 4))]);
+
+        let expected = overlay.live_drawings().clone();
+        let local = Overlay::Local(overlay);
+        assert_eq!(local.live_drawings(), &expected);
+        let remote = Overlay::Remote(RemoteOverlay::new(Path::new("/p"), Box::new(|_: EditorOp| 1)));
+        assert!(remote.live_drawings().is_empty());
+    }
+
+    #[test]
+    fn an_off_queued_before_a_redraw_leaves_the_new_drawing_to_the_contest() {
+        let nvim = Nvim::new();
+        let mut overlay = EditorOverlay::new(Owner::Embedded);
+        let mut at = Instant::now();
+        overlay.note_live(Window::One, &key("s1", "t1"), 10, None, &paths(&["/p/a"]));
+        overlay.call(&nvim, live_show("/p/a", "s1", 1), at);
+        ticks(&mut overlay, &nvim, &mut at);
+        assert_eq!(drawings(&overlay), vec![("/p/a", ("s1", 1))]);
+
+        // Dismissed, and drawn again by the next edit before the drain took the dismissal.
+        nvim.dismiss("/p/a");
+        overlay.call(&nvim, live_show("/p/a", "s1", 1), at);
+        let routed = ticks(&mut overlay, &nvim, &mut at);
+        assert!(nvim.events.borrow().is_empty(), "the dismissal was drained");
+        assert!(!has_off(&routed.mine), "{routed:?}");
+        assert_eq!(drawings(&overlay), vec![("/p/a", ("s1", 1))]);
+        assert_eq!(
+            overlay.active_paths().iter().collect::<Vec<_>>(),
+            vec![Path::new("/p/a")]
+        );
+
+        // A second turn contests the file: the drawing still up is cleared.
+        overlay.note_live(TWO, &key("s2", "t2"), 15, None, &paths(&["/p/a"]));
+        ticks(&mut overlay, &nvim, &mut at);
+        assert_eq!(sent_paths(&nvim, LIVE_CLEAR_LUA), vec!["/p/a".to_owned()]);
+        assert!(nvim.drawn.borrow().is_empty());
+        assert!(overlay.live_drawings().is_empty());
+
+        // A dismissal after the last draw is news.
+        overlay.call(&nvim, show("/p/b", "s1"), at);
+        ticks(&mut overlay, &nvim, &mut at);
+        nvim.dismiss("/p/b");
+        let routed = ticks(&mut overlay, &nvim, &mut at);
+        assert!(has_off(&routed.mine), "{routed:?}");
+        assert!(overlay.active_paths().is_empty());
     }
 }

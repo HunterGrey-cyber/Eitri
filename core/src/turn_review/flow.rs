@@ -1177,6 +1177,8 @@ impl ReviewFlow {
                         self.shown.remove(Path::new(&path));
                     }
                 }
+                // Nothing asks for a live drawing yet.
+                OverlayOutcome::LiveDrawn { .. } => {}
             }
         }
     }
