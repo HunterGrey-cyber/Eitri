@@ -445,6 +445,59 @@ fn every_string_has_both_languages() {
     }
 }
 #[test]
+fn a_list_that_lands_during_a_start_is_there_when_the_start_fails() {
+    let mut c = chooser(Mode::Launch);
+    let effects = c.shown();
+    let Effect::List { serial } = effects[0] else {
+        panic!("expected a list request")
+    };
+    assert_eq!(
+        c.event(Ev::Pick(1)),
+        vec![Effect::Open("/home/me".into())],
+        "the home row"
+    );
+    c.opening("me");
+
+    let rows = vec![row("/a", Fact::Present)];
+    assert_eq!(c.event(Ev::Rows { serial, rows }), vec![], "an answer starts nothing");
+    assert!(c.view().opening);
+    assert_eq!(c.view().message.as_deref(), Some("Opening me…"));
+
+    c.failed("failed".into());
+    assert_eq!(c.view().rows[0].name, "a");
+    assert_eq!(c.view().message.as_deref(), Some("failed"));
+    assert_eq!(
+        enter(&mut c),
+        vec![Effect::Open("/a".into())],
+        "Enter does not wait for an answer that already came"
+    );
+}
+#[test]
+fn a_path_answer_that_lands_during_a_start_is_there_when_the_start_fails() {
+    let mut c = chooser(Mode::Launch);
+    list(&mut c, vec![]);
+    let effects = line(&mut c, "/wo");
+    let Effect::Path { serial, .. } = effects[0] else {
+        panic!("expected a path request")
+    };
+    assert_eq!(c.event(Ev::Line(LineEv::ChooseFolder)), vec![Effect::FolderDialog]);
+    assert_eq!(
+        c.event(Ev::Folder(Some("/picked".into()))),
+        vec![Effect::Open("/picked".into())]
+    );
+    c.opening("picked");
+
+    let answer = found(Some(PathKind::Dir), &[], "");
+    assert_eq!(
+        c.event(Ev::PathAnswer { serial, answer }),
+        vec![],
+        "an answer starts nothing"
+    );
+
+    c.failed("failed".into());
+    assert_eq!(enter(&mut c), vec![Effect::Open("/absolute/target".into())]);
+}
+#[test]
 fn step_keys_match_the_session_chooser() {
     use crate::source_scan::{code_only, read_required};
     let source = read_required("agent-ui/web/src/chooser.ts");

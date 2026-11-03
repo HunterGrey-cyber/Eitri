@@ -198,11 +198,13 @@ impl Chooser {
     }
 
     pub fn event(&mut self, ev: Ev) -> Vec<Effect> {
-        if self.opening || self.closed {
+        if self.closed {
             return vec![];
         }
-        // The native dialog owns input until it answers; worker replies may still update facts.
-        if self.dialog && !matches!(ev, Ev::Rows { .. } | Ev::PathAnswer { .. } | Ev::Folder(_)) {
+        // A start and the native dialog own input until they end, but a worker reply still lands: dropped, its request
+        // would stay pending for good and a held Enter would wait on it once a start had failed.
+        let reply = matches!(ev, Ev::Rows { .. } | Ev::PathAnswer { .. });
+        if (self.opening && !reply) || (self.dialog && !reply && !matches!(ev, Ev::Folder(_))) {
             return vec![];
         }
         match ev {

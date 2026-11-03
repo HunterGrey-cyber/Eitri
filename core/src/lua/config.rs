@@ -127,6 +127,31 @@ pub fn parse_window_restore(value: Option<&str>) -> Result<bool, String> {
     crate::config_switch::parse_switch(WINDOW_RESTORE_KEY, value, true)
 }
 
+/// What a desktop launch with no path does. Read only by `shell choose-project`.
+pub const DESKTOP_START_KEY: &str = "window.desktop_start";
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DesktopStart {
+    /// The project chooser.
+    Choose,
+    /// The newest project known to be present, with no window first; the chooser if there is none.
+    Last,
+    /// The launcher's own directory.
+    Cwd,
+}
+
+/// [`DESKTOP_START_KEY`] as stored. Unset means the chooser.
+pub fn parse_desktop_start(value: Option<&str>) -> Result<DesktopStart, String> {
+    match value {
+        None | Some("choose") => Ok(DesktopStart::Choose),
+        Some("last") => Ok(DesktopStart::Last),
+        Some("cwd") => Ok(DesktopStart::Cwd),
+        Some(value) => Err(format!(
+            "{DESKTOP_START_KEY:?} must be choose, last or cwd (got {value:?})"
+        )),
+    }
+}
+
 /// Whether the editor reopens the files from its last run.
 pub const EDITOR_RESTORE_KEY: &str = "editor.restore";
 
@@ -408,6 +433,30 @@ mod tests {
         assert_eq!(parse_editor_restore(None), Ok(true));
         for (value, expected) in [("true", true), ("on", true), ("false", false), ("off", false)] {
             assert_eq!(parse_editor_restore(Some(value)), Ok(expected));
+        }
+    }
+
+    #[test]
+    fn parse_desktop_start_reads_three_values_and_refuses_others() {
+        assert_eq!(DESKTOP_START_KEY, "window.desktop_start");
+        assert_eq!(parse_desktop_start(None), Ok(DesktopStart::Choose));
+        for (value, expected) in [
+            ("choose", DesktopStart::Choose),
+            ("last", DesktopStart::Last),
+            ("cwd", DesktopStart::Cwd),
+        ] {
+            assert_eq!(parse_desktop_start(Some(value)), Ok(expected));
+        }
+        for bad in ["", "Choose", "true", "last "] {
+            let err = parse_desktop_start(Some(bad)).unwrap_err();
+            assert!(
+                err.contains("\"window.desktop_start\""),
+                "the refusal names its key: {err}"
+            );
+            assert!(
+                err.contains("choose, last or cwd"),
+                "the refusal names the values: {err}"
+            );
         }
     }
 

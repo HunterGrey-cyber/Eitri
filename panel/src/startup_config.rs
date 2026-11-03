@@ -82,6 +82,7 @@ fn checks<'a>(agents: &'a [&'a str]) -> Vec<(&'static str, Check<'a>)> {
         (cfg::WINDOW_RESTORE_KEY, check(cfg::parse_window_restore)),
         (cfg::EDITOR_RESTORE_KEY, check(cfg::parse_editor_restore)),
         (cfg::EDITOR_PRESENTATION_KEY, check(cfg::parse_editor_presentation)),
+        (cfg::DESKTOP_START_KEY, check(cfg::parse_desktop_start)),
     ];
     for key in KIT_KEYS {
         all.push((
@@ -289,6 +290,21 @@ mod tests {
             Some("1"),
             "a key of the person's own stays"
         );
+    }
+
+    #[test]
+    fn a_bad_value_is_reported_and_is_not_an_unknown_key() {
+        let (kernel, problems) = settled("eitri.config.set(\"window.desktop_start\", \"later\")\n");
+        assert_eq!(problems.len(), 1, "{problems:?}");
+        assert!(problems[0].contains("must be choose, last or cwd"), "{problems:?}");
+        assert!(problems[0].ends_with("the default is used"), "{problems:?}");
+        assert_eq!(kernel.config.borrow().get("window.desktop_start"), None);
+
+        for good in ["choose", "last", "cwd"] {
+            let (kernel, problems) = settled(&format!("eitri.config.set(\"window.desktop_start\", {good:?})\n"));
+            assert!(problems.is_empty(), "{good}: {problems:?}");
+            assert_eq!(kernel.config.borrow().get("window.desktop_start"), Some(good));
+        }
     }
 
     #[test]

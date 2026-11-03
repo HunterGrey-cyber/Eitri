@@ -57,7 +57,6 @@ pub(crate) enum How {
     /// Bring the path's running window forward, or be that window: `--raise -- <path>`.
     Raise(PathBuf),
     /// Be a window of the path, as any launch is: `-- <path>`.
-    #[cfg_attr(not(test), allow(dead_code))]
     Plain(PathBuf),
 }
 

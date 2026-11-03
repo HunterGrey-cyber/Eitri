@@ -7,6 +7,7 @@
 mod agent_panel;
 mod capture_requests;
 mod chat_views;
+mod choose_project;
 mod chrome;
 mod close_prompt;
 mod companion;
@@ -317,8 +318,8 @@ fn main() -> glib::ExitCode {
     // version line must never touch GTK, a display, or nvim's stdin.
     // `eitri_core::project_root::KNOWN_FLAGS` also lists `--version`, so `shell --version
     // /some/project` is never a startup failure even though `main()` never reaches `resolve_launch()` on
-    // this path -- see that module's own tests.
-    if has_flag("--version") {
+    // this path -- see that module's own tests. `choose-project` is left out: it refuses every flag but its two.
+    if has_flag("--version") && !choose_project::named(&early_args) {
         println!("{}", version::version_line());
         return glib::ExitCode::SUCCESS;
     }
@@ -327,6 +328,12 @@ fn main() -> glib::ExitCode {
     // `second_first_acts`.
     if matches!(start, linked_window::WindowStart::Full) {
         window_log::start_early();
+    }
+
+    // A desktop launch that named no path. After the relay, so a failed print from `init.lua` cannot panic; before the
+    // guard, because no plugin task runs there, and before the resolver, which would read the name as a directory.
+    if choose_project::named(&early_args) {
+        return choose_project::run(&early_args[1..]);
     }
 
     // Every plugin task this process starts runs under a guard of its own, so a task lives as long as whichever
