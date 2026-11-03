@@ -66,6 +66,7 @@ use super::lifecycle::{ReviewError, Scope};
 use super::live_contest::{LiveContest, TurnKey};
 use super::live_draws::{LiveDraws, LiveRecords, LiveStep};
 use super::live_job::{LiveHunks, LiveRecord, LiveSettle, LiveSkip};
+use super::live_resolve::{has_parent_dir, LiveResolver};
 use super::message::{compose, Preview};
 use super::presence::{Blocked, PresenceGuard};
 use super::revert::{
@@ -76,7 +77,7 @@ use super::write_slot::{SlotBusy, WriteSlot};
 
 /// How long the editor has to say what a buffer holds for a message's check. Past it the revert is
 /// treated as not loaded, which keeps it out of the message rather than guessing.
-const BUFFER_ANSWER_WAIT: Duration = Duration::from_secs(5);
+pub(super) const BUFFER_ANSWER_WAIT: Duration = Duration::from_secs(5);
 
 /// The most comments being quoted at once.
 const MAX_ANCHORS: usize = 4;
@@ -245,8 +246,9 @@ pub struct ReviewFlow {
     live_ends: HashMap<TurnKey, u64>,
     /// Window 2: notes whose shown answer nobody waits for, taken when they come.
     live_unread: Vec<(u64, Instant)>,
-    /// Edits whose path goes through `..`, being resolved against the disk on a worker.
-    live_resolving: Vec<mpsc::Receiver<Vec<LiveEdit>>>,
+    /// Edits waiting behind one whose path goes through `..`, resolved against the disk by one
+    /// worker at a time and handed out in the order they came.
+    live_resolver: LiveResolver,
     follow_ends: FollowEnds,
 }
 
@@ -388,7 +390,7 @@ impl ReviewFlow {
             && self.live_jobs.is_empty()
             && self.live_unread.is_empty()
             && self.follow_ends.is_empty()
-            && self.live_resolving.is_empty()
+            && !self.live_resolver.busy()
     }
 
     /// Whether the live drawings still follow the turn `key`: it runs, or its drawings are not
@@ -1398,20 +1400,34 @@ impl ReviewFlow {
         self.live_headers.clear();
     }
 
+    /// This tick's edits, and every earlier batch the resolver has finished, in the order they came.
+    /// `..` after a link leads where the link leads, which only the disk says: such a batch, and every
+    /// batch after it while one waits, plain ones included, goes behind the resolver's worker.
+    fn live_intake(&mut self, root: Option<&Path>, incoming: Vec<LiveEdit>, now: Instant) -> Vec<LiveEdit> {
+        let mut direct = Vec::new();
+        if let Some(root) = root {
+            if self.live_resolver.busy() || incoming.iter().any(|edit| has_parent_dir(&edit.path)) {
+                self.live_resolver.push(root.to_path_buf(), incoming);
+            } else {
+                direct = incoming
+                    .into_iter()
+                    .filter_map(|mut edit| {
+                        edit.path = live_path(root, &edit.path)?;
+                        Some(edit)
+                    })
+                    .collect();
+            }
+        }
+        let mut edits = self.live_resolver.poll(now);
+        edits.extend(direct);
+        edits
+    }
+
     /// One round of the live drawings: the tabs' new edits, the editor's and the workers' answers,
     /// and what follows from them, each a call on the driver, a question or a worker. Reads memory
     /// only; never waits.
     pub fn live_tick(&mut self, tabs: &mut TabSet, rpc: Option<&dyn EditorRpc>, now: Instant) {
         let edits = tabs.take_live_edits();
-        let mut resolved = Vec::new();
-        self.live_resolving.retain(|rx| match rx.try_recv() {
-            Ok(batch) => {
-                resolved.extend(batch);
-                false
-            }
-            Err(mpsc::TryRecvError::Empty) => true,
-            Err(mpsc::TryRecvError::Disconnected) => false,
-        });
         let follows = self.follow_ends.take();
         let gone: Vec<u64> = self
             .live_tabs
@@ -1419,7 +1435,7 @@ impl ReviewFlow {
             .filter(|(tab, session)| !holds_session(tabs, **tab, session))
             .map(|(tab, _)| *tab)
             .collect();
-        if edits.is_empty() && resolved.is_empty() && follows.is_empty() && gone.is_empty() && self.live_is_idle() {
+        if edits.is_empty() && follows.is_empty() && gone.is_empty() && self.live_is_idle() {
             return;
         }
         let review = tabs.turn_review();
@@ -1435,43 +1451,12 @@ impl ReviewFlow {
             // Their answers would be dropped; the slots are freed now.
             self.live_jobs.retain(|job| job.tab != tab);
         }
-        let (dotted, plain): (Vec<LiveEdit>, Vec<LiveEdit>) = edits
+        let incoming: Vec<LiveEdit> = edits
             .into_iter()
             .filter(|edit| holds_session(tabs, edit.tab.0, &edit.session))
-            .partition(|edit| edit.path.components().any(|c| c == Component::ParentDir));
-        let mut edits: Vec<LiveEdit> = plain
-            .into_iter()
-            .filter_map(|mut edit| {
-                edit.path = live_path(root.as_deref()?, &edit.path)?;
-                Some(edit)
-            })
             .collect();
-        if let (false, Some(root)) = (dotted.is_empty(), root.clone()) {
-            // `..` after a link leads where the link leads, which only the disk says: read off the GTK
-            // thread, taken up on a later tick.
-            let batch = dotted.clone();
-            let worker_root = root.clone();
-            match spawn("live-path", move || {
-                batch
-                    .into_iter()
-                    .filter_map(|mut edit| {
-                        edit.path = resolve_live_path(&worker_root, &edit.path)?;
-                        Some(edit)
-                    })
-                    .collect()
-            }) {
-                Ok(rx) => self.live_resolving.push(rx),
-                Err(_) => edits.extend(dotted.into_iter().filter_map(|mut edit| {
-                    edit.path = live_path(&root, &edit.path)?;
-                    Some(edit)
-                })),
-            }
-        }
-        edits.extend(
-            resolved
-                .into_iter()
-                .filter(|edit| holds_session(tabs, edit.tab.0, &edit.session)),
-        );
+        let mut edits = self.live_intake(root.as_deref(), incoming, now);
+        edits.retain(|edit| holds_session(tabs, edit.tab.0, &edit.session));
         for edit in &edits {
             self.live_tabs.insert(edit.tab.0, edit.session.clone());
         }
@@ -2502,7 +2487,7 @@ fn holds_session(tabs: &TabSet, tab: u64, session: &str) -> bool {
 /// The absolute path of a file an edit call named (absolute, or relative to the project root), when
 /// it names one inside the project in UTF-8; decided from the text alone, on the GTK thread. The
 /// worker's read checks the file itself from the project root.
-fn live_path(root: &Path, named: &Path) -> Option<PathBuf> {
+pub(super) fn live_path(root: &Path, named: &Path) -> Option<PathBuf> {
     // A tool's path is the model's text: `dir/../project/a.rs` names the same file as `project/a.rs`
     // when no link is on the way, so it is read by its text (`.` gone, `..` taking the name before it)
     // and must then lie under the root. Reading the disk here would wait on the GTK thread.
@@ -2528,7 +2513,7 @@ fn live_path(root: &Path, named: &Path) -> Option<PathBuf> {
 /// read by its text, and the file's own name is kept. Only a path that ends under the project root,
 /// both resolved, is kept; when nothing of it exists, its text decides as [`live_path`] does.
 /// Reads the disk: never on the GTK thread.
-fn resolve_live_path(root: &Path, named: &Path) -> Option<PathBuf> {
+pub(super) fn resolve_live_path(root: &Path, named: &Path) -> Option<PathBuf> {
     let full = root.join(named);
     let mut parts: Vec<Component> = full.components().collect();
     let Some(Component::Normal(leaf)) = parts.pop() else {
@@ -2770,6 +2755,43 @@ fn now_ms() -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A plain edit that comes while a `..` edit waits for the resolver's worker comes out after it.
+    #[test]
+    fn a_plain_edit_waits_behind_a_dotted_one_whose_worker_has_not_answered() {
+        use crate::tabs::TabId;
+        use std::sync::{Arc, Mutex};
+        let (release, gate) = mpsc::channel::<()>();
+        let gate = Mutex::new(gate);
+        let mut flow = ReviewFlow::new();
+        flow.live_resolver = LiveResolver::with(Arc::new(move |root: &Path, named: &Path| {
+            let _ = gate.lock().unwrap().recv();
+            Some(root.join(named.file_name()?))
+        }));
+        let edit = |path: &str| LiveEdit {
+            tab: TabId(1),
+            session: "s".into(),
+            turn_id: "t".into(),
+            path: PathBuf::from(path),
+        };
+        let root = Path::new("/w/project");
+        let now = Instant::now();
+        assert!(flow.live_intake(Some(root), vec![edit("x/../a.txt")], now).is_empty());
+        assert!(
+            flow.live_intake(Some(root), vec![edit("b.txt")], now).is_empty(),
+            "the plain edit waits behind the one being resolved"
+        );
+        drop(release);
+        let mut out = Vec::new();
+        let deadline = Instant::now() + Duration::from_secs(30);
+        while out.len() < 2 && Instant::now() < deadline {
+            out.extend(flow.live_intake(Some(root), Vec::new(), now));
+            std::thread::sleep(Duration::from_millis(2));
+        }
+        let paths: Vec<PathBuf> = out.into_iter().map(|e| e.path).collect();
+        assert_eq!(paths, [root.join("a.txt"), root.join("b.txt")]);
+        assert!(flow.live_is_idle());
+    }
 
     #[test]
     fn a_dotted_live_edit_path_is_resolved_against_the_disk() {

@@ -2874,6 +2874,23 @@ fn live_show_uses_the_global_autoread_value_when_the_buffer_inherits_it() {
     assert_eq!(count(&live_show(&mut fx, &path, "t1", 32, &two.hunks), "drawn"), 2);
 }
 
+/// The drawn buffer inherits the global `autoread` (on) while the current buffer is another one with
+/// `noautoread` set locally: the drawn buffer's own value decides, so it is reloaded and drawn.
+#[test]
+#[ignore = "needs nvim"]
+fn live_show_reads_the_global_autoread_not_the_current_buffers() {
+    let mut fx = Fx::new("live-global-not-current");
+    let (path, two) = live_two(&mut fx);
+    fx.nvim.command("setglobal autoread");
+    // `set {option}<` leaves the buffer with no local value of its own (`setlocal {option}<` would copy
+    // the global one into it, and the fallback would never be read).
+    fx.nvim.command("set autoread<");
+    fx.nvim.command("vsplit");
+    fx.nvim.command("enew");
+    fx.nvim.command("setlocal noautoread");
+    assert_eq!(count(&live_show(&mut fx, &path, "t1", 32, &two.hunks), "drawn"), 2);
+}
+
 #[test]
 #[ignore = "needs nvim"]
 fn live_show_leaves_saved_reverted_hunks_followed() {

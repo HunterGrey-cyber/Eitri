@@ -1270,7 +1270,8 @@ function state.live_show(path, meta, hunks)
     return status(answer)
   end
   local autoread = api.nvim_get_option_value('autoread', { buf = buf })
-  if autoread == nil or autoread == -1 then autoread = vim.o.autoread end
+  -- Unset in the buffer: the global value, not the current buffer's (`vim.o` reads that one's local).
+  if autoread == nil or autoread == -1 then autoread = vim.go.autoread end
   local before = state.overlays[buf]
   if autoread then
     state.reloading[buf] = true

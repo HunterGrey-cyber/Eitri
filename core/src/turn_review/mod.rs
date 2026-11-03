@@ -36,6 +36,7 @@ pub mod lifecycle;
 pub mod live_contest;
 pub mod live_draws;
 pub mod live_job;
+mod live_resolve;
 pub mod message;
 pub mod presence;
 pub mod proposal_write;
