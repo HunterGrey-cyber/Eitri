@@ -392,9 +392,13 @@ window.editor-hole, window.editor-hole .shell-root, window.editor-hole .content-
 /* The project chooser (`gtk_host::project_chooser`): one panel in the top bar's own guarded pair, opaque so it reads the
    same over any module and the editor's subsurface never shows through. The line is the place typing goes, so it stands
    on the content's own pair, as the rename entry does, and shows no focus ring: the caret says where the keys are. A
-   row's name is the text to find, its path and its right-hand word (`open`, `gone`, an age) are quiet; `gone` also takes
-   the name to the muted token, never opacity, and stays a word. Title, message, footer and row text share one left edge,
-   the line's own text: its 8px of padding and 1px of border. */
+   row's name is the text to find, its path and its right-hand words (`open`, `gone`, an age, `git`) are quiet; `gone`
+   also takes the name to the muted token, never opacity or another weight (the name column is a fixed number of
+   characters in the name's font, so every name keeps one), and stays a word. The rows are a list view's: the
+   selection and the pointer are on its `row` node, the name and the words on the row's own box inside it. A message
+   about a folder shows the folder quiet beside its words. The panel's `browsing` class (a folder's subfolders on
+   show) changes no colour. Title, message, footer and row text share one left edge, the line's own text: its 8px of
+   padding and 1px of border. */
 .project-chooser-panel {{
     background-color: {bar};
     color: {bar_fg};
@@ -414,6 +418,12 @@ window.editor-hole, window.editor-hole .shell-root, window.editor-hole .content-
     color: {bar_fg};
     font-size: 12px;
     padding: 0 9px;
+}}
+
+.project-chooser-message-path {{
+    color: {bar_muted};
+    font-size: 12px;
+    padding: 0 9px 0 0;
 }}
 
 .project-chooser-footer {{
@@ -468,7 +478,7 @@ window.editor-hole, window.editor-hole .shell-root, window.editor-hole .content-
     min-height: 24px;
 }}
 
-.project-chooser-row {{
+.project-chooser-list > row {{
     background-color: transparent;
     background-image: none;
     border-radius: 4px;
@@ -494,41 +504,40 @@ window.editor-hole, window.editor-hole .shell-root, window.editor-hole .content-
 
 .project-chooser-row.dimmed .project-chooser-name {{
     color: {bar_muted};
-    font-weight: 400;
 }}
 
 /* `cursorline` is guarded against `fg` and `muted`, not against the bar's pair, so the row under the pointer changes its
    text with its fill. */
-.project-chooser-row:hover {{
+.project-chooser-list > row:hover {{
     background-color: {hover};
 }}
 
-.project-chooser-row:hover .project-chooser-name {{
+.project-chooser-list > row:hover .project-chooser-name {{
     color: {fg};
 }}
 
-.project-chooser-row:hover .project-chooser-path {{
+.project-chooser-list > row:hover .project-chooser-path {{
     color: {muted};
 }}
 
-.project-chooser-row:hover .project-chooser-right {{
+.project-chooser-list > row:hover .project-chooser-right {{
     color: {muted};
 }}
 
 /* The selected row is the window's cursor, the guarded pair reversed. Last, so it stays the cursor under the pointer. */
-.project-chooser-row:selected {{
+.project-chooser-list > row:selected {{
     background-color: {bar_fg};
 }}
 
-.project-chooser-row:selected .project-chooser-name {{
+.project-chooser-list > row:selected .project-chooser-name {{
     color: {bar};
 }}
 
-.project-chooser-row:selected .project-chooser-path {{
+.project-chooser-list > row:selected .project-chooser-path {{
     color: {bar};
 }}
 
-.project-chooser-row:selected .project-chooser-right {{
+.project-chooser-list > row:selected .project-chooser-right {{
     color: {bar};
 }}
 
@@ -831,6 +840,7 @@ mod tests {
                 (".project-chooser-panel", t.surface_fg, t.surface),
                 (".project-chooser-title", t.surface_fg, t.surface),
                 (".project-chooser-message", t.surface_fg, t.surface),
+                (".project-chooser-message-path", t.surface_muted, t.surface),
                 (".project-chooser-footer", t.surface_muted, t.surface),
                 (".project-chooser-name", t.surface_fg, t.surface),
                 (".project-chooser-path", t.surface_muted, t.surface),
@@ -843,29 +853,33 @@ mod tests {
                 (".project-chooser-line", t.fg, t.bg),
                 (".project-chooser-line placeholder", t.muted, t.bg),
                 (".project-chooser-line selection", t.bg, t.fg),
-                (".project-chooser-row:hover .project-chooser-name", t.fg, t.cursorline),
                 (
-                    ".project-chooser-row:hover .project-chooser-path",
+                    ".project-chooser-list > row:hover .project-chooser-name",
+                    t.fg,
+                    t.cursorline,
+                ),
+                (
+                    ".project-chooser-list > row:hover .project-chooser-path",
                     t.muted,
                     t.cursorline,
                 ),
                 (
-                    ".project-chooser-row:hover .project-chooser-right",
+                    ".project-chooser-list > row:hover .project-chooser-right",
                     t.muted,
                     t.cursorline,
                 ),
                 (
-                    ".project-chooser-row:selected .project-chooser-name",
+                    ".project-chooser-list > row:selected .project-chooser-name",
                     t.surface,
                     t.surface_fg,
                 ),
                 (
-                    ".project-chooser-row:selected .project-chooser-path",
+                    ".project-chooser-list > row:selected .project-chooser-path",
                     t.surface,
                     t.surface_fg,
                 ),
                 (
-                    ".project-chooser-row:selected .project-chooser-right",
+                    ".project-chooser-list > row:selected .project-chooser-right",
                     t.surface,
                     t.surface_fg,
                 ),
@@ -880,8 +894,8 @@ mod tests {
             for (selector, fill) in [
                 (".project-chooser-panel", t.surface),
                 (".project-chooser-line", t.bg),
-                (".project-chooser-row:hover", t.cursorline),
-                (".project-chooser-row:selected", t.surface_fg),
+                (".project-chooser-list > row:hover", t.cursorline),
+                (".project-chooser-list > row:selected", t.surface_fg),
             ] {
                 let body = rule(&css, selector);
                 assert!(
@@ -901,10 +915,10 @@ mod tests {
             css.find(&format!("\n{selector} {{"))
                 .unwrap_or_else(|| panic!("no rule {selector}"))
         };
-        let name = at(".project-chooser-row:selected .project-chooser-name");
-        assert!(at(".project-chooser-row:hover .project-chooser-name") < name);
+        let name = at(".project-chooser-list > row:selected .project-chooser-name");
+        assert!(at(".project-chooser-list > row:hover .project-chooser-name") < name);
         assert!(at(".project-chooser-row.dimmed .project-chooser-name") < name);
-        assert!(at(".project-chooser-row:hover") < at(".project-chooser-row:selected"));
+        assert!(at(".project-chooser-list > row:hover") < at(".project-chooser-list > row:selected"));
     }
 
     /// The chooser's fills and text all come from the scheme: a colour left to GTK's default theme would be a pale entry
@@ -938,7 +952,7 @@ mod tests {
         }
         assert!(seen >= 10, "the chooser's rules were not found");
         assert!(rule(&css, ".project-chooser-list").contains("\n    background-color: transparent;"));
-        assert!(rule(&css, ".project-chooser-row").contains("\n    background-color: transparent;"));
+        assert!(rule(&css, ".project-chooser-list > row").contains("\n    background-color: transparent;"));
     }
 
     /// GTK's scrollbar asks for more than one row by default, and a scrolled list is never shorter than its scrollbar.

@@ -3,6 +3,7 @@
 use std::cell::RefCell;
 use std::process::Command;
 use std::rc::Rc;
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use eitri_core::project_chooser::{ChooserView, LineEv, RowKind, RowView};
@@ -49,11 +50,15 @@ fn view() -> ChooserView {
     }
 }
 
+/// What the carrier does on a pick before the next event is read: the launch window redraws synchronously.
+type OnPick = Rc<RefCell<Option<Box<dyn Fn(&ProjectChooserView)>>>>;
+
 struct Stage {
     window: gtk4::Window,
     overlay: gtk4::Overlay,
-    chooser: ProjectChooserView,
+    chooser: Rc<ProjectChooserView>,
     reports: Rc<RefCell<Vec<ChooserReport>>>,
+    on_pick: OnPick,
 }
 
 impl Stage {
@@ -63,10 +68,22 @@ impl Stage {
 
     fn sized(width: i32) -> Self {
         let reports = Rc::new(RefCell::new(Vec::new()));
-        let chooser = ProjectChooserView::new(Rc::new({
+        let on_pick: OnPick = Rc::new(RefCell::new(None));
+        let me: Rc<RefCell<std::rc::Weak<ProjectChooserView>>> = Rc::new(RefCell::new(std::rc::Weak::new()));
+        let chooser = Rc::new(ProjectChooserView::new(Rc::new({
             let reports = reports.clone();
-            move |report| reports.borrow_mut().push(report)
-        }));
+            let on_pick = on_pick.clone();
+            let me = me.clone();
+            move |report| {
+                let pick = matches!(report, ChooserReport::Pick { .. });
+                reports.borrow_mut().push(report);
+                let chooser = me.borrow().upgrade();
+                if let (true, Some(chooser), Some(hook)) = (pick, chooser, on_pick.borrow().as_ref()) {
+                    hook(&chooser);
+                }
+            }
+        })));
+        *me.borrow_mut() = Rc::downgrade(&chooser);
         let window = gtk4::Window::new();
         window.set_title(Some("eitri-project-placement"));
         window.set_default_size(width, 500);
@@ -80,7 +97,26 @@ impl Stage {
             overlay,
             chooser,
             reports,
+            on_pick,
         }
+    }
+
+    fn rows(&self) -> Vec<gtk4::Widget> {
+        let mut rows: Vec<_> = self
+            .widgets()
+            .into_iter()
+            .filter(|w| w.has_css_class("project-chooser-row") && w.is_mapped())
+            .collect();
+        rows.sort_by_key(|w| w.compute_bounds(&self.window).map_or(i32::MAX, |b| b.y() as i32));
+        rows
+    }
+
+    fn labelled(&self, class: &str) -> gtk4::Label {
+        self.widgets()
+            .into_iter()
+            .find(|w| w.has_css_class(class))
+            .and_then(|w| w.downcast::<gtk4::Label>().ok())
+            .unwrap_or_else(|| panic!("no label .{class}"))
     }
 
     fn show(&self) {
@@ -173,19 +209,24 @@ fn it_never_raises_the_windows_minimum() {
         .filter_map(|w| w.downcast::<gtk4::Label>().ok())
         .collect();
     assert!(labels.iter().all(|l| !l.uses_markup()));
-    assert!(labels.iter().any(|l| l.text().starts_with("<b>应用</b>?")));
+    assert!(labels.iter().any(|l| l
+        .text()
+        .trim_start_matches(['\u{200e}', '\u{2068}'])
+        .starts_with("<b>应用</b>?")));
+    assert!(!entry_text(&stage).contains('\u{2068}'), "the line holds no isolate");
 }
 
 fn a_row_click_reports_a_pick_and_the_line_keeps_the_keys(display: &str) {
     let stage = Stage::new();
     stage.show();
     assert!(stage.entry_has_keys(), "focus before the first draw reaches the line");
-    let row = stage
+    let list = stage
         .widgets()
         .into_iter()
-        .find_map(|w| w.downcast::<gtk4::ListBoxRow>().ok())
+        .find(|w| w.has_css_class("project-chooser-list"))
         .unwrap();
-    assert!(!row.is_focusable());
+    assert!(!list.can_focus(), "no row can take the keys from the line");
+    let row = stage.rows().into_iter().next().unwrap();
     let bounds = row.compute_bounds(&stage.window).unwrap();
     click(
         display,
@@ -327,8 +368,8 @@ fn the_list_reports_plain_keys_and_the_line_takes_text(display: &str) {
     }
     assert_eq!(keys_of(&stage), vec!['j', 'k', 'g', 'G', '/', 'q', '~']);
     assert_eq!(entry_text(&stage), "", "the list's keys are not the entry's text");
-    xdo(display, &["key", "--clearmodifiers", "BackSpace"]);
-    xdo(display, &["key", "--clearmodifiers", "Left"]);
+    xdo(display, &["key", "--clearmodifiers", "Delete"]);
+    xdo(display, &["key", "--clearmodifiers", "Home"]);
     pump();
     let others = |stage: &Stage| {
         stage
@@ -343,7 +384,19 @@ fn the_list_reports_plain_keys_and_the_line_takes_text(display: &str) {
     xdo(display, &["key", "--clearmodifiers", "Return"]);
     xdo(display, &["key", "--clearmodifiers", "Escape"]);
     pump();
+    xdo(display, &["key", "--clearmodifiers", "BackSpace"]);
+    xdo(display, &["key", "--clearmodifiers", "Left"]);
+    xdo(display, &["key", "--clearmodifiers", "Right"]);
+    pump();
     let reports = stage.reports.borrow();
+    let browse: Vec<_> = reports
+        .iter()
+        .filter_map(|r| match r {
+            ChooserReport::Line(ev @ (LineEv::Up | LineEv::Side(_))) => Some(ev.clone()),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(browse, vec![LineEv::Up, LineEv::Side(-1), LineEv::Side(1)]);
     assert!(reports
         .iter()
         .any(|r| matches!(r, ChooserReport::Line(LineEv::Step(1)))));
@@ -357,6 +410,13 @@ fn the_list_reports_plain_keys_and_the_line_takes_text(display: &str) {
     assert_eq!(entry_text(&stage), "j", "in the line a plain key is text");
     assert_eq!(keys_of(&stage).len(), 7, "and no command");
     assert_eq!(others(&stage), 2, "and no other-key report");
+    xdo(display, &["key", "--clearmodifiers", "ctrl+w"]);
+    pump();
+    assert!(stage
+        .reports
+        .borrow()
+        .iter()
+        .any(|r| matches!(r, ChooserReport::Line(LineEv::DeleteSegment))));
 }
 
 fn updates_over(stage: &Stage, millis: u64) -> u32 {
@@ -416,6 +476,296 @@ fn a_long_message_does_not_widen_the_panel() {
     assert!(panel.width() <= 640, "the panel is {} px", panel.width());
 }
 
+fn folders(n: usize) -> ChooserView {
+    let mut rows = vec![RowView {
+        name: ".".into(),
+        shown: "~/src".into(),
+        right: "this folder".into(),
+        dimmed: false,
+        kind: RowKind::Here,
+    }];
+    rows.extend((1..n).map(|i| RowView {
+        name: format!("folder-{i}/"),
+        shown: String::new(),
+        right: if i % 3 == 0 { "git".into() } else { String::new() },
+        dimmed: false,
+        kind: RowKind::Folder,
+    }));
+    ChooserView {
+        title: "Browse folders".into(),
+        line: "~/src/".into(),
+        placeholder: String::new(),
+        rows: Arc::from(rows),
+        selected: Some(0),
+        message: None,
+        footer: "Enter open src · l in · h up · / filter · . hidden · Esc back · q close".into(),
+        opening: false,
+        in_line: false,
+        browsing: true,
+        hidden: false,
+        rows_rev: 7,
+    }
+}
+
+/// Moving the cursor over a long folder keeps a bounded set of row widgets: the list view makes widgets for a window
+/// of rows around what is on screen (GTK keeps about two hundred), never one per row, and a folder three times longer
+/// makes no more of them.
+fn a_2000_row_view_keeps_its_row_widgets_bounded() {
+    let stage = Stage::sized(720);
+    stage.overlay.add_overlay(stage.chooser.widget());
+    stage.chooser.focus();
+    let row_widgets = |stage: &Stage| {
+        stage
+            .widgets()
+            .into_iter()
+            .filter(|w| w.has_css_class("project-chooser-row"))
+            .count()
+    };
+    let mut view = folders(2000);
+    stage.chooser.show(Some(&view));
+    pump();
+    for i in 1..=100 {
+        view.selected = Some(i);
+        stage.chooser.show(Some(&view));
+        while gtk4::glib::MainContext::default().iteration(false) {}
+    }
+    pump();
+    view.selected = Some(1999);
+    stage.chooser.show(Some(&view));
+    pump();
+    pump();
+    let rows = row_widgets(&stage);
+    println!("row widgets: {rows} for 2000 rows");
+    assert!(rows <= 256, "{rows} row widgets for 2000 rows");
+    let last = stage.rows().into_iter().last().expect("rows on screen");
+    let name = last
+        .first_child()
+        .and_then(|w| w.downcast::<gtk4::Label>().ok())
+        .unwrap();
+    assert!(
+        name.text().contains("folder-1999/"),
+        "G shows the last row: {}",
+        name.text()
+    );
+    let mut longer = folders(6000);
+    longer.rows_rev = 8;
+    longer.selected = Some(5999);
+    stage.chooser.show(Some(&longer));
+    pump();
+    pump();
+    let more = row_widgets(&stage);
+    println!("row widgets: {more} for 6000 rows");
+    assert!(
+        more <= rows + 8,
+        "{more} row widgets for 6000 rows against {rows} for 2000"
+    );
+    let panel = stage
+        .widgets()
+        .into_iter()
+        .find(|w| w.has_css_class("project-chooser-panel"))
+        .unwrap();
+    assert!(panel.has_css_class("browsing"), "the panel says it shows a folder");
+    view.browsing = false;
+    stage.chooser.show(Some(&view));
+    pump();
+    assert!(!panel.has_css_class("browsing"));
+}
+
+/// A double-click carries the revision its first press saw: when that press changed the rows (a redraw in the same
+/// turn), the second press must not act on the new rows.
+fn a_double_click_reports_pick_twice_with_its_first_press_rev(display: &str) {
+    let stage = Stage::sized(720);
+    stage.overlay.add_overlay(stage.chooser.widget());
+    stage.chooser.focus();
+    let first = folders(5);
+    stage.chooser.show(Some(&first));
+    pump();
+    let row = stage.rows().into_iter().nth(1).unwrap();
+    let bounds = row.compute_bounds(&stage.window).unwrap();
+    let (x, y) = ((bounds.x() + 8.0) as i32, (bounds.y() + bounds.height() / 2.0) as i32);
+    let double = |stage: &Stage| {
+        // Clicks closer together than the double-click time count on from the last ones: let the last ones end.
+        std::thread::sleep(Duration::from_millis(800));
+        pump();
+        let xid = xdo(
+            display,
+            &["search", "--onlyvisible", "--name", "^eitri-project-placement$"],
+        );
+        xdo(display, &["windowfocus", &xid]);
+        xdo(
+            display,
+            &["mousemove", "--window", &xid, &x.to_string(), &y.to_string()],
+        );
+        xdo(display, &["click", "--repeat", "2", "--delay", "60", "1"]);
+        pump();
+        let picks: Vec<(bool, usize, u64)> = stage
+            .reports
+            .borrow_mut()
+            .drain(..)
+            .filter_map(|r| match r {
+                ChooserReport::Pick { index, rows_rev } => Some((false, index, rows_rev)),
+                ChooserReport::PickTwice { index, rows_rev } => Some((true, index, rows_rev)),
+                _ => None,
+            })
+            .collect();
+        picks
+    };
+    assert_eq!(
+        double(&stage),
+        vec![(false, 1, 7), (true, 1, 7)],
+        "a click selects, the second press acts on the same rows"
+    );
+    *stage.on_pick.borrow_mut() = Some(Box::new(|chooser: &ProjectChooserView| {
+        let mut next = folders(3);
+        next.rows_rev = 8;
+        chooser.show(Some(&next));
+    }));
+    let picks = double(&stage);
+    assert_eq!(picks.first(), Some(&(false, 1, 7)));
+    assert!(
+        picks.contains(&(true, 1, 7)),
+        "the second press keeps the first press's revision, not the redrawn rows': {picks:?}"
+    );
+    assert!(!picks.iter().any(|(twice, _, rev)| *twice && *rev == 8), "{picks:?}");
+}
+
+fn picks_of(stage: &Stage) -> Vec<usize> {
+    stage
+        .reports
+        .borrow_mut()
+        .drain(..)
+        .filter_map(|r| match r {
+            ChooserReport::Pick { index, .. } => Some(index),
+            _ => None,
+        })
+        .collect()
+}
+
+/// A press let go away from the row it pressed picks nothing, as a button's does; one let go on its own row picks it,
+/// however far it moved inside the row and however long it was held.
+fn a_press_let_go_off_its_row_picks_nothing(display: &str) {
+    let stage = Stage::sized(720);
+    stage.overlay.add_overlay(stage.chooser.widget());
+    stage.chooser.focus();
+    stage.chooser.show(Some(&folders(5)));
+    pump();
+    let rows = stage.rows();
+    let at = |row: usize, dx: f32| {
+        let bounds = rows[row].compute_bounds(&stage.window).unwrap();
+        ((bounds.x() + dx) as i32, (bounds.y() + bounds.height() / 2.0) as i32)
+    };
+    let press = |from: (i32, i32), to: (i32, i32), hold: u64| {
+        // Presses closer together than the double-click time count on from the last ones: let the last ones end.
+        std::thread::sleep(Duration::from_millis(800));
+        pump();
+        let xid = xdo(
+            display,
+            &["search", "--onlyvisible", "--name", "^eitri-project-placement$"],
+        );
+        xdo(display, &["windowfocus", &xid]);
+        let to_point = |(x, y): (i32, i32)| {
+            xdo(
+                display,
+                &["mousemove", "--window", &xid, &x.to_string(), &y.to_string()],
+            );
+            pump();
+        };
+        to_point(from);
+        xdo(display, &["mousedown", "1"]);
+        pump();
+        to_point(to);
+        std::thread::sleep(Duration::from_millis(hold));
+        pump();
+        xdo(display, &["mouseup", "1"]);
+        pump();
+        picks_of(&stage)
+    };
+    assert_eq!(
+        press(at(1, 8.0), at(3, 8.0), 0),
+        Vec::<usize>::new(),
+        "let go on another row"
+    );
+    assert_eq!(press(at(1, 8.0), at(1, 60.0), 0), vec![1], "moved inside its own row");
+    assert_eq!(
+        press(at(2, 8.0), at(2, 8.0), 700),
+        vec![2],
+        "held past the double-click time"
+    );
+}
+
+/// A row takes a click anywhere in its highlight, the side padding of the list's own row included.
+fn a_click_in_a_rows_padding_picks_it(display: &str) {
+    // The theme's row padding (`.project-chooser-list > row`), which this harness does not load otherwise.
+    let css = gtk4::CssProvider::new();
+    css.load_from_string(".project-chooser-list > row { padding: 0 9px; }");
+    let screen = gtk4::gdk::Display::default().unwrap();
+    gtk4::style_context_add_provider_for_display(&screen, &css, gtk4::STYLE_PROVIDER_PRIORITY_APPLICATION);
+    let stage = Stage::sized(720);
+    stage.overlay.add_overlay(stage.chooser.widget());
+    stage.chooser.focus();
+    stage.chooser.show(Some(&folders(5)));
+    pump();
+    let row = stage.rows().into_iter().nth(2).unwrap();
+    let inner = row.compute_bounds(&stage.window).unwrap();
+    let outer = row.parent().unwrap().compute_bounds(&stage.window).unwrap();
+    assert!(
+        inner.x() - outer.x() >= 4.0,
+        "the list's row pads ours: {} against {}",
+        outer.x(),
+        inner.x()
+    );
+    std::thread::sleep(Duration::from_millis(800));
+    pump();
+    stage.reports.borrow_mut().clear();
+    click(
+        display,
+        &stage,
+        (outer.x() + 2.0) as i32,
+        (inner.y() + inner.height() / 2.0) as i32,
+    );
+    let picks = picks_of(&stage);
+    gtk4::style_context_remove_provider_for_display(&screen, &css);
+    assert_eq!(picks, vec![2], "a click in the padding picks the row");
+}
+
+/// The folder in a message is its own label and gives way at its start; the words before it are never cut.
+fn the_path_label_ellipsizes_at_the_start_and_the_action_words_stay() {
+    for width in [720, 400] {
+        let stage = Stage::sized(width);
+        stage.overlay.add_overlay(stage.chooser.widget());
+        stage.chooser.focus();
+        let mut stuck = folders(1);
+        let deep = "/mnt/nas/".to_owned() + &"very-long-folder-name/".repeat(12);
+        stuck.message = Some(format!("not answering · h goes back\t{deep}"));
+        stage.chooser.show(Some(&stuck));
+        pump();
+        pump();
+        let words = stage.labelled("project-chooser-message");
+        let path = stage.labelled("project-chooser-message-path");
+        assert_eq!(words.text(), "not answering · h goes back");
+        assert!(!words.layout().is_ellipsized(), "{width}: the action words are whole");
+        assert!(path.is_visible());
+        assert_eq!(path.ellipsize(), gtk4::pango::EllipsizeMode::Start);
+        assert!(path.layout().is_ellipsized(), "{width}: the folder gives way");
+        assert!(
+            path.text().ends_with("very-long-folder-name/\u{2069}"),
+            "{}",
+            path.text()
+        );
+        let panel = stage
+            .widgets()
+            .into_iter()
+            .find(|w| w.has_css_class("project-chooser-panel"))
+            .unwrap();
+        assert!(panel.width() <= 640, "{width}: the panel is {} px", panel.width());
+        assert!(path.compute_bounds(&panel).unwrap().x() > words.compute_bounds(&panel).unwrap().x());
+        stuck.message = Some("Opening atlas…".into());
+        stage.chooser.show(Some(&stuck));
+        pump();
+        assert!(!path.is_visible(), "a message with no folder is words alone");
+    }
+}
+
 fn run(filter: &Option<String>, name: &str, check: impl FnOnce()) {
     if filter.as_ref().is_some_and(|f| !name.contains(f.as_str())) {
         return;
@@ -466,5 +816,24 @@ fn main() {
         f,
         "a_long_message_does_not_widen_the_panel",
         a_long_message_does_not_widen_the_panel,
+    );
+    run(
+        f,
+        "a_2000_row_view_keeps_its_row_widgets_bounded",
+        a_2000_row_view_keeps_its_row_widgets_bounded,
+    );
+    run(f, "a_double_click_reports_pick_twice_with_its_first_press_rev", || {
+        a_double_click_reports_pick_twice_with_its_first_press_rev(d)
+    });
+    run(f, "a_press_let_go_off_its_row_picks_nothing", || {
+        a_press_let_go_off_its_row_picks_nothing(d)
+    });
+    run(f, "a_click_in_a_rows_padding_picks_it", || {
+        a_click_in_a_rows_padding_picks_it(d)
+    });
+    run(
+        f,
+        "the_path_label_ellipsizes_at_the_start_and_the_action_words_stay",
+        the_path_label_ellipsizes_at_the_start_and_the_action_words_stay,
     );
 }
