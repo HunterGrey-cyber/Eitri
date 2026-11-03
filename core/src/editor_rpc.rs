@@ -14,6 +14,21 @@ use rmpv::Value;
 
 use crate::nvim_rpc::{NvimLink, Pending};
 
+/// The glue owned by one connection in the editor.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum GlueSlot {
+    Agent,
+    Page(String),
+}
+
+/// Which glue slot a connection owns and the channel it is reached on: the pair the editor checks before it
+/// lets a connection's calls touch that slot's state.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Glue {
+    pub slot: GlueSlot,
+    pub chan: u64,
+}
+
 /// **Calls are written in the order they were made.** Every call made through one handle reaches
 /// nvim after every call made through it before, and nvim runs them in that order; each is answered
 /// by its own request id, so a later call is written at once, never held back until an earlier one
@@ -39,6 +54,11 @@ pub trait EditorRpc {
     /// The order above holds within one target: a call to the next editor is not ordered with one
     /// still out at the last.
     fn target(&self) -> Option<u64>;
+
+    /// The slot held by this connection, when it installed glue in the user's own editor.
+    fn glue(&self) -> Option<Glue> {
+        None
+    }
 
     /// Whether the person can see this editor now. Only a window that lays the editor out can say no: any other
     /// transport reaches an nvim of the person's own, in a place Eitri does not know.

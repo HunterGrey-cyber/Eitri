@@ -14,8 +14,8 @@ use std::sync::mpsc::Receiver;
 use std::time::{Duration, Instant};
 
 use eitri_core::companion::{
-    client_info_params, install_args, parse_install_report, InstallReport, Sockets, INSTALL_LUA, REPLACED_METHOD,
-    TEARDOWN_LUA,
+    client_info_params, install_args, parse_install_report, InstallKind, InstallReport, Sockets, INSTALL_LUA,
+    REPLACED_METHOD, TEARDOWN_LUA,
 };
 use eitri_core::nvim_rpc::{LinkEvent, NvimLink, Pending};
 use rmpv::Value;
@@ -325,8 +325,8 @@ impl Panel {
         let (link, events) = nvim.connect();
         let chan = link.channel_id();
         // Not waited for: it is not api-fast, so it queues behind a char-wait like the install does.
-        let _ = link.call("nvim_set_client_info", client_info_params());
-        let install = link.exec_lua(INSTALL_LUA, install_args(chan, sockets));
+        let _ = link.call("nvim_set_client_info", client_info_params(&InstallKind::Agent));
+        let install = link.exec_lua(INSTALL_LUA, install_args(chan, sockets, &InstallKind::Agent));
         Panel {
             link,
             events,
@@ -343,7 +343,9 @@ impl Panel {
     /// Install again from this same connection.
     fn install_again(&self, sockets: &Sockets) -> InstallReport {
         let value = finish(
-            &self.link.exec_lua(INSTALL_LUA, install_args(self.chan, sockets)),
+            &self
+                .link
+                .exec_lua(INSTALL_LUA, install_args(self.chan, sockets, &InstallKind::Agent)),
             "the second install",
             Duration::from_secs(5),
         );

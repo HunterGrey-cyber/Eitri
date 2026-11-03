@@ -116,7 +116,7 @@ local function send_now()
   send(false)
 end
 
-local augroup = vim.api.nvim_create_augroup("EitriThemeFeed", { clear = true })
+local augroup = vim.api.nvim_create_augroup((type(opts) == "table" and opts.group) or "EitriThemeFeed", { clear = true })
 vim.api.nvim_create_autocmd("VimEnter", { group = augroup, once = true, callback = function()
   read_start_scale()
 end })
@@ -138,6 +138,9 @@ local resnapshot_timer = vim.uv.new_timer()
 -- runs in one -- `vim.schedule_wrap` defers it onto the main loop, same as every other libuv
 -- callback that touches the API in this workspace.
 resnapshot_timer:start(RESNAPSHOT_INTERVAL_MS, RESNAPSHOT_INTERVAL_MS, vim.schedule_wrap(function()
+  if torn then
+    return
+  end
   send(true)
 end))
 

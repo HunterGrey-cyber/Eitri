@@ -5,6 +5,32 @@
 -- owner (a plugin id). Runs on LuaJIT and PUC 5.1.
 local op, opts = ...
 
+-- A stale connection cannot change the current holder's glue, including during editor startup.
+-- With no id the reference names the agent slot; an id names a page slot.
+local slot
+if opts.slot ~= nil then
+  local ref = opts.slot
+  if type(ref) ~= 'table' or type(ref.chan) ~= 'number' then
+    return { ok = false, slot = false }
+  end
+  if ref.id == nil then
+    slot = rawget(_G, '__eitri_companion')
+  elseif type(ref.id) == 'string' then
+    local pages = rawget(_G, '__eitri_pages')
+    slot = pages and pages[ref.id]
+  end
+  if type(slot) ~= 'table' or slot.torn or slot.chan ~= ref.chan or type(slot.adopt) ~= 'function' then
+    return { ok = false, slot = false }
+  end
+  if op ~= 'install' then
+    local all = rawget(_G, '__eitri_plugin_follow')
+    local st = all and all[opts.owner]
+    if st == nil or st.torn or st.slot_chan ~= ref.chan or st.slot_id ~= ref.id then
+      return { ok = false, slot = false }
+    end
+  end
+end
+
 local uv = vim.uv or vim.loop
 
 -- View lines are throttled to one per VIEW_MS per owner, leading and trailing: fast enough for scroll sync,
@@ -70,6 +96,10 @@ local function followable(st, buf)
     return false
   end
   local name = vim.api.nvim_buf_get_name(buf)
+  local prefix = st.scratch_prefix
+  if prefix and name:sub(1, #prefix) == prefix then
+    return false
+  end
   local dir = st.scratch_dir
   if dir and name ~= '' and (name == dir or name:sub(1, #dir + 1) == dir .. '/') then
     return false
@@ -145,8 +175,11 @@ local function watch_text(st, buf)
       st.text_queued = true
       -- Buffer callbacks run under textlock; the view is built on the main loop.
       vim.schedule(function()
+        if st.torn then
+          return
+        end
         st.text_queued = false
-        if not st.torn and st.following then
+        if st.following then
           changed(st)
         end
       end)
@@ -332,14 +365,16 @@ local function stop_following(st)
   st.following = false
 end
 
-local function teardown(o)
-  local all = rawget(_G, '__eitri_plugin_follow')
-  local st = all and all[o.owner]
-  if st == nil then
-    return { ok = true }
-  end
+local function teardown_state(st)
   st.torn = true
-  all[o.owner] = nil
+  local all = rawget(_G, '__eitri_plugin_follow')
+  if all and all[st.owner] == st then
+    all[st.owner] = nil
+    -- A slot leaving the user's editor takes its empty registry away with it.
+    if st.slot_chan ~= nil and next(all) == nil then
+      _G.__eitri_plugin_follow = nil
+    end
+  end
   pcall(vim.api.nvim_del_augroup_by_name, 'EitriPluginFollow_' .. st.owner)
   stop_following(st)
   -- A command is deleted only while it is still the one this owner defined; nvim reports a Lua command's
@@ -350,6 +385,14 @@ local function teardown(o)
     if cmd ~= nil and cmd.definition == desc then
       pcall(vim.api.nvim_del_user_command, name)
     end
+  end
+  return { ok = true }
+end
+
+local function teardown(o)
+  local st = state_of(o.owner)
+  if st ~= nil then
+    teardown_state(st)
   end
   return { ok = true }
 end
@@ -396,6 +439,9 @@ local function install(o)
     socket = o.socket,
     filetypes = filetypes,
     scratch_dir = dir,
+    scratch_prefix = type(o.scratch_prefix) == 'string' and o.scratch_prefix ~= '' and o.scratch_prefix or nil,
+    slot_chan = o.slot and o.slot.chan,
+    slot_id = o.slot and o.slot.id,
     following = false,
     seq = 0,
     defined = {},
@@ -405,6 +451,13 @@ local function install(o)
     last_sent = -VIEW_MS,
   }
   all[owner] = st
+  if slot then
+    slot.adopt(function()
+      if all[owner] == st then
+        teardown_state(st)
+      end
+    end)
+  end
   st.group = vim.api.nvim_create_augroup('EitriPluginFollow_' .. owner, { clear = true })
 
   local skipped = {}

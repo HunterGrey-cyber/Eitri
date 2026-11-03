@@ -637,6 +637,7 @@ pub(crate) fn build(app: &Application, start: &Start) -> Rc<CompanionWindow> {
         link::start(
             start.nvim.clone(),
             sockets,
+            eitri_core::companion::InstallKind::Agent,
             move |state, band, peer_pid, connect_began| {
                 let was = attached.get();
                 let now = matches!(state, LinkState::Attached { .. });
@@ -657,9 +658,10 @@ pub(crate) fn build(app: &Application, start: &Start) -> Rc<CompanionWindow> {
                 // there is no partner.
                 match state {
                     LinkState::Attached { .. } => runner_for_change.set_partner_from(peer_pid),
-                    LinkState::NoEditor | LinkState::Detached { .. } | LinkState::Failed { .. } => {
-                        runner_for_change.set_partner_from(None)
-                    }
+                    LinkState::NoEditor
+                    | LinkState::Detached { .. }
+                    | LinkState::Failed { .. }
+                    | LinkState::Refused { .. } => runner_for_change.set_partner_from(None),
                     LinkState::Connecting { .. } | LinkState::Attaching { .. } => {}
                 }
                 println!("[companion] link: {} {}", band.state, band.text);

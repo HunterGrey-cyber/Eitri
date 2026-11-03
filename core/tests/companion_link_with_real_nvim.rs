@@ -14,7 +14,9 @@ use std::time::{Duration, Instant};
 
 use eitri_core::companion::attach::{Detach, LinkState};
 use eitri_core::companion::driver::{LinkDriver, Tick};
-use eitri_core::companion::Sockets;
+use eitri_core::companion::link::CompanionLink;
+use eitri_core::companion::{InstallKind, Sockets};
+use eitri_core::editor_rpc::{EditorRpc, Glue, GlueSlot};
 use eitri_core::nvim_rpc::{LinkEvent, NvimLink, Pending};
 use rmpv::Value;
 
@@ -241,7 +243,7 @@ impl Ui {
 fn attach_install_and_nvim_quit_reach_detached_and_cancel_drafts_once() {
     let nvim = Nvim::start("quit");
     let (obs, _obs_events) = nvim.connect();
-    let mut driver = LinkDriver::new(Some(nvim.sock.clone()), nvim.sockets.clone());
+    let mut driver = LinkDriver::new(Some(nvim.sock.clone()), nvim.sockets.clone(), InstallKind::Agent);
     let mut cancels = 0;
 
     drive(
@@ -298,7 +300,7 @@ fn a_stale_address_reaches_failed_within_two_seconds() {
     nvim.child.wait().unwrap();
     assert!(nvim.sock.exists(), "kill -9 leaves the socket file behind");
 
-    let mut driver = LinkDriver::new(Some(nvim.sock.clone()), nvim.sockets.clone());
+    let mut driver = LinkDriver::new(Some(nvim.sock.clone()), nvim.sockets.clone(), InstallKind::Agent);
     let mut cancels = 0;
     drive(
         "the attach failed",
@@ -322,7 +324,7 @@ fn close_does_not_wait_for_a_blocked_nvim() {
     let (obs, _obs_events) = nvim.connect();
     let ui = Ui::attach(&nvim);
     let baseline = footprint(&obs);
-    let mut driver = LinkDriver::new(Some(nvim.sock.clone()), nvim.sockets.clone());
+    let mut driver = LinkDriver::new(Some(nvim.sock.clone()), nvim.sockets.clone(), InstallKind::Agent);
     let mut cancels = 0;
     drive(
         "the panel attached",
@@ -362,4 +364,115 @@ fn close_does_not_wait_for_a_blocked_nvim() {
     poll("the glue gone after the key", TEARDOWN_WITHIN, || {
         (footprint(&obs) == baseline).then_some(())
     });
+}
+
+#[test]
+#[ignore = "needs a real nvim on PATH; spends no tokens and needs no display"]
+fn a_page_install_pending_on_a_key_is_not_failed() {
+    let nvim = Nvim::start("pagekey");
+    let (obs, _events) = nvim.connect();
+    let ui = Ui::attach(&nvim);
+    ui.keys("f");
+    poll("nvim waiting for a key", Duration::from_secs(2), || {
+        is_blocking(&obs).then_some(())
+    });
+    let mut driver = LinkDriver::new(
+        Some(nvim.sock.clone()),
+        nvim.sockets.clone(),
+        InstallKind::Page {
+            id: "sample-page".into(),
+        },
+    );
+    let mut cancels = 0;
+    drive(
+        "the page waiting for its install",
+        &mut driver,
+        Duration::from_secs(3),
+        &mut cancels,
+        |driver, _| {
+            matches!(
+                driver.state(),
+                LinkState::Attaching {
+                    waiting_for_key: true,
+                    ..
+                }
+            )
+            .then_some(())
+        },
+    );
+    let until = Instant::now() + Duration::from_secs(1);
+    while Instant::now() < until {
+        driver.poll(Instant::now());
+        assert!(matches!(driver.state(), LinkState::Attaching { .. }));
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    ui.keys("x");
+    drive(
+        "the page attached after the key",
+        &mut driver,
+        Duration::from_secs(3),
+        &mut cancels,
+        |driver, _| matches!(driver.state(), LinkState::Attached { .. }).then_some(()),
+    );
+    assert_eq!(driver.in_tmux(), Some(false));
+    assert_eq!(
+        lua(&obs, "return _G.__eitri_pages['sample-page'] ~= nil"),
+        Value::from(true)
+    );
+    assert_eq!(lua(&obs, "return _G.__eitri_companion == nil"), Value::from(true));
+    driver.shutdown();
+    poll("the page slot removed", TEARDOWN_WITHIN, || {
+        (lua(
+            &obs,
+            "return _G.__eitri_pages == nil or _G.__eitri_pages['sample-page'] == nil",
+        ) == Value::from(true))
+        .then_some(())
+    });
+}
+
+#[test]
+#[ignore = "needs a real nvim on PATH; spends no tokens and needs no display"]
+fn glue_is_none_until_attached_and_after_detach() {
+    for (case, kind, slot) in [
+        ("glue-a", InstallKind::Agent, GlueSlot::Agent),
+        (
+            "glue-p",
+            InstallKind::Page {
+                id: "sample-page".into(),
+            },
+            GlueSlot::Page("sample-page".into()),
+        ),
+    ] {
+        let nvim = Nvim::start(case);
+        let (obs, _events) = nvim.connect();
+        let link = CompanionLink::new(Some(nvim.sock.clone()), nvim.sockets.clone(), kind);
+        assert_eq!(link.glue(), None);
+        assert_eq!(link.in_tmux(), None);
+        poll("the link attached", Duration::from_secs(3), || {
+            link.poll(Instant::now());
+            matches!(link.snapshot().0, LinkState::Attached { .. }).then_some(())
+        });
+        let LinkState::Attached { channel, .. } = link.snapshot().0 else {
+            unreachable!()
+        };
+        assert_eq!(link.glue(), Some(Glue { slot, chan: channel }));
+        assert_eq!(link.in_tmux(), Some(false));
+        let name = lua(
+            &obs,
+            &format!("return vim.api.nvim_get_chan_info({channel}).client.name"),
+        );
+        assert_eq!(
+            name.as_str(),
+            Some(if case == "glue-a" { "eitri-panel" } else { "eitri-page" })
+        );
+        drop(obs.call("nvim_command", vec![Value::from("qa!")]));
+        poll("the link detached", Duration::from_secs(2), || {
+            link.poll(Instant::now());
+            matches!(link.snapshot().0, LinkState::Detached { .. }).then_some(())
+        });
+        assert_eq!(link.glue(), None);
+        assert_eq!(link.in_tmux(), None);
+        assert!(link.slot_call("busy", vec![Value::from(true)]).is_err());
+        link.shutdown();
+    }
 }

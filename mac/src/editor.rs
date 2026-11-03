@@ -205,7 +205,11 @@ impl Editor {
         if let Some(listener) = pane_switch.as_mut().and_then(PaneSwitchChannel::take_listener) {
             feeds.add_pane_switch(PaneSwitchReader::new(listener), now);
         }
-        let link = Rc::new(CompanionLink::new(None, sockets));
+        let link = Rc::new(CompanionLink::new(
+            None,
+            sockets,
+            eitri_core::companion::InstallKind::Agent,
+        ));
         let link_wake = match link_wake_pair() {
             Some((read, write)) => {
                 link.set_wake(Arc::new(move || {
@@ -308,7 +312,10 @@ impl Editor {
             return EditorWait::Stop;
         }
         let settled = match self.link.snapshot().0 {
-            LinkState::NoEditor | LinkState::Attached { .. } | LinkState::Detached { .. } => true,
+            LinkState::NoEditor
+            | LinkState::Attached { .. }
+            | LinkState::Detached { .. }
+            | LinkState::Refused { .. } => true,
             LinkState::Failed { .. } => self.retry_until.get().is_none_or(|until| now >= until),
             LinkState::Connecting { .. } | LinkState::Attaching { .. } => false,
         };

@@ -12,7 +12,7 @@ mod embed_client;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicUsize, Ordering};
 
-use eitri_core::companion::{install_args as companion_install_args, Sockets, INSTALL_LUA, TEARDOWN_LUA};
+use eitri_core::companion::{install_args as companion_install_args, InstallKind, Sockets, INSTALL_LUA, TEARDOWN_LUA};
 use eitri_core::review_editor::{
     clear_args, install_args, open_and_show_args, parse_revert_event, parse_unrevert_event, show_args, Owner, ShowHunk,
     ShowMeta, CLEAR_ALL_LUA, CLEAR_LUA, OPEN_AND_SHOW_LUA, REVIEW_LUA, REVIEW_LUA_VERSION, SHOW_LUA, TAKE_EVENTS_LUA,
@@ -1102,7 +1102,10 @@ fn channel(nvim: &mut Embed) -> u64 {
 
 fn install_companion(nvim: &mut Embed) -> u64 {
     let chan = channel(nvim);
-    nvim.lua(INSTALL_LUA, companion_install_args(chan, &Sockets::default()));
+    nvim.lua(
+        INSTALL_LUA,
+        companion_install_args(chan, &Sockets::default(), &InstallKind::Agent),
+    );
     chan
 }
 

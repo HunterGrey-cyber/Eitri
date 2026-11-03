@@ -501,6 +501,9 @@ struct PluginHostState {
     follow_socket: Option<PathBuf>,
     /// Eitri's own scratch buffers live here; none is ever followed.
     scratch_dir: Option<PathBuf>,
+    scratch_prefix: Option<PathBuf>,
+    follow_refused: bool,
+    follow_refused_hook: Option<Rc<dyn Fn()>>,
     /// The document that called `editor.follow`.
     page_follows_document: Option<u64>,
     /// Whether the plugin's module is drawn, as the window last said.
@@ -730,6 +733,9 @@ impl PluginHost {
             follow_owed: Vec::new(),
             follow_socket: None,
             scratch_dir: None,
+            scratch_prefix: None,
+            follow_refused: false,
+            follow_refused_hook: None,
             page_follows_document: None,
             on_screen: false,
             view: None,
@@ -1055,6 +1061,16 @@ impl PluginHost {
         (self.wake)();
     }
 
+    /// Excludes scratch buffers belonging to every window sharing this editor.
+    pub fn set_scratch_prefix(&self, prefix: Option<PathBuf>) {
+        self.state.borrow_mut().scratch_prefix = prefix;
+    }
+
+    /// Called once when the editor refuses this connection's follow glue. No follow call is retried after it.
+    pub fn on_follow_refused(&self, hook: Rc<dyn Fn()>) {
+        self.state.borrow_mut().follow_refused_hook = Some(hook);
+    }
+
     /// Whether the plugin's module is drawn. nvim follows only while it is and the document follows; a
     /// document that comes back on screen is given the newest view, and the text if it moved meanwhile.
     pub fn set_on_screen(&self, on: bool, _now: Instant) {
@@ -1299,6 +1315,17 @@ impl PluginHost {
         }
     }
 
+    /// The answer to a follow request once follow is stopped: the editor's refusal of the slot is a different reason
+    /// from the module having been stopped, and the page is told which.
+    fn stopped_follow_reply(&self, re: u64) -> Reply {
+        let message = if self.state.borrow().follow_refused {
+            "the editor refused the follow slot"
+        } else {
+            "stopped with prefix x; the plugin comes back when the window restarts"
+        };
+        Reply::err(re, ErrorCode::EditorUnavailable, message)
+    }
+
     fn editor_follow(&self, re: u64) -> Option<Reply> {
         let (hello, stopped) = {
             let st = self.state.borrow();
@@ -1312,11 +1339,7 @@ impl PluginHost {
             ));
         }
         if stopped {
-            return Some(Reply::err(
-                re,
-                ErrorCode::EditorUnavailable,
-                "stopped with prefix x; the plugin comes back when the window restarts",
-            ));
+            return Some(self.stopped_follow_reply(re));
         }
         {
             let mut st = self.state.borrow_mut();
@@ -1453,6 +1476,43 @@ impl PluginHost {
         in_time: bool,
         replies: &mut Vec<Reply>,
     ) -> Done {
+        let flag = |key: &str| {
+            value.as_map().and_then(|fields| {
+                fields
+                    .iter()
+                    .find(|(k, _)| k.as_str() == Some(key))
+                    .and_then(|(_, v)| v.as_bool())
+            })
+        };
+        if flag("ok") == Some(false) && flag("slot") == Some(false) {
+            let hook = {
+                let mut st = self.state.borrow_mut();
+                if st.follow_refused {
+                    None
+                } else {
+                    st.follow_refused = true;
+                    st.follow_stopped = true;
+                    st.follow_refused_hook.clone()
+                }
+            };
+            answer_or_drop(
+                self.id(),
+                audience,
+                call,
+                |re| {
+                    Some(Reply::err(
+                        re,
+                        ErrorCode::EditorUnavailable,
+                        "the editor refused the follow slot",
+                    ))
+                },
+                replies,
+            );
+            if let Some(hook) = hook {
+                hook();
+            }
+            return Done::Failed;
+        }
         // A copy, so the page's answer below can be given through `answer_or_drop`, which takes the call.
         let op = call.on.op.clone();
         match &op {
@@ -1623,7 +1683,7 @@ impl PluginHost {
     fn send_follow(&self, now: Instant) -> Option<Instant> {
         let next = {
             let mut st = self.state.borrow_mut();
-            if st.follow_call.is_some() {
+            if st.follow_refused || st.follow_call.is_some() {
                 return None;
             }
             st.follow.next(now)
@@ -1641,9 +1701,13 @@ impl PluginHost {
         let id = self.id();
         let (answer, re) = match &op {
             FollowOp::Install => {
-                let (socket, scratch_dir) = {
+                let (socket, scratch_dir, scratch_prefix) = {
                     let st = self.state.borrow();
-                    (st.follow_socket.clone(), st.scratch_dir.clone())
+                    (
+                        st.follow_socket.clone(),
+                        st.scratch_dir.clone(),
+                        st.scratch_prefix.clone(),
+                    )
                 };
                 let Some(socket) = socket else {
                     self.state.borrow_mut().follow.done(Done::Failed, now);
@@ -1668,7 +1732,10 @@ impl PluginHost {
                     commands: &commands,
                     scratch_dir: scratch_dir.as_deref(),
                 };
-                (editor::follow_install(&*editor, &install), None)
+                (
+                    editor::follow_install_with_scratch_prefix(&*editor, &install, scratch_prefix.as_deref()),
+                    None,
+                )
             }
             FollowOp::Follow(on) => {
                 trace::line(id, "follow", on_off(*on));
@@ -2200,11 +2267,7 @@ impl PluginHost {
             return Some(Reply::err(re, ErrorCode::BadRequest, &why));
         }
         if stopped {
-            return Some(Reply::err(
-                re,
-                ErrorCode::EditorUnavailable,
-                "stopped with prefix x; the plugin comes back when the window restarts",
-            ));
+            return Some(self.stopped_follow_reply(re));
         }
         if self.editor().is_none() {
             return Some(Reply::err(
@@ -3207,7 +3270,8 @@ impl PluginHost {
         }
         let waiting = {
             let st = self.state.borrow();
-            let follow = st.follow_socket.is_some() && (st.follow_call.is_some() || !st.follow.stopped());
+            let follow =
+                !st.follow_refused && st.follow_socket.is_some() && (st.follow_call.is_some() || !st.follow.stopped());
             follow || !st.calls.is_empty() || !st.parked.is_empty() || !st.checking.is_empty()
         };
         waiting.then(|| now + EDITOR_POLL)
@@ -3318,6 +3382,7 @@ mod tests {
 
     #[derive(Default)]
     struct CwdEditor {
+        glue: Option<crate::editor_rpc::Glue>,
         calls: RefCell<Vec<(&'static str, Vec<rmpv::Value>)>>,
         answers: RefCell<Vec<nvim_rpc::Answer>>,
     }
@@ -3332,6 +3397,126 @@ mod tests {
         fn target(&self) -> Option<u64> {
             Some(1)
         }
+        fn glue(&self) -> Option<crate::editor_rpc::Glue> {
+            self.glue.clone()
+        }
+    }
+
+    #[test]
+    fn every_follow_op_carries_the_glue_when_the_editor_has_one() {
+        use crate::editor_rpc::GlueSlot;
+        for slot in [GlueSlot::Page("demo".into()), GlueSlot::Agent] {
+            let r = rig(vec![]);
+            let rpc = Rc::new(CwdEditor {
+                glue: Some(crate::editor_rpc::Glue {
+                    slot: slot.clone(),
+                    chan: 17,
+                }),
+                ..CwdEditor::default()
+            });
+            r.host.set_editor(rpc.clone());
+            let socket = agent::socket_path::in_dir(&std::env::temp_dir(), "follow.sock").unwrap();
+            let prefix = std::env::temp_dir().join("nv-sc-");
+            r.host.set_follow_feed(socket, None);
+            r.host.set_scratch_prefix(Some(prefix.clone()));
+            let now = Instant::now();
+            r.host.follow_session(now);
+            r.host.send_follow(now);
+            let _ = editor::follow_on(&*rpc, "demo", true);
+            let _ = editor::follow_text(&*rpc, "demo", 1, 100, 100);
+            let _ = editor::follow_reveal(&*rpc, "demo", 1, 2, 3, None);
+            let _ = editor::follow_jump(&*rpc, "demo", 1, 2, 0);
+            let _ = editor::follow_teardown(&*rpc, "demo");
+            let calls = rpc.calls.borrow();
+            assert_eq!(calls.len(), 6);
+            for ((code, args), op) in calls
+                .iter()
+                .zip(["install", "follow", "text", "reveal", "jump", "teardown"])
+            {
+                assert!(std::ptr::eq(*code, editor::PLUGIN_FOLLOW_LUA));
+                assert_eq!(args[0].as_str(), Some(op));
+                let field = |value: &rmpv::Value, key: &str| {
+                    value
+                        .as_map()
+                        .unwrap()
+                        .iter()
+                        .find(|(k, _)| k.as_str() == Some(key))
+                        .map(|(_, v)| v.clone())
+                };
+                let glue = field(&args[1], "slot").expect("every follow op identifies its glue");
+                assert_eq!(field(&glue, "chan"), Some(17.into()));
+                match &slot {
+                    GlueSlot::Page(id) => assert_eq!(field(&glue, "id"), Some(id.as_str().into())),
+                    GlueSlot::Agent => assert_eq!(field(&glue, "id"), None),
+                }
+                if op == "install" {
+                    use std::os::unix::ffi::OsStrExt;
+                    assert_eq!(
+                        field(&args[1], "scratch_prefix"),
+                        Some(rmpv::Value::Binary(prefix.as_os_str().as_bytes().to_vec()))
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn a_refused_install_calls_on_follow_refused_once_and_does_not_retry() {
+        let r = rig(vec![]);
+        let host = Rc::new(r.host);
+        let rpc = Rc::new(CwdEditor::default());
+        host.set_editor(rpc.clone());
+        let socket = agent::socket_path::in_dir(&std::env::temp_dir(), "follow.sock").unwrap();
+        host.set_follow_feed(socket, None);
+        let called = Rc::new(Cell::new(0));
+        let count = called.clone();
+        let weak_host = Rc::downgrade(&host);
+        host.on_follow_refused(Rc::new(move || {
+            count.set(count.get() + 1);
+            // The hook may inspect the host while closing its window.
+            let _ = weak_host.upgrade().unwrap().state.borrow();
+        }));
+        let now = Instant::now();
+        host.pump(now);
+        assert_eq!(rpc.calls.borrow().len(), 1);
+        rpc.answers.borrow_mut().remove(0).send(Ok(rmpv::Value::Map(vec![
+            ("ok".into(), false.into()),
+            ("slot".into(), false.into()),
+        ])));
+        host.pump(now);
+        assert_eq!(called.get(), 1);
+        for seconds in [1, 10, 100] {
+            host.editor_session(now + Duration::from_secs(seconds));
+            host.pump(now + Duration::from_secs(seconds));
+        }
+        assert_eq!(called.get(), 1);
+        assert_eq!(
+            rpc.calls.borrow().len(),
+            1,
+            "a refusal cannot be repaired by another install"
+        );
+    }
+
+    #[test]
+    fn after_a_refusal_a_follow_request_is_told_the_editor_refused() {
+        let r = rig(vec![]);
+        r.hello();
+        let host = Rc::new(r.host);
+        let rpc = Rc::new(CwdEditor::default());
+        host.set_editor(rpc.clone());
+        let socket = agent::socket_path::in_dir(&std::env::temp_dir(), "follow.sock").unwrap();
+        host.set_follow_feed(socket, None);
+        let now = Instant::now();
+        host.pump(now);
+        rpc.answers.borrow_mut().remove(0).send(Ok(rmpv::Value::Map(vec![
+            ("ok".into(), false.into()),
+            ("slot".into(), false.into()),
+        ])));
+        host.pump(now);
+        let reply = host.editor_follow(9).expect("follow is refused after a refusal");
+        let error = reply.error.expect("an error answer");
+        assert_eq!(error.code, ErrorCode::EditorUnavailable);
+        assert_eq!(error.message, "the editor refused the follow slot");
     }
 
     fn cwd_rig() -> (Rig, Rc<CwdEditor>) {

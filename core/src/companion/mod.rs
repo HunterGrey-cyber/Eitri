@@ -1,9 +1,9 @@
 //! The injector: what a companion panel loads into a user's own, already running nvim, and the
 //! state machine that follows the attach.
 //!
-//! One `nvim_exec_lua` call ([`INSTALL_LUA`]) installs the six Eitri snippets and a liveness timer.
-//! The same call removes whatever an earlier panel left, so a second panel replaces the first, and a
-//! second install from the same channel tears down and reinstalls without telling that channel it
+//! One `nvim_exec_lua` call ([`INSTALL_LUA`]) installs an agent's six snippets or a page's theme,
+//! with a liveness timer for each slot. An install replaces only its slot's earlier holder; a second
+//! install from the same channel tears down and reinstalls without telling that channel it
 //! was replaced. Nothing here touches the socket: the
 //! caller sends [`install_args`] through an [`crate::nvim_rpc::NvimLink`] and reads the answer with
 //! [`parse_install_report`]. A slow answer is a pending one, never a failed one, because nvim
@@ -27,6 +27,42 @@ pub const INSTALL_LUA: &str = include_str!("install.lua");
 /// current one. `true` when it ran, `false` when another channel's install holds the nvim or
 /// nothing is installed.
 pub const TEARDOWN_LUA: &str = "local chan = ...; local c = rawget(_G, '__eitri_companion'); if c and c.chan == chan then c.teardown() return true end return false";
+
+/// Tear down only the page held by the supplied `(id, channel)`.
+pub const PAGE_TEARDOWN_LUA: &str = "local id, chan = ...; local pages = rawget(_G, '__eitri_pages'); local c = pages and pages[id]; if c and c.chan == chan then c.teardown() return true end return false";
+
+/// Call a named operation only while the supplied slot belongs to this channel.
+pub const SLOT_CALL_LUA: &str = r#"
+local slot, chan, name, args = ...
+local state
+if slot == "agent" then
+  state = rawget(_G, "__eitri_companion")
+elseif type(slot) == "string" and slot:sub(1, 5) == "page:" then
+  local pages = rawget(_G, "__eitri_pages")
+  state = pages and pages[slot:sub(6)]
+end
+if not state or state.torn or state.chan ~= chan then return false end
+local call = state.calls and state.calls[name]
+if type(call) ~= "function" then return false end
+return call(unpack(args or {}))
+"#;
+
+/// The glue a connection installs into its nvim.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum InstallKind {
+    Agent,
+    Page { id: String },
+}
+
+/// A page id is also safe as a suffix in nvim's group names.
+pub fn page_id_ok(id: &str) -> bool {
+    (1..=40).contains(&id.len())
+        && !id.starts_with('-')
+        && !id.ends_with('-')
+        && id
+            .bytes()
+            .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-')
+}
 
 /// Hand `EitriScratch` the hex-encoded request `...`; `false` when the scratch snippet is not installed.
 pub const SCRATCH_CALL_LUA: &str = "local hex = ...; if type(rawget(_G, 'EitriScratch')) == 'table' then EitriScratch.call(hex) return true end return false";
@@ -58,7 +94,7 @@ fn map(pairs: Vec<(&str, Value)>) -> Value {
 }
 
 /// The arguments of `nvim_set_client_info`: how the panel's channel is described in `nvim_get_chan_info`.
-pub fn client_info_params() -> Vec<Value> {
+pub fn client_info_params(kind: &InstallKind) -> Vec<Value> {
     let number = |text: &str| Value::from(text.parse::<u64>().unwrap_or(0));
     let mut version = vec![
         ("major", number(env!("CARGO_PKG_VERSION_MAJOR"))),
@@ -70,7 +106,10 @@ pub fn client_info_params() -> Vec<Value> {
         version.push(("prerelease", Value::from(pre)));
     }
     vec![
-        Value::from("eitri-panel"),
+        Value::from(match kind {
+            InstallKind::Agent => "eitri-panel",
+            InstallKind::Page { .. } => "eitri-page",
+        }),
         map(version),
         Value::from("remote"),
         map(vec![]),
@@ -87,9 +126,29 @@ fn part(name: &str, src: &str, opts: Vec<(&str, Value)>) -> Value {
 }
 
 /// The three arguments of [`INSTALL_LUA`]: the panel's channel, the parts in install order and the
-/// extras (`edge_socket`).
-pub fn install_args(channel_id: u64, sockets: &Sockets) -> Vec<Value> {
+/// extras (`edge_socket` for an agent, `slot` for a page).
+pub fn install_args(channel_id: u64, sockets: &Sockets, kind: &InstallKind) -> Vec<Value> {
     let mut parts = Vec::new();
+    if let InstallKind::Page { id } = kind {
+        if let Some(socket) = &sockets.theme {
+            parts.push(part(
+                "theme",
+                crate::theme::feed::NVIM_THEME_LUA,
+                vec![
+                    ("socket", path_value(socket)),
+                    ("group", Value::from(format!("EitriThemeFeed_page_{id}"))),
+                ],
+            ));
+        }
+        return vec![
+            Value::from(channel_id),
+            Value::Array(parts),
+            map(vec![(
+                "slot",
+                map(vec![("kind", Value::from("page")), ("id", Value::from(id.as_str()))]),
+            )]),
+        ];
+    }
     if let Some(socket) = &sockets.editor_context {
         parts.push(part(
             "editor_context",
@@ -131,6 +190,8 @@ pub fn install_args(channel_id: u64, sockets: &Sockets) -> Vec<Value> {
 /// What [`INSTALL_LUA`] answered.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct InstallReport {
+    /// Absent in reports from the older injector.
+    pub slot: Option<String>,
     /// The parts that loaded, in install order.
     pub installed: Vec<String>,
     /// The parts that did not: `(name, why)`.
@@ -140,8 +201,40 @@ pub struct InstallReport {
     pub in_tmux: bool,
 }
 
-/// The only report version this panel reads.
-const REPORT_VERSION: u64 = 1;
+/// The current report version; the original report remains readable.
+const REPORT_VERSION: u64 = 2;
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum InstallRefusal {
+    EitriWindow,
+    Takeover,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum InstallError {
+    Refused(InstallRefusal),
+    Malformed(String),
+}
+
+impl From<String> for InstallError {
+    fn from(why: String) -> Self {
+        Self::Malformed(why)
+    }
+}
+
+impl std::fmt::Display for InstallError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Malformed(why) => f.write_str(why),
+            Self::Refused(InstallRefusal::EitriWindow) => {
+                f.write_str("this nvim is open in an Eitri window: its pages open there")
+            }
+            Self::Refused(InstallRefusal::Takeover) => f.write_str("a takeover owns this nvim"),
+        }
+    }
+}
+
+impl std::error::Error for InstallError {}
 
 fn field<'a>(report: &'a Value, name: &str) -> Option<&'a Value> {
     report
@@ -161,24 +254,39 @@ fn list<'a>(report: &'a Value, name: &str) -> Result<&'a [Value], String> {
 }
 
 /// Read the table [`INSTALL_LUA`] returns. The error is a plain sentence for the band.
-pub fn parse_install_report(report: &Value) -> Result<InstallReport, String> {
+pub fn parse_install_report(report: &Value) -> Result<InstallReport, InstallError> {
     if report.as_map().is_none() {
-        return Err("the injector answered something that is not a report".to_owned());
+        return Err("the injector answered something that is not a report".to_owned().into());
     }
-    match field(report, "version").and_then(Value::as_u64) {
-        Some(REPORT_VERSION) => {}
+    if let Some(refused) = field(report, "refused") {
+        return Err(match refused.as_str() {
+            Some("eitri_window") => InstallError::Refused(InstallRefusal::EitriWindow),
+            Some("takeover") => InstallError::Refused(InstallRefusal::Takeover),
+            _ => InstallError::Malformed("the install report has an unknown refusal".to_owned()),
+        });
+    }
+    let version = field(report, "version").and_then(Value::as_u64);
+    match version {
+        Some(1 | REPORT_VERSION) => {}
         Some(other) => {
-            return Err(format!(
-                "the injector answered version {other}, this panel speaks {REPORT_VERSION}"
-            ));
+            return Err(format!("the injector answered version {other}, this panel speaks {REPORT_VERSION}").into());
         }
-        None => return Err("the install report has no version".to_owned()),
+        None => return Err("the install report has no version".to_owned().into()),
     }
     let text = |value: &Value, what: &str| {
         value
             .as_str()
             .map(str::to_owned)
             .ok_or_else(|| format!("the install report has a {what} that is not text"))
+    };
+    let slot = match (version, field(report, "slot")) {
+        (Some(1), None) => None,
+        (_, Some(value)) if matches!(value.as_str(), Some("agent" | "page")) => value.as_str().map(str::to_owned),
+        _ => {
+            return Err(InstallError::Malformed(
+                "the install report has no valid slot".to_owned(),
+            ))
+        }
     };
     let installed = list(report, "installed")?
         .iter()
@@ -199,6 +307,7 @@ pub fn parse_install_report(report: &Value) -> Result<InstallReport, String> {
         .and_then(Value::as_bool)
         .ok_or_else(|| "the install report does not say whether nvim runs in tmux".to_owned())?;
     Ok(InstallReport {
+        slot,
         installed,
         failed,
         nvim_pid,
@@ -244,7 +353,7 @@ mod tests {
 
     #[test]
     fn install_args_lists_parts_in_order_and_leaves_out_a_missing_socket() {
-        let args = install_args(7, &all_sockets());
+        let args = install_args(7, &all_sockets(), &InstallKind::Agent);
         assert_eq!(args.len(), 3);
         assert_eq!(args[0].as_u64(), Some(7));
         assert_eq!(
@@ -287,6 +396,7 @@ mod tests {
                 theme: Some(PathBuf::from("/r/th")),
                 ..Sockets::default()
             },
+            &InstallKind::Agent,
         );
         assert_eq!(names(&none), ["theme", "scratch", "buffer_reload"]);
         assert_eq!(
@@ -300,11 +410,74 @@ mod tests {
                 pane_switch: None,
                 ..all_sockets()
             },
+            &InstallKind::Agent,
         );
         assert_eq!(
             names(&no_nav),
             ["editor_context", "theme", "keys", "scratch", "buffer_reload"]
         );
+    }
+
+    #[test]
+    fn page_args_install_only_the_theme_in_its_own_group() {
+        let kind = InstallKind::Page {
+            id: "sample-page".into(),
+        };
+        let args = install_args(8, &all_sockets(), &kind);
+        assert_eq!(names(&args), ["theme"]);
+        let theme = &args[1].as_array().unwrap()[0];
+        assert_eq!(get(get(theme, "opts"), "socket").as_str(), Some("/r/th"));
+        assert_eq!(
+            get(get(theme, "opts"), "group").as_str(),
+            Some("EitriThemeFeed_page_sample-page")
+        );
+        let slot = get(&args[2], "slot");
+        assert_eq!(get(slot, "kind").as_str(), Some("page"));
+        assert_eq!(get(slot, "id").as_str(), Some("sample-page"));
+        assert_eq!(args[2].as_map().unwrap().len(), 1);
+        assert!(names(&install_args(8, &Sockets::default(), &kind)).is_empty());
+    }
+
+    #[test]
+    fn page_ids_have_bounded_ascii_names_and_no_edge_hyphens() {
+        for id in ["a", "0", "a--b", &"a".repeat(40)] {
+            assert!(page_id_ok(id), "{id}");
+        }
+        for id in ["", "-", "-a", "a-", "A", "a_b", "a/b", "a\n", "é", &"a".repeat(41)] {
+            assert!(!page_id_ok(id), "{id}");
+        }
+    }
+
+    #[test]
+    fn reports_read_both_slots_and_distinguish_refusals_from_malformed_answers() {
+        for slot in ["agent", "page"] {
+            let mut value = report(Value::Array(vec![]), Value::Array(vec![]));
+            let Value::Map(pairs) = &mut value else { unreachable!() };
+            pairs[0].1 = Value::from(2);
+            pairs.push((Value::from("slot"), Value::from(slot)));
+            assert_eq!(parse_install_report(&value).unwrap().slot.as_deref(), Some(slot));
+        }
+        for (name, refusal) in [
+            ("eitri_window", InstallRefusal::EitriWindow),
+            ("takeover", InstallRefusal::Takeover),
+        ] {
+            assert_eq!(
+                parse_install_report(&map(vec![("refused", Value::from(name))])),
+                Err(InstallError::Refused(refusal))
+            );
+        }
+        for value in [Value::from(false), map(vec![("refused", Value::from("other"))])] {
+            assert!(matches!(parse_install_report(&value), Err(InstallError::Malformed(_))));
+        }
+        let mut value = report(Value::Array(vec![]), Value::Array(vec![]));
+        if let Value::Map(pairs) = &mut value {
+            pairs[0].1 = Value::from(2);
+        }
+        assert!(matches!(parse_install_report(&value), Err(InstallError::Malformed(_))));
+        if let Value::Map(pairs) = &mut value {
+            pairs.push((Value::from("slot"), Value::from("other")));
+        }
+        assert!(matches!(parse_install_report(&value), Err(InstallError::Malformed(_))));
     }
 
     #[test]
@@ -326,6 +499,7 @@ mod tests {
         assert_eq!(
             parse_install_report(&value),
             Ok(InstallReport {
+                slot: None,
                 installed: vec!["theme".into(), "keys".into()],
                 failed: vec![("scratch".into(), "boom".into())],
                 nvim_pid: 4242,
@@ -346,11 +520,13 @@ mod tests {
     fn parse_install_report_refuses_another_version() {
         let mut value = report(Value::Array(vec![]), Value::Array(vec![]));
         if let Value::Map(pairs) = &mut value {
-            pairs[0].1 = Value::from(2);
+            pairs[0].1 = Value::from(3);
         }
         assert_eq!(
             parse_install_report(&value),
-            Err("the injector answered version 2, this panel speaks 1".to_owned())
+            Err(InstallError::Malformed(
+                "the injector answered version 3, this panel speaks 2".to_owned()
+            ))
         );
         assert!(parse_install_report(&Value::from("no")).is_err());
     }
@@ -362,7 +538,7 @@ mod tests {
             if let Value::Map(pairs) = &mut value {
                 pairs.retain(|(k, _)| k.as_str() != Some(gone));
             }
-            parse_install_report(&value).unwrap_err()
+            parse_install_report(&value).unwrap_err().to_string()
         };
         assert_eq!(without("pid"), "the install report has no pid");
         assert!(without("installed").contains("installed"));
@@ -373,7 +549,7 @@ mod tests {
 
     #[test]
     fn client_info_names_a_remote_eitri_panel() {
-        let info = client_info_params();
+        let info = client_info_params(&InstallKind::Agent);
         assert_eq!(info.len(), 5);
         assert_eq!(info[0].as_str(), Some("eitri-panel"));
         assert_eq!(info[2].as_str(), Some("remote"));

@@ -10,7 +10,7 @@ use std::path::PathBuf;
 
 use serde::Serialize;
 
-use super::InstallReport;
+use super::{InstallError, InstallRefusal, InstallReport};
 
 /// Why a panel that was attached no longer is.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -41,6 +41,10 @@ pub enum LinkState {
     Detached {
         why: Detach,
     },
+    Refused {
+        addr: PathBuf,
+        why: InstallRefusal,
+    },
     Failed {
         addr: PathBuf,
         why: String,
@@ -67,6 +71,10 @@ pub enum AttachEvent {
     Installed {
         gen: u64,
         report: InstallReport,
+    },
+    InstallRefused {
+        gen: u64,
+        why: InstallRefusal,
     },
     InstallFailed {
         gen: u64,
@@ -95,6 +103,7 @@ impl AttachEvent {
             | AttachEvent::Blocking { gen, .. }
             | AttachEvent::Installed { gen, .. }
             | AttachEvent::InstallFailed { gen, .. }
+            | AttachEvent::InstallRefused { gen, .. }
             | AttachEvent::ConnectFailed { gen, .. }
             | AttachEvent::Closed { gen }
             | AttachEvent::Replaced { gen } => Some(*gen),
@@ -197,6 +206,16 @@ impl Attacher {
             }
             (
                 LinkState::Connecting { addr } | LinkState::Attaching { addr, .. },
+                AttachEvent::InstallRefused { why, .. },
+            ) => {
+                self.state = LinkState::Refused {
+                    addr: addr.clone(),
+                    why,
+                };
+                vec![Effect::Close { gen }]
+            }
+            (
+                LinkState::Connecting { addr } | LinkState::Attaching { addr, .. },
                 AttachEvent::ConnectFailed { why, .. } | AttachEvent::InstallFailed { why, .. },
             ) => {
                 self.state = LinkState::Failed {
@@ -238,7 +257,9 @@ impl Attacher {
             LinkState::Connecting { addr: at }
             | LinkState::Attaching { addr: at, .. }
             | LinkState::Attached { addr: at, .. } => at == addr,
-            LinkState::NoEditor | LinkState::Detached { .. } | LinkState::Failed { .. } => false,
+            LinkState::NoEditor | LinkState::Detached { .. } | LinkState::Failed { .. } | LinkState::Refused { .. } => {
+                false
+            }
         }
     }
 
@@ -285,6 +306,7 @@ impl Attacher {
                 "detached",
                 "editor detached: another Eitri panel attached to it".to_owned(),
             ),
+            LinkState::Refused { why, .. } => ("refused", InstallError::Refused(why.clone()).to_string()),
             LinkState::Failed { why, .. } => ("failed", format!("could not attach: {why}")),
         };
         BandLink { state, text }
@@ -301,6 +323,7 @@ mod tests {
 
     fn report() -> InstallReport {
         InstallReport {
+            slot: Some("agent".into()),
             installed: vec!["theme".into()],
             failed: vec![],
             nvim_pid: 77,

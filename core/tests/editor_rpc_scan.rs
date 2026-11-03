@@ -710,6 +710,8 @@ fn the_editor_op_dispatcher_names_only_its_table() {
     for forbidden in [
         "INSTALL_LUA",
         "TEARDOWN_LUA",
+        "PAGE_TEARDOWN_LUA",
+        "SLOT_CALL_LUA",
         "SCRATCH_CALL_LUA",
         "REVIEW_LUA",
         "TAKE_EVENTS_LUA",

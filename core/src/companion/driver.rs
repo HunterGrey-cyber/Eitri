@@ -19,8 +19,10 @@ use rmpv::Value;
 
 use super::attach::{AttachEvent, Attacher, BandLink, Effect, LinkState};
 use super::{
-    client_info_params, install_args, parse_install_report, Sockets, INSTALL_LUA, REPLACED_METHOD, TEARDOWN_LUA,
+    client_info_params, install_args, parse_install_report, InstallError, InstallKind, Sockets, INSTALL_LUA,
+    PAGE_TEARDOWN_LUA, REPLACED_METHOD, SLOT_CALL_LUA, TEARDOWN_LUA,
 };
+use crate::editor_rpc::{Glue, GlueSlot};
 use crate::nvim_rpc::{LinkEvent, NvimLink, Pending, RpcError};
 
 /// How long a connect may take before it is a failure. A stale socket file refuses at once; this
@@ -133,6 +135,7 @@ pub(crate) fn run_effects<W: Wire>(
     effects: Vec<Effect>,
     live: &mut Option<Live<W>>,
     current_gen: &AtomicU64,
+    kind: &InstallKind,
     spawn: &mut dyn FnMut(u64, PathBuf),
 ) -> bool {
     let mut cancel = false;
@@ -144,7 +147,7 @@ pub(crate) fn run_effects<W: Wire>(
             }
             Effect::ExplicitTeardown { gen } => {
                 if let Some(held) = live.as_ref().filter(|held| held.gen == gen) {
-                    held.link.exec_lua(TEARDOWN_LUA, vec![Value::from(held.channel)]);
+                    teardown(&held.link, kind, held.channel);
                 }
             }
             Effect::Close { gen } => {
@@ -158,6 +161,16 @@ pub(crate) fn run_effects<W: Wire>(
         }
     }
     cancel
+}
+
+/// Queue only the teardown owned by this connection's slot and channel.
+fn teardown<W: Wire>(link: &W, kind: &InstallKind, channel: u64) {
+    match kind {
+        InstallKind::Agent => link.exec_lua(TEARDOWN_LUA, vec![Value::from(channel)]),
+        InstallKind::Page { id } => {
+            link.exec_lua(PAGE_TEARDOWN_LUA, vec![Value::from(id.as_str()), Value::from(channel)])
+        }
+    }
 }
 
 /// Decides when to ask nvim whether it is waiting for a key.
@@ -219,7 +232,9 @@ pub fn not_attached_why(state: &LinkState) -> Option<&'static str> {
     match state {
         LinkState::Attached { .. } => None,
         LinkState::Connecting { .. } | LinkState::Attaching { .. } => Some("the editor is still attaching"),
-        LinkState::NoEditor | LinkState::Detached { .. } | LinkState::Failed { .. } => Some(NOT_CONNECTED),
+        LinkState::NoEditor | LinkState::Detached { .. } | LinkState::Failed { .. } | LinkState::Refused { .. } => {
+            Some(NOT_CONNECTED)
+        }
     }
 }
 
@@ -259,6 +274,7 @@ pub struct LinkDriver {
     installed: Vec<String>,
     own_channels: VecDeque<OwnChannel>,
     sockets: Sockets,
+    kind: InstallKind,
     /// What `new` already asked of the machine, carried out by the first `poll`.
     first_effects: Vec<Effect>,
     last_state: LinkState,
@@ -271,7 +287,7 @@ pub struct LinkDriver {
 impl LinkDriver {
     /// A driver for a window started with an editor address, or without one. Nothing connects
     /// until the first [`LinkDriver::poll`]; the state already says `Connecting` for an address.
-    pub fn new(initial: Option<PathBuf>, sockets: Sockets) -> LinkDriver {
+    pub fn new(initial: Option<PathBuf>, sockets: Sockets, kind: InstallKind) -> LinkDriver {
         let (attacher, first_effects) = Attacher::new(initial);
         let (tx, rx) = mpsc::channel();
         let last_state = attacher.state().clone();
@@ -285,6 +301,7 @@ impl LinkDriver {
             installed: Vec::new(),
             own_channels: VecDeque::new(),
             sockets,
+            kind,
             first_effects,
             last_state,
             shut: false,
@@ -335,6 +352,52 @@ impl LinkDriver {
     /// or the editor's own report where the platform gives no peer pid.
     fn editor_pid(&self) -> Option<u32> {
         self.peer_pid().or_else(|| self.nvim_pid())
+    }
+
+    /// The slot and channel this connection owns, only while attached.
+    pub fn glue(&self) -> Option<Glue> {
+        if self.shut {
+            return None;
+        }
+        let LinkState::Attached { channel, .. } = self.state() else {
+            return None;
+        };
+        let slot = match &self.kind {
+            InstallKind::Agent => GlueSlot::Agent,
+            InstallKind::Page { id } => GlueSlot::Page(id.clone()),
+        };
+        Some(Glue { slot, chan: *channel })
+    }
+
+    /// Whether the attached editor reported running inside tmux.
+    pub fn in_tmux(&self) -> Option<bool> {
+        if self.shut {
+            return None;
+        }
+        match self.state() {
+            LinkState::Attached { in_tmux, .. } => Some(*in_tmux),
+            _ => None,
+        }
+    }
+
+    /// Queue a named call guarded by this link's slot and channel.
+    pub fn slot_call(&mut self, name: &str, args: Vec<Value>) -> Result<(), String> {
+        let glue = self
+            .glue()
+            .ok_or_else(|| not_attached_why(self.state()).unwrap_or(NOT_CONNECTED).to_owned())?;
+        let slot = match glue.slot {
+            GlueSlot::Agent => "agent".to_owned(),
+            GlueSlot::Page(id) => format!("page:{id}"),
+        };
+        self.exec_lua(
+            SLOT_CALL_LUA,
+            vec![
+                Value::from(slot),
+                Value::from(glue.chan),
+                Value::from(name),
+                Value::Array(args),
+            ],
+        )
     }
 
     /// Whether the last install loaded the part called `name`.
@@ -417,7 +480,7 @@ impl LinkDriver {
     /// glue's own liveness timer removes what a dropped teardown leaves.
     pub fn shutdown(&mut self) {
         if let (LinkState::Attached { channel, .. }, Some(live)) = (self.attacher.state(), &self.live) {
-            Wire::exec_lua(&live.link, TEARDOWN_LUA, vec![Value::from(*channel)]);
+            teardown(&live.link, &self.kind, *channel);
         }
         if let Some(live) = self.live.take() {
             live.link.close_when_flushed();
@@ -541,7 +604,8 @@ impl LinkDriver {
             LinkState::Connecting { addr }
             | LinkState::Attaching { addr, .. }
             | LinkState::Attached { addr, .. }
-            | LinkState::Failed { addr, .. } => Some(addr.clone()),
+            | LinkState::Failed { addr, .. }
+            | LinkState::Refused { addr, .. } => Some(addr.clone()),
             LinkState::NoEditor | LinkState::Detached { .. } => None,
         }
     }
@@ -561,19 +625,20 @@ impl LinkDriver {
         };
         let current = Arc::clone(&self.current_gen);
         let sockets = self.sockets.clone();
+        let kind = self.kind.clone();
         let spawn_thread = self.spawn_thread;
         let mut spawn = move |gen: u64, addr: PathBuf| {
-            let (tx, current, sockets) = (tx.clone(), Arc::clone(&current), sockets.clone());
+            let (tx, current, sockets, kind) = (tx.clone(), Arc::clone(&current), sockets.clone(), kind.clone());
             let report = tx.clone();
             let shown = addr.display().to_string();
             // Out of threads is a failed connect like any other, reported through the channel the
             // worker would have used, so this same poll reads it; a panic here would end the panel.
-            if let Err(e) = spawn_thread(Box::new(move || worker(gen, addr, tx, current, sockets))) {
+            if let Err(e) = spawn_thread(Box::new(move || worker(gen, addr, tx, current, sockets, kind))) {
                 let why = format!("could not start a thread to connect to {shown}: {e}");
                 let _ = report.send(WorkerMsg::Event(AttachEvent::ConnectFailed { gen, why }));
             }
         };
-        if run_effects(effects, &mut self.live, &self.current_gen, &mut spawn) {
+        if run_effects(effects, &mut self.live, &self.current_gen, &self.kind, &mut spawn) {
             tick.cancel_drafts = true;
         }
     }
@@ -601,7 +666,14 @@ impl LinkDriver {
                     }
                     self.feed(AttachEvent::Installed { gen, report }, tick);
                 }
-                Err(why) => self.feed(AttachEvent::InstallFailed { gen, why }, tick),
+                Err(InstallError::Refused(why)) => self.feed(AttachEvent::InstallRefused { gen, why }, tick),
+                Err(why) => self.feed(
+                    AttachEvent::InstallFailed {
+                        gen,
+                        why: why.to_string(),
+                    },
+                    tick,
+                ),
             },
             Err(RpcError::Nvim(why)) => self.feed(AttachEvent::InstallFailed { gen, why }, tick),
             // The connection ended first; its own `Closed` says what the band says.
@@ -644,7 +716,7 @@ fn spawn_attach_thread(job: Job) -> io::Result<()> {
 }
 
 /// One connect, for one generation. Ends when the connection does or when the driver is gone.
-fn worker(gen: u64, addr: PathBuf, tx: ToDriver, current: Arc<AtomicU64>, sockets: Sockets) {
+fn worker(gen: u64, addr: PathBuf, tx: ToDriver, current: Arc<AtomicU64>, sockets: Sockets, kind: InstallKind) {
     let (link, events) = match NvimLink::connect(&addr, CONNECT_TIMEOUT) {
         Ok(connected) => connected,
         Err(why) => {
@@ -657,8 +729,7 @@ fn worker(gen: u64, addr: PathBuf, tx: ToDriver, current: Arc<AtomicU64>, socket
         link.close();
         return;
     }
-    drop(link.call("nvim_set_client_info", client_info_params()));
-    let install = link.exec_lua(INSTALL_LUA, install_args(link.channel_id(), &sockets));
+    let install = queue_install(&link, &sockets, &kind);
     if tx.send(WorkerMsg::Linked { gen, link, install }).is_err() {
         return;
     }
@@ -681,6 +752,11 @@ fn worker(gen: u64, addr: PathBuf, tx: ToDriver, current: Arc<AtomicU64>, socket
     }
 }
 
+fn queue_install(link: &NvimLink, sockets: &Sockets, kind: &InstallKind) -> Pending {
+    drop(link.call("nvim_set_client_info", client_info_params(kind)));
+    link.exec_lua(INSTALL_LUA, install_args(link.channel_id(), sockets, kind))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -688,6 +764,176 @@ mod tests {
     use crate::companion::InstallReport;
     use std::cell::RefCell;
     use std::rc::Rc;
+
+    fn page_kind() -> InstallKind {
+        InstallKind::Page {
+            id: "sample-page".into(),
+        }
+    }
+
+    #[test]
+    fn a_page_link_installs_the_page_slot_and_names_itself_eitri_page() {
+        let (link, _fake, mut reader) = fake_link();
+        let _install = queue_install(&link, &Sockets::default(), &page_kind());
+        let (_, method, params) = read_request(&mut reader);
+        assert_eq!(method, "nvim_set_client_info");
+        assert_eq!(params[0], Value::from("eitri-page"));
+        let (_, method, params) = read_request(&mut reader);
+        assert_eq!(method, "nvim_exec_lua");
+        assert_eq!(params[0], Value::from(INSTALL_LUA));
+        assert_eq!(
+            params[1],
+            Value::Array(install_args(3, &Sockets::default(), &page_kind()))
+        );
+    }
+
+    #[test]
+    fn a_page_links_teardown_is_page_teardown_lua() {
+        let (link, _fake, mut reader) = fake_link();
+        let mut driver = attached_over(link);
+        driver.kind = page_kind();
+        driver.spawn_thread = |_| Ok(());
+        driver.first_effects.clear();
+        let mut tick = Tick::default();
+        driver.feed(Ev::Attach(PathBuf::from("/r/b")), &mut tick);
+        let (_, method, params) = read_request(&mut reader);
+        assert_eq!(method, "nvim_exec_lua");
+        let expected = vec![
+            Value::from(PAGE_TEARDOWN_LUA),
+            Value::Array(vec![Value::from("sample-page"), Value::from(3)]),
+        ];
+        assert_eq!(params, expected);
+        driver.shutdown();
+
+        let (link, _fake, mut reader) = fake_link();
+        let mut driver = attached_over(link);
+        driver.kind = page_kind();
+        driver.shutdown();
+        let (_, method, params) = read_request(&mut reader);
+        assert_eq!(method, "nvim_exec_lua");
+        assert_eq!(params, expected);
+    }
+
+    #[test]
+    fn a_refused_install_is_a_refused_state_not_failed() {
+        for (reason, why) in [
+            ("eitri_window", super::super::InstallRefusal::EitriWindow),
+            ("takeover", super::super::InstallRefusal::Takeover),
+        ] {
+            let mut driver = LinkDriver::new(Some(PathBuf::from("/r/a")), Sockets::default(), page_kind());
+            driver.first_effects.clear();
+            driver.attacher.handle(Ev::Connected { gen: 1, channel: 3 });
+            let (answer, pending) = Pending::pair();
+            answer.send(Ok(Value::Map(vec![(Value::from("refused"), Value::from(reason))])));
+            driver.install = Some(InstallWatch {
+                gen: 1,
+                pending,
+                sent_at: Instant::now(),
+                probe: ModeProbe::default(),
+                mode: None,
+            });
+            driver.poll(Instant::now());
+            assert_eq!(
+                driver.state(),
+                &LinkState::Refused {
+                    addr: PathBuf::from("/r/a"),
+                    why
+                }
+            );
+            assert_eq!(driver.band().state, "refused");
+            assert!(driver.install.is_none());
+            assert_eq!(driver.glue(), None);
+            assert!(driver.slot_call("busy", vec![]).is_err());
+            let refused = driver.state().clone();
+            driver.feed(Ev::Closed { gen: 1 }, &mut Tick::default());
+            driver.feed(
+                Ev::Installed {
+                    gen: 1,
+                    report: report(),
+                },
+                &mut Tick::default(),
+            );
+            assert_eq!(driver.state(), &refused);
+            driver.spawn_thread = |_| Ok(());
+            driver.attach(PathBuf::from("/r/b"));
+            driver.poll(Instant::now());
+            assert!(matches!(driver.state(), LinkState::Connecting { addr } if addr == &PathBuf::from("/r/b")));
+        }
+    }
+
+    #[test]
+    fn a_page_install_pending_on_a_key_is_not_failed() {
+        let (link, _fake, _reader) = fake_link();
+        let mut driver = LinkDriver::new(Some(PathBuf::from("/r/a")), Sockets::default(), page_kind());
+        driver.spawn_thread = |_| Ok(());
+        let now = Instant::now();
+        driver.poll(now);
+        let (_answer, install) = Pending::pair();
+        driver.tx.send(WorkerMsg::Linked { gen: 1, link, install }).unwrap();
+        driver.poll(now);
+        driver.feed(Ev::Blocking { gen: 1, blocking: true }, &mut Tick::default());
+        driver.poll(now + Duration::from_secs(60));
+        assert!(matches!(
+            driver.state(),
+            LinkState::Attaching {
+                waiting_for_key: true,
+                ..
+            }
+        ));
+        assert!(driver.install.is_some());
+        assert!(driver.glue().is_none());
+        driver.shutdown();
+        assert!(driver.is_shut());
+    }
+
+    #[test]
+    fn glue_is_none_until_attached_and_after_detach() {
+        for (kind, slot, in_tmux) in [
+            (InstallKind::Agent, GlueSlot::Agent, true),
+            (page_kind(), GlueSlot::Page("sample-page".into()), false),
+        ] {
+            let mut driver = LinkDriver::new(Some(PathBuf::from("/r/a")), Sockets::default(), kind);
+            assert_eq!(driver.glue(), None);
+            assert_eq!(driver.in_tmux(), None);
+            driver.attacher.handle(Ev::Connected { gen: 1, channel: 3 });
+            assert_eq!(driver.glue(), None);
+            driver.attacher.handle(Ev::Installed {
+                gen: 1,
+                report: InstallReport { in_tmux, ..report() },
+            });
+            assert_eq!(driver.glue(), Some(Glue { slot, chan: 3 }));
+            assert_eq!(driver.in_tmux(), Some(in_tmux));
+            driver.attacher.handle(Ev::Closed { gen: 1 });
+            assert_eq!(driver.glue(), None);
+            assert_eq!(driver.in_tmux(), None);
+        }
+    }
+
+    #[test]
+    fn slot_call_goes_to_this_links_slot_and_channel() {
+        for (kind, slot) in [(InstallKind::Agent, "agent"), (page_kind(), "page:sample-page")] {
+            let (link, _fake, mut reader) = fake_link();
+            let mut driver = attached_over(link);
+            driver.kind = kind;
+            driver.slot_call("busy", vec![Value::from(true)]).unwrap();
+            let (_, method, params) = read_request(&mut reader);
+            assert_eq!(method, "nvim_exec_lua");
+            assert_eq!(
+                params,
+                vec![
+                    Value::from(SLOT_CALL_LUA),
+                    Value::Array(vec![
+                        Value::from(slot),
+                        Value::from(3),
+                        Value::from("busy"),
+                        Value::Array(vec![Value::from(true)])
+                    ])
+                ]
+            );
+            driver.attacher.handle(Ev::Closed { gen: 1 });
+            assert!(driver.slot_call("busy", vec![]).is_err());
+        }
+    }
 
     #[test]
     fn an_install_pending_past_300ms_asks_get_mode_once_a_second() {
@@ -731,6 +977,7 @@ mod tests {
 
     fn report() -> InstallReport {
         InstallReport {
+            slot: Some("agent".into()),
             installed: vec!["scratch".into()],
             failed: vec![],
             nvim_pid: 9,
@@ -756,7 +1003,7 @@ mod tests {
         });
         let current = AtomicU64::new(1);
         let spawned = log.clone();
-        let cancel = run_effects(effects, &mut live, &current, &mut |gen, addr| {
+        let cancel = run_effects(effects, &mut live, &current, &InstallKind::Agent, &mut |gen, addr| {
             spawned.borrow_mut().push(format!("spawn({gen},{})", addr.display()));
         });
         assert_eq!(
@@ -785,6 +1032,7 @@ mod tests {
             vec![Effect::ExplicitTeardown { gen: 1 }, Effect::Close { gen: 1 }],
             &mut live,
             &current,
+            &InstallKind::Agent,
             &mut |_, _| panic!("no connect was asked for"),
         );
         assert!(log.borrow().is_empty());
@@ -923,7 +1171,7 @@ mod tests {
         assert!(!quiet.connect_began);
         assert!(!quiet.state_changed);
 
-        let mut first = LinkDriver::new(Some(PathBuf::from("/r/a")), Sockets::default());
+        let mut first = LinkDriver::new(Some(PathBuf::from("/r/a")), Sockets::default(), InstallKind::Agent);
         first.spawn_thread = |_| Ok(());
         let tick = first.poll(Instant::now());
         assert!(tick.connect_began);
@@ -935,7 +1183,7 @@ mod tests {
     fn an_installing_connection_matches_earlier_channels_by_its_live_socket_pid() {
         let (link, _fake, _reader) = fake_link();
         let holder = link.peer_pid().expect("a socket pair names its peer");
-        let mut driver = LinkDriver::new(Some(PathBuf::from("/r/a")), Sockets::default());
+        let mut driver = LinkDriver::new(Some(PathBuf::from("/r/a")), Sockets::default(), InstallKind::Agent);
         driver.attacher.handle(Ev::Connected { gen: 1, channel: 3 });
         driver.live = Some(Live {
             gen: 1,
@@ -958,7 +1206,7 @@ mod tests {
     fn a_linked_connection_records_its_socket_holder_pid_before_the_install_answers() {
         let (link, _fake, _reader) = fake_link();
         let holder = link.peer_pid().expect("a socket pair names its peer");
-        let mut driver = LinkDriver::new(Some(PathBuf::from("/r/a")), Sockets::default());
+        let mut driver = LinkDriver::new(Some(PathBuf::from("/r/a")), Sockets::default(), InstallKind::Agent);
         driver.spawn_thread = |_| Ok(());
         driver.poll(Instant::now());
         assert!(matches!(driver.state(), LinkState::Connecting { .. }));
@@ -974,7 +1222,7 @@ mod tests {
     fn a_channel_number_counts_as_ours_only_in_the_nvim_it_was_handed_out_by() {
         // Attached to A on channel 5, then to B on channel 3; another panel installs into B and is
         // given channel 5 there.
-        let mut driver = LinkDriver::new(Some(PathBuf::from("/r/b")), Sockets::default());
+        let mut driver = LinkDriver::new(Some(PathBuf::from("/r/b")), Sockets::default(), InstallKind::Agent);
         driver.own_channels.push_back(own("/r/a", 5, Some(100)));
         driver.own_channels.push_back(own("/r/b", 3, None));
         assert!(!driver.is_own_earlier_channel(5), "channel 5 was A's, not B's");
@@ -984,7 +1232,7 @@ mod tests {
 
     #[test]
     fn an_nvim_restarted_on_the_same_address_does_not_inherit_the_old_channels() {
-        let mut driver = LinkDriver::new(Some(PathBuf::from("/r/a")), Sockets::default());
+        let mut driver = LinkDriver::new(Some(PathBuf::from("/r/a")), Sockets::default(), InstallKind::Agent);
         driver.own_channels.push_back(own("/r/a", 5, Some(100)));
         assert!(
             driver.is_own_earlier_channel(5),
@@ -1029,7 +1277,7 @@ mod tests {
     #[test]
     fn each_thing_a_worker_sends_and_each_attach_calls_the_wake() {
         let count = Arc::new(AtomicU64::new(0));
-        let mut driver = LinkDriver::new(None, Sockets::default());
+        let mut driver = LinkDriver::new(None, Sockets::default(), InstallKind::Agent);
         let counted = Arc::clone(&count);
         driver.set_wake(Arc::new(move || {
             counted.fetch_add(1, Ordering::SeqCst);
@@ -1091,7 +1339,7 @@ mod tests {
 
     #[test]
     fn a_thread_that_cannot_start_fails_the_connect() {
-        let mut driver = LinkDriver::new(Some(PathBuf::from("/r/a")), Sockets::default());
+        let mut driver = LinkDriver::new(Some(PathBuf::from("/r/a")), Sockets::default(), InstallKind::Agent);
         driver.spawn_thread = |_| Err(std::io::Error::other("no threads left"));
         let tick = driver.poll(Instant::now());
         assert!(tick.state_changed);
@@ -1135,7 +1383,7 @@ mod tests {
 
     /// A driver aimed at `/r/a` whose generation 1 is attached over `link`.
     fn attached_over(link: NvimLink) -> LinkDriver {
-        let mut driver = LinkDriver::new(Some(PathBuf::from("/r/a")), Sockets::default());
+        let mut driver = LinkDriver::new(Some(PathBuf::from("/r/a")), Sockets::default(), InstallKind::Agent);
         driver.attacher.handle(Ev::Connected { gen: 1, channel: 3 });
         driver.attacher.handle(Ev::Installed {
             gen: 1,
@@ -1163,12 +1411,12 @@ mod tests {
 
     #[test]
     fn exec_lua_answered_is_refused_while_detached() {
-        let mut driver = LinkDriver::new(None, Sockets::default());
+        let mut driver = LinkDriver::new(None, Sockets::default(), InstallKind::Agent);
         assert_eq!(
             driver.exec_lua_answered("return 1", vec![]).try_take(),
             unavailable("the editor is not connected to this panel")
         );
-        let mut driver = LinkDriver::new(Some(PathBuf::from("/r/a")), Sockets::default());
+        let mut driver = LinkDriver::new(Some(PathBuf::from("/r/a")), Sockets::default(), InstallKind::Agent);
         assert_eq!(
             driver.exec_lua_answered("return 1", vec![]).try_take(),
             unavailable("the editor is still attaching")
@@ -1230,12 +1478,12 @@ mod tests {
     #[test]
     fn generation_follows_attach() {
         assert_eq!(
-            LinkDriver::new(None, Sockets::default()).generation(),
+            LinkDriver::new(None, Sockets::default(), InstallKind::Agent).generation(),
             None,
             "no editor"
         );
         assert_eq!(
-            LinkDriver::new(Some(PathBuf::from("/r/a")), Sockets::default()).generation(),
+            LinkDriver::new(Some(PathBuf::from("/r/a")), Sockets::default(), InstallKind::Agent).generation(),
             None,
             "still connecting"
         );
@@ -1271,9 +1519,9 @@ mod tests {
 
     #[test]
     fn a_driver_for_an_address_says_connecting_before_it_connects() {
-        let driver = LinkDriver::new(Some(PathBuf::from("/r/a")), Sockets::default());
+        let driver = LinkDriver::new(Some(PathBuf::from("/r/a")), Sockets::default(), InstallKind::Agent);
         assert!(matches!(driver.state(), LinkState::Connecting { .. }));
-        let driver = LinkDriver::new(None, Sockets::default());
+        let driver = LinkDriver::new(None, Sockets::default(), InstallKind::Agent);
         assert_eq!(*driver.state(), LinkState::NoEditor);
         assert_eq!(driver.band().state, "none");
     }

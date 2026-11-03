@@ -11,8 +11,8 @@ use rmpv::Value;
 
 use super::attach::{BandLink, LinkState};
 use super::driver::LinkDriver;
-use super::Sockets;
-use crate::editor_rpc::EditorRpc;
+use super::{InstallKind, Sockets};
+use crate::editor_rpc::{EditorRpc, Glue};
 use crate::nvim_rpc::Pending;
 
 /// What one poll of the link found.
@@ -39,9 +39,9 @@ impl CompanionLink {
     pub const POLL_INTERVAL: Duration = Duration::from_millis(50);
 
     /// Starts following `initial` (an nvim address) or nothing.
-    pub fn new(initial: Option<PathBuf>, sockets: Sockets) -> Self {
+    pub fn new(initial: Option<PathBuf>, sockets: Sockets, kind: InstallKind) -> Self {
         CompanionLink {
-            driver: RefCell::new(LinkDriver::new(initial, sockets)),
+            driver: RefCell::new(LinkDriver::new(initial, sockets, kind)),
         }
     }
 
@@ -82,6 +82,16 @@ impl CompanionLink {
     pub fn exec_lua_for(&self, part: &str, code: &str, args: Vec<Value>) -> Result<(), String> {
         // editor-rpc-scan: forwards a caller's constant
         self.driver.borrow_mut().exec_lua_for(Some(part), code, args)
+    }
+
+    /// Whether the attached editor runs inside tmux.
+    pub fn in_tmux(&self) -> Option<bool> {
+        self.driver.borrow().in_tmux()
+    }
+
+    /// Queue a named operation in this connection's slot.
+    pub fn slot_call(&self, name: &str, args: Vec<Value>) -> Result<(), String> {
+        self.driver.borrow_mut().slot_call(name, args)
     }
 
     /// Hand `keys` to the attached nvim as typed (`nvim_input`), without waiting for an answer. Unlike a Lua
@@ -131,6 +141,10 @@ impl EditorRpc for CompanionLink {
         self.driver.borrow_mut().exec_lua_answered(code, args)
     }
 
+    fn glue(&self) -> Option<Glue> {
+        self.driver.borrow().glue()
+    }
+
     fn target(&self) -> Option<u64> {
         self.driver.borrow().generation()
     }
@@ -142,7 +156,7 @@ mod tests {
 
     #[test]
     fn a_link_with_no_editor_polls_idle_and_shuts() {
-        let link = CompanionLink::new(None, Sockets::default());
+        let link = CompanionLink::new(None, Sockets::default(), InstallKind::Agent);
         let first = link.poll(Instant::now());
         assert!(first.changed.is_none());
         assert!(!first.cancel_drafts);

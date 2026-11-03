@@ -10,7 +10,7 @@ use gtk4::glib;
 
 use eitri_core::companion::attach::{BandLink, LinkState};
 pub(crate) use eitri_core::companion::link::CompanionLink;
-use eitri_core::companion::Sockets;
+use eitri_core::companion::{InstallKind, Sockets};
 
 /// Starts following `initial` (an nvim address) or nothing. `on_change` is called once at once
 /// with the starting state, and again whenever the state changes or a connection begins, with the state, the band,
@@ -21,10 +21,11 @@ use eitri_core::companion::Sockets;
 pub(crate) fn start(
     initial: Option<PathBuf>,
     sockets: Sockets,
+    kind: InstallKind,
     on_change: impl Fn(&LinkState, BandLink, Option<u32>, bool) + 'static,
     on_cancel_drafts: impl Fn() + 'static,
 ) -> Rc<CompanionLink> {
-    let link = Rc::new(CompanionLink::new(initial, sockets));
+    let link = Rc::new(CompanionLink::new(initial, sockets, kind));
     {
         let (state, band, peer) = link.snapshot();
         on_change(&state, band, peer, false);

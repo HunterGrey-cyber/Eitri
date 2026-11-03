@@ -2759,3 +2759,42 @@ fn diff_refuses_a_path_retargeted_by_a_read_autocommand_and_removes_its_buffer()
     );
     assert_eq!(got, Value::Array(vec![false.into(), 1.into(), (-1).into()]));
 }
+
+#[test]
+#[ignore = "needs a real nvim on PATH and a listening socket; spends no tokens and needs no display"]
+fn every_follow_op_without_slot_behaves_as_before() {
+    let (mut c, listener, socket) = follow_case("no-slot");
+    let path = write_doc(&c, "doc.md", &numbered(100));
+    edit(&mut c, &path);
+    c.nvim.lua("vim.bo.filetype = 'markdown'", vec![]);
+    let installed = install(&mut c, &socket, false, &[("EitriFollowDemo", "show")], None);
+    assert_eq!(field(&installed, "ok"), &true.into());
+    follow(&mut c, true);
+    let messages = lines_within(&mut c.nvim, &listener, SETTLE);
+    assert!(!views(&messages).is_empty());
+    let buf = buf_of(&mut c, &path);
+    let pulled = op(
+        &mut c,
+        "text",
+        opts_map(&[
+            ("owner", OWNER.into()),
+            ("buf", buf.into()),
+            ("max_bytes", 10000.into()),
+            ("max_lines", 1000.into()),
+        ]),
+    );
+    assert_eq!(field(&pulled, "lines").as_array().unwrap().len(), 100);
+    let revealed = op(&mut c, "reveal", at(buf, 20, ("token", 1)));
+    assert_eq!(field(&revealed, "applied"), &true.into());
+    let jumped = op(&mut c, "jump", at(buf, 30, ("col", 1)));
+    assert_eq!(field(&jumped, "applied"), &true.into());
+    assert_eq!(cursor(&mut c).as_array().unwrap()[0].as_u64(), Some(30));
+    follow(&mut c, false);
+    drain(&mut c, &listener);
+    let torn = op(&mut c, "teardown", opts_map(&[("owner", OWNER.into())]));
+    assert_eq!(field(&torn, "ok"), &true.into());
+    assert_eq!(
+        c.nvim.lua("return vim.fn.exists(':EitriFollowDemo')", vec![]).as_u64(),
+        Some(0)
+    );
+}

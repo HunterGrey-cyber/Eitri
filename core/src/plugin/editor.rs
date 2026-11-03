@@ -10,7 +10,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use rmpv::Value;
 
-use crate::editor_rpc::EditorRpc;
+use crate::editor_rpc::{EditorRpc, GlueSlot};
 use crate::nvim_rpc::Pending;
 
 // Statics, not consts: a const is copied to each use, and the tests check that the very same text is what
@@ -294,11 +294,27 @@ pub struct FollowInstall<'a> {
     pub scratch_dir: Option<&'a Path>,
 }
 
-fn follow_call(rpc: &dyn EditorRpc, op: &str, opts: Vec<(Value, Value)>) -> Pending {
+fn follow_call(rpc: &dyn EditorRpc, op: &str, mut opts: Vec<(Value, Value)>) -> Pending {
+    if let Some(glue) = rpc.glue() {
+        let mut slot = vec![(Value::from("chan"), Value::from(glue.chan))];
+        // An absent id names the agent slot; page ids always name entries in the page registry.
+        if let GlueSlot::Page(id) = glue.slot {
+            slot.push((Value::from("id"), Value::from(id)));
+        }
+        opts.push((Value::from("slot"), Value::Map(slot)));
+    }
     rpc.exec_lua(PLUGIN_FOLLOW_LUA, vec![Value::from(op), Value::Map(opts)])
 }
 
 pub fn follow_install(rpc: &dyn EditorRpc, install: &FollowInstall<'_>) -> Pending {
+    follow_install_with_scratch_prefix(rpc, install, None)
+}
+
+pub(super) fn follow_install_with_scratch_prefix(
+    rpc: &dyn EditorRpc,
+    install: &FollowInstall<'_>,
+    scratch_prefix: Option<&Path>,
+) -> Pending {
     let filetypes = install.filetypes.iter().map(|f| Value::from(f.as_str())).collect();
     let commands = install
         .commands
@@ -314,6 +330,9 @@ pub fn follow_install(rpc: &dyn EditorRpc, install: &FollowInstall<'_>) -> Pendi
     ];
     if let Some(dir) = install.scratch_dir {
         opts.push((Value::from("scratch_dir"), path_value(dir)));
+    }
+    if let Some(prefix) = scratch_prefix {
+        opts.push((Value::from("scratch_prefix"), path_value(prefix)));
     }
     follow_call(rpc, "install", opts)
 }
