@@ -2821,6 +2821,59 @@ mod live_review {
         f.shut_down();
     }
 
+    /// An edit whose tool named its file through a link and `..` is drawn on the file the disk names,
+    /// which only the disk can say (`alias/..` is where the link leads, not the root).
+    #[test]
+    fn an_edit_named_through_a_link_and_dotdot_is_drawn_on_the_file_the_disk_names() {
+        let mut f = live("live-dotdot");
+        std::fs::create_dir_all(f.file("other/sub")).unwrap();
+        std::os::unix::fs::symlink(f.file("other/sub"), f.file("alias")).unwrap();
+        f.write("other/a.txt", FOUR, 0o644);
+        f.write("a.txt", FOUR, 0o644);
+        f.start_turn();
+        let editor = ScriptedEditor::new();
+        let (tab, provider, turn) = (f.tab, f.provider.clone(), format!("t{}", f.turns));
+        f.write("other/a.txt", FOUR_EDITED, 0o644);
+        let id = format!("edit-{}", uuid::Uuid::new_v4().simple());
+        let named = f.file("alias").join("../a.txt");
+        provider.queue_all(vec![
+            AgentDomainEvent::ToolCallStarted {
+                turn_id: turn.clone(),
+                tool_use_id: id.clone(),
+                name: "Edit".to_owned(),
+                input: json!({"file_path": named.to_str().unwrap()}),
+            },
+            AgentDomainEvent::ToolCallCompleted {
+                turn_id: turn.clone(),
+                tool_use_id: id.clone(),
+                content: json!("ok"),
+                is_error: false,
+            },
+        ]);
+        until("the edit's end", || {
+            f.pump();
+            f.tabs.get(tab).and_then(|t| t.live()).is_some_and(|b| {
+                b.projection()
+                    .tool_calls
+                    .iter()
+                    .any(|c| c.tool_use_id == id && c.result.is_some())
+            })
+        });
+        let at = Instant::now();
+        live_until(&mut f, &editor, at, "the live drawing", |_, e| {
+            e.count(LIVE_SHOW_LUA) == 1
+        });
+        let asked = editor.args(LIVE_SHOWN_LUA, 0);
+        let asked: Vec<Vec<u8>> = asked[0].as_array().unwrap().iter().map(bytes_of).collect();
+        assert_eq!(asked, vec![path_bytes(&f.file("other/a.txt"))]);
+        assert_eq!(
+            bytes_of(&editor.args(LIVE_SHOW_LUA, 0)[0]),
+            path_bytes(&f.file("other/a.txt"))
+        );
+        f.end_turn();
+        f.shut_down();
+    }
+
     #[test]
     fn an_edit_of_a_file_not_shown_runs_no_job() {
         let mut f = live("live-hidden");

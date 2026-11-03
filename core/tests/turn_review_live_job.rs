@@ -149,6 +149,30 @@ fn an_ignored_new_file_is_skipped_as_ignored() {
 }
 
 #[test]
+fn a_file_the_base_ignored_is_not_new_after_the_turn_changes_an_ignore_file() {
+    let mut p = Project::new(&[(".gitignore", b".env\n"), (".env", b"SECRET=1\n")], options());
+    std::fs::create_dir(p.root.join("sub")).unwrap();
+    p.base();
+    p.write(".gitignore", b"");
+    p.write(".env", b"SECRET=2\n");
+    assert_eq!(p.live(".env"), Err(LiveSkip::Ignored), "the base's rules kept it out");
+    p.write(".gitignore", b".env\n");
+    p.write("sub/.gitignore", b"other\n");
+    p.write("sub/new", b"one\n");
+    assert_eq!(
+        p.live("sub/new"),
+        Err(LiveSkip::Ignored),
+        "an ignore file made in the turn"
+    );
+    p.write("plain", b"two\n");
+    assert_eq!(
+        p.live("plain").unwrap().hunks[0].new_lines.concat(),
+        b"two\n",
+        "unchanged ignore files above it: new"
+    );
+}
+
+#[test]
 fn an_ignored_name_that_starts_with_a_colon_is_still_ignored() {
     let mut p = Project::new(&[(".gitignore", b":secret\n")], options());
     p.base();
@@ -303,7 +327,7 @@ fn a_link_and_a_fifo_are_not_read() {
 fn read_lines_counts_the_lines_read() {
     let mut p = Project::new(&[("a", b"base\n")], options());
     p.base();
-    for (bytes, count) in [(b"a\nb\n".as_slice(), 2), (b"a\nb", 2), (b"\n", 1), (b"", 1)] {
+    for (bytes, count) in [(b"a\nb\n".as_slice(), 2), (b"a\nb", 2), (b"\n", 1), (b"", 0)] {
         p.write("a", bytes);
         assert_eq!(p.live("a").unwrap().read_lines, count);
     }
@@ -328,7 +352,7 @@ fn a_crlf_file_and_one_without_a_final_newline_give_exact_sides() {
 
 #[test]
 fn the_settle_job_gives_the_end_snapshots_line_count() {
-    for (after, count) in [(b"one\ntwo\n".as_slice(), 2), (b"one\ntwo", 2), (b"", 1)] {
+    for (after, count) in [(b"one\ntwo\n".as_slice(), 2), (b"one\ntwo", 2), (b"", 0)] {
         let mut p = Project::new(&[("a", b"base\n")], options());
         p.base();
         p.write("a", after);

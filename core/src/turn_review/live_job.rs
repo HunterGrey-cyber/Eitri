@@ -1,6 +1,6 @@
 //! Worker jobs for live drawings and their snapshot-backed settle.
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::time::Instant;
 
 use super::diff::{blob_hunks, Side};
@@ -10,7 +10,7 @@ use super::lifecycle::{
     MAX_OVERVIEW_DIFF_LINES,
 };
 use super::revert::{exact_hunks, lines_of, ExactHunk, ExactHunks, ExactHunksJob};
-use super::shadow::{remaining, EntryKind, ShadowError, READ_TIMEOUT};
+use super::shadow::{remaining, EntryKind, Shadow, ShadowError, READ_TIMEOUT};
 use super::write::{self, Current, ProjectDir, WriteError};
 
 const MAX_FILE_BYTES: u64 = 8 * 1024 * 1024;
@@ -40,6 +40,7 @@ pub struct LiveHunksJob {
 pub struct LiveHunks {
     pub path: String,
     pub hunks: Vec<ExactHunk>,
+    /// Zero for an empty file, which nvim holds as one empty line: only that line may stand for it.
     pub read_lines: u64,
 }
 
@@ -66,7 +67,7 @@ pub struct LiveSettleJob {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct LiveSettle {
     pub exact: ExactHunks,
-    /// An empty file counts as one line, as it does in nvim.
+    /// Zero for a file empty or gone at the end, as [`LiveHunks::read_lines`].
     pub end_lines: u64,
 }
 
@@ -129,6 +130,11 @@ impl LiveHunksJob {
                     GitError::check("check-ignore", output).map_err(|e| ReviewError::Unavailable(e.to_string()))?;
                 }
             }
+            // That answer uses the `.gitignore` files on disk now. One the turn changed may have let
+            // out a file the base's rules kept out of the snapshot, which is not new either.
+            if ignore_files_changed(&shadow, commit, &project, &self.path)? {
+                return Ok(Err(LiveSkip::Ignored));
+            }
         }
         let size = write::file_len(&target).map_err(|e| ReviewError::Unavailable(e.to_string()))?;
         if size.is_some_and(|size| size > MAX_FILE_BYTES) {
@@ -163,7 +169,7 @@ impl LiveHunksJob {
         }
         let before_lines = lines_of(&before);
         let after_lines = lines_of(&bytes);
-        let read_lines = buffer_line_count(&after_lines);
+        let read_lines = after_lines.len() as u64;
         let hunks = exact_hunks(patch, &before_lines, &after_lines)?;
         Ok(Ok(LiveHunks {
             path: self.path.to_string_lossy().into_owned(),
@@ -191,7 +197,7 @@ impl LiveSettleJob {
             return Err(ReviewError::NotReady("this turn has no end snapshot yet".into()));
         };
         let end = shadow.read_entry(end_commit, &self.exact.path).map_err(unavailable)?;
-        let end_lines = end.map_or(1, |e| e.bytes.split_inclusive(|b| *b == b'\n').count().max(1) as u64);
+        let end_lines = end.map_or(0, |e| e.bytes.split_inclusive(|b| *b == b'\n').count() as u64);
         let exact = self.exact.run_resolved(&shadow, &resolved)?;
         Ok(LiveSettle { exact, end_lines })
     }
@@ -201,8 +207,29 @@ fn unavailable(error: ShadowError) -> ReviewError {
     ReviewError::Unavailable(error.to_string())
 }
 
-fn buffer_line_count(lines: &[Vec<u8>]) -> u64 {
-    lines.len().max(1) as u64
+/// Whether a `.gitignore` in a directory above `path` differs from the base snapshot's copy (made,
+/// changed, removed, or no longer a plain file).
+fn ignore_files_changed(shadow: &Shadow, commit: &str, project: &ProjectDir, path: &Path) -> Result<bool, ReviewError> {
+    for dir in path.ancestors().skip(1) {
+        let file = dir.join(".gitignore");
+        let base = shadow.read_entry(commit, &file).map_err(unavailable)?;
+        let target = match project.target(&file, false) {
+            Ok(target) => target,
+            Err(WriteError::Outside(_)) => return Ok(true),
+            Err(e) => return Err(ReviewError::Unavailable(e.to_string())),
+        };
+        let now =
+            write::read_current_within(&target, MAX_FILE_BYTES).map_err(|e| ReviewError::Unavailable(e.to_string()))?;
+        let same = match (&base, &now) {
+            (None, Current::Absent) => true,
+            (Some(entry), Current::Regular { bytes, .. }) => entry.kind == EntryKind::Blob && entry.bytes == *bytes,
+            _ => false,
+        };
+        if !same {
+            return Ok(true);
+        }
+    }
+    Ok(false)
 }
 
 #[cfg(test)]

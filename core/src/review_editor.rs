@@ -34,7 +34,7 @@ use crate::wm::PeerId;
 pub const REVIEW_LUA: &str = concat!(include_str!("find_buf.lua"), include_str!("review.lua"));
 
 /// Bumped whenever `find_buf.lua` or `review.lua` changes.
-pub const REVIEW_LUA_VERSION: i64 = 11;
+pub const REVIEW_LUA_VERSION: i64 = 14;
 
 /// Every call into an installed module first checks that one is there, and answers
 /// `{ missing = true }` when it is not (another panel's teardown, or nvim restarted) rather than
@@ -877,19 +877,27 @@ impl EditorOverlay {
         ended_ns: Option<u64>,
         paths: &[PathBuf],
     ) {
-        let paths: BTreeSet<&PathBuf> = paths.iter().collect();
-        let before: BTreeSet<&PathBuf> = paths
+        let mut touched: BTreeSet<PathBuf> = paths.iter().cloned().collect();
+        // Running again after an end was noted: its older paths may now overlap a newer turn's.
+        let reopens = ended_ns.is_none() && self.contest.has_ended(key);
+        if reopens {
+            touched.extend(self.contest.paths_of(key));
+        }
+        let before: BTreeSet<PathBuf> = touched
             .iter()
-            .copied()
             .filter(|path| self.contest.is_contested(path))
+            .cloned()
             .collect();
-        for path in &paths {
+        if reopens {
+            self.contest.reopen(key);
+        }
+        for path in paths {
             self.contest.note_edit(key, started_ns, path);
         }
         if let Some(ended_ns) = ended_ns {
             self.contest.note_end(key, ended_ns);
         }
-        for path in paths {
+        for path in &touched {
             if !before.contains(path) && self.contest.is_contested(path) {
                 self.clear_contested(path);
             }
@@ -3580,6 +3588,27 @@ mod tests {
             state: Drawn::Cleared,
         }));
         assert!(!has_off(&routed.mine), "a contested clear says nothing: {routed:?}");
+    }
+
+    #[test]
+    fn a_turn_noted_running_after_its_end_contests_its_paths_again() {
+        let nvim = Nvim::new();
+        let mut overlay = EditorOverlay::new(Owner::Embedded);
+        let mut at = Instant::now();
+        // t1's tab went for a move, so its end was noted when it went.
+        overlay.note_live(Window::One, &key("s1", "t1"), 10, None, &paths(&["/p/a"]));
+        overlay.note_live(Window::One, &key("s1", "t1"), 10, Some(30), &[]);
+        // A turn that started after that draws the same file.
+        overlay.note_live(Window::One, &key("s2", "t2"), 40, None, &paths(&["/p/a"]));
+        overlay.call(&nvim, live_show("/p/a", "s2", 2), at);
+        ticks(&mut overlay, &nvim, &mut at);
+        assert_eq!(drawings(&overlay), vec![("/p/a", ("s2", 2))]);
+
+        // The move was cancelled: t1 runs on and edits another file, and both turns now run.
+        overlay.note_live(Window::One, &key("s1", "t1"), 10, None, &paths(&["/p/b"]));
+        ticks(&mut overlay, &nvim, &mut at);
+        assert_eq!(sent_paths(&nvim, LIVE_CLEAR_LUA), vec!["/p/a".to_owned()]);
+        assert!(overlay.live_drawings().is_empty(), "{:?}", overlay.live_drawings());
     }
 
     #[test]

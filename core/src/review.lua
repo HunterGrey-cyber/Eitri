@@ -109,8 +109,66 @@ local state = {
 }
 local MAX_FORGOTTEN = 256
 
+-- Whether `vim.notify` is still nvim's own, which echoes on the command line. Anything else -- a
+-- notification plugin's function, or a callable table -- shows a long line its own way.
+local function own_notify()
+  local notify = vim.notify
+  if type(notify) ~= 'function' then
+    return false
+  end
+  local ok, info = pcall(debug.getinfo, notify, 'S')
+  local source = ok and info and info.source or ''
+  return source:find('vim/_editor', 1, true) ~= nil or source:find('vim/_core/editor', 1, true) ~= nil
+end
+
+-- `msg` cut in the middle to at most `room` cells, as nvim's own `shortmess+=T` cuts a long
+-- message: its start and its end stay, the end with two thirds of the room, so an instruction at
+-- the end ("undo it in the panel (x)") is still read.
+local function cut_to(msg, room)
+  local mark = '...'
+  local keep = room - #mark
+  local head_room = math.floor(keep / 3)
+  local tail_room = keep - head_room
+  local n = vim.fn.strchars(msg)
+  local head, tail = '', ''
+  local i = 0
+  while i < n do
+    local ch = vim.fn.strcharpart(msg, i, 1)
+    if vim.fn.strdisplaywidth(head .. ch) > head_room then
+      break
+    end
+    head = head .. ch
+    i = i + 1
+  end
+  local j = n - 1
+  while j >= i do
+    local ch = vim.fn.strcharpart(msg, j, 1)
+    if vim.fn.strdisplaywidth(ch .. tail) > tail_room then
+      break
+    end
+    tail = ch .. tail
+    j = j - 1
+  end
+  return head .. mark .. tail
+end
+
+-- A line wider than `v:echospace` stops nvim at a hit-enter prompt in the middle of the key the
+-- person pressed, and the editor waits there until they answer it. nvim keeps in `:messages` only
+-- what it shows (a `:silent` message never reaches it), so through nvim's own notify such a line
+-- is echoed cut in the middle to fit, and that is what `:messages` holds; anything shorter, or any
+-- line under a replaced `vim.notify`, goes through `vim.notify` whole.
+local function say(msg, level)
+  local room = tonumber(vim.v.echospace) or 0
+  if room <= 3 or vim.fn.strdisplaywidth(msg) <= room or not own_notify() then
+    vim.notify(msg, level)
+    return
+  end
+  local hl = level == vim.log.levels.WARN and 'WarningMsg' or (level == vim.log.levels.ERROR and 'ErrorMsg' or nil)
+  vim.api.nvim_echo({ { cut_to(msg, room), hl } }, true, {})
+end
+
 local function warn(msg)
-  vim.notify(msg, vim.log.levels.WARN)
+  say(msg, vim.log.levels.WARN)
 end
 
 local function active_count()
@@ -291,6 +349,16 @@ local function drop_marks(buf, d)
   d.alive = false
 end
 
+-- NUL and the escape byte spelled out with the escape byte, so the result never holds a NUL:
+-- vim.fn.sha256 refuses a string with one on nvim 0.10 and 0.11 (it arrives as a Blob).
+local FIELD_ESCAPES = { ['\0'] = '\1\2', ['\1'] = '\1\1' }
+
+-- A text as its byte length and its escaped bytes: no text can run into the next field.
+local function field(text)
+  local escaped = text:gsub('[%z\1]', FIELD_ESCAPES)
+  return #text .. ':' .. escaped
+end
+
 local function keyed(lines, eols)
   local parts = {}
   for i = 1, #lines do
@@ -299,8 +367,17 @@ local function keyed(lines, eols)
   return table.concat(parts)
 end
 
+-- Both sides, each as its line count and every line's ending and text as fields.
 local function fingerprint(h)
-  return vim.fn.sha256(keyed(h.old_lines, h.old_eols) .. '\0' .. keyed(h.new_lines, h.new_eols))
+  local parts = {}
+  for _, side in ipairs({ { h.old_lines, h.old_eols }, { h.new_lines, h.new_eols } }) do
+    local lines, eols = side[1], side[2]
+    parts[#parts + 1] = #lines .. ';'
+    for i = 1, #lines do
+      parts[#parts + 1] = field(eols[i]) .. field(lines[i])
+    end
+  end
+  return vim.fn.sha256(table.concat(parts))
 end
 
 local function kept_hunks(path, meta)
@@ -844,7 +921,7 @@ local function undo_all()
     state.events[#state.events + 1] = plan.event
   end
   local noun = #plans == 1 and ' change' or ' changes'
-  vim.notify(#plans .. noun .. ' undone in this buffer only; :w writes them, u brings them back', vim.log.levels.INFO)
+  say(#plans .. noun .. ' undone in this buffer only; :w writes them, u brings them back', vim.log.levels.INFO)
 end
 state.undo_current = undo_all
 
@@ -1183,6 +1260,13 @@ function state.live_show(path, meta, hunks)
   if not answer.shown then return status(answer) end
   if must_leave(buf) then
     answer.left = true
+    -- The turn ended but its exact hunks cannot go over this buffer: its drawing from the running
+    -- turn would otherwise stay marked running, and undo would keep refusing for a turn that is over.
+    local ov = state.overlays[buf]
+    if not meta.running and ov and ov.live and ov.running and ov.meta.session == meta.session
+      and ov.meta.turn_id == meta.turn_id then
+      remove_overlay(buf, 'settled')
+    end
     return status(answer)
   end
   local autoread = api.nvim_get_option_value('autoread', { buf = buf })
@@ -1299,7 +1383,7 @@ watch = function()
       local why = not state.reloading[args.buf] and 'reload' or nil
       remove_overlay(args.buf, why)
       if not live then
-        vim.notify('the review overlay was cleared: the file was reloaded', vim.log.levels.INFO)
+        say('the review overlay was cleared: the file was reloaded', vim.log.levels.INFO)
       end
     end,
   })

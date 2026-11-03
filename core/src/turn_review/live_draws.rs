@@ -179,6 +179,9 @@ struct Finished {
     key: TurnKey,
     started_ns: u64,
     ended_ns: u64,
+    /// Its tab went (a move froze it) before its record ended, so `ended_ns` is when the tab went: an
+    /// edit of it from a tab that holds its session again (the move was cancelled) follows it anew.
+    left_running: bool,
 }
 
 /// One window's live drawings.
@@ -229,6 +232,13 @@ impl LiveDraws {
                 turn_id: edit.turn_id,
             };
             let path = edit.path;
+            if let Some(at) = self
+                .finished
+                .iter()
+                .position(|done| done.key == key && done.left_running)
+            {
+                self.finished.remove(at);
+            }
             if let Some(done) = self.finished.iter().find(|done| done.key == key) {
                 self.out.push(LiveStep::Note {
                     key,
@@ -465,7 +475,7 @@ impl LiveDraws {
             .partition(|turn| turn.tab == tab);
         self.turns = kept;
         for turn in gone {
-            self.finish(turn);
+            self.finish(turn, true);
         }
         self.out
             .retain(|step| !matches!(step, LiveStep::Draw { tab: drawn_by, .. } if *drawn_by == tab));
@@ -507,7 +517,7 @@ impl LiveDraws {
         while index < self.turns.len() {
             if self.advance(index, records, now) {
                 let turn = self.turns.remove(index);
-                self.finish(turn);
+                self.finish(turn, false);
             } else {
                 index += 1;
             }
@@ -659,8 +669,9 @@ impl LiveDraws {
     }
 
     /// Forgets a turn: its end, and any path named after it was told, go to the contested-paths
-    /// table. A path no held turn names stops being anyone's.
-    fn finish(&mut self, turn: Turn) {
+    /// table. A path no held turn names stops being anyone's. `tab_went`: forgotten because its tab
+    /// went, not because it settled.
+    fn finish(&mut self, turn: Turn, tab_went: bool) {
         let turns = &self.turns;
         self.owner
             .retain(|path, _| turns.iter().any(|held| held.paths.contains(path)));
@@ -668,6 +679,7 @@ impl LiveDraws {
         let Some(started_ns) = turn.started_ns else {
             return;
         };
+        let left_running = tab_went && turn.ended_ns.is_none();
         let ended_ns = turn.ended_ns.unwrap_or_else(self.clock);
         let paths: Vec<PathBuf> = if turn.end_noted {
             turn.unnoted.into_iter().collect()
@@ -689,6 +701,7 @@ impl LiveDraws {
             key: turn.key,
             started_ns,
             ended_ns,
+            left_running,
         });
     }
 
@@ -1390,6 +1403,53 @@ mod tests {
         draws.shown(vec![p("a.rs")], vec![false], now);
         draws.follow_ended(2, &p("a.rs"), now);
         assert!(asks(&draws.steps(&records, 0, now)).is_empty());
+    }
+
+    #[test]
+    fn a_running_turn_whose_tab_comes_back_is_drawn_and_settled_again() {
+        let now = Instant::now();
+        let mut records = Records::default();
+        records.running(1, "s", "t1");
+        let mut draws = fresh();
+        draw_live(&mut draws, &records, 1, "t1", "a.rs", now);
+        // A move froze the tab: its drawing goes and its end is noted at the time it went.
+        draws.tab_gone(1);
+        let steps = draws.steps(&records, 0, now);
+        assert_eq!(clears(&steps), vec![p("a.rs")]);
+        assert_eq!(notes(&steps), vec![(key("s", "t1"), Some(GONE_AT), vec![p("a.rs")])]);
+
+        // The move was cancelled: the still-running turn's next edit is drawn, and noted as running.
+        draws.edits(vec![edit(1, "s", "t1", "a.rs")], &records, now);
+        let steps = draws.steps(&records, 0, now);
+        assert_eq!(notes(&steps), vec![(key("s", "t1"), None, vec![p("a.rs")])]);
+        assert_eq!(asks(&steps), vec![vec![p("a.rs")]], "{steps:?}");
+        draws.shown(vec![p("a.rs")], vec![true], now);
+        assert_eq!(runs(&draws.steps(&records, 0, now)), vec![p("a.rs")]);
+        draws.live_done(&key("s", "t1"), &p("a.rs"), live_ok("a.rs", 10));
+        assert_eq!(drawn(&draws.steps(&records, 0, now)), vec![(p("a.rs"), true)]);
+
+        // Its real end is noted and its drawing settled.
+        records.end("s", "t1", TurnState::Ok);
+        let steps = draws.steps(&records, 0, now);
+        assert_eq!(notes(&steps), vec![(key("s", "t1"), Some(ENDED), vec![p("a.rs")])]);
+        assert_eq!(asks(&steps), vec![vec![p("a.rs")]], "the settle asks: {steps:?}");
+
+        // A turn that had ended before its tab went stays only noted.
+        let mut draws = fresh();
+        records.running(2, "s", "t2");
+        draws.edits(vec![edit(2, "s", "t2", "b.rs")], &records, now);
+        let steps = draws.steps(&records, 0, now);
+        draws.shown(asks(&steps).remove(0), vec![false], now);
+        records.end("s", "t2", TurnState::Ok);
+        let steps = draws.steps(&records, 0, now);
+        draws.shown(asks(&steps).remove(0), vec![true], now);
+        draws.tab_gone(2);
+        draws.steps(&records, 0, now);
+        draws.edits(vec![edit(2, "s", "t2", "b.rs")], &records, now);
+        let steps = draws.steps(&records, 0, now);
+        assert_eq!(notes(&steps), vec![(key("s", "t2"), Some(ENDED), vec![p("b.rs")])]);
+        assert!(asks(&steps).is_empty() && runs(&steps).is_empty(), "{steps:?}");
+        assert!(!draws.wants_ticks());
     }
 
     #[test]

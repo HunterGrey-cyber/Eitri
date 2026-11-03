@@ -21,8 +21,9 @@ use eitri_core::turn_review::Scope;
 use embed_client::{opts_map, Embed};
 use rmpv::Value;
 
-/// `,` as the local leader, and `vim.notify` replaced by a recorder the test reads.
-const PREPARE_LUA: &str = "vim.g.maplocalleader = ',' _G.__said = {} \
+/// `,` as the local leader, and `vim.notify` replaced by a recorder the test reads (nvim's own kept
+/// as `_G.__own_notify` for a test that needs it).
+const PREPARE_LUA: &str = "vim.g.maplocalleader = ',' _G.__said = {} _G.__own_notify = vim.notify \
      vim.notify = function(msg) table.insert(_G.__said, msg) end";
 /// `:edit <path>` with the path as an argument and no file-name expansion.
 const OPEN_LUA: &str =
@@ -2421,6 +2422,37 @@ fn live_show_leaves_a_modified_buffer_and_its_overlay_alone() {
 
 #[test]
 #[ignore = "needs nvim"]
+fn a_settle_over_a_modified_buffer_takes_its_own_running_drawing_off() {
+    let mut fx = Fx::new("live-settle-modified");
+    let (path, two) = live_two(&mut fx);
+    draw_running(&mut fx, &path, &two.hunks);
+    assert!(fx.marks().count > 0);
+    fx.nvim.lua(
+        "vim.api.nvim_buf_set_lines(0, 0, 0, true, { 'typed meanwhile' })",
+        vec![],
+    );
+    assert!(fx.modified());
+    let typed = fx.lines();
+
+    // Another turn's settle leaves the drawing as it is.
+    let before = fx.nvim.lua(OVERLAY_SNAPSHOT_LUA, vec![]);
+    let answer = live_show(&mut fx, &path, "t2", 32, &two.hunks);
+    assert_eq!(get(&answer, "left"), &Value::from(true));
+    assert_eq!(fx.nvim.lua(OVERLAY_SNAPSHOT_LUA, vec![]), before);
+
+    // Its own turn's settle cannot draw here, so the drawing that says "running" goes.
+    let answer = live_show(&mut fx, &path, "t1", 32, &two.hunks);
+    assert_eq!(get(&answer, "left"), &Value::from(true));
+    assert_eq!(count(&answer, "drawn"), 0);
+    assert_eq!(fx.marks().count, 0);
+    assert!(fx.review_maps().is_empty());
+    assert_eq!(fx.lines(), typed, "the person's text is untouched");
+    assert!(fx.modified());
+    assert_eq!(fx.event_kinds(), vec!["off"], "the host learns the drawing went");
+}
+
+#[test]
+#[ignore = "needs nvim"]
 fn live_show_never_replaces_an_overlay_that_is_not_live() {
     let mut fx = Fx::new("live-explicit");
     let (path, two) = live_two(&mut fx);
@@ -3158,6 +3190,73 @@ fn draw_running(fx: &mut Fx, path: &Path, hunks: &[ShowHunk]) {
     let mut meta = live_meta("t1", 32);
     meta.running = true;
     fx.nvim.lua(LIVE_SHOW_LUA, live_show_args(path, &meta, hunks));
+}
+
+/// With a UI attached and nvim's own notify, a refusal wider than the command line would stop nvim at
+/// a hit-enter prompt that eats the person's next key. It is echoed cut to fit instead.
+#[test]
+#[ignore = "needs nvim"]
+fn a_message_wider_than_the_command_line_is_cut_to_fit_and_stops_nothing() {
+    let mut fx = Fx::new("cut-message");
+    fx.nvim.lua("vim.notify = _G.__own_notify", vec![]);
+    fx.nvim.request(
+        "nvim_ui_attach",
+        vec![
+            Value::from(60),
+            Value::from(20),
+            opts_map(&[("ext_linegrid", Value::from(true))]),
+        ],
+    );
+    let (path, two) = live_two(&mut fx);
+    draw_running(&mut fx, &path, &two.hunks);
+    fx.nvim.command("messages clear");
+    fx.nvim.input(",d");
+    std::thread::sleep(std::time::Duration::from_millis(300));
+    let mode = fx.nvim.request("nvim_get_mode", vec![]);
+    assert_eq!(get(&mode, "mode"), &Value::from("n"), "{mode:?}");
+    assert_eq!(get(&mode, "blocking"), &Value::from(false), "{mode:?}");
+    let room = int(&fx.nvim.eval("v:echospace"));
+    let said = fx.nvim.lua(
+        "return vim.api.nvim_exec2('messages', { output = true }).output",
+        vec![],
+    );
+    let said = said.as_str().unwrap_or_default().to_string();
+    assert!(
+        said.starts_with("the turn is") && said.contains("...") && said.ends_with("in the panel interrupts it)"),
+        "the start and the instruction at the end stay: {said:?}"
+    );
+    assert!(said.chars().count() as i64 <= room, "{said:?} is wider than {room}");
+    assert_eq!(fx.lines(), as_lines(&two.end), "a refusal changes nothing");
+}
+
+/// A `vim.notify` that is a callable table (a metatable `__call`) is a replacement: the line goes to it
+/// whole, and nothing asks `debug.getinfo` about a table.
+#[test]
+#[ignore = "needs nvim"]
+fn a_callable_table_notify_gets_the_whole_line() {
+    let mut fx = Fx::new("callable-notify");
+    fx.nvim.lua(
+        "vim.notify = setmetatable({}, { __call = function(_, msg) table.insert(_G.__said, msg) end })",
+        vec![],
+    );
+    fx.nvim.request(
+        "nvim_ui_attach",
+        vec![
+            Value::from(60),
+            Value::from(20),
+            opts_map(&[("ext_linegrid", Value::from(true))]),
+        ],
+    );
+    let (path, two) = live_two(&mut fx);
+    draw_running(&mut fx, &path, &two.hunks);
+    fx.nvim.input(",d");
+    std::thread::sleep(std::time::Duration::from_millis(300));
+    let mode = fx.nvim.request("nvim_get_mode", vec![]);
+    assert_eq!(get(&mode, "mode"), &Value::from("n"), "{mode:?}");
+    assert_eq!(
+        fx.said(),
+        vec!["the turn is still running; undo when it ends (Esc in the panel interrupts it)"]
+    );
 }
 
 #[test]

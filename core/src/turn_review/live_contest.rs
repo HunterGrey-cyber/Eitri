@@ -146,6 +146,37 @@ impl LiveContest {
         }
     }
 
+    /// Whether an end was noted for `key`.
+    pub fn has_ended(&self, key: &TurnKey) -> bool {
+        self.turns.get(key).is_some_and(|interval| interval.ended_ns.is_some())
+    }
+
+    /// The paths whose entries name `key`.
+    pub fn paths_of(&self, key: &TurnKey) -> Vec<PathBuf> {
+        self.paths
+            .iter()
+            .filter(|entry| entry.keys.contains(key))
+            .map(|entry| entry.path.clone())
+            .collect()
+    }
+
+    /// A turn noted as running after an end was noted for it (its tab went for a move that was
+    /// cancelled, or the window it moved to took it up): its interval is open again, so a turn that
+    /// started after that end and names one of its paths contests the path.
+    pub fn reopen(&mut self, key: &TurnKey) {
+        let Some(interval) = self.turns.get_mut(key) else {
+            return;
+        };
+        if interval.ended_ns.take().is_none() {
+            return;
+        }
+        for entry in &mut self.paths {
+            if entry.keys.contains(key) {
+                entry.refresh(&self.turns);
+            }
+        }
+    }
+
     pub fn is_contested(&self, path: &Path) -> bool {
         self.paths
             .iter()
@@ -173,6 +204,25 @@ mod tests {
             session: session.into(),
             turn_id: turn_id.into(),
         }
+    }
+
+    #[test]
+    fn a_turn_running_again_after_its_end_reopens_its_interval() {
+        let mut contest = LiveContest::new();
+        let (a, b) = (key("s", "a"), key("s2", "b"));
+        let p = Path::new("p");
+        assert!(!contest.note_edit(&a, 10, p));
+        contest.note_end(&a, 20);
+        assert!(contest.has_ended(&a));
+        assert!(!contest.note_edit(&b, 30, p), "b started after a's end");
+        contest.reopen(&a);
+        assert!(!contest.has_ended(&a));
+        assert!(contest.contested_by(&a, p) && contest.contested_by(&b, p));
+        assert_eq!(contest.paths_of(&a), vec![PathBuf::from("p")]);
+        // Reopening a turn that is running, or unknown, changes nothing.
+        contest.reopen(&a);
+        contest.reopen(&key("s3", "c"));
+        assert!(contest.contested_by(&a, p) && contest.contested_by(&b, p));
     }
 
     #[test]

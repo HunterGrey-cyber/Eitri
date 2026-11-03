@@ -245,6 +245,8 @@ pub struct ReviewFlow {
     live_ends: HashMap<TurnKey, u64>,
     /// Window 2: notes whose shown answer nobody waits for, taken when they come.
     live_unread: Vec<(u64, Instant)>,
+    /// Edits whose path goes through `..`, being resolved against the disk on a worker.
+    live_resolving: Vec<mpsc::Receiver<Vec<LiveEdit>>>,
     follow_ends: FollowEnds,
 }
 
@@ -386,6 +388,7 @@ impl ReviewFlow {
             && self.live_jobs.is_empty()
             && self.live_unread.is_empty()
             && self.follow_ends.is_empty()
+            && self.live_resolving.is_empty()
     }
 
     /// Whether the live drawings still follow the turn `key`: it runs, or its drawings are not
@@ -1400,6 +1403,15 @@ impl ReviewFlow {
     /// only; never waits.
     pub fn live_tick(&mut self, tabs: &mut TabSet, rpc: Option<&dyn EditorRpc>, now: Instant) {
         let edits = tabs.take_live_edits();
+        let mut resolved = Vec::new();
+        self.live_resolving.retain(|rx| match rx.try_recv() {
+            Ok(batch) => {
+                resolved.extend(batch);
+                false
+            }
+            Err(mpsc::TryRecvError::Empty) => true,
+            Err(mpsc::TryRecvError::Disconnected) => false,
+        });
         let follows = self.follow_ends.take();
         let gone: Vec<u64> = self
             .live_tabs
@@ -1407,7 +1419,7 @@ impl ReviewFlow {
             .filter(|(tab, session)| !holds_session(tabs, **tab, session))
             .map(|(tab, _)| *tab)
             .collect();
-        if edits.is_empty() && follows.is_empty() && gone.is_empty() && self.live_is_idle() {
+        if edits.is_empty() && resolved.is_empty() && follows.is_empty() && gone.is_empty() && self.live_is_idle() {
             return;
         }
         let review = tabs.turn_review();
@@ -1423,14 +1435,43 @@ impl ReviewFlow {
             // Their answers would be dropped; the slots are freed now.
             self.live_jobs.retain(|job| job.tab != tab);
         }
-        let edits: Vec<LiveEdit> = edits
+        let (dotted, plain): (Vec<LiveEdit>, Vec<LiveEdit>) = edits
             .into_iter()
             .filter(|edit| holds_session(tabs, edit.tab.0, &edit.session))
+            .partition(|edit| edit.path.components().any(|c| c == Component::ParentDir));
+        let mut edits: Vec<LiveEdit> = plain
+            .into_iter()
             .filter_map(|mut edit| {
                 edit.path = live_path(root.as_deref()?, &edit.path)?;
                 Some(edit)
             })
             .collect();
+        if let (false, Some(root)) = (dotted.is_empty(), root.clone()) {
+            // `..` after a link leads where the link leads, which only the disk says: read off the GTK
+            // thread, taken up on a later tick.
+            let batch = dotted.clone();
+            let worker_root = root.clone();
+            match spawn("live-path", move || {
+                batch
+                    .into_iter()
+                    .filter_map(|mut edit| {
+                        edit.path = resolve_live_path(&worker_root, &edit.path)?;
+                        Some(edit)
+                    })
+                    .collect()
+            }) {
+                Ok(rx) => self.live_resolving.push(rx),
+                Err(_) => edits.extend(dotted.into_iter().filter_map(|mut edit| {
+                    edit.path = live_path(&root, &edit.path)?;
+                    Some(edit)
+                })),
+            }
+        }
+        edits.extend(
+            resolved
+                .into_iter()
+                .filter(|edit| holds_session(tabs, edit.tab.0, &edit.session)),
+        );
         for edit in &edits {
             self.live_tabs.insert(edit.tab.0, edit.session.clone());
         }
@@ -1744,6 +1785,9 @@ impl ReviewFlow {
         match self.overlay.as_mut() {
             Some(Overlay::Local(overlay)) => overlay.note_live(from, key, started_ns, ended_ns, paths),
             None => {
+                if ended_ns.is_none() {
+                    self.parked_contest.reopen(key);
+                }
                 for path in paths {
                     self.parked_contest.note_edit(key, started_ns, path);
                 }
@@ -2459,21 +2503,69 @@ fn holds_session(tabs: &TabSet, tab: u64, session: &str) -> bool {
 /// it names one inside the project in UTF-8; decided from the text alone, on the GTK thread. The
 /// worker's read checks the file itself from the project root.
 fn live_path(root: &Path, named: &Path) -> Option<PathBuf> {
-    let rel = if named.is_absolute() {
-        named.strip_prefix(root).ok()?
-    } else {
-        named
-    };
+    // A tool's path is the model's text: `dir/../project/a.rs` names the same file as `project/a.rs`
+    // when no link is on the way, so it is read by its text (`.` gone, `..` taking the name before it)
+    // and must then lie under the root. Reading the disk here would wait on the GTK thread.
     let mut clean = PathBuf::new();
-    for component in rel.components() {
+    for component in root.join(named).components() {
         match component {
-            Component::Normal(part) => clean.push(part),
             Component::CurDir => {}
-            _ => return None,
+            Component::ParentDir => {
+                if !clean.pop() {
+                    return None;
+                }
+            }
+            other => clean.push(other.as_os_str()),
         }
     }
-    check_relative(clean.to_str()?).ok()?;
-    Some(root.join(clean))
+    let rel = clean.strip_prefix(root).ok()?;
+    check_relative(rel.to_str()?).ok()?;
+    Some(root.join(rel))
+}
+
+/// The absolute path of the file a path with `..` in it names, as the disk resolves it: the deepest
+/// part of its directory that exists is resolved with its links, the rest (names not there yet) is
+/// read by its text, and the file's own name is kept. Only a path that ends under the project root,
+/// both resolved, is kept; when nothing of it exists, its text decides as [`live_path`] does.
+/// Reads the disk: never on the GTK thread.
+fn resolve_live_path(root: &Path, named: &Path) -> Option<PathBuf> {
+    let full = root.join(named);
+    let mut parts: Vec<Component> = full.components().collect();
+    let Some(Component::Normal(leaf)) = parts.pop() else {
+        return None;
+    };
+    let Ok(real_root) = std::fs::canonicalize(root) else {
+        return live_path(root, named);
+    };
+    for n in (1..=parts.len()).rev() {
+        if parts[..n]
+            .iter()
+            .all(|c| matches!(c, Component::RootDir | Component::Prefix(_)))
+        {
+            break;
+        }
+        let prefix: PathBuf = parts[..n].iter().collect();
+        let Ok(mut real) = std::fs::canonicalize(&prefix) else {
+            continue;
+        };
+        for part in &parts[n..] {
+            match part {
+                Component::CurDir => {}
+                Component::ParentDir => {
+                    if !real.pop() {
+                        return None;
+                    }
+                }
+                Component::Normal(name) => real.push(name),
+                _ => return None,
+            }
+        }
+        real.push(leaf);
+        let rel = real.strip_prefix(&real_root).ok()?;
+        check_relative(rel.to_str()?).ok()?;
+        return Some(root.join(rel));
+    }
+    live_path(root, named)
 }
 
 /// Whether `abs` is drawn live for another turn than `session`'s `turn`.
@@ -2678,6 +2770,60 @@ fn now_ms() -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_dotted_live_edit_path_is_resolved_against_the_disk() {
+        let dir = crate::test_scratch_dir::ScratchDir::new("live-path", "dotted");
+        let root = dir.join("project");
+        std::fs::create_dir_all(root.join("other/sub")).unwrap();
+        std::fs::write(root.join("other/a.txt"), "x").unwrap();
+        std::fs::write(root.join("a.txt"), "y").unwrap();
+        std::os::unix::fs::symlink(root.join("other/sub"), root.join("alias")).unwrap();
+        std::fs::create_dir_all(dir.join("run")).unwrap();
+        // `alias/..` is `other`, where the link leads: not the root, as the text alone would say.
+        assert_eq!(live_path(&root, Path::new("alias/../a.txt")), Some(root.join("a.txt")));
+        assert_eq!(
+            resolve_live_path(&root, Path::new("alias/../a.txt")),
+            Some(root.join("other/a.txt"))
+        );
+        assert_eq!(
+            resolve_live_path(&root, &root.join("alias/../a.txt")),
+            Some(root.join("other/a.txt"))
+        );
+        // A directory beside the root, reached through `..`, as the window pass's tool names its file.
+        assert_eq!(
+            resolve_live_path(&root, &dir.join("run/../project/a.txt")),
+            Some(root.join("a.txt"))
+        );
+        // A file not there yet, under a directory not there yet: the missing part is read by its text.
+        assert_eq!(
+            resolve_live_path(&root, Path::new("new/../other/b.txt")),
+            Some(root.join("other/b.txt"))
+        );
+        // Out of the root, through the link or past it.
+        assert_eq!(resolve_live_path(&root, Path::new("alias/../../../x.txt")), None);
+        assert_eq!(resolve_live_path(&root, Path::new("../x.txt")), None);
+        assert_eq!(resolve_live_path(&root, Path::new("other/..")), None);
+    }
+
+    #[test]
+    fn a_live_edit_path_is_read_by_its_text_and_kept_inside_the_root() {
+        let root = Path::new("/w/project");
+        for (named, want) in [
+            ("/w/project/a.txt", Some("/w/project/a.txt")),
+            ("/w/run/../project/a.txt", Some("/w/project/a.txt")),
+            ("/w/project/./src/../a.txt", Some("/w/project/a.txt")),
+            ("src/a.rs", Some("/w/project/src/a.rs")),
+            ("src/../a.txt", Some("/w/project/a.txt")),
+            ("../other/a.txt", None),
+            ("/w/project/../other/a.txt", None),
+            ("/w/project", None),
+            ("/w/projectx/a.txt", None),
+            ("/../../a.txt", None),
+        ] {
+            assert_eq!(live_path(root, Path::new(named)), want.map(PathBuf::from), "{named}");
+        }
+    }
 
     fn applied(reverted_to: &[u8], replaced: &[u8]) -> AppliedRevert {
         AppliedRevert {

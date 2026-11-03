@@ -25,21 +25,29 @@
 //! them, needs no new channel or socket, and the latency it trades away is bounded by
 //! [`RELOAD_INTERVAL_MS`].
 //!
-//! # Why `checktime` is safe to run unconditionally
+//! # Which buffers the timer checks
 //!
 //! What follows was measured on real nvim rather than reasoned about, because an unbidden modal
 //! prompt inside an embedded editor would be worse than a stale buffer:
 //!
 //! - `autoread` defaults to **on** in nvim (unlike vim), and with it an **unmodified** buffer is
 //!   reloaded silently.
-//! - A **modified** buffer is not touched. nvim prints `W12: ... has changed and the buffer was
-//!   changed in Vim as well` and carries on -- no prompt, no block, the user's edits intact.
+//! - For a **modified** buffer `checktime` raises `W12` as a dialog (`[O]K, (L)oad File, Load File
+//!   (a)nd Options`) whenever a UI is attached: in insert mode it takes the next keys the person
+//!   types. Headless, with no UI, nvim answers the dialog itself and only the message shows.
+//! - For an unmodified buffer whose `autoread` is **off**, `checktime` raises `W11` as the same
+//!   kind of dialog, every tick.
 //!
-//! So this deliberately does **not** inspect `&modified` or `&autoread` first. nvim already makes
-//! the right distinction, and a guard here would be a second, worse copy of it.
+//! So the timer checks only buffers shown in a window of some tab page (a bare `checktime`'s set;
+//! `checktime {buf}` would also reload a buffer in no window), unmodified, with `autoread` on. A
+//! buffer with unsaved edits, or whose person turned `autoread` off, hears nothing until it is
+//! written, where nvim's own "changed since reading it" question still asks. Each window's step runs
+//! under `pcall` with its window and buffer checked first: a reload's autocommands may close a window
+//! or wipe a buffer the loop has not reached, and an error in a scheduled callback is a message that
+//! stops nvim at a hit-enter prompt.
 
-/// How often nvim checks. `checktime` stats each loaded buffer's file, so this is a handful of
-/// syscalls a second, and one second is far below the time it takes to notice a stale buffer.
+/// How often nvim checks. Each tick stats the file of each buffer shown in a window, so this is a
+/// handful of syscalls a second, and one second is far below the time it takes to notice a stale buffer.
 pub const RELOAD_INTERVAL_MS: u64 = 1000;
 
 /// The one `--cmd`, inline rather than a `dofile`d file.
@@ -52,8 +60,8 @@ pub const RELOAD_INTERVAL_MS: u64 = 1000;
 /// Three details, each load-bearing:
 /// - `vim.schedule`, because `vim.cmd` in a libuv callback is a "fast event" and fails at runtime
 ///   with E5560, never at load.
-/// - `pcall`, so a `checktime` that errors on some pathological buffer costs one tick, not the
-///   timer.
+/// - `pcall` around each window's step, so a `checktime` that errors on some pathological buffer, or
+///   a window a reload's autocommand closed, costs that window one tick, not the timer.
 /// - The timer handle is kept in a **Lua** global (`_G`), not in `vim.g`. A local would be
 ///   collected and the timer would stop at an unpredictable moment; `vim.g` is worse than either.
 ///   `vim.g.x = vim.uv.new_timer()` raises `__newindex`: `vim.g` holds only values convertible
@@ -116,12 +124,16 @@ mod tests {
         );
     }
 
-    /// Deliberately unconditional: nvim already reloads only unmodified buffers and only warns
-    /// about modified ones, both measured. A guard here would be a second, worse copy of that.
+    /// Under a UI a modified buffer would get `W12` and a `noautoread` one `W11`, each as a dialog; the
+    /// timer leaves both alone, and checks each window and buffer before it touches them.
+    /// `core/tests/buffer_reload_with_real_nvim.rs` checks the dialogs and the closed window.
     #[test]
-    fn it_does_not_second_guess_nvim_about_modified_or_autoread() {
-        assert!(!RELOAD_CMD.contains("modified"), "{RELOAD_CMD}");
-        assert!(!RELOAD_CMD.contains("autoread"), "{RELOAD_CMD}");
+    fn it_skips_modified_and_noautoread_buffers_and_guards_each_window() {
+        assert!(RELOAD_CMD.contains("vim.bo[b].modified"), "{RELOAD_CMD}");
+        assert!(RELOAD_CMD.contains("nvim_get_option_value('autoread'"), "{RELOAD_CMD}");
+        assert!(RELOAD_CMD.contains("pcall(function()"), "{RELOAD_CMD}");
+        assert!(RELOAD_CMD.contains("nvim_win_is_valid(w)"), "{RELOAD_CMD}");
+        assert!(RELOAD_CMD.contains("nvim_buf_is_valid(b)"), "{RELOAD_CMD}");
     }
 
     /// The interval is stated once and used once. A literal in the Lua that drifts from the

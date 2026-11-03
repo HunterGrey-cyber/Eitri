@@ -190,11 +190,13 @@ the file is up to you.
 
 ## Live drawings
 
-With `review.live` turned on (the [Configuration](configuration.md) page says whether it is on until you set it), a file
-the agent edits is drawn in your editor as the edit lands, without your pressing `o`. It works for a file that is
-shown in a Neovim window of the editor (in the full window or a companion window), for every kind of agent tab, and
-for a tab in a second window. The drawing is the same as the one `o` makes: added lines highlighted, removed lines
-shown above or below them as text that is not in the buffer.
+Live drawings are off until you turn them on: add `eitri.config.set("review.live", true)` to your `init.lua` and
+start Eitri again (the setting is read once at start).
+
+With `review.live` turned on, a file the agent edits is drawn in your editor as the edit lands, without your pressing
+`o`. It works for a file that is shown in a Neovim window of the editor (in the full window or a companion window), for
+every kind of agent tab, and for a tab in a second window. The drawing is the same as the one `o` makes: added lines
+highlighted, removed lines shown above or below them as text that is not in the buffer.
 
 What a drawing never does: open a file or a window, move your cursor or the view, take focus, change the mode, or
 say anything. It is drawn over a buffer only when the buffer is unmodified; a buffer you are typing in, or one with
