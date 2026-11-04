@@ -70,6 +70,7 @@ pub mod state_paths;
 pub mod tab_restore;
 pub mod tab_set;
 pub mod tabs;
+pub mod takeover;
 pub mod theme;
 pub mod transcript_titles;
 pub mod turn_review;
