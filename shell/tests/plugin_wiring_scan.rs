@@ -401,7 +401,7 @@ fn an_editor_drive_that_discards_the_outcome_is_rejected() {
 /// from an idle, never inside the batch, or they close the moment they open.
 #[test]
 fn the_keys_sheet_and_the_command_line_open_after_the_page_hears_it_has_the_keys() {
-    let code = file_code("shell/src/main.rs");
+    let code = file_code("shell/src/window_services.rs");
     let services = code
         .find("implgtk_host::ServiceSetforPanelServices{")
         .expect("the window's panel services");
@@ -985,7 +985,7 @@ fn no_module_verb_is_left_in_build_ui() {
     assert!(code.contains("tray.on_activate("));
     let chip = call_texts(&code, "tray.on_activate(");
     assert!(chip[0].contains("driver.run(WinId::MAIN,Action::Module(id.clone()),Origin::Chip);"));
-    let main = file_code("shell/src/main.rs");
+    let main = file_code("shell/src/window_services.rs");
     let at = main
         .find("fnfollow(&self,module:&ModuleId,show:bool){")
         .expect("the follow window's commands");
@@ -1557,9 +1557,15 @@ fn no_workspace_verb_is_left_in_build_ui() {
     assert!(config < code.find("driver.set_module_setup(").unwrap());
     let grid = file_code("shell/src/module_grid.rs");
     assert!(!grid.contains("fnswitch_workspace(") && !grid.contains("fnswitch_then_unmap"));
-    let main = file_code("shell/src/main.rs");
-    for helper in ["fnresolve_pick(", "fnnew_workspace_layout(", "enumPick{"] {
-        assert!(!main.contains(helper), "main.rs keeps `{helper}`");
+    for path in [
+        "shell/src/main.rs",
+        "shell/src/launch.rs",
+        "shell/src/window_services.rs",
+    ] {
+        let main = file_code(path);
+        for helper in ["fnresolve_pick(", "fnnew_workspace_layout(", "enumPick{"] {
+            assert!(!main.contains(helper), "{path} keeps `{helper}`");
+        }
     }
 }
 

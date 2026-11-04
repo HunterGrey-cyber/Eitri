@@ -425,17 +425,25 @@ fn transitional(source: &Source, code: &str, words: &[&str]) -> Vec<String> {
 fn violations(rule: Rule, sources: &[Source]) -> Vec<String> {
     let mut failures = Vec::new();
     let test_modules = file_test_modules(sources);
-    for source in sources {
+    let test_only = scan::test_only_files(sources);
+    for source in sources.iter().filter(|source| !test_only.contains(&source.path)) {
         // Keep newlines from test modules too: production_code blanks their entire bodies.
         let blanked = scan::code_only(&source.text);
         let line_at = |at| blanked[..at].bytes().filter(|b| *b == b'\n').count() + 1;
         let code = production_code(source, &test_modules);
         let words = tokens(&code);
         let failures_here = match rule {
-            Rule::ActionMatch if source.path == "shell/src/main.rs" => action_match(&code)
-                .map(|at| format!("{}: match over Action", line_at(at)))
-                .into_iter()
-                .collect(),
+            Rule::ActionMatch
+                if matches!(
+                    source.path.as_str(),
+                    "shell/src/main.rs" | "shell/src/launch.rs" | "shell/src/window_services.rs"
+                ) =>
+            {
+                action_match(&code)
+                    .map(|at| format!("{}: match over Action", line_at(at)))
+                    .into_iter()
+                    .collect()
+            }
             Rule::TryBorrow if source.path != "shell/src/gtk_host/services.rs" => ["try_borrow", "try_borrow_mut"]
                 .into_iter()
                 .filter(|name| has(&words, &[name, "("]))
@@ -475,6 +483,8 @@ fn check_shell(rule: Rule) {
     let sources = scan::rust_sources(&["shell/src"]);
     for path in [
         "shell/src/main.rs",
+        "shell/src/launch.rs",
+        "shell/src/window_services.rs",
         "shell/src/module_grid.rs",
         "shell/src/gtk_host/services.rs",
     ] {
@@ -553,7 +563,13 @@ fn action_match_mutants_are_caught_without_rejecting_constructors() {
         "fn run() { if let Action::Zoom = input {} }",
         "fn run() { let Action::Zoom = input else { return }; }",
     ] {
-        caught(Rule::ActionMatch, "shell/src/main.rs", text);
+        for path in [
+            "shell/src/main.rs",
+            "shell/src/launch.rs",
+            "shell/src/window_services.rs",
+        ] {
+            caught(Rule::ActionMatch, path, text);
+        }
     }
     assert!(violations(
         Rule::ActionMatch,
@@ -806,6 +822,19 @@ checks;",
         let sources = [fixture(parent, "mod checks;"), fixture(child, bad)];
         assert_eq!(violations(Rule::Transitional, &sources).len(), 1);
     }
+    let sources = [
+        fixture(
+            "shell/src/main.rs",
+            "#[cfg(test)]\n#[path = \"main_tests.rs\"]\nmod tests;",
+        ),
+        fixture("shell/src/main_tests.rs", bad),
+    ];
+    assert_eq!(
+        scan::test_only_files(&sources),
+        ["shell/src/main_tests.rs".to_owned()].into()
+    );
+    assert!(violations(Rule::Transitional, &sources).is_empty());
+    assert!(scan::test_only_files(&scan::rust_sources(&["shell/src"])).contains("shell/src/main_tests.rs"));
     let sources = [
         fixture("core/src/wm/mod.rs", "#[cfg(test)] pub(crate) mod checks;"),
         fixture("core/src/wm/checks.rs", bad),

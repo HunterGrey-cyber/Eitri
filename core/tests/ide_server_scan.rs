@@ -162,6 +162,10 @@ fn the_wiring_is_behind_the_linux_gate() {
         assert!(product.contains(anchor), "{path} no longer has the wiring");
         assert_eq!(ungated(product), Vec::<String>::new(), "{path}");
     }
+    for path in ["shell/src/launch.rs", "shell/src/window_services.rs"] {
+        let text = read_required(path).text;
+        assert_eq!(ungated(before_tests(&text)), Vec::<String>::new(), "{path}");
+    }
 }
 
 #[test]
