@@ -1,12 +1,12 @@
 {
   "domain_events": [
     {
-      "occurred_at": 1793530394000,
+      "occurred_at": 1793757368653,
       "tasks": [],
       "type": "background_tasks_changed"
     },
     {
-      "turn_id": "c01d7811-9e5b-4a7a-9519-a17f6e0b2946",
+      "turn_id": "3ccc4a73-7a1e-4060-a998-5b8a1ff16b53",
       "type": "turn_started"
     },
     {
@@ -217,7 +217,7 @@
         },
         "script": "export const meta = {name: 'c16w', description: 'C16W two phases', phases: [{title: 'one'}, {title: 'two'}]}\nconst a = await agent('C16W-AGENT-A run the command it names and report', {label: 'agent-a', phase: 'one'})\nconst b = await agent('C16W-AGENT-B run the command it names and report', {label: 'agent-b', phase: 'two'})\nreturn {a, b}\n"
       },
-      "permission_id": "9aefc169-8510-4499-ae78-c73c44211a59",
+      "permission_id": "e23ba56c-d308-489e-9f7a-358db65bcc23",
       "tool_name": "Workflow",
       "tool_use_id": "toolu_wf1",
       "type": "permission_requested"
@@ -225,8 +225,8 @@
     {
       "cwd": "$RUN/project",
       "model": "claude-opus-5-5",
-      "provider_session_id": "d0b1f6f4-b454-45a3-a801-e4dbb24e2550",
-      "session_id": "acfe330e-fccd-4dab-8f65-bbc5677105a8",
+      "provider_session_id": "89aee451-80ac-4566-824a-5a6a36194497",
+      "session_id": "b4c53c33-b495-4c46-b330-a158ac434cc8",
       "type": "session_opened"
     },
     {
@@ -243,7 +243,7 @@
     },
     {
       "outcome": "allowed",
-      "permission_id": "9aefc169-8510-4499-ae78-c73c44211a59",
+      "permission_id": "e23ba56c-d308-489e-9f7a-358db65bcc23",
       "type": "permission_resolved"
     },
     {
@@ -251,7 +251,7 @@
         "command": "<cli-text chars=28 sha256=052f6b2ee7512ffd>",
         "description": "C16W agent A"
       },
-      "permission_id": "fb74bf54-b9f6-4092-81d6-ee3c4f58f42c",
+      "permission_id": "5f76f166-1b13-45f3-b324-37356a38fb60",
       "tool_name": "Bash",
       "tool_use_id": "toolu_wa",
       "type": "permission_requested"
@@ -268,7 +268,7 @@
     },
     {
       "outcome": "allowed",
-      "permission_id": "fb74bf54-b9f6-4092-81d6-ee3c4f58f42c",
+      "permission_id": "5f76f166-1b13-45f3-b324-37356a38fb60",
       "type": "permission_resolved"
     },
     {
@@ -280,20 +280,20 @@
       },
       "name": "Workflow",
       "tool_use_id": "toolu_wf1",
-      "turn_id": "c01d7811-9e5b-4a7a-9519-a17f6e0b2946",
+      "turn_id": "3ccc4a73-7a1e-4060-a998-5b8a1ff16b53",
       "type": "tool_call_started"
     },
     {
-      "occurred_at": 1793530394403,
+      "occurred_at": 1793757369057,
       "tasks": [
         {
           "ambient": false,
           "description": "C16W two phases",
           "kind": "shell",
           "parent_task_id": null,
-          "run_id": "0mvxpot3j-6a83e023",
+          "run_id": "0mw1gtnv1-30cafe42",
           "subagent_type": null,
-          "task_id": "wgzzq900t",
+          "task_id": "wat7192ad",
           "task_type": "local_workflow",
           "tool_use_id": null,
           "workflow_name": null
@@ -307,10 +307,10 @@
       "error": null,
       "is_backgrounded": null,
       "last_tool_name": null,
-      "occurred_at": 1793530394424,
+      "occurred_at": 1793757369076,
       "output_file": null,
       "reason": null,
-      "run_id": "0mvxpot3j-6a83e023",
+      "run_id": "0mw1gtnv1-30cafe42",
       "status": null,
       "summary": null,
       "task": {
@@ -318,23 +318,23 @@
         "description": "C16W two phases",
         "kind": "workflow",
         "parent_task_id": null,
-        "run_id": "0mvxpot3j-6a83e023",
+        "run_id": "0mw1gtnv1-30cafe42",
         "subagent_type": null,
-        "task_id": "wgzzq900t",
+        "task_id": "wat7192ad",
         "task_type": "local_workflow",
         "tool_use_id": "toolu_wf1",
         "workflow_name": "c16w"
       },
-      "task_id": "wgzzq900t",
+      "task_id": "wat7192ad",
       "type": "task_event",
       "usage": null,
       "workflow_progress": null
     },
     {
-      "content": "<cli-text chars=1024 sha256=8cb81e92f60534fe>",
+      "content": "<cli-text chars=1024 sha256=9e4692f6e24985f1>",
       "is_error": false,
       "tool_use_id": "toolu_wf1",
-      "turn_id": "c01d7811-9e5b-4a7a-9519-a17f6e0b2946",
+      "turn_id": "3ccc4a73-7a1e-4060-a998-5b8a1ff16b53",
       "type": "tool_call_completed"
     },
     {
@@ -343,14 +343,14 @@
       "error": null,
       "is_backgrounded": null,
       "last_tool_name": "agent-a",
-      "occurred_at": 1793530394484,
+      "occurred_at": 1793757369137,
       "output_file": null,
       "reason": null,
-      "run_id": "0mvxpot3j-6a83e023",
+      "run_id": "0mw1gtnv1-30cafe42",
       "status": null,
       "summary": "C16W two phases",
       "task": null,
-      "task_id": "wgzzq900t",
+      "task_id": "wat7192ad",
       "type": "task_event",
       "usage": {
         "duration_ms": 21,
@@ -389,7 +389,7 @@
     {
       "kind": "text",
       "text": "WF-LAUNCHED",
-      "turn_id": "c01d7811-9e5b-4a7a-9519-a17f6e0b2946",
+      "turn_id": "3ccc4a73-7a1e-4060-a998-5b8a1ff16b53",
       "type": "content_delta"
     },
     {
@@ -402,7 +402,7 @@
       "outcome": "completed",
       "result_text": "WF-LAUNCHED",
       "stop_reason": "end_turn",
-      "turn_id": "c01d7811-9e5b-4a7a-9519-a17f6e0b2946",
+      "turn_id": "3ccc4a73-7a1e-4060-a998-5b8a1ff16b53",
       "type": "turn_completed",
       "usage": {
         "model": "claude-opus-5-5",
@@ -422,14 +422,14 @@
       "error": null,
       "is_backgrounded": null,
       "last_tool_name": "agent-a",
-      "occurred_at": 1793530394685,
+      "occurred_at": 1793757369336,
       "output_file": null,
       "reason": null,
-      "run_id": "0mvxpot3j-6a83e023",
+      "run_id": "0mw1gtnv1-30cafe42",
       "status": null,
       "summary": "C16W two phases",
       "task": null,
-      "task_id": "wgzzq900t",
+      "task_id": "wat7192ad",
       "type": "task_event",
       "usage": {
         "duration_ms": 43,
@@ -444,17 +444,17 @@
       "error": null,
       "is_backgrounded": null,
       "last_tool_name": "agent-a",
-      "occurred_at": 1793530394706,
+      "occurred_at": 1793757369376,
       "output_file": null,
       "reason": null,
-      "run_id": "0mvxpot3j-6a83e023",
+      "run_id": "0mw1gtnv1-30cafe42",
       "status": null,
       "summary": "C16W two phases",
       "task": null,
-      "task_id": "wgzzq900t",
+      "task_id": "wat7192ad",
       "type": "task_event",
       "usage": {
-        "duration_ms": 501,
+        "duration_ms": 521,
         "tool_uses": 1,
         "total_tokens": 1000
       },
@@ -462,7 +462,7 @@
         "agents": [
           {
             "agent_type": null,
-            "duration_ms": 490,
+            "duration_ms": 509,
             "error": null,
             "index": 1,
             "label": "agent-a",
@@ -492,7 +492,7 @@
         "command": "<cli-text chars=28 sha256=81e4a9b6cf7c1d24>",
         "description": "C16W agent B"
       },
-      "permission_id": "7087dff4-e048-4d32-a7c3-413248295604",
+      "permission_id": "bb58db06-ca04-43cf-9cce-c63c2bb7bfff",
       "tool_name": "Bash",
       "tool_use_id": "toolu_wb",
       "type": "permission_requested"
@@ -503,17 +503,17 @@
       "error": null,
       "is_backgrounded": null,
       "last_tool_name": "agent-b",
-      "occurred_at": 1793530394725,
+      "occurred_at": 1793757369397,
       "output_file": null,
       "reason": null,
-      "run_id": "0mvxpot3j-6a83e023",
+      "run_id": "0mw1gtnv1-30cafe42",
       "status": null,
       "summary": "C16W two phases",
       "task": null,
-      "task_id": "wgzzq900t",
+      "task_id": "wat7192ad",
       "type": "task_event",
       "usage": {
-        "duration_ms": 519,
+        "duration_ms": 539,
         "tool_uses": 2,
         "total_tokens": 2000
       },
@@ -521,7 +521,7 @@
         "agents": [
           {
             "agent_type": null,
-            "duration_ms": 490,
+            "duration_ms": 509,
             "error": null,
             "index": 1,
             "label": "agent-a",
@@ -560,7 +560,7 @@
     },
     {
       "outcome": "allowed",
-      "permission_id": "7087dff4-e048-4d32-a7c3-413248295604",
+      "permission_id": "bb58db06-ca04-43cf-9cce-c63c2bb7bfff",
       "type": "permission_resolved"
     },
     {
@@ -569,17 +569,17 @@
       "error": null,
       "is_backgrounded": null,
       "last_tool_name": "agent-b",
-      "occurred_at": 1793530394785,
+      "occurred_at": 1793757369436,
       "output_file": null,
       "reason": null,
-      "run_id": "0mvxpot3j-6a83e023",
+      "run_id": "0mw1gtnv1-30cafe42",
       "status": null,
       "summary": "C16W two phases",
       "task": null,
-      "task_id": "wgzzq900t",
+      "task_id": "wat7192ad",
       "type": "task_event",
       "usage": {
-        "duration_ms": 574,
+        "duration_ms": 583,
         "tool_uses": 2,
         "total_tokens": 2000
       },
@@ -587,7 +587,7 @@
         "agents": [
           {
             "agent_type": null,
-            "duration_ms": 490,
+            "duration_ms": 509,
             "error": null,
             "index": 1,
             "label": "agent-a",
@@ -599,7 +599,7 @@
           },
           {
             "agent_type": null,
-            "duration_ms": 62,
+            "duration_ms": 51,
             "error": null,
             "index": 2,
             "label": "agent-b",
@@ -626,18 +626,18 @@
     },
     {
       "edge": "updated",
-      "end_time_ms": 1793530394765,
+      "end_time_ms": 1793757369428,
       "error": null,
       "is_backgrounded": null,
       "last_tool_name": null,
-      "occurred_at": 1793530394805,
+      "occurred_at": 1793757369456,
       "output_file": null,
       "reason": null,
-      "run_id": "0mvxpot3j-6a83e023",
+      "run_id": "0mw1gtnv1-30cafe42",
       "status": "completed",
       "summary": null,
       "task": null,
-      "task_id": "wgzzq900t",
+      "task_id": "wat7192ad",
       "type": "task_event",
       "usage": null,
       "workflow_progress": null
@@ -648,32 +648,32 @@
       "error": null,
       "is_backgrounded": null,
       "last_tool_name": null,
-      "occurred_at": 1793530394826,
-      "output_file": "$RUN/tmp/claude-$UID/-RUN-project/d0b1f6f4-b454-45a3-a801-e4dbb24e2550/tasks/wgzzq900t.output",
+      "occurred_at": 1793757369477,
+      "output_file": "$RUN/tmp/claude-$UID/-RUN-project/89aee451-80ac-4566-824a-5a6a36194497/tasks/wat7192ad.output",
       "reason": null,
-      "run_id": "0mvxpot3j-6a83e023",
+      "run_id": "0mw1gtnv1-30cafe42",
       "status": "completed",
       "summary": "<cli-text chars=44 sha256=6e5ec2bc6d7bf634>",
       "task": null,
-      "task_id": "wgzzq900t",
+      "task_id": "wat7192ad",
       "type": "task_event",
       "usage": {
-        "duration_ms": 570,
+        "duration_ms": 579,
         "tool_uses": 2,
         "total_tokens": 2000
       },
       "workflow_progress": null
     },
     {
-      "occurred_at": 1793530394846,
+      "occurred_at": 1793757369496,
       "tasks": [],
       "type": "background_tasks_changed"
     },
     {
       "cwd": "$RUN/project",
       "model": "claude-opus-5-5",
-      "provider_session_id": "d0b1f6f4-b454-45a3-a801-e4dbb24e2550",
-      "session_id": "acfe330e-fccd-4dab-8f65-bbc5677105a8",
+      "provider_session_id": "89aee451-80ac-4566-824a-5a6a36194497",
+      "session_id": "b4c53c33-b495-4c46-b330-a158ac434cc8",
       "type": "session_opened"
     },
     {
@@ -689,7 +689,7 @@
       "type": "session_servers"
     },
     {
-      "turn_id": "83b73205-04e2-444b-bedd-5df4d85407d6",
+      "turn_id": "466fe8f5-594b-4f1e-9b4b-20143a7861cb",
       "type": "turn_started"
     },
     {
@@ -702,20 +702,20 @@
         "schedule_reason": null,
         "scheduled_for_ms": null,
         "summary": "<cli-text chars=44 sha256=6e5ec2bc6d7bf634>",
-        "task_id": "wgzzq900t",
+        "task_id": "wat7192ad",
         "task_kind": "workflow",
         "task_status": "completed",
         "text": null,
         "wakeup_source": null
       },
       "origin": "cli",
-      "turn_id": "83b73205-04e2-444b-bedd-5df4d85407d6",
+      "turn_id": "466fe8f5-594b-4f1e-9b4b-20143a7861cb",
       "type": "turn_attributed"
     },
     {
       "kind": "text",
       "text": "WF-REPORTED",
-      "turn_id": "83b73205-04e2-444b-bedd-5df4d85407d6",
+      "turn_id": "466fe8f5-594b-4f1e-9b4b-20143a7861cb",
       "type": "content_delta"
     },
     {
@@ -729,7 +729,7 @@
       "outcome": "completed",
       "result_text": "WF-REPORTED",
       "stop_reason": "end_turn",
-      "turn_id": "83b73205-04e2-444b-bedd-5df4d85407d6",
+      "turn_id": "466fe8f5-594b-4f1e-9b4b-20143a7861cb",
       "type": "turn_completed",
       "usage": {
         "model": "claude-opus-5-5",
@@ -747,12 +747,12 @@
   "events": {
     "events": [
       {
-        "occurred_at": 1793530394000,
+        "occurred_at": 1793757368653,
         "tasks": [],
         "type": "background_tasks_changed"
       },
       {
-        "turn_id": "c01d7811-9e5b-4a7a-9519-a17f6e0b2946",
+        "turn_id": "3ccc4a73-7a1e-4060-a998-5b8a1ff16b53",
         "type": "turn_started"
       },
       {
@@ -963,7 +963,7 @@
           },
           "script": "export const meta = {name: 'c16w', description: 'C16W two phases', phases: [{title: 'one'}, {title: 'two'}]}\nconst a = await agent('C16W-AGENT-A run the command it names and report', {label: 'agent-a', phase: 'one'})\nconst b = await agent('C16W-AGENT-B run the command it names and report', {label: 'agent-b', phase: 'two'})\nreturn {a, b}\n"
         },
-        "permission_id": "9aefc169-8510-4499-ae78-c73c44211a59",
+        "permission_id": "e23ba56c-d308-489e-9f7a-358db65bcc23",
         "tool_name": "Workflow",
         "tool_use_id": "toolu_wf1",
         "type": "permission_requested"
@@ -971,8 +971,8 @@
       {
         "cwd": "$RUN/project",
         "model": "claude-opus-5-5",
-        "provider_session_id": "d0b1f6f4-b454-45a3-a801-e4dbb24e2550",
-        "session_id": "acfe330e-fccd-4dab-8f65-bbc5677105a8",
+        "provider_session_id": "89aee451-80ac-4566-824a-5a6a36194497",
+        "session_id": "b4c53c33-b495-4c46-b330-a158ac434cc8",
         "type": "session_opened"
       },
       {
@@ -989,7 +989,7 @@
       },
       {
         "outcome": "allowed",
-        "permission_id": "9aefc169-8510-4499-ae78-c73c44211a59",
+        "permission_id": "e23ba56c-d308-489e-9f7a-358db65bcc23",
         "type": "permission_resolved"
       },
       {
@@ -997,7 +997,7 @@
           "command": "<cli-text chars=28 sha256=052f6b2ee7512ffd>",
           "description": "C16W agent A"
         },
-        "permission_id": "fb74bf54-b9f6-4092-81d6-ee3c4f58f42c",
+        "permission_id": "5f76f166-1b13-45f3-b324-37356a38fb60",
         "tool_name": "Bash",
         "tool_use_id": "toolu_wa",
         "type": "permission_requested"
@@ -1014,7 +1014,7 @@
       },
       {
         "outcome": "allowed",
-        "permission_id": "fb74bf54-b9f6-4092-81d6-ee3c4f58f42c",
+        "permission_id": "5f76f166-1b13-45f3-b324-37356a38fb60",
         "type": "permission_resolved"
       },
       {
@@ -1026,20 +1026,20 @@
         },
         "name": "Workflow",
         "tool_use_id": "toolu_wf1",
-        "turn_id": "c01d7811-9e5b-4a7a-9519-a17f6e0b2946",
+        "turn_id": "3ccc4a73-7a1e-4060-a998-5b8a1ff16b53",
         "type": "tool_call_started"
       },
       {
-        "occurred_at": 1793530394403,
+        "occurred_at": 1793757369057,
         "tasks": [
           {
             "ambient": false,
             "description": "C16W two phases",
             "kind": "shell",
             "parent_task_id": null,
-            "run_id": "0mvxpot3j-6a83e023",
+            "run_id": "0mw1gtnv1-30cafe42",
             "subagent_type": null,
-            "task_id": "wgzzq900t",
+            "task_id": "wat7192ad",
             "task_type": "local_workflow",
             "tool_use_id": null,
             "workflow_name": null
@@ -1053,10 +1053,10 @@
         "error": null,
         "is_backgrounded": null,
         "last_tool_name": null,
-        "occurred_at": 1793530394424,
+        "occurred_at": 1793757369076,
         "output_file": null,
         "reason": null,
-        "run_id": "0mvxpot3j-6a83e023",
+        "run_id": "0mw1gtnv1-30cafe42",
         "status": null,
         "summary": null,
         "task": {
@@ -1064,23 +1064,23 @@
           "description": "C16W two phases",
           "kind": "workflow",
           "parent_task_id": null,
-          "run_id": "0mvxpot3j-6a83e023",
+          "run_id": "0mw1gtnv1-30cafe42",
           "subagent_type": null,
-          "task_id": "wgzzq900t",
+          "task_id": "wat7192ad",
           "task_type": "local_workflow",
           "tool_use_id": "toolu_wf1",
           "workflow_name": "c16w"
         },
-        "task_id": "wgzzq900t",
+        "task_id": "wat7192ad",
         "type": "task_event",
         "usage": null,
         "workflow_progress": null
       },
       {
-        "content": "<cli-text chars=1024 sha256=8cb81e92f60534fe>",
+        "content": "<cli-text chars=1024 sha256=9e4692f6e24985f1>",
         "is_error": false,
         "tool_use_id": "toolu_wf1",
-        "turn_id": "c01d7811-9e5b-4a7a-9519-a17f6e0b2946",
+        "turn_id": "3ccc4a73-7a1e-4060-a998-5b8a1ff16b53",
         "type": "tool_call_completed"
       },
       {
@@ -1089,14 +1089,14 @@
         "error": null,
         "is_backgrounded": null,
         "last_tool_name": "agent-a",
-        "occurred_at": 1793530394484,
+        "occurred_at": 1793757369137,
         "output_file": null,
         "reason": null,
-        "run_id": "0mvxpot3j-6a83e023",
+        "run_id": "0mw1gtnv1-30cafe42",
         "status": null,
         "summary": "C16W two phases",
         "task": null,
-        "task_id": "wgzzq900t",
+        "task_id": "wat7192ad",
         "type": "task_event",
         "usage": {
           "duration_ms": 21,
@@ -1135,7 +1135,7 @@
       {
         "kind": "text",
         "text": "WF-LAUNCHED",
-        "turn_id": "c01d7811-9e5b-4a7a-9519-a17f6e0b2946",
+        "turn_id": "3ccc4a73-7a1e-4060-a998-5b8a1ff16b53",
         "type": "content_delta"
       },
       {
@@ -1148,7 +1148,7 @@
         "outcome": "completed",
         "result_text": "WF-LAUNCHED",
         "stop_reason": "end_turn",
-        "turn_id": "c01d7811-9e5b-4a7a-9519-a17f6e0b2946",
+        "turn_id": "3ccc4a73-7a1e-4060-a998-5b8a1ff16b53",
         "type": "turn_completed",
         "usage": {
           "model": "claude-opus-5-5",
@@ -1168,14 +1168,14 @@
         "error": null,
         "is_backgrounded": null,
         "last_tool_name": "agent-a",
-        "occurred_at": 1793530394685,
+        "occurred_at": 1793757369336,
         "output_file": null,
         "reason": null,
-        "run_id": "0mvxpot3j-6a83e023",
+        "run_id": "0mw1gtnv1-30cafe42",
         "status": null,
         "summary": "C16W two phases",
         "task": null,
-        "task_id": "wgzzq900t",
+        "task_id": "wat7192ad",
         "type": "task_event",
         "usage": {
           "duration_ms": 43,
@@ -1190,17 +1190,17 @@
         "error": null,
         "is_backgrounded": null,
         "last_tool_name": "agent-a",
-        "occurred_at": 1793530394706,
+        "occurred_at": 1793757369376,
         "output_file": null,
         "reason": null,
-        "run_id": "0mvxpot3j-6a83e023",
+        "run_id": "0mw1gtnv1-30cafe42",
         "status": null,
         "summary": "C16W two phases",
         "task": null,
-        "task_id": "wgzzq900t",
+        "task_id": "wat7192ad",
         "type": "task_event",
         "usage": {
-          "duration_ms": 501,
+          "duration_ms": 521,
           "tool_uses": 1,
           "total_tokens": 1000
         },
@@ -1208,7 +1208,7 @@
           "agents": [
             {
               "agent_type": null,
-              "duration_ms": 490,
+              "duration_ms": 509,
               "error": null,
               "index": 1,
               "label": "agent-a",
@@ -1238,7 +1238,7 @@
           "command": "<cli-text chars=28 sha256=81e4a9b6cf7c1d24>",
           "description": "C16W agent B"
         },
-        "permission_id": "7087dff4-e048-4d32-a7c3-413248295604",
+        "permission_id": "bb58db06-ca04-43cf-9cce-c63c2bb7bfff",
         "tool_name": "Bash",
         "tool_use_id": "toolu_wb",
         "type": "permission_requested"
@@ -1249,17 +1249,17 @@
         "error": null,
         "is_backgrounded": null,
         "last_tool_name": "agent-b",
-        "occurred_at": 1793530394725,
+        "occurred_at": 1793757369397,
         "output_file": null,
         "reason": null,
-        "run_id": "0mvxpot3j-6a83e023",
+        "run_id": "0mw1gtnv1-30cafe42",
         "status": null,
         "summary": "C16W two phases",
         "task": null,
-        "task_id": "wgzzq900t",
+        "task_id": "wat7192ad",
         "type": "task_event",
         "usage": {
-          "duration_ms": 519,
+          "duration_ms": 539,
           "tool_uses": 2,
           "total_tokens": 2000
         },
@@ -1267,7 +1267,7 @@
           "agents": [
             {
               "agent_type": null,
-              "duration_ms": 490,
+              "duration_ms": 509,
               "error": null,
               "index": 1,
               "label": "agent-a",
@@ -1306,7 +1306,7 @@
       },
       {
         "outcome": "allowed",
-        "permission_id": "7087dff4-e048-4d32-a7c3-413248295604",
+        "permission_id": "bb58db06-ca04-43cf-9cce-c63c2bb7bfff",
         "type": "permission_resolved"
       },
       {
@@ -1315,17 +1315,17 @@
         "error": null,
         "is_backgrounded": null,
         "last_tool_name": "agent-b",
-        "occurred_at": 1793530394785,
+        "occurred_at": 1793757369436,
         "output_file": null,
         "reason": null,
-        "run_id": "0mvxpot3j-6a83e023",
+        "run_id": "0mw1gtnv1-30cafe42",
         "status": null,
         "summary": "C16W two phases",
         "task": null,
-        "task_id": "wgzzq900t",
+        "task_id": "wat7192ad",
         "type": "task_event",
         "usage": {
-          "duration_ms": 574,
+          "duration_ms": 583,
           "tool_uses": 2,
           "total_tokens": 2000
         },
@@ -1333,7 +1333,7 @@
           "agents": [
             {
               "agent_type": null,
-              "duration_ms": 490,
+              "duration_ms": 509,
               "error": null,
               "index": 1,
               "label": "agent-a",
@@ -1345,7 +1345,7 @@
             },
             {
               "agent_type": null,
-              "duration_ms": 62,
+              "duration_ms": 51,
               "error": null,
               "index": 2,
               "label": "agent-b",
@@ -1372,18 +1372,18 @@
       },
       {
         "edge": "updated",
-        "end_time_ms": 1793530394765,
+        "end_time_ms": 1793757369428,
         "error": null,
         "is_backgrounded": null,
         "last_tool_name": null,
-        "occurred_at": 1793530394805,
+        "occurred_at": 1793757369456,
         "output_file": null,
         "reason": null,
-        "run_id": "0mvxpot3j-6a83e023",
+        "run_id": "0mw1gtnv1-30cafe42",
         "status": "completed",
         "summary": null,
         "task": null,
-        "task_id": "wgzzq900t",
+        "task_id": "wat7192ad",
         "type": "task_event",
         "usage": null,
         "workflow_progress": null
@@ -1394,32 +1394,32 @@
         "error": null,
         "is_backgrounded": null,
         "last_tool_name": null,
-        "occurred_at": 1793530394826,
-        "output_file": "$RUN/tmp/claude-$UID/-RUN-project/d0b1f6f4-b454-45a3-a801-e4dbb24e2550/tasks/wgzzq900t.output",
+        "occurred_at": 1793757369477,
+        "output_file": "$RUN/tmp/claude-$UID/-RUN-project/89aee451-80ac-4566-824a-5a6a36194497/tasks/wat7192ad.output",
         "reason": null,
-        "run_id": "0mvxpot3j-6a83e023",
+        "run_id": "0mw1gtnv1-30cafe42",
         "status": "completed",
         "summary": "<cli-text chars=44 sha256=6e5ec2bc6d7bf634>",
         "task": null,
-        "task_id": "wgzzq900t",
+        "task_id": "wat7192ad",
         "type": "task_event",
         "usage": {
-          "duration_ms": 570,
+          "duration_ms": 579,
           "tool_uses": 2,
           "total_tokens": 2000
         },
         "workflow_progress": null
       },
       {
-        "occurred_at": 1793530394846,
+        "occurred_at": 1793757369496,
         "tasks": [],
         "type": "background_tasks_changed"
       },
       {
         "cwd": "$RUN/project",
         "model": "claude-opus-5-5",
-        "provider_session_id": "d0b1f6f4-b454-45a3-a801-e4dbb24e2550",
-        "session_id": "acfe330e-fccd-4dab-8f65-bbc5677105a8",
+        "provider_session_id": "89aee451-80ac-4566-824a-5a6a36194497",
+        "session_id": "b4c53c33-b495-4c46-b330-a158ac434cc8",
         "type": "session_opened"
       },
       {
@@ -1435,7 +1435,7 @@
         "type": "session_servers"
       },
       {
-        "turn_id": "83b73205-04e2-444b-bedd-5df4d85407d6",
+        "turn_id": "466fe8f5-594b-4f1e-9b4b-20143a7861cb",
         "type": "turn_started"
       },
       {
@@ -1448,20 +1448,20 @@
           "schedule_reason": null,
           "scheduled_for_ms": null,
           "summary": "<cli-text chars=44 sha256=6e5ec2bc6d7bf634>",
-          "task_id": "wgzzq900t",
+          "task_id": "wat7192ad",
           "task_kind": "workflow",
           "task_status": "completed",
           "text": null,
           "wakeup_source": null
         },
         "origin": "cli",
-        "turn_id": "83b73205-04e2-444b-bedd-5df4d85407d6",
+        "turn_id": "466fe8f5-594b-4f1e-9b4b-20143a7861cb",
         "type": "turn_attributed"
       },
       {
         "kind": "text",
         "text": "WF-REPORTED",
-        "turn_id": "83b73205-04e2-444b-bedd-5df4d85407d6",
+        "turn_id": "466fe8f5-594b-4f1e-9b4b-20143a7861cb",
         "type": "content_delta"
       },
       {
@@ -1475,7 +1475,7 @@
         "outcome": "completed",
         "result_text": "WF-REPORTED",
         "stop_reason": "end_turn",
-        "turn_id": "83b73205-04e2-444b-bedd-5df4d85407d6",
+        "turn_id": "466fe8f5-594b-4f1e-9b4b-20143a7861cb",
         "type": "turn_completed",
         "usage": {
           "model": "claude-opus-5-5",
@@ -1708,26 +1708,26 @@
           {
             "ambient": false,
             "description": "C16W two phases",
-            "ended_at": 1793530394765,
+            "ended_at": 1793757369428,
             "error": null,
             "finished_seq": 26,
             "is_backgrounded": null,
             "kind": "workflow",
             "last_tool_name": "agent-b",
             "live": false,
-            "output_file": "$RUN/tmp/claude-$UID/-RUN-project/d0b1f6f4-b454-45a3-a801-e4dbb24e2550/tasks/wgzzq900t.output",
+            "output_file": "$RUN/tmp/claude-$UID/-RUN-project/89aee451-80ac-4566-824a-5a6a36194497/tasks/wat7192ad.output",
             "parent_task_id": null,
             "reason": null,
-            "run_id": "0mvxpot3j-6a83e023",
-            "started_at": 1793530394424,
+            "run_id": "0mw1gtnv1-30cafe42",
+            "started_at": 1793757369076,
             "status": "completed",
             "subagent_type": null,
             "summary": "<cli-text chars=44 sha256=6e5ec2bc6d7bf634>",
-            "task_id": "wgzzq900t",
+            "task_id": "wat7192ad",
             "task_type": "local_workflow",
             "tool_use_id": "toolu_wf1",
             "usage": {
-              "duration_ms": 570,
+              "duration_ms": 579,
               "tool_uses": 2,
               "total_tokens": 2000
             },
@@ -1736,7 +1736,7 @@
               "agents": [
                 {
                   "agent_type": null,
-                  "duration_ms": 490,
+                  "duration_ms": 509,
                   "error": null,
                   "index": 1,
                   "label": "agent-a",
@@ -1748,7 +1748,7 @@
                 },
                 {
                   "agent_type": null,
-                  "duration_ms": 62,
+                  "duration_ms": 51,
                   "error": null,
                   "index": 2,
                   "label": "agent-b",
@@ -1805,7 +1805,7 @@
           "level": "notice",
           "scalars": {},
           "seq": 26,
-          "taskId": "wgzzq900t",
+          "taskId": "wat7192ad",
           "taskStatus": "completed",
           "toolUseId": "toolu_wf1"
         }
@@ -1829,12 +1829,12 @@
           },
           "name": "Workflow",
           "result": {
-            "content": "<cli-text chars=1024 sha256=8cb81e92f60534fe>",
+            "content": "<cli-text chars=1024 sha256=9e4692f6e24985f1>",
             "isError": false
           },
           "seq": 12,
           "toolUseId": "toolu_wf1",
-          "turnId": "c01d7811-9e5b-4a7a-9519-a17f6e0b2946"
+          "turnId": "3ccc4a73-7a1e-4060-a998-5b8a1ff16b53"
         }
       ],
       "transcript": [
@@ -1859,7 +1859,7 @@
             "scheduleReason": null,
             "scheduledForMs": null,
             "summary": "<cli-text chars=44 sha256=6e5ec2bc6d7bf634>",
-            "taskId": "wgzzq900t",
+            "taskId": "wat7192ad",
             "taskKind": "workflow",
             "taskStatus": "completed",
             "text": null,
@@ -1867,7 +1867,7 @@
           },
           "origin": "cli",
           "seq": 33,
-          "turnId": "83b73205-04e2-444b-bedd-5df4d85407d6"
+          "turnId": "466fe8f5-594b-4f1e-9b4b-20143a7861cb"
         }
       ],
       "usage": {

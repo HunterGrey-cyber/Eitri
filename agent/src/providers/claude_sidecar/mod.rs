@@ -3608,7 +3608,7 @@ mod tests {
             // The handshake reports `capabilities.json`'s minor (it was the literal 0 until
             // 2026-09-30): 23 at the pinned revision.
             protocol_minor: 23,
-            sidecar_version: "0.2.0".into(),
+            sidecar_version: "0.3.0".into(),
             claude_agent_sdk_version: "0.3.0".into(),
             sdk_declared_claude_code_version: "2.1.269".into(),
             actual_claude_code_version: "2.1.269".into(),
@@ -4642,7 +4642,7 @@ mod tests {
         );
         assert_eq!(info.actual_claude_code_version, "2.1.269");
         assert_eq!(info.protocol_major, 3);
-        assert_eq!(info.sidecar_version, "0.2.0");
+        assert_eq!(info.sidecar_version, "0.3.0");
         // Raw, not filtered down to the ones this client recognizes -- an unrecognized future
         // capability must stay visible in diagnostics rather than vanish.
         assert!(info.advertised_permission_modes.contains(&"verdandi_rules".to_string()));

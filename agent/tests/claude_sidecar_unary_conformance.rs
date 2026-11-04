@@ -223,7 +223,7 @@ fn the_live_handshake_still_matches_the_fixture_in_mod_rs() {
         "the real sidecar's permission modes have moved; update real_handshake_today()"
     );
     assert_eq!(
-        info.sidecar_version, "0.2.0",
+        info.sidecar_version, "0.3.0",
         "SIDECAR_VERSION moved; update real_handshake_today()"
     );
     assert_eq!(

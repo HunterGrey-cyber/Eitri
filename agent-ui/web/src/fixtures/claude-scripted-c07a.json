@@ -1,12 +1,12 @@
 {
   "domain_events": [
     {
-      "occurred_at": 1793530182813,
+      "occurred_at": 1793757330812,
       "tasks": [],
       "type": "background_tasks_changed"
     },
     {
-      "turn_id": "608863c7-8560-45d2-8842-6300c9142d90",
+      "turn_id": "d4592168-096f-458f-9920-d7fad256b970",
       "type": "turn_started"
     },
     {
@@ -213,8 +213,8 @@
     {
       "cwd": "$RUN/project",
       "model": "claude-opus-5-5",
-      "provider_session_id": "ea1f6390-c86d-4396-a3a7-10d8c00b5b15",
-      "session_id": "b9ab7ed1-ae96-4935-8d59-c8ffdfb01591",
+      "provider_session_id": "4910d103-5090-4461-b535-39d335f0d4cc",
+      "session_id": "0261b41b-70e2-485d-b4df-4bd47783f72a",
       "type": "session_opened"
     },
     {
@@ -242,19 +242,19 @@
     {
       "kind": "text",
       "text": "C07A-PARTIAL words ",
-      "turn_id": "608863c7-8560-45d2-8842-6300c9142d90",
+      "turn_id": "d4592168-096f-458f-9920-d7fad256b970",
       "type": "content_delta"
     },
     {
       "kind": "text",
       "text": "before the ",
-      "turn_id": "608863c7-8560-45d2-8842-6300c9142d90",
+      "turn_id": "d4592168-096f-458f-9920-d7fad256b970",
       "type": "content_delta"
     },
     {
       "kind": "text",
       "text": "interrupt",
-      "turn_id": "608863c7-8560-45d2-8842-6300c9142d90",
+      "turn_id": "d4592168-096f-458f-9920-d7fad256b970",
       "type": "content_delta"
     },
     {
@@ -267,7 +267,7 @@
       "outcome": "interrupted",
       "result_text": "",
       "stop_reason": null,
-      "turn_id": "608863c7-8560-45d2-8842-6300c9142d90",
+      "turn_id": "d4592168-096f-458f-9920-d7fad256b970",
       "type": "turn_completed",
       "usage": null
     }
@@ -275,12 +275,12 @@
   "events": {
     "events": [
       {
-        "occurred_at": 1793530182813,
+        "occurred_at": 1793757330812,
         "tasks": [],
         "type": "background_tasks_changed"
       },
       {
-        "turn_id": "608863c7-8560-45d2-8842-6300c9142d90",
+        "turn_id": "d4592168-096f-458f-9920-d7fad256b970",
         "type": "turn_started"
       },
       {
@@ -487,8 +487,8 @@
       {
         "cwd": "$RUN/project",
         "model": "claude-opus-5-5",
-        "provider_session_id": "ea1f6390-c86d-4396-a3a7-10d8c00b5b15",
-        "session_id": "b9ab7ed1-ae96-4935-8d59-c8ffdfb01591",
+        "provider_session_id": "4910d103-5090-4461-b535-39d335f0d4cc",
+        "session_id": "0261b41b-70e2-485d-b4df-4bd47783f72a",
         "type": "session_opened"
       },
       {
@@ -516,19 +516,19 @@
       {
         "kind": "text",
         "text": "C07A-PARTIAL words ",
-        "turn_id": "608863c7-8560-45d2-8842-6300c9142d90",
+        "turn_id": "d4592168-096f-458f-9920-d7fad256b970",
         "type": "content_delta"
       },
       {
         "kind": "text",
         "text": "before the ",
-        "turn_id": "608863c7-8560-45d2-8842-6300c9142d90",
+        "turn_id": "d4592168-096f-458f-9920-d7fad256b970",
         "type": "content_delta"
       },
       {
         "kind": "text",
         "text": "interrupt",
-        "turn_id": "608863c7-8560-45d2-8842-6300c9142d90",
+        "turn_id": "d4592168-096f-458f-9920-d7fad256b970",
         "type": "content_delta"
       },
       {
@@ -541,7 +541,7 @@
         "outcome": "interrupted",
         "result_text": "",
         "stop_reason": null,
-        "turn_id": "608863c7-8560-45d2-8842-6300c9142d90",
+        "turn_id": "d4592168-096f-458f-9920-d7fad256b970",
         "type": "turn_completed",
         "usage": null
       }
@@ -808,7 +808,7 @@
           "reason": "<cli-text chars=17 sha256=b87712cf78a6767c>",
           "resetsAt": null,
           "seq": 11,
-          "turnId": "608863c7-8560-45d2-8842-6300c9142d90"
+          "turnId": "d4592168-096f-458f-9920-d7fad256b970"
         }
       ],
       "usage": null,

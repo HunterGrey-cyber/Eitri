@@ -1,12 +1,12 @@
 {
   "domain_events": [
     {
-      "occurred_at": 1793530278102,
+      "occurred_at": 1793757395823,
       "tasks": [],
       "type": "background_tasks_changed"
     },
     {
-      "turn_id": "19f8706b-4fb5-42b5-a3fa-ef89da662cf0",
+      "turn_id": "116b7358-ca8d-4b65-a2df-76ed5823f33a",
       "type": "turn_started"
     },
     {
@@ -213,8 +213,8 @@
     {
       "cwd": "$RUN/project",
       "model": "claude-opus-5-5",
-      "provider_session_id": "8c7c4fe7-c75e-43e4-ab10-b4d2e0b0a403",
-      "session_id": "64847294-3010-48fe-9461-fcbc4877e408",
+      "provider_session_id": "80d4dddb-fc95-4dd1-a220-e4662bcd703d",
+      "session_id": "998b8084-6a81-43d7-a410-056e65228c39",
       "type": "session_opened"
     },
     {
@@ -242,7 +242,7 @@
     {
       "kind": "text",
       "text": "C20OFF-DONE",
-      "turn_id": "19f8706b-4fb5-42b5-a3fa-ef89da662cf0",
+      "turn_id": "116b7358-ca8d-4b65-a2df-76ed5823f33a",
       "type": "content_delta"
     },
     {
@@ -255,7 +255,7 @@
       "outcome": "completed",
       "result_text": "C20OFF-DONE",
       "stop_reason": "end_turn",
-      "turn_id": "19f8706b-4fb5-42b5-a3fa-ef89da662cf0",
+      "turn_id": "116b7358-ca8d-4b65-a2df-76ed5823f33a",
       "type": "turn_completed",
       "usage": {
         "model": "claude-opus-5-5",
@@ -273,12 +273,12 @@
   "events": {
     "events": [
       {
-        "occurred_at": 1793530278102,
+        "occurred_at": 1793757395823,
         "tasks": [],
         "type": "background_tasks_changed"
       },
       {
-        "turn_id": "19f8706b-4fb5-42b5-a3fa-ef89da662cf0",
+        "turn_id": "116b7358-ca8d-4b65-a2df-76ed5823f33a",
         "type": "turn_started"
       },
       {
@@ -485,8 +485,8 @@
       {
         "cwd": "$RUN/project",
         "model": "claude-opus-5-5",
-        "provider_session_id": "8c7c4fe7-c75e-43e4-ab10-b4d2e0b0a403",
-        "session_id": "64847294-3010-48fe-9461-fcbc4877e408",
+        "provider_session_id": "80d4dddb-fc95-4dd1-a220-e4662bcd703d",
+        "session_id": "998b8084-6a81-43d7-a410-056e65228c39",
         "type": "session_opened"
       },
       {
@@ -514,7 +514,7 @@
       {
         "kind": "text",
         "text": "C20OFF-DONE",
-        "turn_id": "19f8706b-4fb5-42b5-a3fa-ef89da662cf0",
+        "turn_id": "116b7358-ca8d-4b65-a2df-76ed5823f33a",
         "type": "content_delta"
       },
       {
@@ -527,7 +527,7 @@
         "outcome": "completed",
         "result_text": "C20OFF-DONE",
         "stop_reason": "end_turn",
-        "turn_id": "19f8706b-4fb5-42b5-a3fa-ef89da662cf0",
+        "turn_id": "116b7358-ca8d-4b65-a2df-76ed5823f33a",
         "type": "turn_completed",
         "usage": {
           "model": "claude-opus-5-5",

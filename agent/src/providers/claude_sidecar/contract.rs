@@ -2,7 +2,7 @@ use std::collections::HashSet;
 
 /// The version of the sidecar built from the bundled source revision.
 /// Only a selected update is compared against this version to require a newer release.
-pub const BUNDLED_SIDECAR_VERSION: &str = "0.2.0";
+pub const BUNDLED_SIDECAR_VERSION: &str = "0.3.0";
 
 /// A quiet hint beside the compatibility diagnostic, only where the sidecar command exists.
 pub const UNTESTED_CLAUDE_NOTE: &str = "If something looks wrong, a newer sidecar may fix it: eitri sidecar check";

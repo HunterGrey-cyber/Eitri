@@ -42,6 +42,13 @@ you. Your Neovim stays the editor: a real `nvim --embed` with your own `init.lua
 - This starts with this release: 0.3.0 cannot take updates. After a `.deb` or `.rpm` upgrade run `eitri setup` once
   before `eitri sidecar update`, since the update needs the bundled sidecar built behind it.
 
+**Fixed**
+
+- An idle Claude session's sidecar no longer grows. In 0.3.0 each one grew 30 to 47 MB an hour for as long as the tab
+  stayed open. This release bundles sidecar 0.3.0: in the same 25-minute test of one idle session, its memory held at
+  102.6 MB from the fifth minute, where Eitri 0.3.0's grew 22 MB an hour (the JavaScript heap 44 MB an hour, against
+  0.3).
+
 **What this can break:**
 
 - **On Hyprland, sway and niri, chats and pages leave the Eitri window** and Eitri's layout keys go off: splits, zoom,

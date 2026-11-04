@@ -1,12 +1,12 @@
 {
   "domain_events": [
     {
-      "occurred_at": 1793530288159,
+      "occurred_at": 1793757418254,
       "tasks": [],
       "type": "background_tasks_changed"
     },
     {
-      "turn_id": "a66db73f-fe89-4ee5-9038-f0ade8d112a8",
+      "turn_id": "5a9d4745-c33a-480a-8224-dc65716c8037",
       "type": "turn_started"
     },
     {
@@ -213,8 +213,8 @@
     {
       "cwd": "$RUN/project",
       "model": "claude-opus-5-5",
-      "provider_session_id": "275bc42d-1906-4385-b6aa-9656c2648047",
-      "session_id": "aec14e39-e35a-443e-92f5-aa723ea2af77",
+      "provider_session_id": "0aa8064a-df63-40df-8779-42d160dd3972",
+      "session_id": "c4cab87e-3b2a-458b-9b51-fa121d75e196",
       "type": "session_opened"
     },
     {
@@ -242,7 +242,7 @@
     {
       "kind": "text",
       "text": "C20G-OPEN-DONE",
-      "turn_id": "a66db73f-fe89-4ee5-9038-f0ade8d112a8",
+      "turn_id": "5a9d4745-c33a-480a-8224-dc65716c8037",
       "type": "content_delta"
     },
     {
@@ -255,7 +255,7 @@
       "outcome": "completed",
       "result_text": "C20G-OPEN-DONE",
       "stop_reason": "end_turn",
-      "turn_id": "a66db73f-fe89-4ee5-9038-f0ade8d112a8",
+      "turn_id": "5a9d4745-c33a-480a-8224-dc65716c8037",
       "type": "turn_completed",
       "usage": {
         "model": "claude-opus-5-5",
@@ -270,11 +270,11 @@
       }
     },
     {
-      "turn_id": "a2f90953-18c3-4e9f-9ebb-9ddf122ceb81",
+      "turn_id": "68c8e6e5-1d4f-42c8-be0c-629685cc3be6",
       "type": "turn_started"
     },
     {
-      "interaction_id": "04eedbd5-d341-45da-b51f-59514426b9c6",
+      "interaction_id": "66fe1e3f-8e98-40a9-804e-9f82a28c4951",
       "questions": [
         {
           "header": "Go",
@@ -301,8 +301,8 @@
     {
       "cwd": "$RUN/project",
       "model": "claude-opus-5-5",
-      "provider_session_id": "275bc42d-1906-4385-b6aa-9656c2648047",
-      "session_id": "aec14e39-e35a-443e-92f5-aa723ea2af77",
+      "provider_session_id": "0aa8064a-df63-40df-8779-42d160dd3972",
+      "session_id": "c4cab87e-3b2a-458b-9b51-fa121d75e196",
       "type": "session_opened"
     },
     {
@@ -339,12 +339,12 @@
       },
       "name": "AskUserQuestion",
       "tool_use_id": "toolu_q1",
-      "turn_id": "a2f90953-18c3-4e9f-9ebb-9ddf122ceb81",
+      "turn_id": "68c8e6e5-1d4f-42c8-be0c-629685cc3be6",
       "type": "tool_call_started"
     },
     {
       "answers": [],
-      "interaction_id": "04eedbd5-d341-45da-b51f-59514426b9c6",
+      "interaction_id": "66fe1e3f-8e98-40a9-804e-9f82a28c4951",
       "outcome": "session_closed",
       "reason": null,
       "type": "question_settled"
@@ -358,7 +358,7 @@
       "outcome": "failed",
       "result_text": "",
       "stop_reason": null,
-      "turn_id": "a2f90953-18c3-4e9f-9ebb-9ddf122ceb81",
+      "turn_id": "68c8e6e5-1d4f-42c8-be0c-629685cc3be6",
       "type": "turn_completed",
       "usage": null
     },
@@ -367,12 +367,12 @@
       "type": "session_closed"
     },
     {
-      "occurred_at": 1793530290655,
+      "occurred_at": 1793757420750,
       "tasks": [],
       "type": "background_tasks_changed"
     },
     {
-      "turn_id": "d7d60864-3fe4-4b5a-89b7-09cb1af4fd34",
+      "turn_id": "0c817de6-7c4b-4aee-bc1e-14844fc8074d",
       "type": "turn_started"
     },
     {
@@ -577,18 +577,18 @@
       "type": "commands_available"
     },
     {
-      "attached_provider_session_id": "275bc42d-1906-4385-b6aa-9656c2648047",
+      "attached_provider_session_id": "0aa8064a-df63-40df-8779-42d160dd3972",
       "detail": null,
       "forked": false,
-      "requested_provider_session_id": "275bc42d-1906-4385-b6aa-9656c2648047",
+      "requested_provider_session_id": "0aa8064a-df63-40df-8779-42d160dd3972",
       "status": "attached",
       "type": "resume_outcome"
     },
     {
       "cwd": "$RUN/project",
       "model": "claude-opus-5-5",
-      "provider_session_id": "275bc42d-1906-4385-b6aa-9656c2648047",
-      "session_id": "d80c9c33-a967-4767-a12c-397a01858c5e",
+      "provider_session_id": "0aa8064a-df63-40df-8779-42d160dd3972",
+      "session_id": "df46ef74-a081-415a-8668-f36b6d411cf1",
       "type": "session_opened"
     },
     {
@@ -616,7 +616,7 @@
     {
       "kind": "text",
       "text": "C20G-AFTER-DONE",
-      "turn_id": "d7d60864-3fe4-4b5a-89b7-09cb1af4fd34",
+      "turn_id": "0c817de6-7c4b-4aee-bc1e-14844fc8074d",
       "type": "content_delta"
     },
     {
@@ -629,7 +629,7 @@
       "outcome": "completed",
       "result_text": "C20G-AFTER-DONE",
       "stop_reason": "end_turn",
-      "turn_id": "d7d60864-3fe4-4b5a-89b7-09cb1af4fd34",
+      "turn_id": "0c817de6-7c4b-4aee-bc1e-14844fc8074d",
       "type": "turn_completed",
       "usage": {
         "model": "claude-opus-5-5",
@@ -647,12 +647,12 @@
   "events": {
     "events": [
       {
-        "occurred_at": 1793530288159,
+        "occurred_at": 1793757418254,
         "tasks": [],
         "type": "background_tasks_changed"
       },
       {
-        "turn_id": "a66db73f-fe89-4ee5-9038-f0ade8d112a8",
+        "turn_id": "5a9d4745-c33a-480a-8224-dc65716c8037",
         "type": "turn_started"
       },
       {
@@ -859,8 +859,8 @@
       {
         "cwd": "$RUN/project",
         "model": "claude-opus-5-5",
-        "provider_session_id": "275bc42d-1906-4385-b6aa-9656c2648047",
-        "session_id": "aec14e39-e35a-443e-92f5-aa723ea2af77",
+        "provider_session_id": "0aa8064a-df63-40df-8779-42d160dd3972",
+        "session_id": "c4cab87e-3b2a-458b-9b51-fa121d75e196",
         "type": "session_opened"
       },
       {
@@ -888,7 +888,7 @@
       {
         "kind": "text",
         "text": "C20G-OPEN-DONE",
-        "turn_id": "a66db73f-fe89-4ee5-9038-f0ade8d112a8",
+        "turn_id": "5a9d4745-c33a-480a-8224-dc65716c8037",
         "type": "content_delta"
       },
       {
@@ -901,7 +901,7 @@
         "outcome": "completed",
         "result_text": "C20G-OPEN-DONE",
         "stop_reason": "end_turn",
-        "turn_id": "a66db73f-fe89-4ee5-9038-f0ade8d112a8",
+        "turn_id": "5a9d4745-c33a-480a-8224-dc65716c8037",
         "type": "turn_completed",
         "usage": {
           "model": "claude-opus-5-5",
@@ -916,11 +916,11 @@
         }
       },
       {
-        "turn_id": "a2f90953-18c3-4e9f-9ebb-9ddf122ceb81",
+        "turn_id": "68c8e6e5-1d4f-42c8-be0c-629685cc3be6",
         "type": "turn_started"
       },
       {
-        "interaction_id": "04eedbd5-d341-45da-b51f-59514426b9c6",
+        "interaction_id": "66fe1e3f-8e98-40a9-804e-9f82a28c4951",
         "questions": [
           {
             "header": "Go",
@@ -947,8 +947,8 @@
       {
         "cwd": "$RUN/project",
         "model": "claude-opus-5-5",
-        "provider_session_id": "275bc42d-1906-4385-b6aa-9656c2648047",
-        "session_id": "aec14e39-e35a-443e-92f5-aa723ea2af77",
+        "provider_session_id": "0aa8064a-df63-40df-8779-42d160dd3972",
+        "session_id": "c4cab87e-3b2a-458b-9b51-fa121d75e196",
         "type": "session_opened"
       },
       {
@@ -985,12 +985,12 @@
         },
         "name": "AskUserQuestion",
         "tool_use_id": "toolu_q1",
-        "turn_id": "a2f90953-18c3-4e9f-9ebb-9ddf122ceb81",
+        "turn_id": "68c8e6e5-1d4f-42c8-be0c-629685cc3be6",
         "type": "tool_call_started"
       },
       {
         "answers": [],
-        "interaction_id": "04eedbd5-d341-45da-b51f-59514426b9c6",
+        "interaction_id": "66fe1e3f-8e98-40a9-804e-9f82a28c4951",
         "outcome": "session_closed",
         "reason": null,
         "type": "question_settled"
@@ -1004,7 +1004,7 @@
         "outcome": "failed",
         "result_text": "",
         "stop_reason": null,
-        "turn_id": "a2f90953-18c3-4e9f-9ebb-9ddf122ceb81",
+        "turn_id": "68c8e6e5-1d4f-42c8-be0c-629685cc3be6",
         "type": "turn_completed",
         "usage": null
       },
@@ -1013,12 +1013,12 @@
         "type": "session_closed"
       },
       {
-        "occurred_at": 1793530290655,
+        "occurred_at": 1793757420750,
         "tasks": [],
         "type": "background_tasks_changed"
       },
       {
-        "turn_id": "d7d60864-3fe4-4b5a-89b7-09cb1af4fd34",
+        "turn_id": "0c817de6-7c4b-4aee-bc1e-14844fc8074d",
         "type": "turn_started"
       },
       {
@@ -1223,18 +1223,18 @@
         "type": "commands_available"
       },
       {
-        "attached_provider_session_id": "275bc42d-1906-4385-b6aa-9656c2648047",
+        "attached_provider_session_id": "0aa8064a-df63-40df-8779-42d160dd3972",
         "detail": null,
         "forked": false,
-        "requested_provider_session_id": "275bc42d-1906-4385-b6aa-9656c2648047",
+        "requested_provider_session_id": "0aa8064a-df63-40df-8779-42d160dd3972",
         "status": "attached",
         "type": "resume_outcome"
       },
       {
         "cwd": "$RUN/project",
         "model": "claude-opus-5-5",
-        "provider_session_id": "275bc42d-1906-4385-b6aa-9656c2648047",
-        "session_id": "d80c9c33-a967-4767-a12c-397a01858c5e",
+        "provider_session_id": "0aa8064a-df63-40df-8779-42d160dd3972",
+        "session_id": "df46ef74-a081-415a-8668-f36b6d411cf1",
         "type": "session_opened"
       },
       {
@@ -1262,7 +1262,7 @@
       {
         "kind": "text",
         "text": "C20G-AFTER-DONE",
-        "turn_id": "d7d60864-3fe4-4b5a-89b7-09cb1af4fd34",
+        "turn_id": "0c817de6-7c4b-4aee-bc1e-14844fc8074d",
         "type": "content_delta"
       },
       {
@@ -1275,7 +1275,7 @@
         "outcome": "completed",
         "result_text": "C20G-AFTER-DONE",
         "stop_reason": "end_turn",
-        "turn_id": "d7d60864-3fe4-4b5a-89b7-09cb1af4fd34",
+        "turn_id": "0c817de6-7c4b-4aee-bc1e-14844fc8074d",
         "type": "turn_completed",
         "usage": {
           "model": "claude-opus-5-5",
@@ -1542,7 +1542,7 @@
       "providerSessionId": "prov-1",
       "questions": [
         {
-          "interactionId": "04eedbd5-d341-45da-b51f-59514426b9c6",
+          "interactionId": "66fe1e3f-8e98-40a9-804e-9f82a28c4951",
           "questions": [
             {
               "header": "Go",
@@ -1570,7 +1570,7 @@
             "reason": null
           },
           "toolUseId": "toolu_q1",
-          "turnId": "a2f90953-18c3-4e9f-9ebb-9ddf122ceb81",
+          "turnId": "68c8e6e5-1d4f-42c8-be0c-629685cc3be6",
           "unsupportedReason": null
         }
       ],
@@ -1605,7 +1605,7 @@
           "result": null,
           "seq": 16,
           "toolUseId": "toolu_q1",
-          "turnId": "a2f90953-18c3-4e9f-9ebb-9ddf122ceb81"
+          "turnId": "68c8e6e5-1d4f-42c8-be0c-629685cc3be6"
         }
       ],
       "transcript": [
@@ -1626,7 +1626,7 @@
           "reason": null,
           "resetsAt": null,
           "seq": 18,
-          "turnId": "a2f90953-18c3-4e9f-9ebb-9ddf122ceb81"
+          "turnId": "68c8e6e5-1d4f-42c8-be0c-629685cc3be6"
         }
       ],
       "usage": {
