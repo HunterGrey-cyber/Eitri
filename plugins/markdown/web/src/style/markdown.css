@@ -5,8 +5,15 @@
    page sets its background and its text together, so neither half is left to the host's defaults. The engine's own
    scrolls to a target (a focused link, a fragment) leave the reading reserve above it, as the page's keys do (the
    page keeps --mdp-reserve at its reading reserve, five lines of text at least), and stay clear of the keys' 20 px HUD
-   below. */
+   below.
+
+   The base text size is --mdp-text: the editor's own size when the host gives it (--nv-text-size, in CSS px),
+   14px when it does not (a window beside someone's terminal has no editor font to follow), or the font_size setting,
+   which the page puts on the root element. The line height and every size below are ratios of it (22px at 14px),
+   so a larger editor font gives a larger page and the same proportions. */
 html {
+  --mdp-text: var(--nv-text-size, 14px);
+  --mdp-line: calc(var(--mdp-text) * 11 / 7);
   color-scheme: var(--nv-color-scheme);
   background-color: var(--nv-bg);
   color: var(--nv-fg);
@@ -16,8 +23,8 @@ html {
 
 html, body {
   font-family: var(--nv-font-prose);
-  font-size: 14px;
-  line-height: 22px;
+  font-size: var(--mdp-text);
+  line-height: var(--mdp-line);
   word-wrap: break-word;
 }
 
@@ -32,7 +39,7 @@ body {
   position: relative;
   background-color: var(--nv-bg);
   color: var(--nv-fg);
-  margin-bottom: calc(100vh - 22px);
+  margin-bottom: calc(100vh - var(--mdp-line));
 }
 
 h1, h2, h3, h4, h5, h6, p, ol, ul, pre {

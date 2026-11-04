@@ -92,12 +92,21 @@ fn text(value: Value, what: &str, dir: &str) -> Result<String, String> {
     }
 }
 
-/// An option's value: a string, or a boolean for a `bool` setting.
+/// An option's value: a string, a boolean for a `bool` setting, or a whole number for an `int` setting (`16` and
+/// `16.0` are both 16; `16.5` is refused rather than rounded; so is a float beyond +-9007199254740991, the integers a
+/// float holds exactly and a page reads back unchanged).
 fn option_value(value: Value, name: &str, dir: &str) -> Result<SettingValue, String> {
     match value {
         Value::Boolean(b) => Ok(SettingValue::Bool(b)),
+        Value::Integer(n) => Ok(SettingValue::Int(i64::from(n))),
+        Value::Number(f) if f.fract() == 0.0 && f.abs() <= 9_007_199_254_740_991.0 => Ok(SettingValue::Int(f as i64)),
+        Value::Number(f) => Err(format!(
+            "{PREFIX}({dir}): option {name} = {f} must be a whole number within +-9007199254740991"
+        )),
         Value::String(_) => text(value, &format!("option {name}"), dir).map(SettingValue::Text),
-        _ => Err(format!("{PREFIX}({dir}): option {name} must be a string or a boolean")),
+        _ => Err(format!(
+            "{PREFIX}({dir}): option {name} must be a string, a boolean or a number"
+        )),
     }
 }
 
@@ -604,7 +613,24 @@ mod tests {
             ("{ work = true }".to_string(), "a dir setting takes a path"),
             (
                 format!("{{ work = {w:?}, auto = 1 }}"),
-                "option auto must be a string or a boolean",
+                "a bool setting takes true or false",
+            ),
+            (
+                format!("{{ work = {w:?}, auto = {{}} }}"),
+                "option auto must be a string, a boolean or a number",
+            ),
+            (
+                format!("{{ work = {w:?}, auto = 1.5 }}"),
+                "option auto = 1.5 must be a whole number",
+            ),
+            (
+                format!("{{ work = {w:?}, auto = 1e300 }}"),
+                "must be a whole number within +-9007199254740991",
+            ),
+            (
+                // A whole float in range is a number like any other: the bool setting's own refusal, not this one.
+                format!("{{ work = {w:?}, auto = 1e15 }}"),
+                "a bool setting takes true or false",
             ),
             (format!("{{ work = {w:?}, key = true }}"), "option key must be a string"),
             (

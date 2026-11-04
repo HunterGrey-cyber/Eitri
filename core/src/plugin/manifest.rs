@@ -29,6 +29,9 @@ pub const MAX_COMMANDS: usize = 8;
 pub const MAX_COMMAND_NAME: usize = 40;
 /// The most values a `choice` setting may list.
 pub const MAX_CHOICES: usize = 8;
+/// The largest whole number a page reads from a JSON number without it changing (JavaScript's 2^53 - 1): the bound of an
+/// `int` setting's `min` and `max`.
+const MAX_SAFE_INT: i64 = 9_007_199_254_740_991;
 
 /// What a page may be given. A closed set: a name outside it refuses the manifest.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
@@ -242,6 +245,9 @@ pub enum SettingKind {
     Bool,
     /// One of a closed list of words, in the order the manifest lists them.
     Choice(Vec<String>),
+    /// A whole number between `min` and `max`, both included. Its manifest `default` may be left out: the
+    /// setting is then unset until `init.lua` gives it a value.
+    Int { min: i64, max: i64 },
 }
 
 impl SettingKind {
@@ -250,20 +256,23 @@ impl SettingKind {
             SettingKind::Dir => "dir",
             SettingKind::Bool => "bool",
             SettingKind::Choice(_) => "choice",
+            SettingKind::Int { .. } => "int",
         }
     }
 }
 
-/// A setting's value: a `dir` or `choice` setting holds text, a `bool` setting a boolean.
+/// A setting's value: a `dir` or `choice` setting holds text, a `bool` setting a boolean, an `int` setting a number.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum SettingValue {
     Text(String),
     Bool(bool),
+    Int(i64),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Setting {
-    pub default: SettingValue,
+    /// `None` only for an `int` setting the manifest gives no default.
+    pub default: Option<SettingValue>,
     pub kind: SettingKind,
 }
 
@@ -501,9 +510,11 @@ fn window_node(value: &toml::Value, at: &str) -> Result<SpecNode, String> {
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct RawSetting {
-    default: toml::Value,
+    default: Option<toml::Value>,
     kind: String,
     values: Option<Vec<String>>,
+    min: Option<i64>,
+    max: Option<i64>,
 }
 
 #[derive(Deserialize)]
@@ -696,10 +707,31 @@ pub fn parse_manifest(text: &str) -> Result<Manifest, String> {
                 }
                 SettingKind::Choice(values.clone())
             }
+            "int" => match (setting.min, setting.max) {
+                (Some(min), Some(max))
+                    if !(-MAX_SAFE_INT..=MAX_SAFE_INT).contains(&min)
+                        || !(-MAX_SAFE_INT..=MAX_SAFE_INT).contains(&max) =>
+                {
+                    return fail(
+                        &format!("settings.{name}.max"),
+                        format!("min and max are within +-{MAX_SAFE_INT}, which a page reads back unchanged"),
+                    );
+                }
+                (Some(min), Some(max)) if min <= max => SettingKind::Int { min, max },
+                (Some(_), Some(_)) => {
+                    return fail(&format!("settings.{name}.min"), "must not be above max".into());
+                }
+                _ => {
+                    return fail(
+                        &format!("settings.{name}"),
+                        "an int setting gives its min and max".into(),
+                    );
+                }
+            },
             other => {
                 return fail(
                     &format!("settings.{name}.kind"),
-                    format!("{other:?} is not a kind (dir, bool, choice)"),
+                    format!("{other:?} is not a kind (dir, bool, choice, int)"),
                 );
             }
         };
@@ -709,8 +741,21 @@ pub fn parse_manifest(text: &str) -> Result<Manifest, String> {
                 "only a choice setting has values".into(),
             );
         }
+        if (setting.min.is_some() || setting.max.is_some()) && !matches!(kind, SettingKind::Int { .. }) {
+            return fail(
+                &format!("settings.{name}.min"),
+                "only an int setting has a min and a max".into(),
+            );
+        }
         let key = format!("settings.{name}.default");
-        let default = match (&kind, &setting.default) {
+        let Some(raw_default) = &setting.default else {
+            if !matches!(kind, SettingKind::Int { .. }) {
+                return fail(&key, "is required (only an int setting may leave it out)".into());
+            }
+            settings.insert(name.clone(), Setting { default: None, kind });
+            continue;
+        };
+        let default = match (&kind, raw_default) {
             (SettingKind::Dir, toml::Value::String(text)) if text.trim().is_empty() => {
                 return fail(&key, "must not be empty".into());
             }
@@ -725,8 +770,20 @@ pub fn parse_manifest(text: &str) -> Result<Manifest, String> {
                 let listed: Vec<String> = values.iter().map(|v| format!("{v:?}")).collect();
                 return fail(&key, format!("must be one of {}", listed.join(", ")));
             }
+            (SettingKind::Int { min, max }, toml::Value::Integer(n)) if (*min..=*max).contains(n) => {
+                SettingValue::Int(*n)
+            }
+            (SettingKind::Int { min, max }, _) => {
+                return fail(&key, format!("must be a whole number from {min} to {max}"));
+            }
         };
-        settings.insert(name.clone(), Setting { default, kind });
+        settings.insert(
+            name.clone(),
+            Setting {
+                default: Some(default),
+                kind,
+            },
+        );
     }
     let setting_names: BTreeSet<String> = settings.keys().cloned().collect();
 
@@ -1250,6 +1307,90 @@ layout = { row = [ { module = "page", share = 0.42 }, { column = [ { module = "e
         assert!(err.contains("terminal.cwd") && err.contains("[window]"), "{err}");
     }
 
+    fn int_manifest(setting: &str) -> String {
+        format!("{WINDOW_BASE}\n[settings.size]\n{setting}\n")
+    }
+
+    #[test]
+    fn an_int_setting_has_a_range_and_may_leave_its_default_out() {
+        let m = parse_manifest(&int_manifest("kind = 'int'\nmin = 9\nmax = 32")).unwrap();
+        assert_eq!(
+            m.settings["size"],
+            Setting {
+                default: None,
+                kind: SettingKind::Int { min: 9, max: 32 }
+            }
+        );
+        let m = parse_manifest(&int_manifest("kind = 'int'\nmin = 9\nmax = 32\ndefault = 14")).unwrap();
+        assert_eq!(m.settings["size"].default, Some(SettingValue::Int(14)));
+        let widest = int_manifest("kind = 'int'\nmin = -9007199254740991\nmax = 9007199254740991\ndefault = 0");
+        assert!(parse_manifest(&widest).is_ok(), "the safe range itself is accepted");
+        for edge in [9, 32] {
+            let text = int_manifest(&format!("kind = 'int'\nmin = 9\nmax = 32\ndefault = {edge}"));
+            assert!(parse_manifest(&text).is_ok(), "{edge}");
+        }
+    }
+
+    #[test]
+    fn a_malformed_int_setting_is_refused_naming_the_key() {
+        for (setting, key, says) in [
+            ("kind = 'int'", "settings.size", "min and max"),
+            ("kind = 'int'\nmin = 1", "settings.size", "min and max"),
+            ("kind = 'int'\nmin = 9\nmax = 3", "settings.size.min", "above max"),
+            (
+                "kind = 'int'\nmin = 9\nmax = 32\ndefault = 8",
+                "settings.size.default",
+                "from 9 to 32",
+            ),
+            (
+                "kind = 'int'\nmin = 9\nmax = 32\ndefault = 33",
+                "settings.size.default",
+                "from 9 to 32",
+            ),
+            (
+                "kind = 'int'\nmin = 9\nmax = 32\ndefault = 14.5",
+                "settings.size.default",
+                "from 9 to 32",
+            ),
+            (
+                "kind = 'int'\nmin = 9\nmax = 32\ndefault = '14'",
+                "settings.size.default",
+                "from 9 to 32",
+            ),
+            (
+                "kind = 'bool'\nmin = 9\nmax = 32\ndefault = true",
+                "settings.size.min",
+                "only an int",
+            ),
+            (
+                "kind = 'int'\nmin = 9007199254740993\nmax = 9007199254740993\ndefault = 9007199254740993",
+                "settings.size.max",
+                "page reads back unchanged",
+            ),
+            (
+                "kind = 'int'\nmin = -9007199254740993\nmax = 5",
+                "settings.size.max",
+                "page reads back unchanged",
+            ),
+            (
+                "kind = 'int'\nmin = -9223372036854775808\nmax = 0\ndefault = -9007199254740993",
+                "settings.size.max",
+                "page reads back unchanged",
+            ),
+            (
+                "kind = 'int'\nmin = 0\nmax = 9223372036854775807",
+                "settings.size.max",
+                "page reads back unchanged",
+            ),
+            ("kind = 'bool'", "settings.size.default", "is required"),
+            ("kind = 'dir'", "settings.size.default", "is required"),
+            ("kind = 'float'\ndefault = 1", "settings.size.kind", "bool, choice, int"),
+        ] {
+            let err = parse_manifest(&int_manifest(setting)).unwrap_err();
+            assert!(err.contains(key) && err.contains(says), "{setting}: {err}");
+        }
+    }
+
     #[test]
     fn editor_buffers_needs_no_window() {
         let text = WINDOW_BASE.replace("[roots]", "capabilities = ['editor.buffers']\n[roots]");
@@ -1261,19 +1402,22 @@ layout = { row = [ { module = "page", share = 0.42 }, { column = [ { module = "e
         let m = parse_manifest(EXAMPLE).expect("the example is valid");
         assert_eq!(m.id, "demo");
         assert_eq!(m.capabilities, Capability::ALL[..8].to_vec());
-        assert_eq!(m.settings["work"].default, SettingValue::Text("~/demo-work".into()));
+        assert_eq!(
+            m.settings["work"].default,
+            Some(SettingValue::Text("~/demo-work".into()))
+        );
         assert_eq!(m.settings["work"].kind, SettingKind::Dir);
         assert_eq!(
             m.settings["auto"],
             Setting {
-                default: SettingValue::Bool(false),
+                default: Some(SettingValue::Bool(false)),
                 kind: SettingKind::Bool
             }
         );
         assert_eq!(
             m.settings["images"],
             Setting {
-                default: SettingValue::Text("https".into()),
+                default: Some(SettingValue::Text("https".into())),
                 kind: SettingKind::Choice(vec!["https".into(), "off".into()])
             }
         );
@@ -1788,22 +1932,29 @@ images = "${remote_images}"         # resolves to "https" or "off"
         assert_eq!(
             m.settings["auto"],
             Setting {
-                default: SettingValue::Bool(false),
+                default: Some(SettingValue::Bool(false)),
                 kind: SettingKind::Bool
             }
         );
         assert_eq!(
             m.settings["remote_images"],
             Setting {
-                default: SettingValue::Text("https".into()),
+                default: Some(SettingValue::Text("https".into())),
                 kind: SettingKind::Choice(vec!["https".into(), "off".into()]),
             }
         );
         assert_eq!(
             m.settings["sync"],
             Setting {
-                default: SettingValue::Text("both".into()),
+                default: Some(SettingValue::Text("both".into())),
                 kind: SettingKind::Choice(vec!["both".into(), "editor".into(), "off".into()]),
+            }
+        );
+        assert_eq!(
+            m.settings["font_size"],
+            Setting {
+                default: None,
+                kind: SettingKind::Int { min: 9, max: 32 },
             }
         );
         assert!(m.origins.is_empty() && m.roots.is_empty() && m.tasks.is_empty());

@@ -28,11 +28,12 @@ describe("the page's stylesheets", () => {
     const sent = new Set(Object.keys(theme.data.vars));
     const used = new Set([...withoutComments(all).matchAll(/var\((--nv-[a-z0-9-]+)/g)].map((m) => m[1]));
     expect(used.size).toBeGreaterThan(20);
-    expect([...used].filter((name) => !sent.has(name))).toEqual([]);
+    // The editor's text size comes in its own var, from a window with an editor of its own, and is optional.
+    expect([...used].filter((name) => !sent.has(name) && name !== "--nv-text-size")).toEqual([]);
     expect(used.has("--nv-link")).toBe(true);
   });
 
-  it("colour the page's background and text together, from the theme, at a 14 px base", () => {
+  it("colour the page's background and text together, from the theme", () => {
     for (const selector of ["html", ".mdp-root"]) {
       const rule = rules(css["markdown.css"]).find((r) => r.selector === selector)!;
       expect(rule, selector).toBeDefined();
@@ -42,7 +43,21 @@ describe("the page's stylesheets", () => {
     expect(rules(css["markdown.css"]).find((r) => r.selector === "html")!.body).toMatch(/color-scheme:\s*var\(--nv-color-scheme\)/);
     expect(rules(css["markdown.css"]).find((r) => r.selector === "html")!.body).toMatch(/scroll-padding-top:\s*var\(--mdp-reserve, 110px\)/);
     expect(rules(css["markdown.css"]).find((r) => r.selector === "html")!.body).toMatch(/scroll-padding-bottom:\s*20px/);
-    expect(rules(css["markdown.css"]).find((r) => r.selector === "html, body")!.body).toMatch(/font-size:\s*14px/);
+    expect(rules(css["markdown.css"]).find((r) => r.selector === "html, body")!.body).toMatch(/font-size:\s*var\(--mdp-text\)/);
+  });
+
+  it("size the text from one base: the editor's size, else 14 px, and every length a ratio of it", () => {
+    const html = rules(css["markdown.css"]).find((r) => r.selector === "html")!.body;
+    expect(html).toMatch(/--mdp-text:\s*var\(--nv-text-size, 14px\)/);
+    // 22 px of line at 14 px of text, as it was before the size could move.
+    expect(html).toMatch(/--mdp-line:\s*calc\(var\(--mdp-text\) \* 11 \/ 7\)/);
+    const base = rules(css["markdown.css"]).find((r) => r.selector === "html, body")!.body;
+    expect(base).toMatch(/line-height:\s*var\(--mdp-line\)/);
+    expect(squash(css["markdown.css"])).toContain("margin-bottom: calc(100vh - var(--mdp-line))");
+    // Nothing else in the page's own sheets fixes a font size or a line height in px: those would not move.
+    const fixed = rules(all).flatMap(({ selector, body }) =>
+      body.split(";").map((d) => d.trim()).filter((d) => /^(font-size|line-height)\s*:\s*[\d.]+px/.test(d)).map((d) => `${selector} { ${d} }`));
+    expect(fixed).toEqual([]);
   });
 
   it("never draw text in a signal colour; those colour borders, fills and glyphs", () => {

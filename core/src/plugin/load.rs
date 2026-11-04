@@ -87,6 +87,7 @@ fn shown(value: &SettingValue) -> String {
     match value {
         SettingValue::Text(text) => format!("{text:?}"),
         SettingValue::Bool(b) => b.to_string(),
+        SettingValue::Int(n) => n.to_string(),
     }
 }
 
@@ -127,7 +128,10 @@ pub fn load_plugin_with(
     let mut settings = BTreeMap::new();
     let mut values = BTreeMap::new();
     for (name, setting) in &manifest.settings {
-        let value = given.get(name).unwrap_or(&setting.default);
+        // An `int` setting with no default and no given value stays unset: a page is told nothing about it.
+        let Some(value) = given.get(name).or(setting.default.as_ref()) else {
+            continue;
+        };
         match &setting.kind {
             SettingKind::Dir => {
                 let SettingValue::Text(raw) = value else {
@@ -162,6 +166,17 @@ pub fn load_plugin_with(
                 }
                 values.insert(name.clone(), value.clone());
             }
+            SettingKind::Int { min, max } => match value {
+                SettingValue::Int(n) if (*min..=*max).contains(n) => {
+                    values.insert(name.clone(), value.clone());
+                }
+                _ => {
+                    return Err(format!(
+                        "setting {name} = {}: an int setting takes a whole number from {min} to {max}",
+                        shown(value)
+                    ));
+                }
+            },
             SettingKind::Choice(allowed) => match value {
                 SettingValue::Text(text) if allowed.contains(text) => {
                     values.insert(name.clone(), value.clone());
@@ -251,8 +266,9 @@ pub fn check_window_roots(plugins: &[(&LoadedPlugin, &str)]) -> Result<(), Strin
 }
 
 impl LoadedPlugin {
-    /// Every `bool` and `choice` setting as the page reads it in `host.hello`: a bool as a JSON boolean, a
-    /// choice as a JSON string. `dir` settings are not here; a page sees them as roots.
+    /// Every `bool`, `choice` and `int` setting that has a value, as the page reads it in `host.hello`: a bool as
+    /// a JSON boolean, a choice as a JSON string, an int as a JSON number. An `int` setting nobody gave a value is
+    /// left out. `dir` settings are not here; a page sees them as roots.
     pub fn page_settings(&self) -> serde_json::Map<String, serde_json::Value> {
         self.values
             .iter()
@@ -260,6 +276,7 @@ impl LoadedPlugin {
                 let value = match value {
                     SettingValue::Bool(b) => serde_json::Value::Bool(*b),
                     SettingValue::Text(text) => serde_json::Value::String(text.clone()),
+                    SettingValue::Int(n) => serde_json::Value::from(*n),
                 };
                 (name.clone(), value)
             })
@@ -511,6 +528,62 @@ mod tests {
         assert!(load_plugin(dir.to_str().unwrap(), &settings, None)
             .unwrap_err()
             .contains("not a directory"));
+    }
+
+    /// The demo plugin with two `int` settings: `size` (9 to 32, no default) and `steps` (1 to 5, default 3).
+    fn int_plugin(root: &Path) -> (std::path::PathBuf, BTreeMap<String, SettingValue>) {
+        let (dir, settings) = demo_plugin(root);
+        let manifest = std::fs::read_to_string(dir.join("eitri-plugin.toml")).unwrap();
+        let manifest = manifest.replace(
+            "[settings]\n",
+            "[settings]\nsize = { kind = \"int\", min = 9, max = 32 }\nsteps = { kind = \"int\", min = 1, max = 5, default = 3 }\n",
+        );
+        std::fs::write(dir.join("eitri-plugin.toml"), manifest).unwrap();
+        let given = settings.into_iter().map(|(k, v)| (k, SettingValue::Text(v))).collect();
+        (dir, given)
+    }
+
+    #[test]
+    fn an_int_setting_without_a_default_is_unset_until_given_and_then_a_number_for_the_page() {
+        let s = Scratch::new("int-setting");
+        let (dir, mut given) = int_plugin(&s.0);
+        let p = load_plugin_with(dir.to_str().unwrap(), &given, None).unwrap();
+        assert!(!p.values.contains_key("size"), "no default, no value: unset");
+        assert_eq!(p.values["steps"], SettingValue::Int(3));
+        let page = p.page_settings();
+        assert!(!page.contains_key("size"), "{page:?}");
+        assert_eq!(page["steps"], serde_json::json!(3));
+        for n in [9, 16, 32] {
+            given.insert("size".into(), SettingValue::Int(n));
+            let p = load_plugin_with(dir.to_str().unwrap(), &given, None).unwrap();
+            assert_eq!(p.page_settings()["size"], serde_json::json!(n));
+        }
+    }
+
+    #[test]
+    fn an_int_setting_outside_its_range_or_of_another_kind_is_refused_naming_it() {
+        let s = Scratch::new("int-setting-refused");
+        let (dir, mut given) = int_plugin(&s.0);
+        for bad in [
+            SettingValue::Int(8),
+            SettingValue::Int(33),
+            SettingValue::Int(-1),
+            SettingValue::Text("16".into()),
+            SettingValue::Bool(true),
+        ] {
+            given.insert("size".into(), bad.clone());
+            let err = load_plugin_with(dir.to_str().unwrap(), &given, None).unwrap_err();
+            assert!(
+                err.contains("setting size =") && err.contains("an int setting takes a whole number from 9 to 32"),
+                "{bad:?}: {err}"
+            );
+        }
+        // A number given to a setting of another kind is that kind's refusal.
+        given.insert("size".into(), SettingValue::Int(12));
+        given.insert("auto".into(), SettingValue::Int(1));
+        assert!(load_plugin_with(dir.to_str().unwrap(), &given, None)
+            .unwrap_err()
+            .contains("a bool setting takes true or false"));
     }
 
     #[test]

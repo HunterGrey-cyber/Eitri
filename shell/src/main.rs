@@ -1014,6 +1014,13 @@ fn build_ui(
             std::process::exit(1);
         }
     };
+    // A page that sizes its prose by the editor's gets the editor's size in its own CSS px, before any page is built
+    // and again at every change of either side. A page window beside a person's own nvim has no editor font of
+    // Eitri's to follow, so its pages are given none and keep their own size.
+    let pages_follow_editor_text = !pair.is_beside();
+    if pages_follow_editor_text {
+        plugin_panels.set_text_size(Some(editor_font.get().css_px()));
+    }
     {
         let driver = Rc::downgrade(&driver);
         plugin_panels.set_move_events(Rc::new(move |event| {
@@ -2493,12 +2500,15 @@ fn build_ui(
         let backdrop = backdrop.downgrade();
         Rc::new(move |payload: eitri_core::theme::payload::NvimThemePayload| {
             // The editor's font first, so the theme sent below already carries the panel's new size.
-            if follows_editor {
+            if follows_editor || pages_follow_editor_text {
                 let mut font = editor_font.get();
                 let moved = font.set_logical_px(eitri_core::theme::guifont_size_px(&payload.options.guifont));
                 editor_font.set(font);
-                if let Some(base) = moved {
+                if let (Some(base), true) = (moved, follows_editor) {
                     text_size_controller.set_base(base);
+                }
+                if moved.is_some() && pages_follow_editor_text {
+                    plugin_panels.set_text_size(Some(font.css_px()));
                 }
             }
             let tokens = eitri_core::theme::ThemeTokens::derive(&payload);
@@ -2533,8 +2543,9 @@ fn build_ui(
                     pane.set_face(face.clone());
                 }
             }
-            // The derived tokens, not the panel's sized ones: a page's set carries no size, so a size-only
-            // change leaves it equal and sends the pages nothing.
+            // The derived tokens, not the panel's sized ones: the panel's size is not a page's, so a change of it
+            // alone leaves the set equal and sends the pages nothing. The editor's own size reaches them through
+            // `set_text_size`, above and on a desktop text-scaling change.
             plugin_panels.set_theme(&tokens);
         })
     };
@@ -2572,15 +2583,20 @@ fn build_ui(
 
     // The desktop's text scaling moved WebKit's page zoom, so the editor's size is a different number of
     // the panel's CSS px (the cell height's own handler above does the same for `--nv-editor-row`).
-    if config.panel_font_follows_editor {
+    if config.panel_font_follows_editor || pages_follow_editor_text {
         if let Some(settings) = gtk4::Settings::default() {
             let controller = text_size_controller.clone();
+            let plugin_panels = plugin_panels.clone();
+            let panel_follows = config.panel_font_follows_editor;
             settings.connect_gtk_xft_dpi_notify(move |settings| {
                 let mut font = editor_font.get();
                 let moved = font.follow_xft_dpi(settings.gtk_xft_dpi());
                 editor_font.set(font);
-                if let Some(base) = moved {
+                if let (Some(base), true) = (moved, panel_follows) {
                     controller.set_base(base);
+                }
+                if moved.is_some() && pages_follow_editor_text {
+                    plugin_panels.set_text_size(Some(font.css_px()));
                 }
             });
         }

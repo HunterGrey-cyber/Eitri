@@ -1,7 +1,7 @@
 /** The page's side of the plugin protocol: the host's hello, the editor events, and the four editor verbs. Every
  *  reply and event is checked before the page reads it, since the page renders whatever the host hands over. */
 
-export type SettingValue = boolean | string;
+export type SettingValue = boolean | string | number;
 
 export interface Hello {
   host: "eitri";
@@ -23,6 +23,9 @@ export interface PreviewSettings {
   remote_images: "https" | "off";
   sync: "both" | "editor" | "off";
 }
+
+/** The range `font_size` may take: the manifest's own, checked again because the page renders what it is handed. */
+export const FONT_SIZE_RANGE = { min: 9, max: 32 } as const;
 
 export interface DocPrefixes {
   root: string;
@@ -120,16 +123,20 @@ export function isHello(v: unknown): v is Hello {
   if (!isRecord(v.theme) || !isStringRecord(v.theme.vars)) return false;
   if (v.settings !== undefined) {
     if (!isRecord(v.settings)) return false;
-    if (!Object.values(v.settings).every((x) => typeof x === "boolean" || typeof x === "string")) return false;
+    if (!Object.values(v.settings).every(isSettingValue)) return false;
   }
   return true;
+}
+
+function isSettingValue(x: unknown): x is SettingValue {
+  return typeof x === "boolean" || typeof x === "string" || (typeof x === "number" && Number.isFinite(x));
 }
 
 /** A setting value of a type no setting kind has is dropped before the reply is checked, so it reads as absent and
  *  takes its default, rather than costing the page the whole hello. */
 function withoutForeignSettings(reply: unknown): unknown {
   if (!isRecord(reply) || !isRecord(reply.settings)) return reply;
-  const kept = Object.entries(reply.settings).filter(([, x]) => typeof x === "boolean" || typeof x === "string");
+  const kept = Object.entries(reply.settings).filter(([, x]) => isSettingValue(x));
   return { ...reply, settings: Object.fromEntries(kept) };
 }
 
@@ -147,6 +154,14 @@ export function readSettings(h: Hello): PreviewSettings {
   const remote_images = s.remote_images === "https" || s.remote_images === "off" ? s.remote_images : "https";
   const sync = s.sync === "both" || s.sync === "editor" || s.sync === "off" ? s.sync : "both";
   return { auto, remote_images, sync };
+}
+
+/** The `font_size` setting from `init.lua` in CSS px, or `null` when it is unset or not a whole number in range: the
+ *  text size is then the host's to give (the editor's own) or, with none given, the page's own. */
+export function readFontSize(h: Hello): number | null {
+  const size = (h.settings ?? {}).font_size;
+  const whole = typeof size === "number" && Number.isInteger(size);
+  return whole && size >= FONT_SIZE_RANGE.min && size <= FONT_SIZE_RANGE.max ? size : null;
 }
 
 function isDoc(v: unknown): v is DocPrefixes {

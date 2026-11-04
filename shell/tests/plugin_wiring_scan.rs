@@ -150,7 +150,7 @@ fn the_theme_listener_feeds_every_plugin_page() {
     let terminal = body
         .find("pane.set_colors(colors);")
         .expect("every terminal follows the theme");
-    // The freshly derived tokens: the page set carries no size, so a size-only change sends the page nothing.
+    // The freshly derived tokens: a change of the panel's size alone leaves the page set equal and sends nothing.
     let pages = body
         .find("plugin_panels.set_theme(&tokens);")
         .expect("every plugin page follows the theme");
@@ -168,6 +168,52 @@ fn the_theme_listener_feeds_every_plugin_page() {
     assert!(
         code.contains("two.on_theme(apply_theme.clone());"),
         "the theme told over the link reaches the same consumer"
+    );
+}
+
+/// The pages' text size is the editor's own: told once before any page is built, again when `guifont` moves and
+/// when the desktop's text scaling does (both change the editor's size in the pages' CSS px), and never in a page
+/// window beside a person's own nvim, whose font Eitri does not know.
+#[test]
+fn the_pages_are_told_the_editors_text_size_except_beside_a_persons_nvim() {
+    let code = build_ui_code();
+    assert!(
+        code.contains("letpages_follow_editor_text=!pair.is_beside();"),
+        "only a window with an editor font of its own"
+    );
+    let first = code
+        .find(
+            "if pages_follow_editor_text{plugin_panels.set_text_size(Some(editor_font.get().css_px()));}"
+                .replace(' ', "")
+                .as_str(),
+        )
+        .expect("the start size reaches the pages");
+    let built = code.find("plugin_panels.build_page(").expect("a page is built");
+    assert!(first < built, "before any page is built");
+    let body = let_block(&code, "letapply_theme:");
+    let size = body
+        .find("plugin_panels.set_text_size(Some(font.css_px()));")
+        .expect("a guifont change reaches the pages");
+    let theme = body.find("plugin_panels.set_theme(&tokens);").unwrap();
+    assert!(
+        size < theme,
+        "the size first: the theme that follows already carries it"
+    );
+    assert!(
+        body.contains("ifmoved.is_some()&&pages_follow_editor_text{"),
+        "only a change is sent, and only to a window that follows the editor"
+    );
+    let panel_follows = code
+        .find("letpanel_follows=config.panel_font_follows_editor;")
+        .expect("the text-scaling listener's setup");
+    let at = panel_follows
+        + code[panel_follows..]
+            .find("connect_gtk_xft_dpi_notify(")
+            .expect("the text-scaling listener");
+    let listener = scan::braced(&code, at + code[at..].find('{').unwrap());
+    assert!(
+        listener.contains("plugin_panels.set_text_size(Some(font.css_px()));"),
+        "a text-scaling change moves the editor's size in CSS px: {listener}"
     );
 }
 

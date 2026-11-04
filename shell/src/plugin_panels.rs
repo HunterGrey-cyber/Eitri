@@ -732,6 +732,9 @@ pub(crate) struct PluginPanels {
     panels: Vec<Panel>,
     /// The window's theme as the pages last got it: what a page built later starts with.
     theme: RefCell<PageTheme>,
+    /// The editor's text size in the pages' CSS px, which every theme this window sends carries as
+    /// `--nv-text-size`; `None` in a window with no editor font to follow (one beside a person's own nvim).
+    text_px: Cell<Option<f32>>,
     follow_totals: RefCell<FollowTotals>,
     /// The editor's end was told to the hosts and no editor session has been seen since: an exit that is reported
     /// twice (nvim's own exit, then the editor's retirement) tells the pages once.
@@ -882,6 +885,7 @@ impl PluginPanels {
         Ok(PluginPanels {
             panels,
             theme: RefCell::new(theme.clone()),
+            text_px: Cell::new(None),
             follow_totals: RefCell::default(),
             editor_gone: Cell::new(false),
             page_built: RefCell::new(None),
@@ -1403,7 +1407,18 @@ impl PluginPanels {
     /// Every page follows the window's colorscheme. A change that leaves the page's set as it was (a size
     /// alone, say) sends nothing.
     pub(crate) fn set_theme(&self, tokens: &ThemeTokens) {
-        let theme = PageTheme::from_tokens(tokens);
+        self.send_theme(PageTheme::from_tokens(tokens).with_text_size(self.text_px.get()));
+    }
+
+    /// The editor's text size in the pages' CSS px (`EditorFont::css_px`), which a page that wants its prose the
+    /// editor's size reads as `--nv-text-size`; `None` takes it away. Sent on a change only, like any theme.
+    pub(crate) fn set_text_size(&self, css_px: Option<f32>) {
+        self.text_px.set(css_px);
+        let theme = self.theme.borrow().clone().with_text_size(css_px);
+        self.send_theme(theme);
+    }
+
+    fn send_theme(&self, theme: PageTheme) {
         *self.theme.borrow_mut() = theme.clone();
         for (_, pump) in self.held_hosts() {
             pump.host.set_theme(&theme);
@@ -1787,6 +1802,7 @@ mod tests {
         PluginPanels {
             panels,
             theme: RefCell::new(PageTheme::fallback()),
+            text_px: Cell::new(None),
             follow_totals: RefCell::default(),
             editor_gone: Cell::new(false),
             page_built: RefCell::new(None),
@@ -1860,6 +1876,57 @@ mod tests {
             assert_eq!(*page.0.borrow(), ["set_theme", "theme"]);
         }
         assert_eq!(plugin_panels.theme(), PageTheme::from_tokens(&light));
+    }
+
+    /// The editor's text size reaches every host as `--nv-text-size`, survives a colourscheme change, goes away
+    /// again on `None`, and an unchanged size sends nothing.
+    #[test]
+    fn the_editors_text_size_rides_every_theme_and_only_a_change_is_sent() {
+        let scratch = Scratch::new("panels-text-size");
+        let page = Rc::new(Recorded::default());
+        let port = Rc::new(LazyPort::default());
+        *port.0.borrow_mut() = Some(page.clone());
+        let registration = registered(&scratch, "one", false, None);
+        let panel = panel(&registration, port, None);
+        let host = panel.pump.as_ref().unwrap().host.clone();
+        let panels = plugin_panels(vec![panel]);
+        let size = |theme: &PageTheme| {
+            theme
+                .vars()
+                .iter()
+                .find(|(name, _)| name == "--nv-text-size")
+                .map(|(_, value)| value.clone())
+        };
+        assert_eq!(size(&host.theme()), None, "no size until the window gives one");
+
+        panels.set_text_size(Some(56.0 / 3.0 / 1.5));
+        assert_eq!(size(&host.theme()).as_deref(), Some("12.44px"));
+        assert_eq!(
+            size(&panels.theme()).as_deref(),
+            Some("12.44px"),
+            "a page built later starts with it"
+        );
+        assert_eq!(*page.0.borrow(), ["set_theme", "theme"]);
+
+        panels.set_text_size(Some(56.0 / 3.0 / 1.5));
+        assert_eq!(*page.0.borrow(), ["set_theme", "theme"], "the same size sends nothing");
+
+        let light = tokens("light", 0x575279, 0xfaf4ed);
+        panels.set_theme(&light);
+        assert_eq!(
+            size(&host.theme()).as_deref(),
+            Some("12.44px"),
+            "a colourscheme change keeps it"
+        );
+        assert_eq!(
+            host.theme(),
+            PageTheme::from_tokens(&light).with_text_size(Some(56.0 / 3.0 / 1.5))
+        );
+
+        panels.set_text_size(None);
+        assert_eq!(host.theme(), PageTheme::from_tokens(&light), "taken away again");
+        panels.set_theme(&light);
+        assert_eq!(size(&host.theme()), None);
     }
 
     #[test]

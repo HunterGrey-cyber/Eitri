@@ -353,6 +353,22 @@ describe("the reading line shared with nvim", () => {
     expect(p.reservePx()).toBe(window.innerHeight / 4);
   });
 
+  it("follows the page's text size: five lines of it, refreshed when the size changes and nothing else does", () => {
+    root.style.lineHeight = "22px";
+    const p = make();
+    p.onView(view(1, 1));
+    expect(document.documentElement.style.getPropertyValue("--mdp-reserve")).toBe("110px");
+    // A larger editor font: the host's theme event sets the size, the line height follows from it.
+    root.style.lineHeight = "29.34px";
+    expect(document.documentElement.style.getPropertyValue("--mdp-reserve")).toBe("110px");
+    p.onTextSize();
+    expect(document.documentElement.style.getPropertyValue("--mdp-reserve")).toBe("147px");
+    expect(p.reservePx()).toBeCloseTo(146.7, 5);
+    root.style.lineHeight = "22px";
+    p.onTextSize();
+    expect(document.documentElement.style.getPropertyValue("--mdp-reserve")).toBe("110px");
+  });
+
   it("goes to nvim as the reveal's cursor, and a change of the reading line alone sends a reveal", () => {
     const p = make();
     p.onView(view(1, 1, { scrolloff: 0 }));

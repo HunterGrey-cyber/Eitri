@@ -38,5 +38,10 @@ kind = "choice"
 values = ["both", "editor", "off"]
 default = "both"
 
+[settings.font_size]                # CSS px, 9-32; unset = the editor's own text size
+kind = "int"
+min = 9
+max = 32
+
 [net]
 images = "${remote_images}"         # resolves to "https" or "off"

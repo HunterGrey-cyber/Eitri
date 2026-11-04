@@ -1,5 +1,5 @@
 [English](markdown-preview.md) | 简体中文
-<!-- translated-from: markdown-preview.md sha256=9d46586f077a16d5734e77fcdbc85c1057f51cd4089316dae0f2efb2dc6c0606 -->
+<!-- translated-from: markdown-preview.md sha256=d61869fafd87618cf83eeadb591c1c2b77b77d29a1845a85d7fa570d838d6109 -->
 
 # Markdown 预览
 
@@ -125,6 +125,18 @@ eitri.keymap.set("plugin:markdown", "e", "edit.here")
 - 图片文件改动后，要在你切换文档或重新打开预览时才会显示；预览不监视文件。
 
 <a id="settings"></a>
+## 文字大小
+
+预览的文字和编辑器的一样大：就是 Neovim 的 `guifont` 的大小，在屏幕上画出来也一样大，不管桌面的文字缩放是多少。它在你工作时跟着编辑器变：改 `guifont`，或者用 `Ctrl+=` 调整窗口的大小，预览就跟着变。标题、代码和表格与正文保持原来的比例。
+
+要单独调整预览的大小，给它 `font_size`，一个 9 到 32 的整数（单位是页面的像素，和 [`agent.font_size`](configuration.zh-CN.md) 一样）：
+
+```lua
+eitri.plugin.load("markdown", { font_size = 16 })
+```
+
+在[你自己的 Neovim 旁边](#beside-your-own-neovim)的窗口里，Eitri 不知道你终端的字体，所以预览用它自己的大小，14 像素，除非你给了 `font_size`。
+
 ## 设置
 
 | 选项 | 取值 | 默认 | 作用 |
@@ -133,6 +145,7 @@ eitri.keymap.set("plugin:markdown", "e", "edit.here")
 | `auto` | `true` 或 `false` | `false` | 每当一个 Markdown 缓冲区成为当前缓冲区时显示预览 |
 | `remote_images` | `"https"` 或 `"off"` | `"https"` | 加载 `https` 图片，或者一张远程图片都不加载 |
 | `sync` | `"both"`、`"editor"` 或 `"off"` | `"both"` | 双向同步滚动；只由 Neovim 带动预览；或者完全不同步（文字仍然跟着更新） |
+| `font_size` | 一个整数，9 到 32 | 编辑器的文字大小 | 预览文字的大小，单位是像素，不再跟随编辑器的大小 |
 | `position` | `"side"`、`"bottom"` 或 `"main"` | 编辑器右边 | 预览第一次打开的位置 |
 
 ```lua

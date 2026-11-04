@@ -180,7 +180,7 @@ the page's keys, and `j`, `k`, `/` and `f` work as in every plugin page. The not
 | `protocol` | `1` |
 | `site`, `entry` | the directory of the page's files, relative to the plugin, and the page inside it |
 | `capabilities` | the host powers the page may use, from the list below; a verb of any other is refused with `not_declared` |
-| `[settings.<name>]` | an option of `eitri.plugin.load`: `kind = "bool"`, `"choice"` (with `values`, one to eight words) or `"dir"` (a path, created if missing), and a `default` |
+| `[settings.<name>]` | an option of `eitri.plugin.load`: `kind = "bool"`, `"choice"` (with `values`, one to eight words), `"int"` (a whole number, with `min` and `max`; its `default` may be left out, and the option is then unset until `init.lua` gives it a value) or `"dir"` (a path, created if missing), and a `default` |
 | `[module]` | `start` (`"shown"` or `"hidden"` at a first launch), `at` (an [open rule](configuration.md#where-a-new-module-opens) place), `size`, `focus` |
 | `[roots]` | the directories `editor.open`, `editor.assist` and tasks may touch, as `${plugin}` or a `dir` setting |
 | `[tasks.<name>]` | `argv` (the first word `${plugin}/<path>`, a program inside the plugin), `cwd` (inside a root) and `timeout_secs` (`0` for none) |
@@ -222,7 +222,10 @@ The capabilities:
   value 192 KiB, and a plugin keeps at most 64 keys.
 - **Colours and fonts** arrive as `--nv-*` CSS variables on the page's root (`--nv-bg`, `--nv-fg`, `--nv-surface`,
   `--nv-border`, `--nv-link`, `--nv-font-mono`, `--nv-font-prose`, the `--nv-syn-*` syntax colours and more), and
-  change live with your colourscheme. `prefers-color-scheme` follows Eitri's light or dark.
+  change live with your colourscheme. `prefers-color-scheme` follows Eitri's light or dark. A window with an editor of
+  its own also sends `--nv-text-size`, the editor's text size in the page's pixels (for example `18.67px`), which moves
+  with `guifont`; a page that wants its text the editor's size reads `var(--nv-text-size, 14px)`. A window beside your
+  own Neovim sends none.
 - **The keys kit** at `/.eitri/keys.js` gives the page the keys every plugin page shares: `j`/`k` and `d`/`u`
   scroll, `gg`/`G`, `/` finds, `f` labels what can be pressed, `?` lists the keys, `H`/`L` go back and forward.
   `window.eitriKeys.install({rows, run, initial})` adds your rows; `run(action)` returns `true` when it handled the

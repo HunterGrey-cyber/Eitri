@@ -178,6 +178,22 @@ see [Keys in a plugin page](configuration.md#keys-in-a-plugin-page).
   else in the preview uses the network: no fonts, scripts or diagrams are fetched, and links are never prefetched.
 - A changed image file shows when you switch documents or reopen the preview; the preview does not watch files.
 
+## Text size
+
+The preview's text is the size of the editor's: Neovim's `guifont` size, drawn at the same size on screen, whatever your
+desktop's text scaling is. It follows the editor while you work. Change `guifont`, or size the window with `Ctrl+=`,
+and the preview changes with it. Headings, code and tables keep their proportions to the text.
+
+To size the preview on its own, give it `font_size`, a whole number from 9 to 32 (in the page's pixels, as
+[`agent.font_size`](configuration.md) is):
+
+```lua
+eitri.plugin.load("markdown", { font_size = 16 })
+```
+
+In a window [beside your own Neovim](#beside-your-own-neovim) Eitri does not know your terminal's font, so the preview
+keeps a size of its own, 14 pixels, unless you give `font_size`.
+
 ## Settings
 
 | option | values | default | what it does |
@@ -186,6 +202,7 @@ see [Keys in a plugin page](configuration.md#keys-in-a-plugin-page).
 | `auto` | `true` or `false` | `false` | show the preview whenever a Markdown buffer becomes current |
 | `remote_images` | `"https"` or `"off"` | `"https"` | load `https` images, or no remote image at all |
 | `sync` | `"both"`, `"editor"` or `"off"` | `"both"` | scroll together both ways; only Neovim moves the preview; or not at all (the text still follows) |
+| `font_size` | a whole number, 9 to 32 | the editor's text size | the preview's text size in pixels, instead of following the editor's |
 | `position` | `"side"`, `"bottom"` or `"main"` | right of the editor | where the preview first opens |
 
 ```lua

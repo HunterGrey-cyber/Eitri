@@ -5,13 +5,14 @@ import "./style/alerts.css";
 import "./style/chrome.css";
 import { hasPosition, onRestored, onSave, type MarkdownState } from "./handoff";
 import { kit } from "./kit";
-import { bridge, follow, hello, isEditorClosed, isEditorText, isEditorView, readSettings } from "./protocol";
+import { bridge, follow, hello, isEditorClosed, isEditorText, isEditorView, readFontSize, readSettings } from "./protocol";
 import { createMermaid } from "./render/mermaid";
 import { trace } from "./trace";
 import { yankCurrentBlock } from "./view/clipboard";
 import { installKeys } from "./view/keys";
 import { installLinks } from "./view/links";
 import { Preview } from "./view/preview";
+import { applyFontSize } from "./view/text-size";
 
 function hasKeysOf(data: unknown): boolean | undefined {
   return data !== null && typeof data === "object" && typeof (data as { has_keys?: unknown }).has_keys === "boolean"
@@ -42,6 +43,7 @@ async function start(): Promise<void> {
   });
   const h = await hello(b);
   const settings = readSettings(h);
+  applyFontSize(document.documentElement, readFontSize(h));
   const mermaid = createMermaid();
   mermaid.setTheme(h.theme.vars);
   const p = new Preview(root, b, settings, mermaid);
@@ -74,6 +76,7 @@ async function start(): Promise<void> {
     const vars = themeVarsOf(data);
     if (!vars) return;
     mermaid.setTheme(vars);
+    p.onTextSize();
     p.rerender();
   });
   installLinks(p, root);

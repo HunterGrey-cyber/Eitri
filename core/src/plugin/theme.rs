@@ -1,7 +1,9 @@
 //! The window's appearance as a plugin page receives it: the colours, font stacks and colour scheme of
 //! [`ThemeTokens::appearance_vars`], each checked by one grammar ([`page_var_ok`]) before it may reach a
 //! page, either as a `--nv-*` custom property set by the bridge or inside the host's user style sheet.
-//! Sizes are left out on purpose: a page has its own zoom, so a size change tells it nothing.
+//! Sizes are left out of the appearance set on purpose: a page has its own zoom, so a size change tells it nothing.
+//! The one size a page may be given is [`TEXT_SIZE_VAR`], the editor's own text size, which only a window with an
+//! editor of its own adds ([`PageTheme::with_text_size`]).
 
 use serde_json::{Map, Value};
 
@@ -11,6 +13,11 @@ use crate::theme::tokens::{ThemeTokens, FONT_FAMILY_MAX_CHARS, FONT_LIST_MAX_CHA
 const NAME_MAX_CHARS: usize = 64;
 /// Longest bare (unquoted) font family, such as `system-ui`.
 const BARE_FAMILY_MAX_CHARS: usize = 40;
+
+/// The custom property that carries the editor's text size, in the page's CSS px, to a page that wants its prose
+/// the editor's size. It is not part of `ThemeTokens::appearance_vars`: a window without an editor of its own
+/// (one beside a person's terminal) has no such size to give, and a page without it keeps its own.
+pub const TEXT_SIZE_VAR: &str = "--nv-text-size";
 
 /// The appearance set a plugin page is given, already checked, and the background its view shows before
 /// the page paints.
@@ -44,6 +51,20 @@ impl PageTheme {
     /// The set for the fallback tokens: what a page has before the editor reported its colorscheme.
     pub fn fallback() -> PageTheme {
         PageTheme::from_tokens(&ThemeTokens::fallback())
+    }
+
+    /// This set with [`TEXT_SIZE_VAR`] set to `css_px` (rounded to two decimals), or taken out for `None`. A size
+    /// that is not a finite number of at least 1 and under 1000 is taken out too: the page then keeps its own.
+    pub fn with_text_size(mut self, css_px: Option<f32>) -> PageTheme {
+        self.vars.retain(|(name, _)| name != TEXT_SIZE_VAR);
+        if let Some(px) = css_px.filter(|px| px.is_finite() && (1.0..1000.0).contains(px)) {
+            // `{}` on an `f32` prints `14`, not `14.0`, so the common case reads as it was typed.
+            let value = format!("{}px", (px * 100.0).round() / 100.0);
+            if page_var_ok(TEXT_SIZE_VAR, &value) {
+                self.vars.push((TEXT_SIZE_VAR.to_string(), value));
+            }
+        }
+        self
     }
 
     pub fn vars(&self) -> &[(String, String)] {
@@ -88,8 +109,9 @@ impl PageTheme {
 ///
 /// The name is `--nv-` and dash-separated groups of lowercase ASCII letters and digits, at most 64
 /// characters. Its shape decides the value's kind, so nothing has to list the set: `--nv-color-scheme` is
-/// `light` or `dark`, a name starting `--nv-font-` is a font list, and every other name is a `#rrggbb`
-/// colour in lowercase hex. Lengths count Unicode scalar values.
+/// `light` or `dark`, a name starting `--nv-font-` is a font list, a name ending `-size` is a length in whole or
+/// hundredths of CSS px (`14px`, `18.67px`), and every other name is a `#rrggbb` colour in lowercase hex.
+/// Lengths count Unicode scalar values.
 pub fn page_var_ok(name: &str, value: &str) -> bool {
     if !name_ok(name) {
         return false;
@@ -98,9 +120,24 @@ pub fn page_var_ok(name: &str, value: &str) -> bool {
         value == "light" || value == "dark"
     } else if name.starts_with("--nv-font-") {
         font_list_ok(value)
+    } else if name.ends_with("-size") {
+        size_ok(value)
     } else {
         colour_ok(value)
     }
+}
+
+/// `<1 to 3 digits, no leading zero>[.<1 or 2 digits>]px`.
+fn size_ok(value: &str) -> bool {
+    let Some(number) = value.strip_suffix("px") else {
+        return false;
+    };
+    let (whole, fraction) = match number.split_once('.') {
+        Some((whole, fraction)) => (whole, Some(fraction)),
+        None => (number, None),
+    };
+    let digits = |text: &str, most: usize| (1..=most).contains(&text.len()) && text.bytes().all(|b| b.is_ascii_digit());
+    digits(whole, 3) && !whole.starts_with('0') && fraction.is_none_or(|f| digits(f, 2))
 }
 
 fn name_ok(name: &str) -> bool {
@@ -364,6 +401,63 @@ mod tests {
         after.editor_row_px = Some(30.0);
         after.editor_cmd_rows = Some(3);
         assert_eq!(PageTheme::from_tokens(&before), PageTheme::from_tokens(&after));
+    }
+
+    #[test]
+    fn the_editors_text_size_is_one_more_var_and_only_when_given() {
+        let base = PageTheme::fallback();
+        assert_eq!(base.clone().with_text_size(None), base);
+        let sized = base.clone().with_text_size(Some(18.0));
+        assert_eq!(sized.vars().len(), base.vars().len() + 1);
+        assert!(sized.vars().contains(&(TEXT_SIZE_VAR.to_string(), "18px".to_string())));
+        assert!(sized.vars().iter().all(|(name, value)| page_var_ok(name, value)));
+        let again = sized.clone().with_text_size(Some(56.0 / 3.0));
+        assert!(again
+            .vars()
+            .contains(&(TEXT_SIZE_VAR.to_string(), "18.67px".to_string())));
+        assert_eq!(again.vars().iter().filter(|(n, _)| n == TEXT_SIZE_VAR).count(), 1);
+        assert_eq!(sized.with_text_size(None), base, "taking it out restores the set");
+        for bad in [f32::NAN, f32::INFINITY, -3.0, 0.0, 0.5, 1000.0, 1e9] {
+            assert_eq!(base.clone().with_text_size(Some(bad)), base, "{bad}");
+        }
+        assert_one_root_rule(&base.with_text_size(Some(12.5)).user_style_sheet());
+    }
+
+    #[test]
+    fn a_size_name_takes_a_length_and_nothing_else() {
+        for ok in ["14px", "9px", "18.67px", "32.5px", "999.99px", "1px"] {
+            assert!(page_var_ok("--nv-text-size", ok), "{ok}");
+        }
+        for bad in [
+            "",
+            "14",
+            "px",
+            "14 px",
+            "14PX",
+            "14em",
+            "014px",
+            "0px",
+            "1000px",
+            "14.px",
+            ".5px",
+            "14.123px",
+            "-14px",
+            "+14px",
+            "1e1px",
+            "#14161b",
+            "14px;",
+            "14px}",
+            "calc(1px)",
+            "14px ",
+            " 14px",
+            "１４px",
+        ] {
+            assert!(!page_var_ok("--nv-text-size", bad), "{bad:?}");
+        }
+        assert!(
+            !page_var_ok("--nv-bg", "14px"),
+            "a name that does not end -size is a colour"
+        );
     }
 
     #[test]

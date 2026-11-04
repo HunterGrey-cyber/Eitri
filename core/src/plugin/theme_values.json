@@ -89,6 +89,16 @@
       "id": "other-font-name",
       "name": "--nv-font-other",
       "value": "serif"
+    },
+    {
+      "id": "size-whole",
+      "name": "--nv-text-size",
+      "value": "14px"
+    },
+    {
+      "id": "size-hundredths",
+      "name": "--nv-text-size",
+      "value": "18.67px"
     }
   ],
   "refused": [
@@ -439,6 +449,42 @@
       "name": "--nv-font-mono",
       "value": "inherit; color: red",
       "why": "separator"
+    },
+    {
+      "id": "size-no-unit",
+      "name": "--nv-text-size",
+      "value": "14",
+      "why": "value"
+    },
+    {
+      "id": "size-em",
+      "name": "--nv-text-size",
+      "value": "1em",
+      "why": "value"
+    },
+    {
+      "id": "size-leading-zero",
+      "name": "--nv-text-size",
+      "value": "014px",
+      "why": "value"
+    },
+    {
+      "id": "size-three-decimals",
+      "name": "--nv-text-size",
+      "value": "14.123px",
+      "why": "value"
+    },
+    {
+      "id": "size-calc",
+      "name": "--nv-text-size",
+      "value": "calc(1px)",
+      "why": "refused character"
+    },
+    {
+      "id": "size-name-takes-no-colour",
+      "name": "--nv-text-size",
+      "value": "#14161b",
+      "why": "value"
     }
   ]
 }

@@ -3,7 +3,7 @@ import { dirname, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import { afterEach, describe, expect, it } from "vitest";
 import {
-  bridge, follow, hello, isEditorClosed, isEditorText, isEditorView, isHello, jump, openLink, readSettings, reveal,
+  bridge, follow, hello, isEditorClosed, isEditorText, isEditorView, isHello, jump, openLink, readSettings, readFontSize, reveal,
   type Bridge,
 } from "./protocol";
 
@@ -41,6 +41,19 @@ describe("hello", () => {
     expect(readSettings(await hello(b))).toEqual({ auto: true, remote_images: "off", sync: "editor" });
     const bad = fakeBridge({ "host.hello": { ...base, settings: { auto: "yes", remote_images: "http", sync: 3 } } });
     expect(readSettings(await hello(bad.b))).toEqual({ auto: false, remote_images: "https", sync: "both" });
+  });
+  it("reads font_size as a whole number in range, else as unset", async () => {
+    const base = fixture("rep-hello.json").result;
+    const size = async (value: unknown) => readFontSize(await hello(fakeBridge({ "host.hello": { ...base, settings: { font_size: value } } }).b));
+    expect(await size(9)).toBe(9);
+    expect(await size(16)).toBe(16);
+    expect(await size(32)).toBe(32);
+    for (const bad of [8, 33, 0, -14, 14.5, "16", true, null, Number.NaN, Number.POSITIVE_INFINITY]) expect(await size(bad), String(bad)).toBeNull();
+    expect(readFontSize(await hello(fakeBridge({ "host.hello": base }).b))).toBeNull();
+    // A number beside the other settings costs none of them.
+    const mixed = await hello(fakeBridge({ "host.hello": { ...base, settings: { auto: true, sync: "off", font_size: 18 } } }).b);
+    expect(readSettings(mixed)).toEqual({ auto: true, remote_images: "https", sync: "off" });
+    expect(readFontSize(mixed)).toBe(18);
   });
   it("hands the kit's settings through as the host sent them", async () => {
     const result = fixture("rep-hello.json").result;

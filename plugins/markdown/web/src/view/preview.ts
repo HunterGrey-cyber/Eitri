@@ -391,6 +391,9 @@ export class Preview {
   private applyReserve(): void {
     document.documentElement.style.setProperty("--mdp-reserve", `${Math.round(this.reservePx())}px`);
   }
+  /** The page's text size moved (the host's `--nv-text-size` arrives in a theme event): the reserve is lines of that
+   *  text, and nothing else about the page need have changed, so nothing else would refresh it. */
+  onTextSize(): void { this.applyReserve(); }
   private notify(why: UpdateReason): void { for (const fn of [...this.listeners]) fn(why); }
   private setNotice(text: string): void { this.notice.textContent = text; if (text) trace("notice", { text }); }
 
