@@ -1,5 +1,5 @@
 [English](markdown-preview.md) | 简体中文
-<!-- translated-from: markdown-preview.md sha256=d61869fafd87618cf83eeadb591c1c2b77b77d29a1845a85d7fa570d838d6109 -->
+<!-- translated-from: markdown-preview.md sha256=c61fad443bea6336fe17c62b23edc252dc6c432e5729b3dde3874e310979622d -->
 
 # Markdown 预览
 
@@ -127,7 +127,7 @@ eitri.keymap.set("plugin:markdown", "e", "edit.here")
 <a id="settings"></a>
 ## 文字大小
 
-预览的文字和编辑器的一样大：就是 Neovim 的 `guifont` 的大小，在屏幕上画出来也一样大，不管桌面的文字缩放是多少。它在你工作时跟着编辑器变：改 `guifont`，或者用 `Ctrl+=` 调整窗口的大小，预览就跟着变。标题、代码和表格与正文保持原来的比例。
+预览的文字和编辑器的一样大：就是 Neovim 的 `guifont` 的大小，在屏幕上画出来也一样大。它在你工作时跟着编辑器变：改 `guifont`，或者用 `Ctrl+=` 调整窗口的大小，预览就跟着变。标题、代码和表格与正文保持原来的比例。
 
 要单独调整预览的大小，给它 `font_size`，一个 9 到 32 的整数（单位是页面的像素，和 [`agent.font_size`](configuration.zh-CN.md) 一样）：
 

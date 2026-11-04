@@ -180,8 +180,7 @@ see [Keys in a plugin page](configuration.md#keys-in-a-plugin-page).
 
 ## Text size
 
-The preview's text is the size of the editor's: Neovim's `guifont` size, drawn at the same size on screen, whatever your
-desktop's text scaling is. It follows the editor while you work. Change `guifont`, or size the window with `Ctrl+=`,
+The preview's text is the size of the editor's: Neovim's `guifont` size, drawn at the same size on screen. It follows the editor while you work. Change `guifont`, or size the window with `Ctrl+=`,
 and the preview changes with it. Headings, code and tables keep their proportions to the text.
 
 To size the preview on its own, give it `font_size`, a whole number from 9 to 32 (in the page's pixels, as

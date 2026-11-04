@@ -2,8 +2,8 @@
 //! [`ThemeTokens::appearance_vars`], each checked by one grammar ([`page_var_ok`]) before it may reach a
 //! page, either as a `--nv-*` custom property set by the bridge or inside the host's user style sheet.
 //! Sizes are left out of the appearance set on purpose: a page has its own zoom, so a size change tells it nothing.
-//! The one size a page may be given is [`TEXT_SIZE_VAR`], the editor's own text size, which only a window with an
-//! editor of its own adds ([`PageTheme::with_text_size`]).
+//! The one size a page may be given is [`TEXT_SIZE_VAR`], the editor's own text size, which every Eitri window but one
+//! beside a person's own Neovim adds ([`PageTheme::with_text_size`]).
 
 use serde_json::{Map, Value};
 
@@ -15,8 +15,9 @@ const NAME_MAX_CHARS: usize = 64;
 const BARE_FAMILY_MAX_CHARS: usize = 40;
 
 /// The custom property that carries the editor's text size, in the page's CSS px, to a page that wants its prose
-/// the editor's size. It is not part of `ThemeTokens::appearance_vars`: a window without an editor of its own
-/// (one beside a person's terminal) has no such size to give, and a page without it keeps its own.
+/// the editor's size. It is not part of `ThemeTokens::appearance_vars`: a window beside a person's own
+/// Neovim (a terminal) has no Eitri editor font to give, and a page without it keeps its own. Every other Eitri window
+/// gives it (window 2 and a page window follow window 1's `guifont`).
 pub const TEXT_SIZE_VAR: &str = "--nv-text-size";
 
 /// The appearance set a plugin page is given, already checked, and the background its view shows before

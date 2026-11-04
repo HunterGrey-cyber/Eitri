@@ -23,8 +23,8 @@
     return e;
   }
 
-  // The theme the host hands every page: the user's colours and font lists, and from a window with an editor of its
-  // own the editor's text size, set as custom properties on the root so a page reads them with var(). Each value is
+  // The theme the host hands every page: the user's colours and font lists, and, from every Eitri window except one
+  // beside a person's own Neovim, the editor's text size, set as custom properties on the root so a page reads them with var(). Each value is
   // checked again here with the host's own rule.
   var THEME_NAME = /^--nv-[a-z0-9]+(?:-[a-z0-9]+)*$/u;
   var THEME_COLOUR = /^#[0-9a-f]{6}$/u;

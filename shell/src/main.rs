@@ -2508,7 +2508,8 @@ fn build_ui(
                     text_size_controller.set_base(base);
                 }
                 if moved.is_some() && pages_follow_editor_text {
-                    plugin_panels.set_text_size(Some(font.css_px()));
+                    // Stored only: the `set_theme` below sends it with the colours, one event for both.
+                    plugin_panels.store_text_size(Some(font.css_px()));
                 }
             }
             let tokens = eitri_core::theme::ThemeTokens::derive(&payload);
@@ -2544,8 +2545,9 @@ fn build_ui(
                 }
             }
             // The derived tokens, not the panel's sized ones: the panel's size is not a page's, so a change of it
-            // alone leaves the set equal and sends the pages nothing. The editor's own size reaches them through
-            // `set_text_size`, above and on a desktop text-scaling change.
+            // alone leaves the set equal and sends the pages nothing. The editor's own size rides this same call
+            // (`store_text_size`, above) and reaches them alone through `set_text_size` on a desktop text-scaling
+            // change.
             plugin_panels.set_theme(&tokens);
         })
     };

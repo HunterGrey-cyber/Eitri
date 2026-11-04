@@ -708,10 +708,13 @@ pub fn parse_manifest(text: &str) -> Result<Manifest, String> {
                 SettingKind::Choice(values.clone())
             }
             "int" => match (setting.min, setting.max) {
-                (Some(min), Some(max))
-                    if !(-MAX_SAFE_INT..=MAX_SAFE_INT).contains(&min)
-                        || !(-MAX_SAFE_INT..=MAX_SAFE_INT).contains(&max) =>
-                {
+                (Some(min), Some(max)) if !(-MAX_SAFE_INT..=MAX_SAFE_INT).contains(&min) => {
+                    return fail(
+                        &format!("settings.{name}.min"),
+                        format!("min and max are within +-{MAX_SAFE_INT}, which a page reads back unchanged"),
+                    );
+                }
+                (Some(_), Some(max)) if !(-MAX_SAFE_INT..=MAX_SAFE_INT).contains(&max) => {
                     return fail(
                         &format!("settings.{name}.max"),
                         format!("min and max are within +-{MAX_SAFE_INT}, which a page reads back unchanged"),
@@ -1364,17 +1367,17 @@ layout = { row = [ { module = "page", share = 0.42 }, { column = [ { module = "e
             ),
             (
                 "kind = 'int'\nmin = 9007199254740993\nmax = 9007199254740993\ndefault = 9007199254740993",
-                "settings.size.max",
+                "settings.size.min",
                 "page reads back unchanged",
             ),
             (
                 "kind = 'int'\nmin = -9007199254740993\nmax = 5",
-                "settings.size.max",
+                "settings.size.min",
                 "page reads back unchanged",
             ),
             (
                 "kind = 'int'\nmin = -9223372036854775808\nmax = 0\ndefault = -9007199254740993",
-                "settings.size.max",
+                "settings.size.min",
                 "page reads back unchanged",
             ),
             (

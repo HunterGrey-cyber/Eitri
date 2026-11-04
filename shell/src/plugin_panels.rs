@@ -1410,10 +1410,16 @@ impl PluginPanels {
         self.send_theme(PageTheme::from_tokens(tokens).with_text_size(self.text_px.get()));
     }
 
+    /// Remembers the editor's text size without sending anything: for a caller that calls [`Self::set_theme`] next, so
+    /// a payload that moves the size and the colourscheme together reaches the pages as one theme event, not two.
+    pub(crate) fn store_text_size(&self, css_px: Option<f32>) {
+        self.text_px.set(css_px);
+    }
+
     /// The editor's text size in the pages' CSS px (`EditorFont::css_px`), which a page that wants its prose the
     /// editor's size reads as `--nv-text-size`; `None` takes it away. Sent on a change only, like any theme.
     pub(crate) fn set_text_size(&self, css_px: Option<f32>) {
-        self.text_px.set(css_px);
+        self.store_text_size(css_px);
         let theme = self.theme.borrow().clone().with_text_size(css_px);
         self.send_theme(theme);
     }
@@ -1927,6 +1933,26 @@ mod tests {
         assert_eq!(host.theme(), PageTheme::from_tokens(&light), "taken away again");
         panels.set_theme(&light);
         assert_eq!(size(&host.theme()), None);
+    }
+
+    /// A payload that moves the guifont and the colourscheme together is one `theme` event to a page, not two (each
+    /// one re-renders the page and its diagrams): the size is stored, and the colour call sends both.
+    #[test]
+    fn a_size_stored_before_a_theme_goes_out_with_it_in_one_event() {
+        let scratch = Scratch::new("panels-text-size-one-event");
+        let page = Rc::new(Recorded::default());
+        let port = Rc::new(LazyPort::default());
+        *port.0.borrow_mut() = Some(page.clone());
+        let registration = registered(&scratch, "one", false, None);
+        let panel = panel(&registration, port, None);
+        let host = panel.pump.as_ref().unwrap().host.clone();
+        let panels = plugin_panels(vec![panel]);
+        let light = tokens("light", 0x575279, 0xfaf4ed);
+        panels.store_text_size(Some(24.0));
+        assert!(page.0.borrow().is_empty(), "storing sends nothing");
+        panels.set_theme(&light);
+        assert_eq!(*page.0.borrow(), ["set_theme", "theme"], "one event for both");
+        assert_eq!(host.theme(), PageTheme::from_tokens(&light).with_text_size(Some(24.0)));
     }
 
     #[test]

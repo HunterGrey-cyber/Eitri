@@ -222,8 +222,8 @@ The capabilities:
   value 192 KiB, and a plugin keeps at most 64 keys.
 - **Colours and fonts** arrive as `--nv-*` CSS variables on the page's root (`--nv-bg`, `--nv-fg`, `--nv-surface`,
   `--nv-border`, `--nv-link`, `--nv-font-mono`, `--nv-font-prose`, the `--nv-syn-*` syntax colours and more), and
-  change live with your colourscheme. `prefers-color-scheme` follows Eitri's light or dark. A window with an editor of
-  its own also sends `--nv-text-size`, the editor's text size in the page's pixels (for example `18.67px`), which moves
+  change live with your colourscheme. `prefers-color-scheme` follows Eitri's light or dark. Every Eitri window except one beside
+  your own Neovim also sends `--nv-text-size`, the editor's text size in the page's pixels (for example `18.67px`), which moves
   with `guifont`; a page that wants its text the editor's size reads `var(--nv-text-size, 14px)`. A window beside your
   own Neovim sends none.
 - **The keys kit** at `/.eitri/keys.js` gives the page the keys every plugin page shares: `j`/`k` and `d`/`u`

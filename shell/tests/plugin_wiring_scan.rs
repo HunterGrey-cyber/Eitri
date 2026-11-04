@@ -192,8 +192,8 @@ fn the_pages_are_told_the_editors_text_size_except_beside_a_persons_nvim() {
     assert!(first < built, "before any page is built");
     let body = let_block(&code, "letapply_theme:");
     let size = body
-        .find("plugin_panels.set_text_size(Some(font.css_px()));")
-        .expect("a guifont change reaches the pages");
+        .find("plugin_panels.store_text_size(Some(font.css_px()));")
+        .expect("a guifont change reaches the pages, stored for the theme call that follows");
     let theme = body.find("plugin_panels.set_theme(&tokens);").unwrap();
     assert!(
         size < theme,
