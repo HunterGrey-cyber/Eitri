@@ -53,6 +53,9 @@ export interface EditorView {
   /** The screen row (one-based, from the top of nvim's grid) on which the cursor's line starts; an older host sends
    *  none. */
   cursor_row?: number;
+  /** The share of the editor's height above its grid's first row (the part of a cell the grid does not fill, which
+   *  the editor leaves at the top); only from a host that draws nvim's grid itself. */
+  grid_top?: number;
 }
 
 export interface TooLarge {
@@ -180,6 +183,8 @@ export function isEditorView(v: unknown): v is EditorView {
   if (v.scrolloff !== undefined && !isCount(v.scrolloff)) return false;
   if (v.rows !== undefined && !isCount(v.rows)) return false;
   if (v.cursor_row !== undefined && !isCount(v.cursor_row)) return false;
+  const g = v.grid_top;
+  if (g !== undefined && (typeof g !== "number" || !Number.isFinite(g) || g < 0 || g >= 1)) return false;
   return v.doc === null || isDoc(v.doc);
 }
 

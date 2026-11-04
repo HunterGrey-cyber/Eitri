@@ -57,6 +57,16 @@ describe("one line at the same height on both sides", () => {
     expect(rowAt(-30, 400, 40)).toBe(1);
     expect(rowAt(500, 400, 40)).toBe(40);
   });
+  it("puts nvim's rows below the part of a cell the editor leaves above its grid, both ways", () => {
+    // A 1000 px editor with a 25 px cell and 39 rows leaves 25 px above the grid: a share of 0.025.
+    const top = 25 / 1000;
+    expect(rowShare(1, 39, top)).toBeCloseTo(0.025, 10);
+    expect(rowShare(2, 39, top)).toBeCloseTo(0.05, 10);
+    expect(rowShare(39, 39, top)).toBeCloseTo(0.975, 10);
+    for (const row of [1, 7, 23, 39]) expect(rowAt(rowShare(row, 39, top) * 1000, 1000, 39, top)).toBe(row);
+    // Without it, the share is the rows' alone: the first row a whole remainder high.
+    expect(rowShare(1, 39) * 1000).toBe(0);
+  });
 });
 
 describe("preview to editor", () => {

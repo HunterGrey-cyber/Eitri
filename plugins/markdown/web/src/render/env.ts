@@ -4,6 +4,8 @@ export type { DocPrefixes } from "../protocol";
 
 /** The attribute that marks an element the renderer made, as against one the document wrote. */
 export const NONCE_ATTR = "data-eitri-n";
+/** On a fenced code block: how many lines of code it holds, the lines after its opening fence line. */
+export const FENCE_ATTR = "data-eitri-fence";
 
 export type BlockReason = "http" | "remote_off" | "outside" | "unsaved";
 

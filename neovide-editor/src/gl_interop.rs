@@ -435,6 +435,13 @@ pub(crate) fn grid_layout(
     }
 }
 
+/// `band_top_px` as a share of the framebuffer's height `fb_h` (device px, as `grid_layout` is
+/// given it): in `[0, 1)`, or `None` for an empty framebuffer or a value that is not finite.
+pub(crate) fn band_share(band_top_px: f32, fb_h: i32) -> Option<f64> {
+    let share = f64::from(band_top_px) / f64::from(fb_h);
+    (fb_h > 0 && share.is_finite() && (0.0..1.0).contains(&share)).then_some(share)
+}
+
 /// Whether two grid scales are the same cell, compared by bits. `GridScale` has no `PartialEq`,
 /// and a plain f32 `!=` would call a NaN cell (before nvim reports a font) "changed" on every
 /// frame -- the render callback would then ask for another frame forever, an idle-CPU
@@ -725,6 +732,21 @@ mod snap_tests {
                 ((r.max.y - r.min.y) / scale.height()).floor() as u32,
             )
         }
+    }
+
+    /// The band above the grid as a share of the framebuffer's height: what a host beside the
+    /// editor takes off to put nvim's rows at their heights. Nothing for an empty framebuffer.
+    #[test]
+    fn band_share_is_the_band_over_the_height() {
+        let scale = GridScale::new(PixelSize::new(20.0, 44.0));
+        let layout = grid_layout(1400, 1598, scale, divide(scale));
+        assert_eq!(
+            band_share(layout.band_top_px, 1598),
+            Some(f64::from(1598.0_f32 % 44.0) / 1598.0)
+        );
+        assert_eq!(band_share(0.0, 1320), Some(0.0));
+        assert_eq!(band_share(0.0, 0), None);
+        assert_eq!(band_share(f32::NAN, 100), None);
     }
 
     /// The grid's rows exactly fill the snapped region, with unused space above rather than

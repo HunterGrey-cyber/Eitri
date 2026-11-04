@@ -3618,6 +3618,12 @@ fn build_ui(
         }
         onboarding_host.set_editor(editor_rpc.clone());
         plugin_panels.set_editor(editor_rpc);
+        // A page beside the editor maps nvim's screen rows to heights; the editor leaves the part of a cell its
+        // height does not fill above the grid.
+        if let Some(pane) = &pane {
+            let pane = Rc::downgrade(pane);
+            plugin_panels.set_grid_top(Rc::new(move || pane.upgrade().and_then(|p| p.grid_top_share())));
+        }
         if let Some(two) = &window2_editor {
             plugin_panels.set_link_editor(two.ops());
             agent_panel_handle.set_editor_way(Rc::new(two.ops().editor_way(project_root)));

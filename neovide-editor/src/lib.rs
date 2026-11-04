@@ -709,6 +709,8 @@ pub struct NeovideEditorPane {
     scale_watch: Rc<ScaleWatch>,
     /// See [`NeovideEditorPane::connect_cell_size_changed`].
     cell_size_callback: CellSizeCallbackSlot,
+    /// See [`NeovideEditorPane::grid_top_share`]. Written by the render callback.
+    grid_top_share: Rc<Cell<Option<f64>>>,
     /// See [`NeovideEditorPane::on_start_failed`].
     start_failed_callback: StartFailedCallbackSlot,
     /// See [`NeovideEditorPane::on_session_ready`].
@@ -1396,6 +1398,7 @@ impl NeovideEditorPane {
         // fullscreen hears the new nvim's `false`.
         let last_fullscreen_setting: Rc<Cell<bool>> = Rc::new(Cell::new(false));
         let cell_size_callback: CellSizeCallbackSlot = Rc::new(RefCell::new(None));
+        let grid_top_share: Rc<Cell<Option<f64>>> = Rc::new(Cell::new(None));
         let start_failed_callback: StartFailedCallbackSlot = Rc::new(RefCell::new(None));
         let session_ready_callback: SessionReadyCallbackSlot = Rc::new(RefCell::new(None));
         // Set the first time the `Failed` arm below actually paints `FAILED_COLOR` and the message
@@ -1594,6 +1597,7 @@ impl NeovideEditorPane {
             let tick_driver_for_render = tick_driver.clone();
             let fb_size = fb_size.clone();
             let cell_size_callback_for_render = cell_size_callback.clone();
+            let grid_top_share_for_render = grid_top_share.clone();
             let last_cell_size = last_cell_size.clone();
             let start_failed_callback_for_render = start_failed_callback.clone();
             let session_ready_callback_for_render = session_ready_callback.clone();
@@ -1960,6 +1964,7 @@ impl NeovideEditorPane {
                             grid_size_for_content_region(&session.harness, r)
                         });
                         session.log_layout_if_changed(fb_w, fb_h, snapped_scale, &layout);
+                        grid_top_share_for_render.set(gl_interop::band_share(layout.band_top_px, fb_h));
                         let animating = session.harness.render_frame(canvas, Some(&layout.region), dt);
                         if let Some(log) = widget
                             .downcast_ref::<editor_area::EditorGlArea>()
@@ -2460,6 +2465,7 @@ impl NeovideEditorPane {
             scale_factor_callback,
             scale_watch,
             cell_size_callback,
+            grid_top_share,
             start_failed_callback,
             session_ready_callback,
             key_activity,
@@ -2867,6 +2873,14 @@ impl NeovideEditorPane {
         let scale = session.harness.grid_scale();
         let factor = self.shared.device_scale();
         Some((f64::from(scale.width()) / factor, f64::from(scale.height()) / factor))
+    }
+
+    /// The share of the editor's height above its grid's first row, as last drawn: the part of a cell
+    /// the height does not fill, which the snap leaves at the top (`gl_interop::snap_region_to_grid`).
+    /// A host that maps nvim's screen rows to heights beside the editor (a plugin page placing the
+    /// line nvim's cursor is on) takes it off. `None` before the first frame with a grid.
+    pub fn grid_top_share(&self) -> Option<f64> {
+        self.grid_top_share.get()
     }
 
     /// Registers `callback`, called with `(width, height)` in logical px -- the same numbers

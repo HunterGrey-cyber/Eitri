@@ -63,16 +63,18 @@ export function placeLine(index: Box[], L: number, share: number, view: number, 
   return Math.min(Math.max(0, lineToY(index, L, Number.POSITIVE_INFINITY) - share * view), Math.max(0, scrollMax));
 }
 
-/** The share of nvim's screen above the start of screen row `row` (one-based) of `rows`: the same share of the view
- *  is where the line on that row goes. */
-export function rowShare(row: number, rows: number): number {
-  return Math.min(Math.max(0, (row - 1) / rows), 1);
+/** The share of the editor's height above the start of screen row `row` (one-based) of nvim's `rows`: the same share
+ *  of the view is where the line on that row goes. `gridTop` is the share above the grid's first row (the editor
+ *  leaves the part of a cell its height does not fill at the top), so the rows share what is below it. */
+export function rowShare(row: number, rows: number, gridTop = 0): number {
+  return Math.min(Math.max(0, gridTop + ((1 - gridTop) * (row - 1)) / rows), 1);
 }
 
-/** The screen row (one-based) of nvim's `rows` that starts the same share down nvim's screen as view y `y` is down a
- *  view `view` px high; the inverse of `rowShare`, to the nearest row and within the screen. */
-export function rowAt(y: number, view: number, rows: number): number {
-  return Math.min(Math.max(1, 1 + Math.round((y / view) * rows)), rows);
+/** The screen row (one-based) of nvim's `rows` that starts the same share down the editor as view y `y` is down a
+ *  view `view` px high; the inverse of `rowShare` (with the same `gridTop`), to the nearest row and within the
+ *  screen. */
+export function rowAt(y: number, view: number, rows: number, gridTop = 0): number {
+  return Math.min(Math.max(1, 1 + Math.round(((y / view - gridTop) / (1 - gridTop)) * rows)), rows);
 }
 
 /** How far from a whole pixel an offset may be and still be taken for it: far above floating-point rounding at any

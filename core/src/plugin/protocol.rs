@@ -713,6 +713,10 @@ pub struct EditorView {
     /// The first screen row of the cursor line, counted from the top of the grid.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cursor_row: Option<u64>,
+    /// The share of the editor's height above the grid's first row, in `[0, 1)`: the part of a cell the editor
+    /// leaves at the top. Only from a window that draws nvim's grid itself.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub grid_top: Option<f64>,
 }
 
 /// Why a document was not sent: its size and the caps it went over.
@@ -1258,11 +1262,12 @@ mod tests {
         assert!(written.get("token").is_none(), "no token on a user view");
         assert_eq!(user.scrolloff, None, "an older view has no scrolloff");
         assert!(written.get("scrolloff").is_none(), "no scrolloff written when unknown");
-        for key in ["rows", "cursor_row"] {
+        for key in ["rows", "cursor_row", "grid_top"] {
             assert!(written.get(key).is_none(), "no {key} written when unknown");
         }
         assert_eq!(user.rows, None);
         assert_eq!(user.cursor_row, None);
+        assert_eq!(user.grid_top, None);
         data.as_object_mut().unwrap().remove("doc");
         assert!(serde_json::from_value::<EditorView>(data).is_err(), "doc is required");
         let view: EditorView = serde_json::from_value(fixture("ev-editor-view.json")["data"].clone()).unwrap();
@@ -1277,6 +1282,7 @@ mod tests {
         assert_eq!(view.scrolloff, Some(4));
         assert_eq!(view.rows, Some(46));
         assert_eq!(view.cursor_row, Some(7));
+        assert_eq!(view.grid_top, Some(0.0125));
     }
 
     #[test]

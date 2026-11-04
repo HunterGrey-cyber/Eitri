@@ -74,13 +74,31 @@ div.mdp-box {
   overflow-x: auto;
 }
 
-/* The bars in the left margin: nvim's cursor line while nvim leads, the reading position's block while the preview
-   has the keys. Placed by the page in document coordinates. */
+/* The bars in the left margin: nvim's cursor line while nvim leads, the preview's cursor row and its block while the
+   preview has the keys. Placed by the page in document coordinates. */
 .mdp-cursor-bar, .mdp-current-bar {
   position: absolute;
   width: 3px;
   border-radius: 1px;
   pointer-events: none;
+}
+
+/* The cursor's row band, nvim's CursorLine colour across the text. It lies over the text, so it blends: on a dark
+   scheme only what is darker than the band (the background) takes its colour, on a light one only what is lighter,
+   and the text keeps its own colour either way. The page sets data-scheme from --nv-color-scheme. */
+.mdp-cursor-line {
+  position: absolute;
+  pointer-events: none;
+  background-color: var(--nv-cursorline);
+  mix-blend-mode: lighten;
+}
+
+.mdp-cursor-line[data-scheme="light"] {
+  mix-blend-mode: darken;
+}
+
+.mdp-cursor-line[hidden] {
+  display: none;
 }
 
 .mdp-cursor-bar {

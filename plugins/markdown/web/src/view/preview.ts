@@ -5,7 +5,8 @@ import { renderDocument } from "../render/pipeline";
 import { kit } from "../kit";
 import { trace } from "../trace";
 import { ScrollGuard } from "./anchor";
-import { clickedRecently, lineAt, pickBlock } from "./current";
+import { boxAt, clickedRecently, lineAt, pickBlock, pickedLine } from "./current";
+import { RowCache, rowsIn, type Row } from "./rows";
 import { buildIndex, lastLineAtOrBefore, lastTopAtOrBefore, measure, type Box } from "./lineindex";
 import { blockedText, BUFFER_CLOSED_TEXT, EDITOR_CLOSED_TEXT, EMPTY_TEXT, tooLargeText } from "./notices";
 import {
@@ -16,7 +17,7 @@ import { applyUpdate } from "./update";
 
 /** Why the listeners of `afterUpdate` are called: what depends on the rendered text (the kit's find) waits for
  *  `render`, what depends on the position or the keys (the HUD, the current block) follows every reason. */
-export type UpdateReason = "render" | "view" | "scroll" | "anchor" | "focus" | "notice";
+export type UpdateReason = "render" | "view" | "scroll" | "anchor" | "focus" | "notice" | "cursor";
 
 /* What is on the page: the buffer and tick it came from, the lines it was rendered from (what a yank copies), how
    many images it does not show, and the document route it was rendered with. */
@@ -34,6 +35,14 @@ const RESERVE_SHARE = 1 / 4;
 const FALLBACK_LINE_PX = 22;
 /** How long an edit jump owns nvim's cursor while the keys move to nvim: the host's focus event follows the jump. */
 const EDIT_JUMP_MS = 1000;
+/** How long a smooth scroll asked of the engine is taken to be heading for its target. */
+const ENGINE_SCROLL_MS = 1000;
+/** How far below a source line's top the cursor looks for the row that line starts on: a line's top can fall on the
+ *  boundary between two rows, and the row below it is the line's. */
+const ROW_PROBE_PX = 0.5;
+
+/** Where the cursor is: a row, or, in a row taller than the space between the margins, one line's height of it. */
+export interface Band { top: number; bottom: number; row: Row }
 
 function clamp(n: number, lo: number, hi: number): number { return Math.min(Math.max(n, lo), hi); }
 
@@ -112,6 +121,26 @@ export class Preview {
   private asked: { token: number; cursor: number } | null = null;
   private placed: { asked: number; got: number } | null = null;
   private lastTop: number | null = null;
+  /** The cursor, while the preview has the keys: the source line (zero-based, fractional) at the middle of its band,
+   *  so it keeps its place in the text when the layout changes; null until it is placed. */
+  private cursorAt: number | null = null;
+  /** Counts the cursor's moves: what was picked for one place of the cursor holds until it moves. */
+  private moves = 0;
+  /** The cursor's band as last worked out, for the line index (the layout) it was worked out on. */
+  /** How far the cursor's band's middle lies below `lineToY(cursorAt)`: several rows can read as one source line
+   *  (footnotes below the index's last block all read as its end), and this tells them apart. */
+  private cursorDy = 0;
+  private bandMemo: { at: number; dy: number; index: Box[]; band: Band | null } | null = null;
+  /** The rows of each index block, for the line index (the layout) they were read on. */
+  private rowCache: RowCache | null = null;
+  /** The top of the document's first row, for the line index it was read on. */
+  private firstRowMemo: { index: Box[]; top: number } | null = null;
+  /** Where a scroll asked of the engine (no kit glide) is heading, until it gets there or a second has passed. */
+  private engineTo: { y: number; until: number } | null = null;
+  private lastScrollY = 0;
+  /** The bottom of the document's last row, for the line index (the layout) it was read on. */
+  private lastRowMemo: { index: Box[]; bottom: number | null } | null = null;
+  private readonly cursorLine: HTMLElement;
   /** Images on the document route that failed to load, by URL, for the route they were seen under. */
   private failed = new Set<string>();
   private failedRoute = "";
@@ -135,6 +164,11 @@ export class Preview {
     this.cursorBar.className = "mdp-cursor-bar";
     this.cursorBar.hidden = true;
     document.body.append(this.cursorBar);
+    // The row band at the cursor, as nvim's 'cursorline' marks the cursor's line; drawn under the bar.
+    this.cursorLine = document.createElement("div");
+    this.cursorLine.className = "mdp-cursor-line";
+    this.cursorLine.hidden = true;
+    this.cursorBar.before(this.cursorLine);
     this.setNotice(EMPTY_TEXT);
     const scroll = () => this.onScroll();
     const wheel = () => this.onPointer();
@@ -164,6 +198,7 @@ export class Preview {
       observer?.disconnect();
       this.revealer.cancel();
       this.cursorBar.remove();
+      this.cursorLine.remove();
     });
   }
 
@@ -250,7 +285,12 @@ export class Preview {
     if (hasKeys) this.editJumpUntil = 0;
     this.keys = hasKeys;
     this.leadChanged(was);
-    if (hasKeys && !hadKeys) this.pickCursorBlock();
+    // The cursor starts on nvim's cursor line, unless a click that brought the keys has just put it: nvim hears of
+    // that place now, since the click moved the cursor while nvim still led.
+    if (hasKeys && !hadKeys) {
+      if (!clickedRecently()) this.startCursor();
+      else if (this.cursorAt !== null && !this.editJumping()) { this.unsent = true; this.revealer.request(); }
+    }
     this.placeBars();
     this.notify("focus");
   }
@@ -298,20 +338,23 @@ export class Preview {
    *  and at least `RESERVE_FLOOR_LINES` lines of the page's text, at most a quarter of the view. The reading point
    *  sits this far below the top, so the line being read is never on the top edge. */
   reservePx(): number {
-    const text = parseFloat(getComputedStyle(this.root).lineHeight) || FALLBACK_LINE_PX;
+    const text = this.lineHeight();
     const rows = this.view?.rows;
-    const row = rows ? window.innerHeight / rows : text;
+    const row = rows ? (window.innerHeight * (1 - (this.view?.grid_top ?? 0))) / rows : text;
     const lines = Math.max((this.view?.scrolloff ?? 0) * row, RESERVE_FLOOR_LINES * text);
     return Math.min(lines, window.innerHeight * RESERVE_SHARE);
   }
-  /** Where the reader reads: the reading reserve below the top. Near the document's start the reserve shrinks to
-   *  what is scrolled away, as 'scrolloff' keeps no margin above a buffer's first line, so the first blocks can be
-   *  read (and yanked) at the top. */
-  readingY(): number { return window.scrollY + Math.min(this.reservePx(), Math.max(0, window.scrollY)); }
+  /** Where the reader reads: the middle of the cursor's band while the preview has the keys; without a cursor (nvim
+   *  has the keys, nothing is shown) the reading reserve below the top, shrunk near the document's start. */
+  readingY(): number {
+    const b = this.cursorBand();
+    if (b) return (b.top + b.bottom) / 2;
+    return window.scrollY + Math.min(this.reservePx(), Math.max(0, window.scrollY));
+  }
   /** Where nvim put its cursor (zero-based) for the reading line at `y`, when the page's reveal of that reading line
    *  has been answered; else null. */
   heldLine(y: number): number | null {
-    const reading = lineAt(this.index(), y);
+    const reading = this.sourceLineAt(y);
     const placed = this.placed;
     if (reading === null || placed === null || placed.asked !== reading + 1 || this.editorCursorLine() === null) {
       return null;
@@ -336,15 +379,33 @@ export class Preview {
    *  preview leads. */
   scrollByUser(dy: number, smooth: boolean): void { window.scrollBy({ top: dy, behavior: smooth ? "smooth" : INSTANT }); }
   /** Where the window is heading: the kit's running glide's destination, else where it is. */
-  destination(): number { return kit()?.destination?.() ?? window.scrollY; }
+  destination(): number {
+    const heading = kit()?.destination?.();
+    if (typeof heading === "number") return heading;
+    // Without the kit's glide the engine scrolls smoothly toward where the page asked it to go.
+    const e = this.engineTo;
+    if (e && Date.now() < e.until && Math.abs(window.scrollY - e.y) >= 1) return e.y;
+    this.engineTo = null;
+    return window.scrollY;
+  }
   /** The window position that brings document y `top` to the reading reserve below the view's top. */
   yFor(top: number): number { return clamp(top - this.reservePx(), 0, this.scrollMax()); }
+  /** Brings an element to the reading reserve below the top, where a jump made without the cursor (nvim has the
+   *  keys) lands; returns the window position it goes to. */
+  scrollToElement(el: Element): number {
+    const y = this.yFor(el.getBoundingClientRect().top + window.scrollY);
+    this.glideTo(y);
+    return y;
+  }
   /** Moves the window to `y` through the kit's glide (eased, or a jump under reduced motion or `smooth` off); the
    *  reader's scroll, so it reveals while leading. Without the kit's glide the engine's smooth scroll does it. */
   glideTo(y: number): void {
     const k = kit();
     if (typeof k?.scrollTo === "function") k.scrollTo(y);
-    else window.scrollTo({ top: y, behavior: "smooth" });
+    else {
+      this.engineTo = { y, until: Date.now() + ENGINE_SCROLL_MS };
+      window.scrollTo({ top: y, behavior: "smooth" });
+    }
   }
   /** Enter or a double-click is about to move nvim's cursor and give nvim the keys. A running glide ends where it was
    *  heading, so the block acted on is the one the reader is heading for; a place the preview has not yet revealed
@@ -362,12 +423,6 @@ export class Preview {
   /** The edit jump moved nothing (no window shows the file, or the call failed): the keys stay, and the preview's
    *  scrolls reveal again. */
   editJumpFailed(): void { this.editJumpUntil = 0; }
-  /** Brings an element to the reading reserve below the top; returns the window position it goes to. */
-  scrollToElement(el: Element): number {
-    const y = this.yFor(el.getBoundingClientRect().top + window.scrollY);
-    this.glideTo(y);
-    return y;
-  }
   /** Where `G` takes the window: the document's last block at the bottom of the view, clear of the HUD, as vim's
    *  `G` puts the last line at the window's bottom; null with nothing rendered. */
   bottomY(): number | null {
@@ -376,13 +431,395 @@ export class Preview {
     let end: number | null = null;
     for (const b of this.index()) if (b.line < count) end = Math.max(end ?? 0, b.top + b.height);
     if (end === null) return null;
-    const hud = document.getElementById("eitri-keys-hud");
-    const clear = hud && !hud.hidden ? hud.getBoundingClientRect().height : 0;
-    return clamp(end + clear - window.innerHeight, 0, this.scrollMax());
+    // Text the index leaves out (footnotes, shown below a later line's block) ends the document too.
+    const index = this.index();
+    if (this.lastRowMemo?.index !== index) this.lastRowMemo = { index, bottom: this.lastBand()?.row.bottom ?? null };
+    if (this.lastRowMemo.bottom !== null) end = Math.max(end, this.lastRowMemo.bottom);
+    return clamp(end + this.hudPx() - window.innerHeight, 0, this.scrollMax());
   }
+
+  /** How many times the cursor has moved: what was picked for one place of the cursor holds until this changes. */
+  cursorMoves(): number { return this.moves; }
+
+  /** The cursor's band in document coordinates while the preview has the keys and shows a document, else null.
+   *  Placed on first use: on nvim's cursor line, else on the first row below the top margin. */
+  cursorBand(): Band | null {
+    if (!this.keys || !this.rendered || this.root.hidden) return null;
+    if (this.cursorAt === null) this.startCursor();
+    if (this.cursorAt === null) return null;
+    const index = this.index();
+    const memo = this.bandMemo;
+    if (memo && memo.at === this.cursorAt && memo.dy === this.cursorDy && memo.index === index) return memo.band;
+    const band = this.bandAt(lineToY(index, this.cursorAt, Number.POSITIVE_INFINITY) + this.cursorDy);
+    this.bandMemo = { at: this.cursorAt, dy: this.cursorDy, index, band };
+    return band;
+  }
+
+  /** The source line (zero-based) at document y `y`. Inside a block, the line under it (`current.ts::lineAt`), moved
+   *  up off the blank lines the block's map ends with (a list item followed by a blank line holds it), so the line
+   *  nvim's cursor is put on, and Enter's, is one with the block's text. Between blocks (text no index block holds,
+   *  such as a list item's own line above its nested list), the line read there, kept to the lines between the two
+   *  blocks and off blank ones; only where there is none of those, the first line of the block below. */
+  sourceLineAt(y: number): number | null {
+    const index = this.index();
+    const lines = this.rendered?.lines ?? [];
+    const blank = (l: number) => (lines[l] ?? "").trim() === "";
+    const box = boxAt(index, y);
+    if (box && y >= box.top && y < box.top + box.height) {
+      const line = lineAt(index, y);
+      if (line === null) return null;
+      let last = box.end - 1;
+      while (last > box.line && blank(last)) last--;
+      return Math.max(box.line, Math.min(line, last));
+    }
+    const i = lastTopAtOrBefore(index, y);
+    const lo = i >= 0 ? index[i].end : 0;
+    const hi = i + 1 < index.length ? index[i + 1].line - 1 : lines.length - 1;
+    if (lo <= hi) {
+      const read = Math.min(Math.max(Math.floor(yToLine(index, y)), lo), hi);
+      for (let l = read; l <= hi; l++) if (!blank(l)) return l;
+      for (let l = read - 1; l >= lo; l--) if (!blank(l)) return l;
+    }
+    return lineAt(index, y);
+  }
+
+  /** The cursor's place as a history entry keeps it (the source line at its band's middle), or null. */
+  cursorPlace(): number | null { return this.cursorBand() ? this.cursorAt : null; }
+
+  /** `j` / `k`: the cursor one row down (1) or up (-1), as nvim's `gj` / `gk` under 'wrap'. A move that would cross
+   *  a margin scrolls the page by just enough instead; on the document's first or last row nothing moves. */
+  moveRows(dir: 1 | -1): void {
+    const b = this.cursorBand();
+    const next = b ? this.stepBand(b, dir) : null;
+    if (next) this.moveCursor(next, this.scrollFor(next, this.destination()));
+  }
+
+  /** `<C-d>` / `<C-u>`: the page half a view down or up and the cursor the same distance, so it keeps its height on
+   *  the screen; where the page cannot go further (the document's start, or its last row at the bottom) the cursor
+   *  moves alone. */
+  halfPage(dir: 1 | -1): void {
+    const b = this.cursorBand();
+    if (!b) return;
+    const s = this.destination();
+    const d = window.innerHeight / 2;
+    const t = dir > 0 ? Math.min(s + d, Math.max(s, this.endY())) : Math.max(s - d, 0);
+    const moved = this.bandAt((b.top + b.bottom) / 2 + dir * d);
+    const next = moved ? this.insideMargins(moved, t) : null;
+    if (next) this.moveCursor(next, this.scrollFor(next, t));
+  }
+
+  /** `<C-f>` / `<C-b>`: the page a view less two lines down or up, and the cursor to the margin the text came in
+   *  from (the top one going down, the bottom one going up), as nvim's; where the page cannot scroll, the cursor goes
+   *  to the last or the first row. */
+  fullPage(dir: 1 | -1): void {
+    if (!this.cursorBand()) return;
+    const s = this.destination();
+    const line = this.lineHeight();
+    const p = Math.max(line, window.innerHeight - 2 * line);
+    const t = dir > 0 ? Math.min(s + p, Math.max(s, this.scrollMax())) : Math.max(s - p, 0);
+    const next = Math.abs(t - s) < 0.5 ? (dir > 0 ? this.lastBand() : this.firstBand())
+      : dir > 0 ? this.firstBandFrom(this.topLimit(t)) : this.lastBandTo(this.bottomLimit(t));
+    if (next) this.moveCursor(next, this.scrollFor(next, t));
+  }
+
+  /** `gg` / `G`: the cursor to the document's first or last row, placed as a jump. False when there is none. */
+  cursorFirst(): boolean { return this.jumpBand(this.cursorBand() ? this.firstBand() : null); }
+  cursorLast(): boolean { return this.jumpBand(this.cursorBand() ? this.lastBand() : null); }
+
+  /** Puts the cursor on the row at document y `y` and scrolls only if that row is outside the margins: as little
+   *  as needed when it is near, centred when it is further than half a view away, as nvim places a jump. `from` is
+   *  the window position the jump is judged from (where the window was heading before it). False with no row. */
+  jumpCursorTo(y: number, from = this.destination()): boolean {
+    return this.cursorBand() !== null && this.jumpBand(this.bandAt(y), from);
+  }
+
+  /** The cursor to the row holding source line `L` (a history entry's place), placed as a jump. */
+  jumpCursorToLine(L: number): boolean {
+    return this.cursorBand() !== null && this.jumpBand(this.bandAt(lineToY(this.index(), L, Number.POSITIVE_INFINITY)));
+  }
+
+  /** A click: the cursor to the clicked row, without scrolling. It may come before the keys do; the cursor is then
+   *  where they find it. */
+  cursorToPoint(y: number): void {
+    if (!this.rendered || this.root.hidden) return;
+    const b = this.bandAt(y);
+    if (b) this.moveCursor(b, null);
+  }
+
   afterUpdate(fn: (why: UpdateReason) => void): () => void { this.listeners.add(fn); return () => { this.listeners.delete(fn); }; }
 
   private editJumping(): boolean { return Date.now() < this.editJumpUntil; }
+
+  private lineHeight(): number { return parseFloat(getComputedStyle(this.root).lineHeight) || FALLBACK_LINE_PX; }
+  /** The height the keys' HUD takes at the view's bottom while it shows. */
+  private hudPx(): number {
+    const hud = document.getElementById("eitri-keys-hud");
+    return hud && !hud.hidden ? hud.getBoundingClientRect().height : 0;
+  }
+  /** Where scrolling for the cursor stops going down: the document's last row at the view's bottom, as nvim's
+   *  'scrolloff' never scrolls past a buffer's last line (`G`'s place). */
+  private endY(): number { return this.bottomY() ?? this.scrollMax(); }
+  /** The highest a cursor band may start with the window at `s`: the reserve below the view's top, giving way at
+   *  the document's start (nvim keeps no margin above a buffer's first line). */
+  private topLimit(s: number): number { return s <= this.firstRowTop() + 0.5 ? s : s + this.reservePx(); }
+  /** The top of the document's first row (the page's top padding lies above it): with the window there or above,
+   *  the document's start is in view and the top margin gives way, as 'scrolloff' does at a buffer's first line. */
+  private firstRowTop(): number {
+    const index = this.index();
+    if (this.firstRowMemo?.index !== index) {
+      this.firstRowMemo = { index, top: Math.max(0, this.firstBand()?.row.top ?? 0) };
+    }
+    return this.firstRowMemo.top;
+  }
+  /** The lowest a cursor band may end with the window at `s`: the reserve above the view's bottom (clear of the
+   *  HUD), giving way once the window is at the document's end. */
+  private bottomLimit(s: number): number {
+    const bottom = s + window.innerHeight - this.hudPx();
+    return s >= this.endY() - 0.5 ? bottom : bottom - this.reservePx();
+  }
+  /** The space between the two margins; a row taller than this is gone through a line's height at a time. */
+  private room(): number {
+    return Math.max(this.lineHeight(), window.innerHeight - this.hudPx() - 2 * this.reservePx());
+  }
+  private isTall(r: Row): boolean { return r.bottom - r.top > this.room() + 0.5; }
+
+  /** The window position that keeps band `b` inside the margins, starting from `s` and moving the least. */
+  private scrollFor(b: Band, s: number): number {
+    if (b.top < this.topLimit(s) - 0.5) return Math.min(s, Math.max(0, b.top - this.reservePx()));
+    if (b.bottom > this.bottomLimit(s) + 0.5) {
+      const view = window.innerHeight - this.hudPx();
+      return Math.max(s, Math.min(b.bottom - (view - this.reservePx()), Math.max(s, this.endY())));
+    }
+    return s;
+  }
+  /** As `scrollFor`, for a jump: a band further than half a view outside the margins is centred instead. */
+  private scrollForJump(b: Band, s: number): number {
+    const t = this.scrollFor(b, s);
+    if (Math.abs(t - s) < 0.5) return s;
+    const view = window.innerHeight - this.hudPx();
+    const off = b.top < this.topLimit(s) ? this.topLimit(s) - b.top : b.bottom - this.bottomLimit(s);
+    if (off <= view / 2) return t;
+    const centre = (b.top + b.bottom) / 2 - view / 2;
+    return centre < s ? Math.max(0, centre) : Math.min(centre, Math.max(s, this.endY()));
+  }
+  /** `b`, or, when it lies outside the margins with the window at `s`, the first or last band inside them: a move
+   *  that keeps the window where it is pushes the cursor in, as 'scrolloff' does after nvim's `<C-d>`. */
+  private insideMargins(b: Band, s: number): Band {
+    const top = this.topLimit(s);
+    const bottom = this.bottomLimit(s);
+    if (b.top < top - 0.5) return this.firstBandFrom(top) ?? b;
+    if (b.bottom > bottom + 0.5) return this.lastBandTo(bottom) ?? b;
+    return b;
+  }
+  private jumpBand(b: Band | null, from = this.destination()): boolean {
+    if (!b) return false;
+    this.moveCursor(b, this.scrollForJump(b, from));
+    return true;
+  }
+
+  /* The cursor goes to `b`; the window to `to` (null: it stays) through the kit's glide, as the reader's scroll;
+     nvim hears of the move as it hears of a scroll. */
+  private moveCursor(b: Band, to: number | null): void {
+    this.setCursor(b);
+    const from = this.destination();
+    if (to !== null && Math.abs(to - from) >= 0.5) this.glideTo(this.onEditorRow(b, to, from));
+    this.cursorMoved();
+  }
+  /* A scroll the cursor makes, from `from` to `to`, carried on by less than one of nvim's rows so that the first row
+     of the cursor's line lands where one of nvim's rows starts (`rowShare`): nvim can then start that line level with
+     it, rather than as near as its whole rows allow. Going on in the scroll's own direction moves the cursor away
+     from the margin it was crossing. Only while the view says nvim's rows, with the line's start on the screen, and
+     never past the document's start or `G`'s place. */
+  private onEditorRow(b: Band, to: number, from: number): number {
+    const v = this.view;
+    if (!v?.rows || v.buf !== this.rendered?.buf || !this.keys) return to;
+    const line = this.sourceLineAt((b.top + b.bottom) / 2);
+    if (line === null) return to;
+    const view = window.innerHeight;
+    const top = view * (v.grid_top ?? 0);
+    const row = (view - top) / v.rows;
+    const at = this.lineStartY(line, b) - to - top;
+    if (row <= 0 || at < 0 || at > view - top) return to;
+    // Further in the scroll's own direction first, then back; a position that would leave the band outside its
+    // margins (a page move puts the cursor right at one) is not taken.
+    const ks = to > from ? [Math.floor(at / row), Math.ceil(at / row)] : [Math.ceil(at / row), Math.floor(at / row)];
+    for (const k of ks) {
+      const snapped = to + at - k * row;
+      if (snapped < 0 || snapped > Math.max(from, this.endY())) continue;
+      if (b.top < this.topLimit(snapped) - 0.5 || b.bottom > this.bottomLimit(snapped) + 0.5) continue;
+      return snapped;
+    }
+    return to;
+  }
+  private setCursor(b: Band): void {
+    const index = this.index();
+    const mid = (b.top + b.bottom) / 2;
+    this.cursorAt = yToLine(index, mid);
+    this.cursorDy = mid - lineToY(index, this.cursorAt, Number.POSITIVE_INFINITY);
+    this.bandMemo = { at: this.cursorAt, dy: this.cursorDy, index, band: b };
+    this.moves++;
+  }
+  private cursorMoved(): void {
+    if (this.lead() === "preview" && !this.editJumping()) { this.unsent = true; this.revealer.request(); }
+    this.placeBars();
+    this.notify("cursor");
+  }
+
+  /* The rows around document y `y`. Where none is within a view of it (below the document's end, or a gap taller
+     than the view), the rows around the nearest block. */
+  private rowsNear(y: number): Row[] {
+    const index = this.index();
+    const v = window.innerHeight;
+    const line = this.lineHeight();
+    const cache = this.rowsOf(index);
+    const rows = rowsIn(this.root, index, y - v, y + v, line, window.scrollY, cache);
+    if (rows.length > 0 || index.length === 0) return rows;
+    const box = index[clamp(lastTopAtOrBefore(index, y), 0, index.length - 1)];
+    return rowsIn(this.root, index, box.top - v, box.top + box.height + v, line, window.scrollY, cache);
+  }
+  /* The row cache for this layout: a block's rows are read once per layout, however often the cursor passes. */
+  private rowsOf(index: Box[]): RowCache {
+    if (this.rowCache?.index !== index) this.rowCache = new RowCache(index);
+    return this.rowCache;
+  }
+  /** The band holding document y `y` (in a tall row, the line's height of it that holds `y`), else the nearest. */
+  private bandAt(y: number): Band | null {
+    const rows = this.rowsNear(y);
+    let best: Row | null = null;
+    let dist = Number.POSITIVE_INFINITY;
+    for (const r of rows) {
+      const d = y < r.top ? r.top - y : y >= r.bottom ? y - r.bottom + 1e-6 : 0;
+      if (d < dist) { best = r; dist = d; }
+      if (d === 0) break;
+    }
+    return best ? this.bandIn(best, y) : null;
+  }
+  private bandIn(r: Row, y: number): Band {
+    if (!this.isTall(r)) return { top: r.top, bottom: r.bottom, row: r };
+    const line = this.lineHeight();
+    // A band's top is r.top plus a whole number of line heights; with a fractional line height the division can
+    // come out a hair under that number, which must not round down to the band before.
+    const k = Math.max(0, Math.floor((clamp(y, r.top, r.bottom - 0.01) - r.top) / line + 1e-6));
+    const top = r.top + k * line;
+    return { top, bottom: Math.min(top + line, r.bottom), row: r };
+  }
+  /** The band after (1) or before (-1) `b`: the next line's height of a tall row, else the next row. */
+  private stepBand(b: Band, dir: 1 | -1): Band | null {
+    const r = b.row;
+    if (this.isTall(r)) {
+      const top = b.top + dir * this.lineHeight();
+      if (dir > 0 ? top < r.bottom - 0.5 : top > r.top - 0.5) return this.bandIn(r, Math.max(top, r.top));
+    }
+    const after = (rows: Row[]) => dir > 0 ? rows.find((x) => x.top >= r.bottom - 0.5)
+      : [...rows].reverse().find((x) => x.bottom <= r.top + 0.5);
+    let next = after(this.rowsNear(dir > 0 ? r.bottom : r.top));
+    if (!next) {
+      // Nothing with text within a view (a stretch taller than the view): the rows of the next block that way,
+      // wherever in it they are.
+      const index = this.index();
+      const boxes = dir > 0 ? index.filter((x) => x.top >= r.bottom - 0.5)
+        : index.filter((x) => x.top + x.height <= r.top + 0.5).reverse();
+      for (const box of boxes) {
+        next = after(rowsIn(this.root, index, box.top - 1, box.top + box.height + 1, this.lineHeight(), window.scrollY,
+          this.rowsOf(index)));
+        if (next) break;
+      }
+    }
+    if (!next) return null;
+    return this.bandIn(next, dir > 0 ? next.top : next.bottom);
+  }
+  private firstBand(): Band | null { return this.bandAt(0); }
+  /** The document's last band: the end sentinel follows every block the page draws, footnotes included. */
+  private lastBand(): Band | null {
+    const index = this.index();
+    if (index.length === 0) return null;
+    const end = index[index.length - 1];
+    return this.bandAt(end.top + end.height);
+  }
+  /** The first band starting at or below `y`, else the band nearest it. */
+  private firstBandFrom(y: number): Band | null {
+    const b = this.bandAt(y);
+    return b && b.top < y - 0.5 ? this.stepBand(b, 1) ?? b : b;
+  }
+  /** The last band ending at or above `y`, else the band nearest it. */
+  private lastBandTo(y: number): Band | null {
+    const b = this.bandAt(y);
+    return b && b.bottom > y + 0.5 ? this.stepBand(b, -1) ?? b : b;
+  }
+  /** The top of the first band of source line `line` that the cursor's band belongs to: where the line starts on
+   *  the screen, which is where nvim starts it. Rows of one source line below the first share this place, so moving
+   *  among them moves nothing in nvim, as `gj` inside one long line does not scroll. */
+  private lineStartY(line: number, b: Band): number {
+    const mid = (r: Row) => this.sourceLineAt((r.top + r.bottom) / 2);
+    if (mid(b.row) !== line && this.sourceLineAt(b.row.top + ROW_PROBE_PX) !== line) return b.top;
+    const rows = this.rowsNear(b.row.top);
+    let i = rows.findIndex((r) => Math.abs(r.top - b.row.top) < 0.5);
+    if (i < 0) return b.row.top;
+    while (i > 0 && mid(rows[i - 1]) === line) i--;
+    return rows[i].top;
+  }
+
+  /* The keys came into the preview: the cursor starts on the row of nvim's cursor line where the page shows it now,
+     so nothing on the screen moves. Its block is picked with nvim's line, so Enter keeps that line until the cursor
+     moves. A line no block holds (a blank line between paragraphs, a line of a hidden element) puts the cursor on
+     the nearest block by line count, the block above on a tie (a blank line closes the paragraph above). With nvim's
+     line off the screen (a host that does not say nvim's rows) or another buffer in nvim, the cursor starts on the
+     first row below the top margin. */
+  private startCursor(): void {
+    if (!this.rendered || this.root.hidden) return;
+    const index = this.index();
+    const s = window.scrollY;
+    const line = this.editorCursorLine();
+    let band: Band | null = null;
+    let picked: Box | null = null;
+    if (line !== null && index.length > 0) {
+      const v = this.view!;
+      const count = this.rendered.lines.length;
+      const i = lastLineAtOrBefore(index, line);
+      if (i >= 0 && line < index[i].end) {
+        const shown = line + (v.cursor.line === v.top ? v.top_fraction : 0);
+        band = this.bandAt(lineToY(index, shown, Number.POSITIVE_INFINITY) + ROW_PROBE_PX);
+        picked = index[i];
+      } else {
+        // A line between blocks that has a row of its own (a list item's own line above its nested list): that row.
+        const y = lineToY(index, line, Number.POSITIVE_INFINITY) + ROW_PROBE_PX;
+        const own = this.bandAt(y);
+        if (own && y >= own.top && y < own.bottom && this.sourceLineAt((own.top + own.bottom) / 2) === line) {
+          band = own;
+          picked = boxAt(index, (own.top + own.bottom) / 2);
+        }
+      }
+      if (!band && !(i >= 0 && line < index[i].end)) {
+        // The end sentinel stands for no source line, so it is never the nearest block.
+        const above = i >= 0 && index[i].line < count ? index[i] : null;
+        const below = i + 1 < index.length && index[i + 1].line < count ? index[i + 1] : null;
+        picked = above && (!below || line - (above.end - 1) <= below.line - line) ? above : below;
+        if (picked) {
+          band = picked === above ? this.bandAt(picked.top + picked.height - ROW_PROBE_PX)
+            : this.bandAt(picked.top + ROW_PROBE_PX);
+        }
+      }
+      if (band && (band.bottom <= s || band.top >= s + window.innerHeight)) { band = null; picked = null; }
+    }
+    band ??= this.firstBandFrom(this.topLimit(s));
+    if (!band) return;
+    this.setCursor(band);
+    if (picked && line !== null) pickBlock(picked, line, this.moves);
+  }
+
+  /* A scroll the cursor did not ask for (the wheel, the scroll bar, <C-e>, a page's own scroll) leaves the cursor on
+     its row unless a margin pushes it onto the first or last row inside, as nvim's mouse scroll and <C-e> do. It is
+     judged where the window is heading, so a glide the cursor asked for never pushes the cursor back. */
+  private pushCursor(): void {
+    if (!this.keys || this.cursorAt === null) return;
+    const b = this.cursorBand();
+    if (!b) return;
+    const next = this.insideMargins(b, this.destination());
+    if (Math.abs(next.top - b.top) < 0.5) return;
+    this.setCursor(next);
+    this.placeBars();
+    this.notify("cursor");
+  }
   private lead(): Leader { return leader({ sync: this.settings.sync, hasKeys: this.keys, pointerScroll: this.pointer }); }
   private scrollMax(): number { return Math.max(0, document.documentElement.scrollHeight - window.innerHeight); }
 
@@ -422,6 +859,8 @@ export class Preview {
       return;
     }
     const switched = this.rendered?.buf !== t.buf;
+    // Another buffer's text: the cursor starts again in it (it stays on the old blocks until they go).
+    if (switched) this.cursorAt = null;
     // The reader's line, read before the update moves anything.
     const before = !switched && this.lead() !== "editor" ? (this.anchor ?? yToLine(this.index(), window.scrollY)) : null;
     const doc = this.view?.buf === t.buf ? this.view.doc : null;
@@ -531,7 +970,7 @@ export class Preview {
     const v = this.view;
     if (v === null || v.rows === undefined || v.cursor_row === undefined || v.rows < 1) return null;
     if (this.rendered?.buf !== v.buf) return null;
-    return rowShare(v.cursor_row, v.rows);
+    return rowShare(v.cursor_row, v.rows, v.grid_top ?? 0);
   }
 
   /* From a host that does not say nvim's rows, while nvim leads the preview shows nvim's top line; rendered Markdown
@@ -571,8 +1010,15 @@ export class Preview {
   }
 
   private onScroll(): void {
+    // A smooth scroll asked of the engine is over once the window is there, or once something moved it away.
+    const e = this.engineTo;
+    if (e && (Math.abs(window.scrollY - e.y) < 1 || Math.abs(window.scrollY - e.y) > Math.abs(this.lastScrollY - e.y) + 1)) {
+      this.engineTo = null;
+    }
+    this.lastScrollY = window.scrollY;
     if (this.guard.onScroll(window.scrollY)) return;
     this.anchor = yToLine(this.index(), window.scrollY);
+    this.pushCursor();
     if (this.lead() === "preview" && !this.editJumping()) { this.unsent = true; this.revealer.request(); }
     else this.traceTop();
     this.placeBars();
@@ -596,13 +1042,20 @@ export class Preview {
     this.unsent = false;
     const index = this.index();
     const line = Math.max(1, Math.floor(yToLine(index, window.scrollY)) + 1);
-    const reading = this.noCursor || !this.keys || !withCursor ? null : lineAt(index, this.readingY());
+    const band = this.noCursor || !this.keys || !withCursor ? null : this.cursorBand();
+    const mid = band === null ? 0 : (band.top + band.bottom) / 2;
+    // While the line nvim's cursor was on when the keys came in is still picked (the cursor has not moved), that line
+    // is the one nvim keeps, so a scroll does not move nvim's cursor off it and Enter finds it where it was.
+    const pickedBox = band === null ? null : boxAt(index, mid);
+    const held = pickedBox === null ? null : pickedLine(pickedBox, this.moves);
+    const reading = band === null ? null : held ?? this.sourceLineAt(mid);
     const cursor = reading === null ? undefined : reading + 1;
-    // With the reading line, the screen row nvim starts it on: the same share down nvim's screen as the line's top is
-    // down the view, so the two sides show it at the same height.
+    // With the cursor's line, the screen row nvim starts it on: the same share down nvim's screen as the line's first
+    // row is down the view, so the two sides show it at the same height.
     const rows = this.view?.buf === this.rendered.buf ? this.view.rows : undefined;
-    const row = reading === null || this.noRow || !rows ? undefined
-      : rowAt(lineToY(index, reading, Number.POSITIVE_INFINITY) - window.scrollY, window.innerHeight, rows);
+    const row = reading === null || band === null || this.noRow || !rows ? undefined
+      : rowAt((held !== null ? lineToY(index, held, Number.POSITIVE_INFINITY) : this.lineStartY(reading, band))
+        - window.scrollY, window.innerHeight, rows, this.view?.grid_top ?? 0);
     this.traceTop();
     const same = cursor === undefined || (cursor === this.lastCursor && row === this.lastRow);
     if (line === this.lastReveal && same) return;
@@ -645,44 +1098,34 @@ export class Preview {
     if (this.unsent || gliding) this.sendReveal(true);
   }
 
-  /* The keys came into the preview: when nvim's cursor line is on screen and no click just picked a block, the
-     block holding it becomes the current block until the next scroll, with nvim's line kept for Enter. A line no
-     block holds (a blank line between paragraphs, a line of a hidden element) keeps its own line too, and the nearest
-     block by line stands as the current one: the block above on a tie, as a blank line closes the paragraph above. */
-  private pickCursorBlock(): void {
-    const line = this.editorCursorLine();
-    if (line === null || clickedRecently() || !this.rendered) return;
-    const index = this.index();
-    const count = this.rendered.lines.length;
-    const i = lastLineAtOrBefore(index, line);
-    if (i >= 0 && line < index[i].end) {
-      const box = index[i];
-      if (box.top >= window.scrollY + window.innerHeight || box.top + box.height <= window.scrollY) return;
-      pickBlock(box, line);
+  /* With the keys in the preview, its cursor: the bar in the margin at the cursor's band and a faint band across
+     the text, as nvim's 'cursorline'. While nvim leads, nvim's cursor line, marked in the margin beside the block
+     that holds it. */
+  private placeBars(): void {
+    this.cursorBar.hidden = true;
+    this.cursorLine.hidden = true;
+    const rootBox = this.root.getBoundingClientRect();
+    const left = rootBox.left + window.scrollX - 12;
+    if (this.keys) {
+      const b = this.cursorBand();
+      if (!b) return;
+      const height = `${b.bottom - b.top}px`;
+      Object.assign(this.cursorBar.style, { top: `${b.top}px`, height, left: `${left}px` });
+      Object.assign(this.cursorLine.style, { top: `${b.top}px`, height, left: `${left}px`,
+        width: `${rootBox.width + 12}px` });
+      const scheme = getComputedStyle(document.documentElement).getPropertyValue("--nv-color-scheme").trim();
+      this.cursorLine.dataset.scheme = scheme === "light" ? "light" : "dark";
+      this.cursorBar.hidden = false;
+      this.cursorLine.hidden = false;
       return;
     }
-    const y = lineToY(index, line, Number.POSITIVE_INFINITY);
-    if (y < window.scrollY || y >= window.scrollY + window.innerHeight) return;
-    // The end sentinel stands for no source line, so it is never the nearest block.
-    const above = i >= 0 && index[i].line < count ? index[i] : null;
-    const below = i + 1 < index.length && index[i + 1].line < count ? index[i + 1] : null;
-    const box = above && (!below || line - (above.end - 1) <= below.line - line) ? above : below;
-    if (box) pickBlock(box, line);
-  }
-
-  /* nvim's cursor line, marked in the margin beside the block that holds it, only while nvim leads: with the keys in
-     the preview, the reader's own place matters, not nvim's cursor. */
-  private placeBars(): void {
     const v = this.view;
-    const show = v !== null && this.rendered?.buf === v.buf && this.lead() === "editor";
-    this.cursorBar.hidden = true;
-    if (!show || !v) return;
+    if (v === null || this.rendered?.buf !== v.buf || this.lead() !== "editor") return;
     const index = this.index();
     const line = v.cursor.line - 1;
     const i = lastLineAtOrBefore(index, line);
     if (i < 0 || index[i].end <= line) return;
     const box = index[i];
-    const left = this.root.getBoundingClientRect().left + window.scrollX - 12;
     Object.assign(this.cursorBar.style, { top: `${box.top}px`, height: `${box.height}px`, left: `${left}px` });
     this.cursorBar.hidden = false;
   }

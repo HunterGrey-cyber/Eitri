@@ -1,15 +1,24 @@
 import { jump } from "../protocol";
 import { kit, type Row } from "../kit";
-import { boxAt, currentBlock, lineAt, pickedLine, setClickedBlock } from "./current";
+import { boxAt, currentBlock, noteClick, pickedLine } from "./current";
 import { lineToY, yToLine } from "./sync";
 import { FIND_MESSAGES, HUD, statusText } from "./notices";
 import type { Preview } from "./preview";
 
 export const PAGE_CONTEXT = "preview";
 /* The page's own reading keys. The kit declares its generic rows first (scrolling, half pages, history, find, hints);
-   a key named here is taken from the generic row that had it, so `]]`/`[[` leave `link.next`/`link.prev` keyless and
-   those rows drop out. */
+   a key named here is taken from the generic row that had it, so `]]`/`[[` leave `link.next`/`link.prev` keyless
+   and those rows drop out, and the cursor's keys leave the kit's scrolling `<C-e>`/`<C-y>` alone (they scroll the
+   page, and the cursor stays on its row unless a margin pushes it, as in nvim). */
 export const PAGE_ROWS: Row[] = [
+  { action: "cursor.down", keys: ["j"], context: PAGE_CONTEXT, desc: "cursor a row down" },
+  { action: "cursor.up", keys: ["k"], context: PAGE_CONTEXT, desc: "cursor a row up" },
+  { action: "cursor.half_down", keys: ["d", "<C-d>"], context: PAGE_CONTEXT, desc: "half a page down" },
+  { action: "cursor.half_up", keys: ["u", "<C-u>"], context: PAGE_CONTEXT, desc: "half a page up" },
+  { action: "cursor.page_down", keys: ["<C-f>"], context: PAGE_CONTEXT, desc: "a page down" },
+  { action: "cursor.page_up", keys: ["<C-b>"], context: PAGE_CONTEXT, desc: "a page up" },
+  { action: "cursor.first", keys: ["gg"], context: PAGE_CONTEXT, desc: "first row" },
+  { action: "cursor.last", keys: ["G"], context: PAGE_CONTEXT, desc: "last row" },
   { action: "heading.next", keys: ["]]"], context: PAGE_CONTEXT, desc: "next heading" },
   { action: "heading.prev", keys: ["[["], context: PAGE_CONTEXT, desc: "previous heading" },
   { action: "scroll.left", keys: ["zh"], context: PAGE_CONTEXT, desc: "scroll the block left" },
@@ -17,6 +26,22 @@ export const PAGE_ROWS: Row[] = [
   { action: "block.yank", keys: ["yy"], context: PAGE_CONTEXT, desc: "copy the block's Markdown" },
   { action: "edit.here", keys: ["<CR>"], context: PAGE_CONTEXT, desc: "edit here in the editor" },
 ];
+
+/** The page's rows for the window's prefix (`host.hello`'s spelling, `Ctrl+b`): a key equal to the prefix is
+ *  dropped, as the kit drops it from its own rows (the host refuses a table holding the prefix), and without a prefix
+ *  every Ctrl key is, since the page cannot tell which one the window keeps. A row left with no key is not declared. */
+export function pageRows(prefix: string | null | undefined): Row[] {
+  const known = typeof prefix === "string";
+  const banned = known ? /^Ctrl\+([a-z])$/.exec(prefix)?.[1] ?? null : null;
+  return PAGE_ROWS.flatMap((row) => {
+    const keys = row.keys.filter((key) => {
+      const ctrl = /^<C-(.)>$/i.exec(key);
+      return !ctrl || (known && ctrl[1] !== banned);
+    });
+    if (!keys.length) return [];
+    return [keys.length === row.keys.length ? row : { ...row, keys }];
+  });
+}
 
 /* What `/` leaves out of the document: KaTeX's hidden MathML (the formula is read once, as drawn) and a drawn
    diagram's text, which sits in SVG nobody reads as prose. */
@@ -26,6 +51,9 @@ export const FIND_EXCLUDE = ".katex-mathml, .mdp-diagram svg";
 const SIDEWAYS_PX = 60;
 const WIDE = ".mdp-wide, .katex-display";
 const HEADING = /^H[1-6]$/;
+/** How far into a target the cursor looks for its first row: a target's top can lie on the boundary with the row
+ *  above it. */
+const ROW_PROBE_PX = 0.5;
 
 /** Moves nvim's cursor to the source line at `y` (the reading position by default) and gives nvim the keys. Enter
  *  acts on the current block; a double-click passes the pointer's position, so the same jump lands where the reader
@@ -51,14 +79,14 @@ export async function editHere(p: Preview, y?: number): Promise<void> {
     if (!box) return;
     const at = y ?? p.readingY();
     const inside = at >= box.top && at < box.top + box.height;
-    const picked = y === undefined ? pickedLine(box) : null;
+    const picked = y === undefined ? pickedLine(box, p.cursorMoves()) : null;
     // nvim's held line answers the reading line, so it stands for the current block only when that block is the one
     // at the reading point (not a clicked one elsewhere).
     const held = y === undefined && boxAt(index, at)?.el === box.el ? p.heldLine(at) : null;
     // The picked line is nvim's own, inside the block or on a line next to it no block holds.
     const line = picked !== null && picked >= 0 && picked < p.lines().length ? picked
       : held !== null ? held
-      : inside ? (lineAt(index, at) ?? box.line) : box.line;
+      : inside || y === undefined ? (p.sourceLineAt(at) ?? box.line) : box.line;
     // On the line nvim's cursor is on, the column stays too: a cursor moved to the start of a long wrapped line
     // at nvim's top would scroll nvim. Elsewhere the first non-blank character, as nvim's own line jumps land. A
     // cursor at a line's first byte other than the one the keys came in with was put there by a reveal, which
@@ -75,31 +103,59 @@ export async function editHere(p: Preview, y?: number): Promise<void> {
   }
 }
 
-/** Records the window position `y` as the line left by a jump: the current history entry says it. */
-function leaving(p: Preview, y: number): void {
+/* A history entry: the buffer, the line at the window's top `y` (where an entry without a cursor places the page),
+   and the cursor's place. */
+function entry(p: Preview, y: number, cursor: number | null): { mdp: true; buf: number | null; line: number; cursor?: number } {
+  const line = yToLine(p.index(), y);
+  return cursor === null ? { mdp: true, buf: p.shownBuf(), line } : { mdp: true, buf: p.shownBuf(), line, cursor };
+}
+
+/** Records the place a jump leaves (the window at `y`, the cursor at `cursor`): the current history entry says it. */
+function leaving(p: Preview, y: number, cursor: number | null): void {
   try {
-    history.replaceState({ mdp: true, buf: p.shownBuf(), line: yToLine(p.index(), y) }, "");
+    history.replaceState(entry(p, y, cursor), "");
   } catch {
     // The engine limits how often history may change; a lost entry costs only that step of H.
   }
 }
 
-/** Records the window position `y` as the place a jump reached: a new history entry. */
-function arriving(p: Preview, y: number): void {
+/** Records the place a jump reached: a new history entry. */
+function arriving(p: Preview, y: number, cursor: number | null): void {
   try {
-    history.pushState({ mdp: true, buf: p.shownBuf(), line: yToLine(p.index(), y) }, "");
+    history.pushState(entry(p, y, cursor), "");
   } catch {
     // As in `leaving`.
   }
 }
 
-/** An in-document jump (an anchor, a footnote): the target lands at the reading reserve below the top, through the
- *  kit's glide, and the place left and the place reached become history entries, so `H` and `L` move between them.
- *  Entries carry the buffer; one from another buffer is ignored. */
+/** Runs `move`, a jump of the cursor, and records the place left and the place reached as history entries, so `H`
+ *  and `L` move between them; a jump that moved the cursor less than a pixel records nothing. */
+function jumping(p: Preview, move: () => boolean): void {
+  const fromY = p.destination();
+  const fromBand = p.cursorBand();
+  const from = p.cursorPlace();
+  if (!move()) return;
+  const toBand = p.cursorBand();
+  if (!fromBand || !toBand || Math.abs(toBand.top - fromBand.top) < 1) return;
+  leaving(p, fromY, from);
+  arriving(p, p.destination(), p.cursorPlace());
+}
+
+/** An in-document jump (an anchor, a footnote): with the keys in the preview the cursor goes to the target's first
+ *  row, the page scrolling only when that row is outside the margins; without them (a link followed while nvim has
+ *  the keys) the target lands at the reading reserve below the top. The place left and the place reached become
+ *  history entries. Entries carry the buffer; one from another buffer is ignored. */
 export function jumpTo(p: Preview, el: Element): void {
-  leaving(p, p.destination());
+  if (p.cursorBand()) {
+    const y = el.getBoundingClientRect().top + window.scrollY;
+    jumping(p, () => p.jumpCursorTo(y + ROW_PROBE_PX));
+    return;
+  }
+  const from = p.destination();
   const y = p.scrollToElement(el);
-  arriving(p, y);
+  if (Math.abs(y - from) < 1) return;
+  leaving(p, from, null);
+  arriving(p, y, null);
 }
 
 /* A wide block (code, a table, a diagram, a formula) scrolls inside itself; by keys this is the only way to read
@@ -111,21 +167,31 @@ function sideways(p: Preview, dx: number): void {
 }
 
 /* A preview has no next page to go to, so `]]`/`[[` move between sections, as they do in vim's own Markdown
-   buffers. A heading lands at the reading reserve below the top, so the next one is looked for below that line, and
-   from where a running glide is heading, so quick presses each move one more heading. The move is a jump: the line
-   left and the heading reached become history entries. */
+   buffers: the cursor goes to the next heading below its row (the previous one above), and the page scrolls only
+   when that heading is outside the margins. The move is a jump: the place left and the heading reached become
+   history entries. */
 function heading(p: Preview, dir: 1 | -1): void {
+  const band = p.cursorBand();
+  if (!band) return;
   const headings = p.index().filter((b) => HEADING.test(b.el.tagName));
-  const from = p.destination();
-  const reading = from + p.reservePx();
-  const target = dir > 0 ? headings.find((b) => b.top > reading + 1)
-    : [...headings].reverse().find((b) => b.top < reading - 1);
-  if (!target) return;
-  const y = p.yFor(target.top);
-  if (Math.abs(y - from) < 1) return;
-  leaving(p, from);
-  p.glideTo(y);
-  arriving(p, y);
+  // A heading the cursor's band overlaps is the one it is on (the band, a line box, reaches a few px past the
+  // heading's own box), never the next or the previous one.
+  const target = dir > 0 ? headings.find((b) => b.top >= band.bottom - 1)
+    : [...headings].reverse().find((b) => b.top + b.height <= band.top + 1);
+  if (target) jumping(p, () => p.jumpCursorTo(target.top + ROW_PROBE_PX));
+}
+
+/* The match the kit's find moved to: its current highlight (the CSS Custom Highlight API), or the selection the kit
+   shows it as without that API. */
+function findMatch(): Range | null {
+  const registry = (globalThis as { CSS?: { highlights?: { get(name: string): Iterable<unknown> | undefined } } }).CSS
+    ?.highlights;
+  if (registry) {
+    for (const r of registry.get("eitri-find-current") ?? []) if (r instanceof Range) return r;
+    return null;
+  }
+  const selection = document.getSelection();
+  return selection && selection.rangeCount > 0 ? selection.getRangeAt(0) : null;
 }
 
 export async function installKeys(
@@ -162,6 +228,15 @@ export async function installKeys(
   // what the page does not know (yank) goes to the caller.
   const run = (action: string, ev: KeyboardEvent): boolean => {
     switch (action) {
+      case "cursor.down": p.moveRows(1); return true;
+      case "cursor.up": p.moveRows(-1); return true;
+      case "cursor.half_down": p.halfPage(1); return true;
+      case "cursor.half_up": p.halfPage(-1); return true;
+      case "cursor.page_down": p.fullPage(1); return true;
+      case "cursor.page_up": p.fullPage(-1); return true;
+      // gg and G are jumps, as in vim; a held key's repeats move nothing more.
+      case "cursor.first": if (!ev.repeat) jumping(p, () => p.cursorFirst()); return true;
+      case "cursor.last": if (!ev.repeat) jumping(p, () => p.cursorLast()); return true;
       case "heading.next": heading(p, 1); return true;
       case "heading.prev": heading(p, -1); return true;
       case "scroll.left": sideways(p, -SIDEWAYS_PX); return true;
@@ -172,19 +247,22 @@ export async function installKeys(
       default: return extra.run(action, ev);
     }
   };
-  // A click picks the block `yy` and Enter act on, without scrolling; a click on a link, a toggle or a check box is
+  // A click puts the cursor on the clicked row, without scrolling; a click on a link, a toggle or a check box is
   // that control's own.
   const onClick = (ev: MouseEvent) => {
     if ((ev.target as Element).closest?.("a, summary, input")) return;
-    setClickedBlock(boxAt(p.index(), ev.pageY));
+    noteClick();
+    p.cursorToPoint(ev.pageY);
     refresh();
   };
   const onDouble = (ev: MouseEvent) => { void editHere(p, ev.pageY); };
   // `H`/`L` are the browser's own back and forward; the page answers only the entries it pushed for the buffer it
   // shows now, so a jump made in another document never scrolls this one.
   const onPop = (ev: PopStateEvent) => {
-    const state = ev.state as { mdp?: boolean; buf?: number; line?: number } | null;
+    const state = ev.state as { mdp?: boolean; buf?: number; line?: number; cursor?: number } | null;
     if (!state?.mdp || state.buf !== p.shownBuf() || typeof state.line !== "number") return;
+    // The entry's cursor goes back as a jump puts it; an entry the cursor did not record places the page by its line.
+    if (typeof state.cursor === "number" && p.jumpCursorToLine(state.cursor)) return;
     const max = Math.max(0, document.documentElement.scrollHeight - window.innerHeight);
     window.scrollTo({ top: lineToY(p.index(), state.line, max), behavior: "instant" as ScrollBehavior });
   };
@@ -201,27 +279,32 @@ export async function installKeys(
     refresh();
     if (why === "render") k?.findRefresh();
   });
-  // The kit's own jumps (gg, G, a search's move) go into the history the way `]]` and anchors do: the line left,
-  // then the line reached.
-  let jumpFrom: number | null = null;
+  // The kit's own jumps (a search's move) put the cursor on the match and go into the history the way `]]` and
+  // anchors do. The kit has started its own scroll to the match; the cursor's jump replaces it, so the page moves
+  // only when the match is outside the margins, judged from where the window was before.
+  let jumpFrom: { y: number; cursor: number | null; band: number | null } | null = null;
   const onJump = (when: "before" | "after") => {
-    if (when === "before") { jumpFrom = p.destination(); return; }
+    if (when === "before") {
+      jumpFrom = { y: p.destination(), cursor: p.cursorPlace(), band: p.cursorBand()?.top ?? null };
+      return;
+    }
     const from = jumpFrom;
     jumpFrom = null;
-    const to = p.destination();
-    if (from === null || Math.abs(to - from) < 1) return;
-    leaving(p, from);
-    arriving(p, to);
+    const rect = findMatch()?.getBoundingClientRect();
+    if (!from || !rect || !p.jumpCursorTo(rect.top + window.scrollY + rect.height / 2, from.y)) return;
+    const to = p.cursorBand()?.top ?? null;
+    if (from.band === null || to === null || Math.abs(to - from.band) < 1) return;
+    leaving(p, from.y, from.cursor);
+    arriving(p, p.destination(), p.cursorPlace());
   };
   const remove = k
     ? await k.install({
-      rows: PAGE_ROWS,
+      rows: pageRows(extra.prefix),
       run,
       initial: { timeoutlen: extra.timeoutlen ?? 1000, hasKeys: p.hasKeys(), prefix: extra.prefix ?? null,
         settings: extra.settings },
       labels: { messages: FIND_MESSAGES },
       find: { root: () => root, exclude: FIND_EXCLUDE },
-      bottom: () => p.bottomY(),
       onJump,
     })
     : () => {};

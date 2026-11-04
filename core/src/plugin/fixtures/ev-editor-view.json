@@ -22,6 +22,7 @@
     },
     "scrolloff": 4,
     "rows": 46,
-    "cursor_row": 7
+    "cursor_row": 7,
+    "grid_top": 0.0125
   }
 }

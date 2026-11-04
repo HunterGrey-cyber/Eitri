@@ -1,5 +1,5 @@
-import { describe, expect, it } from "vitest";
-import { boxAt, clickedRecently, currentBlock, lineAt, pickBlock, pickedLine, setClickedBlock } from "./current";
+import { describe, expect, it, vi } from "vitest";
+import { boxAt, CLICK_WINS_MS, clickedRecently, currentBlock, lineAt, noteClick, pickBlock, pickedLine } from "./current";
 import type { Box } from "./lineindex";
 import type { Preview } from "./preview";
 
@@ -23,35 +23,35 @@ describe("the current block", () => {
     expect(currentBlock(fake(10))).toBe(INDEX[0]);
     expect(currentBlock(fake(22))).toBe(INDEX[1]);
   });
-  it("is a clicked block until the next scroll", () => {
+  it("is the block at the reading point, wherever a click or the keys' pick was made", () => {
     scrollTo(0);
-    setClickedBlock(INDEX[2]);
-    expect(currentBlock(fake(22))).toBe(INDEX[2]);
-    scrollTo(5);
-    expect(currentBlock(fake(27))).toBe(INDEX[1]);
-    scrollTo(0);
-    expect(currentBlock(fake(10))).toBe(INDEX[0]);
+    pickBlock(INDEX[2], 6, 1);
     expect(currentBlock(fake(22))).toBe(INDEX[1]);
+    expect(currentBlock(fake(100))).toBe(INDEX[2]);
   });
-  it("is the block holding nvim's cursor when the keys picked it, keeping that line, until the next scroll", () => {
-    scrollTo(0);
-    pickBlock(INDEX[2], 6);
-    expect(currentBlock(fake(22))).toBe(INDEX[2]);
-    expect(pickedLine(INDEX[2])).toBe(6);
-    expect(pickedLine(INDEX[1])).toBeNull();
+  it("keeps nvim's picked line for the block it was picked for until the cursor moves", () => {
+    pickBlock(INDEX[2], 6, 4);
+    expect(pickedLine(INDEX[2], 4)).toBe(6);
+    expect(pickedLine(INDEX[1], 4)).toBeNull();
+    // A scroll that leaves the cursor where it was keeps it; a move of the cursor drops it.
     scrollTo(5);
-    expect(pickedLine(INDEX[2])).toBeNull();
-    expect(currentBlock(fake(27))).toBe(INDEX[1]);
+    expect(pickedLine(INDEX[2], 4)).toBe(6);
+    expect(pickedLine(INDEX[2], 5)).toBeNull();
   });
   it("tells a recent click from the keys' pick", () => {
-    scrollTo(0);
-    setClickedBlock(null);
-    expect(clickedRecently()).toBe(false);
-    pickBlock(INDEX[0], 0);
-    expect(clickedRecently()).toBe(false);
-    setClickedBlock(INDEX[1]);
-    expect(clickedRecently()).toBe(true);
-    expect(pickedLine(INDEX[1])).toBeNull();
+    let now = 1e9;
+    vi.spyOn(performance, "now").mockImplementation(() => now);
+    try {
+      expect(clickedRecently()).toBe(false);
+      pickBlock(INDEX[0], 0, 1);
+      expect(clickedRecently()).toBe(false);
+      noteClick();
+      expect(clickedRecently()).toBe(true);
+      now += CLICK_WINS_MS;
+      expect(clickedRecently()).toBe(false);
+    } finally {
+      vi.restoreAllMocks();
+    }
   });
 });
 

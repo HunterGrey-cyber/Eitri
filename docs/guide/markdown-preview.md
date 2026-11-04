@@ -8,7 +8,7 @@ both directions, and can be read with Vim-style keys of its own. It is a plugin 
 turn it on.
 
 The preview only shows the file. You edit in Neovim, and only there: `Enter` in the preview moves Neovim's cursor to
-the block you are reading and gives Neovim the keys.
+where the preview's cursor is and gives Neovim the keys.
 
 ## Turn it on
 
@@ -84,22 +84,27 @@ Whichever side has the keys leads:
 - With the keys in Neovim (or anywhere outside the preview), moving and scrolling in Neovim move the preview, a
   cursor move that does not scroll Neovim included, and a bar in the preview's margin marks Neovim's cursor line. At
   the top and the bottom of the document the preview stops at its ends.
-- With the keys in the preview, scrolling it moves Neovim's window so that the line you are reading in the preview
-  is at the same height in Neovim, with Neovim's cursor on it, so leaving the preview finds Neovim at the same place
-  with the cursor on that line. Where
-  Neovim's `scrolloff` does not let the cursor sit on that line without scrolling, the cursor goes to the nearest line
-  that does; Neovim's window never moves for it. A scroll still running when you leave finishes at once, and Neovim
-  is told where it ended. If you leave without having scrolled, Neovim is told nothing and its cursor stays put.
-- The line you are reading sits a few lines below the preview's top, never on its edge: at least five lines of the
-  preview's text (what Vim's own defaults keep; Neovim's default `scrolloff` is 0), more when your Neovim's
-  `scrolloff` keeps more rows, at most a quarter of the view. Near the top of the document there is no such room, as
-  in Neovim.
+- With the keys in the preview, the preview has a cursor of its own, drawn like Neovim's `cursorline`: a bar in the
+  margin and a band in your colourscheme's cursor-line colour. Neovim follows it: Neovim's cursor stands on the same
+  line, at the same height, and Neovim's window scrolls only when the preview does, so leaving the preview finds
+  Neovim at the same place with the cursor on that line. Where Neovim's `scrolloff` does not let the cursor sit on
+  that line without scrolling, the cursor goes to the nearest line that does. A scroll still running when you leave
+  finishes at once, and Neovim is told where it ended. If you leave without having moved, Neovim is told nothing and
+  its cursor stays put.
+- The cursor keeps a margin at the top and the bottom of the view, as Neovim's `scrolloff` does: at least five lines
+  of the preview's text (what Vim's own defaults keep; Neovim's default `scrolloff` is 0), more when your Neovim's
+  `scrolloff` keeps more rows, at most a quarter of the view. A move that would cross a margin scrolls the preview by
+  just enough instead. At the top and the bottom of the document the margins give way, so the cursor reaches the
+  first and the last line.
+- Near the top of a document the preview's cursor can sit lower than Neovim's: rendered Markdown is taller than its
+  source, and neither side scrolls above its first line. From the first scroll on they are level.
 - Coming back to Neovim, nothing moves until you move in Neovim.
-- Going into the preview, the block Neovim's cursor is in, when it is on screen, becomes the current block, so `yy`
-  and `Enter` act on what you were editing. On a line outside any block (a blank line between paragraphs) the
-  nearest block becomes current, and `Enter` still leaves Neovim's cursor on its own line.
-- Scrolling the preview with the mouse wheel moves Neovim's window too, even while Neovim has the keys; Neovim's
-  cursor then moves only as far as its `scrolloff` needs. Neovim's next own move takes the lead back.
+- Going into the preview, the cursor starts on the line Neovim's cursor is on, where the preview shows it, so nothing
+  moves. On a line outside any block (a blank line between paragraphs) it starts on the nearest block, and `Enter`
+  still leaves Neovim's cursor on its own line.
+- Scrolling the preview with the mouse wheel moves the page, and the cursor stays on its line unless a margin pushes
+  it, as in Neovim. While Neovim has the keys, the wheel moves Neovim's window too; Neovim's cursor then moves only
+  as far as its `scrolloff` needs, and Neovim's next own move takes the lead back.
 
 ## Reading with the keyboard
 
@@ -107,11 +112,12 @@ Give the preview the keys with your key, with `Ctrl+l` from the editor, or by cl
 
 | keys | what it does |
 |---|---|
-| `j` or `Ctrl+e` / `k` or `Ctrl+y` | scroll down / up a step (held, they keep scrolling) |
-| `d` or `Ctrl+d` / `u` or `Ctrl+u` | half a page down / up |
+| `j` / `k` | the cursor down / up a line as shown (a long paragraph is several lines, as with Vim's `gj`) |
+| `Ctrl+e` / `Ctrl+y` | scroll down / up a step; the cursor stays unless a margin pushes it |
+| `d` or `Ctrl+d` / `u` or `Ctrl+u` | half a page down / up, the cursor with it |
 | `Ctrl+f` / `Ctrl+b` | a page down / up |
-| `gg` / `G` | top / bottom (the document's last line at the bottom of the view, as in Vim) |
-| `]]` / `[[` | next / previous heading, put where you read, a few lines below the top |
+| `gg` / `G` | the cursor to the first / last line (the document's last line at the bottom of the view, as in Vim) |
+| `]]` / `[[` | the cursor to the next / previous heading |
 | `zh` / `zl` | scroll the current block sideways (a wide table, code block, formula or diagram) |
 | `/` | find in the rendered text; `Enter` runs the search (an empty one repeats the last), `Esc` cancels |
 | `n` / `N` | next / previous match, wrapping round |
@@ -122,16 +128,14 @@ Give the preview the keys with your key, with `Ctrl+l` from the editor, or by cl
 | `?` | the list of these keys |
 | `Esc` | leave a mode; also clears the search highlights |
 
-- The current block is the one where you read, the reading lines below the top of the view; a bar in the margin
-  marks it while the preview has the keys. A click makes the clicked block current until you scroll. Double-clicking
-  a block does what `Enter` does there.
-- `Enter` leaves Neovim's cursor on its line when it is already in the current block (put there as you scrolled, or
-  the block you came in with, where the column stays too), so Neovim's window does not scroll. When the block you read is a
-  long wrapped paragraph on Neovim's top line, `scrolloff` keeps the cursor off it, and `Enter` leaves the cursor on
-  the line Neovim holds just below rather than scroll Neovim.
-- Moves that jump (`gg`, `G`, `]]`, `[[`, a search and `n`/`N`, a link inside the document) glide like the scroll
-  keys, or jump at once when smooth scrolling is off or your desktop asks for reduced motion. `]]` pressed quickly
-  several times moves that many headings.
+- The current block is the one the cursor is in; a second bar in the margin marks it. A click puts the cursor on the
+  line you clicked. Double-clicking a block does what `Enter` does there.
+- `Enter` leaves Neovim's cursor on its line when it is already on the cursor's line (put there as you moved, or the
+  line you came in with, where the column stays too), so Neovim's window does not scroll.
+- Moves that jump (`gg`, `G`, `]]`, `[[`, a search and `n`/`N`, a link inside the document, `H` and `L`) take the
+  cursor to the target and scroll only when it is outside the margins: as little as needed when it is near, centred
+  when it is far, as in Neovim. Scrolling glides, or jumps at once when smooth scrolling is off or your desktop asks
+  for reduced motion. A count (`5j`) is not read.
 - By default the search ignores case unless it has a capital letter, as in Vim's `smartcase`
   (`plugins.keys.find_case` changes that). The status line shows `[3/12]`, and `search hit BOTTOM, continuing at TOP`
   when it wraps.
@@ -149,10 +153,13 @@ Change any of these keys in `init.lua`, as for any plugin, in the `plugin:markdo
 eitri.keymap.set("plugin:markdown", "e", "edit.here")
 ```
 
-`<prefix> ?` with the preview focused lists its keys first in Eitri's own key list. The actions are `scroll.down`,
-`scroll.up`, `scroll.half_down`, `scroll.half_up`, `scroll.page_down`, `scroll.page_up`, `scroll.top`, `scroll.bottom`,
-`heading.next`, `heading.prev`, `scroll.left`, `scroll.right`, `find.start`, `find.next`, `find.prev`, `hint.start`,
-`block.yank`, `edit.here`, `history.back`, `history.forward`, `sheet.open` and `mode.escape`.
+`<prefix> ?` with the preview focused lists its keys first in Eitri's own key list. The actions are `cursor.down`,
+`cursor.up`, `cursor.half_down`, `cursor.half_up`, `cursor.page_down`, `cursor.page_up`, `cursor.first`,
+`cursor.last`, `scroll.down`, `scroll.up`, `heading.next`, `heading.prev`, `scroll.left`, `scroll.right`, `find.start`,
+`find.next`, `find.prev`, `hint.start`, `block.yank`, `edit.here`, `history.back`, `history.forward`, `sheet.open` and
+`mode.escape`. If you changed these keys for a release candidate, rename an override of `scroll.half_down`,
+`scroll.half_up`, `scroll.page_down`, `scroll.page_up`, `scroll.top` or `scroll.bottom` to the matching `cursor.`
+action (`cursor.half_down`, ..., `cursor.first`, `cursor.last`): the preview no longer has those `scroll.` actions.
 
 How far a step scrolls, whether scrolling is animated, how long a key such as `g` waits, when the list of following
 keys appears, the letters hint labels use and how the search treats case are settings shared by every plugin page:

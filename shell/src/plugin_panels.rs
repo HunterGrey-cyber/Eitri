@@ -1373,6 +1373,13 @@ impl PluginPanels {
         }
     }
 
+    /// Where the window's editor draws nvim's grid (the share of its height above the first row), for views.
+    pub(crate) fn set_grid_top(&self, source: Rc<dyn Fn() -> Option<f64>>) {
+        for (_, pump) in self.hosts() {
+            pump.host.set_grid_top(source.clone());
+        }
+    }
+
     pub(crate) fn set_layout(&self, show_and_focus: ShowAndFocus, terminal_at: TerminalAt) {
         for (module, pump) in self.hosts() {
             pump.host.set_layout(Rc::new(WindowLayout {

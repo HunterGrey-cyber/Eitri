@@ -3,7 +3,7 @@ import GithubSlugger from "github-slugger";
 import MarkdownIt from "markdown-it";
 import footnote from "markdown-it-footnote";
 import { alertsPlugin } from "./alerts";
-import { mark, NONCE_ATTR, RAW_HTML_END, type RenderEnv } from "./env";
+import { FENCE_ATTR, mark, NONCE_ATTR, RAW_HTML_END, type RenderEnv } from "./env";
 import { frontMatterPlugin } from "./frontmatter";
 import { highlightCode } from "./highlight";
 import { boxHtml, resolveImage } from "./images";
@@ -84,6 +84,9 @@ function pageRules(md: MarkdownIt): void {
     const code = highlightCode(token.content, lang, nonce);
     token.attrJoin("class", "mdp-wide");
     token.attrSet(NONCE_ATTR, nonce);
+    // The block's map holds its fence lines too; the code's own lines are the ones its rows show.
+    const content = token.content === "" ? 0 : token.content.split("\n").length - (token.content.endsWith("\n") ? 1 : 0);
+    token.attrSet(FENCE_ATTR, String(content));
     const cls = code === null ? "" : ` class="hljs language-${escapeHtml(lang)}"`;
     const body = code ?? escapeHtml(token.content);
     return `<pre${slf.renderAttrs(token)}><code${cls}${mark({ nonce })}>${body}</code></pre>\n`;

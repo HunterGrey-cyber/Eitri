@@ -2,13 +2,13 @@ import { lastTopAtOrBefore, type Box } from "./lineindex";
 import type { Preview } from "./preview";
 import { yToLine } from "./sync";
 
-/** How long after a click the click's block stays the current one even when the keys arrive later: a click that
- *  gives the preview the keys is seen by the page before or after the host's focus event, and it must win. */
+/** How long after a click the cursor it put stays where it is when the keys arrive later: a click that gives the
+ *  preview the keys is seen by the page before or after the host's focus event, and it must win. */
 export const CLICK_WINS_MS = 1000;
 
-/* The current block a click (or the keys arriving) picked, while nothing has scrolled since; `line` is nvim's cursor
-   line when the block was picked for that cursor: inside the block, or a line next to it that no block holds. */
-let clicked: { el: Element; scrollY: number; line: number | null } | null = null;
+/* The block picked for nvim's cursor line as the keys arrived, with that line (inside the block, or a line next to
+   it no block holds) and the cursor's move count then: it stands while the cursor has not moved. */
+let picked: { el: Element; moves: number; line: number } | null = null;
 let clickedAt = Number.NEGATIVE_INFINITY;
 
 /* The document's end sentinel: a tagged element with a line and no end line, last in the index. */
@@ -36,37 +36,30 @@ export function lineAt(index: Box[], y: number): number | null {
   return inside ? Math.min(Math.max(Math.floor(yToLine(index, y)), box.line), box.end - 1) : box.line;
 }
 
-/** A clicked block stays current until the next scroll, without scrolling. */
-export function setClickedBlock(box: Box | null): void {
-  clicked = box ? { el: box.el, scrollY: window.scrollY, line: null } : null;
-  clickedAt = box ? performance.now() : Number.NEGATIVE_INFINITY;
+/** A click on the page put the cursor: keys arriving within `CLICK_WINS_MS` leave it there. */
+export function noteClick(): void {
+  clickedAt = performance.now();
 }
 
-/** Makes `box`, the block holding nvim's cursor `line` (or the nearest one, for a line no block holds), current as a
- *  click would (until the next scroll), without counting as a click. */
-export function pickBlock(box: Box, line: number): void {
-  clicked = { el: box.el, scrollY: window.scrollY, line };
+/** Records `box` as the block holding nvim's cursor `line` (or the nearest one, for a line no block holds) when the
+ *  keys arrived and the cursor was put on it, at the cursor's move count `moves`. */
+export function pickBlock(box: Box, line: number, moves: number): void {
+  picked = { el: box.el, moves, line };
 }
 
-/** nvim's cursor line when `box` is current because it held that cursor, or was the nearest block to it, as the
- *  keys arrived. */
-export function pickedLine(box: Box): number | null {
-  return clicked && clicked.el === box.el && clicked.scrollY === window.scrollY ? clicked.line : null;
+/** nvim's cursor line when `box` was picked for it as the keys arrived and the cursor has not moved since (its move
+ *  count is still `moves`). */
+export function pickedLine(box: Box, moves: number): number | null {
+  return picked && picked.el === box.el && picked.moves === moves ? picked.line : null;
 }
 
-/** Whether a click picked the current block within the last `CLICK_WINS_MS`. */
+/** Whether a click put the cursor within the last `CLICK_WINS_MS`. */
 export function clickedRecently(): boolean {
   return performance.now() - clickedAt < CLICK_WINS_MS;
 }
 
-/** The block `yy` and Enter act on: the clicked (or picked) one while nothing has scrolled since, else the block at
- *  the reading position (the viewport's top plus the reading reserve), else the first block below it. */
+/** The block `yy`, Enter and `zh`/`zl` act on: the block at the reading point (the cursor while the preview has the
+ *  keys), else the first block below it. */
 export function currentBlock(p: Preview): Box | null {
-  const index = p.index();
-  if (clicked && clicked.scrollY === window.scrollY) {
-    const hit = index.find((b) => b.el === clicked!.el);
-    if (hit) return hit;
-  }
-  clicked = null;
-  return boxAt(index, p.readingY());
+  return boxAt(p.index(), p.readingY());
 }

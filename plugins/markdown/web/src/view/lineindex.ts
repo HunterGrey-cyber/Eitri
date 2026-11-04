@@ -1,3 +1,5 @@
+import { FENCE_ATTR } from "../render/env";
+
 /** One block of the rendered document and the source lines it stands for, in document coordinates. */
 export interface Box { line: number; end: number; top: number; height: number; el: Element }
 
@@ -64,8 +66,17 @@ export function measure(root: Element, scrollY: number): Measured[] {
       top += padTop;
       height = Math.max(0, height - padTop - padBottom);
     }
+    let first = line;
+    let end = lineAttr(el.getAttribute("data-line-end"));
+    // A fenced block's rows are its code: its lines are the ones after the opening fence, and the fence lines fall
+    // into the padding around them, as the gaps between blocks do.
+    const code = lineAttr(el.getAttribute(FENCE_ATTR));
+    if (el.tagName === "PRE" && code !== null && code > 0 && (end === null || line + 1 + code <= end)) {
+      first = line + 1;
+      end = line + 1 + code;
+    }
     const m: Measured = {
-      el, line, end: lineAttr(el.getAttribute("data-line-end")), top, height,
+      el, line: first, end, top, height,
       visible: height > 0 && !inClosedDetails(el, root), hasTaggedVisibleDescendant: false,
     };
     out.push(m);

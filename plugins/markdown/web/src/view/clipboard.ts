@@ -46,13 +46,20 @@ export const COPY_FAILED = "could not copy to the clipboard";
 const FENCE_LINE = /^[ \t]*(`{3,}|~{3,})/;
 
 /** `yy`: the current block's Markdown from the snapshot the preview rendered; a fenced block's code without its
- *  fences. The HUD says how many lines went to the clipboard. */
+ *  fences (the line index already holds a fenced block by its code lines alone; a block it holds from its opening
+ *  fence still drops them). A row no block holds (a list item's own line above its nested list) copies its own
+ *  line. The HUD says how many lines went to the clipboard. */
 export async function yankCurrentBlock(p: Preview): Promise<void> {
   const box = currentBlock(p);
   if (!box) return;
   const lines = p.lines();
-  const fence = box.el.tagName === "PRE" && FENCE_LINE.test(lines[box.line] ?? "");
-  const text = yankText(lines, { line: box.line, end: box.end, fence });
+  const at = p.readingY();
+  const own = at >= box.top && at < box.top + box.height ? null : p.sourceLineAt(at);
+  const outside = own !== null && (own < box.line || own >= box.end);
+  const fromFence = box.line === Number(box.el.getAttribute("data-line"));
+  const fence = !outside && box.el.tagName === "PRE" && fromFence && FENCE_LINE.test(lines[box.line] ?? "");
+  const text = outside ? yankText(lines, { line: own, end: own + 1, fence: false })
+    : yankText(lines, { line: box.line, end: box.end, fence });
   const count = text === "" ? 0 : text.split("\n").length;
   const ok = await copyText(text);
   kit()?.message(ok ? HUD.yanked(count) : COPY_FAILED);

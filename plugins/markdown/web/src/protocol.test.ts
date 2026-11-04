@@ -76,7 +76,7 @@ describe("events", () => {
       base: "eitri-plugin://markdown/.eitri/doc/4/docs/",
     });
     expect(view.data.scrolloff).toBe(4);
-    expect([view.data.rows, view.data.cursor_row]).toEqual([46, 7]);
+    expect([view.data.rows, view.data.cursor_row, view.data.grid_top]).toEqual([46, 7, 0.0125]);
     const echo = fixture("ev-editor-view-reveal.json").data;
     expect(isEditorView(echo)).toBe(true);
     expect([echo.cause, echo.token, echo.doc, echo.scrolloff, echo.rows, echo.cursor_row])
@@ -98,6 +98,8 @@ describe("events", () => {
     expect(isEditorView({ ...view, scrolloff: -1 })).toBe(false);
     expect(isEditorView({ ...view, scrolloff: 1.5 })).toBe(false);
     expect(isEditorView({ ...view, scrolloff: "4" })).toBe(false);
+    for (const g of [-0.1, 1, Number.NaN, "0.1"]) expect(isEditorView({ ...view, grid_top: g })).toBe(false);
+    expect(isEditorView({ ...view, grid_top: 0 })).toBe(true);
     for (const key of ["rows", "cursor_row"]) {
       for (const bad of [-1, 1.5, "7", null]) expect(isEditorView({ ...view, [key]: bad })).toBe(false);
     }

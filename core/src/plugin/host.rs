@@ -450,6 +450,9 @@ struct PluginHostState {
     /// is never sent into the document that replaced it.
     document: u64,
     editor: Option<Rc<dyn EditorRpc>>,
+    /// Where the editor beside the page draws nvim's grid: the share of its height above the first row, read as
+    /// each view goes out. Only a window that draws nvim's grid itself has it.
+    grid_top: Option<Rc<dyn Fn() -> Option<f64>>>,
     layout: Option<Rc<dyn LayoutPort>>,
     tasks: TaskRunner,
     store: Option<StoreWorker>,
@@ -603,6 +606,7 @@ fn editor_view(v: &ViewLine) -> EditorView {
         scrolloff: v.scrolloff,
         rows: v.rows,
         cursor_row: v.cursor_row,
+        grid_top: None,
     }
 }
 
@@ -705,6 +709,7 @@ impl PluginHost {
             moved_away: false,
             document: 0,
             editor: None,
+            grid_top: None,
             layout: None,
             tasks: TaskRunner::new(wake.clone()),
             store: None,
@@ -783,6 +788,11 @@ impl PluginHost {
 
     pub fn set_editor(&self, editor: Rc<dyn EditorRpc>) {
         self.state.borrow_mut().editor = Some(editor);
+    }
+
+    /// The editor's grid top (`EditorView::grid_top`), read as each view goes to the page.
+    pub fn set_grid_top(&self, source: Rc<dyn Fn() -> Option<f64>>) {
+        self.state.borrow_mut().grid_top = Some(source);
     }
 
     pub fn set_layout(&self, layout: Rc<dyn LayoutPort>) {
@@ -1124,6 +1134,10 @@ impl PluginHost {
     fn view_event(&self, view: &ViewLine) -> EditorView {
         let mut event = editor_view(view);
         event.doc = self.doc_prefixes(&view.name);
+        let source = self.state.borrow().grid_top.clone();
+        event.grid_top = source
+            .and_then(|read| read())
+            .filter(|g| g.is_finite() && (0.0..1.0).contains(g));
         event
     }
 

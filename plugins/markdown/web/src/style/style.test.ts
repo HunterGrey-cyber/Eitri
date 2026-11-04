@@ -96,7 +96,8 @@ describe("the page's stylesheets", () => {
   it("style every class the page's modules draw", () => {
     for (const cls of [
       ".mdp-root", ".mdp-notice", ".mdp-box", ".mdp-box-reason", ".mdp-error-badge", ".mdp-math-error", ".mdp-diagram",
-      ".mdp-diagram-pending", ".mdp-cursor-bar", ".mdp-current-bar", ".mdp-wide", ".front-matter", ".markdown-alert",
+      ".mdp-diagram-pending", ".mdp-cursor-bar", ".mdp-cursor-line", ".mdp-current-bar", ".mdp-wide", ".front-matter",
+      ".markdown-alert",
       ".markdown-alert-title", ".task-list-item",
     ]) {
       expect(all, cls).toContain(cls);

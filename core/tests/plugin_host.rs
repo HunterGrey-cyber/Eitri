@@ -1754,6 +1754,31 @@ fn a_view_hands_its_scrolloff_and_rows_to_the_page_and_leaves_them_out_when_nvim
 }
 
 #[test]
+fn a_view_carries_the_editors_grid_top_once_the_window_gives_one_and_never_one_out_of_range() {
+    let d = shown("host-view-grid-top");
+    let t = d.t0 + ms(300);
+    d.rig.host.follow_view(named_view(&d.a, 3, 41), t);
+    d.rig.host.pump(t);
+    assert!(last_view(&d.rig).get("grid_top").is_none(), "no editor beside: none");
+    let share = std::rc::Rc::new(std::cell::Cell::new(Some(0.0125)));
+    let read = share.clone();
+    d.rig.host.set_grid_top(std::rc::Rc::new(move || read.get()));
+    let mut v = named_view(&d.a, 3, 41);
+    v.top = 8;
+    d.rig.host.follow_view(v, t + ms(10));
+    d.rig.host.pump(t + ms(10));
+    assert_eq!(last_view(&d.rig)["grid_top"], 0.0125);
+    share.set(Some(1.0));
+    let mut v = named_view(&d.a, 3, 41);
+    v.top = 9;
+    d.rig.host.follow_view(v, t + ms(20));
+    d.rig.host.pump(t + ms(20));
+    let last = last_view(&d.rig);
+    assert_eq!(last["top"], 9);
+    assert!(last.get("grid_top").is_none(), "{last}");
+}
+
+#[test]
 fn a_jump_waiting_behind_a_newer_jump_is_answered_not_applied() {
     let d = shown("host-jump-newest");
     let t = d.t0 + ms(300);
