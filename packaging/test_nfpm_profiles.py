@@ -409,7 +409,7 @@ DESKTOP_SRCS = [DESKTOP_SRC, PANEL_DESKTOP_SRC, PAGE_DESKTOP_SRC]
 DESKTOP_DSTS = [DESKTOP_DST, PANEL_DESKTOP_DST, PAGE_DESKTOP_DST]
 # The nvim plugin: every file under nvim/eitri.nvim, at the same relative path under this directory.
 NVIM_PLUGIN_DST = "/usr/share/eitri/nvim/eitri.nvim"
-NVIM_PLUGIN_FILES = ["doc/eitri.txt", "lua/eitri/init.lua", "plugin/eitri.lua"]
+NVIM_PLUGIN_FILES = ["doc/eitri.txt", "lua/eitri/health.lua", "lua/eitri/init.lua", "plugin/eitri.lua"]
 # The Markdown preview plugin: one `type: tree` entry per profile, from the tree release.sh stages (its manifest and
 # built site), to the system data directory `eitri.plugin.load("markdown")` searches.
 MARKDOWN_PLUGIN_SRC = "./plugins/markdown"

@@ -800,6 +800,7 @@ _ICON_HICOLOR = {
 _PLUGIN_FILES = {
     "plugin-eitri-lua": "plugin/eitri.lua",
     "plugin-module": "lua/eitri/init.lua",
+    "plugin-health": "lua/eitri/health.lua",
     "plugin-doc": "doc/eitri.txt",
 }
 

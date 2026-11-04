@@ -108,6 +108,10 @@ contents:
     dst: /usr/share/eitri/nvim/eitri.nvim/lua/eitri/init.lua
     file_info:
       mode: 0644
+  - src: ./nvim/eitri.nvim/lua/eitri/health.lua
+    dst: /usr/share/eitri/nvim/eitri.nvim/lua/eitri/health.lua
+    file_info:
+      mode: 0644
   - src: ./nvim/eitri.nvim/doc/eitri.txt
     dst: /usr/share/eitri/nvim/eitri.nvim/doc/eitri.txt
     file_info:

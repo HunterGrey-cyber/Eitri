@@ -1179,6 +1179,7 @@ class BinaryAssetTreeTests(unittest.TestCase):
         self.assertEqual(p["plugin-eitri-lua"], "usr/share/eitri/nvim/eitri.nvim/plugin/eitri.lua")
         self.assertEqual(p["plugin-module"], "usr/share/eitri/nvim/eitri.nvim/lua/eitri/init.lua")
         self.assertEqual(p["plugin-doc"], "usr/share/eitri/nvim/eitri.nvim/doc/eitri.txt")
+        self.assertEqual(p["plugin-health"], "usr/share/eitri/nvim/eitri.nvim/lua/eitri/health.lua")
         self.assertEqual(rc.TRACKED_ART["plugin-module"], "nvim/eitri.nvim/lua/eitri/init.lua")
         repo = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
         on_disk = set()
@@ -1187,6 +1188,31 @@ class BinaryAssetTreeTests(unittest.TestCase):
                 on_disk.add(os.path.relpath(os.path.join(dirpath, name), os.path.join(repo, "nvim", "eitri.nvim")))
         self.assertEqual(on_disk, {path[len("nvim/eitri.nvim/"):] for role, path in rc.TRACKED_ART.items()
                                    if role.startswith("plugin-")})
+
+    def test_every_file_under_eitri_nvim_is_named_by_every_list_that_ships_it(self):
+        """The plugin's files are named one by one in four places (the installer's NV_PLUGIN_FILES, both nfpm
+        profiles, release_check's role table); the tarball and the AUR packages take the directory whole. A file
+        added under nvim/eitri.nvim/ and missing from one list ships in some routes and not in others, so each
+        list is held to the files on disk."""
+        repo = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+        root = os.path.join(repo, "nvim", "eitri.nvim")
+        on_disk = {os.path.relpath(os.path.join(d, n), root) for d, _dirs, files in os.walk(root) for n in files}
+        self.assertTrue(on_disk, "no plugin files found")
+        with open(os.path.join(repo, "packaging", "install.sh"), encoding="utf-8") as fh:
+            listed = re.search(r"^NV_PLUGIN_FILES='([^']*)'$", fh.read(), re.M)
+        self.assertIsNotNone(listed, "install.sh has no NV_PLUGIN_FILES line")
+        lists = {"install.sh NV_PLUGIN_FILES": set(listed.group(1).split()),
+                 "release_check.py _PLUGIN_FILES": set(rc._PLUGIN_FILES.values())}
+        for name in ("nfpm.yaml", "nfpm-public.yaml"):
+            with open(os.path.join(repo, "packaging", name), encoding="utf-8") as fh:
+                text = fh.read()
+            srcs = set(re.findall(r"^\s*- src: \./nvim/eitri\.nvim/(\S+)$", text, re.M))
+            dsts = set(re.findall(r"^\s*dst: /usr/share/eitri/nvim/eitri\.nvim/(\S+)$", text, re.M))
+            self.assertEqual(srcs, dsts, name)
+            lists[name] = srcs
+        wrong = [f"{label}: missing {sorted(on_disk - names)}, not on disk {sorted(names - on_disk)}"
+                 for label, names in lists.items() if names != on_disk]
+        self.assertEqual(wrong, [], "each list must name exactly the files under nvim/eitri.nvim/")
 
     def test_the_gnome_extension_is_four_files_in_the_tarball_and_both_packages(self):
         """The extension's shipped set is the four files the shell loads; testing.js, README.md and test/

@@ -47,7 +47,7 @@ t_panel_entry_and_plugin_installed() {
 			fail "the installed plugin file $f is not nvim/eitri.nvim/$f"
 		fi
 	done
-	expect_eq "$(find "$(data_of)/eitri/eitri.nvim" -type f | wc -l | tr -d ' ')" 3 "the files under the plugin directory"
+	expect_eq "$(find "$(data_of)/eitri/eitri.nvim" -type f | wc -l | tr -d ' ')" "$(find "$PKG/../nvim/eitri.nvim" -type f | wc -l | tr -d " ")" "the files under the plugin directory"
 	# Not where the private nvim versions are scanned and removed.
 	expect_absent "$(data_of)/eitri/nvim"
 	expect_eq "$(plugin_tmps)" "" "temporary names left behind"
