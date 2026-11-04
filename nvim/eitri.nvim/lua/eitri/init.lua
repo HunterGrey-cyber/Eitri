@@ -112,6 +112,48 @@ function M.page(id, dir)
   end
 end
 
+function M.open(dir)
+  if torn then return end
+  if vim.fn.has("nvim-0.12") == 0 then
+    local version = vim.version()
+    vim.notify(string.format("Eitri's takeover needs nvim 0.12 or later (this is %d.%d.%d)",
+      version.major, version.minor, version.patch))
+    return
+  end
+  local addr = vim.v.servername
+  if addr == nil or addr == "" then
+    addr = vim.fn.serverstart()
+  end
+  local args = { config.cmd, "open", "--nvim", addr }
+  if dir ~= nil then
+    table.insert(args, "--")
+    table.insert(args, dir)
+  end
+  local stderr = {}
+  local ok, job = pcall(vim.fn.jobstart, args, {
+    detach = true,
+    on_stdout = function() end,
+    stderr_buffered = true,
+    on_stderr = function(_, data)
+      if torn then return end
+      stderr = data or {}
+    end,
+    on_exit = function(_, code)
+      if torn then return end
+      if code ~= 0 then
+        vim.schedule(function()
+          if torn then return end
+          local last = vim.trim(table.concat(stderr, "\n")):match("([^\n]+)$")
+          vim.notify(last or ("eitri open: exited with code " .. code), vim.log.levels.ERROR)
+        end)
+      end
+    end,
+  })
+  if not ok or job <= 0 then
+    vim.notify("eitri: could not run `" .. config.cmd .. "`", vim.log.levels.ERROR)
+  end
+end
+
 function M.panel(dir)
   local addr = vim.v.servername
   if addr == nil or addr == "" then

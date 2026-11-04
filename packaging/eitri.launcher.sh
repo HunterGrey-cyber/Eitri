@@ -128,7 +128,10 @@ fi
 # loop as the one-window command line: what is shared (--account, --quiet, the project) behaves
 # alike, and the options that only make sense for one of the two are refused in the other.
 MODE=window
-if [[ "${1:-}" == panel ]]; then
+if [[ "${1:-}" == open ]]; then
+	MODE=open
+	shift
+elif [[ "${1:-}" == panel ]]; then
 	MODE=panel
 	shift
 elif [[ "${1:-}" == split ]]; then
@@ -157,9 +160,11 @@ SAW_DASHES=""
 SHELL_ARGS=()
 PANEL_ARGS=()
 PAGE_POSITIONALS=()
+OPEN_POSITIONALS=()
 PAGE_LIST=""
 # What an unknown option is reported as: `eitri: ...` for the window, `eitri panel: ...` for the panel.
 CMD_NAME=eitri
+[[ $MODE == open ]] && CMD_NAME="eitri open"
 [[ $MODE == panel ]] && CMD_NAME="eitri panel"
 [[ $MODE == split ]] && CMD_NAME="eitri split"
 [[ $MODE == page ]] && CMD_NAME="eitri page"
@@ -175,7 +180,7 @@ while [[ $# -gt 0 ]]; do
 		           SHELL_ARGS+=(--clean); shift ;;
 		# The panel attaches to an nvim that is already running; there is nothing to attach to in the
 		# one-window mode, which starts its own.
-		--nvim)    [[ $MODE == panel || $MODE == page ]] || { echo "$CMD_NAME: unknown option --nvim" >&2; exit 64; }
+		--nvim)    [[ $MODE == panel || $MODE == page || $MODE == open ]] || { echo "$CMD_NAME: unknown option --nvim" >&2; exit 64; }
 		           [[ -n "${2:-}" ]] || { echo "$CMD_NAME: --nvim needs an address" >&2; exit 64; }
 		           PANEL_ARGS+=(--nvim "$2"); shift 2 ;;
 		--list)    [[ $MODE == page ]] || { echo "$CMD_NAME: unknown option --list" >&2; exit 64; }
@@ -197,6 +202,7 @@ while [[ $# -gt 0 ]]; do
 		--) SAW_DASHES=1; shift
 		    if [[ $MODE == window ]]; then AFTER=("$@"); FIRST="${FIRST:-${1:-}}"
 		    elif [[ $MODE == page ]]; then PAGE_POSITIONALS+=("$@")
+		    elif [[ $MODE == open ]]; then OPEN_POSITIONALS+=("$@")
 		    else PROJECT="${1:-}"; fi
 		    break ;;
 		-*) echo "$CMD_NAME: unknown option $1" >&2; exit 64 ;;
@@ -205,6 +211,7 @@ while [[ $# -gt 0 ]]; do
 		        # The banner names the first thing to open, not a `+N` line spec.
 		        [[ -z "$FIRST" && $1 != +* ]] && FIRST="$1"
 		    elif [[ $MODE == page ]]; then PAGE_POSITIONALS+=("$1")
+		    elif [[ $MODE == open ]]; then OPEN_POSITIONALS+=("$1")
 		    else PROJECT="$1"; fi
 		    shift ;;
 	esac
@@ -222,10 +229,22 @@ if [[ $MODE == page ]]; then
 	[[ ${#PAGE_POSITIONALS[@]} -le 2 ]] || { echo 'eitri page: takes a plugin id and an optional directory' >&2; exit 64; }
 	PROJECT="${PAGE_POSITIONALS[1]:-}"
 fi
+# `open` without a directory leaves the choice to the nvim being taken over (its own working directory), so
+# the launcher's $PWD is never filled in for it; a second directory is refused rather than dropped.
+OPEN_DIR_GIVEN=""
+if [[ $MODE == open ]]; then
+	[[ ${#OPEN_POSITIONALS[@]} -le 1 ]] || { echo 'eitri open: takes at most one project directory' >&2; exit 64; }
+	if [[ ${#OPEN_POSITIONALS[@]} -eq 1 ]]; then
+		OPEN_DIR_GIVEN=1
+		PROJECT="$(realpath -e -- "${OPEN_POSITIONALS[0]}" 2>/dev/null)" || { echo "eitri: no such directory" >&2; exit 1; }
+	fi
+fi
 [[ $MODE == window && -n "$ACCOUNT_FROM_FLAG" ]] && NEW_WINDOW=1
 if [[ -n "$FROM_DESKTOP" && ${#BEFORE[@]} -eq 0 && ${#AFTER[@]} -eq 0 ]]; then
 	# The chooser needs no project yet, and must also start when the current directory is gone.
 	CHOOSE=1
+elif [[ $MODE == open ]]; then
+	:
 elif [[ $MODE != window || (${#BEFORE[@]} -eq 0 && ${#AFTER[@]} -eq 0) ]]; then
 	# No positional (or panel/split, which take a directory only): the one directory, resolved here.
 	PROJECT="$(realpath -e -- "${PROJECT:-$PWD}" 2>/dev/null)" || { echo "eitri: no such directory" >&2; exit 1; }
@@ -321,7 +340,9 @@ fi
 
 if [[ -z "$QUIET" ]]; then
 	{
-		if [[ $MODE != window || -n "$PROJECT" ]]; then
+		if [[ $MODE == open && -z "$OPEN_DIR_GIVEN" ]]; then
+			echo "eitri    project (the editor's working directory)"
+		elif [[ $MODE != window || -n "$PROJECT" ]]; then
 			echo "eitri    project $PROJECT"
 		elif [[ -n "$FIRST" ]]; then
 			echo "eitri    open $FIRST"
@@ -342,6 +363,12 @@ fi
 
 if [[ $MODE == split ]]; then
 	exec "$LIBDIR/shell" split -- "$PROJECT"
+fi
+if [[ $MODE == open ]]; then
+	if [[ -n "$OPEN_DIR_GIVEN" ]]; then
+		exec "$LIBDIR/shell" open "${PANEL_ARGS[@]}" -- "$PROJECT"
+	fi
+	exec "$LIBDIR/shell" open "${PANEL_ARGS[@]}"
 fi
 if [[ $MODE == panel ]]; then
 	exec "$LIBDIR/shell" panel "${PANEL_ARGS[@]}" -- "$PROJECT"
@@ -378,7 +405,7 @@ fi
 # same directory.
 if [[ ${#SHELL_ARGS[@]} -eq 0 && ${#BEFORE[@]} -gt 0 ]]; then
 	case "${BEFORE[0]}" in
-		panel | split | page | run-guard | linked-window | choose-project) BEFORE[0]="./${BEFORE[0]}" ;;
+		open | panel | split | page | run-guard | linked-window | choose-project) BEFORE[0]="./${BEFORE[0]}" ;;
 	esac
 fi
 if [[ -n "$SAW_DASHES" ]]; then

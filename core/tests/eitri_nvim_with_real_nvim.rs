@@ -13,6 +13,10 @@ impl Drop for Scratch {
 }
 
 fn check(case: &str, body: &str) {
+    check_with_nvim(case, body, std::ffi::OsStr::new("nvim"));
+}
+
+fn check_with_nvim(case: &str, body: &str, nvim: &std::ffi::OsStr) {
     let dir = std::env::temp_dir().join(format!("ep-{}-{case}", std::process::id()));
     let _ = std::fs::remove_dir_all(&dir);
     let scratch = Scratch(dir.clone());
@@ -31,6 +35,7 @@ fi
 if [ -n "$RUNNING_THEN" ]; then echo "eitri $1: running; its output goes to ${LOG_DIR:-/x}/$1.log" >&2; exit "$RUNNING_THEN"; fi
 if [ "$1" = --version ]; then echo 'eitri 9.8.7'; exit 0; fi
 if [ "$2" = --list ]; then printf 'notes\npreview\n'; exit 0; fi
+if [ -n "$OPEN_REFUSAL" ]; then echo "earlier diagnostic" >&2; echo "$OPEN_REFUSAL" >&2; exit 64; fi
 if [ "$OLD_EITRI" = yes ]; then echo 'eitri: unknown option --nvim' >&2; exit 64; fi
 "##,
     )
@@ -77,7 +82,7 @@ if not ok then io.stderr:write(tostring(err), '\n'); vim.cmd('cquit 1') else vim
     );
     let script_path = dir.join("check.lua");
     agent::private_fs::write_private(&script_path, script.as_bytes()).unwrap();
-    let mut child = Command::new("nvim")
+    let mut child = Command::new(nvim)
         .args(["--headless", "-u", "NONE", "-i", "NONE", "-n", "-l"])
         .arg(&script_path)
         .current_dir(&dir)
@@ -88,6 +93,7 @@ if not ok then io.stderr:write(tostring(err), '\n'); vim.cmd('cquit 1') else vim
         .env("XDG_DATA_HOME", dir.join("data"))
         .env("XDG_CONFIG_HOME", dir.join("config"))
         .env_remove("OLD_EITRI")
+        .env_remove("OPEN_REFUSAL")
         .env_remove("NVIM")
         .env_remove("NVIM_LISTEN_ADDRESS")
         .env_remove("TMUX")
@@ -286,7 +292,7 @@ assert(jobs == 0 and #argv() == 0)
 
 #[test]
 #[ignore = "needs a real nvim with serverstart() socket access"]
-fn the_plugin_file_defines_two_commands_and_one_global() {
+fn the_plugin_file_defines_three_commands_and_one_global() {
     check(
         "load",
         r#"
@@ -297,7 +303,7 @@ for name in pairs(commands_after) do
   if commands_before[name] == nil then table.insert(added, name) end
 end
 table.sort(added)
-assert(vim.deep_equal(added, {'EitriPage', 'EitriPanel'}), vim.inspect(added))
+assert(vim.deep_equal(added, {'EitriOpen', 'EitriPage', 'EitriPanel'}), vim.inspect(added))
 for name in pairs(commands_before) do assert(commands_after[name] ~= nil, name) end
 assert(vim.g.loaded_eitri == 1)
 local globals_after = vim.fn.eval('copy(g:)')
@@ -341,6 +347,56 @@ complete('', 'EitriPage ')
 assert(#argv() == 7, vim.inspect(argv()))
 eitri.teardown()
 assert(#complete('', 'EitriPage ') == 0)
+"#,
+    );
+}
+
+#[test]
+#[ignore = "needs real nvim 0.11.2 with serverstart() socket access"]
+fn eitri_open_below_0_12_prints_the_line_and_runs_nothing() {
+    let nvim = std::env::var_os("EITRI_TEST_NVIM_0_11").unwrap_or_else(|| {
+        let target = std::env::var_os("CARGO_TARGET_DIR").expect("CARGO_TARGET_DIR must name the release cache");
+        let dest = std::path::PathBuf::from(target).join("nvim-releases/0.11.2");
+        let output = Command::new("bash")
+            .arg(concat!(env!("CARGO_MANIFEST_DIR"), "/../tools/nvim-releases/fetch.sh"))
+            .arg("0.11.2")
+            .arg(dest)
+            .output()
+            .unwrap();
+        assert!(output.status.success(), "{}", String::from_utf8_lossy(&output.stderr));
+        std::path::PathBuf::from(String::from_utf8(output.stdout).unwrap().trim())
+            .join("nvim")
+            .into_os_string()
+    });
+    check_with_nvim(
+        "takeover-old",
+        r#"
+assert(vim.fn.has('nvim-0.12') == 0)
+vim.cmd('EitriOpen')
+said("Eitri's takeover needs nvim 0.12 or later (this is 0.11.2)")
+assert(jobs == 0 and #argv() == 0)
+"#,
+        &nvim,
+    );
+}
+
+#[test]
+#[ignore = "needs a real nvim 0.12 with serverstart() socket access"]
+fn eitri_open_reports_a_refusal_line() {
+    check(
+        "takeover-refusal",
+        r#"
+vim.env.OPEN_REFUSAL = 'takeover is off (editor.takeover in init.lua)'
+local start = vim.fn.jobstart
+vim.fn.jobstart = function(args, opts) assert(opts.detach == true); return start(args, opts) end
+vim.cmd('EitriOpen a directory')
+said('takeover is off (editor.takeover in init.lua)')
+assert(vim.deep_equal(argv(), {'open', '--nvim', vim.v.servername, '--', 'a directory'}), vim.inspect(argv()))
+assert(jobs == 1)
+require('eitri').open()
+said('takeover is off (editor.takeover in init.lua)')
+assert(vim.wait(3000, function() return #argv() == 8 end))
+assert(argv()[6] == 'open' and argv()[7] == '--nvim' and argv()[8] == vim.v.servername)
 "#,
     );
 }

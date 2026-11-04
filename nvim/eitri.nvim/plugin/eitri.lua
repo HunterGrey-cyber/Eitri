@@ -1,4 +1,4 @@
--- These commands launch Eitri beside this nvim. Each window installs its own editor glue,
+-- These commands launch Eitri for this nvim. Each window installs its own editor glue,
 -- so this file and its module never have to match Eitri's version.
 if vim.g.loaded_eitri then
   return
@@ -7,6 +7,9 @@ vim.g.loaded_eitri = 1
 vim.api.nvim_create_user_command("EitriPanel", function(o)
   require("eitri").panel(o.args ~= "" and o.args or nil)
 end, { nargs = "?", complete = "dir", desc = "Open Eitri's agent panel beside this nvim" })
+vim.api.nvim_create_user_command("EitriOpen", function(o)
+  require("eitri").open(o.args ~= "" and o.args or nil)
+end, { nargs = "?", complete = "dir", desc = "Take over this terminal nvim in an Eitri window" })
 vim.api.nvim_create_user_command("EitriPage", function(o)
   if #o.fargs == 0 then
     vim.notify(":EitriPage needs a plugin id, for example :EitriPage markdown", vim.log.levels.ERROR)

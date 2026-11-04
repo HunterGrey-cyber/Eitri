@@ -159,6 +159,13 @@ pub fn parse_editor_restore(value: Option<&str>) -> Result<bool, String> {
     crate::config_switch::parse_switch(EDITOR_RESTORE_KEY, value, true)
 }
 
+/// Whether Eitri may take over a terminal nvim when explicitly asked.
+pub const EDITOR_TAKEOVER_KEY: &str = "editor.takeover";
+
+pub fn parse_editor_takeover(value: Option<&str>) -> Result<bool, String> {
+    crate::config_switch::parse_switch(EDITOR_TAKEOVER_KEY, value, true)
+}
+
 /// The `init.lua` key: `eitri.config.set("terminal.claude_ide", true | false)`. Whether a `claude` started in this
 /// window's bottom terminal can attach to its editor through the CLI's IDE lock file.
 pub const TERMINAL_CLAUDE_IDE_KEY: &str = "terminal.claude_ide";
@@ -305,6 +312,30 @@ pub fn install(lua: &Lua, eitri: &Table, store: Rc<RefCell<ConfigStore>>) -> mlu
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn editor_takeover_parses_and_refuses_others() {
+        assert_eq!(EDITOR_TAKEOVER_KEY, "editor.takeover");
+        assert_eq!(parse_editor_takeover(None), Ok(true));
+        let lua = Lua::new();
+        let eitri = lua.create_table().unwrap();
+        let store = Rc::new(RefCell::new(ConfigStore::default()));
+        install(&lua, &eitri, store.clone()).unwrap();
+        lua.globals().set("eitri", eitri).unwrap();
+        for (value, expected) in [("true", true), ("'on'", true), ("false", false), ("'off'", false)] {
+            lua.load(format!("eitri.config.set('editor.takeover', {value})"))
+                .exec()
+                .unwrap();
+            assert_eq!(
+                parse_editor_takeover(store.borrow().get(EDITOR_TAKEOVER_KEY)),
+                Ok(expected)
+            );
+        }
+        for bad in ["offer", "yes", "1", "0", "", "TRUE"] {
+            let error = parse_editor_takeover(Some(bad)).unwrap_err();
+            assert!(error.contains("editor.takeover"), "{error}");
+        }
+    }
 
     #[test]
     fn keys_under_a_prefix_come_in_key_order_as_get_reads_them() {

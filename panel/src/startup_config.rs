@@ -82,6 +82,7 @@ fn checks<'a>(agents: &'a [&'a str]) -> Vec<(&'static str, Check<'a>)> {
         (cfg::TERMINAL_CLAUDE_IDE_KEY, check(cfg::parse_terminal_claude_ide)),
         (cfg::WINDOW_RESTORE_KEY, check(cfg::parse_window_restore)),
         (cfg::EDITOR_RESTORE_KEY, check(cfg::parse_editor_restore)),
+        (cfg::EDITOR_TAKEOVER_KEY, check(cfg::parse_editor_takeover)),
         (cfg::EDITOR_PRESENTATION_KEY, check(cfg::parse_editor_presentation)),
         (cfg::DESKTOP_START_KEY, check(cfg::parse_desktop_start)),
     ];
@@ -357,6 +358,20 @@ mod tests {
             assert!(problems.is_empty(), "{good}: {problems:?}");
             assert_eq!(kernel.config.borrow().get("window.desktop_start"), Some(good));
         }
+    }
+
+    #[test]
+    fn editor_takeover_is_a_known_switch_that_refuses_other_values() {
+        for good in ["true", "false", "\"on\"", "\"off\""] {
+            let (_, problems) = settled(&format!("eitri.config.set(\"editor.takeover\", {good})\n"));
+            assert!(problems.is_empty(), "{good}: {problems:?}");
+        }
+        let (kernel, problems) = settled("eitri.config.set(\"editor.takeover\", \"offer\")\n");
+        assert_eq!(problems.len(), 1, "{problems:?}");
+        assert!(problems[0].contains("editor.takeover"), "{problems:?}");
+        assert!(!problems[0].contains("no setting"), "{problems:?}");
+        assert!(problems[0].ends_with("the default is used"), "{problems:?}");
+        assert_eq!(kernel.config.borrow().get("editor.takeover"), None);
     }
 
     #[test]

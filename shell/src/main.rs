@@ -49,6 +49,7 @@ mod project_stamp;
 mod project_start;
 mod root_conflicts;
 mod sidecar_probe;
+mod takeover;
 mod terminal;
 mod text_size;
 mod theme;
@@ -181,6 +182,15 @@ fn main() -> glib::ExitCode {
     // `eitri panel` is its own command line: the project resolver below would read `panel` as a directory.
     if early_args.first().is_some_and(|a| a == "panel") {
         return companion::run(early_args[1..].to_vec());
+    }
+    if early_args.first().is_some_and(|a| a == "open") {
+        return match eitri_core::project_root::parse_open_args(&early_args[1..]) {
+            Ok(args) => glib::ExitCode::from(takeover::run(args) as u8),
+            Err(message) => {
+                eprintln!("{message}");
+                glib::ExitCode::from(64)
+            }
+        };
     }
     if early_args.first().is_some_and(|a| a == "split") {
         return companion::run_split(early_args[1..].to_vec());

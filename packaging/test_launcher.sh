@@ -658,6 +658,25 @@ out="$(run_launcher --quiet "$PROJECT_DIR")"
 args="$(printf '%s\n' "$out" | grep '^STUB_ARG:' | tr '\n' ' ')"
 assert_eq "$args" "STUB_ARG:$REAL_PROJECT " "without panel the shell gets only the project"
 
+echo "== eitri open: the takeover command line =="
+out="$(run_launcher open --quiet --nvim "/r/a b.sock" "$SPACED")"
+args="$(printf '%s\n' "$out" | grep '^STUB_ARG:' | tr '\n' ' ')"
+assert_eq "$args" "STUB_ARG:open STUB_ARG:--nvim STUB_ARG:/r/a b.sock STUB_ARG:-- STUB_ARG:$(realpath -e -- "$SPACED") " "open passes the address and directory separately"
+out="$(run_launcher open --nvim /r/n.sock --new-window)"
+assert_contains "$out" "eitri open: unknown option --new-window" "open refuses --new-window"
+assert_not_contains "$out" "STUB_ARG" "a refused open runs no shell"
+# No directory: nothing is filled in from the launcher's own directory, so the editor's working directory decides.
+out="$(cd "$SPACED" && run_launcher open --quiet --nvim /r/n.sock)"
+args="$(printf '%s\n' "$out" | grep '^STUB_ARG:' | tr '\n' ' ')"
+assert_eq "$args" "STUB_ARG:open STUB_ARG:--nvim STUB_ARG:/r/n.sock " "open without a directory forwards none"
+# Two directories are refused, with or without the separator; none is silently chosen.
+out="$(run_launcher open --nvim /r/n.sock "$SPACED" "$PROJECT_DIR")"
+assert_contains "$out" "eitri open: takes at most one project directory" "open refuses a second directory"
+assert_not_contains "$out" "STUB_ARG" "a refused open runs no shell"
+out="$(run_launcher open --nvim /r/n.sock -- "$SPACED" "$PROJECT_DIR")"
+assert_contains "$out" "eitri open: takes at most one project directory" "open refuses a second directory after --"
+assert_not_contains "$out" "STUB_ARG" "a refused open after -- runs no shell"
+
 echo "== eitri split: the two-window command line =="
 # `eitri split [DIR]` hands the realpath of the project to `shell split`; the options that belong to
 # the integrated window or to the panel are refused by name, and --account still reaches the shell.

@@ -126,6 +126,43 @@ pub fn resolve_in(args: &[OsString], env: Option<OsString>, cwd: io::Result<Path
     resolve_from(args.iter().map(OsString::as_os_str), env, cwd)
 }
 
+/// The explicit editor address and optional project directory for `eitri open`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OpenArgs {
+    pub nvim: String,
+    pub dir: Option<PathBuf>,
+}
+
+/// Parses takeover arguments without consulting the environment or resolving the directory.
+pub fn parse_open_args(args: &[OsString]) -> Result<OpenArgs, String> {
+    let mut nvim = None;
+    let mut dir = None;
+    let mut positional = false;
+    let mut args = args.iter();
+    while let Some(arg) = args.next() {
+        if !positional && arg == OsStr::new(END_OF_FLAGS) {
+            positional = true;
+            continue;
+        }
+        if !positional && arg == OsStr::new("--nvim") {
+            let value = args
+                .next()
+                .and_then(|value| value.to_str())
+                .filter(|value| !value.is_empty() && !value.starts_with('-'))
+                .ok_or_else(|| "eitri open: --nvim needs an address in UTF-8".to_owned())?;
+            if nvim.replace(value.to_owned()).is_some() {
+                return Err("eitri open: --nvim takes one address".to_owned());
+            }
+        } else if !positional && arg.as_bytes().first() == Some(&b'-') {
+            return Err(format!("eitri open: unknown option {}", arg.to_string_lossy()));
+        } else if dir.replace(PathBuf::from(arg)).is_some() {
+            return Err("eitri open: takes at most one project directory".to_owned());
+        }
+    }
+    let nvim = nvim.ok_or_else(|| "eitri open: --nvim is required".to_owned())?;
+    Ok(OpenArgs { nvim, dir })
+}
+
 /// What `eitri panel` took from its own command line.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PanelArgs {
@@ -853,6 +890,52 @@ mod tests {
     use crate::project_trust::nofollow::tests::{canonical_scratch, mkfifo};
     use agent::project_boundary::NotABoundary;
     use std::os::unix::fs::{symlink, PermissionsExt};
+
+    #[test]
+    fn open_args_need_nvim() {
+        for args in [os(&[]), os(&["project"]), os(&["--nvim"]), os(&["--nvim", ""])] {
+            assert!(parse_open_args(&args).unwrap_err().contains("--nvim"));
+        }
+    }
+
+    #[test]
+    fn open_args_refuse_new_window() {
+        let error = parse_open_args(&os(&["--nvim", "/r/n.sock", "--new-window"])).unwrap_err();
+        assert!(error.contains("--new-window"), "{error}");
+    }
+
+    #[test]
+    fn open_args_never_read_nvim_env() {
+        const CHILD: &str = "EITRI_TEST_TAKEOVER_ENV_CHILD";
+        if std::env::var_os(CHILD).is_some() {
+            assert!(std::env::var_os("NVIM").is_some());
+            assert!(parse_open_args(&[]).is_err());
+            let parsed = parse_open_args(&os(&["--nvim", "explicit"])).unwrap();
+            assert_eq!(parsed.nvim, "explicit");
+            return;
+        }
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", "project_root::tests::open_args_never_read_nvim_env"])
+            .env(CHILD, "1")
+            .env("NVIM", "/r/inherited.sock")
+            .output()
+            .unwrap();
+        assert!(output.status.success(), "{}", String::from_utf8_lossy(&output.stdout));
+    }
+
+    #[test]
+    fn open_args_take_a_relative_dir() {
+        let parsed = parse_open_args(&os(&["--nvim", "/r/a b.sock", "../a directory"])).unwrap();
+        assert_eq!(parsed.nvim, "/r/a b.sock");
+        assert_eq!(parsed.dir, Some(PathBuf::from("../a directory")));
+        assert_eq!(parse_open_args(&os(&["--nvim", "addr"])).unwrap().dir, None);
+        assert_eq!(
+            parse_open_args(&os(&["--nvim", "addr", "--", "-project"])).unwrap().dir,
+            Some(PathBuf::from("-project"))
+        );
+        assert!(parse_open_args(&os(&["--nvim", "addr", "one", "two"])).is_err());
+        assert!(parse_open_args(&os(&["--nvim", "addr", "--unknown"])).is_err());
+    }
 
     #[test]
     fn page_args_defaults_and_refusals() {
