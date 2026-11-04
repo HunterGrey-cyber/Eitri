@@ -900,7 +900,7 @@ mod tests {
 
     #[test]
     fn open_args_refuse_new_window() {
-        let error = parse_open_args(&os(&["--nvim", "/r/n.sock", "--new-window"])).unwrap_err();
+        let error = parse_open_args(&os(&["--nvim", "/r/n", "--new-window"])).unwrap_err();
         assert!(error.contains("--new-window"), "{error}");
     }
 
@@ -917,7 +917,7 @@ mod tests {
         let output = std::process::Command::new(std::env::current_exe().unwrap())
             .args(["--exact", "project_root::tests::open_args_never_read_nvim_env"])
             .env(CHILD, "1")
-            .env("NVIM", "/r/inherited.sock")
+            .env("NVIM", "/r/inherited")
             .output()
             .unwrap();
         assert!(output.status.success(), "{}", String::from_utf8_lossy(&output.stdout));
@@ -925,8 +925,8 @@ mod tests {
 
     #[test]
     fn open_args_take_a_relative_dir() {
-        let parsed = parse_open_args(&os(&["--nvim", "/r/a b.sock", "../a directory"])).unwrap();
-        assert_eq!(parsed.nvim, "/r/a b.sock");
+        let parsed = parse_open_args(&os(&["--nvim", "/r/a b", "../a directory"])).unwrap();
+        assert_eq!(parsed.nvim, "/r/a b");
         assert_eq!(parsed.dir, Some(PathBuf::from("../a directory")));
         assert_eq!(parse_open_args(&os(&["--nvim", "addr"])).unwrap().dir, None);
         assert_eq!(

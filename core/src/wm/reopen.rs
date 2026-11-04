@@ -186,6 +186,11 @@ impl Reopen {
 
 /// The start's reopen step: the window keeps what its start prepared, and the writer wakes the controller.
 pub(super) fn install(w: &mut Window, prepared: Prepared, waker: Arc<dyn Waker>) {
+    // A person's own nvim is never captured, and the window reads no record it left.
+    if w.editor_attached() {
+        w.say("[editor] reopen: off for a person's own nvim".into());
+        return;
+    }
     if let Some(reopen) = Reopen::new(prepared) {
         reopen.writer.set_waker(waker);
         w.reopen = Some(reopen);

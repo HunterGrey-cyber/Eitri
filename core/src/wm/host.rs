@@ -842,17 +842,64 @@ pub enum HintOp {
     Toggle { keycode: u32 },
 }
 
+/// Proof that the editor a call ends or restarts is one Eitri started. [`owned`] is its one constructor, and it
+/// gives none for a person's own nvim, so no quit, end or restart can be built for an attached editor.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OwnedEditor(());
+
+/// The token for an editor of `kind`: `None` for an attached one, which nothing may quit, end or restart.
+pub fn owned(kind: EditorKind) -> Option<OwnedEditor> {
+    match kind {
+        EditorKind::Owned => Some(OwnedEditor(())),
+        EditorKind::Attached => None,
+    }
+}
+
+/// A token for tests that build the calls it guards by hand.
+#[cfg(any(test, feature = "test-support"))]
+#[doc(hidden)]
+pub fn owned_editor_for_tests() -> OwnedEditor {
+    owned(EditorKind::Owned).expect("an owned editor has a token")
+}
+
+/// How long a detach gives the glue's teardown in a person's nvim before it hangs up anyway.
+pub const DETACH_TEARDOWN: Duration = Duration::from_millis(300);
+
+/// How long a close waits for the waiting room to answer that it has taken the nvim back.
+pub const DETACH_ROOM_WAIT: Duration = Duration::from_secs(1);
+
+/// How long a close waits for [`EditorEvent::Detached`] before it tears the window down anyway: the detach's own
+/// bounds, and half a second for the answer to come back.
+pub const DETACHED_WITHIN: Duration = Duration::from_millis(1_800);
+
+/// What a close has to ask about a person's own nvim before it lets go of it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct CloseAsks {
+    /// nvim is waiting for a key or busy (`nvim_get_mode().blocking`): given back now, the terminal would show a
+    /// blank screen until a key, which would answer whatever nvim is asking.
+    pub blocking: bool,
+    /// Drafts being edited in the editor with unsaved changes; they end with the window.
+    pub drafts: usize,
+    /// Agent proposals open in the editor; they end with the window.
+    pub proposals: usize,
+}
+
 /// Commands sent to the editor service.
 #[derive(Debug, Clone, PartialEq)]
 pub enum EditorCall {
     /// Sets editor focus.
     SetFocused { win: WinId, focused: bool },
     /// Asks the editor to quit through Lua.
-    Quit { win: WinId, lua: String, generation: u32 },
+    Quit {
+        win: WinId,
+        lua: String,
+        generation: u32,
+        editor: OwnedEditor,
+    },
     /// Releases an exited pane on the next turn of the loop, after its exit callback returns.
     ReleaseExited { win: WinId },
     /// Ends the editor session.
-    End { win: WinId },
+    End { win: WinId, editor: OwnedEditor },
     /// Shuts down the editor service.
     Shutdown { win: WinId },
     /// Sets editor scale.
@@ -860,7 +907,18 @@ pub enum EditorCall {
     /// Reveals the editor.
     Reveal { win: WinId },
     /// Restarts with complete launch settings.
-    Restart { win: WinId, spawn: EditorSpawn },
+    Restart {
+        win: WinId,
+        spawn: EditorSpawn,
+        editor: OwnedEditor,
+    },
+    /// Lets go of a person's own nvim: the glue's teardown, given at most [`DETACH_TEARDOWN`], then the hang-up,
+    /// then the waiting room is told to take it back. Answered by [`EditorEvent::Detached`].
+    Detach { win: WinId },
+    /// Asks what a close has to ask about a person's own nvim, without waiting on it; answered by
+    /// [`EditorEvent::CloseFacts`] carrying the same `generation`, so an answer to an earlier close that comes late
+    /// is never taken for this one's.
+    AskCloseFacts { win: WinId, generation: u32 },
     /// Types keys into the editor, in the editor's own key notation.
     SendKeys { win: WinId, keys: String },
     /// Opens a file in the running editor. `line` and `col` count from one, `col` in bytes; a line past the end is
@@ -1583,6 +1641,16 @@ pub enum EditorEvent {
     /// An [`EditorCall::Open`] answered an error or has not answered in time. At a blocking prompt it stays queued
     /// in nvim and runs when the prompt ends, so this never means the file will not open.
     OpenFailed { win: WinId, why: String },
+    /// The editor let go of a person's own nvim, which is back with its terminal or on its way there.
+    Detached { win: WinId },
+    /// The answer to the [`EditorCall::AskCloseFacts`] of the same `generation`.
+    CloseFacts {
+        win: WinId,
+        generation: u32,
+        asks: CloseAsks,
+    },
+    /// A person's own nvim went back to them, or must, for `why`: the window closes without asking about it.
+    HandedBack { win: WinId, why: super::close::HandBackWhy },
 }
 
 /// Facts reported by chat services.
@@ -2528,7 +2596,13 @@ mod tests {
         );
         tag!(HostOp::Chrome { win, rev: 2 }, Chrome);
         tag!(HostOp::Hint(HintOp::Hide), Hint);
-        tag!(HostOp::Editor(EditorCall::End { win }), Editor);
+        tag!(
+            HostOp::Editor(EditorCall::End {
+                win,
+                editor: owned_editor_for_tests()
+            }),
+            Editor
+        );
         tag!(
             HostOp::Chat(ChatOp::OpenChooser {
                 win,
@@ -2543,5 +2617,116 @@ mod tests {
         tag!(HostOp::Onboarding(OnboardingOp::OpenTutor { win }), Onboarding);
         tag!(HostOp::Project(ProjectOp::List { win, serial: 1 }), Project);
         tag!(HostOp::Lua(emit("changed")), Lua);
+    }
+
+    #[test]
+    fn owned_gives_none_for_attached() {
+        assert!(
+            owned(EditorKind::Attached).is_none(),
+            "a person's own nvim gets no token"
+        );
+        assert_eq!(owned(EditorKind::Owned), Some(owned_editor_for_tests()));
+        assert_eq!(
+            EditorKind::default(),
+            EditorKind::Owned,
+            "a window owns its editor unless told otherwise"
+        );
+    }
+
+    /// Where product code builds the token, or could get one without asking a window: `path:line` of each
+    /// `OwnedEditor(` outside its definition and `owned`, and of each `EditorKind::Owned` outside `owned` and the
+    /// test constructor, since `owned(EditorKind::Owned)` would give a token whatever the window's kind. Test
+    /// modules, inline or in files of their own, are not product code.
+    fn tokens_built_outside_owned(sources: &[crate::source_scan::Source]) -> Vec<String> {
+        use crate::source_scan::{braced, code_only, functions, test_only_files, word_ends};
+        let test_only = test_only_files(sources);
+        let mut found = Vec::new();
+        for source in sources.iter().filter(|source| !test_only.contains(&source.path)) {
+            let code = code_only(&source.text);
+            let mut tests: Vec<(usize, usize)> = Vec::new();
+            for (at, _) in code.match_indices("#[cfg(test)]") {
+                let rest = &code[at..];
+                let Some(open) = rest.find(['{', ';']) else {
+                    continue;
+                };
+                let head = &rest[..open];
+                if rest.as_bytes()[open] == b'{' && word_ends(head, "mod").len() == 1 {
+                    let body = braced(&code, at + open);
+                    tests.push((at, at + open + body.len()));
+                }
+            }
+            let spans = |name: &str| -> Vec<(usize, usize)> {
+                functions(&code, name)
+                    .into_iter()
+                    .map(|body| {
+                        let start = body.as_ptr() as usize - code.as_ptr() as usize;
+                        (start, start + body.len())
+                    })
+                    .collect()
+            };
+            let owned = spans("owned");
+            let for_tests = spans("owned_editor_for_tests");
+            let line = |at: usize| code[..at].matches('\n').count() + 1;
+            let inside =
+                |spans: &[(usize, usize)], at: usize| spans.iter().any(|(from, to)| (*from..*to).contains(&at));
+            for end in word_ends(&code, "EditorKind") {
+                let rest = code[end..].trim_start();
+                let Some(rest) = rest.strip_prefix("::") else {
+                    continue;
+                };
+                let rest = rest.trim_start();
+                let named = rest
+                    .strip_prefix("Owned")
+                    .is_some_and(|after| !after.starts_with(|c: char| c.is_alphanumeric() || c == '_'));
+                let at = end - "EditorKind".len();
+                if named && !inside(&owned, at) && !inside(&for_tests, at) && !inside(&tests, at) {
+                    found.push(format!("{}:{}", source.path, line(at)));
+                }
+            }
+            for end in word_ends(&code, "OwnedEditor") {
+                if !code[end..].trim_start().starts_with('(') {
+                    continue;
+                }
+                let at = end - "OwnedEditor".len();
+                let defined = code[..at].trim_end().ends_with("struct");
+                if defined || inside(&owned, at) || inside(&tests, at) {
+                    continue;
+                }
+                found.push(format!("{}:{}", source.path, line(at)));
+            }
+        }
+        found
+    }
+
+    #[test]
+    fn owned_editor_is_built_only_by_owned() {
+        use crate::source_scan::{require_anchors, rust_sources, Source};
+        let sources = rust_sources(&["core/src", "shell/src", "panel/src", "agent/src"]);
+        require_anchors(&sources, &["pub struct OwnedEditor(", "pub fn owned("]);
+        assert_eq!(tokens_built_outside_owned(&sources), Vec::<String>::new());
+        // The scan sees a token built anywhere else in product code, and leaves test modules and comments alone.
+        let planted = vec![
+            Source {
+                path: "core/src/planted.rs".into(),
+                text: "// OwnedEditor(()) in a comment\nfn quit() -> OwnedEditor {\n    OwnedEditor(())\n}\n".into(),
+            },
+            Source {
+                path: "core/src/planted_tests.rs".into(),
+                text: "#[cfg(test)]\nmod tests {\n    fn t() { let _ = OwnedEditor(()); let _ = owned(EditorKind::Owned); }\n}\n"
+                    .into(),
+            },
+            Source {
+                path: "core/src/planted_kind.rs".into(),
+                text: "fn sneak() -> Option<OwnedEditor> {\n    owned(super::window::EditorKind :: Owned)\n}\nfn fine(w: &Window) -> bool {\n    w.editor_kind() == EditorKind::OwnedLater\n}\n"
+                    .into(),
+            },
+        ];
+        assert_eq!(
+            tokens_built_outside_owned(&planted),
+            vec![
+                "core/src/planted.rs:3".to_owned(),
+                "core/src/planted_kind.rs:2".to_owned()
+            ]
+        );
     }
 }

@@ -204,7 +204,8 @@ fn a_close_with_a_running_turn_asks_once_and_y_answers_both() {
             HostOp::Editor(EditorCall::Quit {
                 win: WIN,
                 lua: editor_quit_lua(1),
-                generation: 1
+                generation: 1,
+                editor: owned_editor_for_tests()
             }),
             HostOp::Editor(EditorCall::SetFocused {
                 win: WIN,

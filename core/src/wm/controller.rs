@@ -672,6 +672,9 @@ impl Controller {
         }
         let mut window = Window::new(spec, parts, self.timers.clone());
         window.own_window = self.starts.get(&win).and_then(|start| start.own_window.clone());
+        if let Some(start) = self.starts.get(&win) {
+            window.set_editor_kind(start.editor_kind);
+        }
         window.tiling = tiling;
         window.monitors = self.monitors.clone();
         if let Some(placement) = self.placements.remove(&win) {
@@ -685,6 +688,15 @@ impl Controller {
         }
         window.keys.hint_delay = self.hint_delays.get(&win).copied();
         self.windows.insert(win, window);
+    }
+
+    /// Whose nvim `win`'s editor shows. A window over a person's own nvim says so before its first batch, so nothing
+    /// of the window's can quit, end or restart that nvim.
+    pub fn set_editor_kind(&mut self, win: WinId, kind: super::window::EditorKind) {
+        self.starts.entry(win).or_default().editor_kind = kind;
+        if let Some(window) = self.windows.get_mut(&win) {
+            window.set_editor_kind(kind);
+        }
     }
 
     pub(super) fn keep_editor_spawn(&mut self, win: WinId, spawn: EditorSpawn) {
@@ -1744,7 +1756,10 @@ impl Decide for Controller {
                 | EditorEvent::Captured { win, .. }
                 | EditorEvent::QuitCancelled { win, .. }
                 | EditorEvent::QuitNotSent { win, .. }
-                | EditorEvent::OpenFailed { win, .. }),
+                | EditorEvent::OpenFailed { win, .. }
+                | EditorEvent::Detached { win }
+                | EditorEvent::CloseFacts { win, .. }
+                | EditorEvent::HandedBack { win, .. }),
             ) => {
                 self.modules_event(win, &mut batch, |w, cx, batch| {
                     super::close::editor_event(w, cx, win, event, batch)

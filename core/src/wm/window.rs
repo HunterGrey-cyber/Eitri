@@ -89,6 +89,17 @@ pub enum EditorPresence {
     None,
 }
 
+/// Whose nvim an owned editor shows, which decides how the window may end it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum EditorKind {
+    /// Eitri started this nvim: the window may quit, end and restart it.
+    #[default]
+    Owned,
+    /// A person's own nvim, taken over from its terminal: the window only ever lets go of it, and nvim goes back
+    /// where it came from. Nothing in the window can quit, end or restart it.
+    Attached,
+}
+
 /// The initial description of a window.
 #[derive(Debug, Clone, PartialEq)]
 pub struct WindowSpec {
@@ -238,6 +249,8 @@ pub struct Window {
     pub(super) release_exited: Option<TimerToken>,
     /// The spawn a restart starts from; its `open` is always empty.
     pub(super) editor_spawn: Option<EditorSpawn>,
+    /// Whose nvim the editor shows; read only where `presence` is `Owned`.
+    editor_kind: EditorKind,
     /// The editor's open arguments from the launch, until the editor has been ready once: a restart before that
     /// carries them again, because nothing has opened them yet.
     pub(super) pending_open: Vec<String>,
@@ -361,6 +374,7 @@ impl Window {
             quit_timer: None,
             release_exited: None,
             editor_spawn: None,
+            editor_kind: EditorKind::default(),
             pending_open: Vec::new(),
             editor_ready: false,
             queued_opens: VecDeque::new(),
@@ -798,6 +812,25 @@ impl Window {
 
     pub fn presence(&self) -> &EditorPresence {
         &self.spec.presence
+    }
+
+    /// Whose nvim the window's editor shows.
+    pub fn editor_kind(&self) -> EditorKind {
+        self.editor_kind
+    }
+
+    /// The editor shows a person's own nvim, which only ever goes back to them.
+    pub fn editor_attached(&self) -> bool {
+        self.editor_kind == EditorKind::Attached
+    }
+
+    /// Sets whose nvim the editor shows. An attached nvim keeps no record of the window's: nothing captures it or
+    /// reads what it left, since it never ends with the window.
+    pub(super) fn set_editor_kind(&mut self, kind: EditorKind) {
+        self.editor_kind = kind;
+        if kind == EditorKind::Attached {
+            self.reopen = None;
+        }
     }
 
     /// Keeps `spawn` as what a restart starts from, and its open arguments apart as the ones still to be opened.

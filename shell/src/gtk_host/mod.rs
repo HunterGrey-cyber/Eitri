@@ -1709,7 +1709,7 @@ impl Host for GtkHost {
                 }));
                 applied
             }
-            HostOp::Editor(EditorCall::Restart { win, spawn }) => self.restart_editor(op, *win, spawn),
+            HostOp::Editor(EditorCall::Restart { win, spawn, .. }) => self.restart_editor(op, *win, spawn),
             HostOp::Editor(call) => self.service(op, |s| s.editor(call)),
             HostOp::Terminal(call) => self.service(op, |s| s.terminal(call)),
             HostOp::Plugin(call) => self.service(op, |s| s.plugin(call)),
@@ -2235,6 +2235,7 @@ mod editor_reads_tests {
             win: WinId::MAIN,
             lua: "quit".into(),
             generation: 7,
+            editor: eitri_core::wm::owned_editor_for_tests(),
         });
         assert_eq!(host.apply(&quit), Applied::Refused);
         let events: Vec<HostEvent> = sink.events().into_iter().skip(1).map(|(_, event)| event).collect();
@@ -2364,6 +2365,7 @@ mod editor_reads_tests {
         let restart = HostOp::Editor(EditorCall::Restart {
             win: WinId::MAIN,
             spawn: spawn.clone(),
+            editor: eitri_core::wm::owned_editor_for_tests(),
         });
         assert_eq!(host.apply(&restart), Applied::Refused);
         let told = events();

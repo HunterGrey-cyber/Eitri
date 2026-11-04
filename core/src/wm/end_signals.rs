@@ -15,13 +15,17 @@ pub const ANSWER_WITHIN: Duration = Duration::from_secs(5);
 /// - a plugin task group's stop, `crate::plugin::tasks::GRACE` (2 s);
 /// - the plugin pages' hold in `plugin_panels::shutdown` (that grace and 1 s more, 3 s);
 /// - the editor's record: the read of nvim's last one (`editor_reopen_start::HANDOFF_WAIT`, 1 s) and the wait for its
-///   writer (`RECORD_FLUSH`, 2 s), 3 s.
+///   writer (`RECORD_FLUSH`, 2 s), 3 s;
+/// - letting go of a person's own nvim: the glue's teardown ([`DETACH_TEARDOWN`](super::host::DETACH_TEARDOWN),
+///   300 ms) and the wait for the waiting room to take it back
+///   ([`DETACH_ROOM_WAIT`](super::host::DETACH_ROOM_WAIT), 1 s), 1.3 s.
 ///
-/// That is 36 s; 41 s with the margin, rounded up to 42 s so a window this one tells to close after answering the
-/// signal late (within [`ANSWER_WITHIN`]) still has its whole close before its kill ([`told_within`]). A shorter bound
+/// That is 37.3 s; 42.3 s with the margin, and 43.3 s with the second a told window's kill lands ahead of the exit
+/// ([`KILL_AHEAD_OF_EXIT`]), rounded up to 44 s, so a window this one tells to close after answering the signal late
+/// (within [`ANSWER_WITHIN`]) still has its whole close before its kill ([`told_within`]). A shorter bound
 /// would end a healthy close before the session teardown escalates, and leave the very `claude` and sidecar processes
 /// that teardown exists to end. Raising any of those bounds means raising this one.
-pub const CLOSE_WITHIN: Duration = Duration::from_secs(42);
+pub const CLOSE_WITHIN: Duration = Duration::from_secs(44);
 
 /// How far ahead of the watchdog's `_exit` the SIGKILL of a window told to close lands: the `_exit` takes the thread
 /// that would send it.
@@ -155,7 +159,32 @@ mod tests {
         let tasks = crate::plugin::tasks::GRACE;
         let pages = crate::plugin::tasks::GRACE + Duration::from_secs(1);
         let editor_record = crate::editor_reopen_start::HANDOFF_WAIT + crate::editor_reopen_start::RECORD_FLUSH;
-        session + saved_tabs + nvim + tasks + pages + editor_record
+        session + saved_tabs + nvim + tasks + pages + editor_record + detach()
+    }
+
+    /// Letting go of a person's own nvim: the glue's teardown, then the wait for the waiting room.
+    fn detach() -> Duration {
+        crate::wm::host::DETACH_TEARDOWN + crate::wm::host::DETACH_ROOM_WAIT
+    }
+
+    #[test]
+    fn close_within_grows_by_the_teardown_and_the_room_wait() {
+        assert_eq!(crate::wm::host::DETACH_TEARDOWN, Duration::from_millis(300));
+        assert_eq!(crate::wm::host::DETACH_ROOM_WAIT, Duration::from_secs(1));
+        assert_eq!(
+            every_close_bound(),
+            Duration::from_secs(36) + detach(),
+            "every other bound, then the detach's"
+        );
+        assert!(
+            CLOSE_WITHIN >= every_close_bound() + Duration::from_secs(5),
+            "the detach's bounds are inside the close's, with the margin"
+        );
+        assert_eq!(
+            CLOSE_WITHIN,
+            Duration::from_secs(44),
+            "43.3 s with the margin and the kill's second, rounded up to the second"
+        );
     }
 
     #[test]
@@ -168,7 +197,7 @@ mod tests {
         );
         assert_eq!(
             every_close_bound(),
-            Duration::from_secs(33) + editor_record,
+            Duration::from_secs(33) + editor_record + detach(),
             "the other bounds, then the record's"
         );
         assert!(CLOSE_WITHIN >= every_close_bound() + Duration::from_secs(5));

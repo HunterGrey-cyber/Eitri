@@ -2,7 +2,7 @@
 
 use super::host::*;
 use super::module::SurfaceDecl;
-use super::window::{ActivationToken, EditorPresence, Tiling, WinId, WindowParts, WindowSpec};
+use super::window::{ActivationToken, EditorKind, EditorPresence, Tiling, WinId, WindowParts, WindowSpec};
 use super::Controller;
 use crate::compositor::mode::{resolve_mode, Mode, ModeFacts, TilingChoice, Why};
 use crate::compositor::Wm;
@@ -248,6 +248,8 @@ impl StartStep {
 pub(super) struct StartState {
     next: usize,
     pub(super) own_window: Option<String>,
+    /// Whose nvim the window's editor shows, given before the window is opened or after.
+    pub(super) editor_kind: EditorKind,
     pub(super) tiling: Tiling,
     pub(super) spawn: Option<EditorSpawn>,
     /// `None` for a window that was told none, which builds no base page.
@@ -441,7 +443,10 @@ pub(super) fn event_window(event: &HostEvent) -> Option<WinId> {
             | EditorEvent::StartFailed { win, .. }
             | EditorEvent::Navigate { win, .. }
             | EditorEvent::QuitCancelled { win, .. }
-            | EditorEvent::OpenFailed { win, .. },
+            | EditorEvent::OpenFailed { win, .. }
+            | EditorEvent::Detached { win }
+            | EditorEvent::CloseFacts { win, .. }
+            | EditorEvent::HandedBack { win, .. },
         )
         | HostEvent::Plugin(
             PluginEvent::Frozen { win, .. } | PluginEvent::FreezeRefused { win, .. } | PluginEvent::Ready { win, .. },

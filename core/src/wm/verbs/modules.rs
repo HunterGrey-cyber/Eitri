@@ -822,6 +822,12 @@ pub fn restart_editor(w: &mut Window, _cx: &Cx, win: WinId, batch: &mut Batch) {
     if *w.presence() != EditorPresence::Owned {
         return;
     }
+    // A person's own nvim that went back or ended does not start again in this window: nvim is theirs to start.
+    if w.editor_attached() && matches!(w.editor_run, EditorRun::Ending | EditorRun::Ended) {
+        w.say("[modules] editor: its nvim is no longer here, and this window starts none".into());
+        w.refuse(win, String::new(), batch);
+        return;
+    }
     let shown = w
         .layout
         .try_borrow_mut()
@@ -864,9 +870,14 @@ pub(crate) fn send_restart(w: &mut Window, win: WinId, batch: &mut Batch) {
         w.refuse(win, "the editor's launch settings are unavailable".into(), batch);
         return;
     };
+    let Some(editor) = owned(w.editor_kind()) else {
+        w.editor_run = EditorRun::Ended;
+        w.warn("[wm] BUG: a restart was built for a person's own nvim; nothing was sent".into());
+        return;
+    };
     // Until the editor has been ready once, nothing has opened the launch's targets.
     spawn.open = w.pending_open.clone();
-    batch.push_effect(HostOp::Editor(EditorCall::Restart { win, spawn }));
+    batch.push_effect(HostOp::Editor(EditorCall::Restart { win, spawn, editor }));
 }
 
 /// How many files may wait for the editor at once; one more is refused and its client opens a new window.
@@ -1606,6 +1617,12 @@ fn kill_asked(w: &mut Window, cx: &Cx, win: WinId, batch: &mut Batch) -> Ran {
         }
         Err(_) => return Ran::Done,
     };
+    // A person's own nvim cannot be killed apart from the window, which exists for it: the question is whether to
+    // give it back and close.
+    if id == ModuleId::editor() && w.editor_attached() {
+        close::ask_give_back(w, cx, win, batch);
+        return Ran::Done;
+    }
     if scope == KillScope::Window {
         close::ask_last_module(w, cx, win, id, batch);
         return Ran::Done;
@@ -2812,7 +2829,8 @@ mod restart_tests {
                 },
                 HostOp::Editor(EditorCall::Restart {
                     win: WIN,
-                    spawn: r.spawn.clone()
+                    spawn: r.spawn.clone(),
+                    editor: owned_editor_for_tests()
                 }),
                 HostOp::Editor(EditorCall::SetFocused {
                     win: WIN,

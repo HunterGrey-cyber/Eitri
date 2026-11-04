@@ -714,6 +714,12 @@ impl ServiceSet for Services {
                 Ok(())
             }
             EditorCall::Reveal { .. } => Err(NOT_CARRIED_OUT.into()),
+            // Only a window over a person's own nvim sends these, and no window here holds one yet: refused, so a
+            // close's question about the editor waits out its bound and asks.
+            EditorCall::Detach { .. } | EditorCall::AskCloseFacts { .. } => {
+                eprintln!("[editor] {op:?}: this window's editor is not attached to a person's nvim; refused");
+                Err("this window's editor is not attached to a person's nvim".into())
+            }
         }
     }
 

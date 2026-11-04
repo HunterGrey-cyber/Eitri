@@ -256,6 +256,31 @@ pub fn layout_refusal_text(err: &LayoutError) -> String {
     gone_editor_toast_text(err).unwrap_or_else(|| err.to_string())
 }
 
+/// `prefix x` on a person's own nvim: the editor cannot be killed apart from the window, which exists for that nvim.
+pub const GIVE_BACK_PROMPT: &str = "give nvim back to the terminal and close this window? (y/n)";
+
+/// A close of a person's own nvim while it waits for a key, or is busy, or did not say in time: given back now, its
+/// terminal shows a blank screen until a key, and that key answers whatever nvim is asking.
+pub const BLOCKING_PROMPT: &str =
+    "nvim is waiting for a key (or busy): press Esc in the editor, or close anyway? (y/n)";
+
+/// The window's link to a person's own nvim closed while the window lived.
+pub const LINK_LOST_TEXT: &str = "the connection to nvim was lost";
+
+/// The drafts and proposals in a person's own nvim that end with the window, since they are the window's and not the
+/// person's files.
+pub fn unsaved_in_editor_prompt(drafts: usize, proposals: usize) -> String {
+    let mut said = Vec::new();
+    if drafts > 0 {
+        said.push("the draft in the editor has unsaved changes".to_owned());
+    }
+    if proposals > 0 {
+        said.push(format!("{proposals} agent proposals are open"));
+    }
+    said.push("close anyway? (y/n)".to_owned());
+    said.join(", ")
+}
+
 /// What the ended editor's toasts say where the cause is not known: nvim exited, and the key that starts it again.
 /// It names no cause -- a text naming `:qa` or `prefix x` would be wrong after a close that was declined later.
 /// A crash has its own text ([`editor_crashed_text`]). The key is the window's own (its prefix and the editor's module key), written in

@@ -427,6 +427,12 @@ impl QuitFlow {
         }
     }
 
+    /// A window kept after its editor's nvim was let go of: the editor holds no nvim and none comes back to it, so it
+    /// ends in place.
+    pub fn let_go_declined(&mut self, world: &mut dyn QuitWorld) {
+        Self::end_in_place(world, "[window] close declined after nvim was let go of");
+    }
+
     /// A restarted nvim that exited before it was ready: nothing asked it to quit and the window is not closed for
     /// it, so the editor ends in place again and says how to start it once more.
     pub fn restarted_nvim_exited(&mut self, world: &mut dyn QuitWorld) {

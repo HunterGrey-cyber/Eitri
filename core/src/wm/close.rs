@@ -52,6 +52,20 @@
 //!   screen holding the keys with nothing behind it ([`retire_on_declined_close`]). It is not
 //!   restarted in this window (as above); `prefix e` then says so.
 //!
+//! - **a person's own nvim** ([`EditorKind::Attached`](super::window::EditorKind), taken over from its terminal):
+//!   nothing in the window may quit, end or restart it -- [`EditorCall::Quit`], `End` and `Restart` cannot be built
+//!   without an [`OwnedEditor`], which [`owned`] gives no attached editor -- and every close lets go of it
+//!   ([`EditorCall::Detach`]) so it goes back to its terminal. A close that can ask first asks the editor what it has
+//!   to ask about ([`EditorCall::AskCloseFacts`], at most [`CLOSE_FACTS_WITHIN`]; no answer counts as nvim waiting
+//!   for a key), then asks about the drafts and proposals that end with the window, then about a waiting nvim, then
+//!   lets go, and only then asks about running turns, so the terminal never waits on that question. The window is torn
+//!   down only once the editor says it let go ([`EditorEvent::Detached`], at most [`DETACHED_WITHIN`]); an answer to
+//!   an earlier close's ask for the editor's facts is never taken for the current one's (its `generation`).
+//!   `prefix x` on the editor asks whether to give nvim back and close, then closes. A hand-back
+//!   ([`CloseCause::HandedBack`]) lets go at once and asks only about running turns; it and a signal run whatever the
+//!   close is doing ([`ALWAYS_RUN`]). A `n` to the turns' question after the let-go keeps the window for its turns and
+//!   ends the editor in place, since it holds no nvim any more.
+//!
 //! This file holds the pieces decided without a display or a toolkit: the prompt's text and keys,
 //! where each kind of module is left ([`reopen`]), and each single decision of the editor's quit,
 //! read from what nvim answered ([`NvimAnswer`]). [`CloseFlow`] joins native closes, the last module's
@@ -70,6 +84,10 @@ use crate::keymap::KeyName;
 #[cfg(test)]
 #[path = "close/tests.rs"]
 mod flow_tests;
+
+#[cfg(test)]
+#[path = "close/attached_tests.rs"]
+mod attached_tests;
 
 use super::chrome::{self, Prompt};
 use super::host::*;
@@ -93,6 +111,15 @@ pub enum CloseState {
 pub struct CloseFlow {
     pub state: CloseState,
     teardown: Option<TimerToken>,
+    /// An attached editor's close waits for what it has to ask, at most until this timer fires.
+    facts: Option<TimerToken>,
+    /// The generation of the last [`EditorCall::AskCloseFacts`]; only an answer carrying it is this close's.
+    facts_generation: u32,
+    /// The attached editor was let go of, or its nvim ended: there is nothing left to let go of.
+    let_go: bool,
+    /// The editor was told to let go of the nvim and has not said it did: the window is not torn down before it
+    /// does, or before [`DETACHED_WITHIN`].
+    detaching: bool,
     pending: Option<PendingClose>,
     confirmed: bool,
     repeated: bool,
@@ -109,7 +136,23 @@ pub enum PendingClose {
         module: ModuleId,
         confirmed: Option<String>,
     },
+    /// A question about a person's own nvim, asked before it is let go of.
+    Attached(AttachedAsk),
 }
+
+/// The questions a close asks about a person's own nvim, in the order it asks them.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AttachedAsk {
+    /// `prefix x` on the editor: give nvim back to its terminal and close the window.
+    GiveBack,
+    /// Drafts or proposals in the editor end with the window; `blocking` is asked after it.
+    Unsaved { blocking: bool },
+    /// nvim is waiting for a key, or busy, or did not say in time.
+    Blocking,
+}
+
+/// How long an attached editor's close waits for what it has to ask; no answer counts as nvim waiting for a key.
+pub const CLOSE_FACTS_WITHIN: Duration = Duration::from_millis(200);
 
 #[derive(Debug, Clone)]
 pub enum CloseCause {
@@ -120,6 +163,53 @@ pub enum CloseCause {
     Signal(&'static str),
     /// Window 1 said it is closing the group this module window belongs to.
     GroupClosed,
+    /// A person's own nvim went back to its terminal, or must go now: the window lets go of it at once and closes,
+    /// asking only about running turns.
+    HandedBack(HandBackWhy),
+}
+
+/// Why a person's own nvim goes back to its terminal without the window asking.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum HandBackWhy {
+    /// Another UI attached to the nvim.
+    OtherUi,
+    /// Enter in the waiting room took it back.
+    TakeBack,
+    /// The window's link to the nvim closed.
+    LinkLost,
+    /// Another Eitri's glue replaced this window's in the nvim.
+    Replaced,
+    /// The attach failed after the terminal's UI had moved.
+    AttachFailed,
+}
+
+impl HandBackWhy {
+    fn said(self) -> &'static str {
+        match self {
+            HandBackWhy::OtherUi => "another UI attached to it",
+            HandBackWhy::TakeBack => "the terminal took it back",
+            HandBackWhy::LinkLost => super::feedback::LINK_LOST_TEXT,
+            HandBackWhy::Replaced => "another Eitri's glue replaced this window's",
+            HandBackWhy::AttachFailed => "the attach failed",
+        }
+    }
+}
+
+fn is_signal(cause: &CloseCause) -> bool {
+    matches!(cause, CloseCause::Signal(_))
+}
+
+fn is_hand_back(cause: &CloseCause) -> bool {
+    matches!(cause, CloseCause::HandedBack(_))
+}
+
+/// The causes no refusal may stop, whatever the close is doing: a signal cannot wait for an answer, and a person's
+/// own nvim goes back to them without waiting for one.
+pub const ALWAYS_RUN: &[fn(&CloseCause) -> bool] = &[is_signal, is_hand_back];
+
+/// Whether `cause` is one of [`ALWAYS_RUN`].
+pub fn always_runs(cause: &CloseCause) -> bool {
+    ALWAYS_RUN.iter().any(|runs| runs(cause))
 }
 
 /// A signal never waits for an answer. Ordinary closes let nvim guard unsaved buffers before an idle tears down.
@@ -128,6 +218,16 @@ pub fn request(w: &mut Window, cx: &Cx, win: WinId, cause: CloseCause, batch: &m
     if matches!(cause, CloseCause::Signal(_)) && w.close.state == CloseState::Moving {
         w.say("[window] an end signal closes without waiting for the moves".into());
         stop_moving(w);
+    }
+    if let CloseCause::HandedBack(why) = cause {
+        if !w.editor_attached() {
+            w.warn(format!(
+                "[window] BUG: a hand-back ({}) for an nvim this window started; ignored",
+                why.said()
+            ));
+            return;
+        }
+        hand_back(w, win, why, batch);
     }
     if ended(w) {
         return;
@@ -155,6 +255,10 @@ pub fn request(w: &mut Window, cx: &Cx, win: WinId, cause: CloseCause, batch: &m
     if w.tiling == Tiling::Hub && matches!(cause, CloseCause::User | CloseCause::Compositor) && !w.close.confirmed {
         batch.push_effect(HostOp::Cleanup(CleanupOp::GroupAsked));
     }
+    if w.editor_attached() {
+        attached_close(w, cx, win, cause, batch);
+        return;
+    }
     if w.close.teardown.is_some() {
         return;
     }
@@ -174,6 +278,215 @@ pub fn request(w: &mut Window, cx: &Cx, win: WinId, cause: CloseCause, batch: &m
     let proceed = with_quit(w, cx, win, batch, |quit, world| quit.window_close(world, now));
     if proceed == WindowClose::Proceed && !ended(w) && w.close.teardown.is_none() {
         w.close.teardown = Some(w.arm_idle());
+    }
+}
+
+/// Lets go of a person's own nvim now, whatever the close is doing: the wait for what it had to ask and any question
+/// about it go, since the nvim they were about is going back.
+fn hand_back(w: &mut Window, win: WinId, why: HandBackWhy, batch: &mut Batch) {
+    w.say(format!("[window] nvim goes back to its terminal: {}", why.said()));
+    if why == HandBackWhy::LinkLost {
+        chrome::show_toast(w, super::feedback::LINK_LOST_TEXT.into(), ToastKind::Warning);
+    }
+    // The teardown has let go of it already.
+    if matches!(w.close.state, CloseState::TearingDown | CloseState::Closed) {
+        return;
+    }
+    stop_asking_about_the_editor(w);
+    let_go(w, win, batch);
+}
+
+/// The wait for an attached editor's facts and any question about the editor end; the close is left idle unless it
+/// is moving modules away or tearing down.
+fn stop_asking_about_the_editor(w: &mut Window) {
+    if let Some(token) = w.close.facts.take() {
+        w.cancel_timer(token);
+        if w.close.state == CloseState::Quitting && w.close.teardown.is_none() {
+            w.close.state = CloseState::Idle;
+        }
+    }
+    if w.close.state == CloseState::Asking && matches!(w.close.pending, Some(PendingClose::Attached(_))) {
+        w.close.pending = None;
+        w.close.state = CloseState::Idle;
+        chrome::set_prompt(w, None);
+    }
+}
+
+/// The one `Detach` of a close: once let go of, the nvim is not the window's to let go of again.
+fn let_go(w: &mut Window, win: WinId, batch: &mut Batch) {
+    if std::mem::replace(&mut w.close.let_go, true) {
+        return;
+    }
+    w.say("[window] letting go of nvim".into());
+    w.close.detaching = true;
+    // The nvim is no longer the window's from here: an editor kept on screen only ends in place.
+    if matches!(
+        w.editor_run,
+        super::window::EditorRun::Running | super::window::EditorRun::Restarting
+    ) {
+        w.editor_run = super::window::EditorRun::Ending;
+    }
+    batch.push_effect(HostOp::Editor(EditorCall::Detach { win }));
+}
+
+/// The editor said it let go of the nvim: a teardown that waited for that runs from the next idle.
+fn detach_answered(w: &mut Window) {
+    if !std::mem::take(&mut w.close.detaching) || w.close.state != CloseState::Quitting {
+        return;
+    }
+    if let Some(token) = w.close.teardown.take() {
+        w.cancel_timer(token);
+        w.close.teardown = Some(w.arm_idle());
+    }
+}
+
+/// A `n` to the turns' question after the nvim was let go of keeps the window for its turns. Its editor holds no nvim
+/// any more and cannot have one back, so it ends in place, as an editor whose nvim exited does, instead of holding
+/// the keys with nothing behind it.
+fn retire_let_go_editor(w: &mut Window, cx: &Cx, win: WinId, batch: &mut Batch) {
+    if !w.close.let_go {
+        return;
+    }
+    with_quit(w, cx, win, batch, |quit, world| quit.let_go_declined(world));
+}
+
+/// A close of a window whose editor shows a person's own nvim: what the editor has to ask is asked for, then the
+/// questions about it, then it is let go of, and only then the question about running turns.
+fn attached_close(w: &mut Window, cx: &Cx, win: WinId, cause: CloseCause, batch: &mut Batch) {
+    if matches!(cause, CloseCause::NvimExited) {
+        // The nvim ended: there is nothing to ask about it or to give back.
+        stop_asking_about_the_editor(w);
+        w.close.let_go = true;
+    }
+    if w.close.teardown.is_some() || w.close.facts.is_some() {
+        return;
+    }
+    if w.close.state == CloseState::Asking {
+        if !matches!(w.close.pending, Some(PendingClose::LastModule { .. })) {
+            return;
+        }
+        w.say("[window] a window close replaces the last module's kill question".into());
+        w.close.pending = None;
+        w.close.state = CloseState::Idle;
+        chrome::set_prompt(w, None);
+    }
+    if w.close.let_go {
+        after_let_go(w, cx, win);
+        return;
+    }
+    w.close.state = CloseState::Quitting;
+    w.close.facts = Some(w.arm_after(CLOSE_FACTS_WITHIN));
+    w.close.facts_generation = w.close.facts_generation.wrapping_add(1);
+    let generation = w.close.facts_generation;
+    batch.push_effect(HostOp::Editor(EditorCall::AskCloseFacts { win, generation }));
+}
+
+/// The attached editor's facts with the generation of the ask they answer, or `None` when none came in time, which
+/// counts as nvim waiting for a key. A late answer, or one no close is waiting for, changes nothing: an answer to an
+/// earlier close's ask may have been taken before something changed.
+pub(super) fn close_facts(w: &mut Window, cx: &Cx, win: WinId, answer: Option<(u32, CloseAsks)>, batch: &mut Batch) {
+    if let Some((generation, _)) = answer {
+        if w.close.facts.is_none() || generation != w.close.facts_generation {
+            w.say(format!(
+                "[window] the editor's answer to an earlier close's ask ({generation}) came late; ignored"
+            ));
+            return;
+        }
+    }
+    let asks = answer.map(|(_, asks)| asks);
+    let Some(token) = w.close.facts.take() else {
+        return;
+    };
+    if asks.is_some() {
+        w.cancel_timer(token);
+    } else {
+        w.say("[window] the editor did not say in time whether nvim waits for a key; taken as waiting".into());
+    }
+    let asks = asks.unwrap_or(CloseAsks {
+        blocking: true,
+        ..CloseAsks::default()
+    });
+    w.close.state = CloseState::Idle;
+    if asks.drafts > 0 || asks.proposals > 0 {
+        let text = super::feedback::unsaved_in_editor_prompt(asks.drafts, asks.proposals);
+        ask_attached(
+            w,
+            AttachedAsk::Unsaved {
+                blocking: asks.blocking,
+            },
+            text,
+        );
+    } else if asks.blocking {
+        ask_attached(w, AttachedAsk::Blocking, super::feedback::BLOCKING_PROMPT.into());
+    } else {
+        let_go(w, win, batch);
+        after_let_go(w, cx, win);
+    }
+}
+
+/// `prefix x` on an attached editor: whether to give nvim back to its terminal and close the window.
+pub(super) fn ask_give_back(w: &mut Window, cx: &Cx, win: WinId, batch: &mut Batch) {
+    if ended(w) {
+        return;
+    }
+    superseded(w, cx, win, batch);
+    if w.close.state != CloseState::Idle {
+        w.say("[modules] editor: not asked; the window is closing".into());
+        return;
+    }
+    // Nothing is left to give back: killing the editor is the window's close.
+    if w.close.let_go {
+        w.say("[modules] editor: its nvim was let go of already; the window closes".into());
+        request(w, cx, win, CloseCause::User, batch);
+        return;
+    }
+    ask_attached(w, AttachedAsk::GiveBack, super::feedback::GIVE_BACK_PROMPT.into());
+}
+
+fn ask_attached(w: &mut Window, ask: AttachedAsk, text: String) {
+    w.say(format!("[window] {text}"));
+    w.modules.clear_question();
+    w.close.pending = Some(PendingClose::Attached(ask));
+    w.close.state = CloseState::Asking;
+    chrome::set_prompt(
+        w,
+        Some(Prompt {
+            text,
+            closes_window: true,
+            offers_move: false,
+        }),
+    );
+}
+
+/// A `y` to a question about a person's own nvim: the next question, or the close goes on.
+fn attached_answered(w: &mut Window, cx: &Cx, win: WinId, ask: AttachedAsk, batch: &mut Batch) {
+    match ask {
+        AttachedAsk::GiveBack => request(w, cx, win, CloseCause::User, batch),
+        AttachedAsk::Unsaved { blocking: true } => {
+            ask_attached(w, AttachedAsk::Blocking, super::feedback::BLOCKING_PROMPT.into())
+        }
+        AttachedAsk::Unsaved { blocking: false } | AttachedAsk::Blocking => {
+            let_go(w, win, batch);
+            after_let_go(w, cx, win);
+        }
+    }
+}
+
+/// The nvim has been let go of: the question about running turns, if any, then the teardown from an idle.
+fn after_let_go(w: &mut Window, cx: &Cx, win: WinId) {
+    if !w.close.confirmed {
+        if let Some(text) = window_prompt(w, cx, win) {
+            ask_window(w, cx, win, text);
+            return;
+        }
+    }
+    w.close.state = CloseState::Quitting;
+    if w.close.teardown.is_none() {
+        w.close.teardown = Some(if w.close.detaching {
+            w.arm_after(DETACHED_WITHIN)
+        } else {
+            w.arm_idle()
+        });
     }
 }
 
@@ -265,9 +578,19 @@ impl CloseFlow {
             (PromptKey::Yes, Some(PendingClose::LastModule { module, confirmed })) => {
                 last_module_confirmed(w, cx, win, module, confirmed, batch);
             }
+            (PromptKey::Yes, Some(PendingClose::Attached(ask))) => attached_answered(w, cx, win, ask, batch),
+            // A `y` given earlier in this close (the last module's) confirmed this close only.
+            (_, Some(PendingClose::Attached(_))) => {
+                w.close.confirmed = false;
+                w.say("[window] the close was declined; nvim stays in the editor".into());
+            }
             // The last module's question never was the window close's own: declining it leaves the editor as it is.
             (_, Some(PendingClose::Window { .. })) if runs_decline_hook(answer, closes_window) => {
-                with_quit(w, cx, win, batch, |quit, world| quit.window_close_declined(world));
+                if w.editor_attached() {
+                    retire_let_go_editor(w, cx, win, batch);
+                } else {
+                    with_quit(w, cx, win, batch, |quit, world| quit.window_close_declined(world));
+                }
             }
             _ => {}
         }
@@ -310,6 +633,13 @@ fn last_module_confirmed(
             return;
         }
     }
+    // A person's own nvim is let go of as any close lets go of it, the kill's question standing for the turns'.
+    if w.editor_attached() {
+        let now = window_prompt(w, cx, win);
+        w.close.confirmed = close_is_confirmed(confirmed.as_deref(), now.as_deref());
+        request(w, cx, win, CloseCause::User, batch);
+        return;
+    }
     w.close.state = CloseState::Quitting;
     with_quit(w, cx, win, batch, |quit, world| {
         if module == ModuleId::editor() {
@@ -330,10 +660,15 @@ pub(super) fn superseded(w: &mut Window, cx: &Cx, win: WinId, batch: &mut Batch)
     if w.close.state != CloseState::Asking {
         return;
     }
-    let declined = matches!(w.close.pending.take(), Some(PendingClose::Window { .. }));
+    let pending = w.close.pending.take();
     w.close.state = CloseState::Idle;
-    if declined {
-        with_quit(w, cx, win, batch, |quit, world| quit.window_close_declined(world));
+    match pending {
+        Some(PendingClose::Window { .. }) if w.editor_attached() => retire_let_go_editor(w, cx, win, batch),
+        Some(PendingClose::Window { .. }) => {
+            with_quit(w, cx, win, batch, |quit, world| quit.window_close_declined(world));
+        }
+        Some(PendingClose::Attached(_)) => w.close.confirmed = false,
+        Some(PendingClose::LastModule { .. }) | None => {}
     }
 }
 
@@ -510,6 +845,9 @@ pub fn teardown(w: &mut Window, win: WinId, batch: &mut Batch) {
     if let Some(token) = w.close.teardown.take() {
         w.cancel_timer(token);
     }
+    if let Some(token) = w.close.facts.take() {
+        w.cancel_timer(token);
+    }
     if let Some((token, _)) = w.quit_timer.take() {
         w.cancel_timer(token);
     }
@@ -526,23 +864,31 @@ pub fn teardown(w: &mut Window, win: WinId, batch: &mut Batch) {
         batch.push_effect(HostOp::Cleanup(CleanupOp::EndGroup));
     }
     // The editor's record waits for nvim's own last one, which it leaves in the channel directory as it ends: told
-    // after nvim is, before that directory goes.
-    let record = super::reopen::teardown_op(w);
-    for op in [
-        HostOp::Cleanup(CleanupOp::PairOnClose { layout_written }),
-        HostOp::Editor(EditorCall::Shutdown { win }),
-    ]
-    .into_iter()
-    .chain(record)
-    .chain([
-        HostOp::Terminal(TermOp::ShutdownAll { win }),
-        HostOp::Cleanup(CleanupOp::ScratchDir),
-        HostOp::Cleanup(CleanupOp::PaneSwitchDir),
-        HostOp::Cleanup(CleanupOp::Feeds),
-        HostOp::Plugin(PluginOp::ShutdownAll { win }),
-        HostOp::Chat(ChatOp::ShutdownAll { win, hold: true }),
-        HostOp::CloseWindow { win },
-    ]) {
+    // after nvim is, before that directory goes. A person's own nvim is let go of in its place, and keeps no record
+    // of the window's.
+    let (editor, record) = if w.editor_attached() {
+        if w.close.detaching {
+            w.say("[window] closing before the editor said it let go of nvim".into());
+        }
+        let detach = (!std::mem::replace(&mut w.close.let_go, true)).then_some(EditorCall::Detach { win });
+        (detach, None)
+    } else {
+        (Some(EditorCall::Shutdown { win }), super::reopen::teardown_op(w))
+    };
+    for op in [HostOp::Cleanup(CleanupOp::PairOnClose { layout_written })]
+        .into_iter()
+        .chain(editor.map(HostOp::Editor))
+        .chain(record)
+        .chain([
+            HostOp::Terminal(TermOp::ShutdownAll { win }),
+            HostOp::Cleanup(CleanupOp::ScratchDir),
+            HostOp::Cleanup(CleanupOp::PaneSwitchDir),
+            HostOp::Cleanup(CleanupOp::Feeds),
+            HostOp::Plugin(PluginOp::ShutdownAll { win }),
+            HostOp::Chat(ChatOp::ShutdownAll { win, hold: true }),
+            HostOp::CloseWindow { win },
+        ])
+    {
         batch.push_effect(op);
     }
     w.close.state = CloseState::Closed;
@@ -564,6 +910,10 @@ pub fn on_shell_exit(scope: KillScope) -> OnExit {
 }
 
 pub(super) fn timer(w: &mut Window, cx: &Cx, win: WinId, token: TimerToken, batch: &mut Batch) -> bool {
+    if w.close.facts == Some(token) {
+        close_facts(w, cx, win, None, batch);
+        return true;
+    }
     if w.close.teardown == Some(token) {
         w.close.teardown = None;
         teardown(w, win, batch);
@@ -587,10 +937,73 @@ pub(super) fn timer(w: &mut Window, cx: &Cx, win: WinId, token: TimerToken, batc
 }
 
 pub(super) fn editor_event(w: &mut Window, cx: &Cx, win: WinId, event: EditorEvent, batch: &mut Batch) {
+    use super::window::{EditorRun, NvimSaid};
+    match &event {
+        EditorEvent::HandedBack { why, .. } => {
+            request(w, cx, win, CloseCause::HandedBack(*why), batch);
+            return;
+        }
+        EditorEvent::CloseFacts { generation, asks, .. } => {
+            close_facts(w, cx, win, Some((*generation, *asks)), batch);
+            return;
+        }
+        // The pane holds no nvim any more: nothing can take a file, and nothing brings this one back here.
+        EditorEvent::Detached { .. } if !w.editor_attached() => {
+            w.warn("[wm] BUG: a detach was reported for an nvim this window started; ignored".into());
+            return;
+        }
+        EditorEvent::Detached { .. } => {
+            w.close.let_go = true;
+            w.editor_ready = false;
+            w.editor_lost = true;
+            w.editor_run = EditorRun::Ended;
+            w.say("[modules] editor: nvim was let go of".into());
+            detach_answered(w);
+            return;
+        }
+        // An exit reported after the nvim was let go of is the terminal's nvim, not this window's: it closes nothing,
+        // and while the close waits for the detach's answer it is that answer.
+        EditorEvent::Exited { .. } if w.editor_attached() && w.close.let_go => {
+            w.editor_ready = false;
+            w.editor_lost = true;
+            w.editor_run = EditorRun::Ended;
+            w.say("[modules] editor: an exit after nvim was let go of; nothing to close for it".into());
+            detach_answered(w);
+            return;
+        }
+        _ => {}
+    }
     if ended(w) {
         return;
     }
-    use super::window::{EditorRun, NvimSaid};
+    // A person's own nvim that ends closes the window, as plain Neovim's does; nothing reads a record of it, and no
+    // quit of this window's is in flight to settle.
+    if w.editor_attached() {
+        match event {
+            EditorEvent::Exited { .. } => {
+                w.editor_ready = false;
+                w.editor_lost = true;
+                w.editor_run = EditorRun::Ended;
+                w.say("[modules] editor: nvim ended".into());
+                request(w, cx, win, CloseCause::NvimExited, batch);
+                return;
+            }
+            EditorEvent::Unreachable { .. }
+            | EditorEvent::QuitCancelled { .. }
+            | EditorEvent::QuitNotSent { .. }
+            | EditorEvent::Released { .. }
+            | EditorEvent::ReleaseRefused { .. }
+            | EditorEvent::RestartRefused { .. }
+            | EditorEvent::Reopen { .. }
+            | EditorEvent::Captured { .. } => {
+                w.say(format!(
+                    "[modules] editor: {event:?} does not apply to a person's own nvim; ignored"
+                ));
+                return;
+            }
+            _ => {}
+        }
+    }
     let was_ready = w.editor_ready;
     // Taken at every exit, so a restarted nvim starts from nothing said.
     let crashed = matches!(event, EditorEvent::Exited { .. }) && std::mem::take(&mut w.nvim_said) == NvimSaid::Watched;
@@ -762,6 +1175,12 @@ pub(super) fn editor_event(w: &mut Window, cx: &Cx, win: WinId, event: EditorEve
 
 pub(super) fn kill_editor(w: &mut Window, cx: &Cx, win: WinId, scope: KillScope, batch: &mut Batch) {
     if ended(w) {
+        return;
+    }
+    // A person's own nvim is never quit: killing the editor gives it back, which closes the window.
+    if w.editor_attached() {
+        w.say("[modules] editor: nvim goes back to its terminal, and the window closes".into());
+        request(w, cx, win, CloseCause::User, batch);
         return;
     }
     with_quit(w, cx, win, batch, |quit, world| {
@@ -970,15 +1389,26 @@ impl QuitWorld for WindowQuit<'_, '_> {
         window_prompt(self.w, self.cx, self.win)
     }
     fn send_quit(&mut self, lua: String, generation: u32) {
+        let Some(editor) = owned(self.w.editor_kind()) else {
+            self.w
+                .warn("[wm] BUG: a quit was built for a person's own nvim; nothing was sent".into());
+            return;
+        };
         self.batch.push_effect(HostOp::Editor(EditorCall::Quit {
             win: self.win,
             lua,
             generation,
+            editor,
         }));
     }
     fn end_nvim(&mut self) {
+        let Some(editor) = owned(self.w.editor_kind()) else {
+            self.w
+                .warn("[wm] BUG: an end was built for a person's own nvim; nothing was sent".into());
+            return;
+        };
         self.batch
-            .push_effect(HostOp::Editor(EditorCall::End { win: self.win }));
+            .push_effect(HostOp::Editor(EditorCall::End { win: self.win, editor }));
     }
     fn show_editor(&mut self) -> Result<(), crate::layout::LayoutError> {
         modules::show_on_screen(self.w, self.cx, self.win, &ModuleId::editor(), self.batch)?;
