@@ -5,7 +5,7 @@ import type { MermaidRunner } from "../render/mermaid";
 import { installFakeLayout, type FakeLayout } from "./fakelayout";
 import { editSelection, installKeys, yankSelection } from "./keys";
 import { Preview } from "./preview";
-import { sourceSelection } from "./selection";
+import { drawnPart, sourceSelection } from "./selection";
 
 /* The fake layout (fakelayout.ts): each tagged leaf block 20 px a source line, a 10 px gap between blocks; a range
    over a text reports its block's rows. */
@@ -23,7 +23,7 @@ let calls: { verb: string; args: unknown }[];
 let answer: (verb: string, args: unknown) => Promise<unknown>;
 let installed: InstallOptions | null;
 const kit = { version: 5, install: vi.fn(async (o: InstallOptions) => { installed = o; return () => {}; }), setCurrent: vi.fn(),
-  message: vi.fn(), status: vi.fn(), keys: vi.fn(() => []), findRefresh: vi.fn(), findSeed: vi.fn() };
+  message: vi.fn(), status: vi.fn(), keys: vi.fn(() => []), findRefresh: vi.fn(), findSeed: vi.fn(), visualMode: vi.fn(() => null) };
 const jumps = () => calls.filter((c) => c.verb === "editor.jump").map((c) => c.args);
 
 beforeEach(() => {
@@ -105,6 +105,67 @@ describe("the source of a selection", () => {
       { mode: "char", anchor: { line: 1, col: 1 }, focus: { line: 1, col: 4 } });
     expect(sourceSelection(p, select("word", "word"), "char")).toEqual(
       { mode: "char", anchor: { line: 1, col: 6 }, focus: { line: 1, col: 9 } });
+  });
+
+  it("finds a word after an autolink on the autolink's own line: its address is drawn", () => {
+    show("See <https://a.io> now\nthen more text now\n");
+    expect(sourceSelection(p, select("now", "now"), "char")).toEqual(
+      { mode: "char", anchor: { line: 0, col: 20 }, focus: { line: 0, col: 22 } });
+    show("Mail <me@x.org> soon\nlater soon\n");
+    expect(sourceSelection(p, select("soon", "soon"), "char")).toEqual(
+      { mode: "char", anchor: { line: 0, col: 17 }, focus: { line: 0, col: 20 } });
+  });
+
+  it("never takes a word from an HTML comment or an image's alt text on the line before", () => {
+    show("start <!-- word -->\nword end\n");
+    expect(sourceSelection(p, select("word", "word"), "char")).toEqual(
+      { mode: "char", anchor: { line: 1, col: 1 }, focus: { line: 1, col: 4 } });
+    show("pic ![word](a.png)\nword end\n");
+    expect(sourceSelection(p, select("word", "word"), "char")).toEqual(
+      { mode: "char", anchor: { line: 1, col: 1 }, focus: { line: 1, col: 4 } });
+  });
+
+  it("keeps what looks like a tag inside a code span or a fenced block: it is drawn", () => {
+    show("`<details>` here\nmore here\n");
+    expect(sourceSelection(p, select("here", "here"), "char")).toEqual(
+      { mode: "char", anchor: { line: 0, col: 13 }, focus: { line: 0, col: 16 } });
+    show(`${FENCE}\n<div> a\nb <span>\n${FENCE}\n`);
+    expect(sourceSelection(p, select("b", "b"), "char")).toEqual(
+      { mode: "char", anchor: { line: 2, col: 1 }, focus: { line: 2, col: 1 } });
+  });
+
+  it("reads a link target holding backticks as a target, and an undefined image reference as text", () => {
+    show("one [x](https://a/`ghost`)\nghost end\n");
+    expect(sourceSelection(p, select("ghost", "ghost"), "char")).toEqual(
+      { mode: "char", anchor: { line: 1, col: 1 }, focus: { line: 1, col: 5 } });
+    show("one ![ghost] later\n");
+    expect(sourceSelection(p, select("ghost", "ghost"), "char")).toEqual(
+      { mode: "char", anchor: { line: 0, col: 7 }, focus: { line: 0, col: 11 } });
+    expect(drawnPart("![ghost] and [y][ref] and [z][none]", false, new Set(["ghost", "ref"])))
+      .toBe(" and [y] and [z][none]");
+  });
+
+  it("reads a line in time that grows with its length, unmatched backticks too", () => {
+    vi.useRealTimers();
+    const time = (n: number) => {
+      const line = `prefix ${"`".repeat(n)} x ${"` ".repeat(n)}`;
+      let best = Number.POSITIVE_INFINITY;
+      for (let i = 0; i < 3; i++) {
+        const t0 = performance.now();
+        drawnPart(line);
+        best = Math.min(best, performance.now() - t0);
+      }
+      return Math.max(best, 0.05);
+    };
+    time(1000);
+    // Sixteen times the text: a linear reading takes about sixteen times as long, a quadratic one 256.
+    expect(time(32000) / time(2000)).toBeLessThan(64);
+  });
+
+  it("is linewise when the word's one written copy is not the one drawn (an entity, a link's target)", () => {
+    show("caf&eacute; [x](caf\u00e9)\n");
+    expect(sourceSelection(p, select("caf\u00e9", "caf\u00e9"), "char")).toEqual(
+      { mode: "line", anchor: { line: 0, col: 0 }, focus: { line: 0, col: 0 } });
   });
 
   it("is linewise on its line when its text occurs there twice", () => {
@@ -203,6 +264,15 @@ describe("visual mode's Y", () => {
 });
 
 describe("the page's visual hooks", () => {
+  it("ask the kit after every render, so a selection whose text was replaced ends then", async () => {
+    show("one\n");
+    await installKeys(p, { run: () => false });
+    kit.visualMode.mockClear();
+    p.onText({ buf: 1, tick: 2, name: "/p/notes.md", text: "two\n" });
+    vi.advanceTimersByTime(0);
+    expect(kit.visualMode).toHaveBeenCalled();
+  });
+
   it("start at the cursor's row and follow the selection's cursor with the page's", async () => {
     show(Array.from({ length: 40 }, (_, i) => `p${i}`).join("\n\n"));
     await installKeys(p, { run: () => false });

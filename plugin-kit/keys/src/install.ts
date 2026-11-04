@@ -428,7 +428,7 @@ export async function install(opts: InstallOptions): Promise<() => void> {
   };
   configureFind({ root: opts.find?.root, exclude: opts.find?.exclude, messages: opts.labels?.messages, render: renderMode,
     jump: tellJump });
-  configureVisual({ ...opts.visual, root: opts.find?.root, messages: opts.labels?.messages });
+  configureVisual({ ...opts.visual, root: opts.find?.root, messages: opts.labels?.messages, ended: renderMode });
   setBottom(opts.bottom ?? null);
   window.addEventListener("keydown", onKeyFirst, true);
   window.addEventListener("keydown", onKey);

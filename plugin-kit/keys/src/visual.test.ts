@@ -277,6 +277,16 @@ describe("text the mode stands on", () => {
     expect(sel().toString()).toBe("a \u{10400}");
   });
 
+  it("is ended by visualMode() when the page replaced the text under it, HUD and root mark too", async () => {
+    await start({ start: () => at("p", 0, 4) });
+    key("v");
+    const p0 = document.querySelector("p")!;
+    p0.firstChild!.replaceWith(document.createTextNode("one two three"));
+    expect(window.eitriKeys.visualMode()).toBe(null);
+    expect(mode()).toBe("NORMAL");
+    expect(document.documentElement.hasAttribute("data-eitri-visual")).toBe(false);
+  });
+
   it("ends the mode when an update shrinks the text under it", async () => {
     await start({ start: () => at("p", 0, 4) });
     key("v");

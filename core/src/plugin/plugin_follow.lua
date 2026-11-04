@@ -874,7 +874,8 @@ local function select_to(w, buf, line, byte, content, o, how)
     return { applied = true }
   end
   if vim.api.nvim_get_mode().mode ~= 'n' then
-    vim.api.nvim_feedkeys(vim.api.nvim_replace_termcodes('<C-\\><C-n>', true, false, true), 'nx', false)
+    -- Out of Visual or Select mode with an Esc of its own: keys the user typed ahead stay queued, not run here.
+    vim.api.nvim_cmd({ cmd = 'normal', args = { '\27' }, bang = true }, {})
   end
   vim.api.nvim_set_current_win(w)
   marks()

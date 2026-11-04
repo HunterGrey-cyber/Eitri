@@ -447,7 +447,9 @@ export class Preview {
     // Without the kit's glide the engine scrolls smoothly toward where the page asked it to go.
     const e = this.engineTo;
     if (e && Date.now() < e.until && Math.abs(window.scrollY - e.y) >= 1) return e.y;
-    this.engineTo = null;
+    // There: over, its timer too. Its second up short of there: over, and the timer judges the cursor.
+    if (e && Math.abs(window.scrollY - e.y) < 1) this.endEngineScroll();
+    else this.engineTo = null;
     return window.scrollY;
   }
   /** The window position that brings document y `top` to the reading reserve below the view's top. */
@@ -1117,7 +1119,8 @@ export class Preview {
     // A smooth scroll asked of the engine is over once the window is there, or once something moved it away.
     const e = this.engineTo;
     if (e && (Math.abs(window.scrollY - e.y) < 1 || Math.abs(window.scrollY - e.y) > Math.abs(this.lastScrollY - e.y) + 1)) {
-      this.engineTo = null;
+      // This scroll judges the cursor below (`pushCursor`), so the scroll's timer has nothing left to do.
+      this.endEngineScroll();
     }
     this.lastScrollY = window.scrollY;
     if (this.guard.onScroll(window.scrollY)) return;

@@ -32,7 +32,12 @@ let kind: VisualKind | null = null;
  *  (linewise: their whole lines), as vim's does, whichever comes first. */
 let anchor: Place | null = null;
 let cursor: Place | null = null;
-let options: VisualOptions & { root?: () => Element | null; messages?: Partial<Record<KitMessage, string>> } = {};
+let options: VisualOptions & {
+  root?: () => Element | null;
+  messages?: Partial<Record<KitMessage, string>>;
+  /** Told when the mode ends, so the HUD shows it. */
+  ended?: () => void;
+} = {};
 let resolver: ReturnType<typeof createResolver> | null = null;
 let pending = "";
 
@@ -60,9 +65,18 @@ export function configureVisual(next: typeof options): void {
   resolver = null;
 }
 
-/** The visual mode running, or null. */
+/** The visual mode running, or null. A mode whose text went (the page re-rendered it, or the selection was
+ *  dropped) is ended first, so the HUD and `data-eitri-visual` never outlive it. */
 export function visualKind(): VisualKind | null {
+  if (kind && !standing()) endVisual();
   return kind;
+}
+
+/** Whether the mode's selection and both its ends are still on the page's text. */
+function standing(): boolean {
+  const s = document.getSelection();
+  return !!s && s.rangeCount > 0 && !!anchor && !!cursor && anchor.node.isConnected && cursor.node.isConnected &&
+    onPage(anchor.node) && onPage(cursor.node) && exists(anchor) && exists(cursor);
 }
 
 /** The keys typed so far of a visual-mode key that waits for more (`g`). */
@@ -347,6 +361,7 @@ export function endVisual(): void {
   pending = "";
   resolver?.reset();
   document.getSelection()?.removeAllRanges();
+  options.ended?.();
 }
 
 const strokes = (key: string) => parseNotation(key)?.map((k) => `${k.ctrl}${k.shift}${k.key}`).join(" ") ?? key;
@@ -392,8 +407,7 @@ export function visualKey(stroke: KeyStroke, ev: KeyboardEvent, timeoutlen: () =
   scroll: (action: "scroll.down" | "scroll.up", ev: KeyboardEvent) => void): boolean {
   if (!kind) return false;
   const s = selection();
-  if (!s || s.rangeCount === 0 || !anchor || !cursor || !onPage(anchor.node) || !onPage(cursor.node) ||
-    !exists(anchor) || !exists(cursor)) {
+  if (!s || !standing() || !anchor || !cursor) {
     // The selection or its text went (the page replaced its text): so does the mode.
     endVisual();
     return stroke.key === "Escape";

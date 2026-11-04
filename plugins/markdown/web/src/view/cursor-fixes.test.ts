@@ -316,6 +316,14 @@ describe("a scroll asked of the engine that stops short", () => {
     expect(top()).toBe(want - 30);
   });
 
+  it("is over when it gets there, its timer too", () => {
+    stoppedShort();
+    layout.setScroll(12);
+    const push = vi.spyOn(p as unknown as { pushCursor(): void }, "pushCursor");
+    vi.advanceTimersByTime(1000);
+    expect(push).not.toHaveBeenCalled();
+  });
+
   it("is over when its second is up, and a margin then pushes the cursor", () => {
     const { want } = stoppedShort();
     vi.advanceTimersByTime(999);

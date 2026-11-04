@@ -83,7 +83,7 @@ export const settle: () => void = settleGlide;
 
 /** Ends visual mode, if it is running; the selection goes. */
 export const endVisual: () => void = endVisualMode;
-/** Visual mode's kind while it runs, else null. */
+/** Visual mode's kind while it runs, else null; a mode whose text the page replaced is ended first. */
 export const visualMode: () => VisualKind | null = visualKind;
 
 export const eitriKeys = {

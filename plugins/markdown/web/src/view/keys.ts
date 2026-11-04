@@ -315,7 +315,11 @@ export async function installKeys(
   // A render changes the text the kit's find walks; it finds again and keeps the current match near where it was.
   const off = p.afterUpdate((why) => {
     refresh();
-    if (why === "render") k?.findRefresh();
+    if (why === "render") {
+      k?.findRefresh();
+      // A render that replaced the text under a selection ends visual mode now, not at the next key.
+      k?.visualMode?.();
+    }
   });
   // The kit's own jumps (a search's move) put the cursor on the match and go into the history the way `]]` and
   // anchors do. The kit has started its own scroll to the match; the cursor's jump replaces it, so the page moves
