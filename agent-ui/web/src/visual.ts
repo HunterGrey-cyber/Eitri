@@ -866,7 +866,7 @@ export function stepOnce(sel: SelectionLike, model: VisualModel, motion: VisualM
 
 /** A count repeats the next motion `times`, stopping at the first step that makes no progress
  *  (`countedStop`'s own rule for rows, applied here to a caret). `times` is already clamped to
- *  `MAX_MOTION_COUNT` by the caller (`App.tsx`'s `accumulateMotionCount`, shared with BROWSE). */
+ *  `MAX_MOTION_COUNT` by the caller (`app/motion.ts`'s `accumulateMotionCount`, shared with BROWSE). */
 export function repeatMotion(sel: SelectionLike, model: VisualModel, motion: VisualMotion, times: number, root: Element): VisualModel {
   let current = model;
   for (let i = 0; i < times; i++) {

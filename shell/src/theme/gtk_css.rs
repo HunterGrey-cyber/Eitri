@@ -560,7 +560,7 @@ window.editor-hole, window.editor-hole .shell-root, window.editor-hole .content-
 }}
 
 /* A layout verb was refused -- `Ctrl+a x` on the last module on screen: the
-   same block, for 200ms (`main.rs`'s `show_flash`, when the controller's chrome model asks for the
+   same block, for 200ms (`window_services.rs`'s `show_flash`, when the controller's chrome model asks for the
    flash). Its own class, so the prefix's own indicator is never switched off by the flash ending. */
 .topbar-app-name.refused {{
     background-color: {bar_fg};
