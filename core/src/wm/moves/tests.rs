@@ -1663,6 +1663,30 @@ fn a_summary_is_sent_at_attach() {
 #[test]
 fn a_burst_of_count_changes_sends_one_summary() {
     let e = source();
+    // A turn already running was told at once; the burst after it waits.
+    e.host.set_chat_summary(ChatSummary {
+        running: 2,
+        ..Default::default()
+    });
+    e.driver.post(HostEvent::Chat(ChatEvent::Busy {
+        win: WIN,
+        view: crate::tabs::ViewId::BASE,
+        busy: true,
+    }));
+    e.scheduler.advance(Duration::ZERO);
+    let told = e
+        .port
+        .sent()
+        .iter()
+        .filter(|s| matches!(&s.msg, Msg::Summary(s) if s.running == 2))
+        .count();
+    assert_eq!(told, 1, "work starting goes at once");
+    let base = e
+        .port
+        .sent()
+        .iter()
+        .filter(|s| matches!(s.msg, Msg::Summary(_)))
+        .count();
     for waiting in [1, 2, 3] {
         e.host.set_chat_summary(ChatSummary {
             waiting,
@@ -1681,7 +1705,7 @@ fn a_burst_of_count_changes_sends_one_summary() {
             .iter()
             .filter(|s| matches!(s.msg, Msg::Summary(_)))
             .count(),
-        1
+        base
     );
     e.scheduler.advance(Duration::from_millis(200));
     let summaries: Vec<_> = e
@@ -1693,9 +1717,9 @@ fn a_burst_of_count_changes_sends_one_summary() {
             _ => None,
         })
         .collect();
-    assert_eq!(summaries.len(), 2);
-    assert_eq!(summaries[1].waiting, 3);
-    assert_eq!(summaries[1].running, 2);
+    assert_eq!(summaries.len(), base + 1);
+    assert_eq!(summaries[base].waiting, 3);
+    assert_eq!(summaries[base].running, 2);
     e.host.set_chat_summary(ChatSummary {
         waiting: 3,
         running: 2,
@@ -1709,7 +1733,7 @@ fn a_burst_of_count_changes_sends_one_summary() {
             .iter()
             .filter(|s| matches!(s.msg, Msg::Summary(_)))
             .count(),
-        2
+        base + 1
     );
     e.driver.post(HostEvent::Chat(ChatEvent::Busy {
         win: WIN,
@@ -1722,6 +1746,58 @@ fn a_burst_of_count_changes_sends_one_summary() {
         .sent()
         .iter()
         .any(|s| matches!(&s.msg, Msg::Summary(s) if s.queued == 4)));
+}
+
+#[test]
+fn background_work_reaches_the_summary_at_once() {
+    let e = source();
+    let before = e.port.sent().len();
+    e.host.set_chat_kill_counts(
+        crate::tabs::ViewId::BASE,
+        ChatKillCounts {
+            background: 1,
+            ..Default::default()
+        },
+    );
+    e.driver.post(HostEvent::Chat(ChatEvent::Busy {
+        win: WIN,
+        view: crate::tabs::ViewId::BASE,
+        busy: true,
+    }));
+    e.scheduler.advance(Duration::ZERO);
+    assert!(
+        e.port.sent()[before..]
+            .iter()
+            .any(|s| matches!(&s.msg, Msg::Summary(s) if s.background == 1)),
+        "{:?}",
+        &e.port.sent()[before..]
+    );
+}
+
+#[test]
+fn a_draft_the_window_would_lose_reaches_the_summary_at_once() {
+    let e = source();
+    let before = e.port.sent().len();
+    e.host.set_chat_kill_counts(
+        crate::tabs::ViewId::BASE,
+        ChatKillCounts {
+            drafts: 1,
+            ..Default::default()
+        },
+    );
+    e.driver.post(HostEvent::Chat(ChatEvent::Busy {
+        win: WIN,
+        view: crate::tabs::ViewId::BASE,
+        busy: false,
+    }));
+    e.scheduler.advance(Duration::ZERO);
+    assert!(
+        e.port.sent()[before..]
+            .iter()
+            .any(|s| matches!(&s.msg, Msg::Summary(s) if s.drafts == 1)),
+        "{:?}",
+        &e.port.sent()[before..]
+    );
 }
 
 #[test]

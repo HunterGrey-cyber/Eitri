@@ -4418,6 +4418,20 @@ impl TabSet {
             .count()
     }
 
+    /// [`Self::running_count`] with the tabs whose turn Claude Code started by itself, whose start was never folded: what
+    /// a window's summary says runs, since a close ends those turns too (the tab close counts them, `close_needs_confirm`).
+    pub fn running_or_cli_busy_count(&self) -> usize {
+        self.tabs
+            .iter()
+            .filter(|t| {
+                matches!(t.backend, TabBackend::Starting(_))
+                    || t.turn_running()
+                    || t.question_waiting()
+                    || t.cli_unseen_busy()
+            })
+            .count()
+    }
+
     /// Tabs with live background work; scheduled wakeups and ambient tasks do not count.
     pub fn background_count(&self) -> usize {
         self.tabs.iter().filter(|tab| tab.background_calls() > 0).count()

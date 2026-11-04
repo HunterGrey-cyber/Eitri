@@ -190,22 +190,29 @@ open and empty.
 
 | what happens | its tabs and its place |
 |---|---|
-| you close window 1 and answer `y` | **kept**: every chat window comes back at the next start |
+| you close window 1 (and answer `y` if it asks) | **kept**: every chat window comes back at the next start |
 | you close a chat or page window with the compositor's key, or `<prefix> x` | **forgotten** after two seconds: the tabs and the place are dropped |
 | every window closes at once, as a logout does | **kept**: each window comes back at the next start |
 | a chat window with tabs still on offer closes before you answered the offer | **kept**: it reopens empty, offering them |
 | an end signal (`SIGTERM`) closes a window | **kept** |
 | a window crashes | **kept**, and its key starts it again |
 
-Closing window 1 closes the whole group, and always asks while any window is open:
-`close Eitri and its 2 windows? 3 turns are running, 1 queued (y/n)`.
+Closing window 1 closes the whole group. It asks only when that would cut something short, a turn running, a message
+queued or background work in any window, or a command running in the bottom terminal:
+`close Eitri and its 2 windows? 3 turns are running, 1 queued (y/n)`. With every window idle it closes at once, since
+the windows come back at the next start anyway. Text you typed in a chat window and did not send counts too when
+it would not come back with its tab (a new tab that has not started a conversation yet, or a very long text). While the
+question is up, closing the windows it names is an answer as well: once what is left is idle, window 1 and the idle
+windows close with no further question.
 
 A compositor that exits or crashes takes every window with it at once, with no time to ask, so a turn running then stops
 where it was. At the next start the chat window's offer says so under its rows (`a turn was cut off when this window last
 ended`), and so does the message when the tab comes back, with `agent.restore = "auto"` too.
 
-When nvim exits in window 1 (`:qa`, say), window 1 closes, so it asks that same question. Answer `n` and the group stays:
-the bottom terminal takes the window and the keys, and `<prefix> e` starts nvim again.
+When nvim exits in window 1 (`:qa` or `:wqa`, say), window 1 closes the same way: at once when everything is idle,
+and with that same question when something would be cut short. Answer `n` and the group stays: the bottom terminal
+takes the window and the keys, and `<prefix> e` starts nvim again. The terminal showing up here is not remembered: the
+next start shows it only if it was shown before nvim exited, or if you show it or change its height afterwards.
 
 Closing a chat window asks only while a turn runs (`close window? 1 running (y/n)`), and when it is idle it closes with no
 question. **This differs from `eitri` mode,** where closing a window always kept its tabs: here a chat window you close

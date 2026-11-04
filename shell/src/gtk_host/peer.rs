@@ -550,6 +550,8 @@ mod tests {
             unseen: 2,
             running: 3,
             queued: 4,
+            background: 5,
+            drafts: 6,
             workspaces: vec!["<peer>".into()],
         };
         assert_eq!(

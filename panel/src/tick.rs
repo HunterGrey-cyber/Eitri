@@ -319,7 +319,28 @@ pub(super) fn tabs_busy(tabs: &eitri_core::tab_set::TabSet) -> bool {
     tabs.running_count() > 0 || tabs.background_count() > 0 || tabs.tabs().iter().any(|tab| tab.cli_unseen_busy())
 }
 
-/// Running-tab and queue counts invalidate the window's counts even when no attention mark moved.
+/// What a window's summary counts that no view's running or queued count shows: tabs with background work, turns
+/// Claude Code started by itself, and unsent drafts that would not come back.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub(super) struct SummaryCounts {
+    background: usize,
+    cli_busy: usize,
+    drafts: usize,
+}
+
+pub(super) fn summary_counts(state: &AgentPanelState) -> SummaryCounts {
+    SummaryCounts {
+        background: state.tabs.background_count(),
+        cli_busy: state.tabs.tabs().iter().filter(|tab| tab.cli_unseen_busy()).count(),
+        drafts: state.tabs.unsaved_draft_count(
+            state.restore_policy != eitri_core::tab_restore::RestorePolicy::Off,
+            &state.mentions.held_by_tab(),
+        ),
+    }
+}
+
+/// Running-tab and queue counts invalidate the window's counts even when no attention mark moved; so do the counts
+/// only a summary reads (`SummaryCounts`), told as the base view's change, which has the window counted again.
 pub(super) fn report_busy(state: &mut AgentPanelState, out: &mut Outbox) {
     if state.shutting_down {
         return;
@@ -331,8 +352,11 @@ pub(super) fn report_busy(state: &mut AgentPanelState, out: &mut Outbox) {
         state.reported_busy = busy;
         out.effect(Effect::BusyChanged(busy));
     }
+    let counts = summary_counts(state);
+    let counts_moved = counts != state.reported_counts;
+    state.reported_counts = counts;
     let (now, turns) = state.tabs.activity_and_turns();
-    if now == state.reported_activity && turns == state.reported_turns {
+    if now == state.reported_activity && turns == state.reported_turns && !counts_moved {
         return;
     }
     let mut changed: Vec<_> = now
@@ -356,6 +380,12 @@ pub(super) fn report_busy(state: &mut AgentPanelState, out: &mut Outbox) {
                 .any(|(current, activity)| current == view && activity.running > 0);
             changed.push((*view, busy));
         }
+    }
+    if counts_moved && !changed.iter().any(|(view, _)| *view == ViewId::BASE) {
+        let busy = now
+            .iter()
+            .any(|(view, activity)| *view == ViewId::BASE && activity.running > 0);
+        changed.push((ViewId::BASE, busy));
     }
     state.reported_activity = now;
     state.reported_turns = turns;
@@ -1250,6 +1280,33 @@ mod tests {
             report_busy(state, out);
         });
         assert!(heard.borrow().is_empty());
+    }
+
+    /// A window's summary counts unsent drafts that would not come back, which no view's activity shows: a draft
+    /// typed in a tab with no session yet is told as the base view's change, once, and so is its clearing.
+    #[test]
+    fn a_draft_that_would_be_lost_is_told_as_the_base_views_change() {
+        let state = state_for_hooks(TabSet::new(BackendKind::Sidecar, SessionModeChoice::Auto));
+        let heard = Rc::new(RefCell::new(Vec::new()));
+        let calls = heard.clone();
+        state.borrow_mut().busy_hook = Some(Rc::new(move |changed| calls.borrow_mut().push(changed.to_vec())));
+        stepped(&state, report_busy);
+        heard.borrow_mut().clear();
+        let tab = state.borrow_mut().tabs.open(eitri_core::tab_set::AgentId::Claude);
+        stepped(&state, report_busy);
+        heard.borrow_mut().clear();
+        stepped(&state, |state, out| {
+            state.tabs.set_draft(tab, "a prompt not sent yet");
+            report_busy(state, out);
+        });
+        assert_eq!(heard.borrow_mut().pop(), Some(vec![(ViewId::BASE, false)]));
+        stepped(&state, report_busy);
+        assert!(heard.borrow().is_empty(), "told once");
+        stepped(&state, |state, out| {
+            state.tabs.set_draft(tab, "");
+            report_busy(state, out);
+        });
+        assert_eq!(heard.borrow_mut().pop(), Some(vec![(ViewId::BASE, false)]));
     }
 
     /// A wait for one tab's turn listens for this: the counts come out the same when the turn ends as another starts.

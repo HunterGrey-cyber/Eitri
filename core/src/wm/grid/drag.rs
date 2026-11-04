@@ -82,6 +82,7 @@ pub fn motion(w: &mut Window, reads: &dyn HostReads, win: WinId, dx: f64, dy: f6
     };
     let arranged = w.arranged.clone();
     let layout = w.layout.clone();
+    let divider = matches!(drag, Drag::Divider { .. });
     let moved = match drag {
         Drag::Divider { handle, grabbed } => {
             let Some(now) = arranged
@@ -144,6 +145,10 @@ pub fn motion(w: &mut Window, reads: &dyn HostReads, win: WinId, dx: f64, dy: f6
         }
     };
     if moved {
+        // A dragged divider is the user's height for the terminal, also one that stood in for an exited nvim.
+        if divider {
+            w.terminal_before_stand_in = None;
+        }
         batch.push_layout(HostOp::Allocate { win });
         // What a float covers is in pixels, as after a resize: judged again, with no label derived.
         super::super::chrome::resized(w);

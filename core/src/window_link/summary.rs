@@ -34,6 +34,12 @@ pub fn bounded(mut summary: Summary) -> Summary {
     summary
 }
 
+/// Whether a summary names something a close would cut short or lose: a turn running, a message queued, background
+/// work, an unsent draft that would not come back.
+pub fn has_work(s: &Summary) -> bool {
+    s.running + s.queued + s.background + s.drafts > 0
+}
+
 #[derive(Debug, Default)]
 pub struct SummaryDebounce {
     sent: Option<Summary>,
@@ -53,14 +59,18 @@ impl SummaryDebounce {
         self.pending = None;
     }
 
-    /// This window's summary now. Every change pushes the send back by [`Self::DELAY`].
+    /// This window's summary now. Every change pushes the send back by [`Self::DELAY`], except work starting where
+    /// the last summary sent had none: that goes at once, since window 1 closes a group whose windows all read as idle
+    /// without asking, and must not read a turn just begun as nothing.
     pub fn observe(&mut self, now: Instant, current: Summary) {
         let changed = match &self.pending {
             Some((pending, _)) => *pending != current,
             None => self.sent.as_ref() != Some(&current),
         };
         if changed {
-            self.pending = Some((current, now + Self::DELAY));
+            let starts_work = has_work(&current) && !self.sent.as_ref().is_some_and(has_work);
+            let at = if starts_work { now } else { now + Self::DELAY };
+            self.pending = Some((current, at));
         }
     }
 
@@ -94,6 +104,8 @@ mod tests {
             unseen,
             running,
             queued,
+            background: 0,
+            drafts: 0,
             workspaces: vec!["main".into()],
         }
     }
@@ -149,16 +161,55 @@ mod tests {
     fn a_burst_of_changes_is_one_send_after_the_last() {
         let t0 = Instant::now();
         let mut d = SummaryDebounce::new();
-        d.sent_now(s(0, 0, 0, 0));
-        d.observe(t0, s(1, 0, 0, 0));
-        d.observe(t0 + Duration::from_millis(100), s(1, 0, 1, 0));
+        d.sent_now(s(0, 0, 1, 0));
+        d.observe(t0, s(1, 0, 1, 0));
+        d.observe(t0 + Duration::from_millis(100), s(1, 0, 2, 0));
         assert_eq!(
             d.poll(t0 + Duration::from_millis(250)),
             None,
             "the second change pushed it back"
         );
-        assert_eq!(d.poll(t0 + Duration::from_millis(300)), Some(s(1, 0, 1, 0)));
+        assert_eq!(d.poll(t0 + Duration::from_millis(300)), Some(s(1, 0, 2, 0)));
         assert_eq!(d.poll(t0 + Duration::from_millis(900)), None);
+    }
+
+    #[test]
+    fn work_starting_after_none_goes_at_once_and_later_changes_wait() {
+        let t0 = Instant::now();
+        let mut d = SummaryDebounce::new();
+        d.sent_now(s(0, 0, 0, 0));
+        d.observe(t0, s(0, 0, 1, 0));
+        assert_eq!(d.due_at(), Some(t0), "a turn begun where none ran");
+        assert_eq!(d.poll(t0), Some(s(0, 0, 1, 0)));
+        d.observe(t0 + Duration::from_millis(10), s(0, 0, 2, 0));
+        assert_eq!(
+            d.due_at(),
+            Some(t0 + Duration::from_millis(10) + SummaryDebounce::DELAY)
+        );
+        let background = Summary {
+            background: 1,
+            ..s(0, 0, 0, 0)
+        };
+        let mut d = SummaryDebounce::new();
+        d.sent_now(s(0, 0, 0, 0));
+        d.observe(t0, background.clone());
+        assert_eq!(d.poll(t0), Some(background), "background work counts as work");
+        let draft = Summary {
+            drafts: 1,
+            ..s(0, 0, 0, 0)
+        };
+        let mut d = SummaryDebounce::new();
+        d.sent_now(s(0, 0, 0, 0));
+        d.observe(t0, draft.clone());
+        assert_eq!(d.poll(t0), Some(draft), "an unsent draft that would be lost counts too");
+        let mut d = SummaryDebounce::new();
+        d.sent_now(s(0, 0, 0, 0));
+        d.observe(t0, s(1, 1, 0, 0));
+        assert_eq!(
+            d.poll(t0),
+            None,
+            "a card or an unseen turn is no work a close cuts short"
+        );
     }
 
     #[test]

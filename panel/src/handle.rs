@@ -2155,7 +2155,7 @@ impl AgentPanelHandle {
                 .iter()
                 .filter(|t| t.attention.attention().unread)
                 .count() as u32,
-            running: state.tabs.running_count() as u32,
+            running: state.tabs.running_or_cli_busy_count() as u32,
             queued: state.tabs.queued_count() as u32,
         }
     }

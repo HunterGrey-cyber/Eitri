@@ -2304,11 +2304,16 @@ fn build_ui(
     // modules the surfaces phase declared -- each shown terminal's shell, each shown start-hidden page, each
     // plugin told whether it is drawn. The launch is not a change, so nothing is saved for it. Every host the
     // window opens with was made by the walk, so no module is left to declare here.
+    // The controller says what the record keeps of the bottom terminal: one standing in for an exited nvim is kept
+    // as it was before, since the window showed it and the user did not.
     if let Some(session) = &cm_session {
-        let (session, layout) = (session.clone(), module_layout.clone());
+        let (session, driver) = (session.clone(), Rc::downgrade(&driver));
         grid.connect_changed_by_controller(move || {
-            if let Some(layout) = layout.try_read() {
-                session.borrow_mut().terminal(&layout);
+            let terminal = driver
+                .upgrade()
+                .and_then(|driver| driver.query(|c| c.cm_terminal(WinId::MAIN)));
+            if let Some(terminal) = terminal {
+                session.borrow_mut().record_terminal(terminal);
             }
         });
     }

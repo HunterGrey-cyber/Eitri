@@ -145,6 +145,13 @@ impl NvimProcess {
         self.known_nvim().map(|nvim| imp::alive_within(nvim, grace))
     }
 
+    /// A file descriptor that polls readable once nvim's process has exited: the pidfd held on the best process known
+    /// to be nvim. Valid for as long as this value lives. `None` with no such process, or no pidfd (a kernel before
+    /// 5.3, or not Linux).
+    pub(crate) fn exit_fd(&self) -> Option<std::os::fd::RawFd> {
+        self.known_nvim().and_then(imp::exit_fd)
+    }
+
     /// The pid the fork started, for the log line at launch.
     pub(crate) fn launched_pid(&self) -> Option<u32> {
         self.launched.as_ref().map(NvimChild::pid)
@@ -413,6 +420,10 @@ mod imp {
         }
     }
 
+    pub(super) fn exit_fd(child: &NvimChild) -> Option<std::os::fd::RawFd> {
+        child.pidfd.as_ref().map(AsRawFd::as_raw_fd)
+    }
+
     /// A pidfd polls readable once its process has exited (Linux 5.3), for a child or not.
     fn exited(pidfd: &OwnedFd, timeout_ms: i32) -> bool {
         let mut poll = libc::pollfd {
@@ -533,6 +544,9 @@ mod imp {
     pub(super) fn try_reap(_child: &NvimChild) -> Option<bool> {
         None
     }
+    pub(super) fn exit_fd(_child: &NvimChild) -> Option<i32> {
+        None
+    }
 }
 
 /// Every test in this crate that spawns an `nvim` takes this first: [`NvimChild::find_new`] looks
@@ -608,6 +622,39 @@ mod tests {
         let _ = nvim.kill();
         let _ = nvim.wait();
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// What wakes a pane whose nvim outlived the fork's report of its exit: the fd answers nothing while nvim runs
+    /// and polls readable once it has gone, reaped or not.
+    #[test]
+    fn the_exit_fd_polls_readable_only_once_nvim_has_gone() {
+        let _serial = SPAWNING.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let dir = scratch("exitfd");
+        let before = direct_children();
+        let mut nvim = spawn_embed(&dir, &[]);
+        let process = NvimProcess::new(NvimChild::find_new(&before));
+        let fd = process.exit_fd().expect("a pidfd on nvim");
+        let readable = |timeout_ms: i32| {
+            let mut poll = libc::pollfd {
+                fd,
+                events: libc::POLLIN,
+                revents: 0,
+            };
+            // SAFETY: one `pollfd` that outlives the call, on an fd `process` holds open.
+            let rc = unsafe { libc::poll(&mut poll, 1, timeout_ms) };
+            rc > 0 && poll.revents & libc::POLLIN != 0
+        };
+        let while_running = readable(50);
+        // nvim exits on its stdin's end, as on the fork's hang-up; not reaped yet.
+        drop(nvim.stdin.take());
+        let after_exit = readable(5000);
+        let _ = nvim.kill();
+        let _ = nvim.wait();
+        let after_reap = readable(0);
+        let _ = std::fs::remove_dir_all(&dir);
+        assert!(!while_running, "nothing to wake while nvim runs");
+        assert!(after_exit, "its exit wakes the watch");
+        assert!(after_reap, "and stays readable once reaped");
     }
 
     /// Short enough for a test; the product's own is [`SCHEDULE`].

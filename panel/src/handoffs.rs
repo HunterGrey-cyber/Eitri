@@ -189,6 +189,7 @@ pub(super) fn panel_tab_handoff(state: &AgentPanelState, tab: TabId) -> Result<P
         busy_hook: _,
         reported_activity: _,
         reported_turns: _,
+        reported_counts: _,
         busy_changed_hook: _,
         turn_ended_hook: _,
         reported_busy: _,

@@ -267,6 +267,9 @@ struct AgentPanelState {
     reported_activity: Vec<(ViewId, eitri_core::tab_set::ViewActivity)>,
     /// Which tabs ran a turn when the hook was last told, each in its view (`report_busy`).
     reported_turns: BTreeSet<(ViewId, TabId)>,
+    /// The window's counts a summary reads that no view's activity shows, as the hook was last told of them
+    /// (`report_busy`, `summary_counts`).
+    reported_counts: tick::SummaryCounts,
     /// Told when the window's aggregate busy state flips: any tab with a running turn or running
     /// background work (`AgentPanelHandle::on_busy_changed`). Called after the step releases its state.
     busy_changed_hook: Option<Rc<dyn Fn(bool)>>,
@@ -615,6 +618,7 @@ impl AgentPanelState {
             busy_hook: None,
             reported_activity: Vec::new(),
             reported_turns: BTreeSet::new(),
+            reported_counts: tick::SummaryCounts::default(),
             busy_changed_hook: None,
             turn_ended_hook: None,
             reported_busy: false,

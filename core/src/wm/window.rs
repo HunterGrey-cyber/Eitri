@@ -290,6 +290,9 @@ pub struct Window {
     /// The divider or float a press began dragging (a float's only by the primary button), until its release or
     /// the next press.
     pub(super) drag: Option<Drag>,
+    /// A hub's bottom terminal as it was before it stood in for an exited nvim: what the compositor record keeps of
+    /// it, since the window showed it and the user did not, until the user hides or resizes it.
+    pub(super) terminal_before_stand_in: Option<crate::window_link::cm_file::CmTerminal>,
     /// The sending page supplies the keys' view for one tab verb only.
     pub(super) tab_view: Option<crate::tabs::ViewId>,
     /// Who holds the keys as the host reports it, and what follows from it.
@@ -397,6 +400,7 @@ impl Window {
             allocated: None,
             arranged: None,
             drag: None,
+            terminal_before_stand_in: None,
             tab_view: None,
             focus: FocusState::default(),
             keys: KeyState::default(),
@@ -520,6 +524,8 @@ impl Window {
             sum.unseen += s.unseen;
             sum.running += s.running;
             sum.queued += s.queued;
+            sum.background += s.background;
+            sum.drafts += s.drafts;
             if *p.name() == WindowName::Second {
                 sum.workspaces = s.workspaces.clone();
             }
@@ -616,7 +622,23 @@ impl Window {
             Err(_) => self.warn("[wm] BUG: the layout was borrowed after a change; no lifecycle effect".into()),
         }
         self.layout_touched();
+        self.terminal_left_standing_in();
         self.saver_changed();
+    }
+
+    /// A terminal that stood in for an exited nvim and is no longer shown was hidden, by the user or by its shell
+    /// ending: from here the record keeps it as it is.
+    fn terminal_left_standing_in(&mut self) {
+        if self.terminal_before_stand_in.is_none() {
+            return;
+        }
+        let hidden = self
+            .layout
+            .try_borrow()
+            .is_ok_and(|layout| !layout.is_shown(&ModuleId::terminal()));
+        if hidden {
+            self.terminal_before_stand_in = None;
+        }
     }
 
     /// The layout may have changed in a way the chrome shows (the selection, the mark, the tray, the strips): its

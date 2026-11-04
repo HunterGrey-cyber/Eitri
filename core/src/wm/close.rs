@@ -1216,7 +1216,8 @@ fn move_target(w: &Window) -> bool {
 pub(super) fn window_prompt(w: &Window, cx: &Cx, win: WinId) -> Option<String> {
     let (running, queued, background, drafts) = window_counts(cx);
     match w.tiling {
-        Tiling::Hub if w.has_peer() => return Some(group_prompt(w, cx, win)),
+        // Idle windows are kept for the group's next start, so only work the close would cut short is asked about.
+        Tiling::Hub if w.has_peer() => return group_cuts_work(w, cx, win).then(|| group_prompt(w, cx, win)),
         // Its close touches nothing of the rest of the group, so what runs here is all it names.
         Tiling::ModuleWindow => {
             let jobs = cx.reads.terminal_jobs(win);
@@ -1250,16 +1251,29 @@ pub(super) fn window_prompt(w: &Window, cx: &Cx, win: WinId) -> Option<String> {
     )
 }
 
+/// Whether closing a hub's group ends something under way or loses something: a turn running, a message queued,
+/// background work or an unsent draft that would not come back, in any of its windows or its own; a job in its bottom
+/// terminal; or a window that has not said what it holds yet, which counts as holding something. Every module window
+/// comes back at the next start.
+fn group_cuts_work(w: &Window, cx: &Cx, win: WinId) -> bool {
+    let (running, queued, background, drafts) = window_counts(cx);
+    let summary = w.group_summary().unwrap_or_default();
+    running + queued + background + drafts + cx.reads.terminal_jobs(win) > 0
+        || crate::window_link::summary::has_work(&summary)
+        || w.peers().any(|(_, peer)| peer.summary().is_none())
+}
+
 /// Window 1's question in a hub: every linked module window and what their last summaries say runs in them.
 fn group_prompt(w: &Window, cx: &Cx, win: WinId) -> String {
-    let (running, queued, _, drafts) = window_counts(cx);
+    let (running, queued, background, drafts) = window_counts(cx);
     let summary = w.group_summary();
-    crate::tabs::group_close_prompt_with_jobs(
+    crate::tabs::group_close_prompt_with_background(
         w.peers().count(),
         running + summary.as_ref().map_or(0, |s| s.running as usize),
         queued + summary.as_ref().map_or(0, |s| s.queued as usize),
         cx.reads.terminal_jobs(win),
-        drafts,
+        background + summary.as_ref().map_or(0, |s| s.background as usize),
+        drafts + summary.as_ref().map_or(0, |s| s.drafts as usize),
     )
 }
 
@@ -1476,6 +1490,15 @@ impl QuitWorld for WindowQuit<'_, '_> {
             super::window::Tiling::Hub => ModuleId::terminal(),
             super::window::Tiling::Eitri | super::window::Tiling::ModuleWindow => ModuleId::agent(),
         };
+        // The window shows the terminal, not the user: the record keeps it as it was.
+        if self.w.tiling == super::window::Tiling::Hub && self.w.terminal_before_stand_in.is_none() {
+            self.w.terminal_before_stand_in = self
+                .w
+                .layout
+                .try_borrow()
+                .ok()
+                .map(|layout| crate::window_link::cm_file::CmTerminal::of(&layout));
+        }
         modules::show_on_screen(self.w, self.cx, self.win, &stand_in, self.batch)
     }
     fn ask_to_close_window(&mut self, text: &str) {

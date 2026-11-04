@@ -1270,6 +1270,18 @@ impl Controller {
         frame_with(&*self.reads, win, size, |frame| crate::layout::min_size(&layout, frame))
     }
 
+    /// What the compositor record keeps of `win`'s bottom terminal: its visibility and height as the layout has them,
+    /// or as they were before it stood in for an exited nvim, until the user hides or resizes it. `None` for a window
+    /// the controller does not hold, or while its layout is being written.
+    pub fn cm_terminal(&self, win: WinId) -> Option<crate::window_link::cm_file::CmTerminal> {
+        let window = self.windows.get(&win)?;
+        if let Some(before) = &window.terminal_before_stand_in {
+            return Some(before.clone());
+        }
+        let layout = window.layout.try_borrow().ok()?;
+        Some(crate::window_link::cm_file::CmTerminal::of(&layout))
+    }
+
     /// The size of `win`'s last allocation; `None` before its first.
     pub fn allocated(&self, win: WinId) -> Option<Size> {
         self.windows.get(&win).and_then(|window| window.allocated)

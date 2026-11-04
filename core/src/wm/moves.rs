@@ -2006,11 +2006,22 @@ pub fn other_name(w: &Window) -> &'static str {
 
 fn current_summary(w: &Window, win: WinId, reads: &dyn HostReads) -> Summary {
     let counts = reads.chat_summary(win);
+    let background = reads
+        .chat_views()
+        .into_iter()
+        .chain(std::iter::once(crate::tabs::ViewId::BASE))
+        .collect::<std::collections::BTreeSet<_>>()
+        .into_iter()
+        .map(|view| reads.chat_kill_counts(view).background)
+        .sum::<usize>();
     Summary {
         waiting: counts.waiting,
         unseen: counts.unseen,
         running: counts.running,
         queued: counts.queued,
+        background: u32::try_from(background).unwrap_or(u32::MAX),
+        // Only the base view's counts carry the window's drafts.
+        drafts: u32::try_from(reads.chat_kill_counts(crate::tabs::ViewId::BASE).drafts).unwrap_or(u32::MAX),
         workspaces: w.workspaces.borrow().order().to_vec(),
     }
 }
@@ -2071,11 +2082,18 @@ pub fn observe_summary(w: &mut Window, win: WinId, reads: &dyn HostReads) {
                 return;
             }
             p.own_summary = summary.clone();
-            p.debounce.observe(w.now(), summary.clone());
+            let now = w.now();
+            p.debounce.observe(now, summary.clone());
             if let Some(token) = p.summary_timer.take() {
                 w.cancel_timer(token);
             }
-            p.summary_timer = Some(w.arm_after(crate::window_link::summary::SummaryDebounce::DELAY));
+            let after = p
+                .debounce
+                .due_at()
+                .map_or(crate::window_link::summary::SummaryDebounce::DELAY, |at| {
+                    at.saturating_duration_since(now)
+                });
+            p.summary_timer = Some(w.arm_after(after));
         });
     }
 }

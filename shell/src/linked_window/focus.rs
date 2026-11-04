@@ -258,11 +258,16 @@ impl CmSession {
         self.writer.changed(self.file.clone());
     }
 
+    #[cfg(test)]
     pub(crate) fn terminal(&mut self, layout: &eitri_core::layout::Layout) {
+        self.record_terminal(eitri_core::window_link::cm_file::CmTerminal::of(layout));
+    }
+
+    /// The bottom terminal as the record keeps it, which the window's controller decides.
+    pub(crate) fn record_terminal(&mut self, terminal: eitri_core::window_link::cm_file::CmTerminal) {
         if self.closing {
             return;
         }
-        let terminal = eitri_core::window_link::cm_file::CmTerminal::of(layout);
         if self.file.terminal != terminal {
             self.file.terminal = terminal;
             self.writer.changed(self.file.clone());

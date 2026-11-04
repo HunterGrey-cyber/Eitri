@@ -422,16 +422,17 @@ pub fn linked_window_close_prompt(
 /// Window 1's close prompt in `compositor` mode: it closes the module windows with it, so it asks whatever they are
 /// doing, and it moves nothing. `running` and `queued` are the whole group's.
 pub fn group_close_prompt(windows: usize, running: usize, queued: usize) -> String {
-    group_close_prompt_with_jobs(windows, running, queued, 0, 0)
+    group_close_prompt_with_background(windows, running, queued, 0, 0, 0)
 }
 
-/// [`group_close_prompt`] for a window that also holds terminals: `jobs` is how many run a job in the foreground, which
-/// the close ends as a window's close does.
-pub fn group_close_prompt_with_jobs(
+/// [`group_close_prompt`] naming, in a window's close's words, the jobs running in the foreground of its terminals, the
+/// tabs with background work and the unsent drafts that would not come back, each of which the close ends.
+pub fn group_close_prompt_with_background(
     windows: usize,
     running: usize,
     queued: usize,
     jobs: usize,
+    background: usize,
     drafts: usize,
 ) -> String {
     let windows = match windows {
@@ -444,7 +445,7 @@ pub fn group_close_prompt_with_jobs(
         1 => parts.push("1 turn is running".to_string()),
         n => parts.push(format!("{n} turns are running")),
     }
-    parts.extend(counts_text(0, queued, jobs, 0, drafts));
+    parts.extend(counts_text(0, queued, jobs, background, drafts));
     if parts.is_empty() {
         return format!("close Eitri and its {windows}? (y/n)");
     }
@@ -701,7 +702,7 @@ mod tests {
             "close Eitri and its 3 windows? 1 queued (y/n)"
         );
         assert_eq!(
-            group_close_prompt_with_jobs(1, 0, 0, 0, 1),
+            group_close_prompt_with_background(1, 0, 0, 0, 0, 1),
             "close Eitri and its 1 window? 1 unsent draft (y/n)"
         );
         assert_eq!(
@@ -714,7 +715,7 @@ mod tests {
         );
         assert_eq!(window_close_prompt_with_drafts(0, 0, 0, 0, 0), None);
         assert_eq!(
-            group_close_prompt_with_jobs(1, 0, 0, 1, 0),
+            group_close_prompt_with_background(1, 0, 0, 1, 0, 0),
             "close Eitri and its 1 window? 1 terminal job (y/n)"
         );
     }

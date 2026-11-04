@@ -901,6 +901,7 @@ fn the_top_bar_text_shows_the_other_windows_marks() {
             running: 3,
             queued: 4,
             workspaces: vec![],
+            ..Default::default()
         },
     }));
     assert_eq!(

@@ -453,9 +453,15 @@ pub struct LiveSession {
     ending: Cell<Option<(Instant, nvim_child::Schedule)>>,
     /// Whether [`NeovideEditorPane::on_nvim_unreachable`]'s callback has fired for this session.
     unreachable_said: Cell<bool>,
+    /// What runs the service once nvim's own process is gone, armed when it outlived the fork's report of its exit
+    /// ([`LiveSession::wake_on_nvim_exit`]); removed before the session, and the pidfd it watches, go.
+    exit_wake: Rc<RefCell<Option<glib::SourceId>>>,
     /// Which session this is ([`NeovideEditorPane::session_serial`]), never reused in the process.
     serial: u64,
 }
+
+/// How often a pane whose nvim outlived the fork's report of its exit, with no pidfd to watch, looks again.
+const EXIT_POLL: Duration = Duration::from_millis(100);
 
 /// The serial the next session takes. Process-wide, so the render callback that builds a session
 /// needs no counter handed to it, and no two sessions of any pane share a number.
@@ -463,6 +469,10 @@ static NEXT_SESSION_SERIAL: AtomicU64 = AtomicU64::new(1);
 
 impl Drop for LiveSession {
     fn drop(&mut self) {
+        // Before the pidfd it may watch can close (`fd_watch`'s contract).
+        if let Some(wake) = self.exit_wake.borrow_mut().take() {
+            wake.remove();
+        }
         // The pane leaves the event-loop watch with its harness; the last pane out removes it.
         live_watch::unregister(Rc::as_ptr(&self.live));
         self.wants_frame.session_ended();
@@ -476,6 +486,48 @@ impl Drop for LiveSession {
 impl LiveSession {
     fn device_scale(&self) -> f64 {
         self.device_scale.get()
+    }
+
+    /// nvim's own process outlived the fork's report of its exit. Nothing else runs the service again: the tick runs
+    /// only while a frame is wanted, and a dead nvim's pipe wakes no event-loop watch. So its exit does: a watch on its
+    /// pidfd, or where there is none a poll every [`EXIT_POLL`], queues one sweep of the event-loop watch
+    /// (`live_watch::after_outside_pump`), which services every pane as the shared fd would, after this source is gone,
+    /// since that run may end this session, and in one pass, so a batch of another pane its pump applies is serviced too.
+    fn wake_on_nvim_exit(&self) {
+        if self.exit_wake.borrow().is_some() {
+            return;
+        }
+        let slot = Rc::downgrade(&self.exit_wake);
+        let fire = move || {
+            if let Some(slot) = slot.upgrade() {
+                slot.borrow_mut().take();
+            }
+            live_watch::after_outside_pump(None);
+        };
+        let watched = self.nvim_process.exit_fd().and_then(|fd| {
+            let fire = fire.clone();
+            fd_watch::add_local(
+                fd,
+                glib::IOCondition::IN | glib::IOCondition::HUP | glib::IOCondition::ERR,
+                glib::ffi::G_PRIORITY_DEFAULT,
+                move |_| {
+                    fire();
+                    glib::ControlFlow::Break
+                },
+            )
+            .ok()
+        });
+        let wake = watched.unwrap_or_else(|| {
+            let process = self.nvim_process.clone();
+            glib::timeout_add_local(EXIT_POLL, move || {
+                if process.alive_within(Duration::ZERO) == Some(true) {
+                    return glib::ControlFlow::Continue;
+                }
+                fire();
+                glib::ControlFlow::Break
+            })
+        });
+        *self.exit_wake.borrow_mut() = Some(wake);
     }
 
     fn new(
@@ -514,6 +566,7 @@ impl LiveSession {
             calls: std::cell::OnceCell::new(),
             ending: Cell::new(None),
             unreachable_said: Cell::new(false),
+            exit_wake: Rc::new(RefCell::new(None)),
             serial: NEXT_SESSION_SERIAL.fetch_add(1, Ordering::Relaxed),
         }
     }
@@ -2384,6 +2437,7 @@ impl NeovideEditorPane {
                         );
                         if events.unreachable {
                             session.unreachable_said.set(true);
+                            session.wake_on_nvim_exit();
                             should_fire_unreachable_callback = true;
                             println!(
                                 "[live] the fork reports nvim exited, and nvim's own process is still alive \

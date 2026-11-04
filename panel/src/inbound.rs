@@ -1322,6 +1322,9 @@ pub(super) fn handle_inbound_message(
                 state.tabs.set_draft(tab, &text);
                 // The panel may be idle, with no tick due: a window killed now still has this in its file.
                 super::restore::remember_tabs(state);
+                // A draft that would not come back is something the window's close asks about, and window 1 reads it in
+                // the window's summary.
+                super::tick::report_busy(state, &mut out);
             } else if late_draft || state.tabs.take_late_draft(tab, view) {
                 deliver_late_draft(state, tab, &text, &mut out);
             } else if let Err(why) = held_here {

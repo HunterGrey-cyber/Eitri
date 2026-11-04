@@ -1590,6 +1590,12 @@ fn close_asks_while_claude_code_works_unseen() {
     });
     assert!(!set.get(tab).unwrap().turn_running(), "no turn is shown running");
     assert!(set.close_needs_confirm(tab));
+    assert_eq!(set.running_count(), 0);
+    assert_eq!(
+        set.running_or_cli_busy_count(),
+        1,
+        "a window's summary counts the turn Claude Code started by itself"
+    );
     let facts = set.close_facts(tab).unwrap();
     assert!(facts.unseen_work);
     assert!(
@@ -1612,6 +1618,7 @@ fn close_asks_while_claude_code_works_unseen() {
         !s.get(tab).unwrap().cli_unseen_busy()
     });
     assert!(!set.close_needs_confirm(tab));
+    assert_eq!(set.running_or_cli_busy_count(), 0);
     shut_down(&mut set);
 }
 

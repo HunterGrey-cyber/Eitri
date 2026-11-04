@@ -128,6 +128,12 @@ pub struct Summary {
     pub unseen: u32,
     pub running: u32,
     pub queued: u32,
+    /// Tabs with live non-ambient background work, which a close ends as it ends a turn.
+    #[serde(default)]
+    pub background: u32,
+    /// Tabs whose unsent text would not come back after a close (`TabSet::unsaved_draft_count`).
+    #[serde(default)]
+    pub drafts: u32,
     pub workspaces: Vec<String>,
 }
 
@@ -746,6 +752,8 @@ mod tests {
                     unseen: 2,
                     running: 3,
                     queued: 4,
+                    background: 5,
+                    drafts: 6,
                     workspaces: vec!["main".into()],
                 },
                 holders: BTreeMap::from([("terminal#2".to_string(), "2".to_string())]),

@@ -1322,6 +1322,21 @@ fn the_close_prompt_counts_every_peers_running_turns() {
 /// A window 1 in `compositor` mode with chat windows `c1`, `c2`..., each reporting the turns `running` gives it.
 fn hub_of(running: &[u32]) -> Rig {
     let r = driven_tiled(two(), Tiling::Hub);
+    link_chats(&r, running);
+    r
+}
+
+/// Window 1 as a hub's start makes it -- the editor over its bottom terminal, hidden -- with chat windows linked as
+/// [`hub_of`] links them.
+fn hub_start(running: &[u32]) -> Rig {
+    let first_launch = crate::wm::persist::first_launch_layout(&[]).unwrap();
+    let r = driven_tiled(crate::wm::start::hub_layout(&first_launch).0, Tiling::Hub);
+    link_chats(&r, running);
+    r
+}
+
+/// Links chat windows `c1`, `c2`... to the rig's window 1, each reporting the turns `running` gives it.
+fn link_chats(r: &Rig, running: &[u32]) {
     for (at, running) in running.iter().enumerate() {
         let peer = crate::wm::PeerId(16 + at as u32);
         let name = WindowName::Chat(at as u8 + 1);
@@ -1335,7 +1350,6 @@ fn hub_of(running: &[u32]) -> Rig {
             },
         }));
     }
-    r
 }
 
 /// The chat window `name`, linked to its window 1.
@@ -1358,12 +1372,232 @@ fn closing_window_1_counts_every_module_windows_running_turns() {
     assert!(!prompt.offers_move, "a hub moves nothing: its windows close with it");
 }
 
+/// Idle windows come back at the next start, so closing window 1 cuts nothing short: it closes the group at once, as
+/// a window with nothing to ask closes, and its windows are ended as a `y` ends them.
 #[test]
-fn closing_window_1_asks_while_it_has_windows_however_idle_they_are() {
+fn an_idle_group_closes_at_once() {
+    for by in [CloseBy::User, CloseBy::Compositor] {
+        let r = hub_of(&[0, 0]);
+        let at = r.ops().len();
+        r.driver.close_requested(WIN, by.clone());
+        assert_eq!(r.driver.query(|c| c.chrome(WIN)).prompt, None, "{by:?}");
+        r.advance();
+        let ops = r.ops()[at..].to_vec();
+        assert!(
+            ops.contains(&HostOp::Cleanup(CleanupOp::GroupAsked)),
+            "{by:?}: still window 1 being asked, for the windows a logout closes around it: {ops:?}"
+        );
+        let mut expected = vec![HostOp::Cleanup(CleanupOp::EndGroup)];
+        expected.extend(teardown_ops(false));
+        assert!(ops.ends_with(&expected), "{by:?}: {ops:?}");
+        assert_eq!(r.close_count(), 1, "{by:?}");
+    }
+}
+
+#[test]
+fn closing_window_1_asks_about_a_queued_message_in_any_window() {
     let r = hub_of(&[0, 0]);
+    r.driver.post(HostEvent::Peer(PeerEvent::Summary {
+        peer: crate::wm::PeerId(17),
+        summary: crate::window_link::Summary {
+            queued: 1,
+            ..Default::default()
+        },
+    }));
+    r.driver.close_requested(WIN, CloseBy::User);
+    let prompt = r.driver.query(|c| c.chrome(WIN)).prompt.unwrap();
+    assert_eq!(prompt.text, "close Eitri and its 2 windows? 1 queued (y/n)");
+    assert_eq!(r.close_count(), 0);
+}
+
+#[test]
+fn closing_window_1_asks_about_background_work_in_any_window() {
+    let r = hub_of(&[0]);
+    r.driver.post(HostEvent::Peer(PeerEvent::Summary {
+        peer: crate::wm::PeerId(16),
+        summary: crate::window_link::Summary {
+            background: 1,
+            ..Default::default()
+        },
+    }));
+    r.driver.close_requested(WIN, CloseBy::User);
+    let prompt = r.driver.query(|c| c.chrome(WIN)).prompt.unwrap();
+    assert_eq!(
+        prompt.text,
+        "close Eitri and its 1 window? 1 with background tasks (y/n)"
+    );
+    assert_eq!(r.close_count(), 0);
+}
+
+/// A window linked and not yet heard from may hold anything: window 1 asks rather than guess it idle.
+#[test]
+fn closing_window_1_asks_while_a_window_has_not_said_what_it_holds() {
+    let r = hub_of(&[0]);
+    r.driver.attach_peer(
+        WIN,
+        crate::wm::PeerId(17),
+        WindowName::Chat(2),
+        crate::wm::fake::FakePeerPort::new(),
+    );
     r.driver.close_requested(WIN, CloseBy::User);
     let prompt = r.driver.query(|c| c.chrome(WIN)).prompt.unwrap();
     assert_eq!(prompt.text, "close Eitri and its 2 windows? (y/n)");
+    assert_eq!(r.close_count(), 0);
+}
+
+/// An unsent draft in a chat window that would not come back (a tab with no session yet, a draft over the saved size).
+#[test]
+fn closing_window_1_asks_about_a_draft_a_window_would_lose() {
+    let r = hub_of(&[0]);
+    r.driver.post(HostEvent::Peer(PeerEvent::Summary {
+        peer: crate::wm::PeerId(16),
+        summary: crate::window_link::Summary {
+            drafts: 1,
+            ..Default::default()
+        },
+    }));
+    r.exited(None);
+    let prompt = r.driver.query(|c| c.chrome(WIN)).prompt.unwrap();
+    assert_eq!(prompt.text, "close Eitri and its 1 window? 1 unsent draft (y/n)");
+    assert_eq!(r.close_count(), 0);
+}
+
+#[test]
+fn closing_window_1_asks_about_a_terminal_job_beside_idle_windows() {
+    let r = hub_of(&[0]);
+    r.host.set_terminal_jobs(1);
+    r.driver.close_requested(WIN, CloseBy::User);
+    let prompt = r.driver.query(|c| c.chrome(WIN)).prompt.unwrap();
+    assert_eq!(prompt.text, "close Eitri and its 1 window? 1 terminal job (y/n)");
+    r.advance();
+    assert_eq!(r.close_count(), 0);
+}
+
+/// `:qa` or `:wqa` in window 1's nvim with every window idle closes the group, as `:q` closes a window alone.
+#[test]
+fn nvims_own_quit_closes_an_idle_group() {
+    let r = hub_start(&[0, 0]);
+    let at = r.ops().len();
+    r.exited(None);
+    assert_eq!(r.driver.query(|c| c.chrome(WIN)).prompt, None);
+    r.advance();
+    assert!(
+        r.ops()[at..].contains(&HostOp::Cleanup(CleanupOp::EndGroup)),
+        "{:?}",
+        &r.ops()[at..]
+    );
+    assert_eq!(r.close_count(), 1);
+    assert!(
+        !r.layout.borrow().is_shown(&ModuleId::terminal()),
+        "nothing stood in: the window closed"
+    );
+}
+
+/// What the compositor record keeps of window 1's bottom terminal.
+fn recorded_terminal(r: &Rig) -> crate::window_link::cm_file::CmTerminal {
+    r.driver
+        .query(|c| c.cm_terminal(WIN))
+        .expect("window 1 says what its record keeps")
+}
+
+/// A turn still running asks, and a `n` keeps the group: the bottom terminal takes the screen and the keys from the
+/// exited nvim. That is the window standing in, not the user showing the terminal, so the record keeps the terminal
+/// as it was, and the next start does not open with it.
+#[test]
+fn the_terminal_standing_in_for_an_exited_nvim_is_not_recorded() {
+    let r = hub_start(&[1]);
+    let terminal = ModuleId::terminal();
+    let before = recorded_terminal(&r);
+    assert!(!before.shown, "the premise: the terminal starts hidden");
+    r.exited(None);
+    let prompt = r.driver.query(|c| c.chrome(WIN)).prompt.unwrap();
+    assert_eq!(prompt.text, "close Eitri and its 1 window? 1 turn is running (y/n)");
+    r.answer("n");
+    r.advance();
+    assert_eq!(r.close_count(), 0);
+    assert!(r.layout.borrow().is_shown(&terminal), "the terminal stands in");
+    assert_eq!(recorded_terminal(&r), before);
+}
+
+/// A hub whose nvim exited with a turn running, the close declined and nvim started again with `<prefix> e`: the
+/// editor is back above the terminal that stood in, and the record still keeps the terminal hidden.
+fn hub_after_a_stand_in() -> Rig {
+    let r = hub_start(&[1]);
+    r.exited(None);
+    r.answer("n");
+    r.advance();
+    assert!(
+        r.layout.borrow().is_shown(&ModuleId::terminal()),
+        "the premise: it stands in"
+    );
+    r.driver.run(
+        WIN,
+        crate::keymap::Action::Module(ModuleId::editor()),
+        Origin::Key { keycode: 7 },
+    );
+    r.advance();
+    assert!(
+        r.layout.borrow().is_visible(&ModuleId::editor()),
+        "the premise: nvim is back"
+    );
+    assert!(
+        !recorded_terminal(&r).shown,
+        "starting nvim again is not the user's choice of terminal"
+    );
+    r
+}
+
+/// Once the user hides or shows the terminal that stood in, what they did is the record again.
+#[test]
+fn hiding_or_showing_the_terminal_after_it_stood_in_is_recorded() {
+    let r = hub_after_a_stand_in();
+    let terminal = ModuleId::terminal();
+    // A first press may only give the terminal the keys; the next hides it.
+    for _ in 0..2 {
+        if r.layout.borrow().is_shown(&terminal) {
+            r.driver.run(
+                WIN,
+                crate::keymap::Action::Module(terminal.clone()),
+                Origin::Key { keycode: 7 },
+            );
+            r.advance();
+        }
+    }
+    assert!(!r.layout.borrow().is_shown(&terminal), "the premise: the key hid it");
+    assert!(!recorded_terminal(&r).shown);
+    r.driver.run(
+        WIN,
+        crate::keymap::Action::Module(terminal.clone()),
+        Origin::Key { keycode: 7 },
+    );
+    assert!(r.layout.borrow().is_shown(&terminal), "the premise: the key showed it");
+    assert!(recorded_terminal(&r).shown, "the user showed it");
+}
+
+/// Dragging the terminal's divider is the user's too: the height and the terminal shown are recorded.
+#[test]
+fn resizing_the_terminal_after_it_stood_in_is_recorded() {
+    let r = hub_after_a_stand_in();
+    let terminal = ModuleId::terminal();
+    let size = crate::wm::grid::UNALLOCATED;
+    let divider = crate::wm::Allocator::allocate(&*r.driver, WIN, size).dividers[0].clone();
+    r.advance();
+    assert!(
+        !recorded_terminal(&r).shown,
+        "the premise: an allocation is nobody's choice"
+    );
+    r.host.press_on(WIN, PointerTarget::Divider(0));
+    r.host.drag_by(WIN, PointerTarget::Divider(0), 0.0, -40.0);
+    let moved = crate::wm::Allocator::allocate(&*r.driver, WIN, size).dividers[0].clone();
+    assert_ne!(moved.rect, divider.rect, "the premise: the divider moved");
+    let recorded = recorded_terminal(&r);
+    assert!(recorded.shown);
+    assert_eq!(
+        recorded,
+        crate::window_link::cm_file::CmTerminal::of(&r.layout.borrow()),
+        "the dragged height is kept"
+    );
+    assert!(r.layout.borrow().is_shown(&terminal));
 }
 
 #[test]
@@ -1382,17 +1616,29 @@ fn closing_window_1_names_a_terminal_job_beside_its_windows() {
 fn the_last_modules_kill_in_window_1_asks_the_groups_question() {
     let only = Layout::new(Node::Leaf(ModuleId::editor()), ModuleId::editor()).unwrap();
     let r = driven_tiled(only, Tiling::Hub);
-    r.driver.attach_peer(
-        WIN,
-        crate::wm::PeerId(16),
-        WindowName::Chat(1),
-        crate::wm::fake::FakePeerPort::new(),
-    );
+    link_chats(&r, &[1]);
     r.driver
         .run(WIN, crate::keymap::Action::ModuleKill, Origin::Key { keycode: 7 });
     let prompt = r.driver.query(|c| c.chrome(WIN)).prompt.unwrap();
-    assert_eq!(prompt.text, "close Eitri and its 1 window? (y/n)");
+    assert_eq!(prompt.text, "close Eitri and its 1 window? 1 turn is running (y/n)");
     assert!(!prompt.offers_move);
+}
+
+/// With every window idle the kill asks tmux's own `kill-pane` question, as it does in a window alone, and its `y`
+/// closes the group.
+#[test]
+fn the_last_modules_kill_in_window_1_of_an_idle_group_asks_the_kill_alone() {
+    let only = Layout::new(Node::Leaf(ModuleId::editor()), ModuleId::editor()).unwrap();
+    let r = driven_tiled(only, Tiling::Hub);
+    link_chats(&r, &[0]);
+    r.driver
+        .run(WIN, crate::keymap::Action::ModuleKill, Origin::Key { keycode: 7 });
+    let prompt = r.driver.query(|c| c.chrome(WIN)).prompt.unwrap();
+    assert_eq!(prompt.text, "kill-pane editor? closes Eitri (y/n)");
+    r.answer("y");
+    r.advance();
+    assert_eq!(r.close_count(), 1);
+    assert!(r.ops().contains(&HostOp::Cleanup(CleanupOp::EndGroup)));
 }
 
 #[test]
@@ -1417,7 +1663,7 @@ fn window_1_says_when_it_is_asked_to_close() {
             .filter(|op| **op == HostOp::Cleanup(CleanupOp::GroupAsked))
             .count()
     };
-    let r = hub_of(&[0]);
+    let r = hub_of(&[1]);
     r.driver.close_requested(WIN, CloseBy::Compositor);
     assert_eq!(asked(&r), 1, "said with the question up");
     r.driver.close_requested(WIN, CloseBy::Compositor);
@@ -1436,19 +1682,38 @@ fn window_1_says_when_it_is_asked_to_close() {
 /// A logout closes every window at once and waits for all of them to go: window 1's question goes with what it was about.
 #[test]
 fn window_1s_question_goes_when_the_windows_it_asked_about_have_gone() {
-    let r = hub_of(&[0, 0]);
+    let r = hub_of(&[1, 1]);
     r.driver.close_requested(WIN, CloseBy::Compositor);
     let prompt = |r: &Rig| r.driver.query(|c| c.chrome(WIN)).prompt.map(|p| p.text);
-    assert_eq!(prompt(&r).unwrap(), "close Eitri and its 2 windows? (y/n)");
+    assert_eq!(
+        prompt(&r).unwrap(),
+        "close Eitri and its 2 windows? 2 turns are running (y/n)"
+    );
 
     r.driver.detach_peer(WIN, crate::wm::PeerId(16));
-    assert_eq!(prompt(&r).unwrap(), "close Eitri and its 1 window? (y/n)");
+    assert_eq!(
+        prompt(&r).unwrap(),
+        "close Eitri and its 1 window? 1 turn is running (y/n)"
+    );
     assert_eq!(r.close_count(), 0);
 
     r.driver.detach_peer(WIN, crate::wm::PeerId(17));
     r.advance();
     assert_eq!(prompt(&r), None);
     assert_eq!(r.close_count(), 1);
+}
+
+/// The window whose turn was asked about goes, and the windows left are idle: nothing is left to ask about.
+#[test]
+fn window_1s_question_goes_when_only_idle_windows_are_left() {
+    let r = hub_of(&[1, 0]);
+    r.driver.close_requested(WIN, CloseBy::Compositor);
+    assert!(r.driver.query(|c| c.chrome(WIN)).prompt.is_some());
+    r.driver.detach_peer(WIN, crate::wm::PeerId(16));
+    r.advance();
+    assert_eq!(r.driver.query(|c| c.chrome(WIN)).prompt, None);
+    assert_eq!(r.close_count(), 1);
+    assert!(r.ops().contains(&HostOp::Cleanup(CleanupOp::EndGroup)));
 }
 
 /// What it still has to ask about keeps it: the logout waits, as it does for any window that asks.
@@ -1643,9 +1908,9 @@ fn a_module_window_that_hears_window_1_close_closes_itself() {
     assert!(r.driver.query(|c| c.chrome(WIN).prompt.is_none()));
 }
 
-/// A hub's chats are other windows, so with its bottom terminal hidden the editor is all it shows. When nvim exits and
-/// the group's question is answered `n`, the terminal takes the screen and the keys, the editor ends in place and says
-/// so, and the editor's key starts nvim again.
+/// A hub's chats are other windows, so with its bottom terminal hidden the editor is all it shows. When nvim exits with
+/// a turn running and the group's question is answered `n`, the terminal takes the screen and the keys, the editor ends
+/// in place and says so, and the editor's key starts nvim again.
 #[test]
 fn a_declined_close_after_a_hubs_nvim_exited_leaves_the_terminal_and_the_way_back() {
     let first_launch = crate::wm::persist::first_launch_layout(&[]).unwrap();
@@ -1667,6 +1932,13 @@ fn a_declined_close_after_a_hubs_nvim_exited_leaves_the_terminal_and_the_way_bac
         WindowName::Chat(1),
         crate::wm::fake::FakePeerPort::new(),
     );
+    r.driver.post(HostEvent::Peer(PeerEvent::Summary {
+        peer: crate::wm::PeerId(16),
+        summary: crate::window_link::Summary {
+            running: 1,
+            ..Default::default()
+        },
+    }));
     assert!(!r.layout.borrow().is_shown(&ModuleId::terminal()));
     r.exited(None);
     let prompt = r.driver.query(|c| c.chrome(WIN)).prompt.expect("a hub asks");
