@@ -1,8 +1,12 @@
 -- Eitri's scratch buffers: the read-only row view and the draft editor. Loaded by one
 -- `--cmd` like editor_context.lua. shell calls EitriScratch.call('<hex>') through nvim_input's
 -- <Cmd>; the hex is a JSON request, so nothing the request carries is ever read as keys.
--- Injected over RPC, it is given no options and returns the function that removes the global.
+-- Injected over RPC, it accepts an options table and returns the teardown for its windows, buffers and global.
+local opts = ...
 local M = {}
+local torn = false
+local buffers, windows = {}, {}
+local syntax_before, syntax_set
 
 local function unhex(h)
   return (h:gsub('..', function(c) return string.char(tonumber(c, 16)) end))
@@ -46,6 +50,8 @@ local function split(path)
   vim.bo[buf].swapfile = false
   vim.bo[buf].bufhidden = 'wipe'
   vim.bo[buf].filetype = 'markdown'
+  buffers[buf] = true
+  windows[vim.api.nvim_get_current_win()] = buf
   return buf
 end
 
@@ -83,6 +89,7 @@ end
 -- any text is in it.
 local function read_only_buffer(path, lines)
   local buf = vim.api.nvim_create_buf(true, false)
+  buffers[buf] = true
   vim.bo[buf].modeline = false
   vim.bo[buf].swapfile = false
   vim.bo[buf].bufhidden = 'wipe'
@@ -116,6 +123,7 @@ local function view(path)
   end
   -- After the window shows it: a filetype plugin sets window options on the current window.
   vim.bo[buf].filetype = 'markdown'
+  windows[win] = buf
   last_view = { win = win, buf = buf }
 end
 
@@ -145,6 +153,7 @@ local function diff(req)
   if tab == previous then error('no tab page was opened for the proposal') end
   local left = vim.api.nvim_get_current_win()
   local right = vim.api.nvim_open_win(proposed, true, { split = 'right', win = left })
+  windows[left], windows[right] = base, proposed
   for _, pair in ipairs({ { left, base }, { right, proposed } }) do
     local win, buf = pair[1], pair[2]
     vim.api.nvim_win_call(win, function()
@@ -180,8 +189,10 @@ local function diff(req)
 end
 
 function M.call(hex)
+  if torn then return end
   local ok, req = pcall(vim.json.decode, unhex(hex))
   if not ok or type(req) ~= 'table' then return end
+  local previous_syntax = vim.go.syntax
   local ran, err = pcall(function()
     if req.op == 'open' then
       run('edit', req.path)
@@ -195,16 +206,20 @@ function M.call(hex)
     elseif req.op == 'edit' then
       local buf = split(req.path)
       local written = false
-      vim.api.nvim_create_autocmd('BufWritePost', { buffer = buf, callback = function() written = true end })
+      vim.api.nvim_create_autocmd('BufWritePost', { buffer = buf, callback = function() if torn then return end; written = true end })
       vim.api.nvim_create_autocmd('BufWipeout', {
         buffer = buf,
         once = true,
-        callback = function() mark(req.done, written and 'written' or 'discarded') end,
+        callback = function() if torn then return end; mark(req.done, written and 'written' or 'discarded') end,
       })
     else
       error('unknown scratch op: ' .. tostring(req.op))
     end
   end)
+  if req.op ~= 'open' and vim.go.syntax ~= previous_syntax then
+    if syntax_set == nil or syntax_set ~= previous_syntax then syntax_before = previous_syntax end
+    syntax_set = vim.go.syntax
+  end
   -- Known limit: `open` and `view` carry no `done`, so a failure of theirs (E37 from `:edit` over a
   -- modified buffer with 'nohidden', say) reaches only nvim's message area; the panel said `ok`.
   if not ran then mark(req.done, 'error: ' .. tostring(err)) end
@@ -213,6 +228,19 @@ end
 EitriScratch = M
 
 return function()
+  if torn then return end
+  torn = true
+  local current = vim.api.nvim_get_current_win()
+  for win, buf in pairs(windows) do
+    if vim.api.nvim_win_is_valid(win) and vim.api.nvim_win_get_buf(win) == buf then
+      pcall(vim.api.nvim_win_close, win, true)
+    end
+  end
+  for buf in pairs(buffers) do
+    if vim.api.nvim_buf_is_valid(buf) then pcall(vim.api.nvim_buf_delete, buf, {force=true}) end
+  end
+  if vim.api.nvim_win_is_valid(current) then vim.api.nvim_set_current_win(current) end
+  if syntax_set ~= nil and vim.go.syntax == syntax_set then vim.go.syntax = syntax_before end
   if rawget(_G, "EitriScratch") == M then
     EitriScratch = nil
   end

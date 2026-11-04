@@ -199,6 +199,74 @@ pub fn install_args(channel_id: u64, sockets: &Sockets, kind: &InstallKind) -> V
     vec![Value::from(channel_id), Value::Array(parts), extra]
 }
 
+/// The takeover uses the companion parts with a reload timer that stays on for the whole attach.
+/// All addresses and environment values travel as arguments to the snippets.
+pub fn takeover_install_args(channel_id: u64, parts: &crate::takeover::glue::TakeoverParts) -> Vec<Value> {
+    use crate::takeover::glue::{CURSOR_PART_LUA, ENV_PART_LUA, FORK_PART_LUA, UI_PART_LUA};
+
+    let mut sockets = parts.sockets.clone();
+    sockets.reload_always = true;
+    let mut args = install_args(channel_id, &sockets, &InstallKind::Agent);
+    let mut items = args[1].as_array().expect("the companion parts are an array").clone();
+    let strings = |words: &[String]| Value::Array(words.iter().map(|word| Value::from(word.as_str())).collect());
+    let group = match &parts.commands.group {
+        None => Value::Nil,
+        Some((lhs, keys)) => map(vec![
+            ("lhs", Value::from(lhs.as_str())),
+            (
+                "keys",
+                Value::Array(
+                    keys.iter()
+                        .map(|key| {
+                            map(vec![
+                                ("suffix", Value::from(key.suffix.as_str())),
+                                ("words", strings(&key.words)),
+                                ("desc", Value::from(key.desc.as_str())),
+                            ])
+                        })
+                        .collect(),
+                ),
+            ),
+        ]),
+    };
+    items.push(part(
+        "takeover_commands",
+        crate::nvim_verbs::install::EITRI_COMMANDS_LUA,
+        vec![
+            ("socket", path_value(&parts.commands.socket)),
+            ("words", strings(&parts.commands.words.first)),
+            ("names", strings(&parts.commands.words.known)),
+            ("modules", strings(&parts.commands.words.modules)),
+            ("group", group),
+            ("teardown", Value::from(true)),
+        ],
+    ));
+    items.push(part("takeover_cursor", CURSOR_PART_LUA, vec![]));
+    if let Some(swap) = &parts.tmux_swap {
+        items.push(part(
+            "takeover_env",
+            ENV_PART_LUA,
+            vec![
+                ("tmux", Value::from(swap.tmux.as_str())),
+                ("tmux_pane", Value::from(swap.tmux_pane.as_str())),
+                ("socket", path_value(&swap.pane_switch_socket)),
+                ("shim_dir", path_value(&swap.shim_dir)),
+            ],
+        ));
+    }
+    items.push(part(
+        "takeover_ui",
+        UI_PART_LUA,
+        vec![("chan", Value::from(channel_id))],
+    ));
+    items.push(part("takeover_fork", FORK_PART_LUA, vec![]));
+    args[1] = Value::Array(items);
+    let mut extra = args[2].as_map().expect("the companion extras are a map").clone();
+    extra.push((Value::from("mode"), Value::from("takeover")));
+    args[2] = Value::Map(extra);
+    args
+}
+
 /// What [`INSTALL_LUA`] answered.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct InstallReport {
@@ -364,6 +432,64 @@ mod tests {
             ("pid", Value::from(4242)),
             ("tmux", Value::from(false)),
         ])
+    }
+
+    #[test]
+    fn takeover_reuses_the_companion_parts_and_the_windows_own_command_options() {
+        use crate::nvim_verbs::{install, leader::LeaderKey, CommandWords};
+        use crate::takeover::glue::{CommandsPart, TakeoverParts};
+
+        let keys = vec![LeaderKey {
+            suffix: "x".into(),
+            words: vec!["focus".into(), "lua:preview".into()],
+            desc: "preview".into(),
+        }];
+        let parts = TakeoverParts {
+            sockets: all_sockets(),
+            commands: CommandsPart {
+                socket: PathBuf::from("/r/takeover'\nsocket"),
+                words: CommandWords {
+                    first: vec!["focus".into()],
+                    known: vec!["focus".into(), "show".into()],
+                    modules: vec!["lua:preview".into()],
+                },
+                group: Some(("<Space>e".into(), keys.clone())),
+            },
+            tmux_swap: None,
+        };
+        let companion_before = install_args(7, &parts.sockets, &InstallKind::Agent);
+        let args = takeover_install_args(7, &parts);
+        let mut always = parts.sockets.clone();
+        always.reload_always = true;
+        let companion_always = install_args(7, &always, &InstallKind::Agent);
+        let items = args[1].as_array().unwrap();
+        assert_eq!(&items[..6], companion_always[1].as_array().unwrap().as_slice());
+        let command = items
+            .iter()
+            .find(|p| get(p, "name").as_str() == Some("takeover_commands"))
+            .unwrap();
+        let expected = install::install_args(&parts.commands.socket, &parts.commands.words, Some(("<Space>e", &keys)));
+        fn ordered(value: &Value) -> Value {
+            match value {
+                Value::Map(items) => {
+                    let mut items: Vec<_> = items.iter().map(|(key, value)| (key.clone(), ordered(value))).collect();
+                    items.sort_by_key(|(key, _)| key.as_str().unwrap_or_default().to_owned());
+                    Value::Map(items)
+                }
+                Value::Array(items) => Value::Array(items.iter().map(ordered).collect()),
+                other => other.clone(),
+            }
+        }
+        // The takeover alone asks the command part for its teardown; the window's own install never does.
+        let mut with_teardown = ordered(&install::to_msgpack(&expected));
+        if let Value::Map(items) = &mut with_teardown {
+            items.push((Value::from("teardown"), Value::from(true)));
+            items.sort_by_key(|(key, _)| key.as_str().unwrap_or_default().to_owned());
+        }
+        assert_eq!(ordered(get(command, "opts")), with_teardown);
+        assert_eq!(get(&args[2], "mode").as_str(), Some("takeover"));
+        assert_eq!(get(items.last().unwrap(), "name").as_str(), Some("takeover_fork"));
+        assert_eq!(install_args(7, &parts.sockets, &InstallKind::Agent), companion_before);
     }
 
     /// A host that never reports its agent's activity asks for the reload timer at all times; the others leave the

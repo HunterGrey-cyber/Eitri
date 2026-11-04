@@ -10,6 +10,9 @@
 -- would drop is refused here with a message instead of vanishing, and a first word the host has no reading for is
 -- refused the same way. What the host refuses among the rest it toasts in the window: nothing comes back on the socket.
 local o = ...
+local torn = false
+local teardowns = {}
+local command_callback
 
 local NAME = "Eitri"
 -- nvim reports a Lua command's description as its `definition`, which is how a later call tells this command from
@@ -70,6 +73,7 @@ end
 -- is on the wire by the time the caller is. Every failure of the socket (nobody listening, a window that is gone)
 -- costs the keypress and never an error in the user's editor.
 local function write_line(line)
+  if torn then return false end
   local ok, chan = pcall(vim.fn.sockconnect, "pipe", socket, { rpc = false })
   if not ok or chan == 0 then
     return false
@@ -144,9 +148,10 @@ do
   local taken = (global[NAME] ~= nil and not mine) or in_buffer[NAME] ~= nil
   local made = false
   if not taken then
-    made = pcall(vim.api.nvim_create_user_command, NAME, function(args)
+    command_callback = function(args)
       send(args.fargs, #args.fargs)
-    end, {
+    end
+    made = pcall(vim.api.nvim_create_user_command, NAME, command_callback, {
       nargs = "+",
       desc = DESC,
       complete = function(lead, line, pos)
@@ -168,6 +173,12 @@ do
         return out
       end,
     })
+  end
+  if made then
+    -- The callback identity survives a query even when a replacement copies the description.
+    command_callback = vim.api.nvim_get_commands({ builtin = false })[NAME].callback
+  else
+    command_callback = nil
   end
   if not made then
     skipped[#skipped + 1] = NAME
@@ -201,13 +212,13 @@ local function raw(lhs)
 end
 
 local function install_group(group)
-  local mapped = {} -- raw lhs -> the lhs as mapped, for each map this snippet made
+  local mapped = {} -- raw lhs -> the lhs and callback this snippet installed
   local installed = false
   local refused = false
   local which_key_told = false
 
-  local function ours(map)
-    return type(map) == "table" and type(map.desc) == "string" and map.desc:sub(1, #GROUP_DESC_PREFIX) == GROUP_DESC_PREFIX
+  local function ours(map, saved)
+    return saved ~= nil and map.callback == saved.callback
   end
 
   -- The first map of someone else at or under the group's lhs, global or buffer-local. A key the group installed
@@ -221,7 +232,7 @@ local function install_group(group)
         maps = vim.api.nvim_buf_get_keymap(0, "n")
       end
       for _, map in ipairs(maps) do
-        local lhs = map.lhsraw or raw(map.lhs)
+        local lhs = map.lhsrawalt or map.lhsraw or raw(map.lhs)
         if lhs:sub(1, #group_raw) == group_raw and mapped[lhs] == nil then
           return map
         end
@@ -234,14 +245,15 @@ local function install_group(group)
   -- map would stay behind.
   local function remove_ours()
     for _, map in ipairs(vim.api.nvim_get_keymap("n")) do
-      local lhs = mapped[map.lhsraw or raw(map.lhs)]
-      if lhs ~= nil and ours(map) then
-        pcall(vim.api.nvim_del_keymap, "n", lhs)
+      local saved = mapped[map.lhsrawalt or map.lhsraw or raw(map.lhs)]
+      if ours(map, saved) then
+        pcall(vim.api.nvim_del_keymap, "n", saved.lhs)
       end
     end
   end
 
   local function check()
+    if torn then return end
     if refused then
       return
     end
@@ -273,11 +285,12 @@ local function install_group(group)
         local taken = vim.fn.maparg(lhs, "n", false, true)
         if type(taken) ~= "table" or next(taken) == nil then
           local words = key.words
-          local made = pcall(vim.keymap.set, "n", lhs, function()
+          local callback = function()
             send(words, #words)
-          end, { desc = GROUP_DESC_PREFIX .. key.desc, silent = true, noremap = true })
+          end
+          local made = pcall(vim.keymap.set, "n", lhs, callback, { desc = GROUP_DESC_PREFIX .. key.desc, silent = true, noremap = true })
           if made then
-            mapped[raw(lhs)] = lhs
+            mapped[raw(lhs)] = { lhs = lhs, callback = callback }
           end
         end
       end
@@ -295,6 +308,10 @@ local function install_group(group)
   -- can come after the install, so the group is checked again there, scheduled so that every handler of the event
   -- (this one is registered first) has run when the maps are read.
   local augroup = vim.api.nvim_create_augroup("EitriVerbs", { clear = true })
+  teardowns[#teardowns + 1] = function()
+    remove_ours()
+    pcall(vim.api.nvim_del_augroup_by_id, augroup)
+  end
   for _, pattern in ipairs({ "VeryLazy", "LazyLoad" }) do
     vim.api.nvim_create_autocmd("User", { group = augroup, pattern = pattern, callback = vim.schedule_wrap(check) })
   end
@@ -304,10 +321,27 @@ if type(o.group) == "table" and type(o.group.lhs) == "string" and type(o.group.k
   install_group(o.group)
 end
 
-_G.__eitri_window = { run = run_words, edge = edge }
+local window = { run = run_words, edge = edge }
+_G.__eitri_window = window
 local first = vim.g.eitri ~= 1
 vim.g.eitri = 1
 if first then
   pcall(vim.api.nvim_exec_autocmds, "User", { pattern = "EitriReady" })
+end
+local function teardown()
+  if torn then return end
+  torn = true
+  for i = #teardowns, 1, -1 do pcall(teardowns[i]) end
+  local command = vim.api.nvim_get_commands({ builtin = false })[NAME]
+  if command_callback and command and command.callback == command_callback then
+    pcall(vim.api.nvim_del_user_command, NAME)
+  end
+  if rawget(_G, "__eitri_window") == window then _G.__eitri_window = nil end
+  if vim.g.eitri == 1 then vim.g.eitri = nil end
+end
+-- A function cannot cross the RPC answer of the window's own install; only the takeover glue, which reads the
+-- result inside nvim, asks for the teardown.
+if o.teardown == true then
+  return { ok = true, skipped = skipped, teardown = teardown }
 end
 return { ok = true, skipped = skipped }

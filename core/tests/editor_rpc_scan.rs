@@ -6,8 +6,8 @@
 //!   string literal or a path ending in an `UPPER_SNAKE` constant. A wrapper that passes its own
 //!   caller's constant on carries `// editor-rpc-scan: forwards a caller's constant` on the call's
 //!   line or the line above, and every such wrapper is listed in [`EXPECTED_FORWARDERS`], so a new
-//!   one is red until someone has looked at it. `exec_lua_watched` (the editor's quit, which runs
-//!   one fixed chunk) is a different name and out of scope;
+//!   one is red until someone has looked at it. The chunk inventory also covers `exec_lua_watched`:
+//!   its owned-editor quit template is refused, as are its generated forms;
 //! - `leak` called as a method or a path (`.leak()`, `Box::leak(..)`, `.map(String::leak)`) outside
 //!   a `#[cfg(test)]` module: leaking is the one way to make a built `String` a `&'static str`. A
 //!   test module kept in a file of its own is read as product code, which can only turn this red;
@@ -57,7 +57,7 @@ fn the_agent_reload_part_comes_from_its_compile_time_constant() {
 const EXPECTED_FORWARDERS: &[(&str, usize)] = &[
     ("core/src/companion/driver.rs", 5),
     ("core/src/companion/link.rs", 2),
-    ("core/src/editor_rpc.rs", 1),
+    ("core/src/editor_rpc.rs", 2),
     ("shell/src/editor_rpc.rs", 1),
 ];
 
@@ -350,6 +350,10 @@ fn code_argument(name: &str, path_form: bool) -> usize {
 }
 
 fn scan(rel: &str, text: &str) -> Report {
+    scan_calls(rel, text, &["exec_lua", "exec_lua_answered", "exec_lua_for"])
+}
+
+fn scan_calls(rel: &str, text: &str, names: &[&str]) -> Report {
     let chars: Vec<char> = text.chars().collect();
     let kinds = kinds(&chars);
     let code = code_only(&chars, &kinds);
@@ -368,11 +372,18 @@ fn scan(rel: &str, text: &str) -> Report {
     let slice = |from: usize, to: usize, of: &[char]| of[from..to].iter().collect::<String>();
     let mut report = Report::default();
 
-    for name in ["exec_lua", "exec_lua_answered", "exec_lua_for"] {
+    for &name in names {
         for at in word_starts(&code, name) {
             let path_form = match back_over_space(&code, at) {
                 Some(p) if code[p] == '.' => false,
                 Some(p) if code[p] == ':' && p > 0 && code[p - 1] == ':' => true,
+                _ if names.contains(&"exec_lua_watched") => {
+                    let prefix: String = code[..at].iter().collect();
+                    if prefix.split_whitespace().last() == Some("fn") {
+                        continue;
+                    }
+                    false
+                }
                 _ => continue,
             };
             let Some(open) = forward_over_space(&code, at + name.len()).filter(|&p| code[p] == '(') else {
@@ -1053,6 +1064,7 @@ fn exec_record_wrong(text: &str) -> Vec<String> {
     const CONSTRUCTOR: &str = "fnfrom_card(pending:PendingExec,answer:CardAnswer,";
     const ARGS: &str = "fnexec_args(stamp:&Stamp,record:ApprovalRecord)";
     const RECORD: &str = "ApprovalRecord";
+    const CLASSIFIER: &str = "pubfnis_exec_chunk(code:&str)->bool{code==AGENT_EXEC_LUA}";
 
     let code = product_code(text);
     let squeezed = squeeze(&code);
@@ -1066,8 +1078,12 @@ fn exec_record_wrong(text: &str) -> Vec<String> {
     let calls: Vec<usize> = squeezed.match_indices(CALL).map(|(at, _)| at).collect();
     need(calls.len() == 1, "the chunk has exactly one call");
     need(
-        word_ends(&code, "AGENT_EXEC_LUA").len() == 2,
-        "`AGENT_EXEC_LUA` stands in its `const` and its call, and nowhere else in product code",
+        word_ends(&code, "AGENT_EXEC_LUA").len() == 3,
+        "`AGENT_EXEC_LUA` stands in its `const`, its call and `is_exec_chunk`, and nowhere else in product code",
+    );
+    need(
+        squeezed.matches(CLASSIFIER).count() == 1,
+        "`is_exec_chunk` only compares a string with the chunk, once",
     );
     let after_call = |at: &usize| &squeezed[at + CALL.len()..];
     need(
@@ -1512,6 +1528,10 @@ fn only_the_card_path_answers_a_broker_card() {
 const EXEC_SHAPE: &str = r#"
 const AGENT_EXEC_LUA: &str = chunk!("nvim_exec.lua");
 
+pub fn is_exec_chunk(code: &str) -> bool {
+    code == AGENT_EXEC_LUA
+}
+
 pub struct ApprovalRecord {
     tab: u64,
     code: String,
@@ -1574,7 +1594,7 @@ fn a_second_caller_of_the_chunk_fails() {
     let second = format!("{EXEC_SHAPE}\nfn other(rpc: &dyn EditorRpc) {{ rpc.exec_lua(AGENT_EXEC_LUA, vec![]); }}");
     refused(&second, "exactly one call");
     let alias = format!("{EXEC_SHAPE}\nconst SAME: &str = AGENT_EXEC_LUA;");
-    refused(&alias, "its `const` and its call");
+    refused(&alias, "its `const`, its call and `is_exec_chunk`");
 
     let module = file(EXEC_MODULE, EXEC_SHAPE);
     assert_eq!(exec_chunk_naming(std::slice::from_ref(&module)), Vec::<String>::new());
@@ -2191,4 +2211,239 @@ fn literals_are_read_with_and_without_the_tests() {
     let text = "const A: &str = \"one\";\n#[cfg(test)]\nmod t { const B: &str = \"two\"; }\n";
     assert_eq!(literals(text, false), ["\"one\""]);
     assert_eq!(literals(text, true), ["\"one\"", "\"two\""]);
+}
+
+#[test]
+fn every_exec_lua_code_argument_is_in_the_chunk_table() {
+    let sources = source_scan::rust_sources(&["core/src", "shell/src"]);
+    let mut seen = BTreeSet::new();
+    let mut watched = 0;
+    for source in &sources {
+        let text = product_text(&source.text);
+        let calls = scan_calls(
+            &source.path,
+            &text,
+            &[
+                "exec_lua",
+                "exec_lua_answered",
+                "exec_lua_for",
+                "exec_lua_watched",
+                "nvim_exec_lua",
+            ],
+        );
+        for flagged in &calls.flagged {
+            watched += 1;
+            assert!(
+                source.path == "shell/src/gtk_host/services.rs"
+                    && flagged.contains("`exec_lua_watched` is passed `lua`"),
+                "{flagged}"
+            );
+            // The owned-editor quit embeds its generation in the source. Its template is refused,
+            // and every instantiated form is unknown, so the attached pane rejects both.
+            let owner = source_scan::read_required("core/src/layout/kill.rs");
+            let (_, body) = source_scan::function_in_raw(&[owner.clone()], "editor_quit_lua");
+            let template = literals(&body, false);
+            assert_eq!(template.len(), 1);
+            let template = rust_string(&template[0]);
+            assert_eq!(
+                eitri_core::editor_rpc::check_chunk(&template),
+                Ok(eitri_core::editor_rpc::ChunkSide::Refused)
+            );
+            for generation in [0, 1, u32::MAX] {
+                assert!(
+                    eitri_core::editor_rpc::check_chunk(&eitri_core::layout::kill::editor_quit_lua(generation))
+                        .is_err()
+                );
+            }
+        }
+        for argument in calls.constants {
+            let content = chunk_content(&sources, source, &argument);
+            // The approved-code chunk is not a table row: its module classifies it without handing out the text.
+            if eitri_core::editor_tools::tools::nvim_exec::is_exec_chunk(&content) {
+                assert_eq!(
+                    source.path, EXEC_MODULE,
+                    "{}: {argument} is the approved-code chunk",
+                    source.path
+                );
+                assert_eq!(
+                    eitri_core::editor_rpc::check_chunk(&content),
+                    Ok(eitri_core::editor_rpc::ChunkSide::Registered)
+                );
+                seen.insert(argument.split("::").last().unwrap().to_owned());
+                continue;
+            }
+            assert!(
+                eitri_core::editor_rpc::CHUNKS.iter().any(|(code, _)| *code == content),
+                "{}: {argument} has no chunk classification",
+                source.path
+            );
+            seen.insert(argument.split("::").last().unwrap().to_owned());
+        }
+    }
+    for required in [
+        "IDE_DIFF_CLOSE",
+        "IDE_TAKE_EVENTS",
+        "IDE_DIFF_OPEN",
+        "SETUP_LUA",
+        "SET_LINES_LUA",
+        "TUTOR_SNIPPET",
+        "eitri_core::editor_reopen::EDITOR_REOPEN_CAPTURE_LUA",
+        "AGENT_EXEC_LUA",
+        "REVIEW_LUA",
+    ] {
+        assert!(
+            seen.contains(required.split("::").last().unwrap()),
+            "missing call site: {required}"
+        );
+    }
+    assert_eq!(watched, 1, "the watched quit must remain covered");
+}
+
+fn product_text(text: &str) -> String {
+    let chars: Vec<_> = text.chars().collect();
+    let code = code_only(&chars, &kinds(&chars));
+    let mut out = chars;
+    for (from, to) in test_modules(&code) {
+        out[from..=to].fill(' ');
+    }
+    out.into_iter().collect()
+}
+
+fn rust_string(text: &str) -> String {
+    let text = text.trim();
+    if text.starts_with('r') {
+        let start = text.find('"').unwrap();
+        return text[start + 1..text.len() - start].to_owned();
+    }
+    let mut out = String::new();
+    let mut chars = text[1..text.len() - 1].chars().peekable();
+    while let Some(c) = chars.next() {
+        if c != '\\' {
+            out.push(c);
+            continue;
+        }
+        match chars.next().unwrap() {
+            'n' => out.push('\n'),
+            'r' => out.push('\r'),
+            't' => out.push('\t'),
+            '\\' => out.push('\\'),
+            '"' => out.push('"'),
+            '0' => out.push('\0'),
+            '\n' => {
+                while chars.peek().is_some_and(|c| c.is_whitespace()) {
+                    chars.next();
+                }
+            }
+            other => panic!("unsupported string escape {other}"),
+        }
+    }
+    out
+}
+
+fn chunk_content(sources: &[Source], source: &Source, expression: &str) -> String {
+    let expression = expression.trim();
+    if expression.starts_with('"') || expression.starts_with("r#") || expression.starts_with("r\"") {
+        return rust_string(expression);
+    }
+    if expression.starts_with("include_str!") {
+        let path = literals(expression, true)
+            .pop()
+            .unwrap_or_else(|| panic!("unresolved include in {}: {expression}", source.path));
+        let path = std::path::Path::new(&source.path)
+            .parent()
+            .unwrap()
+            .join(rust_string(&path));
+        return source_scan::read_required(path.to_str().unwrap()).text;
+    }
+    if let Some(open) = expression.find('!').map(|at| at + 1) {
+        let chars: Vec<_> = expression.chars().collect();
+        let tags = kinds(&chars);
+        let mut code = code_only(&chars, &tags);
+        for i in 0..code.len() {
+            if tags[i] == Kind::Literal && (i == 0 || tags[i - 1] != Kind::Literal) {
+                code[i] = 'L';
+            }
+        }
+        let close = closing(&code, open).unwrap();
+        let args: Vec<String> = arguments(&code, open, close)
+            .into_iter()
+            .map(|(a, b)| chars[a..b].iter().collect())
+            .collect();
+        let name = expression[..open - 1].trim().split("::").last().unwrap();
+        if name == "concat" {
+            return args.iter().map(|arg| chunk_content(sources, source, arg)).collect();
+        }
+        let definition = sources
+            .iter()
+            .find_map(|s| {
+                let head = format!("macro_rules! {name}");
+                s.text.find(&head).map(|at| (s, at))
+            })
+            .unwrap_or_else(|| panic!("unknown macro {name}"));
+        let (owner, at) = definition;
+        let rest = &owner.text[at..];
+        let start = rest.find("concat!(").unwrap();
+        let tail = &rest[start..];
+        let chars: Vec<_> = tail.chars().collect();
+        let code = code_only(&chars, &kinds(&chars));
+        let end = closing(&code, 7).unwrap();
+        let mut expanded: String = chars[..=end].iter().collect();
+        // Macro bodies here have literal or expression parameters, in declaration order.
+        let parameters: Vec<_> = rest[..start]
+            .split('$')
+            .skip(1)
+            .filter_map(|p| p.split_once(':').map(|(name, _)| name.trim()))
+            .collect();
+        for (parameter, value) in parameters.iter().zip(args) {
+            expanded = expanded.replace(&format!("${parameter}"), &value);
+        }
+        // include_str! paths in chunk macros are relative to the invocation's module.
+        return chunk_content(sources, source, &expanded);
+    }
+    let name = expression.split("::").last().unwrap().trim();
+    let mut candidates = Vec::new();
+    for candidate in sources {
+        if !candidate.text.contains(name) {
+            continue;
+        }
+        let chars: Vec<_> = candidate.text.chars().collect();
+        let code = code_only(&chars, &kinds(&chars));
+        for at in word_starts(&code, name) {
+            let before: String = code[..at]
+                .iter()
+                .rev()
+                .take(16)
+                .collect::<String>()
+                .chars()
+                .rev()
+                .collect();
+            if !before.trim_end().ends_with("const") && !before.trim_end().ends_with("static") {
+                continue;
+            }
+            let Some(eq) = (at..code.len()).find(|i| code[*i] == '=') else {
+                continue;
+            };
+            let end = (eq + 1..code.len()).find(|i| code[*i] == ';').unwrap();
+            candidates.push((candidate, chars[eq + 1..end].iter().collect::<String>()));
+        }
+    }
+    let (owner, value) = candidates
+        .iter()
+        .find(|(owner, _)| owner.path == source.path)
+        .or_else(|| (candidates.len() == 1).then(|| &candidates[0]))
+        .unwrap_or_else(|| panic!("{}: cannot resolve {expression}", source.path));
+    chunk_content(sources, owner, value)
+}
+
+#[test]
+fn chunk_inventory_finds_bare_calls_and_calls_split_across_lines() {
+    let names = &["exec_lua", "exec_lua_watched", "nvim_exec_lua"];
+    for text in [
+        "fn exec_lua(code: &str, args: A) {} fn f() { exec_lua(IDE_DIFF_CLOSE, args); rpc.nvim_exec_lua(IDE_TAKE_EVENTS, args); pane.exec_lua_watched(QUIT); }",
+        "fn exec_lua (code: &str, args: A) {} fn f() { exec_lua\n(\nIDE_DIFF_CLOSE, args); rpc\n.\nnvim_exec_lua\n(IDE_TAKE_EVENTS, args); pane\n.exec_lua_watched\n(QUIT); }",
+    ] {
+        let report = scan_calls("core/src/example.rs", text, names);
+        assert!(report.flagged.is_empty());
+        assert_eq!(report.constants, ["IDE_DIFF_CLOSE", "QUIT", "IDE_TAKE_EVENTS"]);
+    }
 }

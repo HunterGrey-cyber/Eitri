@@ -31,7 +31,8 @@ use crate::wm::PeerId;
 /// (`installed = false`); any other replaces the module there, tearing the old one down first.
 /// Changing `find_buf.lua` or `review.lua` means bumping [`REVIEW_LUA_VERSION`], or an nvim that
 /// holds the old one keeps it.
-pub const REVIEW_LUA: &str = concat!(include_str!("find_buf.lua"), include_str!("review.lua"));
+pub const REVIEW_LUA: &str =
+    crate::editor_rpc::takeover_chunk!(concat!(include_str!("find_buf.lua"), include_str!("review.lua")), "");
 
 /// Bumped whenever `find_buf.lua` or `review.lua` changes.
 pub const REVIEW_LUA_VERSION: i64 = 15;

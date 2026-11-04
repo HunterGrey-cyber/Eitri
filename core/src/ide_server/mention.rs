@@ -51,9 +51,15 @@ const ACCEPT_REST: Duration = Duration::from_secs(1);
 /// are, so one that is not UTF-8 is [`parse_line`]'s to catch, and the Lua stays out of judging names. `line1` and
 /// `line2` are the cursor's line when no range was given. No key is bound: the person binds one if they want it.
 /// Harmless late: run after [`IDE_MENTION_REMOVE`] it leaves a command whose connect fails, and that drops the line.
-pub const IDE_MENTION_DEFINE: &str = r#"
+pub const IDE_MENTION_DEFINE: &str = crate::editor_rpc::takeover_chunk!(
+    r#"
 local socket = ...
+local takeover_options = select(2, ...)
+local takeover = type(takeover_options) == 'table' and takeover_options.takeover_chan ~= nil
+if takeover and (vim.v.vim_did_enter == 0 or vim.fn.exists(':EitriMention') ~= 0) then return false end
+local torn = false
 vim.api.nvim_create_user_command('EitriMention', function(opts)
+  if torn then return end
   local name = vim.bo.buftype == '' and vim.api.nvim_buf_get_name(0) or ''
   local function line_for(file)
     return vim.json.encode({ v = 1, file = file, start = opts.line1 - 1, ['end'] = opts.line2 - 1 })
@@ -79,11 +85,29 @@ vim.api.nvim_create_user_command('EitriMention', function(opts)
   if not started and not pipe:is_closing() then
     pipe:close()
   end
-end, { range = true, force = true, desc = "Mention this file's lines to the claude in the bottom terminal" })
-"#;
+end, { range = true, force = not takeover, desc = "Mention this file's lines to the claude in the bottom terminal" })
+if takeover then
+  local command = vim.api.nvim_get_commands({builtin=false}).EitriMention
+  local glue = rawget(_G, '__eitri_companion')
+  local record = {definition=command.definition}
+  glue.takeover_mention = record
+  record.teardown = function()
+    if torn then return end
+    torn = true
+    local current = vim.api.nvim_get_commands({builtin=false}).EitriMention
+    if current and current.definition == command.definition then pcall(vim.api.nvim_del_user_command, 'EitriMention') end
+  end
+end
+return true
+"#,
+    r#"
+local record = __takeover_glue.takeover_mention
+if __takeover_result and record then __takeover_adopt('mention', record.teardown) end
+"#
+);
 
 /// Takes `:EitriMention` away. Harmless late or twice: the command may already be gone.
-pub const IDE_MENTION_REMOVE: &str = "pcall(vim.api.nvim_del_user_command, 'EitriMention')";
+pub const IDE_MENTION_REMOVE: &str = "local glue = rawget(_G, '__eitri_companion'); if glue and glue.mode == 'takeover' then if glue.takeover_mention then glue.takeover_mention.teardown() end else pcall(vim.api.nvim_del_user_command, 'EitriMention') end";
 
 /// Says in the message area that a mention was not sent, since the judgement runs on the judge's thread, not in nvim.
 /// The file may be in the project and still have a name no client can be told. Harmless late: it changes nothing but

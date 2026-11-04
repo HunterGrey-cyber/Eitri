@@ -15,9 +15,21 @@ use crate::editor_tools::stamp::Stamp;
 use crate::nvim_rpc::Pending;
 
 /// Opens a view. Its stamp's rule holds: a chunk that runs late shows nothing.
-pub const IDE_DIFF_OPEN: &str = concat!(
-    include_str!("../editor_tools/prelude.lua"),
-    include_str!("ide_view.lua")
+pub const IDE_DIFF_OPEN: &str = crate::editor_rpc::takeover_chunk!(
+    concat!(
+        include_str!("../editor_tools/prelude.lua"),
+        include_str!("ide_view.lua")
+    ),
+    r#"
+local ide = rawget(_G, '__eitri_ide')
+if ide then __takeover_adopt('ide', function()
+  if rawget(_G, '__eitri_ide') ~= ide then return end
+  local ids = {}
+  for id in pairs(ide.views) do ids[#ids+1] = id end
+  for _, id in ipairs(ids) do pcall(ide.close, id) end
+  _G.__eitri_ide = nil
+end) end
+"#
 );
 
 /// No prelude: a close that runs late still closes. Argument: the view id.

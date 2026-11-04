@@ -81,8 +81,18 @@ local function wipe()
     return false, 0
   end
   local buf = state.buf
-  if vim.b[buf].eitri_plugin_preload ~= opts.owner or vim.b[buf].eitri_plugin_preload_own == nil
-      or vim.bo[buf].modified or #vim.fn.win_findbuf(buf) > 0 then
+  if vim.b[buf].eitri_plugin_preload ~= opts.owner or vim.b[buf].eitri_plugin_preload_own == nil then
+    return false, 0
+  end
+  if vim.bo[buf].modified or #vim.fn.win_findbuf(buf) > 0 then
+    -- The buffer now belongs to the person. A release (the end of a takeover, which wipes nothing the person has
+    -- touched) gives it back the policy it had before the preload and drops the preload's marks.
+    if opts.release then
+      pcall(set, buf, vim.b[buf].eitri_plugin_preload_own)
+      vim.b[buf].eitri_plugin_preload = nil
+      vim.b[buf].eitri_plugin_preload_own = nil
+      vim.b[buf].eitri_plugin_preload_clients = nil
+    end
     return false, 0
   end
   local ids = vim.b[buf].eitri_plugin_preload_clients or {}

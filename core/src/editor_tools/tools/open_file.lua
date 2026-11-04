@@ -25,6 +25,11 @@ if not (buf and api.nvim_buf_is_loaded(buf)) then
   end
 end
 
+-- A file opened to be looked at is the person's to keep, whichever call loaded it.
+if __state.takeover_buffers then
+  __state.takeover_buffers[buf] = nil
+end
+
 local function is_float(win)
   return api.nvim_win_get_config(win).relative ~= ''
 end

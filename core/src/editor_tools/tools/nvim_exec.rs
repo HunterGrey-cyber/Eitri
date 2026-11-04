@@ -45,6 +45,12 @@ pub const ROW: ToolRow = ToolRow {
 
 const AGENT_EXEC_LUA: &str = chunk!("nvim_exec.lua");
 
+/// Whether `code` is the approved-code chunk. The text itself never leaves this file: a caller learns only that a
+/// string is it, so no other module can name the chunk and send it without a person's answer.
+pub fn is_exec_chunk(code: &str) -> bool {
+    code == AGENT_EXEC_LUA
+}
+
 /// The longest `code` a call may hold, in bytes.
 pub const CODE_LIMIT: usize = 16 * 1024;
 /// The longest `why` a call may hold, in bytes.

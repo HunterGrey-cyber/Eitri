@@ -10,6 +10,14 @@
 local chan, parts, extra = ...
 extra = extra or {}
 
+-- A takeover owns the whole nvim, including the window marker its commands install.
+-- Refuse before checking a page's slot or touching any previous holder.
+local agent = rawget(_G, "__eitri_companion")
+if type(agent) == "table" and agent.mode == "takeover" then
+  return { refused = "takeover" }
+end
+local takeover = extra.mode == "takeover"
+
 -- Each slot has one holder. Tell its previous holder before removing the glue,
 -- so it can say "detached" instead of going on as if attached.
 local page_id
@@ -21,12 +29,18 @@ if extra.slot ~= nil then
   if type(rawget(_G, "__eitri_window")) == "table" then
     return { refused = "eitri_window" }
   end
-  local agent = rawget(_G, "__eitri_companion")
-  if type(agent) == "table" and agent.mode == "takeover" then
-    return { refused = "takeover" }
-  end
 end
 local pages = rawget(_G, "__eitri_pages")
+if takeover and pages then
+  -- A teardown removes its entry, so collect holders before walking them.
+  local holders = {}
+  for _, page in pairs(pages) do holders[#holders + 1] = page end
+  for _, page in ipairs(holders) do
+    pcall(vim.rpcnotify, page.chan, "eitri_replaced", chan)
+    pcall(page.teardown)
+  end
+  pages = rawget(_G, "__eitri_pages")
+end
 local previous
 if page_id then
   previous = pages and pages[page_id]
@@ -41,6 +55,7 @@ if previous then
 end
 
 local state = { chan = chan, teardowns = {}, calls = {}, installed = {}, failed = {}, torn = false }
+if takeover then state.mode = "takeover" end
 if page_id then
   pages = rawget(_G, "__eitri_pages") or {}
   _G.__eitri_pages = pages
@@ -77,6 +92,17 @@ local function teardown()
   end
 end
 state.teardown = teardown
+if takeover then
+  function state.take_back()
+    if torn then return false end
+    -- Fork cleanup may remove its record, so keep the channel before tearing down.
+    local fork = rawget(_G, "__neovide_attach")
+    local fork_chan = type(fork) == "table" and fork.chan or nil
+    teardown()
+    if fork_chan then pcall(vim.fn.chanclose, fork_chan) end
+    return true
+  end
+end
 
 function state.adopt(fn)
   if torn or type(fn) ~= "function" then
@@ -140,6 +166,15 @@ state.timer:start(500, 500, vim.schedule_wrap(function()
   local ok, info = pcall(vim.api.nvim_get_chan_info, chan)
   if ok and info.id == nil then
     teardown()
+    return
+  end
+  if takeover then
+    local fork = rawget(_G, "__neovide_attach")
+    local fork_chan = type(fork) == "table" and fork.chan or nil
+    if fork_chan then
+      local fork_ok, fork_info = pcall(vim.api.nvim_get_chan_info, fork_chan)
+      if fork_ok and fork_info.id == nil then teardown() end
+    end
   end
 end))
 

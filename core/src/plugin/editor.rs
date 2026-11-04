@@ -17,11 +17,70 @@ use super::protocol::JumpSelect;
 
 // Statics, not consts: a const is copied to each use, and the tests check that the very same text is what
 // reaches the editor, by address.
-pub static PLUGIN_BUFFERS_LUA: &str = include_str!("plugin_buffers.lua");
-pub static PLUGIN_CWD_LUA: &str = include_str!("plugin_cwd.lua");
+pub static PLUGIN_BUFFERS_LUA: &str = crate::editor_rpc::takeover_chunk!(
+    include_str!("plugin_buffers.lua"),
+    r#"
+local _, opts = ...
+local registry = rawget(_G, '__eitri_plugin_preloads')
+if registry then __takeover_adopt('buffers:' .. opts.owner, function()
+  -- The current diff tab cannot close itself through close_diffs. Select a surviving origin first.
+  local current = vim.api.nvim_get_current_tabpage()
+  for _, tab in ipairs(vim.api.nvim_list_tabpages()) do
+    local ok, owner = pcall(vim.api.nvim_tabpage_get_var, tab, 'eitri_plugin_diff')
+    if not ok or owner ~= opts.owner then vim.api.nvim_set_current_tabpage(tab); break end
+  end
+  __takeover_run('close_diffs', {owner=opts.owner})
+  __takeover_run('wipe_preload', {owner=opts.owner, release=true})
+  if vim.api.nvim_tabpage_is_valid(current) then vim.api.nvim_set_current_tabpage(current) end
+  if rawget(_G, '__eitri_plugin_preloads') == registry and next(registry.owners) == nil then
+    _G.__eitri_plugin_preloads = nil
+  end
+  local diffs = rawget(_G, '__eitri_plugin_diffs')
+  if diffs then
+    diffs.last[opts.owner] = nil
+    if next(diffs.last) == nil then _G.__eitri_plugin_diffs = nil end
+  end
+end) end
+"#
+);
+pub static PLUGIN_CWD_LUA: &str = crate::editor_rpc::takeover_chunk!(
+    include_str!("plugin_cwd.lua"),
+    r#"
+local _, opts = ...
+local registry = rawget(_G, '__eitri_plugin_cwd_last')
+if registry then __takeover_adopt('cwd:' .. opts.owner, function()
+  if rawget(_G, '__eitri_plugin_cwd_last') ~= registry then return end
+  __takeover_run('clear', {owner=opts.owner})
+  registry[opts.owner] = nil
+  if next(registry) == nil then _G.__eitri_plugin_cwd_last = nil end
+end) end
+"#
+);
 pub static PLUGIN_OPEN_LUA: &str = include_str!("plugin_open.lua");
-pub static PLUGIN_ASSIST_LUA: &str = include_str!("plugin_assist.lua");
-pub static PLUGIN_FOLLOW_LUA: &str = include_str!("plugin_follow.lua");
+pub static PLUGIN_ASSIST_LUA: &str = crate::editor_rpc::takeover_chunk!(
+    include_str!("plugin_assist.lua"),
+    r#"
+local _, opts = ...
+local registry = rawget(_G, '__eitri_plugin_assist')
+if registry then __takeover_adopt('assist:' .. opts.owner, function()
+  if rawget(_G, '__eitri_plugin_assist') ~= registry then return end
+  __takeover_run('clear', {owner=opts.owner})
+  if next(registry.owners) == nil then _G.__eitri_plugin_assist = nil end
+end) end
+"#
+);
+pub static PLUGIN_FOLLOW_LUA: &str = crate::editor_rpc::takeover_chunk!(
+    include_str!("plugin_follow.lua"),
+    r#"
+local _, opts = ...
+local registry = rawget(_G, '__eitri_plugin_follow')
+if registry then __takeover_adopt('follow:' .. opts.owner, function()
+  if rawget(_G, '__eitri_plugin_follow') ~= registry then return end
+  __takeover_run('teardown', {owner=opts.owner})
+  if next(registry) == nil then _G.__eitri_plugin_follow = nil end
+end) end
+"#
+);
 
 /// A path as bytes: nvim gives Lua a string either way, and bytes are never re-encoded.
 fn path_value(path: &Path) -> Value {
