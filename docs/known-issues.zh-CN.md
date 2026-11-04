@@ -1,5 +1,5 @@
 [English](known-issues.md) | 简体中文
-<!-- translated-from: known-issues.md sha256=c34bc971512340dac8c00eaad596de020a0e356b325c4af380aa33e7c4a7b3fc -->
+<!-- translated-from: known-issues.md sha256=034cccb47d76fd20600b64d812dcd8618ff0a97a64639b4c2150321731300568 -->
 
 # 已知问题与限制
 
@@ -71,6 +71,8 @@ Companion 模式是把 agent 面板作为一个独立窗口，开在你自己的
 - **`foot --server` 的客户端共用同一个 pid**，所以按进程把编辑器提到前面时，可能提起同一个 server 的另一个 foot 窗口，而不是装着你那个 nvim 的窗口。
 - **在 sway 的边缘，这个按键会被吞掉。** Eitri 必须先接管或放行 `Ctrl+h/j/k/l`，才能去问 sway 那个方向上有没有窗口，所以在边缘上这个按键什么也不做，和 tmux 自己的 `select-pane` 在它的边缘上一样。
 - **KDE：不移动焦点。** 在那里 Wayland 客户端没法抢到焦点；请用桌面自己的窗口键。
+- **开在你 nvim 旁边的页面**（`eitri page`、`:EitriPage`；[使用指南](guide/companion.zh-CN.md#pages-beside-your-nvim)）只经过了测试，还没有在窗口里跑过。仍然欠着：在隔离的无界面桌面里配合终端里的真实 Neovim 跑一遍（页面的配色、跟随、按键、关闭、`kill -9`、tmux 里的 nvim）；虚拟机里的 Hyprland 0.56.2 和 0.57；niri；KDE；启用了扩展的 GNOME；真实硬件；以及 nvim 0.10（最低版本）和 0.11，它们没有跑过。agent 工作期间的缓冲区重新加载，以及聚焦时的重新加载（在 tmux 里需要 `set -g focus-events on`），也处于同样的状态。
+- **页面窗口在两种情况下关得慢。** 正常关闭会把它的槽位留在你的 Neovim 里，直到 Neovim 下一次存活检查（最多一秒），被杀掉的窗口也一样；你运行 `:EitriPage` 时如果 Neovim 正卡在一个提示上，`eitri page` 会一直等着、不开窗口，直到它响应。
 - **GNOME 需要 Eitri GNOME Shell 扩展**才能移动焦点：由你自己启用，下次登录时生效（见[使用指南](guide/companion.zh-CN.md#gnome-the-extension)）。有了它：移动只在拥有焦点的窗口所在的显示器上进行；X11 或 XWayland 窗口永远不算数；在上一次移动之后大约三分之一秒内再移回去会被拒绝；所有窗口都跑在同一个进程里的终端（GNOME Terminal、Ptyxis）在交回焦点时会落到它最近使用的窗口，那未必是 nvim 所在的窗口；被转发的 `eitri split` 不会把面板带到前面；监视器的“带到前面”不起作用。
 
 ## 安全

@@ -80,6 +80,7 @@ impl Nvim {
             theme: bind("th.sock"),
             keys: bind("ky.sock"),
             pane_switch: bind("ps.sock"),
+            reload_always: false,
         };
         let nvim = Nvim {
             child,

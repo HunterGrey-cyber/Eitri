@@ -135,8 +135,10 @@ state.timer:start(500, 500, vim.schedule_wrap(function()
   if torn then
     return
   end
+  -- A closed channel has no id. nvim 0.10 answers it with a typed empty dictionary
+  -- ({[vim.type_idx] = vim.types.dictionary}), which next() does not see as empty.
   local ok, info = pcall(vim.api.nvim_get_chan_info, chan)
-  if ok and next(info) == nil then
+  if ok and info.id == nil then
     teardown()
   end
 end))

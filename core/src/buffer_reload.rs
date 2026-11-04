@@ -68,12 +68,13 @@ pub const RELOAD_INTERVAL_MS: u64 = 1000;
 ///   to vimscript, and a uv handle is userdata. A text assertion can miss a timer that never
 ///   starts; the real-nvim integration test checks that it runs.
 ///
-/// The same text is also what an injector loads into an nvim that is already running: the chunk
-/// returns a function that stops the timer, and leaves `_G.eitri_reload_timer` alone if it no longer
+/// Loaded as a chunk into an nvim that is already running, it returns a function that stops the
+/// timer, and leaves `_G.eitri_reload_timer` alone if it no longer
 /// holds this chunk's own timer.
 pub const RELOAD_CMD: &str = concat!("lua ", include_str!("buffer_reload.lua"));
 
-/// The timer as a chunk: one line, so the `--cmd` above can carry it verbatim.
+/// The timer as a chunk: one line, so the `--cmd` above can carry it verbatim (its tests read it).
+#[cfg(test)]
 pub(crate) const BUFFER_RELOAD_LUA: &str = include_str!("buffer_reload.lua");
 
 /// The two arguments to append to the nvim child's command line.
@@ -87,7 +88,7 @@ mod tests {
 
     #[test]
     fn reload_cmd_and_its_snippet_are_byte_identical_to_today() {
-        const SNIPPET: &str = r#"_G.eitri_reload_timer = vim.uv.new_timer(); local t = _G.eitri_reload_timer; _G.eitri_reload_timer:start(1000, 1000, function() vim.schedule(function() pcall(vim.cmd, 'checktime') end) end); return function() if not t:is_closing() then t:stop(); t:close() end; if _G.eitri_reload_timer == t then _G.eitri_reload_timer = nil end end"#;
+        const SNIPPET: &str = r#"_G.eitri_reload_timer = vim.uv.new_timer(); local t = _G.eitri_reload_timer; _G.eitri_reload_timer:start(1000, 1000, function() vim.schedule(function() local seen = {} for _, w in ipairs(vim.api.nvim_list_wins()) do pcall(function() if not vim.api.nvim_win_is_valid(w) then return end local b = vim.api.nvim_win_get_buf(w) if seen[b] or not vim.api.nvim_buf_is_valid(b) then return end seen[b] = true if vim.bo[b].modified then return end local ar = vim.api.nvim_get_option_value('autoread', { buf = b }) if ar == nil or ar == -1 then ar = vim.go.autoread end if ar ~= true and ar ~= 1 then return end vim.cmd('checktime ' .. b) end) end end) end); return function() if not t:is_closing() then t:stop(); t:close() end; if _G.eitri_reload_timer == t then _G.eitri_reload_timer = nil end end"#;
         assert_eq!(include_str!("buffer_reload.lua").as_bytes(), SNIPPET.as_bytes());
         assert_eq!(RELOAD_CMD.as_bytes(), [b"lua ".as_slice(), SNIPPET.as_bytes()].concat());
     }

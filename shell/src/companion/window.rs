@@ -71,6 +71,7 @@ fn page_context(
         control_dir: control_dir.to_owned(),
         exe: exe.to_owned(),
         exe_args: Vec::new(),
+        search: None,
     })
 }
 
@@ -424,6 +425,8 @@ pub(crate) fn build(app: &Application, start: &Start) -> Rc<CompanionWindow> {
             .borrow()
             .as_ref()
             .map(|channel| channel.socket_path().to_path_buf()),
+        // The panel's activity drives the reload timer through the link's busy and now calls.
+        reload_always: false,
     };
     // Whether an editor is attached: the context is nothing while it is not, and starts empty for
     // the next one (the cache otherwise keeps a gone editor's file and selection for good).

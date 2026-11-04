@@ -69,28 +69,49 @@ io.stdout:write("OK\n")
 LUA
 check ":EitriPanel with a failing launcher notifies an error" "$SCRATCH/fail.lua"
 
-# A panel that started moves its output to a log, so the pipe ends early; a later failure is reported with the
-# last line it wrote before that (where its log is).
+# A panel that started moves its output to a log, so the pipe ends early; a later end is a warning (an error on
+# display makes nvim pause) naming the exit code and the log, shown from `~` to keep the line short.
 cat >"$SCRATCH/late.lua" <<'LUA'
 local msgs = {}
 vim.notify = function(msg, level) table.insert(msgs, { msg, level }) end
 require("eitri").setup({ cmd = vim.env.EITRI_TEST_SCRIPT })
 vim.cmd("EitriPanel")
-assert(vim.wait(5000, function() return #msgs > 0 end, 20), "no error message after a late failure")
-assert(msgs[1][2] == vim.log.levels.ERROR)
-assert(msgs[1][1]:find("its output goes to /log/x.log", 1, true), "the log is not named: " .. msgs[1][1])
+assert(vim.wait(5000, function() return #msgs > 0 end, 20), "no message after a late failure")
+assert(msgs[1][2] == vim.log.levels.WARN, "a window that ran and ended is not a warning: " .. vim.inspect(msgs))
+assert(msgs[1][1] == "eitri panel: window ended (exit 4); log: ~/.local/state/eitri/companion/panel-ab.log",
+  "the end is not reported with its code and log: " .. msgs[1][1])
 io.stdout:write("OK\n")
 LUA
 cat >"$SCRATCH/late-eitri" <<'SH'
 #!/bin/sh
-echo "eitri panel: running; its output goes to /log/x.log" >&2
+echo "eitri panel: running; its output goes to $HOME/.local/state/eitri/companion/panel-ab.log" >&2
 exec 2>/dev/null
 sleep 0.3
 echo "lost" >&2
 exit 4
 SH
 chmod +x "$SCRATCH/late-eitri"
-EITRI_TEST_SCRIPT="$SCRATCH/late-eitri" check ":EitriPanel reports a failure after the panel left the pipe" "$SCRATCH/late.lua"
+EITRI_TEST_SCRIPT="$SCRATCH/late-eitri" check ":EitriPanel reports a window that ran and ended as a warning" "$SCRATCH/late.lua"
+
+# A refusal after the "running;" line is the last line the panel wrote: it stays an error carrying its text.
+cat >"$SCRATCH/refused.lua" <<'LUA'
+local msgs = {}
+vim.notify = function(msg, level) table.insert(msgs, { msg, level }) end
+require("eitri").setup({ cmd = vim.env.EITRI_TEST_SCRIPT })
+vim.cmd("EitriPanel")
+assert(vim.wait(5000, function() return #msgs > 0 end, 20), "no message after a refusal")
+assert(msgs[1][2] == vim.log.levels.ERROR, "a refusal is not an error: " .. vim.inspect(msgs))
+assert(msgs[1][1] == "eitri panel: the editor refused the panel; closing", "the refusal's text is lost: " .. msgs[1][1])
+io.stdout:write("OK\n")
+LUA
+cat >"$SCRATCH/refused-eitri" <<'SH'
+#!/bin/sh
+echo "eitri panel: running; its output goes to /log/x.log" >&2
+echo "eitri panel: the editor refused the panel; closing" >&2
+exit 3
+SH
+chmod +x "$SCRATCH/refused-eitri"
+EITRI_TEST_SCRIPT="$SCRATCH/refused-eitri" check ":EitriPanel reports a refusal after the running line as an error" "$SCRATCH/refused.lua"
 
 cat >"$SCRATCH/missing.lua" <<'LUA'
 local msgs = {}

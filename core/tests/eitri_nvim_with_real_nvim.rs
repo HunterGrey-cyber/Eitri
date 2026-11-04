@@ -22,6 +22,13 @@ fn check(case: &str, body: &str) {
         &stub,
         br##"#!/bin/sh
 printf '%s\n' "$@" >> "$ARGV_LOG"
+if [ -n "$STDOUT_LOG" ]; then readlink "/proc/$$/fd/1" >> "$STDOUT_LOG"; fi
+if [ -n "$REFUSED_AFTER" ]; then
+  echo "eitri $1: running; its output goes to /x/$1.log" >&2
+  echo "eitri $1: $REFUSED_AFTER" >&2
+  exit 3
+fi
+if [ -n "$RUNNING_THEN" ]; then echo "eitri $1: running; its output goes to ${LOG_DIR:-/x}/$1.log" >&2; exit "$RUNNING_THEN"; fi
 if [ "$1" = --version ]; then echo 'eitri 9.8.7'; exit 0; fi
 if [ "$2" = --list ]; then printf 'notes\npreview\n'; exit 0; fi
 if [ "$OLD_EITRI" = yes ]; then echo 'eitri: unknown option --nvim' >&2; exit 64; fi
@@ -155,6 +162,97 @@ require('eitri').page('notes')
 assert(vim.v.servername ~= '')
 assert(vim.wait(3000, function() return #argv() == 6 end))
 assert(argv()[4] == vim.v.servername)
+"#,
+    );
+}
+
+/// A window moves only a pipe into its log (a file or `/dev/null` is left alone), and a detached job with no
+/// `on_stdout` gets `/dev/null` for stdout: both the page and the panel are started with a stdout pipe, so
+/// what the window prints reaches its log too.
+#[test]
+#[ignore = "needs a real nvim with serverstart() socket access"]
+fn the_page_and_the_panel_start_with_a_stdout_pipe() {
+    check(
+        "stdout",
+        r#"
+vim.env.STDOUT_LOG = vim.fn.getcwd() .. '/stdout'
+local function links()
+  return vim.fn.filereadable(vim.env.STDOUT_LOG) == 1 and vim.fn.readfile(vim.env.STDOUT_LOG) or {}
+end
+require('eitri').page('notes')
+assert(vim.wait(3000, function() return #links() == 1 end), vim.inspect(links()))
+require('eitri').panel()
+assert(vim.wait(3000, function() return #links() == 2 end), vim.inspect(links()))
+for _, link in ipairs(links()) do
+  -- nvim 0.12 hands the job a pipe, 0.10 and 0.11 a socket pair; the window moves either off itself.
+  assert(link:match('^pipe:') or link:match('^socket:'), 'stdout was ' .. link)
+end
+"#,
+    );
+}
+
+/// A window that started and later ended (a crash, a kill) is news, not an error: an error message on display makes
+/// nvim pause about a second at its next redraw, in the middle of whatever the person is typing.
+#[test]
+#[ignore = "needs a real nvim with serverstart() socket access"]
+fn a_window_that_ran_and_ended_is_a_warning_naming_its_log() {
+    check(
+        "ended",
+        r#"
+local seen = {}
+vim.notify = function(text, level) table.insert(seen, {text = text, level = level}) end
+vim.env.RUNNING_THEN = '137'
+require('eitri').page('notes')
+assert(vim.wait(3000, function() return #seen == 1 end), vim.inspect(seen))
+require('eitri').panel()
+assert(vim.wait(3000, function() return #seen == 2 end), vim.inspect(seen))
+assert(vim.deep_equal(seen, {
+  {text = 'eitri page: window ended (exit 137); log: /x/page.log', level = vim.log.levels.WARN},
+  {text = 'eitri panel: window ended (exit 137); log: /x/panel.log', level = vim.log.levels.WARN},
+}), vim.inspect(seen))
+"#,
+    );
+}
+
+/// The warning is one short line in a narrow nvim: the log path is shown from `~`.
+#[test]
+#[ignore = "needs a real nvim with serverstart() socket access"]
+fn the_warning_shows_the_log_from_the_home_directory() {
+    check(
+        "home",
+        r#"
+local seen = {}
+vim.notify = function(text, level) table.insert(seen, {text = text, level = level}) end
+vim.env.RUNNING_THEN = '4'
+vim.env.LOG_DIR = vim.env.HOME .. '/.local/state/eitri/companion'
+require('eitri').page('notes')
+assert(vim.wait(3000, function() return #seen == 1 end), vim.inspect(seen))
+assert(vim.deep_equal(seen, {
+  {text = 'eitri page: window ended (exit 4); log: ~/.local/state/eitri/companion/page.log', level = vim.log.levels.WARN},
+}), vim.inspect(seen))
+"#,
+    );
+}
+
+/// What the window says after its "running;" line is the last line it wrote: a refusal found once it was up stays
+/// an error carrying that text, for the page and the panel alike.
+#[test]
+#[ignore = "needs a real nvim with serverstart() socket access"]
+fn a_refusal_after_the_running_line_stays_an_error_with_its_text() {
+    check(
+        "refused",
+        r#"
+local seen = {}
+vim.notify = function(text, level) table.insert(seen, {text = text, level = level}) end
+vim.env.REFUSED_AFTER = 'the editor refused the follow snippet; closing'
+require('eitri').page('notes')
+assert(vim.wait(3000, function() return #seen == 1 end), vim.inspect(seen))
+require('eitri').panel()
+assert(vim.wait(3000, function() return #seen == 2 end), vim.inspect(seen))
+assert(vim.deep_equal(seen, {
+  {text = 'eitri page: the editor refused the follow snippet; closing', level = vim.log.levels.ERROR},
+  {text = 'eitri panel: the editor refused the follow snippet; closing', level = vim.log.levels.ERROR},
+}), vim.inspect(seen))
 "#,
     );
 }

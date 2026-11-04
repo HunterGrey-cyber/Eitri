@@ -257,8 +257,8 @@ pane itself is resized (`stty size` shows the new numbers). The program never se
 
 A companion window (see [Companion mode](companion.md)) has no layout of its own, so there the prefix keeps
 the tab keys, `r`, `?`, `:`, `f`, the text size keys (`Ctrl+=`, `Ctrl+-`, `Ctrl+0`), sending the prefix itself
-or a `Ctrl+h/j/k/l` chord, and the arrow keys, which move toward the neighbouring window; every layout key answers
-`not in a companion window`.
+or a `Ctrl+h/j/k/l` chord, and the arrow keys, which move toward the neighbouring window; a layout or window key answers
+`not here: your window manager arranges this window` the first time you press one in that window, and nothing after.
 
 ### Containers and terminals
 

@@ -1,3 +1,5 @@
+#[path = "support/embed_client.rs"]
+mod embed_client;
 #[path = "support/embed_nvim.rs"]
 mod embed_nvim;
 
@@ -53,7 +55,7 @@ local cmd = vim.cmd
 _G.reload_checks = 0
 _G.reload_after_torn = 0
 vim.cmd = function(c)
-  if c == 'checktime' then
+  if type(c) == 'string' and c:match('^checktime') then
     _G.reload_checks = _G.reload_checks + 1
     if _G.saved_reload_slot and _G.saved_reload_slot.torn then
       _G.reload_after_torn = _G.reload_after_torn + 1
@@ -110,14 +112,25 @@ end
         self.nvim.exec_lua("return reload_checks", vec![]).as_u64().unwrap()
     }
 
-    fn handles(&self) -> u64 {
+    /// Open libuv handles, or `None` on nvim 0.10, where `vim.uv.walk` crashes an embedded nvim
+    /// (SIGSEGV on 0.10.4) and the counts are not taken.
+    fn handles(&self) -> Option<u64> {
         self.nvim
             .exec_lua(
-                "local n = 0; vim.uv.walk(function(h) if not h:is_closing() then n = n + 1 end end); return n",
+                "if vim.fn.has('nvim-0.11') == 0 then return nil end; local n = 0; vim.uv.walk(function(h) if not h:is_closing() then n = n + 1 end end); return n",
                 vec![],
             )
             .as_u64()
-            .unwrap()
+    }
+
+    /// Active 1 s timers, or `None` where `handles` gives none.
+    fn timers(&self) -> Option<u64> {
+        self.nvim
+            .exec_lua(
+                "if vim.fn.has('nvim-0.11') == 0 then return nil end; local n = 0; vim.uv.walk(function(h) if h:get_type() == 'timer' and h:is_active() and h:get_repeat() == 1000 then n = n + 1 end end); return n",
+                vec![],
+            )
+            .as_u64()
     }
 
     fn wait(&self, millis: u64) {
@@ -176,8 +189,8 @@ fn busy_reloads_a_file_changed_by_sed_within_1_5_s() {
     f.install(false);
     let before = f.handles();
     f.nvim.exec_lua("reload_part.calls.busy(true); reload_part.calls.busy(true); collectgarbage('collect'); collectgarbage('collect')", vec![]);
-    assert_eq!(f.handles(), before + 1);
-    assert_eq!(f.nvim.exec_lua("local n = 0; vim.uv.walk(function(h) if h:get_type() == 'timer' and h:is_active() and h:get_repeat() == 1000 then n = n + 1 end end); return n", vec![]).as_u64(), Some(1));
+    assert_eq!(f.handles(), before.map(|n| n + 1));
+    assert!(matches!(f.timers(), None | Some(1)), "one 1 s timer runs while busy");
     f.change_on_disk();
     assert_eq!(f.first_line(), "before");
     f.wait_for_reload();
@@ -200,7 +213,8 @@ fn a_modified_buffer_is_left_alone() {
     );
     f.change_on_disk();
     f.wait(1200);
-    assert!(f.checks() > 0);
+    assert!(matches!(f.timers(), None | Some(1)), "the timer is running");
+    assert_eq!(f.checks(), 0, "a modified buffer is not checked");
     assert_eq!(f.first_line(), "unsaved edit");
     assert_eq!(f.nvim.exec_lua("return vim.bo.modified", vec![]).as_bool(), Some(true));
 }
@@ -225,7 +239,7 @@ fn busy_off_reloads_once_then_closes_the_timer() {
     f.install(false);
     let before = f.handles();
     f.nvim.exec_lua("reload_part.calls.busy(true)", vec![]);
-    assert_eq!(f.handles(), before + 1);
+    assert_eq!(f.handles(), before.map(|n| n + 1));
     f.change_on_disk();
     let checks = f.checks();
     f.nvim.exec_lua("reload_part.calls.busy(false)", vec![]);
@@ -306,11 +320,11 @@ fn always_keeps_the_timer_on_through_busy_off() {
     let f = FileBuffer::new();
     let before = f.handles();
     f.install(true);
-    assert_eq!(f.handles(), before + 1);
+    assert_eq!(f.handles(), before.map(|n| n + 1));
     f.nvim
         .exec_lua("reload_part.calls.busy(true); reload_part.calls.busy(false)", vec![]);
     assert_eq!(f.checks(), 0, "always mode ignores busy changes");
-    assert_eq!(f.handles(), before + 1);
+    assert_eq!(f.handles(), before.map(|n| n + 1));
     f.change_on_disk();
     f.wait_for_reload();
     f.nvim.exec_lua("reload_part.teardown()", vec![]);
@@ -389,11 +403,13 @@ assert(chan > 0, 'a helper starts over stdio')
 local result = vim.rpcrequest(chan, 'nvim_exec_lua', [[
   assert(vim.v.vim_did_enter == 1, 'startup has completed')
   reload_part.calls.busy(false)
-  local timers = 0
-  vim.uv.walk(function(h)
-    if h:get_type() == 'timer' and h:is_active() and h:get_repeat() == 1000 then timers = timers + 1 end
-  end)
-  assert(timers == 1, 'the early install keeps its one timer')
+  if vim.fn.has('nvim-0.11') == 1 then
+    local timers = 0
+    vim.uv.walk(function(h)
+      if h:get_type() == 'timer' and h:is_active() and h:get_repeat() == 1000 then timers = timers + 1 end
+    end)
+    assert(timers == 1, 'the early install keeps its one timer')
+  end
   assert(_G.eitri_reload_timer == nil, 'the timer belongs only to the part')
   assert(#vim.api.nvim_get_autocmds({group='EitriBufferReload', event='FocusGained'}) == 1)
   reload_part.teardown()
@@ -406,4 +422,128 @@ return result
         ).as_bool(),
         Some(true)
     );
+}
+
+/// An nvim with a UI attached (80x24), `f.txt` (`one`, `two`) open, and the reload part loaded with `opts`
+/// as `_G.rp`. Under a UI, `checktime` on a modified buffer is a `W12` dialog and on a `noautoread` one a
+/// `W11` dialog, each taking the person's next keys.
+fn ui_with_part(label: &str, always: bool) -> (embed_client::Embed, PathBuf, PathBuf) {
+    use embed_client::{opts_map, Embed};
+
+    let scratch = std::path::Path::new(env!("CARGO_TARGET_TMPDIR")).join(format!("rp-{label}-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&scratch);
+    std::fs::create_dir_all(&scratch).unwrap();
+    let file = scratch.join("f.txt");
+    std::fs::write(&file, "one\ntwo\n").unwrap();
+    let mut nvim = Embed::start(&scratch, &[], &[]);
+    nvim.wait_until("VimEnter", |n| n.eval("v:vim_did_enter").as_i64() == Some(1));
+    nvim.request(
+        "nvim_ui_attach",
+        vec![
+            Value::from(80),
+            Value::from(24),
+            opts_map(&[("ext_linegrid", Value::from(true))]),
+        ],
+    );
+    nvim.command(&format!("edit {}", file.display()));
+    nvim.lua(
+        "local src, opts = ...; _G.rp = assert(loadstring(src))(opts)",
+        vec![Value::from(reload_source()), opts(always)],
+    );
+    (nvim, scratch, file)
+}
+
+/// `nvim_get_mode`'s mode and whether nvim is blocked waiting for input.
+fn ui_mode(nvim: &mut embed_client::Embed) -> (String, bool) {
+    let m = nvim.request("nvim_get_mode", vec![]);
+    let get = |key: &str| {
+        m.as_map()
+            .and_then(|entries| entries.iter().find(|(k, _)| k.as_str() == Some(key)))
+            .map(|(_, v)| v.clone())
+    };
+    (
+        get("mode")
+            .and_then(|v| v.as_str().map(str::to_string))
+            .unwrap_or_default(),
+        get("blocking").and_then(|v| v.as_bool()).unwrap_or(false),
+    )
+}
+
+/// A person typing in insert mode in their own terminal nvim while an agent's turn changes the file
+/// stays in insert mode: the timer's tick leaves the modified buffer alone, with no dialog.
+#[test]
+#[ignore = "needs a real nvim on PATH; spends no tokens and needs no display"]
+fn typing_while_the_timer_runs_meets_no_dialog() {
+    let (mut nvim, scratch, file) = ui_with_part("typ", true);
+    nvim.input("ix");
+    nvim.wait_until("insert mode", |n| ui_mode(n).0 == "i");
+    std::fs::write(&file, "DISK\nchange\n").unwrap();
+    std::thread::sleep(std::time::Duration::from_millis(2500));
+    assert_eq!(ui_mode(&mut nvim), ("i".to_string(), false), "a dialog met the typing");
+    nvim.input("<Esc>");
+    nvim.wait_until("normal mode", |n| ui_mode(n).0 == "n");
+    assert_eq!(
+        nvim.eval("getline(1)").as_str(),
+        Some("xone"),
+        "the typed text was lost"
+    );
+    nvim.lua("rp.teardown()", vec![]);
+    nvim.quit();
+    let _ = std::fs::remove_dir_all(&scratch);
+}
+
+/// The turn-end and focus reload (`now`) meets a modified buffer the same way: no dialog.
+#[test]
+#[ignore = "needs a real nvim on PATH; spends no tokens and needs no display"]
+fn a_turn_end_on_a_modified_buffer_meets_no_dialog() {
+    let (mut nvim, scratch, file) = ui_with_part("now", false);
+    nvim.input("ix");
+    nvim.wait_until("insert mode", |n| ui_mode(n).0 == "i");
+    std::fs::write(&file, "DISK\nchange\n").unwrap();
+    std::thread::sleep(std::time::Duration::from_millis(1100));
+    nvim.lua("vim.schedule(function() rp.calls.now() end)", vec![]);
+    std::thread::sleep(std::time::Duration::from_millis(300));
+    assert_eq!(ui_mode(&mut nvim), ("i".to_string(), false), "a dialog met the typing");
+    nvim.input("<Esc>");
+    nvim.wait_until("normal mode", |n| ui_mode(n).0 == "n");
+    assert_eq!(
+        nvim.eval("getline(1)").as_str(),
+        Some("xone"),
+        "the typed text was lost"
+    );
+    nvim.lua("rp.teardown()", vec![]);
+    nvim.quit();
+    let _ = std::fs::remove_dir_all(&scratch);
+}
+
+/// With `autoread` off the person chose no automatic reload: the part leaves such a buffer alone and
+/// raises no `W11` dialog, while an unmodified buffer shown beside it still reloads.
+#[test]
+#[ignore = "needs a real nvim on PATH; spends no tokens and needs no display"]
+fn a_noautoread_buffer_meets_no_dialog_and_is_not_reloaded() {
+    let (mut nvim, scratch, file) = ui_with_part("noar", true);
+    let other = scratch.join("g.txt");
+    std::fs::write(&other, "three\n").unwrap();
+    nvim.command("setlocal noautoread");
+    nvim.command(&format!("vsplit {}", other.display()));
+    std::thread::sleep(std::time::Duration::from_millis(1100));
+    std::fs::write(&file, "DISK\nchange\n").unwrap();
+    std::fs::write(&other, "DISK too\n").unwrap();
+    nvim.wait_until("the other buffer's reload", |n| {
+        n.eval("getline(1)").as_str() == Some("DISK too")
+    });
+    std::thread::sleep(std::time::Duration::from_millis(1200));
+    assert_eq!(ui_mode(&mut nvim), ("n".to_string(), false), "a dialog met the buffer");
+    assert_eq!(
+        nvim.lua(
+            "return vim.api.nvim_buf_get_lines(vim.fn.bufnr(...), 0, 1, false)[1]",
+            vec![Value::from(file.to_str().unwrap())]
+        )
+        .as_str(),
+        Some("one"),
+        "a noautoread buffer was reloaded"
+    );
+    nvim.lua("rp.teardown()", vec![]);
+    nvim.quit();
+    let _ = std::fs::remove_dir_all(&scratch);
 }

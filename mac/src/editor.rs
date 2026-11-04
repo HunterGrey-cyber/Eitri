@@ -185,6 +185,8 @@ impl Editor {
             theme: theme_feed.as_ref().map(|feed| feed.socket_path().to_path_buf()),
             keys: keys_feed.as_ref().map(|feed| feed.socket_path().to_path_buf()),
             pane_switch: pane_switch.as_ref().map(|channel| channel.socket_path().to_path_buf()),
+            // This host sends the reload part no busy or now calls, so its timer stays on while attached.
+            reload_always: true,
         };
 
         // Every reader is added at once: the consumer of each is `poll`'s caller.

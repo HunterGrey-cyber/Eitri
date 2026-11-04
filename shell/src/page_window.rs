@@ -530,6 +530,7 @@ pub(crate) fn wire(wiring: Wiring) {
                     control_dir: control_dir.clone(),
                     exe: exe.clone(),
                     exe_args: Vec::new(),
+                    search: None,
                 }
             }),
             raise_editor: Rc::new(move |pid| runner.raise_editor(pid)),
@@ -618,6 +619,9 @@ pub(crate) struct BesideCtx {
     /// but in a test).
     pub exe: PathBuf,
     pub exe_args: Vec<OsString>,
+    /// Where a page's plugin is looked for before its window starts, so a refusal is said in this window rather than
+    /// lost with the child's stderr; `None` reads this process's environment when the op runs.
+    pub search: Option<SearchEnv>,
 }
 
 /// What [`carry_out`] leaves for the main loop: raises go through the window's own adapter, which never blocks.
@@ -641,11 +645,16 @@ pub(crate) fn carry_out(op: &BesideOp, ctx: &BesideCtx) -> Result<Carried, Strin
                 Forwarded::NoneListening => start(ctx, "the agent window", vec!["panel".into(), "--nvim".into(), nvim]),
             }
         }
-        BesideOp::Page(id) => start(
-            ctx,
-            "the page window",
-            vec!["page".into(), id.into(), "--nvim".into(), nvim],
-        ),
+        BesideOp::Page(id) => {
+            // The child would refuse the same way, but its stderr goes nowhere this window shows.
+            let search = ctx.search.clone().unwrap_or_else(SearchEnv::from_process);
+            check_plugin(id, &search).map_err(|(_, why)| named(&why))?;
+            start(
+                ctx,
+                "the page window",
+                vec!["page".into(), id.into(), "--nvim".into(), nvim],
+            )
+        }
         BesideOp::RaiseEditor if ctx.in_tmux => Err(eitri_core::wm::feedback::BESIDE_TMUX_TEXT.to_owned()),
         BesideOp::RaiseEditor => ctx
             .nvim_pid
@@ -753,6 +762,23 @@ mod tests {
             self.0.join(name)
         }
 
+        /// Writes plugin `id` declaring `caps` under the scratch data directory; the search that finds it and no other.
+        fn plugin(&self, id: &str, caps: &str) -> SearchEnv {
+            let dir = self.path("data/eitri/plugins").join(id);
+            std::fs::create_dir_all(dir.join("site")).unwrap();
+            std::fs::write(
+                dir.join("eitri-plugin.toml"),
+                format!("id = \"{id}\"\ntitle = \"T\"\nprotocol = 1\nsite = \"site\"\nentry = \"index.html\"\ncapabilities = {caps}\n"),
+            )
+            .unwrap();
+            std::fs::write(dir.join("site/index.html"), "<p>x</p>\n").unwrap();
+            SearchEnv {
+                xdg_data_home: Some(self.path("data").into_os_string()),
+                xdg_data_dirs: Some(self.path("none").into_os_string()),
+                ..Default::default()
+            }
+        }
+
         /// A shell script the test runs as `/bin/sh <script>`: nothing the test writes is ever exec'd itself.
         fn stub(&self, body: &str) -> OsString {
             let path = self.path("stub.sh");
@@ -785,6 +811,7 @@ mod tests {
             control_dir: scratch.path("eitri"),
             exe: PathBuf::from("/bin/sh"),
             exe_args: vec![stub],
+            search: Some(scratch.plugin("sketch", "[\"net\"]")),
         }
     }
 
@@ -851,6 +878,25 @@ mod tests {
             carry_out(&BesideOp::Page("sketch".into()), &ctx).is_err(),
             "a child that ends at once is said"
         );
+    }
+
+    /// A page that cannot open beside nvim, or is not on the search path, is said by name in the window whose key
+    /// asked for it, and nothing is started.
+    #[test]
+    fn a_page_op_names_a_refusal_and_starts_nothing() {
+        let scratch = Scratch::new("refused");
+        let stub = scratch.stub(&format!("printf started > '{}'\n", scratch.path("started").display()));
+        let ctx = ctx(&scratch, stub);
+        scratch.plugin("snotra", "[\"tasks\"]");
+        assert_eq!(
+            carry_out(&BesideOp::Page("snotra".into()), &ctx),
+            Err("eitri page: snotra needs Eitri's own window (it declares tasks)".to_owned())
+        );
+        assert_eq!(
+            carry_out(&BesideOp::Page("nope".into()), &ctx),
+            Err("eitri page: no plugin \"nope\" on the plugin search path".to_owned())
+        );
+        assert!(!scratch.path("started").exists(), "nothing started for a refused page");
     }
 
     /// Inside tmux the editor's window cannot be found from nvim's pid: nothing is raised, and the refusal is the

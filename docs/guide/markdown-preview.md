@@ -194,13 +194,32 @@ eitri.layout.rule("lua:markdown", { at = "right", size = 0.45, focus = false })
 opens](configuration.md#where-a-new-module-opens)). A value an option does not accept is refused and listed when
 Eitri starts, naming it.
 
+## Beside your own Neovim
+
+If you edit in your own Neovim rather than in Eitri's window, the preview can open as a window of its own beside it. From
+Neovim, with [eitri.nvim](companion.md#the-eitrinvim-plugin) installed, type `:EitriPage markdown`; from a shell,
+`eitri page markdown --nvim <address>` (the address defaults to `$NVIM` inside Neovim's own terminal). No `eitri.plugin.load`
+line is needed: typing the command is the permission to load the plugin with its default settings, and if your `init.lua`
+does load it with options, those are used.
+
+The window follows the buffer of the Neovim it started with, in your colourscheme's colours, and a second `:EitriPage markdown`
+from that Neovim raises it instead of opening another. `Enter` on a block still moves Neovim's cursor there and brings the
+Neovim window forward. A window manager places the window; Eitri moves nothing.
+
+Here the plugin's commands exist only while the window does. `:EitriMarkdown` brings an open window forward, and
+`:EitriMarkdownHide` and `:EitriMarkdownToggle` close it and take the commands with them, so afterwards `:EitriMarkdown` fails with
+Neovim's own `E492: Not an editor command`. `:EitriPage markdown` opens the window again. With `auto = true` the preview follows
+the Markdown buffers you enter without coming forward or taking the keys. The window starts, lives and ends as
+[Pages beside your nvim](companion.md#pages-beside-your-nvim) describes.
+
 ## Limits
 
 - A document over 4 MB or 50,000 lines is not rendered; the preview says `This document is too large to preview`, with
   the document's size and the limits. Neovim is not affected.
 - Over 512 KB the preview updates at most once a second while you type.
-- Editing in the preview, exporting to PDF or HTML, wiki links and slides are not part of the preview. Plugin pages
-  are not available in the companion window.
+- Editing in the preview, exporting to PDF or HTML, wiki links and slides are not part of the preview. The agent panel
+  beside your own Neovim (the [companion window](companion.md)) does not draw plugin pages in itself; the preview opens
+  there as its own window, as the section above describes.
 
 ## Your own copy
 

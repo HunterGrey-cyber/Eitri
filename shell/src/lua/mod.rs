@@ -190,6 +190,7 @@ impl LuaEngine {
     }
 
     /// How many loads `init.lua` made of plugins other than the page's own.
+    #[cfg(test)]
     pub(crate) fn other_loads(&self) -> usize {
         self.page.as_ref().map_or(0, |page| page.others.get())
     }

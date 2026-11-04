@@ -47,8 +47,12 @@ local groups = {}
 for _, group in ipairs(vim.fn.getcompletion('', 'augroup')) do
   if pcall(vim.api.nvim_get_autocmds, {group = group}) then groups[#groups + 1] = group end
 end
-local handles = 0
-vim.uv.walk(function(h) if not h:is_closing() then handles = handles + 1 end end)
+-- vim.uv.walk crashes an embedded nvim 0.10 (SIGSEGV on 0.10.4), so handles are counted from 0.11 on.
+local handles = vim.NIL
+if vim.fn.has('nvim-0.11') == 1 then
+  handles = 0
+  vim.uv.walk(function(h) if not h:is_closing() then handles = handles + 1 end end)
+end
 return plain({
   globals = vim.fn.eval('g:'), commands = plain(vim.api.nvim_get_commands({ builtin = false })),
   augroups = groups, autocmds = plain(autocmds), maps = maps, options = options,

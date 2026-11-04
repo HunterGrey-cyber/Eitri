@@ -1,5 +1,5 @@
 [English](keys.md) | 简体中文
-<!-- translated-from: keys.md sha256=ff9c8573fcdc19aad73d6e57015aed7c1d61a4a2a5dc0b7321f7f4b0f759ff7e -->
+<!-- translated-from: keys.md sha256=1e65bac01cb9d614590f144eef4204bbc11d90d3f5a63f21fc248d586928bbad -->
 
 # 按键
 
@@ -197,7 +197,7 @@ Eitri 完全无法执行的调用（读不懂的键、不认识的动作、对�
 
 终端用编辑器的字体绘制，也就是你的 `guifont` 里的字体和字号（在 `init.lua` 里设 `terminal.font` 可以改，见[配置](configuration.zh-CN.md#settings)），并以同样的方式跟着窗口的文字大小走：`Ctrl+=` 让它和其他模块一起变大；在终端上 `Ctrl+wheel`，或在终端里按 `<prefix> Ctrl+=`，只改终端，直到在那里按 `Ctrl+0` 或 `<prefix> Ctrl+0`。窗口里所有终端是同一个大小，就像所有聊天视图是同一个大小。改字号就是给 shell 换一个网格：字越大，行数和列数越少，里面运行的程序会收到通知，和窗格本身改变大小时一样（`stty size` 会显示新的数字）。这些键和 `Ctrl+wheel` 程序本身收不到。
 
-companion 窗口（见 [Companion 模式](companion.zh-CN.md)）没有自己的布局，所以那里的前缀只保留标签页键、`r`、`?`、`:`、`f`、文字大小键（`Ctrl+=`、`Ctrl+-`、`Ctrl+0`）、发送前缀本身或某个 `Ctrl+h/j/k/l` 组合键，以及方向键（它们朝相邻的窗口移动）；每个布局键都回答 `not in a companion window`。
+companion 窗口（见 [Companion 模式](companion.zh-CN.md)）没有自己的布局，所以那里的前缀只保留标签页键、`r`、`?`、`:`、`f`、文字大小键（`Ctrl+=`、`Ctrl+-`、`Ctrl+0`）、发送前缀本身或某个 `Ctrl+h/j/k/l` 组合键，以及方向键（它们朝相邻的窗口移动）；布局键或窗口键在那个窗口里第一次按下时回答 `not here: your window manager arranges this window`，之后什么都不说。
 
 <a id="containers-and-terminals"></a>
 ### 容器和终端

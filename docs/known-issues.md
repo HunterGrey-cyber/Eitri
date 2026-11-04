@@ -161,6 +161,14 @@ one-window mode.
 - **At sway's edge the key is consumed.** Eitri has to take or release `Ctrl+h/j/k/l` before it can ask sway
   whether a window lies that way, so at the edge the key does nothing, as tmux's own `select-pane` does at its edge.
 - **KDE: no focus moves.** A Wayland client cannot take focus there; use the desktop's own window keys.
+- **Pages beside your nvim** (`eitri page`, `:EitriPage`; [the guide](guide/companion.md#pages-beside-your-nvim)) have been through tests only, not yet
+  a run in a window. Still owed: a pass in an isolated headless desktop with a real Neovim in a terminal (the page's colours, the
+  follow, the keys, closing, `kill -9`, nvim inside tmux), Hyprland 0.56.2 and 0.57 in a virtual machine, niri, KDE, GNOME
+  with the extension, real hardware, and nvim 0.10 (the floor) and 0.11, which have not been run. The buffer reload that runs
+  while the agent works, and the reload on focus (which in tmux needs `set -g focus-events on`), are in the same state.
+- **A page window closes slowly in two cases.** A graceful close leaves its slot in your Neovim until Neovim's next liveness
+  check (up to a second), as a killed window does; and a Neovim that is blocked at a prompt when you run `:EitriPage` keeps
+  `eitri page` waiting, with no window, until it answers.
 - **GNOME needs the Eitri GNOME Shell extension** for focus moves, enabled by you and loaded at your next login
   ([the guide](guide/companion.md#gnome-the-extension)). With it: moves stay on the focused window's monitor; an X11 or
   XWayland window never counts; moving back within about a third of a second of the previous move is refused; a

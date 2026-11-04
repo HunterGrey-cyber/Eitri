@@ -4,13 +4,14 @@ English | [简体中文](companion.zh-CN.md)
 
 Eitri can also run as the agent panel alone: a separate window next to the Neovim you already use, in a
 terminal (inside tmux or not), in upstream Neovide, or in any other Neovim GUI. This page covers how to start
-it, how focus moves between the two windows, and what each desktop needs. The window you get from plain
+it, how focus moves between the two windows, how a plugin page such as the Markdown preview opens beside your Neovim on
+its own, and what each desktop needs. The window you get from plain
 `eitri` is described in [Getting started](getting-started.md); the panel's own keys are the same in both, and
 [Keys](keys.md) lists them.
 
 The panel attaches to your Neovim over its RPC socket and installs a little glue inside it: the file you have
 open and your Visual selection go to the agent, the panel takes your colorscheme and shows your which-key keys,
-buffers reload after the agent edits them, a file opens at a line from the panel, `Ctrl+g` edits a draft in
+buffers reload while the agent works (see [Buffers reload](#buffers-reload)), a file opens at a line from the panel, `Ctrl+g` edits a draft in
 Neovim, and `<leader>ae` in Visual mode sends you to the panel's box with the selection attached and
 `Edit the selection: ` ready to finish (where the window manager can be asked to bring the panel forward; elsewhere use your
 desktop's own window keys). It removes all of it again when the panel goes away. Nothing is written to your Neovim configuration.
@@ -29,18 +30,22 @@ of the installed files. With lazy.nvim, point a spec at the directory:
 
 ```lua
 -- .deb, .rpm, AUR
-{ dir = "/usr/share/eitri/nvim/eitri.nvim", cmd = "EitriPanel" },
+{ dir = "/usr/share/eitri/nvim/eitri.nvim", cmd = { "EitriPanel", "EitriPage" } },
 
 -- the tarball installer (install.sh)
-{ dir = vim.fn.expand("~/.local/share/eitri/eitri.nvim"), cmd = "EitriPanel" },
+{ dir = vim.fn.expand("~/.local/share/eitri/eitri.nvim"), cmd = { "EitriPanel", "EitriPage" } },
 ```
 
 Without a plugin manager, add the directory to `runtimepath`:
 `set runtimepath+=/usr/share/eitri/nvim/eitri.nvim`.
 
 Calling `require("eitri").setup({ ... })` is optional. `mapping = "<leader>ep"` binds a normal-mode key to
-the command, and `cmd = "/path/to/eitri"` names the launcher when it is not on Neovim's `PATH`. `:help
-eitri.nvim` has the same in Neovim.
+the command, `page_mappings = { ["<leader>em"] = "markdown" }` binds normal-mode keys to
+[pages beside your nvim](#pages-beside-your-nvim) (none by default), and `cmd = "/path/to/eitri"` names the launcher when it
+is not on Neovim's `PATH`. `:help eitri.nvim` has the same in Neovim, and `:checkhealth eitri` finds the program, prints its
+version and lists the page ids. Nothing of Eitri runs in your Neovim until you use one of the commands. A lazy.nvim
+spec that names only `EitriPanel`, as this page used to show, leaves `:EitriPage` undefined until the panel has been
+opened once: name both commands, as above.
 
 `:EitriPanel` opens the panel for the current working directory, and `:EitriPanel ~/some/project` for another.
 If Neovim has no server address yet, the plugin starts one. The panel's band says `attaching…` until the glue
@@ -72,8 +77,11 @@ so a window rule can pick it out. It reads the same `$XDG_CONFIG_HOME/eitri/init
 `~/.config/eitri/init.lua`) as the one-window mode (`agent.account` applies); Lua panels and commands registered there
 are not shown, and one line in the panel's output says how many were left out. It has no editor, no bottom terminal
 and no layout of its own: the tab keys, `r`, `?`, `:`, the text size keys, `f`, sending the prefix itself and the
-arrow keys (toward the neighbouring window) work under the prefix, and the layout keys answer
-`not in a companion window`.
+arrow keys (toward the neighbouring window) work under the prefix, and a layout or window key answers
+`not here: your window manager arranges this window` the first time you press one in a window (later presses say nothing).
+A key you gave a plugin page with `eitri.plugin.load("markdown", { key = "b" })` in `init.lua` opens or raises
+that [page's own window](#pages-beside-your-nvim) for the attached Neovim; with no Neovim attached it says
+`no editor attached: run :EitriPanel in nvim`.
 
 ### Moving between the two windows
 
@@ -94,6 +102,25 @@ In the panel:
 
 Opening a file from the panel opens it in your Neovim and raises the editor's window (not from inside tmux,
 see below). A second `:EitriPanel` raises the panel.
+
+**`Ctrl+l` with a split to the right.** The key moves inside Neovim first: with another Neovim window to the right
+it goes there, and only at the right edge does it go to the panel (the same for the other three directions). That holds in Normal and Visual mode, and in Insert mode for `Ctrl+l`. Where Eitri takes Neovim's own default `Ctrl+l`, that key no
+longer clears the highlight and redraws, as with vim-tmux-navigator; map `:nohlsearch | diffupdate | redraw` to a key
+of your own if you want it back.
+
+**A key mapped by hand.** If you map a key yourself rather than through a navigator plugin, run the window move
+first and hand the move to the panel only when it did not move, because `require("eitri").edge` does not look at
+Neovim's windows:
+
+```lua
+vim.keymap.set("n", "<C-l>", function()
+  local before = vim.fn.winnr()
+  vim.cmd.wincmd("l")
+  if vim.fn.winnr() == before then
+    require("eitri").edge("right")
+  end
+end)
+```
 
 ### Navigator plugins and tmux
 
@@ -122,7 +149,94 @@ vim-tmux-navigator there is then no crossing to the panel window (use a binding 
 window manager's keys); with smart-splits.nvim, the `at_edge` hook above hands a move at tmux's own edge to the
 panel. Neither has been tried on real hardware yet (see [known issues](../known-issues.md#companion-mode)). The
 editor's window is not raised when you open a file from the panel, because from inside tmux the process tree
-leads to the tmux server, not to the terminal.
+leads to the tmux server, not to the terminal. Neovim inside tmux also hears of focus changes only with
+`set -g focus-events on` in your `tmux.conf`; without it the reload on focus, described next, does not happen.
+
+### Buffers reload
+
+While the agent is working (a turn is running, or a background task it started), Neovim checks once a second whether
+a file changed on disk and reloads the buffers you have not touched. It also checks once at the end of every turn, when
+the panel detaches or closes (so a panel killed mid-turn still reloads what it wrote last), and when Neovim gets focus
+back. Outside those times nothing polls. A buffer you have changed yourself is left alone, with Neovim's own warning.
+Two cases are not covered: when you replace one panel with another in the middle of a turn, files the first panel's
+turn writes afterwards are reloaded at the new panel's next busy moment, on focus, or by hand; and a program the agent
+started that keeps writing after the panel was killed is not reloaded either.
+
+## Pages beside your nvim
+
+A plugin page, such as the [Markdown preview](markdown-preview.md), can also open as a window of its own next to your
+Neovim, with no agent panel. It follows the buffer of the Neovim it started with. Start it from a shell or from Neovim:
+
+```sh
+eitri page <id> [--nvim <addr>] [DIR]
+eitri page --list
+```
+
+```vim
+:EitriPage markdown
+:EitriPage markdown ~/some/project
+```
+
+- `--nvim` and `DIR` are as for `eitri panel`: `--nvim` defaults to `$NVIM` and is required when that is unset, a path
+  to a Unix socket you own; `DIR` is the project. `--account`, `--quiet`, `--clean`, `--legacy` and `--new-window` are
+  refused. `:EitriPage {id} [dir]` completes plugin ids, then directories, and `require("eitri").page("markdown")` is the
+  call for a key of your own. `eitri page --list` prints the ids that can open this way, one per line.
+- Typing the command is the permission to load that plugin: by id, with its default settings, unless your `init.lua`
+  loads it with options (`eitri.plugin.load("markdown", { ... })`), which are then used. Other plugins `init.lua` loads are
+  not built in this window (one line in its log says how many). It has no Lua panels or commands. A key you gave
+  another page starts or raises that page's window.
+- Only plugins that ask for no more than these abilities open this way: following the editor's buffer
+  (`editor.follow`), defining Neovim commands (`editor.commands`), opening files (`editor.open`), keeping state and
+  reaching the network. A plugin that needs more says so and nothing opens:
+  `eitri page: <id> needs Eitri's own window (it declares <capability>)`, exit status 64. The Markdown preview qualifies.
+- A page window starts only when the plugin is on the plugin search path (`eitri page: no plugin "<id>" on the plugin
+  search path`, exit 1). `eitri page: could not attach: <reason>` (exit 1) means it could not reach your Neovim.
+- There is one page window per Neovim and plugin: a second `:EitriPage markdown` from the same Neovim raises the window
+  that is running. The same command from another Neovim opens a second window that follows that one.
+- You can also open a page from the agent window: the prefix and the page's key. In a page window the prefix and
+  `a` raises the project's agent window, or starts one for this Neovim when none runs; an agent window attached to another
+  Neovim keeps it. The prefix and `e` raises the window that holds your Neovim.
+
+**What it puts in your Neovim.** A small slot of its own (`_G.__eitri_pages`): the page's colours follow your
+colorscheme, and the plugin's own commands exist only while the window does (for Markdown: `:EitriMarkdown`,
+`:EitriMarkdownToggle`, `:EitriMarkdownHide`). It defines no keys, maps nothing on `Ctrl+h/j/k/l`, makes no scratch
+buffers, reloads nothing, and never replaces a command of your own with the same name. The agent window's glue and each page's
+slot are independent: closing or killing one removes that one and nothing else, and the agent's `Ctrl+g` draft is never shown
+in the preview.
+
+**How it ends.**
+- Close it with your window manager, the prefix and `x`, or `:EitriMarkdownHide` / `:EitriMarkdownToggle`: it closes without
+  asking, and its slot leaves your Neovim.
+- `:qa` in Neovim closes the page window (exit status 0, `[page] the editor went away; closing` in its log); the agent window
+  stays, showing `editor detached`.
+- If the window is killed, its slot is gone from your Neovim within a second or two; a Neovim that is blocked at a prompt removes it once it answers again.
+
+**What hide and toggle mean here.** The plugin's commands live in the slot, and the slot goes with the window. So after
+`:EitriMarkdownHide` or `:EitriMarkdownToggle` the window is closed, and `:EitriMarkdownToggle` cannot bring it back:
+`:EitriMarkdown` then fails with Neovim's own `E492: Not an editor command`. `:EitriPage markdown` opens it again.
+While it is open, `:EitriMarkdown` raises it, and with `auto = true` the preview follows the buffers you enter without taking
+focus or coming forward.
+
+**Keys in a page window.** The page's own keys work as in any window (`?` in the page lists them; `<prefix> ?` says
+`the page's own ? lists its keys`). `Enter` on a heading moves your Neovim's cursor there and brings the editor's window
+forward.
+
+| key | what happens |
+|---|---|
+| a layout, window, workspace or float key | `not here: your window manager arranges this window` the first time, nothing after |
+| a chat key (tab keys, `r`, `:`) | `no chat here: press the prefix and a to open the agent` the first time |
+| prefix `e` | raises your Neovim's window; inside tmux it says `your nvim runs inside tmux: use your window manager's keys to reach it` once |
+| prefix `a` | raises the agent window, or starts one |
+| prefix `x`, text size, `f` | as in any module window |
+| `Ctrl+h/j/k/l` past the page's edge | your window manager moves focus |
+
+**Where it is refused.** In Eitri's own Neovim, which opens pages itself: `this window opens pages itself: press the prefix
+and the page's key`. In a Neovim that Eitri has taken over: `this nvim is open in an Eitri window: its pages open there`
+(exit status 64, no window).
+
+The window's application id is `cn.huntergrey.eitri.Page` and its title is `<project> — <plugin title> · Eitri`, so one window
+rule covers it. Eitri moves nothing: the window manager places it. Started from Neovim, its output goes to
+`$XDG_STATE_HOME/eitri/companion/page-<16 hex>.log` (default `~/.local/state/eitri/companion/`).
 
 ## Two windows from one command: eitri split
 

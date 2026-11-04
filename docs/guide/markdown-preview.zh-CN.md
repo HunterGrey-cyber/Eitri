@@ -1,5 +1,5 @@
 [English](markdown-preview.md) | 简体中文
-<!-- translated-from: markdown-preview.md sha256=8ef4e4163da8a515e341d8ee45947f0f6114e64123b4cb1602f38066ff1d5d25 -->
+<!-- translated-from: markdown-preview.md sha256=91343e5813acc90b395eba09de24412fb6f71060a2e0516343d3e24b85856b90 -->
 
 # Markdown 预览
 
@@ -143,12 +143,21 @@ eitri.layout.rule("lua:markdown", { at = "right", size = 0.45, focus = false })
 
 和任何模块一样，`eitri.layout.rule` 决定预览在哪里打开（[新模块开在哪里](configuration.zh-CN.md#where-a-new-module-opens)）。选项不接受的值会被拒绝，Eitri 在启动时把它列出来并点出它的名字。
 
+<a id="beside-your-own-neovim"></a>
+## 开在你自己的 Neovim 旁边
+
+如果你编辑用的是自己的 Neovim，而不是 Eitri 的窗口，预览可以单独成为一个窗口，开在它旁边。装好 [eitri.nvim](companion.zh-CN.md#the-eitrinvim-plugin) 后，在 Neovim 里输入 `:EitriPage markdown`；从 shell 里则是 `eitri page markdown --nvim <地址>`（在 Neovim 自己的终端里，地址默认取 `$NVIM`）。不需要 `eitri.plugin.load` 那一行：输入这条命令就是允许用默认设置加载这个插件，如果你的 `init.lua` 确实带选项加载了它，用的就是那些选项。
+
+这个窗口跟随启动它的那个 Neovim 的缓冲区，用你的配色方案的颜色；从那个 Neovim 再输入一次 `:EitriPage markdown` 会提起它，而不是再开一个。在某个块上按 `Enter`，仍然会把 Neovim 的光标移到那里，并把 Neovim 的窗口带到前面。窗口由窗口管理器摆放，Eitri 不移动任何东西。
+
+这里插件的命令只在窗口存在期间存在。`:EitriMarkdown` 把已经打开的窗口提到前面，`:EitriMarkdownHide` 和 `:EitriMarkdownToggle` 会关掉它并带走这些命令，所以之后 `:EitriMarkdown` 会以 Neovim 自己的 `E492: Not an editor command` 失败。`:EitriPage markdown` 会再次打开窗口。设了 `auto = true` 时，预览跟随你进入的 Markdown 缓冲区，不会跑到前面，也不会拿走按键。窗口怎样启动、存在和结束，见[开在你 nvim 旁边的页面](companion.zh-CN.md#pages-beside-your-nvim)。
+
 <a id="limits"></a>
 ## 限制
 
 - 超过 4 MB 或 50,000 行的文档不会被渲染；预览显示 `This document is too large to preview`，附上文档的大小和限制。Neovim 不受影响。
 - 超过 512 KB 时，你输入期间预览最多每秒更新一次。
-- 在预览里编辑、导出为 PDF 或 HTML、wiki 链接和幻灯片都不属于预览的功能。companion 窗口里没有插件页面。
+- 在预览里编辑、导出为 PDF 或 HTML、wiki 链接和幻灯片都不属于预览的功能。你自己的 Neovim 旁边的 agent 面板（[companion 窗口](companion.zh-CN.md)）自己不绘制插件页面；预览在那里是它自己的窗口，见上面一节。
 
 <a id="your-own-copy"></a>
 ## 你自己的副本

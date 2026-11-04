@@ -104,6 +104,7 @@ impl Nvim {
             theme: in_dir("th.sock"),
             keys: in_dir("ky.sock"),
             pane_switch: in_dir("ps.sock"),
+            reload_always: false,
         }
     }
 }

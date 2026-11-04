@@ -14,6 +14,7 @@ page lists only what differs or crosses between the two windows.
 | nvim | vim-tmux-navigator maps, nvim outside tmux | treated as plain window moves while a panel is attached; nothing to configure |
 | nvim | `<leader>ae` in Visual mode | puts the keys in the panel's message box with the selection attached and `Edit the selection: ` in it (only where nothing of yours holds the key; `require("eitri").edit_selection()` is the call for a key of your own). On sway, Hyprland and niri the panel's window is brought forward; elsewhere use your desktop's window keys |
 | nvim | `:EitriPanel [dir]` | opens the panel for `dir` (default: the working directory), or attaches and raises the one already open for the project |
+| nvim | `:EitriPage {id} [dir]` | opens the page `id` (such as `markdown`) as a window of its own beside this nvim, or raises the one already open for it; the guide's "Pages beside your nvim" has the rest |
 | panel | `Ctrl+h`, `Ctrl+l` | always leave the window (the window manager moves focus) |
 | panel | `Ctrl+k` | leaves the window from BROWSE; in INPUT it switches to BROWSE |
 | panel | `Ctrl+j` | leaves the window from INPUT; in BROWSE it switches to INPUT |
@@ -41,10 +42,13 @@ the table works:
 | `f` | hint labels over the panel |
 | the prefix again | sends the literal prefix key to the panel |
 | the `Select` keys (stock tmux's arrow keys, or what you bound) | a window-manager focus move, like `Ctrl+h/j/k/l` |
+| a page's key (the `key` that `eitri.plugin.load` gives it in `init.lua`) | opens that page's window beside the attached nvim, or raises it; with no editor attached it says `no editor attached: run :EitriPanel in nvim` |
 
-Every layout, module or window action (splits, zoom, resize, swap, copy mode, window modes) answers
-`not in a companion window`: the window manager arranges windows. Layout actions that you rebind in
-`init.lua` are refused the same way.
+Every other layout, module or window action (splits, zoom, resize, swap, copy mode, window modes) is off:
+the window manager arranges windows. The first such key in the window shows
+`not here: your window manager arranges this window`; later ones only leave a line in the log. Layout
+actions that you rebind in `init.lua` are refused the same way. After a split or module key, the strip
+lists the page keys this window has.
 
 ## What the band says
 

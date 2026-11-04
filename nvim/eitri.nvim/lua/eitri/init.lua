@@ -50,6 +50,28 @@ function M.complete_pages(lead, line, pos)
   return matches
 end
 
+-- How a window started from here ended, from its exit code and stderr: a window that said it was running and later
+-- ended (a crash, a kill) is a warning naming its log, since an error message on display makes nvim pause about a
+-- second at its next redraw. Anything after that line (a refusal found once the window was up, before the page
+-- attached) or a refusal before it ran is an error carrying the window's own last line. The warning is short, the log
+-- path shown from `~`, because nvim tiled beside a window is narrow and a wrapped notice raises the hit-enter prompt.
+local function ended(kind, code, stderr)
+  local last = vim.trim(table.concat(stderr, "\n")):match("([^\n]+)$") or ""
+  local prefix = "eitri " .. kind .. ": "
+  if last:sub(1, #prefix + 8) == prefix .. "running;" then
+    local log = last:match("its output goes to (.+)$")
+    local where = log and ("; log: " .. vim.fn.fnamemodify(log, ":~")) or ""
+    return prefix .. "window ended (exit " .. code .. ")" .. where, vim.log.levels.WARN
+  end
+  if last == "" then
+    last = "exited with code " .. code
+  end
+  if last:sub(1, #prefix) ~= prefix then
+    last = prefix .. last
+  end
+  return last, vim.log.levels.ERROR
+end
+
 function M.page(id, dir)
   if type(rawget(_G, "__eitri_window")) == "table" then
     vim.notify("this window opens pages itself: press the prefix and the page's key", vim.log.levels.ERROR)
@@ -62,6 +84,9 @@ function M.page(id, dir)
   local stderr = {}
   local ok, job = pcall(vim.fn.jobstart, { config.cmd, "page", id, "--nvim", addr, "--", dir or vim.fn.getcwd() }, {
     detach = true,
+    -- A detached job with no stdout handler gets /dev/null, which the window leaves alone; as a pipe its
+    -- stdout moves into the window's log with its stderr.
+    on_stdout = function() end,
     stderr_buffered = true,
     on_stderr = function(_, data)
       if torn then return end
@@ -77,9 +102,7 @@ function M.page(id, dir)
             vim.notify("eitri page: this Eitri has no page windows yet; update Eitri", vim.log.levels.ERROR)
             return
           end
-          text = text:match("([^\n]+)$") or ("exited with code " .. code)
-          if not text:find("^eitri page:") then text = "eitri page: " .. text end
-          vim.notify(text, vim.log.levels.ERROR)
+          vim.notify(ended("page", code, stderr))
         end)
       end
     end,
@@ -99,6 +122,9 @@ function M.panel(dir)
   local stderr = {}
   local ok, job = pcall(vim.fn.jobstart, { config.cmd, "panel", "--nvim", addr, "--", dir or vim.fn.getcwd() }, {
     detach = true,
+    -- A detached job with no stdout handler gets /dev/null, which the window leaves alone; as a pipe its
+    -- stdout moves into the window's log with its stderr.
+    on_stdout = function() end,
     stderr_buffered = true,
     on_stderr = function(_, data)
       if torn then return end
@@ -109,11 +135,7 @@ function M.panel(dir)
       if code ~= 0 then
         vim.schedule(function()
           if torn then return end
-          local text = vim.trim(table.concat(stderr, "\n"))
-          if text == "" then
-            text = "exited with code " .. code
-          end
-          vim.notify("eitri panel: " .. text, vim.log.levels.ERROR)
+          vim.notify(ended("panel", code, stderr))
         end)
       end
     end,

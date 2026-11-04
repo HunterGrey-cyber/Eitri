@@ -103,13 +103,15 @@ impl EmbedNvim {
         ).as_u64().filter(|id| *id > 0).expect("a helper RPC channel")
     }
 
+    /// A closed channel has no `id`; nvim 0.10 answers it with a typed empty dictionary that `next()`
+    /// does not see as empty.
     pub fn close_channel(&self, chan: u64) {
         assert_eq!(
             self.exec_lua("return vim.fn.jobstop(...)", vec![Value::from(chan)])
                 .as_i64(),
             Some(1)
         );
-        self.exec_lua("local chan = ...; assert(vim.wait(1000, function() return next(vim.api.nvim_get_chan_info(chan)) == nil end, 10))", vec![Value::from(chan)]);
+        self.exec_lua("local chan = ...; assert(vim.wait(1000, function() return vim.api.nvim_get_chan_info(chan).id == nil end, 10))", vec![Value::from(chan)]);
     }
 }
 

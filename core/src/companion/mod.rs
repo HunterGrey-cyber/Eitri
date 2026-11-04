@@ -73,7 +73,8 @@ pub const SCRATCH_CALL_LUA: &str = "local hex = ...; if type(rawget(_G, 'EitriSc
 /// The notification nvim sends the panel that held an nvim when another panel's install replaces it.
 pub const REPLACED_METHOD: &str = "eitri_replaced";
 
-/// The sockets the nvim-side glue writes to. A part whose socket is `None` is not installed.
+/// The sockets the nvim-side glue writes to, and how its buffer reload runs. A part whose socket is `None` is not
+/// installed.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct Sockets {
     pub editor_context: Option<PathBuf>,
@@ -81,6 +82,9 @@ pub struct Sockets {
     pub keys: Option<PathBuf>,
     /// Where the nav fallback, and `edge()` for a navigator plugin, write a direction letter.
     pub pane_switch: Option<PathBuf>,
+    /// The agent's buffer reload keeps its timer on for the whole attach: for a host that never sends the reload
+    /// part's `busy` and `now` calls. Without it the timer runs only while the panel says its agent is busy.
+    pub reload_always: bool,
 }
 
 /// A path as nvim receives it. A path that is not UTF-8 goes as raw bytes, which nvim's unpacker
@@ -182,7 +186,12 @@ pub fn install_args(channel_id: u64, sockets: &Sockets, kind: &InstallKind) -> V
     }
     // An empty table, not nil: a snippet given a table never reads `vim.env`.
     parts.push(part("scratch", crate::scratch::NVIM_SCRATCH_LUA, vec![]));
-    parts.push(part("buffer_reload", RELOAD_PART_LUA, vec![]));
+    let reload = if sockets.reload_always {
+        vec![("always", Value::from(true))]
+    } else {
+        vec![]
+    };
+    parts.push(part("buffer_reload", RELOAD_PART_LUA, reload));
     let extra = match &sockets.pane_switch {
         Some(socket) => map(vec![("edge_socket", path_value(socket))]),
         None => map(vec![]),
@@ -230,9 +239,11 @@ impl std::fmt::Display for InstallError {
         match self {
             Self::Malformed(why) => f.write_str(why),
             Self::Refused(InstallRefusal::EitriWindow) => {
+                f.write_str("this window opens pages itself: press the prefix and the page's key")
+            }
+            Self::Refused(InstallRefusal::Takeover) => {
                 f.write_str("this nvim is open in an Eitri window: its pages open there")
             }
-            Self::Refused(InstallRefusal::Takeover) => f.write_str("a takeover owns this nvim"),
         }
     }
 }
@@ -332,6 +343,7 @@ mod tests {
             theme: Some(PathBuf::from("/r/th")),
             keys: Some(PathBuf::from("/r/ky")),
             pane_switch: Some(PathBuf::from("/r/ps")),
+            reload_always: false,
         }
     }
 
@@ -352,6 +364,31 @@ mod tests {
             ("pid", Value::from(4242)),
             ("tmux", Value::from(false)),
         ])
+    }
+
+    /// A host that never reports its agent's activity asks for the reload timer at all times; the others leave the
+    /// part's options empty, so its timer follows the panel's busy calls.
+    #[test]
+    fn reload_always_reaches_the_reload_part_and_only_then() {
+        let reload_opts = |sockets: &Sockets| {
+            let args = install_args(7, sockets, &InstallKind::Agent);
+            let parts = args[1].as_array().unwrap().clone();
+            let part = parts
+                .iter()
+                .find(|p| get(p, "name").as_str() == Some("buffer_reload"))
+                .expect("the reload part is installed")
+                .clone();
+            assert_eq!(get(&part, "src").as_str(), Some(RELOAD_PART_LUA));
+            get(&part, "opts").clone()
+        };
+        let always = reload_opts(&Sockets {
+            reload_always: true,
+            ..all_sockets()
+        });
+        assert_eq!(get(&always, "always").as_bool(), Some(true));
+        assert_eq!(always.as_map().map(Vec::len), Some(1));
+        assert_eq!(reload_opts(&all_sockets()).as_map().map(Vec::len), Some(0));
+        assert_eq!(reload_opts(&Sockets::default()).as_map().map(Vec::len), Some(0));
     }
 
     #[test]
@@ -449,6 +486,18 @@ mod tests {
         for id in ["", "-", "-a", "a-", "A", "a_b", "a/b", "a\n", "é", &"a".repeat(41)] {
             assert!(!page_id_ok(id), "{id}");
         }
+    }
+
+    #[test]
+    fn a_refusal_reads_as_the_sentence_for_its_own_editor() {
+        assert_eq!(
+            InstallError::Refused(InstallRefusal::EitriWindow).to_string(),
+            "this window opens pages itself: press the prefix and the page's key"
+        );
+        assert_eq!(
+            InstallError::Refused(InstallRefusal::Takeover).to_string(),
+            "this nvim is open in an Eitri window: its pages open there"
+        );
     }
 
     #[test]

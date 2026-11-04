@@ -39,6 +39,7 @@ fn sockets() -> Sockets {
         theme: Some(absent.clone()),
         keys: Some(absent.clone()),
         pane_switch: Some(absent),
+        reload_always: false,
     }
 }
 
@@ -239,6 +240,33 @@ assert(not pcall(vim.api.nvim_get_autocmds, {group='EitriThemeFeed_page_markdown
 "#,
         vec![],
     );
+}
+
+/// nvim 0.10 answers `nvim_get_chan_info` for a closed channel with a typed empty dictionary,
+/// `{[vim.type_idx] = vim.types.dictionary}`, which `next()` does not see as empty; the slot still goes.
+#[test]
+#[ignore = "needs nvim on PATH; uses stdio and no display"]
+fn a_closed_channel_answered_as_a_typed_empty_dict_takes_the_slot() {
+    let nvim = EmbedNvim::start();
+    let chan = nvim.helper_channel();
+    page(&nvim, chan, "markdown");
+    nvim.exec_lua(
+        r#"
+local chan = ...
+_G.saved_page = __eitri_pages.markdown
+local real = vim.api.nvim_get_chan_info
+vim.api.nvim_get_chan_info = function(c)
+  if c == chan then return { [vim.type_idx] = vim.types.dictionary } end
+  return real(c)
+end
+local gone = vim.wait(1000, function() return __eitri_pages == nil end, 10)
+vim.api.nvim_get_chan_info = real
+assert(gone, 'the slot of a channel answered as an empty dictionary is still there')
+assert(saved_page.torn and saved_page.timer:is_closing())
+"#,
+        vec![Value::from(chan)],
+    );
+    nvim.close_channel(chan);
 }
 
 #[test]

@@ -51,7 +51,8 @@ Keyboard-driven tiling: splits, tabs, stacks, floats and workspaces, with tmux's
 - **Keyboard end to end.** vim keys in the panel, tmux keys for the window, `Ctrl+h/j/k/l` across panes.
 - **Review each turn.** `c` lists what changed on disk during the agent's turn; revert a hunk, or send comments back.
 - **Configured in Lua.** `$XDG_CONFIG_HOME/eitri/init.lua` (default `~/.config/eitri/init.lua`), the way Neovim reads yours.
-- **Or beside your own nvim.** `:EitriPanel` opens just the agent panel as its own window next to the Neovim in your terminal.
+- **Or beside your own nvim.** `:EitriPanel` opens just the agent panel as its own window next to the Neovim in your
+  terminal, and `:EitriPage markdown` opens the Markdown preview the same way.
 
 **Prefer to keep Neovim in your terminal?** Companion mode runs the same agent panel as a window of its own,
 beside the nvim you already use (in tmux or not, in upstream Neovide or another GUI). It attaches over nvim's own
@@ -60,7 +61,9 @@ line, and takes everything back out when the panel goes away; your configuration
 manager arranges the two windows, and sway, Hyprland, niri and (with the bundled extension) GNOME can move focus
 between them with the same `Ctrl+h/j/k/l`. Add the `eitri.nvim` plugin and run `:EitriPanel`, or let
 `eitri split` open upstream Neovide and the panel together: see
-[Use it beside your own nvim](docs/guide/companion.md).
+[Use it beside your own nvim](docs/guide/companion.md). The Markdown preview can open there too, with no agent panel:
+`:EitriPage markdown` (or `eitri page markdown` from a shell) starts it as a window of its own that follows the buffer
+you are editing: see [Pages beside your nvim](docs/guide/companion.md#pages-beside-your-nvim).
 
 ## Install
 
