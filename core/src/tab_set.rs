@@ -5492,18 +5492,22 @@ impl TabSet {
     ///
     /// `held` is the words a tab has that are not in its draft yet (a message waiting for the editor), which a close
     /// would put in the draft, after them what was typed since: the tab counts once.
+    ///
+    /// Counted without building the text: a panel's tick reads this, and a draft can be long.
     pub fn unsaved_draft_count(&self, saving: bool, held: &std::collections::BTreeMap<TabId, String>) -> usize {
         self.tabs
             .iter()
-            .filter_map(|tab| {
-                let text = match held.get(&tab.id) {
-                    Some(held) if !tab.draft().trim().is_empty() => format!("{held}\n\n{}", tab.draft()),
-                    Some(held) => held.clone(),
-                    None => tab.draft().to_owned(),
+            .filter(|tab| {
+                let draft = tab.draft();
+                let typed = !draft.trim().is_empty();
+                // What a close would put in the draft: the held words, then what was typed since, a blank line between.
+                let (blank, len) = match held.get(&tab.id) {
+                    Some(held) if typed => (false, held.len() + 2 + draft.len()),
+                    Some(held) => (held.trim().is_empty(), held.len()),
+                    None => (!typed, draft.len()),
                 };
-                (!text.trim().is_empty()).then_some((tab, text))
+                !blank && (!saving || !self.saves(tab) || len > crate::saved_tabs::DRAFT_SAVE_MAX)
             })
-            .filter(|(tab, text)| !saving || !self.saves(tab) || crate::saved_tabs::draft_to_save(text).is_none())
             .count()
     }
 

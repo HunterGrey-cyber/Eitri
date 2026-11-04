@@ -19,6 +19,8 @@
 mod dmabuf_target;
 mod editor_area;
 #[doc(hidden)]
+pub mod exit_wake;
+#[doc(hidden)]
 pub mod fd_watch;
 #[doc(hidden)]
 pub mod subsurface_testing {
@@ -453,15 +455,20 @@ pub struct LiveSession {
     ending: Cell<Option<(Instant, nvim_child::Schedule)>>,
     /// Whether [`NeovideEditorPane::on_nvim_unreachable`]'s callback has fired for this session.
     unreachable_said: Cell<bool>,
-    /// What runs the service once nvim's own process is gone, armed when it outlived the fork's report of its exit
-    /// ([`LiveSession::wake_on_nvim_exit`]); removed before the session, and the pidfd it watches, go.
-    exit_wake: Rc<RefCell<Option<glib::SourceId>>>,
+    /// When the fork first reported nvim's exit while nvim's own process still ran ([`LiveSession::wake_on_nvim_exit`]).
+    outlived_at: Cell<Option<Instant>>,
+    /// What runs the service once nvim's own process is gone, and once [`UNREACHABLE_GRACE`] has passed; armed when the
+    /// fork reported the exit with the process still running, dropped before the session, and the pidfd watched, go.
+    exit_wake: RefCell<Option<exit_wake::Wake>>,
+    grace_wake: RefCell<Option<exit_wake::Wake>>,
     /// Which session this is ([`NeovideEditorPane::session_serial`]), never reused in the process.
     serial: u64,
 }
 
-/// How often a pane whose nvim outlived the fork's report of its exit, with no pidfd to watch, looks again.
-const EXIT_POLL: Duration = Duration::from_millis(100);
+/// How long nvim's process may outlive the fork's report of its exit before the host is told nvim is out of reach. A
+/// quit closes nvim's pipe a few milliseconds before its process is gone, which is no reason to say so; a launcher that
+/// exits leaving nvim running is.
+const UNREACHABLE_GRACE: Duration = Duration::from_millis(500);
 
 /// The serial the next session takes. Process-wide, so the render callback that builds a session
 /// needs no counter handed to it, and no two sessions of any pane share a number.
@@ -469,10 +476,10 @@ static NEXT_SESSION_SERIAL: AtomicU64 = AtomicU64::new(1);
 
 impl Drop for LiveSession {
     fn drop(&mut self) {
-        // Before the pidfd it may watch can close (`fd_watch`'s contract).
-        if let Some(wake) = self.exit_wake.borrow_mut().take() {
-            wake.remove();
-        }
+        // Before the pidfd one may watch can close (`fd_watch`'s contract): the fields, `nvim_process` among them, drop
+        // after this body.
+        drop(self.exit_wake.borrow_mut().take());
+        drop(self.grace_wake.borrow_mut().take());
         // The pane leaves the event-loop watch with its harness; the last pane out removes it.
         live_watch::unregister(Rc::as_ptr(&self.live));
         self.wants_frame.session_ended();
@@ -488,46 +495,32 @@ impl LiveSession {
         self.device_scale.get()
     }
 
-    /// nvim's own process outlived the fork's report of its exit. Nothing else runs the service again: the tick runs
-    /// only while a frame is wanted, and a dead nvim's pipe wakes no event-loop watch. So its exit does: a watch on its
-    /// pidfd, or where there is none a poll every [`EXIT_POLL`], queues one sweep of the event-loop watch
-    /// (`live_watch::after_outside_pump`), which services every pane as the shared fd would, after this source is gone,
-    /// since that run may end this session, and in one pass, so a batch of another pane its pump applies is serviced too.
+    /// The fork reported nvim's exit and nvim's own process still runs. Nothing else runs the service again: the tick
+    /// runs only while a frame is wanted, and a dead nvim's pipe wakes no event-loop watch. So two wakes do, each by
+    /// queueing one sweep of the event-loop watch (`live_watch::after_outside_pump`), which services every pane as the
+    /// shared fd would, in one pass, after the wake's own source is gone (the run may end this session): the process's
+    /// exit (a watch on its pidfd, or a poll every [`exit_wake::EXIT_POLL`] without one), and the end of
+    /// [`UNREACHABLE_GRACE`], after which a process still running is said to be out of reach. Armed once a session.
     fn wake_on_nvim_exit(&self) {
-        if self.exit_wake.borrow().is_some() {
+        if self.outlived_at.get().is_some() {
             return;
         }
-        let slot = Rc::downgrade(&self.exit_wake);
-        let fire = move || {
-            if let Some(slot) = slot.upgrade() {
-                slot.borrow_mut().take();
-            }
-            live_watch::after_outside_pump(None);
-        };
-        let watched = self.nvim_process.exit_fd().and_then(|fd| {
-            let fire = fire.clone();
-            fd_watch::add_local(
-                fd,
-                glib::IOCondition::IN | glib::IOCondition::HUP | glib::IOCondition::ERR,
-                glib::ffi::G_PRIORITY_DEFAULT,
-                move |_| {
-                    fire();
-                    glib::ControlFlow::Break
-                },
-            )
-            .ok()
-        });
-        let wake = watched.unwrap_or_else(|| {
-            let process = self.nvim_process.clone();
-            glib::timeout_add_local(EXIT_POLL, move || {
-                if process.alive_within(Duration::ZERO) == Some(true) {
-                    return glib::ControlFlow::Continue;
-                }
-                fire();
-                glib::ControlFlow::Break
-            })
-        });
-        *self.exit_wake.borrow_mut() = Some(wake);
+        self.outlived_at.set(Some(Instant::now()));
+        let sweep = || live_watch::after_outside_pump(None);
+        let process = self.nvim_process.clone();
+        *self.exit_wake.borrow_mut() = Some(exit_wake::Wake::on_exit(
+            self.nvim_process.exit_fd(),
+            move || process.alive_within(Duration::ZERO) == Some(true),
+            sweep,
+        ));
+        *self.grace_wake.borrow_mut() = Some(exit_wake::Wake::after(UNREACHABLE_GRACE, sweep));
+    }
+
+    /// Whether [`UNREACHABLE_GRACE`] has passed since the fork reported an exit nvim's process outlived.
+    fn grace_over(&self) -> bool {
+        self.outlived_at
+            .get()
+            .is_some_and(|at| at.elapsed() >= UNREACHABLE_GRACE)
     }
 
     fn new(
@@ -566,7 +559,9 @@ impl LiveSession {
             calls: std::cell::OnceCell::new(),
             ending: Cell::new(None),
             unreachable_said: Cell::new(false),
-            exit_wake: Rc::new(RefCell::new(None)),
+            outlived_at: Cell::new(None),
+            exit_wake: RefCell::new(None),
+            grace_wake: RefCell::new(None),
             serial: NEXT_SESSION_SERIAL.fetch_add(1, Ordering::Relaxed),
         }
     }
@@ -1084,20 +1079,26 @@ fn detected_nvim_version(raw_error: &str) -> Option<&str> {
 /// -- so what a host does on it (close the window, retire the editor) never runs while an nvim we
 /// started may still be writing, and it is reported once however often the tick asks (`said`, the
 /// pane's latches). While the fork says exited and the process lives, the host is told once that
-/// nvim is out of reach.
+/// nvim is out of reach, and only once `grace_over` ([`UNREACHABLE_GRACE`]): a quit's process goes a moment after its pipe.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 struct ExitEvents {
     unreachable: bool,
     exited: bool,
 }
 
-fn exit_events(fork_exited: bool, nvim_alive: Option<bool>, unreachable_said: bool, exit_said: bool) -> ExitEvents {
+fn exit_events(
+    fork_exited: bool,
+    nvim_alive: Option<bool>,
+    grace_over: bool,
+    unreachable_said: bool,
+    exit_said: bool,
+) -> ExitEvents {
     if !fork_exited {
         return ExitEvents::default();
     }
     match nvim_alive {
         Some(true) => ExitEvents {
-            unreachable: !unreachable_said,
+            unreachable: grace_over && !unreachable_said,
             exited: false,
         },
         _ => ExitEvents {
@@ -1105,6 +1106,21 @@ fn exit_events(fork_exited: bool, nvim_alive: Option<bool>, unreachable_said: bo
             exited: !exit_said,
         },
     }
+}
+
+/// The line the service logs when it tells the host nvim is out of reach: its process outlived the fork's report of
+/// its exit by [`UNREACHABLE_GRACE`]. Only nvim run behind a launcher is said to have been left by one.
+fn unreachable_log_line(behind_a_launcher: bool) -> String {
+    let why = if behind_a_launcher {
+        " (its launcher exited without it)"
+    } else {
+        ""
+    };
+    format!(
+        "[live] the fork reports nvim exited, and nvim's own process is still alive {} ms later{why}; its exit is \
+         reported once it is gone",
+        UNREACHABLE_GRACE.as_millis()
+    )
 }
 
 /// Whether nvim's exit follows a quit this pane asked of it: the last watched request
@@ -2427,22 +2443,23 @@ impl NeovideEditorPane {
                         //
                         // Only once nvim's own process is gone (`exit_events`).
                         let fork_exited = session.harness.has_neovim_exited();
+                        let nvim_alive = fork_exited
+                            .then(|| session.nvim_process.alive_within(Duration::ZERO))
+                            .flatten();
+                        if nvim_alive == Some(true) {
+                            session.wake_on_nvim_exit();
+                        }
                         let events = exit_events(
                             fork_exited,
-                            fork_exited
-                                .then(|| session.nvim_process.alive_within(Duration::ZERO))
-                                .flatten(),
+                            nvim_alive,
+                            session.grace_over(),
                             session.unreachable_said.get(),
                             session.close_requested.get(),
                         );
                         if events.unreachable {
                             session.unreachable_said.set(true);
-                            session.wake_on_nvim_exit();
                             should_fire_unreachable_callback = true;
-                            println!(
-                                "[live] the fork reports nvim exited, and nvim's own process is still alive \
-                                 (its launcher exited without it); its exit is reported once it is gone"
-                            );
+                            println!("{}", unreachable_log_line(session.nvim_process.behind_a_launcher()));
                         }
                         if events.exited {
                             session.close_requested.set(true);
@@ -3203,9 +3220,9 @@ mod tests {
     use super::{
         build_start_failure_message, build_start_panic_message, cell_size_changed, display_failure_hint, exit_events,
         exit_follows_quit, exit_log_line, failed_tick_should_render, nvim_args, os_scale_to_apply, restart_refusal,
-        run_detached, sessionless_tick_should_render, spawn_named, tick_should_render, watched_failure_note,
-        with_display_hint, CallWatch, DisplayFacts, ExitEvents, LiveState, RemapKick, RestartRefused, ScaleWatch,
-        NVIM_FLOOR, NVIM_INSTALL_URL, NVIM_VERSION_FLOOR, REMAP_RENDER_DELAY,
+        run_detached, sessionless_tick_should_render, spawn_named, tick_should_render, unreachable_log_line,
+        watched_failure_note, with_display_hint, CallWatch, DisplayFacts, ExitEvents, LiveState, RemapKick,
+        RestartRefused, ScaleWatch, NVIM_FLOOR, NVIM_INSTALL_URL, NVIM_VERSION_FLOOR, REMAP_RENDER_DELAY,
     };
     use gtk4::glib;
     use std::cell::Cell;
@@ -3598,29 +3615,55 @@ mod tests {
     #[test]
     fn an_exit_is_reported_once_nvims_process_is_gone_and_only_once() {
         let nothing = ExitEvents::default();
-        assert_eq!(exit_events(false, None, false, false), nothing, "running");
-        assert_eq!(exit_events(false, Some(true), false, false), nothing);
+        assert_eq!(exit_events(false, None, false, false, false), nothing, "running");
+        assert_eq!(exit_events(false, Some(true), false, false, false), nothing);
+        assert_eq!(
+            exit_events(true, Some(true), false, false, false),
+            nothing,
+            "a process going a moment after its pipe is said nothing of"
+        );
         let unreachable = ExitEvents {
             unreachable: true,
             exited: false,
         };
         assert_eq!(
-            exit_events(true, Some(true), false, false),
+            exit_events(true, Some(true), true, false, false),
             unreachable,
-            "the launcher's exit"
+            "still running after the grace: the launcher's exit"
         );
-        assert_eq!(exit_events(true, Some(true), true, false), nothing, "said once");
+        assert_eq!(exit_events(true, Some(true), true, true, false), nothing, "said once");
         let exited = ExitEvents {
             unreachable: false,
             exited: true,
         };
-        assert_eq!(exit_events(true, Some(false), true, false), exited, "then its own exit");
-        assert_eq!(exit_events(true, Some(false), true, true), nothing, "reported once");
         assert_eq!(
-            exit_events(true, None, false, false),
+            exit_events(true, Some(false), false, false, false),
+            exited,
+            "gone within the grace: an exit, with nothing said before it"
+        );
+        assert_eq!(
+            exit_events(true, Some(false), true, true, false),
+            exited,
+            "then its own exit"
+        );
+        assert_eq!(
+            exit_events(true, Some(false), true, true, true),
+            nothing,
+            "reported once"
+        );
+        assert_eq!(
+            exit_events(true, None, false, false, false),
             exited,
             "nothing known: the fork's word"
         );
+    }
+
+    #[test]
+    fn only_nvim_behind_a_launcher_is_said_to_have_been_left_by_it() {
+        assert!(unreachable_log_line(true).contains("(its launcher exited without it)"));
+        let direct = unreachable_log_line(false);
+        assert!(!direct.contains("launcher"), "{direct}");
+        assert!(direct.contains("500 ms later"), "{direct}");
     }
 
     #[test]

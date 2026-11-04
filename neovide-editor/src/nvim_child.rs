@@ -152,6 +152,18 @@ impl NvimProcess {
         self.known_nvim().and_then(imp::exit_fd)
     }
 
+    /// Whether nvim runs behind a launcher: the process held as nvim is not the one the fork started, or, with no
+    /// process known as the fork's (a launcher that exited before the pane looked), it is not this process's own child.
+    pub(crate) fn behind_a_launcher(&self) -> bool {
+        let Some(nvim) = self.known_nvim() else {
+            return false;
+        };
+        if self.launched.as_ref().is_some_and(|launched| launched.pid != nvim.pid) {
+            return true;
+        }
+        imp::parent_of(nvim.pid).is_some_and(|parent| parent != std::process::id())
+    }
+
     /// The pid the fork started, for the log line at launch.
     pub(crate) fn launched_pid(&self) -> Option<u32> {
         self.launched.as_ref().map(NvimChild::pid)
@@ -350,7 +362,7 @@ mod imp {
 
     /// `/proc/<pid>/stat`'s fourth field. The second, the command name, is in parentheses and may
     /// itself hold spaces or parentheses, so the fields are counted from the last `)`.
-    fn parent_of(pid: u32) -> Option<u32> {
+    pub(super) fn parent_of(pid: u32) -> Option<u32> {
         let stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
         let after_name = &stat[stat.rfind(')')? + 1..];
         after_name.split_whitespace().nth(1)?.parse().ok()
@@ -547,6 +559,9 @@ mod imp {
     pub(super) fn exit_fd(_child: &NvimChild) -> Option<i32> {
         None
     }
+    pub(super) fn parent_of(_pid: u32) -> Option<u32> {
+        None
+    }
 }
 
 /// Every test in this crate that spawns an `nvim` takes this first: [`NvimChild::find_new`] looks
@@ -622,6 +637,85 @@ mod tests {
         let _ = nvim.kill();
         let _ = nvim.wait();
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The out-of-reach line names a launcher only for nvim run behind one: the fork's own nvim child is not, an nvim a
+    /// launcher started and stayed in front of is, and so is one whose launcher left it and exited before anything
+    /// looked (known only by its own pid answer, its parent no longer this process).
+    #[test]
+    fn nvim_is_behind_a_launcher_only_when_the_fork_did_not_start_it_itself() {
+        let _serial = SPAWNING.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let dir = scratch("behind");
+        let before = direct_children();
+        let mut direct = spawn_embed(&dir, &[]);
+        let process = NvimProcess::new(NvimChild::find_new(&before));
+        let direct_behind = process.behind_a_launcher();
+        let _ = direct.kill();
+        let _ = direct.wait();
+
+        let before = direct_children();
+        let wrapper = write_wrapper(&dir);
+        let mut launched = Command::new(&wrapper)
+            .args(["--clean", "--embed", "--headless"])
+            .current_dir(&dir)
+            .env("XDG_STATE_HOME", dir.join("state"))
+            .env("XDG_DATA_HOME", dir.join("data"))
+            .env("XDG_CONFIG_HOME", dir.join("config"))
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null())
+            .spawn()
+            .expect("the wrapper");
+        let below = embed_child_of(launched.id());
+        let process = NvimProcess::new(NvimChild::find_new(&before));
+        let wrapped_behind = process.behind_a_launcher();
+        // SAFETY: a signal to the nvim this test's own wrapper started.
+        unsafe { libc::kill(below as libc::pid_t, libc::SIGKILL) };
+        let _ = launched.kill();
+        let _ = launched.wait();
+
+        // A launcher that backgrounds nvim, hands it its stdin and exits at once.
+        let mut left = Command::new("sh")
+            .args([
+                "-c",
+                "exec 3<&0; nvim --clean --embed --headless <&3 3<&- >/dev/null & echo $!; exit 0",
+            ])
+            .current_dir(&dir)
+            .env("XDG_STATE_HOME", dir.join("state"))
+            .env("XDG_DATA_HOME", dir.join("data"))
+            .env("XDG_CONFIG_HOME", dir.join("config"))
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null())
+            .spawn()
+            .expect("the launcher");
+        let mut pid = String::new();
+        std::io::Read::read_to_string(left.stdout.as_mut().expect("its stdout"), &mut pid).expect("nvim's pid");
+        // `wait` closes the child's stdin first, which nvim holds: kept open until the end.
+        let nvim_stdin = left.stdin.take();
+        let _ = left.wait();
+        let pid: u32 = pid.trim().parse().expect("a pid");
+        let process = NvimProcess::new(None);
+        // `$!` is the job's pid before it has become nvim; nvim's own `getpid()` answer, which the pane learns from, is
+        // nvim already.
+        let until = Instant::now() + Duration::from_secs(2);
+        let mut learned = process.learn(pid);
+        while !learned && Instant::now() < until {
+            std::thread::sleep(Duration::from_millis(20));
+            learned = process.learn(pid);
+        }
+        let left_behind = process.behind_a_launcher();
+        // Its stdin's end ends it; a held one is signalled through its pidfd too, never by a number that may be reused.
+        drop(nvim_stdin);
+        if let Some(nvim) = process.known_nvim() {
+            let _ = imp::signal(nvim, libc::SIGKILL);
+        }
+        drop(left);
+        let _ = std::fs::remove_dir_all(&dir);
+        assert!(!direct_behind, "the fork's own nvim child");
+        assert!(wrapped_behind, "a launcher in front of nvim");
+        assert!(learned, "the premise: nvim's own pid is held");
+        assert!(left_behind, "a launcher that left nvim and exited");
     }
 
     /// What wakes a pane whose nvim outlived the fork's report of its exit: the fd answers nothing while nvim runs

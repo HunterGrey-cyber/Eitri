@@ -1309,6 +1309,110 @@ mod tests {
         assert_eq!(heard.borrow_mut().pop(), Some(vec![(ViewId::BASE, false)]));
     }
 
+    fn background_task(id: &str) -> agent::BackgroundTask {
+        agent::BackgroundTask {
+            task_id: id.into(),
+            run_id: None,
+            kind: agent::TaskKind::Shell,
+            task_type: "shell".into(),
+            description: "test".into(),
+            subagent_type: None,
+            parent_task_id: None,
+            tool_use_id: None,
+            ambient: false,
+            workflow_name: None,
+        }
+    }
+
+    /// Background work and a turn Claude Code started by itself move no view's running count, yet a window's summary
+    /// counts them: each starting and each ending is told as the base view's change, so the window counts again.
+    #[test]
+    fn background_work_and_claude_codes_own_turns_are_told_as_the_base_views_change() {
+        let dir = agent::state_dirs::test_workspace_dir("busy-summary-counts");
+        let (handle, _, _) = handle_with_recording_page();
+        let (provider, backend) = live_backend(&dir);
+        {
+            let mut state = handle.state.borrow_mut();
+            let tab = state.tabs.active();
+            state.tabs.get_mut(tab).unwrap().set_backend(TabBackend::Live(backend));
+        }
+        let heard = Rc::new(RefCell::new(Vec::new()));
+        let calls = heard.clone();
+        handle.on_busy(move |changed| calls.borrow_mut().push(changed.to_vec()));
+        handle.tick();
+        heard.borrow_mut().clear();
+        let base_told = |what: &str| {
+            let told = heard.borrow_mut().drain(..).collect::<Vec<_>>();
+            assert_eq!(told, vec![vec![(ViewId::BASE, false)]], "{what}");
+        };
+
+        for (tasks, count) in [(vec![background_task("bg")], 1), (vec![], 0)] {
+            provider.queue(agent::AgentDomainEvent::BackgroundTasksChanged {
+                tasks,
+                occurred_at: None,
+            });
+            tick_handle_until(&handle, "the roster", || {
+                handle.state.borrow().tabs.background_count() == count
+            });
+            handle.tick();
+            base_told(&format!("background work now {count}"));
+        }
+
+        provider.queue(agent::AgentDomainEvent::CliWorkUnseen);
+        tick_handle_until(&handle, "the unseen work", || handle.chat_summary().running == 1);
+        handle.tick();
+        base_told("a turn Claude Code started");
+        assert_eq!(
+            handle.state.borrow().tabs.running_count(),
+            0,
+            "the premise: no turn shown running"
+        );
+        provider.queue(agent::AgentDomainEvent::TurnCompleted {
+            turn_id: "cli-turn".into(),
+            outcome: agent::TurnOutcome::Completed,
+            result_text: String::new(),
+            stop_reason: None,
+            usage: None,
+            detail: Default::default(),
+        });
+        tick_handle_until(&handle, "its end", || handle.chat_summary().running == 0);
+        handle.tick();
+        base_told("its end");
+        let _ = handle.shutdown();
+    }
+
+    /// The page's draft message is where a draft reaches the window: it is told at once, with no tick between.
+    #[test]
+    fn a_draft_message_is_told_as_the_base_views_change_at_once() {
+        let (handle, _, _) = handle_with_recording_page();
+        handle.page_message(ViewId::BASE, READY);
+        let heard = Rc::new(RefCell::new(Vec::new()));
+        let calls = heard.clone();
+        handle.on_busy(move |changed| calls.borrow_mut().push(changed.to_vec()));
+        handle.tick();
+        heard.borrow_mut().clear();
+        let tab = handle.state.borrow().tabs.active();
+        let draft = |text: &str| {
+            handle.page_message(
+                ViewId::BASE,
+                &serde_json::json!({ "type": "draft", "request_id": "d1", "tab": tab.0, "text": text }).to_string(),
+            )
+        };
+        draft("a prompt in a tab with no session yet");
+        assert_eq!(handle.unsaved_draft_count(), 1, "the premise: it would not come back");
+        assert_eq!(
+            heard.borrow_mut().drain(..).collect::<Vec<_>>(),
+            vec![vec![(ViewId::BASE, false)]]
+        );
+        draft("a prompt in a tab with no session yet, longer");
+        assert!(heard.borrow().is_empty(), "the count did not move");
+        draft("");
+        assert_eq!(
+            heard.borrow_mut().drain(..).collect::<Vec<_>>(),
+            vec![vec![(ViewId::BASE, false)]]
+        );
+    }
+
     /// A wait for one tab's turn listens for this: the counts come out the same when the turn ends as another starts.
     #[test]
     fn the_busy_hook_hears_one_turn_end_as_another_starts() {

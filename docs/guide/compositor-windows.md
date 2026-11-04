@@ -201,7 +201,8 @@ Closing window 1 closes the whole group. It asks only when that would cut someth
 queued or background work in any window, or a command running in the bottom terminal:
 `close Eitri and its 2 windows? 3 turns are running, 1 queued (y/n)`. With every window idle it closes at once, since
 the windows come back at the next start anyway. Text you typed in a chat window and did not send counts too when
-it would not come back with its tab (a new tab that has not started a conversation yet, or a very long text). While the
+it would not come back with its tab: in a new tab that has not started a conversation yet, a very long text, or any
+text with `agent.restore = "off"`, since then no tab comes back. While the
 question is up, closing the windows it names is an answer as well: once what is left is idle, window 1 and the idle
 windows close with no further question.
 
