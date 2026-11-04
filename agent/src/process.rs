@@ -2362,7 +2362,10 @@ exit 0"#,
 
     /// Spawns the fake binary at `script` through the real spawn path with a named selection and
     /// returns the session invocation's argv, element by element. The recorder separates elements
-    /// with US (0x1f) and invocations with RS (0x1e), so an empty element stays visible as one.
+    /// with US (0x1f) and invocations with RS (0x1e), so an empty element stays visible as one. It
+    /// writes one element at a time, so only an invocation its RS closes is read: the text after the
+    /// last RS is one still being written. The recorder pauses after `--input-format`, the element
+    /// that names the session invocation, so a reader that took a partial record would always see one.
     fn recorded_session_argv(user_settings: bool, project: ProjectTrust) -> Vec<String> {
         let _socket_guard = hook_socket_guard();
         let dir = std::env::temp_dir().join(format!("agent-process-tiers-argv-test-{}", uuid::Uuid::new_v4()));
@@ -2371,7 +2374,8 @@ exit 0"#,
             .expect("agent-hook must be built for this test to exercise the real gate path");
         let record = dir.join("argv.bin");
         let script = fake_binary_script(&format!(
-            "for arg in \"$@\"; do printf '%s\\037' \"$arg\" >> '{rec}'; done\nprintf '\\036' >> '{rec}'\n\
+            "for arg in \"$@\"; do printf '%s\\037' \"$arg\" >> '{rec}'; [ \"$arg\" = --input-format ] && sleep 0.3; done\n\
+             printf '\\036' >> '{rec}'\n\
              for arg in \"$@\"; do [ \"$arg\" = --version ] && exit 0; done\nexec cat >/dev/null",
             rec = record.display()
         ));
@@ -2383,8 +2387,11 @@ exit 0"#,
         let argv = loop {
             let bytes = std::fs::read(&record).unwrap_or_default();
             let text = String::from_utf8(bytes).expect("the argv is UTF-8");
-            let session = text
-                .split('\u{1e}')
+            let mut invocations: Vec<&str> = text.split('\u{1e}').collect();
+            // The last piece has no closing RS yet: empty, or an invocation still being written.
+            invocations.pop();
+            let session = invocations
+                .into_iter()
                 .map(|invocation| {
                     let mut elements: Vec<String> = invocation.split('\u{1f}').map(str::to_string).collect();
                     // Every element ends with US, so the split leaves one empty tail.
