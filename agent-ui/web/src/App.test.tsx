@@ -1,7 +1,9 @@
 // @vitest-environment jsdom
 import { afterEach, beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
 import { act, cleanup, fireEvent, render } from "@testing-library/react";
-import App, { accumulateMotionCount, HINT_PENDING_TIMEOUT_MS, jumpTarget, MAX_MOTION_COUNT, statusWarning } from "./App";
+import App from "./App";
+import { accumulateMotionCount, HINT_PENDING_TIMEOUT_MS, jumpTarget, MAX_MOTION_COUNT } from "./app/motion";
+import { statusWarning } from "./app/status";
 import { applyEvent, initialState } from "./reducer";
 import { RESUME_FOLLOW_EVENT, USER_SCROLL_EVENT } from "./follow";
 import type { AgentDomainEvent, AgentUiState, EditorCardWire, Hello, ProviderInfo, UsageInfo } from "./types";

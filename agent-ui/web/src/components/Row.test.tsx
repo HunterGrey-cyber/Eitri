@@ -123,13 +123,24 @@ describe("Row", () => {
   /* Only Row may write the sign glyph. Deriving data and visible text from one argument keeps
      them in agreement; a second writer could drift while render tests still pass. */
   it("is the only module that writes a row's sign", () => {
-    const sources = import.meta.glob("../**/*.tsx", { query: "?raw", import: "default", eager: true }) as Record<
+    const sources = import.meta.glob(["../**/*.tsx", "../**/*.ts"], { query: "?raw", import: "default", eager: true }) as Record<
       string,
       string
     >;
     const product = Object.entries(sources).filter(([path]) => !path.includes(".test."));
     // A glob matching nothing would pass vacuously. Check that every row-rendering component is included.
-    for (const name of ["App.tsx", "MessageList.tsx", "EmptyTab.tsx", "TerminalHandoff.tsx", "Row.tsx"]) {
+    for (const name of [
+      "App.tsx",
+      "MessageList.tsx",
+      "EmptyTab.tsx",
+      "TerminalHandoff.tsx",
+      "Row.tsx",
+      "app/flashes.ts",
+      "app/rowScroll.ts",
+      "app/motion.ts",
+      "app/status.ts",
+      "app/elements.ts",
+    ]) {
       expect(product.some(([path]) => path.endsWith(`/${name}`)), `${name} not covered`).toBe(true);
     }
     const writers = product.filter(([, source]) => /data-sign=|"row-sign"/.test(source)).map(([path]) => path);

@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { statusWarning } from "./App";
+import { statusWarning } from "./app/status";
 import type { ProviderInfo } from "./types";
 
 const provider = (diagnostics: string[]): ProviderInfo => ({

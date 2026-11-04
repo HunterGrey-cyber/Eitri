@@ -1,3 +1,51 @@
+import { SessionEndedBanner } from "./components/SessionEndedBanner";
+import { TrustOverlay } from "./components/TrustOverlay";
+import {
+  useClampCursorToTimeline,
+  usePreserveCursorRow,
+  useRevealCursorRow,
+  useClampCursorOnScroll,
+  useRideLastRow,
+  useWaitForCtrlYTarget,
+  useEnterInput,
+  useWatchFrozenSelection,
+} from "./app/panelEffects";
+import { statusWarning, contextFact } from "./app/status";
+import { TOOL_RESULT_SCROLL_STEP_PX, HINT_PENDING_TIMEOUT_MS, accumulateMotionCount, jumpTarget } from "./app/motion";
+import {
+  TYPING_FLASH,
+  COUNT_ANSWER_FLASH,
+  MODIFIED_ENTER_FLASH,
+  ENTER_LANDING_FLASH,
+  ENTER_ELSEWHERE_FLASH,
+  NO_CARD_FLASH,
+  CARD_ELSEWHERE_FLASH,
+  NO_WAITING_CARD_FLASH,
+  STOP_TYPING_FLASH,
+  CTRL_Y_TYPING_FLASH,
+  CTRL_Y_TARGET_FLASH,
+  CTRL_Y_YANK_FLASH,
+  CTRL_Y_HELD_FLASH,
+  CTRL_Y_EDITOR_CARD_FLASH,
+  NOT_APPROVABLE_FLASH,
+  NOTHING_IN_THE_BACKGROUND,
+  CLAUDE_REPORTS_NO_BACKGROUND,
+  nothingToStopWords,
+  stopBackgroundQuestion,
+} from "./app/flashes";
+import { isEditableElement, isComposerBox, isKillKey, CANCELS_WAITING_ANSWER, caretRectMissing } from "./app/elements";
+import type { SlashPickerState, SettingsRequest, SettingsAnswer } from "./app/elements";
+import {
+  scrollVisibleRowBox,
+  rowScrollStep,
+  scrollKeymapOverlay,
+  revealRow,
+  stepWithinRow,
+  clampCursorToView,
+  oldestPendingTool,
+  applyViewScroll,
+} from "./app/rowScroll";
+import type { FrozenSnapshot, ArrivalPark } from "./app/rowScroll";
 import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
 import type { KeyboardEvent, SetStateAction } from "react";
 import { ProjectDirContext } from "./projectPath";
@@ -7,17 +55,9 @@ import { installDispatch, postToRust, nextMirrorId, nextRequestId } from "./brid
 import type { OutboundMessage, PanelKeysMode, PermissionDecision } from "./bridge";
 import { noteUserScroll, resumeFollowing } from "./follow";
 import {
-  cancelListScroll,
   computedLineHeight,
-  decideLanding,
-  decidePress,
-  isListScrollAnimating,
-  readBoxState,
-  readRowGeometry,
   rowTextElement,
-  scrollListTo,
   settleListScroll,
-  STEP_LINES,
 } from "./jkScroll";
 import { cancelHold, isHolding, keepHoldAlive, releaseHold, startHold } from "./jkHold";
 import { isPlainAnswerKey, panelEntryKey, pluginKeysHelp, resolveKey } from "./keymap";
@@ -27,7 +67,7 @@ import type { BoxEntry, SeqStep } from "./leader";
 import { isImeKey } from "./composerKeys";
 import { afterPaint } from "./afterPaint";
 import { bypassYesCounts, isModeCycleKey, isShiftTab, KeyClock, modeFixedMessage, modeKeyRoute } from "./modeKey";
-import { heldKeyName, hintTypingFlash, isModifierKey, leaderTypingFlash, tableKeyTypingFlash, TYPE_HINT_FLASH, TYPING_GUARD_MS, TypingGuard } from "./typingGuard";
+import { heldKeyName, hintTypingFlash, isModifierKey, leaderTypingFlash, tableKeyTypingFlash, TYPE_HINT_FLASH, TypingGuard } from "./typingGuard";
 import {
   caretModelOf,
   compareCarets,
@@ -90,8 +130,7 @@ import type { RestoredDraft } from "./components/Composer";
 import { TabBar } from "./components/TabBar";
 import { MessageList } from "./components/MessageList";
 import { cardApprovable, PermissionCardContext } from "./components/PermissionCard";
-import { Row } from "./components/Row";
-import { classify, remedyNamesR } from "./problems";
+import { classify } from "./problems";
 import { revealedText } from "./revealHidden";
 import { cliPhaseText } from "./turnPhase";
 import { ActivityLine } from "./components/ActivityLine";
@@ -105,7 +144,6 @@ import type { ShownHint } from "./components/HintLayer";
 import { KeymapOverlay } from "./components/KeymapOverlay";
 import { ReviewOverlay } from "./components/ReviewOverlay";
 import { TasksOverlay, stopTaskWords, type TasksOverlayHandle } from "./components/TasksOverlay";
-import { TrustPrompt } from "./components/TrustPrompt";
 import {
   parseExCommand,
   resolveTrustKey,
@@ -136,411 +174,11 @@ import { EFFORT_FROM_SETTINGS, effortPicker, modelPicker, parseEffortReply, pars
 import { DRAFT_MIRROR_DELAY_MS, modePill, REFUSED_ECHO_MS, showTabBar } from "./tabs";
 import { cardSummary, liveTasks, shortModel, usageSegment } from "./band";
 import { latestTurnEnding } from "./turnEnding";
-import type { TurnDurations } from "./turnTimes";
-import type { ApproveFact, BandFacts } from "./band";
-import type { AgentUiState, AppliedSettings, DetailRow, EffortChoice, ModelOption, TabId, TabsEnvelope, ContextSummary, ProviderInfo } from "./types";
+import type { ApproveFact } from "./band";
+import type { DetailRow, TabId, TabsEnvelope } from "./types";
 import { applyTheme } from "./theme";
 import { applyEditorTyping } from "./typingCadence";
 import { copyToPrimary } from "./primaryCopy";
-
-/** `⚠` only for an unavailable Claude Code prompt, a tab that could not run its sidecar update, or a
- *  refusal: a warning that shows on every session stops being read.
- *  Returns what the glyph's title says, or null. Routine diagnostics (the CLI version one, which can
- *  be present on every session of a host) go to the detail popover only. */
-export function statusWarning(provider: ProviderInfo | null, failure: string | null): string | null {
-  if (failure !== null) return failure;
-  return provider?.startupDiagnostics.find(
-    (line) => line.startsWith("Claude Code's system prompt unavailable") || line.startsWith("Sidecar update"),
-  ) ?? null;
-}
-
-/** `ContextSummary` (the wire shape) to `BandFacts["context"]` (band.ts's own shape, `file`
- *  non-nullable once present): the one place both the empty tab's band and the conversation's own
- *  narrow the "no file" case to `null` rather than each repeating the check. */
-function contextFact(context: ContextSummary | null): BandFacts["context"] {
-  if (context === null || context.file === null) return null;
-  return { file: context.file, lines: context.lines };
-}
-
-/** Whether `el` is an ordinary editable control -- an `<input>`, a `<textarea>`, or anything
- *  `contenteditable`. Used to decide what the panel's own keydown handlers must stay out of: this
- *  panel does not own every keystroke inside its own subtree, only the ones outside a text field
- *  someone is actually typing into. Not scoped to any one component on purpose -- a permission
- *  card's deny-reason box is the one that exists today, but the rule is general and must hold for
- *  whatever text field a later card adds too. */
-function isEditableElement(el: EventTarget | null): el is HTMLElement {
-  if (!(el instanceof HTMLElement)) return false;
-  return el.tagName === "INPUT" || el.tagName === "TEXTAREA" || el.isContentEditable;
-}
-
-/** One `j`/`k` press's worth of scroll inside a tool result's own overflow box, chosen to read
- *  like the row-to-row step it stands in for rather than a full-page jump. Arbitrary and not
- *  verified on a screen. */
-const TOOL_RESULT_SCROLL_STEP_PX = 40;
-
-/** The longest this panel swallows keys after `f` asked `shell` for a HINT, if that HINT never ends
- *  here (see `hintPendingRef`). Long enough for a GTK main loop busy with a frame and the 33ms pump; short
- *  enough that a `shell` which never answers (the HINT was refused, or this page is not hosted by
- *  `shell` at all) costs a second of dead keys, not a stuck panel -- the same stance as `shell`'s own
- *  300ms wait for this panel's answer. */
-export const HINT_PENDING_TIMEOUT_MS = 1000;
-
-/** The highest count a digit prefix (`3j`, `1000j`, …) accumulates to before a
- *  motion repeats it. Vim itself never errors on an absurd count -- it silently caps it (a headless
- *  `nvim --headless -u NONE -c "call feedkeys('99999999999999999999j', 'xt')" -c "echo v:count"`
- *  probe against this host's real nvim reports `999999999`, vim's own internal `long` overflow
- *  clamp, whatever the typed digit string). This panel's cap is far smaller and purpose-fit rather
- *  than matching that number: even repeating a cheap DOM lookup `MAX_MOTION_COUNT` times is already
- *  more than any real motion needs, and the cap exists only as a second bound underneath the
- *  boundary early-exit below (the loop stopping the moment a repeat makes no further progress) --
- *  belt and suspenders, not the primary fix. */
-export const MAX_MOTION_COUNT = 9999;
-
-/** Folds one more typed digit into a count-in-progress, capped at `MAX_MOTION_COUNT` on every step
- *  (not only at the end) so an arbitrarily long run of digits -- someone holding a number key --
- *  never builds a number past the cap even transiently. A pure function so the cap is testable
- *  without a DOM: see `onKeyDown`'s `action.kind === "count"` branch for the one call site. */
-export function accumulateMotionCount(count: number | null, digit: number): number {
-  return Math.min(MAX_MOTION_COUNT, (count ?? 0) * 10 + digit);
-}
-
-/** The row `gg` / `G` lands on. Bare, the first or the last row. With a count it is
- *  row N, counted from 1 and clamped to the rows there are -- vim's `{N}gg` and `{N}G` (`:help gg`,
- *  `:help G`), where a count past the end lands on the last line. A pure function so `onKeyDown`'s two
- *  readers of it (the scroll announcement and the jump itself) cannot disagree, and so the clamp is
- *  testable without a DOM. */
-export function jumpTarget(to: "first" | "last", count: number | null, rows: number): number {
-  const last = Math.max(rows - 1, 0);
-  if (count === null) return to === "first" ? 0 : last;
-  return Math.max(0, Math.min(count, rows) - 1);
-}
-
-/** What the band says when a typed `a`/`d`/`D`, or an Enter on a card button,
- *  did not answer because another key came within `TYPING_GUARD_MS` of it (`./typingGuard`). It
- *  says to pause, since `Esc` then `a` -- the route the activity line names --
- *  is refused the same way when the two come close together, and "type" alone read as if the user
- *  had been typing. */
-const TYPING_FLASH = "a / d answer a card only on their own — pause, then press again; i or Ctrl+j to type";
-/** What the band says when `a`/`d`/`D`, or Enter/Space on a card's own button,
- *  came after a count (`3a`) -- a card answer takes no count, so the key answers nothing. */
-const COUNT_ANSWER_FLASH = "a / d / D take no count — press it on its own";
-/** What the band says when Enter on a card's own button came with a modifier held
- *  -- Shift included, which `isPlainAnswerKey` lets through for `D` -- and answered nothing. */
-const MODIFIED_ENTER_FLASH = "Enter with a modifier answers no card";
-/** What the band says when Enter on a card's own button came with no landing right
- *  before it -- focus put on that button by `l`/`h`, a Tab or a HINT -- and answered nothing. Before
- *  that check, `l`, a pause, `s`, Enter (`:ls⏎`) approved the card natively. */
-const ENTER_LANDING_FLASH = "Enter answers a card right after l, h or Tab onto its button";
-/** What the band says when Enter on a card's own button, landed on, is on a
- *  card other than the one `a`/`d` would answer from the cursor (`permissionTarget`) -- a Tab walks on
- *  from one card's buttons into the next card's, and `l`/`h` then walk that card's, while the row
- *  cursor stays where it was. */
-const ENTER_ELSEWHERE_FLASH = "Enter answers the card under the cursor — j / k onto it first";
-/** What the band says when `a`/`d`/`D` have no card under the cursor, nor a
- *  card gating the tool call under it, and no card waits anywhere -- instead of doing nothing
- *  silently. */
-const NO_CARD_FLASH = "no card here — i, o, A or Ctrl+j to type";
-/** The same refusal while a card IS waiting, just not under the cursor -- it
- *  points back to the card, as the activity line's "j to it" does, instead of only suggesting typing. */
-const CARD_ELSEWHERE_FLASH = "a / d answer the card under the cursor — j / k onto it, then a / d";
-/** What the band says when `]p` / `[p` found no card waiting for an answer in this
- *  tab -- none at all, every one already answered from this panel, or a session that ended (its cards are
- *  inert) -- instead of doing nothing silently. */
-const NO_WAITING_CARD_FLASH = "no card waiting here";
-/** What the band says when Enter or Space on the activity line's
- *  Stop did not interrupt because it came in the middle of typing (`TypingGuard.mayActAfterMotion`)
- *  -- "just do it" typed after an arrival reached Stop with its `j` and interrupted the turn. */
-const STOP_TYPING_FLASH = "Stop takes a key only on its own — i or Ctrl+j to type";
-/** What the band says when INPUT's `Ctrl+y` came within `TYPING_GUARD_MS` of
- *  another key (readline's `Ctrl+u`/`Ctrl+w` then `Ctrl+y` yank, typing right after it, a held
- *  key's repeat) and approved nothing. */
-const CTRL_Y_TYPING_FLASH = "Ctrl+y approves only on its own — pause, then press it again";
-/** What the band says when INPUT's `Ctrl+y` came less than
- *  `TYPING_GUARD_MS` after the card it would approve became the one it names -- a card that just
- *  arrived, one that replaced a withdrawn card, or the next card right after an approval. */
-const CTRL_Y_TARGET_FLASH = "Ctrl+y: the waiting card just changed — read it, then press again";
-/** What the band says when INPUT's `Ctrl+y` came right after a kill in the
- *  box (`Ctrl+u`, `Ctrl+w`, `Ctrl+k`), however long the pause -- readline's yank, never an answer. */
-const CTRL_Y_YANK_FLASH = "Ctrl+y right after Ctrl+u, Ctrl+w or Ctrl+k is a yank, not an answer — press it again";
-/** What the band says when INPUT's `Ctrl+y` was let go more than `RELEASE_WAIT_MAX_MS` after it was
- *  pressed: a held key, which approves nothing even where no repeat came to refuse it. */
-const CTRL_Y_HELD_FLASH = "Ctrl+y held down approves nothing — tap it to approve";
-/** What the band says when INPUT's `Ctrl+y` is pressed with only a card of Eitri's own tool broker waiting: such a
- *  card is answered by a key on its own row, never by a key that names no card. */
-const CTRL_Y_EDITOR_CARD_FLASH = "Ctrl+y does not answer an editor card: Esc, then a or d on the card";
-/** What the band says when `a` or INPUT's `Ctrl+y` would approve a card whose Approve is disabled: an ACP card
- *  whose agent offered no allow-once option, or one Eitri held back because the card cannot show the whole
- *  call. Nothing is sent; sending would only bring back the agent's refusal under a misleading reason. */
-const NOT_APPROVABLE_FLASH = "this card cannot be approved — deny it, or Ctrl+c interrupts the turn";
-
-/** The composer's own textarea (never the `Ctrl+r` search field, nor a card's
- *  reason box), the one place INPUT's `Ctrl+y` answers from. */
-function isComposerBox(el: EventTarget | null): el is HTMLTextAreaElement {
-  return el instanceof HTMLTextAreaElement && el.closest(".composer") !== null;
-}
-
-/** A readline kill in the composer -- `Ctrl+u`, `Ctrl+w`, `Ctrl+k` with
- *  nothing else held -- after which `Ctrl+y` is a yank. */
-function isKillKey(event: KeyboardEvent<HTMLElement>): boolean {
-  return (
-    isComposerBox(event.target) &&
-    event.ctrlKey &&
-    !event.shiftKey &&
-    !event.altKey &&
-    !event.metaKey &&
-    ["u", "w", "k"].includes(event.key.toLowerCase())
-  );
-}
-/** What an open `/model`/`/effort` picker shows. */
-type SlashPickerState = { kind: SlashPickerKind; options: string[]; current: string | null; labels?: Record<string, string>; direct?: boolean };
-/** A request of the direct route for the model and the effort, until its answer: the list a picker opens from, or a
- *  change, with what the words about it need from the moment it was made. */
-type SettingsRequest =
-  | { what: "list"; tab: TabId; kind: SlashPickerKind }
-  | { what: "typed-effort"; tab: TabId; level: string; text: string }
-  | { what: "change"; tab: TabId; kind: SlashPickerKind; chosen: string; running: { model: string | null } | null };
-
-/** What answers a `SettingsRequest`. */
-type SettingsAnswer =
-  | { kind: "models_result"; models: ModelOption[]; applied: AppliedSettings; efforts?: EffortChoice[] }
-  | { kind: "settings_result"; applied: AppliedSettings }
-  | { kind: "command_result"; ok: true }
-  | { kind: "command_result"; ok: false; error: string };
-
-/** Envelopes that move the keys, or put something over the conversation, with no keydown this panel
- *  sees: each drops a waiting `a`/`d`/`D` (the typing guard's cancel list -- `pane_focus`, an arrival,
- *  an overlay). `nav_key` is `Ctrl+j`/`Ctrl+k`, which GTK claims before the page sees a key; a Set of
- *  strings, so naming it needs no type from elsewhere.
- *  **The mode cycle key (Shift+Tab) is on that cancel list too, but is NOT a member of this Set**: it is a real
- *  keydown, not an inbound envelope with no keydown of its own, so it cannot be named here -- `onModeKey`'s
- *  document-capture handler calls `typingGuard.onKey` directly instead (not a bare `cancel()`, which would drop a
- *  pending answer but never record the key itself, leaving Shift+Tab invisible to the guard's own "before" half),
- *  since its own `stopPropagation` (needed to keep Shift+Tab from WebKit's backward focus navigation) means the
- *  bubble-phase `onKeyDown` that feeds every OTHER key to `typingGuard.onKey` never runs for it. */
-const CANCELS_WAITING_ANSWER = new Set(["pane_focus", "arrive", "enter_input", "focus_permission", "hint_collect", "nav_key"]);
-
-/** One `TOOL_RESULT_SCROLL_STEP_PX` step of a tool result's capped box, or `false` when the box is
- *  already at the end of travel that way. Used by `scrollVisibleRowBox` (`Ctrl+e`/`Ctrl+y`); `j`/`k`
- *  step the same box by three of its own lines (`stepWithinRow`). */
-function scrollBoxOneStep(box: HTMLElement, direction: 1 | -1): boolean {
-  const atStart = box.scrollTop <= 0;
-  const atEnd = box.scrollTop + box.clientHeight >= box.scrollHeight - 1;
-  if (direction > 0 ? atEnd : atStart) return false;
-  box.scrollTop += direction * TOOL_RESULT_SCROLL_STEP_PX;
-  return true;
-}
-
-/** `Ctrl+e`/`Ctrl+y`'s box-first step: the cursor row's capped tool result takes
- *  the unit only while at least part of it is on screen and it can still move that way -- where a
- *  mouse wheel over it would scroll it too. Otherwise `false`, and the unit scrolls the conversation.
- *
- *  It deliberately does not share `j`/`k`'s helper, whose off-screen branch brings the cursor row back
- *  into view and claims the unit. That is right for a cursor MOTION and wrong for a view scroll --
- *  vim's CTRL-E/CTRL-Y never move the view toward the cursor. With the box just below the view, held
- *  `Ctrl+y` would jump back down to the row each time it had scrolled it off and never get past it,
- *  and `Ctrl+e` would jump a whole box height. */
-function scrollVisibleRowBox(row: HTMLElement | null, direction: 1 | -1): boolean {
-  const box = row?.querySelector<HTMLElement>(".tool-result-body") ?? null;
-  const list = box?.closest(".message-list") ?? null;
-  if (box === null || list === null) return false;
-  const b = box.getBoundingClientRect();
-  const l = list.getBoundingClientRect();
-  if (b.bottom <= l.top || b.top >= l.bottom) return false;
-  return scrollBoxOneStep(box, direction);
-}
-
-/** One step inside a row's own text, in whole pixels: `STEP_LINES` of the row's TEXT's computed line
- *  height (`rowTextElement`). Derived, not a pixel constant, so it follows the theme's font size and
- *  the display's scale. Used by the `?` overlay's own scrolling; the conversation's rows are stepped
- *  by `./jkScroll`'s `decidePress`, which measures the same line. */
-function rowScrollStep(row: HTMLElement): number {
-  return STEP_LINES * computedLineHeight(rowTextElement(row));
-}
-
-/** The sheet owns its scroll box: line motions share the conversation's text-sized step, while page
- *  motions use the visible sheet height so they still fit after resizing the window. */
-function scrollKeymapOverlay(el: HTMLDivElement | null, key: string, ctrl: boolean) {
-  if (el === null) return;
-  if (ctrl) {
-    if (key === "d") el.scrollTop += el.clientHeight / 2;
-    else if (key === "u") el.scrollTop -= el.clientHeight / 2;
-    else if (key === "f") el.scrollTop += el.clientHeight;
-    else if (key === "b") el.scrollTop -= el.clientHeight;
-  } else {
-    if (key === "j" || key === "ArrowDown") el.scrollTop += rowScrollStep(el);
-    else if (key === "k" || key === "ArrowUp") el.scrollTop -= rowScrollStep(el);
-    else if (key === "PageDown" || key === " ") el.scrollTop += el.clientHeight;
-    else if (key === "PageUp") el.scrollTop -= el.clientHeight;
-    else if (key === "gg") el.scrollTop = 0;
-    else if (key === "G") el.scrollTop = Math.max(0, el.scrollHeight - el.clientHeight);
-  }
-}
-
-/** Brings `row` on screen in `list` after the cursor has landed on it, by computing the `scrollTop`
- *  itself (`./jkScroll`'s `decideLanding`) rather than asking the engine's `scrollIntoView`: WebKitGTK
- *  2.52.6's `nearest` top-aligns any row taller than the view, which turned `k` into a row above into a
- *  whole-view jump. `direction` is the key that moved the cursor (`1` for `j`, `-1` for `k`) or `0` for
- *  any other way, which judges from where the row lies. `animate` eases the move out over 150ms.
- *
- *  `head`: a row taller than the view is entered at its head, from any direction -- a permission card that
- *  `focus_permission` lands on is read from its first line.
- *
- *  With no layout to judge -- a panel that is not laid out yet, or jsdom -- it falls back to
- *  `scrollIntoView`, which then does nothing a reader could see anyway. */
-function revealRow(list: HTMLElement | null, row: HTMLElement, direction: 1 | -1 | 0, animate = false, head = false) {
-  const geometry = list === null ? null : readRowGeometry(list, row);
-  if (list === null || geometry === null) {
-    row.scrollIntoView({ block: "nearest" });
-    return;
-  }
-  const landing = decideLanding({ direction, head, ...geometry });
-  if (landing.how !== "stay") scrollListTo(list, landing.scrollTop, animate);
-}
-
-/** A tool result's box is entered at the end nearest the reader -- its start going down, its end going
- *  up -- so it never carries the position it was last read to. Called when `j`/`k` land on the row. */
-function enterBoxAtNearEnd(row: HTMLElement, direction: 1 | -1) {
-  const box = row.querySelector<HTMLElement>(".tool-result-body");
-  if (box === null) return;
-  box.scrollTop = direction > 0 ? 0 : Math.max(0, box.scrollHeight - box.clientHeight);
-}
-
-/** What `j`/`k` do inside the cursor row before they move off it, up to `times` presses' worth (a count):
- *  bring the row back if it is out of view, step its tool result's box if that is on screen, step the
- *  conversation through the row while its end is past the margin -- `./jkScroll`'s `decidePress`, which
- *  has the rules. Returns how many presses it spent, `0` when the first has nothing to scroll and the
- *  cursor should simply move. A count stops spending itself the moment a press has nothing left to give,
- *  and whatever remains moves rows.
- *
- *  Only a lone press eases; a held key's repeats and a count scroll at once, so a run of them is not a
- *  run of animations restarting. Nothing here measures without a layout (`readRowGeometry`), so a panel
- *  not yet laid out, or jsdom, spends nothing and the cursor moves. */
-function stepWithinRow(row: HTMLElement | null, direction: 1 | -1, times: number, animate: boolean): number {
-  const list = row?.closest<HTMLElement>(".message-list") ?? null;
-  if (row == null || list === null) return 0;
-  const easeOut = animate && times === 1;
-  let spent = 0;
-  while (spent < times) {
-    const geometry = readRowGeometry(list, row);
-    if (geometry === null) break;
-    const box = row.querySelector<HTMLElement>(".tool-result-body");
-    const press = decidePress({
-      direction,
-      view: geometry.view,
-      row: geometry.row,
-      line: geometry.line,
-      box: box === null ? null : readBoxState(list, box),
-      boxLine: box === null ? geometry.line : computedLineHeight(box),
-    });
-    if (press.kind === "move") break;
-    if (press.kind === "box") {
-      if (box === null) break;
-      const before = box.scrollTop;
-      box.scrollTop = press.boxScrollTop;
-      if (box.scrollTop === before) break;
-    } else {
-      const before = list.scrollTop;
-      scrollListTo(list, press.scrollTop, easeOut);
-      if (!easeOut && list.scrollTop === before) break;
-    }
-    spent++;
-  }
-  return spent;
-}
-
-/** The conversation rows inside `list` that are at least partly on screen. */
-function visibleRows(list: HTMLElement): HTMLElement[] {
-  const l = list.getBoundingClientRect();
-  return conversationRows(list).filter((row) => {
-    const r = row.getBoundingClientRect();
-    return r.bottom > l.top && r.top < l.bottom;
-  });
-}
-
-/** Vim's scrolloff rule: after a scroll the panel did not make by moving the cursor, a cursor
- *  whose row is entirely off screen goes to the nearest visible row. `null`: leave it. Reads
- *  geometry only; never writes `scrollTop`. */
-export function clampCursorToView(list: HTMLElement, rows: HTMLElement[], cursor: number): number | null {
-  const current = rows[cursor];
-  if (current === undefined) return null;
-  const l = list.getBoundingClientRect();
-  const r = current.getBoundingClientRect();
-  if (r.bottom > l.top && r.top < l.bottom) return null;
-  const onScreen = visibleRows(list);
-  if (onScreen.length === 0) return null;
-  const target = r.bottom <= l.top ? onScreen[0] : onScreen[onScreen.length - 1];
-  const index = rows.indexOf(target);
-  return index === -1 ? null : index;
-}
-
-/** Everything `MessageList` normally reads live, captured once when VISUAL
- *  starts and handed back unchanged for as long as it is on -- only `cursor`/`focused`/`visual`
- *  itself keep moving. `null` outside VISUAL/V-LINE. */
-type FrozenSnapshot = {
-  state: AgentUiState;
-  expanded: Record<string, boolean>;
-  detailed: boolean;
-  ruleOffers: Record<string, string>;
-  answeredPermissions: ReadonlySet<string>;
-  sessionEnded: boolean;
-  turnDurations: TurnDurations;
-};
-
-/** The tool name of the OLDEST pending permission -- the lowest `seq`, the one the
- *  model has waited on longest -- for `ActivityLine`'s "needs approval" slot, or `null` when
- *  nothing waits. */
-function oldestPendingTool(state: AgentUiState): string | null {
-  let oldest: (typeof state.pendingPermissions)[number] | null = null;
-  for (const request of allCards(state)) {
-    if (oldest === null || request.seq < oldest.seq) oldest = request;
-  }
-  return oldest?.toolName ?? null;
-}
-
-/** Where a reader was when the keys left the panel (`pane_focus` false), for the `arrive` that
- *  brings them back. One slot beside `viewStore`, never in it: an arrival must neither consume nor
- *  overwrite the view a tab switch saved, and a park dies with a switch (`tabs` arm). `following` is
- *  "at the bottom AND on the last row" -- in a conversation that fits the view `atBottom` alone is
- *  always true, and would send a reader who put the cursor on row 1 back to the last row. `atKey`:
- *  `typingGuard.keyCount()` at the leave, so any panel key since then makes the park stale. */
-type ArrivalPark = { tab: TabId; view: TabViewState; cursorKey: string | null; following: boolean; atKey: number };
-
-/** The scroll half of putting a saved view back (a tab switch's restore and an arrival's): `follow`
- *  re-arms following outright, as a send does; otherwise the write is announced as the user's, so
- *  `MessageList` does not fight it, and the list goes back to where it was. */
-function applyViewScroll(list: HTMLElement, view: TabViewState, follow: boolean, stop = false) {
-  // A restored view replaces whatever was easing, even one that began at the very position this writes.
-  cancelListScroll(list);
-  if (follow) {
-    resumeFollowing(list);
-    return;
-  }
-  // `stop`: a view that was not following must come back not following, whatever the
-  // list decided while it was away -- a card resolved above the reader shrinks the list, the browser
-  // clamps `scrollTop` to the new end, and `MessageList` reads that scroll as "at the bottom" and
-  // re-arms following, so the next streamed row would snap the view (and, through the scroll clamp, the
-  // cursor) away from the row just restored. "up" stops following outright, as `k`/`gg` do.
-  noteUserScroll(list, stop ? "up" : "unknown");
-  list.scrollTop = view.scrollTop;
-}
-
-/** What `<leader>k` says when the agent left nothing running (Rust's `NOTHING_IN_THE_BACKGROUND`). */
-const NOTHING_IN_THE_BACKGROUND = "nothing is running in the background";
-
-/** What `<leader>k` says on a Claude tab: its session does not report what it left running, so "nothing" would
- *  claim more than is known. */
-const CLAUDE_REPORTS_NO_BACKGROUND = "this Claude Code sidecar does not report background work";
-
-/** `<leader>k`'s line when there is nothing to stop, for the tab's agent. */
-function nothingToStopWords(agent: string | undefined): string {
-  return agent === "claude" ? CLAUDE_REPORTS_NO_BACKGROUND : NOTHING_IN_THE_BACKGROUND;
-}
-
-/** `<leader>k`'s question: what is stopped, by whom it was left running, and what stopping it costs. */
-function stopBackgroundQuestion(who: string, running: number): string {
-  const what = running === 1 ? "the command" : `the ${running} commands`;
-  return `Stop ${what} ${who} left running? This ends the session; the conversation can be resumed. y/n`;
-}
 
 export default function App() {
   /** Everything the envelope router decides (`./page_model`). `pageRef` is the latest model, written
@@ -2156,197 +1794,28 @@ export default function App() {
     if (edgeFocused && !containerRef.current?.contains(document.activeElement)) setEdgeFocused(false);
   });
 
-  /* The cursor is an index into `timeline`, which shrinks on its own -- a permission card resolving
-     removes one row without anything here asking for it. Without this, a cursor left pointing past
-     the new end copies/expands nothing (`timeline[cursor]` is `undefined`) rather than sliding onto
-     the new last row, which is what every other list-with-a-cursor does when its tail disappears. */
-  useEffect(() => {
-    setCursor((c) => Math.min(c, Math.max(timeline.length - 1, 0)));
-  }, [timeline.length]);
-  /** A run collapsing or expanding shifts every index after it, the same shrink-by-something-
-   *  other-than-a-key the effect above exists for -- but here the row the cursor was ON is usually
-   *  still present, just folded into a run or unfolded back out of one, so sliding onto a nearby
-   *  index (what the effect above does for a row that is genuinely GONE) would move the cursor off a
-   *  row that still exists. `cursorKeyRef` remembers the KEY the cursor sat on across the render that
-   *  changed `timeline`; if that key is not where the index now points, `indexOfKey` finds it again
-   *  (a `t-<seq>` folded into a run is found at the run's own key) and the cursor follows it there,
-   *  landing rather than scrolling (`landingRef.current = "keep"`, the same convention every other
-   *  cursor-preserving move in this file uses). A key that has genuinely left the timeline (a
-   *  resolved permission) falls through to the effect above instead.
-   *
-   *  **Why this does not fire on `cursor` alone: the simpler version failed 47 tests.** That version fires this reconciliation on `cursor` alone changing too (its own
-   *  dependency array is `[timeline, cursor]` with no guard distinguishing the two), which means an
-   *  ORDINARY `j`/`k`/`gg`/`G`/search move -- `timeline` unchanged, only `cursor` moves -- reads as
-   *  "the row `want` pointed at relocated", finds that same row still sitting at its OLD index (since
-   *  nothing structural changed), and calls `setCursor` right back to where the user just moved away
-   *  from. Every keyboard-driven cursor move in the suite failed this way. `prevTimelineRef` below is
-   *  the fix: the reconciliation only runs when `timeline`'s own object identity changed since the
-   *  last time this effect ran (a real collapse/expand/tab-switch), never merely because `cursor` did. */
+  useClampCursorToTimeline(setCursor, timeline);
   const cursorKeyRef = useRef<string | null>(null);
   const prevTimelineRef = useRef<TimelineItem[] | null>(null);
-  /* **Correction (a GUI pass, 2026-09-25): and only when `cursor` did NOT change.**
-     `timeline` is a new object on every streamed delta, so a cursor move committed in the same render
-     as one -- the scroll clamp, a `j`/`k`, a restore -- met `timelineChanged`, found the key it had just left
-     still at its old index, and was put straight back. The move back carried no `"keep"` (the slot
-     was spent on the move it undid), so the `[cursor]` effect revealed the stale row, scrolling the
-     list up inside a restore's steering window, and `MessageList` stopped following: a tab switched
-     back to mid-stream came back parked above the end with a pill. A cursor that moved in this render
-     was moved on purpose; only a timeline change under a still cursor is a fold to follow. */
   const prevCursorRef = useRef(cursor);
-  useLayoutEffect(() => {
-    const timelineChanged = prevTimelineRef.current !== null && prevTimelineRef.current !== timeline;
-    const cursorMoved = prevCursorRef.current !== cursor;
-    prevTimelineRef.current = timeline;
-    prevCursorRef.current = cursor;
-    const want = cursorKeyRef.current;
-    if (timelineChanged && !cursorMoved && want !== null && timeline[cursor]?.key !== want) {
-      const found = indexOfKey(timeline, want);
-      if (found !== null && found !== cursor) {
-        landingRef.current = "keep";
-        setCursor(found);
-        return;
-      }
-    }
-    cursorKeyRef.current = timeline[cursor]?.key ?? null;
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [timeline, cursor]);
-  /** Keeps the row the cursor sits on inside the viewport whenever the cursor moves. Before this,
-   *  `j`/`k` moved an invisible highlight once it passed the bottom of the message list -- which
-   *  reads exactly like the key doing nothing (seen on an installed build: `j` could not move down
-   *  inside a long output). `"nearest"` is the least-jarring `ScrollLogicalPosition`: a row
-   *  already fully on screen does not move at all, unlike `"start"`/`"center"`, which would shove
-   *  the viewport around on every single step even when nothing needed to move.
-   *
-   *  Reads through `containerRef` -- already queried above for focus -- rather than a second ref
-   *  into `MessageList`'s own DOM, since every row is a descendant of it. The row is the cursor's
-   *  own (`conversationRows`), never the first `.row-current` in the DOM: a model reply's HTML could
-   *  draw one of those above the real row.
-   *
-   *  Kept from fighting `MessageList`'s own follow-the-newest-message effect (`MessageList.tsx`,
-   *  the `bottomRef` effect -- the GUI pass, 2026-09-24: there is no `bottomRef` any more; the follow
-   *  is a snap to the end, from that effect and from its `ResizeObserver`, and gated the same way)
-   *  by gating THAT effect on the message list's own scroll position
-   *  rather than on this cursor -- see its doc comment. This effect never needs to check anything
-   *  about that one: it only ever moves the viewport the minimum amount to reveal one row, so if
-   *  the other effect already put the tail in view, this is a no-op, and if the user is reading
-   *  further up, this is the only one of the two still allowed to move anything.
-   *
-   *  jsdom implements no layout and has no `scrollIntoView` on `Element` at all (this file's own
-   *  `beforeAll` stubs it for the same reason `MessageList.test.tsx`'s does), so a jsdom test can
-   *  only assert that this was CALLED on the right element -- never that the row actually ends up
-   *  on screen. That is a GUI check nobody has run yet. */
-  useEffect(() => {
-    const landing = landingRef.current;
-    const animate = landingAnimateRef.current;
-    const head = landingHeadRef.current;
-    landingRef.current = 0;
-    landingAnimateRef.current = false;
-    landingHeadRef.current = false;
-    if (landing === "keep") return;
-    // While VISUAL is on the list on screen is the frozen one,
-    // and `cursor` indexes the LIVE timeline -- a prompt sent at a turn's end moved it to a row the
-    // frozen list does not have, and this used to scroll whichever frozen row sat at that index into
-    // view under the selection. VISUAL moves the view only for its own caret; the row cursor is
-    // placed again, by key, when VISUAL ends (`landCursorOnRowKey`).
-    if (frozenSnapshotRef.current !== null) return;
-    const root = containerRef.current;
-    const row = root === null ? undefined : conversationRows(root)[cursor];
-    if (row === undefined) return;
-    const list = row.closest<HTMLElement>(".message-list");
-    if (list !== null) settleListScroll(list);
-    if (landing !== 0) enterBoxAtNearEnd(row, landing);
-    revealRow(list, row, landing, animate, head);
-  }, [cursor]);
-  /** A scroll the panel did not cause by moving the cursor -- a wheel, a drag, the browser's own
-   *  scroll keys -- can leave the cursor's row off screen. Whenever that happens, the cursor moves to
-   *  the nearest visible row; the view itself is never touched here (`clampCursorToView` above never
-   *  writes `scrollTop`). `sessionStarted` mirrors the conversation layout's own
-   *  mount condition, so this attaches only while `.message-list` actually exists. */
+  usePreserveCursorRow(prevTimelineRef, timeline, prevCursorRef, cursor, cursorKeyRef, landingRef, setCursor);
+  useRevealCursorRow(landingRef, landingAnimateRef, landingHeadRef, frozenSnapshotRef, containerRef, cursor);
   const cursorRefForScroll = useRef(cursor);
   cursorRefForScroll.current = cursor;
-  useEffect(() => {
-    const list = containerRef.current?.querySelector<HTMLElement>(".message-list");
-    if (!list) return;
-    const onListScroll = () => {
-      // The rows below are the FROZEN list's while VISUAL is on,
-      // and the index this writes back would name a live row by a frozen position -- the two differ
-      // once a row arrives. VISUAL's own caret scrolls the list; the row cursor is placed again,
-      // by key, when VISUAL ends.
-      if (frozenSnapshotRef.current !== null) return;
-      // While a `j`/`k` eases the view toward its target the cursor's row, still on its way in, can be
-      // wholly out of view for a frame; the target has it in view, so nothing is re-homed until it lands.
-      if (isListScrollAnimating(list)) return;
-      const rows = conversationRows(list);
-      const next = clampCursorToView(list, rows, cursorRefForScroll.current);
-      if (next !== null && next !== cursorRefForScroll.current) {
-        landingRef.current = "keep";
-        setCursor(next);
-      }
-    };
-    // A wheel or a touch drag on the list is the reader choosing a new place, keys or not; the
-    // next arrival must not undo it by restoring the parked one.
-    const dropPark = () => {
-      arrivalParkRef.current = null;
-    };
-    list.addEventListener("scroll", onListScroll, { passive: true });
-    list.addEventListener("wheel", dropPark, { passive: true });
-    list.addEventListener("touchmove", dropPark, { passive: true });
-    return () => {
-      list.removeEventListener("scroll", onListScroll);
-      list.removeEventListener("wheel", dropPark);
-      list.removeEventListener("touchmove", dropPark);
-    };
-  }, [sessionStarted]);
-  /** At the bottom, the cursor rides the new last row as the conversation grows, and a sent
-   *  prompt takes the cursor outright. Keyed on `timeline`, since a plain `state` change (a card
-   *  answered, a tool result arriving) must not move the cursor when the timeline itself did not
-   *  grow. `landOnPromptRef` is set by the `events` dispatch arm the moment a `user_prompt_submitted`
-   *  arrives in the batch; it is read and cleared here rather than in the dispatcher, since the row
-   *  it targets does not exist until this render's `timeline` reflects it. */
+  useClampCursorOnScroll(
+    containerRef,
+    frozenSnapshotRef,
+    cursorRefForScroll,
+    landingRef,
+    setCursor,
+    arrivalParkRef,
+    sessionStarted,
+  );
   const lastLengthRef = useRef(0);
   const landOnPromptRef = useRef(false);
   /** Set by a switch's (or a mount's) first snapshot with no saved view: see the `snapshot` arm. */
   const landOnLastRef = useRef(false);
-  /* A layout effect since a GUI pass (2026-09-25). As a passive effect it ran after
-     the browser's next rendering step, which is where the list's scroll event -- from `MessageList`'s
-     own snap to the end -- is dispatched; the scroll clamp therefore saw the cursor still on the row that
-     WAS last, off screen once a row taller than the view had arrived, and moved it to the nearest
-     visible row, which is not always the last one. The ride then no longer matched (`cursor` was no
-     longer `previous - 1`), and a following view kept its cursor a row above the end for the rest
-     of the reply. `MessageList`'s snap is a layout effect of a child, so it has already run here and
-     the distance read below is the snapped one. */
-  useLayoutEffect(() => {
-    const previous = lastLengthRef.current;
-    lastLengthRef.current = timeline.length;
-    if (landOnLastRef.current) {
-      landOnLastRef.current = false;
-      const last = Math.max(timeline.length - 1, 0);
-      // The view is already at the end, so the landing moves nothing -- and `"keep"` only for a
-      // cursor that really moves (a `"keep"` no `[cursor]` effect consumes swallows the next reveal).
-      if (last !== cursor && !landOnPromptRef.current) {
-        landingRef.current = "keep";
-        setCursor(last);
-        return;
-      }
-    }
-    if (landOnPromptRef.current) {
-      landOnPromptRef.current = false;
-      for (let i = timeline.length - 1; i >= 0; i--) {
-        if (timeline[i].kind === "prompt") {
-          setCursor(i);
-          return;
-        }
-      }
-    }
-    if (timeline.length <= previous || cursor !== previous - 1) return;
-    const list = containerRef.current?.querySelector<HTMLElement>(".message-list");
-    const atBottom = !list || list.scrollHeight - list.scrollTop - list.clientHeight <= 1;
-    if (atBottom) {
-      landingRef.current = "keep";
-      setCursor(timeline.length - 1);
-    }
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [timeline]);
+  useRideLastRow(lastLengthRef, timeline, landOnLastRef, cursor, landOnPromptRef, landingRef, setCursor, containerRef);
   /** The scroll half of a tab switch's view restore: cursor and mode are set
    *  directly in the `snapshot` handler above, but the row the cursor lands on must exist in the DOM
    *  first, so the scroll position waits for the render that `setState` there causes. A layout
@@ -2402,14 +1871,7 @@ export default function App() {
     const item = index === null ? undefined : timeline[index];
     return item?.kind === "permission" ? `${activeTabRef.current}:${item.request.permissionId}` : null;
   })();
-  useLayoutEffect(() => {
-    ctrlYTargetRef.current = { key: ctrlYTargetKey, settled: false };
-    if (ctrlYTargetKey === null) return;
-    const handle = setTimeout(() => {
-      if (ctrlYTargetRef.current.key === ctrlYTargetKey) ctrlYTargetRef.current = { key: ctrlYTargetKey, settled: true };
-    }, TYPING_GUARD_MS);
-    return () => clearTimeout(handle);
-  }, [ctrlYTargetKey]);
+  useWaitForCtrlYTarget(ctrlYTargetRef, ctrlYTargetKey);
   /* INPUT on a dead session was a one-way trap, and the panel's own banners promised otherwise.
      The composer's textarea is `disabled` once the session ends, so `autoFocus` does nothing and
      focus stays on the root -- keys still ARRIVE, they are just dropped: `resolveKey`'s "input"
@@ -2441,28 +1903,16 @@ export default function App() {
   useEffect(() => {
     if (sessionEnded) setKeymapOpen(false);
   }, [sessionEnded]);
-  /* A brand-new tab's own arrival (`enter_input`'s only sender now), or a HINT landing on the composer: INPUT with a
-     blinking caret. Refused under the same condition `i` is (`resolveKey`): a dead session has no box to type into,
-     and no session at all has no composer. Keyed on the request alone, so a session change never opens the composer
-     by itself. There is no card to check for here any more -- a tab this fresh has none, and every arrival that COULD
-     find one waiting now sends `arrive` instead (the effect just below). */
-  useEffect(() => {
-    if (inputRequest === 0) return;
-    // An overlay drawn over the conversation must keep the keys rather than let
-    // this open a composer underneath it.
-    if (overlayOpen) {
-      takeKeys();
-      return;
-    }
-    if (!sessionStarted || sessionEnded) return;
-    setMode("input");
-    // Requests that open the live composer restore its kept caret, matching i, o and Ctrl+j.
-    // A selects the end through a separate focus request, so its caret choice must not carry
-    // over into a later request to resume typing at the saved position.
-    setComposerCaret("kept");
-    setComposerFocusRequest((n) => n + 1);
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [inputRequest]);
+  useEnterInput(
+    inputRequest,
+    overlayOpen,
+    takeKeys,
+    sessionStarted,
+    sessionEnded,
+    setMode,
+    setComposerCaret,
+    setComposerFocusRequest,
+  );
   /* `arrive`: reverses the 2026-09-19 choice that `Ctrl+l` put the caret straight into the composer,
      for every keyboard arrival except a brand-new tab's (`enter_input`, unchanged, above). A
      card waiting in this tab gets the same landing `focus_permission` gives -- BROWSE, on the oldest
@@ -2631,47 +2081,16 @@ export default function App() {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [sessionStarted]);
 
-  /** The freeze's defence in depth (at first not built at all -- a test was written to assert
-   *  "the observer silent", with no observer to be silent). `MessageList`
-   *  reading `frozenSnapshot` (the freeze's PRIMARY mechanism, above) already keeps its own subtree still
-   *  while VISUAL is on; this watches `.message-list` anyway, for whatever that primary mechanism
-   *  does not cover -- a bug in the freeze itself, or some other code path writing into the DOM
-   *  VISUAL is holding a selection in. A `childList`/`characterData` change touching either end of
-   *  the selection VISUAL built ends it with the same flash as a live check at `y`-time
-   *  finding the selection no longer matches. Deliberately narrow (only the two ENDS, not "anything
-   *  in the subtree changed"): a delta landing on some other, unrelated row must not interrupt a
-   *  read of a different one, and the mode does not end "on a card arriving or a reply
-   *  streaming" by itself. */
-  useEffect(() => {
-    if (!isRegionMode(mode)) return;
-    if (typeof MutationObserver === "undefined") return;
-    const list = messageListEl();
-    if (list === null) return;
-    const observer = new MutationObserver((mutations) => {
-      const built = visualBuiltRef.current;
-      if (built === null) return;
-      const touches = (node: Node) =>
-        node === built.anchorNode || node === built.focusNode || node.contains(built.anchorNode) || node.contains(built.focusNode);
-      for (const mutation of mutations) {
-        // `characterData`'s own `target` IS the changed text node -- typically the anchor/focus
-        // node itself, since both are text positions. `childList`'s `target` is the still-attached
-        // PARENT whose children changed, which stays true (and so keeps `touches` reporting a hit)
-        // for content inserted nearby; a REMOVAL is the case that check alone would miss, because a
-        // detached anchor/focus's old parent no longer contains it once the removal has happened --
-        // `removedNodes` is checked for exactly that.
-        if (touches(mutation.target) || Array.from(mutation.removedNodes).some(touches)) {
-          // Names the mode that ended, as `vend` and the
-          // Shift+Tab refusal do -- this said VISUAL while CARET was on.
-          showFlash(`the conversation changed under it — ${regionModeName(modeRef.current)} ended; v to start again`);
-          exitRegion();
-          return;
-        }
-      }
-    });
-    observer.observe(list, { childList: true, characterData: true, subtree: true });
-    return () => observer.disconnect();
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [mode]);
+  useWatchFrozenSelection(
+    isRegionMode,
+    mode,
+    messageListEl,
+    visualBuiltRef,
+    showFlash,
+    regionModeName,
+    modeRef,
+    exitRegion,
+  );
 
   /** The start screen's own DOM anchor -- `HintLayer`'s containing block and the `containerRef ??
    *  startScreenRef` fallback a couple of handlers below use. It used to also be focused whenever
@@ -4371,24 +3790,15 @@ export default function App() {
         ? `${confirm.lines.join(" · ")} · ${flash.text}`
         : confirm.lines.join(" · ");
 
-  /** The trust question, over whichever layout is on screen. A render that throws puts the start off, as
-   *  `Escape` would: leaving the tab asking with nothing to answer would strand it. */
-  const trustOverlay =
-    confirm?.kind === "trust" ? (
-      <PanelErrorBoundary
-        name="trust prompt"
-        onError={() =>
-          overlayFailed("trust prompt", () => {
-            const cancelId = nextRequestId();
-            trackRequest(cancelId, { kind: "trust", tab: confirm.tab });
-            postToRust({ type: "trust_cancel", request_id: cancelId, tab: confirm.tab, nonce: confirm.nonce });
-            setConfirm(null);
-          })
-        }
-      >
-        <TrustPrompt ref={trustOverlayRef} envelope={confirm.view} />
-      </PanelErrorBoundary>
-    ) : null;
+  const trustOverlay = (
+    <TrustOverlay
+      confirm={confirm}
+      setConfirm={setConfirm}
+      overlayFailed={overlayFailed}
+      trackRequest={trackRequest}
+      trustOverlayRef={trustOverlayRef}
+    />
+  );
 
   /** The `:` command line, where vim draws it. It runs `:tabnew` and the trust commands and nothing else:
    *  Enter on anything else says so, Esc (and `Ctrl+[`) closes it silently. Drawn over whichever layout is on
@@ -4954,21 +4364,6 @@ export default function App() {
     const listMoved = listTopBefore !== null && list.scrollTop !== listTopBefore;
     if (listMoved) noteUserScroll(list, list.scrollTop < listTopBefore! ? "up" : "unknown");
     else if (moved) noteUserScroll(list, "unknown");
-  }
-
-  /** Whether `caret` has no usable client rect at all (jsdom, or a node with nothing laid out) --
-   *  `scrollCaretIntoView`'s cue to fall back to the element's own `scrollIntoView`. */
-  function caretRectMissing(caret: Caret): boolean {
-    if (typeof Range === "undefined" || typeof Range.prototype.getBoundingClientRect !== "function") return true;
-    const range = document.createRange();
-    try {
-      range.setStart(caret.node, caret.offset);
-    } catch {
-      return true;
-    }
-    range.collapse(true);
-    const rect = range.getBoundingClientRect();
-    return rect.width === 0 && rect.height === 0 && rect.top === 0 && rect.left === 0;
   }
 
   /** `v`/`V` from BROWSE (`v` starts CARET, `V` starts V-LINE directly). Refuses with a flash and does nothing else when there is nowhere to start
@@ -6471,29 +5866,13 @@ export default function App() {
   const restartHint = activeTab?.resumesOnR
     ? "Press r to resume this conversation."
     : "Press r to start a new session here.";
-  const sessionEndedBanner =
-    state.status.kind === "unavailable" ? (
-      <Row kind="error" sign="✗" role="alert" problem={sessionEndedProblem}>
-        <strong>This session was lost. What is shown above may be incomplete.</strong>
-        <pre>{state.status.reason}</pre>
-        {/* `r` is offered only on this banner and the one below, for resetting this tab -- see
-            `onKeyDown`'s "restart" arm above and `resolveKey`'s `case "r"` in `./keymap`, which is
-            what actually enforces that. The mode this hint is read in is
-            always BROWSE: `resolveKey` refuses `i` once the session has ended and the effect near
-            the top of this component forces BROWSE if it died while INPUT was active, so this
-            sentence cannot be on screen in a mode that drops `r`. */}
-        {!remedyNamesR(sessionEndedProblem) && <div className="row-hint">{restartHint}</div>}
-      </Row>
-    ) : state.status.kind === "closed" ? (
-      // Deliberately NOT `row-error`/`✗`: an ordinary close (the host closed it, the provider
-      // exited cleanly) is not an error, and styling it like the lost-session row above would
-      // train the eye to ignore the one that matters. See `.row-ended` in index.css for the
-      // fuller record of why these two were briefly unified and then split back apart.
-      <Row kind="ended" sign="·" problem={sessionEndedProblem}>
-        This session has ended ({state.status.reason}).
-        {!remedyNamesR(sessionEndedProblem) && <div className="row-hint">{restartHint}</div>}
-      </Row>
-    ) : null;
+  const sessionEndedBanner = (
+    <SessionEndedBanner
+      state={state}
+      restartHint={restartHint}
+      sessionEndedProblem={sessionEndedProblem}
+    />
+  );
 
   /** What the which-key box draws, or `null` while nothing is pending -- gated by `boxShown` in
    *  the JSX below, so a stale `pendingRef.current` left over after its own timer already fired is
