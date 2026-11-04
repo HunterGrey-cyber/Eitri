@@ -43,9 +43,10 @@ pub const NVIM_OVERRIDE_ENV: &str = "EITRI_NVIM";
 /// the write must affect this process rather than only `child_env`, as explained above.
 pub const NEOVIM_BIN_ENV: &str = "NEOVIM_BIN";
 
-/// The fork's own floor (`NEOVIM_REQUIRED_VERSION`, fork `src/bridge/mod.rs:58`) -- LazyVim wants
-/// more (0.11.2), but enforcing that is the fork's business, not this resolver's.
-pub const MINIMUM_VERSION: (u64, u64, u64) = (0, 10, 0);
+/// The oldest nvim Eitri runs. The editor pane hands the same floor to the fork
+/// (`neovide_editor::NVIM_FLOOR`, held equal by `shell/tests/nvim_floor_agrees.rs`), whose own
+/// requirement, 0.12, is Neovide's. LazyVim wants more (0.11.2), but that is LazyVim's to say.
+pub const MINIMUM_VERSION: (u64, u64, u64) = (0, 11, 0);
 
 /// `$XDG_DATA_HOME/eitri/<this>`: where the installer's `tar --strip-components=1`
 /// lands a version, and where [`resolve`] looks for one. The exact path a match is built from is

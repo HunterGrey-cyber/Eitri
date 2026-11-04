@@ -111,6 +111,7 @@ fn launch_sized(extra: &[&str], open: &[String], (cols, rows): (u32, u32)) -> Ed
         extra_nvim_args: pane_args(extra, open),
         // As the pane starts it.
         startup_message_capture: false,
+        minimum_nvim_version: Some(neovide_editor::NVIM_FLOOR),
         ..Default::default()
     })
     .unwrap_or_else(|e| panic!("LiveHarness::with_options failed: {e:#}"));
@@ -381,12 +382,13 @@ fn dirty_swap_case(dir: &Path, size: (u32, u32)) {
     let mut editor = launch_sized(&["--cmd", &directory], &[path_str(&file)], size);
     println!("open_at_start: harness constructed after {:?}", started.elapsed());
 
-    // The prompt must be up and visible to the host: nvim is in a prompt mode (`r?` for the question,
-    // `rm` for a "more" page before it). Only the "more" page reports `blocking`.
+    // The prompt must be up and visible to the host: nvim is in a prompt mode (the question's, `r?` from
+    // nvim 0.12 and `c` on 0.11, or `rm` for a "more" page before it). Only the "more" page reports `blocking`.
+    let question = question_mode();
     let deadline = Instant::now() + Duration::from_secs(15);
     let mut mode = loop {
         let mode = nvim_mode(&mut editor).0;
-        if mode.starts_with('r') {
+        if mode == question || mode == "rm" {
             break mode;
         }
         assert!(
@@ -408,9 +410,10 @@ fn dirty_swap_case(dir: &Path, size: (u32, u32)) {
         "open_at_start: is_ready with the prompt up, {:?} after the start",
         started.elapsed()
     );
+    let still = nvim_mode(&mut editor).0;
     assert!(
-        nvim_mode(&mut editor).0.starts_with('r'),
-        "{case}: the prompt went away by itself"
+        still == question || still == "rm",
+        "{case}: the prompt went away by itself (mode {still:?})"
     );
 
     // A space goes on to the next "more" page until the question itself is up.
@@ -422,7 +425,7 @@ fn dirty_swap_case(dir: &Path, size: (u32, u32)) {
         pump(&mut editor, Duration::from_millis(150));
         mode = nvim_mode(&mut editor).0;
     }
-    assert_eq!(mode, "r?", "{case}: the question itself is up");
+    assert_eq!(mode, question, "{case}: the question itself is up");
     // `e` is "Edit anyway": the prompt goes and the file's buffer is the current one.
     editor.harness.send_text_input("e");
     let got = ask(
@@ -434,6 +437,27 @@ fn dirty_swap_case(dir: &Path, size: (u32, u32)) {
     assert_eq!(got["full"], path_str(&file), "{case}: {got}");
     assert_eq!(got["text"], "original", "{case}: {got}");
     shut(editor);
+}
+
+/// The swap file question's `nvim_get_mode` mode on the `nvim` on `PATH`: `r?` from 0.12, `c` on 0.11.
+fn question_mode() -> &'static str {
+    let out = Command::new("nvim").arg("--version").output().expect("nvim on PATH");
+    let first = String::from_utf8_lossy(&out.stdout)
+        .lines()
+        .next()
+        .unwrap_or_default()
+        .to_owned();
+    let numbers = first
+        .strip_prefix("NVIM v")
+        .unwrap_or_else(|| panic!("unexpected nvim --version line: {first:?}"));
+    let mut parts = numbers
+        .split(|c: char| !c.is_ascii_digit())
+        .map(|p| p.parse::<u64>().expect("a number"));
+    if (parts.next().unwrap(), parts.next().unwrap()) >= (0, 12) {
+        "r?"
+    } else {
+        "c"
+    }
 }
 
 /// nvim's `(mode, blocking)` from `nvim_get_mode`, which it answers even while it waits for a key.

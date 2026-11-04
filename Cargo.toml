@@ -55,3 +55,10 @@ default-members = [
 version = "0.3.0"
 edition = "2021"
 publish = false
+
+# The Neovide fork builds against Neovide's own nvim-rs branch (its `[patch.crates-io]`), which a
+# dependency's patch section cannot give this workspace: nvim-rs master plus "drain queued
+# notifications before reporting RPC EOF". Pinned by commit, never the branch. LGPL-3.0 like the
+# crates.io release; `packaging/collect-licenses.py` reads its texts from the git checkout.
+[patch.crates-io]
+nvim-rs = { git = "https://github.com/neovide/nvim-rs", rev = "7f41ba0c23457c858dc3e9afb3b5de527850ca73" }

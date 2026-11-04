@@ -852,8 +852,10 @@ mod tests {
                 let nvim = nvim.clone();
                 block_on(async move { nvim.input("x").await.unwrap() });
             }
+            // The dialog's mode: `r?` on nvim 0.12, `c` on 0.11.
+            let dialog_mode = crate::test_nvim::prompt_mode();
             wait_for("the dialog", || {
-                quit.watch().last_answer.is_some_and(|a| a.mode == "r?")
+                quit.watch().last_answer.is_some_and(|a| a.mode == dialog_mode)
             });
             {
                 let nvim = nvim.clone();
@@ -870,7 +872,7 @@ mod tests {
             // A stopped nvim: the watch's last sign of life stays where it was.
             let stuck = watched(&nvim);
             wait_for("the second dialog", || {
-                stuck.watch().last_answer.is_some_and(|a| a.mode == "r?")
+                stuck.watch().last_answer.is_some_and(|a| a.mode == dialog_mode)
             });
             let pid = child.id().expect("pid") as libc::pid_t;
             // SAFETY: a signal to the child this test spawned and still holds.

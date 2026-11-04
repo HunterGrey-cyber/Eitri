@@ -1300,12 +1300,13 @@ ctr_proof() {
 			BUILD) build="$value" ;;
 		esac
 	done < <(python3 packaging/release_check.py relink-recipe SOURCE)
-	[ -n "$copy" ] && [ -n "$unlock" ] && [ -n "$build" ] && [ "${#patch[@]}" = 2 ] || ctr_die "cannot read SOURCE's relink recipe"
+	[ -n "$copy" ] && [ -n "$unlock" ] && [ -n "$build" ] && [ "${#patch[@]}" = 1 ] || ctr_die "cannot read SOURCE's relink recipe"
 	bash -c "$copy"
 	bash -c "$unlock"
 	printf '\n// Eitri release proof: a trivial change (LGPL-3.0 sec 4(d)(0) relink recipe)\npub const EITRI_RELINK_PROOF: u32 = 1;\n' \
 		>> "$modified/src/lib.rs"
-	printf '\n%s\n' "${patch[@]}" >> Cargo.toml
+	python3 packaging/release_check.py apply-relink-patch Cargo.toml "${patch[0]}" \
+		|| ctr_die "cannot apply step 4 of SOURCE's relink recipe to Cargo.toml"
 	bash -c "$build" 2>&1 | tee "$logs/proof-b-build.log"
 	[ ! -e "$marker" ] || ctr_die "proof (b) reached npm: $(cat "$marker")"
 	grep -Eq "Compiling nvim-rs v[0-9.]+ \(/proof/work/$asset/$modified\)" "$logs/proof-b-build.log" \

@@ -11,7 +11,7 @@ publish.workspace = true
 # no extra "gl"-crate glue is needed here beyond libloading).
 gtk4 = { version = "0.11.4", features = ["v4_18"] }
 libloading = "0.9.0"
-skia-safe = { version = "0.153.3", features = ["gl"] }
+skia-safe = { version = "0.156.0", features = ["gl"] }
 
 # The patched Neovide fork (branch `neovibe-integration`), depended on via its `neovide` library
 # target (same name as the `[package]`, no rename). Pulls in `neovide::live_harness::LiveHarness`

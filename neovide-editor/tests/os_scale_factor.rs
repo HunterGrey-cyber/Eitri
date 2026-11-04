@@ -12,7 +12,7 @@
 //! Zero, negative and NaN display scales return `false` without changing state.
 //! Setting display scale back to 1.0 restores the baseline cell width.
 //!
-//! Ignored unless requested: requires nvim >= 0.10 on `PATH`. Start a separate `Xvfb`
+//! Ignored unless requested: requires nvim >= 0.11 on `PATH`. Start a separate `Xvfb`
 //! for the clipboard before winit connects, clearing inherited `WAYLAND_DISPLAY` and `DISPLAY`.
 //! Use a plain `main` (`harness = false`) because winit requires the event loop on the main
 //! thread, while libtest runs tests on separate threads. Run without a wrapper:
@@ -133,9 +133,10 @@ fn main() {
         os_scale_factor: 1.0,
         grid_size: Some(GridSize::new(40u32, 8u32)),
         extra_nvim_args: vec!["--clean".to_string()],
+        minimum_nvim_version: Some(neovide_editor::NVIM_FLOOR),
         ..Default::default()
     })
-    .expect("LiveHarness::with_options failed -- is `nvim` (>= 0.10) on $PATH?");
+    .expect("LiveHarness::with_options failed -- is `nvim` (>= 0.11) on $PATH?");
 
     let mut frames = Frames::new();
     let deadline = Instant::now() + Duration::from_secs(15);

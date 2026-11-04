@@ -333,7 +333,7 @@ once, or install from `eitri-@VERSION@-x86_64-linux.tar.gz` with
 (or unpack it and run its own `bin/eitri setup` from inside the extracted directory). A `.deb`/`.rpm` upgrade
 from 0.2.2 needs that `eitri setup` again: it builds the new agent backend.
 
-Eitri needs `nvim` >= 0.10 somewhere it can find one -- either on `PATH`, or its own private copy
+Eitri needs `nvim` >= 0.11 somewhere it can find one -- either on `PATH`, or its own private copy
 under `XDG_DATA_HOME/eitri/nvim` (never placed on `PATH`; none of the packages depend on a system
 nvim). Ubuntu 24.04's own package is 0.9.5, below that floor. `install.sh` (the curl command above)
 offers to fetch the official nvim release for you at install time if none new enough is found; run

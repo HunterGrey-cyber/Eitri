@@ -21,7 +21,7 @@ pkgbase = eitri-git
 	depends = webkitgtk-6.0
 	depends = glibc
 	depends = gcc-libs
-	optdepends = neovim: the editor (any nvim >= 0.10 on PATH)
+	optdepends = neovim: the editor (any nvim >= 0.11 on PATH)
 	optdepends = claude-code: the Claude Code CLI the panel drives
 	optdepends = noto-fonts: the ⏵⏵ mode glyph
 	optdepends = neovide: eitri split

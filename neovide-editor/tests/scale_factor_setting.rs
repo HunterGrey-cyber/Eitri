@@ -21,7 +21,7 @@
 //!    The check measures the first contiguous run of non-background pixels in the text row
 //!    to verify that `prepare_lines(scale_factor_changed)` updates the rendered pixels.
 //!
-//! Ignored unless requested. Requires `nvim` >= 0.10 on `PATH` and starts its own `Xvfb`
+//! Ignored unless requested. Requires `nvim` >= 0.11 on `PATH` and starts its own `Xvfb`
 //! for the clipboard without opening a window. `shell/tests/support/own_x_server.rs` starts
 //! the display before winit connects and removes inherited `WAYLAND_DISPLAY` and `DISPLAY`.
 //! Uses a plain `main` (`harness = false`) because winit builds its event loop on the main
@@ -155,9 +155,10 @@ fn main() {
             "--cmd".to_string(),
             "let g:neovide_scale_factor = 1.5".to_string(),
         ],
+        minimum_nvim_version: Some(neovide_editor::NVIM_FLOOR),
         ..Default::default()
     })
-    .expect("LiveHarness::with_options failed -- is `nvim` (>= 0.10) on $PATH?");
+    .expect("LiveHarness::with_options failed -- is `nvim` (>= 0.11) on $PATH?");
 
     let mut frames = Frames::new();
     let deadline = Instant::now() + Duration::from_secs(15);

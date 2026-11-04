@@ -41,6 +41,7 @@ fn launch(name: &'static str) -> Editor {
     let harness = LiveHarness::with_options(LiveHarnessOptions {
         grid_size: Some(GridSize::new(40u32, 8u32)),
         extra_nvim_args: vec!["--clean".to_string()],
+        minimum_nvim_version: Some(neovide_editor::NVIM_FLOOR),
         ..Default::default()
     })
     .unwrap_or_else(|e| panic!("{name}: LiveHarness::with_options failed: {e:#}"));

@@ -347,11 +347,11 @@ class NoScratchDiskPathShipsInPinsEnv(unittest.TestCase):
         self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
 
 
-# The pinned public source-asset archive (the pin in packaging/pins.env): tag 0.153.3,
-# sha256 ef41a8ff...0caf10. rust-skia's build script caches it under a skia-bindings-* build
+# The pinned public source-asset archive (the pin in packaging/pins.env): tag 0.156.0,
+# sha256 444321da...b1ebf1. rust-skia's build script caches it under a skia-bindings-* build
 # directory's out/.cache/ -- never modified in place, only ever copied out of, by every test below
 # that reads it.
-_PINNED_SKIA_ARCHIVE_SHA256 = "ef41a8ff85bebeb06238df88e144eb04778a368fc1672a63155155d97f0caf10"
+_PINNED_SKIA_ARCHIVE_SHA256 = "444321da446d822dc346a2b8d3f80f680ba95b1b4a34fdc98071569660b1ebf1"
 
 
 # Search release.sh's checked cache and skia-bindings build outputs at fixed depths.
@@ -531,10 +531,12 @@ class SkiaArchiveComponents(unittest.TestCase):
         for comp in ("expat", "libjpeg-turbo", "Wuffs", "HarfBuzz", "ICU", "Skia", "FreeType", "libpng", "zlib"):
             self.assertIn(comp, found, comp)
         counts = cl.skia_archive_symbol_counts(root)
-        self.assertEqual(counts["expat"], 71)
+        # Measured on skia-binaries 0.156.0; the table was 71 expat and 547 + 547 HarfBuzz on
+        # 0.153.3, whose Skia pinned older expat and HarfBuzz.
+        self.assertEqual(counts["expat"], 83)
         self.assertEqual(counts["libjpeg-turbo"], 89 + 34)
         self.assertEqual(counts["Wuffs"], 71)
-        self.assertEqual(counts["HarfBuzz"], 547 + 547)
+        self.assertEqual(counts["HarfBuzz"], 1154)
         self.assertEqual(counts["ICU"], 194)
 
 
@@ -569,6 +571,13 @@ class SkiaArchiveNoticeEntries(unittest.TestCase):
         self.assertNotIn("vendored", by_title["Skia"]["note"])
         self.assertIn("text vendored in packaging/license-texts/", by_title["expat"]["note"])
         self.assertEqual(by_title["ICU"]["license"], "Unicode-3.0")
+        # The archive's Wuffs is wuffs-v0.3.c, whose header is Apache-2.0 alone (the repository's root LICENSE,
+        # MIT and Apache-2.0, is not what that file says).
+        self.assertEqual(by_title["Wuffs"]["license"], "Apache-2.0")
+        wuffs = dict(by_title["Wuffs"]["files"])
+        self.assertEqual(wuffs["notice"], "Copyright 2017 The Wuffs Authors.\n")
+        self.assertIn("Apache License", wuffs["Apache-2.0.txt"])
+        self.assertNotIn("wuffs.LICENSE", wuffs)
 
     def test_a_tar_gz_archive_is_extracted_once_and_reused(self):
         """_skia_archive_root() accepts the raw .tar.gz too (release.sh's own --skia-archive-path
@@ -972,6 +981,20 @@ class WriteSourceNotice(unittest.TestCase):
         self.assertIn('SKIA_BINARIES_URL="file://$PWD/skia/skia-binaries-abcdef0.tar.gz"', recipe)
         self.assertIn("cargo build --release --offline -p shell", recipe)
         self.assertNotIn("edit vendor/nvim-rs", recipe.lower())
+
+
+class PublishedSourceUrl(unittest.TestCase):
+    """Where the copyleft list says a package's unmodified source is published."""
+
+    def test_a_registry_package_names_its_crates_io_page(self):
+        e = {"name": "nvim-rs", "version": "0.9.2", "source": "registry+https://github.com/rust-lang/crates.io-index"}
+        self.assertEqual(cl.published_source_url(e), "https://crates.io/crates/nvim-rs/0.9.2")
+
+    def test_a_github_git_package_names_the_repository_at_its_commit(self):
+        sha = "7f41ba0c23457c858dc3e9afb3b5de527850ca73"
+        e = {"name": "nvim-rs", "version": "0.9.2",
+             "source": f"git+https://github.com/neovide/nvim-rs?rev={sha}#{sha}"}
+        self.assertEqual(cl.published_source_url(e), f"https://github.com/neovide/nvim-rs/tree/{sha}")
 
 
 class MainArgParsing(unittest.TestCase):

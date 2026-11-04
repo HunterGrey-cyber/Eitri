@@ -20,7 +20,7 @@ bug, and tell us if something here is wrong or has changed. The requirements are
 - **WebKitGTK 2.40 or newer** (the `webkitgtk-6.0` API) is required. The prebuilt binaries are built against
   glibc 2.39 and GTK 4.14; older versions are untested. Ubuntu 24.04, Debian 13, Fedora 40+, RHEL 10 and Arch
   meet this; Ubuntu 22.04 and Debian 12 do not.
-- **Neovim 0.10 or newer**: your own on `PATH`, or a private copy (0.12.6) the installer offers to fetch when
+- **Neovim 0.11 or newer**: your own on `PATH`, or a private copy (0.12.6) the installer offers to fetch when
   yours is older. A Neovim 0.11 on `PATH` is accepted and is not replaced, and three popular configurations still
   fail on it: the current kickstart.nvim does not start (it uses `vim.pack`, new in 0.12), LazyVim loses Eitri's
   `Ctrl+j` and `Ctrl+k` on the first start to its notification windows, and AstroNvim now and then keeps its own
@@ -109,6 +109,10 @@ distinguish real refresh-period feedback from the fallback clock.
 - **A relative link in a reply** is underlined like a link, but `gx` and HINT do not offer it.
 - **On i3 or sway with `$mod = Alt`** the window manager takes the prefix's `Alt` rows before Eitri sees them;
   [`docs/keymap/i3-alt-mod.lua`](keymap/i3-alt-mod.lua) moves them.
+- **On Neovim 0.12, `:restart` and `:connect` in the editor end it** instead of moving it to the new Neovim
+  (`<prefix> e` starts the editor again), and each leaves a Neovim running in the background until you end it:
+  `:restart` the new one it started for the editor (an `nvim --embed` that waits for a window), `:connect` the editor's
+  own, with whatever it had open.
 
 ## Pages you build
 
@@ -167,7 +171,7 @@ one-window mode.
 - **Pages beside your nvim** (`eitri page`, `:EitriPage`; [the guide](guide/companion.md#pages-beside-your-nvim)) have been through tests only, not yet
   a run in a window. Still owed: a pass in an isolated headless desktop with a real Neovim in a terminal (the page's colours, the
   follow, the keys, closing, `kill -9`, nvim inside tmux), Hyprland 0.56.2 and 0.57 in a virtual machine, niri, KDE, GNOME
-  with the extension, real hardware, and nvim 0.10 (the floor) and 0.11, which have not been run. The buffer reload that runs
+  with the extension, real hardware, and nvim 0.11 (the floor), which has not been run. The buffer reload that runs
   while the agent works, and the reload on focus (which in tmux needs `set -g focus-events on`), are in the same state.
 - **A page window closes slowly in two cases.** A graceful close leaves its slot in your Neovim until Neovim's next liveness
   check (up to a second), as a killed window does; and a Neovim that is blocked at a prompt when you run `:EitriPage` keeps

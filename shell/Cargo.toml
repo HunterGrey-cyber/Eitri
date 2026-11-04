@@ -31,7 +31,7 @@ terminal-input = { path = "../terminal/input" }
 terminal-render = { path = "../terminal/render" }
 # The terminal's GtkGLArea paints through Skia's GL backend, exactly as neovide-editor's does; same
 # version and features, so no second Skia build.
-skia-safe = { version = "0.153.3", features = ["gl"] }
+skia-safe = { version = "0.156.0", features = ["gl"] }
 libloading = "0.9.0"
 # Wakes the GTK main loop from the terminal's session thread (`glib::spawn_future_local` awaits the
 # receiver). Already in the graph through glib/gio at this version. Floor is 0.3.32, not 0.3: that's
@@ -162,7 +162,7 @@ harness = false
 
 # A plain `main`, because winit builds its event loop on the main thread only, and libtest runs each
 # test on a thread of its own (as `neovide-editor`'s own ignored `LiveHarness` tests are). Needs `nvim`
-# (>= 0.10) on `PATH` and a display for winit's clipboard (no window is ever shown) -- since 2026-09-29
+# (>= 0.11) on `PATH` and a display for winit's clipboard (no window is ever shown) -- since 2026-09-29
 # its own `Xvfb` (`tests/support/own_x_server.rs`), never the session's. Proves the pinned fork
 # honours `NEOVIM_BIN`: see the file's own header.
 [[test]]

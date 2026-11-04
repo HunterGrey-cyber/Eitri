@@ -671,7 +671,7 @@ def parse_relink_recipe(source_text: str) -> RelinkRecipe:
     if missing:
         raise ReleaseCheckError(f"SOURCE's relink recipe has no step(s) {', '.join(missing)}")
     copy, unlock, build = steps["1"][0], steps["2"][0], steps["5"][0]
-    patch_lines = steps["4"][1:]
+    patch_heading, patch_lines = steps["4"][0], steps["4"][1:]
     problems = []
     if not copy.startswith("cp -r vendor/nvim-rs "):
         problems.append(f"step 1 is not a copy of vendor/nvim-rs: {copy!r}")
@@ -679,13 +679,32 @@ def parse_relink_recipe(source_text: str) -> RelinkRecipe:
     if unlock != f"rm {modified_dir}/.cargo-checksum.json":
         problems.append(f"step 2 does not remove {modified_dir}'s checksum file: {unlock!r}")
     patch_re = re.compile(rf'^nvim-rs = \{{ path = "{re.escape(modified_dir)}" \}}$')
-    if patch_lines[:1] != ["[patch.crates-io]"] or len(patch_lines) != 2 or not patch_re.match(patch_lines[1]):
-        problems.append(f"step 4 is not a [patch.crates-io] entry for {modified_dir}: {patch_lines!r}")
+    if ("[patch.crates-io]" not in patch_heading or "replace the nvim-rs line" not in patch_heading
+            or len(patch_lines) != 1 or not patch_re.match(patch_lines[0])):
+        problems.append(f"step 4 does not replace the [patch.crates-io] nvim-rs line with {modified_dir}: "
+                        f"{[patch_heading] + patch_lines!r}")
     if " cargo build " not in f" {build} " or "--offline" not in build.split() or "--locked" in build.split():
         problems.append(f"step 5 is not an offline, unlocked cargo build: {build!r}")
     if problems:
         raise ReleaseCheckError("; ".join(problems))
     return RelinkRecipe(copy, unlock, "\n".join(patch_lines), build, modified_dir)
+
+
+def apply_relink_patch(cargo_toml: str, line: str) -> str:
+    """Step 4 of the relink recipe, as proof (b) carries it out: the root Cargo.toml's
+    `[patch.crates-io]` table already patches nvim-rs (the build uses Neovide's own nvim-rs commit),
+    so its one `nvim-rs = ...` line is replaced; a second table would be a TOML error."""
+    lines = cargo_toml.split("\n")
+    try:
+        start = lines.index("[patch.crates-io]")
+    except ValueError:
+        raise ReleaseCheckError("Cargo.toml has no [patch.crates-io] table for step 4 to change") from None
+    end = next((i for i in range(start + 1, len(lines)) if lines[i].startswith("[")), len(lines))
+    hits = [i for i in range(start + 1, end) if re.match(r"^nvim-rs\s*=", lines[i])]
+    if len(hits) != 1:
+        raise ReleaseCheckError(f"Cargo.toml's [patch.crates-io] has {len(hits)} nvim-rs lines, not one")
+    lines[hits[0]] = line
+    return "\n".join(lines)
 
 
 REBUILD_ENV_NAMES = ("EITRI_BUILD_COMMIT", "EITRI_BUILD_FORK_COMMIT")
@@ -1546,6 +1565,13 @@ def main(argv: list[str]) -> int:
             for line in recipe.patch.splitlines():
                 print(f"PATCH={line}")
             print(f"BUILD={recipe.build}")
+            return 0
+        if cmd == "apply-relink-patch":
+            with open(rest[0], encoding="utf-8") as f:
+                text = f.read()
+            text = apply_relink_patch(text, rest[1])
+            with open(rest[0], "w", encoding="utf-8") as f:
+                f.write(text)
             return 0
         if cmd == "rebuild-env":
             for name, value in parse_rebuild_env(_read(rest[0])).items():

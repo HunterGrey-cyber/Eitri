@@ -1375,7 +1375,7 @@ pub enum NvimState {
     /// ([`EditorCall::End`]: SIGTERM and stdin closed, SIGKILL by pid after the
     /// patience), and [`not_answering_text`] says so.
     NotAnswering,
-    /// Its `:confirm` dialog is up (`nvim_get_mode` says `r?`).
+    /// Its `:confirm` dialog is up (`nvim_get_mode` says `r?`, or `c` on nvim 0.11: [`is_quit_dialog`]).
     Asking,
     /// It waits for a key before it takes the request (`blocking`: after `f`, at a hit-enter prompt).
     WaitingForKey,
@@ -1385,6 +1385,13 @@ pub enum NvimState {
     /// `nvim_get_mode` unanswered until they end, exactly as a Lua busy loop does, so a save hook
     /// that runs one for [`NVIM_QUIT_PATIENCE`] or longer reads [`NvimState::NotAnswering`].
     Busy,
+}
+
+/// The `:confirm qall` dialog while the pane's quit is out: `nvim_get_mode` says `r?` on nvim 0.12, `c` on 0.11, and
+/// `blocking` false on both (measured on 0.11.0, 0.11.2 and 0.12.6 with a UI attached). A `c` that blocks is a `:` line
+/// waiting for the key after `Ctrl+V`, `Ctrl+R` or `Ctrl+K`, which is [`NvimState::WaitingForKey`].
+pub fn is_quit_dialog(mode: &str, blocking: bool) -> bool {
+    mode == "r?" || (mode == "c" && !blocking)
 }
 
 pub fn nvim_state(watch: Option<&NvimAnswer>, now: Instant) -> NvimState {
@@ -1398,7 +1405,7 @@ pub fn nvim_state(watch: Option<&NvimAnswer>, now: Instant) -> NvimState {
         return NvimState::NotAnswering;
     }
     match &watch.last {
-        Some(answer) if answer.mode == "r?" => NvimState::Asking,
+        Some(answer) if is_quit_dialog(&answer.mode, answer.blocking) => NvimState::Asking,
         Some(answer) if answer.blocking => NvimState::WaitingForKey,
         _ => NvimState::Busy,
     }
@@ -1751,6 +1758,26 @@ mod kill_tests {
             "cancelled, its letter not read yet (or no shim to send one)"
         );
         assert_eq!(quit_request(Some(&in_flight), None, now), QuitRequest::Ask);
+    }
+
+    /// nvim 0.11 shows the same `:confirm qall` dialog in mode `c` (0.12 says `r?`); measured on 0.11.0 and
+    /// 0.11.2 with a UI attached, `blocking` false on both. While the quit is out, `c` is that dialog.
+    #[test]
+    fn an_nvim_0_11_quit_dialog_in_mode_c_is_asking() {
+        let sent = Instant::now();
+        let now = sent + Duration::from_secs(1);
+        let in_flight = asked(1, EditorQuit::Window { confirmed: None });
+        let dialog_0_11 = watch(sent, false, Some((Duration::from_millis(900), "c", false)));
+        assert_eq!(
+            quit_request(Some(&in_flight), Some(&dialog_0_11), now),
+            QuitRequest::AnswerThere(NvimState::Asking)
+        );
+        // A `:` line waiting for the key after Ctrl+V, Ctrl+R or Ctrl+K reports `c` and blocking.
+        let cmdline_key = watch(sent, false, Some((Duration::from_millis(900), "c", true)));
+        assert_eq!(
+            quit_request(Some(&in_flight), Some(&cmdline_key), now),
+            QuitRequest::AnswerThere(NvimState::WaitingForKey)
+        );
     }
 
     /// A dialog that waits for its answer draws

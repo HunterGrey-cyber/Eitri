@@ -57,6 +57,7 @@ fn a_hang_up_ends_nvim_while_the_connection_lives() {
         .block_on(NeovimSession::new(
             embedded(&nvim, &["--clean", "--embed", "-n"], &dir),
             Quiet,
+            None,
         ))
         .expect("a session on nvim");
     let mut child = session.neovim_process.take().expect("the child");
@@ -87,7 +88,7 @@ fn a_launcher_that_fails_the_handshake_is_let_go() {
     let instance = embedded(&launcher, &[], &dir);
     std::thread::spawn(move || {
         let runtime = runtime();
-        let result = runtime.block_on(NeovimSession::new(instance, Quiet));
+        let result = runtime.block_on(NeovimSession::new(instance, Quiet, None));
         let _ = tx.send(result.is_err());
         // The runtime is dropped here, on this thread; a launcher still blocked is abandoned to it.
     });
@@ -127,6 +128,7 @@ fn a_hang_up_on_a_server_session_closes_the_servers_channel() {
                 address: socket.to_string_lossy().into_owned(),
             },
             Quiet,
+            None,
         ))
         .expect("a session on the server");
     let (observer, _io) = runtime

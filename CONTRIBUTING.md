@@ -65,7 +65,7 @@ third-party build script with an error that never names this project:
 - **A C toolchain**: Lua 5.4 is built from source and statically linked.
 - **Network access on the first build**: `skia-safe` downloads a prebuilt Skia, and Cargo fetches
   the Verdandi protocol crate from GitHub.
-- At run time: **`nvim` ≥ 0.10** on `PATH`, a working OpenGL driver, a Wayland session, and Claude
+- At run time: **`nvim` ≥ 0.11** on `PATH`, a working OpenGL driver, a Wayland session, and Claude
   Code installed and logged in — Eitri spends whatever account it runs under.
 
 ## Building

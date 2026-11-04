@@ -1,5 +1,5 @@
 [English](known-issues.md) | 简体中文
-<!-- translated-from: known-issues.md sha256=62386d6e14a1a35231e998c992b8f78c63e076a6175adce02eab65ab7cf3b38f -->
+<!-- translated-from: known-issues.md sha256=c10643f24909c40fe49b5edca00f2254ab41c7a2fb914809960e0802a03ba2bf -->
 
 # 已知问题与限制
 
@@ -11,7 +11,7 @@
 - **在 GNOME 和 sway 上测试过，companion 模式还在 Hyprland 上测试过。** 其他桌面和合成器，包括 KDE Plasma，没有测试过，欢迎反馈。Hyprland：companion 模式（焦点移动和置前）在真实运行的 0.57.0 和 0.56.2 上跑过（0.56.2 分别用 `hyprland.conf` 和 `hyprland.lua`）；第二个窗口的置前没有跑过。
 - **[合成器窗口](guide/compositor-windows.zh-CN.md)**是 Hyprland、sway 和 niri 上的默认行为，目前只在无界面会话和虚拟机里跑过，还有一些地方不符合预期：见指南里的[已知缺口](guide/compositor-windows.zh-CN.md#known-gaps)。
 - **需要 WebKitGTK 2.40 或更新**（`webkitgtk-6.0` API）。预构建二进制按 glibc 2.39 和 GTK 4.14 构建，更旧的版本没有测试过。Ubuntu 24.04、Debian 13、Fedora 40+、RHEL 10 和 Arch 满足要求；Ubuntu 22.04 和 Debian 12 不满足。
-- **Neovim 0.10 或更新**：用你自己 `PATH` 里的，或者让安装脚本在你的版本更旧时为 Eitri 单独下载一份私有副本（0.12.6）。`PATH` 里的 Neovim 0.11 会被接受，也不会被替换，但有三个常见配置在它上面仍有问题：当前的 kickstart.nvim 无法启动（它用了 0.12 才有的 `vim.pack`）；LazyVim 在第一次启动时，`Ctrl+j` 和 `Ctrl+k` 会被它的通知浮窗抢走，Eitri 收不到；AstroNvim 偶尔会保留它自己的 `Ctrl+j`（在 0.12.6 上也出现过一次，所以和版本无关）。LazyVim 和 kickstart 的这两项在 0.12.6 上都通过。如果你用其中之一，请让 `PATH` 里是 0.12，或者用 `EITRI_NVIM` 指向它。
+- **Neovim 0.11 或更新**：用你自己 `PATH` 里的，或者让安装脚本在你的版本更旧时为 Eitri 单独下载一份私有副本（0.12.6）。`PATH` 里的 Neovim 0.11 会被接受，也不会被替换，但有三个常见配置在它上面仍有问题：当前的 kickstart.nvim 无法启动（它用了 0.12 才有的 `vim.pack`）；LazyVim 在第一次启动时，`Ctrl+j` 和 `Ctrl+k` 会被它的通知浮窗抢走，Eitri 收不到；AstroNvim 偶尔会保留它自己的 `Ctrl+j`（在 0.12.6 上也出现过一次，所以和版本无关）。LazyVim 和 kickstart 的这两项在 0.12.6 上都通过。如果你用其中之一，请让 `PATH` 里是 0.12，或者用 `EITRI_NVIM` 指向它。
 - **Claude Code**，已安装并已登录，2.1.252 或更新，低于 3.0。没有它时 Eitri 照样能打开，编辑器可以用；agent 面板没法运行对话。
 - **Codex 和其他 agent 是可选的。** Codex 标签页需要 0.160.0 或更新的 `codex`，已安装并已登录（测试过从 0.160.0 到 0.166.0 的每个版本）；其他 agent 的标签页需要一个通过标准输入输出说 ACP 第 1 版的 agent。见 [Codex 与其他 agent](guide/agents.zh-CN.md)。
 
@@ -44,6 +44,7 @@
 - **在编辑器里按 `<prefix> ?`** 会把按键交给面板，但不画出按键表；之后在面板里按 `?` 就会显示。
 - **回复里的相对链接**画成带下划线的链接样子，但 `gx` 和 HINT 不会提供它。
 - **在 `$mod = Alt` 的 i3 或 sway 上**，前缀后面的那些 `Alt` 行会先被窗口管理器拿走，Eitri 看不到；[`docs/keymap/i3-alt-mod.lua`](keymap/i3-alt-mod.lua) 会把它们移开。
+- **在 Neovim 0.12 上，在编辑器里执行 `:restart` 和 `:connect` 会结束编辑器**，而不是让它转到新的 Neovim（`<prefix> e` 会重新启动编辑器），而且两者都会在后台留下一个 Neovim，直到你结束它：`:restart` 留下的是它为编辑器新启动的那个（一个等着窗口来连接的 `nvim --embed`），`:connect` 留下的是编辑器原来的那个，里面还开着它原来打开的东西。
 
 <a id="pages-you-build"></a>
 ## 你自己做的页面
@@ -71,7 +72,7 @@ Companion 模式是把 agent 面板作为一个独立窗口，开在你自己的
 - **`foot --server` 的客户端共用同一个 pid**，所以按进程把编辑器提到前面时，可能提起同一个 server 的另一个 foot 窗口，而不是装着你那个 nvim 的窗口。
 - **在 sway 的边缘，这个按键会被吞掉。** Eitri 必须先接管或放行 `Ctrl+h/j/k/l`，才能去问 sway 那个方向上有没有窗口，所以在边缘上这个按键什么也不做，和 tmux 自己的 `select-pane` 在它的边缘上一样。
 - **KDE：不移动焦点。** 在那里 Wayland 客户端没法抢到焦点；请用桌面自己的窗口键。
-- **开在你 nvim 旁边的页面**（`eitri page`、`:EitriPage`；[使用指南](guide/companion.zh-CN.md#pages-beside-your-nvim)）只经过了测试，还没有在窗口里跑过。仍然欠着：在隔离的无界面桌面里配合终端里的真实 Neovim 跑一遍（页面的配色、跟随、按键、关闭、`kill -9`、tmux 里的 nvim）；虚拟机里的 Hyprland 0.56.2 和 0.57；niri；KDE；启用了扩展的 GNOME；真实硬件；以及 nvim 0.10（最低版本）和 0.11，它们没有跑过。agent 工作期间的缓冲区重新加载，以及聚焦时的重新加载（在 tmux 里需要 `set -g focus-events on`），也处于同样的状态。
+- **开在你 nvim 旁边的页面**（`eitri page`、`:EitriPage`；[使用指南](guide/companion.zh-CN.md#pages-beside-your-nvim)）只经过了测试，还没有在窗口里跑过。仍然欠着：在隔离的无界面桌面里配合终端里的真实 Neovim 跑一遍（页面的配色、跟随、按键、关闭、`kill -9`、tmux 里的 nvim）；虚拟机里的 Hyprland 0.56.2 和 0.57；niri；KDE；启用了扩展的 GNOME；真实硬件；以及 nvim 0.11（最低版本），它没有跑过。agent 工作期间的缓冲区重新加载，以及聚焦时的重新加载（在 tmux 里需要 `set -g focus-events on`），也处于同样的状态。
 - **页面窗口在两种情况下关得慢。** 正常关闭会把它的槽位留在你的 Neovim 里，直到 Neovim 下一次存活检查（最多一秒），被杀掉的窗口也一样；你运行 `:EitriPage` 时如果 Neovim 正卡在一个提示上，`eitri page` 会一直等着、不开窗口，直到它响应。
 - **GNOME 需要 Eitri GNOME Shell 扩展**才能移动焦点：由你自己启用，下次登录时生效（见[使用指南](guide/companion.zh-CN.md#gnome-the-extension)）。有了它：移动只在拥有焦点的窗口所在的显示器上进行；X11 或 XWayland 窗口永远不算数；在上一次移动之后大约三分之一秒内再移回去会被拒绝；所有窗口都跑在同一个进程里的终端（GNOME Terminal、Ptyxis）在交回焦点时会落到它最近使用的窗口，那未必是 nvim 所在的窗口；被转发的 `eitri split` 不会把面板带到前面；监视器的“带到前面”不起作用。
 

@@ -1,22 +1,20 @@
-//! Checks that the pinned fork honours `NEOVIM_BIN` when it is set before `LiveHarness` is built.
-//! `CmdLineSettings` reads it through `#[arg(long = "neovim-bin", env = "NEOVIM_BIN")]`
-//! and launches the selected binary. The environment assignment in `shell::main` depends
-//! on this behaviour. Unit tests with an injected `version_of` do not exercise the fork's
-//! process launch.
+//! Checks that setting `NEOVIM_BIN` before building a `LiveHarness` makes the pinned fork's
+//! `CmdLineSettings` spawn that binary. Its clap argument uses `env = "NEOVIM_BIN"`.
+//! `shell::main` relies on this when it sets the variable. The pure `eitri_core::nvim_bin`
+//! tests inject `version_of` and do not exercise the fork.
 //!
-//! A wrapper script logs its argv to a marker file and then execs the real `nvim`, keeping
-//! the harness session functional. The marker shows that the fork launched the selected
-//! wrapper rather than resolving `nvim` on `PATH` itself.
+//! A wrapper script appends its argv to a marker file, then execs the real `nvim` to provide a
+//! working session. The marker proves the fork ran the selected binary instead of resolving
+//! `nvim` on `PATH`.
 //!
-//! With `harness = false`, `main` handles `--ignored` itself. The test needs `nvim` >= 0.10
-//! on `PATH` and a display connection for winit's clipboard, even though it opens no window.
-//! `support/own_x_server.rs` starts a separate `Xvfb` and points the test at it before winit
-//! connects, dropping inherited `WAYLAND_DISPLAY` and `DISPLAY` values. Run it with:
+//! This `harness = false` test checks `--ignored` in `main` because cargo does not skip it.
+//! It needs `nvim` (>= 0.11) on `PATH` and a display connection for winit's clipboard,
+//! even though it opens no window. `support/own_x_server.rs` starts an isolated `Xvfb` before
+//! winit connects and clears inherited `WAYLAND_DISPLAY` and `DISPLAY` values. Run with:
 //!
 //!     cargo test -p shell --test nvim_bin_override -- --ignored
 //!
-//! The test uses a plain `main` (`harness = false`) so winit creates its event loop
-//! on the main thread.
+//! A plain `main` keeps winit's event loop on the main thread.
 
 use std::os::unix::fs::PermissionsExt;
 use std::time::{Duration, Instant};
@@ -78,9 +76,10 @@ fn main() {
         os_scale_factor: 1.0,
         grid_size: Some(GridSize::new(40u32, 8u32)),
         extra_nvim_args: vec!["--clean".to_string()],
+        minimum_nvim_version: Some(neovide_editor::NVIM_FLOOR),
         ..Default::default()
     })
-    .expect("LiveHarness::with_options failed -- is `nvim` (>= 0.10) on $PATH?");
+    .expect("LiveHarness::with_options failed -- is `nvim` (>= 0.11) on $PATH?");
 
     let mut surface = surfaces::raster_n32_premul((320, 160)).expect("raster surface");
     let region = PixelRect::from_min_max((0.0, 0.0), (320.0, 160.0));

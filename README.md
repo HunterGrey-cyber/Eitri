@@ -75,7 +75,7 @@ eitri ~/path/to/project
 `eitri FILE` opens a single file too, takes the project from it, and hands it to the window already open on that
 project: [Open a file](docs/guide/getting-started.md#open-a-file).
 
-Linux x86_64 on Wayland, with Neovim 0.10 or newer and Claude Code installed. On Arch:
+Linux x86_64 on Wayland, with Neovim 0.11 or newer and Claude Code installed. On Arch:
 [`eitri-bin`](https://aur.archlinux.org/packages/eitri-bin) or [`eitri-git`](https://aur.archlinux.org/packages/eitri-git)
 from the AUR. `.deb`, `.rpm`, building from source and verifying a download: [INSTALL.md](INSTALL.md).
 

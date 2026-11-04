@@ -41,6 +41,8 @@ mod nvim_child;
 mod nvim_rpc;
 mod stdin;
 mod subsurface;
+#[cfg(test)]
+mod test_nvim;
 mod tick_driver;
 
 /// Unit tests that acquire the default main context take this first: two at once would make the
@@ -724,6 +726,13 @@ pub struct NeovideEditorPane {
     spawn_options: Rc<RefCell<NeovideEditorPaneOptions>>,
 }
 
+/// The oldest nvim the editor runs, as `(major, minor, patch)`: the window's own floor
+/// (`eitri_core::nvim_bin::MINIMUM_VERSION`, held equal by a `shell` test). Neovide itself requires
+/// 0.12; the pane hands this to `LiveHarnessOptions::minimum_nvim_version`, so an 0.11 nvim gets
+/// everything Neovide does not need 0.12 for, and the 0.12-only parts (`:restart`, `:connect`, the
+/// mouse grid detection and the newer IME calls) stay off by nvim's own version.
+pub const NVIM_FLOOR: (u64, u64, u64) = (0, 11, 0);
+
 /// Construction-time options for [`NeovideEditorPane::with_options`], and a restart's for
 /// [`NeovideEditorPane::restart`]. Except for the pane's `starting_color`, each field is forwarded to
 /// the `LiveHarnessOptions` field of the same name, so this crate stays a pass-through rather than
@@ -881,11 +890,10 @@ fn cell_size_changed(last: Option<(f64, f64)>, now: (f64, f64)) -> bool {
     last != Some(now)
 }
 
-/// The nvim version floor this pane's pinned fork enforces (`NEOVIM_REQUIRED_VERSION` in
-/// `bridge/mod.rs`) -- restated here because the fork's own too-old error names it as bare numbers
-/// with no context of what *this project* needs, and the pane's own message should say so plainly
-/// rather than make the host go read the fork's source.
-const NVIM_VERSION_FLOOR: &str = "0.10";
+/// [`NVIM_FLOOR`] as the pane's messages spell it -- restated because the fork's own too-old error
+/// names it as bare numbers with no context of what *this project* needs, and the pane's own message
+/// should say so plainly.
+const NVIM_VERSION_FLOOR: &str = "0.11";
 
 /// Where to get a newer nvim -- the same URL the fork's own too-old error already links
 /// (`bridge/mod.rs:197`), restated here so the missing-nvim case (whose error text never names a
@@ -1798,6 +1806,7 @@ impl NeovideEditorPane {
                             // grid, where it can want a keypress to dismiss, instead of being held
                             // and replayed after the first frame.
                             startup_message_capture: false,
+                            minimum_nvim_version: Some(NVIM_FLOOR),
                             ..Default::default()
                         };
                         drop(spawn);
@@ -2116,7 +2125,12 @@ impl NeovideEditorPane {
                         Some(&paint),
                     );
                 }
-                state.gr_context.flush_and_submit();
+                if let Err(error) = state.gr_context.flush_and_submit() {
+                    // The frame is lost; the next render draws a whole one again. Said once a process,
+                    // since a context that fails once tends to fail every frame.
+                    static SAID: std::sync::Once = std::sync::Once::new();
+                    SAID.call_once(|| eprintln!("[editor] skia flush failed: {error:?}"));
+                }
 
                 glib::Propagation::Stop
             })
@@ -3137,7 +3151,7 @@ mod tests {
         exit_follows_quit, exit_log_line, failed_tick_should_render, nvim_args, os_scale_to_apply, restart_refusal,
         run_detached, sessionless_tick_should_render, spawn_named, tick_should_render, watched_failure_note,
         with_display_hint, CallWatch, DisplayFacts, ExitEvents, LiveState, RemapKick, RestartRefused, ScaleWatch,
-        NVIM_INSTALL_URL, NVIM_VERSION_FLOOR, REMAP_RENDER_DELAY,
+        NVIM_FLOOR, NVIM_INSTALL_URL, NVIM_VERSION_FLOOR, REMAP_RENDER_DELAY,
     };
     use gtk4::glib;
     use std::cell::Cell;
@@ -3390,16 +3404,21 @@ mod tests {
     // It uses the raw `anyhow` chain from `LiveHarness::with_options`. A real harness cannot be
     // constructed here, so fixtures use the two error shapes the pinned fork's bridge produces. ---
 
+    #[test]
+    fn the_floor_the_messages_name_is_the_one_the_harness_gets() {
+        assert_eq!(format!("{}.{}", NVIM_FLOOR.0, NVIM_FLOOR.1), NVIM_VERSION_FLOOR);
+    }
+
     /// The too-old shape: the fork's own sentence names the found version; the built message must
     /// name it too, plus Eitri's own floor and where to get a newer nvim.
     #[test]
     fn a_too_old_nvim_names_the_version_that_was_found() {
         // The real shape: the fork puts `:version`'s whole first line, "NVIM v0.9.5", into {found}
         // (measured in the GUI on 2026-09-27: the message read "nvim NVIM v0.9.5 is older").
-        let raw = "Neovide requires nvim version 0.10.0 or higher, but NVIM v0.9.5 was detected. Download \
+        let raw = "Neovide requires nvim version 0.11.0 or higher, but NVIM v0.10.4 was detected. Download \
                     the latest version here https://github.com/neovim/neovim/wiki/Installing-Neovim";
         let message = build_start_failure_message(raw);
-        assert!(message.starts_with("nvim 0.9.5 is older"), "message: {message}");
+        assert!(message.starts_with("nvim 0.10.4 is older"), "message: {message}");
         assert!(!message.contains("NVIM"), "message: {message}");
         assert!(message.contains(NVIM_VERSION_FLOOR), "message: {message}");
         assert!(message.contains(NVIM_INSTALL_URL), "message: {message}");
@@ -3499,7 +3518,7 @@ mod tests {
         let facts = DisplayFacts::default();
         for message in [
             "the editor could not start: unknown panic",
-            "nvim could not be started (Eitri needs 0.10 or newer): No such file or directory",
+            "nvim could not be started (Eitri needs 0.11 or newer): No such file or directory",
         ] {
             assert_eq!(with_display_hint(message.to_string(), &facts), message);
         }

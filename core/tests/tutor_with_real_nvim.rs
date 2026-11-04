@@ -5,7 +5,7 @@
 //! opens them in the language nvim's tutor picks, with their checks working, also when the config skips nvim's
 //! tutor plugin.
 //!
-//! Every case is `#[ignore]`d: it needs `nvim` (>= 0.10) on `PATH`, spends no tokens and opens no window.
+//! Every case is `#[ignore]`d: it needs `nvim` (>= 0.11) on `PATH`, spends no tokens and opens no window.
 
 #[path = "support/embed_client.rs"]
 mod embed_client;

@@ -21,7 +21,7 @@ license: MIT AND Apache-2.0 AND LGPL-3.0-only AND MPL-2.0
 # packaging/test_nfpm_profiles.py checks the permitted differences from packaging/nfpm.yaml.
 #
 # Do not depend on neovim: Ubuntu 24.04's 0.9.5 satisfies the package name but cannot run the
-# editor, which requires at least 0.10. Fedora gets a soft recommendation; Arch's AUR packages
+# editor, which requires at least 0.11. Fedora gets a soft recommendation; Arch's AUR packages
 # use optdepends so bob and self-built nvim installations remain usable.
 #
 # Only deb and rpm are produced here; Arch uses the AUR recipes. Keep all dependency lists in

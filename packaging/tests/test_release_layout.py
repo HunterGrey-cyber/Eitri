@@ -828,7 +828,7 @@ class RelinkRecipeTests(unittest.TestCase):
         self.assertEqual(recipe.modified_dir, "nvim-rs-modified")
         self.assertEqual(recipe.copy, "cp -r vendor/nvim-rs nvim-rs-modified")
         self.assertEqual(recipe.unlock, "rm nvim-rs-modified/.cargo-checksum.json")
-        self.assertEqual(recipe.patch, '[patch.crates-io]\nnvim-rs = { path = "nvim-rs-modified" }')
+        self.assertEqual(recipe.patch, 'nvim-rs = { path = "nvim-rs-modified" }')
         self.assertIn('SKIA_BINARIES_URL="file://$PWD/skia/skia-binaries-k.tar.gz" cargo build', recipe.build)
         self.assertNotIn("--locked", recipe.build)
 
@@ -842,6 +842,27 @@ class RelinkRecipeTests(unittest.TestCase):
         text = self.source_text().replace('nvim-rs = { path = "nvim-rs-modified" }', 'nvim-rs = { path = "vendor/nvim-rs" }')
         with self.assertRaisesRegex(rc.ReleaseCheckError, "step 4"):
             rc.parse_relink_recipe(text)
+
+    def test_step_4_replaces_the_one_nvim_rs_line_of_the_patch_table(self):
+        toml = ('[workspace]\nmembers = ["a"]\n\n[patch.crates-io]\n'
+                'nvim-rs = { git = "https://github.com/neovide/nvim-rs", rev = "abc" }\n\n[profile.release]\nlto = true\n')
+        out = rc.apply_relink_patch(toml, 'nvim-rs = { path = "nvim-rs-modified" }')
+        self.assertIn('[patch.crates-io]\nnvim-rs = { path = "nvim-rs-modified" }\n', out)
+        self.assertEqual(out.count("[patch.crates-io]"), 1)
+        self.assertNotIn("neovide/nvim-rs", out)
+        self.assertIn("[profile.release]\nlto = true", out)
+
+    def test_step_4_refuses_a_cargo_toml_without_the_patch_line(self):
+        with self.assertRaisesRegex(rc.ReleaseCheckError, "no \\[patch.crates-io\\]"):
+            rc.apply_relink_patch('[workspace]\n', 'nvim-rs = { path = "x" }')
+        with self.assertRaisesRegex(rc.ReleaseCheckError, "0 nvim-rs lines"):
+            rc.apply_relink_patch('[patch.crates-io]\nfoo = "1"\n', 'nvim-rs = { path = "x" }')
+
+    def test_the_real_cargo_toml_takes_step_4(self):
+        with open(os.path.join(os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))),
+                               "Cargo.toml"), encoding="utf-8") as f:
+            out = rc.apply_relink_patch(f.read(), 'nvim-rs = { path = "nvim-rs-modified" }')
+        self.assertEqual(out.count('nvim-rs = { path = "nvim-rs-modified" }'), 1)
 
     def test_no_recipe_fails(self):
         with self.assertRaises(rc.ReleaseCheckError):

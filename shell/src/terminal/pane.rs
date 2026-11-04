@@ -1358,7 +1358,12 @@ fn connect_render(area: &GLArea, state: &Rc<RefCell<State>>) {
                 surface.canvas().clear(skia_safe::Color::from_rgb(bg.r, bg.g, bg.b));
             }
         }
-        skia.gr_context.flush_and_submit();
+        if let Err(error) = skia.gr_context.flush_and_submit() {
+            // The frame is lost; the next draw paints a whole one again. Said once a process, since
+            // a context that fails once tends to fail every frame.
+            static SAID: std::sync::Once = std::sync::Once::new();
+            SAID.call_once(|| eprintln!("[terminal] skia flush failed: {error:?}"));
+        }
         glib::Propagation::Stop
     });
 }

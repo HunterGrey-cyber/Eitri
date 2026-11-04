@@ -1707,7 +1707,7 @@ class ReleaseNotes(unittest.TestCase):
         self.assertIn("/releases/download/v1.0.0-rc.1/install.sh | sh -s -- --version 1.0.0-rc.1\n", notes)
         self.assertIn("WebKitGTK 2.40", notes)
         self.assertIn("nvim-rs 0.9.2", notes)
-        self.assertIn("nvim` >= 0.10", notes)
+        self.assertIn("nvim` >= 0.11", notes)
         self.assertIn("--nvim-only", notes)
         self.assertNotIn("@", notes.replace("release@eitri", ""))
 

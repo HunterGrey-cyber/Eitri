@@ -1076,26 +1076,19 @@ mod tests {
 
     /// The fork's own UI answers requests: `neovide.quit`, the one its `VimLeavePre` makes, with nil
     /// (`bridge/handler.rs`). This answers every request with nil, which is all an exit asks of it.
-    /// Written out as `async_trait` expands it, which is how nvim-rs declares the trait.
     #[derive(Clone)]
     struct ForkUi;
 
     impl nvim_rs::Handler for ForkUi {
         type Writer = neovide::bridge::NeovimWriter;
 
-        fn handle_request<'life0, 'async_trait>(
-            &'life0 self,
+        async fn handle_request(
+            &self,
             _name: String,
             _args: Vec<nvim_rs::Value>,
             _neovim: nvim_rs::Neovim<Self::Writer>,
-        ) -> std::pin::Pin<
-            Box<dyn std::future::Future<Output = Result<nvim_rs::Value, nvim_rs::Value>> + Send + 'async_trait>,
-        >
-        where
-            'life0: 'async_trait,
-            Self: 'async_trait,
-        {
-            Box::pin(async { Ok(nvim_rs::Value::Nil) })
+        ) -> Result<nvim_rs::Value, nvim_rs::Value> {
+            Ok(nvim_rs::Value::Nil)
         }
     }
 
@@ -1156,6 +1149,7 @@ mod tests {
             .block_on(neovide::bridge::session::NeovimSession::new(
                 neovide::bridge::session::NeovimInstance::Embedded(command),
                 ForkUi,
+                None,
             ))
             .expect("nvim must be on PATH for this test");
         let nvim = session.neovim.clone();
@@ -1230,7 +1224,8 @@ mod tests {
                             .find(|(k, _)| k.as_str() == Some("mode"))
                             .and_then(|(_, v)| v.as_str().map(str::to_owned))
                     });
-                if mode.as_deref() == Some("r?") {
+                // The `:confirm qall` dialog: mode `r?` on nvim 0.12, `c` on 0.11.
+                if mode.as_deref() == Some(crate::test_nvim::prompt_mode()) {
                     break;
                 }
                 assert!(Instant::now() < deadline, "{case}: the dialog never came up ({mode:?})");

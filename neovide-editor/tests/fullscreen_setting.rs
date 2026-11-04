@@ -10,7 +10,7 @@
 //! 3. `set_fullscreen_setting` really assigns the variable in nvim: nothing but that watcher moves
 //!    the getter, so the getter following the write is the proof the write landed.
 //!
-//! Ignored unless asked for: it spawns a real `nvim` (>= 0.10 on `PATH`) and connects to a display
+//! Ignored unless asked for: it spawns a real `nvim` (>= 0.11 on `PATH`) and connects to a display
 //! for the clipboard (no window) -- **its own `Xvfb`** since 2026-09-29
 //! (`shell/tests/support/own_x_server.rs`), started and pointed to before winit connects, with any
 //! inherited `WAYLAND_DISPLAY`/`DISPLAY` dropped. Before that it took the session's display, the
@@ -101,9 +101,10 @@ fn main() {
             "--cmd".to_string(),
             "let g:neovide_fullscreen = v:true".to_string(),
         ],
+        minimum_nvim_version: Some(neovide_editor::NVIM_FLOOR),
         ..Default::default()
     })
-    .expect("LiveHarness::with_options failed -- is `nvim` (>= 0.10) on $PATH?");
+    .expect("LiveHarness::with_options failed -- is `nvim` (>= 0.11) on $PATH?");
 
     let mut frames = Frames::new();
     let deadline = Instant::now() + Duration::from_secs(15);

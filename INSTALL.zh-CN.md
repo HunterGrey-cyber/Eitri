@@ -1,9 +1,9 @@
 [English](INSTALL.md) | 简体中文
-<!-- translated-from: INSTALL.md sha256=cd97a3aae9e0f688d94777460c6fcc4a6bcf03858f16c79508d78e90f15fba56 -->
+<!-- translated-from: INSTALL.md sha256=6fbed3694d7b7712e3a899e6bfee4a676b0d12a24724bda3e3bd24fb4444b6c0 -->
 
 # 安装 Eitri
 
-**你需要：** x86_64 Linux，带 GTK ≥ 4.14、WebKitGTK 6.0 和 glibc ≥ 2.39（Ubuntu 24.04、Debian 13、Fedora 40+、RHEL 10、Arch 都满足）；**nvim ≥ 0.10**（你的版本更旧时，安装脚本可以给 Eitri 单独下载一份私有副本）；以及已经安装并登录的 **Claude Code**。
+**你需要：** x86_64 Linux，带 GTK ≥ 4.14、WebKitGTK 6.0 和 glibc ≥ 2.39（Ubuntu 24.04、Debian 13、Fedora 40+、RHEL 10、Arch 都满足）；**nvim ≥ 0.11**（你的版本更旧时，安装脚本可以给 Eitri 单独下载一份私有副本）；以及已经安装并登录的 **Claude Code**。
 
 <a id="quick-install"></a>
 ## 快速安装
@@ -39,7 +39,7 @@ sudo dnf install ./eitri-<version>-1.x86_64.rpm    # Fedora、RHEL
 eitri setup
 ```
 
-这两种包不运行任何安装脚本，所以由 `eitri setup` 来构建 sidecar；你的 nvim 低于 0.10 时，它还会提议装一份私有副本。它的其他模式见 `eitri setup --help`。没有软件源，所以每次更新都要重新下载软件包。
+这两种包不运行任何安装脚本，所以由 `eitri setup` 来构建 sidecar；你的 nvim 低于 0.11 时，它还会提议装一份私有副本。它的其他模式见 `eitri setup --help`。没有软件源，所以每次更新都要重新下载软件包。
 
 <a id="from-source"></a>
 ### 从源码构建

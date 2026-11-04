@@ -5,7 +5,7 @@
 //! that differ from nvim's own `Normal` background. The cursor sits on an empty buffer's first
 //! cell, so with no cursor drawn every pixel of that cell is exactly the background.
 //!
-//! Ignored unless asked for, because it spawns a real `nvim` (>= 0.10 on `PATH`) and connects to a
+//! Ignored unless asked for, because it spawns a real `nvim` (>= 0.11 on `PATH`) and connects to a
 //! display for the clipboard (no window is created) -- **each case's own `Xvfb`** since 2026-09-29
 //! (`shell/tests/support/own_x_server.rs`), started in the case's child process and pointed to
 //! before winit connects, with any inherited `WAYLAND_DISPLAY`/`DISPLAY` dropped. Before that it took
@@ -82,9 +82,10 @@ fn measure(scale: f64, insert: bool, keys: &str, extra: &[String]) -> (usize, us
         os_scale_factor: scale,
         grid_size: Some(GridSize::new(40u32, 8u32)),
         extra_nvim_args: args,
+        minimum_nvim_version: Some(neovide_editor::NVIM_FLOOR),
         ..Default::default()
     })
-    .expect("LiveHarness::with_options failed -- is `nvim` (>= 0.10) on $PATH?");
+    .expect("LiveHarness::with_options failed -- is `nvim` (>= 0.11) on $PATH?");
 
     let deadline = Instant::now() + Duration::from_secs(15);
     while !harness.is_ready() {

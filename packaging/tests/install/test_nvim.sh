@@ -16,7 +16,7 @@ nv_inst_net() {
 }
 
 # old_nvim_stubs: a directory holding just an nvim reporting NVIM v0.9.5 (older than NV_NVIM_FLOOR,
-# 0.10.0) -- set as PRE_STUBS so it is searched before $S/stubs' own adequate one (harness.sh's own
+# 0.11.0) -- set as PRE_STUBS so it is searched before $S/stubs' own adequate one (harness.sh's own
 # inst()).
 old_nvim_stubs() {
 	_ons_dir=$T/old-nvim

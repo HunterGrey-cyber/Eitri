@@ -44,7 +44,7 @@ NV_SIDECAR_NAMESPACE='eitri-sidecar-release'
 NV_SIDECAR_REPO_BASE=https://github.com/HunterGrey-cyber/verdandi
 NV_GTK_FLOOR_MINOR=14
 NV_GLIBC_FLOOR='2.39'
-NV_NVIM_FLOOR='0.10.0'
+NV_NVIM_FLOOR='0.11.0'
 NV_BINARIES='shell eitri-supervisor eitri-tmux-shim eitri-claude-handoff eitri-run-guard eitri-editor-bridge'
 NV_LICENCE_FILES='LICENSE THIRD-PARTY-LICENSES SOURCE'
 # The desktop entry is named by the application id (the compositor matches a window to <id>.desktop;
@@ -944,7 +944,7 @@ check_gtk_webkit() {
 }
 
 # nvim_check: reports which nvim is on PATH and why, and sets NV_NVIM_OK=1 when it
-# already satisfies NV_NVIM_FLOOR (0.10, the fork's own floor). maybe_offer_nvim reads NV_NVIM_OK to
+# already satisfies NV_NVIM_FLOOR (0.11, the floor the editor gives the fork). maybe_offer_nvim reads NV_NVIM_OK to
 # decide whether the nvim offer runs at all -- an adequate PATH nvim always wins, whatever flag was
 # given, so --with-nvim never *replaces* a perfectly good system nvim.
 nvim_check() {
@@ -3873,7 +3873,7 @@ do_from_source() {
 		# meaningfully simulated that way, so this says so plainly rather than only pretending to.
 		die "--dry-run is not supported with --from-source (it clones and compiles for real): omit --dry-run"
 	fi
-	# The pinned Skia archive is x86_64, and skia-bindings 0.153.3 unpacks it without checking
+	# The pinned Skia archive is x86_64, and skia-bindings 0.156.0 unpacks it without checking
 	# the target. Refuse other architectures before cloning or compiling, rather than reach a
 	# confusing linker error. ARM builds remain unsupported until an architecture-selected Skia
 	# archive is pinned and can be tested.

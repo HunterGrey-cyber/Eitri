@@ -26,7 +26,7 @@ depends=('gtk4' 'webkitgtk-6.0' 'glibc' 'gcc-libs')
 # C-side LTO flags.
 options=('!strip' '!lto')
 optdepends=(
-	'neovim: the editor (any nvim >= 0.10 on PATH)'
+	'neovim: the editor (any nvim >= 0.11 on PATH)'
 	'claude-code: the Claude Code CLI the panel drives'
 	'noto-fonts: the ⏵⏵ mode glyph'
 	'neovide: eitri split'

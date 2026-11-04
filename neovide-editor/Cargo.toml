@@ -16,7 +16,7 @@ gtk4 = { version = "0.11.4", features = ["v4_14"] }
 # shipped binary through `agent`, so this adds no crate to what `shell` links.
 libc = "0.2"
 libloading = "0.9.0"
-skia-safe = { version = "0.153.3", features = ["gl"] }
+skia-safe = { version = "0.156.0", features = ["gl"] }
 # The patched Neovide fork (branch `neovibe-integration`), pinned to a real commit rather than
 # tracking the branch live -- a standing constraint
 # keeps this fork's divergence scoped to surface/geometry/input-adapter/
@@ -79,6 +79,11 @@ harness = false
 
 [[test]]
 name = "multi_nvim"
+harness = false
+
+# The window's nvim floor against real nvims below and above Neovide's own 0.12; like `multi_nvim`.
+[[test]]
+name = "nvim_floor"
 harness = false
 
 # Opens files as nvim arguments after `--embed` against real nvims; each case starts its own harness in

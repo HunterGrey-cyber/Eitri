@@ -7,4 +7,4 @@ publish.workspace = true
 [dependencies]
 gtk4 = { version = "0.11.4", features = ["v4_18"] }
 libloading = "0.9.0"
-skia-safe = { version = "0.153.3", features = ["gl"] }
+skia-safe = { version = "0.156.0", features = ["gl"] }

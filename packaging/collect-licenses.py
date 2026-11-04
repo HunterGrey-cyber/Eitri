@@ -252,8 +252,8 @@ TEXT_OVERRIDES = {
     ("cargo", "webkit6-sys", "0.6.0"): ["webkit6-rs.LICENSE"],
     ("cargo", "javascriptcore6", "0.6.0"): ["webkit6-rs.LICENSE"],
     ("cargo", "javascriptcore6-sys", "0.6.0"): ["webkit6-rs.LICENSE"],
-    ("cargo", "skia-bindings", "0.153.3"): ["rust-skia.LICENSE"],
-    ("cargo", "skia-safe", "0.153.3"): ["rust-skia.LICENSE"],
+    ("cargo", "skia-bindings", "0.156.0"): ["rust-skia.LICENSE"],
+    ("cargo", "skia-safe", "0.156.0"): ["rust-skia.LICENSE"],
 }
 # Same repository, same release train, and the sibling crate DOES ship the file: read it live.
 SIBLING_TEXT = {
@@ -517,8 +517,18 @@ def resolve(pkg, by_nv, counts):
         raise Fail(f"{eco} {name} {ver} ships only blank licence files ({names}); vendor its licence text (EXTRA_TEXTS)")
     counts[label] = counts.get(label, 0) + 1
     return {"title": f"{name} {ver}", "name": name, "version": ver, "license": label, "status": status, "note": note,
-            "copyleft": key in COPYLEFT_ACK,
+            "copyleft": key in COPYLEFT_ACK, "source": pkg.get("source", ""),
             "files": files}
+
+
+def published_source_url(entry):
+    """Where a cargo package's unmodified source is published: its crates.io page, or for a package
+    Cargo.lock takes from a public git repository (`git+https://...?rev=<r>#<full sha>`), that
+    repository at the exact commit."""
+    m = re.fullmatch(r"git\+(https://github\.com/[^?#]+?)(?:\.git)?(?:\?[^#]*)?#([0-9a-f]{40})", entry.get("source") or "")
+    if m:
+        return f"{m.group(1)}/tree/{m.group(2)}"
+    return f"https://crates.io/crates/{entry['name']}/{entry['version']}"
 
 
 # ---------------------------------------------------------------------------------------------
@@ -859,9 +869,9 @@ _SKIA_ARCHIVE_THIRD_PARTY_STEMS = {
 # knows by symbol as "Chromium zlib" when it reaches a shipped binary).
 _SKIA_ARCHIVE_CHROMIUM_ZLIB_STEMS = {"zlib_adler32_simd", "zlib_crc32_simd", "zlib_inflate_chunk_simd"}
 
-# Every other target this project has found inside the pinned archive (skia-binaries-b7f043e0b1e2a-
-# 850e702-x86_64-unknown-linux-gnu-ftembed-ganesh-gl-jpegd-jpege-pdf-textlayout.tar.gz, tag 0.153.3,
-# sha256 ef41a8ff...0caf10): all Skia's own code -- font-manager backends, its own codec wrappers
+# Every other target this project has found inside the pinned archive (skia-binaries-ce6727ef25151-
+# 8df37bc-x86_64-unknown-linux-gnu-ftembed-ganesh-gl-jpegd-jpege-pdf-textlayout.tar.gz, tag 0.156.0,
+# sha256 444321da...b1ebf1): all Skia's own code -- font-manager backends, its own codec wrappers
 # around the libraries above (e.g. "jpeg_decode.SkJpegCodec.o" is Skia's wrapper, not libjpeg itself;
 # checked by reading its actual defined symbols, not assumed from the name), skcms, SkSL, gpu
 # backends, and so on. A target not in this set and not matching a known third-party stem above (or
@@ -1098,6 +1108,8 @@ def skia_archive_notice_entries(archive_path, extract_dir, expected_sha256=None)
             return "BSD-3-Clause", [("notice", "Copyright 2017 The Chromium Authors. Copyright (C) 2017 ARM, Inc.\n"),
                                      ("chromium.LICENSE", read_text(os.path.join(TEXTS, "chromium.LICENSE")))]
         if comp == "Wuffs":
+            # The archive's member is wuffs-v0.3.c, whose own header is Apache-2.0 (the repository's
+            # root LICENSE, MIT and Apache-2.0, is not what that file says).
             return "Apache-2.0", [("notice", "Copyright 2017 The Wuffs Authors.\n"),
                                    ("Apache-2.0.txt", read_text(os.path.join(TEXTS, "Apache-2.0.txt")))]
         if comp == "expat":
@@ -1531,7 +1543,7 @@ def build_header(no_sidecar, source_url, copyleft, rust_count, native_count, web
         "unmodified source is published:",
     ]
     for e in copyleft:
-        L.append(f"  {e['title']} [{e['license']}]  https://crates.io/crates/{e['name']}/{e['version']}")
+        L.append(f"  {e['title']} [{e['license']}]  {published_source_url(e)}")
     L += [
         f"Eitri's own source is at {source_url}.",
         "",
@@ -1758,8 +1770,7 @@ def write_source_notice(path, version, commit, url, skia_archive, skia_sha256, n
         "    1. cp -r vendor/nvim-rs nvim-rs-modified",
         "    2. rm nvim-rs-modified/.cargo-checksum.json",
         "    3. make your changes inside nvim-rs-modified/, not inside vendor/nvim-rs",
-        "    4. add this to the root Cargo.toml:",
-        "           [patch.crates-io]",
+        "    4. in the root Cargo.toml's [patch.crates-io] section, replace the nvim-rs line with:",
         '           nvim-rs = { path = "nvim-rs-modified" }',
         f'    5. SKIA_BINARIES_URL="file://$PWD/skia/{skia_archive}" cargo build --release --offline -p shell',
         "",

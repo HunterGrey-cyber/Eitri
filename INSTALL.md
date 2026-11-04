@@ -3,7 +3,7 @@ English | [简体中文](INSTALL.zh-CN.md)
 # Installing Eitri
 
 **You need:** x86_64 Linux with GTK ≥ 4.14, WebKitGTK 6.0 and glibc ≥ 2.39 (Ubuntu 24.04, Debian 13,
-Fedora 40+, RHEL 10, Arch); **nvim ≥ 0.10** (the installer can fetch a private copy for Eitri if yours is
+Fedora 40+, RHEL 10, Arch); **nvim ≥ 0.11** (the installer can fetch a private copy for Eitri if yours is
 older); and **Claude Code**, installed and logged in.
 
 ## Quick install
@@ -44,7 +44,7 @@ eitri setup
 ```
 
 The packages run no install scripts, so `eitri setup` builds the sidecar and offers a private nvim if yours
-is older than 0.10. `eitri setup --help` lists its other modes. There is no package repository, so each
+is older than 0.11. `eitri setup --help` lists its other modes. There is no package repository, so each
 update is a new download.
 
 ### From source

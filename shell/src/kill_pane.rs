@@ -56,7 +56,7 @@ mod tests {
             return NvimState::NotAnswering;
         }
         match &watch.last_answer {
-            Some(answer) if answer.mode == "r?" => NvimState::Asking,
+            Some(answer) if eitri_core::wm::close::is_quit_dialog(&answer.mode, answer.blocking) => NvimState::Asking,
             Some(answer) if answer.blocking => NvimState::WaitingForKey,
             _ => NvimState::Busy,
         }

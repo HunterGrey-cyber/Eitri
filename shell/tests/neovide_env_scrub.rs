@@ -40,7 +40,7 @@ impl ListeningNvim {
             .stdout(Stdio::null())
             .stderr(Stdio::null())
             .spawn()
-            .expect("nvim (>= 0.10) on PATH");
+            .expect("nvim (>= 0.11) on PATH");
         let nvim = ListeningNvim { child, dir, socket };
         let deadline = Instant::now() + Duration::from_secs(10);
         while UnixStream::connect(&nvim.socket).is_err() {

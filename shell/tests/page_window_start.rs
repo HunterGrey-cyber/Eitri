@@ -2,7 +2,7 @@
 //! end to end, on the test's own Xvfb.
 //!
 //! A plain `main` (`harness = false`): `own_display_scan` requires a test that starts the product binary to isolate its
-//! display in `main`. Opt-in with `-- --ignored`: it needs `nvim` (>= 0.10) on `PATH`, `Xvfb` and WebKitGTK. Each case
+//! display in `main`. Opt-in with `-- --ignored`: it needs `nvim` (>= 0.11) on `PATH`, `Xvfb` and WebKitGTK. Each case
 //! runs its own headless nvim and its own window under a home of its own, with a stand-in `claude` first on `PATH`, and
 //! ends both by the pids it captured.
 
