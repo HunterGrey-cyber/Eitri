@@ -132,7 +132,7 @@ fn every_shape_of_a_toolkit_dependency_is_caught() {
         assert_eq!(offenders(manifest).len(), 1, "not caught:\n{manifest}");
     }
     for manifest in [
-        "[dependencies]\nglibc-version = \"1\"\nterminal-render = { path = \"../terminal-render\" }\n",
+        "[dependencies]\nglibc-version = \"1\"\nterminal-render = { path = \"../render\" }\n",
         "[package]\nname = \"gtk4\"\n",
     ] {
         assert_eq!(offenders(manifest), Vec::<String>::new(), "a false alarm:\n{manifest}");

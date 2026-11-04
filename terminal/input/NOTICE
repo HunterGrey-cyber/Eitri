@@ -1,0 +1,61 @@
+terminal-input
+==============
+
+This crate contains source code derived from the Alacritty terminal emulator.
+
+    Upstream project: https://github.com/alacritty/alacritty
+    Upstream commit:  94e7c8874e526b1e67b349d9ba30ddf81669119e
+                      (carries tags v0.17.0 and alacritty_terminal_v0.26.0)
+    Upstream licence: Apache License, Version 2.0 (alacritty/Cargo.toml: license = "Apache-2.0").
+                      A LICENSE-MIT file exists at the upstream repository root but does NOT
+                      cover the `alacritty` GUI crate, which is the source of the vendored code.
+
+A copy of the Apache License, Version 2.0 is distributed with this crate as
+`LICENSE-APACHE`, as required by section 4(a).
+
+NOTICE OF MODIFICATION (Apache-2.0 section 4(b))
+------------------------------------------------
+
+The following files carry modified copies of upstream Alacritty source. Each file
+carries a per-file provenance header naming the upstream path, commit and line range,
+and states whether it was modified.
+
+  src/vendored/build_sequence.rs
+      Derived from alacritty/src/input/keyboard.rs lines 291-718 and lines 133-172
+      at commit 94e7c8874e526b1e67b349d9ba30ddf81669119e.
+      CHANGED: the `use winit::...` import lines were replaced with imports of this
+      crate's `terminal_input::keys` shim, and the two functions taken from lines
+      133-172 were lifted out of `impl<T, A> Processor<T, A>` into free functions.
+      The bodies of `build_sequence`, `SequenceBuilder`, `SequenceBase`,
+      `SequenceTerminator`, `SequenceModifiers`, `is_control_character`,
+      `is_modifier_key` and `should_build_sequence` are byte-identical to upstream.
+
+  src/keys.rs
+      An independently written shim. It reproduces the *public API shape* of the winit
+      0.30.13 types `Key`, `NamedKey`, `KeyLocation`, `ElementState`, `ModifiersState`
+      and `KeyEvent` so that the vendored code above compiles unchanged. The variant
+      list and the body of `NamedKey::to_text` follow winit 0.30.13
+      (src/keyboard.rs:1576-1585), which is Apache-2.0 licensed:
+          https://github.com/rust-windowing/winit
+      CHANGED: this is not a copy of winit; it is a minimal re-declaration.
+
+  src/regime.rs
+      Derived from alacritty/src/input/keyboard.rs lines 22-131 and 252-277, and from
+      the declarative key binding table in alacritty/src/config/bindings.rs lines
+      444-460, at the same commit.
+      CHANGED: GUI-only concerns (IME, hint state, vi mode, search bar, key bindings
+      whose action is not `Action::Esc`) are removed; the binding table rows are
+      compiled into Rust match arms; APP_KEYPAD support that upstream does not ship
+      is added and explicitly marked as extrapolation.
+
+MOVED INTO NEOVIBE (2026-09-23)
+-------------------------------
+
+This crate was moved whole from the Verdandi repository (crates/terminal-input at
+e5f9cc32a701008b5a99aae481d3f0d3e4c8368e) into the neovibe repository (terminal-input/). Changed in
+the move: its own Cargo.lock was dropped (the workspace lockfile governs it); Cargo.toml and
+README.md gained a note naming the move; and every Rust file except src/vendored/build_sequence.rs
+was reformatted by rustfmt at max_width = 120 -- whitespace only, no token changed -- which
+src/regime.rs's own provenance header also records. src/vendored/build_sequence.rs is excluded from
+formatting by a #[rustfmt::skip] on its module declaration in src/vendored/mod.rs, so its fenced
+regions stay byte-identical to upstream, which tests/vendored_is_verbatim.rs checks.

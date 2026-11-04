@@ -1,0 +1,22 @@
+[package]
+name = "terminal-render"
+version.workspace = true
+edition = "2021"
+publish = false
+license = "MIT"
+# Eitri is the only product consumer; this library is MIT-licensed with Eitri.
+description = "Correctness-first native rendering of TerminalFrame: a pure paint-list builder. Contains NO backend and no graphics dependency by design -- backends live in the consuming frontend."
+
+# terminal-frame is the ONLY dependency, and that is a hard rule: no graphics
+# crate, no Skia, no windowing, ever. A backend is the consuming frontend's, and
+# keeping one out of here is what lets the whole cell/colour/wide-char/cursor
+# contract be tested with no GPU, no window and no Skia build.
+[dependencies]
+terminal-frame = { path = "../frame" }
+
+[dev-dependencies]
+# Only the TESTS drive a real Term; the library itself never depends on it.
+alacritty_terminal = "0.26.0"
+
+[features]
+default = []

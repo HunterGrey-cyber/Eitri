@@ -80,7 +80,7 @@ fn before_tests(text: &str) -> &str {
 /// code setting it somewhere else: on the sidecar, or on the nvim child.
 #[test]
 fn the_port_variable_is_named_only_in_its_module() {
-    let read = rust_sources(&["agent/src", "core/src", "shell/src", "panel/src", "terminal/src"]);
+    let read = rust_sources(&["agent/src", "core/src", "shell/src", "panel/src", "terminal/engine/src"]);
     require_anchors(
         &read,
         &["fn build_ui(", "fn sidecar_command_for", "fn child_environment_with"],

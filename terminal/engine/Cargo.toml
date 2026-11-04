@@ -10,10 +10,10 @@ description = "The bottom terminal's engine: an owned PTY, one session thread pe
 # The GTK half lives in `shell/src/terminal/`; macOS hosts this crate in an NSView, so the
 # toolkit boundary belongs here rather than at shell.
 [dependencies]
-terminal-render = { path = "../terminal-render" }
-terminal-frame = { path = "../terminal-frame" }
-terminal-sync = { path = "../terminal-sync" }
-terminal-input = { path = "../terminal-input" }
+terminal-render = { path = "../render" }
+terminal-frame = { path = "../frame" }
+terminal-sync = { path = "../sync" }
+terminal-input = { path = "../input" }
 # The one emulator. Same version the four crates above resolve; never `alacritty_terminal::tty` --
 # see `src/pty.rs` for the five reasons.
 alacritty_terminal = "0.26.0"

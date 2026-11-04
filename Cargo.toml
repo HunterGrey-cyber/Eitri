@@ -16,11 +16,11 @@ members = [
     "panel",
     "mac",
     "supervisor",
-    "terminal",
-    "terminal-frame",
-    "terminal-input",
-    "terminal-render",
-    "terminal-sync",
+    "terminal/engine",
+    "terminal/frame",
+    "terminal/input",
+    "terminal/render",
+    "terminal/sync",
 ]
 # The Neovide fork is a submodule with its own workspace; it is a path dependency, not a member.
 exclude = ["neovide"]
@@ -39,11 +39,11 @@ default-members = [
     "panel",
     "mac",
     "supervisor",
-    "terminal",
-    "terminal-frame",
-    "terminal-input",
-    "terminal-render",
-    "terminal-sync",
+    "terminal/engine",
+    "terminal/frame",
+    "terminal/input",
+    "terminal/render",
+    "terminal/sync",
 ]
 
 [workspace.package]

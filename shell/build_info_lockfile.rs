@@ -1,7 +1,7 @@
 // The commit hash `Cargo.lock` recorded for a git-dependency package, read as text rather than
 // through a TOML parser -- `Cargo.lock`'s own format (one `[[package]]` table per package, each
 // key on its own line) is stable enough that this project's other lockfile readers already do
-// the same (`terminal-sync/build.rs`'s vte-version lookup).
+// the same (`terminal/sync/build.rs`'s vte-version lookup).
 //
 // A plain `.rs` file rather than a module (not `//!`-documented, since `include!` can splice this
 // file in anywhere, never only at the top of one): `build.rs` is compiled as a wholly separate

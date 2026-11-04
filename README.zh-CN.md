@@ -1,5 +1,5 @@
 [English](README.md) | 简体中文
-<!-- translated-from: README.md sha256=840b7f2dd2ef205b7cb70c7d6a7f1157a86e4c6d058fc8ae7a9159433297ed3f -->
+<!-- translated-from: README.md sha256=37668f3cbe655d68375ef47a0a6ea1df484a7e3bd7a78597cf6bc57919256974 -->
 
 <div align="center">
 
@@ -72,7 +72,7 @@ eitri ~/path/to/project
 
 ## 许可证
 
-MIT（[LICENSE](LICENSE)），`terminal-input/` 除外，它是 Apache-2.0（派生自 Alacritty；见它自己的 `NOTICE`）。编辑器窗格构建在 [Neovide](https://github.com/neovide/neovide)（MIT）的一个 fork 之上。
+MIT（[LICENSE](LICENSE)），`terminal/input/` 除外，它是 Apache-2.0（派生自 Alacritty；见它自己的 `NOTICE`）。编辑器窗格构建在 [Neovide](https://github.com/neovide/neovide)（MIT）的一个 fork 之上。
 
 `shell` 静态链接了 [nvim-rs](https://crates.io/crates/nvim-rs) 0.9.2，它是 **LGPL-3.0** 许可：每个发布页面都附带对应源码（Corresponding Source，`eitri-<version>-source.tar.gz`），安装后的 `SOURCE` 文件给出了针对修改过的 nvim-rs 重新链接的方法。`THIRD-PARTY-LICENSES` 收录其余所有声明。
 

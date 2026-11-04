@@ -103,7 +103,7 @@ fn offenders(manifest: &str) -> Vec<String> {
 fn manifest_declares_no_gtk_or_webkit_dependency() {
     let offenders: Vec<String> = offenders(MANIFEST)
         .into_iter()
-        .map(|o| format!("terminal/Cargo.toml:{o}"))
+        .map(|o| format!("terminal/engine/Cargo.toml:{o}"))
         .collect();
     assert!(
         offenders.is_empty(),
@@ -135,7 +135,7 @@ fn every_shape_of_a_toolkit_dependency_is_caught() {
         assert_eq!(offenders(manifest).len(), 1, "not caught:\n{manifest}");
     }
     for manifest in [
-        "[dependencies]\nglibc-version = \"1\"\nterminal-render = { path = \"../terminal-render\" }\n",
+        "[dependencies]\nglibc-version = \"1\"\nterminal-render = { path = \"../render\" }\n",
         "[package]\nname = \"gtk4\"\n",
     ] {
         assert_eq!(offenders(manifest), Vec::<String>::new(), "a false alarm:\n{manifest}");

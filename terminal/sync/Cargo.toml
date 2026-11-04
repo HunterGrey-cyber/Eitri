@@ -1,0 +1,31 @@
+[package]
+name = "terminal-sync"
+version.workspace = true
+edition = "2021"
+publish = false
+license = "MIT"
+# Eitri is this library's only product consumer.
+# Verdandi stated no licence for it; it is MIT with the rest of Eitri from here.
+description = "DECSET 2026 synchronized-output publication barrier for Eitri's terminal runtime engine."
+
+# NOTE: vte is deliberately NOT a direct dependency. `alacritty_terminal` re-exports the exact
+# vte it was compiled against (`pub use vte;`), so taking it through the re-export makes a
+# two-vte-versions-in-one-binary mistake structurally impossible. build.rs still reads the vte
+# version out of Cargo.lock, so the generated code tracks the real resolved version.
+[dependencies]
+alacritty_terminal = "0.26.0"
+# Already in the graph (`terminal` depends on it for the same reason: measuring printed
+# characters the way `alacritty_terminal` does). `SyncSpy::input` uses it to cap
+# zero-width combining marks per cell.
+unicode-width = "0.2"
+
+[dev-dependencies]
+libc = "0.2"
+rustix-openpty = "0.2.0"
+
+[features]
+# Negative control ONLY. Swaps the parser's Timeout impl back to vte's stock StdSyncHandler,
+# which re-enables vte's 2 MiB raw-byte sync buffer. Tests that assert the locked semantic model
+# ("Term keeps parsing and mutating during the update") MUST FAIL under this feature. See
+# tests/real_pty.rs and README.md.
+control-stock-sync-handler = []

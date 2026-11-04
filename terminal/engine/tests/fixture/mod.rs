@@ -1,6 +1,6 @@
-//! Parses Verdandi's golden op dump back into `PaintList`s.
+//! Parses terminal-render's golden op dump back into `PaintList`s.
 //!
-//! The dump is a readable one-line-per-op rendering of the exact ops Verdandi's builder produced for
+//! The dump is a readable one-line-per-op rendering of the exact ops terminal-render's builder produced for
 //! each scenario. Parsing it here rather than depending on the builder keeps the tests that use it free
 //! of `terminal-frame`, `alacritty_terminal` and any `Term` -- the same ignorance property the
 //! backend itself has, applied to its tests.
@@ -50,7 +50,7 @@ impl Scenario {
 }
 
 pub fn load_scenarios() -> Vec<Scenario> {
-    parse(include_str!("../../../terminal-render/tests/golden/paintops.txt"))
+    parse(include_str!("../../../render/tests/golden/paintops.txt"))
 }
 
 fn hex(s: &str) -> RgbColor {
@@ -272,7 +272,7 @@ fn parse_style(rest: &str) -> (RgbColor, GlyphStyle) {
             "strike" => style.strikeout = true,
             // `dim` is a resolved COLOUR upstream, not a flag the backend acts on. It appears in the
             // dump as a readability aid; treating it as a style here would re-derive something
-            // Verdandi already decided.
+            // the builder already decided.
             "dim" => {}
             _ => {
                 if let Some(v) = token.strip_prefix("fg=") {

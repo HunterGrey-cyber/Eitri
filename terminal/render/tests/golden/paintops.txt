@@ -1,0 +1,162 @@
+=== ascii ===
+surface 12x2 bg=181818 top_line=0
+fill   r0 c0..12 181818
+fill   r1 c0..12 181818
+text   r0 c0+1 "a" fg=d8d8d8 ul=-
+text   r0 c1+1 "b" fg=d8d8d8 ul=-
+text   r0 c2+1 "c" fg=d8d8d8 ul=-
+cursor r0 c3+1 Block d8d8d8 under=-
+
+=== mixed-ascii-cjk ===
+surface 12x2 bg=181818 top_line=0
+fill   r0 c0..12 181818
+fill   r1 c0..12 181818
+text   r0 c0+1 "a" fg=d8d8d8 ul=-
+text   r0 c1+2 "漢" fg=d8d8d8 ul=-
+text   r0 c3+2 "字" fg=d8d8d8 ul=-
+text   r0 c5+1 "b" fg=d8d8d8 ul=-
+cursor r0 c6+1 Block d8d8d8 under=-
+
+=== wide-char-at-wrap-boundary ===
+surface 5x3 bg=181818 top_line=0
+fill   r0 c0..5 181818
+fill   r1 c0..5 181818
+fill   r2 c0..5 181818
+text   r0 c0+1 "a" fg=d8d8d8 ul=-
+text   r0 c1+1 "b" fg=d8d8d8 ul=-
+text   r0 c2+1 "c" fg=d8d8d8 ul=-
+text   r0 c3+1 "d" fg=d8d8d8 ul=-
+text   r1 c0+2 "漢" fg=d8d8d8 ul=-
+cursor r1 c2+1 Block d8d8d8 under=-
+
+=== decorated-wide-char ===
+surface 12x2 bg=181818 top_line=0
+fill   r0 c0..12 181818
+fill   r1 c0..12 181818
+text   r0 c0+2 "漢" fg=d8d8d8 strike ulc=d8d8d8 ul=u
+cursor r0 c2+1 Block d8d8d8 under=-
+
+=== combining-marks ===
+surface 12x2 bg=181818 top_line=0
+fill   r0 c0..12 181818
+fill   r1 c0..12 181818
+text   r0 c0+1 "e\u{301}" fg=d8d8d8 ul=-
+text   r0 c1+1 " \u{301}" fg=d8d8d8 ul=-
+text   r0 c2+2 "漢\u{308}" fg=d8d8d8 ul=-
+cursor r0 c4+1 Block d8d8d8 under=-
+
+=== colors-indexed-and-truecolor ===
+surface 12x2 bg=181818 top_line=0
+fill   r0 c0..1 0000ee
+fill   r0 c1..12 181818
+fill   r1 c0..12 181818
+text   r0 c0+1 "A" fg=cd0000 ul=-
+text   r0 c1+1 "B" fg=af00ff ul=-
+text   r0 c2+1 "C" fg=112233 ul=-
+cursor r0 c3+1 Block d8d8d8 under=-
+
+=== bold-dim-inverse-underline-strike ===
+surface 12x2 bg=181818 top_line=0
+fill   r0 c0..2 181818
+fill   r0 c2..3 cd0000
+fill   r0 c3..12 181818
+fill   r1 c0..12 181818
+text   r0 c0+1 "b" fg=ff0000 bold ul=-
+text   r0 c1+1 "d" fg=880000 ul=-
+text   r0 c2+1 "i" fg=181818 ul=-
+text   r0 c3+1 "s" fg=d8d8d8 strike ulc=d8d8d8 ul=u
+cursor r0 c4+1 Block d8d8d8 under=-
+
+=== cursor-over-glyph ===
+surface 12x2 bg=181818 top_line=0
+fill   r0 c0..12 181818
+fill   r1 c0..12 181818
+text   r0 c0+1 "X" fg=d8d8d8 ul=-
+text   r0 c1+1 "Y" fg=d8d8d8 ul=-
+cursor r0 c0+1 Block d8d8d8 under="X"@181818
+
+=== cursor-unfocused ===
+surface 12x2 bg=181818 top_line=0
+fill   r0 c0..12 181818
+fill   r1 c0..12 181818
+text   r0 c0+1 "X" fg=d8d8d8 ul=-
+text   r0 c1+1 "Y" fg=d8d8d8 ul=-
+cursor r0 c0+1 HollowBlock d8d8d8 under=-
+
+=== cursor-blinking ===
+surface 12x2 bg=181818 top_line=0
+fill   r0 c0..12 181818
+fill   r1 c0..12 181818
+text   r0 c0+1 "X" fg=d8d8d8 ul=-
+text   r0 c1+1 "Y" fg=d8d8d8 ul=-
+cursor r0 c0+1 Block d8d8d8 blink under="X"@181818
+
+=== cursor-over-wide-glyph ===
+surface 12x2 bg=181818 top_line=0
+fill   r0 c0..12 181818
+fill   r1 c0..12 181818
+text   r0 c0+2 "漢" fg=d8d8d8 ul=-
+cursor r0 c0+2 Block d8d8d8 under="漢"@181818
+
+=== selection ===
+surface 12x2 bg=181818 top_line=0
+fill   r0 c0..1 181818
+fill   r0 c1..4 d8d8d8
+fill   r0 c4..12 181818
+fill   r1 c0..12 181818
+text   r0 c0+1 "a" fg=d8d8d8 ul=-
+text   r0 c1+1 "b" fg=181818 ul=-
+text   r0 c2+1 "c" fg=181818 ul=-
+text   r0 c3+1 "d" fg=181818 ul=-
+text   r0 c4+1 "e" fg=d8d8d8 ul=-
+text   r0 c5+1 "f" fg=d8d8d8 ul=-
+cursor r0 c6+1 Block d8d8d8 under=-
+
+=== wrapped-rows ===
+surface 6x3 bg=181818 top_line=0
+fill   r0 c0..6 181818
+fill   r1 c0..6 181818
+fill   r2 c0..6 181818
+text   r0 c0+1 "A" fg=d8d8d8 ul=-
+text   r0 c1+1 "B" fg=d8d8d8 ul=-
+text   r0 c2+1 "C" fg=d8d8d8 ul=-
+text   r0 c3+1 "D" fg=d8d8d8 ul=-
+text   r0 c4+1 "E" fg=d8d8d8 ul=-
+text   r0 c5+1 "F" fg=d8d8d8 ul=-
+text   r1 c0+1 "G" fg=d8d8d8 ul=-
+text   r1 c1+1 "H" fg=d8d8d8 ul=-
+text   r1 c2+1 "I" fg=d8d8d8 ul=-
+text   r1 c3+1 "J" fg=d8d8d8 ul=-
+text   r1 c4+1 "K" fg=d8d8d8 ul=-
+text   r1 c5+1 "L" fg=d8d8d8 ul=-
+cursor r1 c5+1 Block d8d8d8 under="L"@181818
+
+=== pinned-history-negative-absolute-lines ===
+surface 8x3 bg=181818 top_line=-9
+fill   r0 c0..8 181818
+fill   r1 c0..8 181818
+fill   r2 c0..8 181818
+text   r0 c0+1 "L" fg=d8d8d8 ul=-
+text   r0 c1+1 "1" fg=d8d8d8 ul=-
+text   r0 c2+1 "0" fg=d8d8d8 ul=-
+text   r1 c0+1 "L" fg=d8d8d8 ul=-
+text   r1 c1+1 "1" fg=d8d8d8 ul=-
+text   r1 c2+1 "1" fg=d8d8d8 ul=-
+text   r2 c0+1 "L" fg=d8d8d8 ul=-
+text   r2 c1+1 "1" fg=d8d8d8 ul=-
+text   r2 c2+1 "2" fg=d8d8d8 ul=-
+
+=== anchor-expired ===
+surface 8x3 bg=181818 top_line=0
+fill   r0 c0..8 181818
+fill   r1 c0..8 181818
+fill   r2 c0..8 181818
+text   r0 c0+1 "L" fg=d8d8d8 ul=-
+text   r0 c1+1 "1" fg=d8d8d8 ul=-
+text   r0 c2+1 "9" fg=d8d8d8 ul=-
+text   r1 c0+1 "L" fg=d8d8d8 ul=-
+text   r1 c1+1 "2" fg=d8d8d8 ul=-
+text   r1 c2+1 "0" fg=d8d8d8 ul=-
+cursor r2 c0+1 Block d8d8d8 under=-
+notice r0 c0+8 " pinned history no longer available -- showing live output " fg=181818 bg=d8d8d8
+

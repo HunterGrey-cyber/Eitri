@@ -44,8 +44,8 @@ One Cargo workspace at the repository root.
 | `nvim/eitri.nvim/` | the Neovim plugin behind `:EitriPanel` |
 | `gnome-extension/` | the GNOME Shell extension companion mode uses on GNOME |
 | `supervisor/` | `eitri-supervisor`, a read-only cross-window agent-status dashboard |
-| `terminal/` | package **`eitri-terminal`**: the bottom terminal's engine — PTY, session thread, terminal state, Skia paint |
-| `terminal-render/`, `terminal-frame/`, `terminal-sync/`, `terminal-input/` | the terminal's paint list, frame projection, synchronized-update barrier and key encoder. `terminal-input` is Apache-2.0 (derived from Alacritty); see its `NOTICE` |
+| `terminal/engine/` | package **`eitri-terminal`**: the bottom terminal's engine — PTY, session thread, terminal state, Skia paint |
+| `terminal/render/`, `terminal/frame/`, `terminal/sync/`, `terminal/input/` | the terminal's paint list, frame projection, synchronized-update barrier and key encoder. `terminal-input` is Apache-2.0 (derived from Alacritty); see its `NOTICE` |
 | `neovide/` | submodule: the Neovide fork ([HunterGrey-cyber/neovide](https://github.com/HunterGrey-cyber/neovide), branch `neovibe-integration`) |
 | `poc/` | frozen proof-of-concept crates from the feasibility stage. Not the product; they deliberately keep bugs fixed only in the product crates |
 
@@ -194,6 +194,6 @@ report, and any proof of concept, doesn't sit in public before a fix ships.
 ## Licence
 
 Contributions are made under the licence that already covers the file you're editing: MIT for
-everything except `terminal-input/`, which is Apache-2.0 (derived from Alacritty; see its own
+everything except `terminal/input/`, which is Apache-2.0 (derived from Alacritty; see its own
 `NOTICE`). See [README.md's Licence section](README.md#licence) for the full picture, including what
 Eitri statically links and why the agent sidecar isn't in any release artifact.

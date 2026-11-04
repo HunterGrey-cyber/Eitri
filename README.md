@@ -93,7 +93,7 @@ Known limits are on [eitri.cc](https://eitri.cc/#requirements); what comes next 
 
 ## Licence
 
-MIT ([LICENSE](LICENSE)), except `terminal-input/`, which is Apache-2.0 (derived from Alacritty; see
+MIT ([LICENSE](LICENSE)), except `terminal/input/`, which is Apache-2.0 (derived from Alacritty; see
 its `NOTICE`). The editor pane is built on a fork of [Neovide](https://github.com/neovide/neovide) (MIT).
 
 `shell` statically links [nvim-rs](https://crates.io/crates/nvim-rs) 0.9.2, which is **LGPL-3.0**:

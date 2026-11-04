@@ -1,0 +1,23 @@
+[package]
+name = "terminal-frame"
+version.workspace = true
+edition = "2021"
+publish = false
+license = "MIT"
+# Eitri is the only product consumer; this library is MIT-licensed with Eitri.
+description = "TerminalFrame: the stable Eitri presentation contract, its projection from an authoritative alacritty_terminal::Term, and the wire encodings it is measured with."
+
+# alacritty_terminal is the only terminal dependency; bitflags only builds the
+# frame's own flag types. `vte` is reached through
+# `alacritty_terminal::vte`, the exact version it was compiled against, so a
+# two-vte-versions-in-one-binary mistake is structurally impossible -- the same
+# rule terminal-sync follows.
+[dependencies]
+alacritty_terminal = "0.26.0"
+bitflags = "2"
+
+[dev-dependencies]
+libc = "0.2"
+
+[features]
+default = []

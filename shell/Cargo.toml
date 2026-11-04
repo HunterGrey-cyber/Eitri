@@ -26,9 +26,9 @@ serde_json = "1"
 uuid = { version = "1", features = ["v4"] }
 # The bottom terminal. The engine
 # is GTK-free; `src/terminal/` is its GTK half.
-eitri-terminal = { path = "../terminal" }
-terminal-input = { path = "../terminal-input" }
-terminal-render = { path = "../terminal-render" }
+eitri-terminal = { path = "../terminal/engine" }
+terminal-input = { path = "../terminal/input" }
+terminal-render = { path = "../terminal/render" }
 # The terminal's GtkGLArea paints through Skia's GL backend, exactly as neovide-editor's does; same
 # version and features, so no second Skia build.
 skia-safe = { version = "0.153.3", features = ["gl"] }

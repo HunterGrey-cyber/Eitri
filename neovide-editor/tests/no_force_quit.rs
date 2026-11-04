@@ -449,17 +449,17 @@ const SCANNED: &[&str] = &[
     "core/src",
     "neovide-editor/src",
     "agent/src",
-    "terminal/src",
+    "terminal/engine/src",
     "supervisor/src",
 ];
 
 /// Product crates whose sources this scan does not read, each with why. Copied terminal drawing
 /// libraries never start, drive or stop an nvim.
 const NOT_SCANNED: &[(&str, &str)] = &[
-    ("terminal-frame", "a terminal drawing library; it never talks to nvim"),
-    ("terminal-input", "a key encoder; it never talks to nvim"),
-    ("terminal-render", "a terminal drawing library; it never talks to nvim"),
-    ("terminal-sync", "a terminal drawing library; it never talks to nvim"),
+    ("terminal/frame", "a terminal drawing library; it never talks to nvim"),
+    ("terminal/input", "a key encoder; it never talks to nvim"),
+    ("terminal/render", "a terminal drawing library; it never talks to nvim"),
+    ("terminal/sync", "a terminal drawing library; it never talks to nvim"),
 ];
 
 /// The `default-members` of the workspace manifest, i.e. the product crates.

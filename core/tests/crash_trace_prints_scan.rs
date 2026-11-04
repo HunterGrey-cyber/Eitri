@@ -10,7 +10,7 @@ const DIRS: [&str; 7] = [
     "panel/src",
     "shell/src",
     "neovide-editor/src",
-    "terminal/src",
+    "terminal/engine/src",
     "supervisor/src",
 ];
 const PRINTS: [&str; 4] = ["println", "eprintln", "print", "eprint"];

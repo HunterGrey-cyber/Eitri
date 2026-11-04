@@ -55,7 +55,7 @@ class WorkspaceMembers(unittest.TestCase):
 
     def test_terminal_input_ships_its_licence_and_its_notice(self):
         pkg = {"eco": "cargo", "name": "terminal-input", "version": "0.1.0", "license": "Apache-2.0",
-               "dir": os.path.join(cl.REPO, "terminal-input"), "source": "", "license_file": None}
+               "dir": os.path.join(cl.REPO, "terminal", "input"), "source": "", "license_file": None}
         entry = cl.resolve(pkg, {}, {})
         self.assertEqual(sorted(name for name, _ in entry["files"]), ["LICENSE-APACHE", "NOTICE"])
         notice = dict(entry["files"])["NOTICE"]

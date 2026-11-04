@@ -1,9 +1,9 @@
-//! Renders Verdandi's own golden op corpus and inspects the resulting pixels.
+//! Renders terminal-render's golden op corpus and inspects the resulting pixels.
 //!
-//! The corpus is read from `terminal-render/tests/golden/paintops.txt` in this workspace:
+//! The corpus is read from `terminal/render/tests/golden/paintops.txt` in this workspace:
 //! one file keeps the builder's corpus and these pixel checks from drifting apart.
 //!
-//! The corpus is the exact op stream Verdandi's builder produces for 15 known scenarios. Using it
+//! The corpus is the exact op stream terminal-render's builder produces for 15 known scenarios. Using it
 //! here means the backend is tested against real op streams without this crate needing the builder,
 //! a `Term`, or any terminal vocabulary at test time.
 //!
@@ -137,7 +137,7 @@ fn the_corpus_loads_and_covers_what_it_claims_to() {
     assert_eq!(
         scenarios.len(),
         15,
-        "the fixture should hold every scenario Verdandi generated"
+        "the fixture should hold every scenario the builder generated"
     );
     for name in [
         "ascii",
@@ -157,7 +157,7 @@ fn the_corpus_loads_and_covers_what_it_claims_to() {
     ] {
         assert!(scenarios.iter().any(|s| s.name == name), "missing scenario {name}");
     }
-    // Every list Verdandi emits is layer-ordered, and the backend's correctness depends on executing
+    // Every list the builder emits is layer-ordered, and the backend's correctness depends on executing
     // it in the given order. Checking it here means a corpus that ever violated it would be caught
     // rather than silently painting a cursor under its own background.
     for s in &scenarios {
@@ -243,7 +243,7 @@ fn a_wide_glyph_at_a_wrap_boundary_starts_the_next_row() {
     let bg = rgb(DEFAULT_BG);
     assert!(r.ink_in(1, 0, 1, bg) > 0, "the wide glyph begins row 1 column 0");
     assert!(r.ink_in(1, 1, 1, bg) > 0, "and spans into column 1");
-    // It did NOT get squeezed into the one remaining column of row 0. Verdandi decided that; this
+    // It did NOT get squeezed into the one remaining column of row 0. The builder decided that; this
     // asserts the backend honoured the decision rather than re-deriving it.
     assert_eq!(r.ink_in(0, 4, 1, bg), 0, "row 0's last column stays empty");
 }
@@ -321,7 +321,7 @@ fn fills_use_exactly_the_colour_they_were_given() {
 fn an_inverse_cell_is_already_swapped_and_is_not_swapped_again() {
     let s = scenario("bold-dim-inverse-underline-strike");
     let r = Rendered::of(&s);
-    // Verdandi resolved the inverse cell to fg=181818 on bg=cd0000. If the backend inverted a second
+    // The builder resolved the inverse cell to fg=181818 on bg=cd0000. If the backend inverted a second
     // time the cell would come back dark-on-red, so the cell's DOMINANT colour is the check that
     // matters -- the glyph's own ink covers the centre and says nothing about the fill.
     assert_eq!(

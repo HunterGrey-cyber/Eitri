@@ -1,0 +1,19 @@
+[package]
+name = "terminal-input"
+version.workspace = true
+edition = "2021"
+license = "Apache-2.0"
+# Derived from Alacritty (NOTICE), so it must retain Apache-2.0; packaging/collect-licenses.py
+# ships its LICENSE-APACHE and NOTICE with the package.
+description = "TermMode-aware keyboard/input encoder: NormalizedInput + TermMode -> PTY bytes."
+publish = false
+
+[dependencies]
+alacritty_terminal = "0.26.0"
+bitflags = "2"
+
+[dev-dependencies]
+libc = "0.2"
+
+[features]
+default = []
