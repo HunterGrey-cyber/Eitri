@@ -20,6 +20,16 @@
 //! wake-ups at all (tested in `eitri-terminal`'s `idle_renders_nothing`). Hidden (unmapped), the
 //! pane tells the session so, and a program printing away in a hidden terminal renders nothing.
 //!
+//! **A typed key's echo shows one output frame after the key** (about 18 ms at 60 Hz, 8 ms at 165 Hz,
+//! where an emulator that commits the echo directly takes about 1 ms). The pane is a `GtkGLArea`
+//! painted in GTK's frame clock. A printable key reaches the shell as an input-method commit, whose
+//! handler paints at once, in the key's own frame-clock cycle, before the echo is back. The compositor
+//! composites that commit, and the echo's frame, committed 2-3 ms later, waits for its next output
+//! frame. Without that paint, GTK 4.24 holds the echo's render until one period after the key's cycle
+//! instead (`min_next_frame_time`, a 60 Hz period where the output reports no refresh), which is no
+//! sooner and often later. Only presenting outside GTK's frame clock, as the editor's subsurface does,
+//! takes the frame away.
+//!
 //! **A shell that will not start** (a stale `$SHELL`) falls back to the passwd entry's shell and
 //! then `/bin/sh`; if none starts, the pane says so in its own frame and waits for Enter, rather
 //! than trying again on every resize.
@@ -1919,6 +1929,10 @@ fn connect_ime(area: &GLArea, state: &Rc<RefCell<State>>, im: &IMMulticontext) {
                     text.chars().count()
                 ),
             }
+            // On every commit, plain keys included, not only when a composition was drawn: this
+            // paint stops GTK's frame clock until the compositor's frame callback, and the thaw
+            // paints the echo at once. Skipping it leaves the echo to GTK's hold one period after
+            // the key's cycle, which is no sooner (the module doc).
             if let Some(area) = area.upgrade() {
                 area.queue_render();
             }
