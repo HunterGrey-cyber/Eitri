@@ -903,6 +903,7 @@ const EVALUATORS: &[(&str, &str)] = &[
     (EXEC_CHUNK, "nvim_exec2"),
     (EXEC_CHUNK, "loadstring("),
     ("core/src/companion/install.lua", "loadstring("),
+    ("core/src/takeover/waiting_room.lua", "nvim_exec("),
 ];
 
 /// What `review_lua_builds_no_source` refuses in `review.lua`, but for the word `load(`, read by [`tool_chunk_words`],
