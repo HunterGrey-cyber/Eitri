@@ -1420,6 +1420,18 @@ impl PluginEditorRpc {
                     buf: buf()?,
                     line: line()?.ok_or("missing line")?,
                     col: u32::try_from(number("col")?).map_err(|e| e.to_string())?,
+                    select: match get("select_line") {
+                        None => None,
+                        Some(_) => Some(eitri_core::plugin::protocol::JumpSelect {
+                            line: u32::try_from(number("select_line")?).map_err(|e| e.to_string())?,
+                            col: u32::try_from(number("select_col")?).map_err(|e| e.to_string())?,
+                            mode: match get("select_mode").and_then(rmpv::Value::as_str) {
+                                Some("char") => eitri_core::plugin::protocol::SelectMode::Char,
+                                Some("line") => eitri_core::plugin::protocol::SelectMode::Line,
+                                _ => return Err("a jump's select_mode is char or line".into()),
+                            },
+                        }),
+                    },
                 }),
                 // The snippet and its commands stay window 1's: a page ending here only stops following.
                 Some("teardown") => Ok(EditorOp::PluginFollow { plugin, on: false }),
@@ -2720,7 +2732,19 @@ mod tests {
             editor::follow_on(&proxy, "ignored", true),
             editor::follow_text(&proxy, "ignored", 3, 1, 1),
             editor::follow_reveal(&proxy, "ignored", 3, 2, 8, Some(5), Some(9)),
-            editor::follow_jump(&proxy, "ignored", 3, 2, 1),
+            editor::follow_jump(&proxy, "ignored", 3, 2, 1, None),
+            editor::follow_jump(
+                &proxy,
+                "ignored",
+                3,
+                2,
+                1,
+                Some(eitri_core::plugin::protocol::JumpSelect {
+                    line: 4,
+                    col: 2,
+                    mode: eitri_core::plugin::protocol::SelectMode::Line,
+                }),
+            ),
             editor::follow_teardown(&proxy, "ignored"),
         ];
         for request in requests {
@@ -2733,7 +2757,7 @@ mod tests {
             }));
             assert!(got.into_inner().unwrap().is_ok());
         }
-        assert_eq!(rpc.calls.borrow().len(), 9);
+        assert_eq!(rpc.calls.borrow().len(), 10);
         assert!(rpc.calls.borrow()[3..]
             .iter()
             .all(|code| std::ptr::eq(*code, editor::PLUGIN_FOLLOW_LUA)));

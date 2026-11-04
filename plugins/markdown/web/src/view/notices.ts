@@ -43,6 +43,7 @@ export function statusText(s: { name: string; current: boolean; blocked: number 
 
 export const HUD = {
   notOpen: "the file is not open in a window",
+  notSelected: "the editor did not take the selection (is it in a prompt, or the file not open?)",
   outside: "outside the project",
   noSuchFile: "no such file",
   wrapBottom: "search hit BOTTOM, continuing at TOP",

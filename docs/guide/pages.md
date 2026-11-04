@@ -227,7 +227,9 @@ The capabilities:
   with `guifont`; a page that wants its text the editor's size reads `var(--nv-text-size, 14px)`. A window beside your
   own Neovim sends none.
 - **The keys kit** at `/.eitri/keys.js` gives the page the keys every plugin page shares: `j`/`k` and `d`/`u`
-  scroll, `gg`/`G`, `/` finds, `f` labels what can be pressed, `?` lists the keys, `H`/`L` go back and forward.
+  scroll, `gg`/`G`, `/` finds, `f` labels what can be pressed, `?` lists the keys, `H`/`L` go back and forward, and
+  `v`/`V` select text as Vim's visual mode does (`y` copies it). Pass `visual: {start, follow, keys}` to `install` to
+  start a selection at your page's own cursor, follow it as it moves, and add keys of your own for it.
   `window.eitriKeys.install({rows, run, initial})` adds your rows; `run(action)` returns `true` when it handled the
   key. While a text field has the keys every key goes to it except `Esc`. You can change a page's keys in `init.lua`
   with `eitri.keymap.set("plugin:<id>", "<key>", "<action>")`.

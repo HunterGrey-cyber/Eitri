@@ -101,6 +101,12 @@ div.mdp-box {
   display: none;
 }
 
+/* In visual mode the selection, in the editor's Visual colour, marks the cursor's row; the band blended over the
+   text would wash it out. */
+html[data-eitri-visual] .mdp-cursor-line {
+  display: none;
+}
+
 .mdp-cursor-bar {
   background-color: var(--nv-chrome-accent);
 }

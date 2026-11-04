@@ -1,0 +1,17 @@
+{
+  "v": 1,
+  "id": 35,
+  "verb": "editor.jump",
+  "args": {
+    "buf": 3,
+    "line": 42,
+    "col": 0,
+    "focus": true,
+    "select": {
+      "line": 44,
+      "col": 0,
+      "mode": "line",
+      "end": 45
+    }
+  }
+}

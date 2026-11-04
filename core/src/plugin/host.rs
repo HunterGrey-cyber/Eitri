@@ -1638,6 +1638,10 @@ impl PluginHost {
                 };
                 let row = match &op {
                     FollowOp::Reveal { row: Some(row), .. } => format!(" row={row}"),
+                    // A jump's selection: its mode and the line its cursor ends on.
+                    FollowOp::Jump {
+                        select: Some(select), ..
+                    } => format!(" select={}:{}", select.mode.as_str(), select.line),
                     _ => String::new(),
                 };
                 if let Ok(applied) = applied {
@@ -1776,9 +1780,14 @@ impl PluginHost {
                 editor::follow_reveal(&*editor, id, *buf, *line, *token, *cursor, *row),
                 Some(*re),
             ),
-            FollowOp::Jump { buf, line, col, re, .. } => {
-                (editor::follow_jump(&*editor, id, *buf, *line, *col), Some(*re))
-            }
+            FollowOp::Jump {
+                buf,
+                line,
+                col,
+                select,
+                re,
+                ..
+            } => (editor::follow_jump(&*editor, id, *buf, *line, *col, *select), Some(*re)),
             FollowOp::OpenLink { path, line, re } => (editor::open(&*editor, path, *line, None), Some(*re)),
             FollowOp::Teardown => (editor::follow_teardown(&*editor, id), None),
         };
@@ -2348,6 +2357,7 @@ impl PluginHost {
             line: args.line,
             col: args.col,
             focus: args.focus,
+            select: args.select,
             re,
         };
         let mut replies = Vec::new();
@@ -3447,7 +3457,7 @@ mod tests {
             let _ = editor::follow_on(&*rpc, "demo", true);
             let _ = editor::follow_text(&*rpc, "demo", 1, 100, 100);
             let _ = editor::follow_reveal(&*rpc, "demo", 1, 2, 3, None, None);
-            let _ = editor::follow_jump(&*rpc, "demo", 1, 2, 0);
+            let _ = editor::follow_jump(&*rpc, "demo", 1, 2, 0, None);
             let _ = editor::follow_teardown(&*rpc, "demo");
             let calls = rpc.calls.borrow();
             assert_eq!(calls.len(), 6);

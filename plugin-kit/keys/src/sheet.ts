@@ -42,9 +42,10 @@ export function sheetKey(key: string): boolean {
   return true;
 }
 
-const GROUPS: KitGroup[] = ["scroll", "history", "link", "find", "hint", "sheet", "mode"];
+const GROUPS: KitGroup[] = ["scroll", "history", "link", "find", "hint", "visual", "sheet", "mode"];
 const GROUP_LABELS: Record<KitGroup, string> = {
-  scroll: "scroll", history: "history", link: "pages", find: "find", hint: "hints", sheet: "help", mode: "leave",
+  scroll: "scroll", history: "history", link: "pages", find: "find", hint: "hints", visual: "visual", sheet: "help",
+  mode: "leave",
 };
 
 export function openSheet(rows: Row[], labels?: KitLabels): void {

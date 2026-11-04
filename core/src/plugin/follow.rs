@@ -11,6 +11,8 @@ use std::collections::VecDeque;
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
+use super::protocol::JumpSelect;
+
 /// The least time between two pulls of a buffer that keeps changing.
 pub const PULL_INTERVAL: Duration = Duration::from_millis(200);
 /// The same for a buffer whose last pull measured over `LARGE_TEXT_BYTES`: its render costs more, so it
@@ -56,6 +58,8 @@ pub enum FollowOp {
         line: u32,
         col: u32,
         focus: bool,
+        /// The selection's other end, where nvim's cursor ends, and its visual mode.
+        select: Option<JumpSelect>,
         re: u64,
     },
     OpenLink {
@@ -541,6 +545,7 @@ mod tests {
             line: 5,
             col: 0,
             focus: false,
+            select: None,
             re: 9,
         };
         assert_eq!(f.park(reveal(1)), Parked::Queued);
@@ -593,6 +598,7 @@ mod tests {
             line: 5,
             col: 0,
             focus: true,
+            select: None,
             re: 3,
         };
         assert_eq!(f.park(reveal(1)), Parked::Queued);
@@ -635,6 +641,7 @@ mod tests {
             line: 5,
             col: 0,
             focus: false,
+            select: None,
             re,
         };
         let link = FollowOp::OpenLink {
@@ -696,6 +703,7 @@ mod tests {
             line: 5,
             col: 0,
             focus: false,
+            select: None,
             re: 3,
         });
         assert_eq!(f.drop_page_ops(), [2, 3]);

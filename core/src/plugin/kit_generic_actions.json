@@ -17,6 +17,8 @@
     "find.prev",
     "hint.start",
     "sheet.open",
-    "mode.escape"
+    "mode.escape",
+    "visual.char",
+    "visual.line"
   ]
 }

@@ -1,5 +1,7 @@
 import { jump } from "../protocol";
-import { kit, type Row } from "../kit";
+import { kit, type Row, type VisualKind } from "../kit";
+import { copyText, COPY_FAILED } from "./clipboard";
+import { sourceSelection } from "./selection";
 import { boxAt, currentBlock, noteClick, pickedLine } from "./current";
 import { lineToY, yToLine } from "./sync";
 import { FIND_MESSAGES, HUD, statusText } from "./notices";
@@ -101,6 +103,42 @@ export async function editHere(p: Preview, y?: number): Promise<void> {
   } finally {
     if (!applied) p.editJumpFailed();
   }
+}
+
+/** Visual mode's Enter: the selection goes to nvim, selected there in its own visual mode, with the keys. Charwise
+ *  when the selection lies inside one source line and its text occurs there exactly once, else linewise over the
+ *  source lines it spans; nvim's cursor ends on the line of the selection's cursor, which the preview's cursor
+ *  follows, so nvim's view moves no more than the selection needs. The selection is read at once, inside the key
+ *  event, before visual mode ends. A host that does not know `select` gets the plain jump to the cursor's line. */
+export function editSelection(p: Preview, kind: VisualKind): void {
+  const buf = p.shownBuf();
+  const sel = document.getSelection();
+  const src = buf === null || !sel ? null : sourceSelection(p, sel, kind);
+  if (buf === null || !src) return;
+  p.beforeEditJump();
+  const select = { line: src.focus.line + 1, col: src.focus.col, mode: src.mode };
+  const ask = jump(p.bridge, { buf, line: src.anchor.line + 1, col: src.anchor.col, focus: true, select })
+    .catch((error: unknown) => {
+      if ((error as { code?: unknown } | null)?.code !== "bad_request") throw error;
+      return jump(p.bridge, { buf, line: select.line, col: select.col, focus: true });
+    });
+  void ask.then((result) => result.applied, () => false).then((applied) => {
+    if (applied) return;
+    p.editJumpFailed();
+    kit()?.message(HUD.notSelected);
+  });
+}
+
+/** Visual mode's `Y`: the Markdown of the source lines the selection spans, from the snapshot the page rendered. */
+export function yankSelection(p: Preview, kind: VisualKind): void {
+  const sel = document.getSelection();
+  const src = sel ? sourceSelection(p, sel, kind) : null;
+  if (!src) return;
+  const top = Math.min(src.anchor.line, src.focus.line);
+  const bottom = Math.max(src.anchor.line, src.focus.line);
+  const text = p.lines().slice(top, bottom + 1).map((l) => (l.endsWith("\r") ? l.slice(0, -1) : l)).join("\n");
+  const count = bottom - top + 1;
+  void copyText(text).then((ok) => kit()?.message(ok ? HUD.yanked(count) : COPY_FAILED));
 }
 
 /* A history entry: the buffer, the line at the window's top `y` (where an entry without a cursor places the page),
@@ -306,6 +344,16 @@ export async function installKeys(
       labels: { messages: FIND_MESSAGES },
       find: { root: () => root, exclude: FIND_EXCLUDE },
       onJump,
+      // Visual mode starts at the cursor, the cursor follows its moving end (so nvim follows too), and Enter and `Y`
+      // act on the source it spans.
+      visual: {
+        start: () => p.visualStart(),
+        follow: (rect) => { p.followSelection(rect); refresh(); },
+        keys: {
+          "<CR>": (kind) => { editSelection(p, kind); return true; },
+          Y: (kind) => { yankSelection(p, kind); return true; },
+        },
+      },
     })
     : () => {};
   refresh();

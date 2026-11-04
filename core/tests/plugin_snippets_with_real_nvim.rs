@@ -1640,6 +1640,144 @@ fn jump_lands_on_the_first_non_blank_and_makes_the_window_current() {
     assert!(!applied(&op(&mut c, "jump", at(a_buf, 1, ("col", 0)))));
 }
 
+fn mode(c: &mut Case) -> String {
+    c.nvim
+        .lua("return vim.api.nvim_get_mode().mode", vec![])
+        .as_str()
+        .unwrap()
+        .to_string()
+}
+
+/// A jump from (`line`, `col`) selecting to (`to`, `to_col`) in `mode` (`char` or `line`).
+fn select(buf: u64, line: u64, col: u64, to: u64, to_col: u64, mode: &str) -> Value {
+    opts_map(&[
+        ("owner", OWNER.into()),
+        ("buf", buf.into()),
+        ("line", line.into()),
+        ("col", col.into()),
+        ("select_line", to.into()),
+        ("select_col", to_col.into()),
+        ("select_mode", mode.into()),
+    ])
+}
+
+/// Waits until nvim is in `want` mode.
+fn wait_mode(c: &mut Case, want: &str) {
+    c.nvim.wait_until(want, |n| {
+        n.lua("return vim.api.nvim_get_mode().mode", vec![]) == Value::from(want)
+    });
+}
+
+/// What the selection holds and where it started, by typing `y` as the user would (the yank ends visual mode, and a
+/// key typed after a hand-off must reach Visual mode, not text).
+fn yank_selection(c: &mut Case) -> (String, Value) {
+    let start = c.nvim.lua("return vim.fn.getpos('v')", vec![]);
+    c.nvim.input("y");
+    wait_mode(c, "n");
+    let text = c
+        .nvim
+        .lua("return vim.fn.getreg('\"')", vec![])
+        .as_str()
+        .unwrap()
+        .to_string();
+    (text, start)
+}
+
+#[test]
+#[ignore = "needs a real nvim on PATH; spends no tokens and needs no display"]
+fn a_jump_with_select_selects_in_visual_mode_without_scrolling() {
+    let (mut c, _listener, socket) = follow_case("select");
+    let mut doc = numbered(300);
+    doc[159] = "\u{4e2d}\u{6587}xyz".to_string();
+    let a = write_doc(&c, "a.md", &doc);
+    edit(&mut c, &a);
+    install(&mut c, &socket, false, &[], None);
+    follow(&mut c, true);
+    let a_buf = buf_of(&mut c, &a);
+    let win = current_win(&mut c);
+    c.nvim.command("150");
+    c.nvim.command("normal! zz");
+    let top = top_line(&mut c, win);
+    assert!(top > 30, "line 150 centred puts the top well below line 20 ({top})");
+
+    // Charwise, from a line far above the window to one inside it: nvim's cursor ends on the second place, and
+    // the window does not move.
+    assert!(applied(&op(&mut c, "jump", select(a_buf, 20, 2, 151, 4, "char"))));
+    assert_eq!(mode(&mut c), "v");
+    assert_eq!(cursor(&mut c), Value::Array(vec![151.into(), 3.into()]));
+    assert_eq!(top_line(&mut c, win), top, "the first place is never visited");
+    let (text, start) = yank_selection(&mut c);
+    assert_eq!(start, Value::Array(vec![0.into(), 20.into(), 2.into(), 0.into()]));
+    assert!(text.starts_with("ine 20\n") && text.ends_with("\nline"), "{text:?}");
+
+    // Backward, on one line of multi-byte characters: columns count characters.
+    assert!(applied(&op(&mut c, "jump", select(a_buf, 160, 4, 160, 2, "char"))));
+    assert_eq!(cursor(&mut c), Value::Array(vec![160.into(), 3.into()]));
+    assert_eq!(yank_selection(&mut c).0, "\u{6587}xy");
+
+    // Linewise from insert mode: nvim leaves insert mode and selects as its next keys, and the buffer is unchanged.
+    let tick = c.nvim.lua("return vim.b.changedtick", vec![]);
+    c.nvim.input("i");
+    wait_mode(&mut c, "i");
+    assert!(applied(&op(&mut c, "jump", select(a_buf, 152, 0, 154, 0, "line"))));
+    wait_mode(&mut c, "V");
+    assert_eq!(cursor(&mut c).as_array().unwrap()[0], Value::from(154));
+    assert_eq!(yank_selection(&mut c).0, "line 152\nline 153\nline 154\n");
+    assert_eq!(
+        c.nvim.lua("return vim.b.changedtick", vec![]),
+        tick,
+        "nothing was typed into the text"
+    );
+
+    // From visual mode of the other kind, and with lines and columns past the buffer: held to its last line's
+    // last character.
+    c.nvim.input("V");
+    wait_mode(&mut c, "V");
+    assert!(applied(&op(&mut c, "jump", select(a_buf, 299, 999, 9999, 999, "char"))));
+    assert_eq!(mode(&mut c), "v");
+    assert_eq!(cursor(&mut c), Value::Array(vec![300.into(), 7.into()]));
+    assert_eq!(yank_selection(&mut c).0, "9\nline 300");
+
+    // An exclusive selection still holds the character the page selected last.
+    c.nvim.command("set selection=exclusive");
+    assert!(applied(&op(&mut c, "jump", select(a_buf, 160, 1, 160, 3, "char"))));
+    assert_eq!(yank_selection(&mut c).0, "\u{4e2d}\u{6587}x");
+    assert!(applied(&op(&mut c, "jump", select(a_buf, 160, 5, 160, 2, "char"))));
+    assert_eq!(yank_selection(&mut c).0, "\u{6587}xyz");
+    // An empty line has no character to go on to.
+    c.nvim
+        .lua("vim.api.nvim_buf_set_lines(0, 160, 161, true, { '' })", vec![]);
+    assert!(applied(&op(&mut c, "jump", select(a_buf, 160, 1, 161, 1, "char"))));
+    assert_eq!(mode(&mut c), "v");
+    c.nvim.input("<Esc>");
+    wait_mode(&mut c, "n");
+    c.nvim.command("set selection=inclusive");
+
+    // A command line being typed is the user's: nothing is selected and nothing moves.
+    let before = cursor(&mut c);
+    c.nvim.input(":");
+    wait_mode(&mut c, "c");
+    assert!(!applied(&op(&mut c, "jump", select(a_buf, 10, 0, 12, 0, "line"))));
+    assert_eq!(mode(&mut c), "c");
+    c.nvim.input("<Esc>");
+    wait_mode(&mut c, "n");
+    assert_eq!(cursor(&mut c), before);
+
+    // A closed fold at either end is opened, so the selection is the one asked for, not the whole fold.
+    c.nvim.command("set foldmethod=manual");
+    c.nvim.command("20,24fold");
+    c.nvim.command("40,44fold");
+    assert!(applied(&op(&mut c, "jump", select(a_buf, 22, 2, 42, 3, "char"))));
+    let (text, _) = yank_selection(&mut c);
+    assert!(text.starts_with("ine 22\n") && text.ends_with("\nlin"), "{text:?}");
+    c.nvim.command("normal! zE");
+
+    // A jump without `select` is the plain jump it was.
+    assert!(applied(&op(&mut c, "jump", at(a_buf, 5, ("col", 0)))));
+    assert_eq!(mode(&mut c), "n");
+    assert_eq!(cursor(&mut c), Value::Array(vec![5.into(), 0.into()]));
+}
+
 #[test]
 #[ignore = "needs a real nvim on PATH; spends no tokens and needs no display"]
 fn text_refuses_past_the_caps_without_reading_lines() {

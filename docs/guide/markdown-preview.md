@@ -124,6 +124,7 @@ Give the preview the keys with your key, with `Ctrl+l` from the editor, or by cl
 | `f` | labels on links, footnote links and fold toggles; type a label to follow it |
 | `yy` | copy the current block's Markdown source (for a code block, the code without the fence lines) |
 | `Enter` | edit here: move Neovim's cursor to this place and give Neovim the keys |
+| `v` / `V` | select text from the cursor, by characters / by whole lines ([Selecting text](#selecting-text)) |
 | `H` or `Ctrl+o` / `L` or `Ctrl+i` | back / forward between jumps inside the document: `gg`, `G`, `]]`, `[[`, a search and `n`/`N`, a heading link, a footnote |
 | `?` | the list of these keys |
 | `Esc` | leave a mode; also clears the search highlights |
@@ -147,6 +148,35 @@ Give the preview the keys with your key, with `Ctrl+l` from the editor, or by cl
   when it is Markdown); `src/main.rs#L10` opens at line 10. A web link opens in your browser. A link outside the
   project, or to a file that does not exist, shows `outside the project` or `no such file` and does nothing else.
 
+### Selecting text
+
+`v` starts a selection at the cursor, as in Vim, and `V` selects whole lines; the status line says `VISUAL` or
+`VISUAL LINE`. Then:
+
+| keys | what it does |
+|---|---|
+| `h` / `l`, `w` / `b` / `e`, `0` / `$` | move the cursor end of the selection by a character, a word, to the line's start or end |
+| `j` / `k` | a line down / up, as shown |
+| `gg` / `G` | to the first / last text |
+| `n` / `N` | to the next / previous match of the last search |
+| `o` | to the other end of the selection |
+| `y` | copy the selected text as you see it, and stop selecting |
+| `Y` | copy the Markdown source of the lines the selection covers |
+| `Enter` | edit the selection in Neovim: Neovim gets the keys, with the same text selected in its own visual mode |
+| `v` / `V` | switch between characters and whole lines; the same key again stops selecting |
+| `Esc` | stop selecting |
+
+- The preview's cursor follows the end you move, so the selection stays inside the margins and Neovim follows as it
+  does for `j`.
+- The preview never changes your text. To change what you selected, press `Enter` and change it in Neovim (`c`, `d`,
+  `gq`, ...).
+- `Enter` selects the same characters in Neovim when your selection lies inside one source line and its text appears
+  in that line exactly once. Otherwise Neovim selects the whole source lines it covers: rendered Markdown does not
+  map back to source columns (`**bold**` shows as **bold**, a link shows only its text). If Neovim is at a prompt or
+  on its command line, nothing is selected and the status line says so.
+- A mouse click stops selecting, and so does giving the keys to another pane. The keys used while selecting can't be
+  changed in `init.lua`; `v` and `V` themselves can (`visual.char`, `visual.line`).
+
 Change any of these keys in `init.lua`, as for any plugin, in the `plugin:markdown` table:
 
 ```lua
@@ -156,10 +186,10 @@ eitri.keymap.set("plugin:markdown", "e", "edit.here")
 `<prefix> ?` with the preview focused lists its keys first in Eitri's own key list. The actions are `cursor.down`,
 `cursor.up`, `cursor.half_down`, `cursor.half_up`, `cursor.page_down`, `cursor.page_up`, `cursor.first`,
 `cursor.last`, `scroll.down`, `scroll.up`, `heading.next`, `heading.prev`, `scroll.left`, `scroll.right`, `find.start`,
-`find.next`, `find.prev`, `hint.start`, `block.yank`, `edit.here`, `history.back`, `history.forward`, `sheet.open` and
-`mode.escape`. If you changed these keys for a release candidate, rename an override of `scroll.half_down`,
-`scroll.half_up`, `scroll.page_down`, `scroll.page_up`, `scroll.top` or `scroll.bottom` to the matching `cursor.`
-action (`cursor.half_down`, ..., `cursor.first`, `cursor.last`): the preview no longer has those `scroll.` actions.
+`find.next`, `find.prev`, `hint.start`, `block.yank`, `edit.here`, `history.back`, `history.forward`, `sheet.open`,
+`mode.escape`, `visual.char` and `visual.line`. If you changed these keys for a release candidate, rename an override
+of `scroll.half_down`, `scroll.half_up`, `scroll.page_down`, `scroll.page_up`, `scroll.top` or `scroll.bottom` to the
+matching `cursor.` action (`cursor.half_down`, ..., `cursor.first`, `cursor.last`): the preview no longer has those `scroll.` actions.
 
 How far a step scrolls, whether scrolling is animated, how long a key such as `g` waits, when the list of following
 keys appears, the letters hint labels use and how the search treats case are settings shared by every plugin page:

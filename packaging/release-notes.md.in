@@ -115,7 +115,8 @@ you. Your Neovim stays the editor: a real `nvim --embed` with your own `init.lua
 - Your own pages: a Lua panel (`eitri.panel.register`) shows an HTML file from `~/.config/eitri/panels/`, or any
   address such as your development server, as a module of the window. A plugin is a directory with an
   `eitri-plugin.toml`; its page gets only the host powers the manifest lists, Eitri's colours and the shared reading
-  keys (scrolling, find, hints and history; the Markdown preview adds a cursor of its own). The guide's new "Pages you build" page shows both, with a complete small plugin.
+  keys (scrolling, find, hints, history and Vim-style visual selection with `v`/`V`; the Markdown preview adds a
+  cursor of its own, and `Enter` on a selection hands it to Neovim, selected there). The guide's new "Pages you build" page shows both, with a complete small plugin.
 - **Experimental:** the manifest and the page bridge may change during 0.x, and there is no consent screen yet:
   loading a plugin trusts it as you trust any program you run.
 

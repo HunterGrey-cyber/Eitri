@@ -8,7 +8,9 @@ let message = "";
 let whichKey = "";
 let status = "";
 let dimmed = false;
-const MODES: Record<Mode, string> = { normal: "NORMAL", hint: "HINT", insert: "INSERT" };
+const MODES: Record<Mode, string> = {
+  normal: "NORMAL", hint: "HINT", insert: "INSERT", visual: "VISUAL", visual_line: "VISUAL LINE",
+};
 let modeWords = { ...MODES };
 /** What the HUD last showed. A held key renders on every repeat, so a render that would show the same thing writes
  *  nothing: no style or layout work on a fixed bar thirty times a second. */

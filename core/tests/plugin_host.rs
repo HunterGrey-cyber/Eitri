@@ -1888,6 +1888,25 @@ fn bad_arguments_are_refused_by_their_checks() {
         "line must be at least 1",
     );
     refused(
+        rig.send(
+            "editor.jump",
+            json!({"buf": 3, "line": 2, "col": 0, "focus": true, "select": {"line": 0, "col": 0, "mode": "line"}}),
+        ),
+        "select.line must be at least 1",
+    );
+    for select in [
+        json!({"line": 2, "col": 0, "mode": "block"}),
+        json!({"line": 2, "col": 0}),
+        json!({"line": 2, "col": -1, "mode": "char"}),
+        json!({"line": 2, "col": 0, "mode": "char", "end": 3}),
+    ] {
+        let id = rig.send(
+            "editor.jump",
+            json!({"buf": 3, "line": 2, "col": 0, "focus": true, "select": select}),
+        );
+        assert_eq!(rig.page.replies_to(id)[0]["error"]["code"], "bad_request", "{select}");
+    }
+    refused(
         rig.send("editor.open_link", json!({"buf": 3, "target": "a\nb.md"})),
         "target holds a control character",
     );
@@ -1912,6 +1931,13 @@ fn jump_with_focus_moves_the_keys_only_when_applied() {
         assert_eq!(opt(&opts, "buf"), 3.into());
         assert_eq!(opt(&opts, "line"), 5.into());
         assert_eq!(opt(&opts, "col"), 0.into());
+        assert!(
+            opts.as_map()
+                .unwrap()
+                .iter()
+                .all(|(k, _)| k.as_str() != Some("select_line")),
+            "a jump without a selection sends none"
+        );
         id
     };
     let first = jump(true);
@@ -1949,6 +1975,42 @@ fn jump_with_focus_moves_the_keys_only_when_applied() {
     d.rig.host.pump(d.t0 + EDITOR_DEADLINE + Duration::from_secs(1));
     assert_eq!(d.rig.page.replies_to(slow)[0]["result"], json!({"applied": true}));
     assert_eq!(d.rig.layout.0.borrow().len(), 1, "a late answer moves no keys");
+}
+
+#[test]
+fn a_jumps_selection_reaches_the_snippet_as_its_three_fields() {
+    let d = shown("host-jump-select");
+    let id = d.rig.send(
+        "editor.jump",
+        json!({"buf": 3, "line": 5, "col": 2, "focus": true, "select": {"line": 3, "col": 7, "mode": "char"}}),
+    );
+    d.rig.host.pump(d.t0);
+    let (op, opts) = last_call(&d.rig);
+    assert_eq!(op, "jump");
+    assert_eq!(
+        [
+            opt(&opts, "line"),
+            opt(&opts, "col"),
+            opt(&opts, "select_line"),
+            opt(&opts, "select_col"),
+            opt(&opts, "select_mode"),
+        ],
+        [5.into(), 2.into(), 3.into(), 7.into(), "char".into()]
+    );
+    answer(&d.rig, map(&[("applied", true.into())]));
+    d.rig.host.pump(d.t0);
+    assert_eq!(d.rig.page.replies_to(id)[0]["result"], json!({"applied": true}));
+    assert_eq!(*d.rig.layout.0.borrow(), [FocusTarget::Editor]);
+    let id = d.rig.send(
+        "editor.jump",
+        json!({"buf": 3, "line": 5, "col": 0, "focus": true, "select": {"line": 9, "col": 0, "mode": "line"}}),
+    );
+    d.rig.host.pump(d.t0);
+    let (_, opts) = last_call(&d.rig);
+    assert_eq!(opt(&opts, "select_mode"), "line".into());
+    answer(&d.rig, map(&[("applied", true.into())]));
+    d.rig.host.pump(d.t0);
+    assert_eq!(d.rig.page.replies_to(id)[0]["result"], json!({"applied": true}));
 }
 
 #[test]

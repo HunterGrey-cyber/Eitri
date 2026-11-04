@@ -22,6 +22,8 @@ const DEFAULT_ROWS: (Row & { action: GenericAction })[] = [
   { action: "hint.start", keys: ["f"], context: DEFAULT_PAGE_LABEL, desc: "hint mode" },
   { action: "sheet.open", keys: ["?"], context: DEFAULT_PAGE_LABEL, desc: "this sheet" },
   { action: "mode.escape", keys: ["<Esc>"], context: DEFAULT_PAGE_LABEL, desc: "leave a mode" },
+  { action: "visual.char", keys: ["v"], context: DEFAULT_PAGE_LABEL, desc: "visual mode" },
+  { action: "visual.line", keys: ["V"], context: DEFAULT_PAGE_LABEL, desc: "visual line mode" },
 ];
 
 export function genericRows(labels?: KitLabels): Row[] {

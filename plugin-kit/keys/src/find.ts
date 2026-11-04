@@ -19,6 +19,10 @@ export const DEFAULT_MESSAGES: Record<KitMessage, string> = {
   "find.wrapBottom": "search hit BOTTOM, continuing at TOP",
   "find.wrapTop": "search hit TOP, continuing at BOTTOM",
   "find.count": "[{index}/{total}]",
+  "visual.yanked": "{count} characters yanked",
+  "visual.yankedOne": "1 character yanked",
+  "visual.copyFailed": "could not copy to the clipboard",
+  "visual.noText": "no text to select",
 };
 
 /** Whether `query` matches with case: smartcase turns it on as soon as the query holds a capital. */
@@ -191,8 +195,15 @@ export function configureFind(next: Options): void {
 }
 
 function message(name: KitMessage, values: { query?: string; index?: number; total?: number } = {}): string {
-  const template = options.messages?.[name] ?? DEFAULT_MESSAGES[name];
-  return template.replace(/\{(query|index|total)\}/g, (_, field: "query" | "index" | "total") => String(values[field] ?? ""));
+  return kitMessage(options.messages, name, values);
+}
+
+/** A HUD message of the kit's, from the page's `labels.messages` or the English default, its fields filled in. */
+export function kitMessage(messages: Partial<Record<KitMessage, string>> | undefined, name: KitMessage,
+  values: { query?: string; index?: number; total?: number; count?: number } = {}): string {
+  const template = messages?.[name] ?? DEFAULT_MESSAGES[name];
+  return template.replace(/\{(query|index|total|count)\}/g,
+    (_, field: "query" | "index" | "total" | "count") => String(values[field] ?? ""));
 }
 
 function rootOf(): Element {
@@ -426,6 +437,39 @@ export function findNext(direction: 1 | -1): void {
   else if (next < 0) { next = total - 1; wrap = "find.wrapTop"; }
   index = next;
   land(wrap);
+}
+
+/** Visual mode's `n` (1) and `N` (-1): the first match of the last search starting after the place `node`/`offset`
+ *  (the last starting before it), wrapping with vim's messages, over the text as the page shows it now. It moves
+ *  nothing and highlights nothing; `null` (with the HUD saying why) when there is no search or no match. */
+export function matchFrom(node: Node, offset: number, direction: 1 | -1): Range | null {
+  if (!query) {
+    showMessage(message("find.none"));
+    return null;
+  }
+  const found = matchRanges(rootOf(), query, options.exclude, currentSettings().findCase);
+  if (!found.length) {
+    showMessage(message("find.notFound", { query }));
+    return null;
+  }
+  const point = document.createRange();
+  point.setStart(node, offset);
+  const order = (range: Range) => {
+    try {
+      return range.compareBoundaryPoints(Range.START_TO_START, point);
+    } catch {
+      return 0;
+    }
+  };
+  let at = -1;
+  if (direction === 1) at = found.findIndex((range) => order(range) > 0);
+  else found.forEach((range, i) => { if (order(range) < 0) at = i; });
+  let wrap: KitMessage | null = null;
+  if (direction === 1 && at < 0) { at = 0; wrap = "find.wrapBottom"; }
+  if (direction === -1 && at < 0) { at = found.length - 1; wrap = "find.wrapTop"; }
+  const count = message("find.count", { query, index: at + 1, total: found.length });
+  showMessage(wrap ? `${message(wrap, { query })} ${count}` : count);
+  return found[at];
 }
 
 /** Runs the search again after the page changed its text, keeping the current match the one nearest the old one. */

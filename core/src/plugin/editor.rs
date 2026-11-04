@@ -13,6 +13,8 @@ use rmpv::Value;
 use crate::editor_rpc::{EditorRpc, GlueSlot};
 use crate::nvim_rpc::Pending;
 
+use super::protocol::JumpSelect;
+
 // Statics, not consts: a const is copied to each use, and the tests check that the very same text is what
 // reaches the editor, by address.
 pub static PLUGIN_BUFFERS_LUA: &str = include_str!("plugin_buffers.lua");
@@ -387,18 +389,28 @@ pub fn follow_reveal(
     follow_call(rpc, "reveal", args)
 }
 
-/// `col` counts Unicode scalar values from 1; 0 asks for the line's first non-blank character.
-pub fn follow_jump(rpc: &dyn EditorRpc, owner: &str, buf: u64, line: u32, col: u32) -> Pending {
-    follow_call(
-        rpc,
-        "jump",
-        vec![
-            (Value::from("owner"), Value::from(owner)),
-            (Value::from("buf"), Value::from(buf)),
-            (Value::from("line"), Value::from(line)),
-            (Value::from("col"), Value::from(col)),
-        ],
-    )
+/// `col` counts Unicode scalar values from 1; 0 asks for the line's first non-blank character. With `select`, nvim
+/// selects from (`line`, `col`) to that place in its visual mode, its cursor ending there.
+pub fn follow_jump(
+    rpc: &dyn EditorRpc,
+    owner: &str,
+    buf: u64,
+    line: u32,
+    col: u32,
+    select: Option<JumpSelect>,
+) -> Pending {
+    let mut args = vec![
+        (Value::from("owner"), Value::from(owner)),
+        (Value::from("buf"), Value::from(buf)),
+        (Value::from("line"), Value::from(line)),
+        (Value::from("col"), Value::from(col)),
+    ];
+    if let Some(select) = select {
+        args.push((Value::from("select_line"), Value::from(select.line)));
+        args.push((Value::from("select_col"), Value::from(select.col)));
+        args.push((Value::from("select_mode"), Value::from(select.mode.as_str())));
+    }
+    follow_call(rpc, "jump", args)
 }
 
 pub fn follow_teardown(rpc: &dyn EditorRpc, owner: &str) -> Pending {
@@ -667,7 +679,7 @@ mod tests {
         let _ = follow_on(&rpc, "demo", false);
         let _ = follow_text(&rpc, "demo", 3, 4_194_304, 50_000);
         let _ = follow_reveal(&rpc, "demo", 3, 50, 7, None, None);
-        let _ = follow_jump(&rpc, "demo", 3, 5, 0);
+        let _ = follow_jump(&rpc, "demo", 3, 5, 0, None);
         let _ = follow_teardown(&rpc, "demo");
         install.scratch_dir = None;
         let _ = follow_install(&rpc, &install);

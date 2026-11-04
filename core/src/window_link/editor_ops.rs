@@ -324,13 +324,22 @@ pub fn dispatch(id: u64, op: EditorOp, ctx: &dyn OpContext, rpc: &dyn EditorRpc)
                 rpc, &plugin, buf, line, token, cursor, row,
             )))
         }
-        EditorOp::PluginJump { plugin, buf, line, col } => {
+        EditorOp::PluginJump {
+            plugin,
+            buf,
+            line,
+            col,
+            select,
+        } => {
             held_plugin(ctx, &plugin)?;
             if line == 0 {
                 return Err(OpRefused::Outside("line starts at one".into()));
             }
+            if select.is_some_and(|s| s.line == 0) {
+                return Err(OpRefused::Outside("select.line starts at one".into()));
+            }
             Ok(Dispatch::Rpc(crate::plugin::editor::follow_jump(
-                rpc, &plugin, buf, line, col,
+                rpc, &plugin, buf, line, col, select,
             )))
         }
         EditorOp::PluginOpenLink { plugin, path, line } => {
@@ -743,6 +752,18 @@ mod tests {
                 buf: 3,
                 line: 2,
                 col: 1,
+                select: None,
+            },
+            EditorOp::PluginJump {
+                plugin: "snotra".into(),
+                buf: 3,
+                line: 2,
+                col: 1,
+                select: Some(crate::plugin::protocol::JumpSelect {
+                    line: 4,
+                    col: 3,
+                    mode: crate::plugin::protocol::SelectMode::Char,
+                }),
             },
             EditorOp::PluginFollow {
                 plugin: "snotra".into(),
@@ -765,11 +786,24 @@ mod tests {
             assert!(matches!(dispatch(1, back, &f.ctx, &rpc), Ok(Dispatch::Rpc(_))));
         }
         let calls = rpc.0.borrow();
-        assert_eq!(calls.len(), 6);
-        assert!(calls[..5]
+        assert_eq!(calls.len(), 7);
+        assert!(calls[..6]
             .iter()
             .all(|(code, _)| std::ptr::eq(*code, crate::plugin::editor::PLUGIN_FOLLOW_LUA)));
-        assert!(std::ptr::eq(calls[5].0, crate::plugin::editor::PLUGIN_OPEN_LUA));
+        assert!(std::ptr::eq(calls[6].0, crate::plugin::editor::PLUGIN_OPEN_LUA));
+        // The selection goes on to the snippet as its three fields.
+        let field = |key: &str| {
+            calls[3].1[1]
+                .as_map()
+                .unwrap()
+                .iter()
+                .find(|(k, _)| k.as_str() == Some(key))
+                .map(|(_, v)| v.clone())
+        };
+        assert_eq!(
+            (field("select_line"), field("select_col"), field("select_mode")),
+            (Some(4.into()), Some(3.into()), Some("char".into()))
+        );
         assert_eq!(
             calls[0].1[1]
                 .as_map()
@@ -808,13 +842,26 @@ mod tests {
                 path: "/etc/passwd".into(),
                 line: None,
             },
+            EditorOp::PluginJump {
+                plugin: "snotra".into(),
+                buf: 3,
+                line: 2,
+                col: 1,
+                select: Some(crate::plugin::protocol::JumpSelect {
+                    line: 0,
+                    col: 1,
+                    mode: crate::plugin::protocol::SelectMode::Line,
+                }),
+            },
         ] {
             assert!(dispatch(1, op, &f.ctx, &rpc).is_err());
         }
-        assert_eq!(rpc.0.borrow().len(), 6, "a refused call never reaches nvim");
+        assert_eq!(rpc.0.borrow().len(), 7, "a refused call never reaches nvim");
         for op in [
             r#"{"op":"plugin_text","plugin":"snotra","buf":3,"lua":"return 1"}"#,
             r#"{"op":"plugin_install","plugin":"snotra","socket":"/foreign"}"#,
+            r#"{"op":"plugin_jump","plugin":"snotra","buf":3,"line":2,"col":1,"select":{"line":2,"col":1,"mode":"block"}}"#,
+            r#"{"op":"plugin_jump","plugin":"snotra","buf":3,"line":2,"col":1,"select":{"line":2,"col":1,"mode":"char","x":1}}"#,
         ] {
             assert!(serde_json::from_str::<EditorOp>(op).is_err());
         }

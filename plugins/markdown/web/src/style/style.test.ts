@@ -104,6 +104,11 @@ describe("the page's stylesheets", () => {
     }
   });
 
+  it("drop the cursor's band over the text while the kit's visual mode draws the selection", () => {
+    const rule = rules(css["chrome.css"]).find((r) => r.selector === "html[data-eitri-visual] .mdp-cursor-line");
+    expect(rule?.body.replace(/\s+/g, "")).toBe("display:none;");
+  });
+
   it("leave search highlighting to the kit", () => {
     for (const [file, text] of Object.entries(css)) expect(text, file).not.toMatch(/mdp-search/);
   });

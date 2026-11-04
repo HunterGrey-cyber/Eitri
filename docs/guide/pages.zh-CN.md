@@ -1,5 +1,5 @@
 [English](pages.md) | 简体中文
-<!-- translated-from: pages.md sha256=c09854aca253fe496e84e71ab6dab52cf184c263eb2d8b0cc9c94ed93fba582a -->
+<!-- translated-from: pages.md sha256=fa55bf512d9b88556b46766a6d3984a7c4e5b6b5cbd303a4199127f2063637a8 -->
 
 # 你自己做的页面
 
@@ -191,7 +191,7 @@ start();
 - 页面从 `eitri-plugin://<id>/` 提供，只提供 `site` 下的文件（HTML、CSS、JavaScript、JSON、图片和字体），内容安全策略很严：脚本只能来自站点，没有内联脚本，没有 `eval`；样式表来自站点，另外允许内联样式（`<style>` 元素和 `style` 属性）；图片来自站点或 `data:`，`[net]` 的 `images` 为（或者它的设置取值为）`"https"` 时也可以来自任何 `https` 地址；网络请求只能发往 `[net]` 的 origin。站点之外的 `https`、`http` 或 `mailto` 链接，在你按下它时会在 Eitri 之外打开；脚本没法打开它。
 - **桥**是 `window.eitriPlugin`：`call(verb, args)` 返回一个结果的 promise，或者以一个错误拒绝，错误的 `code` 说明原因（`not_declared`、`bad_request`、`outside_roots`、`too_large` 等等）；`on(event, fn)` 用来监听。先调用 `host.hello`：它的结果里有页面的设置、主题、窗口的前缀和 `timeoutlen`，以及它还在运行的任务。一条消息最大 256 KiB，一个保存的值最大 192 KiB，一个插件最多保存 64 个键。
 - **配色和字体**以 `--nv-*` CSS 变量的形式出现在页面的根元素上（`--nv-bg`、`--nv-fg`、`--nv-surface`、`--nv-border`、`--nv-link`、`--nv-font-mono`、`--nv-font-prose`、`--nv-syn-*` 语法配色等等），并随你的配色实时变化。`prefers-color-scheme` 跟随 Eitri 的浅色或深色。除了开在你自己的 Neovim 旁边的窗口，Eitri 的每个窗口还会发送 `--nv-text-size`，即编辑器的文字大小，以页面的像素为单位（例如 `18.67px`），随 `guifont` 变化；想让文字和编辑器一样大的页面读 `var(--nv-text-size, 14px)`。开在你自己的 Neovim 旁边的窗口不发送它。
-- **按键工具包**在 `/.eitri/keys.js`，给页面所有插件页面共用的按键：`j`/`k` 和 `d`/`u` 滚动，`gg`/`G`，`/` 查找，`f` 给能按的东西标上标签，`?` 列出按键，`H`/`L` 后退和前进。`window.eitriKeys.install({rows, run, initial})` 加上你自己的行；`run(action)` 处理了这个键就返回 `true`。文本框拿着按键时，除了 `Esc`，每个键都交给它。你可以在 `init.lua` 里用 `eitri.keymap.set("plugin:<id>", "<key>", "<action>")` 改一个页面的按键。
+- **按键工具包**在 `/.eitri/keys.js`，给页面所有插件页面共用的按键：`j`/`k` 和 `d`/`u` 滚动，`gg`/`G`，`/` 查找，`f` 给能按的东西标上标签，`?` 列出按键，`H`/`L` 后退和前进，`v`/`V` 像 Vim 的 visual 模式那样选中文字（`y` 复制）。给 `install` 传 `visual: {start, follow, keys}`，可以让选中从你页面自己的光标开始、在它移动时跟着走，并给它加上你自己的按键。`window.eitriKeys.install({rows, run, initial})` 加上你自己的行；`run(action)` 处理了这个键就返回 `true`。文本框拿着按键时，除了 `Esc`，每个键都交给它。你可以在 `init.lua` 里用 `eitri.keymap.set("plugin:<id>", "<key>", "<action>")` 改一个页面的按键。
 - **Eitri 的按键优先**：前缀和它后面的键、`Ctrl+h/j/k/l`、`Ctrl+=`、`Ctrl+-`、`Ctrl+0` 和 `F11` 永远不会到达页面，一行按键也不能用它们、`Ctrl+Shift` 组合键或 `Super` 组合键。不经过工具包、自己处理按键并把按键交给编辑器的页面，应该调用 `preventDefault()`，否则这个键也会传到编辑器。
 - 文字大小跟随窗口（`Ctrl+=`），`<prefix> Ctrl+=` 只调整这个页面。
 

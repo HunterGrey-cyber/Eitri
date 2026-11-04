@@ -12,6 +12,7 @@ import { runScroll } from "./scroll";
 import { isOperable } from "./visible";
 import { currentSettings, prefixKey, settingsOf, useSettings } from "./settings";
 import { closeSheet, openSheet, sheetIsOpen, sheetKey } from "./sheet";
+import { configureVisual, endVisual, startVisual, visualKey, visualKind, visualPending } from "./visual";
 import type { InstallOptions, KitLabels } from "./index";
 
 export type { HintTarget, InstallOptions } from "./index";
@@ -97,7 +98,8 @@ export async function install(opts: InstallOptions): Promise<() => void> {
     const value = hasKeys(data);
     if (value === undefined) return;
     pageHasKeys = value;
-    if (!value) { endHold(); hints?.cancel(); }
+    // Visual mode ends with the keys, as vim's ends on leaving the window.
+    if (!value) { endHold(); hints?.cancel(); endVisual(); }
     clearPrefix();
     if (!value) resetSuper();
     setDimmed(!value);
@@ -134,8 +136,12 @@ export async function install(opts: InstallOptions): Promise<() => void> {
     { prefixWait: () => currentSettings().prefixWait });
   const spaceToKeys = spaceStartsBinding(rows);
   const shiftSpaceToKeys = spaceStartsBinding(rows, true);
-  const renderMode = () => showMode(textField(document.activeElement) ? "insert" : hints?.active ? "hint" : "normal",
-    hints?.active ? hints.prefix : pending);
+  const renderMode = () => {
+    const visual = visualKind();
+    showMode(textField(document.activeElement) ? "insert" : hints?.active ? "hint"
+      : visual === "char" ? "visual" : visual === "line" ? "visual_line" : "normal",
+    hints?.active ? hints.prefix : visual ? visualPending() : pending);
+  };
   const stopWhichKey = () => {
     window.clearTimeout(whichKeyTimer);
     whichKeyTimer = undefined;
@@ -157,8 +163,15 @@ export async function install(opts: InstallOptions): Promise<() => void> {
   const syncFocus = () => { hints?.cancel(); clearPrefix(); };
   document.addEventListener("focusin", syncFocus);
   document.addEventListener("focusout", syncFocus);
-  const onBlur = () => { endHold(); hints?.cancel(); clearPrefix(); };
+  const onBlur = () => { endHold(); hints?.cancel(); endVisual(); clearPrefix(); };
   window.addEventListener("blur", onBlur);
+  // A press of the pointer makes a selection of its own: visual mode gives way to it.
+  const onPointerDown = () => {
+    if (!visualKind()) return;
+    endVisual();
+    renderMode();
+  };
+  window.addEventListener("pointerdown", onPointerDown, true);
   // A held key's release ends its glide. Capture, so a page that stops the keyup cannot leave the view gliding.
   const onKeyUp = (ev: KeyboardEvent) => {
     const code = holdCode();
@@ -259,6 +272,14 @@ export async function install(opts: InstallOptions): Promise<() => void> {
       }
       return;
     }
+    // Visual mode has keys of its own (`visual.ts`); the page's table waits until it ends.
+    if (visualKind()) {
+      const took = visualKey(escape ? ESCAPE : strokeOf(ev), ev, () => timeoutlen,
+        (action, event) => { runScroll(action, event); });
+      renderMode();
+      if (took) ev.preventDefault();
+      return;
+    }
     const result = resolver.feed(escape ? ESCAPE : strokeOf(ev));
     window.clearTimeout(timer);
     timer = undefined;
@@ -339,6 +360,14 @@ export async function install(opts: InstallOptions): Promise<() => void> {
       case "sheet.open": endHold(); openSheet(rows, opts.labels); handled = true; break;
       case "find.start": endHold(); openFind(); handled = true; break;
       case "find.next": case "find.prev": findNext(action === "find.next" ? 1 : -1); handled = true; break;
+      case "visual.char": case "visual.line": {
+        endHold();
+        clearPrefix();
+        startVisual(action === "visual.char" ? "char" : "line");
+        renderMode();
+        handled = true;
+        break;
+      }
       case "mode.escape": {
         endHold();
         clearFind();
@@ -399,6 +428,7 @@ export async function install(opts: InstallOptions): Promise<() => void> {
   };
   configureFind({ root: opts.find?.root, exclude: opts.find?.exclude, messages: opts.labels?.messages, render: renderMode,
     jump: tellJump });
+  configureVisual({ ...opts.visual, root: opts.find?.root, messages: opts.labels?.messages });
   setBottom(opts.bottom ?? null);
   window.addEventListener("keydown", onKeyFirst, true);
   window.addEventListener("keydown", onKey);
@@ -422,6 +452,7 @@ export async function install(opts: InstallOptions): Promise<() => void> {
     window.removeEventListener("keydown", onKey);
     window.removeEventListener("keydown", onSpaceFirst, true);
     window.removeEventListener("blur", onBlur);
+    window.removeEventListener("pointerdown", onPointerDown, true);
     window.removeEventListener("keyup", onKeyUp, true);
     document.removeEventListener("visibilitychange", onVisibility);
     window.removeEventListener("scroll", onViewportChange, true);

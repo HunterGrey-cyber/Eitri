@@ -30,7 +30,7 @@ describe("the document profile against the hostile corpus", () => {
         expect(attr.startsWith("on"), `${el.tagName} ${attr}`).toBe(false);
         expect(["style", "srcset", "ping", "download", "formaction", "xlink:href", "background", "target",
           "popovertarget", "tabindex", "hidden", "data-line", "data-line-end", "data-eitri-n", "data-eitri-mermaid",
-          "data-eitri-math", "class"].includes(attr), `${el.tagName} ${attr}`).toBe(false);
+          "data-eitri-math", "data-eitri-fence", "class"].includes(attr), `${el.tagName} ${attr}`).toBe(false);
       }
     }
     for (const a of host.querySelectorAll("a[href]")) {

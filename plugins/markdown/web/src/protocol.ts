@@ -227,9 +227,11 @@ export function reveal(
   return verb(b, "editor.reveal", a, isApplied);
 }
 
+/** `select` (an older host refuses it): nvim selects from (`line`, `col`) to its place in its own visual mode, its
+ *  cursor ending there. */
 export function jump(
   b: Bridge,
-  a: { buf: number; line: number; col: number; focus: boolean },
+  a: { buf: number; line: number; col: number; focus: boolean; select?: { line: number; col: number; mode: "char" | "line" } },
 ): Promise<{ applied: boolean }> {
   return verb(b, "editor.jump", a, isApplied);
 }

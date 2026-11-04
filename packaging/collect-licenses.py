@@ -1356,12 +1356,12 @@ def vite_runtime(shipped, counts, repo=REPO):
 
 
 # A line esbuild writes above each source module it bundles, so its presence in `shell` shows the kit's
-# hint code (the part adapted from Vimium) is in the binary.
+# hint code (adapted from Vimium, as its visual mode is) is in the binary.
 KIT_MARKER = b"// src/hints.ts"
 
 
 def kit_entries(shipped, counts):
-    """The plugin keyboard kit adapts Vimium's hint-label scheme. It is not an npm dependency, so no tree
+    """The plugin keyboard kit adapts Vimium's hint-label scheme and visual mode. It is not an npm dependency, so no tree
     lists it and the licence text has to be added by hand: Vimium's MIT notice, from
     license-texts/vimium-LICENSE, printed whenever the shipped `shell` carries the kit bundle."""
     with open(shipped["shell"], "rb") as f:
@@ -1371,7 +1371,7 @@ def kit_entries(shipped, counts):
     if "MIT License" not in text or "Phil Crosby" not in text:
         raise Fail("license-texts/vimium-LICENSE is no longer Vimium's MIT notice; re-check it")
     counts["MIT"] = counts.get("MIT", 0) + 1
-    return [{"title": "Vimium (hint-label scheme adapted into the plugin keyboard kit)", "name": "vimium",
+    return [{"title": "Vimium (hint-label scheme and visual mode adapted into the plugin keyboard kit)", "name": "vimium",
              "version": "", "license": "MIT", "status": None, "copyleft": False,
              "note": "adapted source, not an npm dependency, so not in the npm tree above; it is in the built kit bundle",
              "files": [("vimium-LICENSE", text)]}]

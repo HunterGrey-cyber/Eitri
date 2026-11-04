@@ -1,5 +1,5 @@
 [English](markdown-preview.md) | 简体中文
-<!-- translated-from: markdown-preview.md sha256=3cdb26c7c94b046d01eb5f0be823f60235a478c33fb630f10a2b807d2138f86c -->
+<!-- translated-from: markdown-preview.md sha256=f855bd8556a5dd07929923dcfd9630150a76d253aafb7b7feb50e865baaf5842 -->
 
 # Markdown 预览
 
@@ -89,6 +89,7 @@ eitri.plugin.load("markdown", { auto = true })
 | `f` | 在链接、脚注链接和折叠开关上显示标签；输入标签就跟随它 |
 | `yy` | 复制当前块的 Markdown 源码（代码块只复制代码，不含围栏那两行） |
 | `Enter` | 在这里编辑：把 Neovim 的光标移到这个位置，并把按键交给 Neovim |
+| `v` / `V` | 从光标处开始选中文字，按字符 / 按整行（见[选中文字](#选中文字)） |
 | `H` 或 `Ctrl+o` / `L` 或 `Ctrl+i` | 在文档内部的跳转之间后退 / 前进：`gg`、`G`、`]]`、`[[`、搜索和 `n`/`N`、标题链接、脚注 |
 | `?` | 列出这些按键 |
 | `Esc` | 退出当前模式；同时清除搜索高亮 |
@@ -102,13 +103,35 @@ eitri.plugin.load("markdown", { auto = true })
 - 按 `yy` 之后，状态行显示 `yanked 3 lines`。
 - 指向项目里另一个文件的链接会在 Neovim 里打开它（按键留在预览里，如果那个文件是 Markdown，预览接着显示它）；`src/main.rs#L10` 会打开到第 10 行。网页链接在你的浏览器里打开。指向项目以外的链接，或者指向不存在的文件的链接，会显示 `outside the project` 或 `no such file`，此外什么也不做。
 
+### 选中文字
+
+`v` 从光标处开始选中，和 Vim 一样；`V` 按整行选中。状态行显示 `VISUAL` 或 `VISUAL LINE`。然后：
+
+| 按键 | 作用 |
+|---|---|
+| `h` / `l`、`w` / `b` / `e`、`0` / `$` | 把选区光标那一端移动一个字符、一个词，或者移到行首、行尾 |
+| `j` / `k` | 向下 / 向上一个显示行 |
+| `gg` / `G` | 到第一段 / 最后一段文字 |
+| `n` / `N` | 到上一次搜索的下一个 / 上一个匹配 |
+| `o` | 到选区的另一端 |
+| `y` | 按你看到的样子复制选中的文字，然后结束选中 |
+| `Y` | 复制选区覆盖的那些行的 Markdown 源码 |
+| `Enter` | 在 Neovim 里编辑选区：按键交给 Neovim，同样的文字在它自己的 visual 模式里选中 |
+| `v` / `V` | 在按字符和按整行之间切换；再按一次同一个键就结束选中 |
+| `Esc` | 结束选中 |
+
+- 预览的光标跟着你移动的那一端走，所以选区始终在边距以内，Neovim 也像按 `j` 时那样跟着走。
+- 预览从不修改你的文字。要修改选中的内容，按 `Enter`，在 Neovim 里改（`c`、`d`、`gq` 等等）。
+- 选区在一行源码之内，而且它的文字在那一行里只出现一次时，`Enter` 在 Neovim 里选中同样的字符；否则 Neovim 选中它覆盖的整行源码：渲染后的 Markdown 对不回源码的列（`**bold**` 显示为 **bold**，链接只显示文字）。如果 Neovim 正停在提示或命令行上，就什么也不选中，状态行会说明。
+- 点击鼠标会结束选中，把按键交给别的窗格也会。选中时用的按键不能在 `init.lua` 里修改；`v` 和 `V` 本身可以（`visual.char`、`visual.line`）。
+
 和任何插件一样，在 `init.lua` 里用 `plugin:markdown` 这张表修改这些按键：
 
 ```lua
 eitri.keymap.set("plugin:markdown", "e", "edit.here")
 ```
 
-焦点在预览上时，`<prefix> ?` 会在 Eitri 自己的按键列表里先列出它的按键。动作名是 `cursor.down`、`cursor.up`、`cursor.half_down`、`cursor.half_up`、`cursor.page_down`、`cursor.page_up`、`cursor.first`、`cursor.last`、`scroll.down`、`scroll.up`、`heading.next`、`heading.prev`、`scroll.left`、`scroll.right`、`find.start`、`find.next`、`find.prev`、`hint.start`、`block.yank`、`edit.here`、`history.back`、`history.forward`、`sheet.open` 和 `mode.escape`。如果你在候选版本里改过这些按键，把对 `scroll.half_down`、`scroll.half_up`、`scroll.page_down`、`scroll.page_up`、`scroll.top` 或 `scroll.bottom` 的修改改成对应的 `cursor.` 动作（`cursor.half_down`……`cursor.first`、`cursor.last`）：预览里已经没有这几个 `scroll.` 动作了。
+焦点在预览上时，`<prefix> ?` 会在 Eitri 自己的按键列表里先列出它的按键。动作名是 `cursor.down`、`cursor.up`、`cursor.half_down`、`cursor.half_up`、`cursor.page_down`、`cursor.page_up`、`cursor.first`、`cursor.last`、`scroll.down`、`scroll.up`、`heading.next`、`heading.prev`、`scroll.left`、`scroll.right`、`find.start`、`find.next`、`find.prev`、`hint.start`、`block.yank`、`edit.here`、`history.back`、`history.forward`、`sheet.open`、`mode.escape`、`visual.char` 和 `visual.line`。如果你在候选版本里改过这些按键，把对 `scroll.half_down`、`scroll.half_up`、`scroll.page_down`、`scroll.page_up`、`scroll.top` 或 `scroll.bottom` 的修改改成对应的 `cursor.` 动作（`cursor.half_down`……`cursor.first`、`cursor.last`）：预览里已经没有这几个 `scroll.` 动作了。
 
 一步滚动多远、滚动是否带动画、`g` 这样的键等多久、什么时候列出接下来的键、提示标签用哪些字母、搜索怎样处理大小写，这些是所有插件页面共用的设置：见[插件页面里的按键](configuration.zh-CN.md#keys-in-a-plugin-page)。
 

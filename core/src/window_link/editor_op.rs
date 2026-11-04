@@ -105,6 +105,8 @@ pub enum EditorOp {
         buf: u64,
         line: u32,
         col: u32,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        select: Option<crate::plugin::protocol::JumpSelect>,
     },
     /// An already resolved Markdown link, checked again against window 1's project before opening.
     PluginOpenLink {

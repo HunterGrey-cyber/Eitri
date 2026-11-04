@@ -15,7 +15,7 @@ it("emits a keys declaration that can be copied without sibling modules", () => 
   const files = new Map([
     [`${root}/standalone-keys.d.ts`, declaration],
     [`${root}/consumer.ts`, `
-      import type { Row, InstallOptions, KeyStroke, KitLabels, GenericAction } from "./standalone-keys";
+      import type { Row, InstallOptions, KeyStroke, KitLabels, GenericAction, VisualKind } from "./standalone-keys";
       const row: Row = {action: "test.action", keys: ["x"], context: "page", desc: "test"};
       const labels: KitLabels = {modes: {normal: "N"}, page: "page", generic: {"scroll.down": "down"},
         sheetTitle: "Keys", sheetFooter: "Esc closes", sheetClose: "Close"};
@@ -28,8 +28,15 @@ it("emits a keys declaration that can be copied without sibling modules", () => 
       window.eitriKeys.findSeed("query");
       const stroke: KeyStroke = {key: "x", ctrl: false, shift: false};
       const action: GenericAction = "hint.start";
-      const version: 4 = window.eitriKeys.version;
+      const version: 5 = window.eitriKeys.version;
       const v4: InstallOptions = { rows: [row], run: () => true, bottom: () => null, onJump: (when) => void when };
+      const v5: InstallOptions = { rows: [row], run: () => true, visual: { start: () => null,
+        follow: (rect) => void rect.top, keys: { "<CR>": (kind: VisualKind) => kind === "line" } } };
+      window.eitriKeys.install(v5);
+      const visual: VisualKind | null = window.eitriKeys.visualMode();
+      window.eitriKeys.endVisual();
+      const generic: GenericAction = "visual.line";
+      void [visual, generic];
       window.eitriKeys.install(opts);
       window.eitriKeys.install(v3);
       window.eitriKeys.install(v4);

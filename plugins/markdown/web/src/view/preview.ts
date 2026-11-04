@@ -46,6 +46,45 @@ export interface Band { top: number; bottom: number; row: Row }
 
 function clamp(n: number, lo: number, hi: number): number { return Math.min(Math.max(n, lo), hi); }
 
+/** What has no text of the source's: KaTeX's MathML copy, and what is hidden. */
+const NOT_TEXT = ".katex-mathml, [hidden], [aria-hidden='true'], script, style, template";
+
+/** The first character, white space passed over, at or below band `b` (document coordinates) in `scope`'s text, as
+ *  a collapsed range; null when there is none. Characters keep their order down the page, so the first one of a
+ *  text node that reaches the band is found by halving. */
+function textFrom(scope: Element, b: { top: number; bottom: number }): Range | null {
+  const doc = scope.ownerDocument;
+  const range = doc.createRange();
+  const y = window.scrollY;
+  const mid = (node: Text, i: number) => {
+    range.setStart(node, i);
+    range.setEnd(node, i + 1);
+    const r = range.getBoundingClientRect();
+    return (r.top + r.bottom) / 2 + y;
+  };
+  const walker = doc.createTreeWalker(scope, NodeFilter.SHOW_TEXT);
+  for (let n = walker.nextNode(); n; n = walker.nextNode()) {
+    const text = n as Text;
+    if (!/\S/.test(text.data) || text.parentElement?.closest(NOT_TEXT)) continue;
+    range.selectNodeContents(text);
+    const rects = [...(range.getClientRects?.() ?? [])];
+    if (!rects.some((r) => r.bottom + y > b.top + 0.5)) continue;
+    let lo = 0;
+    let hi = text.data.length - 1;
+    while (lo < hi) {
+      const m = (lo + hi) >> 1;
+      if (mid(text, m) >= b.top - 0.5) hi = m;
+      else lo = m + 1;
+    }
+    while (lo < text.data.length && /\s/.test(text.data[lo])) lo++;
+    if (lo >= text.data.length) continue;
+    const at = doc.createRange();
+    at.setStart(text, lo);
+    return at;
+  }
+  return null;
+}
+
 /* The box an image that was not shown leaves, in the shape the sanitiser gives one, so a later render's box for the
    same image compares equal and is kept. Built with DOM calls: the alt text is the document's. */
 function outsideBox(img: Element): Element {
@@ -131,12 +170,17 @@ export class Preview {
    *  (footnotes below the index's last block all read as its end), and this tells them apart. */
   private cursorDy = 0;
   private bandMemo: { at: number; dy: number; index: Box[]; band: Band | null } | null = null;
+  /** The leaf blocks the line index (as last built) leaves out: drawn below a later line's block. */
+  private leftOut: Box[] = [];
   /** The rows of each index block, for the line index (the layout) they were read on. */
   private rowCache: RowCache | null = null;
   /** The top of the document's first row, for the line index it was read on. */
   private firstRowMemo: { index: Box[]; top: number } | null = null;
-  /** Where a scroll asked of the engine (no kit glide) is heading, until it gets there or a second has passed. */
+  /** Where a scroll asked of the engine (no kit glide) is heading, until it gets there, the reader scrolls, or a
+   *  second has passed. */
   private engineTo: { y: number; until: number } | null = null;
+  /** Ends `engineTo` when its second is up, so a scroll that stopped short is judged where it stopped. */
+  private engineTimer: number | undefined = undefined;
   private lastScrollY = 0;
   /** The bottom of the document's last row, for the line index (the layout) it was read on. */
   private lastRowMemo: { index: Box[]; bottom: number | null } | null = null;
@@ -197,6 +241,7 @@ export class Preview {
       root.removeEventListener("error", failed, true);
       observer?.disconnect();
       this.revealer.cancel();
+      this.endEngineScroll();
       this.cursorBar.remove();
       this.cursorLine.remove();
     });
@@ -304,7 +349,20 @@ export class Preview {
     this.schedule();
   }
 
-  index(): Box[] { return (this.cached ??= buildIndex(measure(this.root, window.scrollY))); }
+  index(): Box[] {
+    if (this.cached) return this.cached;
+    const measured = measure(this.root, window.scrollY);
+    const index = buildIndex(measured);
+    const kept = new Set(index.map((b) => b.el));
+    // The leaf blocks the index leaves out because they are drawn below a later line's block (footnotes): a row of
+    // theirs reads as their own line, not as the gap's.
+    this.leftOut = measured
+      .filter((m) => m.visible && m.height > 0 && !m.hasTaggedVisibleDescendant && !kept.has(m.el))
+      .map((m) => ({ line: m.line, end: m.end !== null && m.end > m.line ? m.end : m.line + 1, top: m.top,
+        height: m.height, el: m.el }));
+    this.cached = index;
+    return index;
+  }
   /**
    * The source line at the top (zero-based, fractional), what a page that replaces this one is given to show: the
    * line last placed there, while the page still shows it, else the line read at the scroll offset. Read back from
@@ -377,7 +435,11 @@ export class Preview {
   }
   /** A scroll the reader asked for. It is not guarded, so it is the reader's like any other and reveals while the
    *  preview leads. */
-  scrollByUser(dy: number, smooth: boolean): void { window.scrollBy({ top: dy, behavior: smooth ? "smooth" : INSTANT }); }
+  scrollByUser(dy: number, smooth: boolean): void {
+    // The reader's scroll replaces one the page asked of the engine: the window no longer heads where that one was.
+    this.endEngineScroll();
+    window.scrollBy({ top: dy, behavior: smooth ? "smooth" : INSTANT });
+  }
   /** Where the window is heading: the kit's running glide's destination, else where it is. */
   destination(): number {
     const heading = kit()?.destination?.();
@@ -403,9 +465,24 @@ export class Preview {
     const k = kit();
     if (typeof k?.scrollTo === "function") k.scrollTo(y);
     else {
-      this.engineTo = { y, until: Date.now() + ENGINE_SCROLL_MS };
+      const heading = { y, until: Date.now() + ENGINE_SCROLL_MS };
+      this.endEngineScroll();
+      this.engineTo = heading;
+      // A scroll that has not got there in its second (the engine stopped it) is over: the cursor is judged where the
+      // window is, and a margin there may push it.
+      this.engineTimer = window.setTimeout(() => {
+        this.engineTimer = undefined;
+        this.engineTo = null;
+        this.pushCursor();
+      }, ENGINE_SCROLL_MS);
       window.scrollTo({ top: y, behavior: "smooth" });
     }
+  }
+  /** Forgets where a scroll asked of the engine was heading. */
+  private endEngineScroll(): void {
+    window.clearTimeout(this.engineTimer);
+    this.engineTimer = undefined;
+    this.engineTo = null;
   }
   /** Enter or a double-click is about to move nvim's cursor and give nvim the keys. A running glide ends where it was
    *  heading, so the block acted on is the one the reader is heading for; a place the preview has not yet revealed
@@ -475,6 +552,15 @@ export class Preview {
     const i = lastTopAtOrBefore(index, y);
     const lo = i >= 0 ? index[i].end : 0;
     const hi = i + 1 < index.length ? index[i + 1].line - 1 : lines.length - 1;
+    // A block drawn out of source order (a footnote, drawn after the last block whatever line defines it) is read as
+    // its own lines: the gap's lines there may be text that draws nothing (a link's reference definition).
+    const out = this.leftOut.find((b) => y >= b.top && y < b.top + b.height && (b.line < lo || b.line > hi));
+    if (out) {
+      const share = (y - out.top) / out.height;
+      let last = out.end - 1;
+      while (last > out.line && blank(last)) last--;
+      return Math.min(out.line + Math.floor(share * (out.end - out.line)), last);
+    }
     if (lo <= hi) {
       const read = Math.min(Math.max(Math.floor(yToLine(index, y)), lo), hi);
       for (let l = read; l <= hi; l++) if (!blank(l)) return l;
@@ -536,6 +622,24 @@ export class Preview {
   /** The cursor to the row holding source line `L` (a history entry's place), placed as a jump. */
   jumpCursorToLine(L: number): boolean {
     return this.cursorBand() !== null && this.jumpBand(this.bandAt(lineToY(this.index(), L, Number.POSITIVE_INFINITY)));
+  }
+
+  /** Where visual mode starts (`v`, `V`): the first character of the cursor's row, or the first text after it when
+   *  the row has none (an image); null without a cursor. */
+  visualStart(): Range | null {
+    const b = this.cursorBand();
+    if (!b) return null;
+    const box = boxAt(this.index(), (b.top + b.bottom) / 2);
+    const inBox = box !== null && b.top < box.top + box.height && b.bottom > box.top;
+    return (inBox ? textFrom(box.el, b) : null) ?? textFrom(this.root, b);
+  }
+  /** Visual mode's cursor moved to the character at `rect` (window coordinates): the page's cursor goes to its row,
+   *  and the page scrolls as for a jump, only when that row is outside the margins. */
+  followSelection(rect: DOMRect): void {
+    const b = this.cursorBand();
+    if (!b) return;
+    const next = this.bandAt((rect.top + rect.bottom) / 2 + window.scrollY);
+    if (next && Math.abs(next.top - b.top) >= 0.5) this.jumpBand(next);
   }
 
   /** A click: the cursor to the clicked row, without scrolling. It may come before the keys do; the cursor is then
@@ -1026,6 +1130,11 @@ export class Preview {
   }
 
   private onPointer(): void {
+    // A wheel tick or the scroll bar takes over from a scroll the page asked of the engine, wherever it had got to.
+    if (this.engineTo) {
+      this.endEngineScroll();
+      this.pushCursor();
+    }
     if (this.settings.sync !== "both") return;
     const was = this.lead();
     this.pointer = true;

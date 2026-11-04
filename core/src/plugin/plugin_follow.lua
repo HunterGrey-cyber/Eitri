@@ -788,6 +788,103 @@ local function byte_col(s, chars)
   return math.min(i - 1, #s)
 end
 
+-- The byte offset (from 0) of character `col` (from 1) of line `line`, and the line; `col` 0 or below is the line's
+-- first non-blank character.
+local function byte_at(buf, line, col)
+  local content = vim.api.nvim_buf_get_lines(buf, line - 1, line, false)[1] or ''
+  col = math.floor(tonumber(col) or 0)
+  if col <= 0 then
+    return (content:find('%S') or 1) - 1, content
+  end
+  return byte_col(content, col - 1), content
+end
+
+-- The first byte of the line's last character (0 on an empty line): where a mark past the line's end is held.
+local function last_char(content)
+  local i, last = 1, 0
+  while i <= #content do
+    last = i - 1
+    i = i + char_len(content, i)
+  end
+  return last
+end
+
+-- How a selection is made from nvim's mode: `now` from Normal, Visual and Select mode, which run in Normal mode's
+-- loop; `keys` from Insert and Replace mode (and Normal mode entered from them with CTRL-O), whose own loop a
+-- command run from here cannot end; nil from a command line, a prompt, an operator waiting for its motion or a
+-- terminal, which are the user's and are left alone.
+local function selecting(mode)
+  if mode.blocking then
+    return nil
+  end
+  local m = mode.mode
+  local first = m:sub(1, 1)
+  if m == 'n' or first == 'v' or first == 'V' or first == '\22' or first == 's' or first == 'S' or first == '\19' then
+    return 'now'
+  end
+  if first == 'i' or first == 'R' or m:sub(1, 2) == 'ni' then
+    return 'keys'
+  end
+  return nil
+end
+
+-- Selects from (`line`, `byte`) to the jump's `select_*` place in nvim's own visual mode, the cursor ending at the
+-- second place, by setting the '< and '> marks and running gv: the cursor never visits the first place, so the
+-- window scrolls only as far as the second needs. Lines are clamped to the buffer and columns to their line.
+local function select_to(w, buf, line, byte, content, o, how)
+  local to = clamp_line(buf, o.select_line)
+  local to_byte, to_content = byte_at(buf, to, o.select_col)
+  local linewise = o.select_mode == 'line'
+  byte = math.min(byte, last_char(content))
+  to_byte = math.min(to_byte, last_char(to_content))
+  if not linewise and vim.o.selection == 'exclusive' then
+    -- An exclusive selection leaves out the character at its later end: that end goes one character on.
+    if to > line or (to == line and to_byte >= byte) then
+      if to_byte < #to_content then
+        to_byte = to_byte + char_len(to_content, to_byte + 1)
+      end
+    elseif byte < #content then
+      byte = byte + char_len(content, byte + 1)
+    end
+  end
+  local want = linewise and 'V' or 'v'
+  local function marks()
+    -- gv on a closed fold selects the whole fold: the folds holding either end are opened, as moving the cursor
+    -- into them would show them, so the selection is the one asked for.
+    vim.api.nvim_win_call(w, function()
+      for _, l in ipairs({ line, to }) do
+        if vim.fn.foldclosed(l) ~= -1 then
+          vim.api.nvim_cmd({ cmd = 'foldopen', range = { l, l }, bang = true }, {})
+        end
+      end
+    end)
+    vim.api.nvim_buf_set_mark(buf, '<', line, byte, {})
+    vim.api.nvim_buf_set_mark(buf, '>', to, to_byte, {})
+  end
+  if how == 'keys' then
+    -- nvim leaves Insert mode and selects as its next keys; gv takes the buffer's last visual mode, and setting the
+    -- marks of a buffer that never had one makes it charwise.
+    marks()
+    local last = vim.fn.visualmode()
+    if last == '' then
+      last = 'v'
+    end
+    local keys = '<C-\\><C-n>gv' .. (last ~= want and want or '')
+    vim.api.nvim_feedkeys(vim.api.nvim_replace_termcodes(keys, true, false, true), 'n', false)
+    return { applied = true }
+  end
+  if vim.api.nvim_get_mode().mode ~= 'n' then
+    vim.api.nvim_feedkeys(vim.api.nvim_replace_termcodes('<C-\\><C-n>', true, false, true), 'nx', false)
+  end
+  vim.api.nvim_set_current_win(w)
+  marks()
+  vim.api.nvim_cmd({ cmd = 'normal', args = { 'gv' }, bang = true }, {})
+  if vim.api.nvim_get_mode().mode ~= want then
+    vim.api.nvim_cmd({ cmd = 'normal', args = { want }, bang = true }, {})
+  end
+  return { applied = vim.api.nvim_get_mode().mode == want }
+end
+
 local function jump(o)
   local st = state_of(o.owner)
   local buf = o.buf
@@ -795,15 +892,15 @@ local function jump(o)
   if w == nil then
     return { applied = false }
   end
+  local how = o.select_line ~= nil and selecting(vim.api.nvim_get_mode()) or nil
+  if o.select_line ~= nil and how == nil then
+    return { applied = false }
+  end
   vim.api.nvim_set_current_win(w)
   local line = clamp_line(buf, o.line)
-  local content = vim.api.nvim_buf_get_lines(buf, line - 1, line, false)[1] or ''
-  local col = math.floor(tonumber(o.col) or 0)
-  local byte
-  if col <= 0 then
-    byte = (content:find('%S') or 1) - 1
-  else
-    byte = byte_col(content, col - 1)
+  local byte, content = byte_at(buf, line, o.col)
+  if how ~= nil then
+    return select_to(w, buf, line, byte, content, o, how)
   end
   vim.api.nvim_win_set_cursor(w, { line, byte })
   return { applied = true }

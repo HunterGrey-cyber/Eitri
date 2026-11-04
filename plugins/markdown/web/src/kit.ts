@@ -1,14 +1,16 @@
 // The shapes of the keyboard kit's public interface, as the kit publishes them on `window.eitriKeys`.
 export type Row = { action: string; keys: string[]; context: string; desc: string };
-export type Mode = "normal" | "hint" | "insert";
+export type Mode = "normal" | "hint" | "insert" | "visual" | "visual_line";
+export type VisualKind = "char" | "line";
 export type HintTarget = { el: Element; rank?: number };
 export type GenericAction =
   | "scroll.down" | "scroll.up" | "scroll.half_down" | "scroll.half_up" | "scroll.page_down" | "scroll.page_up"
   | "scroll.top"
   | "scroll.bottom" | "history.back" | "history.forward" | "link.prev" | "link.next" | "find.start" | "find.next"
-  | "find.prev" | "hint.start" | "sheet.open" | "mode.escape";
-export type KitMessage = "find.notFound" | "find.none" | "find.wrapBottom" | "find.wrapTop" | "find.count";
-export type KitGroup = "scroll" | "history" | "link" | "find" | "hint" | "sheet" | "mode";
+  | "find.prev" | "hint.start" | "sheet.open" | "mode.escape" | "visual.char" | "visual.line";
+export type KitMessage = "find.notFound" | "find.none" | "find.wrapBottom" | "find.wrapTop" | "find.count"
+  | "visual.yanked" | "visual.yankedOne" | "visual.copyFailed" | "visual.noText";
+export type KitGroup = "scroll" | "history" | "link" | "find" | "hint" | "sheet" | "mode" | "visual";
 export type KitLabels = {
   groups?: Partial<Record<KitGroup, string>>;
   modes?: Partial<Record<Mode, string>>;
@@ -30,6 +32,12 @@ export type InstallOptions = {
   bottom?: () => number | null;
   /** Version 4 and later: called around the kit's own jumps (`gg`, `G`, a find move). */
   onJump?: (when: "before" | "after") => void;
+  /** Version 5 and later: visual mode's start at the page's cursor, its cursor followed, and the page's own keys in it. */
+  visual?: {
+    start?: () => Range | null;
+    follow?: (focus: DOMRect) => void;
+    keys?: Record<string, (kind: VisualKind) => boolean>;
+  };
 };
 
 export interface EitriKeys {
@@ -45,6 +53,9 @@ export interface EitriKeys {
   scrollTo?(top: number): void;
   destination?(): number;
   settle?(): void;
+  /** Version 5 and later: visual mode's kind while it runs, and ending it. */
+  visualMode?(): VisualKind | null;
+  endVisual?(): void;
 }
 /** The kit the host serves at /.eitri/keys.js, or null when the page runs without it (a test, a browser). */
 export function kit(): EitriKeys | null {

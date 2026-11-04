@@ -25,6 +25,8 @@ it("names the generic rows in English by default", () => {
     ["hint.start", "f", "page", "hint mode"],
     ["sheet.open", "?", "page", "this sheet"],
     ["mode.escape", "<Esc>", "page", "leave a mode"],
+    ["visual.char", "v", "page", "visual mode"],
+    ["visual.line", "V", "page", "visual line mode"],
   ]);
 });
 

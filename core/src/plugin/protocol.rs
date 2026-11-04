@@ -263,7 +263,8 @@ pub struct EditorReveal {
     pub row: Option<u32>,
 }
 
-/// `editor.jump`: move the followed window's cursor, and with `focus` the keys, to a source line.
+/// `editor.jump`: move the followed window's cursor, and with `focus` the keys, to a source line. With `select`, nvim
+/// selects in its own visual mode from (`line`, `col`) to `select`'s place, where its cursor ends.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct EditorJump {
@@ -271,6 +272,36 @@ pub struct EditorJump {
     pub line: u32,
     pub col: u32,
     pub focus: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub select: Option<JumpSelect>,
+}
+
+/// The other end of a jump's selection: a source line (from 1), a column in Unicode scalar values (from 1; 0 is the
+/// line's first non-blank character), and nvim's visual mode for it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct JumpSelect {
+    pub line: u32,
+    pub col: u32,
+    pub mode: SelectMode,
+}
+
+/// nvim's charwise (`v`) or linewise (`V`) visual mode.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum SelectMode {
+    Char,
+    Line,
+}
+
+impl SelectMode {
+    /// The name the follow snippet takes.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            SelectMode::Char => "char",
+            SelectMode::Line => "line",
+        }
+    }
 }
 
 /// `editor.open_link`: a link of the followed document, as written, to open in the editor.
@@ -307,7 +338,11 @@ impl EditorReveal {
 
 impl EditorJump {
     pub fn check(&self) -> Result<(), String> {
-        line_ok(self.line)
+        line_ok(self.line)?;
+        if self.select.is_some_and(|s| s.line < 1) {
+            return Err("select.line must be at least 1".to_string());
+        }
+        Ok(())
     }
 }
 
@@ -1164,7 +1199,22 @@ mod tests {
                 buf: 3,
                 line: 42,
                 col: 0,
-                focus: true
+                focus: true,
+                select: None,
+            })
+        );
+        assert_eq!(
+            verb("req-editor-jump-select.json"),
+            Verb::EditorJump(EditorJump {
+                buf: 3,
+                line: 42,
+                col: 7,
+                focus: true,
+                select: Some(JumpSelect {
+                    line: 40,
+                    col: 2,
+                    mode: SelectMode::Char,
+                }),
             })
         );
         assert_eq!(
@@ -1223,9 +1273,20 @@ mod tests {
             line,
             col: 0,
             focus: true,
+            select: None,
         };
         assert_eq!(jump(0).check(), Err("line must be at least 1".to_string()));
         assert_eq!(jump(7).check(), Ok(()));
+        let select = |line| EditorJump {
+            select: Some(JumpSelect {
+                line,
+                col: 0,
+                mode: SelectMode::Line,
+            }),
+            ..jump(7)
+        };
+        assert_eq!(select(0).check(), Err("select.line must be at least 1".to_string()));
+        assert_eq!(select(1).check(), Ok(()));
         let link = |target: String| EditorOpenLink { buf: 1, target };
         assert_eq!(link("../x.md#L3".into()).check(), Ok(()));
         assert_eq!(link("a".repeat(MAX_LINK_TARGET)).check(), Ok(()));

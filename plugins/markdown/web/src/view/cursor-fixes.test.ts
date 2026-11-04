@@ -251,6 +251,18 @@ describe("rows that read as one source line (9)", () => {
   });
 });
 
+describe("a footnote's row", () => {
+  it("reads as its own line, not as the text that draws nothing after the last block", () => {
+    // Line 2 defines the footnote, drawn below "end" (line 4); line 6 is a reference definition, which draws nothing.
+    show("text[^1]\n\n[^1]: note one\n\nend\n\n[x]: https://example.com");
+    p.onFocus(true);
+    for (let i = 0; i < 10; i++) p.moveRows(1);
+    vi.advanceTimersByTime(100);
+    expect(reveals().at(-1)).toMatchObject({ cursor: 3 });
+    expect(p.sourceLineAt((p.cursorBand()!.top + p.cursorBand()!.bottom) / 2)).toBe(2);
+  });
+});
+
 describe("a scroll asked of the engine (10)", () => {
   it("does not push back the cursor that asked for it while it is on its way", () => {
     show(paragraphs(60));
@@ -269,6 +281,47 @@ describe("a scroll asked of the engine (10)", () => {
     expect(top()).toBe(want);
     layout.setScroll(12);
     expect(top()).toBe(want);
+  });
+});
+
+describe("a scroll asked of the engine that stops short", () => {
+  /* The cursor walks to the bottom margin and asks the engine for a smooth scroll to 12, which has got to 5: there
+     the cursor's row (660..680) is past the bottom margin (673). */
+  function stoppedShort(): { asked: number[]; want: number } {
+    show(paragraphs(60));
+    p.onFocus(true);
+    p.moveRows(1);
+    const asked: number[] = [];
+    window.scrollTo = ((opts: ScrollToOptions) => {
+      if (opts.behavior === "smooth") asked.push(opts.top ?? 0);
+      else layout.setScroll(opts.top ?? 0);
+    }) as typeof window.scrollTo;
+    for (let i = 0; i < 21; i++) p.moveRows(1);
+    const want = top();
+    layout.setScroll(5);
+    expect([asked.at(-1), top()]).toEqual([12, want]);
+    return { asked, want };
+  }
+
+  it("is over at a wheel tick: the cursor is judged where the window is", () => {
+    const { want } = stoppedShort();
+    window.dispatchEvent(new Event("wheel"));
+    expect(top()).toBe(want - 30);
+  });
+
+  it("is over at the reader's <C-e>", () => {
+    const { want } = stoppedShort();
+    p.scrollByUser(3, false);
+    expect(window.scrollY).toBe(8);
+    expect(top()).toBe(want - 30);
+  });
+
+  it("is over when its second is up, and a margin then pushes the cursor", () => {
+    const { want } = stoppedShort();
+    vi.advanceTimersByTime(999);
+    expect(top()).toBe(want);
+    vi.advanceTimersByTime(1);
+    expect(top()).toBe(want - 30);
   });
 });
 
