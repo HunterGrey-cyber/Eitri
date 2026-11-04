@@ -230,14 +230,21 @@ EitriScratch = M
 return function()
   if torn then return end
   torn = true
+  -- A buffer with unwritten changes (a draft the person is still writing) stays open, with its window: its text
+  -- exists nowhere else.
+  local function unsaved(buf)
+    return vim.api.nvim_buf_is_valid(buf) and vim.bo[buf].modified
+  end
   local current = vim.api.nvim_get_current_win()
   for win, buf in pairs(windows) do
-    if vim.api.nvim_win_is_valid(win) and vim.api.nvim_win_get_buf(win) == buf then
+    if vim.api.nvim_win_is_valid(win) and vim.api.nvim_win_get_buf(win) == buf and not unsaved(buf) then
       pcall(vim.api.nvim_win_close, win, true)
     end
   end
   for buf in pairs(buffers) do
-    if vim.api.nvim_buf_is_valid(buf) then pcall(vim.api.nvim_buf_delete, buf, {force=true}) end
+    if vim.api.nvim_buf_is_valid(buf) and not unsaved(buf) then
+      pcall(vim.api.nvim_buf_delete, buf, {force=true})
+    end
   end
   if vim.api.nvim_win_is_valid(current) then vim.api.nvim_set_current_win(current) end
   if syntax_set ~= nil and vim.go.syntax == syntax_set then vim.go.syntax = syntax_before end

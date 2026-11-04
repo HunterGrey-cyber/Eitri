@@ -23,13 +23,14 @@ pub static PLUGIN_BUFFERS_LUA: &str = crate::editor_rpc::takeover_chunk!(
 local _, opts = ...
 local registry = rawget(_G, '__eitri_plugin_preloads')
 if registry then __takeover_adopt('buffers:' .. opts.owner, function()
-  -- The current diff tab cannot close itself through close_diffs. Select a surviving origin first.
+  -- close_diffs closes every diff tab page but the current one. Select a surviving origin first; when none is
+  -- left, the release undoes the diff in the tab page that stays.
   local current = vim.api.nvim_get_current_tabpage()
   for _, tab in ipairs(vim.api.nvim_list_tabpages()) do
     local ok, owner = pcall(vim.api.nvim_tabpage_get_var, tab, 'eitri_plugin_diff')
     if not ok or owner ~= opts.owner then vim.api.nvim_set_current_tabpage(tab); break end
   end
-  __takeover_run('close_diffs', {owner=opts.owner})
+  __takeover_run('close_diffs', {owner=opts.owner, release=true})
   __takeover_run('wipe_preload', {owner=opts.owner, release=true})
   if vim.api.nvim_tabpage_is_valid(current) then vim.api.nvim_set_current_tabpage(current) end
   if rawget(_G, '__eitri_plugin_preloads') == registry and next(registry.owners) == nil then

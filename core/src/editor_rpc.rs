@@ -148,6 +148,12 @@ pub const CHUNKS: &[(&str, ChunkSide)] = &[
         ChunkSide::Refused,
     ),
     (crate::tutor::INSTALL_TUTOR_LUA, ChunkSide::Refused),
+    (crate::takeover::room::ROOM_LUA, ChunkSide::Refused),
+    (crate::takeover::room::ROOM_OP_LUA, ChunkSide::Refused),
+    (crate::takeover::sequence::MOVE_LUA, ChunkSide::Refused),
+    (crate::takeover::sequence::FACTS_LUA, ChunkSide::Refused),
+    (crate::takeover::sequence::TAKEN_LUA, ChunkSide::Refused),
+    ("vim.fn.chanclose(...)", ChunkSide::Refused),
     (crate::editor_reopen::EDITOR_REOPEN_CAPTURE_LUA, ChunkSide::Refused),
     (crate::editor_reopen::EDITOR_REOPEN_LUA, ChunkSide::Refused),
     (

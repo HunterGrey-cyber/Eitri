@@ -759,6 +759,164 @@ return { vim.diagnostic.is_enabled({ bufnr = buf }), vim.b[buf].eitri_plugin_pre
     );
 }
 
+#[test]
+#[ignore = "needs nvim on PATH; uses stdio and no display"]
+fn a_preloaded_buffer_the_person_used_and_then_hid_stays_with_its_undo_history() {
+    use eitri_core::plugin::editor as plugin;
+    let nvim = takeover_ready();
+    let chan = nvim.helper_channel();
+    let file = nvim.exec_lua(
+        "local p = vim.fn.getcwd() .. '/used-then-hidden.txt'; vim.fn.writefile({'x'}, p); return vim.uv.fs_realpath(p)",
+        vec![],
+    );
+    let path = std::path::PathBuf::from(file.as_str().unwrap());
+    install(&nvim, chan);
+    let transport = std::rc::Rc::new(TakeoverTransport(&nvim));
+    let rpc = eitri_core::editor_rpc::TakeoverRpc::new(transport, chan);
+    plugin::preload(&rpc, "takeover-plugin", &path, false, false)
+        .try_take()
+        .unwrap()
+        .unwrap();
+    // The person opens the file, changes and saves it, then goes to another buffer: nothing shows it any more and
+    // it is not modified, but it is theirs.
+    nvim.exec_lua(
+        "vim.cmd.edit(vim.fn.fnameescape((...))); vim.api.nvim_buf_set_lines(0, 0, -1, false, {'mine'}); vim.cmd.write(); vim.cmd.enew()",
+        vec![file.clone()],
+    );
+    detach(&nvim, chan);
+    assert_eq!(
+        nvim.exec_lua(
+            r#"
+local buf = vim.fn.bufnr((...))
+if buf < 0 then return { 'gone' } end
+return { vim.api.nvim_buf_is_loaded(buf), vim.api.nvim_buf_get_lines(buf, 0, -1, false)[1],
+  vim.fn.undotree(buf).seq_last > 0, vim.b[buf].eitri_plugin_preload == nil }
+"#,
+            vec![file]
+        ),
+        Value::Array(vec![true.into(), "mine".into(), true.into(), true.into()]),
+        "the buffer the person used is kept, with its undo history, and without the plugin's marks"
+    );
+}
+
+#[test]
+#[ignore = "needs nvim on PATH; uses stdio and no display"]
+fn a_plugin_diff_left_as_the_only_tab_page_is_undone_at_detach() {
+    use eitri_core::plugin::editor as plugin;
+    let nvim = takeover_ready();
+    let chan = nvim.helper_channel();
+    install(&nvim, chan);
+    let transport = std::rc::Rc::new(TakeoverTransport(&nvim));
+    let rpc = eitri_core::editor_rpc::TakeoverRpc::new(transport, chan);
+    run(
+        &rpc,
+        plugin::PLUGIN_BUFFERS_LUA,
+        vec![
+            "diff".into(),
+            Value::Map(vec![
+                ("owner".into(), "takeover-plugin".into()),
+                (
+                    "left".into(),
+                    Value::Map(vec![("title".into(), "old".into()), ("text".into(), "before".into())]),
+                ),
+                (
+                    "right".into(),
+                    Value::Map(vec![("title".into(), "new".into()), ("text".into(), "after".into())]),
+                ),
+            ]),
+        ],
+    );
+    // The person keeps only the diff's tab page.
+    nvim.exec_lua(
+        r#"
+for _, tab in ipairs(vim.api.nvim_list_tabpages()) do
+  local ok, owner = pcall(vim.api.nvim_tabpage_get_var, tab, 'eitri_plugin_diff')
+  if ok and owner == 'takeover-plugin' then vim.api.nvim_set_current_tabpage(tab) end
+end
+vim.cmd('tabonly')
+"#,
+        vec![],
+    );
+    detach(&nvim, chan);
+    assert_eq!(
+        nvim.exec_lua(
+            r#"
+local tabs = vim.api.nvim_list_tabpages()
+local marked = false
+for _, key in ipairs({'eitri_plugin_diff', 'eitri_plugin_diff_from'}) do
+  if pcall(vim.api.nvim_tabpage_get_var, tabs[1], key) then marked = true end
+end
+local named = false
+for _, buf in ipairs(vim.api.nvim_list_bufs()) do
+  if vim.api.nvim_buf_get_name(buf):find('plugin:takeover-plugin', 1, true) then named = true end
+end
+local diffed = false
+for _, win in ipairs(vim.api.nvim_list_wins()) do
+  if vim.wo[win].diff then diffed = true end
+end
+return { #tabs, marked, named, diffed, __eitri_plugin_diffs == nil }
+"#,
+            vec![]
+        ),
+        Value::Array(vec![1.into(), false.into(), false.into(), false.into(), true.into()]),
+        "one tab page, with no diff, no plugin text buffer and no plugin mark left"
+    );
+}
+
+/// A companion's draft, and the takeover's own, with edits not yet written.
+#[test]
+#[ignore = "needs nvim on PATH; uses stdio and no display"]
+fn an_unsaved_draft_survives_the_teardown_that_replaces_its_companion_and_the_detach() {
+    let nvim = takeover_ready();
+    let companion = nvim.helper_channel();
+    let chan = nvim.helper_channel();
+    let draft = |name: &str, text: &str| -> Value {
+        nvim.exec_lua(
+            r#"
+local name, text = ...
+local path, done = vim.fn.getcwd() .. '/' .. name, vim.fn.getcwd() .. '/' .. name .. '.done'
+vim.fn.writefile({'saved'}, path)
+local req = vim.json.encode({op='edit', path=path, done=done})
+EitriScratch.call((req:gsub('.', function(c) return ('%02x'):format(c:byte()) end)))
+local buf = vim.api.nvim_get_current_buf()
+assert(vim.api.nvim_buf_get_name(buf) == path)
+vim.api.nvim_buf_set_lines(buf, 0, -1, false, {text})
+return buf
+"#,
+            vec![name.into(), text.into()],
+        )
+    };
+    let kept = |buf: &Value, text: &str| -> bool {
+        nvim.exec_lua(
+            r#"
+local buf, text = ...
+return vim.api.nvim_buf_is_valid(buf) and vim.api.nvim_buf_is_loaded(buf) and vim.bo[buf].modified
+  and vim.api.nvim_buf_get_lines(buf, 0, -1, false)[1] == text and #vim.fn.win_findbuf(buf) == 1
+"#,
+            vec![buf.clone(), text.into()],
+        )
+        .as_bool()
+            == Some(true)
+    };
+    nvim.exec_lua(
+        INSTALL_LUA,
+        install_args(companion, &parts().sockets, &InstallKind::Agent),
+    );
+    let first = draft("companion-draft.md", "the companion's unsaved words");
+    install(&nvim, chan);
+    assert!(
+        kept(&first, "the companion's unsaved words"),
+        "the replaced companion's draft is still open"
+    );
+    let second = draft("takeover-draft.md", "the takeover's unsaved words");
+    detach(&nvim, chan);
+    assert!(kept(&first, "the companion's unsaved words"));
+    assert!(
+        kept(&second, "the takeover's unsaved words"),
+        "the takeover's draft is still open after the detach"
+    );
+}
+
 fn scratch_diff(nvim: &EmbedNvim) {
     nvim.exec_lua(
         r#"

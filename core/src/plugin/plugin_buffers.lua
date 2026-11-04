@@ -84,9 +84,11 @@ local function wipe()
   if vim.b[buf].eitri_plugin_preload ~= opts.owner or vim.b[buf].eitri_plugin_preload_own == nil then
     return false, 0
   end
-  if vim.bo[buf].modified or #vim.fn.win_findbuf(buf) > 0 then
-    -- The buffer now belongs to the person. A release (the end of a takeover, which wipes nothing the person has
-    -- touched) gives it back the policy it had before the preload and drops the preload's marks.
+  -- A release (the end of a takeover) wipes nothing the person has touched: a buffer shown in a window since the
+  -- preload is theirs even once it is hidden again, with its undo history.
+  if vim.bo[buf].modified or #vim.fn.win_findbuf(buf) > 0 or (opts.release and state.used) then
+    -- The buffer now belongs to the person. A release gives it back the policy it had before the preload and drops
+    -- the preload's marks.
     if opts.release then
       pcall(set, buf, vim.b[buf].eitri_plugin_preload_own)
       vim.b[buf].eitri_plugin_preload = nil
@@ -140,6 +142,28 @@ if op == 'diff' or op == 'close_diffs' then
           args = { tostring(api.nvim_tabpage_get_number(tab)) } }, {})
         if ok and not api.nvim_tabpage_is_valid(tab) then closed = closed + 1 end
       end
+    end
+    -- A release (the end of a takeover) leaves no diff behind. When the current tab page is one of this owner's
+    -- diffs, no other tab page was left to go to: closing it would quit nvim, so it stays as the person's tab
+    -- page, without its diff, its text buffers or its marks. A file side is the person's file and stays shown.
+    if opts.release and tabvar(current, 'eitri_plugin_diff') == opts.owner then
+      local wins = api.nvim_tabpage_list_wins(current)
+      for _, win in ipairs(wins) do
+        api.nvim_win_call(win, function() vim.cmd('diffoff') end)
+      end
+      for _, win in ipairs(wins) do
+        if api.nvim_win_is_valid(win) then
+          local buf = api.nvim_win_get_buf(win)
+          if vim.b[buf].eitri_plugin_diff_text == opts.owner then
+            pcall(api.nvim_buf_delete, buf, { force = true })
+          end
+        end
+      end
+      for _, key in ipairs({ 'eitri_plugin_diff', 'eitri_plugin_diff_from', 'eitri_plugin_diff_maker',
+          'eitri_plugin_diff_order' }) do
+        pcall(api.nvim_tabpage_del_var, current, key)
+      end
+      closed = closed + 1
     end
     return { closed = closed }
   end
@@ -200,6 +224,7 @@ if op == 'diff' or op == 'close_diffs' then
     local ok, why = pcall(function()
       local buf = api.nvim_create_buf(false, true)
       scratch[#scratch + 1] = buf
+      vim.b[buf].eitri_plugin_diff_text = opts.owner
       vim.bo[buf].buftype = 'nofile'
       vim.bo[buf].bufhidden = 'wipe'
       vim.bo[buf].swapfile = false
@@ -305,7 +330,8 @@ elseif op == 'preload' then
   vim.b[buf].eitri_plugin_preload = opts.owner
   local ids = vim.b[buf].eitri_plugin_preload_clients or {}
   vim.b[buf].eitri_plugin_preload_clients = ids
-  local state = { buf = buf }
+  -- A preload of the same buffer again keeps what the person did with it.
+  local state = { buf = buf, used = old ~= nil and old.buf == buf and old.used or nil }
   reg.owners[opts.owner] = state
   local function active()
     return reg.owners[opts.owner] == state and vim.api.nvim_buf_is_valid(buf)
@@ -346,6 +372,12 @@ elseif op == 'preload' then
     vim.b[buf].eitri_plugin_preload_clients = ids
   end
   local group = vim.api.nvim_create_augroup('eitri_plugin_preload_' .. opts.owner, { clear = true })
+  vim.api.nvim_create_autocmd('BufWinEnter', {
+    group = group, buffer = buf,
+    callback = function()
+      if reg.owners[opts.owner] == state then state.used = true end
+    end,
+  })
   vim.api.nvim_create_autocmd('LspAttach', {
     group = group, buffer = buf,
     callback = function()

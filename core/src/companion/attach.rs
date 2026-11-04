@@ -306,6 +306,11 @@ impl Attacher {
                 "detached",
                 "editor detached: another Eitri panel attached to it".to_owned(),
             ),
+            // The page's text for a takeover sends the person to the window's pages; the panel's is shorter.
+            LinkState::Refused {
+                why: InstallRefusal::Takeover,
+                ..
+            } => ("refused", "this nvim is open in an Eitri window".to_owned()),
             LinkState::Refused { why, .. } => ("refused", InstallError::Refused(why.clone()).to_string()),
             LinkState::Failed { why, .. } => ("failed", format!("could not attach: {why}")),
         };
@@ -772,6 +777,26 @@ mod tests {
                 "failed",
                 "could not attach: the editor went away before attaching".to_owned()
             )
+        );
+    }
+
+    /// The band is the panel's (`:EitriPanel`); the longer text that sends the person to the window's pages belongs
+    /// to `eitri page`, which reads the install error itself.
+    #[test]
+    fn a_takeover_refusal_in_the_band_says_the_nvim_is_open_in_an_eitri_window() {
+        let mut a = attaching();
+        a.handle(AttachEvent::InstallRefused {
+            gen: 1,
+            why: InstallRefusal::Takeover,
+        });
+        let band = a.band();
+        assert_eq!(
+            (band.state, band.text.as_str()),
+            ("refused", "this nvim is open in an Eitri window")
+        );
+        assert_eq!(
+            InstallError::Refused(InstallRefusal::Takeover).to_string(),
+            "this nvim is open in an Eitri window: its pages open there"
         );
     }
 

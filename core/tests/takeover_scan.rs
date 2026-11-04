@@ -7,7 +7,27 @@ fn forced_connect(text: &str) -> bool {
         return true;
     }
     // Read the whole file so storing the bang table in a variable cannot hide its later use.
-    compact.contains("bang=true") && !word_ends(&compact, "connect").is_empty()
+    compact.contains("bang=true")
+        && word_ends(&compact, "connect")
+            .into_iter()
+            .any(|end| !handle_method(&compact, end))
+}
+
+/// Whether the `connect` ending at `end` is a method of a handle other than `vim.cmd` (`pipe.connect`,
+/// `pipe:connect`, a libuv socket), which moves no UI. A file that stores `vim.cmd` under another name counts every
+/// `connect` it has, since the alias would make `alias.connect` the command.
+fn handle_method(compact: &str, end: usize) -> bool {
+    let before = &compact[..end - "connect".len()];
+    let Some(receiver) = before.strip_suffix('.').or_else(|| before.strip_suffix(':')) else {
+        return false;
+    };
+    let name_start = receiver
+        .char_indices()
+        .rev()
+        .find(|(_, c)| !(c.is_alphanumeric() || *c == '_'))
+        .map_or(0, |(at, c)| at + c.len_utf8());
+    let name = &receiver[name_start..];
+    !name.is_empty() && name != "cmd" && !compact.contains("=vim.cmd")
 }
 
 #[test]
@@ -95,4 +115,15 @@ fn forced_connect_is_found_across_line_breaks_and_table_field_orders() {
     }
     assert!(!forced_connect("vim.cmd.connect(...)"));
     assert!(!forced_connect("{ cmd = 'tabclose', bang = true }"));
+    // A libuv pipe's connect beside a `normal!` moves no UI; an alias of vim.cmd still counts.
+    let pipe =
+        "pcall(pipe.connect, pipe, path, cb); h:connect(path); vim.api.nvim_cmd({ cmd = 'normal', bang = true }, {})";
+    assert!(!forced_connect(pipe));
+    for code in [
+        "local c = vim.cmd; c.connect({ args = { origin }, bang = true })",
+        "pipe:connect(p); vim.cmd.connect({ args = { origin }, bang = true })",
+        "pipe.connect(p); vim.api.nvim_cmd({ cmd = 'connect', bang = true }, {})",
+    ] {
+        assert!(forced_connect(code), "a forced connection escaped: {code}");
+    }
 }

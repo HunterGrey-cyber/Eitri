@@ -76,8 +76,8 @@ pub enum LetGo {
     NoUi,
 }
 
-const ROOM_LUA: &str = include_str!("waiting_room.lua");
-const ROOM_OP_LUA: &str =
+pub(crate) const ROOM_LUA: &str = include_str!("waiting_room.lua");
+pub(crate) const ROOM_OP_LUA: &str =
     "local room = _G.__eitri_room; if not room then error('no takeover room') end; return room[(...)]()";
 const ANSWER_WITHIN: Duration = Duration::from_secs(2);
 const START_WITHIN: Duration = Duration::from_secs(5);

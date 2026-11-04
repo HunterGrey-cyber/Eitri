@@ -16,10 +16,11 @@ use crate::nvim_rpc::{NvimLink, RpcError};
 const CHECK_WITHIN: Duration = Duration::from_millis(500);
 const ANSWER_WITHIN: Duration = Duration::from_secs(2);
 const TEARDOWN_WITHIN: Duration = Duration::from_millis(300);
-const MOVE_LUA: &str = "local opts = ...; vim.cmd.connect({args = {opts.addr}, magic = {file = false}})";
-const FACTS_LUA: &str =
+pub(crate) const MOVE_LUA: &str = "local opts = ...; vim.cmd.connect({args = {opts.addr}, magic = {file = false}})";
+pub(crate) const FACTS_LUA: &str =
     "return {addr=vim.v.servername, progpath=vim.v.progpath, version=vim.version(), cwd=vim.fn.getcwd(-1, -1)}";
-const TAKEN_LUA: &str = "local c = rawget(_G, '__eitri_companion'); return type(c) == 'table' and c.mode == 'takeover'";
+pub(crate) const TAKEN_LUA: &str =
+    "local c = rawget(_G, '__eitri_companion'); return type(c) == 'table' and c.mode == 'takeover'";
 
 pub struct Checks {
     pub addr: String,
