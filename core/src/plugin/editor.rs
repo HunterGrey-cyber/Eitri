@@ -361,7 +361,8 @@ pub fn follow_text(rpc: &dyn EditorRpc, owner: &str, buf: u64, max_bytes: u64, m
     )
 }
 
-/// `cursor`, when given, is the line the window's cursor goes to, held inside the window as it then stands.
+/// `cursor`, when given, is the line the window's cursor goes to. With `row`, its line starts on that screen row
+/// of nvim's whole grid where possible; otherwise it is held inside the window as it then stands.
 pub fn follow_reveal(
     rpc: &dyn EditorRpc,
     owner: &str,
@@ -369,6 +370,7 @@ pub fn follow_reveal(
     line: u32,
     token: u64,
     cursor: Option<u32>,
+    row: Option<u32>,
 ) -> Pending {
     let mut args = vec![
         (Value::from("owner"), Value::from(owner)),
@@ -378,6 +380,9 @@ pub fn follow_reveal(
     ];
     if let Some(cursor) = cursor {
         args.push((Value::from("cursor"), Value::from(cursor)));
+    }
+    if let Some(row) = row {
+        args.push((Value::from("row"), Value::from(row)));
     }
     follow_call(rpc, "reveal", args)
 }
@@ -661,12 +666,12 @@ mod tests {
         let _ = follow_install(&rpc, &install);
         let _ = follow_on(&rpc, "demo", false);
         let _ = follow_text(&rpc, "demo", 3, 4_194_304, 50_000);
-        let _ = follow_reveal(&rpc, "demo", 3, 50, 7, None);
+        let _ = follow_reveal(&rpc, "demo", 3, 50, 7, None, None);
         let _ = follow_jump(&rpc, "demo", 3, 5, 0);
         let _ = follow_teardown(&rpc, "demo");
         install.scratch_dir = None;
         let _ = follow_install(&rpc, &install);
-        let _ = follow_reveal(&rpc, "demo", 3, 50, 8, Some(54));
+        let _ = follow_reveal(&rpc, "demo", 3, 50, 8, Some(54), Some(9));
         let calls = rpc.0.borrow();
         assert_eq!(calls.len(), 8);
         let ops = [
@@ -705,6 +710,8 @@ mod tests {
         assert_eq!(get(&calls[3].1[1], "token"), &Value::from(7));
         assert_eq!(field(&calls[3].1[1], "cursor"), None, "no cursor unless one was given");
         assert_eq!(get(&calls[7].1[1], "cursor"), &Value::from(54));
+        assert_eq!(field(&calls[3].1[1], "row"), None, "no row unless one was given");
+        assert_eq!(get(&calls[7].1[1], "row"), &Value::from(9));
         assert_eq!(get(&calls[4].1[1], "line"), &Value::from(5));
         assert_eq!(get(&calls[4].1[1], "col"), &Value::from(0));
         assert!(

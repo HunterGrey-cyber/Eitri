@@ -2739,6 +2739,8 @@ mod tests {
             cause: eitri_core::plugin::protocol::ViewCause::User,
             token: None,
             scrolloff: None,
+            rows: None,
+            cursor_row: None,
         }
     }
 

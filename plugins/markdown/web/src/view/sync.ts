@@ -53,6 +53,28 @@ export function yToLine(index: Box[], y: number): number {
   return e.end + ((n.line - e.end) * (y - bottom)) / (n.top - bottom);
 }
 
+/**
+ * The scroll offset that puts the top of source line `L` (zero-based) `share` of the way down a view `view` px high,
+ * within [0, `scrollMax`]. nvim's cursor line goes at the share its row has of nvim's screen, so beside nvim the same
+ * line sits at the same height on both sides when the two have the same top and height (markdown-preview.nvim's
+ * `relative` scroll). The ends of the document clamp it: nothing scrolls past them to keep a share.
+ */
+export function placeLine(index: Box[], L: number, share: number, view: number, scrollMax: number): number {
+  return Math.min(Math.max(0, lineToY(index, L, Number.POSITIVE_INFINITY) - share * view), Math.max(0, scrollMax));
+}
+
+/** The share of nvim's screen above the start of screen row `row` (one-based) of `rows`: the same share of the view
+ *  is where the line on that row goes. */
+export function rowShare(row: number, rows: number): number {
+  return Math.min(Math.max(0, (row - 1) / rows), 1);
+}
+
+/** The screen row (one-based) of nvim's `rows` that starts the same share down nvim's screen as view y `y` is down a
+ *  view `view` px high; the inverse of `rowShare`, to the nearest row and within the screen. */
+export function rowAt(y: number, view: number, rows: number): number {
+  return Math.min(Math.max(1, 1 + Math.round((y / view) * rows)), rows);
+}
+
 /** How far from a whole pixel an offset may be and still be taken for it: far above floating-point rounding at any
  *  document height, far below anything drawn. */
 export const SNAP_PX = 1e-6;

@@ -963,6 +963,8 @@ fn view(buf: u64, tick: u64) -> ViewLine {
         cause: ViewCause::User,
         token: None,
         scrolloff: None,
+        rows: None,
+        cursor_row: None,
     }
 }
 
@@ -1678,17 +1680,68 @@ fn a_reveal_hands_its_cursor_to_nvim_only_when_the_page_sends_one() {
 }
 
 #[test]
-fn a_view_hands_its_scrolloff_to_the_page_and_leaves_it_out_when_nvim_did_not_say() {
+fn a_reveal_hands_its_row_to_nvim_only_when_the_page_sends_one() {
+    let d = shown("host-reveal-row");
+    let t = d.t0 + ms(300);
+    let from = calls(&d.rig);
+    let with = d.rig.send(
+        "editor.reveal",
+        json!({"buf": 3, "line": 10, "token": 1, "cursor": 14, "row": 9}),
+    );
+    d.rig.host.pump(t);
+    assert_eq!(ops_since(&d.rig, from), ["reveal"]);
+    let (_, opts) = last_call(&d.rig);
+    assert_eq!(opt(&opts, "line"), 10.into());
+    assert_eq!(opt(&opts, "cursor"), 14.into());
+    assert_eq!(opt(&opts, "row"), 9.into());
+    answer(&d.rig, map(&[("applied", true.into())]));
+    d.rig.host.pump(t);
+    assert_eq!(d.rig.page.replies_to(with)[0]["result"], json!({"applied": true}));
+    d.rig
+        .send("editor.reveal", json!({"buf": 3, "line": 20, "token": 2, "cursor": 24}));
+    d.rig.host.pump(t);
+    let (_, opts) = last_call(&d.rig);
+    assert!(!has_key(&opts, "row"), "no row key without one from the page");
+    answer(&d.rig, map(&[("applied", true.into())]));
+    d.rig.host.pump(t);
+    d.rig.send("editor.reveal", json!({"buf": 3, "line": 30, "token": 3}));
+    d.rig.host.pump(t);
+    assert!(!has_key(&last_call(&d.rig).1, "row"));
+    let from = calls(&d.rig);
+    for (args, why) in [
+        (
+            json!({"buf": 3, "line": 20, "token": 4, "cursor": 24, "row": 0}),
+            "row must be at least 1",
+        ),
+        (
+            json!({"buf": 3, "line": 20, "token": 5, "row": 9}),
+            "row needs a cursor",
+        ),
+    ] {
+        let bad = d.rig.send("editor.reveal", args);
+        let reply = &d.rig.page.replies_to(bad)[0];
+        assert_eq!(reply["error"]["code"], "bad_request", "{reply}");
+        assert_eq!(reply["error"]["message"], why);
+    }
+    assert_eq!(calls(&d.rig), from, "bad rows never reach nvim");
+}
+
+#[test]
+fn a_view_hands_its_scrolloff_and_rows_to_the_page_and_leaves_them_out_when_nvim_did_not_say() {
     let d = shown("host-view-scrolloff");
     let t = d.t0 + ms(300);
     let mut v = named_view(&d.a, 3, 41);
     v.top = 7;
     v.scrolloff = Some(4);
+    v.rows = Some(46);
+    v.cursor_row = Some(7);
     d.rig.host.follow_view(v, t);
     d.rig.host.pump(t);
     let last = last_view(&d.rig);
     assert_eq!(last["top"], 7);
     assert_eq!(last["scrolloff"], 4);
+    assert_eq!(last["rows"], 46);
+    assert_eq!(last["cursor_row"], 7);
     let mut v = named_view(&d.a, 3, 41);
     v.top = 8;
     d.rig.host.follow_view(v, t + ms(10));
@@ -1696,6 +1749,8 @@ fn a_view_hands_its_scrolloff_to_the_page_and_leaves_it_out_when_nvim_did_not_sa
     let last = last_view(&d.rig);
     assert_eq!(last["top"], 8);
     assert!(last.get("scrolloff").is_none(), "{last}");
+    assert!(last.get("rows").is_none(), "{last}");
+    assert!(last.get("cursor_row").is_none(), "{last}");
 }
 
 #[test]

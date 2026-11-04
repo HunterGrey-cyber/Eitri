@@ -249,7 +249,8 @@ impl PageSaved {
 pub const MAX_LINK_TARGET: usize = 4096;
 
 /// `editor.reveal`: put a source line of the followed buffer at the top of its window, and with `cursor` the
-/// window's cursor on that line, or as near it as the window can hold without scrolling.
+/// window's cursor on that line, or as near it as the window can hold without scrolling. With `row`, choose the
+/// top that starts the cursor line on that screen row of nvim's whole grid.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct EditorReveal {
@@ -258,6 +259,8 @@ pub struct EditorReveal {
     pub token: u64,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cursor: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub row: Option<u32>,
 }
 
 /// `editor.jump`: move the followed window's cursor, and with `focus` the keys, to a source line.
@@ -289,10 +292,16 @@ fn line_ok(line: u32) -> Result<(), String> {
 impl EditorReveal {
     pub fn check(&self) -> Result<(), String> {
         line_ok(self.line)?;
-        match self.cursor {
-            Some(0) => Err("cursor must be at least 1".to_string()),
-            _ => Ok(()),
+        if self.cursor == Some(0) {
+            return Err("cursor must be at least 1".to_string());
         }
+        if self.row == Some(0) {
+            return Err("row must be at least 1".to_string());
+        }
+        if self.row.is_some() && self.cursor.is_none() {
+            return Err("row needs a cursor".to_string());
+        }
+        Ok(())
     }
 }
 
@@ -698,6 +707,12 @@ pub struct EditorView {
     /// The window's effective 'scrolloff' in screen lines; absent when the editor did not report it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub scrolloff: Option<u64>,
+    /// The height of nvim's whole screen grid.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rows: Option<u64>,
+    /// The first screen row of the cursor line, counted from the top of the grid.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cursor_row: Option<u64>,
 }
 
 /// Why a document was not sent: its size and the caps it went over.
@@ -1115,7 +1130,8 @@ mod tests {
                 buf: 3,
                 line: 120,
                 token: 7,
-                cursor: None
+                cursor: None,
+                row: None,
             })
         );
         assert_eq!(
@@ -1124,7 +1140,18 @@ mod tests {
                 buf: 3,
                 line: 120,
                 token: 8,
-                cursor: Some(124)
+                cursor: Some(124),
+                row: None,
+            })
+        );
+        assert_eq!(
+            verb("req-editor-reveal-row.json"),
+            Verb::EditorReveal(EditorReveal {
+                buf: 3,
+                line: 120,
+                token: 8,
+                cursor: Some(124),
+                row: Some(9),
             })
         );
         assert_eq!(
@@ -1169,6 +1196,7 @@ mod tests {
             line,
             token: 1,
             cursor: None,
+            row: None,
         };
         assert_eq!(reveal(0).check(), Err("line must be at least 1".to_string()));
         assert_eq!(reveal(1).check(), Ok(()));
@@ -1178,6 +1206,14 @@ mod tests {
         };
         assert_eq!(with_cursor(0).check(), Err("cursor must be at least 1".to_string()));
         assert_eq!(with_cursor(5).check(), Ok(()));
+        let with_row = |cursor, row| EditorReveal {
+            cursor,
+            row: Some(row),
+            ..reveal(1)
+        };
+        assert_eq!(with_row(Some(5), 0).check(), Err("row must be at least 1".to_string()));
+        assert_eq!(with_row(None, 9).check(), Err("row needs a cursor".to_string()));
+        assert_eq!(with_row(Some(5), 9).check(), Ok(()));
         let jump = |line| EditorJump {
             buf: 1,
             line,
@@ -1222,6 +1258,11 @@ mod tests {
         assert!(written.get("token").is_none(), "no token on a user view");
         assert_eq!(user.scrolloff, None, "an older view has no scrolloff");
         assert!(written.get("scrolloff").is_none(), "no scrolloff written when unknown");
+        for key in ["rows", "cursor_row"] {
+            assert!(written.get(key).is_none(), "no {key} written when unknown");
+        }
+        assert_eq!(user.rows, None);
+        assert_eq!(user.cursor_row, None);
         data.as_object_mut().unwrap().remove("doc");
         assert!(serde_json::from_value::<EditorView>(data).is_err(), "doc is required");
         let view: EditorView = serde_json::from_value(fixture("ev-editor-view.json")["data"].clone()).unwrap();
@@ -1234,6 +1275,8 @@ mod tests {
         );
         assert_eq!(view.cursor, Cursor { line: 125, col: 4 });
         assert_eq!(view.scrolloff, Some(4));
+        assert_eq!(view.rows, Some(46));
+        assert_eq!(view.cursor_row, Some(7));
     }
 
     #[test]

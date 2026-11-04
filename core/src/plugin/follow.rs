@@ -47,6 +47,8 @@ pub enum FollowOp {
         token: u64,
         /// The line the window's cursor goes to, kept in view without scrolling.
         cursor: Option<u32>,
+        /// The screen row on which that cursor line should start.
+        row: Option<u32>,
         re: u64,
     },
     Jump {
@@ -531,6 +533,7 @@ mod tests {
             line: 10,
             token,
             cursor: None,
+            row: None,
             re: token,
         };
         let jump = FollowOp::Jump {
@@ -582,6 +585,7 @@ mod tests {
             line: 10 * re as u32,
             token: re,
             cursor: None,
+            row: None,
             re,
         };
         let jump = FollowOp::Jump {
@@ -677,6 +681,7 @@ mod tests {
             line: 10,
             token: 1,
             cursor: None,
+            row: None,
             re: 1,
         };
         f.park(reveal.clone());

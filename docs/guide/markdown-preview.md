@@ -75,26 +75,29 @@ that in your own Neovim configuration; Eitri does not configure them.
 
 ## Scrolling together
 
-Neovim's window and the preview show the same source line at their top, through folds, long wrapped lines, long code
-blocks and images that load late. Whichever side has the keys leads:
+The preview keeps the line you are on at the same height as Neovim does: the line Neovim's cursor is on sits as far
+down the preview as it is down Neovim's screen (what markdown-preview.nvim calls `relative` scrolling), through folds,
+long wrapped lines, long code blocks and images that load late. Side by side in Eitri's window that is the same height
+on the screen; beside Neovim in a terminal it is when the preview's window is level with the terminal and as tall.
+Whichever side has the keys leads:
 
-- With the keys in Neovim (or anywhere outside the preview), scrolling and jumping in Neovim move the preview, and a
-  bar in the preview's margin marks Neovim's cursor line.
-- With the keys in the preview, scrolling it moves Neovim's window, and Neovim's cursor follows the line you are
-  reading in the preview, so leaving the preview finds Neovim at the same place with the cursor on that line. Where
+- With the keys in Neovim (or anywhere outside the preview), moving and scrolling in Neovim move the preview, a
+  cursor move that does not scroll Neovim included, and a bar in the preview's margin marks Neovim's cursor line. At
+  the top and the bottom of the document the preview stops at its ends.
+- With the keys in the preview, scrolling it moves Neovim's window so that the line you are reading in the preview
+  is at the same height in Neovim, with Neovim's cursor on it, so leaving the preview finds Neovim at the same place
+  with the cursor on that line. Where
   Neovim's `scrolloff` does not let the cursor sit on that line without scrolling, the cursor goes to the nearest line
   that does; Neovim's window never moves for it. A scroll still running when you leave finishes at once, and Neovim
   is told where it ended. If you leave without having scrolled, Neovim is told nothing and its cursor stays put.
-- The line you are reading sits a few lines below the preview's top, as Neovim's cursor sits `scrolloff` lines below
-  its window's top: the preview keeps as many lines above it as your Neovim's `scrolloff` (two when Neovim does not
-  say), at most a quarter of the view. Near the top of the document there is no such room, as in Neovim.
-- Coming back to Neovim without having moved in it, Neovim's first move does not jump the preview to a whole line:
-  it stays where you left it, even in the middle of a long wrapped paragraph.
+- The line you are reading sits a few lines below the preview's top, never on its edge: at least five lines of the
+  preview's text (what Vim's own defaults keep; Neovim's default `scrolloff` is 0), more when your Neovim's
+  `scrolloff` keeps more rows, at most a quarter of the view. Near the top of the document there is no such room, as
+  in Neovim.
+- Coming back to Neovim, nothing moves until you move in Neovim.
 - Going into the preview, the block Neovim's cursor is in, when it is on screen, becomes the current block, so `yy`
   and `Enter` act on what you were editing. On a line outside any block (a blank line between paragraphs) the
   nearest block becomes current, and `Enter` still leaves Neovim's cursor on its own line.
-- While Neovim leads, the preview keeps the line Neovim's cursor is on in view: when the rendered text is taller than
-  Neovim's and that line would fall below the preview, the preview scrolls the least it needs to show it.
 - Scrolling the preview with the mouse wheel moves Neovim's window too, even while Neovim has the keys; Neovim's
   cursor then moves only as far as its `scrolloff` needs. Neovim's next own move takes the lead back.
 

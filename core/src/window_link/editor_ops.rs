@@ -305,6 +305,7 @@ pub fn dispatch(id: u64, op: EditorOp, ctx: &dyn OpContext, rpc: &dyn EditorRpc)
             line,
             token,
             cursor,
+            row,
         } => {
             held_plugin(ctx, &plugin)?;
             if line == 0 {
@@ -313,8 +314,14 @@ pub fn dispatch(id: u64, op: EditorOp, ctx: &dyn OpContext, rpc: &dyn EditorRpc)
             if cursor == Some(0) {
                 return Err(OpRefused::Outside("cursor starts at one".into()));
             }
+            if row == Some(0) {
+                return Err(OpRefused::Outside("row starts at one".into()));
+            }
+            if row.is_some() && cursor.is_none() {
+                return Err(OpRefused::Outside("row needs a cursor".into()));
+            }
             Ok(Dispatch::Rpc(crate::plugin::editor::follow_reveal(
-                rpc, &plugin, buf, line, token, cursor,
+                rpc, &plugin, buf, line, token, cursor, row,
             )))
         }
         EditorOp::PluginJump { plugin, buf, line, col } => {
@@ -729,6 +736,7 @@ mod tests {
                 line: 2,
                 token: 9,
                 cursor: None,
+                row: None,
             },
             EditorOp::PluginJump {
                 plugin: "snotra".into(),
@@ -785,6 +793,7 @@ mod tests {
                 line: 0,
                 token: 1,
                 cursor: None,
+                row: None,
             },
             EditorOp::PluginReveal {
                 plugin: "snotra".into(),
@@ -792,6 +801,7 @@ mod tests {
                 line: 2,
                 token: 1,
                 cursor: Some(0),
+                row: None,
             },
             EditorOp::PluginOpenLink {
                 plugin: "snotra".into(),
@@ -808,6 +818,27 @@ mod tests {
         ] {
             assert!(serde_json::from_str::<EditorOp>(op).is_err());
         }
+    }
+
+    #[test]
+    fn a_reveals_row_must_start_at_one_and_have_a_cursor() {
+        let f = fixture("reveal-row");
+        let rpc = Recorder::default();
+        for (cursor, row, why) in [
+            (Some(5), Some(0), "row starts at one"),
+            (None, Some(9), "row needs a cursor"),
+        ] {
+            let op = EditorOp::PluginReveal {
+                plugin: "snotra".into(),
+                buf: 3,
+                line: 2,
+                token: 1,
+                cursor,
+                row,
+            };
+            assert!(matches!(dispatch(1, op, &f.ctx, &rpc), Err(OpRefused::Outside(message)) if message == why));
+        }
+        assert!(rpc.0.borrow().is_empty(), "a refused row never reaches nvim");
     }
 
     fn meta(session: &str) -> WireMeta {

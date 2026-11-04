@@ -601,6 +601,8 @@ fn editor_view(v: &ViewLine) -> EditorView {
         token: v.token,
         doc: None,
         scrolloff: v.scrolloff,
+        rows: v.rows,
+        cursor_row: v.cursor_row,
     }
 }
 
@@ -1620,8 +1622,12 @@ impl PluginHost {
                     } => format!(" cursor={cursor}"),
                     _ => String::new(),
                 };
+                let row = match &op {
+                    FollowOp::Reveal { row: Some(row), .. } => format!(" row={row}"),
+                    _ => String::new(),
+                };
                 if let Ok(applied) = applied {
-                    trace::line(self.id(), event, &format!("line={line}{cursor} applied={applied}"));
+                    trace::line(self.id(), event, &format!("line={line}{cursor}{row} applied={applied}"));
                 }
                 // The keys move only for a page still waiting on this answer, and only before the deadline: one
                 // told the editor was busy, or replaced since, has moved on, and so may the user have while nvim
@@ -1750,9 +1756,10 @@ impl PluginHost {
                 line,
                 token,
                 cursor,
+                row,
                 re,
             } => (
-                editor::follow_reveal(&*editor, id, *buf, *line, *token, *cursor),
+                editor::follow_reveal(&*editor, id, *buf, *line, *token, *cursor, *row),
                 Some(*re),
             ),
             FollowOp::Jump { buf, line, col, re, .. } => {
@@ -2296,6 +2303,7 @@ impl PluginHost {
             line: args.line,
             token: args.token,
             cursor: args.cursor,
+            row: args.row,
             re,
         };
         let mut replies = Vec::new();
@@ -3424,7 +3432,7 @@ mod tests {
             r.host.send_follow(now);
             let _ = editor::follow_on(&*rpc, "demo", true);
             let _ = editor::follow_text(&*rpc, "demo", 1, 100, 100);
-            let _ = editor::follow_reveal(&*rpc, "demo", 1, 2, 3, None);
+            let _ = editor::follow_reveal(&*rpc, "demo", 1, 2, 3, None, None);
             let _ = editor::follow_jump(&*rpc, "demo", 1, 2, 0);
             let _ = editor::follow_teardown(&*rpc, "demo");
             let calls = rpc.calls.borrow();

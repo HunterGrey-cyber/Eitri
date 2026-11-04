@@ -51,6 +51,9 @@ beforeEach(() => {
   (window as { requestAnimationFrame?: unknown }).requestAnimationFrame = undefined;
   document.body.innerHTML = '<div id="mdp-notice" class="mdp-notice"></div><main id="mdp-root" class="mdp-root"></main>';
   root = document.getElementById("mdp-root")!;
+  // The reading reserve is at least five lines of the page's text; these tests are written around a 44 px floor, so
+  // the page's text is 8.8 px a line here (the 22 px of the page's own stylesheet: the reserve's own tests).
+  root.style.lineHeight = "8.8px";
   calls = [];
   runner = { fill: vi.fn(() => 0), renderPending: vi.fn(), setTheme: vi.fn() };
   vi.spyOn(Element.prototype, "getBoundingClientRect").mockImplementation(function (this: Element) {
@@ -323,18 +326,29 @@ describe("the anchor and the reveals across a change of lead", () => {
 });
 
 describe("the reading line shared with nvim", () => {
-  it("sits nvim's 'scrolloff' lines below the top, two when nvim does not say, at most a quarter of the view", () => {
+  it("keeps 'scrolloff' in nvim's rows below the top, at least five lines of text, at most a quarter of the view", () => {
+    root.style.lineHeight = "22px";
     const p = make();
+    // nvim says no 'scrolloff', or 0 (nvim's default): five lines of the page's text, never the top edge.
     p.onView(view(1, 1));
-    expect(p.reservePx()).toBe(44);
-    expect(document.documentElement.style.getPropertyValue("--mdp-reserve")).toBe("44px");
-    p.onView(view(1, 1, { scrolloff: 4 }));
-    expect(p.reservePx()).toBe(88);
-    expect(document.documentElement.style.getPropertyValue("--mdp-reserve")).toBe("88px");
-    setScroll(100);
-    expect(p.readingY()).toBe(188);
+    expect(p.reservePx()).toBe(110);
+    expect(document.documentElement.style.getPropertyValue("--mdp-reserve")).toBe("110px");
     p.onView(view(1, 1, { scrolloff: 0 }));
-    expect(p.readingY()).toBe(100);
+    setScroll(200);
+    expect(p.readingY()).toBe(310);
+    // Above the floor, 'scrolloff' counts the page's lines from a host that does not say nvim's rows ...
+    p.onView(view(1, 1, { scrolloff: 6 }));
+    expect(p.reservePx()).toBe(132);
+    // ... and nvim's rows when it does: the view's 768 px over nvim's 48 rows is 16 px a row.
+    p.onView(view(1, 1, { scrolloff: 6, rows: 48, cursor_row: 1 }));
+    expect(p.reservePx()).toBe(110);
+    p.onView(view(1, 1, { scrolloff: 9, rows: 48, cursor_row: 1 }));
+    expect(p.reservePx()).toBe(144);
+    expect(document.documentElement.style.getPropertyValue("--mdp-reserve")).toBe("144px");
+    expect(p.readingY()).toBe(344);
+    // nvim's rows changing alone (a resized screen) moves it too.
+    p.onView(view(1, 1, { scrolloff: 9, rows: 64, cursor_row: 1 }));
+    expect(document.documentElement.style.getPropertyValue("--mdp-reserve")).toBe("110px");
     p.onView(view(1, 1, { scrolloff: 50 }));
     expect(p.reservePx()).toBe(window.innerHeight / 4);
   });
@@ -344,14 +358,14 @@ describe("the reading line shared with nvim", () => {
     p.onView(view(1, 1, { scrolloff: 0 }));
     show(p, 1, paragraphs(30));
     p.onFocus(true);
-    // Reading at the top: the block at 300 is line 20.
+    // 'scrolloff' 0 keeps the floor, 44 px here: reading at 344, line 22 (the block at 330).
     setScroll(300);
-    expect(reveals()).toEqual([{ buf: 1, line: 21, token: 1, cursor: 21 }]);
-    // nvim's own view says 'scrolloff' 1 now: the reading line moves a line down, the top stays.
-    p.onView(view(1, 21, { scrolloff: 1, cause: "reveal", token: 1 }));
+    expect(reveals()).toEqual([{ buf: 1, line: 21, token: 1, cursor: 23 }]);
+    // nvim's own view says 'scrolloff' 6 now, six lines of 8.8 px: the reading line moves down a block, the top stays.
+    p.onView(view(1, 21, { scrolloff: 6, cause: "reveal", token: 1 }));
     setScroll(301);
     vi.advanceTimersByTime(40);
-    expect(reveals().at(-1)).toEqual({ buf: 1, line: 21, token: 2, cursor: 23 });
+    expect(reveals().at(-1)).toEqual({ buf: 1, line: 21, token: 2, cursor: 25 });
   });
 
   it("stops sending the cursor once the host refuses it", async () => {
@@ -526,6 +540,71 @@ describe("the reading line shared with nvim", () => {
     p.editJumpFailed();
     setScroll(300);
     expect(reveals()).toEqual([{ buf: 1, line: 21, token: 1, cursor: 23 }]);
+  });
+
+  it("puts nvim's cursor line as far down the view as its row is down nvim's screen while nvim leads", () => {
+    const p = make();
+    p.onView(view(1, 1));
+    show(p, 1, paragraphs(60));
+    // Line 41 (block 20, at 600) starts on row 13 of nvim's 48: a quarter down nvim's screen, so a quarter down the
+    // view, wherever nvim's top is.
+    p.onView(view(1, 30, { cursor: { line: 41, col: 0 }, rows: 48, cursor_row: 13 }));
+    expect(window.scrollY).toBe(600 - window.innerHeight / 4);
+    // The cursor two lines down and two rows down (block 21, at 630): the page follows the line, not nvim's top.
+    p.onView(view(1, 30, { cursor: { line: 43, col: 0 }, rows: 48, cursor_row: 15 }));
+    expect(window.scrollY).toBe(630 - (window.innerHeight * 14) / 48);
+    // nvim scrolling its window under the cursor takes the line up with it.
+    p.onView(view(1, 30, { cursor: { line: 43, col: 0 }, rows: 48, cursor_row: 3 }));
+    expect(window.scrollY).toBe(630 - (window.innerHeight * 2) / 48);
+    // Near the document's start the page stays at its top rather than keep the share.
+    p.onView(view(1, 1, { cursor: { line: 3, col: 0 }, rows: 48, cursor_row: 3 }));
+    expect(window.scrollY).toBe(0);
+    // The cursor on nvim's top line, scrolled half out of the window ('smoothscroll'): its shown half starts on the
+    // window's first row, row 5 here, so half way into line 41's 20 px block goes a twelfth down the view.
+    p.onView(view(1, 41, { cursor: { line: 41, col: 0 }, top_fraction: 0.5, rows: 48, cursor_row: 5 }));
+    expect(window.scrollY).toBe(600 + 10 - window.innerHeight / 12);
+    expect(reveals()).toEqual([]);
+  });
+
+  it("asks nvim to start the reading line on the row as far down its screen as the line is down the view", () => {
+    const p = make();
+    p.onView(view(1, 1, { rows: 48, cursor_row: 1 }));
+    show(p, 1, paragraphs(30));
+    p.onFocus(true);
+    // Reading at 344: line 22 (block 11, at 330) starts 30 px down the 768 px view, a share that is row 3 of 48.
+    setScroll(300);
+    expect(reveals()).toEqual([{ buf: 1, line: 21, token: 1, cursor: 23, row: 3 }]);
+    // Without the keys (a pointer scroll) the reveal carries the top alone, as before.
+    p.onFocus(false);
+    window.dispatchEvent(new Event("wheel"));
+    setScroll(600);
+    vi.advanceTimersByTime(40);
+    expect(reveals().at(-1)).toEqual({ buf: 1, line: 41, token: 2 });
+  });
+
+  it("stops sending the row once the host refuses it, and keeps the cursor", async () => {
+    const refusing: Bridge = {
+      call: async (verb, args) => {
+        calls.push({ verb, args });
+        if (verb === "editor.reveal" && (args as { row?: number }).row !== undefined) {
+          throw Object.assign(new Error("unknown field `row`"), { code: "bad_request" });
+        }
+        return { applied: true };
+      },
+      on: () => () => {},
+    };
+    const p = new Preview(root, refusing, { auto: false, remote_images: "https", sync: "both" }, runner);
+    made.push(p);
+    p.onView(view(1, 1, { rows: 48, cursor_row: 1 }));
+    show(p, 1, paragraphs(30));
+    p.onFocus(true);
+    setScroll(300);
+    await vi.advanceTimersByTimeAsync(0);
+    expect(reveals()).toEqual([{ buf: 1, line: 21, token: 1, cursor: 23, row: 3 }, { buf: 1, line: 21, token: 2, cursor: 23 }]);
+    setScroll(400);
+    vi.advanceTimersByTime(40);
+    // Reading at 444, in the gap above block 15: line 30.
+    expect(reveals().at(-1)).toEqual({ buf: 1, line: 27, token: 3, cursor: 31 });
   });
 
   it("keeps nvim's cursor line in view while nvim leads, scrolling the least, and reveals nothing", () => {

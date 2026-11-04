@@ -63,9 +63,11 @@ describe("events", () => {
       base: "eitri-plugin://markdown/.eitri/doc/4/docs/",
     });
     expect(view.data.scrolloff).toBe(4);
+    expect([view.data.rows, view.data.cursor_row]).toEqual([46, 7]);
     const echo = fixture("ev-editor-view-reveal.json").data;
     expect(isEditorView(echo)).toBe(true);
-    expect([echo.cause, echo.token, echo.doc, echo.scrolloff]).toEqual(["reveal", 7, null, undefined]);
+    expect([echo.cause, echo.token, echo.doc, echo.scrolloff, echo.rows, echo.cursor_row])
+      .toEqual(["reveal", 7, null, undefined, undefined, undefined]);
     const text = fixture("ev-editor-text.json").data;
     expect(isEditorText(text) && "text" in text).toBe(true);
     const large = fixture("ev-editor-text-too-large.json").data;
@@ -83,6 +85,9 @@ describe("events", () => {
     expect(isEditorView({ ...view, scrolloff: -1 })).toBe(false);
     expect(isEditorView({ ...view, scrolloff: 1.5 })).toBe(false);
     expect(isEditorView({ ...view, scrolloff: "4" })).toBe(false);
+    for (const key of ["rows", "cursor_row"]) {
+      for (const bad of [-1, 1.5, "7", null]) expect(isEditorView({ ...view, [key]: bad })).toBe(false);
+    }
     const text = fixture("ev-editor-text.json").data;
     expect(isEditorText({ ...text, too_large: { bytes: 1, lines: 1, max_bytes: 1, max_lines: 1 } })).toBe(false);
     const { text: _text, ...neither } = text;
@@ -102,12 +107,14 @@ describe("verbs", () => {
     expect(await follow(b)).toEqual({ filetypes: ["markdown"] });
     expect(await reveal(b, { buf: 3, line: 120, token: 7 })).toEqual({ applied: true });
     expect(await reveal(b, { buf: 3, line: 120, token: 8, cursor: 124 })).toEqual({ applied: true });
+    expect(await reveal(b, { buf: 3, line: 120, token: 8, cursor: 124, row: 9 })).toEqual({ applied: true });
     expect(await jump(b, { buf: 3, line: 42, col: 0, focus: true })).toEqual(fixture("rep-editor-jump.json").result);
     expect(await openLink(b, { buf: 3, target: "../docs/setup.md#L10" })).toEqual({ how: "edit", line: 10 });
     expect(calls).toEqual([
       { verb: "editor.follow", args: fixture("req-editor-follow.json").args },
       { verb: "editor.reveal", args: fixture("req-editor-reveal.json").args },
       { verb: "editor.reveal", args: fixture("req-editor-reveal-cursor.json").args },
+      { verb: "editor.reveal", args: fixture("req-editor-reveal-row.json").args },
       { verb: "editor.jump", args: fixture("req-editor-jump.json").args },
       { verb: "editor.open_link", args: fixture("req-editor-open-link.json").args },
     ]);

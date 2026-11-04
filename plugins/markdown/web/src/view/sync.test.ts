@@ -1,6 +1,8 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
 import type { Box } from "./lineindex";
-import { createThrottle, leader, lineToY, OWN_TOKENS, OwnTokens, REVEAL_THROTTLE_MS, scrollTarget, yToLine } from "./sync";
+import {
+  createThrottle, leader, lineToY, OWN_TOKENS, OwnTokens, placeLine, REVEAL_THROTTLE_MS, rowAt, rowShare, scrollTarget, yToLine,
+} from "./sync";
 
 const el = document.createElement("div");
 const box = (line: number, end: number, top: number, height: number): Box => ({ line, end, top, height, el });
@@ -34,6 +36,26 @@ describe("editor to preview", () => {
   });
   it("puts a line where one block ends and the next begins at the next block's top", () => {
     expect(lineToY([box(0, 3, 0, 60), box(3, 4, 80, 20)], 3, FAR)).toBe(80);
+  });
+});
+
+describe("one line at the same height on both sides", () => {
+  it("puts a line's top the share of nvim's screen its row has down the view", () => {
+    // nvim's line 7 starts on row 11 of 41: a quarter down nvim's screen, so a quarter down a 400 px view.
+    expect(rowShare(11, 40)).toBe(0.25);
+    expect(placeLine(INDEX, 7, rowShare(11, 40), 400, FAR)).toBe(140 - 100);
+    // Row 1 is the top edge on both sides: the line's own top, as top-line sync put it.
+    expect(placeLine(INDEX, 12, rowShare(1, 40), 400, FAR)).toBe(260);
+  });
+  it("stops at the document's ends rather than keep the share", () => {
+    expect(placeLine(INDEX, 1, 0.5, 400, FAR)).toBe(0);
+    expect(placeLine(INDEX, 12, 0, 400, 150)).toBe(150);
+  });
+  it("finds the row of nvim's screen at a share of the view, the inverse of the share", () => {
+    expect(rowAt(100, 400, 40)).toBe(11);
+    for (const row of [1, 7, 23, 40]) expect(rowAt(rowShare(row, 40) * 900, 900, 40)).toBe(row);
+    expect(rowAt(-30, 400, 40)).toBe(1);
+    expect(rowAt(500, 400, 40)).toBe(40);
   });
 });
 

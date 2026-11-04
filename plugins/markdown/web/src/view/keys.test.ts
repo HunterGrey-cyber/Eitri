@@ -27,6 +27,9 @@ beforeEach(() => {
   (window as { requestAnimationFrame?: unknown }).requestAnimationFrame = undefined;
   document.body.innerHTML = '<div id="mdp-notice"></div><main id="mdp-root" class="mdp-root"></main>';
   layout = installFakeLayout(document.getElementById("mdp-root")!);
+  // The reading reserve is at least five lines of the page's text; these short fake documents are written around a
+  // 44 px reserve, so their page text is 8.8 px a line (the floor itself: preview.test.ts).
+  document.getElementById("mdp-root")!.style.lineHeight = "8.8px";
   (window as unknown as { eitriKeys: typeof kit }).eitriKeys = kit;
   installed = null;
   calls = [];

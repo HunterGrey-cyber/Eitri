@@ -347,12 +347,18 @@ pub fn view_line(view: &ViewLine) -> String {
         },
     });
     // A view with no token carries none, as the snippet writes it: a `null` token is not a line it writes. The same
-    // goes for a missing 'scrolloff'.
+    // goes for missing 'scrolloff' and screen geometry.
     if let Some(token) = view.token {
         line["token"] = json!(token);
     }
     if let Some(scrolloff) = view.scrolloff {
         line["scrolloff"] = json!(scrolloff);
+    }
+    if let Some(rows) = view.rows {
+        line["rows"] = json!(rows);
+    }
+    if let Some(cursor_row) = view.cursor_row {
+        line["cursor_row"] = json!(cursor_row);
     }
     line.to_string()
 }
@@ -1399,6 +1405,11 @@ impl PluginEditorRpc {
                     line: line()?.ok_or("missing line")?,
                     token: number("token")?,
                     cursor: get("cursor")
+                        .and_then(rmpv::Value::as_u64)
+                        .map(u32::try_from)
+                        .transpose()
+                        .map_err(|e| e.to_string())?,
+                    row: get("row")
                         .and_then(rmpv::Value::as_u64)
                         .map(u32::try_from)
                         .transpose()
@@ -2708,7 +2719,7 @@ mod tests {
             ),
             editor::follow_on(&proxy, "ignored", true),
             editor::follow_text(&proxy, "ignored", 3, 1, 1),
-            editor::follow_reveal(&proxy, "ignored", 3, 2, 8, Some(5)),
+            editor::follow_reveal(&proxy, "ignored", 3, 2, 8, Some(5), Some(9)),
             editor::follow_jump(&proxy, "ignored", 3, 2, 1),
             editor::follow_teardown(&proxy, "ignored"),
         ];
@@ -3319,12 +3330,21 @@ mod tests {
             cause,
             token,
             scrolloff: Some(4),
+            rows: Some(46),
+            cursor_row: Some(7),
         }
     }
 
     #[test]
     fn follow_lines_read_back_as_the_socket_reads_them() {
+        let mut older = view("markdown", 3, ViewCause::User, None);
+        older.rows = None;
+        older.cursor_row = None;
+        let old_wire: serde_json::Value = serde_json::from_str(&view_line(&older)).unwrap();
+        assert!(old_wire.get("rows").is_none());
+        assert!(old_wire.get("cursor_row").is_none());
         for line in [
+            older,
             view("markdown", 1, ViewCause::User, None),
             view("markdown", 2, ViewCause::Reveal, Some(4)),
         ] {

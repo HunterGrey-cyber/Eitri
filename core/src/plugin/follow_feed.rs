@@ -68,6 +68,10 @@ pub struct ViewLine {
     pub token: Option<u64>,
     /// The window's effective 'scrolloff' in screen lines; `None` from a snippet that does not say it.
     pub scrolloff: Option<u64>,
+    /// The height of nvim's whole screen grid.
+    pub rows: Option<u64>,
+    /// The first screen row of the cursor line, counted from the top of the grid.
+    pub cursor_row: Option<u64>,
 }
 
 /// A command the user ran in nvim, for the plugin named by the line's owner.
@@ -129,6 +133,14 @@ pub fn parse_line(bytes: &[u8]) -> Option<(Option<ViewLine>, Option<Ordered>)> {
                 None => None,
                 Some(scrolloff) => Some(scrolloff.as_u64()?),
             };
+            let rows = match line.get("rows") {
+                None => None,
+                Some(rows) => Some(rows.as_u64()?),
+            };
+            let cursor_row = match line.get("cursor_row") {
+                None => None,
+                Some(cursor_row) => Some(cursor_row.as_u64()?),
+            };
             let view = ViewLine {
                 owner,
                 seq: int("seq")?,
@@ -146,6 +158,8 @@ pub fn parse_line(bytes: &[u8]) -> Option<(Option<ViewLine>, Option<Ordered>)> {
                 cause,
                 token,
                 scrolloff,
+                rows,
+                cursor_row,
             };
             Some((Some(view), None))
         }
@@ -596,6 +610,8 @@ mod tests {
             cause: ViewCause::User,
             token: None,
             scrolloff: None,
+            rows: None,
+            cursor_row: None,
         };
         assert_eq!(parse(VIEW), Some((Some(expected.clone()), None)));
         let with_scrolloff = VIEW.replace(r#""cause":"user""#, r#""cause":"user","scrolloff":4"#);
@@ -612,6 +628,24 @@ mod tests {
         for bad in [r#""scrolloff":-1"#, r#""scrolloff":"4""#, r#""scrolloff":null"#] {
             let line = VIEW.replace(r#""cause":"user""#, &format!(r#""cause":"user",{bad}"#));
             assert_eq!(parse(&line), None, "{bad}");
+        }
+        let with_rows = VIEW.replace(r#""cause":"user""#, r#""cause":"user","rows":46,"cursor_row":7"#);
+        assert_eq!(
+            parse(&with_rows),
+            Some((
+                Some(ViewLine {
+                    rows: Some(46),
+                    cursor_row: Some(7),
+                    ..expected.clone()
+                }),
+                None
+            ))
+        );
+        for key in ["rows", "cursor_row"] {
+            for bad in ["-1", "\"7\"", "null"] {
+                let line = VIEW.replace(r#""cause":"user""#, &format!(r#""cause":"user","{key}":{bad}"#));
+                assert_eq!(parse(&line), None, "{key}: {bad}");
+            }
         }
         let reveal = VIEW.replace(r#""cause":"user""#, r#""cause":"reveal","token":7"#);
         assert_eq!(

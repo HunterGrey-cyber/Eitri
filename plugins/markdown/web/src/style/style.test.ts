@@ -40,7 +40,7 @@ describe("the page's stylesheets", () => {
       expect(rule.body, selector).toMatch(/(^|[^-])color:\s*var\(--nv-fg\)/);
     }
     expect(rules(css["markdown.css"]).find((r) => r.selector === "html")!.body).toMatch(/color-scheme:\s*var\(--nv-color-scheme\)/);
-    expect(rules(css["markdown.css"]).find((r) => r.selector === "html")!.body).toMatch(/scroll-padding-top:\s*var\(--mdp-reserve, 44px\)/);
+    expect(rules(css["markdown.css"]).find((r) => r.selector === "html")!.body).toMatch(/scroll-padding-top:\s*var\(--mdp-reserve, 110px\)/);
     expect(rules(css["markdown.css"]).find((r) => r.selector === "html")!.body).toMatch(/scroll-padding-bottom:\s*20px/);
     expect(rules(css["markdown.css"]).find((r) => r.selector === "html, body")!.body).toMatch(/font-size:\s*14px/);
   });

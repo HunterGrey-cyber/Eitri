@@ -1338,6 +1338,253 @@ fn a_reveal_with_a_cursor_keeps_the_top_and_holds_the_cursor_without_scrolling()
     assert_eq!(top_and_cursor(&mut c, w), (140, 144));
 }
 
+/// A reveal whose cursor line starts on a row of the whole nvim grid.
+fn reveal_on_row(buf: u64, cursor: u64, row: u64, token: u64) -> Value {
+    opts_map(&[
+        ("owner", OWNER.into()),
+        ("buf", buf.into()),
+        ("line", 1.into()),
+        ("token", token.into()),
+        ("cursor", cursor.into()),
+        ("row", row.into()),
+    ])
+}
+
+/// The window's first grid row and the first screen row of the given buffer line.
+fn screen_rows(c: &mut Case, win: u64, line: u64) -> (u64, u64) {
+    let v = c.nvim.lua(
+        "local w, l = ... return { vim.fn.win_screenpos(w)[1], vim.fn.screenpos(w, l, 1).row }",
+        vec![win.into(), line.into()],
+    );
+    let v = v.as_array().unwrap();
+    (v[0].as_u64().unwrap(), v[1].as_u64().unwrap())
+}
+
+#[test]
+#[ignore = "needs a real nvim on PATH; spends no tokens and needs no display"]
+fn a_view_counts_the_cursor_lines_row_when_its_first_column_is_scrolled_out_sideways() {
+    let (mut c, listener, socket) = follow_case("view-row-leftcol");
+    let mut doc = numbered(300);
+    doc[89] = "y".repeat(400);
+    let a = write_doc(&c, "a.md", &doc);
+    edit(&mut c, &a);
+    c.nvim.command("set lines=50 columns=100");
+    c.nvim.command("botright split");
+    c.nvim.command("setlocal nowrap scrolloff=0 sidescrolloff=0");
+    c.nvim.command("normal! 80Gzt10j300|");
+    let w = current_win(&mut c);
+    let (first, start) = screen_rows(&mut c, w, 90);
+    let leftcol = c
+        .nvim
+        .lua("return vim.fn.winsaveview().leftcol", vec![])
+        .as_u64()
+        .unwrap();
+    assert!(
+        leftcol > 0 && start == 0,
+        "column 1 of line 90 is scrolled out sideways: leftcol {leftcol}, row {start}"
+    );
+    install(&mut c, &socket, false, &[], None);
+    follow(&mut c, true);
+    let lines = lines_within(&mut c.nvim, &listener, SETTLE);
+    let last = *views(&lines).last().expect("a view of the window scrolled sideways");
+    assert_eq!(last["cursor"]["line"], 90);
+    assert_eq!(last["cursor_row"], first + 10, "line 90 is the window's eleventh row");
+}
+
+#[test]
+#[ignore = "needs a real nvim on PATH; spends no tokens and needs no display"]
+fn a_reveal_takes_in_a_tall_line_rather_than_leave_its_cursor_within_scrolloff_of_the_top() {
+    let (mut c, listener, socket) = follow_case("reveal-row-tall");
+    let mut doc = numbered(300);
+    doc[94] = "x".repeat(1200);
+    let a = write_doc(&c, "a.md", &doc);
+    edit(&mut c, &a);
+    c.nvim.command("set lines=50 columns=100");
+    c.nvim.command("botright split");
+    c.nvim
+        .command("setlocal wrap nosmoothscroll scrolloff=3 nonumber norelativenumber");
+    let w = current_win(&mut c);
+    let first = screen_rows(&mut c, w, 1).0;
+    let tall = c
+        .nvim
+        .lua(
+            "local w = ... return vim.api.nvim_win_text_height(w, { start_row = 94, end_row = 94 }).all",
+            vec![w.into()],
+        )
+        .as_u64()
+        .unwrap();
+    assert!(
+        tall > 7,
+        "line 95 takes more rows than the seven asked for above line 96: {tall}"
+    );
+    install(&mut c, &socket, false, &[], None);
+    follow(&mut c, true);
+    drain(&mut c, &listener);
+    let buf = buf_of(&mut c, &a);
+    assert!(applied(&op(&mut c, "reveal", reveal_on_row(buf, 96, first + 7, 43))));
+    let (top, held) = top_and_cursor(&mut c, w);
+    assert_eq!(held, 96, "the cursor stays on the line asked for");
+    assert_eq!(top, 95, "the tall line above it is taken in whole");
+    assert_eq!(
+        screen_rows(&mut c, w, 96).1,
+        first + tall,
+        "line 96 starts below the tall line"
+    );
+}
+
+#[test]
+#[ignore = "needs a real nvim on PATH; spends no tokens and needs no display"]
+fn a_reveal_of_a_line_inside_a_closed_fold_starts_the_fold_on_the_row() {
+    let (mut c, listener, socket) = follow_case("reveal-row-own-fold");
+    let a = write_doc(&c, "a.md", &numbered(300));
+    edit(&mut c, &a);
+    c.nvim.command("set lines=50 columns=100");
+    c.nvim.command("botright split");
+    c.nvim.command("setlocal scrolloff=0 foldmethod=manual");
+    c.nvim.command("90,99fold");
+    let w = current_win(&mut c);
+    let first = screen_rows(&mut c, w, 1).0;
+    install(&mut c, &socket, false, &[], None);
+    follow(&mut c, true);
+    drain(&mut c, &listener);
+    let buf = buf_of(&mut c, &a);
+    assert!(applied(&op(&mut c, "reveal", reveal_on_row(buf, 96, first + 9, 44))));
+    let (top, held) = top_and_cursor(&mut c, w);
+    assert_eq!(top, 81, "nine rows above the fold, none for the fold itself");
+    assert!((90..=99).contains(&held), "the cursor is in the fold: {held}");
+    assert_eq!(
+        screen_rows(&mut c, w, 90).1,
+        first + 9,
+        "the fold starts on the row asked for"
+    );
+}
+
+#[test]
+#[ignore = "needs a real nvim on PATH; spends no tokens and needs no display"]
+fn a_view_reports_grid_rows_and_the_cursor_lines_screen_row_in_a_lower_split() {
+    let (mut c, listener, socket) = follow_case("view-rows");
+    let a = write_doc(&c, "a.md", &numbered(300));
+    edit(&mut c, &a);
+    c.nvim.command("set lines=50 columns=100");
+    c.nvim.command("botright split");
+    c.nvim.command("normal! 70Gzt5j");
+    let w = current_win(&mut c);
+    install(&mut c, &socket, false, &[], None);
+    follow(&mut c, true);
+    let lines = lines_within(&mut c.nvim, &listener, SETTLE);
+    let last = *views(&lines).last().expect("the lower split's view");
+    let grid_rows = c.nvim.lua("return vim.o.lines", vec![]).as_u64().unwrap();
+    let (first, row) = screen_rows(&mut c, w, 75);
+    assert!(first > 1, "the followed split starts below the grid's first row");
+    assert!(row > first, "the cursor is inside the followed split");
+    assert_eq!(last["cursor"]["line"], 75);
+    assert_eq!(last["rows"], grid_rows);
+    assert_eq!(last["cursor_row"], row);
+}
+
+#[test]
+#[ignore = "needs a real nvim on PATH; spends no tokens and needs no display"]
+fn a_view_uses_the_windows_first_row_when_the_cursor_line_starts_above_it() {
+    let (mut c, listener, socket) = follow_case("view-row-smoothscroll");
+    let mut doc = numbered(300);
+    doc[29] = "x".repeat(2000);
+    let a = write_doc(&c, "a.md", &doc);
+    edit(&mut c, &a);
+    c.nvim.command("botright split");
+    c.nvim.command("setlocal wrap smoothscroll scrolloff=0");
+    c.nvim.command("normal! 30Gzt");
+    c.nvim.command("normal! \u{5}");
+    let w = current_win(&mut c);
+    let (first, row) = screen_rows(&mut c, w, 30);
+    assert!(first > 1);
+    assert_eq!(row, 0, "the long cursor line starts above the visible window");
+    assert_eq!(top_and_cursor(&mut c, w).1, 30);
+    install(&mut c, &socket, false, &[], None);
+    follow(&mut c, true);
+    let lines = lines_within(&mut c.nvim, &listener, SETTLE);
+    let last = *views(&lines).last().expect("a partially scrolled cursor line's view");
+    assert_eq!(last["cursor_row"], first);
+}
+
+#[test]
+#[ignore = "needs a real nvim on PATH; spends no tokens and needs no display"]
+fn a_reveal_places_its_cursor_line_on_a_grid_row_with_wrap_folds_and_clamps() {
+    for kind in ["plain", "wrap", "fold", "scrolloff", "buffer-start"] {
+        let (mut c, listener, socket) = follow_case(&format!("reveal-row-{kind}"));
+        let mut doc = numbered(300);
+        if kind == "wrap" {
+            doc[93] = "x".repeat(80);
+            doc[94] = "x".repeat(80);
+        }
+        let a = write_doc(&c, "a.md", &doc);
+        edit(&mut c, &a);
+        c.nvim.command("set lines=50 columns=100");
+        c.nvim.command("botright split");
+        c.nvim
+            .command("setlocal scrolloff=0 wrap nonumber norelativenumber foldmethod=manual");
+        if kind == "wrap" {
+            c.nvim.command("vsplit");
+            c.nvim.command("vertical resize 30");
+        }
+        if kind == "fold" {
+            c.nvim.command("90,94fold");
+        }
+        if kind == "scrolloff" {
+            c.nvim.command("setlocal scrolloff=3");
+        }
+        let w = current_win(&mut c);
+        let first = screen_rows(&mut c, w, 1).0;
+        assert!(first > 1, "{kind}: rows count from the whole grid");
+        let (cursor, row, expected) = match kind {
+            "wrap" => (96, first + 7, first + 7),
+            "scrolloff" => (96, 1, first + 3),
+            "buffer-start" => (3, first + 8, first + 2),
+            _ => (96, first + 6, first + 6),
+        };
+        install(&mut c, &socket, false, &[], None);
+        follow(&mut c, true);
+        drain(&mut c, &listener);
+        let buf = buf_of(&mut c, &a);
+        assert!(
+            applied(&op(&mut c, "reveal", reveal_on_row(buf, cursor, row, 42))),
+            "{kind}"
+        );
+        let (top, held_cursor) = top_and_cursor(&mut c, w);
+        assert_eq!(held_cursor, cursor, "{kind}: the reveal's cursor");
+        assert_eq!(
+            screen_rows(&mut c, w, cursor).1,
+            expected,
+            "{kind}: the cursor line's grid row"
+        );
+        match kind {
+            "plain" => assert_eq!(top, 90),
+            "wrap" => {
+                let height = c
+                    .nvim
+                    .lua(
+                        "local w = ... return vim.api.nvim_win_text_height(w, { start_row = 93, end_row = 94 }).all",
+                        vec![w.into()],
+                    )
+                    .as_u64()
+                    .unwrap();
+                assert!(height > 2, "the two long lines really wrap");
+                assert_eq!(top, 93, "seven screen rows above the cursor include both wrapped lines");
+            }
+            "fold" => assert_eq!(top, 86, "the five folded lines take one screen row"),
+            "scrolloff" => assert_eq!(top, 93),
+            "buffer-start" => assert_eq!(top, 1),
+            _ => unreachable!(),
+        }
+        let lines = lines_within(&mut c.nvim, &listener, SETTLE);
+        let echo = views(&lines)
+            .into_iter()
+            .find(|l| l["token"] == 42)
+            .unwrap_or_else(|| panic!("{kind}: the echo: {lines:?}"));
+        assert_eq!(echo["cause"], "reveal", "{kind}");
+        assert_eq!(echo["cursor_row"], expected, "{kind}");
+    }
+}
+
 #[test]
 #[ignore = "needs a real nvim on PATH; spends no tokens and needs no display"]
 fn jump_lands_on_the_first_non_blank_and_makes_the_window_current() {
@@ -1560,6 +1807,10 @@ fn a_loaded_followed_buffer_with_no_window_still_reports_its_edits() {
     assert_eq!(left[0]["current"], false);
     assert_eq!(left[0]["top"], shown["top"], "the last position stands");
     assert_eq!(left[0]["tick"], shown["tick"]);
+    for key in ["rows", "cursor_row"] {
+        assert!(shown[key].is_u64(), "the window reported {key}");
+        assert_eq!(left[0][key], shown[key], "the last {key} stands without a window");
+    }
 
     // Moving about in the code buffer says nothing new about a.md.
     c.nvim.command("normal! G");

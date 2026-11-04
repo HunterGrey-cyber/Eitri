@@ -45,6 +45,11 @@ export interface EditorView {
   doc: DocPrefixes | null;
   /** The window's effective 'scrolloff', in screen lines; an older host sends none. */
   scrolloff?: number;
+  /** nvim's screen height in rows (its whole grid); an older host sends none. */
+  rows?: number;
+  /** The screen row (one-based, from the top of nvim's grid) on which the cursor's line starts; an older host sends
+   *  none. */
+  cursor_row?: number;
 }
 
 export interface TooLarge {
@@ -158,6 +163,8 @@ export function isEditorView(v: unknown): v is EditorView {
   if (v.cause !== "user" && v.cause !== "reveal") return false;
   if (v.token !== undefined && !isCount(v.token)) return false;
   if (v.scrolloff !== undefined && !isCount(v.scrolloff)) return false;
+  if (v.rows !== undefined && !isCount(v.rows)) return false;
+  if (v.cursor_row !== undefined && !isCount(v.cursor_row)) return false;
   return v.doc === null || isDoc(v.doc);
 }
 
@@ -195,7 +202,7 @@ export function follow(b: Bridge): Promise<{ filetypes: string[] }> {
 // `cursor` (the line nvim's cursor goes to, kept in view) is optional: an older host refuses it.
 export function reveal(
   b: Bridge,
-  a: { buf: number; line: number; token: number; cursor?: number },
+  a: { buf: number; line: number; token: number; cursor?: number; row?: number },
 ): Promise<{ applied: boolean }> {
   return verb(b, "editor.reveal", a, isApplied);
 }

@@ -262,6 +262,8 @@ local function send_view(st)
       cursor = { line = clamp(last.cursor.line, 1, count), col = last.cursor.col },
       cause = 'user',
       scrolloff = last.scrolloff,
+      rows = last.rows,
+      cursor_row = last.cursor_row,
     }
     st.last_view = msg
     send(st, msg)
@@ -269,6 +271,18 @@ local function send_view(st)
   end
   local top, fraction = top_of(w)
   local c = vim.api.nvim_win_get_cursor(w)
+  -- The screen row the cursor's line starts on. Under 'wrap' that is its first column's row, or the window's first
+  -- row when the line starts above the window ('smoothscroll'); without 'wrap' each line is one row, and its first
+  -- column may be scrolled out sideways, so the cursor's own row is the line's.
+  local cursor_row
+  if vim.wo[w].wrap then
+    cursor_row = vim.fn.screenpos(w, c[1], 1).row
+    if cursor_row == 0 then
+      cursor_row = vim.fn.win_screenpos(w)[1]
+    end
+  else
+    cursor_row = vim.fn.win_screenpos(w)[1] + vim.api.nvim_win_call(w, vim.fn.winline) - 1
+  end
   st.seq = st.seq + 1
   local msg = {
     v = 1,
@@ -287,6 +301,8 @@ local function send_view(st)
     cursor = { line = c[1], col = c[2] },
     cause = 'user',
     scrolloff = scrolloff_of(w),
+    rows = vim.o.lines,
+    cursor_row = cursor_row,
   }
   local r = st.reveal
   if r ~= nil and r.buf == buf and r.top == top and now() - r.at <= ECHO_MS then
@@ -665,6 +681,45 @@ local function place_cursor(w, want)
   end)
 end
 
+-- The top line that starts `cursor` on screen row `row` of nvim's grid, as near as the window allows. The rows
+-- above it respect 'scrolloff' and count lines as nvim draws them: wrapped lines take their rows, closed folds one
+-- (a cursor inside a closed fold starts on the fold's row). A line above too tall for the rows wanted is still taken
+-- when without it the cursor would sit within 'scrolloff' of the top, as long as the cursor stays inside the window:
+-- nvim would otherwise move the cursor off its line, and a whole line is all a top can start with.
+local function top_for_row(w, cursor, row)
+  local first = vim.fn.win_screenpos(w)[1]
+  local height = vim.api.nvim_win_get_height(w)
+  local so = scrolloff_of(w)
+  local most = math.max(so, height - 1 - so)
+  local want = clamp(row - first, so, most)
+  local top, above = cursor, 0
+  vim.api.nvim_win_call(w, function()
+    local own = vim.fn.foldclosed(cursor)
+    if own ~= -1 then
+      top = own
+    end
+    while top > 1 do
+      local l = top - 1
+      local fold = vim.fn.foldclosed(l)
+      local h, start = 1, l
+      if fold ~= -1 then
+        start = fold
+      else
+        h = vim.api.nvim_win_text_height(w, { start_row = l - 1, end_row = l - 1 }).all
+      end
+      if above + h > want then
+        if above < so and above + h <= most then
+          top = start
+        end
+        break
+      end
+      above = above + h
+      top = start
+    end
+  end)
+  return top
+end
+
 local function reveal(o)
   local st = state_of(o.owner)
   local buf = o.buf
@@ -672,7 +727,11 @@ local function reveal(o)
   if w == nil then
     return { applied = false }
   end
-  scroll_to(w, buf, clamp_line(buf, o.line))
+  local top_line = clamp_line(buf, o.line)
+  if o.row ~= nil and o.cursor ~= nil then
+    top_line = top_for_row(w, clamp_line(buf, o.cursor), o.row)
+  end
+  scroll_to(w, buf, top_line)
   if o.cursor ~= nil then
     place_cursor(w, clamp_line(buf, o.cursor))
   end

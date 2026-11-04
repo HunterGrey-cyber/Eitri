@@ -9,7 +9,8 @@ import { clickedRecently, lineAt, pickBlock } from "./current";
 import { buildIndex, lastLineAtOrBefore, lastTopAtOrBefore, measure, type Box } from "./lineindex";
 import { blockedText, BUFFER_CLOSED_TEXT, EDITOR_CLOSED_TEXT, EMPTY_TEXT, tooLargeText } from "./notices";
 import {
-  createThrottle, leader, lineToY, OwnTokens, REVEAL_THROTTLE_MS, scrollTarget, yToLine, type Leader,
+  createThrottle, leader, lineToY, OwnTokens, placeLine, REVEAL_THROTTLE_MS, rowAt, rowShare, scrollTarget, yToLine,
+  type Leader,
 } from "./sync";
 import { applyUpdate } from "./update";
 
@@ -24,9 +25,9 @@ interface Rendered { buf: number; tick: number; name: string; lines: string[]; b
 const docKey = (d: DocPrefixes | null) => (d ? `${d.root}\u0000${d.base}` : "");
 const INSTANT = "instant" as ScrollBehavior;
 
-/** The lines kept above the reading point when nvim does not say its 'scrolloff' (an older host): the agent panel's
- *  margin. */
-export const DEFAULT_RESERVE_LINES = 2;
+/** The fewest lines of the page's text kept above the reading point, whatever nvim's 'scrolloff': Vim's own
+ *  defaults.vim keeps 5, and nvim's 0 would leave the line being read on the view's top edge. */
+export const RESERVE_FLOOR_LINES = 5;
 /** The reading reserve never takes more than this share of the view, however large 'scrolloff' is. */
 const RESERVE_SHARE = 1 / 4;
 /** The line height assumed where the root has none to read (no layout). */
@@ -97,6 +98,10 @@ export class Preview {
   private revealedTop: number | null = null;
   /** The host refused a reveal's `cursor` (an older host): reveals carry only the top line from then on. */
   private noCursor = false;
+  /** The host refused a reveal's `row` (an older host): reveals place nvim by its top line from then on. */
+  private noRow = false;
+  /** The screen row the page's last reveal asked nvim to start the reading line on. */
+  private lastRow: number | undefined = undefined;
   /** The preview moved under its own lead since its last reveal: a reveal of where it is may still be owed. */
   private unsent = false;
   /** Until this time an edit jump (Enter, a double-click) owns nvim's cursor while the keys move to nvim: no scroll
@@ -176,11 +181,12 @@ export class Preview {
   onView(v: EditorView): void {
     const switched = this.view?.buf !== v.buf;
     const docChanged = this.rendered !== null && this.rendered.buf === v.buf && docKey(this.rendered.route) !== docKey(v.doc);
-    const reserveChanged = this.view?.scrolloff !== v.scrolloff;
+    const reserveChanged = this.view?.scrolloff !== v.scrolloff || this.view?.rows !== v.rows;
     this.view = v;
     if (switched) {
       this.target = null; this.anchor = null; this.pointer = false; this.lastReveal = null; this.lastCursor = null;
       this.revealedTop = null; this.asked = null; this.placed = null; this.unsent = false; this.revealer.cancel();
+      this.lastRow = undefined;
     }
     const echo = v.cause === "reveal" && v.token !== undefined && this.tokens.has(v.token);
     if (echo && this.asked !== null && v.token === this.asked.token) {
@@ -191,6 +197,7 @@ export class Preview {
     if (!echo) {
       this.lastReveal = v.top;
       this.lastCursor = v.cursor.line;
+      this.lastRow = undefined;
       if (v.top !== this.revealedTop) this.revealedTop = null;
     }
     if (switched || (!echo && this.lead() === "editor")) {
@@ -286,13 +293,16 @@ export class Preview {
   isCurrent(): boolean { return this.view?.current ?? true; }
   blockedCount(): number { return this.rendered?.blocked ?? 0; }
   hasKeys(): boolean { return this.keys; }
-  /** The reading reserve in px: nvim's 'scrolloff' in lines of the page's text (`DEFAULT_RESERVE_LINES` when nvim
-   *  does not say), at most a quarter of the view. The reading point sits this far below the top, as nvim's cursor
-   *  sits 'scrolloff' lines below its window's top, so the line being read is never on the top edge. */
+  /** The reading reserve in px: nvim's 'scrolloff' in nvim's rows (the view's height over nvim's screen rows, so that
+   *  nvim can start the line being read on the matching row; the page's line height from a host that does not say),
+   *  and at least `RESERVE_FLOOR_LINES` lines of the page's text, at most a quarter of the view. The reading point
+   *  sits this far below the top, so the line being read is never on the top edge. */
   reservePx(): number {
-    const lines = this.view?.scrolloff ?? DEFAULT_RESERVE_LINES;
-    const line = parseFloat(getComputedStyle(this.root).lineHeight) || FALLBACK_LINE_PX;
-    return Math.min(lines * line, window.innerHeight * RESERVE_SHARE);
+    const text = parseFloat(getComputedStyle(this.root).lineHeight) || FALLBACK_LINE_PX;
+    const rows = this.view?.rows;
+    const row = rows ? window.innerHeight / rows : text;
+    const lines = Math.max((this.view?.scrolloff ?? 0) * row, RESERVE_FLOOR_LINES * text);
+    return Math.min(lines, window.innerHeight * RESERVE_SHARE);
   }
   /** Where the reader reads: the reading reserve below the top. Near the document's start the reserve shrinks to
    *  what is scrolled away, as 'scrolloff' keeps no margin above a buffer's first line, so the first blocks can be
@@ -487,25 +497,46 @@ export class Preview {
 
   /* The page's own scrolls are instant (a smooth one would be read as the reader moving for its whole length) and
      guarded; a scroll to where the page already is fires no event, so it is not made and the guard not armed. With
-     `keepCursor`, the place is moved the least that keeps nvim's cursor block in view (`keepCursorIn`). Returns the
-     window position used, or null with nothing to place. */
-  private scrollToLine(L: number, keepCursor = false): number | null {
+     `forEditor` (nvim leads), the place is nvim's: its cursor line the same share down the view as that line's row is
+     down nvim's screen (`cursorShare`), so `L` is not used; from a host that does not say nvim's rows, line `L` at the
+     top moved the least that keeps nvim's cursor block in view (`keepCursorIn`). Returns the window position used, or
+     null with nothing to place. */
+  private scrollToLine(L: number, forEditor = false): number | null {
     const index = this.index();
     if (index.length === 0) return null;
     const max = this.scrollMax();
-    let y = scrollTarget(lineToY(index, L, max));
-    if (keepCursor) y = this.keepCursorIn(index, y, max);
+    const share = forEditor ? this.cursorShare() : null;
+    let y: number;
+    if (share !== null && this.view !== null) {
+      // A cursor line that is nvim's top line, scrolled part way out of the window ('smoothscroll'), starts above
+      // nvim's first row: the part still shown starts there, so the page puts that part at the share.
+      const v = this.view;
+      const shown = v.cursor.line - 1 + (v.cursor.line === v.top ? v.top_fraction : 0);
+      y = scrollTarget(placeLine(index, shown, share, window.innerHeight, max));
+    } else {
+      y = scrollTarget(lineToY(index, L, max));
+      if (forEditor) y = this.keepCursorIn(index, y, max);
+    }
     if (Math.abs(y - window.scrollY) >= 1) { this.guard.arm(y); window.scrollTo({ top: y, behavior: INSTANT }); }
     this.traceTop();
     return y;
   }
 
-  /* While nvim leads, the preview shows nvim's top line; rendered Markdown is taller than its source, so the line
-     being typed lower in nvim's window can sit below the preview's view. Like 'scrolloff', the least scroll then
-     keeps nvim's cursor line, as placed in the block that holds it (a block's lines share its height), inside the
-     view with the reading reserve; of a line taller than the view, its top part. Above the view it acts only once the
-     line is wholly out of it: nvim's top is the preview's top, so a line partly scrolled away there is nvim's own
-     top line. Only this direction: nothing is revealed back, so nothing loops. */
+  /* The share of nvim's screen above the row its cursor's line starts on, while the page shows nvim's buffer and the
+     view says both numbers; else null (a host that does not say them). */
+  private cursorShare(): number | null {
+    const v = this.view;
+    if (v === null || v.rows === undefined || v.cursor_row === undefined || v.rows < 1) return null;
+    if (this.rendered?.buf !== v.buf) return null;
+    return rowShare(v.cursor_row, v.rows);
+  }
+
+  /* From a host that does not say nvim's rows, while nvim leads the preview shows nvim's top line; rendered Markdown
+     is taller than its source, so the line being typed lower in nvim's window can sit below the preview's view. Like
+     'scrolloff', the least scroll then keeps nvim's cursor line, as placed in the block that holds it (a block's
+     lines share its height), inside the view with the reading reserve; of a line taller than the view, its top part.
+     Above the view it acts only once the line is wholly out of it: nvim's top is the preview's top, so a line partly
+     scrolled away there is nvim's own top line. Only this direction: nothing is revealed back, so nothing loops. */
   private keepCursorIn(index: Box[], y: number, max: number): number {
     const line = this.editorCursorLine();
     if (line === null) return y;
@@ -564,21 +595,30 @@ export class Preview {
     const line = Math.max(1, Math.floor(yToLine(index, window.scrollY)) + 1);
     const reading = this.noCursor || !this.keys || !withCursor ? null : lineAt(index, this.readingY());
     const cursor = reading === null ? undefined : reading + 1;
+    // With the reading line, the screen row nvim starts it on: the same share down nvim's screen as the line's top is
+    // down the view, so the two sides show it at the same height.
+    const rows = this.view?.buf === this.rendered.buf ? this.view.rows : undefined;
+    const row = reading === null || this.noRow || !rows ? undefined
+      : rowAt(lineToY(index, reading, Number.POSITIVE_INFINITY) - window.scrollY, window.innerHeight, rows);
     this.traceTop();
-    if (line === this.lastReveal && (cursor === undefined || cursor === this.lastCursor)) return;
+    const same = cursor === undefined || (cursor === this.lastCursor && row === this.lastRow);
+    if (line === this.lastReveal && same) return;
     this.lastReveal = line;
     this.revealedTop = line;
-    if (cursor !== undefined) this.lastCursor = cursor;
+    if (cursor !== undefined) { this.lastCursor = cursor; this.lastRow = row; }
     const token = this.tokens.next();
     if (cursor !== undefined) this.asked = { token, cursor };
-    trace("reveal", cursor === undefined ? { line, token } : { line, cursor, token });
+    trace("reveal", cursor === undefined ? { line, token } : row === undefined ? { line, cursor, token }
+      : { line, cursor, row, token });
     const buf = this.rendered.buf;
-    const args = cursor === undefined ? { buf, line, token } : { buf, line, token, cursor };
+    const args = cursor === undefined ? { buf, line, token } : row === undefined ? { buf, line, token, cursor }
+      : { buf, line, token, cursor, row };
     reveal(this.bridge, args).catch((error: unknown) => {
-      // A host from before `cursor` refuses the argument and moves nothing: reveal the top alone from now on, and
-      // send this place again without it unless nvim has shown another top since or an edit jump owns its cursor.
+      // A host from before `row` (or `cursor`) refuses the argument and moves nothing: from now on reveals go without
+      // it, and this place goes again so, unless nvim has shown another top since or an edit jump owns its cursor.
       if (cursor === undefined || (error as { code?: unknown } | null)?.code !== "bad_request") return;
-      this.noCursor = true;
+      if (row !== undefined) this.noRow = true;
+      else this.noCursor = true;
       if (this.lastReveal !== line || this.rendered?.buf !== buf || this.editJumping()) return;
       this.lastReveal = null;
       this.sendReveal(true);

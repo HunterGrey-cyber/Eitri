@@ -1,5 +1,5 @@
 [English](markdown-preview.md) | 简体中文
-<!-- translated-from: markdown-preview.md sha256=91343e5813acc90b395eba09de24412fb6f71060a2e0516343d3e24b85856b90 -->
+<!-- translated-from: markdown-preview.md sha256=9d46586f077a16d5734e77fcdbc85c1057f51cd4089316dae0f2efb2dc6c0606 -->
 
 # Markdown 预览
 
@@ -60,14 +60,13 @@ eitri.plugin.load("markdown", { auto = true })
 <a id="scrolling-together"></a>
 ## 同步滚动
 
-Neovim 的窗口和预览的顶部显示同一行源码，经过折叠、很长的自动换行、很长的代码块和稍后才加载的图片时也是如此。哪一边拿着按键，哪一边带头：
+预览让你所在的那一行和 Neovim 里保持在同一高度：Neovim 光标所在的行在预览里往下的比例，和它在 Neovim 屏幕上往下的比例相同（markdown-preview.nvim 把这种方式叫 `relative` 滚动），经过折叠、很长的自动换行、很长的代码块和稍后才加载的图片时也是如此。在 Eitri 的窗口里左右并排时，两边在屏幕上就是同一高度；在终端里的 Neovim 旁边，预览窗口和终端顶边对齐、一样高时也是。哪一边拿着按键，哪一边带头：
 
-- 按键在 Neovim 里（或者在预览以外的任何地方）时，在 Neovim 里滚动和跳转会带动预览，预览的边栏里有一条竖线标出 Neovim 光标所在的行。
-- 按键在预览里时，滚动预览会带动 Neovim 的窗口，Neovim 的光标也会跟着你在预览里正在读的那一行，所以离开预览时，Neovim 停在同一个位置，光标就在那一行上。如果 Neovim 的 `scrolloff` 不允许光标停在那一行而不滚动，光标会停在最近的、不用滚动的那一行；Neovim 的窗口不会因此移动。离开时还在进行的滚动会立即结束，并把结束的位置告诉 Neovim。如果离开前没有滚动过，就什么也不告诉 Neovim，它的光标留在原处。
-- 你正在读的那一行在预览顶部往下几行处，就像 Neovim 的光标在窗口顶部往下 `scrolloff` 行处一样：预览在它上面留出的行数等于你的 Neovim 的 `scrolloff`（Neovim 没有告诉时为两行），最多是视图的四分之一。在文档开头没有这样的空间，和 Neovim 一样。
-- 回到 Neovim 后，如果你在 Neovim 里还没有移动过，Neovim 的第一次移动不会让预览跳到某个整行：预览停在你离开时的位置，即使是在一个很长的自动换行段落中间。
+- 按键在 Neovim 里（或者在预览以外的任何地方）时，在 Neovim 里移动和滚动会带动预览，没有让 Neovim 滚动的光标移动也会，预览的边栏里有一条竖线标出 Neovim 光标所在的行。到了文档的开头和结尾，预览停在它的两端。
+- 按键在预览里时，滚动预览会带动 Neovim 的窗口，让你在预览里正在读的那一行在 Neovim 里也处在同一高度，Neovim 的光标就在这一行上，所以离开预览时，Neovim 停在同一个位置，光标就在那一行上。如果 Neovim 的 `scrolloff` 不允许光标停在那一行而不滚动，光标会停在最近的、不用滚动的那一行；Neovim 的窗口不会因此移动。离开时还在进行的滚动会立即结束，并把结束的位置告诉 Neovim。如果离开前没有滚动过，就什么也不告诉 Neovim，它的光标留在原处。
+- 你正在读的那一行在预览顶部往下几行处，不会贴着顶边：至少留出预览里五行文字的高度（Vim 自己的默认设置留五行；Neovim 默认的 `scrolloff` 是 0），你的 Neovim 的 `scrolloff` 留的行更多时就留得更多，最多是视图的四分之一。在文档开头没有这样的空间，和 Neovim 一样。
+- 回到 Neovim 后，在你在 Neovim 里移动之前，什么都不会动。
 - 进入预览时，如果 Neovim 光标所在的块在屏幕上，它就成为当前块，所以 `yy` 和 `Enter` 作用在你刚才编辑的内容上。光标在任何块之外的一行上（比如段落之间的空行）时，离它最近的块成为当前块，`Enter` 仍然让 Neovim 的光标留在它自己那一行。
-- Neovim 带头时，预览会让 Neovim 光标所在的行保持可见：渲染后的文字比 Neovim 里的高，那一行快要落到预览下方时，预览只滚动必要的距离把它显示出来。
 - 用鼠标滚轮滚动预览，即使按键在 Neovim 里，也会带动 Neovim 的窗口；这时 Neovim 的光标只按它的 `scrolloff` 需要的那样移动。Neovim 自己的下一次移动会把带头的位置拿回来。
 
 <a id="reading-with-the-keyboard"></a>
