@@ -62,7 +62,7 @@ pub struct Embed {
 }
 
 impl Embed {
-    /// Runs `nvim --clean --embed --headless -n -i NONE <extra_args>` in `dir`, with `env` added and
+    /// Runs `nvim --clean --embed --headless -n -i NONE <extra_args>` (without `-n` if `env` names `EMBED_KEEP_SWAP`) in `dir`, with `env` added and
     /// every XDG directory pointed under `dir`, so nothing of the user's reaches it.
     pub fn start(dir: &Path, extra_args: &[&str], env: &[(&str, &str)]) -> Embed {
         Embed::start_under_umask(dir, extra_args, env, None)
@@ -95,7 +95,13 @@ impl Embed {
                 command.env_remove(name);
             }
         }
-        command.args(["--clean", "--embed", "--headless", "-n", "-i", "NONE"]);
+        // `EMBED_KEEP_SWAP` in `env` drops `-n`, for a test of what swap files do.
+        let keep_swap = env.iter().any(|(name, _)| *name == "EMBED_KEEP_SWAP");
+        command.args(["--clean", "--embed", "--headless"]);
+        if !keep_swap {
+            command.arg("-n");
+        }
+        command.args(["-i", "NONE"]);
         command.args(extra_args);
         for (k, v) in env {
             command.env(k, v);

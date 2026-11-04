@@ -45,6 +45,21 @@
 //! under `pcall` with its window and buffer checked first: a reload's autocommands may close a window
 //! or wipe a buffer the loop has not reached, and an error in a scheduled callback is a message that
 //! stops nvim at a hit-enter prompt.
+//!
+//! Two more cases answer with a message instead of a reload, and the timer keeps them out too:
+//!
+//! - A shown file that **no longer exists** is `E211`; in Normal mode nvim then pauses for a second,
+//!   once per deletion (a name too long for the command line asks for a key). The timer stats the file
+//!   first and does not check a buffer whose file is gone; when the file comes back the next tick checks
+//!   it again and nvim reloads it.
+//! - A file **created after its buffer was opened on a missing path** is `W13`, a dialog that takes the
+//!   next key whatever `autoread` says. Lua cannot see nvim's mark for such a buffer, but it holds one
+//!   empty line, so a buffer that holds one empty line is read again with `:edit` the first time its file is
+//!   there after it was missing, and at first sight; every other buffer goes to `checktime`. The re-read runs
+//!   narrowed (no swap-file dialog, no enter or leave events, the options it sets put back), only for a
+//!   regular file (opening a FIFO blocks), and the buffer counts as seen only once it has run. A name that
+//!   is not a path (`term://`, `oil://`) and a `buftype` other than `""` are not looked at. One `fs_stat` per
+//!   shown buffer per tick, at most.
 
 /// How often nvim checks. Each tick stats the file of each buffer shown in a window, so this is a
 /// handful of syscalls a second, and one second is far below the time it takes to notice a stale buffer.
@@ -88,7 +103,7 @@ mod tests {
 
     #[test]
     fn reload_cmd_and_its_snippet_are_byte_identical_to_today() {
-        const SNIPPET: &str = r#"_G.eitri_reload_timer = vim.uv.new_timer(); local t = _G.eitri_reload_timer; _G.eitri_reload_timer:start(1000, 1000, function() vim.schedule(function() local seen = {} for _, w in ipairs(vim.api.nvim_list_wins()) do pcall(function() if not vim.api.nvim_win_is_valid(w) then return end local b = vim.api.nvim_win_get_buf(w) if seen[b] or not vim.api.nvim_buf_is_valid(b) then return end seen[b] = true if vim.bo[b].modified then return end local ar = vim.api.nvim_get_option_value('autoread', { buf = b }) if ar == nil or ar == -1 then ar = vim.go.autoread end if ar ~= true and ar ~= 1 then return end vim.cmd('checktime ' .. b) end) end end) end); return function() if not t:is_closing() then t:stop(); t:close() end; if _G.eitri_reload_timer == t then _G.eitri_reload_timer = nil end end"#;
+        const SNIPPET: &str = r#"_G.eitri_reload_timer = vim.uv.new_timer(); local t = _G.eitri_reload_timer; local files = {} local function reread(b) local function put(name, value) vim.api.nvim_cmd({ cmd = "set", args = { name .. "=" .. vim.fn.escape(value, " \\|\"") }, mods = { noautocmd = true } }, {}) end local function flag(name, on) vim.api.nvim_cmd({ cmd = "set", args = { (on and "" or "no") .. name }, mods = { noautocmd = true } }, {}) end local short, ignore, chdir = vim.go.shortmess, vim.go.eventignore, vim.go.autochdir local readonly, listed = vim.bo[b].readonly, vim.bo[b].buflisted local ok = pcall(function() put("shortmess", short .. "A") vim.go.eventignore = (ignore == "" and "" or ignore .. ",") .. "BufEnter,BufLeave,WinEnter,WinLeave" flag("autochdir", false) vim.api.nvim_buf_call(b, function() vim.cmd("silent keepalt keepjumps edit") end) end) pcall(put, "shortmess", short) pcall(function() vim.go.eventignore = ignore end) pcall(flag, "autochdir", chdir) pcall(function() vim.api.nvim_buf_call(b, function() if readonly and not vim.bo[b].readonly then vim.api.nvim_cmd({ cmd = "setlocal", args = { "readonly" }, mods = { noautocmd = true } }, {}) end if not listed and vim.bo[b].buflisted then vim.api.nvim_cmd({ cmd = "setlocal", args = { "nobuflisted" }, mods = { noautocmd = true } }, {}) end end) end) return ok end local function checkable(b) if vim.bo[b].buftype ~= "" then return nil end local name = vim.api.nvim_buf_get_name(b) if name == "" or name:find("^%a[%w+.-]*://") then return nil end local s = files[b] if not s or s.name ~= name then s = { name = name } files[b] = s end local blank = vim.api.nvim_buf_line_count(b) == 1 and vim.api.nvim_buf_get_lines(b, 0, 1, false)[1] == "" local stat = vim.uv.fs_stat(name) if not stat then s.seen = false return nil end if blank and not s.seen and stat.type == "file" then return "reread" end s.seen = true return "check" end; _G.eitri_reload_timer:start(1000, 1000, function() vim.schedule(function() for b in pairs(files) do if not vim.api.nvim_buf_is_valid(b) then files[b] = nil end end local seen = {} for _, w in ipairs(vim.api.nvim_list_wins()) do pcall(function() if not vim.api.nvim_win_is_valid(w) then return end local b = vim.api.nvim_win_get_buf(w) if seen[b] or not vim.api.nvim_buf_is_valid(b) then return end seen[b] = true if vim.bo[b].modified then return end local ar = vim.api.nvim_get_option_value('autoread', { buf = b }) if ar == nil or ar == -1 then ar = vim.go.autoread end if ar ~= true and ar ~= 1 then return end local how = checkable(b) if how == 'reread' then if reread(b) then files[b].seen = true end elseif how then vim.cmd('checktime ' .. b) end end) end end) end); return function() if not t:is_closing() then t:stop(); t:close() end; if _G.eitri_reload_timer == t then _G.eitri_reload_timer = nil end end"#;
         assert_eq!(include_str!("buffer_reload.lua").as_bytes(), SNIPPET.as_bytes());
         assert_eq!(RELOAD_CMD.as_bytes(), [b"lua ".as_slice(), SNIPPET.as_bytes()].concat());
     }
@@ -142,6 +157,10 @@ mod tests {
         assert!(RELOAD_CMD.contains("pcall(function()"), "{RELOAD_CMD}");
         assert!(RELOAD_CMD.contains("nvim_win_is_valid(w)"), "{RELOAD_CMD}");
         assert!(RELOAD_CMD.contains("nvim_buf_is_valid(b)"), "{RELOAD_CMD}");
+        assert!(RELOAD_CMD.contains("vim.uv.fs_stat(name)"), "{RELOAD_CMD}");
+        assert!(RELOAD_CMD.contains("vim.cmd('checktime ' .. b)"), "{RELOAD_CMD}");
+        assert!(RELOAD_CMD.contains("keepalt keepjumps edit"), "{RELOAD_CMD}");
+        assert!(RELOAD_CMD.contains("stat.type == \"file\""), "{RELOAD_CMD}");
     }
 
     /// The interval is stated once and used once. A literal in the Lua that drifts from the
