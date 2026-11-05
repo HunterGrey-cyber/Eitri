@@ -1,10 +1,18 @@
 //! Read-only summaries of agent tabs, shared by windows and command-line readers.
 
 pub mod control;
+#[cfg(target_os = "linux")]
+pub mod liveness;
+pub mod publish;
+#[cfg(target_os = "linux")]
+pub mod read;
 pub mod row;
 pub mod state;
 pub mod wire;
 
+pub use publish::{agents_dir, new_instance, Publisher};
+#[cfg(target_os = "linux")]
+pub use read::{scan_once, Reader, ReaderEvent};
 pub use row::{Background, Change, Departed, GoneWhy, LabelFrom, Needs, ProcessFile, ProjectRef, Row, View, WindowRef};
 pub use state::{derive, Class, EndedHow, State, TabInputs};
 
