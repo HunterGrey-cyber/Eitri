@@ -72,6 +72,28 @@ local function ended(kind, code, stderr)
   return last, vim.log.levels.ERROR
 end
 
+-- A takeover window ends while the terminal's UI is on its way back from the waiting room. A notice wider than the
+-- command line raises the hit-enter prompt then, and nvim waits for a key with the terminal blank (it cannot redraw
+-- while it waits) and answers no ordinary request. So the notice is cut to what fits: first the log is named by its
+-- file alone, then the text is cut at the width.
+local function one_line(text)
+  local width = vim.v.echospace
+  local function fits(s) return vim.fn.strdisplaywidth(s) <= width end
+  if type(width) ~= "number" or fits(text) then return text end
+  local head, file = text:match("^(.-; log: ).-([^/]+)$")
+  if head then
+    text = head .. file
+    if fits(text) then return text end
+  end
+  local n = math.max(width, 0)
+  local cut = vim.fn.strcharpart(text, 0, n)
+  while n > 0 and not fits(cut) do
+    n = n - 1
+    cut = vim.fn.strcharpart(text, 0, n)
+  end
+  return cut
+end
+
 function M.page(id, dir)
   if type(rawget(_G, "__eitri_window")) == "table" then
     vim.notify("this window opens pages itself: press the prefix and the page's key", vim.log.levels.ERROR)
@@ -143,8 +165,14 @@ function M.open(dir)
       if code ~= 0 then
         vim.schedule(function()
           if torn then return end
-          local last = vim.trim(table.concat(stderr, "\n")):match("([^\n]+)$")
-          vim.notify(last or ("eitri open: exited with code " .. code), vim.log.levels.ERROR)
+          if code == 64 then
+            -- A refusal: nothing moved, the terminal's UI never left, and its line is shown whole.
+            local last = vim.trim(table.concat(stderr, "\n")):match("([^\n]+)$")
+            vim.notify(last or ("eitri open: exited with code " .. code), vim.log.levels.ERROR)
+            return
+          end
+          local text, level = ended("open", code, stderr)
+          vim.notify(one_line(text), level)
         end)
       end
     end,
