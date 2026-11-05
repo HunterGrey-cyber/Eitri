@@ -44,6 +44,8 @@ impl ConLayout {
 }
 /// At the minimum share, a split can hold at most twenty children.
 pub const MAX_CHILDREN: usize = 20;
+/// Explicit module heights are small strips, in logical pixels.
+pub const FIXED_HEIGHT_PX: std::ops::RangeInclusive<i32> = 16..=200;
 /// How far below `MIN_RATIO` a share may sit and still count as the minimum: trading shares in `f32`
 /// leaves a share at the minimum a rounding error short of it. The Lua grammar accepts the same range,
 /// so a layout the model holds always reads back from its exported text.
@@ -63,11 +65,18 @@ pub struct Pin {
 pub struct Child {
     pub node: Node,
     pub share: f32,
+    /// A vertical slot's explicit height, independent of its fallback share.
+    pub fixed_px: Option<i32>,
     pub pin: Option<Pin>,
 }
 impl Child {
     pub fn new(node: Node, share: f32) -> Child {
-        Child { node, share, pin: None }
+        Child {
+            node,
+            share,
+            fixed_px: None,
+            pin: None,
+        }
     }
 }
 #[derive(Debug, Clone)]
@@ -128,6 +137,8 @@ pub enum ConFault {
     OneChild,
     Focus(usize),
     Pin(i32),
+    /// A fixed height outside `FIXED_HEIGHT_PX`.
+    FixedHeight(i32),
     TooMany(usize),
 }
 impl Node {
@@ -317,6 +328,11 @@ impl Con {
             return Err(ConFault::ShareSum(sum));
         }
         for ch in &self.children {
+            if let Some(px) = ch.fixed_px {
+                if !FIXED_HEIGHT_PX.contains(&px) {
+                    return Err(ConFault::FixedHeight(px));
+                }
+            }
             if let Some(Pin { px: Some(px) }) = ch.pin {
                 if px < 0 {
                     return Err(ConFault::Pin(px));
@@ -526,6 +542,9 @@ mod tests {
         let mut pinned = two(0.5, 0.5);
         pinned.children[1].pin = Some(Pin { px: Some(-1) });
         assert_eq!(pinned.check(true), Err(ConFault::Pin(-1)));
+        let mut tall = two(0.5, 0.5);
+        tall.children[1].fixed_px = Some(201);
+        assert_eq!(tall.check(true), Err(ConFault::FixedHeight(201)));
         assert_eq!(Con::new(ConLayout::SplitV, vec![]).check(true), Err(ConFault::Empty));
         let one = Con::new(ConLayout::SplitV, vec![Child::new(leaf("agent"), 1.0)]);
         assert_eq!(one.check(true), Ok(()));

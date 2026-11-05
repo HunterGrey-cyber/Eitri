@@ -2703,8 +2703,8 @@ impl AgentSessionProjection {
             // Both endings clear `active_turn_id` and `cli_unseen_busy`, and for one reason: no
             // `TurnCompleted` is ever coming, for the panel's turn or for work it could not show. Leaving it set is what turned a dead session into a spinner that never stops
             // -- `App.tsx` derives `turnInProgress` from exactly this field, and
-            // `supervisor_client::derive_status` reports `Working` from it ahead of any status
-            // check, so a killed provider showed up as a busy agent in the dashboard too. This is
+            // an agent summary that reads this field reports `Working` from it ahead of any status
+            // check, so a killed provider showed up as a busy agent there too. This is
             // not a synthesized `TurnCompleted`: no completion is recorded, no outcome is invented,
             // and no result text appears. The turn simply stops being in progress, because it is
             // not -- and the transcript says so where it stopped (`record_lost_turn`), which states

@@ -638,6 +638,11 @@ class TreeEqualityTests(unittest.TestCase):
             "THIRD-PARTY-LICENSES": b"...\n",
             "SOURCE": b"...\n",
         }
+        for web, output in (("plugin-kit/agents", "dist/agents.js"),
+                            *((f"plugins/{name}/web", "dist/index.html")
+                              for name in ("agents-strips", "agents-top", "agents-pass"))):
+            additions[f"{web}/{output}"] = b"bundle\n"
+            additions[f"{web}/dist/.inputs-sha256"] = b"a" * 64
         for relpath, data in additions.items():
             path = os.path.join(extracted, relpath)
             os.makedirs(os.path.dirname(path), exist_ok=True)
@@ -1028,6 +1033,10 @@ def _fake_elf(text=b""):
 
 # A shipped plugin directory as the release lays it out: the tracked manifest plus the built site, without the
 # build's fingerprint.
+PLUGIN_NAMES = ("markdown", "agents-strips", "agents-top", "agents-pass")
+AGENTS_BUNDLES = (("plugin-kit/agents", "dist/agents.js"),
+                  *((f"plugins/{name}/web", "dist/index.html") for name in PLUGIN_NAMES[1:]))
+
 PLUGIN_MANIFEST = b'id = "markdown"\ntitle = "Markdown preview"\n'
 PLUGIN_SITE = {
     "eitri-plugin.toml": PLUGIN_MANIFEST,
@@ -1049,9 +1058,13 @@ class PluginTreeTests(unittest.TestCase):
         self.deb = os.path.join(self.root, "deb")
         self.rpm = os.path.join(self.root, "rpm")
         self.repo = os.path.join(self.root, "repo")
-        _plant(self.repo, {"plugins/markdown/eitri-plugin.toml": PLUGIN_MANIFEST})
-        for base, rel_dir in self.places():
-            _plant(os.path.join(base, rel_dir), PLUGIN_SITE)
+        for name in PLUGIN_NAMES:
+            _plant(self.repo, {f"plugins/{name}/eitri-plugin.toml": PLUGIN_MANIFEST.replace(b"markdown", name.encode())})
+            for base, rel_dir in ((self.tarball, rc.tarball_plugin_dir(name)),
+                                  (self.deb, rc.package_plugin_dir(name)),
+                                  (self.rpm, rc.package_plugin_dir(name))):
+                _plant(os.path.join(base, rel_dir),
+                       {rel: data.replace(b"markdown", name.encode()) for rel, data in PLUGIN_SITE.items()})
 
     def places(self):
         return ((self.tarball, rc.tarball_plugin_dir("markdown")),
@@ -1066,7 +1079,7 @@ class PluginTreeTests(unittest.TestCase):
         return rc.plugin_tree_problems(self.tarball, self.deb, self.rpm, self.repo)
 
     def test_the_places_and_the_shipped_plugins(self):
-        self.assertEqual(rc.PLUGIN_TREES, (("markdown", "plugins/markdown/eitri-plugin.toml"),))
+        self.assertEqual(rc.PLUGIN_TREES, tuple((name, f"plugins/{name}/eitri-plugin.toml") for name in PLUGIN_NAMES))
         self.assertEqual(rc.tarball_plugin_dir("markdown"), "lib/eitri/plugins/markdown")
         self.assertEqual(rc.package_plugin_dir("markdown"), "usr/share/eitri/plugins/markdown")
 
@@ -1121,9 +1134,9 @@ class PluginTreeTests(unittest.TestCase):
         self.assertIn("plugin tree markdown: web/dist/.inputs-sha256 is missing from: tarball, .rpm", problems)
 
     def test_a_missing_tree_is_named_with_its_place(self):
-        shutil.rmtree(os.path.join(self.rpm, "usr"))
+        shutil.rmtree(os.path.join(self.rpm, rc.package_plugin_dir("markdown")))
         self.assertEqual(self.problems(), ["plugin tree markdown: the .rpm has no usr/share/eitri/plugins/markdown/"])
-        shutil.rmtree(os.path.join(self.tarball, "lib"))
+        shutil.rmtree(os.path.join(self.tarball, rc.tarball_plugin_dir("markdown")))
         self.assertEqual(self.problems(), [
             "plugin tree markdown: the tarball has no lib/eitri/plugins/markdown/",
             "plugin tree markdown: the .rpm has no usr/share/eitri/plugins/markdown/",
@@ -1133,6 +1146,35 @@ class PluginTreeTests(unittest.TestCase):
         os.remove(os.path.join(self.repo, "plugins", "markdown", "eitri-plugin.toml"))
         self.assertEqual(self.problems(),
                          [f"plugin tree markdown: plugins/markdown/eitri-plugin.toml is not in {self.repo}"])
+
+    def test_each_agents_face_requires_its_page_in_every_artifact(self):
+        for name in PLUGIN_NAMES[1:]:
+            for base, directory, label in ((self.tarball, rc.tarball_plugin_dir(name), "tarball"),
+                                            (self.deb, rc.package_plugin_dir(name), ".deb"),
+                                            (self.rpm, rc.package_plugin_dir(name), ".rpm")):
+                path = os.path.join(base, directory, "web/dist/index.html")
+                os.remove(path)
+                self.assertIn(f"plugin tree {name}: the {label} has no web/dist/index.html", self.problems())
+                _plant(os.path.dirname(path), {"index.html": PLUGIN_SITE["web/dist/index.html"]})
+
+    def test_the_public_manifest_carries_sources_and_excludes_build_outputs(self):
+        import fnmatch
+        manifest = os.path.join(_PACKAGING, "..", "publish", "manifest.txt")
+        if not os.path.isfile(manifest):
+            self.skipTest("the public export manifest is not in this checkout")
+        with open(manifest, encoding="utf-8") as f:
+            rules = [line.split() for line in f if line.startswith(("include ", "exclude "))]
+
+        def included(path):
+            return next((verb == "include" for verb, pattern in rules if fnmatch.fnmatchcase(path, pattern)), False)
+
+        for root in ("plugin-kit/agents", *(f"plugins/{name}/web" for name in PLUGIN_NAMES[1:])):
+            for rel in ("package.json", "package-lock.json", "src/index.ts", "build.mjs"):
+                self.assertTrue(included(f"{root}/{rel}"), (root, rel))
+            for rel in ("dist/index.html", "dist/.inputs-sha256", "node_modules/x/index.js"):
+                self.assertFalse(included(f"{root}/{rel}"), (root, rel))
+        for name in PLUGIN_NAMES[1:]:
+            self.assertTrue(included(f"plugins/{name}/eitri-plugin.toml"), name)
 
 
 class BinaryAssetTreeTests(unittest.TestCase):
@@ -1181,7 +1223,7 @@ class BinaryAssetTreeTests(unittest.TestCase):
         rename of one without the other would otherwise fail only at release time)."""
         repo = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
         self.assertEqual(sorted(rc.TRACKED_ART),
-                         sorted(["desktop", "panel-desktop", "page-desktop", "legacy-desktop"]
+                         sorted(["desktop", "panel-desktop", "page-desktop", "legacy-desktop", "legacy-supervisor"]
                                 + [r for r in rc.package_roles() if r.startswith(("icon-", "plugin-", "gnome-ext-"))]))
         for role, path in rc.TRACKED_ART.items():
             self.assertTrue(os.path.isfile(os.path.join(repo, path)), (role, path))
@@ -1266,6 +1308,19 @@ class BinaryAssetTreeTests(unittest.TestCase):
             # The sha256 of packaging/eitri.desktop from the tree 0.2.0 is cut from.
             self.assertEqual(hashlib.sha256(f.read()).hexdigest(),
                              "b58906bcaf3da9e06b3031b0b36d9298e11a7c227c90e36b50c0b7b68aa7f343")
+
+    def test_the_tarball_alone_carries_the_placeholder_0_2_0s_installer_wants_for_the_dashboard(self):
+        """0.2.0's install.sh also refuses a tarball with no executable lib/eitri/eitri-supervisor. The
+        tarball ships a placeholder there (packaging/legacy/eitri-supervisor); no package ships it, and
+        this release's installer removes it from the archive it stages."""
+        top = "eitri-1.0.0-x86_64-linux/"
+        self.assertEqual(rc.tarball_roles("1.0.0")["legacy-supervisor"], top + "lib/eitri/eitri-supervisor")
+        for roles in (rc.package_roles(), rc.deb_roles()):
+            self.assertNotIn("legacy-supervisor", roles)
+        self.assertEqual(rc.TRACKED_ART["legacy-supervisor"], "packaging/legacy/eitri-supervisor")
+        self.assertNotIn("legacy-supervisor", rc.RELEASE_BINARIES)
+        repo = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+        self.assertTrue(os.access(os.path.join(repo, "packaging", "legacy", "eitri-supervisor"), os.X_OK))
 
     def test_a_package_without_an_icon_or_with_the_old_desktop_name_fails(self):
         roles = rc.package_roles()
@@ -1465,8 +1520,10 @@ class EitriSourceTreeTests(unittest.TestCase):
                                                     "package.json": b"{}\n"})
         self.src, _ = _init_git_repo({"Cargo.toml": b"[workspace]\n", "agent-ui/web/src/a.ts": b"x\n",
                                       "plugin-kit/keys/src/a.ts": b"k\n", "plugin-kit/keys/build.mjs": b"b\n",
+                                      **{f"{web}/src/main.ts": b"a\n" for web, _ in AGENTS_BUNDLES},
                                       "packaging/install.sh": b"# names claude-agent-sdk\n",
-                                      "plugins/markdown/eitri-plugin.toml": PLUGIN_MANIFEST,
+                                      **{f"plugins/{name}/eitri-plugin.toml": PLUGIN_MANIFEST.replace(b"markdown", name.encode())
+                                         for name in PLUGIN_NAMES},
                                       "plugins/markdown/web/src/main.ts": b"m\n"})
         fork, _ = _init_git_repo({"Cargo.toml": b"[package]\n"})
         shutil.copytree(fork, os.path.join(self.src, "neovide"))
@@ -1501,6 +1558,23 @@ class EitriSourceTreeTests(unittest.TestCase):
                            "plugins/markdown/web/dist/preview.js": b"export {};\n"})
         _plant(self.root, {"plugins/markdown/web/dist/.inputs-sha256":
                            rc.web_bundle_fingerprint(self.plugin_web).encode()})
+
+        for web, output in AGENTS_BUNDLES:
+            _plant(self.root, {f"{web}/{output}": b"bundle\n"})
+            _plant(self.root, {f"{web}/dist/.inputs-sha256":
+                               rc.web_bundle_fingerprint(os.path.join(self.root, web)).encode()})
+
+    def test_agents_bundles_and_fingerprints_are_required(self):
+        for web, output in AGENTS_BUNDLES:
+            self.assertIn((web, output), rc.WEB_BUNDLES)
+            path = os.path.join(self.root, web, output)
+            os.remove(path)
+            self.assertTrue(any(f"has no {web}/{output}" in problem for problem in self.check()), web)
+            _plant(self.root, {f"{web}/{output}": b"bundle\n"})
+            _plant(self.root, {f"{web}/dist/.inputs-sha256": b"0" * 64})
+            self.assertTrue(any(web in problem for problem in self.check()), web)
+            _plant(self.root, {f"{web}/dist/.inputs-sha256":
+                               rc.web_bundle_fingerprint(os.path.join(self.root, web)).encode()})
 
     def check(self):
         sha = hashlib.sha256(self.SKIA_BYTES).hexdigest()
@@ -1617,7 +1691,9 @@ class ReleaseAssetsTests(unittest.TestCase):
         })
         cls.src, _ = _init_git_repo({"Cargo.toml": b"[workspace]\n", "agent-ui/web/src/a.ts": b"x\n",
                                      "plugin-kit/keys/src/a.ts": b"k\n",
-                                     "plugins/markdown/eitri-plugin.toml": PLUGIN_MANIFEST,
+                                     **{f"{web}/src/main.ts": b"a\n" for web, _ in AGENTS_BUNDLES},
+                                     **{f"plugins/{name}/eitri-plugin.toml": PLUGIN_MANIFEST.replace(b"markdown", name.encode())
+                                         for name in PLUGIN_NAMES},
                                      "plugins/markdown/web/src/main.ts": b"m\n",
                                      "packaging/install.sh": cls.INSTALL, "LICENSE": b"MIT\n",
                                      "NOTICE": b"NOTICE",
@@ -1664,15 +1740,20 @@ class ReleaseAssetsTests(unittest.TestCase):
             "plugins/markdown/web/dist/.inputs-sha256": plugin_fingerprint.encode(),
             **self.NOTICES,
         }.items()})
+        for web, output in AGENTS_BUNDLES:
+            source[top + f"{web}/{output}"] = b"bundle\n"
+            source[top + f"{web}/dist/.inputs-sha256"] = rc.web_bundle_fingerprint(os.path.join(self.src, web)).encode()
         return {
             "tarball": {**{troles[r]: b for r, b in role_bytes.items()},
-                        **{f"{rc.tarball_top(v)}/{rc.tarball_plugin_dir('markdown')}/{rel}": data
-                           for rel, data in PLUGIN_SITE.items()}},
+                        **{f"{rc.tarball_top(v)}/{rc.tarball_plugin_dir(name)}/{rel}": data.replace(b"markdown", name.encode())
+                           for name in PLUGIN_NAMES for rel, data in PLUGIN_SITE.items()}},
             "deb": {**{proles[r]: b for r, b in role_bytes.items() if r in proles},
                     rc.deb_roles()["apparmor"]: self.APPARMOR,
-                    **{f"{rc.package_plugin_dir('markdown')}/{rel}": data for rel, data in PLUGIN_SITE.items()}},
+                    **{f"{rc.package_plugin_dir(name)}/{rel}": data.replace(b"markdown", name.encode())
+                       for name in PLUGIN_NAMES for rel, data in PLUGIN_SITE.items()}},
             "rpm": {**{proles[r]: b for r, b in role_bytes.items() if r in proles},
-                    **{f"{rc.package_plugin_dir('markdown')}/{rel}": data for rel, data in PLUGIN_SITE.items()}},
+                    **{f"{rc.package_plugin_dir(name)}/{rel}": data.replace(b"markdown", name.encode())
+                       for name in PLUGIN_NAMES for rel, data in PLUGIN_SITE.items()}},
             "source": source,
             "verdandi": _archive_files(self.verdandi, self.vrev),
             "install.sh": self.INSTALL,

@@ -1,18 +1,18 @@
 //! Locates, builds if necessary, and spawns Verdandi's `apps/claude-sidecar` Node.js process --
-//! deliberately NOT reusing `panel/src/supervisor_client.rs`'s spawn pattern wholesale. Two real,
-//! verified differences from that pattern:
+//! deliberately not a detached-daemon spawn. Two real,
+//! verified requirements:
 //!
 //! 1. `apps/claude-sidecar/dist/` is gitignored in Verdandi, not committed -- a git-dependency
 //!    checkout of the Rust protocol crate does NOT give this process a runnable sidecar.
 //!    This module locates a real Verdandi checkout on disk and builds the sidecar there if needed.
 //! 2. The sidecar treats stdin EOF as its own parent-death shutdown signal (its own `lifecycle.ts`
-//!    says so explicitly). `Stdio::null()` -- the pattern `supervisor_client.rs` uses -- makes it
+//!    says so explicitly). `Stdio::null()` makes it
 //!    exit within the same tick it starts, since reading from `/dev/null` is an instant EOF. This
 //!    module spawns with `Stdio::piped()` for stdin and holds the write handle open for the whole
 //!    `SpawnedSidecar`'s lifetime; dropping (or explicitly closing) that handle is the intended
 //!    shutdown signal, not a process_group/signal trick.
 //!
-//! Unlike `supervisor` (a shared, machine-wide, detached daemon `shell` never waits on), each
+//! Unlike a shared, machine-wide, detached daemon, each
 //! `ClaudeSidecarProvider` holds exactly one sidecar process, closer to how
 //! `agent::process::AgentProcess` owns its one `claude` child: the sidecar ends when its holder ends
 //! it or dies (stdin EOF), and through nothing else. So it is started in a process group of its own:
@@ -904,7 +904,7 @@ const PACKAGED_SIDECAR_BINARY: &str = "verdandi-claude-sidecar";
 #[derive(Debug)]
 enum SidecarProgram {
     /// A shipped, self-contained executable -- normally a sibling of the running binary, the same
-    /// convention `agent-hook`, `eitri-supervisor` and `eitri-tmux-shim` already follow.
+    /// convention `agent-hook` and `eitri-tmux-shim` already follow.
     Packaged(PathBuf),
     /// The executable `EITRI_SIDECAR_BINARY` names: the same shape, and no claim to be what Eitri ships.
     Named(PathBuf),
@@ -1467,7 +1467,7 @@ fn sidecar_command_for(
         .env("VERDANDI_CLAUDE_SIDECAR_SOCKET", socket_path)
         .stdin(Stdio::piped())
         // stdout/stderr are captured, not nulled -- nulling a spawned child's stderr silently
-        // discards real crash diagnostics (found on `supervisor`'s spawn, 2026-09-09). A Node.js
+        // discards real crash diagnostics. A Node.js
         // sidecar crash during real CLI parity testing is exactly the kind of thing worth seeing.
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
@@ -1830,10 +1830,9 @@ impl Drop for SpawnedSidecar {
     /// `SIDECAR_EXIT_GRACE` (long enough for the sidecar to reap the `claude` CLI it owns before
     /// exiting -- a graceful exit lets the sidecar fail-close any pending permissions server-side
     /// before this process moves on), then SIGKILL its group before reaping it, including when the
-    /// sidecar exited during the wait. Deliberately simpler than
-    /// `panel/src/supervisor_client.rs::connect_or_spawn`'s own background-thread reaper: that
-    /// pattern exists there because a *detached* supervisor process may run for an unbounded time
-    /// after being spawned, so its eventual `wait()` has no natural bound to block on. Here, by the
+    /// sidecar exited during the wait. Deliberately simpler than a
+    /// background-thread reaper, which a *detached* process that may run for an unbounded time
+    /// would need because its eventual `wait()` has no natural bound to block on. Here, by the
     /// time `drop` runs, the sidecar is either already exiting gracefully (bounded by
     /// `SIDECAR_EXIT_GRACE`) or about to be SIGKILLed (which returns near-instantly) -- both paths
     /// are genuinely bounded, so blocking `Drop` itself for at most `SIDECAR_EXIT_GRACE` is a
@@ -1949,7 +1948,7 @@ mod tests {
     }
 
     /// A sibling artifact is used when nothing was named -- the shape a real install has, and the
-    /// same `current_exe()`-sibling convention `agent-hook` and `eitri-supervisor` already follow.
+    /// same `current_exe()`-sibling convention `agent-hook` and `eitri-tmux-shim` already follow.
     #[test]
     fn a_sibling_artifact_is_found_when_nothing_is_named() {
         let dir = std::env::temp_dir().join(format!("nv-sidecar-dir-{}", uuid::Uuid::new_v4()));

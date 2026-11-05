@@ -748,6 +748,7 @@ assert_eq "$?" "64" "page listing refuses a positional id"
 
 echo "== -h lists the panel and split subcommands =="
 out="$(run_launcher -h)"
+assert_contains "$out" "eitri agents" "the help text names eitri agents"
 assert_contains "$out" "eitri panel" "the help text names eitri panel"
 assert_contains "$out" "eitri split" "the help text names eitri split"
 assert_contains "$out" "eitri setup [args]" "and still ends with the setup line"
@@ -783,7 +784,7 @@ out="$(run_in_filedir --quiet --account x a.rs)"
 assert_eq "$(args_of "$out")" "--new-window|a.rs" "--account as a flag asks for a new window"
 assert_contains "$out" "STUB_ARG:--new-window" "and the stub saw it"
 mkdir -p "$FILEDIR/choose-project"
-for sub in panel split page run-guard linked-window choose-project; do
+for sub in panel split page run-guard linked-window choose-project agents; do
 	out="$(run_in_filedir --quiet "$sub")"
 	assert_eq "$(args_of "$out")" "./$sub" "a path named $sub is not read as the $sub subcommand"
 	out="$(run_in_filedir --quiet "$sub" b.rs)"
@@ -795,6 +796,22 @@ for sub in panel split page run-guard linked-window choose-project; do
 	out="$(run_in_filedir --quiet "./$sub")"
 	assert_eq "$(args_of "$out")" "./$sub" "an explicit ./$sub is untouched"
 done
+echo "== eitri agents: handed to shell as typed, with no banner and no project =="
+# The subcommand has its own arguments (--json, --watch, --schema) and writes only its result: a banner
+# on stderr or an unknown-option refusal would break `eitri agents --watch | status-bar-tool`.
+reset_state
+EXTRA_ENV=()
+out="$(run_launcher agents)"
+assert_eq "$?" "0" "eitri agents runs"
+assert_eq "$(args_of "$out")" "agents" "plain eitri agents execs shell agents with nothing else"
+assert_not_contains "$out" "eitri    " "eitri agents prints no startup banner"
+assert_not_contains "$out" "no sidecar built yet" "eitri agents prints no sidecar hint"
+out="$(run_launcher agents --json)"
+assert_eq "$(args_of "$out")" "agents|--json" "--json reaches shell agents"
+out="$(run_launcher agents --watch --schema 1)"
+assert_eq "$(args_of "$out")" "agents|--watch|--schema|1" "--watch and --schema reach shell agents in order"
+out="$(run_launcher agents --bogus)"
+assert_eq "$(args_of "$out")" "agents|--bogus" "an option the subcommand refuses is shell's to refuse, not the launcher's"
 out="$(run_in_filedir --quiet a.rs --clean)"
 assert_eq "$(args_of "$out")" "--clean|a.rs" "an option after a file is still honoured"
 out="$(run_in_filedir --quiet a.rs --bogus)"

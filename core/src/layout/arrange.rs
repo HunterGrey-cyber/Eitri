@@ -89,6 +89,42 @@ fn node_min(node: &Node, shown: &dyn Fn(&ModuleId) -> bool, frame: &Frame, floor
         Node::Con(c) => children_min(c, shown, frame, floor),
     }
 }
+fn fixed_height(child: &Child, axis: Axis) -> Option<i32> {
+    (axis == Axis::Column).then_some(child.fixed_px).flatten()
+}
+fn child_min(child: &Child, axis: Axis, shown: &dyn Fn(&ModuleId) -> bool, frame: &Frame, floor: bool) -> Option<Size> {
+    let mut min = node_min(&child.node, shown, frame, floor)?;
+    if let Some(px) = fixed_height(child, axis) {
+        // The explicit height is also the minimum: a one-line page can be shorter than a normal tile.
+        min.h = px;
+    }
+    Some(min)
+}
+/// Explicit heights and already settled pins reserve space before fractional siblings divide it.
+fn reserved(child: &Child, axis: Axis) -> Option<i32> {
+    fixed_height(child, axis).or_else(|| child.pin.and_then(|pin| pin.px))
+}
+fn fixed_first(c: &Con, rest: &[usize], length: i32, handle: i32) -> Option<i32> {
+    let axis = c.layout.axis()?;
+    if !rest.iter().any(|&i| fixed_height(&c.children[i], axis).is_some()) {
+        return None;
+    }
+    if let Some(px) = reserved(&c.children[rest[0]], axis) {
+        return Some(px);
+    }
+    let pixels: i64 = rest
+        .iter()
+        .filter_map(|&i| reserved(&c.children[i], axis))
+        .map(i64::from)
+        .sum();
+    let shares: f64 = rest
+        .iter()
+        .filter(|&&i| reserved(&c.children[i], axis).is_none())
+        .map(|&i| f64::from(c.children[i].share))
+        .sum();
+    let available = (i64::from(length) - i64::from(handle) * (rest.len() - 1) as i64 - pixels).max(0);
+    Some((available as f64 * f64::from(c.children[rest[0]].share) / shares).round() as i32)
+}
 fn children_min(c: &Con, shown: &dyn Fn(&ModuleId) -> bool, frame: &Frame, floor: bool) -> Option<Size> {
     if c.layout.axis().is_none() {
         let mut min = node_min(&c.children[c.drawn(shown)?].node, shown, frame, floor)?;
@@ -103,7 +139,7 @@ fn children_min(c: &Con, shown: &dyn Fn(&ModuleId) -> bool, frame: &Frame, floor
 
     c.children
         .iter()
-        .filter_map(|ch| node_min(&ch.node, shown, frame, floor))
+        .filter_map(|ch| child_min(ch, c.layout.axis().unwrap(), shown, frame, floor))
         .reduce(|a, b| combine(c.layout.axis().unwrap(), a, b, frame.handle_px))
 }
 pub(crate) fn con_min(root: &Con, shown: &dyn Fn(&ModuleId) -> bool, frame: &Frame) -> Option<Size> {
@@ -204,12 +240,12 @@ pub(crate) fn arrange_tree(root: &Con, rect: Rect, shown: &dyn Fn(&ModuleId) -> 
                 place(&c.children[i].node, rect, shown, frame, out);
                 break;
             }
-            let min_a = along(axis, node_min(&c.children[i].node, shown, frame, true).unwrap());
+            let min_a = along(axis, child_min(&c.children[i], axis, shown, frame, true).unwrap());
             let min_b = along(
                 axis,
                 v[j + 1..]
                     .iter()
-                    .map(|&i| node_min(&c.children[i].node, shown, frame, true).unwrap())
+                    .map(|&i| child_min(&c.children[i], axis, shown, frame, true).unwrap())
                     .reduce(|a, b| combine(axis, a, b, frame.handle_px))
                     .unwrap(),
             );
@@ -223,7 +259,9 @@ pub(crate) fn arrange_tree(root: &Con, rect: Rect, shown: &dyn Fn(&ModuleId) -> 
                     .px
                     .map(|px| if far { avail - px } else { px })
             });
-            let wanted = if let Some(px) = pinned {
+            let wanted = if let Some(px) = fixed_first(c, &v[j..], length, handle) {
+                px
+            } else if let Some(px) = pinned {
                 let (lo, hi) = band(avail);
                 px.clamp(lo, hi)
             } else {
@@ -401,6 +439,70 @@ mod tests {
         )
     }
     const SIZE: Size = Size { w: 1280, h: 721 };
+    #[test]
+    fn fixed_heights_are_reserved_before_fractional_children_share_the_rest() {
+        let mut c = flat(&[0.25; 4]);
+        c.layout = ConLayout::SplitV;
+        c.children[0].fixed_px = Some(24);
+        c.children[2].fixed_px = Some(16);
+        for h in [443, 843, 1643] {
+            let (modules, _) = at(&c, &|_| true, Size { w: 1000, h });
+            let heights: Vec<_> = modules.iter().map(|(_, rect)| rect.h).collect();
+            assert_eq!(heights, [24, (h - 43) / 2, 16, (h - 43) / 2]);
+        }
+        let (modules, _) = at(&c, &|id| *id != ModuleId::lua("m0"), Size { w: 1000, h: 418 });
+        assert_eq!(
+            modules.iter().map(|(_, rect)| rect.h).collect::<Vec<_>>(),
+            [200, 16, 200]
+        );
+    }
+
+    #[test]
+    fn a_fixed_height_overrides_the_pages_measured_minimum() {
+        let mut c = flat(&[0.5, 0.5]);
+        c.layout = ConLayout::SplitV;
+        c.children[0].fixed_px = Some(16);
+        let minimum = |_: &ModuleId| Size { w: 100, h: 300 };
+        let frame = Frame {
+            min: &minimum,
+            ..Frame::new(Size { w: 1000, h: 800 }, 1)
+        };
+        let arranged = arrange_tree(
+            &c,
+            Rect {
+                x: 0,
+                y: 0,
+                w: 1000,
+                h: 800,
+            },
+            &|_| true,
+            &frame,
+        );
+        assert_eq!(arranged.modules[0].1.h, 16);
+        assert_eq!(arranged.modules[1].1.h, 783);
+        assert_eq!(con_min(&c, &|_| true, &frame).unwrap().h, 317);
+    }
+
+    #[test]
+    fn fixed_heights_preserve_settled_pins_and_fit_a_short_frame() {
+        let mut c = flat(&[0.5, 0.25, 0.25]);
+        c.layout = ConLayout::SplitV;
+        c.children[1].fixed_px = Some(24);
+        c.children[2].pin = Some(Pin { px: Some(200) });
+        for h in [400, 800, 1600] {
+            let (modules, _) = at(&c, &|_| true, Size { w: 1000, h });
+            assert_eq!(
+                modules.iter().map(|(_, rect)| rect.h).collect::<Vec<_>>(),
+                [h - 226, 24, 200]
+            );
+        }
+        for h in [0, 1, 10, 32] {
+            let (modules, _) = at(&c, &|_| true, Size { w: 1000, h });
+            assert_eq!(modules.last().map(|(_, rect)| rect.y + rect.h).unwrap(), h);
+            assert!(modules.iter().all(|(_, rect)| rect.h >= 0));
+        }
+    }
+
     #[test]
     fn three_even_children_split_like_the_even_chain() {
         let c = flat(&[1.0 / 3.0; 3]);

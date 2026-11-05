@@ -21,7 +21,7 @@ impl PanelHost for NoHost {
 
 #[cfg(any(test, feature = "test-support"))]
 impl AgentPanelHandle {
-    /// A panel over `page` with one empty tab and no supervisor, disk, trust worker or review: what a
+    /// A panel over `page` with one empty tab and no disk, trust worker or review: what a
     /// host's own tests drive, to see how its loop runs the tick.
     pub fn for_host_test(page: Rc<dyn crate::panel_page::PageSurface>) -> Self {
         let tabs =
@@ -79,11 +79,6 @@ impl AgentPanelHandle {
         handle
     }
 
-    /// Hands the panel a supervisor connection over `stream`, as a host's test plays the supervisor.
-    pub fn connect_test_supervisor(&self, stream: std::os::unix::net::UnixStream) {
-        self.state.borrow_mut().supervisor = crate::supervisor_client::SupervisorClient::over_stream(stream);
-    }
-
     /// How many ticks have run.
     pub fn ticks_run(&self) -> u64 {
         self.state.borrow().ticks_run
@@ -124,6 +119,8 @@ pub struct AgentPanelHandle {
     pub(super) raise: Option<agent::UiWake>,
     partner: Rc<RefCell<PartnerChooser>>,
     arrived_moves: Rc<RefCell<BTreeMap<u64, TabId>>>,
+    /// Where this window's agent rows go, while the agents layer runs here.
+    agents: Rc<RefCell<Option<crate::agents_glue::AgentsGlue>>>,
 }
 
 /// The linked process, identified across process-id reuse, and the number its rows show.
@@ -152,17 +149,6 @@ struct PartnerChooser {
     pending_tab: Option<TabId>,
 }
 
-/// Where the window's link to `eitri-supervisor` stands ([`AgentPanelHandle::supervisor_link`]).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum SupervisorLink {
-    /// The supervisor is being started and connected to, off the window's thread: ask again later.
-    Connecting,
-    /// Connected: an activation arrives on this descriptor, which stays open while it is reported.
-    Socket(std::os::fd::RawFd),
-    /// None now and none to come (none running, its connection gone, or the window closing).
-    Absent,
-}
-
 /// What `AgentPanelHandle::new` builds the panel's state from.
 pub struct PanelInit {
     pub project_dir: PathBuf,
@@ -179,30 +165,6 @@ pub struct PanelInit {
     pub root_note: Option<String>,
 }
 
-/// Connects to (or starts) the supervisor for a window on `project_dir`; a supervisor being started comes back as the
-/// receiver the pump drains.
-#[allow(clippy::type_complexity)]
-fn connect_supervisor(
-    project_dir: &std::path::Path,
-    backend_kind: BackendKind,
-) -> (
-    Option<crate::supervisor_client::SupervisorClient>,
-    Option<std::sync::mpsc::Receiver<Option<crate::supervisor_client::SupervisorClient>>>,
-) {
-    let instance_id = uuid::Uuid::new_v4().to_string();
-    let project_name = project_dir
-        .file_name()
-        .map(|n| n.to_string_lossy().to_string())
-        .unwrap_or_else(|| project_dir.to_string_lossy().to_string());
-    let connected =
-        match crate::supervisor_client::SupervisorClient::connect_or_spawn(instance_id, project_name, project_dir) {
-            crate::supervisor_client::PendingSupervisor::Ready(client) => (client, None),
-            crate::supervisor_client::PendingSupervisor::Connecting(rx) => (None, Some(rx)),
-        };
-    println!("[agent_panel] backend: {}", backend_kind.as_str());
-    connected
-}
-
 impl AgentPanelHandle {
     /// A handle over `state`, holding the state's wake, with `page` attached as the base view's when
     /// there is one; with none, the handle has no pages at all.
@@ -217,6 +179,7 @@ impl AgentPanelHandle {
             raise,
             partner: Rc::default(),
             arrived_moves: Rc::default(),
+            agents: Rc::default(),
         };
         if let Some(page) = page {
             handle.attach_page(ViewId::BASE, page);
@@ -229,6 +192,9 @@ impl AgentPanelHandle {
     pub(super) fn run<T>(&self, step: impl FnOnce(&mut AgentPanelState, &mut Outbox) -> T) -> T {
         let mut out = Outbox::default();
         let value = step(&mut self.state.borrow_mut(), &mut out);
+        // Before the step's effects go out: a freeze's answer starts the hand-over, and the row has to be on its way
+        // to disk as moving before the tab can leave.
+        self.offer_moving_rows();
         out.deliver(&self.state, &self.pages);
         value
     }
@@ -240,17 +206,13 @@ impl AgentPanelHandle {
         self.run(|state, out| step(state, &screen, out))
     }
 
-    /// With pages (`with_pages`): connects to (or starts) the supervisor and builds the state; the pages
-    /// are attached afterwards ([`attach_page`](Self::attach_page)). Without: the state alone, no pump and no
-    /// supervisor client, and every page verb does nothing until [`open_pages`](Self::open_pages), which a window
-    /// with no page ever (WebKit's sandbox cannot start; a hub; a page window) never calls.
+    /// Builds the panel state. Pages are attached afterwards ([`attach_page`](Self::attach_page)).
+    /// Without pages, page verbs do nothing until [`open_pages`](Self::open_pages).
     pub fn new(init: PanelInit, with_pages: bool, host: Rc<dyn PanelHost>) -> Self {
-        let (supervisor, supervisor_pending) = if with_pages {
-            connect_supervisor(&init.project_dir, init.backend_kind)
-        } else {
-            (None, None)
-        };
-        let state = Rc::new(RefCell::new(panel_state(init, supervisor, supervisor_pending, host)));
+        if with_pages {
+            println!("[agent_panel] backend: {}", init.backend_kind.as_str());
+        }
+        let state = Rc::new(RefCell::new(panel_state(init, host)));
         let raise = state.borrow().wake.as_ref().map(crate::panel_wake::PanelWake::waker);
         AgentPanelHandle {
             state,
@@ -260,6 +222,7 @@ impl AgentPanelHandle {
             raise,
             partner: Rc::default(),
             arrived_moves: Rc::default(),
+            agents: Rc::default(),
         }
     }
 
@@ -270,14 +233,7 @@ impl AgentPanelHandle {
         if self.with_pages.replace(true) {
             return;
         }
-        let (project_dir, backend_kind) = {
-            let state = self.state.borrow();
-            (state.project_dir.clone(), state.backend_kind)
-        };
-        let (supervisor, supervisor_pending) = connect_supervisor(&project_dir, backend_kind);
-        let mut state = self.state.borrow_mut();
-        state.supervisor = supervisor;
-        state.supervisor_pending = supervisor_pending;
+        println!("[agent_panel] backend: {}", self.state.borrow().backend_kind.as_str());
     }
 
     /// Says on the log that this window has a backend and no panel: WebKit's sandbox cannot start here.
@@ -631,7 +587,10 @@ impl AgentPanelHandle {
     /// The other window holds `view`'s frozen tab (or `tab`) now: it leaves this window, its session not ended.
     pub fn forget_moved(&self, view: ViewId, tab: Option<TabId>) -> Result<(), String> {
         self.wake();
-        self.run(|state, out| super::chat_moves::forget_moved(state, view, tab, out))
+        let before = self.agent_keys();
+        let forgot = self.run(|state, out| super::chat_moves::forget_moved(state, view, tab, out));
+        self.agents_handed_over(&before);
+        forgot
     }
 
     /// The commit of a move into `view`: the tab another window froze is taken up from `record` and `fds`.
@@ -687,7 +646,80 @@ impl AgentPanelHandle {
     /// its backend has let the session go, or at once when the tab stays.
     pub fn release_tab(&self, agent: &AgentId, session: &str) {
         self.wake();
+        let before = self.agent_keys();
         self.run(|state, out| super::hand_over::release(state, agent, session, out));
+        self.agents_handed_over(&before);
+    }
+
+    /// Hands this window's agent rows to `glue` from the next tick on, or, with `None`, stops handing them on. The
+    /// glue it held comes back, for the caller to let go off this thread: dropping its publisher waits for the
+    /// publisher's last write.
+    #[must_use = "dropping the glue here waits for its publisher's last write"]
+    pub fn set_agents(&self, glue: Option<crate::agents_glue::AgentsGlue>) -> Option<crate::agents_glue::AgentsGlue> {
+        self.wake();
+        self.agents.replace(glue)
+    }
+
+    /// The rows of tabs frozen for a move since the last offer, handed on as moving at once. A no-op while the
+    /// agents layer does not run here, or inside a step that already holds the glue or the state.
+    fn offer_moving_rows(&self) {
+        let Ok(mut agents) = self.agents.try_borrow_mut() else {
+            return;
+        };
+        let Some(glue) = agents.as_mut() else {
+            return;
+        };
+        let Ok(state) = self.state.try_borrow() else {
+            return;
+        };
+        glue.offer_moving(&state.tabs);
+    }
+
+    /// Whether the window has the keyboard, for its agent rows.
+    pub fn set_agents_focused(&self, focused: bool) {
+        self.wake();
+        let mut agents = self.agents.borrow_mut();
+        let Some(glue) = agents.as_mut() else {
+            return;
+        };
+        glue.set_focused(focused);
+    }
+
+    /// The row keys of this window's tabs while the agents layer runs here, read before a step that may hand a tab
+    /// to another window; empty otherwise.
+    fn agent_keys(&self) -> Vec<String> {
+        if self.agents.borrow().is_none() {
+            return Vec::new();
+        }
+        let state = self.state.borrow();
+        crate::agents_glue::AgentsGlue::keys(&state.tabs)
+    }
+
+    /// Marks the rows whose tabs a hand-over took since `before` as moved, ahead of the offer that drops them.
+    fn agents_handed_over(&self, before: &[String]) {
+        let agents = self.agents.borrow();
+        let Some(glue) = agents.as_ref() else {
+            return;
+        };
+        let state = self.state.borrow();
+        glue.handed_over(before, &state.tabs);
+    }
+
+    /// The tick's rows for the agents layer: every tab's row, handed on when it changed. A tab is shown when it is
+    /// the tab of a page on screen.
+    fn offer_agent_rows(&self, live: &[(ViewId, Rc<PanelPage>)], screen: &Screen) {
+        let mut agents = self.agents.borrow_mut();
+        let Some(glue) = agents.as_mut() else {
+            return;
+        };
+        let mut state = self.state.borrow_mut();
+        let shown: Vec<TabId> = live
+            .iter()
+            .map(|(view, _)| *view)
+            .filter(|view| screen.shows(*view))
+            .filter_map(|view| state.tab_of_page(view))
+            .collect();
+        glue.tick(&mut state.tabs, &|tab| shown.contains(&tab));
     }
 
     /// Takes up a tab another window let go, as a launch brings a saved tab back; answered later through
@@ -857,10 +889,10 @@ impl AgentPanelHandle {
     ///    batch -- the base view's active tab's, and each bound tab's -- goes to the page that shows it
     ///    as one `events{tab,fromRevision,throughRevision,events[]}` envelope; a background tab's feeds
     ///    its attention and marks it stale;
-    /// 3. report the window's aggregated status to `eitri-supervisor`.
     ///
-    /// Then each page's `tabs` envelope and `hello` go out if what they describe changed, and the
-    /// extra views left holding no tab are told to the window.
+    /// Then each page's `tabs` envelope and `hello` go out if what they describe changed, the
+    /// extra views left holding no tab are told to the window, and, while the agents layer runs here,
+    /// the tabs' rows are handed to its publisher when they changed.
     pub fn tick(&self) -> bool {
         self.poll_partner_chooser();
         let state = &self.state;
@@ -934,6 +966,7 @@ impl AgentPanelHandle {
             }
         }
         self.run(|state, out| tick_send(state, &screen, pumped, attention_before, out));
+        self.offer_agent_rows(&live, &screen);
         self.replay_mentions();
         self.run(pair_outbound);
         true
@@ -1020,7 +1053,7 @@ impl AgentPanelHandle {
         };
         let tabs = {
             let mut state = self.state.borrow_mut();
-            // Read by the tick, by `poll_activate` and by every path into the tab set, all of
+            // Read by the tick and by every path into the tab set, all of
             // which keep running now that the loop outlives the window. See the field's own doc.
             state.shutting_down = true;
             // Its drop removes the sockets, which nothing else would once the loop ends.
@@ -1206,39 +1239,6 @@ impl AgentPanelHandle {
                 }
             }
             crate::webview_crash_guard::CrashResponse::AlreadyGivenUp => {}
-        }
-    }
-
-    /// Non-blocking: returns `true` if `eitri-supervisor` asked this window to come to the
-    /// front since the last call. `main.rs` polls this on its own timer and calls
-    /// `window.present()` in response -- this handle has no `Window` reference of its own (see
-    /// `AgentPanelHandle`'s own top-level doc: window lifecycle stays owned by `main.rs`).
-    pub fn poll_activate(&self) -> bool {
-        let mut state = self.state.borrow_mut();
-        // The window this would raise is gone; see `AgentPanelState::shutting_down`.
-        if state.shutting_down {
-            return false;
-        }
-        if let Some(supervisor) = state.supervisor.as_mut() {
-            supervisor.poll_activate()
-        } else {
-            false
-        }
-    }
-
-    /// Where the window's link to `eitri-supervisor` stands, for a host that waits on its socket instead
-    /// of polling [`poll_activate`](Self::poll_activate).
-    pub fn supervisor_link(&self) -> SupervisorLink {
-        let state = self.state.borrow();
-        if state.shutting_down {
-            return SupervisorLink::Absent;
-        }
-        match (&state.supervisor, &state.supervisor_pending) {
-            (Some(client), _) => client
-                .activate_fd()
-                .map_or(SupervisorLink::Absent, SupervisorLink::Socket),
-            (None, Some(_)) => SupervisorLink::Connecting,
-            (None, None) => SupervisorLink::Absent,
         }
     }
 
@@ -2054,6 +2054,13 @@ impl AgentPanelHandle {
             .and_then(|tab| state.tabs.place_of(tab.id))
     }
 
+    /// The tab a view's page shows: the base view's active tab, an extra view's bound tab. `None` while the panel's
+    /// state is in use (a read from inside one of its own steps).
+    pub fn tab_shown_in(&self, view: ViewId) -> Option<TabId> {
+        self.wake();
+        self.state.try_borrow().ok()?.tab_of_page(view)
+    }
+
     /// The existing page holding a local tab. A missing tab never falls back to the base view.
     pub fn view_of_tab(&self, tab: TabId) -> Option<ViewId> {
         self.wake();
@@ -2073,6 +2080,14 @@ impl AgentPanelHandle {
         self.state
             .try_borrow()
             .map_or(true, |state| state.shutting_down || state.tabs.is_moving(tab))
+    }
+
+    /// Whether the tab has a turn or background work running, which a stop would end. An uncertain read says no.
+    pub fn tab_has_work(&self, tab: TabId) -> bool {
+        self.wake();
+        self.state
+            .try_borrow()
+            .is_ok_and(|state| !state.shutting_down && state.tabs.has_work(tab))
     }
 
     /// Selects a tab by its stable identity in the view it already belongs to, leaving input closed.
@@ -3225,8 +3240,6 @@ mod tests {
             "wake",
             "wake_fd",
             "take_wake",
-            "poll_activate",
-            "supervisor_link",
             "panel_keys",
             "nav_claims",
             "can_step",
@@ -3418,7 +3431,6 @@ mod tests {
         assert_eq!(handle.newest_card_label(), None);
         assert_eq!(handle.running_count(), 0);
         assert_eq!(handle.queued_count(), 0);
-        assert!(!handle.poll_activate());
     }
 
     /// The pane losing the keys entirely -- the WebView-free half of

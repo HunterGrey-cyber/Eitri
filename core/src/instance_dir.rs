@@ -467,7 +467,7 @@ pub(crate) mod tests {
             Some(4321)
         );
         assert_eq!(stale_instance_dir_pid("neovibe-pane-switch-4321", PREFIX), Some(4321));
-        assert_eq!(stale_instance_dir_pid("eitri-supervisor.sock", PREFIX), None);
+        assert_eq!(stale_instance_dir_pid("eitri-panel.sock", PREFIX), None);
         assert_eq!(stale_instance_dir_pid("systemd-private-abcdef", PREFIX), None);
         assert_eq!(stale_instance_dir_pid("", PREFIX), None);
         assert_eq!(stale_instance_dir_pid("neovibe-pane-switch-4321-scratch", PREFIX), None);

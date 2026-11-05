@@ -1,0 +1,12 @@
+:root { color-scheme: light dark; font: var(--nv-text-size, 14px)/1.6 monospace; }
+body { margin: 1em; background: var(--nv-bg, #202020); color: var(--nv-fg, #eee); }
+h1 { font-size: 1.15em; margin: 0 0 .5em; }
+button { font: inherit; color: inherit; background: transparent; border: 1px solid currentColor; margin: 0 1em .8em 0; }
+table { border-collapse: collapse; width: 100%; white-space: nowrap; }
+th, td { text-align: left; padding: .15em .7em; }
+th { border-bottom: 1px solid currentColor; }
+tbody tr { cursor: pointer; }
+.selected { outline: 1px solid currentColor; outline-offset: -1px; }
+.current td:first-child { font-weight: bold; }
+.visited td:first-child { text-decoration: underline; }
+footer { margin-top: 1em; border-top: 1px solid currentColor; }

@@ -1,5 +1,5 @@
 [English](keys.md) | 简体中文
-<!-- translated-from: keys.md sha256=1e65bac01cb9d614590f144eef4204bbc11d90d3f5a63f21fc248d586928bbad -->
+<!-- translated-from: keys.md sha256=99d31c7acffbb18946c5b4ce8ffedc9c3b5ec6870777b6256bb949c524c8e0ea -->
 
 # 按键
 
@@ -43,6 +43,8 @@ Eitri 的按键来自三个地方，它们互不冲突：用于窗口本身（�
 | `<prefix> &` | 关闭这个标签页，会先问一个 `y/n` |
 | `<prefix> w` | 选一个会话：上一个窗口的标签页可以恢复时，第一行是 `Restore last session`（在编辑器里要拿到它就用这个键，那里的 `s` 是 nvim 的），然后是已打开的标签页，再是可以继续的已保存会话 |
 | `<prefix> i` | 这个会话的详情 |
+
+**在等你的 agent。** `<prefix> u` 会去到等你最久的那个 agent，不管它在哪个窗口，之后每按一次去下一个；`<prefix> B` 结束这一轮，回到出发的地方。两个键都不替你回答任何东西：卡片就摆在你面前，用那个聊天里的卡片键回答它。没有谁在等时，状态行显示 `no agent waits for you`。这一轮和显示你的 agent 的那些页面共用，在伴随窗口里也能用。`agents.enabled` 关掉时，它们会显示 `agents are off in this window`。见[同时用很多 agent](many-agents.zh-CN.md)。
 
 **项目。** `<prefix> O`（也可以用 `:Eitri project.choose`、点顶栏里的项目名，或者在空的聊天标签页上按 `p`）会在窗口上方铺开一个列表：
 你的其他项目，最近用过的排在最前，另有一行用来筛选或输入路径。每个窗口里都能用，[合成器窗口](compositor-windows.md)的聊天窗口和页面窗口也一样；

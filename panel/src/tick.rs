@@ -14,7 +14,7 @@ pub(super) struct Pumped {
 }
 
 /// The tick's first step: the start notes, every connect and handoff that finished, every session that
-/// never opened, the teardowns that returned, the supervisor's connect and status, and every tab's
+/// never opened, the teardowns that returned, and every tab's
 /// backend drained (`TabSet::pump_views`). A tab the CLI-mode tripwire failed is shut down off this
 /// thread, as a closed tab's is, and the shutdown denies what is still pending in it; a tab on screen in
 /// some page also says why there, as a session that never opened does.
@@ -32,43 +32,11 @@ pub(super) fn tick_collect(state: &mut AgentPanelState, screen: &Screen, out: &m
     }
     super::hand_over::poll(state, out);
     collect_history(state, out);
-    // A supervisor this window had to start itself finishes connecting here rather than
-    // during `build_ui`, where waiting for it would have delayed the window appearing.
-    if state.supervisor.is_none() {
-        if let Some(rx) = state.supervisor_pending.as_ref() {
-            match rx.try_recv() {
-                Ok(client) => {
-                    state.supervisor = client;
-                    state.supervisor_pending = None;
-                }
-                Err(std::sync::mpsc::TryRecvError::Disconnected) => {
-                    state.supervisor_pending = None;
-                }
-                Err(std::sync::mpsc::TryRecvError::Empty) => {}
-            }
-        }
-    }
     // The project root travels in because the permission policy judges `Read`/`Grep`/`Glob`
     // paths against it -- see `AgentBackend::answer_what_needs_no_human`. A view counts as
     // mapped only while its page is live and on screen.
     let project_dir = state.project_dir.clone();
     let pumped = state.tabs.pump_views(&project_dir, &|view| screen.shows(view));
-    let statuses: Vec<supervisor::AgentStatus> = state
-        .tabs
-        .tabs()
-        .iter()
-        .map(|t| {
-            // Bound first: `projection()` returns a guard on the sidecar path, and passing
-            // it inline would drop the ingestion lock before `derive_status` had read
-            // through it.
-            let projection = t.live().map(|b| b.projection());
-            crate::supervisor_client::derive_status(projection.as_deref())
-        })
-        .collect();
-    let status = crate::supervisor_client::aggregate_status(statuses);
-    if let Some(supervisor) = state.supervisor.as_mut() {
-        supervisor.send_status(status);
-    }
     // Whose first text each payload carries, kept with it: the cadence may release it after
     // the tab, or that tab's turn, has changed (`panel_pacer::FirstText`).
     let mut streams: Vec<(ViewId, Stream)> = Vec::new();
@@ -420,8 +388,7 @@ pub(super) fn panel_wake(tabs: &mut eitri_core::tab_set::TabSet) -> Option<crate
 }
 
 /// Whether something the tick acts on can become ready without raising the wake, so the tick has to run on
-/// its steady cadence: a worker reporting through a channel (a connect, a teardown, the supervisor's
-/// connect, the trust check, a review or scratch job, the history's writer), a backend that does not announce
+/// its steady cadence: a worker reporting through a channel (a connect, a teardown, the trust check, a review or scratch job, the history's writer), a backend that does not announce
 /// its folds, the review flow or the broker waiting on the editor, or a move waiting on its page or its presence.
 pub(super) fn needs_polling(state: &AgentPanelState) -> bool {
     state.wake.is_none()
@@ -429,7 +396,6 @@ pub(super) fn needs_polling(state: &AgentPanelState) -> bool {
         || state.hand_overs.is_waiting()
         || state.tabs.needs_polling()
         || !state.retiring.is_empty()
-        || state.supervisor_pending.is_some()
         || !state.pending_edits.is_empty()
         || !state.task_commands.is_empty()
         || !state.review_jobs.is_empty()
@@ -871,7 +837,7 @@ mod tests {
     }
 
     /// Each pending thing the tick polls keeps it on its steady cadence: a closed tab's teardown, the
-    /// supervisor's connect, the trust check, a review job, a scratch edit, the history's write. None of
+    /// trust check, a review job, a scratch edit, the history's write. None of
     /// them, nothing to poll.
     #[test]
     fn every_unannounced_pending_job_keeps_the_tick_polling() {
@@ -901,12 +867,6 @@ mod tests {
         done_tx.send(()).unwrap();
         handle.state.borrow_mut().retiring.poll();
         assert!(!polls(&handle));
-
-        let (supervisor_tx, supervisor_rx) = mpsc::channel();
-        handle.state.borrow_mut().supervisor_pending = Some(supervisor_rx);
-        assert!(polls(&handle), "the supervisor's connect");
-        drop(supervisor_tx);
-        handle.state.borrow_mut().supervisor_pending = None;
 
         {
             let mut state = handle.state.borrow_mut();

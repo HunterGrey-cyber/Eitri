@@ -227,7 +227,9 @@ fn decided_here(action: &Action) -> bool {
         | Action::Tab(_)
         | Action::TabBreak
         | Action::Text(_)
-        | Action::TextAll(_) => true,
+        | Action::TextAll(_)
+        | Action::AgentsNext
+        | Action::AgentsBack => true,
     }
 }
 
@@ -304,6 +306,8 @@ pub(super) fn one_of_each() -> Vec<Action> {
         Action::WindowSetup,
         Action::Text(TextChange::Larger),
         Action::CopyMode { up: false },
+        Action::AgentsNext,
+        Action::AgentsBack,
     ]
 }
 

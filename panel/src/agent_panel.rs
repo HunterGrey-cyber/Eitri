@@ -124,7 +124,7 @@ use admission::*;
 pub use chat_moves::ChatMoveEvent;
 use detail::*;
 pub use hand_over::TabAnswer;
-pub use handle::{AgentPanelHandle, PanelInit, SupervisorLink};
+pub use handle::{AgentPanelHandle, PanelInit};
 pub use handoffs::PanelTabHandoff;
 use handoffs::*;
 use inbound::*;
@@ -180,19 +180,13 @@ struct AgentPanelState {
     /// showing when the LAST turn went out is not context, it is a stale claim, and the composer
     /// has no way to tell the model which it is.
     editor_context: eitri_core::editor_context::ContextSource,
-    supervisor: Option<crate::supervisor_client::SupervisorClient>,
-    /// Set only while a freshly-spawned `eitri-supervisor` is still coming up. The pump drains
-    /// it into `supervisor` above. A window that spawns the supervisor cannot connect to it
-    /// synchronously -- see `PendingSupervisor` for the failure that taught us that.
-    supervisor_pending: Option<std::sync::mpsc::Receiver<Option<crate::supervisor_client::SupervisorClient>>>,
     /// Set by `AgentPanelHandle::shutdown`, i.e. only on the window-close path, and never cleared.
     ///
     /// **It exists because the main loop now outlives the window.** `shutdown` holds the
     /// application so the process can finish tearing its children down, which means every
     /// main-loop source this panel installed keeps firing for up to `SESSION_CLOSE_BACKSTOP`
     /// afterwards -- against a destroyed window and a `WebView` that is no longer in a widget
-    /// tree. The pump reads this and stops; `poll_activate` reads it and stops answering, because
-    /// its caller's reaction is `window.present()` on a window GTK has already destroyed.
+    /// tree. The pump reads this and stops before touching that destroyed view.
     ///
     /// **Also the guard on the tab set:** `shutdown` empties it with `TabSet::take_all`, after which
     /// `active_tab()` would panic, so every path that reaches the set checks this first.
@@ -501,8 +495,6 @@ struct StateParts {
     canonical_project_dir: String,
     prefs_dir: Option<PathBuf>,
     mode_remembered: bool,
-    supervisor: Option<crate::supervisor_client::SupervisorClient>,
-    supervisor_pending: Option<std::sync::mpsc::Receiver<Option<crate::supervisor_client::SupervisorClient>>>,
     scratch: Option<eitri_core::scratch::ScratchDir>,
     review_roots: ReviewRoots,
     history_writer: eitri_core::prompt_history::HistoryWriter,
@@ -531,8 +523,6 @@ impl AgentPanelState {
             canonical_project_dir,
             prefs_dir,
             mode_remembered,
-            supervisor,
-            supervisor_pending,
             scratch,
             review_roots,
             history_writer,
@@ -589,8 +579,6 @@ impl AgentPanelState {
             mention_sections: None,
             canonical_project_dir,
             prefs_dir,
-            supervisor,
-            supervisor_pending,
             shutting_down: false,
             wake,
             last_tick: None,
@@ -671,12 +659,7 @@ impl AgentPanelState {
 
 /// The panel's state, the same with a page or without one (`build_agent_panel`'s `unavailable`):
 /// the tab set in the project's remembered mode, its prompt history and saved permission rules.
-fn panel_state(
-    init: PanelInit,
-    supervisor: Option<crate::supervisor_client::SupervisorClient>,
-    supervisor_pending: Option<std::sync::mpsc::Receiver<Option<crate::supervisor_client::SupervisorClient>>>,
-    host: Rc<dyn PanelHost>,
-) -> AgentPanelState {
+fn panel_state(init: PanelInit, host: Rc<dyn PanelHost>) -> AgentPanelState {
     let PanelInit {
         project_dir,
         editor_context,
@@ -743,8 +726,6 @@ fn panel_state(
         canonical_project_dir,
         prefs_dir,
         mode_remembered,
-        supervisor,
-        supervisor_pending,
         scratch,
         review_roots,
         history_writer,
@@ -756,7 +737,7 @@ fn panel_state(
     })
 }
 
-/// A panel state with no supervisor, no disk, no trust worker and nothing installed: what the tests here,
+/// A panel state with no disk, no trust worker and nothing installed: what the tests here,
 /// and a host's own tests through [`AgentPanelHandle::for_host_test`], build on.
 #[cfg(any(test, feature = "test-support"))]
 fn bare_state(
@@ -779,8 +760,6 @@ fn bare_state(
         canonical_project_dir: String::new(),
         prefs_dir: None,
         mode_remembered: false,
-        supervisor: None,
-        supervisor_pending: None,
         scratch: None,
         review_roots: ReviewRoots {
             state_home: None,
@@ -990,7 +969,7 @@ mod tests {
     });
 
     /// A handle over a recording page and a recording host. Not built through `AgentPanelHandle::new`,
-    /// which would connect to (or start) the supervisor.
+    /// which starts the panel's runtime services.
     pub(super) fn handle_with_recording_page() -> (AgentPanelHandle, Rc<RecordingPage>, Rc<RecordingHost>) {
         handle_with_recording_page_in_theme(eitri_core::theme::ThemeTokens::fallback())
     }

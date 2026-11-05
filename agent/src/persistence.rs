@@ -2,7 +2,7 @@
 //! surviving process restarts and reboots -- deliberately NOT under `$XDG_RUNTIME_DIR` (tmpfs,
 //! cleared on logout; correct for the lease in `lease.rs`, wrong here) or `std::env::temp_dir()`.
 //! Small JSON files, no database -- matches this project's own established "small file per key, no
-//! DB dependency" style (e.g. `supervisor`'s own socket-based state, `agent`'s own per-conversation
+//! DB dependency" style (e.g. `agent`'s own per-conversation
 //! hook sockets).
 //!
 //! **One file per SESSION, in a directory per conversation:**

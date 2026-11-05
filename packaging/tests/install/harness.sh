@@ -336,14 +336,22 @@ mk_verdandi_source() {
 	MVS_SHA256=$(sha256sum <"$2" | cut -d' ' -f1)
 }
 
-# mk_plugin_tree DIR TAG: a stand-in for the Markdown preview plugin directory the release ships (its manifest and its
-# built site), with TAG in the page so a test can tell two releases' copies apart.
+# mk_plugin_tree DIR TAG [ID]: a stand-in for one shipped plugin directory (its manifest and its built site), with TAG
+# in the page so a test can tell two releases' copies apart. The Markdown preview (the default ID) also carries the
+# bundle and the math fonts it ships; the agents faces are a manifest and a page.
 mk_plugin_tree() {
-	mkdir -p "$1/web/dist/katex/fonts"
-	printf 'id = "markdown"\ntitle = "Markdown preview"\n' >"$1/eitri-plugin.toml"
-	printf '<!doctype html><title>preview %s</title>\n' "$2" >"$1/web/dist/index.html"
-	printf 'export {};\n' >"$1/web/dist/preview.js"
-	printf 'wOF2' >"$1/web/dist/katex/fonts/KaTeX_Main-Regular.woff2"
+	_mpt_id=${3:-markdown}
+	mkdir -p "$1/web/dist"
+	if [ "$_mpt_id" = markdown ]; then
+		printf 'id = "markdown"\ntitle = "Markdown preview"\n' >"$1/eitri-plugin.toml"
+		printf '<!doctype html><title>preview %s</title>\n' "$2" >"$1/web/dist/index.html"
+		printf 'export {};\n' >"$1/web/dist/preview.js"
+		mkdir -p "$1/web/dist/katex/fonts"
+		printf 'wOF2' >"$1/web/dist/katex/fonts/KaTeX_Main-Regular.woff2"
+	else
+		printf 'id = "%s"\ntitle = "%s"\n' "$_mpt_id" "$_mpt_id" >"$1/eitri-plugin.toml"
+		printf '<!doctype html><title>%s %s</title>\n' "$_mpt_id" "$2" >"$1/web/dist/index.html"
+	fi
 }
 
 # mk_release VERSION REV: a release directory $S/fix/v$VERSION laid out as a real release is, from stub
@@ -360,12 +368,14 @@ mk_release() {
 	mkdir -p "$b/bin" "$b/lib/eitri" "$b/share/applications" "$b/share/icons" "$b/share/licenses/eitri" "$S/fix/v$v"
 	cp "$PKG/eitri.launcher.sh" "$b/bin/eitri"
 	chmod 0755 "$b/bin/eitri"
-	for bin in shell eitri-supervisor eitri-tmux-shim eitri-claude-handoff eitri-run-guard eitri-editor-bridge; do
+	for bin in shell eitri-tmux-shim eitri-claude-handoff eitri-run-guard eitri-editor-bridge; do
 		printf '#!/bin/sh\necho "stub %s %s"\n' "$bin" "$v" >"$b/lib/eitri/$bin"
 		chmod 0755 "$b/lib/eitri/$bin"
 	done
-	# The Markdown preview plugin directory, as the tarball lays it out: lib/eitri/plugins/markdown (release.sh).
-	mk_plugin_tree "$b/lib/eitri/plugins/markdown" "$v"
+	# The shipped plugin directories, as the tarball lays them out: lib/eitri/plugins/<name> (release.sh).
+	for _mr_plugin in markdown agents-strips agents-top agents-pass; do
+		mk_plugin_tree "$b/lib/eitri/plugins/$_mr_plugin" "$v" "$_mr_plugin"
+	done
 	# The fixture release's eitri-setup and install.sh are the unkeyed copy, not the real file: the
 	# tests run them (the tarball's eitri-setup after an install, `eitri setup`) and compare the
 	# installed eitri-setup with $INSTALLER, and none of them may depend on the maintainer's real key.
@@ -402,6 +412,9 @@ mk_release() {
 	# by 0.2.0's installer. Every test below that installs one of these releases with this installer
 	# therefore also holds that this installer never installs it.
 	cp "$PKG/legacy/eitri.desktop" "$b/share/applications/eitri.desktop"
+	# The placeholder for the dashboard binary 0.2.0's installer also wants (same README), which this
+	# installer removes from the archive it stages: t_fresh_layout holds that nothing is left installed.
+	cp "$PKG/legacy/eitri-supervisor" "$b/lib/eitri/eitri-supervisor"
 	cp -R "$PKG/icons/hicolor" "$b/share/icons/hicolor"
 	for f in LICENSE THIRD-PARTY-LICENSES SOURCE; do
 		echo "$f for $v" >"$b/share/licenses/eitri/$f"

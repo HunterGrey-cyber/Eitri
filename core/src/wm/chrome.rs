@@ -371,6 +371,11 @@ pub(super) fn show_toast(w: &mut Window, text: String, kind: ToastKind) {
     } else {
         TOAST_FOR
     };
+    show_toast_for(w, text, kind, shown);
+}
+
+/// [`show_toast`] for `shown` instead of its kind's time: a short status line.
+pub(super) fn show_toast_for(w: &mut Window, text: String, kind: ToastKind, shown: Duration) {
     let text = match &w.chrome.toast {
         Some(up) if kind == ToastKind::Warning && up.kind == kind && up.text.contains(&text) => up.text.clone(),
         Some(up) if kind == ToastKind::Warning && up.kind == kind => format!("{}; {text}", up.text),

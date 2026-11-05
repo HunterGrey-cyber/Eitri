@@ -2755,4 +2755,98 @@ mod tests {
             TabBackend::NotStarted
         ));
     }
+
+    /// What the chat's stop question needs of a tab: a turn, unseen Claude Code work or background work running. A tab
+    /// gone or idle has none.
+    #[test]
+    fn stop_answer_target_has_work_only_while_a_turn_or_background_work_runs() {
+        agent::state_dirs::redirect_state_to_a_test_root();
+        let dir = agent::state_dirs::test_workspace_dir("panel-stop-has-work");
+        let (handle, _page, _second) = handle_with_two_pages();
+        handle.state.borrow_mut().project_dir = dir.clone();
+        let (tab, provider) = live_tab(&handle, &dir);
+        handle.tick();
+        assert!(!handle.tab_has_work(tab), "an idle tab has nothing to stop");
+        assert!(
+            !handle.tab_has_work(TabId(9_999)),
+            "a tab that is not here has nothing to stop"
+        );
+        provider.queue(agent::AgentDomainEvent::BackgroundCalls { running: 2 });
+        tick_handle_until(&handle, "the background calls", || handle.tab_has_work(tab));
+        provider.queue(agent::AgentDomainEvent::BackgroundCalls { running: 0 });
+        tick_handle_until(&handle, "the background calls ending", || !handle.tab_has_work(tab));
+        provider.queue(agent::AgentDomainEvent::CliWorkUnseen);
+        tick_handle_until(&handle, "Claude Code working where the chat cannot show it", || {
+            handle.tab_has_work(tab)
+        });
+        provider.queue(agent::AgentDomainEvent::TurnCompleted {
+            turn_id: "t0".into(),
+            outcome: agent::TurnOutcome::Completed,
+            result_text: String::new(),
+            stop_reason: None,
+            usage: None,
+            detail: Default::default(),
+        });
+        tick_handle_until(&handle, "the unseen work ending", || !handle.tab_has_work(tab));
+        provider.queue(agent::AgentDomainEvent::TurnStarted { turn_id: "t1".into() });
+        tick_handle_until(&handle, "the turn", || handle.tab_has_work(tab));
+        shut_down_every_tab(&handle);
+    }
+
+    /// The stop question is answered with the chat's own stop messages, so it reaches exactly the arms the chat's stop
+    /// keys reach; there is no message of its own for a stop.
+    #[test]
+    fn stop_answer_reaches_only_the_existing_arms() {
+        agent::state_dirs::redirect_state_to_a_test_root();
+        let dir = agent::state_dirs::test_workspace_dir("panel-stop-answer");
+        let (handle, page, _second) = handle_with_two_pages();
+        handle.state.borrow_mut().project_dir = dir.clone();
+        let provider = std::sync::Arc::new(eitri_core::test_providers::RecordingProvider::interruptible());
+        let tab = {
+            let conversation = agent::AgentConversation::create(
+                provider.clone(),
+                &dir,
+                agent::setting_sources::ProjectTrust::Untrusted,
+            )
+            .unwrap();
+            let mut state = handle.state.borrow_mut();
+            let tab = state.tabs.open(AgentId::Claude);
+            state
+                .tabs
+                .get_mut(tab)
+                .unwrap()
+                .set_backend(TabBackend::Live(AgentBackend::Conversation {
+                    agent: AgentId::Claude,
+                    conversation: Box::new(conversation),
+                }));
+            tab
+        };
+        handle.tick();
+        for kind in ["stop_answer", "stop", "stop_turn"] {
+            let line = serde_json::json!({ "type": kind, "request_id": "s1", "tab": tab.0, "yes": true }).to_string();
+            assert!(
+                parse_inbound_message(&line).is_none(),
+                "{kind} is no message the panel takes"
+            );
+        }
+        let interrupt = parse_inbound_message(
+            &serde_json::json!({ "type": "interrupt", "request_id": "i1", "tab": tab.0 }).to_string(),
+        );
+        assert!(matches!(interrupt, Some(InboundMessage::Interrupt { .. })));
+        let stop = parse_inbound_message(
+            &serde_json::json!({ "type": "stop_background", "request_id": "b1", "tab": tab.0, "running": 2 })
+                .to_string(),
+        );
+        assert!(matches!(stop, Some(InboundMessage::StopBackground { running: 2, .. })));
+
+        provider.queue(agent::AgentDomainEvent::TurnStarted { turn_id: "t1".into() });
+        tick_handle_until(&handle, "the turn", || handle.tab_has_work(tab));
+        handle.page_message(
+            ViewId::BASE,
+            &serde_json::json!({ "type": "interrupt", "request_id": "i1", "tab": tab.0 }).to_string(),
+        );
+        assert_eq!(result_for(&page.sent.borrow(), "i1"), Some(Ok(())));
+        assert_eq!(provider.interrupts(), 1, "the stop reached the agent's interrupt");
+        shut_down_every_tab(&handle);
+    }
 }

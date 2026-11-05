@@ -186,8 +186,7 @@ one-window mode.
   ([the guide](guide/companion.md#gnome-the-extension)). With it: moves stay on the focused window's monitor; an X11 or
   XWayland window never counts; moving back within about a third of a second of the previous move is refused; a
   terminal that runs all its windows in one process (GNOME Terminal, Ptyxis) gets focus handed back to its most
-  recent window, which may not be nvim's; a forwarded `eitri split` does not bring the panel forward; and the
-  supervisor's "bring to front" does nothing.
+  recent window, which may not be nvim's; and a forwarded `eitri split` does not bring the panel forward.
 
 ## Security
 

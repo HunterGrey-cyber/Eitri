@@ -473,9 +473,13 @@ KNOWN_EITRI_SOURCE_ADDITIONS = (
     # The plugin keyboard kit's bundle and fingerprint, shipped for the same reason.
     "plugin-kit/keys/dist/keys.js",
     "plugin-kit/keys/dist/.inputs-sha256",
-    # The Markdown preview plugin's built site (several files, so its whole dist/) and its fingerprint, shipped for
-    # the same reason.
+    # The bundled plugins' whole sites and fingerprints travel together for the same reason.
     "plugins/markdown/web/dist/",
+    "plugins/agents-strips/web/dist/",
+    "plugins/agents-top/web/dist/",
+    "plugins/agents-pass/web/dist/",
+    "plugin-kit/agents/dist/agents.js",
+    "plugin-kit/agents/dist/.inputs-sha256",
     "THIRD-PARTY-LICENSES",
     "SOURCE",
 )
@@ -562,7 +566,7 @@ def check_no_legacy_symbols(nm_c_text: str) -> None:
 # A reused target directory may contain binaries left by a development build, such as
 # `agent-hook`, that were not produced by this release build.
 
-RELEASE_BINARIES = ("shell", "eitri-supervisor", "eitri-tmux-shim", "eitri-claude-handoff", "eitri-run-guard", "eitri-editor-bridge")
+RELEASE_BINARIES = ("shell", "eitri-tmux-shim", "eitri-claude-handoff", "eitri-run-guard", "eitri-editor-bridge")
 
 
 def _json_messages(lines: Iterable[str]) -> list[dict]:
@@ -847,6 +851,8 @@ TRACKED_ART = {
     **{role: f"gnome-extension/{rel}" for role, rel in _GNOME_EXT_FILES.items()},
     # 0.2.0's own desktop entry, byte for byte, in the tarball only (see _TARBALL_ONLY_ROLES).
     "legacy-desktop": "packaging/legacy/eitri.desktop",
+    # The placeholder for the dashboard binary the same installer wants (tarball only too).
+    "legacy-supervisor": "packaging/legacy/eitri-supervisor",
     **{role: f"packaging/icons/hicolor/{rel}" for role, rel in _ICON_HICOLOR.items()},
 }
 
@@ -890,9 +896,12 @@ _PACKAGE_ROLES = {
 # (packaging/legacy/eitri.desktop, see its README): 0.2.0's install.sh, which INSTALL.md tells a user to
 # save and rerun to upgrade, refuses a tarball without share/applications/eitri.desktop. Read only by that
 # installer -- this release's installer ignores it, and neither package (nor either AUR package) ships it,
-# so it is a role of the tarball and of no package.
+# so it is a role of the tarball and of no package. The same installer also wants an executable
+# lib/eitri/eitri-supervisor, which this release no longer builds: the tarball carries the placeholder
+# packaging/legacy/eitri-supervisor there.
 _TARBALL_ONLY_ROLES = {
     "legacy-desktop": "share/applications/eitri.desktop",
+    "legacy-supervisor": "lib/eitri/eitri-supervisor",
 }
 
 
@@ -924,7 +933,8 @@ def deb_roles() -> dict[str, str]:
 # directory is one tree, not a role per file: its site's files (fonts, the lazily loaded diagram code) are whatever
 # the build made. The tarball holds it at lib/eitri/plugins/<name>/ (install.sh copies lib/eitri whole), the packages
 # at usr/share/eitri/plugins/<name>/; plugin_tree_problems holds the three to one another.
-PLUGIN_TREES = (("markdown", "plugins/markdown/eitri-plugin.toml"),)
+PLUGIN_TREES = tuple((name, f"plugins/{name}/eitri-plugin.toml")
+                     for name in ("markdown", "agents-strips", "agents-top", "agents-pass"))
 
 
 def tarball_plugin_dir(name: str) -> str:
@@ -1032,10 +1042,11 @@ def check_same_bytes(named_paths: dict[str, str]) -> list[str]:
 
 
 # The npm projects shell/build.rs builds, each with the file it leaves behind: the agent panel's page and the plugin
-# keyboard kit, which the binary embeds, and the Markdown preview plugin's site, which ships as a plugin directory.
+# keyboard and agents kits, which the binary embeds, and every bundled plugin's site.
 # The source asset ships each beside a fingerprint so its offline rebuild reaches no npm.
 WEB_BUNDLES = (("agent-ui/web", "dist/index.html"), ("plugin-kit/keys", "dist/keys.js"),
-               ("plugins/markdown/web", "dist/index.html"))
+               ("plugin-kit/agents", "dist/agents.js"),
+               *((f"plugins/{name}/web", "dist/index.html") for name, _ in PLUGIN_TREES))
 
 
 def _check_web_bundle(root: str, web_rel: str, output: str) -> list[str]:

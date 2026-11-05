@@ -10,10 +10,7 @@ use std::path::Path;
 const NEVER_BOUND: &[(&str, &str)] = &[
     // Parser inputs and file-name arguments: strings that name a socket file, not paths to one.
     // Every path actually built from them goes through `in_dir` at its own construction site.
-    (
-        "src/instance_dir.rs",
-        "stale_instance_dir_pid(\"eitri-supervisor.sock\"",
-    ),
+    ("src/instance_dir.rs", "stale_instance_dir_pid(\"eitri-panel.sock\""),
     (
         "src/instance_dir.rs",
         "sweep_stale_instance_dirs(&root, PREFIX, \"switch.sock\"",

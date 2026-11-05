@@ -19,6 +19,8 @@ pub struct RevealRequest {
 pub enum RevealRefusal {
     Gone,
     Moving,
+    /// A stop asked of a tab with no turn and no background work running: there is nothing to ask about.
+    Idle,
 }
 
 /// Shows the tab's module, selects the tab, then gives its page the keys. Arrival runs only after a
@@ -38,6 +40,10 @@ pub(super) fn reveal_batch(
         let view = cx.reads.view_of_tab(tab).ok_or(RevealRefusal::Gone)?;
         if cx.reads.tab_moving(tab) {
             return Err(RevealRefusal::Moving);
+        }
+        // Checked before anything is shown, so a refused stop leaves the screen as it was.
+        if req.intent == Intent::Stop && !cx.reads.tab_has_work(tab) {
+            return Err(RevealRefusal::Idle);
         }
         Some(view)
     } else {
@@ -177,6 +183,58 @@ mod tests {
     }
 
     #[test]
+    fn stop_on_an_idle_tab_is_refused_idle() {
+        let mut r = two(true);
+        let before = r.layout.borrow().clone();
+        let stop = RevealRequest {
+            intent: Intent::Stop,
+            ..request(Some(TabId(7)))
+        };
+        let (answer, batch) = r.controller.tab_reveal(WIN, &stop);
+        assert_eq!(
+            answer,
+            Err(RevealRefusal::Idle),
+            "nothing runs there, so there is nothing to ask about"
+        );
+        assert!(batch.is_empty(), "a refused stop changes nothing on screen");
+        assert_eq!(*r.layout.borrow(), before);
+
+        // The same tab revealed to look is not refused: only a stop needs something running.
+        let (answer, _) = r.controller.tab_reveal(WIN, &request(Some(TabId(7))));
+        assert_eq!(answer, Ok(()));
+    }
+
+    #[test]
+    fn stop_on_a_tab_with_work_reveals_it() {
+        let mut r = two(true);
+        r.host.set_tab_has_work(TabId(7), true);
+        let stop = RevealRequest {
+            intent: Intent::Stop,
+            ..request(Some(TabId(7)))
+        };
+        let (answer, batch) = r.controller.tab_reveal(WIN, &stop);
+        assert_eq!(answer, Ok(()));
+        assert!(rig::ops(&batch).iter().any(|op| matches!(op, HostOp::Focus { on_grab, .. }
+            if matches!(&on_grab[..], [HostOp::Chat(ChatOp::Arrive { tab: Some(TabId(7)), intent: Intent::Stop, .. })]))));
+    }
+
+    #[test]
+    fn a_moving_tab_is_refused_moving_before_idle() {
+        let mut r = two(true);
+        r.host.set_tab_moving(TabId(7), true);
+        let stop = RevealRequest {
+            intent: Intent::Stop,
+            ..request(Some(TabId(7)))
+        };
+        assert_eq!(r.controller.tab_reveal(WIN, &stop).0, Err(RevealRefusal::Moving));
+        let gone = RevealRequest {
+            tab: Some(TabId(99)),
+            ..stop
+        };
+        assert_eq!(r.controller.tab_reveal(WIN, &gone).0, Err(RevealRefusal::Gone));
+    }
+
+    #[test]
     fn reveal_answers_nothing() {
         let mut r = two(true);
         let (answer, batch) = r.controller.tab_reveal(WIN, &request(Some(TabId(7))));
@@ -252,6 +310,7 @@ mod tests {
         crate::layout::hide(&mut layout, &view.module(), &Frame::new(Size { w: 1200, h: 800 }, 1)).unwrap();
         let mut r = rig::rig(layout);
         r.host.set_view_of_tab(TabId(7), Some(view));
+        r.host.set_tab_has_work(TabId(7), true);
         let (answer, batch) = r.controller.tab_reveal(
             WIN,
             &RevealRequest {

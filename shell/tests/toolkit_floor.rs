@@ -2,14 +2,14 @@
 //! layers of the check live here; the third (the ABI check over shipped binaries) is
 //! `packaging/check-abi-floor.py`.
 //!
-//! 1. `gtk4_manifests_declare_exactly_the_v4_14_floor` -- the three product manifests that name a
-//!    `gtk4` version feature (`shell`, `neovide-editor`, `supervisor`) say `v4_14` and nothing
+//! 1. `gtk4_manifests_declare_exactly_the_v4_14_floor` -- the product manifests that name a
+//!    `gtk4` version feature (`shell`, `neovide-editor`) say `v4_14` and nothing
 //!    else, catching a manifest bump directly.
 //! 2. `gtk_webkit_feature_unification_never_exceeds_the_floor` -- Cargo's *resolved* feature graph
 //!    (`cargo tree -e features -i <crate>`, run with `--locked --offline` so it reads only what is
 //!    already fetched) never carries `gtk4`/`gdk4`/`gsk4` above `v4_14` or `webkit6` above `v2_40`
 //!    through any dependency path, including one that would enable it through unification rather
-//!    than through one of the three manifests above. This is the check that would catch a *new*
+//!    than through one of the manifests above. This is the check that would catch a *new*
 //!    dependency raising the floor even if nobody touched a manifest here.
 //!
 //! Both must fail today (the floor is `v4_18`) before the manifest edit lands; that red run is
@@ -33,13 +33,8 @@ const GTK_FLOOR: u32 = 14;
 /// same way a GTK one would be.
 const WEBKIT_FLOOR: u32 = 40;
 
-/// The three manifests that declare `gtk4` directly, and whether that line must keep
-/// `optional = true` (only `supervisor`'s, gated behind its `gui` feature).
-const GTK4_MANIFESTS: &[(&str, bool)] = &[
-    ("shell/Cargo.toml", false),
-    ("neovide-editor/Cargo.toml", false),
-    ("supervisor/Cargo.toml", true),
-];
+/// The manifests that declare `gtk4` directly.
+const GTK4_MANIFESTS: &[&str] = &["shell/Cargo.toml", "neovide-editor/Cargo.toml"];
 
 /// `-i` targets: the three `-sys` crates whose version-feature convention this guard polices.
 /// `gtk4-sys` catches a manifest bump directly; `gdk4-sys`/`gsk4-sys` catch the same violation
@@ -54,12 +49,12 @@ fn workspace_root() -> PathBuf {
         .to_path_buf()
 }
 
-/// Textually pulls `features = [...]` and whether `optional = true` is present off the single-line
-/// `gtk4 = { ... }` dependency declaration in `manifest_path`. No `toml` parser dependency is added
-/// for this: all three lines are simple single-line inline tables today, and a manifest edit that
+/// Textually pulls `features = [...]` off the single-line `gtk4 = { ... }` dependency declaration in
+/// `manifest_path`. No `toml` parser dependency is added for this: both lines are simple single-line
+/// inline tables today, and a manifest edit that
 /// breaks this parse (e.g. splitting the table across lines) is exactly the kind of change that
 /// should fail loudly here rather than pass silently.
-fn parse_gtk4_line(manifest_path: &Path) -> (Vec<String>, bool) {
+fn parse_gtk4_line(manifest_path: &Path) -> Vec<String> {
     let text =
         std::fs::read_to_string(manifest_path).unwrap_or_else(|e| panic!("reading {}: {e}", manifest_path.display()));
     let line = text
@@ -87,30 +82,20 @@ fn parse_gtk4_line(manifest_path: &Path) -> (Vec<String>, bool) {
         .filter(|s| !s.is_empty())
         .collect();
 
-    // `optional = true` on the same single line; good enough for these three manifests, and a
-    // false positive (matching the word inside a comment on the same line) is not a shape any of
-    // them has.
-    let optional = line.contains("optional") && line.contains("true");
-    (features, optional)
+    features
 }
 
 #[test]
 fn gtk4_manifests_declare_exactly_the_v4_14_floor() {
     let root = workspace_root();
-    for (rel, expect_optional) in GTK4_MANIFESTS {
+    for rel in GTK4_MANIFESTS {
         let path = root.join(rel);
-        let (features, optional) = parse_gtk4_line(&path);
+        let features = parse_gtk4_line(&path);
         assert_eq!(
             features,
             vec!["v4_14".to_string()],
             "{rel}: the gtk4 dependency's `features` must be exactly [\"v4_14\"], found {features:?}"
         );
-        if *expect_optional {
-            assert!(
-                optional,
-                "{rel}: gtk4 must stay `optional = true` (gated behind supervisor's `gui` feature, L2 T6)"
-            );
-        }
     }
 }
 
@@ -188,8 +173,6 @@ fn run_cargo_tree_inverted(invert: &str, root: &Path) -> String {
             "-p",
             "shell",
             "-p",
-            "supervisor",
-            "-p",
             "neovide-editor",
         ])
         .current_dir(root)
@@ -201,7 +184,7 @@ fn run_cargo_tree_inverted(invert: &str, root: &Path) -> String {
         // instead of running `cargo fetch` first.
         let stderr = String::from_utf8_lossy(&output.stderr);
         panic!(
-            "`cargo tree --locked --offline -e features -i {invert} -p shell -p supervisor -p \
+            "`cargo tree --locked --offline -e features -i {invert} -p shell -p \
              neovide-editor` failed (exit {:?}). If this is about the registry or lock file, run \
              `cargo fetch` and re-run this test -- do not drop --offline. stderr:\n{stderr}",
             output.status.code()

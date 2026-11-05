@@ -353,6 +353,25 @@ fn a_toast_goes_when_its_time_is_up() {
 }
 
 #[test]
+fn a_round_keys_status_line_goes_after_its_own_time() {
+    use crate::wm::agents_round::{RoundOutcome, NOTHING_WAITS_TEXT, STATUS_FOR};
+    let r = driven(Layout::new(leaf(editor()), editor()).unwrap());
+    r.host.post(HostEvent::Agents {
+        win: WIN,
+        outcome: RoundOutcome::NothingWaits,
+    });
+    assert_eq!(
+        r.chrome().toast.map(|toast| toast.text).as_deref(),
+        Some(NOTHING_WAITS_TEXT)
+    );
+    r.scheduler.advance(STATUS_FOR - Duration::from_millis(1));
+    assert!(r.chrome().toast.is_some(), "still up before its time");
+    r.scheduler.advance(Duration::from_millis(1));
+    assert_eq!(r.chrome().toast, None);
+    assert!(STATUS_FOR < TOAST_FOR, "shorter than a refusal's toast");
+}
+
+#[test]
 fn a_refusal_flashes_but_leaves_a_waiting_cards_toast_up() {
     let r = driven(Layout::new(leaf(editor()), editor()).unwrap());
     r.host.post(HostEvent::Chat(ChatEvent::Toast {

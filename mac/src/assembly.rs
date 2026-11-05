@@ -253,7 +253,8 @@ impl Shared {
                 self.panel_scale.set(stepped(self.panel_scale.get(), change));
                 self.panel.set_panel_font_size_px(self.panel_font_size_px());
             }
-            CompanionVerb::Hint => self.actions.toast(NOT_IN_THIS_WINDOW),
+            // The agents layer runs only in the GTK shell: no round walks this window.
+            CompanionVerb::Hint | CompanionVerb::Round(_) => self.actions.toast(NOT_IN_THIS_WINDOW),
             CompanionVerb::Literal => {
                 if let Some(key) = literal_for(&action, &self.keymap) {
                     match pane {

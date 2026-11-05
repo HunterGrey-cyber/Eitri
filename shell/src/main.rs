@@ -5,6 +5,7 @@
 //! the crate's own module docs.
 
 mod agent_panel;
+mod agents_host;
 mod capture_requests;
 mod chat_views;
 mod choose_project;
@@ -191,6 +192,26 @@ fn main() -> glib::ExitCode {
         .is_some_and(|a| a == eitri_core::run_guard::SUBCOMMAND)
     {
         eitri_core::run_guard::serve_inherited();
+    }
+    // Agent summaries have their own arguments and never open a project or start GTK.
+    #[cfg(target_os = "linux")]
+    if early_args.first().is_some_and(|a| a == "agents") {
+        let args = match early_args[1..]
+            .iter()
+            .map(|arg| arg.to_str().map(str::to_owned))
+            .collect::<Option<Vec<_>>>()
+        {
+            Some(args) => args,
+            None => {
+                eprintln!("eitri agents: arguments must be valid UTF-8");
+                return glib::ExitCode::from(64);
+            }
+        };
+        let control = eitri_core::panel_control::control_dir(
+            std::env::var_os("XDG_RUNTIME_DIR").as_deref(),
+            &std::env::temp_dir(),
+        );
+        return glib::ExitCode::from(eitri_core::agents::cli::run(&args, &mut std::io::stdout(), &control) as u8);
     }
     // `eitri panel` is its own command line: the project resolver below would read `panel` as a directory.
     if early_args.first().is_some_and(|a| a == "panel") {
@@ -543,14 +564,6 @@ fn main() -> glib::ExitCode {
 /// one `PaneSwitch` directory and one set of `app.add_action` names, none of which this window was
 /// ever designed to share. `shell` is a per-project window (its own nvim child, its own agent
 /// session, its own project root), so two launches must genuinely be two processes.
-///
-/// `supervisor/src/bin/eitri_supervisor.rs` solves the same collision the opposite way, with an
-/// `app.windows().first()` guard that raises the existing window instead. That is right *there*
-/// and wrong here: exactly one dashboard is the supervisor's design, whereas a guard in `shell`
-/// would make `shell ~/other-project` silently raise the window for the project already open and
-/// never open the one that was asked for. Turning the singleton off is the mechanism that matches
-/// what this binary is -- `shell` is the first product binary in this workspace to need it for
-/// what a real second launch does, rather than to survive a sandbox that already has one running.
 ///
 /// `eitri FILE` going to a running window changes none of this: the launch that hands its file over exits before it
 /// gets here (`open_requests::hand_over`), so every window is still a process of its own.
@@ -4840,13 +4853,6 @@ fn build_ui(
     // one trim once it has settled gives them back.
     process_memory::trim_heap_after_startup();
 
-    // Waits for a cross-window "come to the front" request from `eitri-supervisor` -- e.g. the
-    // dashboard's own UI, or another shell instance, asking this window to raise itself.
-    {
-        let raised = window.clone();
-        agent_panel::watch_supervisor(agent_panel_handle.clone(), Rc::new(move || raised.present()));
-    }
-
     // What the window's teardown ends beyond its modules, handed to its services now that each is made and wired:
     // held there, each lives exactly as long as the window, and each is removed by its own teardown step.
     *teardown.borrow_mut() = Some(Rc::new(gtk_host_services::Teardown {
@@ -4869,6 +4875,81 @@ fn build_ui(
     // Last: the answer to a request goes through the teardown's handle, and a request is acted on as soon as it is read.
     if let Some(requests) = &incoming_opens {
         requests.watch();
+    }
+
+    // The agents layer: a window that shows chats publishes its tabs' rows and serves `ag-<instance>.sock`; the hub
+    // publishes none and serves `new` as a new chat window. A page window of a group holds no chat and publishes
+    // nothing; it serves its socket only so a round started from its page can come back to it. Started
+    // after the window exists, off this thread; with `agents.enabled = false` nothing is made. Once started the layer
+    // keeps itself until the window goes; the window's plugin pages that declare `agents` hold it for their verbs.
+    let agents_enabled = agents_host::enabled(
+        lua_engine
+            .config
+            .borrow()
+            .get(eitri_core::agent_prefs::AGENTS_ENABLED_KEY),
+    );
+    let mut window_agents_host = None;
+    if shows_a_chat {
+        let window_name = match (&module_window, pair.pair_role()) {
+            _ if hub => "1".to_owned(),
+            (Some((name, _)), _) => name.text(),
+            (None, eitri_core::window_link::pair::Role::Main) => "1".to_owned(),
+            (None, eitri_core::window_link::pair::Role::Second) => "2".to_owned(),
+            (None, eitri_core::window_link::pair::Role::Unpaired) => "u".to_owned(),
+        };
+        window_agents_host = agents_host::start_for_window(agents_host::AgentsWindow {
+            app: app.clone(),
+            window: window.clone(),
+            driver: Rc::downgrade(&driver),
+            win: WinId::MAIN,
+            raise: pair_raise.clone(),
+            panel: (!hub).then(|| agent_panel_handle.clone()),
+            enabled: agents_enabled,
+            project_root: project_root.to_path_buf(),
+            window_name,
+        });
+    } else if !pair.is_beside() {
+        // A page window of a group publishes nothing, but a round started from its page comes back here.
+        window_agents_host = agents_host::start_for_page_window(agents_host::AgentsWindow {
+            app: app.clone(),
+            window: window.clone(),
+            driver: Rc::downgrade(&driver),
+            win: WinId::MAIN,
+            raise: pair_raise.clone(),
+            panel: None,
+            enabled: agents_enabled,
+            project_root: project_root.to_path_buf(),
+            window_name: String::new(),
+        });
+    }
+    // A page that declares `agents`, in any window that has plugins (a page window included), reads every window's
+    // rows through one reader and asks them through their sockets; its own window's tabs go through the host above.
+    // With the layer off its pages are answered `disabled`.
+    if agents_enabled {
+        let token: Rc<dyn Fn() -> Option<String>> = {
+            let window = window.downgrade();
+            Rc::new(move || window_services::activation_token(&window))
+        };
+        // A round a page started is left by giving that page the keys again, as its `layout.focus` would.
+        let show_and_focus: plugin_panels::ShowAndFocus = {
+            let driver = Rc::downgrade(&driver);
+            Rc::new(move |id: &ModuleId| match driver.upgrade() {
+                Some(driver) => driver.plugin_focus(WinId::MAIN, id),
+                None => Err("the window is gone".to_string()),
+            })
+        };
+        let window_agents = Rc::new(plugin_panels::WindowAgents::new(
+            agents_host::control_dir(),
+            token,
+            show_and_focus,
+        ));
+        window_agents.set_host(window_agents_host);
+        plugin_panels.set_agents(Some(window_agents));
+        // A module declared shown while agents wait comes and goes with them, the keys left where they are, where
+        // modules are tiles; where pages are windows of the compositor it opens only by its key.
+        plugin_panels.show_while_agents_wait(Rc::new(window_services::WaitFollowWindow(GridFollowWindow {
+            driver: Rc::downgrade(&driver),
+        })));
     }
 
     // A termination signal closes the window without its questions: nobody may be there to answer, and the process

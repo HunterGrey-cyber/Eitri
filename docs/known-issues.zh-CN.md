@@ -1,5 +1,5 @@
 [English](known-issues.md) | 简体中文
-<!-- translated-from: known-issues.md sha256=5f23d3aa1dd5a934bfb2549c9bb49b85b1a2455c5552b7a0770bb3bc8412ccc4 -->
+<!-- translated-from: known-issues.md sha256=c178ef10c4e979379ca6b832e944b25e377c03d36b0db424f5a60fdbf16e4cbe -->
 
 # 已知问题与限制
 
@@ -75,7 +75,7 @@ Companion 模式是把 agent 面板作为一个独立窗口，开在你自己的
 - **开在你 nvim 旁边的页面**（`eitri page`、`:EitriPage`；[使用指南](guide/companion.zh-CN.md#pages-beside-your-nvim)）只经过了测试，还没有在窗口里跑过。仍然欠着：在隔离的无界面桌面里配合终端里的真实 Neovim 跑一遍（页面的配色、跟随、按键、关闭、`kill -9`、tmux 里的 nvim）；虚拟机里的 Hyprland 0.56.2 和 0.57；niri；KDE；启用了扩展的 GNOME；真实硬件；以及 nvim 0.11（最低版本），它没有跑过。agent 工作期间的缓冲区重新加载，以及聚焦时的重新加载（在 tmux 里需要 `set -g focus-events on`），也处于同样的状态。
 - **接管终端里的 nvim**（`:EitriOpen`、`eitri open`；[指南](guide/takeover.zh-CN.md)）已经在测试里用真实的 Neovim（0.12）、私有的 tmux 和隔离的显示试过，但还没有在窗口里被人看着跑过，也没在真实硬件上试过。还欠：那次窗口里的运行、Hyprland 和 GNOME 会话、真实的 lazy.nvim 配置，以及作为已安装插件的 vim-tmux-navigator 和 smart-splits。
 - **页面窗口在两种情况下关得慢。** 正常关闭会把它的槽位留在你的 Neovim 里，直到 Neovim 下一次存活检查（最多一秒），被杀掉的窗口也一样；你运行 `:EitriPage` 时如果 Neovim 正卡在一个提示上，`eitri page` 会一直等着、不开窗口，直到它响应。
-- **GNOME 需要 Eitri GNOME Shell 扩展**才能移动焦点：由你自己启用，下次登录时生效（见[使用指南](guide/companion.zh-CN.md#gnome-the-extension)）。有了它：移动只在拥有焦点的窗口所在的显示器上进行；X11 或 XWayland 窗口永远不算数；在上一次移动之后大约三分之一秒内再移回去会被拒绝；所有窗口都跑在同一个进程里的终端（GNOME Terminal、Ptyxis）在交回焦点时会落到它最近使用的窗口，那未必是 nvim 所在的窗口；被转发的 `eitri split` 不会把面板带到前面；监视器的“带到前面”不起作用。
+- **GNOME 需要 Eitri GNOME Shell 扩展**才能移动焦点：由你自己启用，下次登录时生效（见[使用指南](guide/companion.zh-CN.md#gnome-the-extension)）。有了它：移动只在拥有焦点的窗口所在的显示器上进行；X11 或 XWayland 窗口永远不算数；在上一次移动之后大约三分之一秒内再移回去会被拒绝；所有窗口都跑在同一个进程里的终端（GNOME Terminal、Ptyxis）在交回焦点时会落到它最近使用的窗口，那未必是 nvim 所在的窗口；被转发的 `eitri split` 不会把面板带到前面。
 
 ## 安全
 

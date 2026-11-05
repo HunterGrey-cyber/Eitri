@@ -17,7 +17,7 @@ The window is made of modules you arrange yourself, i3/tmux style:
 - **[Terminals](keys.md#containers-and-terminals).** The bottom terminal and `terminal#2` to `terminal#9`,
   each with its own shell, started when you first show it.
 - **[The `claude` in your terminal](terminal-claude.md).** Off by default: a `claude` you run in the bottom terminal can show its edits as diffs in your Neovim and read your diagnostics and selection.
-- **[Plugin and Lua pages](pages.md).** Pages you add are modules alongside the built-in ones; Eitri ships one, the [Markdown preview](markdown-preview.md).
+- **[Plugin and Lua pages](pages.md).** Pages you add are modules alongside the built-in ones; Eitri ships the [Markdown preview](markdown-preview.md) and three pages that show [many agents at once](many-agents.md).
 - **[Containers](keys.md#containers-and-terminals).** Split modules side by side or one above another, or put them in tabbed or stacked containers.
 - **[Floats and the scratchpad](keys.md#floats-the-scratchpad-and-workspaces).** Float a module over the others, or stow it and call it back; it keeps running. The editor stays tiled.
 - **[Workspaces](keys.md#floats-the-scratchpad-and-workspaces).** Keep several arrangements of the same modules and switch between them.
@@ -47,6 +47,7 @@ you register, and you supervise each of them yourself, in a window you control.
 - [Take over a terminal nvim](takeover.md): move the Neovim running in your terminal into an Eitri window, and have it back in the terminal when the window ends.
 - [Turn review](turn-review.md): see what changed on disk during a turn, revert a hunk, send comments back.
 - [Markdown preview](markdown-preview.md): a Markdown file rendered beside the editor, scrolling with it, read with Vim keys.
+- [Many agents at once](many-agents.md): which of your agents needs you, across tabs and windows: three pages, `prefix u`, `eitri agents`, and pages of your own.
 - [Permissions](permissions.md): what runs without asking, what waits on a card, and the bypass mode.
 - [Codex and other agents](agents.md): tabs that run Codex, or an agent you register that speaks ACP.
 - [Your editor, from an agent's tab](editor-tools.md): how an agent in any tab shows you a file, reads what your editor holds, asks your language servers and proposes changes for you to approve, and how to turn that off.

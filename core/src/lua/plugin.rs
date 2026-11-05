@@ -47,7 +47,7 @@ impl PluginRegistration {
         }
         module.map(|m| OpenRule {
             at: m.at,
-            size: m.size.map(RuleSize::Share),
+            size: m.rule_size(),
             focus: m.focus,
             float: false,
             scratchpad: false,
@@ -528,6 +528,47 @@ mod tests {
             })
         );
         assert!(!p.starts_hidden());
+    }
+
+    #[test]
+    fn a_pixel_height_in_the_manifest_opens_the_module_at_that_height() {
+        use crate::layout::fixture::fixture;
+        use crate::layout::module::ModuleId;
+        use crate::layout::rules::open_by_rule;
+        use crate::layout::{arrange, Frame, Size};
+
+        let s = Scratch::new("lua-px-rule");
+        let (dir, settings) = demo_plugin(&s.0);
+        let demo = include_str!("../plugin/testdata/demo-manifest.toml");
+        let strip = demo
+            .replacen("at = \"right\"", "at = \"above\"", 1)
+            .replacen("size = 0.4", "size = \"24px\"", 1);
+        std::fs::write(dir.join("eitri-plugin.toml"), &strip).unwrap();
+        let (lua, registry) = engine(&s.0.join("state"));
+        lua.load(format!(
+            "eitri.plugin.load({:?}, {{ work = {:?} }})",
+            dir.display().to_string(),
+            settings["work"]
+        ))
+        .exec()
+        .unwrap();
+        let p = registry.take().plugins.remove(0);
+        let rule = p.own_rule().unwrap();
+        assert_eq!(rule.size, Some(RuleSize::Pixels(24)));
+
+        let mut layout = fixture("editor focus");
+        let id = ModuleId::lua("demo");
+        open_by_rule(
+            &mut layout,
+            &id,
+            &rule,
+            Some(&ModuleId::editor()),
+            crate::layout::rules::NOMINAL_GRID,
+        )
+        .unwrap();
+        let arranged = arrange(&layout, &Frame::new(Size { w: 1200, h: 800 }, 1));
+        let rect = arranged.modules.iter().find(|(m, _)| *m == id).unwrap().1;
+        assert_eq!(rect.h, 24);
     }
 
     #[test]

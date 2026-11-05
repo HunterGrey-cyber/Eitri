@@ -1,10 +1,10 @@
-# The plugin directories a release ships (today the Markdown preview): in the tarball at lib/eitri/plugins/<name>,
+# The bundled Markdown preview and three agents faces: in the tarball at lib/eitri/plugins/<name>,
 # installed with the binaries at $NV_LIB/plugins/<name> and swapped with them; a from-source install stages them from
 # the tree it built. Sourced by harness.sh.
 # shellcheck shell=sh
 # shellcheck disable=SC2034 # RC, TH and the like are read by harness.sh's helpers
 
-PLUGIN_NAMES='markdown'
+PLUGIN_NAMES='markdown agents-strips agents-top agents-pass'
 
 # plugin_dir: where the installer puts the Markdown preview plugin directory.
 plugin_dir() { printf '%s\n' "$TH/.local/lib/eitri/plugins/markdown"; }
@@ -26,6 +26,10 @@ t_plugin_directory_installed_with_the_binaries() {
 	if ! grep -q 'preview 1.0.0' "$(plugin_dir)/web/dist/index.html"; then
 		fail "the installed page is not the 1.0.0 tarball's: $(cat "$(plugin_dir)/web/dist/index.html")"
 	fi
+	for name in $PLUGIN_NAMES; do
+		expect_file "$TH/.local/lib/eitri/plugins/$name/eitri-plugin.toml"
+		expect_file "$TH/.local/lib/eitri/plugins/$name/web/dist/index.html"
+	done
 	# The user's data directory is the user's own: an install never writes a plugin there.
 	expect_absent "$(data_of)/eitri/plugins"
 }
@@ -68,6 +72,28 @@ t_tarball_without_the_plugin_directory_is_refused() {
 	expect_eq "$(snap "$TH")" "$before" "the home after the refusal"
 }
 
+TESTS="$TESTS t_tarball_without_an_agents_face_is_refused"
+t_tarball_without_an_agents_face_is_refused() {
+	serve 1.0.0
+	d=$(served 1.0.0)
+	top=eitri-1.0.0-x86_64-linux
+	for face in agents-strips agents-top agents-pass; do
+		rm -rf "$T/bad"
+		mkdir -p "$T/bad"
+		tar -C "$T/bad" -xzf "$d/$top.tar.gz"
+		rm -rf "$T/bad/$top/lib/eitri/plugins/$face"
+		tar -C "$T/bad" -czf "$d/$top.tar.gz" "$top"
+		resign "$d"
+		relatest 1.0.0
+		before=$(snap "$TH")
+		inst_net
+		expect_fail "a tarball without the $face plugin"
+		expect_out "has no lib/eitri/plugins/$face/eitri-plugin.toml"
+		expect_eq "$(snap "$TH")" "$before" "the home after the refusal ($face)"
+		serve 1.0.0
+	done
+}
+
 TESTS="$TESTS t_release_before_the_shipped_plugins_is_refused_with_its_way_back"
 t_release_before_the_shipped_plugins_is_refused_with_its_way_back() {
 	serve 1.0.0
@@ -108,6 +134,13 @@ t_from_source_stages_the_plugin_directory() {
 	expect_file "$(plugin_dir)/web/dist/preview.js"
 	expect_absent "$(plugin_dir)/web/dist/.inputs-sha256"
 	expect_absent "$(plugin_dir)/web/src"
+	for name in $PLUGIN_NAMES; do
+		for rel in eitri-plugin.toml web/dist/index.html; do
+			if ! cmp -s "$FS_DIR/plugins/$name/$rel" "$TH/.local/lib/eitri/plugins/$name/$rel"; then
+				fail "the installed $name/$rel differs from the built checkout"
+			fi
+		done
+	done
 }
 
 TESTS="$TESTS t_from_source_without_the_plugin_site_refuses"

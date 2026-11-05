@@ -45,7 +45,9 @@ NV_SIDECAR_REPO_BASE=https://github.com/HunterGrey-cyber/verdandi
 NV_GTK_FLOOR_MINOR=14
 NV_GLIBC_FLOOR='2.39'
 NV_NVIM_FLOOR='0.11.0'
-NV_BINARIES='shell eitri-supervisor eitri-tmux-shim eitri-claude-handoff eitri-run-guard eitri-editor-bridge'
+# Retired companions are removed from staged archives before the install is swapped in.
+NV_OLD_BINARIES='eitri-supervisor'
+NV_BINARIES='shell eitri-tmux-shim eitri-claude-handoff eitri-run-guard eitri-editor-bridge'
 NV_LICENCE_FILES='LICENSE THIRD-PARTY-LICENSES SOURCE'
 # The desktop entry is named by the application id (the compositor matches a window to <id>.desktop;
 # the icon theme's icon name and the window's class, shell/src/main.rs's APP_ID, are the same string).
@@ -71,12 +73,12 @@ NV_PLUGIN_FILES='plugin/eitri.lua lua/eitri/init.lua lua/eitri/health.lua doc/ei
 # list to the committed files.
 NV_EXT_ID='eitri@huntergrey.cn'
 NV_EXT_FILES='metadata.json extension.js direction.js policy.js'
-# The plugin directories the release ships (today the Markdown preview): in the release tarball at
+# The bundled Markdown preview and agents faces: in the release tarball at
 # lib/eitri/plugins/<name>/ (its eitri-plugin.toml and its built site under web/dist/), so they are installed, upgraded
 # and removed with the binaries and the running binary finds them beside itself; never in the user's data directory,
 # whose own plugins the window looks at first. A from-source install stages them from the tree it built. A test holds
 # this list to the harness's.
-NV_SHIPPED_PLUGINS='markdown'
+NV_SHIPPED_PLUGINS='markdown agents-strips agents-top agents-pass'
 # The icon, one file per size under the icon theme's tree: each is in the release tarball at
 # share/icons/<this path> and goes to $XDG_DATA_HOME/icons/<this path> (packaging/release_check.py's
 # role table holds the tarball to exactly this set, and a test holds the two lists equal).
@@ -3950,7 +3952,7 @@ do_from_source() {
 		rm -f -- "$NV_FROM_SOURCE_DIR/target/release/$_dfs_b" || die "cannot remove the stale $NV_FROM_SOURCE_DIR/target/release/$_dfs_b"
 	done
 	run_in "$NV_FROM_SOURCE_DIR" env "PATH=$_dfs_node_top/bin:$PATH" "SKIA_BINARIES_URL=file://$NV_SKIA_ARCHIVE" \
-		cargo build --release --locked --target-dir "$NV_FROM_SOURCE_DIR/target" -p shell -p agent -p supervisor --bins
+		cargo build --release --locked --target-dir "$NV_FROM_SOURCE_DIR/target" -p shell -p agent --bins
 
 	from_source_stage "$NV_FROM_SOURCE_DIR" "$NV_RELEASE_PATH"
 	finish_install
@@ -4077,6 +4079,9 @@ unpack_new() {
 	mkdir -p -- "$NV_LIBROOT" || die "cannot create $NV_LIBROOT"
 	NV_NEW_CREATED=1
 	cp -R -- "$_un_top/lib/eitri" "$NV_LIB.new" || die "cannot copy the new install to $NV_LIB.new (is the disk full?)"
+	for _un_f in $NV_OLD_BINARIES; do
+		rm -f -- "$NV_LIB.new/$_un_f" || die "cannot remove the retired companion $_un_f from $NV_LIB.new"
+	done
 }
 
 # swap_in: the swap of the new install into place.

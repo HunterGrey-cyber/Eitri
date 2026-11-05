@@ -2,6 +2,21 @@
 # shellcheck shell=sh
 # shellcheck disable=SC2034 # RC, TH and the like are read by harness.sh's helpers
 
+if [ "${0##*/}" = test_layout.sh ]; then
+	# Run by hand: the layout tests alone, on a scratch under ~/.cache (never /tmp), removed when they pass.
+	layout_scratch=$HOME/.cache/nv-v1dist-t9/layout.$$
+	set --
+	# shellcheck disable=SC2016 # Match the literal TESTS assignment in this file.
+	layout_tests=$(sed -n 's/^TESTS="$TESTS \([^"]*\)"$/\1/p' "$0")
+	for layout_test in $layout_tests; do
+		set -- "$@" --only "$layout_test"
+	done
+	bash "$(dirname "$0")/harness.sh" --sh bash --scratch "$layout_scratch" "$@"
+	layout_rc=$?
+	[ "$layout_rc" != 0 ] || rm -rf "$layout_scratch"
+	exit "$layout_rc"
+fi
+
 EXPECTED_TREE='./.local d
 ./.local/bin d
 ./.local/bin/eitri f
@@ -12,9 +27,23 @@ EXPECTED_TREE='./.local d
 ./.local/lib/eitri/eitri-editor-bridge f
 ./.local/lib/eitri/eitri-run-guard f
 ./.local/lib/eitri/eitri-setup f
-./.local/lib/eitri/eitri-supervisor f
 ./.local/lib/eitri/eitri-tmux-shim f
 ./.local/lib/eitri/plugins d
+./.local/lib/eitri/plugins/agents-pass d
+./.local/lib/eitri/plugins/agents-pass/eitri-plugin.toml f
+./.local/lib/eitri/plugins/agents-pass/web d
+./.local/lib/eitri/plugins/agents-pass/web/dist d
+./.local/lib/eitri/plugins/agents-pass/web/dist/index.html f
+./.local/lib/eitri/plugins/agents-strips d
+./.local/lib/eitri/plugins/agents-strips/eitri-plugin.toml f
+./.local/lib/eitri/plugins/agents-strips/web d
+./.local/lib/eitri/plugins/agents-strips/web/dist d
+./.local/lib/eitri/plugins/agents-strips/web/dist/index.html f
+./.local/lib/eitri/plugins/agents-top d
+./.local/lib/eitri/plugins/agents-top/eitri-plugin.toml f
+./.local/lib/eitri/plugins/agents-top/web d
+./.local/lib/eitri/plugins/agents-top/web/dist d
+./.local/lib/eitri/plugins/agents-top/web/dist/index.html f
 ./.local/lib/eitri/plugins/markdown d
 ./.local/lib/eitri/plugins/markdown/eitri-plugin.toml f
 ./.local/lib/eitri/plugins/markdown/web d
@@ -91,7 +120,7 @@ t_fresh_layout() {
 	expect_rc 0
 	expect_eq "$(tree "$TH")" "$EXPECTED_TREE" "the installed tree"
 	expect_eq "$(installed_version)" 1.0.0 "the installed version"
-	for b in shell eitri-supervisor eitri-tmux-shim eitri-claude-handoff eitri-run-guard eitri-editor-bridge eitri-setup; do
+	for b in shell eitri-tmux-shim eitri-claude-handoff eitri-run-guard eitri-editor-bridge eitri-setup; do
 		expect_exec "$TH/.local/lib/eitri/$b"
 	done
 	expect_exec "$TH/.local/bin/eitri"
@@ -521,4 +550,21 @@ t_path_warning() {
 	inst_net --stubs "$S/stubs-patheitri" --
 	expect_rc 0
 	expect_out "\`eitri\` on this PATH runs $S/stubs-patheitri/eitri, not the one just installed"
+}
+
+TESTS="$TESTS an_upgrade_from_0_2_0_removes_the_old_supervisor_binary"
+an_upgrade_from_0_2_0_removes_the_old_supervisor_binary() {
+	serve_old_layout 1.0.0
+	run_old_installer --stubs "$S/stubs-net" --
+	expect_rc 0
+	old_binary=eitri-$(printf '%s' supervisor)
+	expect_exec "$TH/.local/lib/eitri/$old_binary"
+	# The new release's tarball carries the placeholder 0.2.0's installer wants (packaging/legacy/README.md).
+	serve 1.1.0 1.0.0
+	inst_net --stubs "$S/stubs-net" --
+	expect_rc 0
+	expect_eq "$(installed_version)" 1.1.0 "the version after the upgrade"
+	expect_absent "$TH/.local/lib/eitri/$old_binary"
+	expect_absent "$TH/.local/lib/eitri.old"
+	expect_absent "$TH/.local/lib/eitri.new"
 }

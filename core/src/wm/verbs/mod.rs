@@ -46,6 +46,8 @@ pub enum Family {
     Close,
     /// Text size.
     TextSize,
+    /// The round over the agents that wait, across windows.
+    Agents,
 }
 
 /// The family `action` belongs to by its kind alone. A `move.<dir>` with the keys on a float is a float's verb
@@ -104,6 +106,7 @@ pub fn family(action: &Action) -> Family {
             Family::Panel
         }
         Action::Text(_) | Action::TextAll(_) => Family::TextSize,
+        Action::AgentsNext | Action::AgentsBack => Family::Agents,
     }
 }
 

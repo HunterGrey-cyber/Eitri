@@ -207,7 +207,7 @@ pub(crate) fn root_note_for(root: &Path) -> Option<String> {
 /// `unavailable`: `Some(notice)` when WebKit's sandbox cannot start in this process
 /// (`webkit_sandbox::Decision::Unavailable`). Then no `WebView` -- nor anything else of WebKit's --
 /// is built: the panel's place is `webkit_sandbox::notice_widget(notice)`, and the handle carries the
-/// same state with no page (`AgentPanelHandle::with_pages`'s own doc), no pump, no supervisor client.
+/// same state with no page (`AgentPanelHandle::with_pages`'s own doc), no pump.
 /// Otherwise the handle is built first and the base view's page built for it by [`build_chat_page`].
 ///
 /// The companion window's panel, whose page is built at once: it has no mode to wait for. A main window takes
@@ -612,62 +612,6 @@ fn start_pump_timer(handle: AgentPanelHandle) {
     // The first tick at once: whatever the window set up before the loop runs is sent by it.
     pump.schedule.borrow_mut().on_wake(Instant::now());
     pump.arm(Instant::now());
-}
-
-/// Raises the window when `eitri-supervisor` asks: `on_activate` runs for each request. A watch on the
-/// supervisor's socket once the panel has one, a look every 200 ms only while one is still being started and
-/// connected, and nothing at all when there is none -- a window with no supervisor used to look five times a
-/// second for its whole life.
-pub(crate) fn watch_supervisor(handle: AgentPanelHandle, on_activate: Rc<dyn Fn()>) {
-    use eitri_panel::agent_panel::SupervisorLink;
-    match handle.supervisor_link() {
-        SupervisorLink::Absent => {}
-        SupervisorLink::Connecting => {
-            gtk4::glib::timeout_add_local_once(SUPERVISOR_CONNECT_LOOK, move || watch_supervisor(handle, on_activate));
-        }
-        SupervisorLink::Socket(fd) => {
-            let watched = {
-                let handle = handle.clone();
-                let on_activate = on_activate.clone();
-                neovide_editor::fd_watch::add_local(
-                    fd,
-                    gtk4::glib::IOCondition::IN | gtk4::glib::IOCondition::ERR | gtk4::glib::IOCondition::HUP,
-                    gtk4::glib::ffi::G_PRIORITY_DEFAULT,
-                    move |_| {
-                        #[cfg(test)]
-                        SUPERVISOR_LOOKS.with(|looks| looks.set(looks.get() + 1));
-                        if handle.poll_activate() {
-                            on_activate();
-                        }
-                        // A connection that ended reads as readable for good: let go of it.
-                        match handle.supervisor_link() {
-                            SupervisorLink::Socket(_) => gtk4::glib::ControlFlow::Continue,
-                            SupervisorLink::Connecting | SupervisorLink::Absent => gtk4::glib::ControlFlow::Break,
-                        }
-                    },
-                )
-            };
-            if watched.is_err() {
-                // Not on the main context's own thread, where nothing could watch the socket: look on the
-                // timer, as the window always did.
-                gtk4::glib::timeout_add_local(SUPERVISOR_CONNECT_LOOK, move || {
-                    if handle.poll_activate() {
-                        on_activate();
-                    }
-                    gtk4::glib::ControlFlow::Continue
-                });
-            }
-        }
-    }
-}
-
-/// How often a window looks at a supervisor connection still being made, and at one it cannot watch.
-const SUPERVISOR_CONNECT_LOOK: std::time::Duration = std::time::Duration::from_millis(200);
-
-#[cfg(test)]
-thread_local! {
-    /// How often the supervisor watch ran, for the test that it is not woken while nothing arrives.
-    static SUPERVISOR_LOOKS: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
 }
 
 /// The panel's Content-Security-Policy: a floor the page cannot loosen, applied two ways -- as the
@@ -1660,54 +1604,6 @@ for (const first of [new Error('first'), undefined, null, false, 0]) {
         handle.wake();
         iterate_for(200);
         assert_eq!(handle.ticks_run(), before, "nothing runs after the close");
-    }
-
-    /// The supervisor raise waits on its socket: a connected window is not woken while nothing arrives
-    /// (it looked five times a second), a request still raises it at once, and a supervisor that goes away
-    /// lets go of the watch. A window with no supervisor arms nothing.
-    #[test]
-    fn the_supervisor_raise_waits_on_its_socket() {
-        let _turn = crate::layout_state::default_context_turn();
-        let context = gtk4::glib::MainContext::default();
-        let _owner = context.acquire().expect("glib's default main context");
-        let handle = AgentPanelHandle::for_host_test(std::rc::Rc::new(CountingPage::default()));
-        assert_eq!(
-            handle.supervisor_link(),
-            eitri_panel::agent_panel::SupervisorLink::Absent
-        );
-        watch_supervisor(handle.clone(), std::rc::Rc::new(|| panic!("no supervisor, no raise")));
-
-        let (ours, theirs) = std::os::unix::net::UnixStream::pair().unwrap();
-        handle.connect_test_supervisor(ours);
-        let raised = std::rc::Rc::new(std::cell::Cell::new(0));
-        {
-            let raised = raised.clone();
-            watch_supervisor(handle.clone(), std::rc::Rc::new(move || raised.set(raised.get() + 1)));
-        }
-        SUPERVISOR_LOOKS.with(|looks| looks.set(0));
-        iterate_for(1000);
-        let looks = SUPERVISOR_LOOKS.with(|looks| looks.get());
-        eprintln!("supervisor raise: {looks} looks in 1 s with nothing sent");
-        assert_eq!(looks, 0);
-
-        use std::io::Write;
-        (&theirs).write_all(b"{\"type\":\"activate\"}\n").unwrap();
-        iterate_for(100);
-        assert_eq!(raised.get(), 1, "the request raised the window");
-
-        drop(theirs);
-        iterate_for(100);
-        let after_close = SUPERVISOR_LOOKS.with(|looks| looks.get());
-        iterate_for(300);
-        assert_eq!(
-            SUPERVISOR_LOOKS.with(|looks| looks.get()),
-            after_close,
-            "a closed connection is let go, not looked at forever"
-        );
-        assert_eq!(
-            handle.supervisor_link(),
-            eitri_panel::agent_panel::SupervisorLink::Absent
-        );
     }
 
     #[test]

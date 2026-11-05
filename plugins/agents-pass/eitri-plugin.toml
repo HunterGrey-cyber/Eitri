@@ -1,0 +1,13 @@
+id = "agents-pass"
+title = "The pass"
+protocol = 1
+site = "web/dist"                   # the build directory, the same path installed and in the source tree
+entry = "index.html"
+capabilities = ["agents", "layout.focus"]
+
+[module]
+start = "hidden"                    # quiet by default: not placed until something waits
+shown_while = "agents-wait"         # the window shows it while an agent waits or a round runs, and hides it after
+at = "above"
+size = "28px"                       # one line
+focus = false

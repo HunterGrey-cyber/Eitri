@@ -5,7 +5,7 @@
 use eitri_core::source_scan::{self as scan, Source};
 
 /// Names no host code may hold, lower case.
-const NAMES: &[&str] = &["markdown", "snotra"];
+const NAMES: &[&str] = &["markdown", "snotra", "agents-strips", "agents-top", "agents-pass"];
 
 /// The `file:line: text` of each line of `text` naming a plugin in any letter case; a Rust file is read only up to
 /// its test module.
@@ -96,4 +96,12 @@ fn both_names_are_caught_and_test_module_formatting_does_not_matter() {
     assert!(!host_sources()
         .iter()
         .any(|source| source.path.ends_with("/tests.rs") || source.path.contains("/tests/")));
+}
+
+#[test]
+fn face_ids_are_refused_but_the_shared_capability_is_allowed() {
+    for id in ["AGENTS-STRIPS", "agents-top", "Agents-Pass"] {
+        assert_eq!(hits("x.rs", &format!("const ID: &str = {id:?};")).len(), 1);
+    }
+    assert!(hits("x.rs", r#"const CAPABILITY: &str = "agents";"#).is_empty());
 }

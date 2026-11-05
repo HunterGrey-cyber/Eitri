@@ -41,7 +41,7 @@ fn connect_bang_only_in_the_waiting_room() {
             "mac/src",
             "neovide-editor/src",
             "terminal",
-            "supervisor/src",
+            "plugin-kit/agents/src",
             "nvim",
             "plugins",
             "plugin-kit/keys/src",

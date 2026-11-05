@@ -1,5 +1,5 @@
 [English](configuration.md) | 简体中文
-<!-- translated-from: configuration.md sha256=a01d38c26a8820cdc72bd421bd93cbb08ba7f3538fb0ce631e13560128b35688 -->
+<!-- translated-from: configuration.md sha256=687daecb5d974bfb5c2fb3d7aa30231237fe9ba002ce3b66aedb9354dd9570cd -->
 
 # 配置
 
@@ -48,6 +48,7 @@ Eitri 说的方式是右上角的一条提示：有几个问题，以及前五�
 | `editor.restore` | `true` / `"on"` 或 `false` / `"off"` | `true` | 编辑器是否重新打开这个项目的上一个窗口关闭或崩溃时的文件、分屏、标签页和光标位置。`false` 既不读也不写，已保存的文件原样保留，再打开时从原来的地方接着来。它在 `init.lua` 运行之后读取。哪些会话插件会让 Eitri 让路，以及哪些东西会回来：[再次启动时](getting-started.zh-CN.md#when-you-start-again)。 |
 | `editor.takeover` | `true` / `"on"` 或 `false` / `"off"` | `true` | `:EitriOpen`（和 `eitri open`）是否可以把终端里运行的 Neovim 搬进 Eitri 窗口。`false` 时它会说 `takeover is off (editor.takeover in init.lua)`，终端保持原样。它自己不会启动任何东西：开着的时候，你不运行命令就什么都不会发生。值不对时，启动时会列出来并点名这个键，`eitri open` 则会拒绝它。[接管终端里的 nvim](takeover.zh-CN.md)。 |
 | `modules.chat.on_permission` | `"badge"` 或 `"reveal"` | `"badge"` | agent 面板被隐藏时来了一张权限卡片，会怎样。`"badge"` 在顶栏显示 `agent ⚑N` 并弹出一条提示；`"reveal"` 把面板带回它原来的位置，但不移动按键焦点。当另一个窗格被放大时，`"reveal"` 改为显示标记，因为显示面板并不会让它出现在屏幕上。companion 窗口从不隐藏它的面板，所以这个键在那里不起作用。 |
+| `agents.enabled` | `true` / `"on"` 或 `false` / `"off"` | `true` | 这个窗口是否为自己的每个 agent 标签页发布一行，并读取所有窗口的行；[`<prefix> u` 和 `<prefix> B`](keys.zh-CN.md)、显示你的 agent 的那些页面和 `eitri agents` 都建立在它之上。`false` 什么都不发布也不读取，这两个键在这个窗口里只会显示 `agents are off in this window`。见[同时用很多 agent](many-agents.zh-CN.md#turn-it-off)。 |
 | `review.enabled` | `true` / `"on"` 或 `false` / `"off"` | `true` | [回合审阅](turn-review.zh-CN.md)是否运行。`false` 不拍快照，也不提供审阅。 |
 | `review.hint` | `true` / `"on"` 或 `false` / `"off"` | `false` | 一个编辑过文件的回合结束后，是否在状态条里加一行提示，以及回合进行期间是否在输入框上方用一行统计它的编辑。无论如何，审阅都只差一个键。 |
 | `review.live` | `true` / `"on"` 或 `false` / `"off"` | `false` | agent 编辑的文件是否在编辑落地时就画在你的编辑器里，回合结束时再画一遍，并在缓冲区里提供全部保留和全部撤回（[实时画出改动](turn-review.zh-CN.md#live-drawings)）。启动时读取一次；`review.enabled` 是 `false` 时它不起作用，Eitri 会在启动时说明。 |
@@ -229,7 +230,7 @@ eitri.layout.rule("terminal#3", { scratchpad = true, focus = false })  -- 终端
 <a id="plugins"></a>
 ## 插件
 
-插件是窗口里一个自己的页面，作为模块和其他模块放在一起，只拿到它自己的清单里列出的能力。Eitri 自带一个，[Markdown 预览](markdown-preview.zh-CN.md)；你也可以自己写或安装别的（[你自己做的页面](pages.zh-CN.md)讲了怎么写，以及怎么把一个普通的 HTML 页面作为 Lua 面板加进来）。每个插件都是一个含有 `eitri-plugin.toml` 的目录，在 `init.lua` 加载它之前，它的任何部分都不会运行：
+插件是窗口里一个自己的页面，作为模块和其他模块放在一起，只拿到它自己的清单里列出的能力。Eitri 自带四个：[Markdown 预览](markdown-preview.zh-CN.md)，以及显示你的 agent 的三个页面（`agents-strips`、`agents-pass` 和 `agents-top`，见[同时用很多 agent](many-agents.zh-CN.md)）；你也可以自己写或安装别的（[你自己做的页面](pages.zh-CN.md)讲了怎么写，以及怎么把一个普通的 HTML 页面作为 Lua 面板加进来）。每个插件都是一个含有 `eitri-plugin.toml` 的目录，在 `init.lua` 加载它之前，它的任何部分都不会运行：
 
 ```lua
 eitri.plugin.load("markdown")                          -- 按名字
@@ -320,7 +321,6 @@ eitri.config.set("agent.default_mode", "auto")    -- "manual", "auto" (the defau
 | `EITRI_FIRST_START` | `off` 让[首次启动界面](#first-start)不再自己打开。其他非空值会被忽略，并记一行日志。 |
 | `EITRI_AGENT_TRACE` | 设为 `1`，每个回合在 stderr 上打印一行 `[turn-trace]`，带着这个回合的耗时。 |
 | `EITRI_WINDOW_LOG` | 设为 `off`，不写崩溃记录，也不留窗口日志。见 [Eitri 自己崩溃时](getting-started.zh-CN.md#eitri-自己崩溃时)。 |
-| `EITRI_SUPERVISOR` | 设为 `1`、`true` 或 `yes`，允许窗口在没有运行时启动 `eitri-supervisor`，一个显示所有已打开窗口的 agent 状态的仪表盘。没设置时，窗口只会连接到你自己启动的那个。 |
 | `EITRI_SIDECAR_BINARY` | 运行 agent 会话所用的 sidecar 程序的路径，替代 `eitri setup` 构建的或软件包安装的那个，也替代任何 [sidecar 更新](../../INSTALL.zh-CN.md#updating-the-sidecar)：它优先于更新，也不会被自带的 sidecar 顶替。不是文件的路径会在会话启动时报错。 |
 | `EITRI_EDITOR_DMABUF` | 编辑器怎样把它的绘制交给 GTK。`0`、`off`、`false` 或 `no` 使用 GTK 自己的纹理路径；`1`、`on`、`true` 或 `yes` 即使在比 4.16 旧的 GTK 上也强制使用 Eitri 自己的缓冲区；其他任何值或不设置，则从 GTK 4.16 起使用 Eitri 自己的缓冲区。 |
 | `XDG_STATE_HOME` | Eitri 保存它所记住的东西的地方：每个项目的布局、打开的标签页、提示历史、权限规则、信任的回答和回合审阅快照，都在这个目录下的 `eitri/` 里。未设置、为空或是相对路径时，表示 `~/.local/state`。不会往你的项目里写任何东西。 |

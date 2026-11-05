@@ -674,6 +674,9 @@ impl ServiceSet for Services {
     fn tab_moving(&self, tab: eitri_core::tabs::TabId) -> bool {
         self.agent.tab_moving(tab)
     }
+    fn tab_has_work(&self, tab: eitri_core::tabs::TabId) -> bool {
+        self.agent.tab_has_work(tab)
+    }
     fn page_built(&self, module: &ModuleId) -> bool {
         self.plugin_panels.is_built(module)
     }
@@ -1012,6 +1015,30 @@ impl ServiceSet for Services {
                 Ok(())
             }
         }
+    }
+
+    /// A round key: carried out by this window's agents layer, whose answer comes back as `HostEvent::Agents`. With
+    /// the layer off here it says so at once.
+    fn agents_scan(
+        &self,
+        win: WinId,
+        step: eitri_core::wm::agents_round::RoundKey,
+        at: Option<&ModuleId>,
+    ) -> Result<(), String> {
+        use eitri_core::wm::agents_round::RoundOutcome;
+        let sink = self.sink.clone();
+        let tell = move |outcome: RoundOutcome| {
+            if let Some(sink) = sink.upgrade() {
+                sink.post(HostEvent::Agents { win, outcome });
+            }
+        };
+        // The tab the keys are on, when they are on a chat: where `prefix B` comes back to.
+        let tab = at
+            .and_then(ViewId::of_module)
+            .and_then(|view| self.agent.tab_shown_in(view))
+            .map(|tab| tab.0);
+        crate::agents_host::round_key_here(step, at.map(|m| m.as_str().to_owned()).unwrap_or_default(), tab, tell);
+        Ok(())
     }
 
     fn chat(&self, op: &ChatOp) -> Result<(), String> {

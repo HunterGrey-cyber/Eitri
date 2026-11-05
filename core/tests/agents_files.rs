@@ -468,7 +468,7 @@ mod read {
     use agent::private_fs::{publish_private_file, PrivateLock};
     use eitri_core::agents::liveness::{self, clean_dead, Alive};
     use eitri_core::agents::publish::{agents_dir, new_instance, process_start_time, Publisher, PublisherHooks};
-    use eitri_core::agents::read::{scan_once, Batch, Reader, ReaderEvent, ReaderHooks};
+    use eitri_core::agents::read::{scan_once, scan_windows, Batch, Reader, ReaderEvent, ReaderHooks};
     use std::collections::BTreeMap;
     use std::ffi::OsStr;
     use std::io::{BufRead, Write};
@@ -1400,6 +1400,42 @@ mod read {
         pa.stop();
         pb.stop();
         pe.stop();
+    }
+
+    #[test]
+    fn scan_windows_names_every_running_window_with_or_without_rows() {
+        let scratch = Scratch::new("scan-windows");
+        let control = scratch.control();
+        assert!(scan_windows(&control, SCHEMA_V).unwrap().is_empty(), "no directory yet");
+        assert!(!control.exists(), "a one-shot read makes nothing");
+
+        let mut w = watch(&control, |_| {});
+        let chat = new_instance();
+        let hub = new_instance();
+        let hub_window = WindowRef {
+            instance: hub.clone(),
+            name: "1".into(),
+            focused: false,
+        };
+        let pc = Publisher::start(&control, &chat, project(), window(&chat)).unwrap();
+        let ph = Publisher::start(&control, &hub, project(), hub_window.clone()).unwrap();
+        pc.offer_now(vec![keyed(&chat, 1)]);
+        w.until(|f| f.rows.len() == 1);
+        let mut found = Vec::new();
+        for _ in 0..200 {
+            found = scan_windows(&control, SCHEMA_V).unwrap();
+            if found.len() == 2 {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        found.sort_by(|a, b| a.1.instance.cmp(&b.1.instance));
+        let mut expected = vec![(project(), window(&chat)), (project(), hub_window)];
+        expected.sort_by(|a, b| a.1.instance.cmp(&b.1.instance));
+        assert_eq!(found, expected, "the window that holds no tab is there too");
+        drop(w);
+        pc.stop();
+        ph.stop();
     }
 
     #[test]

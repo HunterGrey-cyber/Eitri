@@ -198,10 +198,10 @@ pub struct HandoffOutcome {
 }
 
 /// Locates the `eitri-claude-handoff` binary next to whichever binary is currently running --
-/// the same "same cargo build, sibling binary" convention as `supervisor::locate_supervisor_binary`
-/// and this crate's own `settings::locate_agent_hook_binary`, whose body this mirrors line for line
-/// with only the binary name changed. Keep all three in step: if the lookup rule needs to change,
-/// it needs to change in every one of them, not just here.
+/// the same "same cargo build, sibling binary" convention as this crate's own
+/// `settings::locate_agent_hook_binary`, whose body this mirrors line for line with only the binary
+/// name changed. Keep both in step: if the lookup rule needs to change, it needs to change in each of
+/// them, not just here.
 fn locate_handoff_binary() -> std::io::Result<std::path::PathBuf> {
     let current = std::env::current_exe()?;
     let dir = current

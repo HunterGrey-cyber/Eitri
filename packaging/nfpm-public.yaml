@@ -11,7 +11,7 @@ description: |
   ours to redistribute, so this package never contains it).
   Source, including this package's own build recipe: ${EITRI_SOURCE_URL}
 homepage: https://github.com/HunterGrey-cyber/eitri
-# The licence expression covers this package (the tarball's six binaries, statically linking
+# The licence expression covers this package (the tarball's five binaries, statically linking
 # nvim-rs LGPL-3.0-only) plus the MIT/Apache-2.0/MPL-2.0 licences the collector finds. No
 # LicenseRef-Anthropic-Claude-Agent-SDK here: this profile never carries the sidecar.
 license: MIT AND Apache-2.0 AND LGPL-3.0-only AND MPL-2.0
@@ -42,8 +42,6 @@ contents:
   # No agent-hook: releases never compile the legacy backend it would relay for.
   - src: ./target/release/shell
     dst: /usr/lib/eitri/shell
-  - src: ./target/release/eitri-supervisor
-    dst: /usr/lib/eitri/eitri-supervisor
   - src: ./target/release/eitri-tmux-shim
     dst: /usr/lib/eitri/eitri-tmux-shim
   - src: ./target/release/eitri-run-guard
@@ -121,6 +119,15 @@ contents:
   # entry never lists the site's files.
   - src: ./plugins/markdown
     dst: /usr/share/eitri/plugins/markdown
+    type: tree
+  - src: ./plugins/agents-strips
+    dst: /usr/share/eitri/plugins/agents-strips
+    type: tree
+  - src: ./plugins/agents-top
+    dst: /usr/share/eitri/plugins/agents-top
+    type: tree
+  - src: ./plugins/agents-pass
+    dst: /usr/share/eitri/plugins/agents-pass
     type: tree
 
   # The icon, in every size packaging/icons/hicolor holds, under the icon theme's own tree

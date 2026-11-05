@@ -11,7 +11,7 @@ use std::path::{Path, PathBuf};
 use std::rc::Rc;
 
 use eitri_core::plugin::doc_route::{self, DocSlot};
-use eitri_core::plugin::host::PagePort;
+use eitri_core::plugin::host::{GestureClock, PagePort};
 use eitri_core::plugin::manifest::Origin;
 use eitri_core::plugin::page_policy::{self, Navigation, SiteRefusal};
 use eitri_core::plugin::protocol::BRIDGE_JS;
@@ -33,6 +33,17 @@ pub(crate) const HANDLER: &str = "eitriPlugin";
 /// The keyboard kit `build.rs` bundles from `plugin-kit/keys`, answered at `page_policy::KIT_PATH` in every
 /// plugin's origin so a page loads it with an ordinary same-origin script tag under the CSP floor.
 const KIT_JS: &str = include_str!("../../plugin-kit/keys/dist/keys.js");
+const AGENTS_KIT_JS: &str = include_str!("../../plugin-kit/agents/dist/agents.js");
+
+/// The scripts a page of this spec gets at document start after the bridge: the keyboard kit and the agents kit,
+/// only for a plugin that declares `agents`.
+fn kit_scripts(spec: &PageSpec) -> Vec<&'static str> {
+    if spec.agents_kit {
+        vec![KIT_JS, AGENTS_KIT_JS]
+    } else {
+        Vec::new()
+    }
+}
 
 /// Cloned for each build: a page that left the window is built afresh where it comes back.
 #[derive(Clone)]
@@ -52,6 +63,9 @@ pub(crate) struct PageSpec {
     /// A probe build with the plugin trace on: the page's console messages go to stdout, where a GUI pass reads
     /// them.
     pub(crate) console_to_stdout: bool,
+    /// The plugin declares `agents`: the page gets `window.eitriAgents` (and the keyboard kit it binds through) as
+    /// document-start user scripts.
+    pub(crate) agents_kit: bool,
 }
 
 /// Cloned for each build: a page that left the window is built afresh where it comes back.
@@ -232,6 +246,26 @@ fn apply_theme(webview: &WebView, theme: &PageTheme) {
 }
 
 /// Builds the view and starts loading the plugin's entry, already wearing `theme`.
+/// Records in `clock` the moment of every key press and button or touch press the view receives, in the capture
+/// phase, before the page sees it. It observes and consumes nothing: every event goes on as before. A script in the
+/// page cannot make one (its synthetic events never pass through the toolkit), so the agents verbs read it as the
+/// person's gesture.
+pub(crate) fn observe_gestures(view: &WebView, clock: Rc<GestureClock>) {
+    use gtk4::gdk::EventType;
+    let observe = gtk4::EventControllerLegacy::new();
+    observe.set_propagation_phase(gtk4::PropagationPhase::Capture);
+    observe.connect_event(move |_, event| {
+        if matches!(
+            event.event_type(),
+            EventType::KeyPress | EventType::ButtonPress | EventType::TouchBegin
+        ) {
+            clock.record(std::time::Instant::now());
+        }
+        glib::Propagation::Proceed
+    });
+    view.add_controller(observe);
+}
+
 pub(crate) fn build(spec: &PageSpec, hooks: PageHooks, theme: &PageTheme) -> WebView {
     let context = WebContext::new();
     if let Some(security) = context.security_manager() {
@@ -254,6 +288,15 @@ pub(crate) fn build(spec: &PageSpec, hooks: PageHooks, theme: &PageTheme) -> Web
         &[],
         &[],
     ));
+    for script in kit_scripts(spec) {
+        content.add_script(&UserScript::new(
+            script,
+            UserContentInjectedFrames::TopFrame,
+            UserScriptInjectionTime::Start,
+            &[],
+            &[],
+        ));
+    }
     content.register_script_message_handler(HANDLER, None);
 
     // The CSP is the boundary; the proxy is a backstop behind it: anything that gets past the policy dies at
@@ -465,6 +508,29 @@ pub(crate) fn open_outside(url: &str) {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn the_kit_is_injected_only_for_pages_declaring_agents() {
+        let spec = |agents_kit| super::PageSpec {
+            id: "demo".into(),
+            site_root: std::path::PathBuf::new(),
+            entry: "index.html".into(),
+            origins: vec![],
+            downloads: std::path::PathBuf::new(),
+            doc_slot: None,
+            remote_images: false,
+            console_to_stdout: false,
+            agents_kit,
+        };
+        assert!(super::kit_scripts(&spec(false)).is_empty());
+        let scripts = super::kit_scripts(&spec(true));
+        assert_eq!(scripts.len(), 2, "the keyboard kit, then the agents kit");
+        assert!(scripts[0].contains("eitriKeys"));
+        assert!(scripts[1].contains("eitriAgents"));
+        for script in scripts {
+            assert!(script.starts_with("\"use strict\";\n(() => {"));
+        }
+    }
+
     #[test]
     fn the_embedded_kit_is_the_built_bundle() {
         // Named inside the test, not imported at module level: the `harness = false` target that includes this

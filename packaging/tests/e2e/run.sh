@@ -243,7 +243,7 @@ fi
 say "disk usage after the first install (sidecar + nvim included, before --uninstall reclaims it): $(du -sh "$HOME" 2>/dev/null | awk '{print $1}')"
 
 say "=== install layout ==="
-for p in shell eitri-supervisor eitri-tmux-shim eitri-claude-handoff eitri-run-guard eitri-editor-bridge eitri-setup RELEASE; do
+for p in shell eitri-tmux-shim eitri-claude-handoff eitri-run-guard eitri-editor-bridge eitri-setup RELEASE; do
 	[ -f "$HOME/.local/lib/eitri/$p" ] || fail "missing $HOME/.local/lib/eitri/$p"
 done
 [ -f "$LAUNCHER" ] || fail "missing launcher $LAUNCHER"

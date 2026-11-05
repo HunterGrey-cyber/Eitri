@@ -2029,4 +2029,84 @@ mod tests {
         assert_eq!(reads(&dst), 0);
         assert_eq!(dst.handle.state.borrow().tabs.held_client_calls(arrived), None);
     }
+
+    /// Rows as they leave the window, and the freezes the window hears, in one order.
+    #[derive(Clone)]
+    struct Order(Arc<std::sync::Mutex<Vec<String>>>);
+
+    impl crate::agents_glue::RowSink for Order {
+        fn offer(&self, _: Vec<eitri_core::agents::Row>) {
+            self.0.lock().unwrap().push("offer".into());
+        }
+        fn offer_now(&self, rows: Vec<eitri_core::agents::Row>) {
+            let moving: Vec<_> = rows.iter().filter(|r| r.moving).map(|r| r.key.clone()).collect();
+            self.0.lock().unwrap().push(format!("moving {moving:?}"));
+        }
+        fn departing(&self, key: String, _: eitri_core::agents::GoneWhy) {
+            self.0.lock().unwrap().push(format!("departing {key}"));
+        }
+    }
+
+    #[test]
+    fn a_frozen_tabs_row_goes_out_as_moving_before_the_window_hears_the_freeze() {
+        let dir = workspace("chat-move-agents-row");
+        let w = window();
+        let (tab, _provider) = moving_tab(&w, &dir);
+        let key = w
+            .handle
+            .state
+            .borrow()
+            .tabs
+            .get(tab)
+            .unwrap()
+            .row_key()
+            .as_str()
+            .to_owned();
+        let order = Order(Arc::default());
+        let context = eitri_core::tab_set::RowContext {
+            instance: "0123456789abcdef".into(),
+            project: eitri_core::agents::ProjectRef {
+                key: "fedcba9876543210".into(),
+                name: "eitri".into(),
+            },
+            window: eitri_core::agents::WindowRef {
+                instance: "0123456789abcdef".into(),
+                name: "1".into(),
+                focused: false,
+            },
+        };
+        let old = w.handle.set_agents(Some(crate::agents_glue::AgentsGlue::new(
+            context,
+            Box::new(order.clone()),
+        )));
+        assert!(old.is_none());
+        w.handle.tick();
+        assert_eq!(
+            order.0.lock().unwrap().as_slice(),
+            ["offer"],
+            "the first tick hands the rows on"
+        );
+        {
+            let order = order.clone();
+            w.handle.on_chat_move(move |event| {
+                if matches!(event, ChatMoveEvent::Frozen { .. }) {
+                    order.0.lock().unwrap().push("frozen".into());
+                }
+            });
+        }
+
+        w.handle.freeze_for_move(ViewId::BASE, Some(tab), 1);
+        let request = export_asked(&w.page, tab).expect("the page is asked for its view of the tab");
+        answer_export(&w, request, page_view());
+        tick_handle_until(&w.handle, "the freeze's answer", || {
+            order.0.lock().unwrap().iter().any(|seen| seen == "frozen")
+        });
+        let order = order.0.lock().unwrap().clone();
+        let moving = order.iter().position(|seen| *seen == format!("moving {:?}", [&key]));
+        let frozen = order.iter().position(|seen| seen == "frozen");
+        assert!(
+            moving.is_some() && moving < frozen,
+            "the moving row was handed on before the hand-over could start: {order:?}"
+        );
+    }
 }

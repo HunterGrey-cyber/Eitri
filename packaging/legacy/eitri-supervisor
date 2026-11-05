@@ -1,0 +1,3 @@
+#!/bin/sh
+# Placeholder for 0.2.x's installer (see README.md): it exits at once and nothing runs it.
+exit 0

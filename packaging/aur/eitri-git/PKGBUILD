@@ -180,7 +180,7 @@ build() {
 	_skia_url=$(sed -n 's/^SKIA_BINARIES_URL_UPSTREAM=//p' packaging/pins.env)
 	_skia_name=${_skia_url##*/}
 	SKIA_BINARIES_URL="file://$srcdir/$_skia_name" \
-		cargo build --frozen --release -p shell -p agent -p supervisor --bins
+		cargo build --frozen --release -p shell -p agent --bins
 
 	# The sidecar, from the Verdandi clone prepare() checked out and archived -- the same
 	# --build-sidecar-into entry point eitri-bin's build() uses (the sidecar recipe
@@ -199,7 +199,6 @@ package() {
 
 	install -d "$pkgdir/usr/lib/eitri"
 	install -m0755 "target/release/shell" "$pkgdir/usr/lib/eitri/shell"
-	install -m0755 "target/release/eitri-supervisor" "$pkgdir/usr/lib/eitri/eitri-supervisor"
 	install -m0755 "target/release/eitri-tmux-shim" "$pkgdir/usr/lib/eitri/eitri-tmux-shim"
 	install -m0755 "target/release/eitri-run-guard" "$pkgdir/usr/lib/eitri/eitri-run-guard"
 	install -m0755 "target/release/eitri-editor-bridge" "$pkgdir/usr/lib/eitri/eitri-editor-bridge"
@@ -231,16 +230,18 @@ package() {
 	while IFS= read -r _icon; do
 		install -Dm0644 "packaging/icons/$_icon" "$pkgdir/usr/share/icons/$_icon"
 	done < <(cd packaging/icons && find hicolor -type f | LC_ALL=C sort)
-	# The Markdown preview plugin directory: its manifest and the site build()'s cargo build wrote (shell/build.rs),
-	# at the packages' place for it; the build's fingerprint never ships.
-	if [ ! -f "plugins/markdown/web/dist/index.html" ]; then
-		echo "plugins/markdown/web/dist/index.html was not built" >&2
-		return 1
-	fi
-	install -Dm0644 "plugins/markdown/eitri-plugin.toml" "$pkgdir/usr/share/eitri/plugins/markdown/eitri-plugin.toml"
-	while IFS= read -r _pf; do
-		install -Dm0644 "plugins/markdown/web/dist/$_pf" "$pkgdir/usr/share/eitri/plugins/markdown/web/dist/$_pf"
-	done < <(cd plugins/markdown/web/dist && find . -type f ! -name .inputs-sha256 | sed 's#^\./##' | LC_ALL=C sort)
+	# Each bundled plugin keeps its manifest and built site at the same relative paths.
+	local _plugin_name
+	for _plugin_name in markdown agents-strips agents-top agents-pass; do
+		if [ ! -f "plugins/$_plugin_name/web/dist/index.html" ]; then
+			echo "plugins/$_plugin_name/web/dist/index.html was not built" >&2
+			return 1
+		fi
+		install -Dm0644 "plugins/$_plugin_name/eitri-plugin.toml" "$pkgdir/usr/share/eitri/plugins/$_plugin_name/eitri-plugin.toml"
+		while IFS= read -r _pf; do
+			install -Dm0644 "plugins/$_plugin_name/web/dist/$_pf" "$pkgdir/usr/share/eitri/plugins/$_plugin_name/web/dist/$_pf"
+		done < <(cd "plugins/$_plugin_name/web/dist" && find . -type f ! -name .inputs-sha256 | sed 's#^\./##' | LC_ALL=C sort)
+	done
 
 	# This tree's own LICENSE and NOTICE, plus the built SDK's and Node's licences. No
 	# THIRD-PARTY-LICENSES/SOURCE is written here at all -- unlike packaging/install.sh's own

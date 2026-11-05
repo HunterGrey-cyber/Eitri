@@ -1,6 +1,6 @@
 #!/bin/sh
 # Test double for `cargo`, standing in for the whole `cargo build --release --locked -p shell -p
-# agent -p supervisor --bins` recipe --from-source runs: no test here ever runs a real multi-crate release compile. Records its argv (one line per
+# agent --bins` recipe --from-source runs: no test here ever runs a real multi-crate release compile. Records its argv (one line per
 # call) to <scratch>/logs/cargo.log and, on a `build` call, writes the binaries install.sh's own
 # NV_BINARIES names, and agent-hook, into <target-dir>/release/. EITRI_INSTALL_TEST_CARGO_MODE selects the
 # behaviour (default "ok"): "fail" makes the build call exit 1, so nothing after it in
@@ -46,16 +46,23 @@ build)
 	done
 	if [ -z "$_cfs_target_dir" ]; then _cfs_target_dir=${CARGO_TARGET_DIR:-target}; fi
 	mkdir -p "$_cfs_target_dir/release" || exit 1
-	for b in shell eitri-supervisor eitri-tmux-shim eitri-claude-handoff eitri-run-guard eitri-editor-bridge agent-hook; do
+	for b in shell eitri-tmux-shim eitri-claude-handoff eitri-run-guard eitri-editor-bridge agent-hook; do
 		printf '#!/bin/sh\necho "stub %s (from-source test build)"\n' "$b" >"$_cfs_target_dir/release/$b" || exit 1
 		chmod 0755 "$_cfs_target_dir/release/$b" || exit 1
 	done
-	# shell/build.rs builds the Markdown preview plugin's site into the source tree, beside its fingerprint.
-	if [ "${EITRI_INSTALL_TEST_CARGO_MODE:-ok}" != no-plugin-site ] && [ -f plugins/markdown/eitri-plugin.toml ]; then
-		mkdir -p plugins/markdown/web/dist || exit 1
-		printf '<!doctype html><title>preview built from source</title>\n' >plugins/markdown/web/dist/index.html || exit 1
-		printf 'export {};\n' >plugins/markdown/web/dist/preview.js || exit 1
-		printf '0000000000000000000000000000000000000000000000000000000000000000\n' >plugins/markdown/web/dist/.inputs-sha256 || exit 1
+	# shell/build.rs builds each shipped plugin's site into the source tree, beside its fingerprint.
+	if [ "${EITRI_INSTALL_TEST_CARGO_MODE:-ok}" != no-plugin-site ]; then
+		for _cfs_plugin in markdown agents-strips agents-top agents-pass; do
+			[ -f "plugins/$_cfs_plugin/eitri-plugin.toml" ] || continue
+			mkdir -p "plugins/$_cfs_plugin/web/dist" || exit 1
+			if [ "$_cfs_plugin" = markdown ]; then
+				printf '<!doctype html><title>preview built from source</title>\n' >plugins/markdown/web/dist/index.html || exit 1
+				printf 'export {};\n' >plugins/markdown/web/dist/preview.js || exit 1
+			else
+				printf '<!doctype html><title>%s built from source</title>\n' "$_cfs_plugin" >"plugins/$_cfs_plugin/web/dist/index.html" || exit 1
+			fi
+			printf '0000000000000000000000000000000000000000000000000000000000000000\n' >"plugins/$_cfs_plugin/web/dist/.inputs-sha256" || exit 1
+		done
 	fi
 	exit 0
 	;;

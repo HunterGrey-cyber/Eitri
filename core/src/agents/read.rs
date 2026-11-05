@@ -40,8 +40,8 @@ use super::publish::{agents_dir, is_instance, open_own_dir};
 use super::shared::{self, Round, Selection, SharedName, SharedRead, ROUND_FILE, SELECTION_FILE};
 use super::wire::{parse_process_file, WireError};
 use super::{
-    Change, GoneWhy, ProcessFile, ProjectRef, Row, View, LOCK_POLL_MS, MAX_FILE_BYTES, MAX_ROWS_PER_FILE, MOVE_HOLD_MS,
-    SCHEMA_V,
+    Change, GoneWhy, ProcessFile, ProjectRef, Row, View, WindowRef, LOCK_POLL_MS, MAX_FILE_BYTES, MAX_ROWS_PER_FILE,
+    MOVE_HOLD_MS, SCHEMA_V,
 };
 
 /// What a [`Reader`] hands its caller, on the reader's own thread. Nearly every event is a change, so the change
@@ -291,12 +291,42 @@ fn sweep_orphan_locks(dir: &File, control: &File, path: &Path, names: &BTreeSet<
 /// The view as it is now, read once: what `prefix u` and `eitri agents --json` show. A dead writer found on the
 /// way is cleaned up as a watching reader would. No agents directory yet is an empty view, and nothing is made.
 pub fn scan_once(control_dir: &Path, schema: u32) -> io::Result<View> {
+    let Some((dir, files)) = live_files(control_dir, schema)? else {
+        return Ok(view_of(std::iter::empty(), std::iter::empty()));
+    };
+    let path = proc_path(&dir);
+    let rows = merge(files.iter(), &BTreeMap::new());
+    let mut view = view_of(rows.values().map(|s| &s.row), files.values());
+    if let SharedRead::Found(selection) = shared::read_selection_at(&path.join(SELECTION_FILE), schema, owner_as_is) {
+        view.selection = Some(selection);
+    }
+    if let SharedRead::Found(round) = shared::read_round_at(&path.join(ROUND_FILE), schema, owner_as_is) {
+        view.round = Some(round);
+    }
+    Ok(view)
+}
+
+/// Every running window with its project, read once as [`scan_once`] reads, a window that holds no tab (the
+/// compositor hub) included: the view names only the windows its rows are in.
+pub fn scan_windows(control_dir: &Path, schema: u32) -> io::Result<Vec<(ProjectRef, WindowRef)>> {
+    let files = live_files(control_dir, schema)?
+        .map(|(_, files)| files)
+        .unwrap_or_default();
+    Ok(files
+        .into_values()
+        .filter(|file| !file.project.key.is_empty())
+        .map(|file| (file.project, file.window))
+        .collect())
+}
+
+/// The files of the processes that run, by instance, with the handle of the directory they are in (its
+/// `/proc/self/fd` path lives only as long as the handle); `None` when there is no agents directory yet. A dead
+/// writer found on the way is cleaned up.
+fn live_files(control_dir: &Path, schema: u32) -> io::Result<Option<(File, BTreeMap<String, ProcessFile>)>> {
     check_schema(schema)?;
     let dir = match open_own_dir(&agents_dir(control_dir)) {
         Ok(dir) => dir,
-        Err(e) if e.kind() == io::ErrorKind::NotFound => {
-            return Ok(view_of(std::iter::empty(), std::iter::empty()));
-        }
+        Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(None),
         Err(e) => return Err(e),
     };
     let control = open_own_dir(control_dir)?;
@@ -323,15 +353,7 @@ pub fn scan_once(control_dir: &Path, schema: u32) -> io::Result<View> {
             }
         }
     }
-    let rows = merge(files.iter(), &BTreeMap::new());
-    let mut view = view_of(rows.values().map(|s| &s.row), files.values());
-    if let SharedRead::Found(selection) = shared::read_selection_at(&path.join(SELECTION_FILE), schema, owner_as_is) {
-        view.selection = Some(selection);
-    }
-    if let SharedRead::Found(round) = shared::read_round_at(&path.join(ROUND_FILE), schema, owner_as_is) {
-        view.round = Some(round);
-    }
-    Ok(view)
+    Ok(Some((dir, files)))
 }
 
 const WATCHED: u32 = libc::IN_CLOSE_WRITE

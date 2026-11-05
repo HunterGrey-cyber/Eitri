@@ -82,6 +82,7 @@ pub struct FakeHost {
 struct Reads {
     tab_views: BTreeMap<TabId, ViewId>,
     moving_tabs: BTreeSet<TabId>,
+    working_tabs: BTreeSet<TabId>,
     grid_size: Size,
     editor_cell: Option<(f64, f64)>,
     editor_facts: EditorFacts,
@@ -119,6 +120,7 @@ impl Default for Reads {
         Reads {
             tab_views: BTreeMap::new(),
             moving_tabs: BTreeSet::new(),
+            working_tabs: BTreeSet::new(),
             grid_size: super::grid::UNALLOCATED,
             editor_cell: None,
             editor_facts: EditorFacts::default(),
@@ -168,6 +170,14 @@ impl FakeHost {
             reads.moving_tabs.insert(tab);
         } else {
             reads.moving_tabs.remove(&tab);
+        }
+    }
+    pub fn set_tab_has_work(&self, tab: TabId, working: bool) {
+        let mut reads = self.reads.borrow_mut();
+        if working {
+            reads.working_tabs.insert(tab);
+        } else {
+            reads.working_tabs.remove(&tab);
         }
     }
     pub fn set_project_rows(&self, rows: Vec<crate::project_chooser::Row>) {
@@ -727,6 +737,9 @@ impl HostReads for FakeHost {
     }
     fn tab_moving(&self, tab: TabId) -> bool {
         self.reads.borrow().moving_tabs.contains(&tab)
+    }
+    fn tab_has_work(&self, tab: TabId) -> bool {
+        self.reads.borrow().working_tabs.contains(&tab)
     }
     fn project_chooser_env(&self, win: WinId) -> ChooserEnv {
         self.project_env

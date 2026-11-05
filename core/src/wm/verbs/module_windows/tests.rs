@@ -442,6 +442,35 @@ fn a_follow_show_in_window_1_opens_the_pages_window_and_leaves_the_keys() {
 }
 
 #[test]
+fn a_module_shown_while_agents_wait_opens_no_window_where_pages_are_windows() {
+    let page = ModuleId::lua("agents-pass");
+    let mut r = hub();
+    assert!(
+        ops(&r.controller.wait_follow(WIN, &page, true)).is_empty(),
+        "no page window opens by itself: no hide would close it"
+    );
+    assert!(ops(&r.controller.wait_follow(WIN, &page, false)).is_empty());
+    let mut r = rig_in(
+        Tiling::ModuleWindow,
+        Layout::new(Node::Leaf(page.clone()), page.clone()).unwrap(),
+    );
+    r.controller
+        .set_module_name(WIN, WindowName::for_module(&page).unwrap());
+    assert!(ops(&r.controller.wait_follow(WIN, &page, false)).is_empty());
+    assert!(r.layout.borrow().is_shown(&page), "its own window stays as it is");
+
+    // Where modules are tiles it is the follow command itself.
+    let terminal = ModuleId::terminal();
+    let mut by_follow = rig_in(Tiling::Eitri, editor_and_terminal());
+    let mut by_wait = rig_in(Tiling::Eitri, editor_and_terminal());
+    assert_eq!(
+        ops(&by_wait.controller.wait_follow(WIN, &terminal, false)),
+        ops(&by_follow.controller.follow(WIN, &terminal, false))
+    );
+    assert!(!by_wait.layout.borrow().is_shown(&terminal));
+}
+
+#[test]
 fn a_chat_window_a_hand_over_is_starting_is_not_free() {
     let mut r = hub();
     attach(&mut r, 16, WindowName::Chat(1));
@@ -1387,10 +1416,12 @@ fn action_number(action: &Action) -> usize {
         Action::Text(_) => 58,
         Action::TextAll(_) => 59,
         Action::CopyMode { .. } => 60,
+        Action::AgentsNext => 61,
+        Action::AgentsBack => 62,
     }
 }
 
-const ACTION_VARIANTS: usize = 61;
+const ACTION_VARIANTS: usize = 63;
 
 /// One action of every variant, and every kind of module key and `instance.new`, which a beside window tells apart.
 fn every_action() -> Vec<Action> {
@@ -1653,4 +1684,21 @@ fn in_group_and_hub_follow_results_are_unchanged() {
             keep_keys: true,
         }]
     );
+}
+
+#[test]
+fn another_processs_new_starts_the_next_chat_window_with_its_token_in_window_1() {
+    let mut r = hub();
+    attach(&mut r, 16, WindowName::Chat(1));
+    let batch = r.controller.agents_new(WIN, Some("tok".into()));
+    assert_eq!(
+        ops(&batch).into_iter().filter(is_new_op).collect::<Vec<_>>(),
+        vec![open(WindowName::Chat(2), Some("tok"))],
+        "the asking window's token goes with the start"
+    );
+
+    // A window holding chats opens an empty tab of its own: nothing is started or asked of window 1.
+    let mut r = module_window(WindowName::Chat(1));
+    let batch = r.controller.agents_new(WIN, Some("tok".into()));
+    assert!(ops(&batch).iter().all(|op| !is_new_op(op)), "{:?}", ops(&batch));
 }

@@ -37,6 +37,15 @@ use crate::editor_rpc::EditorRpc;
 use crate::keymap::{Chord, KeySpec};
 use crate::nvim_rpc;
 
+mod agents;
+
+#[cfg(target_os = "linux")]
+pub use agents::DirSource;
+pub use agents::{
+    something_waits, write_shared_on_thread, AgentsDone, AgentsFeed, AgentsPort, AgentsRefusal, AgentsServices,
+    AgentsSource, FeedRead, GestureClock, ReaderSink, SharedWrite, WaitShow, AGENTS_DEADLINE, WATCH_DEADLINE,
+};
+
 /// How long an editor call may take before the page is told the editor is busy.
 pub const EDITOR_DEADLINE: Duration = Duration::from_secs(5);
 /// How often a pending editor answer is looked at, by a one-shot timer, while one is outstanding.
@@ -545,6 +554,8 @@ struct PluginHostState {
     /// How many documents the view has committed: the number a trace line gives the document it is about, so a
     /// reader can tell the document a page built ahead of its state from the one that reloaded with it.
     committed: u64,
+    /// What the page watches of the agents layer, and its verbs still out.
+    agents: agents::HostAgents,
 }
 
 pub struct PluginHost {
@@ -761,6 +772,7 @@ impl PluginHost {
             restored: None,
             ready: false,
             committed: 0,
+            agents: agents::HostAgents::default(),
         };
         PluginHost {
             own_window: Cell::new(false),
@@ -1095,6 +1107,9 @@ impl PluginHost {
         };
         if back {
             self.follow_catch_up();
+            // A watching document starts again from the whole view.
+            self.agents_back_on_screen();
+            (self.wake)();
         }
         self.wake_follow();
     }
@@ -1857,6 +1872,7 @@ impl PluginHost {
             self.scoped_call(None, ScopedOp::WipePreload, Instant::now());
             (self.wake)();
         }
+        self.agents_new_document();
         let audience = self.audience();
         let mut replies = Vec::new();
         for mut owed in dropped {
@@ -2061,12 +2077,12 @@ impl PluginHost {
             Verb::PageSaved(args) => Some(self.page_saved(re, args, now)),
             Verb::PageReady(_) => Some(self.page_ready(re)),
             Verb::TerminalAt(args) => self.terminal_at(re, &args.dir, now),
-            Verb::AgentsWatch(_) => Some(Reply::err(re, ErrorCode::Disabled, "agents are disabled")),
-            Verb::AgentsFocus(_) => Some(Reply::err(re, ErrorCode::Disabled, "agents are disabled")),
-            Verb::AgentsNew(_) => Some(Reply::err(re, ErrorCode::Disabled, "agents are disabled")),
-            Verb::AgentsSelect(_) => Some(Reply::err(re, ErrorCode::Disabled, "agents are disabled")),
-            Verb::AgentsRound(_) => Some(Reply::err(re, ErrorCode::Disabled, "agents are disabled")),
-            Verb::AgentsStop(_) => Some(Reply::err(re, ErrorCode::Disabled, "agents are disabled")),
+            verb @ (Verb::AgentsWatch(_)
+            | Verb::AgentsFocus(_)
+            | Verb::AgentsNew(_)
+            | Verb::AgentsSelect(_)
+            | Verb::AgentsRound(_)
+            | Verb::AgentsStop(_)) => self.agents_verb(re, verb, now),
         }
     }
 
@@ -3001,6 +3017,9 @@ impl PluginHost {
         }
         self.take_store_answers(now, &mut replies);
         self.expire_terminal_at(now, &mut replies);
+        if let Some(at) = self.agents_pump(now, &mut replies) {
+            next = Some(next.map_or(at, |n| n.min(at)));
+        }
         {
             let st = self.state.borrow();
             if !st.calls.is_empty() {

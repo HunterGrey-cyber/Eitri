@@ -106,6 +106,27 @@ pub struct RowContext {
 }
 
 impl TabSet {
+    /// Whether a tab has anything a stop would end: a running turn, Claude Code working where the chat cannot show
+    /// it (the rows say `running` for it too), or background work its agent left running (the live, non-ambient
+    /// tasks and the calls the rows count). A tab gone, not started or closed has none.
+    pub fn has_work(&self, tab: TabId) -> bool {
+        let Some(backend) = self.get(tab).and_then(|tab| tab.live()) else {
+            return false;
+        };
+        let projection = backend.projection();
+        if matches!(projection.status, agent::ProjectionStatus::Closed { .. }) {
+            return false;
+        }
+        projection.active_turn_id.is_some()
+            || projection.cli_unseen_busy
+            || projection.background_calls > 0
+            || projection
+                .background_tasks
+                .rows
+                .iter()
+                .any(|r| r.live && !r.task.ambient)
+    }
+
     pub fn agent_rows(&mut self, ctx: &RowContext, shown: &dyn Fn(TabId) -> bool, now_ms: u64) -> Vec<Row> {
         let mut rows = Vec::with_capacity(self.tabs.len());
         for tab in &mut self.tabs {

@@ -446,6 +446,26 @@ impl Controller {
         self.follow_cmd(win, module, cmd)
     }
 
+    /// A module declared shown while agents wait (`[module] shown_while = "agents-wait"`) comes or goes with them:
+    /// [`Controller::follow`] in a window whose modules are tiles. Where pages are windows of the compositor
+    /// (window 1 of a group, a module window) a show would open a page window that no hide closes and that the
+    /// compositor tiles at its own size, so nothing happens there but one log line: the person opens the page by its
+    /// key.
+    pub fn wait_follow(&mut self, win: WinId, module: &ModuleId, show: bool) -> Batch {
+        let Some(window) = self.windows.get_mut(&win) else {
+            return Batch::default();
+        };
+        if window.tiling != super::window::Tiling::Eitri {
+            if show {
+                window.say(format!(
+                    "[modules] {module}: shown while agents wait only where modules are tiles; its key opens its window here"
+                ));
+            }
+            return Batch::default();
+        }
+        self.follow(win, module, show)
+    }
+
     /// A plugin's follow command for `module`, as nvim sent it. A window beside nvim decides every command itself.
     /// Any other window is given `Show` and `Hide` only, which the shell sorts out of the four by what the window
     /// shows (a show of a page on screen dropped, an `Auto` only for a hidden one), so a `Toggle` or an `Auto` that
@@ -467,6 +487,27 @@ impl Controller {
             }
         };
         let mut batch = self.run_gated(win, action, Origin::Follow, Some((module, cmd)));
+        self.settle_chrome(&mut batch);
+        batch
+    }
+
+    /// Another process's `new` for this window: an empty chat tab here, or, in window 1 of a compositor group (which
+    /// holds no tab), the next chat window, started with the asking window's activation token so it can take the
+    /// keys where the compositor gives them only to a window the person was using.
+    pub fn agents_new(&mut self, win: WinId, token: Option<String>) -> Batch {
+        let hub = self
+            .windows
+            .get(&win)
+            .is_some_and(|window| window.tiling == super::window::Tiling::Hub);
+        if !hub {
+            return Decide::run(self, win, Action::Tab(crate::keymap::TabAction::New), Origin::Lua);
+        }
+        let mut batch = Batch::default();
+        let reads = self.reads.clone();
+        if let Some(window) = self.windows.get_mut(&win) {
+            let asked = verbs::module_windows::Asked::ByWindow { token };
+            verbs::module_windows::next_chat_window(window, &*reads, win, &asked, &mut batch);
+        }
         self.settle_chrome(&mut batch);
         batch
     }
@@ -1969,6 +2010,35 @@ impl Decide for Controller {
                     window.refuse(win, text, &mut batch);
                 }
             }
+            HostEvent::Agents {
+                win,
+                outcome: super::agents_round::RoundOutcome::BackTo(module),
+            } => {
+                // The round started on a module of this window with no tab: it is shown and given the keys as a
+                // module key lands there.
+                // A start point no longer in the layout is gone, and the status line says so.
+                self.modules_event(win, &mut batch, |w, cx, batch| {
+                    use super::agents_round::RoundOutcome;
+                    let shown = module_verbs::show_on_screen(w, cx, win, &module, batch)
+                        .map_err(|err| match err {
+                            crate::layout::LayoutError::NotInTree(_) => RoundOutcome::StartGone,
+                            err => RoundOutcome::Refused(err.to_string()),
+                        })
+                        .and_then(|()| {
+                            let tail = super::focus::arrive_tail(win, &module, false);
+                            super::focus::focus_then(w, win, &module, tail, batch)
+                                .map_err(|err| RoundOutcome::Refused(err.to_string()))
+                        });
+                    if let Err(outcome) = shown {
+                        super::agents_round::outcome(w, &outcome);
+                    }
+                });
+            }
+            HostEvent::Agents { win, outcome } => {
+                if let Some(window) = self.windows.get_mut(&win) {
+                    super::agents_round::outcome(window, &outcome);
+                }
+            }
             HostEvent::Terminal(TermEvent::Job {
                 win,
                 module,
@@ -2499,6 +2569,7 @@ impl Controller {
             verbs::Family::Focus => verbs::focus::run(window, &*reads, win, &action, &mut batch),
             verbs::Family::Keys => verbs::keys::run(window, win, &action, keycode, &keymap(), &mut batch),
             verbs::Family::Chrome => verbs::chrome::run(window, win, &action, &mut batch),
+            verbs::Family::Agents => super::agents_round::run(window, win, &action, &mut batch),
             verbs::Family::Project => verbs::project::run(window, &*reads, win, &setup, &mut batch),
             verbs::Family::Workspaces => verbs::workspaces::run(window, &*reads, win, &action, &setup, &mut batch),
             verbs::Family::Floats => {

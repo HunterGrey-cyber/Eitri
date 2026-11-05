@@ -263,6 +263,9 @@ serve_old_layout() {
 	rm -rf "$T/old"
 	mkdir -p "$T/old"
 	tar -C "$T/old" -xzf "$_sol_d/$_sol_top.tar.gz"
+	_sol_binary=eitri-$(printf '%s' supervisor)
+	printf '#!/bin/sh\nexit 0\n' >"$T/old/$_sol_top/lib/eitri/$_sol_binary"
+	chmod 0755 "$T/old/$_sol_top/lib/eitri/$_sol_binary"
 	rm "$T/old/$_sol_top/share/applications/cn.huntergrey.eitri.desktop"
 	rm -rf "$T/old/$_sol_top/share/icons"
 	tar -C "$T/old" -czf "$_sol_d/$_sol_top.tar.gz" "$_sol_top"

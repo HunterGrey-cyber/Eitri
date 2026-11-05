@@ -26,7 +26,7 @@ use super::publish::{agents_dir, open_own_dir};
 pub use super::row::{Round, RoundPoint, Selection};
 use super::row::{Row, View};
 use super::wire::{recut_round, recut_selection, WireError};
-use super::{Class, MAX_FILE_BYTES, SCHEMA_V};
+use super::{Class, MAX_FILE_BYTES, ROUND_MAX_IDLE_MS, SCHEMA_V};
 
 /// The shared selection's file name in the agents directory.
 pub const SELECTION_FILE: &str = "selection.json";
@@ -290,6 +290,23 @@ fn stops(view: &View) -> Vec<Stop<'_>> {
         });
     }
     stops
+}
+
+/// Whether `round` stood still for [`ROUND_MAX_IDLE_MS`] since its last move: then it is over, for both keys, the
+/// automatic advance and every face.
+pub fn is_idle(round: &Round, now_ms: u64) -> bool {
+    now_ms.saturating_sub(round.at_ms) >= ROUND_MAX_IDLE_MS
+}
+
+/// Whether `round` runs over `view` at `now_ms`: it is at a stop that names a row the view still lists, and it has
+/// not stood idle too long. A round that ended with the person in it (no current stop) is kept only so `prefix B`
+/// can go back; one whose stop's process went, or that stood idle, runs no more either.
+pub fn is_running(view: &View, round: &Round, now_ms: u64) -> bool {
+    !is_idle(round, now_ms)
+        && round
+            .current
+            .as_deref()
+            .is_some_and(|key| view.rows.iter().any(|row| row.key == key))
 }
 
 /// The keys of the round's stops: rows of class `needs`, the oldest `waiting_since` first, a window's trust rows

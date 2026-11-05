@@ -39,7 +39,7 @@ RS_SIGN_NAMESPACE=eitri-release
 RS_SIGN_IDENTITY=release@eitri
 RS_PUBLIC_REPO=https://github.com/HunterGrey-cyber/eitri
 RS_IMAGE_REPO=eitri-release-build
-RS_BINARIES=(shell eitri-supervisor eitri-tmux-shim eitri-claude-handoff eitri-run-guard eitri-editor-bridge)
+RS_BINARIES=(shell eitri-tmux-shim eitri-claude-handoff eitri-run-guard eitri-editor-bridge)
 RS_VERSION_ERE='^[0-9]+\.[0-9]+\.[0-9]+(-rc\.[0-9]+)?$'
 RS_LEGACY_MESSAGE='the legacy backend is not in this build'
 # Public identity required by public_commits_check for the released commit.
@@ -958,11 +958,19 @@ ctr_phase_f() {
 	# network, because the build below runs offline.
 	step "npm ci (plugin-kit/keys)"
 	(cd plugin-kit/keys && npm ci --no-audit --no-fund)
-	# The Markdown preview plugin's page is a third bundle shell/build.rs builds (into plugins/markdown/web/dist,
+	step "npm ci (plugin-kit/agents)"
+	(cd plugin-kit/agents && npm ci --no-audit --no-fund)
+	# The bundled plugin pages are built by shell/build.rs (into each plugin's web/dist,
 	# which the release ships as a plugin directory, not inside a binary); its packages come in here for the same
 	# reason.
 	step "npm ci (plugins/markdown/web)"
 	(cd plugins/markdown/web && npm ci --no-audit --no-fund)
+	step "npm ci (plugins/agents-strips/web)"
+	(cd plugins/agents-strips/web && npm ci --no-audit --no-fund)
+	step "npm ci (plugins/agents-top/web)"
+	(cd plugins/agents-top/web && npm ci --no-audit --no-fund)
+	step "npm ci (plugins/agents-pass/web)"
+	(cd plugins/agents-pass/web && npm ci --no-audit --no-fund)
 
 	step "the Skia archive, checked against its pin"
 	ctr_fetch_pinned "$RS_SKIA_URL_UPSTREAM" "/build/skia/$RS_SKIA_ARCHIVE" "$RS_SKIA_SHA256"
@@ -1019,7 +1027,7 @@ GNOME_EXT_FILES='metadata.json extension.js direction.js policy.js'
 # shell/build.rs built under web/dist/. Both packages and the tarball take one staged tree per plugin, found rather
 # than listed, so the site's files (fonts, the lazily loaded diagram code) never need a list of their own here;
 # release_check.py holds the three copies to one another and the manifest to the tracked file.
-SHIPPED_PLUGINS='markdown'
+SHIPPED_PLUGINS='markdown agents-strips agents-top agents-pass'
 
 # ctr_stage_plugins ST: each shipped plugin's eitri-plugin.toml and every file of its web/dist/ except the build's
 # fingerprint (.inputs-sha256), from the clone (cwd) into ST/plugins/<name>/ at the same relative paths, where both
@@ -1054,7 +1062,8 @@ ctr_tarball_plugins() {
 # packaging/icons/hicolor, found rather than listed so that release_check.py's role table is the one
 # list: a file it does not know fails check-assets, and nfpm-public.yaml's own entries are held to the
 # committed files by test_nfpm_profiles.py. packaging/legacy/eitri.desktop (0.2.0's own entry) is staged
-# too, for the tarball alone: no nfpm profile names it, so no package carries it.
+# too, for the tarball alone: no nfpm profile names it, so no package carries it (nor the placeholder
+# packaging/legacy/eitri-supervisor, staged beside it).
 ctr_stage_art() {
 	local st="$1" f
 	install -m 0644 packaging/cn.huntergrey.eitri.desktop "$st/packaging/cn.huntergrey.eitri.desktop"
@@ -1069,6 +1078,7 @@ ctr_stage_art() {
 		install -D -m 0644 "gnome-extension/$f" "$st/gnome-extension/$f"
 	done
 	install -D -m 0644 packaging/legacy/eitri.desktop "$st/packaging/legacy/eitri.desktop"
+	install -D -m 0755 packaging/legacy/eitri-supervisor "$st/packaging/legacy/eitri-supervisor"
 	while IFS= read -r f; do
 		install -D -m 0644 "packaging/icons/$f" "$st/packaging/icons/$f"
 	done < <(cd packaging/icons && find hicolor -type f | LC_ALL=C sort)
@@ -1091,6 +1101,8 @@ ctr_tarball_art() {
 		install -D -m 0644 "$st/gnome-extension/$f" "$tree/share/gnome-shell/extensions/$GNOME_EXT_ID/$f"
 	done
 	install -D -m 0644 "$st/packaging/legacy/eitri.desktop" "$tree/share/applications/eitri.desktop"
+	# The same installer refuses a tarball without an executable lib/eitri/eitri-supervisor (packaging/legacy/README.md).
+	install -D -m 0755 "$st/packaging/legacy/eitri-supervisor" "$tree/lib/eitri/eitri-supervisor"
 	while IFS= read -r f; do
 		install -D -m 0644 "$st/packaging/icons/$f" "$tree/share/icons/$f"
 	done < <(cd "$st/packaging/icons" && find hicolor -type f | LC_ALL=C sort)
@@ -1107,14 +1119,14 @@ ctr_phase_b() {
 	# The same value shell/build.rs would read from neovide/'s own checkout here, set explicitly so
 	# collect-licenses.py prints it in SOURCE for a rebuild from the asset, which has no .git.
 	export EITRI_BUILD_FORK_COMMIT="$RS_FORK_COMMIT"
-	local sde skia_url out=/build/out logs=/build/logs b f rc7="${RS_VERDANDI_REV:0:7}"
+	local sde skia_url out=/build/out logs=/build/logs b f name rc7="${RS_VERDANDI_REV:0:7}"
 	sde="$(git log -1 --format=%ct HEAD)"
 	skia_url="file:///build/skia/$RS_SKIA_ARCHIVE"
 	export SKIA_BINARIES_URL='file:///build/skia/skia-binaries-{key}.tar.gz'
 	export SOURCE_DATE_EPOCH="$sde"
 
 	step "legacy stays out: the resolved feature graph (M15)"
-	cargo tree --locked --offline -e features -p shell -p agent -p supervisor -i agent > "$logs/feature-tree.txt"
+	cargo tree --locked --offline -e features -p shell -p agent -i agent > "$logs/feature-tree.txt"
 	if grep -n 'legacy-backend' "$logs/feature-tree.txt" >&2; then ctr_die "the resolved graph enables legacy-backend"; fi
 
 	# shell/build.rs writes agent-ui/web/dist/index.html (and plugin-kit/keys/dist/keys.js and the Markdown
@@ -1125,8 +1137,8 @@ ctr_phase_b() {
 	# Cleaning shell alone makes its build script run against this copy every time.
 	step "cargo clean --release -p shell (its build script writes the web bundle into this fresh copy)"
 	cargo clean --release --locked --offline -p shell
-	step "cargo build --release --locked -p shell -p agent -p supervisor --bins (no --features)"
-	cargo build --release --locked --offline -p shell -p agent -p supervisor --bins \
+	step "cargo build --release --locked -p shell -p agent --bins (no --features)"
+	cargo build --release --locked --offline -p shell -p agent --bins \
 		--message-format=json-render-diagnostics > "$logs/build.json"
 	local exes=()
 	mapfile -t exes < <(python3 packaging/release_check.py build-executables "$logs/build.json")
@@ -1135,7 +1147,7 @@ ctr_phase_b() {
 	skia_out="$(python3 packaging/release_check.py build-script-out-dir "$logs/build.json" skia-bindings)"
 	python3 packaging/release_check.py check-skia-output "$(dirname "$skia_out")/output" "$skia_url"
 
-	step "check-abi-floor.py over the six (GTK $RS_GTK_FLOOR, glibc $RS_GLIBC_FLOOR)"
+	step "check-abi-floor.py over the five (GTK $RS_GTK_FLOOR, glibc $RS_GLIBC_FLOOR)"
 	python3 packaging/check-abi-floor.py "${exes[@]}" --gtk "$RS_GTK_FLOOR" --glibc "$RS_GLIBC_FLOOR" \
 		| tee "$logs/abi.txt"
 	nm -C "$CARGO_TARGET_DIR/release/shell" > "$logs/shell.nm"
@@ -1214,13 +1226,17 @@ ctr_phase_b() {
 	# together, so the offline rebuild of the asset skips npm for it too.
 	install -D -m 0644 plugin-kit/keys/dist/keys.js "$sd/$sa/plugin-kit/keys/dist/keys.js"
 	install -D -m 0644 plugin-kit/keys/dist/.inputs-sha256 "$sd/$sa/plugin-kit/keys/dist/.inputs-sha256"
-	# The Markdown preview plugin's site and the fingerprint it was built from, for the same reason: the asset's
-	# offline rebuild then skips npm for the third bundle too.
-	while IFS= read -r f; do
-		install -D -m 0644 "plugins/markdown/web/dist/$f" "$sd/$sa/plugins/markdown/web/dist/$f"
-	done < <(cd plugins/markdown/web/dist && find . -type f | sed 's#^\./##' | LC_ALL=C sort)
-	[ -f "$sd/$sa/plugins/markdown/web/dist/.inputs-sha256" ] \
-		|| ctr_die "plugins/markdown/web/dist/.inputs-sha256 is missing: the build wrote no fingerprint"
+	# The agents kit's bundle and fingerprint let an offline rebuild skip npm too.
+	install -D -m 0644 plugin-kit/agents/dist/agents.js "$sd/$sa/plugin-kit/agents/dist/agents.js"
+	install -D -m 0644 plugin-kit/agents/dist/.inputs-sha256 "$sd/$sa/plugin-kit/agents/dist/.inputs-sha256"
+	# Every plugin's whole site travels with its fingerprint in the source asset.
+	for name in $SHIPPED_PLUGINS; do
+		while IFS= read -r f; do
+			install -D -m 0644 "plugins/$name/web/dist/$f" "$sd/$sa/plugins/$name/web/dist/$f"
+		done < <(cd "plugins/$name/web/dist" && find . -type f | sed 's#^\./##' | LC_ALL=C sort)
+		[ -f "$sd/$sa/plugins/$name/web/dist/.inputs-sha256" ] \
+			|| ctr_die "plugins/$name/web/dist/.inputs-sha256 is missing: the build wrote no fingerprint"
+	done
 	install -D -m 0644 "/build/skia/$RS_SKIA_ARCHIVE" "$sd/$sa/skia/$RS_SKIA_ARCHIVE"
 	install -m 0644 "$st/dist/THIRD-PARTY-LICENSES" "$st/dist/SOURCE" "$sd/$sa/"
 	find "$sd/$sa" -exec touch -h -d "@$sde" {} +
@@ -1281,7 +1297,7 @@ ctr_proof() {
 
 	step "proof (a): the full release command, offline and --locked, from the source asset"
 	SKIA_BINARIES_URL="file://$PWD/skia/$archive" \
-		cargo build --release --offline --locked -p shell -p agent -p supervisor --bins
+		cargo build --release --offline --locked -p shell -p agent --bins
 	[ ! -e "$marker" ] || ctr_die "proof (a) reached npm: $(cat "$marker")"
 	env -i PATH=/usr/bin:/bin HOME=/home/builder "$CARGO_TARGET_DIR/release/shell" --version > "$logs/proof-a-version.txt"
 	cmp -s "$logs/proof-a-version.txt" "$logs/version.txt" \

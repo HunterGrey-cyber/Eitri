@@ -97,6 +97,10 @@ export type Confirmation =
   /** `<leader>k`: stop the commands this tab's agent left running, which ends its session. Bound to the tab and
    *  the count it names: a `y` given after either moved is not an answer to it. */
   | { kind: "stop_background"; tab: TabId; running: number; lines: string[]; openedAt: number }
+  /** A tab brought forward to be stopped while its turn runs (`arrive` with `intent: "stop"`). Bound to the tab and
+   *  the turn it asked about (`turn`, the tab's `activeTurnId` then): a `y` given after the tab changed or that turn
+   *  ended stops nothing, even when another turn has begun since. */
+  | { kind: "stop_turn"; tab: TabId; turn: string; lines: string[]; openedAt: number }
   | null;
 
 /** Everything the envelope router decides. Counters (`inputRequest`, `arriveRequest`, `permissionRequest`,

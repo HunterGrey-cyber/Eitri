@@ -166,6 +166,123 @@ impl ReloadCalls {
     }
 }
 
+/// The companion panel as the agents layer's target. Its one chat view is the base view, so a reveal selects the
+/// tab there, gives the view the keys and lands as the full window's arrival does (on that tab's oldest waiting card
+/// with `card_first`, else in the chat; a stop lands in the chat), then presents the window; `new` is `tab.new`.
+/// Nothing here answers a card.
+struct CompanionAgents {
+    window: gtk4::glib::WeakRef<ApplicationWindow>,
+    agent: AgentPanelHandle,
+    runner: Rc<WmRunner>,
+    focus_module: Rc<dyn Fn(&ModuleId) -> bool>,
+    run_tab: Rc<dyn Fn(TabAction)>,
+}
+
+impl CompanionAgents {
+    fn present(&self, token: Option<&str>) {
+        if let Some(window) = self.window.upgrade() {
+            if token.is_some() || !window.is_active() {
+                crate::linked_window::focus::present_with_token(&window, token);
+                self.runner.raise_pid(std::process::id());
+            }
+        }
+    }
+}
+
+impl crate::agents_host::AgentsTarget for CompanionAgents {
+    fn reveal(&self, req: &eitri_core::wm::RevealRequest, token: Option<&str>) -> eitri_core::agents::control::Reply {
+        use eitri_core::wm::RevealRefusal;
+        if let Some(tab) = req.tab {
+            let refused = refused_before_showing(
+                req.intent,
+                || self.agent.view_of_tab(tab),
+                || self.agent.tab_moving(tab),
+                || self.agent.tab_has_work(tab),
+            );
+            if let Some(why) = refused {
+                return crate::agents_host::refusal(why);
+            }
+            if !self.agent.select_tab(tab) {
+                return crate::agents_host::refusal(RevealRefusal::Gone);
+            }
+        }
+        (self.focus_module)(&ModuleId::agent());
+        self.present(token);
+        let landed = req.card_first
+            && match req.tab {
+                Some(tab) => self.agent.focus_card_of(tab),
+                None => self.agent.focus_oldest_card(ViewId::BASE),
+            };
+        if !landed || req.intent == eitri_core::agents::Intent::Stop {
+            self.agent.arrive_with_intent(ViewId::BASE, req.intent);
+        }
+        eitri_core::agents::control::Reply::Ok
+    }
+
+    fn new_tab(&self, token: Option<&str>) -> eitri_core::agents::control::Reply {
+        (self.run_tab)(TabAction::New);
+        self.present(token);
+        eitri_core::agents::control::Reply::Ok
+    }
+}
+
+/// Why a request for one tab of the companion panel is refused before anything is shown, the full window's reveal's
+/// checks in its order: a tab not in the panel's one view is gone, a moving one waits, and a stop of a tab with nothing
+/// running is refused as idle, so the screen and the keys stay as they were.
+fn refused_before_showing(
+    intent: eitri_core::agents::Intent,
+    view: impl FnOnce() -> Option<ViewId>,
+    moving: impl FnOnce() -> bool,
+    has_work: impl FnOnce() -> bool,
+) -> Option<eitri_core::wm::RevealRefusal> {
+    use eitri_core::wm::RevealRefusal;
+    if view() != Some(ViewId::BASE) {
+        return Some(RevealRefusal::Gone);
+    }
+    if moving() {
+        return Some(RevealRefusal::Moving);
+    }
+    if intent == eitri_core::agents::Intent::Stop && !has_work() {
+        return Some(RevealRefusal::Idle);
+    }
+    None
+}
+
+/// Starts the agents layer for the companion panel: its tabs' rows published as the window `companion`, its control
+/// socket served here, and both stopped when the window goes. `None` with `agents.enabled = false`.
+fn start_agents(
+    app: &Application,
+    window: &ApplicationWindow,
+    lua: &LuaEngine,
+    project_root: &std::path::Path,
+    target: CompanionAgents,
+) -> Option<Rc<crate::agents_host::AgentsHost>> {
+    use crate::agents_host::{self, AgentsHost, RowsTo, Setup};
+    let agent = target.agent.clone();
+    let rows: RowsTo = agents_host::rows_to_panel(agent.clone(), window);
+    let token: Rc<dyn Fn() -> Option<String>> = {
+        let window = window.downgrade();
+        Rc::new(move || crate::window_services::activation_token(&window))
+    };
+    let host = AgentsHost::start(
+        Setup {
+            enabled: agents_host::enabled(lua.config.borrow().get(eitri_core::agent_prefs::AGENTS_ENABLED_KEY)),
+            control_dir: agents_host::control_dir(),
+            project: agents_host::project_ref(project_root),
+            window_name: "companion".to_owned(),
+            focused: window.is_active(),
+            publish: true,
+        },
+        Rc::new(target),
+        token,
+        rows,
+    )?;
+    window.connect_is_active_notify(move |window| agent.set_agents_focused(window.is_active()));
+    agents_host::stop_with(app, window, &host);
+    agents_host::serve_this_window(&host);
+    Some(host)
+}
+
 /// Everything the later steps of a companion window reach into.
 #[allow(dead_code)] // read by the attach and the window-manager moves, which come next
 pub(crate) struct CompanionWindow {
@@ -558,6 +675,22 @@ pub(crate) fn build(app: &Application, start: &Start) -> Rc<CompanionWindow> {
         Rc::new(move |action: TabAction| run_tab(action, &window, &grid, &agent_for_tabs, &*focus_module, &toast))
     };
 
+    // The agents layer: this panel's tabs are rows like any window's, and another window's request brings one
+    // forward here. Started off this thread; nothing is made with `agents.enabled = false`.
+    let agents = start_agents(
+        app,
+        &window,
+        &lua,
+        &start.project_root,
+        CompanionAgents {
+            window: window.downgrade(),
+            agent: agent.clone(),
+            runner: runner.clone(),
+            focus_module: focus_module.clone(),
+            run_tab: run_tab_hook.clone(),
+        },
+    );
+
     // The global `f` HINT, over the panel alone.
     let hint = crate::hint::HintCoordinator::new(crate::hint::HintWidgets {
         window: window.clone(),
@@ -725,6 +858,25 @@ pub(crate) fn build(app: &Application, start: &Start) -> Rc<CompanionWindow> {
                             toast.show(&why);
                         }
                     }
+                    CompanionVerb::Round(step) => {
+                        // The keys are on the panel, and on its shown tab: the round's stops include this panel's.
+                        let tab = agent.tab_shown_in(ViewId::BASE).map(|tab| tab.0);
+                        let (toast, focus_module) = (toast.clone(), focus_module.clone());
+                        crate::agents_host::round_key_here(
+                            step,
+                            ModuleId::agent().as_str().to_owned(),
+                            tab,
+                            move |outcome| {
+                                println!("[agents] the round: {outcome:?}");
+                                if let eitri_core::wm::agents_round::RoundOutcome::BackTo(module) = &outcome {
+                                    focus_module(module);
+                                }
+                                if let Some(text) = outcome.text() {
+                                    toast.show_for(&text, eitri_core::wm::agents_round::STATUS_FOR);
+                                }
+                            },
+                        );
+                    }
                     CompanionVerb::Refuse => refuse(format!("{action:?}")),
                 }
             },
@@ -788,22 +940,6 @@ pub(crate) fn build(app: &Application, start: &Start) -> Rc<CompanionWindow> {
             text_size: text_size.clone(),
         },
     );
-
-    // `eitri-supervisor` asks a window to come to the front.
-    {
-        let window = window.downgrade();
-        let agent = agent.clone();
-        let runner = runner.clone();
-        crate::agent_panel::watch_supervisor(
-            agent.clone(),
-            Rc::new(move || {
-                if let Some(window) = window.upgrade() {
-                    window.present();
-                    runner.raise_pid(std::process::id());
-                }
-            }),
-        );
-    }
 
     // Where the panel stands with the user's nvim. The first call of `on_change` is at once, so the
     // band says what is true from the first `ready`.
@@ -1099,6 +1235,9 @@ pub(crate) fn build(app: &Application, start: &Start) -> Rc<CompanionWindow> {
             // reliably free this closure (and so run any `Drop`) before the process ends, and the
             // `y` answer comes back through here.
             link.shutdown();
+            if let Some(agents) = &agents {
+                agents.stop();
+            }
             if let Some(server) = &server {
                 server.cleanup();
             }
@@ -1151,6 +1290,30 @@ pub(crate) fn build(app: &Application, start: &Start) -> Rc<CompanionWindow> {
 mod tests {
     use super::*;
     use std::path::PathBuf;
+
+    #[test]
+    fn a_stop_of_a_companion_tab_with_nothing_running_is_refused_before_anything_is_shown() {
+        use eitri_core::agents::Intent;
+        use eitri_core::wm::RevealRefusal;
+        let base = || Some(ViewId::BASE);
+        assert_eq!(
+            refused_before_showing(Intent::Stop, base, || false, || false),
+            Some(RevealRefusal::Idle)
+        );
+        assert_eq!(refused_before_showing(Intent::Stop, base, || false, || true), None);
+        assert_eq!(
+            refused_before_showing(Intent::Show, base, || false, || panic!("a show does not ask for work")),
+            None
+        );
+        assert_eq!(
+            refused_before_showing(Intent::Stop, || None, || false, || true),
+            Some(RevealRefusal::Gone)
+        );
+        assert_eq!(
+            refused_before_showing(Intent::Stop, base, || true, || true),
+            Some(RevealRefusal::Moving)
+        );
+    }
 
     #[test]
     fn refused_keys_toast_once_then_log() {

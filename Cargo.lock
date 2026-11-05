@@ -971,7 +971,6 @@ dependencies = [
  "eitri-core",
  "serde_json",
  "sha2",
- "supervisor",
  "uuid",
 ]
 
@@ -4068,7 +4067,6 @@ dependencies = [
  "serde_json",
  "sha2",
  "skia-safe",
- "supervisor",
  "terminal-input",
  "terminal-render",
  "uuid",
@@ -4357,15 +4355,6 @@ dependencies = [
  "proc-macro2",
  "quote",
  "syn 2.0.119",
-]
-
-[[package]]
-name = "supervisor"
-version = "0.3.0"
-dependencies = [
- "gtk4",
- "serde",
- "serde_json",
 ]
 
 [[package]]

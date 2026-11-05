@@ -1,5 +1,5 @@
 [English](pages.md) | 简体中文
-<!-- translated-from: pages.md sha256=fa55bf512d9b88556b46766a6d3984a7c4e5b6b5cbd303a4199127f2063637a8 -->
+<!-- translated-from: pages.md sha256=5d1454339c1b17ff738cdf41d682f93eb780c8d3b8d59bb582250baa94dfcfc1 -->
 
 # 你自己做的页面
 
@@ -184,6 +184,7 @@ start();
 | `net` | 从 `[net]` 的 origin 获取内容；除此之外什么都出不了页面 |
 | `editor.follow` | 跟随你正在编辑的缓冲区（`editor.view`、`editor.text` 事件），滚动它、移动它的光标 |
 | `editor.commands` | 在 Neovim 里定义 `[commands]` |
+| `agents` | 看到每个 Eitri 窗口里的每个 agent 标签页（`agents.watch`；页面在屏幕上时收到 `agents.row`、`agents.gone`、`agents.reset`、`agents.selection` 和 `agents.round` 事件），并把某一个带到前面、新开一个、移动共享的选中项、逐个走过等你的 agent（`agents.round`），或者在它的聊天里请它停下（`agents.focus`、`agents.new`、`agents.select`、`agents.round`、`agents.stop`）；这些都要求最近一秒内在页面里按过键或点过鼠标，而且按键在页面上（否则是 `no_gesture`），`agents.new` 每秒最多一次。页面做的任何事都不会回答权限卡片或问题：那只在聊天里做。不能和 `net` 一起声明 |
 
 <a id="what-the-page-runs-in"></a>
 ### 页面运行在什么里面

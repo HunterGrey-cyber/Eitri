@@ -317,6 +317,12 @@ impl<C: Decide> Driver<C> {
 }
 
 impl Driver<Controller> {
+    /// Another process's `new` for this window ([`Controller::agents_new`]), through the same batch queue as keys.
+    pub fn agents_new(&self, win: WinId, token: Option<String>) {
+        let batch = self.decide.borrow_mut().agents_new(win, token);
+        self.submit(batch);
+    }
+
     /// Reveals a local tab through the same batch queue as keys and layout verbs.
     pub fn tab_reveal(
         &self,
@@ -366,6 +372,12 @@ impl Driver<Controller> {
     /// hidden as any hide is, through the runner's gates.
     pub fn follow(&self, win: WinId, module: &ModuleId, show: bool) {
         let batch = self.decide.borrow_mut().follow(win, module, show);
+        self.submit(batch);
+    }
+
+    /// A module shown while agents wait, shown or hidden with them ([`Controller::wait_follow`]).
+    pub fn wait_follow(&self, win: WinId, module: &ModuleId, show: bool) {
+        let batch = self.decide.borrow_mut().wait_follow(win, module, show);
         self.submit(batch);
     }
 

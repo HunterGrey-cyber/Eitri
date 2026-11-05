@@ -9,6 +9,21 @@ you. Your Neovim stays the editor: a real `nvim --embed` with your own `init.lua
 
 ## What's new since 0.3.0
 
+**Many agents at once**
+
+- Every Eitri window now shares one row per agent tab (who it is, its state, since when, whether it waits for you), and
+  three bundled pages read them: Strips (`agents-strips`), a sidebar of who needs you; The pass (`agents-pass`), one
+  line that shows only while an agent waits; and a `top`-style table (`agents-top`). They are off until `init.lua`
+  loads them, for example `eitri.plugin.load("agents-top", { key = "A" })`.
+- `<prefix> u` goes to the agent that has waited longest for you, in whichever window it is, and on to the next;
+  `<prefix> B` goes back to where you started. Neither answers anything: you answer in the chat, as before.
+- `eitri agents` prints the same rows in a terminal (`--json`, `--watch` for a status bar), and a page you write can
+  read them through the new `agents` capability.
+- The layer is on by default; `eitri.config.set("agents.enabled", false)` turns it off for a window. The guide's new
+  "Many agents at once" page has the details.
+- Removed `eitri-supervisor` and `EITRI_SUPERVISOR`. If you used them, load `agents-top` (above) for the same overview
+  inside the window, or run `eitri agents --watch`.
+
 **Windows your window manager tiles**
 
 - On Hyprland, sway and niri, each chat view and each page now opens as a window of its own and your compositor tiles

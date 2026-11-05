@@ -1,10 +1,12 @@
 //! Builds `agent-ui/web` (a standalone npm/Vite project, see agent-ui/web/package.json) into a
 //! single-file `dist/index.html` before `shell` compiles, since `shell/src/agent_panel.rs`
 //! embeds that file's contents at compile time via `include_str!`. Builds `plugin-kit/keys` the same
-//! way into `dist/keys.js`, which `shell/src/plugin_page.rs` embeds. Builds the Markdown preview plugin's page
-//! (`plugins/markdown/web`) into its `dist/` the same way; `shell` embeds none of it -- the plugin directory is
-//! served from disk. Node.js/npm is a hard build-time prerequisite for `shell`; each web project's package.json holds its
-//! build-commands section.
+//! way into `dist/keys.js` and `plugin-kit/agents` into `dist/agents.js`, which
+//! `shell/src/plugin_page.rs` embeds. Builds the Markdown preview plugin's page
+//! (`plugins/markdown/web`), the Strips sidebar's (`plugins/agents-strips/web`) and the agents table's
+//! (`plugins/agents-top/web`) into their `dist/` directories the same way; `shell` embeds none of it -- each plugin
+//! directory is served from disk. Node.js/npm is a hard build-time prerequisite for `shell` -- see
+//! the npm invocations below.
 //!
 //! Also bakes `shell --version`'s three build identities into the
 //! binary as compile-time env vars, read back by `shell/src/version.rs` through `env!`.
@@ -63,7 +65,35 @@ fn main() {
     }
     ensure_web_bundle_built(&kit_dir, "dist/keys.js", None, clean_build);
 
-    // The Markdown preview plugin's page: a third bundle under the same rule. `shell` embeds none of it; a debug build
+    // The agents kit uses the same fingerprint and install rule as the keyboard kit.
+    let agents_kit_dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("../plugin-kit/agents");
+    if !agents_kit_dir.is_dir() {
+        panic!(
+            "plugin-kit/agents is not at {} -- the checkout is incomplete, or this build script was \
+             compiled for another one (`cargo clean -p shell` rebuilds it against this one)",
+            agents_kit_dir.display()
+        );
+    }
+    for path in web_build_watch_paths(&agents_kit_dir) {
+        println!("cargo:rerun-if-changed={}", path.display());
+    }
+    ensure_web_bundle_built(&agents_kit_dir, "dist/agents.js", None, clean_build);
+
+    // The pass (the agents strip) is a plugin page served from its directory, built like the Markdown preview's.
+    let pass_dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("../plugins/agents-pass/web");
+    if !pass_dir.is_dir() {
+        panic!(
+            "plugins/agents-pass/web is not at {} -- the checkout is incomplete, or this build script was \
+             compiled for another one (`cargo clean -p shell` rebuilds it against this one)",
+            pass_dir.display()
+        );
+    }
+    for path in web_build_watch_paths(&pass_dir) {
+        println!("cargo:rerun-if-changed={}", path.display());
+    }
+    ensure_web_bundle_built(&pass_dir, "dist/index.html", None, clean_build);
+
+    // The Markdown preview plugin's page uses the same rule. `shell` embeds none of it; a debug build
     // finds `plugins/markdown/` on the plugin search path, so building here keeps the site that path serves current.
     let markdown_dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("../plugins/markdown/web");
     if !markdown_dir.is_dir() {
@@ -77,6 +107,27 @@ fn main() {
         println!("cargo:rerun-if-changed={}", path.display());
     }
     ensure_web_bundle_built(&markdown_dir, "dist/index.html", None, clean_build);
+
+    // The Strips sidebar (`plugins/agents-strips/`), a plugin page like the Markdown preview, under the same rule.
+    let strips_dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("../plugins/agents-strips/web");
+    if !strips_dir.is_dir() {
+        panic!(
+            "plugins/agents-strips/web is not at {} -- the checkout is incomplete, or this build script was \
+             compiled for another one (`cargo clean -p shell` rebuilds it against this one)",
+            strips_dir.display()
+        );
+    }
+    for path in web_build_watch_paths(&strips_dir) {
+        println!("cargo:rerun-if-changed={}", path.display());
+    }
+    ensure_web_bundle_built(&strips_dir, "dist/index.html", None, clean_build);
+
+    // The agents table is served from its plugin directory under the same freshness rule.
+    let agents_top_dir = workspace_root.join("plugins/agents-top/web");
+    for path in web_build_watch_paths(&agents_top_dir) {
+        println!("cargo:rerun-if-changed={}", path.display());
+    }
+    ensure_web_bundle_built(&agents_top_dir, "dist/index.html", None, clean_build);
 }
 
 /// Bakes `EITRI_BUILD_COMMIT`, `EITRI_FORK_REV` and `EITRI_VERDANDI_REV` into the binary via

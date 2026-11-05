@@ -1,0 +1,20 @@
+id = "agents-strips"
+title = "Agents"
+protocol = 1
+site = "web/dist"                   # the build directory, the same path installed and in the source tree
+entry = "index.html"
+capabilities = ["agents", "state", "layout.focus"]  # state: the rows marked with `m`; layout.focus: Esc
+
+[module]
+start = "shown"
+at = "left"
+size = 0.16                         # a sidebar; with `narrow` set, give it a rail's width in the layout instead
+focus = false
+
+[settings.narrow]                   # the 62 px rail: glyph, what waits, and the tab
+kind = "bool"
+default = false
+
+[settings.show_idle]                # false: idle rows keep their place but show only their glyph
+kind = "bool"
+default = true

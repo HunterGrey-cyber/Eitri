@@ -319,13 +319,36 @@ pub enum ModuleStart {
     Hidden,
 }
 
+/// `[module] shown_while`: what, besides the person, puts the module on screen and takes it off.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ShownWhile {
+    /// `agents-wait`: shown while an agent waits for the person or a round is at a stop, hidden when neither
+    /// holds. The window shows and hides it from the agents view it already reads, with the keys where they are;
+    /// the page itself, built only on the first show and deaf off screen, could not.
+    AgentsWait,
+}
+
 /// `[module]`: how the module starts, and the plugin's own open rule (`at`, `size`, `focus`).
 #[derive(Debug, Clone, PartialEq)]
 pub struct ModuleTable {
     pub start: ModuleStart,
+    /// The window shows and hides the module by this, beside the person's own show and hide.
+    pub shown_while: Option<ShownWhile>,
     pub at: Option<At>,
     pub size: Option<f32>,
+    /// An explicit height; mutually exclusive with the fractional size.
+    pub fixed_height_px: Option<i32>,
     pub focus: bool,
+}
+
+impl ModuleTable {
+    /// The declared extent, including heights that cannot be represented as a share.
+    pub fn rule_size(&self) -> Option<crate::layout::rules::RuleSize> {
+        use crate::layout::rules::RuleSize;
+        self.fixed_height_px
+            .map(RuleSize::Pixels)
+            .or_else(|| self.size.map(RuleSize::Share))
+    }
 }
 
 /// `[net] images`: whether the page may load `https` images from any host.
@@ -565,8 +588,9 @@ struct RawPage {
 #[serde(deny_unknown_fields)]
 struct RawModule {
     start: Option<String>,
+    shown_while: Option<String>,
     at: Option<String>,
-    size: Option<f64>,
+    size: Option<toml::Value>,
     focus: Option<bool>,
 }
 
@@ -1086,6 +1110,19 @@ pub fn parse_manifest(text: &str) -> Result<Manifest, String> {
                 Some("hidden") => ModuleStart::Hidden,
                 Some(other) => return fail("module.start", format!("{other:?} is not shown or hidden")),
             };
+            let shown_while = match m.shown_while.as_deref() {
+                None => None,
+                Some("agents-wait") => Some(ShownWhile::AgentsWait),
+                Some(other) => return fail("module.shown_while", format!("{other:?} is not agents-wait")),
+            };
+            if shown_while.is_some() {
+                if !capabilities.contains(&Capability::Agents) {
+                    return fail("module.shown_while", "needs the agents capability".into());
+                }
+                if start != ModuleStart::Hidden {
+                    return fail("module.shown_while", "needs start = \"hidden\"".into());
+                }
+            }
             let at = match m.at.as_deref() {
                 None => None,
                 Some(name) => match parse_at(name) {
@@ -1101,20 +1138,45 @@ pub fn parse_manifest(text: &str) -> Result<Manifest, String> {
                     }
                 },
             };
-            let size = match m.size {
-                None => None,
-                Some(share) if share > 0.0 && share < 1.0 && (share as f32) < 1.0 => Some(share as f32),
-                Some(share) => {
+            let (size, fixed_height_px) = match &m.size {
+                None => (None, None),
+                Some(toml::Value::Float(share))
+                    if *share > 0.0 && *share < 1.0 && (*share as f32) > 0.0 && (*share as f32) < 1.0 =>
+                {
+                    (Some(*share as f32), None)
+                }
+                Some(toml::Value::String(text)) => {
+                    let px = text
+                        .strip_suffix("px")
+                        .filter(|n| !n.is_empty() && n.bytes().all(|b| b.is_ascii_digit()))
+                        .and_then(|n| n.parse::<i32>().ok())
+                        .filter(|n| crate::layout::con::FIXED_HEIGHT_PX.contains(n));
+                    let Some(px) = px else {
+                        return fail("module.size", "a pixel height must be <n>px with n in 16..=200".into());
+                    };
+                    if !matches!(
+                        at,
+                        Some(At::Beside(
+                            crate::layout::Direction::Up | crate::layout::Direction::Down
+                        ))
+                    ) {
+                        return fail("module.size", "a pixel height requires at = above or below".into());
+                    }
+                    (None, Some(px))
+                }
+                Some(_) => {
                     return fail(
                         "module.size",
-                        format!("{share} must be a share strictly between 0 and 1"),
+                        "must be a share strictly between 0 and 1 or <n>px with n in 16..=200".into(),
                     );
                 }
             };
             Some(ModuleTable {
                 start,
+                shown_while,
                 at,
                 size,
+                fixed_height_px,
                 focus: m.focus.unwrap_or(true),
             })
         }
@@ -1176,6 +1238,52 @@ work = "${plugin}"
         let manifest = parse_manifest(text).unwrap();
         assert_eq!(manifest.capabilities, [Capability::Agents]);
         assert!(manifest.roots.is_empty());
+    }
+
+    fn one_line_strip(capabilities: &str, module: &str) -> String {
+        format!(
+            "id = \"demo\"\ntitle = \"Demo\"\nprotocol = 1\nsite = \"site\"\nentry = \"index.html\"\n\
+             capabilities = [{capabilities}]\n[module]\nat = \"above\"\nsize = \"28px\"\nfocus = false\n{module}"
+        )
+    }
+
+    #[test]
+    fn a_module_shown_while_agents_wait_needs_agents_and_a_hidden_start() {
+        let m = parse_manifest(&one_line_strip(
+            "\"agents\", \"layout.focus\"",
+            "start = \"hidden\"\nshown_while = \"agents-wait\"\n",
+        ))
+        .unwrap();
+        let module = m.module.unwrap();
+        assert_eq!(module.shown_while, Some(ShownWhile::AgentsWait));
+        assert_eq!(
+            (module.start, module.fixed_height_px, module.focus),
+            (ModuleStart::Hidden, Some(28), false)
+        );
+        // Without the key nothing shows the module but the person.
+        let plain = parse_manifest(&one_line_strip("\"agents\"", "start = \"hidden\"\n")).unwrap();
+        assert_eq!(plain.module.unwrap().shown_while, None);
+
+        let refused = [
+            (
+                one_line_strip(
+                    "\"layout.focus\"",
+                    "start = \"hidden\"\nshown_while = \"agents-wait\"\n",
+                ),
+                "eitri-plugin.toml: module.shown_while: needs the agents capability",
+            ),
+            (
+                one_line_strip("\"agents\"", "shown_while = \"agents-wait\"\n"),
+                "eitri-plugin.toml: module.shown_while: needs start = \"hidden\"",
+            ),
+            (
+                one_line_strip("\"agents\"", "start = \"hidden\"\nshown_while = \"always\"\n"),
+                "eitri-plugin.toml: module.shown_while: \"always\" is not agents-wait",
+            ),
+        ];
+        for (text, err) in refused {
+            assert_eq!(parse_manifest(&text).unwrap_err(), err, "{text}");
+        }
     }
 
     #[test]
@@ -1481,8 +1589,10 @@ layout = { row = [ { module = "page", share = 0.42 }, { column = [ { module = "e
             m.module,
             Some(ModuleTable {
                 start: ModuleStart::Hidden,
+                shown_while: None,
                 at: parse_at("right"),
                 size: Some(0.4),
+                fixed_height_px: None,
                 focus: false
             })
         );
@@ -1810,6 +1920,65 @@ layout = { row = [ { module = "page", share = 0.42 }, { column = [ { module = "e
     }
 
     #[test]
+    fn px_size_parses_for_above_and_below() {
+        for at in ["above", "below"] {
+            for px in [16, 24, 200] {
+                let text = EXAMPLE.replacen("at = \"right\"", &format!("at = {at:?}"), 1).replacen(
+                    "size = 0.4",
+                    &format!("size = \"{px}px\""),
+                    1,
+                );
+                let module = parse_manifest(&text).unwrap().module.unwrap();
+                assert_eq!(module.fixed_height_px, Some(px));
+                assert_eq!(module.size, None);
+                assert_eq!(module.rule_size(), Some(crate::layout::rules::RuleSize::Pixels(px)));
+            }
+        }
+    }
+
+    #[test]
+    fn px_size_is_refused_elsewhere() {
+        for at in [
+            None,
+            Some("left"),
+            Some("right"),
+            Some("side"),
+            Some("bottom"),
+            Some("main"),
+            Some("below-editor"),
+            Some("tab"),
+        ] {
+            let placement = at.map(|at| format!("at = {at:?}")).unwrap_or_default();
+            let text = EXAMPLE
+                .replacen("at = \"right\"", &placement, 1)
+                .replacen("size = 0.4", "size = \"24px\"", 1);
+            let error = parse_manifest(&text).unwrap_err();
+            assert!(
+                error.contains("module.size") && error.contains("above or below"),
+                "{error}"
+            );
+        }
+    }
+
+    #[test]
+    fn px_outside_16_200_is_refused() {
+        for size in [
+            "0px", "15px", "201px", "65536px", "-16px", "16.5px", "+16px", "16 px", "16PX", "px",
+        ] {
+            let text = EXAMPLE.replacen("at = \"right\"", "at = \"above\"", 1).replacen(
+                "size = 0.4",
+                &format!("size = {size:?}"),
+                1,
+            );
+            let error = parse_manifest(&text).unwrap_err();
+            assert!(
+                error.contains("module.size") && error.contains("16..=200"),
+                "{size}: {error}"
+            );
+        }
+    }
+
+    #[test]
     fn module_and_net_tables_are_optional_and_default_as_today() {
         let no_module = &EXAMPLE[..EXAMPLE.find("\n[module]\n").unwrap() + 1];
         let no_module = no_module.replacen(", \"editor.follow\", \"editor.commands\"]", "]", 1);
@@ -1820,8 +1989,10 @@ layout = { row = [ { module = "page", share = 0.42 }, { column = [ { module = "e
             parse_manifest(&shown).unwrap().module,
             Some(ModuleTable {
                 start: ModuleStart::Shown,
+                shown_while: None,
                 at: None,
                 size: None,
+                fixed_height_px: None,
                 focus: true
             })
         );

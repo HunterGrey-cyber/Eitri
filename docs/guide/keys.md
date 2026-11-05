@@ -55,6 +55,13 @@ would rather see the keys than remember them, [The hint panel](#the-hint-panel) 
 | `<prefix> w` | choose a session: `Restore last session` first while the last window's tabs are on offer (the way to take it from the editor, where `s` is nvim's), then the open tabs, then saved ones to resume |
 | `<prefix> i` | this session's details |
 
+**Agents that wait.** `<prefix> u` goes to the agent that has waited longest for you, in whichever window it is, and each
+further press goes to the next one; `<prefix> B` leaves the walk and goes back to where it started. Neither answers
+anything: the card is in front of you, and you answer it with the card keys of that chat. With nothing waiting the
+status line says `no agent waits for you`. They share their walk with the pages that show your agents, and they work
+in a companion window too. With `agents.enabled` off they say `agents are off in this window`. See
+[Many agents at once](many-agents.md).
+
 **Projects.** `<prefix> O` (also `:Eitri project.choose`, a click on the project's name in the top bar, or `p` on an empty
 chat tab) lays a list over the window: your other projects, the one you used last first, with a line to filter it or to
 type a path. It works in every window, the chat and page windows of [compositor windows](compositor-windows.md) included,

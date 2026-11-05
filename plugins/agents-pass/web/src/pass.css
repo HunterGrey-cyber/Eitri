@@ -1,0 +1,73 @@
+:root {
+  color-scheme: var(--nv-color-scheme, dark);
+}
+html, body {
+  margin: 0;
+  height: 100%;
+  overflow: hidden;
+  background: var(--nv-surface, var(--nv-bg, #1d1f24));
+  color: var(--nv-surface-fg, var(--nv-fg, #d8dae0));
+  font-family: var(--nv-font-mono, monospace);
+  font-size: calc(var(--nv-text-size, 16px) * 0.82);
+}
+.pass {
+  display: flex;
+  align-items: center;
+  gap: 0.9em;
+  height: 100%;
+  padding: 0 0.8em;
+  box-sizing: border-box;
+  border-bottom: 1px solid var(--nv-border, #33363d);
+  white-space: nowrap;
+}
+.pass[hidden] { display: none; }
+.lead {
+  flex: none;
+  color: var(--nv-chrome-accent, #8fb4e6);
+  font-variant-numeric: tabular-nums;
+}
+.tickets {
+  flex: 1 1 auto;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.sep {
+  margin: 0 0.7em;
+  color: var(--nv-border, #4a4e57);
+}
+.ticket { padding: 0 0.15em; border-radius: 3px; }
+.ticket .where { color: var(--nv-muted, #9095a0); }
+.ticket .age { color: var(--nv-muted, #9095a0); font-variant-numeric: tabular-nums; }
+.ticket.visited { opacity: 0.55; }
+.ticket.current { color: var(--nv-fg, #e8eaf0); font-weight: 600; }
+.ticket.current .marker { color: var(--nv-chrome-accent, #8fb4e6); }
+.ticket.selected { box-shadow: inset 0 -2px 0 var(--nv-focus-ring, var(--nv-chrome-accent, #8fb4e6)); }
+.ticket[data-state="card"] .glyph, .count[data-glyph="⚑"] { color: var(--nv-warn, #e5c07b); }
+.ticket[data-state="question"] .glyph, .ticket[data-state="trust"] .glyph, .count[data-glyph="?"] {
+  color: var(--nv-chrome-accent, #8fb4e6);
+}
+.counts { flex: none; font-variant-numeric: tabular-nums; }
+.hint {
+  flex: none;
+  margin-left: auto;
+  color: var(--nv-muted, #9095a0);
+}
+/* The keys kit draws its bar as a band along the page's bottom, which on this one-line page would cover the line.
+   Here the bar sits at the line's right end, the line's height, and takes room only for what it has to say: the
+   line has no room to spare for the NORMAL word, so it is left out (the other modes' words show), and an empty
+   message takes no cell, so in normal mode with nothing to say the bar has no width. The selectors outrank the
+   kit's own. */
+body #eitri-keys-hud {
+  top: 0;
+  bottom: 0;
+  left: auto;
+  right: 0;
+  max-width: 60%;
+  padding: 0;
+  align-items: center;
+}
+body #eitri-keys-hud .eitri-keys-mode[data-mode="normal"],
+body #eitri-keys-hud .eitri-keys-message:empty {
+  display: none;
+}

@@ -1,0 +1,204 @@
+/* The Strips sidebar. Every colour and font is the host's theme (--nv-*); the fallbacks are its dark defaults. */
+:root {
+  color-scheme: var(--nv-color-scheme, dark);
+}
+/* The list stands on the editor's own bg, the fill fg, muted, cursorline and the signal colours are guarded against.
+   Only the head and the key line stand on chrome, with chrome's own text: a reversed StatusLine makes chrome fg. */
+html, body {
+  margin: 0;
+  height: 100%;
+  background: var(--nv-bg, #14161b);
+  color: var(--nv-fg, #e0e2ea);
+  font-family: var(--nv-font-mono, monospace);
+  font-size: var(--nv-text-size, 13px);
+}
+#strips {
+  height: 100%;
+  overflow-x: hidden;
+  overflow-y: auto;
+}
+.strips {
+  display: flex;
+  flex-direction: column;
+  min-height: 100%;
+}
+
+.head {
+  position: sticky;
+  top: 0;
+  z-index: 1;
+  display: flex;
+  justify-content: space-between;
+  gap: 1ch;
+  padding: 0.3em 1.6em 0.3em 0.8em;
+  background: var(--nv-chrome, #1c1e23);
+  color: var(--nv-chrome-muted, #83858c);
+  border-bottom: 1px solid var(--nv-border, #33353a);
+}
+.head .sum {
+  color: var(--nv-warn, #d19a00);
+}
+
+.list {
+  flex: 1;
+  margin: 0;
+  padding: 0.2em 0 0.6em;
+  list-style: none;
+}
+.project {
+  padding: 0.6em 1.6em 0.1em 0.8em;
+  color: var(--nv-muted, #8e9098);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.project:first-child {
+  padding-top: 0.3em;
+}
+
+/* The right-hand gutter is empty on every row but one that needs the person: that row reaches into it, and its
+   ◀ tab sticks out at the edge. Nothing else moves.
+   The number column is as wide as the list's widest number (`--num-w`, set by the page), so window·tab fits. */
+.row {
+  display: grid;
+  grid-template-columns: 1.4ch var(--num-w, 2.6ch) minmax(0, 1fr) 1.6ch minmax(0, max-content) 4.4ch 1.6em;
+  column-gap: 0.6ch;
+  align-items: baseline;
+  padding-left: 0.4ch;
+  line-height: 1.6;
+  white-space: nowrap;
+  cursor: default;
+  user-select: none;
+}
+.row > span {
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.row .stop {
+  color: var(--nv-warn, #d19a00);
+  font-weight: bold;
+}
+.row.marked:not(.current) .stop {
+  color: var(--nv-link, #e0e2ea);
+  font-weight: normal;
+}
+.row .num {
+  color: var(--nv-muted, #8e9098);
+  text-align: right;
+}
+.row .label.unnamed {
+  color: var(--nv-muted, #8e9098);
+}
+.row .glyph {
+  text-align: center;
+}
+.row .what {
+  max-width: 9ch;
+  color: var(--nv-muted, #8e9098);
+}
+.row .age {
+  color: var(--nv-muted, #8e9098);
+  text-align: right;
+  font-variant-numeric: tabular-nums;
+}
+.row .edge {
+  align-self: stretch;
+  text-align: center;
+  border-radius: 3px 0 0 3px;
+}
+
+.row.cursor {
+  background: var(--nv-cursorline, #26282d);
+  box-shadow: inset 2px 0 0 var(--nv-focus-ring, #e0e2ea);
+}
+.row.out {
+  background: var(--nv-warn-tint, #1f1e19);
+}
+.row.out.cursor {
+  background: var(--nv-cursorline, #26282d);
+}
+.row.out .glyph,
+.row.out .what {
+  color: var(--nv-warn, #d19a00);
+}
+.row.out .edge {
+  background: var(--nv-warn, #d19a00);
+  color: var(--nv-bg, #14161b);
+}
+.row.current .label {
+  font-weight: bold;
+}
+.row[data-state="failed"] .glyph,
+.row[data-state="failed"] .what {
+  color: var(--nv-error, #d4383a);
+}
+.row.class-ended:not([data-state="failed"]) .glyph,
+.row.class-quiet .glyph {
+  color: var(--nv-muted, #8e9098);
+}
+.row.unread .glyph,
+.row.unread .label {
+  color: var(--nv-fg, #e0e2ea);
+  font-weight: bold;
+}
+.row.class-working .glyph {
+  color: var(--nv-ok, #3a8a3a);
+}
+.row.moving {
+  font-style: italic;
+  opacity: 0.6;
+}
+.row.hushed {
+  opacity: 0.5;
+}
+.row.dim {
+  opacity: 0.3;
+}
+.row.empty {
+  color: var(--nv-border, #33353a);
+}
+
+/* The narrow rail: the glyph, what waits, and the tab. Hovering names the row. */
+.narrow .row {
+  grid-template-columns: 1.6ch minmax(0, 1fr) 1.6em;
+  column-gap: 0.3ch;
+  padding-left: 0.8ch;
+}
+.narrow .project {
+  height: 0;
+  margin: 0.35em 0.6ch;
+  padding: 0;
+  border-top: 1px solid var(--nv-border, #33353a);
+}
+.narrow .project:first-child {
+  display: none;
+}
+.narrow .row .count {
+  color: var(--nv-warn, #d19a00);
+}
+.narrow .row.current .glyph {
+  outline: 1px solid var(--nv-warn, #d19a00);
+  outline-offset: -1px;
+  border-radius: 2px;
+}
+.narrow .row.marked .glyph {
+  text-decoration: underline;
+}
+
+.keys {
+  position: sticky;
+  bottom: 0;
+  padding: 0.3em 0.8em;
+  background: var(--nv-chrome, #1c1e23);
+  color: var(--nv-chrome-muted, #83858c);
+  border-top: 1px solid var(--nv-border, #33353a);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: pre;
+}
+.off,
+.none {
+  margin: 0;
+  padding: 0.6em 0.8em;
+  color: var(--nv-muted, #8e9098);
+}

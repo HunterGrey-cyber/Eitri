@@ -1770,6 +1770,7 @@ fn run_all() -> Result<Vec<String>, String> {
         .chain(own_scripts(&f))
         .chain([
             conformance::join_back_refusal_script(f.win, "the tab could not join the base view"),
+            conformance::agents_scan_refusal_script(f.win),
             conformance::teardown_script(f.win),
             conformance::teardown_script_for(
                 f.win,

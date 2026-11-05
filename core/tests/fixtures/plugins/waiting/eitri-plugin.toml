@@ -1,0 +1,11 @@
+id = "waiting"
+title = "Waiting agents"
+protocol = 1
+site = "site"
+entry = "index.html"
+capabilities = ["agents"]
+
+[module]
+at = "below"
+size = 0.08
+focus = false

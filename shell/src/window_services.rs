@@ -78,6 +78,36 @@ impl plugin_panels::FollowWindow for GridFollowWindow {
     }
 }
 
+/// A module shown while agents wait: a [`GridFollowWindow`] whose shows and hides go through
+/// `Controller::wait_follow`, which opens no page window where pages are windows of the compositor.
+pub(crate) struct WaitFollowWindow(pub(crate) GridFollowWindow);
+
+impl plugin_panels::FollowWindow for WaitFollowWindow {
+    fn is_shown(&self, module: &ModuleId) -> bool {
+        plugin_panels::FollowWindow::is_shown(&self.0, module)
+    }
+
+    fn is_on_screen(&self, module: &ModuleId) -> bool {
+        plugin_panels::FollowWindow::is_on_screen(&self.0, module)
+    }
+
+    fn show(&self, module: &ModuleId) {
+        if let Some(driver) = self.0.driver.upgrade() {
+            driver.wait_follow(WinId::MAIN, module, true);
+        }
+    }
+
+    fn hide(&self, module: &ModuleId) {
+        if let Some(driver) = self.0.driver.upgrade() {
+            driver.wait_follow(WinId::MAIN, module, false);
+        }
+    }
+
+    fn command(&self, module: &ModuleId, cmd: eitri_core::plugin::follow_feed::FollowCmd) {
+        plugin_panels::FollowWindow::command(&self.0, module, cmd);
+    }
+}
+
 /// Adds the panel's effects and read-only facts to the window's module services.
 /// A move's answer from the panel, as the controller hears it: a frozen tab's descriptors become the handoff the
 /// link sends unread.
@@ -115,6 +145,15 @@ pub(crate) struct PanelServices {
 }
 
 impl gtk_host::ServiceSet for PanelServices {
+    fn agents_scan(
+        &self,
+        win: WinId,
+        step: eitri_core::wm::agents_round::RoundKey,
+        at: Option<&ModuleId>,
+    ) -> Result<(), String> {
+        self.inner.agents_scan(win, step, at)
+    }
+
     fn page_built(&self, module: &ModuleId) -> bool {
         self.inner.page_built(module)
     }
@@ -124,6 +163,9 @@ impl gtk_host::ServiceSet for PanelServices {
     }
     fn tab_moving(&self, tab: eitri_core::tabs::TabId) -> bool {
         self.inner.tab_moving(tab)
+    }
+    fn tab_has_work(&self, tab: eitri_core::tabs::TabId) -> bool {
+        self.inner.tab_has_work(tab)
     }
     fn tab_can_step(&self, delta: i32) -> bool {
         self.inner.tab_can_step(delta)

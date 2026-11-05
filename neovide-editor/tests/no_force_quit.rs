@@ -451,7 +451,6 @@ const SCANNED: &[&str] = &[
     "neovide-editor/src",
     "agent/src",
     "terminal/engine/src",
-    "supervisor/src",
 ];
 
 /// Product crates whose sources this scan does not read, each with why. Copied terminal drawing

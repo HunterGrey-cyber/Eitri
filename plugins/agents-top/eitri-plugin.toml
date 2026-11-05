@@ -1,0 +1,10 @@
+id = "agents-top"
+title = "Agents"
+protocol = 1
+site = "web/dist"
+entry = "index.html"
+capabilities = ["agents", "layout.focus"]   # layout.focus: Esc gives the keys to the editor
+
+[module]
+at = "main"
+start = "hidden"

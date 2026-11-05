@@ -206,6 +206,7 @@ The capabilities:
 | `net` | fetch from the `[net]` origins; nothing else leaves the page |
 | `editor.follow` | follow the buffer you edit (`editor.view`, `editor.text` events), scroll it and move its cursor |
 | `editor.commands` | define the `[commands]` in Neovim |
+| `agents` | see every agent tab of every Eitri window (`agents.watch`; `agents.row`, `agents.gone`, `agents.reset`, `agents.selection` and `agents.round` events while the page is on screen), and bring one forward, open a new one, move the shared selection, walk the agents that wait (`agents.round`) or ask one to stop in its chat (`agents.focus`, `agents.new`, `agents.select`, `agents.round`, `agents.stop`); each of these needs a key press or click in the page in the last second, with the page holding the keys (`no_gesture` otherwise), and `agents.new` works at most once a second. Nothing a page does answers a permission card or a question: that stays in the chat. Cannot be declared with `net` |
 
 ### What the page runs in
 

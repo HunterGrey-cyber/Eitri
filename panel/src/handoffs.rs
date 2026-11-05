@@ -162,8 +162,6 @@ pub(super) fn panel_tab_handoff(state: &AgentPanelState, tab: TabId) -> Result<P
         canonical_project_dir: _,
         prefs_dir: _,
         editor_context: _,
-        supervisor: _,
-        supervisor_pending: _,
         shutting_down: _,
         wake: _,
         last_tick: _,

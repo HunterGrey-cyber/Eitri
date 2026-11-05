@@ -272,6 +272,8 @@ enum NodeOut<'a> {
 struct ChildOut<'a> {
     share: f32,
     #[serde(skip_serializing_if = "Option::is_none")]
+    fixed_px: Option<i32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pin: Option<PinOut>,
     node: NodeOut<'a>,
 }
@@ -311,6 +313,7 @@ impl<'a> NodeOut<'a> {
                 .iter()
                 .map(|ch| ChildOut {
                     share: ch.share,
+                    fixed_px: ch.fixed_px,
                     pin: ch.pin.map(|pin| PinOut { px: pin.px }),
                     node: NodeOut::of(&ch.node),
                 })
@@ -481,7 +484,7 @@ fn read_node(value: &Value, ws: &str, notes: &mut Vec<String>, copy: &mut bool) 
                 let Value::Object(child) = item else {
                     return Err("a container's child that is not an object".to_string());
                 };
-                not_kept(child, &["share", "pin", "node"], ws, notes, copy);
+                not_kept(child, &["share", "fixed_px", "pin", "node"], ws, notes, copy);
                 let Some(share) = child.get("share").and_then(Value::as_f64) else {
                     return Err("a container's child without a `share`".to_string());
                 };
@@ -505,6 +508,15 @@ fn read_node(value: &Value, ws: &str, notes: &mut Vec<String>, copy: &mut bool) 
                     return Err("a container's child without a `node`".to_string());
                 };
                 let mut out = Child::new(read_node(node, ws, notes, copy)?, share as f32);
+                out.fixed_px = match child.get("fixed_px") {
+                    None | Some(Value::Null) => None,
+                    Some(px) => Some(
+                        px.as_i64()
+                            .and_then(|px| i32::try_from(px).ok())
+                            .filter(|px| super::con::FIXED_HEIGHT_PX.contains(px))
+                            .ok_or_else(|| "a fixed height must be a whole number of pixels in 16..=200".to_string())?,
+                    ),
+                };
                 out.pin = pin;
                 children.push(out);
             }
@@ -1486,6 +1498,52 @@ mod tests {
     }
   ]
 }"#;
+
+    #[test]
+    fn a_fixed_height_round_trips_without_changing_fraction_only_files() {
+        use super::super::rules::{apply_launch_rule, OpenRule, RuleSize, NOMINAL_GRID};
+        let strip = ModuleId::lua("strip");
+        let mut layout = super::super::fixture::fixture("column(row(editor, agent, terminal hidden), lua:strip)");
+        apply_launch_rule(
+            &mut layout,
+            &strip,
+            &OpenRule {
+                size: Some(RuleSize::Pixels(24)),
+                ..OpenRule::default()
+            },
+            NOMINAL_GRID,
+        )
+        .unwrap();
+        let decls = [ModuleDecl {
+            id: strip.clone(),
+            placement: Placement::BelowRoot,
+        }];
+        let text = one(&layout);
+        assert!(text.contains("\"fixed_px\": 24"));
+        let back = decode_v2(&text, &root(), &decls).unwrap();
+        assert!(back.notes.is_empty(), "{:?}", back.notes);
+        assert_eq!(back.current.root(), layout.root());
+        assert_eq!(one(&back.current), text);
+        for h in [400, 800, 1600] {
+            let arrangement = arrange(&back.current, &Frame::new(Size { w: 1000, h }, 1));
+            assert_eq!(arrangement.modules.iter().find(|(m, _)| m == &strip).unwrap().1.h, 24);
+        }
+        assert!(!one(&plain()).contains("fixed_px"));
+    }
+
+    #[test]
+    fn a_saved_layout_with_a_fraction_still_loads() {
+        let text = FIRST_UNIT_GOLDEN;
+        let loaded = decode_v2(text, &root(), &[]).unwrap();
+        assert!(loaded.notes.is_empty(), "{:?}", loaded.notes);
+        let split = loaded.current.root().children[0].node.as_con().unwrap();
+        assert_eq!(split.children[0].share, 0.25);
+        assert_eq!(split.children[1].share, 0.75);
+        assert_eq!(one(&loaded.current), text);
+        let arrangement = arrange(&loaded.current, &Frame::new(Size { w: 1001, h: 800 }, 1));
+        assert_eq!(arrangement.modules[0].1.w, 250);
+        assert_eq!(arrangement.modules[1].1.w, 750);
+    }
 
     /// The on-disk format, byte for byte: every file written depends on these names and this order,
     /// and a change to a `rename_all` or a field's place would pass every round trip while stranding

@@ -37,8 +37,8 @@
 //! asserts that two sessions in one directory each see only their own `PreToolUse` hook. That
 //! isolation is real and lives elsewhere -- the hook config travels in the CLI's own argv
 //! (`--settings`, see `agent::settings`), not in a `.claude/` file two sessions could share. The
-//! cross-window question "is another window running an agent on this project?" is the `supervisor`
-//! dashboard's job, not a lock's.
+//! cross-window question "is another window running an agent on this project?" is the agents layer's job, not a
+//! lock's.
 //!
 //! The lease is ADVISORY and nothing here says otherwise. It binds
 //! processes that take part in this protocol; a `claude` someone runs by hand in the same directory

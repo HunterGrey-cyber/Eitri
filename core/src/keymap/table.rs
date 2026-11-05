@@ -427,6 +427,9 @@ fn default_bindings() -> Vec<Binding> {
     // reserved for the canvas (`crate::layout::keys::RESERVED_FOR_CANVAS`), not this table.
     bind("[", Action::CopyMode { up: false }, false);
     bind("PPage", Action::CopyMode { up: true }, false);
+    // The round over the agents that wait, across windows: keys stock tmux leaves free after its prefix.
+    bind("u", Action::AgentsNext, false);
+    bind("B", Action::AgentsBack, false);
     out
 }
 
@@ -1310,6 +1313,8 @@ mod tests {
         ("t", "module.terminal", false),
         ("[", "copy-mode", false),
         ("PPage", "copy-mode up=true", false),
+        ("u", "agents.next", false),
+        ("B", "agents.back", false),
     ];
 
     fn spelled(action: &Action) -> String {
@@ -1341,6 +1346,36 @@ mod tests {
         let taken = Keymap::apply_user(&[set("!", "zoom")], &[]).unwrap();
         assert_eq!(taken.lookup(&k("!")).unwrap().action, Action::Zoom);
         assert_eq!(taken.user_overrides(), ["prefix ! (was tab.break)"]);
+    }
+
+    #[test]
+    #[allow(non_snake_case)]
+    fn u_and_B_are_bound_in_eitris_table_and_unbound_in_the_stock_tmux_fixture() {
+        let map = Keymap::defaults();
+        for (key, action) in [("u", Action::AgentsNext), ("B", Action::AgentsBack)] {
+            let binding = map.lookup(&k(key)).unwrap_or_else(|| panic!("prefix {key} is unbound"));
+            assert_eq!(binding.action, action);
+            assert!(!binding.repeatable);
+            assert_eq!(map.keys_for(&action), vec![k(key)], "one default key");
+            assert_eq!(
+                crate::keymap::stock::stock_command(&k(key)),
+                None,
+                "stock tmux binds nothing at prefix {key}"
+            );
+            assert!(
+                !is_tmux_action(&action),
+                "Eitri's own: `unbind -a` in a tmux config leaves it"
+            );
+        }
+        let sheet = map.help(&ModuleKeys::built_in());
+        for action in [Action::AgentsNext, Action::AgentsBack] {
+            let what = action.describe("Ctrl+b", "");
+            assert!(
+                sheet.iter().any(|row| row.what == what),
+                "the ? sheet lists {}: {sheet:?}",
+                action.name()
+            );
+        }
     }
 
     #[test]
@@ -1459,7 +1494,7 @@ mod tests {
         // `H J K` are vim's `<C-w>H/J/K`; the Alt chords are i3's `$mod` chords after the prefix.
         // The float and scratchpad chords are i3's `$mod+Shift+space`, `$mod+minus` and
         // `$mod+Shift+minus` after the prefix.
-        const EITRI_ONLY: [&str; 28] = [
+        const EITRI_ONLY: [&str; 30] = [
             "O",
             "C-l",
             "C-h",
@@ -1488,6 +1523,8 @@ mod tests {
             "M-S-Space",
             "M--",
             "M-_",
+            "u",
+            "B",
         ];
         for binding in Keymap::defaults().bindings() {
             let name = binding.key.to_string();

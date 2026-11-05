@@ -783,6 +783,29 @@ pub fn join_back_refusal_script(win: WinId, text: &str) -> Script {
     }
 }
 
+/// A host whose window runs no agents layer refuses a round key's scan while it applies, so the controller hears it;
+/// a host that carries the scan out answers it later as `HostEvent::Agents`.
+pub fn agents_scan_refusal_script(win: WinId) -> Script {
+    Script {
+        name: "a_round_scan_with_no_agents_layer_is_posted_refused",
+        ops: vec![HostOp::AgentsScan {
+            win,
+            step: super::agents_round::RoundKey::Next,
+            at: Some(ModuleId::agent()),
+        }],
+        expect: vec![
+            Expect::Answer {
+                op: 0,
+                applied: Applied::Refused,
+            },
+            Expect::PostedDuring {
+                op: 0,
+                event: EventMatch::Refused(OpTag::AgentsScan),
+            },
+        ],
+    }
+}
+
 /// What a host that can start no second window answers the pair's ops, and the ones a module window's start and keys
 /// add: each refused while it applies, so the
 /// controller hears why. A host whose shell has no pair at all runs these; a host that carries the ops out does not.
@@ -1172,6 +1195,16 @@ mod tests {
             host.with_surface(f.win, f.a.clone(), SurfaceKind::Chat { view: ViewId::BASE }, true);
             run_observed(host.as_ref(), &sink, &script, Some(host.as_ref())).unwrap_or_else(|e| panic!("{e}"));
         }
+    }
+
+    #[test]
+    fn a_round_scan_with_no_agents_layer_is_posted_refused() {
+        let host = FakeHost::new();
+        host.refuse_op(|op| matches!(op, HostOp::AgentsScan { .. }));
+        let sink = Rc::new(RecordingSink::default());
+        let erased: Rc<dyn HostSink> = sink.clone();
+        host.attach(Rc::downgrade(&erased));
+        run(host.as_ref(), &sink, &agents_scan_refusal_script(WinId::MAIN)).unwrap_or_else(|e| panic!("{e}"));
     }
 
     #[test]

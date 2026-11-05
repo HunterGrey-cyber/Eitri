@@ -20,8 +20,7 @@ impl RuntimeThread {
     /// actually constructed and its `Handle` captured -- callers never race a not-yet-ready
     /// runtime. This function contains the two allowed `.expect()` calls in this whole module:
     /// building the runtime is a foundational setup failure with no
-    /// meaningful degraded path (matching `eitri_supervisor.rs`'s own precedent for a bind
-    /// failure), and the `handle_rx.recv().expect(..)` immediately following is not a second,
+    /// meaningful degraded path, and the `handle_rx.recv().expect(..)` immediately following is not a second,
     /// independent risk — it only fires as the direct, causal consequence of that same failure
     /// (if the build panics, the handle is never sent, so the `recv()` fails too),
     /// propagating the same underlying panic to the calling thread rather than introducing a new one.

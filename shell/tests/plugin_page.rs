@@ -235,6 +235,7 @@ fn run(display: &str) -> Result<Vec<String>, String> {
         doc_slot: None,
         remote_images: false,
         console_to_stdout: false,
+        agents_kit: false,
     };
     let window = gtk4::Window::new();
     window.set_title(Some(&window_title()));
@@ -619,6 +620,7 @@ fn run_theme() -> Result<(Vec<String>, bool), String> {
         doc_slot: None,
         remote_images: false,
         console_to_stdout: false,
+        agents_kit: false,
     };
     let fallback = PageTheme::fallback();
     let light = light_theme();
@@ -904,6 +906,7 @@ fn p4_view(label: &str, ip: IpAddr, remote_images: bool, proxy: ProxyOverride) -
         doc_slot: None,
         remote_images,
         console_to_stdout: false,
+        agents_kit: false,
     };
     let window = gtk4::Window::new();
     window.set_default_size(400, 300);

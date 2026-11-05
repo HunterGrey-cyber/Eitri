@@ -1155,7 +1155,7 @@ class StagesTheDesktopEntryAndIcons(unittest.TestCase):
             self.assertTrue(os.path.isfile(os.path.join(self.st, src)), src)
         # The staging dir also holds the legacy entry (for the tarball's own copy of it), which no
         # profile names: a package never ships it.
-        self.assertEqual({p for p in self.files(self.st)}, set(srcs) | {"packaging/legacy/eitri.desktop"})
+        self.assertEqual({p for p in self.files(self.st)}, set(srcs) | {"packaging/legacy/eitri.desktop", "packaging/legacy/eitri-supervisor"})
         for profile in ("nfpm.yaml", "nfpm-public.yaml"):
             with open(os.path.join(_PACKAGING, profile), encoding="utf-8") as f:
                 entries = [ln for ln in f.read().splitlines() if re.match(r"\s*(- )?(src|dst):", ln)]
@@ -1165,7 +1165,7 @@ class StagesTheDesktopEntryAndIcons(unittest.TestCase):
         top = "eitri-1.0.0-x86_64-linux/"
         roles = rc.tarball_roles("1.0.0")
         want = {path[len(top):] for role, path in roles.items()
-                if role in ("desktop", "panel-desktop", "page-desktop", "legacy-desktop") or role.startswith(("icon-", "plugin-", "gnome-ext-"))}
+                if role in ("desktop", "panel-desktop", "page-desktop", "legacy-desktop", "legacy-supervisor") or role.startswith(("icon-", "plugin-", "gnome-ext-"))}
         self.assertIn("share/applications/eitri.desktop", want)
         # Nothing of the extension's test code or notes is in the tarball tree.
         for name in ("testing.js", "README.md"):
@@ -1176,9 +1176,11 @@ class StagesTheDesktopEntryAndIcons(unittest.TestCase):
             with open(os.path.join(_PACKAGING, "..", tracked), "rb") as a, \
                     open(os.path.join(self.tree, roles[role][len(top):]), "rb") as b:
                 self.assertEqual(a.read(), b.read(), role)
-        # Modes: read, never executed (the nfpm packages and install.sh rely on a plain file).
+        # Modes: read, never executed (the nfpm packages and install.sh rely on a plain file), except the
+        # placeholder 0.2.0's installer wants to find executable.
         for rel in self.files(self.tree):
-            self.assertEqual(os.stat(os.path.join(self.tree, rel)).st_mode & 0o777, 0o644, rel)
+            want_mode = 0o755 if rel == "lib/eitri/eitri-supervisor" else 0o644
+            self.assertEqual(os.stat(os.path.join(self.tree, rel)).st_mode & 0o777, want_mode, rel)
 
 
 class StagesThePluginDirectories(unittest.TestCase):
@@ -1186,6 +1188,8 @@ class StagesThePluginDirectories(unittest.TestCase):
     each shipped plugin's manifest and built site at plugins/<name>/ (where both nfpm profiles name it, one tree entry),
     the tarball tree holds the same files at lib/eitri/plugins/<name>/ (which install.sh copies with the binaries),
     and the build's fingerprint is in neither."""
+
+    NAMES = ('markdown', 'agents-strips', 'agents-top', 'agents-pass')
 
     SITE = {
         "eitri-plugin.toml": b'id = "markdown"\n',
@@ -1198,14 +1202,15 @@ class StagesThePluginDirectories(unittest.TestCase):
         self.scratch = _scratch_dir()
         self.addCleanup(shutil.rmtree, self.scratch, ignore_errors=True)
         self.clone = os.path.join(self.scratch, "clone")
-        for rel, data in self.SITE.items():
-            path = os.path.join(self.clone, "plugins", "markdown", rel)
-            os.makedirs(os.path.dirname(path), exist_ok=True)
-            with open(path, "wb") as f:
-                f.write(data)
-        _write(os.path.join(self.clone, "plugins", "markdown", "web", "dist", ".inputs-sha256"), "0" * 64)
-        _write(os.path.join(self.clone, "plugins", "markdown", "web", "src", "main.ts"), "source\n")
-        _write(os.path.join(self.clone, "plugins", "markdown", "web", "package.json"), "{}\n")
+        for name in self.NAMES:
+            for rel, data in self.SITE.items():
+                path = os.path.join(self.clone, "plugins", name, rel)
+                os.makedirs(os.path.dirname(path), exist_ok=True)
+                with open(path, "wb") as f:
+                    f.write(data.replace(b'markdown', name.encode()))
+            for rel, text in (("web/dist/.inputs-sha256", "0" * 64),
+                              ("web/src/main.ts", "source\n"), ("web/package.json", "{}\n")):
+                _write(os.path.join(self.clone, "plugins", name, rel), text)
         self.st = os.path.join(self.scratch, "stage")
         self.tree = os.path.join(self.scratch, "tarball", "top")
         os.makedirs(self.st)
@@ -1221,16 +1226,17 @@ class StagesThePluginDirectories(unittest.TestCase):
     def test_the_staged_and_tarball_trees_hold_the_manifest_and_the_site_only(self):
         proc = self.stage()
         self.assertEqual(proc.returncode, 0, proc.stderr)
-        staged = os.path.join(self.st, "plugins", "markdown")
-        tarball = os.path.join(self.tree, "lib", "eitri", "plugins", "markdown")
-        self.assertEqual(self.files(self.st), {f"plugins/markdown/{rel}" for rel in self.SITE})
-        self.assertEqual(self.files(self.tree), {f"lib/eitri/plugins/markdown/{rel}" for rel in self.SITE})
-        for root in (staged, tarball):
-            for rel, data in self.SITE.items():
-                with open(os.path.join(root, rel), "rb") as f:
-                    self.assertEqual(f.read(), data, rel)
-                self.assertEqual(os.stat(os.path.join(root, rel)).st_mode & 0o777, 0o644, rel)
-            self.assertEqual(os.stat(os.path.join(root, "web", "dist", "katex")).st_mode & 0o777, 0o755)
+        self.assertEqual(self.files(self.st), {f"plugins/{name}/{rel}" for name in self.NAMES for rel in self.SITE})
+        self.assertEqual(self.files(self.tree),
+                         {f"lib/eitri/plugins/{name}/{rel}" for name in self.NAMES for rel in self.SITE})
+        for name in self.NAMES:
+            for root in (os.path.join(self.st, "plugins", name),
+                         os.path.join(self.tree, "lib", "eitri", "plugins", name)):
+                for rel, data in self.SITE.items():
+                    with open(os.path.join(root, rel), "rb") as f:
+                        self.assertEqual(f.read(), data.replace(b'markdown', name.encode()), (name, rel))
+                    self.assertEqual(os.stat(os.path.join(root, rel)).st_mode & 0o777, 0o644, (name, rel))
+                self.assertEqual(os.stat(os.path.join(root, "web", "dist", "katex")).st_mode & 0o777, 0o755)
 
     def test_a_plugin_without_its_built_site_stops_the_release(self):
         os.remove(os.path.join(self.clone, "plugins", "markdown", "web", "dist", "index.html"))
@@ -1255,7 +1261,7 @@ class StagesThePluginDirectories(unittest.TestCase):
     def test_the_phases_install_the_packages_stage_the_tree_and_ship_the_site_in_the_source_asset(self):
         proc = _bash('echo "SHIPPED_PLUGINS=$SHIPPED_PLUGINS"', dict(os.environ), self.scratch)
         self.assertEqual(proc.returncode, 0, proc.stderr)
-        self.assertEqual(proc.stdout.strip(), "SHIPPED_PLUGINS=markdown")
+        self.assertEqual(proc.stdout.strip(), "SHIPPED_PLUGINS=" + " ".join(self.NAMES))
         self.assertIn("(cd plugins/markdown/web && npm ci --no-audit --no-fund)", self.function_text("ctr_phase_f"))
         body = self.function_text("ctr_phase_b")
         self.assertIn('ctr_stage_plugins "$st"', body)
@@ -1263,7 +1269,13 @@ class StagesThePluginDirectories(unittest.TestCase):
         # The staging comes after the build and the licence collection, which reads the build output in the tree.
         self.assertLess(body.index("collect-licenses.py"), body.index('ctr_stage_plugins "$st"'))
         self.assertLess(body.index('ctr_stage_plugins "$st"'), body.index("nfpm pkg --config nfpm-public.yaml"))
-        self.assertIn("plugins/markdown/web/dist/.inputs-sha256", body)
+        self.assertIn('for name in $SHIPPED_PLUGINS; do', body)
+        self.assertIn('plugins/$name/web/dist/.inputs-sha256', body)
+        self.assertIn('plugin-kit/agents/dist/agents.js', body)
+        self.assertIn('plugin-kit/agents/dist/.inputs-sha256', body)
+        phase_f = self.function_text("ctr_phase_f")
+        for web in ("plugin-kit/agents", *(f"plugins/{name}/web" for name in self.NAMES[1:])):
+            self.assertIn(f"(cd {web} && npm ci --no-audit --no-fund)", phase_f)
 
 
 class SignAndVerify(unittest.TestCase):

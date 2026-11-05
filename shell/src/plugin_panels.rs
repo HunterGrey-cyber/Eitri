@@ -16,10 +16,13 @@ use eitri_core::lua::panel::PanelSlot;
 use eitri_core::lua::plugin::PluginRegistration;
 use eitri_core::plugin::doc_route::DocSlot;
 use eitri_core::plugin::follow_feed::{FollowBatch, FollowCmd, Ordered};
-use eitri_core::plugin::host::{LayoutPort, PagePort, PluginHost, TerminalAtAnswer};
+use eitri_core::plugin::host::{
+    AgentsDone, AgentsFeed, AgentsPort, AgentsRefusal, AgentsServices, GestureClock, LayoutPort, PagePort, PluginHost,
+    SharedWrite, TerminalAtAnswer, WaitShow,
+};
 use eitri_core::plugin::keys::EffectiveRow;
 use eitri_core::plugin::load::LoadedPlugin;
-use eitri_core::plugin::manifest::Capability;
+use eitri_core::plugin::manifest::{Capability, ShownWhile};
 use eitri_core::plugin::page_policy;
 use eitri_core::plugin::protocol::FocusTarget;
 use eitri_core::plugin::state::PluginStore;
@@ -450,7 +453,7 @@ fn downloads_dir() -> std::path::PathBuf {
 }
 
 /// Shows a module if it is hidden, then gives it the keys.
-type ShowAndFocus = Rc<dyn Fn(&ModuleId) -> Result<(), String>>;
+pub(crate) type ShowAndFocus = Rc<dyn Fn(&ModuleId) -> Result<(), String>>;
 
 /// Asks for the window's base terminal in a directory on behalf of a plugin (its id), under the host's ticket.
 type TerminalAt = Rc<dyn Fn(&str, PathBuf, u64) -> Result<(), String>>;
@@ -474,6 +477,163 @@ impl LayoutPort for WindowLayout {
 
     fn terminal_at(&self, dir: PathBuf, ticket: u64) -> Result<(), String> {
         (self.terminal_at)(&self.plugin, dir, ticket)
+    }
+}
+
+/// The window as the agents verbs of its plugin pages reach it: its own tabs through its agents host (when the window
+/// shows chats and the layer started), any other window through that window's control socket, and the shared files
+/// of the control directory. Every request returns at once; a socket or a file is worked on a thread, and `done` is
+/// called when it finished. It brings a tab forward, opens an empty one or writes the shared selection or round:
+/// nothing here answers anything in a chat.
+pub(crate) struct WindowAgents {
+    control_dir: PathBuf,
+    host: RefCell<Option<Rc<crate::agents_host::AgentsHost>>>,
+    /// An activation token from this window's display, for a request to another window.
+    token: Rc<dyn Fn() -> Option<String>>,
+    /// The window's address when it has no host of its own (a page window): a round started here names it.
+    here: String,
+    /// Gives a module of this window the keys, as a page's `layout.focus` does.
+    show_and_focus: ShowAndFocus,
+}
+
+impl WindowAgents {
+    pub(crate) fn new(
+        control_dir: PathBuf,
+        token: Rc<dyn Fn() -> Option<String>>,
+        show_and_focus: ShowAndFocus,
+    ) -> WindowAgents {
+        WindowAgents {
+            control_dir,
+            host: RefCell::new(None),
+            token,
+            here: eitri_core::agents::new_instance(),
+            show_and_focus,
+        }
+    }
+
+    /// This window's own agents host, once it started; a window without one sends every request to a socket.
+    pub(crate) fn set_host(&self, host: Option<Rc<crate::agents_host::AgentsHost>>) {
+        *self.host.borrow_mut() = host;
+    }
+
+    fn own(&self) -> Option<Rc<crate::agents_host::AgentsHost>> {
+        self.host.borrow().clone()
+    }
+
+    /// `req` to the window `instance`: through this window's host when it has one, else straight to the socket.
+    fn send(&self, instance: &str, req: eitri_core::agents::control::Request, done: AgentsDone) {
+        let answered = move |reply| done(reply_result(reply));
+        match self.own() {
+            Some(host) => host.focus_remote(instance, req, answered),
+            None => crate::agents_host::send_to(&self.control_dir, &*self.token, instance, req, answered),
+        }
+    }
+}
+
+/// What a control socket's reply is to a page.
+fn reply_result(reply: eitri_core::agents::control::Reply) -> Result<(), AgentsRefusal> {
+    match reply {
+        eitri_core::agents::control::Reply::Ok => Ok(()),
+        eitri_core::agents::control::Reply::Refused(words) => Err(AgentsRefusal::of_words(&words)),
+    }
+}
+
+impl AgentsPort for WindowAgents {
+    fn own_instance(&self) -> Option<String> {
+        self.own().map(|host| host.instance().to_owned())
+    }
+
+    fn origin(&self) -> String {
+        self.own_instance().unwrap_or_else(|| self.here.clone())
+    }
+
+    fn is_here(&self, instance: &str) -> bool {
+        instance == self.here || self.own().is_some_and(|host| host.instance() == instance)
+    }
+
+    fn focus_module(&self, module: &str, done: AgentsDone) {
+        let shown = match ModuleId::parse(module) {
+            Ok(module) => (self.show_and_focus)(&module).map_err(AgentsRefusal::Refused),
+            Err(_) => Err(AgentsRefusal::Gone),
+        };
+        done(shown);
+    }
+
+    fn focus(
+        &self,
+        instance: &str,
+        tab: Option<u64>,
+        card_first: bool,
+        intent: eitri_core::agents::Intent,
+        done: AgentsDone,
+    ) {
+        if let Some(host) = self.own().filter(|host| host.instance() == instance) {
+            let req = eitri_core::wm::RevealRequest {
+                tab: tab.map(eitri_core::tabs::TabId),
+                card_first,
+                intent,
+            };
+            return done(reply_result(host.focus_local(req)));
+        }
+        let req = eitri_core::agents::control::Request::Focus {
+            v: eitri_core::agents::control::PROTOCOL_V,
+            tab,
+            card_first,
+            intent,
+            token: None,
+        };
+        self.send(instance, req, done);
+    }
+
+    fn new_in(&self, project_key: &str, done: AgentsDone) {
+        // Every running window of the project, the hub that holds no tab included, read from the files on a
+        // worker; the target is then asked from this thread.
+        let control_dir = self.control_dir.clone();
+        let project_key = project_key.to_owned();
+        let host = self.own();
+        let token = self.token.clone();
+        glib::spawn_future_local(async move {
+            let dir = control_dir.clone();
+            let scanned =
+                gtk4::gio::spawn_blocking(move || eitri_core::agents::scan_windows(&dir, eitri_core::agents::SCHEMA_V))
+                    .await;
+            let windows = match scanned {
+                Ok(Ok(windows)) => windows,
+                Ok(Err(e)) => {
+                    return done(Err(AgentsRefusal::Refused(format!(
+                        "the agents directory could not be read: {e}"
+                    ))))
+                }
+                Err(_) => return done(Err(AgentsRefusal::Refused("the agents directory was not read".into()))),
+            };
+            let Some(instance) = crate::agents_host::new_target(&windows, &project_key).map(str::to_owned) else {
+                return done(Err(AgentsRefusal::NoWindow));
+            };
+            if let Some(host) = host.as_ref().filter(|host| host.instance() == instance) {
+                return done(reply_result(host.new_local()));
+            }
+            let req = eitri_core::agents::control::Request::New {
+                v: eitri_core::agents::control::PROTOCOL_V,
+                token: None,
+            };
+            let answered = move |reply| done(reply_result(reply));
+            match host {
+                Some(host) => host.focus_remote(&instance, req, answered),
+                None => crate::agents_host::send_to(&control_dir, &*token, &instance, req, answered),
+            }
+        });
+    }
+
+    fn write_selection(&self, selection: eitri_core::agents::shared::Selection, done: AgentsDone) {
+        eitri_core::plugin::host::write_shared_on_thread(
+            self.control_dir.clone(),
+            SharedWrite::Selection(selection),
+            done,
+        );
+    }
+
+    fn write_round(&self, round: Option<eitri_core::agents::shared::Round>, done: AgentsDone) {
+        eitri_core::plugin::host::write_shared_on_thread(self.control_dir.clone(), SharedWrite::Round(round), done);
     }
 }
 
@@ -531,6 +691,9 @@ struct Panel {
     /// Whether the host was last told its module is drawn; `None` until it is first told. A layout change that
     /// leaves it where it was tells the host nothing, so a divider drag wakes no plugin.
     on_screen: Cell<Option<bool>>,
+    /// For a plugin that declares `agents`: when its view last had a key or button press, recorded by every view
+    /// built for it and read by its host's agents verbs.
+    gesture: Option<Rc<GestureClock>>,
 }
 
 /// What `init.lua` registered for one plugin, read once at startup.
@@ -592,6 +755,7 @@ impl Panel {
             own_rule: registered.own_rule.clone(),
             webview,
             on_screen: Cell::new(None),
+            gesture: None,
         }
     }
 }
@@ -701,6 +865,62 @@ pub(crate) fn apply_follow_commands(window: &dyn FollowWindow, commands: Vec<(Mo
     }
 }
 
+/// One module shown while agents wait: its watch over the feed, and the one timer that pumps it again when a running
+/// round on screen will have stood idle too long (an expiry changes no file, so no reader event comes).
+struct WaitFollow {
+    show: WaitShow,
+    panels: std::rc::Weak<PluginPanels>,
+    window: Rc<dyn FollowWindow>,
+    module: ModuleId,
+    recheck: RefCell<Option<glib::SourceId>>,
+}
+
+impl WaitFollow {
+    fn pump(this: &Rc<WaitFollow>) {
+        let now_ms = wall_clock_ms();
+        if let Some(want) = this.show.pump_at(now_ms) {
+            let here = this
+                .panels
+                .upgrade()
+                .is_some_and(|panels| panels.panel(&this.module).is_some_and(|panel| !panel.away.get()));
+            if here {
+                apply_wait_show(&*this.window, &this.module, want);
+            }
+        }
+        if let Some(old) = this.recheck.borrow_mut().take() {
+            old.remove();
+        }
+        if let Some(after) = this.show.recheck_in(now_ms) {
+            let weak = Rc::downgrade(this);
+            let id = glib::timeout_add_local_once(after + Duration::from_millis(1), move || {
+                if let Some(this) = weak.upgrade() {
+                    this.recheck.borrow_mut().take();
+                    WaitFollow::pump(&this);
+                }
+            });
+            *this.recheck.borrow_mut() = Some(id);
+        }
+    }
+}
+
+fn wall_clock_ms() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0)
+}
+
+/// A module shown while agents wait, told whether anything waits: a hidden one is shown with the keys where they
+/// are, and one shown is hidden wherever it is. One shown but off screen (behind a zoom, on a tab not drawn) is
+/// left there: a card arriving must not end the person's zoom or switch their tab.
+pub(crate) fn apply_wait_show(window: &dyn FollowWindow, module: &ModuleId, want: bool) {
+    match (want, window.is_shown(module)) {
+        (true, false) => window.show(module),
+        (false, true) => window.hide(module),
+        _ => {}
+    }
+}
+
 /// How many follow lines the window has read, for the probe build's trace.
 #[derive(Default)]
 struct FollowTotals {
@@ -742,6 +962,9 @@ pub(crate) struct PluginPanels {
     /// Told of each page's view once it exists, so the window's text size reaches it.
     page_built: RefCell<Option<PageBuilt>>,
     holder: RefCell<Option<Rc<dyn Fn(&str, bool)>>>,
+    /// The window's one agents feed, once [`PluginPanels::set_agents`] made it: what the modules shown while agents
+    /// wait are shown and hidden by.
+    agents_feed: RefCell<Option<Rc<AgentsFeed>>>,
 }
 
 /// What [`PluginPanels::set_page_built`] calls with a module and its new view.
@@ -779,6 +1002,10 @@ impl PluginPanels {
                 None
             };
             let port = Rc::new(LazyPort::default());
+            let gesture = plugin
+                .manifest
+                .has(Capability::Agents)
+                .then(|| Rc::new(GestureClock::default()));
             let webview: Rc<RefCell<Option<webkit6::WebView>>> = Rc::default();
             let crash_guard = Rc::new(RefCell::new(WebViewCrashGuard::with_defaults()));
             let (widget, pump, build) = match wake {
@@ -817,6 +1044,7 @@ impl PluginPanels {
                         doc_slot: doc_slot.clone(),
                         remote_images: plugin.remote_images,
                         console_to_stdout: eitri_core::plugin::trace::enabled(),
+                        agents_kit: plugin.manifest.has(Capability::Agents),
                     };
                     let store = store_root.clone().map(|root| PluginStore::new(root, &id));
                     let overrides = keymap.plugin_user(&id).to_vec();
@@ -850,8 +1078,12 @@ impl PluginPanels {
                         let crash_guard = crash_guard.clone();
                         let webview = webview.clone();
                         let slot_widget = slot_widget.clone();
+                        let gesture = gesture.clone();
                         Rc::new(move |theme: &PageTheme| {
                             let view = plugin_page::build(&spec, hooks.clone(), theme);
+                            if let Some(clock) = &gesture {
+                                plugin_page::observe_gestures(&view, clock.clone());
+                            }
                             slot_widget.set_page(&view);
                             install_crash_recovery_into(
                                 &view,
@@ -880,7 +1112,9 @@ impl PluginPanels {
                 widget,
                 crash_guard,
             });
-            panels.push(Panel::new(&registration, pump, port, build, webview));
+            let mut panel = Panel::new(&registration, pump, port, build, webview);
+            panel.gesture = gesture;
+            panels.push(panel);
         }
         Ok(PluginPanels {
             panels,
@@ -890,6 +1124,7 @@ impl PluginPanels {
             editor_gone: Cell::new(false),
             page_built: RefCell::new(None),
             holder: RefCell::new(None),
+            agents_feed: RefCell::new(None),
         })
     }
 
@@ -1391,6 +1626,78 @@ impl PluginPanels {
         }
     }
 
+    /// The agents layer for the pages that declare `agents`: one feed for the whole window, so every such page
+    /// reads the same reader, and the window's port. `None` (the layer is off) leaves each of them answering
+    /// `disabled`.
+    pub(crate) fn set_agents(&self, window: Option<Rc<WindowAgents>>) {
+        let Some(window) = window else {
+            for (_, pump) in self.hosts() {
+                pump.host.set_agents(None);
+            }
+            return;
+        };
+        let feed = AgentsFeed::of_dir(window.control_dir.clone());
+        *self.agents_feed.borrow_mut() = Some(feed.clone());
+        for panel in &self.panels {
+            if let (Some(pump), Some(gesture)) = (&panel.pump, &panel.gesture) {
+                pump.host.set_agents(Some(AgentsServices {
+                    feed: feed.clone(),
+                    port: window.clone(),
+                    gesture: gesture.clone(),
+                }));
+            }
+        }
+    }
+
+    /// Shows and hides each module declared `[module] shown_while = "agents-wait"` from the window's agents feed
+    /// (after [`Self::set_agents`]; with the layer off nothing does): shown while an agent waits or a round is at a
+    /// stop, hidden when neither holds, each time the answer changes, so a show or hide the person makes in between
+    /// stands until the next change. A module handed to another window is left alone.
+    pub(crate) fn show_while_agents_wait(self: &Rc<Self>, window: Rc<dyn FollowWindow>) {
+        let Some(feed) = self.agents_feed.borrow().clone() else {
+            return;
+        };
+        for panel in &self.panels {
+            let declared = panel
+                .pump
+                .as_ref()
+                .and_then(|pump| pump.host.plugin().manifest.module.as_ref().and_then(|m| m.shown_while));
+            if declared != Some(ShownWhile::AgentsWait) {
+                continue;
+            }
+            let module = panel.module.clone();
+            let wake = match PanelWake::new() {
+                Ok(wake) => wake,
+                Err(e) => {
+                    eprintln!("[plugin] {module:?} cannot follow the agents that wait: {e}");
+                    continue;
+                }
+            };
+            let follow = Rc::new(WaitFollow {
+                show: WaitShow::new(feed.clone(), wake.waker()),
+                panels: Rc::downgrade(self),
+                window: window.clone(),
+                module,
+                recheck: RefCell::new(None),
+            });
+            let fd = wake.fd();
+            let named = format!("{:?}", follow.module);
+            let watched = neovide_editor::fd_watch::add_local(
+                fd,
+                glib::IOCondition::IN | glib::IOCondition::ERR | glib::IOCondition::HUP,
+                glib::ffi::G_PRIORITY_DEFAULT,
+                move |_| {
+                    wake.take();
+                    WaitFollow::pump(&follow);
+                    glib::ControlFlow::Continue
+                },
+            );
+            if watched.is_err() {
+                eprintln!("[plugin] {named} cannot follow the agents that wait: its wake cannot be watched here");
+            }
+        }
+    }
+
     /// The window's answer to plugin `plugin`'s `terminal.at`, for its host to give the page that asked.
     pub(crate) fn terminal_at_answered(&self, plugin: &str, ticket: u64, answer: TerminalAtAnswer) {
         let pump = self
@@ -1820,6 +2127,7 @@ mod tests {
             editor_gone: Cell::new(false),
             page_built: RefCell::new(None),
             holder: RefCell::new(None),
+            agents_feed: RefCell::new(None),
         }
     }
 
@@ -2755,6 +3063,33 @@ mod tests {
         apply_follow_commands(&window, vec![(demo(), FollowCmd::Hide), (demo(), FollowCmd::Hide)]);
         assert_eq!(*window.calls.borrow(), ["hide"]);
         assert_eq!(builds.get(), 1);
+    }
+
+    #[test]
+    fn a_module_shown_while_agents_wait_is_shown_when_hidden_and_hidden_when_shown() {
+        let scratch = Scratch::new("panels-wait-show");
+        let registered = registered(&scratch, "demo", true, None);
+        let build: BuildPage = Rc::new(|_: &PageTheme| Some(Rc::new(Recorded::default()) as Rc<dyn PagePort>));
+        let panels = plugin_panels(vec![panel(&registered, Rc::default(), Some(build))]);
+        let window = RecordingWindow {
+            panels: &panels,
+            shown: Cell::new(false),
+            covered: Cell::new(false),
+            calls: RefCell::default(),
+        };
+        apply_wait_show(&window, &demo(), false);
+        assert!(window.calls.borrow().is_empty(), "a hidden module stays as it is");
+        apply_wait_show(&window, &demo(), true);
+        assert_eq!(*window.calls.borrow(), ["show"]);
+        assert!(panels.is_built(&demo()), "the first show builds the page");
+
+        // Shown behind a zoom or on a tab not drawn: a show leaves the person's zoom and tab alone.
+        window.calls.borrow_mut().clear();
+        window.covered.set(true);
+        apply_wait_show(&window, &demo(), true);
+        assert!(window.calls.borrow().is_empty());
+        apply_wait_show(&window, &demo(), false);
+        assert_eq!(*window.calls.borrow(), ["hide"], "hidden wherever it is");
     }
 
     #[test]

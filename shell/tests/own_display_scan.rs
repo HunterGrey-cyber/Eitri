@@ -174,7 +174,6 @@ const PROGRAMS: &[&str] = &[
     "xsel",
     "notify-send",
     "CARGO_BIN_EXE_shell",
-    "CARGO_BIN_EXE_eitri-supervisor",
 ];
 
 /// A literal that names one of these anywhere in a file means a script is run by a shell there, so a

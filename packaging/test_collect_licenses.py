@@ -72,11 +72,11 @@ class ShippedTree(unittest.TestCase):
         self.assertTrue(names.isdisjoint({"shell", "eitri-terminal", "terminal-render", "terminal-frame",
                                           "terminal-sync"}), names)
 
-    def test_shipped_binaries_has_six_entries_and_no_agent_hook(self):
+    def test_shipped_binaries_has_five_entries_and_no_agent_hook(self):
         """No release build compiles the legacy backend, so agent-hook is not in
         any release, in either profile."""
         self.assertNotIn("agent-hook", cl.SHIPPED_BINARIES)
-        self.assertEqual(len(cl.SHIPPED_BINARIES), 6)
+        self.assertEqual(len(cl.SHIPPED_BINARIES), 5)
 
     def test_nvim_rs_carries_lgpl_and_gpl_texts(self):
         """4(b): the output must contain nvim-rs's own LGPL text and a copy of the GPL-3.0 text.
@@ -259,8 +259,8 @@ class RustStdComponent(unittest.TestCase):
         shipped = {b: os.path.join(scratch, f"fake-{b}") for b in cl.SHIPPED_BINARIES}
         with mock.patch.object(cl, "run", side_effect=fake_run):
             entry = cl.rust_std_component(shipped)
-        self.assertEqual(len(cl.SHIPPED_BINARIES), 6, "this test's own expectation below assumes six")
-        self.assertIn("all six binaries", entry["note"])
+        self.assertEqual(len(cl.SHIPPED_BINARIES), 5, "this test's own expectation below assumes five")
+        self.assertIn("all five binaries", entry["note"])
         self.assertNotIn("four", entry["note"])
 
 
@@ -703,10 +703,10 @@ class CFileClassification(unittest.TestCase):
             self.assertIsNone(cl.classify_c_file(f, set()), f)
 
     def test_the_gcc_runtime_entry_carries_the_pinned_exception_text(self):
-        entry = cl.gcc_runtime_component({"shell", "eitri-supervisor"})
+        entry = cl.gcc_runtime_component({"shell", "eitri-editor-bridge"})
         self.assertEqual(entry["title"], cl.GCC_RUNTIME_TITLE)
         self.assertEqual(entry["license"], "GPL-3.0-or-later WITH GCC-exception-3.1")
-        self.assertIn("eitri-supervisor, shell", entry["note"])
+        self.assertIn("eitri-editor-bridge, shell", entry["note"])
         (name, text), = entry["files"]
         self.assertEqual(name, "COPYING.RUNTIME")
         self.assertTrue(text.startswith("GCC RUNTIME LIBRARY EXCEPTION\n\nVersion 3.1, 31 March 2009"))

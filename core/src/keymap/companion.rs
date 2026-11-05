@@ -1,12 +1,14 @@
 //! What the prefix does in a companion window. The window holds one agent panel and nothing to lay
 //! out, so the prefix keeps what concerns the panel (tab verbs, reload, the key help, the `:` line,
-//! text size, HINT, a literal prefix key, and a move to the neighbouring window) and refuses every
-//! other action with a single toast per window. Page keys open pages beside the attached editor.
+//! text size, HINT, a literal prefix key, a move to the neighbouring window, and the round over the
+//! waiting agents, whose stops include this panel's tabs) and refuses every other action with a single
+//! toast per window. Page keys open pages beside the attached editor.
 //! The tab chords are how a tmux user drives the tabs from the keyboard.
 
 use super::prefix::Waiting;
 use super::{Action, Keymap, TabAction, TextChange};
 use crate::layout::{Direction, ModuleId, ModuleKeys, ModuleKind};
+use crate::wm::agents_round::RoundKey;
 
 /// One piece of the strip the armed prefix shows in the top bar, left to right.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -37,6 +39,8 @@ pub enum CompanionVerb {
     Select(Direction),
     /// Open or raise the page beside the attached nvim.
     Page(ModuleId),
+    /// `prefix u` / `prefix B`: the round, carried out by this window's agents layer.
+    Round(RoundKey),
     /// Answered with [`BESIDE_OFF_TEXT`].
     Refuse,
 }
@@ -107,6 +111,8 @@ pub fn classify(action: &Action) -> CompanionVerb {
         | Action::MarkClear
         | Action::SwapMarked
         | Action::SelectNumber => CompanionVerb::Refuse,
+        Action::AgentsNext => CompanionVerb::Round(RoundKey::Next),
+        Action::AgentsBack => CompanionVerb::Round(RoundKey::Back),
     }
 }
 
@@ -278,6 +284,8 @@ mod tests {
             (Action::PanelCommandLine, CompanionVerb::CommandLine),
             (Action::WindowImmersive, CompanionVerb::Refuse),
             (Action::WindowSetup, CompanionVerb::Refuse),
+            (Action::AgentsNext, CompanionVerb::Round(RoundKey::Next)),
+            (Action::AgentsBack, CompanionVerb::Round(RoundKey::Back)),
             (
                 Action::Tab(TabAction::Select(3)),
                 CompanionVerb::Tab(TabAction::Select(3)),

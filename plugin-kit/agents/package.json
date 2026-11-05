@@ -6,7 +6,8 @@
   "license": "MIT",
   "type": "module",
   "scripts": {
-    "test": "vitest run"
+    "test": "node build.mjs && vitest run",
+    "build": "node build.mjs"
   },
   "devDependencies": {
     "esbuild": "0.21.5",

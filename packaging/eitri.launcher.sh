@@ -14,6 +14,8 @@
 #   eitri page ID [--nvim ADDR] [DIR]
 #                          open a plugin page beside nvim (--list lists the available page ids)
 #   eitri split [DIR]      open the editor (Neovide) and the agent panel as two windows (needs Neovide)
+#   eitri agents [--json] [--watch] [--schema 1]
+#                          the agents every open window shares: a table, one JSON view, or a stream
 #   eitri --version        print the version and exit
 #   eitri sidecar status   what new tabs run, what is bundled, what is kept; no network
 #   eitri sidecar check    ask for the newest sidecar release; changes nothing
@@ -96,6 +98,14 @@ if [[ "${1:-}" == sidecar ]]; then
 		exit 64
 		;;
 	esac
+fi
+
+# `eitri agents` opens no project or window and writes only its result to stdout, so a status line can
+# read `eitri agents --watch`: it goes to the binary before the banner and the option loop, which would
+# refuse its own flags.
+if [[ "${1:-}" == agents ]]; then
+	shift
+	exec "$LIBDIR/shell" agents "$@"
 fi
 
 # Handle setup before flag parsing: it opens no project or window. Invoke the POSIX installer
@@ -198,7 +208,7 @@ while [[ $# -gt 0 ]]; do
 		           ACCOUNT="${2:?--account needs a name}"; ACCOUNT_FROM_FLAG=1; shift 2 ;;
 		--quiet)   [[ $MODE != page ]] || { echo "$CMD_NAME: unknown option --quiet" >&2; exit 64; }
 		           QUIET=1; shift ;;
-		-h|--help) sed -n '2,27p' "$0" | sed 's/^# \?//'; exit 0 ;;
+		-h|--help) sed -n '2,29p' "$0" | sed 's/^# \?//'; exit 0 ;;
 		--) SAW_DASHES=1; shift
 		    if [[ $MODE == window ]]; then AFTER=("$@"); FIRST="${FIRST:-${1:-}}"
 		    elif [[ $MODE == page ]]; then PAGE_POSITIONALS+=("$@")
@@ -405,7 +415,7 @@ fi
 # same directory.
 if [[ ${#SHELL_ARGS[@]} -eq 0 && ${#BEFORE[@]} -gt 0 ]]; then
 	case "${BEFORE[0]}" in
-		open | panel | split | page | run-guard | linked-window | choose-project) BEFORE[0]="./${BEFORE[0]}" ;;
+		open | panel | split | page | agents | run-guard | linked-window | choose-project) BEFORE[0]="./${BEFORE[0]}" ;;
 	esac
 fi
 if [[ -n "$SAW_DASHES" ]]; then

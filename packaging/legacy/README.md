@@ -12,3 +12,10 @@ path; the installer of this release ignores it, and neither nfpm profile nor eit
 What an upgrade through the old installer leaves behind is 0.2.0's entry and no icon; running the new
 installer once more removes that entry (it is recognised by being byte for byte what the old installer wrote)
 and installs the new entry and the icons. `packaging/release_check.py` holds the tarball's copy to this file.
+
+`eitri-supervisor` is a placeholder for the same reader. 0.2.0's `install.sh` also refuses a tarball with no
+executable `lib/eitri/eitri-supervisor`, the dashboard binary that this release no longer builds. The file is a
+three-line script that exits at once, and `release.sh` puts it into the release **tarball only**, at that path
+(no package ships it). Nothing runs it: the installer of this release removes it from the archive it stages
+(`NV_OLD_BINARIES`), and the old installer leaves it in `lib/eitri` until the new installer is run once more.
+`packaging/release_check.py` holds the tarball's copy to this file.

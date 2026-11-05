@@ -46,12 +46,13 @@ pub struct HintGroup {
 }
 
 /// The groups in the order the panel shows them, each with the families whose bindings it lists.
-const GROUPS: [(&str, &[Family]); 7] = [
+const GROUPS: [(&str, &[Family]); 8] = [
     ("Tabs", &[Family::Panel]),
     ("Modules", &[Family::Modules, Family::Focus, Family::Close]),
     ("Layout", &[Family::Tiling]),
     ("Workspaces", &[Family::Floats, Family::Workspaces]),
     ("Windows", &[Family::Windows]),
+    ("Agents", &[Family::Agents]),
     ("Projects", &[Family::Project]),
     ("Other", &[Family::Keys, Family::Chrome, Family::TextSize]),
 ];
@@ -236,7 +237,7 @@ mod tests {
         let titles: Vec<&str> = groups.iter().map(|g| g.title).collect();
         assert_eq!(
             titles,
-            ["Tabs", "Modules", "Layout", "Workspaces", "Projects", "Other"],
+            ["Tabs", "Modules", "Layout", "Workspaces", "Agents", "Projects", "Other"],
             "no default binding is a Windows one, and an empty group is left out"
         );
         for binding in keymap.bindings() {

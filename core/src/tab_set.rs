@@ -915,8 +915,8 @@ impl Tab {
     }
 
     /// Claude Code is working where this panel cannot show it (a turn it started itself, and whose
-    /// start the panel never folded). `turn_running` does not say so, and a close, a handoff and the
-    /// supervisor's status each need to.
+    /// start the panel never folded). `turn_running` does not say so, and a close and a handoff each
+    /// need to.
     pub fn cli_unseen_busy(&self) -> bool {
         self.live().is_some_and(|backend| backend.projection().cli_unseen_busy)
     }

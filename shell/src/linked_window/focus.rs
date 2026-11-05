@@ -96,11 +96,18 @@ impl PairRaise {
             });
             return;
         }
-        if let Some(token) = token {
-            window.set_startup_id(token);
-        }
-        window.present();
+        present_with_token(window, token);
         if self.focuses() {
+            self.runner().raise_pid(std::process::id());
+        }
+    }
+
+    /// Brings `window` forward for a request from another process: presented with `token`, and on sway, Hyprland
+    /// and niri focused by this process's pid through the compositor's own tool, whatever the next show was to keep.
+    pub(crate) fn present_and_focus(&self, window: &impl IsA<gtk4::Window>, token: Option<&str>) {
+        use eitri_core::compositor::Wm;
+        present_with_token(window, token);
+        if matches!(self.wm, Wm::Sway | Wm::Hyprland | Wm::Niri) {
             self.runner().raise_pid(std::process::id());
         }
     }
@@ -111,6 +118,16 @@ impl PairRaise {
         let wm = self.wm;
         self.adapter.get_or_init(|| companion::wm_runner::WmRunner::new(wm))
     }
+}
+
+/// Presents `window` with the activation token another window gave, when there is one: GNOME lets a window take the
+/// keys from another only with a token naming that other window's surface. Any process may present a window so; on a
+/// tiling compositor the token becomes an urgency hint, and the compositor's own tool has to focus it as well.
+pub(crate) fn present_with_token(window: &impl IsA<gtk4::Window>, token: Option<&str>) {
+    if let Some(token) = token {
+        window.set_startup_id(token);
+    }
+    window.present();
 }
 
 impl crate::gtk_host::PairRaise for PairRaise {

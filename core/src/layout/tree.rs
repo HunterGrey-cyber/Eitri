@@ -139,6 +139,8 @@ pub enum LayoutError {
     Unnormalised,
     /// A pinned length below zero.
     Pin(i32),
+    /// A fixed height outside the allowed range.
+    FixedHeight(i32),
     /// A module cannot be placed next to itself (tmux: "source and target panes must be different").
     SameModule(ModuleId),
     /// Killed for the rest of this window (`super::kill`, `Reopen::Never`).
@@ -184,6 +186,7 @@ impl fmt::Display for LayoutError {
             LayoutError::ShareSum(sum) => write!(f, "a container's shares add up to {sum}, not 1"),
             LayoutError::Unnormalised => write!(f, "a container holds no children, or only one below the root"),
             LayoutError::Pin(px) => write!(f, "a pinned length of {px}px is below zero"),
+            LayoutError::FixedHeight(px) => write!(f, "a fixed height of {px}px is outside 16..=200"),
             LayoutError::SameModule(id) => write!(f, "'{id}' cannot be placed next to itself"),
             LayoutError::Gone(id) => write!(f, "'{id}' was closed and cannot be reopened in this window"),
             LayoutError::Away(id) => write!(f, "'{id}' is in the other window"),
@@ -270,6 +273,7 @@ impl Layout {
             ConFault::ShareSum(sum) => LayoutError::ShareSum(sum),
             ConFault::Empty | ConFault::OneChild | ConFault::Focus(_) => LayoutError::Unnormalised,
             ConFault::Pin(px) => LayoutError::Pin(px),
+            ConFault::FixedHeight(px) => LayoutError::FixedHeight(px),
             ConFault::TooMany(_) => LayoutError::TooMany { limit: MAX_CHILDREN },
         })?;
         if !seen.contains(&focus) {

@@ -422,6 +422,9 @@ pub(crate) trait ServiceSet {
     fn tab_moving(&self, _tab: eitri_core::tabs::TabId) -> bool {
         true
     }
+    fn tab_has_work(&self, _tab: eitri_core::tabs::TabId) -> bool {
+        false
+    }
     fn page_built(&self, _module: &ModuleId) -> bool {
         false
     }
@@ -511,6 +514,17 @@ pub(crate) trait ServiceSet {
     fn terminal(&self, op: &TermOp) -> Result<(), String>;
     fn plugin(&self, op: &PluginOp) -> Result<(), String>;
     fn chat(&self, op: &ChatOp) -> Result<(), String>;
+    /// Carries out a round key's step ([`HostOp::AgentsScan`]) off this thread, answered later as
+    /// [`HostEvent::Agents`]; `at` is the module with the keys. A set with no agents layer carries none out.
+    fn agents_scan(
+        &self,
+        win: WinId,
+        step: eitri_core::wm::agents_round::RoundKey,
+        at: Option<&ModuleId>,
+    ) -> Result<(), String> {
+        let _ = (win, step, at);
+        Err(NOT_CARRIED_OUT.into())
+    }
     /// The teardown's steps that end no module (the pair, the scratch directory, the pane-switch channel, the
     /// feeds). A set that holds none of them carries none out.
     fn cleanup(&self, op: &CleanupOp) -> Result<(), String> {
@@ -1720,6 +1734,7 @@ impl Host for GtkHost {
             HostOp::Terminal(call) => self.service(op, |s| s.terminal(call)),
             HostOp::Plugin(call) => self.service(op, |s| s.plugin(call)),
             HostOp::Chat(call) => self.service(op, |s| s.chat(call)),
+            HostOp::AgentsScan { win, step, at } => self.service(op, |s| s.agents_scan(*win, *step, at.as_ref())),
             HostOp::OpenWindow { win, spec } => self.open_window(op, *win, spec),
             HostOp::Present { win, activation } => self.present(op, *win, activation.as_ref()),
             HostOp::OpenAnswer { id, accepted } => self.service(op, |s| s.open_answer(*id, *accepted)),
@@ -1834,6 +1849,10 @@ impl HostReads for GtkHost {
     fn tab_moving(&self, tab: eitri_core::tabs::TabId) -> bool {
         let services = self.services.borrow().clone();
         services.is_none_or(|services| services.tab_moving(tab))
+    }
+    fn tab_has_work(&self, tab: eitri_core::tabs::TabId) -> bool {
+        let services = self.services.borrow().clone();
+        services.is_some_and(|services| services.tab_has_work(tab))
     }
     fn project_chooser_env(&self, win: WinId) -> ChooserEnv {
         let host = self.project_host.borrow().clone();

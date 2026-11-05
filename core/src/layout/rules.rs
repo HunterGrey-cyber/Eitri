@@ -28,6 +28,8 @@ pub enum At {
 pub enum RuleSize {
     /// A tiled module's share of its container, above 0 and below 1.
     Share(f32),
+    /// An explicit vertical extent; fractional siblings take the remaining height.
+    Pixels(i32),
     /// A float's width and height as fractions of the grid, each above 0 and at most 1.
     Float { w: f32, h: f32 },
 }
@@ -369,8 +371,10 @@ pub fn open_by_rule(
             layout.hide_unfocused(&ModuleId::editor())?;
         }
     }
-    if let Some(RuleSize::Share(share)) = rule.size {
-        notes.extend(set_share(layout, id, share));
+    match rule.size {
+        Some(RuleSize::Share(share)) => notes.extend(set_share(layout, id, share)),
+        Some(RuleSize::Pixels(px)) => set_fixed_height(layout, id, px),
+        _ => {}
     }
     if takes_keys {
         layout.set_focus(id)?;
@@ -436,10 +440,34 @@ pub fn apply_launch_rule(
         ));
         return Ok(notes);
     }
-    if let Some(RuleSize::Share(share)) = rule.size {
-        notes.extend(set_share(layout, id, share));
+    match rule.size {
+        Some(RuleSize::Share(share)) => notes.extend(set_share(layout, id, share)),
+        Some(RuleSize::Pixels(px)) => set_fixed_height(layout, id, px),
+        _ => {}
     }
     Ok(notes)
+}
+
+/// Stores an explicit height only on the leaf's vertical split slot.
+fn set_fixed_height(layout: &mut Layout, id: &ModuleId, px: i32) {
+    fn apply(c: &mut super::con::Con, id: &ModuleId, px: i32) {
+        for child in &mut c.children {
+            match &mut child.node {
+                Node::Leaf(m) if m == id && c.layout == super::con::ConLayout::SplitV => {
+                    child.fixed_px =
+                        Some(px.clamp(*super::con::FIXED_HEIGHT_PX.start(), *super::con::FIXED_HEIGHT_PX.end()));
+                    child.pin = None;
+                }
+                Node::Con(c) => apply(c, id, px),
+                _ => {}
+            }
+        }
+    }
+    let mut root = layout.root_node();
+    if let Node::Con(c) = &mut root {
+        apply(c, id, px);
+    }
+    layout.replace_root(root);
 }
 
 /// `id`'s share of its split container set to `share`, the other children scaled to the rest in proportion, its
@@ -477,6 +505,7 @@ fn set_share(layout: &mut Layout, id: &ModuleId, share: f32) -> Vec<String> {
             for (j, child) in c.children.iter_mut().enumerate() {
                 if j == i {
                     child.share = share;
+                    child.fixed_px = None;
                     child.pin = None;
                 } else {
                     child.share *= scale;
@@ -511,6 +540,30 @@ mod tests {
         OpenRule {
             at: Some(a),
             ..OpenRule::default()
+        }
+    }
+
+    #[test]
+    fn a_fixed_module_keeps_its_height_when_the_window_resizes() {
+        for direction in [Direction::Up, Direction::Down] {
+            for height in [16, 24, 200] {
+                let mut layout = fixture("editor focus");
+                let strip = id("lua:strip");
+                let rule = OpenRule {
+                    at: Some(At::Beside(direction)),
+                    size: Some(RuleSize::Pixels(height)),
+                    focus: false,
+                    ..OpenRule::default()
+                };
+                open_by_rule(&mut layout, &strip, &rule, Some(&ModuleId::editor()), NOMINAL_GRID).unwrap();
+                for h in [400, 800, 1600] {
+                    let frame = super::super::geometry::Frame::new(Size { w: 1200, h }, 1);
+                    let arranged = super::super::geometry::arrange(&layout, &frame);
+                    let rect = |id: &ModuleId| arranged.modules.iter().find(|(m, _)| m == id).unwrap().1;
+                    assert_eq!(rect(&strip).h, height);
+                    assert_eq!(rect(&ModuleId::editor()).h, h - height - 1);
+                }
+            }
         }
     }
 

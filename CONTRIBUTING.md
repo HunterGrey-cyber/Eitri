@@ -43,7 +43,6 @@ One Cargo workspace at the repository root.
 | `plugins/markdown/` | the Markdown preview, a plugin directory that ships with Eitri (its manifest and its page's source) |
 | `nvim/eitri.nvim/` | the Neovim plugin behind `:EitriPanel` |
 | `gnome-extension/` | the GNOME Shell extension companion mode uses on GNOME |
-| `supervisor/` | `eitri-supervisor`, a read-only cross-window agent-status dashboard |
 | `terminal/engine/` | package **`eitri-terminal`**: the bottom terminal's engine — PTY, session thread, terminal state, Skia paint |
 | `terminal/render/`, `terminal/frame/`, `terminal/sync/`, `terminal/input/` | the terminal's paint list, frame projection, synchronized-update barrier and key encoder. `terminal-input` is Apache-2.0 (derived from Alacritty); see its `NOTICE` |
 | `neovide/` | submodule: the Neovide fork ([HunterGrey-cyber/neovide](https://github.com/HunterGrey-cyber/neovide), branch `neovibe-integration`) |
@@ -78,7 +77,7 @@ cargo build --locked
 ```
 
 `cargo build --locked` — **not** `--workspace` — is the product: the workspace's `default-members`
-(`shell`, `neovide-editor`, `agent`, `core`, `panel`, `mac`, `supervisor` and the terminal crates) at the GTK 4.14
+(`shell`, `neovide-editor`, `agent`, `core`, `panel`, `mac` and the terminal crates) at the GTK 4.14
 floor. `cargo build --workspace` also builds the frozen `poc/` crates below, which need GTK 4.18 and
 are not part of what ships — don't reach for it just to build Eitri itself.
 

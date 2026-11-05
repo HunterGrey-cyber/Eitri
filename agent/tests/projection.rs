@@ -1069,7 +1069,7 @@ fn a_thinking_block_round_trips_and_older_json_without_it_still_loads() {
 ///
 /// A session that dies mid-turn used to leave `active_turn_id` set forever. Three separate surfaces
 /// read that field to mean "busy": the panel's composer (spinner, disabled input), the session
-/// header's status word, and `supervisor_client::derive_status`, which returns `Working` from it
+/// header's status word, and the agent summary, which returns `Working` from it
 /// BEFORE it ever looks at the status. So a killed provider showed up as a working agent in every
 /// one of them, above a truncated reply that looked merely short.
 #[test]

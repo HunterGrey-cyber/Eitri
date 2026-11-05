@@ -67,7 +67,7 @@ import type { BoxEntry, SeqStep } from "./leader";
 import { isImeKey } from "./composerKeys";
 import { afterPaint } from "./afterPaint";
 import { bypassYesCounts, isModeCycleKey, isShiftTab, KeyClock, modeFixedMessage, modeKeyRoute } from "./modeKey";
-import { heldKeyName, hintTypingFlash, isModifierKey, leaderTypingFlash, tableKeyTypingFlash, TYPE_HINT_FLASH, TypingGuard } from "./typingGuard";
+import { heldKeyName, hintTypingFlash, isModifierKey, leaderTypingFlash, tableKeyTypingFlash, TYPE_HINT_FLASH, TYPING_GUARD_MS, TypingGuard } from "./typingGuard";
 import {
   caretModelOf,
   compareCarets,
@@ -173,6 +173,7 @@ import { barePickerCommand, completionSource, settingCommand } from "./slashComm
 import { EFFORT_FROM_SETTINGS, effortPicker, modelPicker, parseEffortReply, parseModelReply, settingsChangedWords } from "./slashPicker";
 import { DRAFT_MIRROR_DELAY_MS, modePill, REFUSED_ECHO_MS, showTabBar } from "./tabs";
 import { cardSummary, liveTasks, shortModel, usageSegment } from "./band";
+import { NOTHING_TO_STOP, STOP_TURN_QUESTION, stopAskFor, stopTurnAnswer, workToStop } from "./stopAsk";
 import { latestTurnEnding } from "./turnEnding";
 import type { ApproveFact } from "./band";
 import type { DetailRow, TabId, TabsEnvelope } from "./types";
@@ -336,6 +337,11 @@ export default function App() {
   const questionIdentity = waitingQuestion ? `${activeTab?.id}:${waitingQuestion.interactionId}` : null;
   const questionArrival = useRef({ identity: null as string | null, at: 0, held: new Set<string>() });
   const questionHeld = useRef(new Set<string>());
+  /** Whether the key being handled belongs to an unbroken run that began at an arrival (`noteArrival`): each key
+   *  of it pressed within `TYPING_GUARD_MS` of the key or arrival before it. The question dock answers from keys
+   *  this page's typing guard never sees, so it asks this instead. Judged for every keydown by the document-capture
+   *  listener that dates keys (`onModeKey`); a pointer press ends it, so a click is judged by the dock's own guard. */
+  const arrivalRunRef = useRef(false);
   useEffect(() => {
     const down = (e: globalThis.KeyboardEvent) => { questionHeld.current.add(e.code || e.key); };
     const up = (e: globalThis.KeyboardEvent) => {
@@ -343,13 +349,16 @@ export default function App() {
       questionArrival.current.held.delete(e.code || e.key);
     };
     const blur = () => { questionHeld.current.clear(); questionArrival.current.held.clear(); };
+    const pointer = () => { arrivalRunRef.current = false; };
     window.addEventListener("keydown", down, true);
     window.addEventListener("keyup", up, true);
     window.addEventListener("blur", blur);
+    window.addEventListener("pointerdown", pointer, true);
     return () => {
       window.removeEventListener("keydown", down, true);
       window.removeEventListener("keyup", up, true);
       window.removeEventListener("blur", blur);
+      window.removeEventListener("pointerdown", pointer, true);
     };
   }, []);
   useLayoutEffect(() => {
@@ -362,7 +371,7 @@ export default function App() {
     else if (previous !== null && questionIdentity === null && mode === "input") setComposerFocusRequest((n) => n + 1);
   }, [questionIdentity, sessionStarted]);
   function questionBlocked() {
-    return performance.now() - questionArrival.current.at < 250 || questionArrival.current.held.size > 0;
+    return performance.now() - questionArrival.current.at < 250 || questionArrival.current.held.size > 0 || arrivalRunRef.current;
   }
   /** A held `j`/`k`'s glide (`./jkHold`): the last repeat's time on the keydowns' clock and on
    *  `performance.now()`'s, to date its release for the typing guard, and which way it goes. */
@@ -886,28 +895,9 @@ export default function App() {
         showFlash(tab.following ? "not following" : "following the agent in the editor");
         break;
       }
-      case "tab.stop-background": {
-        // Claude stops its roster explicitly; other providers keep the session-ending stop.
-        const tab = activeTab?.id ?? null;
-        if (!isExternalAgent(activeTab?.agent)) {
-          if (!state.capabilities.backgroundTasks) showFlash(CLAUDE_REPORTS_NO_BACKGROUND);
-          else if (!state.capabilities.taskControl) showFlash("this sidecar cannot stop one task");
-          else if (tab === null || activeTab?.state !== "live" || liveTasks(state.backgroundTasks.rows).length === 0) showFlash(NOTHING_IN_THE_BACKGROUND);
-          else if (state.activeTurnId !== null) showFlash("a turn is running: /tasks can stop background work");
-          else askStopBackground(tab, liveTasks(state.backgroundTasks.rows).length);
-          break;
-        }
-        if (tab === null || activeTab?.state !== "live" || state.backgroundCalls === 0) {
-          showFlash(nothingToStopWords(activeTab?.agent));
-          break;
-        }
-        if (state.activeTurnId !== null) {
-          showFlash("a turn is running: interrupting the turn stops them too");
-          break;
-        }
-        askStopBackground(tab, state.backgroundCalls);
+      case "tab.stop-background":
+        askStopBackgroundOfActiveTab();
         break;
-      }
       case "mode.cycle":
         // Disabled in the box once the tab is fixed (`modeFixed`, `leader.ts`'s own `boxEntries` doc
         // comment): cycling makes no sense any more, so this flashes rather than posting. Routed
@@ -1249,6 +1239,9 @@ export default function App() {
    *  request while the first is still pending is never silently coalesced away by React (an
    *  unchanged boolean would be). */
   const [chooserFocusRequest, setChooserFocusRequest] = useState(0);
+  /** Bumped by each `arrive` that carries `intent: "stop"`: the tab was brought forward to be stopped, and the
+   *  question is asked once that envelope is drawn (the effect after the arrival's landing). */
+  const [stopAskRequest, setStopAskRequest] = useState(0);
   /** Hands an open picker the keys again: `takeKeys` used to have no `slashPicker` branch, so a GTK
    *  focus round trip while the picker was open handed the keys to the container root instead,
    *  leaving `j`/`k`/`Enter`/`Escape` dead. Same convention as `chooserFocusRequest`, read by `SlashPicker`'s
@@ -1283,12 +1276,13 @@ export default function App() {
      rename field) end the question: what is typed there is text, and the `y` of "you should" must not give a tab
      bypass just because the question was still up. Only a move counts -- a field that already had the keys when
      the question opened (Shift+Tab pressed in the composer) is where an INPUT user answers, so its `y` still does. */
-  const confirmEntersBypass = confirm?.kind === "bypass" || confirm?.kind === "restore" || confirm?.kind === "stop_background";
+  const confirmEntersBypass =
+    confirm?.kind === "bypass" || confirm?.kind === "restore" || confirm?.kind === "stop_background" || confirm?.kind === "stop_turn";
   useEffect(() => {
     if (!confirmEntersBypass) return;
     function onFocusIn(event: FocusEvent) {
       if (!isEditableElement(event.target)) return;
-      setConfirm((c) => (c?.kind === "bypass" || c?.kind === "restore" || c?.kind === "stop_background" ? null : c));
+      setConfirm((c) => (c?.kind === "bypass" || c?.kind === "restore" || c?.kind === "stop_background" || c?.kind === "stop_turn" ? null : c));
     }
     document.addEventListener("focusin", onFocusIn, true);
     return () => document.removeEventListener("focusin", onFocusIn, true);
@@ -1329,6 +1323,16 @@ export default function App() {
    *  private to the document-capture effect below. */
   const currentKeyAtRef = useRef(-Infinity);
   const keyClockRef = useRef(new KeyClock());
+  /** A reveal gave this page the keys (`arrive`, `focus_permission`), from a key or click made somewhere else
+   *  while the person may still be typing: the arrival counts as a key, now, for every guard that answers. The
+   *  typing guard records it on the keydowns' clock (card keys, `Ctrl+y`, the leader, INPUT entry); the y/n
+   *  questions' guard (`bypassYesCounts`) takes it as the last key; the question dock starts a run from it
+   *  (`arrivalRunRef`). It only refuses: whatever waits keeps waiting for a key on its own. */
+  function noteArrival() {
+    typingGuard.noteArrival(typingGuard.clockNow());
+    currentKeyAtRef.current = Math.max(currentKeyAtRef.current, performance.now());
+    arrivalRunRef.current = true;
+  }
   /** The key `answerConfirm` last consumed from a y/n
    *  prompt -- answered or cancelled, either way -- so its own auto-repeats can be swallowed rather
    *  than falling through as an ordinary key once `confirm` is null again. Mirrors
@@ -1672,6 +1676,7 @@ export default function App() {
       if (!isModifierKey(event.key)) {
         lastKeyAtRef.current = currentKeyAtRef.current;
         currentKeyAtRef.current = keyClockRef.current.pressedAt(event, performance.now());
+        arrivalRunRef.current = arrivalRunRef.current && currentKeyAtRef.current - lastKeyAtRef.current < TYPING_GUARD_MS;
       }
       if (!isModeCycleKey(event)) return;
       if (event.target instanceof Element && event.target.closest(".question-dock")) return;
@@ -1987,6 +1992,23 @@ export default function App() {
     if (row !== undefined && clampCursorToView(list, rows, index) !== null) revealRow(list, row, 0);
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [arriveRequest]);
+  /* A stop arrival asks, after the landing above, about the tab and state now on screen: `Stop this turn? (y/n)`
+     while a turn runs, else the stop-background question with its own checks (`<leader>k`'s), else a line saying
+     nothing runs. It only asks; the answer is the person's own `y`, under the y/n guard. */
+  useEffect(() => {
+    if (stopAskRequest === 0 || activeTab === null) return;
+    const background = isExternalAgent(activeTab.agent)
+      ? state.backgroundCalls
+      : state.capabilities.backgroundTasks
+        ? liveTasks(state.backgroundTasks.rows).length
+        : 0;
+    const work = workToStop(state);
+    const ask = stopAskFor({ live: activeTab.state === "live", turnRunning: work !== null, background });
+    if (ask === "turn" && work !== null) askStopTurn(activeTab.id, work);
+    else if (ask === "background") askStopBackgroundOfActiveTab();
+    else showFlash(NOTHING_TO_STOP);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [stopAskRequest]);
   /* `focus_permission`: BROWSE, with the cursor on the oldest pending card, so
      `a`/`d` answer it at once. `shell` sends it only when it counts a card; if the card was answered
      in between, there is nothing to land on, and the arrival is an ordinary keyboard one -- the
@@ -2398,7 +2420,10 @@ export default function App() {
           // A reserved two-key prefix or a leader sequence armed before this arrival means nothing about it.
           dropPendingKeys();
           setEmptyLanding("browse");
+          noteArrival();
           landingAtKeyRef.current = typingGuard.keyCount();
+          // Brought forward to be stopped: the chat asks (the effect after the landing); nothing stops here.
+          if (payload.intent === "stop") setStopAskRequest((n) => n + 1);
           break;
         }
         case "focus_permission": {
@@ -2410,6 +2435,7 @@ export default function App() {
           endKeyPrompts();
           // A card landing wins over a parked row.
           arrivalParkRef.current = null;
+          noteArrival();
           landingAtKeyRef.current = typingGuard.keyCount();
           break;
         }
@@ -3494,8 +3520,43 @@ export default function App() {
    *  that hands the keys to something else calls `endKeyPrompts` (below) instead, which ends all three kinds of
    *  prompt, because a `y` typed into what such a route opens answered a close prompt too. */
   function cancelBypassConfirm() {
-    setConfirm((c) => (c?.kind === "bypass" || c?.kind === "restore" || c?.kind === "trust" || c?.kind === "stop_background" ? null : c));
+    setConfirm((c) => (c?.kind === "bypass" || c?.kind === "restore" || c?.kind === "trust" || c?.kind === "stop_background" || c?.kind === "stop_turn" ? null : c));
     setHeldTrust(null);
+  }
+
+  /** `<leader>k`, and a stop arrival with no turn running: asks to stop the active tab's background work, or says
+   *  why it cannot. Claude stops its roster explicitly; other providers keep the session-ending stop. */
+  function askStopBackgroundOfActiveTab() {
+    const tab = activeTab?.id ?? null;
+    if (!isExternalAgent(activeTab?.agent)) {
+      if (!state.capabilities.backgroundTasks) showFlash(CLAUDE_REPORTS_NO_BACKGROUND);
+      else if (!state.capabilities.taskControl) showFlash("this sidecar cannot stop one task");
+      else if (tab === null || activeTab?.state !== "live" || liveTasks(state.backgroundTasks.rows).length === 0) showFlash(NOTHING_IN_THE_BACKGROUND);
+      else if (state.activeTurnId !== null) showFlash("a turn is running: /tasks can stop background work");
+      else askStopBackground(tab, liveTasks(state.backgroundTasks.rows).length);
+      return;
+    }
+    if (tab === null || activeTab?.state !== "live" || state.backgroundCalls === 0) {
+      showFlash(nothingToStopWords(activeTab?.agent));
+      return;
+    }
+    if (state.activeTurnId !== null) {
+      showFlash("a turn is running: interrupting the turn stops them too");
+      return;
+    }
+    askStopBackground(tab, state.backgroundCalls);
+  }
+
+  /** A stop arrival's question while `tab`'s turn `turn` runs. Like the other y/n prompts it takes the keys from
+   *  whatever was open over the conversation; only a counted `y` sends the chat's own `interrupt` for `tab`, and
+   *  only while `turn` is still the one running. */
+  function askStopTurn(tab: TabId, turn: string) {
+    dropPendingKeys();
+    exitRegion();
+    setDetail(null);
+    setHandoffOpen(false);
+    setKeymapOpen(false);
+    setConfirm({ kind: "stop_turn", tab, turn, lines: [STOP_TURN_QUESTION], openedAt: performance.now() });
   }
 
   /** Opens `<leader>k`'s question for `tab`, naming `running` commands and the tab's agent. Like the other y/n
@@ -3731,6 +3792,25 @@ export default function App() {
             trackRequest(stopId, { kind: "stop-background", tab: confirm.tab });
             postToRust({ type: "stop_background", request_id: stopId, tab: confirm.tab, running: confirm.running });
           }
+        }
+        setConfirm(null);
+        return true;
+      }
+      if (confirm.kind === "stop_turn") {
+        // Any key but a counted `y` puts the question away and stops nothing (`n`, Escape included).
+        const answer = stopTurnAnswer(
+          { key: event.key, plain: isPlainAnswerKey(event.nativeEvent as unknown as KeyLike), repeat: event.repeat },
+          bypassYesCounts(answerClock()),
+          {
+            sameTab: activeTab?.id === confirm.tab && activeTab?.state === "live",
+            askedTurn: confirm.turn,
+            turnNow: workToStop(state),
+          },
+        );
+        if (answer.kind === "interrupt") {
+          postToRust({ type: "interrupt", request_id: nextRequestId(), tab: confirm.tab });
+        } else if (answer.kind === "refused") {
+          showFlash(answer.flash);
         }
         setConfirm(null);
         return true;

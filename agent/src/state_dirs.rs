@@ -97,7 +97,7 @@ pub(crate) fn history_dir() -> std::io::Result<PathBuf> {
 /// lock in their own directory, both succeed, and nothing reports it.
 ///
 /// - **Linux:** `$XDG_RUNTIME_DIR/eitri/session-leases/`, matching this project's own established
-///   pattern for ephemeral, per-session state (`supervisor::socket_path`, `agent::process`'s hook
+///   pattern for ephemeral, per-session state (`agent::process`'s hook
 ///   sockets). A lease has no meaning across a reboot, so tmpfs is right here and wrong for the
 ///   records above. Unset is still an error.
 /// - **macOS:** `<home>/Library/Application Support/eitri/session-leases/`, where `<home>` is the

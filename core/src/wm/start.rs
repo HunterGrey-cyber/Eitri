@@ -416,6 +416,7 @@ pub(super) fn event_window(event: &HostEvent) -> Option<WinId> {
             | OnboardingEvent::NoScreen { win },
         )
         | HostEvent::TopBarLeft { win }
+        | HostEvent::Agents { win, .. }
         | HostEvent::Refused {
             surface: Some((win, _)),
             ..

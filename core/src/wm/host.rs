@@ -1,5 +1,6 @@
 //! The value contract between window decisions and native host services.
 
+use super::agents_round::{RoundKey, RoundOutcome};
 use super::moves::MoveKind;
 use super::window::*;
 use crate::agent_backend::AgentId;
@@ -250,6 +251,11 @@ pub trait HostReads {
     /// Whether a tab is frozen for a move. Uncertain hosts refuse a reveal until they can tell.
     fn tab_moving(&self, _tab: TabId) -> bool {
         true
+    }
+    /// Whether a local tab has a turn or background work running, which is what a stop would end. Uncertain hosts
+    /// say no, so a stop is refused rather than asked about nothing.
+    fn tab_has_work(&self, _tab: TabId) -> bool {
+        false
     }
     /// Cached environment for the chooser; no environment or filesystem reads happen in the controller.
     fn project_chooser_env(&self, _win: WinId) -> ChooserEnv {
@@ -703,6 +709,14 @@ pub enum HostOp {
     Pair(PairOp),
     /// Asks for the first-start screen's work: the checks, the detection, the write, the marker.
     Onboarding(OnboardingOp),
+    /// A round key (`agents.next`, `agents.back`) pressed with the keys on `at`: off this thread, the host reads every
+    /// window's rows and the shared round once, decides the step (`agents_round::on_next`, `on_back`), writes the
+    /// round, brings the stop forward, and answers [`HostEvent::Agents`]. Nothing here answers anything.
+    AgentsScan {
+        win: WinId,
+        step: RoundKey,
+        at: Option<ModuleId>,
+    },
     /// Runs Lua after all other operations.
     Lua(LuaOp),
 }
@@ -1380,6 +1394,9 @@ pub enum HostEvent {
     WindowMonitor { win: WinId, monitor: Option<MonitorId> },
     /// A fact about the first-start screen, from a worker or from the shell.
     Onboarding(OnboardingEvent),
+    /// What a round key's [`HostOp::AgentsScan`] came to, for the status line (or, back to a module of this window,
+    /// for the controller to focus).
+    Agents { win: WinId, outcome: RoundOutcome },
     /// A scheduled timer or idle fired.
     Timer(TimerToken),
     /// A watched descriptor became ready.
@@ -2171,6 +2188,8 @@ pub enum OpTag {
     Pair,
     /// Identifies Onboarding operations.
     Onboarding,
+    /// Identifies AgentsScan operations.
+    AgentsScan,
     /// Identifies Lua operations.
     Lua,
 }
@@ -2221,6 +2240,7 @@ impl OpTag {
             HostOp::Cleanup(..) => Self::Cleanup,
             HostOp::Pair(..) => Self::Pair,
             HostOp::Onboarding(..) => Self::Onboarding,
+            HostOp::AgentsScan { .. } => Self::AgentsScan,
             HostOp::Lua(..) => Self::Lua,
         }
     }
@@ -2644,6 +2664,14 @@ mod tests {
         tag!(HostOp::Cleanup(CleanupOp::Feeds), Cleanup);
         tag!(HostOp::Pair(PairOp::Unrestored { win }), Pair);
         tag!(HostOp::Onboarding(OnboardingOp::OpenTutor { win }), Onboarding);
+        tag!(
+            HostOp::AgentsScan {
+                win,
+                step: RoundKey::Next,
+                at: None
+            },
+            AgentsScan
+        );
         tag!(HostOp::Project(ProjectOp::List { win, serial: 1 }), Project);
         tag!(HostOp::Lua(emit("changed")), Lua);
     }

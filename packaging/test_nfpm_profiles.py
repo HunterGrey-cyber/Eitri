@@ -182,11 +182,10 @@ def _contents_by_dst(doc):
     return {entry["dst"]: entry for entry in doc.get("contents", [])}
 
 
-# The six binaries every release ships; no legacy agent-hook.
+# The five binaries every release ships; no legacy agent-hook.
 
 RELEASE_BINARY_DSTS = {
     "/usr/lib/eitri/shell",
-    "/usr/lib/eitri/eitri-supervisor",
     "/usr/lib/eitri/eitri-tmux-shim",
     "/usr/lib/eitri/eitri-run-guard",
     "/usr/lib/eitri/eitri-editor-bridge",
@@ -269,7 +268,7 @@ class NeitherProfileNamesAgentHook(unittest.TestCase):
                 self.assertNotIn("agent-hook", entry["src"], (path, entry))
                 self.assertNotIn("agent-hook", entry["dst"], (path, entry))
 
-    def test_the_six_binaries_are_at_the_same_dsts_in_both_profiles(self):
+    def test_the_five_binaries_are_at_the_same_dsts_in_both_profiles(self):
         public_dsts = set(_contents_by_dst(_load_yaml(PUBLIC_PATH)))
         private_dsts = set(_contents_by_dst(_load_yaml(PRIVATE_PATH)))
         self.assertTrue(RELEASE_BINARY_DSTS <= public_dsts, public_dsts)
@@ -412,6 +411,7 @@ NVIM_PLUGIN_DST = "/usr/share/eitri/nvim/eitri.nvim"
 NVIM_PLUGIN_FILES = ["doc/eitri.txt", "lua/eitri/health.lua", "lua/eitri/init.lua", "plugin/eitri.lua"]
 # The Markdown preview plugin: one `type: tree` entry per profile, from the tree release.sh stages (its manifest and
 # built site), to the system data directory `eitri.plugin.load("markdown")` searches.
+PLUGIN_NAMES = ('markdown', 'agents-strips', 'agents-top', 'agents-pass')
 MARKDOWN_PLUGIN_SRC = "./plugins/markdown"
 MARKDOWN_PLUGIN_DST = "/usr/share/eitri/plugins/markdown"
 # What the stand-in staged tree holds when the packages are built for real below.
@@ -535,12 +535,13 @@ class BothProfilesShipTheDesktopEntryAndTheIcon(unittest.TestCase):
     def test_the_markdown_plugin_is_one_tree_entry_in_both_profiles(self):
         for path in (PUBLIC_PATH, PRIVATE_PATH):
             by_dst = _contents_by_dst(_load_yaml(path))
-            entry = by_dst.get(MARKDOWN_PLUGIN_DST)
-            self.assertIsNotNone(entry, path)
-            self.assertEqual(entry["src"], MARKDOWN_PLUGIN_SRC, path)
-            self.assertEqual(entry.get("type"), "tree", path)
-            under = [d for d in by_dst if d.startswith("/usr/share/eitri/plugins/")]
-            self.assertEqual(under, [MARKDOWN_PLUGIN_DST], path)
+            for name in PLUGIN_NAMES:
+                entry = by_dst.get(f"/usr/share/eitri/plugins/{name}")
+                self.assertIsNotNone(entry, (path, name))
+                self.assertEqual(entry["src"], f"./plugins/{name}", (path, name))
+                self.assertEqual(entry.get("type"), "tree", (path, name))
+            under = {d for d in by_dst if d.startswith("/usr/share/eitri/plugins/")}
+            self.assertEqual(under, {f"/usr/share/eitri/plugins/{name}" for name in PLUGIN_NAMES}, path)
 
     def test_every_icon_size_is_installed_under_hicolor_in_both(self):
         for path in (PUBLIC_PATH, PRIVATE_PATH):
@@ -682,7 +683,7 @@ class RealPackagesCarryTheProfileWhereTheySay(unittest.TestCase):
             self.assertNotIn(OLD_DESKTOP_DST.lstrip("/"), paths, (label, packager))
 
     def test_every_package_carries_the_plugin_tree(self):
-        want = {f"{MARKDOWN_PLUGIN_DST.lstrip('/')}/{rel}" for rel in MARKDOWN_PLUGIN_STAND_IN}
+        want = {f"usr/share/eitri/plugins/{name}/{rel}" for name in PLUGIN_NAMES for rel in MARKDOWN_PLUGIN_STAND_IN}
         listers = {
             "deb": lambda out: self.sh(["dpkg-deb", "-c", out], text=True).stdout,
             "rpm": lambda out: self.sh(["rpm", "-qlp", out], text=True).stdout,
@@ -693,9 +694,10 @@ class RealPackagesCarryTheProfileWhereTheySay(unittest.TestCase):
             self.assertLessEqual(want, paths, (label, packager, sorted(want - paths)))
         for label in ("public", "private"):
             x, _control = self._deb(label)
-            for rel in MARKDOWN_PLUGIN_STAND_IN:
-                path = os.path.join(x, MARKDOWN_PLUGIN_DST.lstrip("/"), rel)
-                self.assertEqual(os.stat(path).st_mode & 0o777, 0o644, (label, rel))
+            for name in PLUGIN_NAMES:
+                for rel in MARKDOWN_PLUGIN_STAND_IN:
+                    path = os.path.join(x, "usr/share/eitri/plugins", name, rel)
+                    self.assertEqual(os.stat(path).st_mode & 0o777, 0o644, (label, name, rel))
 
     def test_the_debs_icons_are_the_committed_files_byte_for_byte(self):
         for label in ("public", "private"):

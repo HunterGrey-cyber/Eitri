@@ -654,3 +654,188 @@ describe("TypingGuard.timeOf: when a keydown happened", () => {
     expect(stamps.mayActAfterMotion(1150, false)).toBe(false);
   });
 });
+
+/* The host revealed a tab here (`arrive`, `focus_permission`) while the person may still be typing
+   wherever they asked for it: the arrival is a key, at the moment it came, for every rule above. */
+describe("TypingGuard: an arrival counts as a key", () => {
+  /** The keys and a tab arrive now, on the fake clock the keys are dated by. */
+  function arrive() {
+    guard.noteArrival(Date.now());
+  }
+  const enterOnButton = () => key("Enter", { onButton: true });
+  /** INPUT's `Ctrl+y`: the guard's before-half, then a wait for the window and the release. */
+  function ctrlY() {
+    const t = Date.now();
+    guard.onKey("y", t);
+    if (!guard.mayAnswerNow("", t, false)) return;
+    guard.deferUntilReleased(t, false, () => answers.push({ key: "Ctrl+y", at: Date.now() }), "cancelled", "KeyY");
+    guard.onKeyUp("KeyY", t + 50);
+  }
+  /** The leader: acts at once when the guard lets it. */
+  function leader() {
+    const t = Date.now();
+    guard.onKey(" ", t);
+    if (guard.mayActAfterMotion(t, false)) answers.push({ key: "leader", at: t });
+  }
+  function startInput() {
+    const t = Date.now();
+    guard.onKey("i", t);
+    if (guard.mayStartInput(t, false)) answers.push({ key: "i", at: t });
+  }
+
+  it("an_answer_key_within_250ms_of_an_arrival_is_refused", () => {
+    const cases: Array<[string, () => void]> = [
+      ["a", () => key("a")],
+      ["Enter on a card button", enterOnButton],
+      ["Ctrl+y", ctrlY],
+      ["the leader", leader],
+      ["i", startInput],
+    ];
+    for (const [name, press] of cases) {
+      guard = new TypingGuard();
+      answers = [];
+      key("k");
+      vi.advanceTimersByTime(TYPING_GUARD_MS * 4);
+      arrive();
+      vi.advanceTimersByTime(TYPING_GUARD_MS - 1);
+      press();
+      vi.advanceTimersByTime(TYPING_GUARD_MS * 4);
+      expect(answers, name).toEqual([]);
+    }
+  });
+
+  it("an_answer_key_after_250ms_is_taken", () => {
+    const cases: Array<[string, () => void]> = [
+      ["a", () => key("a")],
+      ["Enter on a card button", enterOnButton],
+      ["Ctrl+y", ctrlY],
+      ["the leader", leader],
+      ["i", startInput],
+    ];
+    for (const [name, press] of cases) {
+      guard = new TypingGuard();
+      answers = [];
+      arrive();
+      vi.advanceTimersByTime(TYPING_GUARD_MS);
+      press();
+      vi.advanceTimersByTime(TYPING_GUARD_MS * 4);
+      expect(answers.length, name).toBe(1);
+    }
+  });
+
+  it("a_refused_key_extends_the_run", () => {
+    arrive();
+    vi.advanceTimersByTime(200);
+    key("a");
+    vi.advanceTimersByTime(200);
+    key("a");
+    vi.advanceTimersByTime(200);
+    enterOnButton();
+    vi.advanceTimersByTime(TYPING_GUARD_MS * 4);
+    expect(answers).toEqual([]);
+    key("a");
+    vi.advanceTimersByTime(TYPING_GUARD_MS);
+    expect(answers.map((a) => a.key)).toEqual(["a"]);
+  });
+
+  it("a walk or a motion run that starts inside the arrival's window is no exception", () => {
+    arrive();
+    vi.advanceTimersByTime(100);
+    key("l");
+    vi.advanceTimersByTime(100);
+    enterOnButton();
+    vi.advanceTimersByTime(TYPING_GUARD_MS * 4);
+    arrive();
+    vi.advanceTimersByTime(100);
+    key("j");
+    vi.advanceTimersByTime(100);
+    leader();
+    expect(answers).toEqual([]);
+  });
+
+  it("an arrival cancels a waiting a, as another key would", () => {
+    key("a");
+    vi.advanceTimersByTime(100);
+    arrive();
+    vi.advanceTimersByTime(TYPING_GUARD_MS * 4);
+    expect(answers).toEqual([]);
+  });
+
+  it("an arrival is not a key the page saw: keyCount does not move", () => {
+    key("k");
+    const before = guard.keyCount();
+    arrive();
+    expect(guard.keyCount()).toBe(before);
+  });
+
+  it("a held j let go after an arrival does not move the arrival", () => {
+    key("j");
+    vi.advanceTimersByTime(TYPING_GUARD_MS * 4);
+    arrive();
+    vi.advanceTimersByTime(100);
+    guard.onRelease("j", Date.now());
+    vi.advanceTimersByTime(TYPING_GUARD_MS - 100);
+    key("a");
+    vi.advanceTimersByTime(TYPING_GUARD_MS);
+    expect(answers.map((a) => a.key)).toEqual(["a"]);
+  });
+
+  it("an arrival never comes before the last key recorded", () => {
+    key("x");
+    guard.noteArrival(Date.now() - 1000);
+    vi.advanceTimersByTime(TYPING_GUARD_MS - 1);
+    key("a");
+    vi.advanceTimersByTime(TYPING_GUARD_MS * 4);
+    expect(answers).toEqual([]);
+  });
+});
+
+describe("TypingGuard.clockNow: the present on the keydowns' clock", () => {
+  it("with no key seen yet, it is performance.now()'s", () => {
+    expect(guard.clockNow(42)).toBe(42);
+  });
+
+  it("it follows the keys' clock by the least lag seen, so a key handled late does not pull it back", () => {
+    // Keys stamped on a clock 4900 ms ahead of performance.now()'s, the first handled at once.
+    guard.timeOf({ repeat: false, timeStamp: 5000 }, 100);
+    expect(guard.clockNow(300)).toBe(5200);
+    // A key handled 400 ms after its press, in a stall: the present is still read from the first.
+    guard.timeOf({ repeat: false, timeStamp: 6000 }, 1500);
+    expect(guard.clockNow(1600)).toBe(6500);
+    // A repeat's stamp is the press's own, so it says nothing about the offset.
+    guard.timeOf({ repeat: true, timeStamp: 6000 }, 1700);
+    expect(guard.clockNow(1800)).toBe(6700);
+  });
+
+  it("on performance.now()'s own clock a key handled late does not date an arrival before its moment", () => {
+    // The page's first key is pressed at 100 and handled at 600, in a stall; the clocks are one.
+    guard.onKey("k", guard.timeOf({ repeat: false, timeStamp: 100 }, 600));
+    guard.noteArrival(guard.clockNow(1000));
+    // 100 ms after the arrival, handled at once.
+    const t = guard.timeOf({ repeat: false, timeStamp: 1100 }, 1100);
+    guard.onKey("a", t);
+    expect(guard.mayAnswerNow("a", t, false)).toBe(false);
+    const alone = guard.timeOf({ repeat: false, timeStamp: 1600 }, 1600);
+    guard.onKey("a", alone);
+    expect(guard.mayAnswerNow("a", alone, false)).toBe(true);
+  });
+
+  it("a stamp never ahead of its handling reads as performance.now()'s clock, however late the keys were handled", () => {
+    guard.timeOf({ repeat: false, timeStamp: 100 }, 600);
+    expect(guard.clockNow(1000)).toBe(1000);
+  });
+
+  it("an arrival dated by it refuses a key pressed just after on the keys' clock", () => {
+    guard.onKey("k", guard.timeOf({ repeat: false, timeStamp: 5000 }, 100));
+    guard.noteArrival(guard.clockNow(2000));
+    const t = guard.timeOf({ repeat: false, timeStamp: 7000 }, 2100);
+    guard.onKey("a", t);
+    expect(guard.mayAnswerNow("a", t, false)).toBe(false);
+    const later = guard.timeOf({ repeat: false, timeStamp: 7200 }, 2300);
+    guard.onKey("a", later);
+    expect(guard.mayAnswerNow("a", later, false)).toBe(false);
+    const alone = guard.timeOf({ repeat: false, timeStamp: 7500 }, 2600);
+    guard.onKey("a", alone);
+    expect(guard.mayAnswerNow("a", alone, false)).toBe(true);
+  });
+});

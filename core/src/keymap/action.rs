@@ -210,6 +210,11 @@ pub enum Action {
     CopyMode {
         up: bool,
     },
+    /// The round over the agents that wait for the person, in every window of this user: with no round running, start
+    /// one at the agent that has waited longest; with one running, go to its next stop.
+    AgentsNext,
+    /// Leave the round and give the keys back to where it started.
+    AgentsBack,
 }
 
 /// An option's value as Lua gave it.
@@ -392,6 +397,8 @@ pub const NAMES: &[&str] = &[
     "window.other",
     "window.immersive",
     "window.setup",
+    "agents.next",
+    "agents.back",
     "move.to-window",
     "move.left",
     "move.down",
@@ -656,6 +663,8 @@ pub fn parse(name: &str, opts: &[(String, OptValue)], lua_panels: &[String]) -> 
         "panel.command-line" => (Action::PanelCommandLine, &[]),
         "window.immersive" => (Action::WindowImmersive, &[]),
         "window.setup" => (Action::WindowSetup, &[]),
+        "agents.next" => (Action::AgentsNext, &[]),
+        "agents.back" => (Action::AgentsBack, &[]),
         "text.larger" => (Action::Text(TextChange::Larger), &[]),
         "text.smaller" => (Action::Text(TextChange::Smaller), &[]),
         "text.reset" => (Action::Text(TextChange::Reset), &[]),
@@ -775,6 +784,8 @@ impl Action {
             | Action::PanelCommandLine
             | Action::WindowImmersive
             | Action::WindowSetup
+            | Action::AgentsNext
+            | Action::AgentsBack
             | Action::Text(_)
             | Action::TextAll(_)
             | Action::CopyMode { .. }
@@ -836,6 +847,8 @@ impl Action {
             | Action::PanelCommandLine
             | Action::WindowImmersive
             | Action::WindowSetup
+            | Action::AgentsNext
+            | Action::AgentsBack
             | Action::Text(_)
             | Action::TextAll(_)
             | Action::CopyMode { .. }
@@ -924,6 +937,8 @@ impl Action {
             | Action::PanelCommandLine
             | Action::WindowImmersive
             | Action::WindowSetup
+            | Action::AgentsNext
+            | Action::AgentsBack
             | Action::Text(_)
             | Action::TextAll(_)
             | Action::CopyMode { .. } => false,
@@ -1017,6 +1032,8 @@ impl Action {
             Action::PanelCommandLine => "panel.command-line".into(),
             Action::WindowImmersive => "window.immersive".into(),
             Action::WindowSetup => "window.setup".into(),
+            Action::AgentsNext => "agents.next".into(),
+            Action::AgentsBack => "agents.back".into(),
             Action::Text(TextChange::Larger) => "text.larger".into(),
             Action::Text(TextChange::Smaller) => "text.smaller".into(),
             Action::Text(TextChange::Reset) => "text.reset".into(),
@@ -1206,6 +1223,10 @@ impl Action {
             Action::PanelCommandLine => "Show the chat and its : command line (runs nothing)".into(),
             Action::WindowImmersive => "Immersive: fullscreen without the top bar".into(),
             Action::WindowSetup => "Show the first-start screen: pick a key layout and write init.lua".into(),
+            Action::AgentsNext => {
+                "The agent that has waited longest for you, in any window; again, the next one that waits".into()
+            }
+            Action::AgentsBack => "Leave the round of waiting agents and go back to where it started".into(),
             Action::Text(TextChange::Larger) => "Text size larger, the pane with the keys only".into(),
             Action::Text(TextChange::Smaller) => "Text size smaller, the pane with the keys only".into(),
             Action::Text(TextChange::Reset) => "Text size back in step, the pane with the keys only".into(),
@@ -1318,6 +1339,8 @@ impl Action {
             Action::PanelCommandLine => "command line",
             Action::WindowImmersive => "immersive",
             Action::WindowSetup => "setup keys",
+            Action::AgentsNext => "next waiting agent",
+            Action::AgentsBack => "leave the round",
             Action::Text(TextChange::Larger) => "text larger",
             Action::Text(TextChange::Smaller) => "text smaller",
             Action::Text(TextChange::Reset) => "text size reset",
@@ -1408,6 +1431,8 @@ mod tests {
             Action::PanelCommandLine,
             Action::WindowImmersive,
             Action::WindowSetup,
+            Action::AgentsNext,
+            Action::AgentsBack,
             Action::CopyMode { up: true },
             Action::CopyMode { up: false },
         ];
@@ -1571,6 +1596,8 @@ mod tests {
             | Action::PanelCommandLine
             | Action::WindowImmersive
             | Action::WindowSetup
+            | Action::AgentsNext
+            | Action::AgentsBack
             | Action::Text(_)
             | Action::TextAll(_)
             | Action::CopyMode { .. } => {}
@@ -2165,6 +2192,8 @@ mod tests {
             Action::PanelCommandLine,
             Action::WindowImmersive,
             Action::WindowSetup,
+            Action::AgentsNext,
+            Action::AgentsBack,
             Action::Text(TextChange::Reset),
             Action::CopyMode { up: false },
         ];
@@ -2332,6 +2361,8 @@ mod tests {
             Action::PanelCommandLine,
             Action::WindowImmersive,
             Action::WindowSetup,
+            Action::AgentsNext,
+            Action::AgentsBack,
             Action::Text(TextChange::Reset),
             Action::CopyMode { up: false },
         ] {

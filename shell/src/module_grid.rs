@@ -1985,6 +1985,29 @@ mod tests {
         .unwrap()
     }
 
+    #[test]
+    fn a_fixed_module_keeps_its_height_when_the_window_resizes() {
+        use eitri_core::layout::rules::{open_by_rule, At, OpenRule, RuleSize, NOMINAL_GRID};
+        use eitri_core::layout::Direction;
+        let mut model = Layout::new(Node::Leaf(ModuleId::editor()), ModuleId::editor()).unwrap();
+        let strip = ModuleId::lua("strip");
+        let rule = OpenRule {
+            at: Some(At::Beside(Direction::Up)),
+            size: Some(RuleSize::Pixels(24)),
+            focus: false,
+            ..OpenRule::default()
+        };
+        open_by_rule(&mut model, &strip, &rule, Some(&ModuleId::editor()), NOMINAL_GRID).unwrap();
+        let (layout, _) = LayoutView::for_test(model);
+        for h in [400, 800, 1600] {
+            let size = Size { w: 1200, h };
+            let arrangement = arrangement_for(None, WinId::MAIN, &layout, size, |f| f(&Frame::new(size, 1)));
+            let rect = |id: &ModuleId| arrangement.modules.iter().find(|(m, _)| m == id).unwrap().1;
+            assert_eq!(rect(&strip).h, 24);
+            assert_eq!(rect(&ModuleId::editor()).h, h - 25);
+        }
+    }
+
     /// With an allocator, its arrangement is the one allocated and the grid settles no pin of its own (the
     /// allocator does, and tells the saver); with none, the grid arranges its layout with the pin settled, and
     /// writes nothing.

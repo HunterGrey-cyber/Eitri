@@ -344,8 +344,9 @@ type InboundHandler = (
      *  card, a launch that starts with the keys already in the chat): BROWSE, on the oldest pending
      *  card if one waits, else on the last row with following resumed. Reverses the 2026-09-19 choice
      *  that `Ctrl+l` put the caret straight into the composer: a reader arrives to read first. See
-     *  `serialize_arrive_for_js` in `core/src/agent_bridge.rs`. */
-    | { kind: "arrive" }
+     *  `serialize_arrive_for_js` in `core/src/agent_bridge.rs`. `intent` says why the keys came (a reveal to look,
+     *  or to stop the tab: then the chat asks its own y/n question); it never acts by itself. */
+    | { kind: "arrive"; intent?: "show" | "stop" }
     /** `shell`'s keys for the `?` overlay (`serialize_keymap_for_js`). */
     | ({ kind: "keymap" } & KeymapHelp)
     /** `send-prefix`/`send-keys` with this panel holding the keys: WebKitGTK cannot be handed the

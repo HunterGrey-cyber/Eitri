@@ -61,10 +61,13 @@ fs_scaffold() {
 	cp -R "$PKG/../gnome-extension" "$_fs_dir/gnome-extension"
 	cp -R "$PKG/icons" "$_fs_dir/packaging/icons"
 	# The Markdown preview plugin's manifest is tracked; its site is what the build writes (fixtures/cargo-fromsource).
-	mkdir -p "$_fs_dir/plugins/markdown/web/src"
-	printf 'id = "markdown"\ntitle = "Markdown preview"\n' >"$_fs_dir/plugins/markdown/eitri-plugin.toml"
-	printf 'export {};\n' >"$_fs_dir/plugins/markdown/web/src/main.ts"
-	printf 'dist/\n' >"$_fs_dir/plugins/markdown/web/.gitignore"
+	# The three agents faces are tracked the same way: a manifest, a source file and an ignored dist/.
+	for _fs_plugin in markdown agents-strips agents-top agents-pass; do
+		mkdir -p "$_fs_dir/plugins/$_fs_plugin/web/src"
+		printf 'id = "%s"\ntitle = "%s"\n' "$_fs_plugin" "$_fs_plugin" >"$_fs_dir/plugins/$_fs_plugin/eitri-plugin.toml"
+		printf 'export {};\n' >"$_fs_dir/plugins/$_fs_plugin/web/src/main.ts"
+		printf 'dist/\n' >"$_fs_dir/plugins/$_fs_plugin/web/.gitignore"
+	done
 	cp "$INSTALLER" "$_fs_dir/packaging/install.sh"
 	printf 'test fixture LICENSE: MIT-shaped, not the real text.\n' >"$_fs_dir/LICENSE"
 	if [ -z "${FS_NO_NOTICE:-}" ]; then printf 'test fixture NOTICE.\n' >"$_fs_dir/NOTICE"; fi
@@ -166,11 +169,11 @@ t_from_source_clone_head_match_builds_and_installs() {
 	fi
 	# --target-dir pins staging's <src>/target/release assumption. $TH/.cache/eitri/src is
 	# clone_public_eitri's NV_CACHE_NV/src, the checkout for a network build.
-	if ! grep -Fqx "cargo build --release --locked --target-dir $TH/.cache/eitri/src/target -p shell -p agent -p supervisor --bins" "$S/logs/cargo.log"; then
+	if ! grep -Fqx "cargo build --release --locked --target-dir $TH/.cache/eitri/src/target -p shell -p agent --bins" "$S/logs/cargo.log"; then
 		fail "the recorded build command is not exactly the spec's: $(cat "$S/logs/cargo.log")"
 	fi
-	# Installed exactly like the prebuilt path: the six binaries, the launcher, RELEASE, licences.
-	for b in shell eitri-supervisor eitri-tmux-shim eitri-claude-handoff eitri-run-guard eitri-editor-bridge; do
+	# Installed exactly like the prebuilt path: the five binaries, the launcher, RELEASE, licences.
+	for b in shell eitri-tmux-shim eitri-claude-handoff eitri-run-guard eitri-editor-bridge; do
 		expect_exec "$TH/.local/lib/eitri/$b"
 	done
 	expect_exec "$TH/.local/bin/eitri"
@@ -339,7 +342,7 @@ t_from_source_checkout_public_rev_builds_and_installs() {
 		-- --from-source --checkout "$FS_DIR"
 	expect_rc 0
 	# --target-dir pins staging's <src>/target/release assumption; --checkout uses $FS_DIR as src.
-	if ! grep -Fqx "cargo build --release --locked --target-dir $FS_DIR/target -p shell -p agent -p supervisor --bins" "$S/logs/cargo.log"; then
+	if ! grep -Fqx "cargo build --release --locked --target-dir $FS_DIR/target -p shell -p agent --bins" "$S/logs/cargo.log"; then
 		fail "the recorded build command is not exactly the spec's: $(cat "$S/logs/cargo.log")"
 	fi
 	if ! grep -Fqx "SKIA_BINARIES_URL=file://$T/home/.cache/eitri/from-source-skia/skia-binaries-test.tar.gz" "$S/logs/cargo.log"; then
@@ -401,7 +404,7 @@ t_from_source_checkout_target_dir_pinned_against_stale_binary() {
 	expect_rc 0
 	# --target-dir wins over the caller's CARGO_TARGET_DIR (cargo's own precedence), so the stub
 	# build's fresh binaries land at $FS_DIR/target/release, not $_elsewhere/release.
-	if ! grep -Fqx "cargo build --release --locked --target-dir $FS_DIR/target -p shell -p agent -p supervisor --bins" "$S/logs/cargo.log"; then
+	if ! grep -Fqx "cargo build --release --locked --target-dir $FS_DIR/target -p shell -p agent --bins" "$S/logs/cargo.log"; then
 		fail "--target-dir did not win over the caller's CARGO_TARGET_DIR: $(cat "$S/logs/cargo.log")"
 	fi
 	if grep -q 'STALE stub shell' "$TH/.local/lib/eitri/shell"; then
@@ -432,7 +435,7 @@ t_from_source_checkout_relative_path_from_its_parent_directory() {
 	expect_rc 0
 	# The absolutized checkout dir, not the literal relative argument: --target-dir must name the
 	# same $FS_DIR/target a matching absolute --checkout would (the test right above this one).
-	if ! grep -Fqx "cargo build --release --locked --target-dir $FS_DIR/target -p shell -p agent -p supervisor --bins" "$S/logs/cargo.log"; then
+	if ! grep -Fqx "cargo build --release --locked --target-dir $FS_DIR/target -p shell -p agent --bins" "$S/logs/cargo.log"; then
 		fail "a relative --checkout did not resolve --target-dir against the checkout itself: $(cat "$S/logs/cargo.log")"
 	fi
 	expect_exec "$TH/.local/lib/eitri/shell"

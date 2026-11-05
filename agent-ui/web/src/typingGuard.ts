@@ -43,6 +43,13 @@
  *  quiet before it, so a fast `jjj` to the bottom stops there; quiet after it, because `j` is a first letter and
  *  "just do it" must not lose its `j` to the box; and let go, because a held key would otherwise repeat into the
  *  draft as `jjjj` from the moment the box took the keys.
+ *
+ *  An arrival is a key (`noteArrival`). The host reveals a tab here (`arrive`, `focus_permission`) from a key or
+ *  click made somewhere else, a face in another window, `prefix a`, `prefix u`, and the person may still be
+ *  typing. Recorded as a key at the moment the envelope came, it puts every rule above in force from there: an
+ *  answer key within `TYPING_GUARD_MS` after it is refused, a run that began inside that window is no walk or
+ *  motion run, and the keys it refused count as typing, so a run typed on through the arrival stays refused.
+ *
  *  Pure: no DOM reads. Callers supply event timestamps; injectable timers default to globals looked
  *  up at call time so fake timers apply. */
 
@@ -56,6 +63,9 @@ export const TYPING_GUARD_MS = 250;
  *  default), so the cap, not the repeat, is what refuses a held key in either case; well above a
  *  deliberate press, which is up within about 150 ms. */
 export const RELEASE_WAIT_MAX_MS = 450;
+
+/** What an arrival is recorded as: no key a keydown can name, so nothing is ever its release or its repeat. */
+const ARRIVAL = "\u0000arrival";
 
 /** The keys that walk onto a card button, so Enter at the end of a run made only of them is not
  *  typing. Shift+Tab arrives as `Tab` (the caller normalizes WebKitGTK's `Unidentified`/
@@ -191,6 +201,10 @@ export class TypingGuard {
   /** The last keydown that was not a repeat: its own time and `performance.now()` when it was handled,
    *  for `timeOf`. */
   private fresh: { typed: number; perf: number } | null = null;
+  /** The least lag seen from a fresh press to its handling (`performance.now()` less the press's own time), for
+   *  `clockNow`. The least, since no key is handled before its press, so it is the nearest to the clocks' offset;
+   *  a key held up by a stall lags more and never moves it. */
+  private leastLag = Infinity;
 
   constructor(private readonly timers: GuardTimers = GLOBAL_TIMERS) {}
 
@@ -204,9 +218,38 @@ export class TypingGuard {
     const stamp = event.timeStamp > 0 ? event.timeStamp : perfNow;
     if (!event.repeat || this.fresh === null) {
       this.fresh = { typed: stamp, perf: perfNow };
+      if (!event.repeat) this.leastLag = Math.min(this.leastLag, perfNow - stamp);
       return stamp;
     }
     return Math.max(stamp, this.fresh.typed + Math.max(0, perfNow - this.fresh.perf));
+  }
+
+  /** The present moment on the keydowns' clock, for an event that is not a key (`noteArrival`). A stamp is
+   *  `performance.now()`'s clock (both count from the page's time origin), and a key is never handled before its
+   *  press, so while no fresh press has lagged less than nothing the present is `perfNow` itself. A lag says how
+   *  long a key waited, not where the clock is: taking even the least of them off would date the present early by
+   *  the wait of every key seen so far, and an arrival dated early lets a key typed just after it answer. Stamps
+   *  ahead of `performance.now()` (jsdom's `Date`, a compositor's own clock) are another clock, read as `perfNow`
+   *  less the least lag: early by the least wait any fresh press has had, which for a key handled at once is
+   *  about nothing. With no key seen yet it is `perfNow`, the clock `timeOf` takes for a keydown with no stamp. */
+  clockNow(perfNow: number = performance.now()): number {
+    return this.leastLag === Infinity ? perfNow : perfNow - Math.min(0, this.leastLag);
+  }
+
+  /** The host revealed a tab in this page at `at` on the keydowns' clock (`clockNow`): recorded as a key that
+   *  is neither a walk nor a motion, so every answer key, the leader and INPUT entry wait `TYPING_GUARD_MS`
+   *  after it, a run begun inside that window is typing, and a waiting action is cancelled as by any key. Never
+   *  before the last key recorded. It is not counted in `keyCount`: that ties a landing to the key the page saw
+   *  make it, and the arrival's own landing is tied to the keys after it. */
+  noteArrival(at: number): void {
+    const t = this.latest === null ? at : Math.max(at, this.latest.t);
+    this.previousRunIsWalk = this.latestRunIsWalk;
+    this.latestRunIsWalk = false;
+    this.previousRunIsMotion = this.latestRunIsMotion;
+    this.latestRunIsMotion = false;
+    this.previous = this.latest;
+    this.latest = { key: ARRIVAL, t };
+    this.drop();
   }
 
   /** When a keyup happened, on the keydowns' clock (`event.timeStamp`, or `perfNow` where a page gives

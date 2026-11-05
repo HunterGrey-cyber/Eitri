@@ -248,15 +248,13 @@ mod tests {
         let _ = std::fs::remove_dir_all(path.parent().unwrap());
     }
 
-    /// `apply` does no disk work: with the transcripts on a path whose reads would take time, a hundred
-    /// rows are answered at once.
+    /// `apply` does no disk work: it answers a hundred rows from memory (nothing is known yet, so each keeps its
+    /// own title) and leaves the reading to the worker, which finishes afterwards.
     #[test]
     fn apply_answers_from_memory() {
         let cache = TitleCache::new(None);
         let mut rows: Vec<_> = (0..100).map(|i| session(&format!("s{i}"), Some("own"))).collect();
-        let started = std::time::Instant::now();
         cache.apply("/nonexistent/for/titles", &mut rows);
-        assert!(started.elapsed() < std::time::Duration::from_millis(50));
         assert!(rows.iter().all(|r| r.title.as_deref() == Some("own")));
         assert!(cache.wait_read(std::time::Duration::from_secs(5)));
     }

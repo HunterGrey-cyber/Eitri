@@ -57,7 +57,9 @@ pub fn classify_window1(action: &Action) -> HubVerb {
         | Action::ModuleHide
         | Action::ModuleHideByKey
         | Action::ModuleKill
-        | Action::ProjectChoose => HubVerb::AsToday,
+        | Action::ProjectChoose
+        | Action::AgentsNext
+        | Action::AgentsBack => HubVerb::AsToday,
         Action::Module(id) => match id.kind() {
             ModuleKind::Editor | ModuleKind::Terminal | ModuleKind::Canvas => HubVerb::AsToday,
             ModuleKind::Agent | ModuleKind::LuaWebview => HubVerb::RaiseOrSpawn(id.clone()),
@@ -123,7 +125,9 @@ pub fn classify_module(action: &Action) -> ModuleVerb {
         | Action::SendPrefix
         | Action::SendKeys(_)
         | Action::ModuleKill
-        | Action::ProjectChoose => ModuleVerb::AsToday,
+        | Action::ProjectChoose
+        | Action::AgentsNext
+        | Action::AgentsBack => ModuleVerb::AsToday,
         Action::Select(dir) => ModuleVerb::EdgeToCompositor(*dir),
         Action::Module(id) => match id.kind() {
             ModuleKind::Editor => ModuleVerb::AsToday,
@@ -298,6 +302,8 @@ mod tests {
             Action::WindowImmersive,
             Action::Text(TextChange::Larger),
             Action::CopyMode { up: false },
+            Action::AgentsNext,
+            Action::AgentsBack,
         ]
     }
 
@@ -350,6 +356,11 @@ mod tests {
         }
         hub(Action::TabBreak, H::ToLastChat);
         module(Action::TabBreak, M::TabBreak);
+        // The round reads every window's rows, so it runs from window 1 and from any chat or page window.
+        for action in [Action::AgentsNext, Action::AgentsBack] {
+            hub(action.clone(), H::AsToday);
+            module(action, M::AsToday);
+        }
 
         hub(Action::Module(ModuleId::editor()), H::AsToday);
         hub(Action::Module(ModuleId::terminal()), H::AsToday);
@@ -453,6 +464,7 @@ mod tests {
             Family::Floats,
             Family::Panel,
             Family::TextSize,
+            Family::Agents,
         ] {
             assert!(
                 actions.iter().any(|a| family(a) == family_wanted),

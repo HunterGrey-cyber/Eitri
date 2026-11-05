@@ -38,6 +38,8 @@ EXTENSION_FILES = ["direction.js", "extension.js", "metadata.json", "policy.js"]
 SLOW_LINE = "  -> Installing the Claude Agent SDK and building the sidecar (1-3 min)"
 # The Markdown preview plugin's directory as the tarball (lib/eitri/plugins/markdown) and the built source tree
 # (plugins/markdown, its site under web/dist) hold it; the build's fingerprint is never installed.
+PLUGIN_NAMES = ('markdown', 'agents-strips', 'agents-top', 'agents-pass')
+
 MARKDOWN_SITE = {
     "eitri-plugin.toml": b'id = "markdown"\n',
     "web/dist/index.html": b"<!doctype html>\n",
@@ -173,13 +175,14 @@ class _PackageCase(unittest.TestCase):
 
     def assert_markdown_plugin(self):
         got = self.installed()
-        root = "usr/share/eitri/plugins/markdown"
         self.assertEqual(sorted(p for p in got if p.startswith("usr/share/eitri/plugins/")),
-                         sorted(f"{root}/{rel}" for rel in MARKDOWN_SITE))
-        for rel, data in MARKDOWN_SITE.items():
-            path = os.path.join(self.pkgdir, root, rel)
-            self.assertEqual(_read(path), data, rel)
-            self.assertEqual(os.stat(path).st_mode & 0o777, 0o644, rel)
+                         sorted(f"usr/share/eitri/plugins/{name}/{rel}"
+                                for name in PLUGIN_NAMES for rel in MARKDOWN_SITE))
+        for name in PLUGIN_NAMES:
+            for rel, data in MARKDOWN_SITE.items():
+                path = os.path.join(self.pkgdir, "usr/share/eitri/plugins", name, rel)
+                self.assertEqual(_read(path), data.replace(b'markdown', name.encode()), (name, rel))
+                self.assertEqual(os.stat(path).st_mode & 0o777, 0o644, (name, rel))
 
 
 class EitriBinPackage(_PackageCase):
@@ -188,7 +191,7 @@ class EitriBinPackage(_PackageCase):
     def setUp(self):
         super().setUp()
         top = os.path.join(self.srcdir, "eitri-0.2.0-x86_64-linux")
-        for name in ("shell", "eitri-supervisor", "eitri-tmux-shim", "eitri-claude-handoff", "eitri-run-guard", "eitri-editor-bridge", "eitri-setup"):
+        for name in ("shell", "eitri-tmux-shim", "eitri-claude-handoff", "eitri-run-guard", "eitri-editor-bridge", "eitri-setup"):
             _touch(os.path.join(top, "lib", "eitri", name), mode=0o755)
         _touch(os.path.join(top, "lib", "eitri", "RELEASE"))
         _touch(os.path.join(top, "bin", "eitri"), mode=0o755)
@@ -209,10 +212,10 @@ class EitriBinPackage(_PackageCase):
         shutil.copytree(os.path.join(_PACKAGING, "icons", "hicolor"), os.path.join(top, "share", "icons", "hicolor"))
         for name in ("LICENSE", "NOTICE", "THIRD-PARTY-LICENSES", "SOURCE"):
             _touch(os.path.join(top, "share", "licenses", "eitri", name), name.encode())
-        for rel, data in MARKDOWN_SITE.items():
-            _touch(os.path.join(top, "lib", "eitri", "plugins", "markdown", rel), data)
-        # A fingerprint never reaches a tarball, but the package must leave one out if it ever did.
-        _touch(os.path.join(top, "lib", "eitri", "plugins", "markdown", "web", "dist", ".inputs-sha256"), b"0" * 64)
+        for name in PLUGIN_NAMES:
+            for rel, data in MARKDOWN_SITE.items():
+                _touch(os.path.join(top, "lib", "eitri", "plugins", name, rel), data.replace(b'markdown', name.encode()))
+            _touch(os.path.join(top, "lib", "eitri", "plugins", name, "web/dist/.inputs-sha256"), b"0" * 64)
 
     def test_it_installs_the_desktop_entry_and_every_icon_from_the_tarball_layout(self):
         proc = self.package()
@@ -257,7 +260,7 @@ class EitriGitPackage(_PackageCase):
     def setUp(self):
         super().setUp()
         tree = os.path.join(self.srcdir, "eitri-git")
-        for name in ("shell", "eitri-supervisor", "eitri-tmux-shim", "eitri-claude-handoff", "eitri-run-guard", "eitri-editor-bridge"):
+        for name in ("shell", "eitri-tmux-shim", "eitri-claude-handoff", "eitri-run-guard", "eitri-editor-bridge"):
             _touch(os.path.join(tree, "target", "release", name), mode=0o755)
         for name in ("install.sh", "eitri.launcher.sh"):
             _touch(os.path.join(tree, "packaging", name), mode=0o755)
@@ -271,10 +274,11 @@ class EitriGitPackage(_PackageCase):
         _touch(os.path.join(tree, "LICENSE"), b"MIT\n")
         _touch(os.path.join(tree, "NOTICE"), b"Neovide\n")
         _touch(os.path.join(self.srcdir, "release-for-sidecar.env"))
-        for rel, data in MARKDOWN_SITE.items():
-            _touch(os.path.join(tree, "plugins", "markdown", rel), data)
-        _touch(os.path.join(tree, "plugins", "markdown", "web", "dist", ".inputs-sha256"), b"0" * 64)
-        _touch(os.path.join(tree, "plugins", "markdown", "web", "src", "main.ts"), b"source\n")
+        for name in PLUGIN_NAMES:
+            for rel, data in MARKDOWN_SITE.items():
+                _touch(os.path.join(tree, "plugins", name, rel), data.replace(b'markdown', name.encode()))
+            _touch(os.path.join(tree, "plugins", name, "web/dist/.inputs-sha256"), b"0" * 64)
+            _touch(os.path.join(tree, "plugins", name, "web/src/main.ts"), b"source\n")
 
     def test_it_installs_the_desktop_entry_and_every_icon_from_the_source_tree(self):
         proc = self.package()
