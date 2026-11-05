@@ -1,5 +1,5 @@
 [English](many-agents.md) | 简体中文
-<!-- translated-from: many-agents.md sha256=7cf32d18621503137d1d48295a2b8038cbb027551c4d8e2c49bc62122ffd51fb -->
+<!-- translated-from: many-agents.md sha256=f72f9ad4bfaa89501482c36e1cab98c901e7049493f121414a18fcd76323337c -->
 
 # 同时用很多 agent
 
@@ -25,7 +25,7 @@
 ```lua
 eitri.plugin.load("agents-strips")
 eitri.plugin.load("agents-pass")
-eitri.plugin.load("agents-top", { key = "A" })    -- prefix then A shows or hides the table
+eitri.plugin.load("agents-top", { key = "g" })    -- prefix then g shows or hides the table
 ```
 
 Strips 有两个设置：`narrow`（窄条：给一个约 62 像素宽的模块画，只有一个图标、在等的状态和标签页编号，而不是完整的侧栏）和 `show_idle`（`false` 时空闲的行留在原位，但只画它们的图标）：
@@ -65,7 +65,7 @@ eitri.layout.rule("lua:agents-strips", { at = "left", size = 0.035 })
 | `/` | 过滤：Strips 把不匹配的行变暗，表格把它们隐藏 |
 | `Esc` | 把按键交给编辑器。在 The pass 里，如果有一轮正在进行，`Esc` 改为结束这一轮，回到这一轮开始的地方 |
 
-Strips 另有 `m` 标记一行。表格另有 `s` 循环切换排序（状态、时间、项目、标签），`S` 反向，并且它是唯一会重新排序的页面，因为你是打开它、读、再关上它，就像用 `top` 一样。它自己没有关闭键：再按它的模块键（上面的 `<prefix> A`）就会把它隐藏。
+Strips 另有 `m` 标记一行。表格另有 `s` 循环切换排序（状态、时间、项目、标签），`S` 反向，并且它是唯一会重新排序的页面，因为你是打开它、读、再关上它，就像用 `top` 一样。它自己没有关闭键：再按它的模块键（上面的 `<prefix> g`）就会把它隐藏。
 
 - **回答仍然在聊天里。** 没有任何页面有回答卡片、提问或信任问题的键。当这一轮当前的那个 agent 不再需要你（你在它的聊天里回答了），这一轮会自己移到下一个，而下一个聊天的回答键在它到达后要等四分之一秒，所以你还在按的键，不会去回答一张你没读过的卡片。任何页面、`prefix u` 或 `prefix a` 把一个聊天带到前面时，同样要等这四分之一秒。
 - **停止在聊天里问。** `x` 把聊天带到前面，它自己画出 `Stop this turn? (y/n)`（Claude Code 在做聊天里显示不出来的事、行显示为 `running` 时也是这样），只有后台任务在运行时画出 `Stop the background work? (y/n)`。`y` 停止；`n` 或 `Esc` 什么也不做。什么都没在运行的 agent 会被拒绝（`idle`），在伴随面板里也一样，而且什么都不会被带到前面。

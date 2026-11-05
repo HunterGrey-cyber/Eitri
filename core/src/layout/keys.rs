@@ -419,6 +419,39 @@ mod tests {
         assert!(keys.lua_keys().is_empty());
     }
 
+    /// Every module key the user guide's Lua examples give a page (`eitri.plugin.load(..., { key = ... })` and a
+    /// `key = ...` field of `eitri.panel.register`) is one a window takes with the default table, so a reader who
+    /// copies an example gets the key it names instead of a startup problem.
+    #[test]
+    fn every_module_key_in_the_guides_lua_examples_is_free_by_default() {
+        let guide = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../publish/files/docs/guide");
+        let keymap = Keymap::defaults();
+        let mut seen = 0;
+        let mut refused = Vec::new();
+        for entry in std::fs::read_dir(&guide).expect("the guide directory") {
+            let path = entry.expect("a guide entry").path();
+            if path.extension().and_then(|e| e.to_str()) != Some("md") {
+                continue;
+            }
+            let text = std::fs::read_to_string(&path).expect("a guide page");
+            for (n, line) in text.lines().enumerate() {
+                let Some(at) = line.find("key = \"") else { continue };
+                if !(line.contains("eitri.plugin.load(") || line.trim_start().starts_with("key = \"")) {
+                    continue;
+                }
+                let rest = &line[at + "key = \"".len()..];
+                let Some(end) = rest.find('"') else { continue };
+                let key = &rest[..end];
+                seen += 1;
+                if let Err(e) = build_one(key, &keymap) {
+                    refused.push(format!("{}:{}: {e}", path.display(), n + 1));
+                }
+            }
+        }
+        assert!(seen >= 5, "the guide's examples were not found ({seen})");
+        assert!(refused.is_empty(), "{refused:#?}");
+    }
+
     #[test]
     fn a_lua_panel_key_is_added_in_registration_order() {
         let keys = ModuleKeys::build(

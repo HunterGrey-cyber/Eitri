@@ -30,7 +30,7 @@ All three are plugins that ship with Eitri and are off until `init.lua` loads th
 ```lua
 eitri.plugin.load("agents-strips")
 eitri.plugin.load("agents-pass")
-eitri.plugin.load("agents-top", { key = "A" })    -- prefix then A shows or hides the table
+eitri.plugin.load("agents-top", { key = "g" })    -- prefix then g shows or hides the table
 ```
 
 Strips has two settings: `narrow` (a narrow rail, drawn for a module about 62 pixels wide, with a glyph, what waits and the
@@ -83,7 +83,7 @@ The keys inside a page:
 
 Strips adds `m` to mark a row. The table adds `s` to cycle the sort (state, age, project, label), `S` to reverse it,
 and it is the one page that re-sorts, because you open it, read it and close it, as you do `top`. It has no close key of
-its own: its module key (`<prefix> A` above) hides it again.
+its own: its module key (`<prefix> g` above) hides it again.
 
 - **Answering stays in the chat.** No page has a key that answers a card or a question or the trust question. When the
   round's current agent stops needing you (you answered in its chat), the round moves to the next one by itself, and

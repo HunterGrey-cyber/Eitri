@@ -1,5 +1,5 @@
 [English](pages.md) | 简体中文
-<!-- translated-from: pages.md sha256=5d1454339c1b17ff738cdf41d682f93eb780c8d3b8d59bb582250baa94dfcfc1 -->
+<!-- translated-from: pages.md sha256=e453566e8fdf7a8d1eb0a5e3782e898cf5a713d8cd5143572cbbe920a52bdee7 -->
 
 # 你自己做的页面
 
@@ -27,7 +27,7 @@ eitri.panel.register{
   id = "status",                                  -- the module is lua:status
   title = "Status",                               -- the name on its chip and in the tray
   position = "side",                              -- "side", "bottom" or "main", where it goes the first time
-  key = "u",                                      -- optional: <prefix> u shows it and gives it the keys
+  key = "h",                                      -- optional: <prefix> h shows it and gives it the keys
   content = { type = "webview", url = "status.html" },
 }
 ```

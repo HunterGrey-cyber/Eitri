@@ -37,7 +37,7 @@ eitri.panel.register{
   id = "status",                                  -- the module is lua:status
   title = "Status",                               -- the name on its chip and in the tray
   position = "side",                              -- "side", "bottom" or "main", where it goes the first time
-  key = "u",                                      -- optional: <prefix> u shows it and gives it the keys
+  key = "h",                                      -- optional: <prefix> h shows it and gives it the keys
   content = { type = "webview", url = "status.html" },
 }
 ```
