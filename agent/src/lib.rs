@@ -34,6 +34,9 @@ mod session_stub;
 mod steer_gate;
 /// Runs a test body under a chosen umask in a child copy of the test binary, so the process-wide
 /// umask is never changed while other tests create files.
+/// A throwaway directory under the temp dir that is removed on drop, panics included.
+#[cfg(test)]
+mod test_tmp;
 #[cfg(test)]
 mod test_umask;
 #[cfg(feature = "legacy-backend")]

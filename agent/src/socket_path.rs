@@ -148,18 +148,19 @@ pub(crate) fn require_own_peer(peer_uid: u32) -> io::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_tmp::TmpDir;
 
     /// What `std::env::temp_dir()` is on this project's Mac mini, byte for byte in length. Every
     /// user's `/var/folders/<2>/<28>/T/` has this shape, so this is the real worst case there
     /// rather than a guess.
     const MACOS_TEMP_DIR: &str = "/var/folders/33/0tqfpnyn4z3c049gljzppdv00000gn/T/";
 
-    fn scratch(label: &str) -> PathBuf {
+    /// A directory of its own, removed when the test ends however it ends.
+    fn scratch(label: &str) -> TmpDir {
         use std::os::unix::fs::PermissionsExt;
-        let dir = std::env::temp_dir().join(format!("nv-sock-dir-{label}-{}", uuid::Uuid::new_v4().simple()));
-        std::fs::create_dir(&dir).unwrap_or_else(|e| panic!("create_dir {dir:?}: {e}"));
+        let dir = TmpDir::new("nv-sock-dir", label);
         // 0755 whatever the umask: a directory a private one is made in must not be group-writable.
-        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o755))
+        std::fs::set_permissions(&*dir, std::fs::Permissions::from_mode(0o755))
             .unwrap_or_else(|e| panic!("chmod {dir:?}: {e}"));
         dir
     }
@@ -277,7 +278,8 @@ mod tests {
     #[test]
     fn a_temp_dir_that_is_a_symlink_to_a_safe_directory_is_accepted() {
         let real = scratch("real");
-        let link = scratch("link").join("tmp");
+        let link_dir = scratch("link");
+        let link = link_dir.join("tmp");
         std::os::unix::fs::symlink(&real, &link).unwrap();
         assert_eq!(private_socket_dir(None, &link, 5).unwrap(), link.join("eitri-5"));
     }
@@ -321,9 +323,17 @@ mod tests {
         let name = format!("{stem}{}", "x".repeat(name_len - stem.len()));
         let path = in_dir(&dir, &name).unwrap();
         assert_eq!(path.as_os_str().len(), MAX_SOCKET_PATH_BYTES);
+        // The socket file sits directly in the shared temp dir (the length is the point), so it is
+        // removed on every way out.
+        struct Unlink<'a>(&'a Path);
+        impl Drop for Unlink<'_> {
+            fn drop(&mut self) {
+                let _ = std::fs::remove_file(self.0);
+            }
+        }
+        let _unlink = Unlink(&path);
         let listener = std::os::unix::net::UnixListener::bind(&path).expect("a 103-byte path must bind");
         drop(listener);
-        let _ = std::fs::remove_file(&path);
 
         #[cfg(target_os = "macos")]
         {

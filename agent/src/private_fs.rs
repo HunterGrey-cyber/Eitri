@@ -1262,6 +1262,7 @@ mod publish_test_hooks {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_tmp::TmpDir;
     use std::os::unix::fs::PermissionsExt;
 
     #[test]
@@ -1427,10 +1428,9 @@ mod tests {
         path.symlink_metadata().unwrap().mode() & 0o777
     }
 
-    fn scratch(label: &str) -> std::path::PathBuf {
-        let dir = std::env::temp_dir().join(format!("nv-private-fs-{label}-{}", uuid::Uuid::new_v4().simple()));
-        std::fs::create_dir(&dir).unwrap();
-        dir
+    /// A directory of its own under the temp dir, removed when the test ends however it ends.
+    fn scratch(label: &str) -> TmpDir {
+        TmpDir::new("nv-private-fs", label)
     }
 
     /// Umask 002 otherwise permits group writes (`0775`/`0664`); the modes here are set
@@ -1885,15 +1885,14 @@ mod tests {
         {
             return;
         }
-        let ours = shared.join(format!("nv-private-fs-root-{}", uuid::Uuid::new_v4().simple()));
-        std::fs::create_dir(&ours).unwrap();
+        // Made in `/tmp` itself, not the test's temp dir: the point is a root that is someone else's.
+        let ours = TmpDir::in_dir(shared, "nv-private-fs", "root");
         let err = create_private_dir_all(&ours.join("permissions"), shared).unwrap_err();
         assert_eq!(err.kind(), std::io::ErrorKind::PermissionDenied, "{err}");
         assert!(
             !ours.join("permissions").exists(),
             "nothing is created below a foreign root"
         );
-        std::fs::remove_dir(&ours).unwrap();
     }
 
     /// What Eitri reads back must be a regular file of this user: a FIFO would block the read for
@@ -1939,7 +1938,7 @@ mod tests {
     }
 
     /// A scratch directory a config directory may sit in, whatever the umask made it.
-    fn config_scratch(label: &str) -> std::path::PathBuf {
+    fn config_scratch(label: &str) -> TmpDir {
         let base = scratch(label);
         set_mode(&base, 0o700);
         base
@@ -2236,7 +2235,7 @@ mod tests {
         }
     }
 
-    fn new_config_dir(label: &str) -> (std::path::PathBuf, std::path::PathBuf, OwnedFd) {
+    fn new_config_dir(label: &str) -> (TmpDir, std::path::PathBuf, OwnedFd) {
         let base = config_scratch(label);
         let dir = base.join("eitri");
         let handle = open_user_config_dir(&dir).unwrap();
@@ -2480,7 +2479,7 @@ mod tests {
 
     /// A scratch directory and a handle on it. The mode is set first: under a narrow umask the scratch
     /// itself comes out without the owner's bits.
-    fn scratch_handle(label: &str) -> (std::path::PathBuf, std::fs::File) {
+    fn scratch_handle(label: &str) -> (TmpDir, std::fs::File) {
         let dir = scratch(label);
         std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700)).unwrap();
         let handle = open_dir(&dir).unwrap();

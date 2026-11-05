@@ -437,7 +437,22 @@ pub(crate) mod tests {
 
     impl Drop for Scratch {
         fn drop(&mut self) {
-            let _ = std::fs::remove_dir_all(&self.1);
+            // A worker thread a test started (the editor record's writer, for one) is not joined and can
+            // still write here for a moment after the test's last line, which makes the directory again
+            // under a removal. So the directory must stay gone for a while, up to 5 s.
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+            let mut absent_since = None;
+            while std::time::Instant::now() < deadline {
+                if self.1.exists() {
+                    let _ = std::fs::remove_dir_all(&self.1);
+                    absent_since = None;
+                } else if absent_since.get_or_insert_with(std::time::Instant::now).elapsed()
+                    > std::time::Duration::from_millis(50)
+                {
+                    return;
+                }
+                std::thread::sleep(std::time::Duration::from_millis(5));
+            }
         }
     }
 

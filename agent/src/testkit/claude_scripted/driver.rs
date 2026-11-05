@@ -1705,8 +1705,9 @@ mod tests {
         }
     }
 
-    fn run_dir() -> PathBuf {
-        let run = std::env::temp_dir().join(format!("driver-{}", uuid::Uuid::new_v4()));
+    /// A run directory of the test's own, removed when the test ends however it ends.
+    fn run_dir() -> crate::test_tmp::TmpDir {
+        let run = crate::test_tmp::TmpDir::new("driver", "run");
         std::fs::create_dir_all(run.join("log")).unwrap();
         std::fs::create_dir_all(run.join("gates")).unwrap();
         run

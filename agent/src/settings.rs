@@ -175,10 +175,7 @@ mod tests {
         entries
     }
 
-    fn tempfile_dir() -> std::path::PathBuf {
-        let dir = std::env::temp_dir().join(format!("eitri-settings-test-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).unwrap();
-        dir
+    fn tempfile_dir() -> crate::test_tmp::TmpDir {
+        crate::test_tmp::TmpDir::new("eitri-settings-test", "dir")
     }
 }

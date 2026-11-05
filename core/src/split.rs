@@ -206,11 +206,29 @@ mod tests {
         }
     }
 
-    fn scratch(case: &str) -> PathBuf {
+    /// A directory of the test's own under the temp dir, removed when the test ends however it ends.
+    /// Its name stays short: a split socket is bound under such a directory and a socket path is
+    /// capped at 103 bytes.
+    struct Scratch(PathBuf);
+
+    impl std::ops::Deref for Scratch {
+        type Target = Path;
+        fn deref(&self) -> &Path {
+            &self.0
+        }
+    }
+
+    impl Drop for Scratch {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    fn scratch(case: &str) -> Scratch {
         let dir = std::env::temp_dir().join(format!("sp-{}-{case}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
-        dir
+        Scratch(dir)
     }
 
     #[test]

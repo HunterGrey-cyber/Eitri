@@ -10,6 +10,7 @@
 
 use std::ops::Deref;
 use std::path::{Path, PathBuf};
+use std::time::{Duration, Instant};
 
 /// Owns a directory under the system temp dir and removes it (recursively) on drop.
 ///
@@ -54,6 +55,19 @@ impl AsRef<Path> for ScratchDir {
 
 impl Drop for ScratchDir {
     fn drop(&mut self) {
-        let _ = std::fs::remove_dir_all(&self.outer);
+        // A worker thread a test started (the editor record's writer, for one) is not joined and can still
+        // write here for a moment after the test's last line, which makes the directory again under a
+        // removal. So the directory must stay gone for a while, up to 5 s.
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let mut absent_since = None;
+        while Instant::now() < deadline {
+            if self.outer.exists() {
+                let _ = std::fs::remove_dir_all(&self.outer);
+                absent_since = None;
+            } else if absent_since.get_or_insert_with(Instant::now).elapsed() > Duration::from_millis(50) {
+                return;
+            }
+            std::thread::sleep(Duration::from_millis(5));
+        }
     }
 }
