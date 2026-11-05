@@ -486,12 +486,12 @@ pub struct LiveSession {
     grace_wake: RefCell<Option<exit_wake::Wake>>,
     /// Which session this is ([`NeovideEditorPane::session_serial`]), never reused in the process.
     serial: u64,
-    /// The pane's own nvim a followed `:connect` left, and its address: it runs on with no UI, unless
-    /// a banged `:connect` stopped it. Held only to say whether it still runs
-    /// ([`NeovideEditorPane::left_running`]); nothing signals or ends it.
     /// Whether this session's nvim is the server a followed `:restart` started: its parent was the nvim before
     /// it, so a launcher has nothing to do with how it outlives the fork's report.
     restarted: bool,
+    /// The pane's own nvim a followed `:connect` left, and its address: it runs on with no UI, unless
+    /// a banged `:connect` stopped it. Held only to say whether it still runs
+    /// ([`NeovideEditorPane::left_running`]); nothing signals or ends it.
     left: Option<(Arc<nvim_child::NvimProcess>, Option<String>)>,
 }
 
@@ -1438,8 +1438,6 @@ fn record_end(session: &LiveSession, slot: &RefCell<Option<PaneEnded>>) -> Optio
     Some(how)
 }
 
-/// The line the service logs when it tells the host nvim is out of reach: its process outlived the fork's report of
-/// its exit by [`UNREACHABLE_GRACE`]. Only nvim run behind a launcher is said to have been left by one.
 /// How the nvim a session holds came to run, for the line that says it outlived the fork's report of its exit.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum NvimStart {
@@ -1451,6 +1449,9 @@ enum NvimStart {
     Restart,
 }
 
+/// The line the service logs when it tells the host nvim is out of reach: its process outlived the fork's report of
+/// its exit by [`UNREACHABLE_GRACE`]. Only nvim run behind a launcher is said to have been left by one, and the
+/// server a followed `:restart` started is named as such.
 fn unreachable_log_line(start: NvimStart) -> String {
     let why = match start {
         NvimStart::Direct => "",

@@ -199,6 +199,44 @@ fn the_liveness_timer_tears_down_when_either_channel_goes() {
     }
 }
 
+/// The fork's record takes itself out once its channel is gone (its own 500 ms look), so the glue may find no
+/// record on the tick after the fork's channel went: it keeps the channel it saw and still tears down. Both phases of
+/// the fork's removal against the glue's tick: at once with the channel's end, and a quarter second later.
+#[test]
+#[ignore = "needs nvim on PATH; uses stdio and no display"]
+fn a_fork_record_that_went_with_its_channel_still_tears_the_glue_down() {
+    for removed_after_ms in [0u64, 250] {
+        let nvim = ready();
+        let link = nvim.helper_channel();
+        let fork = nvim.helper_channel();
+        install(&nvim, link);
+        nvim.exec_lua("_G.__neovide_attach = {chan=...}", vec![fork.into()]);
+        // Long enough for the glue's timer to have seen the record at least once.
+        nvim.exec_lua("vim.wait(700, function() return false end, 10)", vec![]);
+        nvim.close_channel(fork);
+        nvim.exec_lua(
+            "local after = ...; vim.wait(after, function() return false end, 5); _G.__neovide_attach = nil",
+            vec![removed_after_ms.into()],
+        );
+        let gone = nvim
+            .exec_lua(
+                "return vim.wait(1500, function() return __eitri_companion == nil end, 10)",
+                vec![],
+            )
+            .as_bool();
+        assert_eq!(
+            gone,
+            Some(true),
+            "the glue outlived the fork's channel when its record went {removed_after_ms} ms after it"
+        );
+        assert_eq!(
+            nvim.exec_lua("return __eitri_window == nil and vim.g.eitri == nil", vec![])
+                .as_bool(),
+            Some(true)
+        );
+    }
+}
+
 #[test]
 #[ignore = "needs nvim on PATH; uses stdio and no display"]
 fn take_back_tears_down_and_closes_the_fork_channel() {

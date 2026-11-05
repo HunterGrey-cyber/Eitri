@@ -242,6 +242,35 @@ assert(vim.deep_equal(seen, {
     );
 }
 
+/// With no room on the command line at all, nothing is shown (an empty notice would still be a message), and the whole
+/// failure is kept in eitri.log, in a log directory made private to its owner.
+#[test]
+#[ignore = "needs a real nvim with serverstart() socket access"]
+fn with_no_room_nothing_is_shown_and_the_whole_failure_is_kept_privately() {
+    check(
+        "noroom",
+        r#"
+local seen = {}
+vim.notify = function(text, level) table.insert(seen, {text = text, level = level}) end
+-- The test's own scratch directory (the stub's argv log sits there), never the user's home.
+vim.env.XDG_STATE_HOME = vim.fn.fnamemodify(vim.env.ARGV_LOG, ':h') .. '/fresh-state'
+local logdir = vim.fn.stdpath('log')
+assert(vim.fn.isdirectory(logdir) == 0, logdir .. ' is there already')
+vim.o.columns = 12
+vim.o.showcmd = true
+vim.o.ruler = true
+assert(vim.v.echospace <= 0, 'echospace ' .. vim.v.echospace)
+vim.env.REFUSED_AFTER = 'the editor refused the follow snippet; closing'
+require('eitri').panel()
+local log = logdir .. '/eitri.log'
+assert(vim.wait(3000, function() return vim.fn.filereadable(log) == 1 end), 'nothing kept: ' .. vim.inspect(seen))
+assert(#seen == 0, 'something was shown: ' .. vim.inspect(seen))
+assert(table.concat(vim.fn.readfile(log), '\n'):find('eitri panel: the editor refused the follow snippet; closing', 1, true))
+assert(vim.fn.getfperm(logdir) == 'rwx------', 'the log directory is ' .. vim.fn.getfperm(logdir))
+"#,
+    );
+}
+
 /// What the window says after its "running;" line is the last line it wrote: a refusal found once it was up stays
 /// an error carrying that text, for the page and the panel alike.
 #[test]

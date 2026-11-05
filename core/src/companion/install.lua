@@ -169,10 +169,14 @@ state.timer:start(500, 500, vim.schedule_wrap(function()
     return
   end
   if takeover then
-    local fork = rawget(_G, "__neovide_attach")
-    local fork_chan = type(fork) == "table" and fork.chan or nil
-    if fork_chan then
-      local fork_ok, fork_info = pcall(vim.api.nvim_get_chan_info, fork_chan)
+    -- The fork's channel is kept from the first tick that sees its record: the record takes itself out once that
+    -- channel is gone (its own look at the channel), so a later tick may find no record at all.
+    if state.fork_chan == nil then
+      local fork = rawget(_G, "__neovide_attach")
+      state.fork_chan = type(fork) == "table" and fork.chan or nil
+    end
+    if state.fork_chan then
+      local fork_ok, fork_info = pcall(vim.api.nvim_get_chan_info, state.fork_chan)
       if fork_ok and fork_info.id == nil then teardown() end
     end
   end

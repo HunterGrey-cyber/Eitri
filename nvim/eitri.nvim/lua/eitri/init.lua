@@ -83,7 +83,7 @@ local LOG_KEEP = 400
 local function keep_whole(stderr)
   pcall(function()
     local dir = vim.fn.stdpath("log")
-    vim.fn.mkdir(dir, "p")
+    vim.fn.mkdir(dir, "p", 448) -- 0700: the log holds what windows wrote
     local path = dir .. "/eitri.log"
     local lines = vim.fn.filereadable(path) == 1 and vim.fn.readfile(path, "", -LOG_KEEP) or {}
     local stamp = os.date("%Y-%m-%d %H:%M:%S")
@@ -103,7 +103,9 @@ local function one_line(text)
     text = head .. file
     if fits(text) then return text, true end
   end
-  local n = math.max(width - 1, 0)
+  -- No room at all: nothing is shown, and the whole text is still kept.
+  if width <= 0 then return "", true end
+  local n = width - 1
   local cut = vim.fn.strcharpart(text, 0, n) .. "…"
   while n > 0 and not fits(cut) do
     n = n - 1
@@ -116,7 +118,7 @@ end
 local function report(text, level, stderr)
   local shown, cut = one_line(text)
   if cut then keep_whole(stderr) end
-  vim.notify(shown, level)
+  if shown ~= "" then vim.notify(shown, level) end
 end
 
 function M.page(id, dir)
