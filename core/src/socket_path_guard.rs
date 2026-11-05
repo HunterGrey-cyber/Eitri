@@ -75,24 +75,43 @@ fn every_sock_path_in_this_crate_is_built_through_agent_socket_path() {
             return;
         }
         let text = std::fs::read_to_string(file).unwrap();
-        let lines: Vec<&str> = text.lines().collect();
-        for (n, line) in lines.iter().enumerate() {
-            let code = line.trim_start();
-            // A name that reaches `in_dir` is checked by it, however rustfmt broke the call up.
-            if code.starts_with("//") || !mentions_a_sock_file(code) || routed_through_in_dir(&lines, n) {
-                continue;
-            }
-            if NEVER_BOUND.iter().any(|(f, s)| *f == rel && code.contains(s)) {
-                continue;
-            }
-            offenders.push(format!("{rel}:{}: {code}", n + 1));
-        }
+        offenders.extend(offenders_in(&rel, &text));
     });
     assert!(
         offenders.is_empty(),
         "socket paths built outside agent::socket_path escape its length check:\n{}",
         offenders.join("\n")
     );
+}
+
+/// The lines of `text` (the file `rel`) that name a socket file outside an `in_dir` call and
+/// outside [`NEVER_BOUND`].
+fn offenders_in(rel: &str, text: &str) -> Vec<String> {
+    let lines: Vec<&str> = text.lines().collect();
+    let mut offenders = Vec::new();
+    for (n, line) in lines.iter().enumerate() {
+        let code = line.trim_start();
+        // A name that reaches `in_dir` is checked by it, however rustfmt broke the call up.
+        if code.starts_with("//") || !mentions_a_sock_file(code) || routed_through_in_dir(&lines, n) {
+            continue;
+        }
+        if NEVER_BOUND.iter().any(|(f, s)| *f == rel && code.contains(s)) {
+            continue;
+        }
+        offenders.push(format!("{rel}:{}: {code}", n + 1));
+    }
+    offenders
+}
+
+/// The walk would let nothing through if the check itself stopped matching: a name joined by hand
+/// is an offender, the same name passed to a wrapped `in_dir` call is not.
+#[test]
+fn a_socket_name_joined_by_hand_is_an_offender() {
+    let by_hand = "fn p(dir: &Path, i: &str) -> PathBuf {\n    dir.join(format!(\"ag-{i}.sock\"))\n}\n";
+    assert_eq!(offenders_in("src/agents/control.rs", by_hand).len(), 1);
+    let wrapped = "fn p(dir: &Path, i: &str) -> io::Result<PathBuf> {\n    agent::socket_path::in_dir(\n        \
+                   dir,\n        &format!(\"ag-{i}.sock\"),\n    )\n}\n";
+    assert_eq!(offenders_in("src/agents/control.rs", wrapped), Vec::<String>::new());
 }
 
 /// Every entry on [`NEVER_BOUND`] still matches a real line. Without this an allowlist rots

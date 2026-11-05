@@ -1,5 +1,6 @@
 //! Read-only summaries of agent tabs, shared by windows and command-line readers.
 
+pub mod control;
 pub mod row;
 pub mod state;
 pub mod wire;
