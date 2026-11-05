@@ -78,6 +78,14 @@ pub struct TabHandoff {
     user_answered: BTreeSet<String>,
     /// The session's turn review, for the window the tab lands in to go on reviewing it.
     review: Option<ReviewHandoff>,
+    /// The tab's name for its whole life. A record from a peer that predates it has none, and the tab then gets a
+    /// new one where it lands.
+    #[serde(default)]
+    row_key: RowKey,
+    /// When each waiting card and question was first seen and when the tab entered its state, so a row's
+    /// `waiting_since` and `since` read the same in the window it lands in: both windows read the same wall clock.
+    #[serde(default)]
+    agent_watch: AgentWatch,
     #[cfg(any(test, feature = "test-support"))]
     #[serde(default)]
     gate_log: Vec<crate::agent_backend::GateAnswer>,
@@ -398,9 +406,8 @@ fn handoff_of(tab: &Tab, review: Option<ReviewHandoff>) -> TabHandoff {
         notes,
         // Handles into this window's review; the other window's review makes its own.
         review_watchers: _,
-        // First-seen times of waiting items and the current state's start, on this process's clock: the window
-        // the tab lands in stamps its own waits afresh.
-        agent_watch: _,
+        agent_watch,
+        row_key,
         #[cfg(any(test, feature = "test-support"))]
         gate_log,
     } = tab;
@@ -516,6 +523,8 @@ fn handoff_of(tab: &Tab, review: Option<ReviewHandoff>) -> TabHandoff {
         human_allowed: human_allowed.clone(),
         user_answered: user_answered.clone(),
         review,
+        row_key: row_key.clone(),
+        agent_watch: agent_watch.clone(),
         #[cfg(any(test, feature = "test-support"))]
         gate_log: gate_log.clone(),
     }
@@ -1458,6 +1467,8 @@ impl TabSet {
             human_allowed,
             user_answered,
             review,
+            row_key,
+            agent_watch,
             #[cfg(any(test, feature = "test-support"))]
             gate_log,
         } = handoff;
@@ -1485,6 +1496,8 @@ impl TabSet {
         t.mode = mode;
         t.backend = backend;
         t.attention = attention_from(attention);
+        t.agent_watch = agent_watch;
+        t.row_key = row_key;
         t.failed_after_start = failed_after_start;
         t.failed_resume = failed_resume;
         t.last_handoff = last_handoff.and_then(|moved| {

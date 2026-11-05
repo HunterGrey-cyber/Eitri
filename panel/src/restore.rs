@@ -1246,6 +1246,7 @@ mod tests {
                 window: None,
                 turn_running: false,
                 draft: None,
+                row_key: None,
             })
             .collect();
         SavedTabs::from_parts(tabs, 0, Vec::new(), None)
@@ -2102,6 +2103,7 @@ mod tests {
                     window: None,
                     turn_running: false,
                     draft: None,
+                    row_key: None,
                 }],
                 Some(0),
             ));

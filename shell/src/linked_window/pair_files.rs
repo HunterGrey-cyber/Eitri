@@ -1469,6 +1469,7 @@ mod tests {
                 window: None,
                 turn_running: false,
                 draft: None,
+                row_key: None,
             }],
             0,
             Vec::new(),

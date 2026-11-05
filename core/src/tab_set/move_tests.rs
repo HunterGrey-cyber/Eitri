@@ -2387,3 +2387,312 @@ fn the_window_a_tab_lands_in_says_a_foreign_server_on_its_own_page() {
     assert!(dest.take_editor_notes().is_empty(), "once in this window too");
     let _ = source.hand_over(tab);
 }
+
+// ---- the row key and the wait stamps --------------------------------------------------------------------
+
+fn row_context() -> RowContext {
+    RowContext {
+        instance: "0123456789abcdef".into(),
+        project: crate::agents::ProjectRef {
+            key: "fedcba9876543210".into(),
+            name: "eitri".into(),
+        },
+        window: crate::agents::WindowRef {
+            instance: "0123456789abcdef".into(),
+            name: "1".into(),
+            focused: true,
+        },
+    }
+}
+
+fn is_key_shaped(key: &str) -> bool {
+    RowKey::parse(key).is_some_and(|parsed| parsed.as_str() == key)
+}
+
+/// The record a session's resume is matched with, as a project's records list it.
+fn record_of(session: &str) -> agent::ResumableSession {
+    agent::ResumableSession {
+        provider: "claude".into(),
+        provider_session_id: session.into(),
+        created_at: "1".into(),
+        updated_at: "2".into(),
+        title: None,
+        name: None,
+    }
+}
+
+/// `saved` brought back in a fresh window as a launch or a break's target brings it back: planned against its
+/// record, started into the window's empty tab. Returns the window and the tab that took the session.
+fn restored(saved: &SavedTabs, session: &str) -> (TabSet, TabId) {
+    let plan = crate::tab_restore::plan(saved, &[record_of(session)], &[], |_, _| false);
+    assert_eq!(plan.items.len(), 1, "the saved tab is planned");
+    let mut target = set();
+    let RestoreStep::Go(go) = target.begin_restore(plan, BypassPolicy::Ask) else {
+        panic!("nothing in bypass, nothing to ask")
+    };
+    let from = target.active();
+    target.start_restore(from, go, |_, _| Ok(RestoreConnect::Started(mpsc::channel().1)));
+    let tab = target
+        .tab_with_session(&AgentId::Claude, session)
+        .expect("the session came back in a tab");
+    (target, tab)
+}
+
+/// A live tab whose session id is known, so it is listed among the saved tabs.
+fn live_tab_with_session(set: &mut TabSet, dir: &Path) -> (Arc<RecordingProvider>, TabId) {
+    let (provider, tab) = live_tab(set, dir);
+    provider.queue_all(vec![opened(dir)]);
+    pump_until(set, dir, "the session id", |s| {
+        s.get(tab).unwrap().provider_session_id().is_some()
+    });
+    (provider, tab)
+}
+
+fn end_all(set: &mut TabSet) {
+    for removed in set.take_all() {
+        if let Some(retired) = removed.retired {
+            retired.into_backend().shutdown();
+        }
+    }
+}
+
+#[test]
+fn the_row_key_is_set_before_the_first_send() {
+    let dir = workspace("row-key-first-send");
+    let mut source = set();
+    let tab = source.active();
+    let before = source.get(tab).unwrap().row_key().clone();
+    assert!(is_key_shaped(before.as_str()), "{before}");
+    let (_provider, live) = live_tab_with_session(&mut source, &dir);
+    assert_eq!(live, tab);
+    assert_eq!(
+        source.get(tab).unwrap().row_key(),
+        &before,
+        "the session id appearing does not rename the tab"
+    );
+    let other = source.open(AgentId::Claude);
+    assert_ne!(
+        source.get(other).unwrap().row_key(),
+        &before,
+        "every tab has a key of its own"
+    );
+    end_all(&mut source);
+}
+
+#[test]
+fn a_tab_keeps_its_row_key_through_adopt_moved() {
+    let dir = workspace("row-key-adopt-moved");
+    let mut source = set();
+    let (provider, tab) = live_tab_with_session(&mut source, &dir);
+    let key = source.get(tab).unwrap().row_key().clone();
+    let mut dest = set();
+    let arrived = moved(&mut source, tab, &mut dest, provider.clone(), ViewId::BASE);
+    assert_eq!(dest.get(arrived).unwrap().row_key(), &key);
+    let row = dest
+        .agent_rows(&row_context(), &|_| true, 100)
+        .into_iter()
+        .find(|row| row.number == dest.get(arrived).unwrap().number)
+        .expect("the arrived tab's row");
+    assert_eq!(row.key, key.as_str(), "the row names the tab by its key");
+    let _ = source.hand_over(tab);
+    end_all(&mut dest);
+}
+
+#[test]
+fn an_unstarted_tab_keeps_its_row_key_through_adopt_moved_unstarted() {
+    let mut source = set();
+    let tab = source.active();
+    let key = source.get(tab).unwrap().row_key().clone();
+    let frozen = freeze_settled(&mut source, tab).expect("an empty tab moves");
+    let record: TabHandoff = serde_json::from_str(&serde_json::to_string(&frozen.tab).unwrap()).unwrap();
+    let mut dest = set();
+    let arrived = dest.adopt_moved_unstarted(record, ViewId::BASE).unwrap();
+    assert_eq!(dest.get(arrived).unwrap().row_key(), &key);
+    assert_ne!(
+        dest.tabs()
+            .iter()
+            .find(|t| t.id != arrived)
+            .map(|t| t.row_key().clone()),
+        Some(key),
+        "the destination's own tabs keep their own keys"
+    );
+}
+
+#[test]
+fn wait_stamps_move_with_the_tab() {
+    let mut source = set();
+    let tab = source.active();
+    source.get_mut(tab).unwrap().attention.resync(["p-1".to_string()]);
+    let before = source.agent_rows(&row_context(), &|_| true, 100).remove(0);
+    assert_eq!(before.waiting_since, Some(100));
+    let frozen = freeze_settled(&mut source, tab).expect("an empty tab moves");
+    let record: TabHandoff = serde_json::from_str(&serde_json::to_string(&frozen.tab).unwrap()).unwrap();
+    let mut dest = set();
+    let arrived = dest.adopt_moved_unstarted(record, ViewId::BASE).unwrap();
+    let number = dest.get(arrived).unwrap().number;
+    let after = dest
+        .agent_rows(&row_context(), &|_| true, 5_000)
+        .into_iter()
+        .find(|row| row.number == number)
+        .expect("the arrived tab's row");
+    assert_eq!(after.state, before.state);
+    assert_eq!(
+        after.waiting_since,
+        Some(100),
+        "the card has waited since it was first seen in the window it left"
+    );
+    assert_eq!(
+        after.since, before.since,
+        "the state did not change, so neither did its start"
+    );
+}
+
+#[test]
+fn a_handoff_without_the_new_fields_parses() {
+    let mut source = set();
+    let tab = source.active();
+    let key = source.get(tab).unwrap().row_key().clone();
+    source.get_mut(tab).unwrap().replace_draft("from an older peer".into());
+    let frozen = freeze_settled(&mut source, tab).expect("an empty tab moves");
+    let mut value = serde_json::to_value(&frozen.tab).unwrap();
+    let fields = value.as_object_mut().unwrap();
+    fields.remove("row_key");
+    fields.remove("agent_watch");
+    let record: TabHandoff = serde_json::from_value(value).expect("an older peer's record is read");
+    let mut dest = set();
+    let arrived = dest.adopt_moved_unstarted(record, ViewId::BASE).unwrap();
+    let t = dest.get(arrived).unwrap();
+    assert_eq!(t.draft(), "from an older peer");
+    assert!(is_key_shaped(t.row_key().as_str()), "a new key: {}", t.row_key());
+    assert_ne!(t.row_key(), &key);
+    let _ = source.hand_over(tab);
+
+    // A key that is no key's shape is read as none, never as a refusal of the record.
+    let next = source.active();
+    let frozen = freeze_settled(&mut source, next).expect("the next empty tab moves");
+    let mut value = serde_json::to_value(&frozen.tab).unwrap();
+    value["row_key"] = serde_json::json!("k-NOT-A-KEY");
+    let record: TabHandoff = serde_json::from_value(value).expect("a malformed key does not refuse the record");
+    let arrived = dest.adopt_moved_unstarted(record, ViewId::BASE).unwrap();
+    assert!(is_key_shaped(dest.get(arrived).unwrap().row_key().as_str()));
+}
+
+#[test]
+fn tab_break_carries_the_key_through_the_saved_record() {
+    let dir = workspace("row-key-tab-break");
+    let mut source = set();
+    let (_provider, tab) = live_tab_with_session(&mut source, &dir);
+    let key = source.get(tab).unwrap().row_key().clone();
+    // What the source sends with `tab_release` and the target reads from `tabs_given`.
+    let snapshot = source.saved_snapshot(PROJECT_ID).expect("the window is not closing");
+    let record = snapshot
+        .tabs
+        .iter()
+        .find(|t| t.provider_session_id == "sess-move")
+        .expect("the tab is listed");
+    assert_eq!(record.row_key.as_deref(), Some(key.as_str()));
+    let crossed = SavedTab::from_wire(&record.to_wire()).expect("the record crosses the link");
+    let given = SavedTabs::from_parts(vec![SavedTab { view: None, ..crossed }], 0, Vec::new(), None);
+    let (mut target, arrived) = restored(&given, "sess-move");
+    assert_eq!(target.get(arrived).unwrap().row_key(), &key);
+    end_all(&mut target);
+    end_all(&mut source);
+}
+
+#[test]
+fn a_restored_tab_keeps_its_key() {
+    let dir = workspace("row-key-restart");
+    let mut source = set();
+    let (_provider, tab) = live_tab_with_session(&mut source, &dir);
+    let key = source.get(tab).unwrap().row_key().clone();
+    let snapshot = source.saved_snapshot(PROJECT_ID).expect("the window is not closing");
+    let root = Path::new("/home/user/project");
+    let read_back = crate::saved_tabs::decode(&crate::saved_tabs::encode(&snapshot, root), root).unwrap();
+    let (mut target, arrived) = restored(&read_back, "sess-move");
+    assert_eq!(target.get(arrived).unwrap().row_key(), &key);
+    end_all(&mut target);
+    end_all(&mut source);
+}
+
+#[test]
+fn a_record_without_a_key_gets_a_new_one() {
+    for saved_key in [
+        None,
+        Some("not-a-key".to_string()),
+        Some("k-0123456789ABCDEF".to_string()),
+    ] {
+        let tab = SavedTab {
+            agent: AgentId::Claude,
+            conversation_id: PROJECT_ID.into(),
+            provider_session_id: "sess-old".into(),
+            name: None,
+            mode: SessionModeChoice::Auto,
+            view: None,
+            window: None,
+            turn_running: false,
+            draft: None,
+            row_key: saved_key.clone(),
+        };
+        let saved = SavedTabs::from_parts(vec![tab], 0, Vec::new(), None);
+        let (mut target, arrived) = restored(&saved, "sess-old");
+        let key = target.get(arrived).unwrap().row_key().clone();
+        assert!(is_key_shaped(key.as_str()), "{saved_key:?}: {key}");
+        assert_ne!(Some(key.as_str()), saved_key.as_deref(), "{saved_key:?}");
+        end_all(&mut target);
+    }
+}
+
+const PROJECT_ID: &str = "conv-0123456789abcdef";
+
+/// A given tab whose resume is refused leaves the window's empty tab empty again, and the key it brought goes back
+/// with the record: the empty tab must not keep it, or the source, taking the tab up again, would publish a second
+/// row under the same name.
+#[test]
+fn a_failed_restore_into_the_empty_tab_does_not_keep_the_records_key() {
+    let key = RowKey::new();
+    let tab = SavedTab {
+        agent: AgentId::Claude,
+        conversation_id: PROJECT_ID.into(),
+        provider_session_id: "sess-refused".into(),
+        name: None,
+        mode: SessionModeChoice::Auto,
+        view: None,
+        window: None,
+        turn_running: false,
+        draft: None,
+        row_key: Some(key.as_str().to_string()),
+    };
+    let saved = SavedTabs::from_parts(vec![tab], 0, Vec::new(), None);
+    let plan = crate::tab_restore::plan(&saved, &[record_of("sess-refused")], &[], |_, _| false);
+    let mut target = set();
+    let from = target.active();
+    let RestoreStep::Go(go) = target.begin_restore(plan, BypassPolicy::Ask) else {
+        panic!("nothing in bypass, nothing to ask")
+    };
+    let (tx, rx) = mpsc::channel();
+    let mut rx = Some(rx);
+    let mut run = target.start_restore(from, go, |_, _| Ok(RestoreConnect::Started(rx.take().unwrap())));
+    assert_eq!(
+        target.get(from).unwrap().row_key(),
+        &key,
+        "the tab taking the session takes its key"
+    );
+    tx.send(Err(BackendError {
+        message: "no such session".into(),
+        benign: false,
+    }))
+    .unwrap();
+    let mut discarded = false;
+    for collected in target.collect_starts() {
+        if let StartCollected::Failed { tab, error, .. } = collected {
+            run.note_failed(tab, &error.message);
+            target.discard_failed_restore(tab, run.back_to(tab));
+            discarded = true;
+        }
+    }
+    assert!(discarded, "the refusal was collected");
+    let empty = target.get(from).expect("the tab the restore began in stays");
+    assert!(matches!(empty.backend, TabBackend::NotStarted), "an empty tab again");
+    assert!(is_key_shaped(empty.row_key().as_str()), "{}", empty.row_key());
+    assert_ne!(empty.row_key(), &key, "the record's key went back with the record");
+}

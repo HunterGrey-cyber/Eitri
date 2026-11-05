@@ -515,6 +515,7 @@ fn planned(agent: AgentId, id: &str, mode: SessionModeChoice) -> PlannedTab {
         view: None,
         turn_running: false,
         draft: None,
+        row_key: None,
     }
 }
 
@@ -670,6 +671,7 @@ fn an_external_tab_is_saved_beside_the_claude_tabs_and_is_the_active_one() {
             window: None,
             turn_running: false,
             draft: None,
+            row_key: Some(set.get(tab).unwrap().row_key().as_str().into()),
         }]
     );
     assert_eq!(others_active(&saved), Some(0));

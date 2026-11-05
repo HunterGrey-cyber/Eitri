@@ -28,7 +28,7 @@ pub use crate::tabs::ViewId;
 use crate::tabs::{self, TabFacts, TabId};
 
 mod agent_rows;
-pub use agent_rows::{AgentWatch, RowContext};
+pub use agent_rows::{AgentWatch, RowContext, RowKey};
 
 mod live_edits;
 pub use live_edits::LiveEdit;
@@ -398,6 +398,9 @@ pub struct Tab {
     pub attention: AttentionTracker,
     /// First sightings of waiting items and the current summary state, owned by this tab.
     pub agent_watch: AgentWatch,
+    /// The tab's name for its whole life, here and in any window it moves to. Private so that only the set gives a
+    /// tab the key a move or a saved record brings; [`Tab::row_key`] reads it.
+    row_key: RowKey,
     /// Whether the session had been open when the tab went `Failed`, so the panel words the
     /// failure as a session that stopped rather than one that never started. Every place that
     /// swaps in `Failed` sets it; it means nothing while the backend is anything else.
@@ -719,6 +722,12 @@ impl Tab {
         &self.gate_log
     }
 
+    /// The tab's name for its whole life: minted with the tab, kept through a move, a break into another window and
+    /// a restart.
+    pub fn row_key(&self) -> &RowKey {
+        &self.row_key
+    }
+
     fn new(id: TabId, number: u16, mode: SessionModeChoice, agent: AgentId, following: bool) -> Self {
         Tab {
             following,
@@ -732,6 +741,7 @@ impl Tab {
             session: SessionState::default(),
             attention: AttentionTracker::default(),
             agent_watch: AgentWatch::default(),
+            row_key: RowKey::new(),
             failed_after_start: false,
             failed_resume: None,
             pending_handoff: None,
@@ -5345,6 +5355,7 @@ impl TabSet {
                         window: None,
                         turn_running: tab.turn_running(),
                         draft: crate::saved_tabs::draft_to_save(tab.draft()),
+                        row_key: Some(tab.row_key.as_str().to_string()),
                     },
                 ))
             })
@@ -5375,6 +5386,7 @@ impl TabSet {
                 window: None,
                 turn_running: granted.planned.turn_running,
                 draft: granted.planned.draft.clone(),
+                row_key: granted.planned.row_key.clone(),
             });
         }
         // A skipped tab's draft has no tab to wait in until the answer comes: the file keeps the entry until then.
@@ -5409,6 +5421,7 @@ impl TabSet {
                         window: None,
                         turn_running: tab.turn_running(),
                         draft: crate::saved_tabs::draft_to_save(tab.draft()),
+                        row_key: Some(tab.row_key.as_str().to_string()),
                     },
                 ))
             })
@@ -5442,6 +5455,7 @@ impl TabSet {
                     window: None,
                     turn_running: granted.planned.turn_running,
                     draft: granted.planned.draft.clone(),
+                    row_key: granted.planned.row_key.clone(),
                 },
             ));
         }
@@ -5798,6 +5812,7 @@ impl TabSet {
             let at = self.position(target).expect("route_resume names a tab it has");
             self.tabs[at].agent = planned.agent;
             self.give_mode(at, mode);
+            self.give_saved_row_key(at, planned.row_key.as_deref());
             self.give_restored_draft(target, planned.draft);
             let tab = &mut self.tabs[at];
             let request_id = format!("restore-{}", n + 1);
@@ -5945,6 +5960,7 @@ impl TabSet {
             let at = self.position(target).expect("route_resume names a tab it has");
             self.tabs[at].agent = planned.agent;
             self.give_mode(at, mode);
+            self.give_saved_row_key(at, planned.row_key.as_deref());
             self.give_restored_draft(target, planned.draft);
             let tab = &mut self.tabs[at];
             tab.failed_after_start = false;
@@ -5971,9 +5987,18 @@ impl TabSet {
         false
     }
 
+    /// The tab at `at` takes the row key of the saved record whose session it takes up, so a tab broken out into
+    /// another window or brought back after a restart keeps its name. A record without one (an older file or peer)
+    /// leaves the tab the key it was made with.
+    fn give_saved_row_key(&mut self, at: usize, saved: Option<&str>) {
+        if let Some(key) = saved.and_then(RowKey::parse) {
+            self.tabs[at].row_key = key;
+        }
+    }
+
     /// A restored tab whose resume failed. `back_to` is [`RestoreRun::back_to`]: an empty tab again, in
-    /// the mode it had before the restore, if it is the one the restore began in; gone if the restore
-    /// made it. What went wrong is reported once for the whole restore, not left as a dead tab each.
+    /// the mode it had before the restore and under a fresh row key, if it is the one the restore began in; gone if
+    /// the restore made it. What went wrong is reported once for the whole restore, not left as a dead tab each.
     pub fn discard_failed_restore(&mut self, tab: TabId, back_to: Option<(SessionModeChoice, AgentId)>) {
         if !matches!(self.get(tab).map(|t| &t.backend), Some(TabBackend::Failed { .. })) {
             return;
@@ -5985,6 +6010,9 @@ impl TabSet {
                     t.backend = TabBackend::NotStarted;
                     t.session.reported_start_failure = false;
                     t.agent = agent;
+                    // The restore gave this tab the record's key, and the record goes back unrestored (a hand-over
+                    // returns it to its source, which takes the key up again): the empty tab is named afresh.
+                    t.row_key = RowKey::new();
                     self.give_mode(at, mode);
                 }
             }

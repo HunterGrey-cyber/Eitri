@@ -75,6 +75,9 @@ pub struct PlannedTab {
     pub turn_running: bool,
     /// The composer's unsent text as it was saved.
     pub draft: Option<String>,
+    /// The row key the tab was saved with, which the tab that comes back takes; without one that tab keeps the key it
+    /// was made with.
+    pub row_key: Option<String>,
 }
 
 /// Which saved tabs to resume and which are skipped before any resume is tried.
@@ -159,6 +162,7 @@ pub fn plan(
             view: saved_view.and_then(ViewId::new).filter(|view| !view.is_base()),
             turn_running,
             draft,
+            row_key: tab.row_key.clone(),
         });
     }
     let active_session = saved.active_tab().map(|t| t.provider_session_id.clone());
@@ -210,6 +214,7 @@ impl RestorePlan {
                 window: None,
                 turn_running: item.turn_running,
                 draft: item.draft,
+                row_key: item.row_key,
             }),
             label: item.label,
             reason: NOT_REGISTERED.to_string(),
@@ -397,6 +402,7 @@ mod tests {
                     window: None,
                     turn_running: false,
                     draft: None,
+                    row_key: None,
                 })
                 .collect(),
             active,
@@ -456,6 +462,7 @@ mod tests {
             window: None,
             turn_running: false,
             draft: None,
+            row_key: None,
         };
         let bar = vec![
             (AgentId::Claude, "a".to_string()),
@@ -504,6 +511,7 @@ mod tests {
             window: None,
             turn_running: false,
             draft: Some(format!("typed for {id}")),
+            row_key: None,
         };
         let saved = SavedTabs::from_parts(
             vec![tab(AgentId::Claude, "a"), tab(AgentId::Claude, "gone")],
@@ -565,6 +573,7 @@ mod tests {
             window: None,
             turn_running: false,
             draft: None,
+            row_key: None,
         };
         saved.tabs.extend([acp("gem", "g-1"), acp("gone", "x-1")]);
         let acp_record = |name: &str, id: &str| ResumableSession {
@@ -650,6 +659,7 @@ mod tests {
             window: None,
             turn_running: false,
             draft: None,
+            row_key: None,
         });
         let records = [
             record("a", None, None),
@@ -699,6 +709,7 @@ mod tests {
             window: None,
             turn_running: false,
             draft: None,
+            row_key: None,
         });
         let acp_record = |name: &str| ResumableSession {
             provider: format!("acp:{name}"),

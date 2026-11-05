@@ -7,6 +7,75 @@ use crate::agents::{derive, Background, LabelFrom, Needs, ProjectRef, Row, State
 use crate::tabs::TabId;
 use std::collections::BTreeMap;
 
+/// A tab's own name for its whole life: `k-` and 16 lowercase hex digits, random, minted when the tab is made and kept
+/// when the tab moves to another window, is broken out into its own window, or comes back after a restart. A row's
+/// `id` names the tab only in the process that holds it, and the session id appears only after the first send.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub struct RowKey(String);
+
+impl RowKey {
+    const PREFIX: &'static str = "k-";
+    const HEX_DIGITS: usize = 16;
+
+    /// A fresh key from a random (v4) UUID, whose randomness the operating system supplies on every platform the core
+    /// builds for. Its trailing half is taken, which holds only the two variant bits fixed, so no digit of the key is
+    /// a constant. It is a name, not a secret.
+    pub fn new() -> RowKey {
+        let uuid = uuid::Uuid::new_v4();
+        let bytes = &uuid.as_bytes()[Self::HEX_DIGITS / 2..];
+        let mut text = String::with_capacity(Self::PREFIX.len() + Self::HEX_DIGITS);
+        text.push_str(Self::PREFIX);
+        for byte in bytes {
+            text.push_str(&format!("{byte:02x}"));
+        }
+        RowKey(text)
+    }
+
+    /// `text` when it is a key's exact shape; anything else (another build's or a hand edit's) is no key.
+    pub fn parse(text: &str) -> Option<RowKey> {
+        let hex = text.strip_prefix(Self::PREFIX)?;
+        let lower_hex = |b: u8| b.is_ascii_digit() || (b'a'..=b'f').contains(&b);
+        (hex.len() == Self::HEX_DIGITS && hex.bytes().all(lower_hex)).then(|| RowKey(text.to_string()))
+    }
+
+    /// The key a saved record carries, or a fresh one when it carries none a key could be.
+    pub fn from_saved(saved: Option<&str>) -> RowKey {
+        saved.and_then(RowKey::parse).unwrap_or_default()
+    }
+
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+/// A fresh key: a record written before tabs had keys, or by a peer that predates them, gives its tab a new one.
+impl Default for RowKey {
+    fn default() -> Self {
+        RowKey::new()
+    }
+}
+
+impl std::fmt::Display for RowKey {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+impl serde::Serialize for RowKey {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        serializer.serialize_str(&self.0)
+    }
+}
+
+/// Read leniently: a value that is no key's shape gives a fresh key rather than refusing the record it rides in, since
+/// losing a tab's key costs a face its place for that tab while refusing the record would lose the tab.
+impl<'de> serde::Deserialize<'de> for RowKey {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        let value = <serde_json::Value as serde::Deserialize>::deserialize(deserializer)?;
+        Ok(RowKey::from_saved(value.as_str()))
+    }
+}
+
 #[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
 #[serde(default)]
 pub struct AgentWatch {
@@ -128,7 +197,7 @@ impl TabSet {
             };
             let id = format!("{}.{}", ctx.instance, tab.id.0);
             let mut row = Row {
-                key: id.clone(),
+                key: tab.row_key().as_str().to_string(),
                 id,
                 agent: tab.agent.record_name(),
                 project: ctx.project.clone(),

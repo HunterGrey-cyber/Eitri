@@ -79,6 +79,10 @@ pub struct SavedTab {
     /// The composer's unsent text, for `s` to put back. Absent with nothing there, or with more than
     /// [`DRAFT_SAVE_MAX`]. This is what the person typed: nothing may log it.
     pub draft: Option<String>,
+    /// The tab's row key (`k-` and 16 lowercase hex digits), so the tab keeps its name when it is broken out into
+    /// another window or brought back after a restart. Absent from a file or a peer that predates keys, and read as
+    /// absent when it is no key's shape: the tab that comes back then keeps the key it was made with.
+    pub row_key: Option<String>,
 }
 
 impl SavedTab {
@@ -113,6 +117,7 @@ impl SavedTab {
             window: self.window,
             turn_running: self.turn_running,
             draft: self.draft.clone(),
+            row_key: self.row_key.clone(),
         };
         serde_json::to_value(entry).expect("a saved tab always serializes")
     }
@@ -134,6 +139,7 @@ impl SavedTab {
             window: entry.window,
             turn_running: entry.turn_running,
             draft: entry.draft,
+            row_key: entry.row_key,
         })
     }
 }
@@ -320,6 +326,16 @@ fn lenient_view<'de, D: serde::Deserializer<'de>>(d: D) -> Result<Option<u8>, D:
         .filter(|n| (2..=crate::layout::module::MAX_INSTANCE).contains(n)))
 }
 
+/// A row key of any other shape is read as absent, so a hand edit or another build's value never makes the file or a
+/// peer's record unusable; the tab that comes back then keeps the key it was made with.
+fn lenient_row_key<'de, D: serde::Deserializer<'de>>(d: D) -> Result<Option<String>, D::Error> {
+    let value = serde_json::Value::deserialize(d)?;
+    Ok(value
+        .as_str()
+        .and_then(crate::tab_set::RowKey::parse)
+        .map(|key| key.as_str().to_string()))
+}
+
 /// A draft of any other type is read as absent: the error that would say otherwise quotes the value, and a
 /// file's error goes to the log.
 fn lenient_draft<'de, D: serde::Deserializer<'de>>(d: D) -> Result<Option<String>, D::Error> {
@@ -384,6 +400,13 @@ struct ClaudeEntry {
     turn_running: bool,
     #[serde(default, skip_serializing_if = "Option::is_none", deserialize_with = "lenient_draft")]
     draft: Option<String>,
+    /// Absent from a file written before tabs had keys; an older build ignores it.
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "lenient_row_key"
+    )]
+    row_key: Option<String>,
 }
 
 /// One entry of `external_tabs`: another agent's tab, the agent named as its records name it
@@ -406,6 +429,13 @@ struct OtherEntry {
     turn_running: bool,
     #[serde(default, skip_serializing_if = "Option::is_none", deserialize_with = "lenient_draft")]
     draft: Option<String>,
+    /// Absent from a file written before tabs had keys; an older build ignores it.
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "lenient_row_key"
+    )]
+    row_key: Option<String>,
 }
 
 /// One entry of `external_tabs` as read: an agent this build does not know (a later build's) is kept
@@ -438,6 +468,7 @@ pub fn encode(saved: &SavedTabs, project_root: &Path) -> String {
                 window: t.window,
                 turn_running: t.turn_running,
                 draft: t.draft.clone(),
+                row_key: t.row_key.clone(),
             })
             .collect(),
         active: saved.rank(saved.claude_active, false).unwrap_or(0),
@@ -454,6 +485,7 @@ pub fn encode(saved: &SavedTabs, project_root: &Path) -> String {
                     window: t.window,
                     turn_running: t.turn_running,
                     draft: t.draft.clone(),
+                    row_key: t.row_key.clone(),
                 })
             })
             .collect(),
@@ -499,6 +531,7 @@ pub fn decode(text: &str, project_root: &Path) -> Result<SavedTabs, String> {
             window: t.window,
             turn_running: t.turn_running,
             draft: t.draft,
+            row_key: t.row_key,
         })
         .collect();
     // An agent this build does not know stays a hole, so the active index still finds its tab.
@@ -516,6 +549,7 @@ pub fn decode(text: &str, project_root: &Path) -> Result<SavedTabs, String> {
                 window: t.window,
                 turn_running: t.turn_running,
                 draft: t.draft,
+                row_key: t.row_key,
             }),
             ExternalEntry::Unknown(_) => None,
         })
@@ -1722,6 +1756,7 @@ mod tests {
             window: None,
             turn_running: false,
             draft: None,
+            row_key: None,
         }
     }
 
@@ -1870,6 +1905,7 @@ mod tests {
                 window: None,
                 turn_running: false,
                 draft: None,
+                row_key: None,
             }],
             None,
         );
@@ -2320,6 +2356,7 @@ mod tests {
             window: None,
             turn_running: false,
             draft: None,
+            row_key: None,
         }
     }
 
@@ -3044,6 +3081,62 @@ mod tests {
         );
     }
 
+    /// The row key rides in the file and across the link in both arrays, and a set without keys writes what it
+    /// always wrote (above).
+    #[test]
+    fn a_row_key_crosses_the_file_and_the_link() {
+        let keyed = |tab: SavedTab, key: &str| SavedTab {
+            row_key: Some(key.to_string()),
+            ..tab
+        };
+        let codex = SavedTab {
+            agent: AgentId::Codex,
+            ..keyed(tab("x-1", None, SessionModeChoice::Auto), "k-00000000000000ff")
+        };
+        let saved = SavedTabs::from_parts(
+            vec![keyed(tab("s-one", None, SessionModeChoice::Auto), "k-0123456789abcdef")],
+            0,
+            vec![codex],
+            None,
+        );
+        let text = encode(&saved, &root());
+        assert!(text.contains(r#""row_key": "k-0123456789abcdef""#), "{text}");
+        assert_eq!(decode(&text, &root()).unwrap(), saved);
+        assert_eq!(SavedTabs::from_wire(&saved.to_wire()).unwrap(), saved);
+        for one in &saved.tabs {
+            assert_eq!(&SavedTab::from_wire(&one.to_wire()).unwrap(), one);
+        }
+    }
+
+    /// A key that is no key's shape (a hand edit, another build's) is read as none, and never makes the file or the
+    /// record unusable.
+    #[test]
+    fn a_saved_key_of_another_shape_reads_as_absent() {
+        for key in [
+            r#""k-0123""#,
+            r#""K-0123456789abcdef""#,
+            r#""k-0123456789ABCDEF""#,
+            "17",
+            "null",
+            "{}",
+        ] {
+            let text = format!(
+                r#"{{"version":1,"project_root":"/home/user/project","tabs":[
+                {{"conversation_id":"c","provider_session_id":"s","mode":"auto","row_key":{key}}}],"active":0}}"#
+            );
+            let saved = decode(&text, &root()).unwrap();
+            assert_eq!(saved.tabs[0].row_key, None, "{key}");
+            let wire = serde_json::json!({
+                "agent": "codex",
+                "conversation_id": "c",
+                "provider_session_id": "s",
+                "mode": "auto",
+                "row_key": serde_json::from_str::<serde_json::Value>(key).unwrap(),
+            });
+            assert_eq!(SavedTab::from_wire(&wire).unwrap().row_key, None, "{key}");
+        }
+    }
+
     /// An older build's reader takes the keys it knows and leaves the rest, so `window` costs it nothing; a value no
     /// window can have reads as absent, as a view's does, rather than making the file unusable.
     #[test]
@@ -3124,6 +3217,7 @@ mod measure {
             window: None,
             turn_running: false,
             draft: None,
+            row_key: None,
         };
         let mut memory = TabMemory::new(Some(dir.clone()), root.to_path_buf());
         let mut times = Vec::new();

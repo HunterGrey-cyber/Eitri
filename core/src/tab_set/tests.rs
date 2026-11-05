@@ -329,6 +329,7 @@ fn planned(id: &str, mode: SessionModeChoice) -> PlannedTab {
         view: None,
         turn_running: false,
         draft: None,
+        row_key: None,
     }
 }
 
@@ -383,5 +384,6 @@ fn saved_tab_named(session: &str) -> SavedTab {
         window: None,
         turn_running: false,
         draft: None,
+        row_key: None,
     }
 }

@@ -573,6 +573,7 @@ fn set_restored_in_bypass() -> TabSet {
             view: None,
             turn_running: false,
             draft: None,
+            row_key: None,
         }],
         skipped: Vec::new(),
         active_session: Some("r1".into()),
