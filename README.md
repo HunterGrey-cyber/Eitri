@@ -65,6 +65,20 @@ between them with the same `Ctrl+h/j/k/l`. Add the `eitri.nvim` plugin and run `
 `:EitriPage markdown` (or `eitri page markdown` from a shell) starts it as a window of its own that follows the buffer
 you are editing: see [Pages beside your nvim](docs/guide/companion.md#pages-beside-your-nvim).
 
+## Privacy
+
+Eitri sends nothing anywhere on its own: no telemetry, no update check, no crash upload. If it crashes, it writes a
+log under `$XDG_STATE_HOME/eitri/log/` (default `~/.local/state/eitri/log/`) and tells you where; attaching it to an
+issue is up to you.
+
+It uses the network when you ask it to: the installer, `eitri setup` and `eitri sidecar check` or `update` download
+things, and a link you click opens in your browser. The one exception is the Markdown preview, which loads the `https`
+images a document points to, so the server hosting an image sees your address. To load none:
+`eitri.plugin.load("markdown", { remote_images = "off" })` ([Markdown preview](docs/guide/markdown-preview.md#images)).
+
+Claude Code and Codex are programs you installed, and Eitri runs them with your own settings. Whatever they send, and
+whatever update checks they make, is governed by their settings, not by Eitri.
+
 ## Install
 
 ```sh

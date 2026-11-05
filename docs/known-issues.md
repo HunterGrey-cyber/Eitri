@@ -82,6 +82,15 @@ distinguish real refresh-period feedback from the fallback clock.
   at the median while a stand-in reply streamed at the default 5 updates a second, on GTK 4.22.5 as well; with
   WebKitGTK 2.52 it was about 2.3 ms. A real reply has not been measured. If you see lag while typing during a
   reply, say so in the "Testing feedback" form, with your GPU and monitor refresh rate.
+- **The bottom terminal draws one output frame behind what you type.** Its echo reaches the screen about 18 ms after
+  the key at a 60 Hz output (8.7 ms at 165 Hz), measured in a headless sway session on an AMD desktop. Ghostty
+  (17.3 ms at the median), WezTerm (16.7) and the terminal in Zed (18.3) land in the same place; foot (1.0), kitty
+  (0.7) and alacritty (0.7) draw at once. The cause is that GTK 4.24 makes two commits of the window for each key and
+  the compositor shows the second one a refresh later; the terminal draws inside GTK's frame clock, which the editor
+  does not. We tried to remove the first commit and typing got slower (about 20 ms at either rate), so nothing ships.
+  If you want the lowest latency, run Neovim's own `:terminal` in the editor, which is drawn the way the editor is
+  (typing in a buffer took 1.7 ms at the median in the same run). A `:terminal` buffer's own latency has not been
+  measured, and none of this has been measured on a physical display.
 - **Memory:** one tab uses 253 to 283 MiB more than native Neovide, more than the 256 MiB we aim for, and each
   extra chat view about 28 MB more. That is the window's own share. Each Claude session behind a chat view also
   runs its own `claude` process (about 113 MB) and its own sidecar (86 to 145 MB), so a session costs about 230 MB
@@ -187,6 +196,21 @@ one-window mode.
   XWayland window never counts; moving back within about a third of a second of the previous move is refused; a
   terminal that runs all its windows in one process (GNOME Terminal, Ptyxis) gets focus handed back to its most
   recent window, which may not be nvim's; and a forwarded `eitri split` does not bring the panel forward.
+
+## What leaves your machine
+
+- **Eitri sends nothing anywhere on its own.** It has no telemetry, no update check and no crash upload; a crash
+  leaves a log under `$XDG_STATE_HOME/eitri/log/` (default `~/.local/state/eitri/log/`) that stays there. It uses the
+  network when you run the installer, `eitri setup` or `eitri sidecar check` / `update`, and when you click a link,
+  which your browser opens.
+- **The Markdown preview loads remote images by default.** An `https` image in the document is fetched when the
+  preview shows it, so the server hosting it sees your address and the time. `http` images are never loaded. To load
+  none, `eitri.plugin.load("markdown", { remote_images = "off" })` ([Markdown preview](guide/markdown-preview.md#images)).
+  The preview has no other network use.
+- **Claude Code and Codex keep their own settings.** Eitri runs the `claude` and `codex` you installed and does not
+  change their telemetry or update settings, so what they send follows your configuration for them.
+- **A Lua panel or a plugin that declares hosts may reach them** ([Pages you build](#pages-you-build)); that is
+  something you installed or configured.
 
 ## Security
 

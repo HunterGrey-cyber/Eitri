@@ -1,5 +1,5 @@
 [English](README.md) | 简体中文
-<!-- translated-from: README.md sha256=4dd076a1a4379c45d01b8e5591f5f5d09793bae7b70091be590ddf1b3e7df378 -->
+<!-- translated-from: README.md sha256=ae45aa75858ba011b3b3688e38d9e0ac42d41d0d43cb7fd9b18d8cca08679985 -->
 
 <div align="center">
 
@@ -47,6 +47,14 @@
 - **也可以放在你自己的 nvim 旁边。** `:EitriPanel` 只把 agent 面板作为一个独立窗口，开在你终端里的 Neovim 旁边；`:EitriPage markdown` 用同样的方式打开 Markdown 预览。
 
 **更想把 Neovim 留在终端里？** companion 模式把同一个 agent 面板作为一个独立窗口，开在你已经在用的 nvim 旁边（在 tmux 里或不在，上游 Neovide 或别的图形前端都行）。它通过 nvim 自己的 RPC socket 附着上去，把你打开的文件和选区送给 agent，agent 改完后重新加载缓冲区，并能按行号打开文件；面板一消失，它装进去的东西就全部撤掉，你的配置不会被碰。两个窗口怎么摆由你的窗口管理器决定，sway、Hyprland、niri 以及（装上随附扩展的）GNOME 还能用同样的 `Ctrl+h/j/k/l` 在它们之间移动焦点。装上 `eitri.nvim` 插件，运行 `:EitriPanel`，或者让 `eitri split` 把上游 Neovide 和面板一起打开：见[配合你自己的 nvim 使用](docs/guide/companion.zh-CN.md)。Markdown 预览也可以开在那里，不带 agent 面板：`:EitriPage markdown`（或者在 shell 里运行 `eitri page markdown`）把它作为一个独立窗口打开，跟着你正在编辑的缓冲区走：见[开在你 nvim 旁边的页面](docs/guide/companion.zh-CN.md#pages-beside-your-nvim)。
+
+## 隐私
+
+Eitri 自己不会向任何地方发送任何东西：没有遥测，不检查更新，也不上传崩溃报告。如果它崩溃了，会在 `$XDG_STATE_HOME/eitri/log/`（默认是 `~/.local/state/eitri/log/`）下写一份日志并告诉你位置；要不要把它附到 issue 里，由你决定。
+
+只有在你要求的时候它才会用网络：安装脚本、`eitri setup`、`eitri sidecar check` 和 `update` 会下载东西，你点开的链接由浏览器打开。唯一的例外是 Markdown 预览：它会加载文档里指向的 `https` 图片，所以托管图片的服务器能看到你的地址。要一张都不加载：`eitri.plugin.load("markdown", { remote_images = "off" })`（见 [Markdown 预览](docs/guide/markdown-preview.zh-CN.md#图片)）。
+
+Claude Code 和 Codex 是你自己装的程序，Eitri 用你自己的设置运行它们。它们发送什么、会不会检查更新，由它们自己的设置决定，和 Eitri 无关。
 
 ## 安装
 
