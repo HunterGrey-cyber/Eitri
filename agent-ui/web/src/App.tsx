@@ -173,7 +173,7 @@ import { barePickerCommand, completionSource, settingCommand } from "./slashComm
 import { EFFORT_FROM_SETTINGS, effortPicker, modelPicker, parseEffortReply, parseModelReply, settingsChangedWords } from "./slashPicker";
 import { DRAFT_MIRROR_DELAY_MS, modePill, REFUSED_ECHO_MS, showTabBar } from "./tabs";
 import { cardSummary, liveTasks, shortModel, usageSegment } from "./band";
-import { NOTHING_TO_STOP, STOP_TURN_QUESTION, stopAskFor, stopTurnAnswer, workToStop } from "./stopAsk";
+import { NOTHING_TO_STOP, STOP_TURN_QUESTION, stopAskFor, stopTurnAnswer, workToStop, type StopWork } from "./stopAsk";
 import { latestTurnEnding } from "./turnEnding";
 import type { ApproveFact } from "./band";
 import type { DetailRow, TabId, TabsEnvelope } from "./types";
@@ -3547,16 +3547,16 @@ export default function App() {
     askStopBackground(tab, state.backgroundCalls);
   }
 
-  /** A stop arrival's question while `tab`'s turn `turn` runs. Like the other y/n prompts it takes the keys from
-   *  whatever was open over the conversation; only a counted `y` sends the chat's own `interrupt` for `tab`, and
-   *  only while `turn` is still the one running. */
-  function askStopTurn(tab: TabId, turn: string) {
+  /** A stop arrival's question while `tab`'s `work` runs (a turn, or a stretch of Claude Code's work the chat cannot
+   *  show). Like the other y/n prompts it takes the keys from whatever was open over the conversation; only a counted
+   *  `y` sends the chat's own `interrupt` for `tab`, and only while `work` is still the work running. */
+  function askStopTurn(tab: TabId, work: StopWork) {
     dropPendingKeys();
     exitRegion();
     setDetail(null);
     setHandoffOpen(false);
     setKeymapOpen(false);
-    setConfirm({ kind: "stop_turn", tab, turn, lines: [STOP_TURN_QUESTION], openedAt: performance.now() });
+    setConfirm({ kind: "stop_turn", tab, work, lines: [STOP_TURN_QUESTION], openedAt: performance.now() });
   }
 
   /** Opens `<leader>k`'s question for `tab`, naming `running` commands and the tab's agent. Like the other y/n
@@ -3803,8 +3803,8 @@ export default function App() {
           bypassYesCounts(answerClock()),
           {
             sameTab: activeTab?.id === confirm.tab && activeTab?.state === "live",
-            askedTurn: confirm.turn,
-            turnNow: workToStop(state),
+            asked: confirm.work,
+            now: workToStop(state),
           },
         );
         if (answer.kind === "interrupt") {

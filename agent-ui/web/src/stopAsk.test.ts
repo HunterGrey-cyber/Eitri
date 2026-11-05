@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { STOP_TURN_QUESTION, UNSEEN_WORK, stopAskFor, stopTurnAnswer, workToStop } from "./stopAsk";
+import { STOP_TURN_QUESTION, sameWork, stopAskFor, stopTurnAnswer, workToStop, type StopWork } from "./stopAsk";
 
 describe("which question a stop arrival asks", () => {
   it("stop_intent_shows_stop_this_turn_when_a_turn_runs: a turn wins over background work", () => {
@@ -20,7 +20,8 @@ describe("which question a stop arrival asks", () => {
 
 describe("the stop-this-turn question's answer", () => {
   const plainY = { key: "y", plain: true, repeat: false };
-  const still = { sameTab: true, askedTurn: "t1", turnNow: "t1" };
+  const t1: StopWork = { kind: "turn", turnId: "t1" };
+  const still = { sameTab: true, asked: t1, now: t1 as StopWork | null };
 
   it("y_after_the_guard_interrupts: a plain, unrepeated y past the guard, the turn still running", () => {
     expect(stopTurnAnswer(plainY, true, still)).toEqual({ kind: "interrupt" });
@@ -39,15 +40,27 @@ describe("the stop-this-turn question's answer", () => {
   });
 
   it("a y after the turn ended or the tab changed stops nothing", () => {
-    expect(stopTurnAnswer(plainY, true, { ...still, turnNow: null }).kind).toBe("refused");
+    expect(stopTurnAnswer(plainY, true, { ...still, now: null }).kind).toBe("refused");
     expect(stopTurnAnswer(plainY, true, { ...still, sameTab: false }).kind).toBe("refused");
   });
 
   it("a y after another turn took the asked one's place stops nothing", () => {
-    expect(stopTurnAnswer(plainY, true, { ...still, turnNow: "t2" })).toEqual({
+    expect(stopTurnAnswer(plainY, true, { ...still, now: { kind: "turn", turnId: "t2" } })).toEqual({
       kind: "refused",
       flash: "the turn has ended; nothing was stopped",
     });
+  });
+
+  it("a y asked about one stretch of unseen work stops nothing once another stretch, or a turn, runs instead", () => {
+    const a: StopWork = { kind: "unseen", episode: 1 };
+    const asked = { ...still, asked: a, now: a as StopWork | null };
+    expect(stopTurnAnswer(plainY, true, asked)).toEqual({ kind: "interrupt" });
+    for (const now of [{ kind: "unseen", episode: 2 }, { kind: "turn", turnId: "t1" }, null] as const) {
+      expect(stopTurnAnswer(plainY, true, { ...asked, now })).toEqual({
+        kind: "refused",
+        flash: "the work changed since the question; nothing was stopped",
+      });
+    }
   });
 
   it("n_and_esc_do_nothing: every other key puts the question away", () => {
@@ -58,9 +71,23 @@ describe("the stop-this-turn question's answer", () => {
 });
 
 describe("what the stop-this-turn question is about", () => {
-  it("a running turn, else Claude Code's unseen work, else nothing", () => {
-    expect(workToStop({ activeTurnId: "t1", cliUnseenBusy: true })).toBe("t1");
-    expect(workToStop({ activeTurnId: null, cliUnseenBusy: true })).toBe(UNSEEN_WORK);
-    expect(workToStop({ activeTurnId: null, cliUnseenBusy: false })).toBeNull();
+  it("a running turn, else Claude Code's unseen work by its stretch's number, else nothing", () => {
+    expect(workToStop({ activeTurnId: "t1", cliUnseenBusy: true, cliUnseenEpisode: 3 })).toEqual({ kind: "turn", turnId: "t1" });
+    expect(workToStop({ activeTurnId: null, cliUnseenBusy: true, cliUnseenEpisode: 3 })).toEqual({ kind: "unseen", episode: 3 });
+    expect(workToStop({ activeTurnId: null, cliUnseenBusy: false, cliUnseenEpisode: 3 })).toBeNull();
+  });
+
+  it("no turn id is ever the same work as a stretch of unseen work, whatever the id holds", () => {
+    for (const turnId of ["1", "3", "", "\u0000unseen-cli-work", "unseen", "[object Object]"]) {
+      const turn: StopWork = { kind: "turn", turnId };
+      for (const episode of [0, 1, 3]) {
+        const unseen: StopWork = { kind: "unseen", episode };
+        expect(sameWork(turn, unseen)).toBe(false);
+        expect(sameWork(unseen, turn)).toBe(false);
+      }
+      expect(sameWork(turn, { kind: "turn", turnId })).toBe(true);
+    }
+    expect(sameWork({ kind: "unseen", episode: 1 }, { kind: "unseen", episode: 1 })).toBe(true);
+    expect(sameWork({ kind: "unseen", episode: 1 }, { kind: "unseen", episode: 2 })).toBe(false);
   });
 });

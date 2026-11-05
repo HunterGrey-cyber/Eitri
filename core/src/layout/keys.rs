@@ -424,11 +424,13 @@ mod tests {
     /// copies an example gets the key it names instead of a startup problem.
     #[test]
     fn every_module_key_in_the_guides_lua_examples_is_free_by_default() {
-        let guide = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../publish/files/docs/guide");
+        let guide = guide_dir(&std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join(".."));
         let keymap = Keymap::defaults();
         let mut seen = 0;
         let mut refused = Vec::new();
-        for entry in std::fs::read_dir(&guide).expect("the guide directory") {
+        let entries =
+            std::fs::read_dir(&guide).unwrap_or_else(|e| panic!("the user guide is not at {} ({e})", guide.display()));
+        for entry in entries {
             let path = entry.expect("a guide entry").path();
             if path.extension().and_then(|e| e.to_str()) != Some("md") {
                 continue;
@@ -448,8 +450,23 @@ mod tests {
                 }
             }
         }
-        assert!(seen >= 5, "the guide's examples were not found ({seen})");
+        assert!(
+            seen >= 5,
+            "the guide's examples were not found in {} ({seen})",
+            guide.display()
+        );
         assert!(refused.is_empty(), "{refused:#?}");
+    }
+
+    /// Find the guide under `publish/files/docs/guide` when `publish/` exists, otherwise
+    /// under `docs/guide`. A missing guide under an existing `publish/` must fail the test
+    /// rather than fall back to another directory.
+    fn guide_dir(root: &std::path::Path) -> std::path::PathBuf {
+        if std::fs::symlink_metadata(root.join("publish")).is_ok() {
+            root.join("publish/files/docs/guide")
+        } else {
+            root.join("docs/guide")
+        }
     }
 
     #[test]

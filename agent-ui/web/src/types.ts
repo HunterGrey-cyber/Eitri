@@ -560,6 +560,13 @@ export type AgentUiState = {
    *  session's end (`session_closed`, `session_unavailable`, a `resume_outcome` that did not attach).
    *  A snapshot carries it only while it is set. */
   cliUnseenBusy: boolean;
+  /** Page-only: the number of the stretch of unseen work under way while `cliUnseenBusy` is set (of the last one
+   *  otherwise). The reducer raises it when `cliUnseenBusy` goes from clear to set and `applySnapshot` on every
+   *  snapshot (a snapshot cannot say whether the work it shows is the stretch the page knew). Every state the page
+   *  model puts in place keeps it at least as high as the one it replaces (`keepUnseenEpisode` in `page_model.ts`:
+   *  a tab switch, a restart in place, a handoff, an error), so it never goes down while the page lives and a stop
+   *  question asked about one stretch (`workToStop`) does not answer for a later one. */
+  cliUnseenEpisode: number;
   /** The `seq` of the prompt the running turn opened with (or the turn about to start will), while it
    *  is still a row of the conversation (Rust's `opening_prompt`): `cli_cycle_started` moves that row out.
    *  A snapshot carries it only while it is set. */
@@ -620,6 +627,7 @@ export type AgentUiSnapshot = Omit<
   AgentUiState,
   | "nextSeq"
   | "turnThinking"
+  | "cliUnseenEpisode"
   | "denialsBeforeTheirCall"
   | "changedInputsBeforeTheirCall"
   | "thinking"

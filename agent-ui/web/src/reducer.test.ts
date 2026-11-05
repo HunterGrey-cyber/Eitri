@@ -481,8 +481,9 @@ describe("applyEvent", () => {
   it("applySnapshot replaces the whole state wholesale", () => {
     const snapshot = { ...initialState(), sessionId: "replaced", transcript: [{ seq: 0, text: "from snapshot" }] };
     const state = applySnapshot(initialState(), snapshot, 1);
-    // `nextSeq` is the one field a snapshot does not carry -- it comes from the envelope beside it.
-    expect(state).toEqual({ ...snapshot, nextSeq: 1 });
+    // A snapshot carries neither `nextSeq`, which comes from the envelope beside it, nor `cliUnseenEpisode`, which
+    // counts on from the page's own.
+    expect(state).toEqual({ ...snapshot, nextSeq: 1, cliUnseenEpisode: 1 });
   });
 });
 
@@ -1484,6 +1485,28 @@ describe("turn ends this page did not run, hook blocks, unseen work, withdrawn p
     expect(noted.cliUnseenBusy).toBe(true);
     expect(noted.activeTurnId).toBeNull();
     expect(folded("cli_work_unseen_then_its_end").cliUnseenBusy).toBe(false);
+  });
+
+  it("each stretch of unseen work gets a number of its own: more messages of one stretch keep it", () => {
+    const unseen: AgentDomainEvent = { type: "cli_work_unseen" };
+    const end: AgentDomainEvent = {
+      type: "turn_completed", turn_id: "cli-a", outcome: "completed", result_text: "", stop_reason: null, usage: null,
+      detail: { reason: null, api_error_status: null, message: null },
+    };
+    const first = applyEvent(initialState(), unseen);
+    expect(first.cliUnseenEpisode).toBe(1);
+    expect(applyEvents(first, [unseen, unseen]).cliUnseenEpisode).toBe(1);
+    const ended = applyEvent(first, end);
+    expect(ended.cliUnseenBusy).toBe(false);
+    expect(ended.cliUnseenEpisode).toBe(1);
+    const second = applyEvent(ended, unseen);
+    expect(second.cliUnseenBusy).toBe(true);
+    expect(second.cliUnseenEpisode).toBe(2);
+    // A snapshot cannot say the work it shows is the stretch the page knew, so it is a new one; a start-over never
+    // counts down.
+    const loaded = applySnapshot(second, { ...initialState(), cliUnseenBusy: true }, 5);
+    expect(loaded.cliUnseenEpisode).toBe(3);
+    expect(resetToStartScreen(loaded).cliUnseenEpisode).toBe(3);
   });
 
   it("a session that ends ends the note of work out of sight: no completion for it is coming", () => {

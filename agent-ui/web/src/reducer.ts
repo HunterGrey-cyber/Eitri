@@ -64,6 +64,7 @@ export function initialState(): AgentUiState {
     notification: null,
     questions: [],
     cliUnseenBusy: false,
+    cliUnseenEpisode: 0,
     openingPromptSeq: null,
     runningTurnCli: false,
     nextSeq: 0,
@@ -152,9 +153,17 @@ function withLostTurn(state: AgentUiState, seq: Seq): AgentUiState {
  * from `hello` and describe the bridge this WebView is attached to, not the session that just
  * ended -- a fresh `hello` is not coming, so this is the only copy of them there is. Everything
  * else (transcript, tool calls, pending permissions, status, `nextSeq`, ...) genuinely belongs to
- * the session that ended, so it resets to exactly what a brand-new mount would show. */
+ * the session that ended, so it resets to exactly what a brand-new mount would show, except the page's count of
+ * stretches of unseen work (`cliUnseenEpisode`), which only goes up. */
 export function resetToStartScreen(state: AgentUiState): AgentUiState {
-  return { ...initialState(), backend: state.backend, capabilities: state.capabilities, provider: state.provider };
+  return {
+    ...initialState(),
+    backend: state.backend,
+    capabilities: state.capabilities,
+    provider: state.provider,
+    // Never counted down: a stop question still up from the ended session must not match the next one's work.
+    cliUnseenEpisode: state.cliUnseenEpisode,
+  };
 }
 
 /**
@@ -701,8 +710,10 @@ function foldEvent(state: AgentUiState, event: AgentDomainEvent, seq: Seq): Agen
     case "session_notice":
       return notices.fold(state, event);
     case "cli_work_unseen":
-      // Work out of sight: noted, and nothing else -- no turn runs here because of it.
-      return { ...state, cliUnseenBusy: true };
+      // Work out of sight: noted, and nothing else -- no turn runs here because of it. Claude Code sends one for
+      // every message it writes there, so only the first after none was under way begins a new stretch.
+      if (state.cliUnseenBusy) return { ...state };
+      return { ...state, cliUnseenBusy: true, cliUnseenEpisode: state.cliUnseenEpisode + 1 };
     case "user_prompt_withdrawn": {
       // The newest prompt not put into a running turn goes; a delivered one is part of its turn and
       // stays. Nothing to take back changes nothing. MUST stay identical to `AgentSessionProjection::apply`.
@@ -888,7 +899,7 @@ export function keepAfterFailure(state: AgentUiState, reason: string): AgentUiSt
  * holds, and sorts after all of them. This is the whole reason the ordering survives a reload or a
  * `UiDelivery::Resync`, the two paths that throw this state away and rebuild it from here.
  */
-export function applySnapshot(_state: AgentUiState, snapshot: AgentUiSnapshot, throughRevision: number): AgentUiState {
+export function applySnapshot(previous: AgentUiState, snapshot: AgentUiSnapshot, throughRevision: number): AgentUiState {
   // The snapshot carries neither `nextSeq` nor `turnThinking` (nor `denialsBeforeTheirCall`, which
   // Rust keeps in a field of its own that is not serialized) -- all reducer-internal on both
   // sides and deliberately not on the wire, which is why the parameter is typed `AgentUiSnapshot`
@@ -938,6 +949,9 @@ export function applySnapshot(_state: AgentUiState, snapshot: AgentUiSnapshot, t
     questions: snapshot.questions ?? [],
     // Sent only while set: a payload without it is a tab with no unseen work noted.
     cliUnseenBusy: snapshot.cliUnseenBusy ?? false,
+    // Not on the wire: the page cannot tell whether unseen work the snapshot shows is the stretch it knew, so it is
+    // a new one.
+    cliUnseenEpisode: previous.cliUnseenEpisode + 1,
     // Both sent only while set.
     openingPromptSeq: snapshot.openingPromptSeq ?? null,
     runningTurnCli: snapshot.runningTurnCli ?? false,

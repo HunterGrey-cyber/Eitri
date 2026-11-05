@@ -159,6 +159,64 @@ describe("stop, asked in the chat", () => {
     expect(interrupts()).toEqual([]);
   });
 
+  /** Ends the stretch of unseen work under way (a completion of a turn this chat never ran), then Claude Code
+   *  writes again where the chat cannot show it: a new stretch. */
+  const unseenEndsThenAnotherBegins = [
+    {
+      type: "turn_completed", turn_id: "cli-a", outcome: "completed", result_text: "", stop_reason: null, usage: null,
+      detail: { reason: null, api_error_status: null, message: null },
+    },
+    { type: "cli_work_unseen" },
+  ];
+
+  it("a y after the unseen work it asked about ended and other unseen work began stops nothing", () => {
+    const { container } = arrivedToStop({ backend: "sidecar", cliUnseenBusy: true }, "claude");
+    expect(bandText(container)).toContain("Stop this turn? (y/n)");
+    dispatch({ kind: "events", tab: 1, fromRevision: 0, throughRevision: 2, events: unseenEndsThenAnotherBegins });
+    wait(TYPING_GUARD_MS + 50);
+    fireEvent.keyDown(root(container), { key: "y" });
+    expect(interrupts()).toEqual([]);
+    expect(bandText(container)).toContain("nothing was stopped");
+  });
+
+  it("a y after one snapshot swapped the unseen work stops nothing: the page cannot tell it is the same work", () => {
+    const { container } = arrivedToStop({ backend: "sidecar", cliUnseenBusy: true }, "claude");
+    dispatch({ kind: "snapshot", tab: 1, throughRevision: 2, state: snapshotState({ backend: "sidecar", cliUnseenBusy: true }) });
+    wait(TYPING_GUARD_MS + 50);
+    fireEvent.keyDown(root(container), { key: "y" });
+    expect(interrupts()).toEqual([]);
+  });
+
+  it("a y asked about unseen work stops nothing once a turn of the chat's own runs instead", () => {
+    const { container } = arrivedToStop({ backend: "sidecar", cliUnseenBusy: true }, "claude");
+    dispatch({ kind: "events", tab: 1, fromRevision: 0, throughRevision: 1, events: [{ type: "turn_started", turn_id: "turn-2" }] });
+    wait(TYPING_GUARD_MS + 50);
+    fireEvent.keyDown(root(container), { key: "y" });
+    expect(interrupts()).toEqual([]);
+    expect(bandText(container)).toContain("nothing was stopped");
+  });
+
+  it("a y asked about a turn stops nothing once the turn ended and unseen work began", () => {
+    const { container } = arrivedToStop({ backend: "sidecar", ...TURN }, "claude");
+    expect(bandText(container)).toContain("Stop this turn? (y/n)");
+    dispatch({
+      kind: "events", tab: 1, fromRevision: 0, throughRevision: 2,
+      events: [{ ...unseenEndsThenAnotherBegins[0], turn_id: "turn-1" }, unseenEndsThenAnotherBegins[1]],
+    });
+    wait(TYPING_GUARD_MS + 50);
+    fireEvent.keyDown(root(container), { key: "y" });
+    expect(interrupts()).toEqual([]);
+    expect(bandText(container)).toContain("nothing was stopped");
+  });
+
+  it("more of the same unseen work while the question is up still lets y interrupt it", () => {
+    const { container } = arrivedToStop({ backend: "sidecar", cliUnseenBusy: true }, "claude");
+    dispatch({ kind: "events", tab: 1, fromRevision: 0, throughRevision: 2, events: [{ type: "cli_work_unseen" }, { type: "cli_work_unseen" }] });
+    wait(TYPING_GUARD_MS + 50);
+    fireEvent.keyDown(root(container), { key: "y" });
+    expect(interrupts()).toEqual([{ type: "interrupt", request_id: expect.any(String), tab: 1 }]);
+  });
+
   it("a stop arrival on a tab with nothing running asks nothing and sends nothing", () => {
     const { container } = arrivedToStop({});
     expect(bandText(container)).not.toContain("(y/n)");

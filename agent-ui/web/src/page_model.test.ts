@@ -1,6 +1,7 @@
 import { describe, expect, it } from "vitest";
 import { initialState } from "./reducer";
 import { initialPageModel, pageModel } from "./page_model";
+import { stopTurnAnswer, workToStop } from "./stopAsk";
 import type { Envelope, PageModel } from "./page_model";
 import type { InboundPayload } from "./bridge";
 
@@ -120,5 +121,53 @@ describe("pageModel", () => {
     expect(same.answerEpoch, "the same active tab leaves a waiting answer aimed at its card").toBe(model.answerEpoch);
     const switched = receive(model, { kind: "tabs", active: 2, tabs: [tab(1), tab(2)], defaultMode: "auto" });
     expect(switched.answerEpoch, "a waiting answer was aimed at the old tab's card").toBe(model.answerEpoch + 1);
+  });
+});
+
+describe("the stop question across a rebuilt conversation", () => {
+  const plainY = { key: "y", plain: true, repeat: false };
+  const unseenSnapshot = (throughRevision: number): InboundPayload => ({
+    kind: "snapshot", tab: 1, throughRevision, state: { ...initialState(), status: { kind: "running" }, cliUnseenBusy: true },
+  });
+  /** Tab 1 with Claude Code working out of sight, and the stop question up about that stretch. */
+  function askedAboutUnseenWork(): PageModel {
+    const shown = receive(connected(), unseenSnapshot(1));
+    const work = workToStop(shown.state);
+    expect(work?.kind).toBe("unseen");
+    return { ...shown, confirm: { kind: "stop_turn", tab: 1, work: work!, lines: [], openedAt: 0 } };
+  }
+  const restartedWithUnseenWork = (model: PageModel) =>
+    receive(
+      receive(model, { kind: "tabs", active: 1, tabs: [{ ...tab(1), state: "starting" }, tab(2)], defaultMode: "auto" }),
+      unseenSnapshot(1),
+    );
+  const answerAfter = (asked: PageModel, now: PageModel) => {
+    if (asked.confirm?.kind !== "stop_turn") throw new Error("no stop question");
+    return stopTurnAnswer(plainY, true, { sameTab: true, asked: asked.confirm.work, now: workToStop(now.state) });
+  };
+
+  const endings: [string, InboundPayload][] = [
+    ["an error with nothing shown", { kind: "error", tab: 1, message: "connection closed" }],
+    ["a handoff", { kind: "handoff", tab: 1, command: "claude --resume s", cwd: "/p", providerSessionId: "s" }],
+  ];
+  for (const [name, ending] of endings) {
+    it(`${name} puts the stop question away and never counts the unseen work down`, () => {
+      const asked = askedAboutUnseenWork();
+      const ended = receive(asked, ending);
+      // Even had the question stayed up, the next session's unseen work is not the work it asked about.
+      const again = restartedWithUnseenWork(ended);
+      expect(answerAfter(asked, again).kind).toBe("refused");
+      expect(again.state.cliUnseenEpisode).toBeGreaterThan(asked.state.cliUnseenEpisode);
+      expect(ended.state.cliUnseenEpisode).toBeGreaterThanOrEqual(asked.state.cliUnseenEpisode);
+      expect(ended.confirm).toBeNull();
+    });
+  }
+
+  it("a switch away and back never counts the unseen work down", () => {
+    const asked = askedAboutUnseenWork();
+    const away = receive(asked, { kind: "tabs", active: 2, tabs: [tab(1), tab(2)], defaultMode: "auto" });
+    const back = receive(receive(away, { kind: "tabs", active: 1, tabs: [tab(1), tab(2)], defaultMode: "auto" }), unseenSnapshot(2));
+    expect(answerAfter(asked, back).kind).toBe("refused");
+    expect(away.state.cliUnseenEpisode).toBeGreaterThanOrEqual(asked.state.cliUnseenEpisode);
   });
 });

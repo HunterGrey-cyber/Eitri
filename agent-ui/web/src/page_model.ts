@@ -12,6 +12,7 @@ import { failureEvidence } from "./problems";
 import { applyCallNotes, applyEvents, applySnapshot, initialState, keepAfterFailure, resumeAttached, withEditorCards } from "./reducer";
 import { failRequest, receiveDiff, receiveDraft, receivePreview, receiveRecovery, receiveReview, withStatus } from "./review";
 import type { ReviewState } from "./review";
+import type { StopWork } from "./stopAsk";
 import { acceptsEnvelope, withoutHandoff } from "./tabs";
 import { durationsFromSnapshot, durationsWith, NO_TURN_DURATIONS } from "./turnTimes";
 import type { TurnDurations } from "./turnTimes";
@@ -97,10 +98,10 @@ export type Confirmation =
   /** `<leader>k`: stop the commands this tab's agent left running, which ends its session. Bound to the tab and
    *  the count it names: a `y` given after either moved is not an answer to it. */
   | { kind: "stop_background"; tab: TabId; running: number; lines: string[]; openedAt: number }
-  /** A tab brought forward to be stopped while its turn runs (`arrive` with `intent: "stop"`). Bound to the tab and
-   *  the turn it asked about (`turn`, the tab's `activeTurnId` then): a `y` given after the tab changed or that turn
-   *  ended stops nothing, even when another turn has begun since. */
-  | { kind: "stop_turn"; tab: TabId; turn: string; lines: string[]; openedAt: number }
+  /** A tab brought forward to be stopped while its turn, or Claude Code's work the chat cannot show, runs (`arrive`
+   *  with `intent: "stop"`). Bound to the tab and the work it asked about (`work`, `workToStop` then): a `y` given
+   *  after the tab changed or that work ended stops nothing, even when other work has begun since. */
+  | { kind: "stop_turn"; tab: TabId; work: StopWork; lines: string[]; openedAt: number }
   | null;
 
 /** Everything the envelope router decides. Counters (`inputRequest`, `arriveRequest`, `permissionRequest`,
@@ -266,9 +267,23 @@ export function pageModel(model: PageModel, envelope: Envelope): PageModel {
   // Every session-scoped envelope names its tab, and the page keeps only the active tab's state, so one for any
   // other tab -- a batch still in flight when the user switched away -- changes nothing.
   if (!acceptsEnvelope(envelope as { kind: string; tab?: number }, model.tabs?.active ?? null)) return model;
-  const next = reduceEnvelope(model, envelope);
+  const next = keepUnseenEpisode(model, reduceEnvelope(model, envelope));
   return ["pane_focus", "arrive", "enter_input", "focus_permission", "hint_collect", "nav_key", "keymap"].includes(envelope.kind)
     ? { ...next, answerEpoch: model.answerEpoch + 1 } : next;
+}
+
+/** `next` with the page's count of stretches of unseen work no lower than `model`'s. A switch, a restart in place,
+ *  a handoff or an error rebuilds the state (`initialState()`, or a failed tab's kept one), and a count that went
+ *  back could hand a later stretch the number a stop question still holds. */
+function keepUnseenEpisode(model: PageModel, next: PageModel): PageModel {
+  const floor = model.state.cliUnseenEpisode;
+  if (next.state.cliUnseenEpisode >= floor) return next;
+  return { ...next, state: { ...next.state, cliUnseenEpisode: floor } };
+}
+
+/** The stop question goes with the session it asked about: a handoff or a failure ended that work. */
+function withoutStopQuestion(confirm: Confirmation): Confirmation {
+  return confirm?.kind === "stop_turn" ? null : confirm;
 }
 
 function reduceEnvelope(model: PageModel, envelope: Envelope): PageModel {
@@ -472,7 +487,7 @@ function reduceEnvelope(model: PageModel, envelope: Envelope): PageModel {
       // across sessions is a question about ids this page does not own, so it clears it rather than answering it.
       return {
         ...model, state: initialState(), handoffRequests: withoutHandoff(model.handoffRequests, envelope.tab),
-        commandNotice: null, turnClock: null, turnDurations: NO_TURN_DURATIONS, handoff: envelope,
+        confirm: withoutStopQuestion(model.confirm), commandNotice: null, turnClock: null, turnDurations: NO_TURN_DURATIONS, handoff: envelope,
         // The resume offer drops exactly the session just given away, from the `hello` this page already has.
         // Rust applies the same rule whenever it builds `hello`, which is the durable half; every other stored
         // session stays offered.
@@ -493,7 +508,7 @@ function reduceEnvelope(model: PageModel, envelope: Envelope): PageModel {
       const keptStates = new Map(model.keptStates);
       if (kept !== null) keptStates.set(envelope.tab, kept);
       return {
-        ...model, keptStates, state: kept ?? initialState(),
+        ...model, keptStates, state: kept ?? initialState(), confirm: withoutStopQuestion(model.confirm),
         handoffRequests: withoutHandoff(model.handoffRequests, envelope.tab), turnClock: null,
         turnDurations: kept === null ? NO_TURN_DURATIONS : model.turnDurations,
         fatalError: kept === null ? envelope.message : null,

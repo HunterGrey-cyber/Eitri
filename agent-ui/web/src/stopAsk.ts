@@ -11,14 +11,29 @@ export const STOP_TURN_QUESTION = "Stop this turn? (y/n)";
  *  ended since it looked). */
 export const NOTHING_TO_STOP = "nothing is running in this tab: nothing to stop";
 
-/** The name `workToStop` gives Claude Code's work the chat cannot show (no turn of the chat's own is open): no turn
- *  id can be it, so a question asked about that work never matches a turn that began after it. */
-export const UNSEEN_WORK = "\u0000unseen-cli-work";
+/** What the stop-this-turn question is about: a turn of the chat's own, by its id, or one stretch of Claude Code's
+ *  work the chat cannot show (no turn of the chat's own is open), by the number the page gave that stretch when it
+ *  began (`cliUnseenEpisode`). The two kinds never compare equal, whatever a turn id holds, so a question asked about
+ *  one never matches a turn, or another stretch of unseen work, that began after it. */
+export type StopWork = { kind: "turn"; turnId: string } | { kind: "unseen"; episode: number };
 
-/** What the stop-this-turn question is about: the running turn's id, else, while Claude Code works where this chat
- *  cannot show it, `UNSEEN_WORK` (the chat's interrupt stops that work as it stops a turn); `null` when neither runs. */
-export function workToStop(state: { activeTurnId: string | null; cliUnseenBusy: boolean }): string | null {
-  return state.activeTurnId ?? (state.cliUnseenBusy ? UNSEEN_WORK : null);
+/** The work the stop-this-turn question would be about now: the running turn, else, while Claude Code works where
+ *  this chat cannot show it, that stretch of work (the chat's interrupt stops it as it stops a turn); `null` when
+ *  neither runs. */
+export function workToStop(state: {
+  activeTurnId: string | null;
+  cliUnseenBusy: boolean;
+  cliUnseenEpisode: number;
+}): StopWork | null {
+  if (state.activeTurnId !== null) return { kind: "turn", turnId: state.activeTurnId };
+  return state.cliUnseenBusy ? { kind: "unseen", episode: state.cliUnseenEpisode } : null;
+}
+
+/** Whether `now` is the very work `asked` named: the same turn, or the same stretch of unseen work. */
+export function sameWork(asked: StopWork, now: StopWork | null): boolean {
+  if (now === null) return false;
+  if (asked.kind === "turn") return now.kind === "turn" && now.turnId === asked.turnId;
+  return now.kind === "unseen" && now.episode === asked.episode;
 }
 
 /** What a stop arrival asks: a running turn comes first, since stopping it is what the person sees happening. */
@@ -33,19 +48,26 @@ export function stopAskFor(facts: { live: boolean; turnRunning: boolean; backgro
 export type StopTurnAnswer = { kind: "interrupt" } | { kind: "refused"; flash: string } | { kind: "cancel" };
 
 /** The answer one key gives the stop-this-turn question. Only `y`/`Y` can stop, and only a plain, unrepeated one the
- *  y/n guard counts (`counts`: `bypassYesCounts`), asked of the same tab while the turn it asked about (`askedTurn`)
- *  is still the one running (`turnNow`). The interrupt names no turn, so a `y` after that turn ended and another
- *  began would stop one nobody was asked about. Every other key puts the question away and stops nothing. */
+ *  y/n guard counts (`counts`: `bypassYesCounts`), asked of the same tab while the work it asked about (`asked`: a
+ *  turn or a stretch of unseen work) is still the work running (`now`, `workToStop` at the key). The interrupt names
+ *  no turn, so a `y` after that work ended and other work began would stop work nobody was asked about. Every other
+ *  key puts the question away and stops nothing. */
 export function stopTurnAnswer(
   key: { key: string; plain: boolean; repeat: boolean },
   counts: boolean,
-  still: { sameTab: boolean; askedTurn: string; turnNow: string | null },
+  still: { sameTab: boolean; asked: StopWork; now: StopWork | null },
 ): StopTurnAnswer {
   if (key.key !== "y" && key.key !== "Y") return { kind: "cancel" };
   if (!key.plain || key.repeat || !counts) {
     return { kind: "refused", flash: "y must be pressed on its own to stop the turn; nothing was stopped" };
   }
   if (!still.sameTab) return { kind: "refused", flash: "the tab changed; nothing was stopped" };
-  if (still.turnNow !== still.askedTurn) return { kind: "refused", flash: "the turn has ended; nothing was stopped" };
+  if (!sameWork(still.asked, still.now)) {
+    // A stretch of unseen work also changes its number on a snapshot while the same work may still run.
+    const flash = still.asked.kind === "turn"
+      ? "the turn has ended; nothing was stopped"
+      : "the work changed since the question; nothing was stopped";
+    return { kind: "refused", flash };
+  }
   return { kind: "interrupt" };
 }
