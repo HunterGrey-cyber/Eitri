@@ -29,10 +29,13 @@ impl Rng {
     }
 }
 
-const FRAMES: [Size; 3] = [
+const FRAMES: [Size; 4] = [
     Size { w: 1280, h: 721 },
     Size { w: 1920, h: 1040 },
     Size { w: 800, h: 600 },
+    // A window narrower and lower than its modules' minimums (a tiling compositor's small tile): drags and resizes
+    // there must still be taken, never panic, and keep every module inside the window.
+    Size { w: 120, h: 80 },
 ];
 const RECTS: [FloatRect; 4] = [
     FloatRect {
@@ -267,10 +270,56 @@ fn step(rng: &mut Rng, layout: &mut Layout, frame: &Frame) {
         }
         39 => {
             // A drag of any divider on screen, fixed children's edges included.
-            let dividers = arrange(layout, frame).dividers;
-            if !dividers.is_empty() {
-                let d = dividers[rng.below(dividers.len())].clone();
+            // One module measures a minimum of its own (a page's), so the drags meet clamped children too.
+            let measured = |id: &ModuleId| {
+                if *id == ModuleId::lua("b") {
+                    Size { w: 150, h: 90 }
+                } else {
+                    Size::default()
+                }
+            };
+            let frame = &Frame {
+                min: &measured,
+                ..Frame::new(frame.size, frame.handle_px)
+            };
+            let before = arrange(layout, frame);
+            if !before.dividers.is_empty() {
+                let d = before.dividers[rng.below(before.dividers.len())].clone();
+                // A fixed child's own (right or lower) edge: only it and the neighbour across that edge may change.
+                let own_edge = layout.root().find(d.con).and_then(|c| {
+                    let Node::Leaf(m) = &c.children[d.index].node else {
+                        return None;
+                    };
+                    let (h, w) = super::super::rules::fixed_lengths_of(layout, m);
+                    let fixed = match d.axis {
+                        Axis::Row => w,
+                        Axis::Column => h,
+                    };
+                    fixed?;
+                    let next = (d.index + 1..c.children.len())
+                        .find(|&i| c.children[i].node.leaves().iter().any(|l| layout.is_shown(l)))?;
+                    let mut moving = c.children[next].node.leaves();
+                    moving.push(m.clone());
+                    Some(moving)
+                });
                 let _ = super::super::geometry::move_divider(layout, &d, rng.below(150) as i32);
+                let roomy = frame.size.w >= 800 && frame.size.h >= 600;
+                if let (Some(moving), true) = (own_edge, roomy) {
+                    let after = arrange(layout, frame);
+                    for (id, r) in &before.modules {
+                        if moving.contains(id) {
+                            continue;
+                        }
+                        let Some(now) = after.rect_of(id) else { continue };
+                        assert!(
+                            (now.x - r.x).abs() <= 1
+                                && (now.w - r.w).abs() <= 1
+                                && (now.y - r.y).abs() <= 1
+                                && (now.h - r.h).abs() <= 1,
+                            "a fixed edge drag moved {id}: {r:?} -> {now:?}"
+                        );
+                    }
+                }
             }
         }
         _ => unreachable!(),
@@ -367,10 +416,11 @@ fn check(layout: &Layout, label: &str) {
                 "{label}: {a} {ra:?} outside {size:?}"
             );
             // Nine modules (six plus terminal#2..#4) fit at 32px each in an 800x600 frame; a slot with a pixel length
-            // may be narrower, down to that length.
+            // may be narrower, down to that length. The small frame cannot hold them all.
             let (fixed_h, fixed_w) = super::super::rules::fixed_lengths_of(layout, a);
+            let roomy = size.w >= 800 && size.h >= 600;
             assert!(
-                ra.w >= 32.min(fixed_w.unwrap_or(32)) && ra.h >= 32.min(fixed_h.unwrap_or(32)),
+                !roomy || (ra.w >= 32.min(fixed_w.unwrap_or(32)) && ra.h >= 32.min(fixed_h.unwrap_or(32))),
                 "{label}: {a} {ra:?} below 32px at {size:?}"
             );
             for (b, rb) in &modules[i + 1..] {
@@ -388,7 +438,7 @@ fn twenty_thousand_random_verbs_keep_every_invariant() {
         let mut layout = random_layout(&mut rng);
         check(&layout, &format!("run {run}, start"));
         for n in 0..100 {
-            let frame = Frame::new(FRAMES[rng.below(3)], 1);
+            let frame = Frame::new(FRAMES[rng.below(FRAMES.len())], 1);
             step(&mut rng, &mut layout, &frame);
             check(&layout, &format!("run {run}, step {n}"));
         }
@@ -402,7 +452,7 @@ fn lone_tile_starts_keep_every_invariant() {
         let mut layout = lone_tile_layout(&mut rng);
         check(&layout, &format!("lone run {run}, start"));
         for n in 0..100 {
-            let frame = Frame::new(FRAMES[rng.below(3)], 1);
+            let frame = Frame::new(FRAMES[rng.below(FRAMES.len())], 1);
             step(&mut rng, &mut layout, &frame);
             check(&layout, &format!("lone run {run}, step {n}"));
         }

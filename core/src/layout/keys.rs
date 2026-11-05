@@ -424,7 +424,7 @@ mod tests {
     /// copies an example gets the key it names instead of a startup problem.
     #[test]
     fn every_module_key_in_the_guides_lua_examples_is_free_by_default() {
-        let guide = guide_dir(&std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join(".."));
+        let guide = crate::guide_files::this_trees_guide();
         let keymap = Keymap::defaults();
         let mut seen = 0;
         let mut refused = Vec::new();
@@ -456,17 +456,6 @@ mod tests {
             guide.display()
         );
         assert!(refused.is_empty(), "{refused:#?}");
-    }
-
-    /// Find the guide under `publish/files/docs/guide` when `publish/` exists, otherwise
-    /// under `docs/guide`. A missing guide under an existing `publish/` must fail the test
-    /// rather than fall back to another directory.
-    fn guide_dir(root: &std::path::Path) -> std::path::PathBuf {
-        if std::fs::symlink_metadata(root.join("publish")).is_ok() {
-            root.join("publish/files/docs/guide")
-        } else {
-            root.join("docs/guide")
-        }
     }
 
     #[test]

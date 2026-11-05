@@ -98,6 +98,10 @@ static COUNTING: alloc_count::Counting = alloc_count::Counting;
 #[cfg(any(test, feature = "test-support"))]
 pub mod source_scan;
 
+/// Where the user guide is, public tree or private, for the tests that read it.
+#[cfg(test)]
+mod guide_files;
+
 /// The crate-wide guard that every socket path here is built through `agent::socket_path`.
 /// Test-only, and in its own file so it can exclude itself from its own walk without excluding
 /// `lib.rs` -- exactly how `agent::socket_path`'s original does it.

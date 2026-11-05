@@ -50,7 +50,9 @@ eitri.layout.rule("lua:agents-strips", { at = "left", size = "62px" })
 
 A rule places the column when the window places it, at a first launch; a layout you saved keeps the column as it was.
 Closed and shown again, the rail comes back at its width. Drag its edge, or use `<prefix> Ctrl+Left`/`Ctrl+Right` with the keys on it, to
-change the width in pixels (16 to 400).
+change the width in pixels (16 to 400). Beside the pixel width the column keeps a share of the window, at first the
+smallest there is (a twentieth), growing and shrinking as you drag the width; that share is what you see only where the width does not apply: in a layout an older Eitri
+reads, or with the rail moved into a column of modules stacked one above the other.
 
 In a narrow column the full sidebar keeps the label, the part that tells your agents apart: it drops the tool word
 first, then the age. Hovering a row names it whole.

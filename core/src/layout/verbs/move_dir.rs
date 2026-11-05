@@ -159,6 +159,64 @@ mod tests {
         }
         assert_eq!(l.focus(), &id("a"));
     }
+    fn width(l: &Layout, name: &str) -> i32 {
+        arrange(l, &Frame::new(Size { w: 1280, h: 721 }, 1))
+            .rect_of(&id(name))
+            .unwrap()
+            .w
+    }
+    /// Beside a leaf sibling `move_dir` exchanges the two nodes: each slot keeps its share and its fixed length, as a
+    /// swap does, so the module moved into the rail's slot is drawn at the rail's width.
+    #[test]
+    fn moving_beside_a_leaf_leaves_a_fixed_width_with_its_slot() {
+        let mut root = Con::new(
+            ConLayout::SplitH,
+            vec![
+                Child::new(leaf("a"), 0.05),
+                Child::new(leaf("b"), 0.5),
+                Child::new(leaf("c"), 0.45),
+            ],
+        );
+        root.children[0].fixed_w_px = Some(62);
+        let mut l = Layout::new(Node::Con(root), id("a")).unwrap();
+        assert_eq!(width(&l, "a"), 62);
+        assert_eq!(move_dir(&mut l, &id("a"), Direction::Right), Ok(true));
+        assert_eq!(l.leaves(), vec![id("b"), id("a"), id("c")]);
+        assert_eq!(width(&l, "b"), 62);
+        assert_eq!(l.root().children[0].fixed_w_px, Some(62));
+        assert_eq!(l.root().children[1].fixed_w_px, None);
+    }
+    /// Taken out of its container, the whole child goes, its length with it: into a column, where a width does not
+    /// apply, and back into a row, where it does again.
+    #[test]
+    fn moving_into_a_container_carries_the_fixed_width_which_applies_along_a_row_only() {
+        let mut root = Con::new(
+            ConLayout::SplitH,
+            vec![
+                Child::new(leaf("a"), 0.05),
+                Child::new(column(leaf("b"), leaf("c")), 0.95),
+            ],
+        );
+        root.children[0].fixed_w_px = Some(62);
+        let mut l = Layout::new(Node::Con(root), id("a")).unwrap();
+        assert_eq!(move_dir(&mut l, &id("a"), Direction::Right), Ok(true));
+        fn slot_of(c: &Con, a: &Node) -> Option<(ConLayout, Option<i32>)> {
+            c.children.iter().find_map(|ch| match &ch.node {
+                n if n == a => Some((c.layout, ch.fixed_w_px)),
+                Node::Con(inner) => slot_of(inner, a),
+                _ => None,
+            })
+        }
+        assert_eq!(
+            slot_of(l.root(), &leaf("a")),
+            Some((ConLayout::SplitV, Some(62))),
+            "{:?}",
+            l.root()
+        );
+        assert!(width(&l, "a") > 62, "a width in a column draws nothing");
+        assert_eq!(move_dir(&mut l, &id("a"), Direction::Left), Ok(true));
+        assert_eq!(width(&l, "a"), 62, "back in a row");
+    }
     #[test]
     fn moving_toward_a_container_goes_into_it_beside_its_focused_child() {
         let mut inner = column(leaf("b"), leaf("c"));

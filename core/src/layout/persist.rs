@@ -446,8 +446,8 @@ fn not_kept(map: &Map<String, Value>, known: &[&str], ws: &str, notes: &mut Vec<
 }
 
 /// A tree node of workspace `ws`. An unknown container layout is read as `splith`, a tab container's
-/// `active` past its children is read as 0, and an unknown key in a node, a child or a pin is not
-/// kept: each is noted and sets `copy`. Anything else that cannot be read fails the workspace.
+/// `active` past its children is read as 0, a fixed length out of range is dropped (the share stays), and an unknown
+/// key in a node, a child or a pin is not kept: each is noted and sets `copy`. Anything else that cannot be read fails the workspace.
 fn read_node(value: &Value, ws: &str, notes: &mut Vec<String>, copy: &mut bool) -> Result<Node, String> {
     let Value::Object(map) = value else {
         return Err("a tree node that is not an object".to_string());
@@ -517,24 +517,29 @@ fn read_node(value: &Value, ws: &str, notes: &mut Vec<String>, copy: &mut bool) 
                     return Err("a container's child without a `node`".to_string());
                 };
                 let mut out = Child::new(read_node(node, ws, notes, copy)?, share as f32);
-                out.fixed_px = match child.get("fixed_px") {
+                // A length out of range (a later build's wider one, a hand edit) is dropped with a note: the child keeps
+                // its share, which is its fallback, and the rest of the workspace is read as it is.
+                let mut length = |key: &str, what: &str, range: std::ops::RangeInclusive<i32>| match child.get(key) {
                     None | Some(Value::Null) => None,
-                    Some(px) => Some(
-                        px.as_i64()
+                    Some(px) => {
+                        let read = px
+                            .as_i64()
                             .and_then(|px| i32::try_from(px).ok())
-                            .filter(|px| super::con::FIXED_HEIGHT_PX.contains(px))
-                            .ok_or_else(|| "a fixed height must be a whole number of pixels in 16..=200".to_string())?,
-                    ),
+                            .filter(|px| range.contains(px));
+                        if read.is_none() {
+                            notes.push(format!(
+                                "a fixed {what} of {px} inside workspace '{ws}' is not kept: a fixed {what} is a whole \
+                                 number of pixels in {}..={}",
+                                range.start(),
+                                range.end()
+                            ));
+                            *copy = true;
+                        }
+                        read
+                    }
                 };
-                out.fixed_w_px = match child.get("fixed_w_px") {
-                    None | Some(Value::Null) => None,
-                    Some(px) => Some(
-                        px.as_i64()
-                            .and_then(|px| i32::try_from(px).ok())
-                            .filter(|px| super::con::FIXED_WIDTH_PX.contains(px))
-                            .ok_or_else(|| "a fixed width must be a whole number of pixels in 16..=400".to_string())?,
-                    ),
-                };
+                out.fixed_px = length("fixed_px", "height", super::con::FIXED_HEIGHT_PX);
+                out.fixed_w_px = length("fixed_w_px", "width", super::con::FIXED_WIDTH_PX);
                 out.pin = pin;
                 children.push(out);
             }
@@ -1579,18 +1584,35 @@ mod tests {
             assert_eq!(arrangement.modules.iter().find(|(m, _)| m == &rail).unwrap().1.w, 62);
         }
         assert!(!one(&plain()).contains("fixed_w_px"));
-        // A width out of range, or not a whole number, makes the file's only workspace unusable, so the file is
-        // refused whole with the reason (the window then starts from its default and sets the file aside).
+        // A width out of range, or not a whole number, is dropped with a note and the text read is kept aside; the rest
+        // of the arrangement is read as it was, the rail at its fallback share.
         for bad in ["401", "15", "62.5", "\"62px\""] {
             let broken = text.replacen("\"fixed_w_px\": 62", &format!("\"fixed_w_px\": {bad}"), 1);
-            let err = decode_v2(&broken, &root(), &decls)
-                .err()
-                .unwrap_or_else(|| panic!("{bad}: read"));
+            let read = decode_v2(&broken, &root(), &decls).unwrap_or_else(|e| panic!("{bad}: {e}"));
+            assert_eq!(read.notes.len(), 1, "{bad}: {:?}", read.notes);
             assert!(
-                err.contains("a fixed width must be a whole number of pixels in 16..=400"),
-                "{bad}: {err}"
+                read.notes[0].contains("a fixed width is a whole number of pixels in 16..=400"),
+                "{bad}: {:?}",
+                read.notes
             );
+            assert!(read.keep_copy.is_some(), "{bad}: the text read is kept aside");
+            let mut stripped = layout.root_node();
+            if let Node::Con(c) = &mut stripped {
+                for ch in &mut c.children {
+                    ch.fixed_w_px = None;
+                }
+            }
+            let mut expected = layout.clone();
+            expected.replace_root(stripped);
+            assert_eq!(read.current.root(), expected.root(), "{bad}");
         }
+        // A height out of range likewise.
+        let tall = text.replacen("\"fixed_w_px\": 62", "\"fixed_w_px\": 62, \"fixed_px\": 201", 1);
+        let read = decode_v2(&tall, &root(), &decls).unwrap();
+        assert!(read
+            .notes
+            .iter()
+            .any(|n| n.contains("a fixed height is a whole number of pixels in 16..=200")));
         // A width on a column's child is read and kept; the column draws it by its share.
         let mut column = super::super::fixture::fixture("column(lua:rail, editor focus, agent, terminal hidden)");
         let mut root_node = column.root_node();

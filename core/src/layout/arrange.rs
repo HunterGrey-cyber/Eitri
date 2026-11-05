@@ -1,7 +1,7 @@
 //! Integer geometry for ordered split containers. Visible children divide the remaining
 //! rectangle as a chain, so hidden children surrender space in proportion to visible shares.
 
-use super::con::{Child, Con, ConId, ConLayout, Node};
+use super::con::{Child, Con, ConId, ConLayout, Node, SHARE_SLACK};
 use super::geometry::{Arrangement, ConStripEntry, Frame, Rect, Size, Strip};
 use super::module::ModuleId;
 use super::tree::{Axis, MAX_RATIO, MIN_RATIO};
@@ -17,6 +17,13 @@ pub struct Divider {
     pub first_px: i32,
     pub min_first: i32,
     pub min_second: i32,
+    /// The drawn length of the one child right after the divider (not the whole rest), and its minimum: what a fixed
+    /// child's own edge may take from that neighbour.
+    pub next_px: i32,
+    pub next_min: i32,
+    /// The drawn length of every child of the container on screen, by its index, as this arrangement drew them: what a
+    /// drag that keeps the others' pixels solves the shares against.
+    pub lengths: Vec<(usize, i32)>,
 }
 impl Divider {
     pub fn ratio_for(&self, first_px: i32) -> f32 {
@@ -263,8 +270,10 @@ pub(crate) fn arrange_tree(root: &Con, rect: Rect, shown: &dyn Fn(&ModuleId) -> 
         }
 
         let axis = c.layout.axis().unwrap();
+        let mut drawn: Vec<(usize, i32)> = Vec::with_capacity(v.len());
         for (j, &i) in v.iter().enumerate() {
             if j + 1 == v.len() {
+                drawn.push((i, along(axis, Size { w: rect.w, h: rect.h })));
                 place(&c.children[i].node, rect, shown, frame, out);
                 break;
             }
@@ -326,6 +335,18 @@ pub(crate) fn arrange_tree(root: &Con, rect: Rect, shown: &dyn Fn(&ModuleId) -> 
                     },
                 ),
             };
+            // The child after this divider is drawn by the next step (or is the last, taking the rest): its length is
+            // filled in then.
+            if j > 0 {
+                if let Some(prev) = out
+                    .dividers
+                    .iter_mut()
+                    .rev()
+                    .find(|p| p.con == c.id && p.index == v[j - 1])
+                {
+                    prev.next_px = first_px;
+                }
+            }
             out.dividers.push(Divider {
                 con: c.id,
                 index: i,
@@ -335,9 +356,19 @@ pub(crate) fn arrange_tree(root: &Con, rect: Rect, shown: &dyn Fn(&ModuleId) -> 
                 first_px,
                 min_first: min_a,
                 min_second: min_b,
+                next_px: second_px,
+                next_min: along(
+                    axis,
+                    child_min(&c.children[v[j + 1]], axis, shown, frame, true).unwrap(),
+                ),
+                lengths: Vec::new(),
             });
+            drawn.push((i, first_px));
             place(&c.children[i].node, first_rect, shown, frame, out);
             rect = second_rect;
+        }
+        for d in out.dividers.iter_mut().filter(|d| d.con == c.id) {
+            d.lengths.clone_from(&drawn);
         }
     }
     let mut out = Arrangement::default();
@@ -392,27 +423,97 @@ fn trade(children: &mut [Child], rest: &[usize], ratio: f32) {
     children[rest[0]].share = new;
     children[rest[1]].share = pair - new;
 }
-pub(crate) fn move_divider_in(root: &mut Con, d: &Divider, first_px: i32, shown: &dyn Fn(&ModuleId) -> bool) -> bool {
-    let Some((c, v)) = step(root, d, shown) else {
-        return false;
-    };
+/// The pixels the children without a fixed length share in the step `v` of `d`: the step's length less its handles
+/// and the reserved lengths in it, as [`fixed_first`] divides it.
+fn fractional_pixels(c: &Con, v: &[usize], d: &Divider) -> i64 {
+    let handle = along(
+        d.axis,
+        Size {
+            w: d.rect.w,
+            h: d.rect.h,
+        },
+    );
+    let pixels: i64 = v
+        .iter()
+        .filter_map(|&i| reserved(&c.children[i], d.axis))
+        .map(i64::from)
+        .sum();
+    i64::from(d.avail + handle) - i64::from(handle) * (v.len() - 1) as i64 - pixels
+}
+/// A child's pixel length that the arrangement takes before the shares: a leaf's fixed length, or a settled pin.
+fn pixel_length(child: &Child, axis: Axis) -> Option<i32> {
+    reserved(child, axis)
+}
+/// A fixed child's own edge moved by `delta` pixels (positive: it grows): the fixed child's length and the one
+/// neighbour across the dragged edge change, in pixels, and every other child keeps its pixels.
+///
+/// - A neighbour with a pixel length of its own (a fixed length, a settled pin) trades length for length, each kept in
+///   its range (a pin at its minimum).
+/// - A neighbour drawn by its share gives or takes the pixels as share: its share moves by `delta` pixels' worth of the
+///   container's fractional space, and every share drawn by a fraction is then scaled alike so the shares add up to
+///   1 again, which moves no other child's pixels. Every share stays at least `MIN_RATIO`; a drag that would break that
+///   is cut back to the largest that does not.
+///
+/// The neighbour never goes below its drawn minimum (`next_min` or `min_first`), nor the fixed child out of its range.
+fn resize_fixed(
+    c: &mut Con,
+    v: &[usize],
+    d: &Divider,
+    shown: &dyn Fn(&ModuleId) -> bool,
+    fixed: usize,
+    neighbour: usize,
+    delta: i32,
+) {
     let axis = d.axis;
-    if let Some((i, far)) = governing(c, &v) {
-        let first = d.clamp_first(first_px);
-        c.children[i].pin.as_mut().unwrap().px = Some(if far { d.avail - first } else { first });
-    } else if fixed_length(&c.children[v[0]], axis).is_some() {
-        // The fixed child's own edge: the drag (or `Ctrl+a h/l`) sets its length in pixels, within its range and
-        // off the other side's minimum, as dragging a pinned row's divider sets the pin.
-        let px = first_px.min(d.avail - d.min_second);
-        set_fixed_length(&mut c.children[v[0]], axis, px);
-    } else if v.len() == 2 && fixed_length(&c.children[v[1]], axis).is_some() {
-        // The last child is the fixed one: it takes what the divider leaves it.
-        let px = (d.avail - first_px).min(d.avail - d.min_first);
-        set_fixed_length(&mut c.children[v[1]], axis, px);
-    } else if v.iter().any(|&i| fixed_length(&c.children[i], axis).is_some()) {
-        // A fixed child further along: the arrangement gives it its pixels first and divides the rest by the shares of
-        // the others, so the drag is turned into a share over that rest, traded with the next child without a fixed
-        // length (the fixed one between them just moves along).
+    let range = fixed_range(axis);
+    let Some(length) = fixed_length(&c.children[fixed], axis) else {
+        return;
+    };
+    let (neighbour_px, neighbour_min) = if neighbour == v[0] {
+        (d.first_px, d.min_first)
+    } else {
+        (d.next_px, d.next_min)
+    };
+    // The fixed child's range, and the neighbour's minimum, bound the drag.
+    let mut delta = delta.clamp(*range.start() - length, *range.end() - length);
+    if fixed_length(&c.children[neighbour], axis).is_none() {
+        // A neighbour without a length of its own stops the growth at its drawn minimum (its page's, or the floor).
+        delta = delta.min((neighbour_px - neighbour_min).max(0));
+    }
+    if let Some(other) = pixel_length(&c.children[neighbour], axis) {
+        let floor = match fixed_length(&c.children[neighbour], axis) {
+            Some(_) => *range.start(),
+            None => neighbour_min.max(0),
+        };
+        let ceiling = match fixed_length(&c.children[neighbour], axis) {
+            Some(_) => *range.end(),
+            None => i32::MAX,
+        };
+        delta = delta.min(other - floor).max(other - ceiling);
+        set_fixed_length(&mut c.children[fixed], axis, length + delta);
+        if fixed_length(&c.children[neighbour], axis).is_some() {
+            set_fixed_length(&mut c.children[neighbour], axis, other - delta);
+        } else if let Some(pin) = c.children[neighbour].pin.as_mut() {
+            pin.px = Some(other - delta);
+        }
+        return;
+    }
+    // A neighbour drawn by its share: solve for the shares that draw the fixed child and its neighbour at their new
+    // lengths and every other child at the length it has now, as the arrangement draws them (pins, clamps and all).
+    let lengths: Vec<(usize, i32)> = d.lengths.clone();
+    let shares_for = |delta: i32| -> Option<Vec<f32>> {
+        let targets: Vec<(usize, i32)> = lengths
+            .iter()
+            .map(|&(i, px)| {
+                if i == fixed {
+                    (i, length + delta)
+                } else if i == neighbour {
+                    (i, px - delta)
+                } else {
+                    (i, px)
+                }
+            })
+            .collect();
         let handle = along(
             axis,
             Size {
@@ -420,13 +521,146 @@ pub(crate) fn move_divider_in(root: &mut Con, d: &Divider, first_px: i32, shown:
                 h: d.rect.h,
             },
         );
-        let length = d.avail + handle;
-        let pixels: i64 = v
-            .iter()
-            .filter_map(|&i| reserved(&c.children[i], axis))
-            .map(i64::from)
-            .sum();
-        let available = i64::from(length) - i64::from(handle) * (v.len() - 1) as i64 - pixels;
+        shares_drawing(c, &targets, handle, axis)
+    };
+    let mut shares = shares_for(delta);
+    if shares.is_none() {
+        // Cut the drag back to the largest that keeps every share at least the smallest.
+        let (mut ok, mut bad) = (0, delta);
+        for _ in 0..24 {
+            let mid = ok + (bad - ok) / 2;
+            if mid == ok {
+                break;
+            }
+            if shares_for(mid).is_some() {
+                ok = mid;
+            } else {
+                bad = mid;
+            }
+        }
+        delta = ok;
+        shares = shares_for(delta);
+    }
+    set_fixed_length(&mut c.children[fixed], axis, length + delta);
+    // With no shares that draw the others as they are (a window too small to draw them at the smallest share), the
+    // length still changes and the children drawn by a fraction divide the difference by their shares.
+    if let Some(shares) = shares {
+        for (child, share) in c.children.iter_mut().zip(shares) {
+            child.share = share;
+        }
+    }
+    let _ = shown;
+}
+/// The shares, for every child of `c`, that make the arrangement draw each child on screen at its length in
+/// `targets` (the container's visible children, in order, with the lengths wanted), or `None` when that needs a share
+/// below the smallest. The arrangement draws the chain step by step, each step's first child from a pixel length
+/// (a fixed length, a pin), or from its share against the shares after it: solved from the last step back, each such
+/// share is the one that gives its child the wanted length against the shares already solved after it. Lengths that
+/// meet every child's minimum are drawn as asked, clamps not binding. The shares of the children without a fixed length
+/// are then scaled together so all add up to 1, which changes no ratio the arrangement reads.
+fn shares_drawing(c: &Con, targets: &[(usize, i32)], handle: i32, axis: Axis) -> Option<Vec<f32>> {
+    let mut shares: Vec<f64> = c.children.iter().map(|ch| f64::from(ch.share)).collect();
+    let rest = |j: usize| -> Vec<usize> { targets[j..].iter().map(|&(i, _)| i).collect() };
+    for j in (0..targets.len().saturating_sub(1)).rev() {
+        let r = rest(j);
+        let (first, want) = targets[j];
+        let want = f64::from(want);
+        let length: f64 =
+            targets[j..].iter().map(|&(_, px)| f64::from(px)).sum::<f64>() + f64::from(handle) * (r.len() - 1) as f64;
+        if r.iter().any(|&i| fixed_length(&c.children[i], axis).is_some()) {
+            if reserved(&c.children[first], axis).is_some() {
+                continue;
+            }
+            // The reserved children's lengths are the wanted ones (the fixed child's new length), not those stored.
+            let pixels: f64 = targets[j..]
+                .iter()
+                .filter(|&&(i, _)| reserved(&c.children[i], axis).is_some())
+                .map(|&(_, px)| f64::from(px))
+                .sum();
+            let available = length - f64::from(handle) * (r.len() - 1) as f64 - pixels;
+            let after: f64 = r[1..]
+                .iter()
+                .filter(|&&i| reserved(&c.children[i], axis).is_none())
+                .map(|&i| shares[i])
+                .sum();
+            if after <= 0.0 {
+                continue;
+            }
+            if available - want <= 0.0 {
+                return None;
+            }
+            shares[first] = want * after / (available - want);
+        } else if governing(c, &r).is_some_and(|(i, _)| c.children[i].pin.is_some_and(|p| p.px.is_some())) {
+            continue;
+        } else {
+            let after: f64 = r[1..].iter().map(|&i| shares[i]).sum();
+            let avail = length - f64::from(handle);
+            if avail - want <= 0.0 || after <= 0.0 {
+                return None;
+            }
+            shares[first] = want * after / (avail - want);
+        }
+    }
+    // A fixed child's share is never read while it has its length (a step holding it divides by the others'), so it
+    // stays as it is; the others are scaled together to fill the rest.
+    let fixed = |i: usize| fixed_length(&c.children[i], axis).is_some();
+    let kept: f64 = (0..shares.len()).filter(|&i| fixed(i)).map(|i| shares[i]).sum();
+    let total: f64 = (0..shares.len()).filter(|&i| !fixed(i)).map(|i| shares[i]).sum();
+    if !total.is_finite() || total <= 0.0 || kept >= 1.0 {
+        return None;
+    }
+    let scale = (1.0 - kept) / total;
+    let shares: Vec<f64> = shares
+        .into_iter()
+        .enumerate()
+        .map(|(i, s)| if fixed(i) { s } else { s * scale })
+        .collect();
+    shares
+        .iter()
+        .all(|&s| s >= f64::from(MIN_RATIO - SHARE_SLACK) && s <= 1.0)
+        .then(|| shares.into_iter().map(|s| s as f32).collect())
+}
+pub(crate) fn move_divider_in(root: &mut Con, d: &Divider, first_px: i32, shown: &dyn Fn(&ModuleId) -> bool) -> bool {
+    let Some((c, v)) = step(root, d, shown) else {
+        return false;
+    };
+    let axis = d.axis;
+    // Where the divider may go: off both sides' minimums, and still inside a step too small for them both (a narrow
+    // window), where the first side's minimum gives way.
+    let hi = (d.avail - d.min_second).max(0);
+    let lo = d.min_first.min(d.avail).min(hi);
+    let first = first_px.clamp(lo, hi);
+    if fixed_length(&c.children[v[0]], axis).is_some() {
+        // The fixed child's own right (or lower) edge, before any pin: the drag (or `Ctrl+a l`) sets its length, and the
+        // neighbour after it alone gives or takes (`resize_fixed`). Its own minimum is the length it has now, so the
+        // lower bound is its range's, not `min_first`.
+        let range = fixed_range(axis);
+        // `min_second` counts the neighbour's minimum; a fixed neighbour's minimum is its present length, which a trade
+        // of lengths may take down to its range's start.
+        let min_second = match fixed_length(&c.children[v[1]], axis) {
+            Some(_) => d.min_second - d.next_min + *range.start(),
+            None => d.min_second,
+        };
+        let hi = (d.avail - min_second).max(0);
+        let px = first_px.clamp((*range.start()).min(hi), hi);
+        resize_fixed(c, &v, d, shown, v[0], v[1], px - d.first_px);
+    } else if let Some(px) = fixed_length(&c.children[v[1]], axis) {
+        // Its left (or upper) edge: the child before it alone gives or takes what the drag moves, down to that child's
+        // minimum one way and to the fixed child's smallest length the other (`min_second` counts the fixed child's
+        // present length, so it does not bound this edge).
+        let range = fixed_range(axis);
+        let hi = (d.first_px + px - *range.start()).max(0);
+        let lo = d.min_first.min(d.avail).min(hi);
+        let first = first_px.clamp(lo, hi);
+        resize_fixed(c, &v, d, shown, v[1], v[0], d.first_px - first);
+    } else if let Some((i, far)) = governing(c, &v) {
+        let first = d.clamp_first(first_px);
+        c.children[i].pin.as_mut().unwrap().px = Some(if far { d.avail - first } else { first });
+    } else if v.iter().any(|&i| fixed_length(&c.children[i], axis).is_some()) {
+        // A fixed child further along: the arrangement gives it its pixels first and divides the rest by the shares of
+        // the others, so the drag is turned into a share over that rest, traded with the next child without a fixed
+        // length (the fixed one between them just moves along).
+        let available = fractional_pixels(c, &v, d);
         let Some(&partner) = v[1..].iter().find(|&&i| reserved(&c.children[i], axis).is_none()) else {
             return true;
         };
@@ -442,7 +676,6 @@ pub(crate) fn move_divider_in(root: &mut Con, d: &Divider, first_px: i32, shown:
         if pair < 2.0 * MIN_RATIO {
             return true;
         }
-        let first = first_px.clamp(d.min_first.min(d.avail), (d.avail - d.min_second).max(0));
         let wanted = (f64::from(first) / available as f64 * f64::from(shares)) as f32;
         let new = wanted.clamp(MIN_RATIO, pair - MIN_RATIO);
         c.children[v[0]].share = new;
@@ -657,6 +890,276 @@ mod tests {
         let d = divider(&c, size, 0);
         assert!(move_divider_in(&mut c, &d, 400, &|_| true));
         assert_eq!(lengths(&c, size), [400, 470, 28]);
+    }
+
+    /// A step too narrow for its minimums (a tiling compositor's narrow window): every drag and key resize near a
+    /// fixed child is taken without a panic, and everything stays inside the row.
+    #[test]
+    fn a_drag_in_a_cramped_step_beside_a_fixed_width_does_not_panic() {
+        for w in [60, 100, 110, 120] {
+            for (k, shares, fixed) in [
+                (2, [0.5, 0.25, 0.25], 2usize),
+                (0, [0.25, 0.5, 0.25], 0),
+                (1, [0.4, 0.2, 0.4], 1),
+            ] {
+                let _ = k;
+                let size = Size { w, h: 80 };
+                for d_index in 0..2 {
+                    for px in [-10, 0, 14, 32, 50, 62, 109, 200, 5000] {
+                        let mut c = flat(&shares);
+                        c.children[fixed].fixed_w_px = Some(62);
+                        let Some(d) = at(&c, &|_| true, size).1.get(d_index).cloned() else {
+                            continue;
+                        };
+                        assert!(move_divider_in(&mut c, &d, px, &|_| true), "{w} {d_index} {px}");
+                        assert_eq!(c.check(true), Ok(()), "{w} {d_index} {px}: {c:?}");
+                        let (modules, _) = at(&c, &|_| true, size);
+                        assert!(modules.iter().all(|(_, r)| r.x >= 0 && r.w >= 0 && r.x + r.w <= w));
+                    }
+                }
+            }
+        }
+        // The same in two fractional leaves and no fixed one.
+        let mut c = flat(&[0.5, 0.5]);
+        let d = at(&c, &|_| true, Size { w: 50, h: 80 }).1.remove(0);
+        assert!(move_divider_in(&mut c, &d, 30, &|_| true));
+    }
+
+    /// A fixed pane in the middle: dragging either of its edges changes its length and the neighbour across that edge
+    /// only; the divider on its other side stays where it was. In a row and in a column.
+    #[test]
+    fn a_middle_fixed_panes_edges_move_only_their_own_neighbour() {
+        let size = Size { w: 1200, h: 700 };
+        let middle = || {
+            let mut c = flat(&[0.475, 0.05, 0.475]);
+            c.children[1].fixed_w_px = Some(62);
+            c
+        };
+        let c0 = middle();
+        assert_eq!(lengths(&c0, size), [568, 62, 568]);
+        // Its right edge, 100 px to the right (a drag from x 631 to 731), and a key resize back by ten.
+        let mut c = middle();
+        let d = divider(&c, size, 1);
+        assert_eq!(d.rect.x, 631);
+        assert!(move_divider_in(&mut c, &d, 162, &|_| true));
+        assert_eq!(lengths(&c, size), [568, 162, 468]);
+        let d = divider(&c, size, 1);
+        assert!(move_divider_in(&mut c, &d, d.first_px - 10, &|_| true));
+        assert_eq!(lengths(&c, size), [568, 152, 478]);
+        assert_eq!(c.check(true), Ok(()));
+        // Its left edge, 100 px to the left.
+        let mut c = middle();
+        let d = divider(&c, size, 0);
+        assert!(move_divider_in(&mut c, &d, 468, &|_| true));
+        assert_eq!(lengths(&c, size), [468, 162, 568]);
+        assert_eq!(c.check(true), Ok(()));
+        // A strip of 28 px in the middle of a column, both edges.
+        let size = Size { w: 1000, h: 900 };
+        let column = || {
+            let mut c = flat(&[0.475, 0.05, 0.475]);
+            c.layout = ConLayout::SplitV;
+            c.children[1].fixed_px = Some(28);
+            c
+        };
+        assert_eq!(lengths(&column(), size), [435, 28, 435]);
+        let mut c = column();
+        let d = divider(&c, size, 1);
+        assert!(move_divider_in(&mut c, &d, 128, &|_| true));
+        assert_eq!(lengths(&c, size), [435, 128, 335]);
+        let mut c = column();
+        let d = divider(&c, size, 0);
+        assert!(move_divider_in(&mut c, &d, 385, &|_| true));
+        assert_eq!(lengths(&c, size), [385, 78, 435]);
+        // A rail at the end of a row: its edge moves the module beside it only, not the one before that.
+        let mut c = flat(&[0.5, 0.25, 0.25]);
+        c.children[2].fixed_w_px = Some(62);
+        let before = lengths(&c, Size { w: 1200, h: 700 });
+        let d = divider(&c, Size { w: 1200, h: 700 }, 1);
+        assert!(move_divider_in(&mut c, &d, d.first_px - 100, &|_| true));
+        let after = lengths(&c, Size { w: 1200, h: 700 });
+        assert_eq!((after[0], after[1], after[2]), (before[0], before[1] - 100, 162));
+    }
+
+    /// The fixed-edge rule: a fixed child's own edge changes its length and the neighbour across that edge, in pixels;
+    /// every other child keeps its pixels. Shrinking from the default share (the smallest), in a row and a column.
+    #[test]
+    fn shrinking_a_fixed_pane_from_its_default_share_moves_only_its_neighbour() {
+        let size = Size { w: 1200, h: 700 };
+        let middle = || {
+            let mut c = flat(&[0.475, 0.05, 0.475]);
+            c.children[1].fixed_w_px = Some(62);
+            c
+        };
+        let mut c = middle();
+        let d = divider(&c, size, 1);
+        assert!(move_divider_in(&mut c, &d, 16, &|_| true));
+        assert_eq!(lengths(&c, size), [568, 16, 614]);
+        assert_eq!(c.check(true), Ok(()));
+        let mut c = middle();
+        let d = divider(&c, size, 0);
+        assert!(move_divider_in(&mut c, &d, 614, &|_| true));
+        assert_eq!(lengths(&c, size), [614, 16, 568]);
+        // The rail at the left of a 1280 px row, narrowed to 40: the editor takes the 22 px, the chat keeps its width.
+        let size = Size { w: 1280, h: 700 };
+        let mut c = flat(&[0.05, 0.5, 0.45]);
+        c.children[0].fixed_w_px = Some(62);
+        let before = lengths(&c, size);
+        let d = divider(&c, size, 0);
+        assert!(move_divider_in(&mut c, &d, 40, &|_| true));
+        let after = lengths(&c, size);
+        assert_eq!(after, [40, before[1] + 22, before[2]]);
+        // A strip in a column.
+        let size = Size { w: 1000, h: 900 };
+        let mut c = flat(&[0.475, 0.05, 0.475]);
+        c.layout = ConLayout::SplitV;
+        c.children[1].fixed_px = Some(28);
+        let d = divider(&c, size, 1);
+        assert!(move_divider_in(&mut c, &d, 16, &|_| true));
+        assert_eq!(lengths(&c, size), [435, 16, 447]);
+    }
+
+    /// Between two fixed panes the drag trades length for length, each within its range; the panes outside keep theirs.
+    #[test]
+    fn dragging_between_two_fixed_panes_trades_their_lengths() {
+        let size = Size { w: 1201, h: 700 };
+        let mut c = flat(&[0.45, 0.05, 0.05, 0.45]);
+        c.children[1].fixed_w_px = Some(62);
+        c.children[2].fixed_w_px = Some(62);
+        let before = lengths(&c, size);
+        assert_eq!(&before[1..3], [62, 62]);
+        let d = divider(&c, size, 1);
+        assert!(move_divider_in(&mut c, &d, 82, &|_| true));
+        assert_eq!(lengths(&c, size), [before[0], 82, 42, before[3]]);
+        // As far as the other's range allows: it stops at 16.
+        let d = divider(&c, size, 1);
+        assert!(move_divider_in(&mut c, &d, 300, &|_| true));
+        assert_eq!(lengths(&c, size), [before[0], 108, 16, before[3]]);
+    }
+
+    /// Growth stops at the neighbour's drawn minimum (here the 32 px floor), not at its share: the pane past the
+    /// neighbour never pays.
+    #[test]
+    fn a_fixed_pane_grows_only_as_far_as_its_neighbours_minimum() {
+        let size = Size { w: 300, h: 700 };
+        let mut c = flat(&[0.4, 0.1, 0.1, 0.4]);
+        c.children[1].fixed_w_px = Some(62);
+        let before = lengths(&c, size);
+        assert_eq!(before[2], 32, "the neighbour is at its floor: {before:?}");
+        let d = divider(&c, size, 1);
+        assert!(move_divider_in(&mut c, &d, d.first_px + 10, &|_| true));
+        assert_eq!(lengths(&c, size), before);
+    }
+
+    /// A fixed pane's own edge wins over a pin beside it: the pinned neighbour gives or takes, the rest stays.
+    #[test]
+    fn a_fixed_panes_edge_beside_a_pinned_row_moves_the_pin_not_the_rest() {
+        let size = Size { w: 1000, h: 900 };
+        let mut c = flat(&[0.5, 0.2, 0.3]);
+        c.layout = ConLayout::SplitV;
+        c.children[1].fixed_px = Some(28);
+        c.children[2].pin = Some(Pin { px: Some(200) });
+        let before = lengths(&c, size);
+        assert_eq!(&before[1..], [28, 200]);
+        let d = divider(&c, size, 1);
+        assert!(move_divider_in(&mut c, &d, 78, &|_| true));
+        assert_eq!(lengths(&c, size), [before[0], 78, 150]);
+    }
+
+    /// Lengths and dividers of `c` in `size` with `minimum` as every module's measured minimum.
+    fn measured(c: &Con, size: Size, minimum: &dyn Fn(&ModuleId) -> Size) -> (Vec<i32>, Vec<Divider>) {
+        let frame = Frame {
+            min: minimum,
+            ..Frame::new(size, 1)
+        };
+        let axis = c.layout.axis().unwrap();
+        let (modules, dividers) = arrange_con(
+            c,
+            Rect {
+                x: 0,
+                y: 0,
+                w: size.w,
+                h: size.h,
+            },
+            &|_| true,
+            &frame,
+        );
+        (
+            modules
+                .iter()
+                .map(|(_, r)| along(axis, Size { w: r.w, h: r.h }))
+                .collect(),
+            dividers,
+        )
+    }
+
+    /// The share given or taken is solved against the lengths drawn, not the shares: a neighbour held at its measured
+    /// minimum, or a pin further on, leaves every other child where it was. In a row and in a column.
+    #[test]
+    fn a_fixed_edge_drag_keeps_the_others_drawn_lengths_past_minimums_and_pins() {
+        for vertical in [false, true] {
+            let size = if vertical {
+                Size { w: 700, h: 1200 }
+            } else {
+                Size { w: 1200, h: 700 }
+            };
+            let set = |c: &mut Con, i: usize, px: i32| {
+                if vertical {
+                    c.layout = ConLayout::SplitV;
+                    c.children[i].fixed_px = Some(px.min(200));
+                } else {
+                    c.children[i].fixed_w_px = Some(px);
+                }
+            };
+            // Case A: the neighbour measures at least 200 px and is drawn there, past its share.
+            let at_least_200 = |id: &ModuleId| {
+                if *id == ModuleId::lua("m1") {
+                    Size { w: 200, h: 200 }
+                } else {
+                    Size::default()
+                }
+            };
+            let mut c = flat(&[0.05, 0.1, 0.4, 0.45]);
+            set(&mut c, 0, 62);
+            let (before, dividers) = measured(&c, size, &at_least_200);
+            assert_eq!(before, [62, 200, 440, 495], "vertical {vertical}");
+            assert!(move_divider_in(&mut c, &dividers[0], 16, &|_| true));
+            assert_eq!(c.check(true), Ok(()));
+            assert_eq!(
+                measured(&c, size, &at_least_200).0,
+                [16, 246, 440, 495],
+                "vertical {vertical}"
+            );
+            // Case B: a 200 px pin at the end.
+            let none = |_: &ModuleId| Size::default();
+            let mut c = flat(&[0.05, 0.2, 0.3, 0.45]);
+            set(&mut c, 0, 62);
+            c.children[3].pin = Some(Pin { px: Some(200) });
+            let (before, dividers) = measured(&c, size, &none);
+            assert_eq!(before, [62, 239, 696, 200], "vertical {vertical}");
+            assert!(move_divider_in(&mut c, &dividers[0], 16, &|_| true));
+            assert_eq!(c.check(true), Ok(()));
+            assert_eq!(measured(&c, size, &none).0, [16, 285, 696, 200], "vertical {vertical}");
+        }
+    }
+
+    /// Two fixed children side by side at the end: their shared edge trades length for length, both ways, down to 16,
+    /// though each one's present length is its minimum.
+    #[test]
+    fn the_edge_between_two_fixed_children_moves_both_ways() {
+        let size = Size { w: 1000, h: 700 };
+        let mut c = flat(&[0.9, 0.05, 0.05]);
+        c.children[1].fixed_w_px = Some(62);
+        c.children[2].fixed_w_px = Some(62);
+        assert_eq!(lengths(&c, size), [874, 62, 62]);
+        let d = divider(&c, size, 1);
+        assert!(move_divider_in(&mut c, &d, 82, &|_| true));
+        assert_eq!(lengths(&c, size), [874, 82, 42]);
+        let d = divider(&c, size, 1);
+        assert!(move_divider_in(&mut c, &d, 62, &|_| true));
+        assert_eq!(lengths(&c, size), [874, 62, 62]);
+        let d = divider(&c, size, 1);
+        assert!(move_divider_in(&mut c, &d, 300, &|_| true));
+        assert_eq!(lengths(&c, size), [874, 108, 16]);
     }
 
     /// A slot that held the rail and now holds a container (a tab added, then split) does not squeeze the container's

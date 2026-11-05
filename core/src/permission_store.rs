@@ -373,6 +373,20 @@ mod tests {
         assert_eq!(load(&dir, &root), LoadedRules::Rules(rules));
     }
 
+    /// Saves once the lock is free: a child another test thread is starting holds a copy of every descriptor
+    /// until it execs, and with it the lock a test just dropped, so "free at once" is not promised.
+    fn once_free<T>(save: impl Fn() -> std::io::Result<T>) -> std::io::Result<T> {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        loop {
+            match save() {
+                Err(e) if e.kind() == std::io::ErrorKind::WouldBlock && std::time::Instant::now() < deadline => {
+                    std::thread::sleep(std::time::Duration::from_millis(10))
+                }
+                other => return other,
+            }
+        }
+    }
+
     /// Holds `file`'s store lock through a descriptor of its own, as another window's process would.
     fn held_by_another_window(file: &Path) -> std::fs::File {
         use std::os::unix::io::AsRawFd;
@@ -469,7 +483,7 @@ mod tests {
         );
         assert_eq!(std::fs::read_to_string(&file).unwrap(), before);
         drop(held);
-        let rules = add(&dir, &root(), &rule("Bash(git log *)")).unwrap();
+        let rules = once_free(|| add(&dir, &root(), &rule("Bash(git log *)"))).unwrap();
         assert_eq!(rules.rules().len(), 2);
     }
 
@@ -486,7 +500,13 @@ mod tests {
         assert!(file.exists(), "set aside while another window held it: {notes:?}");
         assert!(!notes.iter().any(|n| n.contains("set aside as")), "{notes:?}");
         drop(held);
-        assert_eq!(add(&dir, &root(), &rule("Bash(git log *)")).unwrap().rules().len(), 1);
+        assert_eq!(
+            once_free(|| add(&dir, &root(), &rule("Bash(git log *)")))
+                .unwrap()
+                .rules()
+                .len(),
+            1
+        );
     }
 
     #[test]

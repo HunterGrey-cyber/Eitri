@@ -1,5 +1,5 @@
 [English](many-agents.md) | 简体中文
-<!-- translated-from: many-agents.md sha256=f807c4fea609315fb1475d2bcd50fa692b9f5df975045854717f2e550c19b896 -->
+<!-- translated-from: many-agents.md sha256=de147fca84d1da1dcfc01466965956cc3dedf0734407c8a66340e36062936a81 -->
 
 # 同时用很多 agent
 
@@ -40,7 +40,7 @@ eitri.plugin.load("agents-strips", { narrow = true })
 eitri.layout.rule("lua:agents-strips", { at = "left", size = "62px" })
 ```
 
-规则在窗口放置这一列时（第一次启动时）决定它的位置和宽度；你保存过的布局保持这一列原来的样子。关掉再显示，窄条仍是原来的宽度。拖动它的边缘，或者在按键在它上面时用 `<prefix> Ctrl+Left`/`Ctrl+Right`，可以按像素改宽度（16 到 400）。
+规则在窗口放置这一列时（第一次启动时）决定它的位置和宽度；你保存过的布局保持这一列原来的样子。关掉再显示，窄条仍是原来的宽度。拖动它的边缘，或者在按键在它上面时用 `<prefix> Ctrl+Left`/`Ctrl+Right`，可以按像素改宽度（16 到 400）。除了像素宽度，这一列还保留一个占窗口的份额，起初是最小的份额（二十分之一），随你拖动宽度而增减；只有在像素宽度不起作用的地方才会看到这个份额：较旧版本的 Eitri 读到的布局里，或者窄条被移进上下排列的一列模块时。
 
 列窄的时候，完整的侧栏保留标签，也就是让你分清各个 agent 的那部分：先省掉工具名，再省掉时长。鼠标停在一行上会显示它的全名。
 

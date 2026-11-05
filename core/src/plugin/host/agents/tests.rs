@@ -1131,10 +1131,7 @@ fn the_guide_example_plugin_loads_and_counts_waiting() {
         ]
     );
     // The fixture is the guide's example, word for word.
-    let guide = std::fs::read_to_string(
-        std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../publish/files/docs/guide/many-agents.md"),
-    )
-    .unwrap();
+    let guide = std::fs::read_to_string(crate::guide_files::this_trees_guide().join("many-agents.md")).unwrap();
     assert!(
         guide.contains(script.trim_end()),
         "the guide's main.js and the fixture differ"
