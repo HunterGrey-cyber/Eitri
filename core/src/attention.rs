@@ -84,6 +84,8 @@ pub struct Attention {
 #[derive(Debug, Default)]
 pub struct AttentionTracker {
     cards: BTreeMap<String, u64>,
+    /// Only tool names delivered with cards; no request input is retained here.
+    card_tools: BTreeMap<String, String>,
     questions: BTreeMap<String, u64>,
     /// The tool broker's cards, kept apart from `cards` so nothing that approves a tab's waiting cards can name one.
     editor_cards: BTreeMap<String, u64>,
@@ -113,6 +115,7 @@ impl AttentionTracker {
     /// not rise, so [`react`] would miss that card.
     pub fn restart(&mut self) {
         self.cards.clear();
+        self.card_tools.clear();
         self.questions.clear();
         self.editor_cards.clear();
         self.unread = false;
@@ -125,8 +128,13 @@ impl AttentionTracker {
     pub fn observe(&mut self, delivered: &[AgentDomainEvent], on_screen: bool) {
         for event in delivered {
             match event {
-                AgentDomainEvent::PermissionRequested { permission_id, .. } => {
+                AgentDomainEvent::PermissionRequested {
+                    permission_id,
+                    tool_name,
+                    ..
+                } => {
                     self.empty_cli_turn = false;
+                    self.card_tools.insert(permission_id.clone(), tool_name.clone());
                     if !self.cards.contains_key(permission_id) {
                         self.cards.insert(permission_id.clone(), next_stamp());
                         self.arrived += 1;
@@ -134,6 +142,7 @@ impl AttentionTracker {
                 }
                 AgentDomainEvent::PermissionResolved { permission_id, .. } => {
                     self.cards.remove(permission_id);
+                    self.card_tools.remove(permission_id);
                 }
                 AgentDomainEvent::TurnStarted { turn_id } => {
                     self.turn = TurnSeen::Running(turn_id.clone());
@@ -176,6 +185,7 @@ impl AttentionTracker {
     /// module doc).
     pub fn session_ended(&mut self, on_screen: bool) {
         self.cards.clear();
+        self.card_tools.clear();
         self.questions.clear();
         self.editor_cards.clear();
         if !on_screen {
@@ -201,6 +211,7 @@ impl AttentionTracker {
             cards.insert(id, stamp);
         }
         self.cards = cards;
+        self.card_tools.retain(|id, _| self.cards.contains_key(id));
     }
 
     pub fn question_ids(&self) -> Vec<String> {
@@ -235,6 +246,7 @@ impl AttentionTracker {
     /// Forgets every card the projection no longer holds.
     pub fn retain_pending(&mut self, still_pending: impl Fn(&str) -> bool) {
         self.cards.retain(|id, _| still_pending(id));
+        self.card_tools.retain(|id, _| self.cards.contains_key(id));
     }
 
     /// The ids this tracker still holds a card for, oldest arrival first (`TabSet::waiting_cards`:
@@ -267,6 +279,30 @@ impl AttentionTracker {
             .values()
             .chain(self.questions.values())
             .chain(self.editor_cards.values())
+    }
+
+    /// Counts of cards actually handed to the page, broker cards, and questions, respectively.
+    pub(crate) fn counts(&self) -> (usize, usize, usize) {
+        (self.cards.len(), self.editor_cards.len(), self.questions.len())
+    }
+
+    /// Namespaces keep unrelated provider, broker and question ids from sharing a wait stamp.
+    pub(crate) fn waiting_ids(&self) -> Vec<String> {
+        self.cards
+            .keys()
+            .map(|id| format!("card:{id}"))
+            .chain(self.editor_cards.keys().map(|id| format!("editor:{id}")))
+            .chain(self.questions.keys().map(|id| format!("question:{id}")))
+            .collect()
+    }
+
+    /// A broker card has no provider tool name. A resynced card can also have an unknown name.
+    pub(crate) fn oldest_card_tool(&self) -> Option<&str> {
+        let (id, stamp) = self.cards.iter().min_by_key(|(_, stamp)| *stamp)?;
+        if self.editor_cards.values().any(|editor| editor < stamp) {
+            return None;
+        }
+        self.card_tools.get(id).map(String::as_str)
     }
 
     pub fn attention(&self) -> Attention {

@@ -13,6 +13,7 @@
 pub mod agent_backend;
 pub mod agent_bridge;
 pub mod agent_prefs;
+pub mod agents;
 pub mod attention;
 pub mod buffer_reload;
 pub mod companion;

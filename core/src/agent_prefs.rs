@@ -128,6 +128,14 @@ pub fn parse_editor_follow(value: Option<&str>) -> Result<bool, String> {
     crate::config_switch::parse_switch(EDITOR_FOLLOW_KEY, value, false)
 }
 
+/// Whether the shared agent summaries are enabled for this process.
+pub const AGENTS_ENABLED_KEY: &str = "agents.enabled";
+pub const AGENTS_ENABLED_DEFAULT: bool = true;
+
+pub fn parse_agents_enabled(value: Option<&str>) -> Result<bool, String> {
+    crate::config_switch::parse_switch(AGENTS_ENABLED_KEY, value, AGENTS_ENABLED_DEFAULT)
+}
+
 /// The `init.lua` key: `eitri.config.set("review.enabled", true | false)`.
 pub const REVIEW_ENABLED_KEY: &str = "review.enabled";
 
@@ -669,6 +677,21 @@ mod tests {
             assert_eq!(parse_user_settings(Some(value)), Ok(expected));
             assert_eq!(parse_review_enabled(Some(value)), Ok(expected));
             assert_eq!(parse_review_hint(Some(value)), Ok(expected));
+        }
+    }
+
+    #[test]
+    fn agents_enabled_defaults_to_the_constant_and_parses_a_switch() {
+        assert_eq!(parse_agents_enabled(None), Ok(AGENTS_ENABLED_DEFAULT));
+        for (value, expected) in [("true", true), ("on", true), ("false", false), (" off ", false)] {
+            assert_eq!(parse_agents_enabled(Some(value)), Ok(expected));
+        }
+        for bad in ["", "yes", "1", "TRUE"] {
+            let why = parse_agents_enabled(Some(bad)).unwrap_err();
+            assert!(
+                why.contains(AGENTS_ENABLED_KEY) && why.contains(&format!("{bad:?}")),
+                "{why}"
+            );
         }
     }
 

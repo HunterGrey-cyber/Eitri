@@ -62,6 +62,7 @@ fn checks<'a>(agents: &'a [&'a str]) -> Vec<(&'static str, Check<'a>)> {
         (eitri_core::compositor::CONFIG_KEY, check(parse_companion_wm)),
         (prefs::EDITOR_FOLLOW_KEY, check(prefs::parse_editor_follow)),
         (eitri_core::compositor::mode::TILING_KEY, Box::new(tiling_check)),
+        (prefs::AGENTS_ENABLED_KEY, check(prefs::parse_agents_enabled)),
         (prefs::REVIEW_ENABLED_KEY, check(prefs::parse_review_enabled)),
         (prefs::REVIEW_HINT_KEY, check(prefs::parse_review_hint)),
         (prefs::REVIEW_LIVE_KEY, check(prefs::parse_review_live)),

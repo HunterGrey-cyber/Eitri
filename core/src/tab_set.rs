@@ -27,6 +27,9 @@ use crate::tab_restore::{PlannedTab, RestorePlan, RestoreRun, Skipped};
 pub use crate::tabs::ViewId;
 use crate::tabs::{self, TabFacts, TabId};
 
+mod agent_rows;
+pub use agent_rows::{AgentWatch, RowContext};
+
 mod live_edits;
 pub use live_edits::LiveEdit;
 mod moving;
@@ -393,6 +396,8 @@ pub struct Tab {
     backend: TabBackend,
     pub session: SessionState,
     pub attention: AttentionTracker,
+    /// First sightings of waiting items and the current summary state, owned by this tab.
+    pub agent_watch: AgentWatch,
     /// Whether the session had been open when the tab went `Failed`, so the panel words the
     /// failure as a session that stopped rather than one that never started. Every place that
     /// swaps in `Failed` sets it; it means nothing while the backend is anything else.
@@ -726,6 +731,7 @@ impl Tab {
             backend: TabBackend::NotStarted,
             session: SessionState::default(),
             attention: AttentionTracker::default(),
+            agent_watch: AgentWatch::default(),
             failed_after_start: false,
             failed_resume: None,
             pending_handoff: None,

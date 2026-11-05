@@ -398,6 +398,9 @@ fn handoff_of(tab: &Tab, review: Option<ReviewHandoff>) -> TabHandoff {
         notes,
         // Handles into this window's review; the other window's review makes its own.
         review_watchers: _,
+        // First-seen times of waiting items and the current state's start, on this process's clock: the window
+        // the tab lands in stamps its own waits afresh.
+        agent_watch: _,
         #[cfg(any(test, feature = "test-support"))]
         gate_log,
     } = tab;

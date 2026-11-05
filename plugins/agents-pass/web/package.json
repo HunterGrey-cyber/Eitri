@@ -1,0 +1,17 @@
+{
+  "name": "eitri-plugin-agents-pass",
+  "version": "1.0.0",
+  "private": true,
+  "description": "The pass: one line of the agents that wait, built into web/dist and served from the plugin directory",
+  "license": "MIT",
+  "type": "module",
+  "scripts": {
+    "test": "vitest run"
+  },
+  "devDependencies": {
+    "esbuild": "0.21.5",
+    "jsdom": "30.0.1",
+    "typescript": "5.9.3",
+    "vitest": "2.1.9"
+  }
+}

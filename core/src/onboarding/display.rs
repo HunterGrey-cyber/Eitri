@@ -7,9 +7,27 @@ pub const MAX_CHARS: usize = 80;
 /// result is cut to [`MAX_CHARS`], never through an escape. Constant wording does not come through here, so only the
 /// value is cut, not the sentence around it.
 pub fn display_text(s: &str) -> String {
+    display_text_cut(s, MAX_CHARS)
+}
+
+/// Escape hidden characters and fit the result within `max` characters, keeping each escape whole.
+pub fn display_text_cut(s: &str, max: usize) -> String {
     let mut out = String::new();
-    let mut room = MAX_CHARS;
-    for c in s.chars() {
+    let mut room = max;
+    let mut chars = s.char_indices().peekable();
+    while let Some((at, c)) = chars.next() {
+        // A value already escaped by another process must keep its escape whole on a second cut.
+        if let Some(escape) = unicode_escape(&s[at..]) {
+            if escape.len() > room {
+                break;
+            }
+            room -= escape.len();
+            out.push_str(escape);
+            while chars.peek().is_some_and(|(next, _)| *next < at + escape.len()) {
+                chars.next();
+            }
+            continue;
+        }
         let piece = if is_hidden(c) {
             c.escape_unicode().to_string()
         } else {
@@ -23,6 +41,16 @@ pub fn display_text(s: &str) -> String {
         out.push_str(&piece);
     }
     out
+}
+
+fn unicode_escape(s: &str) -> Option<&str> {
+    let digits = s.strip_prefix("\\u{")?;
+    let end = digits.bytes().take(7).position(|b| b == b'}')?;
+    if end == 0 || !digits.as_bytes()[..end].iter().all(u8::is_ascii_hexdigit) {
+        return None;
+    }
+    char::from_u32(u32::from_str_radix(&digits[..end], 16).ok()?)?;
+    Some(&s[..end + 4])
 }
 
 /// Escape invisible characters in a name without cutting it. Layout may ellipsize the label independently.
