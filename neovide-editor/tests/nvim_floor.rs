@@ -3,8 +3,9 @@
 //! The fork normally requires nvim 0.12. The pane passes `neovide_editor::NVIM_FLOOR` to
 //! `LiveHarnessOptions::minimum_nvim_version` to allow supported older versions. Without
 //! that override, versions below 0.12 are refused; at 0.12 or later both configurations start.
-//! On 0.12, it also checks `:restart` and `:connect`; the harness follows no session
-//! transition, and any change in that behavior fails here.
+//! On 0.12, the harness follows the server started by `:restart` and returns to its own
+//! nvim after `:connect` to an address with no listener. The editor keeps taking keys in
+//! both cases, and quitting its nvim leaves no processes from the run.
 //! Run once for each supported nvim version, with that nvim first on `PATH`.
 //!
 //! The scenario runs in a child copy of this binary on its own `Xvfb`: winit and the
@@ -15,7 +16,7 @@
 use std::time::{Duration, Instant};
 
 use neovide::{
-    live_harness::{LiveHarness, LiveHarnessOptions},
+    live_harness::{Followed, LiveHarness, LiveHarnessOptions},
     units::{GridSize, PixelRect},
 };
 use skia_safe::surfaces;
@@ -109,12 +110,13 @@ fn options(floor: Option<(u64, u64, u64)>, marker: &str) -> LiveHarnessOptions {
     }
 }
 
-/// Paints until `done` holds, failing after 15 s.
-fn wait(harness: &mut LiveHarness, what: &str, done: impl Fn(&LiveHarness) -> bool) {
+/// Pumps and paints until `done` holds, failing after 15 s. The pump is what follows a `:restart` or `:connect`.
+fn wait(harness: &mut LiveHarness, what: &str, mut done: impl FnMut(&LiveHarness) -> bool) {
     let mut surface = surfaces::raster_n32_premul(CANVAS).expect("raster surface");
     let region = PixelRect::from_min_max((0.0, 0.0), (CANVAS.0 as f32, CANVAS.1 as f32));
     let deadline = Instant::now() + Duration::from_secs(15);
     loop {
+        harness.pump(Duration::ZERO);
         harness.render_frame(surface.canvas(), Some(&region), 1.0 / 60.0);
         if done(harness) {
             return;
@@ -155,53 +157,51 @@ fn scenario() {
             assert!(version >= (0, 12, 0), "{version:?} started without the floor");
             wait(&mut harness, "ready without the floor", |h| h.is_ready());
             println!("without the floor: started ({version:?} is 0.12 or later)");
-            // An 0.12 nvim's `:restart` asks its UI to attach to the new server; the harness takes
-            // no session transition, so the editor ends as on a quit and its host starts it again.
+            // An 0.12 nvim's `:restart` asks its UI to attach to the new server, and the harness follows it there:
+            // the session goes on, on the new server.
             harness.send_text_input(":restart<CR>");
-            wait(&mut harness, "nvim's exit after :restart", |h| h.has_neovim_exited());
+            let mut followed = None;
+            wait(&mut harness, "the harness followed :restart", |h| {
+                followed = followed.take().or_else(|| h.take_followed());
+                followed.is_some()
+            });
+            assert_eq!(followed, Some(Followed::Restart));
+            assert!(!harness.has_neovim_exited(), "`:restart` ended the session");
+            harness.send_text_input("ifollowed<Esc>");
+            wait(&mut harness, "the followed server takes keys", |h| cursor_col(h) == 7);
+            // Its quit ends the session, and with it the server: nothing of this run is left.
+            harness.send_text_input(":set nomodified | qa<CR>");
+            wait(&mut harness, "the followed server's exit", |h| h.has_neovim_exited());
             assert!(harness.shutdown(), "the shutdown did not observe nvim's exit");
             drop(harness);
-            // What holds now: the server `:restart` starts waits for a UI to attach, and the harness
-            // attaches none, so exactly one nvim of this run outlives the editor (given 5 s to go). The
-            // reaper ends it. Following the transition (Neovide's `replace_session`) would make this zero.
             let left = left_running(&marker, Duration::from_secs(5));
-            println!("`:restart` ended the session; nvim servers still running 5 s later: {left:?}");
-            assert_eq!(
-                left.len(),
-                1,
-                "`:restart` left {left:?} running; expected the one server it starts"
-            );
+            println!("`:restart` followed; nvims still running 5 s after its quit: {left:?}");
+            assert!(left.is_empty(), "the followed `:restart` left {left:?} running");
 
-            // `:connect` to an address nothing listens on: what the editor does with it now.
+            // `:connect` to an address nothing listens on: the editor goes back to its own nvim.
             let marker = self::marker();
             let _reaper = Reaper(marker.clone());
             let mut harness = LiveHarness::with_options(options(None, &marker)).expect("a second editor");
             wait(&mut harness, "ready for :connect", |h| h.is_ready());
             let nowhere = format!("/nonexistent/eitri-nvim-floor-{}.sock", std::process::id());
             harness.send_text_input(&format!(":connect {nowhere}<CR>"));
-            let deadline = Instant::now() + Duration::from_secs(5);
-            let mut surface = surfaces::raster_n32_premul(CANVAS).expect("raster surface");
-            let region = PixelRect::from_min_max((0.0, 0.0), (CANVAS.0 as f32, CANVAS.1 as f32));
-            while !harness.has_neovim_exited() && Instant::now() < deadline {
-                harness.render_frame(surface.canvas(), Some(&region), 1.0 / 60.0);
-                std::thread::sleep(Duration::from_millis(10));
-            }
-            let exited = harness.has_neovim_exited();
+            let until = Instant::now() + Duration::from_secs(2);
+            wait(&mut harness, "two seconds after :connect", |_| Instant::now() >= until);
+            assert!(!harness.has_neovim_exited(), "`:connect` to nowhere ended the session");
+            assert_eq!(
+                harness.take_followed(),
+                None,
+                "a connect that went nowhere was followed"
+            );
+            harness.send_text_input("ikept<Esc>");
+            wait(&mut harness, "the editor's own nvim takes keys", |h| cursor_col(h) == 3);
+            harness.send_text_input(":set nomodified | qa<CR>");
+            wait(&mut harness, "the editor's nvim exit", |h| h.has_neovim_exited());
             harness.shutdown();
             drop(harness);
             let left = left_running(&marker, Duration::from_secs(5));
-            println!(
-                "`:connect` to nowhere: the editor's session ended {exited}; nvims still running 5 s after the shutdown: \
-                 {left:?}"
-            );
-            // What holds now: the editor's session ends, and its nvim, detached from the UI, keeps running even
-            // after the harness closed its stdin.
-            assert!(exited, "`:connect` did not end the editor's session");
-            assert_eq!(
-                left.len(),
-                1,
-                "`:connect` left {left:?} running; expected the editor's own nvim"
-            );
+            println!("`:connect` to nowhere kept the session; nvims still running 5 s after its quit: {left:?}");
+            assert!(left.is_empty(), "`:connect` to nowhere left {left:?} running");
         }
         Err(e) => {
             let message = format!("{e:#}");

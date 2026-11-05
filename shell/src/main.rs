@@ -92,6 +92,7 @@ use std::collections::BTreeMap;
 use std::ffi::OsString;
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
+use std::sync::{Arc, Mutex};
 
 use gtk4::gdk::{Key, ModifierType};
 use gtk4::glib;
@@ -123,6 +124,18 @@ use wire::{wire_host, WireDeps, WireKind};
 const APP_ID: &str = "cn.huntergrey.eitri";
 /// A page window's application id, the one its desktop file is named by.
 const PAGE_APP_ID: &str = "cn.huntergrey.eitri.Page";
+
+/// The editor's check once it shows an nvim a followed `:connect` reached: a one-shot chunk goes as it is; a registered
+/// one, whose teardown nothing of Eitri's is there to run, and any chunk the table refuses or does not know, never
+/// reaches that nvim.
+fn followed_chunk_check() -> neovide_editor::ChunkCheck {
+    neovide_editor::ChunkCheck::new(|code, args| match eitri_core::editor_rpc::check_chunk(code) {
+        Ok(eitri_core::editor_rpc::ChunkSide::OneShot) => Ok(args),
+        _ => Err(neovide_editor::ChunkRefused {
+            reason: "the editor shows an nvim this window did not start; only one-shot chunks reach it".into(),
+        }),
+    })
+}
 
 fn main() -> glib::ExitCode {
     // setenv is not thread-safe, so settle the display before any thread or GTK code runs: the window (GTK), the
@@ -515,6 +528,7 @@ fn main() -> glib::ExitCode {
             start_note,
             open.clone(),
             None,
+            None,
         )
     });
     app.run_with_args::<&str>(&[])
@@ -559,6 +573,7 @@ fn build_ui(
     start_note: Option<String>,
     open: Vec<String>,
     beside: Option<page_window::BesideStart>,
+    takeover: Option<takeover::TakeoverStart>,
 ) {
     use eitri_core::theme::start::{StartReport, StartTheme};
     use eitri_core::theme::store::ThemeWriter;
@@ -608,9 +623,21 @@ fn build_ui(
     let feed_pump = editor_feeds::FeedPump::start();
     // A beside window's feed was bound before its link, whose install hands the socket to the page slot's theme part.
     let mut beside = beside;
-    let mut theme_feed = match beside.as_mut() {
-        Some(start) => start.theme_feed.take(),
-        None => owns_editor.then(theme::feed::ThemeFeed::new).flatten(),
+    // A window over a person's own nvim (`eitri open`) bound its sockets before the glue went in, so each part found
+    // its server listening; the rest of the window is the one an embedded nvim gets.
+    let (mut takeover_feeds, takeover) = match takeover {
+        Some(takeover::TakeoverStart {
+            feeds,
+            held,
+            landed,
+            starter,
+        }) => (Some(feeds), Some((held, landed, starter))),
+        None => (None, None),
+    };
+    let mut theme_feed = match (beside.as_mut(), takeover_feeds.as_mut()) {
+        (Some(start), _) => start.theme_feed.take(),
+        (None, Some(feeds)) => feeds.theme.take(),
+        (None, None) => owns_editor.then(theme::feed::ThemeFeed::new).flatten(),
     };
     let theme_writer = (owns_editor && !want_clean).then(|| {
         Rc::new(RefCell::new(ThemeWriter::new(
@@ -624,7 +651,10 @@ fn build_ui(
     // constructor -- those variables reach nvim through `Command::env` at spawn time and cannot
     // be added afterwards. `None` means the feature is simply unavailable (see `pane_switch`'s
     // own doc); the editor is constructed with an empty child env and behaves exactly as before.
-    let mut pane_switch = owns_editor.then(pane_switch::open).flatten();
+    let mut pane_switch = match takeover_feeds.as_mut() {
+        Some(feeds) => feeds.pane_switch.take(),
+        None => owns_editor.then(pane_switch::open).flatten(),
+    };
     // nvim's `+` and `*` registers through this window's clipboard, for an nvim that finds no clipboard tool and so
     // calls the fake `tmux` (`host_clipboard`). Served once the window exists, since only an active window serves;
     // a yank before that waits in the socket's queue.
@@ -635,16 +665,22 @@ fn build_ui(
     // wire 1's feed, built here for the same reason the other two are: its `child_env()` and its
     // `--cmd` must be handed to the editor pane's constructor, and neither can be added to a child
     // that is already running.
-    let mut context_feed = owns_editor
-        .then(eitri_core::editor_context::feed::EditorContextFeed::new)
-        .flatten();
+    let mut context_feed = match takeover_feeds.as_mut() {
+        Some(feeds) => feeds.context.take(),
+        None => owns_editor
+            .then(eitri_core::editor_context::feed::EditorContextFeed::new)
+            .flatten(),
+    };
     // The fourth push socket: nvim's `mapleader`, `timeoutlen`
     // and Normal-mode maps, built here for the same reason the other three are -- its `child_env()`
     // and `--cmd` must reach the editor pane's constructor, which cannot be handed to an already
     // running child.
-    let mut nvim_keys_feed = owns_editor
-        .then(eitri_core::nvim_keys::feed::NvimKeysFeed::new)
-        .flatten();
+    let mut nvim_keys_feed = match takeover_feeds.as_mut() {
+        Some(feeds) => feeds.keys.take(),
+        None => owns_editor
+            .then(eitri_core::nvim_keys::feed::NvimKeysFeed::new)
+            .flatten(),
+    };
     // `:EitriTutor`, installed in each nvim session once the feeds report it started. Only the window that
     // embeds nvim has one.
     let tutor = owns_editor.then(tutor::Tutor::new);
@@ -698,6 +734,10 @@ fn build_ui(
     let wm_host = gtk_host::GtkHost::new();
     let driver = {
         let mut controller = eitri_core::wm::Controller::new(wm_scheduler.clone());
+        // Before the first batch: nothing of this window may quit, end or restart a person's own nvim.
+        if takeover.is_some() {
+            controller.set_editor_kind(WinId::MAIN, eitri_core::wm::EditorKind::Attached);
+        }
         // What the controller reads at once: the grid's size and measures and the editor's cell, from the host,
         // which answers as no window allocated yet until it is given the grid and the editor below.
         controller.set_reads(wm_host.clone());
@@ -707,6 +747,13 @@ fn build_ui(
         wm_scheduler.attach(Rc::downgrade(&sink));
         driver
     };
+    // The workers that hold the person's nvim report through the controller from here on.
+    let takeover_side = takeover.map(|(held, landed, starter)| {
+        held.set_scratch(scratch_path.clone());
+        let sink: Rc<dyn eitri_core::wm::HostSink> = driver.clone();
+        takeover::WindowSide::start(held, Rc::downgrade(&sink), landed, starter)
+    });
+    let takeover_held = takeover_side.as_ref().map(|side| side.held());
     // The feeds are bound above: the controller keeps the launch settings they make until the editor phase.
     driver.start(
         WinId::MAIN,
@@ -735,7 +782,10 @@ fn build_ui(
                 role: wm_role,
                 presence: editor_presence,
                 title: {
-                    let project = eitri_core::wm::titles::project_display_name(project_root);
+                    let mut project = eitri_core::wm::titles::project_display_name(project_root);
+                    if takeover_side.is_some() {
+                        project.push_str(takeover::TITLE_SUFFIX);
+                    }
                     match &module_window {
                         Some((name, _)) => eitri_core::wm::titles::module_window_title(&project, name, None),
                         None => eitri_core::wm::titles::window_title(&project, None),
@@ -749,8 +799,22 @@ fn build_ui(
         .and_then(|window| window.downcast().ok())
         .expect("the window phase opened the window");
     window.add_css_class("shell-root");
-    let host_clipboard = clipboard_listener
-        .and_then(|(listener, switch_socket)| host_clipboard::start(listener, &switch_socket, &window));
+    // The server a followed `:restart` starts, as the editor (made below) learns it: once the nvim that started it has
+    // exited it is no child of the window, and the clipboard lets it in by that process.
+    let followed_nvim: Arc<Mutex<Option<neovide_editor::LearnedNvim>>> = Arc::new(Mutex::new(None));
+    let host_clipboard = clipboard_listener.and_then(|(listener, switch_socket)| {
+        let attached = takeover_held.as_ref().and_then(|held| held.attached_nvim());
+        let followed = {
+            let slot = followed_nvim.clone();
+            eitri_core::host_clipboard::FollowedNvim::new(move || {
+                let learned = slot.lock().unwrap_or_else(std::sync::PoisonError::into_inner).clone();
+                learned
+                    .and_then(|learned| learned.get())
+                    .map(|(pid, start_time)| eitri_core::host_clipboard::AttachedNvim { pid, start_time })
+            })
+        };
+        host_clipboard::start(listener, &switch_socket, attached, Some(followed), &window)
+    });
     // The editor, launched with `editor_spawn`; its host joins the grid at the surfaces phase. That host
     // is a small overlay carrying a hidden failure-message label, not the bare `GtkGLArea` -- see
     // `editor_start_failure`'s own doc for why this has to wrap the widget before it is ever handed to the grid.
@@ -759,6 +823,15 @@ fn build_ui(
     // Ctrl+h handler (to hand focus back) and the window's services (to quit, end and shut nvim down).
     // `NeovideEditorPane` is deliberately not `Clone`.
     let editor_maker = gtk_host_surfaces::EditorMaker::new(Rc::downgrade(&wm_host));
+    // The person's nvim is joined, not started; the pane's check holds from its first call.
+    if let Some(held) = &takeover_held {
+        editor_maker.attach_to(
+            neovide_editor::AttachSpec {
+                server: held.addr().to_owned(),
+            },
+            takeover::chunk_check(held.link_chan()),
+        );
+    }
     wm_host.set_surface_maker(editor_maker.clone());
     driver.start(WinId::MAIN, StartStep::Editor);
     // `None` in window 2, whose editor phase makes nothing.
@@ -774,6 +847,7 @@ fn build_ui(
     };
     if let Some(pane) = &pane {
         wm_host.set_editor(WinId::MAIN, pane.clone());
+        *followed_nvim.lock().unwrap_or_else(std::sync::PoisonError::into_inner) = Some(pane.learned_nvim());
     }
 
     let config_dir = config_dir();
@@ -826,8 +900,12 @@ fn build_ui(
         .then(|| linked_window::editor::Window1Editor::new(project_root, scratch_path.clone(), editor_repeat.clone()));
     let window2_editor = (!owns_editor)
         .then(|| linked_window::editor::Window2Editor::new(project_root, scratch_path.clone(), editor_repeat.clone()));
-    let editor_context_source = match (context_feed.as_mut(), &window2_editor) {
-        (Some(feed), _) => feed_pump.listen_context(feed, scratch_path.clone()).0,
+    // The context of the window's own nvim, which a followed `:connect` leaves (`on_followed` below).
+    let own_context = context_feed
+        .as_mut()
+        .map(|feed| feed_pump.listen_own_context(feed, scratch_path.clone()));
+    let editor_context_source = match (&own_context, &window2_editor) {
+        (Some(own), _) => own.source(),
         // Window 1's editor context, as window 1 last told it; none while unlinked.
         (None, Some(two)) => two.context_source(),
         (None, None) => std::rc::Rc::new(|| None),
@@ -867,7 +945,7 @@ fn build_ui(
         #[cfg(target_os = "linux")]
         let ide_wiring = ide_wiring.clone();
         #[cfg(target_os = "linux")]
-        let push_facts = feed_pump.push_source();
+        let push_facts = own_context.as_ref().and_then(|own| own.facts());
         feed_pump.on_context(move || {
             panel.wake();
             let context = context_for_link();
@@ -1209,7 +1287,8 @@ fn build_ui(
         .map(|dir| dir.join(""))
         .collect();
         eitri_core::editor_reopen_start::prepare_start(&eitri_core::editor_reopen_start::ReopenStart {
-            enabled: editor_restore && !want_clean,
+            // A person's own nvim is theirs: the project's editor record is neither read nor written for it.
+            enabled: editor_restore && !want_clean && takeover_side.is_none(),
             state_home,
             home,
             role: pair.pair_role(),
@@ -1717,10 +1796,13 @@ fn build_ui(
             .and_then(|registration| registration.plugin.manifest.window.clone())
     });
     // What the window is named by, on its title and its top bar: a plugin's own window by its declared title.
-    let chrome_project = ChromeTitles::project_name(
+    let mut chrome_project = ChromeTitles::project_name(
         project_root,
         own_window_decl.as_ref().map(|window| window.title.as_str()),
     );
+    if takeover_side.is_some() {
+        chrome_project.push_str(takeover::TITLE_SUFFIX);
+    }
     plugin_panels.set_window_root(project_root);
     plugin_panels.set_own_window(own_window.as_deref());
     let plugin_window =
@@ -2257,11 +2339,18 @@ fn build_ui(
                 let module_layout = module_layout.clone();
                 Rc::new(move || module_layout.read().is_visible(&ModuleId::editor()))
             };
-            Rc::new(editor_rpc::EmbeddedEditorRpc::new(
+            let embedded: Rc<dyn eitri_core::editor_rpc::EditorRpc> = Rc::new(editor_rpc::EmbeddedEditorRpc::new(
                 pane.clone(),
                 editor_present,
                 editor_visible,
-            ))
+            ));
+            match &takeover_held {
+                Some(held) => Rc::new(takeover::HeldEditorRpc {
+                    inner: embedded,
+                    link_chan: held.link_chan(),
+                }),
+                None => embedded,
+            }
         }
         // A page window beside nvim asks the person's nvim through its own link, which holds the page's slot there.
         None => match pair.beside_link() {
@@ -2297,6 +2386,7 @@ fn build_ui(
                 });
                 hold
             }),
+            takeover: takeover_side.clone(),
         },
     }));
     // The startup layout is the controller's first layout batch: what the layout shows mapped (every host
@@ -2692,6 +2782,9 @@ fn build_ui(
     hint_overlay.set_child(Some(&backdrop));
     hint_overlay.add_overlay(&root);
     hint_overlay.set_measure_overlay(&root, true);
+    if let Some(side) = &takeover_side {
+        hint_overlay.add_overlay(side.band());
+    }
     if let Some(frame) = &floating_strip {
         hint_overlay.add_overlay(frame);
     }
@@ -4123,7 +4216,18 @@ fn build_ui(
         let exited = Rc::downgrade(pane);
         let driver_for_exit = Rc::downgrade(&driver);
         let feeds_for_exit = Rc::downgrade(&feed_pump);
+        let takeover_for_exit = takeover_side.clone();
         pane.on_exited_unrequested(move || {
+            // A `:connect` typed in the editor, or this window's own hang-up, is answered by the takeover; nvim goes on,
+            // and only what showed it here hears that it went.
+            if let Some(side) = &takeover_for_exit {
+                let ended = exited.upgrade().and_then(|pane| pane.ended());
+                if side.session_ended(ended.as_ref()) {
+                    review_for_exit.review_editor_lost();
+                    plugin_panels.editor_closed();
+                    return;
+                }
+            }
             // nvim's last lines were on the socket before its process went: read them first, so the exit is judged
             // with them and not ahead of the feed's next wake.
             if let Some(feeds) = feeds_for_exit.upgrade() {
@@ -4149,14 +4253,54 @@ fn build_ui(
         // before it said why over the pane; the nvim now running there makes that message stale.
         let driver_for_ready = Rc::downgrade(&driver);
         let failure_label_for_ready = editor_start_failure_label.clone();
+        let takeover_for_ready = takeover_side.clone();
+        let ready_pane = Rc::downgrade(pane);
         pane.on_session_ready(move || {
             if let Some(label) = &failure_label_for_ready {
                 editor_start_failure::hide(label);
+            }
+            if let (Some(side), Some(pane)) = (&takeover_for_ready, ready_pane.upgrade()) {
+                side.session_ready(&pane);
             }
             if let Some(driver) = driver_for_ready.upgrade() {
                 driver.post(HostEvent::Editor(eitri_core::wm::EditorEvent::Ready {
                     win: WinId::MAIN,
                 }));
+            }
+        });
+        // A `:restart` or `:connect` typed in the window's own nvim, which the editor followed instead of ending. A
+        // followed `:restart` is still the window's own nvim, a new session of it, which the session-ready hook sets
+        // up. A server a `:connect` reached is not the window's: only one-shot chunks reach it (nothing of Eitri's is
+        // installed there to be taken out again), the controller hears it is attached, and every rule of an attached
+        // editor holds from here on; the window's own nvim it left runs on with no window, and what it last said of
+        // its file and selection is no longer the editor's context.
+        let driver_for_followed = Rc::downgrade(&driver);
+        let followed_pane = Rc::downgrade(pane);
+        let context_for_followed = own_context.clone();
+        let feeds_for_followed = Rc::downgrade(&feed_pump);
+        pane.on_followed(move |how| match how {
+            neovide_editor::PaneFollowed::Restart => {
+                println!("[editor] followed :restart: the editor shows the server its nvim started");
+            }
+            neovide_editor::PaneFollowed::Connect { left } => {
+                if let Some(pane) = followed_pane.upgrade() {
+                    pane.set_chunk_check(Some(followed_chunk_check()));
+                }
+                if let (Some(own), Some(feeds)) = (&context_for_followed, feeds_for_followed.upgrade()) {
+                    own.leave(&feeds);
+                }
+                println!(
+                    "[editor] followed :connect: the editor shows an nvim this window did not start; its own nvim runs \
+                     on at {}",
+                    left.as_deref().unwrap_or("no address")
+                );
+                if let Some(driver) = driver_for_followed.upgrade() {
+                    driver.post(HostEvent::Editor(eitri_core::wm::EditorEvent::Followed {
+                        win: WinId::MAIN,
+                        kind: eitri_core::wm::EditorKind::Attached,
+                        left,
+                    }));
+                }
             }
         });
         let review_for_unreachable = agent_panel_handle.clone();
@@ -4180,7 +4324,12 @@ fn build_ui(
     if let (Some(pane), Some(editor_start_failure_label)) = (&pane, &editor_start_failure_label) {
         let editor_start_failure_label = editor_start_failure_label.clone();
         let driver_for_failure = Rc::downgrade(&driver);
+        let takeover_for_failure = takeover_side.clone();
         pane.on_start_failed(move |message| {
+            // A person's nvim the editor could not attach to goes back to its terminal first.
+            if let Some(side) = &takeover_for_failure {
+                side.start_failed(message);
+            }
             editor_start_failure::show(&editor_start_failure_label, message);
             // A restart that failed leaves the editor ended, so the next show tries again rather than waiting for an
             // nvim that never comes; keys still in the failed editor go to the chat.

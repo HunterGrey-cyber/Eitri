@@ -154,6 +154,11 @@ pub const CHUNKS: &[(&str, ChunkSide)] = &[
     (crate::takeover::sequence::FACTS_LUA, ChunkSide::Refused),
     (crate::takeover::sequence::TAKEN_LUA, ChunkSide::Refused),
     ("vim.fn.chanclose(...)", ChunkSide::Refused),
+    // The fork's attach records its channel; the takeover window reads it over its own link to check the attach.
+    (
+        "local a = rawget(_G, '__neovide_attach'); return type(a) == 'table' and a.chan or nil",
+        ChunkSide::Refused,
+    ),
     (crate::editor_reopen::EDITOR_REOPEN_CAPTURE_LUA, ChunkSide::Refused),
     (crate::editor_reopen::EDITOR_REOPEN_LUA, ChunkSide::Refused),
     (

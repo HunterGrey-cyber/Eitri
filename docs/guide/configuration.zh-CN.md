@@ -1,5 +1,5 @@
 [English](configuration.md) | 简体中文
-<!-- translated-from: configuration.md sha256=5684f3abcbf0899ef2c0de51cd79d9618d1e0635931ee843d6ffa4e330b8fd80 -->
+<!-- translated-from: configuration.md sha256=a01d38c26a8820cdc72bd421bd93cbb08ba7f3538fb0ce631e13560128b35688 -->
 
 # 配置
 
@@ -46,6 +46,7 @@ Eitri 说的方式是右上角的一条提示：有几个问题，以及前五�
 | `agent.editor.tool.<name>` | `true` / `"on"` 或 `false` / `"off"` | `true`，`nvim_exec` 是 `false` | 按名字指定其中一个工具：`open_file`、`read_buffer`、`editor_state`、`diagnostics`、`usages`、`hover`、`symbols`、`lsp_rename`、`format`、`lsp_code_actions`、`apply_code_action`、`apply_proposal` 或 `nvim_exec`。每个工具都是开着的，除非你关掉；[`nvim_exec`](editor-tools.zh-CN.md#nvim-exec) 相反，你打开之前一直是关的。Eitri 不认识的名字会在启动时被列出并指出是哪个键，那个开关保持默认。 |
 | `agent.editor.follow` | `true` / `"on"` 或 `false` / `"off"` | `false` | 新标签页是否在编辑器里跟随 agent 已完成的修改（[编辑器工具](editor-tools.zh-CN.md#following)）。此后每个标签页自己的选择（`Space e`）优先。值不对会在启动时被列出并指出是哪个键，设置保持关闭。 |
 | `editor.restore` | `true` / `"on"` 或 `false` / `"off"` | `true` | 编辑器是否重新打开这个项目的上一个窗口关闭或崩溃时的文件、分屏、标签页和光标位置。`false` 既不读也不写，已保存的文件原样保留，再打开时从原来的地方接着来。它在 `init.lua` 运行之后读取。哪些会话插件会让 Eitri 让路，以及哪些东西会回来：[再次启动时](getting-started.zh-CN.md#when-you-start-again)。 |
+| `editor.takeover` | `true` / `"on"` 或 `false` / `"off"` | `true` | `:EitriOpen`（和 `eitri open`）是否可以把终端里运行的 Neovim 搬进 Eitri 窗口。`false` 时它会说 `takeover is off (editor.takeover in init.lua)`，终端保持原样。它自己不会启动任何东西：开着的时候，你不运行命令就什么都不会发生。值不对时，启动时会列出来并点名这个键，`eitri open` 则会拒绝它。[接管终端里的 nvim](takeover.zh-CN.md)。 |
 | `modules.chat.on_permission` | `"badge"` 或 `"reveal"` | `"badge"` | agent 面板被隐藏时来了一张权限卡片，会怎样。`"badge"` 在顶栏显示 `agent ⚑N` 并弹出一条提示；`"reveal"` 把面板带回它原来的位置，但不移动按键焦点。当另一个窗格被放大时，`"reveal"` 改为显示标记，因为显示面板并不会让它出现在屏幕上。companion 窗口从不隐藏它的面板，所以这个键在那里不起作用。 |
 | `review.enabled` | `true` / `"on"` 或 `false` / `"off"` | `true` | [回合审阅](turn-review.zh-CN.md)是否运行。`false` 不拍快照，也不提供审阅。 |
 | `review.hint` | `true` / `"on"` 或 `false` / `"off"` | `false` | 一个编辑过文件的回合结束后，是否在状态条里加一行提示，以及回合进行期间是否在输入框上方用一行统计它的编辑。无论如何，审阅都只差一个键。 |

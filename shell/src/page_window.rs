@@ -227,6 +227,7 @@ pub(crate) fn run(args: PageArgs) -> glib::ExitCode {
                     control_dir,
                     exe,
                 }),
+                None,
             );
         });
     });
@@ -301,7 +302,7 @@ fn leave_editor_pipes(log_name: Option<&str>) -> StarterStderr {
 pub(crate) struct StarterStderr(RefCell<Option<OwnedFd>>);
 
 impl StarterStderr {
-    fn keep() -> StarterStderr {
+    pub(crate) fn keep() -> StarterStderr {
         if !eitri_core::companion::stdio::is_pipe(2) {
             return StarterStderr(RefCell::new(None));
         }

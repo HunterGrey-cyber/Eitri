@@ -67,12 +67,14 @@ pub fn event_loop_watch_priority() -> Option<std::ffi::c_int> {
 /// anything that belongs to the GTK thread, and must return at once: every other call of the
 /// session waits while it runs.
 pub type LuaReply = Box<dyn FnOnce(Result<rmpv::Value, String>) + Send + 'static>;
+/// Why an attached session ended on nvim's own initiative ([`PaneEnded::SessionLeft`]).
+pub use neovide::live_harness::Left;
 pub use stdin::{detach_stdin_from_nvim, ForwardedStdin};
 
 use std::cell::{Cell, RefCell};
 use std::panic::{catch_unwind, AssertUnwindSafe};
 use std::rc::Rc;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -85,7 +87,7 @@ use gtk4::{
 use skia_safe::gpu::direct_contexts;
 use skia_safe::{BlendMode, Color4f, Paint, SamplingOptions};
 
-use neovide::live_harness::{LiveHarness, LiveHarnessOptions};
+use neovide::live_harness::{Followed, LiveEvent, LiveHarness, LiveHarnessOptions};
 use neovide::units::{GridScale, GridSize};
 
 use frame_clock::AnimationClock;
@@ -332,14 +334,26 @@ impl LiveState {
 }
 
 /// Why [`NeovideEditorPane::restart`] did nothing: the pane was neither [`LiveState::Exited`] nor
-/// [`LiveState::Failed`]. `state` is the name of the state it was in ([`LiveState::name`]).
+/// [`LiveState::Failed`], or it is attached to an nvim it did not start. `state` is the name of the state it was in
+/// ([`LiveState::name`]), or [`RestartRefused::ATTACHED`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct RestartRefused {
     pub state: &'static str,
 }
 
+impl RestartRefused {
+    /// The `state` of a refusal by an attached pane ([`NeovideEditorPane::is_attached`]), whatever its
+    /// [`LiveState`]: it never starts an nvim of its own in place of the one it was attached to.
+    pub const ATTACHED: &'static str = "Attached";
+}
+
 impl std::fmt::Display for RestartRefused {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        if self.state == Self::ATTACHED {
+            return f.write_str(
+                "the editor pane is attached to an nvim it did not start, and never starts one of its own in its place",
+            );
+        }
         write!(
             f,
             "the editor pane is {}, and only a pane whose nvim ended and was released, or whose launch failed, can restart",
@@ -443,7 +457,16 @@ pub struct LiveSession {
     /// ends, and what [`NeovideEditorPane::end_nvim`] ends. Holds what the fork started from the
     /// launch on, and nvim's own `getpid()` answer once it comes back ([`ask_nvim_for_its_pid`]);
     /// shared with the thread that asks.
-    nvim_process: Arc<nvim_child::NvimProcess>,
+    ///
+    /// `None` for a session attached to an nvim this pane did not start ([`AttachSpec`]): no process
+    /// was looked for at its launch and nvim is never asked for its pid, so nothing here can watch,
+    /// signal or end it. Every ending of such a session is a hang-up of this UI's channel, after
+    /// which nvim goes on.
+    nvim_process: Option<Arc<nvim_child::NvimProcess>>,
+    /// Set by every hang-up this pane makes of an attached session (its shutdown, its drop, a
+    /// [`HangUp`] handle) before the channel is closed, so the end that follows is told from one
+    /// nvim made ([`PaneEnded`]).
+    detached: Arc<AtomicBool>,
     /// The last [`NeovideEditorPane::exec_lua_watched`] request and its watch (`nvim_rpc`).
     watched: Option<nvim_rpc::WatchedCall>,
     /// Every request this session makes for a caller, written to nvim in the order they were made
@@ -463,6 +486,10 @@ pub struct LiveSession {
     grace_wake: RefCell<Option<exit_wake::Wake>>,
     /// Which session this is ([`NeovideEditorPane::session_serial`]), never reused in the process.
     serial: u64,
+    /// The pane's own nvim a followed `:connect` left, and its address: it runs on with no UI, unless
+    /// a banged `:connect` stopped it. Held only to say whether it still runs
+    /// ([`NeovideEditorPane::left_running`]); nothing signals or ends it.
+    left: Option<(Arc<nvim_child::NvimProcess>, Option<String>)>,
 }
 
 /// How long nvim's process may outlive the fork's report of its exit before the host is told nvim is out of reach. A
@@ -502,14 +529,17 @@ impl LiveSession {
     /// exit (a watch on its pidfd, or a poll every [`exit_wake::EXIT_POLL`] without one), and the end of
     /// [`UNREACHABLE_GRACE`], after which a process still running is said to be out of reach. Armed once a session.
     fn wake_on_nvim_exit(&self) {
+        // An attached session holds no process, so there is nothing to watch.
+        let Some(process) = self.nvim_process.clone() else {
+            return;
+        };
         if self.outlived_at.get().is_some() {
             return;
         }
         self.outlived_at.set(Some(Instant::now()));
         let sweep = || live_watch::after_outside_pump(None);
-        let process = self.nvim_process.clone();
         *self.exit_wake.borrow_mut() = Some(exit_wake::Wake::on_exit(
-            self.nvim_process.exit_fd(),
+            process.exit_fd(),
             move || process.alive_within(Duration::ZERO) == Some(true),
             sweep,
         ));
@@ -528,7 +558,7 @@ impl LiveSession {
         grid_size: GridSize<u32>,
         fb_size: Rc<Cell<(i32, i32)>>,
         device_scale: Rc<Cell<f64>>,
-        nvim_process: Arc<nvim_child::NvimProcess>,
+        nvim_process: Option<Arc<nvim_child::NvimProcess>>,
         driver: &Rc<TickDriver>,
     ) -> Self {
         // A ready harness: the event-loop watch wakes this pane from now on.
@@ -555,6 +585,7 @@ impl LiveSession {
             device_scale,
             last_logged_layout: Cell::new(None),
             nvim_process,
+            detached: Arc::new(AtomicBool::new(false)),
             watched: None,
             calls: std::cell::OnceCell::new(),
             ending: Cell::new(None),
@@ -563,6 +594,46 @@ impl LiveSession {
             exit_wake: RefCell::new(None),
             grace_wake: RefCell::new(None),
             serial: NEXT_SESSION_SERIAL.fetch_add(1, Ordering::Relaxed),
+            left: None,
+        }
+    }
+
+    /// The pane's side of a `:restart` or `:connect` the harness followed: the session goes on, on the
+    /// new server, as a new session (its own serial; nothing of its end said yet; no quit or ending of
+    /// the old nvim carried over). A followed `:restart` reached a server the pane's own nvim started,
+    /// which is the pane's from now on: its pid is asked as at a launch, and held only if it is an
+    /// `--embed` nvim. A followed `:connect` reached a server the pane did not start: from now on the
+    /// session holds no process, so nothing asks its pid, signals it or ends it, and the pane's
+    /// attached rules hold.
+    fn follow(&mut self, how: Followed, learned: &LearnedNvim) -> PaneFollowed {
+        self.serial = NEXT_SESSION_SERIAL.fetch_add(1, Ordering::Relaxed);
+        self.close_requested.set(false);
+        self.unreachable_said.set(false);
+        self.outlived_at.set(None);
+        *self.exit_wake.borrow_mut() = None;
+        *self.grace_wake.borrow_mut() = None;
+        self.watched = None;
+        self.ending.set(None);
+        self.detached = Arc::new(AtomicBool::new(false));
+        self.wants_frame.set(true);
+        learned.clear();
+        match how {
+            Followed::Restart => {
+                let process = Arc::new(nvim_child::NvimProcess::new(None));
+                println!("[live] the editor follows nvim's :restart to the server it started; asking it for its pid");
+                ask_nvim_for_its_pid(&self.harness, &process, Some(learned.clone()));
+                self.nvim_process = Some(process);
+                PaneFollowed::Restart
+            }
+            Followed::Connect { left } => {
+                println!(
+                    "[live] the editor follows nvim's :connect to a server it did not start, attached from now on; \
+                     the nvim it left ({}) is not signalled or ended",
+                    left.as_deref().unwrap_or("no address")
+                );
+                self.left = self.nvim_process.take().map(|process| (process, left.clone()));
+                PaneFollowed::Connect { left }
+            }
         }
     }
 
@@ -584,7 +655,48 @@ impl LiveSession {
     /// process is gone ([`exit_events`]). `false` when no process is known to be nvim: then the
     /// fork's report is all there is.
     fn exit_pending(&self) -> bool {
-        self.harness.has_neovim_exited() && self.nvim_process.alive_within(Duration::ZERO) == Some(true)
+        self.harness.has_neovim_exited() && self.nvim_alive() == Some(true)
+    }
+
+    /// What the pidfd on nvim's process says, now; `None` when no process is known to be nvim, as for
+    /// an attached session, which holds none.
+    fn nvim_alive(&self) -> Option<bool> {
+        self.nvim_process
+            .as_ref()
+            .and_then(|process| process.alive_within(Duration::ZERO))
+    }
+
+    /// Whether this session is attached to an nvim the pane did not start.
+    fn is_attached(&self) -> bool {
+        self.nvim_process.is_none()
+    }
+
+    /// Closes an attached session's channel, marking the end as this pane's own first. nvim drops
+    /// the UI and goes on.
+    fn detach(&mut self) {
+        self.detached.store(true, Ordering::SeqCst);
+        self.harness.hang_up();
+    }
+
+    /// How the session ended, once the fork reports it ended (`None` before): an owned session's
+    /// end is its nvim's exit; an attached one's is the `:connect` or `:restart` the fork reported,
+    /// else this pane's hang-up, else nvim's own doing ([`pane_ended`]). Reads the fork's events, so the caller
+    /// keeps the answer ([`NeovideEditorPane::ended`]).
+    fn how_it_ended(&self) -> Option<PaneEnded> {
+        if !self.harness.has_neovim_exited() {
+            return None;
+        }
+        let mut left = None;
+        while let Some(event) = self.harness.take_event() {
+            match event {
+                LiveEvent::SessionLeft(why) => left = Some(why),
+            }
+        }
+        Some(pane_ended(
+            self.is_attached(),
+            self.detached.load(Ordering::SeqCst),
+            left,
+        ))
     }
 
     /// The schedule an ending starting now takes (`nvim_child::schedule`): nvim may be in a prompt
@@ -592,7 +704,11 @@ impl LiveSession {
     /// Without a process known to be nvim there is nothing to signal, and the hang-up comes first.
     fn ending_schedule(&self) -> nvim_child::Schedule {
         let quit_outstanding = self.watched.as_ref().is_some_and(|call| !call.watch().done);
-        nvim_child::schedule(quit_outstanding && self.nvim_process.nvim_pid().is_some())
+        let nvim_known = self
+            .nvim_process
+            .as_ref()
+            .is_some_and(|process| process.nvim_pid().is_some());
+        nvim_child::schedule(quit_outstanding && nvim_known)
     }
 
     /// Prints `[layout] fb=WxH cell=W×H grid=CxR band_top=Npx` when the layout differs from the
@@ -720,6 +836,8 @@ type CellSizeCallbackSlot = Rc<RefCell<Option<Box<dyn Fn(f64, f64)>>>>;
 type StartFailedCallbackSlot = Rc<RefCell<Option<Box<dyn Fn(&str)>>>>;
 /// See [`NeovideEditorPane::on_session_ready`].
 type SessionReadyCallbackSlot = Rc<RefCell<Option<Box<dyn Fn()>>>>;
+/// See [`NeovideEditorPane::on_followed`].
+type FollowedCallbackSlot = Rc<RefCell<Option<Box<dyn Fn(PaneFollowed)>>>>;
 
 /// The embeddable Neovide/Skia editor surface. Wraps a single `GtkGLArea` driving a real
 /// `nvim --embed` connection (`neovide::live_harness::LiveHarness`), with resize/IME/keyboard/
@@ -772,6 +890,16 @@ pub struct NeovideEditorPane {
     /// What the next nvim is started with, read by the render callback when it builds the harness:
     /// the construction's options, until [`NeovideEditorPane::restart`] replaces them.
     spawn_options: Rc<RefCell<NeovideEditorPaneOptions>>,
+    /// How the last session ended ([`NeovideEditorPane::ended`]): written once per session, when the
+    /// service reports its end or a shutdown or release sees it; cleared when a new session starts.
+    ended: Rc<RefCell<Option<PaneEnded>>>,
+    /// See [`NeovideEditorPane::on_followed`].
+    followed_callback: FollowedCallbackSlot,
+    /// See [`NeovideEditorPane::learned_nvim`].
+    learned: LearnedNvim,
+    /// A followed `:connect` made this pane an attached one: it stays so whatever its state, so it never
+    /// starts an nvim of its own again.
+    followed_attach: Rc<Cell<bool>>,
 }
 
 /// The oldest nvim the editor runs, as `(major, minor, patch)`: the window's own floor
@@ -825,6 +953,174 @@ pub struct NeovideEditorPaneOptions {
     /// for `nvim file`. This crate does not validate or quote them; the host builds them from paths
     /// that start with `/`, so none can read as an option or a command.
     pub open: Vec<String>,
+    /// Join an nvim that is already running, as one more UI, instead of starting one
+    /// (`LiveHarnessOptions::server`). `None` (the default) starts the pane's own `nvim --embed`.
+    ///
+    /// The nvim is not this pane's: no process is looked for at the launch and nvim is never asked
+    /// for its pid, so nothing can signal it; [`end_nvim`](NeovideEditorPane::end_nvim),
+    /// [`exec_lua_watched`](NeovideEditorPane::exec_lua_watched) (the quit's carrier) and
+    /// [`restart`](NeovideEditorPane::restart) are refused; every way the pane lets go of it -- its
+    /// shutdown, its drop, a [`HangUp`] handle -- closes this UI's channel and nvim goes on. The
+    /// fork puts no clipboard provider into it, and `clean`, `child_env`, `cwd`,
+    /// `extra_nvim_args` and `open` are not used. The launch still blocks this thread, for at most
+    /// the fork's bound on an attach's setup (4 s).
+    pub attach: Option<AttachSpec>,
+    /// Decides, before [`exec_lua`](NeovideEditorPane::exec_lua) sends anything, whether a chunk
+    /// may reach nvim and with which arguments. Set at construction (or a restart), so it holds from
+    /// the first call. An attached pane with none answers every `exec_lua` with a refusal.
+    pub chunk_check: Option<ChunkCheck>,
+}
+
+/// The nvim an attached pane joins ([`NeovideEditorPaneOptions::attach`]): its `--listen` address,
+/// a unix socket that must be held by this process's own uid (the fork checks the peer before any
+/// request).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AttachSpec {
+    pub server: String,
+}
+
+/// A [`ChunkCheck`]'s refusal: `reason` is what the caller's reply is answered with.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ChunkRefused {
+    pub reason: String,
+}
+
+impl std::fmt::Display for ChunkRefused {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.reason)
+    }
+}
+
+impl std::error::Error for ChunkRefused {}
+
+/// A check's signature: the chunk and the caller's arguments in; the arguments to send, or a
+/// refusal, out.
+type ChunkCheckFn = dyn Fn(&'static str, Vec<rmpv::Value>) -> Result<Vec<rmpv::Value>, ChunkRefused>;
+
+/// The host's rule for what [`NeovideEditorPane::exec_lua`] may send
+/// ([`NeovideEditorPaneOptions::chunk_check`]): called on this thread with the chunk and its
+/// arguments, before anything is written to nvim. `Ok` carries the arguments to send (the caller's,
+/// or the caller's with more appended); `Err` is answered to the caller at once and nothing is sent.
+/// Shared rather than boxed, so the options that hold it can be cloned for a restart and compared
+/// (two checks are equal when they are the same one).
+#[derive(Clone)]
+pub struct ChunkCheck(Rc<ChunkCheckFn>);
+
+impl ChunkCheck {
+    pub fn new(
+        check: impl Fn(&'static str, Vec<rmpv::Value>) -> Result<Vec<rmpv::Value>, ChunkRefused> + 'static,
+    ) -> Self {
+        ChunkCheck(Rc::new(check))
+    }
+
+    fn run(&self, code: &'static str, args: Vec<rmpv::Value>) -> Result<Vec<rmpv::Value>, ChunkRefused> {
+        (self.0)(code, args)
+    }
+}
+
+impl std::fmt::Debug for ChunkCheck {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("ChunkCheck(..)")
+    }
+}
+
+impl PartialEq for ChunkCheck {
+    fn eq(&self, other: &Self) -> bool {
+        Rc::ptr_eq(&self.0, &other.0)
+    }
+}
+
+/// How a pane's session ended ([`NeovideEditorPane::ended`]), read by the host in its exit callback
+/// ([`NeovideEditorPane::on_exited_unrequested`]) or after its own shutdown. There is no exit status:
+/// the fork does not keep one.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PaneEnded {
+    /// nvim ended the session. For an nvim the pane started, it exited. For an attached one, nvim
+    /// either exited (`:qa`) or closed this UI's channel itself (the fork's own quit in attach mode)
+    /// and goes on; the pane cannot tell which, and a host with a connection of its own to that nvim
+    /// can.
+    Exited,
+    /// This pane let go of an attached nvim: its shutdown, its drop or a [`HangUp`] handle closed
+    /// the channel. nvim goes on.
+    Detached,
+    /// `:connect` or `:restart` typed in an attached nvim moved it away from this UI; the fork does
+    /// not follow ([`Left`]).
+    SessionLeft(Left),
+}
+
+/// A `:restart` or `:connect` typed in the pane's own nvim, which the pane followed
+/// ([`NeovideEditorPane::on_followed`]) instead of ending.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PaneFollowed {
+    /// The pane shows the server `:restart` started: still the pane's own nvim, a new session of it.
+    Restart,
+    /// The pane shows the server `:connect` moved it to, which it did not start: it is attached to it
+    /// from now on ([`NeovideEditorPane::is_attached`]). `left` is the address of the pane's own nvim it
+    /// left, which runs on with no UI unless a banged `:connect` stopped it.
+    Connect { left: Option<String> },
+}
+
+/// The pid and start time (`/proc/<pid>/stat`'s 22nd field) of the server a followed `:restart`
+/// started, once it answered for itself ([`NeovideEditorPane::learned_nvim`]); none before, and none
+/// for any other session. A clone reads the same slot from any thread.
+#[derive(Debug, Clone, Default)]
+pub struct LearnedNvim(Arc<std::sync::Mutex<Option<(u32, u64)>>>);
+
+impl LearnedNvim {
+    pub fn get(&self) -> Option<(u32, u64)> {
+        *self.0.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    fn set(&self, pid: u32) {
+        let held = proc_start_time(pid).map(|start| (pid, start));
+        *self.0.lock().unwrap_or_else(std::sync::PoisonError::into_inner) = held;
+    }
+
+    fn clear(&self) {
+        *self.0.lock().unwrap_or_else(std::sync::PoisonError::into_inner) = None;
+    }
+}
+
+/// `/proc/<pid>/stat`'s 22nd field, the start time that tells a process from a later one given its pid.
+fn proc_start_time(pid: u32) -> Option<u64> {
+    let stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
+    let rest = &stat[stat.rfind(')')? + 1..];
+    rest.split_whitespace().nth(19)?.parse().ok()
+}
+
+/// What the pane runs, over the fork's own channel, to let go of a server a followed `:connect` reached:
+/// the fork's cleanup for that channel, its id the argument, which puts back what the fork put in (no glue
+/// of Eitri's is there to run it). Lua cannot name the channel a request came on (its own API calls are
+/// internal ones), so the pane asks nvim for it first, over the same connection.
+const FOLLOWED_CLEANUP_LUA: &str = "local record = rawget(_G, '__neovide_attach') \
+    if type(record) ~= 'table' or type(record.cleanup) ~= 'function' then return false end \
+    return record.cleanup(...) == true";
+
+/// How long [`NeovideEditorPane::detach_followed`] waits for that cleanup before it hangs up anyway: a
+/// server waiting for a key answers later, and its record stays.
+const FOLLOWED_CLEANUP_WITHIN: Duration = Duration::from_millis(300);
+
+/// Closes an attached pane's channel from any thread ([`NeovideEditorPane::hang_up_handle`]): nvim
+/// drops the UI and goes on, and the pane reports the end on its next service run:
+/// [`PaneEnded::Detached`], unless nvim had already left on its own. Idempotent, and harmless once the session has ended. The only thing it can do to
+/// nvim is close this one connection.
+#[derive(Clone)]
+pub struct HangUp {
+    connection: neovide::bridge::session::HangUp,
+    detached: Arc<AtomicBool>,
+}
+
+impl HangUp {
+    pub fn hang_up(&self) {
+        self.detached.store(true, Ordering::SeqCst);
+        self.connection.hang_up();
+    }
+}
+
+impl std::fmt::Debug for HangUp {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("HangUp(..)")
+    }
 }
 
 /// The `--cmd` that hides the cursor while the pane does not have keyboard focus.
@@ -1108,6 +1404,35 @@ fn exit_events(
     }
 }
 
+/// What a session's end means ([`PaneEnded`]), from whether it was attached, whether this pane hung up on it, and
+/// the `:connect` or `:restart` the fork reported for it.
+fn pane_ended(attached: bool, detached: bool, left: Option<Left>) -> PaneEnded {
+    if !attached {
+        PaneEnded::Exited
+    } else if let Some(why) = left {
+        // The fork reports a `:connect` or `:restart` only when nvim ended the session before this
+        // side hung up, so a hang-up made after it (a shutdown or a handle, before the pane's next
+        // service run read the end) does not hide where nvim went.
+        PaneEnded::SessionLeft(why)
+    } else if detached {
+        PaneEnded::Detached
+    } else {
+        PaneEnded::Exited
+    }
+}
+
+/// Keeps how `session` ended in `slot`, once: the first answer stands for the session (a later
+/// read of the fork's events would find them taken). `None` while it has not ended.
+fn record_end(session: &LiveSession, slot: &RefCell<Option<PaneEnded>>) -> Option<PaneEnded> {
+    let known = slot.borrow().clone();
+    if known.is_some() {
+        return known;
+    }
+    let how = session.how_it_ended()?;
+    *slot.borrow_mut() = Some(how.clone());
+    Some(how)
+}
+
 /// The line the service logs when it tells the host nvim is out of reach: its process outlived the fork's report of
 /// its exit by [`UNREACHABLE_GRACE`]. Only nvim run behind a launcher is said to have been left by one.
 fn unreachable_log_line(behind_a_launcher: bool) -> String {
@@ -1208,7 +1533,7 @@ fn run_detached(job: Job, spawn: impl FnOnce(Job) -> std::io::Result<()>) -> boo
 /// what the fork started, `nvim_child`'s source 2). The request is never abandoned: nvim-rs ends
 /// the whole connection when a response arrives for a dropped request (`nvim_rpc`'s module doc),
 /// and nvim exiting resolves it with an error.
-fn ask_nvim_for_its_pid(harness: &LiveHarness, process: &Arc<nvim_child::NvimProcess>) {
+fn ask_nvim_for_its_pid(harness: &LiveHarness, process: &Arc<nvim_child::NvimProcess>, learned: Option<LearnedNvim>) {
     let Some(nvim) = harness.neovim_handler().clone_current_neovim() else {
         println!("[live] no nvim connection to ask for its pid");
         return;
@@ -1223,7 +1548,12 @@ fn ask_nvim_for_its_pid(harness: &LiveHarness, process: &Arc<nvim_child::NvimPro
                 .and_then(|pid| pid.as_u64())
                 .and_then(|pid| u32::try_from(pid).ok())
             {
-                Some(pid) if process.learn(pid) => println!("[live] nvim is pid {pid} (its own answer)"),
+                Some(pid) if process.learn(pid) => {
+                    if let Some(learned) = &learned {
+                        learned.set(pid);
+                    }
+                    println!("[live] nvim is pid {pid} (its own answer)")
+                }
                 Some(pid) => println!("[live] nvim answered pid {pid}, which is not a live nvim --embed; not held"),
                 None => {
                     println!("[live] nvim did not answer getpid(); a forced kill falls back to what the fork started");
@@ -1462,6 +1792,7 @@ impl NeovideEditorPane {
         }
         let focused: Rc<Cell<Option<bool>>> = Rc::new(Cell::new(None));
         let exited_callback: ExitedCallbackSlot = Rc::new(RefCell::new(None));
+        let ended: Rc<RefCell<Option<PaneEnded>>> = Rc::new(RefCell::new(None));
         let unreachable_callback: UnreachableCallbackSlot = Rc::new(RefCell::new(None));
         let fullscreen_callback: FullscreenCallbackSlot = Rc::new(RefCell::new(None));
         let pending_fullscreen: Rc<Cell<Option<bool>>> = Rc::new(Cell::new(None));
@@ -1478,6 +1809,9 @@ impl NeovideEditorPane {
         let grid_top_share: Rc<Cell<Option<f64>>> = Rc::new(Cell::new(None));
         let start_failed_callback: StartFailedCallbackSlot = Rc::new(RefCell::new(None));
         let session_ready_callback: SessionReadyCallbackSlot = Rc::new(RefCell::new(None));
+        let followed_callback: FollowedCallbackSlot = Rc::new(RefCell::new(None));
+        let learned = LearnedNvim::default();
+        let followed_attach: Rc<Cell<bool>> = Rc::new(Cell::new(false));
         // Set the first time the `Failed` arm below actually paints `FAILED_COLOR` and the message
         // -- read by the tick callback ([`failed_tick_should_render`]) to stop asking for more
         // frames once that one paint has happened. `Failed` leaves itself only through a restart,
@@ -1665,6 +1999,7 @@ impl NeovideEditorPane {
             // This closure is the only place `LiveHarness` is ever constructed, so it is the one
             // reader of the options a start (the first, or a restart) uses.
             let spawn_options = spawn_options.clone();
+            let ended_for_render = ended.clone();
             let clear_color = clear_color.clone();
             let focused = focused.clone();
             let pending_fullscreen = pending_fullscreen.clone();
@@ -1839,7 +2174,8 @@ impl NeovideEditorPane {
                         let os_scale_factor = shared.device_scale();
                         let spawn = spawn_options.borrow();
                         let (clean, cwd) = (spawn.clean, spawn.cwd.clone());
-                        let options = LiveHarnessOptions {
+                        let attach = spawn.attach.clone();
+                        let owned_options = || LiveHarnessOptions {
                             os_scale_factor,
                             extra_nvim_args: nvim_args(clean, &spawn.extra_nvim_args, &spawn.open),
                             // Cloned rather than moved because a restart may start from these
@@ -1876,16 +2212,44 @@ impl NeovideEditorPane {
                             // and replayed after the first frame.
                             startup_message_capture: false,
                             minimum_nvim_version: Some(NVIM_FLOOR),
+                            // nvim's clipboard is the host's (`child_env`, `extra_nvim_args`), also on a
+                            // server a followed `:restart` reaches: the fork puts its own provider into
+                            // no session.
+                            remote_clipboard: false,
                             ..Default::default()
                         };
+                        let options = match &attach {
+                            // The person's nvim, not one of ours: nothing to start, so none of the
+                            // spawn's arguments, environment or directory apply, and nvim keeps its own
+                            // clipboard provider.
+                            Some(spec) => LiveHarnessOptions {
+                                os_scale_factor,
+                                startup_message_capture: false,
+                                minimum_nvim_version: Some(NVIM_FLOOR),
+                                server: Some(spec.server.clone()),
+                                remote_clipboard: false,
+                                ..Default::default()
+                            },
+                            None => owned_options(),
+                        };
                         drop(spawn);
-                        println!(
-                            "[live] constructing LiveHarness::with_options(os_scale_factor={os_scale_factor}, \
-                             clean={clean}, cwd={cwd:?}) -- this performs a real, synchronous nvim \
-                             launch and WILL block the GTK main loop until it returns"
-                        );
-                        // Before the launch, so the one new `--embed` child after it is nvim.
-                        let children_before = nvim_child::direct_children();
+                        match &attach {
+                            Some(spec) => println!(
+                                "[live] attaching LiveHarness::with_options(os_scale_factor={os_scale_factor}) to the \
+                                 running nvim at {} -- it blocks the GTK main loop until the attach's setup is \
+                                 answered, at most the fork's 4 s bound",
+                                spec.server
+                            ),
+                            None => println!(
+                                "[live] constructing LiveHarness::with_options(os_scale_factor={os_scale_factor}, \
+                                 clean={clean}, cwd={cwd:?}) -- this performs a real, synchronous nvim \
+                                 launch and WILL block the GTK main loop until it returns"
+                            ),
+                        }
+                        // Before the launch, so the one new `--embed` child after it is nvim. An attach
+                        // starts no process, and an `--embed` child of this process found then would
+                        // not be the nvim attached to: nothing is looked for.
+                        let children_before = attach.is_none().then(nvim_child::direct_children);
                         let t0 = Instant::now();
                         // A construction panic must stop here: GTK's render trampoline cannot unwind.
                         match catch_unwind(AssertUnwindSafe(|| LiveHarness::with_options(options))) {
@@ -1895,20 +2259,32 @@ impl NeovideEditorPane {
                                     "[live] LiveHarness::with_options returned after {elapsed:?} \
                                      (blocked the GTK main loop for that long)"
                                 );
-                                let nvim_process = Arc::new(nvim_child::NvimProcess::new(
-                                    nvim_child::NvimChild::find_new(&children_before),
-                                ));
-                                match nvim_process.launched_pid() {
-                                    Some(pid) => println!(
-                                        "[live] the fork started pid {pid} (nvim, or a launcher of \
-                                         it); asking nvim for its own pid"
-                                    ),
-                                    None => println!(
-                                        "[live] the process the fork started was not found; asking \
-                                         nvim for its own pid"
-                                    ),
+                                // An attached session holds no process: nothing here may watch, signal
+                                // or end an nvim this pane did not start, so nothing asks which it is.
+                                let nvim_process = children_before.map(|children_before| {
+                                    let nvim_process = Arc::new(nvim_child::NvimProcess::new(
+                                        nvim_child::NvimChild::find_new(&children_before),
+                                    ));
+                                    match nvim_process.launched_pid() {
+                                        Some(pid) => println!(
+                                            "[live] the fork started pid {pid} (nvim, or a launcher of \
+                                             it); asking nvim for its own pid"
+                                        ),
+                                        None => println!(
+                                            "[live] the process the fork started was not found; asking \
+                                             nvim for its own pid"
+                                        ),
+                                    }
+                                    ask_nvim_for_its_pid(&harness, &nvim_process, None);
+                                    nvim_process
+                                });
+                                if nvim_process.is_none() {
+                                    println!(
+                                        "[live] attached as one more UI of an nvim this pane did not start: no \
+                                         process of it is held, and letting go of it only closes this channel"
+                                    );
                                 }
-                                ask_nvim_for_its_pid(&harness, &nvim_process);
+                                *ended_for_render.borrow_mut() = None;
                                 // The frozen-scroll fix: `LiveHarnessOptions::grid_size`
                                 // (left `None` above, so `DEFAULT_GRID_SIZE` 100x50) only ever
                                 // sets nvim's grid size at `nvim_ui_attach` time and has no
@@ -2287,6 +2663,11 @@ impl NeovideEditorPane {
             // that reentrant borrow would hit a `RefCell` `BorrowMutError` panic. See
             // `should_fire_exited_callback` below for how that's kept safe.
             let exited_callback_for_tick = exited_callback.clone();
+            let ended_for_tick = ended.clone();
+            let followed_callback_for_tick = followed_callback.clone();
+            let session_ready_callback_for_tick = session_ready_callback.clone();
+            let learned_for_tick = learned.clone();
+            let followed_attach_for_tick = followed_attach.clone();
             let unreachable_callback_for_tick = unreachable_callback.clone();
             // Fired after `live` is dropped, for the same reentrancy reason as the exited callback:
             // the host's handler calls straight back into `set_fullscreen_setting`.
@@ -2311,9 +2692,14 @@ impl NeovideEditorPane {
                 // ordering matters.
                 let mut should_fire_exited_callback = false;
                 let mut exit_after_quit = false;
+                // How an attached session ended, for the exit's log line.
+                let mut attached_end: Option<PaneEnded> = None;
                 let mut should_fire_unreachable_callback = false;
                 let mut fullscreen_changed: Option<bool> = None;
                 let mut scale_factor_changed: Option<f32> = None;
+                // A `:restart` or `:connect` this pane followed in this run, told to the host after `live`
+                // is dropped.
+                let mut pane_followed: Option<PaneFollowed> = None;
                 let issued = match &mut *live {
                     LiveState::Ready(session) => {
                         // Cheap, non-blocking drain of any nvim redraw traffic that arrived since
@@ -2324,6 +2710,17 @@ impl NeovideEditorPane {
                         // them, so the other panes are swept (a wake services every pane itself).
                         if source == ServiceSource::Tick {
                             live_watch::after_outside_pump(Some(Rc::as_ptr(&session.live)));
+                        }
+                        // Whichever pane's pump applied the end of this pane's session, the new one is set
+                        // up here, by this pane's own harness; the pane switches before anything is told.
+                        session.harness.follow_if_due();
+                        if let Some(how) = session.harness.take_followed() {
+                            let how = session.follow(how, &learned_for_tick);
+                            if matches!(how, PaneFollowed::Connect { .. }) {
+                                followed_attach_for_tick.set(true);
+                            }
+                            *ended_for_tick.borrow_mut() = None;
+                            pane_followed = Some(how);
                         }
                         let fullscreen = session.harness.fullscreen_setting();
                         if last_fullscreen_for_tick.replace(fullscreen) != fullscreen {
@@ -2443,9 +2840,7 @@ impl NeovideEditorPane {
                         //
                         // Only once nvim's own process is gone (`exit_events`).
                         let fork_exited = session.harness.has_neovim_exited();
-                        let nvim_alive = fork_exited
-                            .then(|| session.nvim_process.alive_within(Duration::ZERO))
-                            .flatten();
+                        let nvim_alive = fork_exited.then(|| session.nvim_alive()).flatten();
                         if nvim_alive == Some(true) {
                             session.wake_on_nvim_exit();
                         }
@@ -2459,13 +2854,22 @@ impl NeovideEditorPane {
                         if events.unreachable {
                             session.unreachable_said.set(true);
                             should_fire_unreachable_callback = true;
-                            println!("{}", unreachable_log_line(session.nvim_process.behind_a_launcher()));
+                            println!(
+                                "{}",
+                                unreachable_log_line(
+                                    session
+                                        .nvim_process
+                                        .as_ref()
+                                        .is_some_and(|process| process.behind_a_launcher())
+                                )
+                            );
                         }
                         if events.exited {
                             session.close_requested.set(true);
                             should_fire_exited_callback = true;
                             exit_after_quit =
                                 exit_follows_quit(session.watched.as_ref().map(nvim_rpc::WatchedCall::watch).as_ref());
+                            attached_end = record_end(session, &ended_for_tick).filter(|_| session.is_attached());
                         }
 
                         tick_should_render(
@@ -2478,6 +2882,19 @@ impl NeovideEditorPane {
                     other => sessionless_tick_should_render(other, failed_painted_for_tick.get()),
                 };
                 drop(live);
+
+                if let Some(how) = pane_followed {
+                    if let Some(cb) = followed_callback_for_tick.borrow().as_ref() {
+                        cb(how.clone());
+                    }
+                    // A followed `:restart` is a new session of the pane's own nvim, which the host sets up
+                    // as it does each launch's; a server `:connect` reached is not the host's to set up.
+                    if how == PaneFollowed::Restart {
+                        if let Some(cb) = session_ready_callback_for_tick.borrow().as_ref() {
+                            cb();
+                        }
+                    }
+                }
 
                 if let Some(fullscreen) = fullscreen_changed {
                     println!("[live] g:neovide_fullscreen is now {fullscreen}");
@@ -2500,7 +2917,13 @@ impl NeovideEditorPane {
                 }
 
                 if should_fire_exited_callback {
-                    println!("{}", exit_log_line(exit_after_quit));
+                    match &attached_end {
+                        Some(how) => println!(
+                            "[live] the attached nvim's session ended ({how:?}) -- invoking the registered \
+                             on_exited_unrequested callback (if any)"
+                        ),
+                        None => println!("{}", exit_log_line(exit_after_quit)),
+                    }
                     if let Some(cb) = exited_callback_for_tick.borrow().as_ref() {
                         cb();
                     }
@@ -2556,6 +2979,10 @@ impl NeovideEditorPane {
             key_activity,
             tick_driver,
             spawn_options,
+            ended,
+            followed_callback,
+            learned,
+            followed_attach,
         }
     }
 
@@ -2760,12 +3187,20 @@ impl NeovideEditorPane {
     /// request comes back, a thread of its own asks nvim's fast `nvim_get_mode` every 250 ms, so a
     /// host can tell an nvim showing a dialog from one whose loop is stuck
     /// ([`watched_call`](Self::watched_call)). Replaces the previous watch (whose request still runs
-    /// to its end). `false`, sending nothing, when nvim is not running.
+    /// to its end). `false`, sending nothing, when nvim is not running, and on an attached pane
+    /// ([`is_attached`](Self::is_attached)): this is how a window asks nvim to quit, and an nvim the
+    /// pane did not start is never asked.
     pub fn exec_lua_watched(&self, code: &str) -> bool {
         let mut live = self.live_state.borrow_mut();
         let LiveState::Ready(session) = &mut *live else {
             return false;
         };
+        if session.is_attached() {
+            println!(
+                "[live] exec_lua_watched refused: the pane is attached to an nvim it did not start -- nothing sent"
+            );
+            return false;
+        }
         if session.harness.has_neovim_exited() {
             return false;
         }
@@ -2831,7 +3266,36 @@ impl NeovideEditorPane {
     /// thread of its own, and every later call is still written behind it. Unlike
     /// [`exec_lua_watched`](Self::exec_lua_watched) this keeps no record in the session and starts no
     /// watch: the quit and its watch stay the window's own.
+    ///
+    /// With a [`ChunkCheck`] ([`NeovideEditorPaneOptions::chunk_check`]) the chunk goes only where
+    /// the check lets it, with the arguments the check returns; a refusal is answered at once,
+    /// `reply` called here with its reason, and nothing is sent. An attached pane with no check
+    /// answers every call that way. `true` whenever `reply` was or will be called.
     pub fn exec_lua(&self, code: &'static str, args: Vec<rmpv::Value>, reply: LuaReply) -> bool {
+        let attached = match &*self.live_state.borrow() {
+            LiveState::Ready(session) if !session.harness.has_neovim_exited() => session.is_attached(),
+            _ => return false,
+        };
+        // No borrow is held while the host's check runs.
+        let check = self.spawn_options.borrow().chunk_check.clone();
+        let checked = match check {
+            Some(check) => check.run(code, args),
+            None if attached => Err(ChunkRefused {
+                reason: "the editor is attached to an nvim it did not start, and no chunk check was given".to_owned(),
+            }),
+            None => Ok(args),
+        };
+        let args = match checked {
+            Ok(args) => args,
+            Err(refused) => {
+                println!(
+                    "[live] exec_lua: a chunk of {} bytes was refused before anything was sent ({refused})",
+                    code.len()
+                );
+                reply(Err(refused.reason));
+                return true;
+            }
+        };
         let live = self.live_state.borrow();
         let LiveState::Ready(session) = &*live else {
             return false;
@@ -2898,9 +3362,18 @@ impl NeovideEditorPane {
     /// harness lives here. Its exit then reaches the host as any exit does,
     /// once the process is gone ([`on_exited_unrequested`](Self::on_exited_unrequested)).
     /// Idempotent: a second call starts no second watch. `false`, doing nothing, when there is no
-    /// session.
+    /// session, and on an attached pane ([`is_attached`](Self::is_attached)), whose nvim is not this
+    /// pane's to end: it only lets go of it ([`hang_up_handle`](Self::hang_up_handle),
+    /// [`shutdown`](Self::shutdown)).
     pub fn end_nvim(&self) -> bool {
+        if self.is_attached() {
+            println!("[live] end_nvim refused: the pane is attached to an nvim it did not start -- nothing ended");
+            return false;
+        }
         let LiveState::Ready(session) = &mut *self.live_state.borrow_mut() else {
+            return false;
+        };
+        let Some(process) = session.nvim_process.clone() else {
             return false;
         };
         if session.ending.get().is_some() {
@@ -2909,7 +3382,7 @@ impl NeovideEditorPane {
         let at = Instant::now();
         let schedule = session.ending_schedule();
         session.ending.set(Some((at, schedule)));
-        let watched = session.nvim_process.nvim_pid();
+        let watched = process.nvim_pid();
         if schedule.hang_up_after.is_zero() {
             session.harness.hang_up();
             println!("[live] end_nvim: nvim's stdin is closed; watching pid {watched:?} until it has gone");
@@ -2937,7 +3410,6 @@ impl NeovideEditorPane {
                 schedule.hang_up_after
             );
         }
-        let process = session.nvim_process.clone();
         run_detached(
             Box::new(move || {
                 // The hang-up is this thread's timer's, above: the harness is not `Send`.
@@ -2947,6 +3419,51 @@ impl NeovideEditorPane {
             spawn_named("nvim end"),
         );
         true
+    }
+
+    /// Whether this pane is attached to an nvim it did not start ([`NeovideEditorPaneOptions::attach`]):
+    /// its session's, once it has one, else what its options ask for. Such a pane refuses
+    /// [`end_nvim`](Self::end_nvim), [`exec_lua_watched`](Self::exec_lua_watched) and
+    /// [`restart`](Self::restart), and lets go of nvim only by closing its channel.
+    pub fn is_attached(&self) -> bool {
+        if self.followed_attach.get() {
+            return true;
+        }
+        match &*self.live_state.borrow() {
+            LiveState::Ready(session) => session.is_attached(),
+            _ => self.spawn_options.borrow().attach.is_some(),
+        }
+    }
+
+    /// A handle that closes an attached session's channel from any thread ([`HangUp`]), for a host
+    /// that lets go of nvim off this thread once its own teardown in nvim is done. `None` without a
+    /// running attached session: an nvim this pane started is ended through
+    /// [`end_nvim`](Self::end_nvim) and [`shutdown`](Self::shutdown), never by a bare hang-up.
+    pub fn hang_up_handle(&self) -> Option<HangUp> {
+        match &*self.live_state.borrow() {
+            LiveState::Ready(session) if session.is_attached() => {
+                session.harness.hang_up_handle().map(|connection| HangUp {
+                    connection,
+                    detached: session.detached.clone(),
+                })
+            }
+            _ => None,
+        }
+    }
+
+    /// How the last session ended ([`PaneEnded`]), from the moment its end is reported
+    /// ([`on_exited_unrequested`](Self::on_exited_unrequested)'s callback can read it) or the host's
+    /// [`shutdown`](Self::shutdown) returned, until a new session starts. `None` while the session
+    /// runs, or before there was one.
+    pub fn ended(&self) -> Option<PaneEnded> {
+        let known = self.ended.borrow().clone();
+        if known.is_some() {
+            return known;
+        }
+        match &*self.live_state.borrow() {
+            LiveState::Ready(session) => record_end(session, &self.ended),
+            _ => None,
+        }
     }
 
     /// One grid cell's size in logical pixels (the unit GTK sizes and positions widgets in), or
@@ -3034,6 +3551,134 @@ impl NeovideEditorPane {
         *self.session_ready_callback.borrow_mut() = Some(Box::new(callback));
     }
 
+    /// Registers `callback`, called each time the pane followed a `:restart` or `:connect` typed in its
+    /// own nvim ([`PaneFollowed`]) instead of ending: after the pane's own switch, so it already answers
+    /// for the new server ([`is_attached`](Self::is_attached) is `true` after a `:connect`). A followed
+    /// `:restart` is also reported to [`on_session_ready`](Self::on_session_ready)'s callback, after this
+    /// one. Fired from the service, after `live` is dropped. Replaces any earlier callback.
+    pub fn on_followed(&self, callback: impl Fn(PaneFollowed) + 'static) {
+        *self.followed_callback.borrow_mut() = Some(Box::new(callback));
+    }
+
+    /// The server a followed `:restart` started, as it answered for itself; a clone the host may read
+    /// from any thread (the window's clipboard admits it: it is no child of the window once the nvim
+    /// that started it has exited).
+    pub fn learned_nvim(&self) -> LearnedNvim {
+        self.learned.clone()
+    }
+
+    /// Replaces the [`ChunkCheck`] that decides what [`exec_lua`](Self::exec_lua) sends
+    /// ([`NeovideEditorPaneOptions::chunk_check`]); for a host whose editor became attached through a
+    /// followed `:connect`, which refuses every chunk until it has one.
+    pub fn set_chunk_check(&self, check: Option<ChunkCheck>) {
+        self.spawn_options.borrow_mut().chunk_check = check;
+    }
+
+    /// The address of the pane's own nvim a followed `:connect` left, while that nvim still runs; `None`
+    /// once it has exited (a banged `:connect`), and for every other session.
+    pub fn left_running(&self) -> Option<String> {
+        match &*self.live_state.borrow() {
+            LiveState::Ready(session) => session
+                .left
+                .as_ref()
+                .filter(|(process, _)| process.alive_within(Duration::ZERO) == Some(true))
+                .and_then(|(_, address)| address.clone()),
+            _ => None,
+        }
+    }
+
+    /// Lets go of the server a followed `:connect` reached, on a thread of its own: the fork's cleanup
+    /// over the fork's channel (what the fork put into that nvim is taken out), waited for at most
+    /// [`FOLLOWED_CLEANUP_WITHIN`], then this UI's hang-up; `done` gets whether the cleanup said it
+    /// acted. Nothing else is sent: the server goes on as it was. `false`, doing nothing, for any other
+    /// session.
+    pub fn detach_followed(&self, done: impl FnOnce(bool) + Send + 'static) -> bool {
+        let live = self.live_state.borrow();
+        let LiveState::Ready(session) = &*live else {
+            return false;
+        };
+        if !self.followed_attach.get() || !session.is_attached() || session.harness.has_neovim_exited() {
+            return false;
+        }
+        let (Some(nvim), Some(connection)) = (
+            session.harness.neovim_handler().clone_current_neovim(),
+            session.harness.hang_up_handle(),
+        ) else {
+            return false;
+        };
+        let hang_up = HangUp {
+            connection,
+            detached: session.detached.clone(),
+        };
+        run_detached(
+            Box::new(move || {
+                let (tx, rx) = std::sync::mpsc::channel();
+                let asked = std::thread::Builder::new()
+                    .name("nvim-rpc cleanup".into())
+                    .spawn(move || {
+                        let answer = nvim_rpc::block_on(async {
+                            // `nvim_get_api_info`'s first item is the channel the request came on: the fork's.
+                            let info = nvim.get_api_info().await.ok()?;
+                            let chan = info.first().and_then(rmpv::Value::as_u64)?;
+                            nvim.exec_lua(FOLLOWED_CLEANUP_LUA, vec![chan.into()]).await.ok()
+                        });
+                        let _ = tx.send(answer);
+                    });
+                let cleaned = asked.is_ok()
+                    && matches!(
+                        rx.recv_timeout(FOLLOWED_CLEANUP_WITHIN),
+                        Ok(Some(rmpv::Value::Boolean(true)))
+                    );
+                println!(
+                    "[live] letting go of the server a :connect reached: the fork's cleanup {}",
+                    if cleaned { "acted" } else { "did not act in time" }
+                );
+                hang_up.hang_up();
+                done(cleaned);
+            }),
+            spawn_named("followed detach"),
+        );
+        true
+    }
+
+    /// Asks nvim's `nvim_get_mode`, which nvim answers even while it waits for a key, on a thread of its
+    /// own; `reply` gets the answer, or `None` when none came within `within` or nvim is not running.
+    /// `false`, with `reply` dropped uncalled, when there is no running session.
+    pub fn ask_mode(&self, within: Duration, reply: impl FnOnce(Option<NvimMode>) + Send + 'static) -> bool {
+        let nvim = match &*self.live_state.borrow() {
+            LiveState::Ready(session) if !session.harness.has_neovim_exited() => {
+                session.harness.neovim_handler().clone_current_neovim()
+            }
+            _ => None,
+        };
+        let Some(nvim) = nvim else {
+            return false;
+        };
+        run_detached(
+            Box::new(move || {
+                let (tx, rx) = std::sync::mpsc::channel();
+                let asked = std::thread::Builder::new().name("nvim-rpc mode".into()).spawn(move || {
+                    let _ = tx.send(nvim_rpc::block_on(nvim.get_mode()));
+                });
+                let mode = asked
+                    .ok()
+                    .and_then(|_| rx.recv_timeout(within).ok())
+                    .and_then(Result::ok)
+                    .map(|pairs| {
+                        let field = |name: &str| pairs.iter().find(|(k, _)| k.as_str() == Some(name)).map(|(_, v)| v);
+                        NvimMode {
+                            at: Instant::now(),
+                            mode: field("mode").and_then(|v| v.as_str()).unwrap_or_default().to_owned(),
+                            blocking: field("blocking").and_then(rmpv::Value::as_bool).unwrap_or(false),
+                        }
+                    });
+                reply(mode);
+            }),
+            spawn_named("nvim mode"),
+        );
+        true
+    }
+
     /// After nvim quit on its own ([`NeovideEditorPane::on_exited_unrequested`]), for a host that
     /// keeps its window open without the editor (`shell`'s `prefix x`): shuts the harness down --
     /// nvim is already gone, so this does not wait for it -- drops it, and leaves the pane
@@ -3054,6 +3699,7 @@ impl NeovideEditorPane {
             return false;
         }
         session.close_requested.set(true);
+        record_end(session, &self.ended);
         // The shared event loop's fd outlives every harness, so leaving the watch is not what keeps
         // it off a closed fd: the pane leaves because nothing of it is left to wake, and the last
         // pane out removes the watch.
@@ -3076,11 +3722,19 @@ impl NeovideEditorPane {
     /// Returns at once; a pane that is not shown starts once it is drawn.
     ///
     /// Refused, changing nothing, unless the pane is [`LiveState::Exited`] or [`LiveState::Failed`]:
-    /// the error names the state it found.
+    /// the error names the state it found. Refused in every state by an attached pane
+    /// ([`is_attached`](Self::is_attached); [`RestartRefused::ATTACHED`]): it never starts an nvim of
+    /// its own where the person's was.
     ///
     /// [`release_exited`]: Self::release_exited
     /// [`on_start_failed`]: Self::on_start_failed
     pub fn restart(&self, options: NeovideEditorPaneOptions) -> Result<(), RestartRefused> {
+        if self.is_attached() {
+            println!("[live] restart refused: the pane is attached to an nvim it did not start");
+            return Err(RestartRefused {
+                state: RestartRefused::ATTACHED,
+            });
+        }
         {
             let mut live = self.live_state.borrow_mut();
             if let Some(refused) = restart_refusal(&live) {
@@ -3111,6 +3765,10 @@ impl NeovideEditorPane {
     /// A pane still to launch its nvim (built or restarted, `NotStarted` or `Starting`) is left
     /// [`LiveState::Exited`] instead, so no later frame launches one: a window closed while its
     /// editor restarts leaves no nvim behind it.
+    ///
+    /// An attached pane ([`is_attached`](Self::is_attached)) only closes its channel: nvim drops this
+    /// UI and goes on, the fork's shutdown returns at the channel's end, and nothing is signalled.
+    /// Whatever the host installed in that nvim is the host's to take out before this.
     pub fn shutdown(&self) -> bool {
         let mut live = self.live_state.borrow_mut();
         if matches!(&*live, LiveState::NotStarted | LiveState::Starting) {
@@ -3123,27 +3781,118 @@ impl NeovideEditorPane {
             // `LiveSession::close_requested`'s doc) is already tripped when nvim actually exits: a
             // shutdown the host itself initiated must not also reach it as an unrequested exit.
             session.close_requested.set(true);
-            let (at, schedule) = session
-                .ending
-                .get()
-                .unwrap_or_else(|| (Instant::now(), session.ending_schedule()));
-            session.ending.set(Some((at, schedule)));
-            // On this thread, blocking: `end` closes stdin itself when the schedule says, since an
-            // earlier `end_nvim`'s timer cannot run until this returns.
             // A harness being torn down has nothing left for the watch to wake.
             live_watch::unregister(Rc::as_ptr(&session.live));
             self.tick_driver.session_ended();
-            let harness = &mut session.harness;
-            let ended = nvim_child::end(&session.nvim_process, at, schedule, &mut || harness.hang_up());
-            println!("[live] shutdown(): nvim's stdin is closed ({ended:?}); tearing the harness down");
+            match session.nvim_process.clone() {
+                Some(process) => {
+                    let (at, schedule) = session
+                        .ending
+                        .get()
+                        .unwrap_or_else(|| (Instant::now(), session.ending_schedule()));
+                    session.ending.set(Some((at, schedule)));
+                    // On this thread, blocking: `end` closes stdin itself when the schedule says, since an
+                    // earlier `end_nvim`'s timer cannot run until this returns.
+                    let harness = &mut session.harness;
+                    let ended = nvim_child::end(&process, at, schedule, &mut || harness.hang_up());
+                    println!("[live] shutdown(): nvim's stdin is closed ({ended:?}); tearing the harness down");
+                }
+                None => {
+                    session.detach();
+                    println!(
+                        "[live] shutdown(): the channel to the attached nvim is closed; nvim goes on; tearing the \
+                         harness down"
+                    );
+                }
+            }
             let exited_cleanly = session.harness.shutdown();
             // Its shutdown pumped the shared loop, perhaps applying another pane's batches.
             live_watch::after_outside_pump(None);
+            record_end(session, &self.ended);
             println!("[live] LiveHarness::shutdown() returned {exited_cleanly}");
             exited_cleanly
         } else {
             true
         }
+    }
+}
+
+/// A pane dropped without a shutdown lets go of an attached nvim at once: its channel is closed
+/// here rather than whenever the widget's handlers release the session, and a pane still to attach
+/// (`NotStarted` or `Starting`) is left [`LiveState::Exited`], so the frames its widget still draws
+/// never attach with no pane left to let go. Nothing else changes: an nvim the pane started is ended
+/// as it always was, by its harness's own drop.
+impl Drop for NeovideEditorPane {
+    fn drop(&mut self) {
+        let Ok(mut live) = self.live_state.try_borrow_mut() else {
+            return;
+        };
+        match &mut *live {
+            LiveState::Ready(session) => {
+                if session.is_attached() && !session.harness.has_neovim_exited() {
+                    session.detach();
+                    println!("[live] the pane was dropped: the channel to the attached nvim is closed; nvim goes on");
+                }
+            }
+            LiveState::NotStarted | LiveState::Starting if self.spawn_options.borrow().attach.is_some() => {
+                *live = LiveState::Exited;
+                println!("[live] the pane was dropped before it attached; it will not attach");
+            }
+            _ => {}
+        }
+    }
+}
+
+#[cfg(test)]
+mod end_tests {
+    use super::{pane_ended, Left, PaneEnded};
+
+    #[test]
+    fn an_owned_session_always_ends_as_an_exit() {
+        assert_eq!(pane_ended(false, false, None), PaneEnded::Exited);
+        assert_eq!(pane_ended(false, true, Some(Left::Connect)), PaneEnded::Exited);
+    }
+
+    #[test]
+    fn an_attached_session_the_pane_let_go_of_ends_detached() {
+        assert_eq!(pane_ended(true, true, None), PaneEnded::Detached);
+    }
+
+    #[test]
+    fn an_attached_session_nvim_ended_with_nothing_reported_ends_as_an_exit() {
+        assert_eq!(pane_ended(true, false, None), PaneEnded::Exited);
+    }
+
+    #[test]
+    fn a_connect_or_restart_nvim_reported_is_kept() {
+        assert_eq!(
+            pane_ended(true, false, Some(Left::Connect)),
+            PaneEnded::SessionLeft(Left::Connect)
+        );
+        let restart = Left::Restart {
+            addr: Some("/run/o.sock".into()),
+        };
+        assert_eq!(
+            pane_ended(true, false, Some(restart.clone())),
+            PaneEnded::SessionLeft(restart)
+        );
+    }
+
+    /// The fork reports a `:connect` or `:restart` only for an end nvim made before this side hung up, so a hang-up
+    /// that comes after it (the host's shutdown or a worker's handle, before the pane's next service run) keeps it.
+    #[test]
+    fn a_hang_up_after_nvim_left_keeps_where_it_went() {
+        assert_eq!(
+            pane_ended(true, true, Some(Left::Connect)),
+            PaneEnded::SessionLeft(Left::Connect)
+        );
+        let restart = Left::Restart {
+            addr: Some("/run/o.sock".into()),
+        };
+        assert_eq!(
+            pane_ended(true, true, Some(restart.clone())),
+            PaneEnded::SessionLeft(restart)
+        );
     }
 }
 
@@ -3221,8 +3970,9 @@ mod tests {
         build_start_failure_message, build_start_panic_message, cell_size_changed, display_failure_hint, exit_events,
         exit_follows_quit, exit_log_line, failed_tick_should_render, nvim_args, os_scale_to_apply, restart_refusal,
         run_detached, sessionless_tick_should_render, spawn_named, tick_should_render, unreachable_log_line,
-        watched_failure_note, with_display_hint, CallWatch, DisplayFacts, ExitEvents, LiveState, RemapKick,
-        RestartRefused, ScaleWatch, NVIM_FLOOR, NVIM_INSTALL_URL, NVIM_VERSION_FLOOR, REMAP_RENDER_DELAY,
+        watched_failure_note, with_display_hint, CallWatch, ChunkCheck, ChunkRefused, DisplayFacts, ExitEvents,
+        LiveState, NeovideEditorPaneOptions, RemapKick, RestartRefused, ScaleWatch, NVIM_FLOOR, NVIM_INSTALL_URL,
+        NVIM_VERSION_FLOOR, REMAP_RENDER_DELAY,
     };
     use gtk4::glib;
     use std::cell::Cell;
@@ -3788,6 +4538,53 @@ mod tests {
         assert!(
             refused.to_string().contains("Ready"),
             "the message names the state: {refused}"
+        );
+    }
+
+    #[test]
+    fn an_attached_panes_refusal_says_it_is_attached() {
+        let refused = RestartRefused {
+            state: RestartRefused::ATTACHED,
+        };
+        let text = refused.to_string();
+        assert!(text.contains("attached"), "the message names the attach: {text}");
+        assert!(
+            !text.contains("released"),
+            "an attached pane has no state it may restart from: {text}"
+        );
+    }
+
+    #[test]
+    fn a_chunk_check_is_equal_only_to_itself_and_stays_so_in_a_copy_of_the_options() {
+        let refuse = |_: &'static str, _: Vec<rmpv::Value>| {
+            Err(ChunkRefused {
+                reason: "refused".to_owned(),
+            })
+        };
+        let check = ChunkCheck::new(refuse);
+        let options = NeovideEditorPaneOptions {
+            chunk_check: Some(check.clone()),
+            ..Default::default()
+        };
+        assert_eq!(options.clone(), options, "a copy for a restart keeps the same check");
+        assert_ne!(
+            check,
+            ChunkCheck::new(refuse),
+            "another check, even of the same code, is another one"
+        );
+        assert_eq!(
+            check.run("return 1", vec![]),
+            Err(ChunkRefused {
+                reason: "refused".to_owned()
+            })
+        );
+        let append = ChunkCheck::new(|_, mut args| {
+            args.push(rmpv::Value::from(7));
+            Ok(args)
+        });
+        assert_eq!(
+            append.run("return ...", vec![rmpv::Value::from("a")]),
+            Ok(vec![rmpv::Value::from("a"), rmpv::Value::from(7)])
         );
     }
 }

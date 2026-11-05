@@ -111,7 +111,8 @@ function state.pending() state.pending_sent = true; return true end
 function state.held() state.is_held = true; return true end
 function state.let_go()
   if torn then return 'refused' end
-  if #api.nvim_list_uis() == 0 then return 'no_ui' end
+  -- No UI to give back: once Eitri's link closes there is nothing left to wait for, a move sent earlier included.
+  if #api.nvim_list_uis() == 0 then state.let_go_empty = true; return 'no_ui' end
   return state.return_tui() and 'returned' or 'refused'
 end
 function state.quit()
@@ -181,7 +182,7 @@ local function setup()
       if not channel_open(eitri_chan) then
         if #api.nvim_list_uis() > 0 then
           if not unreachable then state.return_tui() end
-        elseif not state.moving_sent and not state.pending_sent then
+        elseif state.let_go_empty or (not state.moving_sent and not state.pending_sent) then
           state.quit()
         end
       end

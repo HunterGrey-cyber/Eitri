@@ -259,6 +259,10 @@ pub fn layout_refusal_text(err: &LayoutError) -> String {
 /// `prefix x` on a person's own nvim: the editor cannot be killed apart from the window, which exists for that nvim.
 pub const GIVE_BACK_PROMPT: &str = "give nvim back to the terminal and close this window? (y/n)";
 
+/// `prefix x` on an editor that followed a `:connect`: no terminal waits for that nvim, and the editor cannot show
+/// another one, so killing it is the window's close.
+pub const CONNECTED_CLOSE_PROMPT: &str = "let go of the nvim :connect reached and close this window? (y/n)";
+
 /// A close of a person's own nvim while it waits for a key, or is busy, or did not say in time: given back now, its
 /// terminal shows a blank screen until a key, and that key answers whatever nvim is asking.
 pub const BLOCKING_PROMPT: &str =
@@ -266,6 +270,14 @@ pub const BLOCKING_PROMPT: &str =
 
 /// The window's link to a person's own nvim closed while the window lived.
 pub const LINK_LOST_TEXT: &str = "the connection to nvim was lost";
+
+/// A close of a person's own nvim whose terminal is gone: once let go of, the nvim runs on with no window, and this is
+/// how to see it again.
+pub fn no_way_back_prompt(addr: &str) -> String {
+    format!(
+        "closing leaves nvim running with no window. To see it again: nvim --remote-ui --server {addr}. Close? (y/n)"
+    )
+}
 
 /// The drafts and proposals in a person's own nvim that end with the window, since they are the window's and not the
 /// person's files.

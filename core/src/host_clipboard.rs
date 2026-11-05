@@ -279,6 +279,41 @@ pub struct Admission {
     pub switch_socket: std::ffi::OsString,
     /// Where `/proc` is (tests point it at a fake tree).
     pub proc_root: std::path::PathBuf,
+    /// A person's own nvim the window holds, taken over from its terminal: no child of the window, so it and what it
+    /// starts are admitted by its pid and start time, never by widening the rule for every process.
+    pub attached: Option<AttachedNvim>,
+    /// The server the window's nvim started for a `:restart` the editor followed: once that nvim has exited, the
+    /// server is no descendant of the window, so it is admitted by the pid and start time the editor learned from it,
+    /// asked at each request (the editor learns it after the server answers).
+    pub followed: Option<FollowedNvim>,
+}
+
+/// Where [`Admission::followed`] reads the followed server's process from, at each request.
+#[derive(Clone)]
+pub struct FollowedNvim(std::sync::Arc<dyn Fn() -> Option<AttachedNvim> + Send + Sync>);
+
+impl FollowedNvim {
+    pub fn new(learned: impl Fn() -> Option<AttachedNvim> + Send + Sync + 'static) -> Self {
+        FollowedNvim(std::sync::Arc::new(learned))
+    }
+
+    fn now(&self) -> Option<AttachedNvim> {
+        (self.0)()
+    }
+}
+
+impl std::fmt::Debug for FollowedNvim {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "FollowedNvim({:?})", self.now())
+    }
+}
+
+/// The process of a person's own nvim the window shows ([`Admission::attached`]): its pid, and the start time that
+/// tells it from a later process given the same pid.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct AttachedNvim {
+    pub pid: u32,
+    pub start_time: u64,
 }
 
 impl Admission {
@@ -290,7 +325,27 @@ impl Admission {
             server_pid: std::process::id(),
             switch_socket: switch_socket.as_os_str().to_owned(),
             proc_root: std::path::PathBuf::from("/proc"),
+            attached: None,
+            followed: None,
         }
+    }
+
+    /// The same admission, also letting in `nvim` and what descends from it.
+    pub fn with_attached(mut self, nvim: AttachedNvim) -> Self {
+        self.attached = Some(nvim);
+        self
+    }
+
+    /// The same admission, also letting in the server a followed `:restart` started, once the editor learned it.
+    pub fn with_followed(mut self, followed: FollowedNvim) -> Self {
+        self.followed = Some(followed);
+        self
+    }
+
+    /// Whether `pid` is the attached nvim's process, or the followed server's, started when it was.
+    fn is_the_attached_nvim(&self, pid: u32) -> bool {
+        let is = |nvim: AttachedNvim| nvim.pid == pid && start_time_of(&self.proc_root, pid) == Some(nvim.start_time);
+        self.attached.is_some_and(is) || self.followed.as_ref().and_then(FollowedNvim::now).is_some_and(is)
     }
 
     /// Whether `pid` is the window's nvim or descends from it. Fails closed on anything unreadable.
@@ -298,6 +353,9 @@ impl Admission {
         let mut pid = pid;
         // A chain longer than this is no nvim job; it also ends a loop a fake tree could make.
         for _ in 0..MAX_ANCESTRY {
+            if self.is_the_attached_nvim(pid) {
+                return true;
+            }
             let Some(parent) = parent_of(&self.proc_root, pid) else {
                 return false;
             };
@@ -326,6 +384,13 @@ impl Admission {
 
 /// How many parent links [`Admission::descends_from_nvim`] follows at most.
 const MAX_ANCESTRY: usize = 64;
+
+/// The start time in `<proc>/<pid>/stat` (its 22nd field), in clock ticks since boot.
+fn start_time_of(proc_root: &Path, pid: u32) -> Option<u64> {
+    let stat = std::fs::read_to_string(proc_root.join(pid.to_string()).join("stat")).ok()?;
+    let rest = &stat[stat.rfind(')')? + 1..];
+    rest.split_whitespace().nth(19)?.parse().ok()
+}
 
 /// The parent pid in `<proc>/<pid>/stat`: the field after the state, which follows the last `)` (a
 /// command name may hold spaces and parentheses).
@@ -663,6 +728,8 @@ mod tests {
             server_pid: FAKE_SERVER,
             switch_socket: SWITCH.into(),
             proc_root: root.to_path_buf(),
+            attached: None,
+            followed: None,
         }
     }
 
@@ -990,6 +1057,88 @@ mod tests {
         ] {
             assert!(!a.descends_from_nvim(pid), "{why}");
         }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A person's nvim the window holds is no child of the window: it and what it starts are let in by its pid and
+    /// start time, and a later process given that pid is not.
+    #[test]
+    fn the_attached_nvim_and_its_descendants_are_admitted_by_pid_and_start_time() {
+        let dir = scratch("attached");
+        let root = dir.join("proc");
+        let full_stat = |pid: u32, parent: u32, start: u64| {
+            let dir = root.join(pid.to_string());
+            std::fs::create_dir_all(&dir).unwrap();
+            let fields: Vec<String> = (0..17).map(|i| i.to_string()).collect();
+            std::fs::write(
+                dir.join("stat"),
+                format!("{pid} (n v) S {parent} {} {start} 0 0\n", fields.join(" ")),
+            )
+            .unwrap();
+        };
+        // terminal -> nvim (the person's, no window variable) -> sh -> shim
+        full_stat(70, 7, 555);
+        full_stat(71, 70, 600);
+        full_stat(72, 71, 601);
+        // the nvim's terminal, beside it
+        full_stat(7, 1, 100);
+        let plain = fake_admission(&root);
+        assert!(
+            !plain.descends_from_nvim(72),
+            "without the attach, the person's nvim is no window's"
+        );
+        let a = fake_admission(&root).with_attached(AttachedNvim {
+            pid: 70,
+            start_time: 555,
+        });
+        assert!(a.descends_from_nvim(70), "the attached nvim");
+        assert!(a.descends_from_nvim(72), "what it starts");
+        assert!(!a.descends_from_nvim(7), "its terminal");
+        let reused = fake_admission(&root).with_attached(AttachedNvim {
+            pid: 70,
+            start_time: 554,
+        });
+        assert!(!reused.descends_from_nvim(72), "another process given the same pid");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The server a followed `:restart` started is no child of the window once the nvim that started it exited: it is
+    /// admitted by the pid and start time the editor learned, and only once it learned them.
+    #[test]
+    fn a_followed_servers_process_is_admitted_by_the_pid_the_editor_learned() {
+        let dir = scratch("followed");
+        let root = dir.join("proc");
+        let full_stat = |pid: u32, parent: u32, start: u64| {
+            let dir = root.join(pid.to_string());
+            std::fs::create_dir_all(&dir).unwrap();
+            let fields: Vec<String> = (0..17).map(|i| i.to_string()).collect();
+            std::fs::write(
+                dir.join("stat"),
+                format!("{pid} (nvim) S {parent} {} {start} 0 0\n", fields.join(" ")),
+            )
+            .unwrap();
+        };
+        // init -> the restarted server -> sh -> shim
+        full_stat(80, 1, 900);
+        full_stat(81, 80, 901);
+        full_stat(82, 81, 902);
+        let learned = std::sync::Arc::new(std::sync::Mutex::new(None::<AttachedNvim>));
+        let a = {
+            let learned = learned.clone();
+            fake_admission(&root).with_followed(FollowedNvim::new(move || *learned.lock().unwrap()))
+        };
+        assert!(!a.descends_from_nvim(82), "a server the editor has not learned yet");
+        *learned.lock().unwrap() = Some(AttachedNvim {
+            pid: 80,
+            start_time: 900,
+        });
+        assert!(a.descends_from_nvim(80), "the followed server");
+        assert!(a.descends_from_nvim(82), "what it starts");
+        *learned.lock().unwrap() = Some(AttachedNvim {
+            pid: 80,
+            start_time: 899,
+        });
+        assert!(!a.descends_from_nvim(82), "another process given the same pid");
         let _ = std::fs::remove_dir_all(&dir);
     }
 

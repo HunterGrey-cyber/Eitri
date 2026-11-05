@@ -109,3 +109,20 @@ harness = false
 [[test]]
 name = "presenter_thread"
 harness = false
+
+# The fork's harness attached to a running `nvim --listen` (`LiveHarnessOptions::server`); each case runs in a child copy
+# of this binary on its own Xvfb, like `multi_nvim`.
+[[test]]
+name = "fork_attach"
+harness = false
+
+# A pane attached to a person's running nvim (`NeovideEditorPaneOptions::attach`), started through a TUI in a private
+# tmux; each case runs in a child copy of this binary on its own Xvfb, like `realized_restart`.
+[[test]]
+name = "attached_pane_with_real_nvim"
+harness = false
+
+# The editor following its own nvim's `:restart` and `:connect`; each case runs in a child copy on its own `Xvfb`.
+[[test]]
+name = "owned_follow"
+harness = false

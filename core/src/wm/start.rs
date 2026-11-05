@@ -446,7 +446,8 @@ pub(super) fn event_window(event: &HostEvent) -> Option<WinId> {
             | EditorEvent::OpenFailed { win, .. }
             | EditorEvent::Detached { win }
             | EditorEvent::CloseFacts { win, .. }
-            | EditorEvent::HandedBack { win, .. },
+            | EditorEvent::HandedBack { win, .. }
+            | EditorEvent::Followed { win, .. },
         )
         | HostEvent::Plugin(
             PluginEvent::Frozen { win, .. } | PluginEvent::FreezeRefused { win, .. } | PluginEvent::Ready { win, .. },

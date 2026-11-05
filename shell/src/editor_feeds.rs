@@ -7,7 +7,7 @@
 //! is the part that names `glib`. The `listen_*` methods mirror what the feeds' own `listen`
 //! functions were, so a call site changes only its callee.
 
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::rc::{Rc, Weak};
 use std::time::Instant;
 
@@ -216,10 +216,15 @@ impl FeedPump {
             }
         }
         if events.context {
-            let handler = self.context.borrow().clone();
-            if let Some(handler) = handler {
-                handler(());
-            }
+            self.context_changed();
+        }
+    }
+
+    /// Calls the context hookup ([`on_context`](Self::on_context)), as a new context does.
+    fn context_changed(&self) {
+        let handler = self.context.borrow().clone();
+        if let Some(handler) = handler {
+            handler(());
         }
     }
 
@@ -286,6 +291,22 @@ impl FeedPump {
         added
     }
 
+    /// [`listen_context`](Self::listen_context) for the context of the window's own nvim, which the editor can leave
+    /// ([`OwnContext::leave`]).
+    pub(crate) fn listen_own_context(
+        &self,
+        feed: &mut EditorContextFeed,
+        scratch_dir: Option<std::path::PathBuf>,
+    ) -> OwnContext {
+        let (source, reset) = self.listen_context(feed, scratch_dir);
+        OwnContext {
+            source,
+            facts: self.push_source(),
+            open: Rc::new(Cell::new(true)),
+            reset,
+        }
+    }
+
     /// Calls `on_message` with each direction letter or quit-cancelled generation the shim, or a
     /// cancelled `:confirm qall`, sends. Takes the channel's listener, so a second call logs and does
     /// nothing.
@@ -317,6 +338,42 @@ impl FeedPump {
             .borrow_mut()
             .add_follow(FollowReader::new(listener), Instant::now());
         self.rearm();
+    }
+}
+
+/// The editor context the window's own nvim feeds, as the panel, the linked window and the IDE wiring read it, until
+/// the editor follows a `:connect` away from that nvim. From then on the editor shows a server that feeds no context,
+/// and the file the left nvim last named is not what the editor shows: the context and its facts are nothing, whatever
+/// that nvim still sends.
+#[derive(Clone)]
+pub(crate) struct OwnContext {
+    source: ContextSource,
+    facts: Option<PushSource>,
+    open: Rc<Cell<bool>>,
+    reset: Rc<dyn Fn()>,
+}
+
+impl OwnContext {
+    /// The context, nothing once [left](Self::leave).
+    pub(crate) fn source(&self) -> ContextSource {
+        eitri_core::editor_context::gated(self.source.clone(), self.open.clone())
+    }
+
+    /// The facts beside the context ([`FeedPump::push_source`]), nothing once [left](Self::leave).
+    pub(crate) fn facts(&self) -> Option<PushSource> {
+        let facts = self.facts.clone()?;
+        let open = self.open.clone();
+        Some(Rc::new(move || if open.get() { facts() } else { None }))
+    }
+
+    /// The editor no longer shows the window's own nvim: what its context held is dropped and `pump`'s context
+    /// hookup hears the change once, so the panel, the linked window and the IDE wiring read nothing from here on.
+    pub(crate) fn leave(&self, pump: &FeedPump) {
+        if !self.open.replace(false) {
+            return;
+        }
+        (self.reset)();
+        pump.context_changed();
     }
 }
 
@@ -545,6 +602,62 @@ mod tests {
                 file.path
             );
         }
+    }
+
+    /// Once the editor follows a `:connect` away from the window's own nvim, the context that nvim fed is nothing to
+    /// the panel, the linked window and the IDE wiring: what it held is dropped, what it still sends is not taken as the
+    /// editor's, and the hookup hears the change once.
+    #[test]
+    fn a_context_left_behind_by_a_followed_connect_is_nothing() {
+        let _turn = crate::layout_state::default_context_turn();
+        let context = glib::MainContext::default();
+        let _owner = context.acquire().expect("glib's default main context");
+        let pump = FeedPump::start();
+        let mut feed = EditorContextFeed::new().unwrap();
+        let own = pump.listen_own_context(&mut feed, None);
+        let source = own.source();
+        let facts = own.facts().expect("a context reader has its facts");
+        let heard = Rc::new(std::cell::Cell::new(0));
+        pump.on_context({
+            let heard = heard.clone();
+            move || heard.set(heard.get() + 1)
+        });
+        send(feed.socket_path(), r#"{"v":1,"file":"/p/a.rs","selection":null}"#);
+        assert!(
+            iterate_until(2000, || source().is_some()),
+            "the window's own nvim's context is read"
+        );
+        let before = heard.get();
+        own.leave(&pump);
+        assert!(source().is_none(), "the left nvim's file is still the editor's context");
+        assert!(facts().is_none(), "the left nvim's facts are still the editor's");
+        assert_eq!(heard.get(), before + 1, "the hookup hears the change once");
+        send(feed.socket_path(), r#"{"v":1,"file":"/p/b.rs","selection":null}"#);
+        iterate_until(300, || false);
+        assert!(
+            source().is_none(),
+            "what the left nvim still sends is taken as the editor's"
+        );
+        assert!(facts().is_none());
+        let after = heard.get();
+        own.leave(&pump);
+        assert_eq!(heard.get(), after, "a second leave tells nothing");
+        feed.cleanup();
+
+        // The window's followed `:connect` lets go of it.
+        use eitri_core::source_scan as scan;
+        let sources = scan::rust_sources(&["shell/src"]);
+        let (file, body) = scan::function_in(&sources, "build_ui");
+        let at = body
+            .find("PaneFollowed::Connect")
+            .unwrap_or_else(|| panic!("{} follows no :connect", file.path));
+        let arm = &body[at..];
+        let arm = &arm[..arm.find("on_nvim_unreachable").unwrap_or(arm.len())];
+        assert!(
+            arm.contains(".leave(&"),
+            "{}: a followed :connect keeps the left nvim's context",
+            file.path
+        );
     }
 
     struct NoPage;

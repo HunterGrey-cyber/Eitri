@@ -1,5 +1,5 @@
 [English](known-issues.md) | 简体中文
-<!-- translated-from: known-issues.md sha256=c10643f24909c40fe49b5edca00f2254ab41c7a2fb914809960e0802a03ba2bf -->
+<!-- translated-from: known-issues.md sha256=5f23d3aa1dd5a934bfb2549c9bb49b85b1a2455c5552b7a0770bb3bc8412ccc4 -->
 
 # 已知问题与限制
 
@@ -44,7 +44,7 @@
 - **在编辑器里按 `<prefix> ?`** 会把按键交给面板，但不画出按键表；之后在面板里按 `?` 就会显示。
 - **回复里的相对链接**画成带下划线的链接样子，但 `gx` 和 HINT 不会提供它。
 - **在 `$mod = Alt` 的 i3 或 sway 上**，前缀后面的那些 `Alt` 行会先被窗口管理器拿走，Eitri 看不到；[`docs/keymap/i3-alt-mod.lua`](keymap/i3-alt-mod.lua) 会把它们移开。
-- **在 Neovim 0.12 上，在编辑器里执行 `:restart` 和 `:connect` 会结束编辑器**，而不是让它转到新的 Neovim（`<prefix> e` 会重新启动编辑器），而且两者都会在后台留下一个 Neovim，直到你结束它：`:restart` 留下的是它为编辑器新启动的那个（一个等着窗口来连接的 `nvim --embed`），`:connect` 留下的是编辑器原来的那个，里面还开着它原来打开的东西。
+- **在 Neovim 0.12 上，在编辑器里执行 `:restart` 和 `:connect` 会让编辑器跟着走**，而不是结束它：`:restart` 转到它新启动的那个 Neovim（不会再留下多余的 `nvim --embed`），`:connect <地址>` 转到那个服务器。`:connect` 会让编辑器原来的 Neovim 继续运行，里面还开着它原来打开的东西；关闭窗口时会告诉你它的地址，`:connect!` 则会把它结束。`:connect` 到一个没有回应的地址，编辑器留在原处。在你从终端[接管](guide/takeover.zh-CN.md)的 Neovim 里，`:connect` 会把它还给终端并关闭窗口，`:restart` 暂时和 `:qa` 一样结束（窗口关闭；新的服务器没有窗口，运行在日志里写明的地址上）。
 
 <a id="pages-you-build"></a>
 ## 你自己做的页面
@@ -73,6 +73,7 @@ Companion 模式是把 agent 面板作为一个独立窗口，开在你自己的
 - **在 sway 的边缘，这个按键会被吞掉。** Eitri 必须先接管或放行 `Ctrl+h/j/k/l`，才能去问 sway 那个方向上有没有窗口，所以在边缘上这个按键什么也不做，和 tmux 自己的 `select-pane` 在它的边缘上一样。
 - **KDE：不移动焦点。** 在那里 Wayland 客户端没法抢到焦点；请用桌面自己的窗口键。
 - **开在你 nvim 旁边的页面**（`eitri page`、`:EitriPage`；[使用指南](guide/companion.zh-CN.md#pages-beside-your-nvim)）只经过了测试，还没有在窗口里跑过。仍然欠着：在隔离的无界面桌面里配合终端里的真实 Neovim 跑一遍（页面的配色、跟随、按键、关闭、`kill -9`、tmux 里的 nvim）；虚拟机里的 Hyprland 0.56.2 和 0.57；niri；KDE；启用了扩展的 GNOME；真实硬件；以及 nvim 0.11（最低版本），它没有跑过。agent 工作期间的缓冲区重新加载，以及聚焦时的重新加载（在 tmux 里需要 `set -g focus-events on`），也处于同样的状态。
+- **接管终端里的 nvim**（`:EitriOpen`、`eitri open`；[指南](guide/takeover.zh-CN.md)）已经在测试里用真实的 Neovim（0.12）、私有的 tmux 和隔离的显示试过，但还没有在窗口里被人看着跑过，也没在真实硬件上试过。还欠：那次窗口里的运行、Hyprland 和 GNOME 会话、真实的 lazy.nvim 配置，以及作为已安装插件的 vim-tmux-navigator 和 smart-splits。
 - **页面窗口在两种情况下关得慢。** 正常关闭会把它的槽位留在你的 Neovim 里，直到 Neovim 下一次存活检查（最多一秒），被杀掉的窗口也一样；你运行 `:EitriPage` 时如果 Neovim 正卡在一个提示上，`eitri page` 会一直等着、不开窗口，直到它响应。
 - **GNOME 需要 Eitri GNOME Shell 扩展**才能移动焦点：由你自己启用，下次登录时生效（见[使用指南](guide/companion.zh-CN.md#gnome-the-extension)）。有了它：移动只在拥有焦点的窗口所在的显示器上进行；X11 或 XWayland 窗口永远不算数；在上一次移动之后大约三分之一秒内再移回去会被拒绝；所有窗口都跑在同一个进程里的终端（GNOME Terminal、Ptyxis）在交回焦点时会落到它最近使用的窗口，那未必是 nvim 所在的窗口；被转发的 `eitri split` 不会把面板带到前面；监视器的“带到前面”不起作用。
 

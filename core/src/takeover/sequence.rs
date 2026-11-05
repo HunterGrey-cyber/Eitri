@@ -17,8 +17,10 @@ const CHECK_WITHIN: Duration = Duration::from_millis(500);
 const ANSWER_WITHIN: Duration = Duration::from_secs(2);
 const TEARDOWN_WITHIN: Duration = Duration::from_millis(300);
 pub(crate) const MOVE_LUA: &str = "local opts = ...; vim.cmd.connect({args = {opts.addr}, magic = {file = false}})";
-pub(crate) const FACTS_LUA: &str =
-    "return {addr=vim.v.servername, progpath=vim.v.progpath, version=vim.version(), cwd=vim.fn.getcwd(-1, -1)}";
+/// The version comes from the API's metadata, not `vim.version()`, which would leave its module loaded in the
+/// person's nvim.
+pub(crate) const FACTS_LUA: &str = "return {addr=vim.v.servername, progpath=vim.v.progpath, \
+                                     version=vim.fn.api_info().version, cwd=vim.fn.getcwd(-1, -1)}";
 pub(crate) const TAKEN_LUA: &str =
     "local c = rawget(_G, '__eitri_companion'); return type(c) == 'table' and c.mode == 'takeover'";
 

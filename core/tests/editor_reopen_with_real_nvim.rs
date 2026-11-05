@@ -3,6 +3,7 @@
 use std::io::{BufReader, Write};
 use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::{symlink, PermissionsExt};
+use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
 use std::process::{Child, ChildStdin, Command, Stdio};
 use std::sync::mpsc::{self, Receiver};
@@ -316,6 +317,205 @@ fn leaves(tree: &Value) -> Vec<&Value> {
         .flatten()
         .flat_map(leaves)
         .collect()
+}
+
+/// A server `:restart` started, reached over its socket the way the editor follows it: the restart's server waits
+/// for a UI before its VimEnter, as every `--embed` nvim does.
+struct Restarted {
+    stream: UnixStream,
+    replies: Receiver<Msg>,
+    next: u64,
+    pid: i32,
+}
+
+impl Restarted {
+    /// The server listening in `runtime` that is not `old`'s.
+    fn find(runtime: &Path, old: i64) -> Self {
+        let deadline = Instant::now() + DEADLINE;
+        loop {
+            for entry in std::fs::read_dir(runtime).unwrap() {
+                let name = entry.unwrap().file_name().to_string_lossy().into_owned();
+                let pid = name
+                    .strip_prefix("nvim.")
+                    .and_then(|rest| rest.strip_suffix(".0"))
+                    .and_then(|pid| pid.parse::<i64>().ok());
+                if pid.is_none() || pid == Some(old) {
+                    continue;
+                }
+                if let Ok(stream) = UnixStream::connect(runtime.join(&name)) {
+                    let read = stream.try_clone().unwrap();
+                    let (tx, replies) = mpsc::channel();
+                    std::thread::spawn(move || {
+                        let mut read = BufReader::new(read);
+                        while let Ok(value) = rmpv::decode::read_value(&mut read) {
+                            if value[0].as_i64() == Some(1) && tx.send(value).is_err() {
+                                break;
+                            }
+                        }
+                    });
+                    let mut server = Self {
+                        stream,
+                        replies,
+                        next: 0,
+                        pid: 0,
+                    };
+                    server.pid = server.lua("return vim.fn.getpid()").as_i64().unwrap() as i32;
+                    return server;
+                }
+            }
+            assert!(Instant::now() < deadline, "the restart's server listens");
+            std::thread::sleep(Duration::from_millis(10));
+        }
+    }
+
+    fn call(&mut self, method: &str, params: Vec<Msg>) -> Msg {
+        self.next += 1;
+        let id = self.next;
+        let value = Msg::Array(vec![0.into(), id.into(), method.into(), Msg::Array(params)]);
+        rmpv::encode::write_value(&mut self.stream, &value).unwrap();
+        self.stream.flush().unwrap();
+        loop {
+            let reply = self
+                .replies
+                .recv_timeout(DEADLINE)
+                .expect("the restart's server answers within the deadline");
+            if reply[1].as_u64() == Some(id) {
+                assert!(reply[2].is_nil(), "RPC {method}: {:?}", reply[2]);
+                return reply[3].clone();
+            }
+        }
+    }
+
+    fn lua(&mut self, code: &str) -> Value {
+        let result = self.call(
+            "nvim_exec_lua",
+            vec![
+                format!("local result=(function() {code} end)(); return vim.json.encode(result)").into(),
+                Msg::Array(vec![]),
+            ],
+        );
+        serde_json::from_str(result.as_str().expect("JSON answer")).unwrap()
+    }
+}
+
+impl Drop for Restarted {
+    fn drop(&mut self) {
+        if self.pid > 0 {
+            unsafe { libc::kill(self.pid, libc::SIGKILL) };
+        }
+    }
+}
+
+/// `:restart` is nvim's own: the server it starts runs the same `--cmd`s and so the restore's loader, which must not
+/// open the window's start record again there. With `!` nvim restores no session, so the new server shows nothing;
+/// the window has had its answer for that record, so nothing is said to it either.
+#[test]
+#[ignore = "needs a real nvim on PATH and a private pane-switch socket; no model or display"]
+fn a_server_restart_started_opens_nothing_of_the_start_record() {
+    let mut rig = Rig::new("restart");
+    rig.simple();
+    let mut nvim = rig.start("", &[]);
+    nvim.done();
+    assert_eq!(rig.ended().0, 2);
+    if nvim.lua("return vim.fn.has('nvim-0.12')") != 1 {
+        // `:restart` came with 0.12.
+        return;
+    }
+    let old = nvim.lua("return vim.fn.getpid()").as_i64().unwrap();
+    nvim.send("nvim_input", vec![":restart!<CR>".into()]);
+    nvim.wait_exit();
+    let mut new = Restarted::find(&rig.root.join("runtime"), old);
+    new.call(
+        "nvim_ui_attach",
+        vec![100.into(), 50.into(), Msg::Map(vec![("rgb".into(), true.into())])],
+    );
+    let deadline = Instant::now() + DEADLINE;
+    while new.lua("return vim.v.vim_did_enter") != 1 {
+        assert!(Instant::now() < deadline, "the restart's VimEnter runs");
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    assert_eq!(new.lua("return vim.v.startreason"), "restart!");
+    // Phase 2 would build the record's split within a second of VimEnter.
+    std::thread::sleep(Duration::from_millis(1500));
+    assert_eq!(
+        new.lua("return {#vim.api.nvim_list_wins(), vim.api.nvim_buf_get_name(0)}"),
+        json!([1, ""]),
+        "the restart's server shows the record's files"
+    );
+    let began = rig
+        .messages()
+        .iter()
+        .filter(|message| matches!(message, PaneMessage::Reopen(ReopenLine::Began { .. })))
+        .count();
+    assert_eq!(began, 1, "the restart's server began the restore again: {:?}", rig.seen);
+}
+
+/// The server `:restart` started goes on keeping the window's record: once the editor's UI is on it, the handoff the
+/// nvim before it left at its exit is gone (it would stand for a session that no longer exists), a capture answers for
+/// the window's token, and its own exit leaves the handoff of what it shows then.
+#[test]
+#[ignore = "needs a real nvim on PATH and a private pane-switch socket; no model or display"]
+fn a_server_restart_started_keeps_the_record_current() {
+    let mut rig = Rig::new("restart-record");
+    rig.simple();
+    let mut nvim = rig.start("", &[]);
+    nvim.done();
+    assert_eq!(rig.ended().0, 2);
+    if nvim.lua("return vim.fn.has('nvim-0.12')") != 1 {
+        // `:restart` came with 0.12.
+        return;
+    }
+    let old = nvim.lua("return vim.fn.getpid()").as_i64().unwrap();
+    nvim.send("nvim_input", vec![":restart!<CR>".into()]);
+    nvim.wait_exit();
+    assert!(
+        rig.handoff_path().exists(),
+        "the nvim before the restart left no handoff"
+    );
+    let mut new = Restarted::find(&rig.root.join("runtime"), old);
+    new.call(
+        "nvim_ui_attach",
+        vec![100.into(), 50.into(), Msg::Map(vec![("rgb".into(), true.into())])],
+    );
+    let deadline = Instant::now() + DEADLINE;
+    while rig.handoff_path().exists() {
+        assert!(
+            Instant::now() < deadline,
+            "the handoff of the session before the restart is still there"
+        );
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    let captured = new.lua(
+        "local p=vim.env.EITRI_REOPEN_LUA:match('^(.*)/'); \
+         local input=vim.json.decode(table.concat(vim.fn.readfile(p..'/reopen-in.json'), '\\n')); \
+         local r=assert(loadfile(p..'/editor_reopen_capture.lua'))(input); return r and vim.json.decode(r.json) or vim.NIL",
+    );
+    assert!(
+        captured.is_object(),
+        "the restarted server answers no capture: {captured}"
+    );
+    new.lua("vim.cmd.edit('5.txt') return true");
+    new.lua("vim.schedule(function() vim.cmd('qall!') end) return true");
+    let deadline = Instant::now() + DEADLINE;
+    while !rig.handoff_path().exists() {
+        assert!(
+            Instant::now() < deadline,
+            "the restarted server left no handoff at its exit"
+        );
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    std::thread::sleep(Duration::from_millis(100));
+    let record = rig.handoff()["record"].clone();
+    let named: Vec<&Value> = record["tabs"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .flat_map(|tab| leaves(&tab["tree"]))
+        .collect();
+    assert!(
+        named.iter().any(|leaf| leaf["f"] == json!(rig.name("5.txt"))),
+        "the handoff is not what the restarted server showed: {record}"
+    );
 }
 
 #[test]

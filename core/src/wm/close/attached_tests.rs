@@ -26,8 +26,17 @@ fn attached(layout: Layout) -> Rig {
 
 /// As [`attached`], with `before` run on the window before the driver takes the controller.
 fn attached_with(layout: Layout, before: impl FnOnce(&mut Window)) -> Rig {
+    rig_of(layout, EditorKind::Attached, before)
+}
+
+/// A window over an nvim it started itself, holding `layout`, with every module hosted.
+fn owned(layout: Layout) -> Rig {
+    rig_of(layout, EditorKind::Owned, |_| {})
+}
+
+fn rig_of(layout: Layout, kind: EditorKind, before: impl FnOnce(&mut Window)) -> Rig {
     let mut r = rig_with(layout, |_, _| None);
-    r.controller.set_editor_kind(WIN, EditorKind::Attached);
+    r.controller.set_editor_kind(WIN, kind);
     before(r.controller.window_mut(WIN).unwrap());
     let hosted: Vec<_> = r.layout.borrow().modules().iter().map(decl).collect();
     for d in hosted {
@@ -234,12 +243,13 @@ fn verb(name: &'static str, run: impl Fn(&Rig) + 'static) -> (&'static str, Box<
     (name, Box::new(run))
 }
 
-const WHYS: [HandBackWhy; 5] = [
+const WHYS: [HandBackWhy; 6] = [
     HandBackWhy::OtherUi,
     HandBackWhy::TakeBack,
     HandBackWhy::LinkLost,
     HandBackWhy::Replaced,
     HandBackWhy::AttachFailed,
+    HandBackWhy::Connected,
 ];
 
 /// Every way a window closes, and every verb that would end or restart its editor, each on a window over a person's
@@ -402,6 +412,7 @@ fn a_close_waits_for_close_facts_then_asks_drafts_and_proposals_then_blocking_th
         blocking: true,
         drafts: 1,
         proposals: 2,
+        ..CloseAsks::default()
     });
     assert_eq!(
         r.prompt().as_deref(),
@@ -438,6 +449,7 @@ fn a_close_waits_for_close_facts_then_asks_drafts_and_proposals_then_blocking_th
             blocking: true,
             drafts: 1,
             proposals: 0,
+            ..CloseAsks::default()
         });
         assert_eq!(r.prompt(), Some(unsaved_in_editor_prompt(1, 0)));
         if decline_at == 1 {
@@ -464,6 +476,7 @@ fn a_close_waits_for_close_facts_then_asks_drafts_and_proposals_then_blocking_th
         blocking: false,
         drafts: 3,
         proposals: 0,
+        ..CloseAsks::default()
     });
     assert_eq!(r.prompt().as_deref(), Some(BLOCKING_PROMPT));
     assert_eq!(r.detaches(), 0);
@@ -541,6 +554,7 @@ fn handed_back_detaches_without_a_question_and_asks_only_about_running_turns() {
         blocking: true,
         drafts: 1,
         proposals: 1,
+        ..CloseAsks::default()
     });
     assert_eq!(r.prompt(), None, "the late facts ask nothing");
     r.detached();
@@ -609,6 +623,7 @@ fn handed_back_and_signals_are_always_run() {
                 blocking: false,
                 drafts: 1,
                 proposals: 0,
+                ..CloseAsks::default()
             });
         }),
         ("asking whether to give nvim back", CloseState::Asking, |r| {
@@ -769,6 +784,7 @@ fn close_facts_answer_only_their_own_ask() {
         blocking: false,
         drafts: 1,
         proposals: 0,
+        ..CloseAsks::default()
     });
     assert_eq!(r.prompt(), Some(unsaved_in_editor_prompt(1, 0)));
     assert_eq!(r.detaches(), 0);
@@ -801,6 +817,7 @@ fn a_declined_editor_question_withdraws_the_last_modules_confirmation() {
             blocking: decline == "blocking",
             drafts: usize::from(decline == "drafts"),
             proposals: 0,
+            ..CloseAsks::default()
         });
         assert!(r.prompt().is_some(), "{decline}: the question about the editor");
         r.answer("n");
@@ -859,4 +876,240 @@ fn the_teardown_waits_for_the_detach_to_be_answered() {
     r.detached();
     r.advance(Duration::ZERO);
     assert_eq!(r.closes(), 1);
+}
+
+#[test]
+fn a_close_with_no_way_back_names_the_remote_ui_command_and_asks_nothing_about_a_waiting_nvim() {
+    let r = attached(two());
+    r.driver.close_requested(WIN, CloseBy::User);
+    r.facts(CloseAsks {
+        blocking: true,
+        no_way_back: Some("/run/nvim-n".into()),
+        ..CloseAsks::default()
+    });
+    assert_eq!(
+        r.prompt().as_deref(),
+        Some("closing leaves nvim running with no window. To see it again: nvim --remote-ui --server /run/nvim-n. Close? (y/n)")
+    );
+    assert_eq!(r.detaches(), 0, "nothing is let go of while the question is up");
+    r.answer("y");
+    assert_eq!(r.detaches(), 1);
+    assert_eq!(
+        r.prompt(),
+        None,
+        "with no terminal to go back to, a waiting nvim is not asked about"
+    );
+
+    // The drafts come first, then the same question.
+    let r = attached(two());
+    r.driver.close_requested(WIN, CloseBy::User);
+    r.facts(CloseAsks {
+        drafts: 1,
+        no_way_back: Some("/run/nvim-n".into()),
+        ..CloseAsks::default()
+    });
+    assert_eq!(r.prompt(), Some(unsaved_in_editor_prompt(1, 0)));
+    r.answer("y");
+    assert_eq!(r.prompt(), Some(crate::wm::feedback::no_way_back_prompt("/run/nvim-n")));
+    r.answer("n");
+    assert_eq!(r.detaches(), 0, "a `n` keeps the nvim in the window");
+}
+
+#[test]
+fn connect_typed_in_the_window_hands_back_without_a_question() {
+    let r = attached(two());
+    r.running();
+    r.hand_back(HandBackWhy::Connected);
+    assert_eq!(r.detaches(), 1);
+}
+
+/// The editor's own nvim moved its UI to another server (`:connect`), which the editor followed: from then on the
+/// window shows an nvim it did not start, and every rule of one holds. Its close asks, lets go of it, and never quits,
+/// ends, restarts or shuts it down.
+#[test]
+fn a_followed_connect_makes_the_editor_attached_and_its_close_detaches() {
+    let r = owned(two());
+    let since = r.ops().len();
+    r.driver.post(HostEvent::Editor(EditorEvent::Followed {
+        win: WIN,
+        kind: EditorKind::Attached,
+        left: None,
+    }));
+    assert!(
+        r.driver.query(|c| c.window(WIN).is_some_and(|w| w.editor_attached())),
+        "the window still treats the server it moved to as its own"
+    );
+    r.driver.close_requested(WIN, CloseBy::User);
+    assert_eq!(r.fact_asks(), 1, "the close did not ask the editor first");
+    r.facts(CloseAsks::default());
+    r.finish();
+    assert_eq!(r.detaches(), 1, "the close did not let go of the server");
+    let wrong: Vec<_> = r
+        .ops_since(since)
+        .into_iter()
+        .filter_map(|op| match op {
+            HostOp::Editor(call) if ends_or_records(&call) => Some(call),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(
+        wrong,
+        Vec::<EditorCall>::new(),
+        "a followed server got a quit, an end or a record's call"
+    );
+    assert_eq!(r.closes(), 1);
+}
+
+/// After a followed `:connect` the editor's own nvim runs on with no window; the close says where, with the command
+/// that shows it again, whether the editor answers in time or not.
+#[test]
+fn the_close_after_a_connect_names_the_left_server() {
+    let left = "/run/nvim-own";
+    let followed = |r: &Rig| {
+        r.driver.post(HostEvent::Editor(EditorEvent::Followed {
+            win: WIN,
+            kind: EditorKind::Attached,
+            left: Some(left.into()),
+        }))
+    };
+
+    // No answer in time: the question still names it.
+    let r = owned(two());
+    followed(&r);
+    r.driver.close_requested(WIN, CloseBy::User);
+    r.advance(CLOSE_FACTS_WITHIN);
+    assert_eq!(r.prompt(), Some(crate::wm::feedback::no_way_back_prompt(left)));
+    assert_eq!(r.detaches(), 0, "nothing is let go of while the question is up");
+    r.answer("y");
+    assert_eq!(r.detaches(), 1);
+
+    // The editor's answer says where it still runs.
+    let r = owned(two());
+    followed(&r);
+    r.driver.close_requested(WIN, CloseBy::User);
+    r.facts(CloseAsks {
+        no_way_back: Some(left.into()),
+        ..CloseAsks::default()
+    });
+    assert_eq!(r.prompt(), Some(crate::wm::feedback::no_way_back_prompt(left)));
+    r.answer("n");
+    assert_eq!(r.detaches(), 0, "a `n` keeps the window");
+}
+
+/// A followed `:restart` is still the window's own nvim: its close quits it as before. An attached editor stays
+/// attached whatever is reported.
+#[test]
+fn a_followed_restart_keeps_the_editor_owned() {
+    let r = owned(two());
+    r.driver.post(HostEvent::Editor(EditorEvent::Followed {
+        win: WIN,
+        kind: EditorKind::Owned,
+        left: None,
+    }));
+    assert!(r.driver.query(|c| c.window(WIN).is_some_and(|w| !w.editor_attached())));
+
+    // Nothing makes an nvim the window did not start its own.
+    let a = attached(two());
+    a.driver.post(HostEvent::Editor(EditorEvent::Followed {
+        win: WIN,
+        kind: EditorKind::Owned,
+        left: None,
+    }));
+    assert!(
+        a.driver.query(|c| c.window(WIN).is_some_and(|w| w.editor_attached())),
+        "a followed restart made an attached editor the window's own"
+    );
+
+    r.driver.close_requested(WIN, CloseBy::User);
+    assert_eq!(
+        r.fact_asks(),
+        0,
+        "an owned editor's close asked for an attached one's facts"
+    );
+}
+
+/// The window's own nvim after a followed `:connect` to `left` (`None`: the `:connect` left none running).
+fn connected(left: Option<&str>) -> Rig {
+    let r = owned(two());
+    r.driver.post(HostEvent::Editor(EditorEvent::Followed {
+        win: WIN,
+        kind: EditorKind::Attached,
+        left: left.map(str::to_owned),
+    }));
+    r
+}
+
+/// The server a `:connect` reached ends (`:qa` typed there, a further `:connect`): the window's own nvim it left still
+/// runs with no window, so the close names it before anything goes, and a `n` keeps the window. A later close asks
+/// again; one that left nothing running closes as before.
+#[test]
+fn the_reached_servers_end_names_the_left_nvim_before_the_window_closes() {
+    let left = "/run/nvim-own";
+    let r = connected(Some(left));
+    r.exited();
+    assert_eq!(r.prompt(), Some(crate::wm::feedback::no_way_back_prompt(left)));
+    assert_eq!(r.closes(), 0, "the window closed before it named the left nvim");
+    r.answer("y");
+    r.finish();
+    assert_eq!(r.closes(), 1);
+    assert_eq!(
+        (r.fact_asks(), r.detaches()),
+        (0, 0),
+        "an ended server has nothing to ask or let go of"
+    );
+    r.assert_nothing_ends_or_records("the reached server's end");
+
+    let r = connected(Some(left));
+    r.exited();
+    r.answer("n");
+    r.advance(Duration::ZERO);
+    assert_eq!((r.prompt(), r.closes()), (None, 0), "a `n` keeps the window");
+    r.driver.close_requested(WIN, CloseBy::User);
+    assert_eq!(
+        r.prompt(),
+        Some(crate::wm::feedback::no_way_back_prompt(left)),
+        "the next close does not name the left nvim"
+    );
+    r.answer("y");
+    r.finish();
+    assert_eq!(r.closes(), 1);
+    r.assert_nothing_ends_or_records("a close after a declined question");
+
+    let r = connected(None);
+    r.exited();
+    assert_eq!(
+        r.prompt(),
+        None,
+        "a `:connect` that left nothing running is asked about"
+    );
+    r.advance(Duration::ZERO);
+    assert_eq!(r.closes(), 1);
+}
+
+/// A close that cannot ask (a signal) still writes where the window's own nvim runs on, with the command that shows it
+/// again.
+#[test]
+fn a_signal_close_after_a_connect_logs_the_left_nvim() {
+    let left = "/run/nvim-own";
+    let r = connected(Some(left));
+    r.driver.post(HostEvent::EndSignal { name: "SIGTERM" });
+    r.finish();
+    let notes = r.driver.query(|c| c.notes(WIN));
+    assert!(
+        notes
+            .iter()
+            .any(|note| note.contains(&format!("nvim --remote-ui --server {left}"))),
+        "{notes:#?}"
+    );
+}
+
+/// `prefix x` on an editor that followed a `:connect` has no terminal to give the nvim back to: its question says the
+/// window closes, and its `y` is the window's close.
+#[test]
+fn prefix_x_after_a_connect_says_the_window_closes() {
+    let r = connected(Some("/run/nvim-own"));
+    r.driver.run(WIN, Action::ModuleKill, Origin::Key { keycode: 7 });
+    assert_eq!(r.prompt().as_deref(), Some(crate::wm::feedback::CONNECTED_CLOSE_PROMPT));
+    r.answer("y");
+    assert_eq!(r.fact_asks(), 1, "the `y` is a close: it asks the editor first");
 }

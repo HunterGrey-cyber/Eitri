@@ -20,6 +20,9 @@ Your editor keeps its own speed and keys, and your window manager arranges the t
 Plain `eitri` on Hyprland, sway or niri also puts its chats and pages in windows of their own, around Eitri's editor
 rather than yours: see [Compositor windows](compositor-windows.md).
 
+To move a Neovim that is already running in your terminal into an Eitri window instead, and have it back in the terminal when the
+window ends, see [Take over a terminal nvim](takeover.md).
+
 ## The eitri.nvim plugin
 
 `eitri.nvim` is a thin launcher: everything the panel needs inside Neovim, the panel installs itself, so the
@@ -51,6 +54,9 @@ opened once: name both commands, as above.
 If Neovim has no server address yet, the plugin starts one. The panel's band says `attaching…` until the glue
 is in, and nothing times out: Neovim answers the request once you finish a pending key or a prompt, and the band
 then says so (`attaching… (nvim is waiting for a key)`).
+
+`:EitriOpen` is the plugin's other command for the panel's window: it moves this Neovim into an Eitri window ([Take over a terminal
+nvim](takeover.md)). Name `"EitriOpen"` in a lazy.nvim spec's `cmd` list to use it.
 
 ## eitri panel
 

@@ -135,6 +135,8 @@ pub(crate) fn editor_options(spawn: &EditorSpawn) -> NeovideEditorPaneOptions {
         cwd: spawn.cwd.clone(),
         extra_nvim_args: spawn.args.clone(),
         open: spawn.open.clone(),
+        attach: None,
+        chunk_check: None,
     }
 }
 
@@ -145,6 +147,8 @@ pub(crate) fn editor_options(spawn: &EditorSpawn) -> NeovideEditorPaneOptions {
 pub(crate) struct EditorMaker {
     host: Weak<GtkHost>,
     made: RefCell<Option<MadeEditor>>,
+    /// The person's nvim the editor joins instead of starting one, with the check every call to it passes.
+    attach: RefCell<Option<(neovide_editor::AttachSpec, neovide_editor::ChunkCheck)>>,
 }
 
 impl EditorMaker {
@@ -152,7 +156,13 @@ impl EditorMaker {
         Rc::new(EditorMaker {
             host,
             made: RefCell::new(None),
+            attach: RefCell::new(None),
         })
+    }
+
+    /// The editor joins the nvim at `spec` and passes every call through `check`, from its first one.
+    pub(crate) fn attach_to(&self, spec: neovide_editor::AttachSpec, check: neovide_editor::ChunkCheck) {
+        *self.attach.borrow_mut() = Some((spec, check));
     }
 
     /// The editor this maker made, handed over once.
@@ -177,7 +187,12 @@ impl SurfaceMaker for EditorMaker {
         let Some(gtk_host) = self.host.upgrade() else {
             return Err("the GTK host is gone".into());
         };
-        let pane = Rc::new(NeovideEditorPane::with_options(editor_options(spawn)));
+        let mut options = editor_options(spawn);
+        if let Some((spec, check)) = self.attach.borrow_mut().take() {
+            options.attach = Some(spec);
+            options.chunk_check = Some(check);
+        }
+        let pane = Rc::new(NeovideEditorPane::with_options(options));
         let (host, failure) = crate::editor_start_failure::install(pane.widget());
         gtk_host.register_surface(win, ModuleId::editor(), host.upcast_ref());
         *self.made.borrow_mut() = Some(MadeEditor { pane, host, failure });
@@ -712,6 +727,8 @@ mod tests {
                 cwd: spawn.cwd.clone(),
                 extra_nvim_args: spawn.args.clone(),
                 open: vec!["+3".into(), "/home/user/project/a b.rs".into()],
+                attach: None,
+                chunk_check: None,
             }
         );
         assert_eq!(editor_options(&spawn), start, "the restart's options are the start's");

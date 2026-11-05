@@ -53,6 +53,12 @@ impl OriginLink {
         self.link.channel_id()
     }
 
+    /// The connection itself, for the window's own requests to the person's nvim once it holds it: the detach's
+    /// teardown and what a close asks. The room is never reached through it.
+    pub fn rpc(&self) -> &NvimLink {
+        &self.link
+    }
+
     /// Notifications stay with the origin connection rather than crossing into the room's namespace.
     pub fn events(&self) -> mpsc::Receiver<LinkEvent> {
         self.events
@@ -480,6 +486,41 @@ mod tests {
             .unwrap();
         room_lua()
             .load("channels[2] = nil; tick(); assert(quit_count == 1)")
+            .exec()
+            .unwrap();
+    }
+
+    /// A `let_go` that finds no UI (the terminal closed after the window last looked) leaves nothing to wait for: once
+    /// Eitri's link closes, the room quits even after a move was sent. A UI reaching it before then is still returned.
+    #[test]
+    fn takeover_a_let_go_with_no_ui_quits_the_room_once_eitri_has_gone() {
+        room_lua()
+            .load(
+                r#"
+            local room = _G.__eitri_room
+            room.moving()
+            assert(room.let_go() == 'no_ui')
+            tick()
+            assert(quit_count == 0, 'the room quit while Eitri still holds its link')
+            channels[9] = nil
+            tick()
+            assert(quit_count == 1 and connected == 0)
+        "#,
+            )
+            .exec()
+            .unwrap();
+        room_lua()
+            .load(
+                r#"
+            local room = _G.__eitri_room
+            room.moving(); room.pending()
+            assert(room.let_go() == 'no_ui')
+            uis = {{chan = 1}}
+            channels[9] = nil
+            tick()
+            assert(connected == 1 and quit_count == 0)
+        "#,
+            )
             .exec()
             .unwrap();
     }

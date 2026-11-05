@@ -49,6 +49,8 @@ pub(crate) const NOT_ACTIVE: &str =
 pub(crate) fn start(
     listener: UnixListener,
     switch_socket: &Path,
+    attached: Option<host_clipboard::AttachedNvim>,
+    followed: Option<host_clipboard::FollowedNvim>,
     window: &impl IsA<gtk4::Window>,
 ) -> Option<ClipboardServer> {
     let (requests, mut taken) = futures_channel::mpsc::unbounded::<(Request, Reply)>();
@@ -60,7 +62,18 @@ pub(crate) fn start(
             answer(request, reply, active);
         }
     });
-    let served = host_clipboard::serve(listener, Admission::for_window(switch_socket), move |request, reply| {
+    // A person's own nvim the window holds is no child of the window: it is let in by its process, which only the
+    // takeover learned.
+    let mut admission = Admission::for_window(switch_socket);
+    if let Some(nvim) = attached {
+        admission = admission.with_attached(nvim);
+    }
+    // The server a followed `:restart` started is no child of the window either once the nvim that started it has
+    // exited: it is let in by the process the editor learned from it.
+    if let Some(followed) = followed {
+        admission = admission.with_followed(followed);
+    }
+    let served = host_clipboard::serve(listener, admission, move |request, reply| {
         // A send fails only once the loop's end has been dropped; the reply then answers `Failed`.
         let _ = requests.unbounded_send((request, reply));
     });

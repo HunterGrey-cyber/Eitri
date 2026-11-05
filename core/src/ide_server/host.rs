@@ -213,6 +213,11 @@ impl IdeHost {
         self.define_mention(rpc);
     }
 
+    /// The proposal views open in the editor, or on their way there: each ends with the window.
+    pub fn open_views(&self) -> usize {
+        self.views.len()
+    }
+
     /// How soon `tick` is owed: `None` with nothing outstanding and no view open, so an idle window has no timer.
     pub fn next_tick(&self) -> Option<Duration> {
         let opening = self
@@ -1065,6 +1070,20 @@ mod tests {
         );
         bench.after(EDITOR_BUDGET);
         assert_eq!(bench.host.next_tick(), None, "kept for one more budget and no longer");
+    }
+
+    #[test]
+    fn open_views_counts_a_view_from_its_open_to_its_end() {
+        let mut bench = Bench::new();
+        assert_eq!(bench.host.open_views(), 0);
+        bench.event(open_diff(1, 1, "tab"));
+        assert_eq!(bench.host.open_views(), 1, "on its way to the editor");
+        bench.editor.answer("open", opened());
+        bench.tick();
+        assert_eq!(bench.host.open_views(), 1, "shown");
+        bench.editor.answer("take", events(vec![view_event(1, "closed")]));
+        bench.tick();
+        assert_eq!(bench.host.open_views(), 0, "the person closed it");
     }
 
     #[test]

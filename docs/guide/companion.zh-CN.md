@@ -1,5 +1,5 @@
 [English](companion.md) | 简体中文
-<!-- translated-from: companion.md sha256=df74caddb4fa5948ff82bda101e6da822d93209292a71b6636bf27cb8db19896 -->
+<!-- translated-from: companion.md sha256=9d93648fffde3e62f5c4aac2b54e9c2b090e98565416d47d4c8cd77b4d804c59 -->
 
 # 配合你自己的 Neovim 使用
 
@@ -8,6 +8,8 @@ Eitri 也可以只运行 agent 面板：一个独立的窗口，放在你平时�
 面板通过 RPC socket 附着到你的 Neovim 上，并在里面装一小段胶水代码：你打开的文件和 Visual 选区会送给 agent；面板取用你的配色方案并显示你的 which-key 按键；agent 工作期间缓冲区会重新加载（见[缓冲区重新加载](#buffers-reload)）；可以从面板里按行号打开文件；`Ctrl+g` 在 Neovim 里编辑草稿；Visual 模式里按 `<leader>ae`，带着选区把你送到面板的输入框，里面已有 `Edit the selection: ` 等你接着写（窗口管理器能被要求把面板带到前面的地方才行；其它地方用桌面自己的窗口键）。面板一消失就把这些全部撤掉。你的 Neovim 配置里不会被写入任何东西。编辑器保持它自己的速度和按键，两个窗口怎么摆由你的窗口管理器决定。
 
 在 Hyprland、sway 或 niri 上，普通的 `eitri` 也会把它的聊天和页面放进各自的窗口，不过围绕的是 Eitri 的编辑器，而不是你的：见[合成器窗口](compositor-windows.zh-CN.md)。
+
+如果你想把一个已经在终端里运行的 Neovim 搬进 Eitri 窗口、窗口结束时再让它回到终端，见[接管终端里的 nvim](takeover.zh-CN.md)。
 
 <a id="the-eitrinvim-plugin"></a>
 ## eitri.nvim 插件
@@ -27,6 +29,8 @@ Eitri 也可以只运行 agent 面板：一个独立的窗口，放在你平时�
 调用 `require("eitri").setup({ ... })` 是可选的。`mapping = "<leader>ep"` 把一个 normal 模式的键绑定到这个命令上，`page_mappings = { ["<leader>em"] = "markdown" }` 把 normal 模式的键绑定到[开在你 nvim 旁边的页面](#pages-beside-your-nvim)（默认一个也没有），`cmd = "/path/to/eitri"` 在启动器不在 Neovim 的 `PATH` 上时指明它。Neovim 里的 `:help eitri.nvim` 有同样的内容，`:checkhealth eitri` 会找到程序、打印它的版本并列出页面 id。你用上某个命令之前，Eitri 的任何东西都不会在你的 Neovim 里运行。lazy.nvim 的 spec 如果只写了 `EitriPanel`（这一页以前就是这样写的），在你打开过一次面板之前 `:EitriPage` 都不存在：像上面那样把两个命令都写上。
 
 `:EitriPanel` 为当前工作目录打开面板，`:EitriPanel ~/some/project` 为另一个目录打开。如果 Neovim 还没有服务器地址，插件会启动一个。在胶水代码装好之前，面板的状态条会写 `attaching…`，而且没有任何超时：等你完成一个未完成的按键或提示之后，Neovim 才会回应这个请求，状态条随后会说明这一点（`attaching… (nvim is waiting for a key)`）。
+
+`:EitriOpen` 是这个插件里另一条与面板窗口相关的命令：它把当前这个 Neovim 搬进一个 Eitri 窗口（[接管终端里的 nvim](takeover.zh-CN.md)）。想在 lazy.nvim 配置里使用它，把 `"EitriOpen"` 也写进 `cmd` 列表。
 
 <a id="eitri-panel"></a>
 ## eitri panel

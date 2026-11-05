@@ -1,5 +1,5 @@
 [English](README.md) | 简体中文
-<!-- translated-from: README.md sha256=c36882f62f57cdfba86b28c7055ca16c175da7db4ab0d3075184fa579be9652b -->
+<!-- translated-from: README.md sha256=13713d17455270e887eb3a0510b1ef78bcaa57a214f2f9804cc2d529642e5c62 -->
 
 # Eitri 文档
 
@@ -35,6 +35,7 @@ Eitri 不取代 Neovim：缓冲区、动作、LSP 和补全仍然是 Neovim 自�
 - [编辑器怎样把画面送上屏幕](editor-presentation.zh-CN.md)：编辑器自己的 Wayland surface、`editor.presentation` 和退回。
 - [合成器窗口](compositor-windows.zh-CN.md)：聊天和页面作为 Hyprland、sway 或 niri 的窗口，每种都有一条窗口规则示例。
 - [Companion 模式](companion.zh-CN.md)：agent 面板作为独立窗口，放在你已经在用的 Neovim 旁边。
+- [接管终端里的 nvim](takeover.zh-CN.md)：把终端里运行的 Neovim 搬进 Eitri 窗口，窗口结束时再让它回到终端。
 - [回合审阅](turn-review.zh-CN.md)：查看一个回合期间磁盘上改了什么，还原一个 hunk，把评论发回去。
 - [Markdown 预览](markdown-preview.zh-CN.md)：在编辑器旁边显示渲染后的 Markdown 文件，和编辑器一起滚动，用 Vim 键阅读。
 - [权限](permissions.zh-CN.md)：什么不经询问就运行，什么要等一张卡片，以及 bypass 模式。

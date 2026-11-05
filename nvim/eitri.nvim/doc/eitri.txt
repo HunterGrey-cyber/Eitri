@@ -4,7 +4,7 @@
 CONTENTS                                                        *eitri-contents*
 
   1. Install ............................ |eitri-install|
-  2. Commands ........................... |:EitriPanel|
+  2. Commands ........................... |:EitriPanel|, |:EitriOpen|
   3. Setup .............................. |eitri-setup|
   4. Navigators ......................... |eitri.edge()|
   5. Inside tmux ........................ |eitri-tmux|
@@ -51,6 +51,30 @@ Without a plugin manager, add the directory to 'runtimepath':
                         it never opens a second window. From the nvim the
                         panel is already attached to, it only raises the
                         panel: drafts being edited here stay open.
+
+                                                                  *:EitriOpen*
+:EitriOpen [dir]        Move this nvim into an Eitri window (a takeover), and
+                        give it back to this terminal when the window ends.
+                        Needs nvim 0.12 or later: below that it prints one
+                        line and nothing loads. [dir] is the project; the
+                        default is nvim's own global working directory. The
+                        nvim must show exactly one UI, this terminal, and not
+                        be waiting for a key. If nvim has no server address
+                        yet, one is started. The terminal shows "This nvim is
+                        open in Eitri" while the window has it; <Enter> there
+                        takes it back at once, and so does closing the window,
+                        quitting Eitri, a logout, a crash, or another UI
+                        attaching. Eitri never signals this nvim and never
+                        quits it. `:qa` typed in the window quits nvim. It is
+                        refused (with one line) when `editor.takeover` is off
+                        in Eitri's init.lua, when this nvim is already open in
+                        an Eitri window, and when no display is available.
+                        See the guide page "Take over a terminal nvim".
+
+                                                                *eitri.open()*
+require("eitri").open({dir})
+
+The Lua form of :EitriOpen; {dir} is optional.
 
                                                                   *:EitriPage*
 :EitriPage {id} [dir]   Open a plugin page beside this nvim, following its

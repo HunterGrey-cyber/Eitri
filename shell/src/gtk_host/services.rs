@@ -411,6 +411,9 @@ pub(crate) struct Services {
     /// Holds or releases the editor's review events of a moving chat's session (`GroupReview::hold_session`):
     /// `None` in a window that is no pair's, where no chat moves.
     pub(crate) review_hold: Option<ReviewHold>,
+    /// A window over a person's own nvim (`eitri open`): where its editor's detach and the close's ask are carried
+    /// out. `None` in every other window.
+    pub(crate) takeover: Option<Rc<crate::takeover::WindowSide>>,
 }
 
 /// [`Services::review_hold`]: the session, whether to hold, and whether this window holds the session after a
@@ -422,6 +425,14 @@ impl Services {
     /// over.
     fn app(&self) -> Result<gtk4::Application, String> {
         Ok(self.teardown()?.app.clone())
+    }
+
+    /// The proposal views the terminal `claude` has open in the editor; none without its listener.
+    fn open_views(&self) -> usize {
+        self.teardown()
+            .ok()
+            .and_then(|teardown| teardown.ide.as_ref().map(|ide| ide.open_views()))
+            .unwrap_or(0)
     }
 
     /// What the teardown ends, handed out so nothing holds its slot while a step runs; `Err` before the window's
@@ -590,6 +601,59 @@ impl Services {
     }
 }
 
+/// How long the close's ask waits for the mode of a server a followed `:connect` reached: inside the controller's own
+/// wait for the answer.
+const FOLLOWED_FACTS_WITHIN: std::time::Duration = std::time::Duration::from_millis(150);
+
+fn post_editor(sink: &Weak<dyn HostSink>, event: eitri_core::wm::EditorEvent) {
+    if let Some(sink) = sink.upgrade() {
+        sink.post(HostEvent::Editor(event));
+    }
+}
+
+/// The close's `Detach` of a server a followed `:connect` reached: the fork's cleanup over the editor's own channel,
+/// then the hang-up, on the editor's worker; answered with `Detached` here once it is done, or at once when there is
+/// nothing left to let go of.
+fn followed_detach(editor: &NeovideEditorPane, win: WinId, sink: Weak<dyn HostSink>) {
+    let (done, finished) = futures_channel::oneshot::channel::<bool>();
+    let started = editor.detach_followed(move |cleaned| {
+        let _ = done.send(cleaned);
+    });
+    gtk4::glib::spawn_future_local(async move {
+        if started {
+            match finished.await {
+                Ok(true) => println!("[editor] let go of the nvim a :connect reached; it is as it was before"),
+                _ => println!("[editor] let go of the nvim a :connect reached; the fork's cleanup did not act"),
+            }
+        } else {
+            println!("[editor] the nvim a :connect reached is no longer this window's; nothing to let go of");
+        }
+        post_editor(&sink, eitri_core::wm::EditorEvent::Detached { win });
+    });
+}
+
+/// The close's ask about a server a followed `:connect` reached: whether it waits for a key (its mode, over the
+/// editor's own channel), and where the window's own nvim it left still runs. No drafts or proposals live there.
+fn followed_close_facts(editor: &NeovideEditorPane, win: WinId, generation: u32, sink: Weak<dyn HostSink>) {
+    let (answer, answered) = futures_channel::oneshot::channel();
+    let asked = editor.ask_mode(FOLLOWED_FACTS_WITHIN, move |mode| {
+        let _ = answer.send(mode);
+    });
+    let no_way_back = editor.left_running();
+    gtk4::glib::spawn_future_local(async move {
+        let mode = if asked { answered.await.ok().flatten() } else { None };
+        let blocking = mode
+            .as_ref()
+            .is_none_or(|mode| mode.blocking || mode.mode.starts_with('r') || mode.mode == "!");
+        let asks = eitri_core::wm::CloseAsks {
+            blocking,
+            no_way_back,
+            ..eitri_core::wm::CloseAsks::default()
+        };
+        post_editor(&sink, eitri_core::wm::EditorEvent::CloseFacts { win, generation, asks });
+    });
+}
+
 /// Gives the end of the shell `pid` started at `start` (a raw wait status, `None` when it could not be read) to the
 /// terminal here that runs it, a shell this window took over from the other one; whether one did.
 pub(crate) fn child_exited_here(terminals: &Registry<TerminalPane>, pid: u32, start: u64, status: Option<i32>) -> bool {
@@ -714,12 +778,37 @@ impl ServiceSet for Services {
                 Ok(())
             }
             EditorCall::Reveal { .. } => Err(NOT_CARRIED_OUT.into()),
-            // Only a window over a person's own nvim sends these, and no window here holds one yet: refused, so a
-            // close's question about the editor waits out its bound and asks.
-            EditorCall::Detach { .. } | EditorCall::AskCloseFacts { .. } => {
-                eprintln!("[editor] {op:?}: this window's editor is not attached to a person's nvim; refused");
-                Err("this window's editor is not attached to a person's nvim".into())
-            }
+            // The detach and the close's ask run on workers (`takeover`, or the editor's own for a server a followed
+            // `:connect` reached, where no takeover part exists), each answered by its own event; a window over an nvim
+            // of its own sends neither, and either is refused there.
+            EditorCall::Detach { win } => match (&self.takeover, &self.editor) {
+                (Some(takeover), _) => {
+                    takeover.detach(self.open_views());
+                    Ok(())
+                }
+                (None, Some(editor)) if editor.is_attached() => {
+                    followed_detach(editor, *win, self.sink.clone());
+                    Ok(())
+                }
+                _ => {
+                    eprintln!("[editor] {op:?}: this window's editor is not attached to a person's nvim; refused");
+                    Err("this window's editor is not attached to a person's nvim".into())
+                }
+            },
+            EditorCall::AskCloseFacts { win, generation } => match (&self.takeover, &self.editor) {
+                (Some(takeover), _) => {
+                    takeover.ask_close_facts(*generation, self.open_views());
+                    Ok(())
+                }
+                (None, Some(editor)) if editor.is_attached() => {
+                    followed_close_facts(editor, *win, *generation, self.sink.clone());
+                    Ok(())
+                }
+                _ => {
+                    eprintln!("[editor] {op:?}: this window's editor is not attached to a person's nvim; refused");
+                    Err("this window's editor is not attached to a person's nvim".into())
+                }
+            },
         }
     }
 

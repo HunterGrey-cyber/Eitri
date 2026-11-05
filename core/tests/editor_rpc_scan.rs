@@ -59,6 +59,9 @@ const EXPECTED_FORWARDERS: &[(&str, usize)] = &[
     ("core/src/companion/link.rs", 2),
     ("core/src/editor_rpc.rs", 2),
     ("shell/src/editor_rpc.rs", 1),
+    // The takeover window's handle forwards to the pane, and the pane's check runs the takeover's rule on the code it
+    // was given.
+    ("shell/src/takeover.rs", 2),
 ];
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]

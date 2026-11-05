@@ -120,6 +120,17 @@ pub struct CloseFlow {
     /// The editor was told to let go of the nvim and has not said it did: the window is not torn down before it
     /// does, or before [`DETACHED_WITHIN`].
     detaching: bool,
+    /// The address a close names when the nvim's terminal is gone ([`CloseAsks::no_way_back`]), from the editor's
+    /// last answer.
+    no_way_back: Option<String>,
+    /// The editor followed a `:connect`: the nvim it shows came from no terminal, and the window's own nvim it left
+    /// runs on with no window at [`CloseFlow::left_own`].
+    connected: bool,
+    /// Where the window's own nvim a followed `:connect` left runs on, as the follow reported it. A close that ends
+    /// with the reached server already gone asks about it once, and every close's teardown writes it to the log.
+    left_own: Option<String>,
+    /// This close's `y` to the question naming where nvim runs on: the close does not ask it again.
+    left_named: bool,
     pending: Option<PendingClose>,
     confirmed: bool,
     repeated: bool,
@@ -149,6 +160,8 @@ pub enum AttachedAsk {
     Unsaved { blocking: bool },
     /// nvim is waiting for a key, or busy, or did not say in time.
     Blocking,
+    /// The terminal the nvim came from is gone: once let go of, it runs on with no window.
+    NoWayBack,
 }
 
 /// How long an attached editor's close waits for what it has to ask; no answer counts as nvim waiting for a key.
@@ -181,6 +194,8 @@ pub enum HandBackWhy {
     Replaced,
     /// The attach failed after the terminal's UI had moved.
     AttachFailed,
+    /// `:connect` typed in the window's editor moved its UI to another nvim; the one it left goes back to its terminal.
+    Connected,
 }
 
 impl HandBackWhy {
@@ -191,6 +206,7 @@ impl HandBackWhy {
             HandBackWhy::LinkLost => super::feedback::LINK_LOST_TEXT,
             HandBackWhy::Replaced => "another Eitri's glue replaced this window's",
             HandBackWhy::AttachFailed => "the attach failed",
+            HandBackWhy::Connected => "`:connect` moved the editor to another nvim",
         }
     }
 }
@@ -371,6 +387,14 @@ fn attached_close(w: &mut Window, cx: &Cx, win: WinId, cause: CloseCause, batch:
         chrome::set_prompt(w, None);
     }
     if w.close.let_go {
+        // The server a `:connect` reached has ended, or was let go of before: the window's own nvim it left still
+        // runs with no window, and nothing else would name it before the window goes.
+        if !w.close.left_named {
+            if let Some(addr) = w.close.left_own.clone() {
+                ask_attached(w, AttachedAsk::NoWayBack, super::feedback::no_way_back_prompt(&addr));
+                return;
+            }
+        }
         after_let_go(w, cx, win);
         return;
     }
@@ -404,9 +428,11 @@ pub(super) fn close_facts(w: &mut Window, cx: &Cx, win: WinId, answer: Option<(u
     }
     let asks = asks.unwrap_or(CloseAsks {
         blocking: true,
+        no_way_back: w.close.no_way_back.clone(),
         ..CloseAsks::default()
     });
     w.close.state = CloseState::Idle;
+    w.close.no_way_back = asks.no_way_back.clone();
     if asks.drafts > 0 || asks.proposals > 0 {
         let text = super::feedback::unsaved_in_editor_prompt(asks.drafts, asks.proposals);
         ask_attached(
@@ -416,7 +442,18 @@ pub(super) fn close_facts(w: &mut Window, cx: &Cx, win: WinId, answer: Option<(u
             },
             text,
         );
-    } else if asks.blocking {
+    } else {
+        ask_next_or_let_go(w, cx, win, asks.blocking, batch);
+    }
+}
+
+/// After the drafts and proposals: whether the terminal is gone, else whether nvim waits for a key, else the let-go.
+/// With no terminal to go back to, nothing would show the blank screen a waiting nvim leaves, so only the first is
+/// asked.
+fn ask_next_or_let_go(w: &mut Window, cx: &Cx, win: WinId, blocking: bool, batch: &mut Batch) {
+    if let Some(addr) = w.close.no_way_back.clone() {
+        ask_attached(w, AttachedAsk::NoWayBack, super::feedback::no_way_back_prompt(&addr));
+    } else if blocking {
         ask_attached(w, AttachedAsk::Blocking, super::feedback::BLOCKING_PROMPT.into());
     } else {
         let_go(w, win, batch);
@@ -440,7 +477,13 @@ pub(super) fn ask_give_back(w: &mut Window, cx: &Cx, win: WinId, batch: &mut Bat
         request(w, cx, win, CloseCause::User, batch);
         return;
     }
-    ask_attached(w, AttachedAsk::GiveBack, super::feedback::GIVE_BACK_PROMPT.into());
+    // An nvim a `:connect` reached came from no terminal, and the editor cannot show another: the window closes.
+    let text = if w.close.connected {
+        super::feedback::CONNECTED_CLOSE_PROMPT
+    } else {
+        super::feedback::GIVE_BACK_PROMPT
+    };
+    ask_attached(w, AttachedAsk::GiveBack, text.into());
 }
 
 fn ask_attached(w: &mut Window, ask: AttachedAsk, text: String) {
@@ -462,10 +505,11 @@ fn ask_attached(w: &mut Window, ask: AttachedAsk, text: String) {
 fn attached_answered(w: &mut Window, cx: &Cx, win: WinId, ask: AttachedAsk, batch: &mut Batch) {
     match ask {
         AttachedAsk::GiveBack => request(w, cx, win, CloseCause::User, batch),
-        AttachedAsk::Unsaved { blocking: true } => {
-            ask_attached(w, AttachedAsk::Blocking, super::feedback::BLOCKING_PROMPT.into())
-        }
-        AttachedAsk::Unsaved { blocking: false } | AttachedAsk::Blocking => {
+        AttachedAsk::Unsaved { blocking } => ask_next_or_let_go(w, cx, win, blocking, batch),
+        AttachedAsk::Blocking | AttachedAsk::NoWayBack => {
+            if ask == AttachedAsk::NoWayBack {
+                w.close.left_named = true;
+            }
             let_go(w, win, batch);
             after_let_go(w, cx, win);
         }
@@ -594,6 +638,10 @@ impl CloseFlow {
             }
             _ => {}
         }
+        // A close that did not go on asks again, next time, where nvim runs on.
+        if answer != PromptKey::Yes {
+            w.close.left_named = false;
+        }
         std::mem::swap(self, &mut w.close);
     }
 }
@@ -662,6 +710,7 @@ pub(super) fn superseded(w: &mut Window, cx: &Cx, win: WinId, batch: &mut Batch)
     }
     let pending = w.close.pending.take();
     w.close.state = CloseState::Idle;
+    w.close.left_named = false;
     match pending {
         Some(PendingClose::Window { .. }) if w.editor_attached() => retire_let_go_editor(w, cx, win, batch),
         Some(PendingClose::Window { .. }) => {
@@ -857,6 +906,14 @@ pub fn teardown(w: &mut Window, win: WinId, batch: &mut Batch) {
     w.close.pending = None;
     w.modules.clear_question();
     chrome::set_prompt(w, None);
+    // Whatever closed the window (a signal or a hand-back cannot ask), the log says where the window's own nvim a
+    // `:connect` left runs on.
+    if let Some(addr) = w.close.left_own.clone() {
+        w.say(format!(
+            "[window] {}",
+            super::feedback::no_way_back_prompt(&addr).trim_end_matches(" Close? (y/n)")
+        ));
+    }
     let layout_written = save_for_close(w);
     super::moves::forget_sent_at_teardown(w, win, batch);
     // Window 2 outlives window 1; a row of orphaned chat windows after the editor was quit would be clutter.
@@ -944,7 +1001,33 @@ pub(super) fn editor_event(w: &mut Window, cx: &Cx, win: WinId, event: EditorEve
             return;
         }
         EditorEvent::CloseFacts { generation, asks, .. } => {
-            close_facts(w, cx, win, Some((*generation, *asks)), batch);
+            close_facts(w, cx, win, Some((*generation, asks.clone())), batch);
+            return;
+        }
+        // The editor followed its nvim to another server: from now on the window holds that kind of nvim, and every
+        // rule of it holds. A server a `:connect` reached is not the window's to quit, end or restart, and the
+        // window's own nvim it left runs on with no window, which the close names.
+        EditorEvent::Followed { kind, left, .. } => {
+            if *kind == super::window::EditorKind::Attached {
+                w.set_editor_kind(*kind);
+                w.close.no_way_back = left.clone();
+                w.close.connected = true;
+                w.close.left_own = left.clone();
+                w.say(match left {
+                    Some(addr) => format!(
+                        "[modules] editor: it follows a :connect to an nvim the window did not start; the window's own \
+                         nvim runs on at {addr}"
+                    ),
+                    None => "[modules] editor: it follows a :connect to an nvim the window did not start".into(),
+                });
+            } else if w.editor_attached() {
+                // Nothing makes an nvim the window did not start its own again.
+                w.warn(
+                    "[wm] BUG: a followed :restart was reported for an nvim this window did not start; ignored".into(),
+                );
+            } else {
+                w.say("[modules] editor: it follows a :restart to the server its nvim started".into());
+            }
             return;
         }
         // The pane holds no nvim any more: nothing can take a file, and nothing brings this one back here.

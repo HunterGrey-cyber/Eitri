@@ -44,6 +44,7 @@ you register, and you supervise each of them yourself, in a window you control.
 - [How the editor reaches the screen](editor-presentation.md): the editor's own Wayland surface, `editor.presentation` and its fallback.
 - [Compositor windows](compositor-windows.md): chats and pages as windows of Hyprland, sway or niri, with a window rule for each.
 - [Companion mode](companion.md): the agent panel as its own window beside the Neovim you already use.
+- [Take over a terminal nvim](takeover.md): move the Neovim running in your terminal into an Eitri window, and have it back in the terminal when the window ends.
 - [Turn review](turn-review.md): see what changed on disk during a turn, revert a hunk, send comments back.
 - [Markdown preview](markdown-preview.md): a Markdown file rendered beside the editor, scrolling with it, read with Vim keys.
 - [Permissions](permissions.md): what runs without asking, what waits on a card, and the bypass mode.

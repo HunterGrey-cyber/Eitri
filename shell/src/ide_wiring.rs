@@ -215,6 +215,11 @@ impl IdeWiring {
         self.settle_timer();
     }
 
+    /// The proposal views open in the editor, which end with the window.
+    pub(crate) fn open_views(&self) -> usize {
+        self.host.borrow().open_views()
+    }
+
     /// The window's end: every view closes, then the lock and the port go. Waits, within its bound.
     pub(crate) fn end(&self) {
         let Some(listener) = self.listener.borrow_mut().take() else {

@@ -12,6 +12,7 @@
 
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::sync::atomic::{AtomicUsize, Ordering};
 
 /// Ex commands that end nvim without asking: `:q!`, `:qa!`, `:wq!`, `:x!` and their spellings, and
 /// `:cq`, which quits without writing whether or not it has a bang.
@@ -583,6 +584,14 @@ fn the_pinned_forks_harness_never_force_quits_nvim() {
         exit_handler.contains("always_confirm or"),
         "the exit handler confirms when the embedding says so"
     );
+    assert!(
+        harness.contains("attach_mode = attach"),
+        "LiveHarness puts a session on a server it was given into attach mode"
+    );
+    assert!(
+        ui_commands.contains(".attach_mode"),
+        "the Quit command tells the exit handler about attach mode"
+    );
     let mut lua = Vec::new();
     files(&fork.join("lua"), &mut lua);
     let offences: Vec<String> = lua.iter().flat_map(|p| offences(p)).collect();
@@ -593,12 +602,22 @@ fn the_pinned_forks_harness_never_force_quits_nvim() {
     );
 }
 
+/// A probe script's path, distinct for every call: the tests of this binary run on parallel threads
+/// of one process, and each probe file is deleted as soon as its nvim exits, so a path shared by two
+/// calls could vanish before the other call's nvim has read it.
+fn probe_path(name: &str) -> PathBuf {
+    static NEXT: AtomicUsize = AtomicUsize::new(0);
+    let n = NEXT.fetch_add(1, Ordering::Relaxed);
+    Path::new(env!("CARGO_TARGET_TMPDIR")).join(format!("{name}-{}-{n}.lua", std::process::id()))
+}
+
 /// Loads the fork's `lua/init.lua` into a real nvim as the bridge does, with `has("macunix")`
-/// answering `macunix`, presses `<D-q>` (Super+q on Linux), and returns what the map table and the
-/// fork's notifications show: `(modes mapping <D-q>, whether the quit handler was asked)`.
-fn super_q_in_the_forks_lua(macunix: u8) -> (Vec<String>, bool) {
+/// answering `macunix` and in attach mode when `attached`, presses `<D-q>` (Super+q on Linux), and
+/// returns what the map table and the fork's notifications show: `(modes mapping <D-q>, whether the
+/// quit handler was asked)`.
+fn super_q_in_the_forks_lua(macunix: u8, attached: bool) -> (Vec<String>, bool) {
     const PROBE: &str = r#"
-local init, macunix = arg[1], tonumber(arg[2])
+local init, macunix, attached = arg[1], tonumber(arg[2]), arg[3] == "attached"
 local real_has = vim.fn.has
 vim.fn.has = function(feature)
   if feature == "macunix" then return macunix end
@@ -609,7 +628,7 @@ vim.rpcnotify = function(_, method) asked[#asked + 1] = method end
 vim.rpcrequest = function(_, method) asked[#asked + 1] = method end
 assert(loadfile(init))({
   neovide_channel_id = 0, neovide_version = "probe", config_path = "", register_clipboard = false,
-  register_right_click = false, remote = false, enable_focus_command = false,
+  register_right_click = false, remote = attached, attached = attached, enable_focus_command = false,
   global_variable_settings = {}, option_settings = {},
 })
 local mapped = {}
@@ -628,13 +647,14 @@ io.stdout:flush()
 os.exit(0)
 "#;
     let init = fork_root().join("lua/init.lua");
-    let probe = Path::new(env!("CARGO_TARGET_TMPDIR")).join(format!("fork-super-q-{}.lua", std::process::id()));
+    let probe = probe_path("fork-super-q");
     std::fs::write(&probe, PROBE).expect("write the probe");
     let output = Command::new("nvim")
         .args(["--clean", "--headless", "-l"])
         .arg(&probe)
         .arg(&init)
         .arg(macunix.to_string())
+        .arg(if attached { "attached" } else { "owned" })
         .output()
         .expect("nvim runs");
     let _ = std::fs::remove_file(&probe);
@@ -657,14 +677,95 @@ os.exit(0)
 /// answers 1: `has()` returns 0 elsewhere, and 0 is true in Lua.
 #[test]
 fn super_q_quits_only_on_macos() {
-    let (modes, quit) = super_q_in_the_forks_lua(0);
+    let (modes, quit) = super_q_in_the_forks_lua(0, false);
     assert_eq!(modes, Vec::<String>::new(), "off macOS nothing maps <D-q>");
     assert!(!quit, "off macOS Super+q does not ask the fork to quit");
-    let (modes, quit) = super_q_in_the_forks_lua(1);
+    let (modes, quit) = super_q_in_the_forks_lua(1, false);
     assert_eq!(
         modes,
         ["n", "i", "c", "v", "o", "t", "l"],
         "on macOS Command+Q is mapped in every mode"
     );
     assert!(quit, "on macOS Command+Q asks the fork's quit handler, which confirms");
+}
+
+/// An nvim the editor attached to is not the editor's to quit: in attach mode the fork's Lua maps no
+/// quit key at all, on macOS too, and Command+Q (Super+q) does not reach the quit handler.
+#[test]
+fn super_q_is_never_mapped_in_attach_mode() {
+    for macunix in [0, 1] {
+        let (modes, quit) = super_q_in_the_forks_lua(macunix, true);
+        assert_eq!(
+            modes,
+            Vec::<String>::new(),
+            "attach mode maps <D-q> (has('macunix') = {macunix})"
+        );
+        assert!(!quit, "attach mode asks the fork to quit (has('macunix') = {macunix})");
+    }
+}
+
+/// Runs the pinned fork's `lua/exit_handler.lua` in a real nvim as the bridge's `Quit` does, over
+/// a channel of the nvim's own, with `:confirm qa`, `:qa!` and `confirm()` recorded instead of run,
+/// and returns `(whether the channel closed, the commands it ran, the questions it asked)`.
+fn exit_handler_in_the_forks_lua(always_detach: bool) -> (bool, Vec<String>, Vec<String>) {
+    const PROBE: &str = r#"
+local handler, always_detach = arg[1], arg[2] == "detach"
+local address = vim.v.servername ~= "" and vim.v.servername or vim.fn.serverstart()
+local chan = vim.fn.sockconnect("pipe", address, { rpc = true })
+vim.g.neovide_channel_id = chan
+local commands, asked = {}, {}
+vim.cmd = function(command) commands[#commands + 1] = command end
+vim.fn.confirm = function(message) asked[#asked + 1] = message return 3 end
+assert(loadfile(handler))(true, true, always_detach)
+local closed = vim.wait(2000, function() return vim.api.nvim_get_chan_info(chan).id == nil end, 10)
+io.stdout:write(tostring(closed) .. "|" .. table.concat(commands, ";") .. "|" .. table.concat(asked, ";") .. "\n")
+io.stdout:flush()
+os.exit(0)
+"#;
+    let handler = fork_root().join("lua/exit_handler.lua");
+    let probe = probe_path("fork-exit-handler");
+    std::fs::write(&probe, PROBE).expect("write the probe");
+    let output = Command::new("nvim")
+        .args(["--clean", "--headless", "-n", "-i", "NONE", "-l"])
+        .arg(&probe)
+        .arg(&handler)
+        .arg(if always_detach { "detach" } else { "ask" })
+        .output()
+        .expect("nvim runs");
+    let _ = std::fs::remove_file(&probe);
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        output.status.success(),
+        "the probe nvim failed: {stdout}{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let line = stdout.lines().last().unwrap_or_default();
+    let mut parts = line.splitn(3, '|');
+    let closed = parts.next() == Some("true");
+    let words = |part: Option<&str>| -> Vec<String> {
+        part.unwrap_or_default()
+            .split(';')
+            .filter(|w| !w.is_empty())
+            .map(str::to_owned)
+            .collect()
+    };
+    let commands = words(parts.next());
+    let asked = words(parts.next());
+    (closed, commands, asked)
+}
+
+/// A quit in attach mode (the fork's `<D-q>`, or any `Quit` the bridge sends) closes the editor's
+/// channel and nothing else: no quit command and no question reach the nvim, which goes on. Without
+/// attach mode the same handler asks first, so the probe sees the difference.
+#[test]
+fn quit_in_attach_mode_only_closes_the_channel() {
+    let (closed, commands, asked) = exit_handler_in_the_forks_lua(true);
+    assert!(closed, "the editor's channel is still open");
+    assert_eq!(commands, Vec::<String>::new(), "attach mode ran a quit command");
+    assert_eq!(asked, Vec::<String>::new(), "attach mode asked a question");
+
+    let (closed, commands, asked) = exit_handler_in_the_forks_lua(false);
+    assert!(!closed, "a cancelled question closed the channel");
+    assert_eq!(commands, Vec::<String>::new());
+    assert_eq!(asked.len(), 1, "a remote quit outside attach mode asks: {asked:?}");
 }

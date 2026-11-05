@@ -1771,7 +1771,8 @@ impl Decide for Controller {
                 | EditorEvent::OpenFailed { win, .. }
                 | EditorEvent::Detached { win }
                 | EditorEvent::CloseFacts { win, .. }
-                | EditorEvent::HandedBack { win, .. }),
+                | EditorEvent::HandedBack { win, .. }
+                | EditorEvent::Followed { win, .. }),
             ) => {
                 self.modules_event(win, &mut batch, |w, cx, batch| {
                     super::close::editor_event(w, cx, win, event, batch)

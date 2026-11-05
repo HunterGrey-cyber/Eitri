@@ -50,6 +50,8 @@ api.nvim_create_autocmd('VimEnter', {
   once = true,
   nested = true,
   callback = function()
+    local known, reason = pcall(function() return vim.v.startreason end)
+    local restarted = known and type(reason) == 'string' and reason:find('^restart') ~= nil
     local ok, input = pcall(function()
       local fd = assert(uv.fs_open(dir .. '/reopen-in.json', 'r', 0))
       local stat = uv.fs_fstat(fd)
@@ -64,7 +66,76 @@ api.nvim_create_autocmd('VimEnter', {
     local token = ok and type(input) == 'table' and input.token or '0000000000000000'
     if type(token) ~= 'string' or #token ~= 16 or token:find('[^0-9a-f]') then return end
     local function aside(word) send('A ' .. token .. ' ' .. word) end
-    if not ok or type(input) ~= 'table' then aside('off'); return end
+    if not ok or type(input) ~= 'table' then
+      if not restarted then aside('off') end
+      return
+    end
+    -- The window ends nvim by closing its stdin. By VimLeavePre such an nvim has unloaded its buffers, which puts
+    -- every cursor in column 0; the UI leaving comes before that. The answer taken there lends its columns only when
+    -- the exit's own answer has every column 0 and is otherwise the same: a change made after a UI left (another UI
+    -- still attached) is then never lost to it.
+    local at_leave
+    local function columns_lost(fresh, kept, key)
+      if key == 'col' and type(fresh) == 'number' and type(kept) == 'number' then return fresh == 0 end
+      if type(fresh) ~= type(kept) then return false end
+      if type(fresh) ~= 'table' then return fresh == kept end
+      for k, v in pairs(fresh) do
+        if not columns_lost(v, kept[k], k) then return false end
+      end
+      for k in pairs(kept) do
+        if fresh[k] == nil then return false end
+      end
+      return true
+    end
+    local function handoff()
+      local answer = assert(loadfile(dir .. '/editor_reopen_capture.lua'))(input)
+      if answer and at_leave and columns_lost(vim.json.decode(answer.json), vim.json.decode(at_leave.json)) then
+        answer = at_leave
+      end
+      if not answer then return end
+      local content = vim.json.encode({ same = answer.same, record = vim.json.decode(answer.json) })
+      if #content > 256 * 1024 then return end
+      local bytes = uv.random(4)
+      if not bytes then return end
+      local suffix = (bytes:gsub('.', function(byte) return ('%02x'):format(byte:byte()) end))
+      local temporary = dir .. '/reopen-out-' .. token .. '-' .. suffix .. '.tmp'
+      local fd = uv.fs_open(temporary, 'wx', 384)
+      if not fd then return end
+      local success = pcall(function()
+        assert(uv.fs_fchmod(fd, 384))
+        local offset = 0
+        while offset < #content do
+          local count = assert(uv.fs_write(fd, content:sub(offset + 1), offset))
+          assert(count > 0)
+          offset = offset + count
+        end
+      end)
+      local closed = uv.fs_close(fd)
+      if success and closed and uv.fs_rename(temporary, dir .. '/reopen-out-' .. token .. '.json') then return end
+      uv.fs_unlink(temporary)
+    end
+    -- Captures answer for the token from here on, and nvim's exit leaves its handoff.
+    local function keep()
+      api.nvim_create_autocmd('VimLeavePre', { group = group, callback = function() pcall(handoff) end })
+      api.nvim_create_autocmd('UILeave', { group = group, callback = function()
+        local ok, answer = pcall(function() return assert(loadfile(dir .. '/editor_reopen_capture.lua'))(input) end)
+        at_leave = ok and answer or nil
+      end })
+    end
+    -- A server `:restart` started runs these same `--cmd`s. What it shows is nvim's own restart (its session, or
+    -- none with `!`), and the window has already had its answer for this input, so nothing is opened or said. It
+    -- keeps the window's record from the editor's UI on: by then the nvim before it has exited, and the handoff it
+    -- left would stand for a session that is gone, so it goes. A window that asks for no capture reads none of it.
+    if restarted then
+      local function take_over()
+        pcall(uv.fs_unlink, dir .. '/reopen-out-' .. token .. '.json')
+        package.loaded['eitri.reopen'] = { done = token }
+        keep()
+      end
+      if #api.nvim_list_uis() > 0 then take_over()
+      else api.nvim_create_autocmd('UIEnter', { group = group, once = true, callback = take_over }) end
+      return
+    end
     if vim.fn.argc() > 0 then aside('args'); return end
     local tool = session_tool()
     if tool then aside(tool); return end
@@ -307,50 +378,6 @@ api.nvim_create_autocmd('VimEnter', {
     local phase_buffer = api.nvim_win_get_buf(initial_win)
     local completed = false
     local resize_id
-    -- The window ends nvim by closing its stdin. By VimLeavePre such an nvim has unloaded its buffers, which puts
-    -- every cursor in column 0; the UI leaving comes before that. The answer taken there lends its columns only when
-    -- the exit's own answer has every column 0 and is otherwise the same: a change made after a UI left (another UI
-    -- still attached) is then never lost to it.
-    local at_leave
-    local function columns_lost(fresh, kept, key)
-      if key == 'col' and type(fresh) == 'number' and type(kept) == 'number' then return fresh == 0 end
-      if type(fresh) ~= type(kept) then return false end
-      if type(fresh) ~= 'table' then return fresh == kept end
-      for k, v in pairs(fresh) do
-        if not columns_lost(v, kept[k], k) then return false end
-      end
-      for k in pairs(kept) do
-        if fresh[k] == nil then return false end
-      end
-      return true
-    end
-    local function handoff()
-      local answer = assert(loadfile(dir .. '/editor_reopen_capture.lua'))(input)
-      if answer and at_leave and columns_lost(vim.json.decode(answer.json), vim.json.decode(at_leave.json)) then
-        answer = at_leave
-      end
-      if not answer then return end
-      local content = vim.json.encode({ same = answer.same, record = vim.json.decode(answer.json) })
-      if #content > 256 * 1024 then return end
-      local bytes = uv.random(4)
-      if not bytes then return end
-      local suffix = (bytes:gsub('.', function(byte) return ('%02x'):format(byte:byte()) end))
-      local temporary = dir .. '/reopen-out-' .. token .. '-' .. suffix .. '.tmp'
-      local fd = uv.fs_open(temporary, 'wx', 384)
-      if not fd then return end
-      local success = pcall(function()
-        assert(uv.fs_fchmod(fd, 384))
-        local offset = 0
-        while offset < #content do
-          local count = assert(uv.fs_write(fd, content:sub(offset + 1), offset))
-          assert(count > 0)
-          offset = offset + count
-        end
-      end)
-      local closed = uv.fs_close(fd)
-      if success and closed and uv.fs_rename(temporary, dir .. '/reopen-out-' .. token .. '.json') then return end
-      uv.fs_unlink(temporary)
-    end
     local function notice(kind, name)
       if not name then return end
       local prefix = root:sub(-1) == '/' and root or root .. '/'
@@ -367,11 +394,7 @@ api.nvim_create_autocmd('VimEnter', {
       local success, answer = pcall(function() return assert(loadfile(dir .. '/editor_reopen_capture.lua'))(input) end)
       if not success or not answer then state.done = nil; return end
       state.restored = answer.json
-      api.nvim_create_autocmd('VimLeavePre', { group = group, callback = function() pcall(handoff) end })
-      api.nvim_create_autocmd('UILeave', { group = group, callback = function()
-        local ok, answer = pcall(function() return assert(loadfile(dir .. '/editor_reopen_capture.lua'))(input) end)
-        at_leave = ok and answer or nil
-      end })
+      keep()
       send(('O %s %d %d %d %d %.0f'):format(token, opened, gone, failed, squeezed,
         math.max(1, math.floor((elapsed + uv.hrtime() - started) / 1000))))
       notice('g', first_gone)

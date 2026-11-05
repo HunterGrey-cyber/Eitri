@@ -873,7 +873,7 @@ pub const DETACH_ROOM_WAIT: Duration = Duration::from_secs(1);
 pub const DETACHED_WITHIN: Duration = Duration::from_millis(1_800);
 
 /// What a close has to ask about a person's own nvim before it lets go of it.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct CloseAsks {
     /// nvim is waiting for a key or busy (`nvim_get_mode().blocking`): given back now, the terminal would show a
     /// blank screen until a key, which would answer whatever nvim is asking.
@@ -882,6 +882,9 @@ pub struct CloseAsks {
     pub drafts: usize,
     /// Agent proposals open in the editor; they end with the window.
     pub proposals: usize,
+    /// The terminal the nvim came from is gone, or its way back is: the nvim's address, which the close names so the
+    /// person can reach the nvim again once the window has let go of it.
+    pub no_way_back: Option<String>,
 }
 
 /// Commands sent to the editor service.
@@ -1651,6 +1654,14 @@ pub enum EditorEvent {
     },
     /// A person's own nvim went back to them, or must, for `why`: the window closes without asking about it.
     HandedBack { win: WinId, why: super::close::HandBackWhy },
+    /// The editor followed a `:restart` or `:connect` typed in its nvim instead of ending, and now shows an nvim of
+    /// `kind`: `Owned` for the server a `:restart` started, `Attached` for one a `:connect` reached, which the window
+    /// did not start. `left` is the address of the window's own nvim a `:connect` left running with no window.
+    Followed {
+        win: WinId,
+        kind: super::window::EditorKind,
+        left: Option<String>,
+    },
 }
 
 /// Facts reported by chat services.
