@@ -1,0 +1,74 @@
+{
+  "v": 1,
+  "re": 60,
+  "ok": true,
+  "result": {
+    "at": 1793865600200,
+    "enabled": true,
+    "projects": [
+      {
+        "key": "9b2c4e7a10f3d856",
+        "name": "eitri"
+      }
+    ],
+    "round": {
+      "at": 1793865600100,
+      "current": "k-5c1e0b9a7d3f2e18",
+      "from": {
+        "instance": "a3f09c1d2e4b5f60",
+        "module": "agent",
+        "tab": 7
+      },
+      "started_at": 1793865500000,
+      "visited": []
+    },
+    "rows": [
+      {
+        "agent": "claude",
+        "background": {
+          "agents": 0,
+          "calls": 0,
+          "monitors": 0,
+          "other": 0,
+          "shells": 0
+        },
+        "class": "needs",
+        "ended_how": null,
+        "id": "a3f09c1d2e4b5f60.7",
+        "key": "k-5c1e0b9a7d3f2e18",
+        "label": "close question",
+        "label_from": "title",
+        "mode": "manual",
+        "moving": false,
+        "needs": {
+          "cards": 1,
+          "questions": 0,
+          "trust": false
+        },
+        "number": 3,
+        "project": {
+          "key": "9b2c4e7a10f3d856",
+          "name": "eitri"
+        },
+        "queued": 0,
+        "shown": false,
+        "since": 1793865600123,
+        "state": "card",
+        "tool": "Bash",
+        "unread": false,
+        "waiting_since": 1793865600123,
+        "window": {
+          "focused": true,
+          "instance": "a3f09c1d2e4b5f60",
+          "name": "1"
+        }
+      }
+    ],
+    "selection": {
+      "at": 1793865600100,
+      "by": "a3f09c1d2e4b5f60",
+      "key": "k-5c1e0b9a7d3f2e18"
+    },
+    "v": 1
+  }
+}

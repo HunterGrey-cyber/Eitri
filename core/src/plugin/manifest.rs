@@ -47,10 +47,11 @@ pub enum Capability {
     EditorCwd,
     EditorBuffers,
     TerminalCwd,
+    Agents,
 }
 
 impl Capability {
-    pub const ALL: [Capability; 11] = [
+    pub const ALL: [Capability; 12] = [
         Capability::Tasks,
         Capability::EditorOpen,
         Capability::EditorAssist,
@@ -62,6 +63,7 @@ impl Capability {
         Capability::EditorCwd,
         Capability::EditorBuffers,
         Capability::TerminalCwd,
+        Capability::Agents,
     ];
 
     pub fn as_str(self) -> &'static str {
@@ -77,6 +79,7 @@ impl Capability {
             Capability::EditorCwd => "editor.cwd",
             Capability::EditorBuffers => "editor.buffers",
             Capability::TerminalCwd => "terminal.cwd",
+            Capability::Agents => "agents",
         }
     }
 
@@ -676,6 +679,10 @@ pub fn parse_manifest(text: &str) -> Result<Manifest, String> {
         }
     }
 
+    if capabilities.contains(&Capability::Agents) && capabilities.contains(&Capability::Net) {
+        return fail("capabilities", "agents and net cannot be declared together".into());
+    }
+
     let mut settings = BTreeMap::new();
     for (name, setting) in &raw.settings {
         // `key` and `position` are options `eitri.plugin.load` reads itself, so a setting of either name
@@ -1153,6 +1160,31 @@ work = "${plugin}"
     }
 
     #[test]
+    fn agents_and_net_are_refused_together() {
+        for caps in ["\"agents\", \"net\"", "\"net\", \"agents\""] {
+            let text = format!("id = \"demo\"\ntitle = \"Demo\"\nprotocol = 1\nsite = \"site\"\nentry = \"index.html\"\ncapabilities = [{caps}]\n");
+            assert_eq!(
+                parse_manifest(&text).unwrap_err(),
+                "eitri-plugin.toml: capabilities: agents and net cannot be declared together"
+            );
+        }
+    }
+
+    #[test]
+    fn agents_alone_loads() {
+        let text = "id = \"demo\"\ntitle = \"Demo\"\nprotocol = 1\nsite = \"site\"\nentry = \"index.html\"\ncapabilities = [\"agents\"]\n";
+        let manifest = parse_manifest(text).unwrap();
+        assert_eq!(manifest.capabilities, [Capability::Agents]);
+        assert!(manifest.roots.is_empty());
+    }
+
+    #[test]
+    fn capability_all_has_twelve() {
+        assert_eq!(Capability::ALL.len(), 12);
+        assert_eq!(Capability::ALL.last(), Some(&Capability::Agents));
+    }
+
+    #[test]
     fn window_parses_root_title_focus_and_layout() {
         let m = parse_manifest(&window_manifest(
             r#"title = "Study"
@@ -1454,7 +1486,7 @@ layout = { row = [ { module = "page", share = 0.42 }, { column = [ { module = "e
                 focus: false
             })
         );
-        assert_eq!(Capability::ALL.len(), 11);
+        assert_eq!(Capability::ALL.len(), 12);
         assert_eq!(Capability::parse("editor.follow"), Some(Capability::EditorFollow));
         assert_eq!(Capability::parse("editor.commands"), Some(Capability::EditorCommands));
         assert_eq!(

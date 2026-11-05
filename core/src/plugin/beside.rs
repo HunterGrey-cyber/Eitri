@@ -68,6 +68,16 @@ entry = "index.html"
     }
 
     #[test]
+    fn agents_is_refused_beside() {
+        let mut m = manifest();
+        m.capabilities = vec![Capability::Agents];
+        assert_eq!(
+            check(&m),
+            Err("notes needs Eitri's own window (it declares agents)".into())
+        );
+    }
+
+    #[test]
     fn check_admits_exactly_the_five_and_names_the_first_out() {
         assert_eq!(
             BESIDE_CAPABILITIES,

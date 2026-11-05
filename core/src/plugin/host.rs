@@ -2061,6 +2061,12 @@ impl PluginHost {
             Verb::PageSaved(args) => Some(self.page_saved(re, args, now)),
             Verb::PageReady(_) => Some(self.page_ready(re)),
             Verb::TerminalAt(args) => self.terminal_at(re, &args.dir, now),
+            Verb::AgentsWatch(_) => Some(Reply::err(re, ErrorCode::Disabled, "agents are disabled")),
+            Verb::AgentsFocus(_) => Some(Reply::err(re, ErrorCode::Disabled, "agents are disabled")),
+            Verb::AgentsNew(_) => Some(Reply::err(re, ErrorCode::Disabled, "agents are disabled")),
+            Verb::AgentsSelect(_) => Some(Reply::err(re, ErrorCode::Disabled, "agents are disabled")),
+            Verb::AgentsRound(_) => Some(Reply::err(re, ErrorCode::Disabled, "agents are disabled")),
+            Verb::AgentsStop(_) => Some(Reply::err(re, ErrorCode::Disabled, "agents are disabled")),
         }
     }
 
@@ -3431,6 +3437,37 @@ mod tests {
         }
         fn glue(&self) -> Option<crate::editor_rpc::Glue> {
             self.glue.clone()
+        }
+    }
+
+    #[test]
+    fn agents_verbs_answer_disabled_until_served() {
+        let r = rig(vec![]);
+        let mut plugin = (*r.host.plugin).clone();
+        plugin.manifest.capabilities = vec![Capability::Agents];
+        let host = PluginHost::new(Rc::new(plugin), r.page.clone(), Arc::new(|| {}), None, vec![]);
+        for (index, (verb, args)) in [
+            ("agents.watch", json!({})),
+            ("agents.focus", json!({"id": "a.1", "card_first": true})),
+            ("agents.new", json!({"project": "9b2c4e7a10f3d856"})),
+            ("agents.select", json!({"key": "k-5c1e0b9a7d3f2e18"})),
+            ("agents.round", json!({"op": "start"})),
+            ("agents.stop", json!({"id": "a.1"})),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let id = index as u64 + 1;
+            let raw = json!({"v": 1, "id": id, "verb": verb, "args": args}).to_string();
+            r.host.page_message(&raw, Instant::now());
+            let replies = r.page.take();
+            assert_eq!(replies.len(), 1);
+            assert_eq!(replies[0]["error"]["code"], "not_declared");
+            host.page_message(&raw, Instant::now());
+            let replies = r.page.take();
+            assert_eq!(replies.len(), 1);
+            assert_eq!(replies[0]["re"], id);
+            assert_eq!(replies[0]["error"]["code"], "disabled");
         }
     }
 

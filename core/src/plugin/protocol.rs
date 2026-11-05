@@ -33,6 +33,11 @@ pub enum ErrorCode {
     Io,
     /// A verb that reshapes the window was asked by a page outside the plugin's own window.
     NotOwnWindow,
+    Disabled,
+    Gone,
+    NoWindow,
+    NoGesture,
+    Refused,
 }
 
 /// `{}`, and nothing else.
@@ -358,6 +363,48 @@ impl EditorOpenLink {
     }
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct AgentsFocus {
+    pub id: String,
+    #[serde(default)]
+    pub card_first: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct AgentsNew {
+    pub project: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct AgentsSelect {
+    pub key: String,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum RoundOp {
+    Start,
+    Next,
+    Leave,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct AgentsRound {
+    pub op: RoundOp,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub key: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct AgentsStop {
+    pub id: String,
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "verb", content = "args")]
 pub enum Verb {
@@ -409,6 +456,18 @@ pub enum Verb {
     PageReady(NoArgs),
     #[serde(rename = "terminal.at")]
     TerminalAt(TerminalAt),
+    #[serde(rename = "agents.watch")]
+    AgentsWatch(NoArgs),
+    #[serde(rename = "agents.focus")]
+    AgentsFocus(AgentsFocus),
+    #[serde(rename = "agents.new")]
+    AgentsNew(AgentsNew),
+    #[serde(rename = "agents.select")]
+    AgentsSelect(AgentsSelect),
+    #[serde(rename = "agents.round")]
+    AgentsRound(AgentsRound),
+    #[serde(rename = "agents.stop")]
+    AgentsStop(AgentsStop),
 }
 
 impl Verb {
@@ -430,6 +489,12 @@ impl Verb {
             Verb::EditorAssist(_) | Verb::EditorAssistClear(_) => Some(Capability::EditorAssist),
             Verb::LayoutFocus(_) => Some(Capability::LayoutFocus),
             Verb::TerminalAt(_) => Some(Capability::TerminalCwd),
+            Verb::AgentsWatch(_)
+            | Verb::AgentsFocus(_)
+            | Verb::AgentsNew(_)
+            | Verb::AgentsSelect(_)
+            | Verb::AgentsRound(_)
+            | Verb::AgentsStop(_) => Some(Capability::Agents),
             Verb::StateRead(_) | Verb::StateWrite(_) | Verb::LogAppend(_) | Verb::LogRead(_) => Some(Capability::State),
         }
     }
@@ -460,6 +525,12 @@ impl Verb {
             Verb::PageSaved(_) => "page.saved",
             Verb::PageReady(_) => "page.ready",
             Verb::TerminalAt(_) => "terminal.at",
+            Verb::AgentsWatch(_) => "agents.watch",
+            Verb::AgentsFocus(_) => "agents.focus",
+            Verb::AgentsNew(_) => "agents.new",
+            Verb::AgentsSelect(_) => "agents.select",
+            Verb::AgentsRound(_) => "agents.round",
+            Verb::AgentsStop(_) => "agents.stop",
         }
     }
 }
@@ -689,6 +760,11 @@ pub const EVENT_EDITOR_TEXT: &str = "editor.text";
 pub const EVENT_EDITOR_CLOSED: &str = "editor.closed";
 /// The host asks a page that hands its state over for that state; its data is `{}`.
 pub const EVENT_HOST_SAVE: &str = "host.save";
+pub const EVENT_AGENTS_ROW: &str = "agents.row";
+pub const EVENT_AGENTS_GONE: &str = "agents.gone";
+pub const EVENT_AGENTS_RESET: &str = "agents.reset";
+pub const EVENT_AGENTS_SELECTION: &str = "agents.selection";
+pub const EVENT_AGENTS_ROUND: &str = "agents.round";
 
 /// nvim's cursor in the followed window: `line` 1-based, `col` nvim's 0-based byte column.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -835,6 +911,113 @@ mod tests {
         v
     }
 
+    const AGENTS_REQUESTS: &[&str] = &[
+        "watch",
+        "focus",
+        "new",
+        "select",
+        "round-start",
+        "round-next",
+        "round-leave",
+        "stop",
+    ];
+
+    #[test]
+    fn agents_verbs_need_the_agents_capability() {
+        for name in AGENTS_REQUESTS {
+            let text = fixture_text(&format!("req-agents-{name}.json"));
+            let Inbound::Request(request) = parse_request(&text) else {
+                panic!("{name} must parse")
+            };
+            assert_eq!(request.verb.capability(), Some(Capability::Agents));
+            let mut extra = request.to_value();
+            extra["args"]["extra"] = Value::Bool(true);
+            assert!(matches!(
+                parse_request(&extra.to_string()),
+                Inbound::Refused {
+                    code: ErrorCode::BadRequest,
+                    ..
+                }
+            ));
+        }
+        let Inbound::Request(request) = parse_request(r#"{"v":1,"id":1,"verb":"agents.focus","args":{"id":"a.1"}}"#)
+        else {
+            panic!("card_first is optional")
+        };
+        assert_eq!(
+            request.verb,
+            Verb::AgentsFocus(AgentsFocus {
+                id: "a.1".into(),
+                card_first: false
+            })
+        );
+        assert!(matches!(
+            parse_request(r#"{"v":1,"id":1,"verb":"agents.round","args":{"op":"other"}}"#),
+            Inbound::Refused {
+                code: ErrorCode::BadRequest,
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn agents_fixtures_parse_and_round_trip() {
+        for name in AGENTS_REQUESTS {
+            let text = fixture_text(&format!("req-agents-{name}.json"));
+            let Inbound::Request(request) = parse_request(&text) else {
+                panic!("{name} must parse")
+            };
+            assert_eq!(
+                format!("{}\n", serde_json::to_string_pretty(&request.to_value()).unwrap()),
+                text
+            );
+            assert_eq!(request.verb.name(), request.to_value()["verb"].as_str().unwrap());
+        }
+        let text = fixture_text("rep-agents-watch.json");
+        let reply: Reply = serde_json::from_str(&text).unwrap();
+        assert_eq!(format!("{}\n", serde_json::to_string_pretty(&reply).unwrap()), text);
+        for (name, event) in [
+            ("row", EVENT_AGENTS_ROW),
+            ("gone", EVENT_AGENTS_GONE),
+            ("reset", EVENT_AGENTS_RESET),
+            ("selection", EVENT_AGENTS_SELECTION),
+            ("round", EVENT_AGENTS_ROUND),
+        ] {
+            let text = fixture_text(&format!("ev-agents-{name}.json"));
+            let parsed: HostEvent = serde_json::from_str(&text).unwrap();
+            assert_eq!(parsed.event, event);
+            assert_eq!(format!("{}\n", serde_json::to_string_pretty(&parsed).unwrap()), text);
+        }
+        for (code, name) in [
+            (ErrorCode::Disabled, "disabled"),
+            (ErrorCode::Gone, "gone"),
+            (ErrorCode::NoWindow, "no_window"),
+            (ErrorCode::NoGesture, "no_gesture"),
+            (ErrorCode::Refused, "refused"),
+        ] {
+            assert_eq!(serde_json::to_value(code).unwrap(), name);
+        }
+    }
+
+    #[test]
+    fn verb_and_event_counts() {
+        let mut verbs = std::collections::BTreeSet::new();
+        let mut events = std::collections::BTreeSet::new();
+        for (name, text) in fixtures() {
+            if name.starts_with("req-") {
+                let Inbound::Request(request) = parse_request(&text) else {
+                    panic!("{name} must parse")
+                };
+                verbs.insert(request.verb.name());
+            } else if name.starts_with("ev-") {
+                let event: HostEvent = serde_json::from_str(&text).unwrap();
+                events.insert(event.event);
+            }
+        }
+        assert_eq!(verbs.len(), 30);
+        assert_eq!(events.len(), 14);
+    }
+
     #[test]
     fn every_request_fixture_parses_and_writes_back_the_same() {
         for (name, text) in fixtures().into_iter().filter(|(n, _)| n.starts_with("req-")) {
@@ -895,6 +1078,27 @@ mod tests {
                     serde_json::to_value(serde_json::from_value::<EditorClosed>(event.data.clone()).unwrap())
                 }
                 "host.save" => serde_json::to_value(serde_json::from_value::<NoArgs>(event.data.clone()).unwrap()),
+                EVENT_AGENTS_ROW => {
+                    serde_json::to_value(serde_json::from_value::<crate::agents::Row>(event.data.clone()).unwrap())
+                }
+                EVENT_AGENTS_SELECTION => serde_json::to_value(
+                    serde_json::from_value::<Option<crate::agents::row::Selection>>(event.data.clone()).unwrap(),
+                ),
+                EVENT_AGENTS_ROUND => serde_json::to_value(
+                    serde_json::from_value::<Option<crate::agents::row::Round>>(event.data.clone()).unwrap(),
+                ),
+                EVENT_AGENTS_RESET => {
+                    let view: crate::agents::View = serde_json::from_value(event.data.clone()).unwrap();
+                    serde_json::from_str::<Value>(&crate::agents::wire::view_json(&view, crate::agents::SCHEMA_V))
+                }
+                EVENT_AGENTS_GONE => {
+                    let mut data = event.data.clone();
+                    data["type"] = Value::String("gone".into());
+                    let change: crate::agents::Change = serde_json::from_value(data).unwrap();
+                    let mut data = serde_json::to_value(change).unwrap();
+                    data.as_object_mut().unwrap().remove("type");
+                    Ok(data)
+                }
                 other => panic!("{name}: unknown event {other}"),
             }
             .unwrap();
