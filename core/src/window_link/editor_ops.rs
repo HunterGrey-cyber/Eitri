@@ -2082,7 +2082,7 @@ mod tests {
         assert!(shown.is_some());
         let calls = rpc.calls();
         assert_eq!(calls.len(), 1);
-        assert!(std::ptr::eq(calls[0].0, LIVE_SHOWN_LUA));
+        assert_eq!(calls[0].0, LIVE_SHOWN_LUA, "the note asks with the live-shown script");
         assert_eq!(calls[0].1, live_shown_args(&note.paths));
 
         // The live draw and clear are a review's: the session, then the path, as a show's are.
@@ -2145,7 +2145,7 @@ mod tests {
         assert_eq!(note.ended_ns, None);
         let calls = rpc.calls();
         assert_eq!(calls.len(), 1);
-        assert!(std::ptr::eq(calls[0].0, LIVE_SHOWN_LUA));
+        assert_eq!(calls[0].0, LIVE_SHOWN_LUA, "the note asks with the live-shown script");
         assert_eq!(calls[0].1, live_shown_args(&[f.ctx.root.join("src/a.rs")]));
 
         // A running turn's note with no path has nothing to ask.

@@ -274,6 +274,8 @@ struct ChildOut<'a> {
     #[serde(skip_serializing_if = "Option::is_none")]
     fixed_px: Option<i32>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    fixed_w_px: Option<i32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pin: Option<PinOut>,
     node: NodeOut<'a>,
 }
@@ -314,6 +316,7 @@ impl<'a> NodeOut<'a> {
                 .map(|ch| ChildOut {
                     share: ch.share,
                     fixed_px: ch.fixed_px,
+                    fixed_w_px: ch.fixed_w_px,
                     pin: ch.pin.map(|pin| PinOut { px: pin.px }),
                     node: NodeOut::of(&ch.node),
                 })
@@ -484,7 +487,13 @@ fn read_node(value: &Value, ws: &str, notes: &mut Vec<String>, copy: &mut bool) 
                 let Value::Object(child) = item else {
                     return Err("a container's child that is not an object".to_string());
                 };
-                not_kept(child, &["share", "fixed_px", "pin", "node"], ws, notes, copy);
+                not_kept(
+                    child,
+                    &["share", "fixed_px", "fixed_w_px", "pin", "node"],
+                    ws,
+                    notes,
+                    copy,
+                );
                 let Some(share) = child.get("share").and_then(Value::as_f64) else {
                     return Err("a container's child without a `share`".to_string());
                 };
@@ -515,6 +524,15 @@ fn read_node(value: &Value, ws: &str, notes: &mut Vec<String>, copy: &mut bool) 
                             .and_then(|px| i32::try_from(px).ok())
                             .filter(|px| super::con::FIXED_HEIGHT_PX.contains(px))
                             .ok_or_else(|| "a fixed height must be a whole number of pixels in 16..=200".to_string())?,
+                    ),
+                };
+                out.fixed_w_px = match child.get("fixed_w_px") {
+                    None | Some(Value::Null) => None,
+                    Some(px) => Some(
+                        px.as_i64()
+                            .and_then(|px| i32::try_from(px).ok())
+                            .filter(|px| super::con::FIXED_WIDTH_PX.contains(px))
+                            .ok_or_else(|| "a fixed width must be a whole number of pixels in 16..=400".to_string())?,
                     ),
                 };
                 out.pin = pin;
@@ -1529,6 +1547,64 @@ mod tests {
             assert_eq!(arrangement.modules.iter().find(|(m, _)| m == &strip).unwrap().1.h, 24);
         }
         assert!(!one(&plain()).contains("fixed_px"));
+    }
+
+    #[test]
+    fn a_fixed_width_round_trips_and_a_bad_one_is_refused() {
+        use super::super::rules::{apply_launch_rule, OpenRule, RuleSize, NOMINAL_GRID};
+        let rail = ModuleId::lua("rail");
+        let mut layout = super::super::fixture::fixture("row(lua:rail, editor focus, agent, terminal hidden)");
+        apply_launch_rule(
+            &mut layout,
+            &rail,
+            &OpenRule {
+                size: Some(RuleSize::Pixels(62)),
+                ..OpenRule::default()
+            },
+            NOMINAL_GRID,
+        )
+        .unwrap();
+        let decls = [ModuleDecl {
+            id: rail.clone(),
+            placement: Placement::LeftOfRoot,
+        }];
+        let text = one(&layout);
+        assert!(text.contains("\"fixed_w_px\": 62"), "{text}");
+        assert!(!text.contains("\"fixed_px\""), "{text}");
+        let back = decode_v2(&text, &root(), &decls).unwrap();
+        assert!(back.notes.is_empty(), "{:?}", back.notes);
+        assert_eq!(back.current.root(), layout.root());
+        for w in [800, 1920] {
+            let arrangement = arrange(&back.current, &Frame::new(Size { w, h: 900 }, 1));
+            assert_eq!(arrangement.modules.iter().find(|(m, _)| m == &rail).unwrap().1.w, 62);
+        }
+        assert!(!one(&plain()).contains("fixed_w_px"));
+        // A width out of range, or not a whole number, makes the file's only workspace unusable, so the file is
+        // refused whole with the reason (the window then starts from its default and sets the file aside).
+        for bad in ["401", "15", "62.5", "\"62px\""] {
+            let broken = text.replacen("\"fixed_w_px\": 62", &format!("\"fixed_w_px\": {bad}"), 1);
+            let err = decode_v2(&broken, &root(), &decls)
+                .err()
+                .unwrap_or_else(|| panic!("{bad}: read"));
+            assert!(
+                err.contains("a fixed width must be a whole number of pixels in 16..=400"),
+                "{bad}: {err}"
+            );
+        }
+        // A width on a column's child is read and kept; the column draws it by its share.
+        let mut column = super::super::fixture::fixture("column(lua:rail, editor focus, agent, terminal hidden)");
+        let mut root_node = column.root_node();
+        if let Node::Con(c) = &mut root_node {
+            c.children[0].fixed_w_px = Some(62);
+        }
+        column.replace_root(root_node);
+        let text = one(&column);
+        let back = decode_v2(&text, &root(), &decls).unwrap();
+        assert!(back.notes.is_empty(), "{:?}", back.notes);
+        let arrangement = arrange(&back.current, &Frame::new(Size { w: 1000, h: 900 }, 1));
+        let r = arrangement.modules.iter().find(|(m, _)| m == &rail).unwrap().1;
+        assert_eq!(r.w, 1000);
+        assert!(r.h > 200, "{r:?}");
     }
 
     #[test]

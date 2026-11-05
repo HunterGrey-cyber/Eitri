@@ -1080,14 +1080,14 @@ fn the_guide_example_plugin_loads_and_counts_waiting() {
     };
     assert_eq!(
         named("eitriPlugin.call(\""),
-        ["agents.focus", "host.hello", "agents.watch"]
+        ["agents.round", "host.hello", "agents.watch"]
     );
     assert_eq!(
         named("eitriPlugin.on(\""),
         [EVENT_AGENTS_ROW, EVENT_AGENTS_GONE, EVENT_AGENTS_RESET]
     );
-    // Served: hello, the watch's view (whose class `needs` rows the page counts), and the click's focus on the
-    // oldest wait with its card first.
+    // Served: hello, the watch's view (whose class `needs` rows the page counts), and the click's round started at
+    // the oldest wait, which focuses it with its card first.
     let page = Rc::new(Page::default());
     let host = PluginHost::new(plugin, page.clone(), Arc::new(|| {}), None, vec![]);
     let (feed, log) = feed();
@@ -1121,9 +1121,24 @@ fn the_guide_example_plugin_loads_and_counts_waiting() {
         .unwrap();
     let at = Instant::now();
     r.clock.record(at);
-    let reply = r.answer_at(at, 4, "agents.focus", json!({"id": oldest["id"], "card_first": true}));
+    let reply = r.answer_at(at, 4, "agents.round", json!({"op": "start", "key": oldest["key"]}));
     assert_eq!(reply["ok"], true, "{reply}");
-    assert_eq!(r.port.take(), [format!("focus {B} Some(3) card_first=true Show")]);
+    assert_eq!(
+        r.port.take(),
+        [
+            "round Some(Some(\"k-000000000000000c\"))".to_owned(),
+            format!("focus {B} Some(3) card_first=true Show"),
+        ]
+    );
+    // The fixture is the guide's example, word for word.
+    let guide = std::fs::read_to_string(
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../publish/files/docs/guide/many-agents.md"),
+    )
+    .unwrap();
+    assert!(
+        guide.contains(script.trim_end()),
+        "the guide's main.js and the fixture differ"
+    );
 }
 
 #[test]

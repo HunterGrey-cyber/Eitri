@@ -8,7 +8,7 @@ capabilities = ["agents", "state", "layout.focus"]  # state: the rows marked wit
 [module]
 start = "shown"
 at = "left"
-size = 0.16                         # a sidebar; with `narrow` set, give it a rail's width in the layout instead
+size = 0.2                          # a sidebar (a fifth of the window); `narrow` wants a 62 px rule of its own
 focus = false
 
 [settings.narrow]                   # the 62 px rail: glyph, what waits, and the tab

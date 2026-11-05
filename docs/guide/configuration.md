@@ -397,9 +397,10 @@ eitri.layout.rule("terminal#3", { scratchpad = true, focus = false })  -- termin
   window), `main` (in the editor's place, hiding the editor), `below-editor` (a row below the editor's column, a
   terminal's default place), `right`, `below`, `left`, `above` (beside the module that has the keys, taking half of its space) and `tab` (as a tab of the
   container the module with the keys is in, which is made tabbed with the two of them if it is split). `size` is the
-  share of its container when the module is tiled (a number above 0 and below 1) and `{ w, h }` or `{ w = ..., h = ... }`,
-  fractions of the window above 0 and at most 1, when it floats; a float with no size opens centred at 60% of the
-  window on each axis.
+  share of its container when the module is tiled (a number above 0 and below 1), or a length in pixels, `"<n>px"`,
+  that stays the same however big the window is: a height from 16 to 200 for a module `above` or `below`, a width from
+  16 to 400 for one `left` or `right`. It is `{ w, h }` or `{ w = ..., h = ... }`, fractions of the window above 0 and
+  at most 1, when the module floats; a float with no size opens centred at 60% of the window on each axis.
 - **What is refused,** listed at startup with a message that names the call, the rule not applied: an option that is not one of those, a value of the wrong type or out of range, a
   tiled size given as a table or a floating one as a number, `float` or `scratchpad` together with `at`, a
   floating editor (the editor never floats; any other rule for it is accepted and never applies, since nothing opens
@@ -408,8 +409,9 @@ eitri.layout.rule("terminal#3", { scratchpad = true, focus = false })  -- termin
   then the built-in default of where it opens: a new terminal or chat view, and a tab broken out, go to the right of the module
   that has the keys (the base view, for a broken-out tab); a module the window places at a launch or brings back
   after a close goes where it always did (the terminal below the editor, a Lua panel at its `position`). With no module
-  holding the keys (a first launch, a layout file read at startup) `right`, `left` and `tab` become `side`, and
-  `below` and `above` become `bottom`, with a note in the log for a rule that asked for them.
+  holding the keys (a first launch, a layout file read at startup) `right` and `tab` become `side`, `left` becomes a
+  new column at the left of the whole window, and `below` and `above` become `bottom`, with a note in the log for a
+  rule that asked for them.
 - **What a rule never decides.** Anything that says where itself always wins: a split key, a move, a drag,
   `eitri.layout.float`. A saved layout is never changed by a rule, and a layout from `eitri.layout.default` or
   `eitri.layout.workspace` places the modules it names (in a [plugin's own window](#plugins), the plugin's own

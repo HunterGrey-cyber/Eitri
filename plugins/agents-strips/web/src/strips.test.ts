@@ -39,7 +39,16 @@ afterEach(() => {
   document.body.replaceChildren();
 });
 
-async function open(rows: unknown[], opts: { enabled?: boolean; settings?: Record<string, unknown>; store?: { value: unknown } } = {}) {
+type OpenOpts = {
+  enabled?: boolean;
+  settings?: Record<string, unknown>;
+  store?: { value: unknown };
+  /** A `state.write` that fails, with this error. */
+  writeFails?: () => Error | undefined;
+  marksEvery?: number;
+};
+
+async function open(rows: unknown[], opts: OpenOpts = {}) {
   // The plugin store, shared by every window's sidebar: a test may write it as another window would.
   const store = opts.store ?? { value: null };
   vi.resetModules();
@@ -58,6 +67,8 @@ async function open(rows: unknown[], opts: { enabled?: boolean; settings?: Recor
     if (verb === "agents.watch") return view(rows);
     if (verb === "state.read") return { value: store.value };
     if (verb === "state.write") {
+      const failure = opts.writeFails?.();
+      if (failure) throw failure;
       store.value = (_args as { value: unknown }).value;
       return {};
     }
@@ -80,7 +91,7 @@ async function open(rows: unknown[], opts: { enabled?: boolean; settings?: Recor
   });
   await import("../../../../plugin-kit/agents/src/index");
   const { boot } = await import("./app");
-  const page = await boot(document, window, { now: () => NOW, tick: false });
+  const page = await boot(document, window, { now: () => NOW, tick: false, marksEvery: opts.marksEvery });
   stop = page.stop;
   const root = document.getElementById("strips")!;
   const emit = (event: string, data: unknown) => listeners.get(event)?.forEach(fn => fn(data));
@@ -224,6 +235,106 @@ it("a_full_mark_list_drops_its_oldest_stored_mark", async () => {
   await vi.waitFor(() => expect(store.value).toEqual([...old.slice(1), "k-b"]));
 });
 
+it("marks_another_window_writes_show_without_a_write_here", async () => {
+  vi.useFakeTimers({ toFake: ["setInterval", "clearInterval"] });
+  try {
+    const store: { value: unknown } = { value: null };
+    const page = await open([row("k-a"), row("k-b")], { store, marksEvery: 2_000 });
+    expect(page.at("k-a").classList.contains("marked")).toBe(false);
+    // Another window's sidebar marks k-a; this page writes nothing.
+    store.value = ["k-a"];
+    vi.advanceTimersByTime(2_000);
+    await vi.waitFor(() => expect(page.at("k-a").classList.contains("marked")).toBe(true));
+    expect(page.at("k-b").classList.contains("marked")).toBe(false);
+    // And when the page comes back on screen, at once.
+    store.value = ["k-b"];
+    document.dispatchEvent(new Event("visibilitychange"));
+    await vi.waitFor(() => expect(page.at("k-b").classList.contains("marked")).toBe(true));
+    expect(page.at("k-a").classList.contains("marked")).toBe(false);
+  } finally {
+    vi.useRealTimers();
+  }
+});
+
+it("a_read_older_than_a_mark_made_here_is_dropped", async () => {
+  const store: { value: unknown } = { value: [] };
+  const page = await open([row("k-a"), row("k-b")], { store });
+  let release!: () => void;
+  const held = new Promise<void>(resolve => { release = resolve; });
+  const call = page.call.getMockImplementation()!;
+  // The refresh's read is held; meanwhile `m` marks k-b here and its write lands.
+  page.call.mockImplementationOnce(async (verb: string, args?: unknown) => {
+    await held;
+    return call(verb, args);
+  });
+  document.dispatchEvent(new Event("visibilitychange"));
+  page.emit("agents.selection", { key: "k-b", at: NOW, by: WINDOW.instance });
+  page.keys().run(markRow(page).action, new KeyboardEvent("keydown"));
+  await vi.waitFor(() => expect(store.value).toEqual(["k-b"]));
+  // The held read now answers what it would have read before: the page keeps the mark made here.
+  store.value = [];
+  release();
+  await new Promise(resolve => setTimeout(resolve, 20));
+  expect(page.at("k-b").classList.contains("marked")).toBe(true);
+});
+
+it("a_failed_mark_write_takes_the_toggle_back", async () => {
+  const store: { value: unknown } = { value: [] };
+  let fail = true;
+  const page = await open([row("k-a"), row("k-b")], {
+    store, writeFails: () => fail ? Object.assign(new Error("the plugin's store did not answer"), { code: "io" }) : undefined,
+  });
+  page.emit("agents.selection", { key: "k-b", at: NOW, by: WINDOW.instance });
+  page.keys().run(markRow(page).action, new KeyboardEvent("keydown"));
+  // Shown at once, before the store answers.
+  expect(page.at("k-b").classList.contains("marked")).toBe(true);
+  await vi.waitFor(() => expect(page.at("k-b").classList.contains("marked")).toBe(false));
+  expect(store.value).toEqual([]);
+  expect((window as unknown as { eitriKeys: { message: ReturnType<typeof vi.fn> } }).eitriKeys.message)
+    .toHaveBeenCalledWith("the plugin's store did not answer");
+  // An unmark that fails puts the mark back.
+  fail = false;
+  page.keys().run(markRow(page).action, new KeyboardEvent("keydown"));
+  await vi.waitFor(() => expect(store.value).toEqual(["k-b"]));
+  fail = true;
+  page.keys().run(markRow(page).action, new KeyboardEvent("keydown"));
+  expect(page.at("k-b").classList.contains("marked")).toBe(false);
+  await vi.waitFor(() => expect(page.at("k-b").classList.contains("marked")).toBe(true));
+  expect(store.value).toEqual(["k-b"]);
+});
+
+it("two_marks_whose_writes_both_fail_leave_nothing_marked", async () => {
+  const store: { value: unknown } = { value: [] };
+  const page = await open([row("k-a"), row("k-b")], {
+    store, writeFails: () => Object.assign(new Error("the plugin's store did not answer"), { code: "io" }),
+  });
+  // `m` on A, then `m` on B before A's write has failed: both show at once.
+  page.emit("agents.selection", { key: "k-a", at: NOW, by: WINDOW.instance });
+  page.keys().run(markRow(page).action, new KeyboardEvent("keydown"));
+  page.emit("agents.selection", { key: "k-b", at: NOW, by: WINDOW.instance });
+  page.keys().run(markRow(page).action, new KeyboardEvent("keydown"));
+  expect(page.at("k-a").classList.contains("marked")).toBe(true);
+  expect(page.at("k-b").classList.contains("marked")).toBe(true);
+  // Neither was stored: neither stays marked, and the store is as it was.
+  await vi.waitFor(() => expect(page.root.querySelectorAll(".row.marked")).toHaveLength(0));
+  expect(store.value).toEqual([]);
+});
+
+it("a_failed_write_keeps_a_later_mark_that_was_stored", async () => {
+  const store: { value: unknown } = { value: [] };
+  let writes = 0;
+  const page = await open([row("k-a"), row("k-b")], {
+    store, writeFails: () => (writes++ === 0 ? Object.assign(new Error("busy"), { code: "busy" }) : undefined),
+  });
+  page.emit("agents.selection", { key: "k-a", at: NOW, by: WINDOW.instance });
+  page.keys().run(markRow(page).action, new KeyboardEvent("keydown"));
+  page.emit("agents.selection", { key: "k-b", at: NOW, by: WINDOW.instance });
+  page.keys().run(markRow(page).action, new KeyboardEvent("keydown"));
+  await vi.waitFor(() => expect(store.value).toEqual(["k-b"]));
+  await vi.waitFor(() => expect(page.at("k-a").classList.contains("marked")).toBe(false));
+  expect(page.at("k-b").classList.contains("marked")).toBe(true);
+});
+
 const mouse = (type: string, el: Element, detail = 1, button = 0) =>
   el.dispatchEvent(new MouseEvent(type, { bubbles: true, cancelable: true, button, detail }));
 
@@ -253,6 +364,31 @@ it("a_click_selects_though_a_redraw_replaces_the_row_mid_click", async () => {
   expect(page.call).not.toHaveBeenCalledWith("agents.select", expect.anything());
   // A click with no press behind it (assistive technology) still selects.
   mouse("click", page.at("k-b"), 0);
+  expect(page.call).toHaveBeenCalledWith("agents.select", { key: "k-b" });
+});
+
+it("a_press_released_outside_the_sidebar_is_forgotten", async () => {
+  const page = await open([row("k-a"), row("k-b")]);
+  const outside = document.createElement("div");
+  document.body.append(outside);
+  // Pressed on a row, released outside the sidebar: no click. A later release on that row with no press of its own
+  // (a drag that came in from outside) selects nothing either.
+  mouse("mousedown", page.at("k-a"));
+  mouse("mouseup", outside);
+  mouse("mouseup", page.at("k-a"));
+  expect(page.call).not.toHaveBeenCalledWith("agents.select", expect.anything());
+  // The same after a cancelled pointer, and after the pointer left the sidebar with no button held.
+  mouse("mousedown", page.at("k-a"));
+  document.dispatchEvent(new Event("pointercancel"));
+  mouse("mouseup", page.at("k-a"));
+  mouse("mousedown", page.at("k-b"));
+  page.root.dispatchEvent(new MouseEvent("mouseleave", { buttons: 0 }));
+  mouse("mouseup", page.at("k-b"));
+  expect(page.call).not.toHaveBeenCalledWith("agents.select", expect.anything());
+  // A drag out and back with the button held keeps the press: its release on the row is a click.
+  mouse("mousedown", page.at("k-b"));
+  page.root.dispatchEvent(new MouseEvent("mouseleave", { buttons: 1 }));
+  mouse("mouseup", page.at("k-b"));
   expect(page.call).toHaveBeenCalledWith("agents.select", { key: "k-b" });
 });
 
@@ -315,9 +451,37 @@ it("a_window_and_tab_number_is_given_its_width", async () => {
   expect(page.at("k-b").querySelector(".num")!.textContent).toBe("工作·2");
   expect(page.at("k-b").querySelector<HTMLElement>(".num")!.title).toBe("工作·2");
   // Two cells for each wide character, one for the rest: the widest number in the list sets the column.
-  expect(page.root.querySelector<HTMLElement>(".list")!.style.getPropertyValue("--num-w")).toBe("6ch");
+  expect(page.root.querySelector<HTMLElement>(".list")!.style.getPropertyValue("--num-w")).toBe("6.4ch");
   const grid = RULES.find(r => r.selector === ".row")!.body;
   expect(grid).toMatch(/grid-template-columns:\s*1\.4ch var\(--num-w, 2\.6ch\)/);
+});
+
+it("the_label_keeps_its_room_as_the_column_narrows", async () => {
+  const page = await open([row("k-a", { label: "close question", tool: "Bash", state: "running", class: "working" })]);
+  // Every row names itself whole on hover, wide or narrow, since a narrow column cuts it.
+  expect(page.at("k-a").title).toBe("eitri 1·" + page.at("k-a").querySelector(".num")!.textContent + " close question: running");
+  const sheet = SHEET;
+  expect(RULES.find(r => r.selector === "#strips")!.body).toMatch(/container-type: inline-size;/);
+  const blocks = [...sheet.matchAll(/@container \(max-width: (\d+)ch\) \{([\s\S]*?\})\s*\}/g)];
+  const at = (n: number) => blocks.find(b => Number(b[1]) === n)?.[2] ?? "";
+  // The tool word goes first, then the age; the label's column (the one fraction) stays in every template.
+  expect(at(36)).toMatch(/\.row \.what \{ display: none; \}/);
+  expect(at(24)).toMatch(/\.row \.what, \.row \.age \{ display: none; \}/);
+  // The head keeps to one line: the count without the title, cut rather than wrapped.
+  expect(at(24)).toMatch(/\.head \.title \{ display: none; \}/);
+  expect(RULES.find(r => r.selector === ".head .sum")!.body).toMatch(/text-overflow: ellipsis;/);
+  for (const n of [36, 24]) {
+    const template = at(n).match(/grid-template-columns: ([^;]+);/)![1];
+    expect(template).toContain("minmax(0, 1fr)");
+    // One track per span still drawn: stop, number, label, glyph, (age,) edge.
+    expect(template.split(/ (?![^(]*\))/)).toHaveLength(n === 36 ? 6 : 5);
+  }
+  // The narrow rail keeps its own template, more specific than the width rules, and at 62 px (about five and a half
+  // cells) the count keeps two cells: glyph 1.4, count at least 2, a one-em tab, gaps and padding under one cell.
+  const rail = RULES.find(r => r.selector === ".strips.narrow .row")!.body;
+  expect(rail).toMatch(/grid-template-columns: 1\.4ch minmax\(2ch, 1fr\) 1em;/);
+  expect(rail).toMatch(/column-gap: 0\.2ch;/);
+  expect(rail).toMatch(/padding-left: 0\.3ch;/);
 });
 
 it("one_window_keeps_the_narrow_number_column", async () => {

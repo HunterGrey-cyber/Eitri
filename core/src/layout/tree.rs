@@ -85,6 +85,7 @@ pub(super) fn place_new(root: Node, id: &ModuleId, placement: Placement) -> (Nod
         Placement::RightOfRoot | Placement::InPlaceOfEditor => {
             (Node::split(Axis::Row, RIGHT_OF_ROOT_SHARE, root, leaf), false)
         }
+        Placement::LeftOfRoot => (Node::split(Axis::Row, 1.0 - RIGHT_OF_ROOT_SHARE, leaf, root), false),
         Placement::BelowRoot => (
             Node::pinned(Axis::Column, BELOW_ROOT_SHARE, Branch::Second, root, leaf),
             false,
@@ -141,6 +142,8 @@ pub enum LayoutError {
     Pin(i32),
     /// A fixed height outside the allowed range.
     FixedHeight(i32),
+    /// A fixed width outside the allowed range.
+    FixedWidth(i32),
     /// A module cannot be placed next to itself (tmux: "source and target panes must be different").
     SameModule(ModuleId),
     /// Killed for the rest of this window (`super::kill`, `Reopen::Never`).
@@ -187,6 +190,7 @@ impl fmt::Display for LayoutError {
             LayoutError::Unnormalised => write!(f, "a container holds no children, or only one below the root"),
             LayoutError::Pin(px) => write!(f, "a pinned length of {px}px is below zero"),
             LayoutError::FixedHeight(px) => write!(f, "a fixed height of {px}px is outside 16..=200"),
+            LayoutError::FixedWidth(px) => write!(f, "a fixed width of {px}px is outside 16..=400"),
             LayoutError::SameModule(id) => write!(f, "'{id}' cannot be placed next to itself"),
             LayoutError::Gone(id) => write!(f, "'{id}' was closed and cannot be reopened in this window"),
             LayoutError::Away(id) => write!(f, "'{id}' is in the other window"),
@@ -274,6 +278,7 @@ impl Layout {
             ConFault::Empty | ConFault::OneChild | ConFault::Focus(_) => LayoutError::Unnormalised,
             ConFault::Pin(px) => LayoutError::Pin(px),
             ConFault::FixedHeight(px) => LayoutError::FixedHeight(px),
+            ConFault::FixedWidth(px) => LayoutError::FixedWidth(px),
             ConFault::TooMany(_) => LayoutError::TooMany { limit: MAX_CHILDREN },
         })?;
         if !seen.contains(&focus) {

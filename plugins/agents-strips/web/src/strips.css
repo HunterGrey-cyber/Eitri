@@ -12,10 +12,12 @@ html, body {
   font-family: var(--nv-font-mono, monospace);
   font-size: var(--nv-text-size, 13px);
 }
+/* The list is the container the width rules below measure: the column's width, in the list's own characters. */
 #strips {
   height: 100%;
   overflow-x: hidden;
   overflow-y: auto;
+  container-type: inline-size;
 }
 .strips {
   display: flex;
@@ -35,7 +37,13 @@ html, body {
   color: var(--nv-chrome-muted, #83858c);
   border-bottom: 1px solid var(--nv-border, #33353a);
 }
+.head {
+  white-space: nowrap;
+}
 .head .sum {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
   color: var(--nv-warn, #d19a00);
 }
 
@@ -58,7 +66,9 @@ html, body {
 
 /* The right-hand gutter is empty on every row but one that needs the person: that row reaches into it, and its
    ◀ tab sticks out at the edge. Nothing else moves.
-   The number column is as wide as the list's widest number (`--num-w`, set by the page), so window·tab fits. */
+   The number column is as wide as the list's widest number (`--num-w`, set by the page), so window·tab fits.
+   The label is what tells rows apart, so it is the column that keeps its room: the tool word goes first when the
+   column narrows, then the age (the glyph still says the state, and the row's title says it all). */
 .row {
   display: grid;
   grid-template-columns: 1.4ch var(--num-w, 2.6ch) minmax(0, 1fr) 1.6ch minmax(0, max-content) 4.4ch 1.6em;
@@ -95,6 +105,23 @@ html, body {
 .row .what {
   max-width: 9ch;
   color: var(--nv-muted, #8e9098);
+}
+@container (max-width: 36ch) {
+  .row {
+    grid-template-columns: 1.4ch var(--num-w, 2.6ch) minmax(0, 1fr) 1.6ch 4.4ch 1.6em;
+  }
+  .row .what { display: none; }
+}
+@container (max-width: 24ch) {
+  .row {
+    grid-template-columns: 1ch var(--num-w, 2.6ch) minmax(0, 1fr) 1.6ch 1.2em;
+    column-gap: 0.4ch;
+    padding-left: 0.2ch;
+  }
+  .row .what, .row .age { display: none; }
+  .head, .project { padding-left: 0.4em; padding-right: 0.8em; }
+  /* The count says it: `1 waiting` on one line rather than the title and a wrapped count. */
+  .head .title { display: none; }
 }
 .row .age {
   color: var(--nv-muted, #8e9098);
@@ -158,11 +185,12 @@ html, body {
   color: var(--nv-border, #33353a);
 }
 
-/* The narrow rail: the glyph, what waits, and the tab. Hovering names the row. */
-.narrow .row {
-  grid-template-columns: 1.6ch minmax(0, 1fr) 1.6em;
-  column-gap: 0.3ch;
-  padding-left: 0.8ch;
+/* The narrow rail: the glyph, what waits, and the tab. Hovering names the row. At 62 px a line holds about five and a
+   half cells, so the glyph, a two-digit count and the tab must fit in that: tight gaps and a one-em tab. */
+.strips.narrow .row {
+  grid-template-columns: 1.4ch minmax(2ch, 1fr) 1em;
+  column-gap: 0.2ch;
+  padding-left: 0.3ch;
 }
 .narrow .project {
   height: 0;

@@ -132,6 +132,7 @@ pub fn kill(
         Reopen::At(placement) => {
             // The module can be the root's only tile while everything else floats: taking it out
             // leaves no tree to place it into, so it stays hidden where it is, as `InPlace` leaves it.
+            let lengths = super::rules::fixed_lengths_of(layout, id);
             if let Ok(root) = layout.detach_tile(id) {
                 layout.take_float(id);
                 // A first launch hides the editor under a Lua `main` panel (`place_new`'s `true`). Not
@@ -139,6 +140,7 @@ pub fn kill(
                 // editor's visibility is the user's own by now.
                 let (root, _took_editors_place) = place_new(root, id, placement);
                 layout.replace_root(root);
+                super::rules::restore_fixed_length(layout, id, lengths);
             }
         }
         Reopen::InPlace => {
@@ -184,6 +186,36 @@ mod tests {
             placement: Placement::BelowEditor,
         }])
         .unwrap()
+    }
+
+    /// A rail with a pixel width, killed and shown again, comes back at its declaration with its width, not the third
+    /// of the window a new column at that place takes.
+    #[test]
+    fn a_killed_rail_comes_back_with_its_width() {
+        use super::super::rules::{apply_launch_rule, At, OpenRule, RuleSize, NOMINAL_GRID};
+        use super::super::Direction;
+        let rail = ModuleId::lua("agents-strips");
+        let mut layout = Layout::initial(&[ModuleDecl {
+            id: rail.clone(),
+            placement: Placement::LeftOfRoot,
+        }])
+        .unwrap();
+        let rule = OpenRule {
+            at: Some(At::Beside(Direction::Left)),
+            size: Some(RuleSize::Pixels(62)),
+            focus: false,
+            ..OpenRule::default()
+        };
+        apply_launch_rule(&mut layout, &rail, &rule, NOMINAL_GRID).unwrap();
+        let width = |layout: &Layout| {
+            let arranged = arrange(layout, &frame());
+            arranged.modules.iter().find(|(m, _)| *m == rail).map(|(_, r)| r.w)
+        };
+        assert_eq!(width(&layout), Some(62));
+        kill(&mut layout, &rail, Reopen::At(Placement::LeftOfRoot), &frame()).unwrap();
+        assert_eq!(width(&layout), None, "hidden");
+        layout.show(&rail).unwrap();
+        assert_eq!(width(&layout), Some(62));
     }
 
     /// A terminal moved right of the editor and killed there comes back where a first launch puts

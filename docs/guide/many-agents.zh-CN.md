@@ -1,5 +1,5 @@
 [English](many-agents.md) | 简体中文
-<!-- translated-from: many-agents.md sha256=f72f9ad4bfaa89501482c36e1cab98c901e7049493f121414a18fcd76323337c -->
+<!-- translated-from: many-agents.md sha256=f807c4fea609315fb1475d2bcd50fa692b9f5df975045854717f2e550c19b896 -->
 
 # 同时用很多 agent
 
@@ -34,13 +34,15 @@ Strips 有两个设置：`narrow`（窄条：给一个约 62 像素宽的模块�
 eitri.plugin.load("agents-strips", { narrow = true })
 ```
 
-`narrow` 改变的是 Strips 画什么，而不是它那一列有多宽：这一列仍占窗口原来的份额（大约六分之一）。列宽是窗口的一个份额，从来不是像素，所以用你自己的一条[打开规则](configuration.zh-CN.md#where-a-new-module-opens)给窄条一个小份额；窗口约 1900 像素宽时，`0.035` 接近 62 像素：
+`narrow` 改变的是 Strips 画什么，而不是它那一列有多宽：这一列仍占窗口原来的份额（五分之一）。用你自己的一条[打开规则](configuration.zh-CN.md#where-a-new-module-opens)以像素给窄条定宽；以像素给的宽度不随窗口宽窄而变：
 
 ```lua
-eitri.layout.rule("lua:agents-strips", { at = "left", size = 0.035 })
+eitri.layout.rule("lua:agents-strips", { at = "left", size = "62px" })
 ```
 
-规则在窗口打开这一列时决定它的位置；你保存过的布局保留原来的宽度，所以那一列要手动调窄一次。
+规则在窗口放置这一列时（第一次启动时）决定它的位置和宽度；你保存过的布局保持这一列原来的样子。关掉再显示，窄条仍是原来的宽度。拖动它的边缘，或者在按键在它上面时用 `<prefix> Ctrl+Left`/`Ctrl+Right`，可以按像素改宽度（16 到 400）。
+
+列窄的时候，完整的侧栏保留标签，也就是让你分清各个 agent 的那部分：先省掉工具名，再省掉时长。鼠标停在一行上会显示它的全名。
 
 这些页面在完整的 Eitri 窗口里和[合成器窗口](compositor-windows.zh-CN.md)的页面窗口里运行。它们不在[伴随窗口](companion.zh-CN.md)里、也不在 Mac 上运行，那里不加载插件；伴随面板仍然会发布它的行，所以另一个窗口里的页面，以及它旁边终端里的 `eitri agents`，都能显示这些行。
 
@@ -177,7 +179,7 @@ const draw = () => {
 };
 el.onclick = () => {
   const w = waiting().sort((a, b) => a.waiting_since - b.waiting_since);
-  if (w.length) eitriPlugin.call("agents.focus", { id: w[0].id, card_first: true });
+  if (w.length) eitriPlugin.call("agents.round", { op: "start", key: w[0].key });
 };
 const load = (view) => { rows.clear(); view.rows.forEach((r) => rows.set(r.id, r)); draw(); };
 eitriPlugin.on("agents.row", (r) => { rows.set(r.id, r); draw(); });
@@ -191,7 +193,7 @@ eitriPlugin.call("host.hello", {})
 
 然后在 `init.lua` 里：`eitri.plugin.load("waiting")`。
 
-点击就是 `agents.focus` 需要的那个手势。宿主在向这个文档发送任何事件之前，先回答 `agents.watch`，所以 `load` 不会覆盖更新的行。
+点击就是这次调用需要的那个手势。它在等得最久的 agent 那里开始一轮（或者把正在进行的一轮移到那里），那个 agent 的聊天来到前面，卡片摆在最前，和在内置页面里对一行在等的行按 `Enter` 一样。`agents.focus` 去到一行的聊天，但不开始一轮。宿主在向这个文档发送任何事件之前，先回答 `agents.watch`，所以 `load` 不会覆盖更新的行。
 
 带有 `agents` 能力的页面可以发出的调用：
 
@@ -201,7 +203,7 @@ eitriPlugin.call("host.hello", {})
 | `agents.focus` | `{id, card_first?}` | 去到那一行的聊天；`card_first` 为 true 时，把它的卡片摆在前面 |
 | `agents.new` | `{project}` | 在那个项目里新开一个 agent 标签页（视图 `projects` 里的项目键） |
 | `agents.select` | `{key}` | 移动共用的选中项 |
-| `agents.round` | `{op, key?}` | `op` 是 `start`、`next` 或 `leave` |
+| `agents.round` | `{op, key?}` | `op` 是 `start`、`next` 或 `leave`；`start` 带上一行在等的行的 `key`，在那里开始一轮（或者把正在进行的一轮移到那里），并去到它的聊天，卡片摆在最前 |
 | `agents.stop` | `{id}` | 去到那一行的聊天，并在那里问 `Stop this turn? (y/n)` |
 
 事件有 `agents.row`（一行变了）、`agents.gone`、`agents.reset`（页面没来得及听到变化之后给的完整视图）、`agents.selection` 和 `agents.round`。不在屏幕上的页面什么也听不到，回来时会收到一次 `agents.reset`。

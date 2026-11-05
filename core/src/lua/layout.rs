@@ -688,12 +688,17 @@ fn parse_rule(call: &str, opts: &Value, editor: bool) -> Result<OpenRule, String
         return Err(format!("{call}: the editor never floats"));
     }
     if let Some(value) = size {
-        rule.size = Some(parse_rule_size(call, &value, rule.float)?);
+        rule.size = Some(parse_rule_size(call, &value, rule.float, rule.at)?);
     }
     Ok(rule)
 }
 
-fn parse_rule_size(call: &str, value: &Value, floating: bool) -> Result<RuleSize, String> {
+fn parse_rule_size(
+    call: &str,
+    value: &Value,
+    floating: bool,
+    at: Option<crate::layout::rules::At>,
+) -> Result<RuleSize, String> {
     let number = |v: &Value| match v {
         Value::Integer(i) => Some(*i as f64),
         Value::Number(n) => Some(*n),
@@ -729,8 +734,14 @@ fn parse_rule_size(call: &str, value: &Value, floating: bool) -> Result<RuleSize
             }
         }
         (Value::Table(_), false) => Err(format!(
-            "{call}: a tiled size is one share between 0 and 1, not a table"
+            "{call}: a tiled size is one share between 0 and 1, or \"<n>px\", not a table"
         )),
+        (Value::String(text), false) => {
+            let text = text.to_str().map_err(|e| format!("{call}: {e}"))?;
+            crate::layout::rules::parse_pixels(&text, at)
+                .map(RuleSize::Pixels)
+                .map_err(|why| format!("{call}: size \"{text}\": {why}"))
+        }
         (_, true) => Err(format!(
             "{call}: a floating size is {{ w, h }}, two fractions of the grid"
         )),
@@ -1188,6 +1199,28 @@ mod tests {
     }
 
     #[test]
+    fn a_rule_takes_a_pixel_width_at_the_left_and_a_height_below() {
+        use crate::layout::rules::{At, OpenPoint, RuleSize};
+        use crate::layout::Direction;
+        let (lua, store) = engine();
+        lua.load(
+            "eitri.layout.rule('lua:notes', { at = 'left', size = '62px' })\n\
+             eitri.layout.rule('terminal', { at = 'below', size = '120px' })",
+        )
+        .exec()
+        .unwrap();
+        let store = store.borrow();
+        let rules = store.rules().unwrap();
+        let (rule, _) = rules.resolve(&ModuleId::lua("notes"), OpenPoint::Launch, None);
+        assert_eq!(
+            (rule.at, rule.size),
+            (Some(At::Beside(Direction::Left)), Some(RuleSize::Pixels(62)))
+        );
+        let (rule, _) = rules.resolve(&ModuleId::terminal(), OpenPoint::NewInstance, None);
+        assert_eq!(rule.size, Some(RuleSize::Pixels(120)));
+    }
+
+    #[test]
     fn a_malformed_rule_is_a_startup_failure_naming_the_call() {
         for (source, why) in [
             (
@@ -1228,11 +1261,23 @@ mod tests {
             ),
             (
                 "eitri.layout.rule('terminal', { size = 'big' })",
-                "size must be a number, not a string",
+                "size \"big\": a pixel size requires at = above or below (a height), or left or right (a width)",
+            ),
+            (
+                "eitri.layout.rule('terminal', { at = 'left', size = 'big' })",
+                "size \"big\": a pixel width must be <n>px with n in 16..=400",
+            ),
+            (
+                "eitri.layout.rule('terminal', { at = 'below', size = '201px' })",
+                "size \"201px\": a pixel height must be <n>px with n in 16..=200",
+            ),
+            (
+                "eitri.layout.rule('terminal', { at = 'side', size = '62px' })",
+                "size \"62px\": a pixel size requires at = above or below (a height), or left or right (a width)",
             ),
             (
                 "eitri.layout.rule('terminal', { size = { 0.5, 0.5 } })",
-                "a tiled size is one share between 0 and 1, not a table",
+                "a tiled size is one share between 0 and 1, or \"<n>px\", not a table",
             ),
             (
                 "eitri.layout.rule('terminal', { float = true, size = 0.5 })",

@@ -1,12 +1,32 @@
 :root { color-scheme: light dark; font: var(--nv-text-size, 14px)/1.6 monospace; }
-body { margin: 1em; background: var(--nv-bg, #202020); color: var(--nv-fg, #eee); }
+/* The body is the container the narrow rules below measure: the module's width, in the page's own characters. */
+body { margin: 1em; background: var(--nv-bg, #202020); color: var(--nv-fg, #eee); container-type: inline-size; }
 h1 { font-size: 1.15em; margin: 0 0 .5em; }
 button { font: inherit; color: inherit; background: transparent; border: 1px solid currentColor; margin: 0 1em .8em 0; }
+/* The table is never wider than its module: the label takes what the other columns leave and ends in an ellipsis, and
+   a long project name or tool is cut at a fixed width (each cell's title says it whole). */
 table { border-collapse: collapse; width: 100%; white-space: nowrap; }
-th, td { text-align: left; padding: .15em .7em; }
+th, td { text-align: left; padding: .15em .5em; }
+th:first-child, td:first-child { padding-left: .2em; }
+td > span { display: inline-block; max-width: 14ch; overflow: hidden; text-overflow: ellipsis; vertical-align: bottom; }
+td[data-column="state"] > span { max-width: none; }
+th[data-column="label"], td[data-column="label"] { width: 100%; max-width: 0; overflow: hidden; }
+td[data-column="label"] > span { display: block; max-width: none; }
 th { border-bottom: 1px solid currentColor; }
 tbody tr { cursor: pointer; }
 .selected { outline: 1px solid currentColor; outline-offset: -1px; }
 .current td:first-child { font-weight: bold; }
 .visited td:first-child { text-decoration: underline; }
 footer { margin-top: 1em; border-top: 1px solid currentColor; }
+/* A narrow module keeps what tells agents apart and what they are doing: the agent kind and the mode go first, then
+   the background count, then the tool; the window and the tab number stay, as tab numbers count per window. */
+@container (max-width: 96ch) {
+  [data-column="agent"], [data-column="mode"] { display: none; }
+}
+@container (max-width: 72ch) {
+  [data-column="background"] { display: none; }
+  td > span { max-width: 10ch; }
+}
+@container (max-width: 52ch) {
+  [data-column="tool"] { display: none; }
+}

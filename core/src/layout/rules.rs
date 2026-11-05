@@ -4,7 +4,7 @@
 //! the module's id, then its kind's (`terminal`, `agent`), then the module's own rule (a Lua panel's
 //! `position`, or a plugin's declared rule), then the built-in default of the point where it opens.
 
-use super::con::Node;
+use super::con::{Node, FIXED_HEIGHT_PX, FIXED_WIDTH_PX};
 use super::float::{Float, FloatRect, DEFAULT_FLOAT_SHARE};
 use super::geometry::{Direction, Size};
 use super::module::{ModuleDecl, ModuleId, ModuleKind, Placement};
@@ -18,7 +18,8 @@ pub const NOMINAL_GRID: Size = Size { w: 1280, h: 720 };
 pub enum At {
     /// `side`, `bottom`, `main`, `below-editor`: a first launch's own places.
     Placement(Placement),
-    /// `right`, `below`, `left`, `above`: a split on that side of the module with the keys.
+    /// `right`, `below`, `left`, `above`: a split on that side of the module with the keys (with none, `left` is the
+    /// window's left edge, `right` the side, `below` and `above` the bottom).
     Beside(Direction),
     /// `tab`: into the keys' module's tabbed or stacked container, else both into a new tabbed one.
     Tab,
@@ -28,7 +29,8 @@ pub enum At {
 pub enum RuleSize {
     /// A tiled module's share of its container, above 0 and below 1.
     Share(f32),
-    /// An explicit vertical extent; fractional siblings take the remaining height.
+    /// An explicit extent along the side the module opens on: a height above or below, a width left or right;
+    /// fractional siblings take the rest.
     Pixels(i32),
     /// A float's width and height as fractions of the grid, each above 0 and at most 1.
     Float { w: f32, h: f32 },
@@ -219,13 +221,36 @@ pub fn builtin(id: &ModuleId, point: OpenPoint) -> OpenRule {
     }
 }
 
-/// Where `at` goes when no module holds the keys, and whether that is a fallback.
+/// Where `at` goes when no module holds the keys, and whether that is a fallback. `left` keeps its side: the window's
+/// left edge, full height, as `right` becomes the side.
 pub fn without_keys(at: At) -> (Placement, bool) {
     match at {
         At::Placement(placement) => (placement, false),
-        At::Beside(Direction::Right | Direction::Left) | At::Tab => (Placement::RightOfRoot, true),
+        At::Beside(Direction::Right) | At::Tab => (Placement::RightOfRoot, true),
+        At::Beside(Direction::Left) => (Placement::LeftOfRoot, true),
         At::Beside(Direction::Down | Direction::Up) => (Placement::BelowRoot, true),
     }
+}
+
+/// A pixel size, `<n>px`, for a rule placed at `at`: a height (16..=200) above or below, a width (16..=400) left or
+/// right; anywhere else a pixel size has no side to measure along and is refused.
+pub fn parse_pixels(text: &str, at: Option<At>) -> Result<i32, String> {
+    let (range, what) = match at {
+        Some(At::Beside(Direction::Up | Direction::Down)) => (FIXED_HEIGHT_PX, "height"),
+        Some(At::Beside(Direction::Left | Direction::Right)) => (FIXED_WIDTH_PX, "width"),
+        _ => return Err("a pixel size requires at = above or below (a height), or left or right (a width)".into()),
+    };
+    text.strip_suffix("px")
+        .filter(|n| !n.is_empty() && n.bytes().all(|b| b.is_ascii_digit()))
+        .and_then(|n| n.parse::<i32>().ok())
+        .filter(|n| range.contains(n))
+        .ok_or_else(|| {
+            format!(
+                "a pixel {what} must be <n>px with n in {}..={}",
+                range.start(),
+                range.end()
+            )
+        })
 }
 
 pub fn parse_at(name: &str) -> Option<At> {
@@ -246,6 +271,7 @@ pub fn parse_at(name: &str) -> Option<At> {
 pub fn at_name(at: At) -> &'static str {
     match at {
         At::Placement(Placement::RightOfRoot) => "side",
+        At::Placement(Placement::LeftOfRoot) => "window's left edge",
         At::Placement(Placement::BelowRoot) => "bottom",
         At::Placement(Placement::InPlaceOfEditor) => "main",
         At::Placement(Placement::BelowEditor) => "below-editor",
@@ -373,7 +399,7 @@ pub fn open_by_rule(
     }
     match rule.size {
         Some(RuleSize::Share(share)) => notes.extend(set_share(layout, id, share)),
-        Some(RuleSize::Pixels(px)) => set_fixed_height(layout, id, px),
+        Some(RuleSize::Pixels(px)) => set_fixed_length(layout, id, px),
         _ => {}
     }
     if takes_keys {
@@ -442,20 +468,77 @@ pub fn apply_launch_rule(
     }
     match rule.size {
         Some(RuleSize::Share(share)) => notes.extend(set_share(layout, id, share)),
-        Some(RuleSize::Pixels(px)) => set_fixed_height(layout, id, px),
+        Some(RuleSize::Pixels(px)) => set_fixed_length(layout, id, px),
         _ => {}
     }
     Ok(notes)
 }
 
-/// Stores an explicit height only on the leaf's vertical split slot.
-fn set_fixed_height(layout: &mut Layout, id: &ModuleId, px: i32) {
+/// The fixed lengths of `id`'s slot, height and width, if it has any.
+pub(super) fn fixed_lengths_of(layout: &Layout, id: &ModuleId) -> (Option<i32>, Option<i32>) {
+    fn find(node: &Node, id: &ModuleId) -> Option<(Option<i32>, Option<i32>)> {
+        let Node::Con(c) = node else { return None };
+        c.children.iter().find_map(|ch| match &ch.node {
+            Node::Leaf(m) if m == id => Some((ch.fixed_px, ch.fixed_w_px)),
+            other => find(other, id),
+        })
+    }
+    find(&layout.root_node(), id).unwrap_or((None, None))
+}
+
+/// Gives `id`, placed again, the fixed length its slot had, the one that fits its new container's axis: a module
+/// closed and shown again comes back the rail or the strip it was, not the share its placement gives a new column.
+pub(super) fn restore_fixed_length(layout: &mut Layout, id: &ModuleId, (height, width): (Option<i32>, Option<i32>)) {
+    fn parent(node: &Node, id: &ModuleId) -> Option<super::con::ConLayout> {
+        let Node::Con(c) = node else { return None };
+        if c.children.iter().any(|ch| matches!(&ch.node, Node::Leaf(m) if m == id)) {
+            return Some(c.layout);
+        }
+        c.children.iter().find_map(|ch| parent(&ch.node, id))
+    }
+    let px = match parent(&layout.root_node(), id) {
+        Some(super::con::ConLayout::SplitV) => height,
+        Some(super::con::ConLayout::SplitH) => width,
+        _ => None,
+    };
+    if let Some(px) = px {
+        set_fixed_length(layout, id, px);
+    }
+}
+
+/// Stores an explicit length on the leaf's split slot: a height in a vertical split, a width in a horizontal one. A
+/// tabbed or stacked container draws no lengths, so nothing changes there.
+///
+/// The slot's share is set too, to about the same length in the window's nominal grid (at least the smallest share):
+/// what a build that does not know the length, or a container turned the other way, draws in its place, so a 62 px
+/// rail falls back to a narrow column rather than to the third of the window its placement gave it.
+fn set_fixed_length(layout: &mut Layout, id: &ModuleId, px: i32) {
+    fn parent(node: &Node, id: &ModuleId) -> Option<super::con::ConLayout> {
+        let Node::Con(c) = node else { return None };
+        if c.children.iter().any(|ch| matches!(&ch.node, Node::Leaf(m) if m == id)) {
+            return Some(c.layout);
+        }
+        c.children.iter().find_map(|ch| parent(&ch.node, id))
+    }
+    let nominal = match parent(&layout.root_node(), id) {
+        Some(super::con::ConLayout::SplitV) => NOMINAL_GRID.h,
+        Some(super::con::ConLayout::SplitH) => NOMINAL_GRID.w,
+        _ => 0,
+    };
+    if nominal > 0 {
+        // A refusal (a sibling would fall below the smallest share) leaves the share where it was; the length holds.
+        let _ = set_share(layout, id, (px as f32 / nominal as f32).clamp(MIN_RATIO, 0.5));
+    }
     fn apply(c: &mut super::con::Con, id: &ModuleId, px: i32) {
+        let layout = c.layout;
         for child in &mut c.children {
             match &mut child.node {
-                Node::Leaf(m) if m == id && c.layout == super::con::ConLayout::SplitV => {
-                    child.fixed_px =
-                        Some(px.clamp(*super::con::FIXED_HEIGHT_PX.start(), *super::con::FIXED_HEIGHT_PX.end()));
+                Node::Leaf(m) if m == id && layout == super::con::ConLayout::SplitV => {
+                    child.fixed_px = Some(px.clamp(*FIXED_HEIGHT_PX.start(), *FIXED_HEIGHT_PX.end()));
+                    child.pin = None;
+                }
+                Node::Leaf(m) if m == id && layout == super::con::ConLayout::SplitH => {
+                    child.fixed_w_px = Some(px.clamp(*FIXED_WIDTH_PX.start(), *FIXED_WIDTH_PX.end()));
                     child.pin = None;
                 }
                 Node::Con(c) => apply(c, id, px),
@@ -506,6 +589,7 @@ fn set_share(layout: &mut Layout, id: &ModuleId, share: f32) -> Vec<String> {
                 if j == i {
                     child.share = share;
                     child.fixed_px = None;
+                    child.fixed_w_px = None;
                     child.pin = None;
                 } else {
                     child.share *= scale;
@@ -729,10 +813,7 @@ mod tests {
             without_keys(At::Beside(Direction::Right)),
             (Placement::RightOfRoot, true)
         );
-        assert_eq!(
-            without_keys(At::Beside(Direction::Left)),
-            (Placement::RightOfRoot, true)
-        );
+        assert_eq!(without_keys(At::Beside(Direction::Left)), (Placement::LeftOfRoot, true));
         assert_eq!(without_keys(At::Tab), (Placement::RightOfRoot, true));
         assert_eq!(without_keys(At::Beside(Direction::Down)), (Placement::BelowRoot, true));
         assert_eq!(without_keys(At::Beside(Direction::Up)), (Placement::BelowRoot, true));
@@ -1192,7 +1273,7 @@ mod tests {
     fn with_no_module_holding_the_keys_a_beside_rule_opens_at_the_side_with_a_note() {
         let size = Size { w: 1280, h: 721 };
         let mut layout = fixture("row(editor focus 0.6, agent)");
-        let opened = open_by_rule(&mut layout, &t2(), &at(At::Beside(Direction::Left)), None, GRID).unwrap();
+        let opened = open_by_rule(&mut layout, &t2(), &at(At::Beside(Direction::Right)), None, GRID).unwrap();
         assert_eq!(layout.leaves().last(), Some(&t2()));
         assert_eq!(
             rects(&layout, size)[&t2()].h,
@@ -1200,7 +1281,25 @@ mod tests {
             "full height"
         );
         assert!(
-            opened.notes.iter().any(|n| n.contains("'left'") && n.contains("side")),
+            opened.notes.iter().any(|n| n.contains("'right'") && n.contains("side")),
+            "{:?}",
+            opened.notes
+        );
+        // `left` keeps its side: the window's left edge, full height.
+        let mut layout = fixture("row(editor focus 0.6, agent)");
+        let opened = open_by_rule(&mut layout, &t2(), &at(At::Beside(Direction::Left)), None, GRID).unwrap();
+        assert_eq!(layout.leaves().first(), Some(&t2()));
+        let r = rects(&layout, size);
+        assert_eq!(
+            (r[&t2()].x, r[&t2()].h),
+            (0, r[&ModuleId::agent()].h),
+            "left edge, full height"
+        );
+        assert!(
+            opened
+                .notes
+                .iter()
+                .any(|n| n.contains("'left'") && n.contains("window's left edge")),
             "{:?}",
             opened.notes
         );
@@ -1308,6 +1407,335 @@ mod tests {
             assert_eq!(layout.focus(), &ModuleId::editor(), "scratchpad {scratchpad}");
             assert!(layout.can_focus(layout.focus()).is_ok());
             assert_eq!(layout.is_stowed(&notes_panel), scratchpad);
+        }
+    }
+
+    fn rect_of(layout: &Layout, w: i32, id: &ModuleId) -> super::super::geometry::Rect {
+        let frame = super::super::geometry::Frame::new(Size { w, h: 1000 }, 1);
+        let arranged = super::super::geometry::arrange(layout, &frame);
+        arranged.modules.iter().find(|(m, _)| m == id).unwrap().1
+    }
+
+    /// A sidebar declared at the left opens at the window's left edge, full height, at a first launch: no module holds
+    /// the keys then, and `left` keeps its side rather than turning into the side at the right.
+    #[test]
+    fn a_left_rule_with_no_keys_opens_at_the_windows_left_edge() {
+        let strips = id("lua:agents-strips");
+        let rule = OpenRule {
+            at: Some(At::Beside(Direction::Left)),
+            size: Some(RuleSize::Share(0.2)),
+            focus: false,
+            ..OpenRule::default()
+        };
+        let mut rules = OpenRules::default();
+        rules.add(RuleTarget::Module(strips.clone()), rule.clone()).unwrap();
+        let (decls, notes) = rules.launch_decls(&[ModuleDecl {
+            id: strips.clone(),
+            placement: Placement::RightOfRoot,
+        }]);
+        let decl = decls.iter().find(|d| d.id == strips).unwrap();
+        assert_eq!(decl.placement, Placement::LeftOfRoot);
+        assert!(
+            notes.iter().any(|n| n.contains("it goes to the window's left edge")),
+            "{notes:?}"
+        );
+        let mut layout = Layout::initial(&[
+            ModuleDecl {
+                id: ModuleId::terminal(),
+                placement: Placement::BelowEditor,
+            },
+            decl.clone(),
+        ])
+        .unwrap();
+        apply_launch_rule(&mut layout, &strips, &rule, NOMINAL_GRID).unwrap();
+        let s = rect_of(&layout, 1920, &strips);
+        let editor = rect_of(&layout, 1920, &ModuleId::editor());
+        let terminal = rect_of(&layout, 1920, &ModuleId::terminal());
+        assert_eq!((s.x, s.y, s.h), (0, 0, 1000), "the left edge, full height: {s:?}");
+        assert!(editor.x > s.x && terminal.x > s.x && terminal.y > editor.y);
+        assert_eq!(s.w, 384, "a fifth of 1920");
+        // At run time, with a module holding the keys, `left` is still left of that module.
+        let mut runtime = fixture("editor focus");
+        let notes_panel = id("lua:notes");
+        open_by_rule(
+            &mut runtime,
+            &notes_panel,
+            &at(At::Beside(Direction::Left)),
+            Some(&ModuleId::editor()),
+            NOMINAL_GRID,
+        )
+        .unwrap();
+        assert!(rect_of(&runtime, 1200, &notes_panel).x < rect_of(&runtime, 1200, &ModuleId::editor()).x);
+        // With none, the window's left edge, noted.
+        let mut bare = fixture("editor focus");
+        let opened = open_by_rule(
+            &mut bare,
+            &notes_panel,
+            &at(At::Beside(Direction::Left)),
+            None,
+            NOMINAL_GRID,
+        )
+        .unwrap();
+        assert_eq!(rect_of(&bare, 1200, &notes_panel).x, 0);
+        assert!(
+            opened.notes[0].contains("opened at the window's left edge"),
+            "{:?}",
+            opened.notes
+        );
+    }
+
+    /// The narrow rail: a pixel width on a module in a row keeps that width at any window width, below the smallest
+    /// share a fraction may take (0.05 of 1920 is 96 px), and the siblings share the rest.
+    #[test]
+    fn a_pixel_width_holds_at_every_window_width() {
+        let strips = id("lua:agents-strips");
+        let rule = OpenRule {
+            at: Some(At::Beside(Direction::Left)),
+            size: Some(RuleSize::Pixels(62)),
+            focus: false,
+            ..OpenRule::default()
+        };
+        let mut layout = Layout::initial(&[ModuleDecl {
+            id: strips.clone(),
+            placement: Placement::LeftOfRoot,
+        }])
+        .unwrap();
+        assert!(apply_launch_rule(&mut layout, &strips, &rule, NOMINAL_GRID)
+            .unwrap()
+            .is_empty());
+        for w in [958, 1280, 1920, 3840] {
+            let s = rect_of(&layout, w, &strips);
+            assert_eq!((s.x, s.w), (0, 62), "at {w}");
+            let editor = rect_of(&layout, w, &ModuleId::editor());
+            let agent = rect_of(&layout, w, &ModuleId::agent());
+            assert_eq!(editor.x, 63, "at {w}");
+            assert_eq!(agent.x + agent.w, w, "at {w}");
+        }
+        // The same at run time, beside the module with the keys.
+        let mut runtime = fixture("editor focus");
+        open_by_rule(&mut runtime, &strips, &rule, Some(&ModuleId::editor()), NOMINAL_GRID).unwrap();
+        assert_eq!(rect_of(&runtime, 1920, &strips).w, 62);
+    }
+
+    /// The rail at a first launch (left of the whole root, which nests the rest): its edge moves with a drag and with
+    /// `Ctrl+a l`, in pixels, and a drag beside it lands where it is dragged. Its share is about its width in the nominal
+    /// grid, what a build that does not know the width would draw.
+    #[test]
+    fn the_rails_edge_and_its_neighbours_move_where_they_are_dragged() {
+        use super::super::geometry::{arrange, move_divider, resize, Frame};
+        let strips = id("lua:agents-strips");
+        let rule = OpenRule {
+            at: Some(At::Beside(Direction::Left)),
+            size: Some(RuleSize::Pixels(62)),
+            focus: false,
+            ..OpenRule::default()
+        };
+        let mut layout = Layout::initial(&[ModuleDecl {
+            id: strips.clone(),
+            placement: Placement::LeftOfRoot,
+        }])
+        .unwrap();
+        apply_launch_rule(&mut layout, &strips, &rule, NOMINAL_GRID).unwrap();
+        fn share_of(node: &Node, id: &ModuleId) -> Option<f32> {
+            let Node::Con(c) = node else { return None };
+            c.children.iter().find_map(|ch| match &ch.node {
+                Node::Leaf(m) if m == id => Some(ch.share),
+                other => share_of(other, id),
+            })
+        }
+        assert!((share_of(&layout.root_node(), &strips).unwrap() - MIN_RATIO).abs() < 1e-6);
+        let frame = Frame::new(Size { w: 1280, h: 720 }, 1);
+        let rail_edge = |layout: &Layout| {
+            arrange(layout, &frame)
+                .dividers
+                .into_iter()
+                .find(|d| d.first_px == rect_of(layout, 1280, &strips).w && d.rect.x == d.first_px)
+                .unwrap()
+        };
+        let d = rail_edge(&layout);
+        move_divider(&mut layout, &d, 100).unwrap();
+        assert_eq!(rect_of(&layout, 1280, &strips).w, 100);
+        let d = rail_edge(&layout);
+        move_divider(&mut layout, &d, 600).unwrap();
+        assert_eq!(rect_of(&layout, 1280, &strips).w, 400);
+        assert!(
+            rect_of(&layout, 1280, &ModuleId::editor()).w > 300,
+            "the editor is not squeezed"
+        );
+        layout.set_focus(&strips).unwrap();
+        assert!(resize(&mut layout, &strips, Direction::Left, 20, &frame));
+        assert_eq!(rect_of(&layout, 1280, &strips).w, 380);
+        // The editor's right edge, with the rail left of it: where it is dragged.
+        let editor_edge = arrange(&layout, &frame)
+            .dividers
+            .into_iter()
+            .find(|d| {
+                d.rect.x
+                    == rect_of(&layout, 1280, &ModuleId::editor()).x + rect_of(&layout, 1280, &ModuleId::editor()).w
+            })
+            .unwrap();
+        let x = editor_edge.first_px - 50;
+        move_divider(&mut layout, &editor_edge, x).unwrap();
+        let after = arrange(&layout, &frame)
+            .dividers
+            .into_iter()
+            .find(|d| d.con == editor_edge.con && d.index == editor_edge.index)
+            .unwrap();
+        assert_eq!(after.first_px, x);
+    }
+
+    /// A tab added into the rail's slot makes it a container: the container is drawn by its share and its modules'
+    /// minimums, not squeezed into the rail's 62 px.
+    #[test]
+    fn a_tab_added_to_the_rail_is_not_squeezed_into_its_width() {
+        let strips = id("lua:agents-strips");
+        let rule = OpenRule {
+            at: Some(At::Beside(Direction::Left)),
+            size: Some(RuleSize::Pixels(62)),
+            focus: false,
+            ..OpenRule::default()
+        };
+        let mut layout = Layout::initial(&[ModuleDecl {
+            id: strips.clone(),
+            placement: Placement::LeftOfRoot,
+        }])
+        .unwrap();
+        apply_launch_rule(&mut layout, &strips, &rule, NOMINAL_GRID).unwrap();
+        let notes_panel = id("lua:notes");
+        super::super::ops::place_as_tab(&mut layout, &notes_panel, &strips, true).unwrap();
+        // The tabbed container turned into a row and given a third module, as a toggle and a split do.
+        fn widen(node: &mut Node, notes_panel: &ModuleId) {
+            let Node::Con(c) = node else { return };
+            if c.layout == super::super::con::ConLayout::Tabbed
+                && c.children
+                    .iter()
+                    .any(|ch| matches!(&ch.node, Node::Leaf(m) if m == notes_panel))
+            {
+                c.layout = super::super::con::ConLayout::SplitH;
+                c.children
+                    .push(super::super::con::Child::new(Node::Leaf(ModuleId::lua("extra")), 0.0));
+                let n = c.children.len() as f32;
+                for ch in &mut c.children {
+                    ch.share = 1.0 / n;
+                }
+                return;
+            }
+            for ch in &mut c.children {
+                widen(&mut ch.node, notes_panel);
+            }
+        }
+        let mut root = layout.root_node();
+        widen(&mut root, &notes_panel);
+        layout.replace_root(root);
+        let frame = super::super::geometry::Frame::new(Size { w: 1280, h: 720 }, 1);
+        let arranged = super::super::geometry::arrange(&layout, &frame);
+        for m in [&strips, &notes_panel, &ModuleId::lua("extra")] {
+            let r = arranged.modules.iter().find(|(id, _)| id == m).unwrap().1;
+            assert!(
+                r.w >= 32,
+                "{m} is {}px wide: the container's modules keep their minimums",
+                r.w
+            );
+        }
+    }
+
+    /// A width belongs to the slot: a swap leaves it where it was (the module swapped in is drawn at it), and a move into
+    /// a column takes it along, where it is a width in a column and so draws nothing.
+    #[test]
+    fn a_swap_keeps_the_slots_width_and_a_move_into_a_column_carries_it_unused() {
+        use super::super::geometry::{Direction as D, Frame};
+        let rail = id("lua:rail");
+        let rule = OpenRule {
+            at: Some(At::Beside(Direction::Left)),
+            size: Some(RuleSize::Pixels(62)),
+            focus: false,
+            ..OpenRule::default()
+        };
+        let mut layout = fixture("row(editor focus, agent)");
+        open_by_rule(&mut layout, &rail, &rule, Some(&ModuleId::editor()), NOMINAL_GRID).unwrap();
+        assert_eq!(rect_of(&layout, 1280, &rail).w, 62);
+        layout.set_focus(&rail).unwrap();
+        let frame = Frame::new(Size { w: 1280, h: 1000 }, 1);
+        assert!(super::super::ops::swap(&mut layout, &rail, D::Right, &frame).is_some());
+        assert_eq!(
+            rect_of(&layout, 1280, &ModuleId::editor()).w,
+            62,
+            "the editor took the rail's slot"
+        );
+        assert!(rect_of(&layout, 1280, &rail).w > 62);
+        // Back, then into the column beside: there it is drawn by the column, its width no longer applies.
+        assert!(super::super::ops::swap(&mut layout, &rail, D::Left, &frame).is_some());
+        assert_eq!(rect_of(&layout, 1280, &rail).w, 62);
+        let mut layout = fixture("row(editor focus, column(agent, terminal))");
+        open_by_rule(&mut layout, &rail, &rule, Some(&ModuleId::editor()), NOMINAL_GRID).unwrap();
+        super::super::verbs::move_dir::move_dir(&mut layout, &rail, D::Right).unwrap();
+        super::super::verbs::move_dir::move_dir(&mut layout, &rail, D::Right).unwrap();
+        let r = rect_of(&layout, 1280, &rail);
+        let agent = rect_of(&layout, 1280, &ModuleId::agent());
+        assert_eq!((r.x, r.w), (agent.x, agent.w), "the column's width, not 62 px: {r:?}");
+    }
+
+    /// A width belongs to a row and a height to a column: a container that turns from one into the other never reads
+    /// one as the other.
+    #[test]
+    fn a_pixel_width_is_not_a_height() {
+        let rail = id("lua:rail");
+        let mut layout = fixture("editor focus");
+        let rule = OpenRule {
+            at: Some(At::Beside(Direction::Left)),
+            size: Some(RuleSize::Pixels(62)),
+            focus: false,
+            ..OpenRule::default()
+        };
+        open_by_rule(&mut layout, &rail, &rule, Some(&ModuleId::editor()), NOMINAL_GRID).unwrap();
+        let mut root = layout.root_node();
+        fn turn(node: &mut Node, rail: &ModuleId) {
+            if let Node::Con(c) = node {
+                if c.children
+                    .iter()
+                    .any(|ch| matches!(&ch.node, Node::Leaf(m) if m == rail))
+                {
+                    c.layout = super::super::con::ConLayout::SplitV;
+                }
+                for ch in &mut c.children {
+                    turn(&mut ch.node, rail);
+                }
+            }
+        }
+        turn(&mut root, &rail);
+        layout.replace_root(root);
+        let frame = super::super::geometry::Frame::new(Size { w: 1200, h: 1000 }, 1);
+        let arranged = super::super::geometry::arrange(&layout, &frame);
+        let r = arranged.modules.iter().find(|(m, _)| *m == rail).unwrap().1;
+        // The whole column's width, and the height its fallback share gives (a twentieth), not 62 px either way.
+        assert_eq!(r.w, 1200, "{r:?}");
+        assert_eq!(r.h, ((1000 - 1) as f32 * MIN_RATIO).round() as i32, "{r:?}");
+    }
+
+    #[test]
+    fn pixel_sizes_need_a_side_to_measure_along() {
+        let left = Some(At::Beside(Direction::Left));
+        let right = Some(At::Beside(Direction::Right));
+        let above = Some(At::Beside(Direction::Up));
+        assert_eq!(parse_pixels("62px", left), Ok(62));
+        assert_eq!(parse_pixels("400px", right), Ok(400));
+        assert_eq!(parse_pixels("200px", above), Ok(200));
+        assert!(parse_pixels("201px", above)
+            .unwrap_err()
+            .contains("height must be <n>px with n in 16..=200"));
+        assert!(parse_pixels("401px", left)
+            .unwrap_err()
+            .contains("width must be <n>px with n in 16..=400"));
+        for bad in ["15px", "62", "62 px", "6.2px", "+62px", "px", "62PX"] {
+            assert!(parse_pixels(bad, left).is_err(), "{bad}");
+        }
+        for at in [None, Some(At::Tab), Some(At::Placement(Placement::RightOfRoot))] {
+            assert!(
+                parse_pixels("62px", at)
+                    .unwrap_err()
+                    .contains("requires at = above or below"),
+                "{at:?}"
+            );
         }
     }
 }

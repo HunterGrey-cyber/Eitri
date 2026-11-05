@@ -34,6 +34,6 @@ export async function start(root: HTMLElement, host = window as unknown as HostW
 const root = document.getElementById("agents");
 if (root) {
   void start(root).catch(error => {
-    root.textContent = (error as { code?: string }).code === "disabled" ? "Agents are off" : "Could not load agents";
+    root.textContent = (error as { code?: string }).code === "disabled" ? "agents are off in this window" : "Could not load agents";
   });
 }

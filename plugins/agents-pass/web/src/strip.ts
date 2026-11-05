@@ -137,7 +137,18 @@ function span(cls: string, text: string): HTMLSpanElement {
   return el;
 }
 
-function ticketNode(t: Ticket, glyph: (row: PassRow) => string, now: number): HTMLElement {
+/** Where a ticket's agent is: its project and tab, and its window too when the rows come from more than one window,
+ *  since tab numbers count per window. */
+export function where(row: PassRow, manyWindows: boolean): string {
+  return manyWindows ? `${row.project.name} ${row.window.name}·${row.number}` : `${row.project.name}·${row.number}`;
+}
+
+/** Whether the rows come from more than one window. */
+export function manyWindows(rows: PassRow[]): boolean {
+  return new Set(rows.map((row) => row.window.instance)).size > 1;
+}
+
+function ticketNode(t: Ticket, glyph: (row: PassRow) => string, now: number, many: boolean): HTMLElement {
   const el = document.createElement("span");
   el.className = "ticket";
   if (t.current) el.classList.add("current");
@@ -148,7 +159,7 @@ function ticketNode(t: Ticket, glyph: (row: PassRow) => string, now: number): HT
   const parts: Node[] = [];
   if (t.current) parts.push(span("marker", "▸"));
   parts.push(span("glyph", glyph(t.row)));
-  parts.push(span("where", `${t.row.project.name}·${t.row.number}`));
+  parts.push(span("where", where(t.row, many)));
   if (t.row.label) parts.push(span("label", t.row.label));
   parts.push(span("age", age(now, waited(t.row))));
   parts.forEach((part, i) => {
@@ -202,11 +213,16 @@ export function render(
     const at = place(rows, round, groups)!;
     parts.push(span("lead", at.of ? `round ${at.at}/${at.of}` : "round"));
     const line = span("tickets", "");
+    const many = manyWindows(rows);
     list.forEach((t, i) => {
       if (i) line.append(span("sep", "│"));
-      line.append(ticketNode(t, deps.glyph, now));
+      line.append(ticketNode(t, deps.glyph, now, many));
     });
     parts.push(line);
+    // A module too narrow for every ticket shows the current one and how many others wait (the stylesheet decides).
+    // Once the current stop is answered it is no ticket any more, and the count is all a narrow strip shows until `n`.
+    const others = list.filter((t) => !t.current).length;
+    if (others) parts.push(span("more", `+${others}`));
     parts.push(span("hint", "n next · prefix B back"));
   } else {
     parts.push(countsNode(rows, deps.glyph));

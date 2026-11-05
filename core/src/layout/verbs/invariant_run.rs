@@ -61,8 +61,9 @@ const RECTS: [FloatRect; 4] = [
     },
 ];
 const DIRS: [Direction; 4] = [Direction::Left, Direction::Down, Direction::Up, Direction::Right];
-const PLACEMENTS: [Placement; 4] = [
+const PLACEMENTS: [Placement; 5] = [
     Placement::RightOfRoot,
+    Placement::LeftOfRoot,
     Placement::BelowRoot,
     Placement::InPlaceOfEditor,
     Placement::BelowEditor,
@@ -117,7 +118,7 @@ fn step(rng: &mut Rng, layout: &mut Layout, frame: &Frame) {
     let dir = DIRS[rng.below(4)];
     let axis = if rng.below(2) == 0 { Axis::Row } else { Axis::Column };
     let flag = rng.below(2) == 0;
-    let verb = rng.below(38);
+    let verb = rng.below(40);
     match verb {
         0 => {
             let _ = hide(layout, &any, frame);
@@ -254,9 +255,27 @@ fn step(rng: &mut Rng, layout: &mut Layout, frame: &Frame) {
                 frame,
             );
         }
+        38 => {
+            // A pixel length on a module's slot (a rail's width in a row, a strip's height in a column), as a rule
+            // gives one; kept small enough that nine modules still fit the smallest frame.
+            let rule = super::super::rules::OpenRule {
+                size: Some(super::super::rules::RuleSize::Pixels(16 + rng.below(45) as i32)),
+                focus: false,
+                ..super::super::rules::OpenRule::default()
+            };
+            let _ = super::super::rules::apply_launch_rule(layout, &any, &rule, super::super::rules::NOMINAL_GRID);
+        }
+        39 => {
+            // A drag of any divider on screen, fixed children's edges included.
+            let dividers = arrange(layout, frame).dividers;
+            if !dividers.is_empty() {
+                let d = dividers[rng.below(dividers.len())].clone();
+                let _ = super::super::geometry::move_divider(layout, &d, rng.below(150) as i32);
+            }
+        }
         _ => unreachable!(),
     }
-    if matches!(verb, 3 | 5..=19 | 21..=22 | 24..=30 | 32 | 36 | 37) {
+    if matches!(verb, 3 | 5..=19 | 21..=22 | 24..=30 | 32 | 36..=39) {
         assert_eq!(layout.focus(), &focus, "verb {verb} moved the keys");
     }
 }
@@ -347,8 +366,13 @@ fn check(layout: &Layout, label: &str) {
                 ra.x >= 0 && ra.y >= 0 && ra.x + ra.w <= size.w && ra.y + ra.h <= size.h,
                 "{label}: {a} {ra:?} outside {size:?}"
             );
-            // Nine modules (six plus terminal#2..#4) fit at 32px each in an 800x600 frame.
-            assert!(ra.w >= 32 && ra.h >= 32, "{label}: {a} {ra:?} below 32px at {size:?}");
+            // Nine modules (six plus terminal#2..#4) fit at 32px each in an 800x600 frame; a slot with a pixel length
+            // may be narrower, down to that length.
+            let (fixed_h, fixed_w) = super::super::rules::fixed_lengths_of(layout, a);
+            assert!(
+                ra.w >= 32.min(fixed_w.unwrap_or(32)) && ra.h >= 32.min(fixed_h.unwrap_or(32)),
+                "{label}: {a} {ra:?} below 32px at {size:?}"
+            );
             for (b, rb) in &modules[i + 1..] {
                 let apart = ra.x + ra.w <= rb.x || rb.x + rb.w <= ra.x || ra.y + ra.h <= rb.y || rb.y + rb.h <= ra.y;
                 assert!(apart, "{label}: {a} {ra:?} overlaps {b} {rb:?}");

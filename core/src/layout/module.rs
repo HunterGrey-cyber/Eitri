@@ -186,6 +186,10 @@ impl std::error::Error for ModuleError {}
 pub enum Placement {
     /// A new split to the right of the whole root. Lua `position = "side"`.
     RightOfRoot,
+    /// A new split to the left of the whole root, full height: where a rule's `left` goes when no module holds the
+    /// keys to be left of (a first launch, reconcile), so a sidebar declared at the left opens at the window's left
+    /// edge. No Lua `position` names it.
+    LeftOfRoot,
     /// A new split below the whole root, full width. Lua `position = "bottom"`.
     BelowRoot,
     /// The editor's own leaf: the module takes the editor's place and the editor is **hidden**,

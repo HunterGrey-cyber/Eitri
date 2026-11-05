@@ -46,6 +46,8 @@ impl ConLayout {
 pub const MAX_CHILDREN: usize = 20;
 /// Explicit module heights are small strips, in logical pixels.
 pub const FIXED_HEIGHT_PX: std::ops::RangeInclusive<i32> = 16..=200;
+/// Explicit module widths are rails and sidebars, in logical pixels.
+pub const FIXED_WIDTH_PX: std::ops::RangeInclusive<i32> = 16..=400;
 /// How far below `MIN_RATIO` a share may sit and still count as the minimum: trading shares in `f32`
 /// leaves a share at the minimum a rounding error short of it. The Lua grammar accepts the same range,
 /// so a layout the model holds always reads back from its exported text.
@@ -67,6 +69,9 @@ pub struct Child {
     pub share: f32,
     /// A vertical slot's explicit height, independent of its fallback share.
     pub fixed_px: Option<i32>,
+    /// A horizontal slot's explicit width, independent of its fallback share. Each of the two applies only along its
+    /// own axis, so a container that turns from a row into a column (or back) never reads a width as a height.
+    pub fixed_w_px: Option<i32>,
     pub pin: Option<Pin>,
 }
 impl Child {
@@ -75,6 +80,7 @@ impl Child {
             node,
             share,
             fixed_px: None,
+            fixed_w_px: None,
             pin: None,
         }
     }
@@ -139,6 +145,8 @@ pub enum ConFault {
     Pin(i32),
     /// A fixed height outside `FIXED_HEIGHT_PX`.
     FixedHeight(i32),
+    /// A fixed width outside `FIXED_WIDTH_PX`.
+    FixedWidth(i32),
     TooMany(usize),
 }
 impl Node {
@@ -331,6 +339,11 @@ impl Con {
             if let Some(px) = ch.fixed_px {
                 if !FIXED_HEIGHT_PX.contains(&px) {
                     return Err(ConFault::FixedHeight(px));
+                }
+            }
+            if let Some(px) = ch.fixed_w_px {
+                if !FIXED_WIDTH_PX.contains(&px) {
+                    return Err(ConFault::FixedWidth(px));
                 }
             }
             if let Some(Pin { px: Some(px) }) = ch.pin {

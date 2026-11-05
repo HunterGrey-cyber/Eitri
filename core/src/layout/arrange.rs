@@ -89,24 +89,52 @@ fn node_min(node: &Node, shown: &dyn Fn(&ModuleId) -> bool, frame: &Frame, floor
         Node::Con(c) => children_min(c, shown, frame, floor),
     }
 }
-fn fixed_height(child: &Child, axis: Axis) -> Option<i32> {
-    (axis == Axis::Column).then_some(child.fixed_px).flatten()
+/// A child's explicit length along its container's axis: a height in a column, a width in a row. Only a leaf has one:
+/// the length is one module's (a one-line strip, a rail), and a slot that has become a container (a tab added to it,
+/// then split) holds modules with minimums of their own, which a length meant for one page would squeeze to nothing.
+/// The stored length stays with the slot and counts again if the container dissolves back into one leaf.
+fn fixed_length(child: &Child, axis: Axis) -> Option<i32> {
+    if !matches!(child.node, Node::Leaf(_)) {
+        return None;
+    }
+    match axis {
+        Axis::Column => child.fixed_px,
+        Axis::Row => child.fixed_w_px,
+    }
+}
+/// The range a fixed length may take along `axis`.
+fn fixed_range(axis: Axis) -> std::ops::RangeInclusive<i32> {
+    match axis {
+        Axis::Column => super::con::FIXED_HEIGHT_PX,
+        Axis::Row => super::con::FIXED_WIDTH_PX,
+    }
+}
+fn set_fixed_length(child: &mut Child, axis: Axis, px: i32) {
+    let range = fixed_range(axis);
+    let px = px.clamp(*range.start(), *range.end());
+    match axis {
+        Axis::Column => child.fixed_px = Some(px),
+        Axis::Row => child.fixed_w_px = Some(px),
+    }
 }
 fn child_min(child: &Child, axis: Axis, shown: &dyn Fn(&ModuleId) -> bool, frame: &Frame, floor: bool) -> Option<Size> {
     let mut min = node_min(&child.node, shown, frame, floor)?;
-    if let Some(px) = fixed_height(child, axis) {
-        // The explicit height is also the minimum: a one-line page can be shorter than a normal tile.
-        min.h = px;
+    if let Some(px) = fixed_length(child, axis) {
+        // The explicit length is also the minimum: a one-line page or a rail can be smaller than a normal tile.
+        match axis {
+            Axis::Column => min.h = px,
+            Axis::Row => min.w = px,
+        }
     }
     Some(min)
 }
-/// Explicit heights and already settled pins reserve space before fractional siblings divide it.
+/// Explicit lengths and already settled pins reserve space before fractional siblings divide it.
 fn reserved(child: &Child, axis: Axis) -> Option<i32> {
-    fixed_height(child, axis).or_else(|| child.pin.and_then(|pin| pin.px))
+    fixed_length(child, axis).or_else(|| child.pin.and_then(|pin| pin.px))
 }
 fn fixed_first(c: &Con, rest: &[usize], length: i32, handle: i32) -> Option<i32> {
     let axis = c.layout.axis()?;
-    if !rest.iter().any(|&i| fixed_height(&c.children[i], axis).is_some()) {
+    if !rest.iter().any(|&i| fixed_length(&c.children[i], axis).is_some()) {
         return None;
     }
     if let Some(px) = reserved(&c.children[rest[0]], axis) {
@@ -368,9 +396,57 @@ pub(crate) fn move_divider_in(root: &mut Con, d: &Divider, first_px: i32, shown:
     let Some((c, v)) = step(root, d, shown) else {
         return false;
     };
+    let axis = d.axis;
     if let Some((i, far)) = governing(c, &v) {
         let first = d.clamp_first(first_px);
         c.children[i].pin.as_mut().unwrap().px = Some(if far { d.avail - first } else { first });
+    } else if fixed_length(&c.children[v[0]], axis).is_some() {
+        // The fixed child's own edge: the drag (or `Ctrl+a h/l`) sets its length in pixels, within its range and
+        // off the other side's minimum, as dragging a pinned row's divider sets the pin.
+        let px = first_px.min(d.avail - d.min_second);
+        set_fixed_length(&mut c.children[v[0]], axis, px);
+    } else if v.len() == 2 && fixed_length(&c.children[v[1]], axis).is_some() {
+        // The last child is the fixed one: it takes what the divider leaves it.
+        let px = (d.avail - first_px).min(d.avail - d.min_first);
+        set_fixed_length(&mut c.children[v[1]], axis, px);
+    } else if v.iter().any(|&i| fixed_length(&c.children[i], axis).is_some()) {
+        // A fixed child further along: the arrangement gives it its pixels first and divides the rest by the shares of
+        // the others, so the drag is turned into a share over that rest, traded with the next child without a fixed
+        // length (the fixed one between them just moves along).
+        let handle = along(
+            axis,
+            Size {
+                w: d.rect.w,
+                h: d.rect.h,
+            },
+        );
+        let length = d.avail + handle;
+        let pixels: i64 = v
+            .iter()
+            .filter_map(|&i| reserved(&c.children[i], axis))
+            .map(i64::from)
+            .sum();
+        let available = i64::from(length) - i64::from(handle) * (v.len() - 1) as i64 - pixels;
+        let Some(&partner) = v[1..].iter().find(|&&i| reserved(&c.children[i], axis).is_none()) else {
+            return true;
+        };
+        if available <= 0 {
+            return true;
+        }
+        let shares: f32 = v
+            .iter()
+            .filter(|&&i| reserved(&c.children[i], axis).is_none())
+            .map(|&i| c.children[i].share)
+            .sum();
+        let pair = c.children[v[0]].share + c.children[partner].share;
+        if pair < 2.0 * MIN_RATIO {
+            return true;
+        }
+        let first = first_px.clamp(d.min_first.min(d.avail), (d.avail - d.min_second).max(0));
+        let wanted = (f64::from(first) / available as f64 * f64::from(shares)) as f32;
+        let new = wanted.clamp(MIN_RATIO, pair - MIN_RATIO);
+        c.children[v[0]].share = new;
+        c.children[partner].share = pair - new;
     } else {
         trade(&mut c.children, &v, d.ratio_for(first_px));
     }
@@ -500,6 +576,136 @@ mod tests {
             let (modules, _) = at(&c, &|_| true, Size { w: 1000, h });
             assert_eq!(modules.last().map(|(_, rect)| rect.y + rect.h).unwrap(), h);
             assert!(modules.iter().all(|(_, rect)| rect.h >= 0));
+        }
+    }
+
+    fn lengths(c: &Con, size: Size) -> Vec<i32> {
+        let axis = c.layout.axis().unwrap();
+        at(c, &|_| true, size)
+            .0
+            .iter()
+            .map(|(_, r)| along(axis, Size { w: r.w, h: r.h }))
+            .collect()
+    }
+    fn divider(c: &Con, size: Size, k: usize) -> Divider {
+        at(c, &|_| true, size).1.remove(k)
+    }
+
+    /// A drag beside a fixed width puts the divider where the pointer is: the arrangement gives the fixed child its
+    /// pixels first, so the drag is turned into shares over what is left, not over the whole row.
+    #[test]
+    fn a_drag_or_a_key_resize_beside_a_fixed_width_lands_where_it_asked() {
+        let size = Size { w: 1200, h: 700 };
+        let mut c = flat(&[0.5, 0.25, 0.25]);
+        c.children[2].fixed_w_px = Some(62);
+        assert_eq!(lengths(&c, size), [757, 379, 62]);
+        let d = divider(&c, size, 0);
+        assert!(move_divider_in(&mut c, &d, 500, &|_| true));
+        assert_eq!(lengths(&c, size)[0], 500);
+        // `Ctrl+a h` by ten pixels: ten pixels to the left, not a jump.
+        let d = divider(&c, size, 0);
+        assert!(move_divider_in(&mut c, &d, d.first_px - 10, &|_| true));
+        assert_eq!(lengths(&c, size)[0], 490);
+        assert_eq!(lengths(&c, size)[2], 62);
+        // The fixed child's own divider sets its width, within 16..=400.
+        let d = divider(&c, size, 1);
+        assert!(move_divider_in(&mut c, &d, d.first_px - 100, &|_| true));
+        assert_eq!(lengths(&c, size)[2], 162);
+        assert_eq!(c.children[2].fixed_w_px, Some(162));
+        let d = divider(&c, size, 1);
+        assert!(move_divider_in(&mut c, &d, 0, &|_| true));
+        assert_eq!(c.children[2].fixed_w_px, Some(400));
+        assert!((c.children.iter().map(|ch| ch.share).sum::<f32>() - 1.0).abs() < 1e-5);
+    }
+
+    #[test]
+    fn dragging_a_fixed_childs_own_edge_sets_its_length_in_a_row_and_in_a_column() {
+        // A rail first in a row.
+        let size = Size { w: 1200, h: 700 };
+        let mut c = flat(&[0.25, 0.5, 0.25]);
+        c.children[0].fixed_w_px = Some(62);
+        let d = divider(&c, size, 0);
+        assert!(move_divider_in(&mut c, &d, 100, &|_| true));
+        assert_eq!(lengths(&c, size)[0], 100);
+        let d = divider(&c, size, 0);
+        assert!(move_divider_in(&mut c, &d, 600, &|_| true));
+        assert_eq!(lengths(&c, size)[0], 400, "a width stays within 16..=400");
+        let d = divider(&c, size, 0);
+        assert!(move_divider_in(&mut c, &d, 3, &|_| true));
+        assert_eq!(lengths(&c, size)[0], 16);
+        // The editor beside it still lands where it is dragged.
+        let d = divider(&c, size, 1);
+        assert!(move_divider_in(&mut c, &d, 700, &|_| true));
+        assert_eq!(lengths(&c, size)[1], 700);
+        // The same for a one-line strip on top of a column, and for one at its bottom.
+        let size = Size { w: 1000, h: 900 };
+        let mut c = flat(&[0.2, 0.5, 0.3]);
+        c.layout = ConLayout::SplitV;
+        c.children[0].fixed_px = Some(28);
+        let d = divider(&c, size, 0);
+        assert!(move_divider_in(&mut c, &d, 40, &|_| true));
+        assert_eq!(lengths(&c, size)[0], 40);
+        let d = divider(&c, size, 0);
+        assert!(move_divider_in(&mut c, &d, 500, &|_| true));
+        assert_eq!(lengths(&c, size)[0], 200, "a height stays within 16..=200");
+        let d = divider(&c, size, 1);
+        assert!(move_divider_in(&mut c, &d, 300, &|_| true));
+        assert_eq!(lengths(&c, size)[1], 300);
+        let mut c = flat(&[0.5, 0.3, 0.2]);
+        c.layout = ConLayout::SplitV;
+        c.children[2].fixed_px = Some(28);
+        let d = divider(&c, size, 0);
+        assert!(move_divider_in(&mut c, &d, 400, &|_| true));
+        assert_eq!(lengths(&c, size), [400, 470, 28]);
+    }
+
+    /// A slot that held the rail and now holds a container (a tab added, then split) does not squeeze the container's
+    /// modules into the rail's width: only a leaf has a fixed length.
+    #[test]
+    fn a_fixed_width_holds_for_a_leaf_not_for_a_container_in_its_slot() {
+        let inner = Con::new(
+            ConLayout::SplitH,
+            vec![
+                Child::new(leaf("rail"), 0.34),
+                Child::new(leaf("a"), 0.33),
+                Child::new(leaf("b"), 0.33),
+            ],
+        );
+        let mut c = Con::new(
+            ConLayout::SplitH,
+            vec![Child::new(Node::Con(inner), 0.25), Child::new(leaf("editor"), 0.75)],
+        );
+        c.children[0].fixed_w_px = Some(62);
+        let (modules, _) = at(&c, &|_| true, SIZE);
+        let w = |name: &str| modules.iter().find(|(m, _)| *m == ModuleId::lua(name)).unwrap().1.w;
+        assert!(w("rail") >= 32 && w("a") >= 32 && w("b") >= 32, "{modules:?}");
+        assert_eq!(
+            w("rail") + w("a") + w("b") + 2,
+            320,
+            "the slot's share, a quarter of 1280"
+        );
+        // Back to one leaf, the slot's width counts again.
+        let Node::Con(inner) = &c.children[0].node else {
+            unreachable!()
+        };
+        let rail = inner.children[0].node.clone();
+        c.children[0].node = rail;
+        assert_eq!(lengths(&c, SIZE)[0], 62);
+    }
+
+    /// Fixed lengths that add up to more than the row: every module stays inside the row, none is negative.
+    #[test]
+    fn fixed_widths_wider_than_the_row_stay_inside_it() {
+        let mut c = flat(&[0.3, 0.3, 0.4]);
+        c.children[0].fixed_w_px = Some(300);
+        c.children[1].fixed_w_px = Some(300);
+        for w in [400, 610, 1200] {
+            let (modules, _) = at(&c, &|_| true, Size { w, h: 700 });
+            assert!(
+                modules.iter().all(|(_, r)| r.w >= 0 && r.x >= 0 && r.x + r.w <= w),
+                "{w}: {modules:?}"
+            );
+            assert_eq!(modules.last().map(|(_, r)| r.x + r.w), Some(w));
         }
     }
 

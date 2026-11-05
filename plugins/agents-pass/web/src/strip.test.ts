@@ -1,4 +1,7 @@
 import { describe, expect, it } from "vitest";
+import { readFileSync } from "node:fs";
+import { dirname, resolve } from "node:path";
+import { fileURLToPath } from "node:url";
 import { age, mountStrip, place, tickets, wanted } from "./strip";
 import { fakeStore, glyph, round, row } from "./fixtures";
 
@@ -140,6 +143,62 @@ describe("the pass", () => {
     const fake = fakeStore(rows, round("a", ["a"]), "b");
     const { root } = mount(fake.store);
     expect([...root.querySelectorAll<HTMLElement>(".selected")].map((t) => t.dataset.key)).toEqual(["b"]);
+  });
+
+  it("tickets_name_the_window_when_rows_come_from_more_than_one", () => {
+    const two = { instance: "w2", name: "2" };
+    const rows = [
+      row("a", "card", { waiting_since: 1_000, number: 1, label: "" }),
+      row("b", "card", { waiting_since: 2_000, number: 1, label: "", window: two }),
+    ];
+    const fake = fakeStore(rows, round("a", ["a"]));
+    const { root } = mount(fake.store);
+    const places = () => [...root.querySelectorAll(".ticket .where")].map((w) => w.textContent);
+    // Tab 1 of window 1 and tab 1 of window 2 read apart.
+    expect(places()).toEqual(["eitri 1·1", "eitri 2·1"]);
+    // One window: the tab alone, as before.
+    fake.set({ rows: [rows[0], row("c", "card", { waiting_since: 3_000, number: 2, label: "" })] });
+    expect(places()).toEqual(["eitri·1", "eitri·2"]);
+    // A quiet row of another window counts: its tab 1 is somewhere the person can see.
+    fake.set({ rows: [rows[0], row("d", "running", { window: two })] });
+    expect(places()).toEqual(["eitri 1·1"]);
+  });
+
+  it("a_narrow_module_keeps_the_current_ticket_and_counts_the_others", () => {
+    const rows = [
+      row("a", "card", { waiting_since: 1_000 }),
+      row("b", "question", { waiting_since: 2_000 }),
+      row("c", "card", { waiting_since: 3_000 }),
+    ];
+    const fake = fakeStore(rows, round("b", ["a", "b"]));
+    const { root } = mount(fake.store);
+    expect(root.querySelector(".more")?.textContent).toBe("+2");
+    // The count comes after the tickets, before the hint, so a narrow module shows `round 2/3 ▸ ? … +2`.
+    const order = [...root.children].map((c) => c.className);
+    expect(order).toEqual(["lead", "tickets", "more", "hint"]);
+    // Alone, the current ticket has nothing to count.
+    fake.set({ rows: [rows[1]], round: round("b", ["a", "b"]) });
+    expect(root.querySelector(".more")).toBeNull();
+    // The current stop answered (its row no longer waits) and `n` not pressed yet: the round still runs, and a narrow
+    // strip, which hides every ticket but the current one, still says how many wait.
+    fake.set({ rows: [rows[0], row("b", "running"), rows[2]], round: round("b", ["a", "b"]) });
+    expect(root.querySelector(".current")).toBeNull();
+    expect(root.querySelector(".more")?.textContent).toBe("+2");
+  });
+
+  it("the_stylesheet_gives_a_narrow_module_the_current_ticket", () => {
+    const css = readFileSync(resolve(dirname(fileURLToPath(import.meta.url)), "pass.css"), "utf8")
+      .replace(/\/\*[\s\S]*?\*\//g, "");
+    const narrow = css.match(/@container \(max-width: (\d+)ch\) \{([\s\S]*?\})\s*\}/);
+    expect(narrow).not.toBeNull();
+    // Hidden there: every ticket but the current one, the separators and the round's hint (the one after the
+    // tickets; with no round the hint follows the counts and stays); shown: the count.
+    expect(narrow![2]).toMatch(/\.ticket:not\(\.current\), \.sep, \.tickets ~ \.hint \{ display: none; \}/);
+    expect(narrow![2]).toMatch(/\.more \{ display: inline; \}/);
+    // The body is the container the rule measures.
+    expect(css).toMatch(/body \{\s*container-type: inline-size;/);
+    // A ticket's label is the one part that gives way.
+    expect(css).toMatch(/\.ticket > \.label \{[^}]*text-overflow: ellipsis;/);
   });
 
   it("ages_read_as_the_command_line_prints_them", () => {

@@ -5,6 +5,10 @@ html, body {
   margin: 0;
   height: 100%;
   overflow: hidden;
+}
+/* The body is the container the narrow rules below measure: the module's width, in the line's own characters. */
+body {
+  container-type: inline-size;
   background: var(--nv-surface, var(--nv-bg, #1d1f24));
   color: var(--nv-surface-fg, var(--nv-fg, #d8dae0));
   font-family: var(--nv-font-mono, monospace);
@@ -27,10 +31,33 @@ html, body {
   font-variant-numeric: tabular-nums;
 }
 .tickets {
+  display: flex;
+  align-items: baseline;
   flex: 1 1 auto;
   min-width: 0;
   overflow: hidden;
+}
+/* A ticket keeps its glyph, its place and its age; only its label gives way, ending in an ellipsis. */
+.ticket {
+  display: inline-flex;
+  align-items: baseline;
+  gap: 1ch;
+  flex: 0 1 auto;
+  min-width: 0;
+  overflow: hidden;
+}
+.ticket > span { flex: none; }
+.ticket > .label {
+  flex: 0 1 auto;
+  min-width: 2ch;
+  overflow: hidden;
   text-overflow: ellipsis;
+}
+.sep { flex: none; }
+.more {
+  display: none;
+  flex: none;
+  color: var(--nv-muted, #9095a0);
 }
 .sep {
   margin: 0 0.7em;
@@ -48,10 +75,21 @@ html, body {
   color: var(--nv-chrome-accent, #8fb4e6);
 }
 .counts { flex: none; font-variant-numeric: tabular-nums; }
+/* Short of room the hint gives way first: an ellipsis, then nothing. */
 .hint {
-  flex: none;
+  flex: 0 1 auto;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
   margin-left: auto;
   color: var(--nv-muted, #9095a0);
+}
+/* A narrow module (a column of a split window, a laptop's half screen), while a round runs: the round's place, the
+   current ticket and how many others wait. The other tickets and the hint are what `n` and the guide already say.
+   With no round the line is short: the counts and the hint, which gives way on its own. */
+@container (max-width: 72ch) {
+  .ticket:not(.current), .sep, .tickets ~ .hint { display: none; }
+  .more { display: inline; }
 }
 /* The keys kit draws its bar as a band along the page's bottom, which on this one-line page would cover the line.
    Here the bar sits at the line's right end, the line's height, and takes room only for what it has to say: the

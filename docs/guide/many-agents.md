@@ -40,17 +40,20 @@ tab number, instead of the full sidebar) and `show_idle` (`false` keeps idle row
 eitri.plugin.load("agents-strips", { narrow = true })
 ```
 
-`narrow` changes what Strips draws, not how wide its column is: the column keeps its share of the window (about a sixth).
-A column's width is a share of the window, never pixels, so give the rail a small share with an
-[open rule](configuration.md#where-a-new-module-opens) of your own; on a window about 1900 pixels wide, `0.035` is close
-to 62 pixels:
+`narrow` changes what Strips draws, not how wide its column is: the column keeps its share of the window (a fifth).
+Give the rail its width in pixels with an [open rule](configuration.md#where-a-new-module-opens) of your own; a width in
+pixels stays the same however wide the window is:
 
 ```lua
-eitri.layout.rule("lua:agents-strips", { at = "left", size = 0.035 })
+eitri.layout.rule("lua:agents-strips", { at = "left", size = "62px" })
 ```
 
-A rule places the column when the window opens it; a layout you saved keeps the width it had, so narrow that column by
-hand once.
+A rule places the column when the window places it, at a first launch; a layout you saved keeps the column as it was.
+Closed and shown again, the rail comes back at its width. Drag its edge, or use `<prefix> Ctrl+Left`/`Ctrl+Right` with the keys on it, to
+change the width in pixels (16 to 400).
+
+In a narrow column the full sidebar keeps the label, the part that tells your agents apart: it drops the tool word
+first, then the age. Hovering a row names it whole.
 
 The pages run in the full Eitri window and in the page windows of [compositor windows](compositor-windows.md). They
 do not run in the [companion window](companion.md) or on the Mac, where plugins are not loaded; a companion panel
@@ -209,7 +212,7 @@ const draw = () => {
 };
 el.onclick = () => {
   const w = waiting().sort((a, b) => a.waiting_since - b.waiting_since);
-  if (w.length) eitriPlugin.call("agents.focus", { id: w[0].id, card_first: true });
+  if (w.length) eitriPlugin.call("agents.round", { op: "start", key: w[0].key });
 };
 const load = (view) => { rows.clear(); view.rows.forEach((r) => rows.set(r.id, r)); draw(); };
 eitriPlugin.on("agents.row", (r) => { rows.set(r.id, r); draw(); });
@@ -223,8 +226,10 @@ eitriPlugin.call("host.hello", {})
 
 and in `init.lua`: `eitri.plugin.load("waiting")`.
 
-The click is the gesture `agents.focus` needs. The host answers `agents.watch` before it sends this document any
-event, so `load` never overwrites a newer row.
+The click is the gesture the call needs. It starts the round at the agent that has waited longest (or moves a round
+already running there), and that agent's chat comes forward with its card in front, as `Enter` on a waiting row does in
+the bundled pages. `agents.focus` goes to a row's chat without the round. The host answers `agents.watch` before it
+sends this document any event, so `load` never overwrites a newer row.
 
 The calls a page with the `agents` capability can make:
 
@@ -234,7 +239,7 @@ The calls a page with the `agents` capability can make:
 | `agents.focus` | `{id, card_first?}` | goes to that row's chat, with its card in front when `card_first` is true |
 | `agents.new` | `{project}` | opens a new agent tab in that project (a project key from the view's `projects`) |
 | `agents.select` | `{key}` | moves the shared selection |
-| `agents.round` | `{op, key?}` | `op` is `start`, `next` or `leave` |
+| `agents.round` | `{op, key?}` | `op` is `start`, `next` or `leave`; `start` with the `key` of a row that waits starts the round there (or moves a running round there) and goes to its chat with the card in front |
 | `agents.stop` | `{id}` | goes to that row's chat and asks `Stop this turn? (y/n)` there |
 
 The events are `agents.row` (a row changed), `agents.gone`, `agents.reset` (the whole view, after changes the page

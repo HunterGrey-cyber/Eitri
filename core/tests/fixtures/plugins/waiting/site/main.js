@@ -7,7 +7,7 @@ const draw = () => {
 };
 el.onclick = () => {
   const w = waiting().sort((a, b) => a.waiting_since - b.waiting_since);
-  if (w.length) eitriPlugin.call("agents.focus", { id: w[0].id, card_first: true });
+  if (w.length) eitriPlugin.call("agents.round", { op: "start", key: w[0].key });
 };
 const load = (view) => { rows.clear(); view.rows.forEach((r) => rows.set(r.id, r)); draw(); };
 eitriPlugin.on("agents.row", (r) => { rows.set(r.id, r); draw(); });

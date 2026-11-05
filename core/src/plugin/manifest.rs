@@ -336,16 +336,17 @@ pub struct ModuleTable {
     pub shown_while: Option<ShownWhile>,
     pub at: Option<At>,
     pub size: Option<f32>,
-    /// An explicit height; mutually exclusive with the fractional size.
-    pub fixed_height_px: Option<i32>,
+    /// An explicit extent in pixels along the side the module opens on (a height above or below, a width left or
+    /// right); mutually exclusive with the fractional size.
+    pub fixed_px: Option<i32>,
     pub focus: bool,
 }
 
 impl ModuleTable {
-    /// The declared extent, including heights that cannot be represented as a share.
+    /// The declared extent, including pixel lengths that cannot be represented as a share.
     pub fn rule_size(&self) -> Option<crate::layout::rules::RuleSize> {
         use crate::layout::rules::RuleSize;
-        self.fixed_height_px
+        self.fixed_px
             .map(RuleSize::Pixels)
             .or_else(|| self.size.map(RuleSize::Share))
     }
@@ -1138,36 +1139,23 @@ pub fn parse_manifest(text: &str) -> Result<Manifest, String> {
                     }
                 },
             };
-            let (size, fixed_height_px) = match &m.size {
+            let (size, fixed_px) = match &m.size {
                 None => (None, None),
                 Some(toml::Value::Float(share))
                     if *share > 0.0 && *share < 1.0 && (*share as f32) > 0.0 && (*share as f32) < 1.0 =>
                 {
                     (Some(*share as f32), None)
                 }
-                Some(toml::Value::String(text)) => {
-                    let px = text
-                        .strip_suffix("px")
-                        .filter(|n| !n.is_empty() && n.bytes().all(|b| b.is_ascii_digit()))
-                        .and_then(|n| n.parse::<i32>().ok())
-                        .filter(|n| crate::layout::con::FIXED_HEIGHT_PX.contains(n));
-                    let Some(px) = px else {
-                        return fail("module.size", "a pixel height must be <n>px with n in 16..=200".into());
-                    };
-                    if !matches!(
-                        at,
-                        Some(At::Beside(
-                            crate::layout::Direction::Up | crate::layout::Direction::Down
-                        ))
-                    ) {
-                        return fail("module.size", "a pixel height requires at = above or below".into());
-                    }
-                    (None, Some(px))
-                }
+                Some(toml::Value::String(text)) => match crate::layout::rules::parse_pixels(text, at) {
+                    Ok(px) => (None, Some(px)),
+                    Err(why) => return fail("module.size", why),
+                },
                 Some(_) => {
                     return fail(
                         "module.size",
-                        "must be a share strictly between 0 and 1 or <n>px with n in 16..=200".into(),
+                        "must be a share strictly between 0 and 1, or <n>px: a height in 16..=200 above or below, a \
+                         width in 16..=400 left or right"
+                            .into(),
                     );
                 }
             };
@@ -1176,7 +1164,7 @@ pub fn parse_manifest(text: &str) -> Result<Manifest, String> {
                 shown_while,
                 at,
                 size,
-                fixed_height_px,
+                fixed_px,
                 focus: m.focus.unwrap_or(true),
             })
         }
@@ -1257,7 +1245,7 @@ work = "${plugin}"
         let module = m.module.unwrap();
         assert_eq!(module.shown_while, Some(ShownWhile::AgentsWait));
         assert_eq!(
-            (module.start, module.fixed_height_px, module.focus),
+            (module.start, module.fixed_px, module.focus),
             (ModuleStart::Hidden, Some(28), false)
         );
         // Without the key nothing shows the module but the person.
@@ -1592,7 +1580,7 @@ layout = { row = [ { module = "page", share = 0.42 }, { column = [ { module = "e
                 shown_while: None,
                 at: parse_at("right"),
                 size: Some(0.4),
-                fixed_height_px: None,
+                fixed_px: None,
                 focus: false
             })
         );
@@ -1929,9 +1917,37 @@ layout = { row = [ { module = "page", share = 0.42 }, { column = [ { module = "e
                     1,
                 );
                 let module = parse_manifest(&text).unwrap().module.unwrap();
-                assert_eq!(module.fixed_height_px, Some(px));
+                assert_eq!(module.fixed_px, Some(px));
                 assert_eq!(module.size, None);
                 assert_eq!(module.rule_size(), Some(crate::layout::rules::RuleSize::Pixels(px)));
+            }
+        }
+    }
+
+    #[test]
+    fn px_width_parses_for_left_and_right() {
+        for at in ["left", "right"] {
+            for px in [16, 62, 400] {
+                let text = EXAMPLE.replacen("at = \"right\"", &format!("at = {at:?}"), 1).replacen(
+                    "size = 0.4",
+                    &format!("size = \"{px}px\""),
+                    1,
+                );
+                let module = parse_manifest(&text).unwrap().module.unwrap();
+                assert_eq!((module.fixed_px, module.size), (Some(px), None));
+                assert_eq!(module.rule_size(), Some(crate::layout::rules::RuleSize::Pixels(px)));
+            }
+            for size in ["15px", "401px", "62"] {
+                let text = EXAMPLE.replacen("at = \"right\"", &format!("at = {at:?}"), 1).replacen(
+                    "size = 0.4",
+                    &format!("size = {size:?}"),
+                    1,
+                );
+                let error = parse_manifest(&text).unwrap_err();
+                assert!(
+                    error.contains("module.size") && error.contains("16..=400"),
+                    "{size}: {error}"
+                );
             }
         }
     }
@@ -1940,8 +1956,6 @@ layout = { row = [ { module = "page", share = 0.42 }, { column = [ { module = "e
     fn px_size_is_refused_elsewhere() {
         for at in [
             None,
-            Some("left"),
-            Some("right"),
             Some("side"),
             Some("bottom"),
             Some("main"),
@@ -1992,7 +2006,7 @@ layout = { row = [ { module = "page", share = 0.42 }, { column = [ { module = "e
                 shown_while: None,
                 at: None,
                 size: None,
-                fixed_height_px: None,
+                fixed_px: None,
                 focus: true
             })
         );

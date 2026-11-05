@@ -17,6 +17,14 @@ function background(row: Row): string {
     .filter(([count]) => Number(count) > 0).map(([count, name]) => `${count} ${name}`);
   return `${bg.calls}${kinds.length ? ` (${kinds.join(", ")})` : ""}`;
 }
+/** Scrolls the page only as far as it takes to show `el` whole, top to bottom, and never sideways: a row is as wide as
+ *  the table, so a scroll that also lined it up horizontally would move the page off its first column. */
+export function reveal(el: Element, view: Window = window): void {
+  const box = el.getBoundingClientRect();
+  const height = view.innerHeight;
+  if (box.top < 0) view.scrollBy(0, box.top);
+  else if (box.bottom > height) view.scrollBy(0, Math.min(box.bottom - height, box.top));
+}
 export function createTable(root: HTMLElement, kit: Kit, select?: (key: string) => void) {
   let sort: Sort = "state";
   let reverse = false;
@@ -34,12 +42,14 @@ export function createTable(root: HTMLElement, kit: Kit, select?: (key: string) 
   controls.append(sortButton, reverseButton);
   const table = document.createElement("table");
   const head = table.createTHead().insertRow();
-  for (const name of ["STATE", "AGE", "PROJECT", "WIN", "#", "AGENT", "MODE", "TOOL", "BG", "LABEL"]) {
+  ["STATE", "AGE", "PROJECT", "WIN", "#", "AGENT", "MODE", "TOOL", "BG", "LABEL"].forEach((name, i) => {
     const cell = document.createElement("th");
     cell.scope = "col";
     cell.textContent = name;
+    // The stylesheet drops a column from the header and the rows together, by name, when the module is narrow.
+    cell.dataset.column = columns[i];
     head.append(cell);
-  }
+  });
   const body = table.createTBody();
   const empty = document.createElement("p");
   const footer = document.createElement("footer");
@@ -62,7 +72,12 @@ export function createTable(root: HTMLElement, kit: Kit, select?: (key: string) 
       if (!tr) {
         tr = document.createElement("tr");
         tr.dataset.key = row.key;
-        for (const column of columns) tr.insertCell().dataset.column = column;
+        for (const column of columns) {
+          const cell = tr.insertCell();
+          cell.dataset.column = column;
+          // The value sits in its own box, which the stylesheet can cut short (a table cell takes no max-width).
+          cell.append(document.createElement("span"));
+        }
         if (select) {
           const key = row.key;
           tr.addEventListener("click", () => select(key));
@@ -78,7 +93,10 @@ export function createTable(root: HTMLElement, kit: Kit, select?: (key: string) 
         row.window.name, String(row.number), row.agent, row.mode, row.tool ?? "", background(row), row.label];
       values.forEach((value, i) => {
         const cell = tr.cells[i];
-        if (cell.textContent !== value) cell.textContent = value;
+        const box = cell.firstElementChild as HTMLElement;
+        if (box.textContent !== value) box.textContent = value;
+        // A value the stylesheet cuts short says itself whole on hover.
+        if (cell.title !== value) cell.title = value;
       });
     }
     for (const key of [...rowEls.keys()]) if (!seen.has(key)) rowEls.delete(key);
@@ -86,7 +104,8 @@ export function createTable(root: HTMLElement, kit: Kit, select?: (key: string) 
     if (ordered.length !== body.rows.length || ordered.some((tr, i) => body.rows[i] !== tr)) body.replaceChildren(...ordered);
     if (selected !== scrolledTo) {
       scrolledTo = selected;
-      if (selected) rowEls.get(selected)?.scrollIntoView?.({ block: "nearest" });
+      const tr = selected ? rowEls.get(selected) : undefined;
+      if (tr) reveal(tr);
     }
     empty.textContent = visible.length ? "" : rows.length ? "No matching agents" : "No window shares agents";
   }

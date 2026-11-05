@@ -1,4 +1,7 @@
 import { afterEach, expect, it, vi } from "vitest";
+import { readFileSync } from "node:fs";
+import { dirname, resolve } from "node:path";
+import { fileURLToPath } from "node:url";
 import { createStore } from "../../../../plugin-kit/agents/src/store";
 import type { Row } from "../../../../plugin-kit/agents/src/store";
 import { glyph, word } from "../../../../plugin-kit/agents/src/glyphs";
@@ -85,10 +88,13 @@ it("visited_round_rows_are_marked", () => {
 it("labels_are_text_nodes", () => {
   const label = '<img src=x onerror="alert(1)"><script>bad()</script>';
   const { root } = setup([row("markup", { label })]);
-  const cell = root.querySelector('[data-column="label"]')!;
+  const cell = root.querySelector('td[data-column="label"]')!;
   expect(cell.textContent).toBe(label);
+  // The cell holds the value's box, and the box one text node.
+  const box = cell.firstElementChild!;
   expect(cell.childNodes).toHaveLength(1);
-  expect(cell.firstChild?.nodeType).toBe(Node.TEXT_NODE);
+  expect(box.childNodes).toHaveLength(1);
+  expect(box.firstChild?.nodeType).toBe(Node.TEXT_NODE);
   expect(root.querySelector("img, script")).toBeNull();
 });
 it("failed_and_ended_rows_follow_the_needs_states", () => {
@@ -124,16 +130,54 @@ it("a_redraw_keeps_the_row_elements_and_their_clicks", () => {
   expect(root.querySelectorAll("tbody tr")).toHaveLength(1);
 });
 it("the_selected_row_scrolls_into_view_when_the_selection_moves", () => {
-  const scroll = vi.fn();
+  // Only up and down: lining a table-wide row up sideways moved the page off its first column.
+  const into = vi.fn();
   const original = Element.prototype.scrollIntoView;
-  Element.prototype.scrollIntoView = scroll;
-  cleanups.push(() => { Element.prototype.scrollIntoView = original; });
+  Element.prototype.scrollIntoView = into;
+  const by = vi.spyOn(window, "scrollBy").mockImplementation(() => {});
+  cleanups.push(() => { Element.prototype.scrollIntoView = original; by.mockRestore(); });
   const { apply } = setup([row("a"), row("b"), row("c")]);
-  scroll.mockClear();
+  const c = document.querySelector('[data-key="c"]')!;
+  const height = window.innerHeight;
+  vi.spyOn(c, "getBoundingClientRect").mockReturnValue(
+    { top: height + 40, bottom: height + 64, left: -3, right: 900, width: 903, height: 24, x: -3, y: height + 40 } as DOMRect);
+  by.mockClear();
   apply("agents.selection", { key: "c" });
-  expect(scroll).toHaveBeenCalledTimes(1);
-  expect(scroll.mock.contexts[0]).toBe(document.querySelector('[data-key="c"]'));
-  expect(scroll.mock.calls[0][0]).toEqual({ block: "nearest" });
+  expect(into).not.toHaveBeenCalled();
+  expect(by).toHaveBeenCalledTimes(1);
+  expect(by.mock.calls[0]).toEqual([0, 64]);
+  // A redraw that keeps the selection scrolls nothing more.
   apply("agents.row", row("a", { label: "other" }));
-  expect(scroll).toHaveBeenCalledTimes(1);
+  expect(by).toHaveBeenCalledTimes(1);
+  // Above the page's top: up by as much.
+  const a = document.querySelector('[data-key="a"]')!;
+  vi.spyOn(a, "getBoundingClientRect").mockReturnValue(
+    { top: -30, bottom: -6, left: 0, right: 900, width: 900, height: 24, x: 0, y: -30 } as DOMRect);
+  apply("agents.selection", { key: "a" });
+  expect(by.mock.calls[1]).toEqual([0, -30]);
+});
+
+const SHEET = readFileSync(resolve(dirname(fileURLToPath(import.meta.url)), "style.css"), "utf8")
+  .replace(/\/\*[\s\S]*?\*\//g, "");
+
+it("the_table_fits_a_narrow_module", () => {
+  const { root } = setup([row("a", { label: "close question" })]);
+  // Header and row cells name their column, so one rule drops both.
+  const heads = [...root.querySelectorAll("th")].map(th => (th as HTMLElement).dataset.column);
+  expect(heads).toEqual(["state", "age", "project", "window", "number", "agent", "mode", "tool", "background", "label"]);
+  const cells = [...root.querySelectorAll<HTMLElement>("tbody td")];
+  expect(cells.map(td => td.dataset.column)).toEqual(heads);
+  // Each value is in a box of its own, and its cell's title says it whole.
+  expect(cells[9].firstElementChild?.textContent).toBe("close question");
+  expect(cells[9].title).toBe("close question");
+  // The label takes the rest of the width and gives way; nothing else wraps or widens the table.
+  expect(SHEET).toMatch(/table \{[^}]*width: 100%;[^}]*white-space: nowrap;/);
+  expect(SHEET).toMatch(/th\[data-column="label"\], td\[data-column="label"\] \{ width: 100%; max-width: 0; overflow: hidden; \}/);
+  expect(SHEET).toMatch(/td > span \{[^}]*max-width: 14ch; overflow: hidden; text-overflow: ellipsis;/);
+  // Narrower modules drop columns, the least telling first; the window and the tab number always stay.
+  const drops = [...SHEET.matchAll(/@container \(max-width: (\d+)ch\) \{([\s\S]*?\})\s*\}/g)]
+    .map(m => [Number(m[1]), [...m[2].matchAll(/\[data-column="([a-z]+)"\]/g)].map(x => x[1])
+      .filter((c, i, all) => all.indexOf(c) === i && /display: none/.test(m[2]))] as const);
+  expect(drops).toEqual([[96, ["agent", "mode"]], [72, ["background"]], [52, ["tool"]]]);
+  expect(SHEET).toMatch(/body \{[^}]*container-type: inline-size;/);
 });

@@ -99,9 +99,10 @@ function rowNode(row: Row, m: Model, manyWindows: boolean): HTMLLIElement {
   li.classList.toggle("unread", row.unread);
   li.classList.toggle("moving", row.moving);
   li.classList.toggle("hushed", hushed);
+  // Hovering names the row whole: a narrow column cuts the label and drops the tool word and the age.
   const name = `${row.project.name} ${row.window.name}·${row.number} ${row.label || row.agent}: ${word}`;
+  li.title = name;
   if (m.narrow) {
-    li.title = name;
     const count = out && waiting(row) > 0 ? String(waiting(row)) : "";
     li.append(el("span", "glyph", m.kit.glyph(row)), el("span", "count", count), el("span", "edge", out ? "◀" : ""));
     return li;
@@ -132,6 +133,7 @@ export function cells(text: string): number {
 
 /** The widest number the column holds; past it a number ends in an ellipsis and its title says it whole. */
 const NUM_MAX_CELLS = 16;
+const NUM_SLACK_CELLS = 0.4;
 
 function emptyNode(narrow: boolean): HTMLLIElement {
   const li = el("li", "row empty");
@@ -172,8 +174,9 @@ export function render(root: HTMLElement, m: Model): void {
       list.append(rowNode(row, m, manyWindows));
     }
   }
-  // Only a list that names windows widens the column; a bare tab number fits the stylesheet's default.
-  if (numCells) list.style.setProperty("--num-w", `${Math.min(numCells, NUM_MAX_CELLS)}ch`);
+  // Only a list that names windows widens the column; a bare tab number fits the stylesheet's default. The column is a
+  // little wider than its characters, so a number that fits exactly is not cut to an ellipsis by rounding.
+  if (numCells) list.style.setProperty("--num-w", `${Math.min(numCells, NUM_MAX_CELLS) + NUM_SLACK_CELLS}ch`);
   if (!m.narrow) {
     const head = el("header", "head");
     const sum = needs ? `${needs} waiting` : total ? String(total) : "";
