@@ -8,7 +8,9 @@ import "./index";
 
 /* jsdom lays nothing out and has no `Selection.modify`. This stand-in moves over the text as one string of
    characters, in document order: a line is a block element's text (a `p`, `li`, `h1`), a word is a run of letters,
-   digits and `_`, and a line move keeps the column. It is what WebKit's `modify` does on one-line paragraphs. */
+   digits and `_`, and a line move keeps the column. It is what WebKit's `modify` does on one-line paragraphs. In a
+   table each cell is a block of its own, as in WebKit: a line boundary is the cell's, and a line move goes to the
+   next cell of the same row. */
 type Place = { node: Text; offset: number; length: number };
 function chars(): Place[] {
   const out: Place[] = [];
@@ -24,7 +26,7 @@ function chars(): Place[] {
   }
   return out;
 }
-const blockOf = (p: Place) => p.node.parentElement!.closest("p, li, h1, h2, pre, div")!;
+const blockOf = (p: Place) => p.node.parentElement!.closest("p, li, h1, h2, pre, div, td, th")!;
 function indexOf(all: Place[], node: Node | null, offset: number): number {
   const at = all.findIndex((c) => c.node === node && c.offset === offset);
   if (at >= 0) return at;
@@ -42,8 +44,10 @@ function fakeModify(this: Selection, _alter: string, direction: string, granular
   const fwd = direction === "forward";
   const word = (k: number) => k >= 0 && k < all.length &&
     /[\p{L}\p{N}_]/u.test(String.fromCodePoint(all[k].node.data.codePointAt(all[k].offset)!));
-  const lineStart = (k: number) => { const b = blockOf(all[Math.min(k, all.length - 1)]); let s = k; while (s > 0 && blockOf(all[s - 1]) === b) s--; return s; };
-  const lineEnd = (k: number) => { const b = blockOf(all[Math.min(k, all.length - 1)]); let e = Math.min(k, all.length - 1); while (e < all.length && blockOf(all[e]) === b) e++; return e; };
+  const startIn = (of: (p: Place) => Element) => (k: number) => { const b = of(all[Math.min(k, all.length - 1)]); let s = k; while (s > 0 && of(all[s - 1]) === b) s--; return s; };
+  const endIn = (of: (p: Place) => Element) => (k: number) => { const b = of(all[Math.min(k, all.length - 1)]); let e = Math.min(k, all.length - 1); while (e < all.length && of(all[e]) === b) e++; return e; };
+  const lineStart = startIn(blockOf);
+  const lineEnd = endIn(blockOf);
   if (granularity === "character") i = Math.max(0, Math.min(all.length, i + (fwd ? 1 : -1)));
   else if (granularity === "word") {
     if (fwd) { while (i < all.length && !word(i)) i++; while (word(i)) i++; }
@@ -115,8 +119,21 @@ afterEach(() => {
   delete (Selection.prototype as unknown as { modify?: unknown }).modify;
   delete (Range.prototype as unknown as { getClientRects?: unknown }).getClientRects;
   delete (window as unknown as Record<string, unknown>).matchMedia;
+  delete (globalThis as Record<string, unknown>).CSS;
+  delete (globalThis as Record<string, unknown>).Highlight;
   vi.restoreAllMocks();
 });
+
+/** A Custom Highlight API stand-in: the registry, and highlights that keep their ranges. */
+function useHighlights(): Map<string, { ranges: Range[] }> {
+  const registry = new Map<string, { ranges: Range[] }>();
+  (globalThis as Record<string, unknown>).CSS = { highlights: registry };
+  (globalThis as Record<string, unknown>).Highlight = class {
+    ranges: Range[] = [];
+    add(r: Range) { this.ranges.push(r); return this; }
+  };
+  return registry;
+}
 
 /** A range at character `offset` of the text of the `index`th element `selector` matches. */
 function at(selector: string, index: number, offset: number): Range {
@@ -315,6 +332,103 @@ describe("V", () => {
     expect(mode()).toBe("VISUAL LINE");
     key("V", { shiftKey: true });
     expect(mode()).toBe("NORMAL");
+  });
+});
+
+describe("in a table", () => {
+  const table = () => {
+    document.body.innerHTML = '<main id="root"><p>before</p><table><thead><tr><th>crate</th><th>lines</th>' +
+      "<th>tests</th></tr></thead><tbody><tr><td>core</td><td>146,507</td><td>244,246</td></tr>" +
+      "<tr><td>shell</td><td>48,315</td><td>57,077</td></tr></tbody></table><p>after</p></main>";
+  };
+
+  it("V takes the cursor's whole row, every cell, from any cell; j adds the next row whole", async () => {
+    table();
+    await start({ start: () => at("td", 1, 2) });
+    key("V", { shiftKey: true });
+    expect(sel().toString()).toBe("core146,507244,246");
+    key("j");
+    expect(sel().toString()).toBe("core146,507244,246shell48,31557,077");
+    key("k");
+    key("k");
+    expect(sel().toString()).toBe("cratelinestestscore146,507244,246");
+  });
+
+  it("j and k go a row, to the same column and character; past the table's edge, to the text beyond it", async () => {
+    table();
+    await start({ start: () => at("td", 1, 2) });
+    key("v");
+    key("j");
+    expect(sel().toString()).toBe("6,507244,246shell48,");
+    key("j");
+    expect(sel().focusNode?.parentElement?.tagName).toBe("P");
+    expect(sel().toString().endsWith("a")).toBe(true);
+    key("k");
+    key("k");
+    key("k");
+    expect(sel().toString()).toBe("testscore146");
+    key("k");
+    expect(sel().toString()).toBe("ecratelinestestscore146");
+  });
+
+  it("k and j count characters in code points: never into the middle of a letter outside the BMP", async () => {
+    document.body.innerHTML = '<main id="root"><table><tbody><tr><td>\u{1F600}x</td></tr><tr><td>abcd</td></tr>' +
+      "<tr><td>\u{1F600}</td></tr></tbody></table></main>";
+    await start({ start: () => at("td", 1, 1) });
+    key("v");
+    key("k");
+    expect(sel().toString()).toBe("xab");
+    key("Escape");
+    cleanup?.();
+    await start({ start: () => at("td", 1, 3) });
+    key("v");
+    key("j");
+    expect(sel().toString()).toBe("d\u{1F600}");
+  });
+
+  it("v selects exactly the characters, across cells too", async () => {
+    table();
+    await start({ start: () => at("td", 3, 0) });
+    key("v");
+    key("$");
+    expect(sel().toString()).toBe("shell");
+    key("l");
+    key("$");
+    expect(sel().toString().replace(/\s+/g, "")).toBe("shell48,315");
+  });
+});
+
+describe("painting", () => {
+  it("draws the selection as the eitri-visual highlight, not the engine's selection, and drops it at the end", async () => {
+    const registry = useHighlights();
+    await start({ start: () => at("p", 0, 4) });
+    key("v");
+    key("e");
+    const root = document.documentElement;
+    expect(root.getAttribute("data-eitri-visual-paint")).toBe("highlight");
+    expect(registry.get("eitri-visual")?.ranges.map((r) => r.toString())).toEqual(["two"]);
+    key("j");
+    expect(registry.get("eitri-visual")?.ranges.map((r) => r.toString())).toEqual([sel().toString()]);
+    key("V", { shiftKey: true });
+    expect(registry.get("eitri-visual")?.ranges.map((r) => r.toString())).toEqual(["one two threefour five"]);
+    key("Escape");
+    expect(registry.has("eitri-visual")).toBe(false);
+    expect(root.hasAttribute("data-eitri-visual-paint")).toBe(false);
+  });
+
+  it("without the Custom Highlight API leaves the engine's selection to draw it", async () => {
+    await start({ start: () => at("p", 0, 4) });
+    key("v");
+    expect(document.documentElement.hasAttribute("data-eitri-visual-paint")).toBe(false);
+    expect(sel().toString()).toBe("t");
+  });
+
+  it("the stylesheet hides the engine's selection only while the kit paints", async () => {
+    const { STYLE_TEXT } = await import("./style");
+    expect(STYLE_TEXT).toContain("html[data-eitri-visual-paint] ::selection{background-color:transparent}");
+    expect(STYLE_TEXT).toContain("::highlight(eitri-visual){background-color:var(--nv-cursorline, #4f5258)}");
+    expect(STYLE_TEXT.indexOf("html[data-eitri-visual-paint] ::selection"))
+      .toBeGreaterThan(STYLE_TEXT.indexOf("html[data-eitri-visual] ::selection"));
   });
 });
 

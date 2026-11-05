@@ -9,6 +9,8 @@ const THEMED = /var\(--nv-[a-z0-9-]+, [^()]+\)/;
 const THEMED_ALL = /var\(--nv-[a-z0-9-]+, [^()]+\)/g;
 /* The one colour drawn a hair short of opaque: WebKit blends an opaque selection colour toward white. */
 const NEARLY_OPAQUE = /^color-mix\(in srgb, (var\(--nv-[a-z0-9-]+, #[0-9a-f]+\)) 99%, transparent\)$/;
+/* What paints nothing is no colour of the theme's: the engine's selection while the kit draws visual mode itself. */
+const NOTHING = "transparent";
 
 function hud() { return document.getElementById("eitri-keys-hud")!; }
 function part(name: string) { return hud().querySelector<HTMLElement>(`.eitri-keys-${name}`)!; }
@@ -30,7 +32,7 @@ describe("the kit stylesheet", () => {
       .flatMap((rule) => rule.slice(rule.indexOf("{") + 1).split(";").filter(Boolean))
       .map((d) => [d.slice(0, d.indexOf(":")), d.slice(d.indexOf(":") + 1)] as const)
       .map(([prop, value]) => [prop, value.replace(NEARLY_OPAQUE, "$1")] as const)
-      .filter(([prop]) => THEMED_PROPS.has(prop));
+      .filter(([prop, value]) => THEMED_PROPS.has(prop) && value !== NOTHING);
     expect(declarations.length).toBeGreaterThanOrEqual(20);
     for (const [prop, value] of declarations) {
       expect(value, prop).toMatch(THEMED);

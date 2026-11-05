@@ -7,6 +7,9 @@ export const STYLE_TEXT: string =
   // WebKit draws an opaque selection colour blended toward white (on a dark page, darker than the page); a colour a
   // hair short of opaque is drawn as given.
   'html[data-eitri-visual] ::selection{background-color:color-mix(in srgb, var(--nv-cursorline, #4f5258) 99%, transparent)}' +
+  // Where the kit draws the selection as a highlight of its characters, the engine's own selection is not painted.
+  'html[data-eitri-visual-paint] ::selection{background-color:transparent}' +
+  '::highlight(eitri-visual){background-color:var(--nv-cursorline, #4f5258)}' +
   '.eitri-keys-mode[data-mode="visual"],.eitri-keys-mode[data-mode="visual_line"]{background:var(--nv-status-visual-bg, #20252b);color:var(--nv-status-visual-fg, #f4f4f4)}' +
   '.eitri-keys-pending{flex:0 0 auto;padding:0 0 0 1ch;color:var(--nv-chrome-muted, #c8c8c8)}' +
   '.eitri-keys-pending:empty{display:none}' +

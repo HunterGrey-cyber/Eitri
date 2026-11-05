@@ -220,6 +220,103 @@ function selectedEnds(range: Range): { first: Place; last: Place } | null {
   return first && last ? { first, last } : null;
 }
 
+/** Where a selection's text lies down the page, in document coordinates: the middle of its first and of its last
+ *  selected character that is not white space, and the table rows (`tr`) they are in, if any. Null when nothing but
+ *  white space is selected or a character has no box. */
+export function selectionSpan(range: Range): { first: number; last: number; rows: [Element | null, Element | null] } | null {
+  const ends = selectedEnds(range);
+  if (!ends) return null;
+  const first = placeY(ends.first, true);
+  const last = placeY(ends.last, false);
+  if (first === null || last === null) return null;
+  const row = (p: Place) => (p.node.nodeType === Node.ELEMENT_NODE ? (p.node as Element) : p.node.parentElement)
+    ?.closest("tr") ?? null;
+  return { first, last, rows: [row(ends.first), row(ends.last)] };
+}
+
+/** A box in document coordinates. */
+export interface Rect { top: number; bottom: number; left: number; right: number }
+
+/** Text with no box a reader sees: KaTeX's MathML copy is clipped to a pixel. */
+const UNDRAWN = ".katex-mathml, [hidden], script, style, template";
+
+/** Blocks that scroll sideways: what lies past their sides is clipped, and so is a box over it. */
+const SCROLLERS = ".mdp-wide, .katex-display";
+
+/** Elements whose own children are boxes, never text: white space directly inside them is not laid out. */
+const STRUCTURE = "table, thead, tbody, tfoot, tr, ul, ol";
+
+/** How much of the shorter of two boxes must overlap the other, vertically, for both to be on one row. */
+const SAME_ROW = 0.5;
+
+/**
+ * The boxes a charwise selection is drawn as, in document coordinates: the boxes of the selected characters (each
+ * text node's selected part; white space alone between a table's or a list's own elements is passed over), gathered
+ * into rows (boxes overlapping by half the shorter one), every box of a row
+ * given the row's full height, and neighbours on a row joined where the gap between them is at most `join` px (a
+ * space, a code span's padding) unless they are in different table cells: a cell's text is drawn by itself. A box
+ * inside a block that scrolls sideways (a wide table or code block, display math) is cut to that block's sides.
+ */
+export function selectionBoxes(range: Range, join: number): Rect[] {
+  const doc = range.startContainer.ownerDocument ?? document;
+  type Part = Rect & { cell: Element | null };
+  const parts: Part[] = [];
+  const common = range.commonAncestorContainer;
+  const walker = doc.createTreeWalker(common, NodeFilter.SHOW_TEXT);
+  const piece = doc.createRange();
+  for (let n = common.nodeType === Node.TEXT_NODE ? common : walker.nextNode(); n; n = walker.nextNode()) {
+    if (!range.intersectsNode(n)) continue;
+    const text = n as Text;
+    // White space alone between a table's or a list's own elements is laid out nowhere (a stand-in layout may still
+    // give it a box); between inline elements it is a space and drawn like one.
+    if ((!/\S/.test(text.data) && text.parentElement?.matches(STRUCTURE)) || text.parentElement?.closest(UNDRAWN)) continue;
+    const from = text === range.startContainer ? range.startOffset : 0;
+    const to = text === range.endContainer ? range.endOffset : text.data.length;
+    if (to <= from) continue;
+    piece.setStart(text, from);
+    piece.setEnd(text, to);
+    const cell = text.parentElement?.closest("td, th") ?? null;
+    const scroller = text.parentElement?.closest(SCROLLERS)?.getBoundingClientRect() ?? null;
+    for (const r of Array.from(piece.getClientRects?.() ?? [])) {
+      const left = Math.max(r.left, scroller?.left ?? r.left);
+      const right = Math.min(r.right, scroller?.right ?? r.right);
+      if (right <= left || r.height <= 0) continue;
+      parts.push({ top: r.top + window.scrollY, bottom: r.bottom + window.scrollY, left: left + window.scrollX,
+        right: right + window.scrollX, cell });
+    }
+  }
+  // Rows: boxes overlapping the row so far by half the shorter of the two.
+  parts.sort((a, b) => a.top - b.top || a.left - b.left);
+  const rows: Part[][] = [];
+  let span: { top: number; bottom: number } | null = null;
+  for (const p of parts) {
+    const overlap = span ? Math.min(span.bottom, p.bottom) - Math.max(span.top, p.top) : -1;
+    if (span && overlap >= SAME_ROW * Math.min(span.bottom - span.top, p.bottom - p.top)) {
+      rows[rows.length - 1].push(p);
+      span = { top: Math.min(span.top, p.top), bottom: Math.max(span.bottom, p.bottom) };
+    } else {
+      rows.push([p]);
+      span = { top: p.top, bottom: p.bottom };
+    }
+  }
+  const out: Rect[] = [];
+  for (const row of rows) {
+    const top = Math.min(...row.map((p) => p.top));
+    const bottom = Math.max(...row.map((p) => p.bottom));
+    row.sort((a, b) => a.left - b.left);
+    let run: Part | null = null;
+    for (const p of row) {
+      if (run && run.cell === p.cell && p.left - run.right <= join) run.right = Math.max(run.right, p.right);
+      else {
+        if (run) out.push({ top, bottom, left: run.left, right: run.right });
+        run = { ...p };
+      }
+    }
+    if (run) out.push({ top, bottom, left: run.left, right: run.right });
+  }
+  return out;
+}
+
 /** The source of the page's selection `sel`, for nvim's visual mode `kind`: charwise when the selection lies inside
  *  one source line and its text occurs there exactly once (the text as shown: rendered Markdown does not map back to
  *  source columns otherwise), else linewise over the source lines it spans. Null with no selection. */

@@ -270,3 +270,38 @@ describe("handing the keys over", () => {
     expect(document.querySelector<HTMLElement>(".mdp-cursor-line")!.hidden).toBe(true);
   });
 });
+
+describe("the cursor in a table", () => {
+  /* A real table row's text sits inside its cell's padding, under the border between rows: the row's top (where its
+     source line starts) can lie nearer the row above's text than its own. Here each cell's text is 8 px high, 12 px
+     into its row's 20 px box. */
+  let undo: () => void = () => {};
+  beforeEach(() => {
+    const proto = Range.prototype as Range & { getClientRects(): DOMRect[] };
+    const had = Object.getOwnPropertyDescriptor(proto, "getClientRects")!;
+    Object.defineProperty(proto, "getClientRects", {
+      configurable: true,
+      value: function (this: Range) {
+        const node = this.startContainer;
+        const cell = (node.nodeType === Node.TEXT_NODE ? node.parentElement : node as Element)?.closest("td, th");
+        const box = cell ? layout.boxOf(cell) : undefined;
+        if (!box) return (had.value as () => DOMRect[]).call(this);
+        const t = box.top + 12 - window.scrollY;
+        return [{ top: t, height: 8, bottom: t + 8, left: 0, right: 600, width: 600, x: 0, y: t, toJSON: () => ({}) }];
+      },
+    });
+    undo = () => Object.defineProperty(proto, "getClientRects", had);
+  });
+  afterEach(() => undo());
+
+  it("starts on the row of nvim's line, not the row above whose text is nearer that line's top", () => {
+    const TABLE = "intro\n\n| a | b |\n| --- | --- |\n| core | 1 |\n| agent | 2 |\n| shell | 3 |\n";
+    show(TABLE, { rows: 48, cursor_row: 7, top: 1, cursor: { line: 7, col: 0 } });
+    p.onFocus(true);
+    const row = [...document.querySelectorAll("tr")].find((r) => r.textContent?.includes("shell"))!;
+    const box = layout.boxOf(row)!;
+    const band = p.cursorBand()!;
+    expect(band.top).toBeGreaterThanOrEqual(box.top);
+    expect(band.bottom).toBeLessThanOrEqual(box.top + box.height + 10);
+  });
+});

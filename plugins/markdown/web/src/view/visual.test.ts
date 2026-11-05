@@ -5,7 +5,7 @@ import type { MermaidRunner } from "../render/mermaid";
 import { installFakeLayout, type FakeLayout } from "./fakelayout";
 import { editSelection, installKeys, yankSelection } from "./keys";
 import { Preview } from "./preview";
-import { drawnPart, sourceSelection } from "./selection";
+import { drawnPart, selectionBoxes, sourceSelection } from "./selection";
 
 /* The fake layout (fakelayout.ts): each tagged leaf block 20 px a source line, a 10 px gap between blocks; a range
    over a text reports its block's rows. */
@@ -290,5 +290,207 @@ describe("the page's visual hooks", () => {
     expect(p.cursorBand()!.top).toBe(900);
     expect(window.scrollY).toBeGreaterThan(0);
     expect(Object.keys(installed!.visual!.keys!)).toEqual(["<CR>", "Y"]);
+  });
+});
+
+describe("visual line mode's band", () => {
+  const band = () => document.querySelector<HTMLElement>(".mdp-visual-band")!;
+  const TABLE = "intro\n\n| crate | lines |\n| --- | --- |\n| core | 146,507 |\n| shell | 48,315 |\n| panel | 22,486 |\n";
+  afterEach(() => { document.documentElement.removeAttribute("data-eitri-visual"); });
+  const box = (el: Element) => layout.boxOf(el)!;
+  const rowWith = (text: string) => [...root.querySelectorAll("tr")].find((r) => r.textContent?.includes(text))!;
+
+  it("covers a table row's whole box, every cell, when V is on it", () => {
+    show(TABLE);
+    document.documentElement.setAttribute("data-eitri-visual", "line");
+    select("shell", "48,315");
+    p.placeVisual();
+    const row = box(rowWith("shell"));
+    expect(band().hidden).toBe(false);
+    expect(band().style.top).toBe(`${row.top}px`);
+    expect(band().style.height).toBe(`${row.height}px`);
+  });
+
+  it("is one band over a range of rows, the gaps between them included", () => {
+    show(TABLE);
+    document.documentElement.setAttribute("data-eitri-visual", "line");
+    select("core", "48,315");
+    p.placeVisual();
+    const first = box(rowWith("core"));
+    const last = box(rowWith("shell"));
+    expect(band().style.top).toBe(`${first.top}px`);
+    expect(band().style.height).toBe(`${last.top + last.height - first.top}px`);
+    expect(document.querySelectorAll(".mdp-visual-band").length).toBe(1);
+  });
+
+  it("spans paragraphs, list items and a quote from the first selected row to the last", () => {
+    show("first para\n\n- one\n- two\n\n> quoted\n");
+    document.documentElement.setAttribute("data-eitri-visual", "line");
+    select("first", "quoted");
+    p.placeVisual();
+    const a = box(find("first").node.parentElement!);
+    const b = box(find("quoted").node.parentElement!);
+    expect(band().style.top).toBe(`${a.top}px`);
+    expect(band().style.height).toBe(`${b.top + b.height - a.top}px`);
+  });
+
+  it("is not drawn charwise, without a selection on the page, or when the mode ended", () => {
+    show(TABLE);
+    document.documentElement.setAttribute("data-eitri-visual", "char");
+    select("shell", "48,315");
+    p.placeVisual();
+    expect(band().hidden).toBe(true);
+    document.documentElement.setAttribute("data-eitri-visual", "line");
+    document.getSelection()!.removeAllRanges();
+    p.placeVisual();
+    expect(band().hidden).toBe(true);
+  });
+
+  it("follows the selection: the kit's follow after a move places it", () => {
+    show(TABLE);
+    document.documentElement.setAttribute("data-eitri-visual", "line");
+    select("core", "146,507");
+    const r = box(rowWith("core"));
+    p.followSelection({ top: r.top, bottom: r.top + r.height, left: 0, right: 10, width: 10, height: r.height, x: 0,
+      y: r.top, toJSON: () => ({}) } as DOMRect);
+    expect(band().hidden).toBe(false);
+    expect(band().style.top).toBe(`${r.top}px`);
+  });
+});
+
+describe("charwise visual mode's boxes", () => {
+  /* Boxes by text: each text node named here lies on one line at `top`, `left`, `width` px (`rows` lines of it
+     stacked 20 px apart, the width split evenly), its characters evenly wide; text not named keeps the fake layout. */
+  type Fake = { top: number; height: number; left: number; width: number; rows?: number };
+  let boxes: Map<string, Fake>;
+  let undo: () => void = () => {};
+  beforeEach(() => {
+    boxes = new Map();
+    const proto = Range.prototype as Range & { getClientRects(): DOMRect[] };
+    const had = Object.getOwnPropertyDescriptor(proto, "getClientRects")!;
+    Object.defineProperty(proto, "getClientRects", {
+      configurable: true,
+      value: function (this: Range) {
+        const node = this.startContainer;
+        const f = node.nodeType === Node.TEXT_NODE ? boxes.get((node as Text).data) : undefined;
+        if (!f) return (had.value as () => DOMRect[]).call(this);
+        const n = (node as Text).data.length;
+        const rows = f.rows ?? 1;
+        const per = Math.ceil(n / rows);
+        const out: DOMRect[] = [];
+        const end = this.endContainer === node ? this.endOffset : n;
+        for (let r = 0; r < rows; r++) {
+          const a = Math.max(this.startOffset, r * per);
+          const b = Math.min(end, (r + 1) * per);
+          if (b < a) continue;
+          const w = f.width / per;
+          const top = f.top + 20 * r - window.scrollY;
+          const left = f.left + (a - r * per) * w;
+          out.push({ top, height: f.height, bottom: top + f.height, left, right: left + (b - a) * w, width: (b - a) * w,
+            x: left, y: top, toJSON: () => ({}) } as DOMRect);
+        }
+        return out;
+      },
+    });
+    undo = () => Object.defineProperty(proto, "getClientRects", had);
+  });
+  afterEach(() => { undo(); document.documentElement.removeAttribute("data-eitri-visual"); });
+  const drawn = () => [...document.querySelectorAll<HTMLElement>(".mdp-visual-box")]
+    .map((b) => [b.style.top, b.style.height, b.style.left, b.style.width].map((v) => parseFloat(v)));
+
+  it("draws each table cell's selected text apart, every box of a row at the row's height", () => {
+    show("| crate | lines | tests |\n| --- | --- | --- |\n| shell | 48,315 | 57,077 |\n");
+    boxes.set("shell", { top: 102, height: 18, left: 10, width: 50 });
+    boxes.set("48,315", { top: 100, height: 22, left: 90, width: 60 });
+    boxes.set("57,077", { top: 100, height: 22, left: 180, width: 60 });
+    const range = document.createRange();
+    const a = find("shell"), b = find("57,077");
+    range.setStart(a.node, a.offset);
+    range.setEnd(b.node, 1);
+    expect(selectionBoxes(range, 8)).toEqual([
+      { top: 100, bottom: 122, left: 10, right: 60 },
+      { top: 100, bottom: 122, left: 90, right: 150 },
+      { top: 100, bottom: 122, left: 180, right: 190 },
+    ]);
+  });
+
+  it("joins a row's text across a code span's padding and a space between two spans", () => {
+    show("x\n");
+    const para = root.querySelector("p")!;
+    para.replaceChildren();
+    const a = document.createElement("span"); a.textContent = "fn";
+    const b = document.createElement("span"); b.textContent = "main";
+    para.append(a, document.createTextNode(" "), b);
+    boxes.set("fn", { top: 0, height: 18, left: 0, width: 16 });
+    boxes.set(" ", { top: 0, height: 18, left: 16, width: 8 });
+    boxes.set("main", { top: 0, height: 18, left: 24, width: 32 });
+    const range = document.createRange();
+    range.selectNodeContents(para);
+    expect(selectionBoxes(range, 7)).toEqual([{ top: 0, bottom: 18, left: 0, right: 56 }]);
+  });
+
+  it("joins a row's text across a code span's padding and leaves out what has no width", () => {
+    show("say `code` here\n");
+    boxes.set("say ", { top: 0, height: 18, left: 0, width: 40 });
+    boxes.set("code", { top: 0, height: 18, left: 46, width: 40 });
+    boxes.set(" here", { top: 0, height: 18, left: 92, width: 50 });
+    const range = document.createRange();
+    range.selectNodeContents(root.querySelector("p")!);
+    expect(selectionBoxes(range, 8)).toEqual([{ top: 0, bottom: 18, left: 0, right: 142 }]);
+  });
+
+  it("is drawn by the page charwise, a row's band tall, so a wrapped paragraph's rows meet; not linewise", () => {
+    show("a paragraph long enough to wrap\n");
+    boxes.set("a paragraph long enough to wrap", { top: 1, height: 18, left: 0, width: 300, rows: 2 });
+    document.documentElement.setAttribute("data-eitri-visual", "char");
+    select("paragraph", "enough");
+    p.placeVisual();
+    const got = drawn();
+    expect(got.length).toBe(2);
+    expect(got[0][0] + got[0][1]).toBe(got[1][0]);
+    document.documentElement.setAttribute("data-eitri-visual", "line");
+    p.placeVisual();
+    expect(drawn()).toEqual([]);
+    expect(document.querySelector<HTMLElement>(".mdp-visual-band")!.hidden).toBe(false);
+  });
+
+  it("cuts a box to the sides of a block that scrolls sideways", () => {
+    show("```\nwide line\n```\n");
+    boxes.set("wide line\n", { top: 0, height: 18, left: 500, width: 300 });
+    const range = document.createRange();
+    range.selectNodeContents(root.querySelector("code")!);
+    expect(root.querySelector("pre")!.classList.contains("mdp-wide")).toBe(true);
+    expect(selectionBoxes(range, 8)).toEqual([{ top: 0, bottom: 18, left: 500, right: 600 }]);
+  });
+
+  it("moves with a block scrolled sideways under it", () => {
+    show("| a | b |\n| --- | --- |\n| cell | other |\n");
+    boxes.set("cell", { top: 40, height: 18, left: 10, width: 40 });
+    document.documentElement.setAttribute("data-eitri-visual", "char");
+    select("cell", "cell");
+    p.placeVisual();
+    expect(drawn()[0][2]).toBe(10);
+    boxes.set("cell", { top: 40, height: 18, left: -30, width: 40 });
+    root.querySelector("table")!.dispatchEvent(new Event("scroll"));
+    expect(drawn()[0][2]).toBe(0);
+  });
+
+  it("reads the rows once for a long selection, not once a box", () => {
+    const lines = Array.from({ length: 300 }, (_, i) => `line ${i}`);
+    show("```\n" + lines.join("\n") + "\n```\n");
+    document.documentElement.setAttribute("data-eitri-visual", "char");
+    select("line 0", "line 299");
+    const near = vi.spyOn(Preview.prototype as unknown as { rowsNear(y: number): unknown }, "rowsNear");
+    p.placeVisual();
+    expect(drawn().length).toBe(300);
+    expect(near.mock.calls.length).toBeLessThanOrEqual(2);
+  });
+
+  it("hides the kit's highlight: the page draws the selection itself", async () => {
+    const { readFileSync } = await import("node:fs");
+    const { dirname, resolve } = await import("node:path");
+    const { fileURLToPath } = await import("node:url");
+    const css = readFileSync(resolve(dirname(fileURLToPath(import.meta.url)), "../style/chrome.css"), "utf8");
+    expect(css).toMatch(/html\[data-eitri-visual\] ::highlight\(eitri-visual\) \{\s*background-color: transparent;/);
   });
 });

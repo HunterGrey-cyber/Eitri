@@ -7,6 +7,7 @@ import { trace } from "../trace";
 import { ScrollGuard } from "./anchor";
 import { boxAt, clickedRecently, lineAt, pickBlock, pickedLine } from "./current";
 import { RowCache, rowsIn, type Row } from "./rows";
+import { selectionBoxes, selectionSpan } from "./selection";
 import { buildIndex, lastLineAtOrBefore, lastTopAtOrBefore, measure, type Box } from "./lineindex";
 import { blockedText, BUFFER_CLOSED_TEXT, EDITOR_CLOSED_TEXT, EMPTY_TEXT, tooLargeText } from "./notices";
 import {
@@ -185,6 +186,12 @@ export class Preview {
   /** The bottom of the document's last row, for the line index (the layout) it was read on. */
   private lastRowMemo: { index: Box[]; bottom: number | null } | null = null;
   private readonly cursorLine: HTMLElement;
+  /** Visual line mode's band over the rows the selection spans. */
+  private readonly visualBand: HTMLElement;
+  /** Charwise visual mode's boxes over the selected characters. */
+  private readonly visualBoxes: HTMLElement;
+  /** What the visual band or boxes were last drawn for: the mode, the selection's ends and the layout. */
+  private visualMemo: { kind: string; ends: [Node, number, Node, number]; index: Box[]; width: number } | null = null;
   /** Images on the document route that failed to load, by URL, for the route they were seen under. */
   private failed = new Set<string>();
   private failedRoute = "";
@@ -213,10 +220,25 @@ export class Preview {
     this.cursorLine.className = "mdp-cursor-line";
     this.cursorLine.hidden = true;
     this.cursorBar.before(this.cursorLine);
+    this.visualBand = document.createElement("div");
+    this.visualBand.className = "mdp-visual-band";
+    this.visualBand.hidden = true;
+    this.cursorLine.before(this.visualBand);
+    this.visualBoxes = document.createElement("div");
+    this.visualBoxes.className = "mdp-visual-boxes";
+    this.visualBand.before(this.visualBoxes);
     this.setNotice(EMPTY_TEXT);
     const scroll = () => this.onScroll();
     const wheel = () => this.onPointer();
     const resize = () => this.applyReserve();
+    // A block scrolled sideways (a wide table or code block) moves the text under visual mode's boxes; its scroll
+    // does not reach the window, so it is caught on the way down.
+    const nestedScroll = (ev: Event) => {
+      if (ev.target === this.root || !document.documentElement.hasAttribute("data-eitri-visual")) return;
+      this.visualMemo = null;
+      this.placeVisual();
+    };
+    root.addEventListener("scroll", nestedScroll, true);
     // A press right of the content is on the scroll bar: dragging it is a pointer scroll like the wheel.
     const down = (ev: PointerEvent) => { if (ev.clientX >= document.documentElement.clientWidth) this.onPointer(); };
     // Image events do not bubble; the capture phase sees every image under the root.
@@ -239,11 +261,14 @@ export class Preview {
       window.removeEventListener("pointerdown", down);
       root.removeEventListener("load", loaded, true);
       root.removeEventListener("error", failed, true);
+      root.removeEventListener("scroll", nestedScroll, true);
       observer?.disconnect();
       this.revealer.cancel();
       this.endEngineScroll();
       this.cursorBar.remove();
       this.cursorLine.remove();
+      this.visualBand.remove();
+      this.visualBoxes.remove();
     });
   }
 
@@ -623,7 +648,8 @@ export class Preview {
 
   /** The cursor to the row holding source line `L` (a history entry's place), placed as a jump. */
   jumpCursorToLine(L: number): boolean {
-    return this.cursorBand() !== null && this.jumpBand(this.bandAt(lineToY(this.index(), L, Number.POSITIVE_INFINITY)));
+    const index = this.index();
+    return this.cursorBand() !== null && this.jumpBand(this.bandOfLine(index, L, lineToY(index, L, Number.POSITIVE_INFINITY)));
   }
 
   /** Where visual mode starts (`v`, `V`): the first character of the cursor's row, or the first text after it when
@@ -639,9 +665,88 @@ export class Preview {
    *  and the page scrolls as for a jump, only when that row is outside the margins. */
   followSelection(rect: DOMRect): void {
     const b = this.cursorBand();
-    if (!b) return;
-    const next = this.bandAt((rect.top + rect.bottom) / 2 + window.scrollY);
-    if (next && Math.abs(next.top - b.top) >= 0.5) this.jumpBand(next);
+    if (b) {
+      const next = this.bandAt((rect.top + rect.bottom) / 2 + window.scrollY);
+      if (next && Math.abs(next.top - b.top) >= 0.5) this.jumpBand(next);
+    }
+    this.placeVisual();
+  }
+
+  /** The page draws visual mode's selection itself (the kit's highlight is hidden in `chrome.css`: WebKitGTK paints
+   *  none on a list item's own text beside its nested list, which sits in an anonymous block). Linewise
+   *  (`data-eitri-visual="line"` on the root): one band from the top of the selection's first row to the bottom of
+   *  its last, across the text as the cursor's band is, a table row's whole box included: the lines are selected
+   *  whole, the gaps between them too, as vim's `V` shows them. Charwise: a box over the selected characters of each
+   *  row (`selectionBoxes`), a table cell's apart from the next cell's, each as tall as the row's band, so a row's
+   *  boxes have one height and the rows of a paragraph meet. Drawn again only when the selection or the layout
+   *  changed. */
+  placeVisual(): void {
+    const kind = document.documentElement.getAttribute("data-eitri-visual");
+    const s = document.getSelection();
+    const range = s && s.rangeCount > 0 ? s.getRangeAt(0) : null;
+    if ((kind !== "line" && kind !== "char") || this.root.hidden || !range || !this.root.contains(range.startContainer) ||
+      !this.root.contains(range.endContainer)) {
+      this.visualBand.hidden = true;
+      this.visualBoxes.replaceChildren();
+      this.visualMemo = null;
+      return;
+    }
+    const index = this.index();
+    const rootBox = this.root.getBoundingClientRect();
+    const ends: [Node, number, Node, number] = [range.startContainer, range.startOffset, range.endContainer, range.endOffset];
+    const memo = this.visualMemo;
+    if (memo && memo.kind === kind && memo.index === index && memo.width === rootBox.width &&
+      memo.ends.every((v, i) => v === ends[i])) return;
+    this.visualMemo = { kind, ends, index, width: rootBox.width };
+    this.visualBand.hidden = true;
+    this.visualBoxes.replaceChildren();
+    const scheme = getComputedStyle(document.documentElement).getPropertyValue("--nv-color-scheme").trim() === "light"
+      ? "light" : "dark";
+    if (kind === "char") {
+      const join = (parseFloat(getComputedStyle(this.root).fontSize) || 16) / 2;
+      const boxes = selectionBoxes(range, join);
+      // The rows the boxes lie on, read once (a long code block is one block: reading its rows per box would cost the
+      // square of its length); the boxes come in row order, so one pass pairs them.
+      let lo = Number.POSITIVE_INFINITY;
+      let hi = Number.NEGATIVE_INFINITY;
+      for (const b of boxes) { lo = Math.min(lo, b.top); hi = Math.max(hi, b.bottom); }
+      const rows = boxes.length > 0
+        ? rowsIn(this.root, index, lo, hi, this.lineHeight(), window.scrollY, this.rowsOf(index)) : [];
+      let k = 0;
+      for (const box of boxes) {
+        const mid = (box.top + box.bottom) / 2;
+        while (k + 1 < rows.length && rows[k].bottom <= mid) k++;
+        const row = rows[k];
+        const band = row && mid >= row.top && mid < row.bottom ? this.bandIn(row, mid) : null;
+        const top = band ? Math.min(band.top, box.top) : box.top;
+        const bottom = band ? Math.max(band.bottom, box.bottom) : box.bottom;
+        const el = document.createElement("div");
+        el.className = "mdp-visual-box";
+        el.dataset.scheme = scheme;
+        Object.assign(el.style, { top: `${top}px`, height: `${bottom - top}px`, left: `${box.left}px`,
+          width: `${box.right - box.left}px` });
+        this.visualBoxes.append(el);
+      }
+      return;
+    }
+    const span = selectionSpan(range);
+    if (!span) return;
+    const a = this.bandAt(span.first);
+    const b = this.bandAt(span.last);
+    if (!a || !b) return;
+    let top = Math.min(a.top, b.top);
+    let bottom = Math.max(a.bottom, b.bottom);
+    for (const row of span.rows) {
+      if (!row) continue;
+      const box = row.getBoundingClientRect();
+      top = Math.min(top, box.top + window.scrollY);
+      bottom = Math.max(bottom, box.bottom + window.scrollY);
+    }
+    const left = rootBox.left + window.scrollX - 12;
+    Object.assign(this.visualBand.style, { top: `${top}px`, height: `${bottom - top}px`, left: `${left}px`,
+      width: `${rootBox.width + 12}px` });
+    this.visualBand.dataset.scheme = scheme;
+    this.visualBand.hidden = false;
   }
 
   /** A click: the cursor to the clicked row, without scrolling. It may come before the keys do; the cursor is then
@@ -842,6 +947,20 @@ export class Preview {
     const end = index[index.length - 1];
     return this.bandAt(end.top + end.height);
   }
+  /** The band of source line `line` at document y `y` (where the line index puts it): the row nearest `y`, unless
+   *  that row lies outside the line's own block while the block has a row from `y` down. A line's top can sit in its
+   *  block's padding (a table row's top is the border above its cells' padding), nearer the text of the row above
+   *  than its own. */
+  private bandOfLine(index: Box[], line: number, y: number): Band | null {
+    const band = this.bandAt(y);
+    const i = lastLineAtOrBefore(index, line);
+    if (!band || i < 0 || line >= index[i].end) return band;
+    const box = index[i];
+    const inBox = (b: Band) => b.bottom > box.top + 0.5 && b.top < box.top + box.height - 0.5;
+    if (inBox(band)) return band;
+    const below = this.firstBandFrom(Math.max(y, box.top));
+    return below && inBox(below) ? below : band;
+  }
   /** The first band starting at or below `y`, else the band nearest it. */
   private firstBandFrom(y: number): Band | null {
     const b = this.bandAt(y);
@@ -884,7 +1003,7 @@ export class Preview {
       const i = lastLineAtOrBefore(index, line);
       if (i >= 0 && line < index[i].end) {
         const shown = line + (v.cursor.line === v.top ? v.top_fraction : 0);
-        band = this.bandAt(lineToY(index, shown, Number.POSITIVE_INFINITY) + ROW_PROBE_PX);
+        band = this.bandOfLine(index, line, lineToY(index, shown, Number.POSITIVE_INFINITY) + ROW_PROBE_PX);
         picked = index[i];
       } else {
         // A line between blocks that has a row of its own (a list item's own line above its nested list): that row.
@@ -1214,6 +1333,7 @@ export class Preview {
      the text, as nvim's 'cursorline'. While nvim leads, nvim's cursor line, marked in the margin beside the block
      that holds it. */
   private placeBars(): void {
+    this.placeVisual();
     this.cursorBar.hidden = true;
     this.cursorLine.hidden = true;
     const rootBox = this.root.getBoundingClientRect();

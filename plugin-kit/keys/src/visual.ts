@@ -48,8 +48,43 @@ function mark(next: VisualKind | null): void {
   else document.documentElement.removeAttribute("data-eitri-visual");
 }
 
+/** The highlight the selection is drawn as, where the engine has the Custom Highlight API. */
+const HIGHLIGHT = "eitri-visual";
+type Registry = { set(name: string, value: unknown): unknown; delete(name: string): unknown };
+
+function registry(): { highlights: Registry; make: () => { add(range: Range): unknown } } | null {
+  const css = (globalThis as { CSS?: { highlights?: Registry } }).CSS;
+  const ctor = (globalThis as { Highlight?: new () => { add(range: Range): unknown } }).Highlight;
+  return css?.highlights && typeof ctor === "function" ? { highlights: css.highlights, make: () => new ctor() } : null;
+}
+
+/* The selection is drawn as a highlight of its text, and the engine's own selection painting is turned off
+   (`data-eitri-visual-paint`): WebKit paints a selection with gaps, filling a table cell's padding up to the next
+   selected cell and a block's width past the end of its text, so a row of cells came out as boxes of different
+   widths and heights, slivers above the text and a cell left out. A highlight paints the selected characters and
+   nothing else. Without the API the engine's selection stays, in the Visual colour. WebKitGTK 2.54 paints no
+   highlight on text that sits in an anonymous block (a list item's own text beside its nested list): a page whose
+   text can be laid out that way draws the selection itself and hides this one. */
+function paint(s: Selection | null): void {
+  const api = registry();
+  if (!api || !kind || !s || s.rangeCount === 0) {
+    unpaint();
+    return;
+  }
+  const highlight = api.make();
+  highlight.add(s.getRangeAt(0).cloneRange());
+  api.highlights.set(HIGHLIGHT, highlight);
+  document.documentElement.setAttribute("data-eitri-visual-paint", "highlight");
+}
+
+function unpaint(): void {
+  registry()?.highlights.delete(HIGHLIGHT);
+  document.documentElement.removeAttribute("data-eitri-visual-paint");
+}
+
 onRemove(() => {
   if (kind) document.getSelection()?.removeAllRanges();
+  unpaint();
   mark(null);
   kind = null;
   anchor = null;
@@ -171,8 +206,8 @@ function moveCursor(s: Alterable, at: Place, motion: string): Place | null {
   switch (motion) {
     case "h": return step(s, at, "backward");
     case "l": return step(s, at, "forward");
-    case "j": return from(s, at, (sel) => sel.modify("extend", "forward", "line"));
-    case "k": return from(s, at, (sel) => sel.modify("extend", "backward", "line"));
+    case "j": return rowMove(at, "forward") ?? from(s, at, (sel) => sel.modify("extend", "forward", "line"));
+    case "k": return rowMove(at, "backward") ?? from(s, at, (sel) => sel.modify("extend", "backward", "line"));
     case "b": return from(s, at, (sel) => sel.modify("extend", "backward", "word"));
     case "0": return from(s, at, (sel) => sel.modify("extend", "backward", "lineboundary"));
     case "w":
@@ -208,6 +243,58 @@ function moveCursor(s: Alterable, at: Place, motion: string): Place | null {
   }
 }
 
+/** The offset of a text's last character (a whole code point: a letter outside the BMP is two UTF-16 units). */
+function lastCharOffset(t: Text): number {
+  const points = [...t.data];
+  return Math.max(0, t.data.length - (points[points.length - 1]?.length ?? 1));
+}
+
+/** The cells of a table row, in order. */
+function cellsOf(row: Element): Element[] {
+  return [...row.children].filter((c) => c.matches("td, th"));
+}
+
+/** `j` and `k` from a table row. The engine's line move goes from a cell to the next cell of the same row (each cell
+ *  is a block of its own), so the cursor goes to the row below (above) instead: the cell in the same column, at the
+ *  same character or the cell's last; past the table's last (first) row, to the first text after the table (the
+ *  last character before it). Null outside a table. */
+function rowMove(at: Place, direction: Direction): Place | null {
+  const row = rowOf(at.node);
+  const table = row?.closest("table");
+  if (!row || !table) return null;
+  const rows: Element[] = [...table.querySelectorAll("tr")].filter((r) => r.closest("table") === table && texts(r).length > 0);
+  const el = at.node.nodeType === Node.ELEMENT_NODE ? (at.node as Element) : at.node.parentElement;
+  const cell = el?.closest("td, th") ?? null;
+  const column = cell && cell.parentElement === row ? cellsOf(row).indexOf(cell) : 0;
+  // Characters are counted in code points, so the cursor never lands inside a letter outside the BMP.
+  let chars = 0;
+  for (const t of cell ? texts(cell) : []) {
+    if (t === at.node) { chars += [...t.data.slice(0, at.offset)].length; break; }
+    chars += [...t.data].length;
+  }
+  const next = rows[rows.indexOf(row) + (direction === "forward" ? 1 : -1)];
+  if (next) {
+    const cells = cellsOf(next);
+    const target = cells[Math.min(column, cells.length - 1)];
+    let inCell = target ? texts(target) : [];
+    if (inCell.length === 0) inCell = texts(next);
+    for (const t of inCell) {
+      const points = [...t.data];
+      if (chars < points.length) return { node: t, offset: points.slice(0, chars).join("").length };
+      chars -= points.length;
+    }
+    const last = inCell[inCell.length - 1];
+    return { node: last, offset: lastCharOffset(last) };
+  }
+  const all = texts(rootOf()).filter((t) => !table.contains(t));
+  if (direction === "forward") {
+    const after = all.find((t) => (table.compareDocumentPosition(t) & Node.DOCUMENT_POSITION_FOLLOWING) !== 0);
+    return after ? { node: after, offset: 0 } : at;
+  }
+  const before = all.reverse().find((t) => (table.compareDocumentPosition(t) & Node.DOCUMENT_POSITION_PRECEDING) !== 0);
+  return before ? { node: before, offset: lastCharOffset(before) } : at;
+}
+
 /** Linewise: both ends go out to the boundaries of the lines they are on, the focus's end last. */
 function wholeLines(s: Alterable): void {
   const forward = !s.anchorNode || !s.focusNode ||
@@ -223,15 +310,47 @@ function wholeLines(s: Alterable): void {
   reverse();
 }
 
+/** The table row holding a place, if it is in one on the page. */
+function rowOf(node: Node | null): Element | null {
+  const el = node && (node.nodeType === Node.ELEMENT_NODE ? (node as Element) : node.parentElement);
+  const row = el?.closest("tr") ?? null;
+  return row && onPage(row) ? row : null;
+}
+
+/** Linewise in a table: a row is one line, as its source is. The engine's line boundary is a cell's (each cell is a
+ *  block of its own), so an end in a row goes out to the row's first and last text. */
+function wholeRows(s: Alterable): void {
+  if (!s.anchorNode || !s.focusNode) return;
+  const a: Place = { node: s.anchorNode, offset: s.anchorOffset };
+  const f: Place = { node: s.focusNode, offset: s.focusOffset };
+  const forward = order(f, a) >= 0;
+  const [first, last] = forward ? [a, f] : [f, a];
+  const out = (p: Place, start: boolean): Place => {
+    const row = rowOf(p.node);
+    const text = row ? texts(row) : [];
+    if (text.length === 0) return p;
+    const t = start ? text[0] : text[text.length - 1];
+    return start ? { node: t, offset: 0 } : { node: t, offset: t.data.length };
+  };
+  const from = out(first, true);
+  const to = out(last, false);
+  if (forward) s.setBaseAndExtent(from.node, from.offset, to.node, to.offset);
+  else s.setBaseAndExtent(to.node, to.offset, from.node, from.offset);
+}
+
 /** Draws vim's selection from the two ends: both characters and what lies between, the focus on the cursor's side
- *  (after its character going forward, before it going back); linewise, their whole lines. */
+ *  (after its character going forward, before it going back); linewise, their whole lines (a table row whole). */
 function draw(s: Alterable): void {
   if (!anchor || !cursor) return;
   const forward = order(cursor, anchor) >= 0;
   const a = forward ? anchor : step(s, anchor, "forward");
   const c = forward ? step(s, cursor, "forward") : cursor;
   s.setBaseAndExtent(a.node, a.offset, c.node, c.offset);
-  if (kind === "line") wholeLines(s);
+  if (kind === "line") {
+    wholeLines(s);
+    wholeRows(s);
+  }
+  paint(s);
 }
 
 /* The page's first and last text: `gg` and `G` stop there, and the selection never takes in what follows the
@@ -356,6 +475,7 @@ export function endVisual(): void {
   if (!kind) return;
   kind = null;
   mark(null);
+  unpaint();
   anchor = null;
   cursor = null;
   pending = "";

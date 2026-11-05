@@ -86,15 +86,29 @@ div.mdp-box {
 /* The cursor's row band, nvim's CursorLine colour across the text. It lies over the text, so it blends: on a dark
    scheme only what is darker than the band (the background) takes its colour, on a light one only what is lighter,
    and the text keeps its own colour either way. The page sets data-scheme from --nv-color-scheme. */
-.mdp-cursor-line {
+.mdp-cursor-line, .mdp-visual-band, .mdp-visual-box {
   position: absolute;
   pointer-events: none;
   background-color: var(--nv-cursorline);
   mix-blend-mode: lighten;
 }
 
-.mdp-cursor-line[data-scheme="light"] {
+.mdp-cursor-line[data-scheme="light"], .mdp-visual-band[data-scheme="light"], .mdp-visual-box[data-scheme="light"] {
   mix-blend-mode: darken;
+}
+
+/* Visual mode's selection, drawn by the page in the same colour, blended the same way: linewise a band over the
+   selected rows (a table row's every cell at one height), charwise a box over each row's selected characters. Each
+   is gone as soon as the mode is not its own. The kit's highlight of the selection is not painted: WebKitGTK paints
+   none on text in an anonymous block (a list item's own text beside its nested list), and two paints would not
+   match. */
+.mdp-visual-band[hidden], html:not([data-eitri-visual="line"]) .mdp-visual-band,
+html:not([data-eitri-visual="char"]) .mdp-visual-box {
+  display: none;
+}
+
+html[data-eitri-visual] ::highlight(eitri-visual) {
+  background-color: transparent;
 }
 
 .mdp-cursor-line[hidden] {
