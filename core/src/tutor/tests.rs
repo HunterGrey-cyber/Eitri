@@ -399,6 +399,7 @@ fn a_path_with_a_character_runtimepath_does_not_take_literally_is_refused() {
 struct FakeEditor {
     target: Cell<Option<u64>>,
     calls: RefCell<Vec<(Value, Answer)>>,
+    attached: Cell<bool>,
 }
 
 impl EditorRpc for FakeEditor {
@@ -413,6 +414,22 @@ impl EditorRpc for FakeEditor {
     fn target(&self) -> Option<u64> {
         self.target.get()
     }
+
+    fn attached(&self) -> bool {
+        self.attached.get()
+    }
+}
+
+#[test]
+fn a_taken_over_nvim_gets_no_tutor_and_is_not_asked() {
+    let editor = Rc::new(FakeEditor::default());
+    editor.attached.set(true);
+    let mut tutor = installer(&editor);
+    editor.target.set(Some(3));
+    let now = Instant::now();
+    assert_eq!(tutor.editor_session(now), None);
+    assert_eq!(tutor.editor_session(now), None, "said once, then nothing");
+    assert_eq!(editor.calls(), 0);
 }
 
 impl FakeEditor {

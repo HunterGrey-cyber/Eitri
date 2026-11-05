@@ -489,6 +489,9 @@ pub struct LiveSession {
     /// The pane's own nvim a followed `:connect` left, and its address: it runs on with no UI, unless
     /// a banged `:connect` stopped it. Held only to say whether it still runs
     /// ([`NeovideEditorPane::left_running`]); nothing signals or ends it.
+    /// Whether this session's nvim is the server a followed `:restart` started: its parent was the nvim before
+    /// it, so a launcher has nothing to do with how it outlives the fork's report.
+    restarted: bool,
     left: Option<(Arc<nvim_child::NvimProcess>, Option<String>)>,
 }
 
@@ -594,6 +597,7 @@ impl LiveSession {
             exit_wake: RefCell::new(None),
             grace_wake: RefCell::new(None),
             serial: NEXT_SESSION_SERIAL.fetch_add(1, Ordering::Relaxed),
+            restarted: false,
             left: None,
         }
     }
@@ -623,6 +627,7 @@ impl LiveSession {
                 println!("[live] the editor follows nvim's :restart to the server it started; asking it for its pid");
                 ask_nvim_for_its_pid(&self.harness, &process, Some(learned.clone()));
                 self.nvim_process = Some(process);
+                self.restarted = true;
                 PaneFollowed::Restart
             }
             Followed::Connect { left } => {
@@ -1435,11 +1440,22 @@ fn record_end(session: &LiveSession, slot: &RefCell<Option<PaneEnded>>) -> Optio
 
 /// The line the service logs when it tells the host nvim is out of reach: its process outlived the fork's report of
 /// its exit by [`UNREACHABLE_GRACE`]. Only nvim run behind a launcher is said to have been left by one.
-fn unreachable_log_line(behind_a_launcher: bool) -> String {
-    let why = if behind_a_launcher {
-        " (its launcher exited without it)"
-    } else {
-        ""
+/// How the nvim a session holds came to run, for the line that says it outlived the fork's report of its exit.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum NvimStart {
+    /// Started by the fork, as the pane's own child.
+    Direct,
+    /// Behind a launcher that exited and left it running.
+    Launcher,
+    /// The server a followed `:restart` started: its parent was the nvim before it.
+    Restart,
+}
+
+fn unreachable_log_line(start: NvimStart) -> String {
+    let why = match start {
+        NvimStart::Direct => "",
+        NvimStart::Launcher => " (its launcher exited without it)",
+        NvimStart::Restart => " (the server nvim's :restart started)",
     };
     format!(
         "[live] the fork reports nvim exited, and nvim's own process is still alive {} ms later{why}; its exit is \
@@ -2856,12 +2872,17 @@ impl NeovideEditorPane {
                             should_fire_unreachable_callback = true;
                             println!(
                                 "{}",
-                                unreachable_log_line(
-                                    session
-                                        .nvim_process
-                                        .as_ref()
-                                        .is_some_and(|process| process.behind_a_launcher())
-                                )
+                                unreachable_log_line(if session.restarted {
+                                    NvimStart::Restart
+                                } else if session
+                                    .nvim_process
+                                    .as_ref()
+                                    .is_some_and(|process| process.behind_a_launcher())
+                                {
+                                    NvimStart::Launcher
+                                } else {
+                                    NvimStart::Direct
+                                })
                             );
                         }
                         if events.exited {
@@ -3971,8 +3992,8 @@ mod tests {
         exit_follows_quit, exit_log_line, failed_tick_should_render, nvim_args, os_scale_to_apply, restart_refusal,
         run_detached, sessionless_tick_should_render, spawn_named, tick_should_render, unreachable_log_line,
         watched_failure_note, with_display_hint, CallWatch, ChunkCheck, ChunkRefused, DisplayFacts, ExitEvents,
-        LiveState, NeovideEditorPaneOptions, RemapKick, RestartRefused, ScaleWatch, NVIM_FLOOR, NVIM_INSTALL_URL,
-        NVIM_VERSION_FLOOR, REMAP_RENDER_DELAY,
+        LiveState, NeovideEditorPaneOptions, NvimStart, RemapKick, RestartRefused, ScaleWatch, NVIM_FLOOR,
+        NVIM_INSTALL_URL, NVIM_VERSION_FLOOR, REMAP_RENDER_DELAY,
     };
     use gtk4::glib;
     use std::cell::Cell;
@@ -4410,9 +4431,18 @@ mod tests {
 
     #[test]
     fn only_nvim_behind_a_launcher_is_said_to_have_been_left_by_it() {
-        assert!(unreachable_log_line(true).contains("(its launcher exited without it)"));
-        let direct = unreachable_log_line(false);
+        assert!(unreachable_log_line(NvimStart::Launcher).contains("(its launcher exited without it)"));
+        let direct = unreachable_log_line(NvimStart::Direct);
         assert!(!direct.contains("launcher"), "{direct}");
+        let restarted = unreachable_log_line(NvimStart::Restart);
+        assert!(
+            restarted.contains("(the server nvim's :restart started)"),
+            "{restarted}"
+        );
+        assert!(
+            !restarted.contains("launcher"),
+            "a restarted server was left by no launcher: {restarted}"
+        );
         assert!(direct.contains("500 ms later"), "{direct}");
     }
 

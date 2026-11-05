@@ -220,7 +220,8 @@ assert(vim.deep_equal(seen, {
     );
 }
 
-/// The warning is one short line in a narrow nvim: the log path is shown from `~`.
+/// The warning is one short line: the log path is shown from `~` where the line has room for it (a narrower nvim
+/// gets the log's file name alone, `eitri_open_end_with_real_nvim.rs`).
 #[test]
 #[ignore = "needs a real nvim with serverstart() socket access"]
 fn the_warning_shows_the_log_from_the_home_directory() {
@@ -231,6 +232,7 @@ local seen = {}
 vim.notify = function(text, level) table.insert(seen, {text = text, level = level}) end
 vim.env.RUNNING_THEN = '4'
 vim.env.LOG_DIR = vim.env.HOME .. '/.local/state/eitri/companion'
+vim.o.columns = 200
 require('eitri').page('notes')
 assert(vim.wait(3000, function() return #seen == 1 end), vim.inspect(seen))
 assert(vim.deep_equal(seen, {

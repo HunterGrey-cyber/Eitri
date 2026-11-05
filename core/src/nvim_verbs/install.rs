@@ -112,6 +112,16 @@ impl VerbsInstaller {
         if self.installed_for == Some(target) || self.out.as_ref().is_some_and(|o| o.target == target) {
             return self.next_poll(now);
         }
+        if self.editor.as_ref().is_some_and(|e| e.attached()) {
+            // A taken-over nvim gets `:Eitri` from the takeover's glue, which also takes it out at the detach; the
+            // window's own install would be refused there, so it is not sent.
+            eprintln!(
+                "[nvim] :{COMMAND} in a taken-over nvim comes with the takeover; the window installs none of its own"
+            );
+            self.out = None;
+            self.installed_for = Some(target);
+            return None;
+        }
         self.out = None;
         self.send(target, now, now)
     }
@@ -214,6 +224,7 @@ mod tests {
     struct FakeEditor {
         target: Cell<Option<u64>>,
         calls: RefCell<Vec<(Value, Answer)>>,
+        attached: Cell<bool>,
     }
 
     impl EditorRpc for FakeEditor {
@@ -228,6 +239,25 @@ mod tests {
         fn target(&self) -> Option<u64> {
             self.target.get()
         }
+
+        fn attached(&self) -> bool {
+            self.attached.get()
+        }
+    }
+
+    #[test]
+    fn a_taken_over_nvim_is_not_asked_and_its_session_counts_as_done() {
+        let editor = Rc::new(FakeEditor::default());
+        editor.attached.set(true);
+        let mut installer = installer(&editor);
+        editor.target.set(Some(7));
+        let now = Instant::now();
+        assert_eq!(installer.editor_session(now), None);
+        assert_eq!(installer.editor_session(now), None, "said once, then nothing");
+        assert!(
+            editor.calls.borrow().is_empty(),
+            "the glue gives a taken-over nvim its :Eitri"
+        );
     }
 
     fn answer(ok: bool, early: bool, skipped: &[&str]) -> Result<Value, RpcError> {

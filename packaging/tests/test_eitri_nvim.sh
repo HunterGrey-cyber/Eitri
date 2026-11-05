@@ -75,6 +75,8 @@ cat >"$SCRATCH/late.lua" <<'LUA'
 local msgs = {}
 vim.notify = function(msg, level) table.insert(msgs, { msg, level }) end
 require("eitri").setup({ cmd = vim.env.EITRI_TEST_SCRIPT })
+-- Wide enough for the whole line: a narrower nvim names the log by its file alone.
+vim.o.columns = 200
 vim.cmd("EitriPanel")
 assert(vim.wait(5000, function() return #msgs > 0 end, 20), "no message after a late failure")
 assert(msgs[1][2] == vim.log.levels.WARN, "a window that ran and ended is not a warning: " .. vim.inspect(msgs))

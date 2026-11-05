@@ -350,6 +350,13 @@ impl TutorInstaller {
         if self.installed_for == Some(target) || self.out.as_ref().is_some_and(|o| o.target == target) {
             return self.next_poll(now);
         }
+        if self.editor.as_ref().is_some_and(|e| e.attached()) {
+            // Eitri adds no tutor to a taken-over nvim: nothing of the window's own stays in the person's nvim.
+            eprintln!("[tutor] :{COMMAND} is not offered in a taken-over nvim; nothing is installed there");
+            self.out = None;
+            self.installed_for = Some(target);
+            return None;
+        }
         self.out = None;
         self.send(target, now, now)
     }

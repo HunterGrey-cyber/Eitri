@@ -590,6 +590,16 @@ window.editor-hole, window.editor-hole .shell-root, window.editor-hole .content-
     font-size: 12px;
 }}
 
+/* A takeover window's band (`shell::takeover`): the terminal or its way back is gone. It lies over the content's
+   bottom row, so it has the top bar's own guarded pair as a fill; without one the modules' dividers show through. */
+.takeover-band {{
+    background-color: {bar};
+    color: {bar_fg};
+    border-top: 1px solid {border};
+    padding: 4px 10px;
+    font-size: 12px;
+}}
+
 /* The global f HINT's GTK labels -- top bar items, the editor pane, a bottom plugin pane
    -- are styled here. The panel draws its own, in the same pair. They sit
    in the window's hint overlay and never take a click (`can_target(false)`). The fill is in this
@@ -794,6 +804,7 @@ mod tests {
         for (selector, colour, min) in [
             (".module-toast", t.surface_fg, 4.5),
             (".close-prompt", t.surface_fg, 4.5),
+            (".takeover-band", t.surface_fg, 4.5),
             (".tray-chip", t.surface_muted, 4.5),
             (".tray-chip.attention", t.surface_fg, 4.5),
             ("constrip > label", t.surface_muted, 4.5),

@@ -72,26 +72,51 @@ local function ended(kind, code, stderr)
   return last, vim.log.levels.ERROR
 end
 
--- A takeover window ends while the terminal's UI is on its way back from the waiting room. A notice wider than the
--- command line raises the hit-enter prompt then, and nvim waits for a key with the terminal blank (it cannot redraw
--- while it waits) and answers no ordinary request. So the notice is cut to what fits: first the log is named by its
--- file alone, then the text is cut at the width.
+-- A window ends while this nvim may be narrow (tiled beside it) or while a terminal's UI is on its way back from a
+-- takeover's waiting room. A notice wider than the command line raises the hit-enter prompt then, and nvim waits for a
+-- key (with the terminal blank, after a takeover, since it cannot redraw while it waits) and answers no ordinary
+-- request. So the notice is cut to what fits: first a log is named by its file alone, then the text is cut at the
+-- width and marked with "…". Whatever was cut is not lost: the whole of what the window wrote to stderr goes to
+-- eitri.log in nvim's log directory (`stdpath("log")`), the last 400 lines kept.
+local LOG_KEEP = 400
+
+local function keep_whole(stderr)
+  pcall(function()
+    local dir = vim.fn.stdpath("log")
+    vim.fn.mkdir(dir, "p")
+    local path = dir .. "/eitri.log"
+    local lines = vim.fn.filereadable(path) == 1 and vim.fn.readfile(path, "", -LOG_KEEP) or {}
+    local stamp = os.date("%Y-%m-%d %H:%M:%S")
+    for _, line in ipairs(stderr) do
+      if line ~= "" then table.insert(lines, stamp .. " " .. line) end
+    end
+    vim.fn.writefile(vim.list_slice(lines, math.max(#lines - LOG_KEEP + 1, 1)), path)
+  end)
+end
+
 local function one_line(text)
   local width = vim.v.echospace
   local function fits(s) return vim.fn.strdisplaywidth(s) <= width end
-  if type(width) ~= "number" or fits(text) then return text end
+  if type(width) ~= "number" or fits(text) then return text, false end
   local head, file = text:match("^(.-; log: ).-([^/]+)$")
   if head then
     text = head .. file
-    if fits(text) then return text end
+    if fits(text) then return text, true end
   end
-  local n = math.max(width, 0)
-  local cut = vim.fn.strcharpart(text, 0, n)
+  local n = math.max(width - 1, 0)
+  local cut = vim.fn.strcharpart(text, 0, n) .. "…"
   while n > 0 and not fits(cut) do
     n = n - 1
-    cut = vim.fn.strcharpart(text, 0, n)
+    cut = vim.fn.strcharpart(text, 0, n) .. "…"
   end
-  return cut
+  return cut, true
+end
+
+-- Shows how a window ended on one line, keeping the whole of its stderr in eitri.log when the line had to be cut.
+local function report(text, level, stderr)
+  local shown, cut = one_line(text)
+  if cut then keep_whole(stderr) end
+  vim.notify(shown, level)
 end
 
 function M.page(id, dir)
@@ -124,7 +149,8 @@ function M.page(id, dir)
             vim.notify("eitri page: this Eitri has no page windows yet; update Eitri", vim.log.levels.ERROR)
             return
           end
-          vim.notify(ended("page", code, stderr))
+          local text, level = ended("page", code, stderr)
+          report(text, level, stderr)
         end)
       end
     end,
@@ -172,7 +198,7 @@ function M.open(dir)
             return
           end
           local text, level = ended("open", code, stderr)
-          vim.notify(one_line(text), level)
+          report(text, level, stderr)
         end)
       end
     end,
@@ -205,7 +231,8 @@ function M.panel(dir)
       if code ~= 0 then
         vim.schedule(function()
           if torn then return end
-          vim.notify(ended("panel", code, stderr))
+          local text, level = ended("panel", code, stderr)
+          report(text, level, stderr)
         end)
       end
     end,

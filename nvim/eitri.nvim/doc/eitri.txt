@@ -96,6 +96,13 @@ error message. Once the panel is up it writes its output to a log file of its
 own (under `~/.local/state/eitri/companion/`), so it keeps running after this
 nvim quits; if it fails later, the message names that log.
 
+                                                                   *eitri-log*
+A window's message fits on one line, so a narrow nvim never waits for <Enter>
+after it: a long log path is named by its file, and a longer message is cut
+and ends with "…". When a message was shortened, everything the window wrote
+is kept, with the time, in `eitri.log` in nvim's log directory (see
+|stdpath()|, "log"); its last 400 lines are kept.
+
 ==============================================================================
 3. SETUP                                                         *eitri-setup*
 
