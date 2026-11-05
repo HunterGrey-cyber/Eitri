@@ -64,6 +64,7 @@ describe("the page's rows", () => {
       ["cursor.down", ["j"]], ["cursor.up", ["k"]], ["cursor.half_down", ["d", "<C-d>"]],
       ["cursor.half_up", ["u", "<C-u>"]], ["cursor.page_down", ["<C-f>"]], ["cursor.page_up", ["<C-b>"]],
       ["cursor.first", ["gg"]], ["cursor.last", ["G"]],
+      ["block.next", ["}"]], ["block.prev", ["{"]],
       ["heading.next", ["]]"]], ["heading.prev", ["[["]], ["scroll.left", ["zh"]], ["scroll.right", ["zl"]],
       ["block.yank", ["yy"]], ["edit.here", ["<CR>"]],
     ]);

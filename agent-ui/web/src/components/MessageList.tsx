@@ -13,6 +13,7 @@ import { PermissionCard } from "./PermissionCard";
 import { Row } from "./Row";
 import { Revealed } from "./Revealed";
 import { revealHidden } from "../revealHidden";
+import { followSelection } from "../visualPaint";
 import type { PermissionDecision } from "../bridge";
 import { noteUserScroll, RESUME_FOLLOW_EVENT, USER_SCROLL_EVENT, type UserScrollDirection } from "../follow";
 import { pillLabel, pillShown } from "../pill";
@@ -231,6 +232,8 @@ export function MessageList({
   /** Cursor fill: its element, animator and row key. `placeBandRef` keeps placement current for
    *  the once-created observer. */
   const bandElRef = useRef<HTMLDivElement>(null);
+  /** VISUAL and V-LINE's selection, drawn by `../visualPaint` while one is on. */
+  const paintElRef = useRef<HTMLDivElement>(null);
   const bandRef = useRef<CursorBand | null>(null);
   const bandRowKeyRef = useRef<string | null>(null);
   const bandTabRef = useRef(tab);
@@ -291,7 +294,7 @@ export function MessageList({
     }
     for (const el of children) {
       // The band changes size as it glides; it is not content, and is placed from the rows.
-      if (el === bandElRef.current) continue;
+      if (el === bandElRef.current || el === paintElRef.current) continue;
       if (!observed.has(el)) {
         observer.observe(el);
         observed.add(el);
@@ -627,6 +630,16 @@ export function MessageList({
     placeBandRef.current(glide);
   });
   useEffect(() => () => bandRef.current?.stop(), []);
+  // The selection's own drawing follows every change of it while VISUAL or V-LINE is on.
+  const visualRef = useRef(visual);
+  visualRef.current = visual;
+  const painting = visual === "visual" || visual === "vline";
+  useEffect(() => {
+    const list = listRef.current;
+    const layer = paintElRef.current;
+    if (!painting || !list || !layer) return;
+    return followSelection(list, layer, () => visualRef.current ?? null);
+  }, [painting]);
 
   /** The card callbacks a row calls, through one ref that never changes, so a new callback from the
    *  parent (they are made on every render) does not make every row render again. */
@@ -723,6 +736,8 @@ export function MessageList({
         {/* The cursor's fill, behind the rows (`../cursorBand`). Hidden from assistive technology and from
             VISUAL's selection (`[aria-hidden="true"]` is chrome there). */}
         <div className="cursor-band" aria-hidden="true" ref={bandElRef} />
+        {/* VISUAL and V-LINE's selection (`../visualPaint`), over the rows. */}
+        <div className="visual-paint" aria-hidden="true" ref={paintElRef} />
       </div>
     </>
   );

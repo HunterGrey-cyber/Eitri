@@ -2843,9 +2843,13 @@ describe("VISUAL mode", () => {
     const rules = splitRules(stripComments(css)).filter((r) => r.selector.includes("::selection"));
     expect(rules.map((r) => r.selector).sort()).toEqual([
       '.message-list[data-visual="caret"] ::selection',
+      '.message-list[data-visual="visual"] ::selection, .message-list[data-visual="vline"] ::selection',
       ".message-list[data-visual] ::selection",
     ]);
-    for (const rule of rules) {
+    // VISUAL and V-LINE draw their own selection (`visualPaint.ts`): the engine's is not painted at all.
+    const own = rules.find((r) => r.selector.includes('"vline"'))!;
+    expect(own.declarations).toMatch(/background:\s*transparent/);
+    for (const rule of rules.filter((r) => r !== own)) {
       const fills = rule.declarations
         .split(";")
         .map((d) => d.trim())
@@ -2857,6 +2861,25 @@ describe("VISUAL mode", () => {
     expect("background: var(--nv-cursorline)").not.toMatch(SELECTION_FILL);
     expect("background: color-mix(in srgb, var(--nv-cursorline) 100%, transparent)").not.toMatch(SELECTION_FILL);
     expect("background: color-mix(in srgb, var(--nv-cursorline) 99%, var(--nv-bg))").not.toMatch(SELECTION_FILL);
+  });
+});
+
+describe("VISUAL's own selection layer", () => {
+  it("lies over the rows, blended so the text keeps its colour, and shows only in VISUAL and V-LINE", () => {
+    const rules = splitRules(stripComments(css));
+    const layer = rules.find((r) => r.selector === ".visual-paint")!;
+    expect(layer.declarations).toMatch(/position:\s*absolute/);
+    expect(layer.declarations).toMatch(/pointer-events:\s*none/);
+    // No stacking context between the boxes and the conversation: with a z-index on the layer the boxes would blend
+    // with an empty group of their own and cover the text, and a blend on the layer drew them opaque in WebKitGTK.
+    expect(layer.declarations).not.toMatch(/z-index|mix-blend-mode|isolation|opacity|transform|filter/);
+    const box = rules.find((r) => r.selector === ".visual-paint > div")!;
+    expect(box.declarations).toMatch(/background:\s*var\(--nv-cursorline\)/);
+    expect(box.declarations).toMatch(/mix-blend-mode:\s*lighten/);
+    expect(rules.find((r) => r.selector === '.visual-paint[data-scheme="light"] > div')!.declarations)
+      .toMatch(/mix-blend-mode:\s*darken/);
+    expect(rules.find((r) => r.selector.includes(":not([data-visual=\"visual\"])") && r.selector.endsWith(".visual-paint"))!
+      .declarations).toMatch(/display:\s*none/);
   });
 });
 

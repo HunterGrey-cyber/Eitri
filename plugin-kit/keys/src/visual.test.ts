@@ -315,6 +315,42 @@ describe("text the mode stands on", () => {
   });
 });
 
+describe("} and {", () => {
+  it("v} takes the selection to its block's end, then the next block's; { back to a block's start", async () => {
+    await start({ start: () => at("p", 0, 4) });
+    key("v");
+    key("}");
+    expect(sel().toString()).toBe("two three");
+    key("}");
+    expect(sel().toString()).toBe("two threefour five");
+    key("{");
+    expect(sel().toString()).toBe("two threef");
+    key("{");
+    expect(sel().toString()).toBe("one t");
+    key("{");
+    expect(sel().toString()).toBe("Title hereone t");
+  });
+
+  // Linewise the same motions take whole lines (`wholeLines`); the stand-in's line boundary is not WebKit's at a
+  // block's end, so this reads the motion charwise and the sandbox pass shows `V}`.
+  it("a list item's own text beside its nested list and a table row are blocks of their own", async () => {
+    document.body.innerHTML = '<main id="root"><p>intro text</p><ul><li>own text<ul><li>nested</li></ul></li></ul>' +
+      "<table><tbody><tr><td>core</td><td>146</td></tr><tr><td>shell</td><td>48</td></tr></tbody></table></main>";
+    await start({ start: () => at("p", 0, 0) });
+    key("v");
+    key("}");
+    expect(sel().toString()).toBe("intro text");
+    key("}");
+    expect(sel().toString()).toBe("intro textown text");
+    key("}");
+    expect(sel().toString()).toBe("intro textown textnested");
+    key("}");
+    expect(sel().toString()).toBe("intro textown textnestedcore146");
+    key("{");
+    expect(sel().toString()).toBe("intro textown textnestedc");
+  });
+});
+
 describe("V", () => {
   it("selects the cursor's whole line, and j and k add and drop whole lines", async () => {
     await start({ start: () => at("p", 0, 5) });

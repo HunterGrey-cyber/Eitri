@@ -23,7 +23,7 @@ const NOT_PAGE = "#eitri-keys-hud, #eitri-keys-sheet, #eitri-keys-find, #eitri-k
 const MARGIN_SHARE = 1 / 8;
 
 /** Visual mode's motions, vim's: fixed, as hint mode's letters are, so they are never declared. */
-const MOTIONS = ["h", "l", "j", "k", "w", "b", "e", "0", "$", "gg", "G", "n", "N"];
+const MOTIONS = ["h", "l", "j", "k", "w", "b", "e", "0", "$", "{", "}", "gg", "G", "n", "N"];
 const COMMANDS = ["o", "y", "v", "V", "<C-e>", "<C-y>", "<Esc>"];
 
 let kind: VisualKind | null = null;
@@ -229,6 +229,8 @@ function moveCursor(s: Alterable, at: Place, motion: string): Place | null {
       const end = from(s, at, (sel) => sel.modify("extend", "forward", "lineboundary"));
       return order(end, at) > 0 ? step(s, end, "backward") : at;
     }
+    case "}": return blockMove(at, "forward");
+    case "{": return blockMove(at, "backward");
     case "gg": case "G": {
       const all = texts(rootOf());
       const text = motion === "G" ? all[all.length - 1] : all[0];
@@ -247,6 +249,62 @@ function moveCursor(s: Alterable, at: Place, motion: string): Place | null {
 function lastCharOffset(t: Text): number {
   const points = [...t.data];
   return Math.max(0, t.data.length - (points[points.length - 1]?.length ?? 1));
+}
+
+/** The block a place belongs to for `{` and `}`: its table row, else its nearest ancestor laid out as a block (a
+ *  paragraph, a list item's own text, a heading, a code block), not inline. */
+function blockOf(node: Node, known: Map<Node, Element | null>): Element | null {
+  const had = known.get(node);
+  if (had !== undefined) return had;
+  let el: Element | null = node.nodeType === Node.ELEMENT_NODE ? (node as Element) : node.parentElement;
+  let block: Element | null = el?.closest("tr") ?? null;
+  for (; !block && el; el = el.parentElement) {
+    const display = getComputedStyle(el).display;
+    if (display && !display.startsWith("inline") && display !== "contents") block = el;
+  }
+  known.set(node, block);
+  return block;
+}
+
+/** `}` and `{`, vim's paragraph motions over the page's blocks: `}` to the last character of the cursor's block, or
+ *  from there to the last of the next block; `{` to the first character of the cursor's block, or from there to the
+ *  first of the block before. So a selection grows a whole block at a time, as `v}` and `V}` grow by paragraphs.
+ *  White space at a block's edges is passed over. */
+function blockMove(at: Place, direction: Direction): Place | null {
+  const all = texts(rootOf());
+  if (all.length === 0) return null;
+  const known = new Map<Node, Element | null>();
+  let i = all.indexOf(at.node as Text);
+  if (i < 0) {
+    // A place between texts: the text it stands before (forward) or after (backward).
+    i = direction === "forward" ? all.findIndex((t) => order({ node: t, offset: 0 }, at) >= 0)
+      : all.length - 1 - [...all].reverse().findIndex((t) => order({ node: t, offset: 0 }, at) < 0);
+    if (i < 0 || i >= all.length) return null;
+  }
+  // The run of texts around `k` in one block.
+  const run = (k: number): [number, number] => {
+    const block = blockOf(all[k], known);
+    let a = k;
+    let b = k;
+    while (a > 0 && blockOf(all[a - 1], known) === block) a--;
+    while (b + 1 < all.length && blockOf(all[b + 1], known) === block) b++;
+    return [a, b];
+  };
+  const first = (t: Text): Place => ({ node: t, offset: t.data.length - t.data.replace(/^\s+/, "").length });
+  const last = (t: Text): Place => {
+    const trimmed = t.data.replace(/\s+$/, "");
+    const points = [...trimmed];
+    return { node: t, offset: Math.max(0, trimmed.length - (points[points.length - 1]?.length ?? 1)) };
+  };
+  const [a, b] = run(i);
+  if (direction === "forward") {
+    const end = last(all[b]);
+    if (order(end, at) > 0) return end;
+    return b + 1 < all.length ? last(all[run(b + 1)[1]]) : null;
+  }
+  const start = first(all[a]);
+  if (order(start, at) < 0) return start;
+  return a > 0 ? first(all[run(a - 1)[0]]) : null;
 }
 
 /** The cells of a table row, in order. */

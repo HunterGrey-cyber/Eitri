@@ -21,6 +21,8 @@ export const PAGE_ROWS: Row[] = [
   { action: "cursor.page_up", keys: ["<C-b>"], context: PAGE_CONTEXT, desc: "a page up" },
   { action: "cursor.first", keys: ["gg"], context: PAGE_CONTEXT, desc: "first row" },
   { action: "cursor.last", keys: ["G"], context: PAGE_CONTEXT, desc: "last row" },
+  { action: "block.next", keys: ["}"], context: PAGE_CONTEXT, desc: "next block" },
+  { action: "block.prev", keys: ["{"], context: PAGE_CONTEXT, desc: "previous block" },
   { action: "heading.next", keys: ["]]"], context: PAGE_CONTEXT, desc: "next heading" },
   { action: "heading.prev", keys: ["[["], context: PAGE_CONTEXT, desc: "previous heading" },
   { action: "scroll.left", keys: ["zh"], context: PAGE_CONTEXT, desc: "scroll the block left" },
@@ -275,6 +277,9 @@ export async function installKeys(
       // gg and G are jumps, as in vim; a held key's repeats move nothing more.
       case "cursor.first": if (!ev.repeat) jumping(p, () => p.cursorFirst()); return true;
       case "cursor.last": if (!ev.repeat) jumping(p, () => p.cursorLast()); return true;
+      // `}`/`{` are jumps, as vim's paragraph motions are.
+      case "block.next": jumping(p, () => p.blockJump(1)); return true;
+      case "block.prev": jumping(p, () => p.blockJump(-1)); return true;
       case "heading.next": heading(p, 1); return true;
       case "heading.prev": heading(p, -1); return true;
       case "scroll.left": sideways(p, -SIDEWAYS_PX); return true;

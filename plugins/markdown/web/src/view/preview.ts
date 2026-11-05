@@ -652,6 +652,61 @@ export class Preview {
     return this.cursorBand() !== null && this.jumpBand(this.bandOfLine(index, L, lineToY(index, L, Number.POSITIVE_INFINITY)));
   }
 
+  /** `}` / `{`: the cursor to the first row of the next block below its row (`}`), or to the first row of the block
+   *  it is in when it is below that row, else of the block above (`{`): the blocks the margin bar marks (the line
+   *  index's), and a row between them (a list item's own text above its nested list) as a block of its own line. A
+   *  jump, placed as `jumpCursorTo` places one. False when there is no such row. */
+  blockJump(dir: 1 | -1): boolean {
+    const b = this.cursorBand();
+    if (!b) return false;
+    const target = dir > 0 ? this.nextBlockStart(b) : this.blockStartBefore(b);
+    return target !== null && Math.abs(target.top - b.top) >= 0.5 && this.jumpBand(target);
+  }
+  /** The index block holding band `b`'s middle, or null for a row between blocks. */
+  private blockOfBand(b: Band): Box | null {
+    const index = this.index();
+    const mid = (b.top + b.bottom) / 2;
+    const i = lastTopAtOrBefore(index, mid);
+    if (i < 0 || mid >= index[i].top + index[i].height) return null;
+    const box = index[i];
+    // The end sentinel stands for no block.
+    return i === index.length - 1 && !box.el.hasAttribute("data-line-end") ? null : box;
+  }
+  /** Whether bands `a` and `b` are in one block: one index block, or rows between blocks of one source line. */
+  private sameBlock(a: Band, b: Band): boolean {
+    const x = this.blockOfBand(a);
+    const y = this.blockOfBand(b);
+    if (x || y) return x === y;
+    const line = (r: Band) => this.sourceLineAt((r.top + r.bottom) / 2);
+    return line(a) !== null && line(a) === line(b);
+  }
+  /** The first row of the block after band `b`'s. */
+  private nextBlockStart(b: Band): Band | null {
+    const box = this.blockOfBand(b);
+    let next = this.firstBandFrom(box ? box.top + box.height : b.bottom);
+    for (let guard = 0; next && next.top > b.top + 0.5 && this.sameBlock(next, b) && guard < 1000; guard++) {
+      next = this.stepBand(next, 1);
+    }
+    return next && next.top > b.top + 0.5 ? next : null;
+  }
+  /** The first row of band `b`'s block when `b` is below it, else of the block above. */
+  private blockStartBefore(b: Band): Band | null {
+    const start = (r: Band): Band => {
+      const box = this.blockOfBand(r);
+      let first = box ? this.firstBandFrom(box.top) ?? r : r;
+      for (let guard = 0; guard < 1000; guard++) {
+        const up = this.stepBand(first, -1);
+        if (!up || up.top >= first.top - 0.5 || !this.sameBlock(up, r)) break;
+        first = up;
+      }
+      return first;
+    };
+    const own = start(b);
+    if (own.top < b.top - 0.5) return own;
+    const up = this.stepBand(b, -1);
+    return up && up.top < b.top - 0.5 ? start(up) : null;
+  }
+
   /** Where visual mode starts (`v`, `V`): the first character of the cursor's row, or the first text after it when
    *  the row has none (an image); null without a cursor. */
   visualStart(): Range | null {

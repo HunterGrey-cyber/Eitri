@@ -117,6 +117,7 @@ Give the preview the keys with your key, with `Ctrl+l` from the editor, or by cl
 | `d` or `Ctrl+d` / `u` or `Ctrl+u` | half a page down / up, the cursor with it |
 | `Ctrl+f` / `Ctrl+b` | a page down / up |
 | `gg` / `G` | the cursor to the first / last line (the document's last line at the bottom of the view, as in Vim) |
+| `}` / `{` | the cursor to the next block (a paragraph, a list item, a table row, a whole code block) / to the start of its block, or of the one before when it is there already |
 | `]]` / `[[` | the cursor to the next / previous heading |
 | `zh` / `zl` | scroll the current block sideways (a wide table, code block, formula or diagram) |
 | `/` | find in the rendered text; `Enter` runs the search (an empty one repeats the last), `Esc` cancels |
@@ -125,7 +126,7 @@ Give the preview the keys with your key, with `Ctrl+l` from the editor, or by cl
 | `yy` | copy the current block's Markdown source (for a code block, the code without the fence lines) |
 | `Enter` | edit here: move Neovim's cursor to this place and give Neovim the keys |
 | `v` / `V` | select text from the cursor, by characters / by whole lines ([Selecting text](#selecting-text)) |
-| `H` or `Ctrl+o` / `L` or `Ctrl+i` | back / forward between jumps inside the document: `gg`, `G`, `]]`, `[[`, a search and `n`/`N`, a heading link, a footnote |
+| `H` or `Ctrl+o` / `L` or `Ctrl+i` | back / forward between jumps inside the document: `gg`, `G`, `}`, `{`, `]]`, `[[`, a search and `n`/`N`, a heading link, a footnote |
 | `?` | the list of these keys |
 | `Esc` | leave a mode; also clears the search highlights |
 
@@ -133,7 +134,8 @@ Give the preview the keys with your key, with `Ctrl+l` from the editor, or by cl
   line you clicked. Double-clicking a block does what `Enter` does there.
 - `Enter` leaves Neovim's cursor on its line when it is already on the cursor's line (put there as you moved, or the
   line you came in with, where the column stays too), so Neovim's window does not scroll.
-- Moves that jump (`gg`, `G`, `]]`, `[[`, a search and `n`/`N`, a link inside the document, `H` and `L`) take the
+- The blocks `}` and `{` step through are the ones the bar in the margin marks.
+- Moves that jump (`gg`, `G`, `}`, `{`, `]]`, `[[`, a search and `n`/`N`, a link inside the document, `H` and `L`) take the
   cursor to the target and scroll only when it is outside the margins: as little as needed when it is near, centred
   when it is far, as in Neovim. Scrolling glides, or jumps at once when smooth scrolling is off or your desktop asks
   for reduced motion. A count (`5j`) is not read.
@@ -157,6 +159,7 @@ Give the preview the keys with your key, with `Ctrl+l` from the editor, or by cl
 |---|---|
 | `h` / `l`, `w` / `b` / `e`, `0` / `$` | move the cursor end of the selection by a character, a word, to the line's start or end |
 | `j` / `k` | a line down / up, as shown |
+| `}` / `{` | to the end of the block / to its start, then on to the end of the next block / the start of the one before: the selection grows a block at a time |
 | `gg` / `G` | to the first / last text |
 | `n` / `N` | to the next / previous match of the last search |
 | `o` | to the other end of the selection |
@@ -185,7 +188,7 @@ eitri.keymap.set("plugin:markdown", "e", "edit.here")
 
 `<prefix> ?` with the preview focused lists its keys first in Eitri's own key list. The actions are `cursor.down`,
 `cursor.up`, `cursor.half_down`, `cursor.half_up`, `cursor.page_down`, `cursor.page_up`, `cursor.first`,
-`cursor.last`, `scroll.down`, `scroll.up`, `heading.next`, `heading.prev`, `scroll.left`, `scroll.right`, `find.start`,
+`cursor.last`, `block.next`, `block.prev`, `scroll.down`, `scroll.up`, `heading.next`, `heading.prev`, `scroll.left`, `scroll.right`, `find.start`,
 `find.next`, `find.prev`, `hint.start`, `block.yank`, `edit.here`, `history.back`, `history.forward`, `sheet.open`,
 `mode.escape`, `visual.char` and `visual.line`. If you changed these keys for a release candidate, rename an override
 of `scroll.half_down`, `scroll.half_up`, `scroll.page_down`, `scroll.page_up`, `scroll.top` or `scroll.bottom` to the

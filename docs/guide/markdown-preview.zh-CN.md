@@ -1,5 +1,5 @@
 [English](markdown-preview.md) | 简体中文
-<!-- translated-from: markdown-preview.md sha256=f855bd8556a5dd07929923dcfd9630150a76d253aafb7b7feb50e865baaf5842 -->
+<!-- translated-from: markdown-preview.md sha256=7a83dd13e7d9da0f193f72b5b9d1a2eaa1856261a89dc804fba061c93dfdfcd1 -->
 
 # Markdown 预览
 
@@ -82,6 +82,7 @@ eitri.plugin.load("markdown", { auto = true })
 | `d` 或 `Ctrl+d` / `u` 或 `Ctrl+u` | 向下 / 向上半页，光标跟着走 |
 | `Ctrl+f` / `Ctrl+b` | 向下 / 向上一页 |
 | `gg` / `G` | 光标到第一行 / 最后一行（文档最后一行在视图底部，和 Vim 一样） |
+| `}` / `{` | 光标到下一块（一段、一个列表项、一行表格、整个代码块）/ 到所在块的开头，已经在开头时到上一块的开头 |
 | `]]` / `[[` | 光标到下一个 / 上一个标题 |
 | `zh` / `zl` | 横向滚动当前块（很宽的表格、代码块、公式或图表） |
 | `/` | 在渲染后的文字里查找；`Enter` 执行搜索（空的搜索重复上一次），`Esc` 取消 |
@@ -90,13 +91,14 @@ eitri.plugin.load("markdown", { auto = true })
 | `yy` | 复制当前块的 Markdown 源码（代码块只复制代码，不含围栏那两行） |
 | `Enter` | 在这里编辑：把 Neovim 的光标移到这个位置，并把按键交给 Neovim |
 | `v` / `V` | 从光标处开始选中文字，按字符 / 按整行（见[选中文字](#选中文字)） |
-| `H` 或 `Ctrl+o` / `L` 或 `Ctrl+i` | 在文档内部的跳转之间后退 / 前进：`gg`、`G`、`]]`、`[[`、搜索和 `n`/`N`、标题链接、脚注 |
+| `H` 或 `Ctrl+o` / `L` 或 `Ctrl+i` | 在文档内部的跳转之间后退 / 前进：`gg`、`G`、`}`、`{`、`]]`、`[[`、搜索和 `n`/`N`、标题链接、脚注 |
 | `?` | 列出这些按键 |
 | `Esc` | 退出当前模式；同时清除搜索高亮 |
 
 - 当前块是光标所在的那一块；边栏里另有一条竖线标出它。点击会把光标放到你点的那一行。双击一个块，等于在那里按 `Enter`。
 - 如果 Neovim 的光标已经在预览光标所在的那一行上（移动时放到那里的，或者进入预览时带进来的那一行，这时连所在的列也不变），`Enter` 让它留在那一行，所以 Neovim 的窗口不会滚动。
-- 跳转类的移动（`gg`、`G`、`]]`、`[[`、搜索和 `n`/`N`、文档内的链接、`H` 和 `L`）把光标移到目标上，只有目标在边距之外时才滚动：离得近就只滚动需要的那一点，离得远就把它放到中间，和 Neovim 一样。滚动是平滑的；关掉平滑滚动，或者桌面要求减少动画时，就立即跳过去。不支持计数（`5j`）。
+- `}` 和 `{` 一块一块走过的，就是边栏竖线标出的那些块。
+- 跳转类的移动（`gg`、`G`、`}`、`{`、`]]`、`[[`、搜索和 `n`/`N`、文档内的链接、`H` 和 `L`）把光标移到目标上，只有目标在边距之外时才滚动：离得近就只滚动需要的那一点，离得远就把它放到中间，和 Neovim 一样。滚动是平滑的；关掉平滑滚动，或者桌面要求减少动画时，就立即跳过去。不支持计数（`5j`）。
 - 默认情况下，搜索不区分大小写，除非搜索里有大写字母，和 Vim 的 `smartcase` 一样（`plugins.keys.find_case` 可以改）。状态行显示 `[3/12]`，到头接着找时显示 `search hit BOTTOM, continuing at TOP`。
 - 按下一个较长按键的第一个键（`g`、`z`、`y`、`[`、`]`）之后，状态行会列出接下来可以按的键。
 - 如果你的 Eitri 前缀是这些 Ctrl 键中的一个，它仍然是前缀，预览里就没有这个键：用默认前缀 `Ctrl+b` 时，没有 `Ctrl+b` 向上翻页。
@@ -111,6 +113,7 @@ eitri.plugin.load("markdown", { auto = true })
 |---|---|
 | `h` / `l`、`w` / `b` / `e`、`0` / `$` | 把选区光标那一端移动一个字符、一个词，或者移到行首、行尾 |
 | `j` / `k` | 向下 / 向上一个显示行 |
+| `}` / `{` | 到所在块的末尾 / 开头，再按就到下一块的末尾 / 上一块的开头：选区一次多一整块 |
 | `gg` / `G` | 到第一段 / 最后一段文字 |
 | `n` / `N` | 到上一次搜索的下一个 / 上一个匹配 |
 | `o` | 到选区的另一端 |
@@ -131,7 +134,7 @@ eitri.plugin.load("markdown", { auto = true })
 eitri.keymap.set("plugin:markdown", "e", "edit.here")
 ```
 
-焦点在预览上时，`<prefix> ?` 会在 Eitri 自己的按键列表里先列出它的按键。动作名是 `cursor.down`、`cursor.up`、`cursor.half_down`、`cursor.half_up`、`cursor.page_down`、`cursor.page_up`、`cursor.first`、`cursor.last`、`scroll.down`、`scroll.up`、`heading.next`、`heading.prev`、`scroll.left`、`scroll.right`、`find.start`、`find.next`、`find.prev`、`hint.start`、`block.yank`、`edit.here`、`history.back`、`history.forward`、`sheet.open`、`mode.escape`、`visual.char` 和 `visual.line`。如果你在候选版本里改过这些按键，把对 `scroll.half_down`、`scroll.half_up`、`scroll.page_down`、`scroll.page_up`、`scroll.top` 或 `scroll.bottom` 的修改改成对应的 `cursor.` 动作（`cursor.half_down`……`cursor.first`、`cursor.last`）：预览里已经没有这几个 `scroll.` 动作了。
+焦点在预览上时，`<prefix> ?` 会在 Eitri 自己的按键列表里先列出它的按键。动作名是 `cursor.down`、`cursor.up`、`cursor.half_down`、`cursor.half_up`、`cursor.page_down`、`cursor.page_up`、`cursor.first`、`cursor.last`、`block.next`、`block.prev`、`scroll.down`、`scroll.up`、`heading.next`、`heading.prev`、`scroll.left`、`scroll.right`、`find.start`、`find.next`、`find.prev`、`hint.start`、`block.yank`、`edit.here`、`history.back`、`history.forward`、`sheet.open`、`mode.escape`、`visual.char` 和 `visual.line`。如果你在候选版本里改过这些按键，把对 `scroll.half_down`、`scroll.half_up`、`scroll.page_down`、`scroll.page_up`、`scroll.top` 或 `scroll.bottom` 的修改改成对应的 `cursor.` 动作（`cursor.half_down`……`cursor.first`、`cursor.last`）：预览里已经没有这几个 `scroll.` 动作了。
 
 一步滚动多远、滚动是否带动画、`g` 这样的键等多久、什么时候列出接下来的键、提示标签用哪些字母、搜索怎样处理大小写，这些是所有插件页面共用的设置：见[插件页面里的按键](configuration.zh-CN.md#keys-in-a-plugin-page)。
 

@@ -570,6 +570,36 @@ pre {
 .message-list[data-visual] ::selection {
   background: color-mix(in srgb, var(--nv-cursorline) 99%, transparent);
 }
+/* VISUAL and V-LINE draw their selection themselves (`visualPaint.ts`, the `.visual-paint` layer): the engine's
+   selection fills a table cell's padding up to the next selected cell and a block's width past its text, so a
+   table row came out as boxes of different widths and heights with a sliver above the last cell. The layer's
+   boxes are nvim's Visual colour laid over the text, blended as the preview's cursor band is: on a dark scheme
+   only what is darker than the fill (the background) takes it, on a light one only what is lighter, and the text
+   keeps its colour. CARET keeps the engine's one reversed character. */
+.message-list[data-visual="visual"] ::selection, .message-list[data-visual="vline"] ::selection {
+  background: transparent;
+}
+/* The layer makes no stacking context of its own (no z-index, no blend): it is painted after the rows (positioned,
+   last in the list) and each box blends with the conversation under it, inside the list's own group. A z-index on
+   the layer would put the boxes in a group of their own with nothing under them; the blend moved onto the layer as
+   one group, WebKitGTK drew the boxes opaque over the text (sandbox, 2026-11-05). */
+.visual-paint {
+  position: absolute;
+  top: 0;
+  left: 0;
+  pointer-events: none;
+}
+.visual-paint > div {
+  position: absolute;
+  background: var(--nv-cursorline);
+  mix-blend-mode: lighten;
+}
+.visual-paint[data-scheme="light"] > div {
+  mix-blend-mode: darken;
+}
+.message-list:not([data-visual="visual"]):not([data-visual="vline"]) .visual-paint {
+  display: none;
+}
 .message-list[data-visual="caret"] ::selection {
   background: color-mix(in srgb, var(--nv-fg) 99%, transparent);
   color: var(--nv-bg);
