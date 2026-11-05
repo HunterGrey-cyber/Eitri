@@ -411,6 +411,8 @@ fn a_view_shown_by_the_panel_arrives_only_if_the_grab_took() {
         win: WIN,
         view: two(),
         card_first: false,
+        tab: None,
+        intent: crate::agents::Intent::Show,
     });
     let r = driven(with_extra_view(editor()));
     let refused = agent2();

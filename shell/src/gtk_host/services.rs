@@ -668,6 +668,12 @@ pub(crate) fn child_exited_here(terminals: &Registry<TerminalPane>, pid: u32, st
 }
 
 impl ServiceSet for Services {
+    fn view_of_tab(&self, tab: eitri_core::tabs::TabId) -> Option<ViewId> {
+        self.agent.view_of_tab(tab)
+    }
+    fn tab_moving(&self, tab: eitri_core::tabs::TabId) -> bool {
+        self.agent.tab_moving(tab)
+    }
     fn page_built(&self, module: &ModuleId) -> bool {
         self.plugin_panels.is_built(module)
     }
@@ -1022,14 +1028,31 @@ impl ServiceSet for Services {
                 self.agent.open_chooser(*view);
                 Ok(())
             }
-            // Into a chat view: when asked, the oldest card among that view's tabs (the base view switches to the tab
-            // holding it first), else the view's own arrival.
-            // Into a chat view: the oldest card among that view's tabs (the base view switches to the tab holding it
-            // first), else BROWSE, as every keyboard arrival there is -- on the last row if the reader was following
-            // it, else on the row and scroll they left (the page decides, `App.tsx`'s `arrive` effect).
-            ChatOp::Arrive { view, card_first, .. } => {
-                if !(*card_first && self.agent.focus_oldest_card(*view)) {
-                    self.agent.arrive(*view);
+            ChatOp::SelectTab { tab, .. } => self
+                .agent
+                .select_tab(*tab)
+                .then_some(())
+                .ok_or_else(|| "the tab is gone or moving".into()),
+            // A named arrival only reaches that tab's card; ordinary module arrivals keep the view's rule.
+            ChatOp::Arrive {
+                view,
+                card_first,
+                tab,
+                intent,
+                ..
+            } => {
+                if let Some(tab) = tab {
+                    if self.agent.view_of_tab(*tab) != Some(*view) || self.agent.tab_moving(*tab) {
+                        return Err("the tab is gone or moving".into());
+                    }
+                }
+                let focused = *card_first
+                    && match tab {
+                        Some(tab) => self.agent.focus_card_of(*tab),
+                        None => self.agent.focus_oldest_card(*view),
+                    };
+                if !focused || *intent == eitri_core::agents::Intent::Stop {
+                    self.agent.arrive_with_intent(*view, *intent);
                 }
                 Ok(())
             }

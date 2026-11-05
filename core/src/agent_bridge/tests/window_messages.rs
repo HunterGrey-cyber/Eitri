@@ -230,11 +230,23 @@ fn the_keymap_envelope_carries_the_panel_table() {
     );
 }
 
+fn intent_arrival(intent: crate::agents::Intent) -> serde_json::Value {
+    serde_json::from_str(&serialize_arrive_with_intent_for_js(intent)).unwrap()
+}
+
 /// An unknown verb returns `None`, matching other unrecognized wire values and malformed
 /// messages in the `Option<InboundMessage>` parser.
 #[test]
 fn arrive_tab_verb_and_cycle_default_mode() {
     assert_eq!(serialize_arrive_for_js(), r#"{"kind":"arrive"}"#);
+    assert_eq!(
+        intent_arrival(crate::agents::Intent::Stop),
+        serde_json::json!({"kind": "arrive", "intent": "stop"})
+    );
+    assert_eq!(
+        intent_arrival(crate::agents::Intent::Show),
+        serde_json::json!({"kind": "arrive", "intent": "show"})
+    );
     let m = parse_inbound_message(r#"{"type":"tab_verb","request_id":"a","verb":"close"}"#).unwrap();
     assert!(matches!(
         m,

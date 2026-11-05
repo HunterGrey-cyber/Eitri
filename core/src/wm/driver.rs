@@ -317,6 +317,17 @@ impl<C: Decide> Driver<C> {
 }
 
 impl Driver<Controller> {
+    /// Reveals a local tab through the same batch queue as keys and layout verbs.
+    pub fn tab_reveal(
+        &self,
+        win: WinId,
+        req: &super::reveal::RevealRequest,
+    ) -> Result<(), super::reveal::RevealRefusal> {
+        let (answer, batch) = self.decide.borrow_mut().tab_reveal(win, req);
+        self.submit(batch);
+        answer
+    }
+
     /// Decides a startup phase before applying its batch, with no controller borrow held by the host.
     pub fn start(&self, win: WinId, step: super::start::StartStep) {
         let batch = self.decide.borrow_mut().start(win, step);
@@ -949,6 +960,8 @@ mod tests {
             win: WIN,
             view: ViewId::BASE,
             card_first: true,
+            tab: None,
+            intent: crate::agents::Intent::Show,
         });
         let r = rig(|d| {
             d.then_run(layout(vec![
@@ -983,6 +996,8 @@ mod tests {
             win: WIN,
             view: ViewId::BASE,
             card_first: true,
+            tab: None,
+            intent: crate::agents::Intent::Show,
         });
         let from_tail = HostOp::Lua(LuaOp::Emit {
             event: "from_tail".into(),

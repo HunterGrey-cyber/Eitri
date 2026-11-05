@@ -1554,8 +1554,17 @@ impl AgentPanelHandle {
     /// except for the envelope it dispatches; safe before the page loads for the same reason.
     pub fn arrive(&self, view: ViewId) {
         self.wake();
+        self.arrive_with_intent(view, eitri_core::agents::Intent::Show);
+    }
+
+    /// Arrival carries its purpose to the page; any action still needs the person's keys there.
+    pub fn arrive_with_intent(&self, view: ViewId, intent: eitri_core::agents::Intent) {
+        self.wake();
         self.drop_bypass_prompt_in(view);
-        self.dispatch(view, eitri_core::agent_bridge::serialize_arrive_for_js());
+        self.dispatch(
+            view,
+            eitri_core::agent_bridge::serialize_arrive_with_intent_for_js(intent),
+        );
     }
 
     /// Every keyboard route GTK claims before the WebView sees a key is a route away
@@ -2045,6 +2054,47 @@ impl AgentPanelHandle {
             .and_then(|tab| state.tabs.place_of(tab.id))
     }
 
+    /// The existing page holding a local tab. A missing tab never falls back to the base view.
+    pub fn view_of_tab(&self, tab: TabId) -> Option<ViewId> {
+        self.wake();
+        if !self.with_pages.get() {
+            return None;
+        }
+        let state = self.state.try_borrow().ok()?;
+        if state.shutting_down {
+            return None;
+        }
+        state.tabs.get(tab).map(|tab| tab.view_id())
+    }
+
+    /// An uncertain read keeps the tab from being revealed during a move.
+    pub fn tab_moving(&self, tab: TabId) -> bool {
+        self.wake();
+        self.state
+            .try_borrow()
+            .map_or(true, |state| state.shutting_down || state.tabs.is_moving(tab))
+    }
+
+    /// Selects a tab by its stable identity in the view it already belongs to, leaving input closed.
+    pub fn select_tab(&self, tab: TabId) -> bool {
+        self.wake();
+        if self.closing() {
+            return false;
+        }
+        self.run_seen(|state, screen, out| {
+            if state.tabs.is_moving(tab) {
+                return false;
+            }
+            let Some(place) = state.tabs.select_place(tab) else {
+                return false;
+            };
+            if matches!(place, TabPlace::Base(_)) {
+                send_switch(state, screen, out);
+            }
+            true
+        })
+    }
+
     /// `prefix n` (+1) / `p` (-1), wrapping, over the base view's tabs.
     pub fn step(&self, delta: i32) -> bool {
         self.wake();
@@ -2281,6 +2331,32 @@ impl AgentPanelHandle {
             view,
             eitri_core::agent_bridge::serialize_focus_permission_for_js(target),
         );
+        true
+    }
+
+    /// Lands on this tab's oldest waiting card, even when another tab in the view has an older one.
+    pub fn focus_card_of(&self, tab: TabId) -> bool {
+        self.wake();
+        if self.closing() {
+            return false;
+        }
+        let view = self.run_seen(|state, screen, out| {
+            let target = state.tabs.get(tab)?;
+            if state.tabs.is_moving(tab) || target.attention.oldest_pending_stamp().is_none() {
+                return None;
+            }
+            let view = target.view_id();
+            if view.is_base() {
+                state.tabs.select(tab);
+            }
+            state.tabs.drop_bypass_prompt_in(view);
+            if view.is_base() {
+                send_switch(state, screen, out);
+            }
+            Some(view)
+        });
+        let Some(view) = view else { return false };
+        self.dispatch(view, eitri_core::agent_bridge::serialize_focus_permission_for_js(tab));
         true
     }
 
@@ -2642,6 +2718,95 @@ fn tabs_cannot_close(state: &AgentPanelState, view: ViewId) -> Option<&'static s
 mod tests {
     use super::*;
     use crate::agent_panel::tests::*;
+
+    #[test]
+    fn card_first_lands_on_that_tabs_card_when_another_tab_holds_an_older_one() {
+        let (handle, page) = settled_panel();
+        let (older, target) = {
+            let mut state = handle.state.borrow_mut();
+            let older = state.tabs.active();
+            state.tabs.get_mut(older).unwrap().attention.resync(["older".into()]);
+            let target = state.tabs.open(AgentId::Claude);
+            state.tabs.get_mut(target).unwrap().attention.resync(["target".into()]);
+            state.tabs.select(older);
+            assert_eq!(oldest_card_in(&state.tabs, ViewId::BASE), Some(older));
+            (older, target)
+        };
+        page.sent.borrow_mut().clear();
+        assert!(handle.focus_card_of(target));
+        let state = handle.state.borrow();
+        assert_eq!(state.tabs.active(), target);
+        assert_eq!(state.tabs.get(older).unwrap().attention.card_ids(), vec!["older"]);
+        assert_eq!(state.tabs.get(target).unwrap().attention.card_ids(), vec!["target"]);
+        assert!(page.sent.borrow().iter().any(|json| {
+            let value: serde_json::Value = serde_json::from_str(json).unwrap();
+            value["kind"] == "focus_permission" && value["tab"] == target.0
+        }));
+    }
+
+    #[test]
+    fn a_tab_with_no_card_never_lands_on_another_tabs_card() {
+        let (handle, page) = settled_panel();
+        let target = {
+            let mut state = handle.state.borrow_mut();
+            let older = state.tabs.active();
+            state.tabs.get_mut(older).unwrap().attention.resync(["older".into()]);
+            let target = state.tabs.open(AgentId::Claude);
+            state.tabs.select(older);
+            target
+        };
+        assert!(handle.select_tab(target));
+        page.sent.borrow_mut().clear();
+        assert!(!handle.focus_card_of(target));
+        assert_eq!(handle.state.borrow().tabs.active(), target);
+        assert!(page.sent.borrow().is_empty());
+    }
+
+    #[test]
+    fn a_card_landing_in_an_extra_view_keeps_the_base_tab_selected() {
+        let (handle, _) = settled_panel();
+        let view = ViewId::new(2).unwrap();
+        let page = Rc::new(RecordingPage::default());
+        handle.attach_page(view, Rc::new(PanelPage::new(page.clone())));
+        handle.page_message(view, r#"{"type":"ready","request_id":"r2"}"#);
+        let (base, target) = {
+            let mut state = handle.state.borrow_mut();
+            let base = state.tabs.active();
+            let target = state.tabs.open_in(AgentId::Claude, view).unwrap();
+            state.tabs.get_mut(target).unwrap().attention.resync(["card".into()]);
+            (base, target)
+        };
+        assert_eq!(handle.view_of_tab(target), Some(view));
+        assert!(handle.select_tab(target));
+        assert!(handle.focus_card_of(target));
+        assert_eq!(handle.state.borrow().tabs.active(), base);
+        assert!(page.sent.borrow().iter().any(|json| {
+            let value: serde_json::Value = serde_json::from_str(json).unwrap();
+            value["kind"] == "focus_permission" && value["tab"] == target.0
+        }));
+    }
+
+    #[test]
+    fn arrival_delivers_show_and_stop_intents_to_the_page() {
+        use eitri_core::agents::Intent;
+        let (handle, page) = settled_panel();
+        page.sent.borrow_mut().clear();
+        handle.arrive(ViewId::BASE);
+        handle.arrive_with_intent(ViewId::BASE, Intent::Stop);
+        let arrivals: Vec<serde_json::Value> = page
+            .sent
+            .borrow()
+            .iter()
+            .map(|json| serde_json::from_str(json).unwrap())
+            .collect();
+        assert_eq!(
+            arrivals,
+            vec![
+                serde_json::json!({ "kind": "arrive", "intent": "show" }),
+                serde_json::json!({ "kind": "arrive", "intent": "stop" }),
+            ]
+        );
+    }
 
     #[test]
     fn view_in_editor_refuses_without_a_scratch_directory() {

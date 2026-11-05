@@ -906,6 +906,8 @@ fn a_digit_on_the_zoomed_module_keeps_the_zoom_and_arrives_only_if_the_grab_took
         win: WIN,
         view: ViewId::BASE,
         card_first: false,
+        tab: None,
+        intent: crate::agents::Intent::Show,
     });
     assert!(applied.contains(&(
         HostOp::Focus {
@@ -950,6 +952,8 @@ fn a_digit_on_another_module_lands_as_ctrl_hjkl_land() {
         win: WIN,
         view: ViewId::BASE,
         card_first: false,
+        tab: None,
+        intent: crate::agents::Intent::Show,
     })));
     assert!(ops.contains(&HostOp::Hint(HintOp::Hide)), "the digit ended the wait");
 }

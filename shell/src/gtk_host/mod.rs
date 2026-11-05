@@ -416,6 +416,12 @@ pub(crate) fn respawn_pane(
 
 /// The window's services the controller's effect ops call. `Err` says why an op was not carried out.
 pub(crate) trait ServiceSet {
+    fn view_of_tab(&self, _tab: eitri_core::tabs::TabId) -> Option<ViewId> {
+        None
+    }
+    fn tab_moving(&self, _tab: eitri_core::tabs::TabId) -> bool {
+        true
+    }
     fn page_built(&self, _module: &ModuleId) -> bool {
         false
     }
@@ -1821,6 +1827,14 @@ impl Host for GtkHost {
 /// Every read answers at once from the window's grid and editor, and calls nothing that could reach the
 /// controller; a window that has given neither answers as [`NoReads`] does.
 impl HostReads for GtkHost {
+    fn view_of_tab(&self, tab: eitri_core::tabs::TabId) -> Option<ViewId> {
+        let services = self.services.borrow().clone();
+        services.and_then(|services| services.view_of_tab(tab))
+    }
+    fn tab_moving(&self, tab: eitri_core::tabs::TabId) -> bool {
+        let services = self.services.borrow().clone();
+        services.is_none_or(|services| services.tab_moving(tab))
+    }
     fn project_chooser_env(&self, win: WinId) -> ChooserEnv {
         let host = self.project_host.borrow().clone();
         host.map_or_else(|| NoReads.project_chooser_env(win), |host| host.env(win))

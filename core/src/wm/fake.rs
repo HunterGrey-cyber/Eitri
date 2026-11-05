@@ -80,6 +80,8 @@ pub struct FakeHost {
 
 /// What the fake answers as [`HostReads`]: [`NoReads`]' values until a test sets one.
 struct Reads {
+    tab_views: BTreeMap<TabId, ViewId>,
+    moving_tabs: BTreeSet<TabId>,
     grid_size: Size,
     editor_cell: Option<(f64, f64)>,
     editor_facts: EditorFacts,
@@ -115,6 +117,8 @@ struct Reads {
 impl Default for Reads {
     fn default() -> Self {
         Reads {
+            tab_views: BTreeMap::new(),
+            moving_tabs: BTreeSet::new(),
             grid_size: super::grid::UNALLOCATED,
             editor_cell: None,
             editor_facts: EditorFacts::default(),
@@ -150,6 +154,22 @@ impl Default for Reads {
 }
 
 impl FakeHost {
+    pub fn set_view_of_tab(&self, tab: TabId, view: Option<ViewId>) {
+        let mut reads = self.reads.borrow_mut();
+        if let Some(view) = view {
+            reads.tab_views.insert(tab, view);
+        } else {
+            reads.tab_views.remove(&tab);
+        }
+    }
+    pub fn set_tab_moving(&self, tab: TabId, moving: bool) {
+        let mut reads = self.reads.borrow_mut();
+        if moving {
+            reads.moving_tabs.insert(tab);
+        } else {
+            reads.moving_tabs.remove(&tab);
+        }
+    }
     pub fn set_project_rows(&self, rows: Vec<crate::project_chooser::Row>) {
         *self.project_rows.borrow_mut() = rows;
     }
@@ -702,6 +722,12 @@ impl super::conformance::GridObserve for FakeHost {
 }
 
 impl HostReads for FakeHost {
+    fn view_of_tab(&self, tab: TabId) -> Option<ViewId> {
+        self.reads.borrow().tab_views.get(&tab).copied()
+    }
+    fn tab_moving(&self, tab: TabId) -> bool {
+        self.reads.borrow().moving_tabs.contains(&tab)
+    }
     fn project_chooser_env(&self, win: WinId) -> ChooserEnv {
         self.project_env
             .borrow()

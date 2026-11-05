@@ -217,6 +217,8 @@ fn arrive() -> HostOp {
         win: WIN,
         view: crate::tabs::ViewId::BASE,
         card_first: false,
+        tab: None,
+        intent: crate::agents::Intent::Show,
     })
 }
 
@@ -226,6 +228,8 @@ fn arrive_at_card() -> HostOp {
         win: WIN,
         view: crate::tabs::ViewId::BASE,
         card_first: true,
+        tab: None,
+        intent: crate::agents::Intent::Show,
     })
 }
 

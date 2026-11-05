@@ -119,6 +119,12 @@ impl gtk_host::ServiceSet for PanelServices {
         self.inner.page_built(module)
     }
 
+    fn view_of_tab(&self, tab: eitri_core::tabs::TabId) -> Option<ViewId> {
+        self.inner.view_of_tab(tab)
+    }
+    fn tab_moving(&self, tab: eitri_core::tabs::TabId) -> bool {
+        self.inner.tab_moving(tab)
+    }
     fn tab_can_step(&self, delta: i32) -> bool {
         self.inner.tab_can_step(delta)
     }

@@ -1257,6 +1257,13 @@ pub fn serialize_arrive_for_js() -> String {
     json!({ "kind": "arrive" }).to_string()
 }
 
+/// `{"kind":"arrive","intent":"show"|"stop"}`: the same arrival, carrying why the keys came
+/// (a reveal to look, or to stop an agent). The intent only informs the page; any action still
+/// needs the person's own keys there.
+pub fn serialize_arrive_with_intent_for_js(intent: crate::agents::Intent) -> String {
+    json!({ "kind": "arrive", "intent": intent }).to_string()
+}
+
 /// `{"kind":"focus_permission","tab":...}`: the chat was brought back to answer a card -- its tray
 /// chip `agent ⚑N` activated, or `Ctrl+a a` with a card waiting. The panel goes
 /// to BROWSE with its cursor on the oldest pending card. `shell` sends it only when the count it

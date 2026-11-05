@@ -364,6 +364,8 @@ impl Controller {
                                 win,
                                 view,
                                 card_first: true,
+                                tab: None,
+                                intent: crate::agents::Intent::Show,
                             })
                         })
                         .collect(),
@@ -1344,6 +1346,8 @@ mod tests {
                     win: WinId::MAIN,
                     view: ViewId::BASE,
                     card_first: true,
+                    tab: None,
+                    intent: crate::agents::Intent::Show,
                 })],
             }
         );
@@ -1351,6 +1355,8 @@ mod tests {
             win: WinId::MAIN,
             view: ViewId::BASE,
             card_first: true,
+            tab: None,
+            intent: crate::agents::Intent::Show,
         })));
         assert_eq!(
             ops.last(),

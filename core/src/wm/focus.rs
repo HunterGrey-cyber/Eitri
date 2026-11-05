@@ -164,7 +164,15 @@ pub fn give_keys(w: &mut Window, win: WinId, to: &ModuleId, on_grab: Vec<HostOp>
 /// and only a route that picks the chat by name (its key, its strip entry, a HINT label) goes to what waits there.
 pub fn arrive_tail(win: WinId, to: &ModuleId, card_first: bool) -> Vec<HostOp> {
     ViewId::of_module(to)
-        .map(|view| HostOp::Chat(ChatOp::Arrive { win, view, card_first }))
+        .map(|view| {
+            HostOp::Chat(ChatOp::Arrive {
+                win,
+                view,
+                card_first,
+                tab: None,
+                intent: crate::agents::Intent::Show,
+            })
+        })
         .into_iter()
         .collect()
 }

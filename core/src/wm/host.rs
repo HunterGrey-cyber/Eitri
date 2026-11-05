@@ -3,6 +3,7 @@
 use super::moves::MoveKind;
 use super::window::*;
 use crate::agent_backend::AgentId;
+use crate::agents::Intent;
 use crate::keymap::{
     action::Action,
     key::{KeyName, KeySpec},
@@ -242,6 +243,14 @@ pub struct EditorFacts {
 /// the controller: the grid's size and measures, the editor's cell and whether it runs, and whether a chat page
 /// claims a navigation key.
 pub trait HostReads {
+    /// The live view holding a local tab, or none once that tab has gone.
+    fn view_of_tab(&self, _tab: TabId) -> Option<ViewId> {
+        None
+    }
+    /// Whether a tab is frozen for a move. Uncertain hosts refuse a reveal until they can tell.
+    fn tab_moving(&self, _tab: TabId) -> bool {
+        true
+    }
     /// Cached environment for the chooser; no environment or filesystem reads happen in the controller.
     fn project_chooser_env(&self, _win: WinId) -> ChooserEnv {
         ChooserEnv {
@@ -968,8 +977,17 @@ pub enum ChatOp {
     EditSelection { win: WinId, view: ViewId },
     /// Completes arrival in a view. With `card_first` (a module key, a strip entry, a HINT landing, the window's
     /// first focus) the view's oldest pending card takes the keys if one waits; without it (`Ctrl+h/j/k/l`,
-    /// `select.last`, `select.next`, a digit) the view lands where its reader left it, card or not.
-    Arrive { win: WinId, view: ViewId, card_first: bool },
+    /// `select.last`, `select.next`, a digit) the view lands where its reader left it, card or not. A named
+    /// tab restricts card focus to that tab; `intent` is delivered to the page without taking an action.
+    Arrive {
+        win: WinId,
+        view: ViewId,
+        card_first: bool,
+        tab: Option<TabId>,
+        intent: Intent,
+    },
+    /// Selects this tab in its existing view without opening input or answering a prompt.
+    SelectTab { win: WinId, tab: TabId },
     /// Delivers directional navigation.
     NavKey {
         win: WinId,

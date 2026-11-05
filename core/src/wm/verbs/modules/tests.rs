@@ -610,6 +610,8 @@ fn a_split_key_on_an_existing_module_places_it_and_arrives_only_if_the_grab_took
         win: WIN,
         view: ViewId::BASE,
         card_first: true,
+        tab: None,
+        intent: crate::agents::Intent::Show,
     });
     for grab_takes in [true, false] {
         let without = if grab_takes { vec![] } else { vec![agent()] };

@@ -471,6 +471,21 @@ impl Controller {
         batch
     }
 
+    /// Reveals a local tab, or returns to this window's last module when no tab is named.
+    pub fn tab_reveal(
+        &mut self,
+        win: WinId,
+        req: &super::reveal::RevealRequest,
+    ) -> (Result<(), super::reveal::RevealRefusal>, Batch) {
+        let mut batch = Batch::default();
+        let mut answer = Err(super::reveal::RevealRefusal::Gone);
+        self.modules_event(win, &mut batch, |w, cx, batch| {
+            answer = super::reveal::reveal_batch(w, cx, win, req).map(|revealed| batch.append(revealed));
+        });
+        self.settle_chrome(&mut batch);
+        (answer, batch)
+    }
+
     /// A plugin page's `layout.focus` on `module`: shown where it was hidden from (a start-hidden plugin's module
     /// this workspace does not hold yet opened by its rule), then given the keys and arrived at, as the module key
     /// lands. The answer the page is given: the refusal's text, or `Ok`.

@@ -489,6 +489,8 @@ pub fn scripts(f: &Fixture) -> Vec<Script> {
                         win: f.win,
                         view: ViewId::BASE,
                         card_first: true,
+                        tab: None,
+                        intent: crate::agents::Intent::Show,
                     })],
                 },
             ],
@@ -592,6 +594,8 @@ pub fn scripts(f: &Fixture) -> Vec<Script> {
                         win: f.win,
                         view: ViewId::BASE,
                         card_first: true,
+                        tab: None,
+                        intent: crate::agents::Intent::Show,
                     })],
                 },
                 HostOp::Unmap {
@@ -983,6 +987,81 @@ mod tests {
     use super::*;
     use crate::wm::fake::FakeHost;
     use std::rc::Rc;
+
+    #[test]
+    fn arrive_without_tab_is_unchanged() {
+        let tail = crate::wm::focus::arrive_tail(WinId::MAIN, &ModuleId::agent(), true);
+        assert_eq!(
+            tail,
+            vec![HostOp::Chat(ChatOp::Arrive {
+                win: WinId::MAIN,
+                view: ViewId::BASE,
+                card_first: true,
+                tab: None,
+                intent: crate::agents::Intent::Show,
+            })]
+        );
+        let tail = crate::wm::focus::arrive_tail(WinId::MAIN, &ModuleId::agent(), false);
+        assert!(matches!(
+            &tail[..],
+            [HostOp::Chat(ChatOp::Arrive {
+                tab: None,
+                card_first: false,
+                intent: crate::agents::Intent::Show,
+                ..
+            })]
+        ));
+    }
+
+    #[test]
+    fn a_tab_arrival_keeps_its_identity_and_intent_and_requires_a_successful_grab() {
+        use crate::agents::Intent;
+        use crate::tabs::TabId;
+        use crate::wm::fake::{FakeScheduler, Logged, ScriptedDecide};
+        use crate::wm::Driver;
+
+        let arrive = HostOp::Chat(ChatOp::Arrive {
+            win: WinId::MAIN,
+            view: ViewId::BASE,
+            card_first: true,
+            tab: Some(TabId(7)),
+            intent: Intent::Stop,
+        });
+        for mapped in [true, false] {
+            let host = FakeHost::new();
+            host.with_surface(
+                WinId::MAIN,
+                ModuleId::agent(),
+                SurfaceKind::Chat { view: ViewId::BASE },
+                mapped,
+            );
+            let mut batch = Batch::default();
+            batch.push_layout(HostOp::Focus {
+                win: WinId::MAIN,
+                to: FocusTo::Module(ModuleId::agent()),
+                on_grab: vec![arrive.clone()],
+            });
+            let mut decide = ScriptedDecide::default();
+            decide.then_run(batch);
+            let driver = Driver::new(decide, host.clone(), FakeScheduler::new());
+            let sink: Rc<dyn HostSink> = driver.clone();
+            host.attach(Rc::downgrade(&sink));
+            driver.run(
+                WinId::MAIN,
+                crate::keymap::Action::Module(ModuleId::agent()),
+                Origin::Chip,
+            );
+            let arrivals: Vec<_> = host
+                .log()
+                .into_iter()
+                .filter_map(|logged| match logged {
+                    Logged::Op(op @ HostOp::Chat(ChatOp::Arrive { .. }), Applied::Done) => Some(op),
+                    _ => None,
+                })
+                .collect();
+            assert_eq!(arrivals, if mapped { vec![arrive.clone()] } else { vec![] });
+        }
+    }
 
     #[test]
     fn conformance_reports_the_first_unmet_expectation_and_ignores_previous_events() {
