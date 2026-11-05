@@ -7,6 +7,7 @@ pub mod publish;
 #[cfg(target_os = "linux")]
 pub mod read;
 pub mod row;
+pub mod shared;
 pub mod state;
 pub mod wire;
 

@@ -38,12 +38,12 @@ pub(crate) fn recut_row(r: &mut Row) {
     text(&mut r.mode);
 }
 
-fn selection(s: &mut Selection) {
+pub(crate) fn recut_selection(s: &mut Selection) {
     text(&mut s.key);
     text(&mut s.by);
 }
 
-fn round(r: &mut Round) {
+pub(crate) fn recut_round(r: &mut Round) {
     text(&mut r.from.instance);
     text(&mut r.from.module);
     if let Some(key) = &mut r.current {
@@ -62,10 +62,10 @@ fn recut_view(v: &mut View) {
         recut_row(r);
     }
     if let Some(s) = &mut v.selection {
-        selection(s);
+        recut_selection(s);
     }
     if let Some(r) = &mut v.round {
-        round(r);
+        recut_round(r);
     }
 }
 
@@ -104,6 +104,12 @@ pub fn change_json(c: &Change, schema: u32) -> String {
         Reset {
             view: VersionedView<'a>,
         },
+        Selection {
+            selection: Option<&'a Selection>,
+        },
+        Round {
+            round: Option<&'a Round>,
+        },
     }
     let mut c = c.clone();
     let change = match &mut c {
@@ -121,6 +127,20 @@ pub fn change_json(c: &Change, schema: u32) -> String {
             Body::Reset {
                 view: VersionedView { v: schema, view },
             }
+        }
+        Change::Selection { selection } => {
+            if let Some(s) = selection.as_mut() {
+                recut_selection(s);
+            }
+            Body::Selection {
+                selection: selection.as_ref(),
+            }
+        }
+        Change::Round { round } => {
+            if let Some(r) = round.as_mut() {
+                recut_round(r);
+            }
+            Body::Round { round: round.as_ref() }
         }
     };
     serde_json::to_string(&VersionedChange { v: schema, change }).expect("agent changes contain only JSON values")

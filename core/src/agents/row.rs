@@ -150,9 +150,25 @@ pub enum GoneWhy {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum Change {
-    Row { row: Row },
-    Gone { id: String, key: String, why: GoneWhy },
-    Reset { view: View },
+    Row {
+        row: Row,
+    },
+    Gone {
+        id: String,
+        key: String,
+        why: GoneWhy,
+    },
+    Reset {
+        view: View,
+    },
+    /// The shared selection was written or removed.
+    Selection {
+        selection: Option<Selection>,
+    },
+    /// The shared round started, moved or ended.
+    Round {
+        round: Option<Round>,
+    },
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]

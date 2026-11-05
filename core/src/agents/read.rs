@@ -14,6 +14,11 @@
 //!
 //! The projects with a running window travel only in a whole view: when they change, the batch's `gone` changes
 //! go out first, with their reasons, and a `reset` follows in place of its `row` changes.
+//!
+//! The shared selection and round (`selection.json`, `round.json`, see [`super::shared`]) are read through the
+//! same watch: each whole view carries them, and a change to either goes out as `selection` or `round` after the
+//! batch's row changes. One that cannot be read (a link, another user's, a newer schema's) is logged once like
+//! any ignored file and reads as none.
 
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::ffi::{CString, OsStr, OsString};
@@ -32,6 +37,7 @@ use agent::private_fs::{self, euid};
 
 use super::liveness::{self, Alive};
 use super::publish::{agents_dir, is_instance, open_own_dir};
+use super::shared::{self, Round, Selection, SharedName, SharedRead, ROUND_FILE, SELECTION_FILE};
 use super::wire::{parse_process_file, WireError};
 use super::{
     Change, GoneWhy, ProcessFile, ProjectRef, Row, View, LOCK_POLL_MS, MAX_FILE_BYTES, MAX_ROWS_PER_FILE, MOVE_HOLD_MS,
@@ -318,7 +324,14 @@ pub fn scan_once(control_dir: &Path, schema: u32) -> io::Result<View> {
         }
     }
     let rows = merge(files.iter(), &BTreeMap::new());
-    Ok(view_of(rows.values().map(|s| &s.row), files.values()))
+    let mut view = view_of(rows.values().map(|s| &s.row), files.values());
+    if let SharedRead::Found(selection) = shared::read_selection_at(&path.join(SELECTION_FILE), schema, owner_as_is) {
+        view.selection = Some(selection);
+    }
+    if let SharedRead::Found(round) = shared::read_round_at(&path.join(ROUND_FILE), schema, owner_as_is) {
+        view.round = Some(round);
+    }
+    Ok(view)
 }
 
 const WATCHED: u32 = libc::IN_CLOSE_WRITE
@@ -441,6 +454,10 @@ impl Reader {
             shown: BTreeMap::new(),
             held: HashMap::new(),
             projects: Vec::new(),
+            selection: None,
+            round: None,
+            sent_selection: None,
+            sent_round: None,
             next_lock_poll: None,
             batch: Batch::default(),
         };
@@ -514,6 +531,11 @@ struct Watch {
     held: HashMap<String, Instant>,
     /// The projects as last handed out.
     projects: Vec<ProjectRef>,
+    /// The shared selection and round as last read, and as last handed out.
+    selection: Option<Selection>,
+    round: Option<Round>,
+    sent_selection: Option<Selection>,
+    sent_round: Option<Round>,
     next_lock_poll: Option<Instant>,
     batch: Batch,
 }
@@ -676,6 +698,8 @@ impl Watch {
         }
         sweep_orphan_locks(&self.dir, &self.control, &self.dir_path, &names);
         names.extend(self.entries.keys().map(|i| OsString::from(format!("{i}.json"))));
+        // Read even when gone, so a shared file removed while events were lost reads as none.
+        names.extend([SELECTION_FILE, ROUND_FILE].map(OsString::from));
         for name in names {
             self.refresh(&name);
         }
@@ -688,6 +712,9 @@ impl Watch {
             return;
         }
         let shown_name = name.to_string_lossy().into_owned();
+        if let Some(which) = SharedName::of(name) {
+            return self.refresh_shared(which, &shown_name);
+        }
         let Some(instance) = instance_of(name).map(str::to_owned) else {
             return self.ignore(&shown_name, "not an agents file name", None);
         };
@@ -727,6 +754,38 @@ impl Watch {
                         self.bury(&instance);
                     }
                 }
+            }
+        }
+    }
+
+    /// Reads a shared file again. What cannot be read is logged as an ignored file and reads as none.
+    fn refresh_shared(&mut self, which: SharedName, name: &str) {
+        let path = self.dir_path.join(name);
+        match which {
+            SharedName::Selection => {
+                let found = shared::read_selection_at(&path, self.schema, self.hooks.owner);
+                self.selection = self.settle(found, name);
+            }
+            SharedName::Round => {
+                let found = shared::read_round_at(&path, self.schema, self.hooks.owner);
+                self.round = self.settle(found, name);
+            }
+        }
+    }
+
+    fn settle<T>(&mut self, found: SharedRead<T>, name: &str) -> Option<T> {
+        match found {
+            SharedRead::Found(value) => {
+                self.logged.remove(name);
+                Some(value)
+            }
+            SharedRead::Missing => {
+                self.logged.remove(name);
+                None
+            }
+            SharedRead::Ignored(why) => {
+                self.ignore(name, &why, None);
+                None
             }
         }
     }
@@ -792,16 +851,26 @@ impl Watch {
         merge(self.entries.iter().map(|(i, e)| (i, &e.file)), &self.shown)
     }
 
+    /// The view of the rows as shown, with the shared selection and round, which are handed out with it.
+    fn whole_view(&mut self) -> View {
+        let mut view = view_of(
+            self.shown.values().map(|s| &s.row),
+            self.entries.values().map(|e| &e.file),
+        );
+        view.selection = self.selection.clone();
+        view.round = self.round.clone();
+        self.sent_selection = view.selection.clone();
+        self.sent_round = view.round.clone();
+        self.projects = view.projects.clone();
+        view
+    }
+
     /// The whole view again, replacing everything a face holds.
     fn reset(&mut self) {
         self.shown = self.current();
         self.held.clear();
         self.left.clear();
-        let view = view_of(
-            self.shown.values().map(|s| &s.row),
-            self.entries.values().map(|e| &e.file),
-        );
-        self.projects = view.projects.clone();
+        let view = self.whole_view();
         self.send(Change::Reset { view });
     }
 
@@ -886,14 +955,22 @@ impl Watch {
             self.shown.insert(id, s);
         }
         self.left.clear();
+        if self.selection != self.sent_selection {
+            self.sent_selection = self.selection.clone();
+            changes.push(Change::Selection {
+                selection: self.selection.clone(),
+            });
+        }
+        if self.round != self.sent_round {
+            self.sent_round = self.round.clone();
+            changes.push(Change::Round {
+                round: self.round.clone(),
+            });
+        }
         if projects_of(self.entries.values().map(|e| &e.file)) != self.projects {
             // Rows held for a move stay in the view, so a face keeps their places until they land or time out.
             changes.retain(|change| matches!(change, Change::Gone { .. }));
-            let view = view_of(
-                self.shown.values().map(|s| &s.row),
-                self.entries.values().map(|e| &e.file),
-            );
-            self.projects = view.projects.clone();
+            let view = self.whole_view();
             changes.push(Change::Reset { view });
         }
         for change in changes {

@@ -528,6 +528,8 @@ mod read {
                 Change::Gone { id, .. } => {
                     self.rows.remove(id);
                 }
+                // The shared selection and round are not rows; their own tests follow them.
+                Change::Selection { .. } | Change::Round { .. } => {}
             }
         }
 

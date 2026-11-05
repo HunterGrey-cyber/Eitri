@@ -54,6 +54,12 @@ const NEVER_BOUND: &[(&str, &str)] = &[
     ("src/plugin/follow_feed.rs", "const SOCKET_NAME: &str = \"f.sock\""),
     ("src/plugin/follow_feed.rs", "const SWEPT_NAMES:"),
     ("src/ide_server/mention.rs", "const SOCKET_NAME: &str = \"m.sock\""),
+    // The agents directory's cleanup unlinks a dead process's control socket by its file name, relative to
+    // the control directory's handle; it never binds or connects, and the socket was bound through `in_dir`.
+    (
+        "src/agents/liveness.rs",
+        "let socket_name = c_name(format!(\"ag-{instance}.sock\"))?",
+    ),
     // The host's tests hand a fake editor a socket name to compare against what the host sends back;
     // nothing binds or connects to it.
     ("src/ide_server/host.rs", "socket: PathBuf::from(\"/run/m.sock\")"),
