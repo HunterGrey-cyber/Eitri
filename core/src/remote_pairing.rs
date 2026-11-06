@@ -514,6 +514,27 @@ pub fn confirmed_listen_with_kind(state_dir: &Path) -> io::Result<Option<(String
     Ok(Some((record.addr, record.kind)))
 }
 
+/// The address the desk said yes to, while the link that holds it now is of the kind it was on when the desk was asked:
+/// a yes given for a tunnel does not cover the same address on a plain link. `None` when nothing was recorded, the
+/// address is on no link of this machine, or the link's kind changed.
+pub fn confirmed_listen_now(state_dir: &Path) -> io::Result<Option<String>> {
+    confirmed_listen_on(state_dir, |addr| interface_of(addr).map(|iface| interface_kind(&iface)))
+}
+
+/// [`confirmed_listen_now`] with `kind_of` saying what kind of link holds an address now (`None`: none does).
+pub fn confirmed_listen_on(
+    state_dir: &Path,
+    kind_of: impl Fn(IpAddr) -> Option<IfaceKind>,
+) -> io::Result<Option<String>> {
+    let Some((addr, kind)) = confirmed_listen_with_kind(state_dir)? else {
+        return Ok(None);
+    };
+    let Some(ip) = named_listen_addr(&addr) else {
+        return Ok(None);
+    };
+    Ok((kind_of(ip) == Some(kind)).then_some(addr))
+}
+
 /// Records the desk's yes to listening on `addr`, a link of `kind`, in `state_dir` (made 0700 if missing): a 0600
 /// file written beside its place and renamed into it.
 pub fn record_listen(state_dir: &Path, addr: &str, kind: IfaceKind, at: u64) -> io::Result<()> {
@@ -804,5 +825,30 @@ mod tests {
             io::ErrorKind::PermissionDenied,
             "a record others could have written is no yes"
         );
+    }
+
+    #[test]
+    fn a_yes_covers_its_address_only_on_a_link_of_the_kind_asked_about() {
+        let root = agent::state_dirs::test_workspace_dir("pairing-listen-kind");
+        let dir = root.join("remote");
+        let on = |kind: Option<IfaceKind>| confirmed_listen_on(&dir, move |_| kind).unwrap();
+        assert_eq!(on(Some(IfaceKind::WireGuard)), None, "nothing recorded yet");
+        record_listen(&dir, "198.51.100.2", IfaceKind::WireGuard, 1_762_400_000).unwrap();
+        assert_eq!(on(Some(IfaceKind::WireGuard)).as_deref(), Some("198.51.100.2"));
+        assert_eq!(on(Some(IfaceKind::Plain)), None, "the address moved to a plain link");
+        assert_eq!(
+            on(Some(IfaceKind::Tailscale)),
+            None,
+            "the address moved to another tunnel"
+        );
+        assert_eq!(on(None), None, "no link holds the address");
+        // The address is looked up, not the record's text taken on trust.
+        let asked = std::cell::Cell::new(None);
+        confirmed_listen_on(&dir, |addr| {
+            asked.set(Some(addr));
+            Some(IfaceKind::WireGuard)
+        })
+        .unwrap();
+        assert_eq!(asked.get(), Some("198.51.100.2".parse().unwrap()));
     }
 }

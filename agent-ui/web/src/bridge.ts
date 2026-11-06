@@ -518,6 +518,11 @@ function isWellFormedTrustPrompt(value: unknown): boolean {
 /** What a phone may do, as the desk grants it. */
 export type RemoteGrant = "watch" | "watch+steer";
 
+/** One phone connected to this desk now (`panel/src/remote_socket/devices.rs`): its name as the store holds it, the
+ *  grant it has, the `Host` its request named and when it connected (seconds since the Unix epoch). The name and
+ *  host are plain text, drawn through `revealHidden`. */
+export type RemoteConnectedDevice = { device: string; name: string; grant: RemoteGrant; host: string; since: number };
+
 /** What the window's remote-control questions are drawn from (`panel/src/remote_enroll.rs`), and the answers to
  *  them. Names and addresses are plain text, drawn through `revealHidden`. */
 export type RemoteDeskEnvelope =
@@ -534,6 +539,8 @@ export type RemoteDeskEnvelope =
   | { kind: "remote_question_closed"; nonce: number }
   /** A device in the store that no desk said yes to (something other than an enrollment wrote it). */
   | { kind: "remote_device_flagged"; device: string; name: string }
+  /** Who is connected now, whole: it replaces the last list, and an empty one takes the band's phone mark away. */
+  | { kind: "remote_connected"; devices: RemoteConnectedDevice[] }
   | { kind: "command_result"; requestId: string; ok: true }
   | { kind: "command_result"; requestId: string; ok: false; error: string };
 
@@ -576,6 +583,12 @@ function isWellFormedRemote(value: Record<string, unknown>): boolean {
       return nonce;
     case "remote_device_flagged":
       return text(value.device) && text(value.name);
+    case "remote_connected":
+      return Array.isArray(value.devices) && value.devices.every((d: unknown) => {
+        const device = d as Record<string, unknown> | null;
+        return device !== null && typeof device === "object" && text(device.device) && text(device.name) && isGrant(device.grant) &&
+          text(device.host) && Number.isSafeInteger(device.since) && (device.since as number) >= 0;
+      });
     default:
       return false;
   }
@@ -600,7 +613,8 @@ export function installDispatch(handler: InboundHandler): void {
         obj.kind === "remote_listen" ||
         obj.kind === "remote_grant" ||
         obj.kind === "remote_question_closed" ||
-        obj.kind === "remote_device_flagged"
+        obj.kind === "remote_device_flagged" ||
+        obj.kind === "remote_connected"
       ) {
         if (!isWellFormedRemote(parsed as Record<string, unknown>)) {
           console.warn("agent-ui: __eitriDispatch received a malformed remote-control envelope", parsed);

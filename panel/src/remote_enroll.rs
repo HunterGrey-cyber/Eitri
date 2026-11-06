@@ -13,6 +13,10 @@
 //! [`QUESTION_WITHIN`] is answered no (whoever asked is told `the desk did not answer in time`) at the first of: the
 //! remote socket's pump at or after that time ([`expire_questions`]), the next question of its kind, or the page's
 //! late answer. Each question tells the page how long it waits, and the page takes it down then on its own.
+//!
+//! A question may be asked before the base page's document is ready (an address asked about as the window opens) or
+//! outlive the document it was shown in (a reload): every question still waiting in time is shown again, with the time
+//! it has left, to each new base document on its `ready` ([`questions_for_new_document`]).
 
 use super::*;
 use eitri_core::remote_devices::Grant;
@@ -106,6 +110,9 @@ pub(super) struct RemoteDesk {
     enroll: Option<Asking<EnrollAsk, EnrollReply>>,
     grant: Option<Asking<GrantAsk, EnrollReply>>,
     listen: Option<Asking<ListenAsk, bool>>,
+    /// The `remote_connected` envelope last sent, kept while phones are connected: a document that loads later
+    /// (a reload, a crash's recovery, a page made for a tab broken out) starts without it and is told on `ready`.
+    connected: Option<String>,
 }
 
 impl RemoteDesk {
@@ -142,6 +149,72 @@ pub(super) fn grant_word(grant: Grant) -> &'static str {
     }
 }
 
+/// The phone question `nonce` about `ask`, waiting `left` more.
+fn enroll_payload(nonce: u64, ask: &EnrollAsk, left: Duration) -> String {
+    let grants: Vec<&str> = grants_for(ask.mode).iter().copied().map(grant_word).collect();
+    serde_json::json!({
+        "kind": "remote_enroll",
+        "expiresInMs": left.as_millis() as u64,
+        "nonce": nonce,
+        "name": ask.name,
+        "host": ask.host,
+        "peer": ask.peer,
+        "grants": grants,
+        "grant": grant_word(Grant::Watch),
+    })
+    .to_string()
+}
+
+/// The grant question `nonce` about `ask`, waiting `left` more.
+fn grant_payload(nonce: u64, ask: &GrantAsk, left: Duration) -> String {
+    serde_json::json!({
+        "kind": "remote_grant",
+        "expiresInMs": left.as_millis() as u64,
+        "nonce": nonce,
+        "device": ask.device,
+        "name": ask.name,
+        "from": grant_word(ask.from),
+        "to": grant_word(ask.to),
+    })
+    .to_string()
+}
+
+/// The address question `nonce` about `ask`, waiting `left` more.
+fn listen_payload(nonce: u64, ask: &ListenAsk, left: Duration) -> String {
+    serde_json::json!({
+        "kind": "remote_listen",
+        "expiresInMs": left.as_millis() as u64,
+        "nonce": nonce,
+        "addr": ask.addr,
+        "iface": ask.iface,
+        "link": ask.kind.as_str(),
+        "plain": !ask.kind.is_tunnel(),
+    })
+    .to_string()
+}
+
+/// The questions waiting in time at `now`, for a base document that has just said `ready`: each under its own nonce,
+/// with the time it has left. A question past its time is not shown; it is answered no as before.
+pub(super) fn questions_for_new_document(state: &AgentPanelState, now: Instant) -> Vec<String> {
+    let desk = &state.remote_desk;
+    let left = |asked: Instant| {
+        QUESTION_WITHIN
+            .checked_sub(now.saturating_duration_since(asked))
+            .filter(|d| !d.is_zero())
+    };
+    let mut shown = Vec::new();
+    if let Some((a, left)) = desk.enroll.as_ref().and_then(|a| Some((a, left(a.asked)?))) {
+        shown.push(enroll_payload(a.nonce, &a.ask, left));
+    }
+    if let Some((a, left)) = desk.grant.as_ref().and_then(|a| Some((a, left(a.asked)?))) {
+        shown.push(grant_payload(a.nonce, &a.ask, left));
+    }
+    if let Some((a, left)) = desk.listen.as_ref().and_then(|a| Some((a, left(a.asked)?))) {
+        shown.push(listen_payload(a.nonce, &a.ask, left));
+    }
+    shown
+}
+
 /// Asks the base page whether the phone `ask` describes may be added; `reply` gets the answer once. Turned down,
 /// with what the phone is told, while another phone's question waits in time.
 pub(super) fn ask_enroll(
@@ -161,21 +234,7 @@ pub(super) fn ask_enroll(
         (stale.reply)(EnrollReply::No(THE_DESK_DID_NOT_ANSWER));
     }
     let nonce = desk.nonce();
-    let grants: Vec<&str> = grants_for(ask.mode).iter().copied().map(grant_word).collect();
-    out.send(
-        ViewId::BASE,
-        serde_json::json!({
-            "kind": "remote_enroll",
-            "expiresInMs": QUESTION_WITHIN.as_millis() as u64,
-            "nonce": nonce,
-            "name": ask.name,
-            "host": ask.host,
-            "peer": ask.peer,
-            "grants": grants,
-            "grant": grant_word(Grant::Watch),
-        })
-        .to_string(),
-    );
+    out.send(ViewId::BASE, enroll_payload(nonce, &ask, QUESTION_WITHIN));
     desk.enroll = Some(Asking {
         nonce,
         asked: now,
@@ -204,19 +263,7 @@ pub(super) fn ask_grant(
         (stale.reply)(EnrollReply::No(THE_DESK_DID_NOT_ANSWER));
     }
     let nonce = desk.nonce();
-    out.send(
-        ViewId::BASE,
-        serde_json::json!({
-            "kind": "remote_grant",
-            "expiresInMs": QUESTION_WITHIN.as_millis() as u64,
-            "nonce": nonce,
-            "device": ask.device,
-            "name": ask.name,
-            "from": grant_word(ask.from),
-            "to": grant_word(ask.to),
-        })
-        .to_string(),
-    );
+    out.send(ViewId::BASE, grant_payload(nonce, &ask, QUESTION_WITHIN));
     desk.grant = Some(Asking {
         nonce,
         asked: now,
@@ -245,19 +292,7 @@ pub(super) fn ask_listen(
         (stale.reply)(false);
     }
     let nonce = desk.nonce();
-    out.send(
-        ViewId::BASE,
-        serde_json::json!({
-            "kind": "remote_listen",
-            "expiresInMs": QUESTION_WITHIN.as_millis() as u64,
-            "nonce": nonce,
-            "addr": ask.addr,
-            "iface": ask.iface,
-            "link": ask.kind.as_str(),
-            "plain": !ask.kind.is_tunnel(),
-        })
-        .to_string(),
-    );
+    out.send(ViewId::BASE, listen_payload(nonce, &ask, QUESTION_WITHIN));
     desk.listen = Some(Asking {
         nonce,
         asked: now,
@@ -426,6 +461,59 @@ pub(super) fn show_flagged(device: &str, name: &str, out: &mut Outbox) {
     );
 }
 
+/// One phone connected now, as the base page is told: the store's name and grant for the device `serve` named, and
+/// the `Host` and time of the connection.
+pub(super) struct ConnectedShown {
+    pub(super) device: String,
+    pub(super) name: String,
+    pub(super) grant: eitri_core::remote_devices::Grant,
+    pub(super) host: String,
+    pub(super) since: u64,
+}
+
+impl ConnectedShown {
+    /// A connected device whose store entry could not be read: shown by its id, with the narrowest grant.
+    pub(super) fn unnamed(c: &eitri_core::remote_rv::Connected) -> ConnectedShown {
+        ConnectedShown {
+            device: c.device.clone(),
+            name: c.device.clone(),
+            grant: eitri_core::remote_devices::Grant::Watch,
+            host: c.host.clone(),
+            since: c.since,
+        }
+    }
+}
+
+/// Tells every chat page who is connected now: the whole list, which replaces the last one. An empty list takes the
+/// phone mark off the status band. The list is kept for the documents that load after this call
+/// ([`connected_for_new_document`]).
+pub(super) fn show_connected(state: &mut AgentPanelState, connected: &[ConnectedShown], out: &mut Outbox) {
+    let devices: Vec<serde_json::Value> = connected
+        .iter()
+        .map(|c| {
+            serde_json::json!({
+                "device": c.device,
+                "name": c.name,
+                "grant": grant_word(c.grant),
+                "host": c.host,
+                "since": c.since,
+            })
+        })
+        .collect();
+    let payload = serde_json::json!({ "kind": "remote_connected", "devices": devices }).to_string();
+    state.remote_desk.connected = (!connected.is_empty()).then(|| payload.clone());
+    let views: Vec<ViewId> = state.pages.keys().copied().collect();
+    for view in views {
+        out.send(view, payload.clone());
+    }
+}
+
+/// What a document that has just said `ready` is owed about the phones: the last list, while any phone is
+/// connected (a document starts with none).
+pub(super) fn connected_for_new_document(state: &AgentPanelState) -> Option<String> {
+    state.remote_desk.connected.clone()
+}
+
 /// Shows the code waiting to be scanned in the base page.
 pub(super) fn show_pairing(shown: &PairingShown, out: &mut Outbox) {
     out.send(
@@ -566,6 +654,54 @@ mod tests {
         covered.set(false);
         listen_answer("l2", true);
         assert_eq!(*said.borrow(), vec![true]);
+    }
+
+    #[test]
+    fn a_waiting_question_is_shown_again_to_a_new_base_document() {
+        let (handle, base, second) = handle_with_two_pages();
+        let asked_at = Instant::now();
+        handle
+            .run(|state, out| {
+                ask_listen(
+                    state,
+                    ListenAsk {
+                        addr: "198.51.100.20".into(),
+                        iface: "eth0".into(),
+                        kind: IfaceKind::Plain,
+                    },
+                    asked_at,
+                    Box::new(|_| {}),
+                    out,
+                )
+            })
+            .unwrap();
+        let (enroll_nonce, _replies) = ask(&handle, PairMode::Direct);
+        let listens = |sent: &[String]| -> Vec<serde_json::Value> {
+            sent.iter()
+                .map(|e| json_of(e))
+                .filter(|v| v["kind"] == "remote_listen" || v["kind"] == "remote_enroll")
+                .collect()
+        };
+        let first = listens(&base.sent.borrow());
+        assert_eq!(first.len(), 2);
+        // The document that was there missed them (it was not loaded yet, or it is reloaded): the new one is told.
+        base.sent.borrow_mut().clear();
+        handle.page_message(ViewId::BASE, r#"{"type":"ready","request_id":"r-again"}"#);
+        let again = listens(&base.sent.borrow());
+        let nonces: Vec<u64> = again.iter().map(|v| v["nonce"].as_u64().unwrap()).collect();
+        assert_eq!(nonces.len(), 2, "{again:?}");
+        assert_eq!(first[0]["kind"], "remote_listen");
+        assert_eq!(nonces, [enroll_nonce, first[0]["nonce"].as_u64().unwrap()]);
+        assert!(again
+            .iter()
+            .all(|v| v["expiresInMs"].as_u64().unwrap() <= QUESTION_WITHIN.as_millis() as u64));
+        // Only the base page answers them, so only it is shown them.
+        second.sent.borrow_mut().clear();
+        handle.page_message(view(2), r#"{"type":"ready","request_id":"r-second"}"#);
+        assert!(listens(&second.sent.borrow()).is_empty());
+        // Past its time a question is not shown again.
+        let late = Instant::now() + QUESTION_WITHIN;
+        assert!(questions_for_new_document(&handle.state.borrow(), late).is_empty());
     }
 
     #[test]

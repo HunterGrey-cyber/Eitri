@@ -8,6 +8,29 @@ const running: BandFacts = { mode: "input", pill: "⏵⏵ auto", showcmd: null, 
 const idle: BandFacts = { ...running, mode: "browse", unread: null, cards: 0, queued: 0, context: null };
 const ids = (w: number, f: BandFacts) => bandLayout(f, w, 7.2).map((s) => s.id);
 
+describe("the phone mark", () => {
+  it("phone_mark_counts_connected_devices", () => {
+    const wide = bandLayout({ ...running, phones: 2 }, 900, 7.2);
+    expect(wide.find((s) => s.id === "phone")).toEqual({ id: "phone", text: "☎2", side: "left" });
+    expect(bandLayout({ ...running, phones: 1 }, 900, 7.2).find((s) => s.id === "phone")?.text).toBe("☎1");
+    // Beside the other left-hand counts, ahead of the message.
+    const order = wide.map((s) => s.id);
+    expect(order.indexOf("phone")).toBeGreaterThan(order.indexOf("queue"));
+  });
+  it("phone_mark_absent_when_none", () => {
+    expect(ids(900, running)).not.toContain("phone");
+    expect(ids(900, { ...running, phones: 0 })).not.toContain("phone");
+    expect(ids(900, { ...running, phones: null })).not.toContain("phone");
+  });
+  it("phone_mark_outlasts_every_other_segment", () => {
+    const facts: BandFacts = { ...running, phones: 3, background: 1, recovery: { path: "/a/b.txt", more: 0 }, ending: { kind: "failed", reason: "x", apiErrorStatus: null, message: "m" } };
+    for (let width = 1; width <= 900; width++) expect(ids(width, facts)).toContain("phone");
+    // Before the first measurement, and under a prompt, which take the band whole for themselves.
+    expect(bandLayout({ ...running, phones: 3 }, 0, 0).map((s) => s.id)).toEqual(["mode", "pill", "phone"]);
+    expect(bandLayout({ ...running, phones: 3, prompt: "close the window? (y/n)" }, 900, 7.2).map((s) => s.id)).toEqual(["mode", "prompt", "phone"]);
+  });
+});
+
 describe("the band degrades by priority", () => {
   it("following_shows_and_goes_when_narrow", () => {
     const facts = { ...idle, queued: 1, background: 1, following: true };

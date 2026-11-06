@@ -48,6 +48,8 @@ mod project_host;
 mod project_reader;
 mod project_stamp;
 mod project_start;
+#[cfg(target_os = "linux")]
+mod remote_switch;
 mod root_conflicts;
 mod sidecar_probe;
 mod takeover;
@@ -4933,6 +4935,25 @@ fn build_ui(
             project_root: project_root.to_path_buf(),
             window_name: String::new(),
         });
+    }
+    // Remote control (`remote.enabled`, off by default): a window that shows chats and shares its agents binds its `rv-`
+    // socket and starts `eitri remote serve` when none runs; the hub and page windows hold no tab and take no part.
+    #[cfg(target_os = "linux")]
+    if shows_a_chat && !hub {
+        match &window_agents_host {
+            Some(host) => remote_switch::start(&agent_panel_handle, host.instance(), &lua_engine.config.borrow()),
+            None if eitri_core::lua::config::parse_remote_enabled(
+                lua_engine
+                    .config
+                    .borrow()
+                    .get(eitri_core::lua::config::REMOTE_ENABLED_KEY),
+            )
+            .unwrap_or(false) =>
+            {
+                eprintln!("[remote] off: remote control follows the agents layer, and agents.enabled is false")
+            }
+            None => {}
+        }
     }
     // A page that declares `agents`, in any window that has plugins (a page window included), reads every window's
     // rows through one reader and asks them through their sockets; its own window's tabs go through the host above.

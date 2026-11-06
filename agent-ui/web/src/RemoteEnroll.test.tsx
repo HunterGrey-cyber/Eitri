@@ -166,6 +166,31 @@ describe("RemoteEnroll", () => {
     expect(answers()).toEqual([]);
   });
 
+  it("remote_connected replaces the list of connected devices and outlasts Escape", () => {
+    const first = { device: "d1", name: "Pixel", grant: "watch", host: "127.0.0.1:7341", since: 5 };
+    const second = { device: "d2", name: "Tablet", grant: "watch+steer", host: "desk.example.org", since: 9 };
+    fromRust({ kind: "remote_connected", devices: [first, second] });
+    expect(desk.snapshot().connected.map((d) => d.name)).toEqual(["Pixel", "Tablet"]);
+    fromRust({ kind: "remote_connected", devices: [second] });
+    expect(desk.snapshot().connected).toEqual([second]);
+    // The warnings and the code go with Escape; who is connected does not.
+    act(() => desk.dismiss());
+    expect(desk.snapshot().connected).toEqual([second]);
+    fromRust({ kind: "remote_connected", devices: [] });
+    expect(desk.snapshot().connected).toEqual([]);
+  });
+
+  it("a malformed remote_connected is dropped and leaves the list as it was", () => {
+    const ok = { device: "d1", name: "Pixel", grant: "watch", host: "h", since: 5 };
+    fromRust({ kind: "remote_connected", devices: [ok] });
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+    fromRust({ kind: "remote_connected", devices: [{ ...ok, grant: "admin" }] });
+    fromRust({ kind: "remote_connected", devices: "none" });
+    fromRust({ kind: "remote_connected", devices: [{ ...ok, since: -1 }] });
+    warn.mockRestore();
+    expect(desk.snapshot().connected).toEqual([ok]);
+  });
+
   it("shows the code to scan until a phone presents it, and drops a malformed question", () => {
     const { container } = render(<RemoteEnroll desk={desk} now={now} />);
     fromRust({ kind: "remote_pairing", code: "BwcHBwcHBwcHBwcHBwcHBw", uri: "eitri-pair:v=1", modules: ["10", "01"], expiresInMs: 180000 });

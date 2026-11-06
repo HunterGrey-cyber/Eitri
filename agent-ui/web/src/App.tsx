@@ -46,7 +46,7 @@ import {
   applyViewScroll,
 } from "./app/rowScroll";
 import type { FrozenSnapshot, ArrivalPark } from "./app/rowScroll";
-import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
+import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState, useSyncExternalStore } from "react";
 import type { KeyboardEvent, SetStateAction } from "react";
 import { ProjectDirContext } from "./projectPath";
 import { initialPageModel, pageModel, withoutHint } from "./page_model";
@@ -1496,6 +1496,8 @@ export default function App() {
      draws them) loses none. While another overlay owns the keys they take none: a `y` typed into the chooser's
      filter is the filter's. */
   const [remoteDesk] = useState(() => new RemoteDesk());
+  // Only the connected list: the questions' own changes do not render the whole panel.
+  const connectedPhones = useSyncExternalStore(remoteDesk.subscribe, () => remoteDesk.snapshot().connected);
   useEffect(() => {
     installRemoteDesk(remoteDesk.receive);
     return () => installRemoteDesk(null);
@@ -4114,6 +4116,8 @@ export default function App() {
             usage: null,
             // An empty tab has had no turns.
             ending: null,
+            // Phones watch other sessions too: the mark does not wait for this tab to start.
+            phones: connectedPhones.length,
           }}
           paneFocused={paneFocused}
           entryKey={panelEntryKey(keymapHelp.window, editorLink !== null)}
@@ -4178,6 +4182,7 @@ export default function App() {
               tmuxSkipped={keymapHelp.tmuxSkipped}
               companion={editorLink !== null}
               plugin={keymapPlugin ?? undefined}
+              phones={connectedPhones}
               startAt={keymapOpening.current !== null && keymapPlugin === null ? "prefix" : undefined}
               startRequest={keymapRequest}
               claudeSlashCommands={!isExternalAgent(activeTab?.agent)}
@@ -6144,6 +6149,7 @@ export default function App() {
               tmuxSkipped={keymapHelp.tmuxSkipped}
               companion={editorLink !== null}
               plugin={keymapPlugin ?? undefined}
+              phones={connectedPhones}
               startAt={keymapOpening.current !== null && keymapPlugin === null ? "prefix" : undefined}
               startRequest={keymapRequest}
               claudeSlashCommands={!isExternalAgent(activeTab?.agent)}
@@ -6459,6 +6465,8 @@ export default function App() {
           // Commands this tab's agent left running after its turns ended; nothing while there are none.
           background: sessionEnded ? null : state.backgroundCalls,
           following: activeTab?.following,
+          // Phones connected to this desk (remote control); the mark stays while there is one.
+          phones: connectedPhones.length,
           backgroundTasks: sessionEnded ? [] : state.backend === "sidecar" ? state.backgroundTasks.rows : undefined,
         }}
         paneFocused={paneFocused}

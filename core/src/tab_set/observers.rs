@@ -262,10 +262,13 @@ impl Observers {
     }
 
     /// The tab changed in a way no events frame carries (its delivery lost events, the broker's cards changed): each
-    /// observer is owed a snapshot.
+    /// observer is owed a snapshot, and a page it was owed is dropped. The lost events may have held a `/clear`, after
+    /// which the page's turn number names a turn of another conversation; the phone drops the answer to any `more` it
+    /// sent before the snapshot it is given, and asks again from that snapshot.
     pub(super) fn owe_snapshot(&mut self, tab: TabId) {
         for observer in self.of(tab) {
             observer.want_snapshot();
+            observer.owed_page = None;
         }
     }
 

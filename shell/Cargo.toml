@@ -276,3 +276,10 @@ harness = false
 [[test]]
 name = "remote_serve"
 harness = false
+
+# Remote control switched on end to end: windows decide and start `serve` as a window does, the product binary runs it
+# sandboxed in a home of its own, and a headless phone enrolls, watches, interrupts and is closed by `eitri remote stop`.
+# `own_display_scan` requires a test that starts the product binary to isolate its display in `main`.
+[[test]]
+name = "remote_e2e"
+harness = false

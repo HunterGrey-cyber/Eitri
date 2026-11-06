@@ -5,6 +5,9 @@ import type { KeyHelp, PanelBinding, PanelTable, PluginKeysHelp } from "../keyma
 import { sequenceTitle } from "../leader";
 import { listedSlashCommands } from "../slashCommands";
 import type { PermissionModeChoice } from "../types";
+import type { RemoteConnectedDevice } from "../bridge";
+import { revealHidden } from "../revealHidden";
+import { Revealed } from "./Revealed";
 import { modeConsequence } from "./Dashboard";
 
 type Props = {
@@ -36,12 +39,40 @@ type Props = {
   /** The plugin page that held the keys when `prefix ?` opened this sheet: its section comes first. Its title
    *  and rows are the page's own text, drawn as text nodes only. */
   plugin?: PluginKeysHelp;
+  /** The phones connected to this desk now (remote control): named first, with the grant each has and the `Host` it
+   *  came through, since the band's phone mark only counts them. No section when there are none. */
+  phones?: RemoteConnectedDevice[];
   /** Open at the window prefix keys when no plugin section takes precedence. */
   startAt?: "prefix";
   /** Which opening request `startAt` belongs to. A different number while the sheet is up positions it again;
    *  the same number never does, so ordinary re-renders leave the reader's scroll alone. */
   startRequest?: number;
 };
+
+/** The connected phones, one line each. Names and hosts are the phone's and the network's words: drawn as text with
+ *  their hidden characters escaped. */
+function PhonesSection({ phones }: { phones: RemoteConnectedDevice[] }) {
+  return (
+    <section>
+      <h2>Phones connected</h2>
+      <table>
+        <tbody>
+          {phones.map((phone) => (
+            <tr key={phone.device}>
+              <td>
+                <Revealed pieces={revealHidden(phone.name)} />
+              </td>
+              <td>
+                {phone.grant} · <Revealed pieces={revealHidden(phone.host)} />
+              </td>
+            </tr>
+          ))}
+        </tbody>
+      </table>
+      <p>These phones can watch this desk{phones.some((p) => p.grant === "watch+steer") ? ", and some can send messages" : ""}. `eitri remote revoke` takes one out.</p>
+    </section>
+  );
+}
 
 const ALL_MODES: PermissionModeChoice[] = ["manual", "auto", "bypass"];
 
@@ -233,7 +264,7 @@ function SlashCommands() {
  *  so reading the sheet never acts on a card underneath. Only a click on the backdrop closes it here:
  *  a click inside a table must still allow reading a row or selecting its text. */
 export const KeymapOverlay = forwardRef<HTMLDivElement, Props>(function KeymapOverlay(
-  { onClose, windowKeys, prefixKeys, prefixLabel, panel, tmuxSkipped, companion = false, claudeSlashCommands = true, agent = null, modes = ALL_MODES, plugin, startAt, startRequest = 0 },
+  { onClose, windowKeys, prefixKeys, prefixLabel, panel, tmuxSkipped, companion = false, claudeSlashCommands = true, agent = null, modes = ALL_MODES, plugin, phones, startAt, startRequest = 0 },
   ref,
 ) {
   const prefixHeading = useRef<HTMLHeadingElement>(null);
@@ -266,6 +297,7 @@ export const KeymapOverlay = forwardRef<HTMLDivElement, Props>(function KeymapOv
           BROWSE_KEYS, which keymap.test.ts ties to resolveKey both ways. Typing does the same for
           its GTK-decided rows. Ctrl+[ is a document listener, so it belongs in the note rather than
           that table. Mode consequences live here; the status band names the current mode. */}
+      {phones !== undefined && phones.length > 0 && <PhonesSection phones={phones} />}
       {/* The page the keys were in when the sheet was asked for comes first: those are the keys the reader
           was just using. Its title and rows are the page's own text, so they go through `Section`, which
           draws text nodes only. */}

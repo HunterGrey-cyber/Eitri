@@ -75,6 +75,9 @@ pub const CHUNK_BYTES: usize = 512 * 1024;
 /// The name of `serve`'s own socket in the runtime directory.
 const SERVE_SOCKET: &str = "remote.sock";
 
+/// The name of `serve`'s control socket in the runtime directory.
+const SERVE_CONTROL_SOCKET: &str = "remote-ctl.sock";
+
 /// How long [`RvClient::connect`] waits for the server to accept.
 const CONNECT_WITHIN: Duration = Duration::from_secs(2);
 
@@ -105,6 +108,12 @@ pub fn rv_socket_path(control_dir: &Path, instance: &str) -> io::Result<PathBuf>
 /// over the socket path limit.
 pub fn serve_socket_path(runtime_dir: &Path) -> io::Result<PathBuf> {
     agent::socket_path::in_dir(runtime_dir, SERVE_SOCKET)
+}
+
+/// `runtime_dir/remote-ctl.sock`, the socket `eitri remote add-device` and `grant` reach a window through (bound by
+/// `serve` whatever it listens on for phones), through `agent::socket_path::in_dir`.
+pub fn serve_control_socket_path(runtime_dir: &Path) -> io::Result<PathBuf> {
+    agent::socket_path::in_dir(runtime_dir, SERVE_CONTROL_SOCKET)
 }
 
 /// A credential a line carries: a device's token, an enrollment code, a push endpoint (whose URL may be the only

@@ -46,6 +46,7 @@ impl Drop for Scratch {
 struct Window {
     handle: AgentPanelHandle,
     base: Rc<RecordingPage>,
+    second: Rc<RecordingPage>,
     socket: RemoteSocket,
     path: PathBuf,
     _wake: PanelWake,
@@ -54,7 +55,7 @@ struct Window {
 impl Window {
     fn new(scratch: &Scratch, instance: &str) -> Window {
         agent::state_dirs::redirect_state_to_a_test_root();
-        let (handle, base, _second) = handle_with_two_pages();
+        let (handle, base, second) = handle_with_two_pages();
         let wake = PanelWake::new().unwrap();
         let socket = RemoteSocket::bind(&scratch.0, instance, &scratch.store(), &wake).expect("the socket binds");
         socket.set_pairing(Pairing {
@@ -69,6 +70,7 @@ impl Window {
         Window {
             handle,
             base,
+            second,
             socket,
             path,
             _wake: wake,
@@ -819,6 +821,121 @@ fn last_seen_and_host_follow_devices_connected() {
     // A report is not answered.
     window.settle();
     assert!(client.recv(Duration::from_millis(20)).unwrap().is_none());
+}
+
+#[test]
+fn every_report_tells_the_base_page_who_is_connected() {
+    let scratch = Scratch::new();
+    let window = Window::new(&scratch, INSTANCE_A);
+    let mut client = window.connect();
+    let (a, _) = window.enroll_with_yes(&mut client, "Pixel", "watch");
+    let (b, _) = window.enroll_with_yes(&mut client, "Tablet", "watch+steer");
+
+    // The newest `remote_connected` the base page was sent, once there are `after` of them.
+    let latest = |after: usize| {
+        window.turn_until("a remote_connected", || window.count("remote_connected") >= after);
+        let all: Vec<serde_json::Value> = window
+            .base
+            .sent
+            .borrow()
+            .iter()
+            .map(|e| json_of(e))
+            .filter(|v| v["kind"] == "remote_connected")
+            .collect();
+        all.last().unwrap().clone()
+    };
+
+    // Named from the store (name and grant) and the report (`Host`); a device the store does not hold is left out.
+    report(
+        &mut client,
+        &[
+            (&a, "203.0.113.5:43117"),
+            (&b, "127.0.0.1:43117"),
+            ("d0000", "127.0.0.1:1"),
+        ],
+    );
+    let told = latest(1);
+    let devices = told["devices"].as_array().unwrap();
+    assert_eq!(devices.len(), 2, "{told}");
+    assert_eq!(devices[0]["device"], a.as_str());
+    assert_eq!(devices[0]["name"], "Pixel");
+    assert_eq!(devices[0]["grant"], "watch");
+    assert_eq!(devices[0]["host"], "203.0.113.5:43117");
+    assert_eq!(devices[1]["name"], "Tablet");
+    assert_eq!(devices[1]["grant"], "watch+steer");
+
+    // The list replaces the last one, and an empty report clears it.
+    report(&mut client, &[(&b, "127.0.0.1:43117")]);
+    assert_eq!(latest(2)["devices"].as_array().unwrap().len(), 1);
+    report(&mut client, &[]);
+    assert_eq!(latest(3)["devices"], serde_json::json!([]));
+    assert!(!told.to_string().contains("token"), "{told}");
+}
+
+#[test]
+fn the_list_of_connected_phones_reaches_every_page_and_a_new_document() {
+    let scratch = Scratch::new();
+    let window = Window::new(&scratch, INSTANCE_A);
+    let mut client = window.connect();
+    let (a, _) = window.enroll_with_yes(&mut client, "Pixel", "watch");
+    let told = |page: &RecordingPage| {
+        page.sent
+            .borrow()
+            .iter()
+            .map(|e| json_of(e))
+            .filter(|v| v["kind"] == "remote_connected")
+            .count()
+    };
+    let last = |page: &RecordingPage| {
+        page.sent
+            .borrow()
+            .iter()
+            .map(|e| json_of(e))
+            .filter(|v| v["kind"] == "remote_connected")
+            .next_back()
+            .map(|v| v["devices"].as_array().unwrap().len())
+    };
+
+    // A page made for a tab broken out is told as well as the base page.
+    report(&mut client, &[(&a, "127.0.0.1:43117")]);
+    window.turn_until("the second page's list", || told(&window.second) >= 1);
+    assert_eq!(last(&window.second), Some(1));
+    assert_eq!(last(&window.base), Some(1));
+
+    // A document that loads while a phone is connected starts with nobody: its `ready` brings the list back.
+    let before = (told(&window.base), told(&window.second));
+    window.handle.page_message(ViewId::BASE, READY);
+    window.handle.page_message(view(2), READY);
+    assert_eq!(told(&window.base), before.0 + 1);
+    assert_eq!(told(&window.second), before.1 + 1);
+    assert_eq!(last(&window.base), Some(1));
+    assert_eq!(last(&window.second), Some(1));
+
+    // Once the last phone is gone a new document is told nothing about phones.
+    report(&mut client, &[]);
+    window.turn_until("the empty list", || last(&window.base) == Some(0));
+    let after = told(&window.base);
+    window.handle.page_message(ViewId::BASE, READY);
+    assert_eq!(told(&window.base), after);
+}
+
+#[test]
+fn a_phone_connected_twice_is_listed_once() {
+    let scratch = Scratch::new();
+    let window = Window::new(&scratch, INSTANCE_A);
+    let mut client = window.connect();
+    let (a, _) = window.enroll_with_yes(&mut client, "Pixel", "watch");
+    let (b, _) = window.enroll_with_yes(&mut client, "Tablet", "watch+steer");
+
+    report(
+        &mut client,
+        &[(&a, "127.0.0.1:1"), (&b, "127.0.0.1:2"), (&a, "127.0.0.1:3")],
+    );
+    let told = window.asked("remote_connected", 0);
+    let devices = told["devices"].as_array().unwrap();
+    assert_eq!(devices.len(), 2, "{told}");
+    assert_eq!(devices[0]["device"], a.as_str());
+    assert_eq!(devices[1]["device"], b.as_str());
 }
 
 #[test]

@@ -2,13 +2,16 @@
 //!
 //! `devices` and `revoke` read and write the store themselves (`revoke` through `remote_devices::update`, so a window
 //! enrolling at the same time cannot write the device back); `serve` sees the device go and closes its connections.
-//! `add-device` and `grant` only ask a window, through `serve`: the desk's y/n there is the boundary, which nothing
-//! typed in a terminal can stand in for, since an agent can type too. `ssh-key add` edits `~/.ssh/authorized_keys`
+//! `add-device` and `grant` only ask a window, through `serve`'s control socket (bound whatever `serve` listens on for
+//! phones): the desk's y/n there is the boundary, which nothing typed in a terminal can stand in for, since an agent
+//! can type too. `ssh-key add` edits `~/.ssh/authorized_keys`
 //! after a y/n here: it gives a phone's key one forward to the loopback port and nothing else.
 
 use eitri_core::remote_devices::{Device, DeviceStore, Grant, Recipe};
 use eitri_core::remote_pairing::{public_key_fingerprint, remote_state_dir, DEVICES_FILE};
-use eitri_core::remote_rv::{parse_rv_outbound, serve_socket_path, RvClient, RvInbound, RvOutbound, RV_PROTOCOL};
+use eitri_core::remote_rv::{
+    parse_rv_outbound, serve_control_socket_path, RvClient, RvInbound, RvOutbound, RV_PROTOCOL,
+};
 use std::io::{self, BufRead, Read, Write};
 use std::os::unix::fs::{DirBuilderExt, MetadataExt, OpenOptionsExt};
 use std::path::{Path, PathBuf};
@@ -51,7 +54,7 @@ pub fn add_device(args: &[String]) -> i32 {
     };
     let control_dir =
         eitri_core::panel_control::control_dir(std::env::var_os("XDG_RUNTIME_DIR").as_deref(), &std::env::temp_dir());
-    match serve_socket_path(&control_dir) {
+    match serve_control_socket_path(&control_dir) {
         Ok(path) => add_device_at(&path, name),
         Err(e) => {
             eprintln!("eitri remote add-device: {e}");
@@ -117,11 +120,11 @@ fn store_path() -> Result<PathBuf, String> {
     .ok_or_else(|| "neither XDG_STATE_HOME nor HOME names an absolute directory".to_owned())
 }
 
-/// `serve`'s socket in the control directory.
+/// `serve`'s control socket in the control directory.
 fn serve_path() -> io::Result<PathBuf> {
     let control_dir =
         eitri_core::panel_control::control_dir(std::env::var_os("XDG_RUNTIME_DIR").as_deref(), &std::env::temp_dir());
-    serve_socket_path(&control_dir)
+    serve_control_socket_path(&control_dir)
 }
 
 /// The store at `path`; a missing store holds no device.

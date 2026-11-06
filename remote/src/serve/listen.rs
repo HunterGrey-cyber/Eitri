@@ -95,7 +95,7 @@ pub fn bind(cfg: &ServeConfig, control_dir: &Path, confirmed: Option<&str>) -> R
 }
 
 /// A socket left at `path` by an earlier `serve` of this user: the lock is held now, so no other `serve` owns it.
-fn remove_stale_socket(path: &Path) -> Result<(), String> {
+pub(super) fn remove_stale_socket(path: &Path) -> Result<(), String> {
     match std::fs::symlink_metadata(path) {
         Ok(meta) if meta.file_type().is_socket() && meta.uid() == agent::private_fs::euid() => {
             std::fs::remove_file(path).map_err(|e| format!("could not remove the old socket {}: {e}", path.display()))

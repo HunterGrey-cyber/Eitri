@@ -12,9 +12,17 @@
 //! connection is a phone's session ([`session`]): its `hello` checked against the device store, its frames routed to
 //! the window that owns each tab ([`route`]), what it is owed queued with a bound ([`outbound`]); the store is watched
 //! so a revoked phone is cut off ([`revoke`]), and every window is told who is connected ([`report`]).
+//!
+//! Whatever it listens on for phones, it also binds its control socket ([`control`]), through which `eitri remote
+//! add-device` and `grant` reach a window.
+//!
+//! A window with `remote.enabled` starts it ([`spawn`]); it ends with exit 0 once no window has had a live `rv-` socket
+//! for [`SERVE_IDLE_EXIT`], and `eitri remote stop` ends it at once.
 
 #[cfg(target_os = "linux")]
 pub mod config;
+#[cfg(target_os = "linux")]
+pub mod control;
 #[cfg(target_os = "linux")]
 pub mod listen;
 #[cfg(target_os = "linux")]
@@ -33,6 +41,8 @@ pub mod route;
 pub mod sandbox;
 #[cfg(target_os = "linux")]
 pub mod session;
+#[cfg(target_os = "linux")]
+pub mod spawn;
 #[cfg(target_os = "linux")]
 pub mod ws;
 
@@ -71,6 +81,7 @@ mod linux {
     use std::time::{Duration, Instant};
 
     use agent::private_fs::PrivateLock;
+    pub use eitri_core::remote_runtime::SERVE_IDLE_EXIT;
 
     use super::config::{Record, ServeConfig, RECORD_V};
     use super::listen::{bind, iface_of, peer_in, Listeners};
@@ -135,10 +146,10 @@ mod linux {
         }
     }
 
-    /// The address the desk confirmed for listening. Nothing keeps the desk's answer in this build, so an address
-    /// listener is refused until it does.
-    fn confirmed_listen(_state: &Path) -> Option<String> {
-        None
+    /// The address the desk said yes to, recorded beside the device store by the window that asked, while the link
+    /// that holds it is still of the kind the desk was told; an unreadable record is no answer.
+    fn confirmed_listen(state: &Path) -> Option<String> {
+        eitri_core::remote_pairing::confirmed_listen_now(state).ok().flatten()
     }
 
     /// `eitri remote serve [--listen ...] [--port ...] [--origin ...]`. Returns only when it could not start, or another
@@ -151,14 +162,20 @@ mod linux {
                 return EXIT_FAILED;
             }
         };
-        let Err((code, line)) = run_serve(&dirs, args, confirmed_listen);
+        let Err((code, line)) = run_serve(&dirs, args, confirmed_listen, SERVE_IDLE_EXIT);
         eprintln!("eitri remote serve: {line}");
         code
     }
 
     enum Never {}
 
-    fn run_serve(dirs: &Dirs, args: &[String], confirmed: fn(&Path) -> Option<String>) -> Result<Never, (i32, String)> {
+    /// Runs `serve` until no window has had a live `rv-` socket for `idle` (then `Err` with exit 0), or fails.
+    fn run_serve(
+        dirs: &Dirs,
+        args: &[String],
+        confirmed: fn(&Path) -> Option<String>,
+        idle: Duration,
+    ) -> Result<Never, (i32, String)> {
         let failed = |e: String| (EXIT_FAILED, e);
         eitri_core::panel_control::ensure_dir(&dirs.control).map_err(failed)?;
         agent::private_fs::create_private_dir_all(&dirs.agents(), &dirs.control)
@@ -178,6 +195,7 @@ mod linux {
             .map_err(|e| failed(format!("could not open the record: {e}")))?;
 
         let listeners = bind(&cfg, &dirs.control, confirmed(&dirs.state).as_deref()).map_err(|e| (EXIT_REFUSED, e))?;
+        let (control, _control_path) = super::control::bind_control(&dirs.control).map_err(failed)?;
 
         let state = sandbox(&dirs.agents(), &dirs.control, &dirs.state)
             .map_err(|e| failed(format!("could not confine itself: {e}")))?;
@@ -200,10 +218,35 @@ mod linux {
         let hub = Hub::start(&dirs.control, &dirs.state.join(DEVICES_FILE), Limits::default())
             .map_err(|e| failed(format!("could not start serving: {e}")))?;
         accept_all(listeners, Arc::new(cfg), hub);
-        // The accepting threads never end, and the lock is held for as long as the process runs.
+        super::control::serve_control(control, dirs.control.clone())
+            .map_err(|e| failed(format!("could not answer the control socket: {e}")))?;
+        // The lock is held for as long as the process runs: a window that looks while it waits here sees it running.
         let _held = lock;
+        wait_for_no_window(&dirs.control, idle, idle_poll(idle));
+        Err((
+            0,
+            format!("no window has had remote control on for {} s; ending", idle.as_secs()),
+        ))
+    }
+
+    /// How often the windows are looked for while `serve` waits for the last to go.
+    fn idle_poll(idle: Duration) -> Duration {
+        (idle / 12).clamp(Duration::from_millis(10), Duration::from_secs(5))
+    }
+
+    /// Returns once no window in `control` has had a live `rv-` socket for `idle`, looking every `poll`
+    /// ([`live_windows`](super::report::live_windows): a socket whose window's rows name a live process; one a
+    /// crashed window left behind is none). The sockets are not connected to, so the windows are not woken.
+    pub fn wait_for_no_window(control: &Path, idle: Duration, poll: Duration) {
+        let mut last_seen = Instant::now();
         loop {
-            std::thread::park();
+            let any = !super::report::live_windows(control).is_empty();
+            if any {
+                last_seen = Instant::now();
+            } else if last_seen.elapsed() >= idle {
+                return;
+            }
+            std::thread::sleep(poll);
         }
     }
 
@@ -419,7 +462,7 @@ mod linux {
     }
 
     /// `eitri remote stop`: ends the running `serve`, and every phone's connection with it, then waits up to 5 s for
-    /// its lock to be let go. A window starts it again at its next start while remote control is on.
+    /// its lock to be let go. A window starts it again only at its own next start, while remote control is on.
     pub fn stop(args: &[String]) -> i32 {
         if !args.is_empty() {
             eprintln!("usage: eitri remote stop");
@@ -498,7 +541,7 @@ mod linux {
             std::fs::write(dirs.control.join(RECORD_FILE), format!("{stale}\n")).unwrap();
             let args = ["--listen".to_owned(), "socket".to_owned()];
             // The sandbox refuses beside libtest's threads, so this start ends there, after binding.
-            let (code, line) = match run_serve(&dirs, &args, record_at_bind) {
+            let (code, line) = match run_serve(&dirs, &args, record_at_bind, SERVE_IDLE_EXIT) {
                 Ok(never) => match never {},
                 Err(refused) => refused,
             };
@@ -509,6 +552,57 @@ mod linux {
                 Some(""),
                 "the previous serve's pid was still recorded while this one held the lock"
             );
+        }
+
+        #[test]
+        fn serve_exits_after_the_last_window() {
+            use eitri_core::agents::{ProjectRef, Publisher, WindowRef};
+            let control = scratch("idle");
+            let instance = "a3f09c1d2e4b5f60";
+            let socket = eitri_core::remote_rv::rv_socket_path(&control, instance).unwrap();
+            let window = std::os::unix::net::UnixListener::bind(&socket).unwrap();
+            window.set_nonblocking(true).unwrap();
+            let rows = Publisher::start(
+                &control,
+                instance,
+                ProjectRef {
+                    key: "9b2c4e7a10f3d856".into(),
+                    name: "p".into(),
+                },
+                WindowRef {
+                    instance: instance.into(),
+                    name: "1".into(),
+                    focused: false,
+                },
+            )
+            .unwrap();
+            let until = Instant::now() + Duration::from_secs(30);
+            while super::super::report::live_windows(&control).is_empty() {
+                assert!(Instant::now() < until, "the window's rows never showed");
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            let (done_tx, done) = std::sync::mpsc::channel();
+            let watched = control.clone();
+            std::thread::spawn(move || {
+                wait_for_no_window(&watched, Duration::from_millis(300), Duration::from_millis(10));
+                let _ = done_tx.send(());
+            });
+            assert!(
+                done.recv_timeout(Duration::from_millis(900)).is_err(),
+                "it ended while a window was up"
+            );
+            assert_eq!(
+                window.accept().map(|_| ()).unwrap_err().kind(),
+                io::ErrorKind::WouldBlock,
+                "looking for windows connected to one"
+            );
+            // The window's rows go (a crashed window's name a dead process, which counts the same) while its socket
+            // stays, and here would even take a connection.
+            rows.stop();
+            assert!(socket.exists());
+            done.recv_timeout(Duration::from_secs(30))
+                .expect("it did not end after the last window went");
+            drop(window);
         }
 
         #[test]

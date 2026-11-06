@@ -135,6 +135,17 @@ impl RemoteSocket {
     /// Fails, having created nothing, when the path would pass the socket path limit or `instance` is not an
     /// instance id; fails when the directory is not private or the name is taken.
     pub fn bind(control_dir: &Path, instance: &str, store_path: &Path, wake: &PanelWake) -> io::Result<RemoteSocket> {
+        RemoteSocket::bind_with(control_dir, instance, store_path, wake.waker(), Deadlines::default())
+    }
+
+    /// [`bind`](Self::bind) raising `wake` itself: what a window binds off the tick's thread with its panel's raise
+    /// ([`AgentPanelHandle::remote_waker`]) before it hands the socket to the panel ([`AgentPanelHandle::set_remote`]).
+    pub fn bind_waking(
+        control_dir: &Path,
+        instance: &str,
+        store_path: &Path,
+        wake: agent::UiWake,
+    ) -> io::Result<RemoteSocket> {
         RemoteSocket::bind_with(control_dir, instance, store_path, wake, Deadlines::default())
     }
 
@@ -142,13 +153,13 @@ impl RemoteSocket {
         control_dir: &Path,
         instance: &str,
         store_path: &Path,
-        wake: &PanelWake,
+        wake: agent::UiWake,
         deadlines: Deadlines,
     ) -> io::Result<RemoteSocket> {
         let (tx, rx) = mpsc::sync_channel(INBOUND_LINES);
         let shared = Arc::new(Shared {
             inbound: tx,
-            wake: wake.waker(),
+            wake,
             store: store_path.to_path_buf(),
             deadlines,
             live: AtomicUsize::new(0),

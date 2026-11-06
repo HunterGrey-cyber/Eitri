@@ -86,6 +86,10 @@ fn checks<'a>(agents: &'a [&'a str]) -> Vec<(&'static str, Check<'a>)> {
         (cfg::EDITOR_TAKEOVER_KEY, check(cfg::parse_editor_takeover)),
         (cfg::EDITOR_PRESENTATION_KEY, check(cfg::parse_editor_presentation)),
         (cfg::DESKTOP_START_KEY, check(cfg::parse_desktop_start)),
+        (cfg::REMOTE_ENABLED_KEY, check(cfg::parse_remote_enabled)),
+        (cfg::REMOTE_LISTEN_KEY, check(cfg::parse_remote_listen)),
+        (cfg::REMOTE_PORT_KEY, check(cfg::parse_remote_port)),
+        (cfg::REMOTE_ORIGINS_KEY, check(cfg::parse_remote_origins)),
     ];
     for key in KIT_KEYS {
         all.push((
@@ -293,6 +297,32 @@ mod tests {
         settle(&kernel);
         let problems = kernel.startup_problems();
         (kernel, problems)
+    }
+
+    #[test]
+    fn a_wildcard_remote_listen_is_said_and_loopback_is_used() {
+        use eitri_core::lua::config::{RemoteListen, RemoteSettings};
+        let (kernel, problems) =
+            settled("eitri.config.set('remote.enabled', true)\neitri.config.set('remote.listen', '0.0.0.0')\n");
+        let read = RemoteSettings::read(&kernel.config.borrow()).unwrap();
+        assert!(read.enabled);
+        assert_eq!(read.listen, RemoteListen::Loopback);
+        assert_eq!(problems.len(), 1, "{problems:?}");
+        assert!(
+            problems[0].contains("remote.listen") && problems[0].contains("wildcard"),
+            "{problems:?}"
+        );
+        assert!(
+            problems[0].contains("the default is used") && problems[0].contains("init.lua:2:"),
+            "{problems:?}"
+        );
+    }
+
+    #[test]
+    fn a_mistyped_remote_key_is_said() {
+        let (_kernel, problems) = settled("eitri.config.set('remote.enable', true)\n");
+        assert_eq!(problems.len(), 1, "{problems:?}");
+        assert!(problems[0].contains("remote.enabled"), "{problems:?}");
     }
 
     #[test]

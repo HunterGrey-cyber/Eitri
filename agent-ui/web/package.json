@@ -5,8 +5,8 @@
   "type": "module",
   "scripts": {
     "dev": "vite",
-    "build": "tsc -b && vite build",
-    "test": "vitest run"
+    "build": "tsc -b && vite build && node scripts/size-check.mjs 240000",
+    "test": "vitest run && node --test scripts/size-check.test.mjs"
   },
   "dependencies": {
     "dompurify": "^3.4.16",

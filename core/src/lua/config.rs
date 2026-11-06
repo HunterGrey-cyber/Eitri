@@ -176,6 +176,130 @@ pub fn parse_terminal_claude_ide(value: Option<&str>) -> Result<bool, String> {
     crate::config_switch::parse_switch(TERMINAL_CLAUDE_IDE_KEY, value, false)
 }
 
+/// The `init.lua` key: `eitri.config.set("remote.enabled", true | false)`. Whether this window starts remote control
+/// (the `rv-` socket and `eitri remote serve`).
+pub const REMOTE_ENABLED_KEY: &str = "remote.enabled";
+/// Where `eitri remote serve` listens: `"loopback"`, `"socket"`, or one address of this machine.
+pub const REMOTE_LISTEN_KEY: &str = "remote.listen";
+/// The TCP port `serve` listens on; unset means the port chosen once for this user.
+pub const REMOTE_PORT_KEY: &str = "remote.port";
+/// Public names a proxy or a tunnel reaches `serve` by, separated by commas or spaces.
+pub const REMOTE_ORIGINS_KEY: &str = "remote.origins";
+
+/// The longest `remote.origins` entry taken, and how many: a DNS name is at most 253 bytes, and a scheme and port
+/// add a few.
+const REMOTE_ORIGIN_MAX_BYTES: usize = 300;
+const REMOTE_ORIGINS_MAX: usize = 16;
+
+/// Where `serve` listens, as `remote.listen` says.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RemoteListen {
+    /// `127.0.0.1` and `::1`.
+    Loopback,
+    /// A Unix socket in the runtime directory.
+    Socket,
+    /// Exactly one address of this machine; the desk is asked about it before `serve` listens there.
+    Address(std::net::IpAddr),
+}
+
+/// The four `remote.*` keys as one reading of the store.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RemoteSettings {
+    pub enabled: bool,
+    pub listen: RemoteListen,
+    /// `None` is the port chosen once for this user.
+    pub port: Option<u16>,
+    pub origins: Vec<String>,
+}
+
+/// [`REMOTE_ENABLED_KEY`] as stored. Unset means off: it opens a socket and starts a listener, which only someone
+/// who asked for it should get.
+pub fn parse_remote_enabled(value: Option<&str>) -> Result<bool, String> {
+    crate::config_switch::parse_switch(REMOTE_ENABLED_KEY, value, false)
+}
+
+/// [`REMOTE_LISTEN_KEY`] as stored. Unset is loopback. A wildcard address is refused: it would take every network the
+/// machine is on, and the address the desk confirms has to be one.
+pub fn parse_remote_listen(value: Option<&str>) -> Result<RemoteListen, String> {
+    let Some(value) = value else {
+        return Ok(RemoteListen::Loopback);
+    };
+    match value.trim() {
+        "loopback" => Ok(RemoteListen::Loopback),
+        "socket" => Ok(RemoteListen::Socket),
+        text => {
+            let addr: std::net::IpAddr = text.parse().map_err(|_| {
+                format!("{REMOTE_LISTEN_KEY:?} must be loopback, socket or one address of this machine (got {value:?})")
+            })?;
+            if addr.is_unspecified() {
+                return Err(format!(
+                    "{REMOTE_LISTEN_KEY:?} refuses the wildcard address {addr}: name the one address phones reach this machine by"
+                ));
+            }
+            if addr.is_multicast() {
+                return Err(format!("{REMOTE_LISTEN_KEY:?} refuses the multicast address {addr}"));
+            }
+            Ok(if addr.is_loopback() {
+                RemoteListen::Loopback
+            } else {
+                RemoteListen::Address(addr)
+            })
+        }
+    }
+}
+
+/// [`REMOTE_PORT_KEY`] as stored: a port from 1 to 65535, or unset for the stable one.
+pub fn parse_remote_port(value: Option<&str>) -> Result<Option<u16>, String> {
+    let Some(value) = value else {
+        return Ok(None);
+    };
+    let text = value.trim();
+    match text.parse::<u16>() {
+        Ok(port) if port != 0 && text.bytes().all(|b| b.is_ascii_digit()) => Ok(Some(port)),
+        _ => Err(format!(
+            "{REMOTE_PORT_KEY:?} must be a port from 1 to 65535 (got {value:?})"
+        )),
+    }
+}
+
+/// [`REMOTE_ORIGINS_KEY`] as stored: names separated by commas or spaces, none empty. A wildcard, a path, a query or
+/// user information is refused by `serve`, which normalises each entry; this keeps out what could not be one.
+pub fn parse_remote_origins(value: Option<&str>) -> Result<Vec<String>, String> {
+    let Some(value) = value else {
+        return Ok(Vec::new());
+    };
+    let mut origins: Vec<String> = Vec::new();
+    for entry in value.split([',', ' ']).filter(|entry| !entry.is_empty()) {
+        if entry.len() > REMOTE_ORIGIN_MAX_BYTES || entry.contains('*') || !entry.bytes().all(|b| b.is_ascii_graphic())
+        {
+            return Err(format!(
+                "{REMOTE_ORIGINS_KEY:?} takes public host names or origins, not {entry:?}"
+            ));
+        }
+        if !origins.iter().any(|known| known == entry) {
+            origins.push(entry.to_owned());
+        }
+    }
+    if origins.len() > REMOTE_ORIGINS_MAX {
+        return Err(format!(
+            "{REMOTE_ORIGINS_KEY:?} names more than {REMOTE_ORIGINS_MAX} origins"
+        ));
+    }
+    Ok(origins)
+}
+
+impl RemoteSettings {
+    /// The four keys of `store`; the first bad one is the error.
+    pub fn read(store: &ConfigStore) -> Result<RemoteSettings, String> {
+        Ok(RemoteSettings {
+            enabled: parse_remote_enabled(store.get(REMOTE_ENABLED_KEY))?,
+            listen: parse_remote_listen(store.get(REMOTE_LISTEN_KEY))?,
+            port: parse_remote_port(store.get(REMOTE_PORT_KEY))?,
+            origins: parse_remote_origins(store.get(REMOTE_ORIGINS_KEY))?,
+        })
+    }
+}
+
 /// The editor's presentation preference, read after init.lua has run.
 pub const EDITOR_PRESENTATION_KEY: &str = "editor.presentation";
 
@@ -312,6 +436,96 @@ pub fn install(lua: &Lua, eitri: &Table, store: Rc<RefCell<ConfigStore>>) -> mlu
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn store_with(init: &str) -> Rc<RefCell<ConfigStore>> {
+        let lua = Lua::new();
+        let eitri = lua.create_table().unwrap();
+        let store = Rc::new(RefCell::new(ConfigStore::default()));
+        install(&lua, &eitri, store.clone()).unwrap();
+        lua.globals().set("eitri", eitri).unwrap();
+        lua.load(init).exec().unwrap();
+        store
+    }
+
+    #[test]
+    fn defaults_are_off_and_loopback() {
+        assert_eq!(REMOTE_ENABLED_KEY, "remote.enabled");
+        assert_eq!(REMOTE_LISTEN_KEY, "remote.listen");
+        assert_eq!(REMOTE_PORT_KEY, "remote.port");
+        assert_eq!(REMOTE_ORIGINS_KEY, "remote.origins");
+        let read = RemoteSettings::read(&ConfigStore::default()).unwrap();
+        assert_eq!(
+            read,
+            RemoteSettings {
+                enabled: false,
+                listen: RemoteListen::Loopback,
+                port: None,
+                origins: Vec::new(),
+            }
+        );
+    }
+
+    #[test]
+    fn the_keys_read_what_init_lua_set() {
+        let store = store_with(
+            "eitri.config.set('remote.enabled', true)\n\
+             eitri.config.set('remote.listen', '203.0.113.7')\n\
+             eitri.config.set('remote.port', 7400)\n\
+             eitri.config.set('remote.origins', 'desk.tail1.ts.net, https://phone.example.org desk.tail1.ts.net')",
+        );
+        let read = RemoteSettings::read(&store.borrow()).unwrap();
+        assert!(read.enabled);
+        assert_eq!(read.listen, RemoteListen::Address("203.0.113.7".parse().unwrap()));
+        assert_eq!(read.port, Some(7400));
+        assert_eq!(read.origins, ["desk.tail1.ts.net", "https://phone.example.org"]);
+        for (value, expected) in [
+            ("'loopback'", RemoteListen::Loopback),
+            ("'socket'", RemoteListen::Socket),
+            ("'127.0.0.1'", RemoteListen::Loopback),
+        ] {
+            let store = store_with(&format!("eitri.config.set('remote.listen', {value})"));
+            assert_eq!(parse_remote_listen(store.borrow().get(REMOTE_LISTEN_KEY)), Ok(expected));
+        }
+    }
+
+    #[test]
+    fn wildcard_listen_is_a_config_error() {
+        for wildcard in ["0.0.0.0", "::", " 0.0.0.0 "] {
+            let err = parse_remote_listen(Some(wildcard)).unwrap_err();
+            assert!(err.contains("remote.listen") && err.contains("wildcard"), "{err}");
+        }
+        for other in ["", "everywhere", "desk.local", "224.0.0.1", "ff02::1"] {
+            let err = parse_remote_listen(Some(other)).unwrap_err();
+            assert!(err.contains("remote.listen"), "{err}");
+        }
+        // The error reaches a reader of the whole group, so the window can say it and use the default.
+        let store = store_with("eitri.config.set('remote.listen', '0.0.0.0')");
+        assert!(RemoteSettings::read(&store.borrow()).is_err());
+    }
+
+    #[test]
+    fn a_bad_enabled_port_or_origin_names_its_key() {
+        assert!(parse_remote_enabled(Some("yes"))
+            .unwrap_err()
+            .contains("remote.enabled"));
+        for port in ["0", "65536", "-1", "80x", "", "1e3"] {
+            assert!(
+                parse_remote_port(Some(port)).unwrap_err().contains("remote.port"),
+                "{port}"
+            );
+        }
+        assert_eq!(parse_remote_port(Some("65535")), Ok(Some(65535)));
+        for origin in ["*.ts.net", "a\u{7f}b", "bad\u{e9}", &"a".repeat(301)] {
+            let err = parse_remote_origins(Some(origin)).unwrap_err();
+            assert!(err.contains("remote.origins"), "{err}");
+        }
+        assert_eq!(parse_remote_origins(Some(" , ")), Ok(Vec::new()));
+        let many = (0..17)
+            .map(|n| format!("h{n}.example.org"))
+            .collect::<Vec<_>>()
+            .join(",");
+        assert!(parse_remote_origins(Some(&many)).unwrap_err().contains("more than"));
+    }
 
     #[test]
     fn editor_takeover_parses_and_refuses_others() {

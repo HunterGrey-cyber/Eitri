@@ -386,7 +386,7 @@ fn serve_fake(stream: UnixStream, tx: &mpsc::Sender<Value>, me: &str) {
         let answer = match value["kind"].as_str() {
             Some("subscribe") => Some(json!({
                 "v": 1, "kind": "snapshot", "key": value["key"], "through": 1, "generation": 1, "unseen": null,
-                "frame": { "from": me },
+                "first_turn": 0, "cut": [], "frame": { "from": me },
             })),
             Some("ping") => Some(json!({ "v": 1, "kind": "pong" })),
             _ => None,
@@ -897,12 +897,10 @@ fn reconnect_gets_fresh_greeting(dir: &Path) -> Result<(), String> {
     let lines = phone.until(&[&window], "a fresh snapshot after the window closed", |l| {
         l["kind"] == "snapshot" && l["key"] == key
     })?;
+    let of_key: Vec<&Value> = lines.iter().filter(|l| l["key"] == key).collect();
     check(
-        lines
-            .iter()
-            .filter(|l| l["key"] == key)
-            .all(|l| l["kind"] == "greeting" || l["kind"] == "snapshot"),
-        || format!("only a greeting may come before it: {}", summary(&lines)),
+        of_key.len() == 2 && of_key[0]["kind"] == "greeting" && of_key[1]["kind"] == "snapshot",
+        || format!("a fresh greeting, then the snapshot: {}", summary(&lines)),
     )?;
     check(lines.last().unwrap()["through"].as_u64() == Some(through), || {
         format!("the fresh snapshot is of now: {}", lines.last().unwrap())
@@ -920,7 +918,7 @@ fn reconnect_gets_fresh_greeting(dir: &Path) -> Result<(), String> {
         format!("a new connection counts from 1: {}", lines[0])
     })?;
     check(
-        lines.iter().all(|l| l["kind"] == "greeting" || l["kind"] == "snapshot"),
+        lines.len() == 2 && lines[0]["kind"] == "greeting" && lines[1]["kind"] == "snapshot",
         || summary(&lines),
     )
 }
@@ -1152,10 +1150,23 @@ fn a_refused_more_keeps_the_subscription(dir: &Path) -> Result<(), String> {
     phone.send(json!({ "kind": "subscribe", "key": key }));
     let lines = phone.until(&[&window], "the snapshot", |l| l["kind"] == "snapshot")?;
     let generation = lines.last().unwrap()["generation"].as_u64().ok_or("no generation")?;
-    // The window turns the page down; the tab is still followed.
+    // A `more` the window carries out comes back as a page through the subscription.
     phone.send(json!({ "kind": "more", "key": key, "generation": generation, "before_turn": 1 }));
+    let lines = phone.until(&[&window], "the page", |l| {
+        l["kind"] == "page" || l["kind"] == "refused"
+    })?;
+    let page = lines.last().unwrap();
+    check(
+        page["kind"] == "page" && page["key"] == key && page["from_turn"] == 0 && page["through_turn"] == 0,
+        || summary(&lines),
+    )?;
+    // One that names a session the tab no longer holds is turned down by the window; the tab is still followed.
+    phone.send(json!({ "kind": "more", "key": key, "generation": generation + 1, "before_turn": 1 }));
     let lines = phone.until(&[&window], "the answer to more", |l| l["kind"] == "refused")?;
-    check(lines.last().unwrap()["key"] == key, || summary(&lines))?;
+    check(
+        lines.last().unwrap()["key"] == key && lines.last().unwrap()["why"] == "the session changed",
+        || summary(&lines),
+    )?;
     let through = window.fold(&tab, 3, "after more ")?;
     phone.until(&[&window], "the events after a refused more", |l| {
         l["kind"] == "events" && l["through"].as_u64() == Some(through)

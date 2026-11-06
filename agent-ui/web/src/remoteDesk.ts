@@ -1,5 +1,5 @@
 import { nextRequestId, postRemoteAnswer } from "./bridge";
-import type { RemoteDeskEnvelope, RemoteGrant } from "./bridge";
+import type { RemoteConnectedDevice, RemoteDeskEnvelope, RemoteGrant } from "./bridge";
 
 export type Pairing = Extract<RemoteDeskEnvelope, { kind: "remote_pairing" }>;
 export type Question =
@@ -17,11 +17,14 @@ export type DeskView = {
   /** Why the window turned down the shown question's `y`. */
   refusal: string | null;
   flagged: Flagged[];
+  /** The phones connected now, as the window last said. Not part of what Escape takes down: the mark it feeds stays
+   *  while a device is connected. */
+  connected: RemoteConnectedDevice[];
   /** Bumped each time the shown question must be on screen afresh before a `y` counts. */
   asking: number;
 };
 
-const EMPTY: DeskView = { pairing: null, questions: [], refusal: null, flagged: [], asking: 0 };
+const EMPTY: DeskView = { pairing: null, questions: [], refusal: null, flagged: [], connected: [], asking: 0 };
 
 /** The window's remote-control questions, kept apart from the component that draws them: the panel draws that
  *  component in whichever layout is up, and a question must outlive a switch between them, since the window asks it
@@ -114,6 +117,9 @@ export class RemoteDesk {
         if (!this.view.flagged.some((f) => f.device === payload.device)) {
           this.set({ flagged: [...this.view.flagged, payload] });
         }
+        return;
+      case "remote_connected":
+        this.set({ connected: payload.devices });
         return;
       case "command_result": {
         if (this.pending === null || payload.requestId !== this.pending.requestId) return;

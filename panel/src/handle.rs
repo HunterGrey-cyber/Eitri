@@ -121,6 +121,8 @@ pub struct AgentPanelHandle {
     arrived_moves: Rc<RefCell<BTreeMap<u64, TabId>>>,
     /// Where this window's agent rows go, while the agents layer runs here.
     agents: Rc<RefCell<Option<crate::agents_glue::AgentsGlue>>>,
+    /// This window's `rv-` socket, while remote control is on here: pumped at the end of every tick.
+    remote: Rc<RefCell<Option<super::RemoteSocket>>>,
 }
 
 /// The linked process, identified across process-id reuse, and the number its rows show.
@@ -180,6 +182,7 @@ impl AgentPanelHandle {
             partner: Rc::default(),
             arrived_moves: Rc::default(),
             agents: Rc::default(),
+            remote: Rc::default(),
         };
         if let Some(page) = page {
             handle.attach_page(ViewId::BASE, page);
@@ -223,6 +226,7 @@ impl AgentPanelHandle {
             partner: Rc::default(),
             arrived_moves: Rc::default(),
             agents: Rc::default(),
+            remote: Rc::default(),
         }
     }
 
@@ -1006,7 +1010,41 @@ impl AgentPanelHandle {
         self.offer_agent_rows(&live, &screen);
         self.replay_mentions();
         self.run(pair_outbound);
+        self.pump_remote();
         true
+    }
+
+    /// What a socket bound for this window raises so that the tick runs: the panel's own wake, or nothing where the
+    /// tick runs on its steady cadence anyway.
+    pub fn remote_waker(&self) -> agent::UiWake {
+        self.raise.clone().unwrap_or_else(|| std::sync::Arc::new(|| {}))
+    }
+
+    /// Hands this window's `rv-` socket to the panel, which pumps it at the end of every tick from now on and closes
+    /// it at shutdown. A socket handed over before is closed, its observers forgotten; a panel shutting down closes
+    /// this one at once.
+    pub fn set_remote(&self, socket: super::RemoteSocket) {
+        self.wake();
+        if self.state.borrow().shutting_down {
+            socket.close(self);
+            return;
+        }
+        let before = self.remote.borrow_mut().replace(socket);
+        if let Some(before) = before {
+            before.close(self);
+        }
+    }
+
+    /// Whether this window's `rv-` socket is with the panel.
+    pub fn has_remote(&self) -> bool {
+        self.remote.borrow().is_some()
+    }
+
+    fn pump_remote(&self) {
+        let remote = self.remote.borrow();
+        if let Some(socket) = remote.as_ref() {
+            socket.pump(self);
+        }
     }
 
     /// The one job of a tick with no page: the overlay in this window's editor moves on, and what it found goes out
@@ -1071,6 +1109,11 @@ impl AgentPanelHandle {
     /// the watch keeps alive belongs to the application that owns the loop this panel's timers run on.
     pub fn shutdown(&self) -> ShutdownWatch {
         self.wake();
+        // The `rv-` socket goes first: its observers are the tabs' and the tabs are taken below.
+        let remote = self.remote.borrow_mut().take();
+        if let Some(socket) = remote {
+            socket.close(self);
+        }
         // Words held for the editor go where a draft goes: the tab's, saved with it, and the history.
         self.run(super::mentions::drop_all);
         // Queued words outlive the window as history: handed to the history's writer with whatever it
@@ -3293,6 +3336,9 @@ mod tests {
             "take_startup_problems",
             // Drained by the socket's pump, which the tick runs: a wake here would tick again for nothing.
             "take_remote_results",
+            // Reads: what a socket bound off the GTK thread raises, and whether the panel holds one.
+            "remote_waker",
+            "has_remote",
         ];
         // Calls that wake only when what they changed needs the tick: a key that starts a typing window.
         const WAKES_WHEN: &[&str] = &["note_editor_key"];

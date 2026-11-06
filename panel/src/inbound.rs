@@ -617,6 +617,15 @@ pub(super) fn handle_inbound_message(
                 for hint in hints_for_new_document(state, view) {
                     payloads.push(eitri_core::agent_bridge::serialize_review_hint_for_js(&hint));
                 }
+                // Who is connected from a phone: a new document starts with nobody.
+                payloads.extend(super::remote_enroll::connected_for_new_document(state));
+                // The remote-control questions still waiting: the document that was here, if any, took them with it.
+                if view.is_base() {
+                    payloads.extend(super::remote_enroll::questions_for_new_document(
+                        state,
+                        std::time::Instant::now(),
+                    ));
+                }
                 // Last, so nothing the document draws from the payloads above can reset it.
                 let focused = state.page(view).is_some_and(|record| record.pane_focused);
                 payloads.push(eitri_core::agent_bridge::serialize_pane_focus_for_js(focused));

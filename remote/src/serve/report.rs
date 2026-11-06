@@ -5,7 +5,7 @@
 //! came from and when. A window keeps the device's last sighting from it. The lines go out on a thread of their own,
 //! so no phone's session waits for a window, and a report that finds a newer one queued behind it is skipped.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 use std::sync::mpsc::{self, Receiver, Sender};
 
@@ -79,14 +79,37 @@ pub fn window_sockets(control: &Path) -> Vec<PathBuf> {
     found.into_values().collect()
 }
 
+/// The instance ids of the windows with remote control on now, in order: an `rv-` socket whose window still runs (its
+/// rows file names a live process). A socket a crashed window left behind is no window. Nothing is connected to, so no
+/// window is woken to find out; when the rows cannot be read, a socket that takes a connection counts instead.
+pub fn live_windows(control: &Path) -> Vec<String> {
+    let running: BTreeSet<String> = match eitri_core::agents::scan_windows(control, eitri_core::agents::SCHEMA_V) {
+        Ok(windows) => windows.into_iter().map(|(_, window)| window.instance).collect(),
+        Err(e) => {
+            eprintln!("[remote] the windows were not read ({e}); asking their sockets");
+            return window_sockets(control)
+                .iter()
+                .filter(|socket| std::os::unix::net::UnixStream::connect(socket).is_ok())
+                .filter_map(|socket| instance_of(socket))
+                .collect();
+        }
+    };
+    window_instances(control)
+        .into_iter()
+        .filter(|instance| running.contains(instance))
+        .collect()
+}
+
+fn instance_of(socket: &Path) -> Option<String> {
+    let name = socket.file_name()?.to_str()?;
+    Some(name.strip_prefix("rv-")?.strip_suffix(".sock")?.to_owned())
+}
+
 /// The instance ids of every window with an `rv-` socket in `control`, in order.
 pub fn window_instances(control: &Path) -> Vec<String> {
     window_sockets(control)
         .iter()
-        .filter_map(|path| {
-            let name = path.file_name()?.to_str()?;
-            Some(name.strip_prefix("rv-")?.strip_suffix(".sock")?.to_owned())
-        })
+        .filter_map(|path| instance_of(path))
         .collect()
 }
 

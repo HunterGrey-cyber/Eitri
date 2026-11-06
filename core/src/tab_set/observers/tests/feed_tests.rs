@@ -633,6 +633,48 @@ fn clear_owes_a_snapshot_and_drops_the_owed_page() {
 }
 
 #[test]
+fn a_resync_that_hid_a_clear_drops_the_owed_page() {
+    let (dir, mut set, tab, provider) = tab_with("observers-more-resync", turns_of(5, 100));
+    let id = set.observe(&key(&set, tab)).unwrap();
+    set.take_observer_frames(id, usize::MAX);
+    let session = generation(&set, tab);
+    set.observer_more(id, session, 3).unwrap();
+    // A `/clear` and more of the new conversation than the UI queue holds: the tick sees a `Resync`, never the reset.
+    let turns = agent::UI_EVENT_QUEUE_CAPACITY / 4 + 10;
+    let mut events = vec![AgentDomainEvent::ConversationReset {
+        new_conversation_id: "conversation-after-clear".into(),
+        trigger: Some("clear".into()),
+    }];
+    events.extend(turns_of(turns, 10).into_iter().map(|event| match event {
+        AgentDomainEvent::UserPromptSubmitted { text } => AgentDomainEvent::UserPromptSubmitted {
+            text: format!("after {text}"),
+        },
+        other => other,
+    }));
+    let through = revision(&set, tab) + events.len() as u64;
+    provider.queue_all(events);
+    folded(&set, tab, through);
+    let out = set.pump(&dir, true);
+    let payload = json(&out.active_payload.expect("a payload"));
+    assert_eq!(payload["kind"], "snapshot", "the overflow became a resync");
+    assert_eq!(generation(&set, tab), session, "the same session");
+    let frames = set.take_observer_frames(id, usize::MAX);
+    assert!(
+        matches!(&frames[..], [ObserverFrame::Snapshot { .. }]),
+        "the new conversation's snapshot, and no page counted in the old one: {frames:?}"
+    );
+    let (first_turn, _, _, payload) = snapshot_of(&frames);
+    assert_eq!(first_turn, 0);
+    assert_eq!(prompts(&payload).first().map(String::as_str), Some("after prompt 0"));
+    set.observer_more(id, session, 3)
+        .expect("a page of the conversation it now holds");
+    let (from, through, _, page) = page_of(&set.take_observer_frames(id, usize::MAX));
+    assert_eq!((from, through), (0, 2));
+    assert_eq!(prompts(&page), ["after prompt 0", "after prompt 1", "after prompt 2"]);
+    shut_down(&mut set);
+}
+
+#[test]
 fn more_before_the_first_snapshot_is_refused() {
     let (_dir, mut set, tab, _provider) = tab_with("observers-more-first", turns_of(5, 100));
     let id = set.observe(&key(&set, tab)).unwrap();

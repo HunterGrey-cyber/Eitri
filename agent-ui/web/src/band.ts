@@ -5,7 +5,7 @@ import { escapeText, isHiddenChar, revealedText } from "./revealHidden";
 
 /** One segment's identity, in priority order (used only for lookups here --
  *  `bandLayout`'s own construction order, not this list, decides degrade order and render order). */
-export type SegId = "mode" | "pill" | "showcmd" | "message" | "prompt" | "warn" | "unread" | "cards" | "approve" | "queue" | "context" | "link" | "position" | "model" | "effort" | "usage" | "review" | "recovery" | "ending" | "background" | "following";
+export type SegId = "mode" | "pill" | "showcmd" | "message" | "prompt" | "warn" | "unread" | "cards" | "approve" | "queue" | "context" | "link" | "position" | "model" | "effort" | "usage" | "review" | "recovery" | "ending" | "background" | "following" | "phone";
 
 /** One piece of the band: the text to show and which side of the gap it belongs on (left of the
  *  gap is mode, pill, `⚑N`, `⧗N`, message; right of it is showcmd, `⚠`, context,
@@ -75,7 +75,16 @@ export type BandFacts = {
   background?: number | null;
   backgroundTasks?: BackgroundTaskRecord[];
   following?: boolean;
+  /** How many phones are connected to this desk right now (remote control). `0`, `null` or absent says nothing.
+   *  Unlike every other segment the mark is never dropped, shortened or hidden by a prompt while it is above `0`:
+   *  the person at the desk must always see that someone else can watch. */
+  phones?: number | null;
 };
+
+/** The band's phone mark: how many phones are connected. `?` names them. */
+export function phoneSegment(count: number): string {
+  return `☎${count}`;
+}
 
 /** The band's count of the commands an agent left running after its turns ended. */
 export function backgroundSegment(running: number): string {
@@ -281,11 +290,13 @@ const MODE_LETTER: Record<PanelMode, string> = { input: "I", browse: "B", hint: 
 export function bandLayout(f: BandFacts, widthPx: number, charPx: number): Seg[] {
   const mode: Seg = { id: "mode", text: MODE_TEXT[f.mode], side: "left" };
   const pill: Seg = { id: "pill", text: f.pill, side: "left" };
-  if (widthPx <= 0 || charPx <= 0) return [mode, pill];
+  const phone: Seg[] = f.phones && f.phones > 0 ? [{ id: "phone", text: phoneSegment(f.phones), side: "left" }] : [];
+  if (widthPx <= 0 || charPx <= 0) return [mode, pill, ...phone];
   const budget = Math.floor(widthPx / charPx);
   if (f.prompt !== null) {
-    const roomForPrompt = budget - textWidth(mode.text) - MODE_ARROW - 2 * PAD;
-    return [mode, { id: "prompt", text: f.prompt, side: "left", wraps: textWidth(f.prompt) > roomForPrompt }];
+    const taken = phone.reduce((n, x) => n + textWidth(x.text) + PAD, 0);
+    const roomForPrompt = budget - textWidth(mode.text) - MODE_ARROW - 2 * PAD - taken;
+    return [mode, { id: "prompt", text: f.prompt, side: "left", wraps: textWidth(f.prompt) > roomForPrompt }, ...phone];
   }
   const ctxFull = f.context && (f.context.lines ? `⧉ ${f.context.file}:${f.context.lines[0]}-${f.context.lines[1]}` : `⧉ ${f.context.file}`);
   const link = f.link && f.link.state !== "attached" && f.link.text !== "" ? f.link : null;
@@ -297,6 +308,7 @@ export function bandLayout(f: BandFacts, widthPx: number, charPx: number): Seg[]
     ...(f.cards + (f.questions ?? 0) > 0 ? [{ id: "cards", text: `⚑${f.cards + (f.questions ?? 0)}`, side: "left" } as Seg] : []),
     ...(f.approve ? [{ id: "approve", text: `Ctrl+y approves ${revealedText(f.approve.tool)}: ${f.approve.summary}`, side: "left" } as Seg] : []),
     ...(f.queued > 0 ? [{ id: "queue", text: `⧗${f.queued}`, side: "left" } as Seg] : []),
+    ...phone,
     ...(background ? [{ id: "background", text: background, side: "left" } as Seg] : []),
     ...(f.following ? [{ id: "following", text: "following", side: "left" } as Seg] : []),
     ...(f.ending ? [{ id: "ending", text: turnEndingBandText(f.ending), side: "left" } as Seg] : []),

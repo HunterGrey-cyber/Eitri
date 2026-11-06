@@ -63,6 +63,31 @@ describe("KeymapOverlay", () => {
     ]);
   });
 
+  it("names the connected phones first, with their grants and hosts, and no section without any", () => {
+    const phones = [
+      { device: "d1", name: "Pixel\u202e", grant: "watch" as const, host: "127.0.0.1:7341", since: 5 },
+      { device: "d2", name: "Tablet", grant: "watch+steer" as const, host: "desk.example.org", since: 9 },
+    ];
+    const { container } = render(
+      <KeymapOverlay onClose={() => {}} windowKeys={WINDOW} prefixKeys={PREFIX} prefixLabel="Ctrl+b" panel={EMPTY_PANEL_TABLE} phones={phones} />,
+    );
+    expect(container.querySelector("h2")?.textContent).toBe("Phones connected");
+    const text = sectionTitled(container, "Phones connected").textContent ?? "";
+    expect(text).toContain("Pixel⟨U+202E⟩");
+    expect(text).toContain("watch");
+    expect(text).toContain("127.0.0.1:7341");
+    expect(text).toContain("Tablet");
+    expect(text).toContain("watch+steer");
+    expect(text).toContain("desk.example.org");
+    for (const none of [undefined, []]) {
+      const bare = render(
+        <KeymapOverlay onClose={() => {}} windowKeys={WINDOW} prefixKeys={PREFIX} prefixLabel="Ctrl+b" panel={EMPTY_PANEL_TABLE} phones={none} />,
+      );
+      expect(Array.from(bare.container.querySelectorAll("h2")).map((h) => h.textContent)).not.toContain("Phones connected");
+      bare.unmount();
+    }
+  });
+
   it("follows a user's prefix", () => {
     const { container } = render(
       <KeymapOverlay onClose={() => {}} windowKeys={WINDOW} prefixKeys={PREFIX} prefixLabel="Ctrl+a" panel={EMPTY_PANEL_TABLE} />,

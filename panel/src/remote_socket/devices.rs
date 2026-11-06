@@ -29,14 +29,19 @@
 //! `devices_connected` is `serve`'s report, sent on every open and close, and written on the reader's thread in the
 //! order it came: the devices it names get `last_seen` and `last_host`, and those named by the previous report and not
 //! this one get `last_seen` (the close). Nothing is answered to a report. A device in the store with no desk's yes
-//! recorded (written by something other than a window's enrollment) is shown to the base page once per process.
+//! recorded (written by something other than a window's enrollment) is shown to the base page once per process. Every
+//! report also goes to every chat page whole (`remote_connected`: who is connected, with name, grant and `Host`; one
+//! entry per device however many connections it holds), so the status band counts the phones that can watch; a report
+//! that names nobody clears the mark. The window keeps the last list, and a document that says `ready` is told it.
 
 use super::*;
 use crate::agent_panel::remote_enroll::{
     ask_enroll, ask_listen, qr_rows, show_pairing, EnrollAsk, EnrollReply, ListenAsk, PairingShown,
     REMOTE_FIELD_MAX_BYTES,
 };
-use crate::agent_panel::remote_enroll::{ask_grant, grants_for, show_flagged, GrantAsk, SSH_ONLY_WATCHES};
+use crate::agent_panel::remote_enroll::{
+    ask_grant, grants_for, show_connected, show_flagged, ConnectedShown, GrantAsk, SSH_ONLY_WATCHES,
+};
 use eitri_core::remote_devices::{Confirmed, Device, DeviceStore, Recipe};
 use eitri_core::remote_pairing::{
     base64url, confirmed_listen_with_kind, interface_kind, interface_of, named_listen_addr, pairing_uri, random_fill,
@@ -155,8 +160,12 @@ pub(super) enum DevicesInbound {
     RevokeSelf { device: String },
     /// The device whose token was checked names its push endpoint, already checked.
     SetPushEndpoint { device: String, url: Secret },
-    /// Devices with no desk's yes, not shown before in this process: `(id, name)`.
-    Flagged(Vec<(String, String)>),
+    /// `serve`'s report was written: the devices with no desk's yes not shown before in this process (`(id, name)`),
+    /// and who is connected now, for the base page to count and name.
+    Reported {
+        flagged: Vec<(String, String)>,
+        connected: Vec<ConnectedShown>,
+    },
 }
 
 impl DevicesInbound {
@@ -472,28 +481,69 @@ fn record_connected(shared: &Shared, connected: Vec<Connected>, now: u64) -> Dev
                 d.last_seen = Some(now);
             }
         }
-        s.devices()
+        let unconfirmed = s
+            .devices()
             .iter()
             .filter(|d| d.confirmed.is_none())
             .map(|d| (d.id.clone(), d.name.clone()))
-            .collect::<Vec<_>>()
+            .collect::<Vec<_>>();
+        (unconfirmed, shown_connected(s, &connected))
     });
     *previous = named;
     match written {
-        Ok(unconfirmed) => {
+        Ok((unconfirmed, shown)) => {
             let mut flagged = FLAGGED.lock().unwrap_or_else(|e| e.into_inner());
-            DevicesInbound::Flagged(
-                unconfirmed
+            DevicesInbound::Reported {
+                flagged: unconfirmed
                     .into_iter()
                     .filter(|(id, _)| flagged.insert(id.clone()))
                     .collect(),
-            )
+                connected: shown,
+            }
         }
         Err(e) => {
             eprintln!("[agent_panel] remote: the connected devices were not recorded: {e}");
-            DevicesInbound::Flagged(Vec::new())
+            // The store could not be read for names, but the desk must still see that someone can watch.
+            DevicesInbound::Reported {
+                flagged: Vec::new(),
+                connected: one_per_device(&connected).iter().map(ConnectedShown::unnamed).collect(),
+            }
         }
     }
+}
+
+/// `report` with one entry per device, in the order the devices first appear: a phone whose connections overlap (a
+/// reconnect before the old socket closed) is one device, shown with its oldest connection.
+fn one_per_device(report: &[Connected]) -> Vec<Connected> {
+    let mut one: Vec<Connected> = Vec::new();
+    for c in report {
+        match one.iter_mut().find(|seen| seen.device == c.device) {
+            Some(seen) => {
+                if c.since < seen.since {
+                    *seen = c.clone();
+                }
+            }
+            None => one.push(c.clone()),
+        }
+    }
+    one
+}
+
+/// The devices of `report` the store still holds, with their names and grants. A device the store no longer holds
+/// (revoked since `serve` sent the report) is not shown: `serve` closes it and says so in the next report.
+fn shown_connected(store: &DeviceStore, report: &[Connected]) -> Vec<ConnectedShown> {
+    one_per_device(report)
+        .iter()
+        .filter_map(|c| {
+            store.get(&c.device).map(|d| ConnectedShown {
+                device: d.id.clone(),
+                name: d.name.clone(),
+                grant: d.grant,
+                host: c.host.clone(),
+                since: c.since,
+            })
+        })
+        .collect()
 }
 
 impl RemoteSocket {
@@ -538,11 +588,12 @@ impl RemoteSocket {
                     })
                 });
             }
-            DevicesInbound::Flagged(devices) => {
-                for (device, name) in devices {
+            DevicesInbound::Reported { flagged, connected } => {
+                for (device, name) in flagged {
                     eprintln!("[agent_panel] remote: device {device:?} is in the device store with no desk's yes");
                     handle.run(|_state, out| show_flagged(&device, &name, out));
                 }
+                handle.run(|state, out| show_connected(state, &connected, out));
             }
             DevicesInbound::StartEnroll(shown) => {
                 handle.run(|_state, out| show_pairing(&shown, out));

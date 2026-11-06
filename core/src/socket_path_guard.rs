@@ -53,6 +53,12 @@ const NEVER_BOUND: &[(&str, &str)] = &[
     // `eitri remote serve`'s socket's file name: its path is built only through `in_dir`
     // (`remote_rv::serve_socket_path`).
     ("src/remote_rv.rs", "const SERVE_SOCKET: &str = \"remote.sock\""),
+    // `serve`'s control socket's file name: its path is built only through `in_dir`
+    // (`remote_rv::serve_control_socket_path`).
+    (
+        "src/remote_rv.rs",
+        "const SERVE_CONTROL_SOCKET: &str = \"remote-ctl.sock\"",
+    ),
     ("src/ide_server/mention.rs", "const SOCKET_NAME: &str = \"m.sock\""),
     // The agents directory's cleanup unlinks a dead process's control socket by its file name, relative to
     // the control directory's handle; it never binds or connects, and the socket was bound through `in_dir`.

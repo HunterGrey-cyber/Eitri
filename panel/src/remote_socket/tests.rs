@@ -76,7 +76,8 @@ impl Rig {
         let scratch = Scratch::new();
         let store = write_store(&scratch.0);
         let wake = PanelWake::new().unwrap();
-        let socket = RemoteSocket::bind_with(&scratch.0, INSTANCE, &store, &wake, deadlines).expect("the socket binds");
+        let socket =
+            RemoteSocket::bind_with(&scratch.0, INSTANCE, &store, wake.waker(), deadlines).expect("the socket binds");
         let path = rv_socket_path(&scratch.0, INSTANCE).unwrap();
         Rig {
             handle,
