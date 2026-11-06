@@ -1006,6 +1006,84 @@ mod tests {
         shut_down(&mut set);
     }
 
+    /// A conversation of `turns` turns, each a prompt, some text, one tool call with a result and a completion.
+    fn transcript_of(turns: usize) -> Vec<AgentDomainEvent> {
+        let text = "The parser keeps one cursor per line and hands each token to the folding pass. ".repeat(5);
+        let output = "src/lib.rs:120: fn fold(&mut self, event: Event) -> Revision {\n".repeat(24);
+        let mut events = Vec::with_capacity(turns * 6);
+        for n in 0..turns {
+            let turn = format!("turn-{n}");
+            events.push(AgentDomainEvent::TurnStarted { turn_id: turn.clone() });
+            events.push(AgentDomainEvent::UserPromptSubmitted {
+                text: format!("Please look at the folding pass, step {n}, and tell me what it does."),
+            });
+            events.push(AgentDomainEvent::ContentDelta {
+                turn_id: turn.clone(),
+                kind: agent::ContentKind::Text,
+                text: text.clone(),
+            });
+            events.push(AgentDomainEvent::ToolCallStarted {
+                turn_id: turn.clone(),
+                tool_use_id: format!("call-{n}"),
+                name: "Bash".into(),
+                input: serde_json::json!({"command": format!("rg -n fold src/ | head -n 24 # {n}")}),
+            });
+            events.push(AgentDomainEvent::ToolCallCompleted {
+                turn_id: turn.clone(),
+                tool_use_id: format!("call-{n}"),
+                content: serde_json::json!(output),
+                is_error: false,
+            });
+            events.push(AgentDomainEvent::TurnCompleted {
+                turn_id: turn,
+                outcome: agent::TurnOutcome::Completed,
+                result_text: String::new(),
+                stop_reason: None,
+                usage: None,
+                detail: Default::default(),
+            });
+        }
+        events
+    }
+
+    /// Prints the size and serialization time of an observer snapshot for 10, 100 and 1000 turns; run with
+    /// `--ignored --nocapture`. It asserts only that ten times the turns cost less than fifteen times the time.
+    #[test]
+    #[ignore = "a measurement: prints figures for the remote-control decisions"]
+    fn measure_snapshot_cost() {
+        let mut measured = Vec::new();
+        for turns in [10usize, 100, 1000] {
+            let (dir, mut set, tab, provider) = opened_tab(&format!("observers-measure-{turns}"));
+            let events = transcript_of(turns);
+            let through = 1 + events.len() as u64;
+            provider.queue_all(events);
+            folded(&set, tab, through);
+            set.pump(&dir, true);
+            let mut times = Vec::new();
+            let mut bytes = 0;
+            for _ in 0..9 {
+                let started = Instant::now();
+                let (_, text, _) = observer_snapshot(set.get(tab).unwrap()).expect("a live tab has a snapshot");
+                times.push(started.elapsed());
+                bytes = text.len();
+            }
+            times.sort();
+            let median = times[times.len() / 2];
+            println!(
+                "{{\"turns\":{turns},\"snapshot_bytes\":{bytes},\"serialize_us_median\":{},\"serialize_us_min\":{}}}",
+                median.as_micros(),
+                times[0].as_micros()
+            );
+            measured.push((turns, median));
+            shut_down(&mut set);
+        }
+        let (hundred, thousand) = (measured[1].1, measured[2].1);
+        assert!(
+            thousand < hundred * 15,
+            "ten times the turns cost more than fifteen times the time: {hundred:?} -> {thousand:?}"
+        );
+    }
+
     #[test]
     fn changed_editor_cards_give_observers_a_fresh_snapshot() {
         let (_dir, mut set, tab, _provider) = opened_tab("observers-editor-cards");
