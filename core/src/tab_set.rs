@@ -36,7 +36,7 @@ mod moving;
 mod observers;
 mod shell;
 pub use moving::{FrozenChat, FrozenTab, MoveRefusedWhy, SendGate, Sent, TabHandoff};
-pub use observers::{GoneWhy, ObserveError, ObserverFrame, ObserverId, OBSERVER_QUEUE_CAP_BYTES};
+pub use observers::{GoneWhy, ObserveError, ObserverFrame, ObserverId, WorkMark, OBSERVER_QUEUE_CAP_BYTES};
 pub use shell::{shell_command, ShellEnded};
 
 #[cfg(test)]
@@ -940,6 +940,12 @@ impl Tab {
         self.live().is_some_and(|backend| backend.projection().cli_unseen_busy)
     }
 
+    /// Which of the sessions this tab has held is the one it holds now: raised each time a backend is put in place of
+    /// another (a start, a restart, a resume, a reset). A turn id is the agent's, and a later session may reuse one.
+    pub fn backend_generation(&self) -> u64 {
+        self.backend_generation
+    }
+
     /// The number of the latest stretch of work the panel cannot show (0 before the first). The tick starts a new one
     /// each time it sees [`Tab::cli_unseen_busy`] go from clear to set, and at every resync that finds it set: the
     /// events a resync dropped may have ended one stretch and begun the next.
@@ -951,7 +957,7 @@ impl Tab {
     /// projection's `last_revision`, read by the caller beside `cli_unseen_busy`), else `None`: work folded since the
     /// last tick may have ended one stretch and begun the next, which the number does not show yet.
     pub fn unseen_stretch_at(&self, revision: u64) -> Option<u64> {
-        (self.unseen_stretch.counted_through == Some(revision)).then_some(self.unseen_stretch.latest)
+        self.unseen_stretch.at(revision)
     }
 
     /// Applies what the provider reported about the messages this tab put into the running turn: one the
@@ -3792,7 +3798,13 @@ impl TabSet {
             }
         };
         if let Some(batch) = arm.observed.take() {
-            tick.observers.feed(live.id, generation, &batch, &live.notes.turn_times);
+            tick.observers.feed(
+                live.id,
+                generation,
+                *live.unseen_stretch,
+                &batch,
+                &live.notes.turn_times,
+            );
         }
         if arm.untracked_start {
             tick.untracked_starts.insert(live.id.0);
@@ -6568,6 +6580,13 @@ struct UnseenStretch {
     /// The projection revision through which every fold of the tab's backend has been counted; `None` until the
     /// first tick of a backend.
     counted_through: Option<u64>,
+}
+
+impl UnseenStretch {
+    /// The latest stretch's number when every fold through `revision` has been counted, else `None`.
+    fn at(&self, revision: u64) -> Option<u64> {
+        (self.counted_through == Some(revision)).then_some(self.latest)
+    }
 }
 
 /// What a pump arm leaves for the rest of its tab's tick.

@@ -729,6 +729,10 @@ mod tests {
             (tab, provider, key)
         }
 
+        fn generation(&self, tab: TabId) -> u64 {
+            self.handle.state.borrow().tabs.get(tab).unwrap().backend_generation()
+        }
+
         fn active_turn(&self, tab: TabId) -> Option<String> {
             let state = self.handle.state.borrow();
             let turn = state.tabs.get(tab).unwrap().live()?.projection().active_turn_id.clone();
@@ -855,8 +859,12 @@ mod tests {
             .collect()
     }
 
-    fn interrupt(command_id: &str, turn: &str) -> serde_json::Value {
-        serde_json::json!({ "type": "interrupt", "command_id": command_id, "expect_work": { "turn": turn } })
+    fn interrupt(command_id: &str, turn: &str, generation: u64) -> serde_json::Value {
+        serde_json::json!({
+            "type": "interrupt",
+            "command_id": command_id,
+            "expect_work": { "turn": { "id": turn, "generation": generation } },
+        })
     }
 
     fn delta(turn: &str, text: &str) -> agent::AgentDomainEvent {
@@ -936,7 +944,13 @@ mod tests {
         .enumerate()
         {
             let id = format!("c{n}");
-            rig.act(&mut client, device, token, &key, interrupt(&id, "t1"));
+            rig.act(
+                &mut client,
+                device,
+                token,
+                &key,
+                interrupt(&id, "t1", rig.generation(tab)),
+            );
             let lines = rig.until(&mut client, "the result", |l| l["kind"] == "result");
             let result = lines.last().unwrap();
             assert_eq!(result["command_id"], id.as_str());
@@ -953,7 +967,13 @@ mod tests {
         let (tab, provider, key) = rig.tab();
         rig.start_turn(tab, &provider, "t1");
         let mut client = rig.connect();
-        rig.act(&mut client, "d1", "tok", &key, interrupt("c1", "t1"));
+        // The phone names the session as the frames it was sent name it.
+        rig.subscribe(&mut client, &key);
+        let lines = rig.until(&mut client, "the snapshot", |l| l["kind"] == "snapshot");
+        let generation = lines.last().unwrap()["generation"]
+            .as_u64()
+            .expect("the snapshot names its session");
+        rig.act(&mut client, "d1", "tok", &key, interrupt("c1", "t1", generation));
         let lines = rig.until(&mut client, "the result", |l| l["kind"] == "result");
         let result = lines.last().unwrap();
         assert_eq!(
@@ -968,6 +988,25 @@ mod tests {
         let lines = rig.until(&mut client, "the result", |l| l["kind"] == "result");
         assert_eq!(lines.last().unwrap()["ok"], false);
         assert_eq!(lines.last().unwrap()["why"], "malformed");
+    }
+
+    #[test]
+    fn unseen_work_is_stopped_by_the_number_its_frames_carry() {
+        let rig = Rig::new("remote-unseen-by-frames");
+        let (_tab, provider, key) = rig.tab();
+        let mut client = rig.connect();
+        rig.subscribe(&mut client, &key);
+        rig.until(&mut client, "the snapshot", |l| l["kind"] == "snapshot");
+        provider.queue(agent::AgentDomainEvent::CliWorkUnseen);
+        let lines = rig.until(&mut client, "a frame naming the stretch", |l| {
+            l["kind"] == "events" && l["unseen"].is_u64()
+        });
+        let stretch = lines.last().unwrap()["unseen"].clone();
+        let stop = serde_json::json!({ "type": "interrupt", "command_id": "c1", "expect_work": { "unseen": stretch } });
+        rig.act(&mut client, "d1", "tok", &key, stop);
+        let lines = rig.until(&mut client, "the result", |l| l["kind"] == "result");
+        assert_eq!(lines.last().unwrap()["ok"], true, "{:?}", lines.last());
+        assert_eq!(provider.interrupts(), 1, "the unseen work was stopped");
     }
 
     #[test]
@@ -1258,12 +1297,24 @@ mod tests {
         let (tab, provider, key) = rig.tab();
         rig.start_turn(tab, &provider, "t1");
         let mut client = rig.connect();
-        rig.act(&mut client, "d1", "tok", &key, interrupt("c1", "t1"));
+        rig.act(
+            &mut client,
+            "d1",
+            "tok",
+            &key,
+            interrupt("c1", "t1", rig.generation(tab)),
+        );
         let lines = rig.until(&mut client, "the first result", |l| l["kind"] == "result");
         assert_eq!(lines.last().unwrap()["ok"], true);
 
         rig.start_turn(tab, &provider, "t2");
-        rig.act(&mut client, "d3", "tok3", &key, interrupt("c1", "t2"));
+        rig.act(
+            &mut client,
+            "d3",
+            "tok3",
+            &key,
+            interrupt("c1", "t2", rig.generation(tab)),
+        );
         let lines = rig.until(&mut client, "the second result", |l| l["kind"] == "result");
         let result = lines.last().unwrap();
         assert_eq!(

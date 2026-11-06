@@ -343,7 +343,10 @@ pub(super) fn admit_remote(
             };
             let projection = backend.projection();
             let still_running = match expect_work {
-                ExpectWork::Turn(turn) => projection.active_turn_id.as_deref() == Some(turn.as_str()),
+                ExpectWork::Turn { id, generation } => {
+                    held.backend_generation() == *generation
+                        && projection.active_turn_id.as_deref() == Some(id.as_str())
+                }
                 // The number only from a tick that counted every fold this projection shows.
                 ExpectWork::Unseen(stretch) => {
                     projection.active_turn_id.is_none()

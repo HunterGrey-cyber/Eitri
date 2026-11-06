@@ -21,12 +21,18 @@ pub struct RemoteOrigin {
     pub conn: u64,
 }
 
-/// The work a stop was asked about, so a stop that arrives after that work has ended stops nothing: a turn by its id,
-/// or a stretch of work the panel cannot show by its number ([`eitri_core::tab_set::Tab::unseen_stretch`]).
+/// The work a stop was asked about, so a stop that arrives after that work has ended stops nothing: a turn by its id
+/// and the session it ran in, or a stretch of work the panel cannot show by its number. Both are as the observer's
+/// frames named them ([`eitri_core::tab_set::WorkMark`]); the session is needed because a turn id is the agent's and a
+/// session that replaces another in the tab may reuse it, while the stretch number never repeats in a tab.
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
 #[serde(rename_all = "snake_case", deny_unknown_fields)]
 pub enum ExpectWork {
-    Turn(String),
+    Turn {
+        id: String,
+        /// The tab's backend generation ([`eitri_core::tab_set::Tab::backend_generation`]).
+        generation: u64,
+    },
     Unseen(u64),
 }
 
@@ -182,6 +188,33 @@ mod tests {
         (tab, provider, key)
     }
 
+    /// The work `turn` of the session `tab` holds now, as a phone names it from the frames it was sent.
+    fn turn(handle: &AgentPanelHandle, tab: TabId, turn: &str) -> serde_json::Value {
+        let generation = handle.state.borrow().tabs.get(tab).unwrap().backend_generation();
+        serde_json::json!({ "turn": { "id": turn, "generation": generation } })
+    }
+
+    /// Puts a new session over a recording provider in `tab` in place of the one it held.
+    fn replace_session(handle: &AgentPanelHandle, tab: TabId, dir: &Path) -> std::sync::Arc<RecordingProvider> {
+        let provider = std::sync::Arc::new(RecordingProvider::interruptible());
+        let conversation = agent::AgentConversation::create(provider.clone(), dir, ProjectTrust::Untrusted).unwrap();
+        let backend = AgentBackend::Conversation {
+            agent: AgentId::Claude,
+            conversation: Box::new(conversation),
+        };
+        let old = handle
+            .state
+            .borrow_mut()
+            .tabs
+            .get_mut(tab)
+            .unwrap()
+            .set_backend(TabBackend::Live(backend));
+        if let TabBackend::Live(mut old) = old {
+            old.shutdown();
+        }
+        provider
+    }
+
     fn active_turn(handle: &AgentPanelHandle, tab: TabId) -> Option<String> {
         let state = handle.state.borrow();
         let backend = state.tabs.get(tab).unwrap().live()?;
@@ -213,7 +246,7 @@ mod tests {
 
     #[test]
     fn remote_inbound_refuses_desk_only_kinds() {
-        let interrupt = r#"{"type":"interrupt","command_id":"c1","expect_work":{"turn":"t1"}}"#;
+        let interrupt = r#"{"type":"interrupt","command_id":"c1","expect_work":{"turn":{"id":"t1","generation":1}}}"#;
         assert!(
             serde_json::from_str::<RemoteInbound>(interrupt).is_ok(),
             "the one remote kind parses"
@@ -230,7 +263,9 @@ mod tests {
             "ready",
             "turn_rendered",
         ] {
-            let raw = format!(r#"{{"type":"{kind}","command_id":"c1","expect_work":{{"turn":"t1"}}}}"#);
+            let raw = format!(
+                r#"{{"type":"{kind}","command_id":"c1","expect_work":{{"turn":{{"id":"t1","generation":1}}}}}}"#
+            );
             assert!(
                 serde_json::from_str::<RemoteInbound>(&raw).is_err(),
                 "{kind} is the desk's alone"
@@ -241,17 +276,30 @@ mod tests {
 
     #[test]
     fn remote_inbound_refuses_unknown_fields() {
-        let named_tab = r#"{"type":"interrupt","command_id":"c1","expect_work":{"turn":"t"},"tab":3}"#;
+        let named_tab =
+            r#"{"type":"interrupt","command_id":"c1","expect_work":{"turn":{"id":"t","generation":1}},"tab":3}"#;
         assert!(serde_json::from_str::<RemoteInbound>(named_tab).is_err());
         assert_eq!(parse_remote_inbound(named_tab), Err(RemoteRefusal::Parse));
-        let both = r#"{"type":"interrupt","command_id":"c1","expect_work":{"turn":"t","unseen":1}}"#;
+        let both =
+            r#"{"type":"interrupt","command_id":"c1","expect_work":{"turn":{"id":"t","generation":1},"unseen":1}}"#;
         assert!(serde_json::from_str::<RemoteInbound>(both).is_err(), "one kind of work");
-        let without = r#"{"type":"interrupt","command_id":"c1","expect_work":{"turn":"t"}}"#;
+        for turn in [
+            r#"{"turn":"t"}"#,
+            r#"{"turn":{"id":"t"}}"#,
+            r#"{"turn":{"id":"t","generation":1,"tab":3}}"#,
+        ] {
+            let raw = format!(r#"{{"type":"interrupt","command_id":"c1","expect_work":{turn}}}"#);
+            assert_eq!(parse_remote_inbound(&raw), Err(RemoteRefusal::Parse), "{raw}");
+        }
+        let without = r#"{"type":"interrupt","command_id":"c1","expect_work":{"turn":{"id":"t","generation":1}}}"#;
         assert_eq!(
             serde_json::from_str::<RemoteInbound>(without).unwrap(),
             RemoteInbound::Interrupt {
                 command_id: "c1".into(),
-                expect_work: ExpectWork::Turn("t".into()),
+                expect_work: ExpectWork::Turn {
+                    id: "t".into(),
+                    generation: 1
+                },
             }
         );
         let stretch = r#"{"type":"interrupt","command_id":"c1","expect_work":{"unseen":2}}"#;
@@ -280,11 +328,7 @@ mod tests {
         );
 
         assert_eq!(
-            handle.remote_message(
-                &phone(),
-                &first_key,
-                &interrupt("c1", serde_json::json!({ "turn": "t1" }))
-            ),
+            handle.remote_message(&phone(), &first_key, &interrupt("c1", turn(&handle, first, "t1"))),
             Ok(())
         );
         assert_eq!(first_provider.interrupts(), 1, "the tab with that key stopped");
@@ -300,11 +344,7 @@ mod tests {
         let (tab, provider, _) = interruptible_tab(&handle, &dir);
         start_turn(&handle, tab, &provider, "t1");
         assert_eq!(
-            handle.remote_message(
-                &phone(),
-                &RowKey::new(),
-                &interrupt("c1", serde_json::json!({ "turn": "t1" }))
-            ),
+            handle.remote_message(&phone(), &RowKey::new(), &interrupt("c1", turn(&handle, tab, "t1"))),
             Err(RemoteRefusal::NoSuchTab)
         );
         assert_eq!(provider.interrupts(), 0, "nothing stopped");
@@ -322,7 +362,7 @@ mod tests {
         start_turn(&handle, tab, &provider, "t2");
 
         assert_eq!(
-            handle.remote_message(&phone(), &key, &interrupt("c1", serde_json::json!({ "turn": "t1" }))),
+            handle.remote_message(&phone(), &key, &interrupt("c1", turn(&handle, tab, "t1"))),
             Err(RemoteRefusal::WorkChanged)
         );
         assert_eq!(provider.interrupts(), 0, "nothing stopped");
@@ -332,6 +372,33 @@ mod tests {
             handle.remote_message(&phone(), &key, &interrupt("c2", serde_json::json!({ "unseen": 0 }))),
             Err(RemoteRefusal::WorkChanged)
         );
+        shut_down_every_tab(&handle);
+    }
+
+    #[test]
+    fn remote_interrupt_for_a_turn_of_a_replaced_session_is_refused() {
+        agent::state_dirs::redirect_state_to_a_test_root();
+        let dir = agent::state_dirs::test_workspace_dir("remote-replaced-session");
+        let (handle, _base, _second) = handle_with_two_pages();
+        let (tab, provider, key) = interruptible_tab(&handle, &dir);
+        start_turn(&handle, tab, &provider, "t1");
+        let asked = turn(&handle, tab, "t1");
+
+        // The session is replaced, and the next one names its first turn the same.
+        let next = replace_session(&handle, tab, &dir);
+        start_turn(&handle, tab, &next, "t1");
+        assert_eq!(
+            handle.remote_message(&phone(), &key, &interrupt("c1", asked)),
+            Err(RemoteRefusal::WorkChanged)
+        );
+        assert_eq!(next.interrupts(), 0, "the new session's turn was not stopped");
+        assert_eq!(active_turn(&handle, tab).as_deref(), Some("t1"));
+        assert_eq!(
+            handle.remote_message(&phone(), &key, &interrupt("c2", turn(&handle, tab, "t1"))),
+            Ok(()),
+            "a stop naming this session's turn stops it"
+        );
+        assert_eq!(next.interrupts(), 1);
         shut_down_every_tab(&handle);
     }
 
@@ -385,7 +452,7 @@ mod tests {
         start_turn(&handle, tab, &provider, "t1");
 
         assert_eq!(
-            handle.remote_message(&phone(), &key, &interrupt("c1", serde_json::json!({ "turn": "t1" }))),
+            handle.remote_message(&phone(), &key, &interrupt("c1", turn(&handle, tab, "t1"))),
             Ok(())
         );
         assert_eq!(provider.interrupts(), 1, "the running turn was stopped");
@@ -407,7 +474,7 @@ mod tests {
         start_turn(&handle, tab, &provider, "t1");
 
         assert_eq!(
-            handle.remote_message(&phone(), &key, &interrupt("c1", serde_json::json!({ "turn": "t1" }))),
+            handle.remote_message(&phone(), &key, &interrupt("c1", turn(&handle, tab, "t1"))),
             Ok(())
         );
         assert_eq!(provider.interrupts(), 1, "the agent's turn was stopped");
@@ -434,7 +501,7 @@ mod tests {
         tick_handle_until(&handle, "the card", || waiting(&handle, tab, "perm-1"));
 
         assert_eq!(
-            handle.remote_message(&phone(), &key, &interrupt("c1", serde_json::json!({ "turn": "t1" }))),
+            handle.remote_message(&phone(), &key, &interrupt("c1", turn(&handle, tab, "t1"))),
             Ok(())
         );
         for _ in 0..5 {
@@ -464,7 +531,7 @@ mod tests {
         clear(&[&base, &second]);
 
         assert_eq!(
-            handle.remote_message(&phone(), &key, &interrupt("c1", serde_json::json!({ "turn": "t1" }))),
+            handle.remote_message(&phone(), &key, &interrupt("c1", turn(&handle, tab, "t1"))),
             Ok(())
         );
         handle.tick();
@@ -491,7 +558,7 @@ mod tests {
         let (handle, _base, _second) = handle_with_two_pages();
         let (tab, provider, key) = interruptible_tab(&handle, &dir);
         start_turn(&handle, tab, &provider, "t1");
-        let stop = interrupt("c1", serde_json::json!({ "turn": "t1" }));
+        let stop = interrupt("c1", turn(&handle, tab, "t1"));
 
         assert_eq!(handle.remote_message(&phone(), &key, &stop), Ok(()));
         assert_eq!(
@@ -570,10 +637,10 @@ mod tests {
     fn command_ids_outlive_the_handle_that_took_them() {
         agent::state_dirs::redirect_state_to_a_test_root();
         let dir = agent::state_dirs::test_workspace_dir("remote-ids-across-handles");
-        let stop = interrupt("c1", serde_json::json!({ "turn": "t1" }));
         let (first, _base, _second) = handle_with_two_pages();
         let (tab, provider, key) = interruptible_tab(&first, &dir);
         start_turn(&first, tab, &provider, "t1");
+        let stop = interrupt("c1", turn(&first, tab, "t1"));
         assert_eq!(first.remote_message(&phone(), &key, &stop), Ok(()));
 
         let (other, _other_base, _other_second) = handle_with_two_pages();

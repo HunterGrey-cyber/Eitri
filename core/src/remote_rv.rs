@@ -15,7 +15,7 @@
 //! by this user, before it writes a byte.
 
 use crate::panel_control::euid;
-use crate::tab_set::{GoneWhy, ObserverFrame, RowKey};
+use crate::tab_set::{GoneWhy, ObserverFrame, RowKey, WorkMark};
 use agent::private_fs::{remove_if_same, FileIdentity};
 use serde::{Deserialize, Serialize};
 use std::ffi::OsString;
@@ -143,22 +143,36 @@ fn json_string(text: &str) -> String {
     serde_json::to_string(text).unwrap_or_else(|_| "\"\"".to_owned())
 }
 
+/// `"generation":g,"unseen":n` (`null` when the stretch is not counted yet): what a stop about the frame's work names.
+fn work_fields(work: &WorkMark) -> String {
+    let unseen = work.unseen.map_or_else(|| "null".to_owned(), |n| n.to_string());
+    format!(r#""generation":{},"unseen":{unseen}"#, work.generation)
+}
+
 /// The outbound line for one observer frame, without the newline. The desk's envelope goes in `frame` as it was
 /// serialized, never parsed again.
 pub fn frame_line(frame: &ObserverFrame) -> String {
     match frame {
-        ObserverFrame::Snapshot { key, through, json } => format!(
-            r#"{{"v":{RV_PROTOCOL},"kind":"snapshot","key":{},"through":{through},"frame":{json}}}"#,
-            json_string(key.as_str())
+        ObserverFrame::Snapshot {
+            key,
+            through,
+            work,
+            json,
+        } => format!(
+            r#"{{"v":{RV_PROTOCOL},"kind":"snapshot","key":{},"through":{through},{},"frame":{json}}}"#,
+            json_string(key.as_str()),
+            work_fields(work),
         ),
         ObserverFrame::Events {
             key,
             from,
             through,
+            work,
             json,
         } => format!(
-            r#"{{"v":{RV_PROTOCOL},"kind":"events","key":{},"from":{from},"through":{through},"frame":{json}}}"#,
-            json_string(key.as_str())
+            r#"{{"v":{RV_PROTOCOL},"kind":"events","key":{},"from":{from},"through":{through},{},"frame":{json}}}"#,
+            json_string(key.as_str()),
+            work_fields(work),
         ),
         ObserverFrame::Gone { key, why } => {
             let why = match why {
@@ -337,6 +351,28 @@ fn accept_loop<S: FnMut(UnixStream) -> bool>(
     }
 }
 
+/// Takes the first whole line out of `buf`, without its newline; `None` while none has ended. `scanned` is how much
+/// of `buf` is known to hold no newline. A line longer than `cap`, ended or not, is `InvalidData`, however its bytes
+/// were split across reads.
+fn next_line(buf: &mut Vec<u8>, scanned: &mut usize, cap: usize) -> io::Result<Option<Vec<u8>>> {
+    let too_long = || io::Error::new(io::ErrorKind::InvalidData, "line too long");
+    if let Some(at) = buf[*scanned..].iter().position(|&b| b == b'\n') {
+        let end = *scanned + at;
+        if end > cap {
+            return Err(too_long());
+        }
+        *scanned = 0;
+        let mut line: Vec<u8> = buf.drain(..=end).collect();
+        line.pop();
+        return Ok(Some(line));
+    }
+    *scanned = buf.len();
+    if buf.len() > cap {
+        return Err(too_long());
+    }
+    Ok(None)
+}
+
 /// A connection to a process's `rv-` socket.
 pub struct RvClient {
     stream: UnixStream,
@@ -381,18 +417,10 @@ impl RvClient {
         let deadline = Instant::now() + timeout;
         let mut chunk = vec![0u8; 64 * 1024];
         loop {
-            if let Some(at) = self.buf[self.scanned..].iter().position(|&b| b == b'\n') {
-                let end = self.scanned + at;
-                self.scanned = 0;
-                let mut line: Vec<u8> = self.buf.drain(..=end).collect();
-                line.pop();
+            if let Some(line) = next_line(&mut self.buf, &mut self.scanned, RV_MAX_OUTBOUND_LINE)? {
                 return String::from_utf8(line)
                     .map(Some)
                     .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e));
-            }
-            self.scanned = self.buf.len();
-            if self.buf.len() > RV_MAX_OUTBOUND_LINE {
-                return Err(io::Error::new(io::ErrorKind::InvalidData, "line too long"));
             }
             let left = deadline.saturating_duration_since(Instant::now());
             if left.is_zero() {
@@ -560,6 +588,10 @@ mod tests {
         let snapshot = ObserverFrame::Snapshot {
             key: key.clone(),
             through: 4,
+            work: WorkMark {
+                generation: 2,
+                unseen: None,
+            },
             json: Arc::from(r#"{"kind":"snapshot","tab":1}"#),
         };
         let line: serde_json::Value = serde_json::from_str(&frame_line(&snapshot)).unwrap();
@@ -567,17 +599,27 @@ mod tests {
         assert_eq!(line["kind"], "snapshot");
         assert_eq!(line["key"], "k-0123456789abcdef");
         assert_eq!(line["through"], 4);
+        assert_eq!(line["generation"], 2);
+        assert!(line["unseen"].is_null(), "a stretch not counted yet is named by none");
         assert_eq!(line["frame"]["kind"], "snapshot");
         let events = ObserverFrame::Events {
             key: key.clone(),
             from: 4,
             through: 6,
+            work: WorkMark {
+                generation: 2,
+                unseen: Some(3),
+            },
             json: Arc::from(r#"{"kind":"events"}"#),
         };
         let line: serde_json::Value = serde_json::from_str(&frame_line(&events)).unwrap();
         assert_eq!(
             (line["kind"].as_str(), line["from"].as_u64(), line["through"].as_u64()),
             (Some("events"), Some(4), Some(6))
+        );
+        assert_eq!(
+            (line["generation"].as_u64(), line["unseen"].as_u64()),
+            (Some(2), Some(3))
         );
         let gone = ObserverFrame::Gone {
             key,
@@ -599,5 +641,44 @@ mod tests {
             result,
             serde_json::json!({"v":1,"kind":"result","command_id":null,"ok":true,"why":null})
         );
+    }
+
+    #[test]
+    fn a_received_line_over_the_cap_is_refused_however_its_bytes_arrive() {
+        const CAP: usize = 8;
+        let mut buf = Vec::new();
+        let mut scanned = 0;
+        buf.extend_from_slice(b"12345678");
+        assert!(
+            next_line(&mut buf, &mut scanned, CAP).unwrap().is_none(),
+            "a full line may still end"
+        );
+        buf.extend_from_slice(b"9\n");
+        let error = next_line(&mut buf, &mut scanned, CAP).unwrap_err();
+        assert_eq!(
+            error.kind(),
+            io::ErrorKind::InvalidData,
+            "the newline came one byte past the cap"
+        );
+
+        let (mut buf, mut scanned) = (b"123456789\nab".to_vec(), 0);
+        let error = next_line(&mut buf, &mut scanned, CAP).unwrap_err();
+        assert_eq!(
+            error.kind(),
+            io::ErrorKind::InvalidData,
+            "a long line read in one piece"
+        );
+
+        let (mut buf, mut scanned) = (b"12345678\nab".to_vec(), 0);
+        assert_eq!(
+            next_line(&mut buf, &mut scanned, CAP).unwrap().as_deref(),
+            Some(&b"12345678"[..]),
+            "a line of exactly the cap is taken"
+        );
+        assert_eq!(buf, b"ab", "what follows it waits for the next call");
+        assert!(next_line(&mut buf, &mut scanned, CAP).unwrap().is_none());
+        buf.extend_from_slice(b"123456789");
+        let error = next_line(&mut buf, &mut scanned, CAP).unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::InvalidData, "no newline and past the cap");
     }
 }

@@ -20,7 +20,7 @@ use std::sync::Arc;
 
 use agent::AgentDomainEvent;
 
-use super::{RowKey, Tab, TabSet};
+use super::{RowKey, Tab, TabSet, UnseenStretch};
 use crate::agent_bridge::{
     serialize_events_with_notes_and_revisions_for_js, serialize_snapshot_with_notes_for_js, CallNotes, SnapshotView,
     TurnTime,
@@ -39,18 +39,36 @@ pub enum GoneWhy {
     Moved,
 }
 
+/// The work a frame shows, as a stop must name it: which session of the tab, and which stretch of the work the panel
+/// cannot show. Neither is in the desk's envelope, which names a turn only by the agent's id.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct WorkMark {
+    /// The tab's backend generation the frame is of ([`Tab::backend_generation`]).
+    pub generation: u64,
+    /// The latest stretch's number ([`Tab::unseen_stretch`]) when the tick has counted every fold through the
+    /// frame's revision, else `None`: work folded since may have ended one stretch and begun another.
+    pub unseen: Option<u64>,
+}
+
 /// One frame for an observer, in the order it must be applied. `json` is the desk's own envelope for the same
-/// content (`kind` `snapshot` or `events`); `through` is the revision the observer stands at once it is applied.
+/// content (`kind` `snapshot` or `events`); `through` is the revision the observer stands at once it is applied, and
+/// `work` names the session and the unseen stretch as they stand there.
 #[derive(Debug, Clone)]
 pub enum ObserverFrame {
     /// The tab's whole state through `through`; whatever the observer held before is replaced.
-    Snapshot { key: RowKey, through: u64, json: Arc<str> },
+    Snapshot {
+        key: RowKey,
+        through: u64,
+        work: WorkMark,
+        json: Arc<str>,
+    },
     /// The events after revision `from` through `through`, with their own revisions; `from` is where the previous
     /// frame ended. Carries notes only (no events) when the batch above `from` settled notes and held no new event.
     Events {
         key: RowKey,
         from: u64,
         through: u64,
+        work: WorkMark,
         json: Arc<str>,
     },
     /// The last frame of this observer.
@@ -140,6 +158,7 @@ type Position = (u64, Option<TurnTime>);
 struct Built {
     from: u64,
     through: u64,
+    work: WorkMark,
     json: Arc<str>,
 }
 
@@ -181,8 +200,15 @@ impl Observers {
     }
 
     /// Queues for each observer of `tab` what `batch` holds past its position. `generation` is the tab's backend
-    /// generation the batch was drained from; `turn_times` is the tab's whole list as the tick left it.
-    pub(super) fn feed(&mut self, tab: TabId, generation: u64, batch: &ObservedBatch, turn_times: &[TurnTime]) {
+    /// generation the batch was drained from; `stretch` and `turn_times` are the tab's as the tick left them.
+    pub(super) fn feed(
+        &mut self,
+        tab: TabId,
+        generation: u64,
+        stretch: UnseenStretch,
+        batch: &ObservedBatch,
+        turn_times: &[TurnTime],
+    ) {
         let mut built: Vec<(Position, Option<Built>)> = Vec::new();
         for observer in self.of(tab) {
             if observer.generation != generation {
@@ -202,12 +228,27 @@ impl Observers {
                         observer.turn_time_sent.as_ref(),
                         batch,
                         turn_times,
-                    );
+                    )
+                    .map(|(from, through, json)| Built {
+                        from,
+                        through,
+                        work: WorkMark {
+                            generation,
+                            unseen: stretch.at(through),
+                        },
+                        json,
+                    });
                     built.push((at, frame.clone()));
                     frame
                 }
             };
-            let Some(Built { from, through, json }) = frame else {
+            let Some(Built {
+                from,
+                through,
+                work,
+                json,
+            }) = frame
+            else {
                 continue;
             };
             observer.watermark = through;
@@ -216,6 +257,7 @@ impl Observers {
                 key: observer.key.clone(),
                 from,
                 through,
+                work,
                 json,
             });
         }
@@ -242,14 +284,15 @@ fn turn_times_after<'a>(times: &'a [TurnTime], sent: Option<&TurnTime>) -> &'a [
     }
 }
 
-/// The events frame for an observer at `watermark`, or `None` when the batch holds nothing past it.
+/// The events frame for an observer at `watermark` (its `from`, `through` and envelope), or `None` when the batch
+/// holds nothing past it.
 fn events_frame(
     tab: TabId,
     watermark: u64,
     sent: Option<&TurnTime>,
     batch: &ObservedBatch,
     turn_times: &[TurnTime],
-) -> Option<Built> {
+) -> Option<(u64, u64, Arc<str>)> {
     // The tags strictly increase: what the observer's snapshot or an earlier frame carried is a prefix.
     let shown = batch.revisions.partition_point(|revision| *revision <= watermark);
     let mut notes = batch.notes.clone();
@@ -266,16 +309,12 @@ fn events_frame(
         &notes,
         Some(&batch.revisions[shown..]),
     );
-    Some(Built {
-        from: watermark,
-        through,
-        json: Arc::from(json),
-    })
+    Some((watermark, through, Arc::from(json)))
 }
 
-/// The tab's snapshot for an observer: its revision, its envelope and the newest turn time it carries. Read from
-/// the same view as the desk's snapshot, and nothing of the tab's delivery state is changed.
-fn observer_snapshot(tab: &Tab) -> Option<(u64, String, Option<TurnTime>)> {
+/// The tab's snapshot for an observer: its revision, the work it shows, its envelope and the newest turn time it
+/// carries. Read from the same view as the desk's snapshot, and nothing of the tab's delivery state is changed.
+fn observer_snapshot(tab: &Tab) -> Option<(u64, WorkMark, String, Option<TurnTime>)> {
     let backend = tab.live()?;
     let view = SnapshotView::of(backend, &tab.session.host_answered);
     // The clock as the last tick left it, and only for the turn this very snapshot names: a clock from the turn
@@ -287,8 +326,14 @@ fn observer_snapshot(tab: &Tab) -> Option<(u64, String, Option<TurnTime>)> {
         .filter(|(turn, _)| view.projection.active_turn_id.as_deref() == Some(turn.as_str()))
         .map(|(_, at)| *at);
     let json = serialize_snapshot_with_notes_for_js(tab.id, &view, started_at, &tab.notes, &tab.session.editor_cards);
+    // The stretch read beside the revision, under the same guard, as a stop's admission reads them.
+    let work = WorkMark {
+        generation: tab.backend_generation,
+        unseen: tab.unseen_stretch_at(view.projection.last_revision),
+    };
     Some((
         view.projection.last_revision,
+        work,
         json,
         tab.notes.turn_times.last().cloned(),
     ))
@@ -357,7 +402,7 @@ impl TabSet {
                 observer.want_snapshot();
             }
             if observer.needs_snapshot {
-                if let Some((through, json, turn_time)) = observer_snapshot(tab) {
+                if let Some((through, work, json, turn_time)) = observer_snapshot(tab) {
                     #[cfg(test)]
                     {
                         self.observers.snapshots_built += 1;
@@ -370,6 +415,7 @@ impl TabSet {
                     frames.push(ObserverFrame::Snapshot {
                         key: observer.key.clone(),
                         through,
+                        work,
                         json: Arc::from(json),
                     });
                 }
@@ -580,6 +626,7 @@ mod tests {
             key: framed,
             through,
             json: text,
+            ..
         } = &frames[0]
         else {
             panic!("the first frame is a snapshot: {frames:?}");
@@ -791,6 +838,87 @@ mod tests {
         phone.apply(set.take_observer_frames(id, usize::MAX));
         assert_eq!(phone.snapshots, [5, 3]);
         assert_eq!(phone.revisions, [4]);
+        shut_down(&mut set);
+    }
+
+    #[test]
+    fn frames_name_the_session_and_the_unseen_stretch() {
+        let (dir, mut set, tab, provider) = opened_tab("observers-work-mark");
+        let generation = set.get(tab).unwrap().backend_generation();
+        let id = set.observe(&key(&set, tab)).unwrap();
+        let frames = set.take_observer_frames(id, usize::MAX);
+        let [ObserverFrame::Snapshot { work, .. }] = &frames[..] else {
+            panic!("a snapshot first: {frames:?}");
+        };
+        assert_eq!(
+            *work,
+            WorkMark {
+                generation,
+                unseen: Some(0)
+            },
+            "no stretch yet, counted through the snapshot"
+        );
+
+        let unseen_ended = AgentDomainEvent::TurnCompleted {
+            turn_id: agent::NO_OPEN_TURN_ID.into(),
+            outcome: agent::TurnOutcome::Completed,
+            result_text: String::new(),
+            stop_reason: None,
+            usage: None,
+            detail: Default::default(),
+        };
+        let mut marks = Vec::new();
+        for (events, through) in [
+            (vec![AgentDomainEvent::CliWorkUnseen], 2),
+            (vec![AgentDomainEvent::CliWorkUnseen], 3),
+            (vec![unseen_ended, AgentDomainEvent::CliWorkUnseen], 5),
+        ] {
+            provider.queue_all(events);
+            folded(&set, tab, through);
+            set.pump(&dir, true);
+            for frame in set.take_observer_frames(id, usize::MAX) {
+                if let ObserverFrame::Events { work, .. } = frame {
+                    marks.push(work);
+                }
+            }
+        }
+        assert_eq!(
+            marks,
+            [1, 1, 2].map(|n| WorkMark {
+                generation,
+                unseen: Some(n)
+            }),
+            "each events frame names the stretch running once it is applied"
+        );
+
+        // Folded but not yet counted by a tick: a snapshot cannot name the stretch.
+        provider.queue(AgentDomainEvent::CliWorkUnseen);
+        folded(&set, tab, 6);
+        let late = set.observe(&key(&set, tab)).unwrap();
+        let frames = set.take_observer_frames(late, usize::MAX);
+        let [ObserverFrame::Snapshot { through: 6, work, .. }] = &frames[..] else {
+            panic!("a snapshot through the fold: {frames:?}");
+        };
+        assert_eq!(work.unseen, None);
+        set.unobserve(late);
+
+        let (second, backend) = conversation(&dir);
+        if let TabBackend::Live(mut old) = set.get_mut(tab).unwrap().set_backend(backend) {
+            old.shutdown();
+        }
+        second.queue(opened(&dir));
+        folded(&set, tab, 1);
+        set.pump(&dir, true);
+        let frames = set.take_observer_frames(id, usize::MAX);
+        let [ObserverFrame::Snapshot { work, .. }] = &frames[..] else {
+            panic!("the new session's snapshot: {frames:?}");
+        };
+        assert_eq!(
+            work.generation,
+            generation + 1,
+            "the new session is named apart from the old"
+        );
+        assert_eq!(work.unseen, Some(2), "the stretch number never goes down in the tab");
         shut_down(&mut set);
     }
 
@@ -1063,7 +1191,7 @@ mod tests {
             let mut bytes = 0;
             for _ in 0..9 {
                 let started = Instant::now();
-                let (_, text, _) = observer_snapshot(set.get(tab).unwrap()).expect("a live tab has a snapshot");
+                let (_, _, text, _) = observer_snapshot(set.get(tab).unwrap()).expect("a live tab has a snapshot");
                 times.push(started.elapsed());
                 bytes = text.len();
             }
