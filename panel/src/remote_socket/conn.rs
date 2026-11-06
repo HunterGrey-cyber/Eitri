@@ -133,7 +133,8 @@ impl Conn {
 pub(super) fn start_connection(stream: UnixStream, shared: &Arc<Shared>) -> bool {
     if shared.live.load(Ordering::SeqCst) >= RV_MAX_CONNECTIONS {
         let _ = stream.set_write_timeout(Some(REFUSAL_WITHIN));
-        let _ = (&stream).write_all(format!("{}\n", refused_line(None, "too many connections")).as_bytes());
+        let _ =
+            (&stream).write_all(format!("{}\n", refused_line(None, eitri_core::remote_rv::RV_REFUSED_FULL)).as_bytes());
         return true;
     }
     let (Ok(writer), Ok(tick)) = (stream.try_clone(), stream.try_clone()) else {

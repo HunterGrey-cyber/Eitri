@@ -268,3 +268,11 @@ harness = false
 [[test]]
 name = "project_chooser_placement"
 harness = false
+
+# `eitri remote serve` end to end, and its sandbox in children of the test: a plain `main`, because
+# `own_display_scan` requires a test that starts the product binary to isolate its display in `main`, and the
+# sandbox can only be set up by a process with one thread, which a child the test starts itself is. No display is
+# opened; the children get none.
+[[test]]
+name = "remote_serve"
+harness = false

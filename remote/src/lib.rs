@@ -52,16 +52,8 @@ mod tests {
 
     #[test]
     fn remote_subcommands_are_stubs_until_built_and_the_rest_is_usage() {
-        for sub in [
-            "serve",
-            "stop",
-            "status",
-            "add-device",
-            "devices",
-            "revoke",
-            "grant",
-            "ssh-key",
-        ] {
+        // `serve`, `stop` and `status` are carried out (`serve/`), and their tests start a real server.
+        for sub in ["add-device", "devices", "revoke", "grant", "ssh-key"] {
             assert_eq!(run(&args(&[sub])), 2, "{sub}");
         }
         assert_eq!(run(&args(&[])), 2, "no subcommand");

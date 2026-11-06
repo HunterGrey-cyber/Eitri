@@ -1,5 +1,5 @@
 // @vitest-environment jsdom
-import { afterEach, beforeAll, describe, expect, it, vi } from "vitest";
+import { afterEach, beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
 import { act, cleanup, render } from "@testing-library/react";
 import App from "./App";
 import { MessageList, timelineRowRenderCount } from "./components/MessageList";
@@ -136,6 +136,15 @@ describe("VISUAL over a reply being written", () => {
 });
 
 describe("a streaming reply", () => {
+  // A drawing that takes longer than the rest threshold makes the next text wait; these tests check
+  // what is drawn, not when, so the clock stands still and every drawing takes no time. Under a
+  // loaded machine the real clock made the code-block deltas wait and the comparison see half of them.
+  beforeEach(() => {
+    vi.spyOn(performance, "now").mockReturnValue(1_000);
+  });
+  afterEach(() => {
+    vi.restoreAllMocks();
+  });
   it("holds what one rendering of its text holds after every batch and after it ends", () => {
     const { deliver, delta, body } = mount();
     let text = "";

@@ -75,6 +75,9 @@ mod pair_review;
 mod path_menu;
 #[path = "remote_entry.rs"]
 mod remote_entry;
+#[cfg(any(test, feature = "test-support"))]
+#[path = "remote_host_test.rs"]
+mod remote_host_test;
 #[path = "remote_socket/mod.rs"]
 mod remote_socket;
 #[path = "restore.rs"]

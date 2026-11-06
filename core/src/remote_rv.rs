@@ -41,6 +41,10 @@ pub const RV_MAX_LINE: usize = 1024 * 1024;
 /// How many connections a process serves at once; one more is refused.
 pub const RV_MAX_CONNECTIONS: usize = 8;
 
+/// The reason in the `refused` line (no key) a process sends a connection past [`RV_MAX_CONNECTIONS`] before it closes
+/// it: an answer to the connection, not to anything sent on it.
+pub const RV_REFUSED_FULL: &str = "too many connections";
+
 /// How many tabs one connection may follow at once.
 pub const RV_MAX_OBSERVERS_PER_CONNECTION: usize = 16;
 
@@ -646,6 +650,12 @@ impl RvClient {
             buf: Vec::new(),
             scanned: 0,
         })
+    }
+
+    /// A second handle on the same connection, for a thread that writes lines while another receives; shutting it
+    /// down ends a [`recv`](Self::recv) waiting on the other.
+    pub fn writer(&self) -> io::Result<UnixStream> {
+        self.stream.try_clone()
     }
 
     /// Writes `frame` as one line.

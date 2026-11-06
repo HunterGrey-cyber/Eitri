@@ -1,6 +1,10 @@
 //! The token and the checks a WebSocket upgrade passes before it is accepted.
 //!
 //! Pure over the bytes read so far: nothing here touches a socket, and an answer never repeats a byte of the request.
+//!
+//! The strict request parse ([`RequestHead`]), where a head ends ([`head_end`]), the upgrade's own headers
+//! ([`RequestHead::websocket_key`]) and the 101 ([`upgrade_answer_with`]) are shared with `eitri remote serve`, which
+//! checks `Host` and `Origin` its own way; the checks and answers of this listener are [`judge`]'s alone.
 
 use std::io;
 
@@ -134,21 +138,38 @@ impl Failure {
 
 /// Judges `head`, everything read from a connection so far. Bytes after the blank line are not part of the request.
 pub fn judge(head: &[u8], port: u16, token: &Token, limits: &Limits) -> Verdict {
-    // Searching only the cap's worth also refuses a whole head that arrived in one read and ends past the cap.
-    let within = &head[..head.len().min(limits.handshake_bytes)];
-    let Some(end) = within.windows(4).position(|bytes| bytes == b"\r\n\r\n") else {
-        // A head already at the cap with no blank line cannot end inside the cap, whatever comes next.
-        return if head.len() >= limits.handshake_bytes {
-            Failure::Malformed.verdict()
-        } else {
-            Verdict::NeedMore
-        };
-    };
-    match decide(&within[..end], port, token) {
-        Ok(key) => Verdict::Upgrade {
-            answer: upgrade_answer(key),
+    match head_end(head, limits.handshake_bytes) {
+        HeadEnd::NeedMore => Verdict::NeedMore,
+        HeadEnd::TooLong => Failure::Malformed.verdict(),
+        HeadEnd::Whole(block) => match decide(block, port, token) {
+            Ok(key) => Verdict::Upgrade {
+                answer: upgrade_answer(key),
+            },
+            Err(failure) => failure.verdict(),
         },
-        Err(failure) => failure.verdict(),
+    }
+}
+
+/// Where a request's head ends in the bytes read so far, under a cap of `cap` bytes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum HeadEnd<'h> {
+    /// No blank line yet, and under the cap.
+    NeedMore,
+    /// No blank line inside the cap: no later byte can end the head inside it.
+    TooLong,
+    /// The head without its blank line. Bytes after the blank line are not part of the request.
+    Whole(&'h [u8]),
+}
+
+/// Finds the blank line that ends a head within the first `cap` bytes of `head`.
+pub fn head_end(head: &[u8], cap: usize) -> HeadEnd<'_> {
+    // Searching only the cap's worth also refuses a whole head that arrived in one read and ends past the cap.
+    let within = &head[..head.len().min(cap)];
+    match within.windows(4).position(|bytes| bytes == b"\r\n\r\n") {
+        Some(end) => HeadEnd::Whole(&within[..end]),
+        // A head already at the cap with no blank line cannot end inside the cap, whatever comes next.
+        None if head.len() >= cap => HeadEnd::TooLong,
+        None => HeadEnd::NeedMore,
     }
 }
 
@@ -167,9 +188,18 @@ pub fn accept_value(key: &str) -> String {
 }
 
 fn upgrade_answer(key: &str) -> Vec<u8> {
+    upgrade_answer_with(key, Some(SUBPROTOCOL))
+}
+
+/// The 101 for a request whose `Sec-WebSocket-Key` is `key`, naming `subprotocol` when there is one. `key` is the one
+/// part of a request an answer carries back, and only as the hash RFC 6455 asks for.
+pub fn upgrade_answer_with(key: &str, subprotocol: Option<&str>) -> Vec<u8> {
+    let protocol = subprotocol
+        .map(|name| format!("Sec-WebSocket-Protocol: {name}\r\n"))
+        .unwrap_or_default();
     format!(
         "HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\n\
-         Sec-WebSocket-Accept: {}\r\nSec-WebSocket-Protocol: {SUBPROTOCOL}\r\n\r\n",
+         Sec-WebSocket-Accept: {}\r\n{protocol}\r\n",
         accept_value(key)
     )
     .into_bytes()
@@ -177,24 +207,24 @@ fn upgrade_answer(key: &str) -> Vec<u8> {
 
 /// Every check in its order, over the head without its blank line. `Ok` holds the request's `Sec-WebSocket-Key`.
 fn decide<'h>(block: &'h [u8], port: u16, token: &Token) -> Result<&'h str, Failure> {
-    let headers = parse(block).ok_or(Failure::Malformed)?;
+    let request = RequestHead::parse(block).ok_or(Failure::Malformed)?;
     // Exact, so a page that rebinds a name to the loopback address names the wrong host.
-    if one(&headers, "host") != Some(format!("127.0.0.1:{port}").as_str()) {
+    if request.one("host") != Some(format!("127.0.0.1:{port}").as_str()) {
         return Err(Failure::Host);
     }
     // A browser's WebSocket always sends one, and the CLI none, so its value says nothing worth reading.
-    if !all(&headers, "origin").is_empty() {
+    if !request.all("origin").is_empty() {
         return Err(Failure::Origin);
     }
-    if !one(&headers, TOKEN_HEADER).is_some_and(|given| token.matches(given.as_bytes())) {
+    if !request
+        .one(TOKEN_HEADER)
+        .is_some_and(|given| token.matches(given.as_bytes()))
+    {
         return Err(Failure::Token);
     }
-    let upgrades = one(&headers, "upgrade").is_some_and(|value| value.eq_ignore_ascii_case("websocket"));
-    let connection = in_list(&headers, "connection", |item| item.eq_ignore_ascii_case("upgrade"));
-    let version = one(&headers, "sec-websocket-version") == Some("13");
-    let subprotocol = in_list(&headers, "sec-websocket-protocol", |item| item == SUBPROTOCOL);
-    match one(&headers, "sec-websocket-key").filter(|key| !key.is_empty()) {
-        Some(key) if upgrades && connection && version && subprotocol => Ok(key),
+    let subprotocol = request.in_list("sec-websocket-protocol", |item| item == SUBPROTOCOL);
+    match request.websocket_key() {
+        Some(key) if subprotocol => Ok(key),
         _ => Err(Failure::Upgrade),
     }
 }
@@ -202,52 +232,80 @@ fn decide<'h>(block: &'h [u8], port: u16, token: &Token) -> Result<&'h str, Fail
 /// A header's name and its value, trimmed.
 type Header<'h> = (&'h str, &'h str);
 
-/// The header fields of a `GET <target> HTTP/1.1` head, or `None` when it is not one. Strict on purpose: a bare `\r` or
-/// `\n` or any other control byte is refused, so no line can hide inside another's value. A folded line fails with the
-/// rest, since its leading blank makes its name no token.
-fn parse(block: &[u8]) -> Option<Vec<Header<'_>>> {
-    let text = std::str::from_utf8(block).ok().filter(|text| text.is_ascii())?;
-    let clean = |line: &str| !line.bytes().any(|byte| byte.is_ascii_control() && byte != b'\t');
-    let mut lines = text.split("\r\n");
-    let first = lines.next()?;
-    let parts: Vec<&str> = first.split(' ').collect();
-    if !clean(first) || !matches!(parts.as_slice(), ["GET", target, "HTTP/1.1"] if !target.is_empty()) {
-        return None;
-    }
-    let mut headers = Vec::new();
-    for line in lines {
-        let (name, value) = line.split_once(':')?;
-        if !clean(line) || name.is_empty() || name.contains([' ', '\t']) {
-            return None;
+/// A `GET <target> HTTP/1.1` head: its target and its header fields, in order.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RequestHead<'h> {
+    target: &'h str,
+    headers: Vec<Header<'h>>,
+}
+
+impl<'h> RequestHead<'h> {
+    /// The head `block` (without its blank line), or `None` when it is not a `GET <target> HTTP/1.1` head. Strict on
+    /// purpose: a bare `\r` or `\n` or any other control byte is refused, so no line can hide inside another's value. A
+    /// folded line fails with the rest, since its leading blank makes its name no token.
+    pub fn parse(block: &'h [u8]) -> Option<RequestHead<'h>> {
+        let text = std::str::from_utf8(block).ok().filter(|text| text.is_ascii())?;
+        let clean = |line: &str| !line.bytes().any(|byte| byte.is_ascii_control() && byte != b'\t');
+        let mut lines = text.split("\r\n");
+        let first = lines.next()?;
+        let parts: Vec<&str> = first.split(' ').collect();
+        let target = match parts.as_slice() {
+            ["GET", target, "HTTP/1.1"] if clean(first) && !target.is_empty() => *target,
+            _ => return None,
+        };
+        let mut headers = Vec::new();
+        for line in lines {
+            let (name, value) = line.split_once(':')?;
+            if !clean(line) || name.is_empty() || name.contains([' ', '\t']) {
+                return None;
+            }
+            headers.push((name, value.trim()));
         }
-        headers.push((name, value.trim()));
+        Some(RequestHead { target, headers })
     }
-    Some(headers)
-}
 
-/// Every value of the header `name`, which is lowercase.
-fn all<'h>(headers: &[Header<'h>], name: &str) -> Vec<&'h str> {
-    headers
-        .iter()
-        .filter(|(key, _)| key.eq_ignore_ascii_case(name))
-        .map(|(_, value)| *value)
-        .collect()
-}
-
-/// The value of a header that may appear once: `None` when it is absent or there twice.
-fn one<'h>(headers: &[Header<'h>], name: &str) -> Option<&'h str> {
-    match all(headers, name).as_slice() {
-        [value] => Some(*value),
-        _ => None,
+    /// The request line's target, as sent.
+    pub fn target(&self) -> &'h str {
+        self.target
     }
-}
 
-/// Whether a comma-separated header, over all its appearances, has an item `wanted` accepts.
-fn in_list(headers: &[Header<'_>], name: &str, wanted: impl Fn(&str) -> bool) -> bool {
-    all(headers, name)
-        .iter()
-        .flat_map(|value| value.split(','))
-        .any(|item| wanted(item.trim()))
+    /// Every value of the header `name`, which is lowercase.
+    pub fn all(&self, name: &str) -> Vec<&'h str> {
+        self.headers
+            .iter()
+            .filter(|(key, _)| key.eq_ignore_ascii_case(name))
+            .map(|(_, value)| *value)
+            .collect()
+    }
+
+    /// The value of a header that may appear once: `None` when it is absent or there twice.
+    pub fn one(&self, name: &str) -> Option<&'h str> {
+        match self.all(name).as_slice() {
+            [value] => Some(*value),
+            _ => None,
+        }
+    }
+
+    /// Whether a comma-separated header, over all its appearances, has an item `wanted` accepts.
+    pub fn in_list(&self, name: &str, wanted: impl Fn(&str) -> bool) -> bool {
+        self.all(name)
+            .iter()
+            .flat_map(|value| value.split(','))
+            .any(|item| wanted(item.trim()))
+    }
+
+    /// The `Sec-WebSocket-Key` of a request that asks for an RFC 6455 upgrade: `Upgrade` once and `websocket` in any
+    /// case, `Connection` listing `upgrade`, `Sec-WebSocket-Version` once and `13`, and one non-empty key. `None`
+    /// otherwise.
+    pub fn websocket_key(&self) -> Option<&'h str> {
+        let upgrades = self
+            .one("upgrade")
+            .is_some_and(|value| value.eq_ignore_ascii_case("websocket"));
+        let connection = self.in_list("connection", |item| item.eq_ignore_ascii_case("upgrade"));
+        let version = self.one("sec-websocket-version") == Some("13");
+        self.one("sec-websocket-key")
+            .filter(|key| !key.is_empty() && upgrades && connection && version)
+    }
 }
 
 /// Standard base64 with padding, for the 20 bytes of a SHA-1.
@@ -763,6 +821,72 @@ mod tests {
     fn debug_prints_none_of_the_token() {
         let token = token();
         assert!(!format!("{token:?}").contains(token.as_str()));
+    }
+
+    /// The listener's answers, byte for byte, to a request that upgrades and to one that fails each check: what it
+    /// sends is part of what the CLI attaches to, so sharing the request parse must change none of it.
+    #[test]
+    fn ide_server_handshake_unchanged() {
+        let upgrade = "HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\n\
+                       Sec-WebSocket-Accept: s3pPLMBiTxaQ9kYGzzhZRbK+xOo=\r\nSec-WebSocket-Protocol: mcp\r\n\r\n";
+        let refused = |status: &str| format!("HTTP/1.1 {status}\r\nConnection: close\r\nContent-Length: 0\r\n\r\n");
+        let cases: Vec<(Vec<u8>, Verdict)> = vec![
+            (
+                Head::good().text().into_bytes(),
+                Verdict::Upgrade {
+                    answer: upgrade.as_bytes().to_vec(),
+                },
+            ),
+            (
+                Head::good().set("Host", "localhost").text().into_bytes(),
+                Verdict::Refuse {
+                    answer: refused("403 Forbidden").into_bytes(),
+                    why: "its Host is not this listener's address",
+                },
+            ),
+            (
+                Head::good().with("Origin", "null").text().into_bytes(),
+                Verdict::Refuse {
+                    answer: refused("403 Forbidden").into_bytes(),
+                    why: "it sent an Origin header",
+                },
+            ),
+            (
+                Head::good()
+                    .without("X-Claude-Code-Ide-Authorization")
+                    .text()
+                    .into_bytes(),
+                Verdict::Refuse {
+                    answer: refused("401 Unauthorized").into_bytes(),
+                    why: "no token header with this listener's token",
+                },
+            ),
+            (
+                Head::good().set("Sec-WebSocket-Version", "8").text().into_bytes(),
+                Verdict::Refuse {
+                    answer: refused("400 Bad Request").into_bytes(),
+                    why: "its WebSocket upgrade headers are not the ones expected",
+                },
+            ),
+            (
+                Head::good().text().replacen("GET / ", "POST / ", 1).into_bytes(),
+                Verdict::Refuse {
+                    answer: refused("400 Bad Request").into_bytes(),
+                    why: "not a well-formed upgrade request",
+                },
+            ),
+            (
+                vec![b'a'; Limits::default().handshake_bytes],
+                Verdict::Refuse {
+                    answer: refused("400 Bad Request").into_bytes(),
+                    why: "not a well-formed upgrade request",
+                },
+            ),
+            (b"GET / HTTP/1.1\r\nHost: 127.0.0.1".to_vec(), Verdict::NeedMore),
+        ];
+        for (head, wanted) in cases {
+            assert_eq!(judged(&head), wanted, "{}", String::from_utf8_lossy(&head));
+        }
     }
 
     #[test]
