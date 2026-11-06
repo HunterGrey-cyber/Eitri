@@ -947,67 +947,15 @@ fn every_new_kind_parses_and_is_refused_not_yet() {
     let (tab, provider, key) = rig.tab();
     rig.start_turn(tab, &provider, "t1");
     let mut client = rig.connect();
-    let errands = [
-        (
-            RvInbound::More {
-                v: 1,
-                key: key.to_string(),
-                generation: rig.generation(tab),
-                before_turn: 1,
-            },
-            serde_json::json!(key.as_str()),
-        ),
-        (
-            RvInbound::Enroll {
-                v: 1,
-                code: "c0de".into(),
-                device_name: "Pixel".into(),
-                host: "127.0.0.1:7341".into(),
-                peer: "127.0.0.1:5000".into(),
-            },
-            serde_json::Value::Null,
-        ),
-        (RvInbound::StartEnroll { v: 1 }, serde_json::Value::Null),
-        (
-            RvInbound::GrantRequest {
-                v: 1,
-                device: "d2".into(),
-                grant: Grant::WatchSteer,
-            },
-            serde_json::Value::Null,
-        ),
-        (
-            RvInbound::ListenRequest {
-                v: 1,
-                addr: "192.0.2.10:7341".into(),
-            },
-            serde_json::Value::Null,
-        ),
-        (
-            RvInbound::RevokeSelf {
-                v: 1,
-                device: "d1".into(),
-                token: "tok".into(),
-            },
-            serde_json::Value::Null,
-        ),
-        (
-            RvInbound::SetPushEndpoint {
-                v: 1,
-                device: "d1".into(),
-                token: "tok".into(),
-                url: "https://ntfy.example/t".into(),
-            },
-            serde_json::Value::Null,
-        ),
-        (
-            RvInbound::DevicesConnected {
-                v: 1,
-                devices: Vec::new(),
-            },
-            serde_json::Value::Null,
-        ),
-    ];
+    let errands = [(
+        RvInbound::More {
+            v: 1,
+            key: key.to_string(),
+            generation: rig.generation(tab),
+            before_turn: 1,
+        },
+        serde_json::json!(key.as_str()),
+    )];
     for (line, key) in errands {
         client.send(&line).unwrap();
         let lines = rig.until(&mut client, "the refusal", |l| l["kind"] == "refused");

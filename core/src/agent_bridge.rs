@@ -569,6 +569,23 @@ pub enum InboundMessage {
         request_id: String,
         url: String,
     },
+    /// `y` or `n` (or Escape, a `no`) to the window's question about adding a phone that presented this window's
+    /// enrollment code. Window-level, like `ConfirmBypass`: a `yes` meets the window's answer gate, and only the base
+    /// page answers it. `grant` is what the device may do, chosen at the `y` (`watch` or `watch+steer`); none of
+    /// `nonce`, `yes` or `grant` has a default, so only the exact question shown is answered, with what was chosen.
+    RemoteEnrollAnswer {
+        request_id: String,
+        nonce: u64,
+        yes: bool,
+        grant: crate::remote_devices::Grant,
+    },
+    /// `y` or `n` (or Escape) to the window's question about listening for phones on a named address; gated and
+    /// window-level like [`InboundMessage::RemoteEnrollAnswer`].
+    RemoteListenAnswer {
+        request_id: String,
+        nonce: u64,
+        yes: bool,
+    },
     /// `s` on the launch dashboard: bring back the tabs the last window had open, the first into
     /// this empty tab and the rest into new ones. Names the tab it was pressed in.
     RestoreLast {
@@ -715,6 +732,8 @@ impl InboundMessage {
             | InboundMessage::ViewExported { .. }
             | InboundMessage::ReviewRecover { .. }
             | InboundMessage::TrustCommand { .. }
+            | InboundMessage::RemoteEnrollAnswer { .. }
+            | InboundMessage::RemoteListenAnswer { .. }
             | InboundMessage::OpenUrl { .. } => return TabRef::WindowLevel,
             // These two name their tab as a plain number: a message without one does not parse.
             InboundMessage::TrustAnswer { tab, .. } | InboundMessage::TrustCancel { tab, .. } => Some(*tab),
@@ -978,6 +997,8 @@ impl InboundMessage {
             | InboundMessage::TrustAnswer { request_id, .. }
             | InboundMessage::TrustCancel { request_id, .. }
             | InboundMessage::TrustCommand { request_id, .. }
+            | InboundMessage::RemoteEnrollAnswer { request_id, .. }
+            | InboundMessage::RemoteListenAnswer { request_id, .. }
             | InboundMessage::OpenUrl { request_id, .. } => request_id,
         }
     }

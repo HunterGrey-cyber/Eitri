@@ -53,6 +53,7 @@ use acts::ActInbound;
 use conn::{start_connection, CloseWhy, Conn, Deadlines, Gauge};
 pub use conn::{CONTROL_LINES_MAX, WRITER_BYTES};
 use devices::DevicesInbound;
+pub use devices::Pairing;
 use feed::FeedInbound;
 
 /// The lines the readers may have queued for the tick; a reader past it waits, and so does its peer.
@@ -103,6 +104,8 @@ struct Shared {
     next_conn: AtomicU64,
     /// The socket's owner is gone: a connection accepted from now on is shut at once.
     stopped: AtomicBool,
+    /// What the errands about devices share across the threads: the code on show, where phones connect.
+    devices: devices::DevicesShared,
 }
 
 /// A bound `rv-` socket, its threads, and what the tick holds of its connections.
@@ -149,6 +152,7 @@ impl RemoteSocket {
             live: AtomicUsize::new(0),
             next_conn: AtomicU64::new(1),
             stopped: AtomicBool::new(false),
+            devices: devices::DevicesShared::new(instance),
         });
         let accepting = Arc::clone(&shared);
         let listener = RvListener::bind(control_dir, instance, move |stream| {
@@ -165,9 +169,15 @@ impl RemoteSocket {
         })
     }
 
-    /// Called from the tick: handles queued inbound lines, then takes frames only for observers whose writer has
-    /// room. Never waits on a socket.
+    /// Called from the tick: answers no to the desk's questions left past their time (what that tells whoever asked
+    /// is handled below, in the same pump), handles queued inbound lines, then takes frames only for observers whose
+    /// writer has room. Never waits on a socket.
     pub fn pump(&self, handle: &AgentPanelHandle) {
+        if handle.state.borrow().remote_desk.any_waiting() {
+            handle.run(|state, out| {
+                crate::agent_panel::remote_enroll::expire_questions(state, std::time::Instant::now(), out)
+            });
+        }
         let mut handled = 0;
         while handled < INBOUND_PER_PUMP {
             let Ok(inbound) = self.inbound.try_recv() else {

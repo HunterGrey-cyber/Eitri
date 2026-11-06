@@ -582,3 +582,41 @@ fn an_open_url_with_no_url_or_request_id_fails_to_parse() {
         assert!(parse_inbound_message(bad).is_none(), "{bad}");
     }
 }
+
+/// The two remote-control answers are window-level, and name the question, the answer and (for a phone) the grant,
+/// none of them defaulted: an answer that does not say what it answers, or grants something unknown, is malformed.
+#[test]
+fn remote_answers_parse_as_window_level_and_need_every_field() {
+    let enroll = parse_inbound_message(
+        r#"{"type":"remote_enroll_answer","request_id":"r1","nonce":4,"yes":true,"grant":"watch+steer"}"#,
+    )
+    .unwrap();
+    assert_eq!(enroll.tab_ref(), TabRef::WindowLevel);
+    assert_eq!(enroll.request_id(), "r1");
+    match enroll {
+        InboundMessage::RemoteEnrollAnswer { nonce, yes, grant, .. } => {
+            assert_eq!((nonce, yes, grant), (4, true, crate::remote_devices::Grant::WatchSteer))
+        }
+        other => panic!("{other:?}"),
+    }
+    let listen =
+        parse_inbound_message(r#"{"type":"remote_listen_answer","request_id":"r2","nonce":5,"yes":false}"#).unwrap();
+    assert_eq!(listen.tab_ref(), TabRef::WindowLevel);
+    assert!(matches!(
+        listen,
+        InboundMessage::RemoteListenAnswer {
+            nonce: 5,
+            yes: false,
+            ..
+        }
+    ));
+    for bad in [
+        r#"{"type":"remote_enroll_answer","request_id":"r","nonce":4,"yes":true}"#,
+        r#"{"type":"remote_enroll_answer","request_id":"r","nonce":4,"yes":true,"grant":"root"}"#,
+        r#"{"type":"remote_enroll_answer","request_id":"r","yes":true,"grant":"watch"}"#,
+        r#"{"type":"remote_listen_answer","request_id":"r","nonce":5}"#,
+        r#"{"type":"remote_listen_answer","request_id":"r","yes":true}"#,
+    ] {
+        assert!(parse_inbound_message(bad).is_none(), "{bad}");
+    }
+}

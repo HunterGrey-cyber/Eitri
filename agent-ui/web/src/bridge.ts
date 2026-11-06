@@ -182,6 +182,11 @@ export type OutboundMessage =
    *  host only) and answers with a `command_result`, an error when it is not a web link.
    *  `InboundMessage::OpenUrl`, `core/src/agent_bridge.rs`. */
   | { type: "open_url"; request_id: string; url: string }
+  /** `y` (with the grant chosen) or `n`/Escape/Enter to the window's question about adding a phone. Window-level and
+   *  base-page only; a `yes` meets the window's answer gate (`InboundMessage::RemoteEnrollAnswer`). */
+  | { type: "remote_enroll_answer"; request_id: string; nonce: number; yes: boolean; grant: RemoteGrant }
+  /** `y` or `n`/Escape/Enter to the window's question about listening for phones on a named address. */
+  | { type: "remote_listen_answer"; request_id: string; nonce: number; yes: boolean }
   /** `c` in BROWSE, and `[`/`]`/`S` inside the review overlay: the files that changed on disk during this
    *  tab's turn (`"latest"`, or a turn number) or, with `scope: "session"`, since the session's first
    *  baseline. Names the tab, as every tab-scoped command does; the reply is a `review` envelope carrying the
@@ -510,6 +515,72 @@ function isWellFormedTrustPrompt(value: unknown): boolean {
   );
 }
 
+/** What a phone may do, as the desk grants it. */
+export type RemoteGrant = "watch" | "watch+steer";
+
+/** What the window's remote-control questions are drawn from (`panel/src/remote_enroll.rs`), and the answers to
+ *  them. Names and addresses are plain text, drawn through `revealHidden`. */
+export type RemoteDeskEnvelope =
+  /** A one-time code waiting to be scanned: the code itself (typed instead), the pairing URI and its QR modules,
+   *  one string of `0`/`1` per row. */
+  | { kind: "remote_pairing"; code: string; uri: string; modules: string[]; expiresInMs: number }
+  /** Each question says how long the window waits for it (`expiresInMs`); past that it is no. */
+  | { kind: "remote_enroll"; nonce: number; name: string; host: string; peer: string; grants: RemoteGrant[]; grant: RemoteGrant; expiresInMs: number }
+  | { kind: "remote_listen"; nonce: number; addr: string; iface: string; link: string; plain: boolean; expiresInMs: number }
+  /** `eitri remote grant` asks whether a device's grant may change from `from` to `to`; answered with
+   *  `remote_enroll_answer` under its nonce, a `yes` naming `to`. */
+  | { kind: "remote_grant"; nonce: number; device: string; name: string; from: RemoteGrant; to: RemoteGrant; expiresInMs: number }
+  /** The window stopped waiting for the question `nonce` (it went unanswered past its time). */
+  | { kind: "remote_question_closed"; nonce: number }
+  /** A device in the store that no desk said yes to (something other than an enrollment wrote it). */
+  | { kind: "remote_device_flagged"; device: string; name: string }
+  | { kind: "command_result"; requestId: string; ok: true }
+  | { kind: "command_result"; requestId: string; ok: false; error: string };
+
+let remoteDesk: ((payload: RemoteDeskEnvelope) => void) | null = null;
+const remoteRequests = new Set<string>();
+
+/** Where the remote-control questions and the results of their answers go (a `RemoteDesk`, `remoteDesk.ts`);
+ *  `null` stops it. */
+export function installRemoteDesk(handler: ((payload: RemoteDeskEnvelope) => void) | null): void {
+  remoteDesk = handler;
+}
+
+/** Sends an answer to a remote-control question; its `command_result` goes to the remote desk, not the panel. */
+export function postRemoteAnswer(message: Extract<OutboundMessage, { type: "remote_enroll_answer" | "remote_listen_answer" }>): void {
+  remoteRequests.add(message.request_id);
+  postToRust(message);
+}
+
+function isGrant(value: unknown): value is RemoteGrant {
+  return value === "watch" || value === "watch+steer";
+}
+
+function isWellFormedRemote(value: Record<string, unknown>): boolean {
+  const text = (v: unknown) => typeof v === "string";
+  const nonce = Number.isSafeInteger(value.nonce) && (value.nonce as number) >= 0;
+  const expires = typeof value.expiresInMs === "number" && value.expiresInMs > 0;
+  switch (value.kind) {
+    case "remote_pairing":
+      return text(value.code) && text(value.uri) && Array.isArray(value.modules) &&
+        value.modules.every((row) => typeof row === "string" && /^[01]*$/.test(row) && row.length === (value.modules as unknown[]).length) &&
+        typeof value.expiresInMs === "number";
+    case "remote_enroll":
+      return nonce && expires && text(value.name) && text(value.host) && text(value.peer) && Array.isArray(value.grants) &&
+        value.grants.length > 0 && value.grants.every(isGrant) && isGrant(value.grant);
+    case "remote_listen":
+      return nonce && expires && text(value.addr) && text(value.iface) && text(value.link) && typeof value.plain === "boolean";
+    case "remote_grant":
+      return nonce && expires && text(value.device) && text(value.name) && isGrant(value.from) && isGrant(value.to);
+    case "remote_question_closed":
+      return nonce;
+    case "remote_device_flagged":
+      return text(value.device) && text(value.name);
+    default:
+      return false;
+  }
+}
+
 export function installDispatch(handler: InboundHandler): void {
   window.__eitriDispatch = (json: string) => {
     let parsed: unknown;
@@ -521,6 +592,30 @@ export function installDispatch(handler: InboundHandler): void {
     }
     if (parsed && typeof parsed === "object" && "kind" in parsed) {
       const obj = parsed as { kind: string };
+      // The remote-control questions are drawn by their own component; one that cannot be answered as shown is
+      // dropped like any malformed question.
+      if (
+        obj.kind === "remote_pairing" ||
+        obj.kind === "remote_enroll" ||
+        obj.kind === "remote_listen" ||
+        obj.kind === "remote_grant" ||
+        obj.kind === "remote_question_closed" ||
+        obj.kind === "remote_device_flagged"
+      ) {
+        if (!isWellFormedRemote(parsed as Record<string, unknown>)) {
+          console.warn("agent-ui: __eitriDispatch received a malformed remote-control envelope", parsed);
+          return;
+        }
+        remoteDesk?.(parsed as RemoteDeskEnvelope);
+        return;
+      }
+      if (obj.kind === "command_result") {
+        const requestId = (parsed as { requestId?: unknown }).requestId;
+        if (typeof requestId === "string" && remoteRequests.delete(requestId)) {
+          remoteDesk?.(parsed as RemoteDeskEnvelope);
+          return;
+        }
+      }
       // A `confirm_bypass` with no numeric `nonce` can never be answered correctly (there
       // would be nothing real to echo back on `y`), so it is rejected the same way an unrecognized
       // envelope is -- warned about and dropped -- rather than reaching `App.tsx` as a confirm this

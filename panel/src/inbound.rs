@@ -1725,6 +1725,19 @@ pub(super) fn handle_inbound_message(
                 }
             }
         },
+        // Remote control's questions: admitted from the base page only, a `yes` past the window's gate.
+        InboundMessage::RemoteEnrollAnswer { nonce, yes, grant, .. } => {
+            match super::remote_enroll::answer_enroll(state, nonce, yes, grant, std::time::Instant::now()) {
+                Ok(()) => ok(&mut out),
+                Err(why) => refuse(&mut out, &why),
+            }
+        }
+        InboundMessage::RemoteListenAnswer { nonce, yes, .. } => {
+            match super::remote_enroll::answer_listen(state, nonce, yes, std::time::Instant::now()) {
+                Ok(()) => ok(&mut out),
+                Err(why) => refuse(&mut out, &why),
+            }
+        }
     }
     out
 }

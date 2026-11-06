@@ -51,7 +51,7 @@ import type { KeyboardEvent, SetStateAction } from "react";
 import { ProjectDirContext } from "./projectPath";
 import { initialPageModel, pageModel, withoutHint } from "./page_model";
 import type { CommandRecord, PageModel } from "./page_model";
-import { installDispatch, postToRust, nextMirrorId, nextRequestId } from "./bridge";
+import { installDispatch, installRemoteDesk, postToRust, nextMirrorId, nextRequestId } from "./bridge";
 import type { OutboundMessage, PanelKeysMode, PermissionDecision } from "./bridge";
 import { noteUserScroll, resumeFollowing } from "./follow";
 import {
@@ -168,6 +168,8 @@ import { Chooser } from "./components/Chooser";
 import { SlashPicker } from "./components/SlashPicker";
 import type { SlashPickerKind } from "./components/SlashPicker";
 import { PanelErrorBoundary } from "./components/PanelErrorBoundary";
+import { RemoteEnroll } from "./RemoteEnroll";
+import { RemoteDesk } from "./remoteDesk";
 import type { SlashAction } from "./slashCommands";
 import { barePickerCommand, completionSource, settingCommand } from "./slashCommands";
 import { EFFORT_FROM_SETTINGS, effortPicker, modelPicker, parseEffortReply, parseModelReply, settingsChangedWords } from "./slashPicker";
@@ -1490,6 +1492,16 @@ export default function App() {
     }
   }, [typingGuard, keymapOpen, detail, handoffOpen, pathPick, linkPick, confirm, overlayOpen]);
   useEffect(() => () => void typingGuard.cancel(), [typingGuard]);
+  /* The window's remote-control questions, kept here so a switch between the empty tab and the conversation (each
+     draws them) loses none. While another overlay owns the keys they take none: a `y` typed into the chooser's
+     filter is the filter's. */
+  const [remoteDesk] = useState(() => new RemoteDesk());
+  useEffect(() => {
+    installRemoteDesk(remoteDesk.receive);
+    return () => installRemoteDesk(null);
+  }, [remoteDesk]);
+  const remoteCovered =
+    overlayOpen || keymapOpen || detail !== null || handoffOpen || pathPick !== null || linkPick !== null || confirm !== null;
   // Releases, for an answer that waits for its key to be let go (`approveOldestByKey`). Capture
   // phase on the window, so a keyup another handler stops from bubbling still arrives.
   useEffect(() => {
@@ -4083,6 +4095,7 @@ export default function App() {
             `Footer` the same way it replaces the conversation's; the editor context (once
             `EmptyTab`'s own `ContextLine`) is its `context` fact. */}
         {commandLineOverlay}
+        <RemoteEnroll desk={remoteDesk} covered={remoteCovered} />
         <StatusBand
           facts={{
             mode: emptyMode,
@@ -6401,6 +6414,7 @@ export default function App() {
         </PanelErrorBoundary>
       )}
       {commandLineOverlay}
+      <RemoteEnroll desk={remoteDesk} covered={remoteCovered} />
       {/* The bottom band: replaces `StatusRow`, `Footer`,
           `NewPill` and `ContextLine` with one vim-statusline row. `showcmd` reads the same `box`
           the which-key popup draws from -- vim shows `showcmd` immediately, without that popup's

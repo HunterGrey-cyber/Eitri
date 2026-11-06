@@ -26,6 +26,9 @@ serde_json = "1"
 sha2 = "0.10"
 base64 = "0.22"
 uuid = { version = "1", features = ["v4"] }
+# The enrollment QR code's modules, drawn by the page. MIT OR Apache-2.0, no dependency and no build script without
+# its default features (which pull in `image`).
+qrcode = { version = "0.14.1", default-features = false }
 
 [dev-dependencies]
 eitri-core = { path = "../core", features = ["test-support"] }

@@ -73,6 +73,8 @@ mod pages;
 mod pair_review;
 #[path = "path_menu.rs"]
 mod path_menu;
+#[path = "remote_enroll.rs"]
+mod remote_enroll;
 #[path = "remote_entry.rs"]
 mod remote_entry;
 #[cfg(any(test, feature = "test-support"))]
@@ -145,7 +147,7 @@ pub use remote_entry::{
     ExpectWork, RemoteAccepted, RemoteInbound, RemoteOrigin, RemoteRefusal, RemoteResult, COMMAND_LEDGER_PER_DEVICE,
     REMOTE_TEXT_MAX_BYTES,
 };
-pub use remote_socket::RemoteSocket;
+pub use remote_socket::{Pairing, RemoteSocket};
 use restore::*;
 pub use review_glue::ReviewConfig;
 use review_glue::*;
@@ -181,6 +183,8 @@ struct AgentPanelState {
     path_menu: path_menu::PathMenu,
     /// Messages that name the editor's own sources and wait for its answer.
     mentions: mentions::Desk,
+    /// The window's questions about remote control waiting for the base page's answer.
+    remote_desk: remote_enroll::RemoteDesk,
     /// The sections a replayed message sends, set only while `handle_inbound_message` runs it.
     mention_sections: Option<eitri_core::mentions::gather::Gathered>,
     /// `project_dir.canonicalize()`, read once: the `canonical_cwd` a session lease is keyed on
@@ -591,6 +595,7 @@ impl AgentPanelState {
             project_dir,
             path_menu: path_menu::PathMenu::default(),
             mentions: mentions::Desk::default(),
+            remote_desk: remote_enroll::RemoteDesk::default(),
             mention_sections: None,
             canonical_project_dir,
             prefs_dir,

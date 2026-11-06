@@ -24,7 +24,8 @@ pub(super) enum Admission {
 /// of Claude's questions, starts a session the user was asked about, or loosens permissions -- a card
 /// answer, a question's answer or decline, a bypass `y`, a restore `y` (it resumes the saved bypass
 /// tabs in bypass), a trust `y` or `n` (a covered page's question may not be the one the user
-/// read) and turning following on (the consent that lets edited files be loaded in the editor).
+/// read), turning following on (the consent that lets edited files be loaded in the editor) and a
+/// `y` to one of remote control's questions (it adds a device or opens the listener to a network).
 /// `target` is the tab the message resolved to. Every
 /// variant is named, so a new message is classified when it is added rather than falling through
 /// ungated. Changes nothing.
@@ -150,6 +151,18 @@ pub(super) fn admission(
         InboundMessage::CycleMode { .. } | InboundMessage::CycleDefaultMode { .. } => Admission::Ungated,
         // Escape on a trust question starts and loads nothing.
         InboundMessage::TrustCancel { .. } => Admission::Ungated,
+        // Remote control's questions are the window's, asked in its base page: a `y` adds a device that may follow
+        // the tabs, or lets phones reach the listener from a network, so it meets the window's gate; an `n` changes
+        // nothing.
+        InboundMessage::RemoteEnrollAnswer { yes, .. } | InboundMessage::RemoteListenAnswer { yes, .. } => {
+            if !view.is_base() {
+                Admission::Refused(super::remote_enroll::REMOTE_QUESTIONS_ARE_THE_BASE_PAGES.into())
+            } else if *yes {
+                Admission::Gated(view)
+            } else {
+                Admission::Ungated
+            }
+        }
         // None of these answers a card or a question, or loosens a permission.
         InboundMessage::Ready { .. }
         | InboundMessage::PathComplete { .. }

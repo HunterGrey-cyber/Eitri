@@ -36,12 +36,6 @@ pub fn run(args: &[String]) -> i32 {
     }
 }
 
-/// What a subcommand this build does not carry out yet prints and returns.
-pub(crate) fn not_yet(subcommand: &str) -> i32 {
-    eprintln!("eitri remote {subcommand}: not yet");
-    2
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -51,9 +45,15 @@ mod tests {
     }
 
     #[test]
-    fn remote_subcommands_are_stubs_until_built_and_the_rest_is_usage() {
-        // `serve`, `stop` and `status` are carried out (`serve/`), and their tests start a real server.
-        for sub in ["add-device", "devices", "revoke", "grant", "ssh-key"] {
+    fn a_subcommand_without_its_argument_and_the_rest_are_usage() {
+        // `serve`, `stop` and `status` need no argument and start a real server: their tests are in `serve/`.
+        for sub in [
+            "add-device",
+            // `devices` takes no argument and reads the user's own store: its test reads a store of its own.
+            "revoke",
+            "grant",
+            "ssh-key",
+        ] {
             assert_eq!(run(&args(&[sub])), 2, "{sub}");
         }
         assert_eq!(run(&args(&[])), 2, "no subcommand");
