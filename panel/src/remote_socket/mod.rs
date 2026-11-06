@@ -179,6 +179,7 @@ impl RemoteSocket {
         if handled == INBOUND_PER_PUMP {
             (self.shared.wake)();
         }
+        self.deliver_results(handle);
         self.send_frames(handle);
     }
 

@@ -66,6 +66,10 @@ pub struct RecordingProvider {
     /// While on, a read of the open calls gets no reply until the test gives or drops it.
     holding_client_reads: AtomicBool,
     held_client_reads: std::sync::Mutex<Vec<ClientReadReply>>,
+    /// While set, `interrupt_turn` and `send_turn` wait on it before they do anything ([`Self::hold_calls`]).
+    held_calls: std::sync::Mutex<Option<std::sync::mpsc::Receiver<()>>>,
+    /// How many calls have begun to wait on the hold.
+    calls_waiting: AtomicUsize,
 }
 
 type ClientReadReply = std::sync::mpsc::Sender<Result<agent::ClientToolCallState, agent::ProviderError>>;
@@ -159,6 +163,24 @@ impl RecordingProvider {
     }
     pub fn resolutions(&self) -> Vec<(String, bool)> {
         self.resolved.lock().unwrap().clone()
+    }
+    /// From now on every `interrupt_turn` and `send_turn` waits before it does anything, until the returned sender
+    /// sends or is dropped: a provider slow to answer. Calls wait one at a time.
+    pub fn hold_calls(&self) -> std::sync::mpsc::Sender<()> {
+        let (release, held) = std::sync::mpsc::channel();
+        *self.held_calls.lock().unwrap() = Some(held);
+        release
+    }
+    /// How many calls have begun to wait on [`Self::hold_calls`]' hold.
+    pub fn calls_waiting(&self) -> usize {
+        self.calls_waiting.load(Ordering::SeqCst)
+    }
+    fn wait_if_held(&self) {
+        let held = self.held_calls.lock().unwrap();
+        if let Some(held) = held.as_ref() {
+            self.calls_waiting.fetch_add(1, Ordering::SeqCst);
+            let _ = held.recv();
+        }
     }
     /// A provider that advertises `interrupt` (read by `AgentConversation::create`, so choose it
     /// before creating the conversation).
@@ -323,6 +345,7 @@ impl agent::AgentProvider for RecordingProvider {
         Err(agent::ProviderError::UnsupportedCapability("resume"))
     }
     fn send_turn(&self, request: agent::SendTurnRequest) -> Result<String, agent::ProviderError> {
+        self.wait_if_held();
         self.turns.lock().unwrap().push(request.text);
         if self.refusing.load(Ordering::SeqCst) {
             return Err(agent::ProviderError::Provider {
@@ -443,6 +466,7 @@ impl agent::AgentProvider for RecordingProvider {
         Ok(rx)
     }
     fn interrupt_turn(&self, _request: agent::InterruptTurnRequest) -> Result<(), agent::ProviderError> {
+        self.wait_if_held();
         self.interrupts.fetch_add(1, Ordering::SeqCst);
         if self.failing_interrupts.load(Ordering::SeqCst) {
             return Err(agent::ProviderError::Transport(

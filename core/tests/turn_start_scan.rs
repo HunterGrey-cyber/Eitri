@@ -12,6 +12,7 @@ fn files() -> Vec<String> {
     let mut files: Vec<String> = [
         "core/src/tab_set.rs",
         "core/src/tab_set/moving.rs",
+        "core/src/tab_set/remote_turns.rs",
         "core/src/agent_backend.rs",
     ]
     .map(String::from)
@@ -21,13 +22,21 @@ fn files() -> Vec<String> {
 }
 
 /// The methods that put a turn on its way to an agent.
-const SEND_METHODS: &[&str] = &["send_turn", "send_turn_in", "send_turn_as", "send_turn_with"];
+const SEND_METHODS: &[&str] = &[
+    "send_turn",
+    "send_turn_in",
+    "send_turn_as",
+    "send_turn_with",
+    "send_turn_spawned",
+    "send_turn_as_spawned",
+];
 
-/// The six places a turn leaves for an agent, each of which this scan must find: the tab set's two (its
+/// The eight places a turn leaves for an agent, each of which this scan must find: the tab set's three (its
 /// queue, which carries a typed prompt, a queue flush at a turn's end, a review message and a resumed
-/// session's prompt, and a new session's first message), the legacy session's and the sidecar
-/// conversation's turn, a Claude turn sent through the mode-carrying door, and an external agent's (a
-/// Codex `turn/start`, an ACP `session/prompt`).
+/// session's prompt; a new session's first message; and a phone's message, whose provider call runs off the
+/// tick), the legacy session's and the sidecar conversation's turn (sent in place, or with the provider's
+/// call on a thread of its own), a Claude turn sent through the mode-carrying door, and an external agent's
+/// (a Codex `turn/start`, an ACP `session/prompt`).
 const SENDS: &[(&str, &str)] = &[
     (
         "core/src/tab_set.rs",
@@ -50,12 +59,21 @@ const SENDS: &[(&str, &str)] = &[
         "core/src/agent_backend.rs",
         "conversation.send_turn_with(wire_text, policy)",
     ),
+    (
+        "core/src/tab_set/remote_turns.rs",
+        "backend.send_turn_spawned(request, answered)",
+    ),
+    (
+        "core/src/agent_backend.rs",
+        "conversation.send_turn_as_spawned(&turn.wire, &turn.typed, turn.origin, &client_message_id, answered)",
+    ),
 ];
 
 /// The backend's own send primitives: they are what a gated caller calls.
 const PRIMITIVES: &[(&str, &str)] = &[
     ("core/src/agent_backend.rs", "send_turn"),
     ("core/src/agent_backend.rs", "send_turn_in"),
+    ("core/src/agent_backend.rs", "send_turn_spawned"),
 ];
 
 /// One function of `code`: its name, its signature (from `fn` to its body) and its body.

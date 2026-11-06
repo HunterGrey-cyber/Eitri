@@ -1018,27 +1018,6 @@ fn every_new_kind_parses_and_is_refused_not_yet() {
             "{line:?}"
         );
     }
-    for (n, cmd) in [
-        serde_json::json!({ "type": "send", "text": "hello" }),
-        serde_json::json!({ "type": "queue", "text": "later" }),
-        serde_json::json!({ "type": "stop_background" }),
-        serde_json::json!({ "type": "stop_task", "task": "b7" }),
-        serde_json::json!({ "type": "take_back" }),
-    ]
-    .into_iter()
-    .enumerate()
-    {
-        let mut cmd = cmd;
-        cmd["command_id"] = serde_json::json!(format!("ny{n}"));
-        rig.act(&mut client, "d1", "tok", &key, cmd.clone());
-        let lines = rig.until(&mut client, "the result", |l| l["kind"] == "result");
-        let result = lines.last().unwrap();
-        assert_eq!(
-            (&result["ok"], &result["why"]),
-            (&serde_json::json!(false), &serde_json::json!("not yet")),
-            "{cmd}"
-        );
-    }
     assert_eq!(provider.interrupts(), 0, "nothing reached the agent");
 
     // A field none of them has closes the connection, as any line that does not parse does.

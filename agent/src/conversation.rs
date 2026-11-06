@@ -401,6 +401,35 @@ fn declared_tools(capabilities: &ProviderCapabilities, set: Option<&ClientToolSe
     }
 }
 
+/// Runs `call` on a thread named `name` and hands its outcome to `done` there. When no thread can be made, `done`
+/// is told so at once, on this one.
+fn spawn_provider_call<T: Send + 'static>(
+    name: &str,
+    call: impl FnOnce() -> Result<T, ConversationError> + Send + 'static,
+    done: impl FnOnce(Result<T, ConversationError>) + Send + 'static,
+) {
+    // Shared so that a thread that was never made still leaves `done` here to be told.
+    let done = Arc::new(std::sync::Mutex::new(Some(done)));
+    let on_thread = Arc::clone(&done);
+    let spawned = std::thread::Builder::new().name(name.to_owned()).spawn(move || {
+        let outcome = call();
+        if let Some(done) = on_thread
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .take()
+        {
+            done(outcome);
+        }
+    });
+    if let Err(e) = spawned {
+        if let Some(done) = done.lock().unwrap_or_else(std::sync::PoisonError::into_inner).take() {
+            done(Err(ConversationError::Provider(ProviderError::Transport(format!(
+                "no thread for the call: {e}"
+            )))));
+        }
+    }
+}
+
 impl AgentConversation {
     /// Creates a fresh provider session for `cwd`.
     ///
@@ -1232,6 +1261,69 @@ impl AgentConversation {
         }
         let session_id = self.require_session()?;
         self.provider.interrupt_turn(InterruptTurnRequest { session_id })?;
+        Ok(())
+    }
+
+    /// [`interrupt`](Self::interrupt) with the provider's call made on a thread of its own, for a caller that
+    /// must not wait for it: `done` gets the outcome on that thread. A refusal known here (no interrupt, no
+    /// session) is given to `done` before this returns.
+    pub fn interrupt_spawned(&mut self, done: impl FnOnce(Result<(), ConversationError>) + Send + 'static) {
+        if !self.capabilities.interrupt {
+            done(Err(ConversationError::Provider(ProviderError::UnsupportedCapability(
+                "interrupt",
+            ))));
+            return;
+        }
+        let session_id = match self.require_session() {
+            Ok(id) => id,
+            Err(e) => return done(Err(e)),
+        };
+        let provider = Arc::clone(&self.provider);
+        spawn_provider_call(
+            "eitri-interrupt",
+            move || {
+                provider
+                    .interrupt_turn(InterruptTurnRequest { session_id })
+                    .map_err(ConversationError::Provider)
+            },
+            done,
+        );
+    }
+
+    /// [`send_turn_as`](Self::send_turn_as) with the provider's call made on a thread of its own, for a caller
+    /// that must not wait for it: `done` gets the turn id, or why not, on that thread. Its refusals known here
+    /// (an external conversation, a turn already running, no session) are returned, and `done` is then never
+    /// called.
+    pub fn send_turn_as_spawned(
+        &mut self,
+        text: &str,
+        as_typed: &str,
+        origin: PromptOrigin,
+        client_message_id: &str,
+        done: impl FnOnce(Result<String, ConversationError>) + Send + 'static,
+    ) -> Result<(), ConversationError> {
+        if self.external.is_some() {
+            return Err(ConversationError::Unsupported);
+        }
+        if self.projection().active_turn_id.is_some() {
+            return Err(ConversationError::TurnAlreadyActive);
+        }
+        let session_id = self.require_session()?;
+        let provider = Arc::clone(&self.provider);
+        let request = SendTurnRequest {
+            session_id,
+            text: text.to_string(),
+        };
+        let stamp = TurnStamp {
+            client_message_id: Some(client_message_id.to_string()),
+            typed_by_person: origin == PromptOrigin::Typed,
+            as_typed: Some(as_typed.to_string()),
+        };
+        spawn_provider_call(
+            "eitri-send-turn",
+            move || provider.send_turn_stamped(request, stamp).map_err(Self::turn_error),
+            done,
+        );
         Ok(())
     }
 

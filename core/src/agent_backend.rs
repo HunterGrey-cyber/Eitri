@@ -551,6 +551,33 @@ pub struct SubmittedPrompt {
     pub after_revision: u64,
 }
 
+/// A turn for [`AgentBackend::send_turn_spawned`]: what goes to the model, what was typed, and who wrote it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TurnRequest {
+    pub wire: String,
+    pub typed: String,
+    pub origin: agent::PromptOrigin,
+}
+
+/// What [`AgentBackend::send_turn_spawned`] knows of a turn before the provider has answered: the host's id for
+/// its message and the revision it was sent after. With the turn id the answer brings, a [`SubmittedPrompt`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SpawnedTurn {
+    pub client_message_id: String,
+    pub after_revision: u64,
+}
+
+impl SpawnedTurn {
+    /// The prompt as [`AgentBackend::send_turn`] would have reported it, once the provider named its turn.
+    pub fn submitted(self, turn_id: String) -> SubmittedPrompt {
+        SubmittedPrompt {
+            client_message_id: self.client_message_id,
+            turn_id: Some(turn_id),
+            after_revision: self.after_revision,
+        }
+    }
+}
+
 /// The event a submitted prompt becomes. Free function so `send_turn` and its test build it the
 /// same way.
 fn user_prompt_event(as_typed: &str) -> AgentDomainEvent {
@@ -1184,6 +1211,88 @@ impl AgentBackend {
                 Ok(())
             }
         }
+    }
+
+    /// [`interrupt`](Self::interrupt) for a caller that must not wait on the provider: the call runs on a thread
+    /// of its own and `done` gets its outcome there (`AgentConversation::interrupt_spawned`). The legacy backend
+    /// stops its own child at once, and `done` is told before this returns.
+    pub fn interrupt_spawned(&mut self, done: impl FnOnce(Result<(), BackendError>) + Send + 'static) {
+        match self {
+            AgentBackend::Legacy(session) => done(session.interrupt().map(|_| ()).map_err(BackendError::from)),
+            AgentBackend::Conversation { conversation, .. } => {
+                conversation.interrupt_spawned(move |outcome| done(outcome.map_err(BackendError::from)))
+            }
+        }
+    }
+
+    /// [`send_turn`](Self::send_turn) for a caller that must not wait on the provider. The prompt's row is folded
+    /// here, as `send_turn` folds it, and the provider's call runs on a thread of its own: `done` gets the turn id
+    /// there, or why not. A turn the agent had open that this side had not folded comes back as
+    /// [`BackendError::is_turn_busy`], and the caller withdraws the row ([`Self::withdraw_prompt`]). A refusal known
+    /// here (an external agent's tab, a turn already folded as running, no session) is returned with nothing
+    /// folded, and `done` is never called. The legacy backend sends at once, and `done` is told before this returns.
+    pub fn send_turn_spawned(
+        &mut self,
+        turn: TurnRequest,
+        done: impl FnOnce(Result<String, BackendError>) + Send + 'static,
+    ) -> Result<SpawnedTurn, BackendError> {
+        if self.agent().is_external() {
+            return Err(BackendError {
+                message: "this tab's turns carry its permission mode; send it through its tab".to_string(),
+                benign: true,
+            });
+        }
+        let client_message_id = uuid::Uuid::new_v4().to_string();
+        let after_revision = self.projection().last_revision;
+        let spawned = SpawnedTurn {
+            client_message_id: client_message_id.clone(),
+            after_revision,
+        };
+        if matches!(self, AgentBackend::Legacy(_)) {
+            let outcome = self.send_turn(&turn.wire, &turn.typed, turn.origin);
+            done(outcome.map(|submitted| submitted.turn_id.unwrap_or_default()));
+            return Ok(spawned);
+        }
+        let AgentBackend::Conversation { conversation, .. } = self else {
+            unreachable!("the legacy backend returned above");
+        };
+        if conversation.projection().active_turn_id.is_some() {
+            return Err(BackendError::turn_busy());
+        }
+        let row = turn.origin != agent::PromptOrigin::ShellLine;
+        if row {
+            conversation.fold_locally(user_prompt_event(&turn.typed));
+        }
+        let turn_error = |error: ConversationError| match error {
+            ConversationError::TurnAlreadyActive => BackendError::turn_busy(),
+            other => other.into(),
+        };
+        let answered = move |outcome: Result<String, ConversationError>| done(outcome.map_err(turn_error));
+        let sent =
+            conversation.send_turn_as_spawned(&turn.wire, &turn.typed, turn.origin, &client_message_id, answered);
+        match sent {
+            Ok(()) => Ok(spawned),
+            Err(error) => {
+                if row {
+                    conversation.fold_locally(AgentDomainEvent::UserPromptWithdrawn);
+                }
+                Err(turn_error(error))
+            }
+        }
+    }
+
+    /// The prompt a turn sent by [`Self::send_turn_spawned`] was accepted with names the session for the resume
+    /// picker, as an accepted [`Self::send_turn`] names it.
+    pub fn note_accepted_prompt(&mut self, as_typed: &str) {
+        if let AgentBackend::Conversation { conversation, .. } = self {
+            conversation.note_title(as_typed);
+        }
+    }
+
+    /// Takes back the row of a prompt [`Self::send_turn_spawned`] folded, once the agent said it already had a turn
+    /// open: the prompt was put into no turn.
+    pub fn withdraw_prompt(&mut self) {
+        self.fold_row(AgentDomainEvent::UserPromptWithdrawn);
     }
 
     /// What the tab should say about editor tools its session was given and the agent's provider left out,

@@ -148,6 +148,8 @@ pub(super) fn panel_tab_handoff(state: &AgentPanelState, tab: TabId) -> Result<P
         // A chat whose answer's reply is unread refuses to move (the provider's freeze), and the
         // reply is told to the page that answered here.
         question_sends: _,
+        // A phone's call is answered where it was made, to the connection it came on.
+        remote: _,
         // The tab itself moves through the tab set's own record.
         tabs,
         // The window's, not the tab's.

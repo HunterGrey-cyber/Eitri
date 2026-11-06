@@ -619,6 +619,8 @@ fn send_calls(code: &str) -> Vec<String> {
         "send_turn_as",
         "send_turn_with",
         "send_turn_stamped",
+        "send_turn_spawned",
+        "send_turn_as_spawned",
         "steer",
         "steer_turn",
         "steer_turn_stamped",
@@ -706,6 +708,19 @@ fn every_send_caller_names_its_origin() {
             "send_turn_as(wire_text,as_typed,origin,&client_message_id)",
         ),
         ("core/src/agent_backend.rs", "send_turn_with(wire_text,policy)"),
+        (
+            "core/src/agent_backend.rs",
+            "send_turn(&turn.wire,&turn.typed,turn.origin)",
+        ),
+        (
+            "core/src/agent_backend.rs",
+            "send_turn_as_spawned(&turn.wire,&turn.typed,turn.origin,&client_message_id,answered)",
+        ),
+        // A phone's turn: its request names `PromptOrigin::Composed`.
+        (
+            "core/src/tab_set/remote_turns.rs",
+            "send_turn_spawned(request,answered)",
+        ),
         (
             "core/src/agent_backend.rs",
             "steer_turn(shown_turn,client_message_id,wire_text,as_typed,origin)",

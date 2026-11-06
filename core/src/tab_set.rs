@@ -34,11 +34,13 @@ mod live_edits;
 pub use live_edits::LiveEdit;
 mod moving;
 mod observers;
+mod remote_turns;
 mod shell;
 pub use moving::{FrozenChat, FrozenTab, MoveRefusedWhy, SendGate, Sent, TabHandoff};
 pub use observers::{
     GoneWhy, ObserveError, ObserverFrame, ObserverId, ObserverReaper, WorkMark, OBSERVER_QUEUE_CAP_BYTES,
 };
+pub use remote_turns::{QueuedFrom, RemoteAsker, RemoteRefused, RemoteSent};
 pub use shell::{shell_command, ShellEnded};
 
 #[cfg(test)]
@@ -51,6 +53,8 @@ mod move_tests;
 mod prompt_origin_tests;
 #[cfg(test)]
 mod question_gate_tests;
+#[cfg(test)]
+mod remote_turn_tests;
 #[cfg(test)]
 mod steer_tests;
 #[cfg(test)]
@@ -215,6 +219,10 @@ pub struct Queued {
     /// What a `!` line printed, for the agent: its row is in the conversation already.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub shell_report: bool,
+    /// Who queued it. A phone's goes out only while the tab's mode is no wider than when it was taken
+    /// ([`QueuedFrom::may_go_in`]), and carries its device across a move.
+    #[serde(default, skip_serializing_if = "QueuedFrom::is_desk")]
+    pub from: QueuedFrom,
 }
 
 impl Queued {
@@ -233,6 +241,7 @@ impl Queued {
             refused: false,
             shell_line: false,
             shell_report: false,
+            from: QueuedFrom::Desk,
         }
     }
 
@@ -1612,6 +1621,12 @@ pub struct TabSet {
     /// Prompts held until the presence says they may go out (a linked window), by tab: at most one
     /// per tab ([`TabSet::poll_turn_sends`]).
     pending_sends: BTreeMap<u64, moving::PendingSend>,
+    /// A phone's sends whose provider call is out, by tab: at most one per tab ([`TabSet::poll_remote_sends`]).
+    remote_sends: BTreeMap<u64, remote_turns::RemoteSendWait>,
+    /// A phone's sends refused before their provider call was made, for the next [`TabSet::poll_remote_sends`].
+    remote_sent: Vec<RemoteSent>,
+    /// A phone's queued messages taken out unsent because their tab's mode widened ([`TabSet::take_remote_refused`]).
+    remote_refused: Vec<RemoteRefused>,
     /// Whether this window is linked to another one (`TabSet::set_partner`, `TabSet::add_partner`): then a
     /// prompt waits for its presence file before it goes out.
     linked: bool,
@@ -1721,6 +1736,9 @@ impl TabSet {
             starting: BTreeSet::new(),
             starting_since: BTreeMap::new(),
             pending_sends: BTreeMap::new(),
+            remote_sends: BTreeMap::new(),
+            remote_sent: Vec::new(),
+            remote_refused: Vec::new(),
             linked: false,
             partner_pids: BTreeSet::new(),
             untracked_turns: BTreeMap::new(),
@@ -1814,7 +1832,7 @@ impl TabSet {
     /// When this is false, nothing changes here until a backend's wake, or a command from the window, says
     /// so.
     pub fn needs_polling(&self) -> bool {
-        if !self.pending_sends.is_empty() {
+        if !self.pending_sends.is_empty() || self.remote_needs_polling() {
             return true;
         }
         self.tabs.iter().any(|tab| {
@@ -4663,6 +4681,7 @@ impl TabSet {
             refused: false,
             shell_line: false,
             shell_report: false,
+            from: QueuedFrom::Desk,
         });
         Ok(tab.session.queue.len())
     }
@@ -4684,9 +4703,11 @@ impl TabSet {
         if self.moving.contains(&id.0) {
             return false;
         }
+        // A phone's message goes into a turn only while the tab's mode is no wider than when it was taken.
+        let widened = self.refuse_widened_in(id);
         let mut next = self.next_steer;
         let Some(tab) = self.get_mut(id) else { return false };
-        let mut changed = tab.settle_steered();
+        let mut changed = tab.settle_steered() || widened;
         if tab.pending_handoff.is_some() || !tab.turn_running() || !tab.session.queue.iter().any(Queued::is_held) {
             return changed;
         }
@@ -4774,8 +4795,13 @@ impl TabSet {
     /// read look unreported, and it would be sent again.
     pub fn flush_queue(&mut self, id: TabId) -> Option<Flush> {
         // A turn already starting in the tab takes the queue at its end, as a running turn does: sent
-        // now, the queue would be a second turn the agent refuses.
-        if self.starting.contains(&id.0) || self.pending_sends.contains_key(&id.0) || !self.queue_can_go(id) {
+        // now, the queue would be a second turn the agent refuses. A phone's send whose provider call is
+        // still out is such a start, whatever the pump has seen since.
+        if self.starting.contains(&id.0)
+            || self.pending_sends.contains_key(&id.0)
+            || self.remote_sends.contains_key(&id.0)
+            || !self.queue_can_go(id)
+        {
             return None;
         }
         let gate = self.begin_turn_send(id);
@@ -4821,8 +4847,14 @@ impl TabSet {
                 return false;
             }
         }
+        // A phone's message goes only while the tab's mode is no wider than when it was taken. No turn runs, so
+        // one put into the last turn that the agent never said it read would be sent again below: it is
+        // refused as a held one is.
+        let refused = tab.refuse_widened(true);
         // A message the CLI refused waits for the person; it is not a reason to send a turn.
-        tab.session.queue.iter().any(|item| !item.refused)
+        let goes = tab.session.queue.iter().any(|item| !item.refused);
+        self.remote_refused.extend(refused);
+        goes
     }
 
     /// The one place a turn of Eitri's goes out to an agent: the tab's queue as one turn, or a new
@@ -4881,6 +4913,8 @@ impl TabSet {
                 match &outcome {
                     Ok(submitted) => {
                         let mut message = Queued::held(&typed, wire, wall_clock_ms());
+                        // One sender's items only (`next_turn`): handed back to the queue, it is still theirs.
+                        message.from = tab.session.queue[turn[0]].from.clone();
                         message.typed_by_person = origin == PromptOrigin::Typed;
                         message.shell_report = origin == PromptOrigin::ShellLine;
                         message.steerable = !message.shell_report;
@@ -4930,6 +4964,14 @@ impl TabSet {
                     typed: turn.typed,
                     outcome,
                 }
+            }
+            moving::TurnSend::Remote {
+                turn,
+                asker,
+                accepted_mode,
+            } => {
+                self.release_remote_send(gate, turn, asker, accepted_mode);
+                return None;
             }
             moving::TurnSend::Prompt { request_id, page, turn } => {
                 // A card or question that arrived during the presence wait holds this message too:
@@ -6708,11 +6750,18 @@ fn reads_slash_commands(agent: &AgentId, projection: &agent::AgentSessionProject
 }
 
 /// Where in the queue the next turn comes from: the first item the CLI did not refuse when it is a command, or
-/// else every message up to the next command. So what waits goes out in the order typed, and a command is never
-/// read with a message for its arguments. Ascending.
+/// else every message up to the next command, and up to the next item of another sender
+/// ([`QueuedFrom::same_sender`]). So what waits goes out in the order typed, a command is never read with a
+/// message for its arguments, and a phone's words are never one turn with the desk's. Ascending.
 fn next_turn(queue: &[Queued], reads_commands: bool) -> Vec<usize> {
-    let mut turn = Vec::new();
+    let mut turn: Vec<usize> = Vec::new();
     for (index, item) in queue.iter().enumerate().filter(|(_, item)| !item.refused) {
+        if turn
+            .first()
+            .is_some_and(|first| !queue[*first].from.same_sender(&item.from))
+        {
+            break;
+        }
         if item.is_command(reads_commands) || item.is_shell() {
             if turn.is_empty() {
                 turn.push(index);

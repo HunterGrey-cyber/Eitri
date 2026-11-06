@@ -272,12 +272,26 @@ pub(super) enum TurnSend {
         page: ViewId,
         turn: FirstTurn,
     },
+    /// A phone's message to the tab's idle session, taken while the tab was in `accepted_mode`: its provider call
+    /// runs off this thread, and what became of it is told through [`TabSet::poll_remote_sends`].
+    Remote {
+        turn: FirstTurn,
+        asker: RemoteAsker,
+        accepted_mode: SessionModeChoice,
+    },
 }
 
 /// A prompt held until the presence says it may go out.
 pub(super) struct PendingSend {
     gate: SendGate,
     what: TurnSend,
+}
+
+impl PendingSend {
+    /// Whether it is a phone's send.
+    pub(super) fn is_remote(&self) -> bool {
+        matches!(self.what, TurnSend::Remote { .. })
+    }
 }
 
 /// What happened to a turn of Eitri's that was let go: sent (whatever the backend answered), or held at
@@ -940,12 +954,13 @@ impl TabSet {
 
     /// Why no message may start a turn in `tab` now: it is frozen for a move (its record is taken, and a
     /// turn begun here would be missing from it), or a message of it already waits for the presence (a
-    /// second one would take its place, and the first would be neither sent nor answered).
-    fn why_no_turn_send(&self, tab: TabId) -> Option<String> {
+    /// second one would take its place, and the first would be neither sent nor answered) or for the
+    /// provider's answer to a phone's send.
+    pub(super) fn why_no_turn_send(&self, tab: TabId) -> Option<String> {
         if self.moving.contains(&tab.0) {
             return Some(MOVING.to_string());
         }
-        if self.pending_sends.contains_key(&tab.0) {
+        if self.pending_sends.contains_key(&tab.0) || self.remote_sends.contains_key(&tab.0) {
             return Some(SEND_HELD.to_string());
         }
         None
@@ -967,7 +982,7 @@ impl TabSet {
     /// when nothing is held or what is held is the tab's queue, which no command waits on.
     pub fn held_send_request(&self, tab: TabId) -> Option<(&str, Option<ViewId>)> {
         match &self.pending_sends.get(&tab.0)?.what {
-            TurnSend::Queue => None,
+            TurnSend::Queue | TurnSend::Remote { .. } => None,
             TurnSend::First { request_id, .. } => Some((request_id, None)),
             TurnSend::Prompt { request_id, page, .. } => Some((request_id, Some(*page))),
         }
@@ -1013,6 +1028,10 @@ impl TabSet {
             }
             Decision::NotSent(note) => {
                 self.end_start_of(&gate);
+                if let TurnSend::Remote { turn, asker, .. } = what {
+                    self.remote_not_sent(tab, turn, asker, note);
+                    return None;
+                }
                 Some(self.not_sent(tab, what, note))
             }
         }
@@ -1022,7 +1041,8 @@ impl TabSet {
     /// note, and goes out again only when the user sends it.
     fn not_sent(&mut self, tab: TabId, what: TurnSend, note: String) -> Sent {
         let (request_id, page, turn) = match what {
-            TurnSend::Queue => (None, None, None),
+            // A phone's send is told to the phone (`remote_not_sent`), never put in the desk's queue.
+            TurnSend::Queue | TurnSend::Remote { .. } => (None, None, None),
             TurnSend::First { request_id, turn } => (Some(request_id), None, Some(turn)),
             TurnSend::Prompt { request_id, page, turn } => (Some(request_id), Some(page), Some(turn)),
         };
@@ -1104,7 +1124,15 @@ impl TabSet {
         self.moving.remove(&tab.0);
         self.starting.remove(&tab.0);
         self.starting_since.remove(&tab.0);
-        self.pending_sends.remove(&tab.0);
+        // A phone's send held for the presence never goes now: the phone is told. One whose call is out is
+        // answered when the call comes back.
+        if let Some(PendingSend {
+            what: TurnSend::Remote { turn, asker, .. },
+            ..
+        }) = self.pending_sends.remove(&tab.0)
+        {
+            self.remote_not_sent(tab, turn, asker, "the tab closed before the message went".to_string());
+        }
         self.unbound_since.remove(&tab.0);
         self.flush_owed.remove(&tab.0);
     }
@@ -1129,7 +1157,10 @@ impl TabSet {
         let t = &self.tabs[at];
         // Ingestion can start the turn after the last pump checked `starting`. The final frozen
         // pump reconciles that flag; a prompt still held for presence must stay here regardless.
-        if self.pending_sends.contains_key(&tab.0) || (self.starting.contains(&tab.0) && !t.turn_running()) {
+        if self.pending_sends.contains_key(&tab.0)
+            || self.remote_sends.contains_key(&tab.0)
+            || (self.starting.contains(&tab.0) && !t.turn_running())
+        {
             return Some(MoveRefusedWhy::Starting);
         }
         if t.pending_handoff.is_some() {

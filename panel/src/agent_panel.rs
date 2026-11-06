@@ -142,7 +142,8 @@ use pair_review::pair_outbound;
 pub use pair_review::{take_pair_outbound, PairOutbound, ReviewSettled, ReviewStep};
 use remote_entry::*;
 pub use remote_entry::{
-    ExpectWork, RemoteInbound, RemoteOrigin, RemoteRefusal, COMMAND_LEDGER_PER_DEVICE, REMOTE_TEXT_MAX_BYTES,
+    ExpectWork, RemoteAccepted, RemoteInbound, RemoteOrigin, RemoteRefusal, RemoteResult, COMMAND_LEDGER_PER_DEVICE,
+    REMOTE_TEXT_MAX_BYTES,
 };
 pub use remote_socket::RemoteSocket;
 use restore::*;
@@ -297,6 +298,8 @@ struct AgentPanelState {
     /// Answers to Claude's questions on their way to the agent, polled by the tick: the GTK thread
     /// never waits for the agent's reply, and the page that answered is told once it came.
     question_sends: Vec<PendingQuestionSend>,
+    /// A phone's calls out to the provider, polled by the tick, and their results for the socket to take.
+    remote: RemoteCalls,
     /// Pending edits' proposals being read on worker threads, polled by the tick: the agent names the
     /// file, and nothing it names is opened on the GTK thread.
     proposal_jobs: Vec<PendingProposal>,
@@ -628,6 +631,7 @@ impl AgentPanelState {
             task_commands: Vec::new(),
             review_jobs: Vec::new(),
             question_sends: Vec::new(),
+            remote: RemoteCalls::default(),
             proposal_jobs: Vec::new(),
             view_jobs: Vec::new(),
             reset_checks: Vec::new(),

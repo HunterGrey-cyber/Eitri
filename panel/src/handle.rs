@@ -457,13 +457,14 @@ impl AgentPanelHandle {
     /// A remote observer's message about the tab named `key` (a phone's, from `origin`): parsed only as a
     /// [`RemoteInbound`], admitted apart from every page's message and answered to the caller, never to a page. It takes
     /// no view and is never held for the editor's answer. A command id is taken once per device for the life of the
-    /// process, whatever became of it.
+    /// process, whatever became of it. A call that waits on the provider is answered [`RemoteAccepted::Pending`], and
+    /// its result comes later from [`Self::take_remote_results`]; this never waits on the provider.
     pub fn remote_message(
         &self,
         origin: &RemoteOrigin,
         key: &eitri_core::tab_set::RowKey,
         raw: &str,
-    ) -> Result<(), RemoteRefusal> {
+    ) -> Result<RemoteAccepted, RemoteRefusal> {
         self.wake();
         let message = parse_remote_inbound(raw)?;
         if !first_command_use(&origin.device_id, message.command_id()) {
@@ -482,6 +483,12 @@ impl AgentPanelHandle {
             );
         }
         outcome
+    }
+
+    /// The results of remote commands that came after they were taken, oldest first, each for the connection it
+    /// names: a call answered [`RemoteAccepted::Pending`], or a queued message refused once its tab's mode widened.
+    pub fn take_remote_results(&self) -> Vec<RemoteResult> {
+        self.state.borrow_mut().remote.take_results()
     }
 
     /// Sends the messages whose editor answers have come, each through the arm it was bound for with its sections in
@@ -3284,6 +3291,8 @@ mod tests {
             "queued_count",
             "trust_question_open",
             "take_startup_problems",
+            // Drained by the socket's pump, which the tick runs: a wake here would tick again for nothing.
+            "take_remote_results",
         ];
         // Calls that wake only when what they changed needs the tick: a key that starts a typing window.
         const WAKES_WHEN: &[&str] = &["note_editor_key"];

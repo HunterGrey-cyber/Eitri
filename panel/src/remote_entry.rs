@@ -6,9 +6,16 @@
 //! from afar, so every kind a page may send and the list does not name (a card's answer, a question's, a trust
 //! answer, a mode change, a shell line) fails to parse. What it caused is told to the page that shows its tab,
 //! naming the device.
+//!
+//! The arms are written for the remote path, not borrowed from the pages': a phone's words go to a live Claude tab
+//! in Manual or Auto only, as they came (never composed with the editor's context, so `@words` read no buffer), and
+//! never as a command (`/`) or a shell line (`!`); the desk's draft and its history are not touched. A call that
+//! waits on the provider (a stop, a send, a task's stop) runs off this thread: the message is answered
+//! [`RemoteAccepted::Pending`] and its result follows from the tick ([`poll_remote`]), with the desk's notice.
 
 use super::*;
 use eitri_core::remote_rv::COMMAND_ID_MAX_BYTES;
+use eitri_core::tab_set::RemoteAsker;
 use serde::Deserialize;
 use std::collections::{HashMap, HashSet, VecDeque};
 
@@ -102,7 +109,47 @@ pub enum RemoteRefusal {
     Agent(String),
     /// A kind this build parses and does not carry out yet.
     NotYet,
+    /// The tab's mode is Bypass, or wider than when a queued message was taken.
+    ModeNotAllowed,
+    /// The tab's session has not started; a phone never starts one.
+    NotStarted,
+    /// The text's first non-blank character is `/` (a command) or `!` (a shell line).
+    SlashOrBang,
+    /// The text is longer than [`REMOTE_TEXT_MAX_BYTES`].
+    TooLong,
+    /// Nothing this device queued is waiting in the tab.
+    NotYours,
+    /// The tab cannot take it now, and why: a start or a send under way, a card or a `!` line holding it, its
+    /// queue waiting to go, too many of the phone's calls out.
+    Busy(String),
 }
+
+/// What became of a remote message that was taken.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RemoteAccepted {
+    /// Carried out.
+    Done,
+    /// A provider call is running; its result comes later from [`AgentPanelHandle::take_remote_results`].
+    Pending,
+}
+
+/// The result of a remote command that came after it was taken: a call that was [`RemoteAccepted::Pending`], or a
+/// queued message the tab took out unsent once its mode had widened (a second result for the same command, which
+/// was answered [`RemoteAccepted::Done`] when it was queued).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RemoteResult {
+    /// The connection the command came on.
+    pub conn: u64,
+    pub command_id: String,
+    pub outcome: Result<(), RemoteRefusal>,
+}
+
+/// The most of a window's remote calls out at once; past it a command is refused, and no thread is made for it.
+pub(super) const REMOTE_CALLS_MAX: usize = 16;
+
+/// The most results a window keeps for the socket to take; past it the oldest go, and their commands show on the
+/// phone as not confirmed.
+pub(super) const REMOTE_RESULTS_MAX: usize = 256;
 
 /// The longest text a `send` or `queue` carries, in UTF-8 bytes.
 pub const REMOTE_TEXT_MAX_BYTES: usize = 64 * 1024;
@@ -127,9 +174,14 @@ pub(super) fn parse_remote_inbound(raw: &str) -> Result<RemoteInbound, RemoteRef
         return Err(RemoteRefusal::Parse);
     }
     if message.text().is_some_and(|text| text.len() > REMOTE_TEXT_MAX_BYTES) {
-        return Err(RemoteRefusal::Parse);
+        return Err(RemoteRefusal::TooLong);
     }
     Ok(message)
+}
+
+/// Whether `text` would run as a command (`/`) or a shell line (`!`) at the desk: its first non-blank character.
+fn is_slash_or_bang(text: &str) -> bool {
+    text.trim_start().starts_with(['/', '!'])
 }
 
 /// One device's remembered command ids: the set to look them up, and their order to forget the oldest.
@@ -184,8 +236,9 @@ pub(super) fn first_command_use(device: &str, id: &str) -> bool {
     REMOTE_COMMANDS.with_borrow_mut(|commands| commands.first_use(device, id))
 }
 
-/// A parsed remote message from `origin` about the tab named `key`: admitted by [`admit_remote`], then its arm. No
-/// view is taken and no request is answered on a page; the page that shows the tab gets a notice of what was done.
+/// A parsed remote message from `origin` about the tab named `key`: admitted ([`admit_remote`] for a stop of the
+/// turn, [`admit_remote_arm`] for the rest), then its arm. No view is taken and no request is answered on a page; the
+/// page that shows the tab gets a notice of what was done, once it was.
 pub(super) fn handle_remote_message(
     state: &mut AgentPanelState,
     screen: &Screen,
@@ -193,41 +246,482 @@ pub(super) fn handle_remote_message(
     key: &eitri_core::tab_set::RowKey,
     message: RemoteInbound,
     out: &mut Outbox,
-) -> Result<(), RemoteRefusal> {
-    let not_yet = match &message {
-        RemoteInbound::Interrupt { .. } => false,
-        RemoteInbound::Send { .. }
-        | RemoteInbound::Queue { .. }
-        | RemoteInbound::StopBackground { .. }
-        | RemoteInbound::StopTask { .. }
-        | RemoteInbound::TakeBack { .. } => true,
+) -> Result<RemoteAccepted, RemoteRefusal> {
+    let tab = match &message {
+        RemoteInbound::Interrupt { .. } => admit_remote(state, &message, key)?,
+        _ => admit_remote_arm(state, &message, key)?,
     };
-    if not_yet {
-        return Err(RemoteRefusal::NotYet);
-    }
-    let tab = admit_remote(state, &message, key)?;
+    // A phone's send is a provider call too, kept by the tab set while it is out.
+    let calls_full = state.remote.calls.len() + state.tabs.remote_sends_out() >= REMOTE_CALLS_MAX;
+    let full = || RemoteRefusal::Busy("too many of the phone's calls are out: wait for their results".to_owned());
+    let asker = |command_id: String| RemoteAsker {
+        device_id: origin.device_id.clone(),
+        device: origin.device.clone(),
+        command_id,
+        conn: Some(origin.conn),
+    };
     match message {
-        RemoteInbound::Interrupt { .. } => {
+        RemoteInbound::Interrupt { command_id, .. } => {
+            if calls_full {
+                return Err(full());
+            }
             // The agent's work only: a `!` line the person started at the desk is theirs to stop.
-            let outcome = interrupt_agent(state, tab);
-            let result = match &outcome {
-                Ok(()) => Ok(()),
-                Err(error) => Err(RemoteRefusal::Agent(error.message.clone())),
-            };
-            apply_outcome(state, screen, tab, None, outcome, out);
-            if result.is_ok() {
-                if let Some(view) = state.shown_in(tab) {
-                    let told = format!("stopped from {}", origin.device);
-                    out.send(view, eitri_core::agent_bridge::serialize_notice_for_js(&told));
+            let answer = spawned_answer(state);
+            match interrupt_agent_spawned(state, tab, answer.done) {
+                Ok(()) => {
+                    let generation = generation_of(state, tab);
+                    state.remote.wait(
+                        tab,
+                        generation,
+                        origin,
+                        command_id,
+                        Call::Stop,
+                        Answer::Spawned(answer.rx),
+                    );
+                    Ok(RemoteAccepted::Pending)
+                }
+                Err(error) => {
+                    let why = RemoteRefusal::Agent(error.message.clone());
+                    apply_outcome(state, screen, tab, None, Err(error), out);
+                    Err(why)
                 }
             }
-            result
         }
-        RemoteInbound::Send { .. }
-        | RemoteInbound::Queue { .. }
-        | RemoteInbound::StopBackground { .. }
-        | RemoteInbound::StopTask { .. }
-        | RemoteInbound::TakeBack { .. } => Err(RemoteRefusal::NotYet),
+        RemoteInbound::Send { command_id, text } => {
+            if state.tabs.get(tab).is_some_and(Tab::turn_running) {
+                return Err(RemoteRefusal::WorkChanged);
+            }
+            if calls_full {
+                return Err(full());
+            }
+            state
+                .tabs
+                .send_remote(tab, &text, asker(command_id))
+                .map_err(RemoteRefusal::Busy)?;
+            Ok(RemoteAccepted::Pending)
+        }
+        RemoteInbound::Queue { command_id, text } => {
+            let Some(turn) = running_turn(state, tab) else {
+                return Err(RemoteRefusal::WorkChanged);
+            };
+            let now = super::inbound::now_ms();
+            state
+                .tabs
+                .queue_remote(tab, &text, asker(command_id), now)
+                .map_err(RemoteRefusal::Busy)?;
+            // Into the running turn when the agent can take it, else held for its end; never waits on the agent.
+            state.tabs.steer_held(tab, now, Some(&turn));
+            send_queue(state, tab, out);
+            tell_desk(state, tab, &format!("queued from {}", origin.device), out);
+            Ok(RemoteAccepted::Done)
+        }
+        RemoteInbound::StopBackground { .. } => {
+            // The grammar names no count: what runs now is what is stopped.
+            let shown = state
+                .tabs
+                .get(tab)
+                .and_then(|t| t.live())
+                .map_or(0, |backend| backend.projection().background_calls);
+            match state.tabs.stop_background(tab, shown) {
+                Ok(()) => {
+                    tell_desk(
+                        state,
+                        tab,
+                        &format!("background work stopped from {}", origin.device),
+                        out,
+                    );
+                    Ok(RemoteAccepted::Done)
+                }
+                Err(error) => {
+                    let why = RemoteRefusal::Agent(error.message.clone());
+                    apply_outcome(state, screen, tab, None, Err(error), out);
+                    Err(why)
+                }
+            }
+        }
+        RemoteInbound::StopTask { command_id, task } => {
+            if calls_full {
+                return Err(full());
+            }
+            let reply = backend_for(&mut state.tabs, tab)
+                .and_then(|backend| backend.stop_task(&task))
+                .map_err(|error| RemoteRefusal::Agent(error.message))?;
+            let generation = generation_of(state, tab);
+            state
+                .remote
+                .wait(tab, generation, origin, command_id, Call::StopTask, Answer::Task(reply));
+            Ok(RemoteAccepted::Pending)
+        }
+        RemoteInbound::TakeBack { .. } => {
+            let taken = state.tabs.take_back_remote(tab, &origin.device_id);
+            if taken.is_empty() {
+                return Err(RemoteRefusal::NotYours);
+            }
+            send_queue(state, tab, out);
+            let told = match taken.len() {
+                1 => format!("{} took back its queued message", origin.device),
+                n => format!("{} took back its {n} queued messages", origin.device),
+            };
+            tell_desk(state, tab, &told, out);
+            Ok(RemoteAccepted::Done)
+        }
+    }
+}
+
+/// Admits every remote kind but `interrupt` (which [`admit_remote`] admits): a message resolves its tab by key, and
+/// only a Claude tab takes one. Words (`send`, `queue`) go only to a live session in Manual or Auto, never as a
+/// command or a shell line; a stop goes to a live session in any mode, a task's only while that task is listed;
+/// `take_back` needs only the tab, since it finds nothing of this device's anywhere else. Changes nothing.
+pub(super) fn admit_remote_arm(
+    state: &AgentPanelState,
+    message: &RemoteInbound,
+    key: &eitri_core::tab_set::RowKey,
+) -> Result<TabId, RemoteRefusal> {
+    if message.text().is_some_and(is_slash_or_bang) {
+        return Err(RemoteRefusal::SlashOrBang);
+    }
+    let tab = state.tabs.tab_by_key(key).ok_or(RemoteRefusal::NoSuchTab)?;
+    let held = state.tabs.get(tab).ok_or(RemoteRefusal::NoSuchTab)?;
+    if matches!(message, RemoteInbound::TakeBack { .. }) {
+        return Ok(tab);
+    }
+    if *held.agent() != AgentId::Claude {
+        return Err(RemoteRefusal::NotClaude);
+    }
+    let live = match held.backend() {
+        TabBackend::NotStarted => return Err(RemoteRefusal::NotStarted),
+        TabBackend::Live(backend) if !state.tabs.is_moving(tab) && held.pending_handoff.is_none() => backend,
+        _ => return Err(RemoteRefusal::NotLive),
+    };
+    match message {
+        RemoteInbound::Send { .. } | RemoteInbound::Queue { .. } => match held.mode() {
+            SessionModeChoice::Manual | SessionModeChoice::Auto => Ok(tab),
+            SessionModeChoice::Bypass => Err(RemoteRefusal::ModeNotAllowed),
+        },
+        RemoteInbound::StopBackground { .. } => Ok(tab),
+        RemoteInbound::StopTask { task, .. } => {
+            let listed = live
+                .projection()
+                .background_tasks
+                .rows
+                .iter()
+                .any(|row| row.task.task_id == *task);
+            if listed {
+                Ok(tab)
+            } else {
+                Err(RemoteRefusal::WorkChanged)
+            }
+        }
+        RemoteInbound::Interrupt { .. } | RemoteInbound::TakeBack { .. } => {
+            unreachable!("admitted by admit_remote and above")
+        }
+    }
+}
+
+/// The backend generation of `tab` now ([`Tab::backend_generation`]).
+fn generation_of(state: &AgentPanelState, tab: TabId) -> u64 {
+    state.tabs.get(tab).map_or(0, Tab::backend_generation)
+}
+
+/// The turn running in `tab` as its projection shows it, if one is.
+fn running_turn(state: &AgentPanelState, tab: TabId) -> Option<String> {
+    let backend = state.tabs.get(tab)?.live()?;
+    let turn = backend.projection().active_turn_id.clone();
+    turn
+}
+
+/// Tells the page that shows `tab` what a phone did there; while no ready page shows it, the notice waits until
+/// one does ([`send_owed_notices`]).
+fn tell_desk(state: &mut AgentPanelState, tab: TabId, text: &str, out: &mut Outbox) {
+    match state.page_of(tab) {
+        Some(view) => out.send(view, eitri_core::agent_bridge::serialize_notice_for_js(text)),
+        None => state.remote.owe_notice(tab, text),
+    }
+}
+
+/// The notices about a phone's doings owed to tabs a ready page shows now, oldest first; those of tabs that have
+/// left the window are forgotten.
+fn send_owed_notices(state: &mut AgentPanelState, out: &mut Outbox) {
+    if state.remote.notices.is_empty() {
+        return;
+    }
+    let owed = std::mem::take(&mut state.remote.notices);
+    for (tab, text) in owed {
+        if state.tabs.get(tab).is_none() {
+            continue;
+        }
+        match state.page_of(tab) {
+            Some(view) => out.send(view, eitri_core::agent_bridge::serialize_notice_for_js(&text)),
+            None => state.remote.notices.push_back((tab, text)),
+        }
+    }
+}
+
+/// [`interrupt_agent`] for a remote stop, with the provider's call off this thread (`AgentBackend::interrupt_spawned`).
+fn interrupt_agent_spawned(
+    state: &mut AgentPanelState,
+    tab: TabId,
+    done: impl FnOnce(Result<(), BackendError>) + Send + 'static,
+) -> Result<(), BackendError> {
+    if state.tabs.is_moving(tab) {
+        return Err(BackendError {
+            message: eitri_core::tab_set::MOVING.to_string(),
+            benign: true,
+        });
+    }
+    backend_for(&mut state.tabs, tab)?.interrupt_spawned(done);
+    Ok(())
+}
+
+/// A channel for a spawned call's outcome, whose sender raises the panel's wake once it is told.
+struct SpawnedAnswer<F> {
+    done: F,
+    rx: mpsc::Receiver<Result<(), BackendError>>,
+}
+
+fn spawned_answer(state: &AgentPanelState) -> SpawnedAnswer<impl FnOnce(Result<(), BackendError>) + Send + 'static> {
+    let (tx, rx) = mpsc::channel();
+    let wake = state.wake.as_ref().map(crate::panel_wake::PanelWake::waker);
+    let done = move |outcome| {
+        let _ = tx.send(outcome);
+        if let Some(wake) = wake {
+            wake();
+        }
+    };
+    SpawnedAnswer { done, rx }
+}
+
+/// What a remote call that waits on the provider was.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Call {
+    Stop,
+    StopTask,
+}
+
+/// Where a waiting call's outcome comes from.
+enum Answer {
+    Spawned(mpsc::Receiver<Result<(), BackendError>>),
+    Task(agent::TaskReply<()>),
+}
+
+/// One remote call out to the provider.
+struct Waiting {
+    tab: TabId,
+    /// The tab's backend generation when the call was made: an answer about a session the tab no longer holds is
+    /// the phone's alone.
+    generation: u64,
+    origin: RemoteOrigin,
+    command_id: String,
+    call: Call,
+    answer: Answer,
+}
+
+/// The most notices a window keeps for tabs no ready page shows; past it the oldest go.
+pub(super) const REMOTE_NOTICES_MAX: usize = 64;
+
+/// A window's remote calls out to the provider, the results the socket has not taken yet, and the desk's notices
+/// owed to tabs no ready page shows.
+#[derive(Default)]
+pub(super) struct RemoteCalls {
+    calls: Vec<Waiting>,
+    results: std::collections::VecDeque<RemoteResult>,
+    notices: std::collections::VecDeque<(TabId, String)>,
+}
+
+impl RemoteCalls {
+    fn wait(
+        &mut self,
+        tab: TabId,
+        generation: u64,
+        origin: &RemoteOrigin,
+        command_id: String,
+        call: Call,
+        answer: Answer,
+    ) {
+        self.calls.push(Waiting {
+            tab,
+            generation,
+            origin: origin.clone(),
+            command_id,
+            call,
+            answer,
+        });
+    }
+
+    /// Keeps a result for the socket; the oldest goes past [`REMOTE_RESULTS_MAX`].
+    fn result(&mut self, conn: Option<u64>, command_id: String, outcome: Result<(), RemoteRefusal>) {
+        let Some(conn) = conn else {
+            return;
+        };
+        if self.results.len() >= REMOTE_RESULTS_MAX {
+            if let Some(dropped) = self.results.pop_front() {
+                eprintln!(
+                    "[agent_panel] remote: the result of command {} on connection {} was dropped untaken",
+                    dropped.command_id, dropped.conn
+                );
+            }
+        }
+        self.results.push_back(RemoteResult {
+            conn,
+            command_id,
+            outcome,
+        });
+    }
+
+    /// Keeps a notice for `tab` until a ready page shows it; the oldest goes past [`REMOTE_NOTICES_MAX`].
+    fn owe_notice(&mut self, tab: TabId, text: &str) {
+        if self.notices.len() >= REMOTE_NOTICES_MAX {
+            self.notices.pop_front();
+        }
+        self.notices.push_back((tab, text.to_owned()));
+    }
+
+    /// Every result kept so far, oldest first.
+    pub(super) fn take_results(&mut self) -> Vec<RemoteResult> {
+        self.results.drain(..).collect()
+    }
+
+    /// Whether a call is out: a task's stop raises no wake when it is answered.
+    pub(super) fn needs_polling(&self) -> bool {
+        !self.calls.is_empty()
+    }
+}
+
+/// Called from the tick: the remote calls the provider answered, the phone's sends the tab set let go or refused,
+/// and the phone's queued messages its mode no longer lets go. Each tells the page that shows its tab and keeps a
+/// result for the socket; a result kept raises the wake, so the socket's pump takes it whichever of the two ran
+/// first. Notices owed to tabs a page shows now go too. Never waits.
+pub(super) fn poll_remote(state: &mut AgentPanelState, screen: &Screen, out: &mut Outbox) {
+    send_owed_notices(state, out);
+    let results_before = state.remote.results.len();
+    poll_remote_answers(state, screen, out);
+    if state.remote.results.len() != results_before {
+        if let Some(wake) = &state.wake {
+            wake.raise();
+        }
+    }
+}
+
+fn poll_remote_answers(state: &mut AgentPanelState, screen: &Screen, out: &mut Outbox) {
+    let mut answered = Vec::new();
+    state.remote.calls.retain_mut(|waiting| {
+        use std::sync::mpsc::TryRecvError;
+        let outcome = match &waiting.answer {
+            Answer::Spawned(rx) => match rx.try_recv() {
+                Ok(outcome) => outcome,
+                Err(TryRecvError::Empty) => return true,
+                Err(TryRecvError::Disconnected) => Err(BackendError {
+                    message: "the call ended before the agent answered".to_owned(),
+                    benign: true,
+                }),
+            },
+            Answer::Task(rx) => match rx.try_recv() {
+                Ok(outcome) => outcome.map_err(|error| BackendError {
+                    message: agent::providers::claude_sidecar::task_refusal(error),
+                    benign: true,
+                }),
+                Err(TryRecvError::Empty) => return true,
+                Err(TryRecvError::Disconnected) => Err(BackendError {
+                    message: "task request ended before an answer arrived".to_owned(),
+                    benign: true,
+                }),
+            },
+        };
+        answered.push((
+            waiting.tab,
+            waiting.generation,
+            waiting.origin.clone(),
+            waiting.command_id.clone(),
+            waiting.call,
+            outcome,
+        ));
+        false
+    });
+    for (tab, generation, origin, command_id, call, outcome) in answered {
+        // An answer about a session the tab no longer holds (it closed, or another took its place) is the phone's
+        // alone: applied, a failure would end the session that replaced it.
+        let same_session = state
+            .tabs
+            .get(tab)
+            .is_some_and(|t| t.backend_generation() == generation);
+        let result = match outcome {
+            Ok(()) => {
+                if same_session {
+                    let told = match call {
+                        Call::Stop => format!("stopped from {}", origin.device),
+                        Call::StopTask => format!("a background task stopped from {}", origin.device),
+                    };
+                    tell_desk(state, tab, &told, out);
+                }
+                Ok(())
+            }
+            Err(error) => {
+                let why = RemoteRefusal::Agent(error.message.clone());
+                if same_session {
+                    apply_outcome(state, screen, tab, None, Err(error), out);
+                }
+                Err(why)
+            }
+        };
+        log_refusal(&origin.device, &origin.device_id, origin.conn, &result);
+        state.remote.result(Some(origin.conn), command_id, result);
+    }
+    for sent in state.tabs.poll_remote_sends() {
+        let eitri_core::tab_set::RemoteSent {
+            tab,
+            asker,
+            typed,
+            outcome,
+            same_session,
+        } = sent;
+        let result = match &outcome {
+            Ok(()) => Ok(()),
+            Err(error) if error.is_turn_busy() => Err(RemoteRefusal::WorkChanged),
+            Err(error) => Err(RemoteRefusal::Agent(error.message.clone())),
+        };
+        if same_session && state.tabs.get(tab).is_some() {
+            if result.is_ok() {
+                tell_desk(state, tab, &format!("sent from {}", asker.device), out);
+            }
+            // As a desk's send: the tab's title, a failure that ends the session, the queue.
+            super::routing::prompt_sent(state, screen, tab, None, &typed, outcome, out);
+        }
+        let conn = asker.conn.unwrap_or_default();
+        log_refusal(&asker.device, &asker.device_id, conn, &result);
+        state.remote.result(asker.conn, asker.command_id, result);
+    }
+    for refused in state.tabs.take_remote_refused() {
+        let eitri_core::tab_set::RemoteRefused {
+            tab,
+            asker,
+            accepted_mode,
+            mode,
+        } = refused;
+        let told = format!(
+            "a message from {} was not sent: this tab is in {} now, wider than {} when it was taken",
+            asker.device,
+            mode_name(mode),
+            mode_name(accepted_mode)
+        );
+        tell_desk(state, tab, &told, out);
+        send_queue(state, tab, out);
+        state
+            .remote
+            .result(asker.conn, asker.command_id, Err(RemoteRefusal::ModeNotAllowed));
+    }
+}
+
+fn mode_name(mode: SessionModeChoice) -> &'static str {
+    match mode {
+        SessionModeChoice::Manual => "Manual",
+        SessionModeChoice::Auto => "Auto",
+        SessionModeChoice::Bypass => "Bypass",
+    }
+}
+
+fn log_refusal(device: &str, device_id: &str, conn: u64, result: &Result<(), RemoteRefusal>) {
+    if let Err(why) = result {
+        eprintln!("[agent_panel] remote {device} ({device_id}, connection {conn}): refused: {why:?}");
     }
 }
 
@@ -249,9 +743,21 @@ mod tests {
         serde_json::json!({ "type": "interrupt", "command_id": command_id, "expect_work": expect_work }).to_string()
     }
 
-    /// A new Claude tab whose provider can interrupt, opened (so selected) in the base view, and its row key.
-    fn interruptible_tab(handle: &AgentPanelHandle, dir: &Path) -> (TabId, std::sync::Arc<RecordingProvider>, RowKey) {
-        let provider = std::sync::Arc::new(RecordingProvider::interruptible());
+    fn send(command_id: &str, text: &str) -> String {
+        serde_json::json!({ "type": "send", "command_id": command_id, "text": text }).to_string()
+    }
+
+    fn queue(command_id: &str, text: &str) -> String {
+        serde_json::json!({ "type": "queue", "command_id": command_id, "text": text }).to_string()
+    }
+
+    /// A new tab of `provider`'s, opened (so selected) in the base view, and its row key.
+    fn tab_of(
+        handle: &AgentPanelHandle,
+        dir: &Path,
+        provider: RecordingProvider,
+    ) -> (TabId, std::sync::Arc<RecordingProvider>, RowKey) {
+        let provider = std::sync::Arc::new(provider);
         let conversation = agent::AgentConversation::create(provider.clone(), dir, ProjectTrust::Untrusted).unwrap();
         let backend = AgentBackend::Conversation {
             agent: AgentId::Claude,
@@ -263,6 +769,11 @@ mod tests {
         held.set_backend(TabBackend::Live(backend));
         let key = held.row_key().clone();
         (tab, provider, key)
+    }
+
+    /// A new Claude tab whose provider can interrupt, opened (so selected) in the base view, and its row key.
+    fn interruptible_tab(handle: &AgentPanelHandle, dir: &Path) -> (TabId, std::sync::Arc<RecordingProvider>, RowKey) {
+        tab_of(handle, dir, RecordingProvider::interruptible())
     }
 
     /// The work `turn` of the session `tab` holds now, as a phone names it from the frames it was sent.
@@ -304,6 +815,11 @@ mod tests {
         tick_handle_until(handle, "the turn", || active_turn(handle, tab).as_deref() == Some(turn));
     }
 
+    fn end_turn(handle: &AgentPanelHandle, tab: TabId, provider: &RecordingProvider, turn: &str) {
+        provider.queue(completed(turn));
+        tick_handle_until(handle, "the turn's end", || active_turn(handle, tab).is_none());
+    }
+
     fn completed(turn: &str) -> agent::AgentDomainEvent {
         agent::AgentDomainEvent::TurnCompleted {
             turn_id: turn.into(),
@@ -319,6 +835,64 @@ mod tests {
         let state = handle.state.borrow();
         let held = state.tabs.get(tab).unwrap();
         (held.cli_unseen_busy(), held.unseen_stretch())
+    }
+
+    /// Cycles `tab`'s mode from the base page until it is `wanted`, confirming Bypass when it is asked.
+    fn set_mode(handle: &AgentPanelHandle, base: &Rc<RecordingPage>, tab: TabId, wanted: SessionModeChoice) {
+        for round in 0..4 {
+            if mode_of(handle, tab) == wanted {
+                return;
+            }
+            clear(&[base]);
+            cycle_mode_from(handle, ViewId::BASE, &format!("m{round}"), tab);
+            if let Some((_, nonce)) = last_bypass_prompt(base) {
+                confirm_bypass_from(handle, ViewId::BASE, &format!("y{round}"), tab, nonce);
+            }
+        }
+        assert_eq!(mode_of(handle, tab), wanted);
+    }
+
+    /// The result of command `command_id` from the socket's side, ticking until it comes; the other results taken
+    /// meanwhile are dropped.
+    fn result_of(handle: &AgentPanelHandle, command_id: &str) -> RemoteResult {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        loop {
+            if let Some(found) = handle
+                .take_remote_results()
+                .into_iter()
+                .find(|result| result.command_id == command_id)
+            {
+                return found;
+            }
+            assert!(std::time::Instant::now() < deadline, "no result for {command_id}");
+            handle.tick();
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+    }
+
+    /// A remote message carried out to its end: answered at once, or, when it went out to the provider, once its
+    /// result came.
+    fn settle(handle: &AgentPanelHandle, origin: &RemoteOrigin, key: &RowKey, raw: &str) -> Result<(), RemoteRefusal> {
+        match handle.remote_message(origin, key, raw)? {
+            RemoteAccepted::Done => Ok(()),
+            RemoteAccepted::Pending => {
+                let id: serde_json::Value = serde_json::from_str(raw).unwrap();
+                let result = result_of(handle, id["command_id"].as_str().unwrap());
+                assert_eq!(result.conn, origin.conn, "answered on the connection it came on");
+                result.outcome
+            }
+        }
+    }
+
+    fn queued_texts(handle: &AgentPanelHandle, tab: TabId) -> Vec<String> {
+        handle.state.borrow().tabs.queue_texts(tab)
+    }
+
+    fn not_started(handle: &AgentPanelHandle, tab: TabId) -> bool {
+        matches!(
+            handle.state.borrow().tabs.get(tab).unwrap().backend(),
+            TabBackend::NotStarted
+        )
     }
 
     #[test]
@@ -387,6 +961,23 @@ mod tests {
                 ..
             }
         ));
+        for kind in [
+            serde_json::json!({ "type": "send", "command_id": "n1", "text": "hello" }),
+            serde_json::json!({ "type": "queue", "command_id": "n2", "text": "later" }),
+            serde_json::json!({ "type": "stop_background", "command_id": "n3" }),
+            serde_json::json!({ "type": "stop_task", "command_id": "n4", "task": "b7" }),
+            serde_json::json!({ "type": "take_back", "command_id": "n5" }),
+        ] {
+            let parsed = parse_remote_inbound(&kind.to_string()).unwrap_or_else(|e| panic!("{kind}: {e:?}"));
+            assert_eq!(parsed.command_id(), kind["command_id"].as_str().unwrap());
+            let mut extra = kind.clone();
+            extra["tab"] = serde_json::json!(3);
+            assert_eq!(
+                parse_remote_inbound(&extra.to_string()),
+                Err(RemoteRefusal::Parse),
+                "{extra}"
+            );
+        }
     }
 
     #[test]
@@ -412,48 +1003,6 @@ mod tests {
     }
 
     #[test]
-    fn every_new_remote_kind_parses_and_is_refused_not_yet() {
-        agent::state_dirs::redirect_state_to_a_test_root();
-        let dir = agent::state_dirs::test_workspace_dir("remote-not-yet");
-        let (handle, base, _second) = handle_with_two_pages();
-        let (tab, provider, key) = interruptible_tab(&handle, &dir);
-        start_turn(&handle, tab, &provider, "t1");
-        clear(&[&base]);
-        let kinds = [
-            serde_json::json!({ "type": "send", "command_id": "n1", "text": "hello" }),
-            serde_json::json!({ "type": "queue", "command_id": "n2", "text": "later" }),
-            serde_json::json!({ "type": "stop_background", "command_id": "n3" }),
-            serde_json::json!({ "type": "stop_task", "command_id": "n4", "task": "b7" }),
-            serde_json::json!({ "type": "take_back", "command_id": "n5" }),
-        ];
-        for kind in kinds {
-            let raw = kind.to_string();
-            let parsed = parse_remote_inbound(&raw).unwrap_or_else(|e| panic!("{raw}: {e:?}"));
-            assert_eq!(parsed.command_id(), kind["command_id"].as_str().unwrap());
-            assert_eq!(
-                handle.remote_message(&phone(), &key, &raw),
-                Err(RemoteRefusal::NotYet),
-                "{raw}"
-            );
-            let mut extra = kind.clone();
-            extra["tab"] = serde_json::json!(3);
-            assert_eq!(
-                parse_remote_inbound(&extra.to_string()),
-                Err(RemoteRefusal::Parse),
-                "{extra}"
-            );
-        }
-        assert_eq!(provider.interrupts(), 0, "nothing reached the agent");
-        assert_eq!(active_turn(&handle, tab).as_deref(), Some("t1"));
-        handle.tick();
-        assert!(
-            notices(&base.sent.borrow()).is_empty(),
-            "the desk is told of nothing that was not done"
-        );
-        shut_down_every_tab(&handle);
-    }
-
-    #[test]
     fn remote_text_is_bounded() {
         assert_eq!(REMOTE_TEXT_MAX_BYTES, 64 * 1024);
         let fits = serde_json::json!({ "type": "send", "command_id": "t1", "text": "a".repeat(REMOTE_TEXT_MAX_BYTES) });
@@ -470,9 +1019,18 @@ mod tests {
         );
         let over =
             serde_json::json!({ "type": "send", "command_id": "t3", "text": "a".repeat(REMOTE_TEXT_MAX_BYTES + 1) });
-        assert_eq!(parse_remote_inbound(&over.to_string()), Err(RemoteRefusal::Parse));
+        assert_eq!(parse_remote_inbound(&over.to_string()), Err(RemoteRefusal::TooLong));
         let long_id = serde_json::json!({ "type": "take_back", "command_id": "c".repeat(65) });
         assert_eq!(parse_remote_inbound(&long_id.to_string()), Err(RemoteRefusal::Parse));
+        let unread = format!(
+            r#"{{"type":"send","command_id":"t4","text":"{}"}}"#,
+            "a".repeat(REMOTE_MESSAGE_MAX_BYTES)
+        );
+        assert_eq!(
+            parse_remote_inbound(&unread),
+            Err(RemoteRefusal::Parse),
+            "too long to read"
+        );
     }
 
     #[test]
@@ -491,7 +1049,12 @@ mod tests {
         );
 
         assert_eq!(
-            handle.remote_message(&phone(), &first_key, &interrupt("c1", turn(&handle, first, "t1"))),
+            settle(
+                &handle,
+                &phone(),
+                &first_key,
+                &interrupt("c1", turn(&handle, first, "t1"))
+            ),
             Ok(())
         );
         assert_eq!(first_provider.interrupts(), 1, "the tab with that key stopped");
@@ -557,7 +1120,7 @@ mod tests {
         assert_eq!(next.interrupts(), 0, "the new session's turn was not stopped");
         assert_eq!(active_turn(&handle, tab).as_deref(), Some("t1"));
         assert_eq!(
-            handle.remote_message(&phone(), &key, &interrupt("c2", turn(&handle, tab, "t1"))),
+            settle(&handle, &phone(), &key, &interrupt("c2", turn(&handle, tab, "t1"))),
             Ok(()),
             "a stop naming this session's turn stops it"
         );
@@ -586,7 +1149,12 @@ mod tests {
         );
         assert_eq!(provider.interrupts(), 0, "nothing stopped");
         assert_eq!(
-            handle.remote_message(&phone(), &key, &interrupt("c2", serde_json::json!({ "unseen": 2 }))),
+            settle(
+                &handle,
+                &phone(),
+                &key,
+                &interrupt("c2", serde_json::json!({ "unseen": 2 }))
+            ),
             Ok(()),
             "the stretch running now is stopped"
         );
@@ -601,21 +1169,11 @@ mod tests {
         let (handle, base, _second) = handle_with_two_pages();
         let (tab, provider, key) = interruptible_tab(&handle, &dir);
         handle.tick();
-        for round in 0..3 {
-            if mode_of(&handle, tab) == SessionModeChoice::Bypass {
-                break;
-            }
-            clear(&[&base]);
-            cycle_mode_from(&handle, ViewId::BASE, &format!("m{round}"), tab);
-            if let Some((_, nonce)) = last_bypass_prompt(&base) {
-                confirm_bypass_from(&handle, ViewId::BASE, &format!("y{round}"), tab, nonce);
-            }
-        }
-        assert_eq!(mode_of(&handle, tab), SessionModeChoice::Bypass);
+        set_mode(&handle, &base, tab, SessionModeChoice::Bypass);
         start_turn(&handle, tab, &provider, "t1");
 
         assert_eq!(
-            handle.remote_message(&phone(), &key, &interrupt("c1", turn(&handle, tab, "t1"))),
+            settle(&handle, &phone(), &key, &interrupt("c1", turn(&handle, tab, "t1"))),
             Ok(())
         );
         assert_eq!(provider.interrupts(), 1, "the running turn was stopped");
@@ -637,7 +1195,7 @@ mod tests {
         start_turn(&handle, tab, &provider, "t1");
 
         assert_eq!(
-            handle.remote_message(&phone(), &key, &interrupt("c1", turn(&handle, tab, "t1"))),
+            settle(&handle, &phone(), &key, &interrupt("c1", turn(&handle, tab, "t1"))),
             Ok(())
         );
         assert_eq!(provider.interrupts(), 1, "the agent's turn was stopped");
@@ -664,7 +1222,7 @@ mod tests {
         tick_handle_until(&handle, "the card", || waiting(&handle, tab, "perm-1"));
 
         assert_eq!(
-            handle.remote_message(&phone(), &key, &interrupt("c1", turn(&handle, tab, "t1"))),
+            settle(&handle, &phone(), &key, &interrupt("c1", turn(&handle, tab, "t1"))),
             Ok(())
         );
         for _ in 0..5 {
@@ -694,7 +1252,7 @@ mod tests {
         clear(&[&base, &second]);
 
         assert_eq!(
-            handle.remote_message(&phone(), &key, &interrupt("c1", turn(&handle, tab, "t1"))),
+            settle(&handle, &phone(), &key, &interrupt("c1", turn(&handle, tab, "t1"))),
             Ok(())
         );
         handle.tick();
@@ -705,8 +1263,7 @@ mod tests {
             );
         }
         let told = notices(&base.sent.borrow());
-        assert_eq!(told.len(), 1, "one notice: {told:?}");
-        assert!(told[0].contains("Pixel 8"), "it names the device: {told:?}");
+        assert_eq!(told, ["stopped from Pixel 8"], "one notice, naming the device");
         assert!(
             notices(&second.sent.borrow()).is_empty(),
             "a page that does not show the tab is told nothing"
@@ -723,7 +1280,7 @@ mod tests {
         start_turn(&handle, tab, &provider, "t1");
         let stop = interrupt("c1", turn(&handle, tab, "t1"));
 
-        assert_eq!(handle.remote_message(&phone(), &key, &stop), Ok(()));
+        assert_eq!(settle(&handle, &phone(), &key, &stop), Ok(()));
         assert_eq!(
             handle.remote_message(&phone(), &key, &stop),
             Err(RemoteRefusal::Duplicate)
@@ -741,7 +1298,7 @@ mod tests {
             conn: 3,
         };
         assert_eq!(
-            handle.remote_message(&other, &key, &stop),
+            settle(&handle, &other, &key, &stop),
             Ok(()),
             "another device's ids are its own"
         );
@@ -788,7 +1345,12 @@ mod tests {
         assert_eq!(provider.interrupts(), 0, "the second stretch was not stopped");
         tick_handle_until(&handle, "the second stretch", || unseen(&handle, tab) == (true, 2));
         assert_eq!(
-            handle.remote_message(&phone(), &key, &interrupt("c2", serde_json::json!({ "unseen": 2 }))),
+            settle(
+                &handle,
+                &phone(),
+                &key,
+                &interrupt("c2", serde_json::json!({ "unseen": 2 }))
+            ),
             Ok(()),
             "once counted, the stretch running now is stopped"
         );
@@ -804,7 +1366,7 @@ mod tests {
         let (tab, provider, key) = interruptible_tab(&first, &dir);
         start_turn(&first, tab, &provider, "t1");
         let stop = interrupt("c1", turn(&first, tab, "t1"));
-        assert_eq!(first.remote_message(&phone(), &key, &stop), Ok(()));
+        assert_eq!(settle(&first, &phone(), &key, &stop), Ok(()));
 
         let (other, _other_base, _other_second) = handle_with_two_pages();
         let (other_tab, other_provider, other_key) = interruptible_tab(&other, &dir);
@@ -823,5 +1385,918 @@ mod tests {
         );
         assert_eq!(other_provider.interrupts(), 0, "nothing stopped by a repeated id");
         shut_down_every_tab(&other);
+    }
+
+    // ---- the remaining arms ------------------------------------------------------------------------------
+
+    #[test]
+    fn send_reaches_an_idle_manual_tab() {
+        agent::state_dirs::redirect_state_to_a_test_root();
+        let dir = agent::state_dirs::test_workspace_dir("remote-send-manual");
+        let (handle, base, second) = handle_with_two_pages();
+        let (tab, provider, key) = interruptible_tab(&handle, &dir);
+        handle.tick();
+        set_mode(&handle, &base, tab, SessionModeChoice::Manual);
+        clear(&[&base, &second]);
+
+        assert_eq!(settle(&handle, &phone(), &key, &send("s1", "fix the test")), Ok(()));
+        assert_eq!(provider.turns(), ["fix the test"], "sent as it came");
+        let stamps = provider.turn_stamps();
+        assert!(
+            stamps.iter().all(|stamp| !stamp.typed_by_person),
+            "not marked as typed at the desk: {stamps:?}"
+        );
+        handle.tick();
+        assert_eq!(notices(&base.sent.borrow()), ["sent from Pixel 8"]);
+        assert!(
+            base.sent.borrow().iter().all(|p| kind_of(p) != "command_result"),
+            "no page is answered for it"
+        );
+        assert!(notices(&second.sent.borrow()).is_empty());
+        shut_down_every_tab(&handle);
+    }
+
+    #[test]
+    fn send_reaches_an_auto_tab() {
+        agent::state_dirs::redirect_state_to_a_test_root();
+        let dir = agent::state_dirs::test_workspace_dir("remote-send-auto");
+        let (handle, base, _second) = handle_with_two_pages();
+        let (tab, provider, key) = interruptible_tab(&handle, &dir);
+        handle.tick();
+        set_mode(&handle, &base, tab, SessionModeChoice::Auto);
+
+        assert_eq!(settle(&handle, &phone(), &key, &send("s1", "go on")), Ok(()));
+        assert_eq!(provider.turns(), ["go on"]);
+        shut_down_every_tab(&handle);
+    }
+
+    #[test]
+    fn send_refused_in_bypass() {
+        agent::state_dirs::redirect_state_to_a_test_root();
+        let dir = agent::state_dirs::test_workspace_dir("remote-send-bypass");
+        let (handle, base, _second) = handle_with_two_pages();
+        let (tab, provider, key) = interruptible_tab(&handle, &dir);
+        handle.tick();
+        set_mode(&handle, &base, tab, SessionModeChoice::Bypass);
+
+        assert_eq!(
+            handle.remote_message(&phone(), &key, &send("s1", "go on")),
+            Err(RemoteRefusal::ModeNotAllowed)
+        );
+        start_turn(&handle, tab, &provider, "t1");
+        assert_eq!(
+            handle.remote_message(&phone(), &key, &queue("q1", "and then")),
+            Err(RemoteRefusal::ModeNotAllowed)
+        );
+        handle.tick();
+        assert!(provider.turns().is_empty(), "nothing was sent");
+        assert!(queued_texts(&handle, tab).is_empty(), "nothing was queued");
+        shut_down_every_tab(&handle);
+    }
+
+    #[test]
+    fn send_refused_to_a_codex_tab() {
+        agent::state_dirs::redirect_state_to_a_test_root();
+        let (handle, _base, _second) = handle_with_two_pages();
+        let (tab, key) = {
+            let mut state = handle.state.borrow_mut();
+            let tab = state.tabs.open(AgentId::Codex);
+            let key = state.tabs.get(tab).unwrap().row_key().clone();
+            (tab, key)
+        };
+        for message in [send("s1", "hello"), queue("q1", "hello")] {
+            assert_eq!(
+                handle.remote_message(&phone(), &key, &message),
+                Err(RemoteRefusal::NotClaude),
+                "{message}"
+            );
+        }
+        assert!(not_started(&handle, tab), "no session starts");
+        shut_down_every_tab(&handle);
+    }
+
+    #[test]
+    fn send_refused_to_an_unstarted_tab() {
+        agent::state_dirs::redirect_state_to_a_test_root();
+        let (handle, base, _second) = handle_with_two_pages();
+        let (tab, key) = {
+            let mut state = handle.state.borrow_mut();
+            let tab = state.tabs.open(AgentId::Claude);
+            let key = state.tabs.get(tab).unwrap().row_key().clone();
+            (tab, key)
+        };
+        for message in [send("s1", "hello"), queue("q1", "hello")] {
+            assert_eq!(
+                handle.remote_message(&phone(), &key, &message),
+                Err(RemoteRefusal::NotStarted),
+                "{message}"
+            );
+        }
+        for _ in 0..3 {
+            handle.tick();
+        }
+        assert!(not_started(&handle, tab), "no session starts");
+        assert!(
+            !handle.state.borrow().tabs.awaiting_trust().contains(&tab),
+            "no trust question is asked for it"
+        );
+        assert!(notices(&base.sent.borrow()).is_empty());
+        shut_down_every_tab(&handle);
+    }
+
+    #[test]
+    fn slash_and_bang_are_refused() {
+        agent::state_dirs::redirect_state_to_a_test_root();
+        let dir = agent::state_dirs::test_workspace_dir("remote-slash-bang");
+        let (handle, _base, _second) = handle_with_two_pages();
+        let (tab, provider, key) = interruptible_tab(&handle, &dir);
+        handle.tick();
+        for (n, text) in [
+            "/model opus",
+            "!rm -rf build",
+            "   /compact",
+            "\n\t !ls",
+            "\u{3000}/help",
+        ]
+        .iter()
+        .enumerate()
+        {
+            assert_eq!(
+                handle.remote_message(&phone(), &key, &send(&format!("s{n}"), text)),
+                Err(RemoteRefusal::SlashOrBang),
+                "{text:?}"
+            );
+        }
+        start_turn(&handle, tab, &provider, "t1");
+        assert_eq!(
+            handle.remote_message(&phone(), &key, &queue("q1", "  /clear")),
+            Err(RemoteRefusal::SlashOrBang)
+        );
+        handle.tick();
+        assert!(provider.turns().is_empty(), "nothing was sent");
+        assert!(queued_texts(&handle, tab).is_empty(), "nothing was queued");
+        shut_down_every_tab(&handle);
+    }
+
+    #[test]
+    fn at_words_stay_literal_and_read_no_buffers() {
+        agent::state_dirs::redirect_state_to_a_test_root();
+        let dir = agent::state_dirs::test_workspace_dir("remote-at-words");
+        let (handle, _base, _second) = handle_with_two_pages();
+        let (tab, provider, key) = interruptible_tab(&handle, &dir);
+        handle.tick();
+        // The context fails the test if it is read at all; the editor records any question it is asked.
+        let editor = Rc::new(eitri_core::editor_tools::testing::FakeEditor::default());
+        let context = {
+            let mut state = handle.state.borrow_mut();
+            state.editor_rpc = Some(editor.clone());
+            std::mem::replace(
+                &mut state.editor_context,
+                Rc::new(|| panic!("a phone's message read the editor's context")),
+            )
+        };
+        let text = "look at @buffers and @diagnostics";
+        let accepted = handle.remote_message(&phone(), &key, &send("s1", text));
+        handle.state.borrow_mut().editor_context = context;
+        assert_eq!(accepted, Ok(RemoteAccepted::Pending));
+        assert!(editor.asked().is_empty(), "the editor was asked: {:?}", editor.asked());
+        assert!(
+            !handle.state.borrow().mentions.is_waiting(),
+            "nothing waits for the editor"
+        );
+        assert_eq!(result_of(&handle, "s1").outcome, Ok(()));
+        assert_eq!(provider.turns(), [text], "the words went as they came");
+        assert!(editor.asked().is_empty(), "the editor was asked: {:?}", editor.asked());
+        assert!(handle.state.borrow().tabs.get(tab).is_some());
+        shut_down_every_tab(&handle);
+    }
+
+    #[test]
+    fn desk_draft_and_history_untouched() {
+        agent::state_dirs::redirect_state_to_a_test_root();
+        let dir = agent::state_dirs::test_workspace_dir("remote-draft-history");
+        let (handle, base, _second) = handle_with_two_pages();
+        let (tab, provider, key) = interruptible_tab(&handle, &dir);
+        handle.tick();
+        handle.state.borrow_mut().tabs.set_draft(tab, "half a thought");
+        let history = handle.state.borrow().history.clone();
+        clear(&[&base]);
+
+        assert_eq!(settle(&handle, &phone(), &key, &send("s1", "from afar")), Ok(()));
+        provider.queue(agent::AgentDomainEvent::TurnStarted { turn_id: "t1".into() });
+        tick_handle_until(&handle, "the turn", || active_turn(&handle, tab).is_some());
+        assert_eq!(settle(&handle, &phone(), &key, &queue("q1", "and more")), Ok(()));
+        handle.tick();
+
+        let state = handle.state.borrow();
+        assert_eq!(
+            state.tabs.get(tab).unwrap().draft(),
+            "half a thought",
+            "the desk's draft"
+        );
+        assert_eq!(state.history, history, "the desk's history");
+        assert!(
+            base.sent.borrow().iter().all(|p| kind_of(p) != "history"),
+            "no history goes to the page"
+        );
+        drop(state);
+        shut_down_every_tab(&handle);
+    }
+
+    #[test]
+    fn queue_waits_for_the_turn_and_goes_at_its_end() {
+        agent::state_dirs::redirect_state_to_a_test_root();
+        let dir = agent::state_dirs::test_workspace_dir("remote-queue-goes");
+        let (handle, base, _second) = handle_with_two_pages();
+        let (tab, provider, key) = interruptible_tab(&handle, &dir);
+        handle.tick();
+        set_mode(&handle, &base, tab, SessionModeChoice::Auto);
+        assert_eq!(
+            handle.remote_message(&phone(), &key, &queue("q0", "nothing runs")),
+            Err(RemoteRefusal::WorkChanged),
+            "a queue with no turn running"
+        );
+        start_turn(&handle, tab, &provider, "t1");
+        clear(&[&base]);
+        assert_eq!(
+            handle.remote_message(&phone(), &key, &queue("q1", "then this")),
+            Ok(RemoteAccepted::Done)
+        );
+        assert_eq!(
+            handle.remote_message(&phone(), &key, &send("s1", "now")),
+            Err(RemoteRefusal::WorkChanged),
+            "a send while a turn runs"
+        );
+        assert_eq!(queued_texts(&handle, tab), ["then this"]);
+        assert_eq!(notices(&base.sent.borrow()), ["queued from Pixel 8"]);
+        // Narrower is no wider: it still goes.
+        set_mode(&handle, &base, tab, SessionModeChoice::Bypass);
+        set_mode(&handle, &base, tab, SessionModeChoice::Manual);
+        end_turn(&handle, tab, &provider, "t1");
+        tick_handle_until(&handle, "the queued message", || provider.turns().len() == 1);
+        assert_eq!(provider.turns(), ["then this"]);
+        assert!(queued_texts(&handle, tab).is_empty());
+        shut_down_every_tab(&handle);
+    }
+
+    #[test]
+    fn queued_phone_message_is_refused_when_the_mode_widened() {
+        agent::state_dirs::redirect_state_to_a_test_root();
+        for (from, to) in [
+            (SessionModeChoice::Manual, SessionModeChoice::Auto),
+            (SessionModeChoice::Auto, SessionModeChoice::Bypass),
+        ] {
+            let dir = agent::state_dirs::test_workspace_dir(&format!("remote-widened-{from:?}"));
+            let (handle, base, _second) = handle_with_two_pages();
+            let (tab, provider, key) = interruptible_tab(&handle, &dir);
+            handle.tick();
+            set_mode(&handle, &base, tab, from);
+            start_turn(&handle, tab, &provider, "t1");
+            let id = format!("q-{from:?}");
+            assert_eq!(
+                handle.remote_message(&phone(), &key, &queue(&id, "do it")),
+                Ok(RemoteAccepted::Done)
+            );
+            // A desk message queued behind it is the desk's, and goes whatever the mode.
+            handle.page_message(
+                ViewId::BASE,
+                &serde_json::json!({ "type": "queue_message", "request_id": "r1", "tab": tab.0, "text": "mine" })
+                    .to_string(),
+            );
+            set_mode(&handle, &base, tab, to);
+            clear(&[&base]);
+            end_turn(&handle, tab, &provider, "t1");
+            let refused = result_of(&handle, &id);
+            assert_eq!(
+                refused.outcome,
+                Err(RemoteRefusal::ModeNotAllowed),
+                "{from:?} -> {to:?}"
+            );
+            assert_eq!(refused.conn, phone().conn);
+            tick_handle_until(&handle, "the desk's message", || !provider.turns().is_empty());
+            assert_eq!(provider.turns(), ["mine"], "only the desk's went: {from:?} -> {to:?}");
+            let told = notices(&base.sent.borrow());
+            assert!(
+                told.iter()
+                    .any(|n| n.contains("Pixel 8") && n.contains("not sent") && n.contains(&format!("{to:?}"))),
+                "the desk is told: {told:?}"
+            );
+            shut_down_every_tab(&handle);
+        }
+    }
+
+    #[test]
+    fn take_back_returns_only_this_devices_items() {
+        agent::state_dirs::redirect_state_to_a_test_root();
+        let dir = agent::state_dirs::test_workspace_dir("remote-take-back");
+        let (handle, base, _second) = handle_with_two_pages();
+        let (tab, provider, key) = interruptible_tab(&handle, &dir);
+        handle.tick();
+        set_mode(&handle, &base, tab, SessionModeChoice::Manual);
+        start_turn(&handle, tab, &provider, "t1");
+        let tablet = RemoteOrigin {
+            device_id: "d2".into(),
+            device: "Pixel 8".into(),
+            conn: 2,
+        };
+        assert_eq!(
+            handle.remote_message(
+                &phone(),
+                &key,
+                &serde_json::json!({ "type": "take_back", "command_id": "b0" }).to_string()
+            ),
+            Err(RemoteRefusal::NotYours),
+            "nothing queued yet"
+        );
+        handle.remote_message(&phone(), &key, &queue("q1", "mine 1")).unwrap();
+        handle.page_message(
+            ViewId::BASE,
+            &serde_json::json!({ "type": "queue_message", "request_id": "r1", "tab": tab.0, "text": "the desk's" })
+                .to_string(),
+        );
+        handle
+            .remote_message(&tablet, &key, &queue("q2", "same name, other device"))
+            .unwrap();
+        handle.remote_message(&phone(), &key, &queue("q3", "mine 2")).unwrap();
+        clear(&[&base]);
+
+        let take_back = serde_json::json!({ "type": "take_back", "command_id": "b1" }).to_string();
+        assert_eq!(
+            handle.remote_message(&phone(), &key, &take_back),
+            Ok(RemoteAccepted::Done)
+        );
+        assert_eq!(
+            queued_texts(&handle, tab),
+            ["the desk's", "same name, other device"],
+            "only device d1's items left"
+        );
+        let told = notices(&base.sent.borrow());
+        assert_eq!(told, ["Pixel 8 took back its 2 queued messages"]);
+        assert!(
+            base.sent.borrow().iter().any(|p| kind_of(p) == "queue"),
+            "the page is sent the queue"
+        );
+        assert_eq!(
+            handle.remote_message(
+                &phone(),
+                &key,
+                &serde_json::json!({ "type": "take_back", "command_id": "b2" }).to_string()
+            ),
+            Err(RemoteRefusal::NotYours),
+            "nothing of d1's is left"
+        );
+        shut_down_every_tab(&handle);
+    }
+
+    #[test]
+    fn stop_background_refused_on_codex() {
+        agent::state_dirs::redirect_state_to_a_test_root();
+        let (handle, _base, _second) = handle_with_two_pages();
+        let key = {
+            let mut state = handle.state.borrow_mut();
+            let tab = state.tabs.open(AgentId::Codex);
+            state.tabs.get(tab).unwrap().row_key().clone()
+        };
+        for message in [
+            serde_json::json!({ "type": "stop_background", "command_id": "b1" }),
+            serde_json::json!({ "type": "stop_task", "command_id": "b2", "task": "t" }),
+        ] {
+            assert_eq!(
+                handle.remote_message(&phone(), &key, &message.to_string()),
+                Err(RemoteRefusal::NotClaude),
+                "{message}"
+            );
+        }
+        shut_down_every_tab(&handle);
+    }
+
+    /// One command left running in the background, as the roster and the count report it.
+    fn background_task(id: &str) -> Vec<agent::AgentDomainEvent> {
+        vec![
+            agent::AgentDomainEvent::BackgroundTasksChanged {
+                tasks: vec![agent::BackgroundTask {
+                    task_id: id.into(),
+                    run_id: None,
+                    kind: agent::TaskKind::Shell,
+                    task_type: "shell".into(),
+                    description: "watch the build".into(),
+                    subagent_type: None,
+                    parent_task_id: None,
+                    tool_use_id: None,
+                    ambient: false,
+                    workflow_name: None,
+                }],
+                occurred_at: None,
+            },
+            agent::AgentDomainEvent::BackgroundCalls { running: 1 },
+        ]
+    }
+
+    #[test]
+    fn stop_background_and_stop_task_leave_the_desk_a_notice() {
+        agent::state_dirs::redirect_state_to_a_test_root();
+        let dir = agent::state_dirs::test_workspace_dir("remote-stop-background");
+        let (handle, base, _second) = handle_with_two_pages();
+        let (tab, provider, key) = tab_of(&handle, &dir, RecordingProvider::task_controlling());
+        handle.tick();
+        assert_eq!(
+            handle.remote_message(
+                &phone(),
+                &key,
+                &serde_json::json!({ "type": "stop_task", "command_id": "k0", "task": "b9" }).to_string()
+            ),
+            Err(RemoteRefusal::WorkChanged),
+            "a task that is not listed"
+        );
+        provider.queue_all(background_task("b7"));
+        tick_handle_until(&handle, "the task", || {
+            let state = handle.state.borrow();
+            let listed = state
+                .tabs
+                .get(tab)
+                .unwrap()
+                .live()
+                .unwrap()
+                .projection()
+                .background_calls
+                > 0;
+            listed
+        });
+        clear(&[&base]);
+        let stop_task = serde_json::json!({ "type": "stop_task", "command_id": "k1", "task": "b7" }).to_string();
+        assert_eq!(settle(&handle, &phone(), &key, &stop_task), Ok(()));
+        assert_eq!(provider.stopped_tasks(), ["b7"]);
+        let stop_all = serde_json::json!({ "type": "stop_background", "command_id": "k2" }).to_string();
+        assert_eq!(settle(&handle, &phone(), &key, &stop_all), Ok(()));
+        assert_eq!(provider.stopped_tasks(), ["b7", "b7"]);
+        handle.tick();
+        assert_eq!(
+            notices(&base.sent.borrow()),
+            [
+                "a background task stopped from Pixel 8",
+                "background work stopped from Pixel 8"
+            ]
+        );
+        shut_down_every_tab(&handle);
+    }
+
+    #[test]
+    fn interrupt_returns_pending_while_the_provider_blocks() {
+        agent::state_dirs::redirect_state_to_a_test_root();
+        let dir = agent::state_dirs::test_workspace_dir("remote-interrupt-blocks");
+        let (handle, base, _second) = handle_with_two_pages();
+        let (tab, provider, key) = interruptible_tab(&handle, &dir);
+        start_turn(&handle, tab, &provider, "t1");
+        clear(&[&base]);
+        let release = provider.hold_calls();
+
+        assert_eq!(
+            handle.remote_message(&phone(), &key, &interrupt("c1", turn(&handle, tab, "t1"))),
+            Ok(RemoteAccepted::Pending)
+        );
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while provider.calls_waiting() == 0 {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the call never reached the provider"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(2));
+        }
+        for _ in 0..3 {
+            handle.tick();
+        }
+        assert!(
+            handle.take_remote_results().is_empty(),
+            "no result while the provider waits"
+        );
+        assert_eq!(provider.interrupts(), 0, "the provider has not answered");
+        assert!(
+            notices(&base.sent.borrow()).is_empty(),
+            "nothing told before it was done"
+        );
+        // The ticks above came back while the call waited; the call is released only now.
+        drop(release);
+        let result = result_of(&handle, "c1");
+        assert_eq!(result.outcome, Ok(()));
+        assert_eq!(result.conn, phone().conn);
+        assert_eq!(provider.interrupts(), 1);
+        handle.tick();
+        assert_eq!(notices(&base.sent.borrow()), ["stopped from Pixel 8"]);
+        shut_down_every_tab(&handle);
+    }
+
+    #[test]
+    fn send_returns_pending_while_the_provider_blocks() {
+        agent::state_dirs::redirect_state_to_a_test_root();
+        let dir = agent::state_dirs::test_workspace_dir("remote-send-blocks");
+        let (handle, base, _second) = handle_with_two_pages();
+        let (tab, provider, key) = interruptible_tab(&handle, &dir);
+        handle.tick();
+        set_mode(&handle, &base, tab, SessionModeChoice::Manual);
+        clear(&[&base]);
+        let release = provider.hold_calls();
+
+        assert_eq!(
+            handle.remote_message(&phone(), &key, &send("s1", "hello")),
+            Ok(RemoteAccepted::Pending)
+        );
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while provider.calls_waiting() == 0 {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the call never reached the provider"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(2));
+        }
+        for _ in 0..3 {
+            handle.tick();
+        }
+        assert!(
+            handle.take_remote_results().is_empty(),
+            "no result while the provider waits"
+        );
+        assert!(handle.state.borrow().tabs.remote_send_waits(tab));
+        assert_eq!(
+            handle.remote_message(&phone(), &key, &send("s2", "again")),
+            Err(RemoteRefusal::Busy(eitri_core::tab_set::SEND_HELD.to_string())),
+            "one send of a tab at a time"
+        );
+        assert!(provider.turns().is_empty(), "the provider has not taken it");
+        drop(release);
+        assert_eq!(result_of(&handle, "s1").outcome, Ok(()));
+        assert_eq!(provider.turns(), ["hello"]);
+        assert!(!handle.state.borrow().tabs.remote_send_waits(tab));
+        handle.tick();
+        assert_eq!(notices(&base.sent.borrow()), ["sent from Pixel 8"]);
+        shut_down_every_tab(&handle);
+    }
+
+    #[test]
+    fn a_failed_remote_stop_reaches_the_phone() {
+        agent::state_dirs::redirect_state_to_a_test_root();
+        let dir = agent::state_dirs::test_workspace_dir("remote-stop-unsupported");
+        let (handle, base, _second) = handle_with_two_pages();
+        // A provider that cannot interrupt: refused at once, through the same path as the provider's answer, and
+        // handled as the desk's stop handles it.
+        let (tab, provider, key) = tab_of(&handle, &dir, RecordingProvider::default());
+        start_turn(&handle, tab, &provider, "t1");
+        clear(&[&base]);
+        let refused = settle(&handle, &phone(), &key, &interrupt("c1", turn(&handle, tab, "t1")));
+        assert!(matches!(refused, Err(RemoteRefusal::Agent(_))), "{refused:?}");
+        handle.tick();
+        assert!(
+            notices(&base.sent.borrow()).iter().all(|n| !n.contains("stopped from")),
+            "nothing was stopped"
+        );
+        assert_eq!(provider.interrupts(), 0);
+        shut_down_every_tab(&handle);
+    }
+
+    /// A Claude tab over `provider`, opened (so selected) in the base view, out of Bypass, and its row key.
+    fn tab_over(
+        handle: &AgentPanelHandle,
+        base: &Rc<RecordingPage>,
+        dir: &Path,
+        provider: &std::sync::Arc<RecordingProvider>,
+    ) -> (TabId, RowKey) {
+        let conversation = agent::AgentConversation::create(provider.clone(), dir, ProjectTrust::Untrusted).unwrap();
+        let backend = AgentBackend::Conversation {
+            agent: AgentId::Claude,
+            conversation: Box::new(conversation),
+        };
+        let (tab, key) = {
+            let mut state = handle.state.borrow_mut();
+            let tab = state.tabs.open(AgentId::Claude);
+            let held = state.tabs.get_mut(tab).unwrap();
+            held.set_backend(TabBackend::Live(backend));
+            (tab, held.row_key().clone())
+        };
+        handle.tick();
+        if mode_of(handle, tab) == SessionModeChoice::Bypass {
+            set_mode(handle, base, tab, SessionModeChoice::Manual);
+        }
+        (tab, key)
+    }
+
+    #[test]
+    fn the_phones_sends_count_against_the_windows_bound_on_calls() {
+        agent::state_dirs::redirect_state_to_a_test_root();
+        let dir = agent::state_dirs::test_workspace_dir("remote-calls-bound");
+        let (handle, base, _second) = handle_with_two_pages();
+        let provider = std::sync::Arc::new(RecordingProvider::interruptible());
+        let release = provider.hold_calls();
+        let tabs: Vec<(TabId, RowKey)> = (0..=REMOTE_CALLS_MAX)
+            .map(|_| tab_over(&handle, &base, &dir, &provider))
+            .collect();
+        for (n, (_, key)) in tabs.iter().take(REMOTE_CALLS_MAX).enumerate() {
+            assert_eq!(
+                handle.remote_message(&phone(), key, &send(&format!("s{n}"), "hello")),
+                Ok(RemoteAccepted::Pending),
+                "send {n}"
+            );
+        }
+        let (_, last) = tabs.last().unwrap();
+        assert!(
+            matches!(
+                handle.remote_message(&phone(), last, &send("over", "hello")),
+                Err(RemoteRefusal::Busy(_))
+            ),
+            "a send past the bound makes no call"
+        );
+        drop(release);
+        let mut results = HashMap::new();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while results.len() < REMOTE_CALLS_MAX {
+            assert!(std::time::Instant::now() < deadline, "results so far: {results:?}");
+            handle.tick();
+            results.extend(
+                handle
+                    .take_remote_results()
+                    .into_iter()
+                    .map(|result| (result.command_id, result.outcome)),
+            );
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        assert!(results.values().all(Result::is_ok), "{results:?}");
+        assert!(!results.contains_key("over"));
+        assert_eq!(provider.turns().len(), REMOTE_CALLS_MAX);
+        shut_down_every_tab(&handle);
+    }
+
+    #[test]
+    fn a_notice_for_a_tab_no_page_shows_waits_until_one_does() {
+        agent::state_dirs::redirect_state_to_a_test_root();
+        let dir = agent::state_dirs::test_workspace_dir("remote-notice-owed");
+        let (handle, base, _second) = handle_with_two_pages();
+        let provider = std::sync::Arc::new(RecordingProvider::interruptible());
+        let (first, key) = tab_over(&handle, &base, &dir, &provider);
+        let (_shown, _) = tab_over(
+            &handle,
+            &base,
+            &dir,
+            &std::sync::Arc::new(RecordingProvider::interruptible()),
+        );
+        clear(&[&base]);
+        assert_eq!(settle(&handle, &phone(), &key, &send("s1", "from afar")), Ok(()));
+        handle.tick();
+        assert!(
+            notices(&base.sent.borrow()).iter().all(|n| !n.contains("Pixel 8")),
+            "the tab is in the background"
+        );
+        assert!(handle.select_tab(first));
+        handle.tick();
+        let told = notices(&base.sent.borrow());
+        assert_eq!(
+            told.iter().filter(|n| *n == "sent from Pixel 8").count(),
+            1,
+            "said once the tab is shown: {told:?}"
+        );
+        handle.tick();
+        assert_eq!(notices(&base.sent.borrow()), told, "and only once");
+        shut_down_every_tab(&handle);
+    }
+
+    #[test]
+    fn a_stop_answered_after_its_session_was_replaced_leaves_the_new_session_alone() {
+        agent::state_dirs::redirect_state_to_a_test_root();
+        let dir = agent::state_dirs::test_workspace_dir("remote-stop-replaced");
+        let (handle, base, _second) = handle_with_two_pages();
+        let (tab, provider, key) = interruptible_tab(&handle, &dir);
+        start_turn(&handle, tab, &provider, "t1");
+        let release = provider.hold_calls();
+        provider.fail_interrupts(true);
+        assert_eq!(
+            handle.remote_message(&phone(), &key, &interrupt("c1", turn(&handle, tab, "t1"))),
+            Ok(RemoteAccepted::Pending)
+        );
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while provider.calls_waiting() == 0 {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the call never reached the provider"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(2));
+        }
+        let fresh = replace_session(&handle, tab, &dir);
+        clear(&[&base]);
+        drop(release);
+        let result = result_of(&handle, "c1");
+        assert!(matches!(result.outcome, Err(RemoteRefusal::Agent(_))), "{result:?}");
+        handle.tick();
+        assert!(
+            matches!(
+                handle.state.borrow().tabs.get(tab).unwrap().backend(),
+                TabBackend::Live(_)
+            ),
+            "the old session's failure did not end the new one"
+        );
+        assert_eq!(fresh.closes(), 0);
+        assert!(notices(&base.sent.borrow()).iter().all(|n| !n.contains("Pixel 8")));
+        shut_down_every_tab(&handle);
+    }
+
+    #[test]
+    fn a_result_kept_raises_the_wake() {
+        agent::state_dirs::redirect_state_to_a_test_root();
+        let dir = agent::state_dirs::test_workspace_dir("remote-result-wake");
+        let (handle, _base, _second) = handle_with_two_pages();
+        let (tab, provider, key) = interruptible_tab(&handle, &dir);
+        start_turn(&handle, tab, &provider, "t1");
+        let release = provider.hold_calls();
+        assert_eq!(
+            handle.remote_message(&phone(), &key, &interrupt("c1", turn(&handle, tab, "t1"))),
+            Ok(RemoteAccepted::Pending)
+        );
+        drop(release);
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while provider.interrupts() == 0 {
+            assert!(std::time::Instant::now() < deadline, "the provider never answered");
+            std::thread::sleep(std::time::Duration::from_millis(2));
+        }
+        // The call's own wake has been raised by now; the socket's pump may have run before this tick.
+        std::thread::sleep(std::time::Duration::from_millis(50));
+        let woken = || handle.state.borrow().wake.as_ref().unwrap().take();
+        woken();
+        handle.tick();
+        assert_eq!(
+            handle.state.borrow().remote.results.len(),
+            1,
+            "the tick kept the result"
+        );
+        assert!(woken(), "the pump is woken to take it");
+        shut_down_every_tab(&handle);
+    }
+
+    /// A small fixed-seed generator: the same inputs on every run, and no new dependency.
+    struct Lcg(u64);
+
+    impl Lcg {
+        fn next(&mut self) -> u64 {
+            self.0 = self
+                .0
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            self.0 >> 33
+        }
+
+        fn below(&mut self, n: usize) -> usize {
+            (self.next() % n as u64) as usize
+        }
+
+        fn pick<'a, T>(&mut self, from: &'a [T]) -> &'a T {
+            &from[self.below(from.len())]
+        }
+    }
+
+    /// The fields each kind may carry, and what `expect_work` may hold.
+    fn known_fields(kind: &str) -> &'static [&'static str] {
+        match kind {
+            "interrupt" => &["type", "command_id", "expect_work"],
+            "send" | "queue" => &["type", "command_id", "text"],
+            "stop_background" | "take_back" => &["type", "command_id"],
+            "stop_task" => &["type", "command_id", "task"],
+            _ => &[],
+        }
+    }
+
+    /// Whether `value` uses only fields the grammar names, at every level.
+    fn only_known_fields(value: &serde_json::Value) -> bool {
+        let Some(object) = value.as_object() else { return false };
+        let kind = object.get("type").and_then(|t| t.as_str()).unwrap_or("");
+        let fields = known_fields(kind);
+        if !object.keys().all(|key| fields.contains(&key.as_str())) {
+            return false;
+        }
+        match object.get("expect_work") {
+            None => true,
+            Some(work) => match work.as_object() {
+                Some(work) if work.len() == 1 => match (work.get("turn"), work.get("unseen")) {
+                    (Some(turn), None) => turn
+                        .as_object()
+                        .is_some_and(|turn| turn.keys().all(|key| key == "id" || key == "generation")),
+                    (None, Some(_)) => true,
+                    _ => false,
+                },
+                _ => false,
+            },
+        }
+    }
+
+    fn random_value(rng: &mut Lcg, depth: usize) -> serde_json::Value {
+        let strings = ["", "t1", "/compact", "!ls", " /x", "c1", "\u{0}", "\u{1f600}", "a b"];
+        match rng.below(if depth > 1 { 5 } else { 7 }) {
+            0 => serde_json::Value::Null,
+            1 => serde_json::json!(rng.below(2) == 1),
+            2 => serde_json::json!(rng.next() as i64 - (1 << 30)),
+            3 => serde_json::json!(*rng.pick(&strings)),
+            4 => serde_json::json!(rng.below(1 << 20) as u64),
+            5 => serde_json::Value::Array((0..rng.below(3)).map(|_| random_value(rng, depth + 1)).collect()),
+            _ => random_object(rng, depth + 1),
+        }
+    }
+
+    fn random_object(rng: &mut Lcg, depth: usize) -> serde_json::Value {
+        let keys = [
+            "type",
+            "command_id",
+            "expect_work",
+            "text",
+            "task",
+            "turn",
+            "unseen",
+            "id",
+            "generation",
+            "tab",
+            "decision",
+            "permission_id",
+            "mode",
+            "v",
+        ];
+        let kinds = [
+            "interrupt",
+            "send",
+            "queue",
+            "stop_background",
+            "stop_task",
+            "take_back",
+            "permission_response",
+            "cycle_mode",
+            "confirm_bypass",
+            "run_shell",
+            "trust_answer",
+            "send_message",
+        ];
+        let mut object = serde_json::Map::new();
+        for _ in 0..rng.below(6) {
+            let key = *rng.pick(&keys);
+            let value = match key {
+                "type" => serde_json::json!(*rng.pick(&kinds)),
+                "command_id" if rng.below(4) > 0 => serde_json::json!(format!("c{}", rng.below(1000))),
+                "expect_work" if rng.below(3) > 0 => {
+                    if rng.below(2) == 0 {
+                        serde_json::json!({ "unseen": rng.below(9) })
+                    } else {
+                        serde_json::json!({ "turn": { "id": "t1", "generation": rng.below(3) } })
+                    }
+                }
+                _ => random_value(rng, depth),
+            };
+            object.insert(key.to_owned(), value);
+        }
+        serde_json::Value::Object(object)
+    }
+
+    /// A message the grammar takes, of a random kind.
+    fn valid_message(rng: &mut Lcg) -> serde_json::Value {
+        let id = format!("v{}", rng.below(1 << 16));
+        match rng.below(6) {
+            0 => serde_json::json!({ "type": "interrupt", "command_id": id, "expect_work": { "unseen": 1 } }),
+            1 => serde_json::json!({ "type": "send", "command_id": id, "text": "fix it" }),
+            2 => serde_json::json!({ "type": "queue", "command_id": id, "text": "then this" }),
+            3 => serde_json::json!({ "type": "stop_background", "command_id": id }),
+            4 => serde_json::json!({ "type": "stop_task", "command_id": id, "task": "b7" }),
+            _ => serde_json::json!({ "type": "take_back", "command_id": id }),
+        }
+    }
+
+    #[test]
+    fn remote_inbound_parsing_never_panics_and_never_takes_an_unknown_field() {
+        let mut rng = Lcg(0x5eed_7a5c_0007);
+        let mut taken = 0;
+        let extra = ["tab", "decision", "mode", "v", "seq", "answer", "allow"];
+        for round in 0..100_000 {
+            let raw = match round % 4 {
+                // Objects built from the grammar's own words and others.
+                0 | 1 => random_object(&mut rng, 0).to_string(),
+                // A message the grammar takes, with one field it does not name.
+                2 => {
+                    let mut message = valid_message(&mut rng);
+                    message[*rng.pick(&extra)] = random_value(&mut rng, 1);
+                    let raw = message.to_string();
+                    assert_eq!(parse_remote_inbound(&raw), Err(RemoteRefusal::Parse), "{raw}");
+                    raw
+                }
+                // A message the grammar takes, cut short or with bytes changed.
+                _ => {
+                    let mut bytes = valid_message(&mut rng).to_string().into_bytes();
+                    if rng.below(2) == 0 {
+                        bytes.truncate(rng.below(bytes.len() + 1));
+                    }
+                    for _ in 0..rng.below(4) {
+                        let at = rng.below(bytes.len().max(1));
+                        if let Some(byte) = bytes.get_mut(at) {
+                            *byte = rng.next() as u8;
+                        }
+                    }
+                    String::from_utf8_lossy(&bytes).into_owned()
+                }
+            };
+            if parse_remote_inbound(&raw).is_ok() {
+                taken += 1;
+                let value: serde_json::Value = serde_json::from_str(&raw).expect("what was taken is JSON");
+                assert!(only_known_fields(&value), "an unknown field was taken: {raw}");
+            }
+        }
+        assert!(taken > 1000, "the inputs reach the parser's accepting paths: {taken}");
     }
 }

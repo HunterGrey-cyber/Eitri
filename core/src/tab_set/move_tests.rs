@@ -1148,6 +1148,109 @@ fn a_prompt_released_by_the_presence_waits_behind_a_card_that_arrived_meanwhile(
     let _ = std::fs::remove_dir_all(&scratch);
 }
 
+fn phone() -> RemoteAsker {
+    RemoteAsker {
+        device_id: "d1".into(),
+        device: "Pixel 8".into(),
+        command_id: "s1".into(),
+        conn: Some(7),
+    }
+}
+
+/// A linked window whose presence never answers, with a live Claude tab in Auto: a send waits for the presence
+/// until the link ends.
+fn linked_with_a_waiting_presence(label: &str, pid: u32) -> (PathBuf, TabSet, TabId, Arc<RecordingProvider>) {
+    let scratch = scratch(label);
+    let dir = scratch.join("project");
+    let mut set = set();
+    let (holder, _parked) = PresenceHolder::start_parked(scratch.join("state/eitri/review/0123456789abcdef"), pid);
+    set.hold_presence(holder);
+    let (provider, tab) = live_tab(&mut set, &dir);
+    provider.queue(opened(&dir));
+    pump_until(&mut set, &dir, "the session", |s| {
+        s.get(tab).unwrap().live().unwrap().projection().status == agent::ProjectionStatus::Running
+    });
+    set.get_mut(tab).unwrap().set_mode_for_test(SessionModeChoice::Auto);
+    let _ = set.set_partner(Some(partner()));
+    (scratch, set, tab, provider)
+}
+
+/// A phone's send let go by the presence after the desk widened the tab's mode is refused, as the queue refuses
+/// one: nothing reaches the agent, and the phone is told why.
+#[test]
+fn a_phone_send_released_by_the_presence_is_refused_once_the_mode_widened() {
+    let (scratch, mut set, tab, provider) = linked_with_a_waiting_presence("move-remote-widened", 4252);
+    set.send_remote(tab, "phone words", phone()).unwrap();
+    assert!(set.send_is_held(tab), "linked, it waits for the presence");
+    set.get_mut(tab).unwrap().set_mode_for_test(SessionModeChoice::Bypass);
+    let _ = set.set_partner(None);
+    assert!(!set.remote_send_waits(tab), "no call was made");
+    assert!(provider.turns().is_empty(), "nothing reached the agent in Bypass");
+    let refused = set.take_remote_refused();
+    assert_eq!(refused.len(), 1);
+    assert_eq!(
+        (refused[0].accepted_mode, refused[0].mode),
+        (SessionModeChoice::Auto, SessionModeChoice::Bypass)
+    );
+    assert!(!set.send_is_held(tab) && !set.starting.contains(&tab.0));
+    shut_down(&mut set);
+    let _ = std::fs::remove_dir_all(&scratch);
+}
+
+/// A card that arrives while a phone's send waits for the presence holds the send back: the phone is told it did
+/// not go, and nothing goes into a session stopped on the user.
+#[test]
+fn a_phone_send_released_by_the_presence_is_not_sent_behind_a_card_that_arrived_meanwhile() {
+    let (scratch, mut set, tab, provider) = linked_with_a_waiting_presence("move-remote-card", 4253);
+    let dir = scratch.join("project");
+    set.send_remote(tab, "phone words", phone()).unwrap();
+    assert!(set.send_is_held(tab));
+    provider.queue(cli_prompt("card-1", "tool-1"));
+    pump_until(&mut set, &dir, "the card", |s| s.card_waits(tab));
+    let _ = set.set_partner(None);
+    assert!(!set.remote_send_waits(tab), "no call was made");
+    let told = set.poll_remote_sends();
+    assert!(
+        matches!(
+            &told[..],
+            [RemoteSent {
+                outcome: Err(_),
+                same_session: true,
+                ..
+            }]
+        ),
+        "the phone is told: {told:?}"
+    );
+    assert!(
+        provider.turns().is_empty(),
+        "nothing reached the agent while the card waits"
+    );
+    assert!(set.queue_texts(tab).is_empty(), "never put in the desk's queue");
+    assert!(!set.send_is_held(tab) && !set.starting.contains(&tab.0));
+    shut_down(&mut set);
+    let _ = std::fs::remove_dir_all(&scratch);
+}
+
+/// A phone's send still waiting for the presence when its tab closes is answered: it never went.
+#[test]
+fn a_phone_send_held_when_its_tab_closes_is_answered() {
+    let (scratch, mut set, tab, provider) = linked_with_a_waiting_presence("move-remote-closed", 4254);
+    set.send_remote(tab, "phone words", phone()).unwrap();
+    assert!(set.send_is_held(tab));
+    let removed = set.remove(tab).expect("the tab closes");
+    if let Some(retired) = removed.retired {
+        retired.into_backend().shutdown();
+    }
+    let told = set.poll_remote_sends();
+    assert_eq!(told.len(), 1, "the phone is told: {told:?}");
+    assert_eq!(told[0].tab, tab);
+    assert_eq!(told[0].asker, phone());
+    assert!(told[0].outcome.is_err());
+    assert!(provider.turns().is_empty());
+    shut_down(&mut set);
+    let _ = std::fs::remove_dir_all(&scratch);
+}
+
 #[test]
 fn a_prompt_held_when_this_window_closes_its_link_stays_unsent_in_its_queue() {
     let scratch = scratch("move-closing");

@@ -162,6 +162,7 @@ pub(super) fn tick_send(
     poll_scratch_edits(state, out);
     poll_review_jobs(state, out);
     poll_question_sends(state, out);
+    super::remote_entry::poll_remote(state, screen, out);
     super::editor_glue::poll(state, out);
     poll_proposal_jobs(state, out);
     poll_view_jobs(state, out);
@@ -400,6 +401,7 @@ pub(super) fn needs_polling(state: &AgentPanelState) -> bool {
         || !state.task_commands.is_empty()
         || !state.review_jobs.is_empty()
         || !state.question_sends.is_empty()
+        || state.remote.needs_polling()
         || !state.proposal_jobs.is_empty()
         || !state.view_jobs.is_empty()
         || !state.reset_checks.is_empty()
