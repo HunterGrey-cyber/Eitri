@@ -14,6 +14,9 @@ use std::collections::{HashMap, HashSet};
 /// Who sent a remote message: the device it was enrolled as and the connection it came on.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RemoteOrigin {
+    /// The device's id in the device store, which its command ids are kept under.
+    pub device_id: String,
+    /// The device's name, as the page that shows the tab is told it.
     pub device: String,
     pub conn: u64,
 }
@@ -153,6 +156,7 @@ mod tests {
 
     fn phone() -> RemoteOrigin {
         RemoteOrigin {
+            device_id: "d1".into(),
             device: "Pixel 8".into(),
             conn: 1,
         }
@@ -502,6 +506,7 @@ mod tests {
         );
         assert_eq!(provider.interrupts(), 1, "stopped once");
         let other = RemoteOrigin {
+            device_id: "d2".into(),
             device: "Tablet".into(),
             conn: 3,
         };

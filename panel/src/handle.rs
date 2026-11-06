@@ -466,7 +466,7 @@ impl AgentPanelHandle {
     ) -> Result<(), RemoteRefusal> {
         self.wake();
         let message = parse_remote_inbound(raw)?;
-        if !first_command_use(&origin.device, message.command_id()) {
+        if !first_command_use(&origin.device_id, message.command_id()) {
             return Err(RemoteRefusal::Duplicate);
         }
         // The window is closing and its tabs are gone.
@@ -477,8 +477,8 @@ impl AgentPanelHandle {
         let outcome = self.run(|state, out| handle_remote_message(state, &screen, origin, key, message, out));
         if let Err(why) = &outcome {
             eprintln!(
-                "[agent_panel] remote {} (connection {}): refused: {why:?}",
-                origin.device, origin.conn
+                "[agent_panel] remote {} ({}, connection {}): refused: {why:?}",
+                origin.device, origin.device_id, origin.conn
             );
         }
         outcome

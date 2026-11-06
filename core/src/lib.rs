@@ -60,6 +60,8 @@ pub mod project_root;
 pub mod project_trust;
 pub mod prompt_history;
 pub mod recent_projects;
+pub mod remote_devices;
+pub mod remote_rv;
 pub mod remote_wire;
 pub mod review_editor;
 #[cfg(target_os = "linux")]
