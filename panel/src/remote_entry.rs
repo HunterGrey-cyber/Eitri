@@ -8,8 +8,9 @@
 //! naming the device.
 
 use super::*;
+use eitri_core::remote_rv::COMMAND_ID_MAX_BYTES;
 use serde::Deserialize;
-use std::collections::{HashMap, HashSet};
+use std::collections::{HashMap, HashSet, VecDeque};
 
 /// Who sent a remote message: the device it was enrolled as and the connection it came on.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -45,13 +46,39 @@ pub enum RemoteInbound {
         command_id: String,
         expect_work: ExpectWork,
     },
+    /// Sends `text` as the tab's next turn.
+    Send { command_id: String, text: String },
+    /// Queues `text` behind the turn running in the tab.
+    Queue { command_id: String, text: String },
+    /// Stops the tab's background work.
+    StopBackground { command_id: String },
+    /// Stops the tab's background task `task`.
+    StopTask { command_id: String, task: String },
+    /// Takes this device's queued items back out of the tab's queue.
+    TakeBack { command_id: String },
 }
 
 impl RemoteInbound {
     /// The id the sender gave this command; each is taken once per device.
     pub fn command_id(&self) -> &str {
         match self {
-            RemoteInbound::Interrupt { command_id, .. } => command_id,
+            RemoteInbound::Interrupt { command_id, .. }
+            | RemoteInbound::Send { command_id, .. }
+            | RemoteInbound::Queue { command_id, .. }
+            | RemoteInbound::StopBackground { command_id }
+            | RemoteInbound::StopTask { command_id, .. }
+            | RemoteInbound::TakeBack { command_id } => command_id,
+        }
+    }
+
+    /// The text the message carries, for the kinds that carry one.
+    fn text(&self) -> Option<&str> {
+        match self {
+            RemoteInbound::Send { text, .. } | RemoteInbound::Queue { text, .. } => Some(text),
+            RemoteInbound::Interrupt { .. }
+            | RemoteInbound::StopBackground { .. }
+            | RemoteInbound::StopTask { .. }
+            | RemoteInbound::TakeBack { .. } => None,
         }
     }
 }
@@ -73,13 +100,21 @@ pub enum RemoteRefusal {
     Duplicate,
     /// The agent turned the command down or failed it, in its own words.
     Agent(String),
+    /// A kind this build parses and does not carry out yet.
+    NotYet,
 }
 
-/// The longest remote message read; anything longer is refused unread.
-pub(super) const REMOTE_MESSAGE_MAX_BYTES: usize = 4096;
+/// The longest text a `send` or `queue` carries, in UTF-8 bytes.
+pub const REMOTE_TEXT_MAX_BYTES: usize = 64 * 1024;
 
-/// The longest command id taken: a 128-bit id fits many times over, and the ids are kept for the process's life.
-pub(super) const COMMAND_ID_MAX_BYTES: usize = 64;
+/// How many of a device's command ids are remembered: its last 1024. The phone never sends a command again by
+/// itself (a result that never came shows as not confirmed, and the person decides), so an id older than that is
+/// never a retry.
+pub const COMMAND_LEDGER_PER_DEVICE: usize = 1024;
+
+/// The longest remote message read; anything longer is refused unread. It holds a text of
+/// [`REMOTE_TEXT_MAX_BYTES`] with every byte escaped (six bytes each on the wire), and the rest of the message.
+pub(super) const REMOTE_MESSAGE_MAX_BYTES: usize = 6 * REMOTE_TEXT_MAX_BYTES + 4096;
 
 /// Parses `raw` as a remote message, and nothing else.
 pub(super) fn parse_remote_inbound(raw: &str) -> Result<RemoteInbound, RemoteRefusal> {
@@ -91,23 +126,49 @@ pub(super) fn parse_remote_inbound(raw: &str) -> Result<RemoteInbound, RemoteRef
     if id.is_empty() || id.len() > COMMAND_ID_MAX_BYTES {
         return Err(RemoteRefusal::Parse);
     }
+    if message.text().is_some_and(|text| text.len() > REMOTE_TEXT_MAX_BYTES) {
+        return Err(RemoteRefusal::Parse);
+    }
     Ok(message)
 }
 
-/// The command ids each device has sent, kept for the life of the process: a command whose result never reached the
-/// phone may be sent again by the person, never by a retry that repeats the id.
+/// One device's remembered command ids: the set to look them up, and their order to forget the oldest.
+#[derive(Default)]
+struct DeviceLedger {
+    ids: HashSet<String>,
+    order: VecDeque<String>,
+}
+
+impl DeviceLedger {
+    #[cfg(test)]
+    fn len(&self) -> usize {
+        self.order.len()
+    }
+}
+
+/// The last [`COMMAND_LEDGER_PER_DEVICE`] command ids each device has sent, kept for the life of the process: a
+/// command whose result never reached the phone may be sent again by the person, never by a retry that repeats the
+/// id. Devices come from the store, so their number is bounded there.
 #[derive(Default)]
 struct RemoteCommands {
-    by_device: HashMap<String, HashSet<String>>,
+    by_device: HashMap<String, DeviceLedger>,
 }
 
 impl RemoteCommands {
-    /// Records `id` for `device`; false when that device sent it before.
+    /// Records `id` for `device`, forgetting that device's oldest when it has more than the bound; false when the
+    /// device sent it among its last ids.
     fn first_use(&mut self, device: &str, id: &str) -> bool {
-        self.by_device
-            .entry(device.to_owned())
-            .or_default()
-            .insert(id.to_owned())
+        let ledger = self.by_device.entry(device.to_owned()).or_default();
+        if !ledger.ids.insert(id.to_owned()) {
+            return false;
+        }
+        ledger.order.push_back(id.to_owned());
+        if ledger.order.len() > COMMAND_LEDGER_PER_DEVICE {
+            if let Some(oldest) = ledger.order.pop_front() {
+                ledger.ids.remove(&oldest);
+            }
+        }
+        true
     }
 }
 
@@ -133,6 +194,17 @@ pub(super) fn handle_remote_message(
     message: RemoteInbound,
     out: &mut Outbox,
 ) -> Result<(), RemoteRefusal> {
+    let not_yet = match &message {
+        RemoteInbound::Interrupt { .. } => false,
+        RemoteInbound::Send { .. }
+        | RemoteInbound::Queue { .. }
+        | RemoteInbound::StopBackground { .. }
+        | RemoteInbound::StopTask { .. }
+        | RemoteInbound::TakeBack { .. } => true,
+    };
+    if not_yet {
+        return Err(RemoteRefusal::NotYet);
+    }
     let tab = admit_remote(state, &message, key)?;
     match message {
         RemoteInbound::Interrupt { .. } => {
@@ -151,6 +223,11 @@ pub(super) fn handle_remote_message(
             }
             result
         }
+        RemoteInbound::Send { .. }
+        | RemoteInbound::Queue { .. }
+        | RemoteInbound::StopBackground { .. }
+        | RemoteInbound::StopTask { .. }
+        | RemoteInbound::TakeBack { .. } => Err(RemoteRefusal::NotYet),
     }
 }
 
@@ -310,6 +387,92 @@ mod tests {
                 ..
             }
         ));
+    }
+
+    #[test]
+    fn command_ledger_keeps_the_last_1024_per_device() {
+        assert_eq!(COMMAND_LEDGER_PER_DEVICE, 1024);
+        let mut ledger = RemoteCommands::default();
+        for n in 0..=COMMAND_LEDGER_PER_DEVICE {
+            assert!(ledger.first_use("d1", &format!("c{n}")), "c{n} is new");
+        }
+        assert!(
+            !ledger.first_use("d1", "c1"),
+            "the oldest of the last 1024 is still known"
+        );
+        assert!(
+            !ledger.first_use("d1", &format!("c{COMMAND_LEDGER_PER_DEVICE}")),
+            "and the newest"
+        );
+        assert!(ledger.first_use("d1", "c0"), "one past the last 1024 is forgotten");
+        assert!(ledger.first_use("d2", "c5"), "another device's ids are its own");
+        assert!(!ledger.first_use("d2", "c5"));
+        let held: usize = ledger.by_device.values().map(DeviceLedger::len).sum();
+        assert_eq!(held, COMMAND_LEDGER_PER_DEVICE + 1, "nothing beyond the bound is kept");
+    }
+
+    #[test]
+    fn every_new_remote_kind_parses_and_is_refused_not_yet() {
+        agent::state_dirs::redirect_state_to_a_test_root();
+        let dir = agent::state_dirs::test_workspace_dir("remote-not-yet");
+        let (handle, base, _second) = handle_with_two_pages();
+        let (tab, provider, key) = interruptible_tab(&handle, &dir);
+        start_turn(&handle, tab, &provider, "t1");
+        clear(&[&base]);
+        let kinds = [
+            serde_json::json!({ "type": "send", "command_id": "n1", "text": "hello" }),
+            serde_json::json!({ "type": "queue", "command_id": "n2", "text": "later" }),
+            serde_json::json!({ "type": "stop_background", "command_id": "n3" }),
+            serde_json::json!({ "type": "stop_task", "command_id": "n4", "task": "b7" }),
+            serde_json::json!({ "type": "take_back", "command_id": "n5" }),
+        ];
+        for kind in kinds {
+            let raw = kind.to_string();
+            let parsed = parse_remote_inbound(&raw).unwrap_or_else(|e| panic!("{raw}: {e:?}"));
+            assert_eq!(parsed.command_id(), kind["command_id"].as_str().unwrap());
+            assert_eq!(
+                handle.remote_message(&phone(), &key, &raw),
+                Err(RemoteRefusal::NotYet),
+                "{raw}"
+            );
+            let mut extra = kind.clone();
+            extra["tab"] = serde_json::json!(3);
+            assert_eq!(
+                parse_remote_inbound(&extra.to_string()),
+                Err(RemoteRefusal::Parse),
+                "{extra}"
+            );
+        }
+        assert_eq!(provider.interrupts(), 0, "nothing reached the agent");
+        assert_eq!(active_turn(&handle, tab).as_deref(), Some("t1"));
+        handle.tick();
+        assert!(
+            notices(&base.sent.borrow()).is_empty(),
+            "the desk is told of nothing that was not done"
+        );
+        shut_down_every_tab(&handle);
+    }
+
+    #[test]
+    fn remote_text_is_bounded() {
+        assert_eq!(REMOTE_TEXT_MAX_BYTES, 64 * 1024);
+        let fits = serde_json::json!({ "type": "send", "command_id": "t1", "text": "a".repeat(REMOTE_TEXT_MAX_BYTES) });
+        assert!(
+            parse_remote_inbound(&fits.to_string()).is_ok(),
+            "64 KiB of text is taken"
+        );
+        // Every byte escaped is six on the wire, and still taken.
+        let escaped =
+            serde_json::json!({ "type": "queue", "command_id": "t2", "text": "\u{1}".repeat(REMOTE_TEXT_MAX_BYTES) });
+        assert!(
+            parse_remote_inbound(&escaped.to_string()).is_ok(),
+            "escaped text of the limit is taken"
+        );
+        let over =
+            serde_json::json!({ "type": "send", "command_id": "t3", "text": "a".repeat(REMOTE_TEXT_MAX_BYTES + 1) });
+        assert_eq!(parse_remote_inbound(&over.to_string()), Err(RemoteRefusal::Parse));
+        let long_id = serde_json::json!({ "type": "take_back", "command_id": "c".repeat(65) });
+        assert_eq!(parse_remote_inbound(&long_id.to_string()), Err(RemoteRefusal::Parse));
     }
 
     #[test]

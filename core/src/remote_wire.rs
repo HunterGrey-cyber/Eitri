@@ -1,6 +1,7 @@
 //! JSON frames shared by remote observation and the phone's inbound transport.
 
 use crate::agents::{wire, Change, View};
+use crate::remote_rv::Secret;
 use serde::Deserialize;
 use serde_json::{json, Value};
 
@@ -37,12 +38,15 @@ pub fn agents_change_frame(change: &Change) -> String {
     frame.to_string()
 }
 
+/// What a phone may send `serve`. Any other kind, and any field not named here, fails to parse. A credential is a
+/// [`Secret`], which `Debug` never shows.
 #[derive(Debug, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
 pub enum PhoneInbound {
+    /// The first frame of a connection. A phone that is enrolling has no token yet.
     Hello {
         device: String,
-        token: String,
+        token: Option<Secret>,
         layout: String,
         protocol: u32,
     },
@@ -54,9 +58,31 @@ pub enum PhoneInbound {
     Unsubscribe {
         key: String,
     },
+    /// The turns of `key` before `before_turn`, of the session `generation`.
+    More {
+        key: String,
+        generation: u64,
+        before_turn: u64,
+    },
     Act {
         key: String,
         cmd: Value,
+    },
+    /// Keeps a quiet connection open.
+    #[serde(deserialize_with = "empty_body")]
+    Ping,
+    /// Enrolls with the one-time `code` that the window `instance` showed, as `device_name`.
+    Enroll {
+        instance: String,
+        code: Secret,
+        device_name: String,
+    },
+    /// The phone takes itself out of the store.
+    #[serde(deserialize_with = "empty_body")]
+    RevokeSelf,
+    /// Where the phone's notifications go.
+    SetPushEndpoint {
+        url: Secret,
     },
 }
 
@@ -216,6 +242,45 @@ mod tests {
         assert!(parse_phone_frame(&format!("{line} {line}")).is_err());
         assert!(parse_phone_frame(r#"{"v":1,"seq":-1,"ack":0,"kind":"subscribe_rows"}"#).is_err());
         assert!(parse_phone_frame(r#"{"v":1,"seq":1,"ack":"0","kind":"subscribe_rows"}"#).is_err());
+    }
+
+    #[test]
+    fn every_new_phone_kind_parses_strictly() {
+        for body in [
+            json!({"kind":"ping"}),
+            json!({"kind":"more", "key":"k-1", "generation":3, "before_turn":12}),
+            json!({"kind":"enroll", "instance":"a3f09c1d2e4b5f60", "code":"c0de", "device_name":"Pixel"}),
+            json!({"kind":"revoke_self"}),
+            json!({"kind":"set_push_endpoint", "url":"https://ntfy.example/t"}),
+            json!({"kind":"hello", "device":"phone", "layout":"slab", "protocol":1}),
+            json!({"kind":"hello", "device":"phone", "token":"secret", "layout":"slab", "protocol":1}),
+        ] {
+            let mut frame = body.clone();
+            frame["v"] = json!(1);
+            frame["seq"] = json!(1);
+            frame["ack"] = json!(0);
+            let parsed = parse_phone_frame(&frame.to_string()).unwrap_or_else(|e| panic!("{frame}: {e}"));
+            let shown = format!("{:?}", parsed.body);
+            assert!(
+                !shown.contains("c0de") && !shown.contains("secret") && !shown.contains("ntfy.example"),
+                "{shown}"
+            );
+            frame["unknown"] = json!(true);
+            assert!(parse_phone_frame(&frame.to_string()).is_err(), "{frame}");
+        }
+        let line = r#"{"v":1,"seq":1,"ack":0,"kind":"hello","device":"phone","layout":"slab","protocol":1}"#;
+        assert!(matches!(
+            parse_phone_frame(line).unwrap().body,
+            PhoneInbound::Hello { token: None, .. }
+        ));
+        for body in [
+            json!({"kind":"more", "key":"k-1", "generation":3}),
+            json!({"kind":"enroll", "code":"c0de", "device_name":"Pixel"}),
+            json!({"kind":"ping", "x":1}),
+            json!({"kind":"revoke_self", "token":"t"}),
+        ] {
+            assert!(serde_json::from_value::<PhoneInbound>(body.clone()).is_err(), "{body}");
+        }
     }
 
     #[test]

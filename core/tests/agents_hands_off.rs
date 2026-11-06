@@ -24,7 +24,7 @@ const FORBIDDEN: [&str; 10] = [
 ];
 
 /// Whole files that are the layer's, each with a token it is known to hold.
-const FILES: [(&str, &str); 7] = [
+const FILES: [(&str, &str); 8] = [
     ("core/src/tab_set/agent_rows.rs", "RowContext"),
     ("core/src/wm/reveal.rs", "RevealRequest"),
     ("core/src/plugin/host/agents.rs", "fn agents_verb"),
@@ -32,6 +32,7 @@ const FILES: [(&str, &str); 7] = [
     ("shell/src/agents_host.rs", "fn focus_remote"),
     ("core/src/wm/agents_round.rs", "pub enum RoundKey"),
     ("remote/src/agents_feed.rs", "pub struct AgentsFeed"),
+    ("core/src/remote_wire.rs", "pub enum PhoneInbound"),
 ];
 
 /// Each whole-word use of a forbidden name in `code`, as `name`.

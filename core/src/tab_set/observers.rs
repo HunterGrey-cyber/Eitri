@@ -9,14 +9,14 @@
 //! snapshot is serialized only when the observer takes its frames, never inside the tick, from the same view the
 //! desk's snapshot reads, without settling the queue, stamping the tab's clock or noting a revision on the backend.
 //!
-//! Bounded per observer: queued frames past [`OBSERVER_QUEUE_CAP_BYTES`] are dropped together and the observer is
+//! Bounded per observer: queued frames past [`OBSERVER_QUEUE_CAP_BYTES`] (1 MiB) are dropped together and the observer is
 //! owed a snapshot instead, so one that stops taking costs at most that much memory and never sees a gap. A backend
 //! put in place of the one it followed (a restart, a resume, a reset), a `Resync` that lost events, a change to the
 //! broker's cards (which no events frame carries), and an observer registered fresh all owe a snapshot the same way. A tab that closes, or is frozen to move to another window,
 //! ends each of its observers with a `Gone` after what was already queued; nothing follows it.
 
 use std::collections::{BTreeMap, VecDeque};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use agent::AgentDomainEvent;
 
@@ -32,7 +32,8 @@ use crate::tabs::TabId;
 pub struct ObserverId(pub u64);
 
 /// Why an observed tab is no longer here.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum GoneWhy {
     Closed,
     /// Frozen to move to another window (or handed over to one): it is followed there, not here.
@@ -94,13 +95,31 @@ pub enum ObserveError {
 }
 
 /// The bytes of frames one observer may have waiting; past it they are dropped and a snapshot is owed.
-pub const OBSERVER_QUEUE_CAP_BYTES: usize = 4 * 1024 * 1024;
+pub const OBSERVER_QUEUE_CAP_BYTES: usize = 1024 * 1024;
+
+/// Where an observer's owner that goes away without forgetting its observers (a socket dropped with its window)
+/// leaves their ids; the set forgets them at its next pump. Cloned from [`TabSet::observer_reaper`], and safe to hand
+/// ids to from any thread.
+#[derive(Clone, Default)]
+pub struct ObserverReaper(Arc<Mutex<Vec<ObserverId>>>);
+
+impl ObserverReaper {
+    /// Leaves `ids` to be forgotten; an id the set no longer knows changes nothing.
+    pub fn hand_over(&self, ids: impl IntoIterator<Item = ObserverId>) {
+        self.0.lock().unwrap_or_else(|e| e.into_inner()).extend(ids);
+    }
+
+    fn take(&self) -> Vec<ObserverId> {
+        std::mem::take(&mut *self.0.lock().unwrap_or_else(|e| e.into_inner()))
+    }
+}
 
 /// Every observer of the set's tabs.
 #[derive(Default)]
 pub(super) struct Observers {
     next_id: u64,
     pub(super) by_id: BTreeMap<u64, Observer>,
+    reaper: ObserverReaper,
     /// How many observer snapshots were serialized, for tests that prove none is built by the tick.
     #[cfg(test)]
     pub(super) snapshots_built: usize,
@@ -163,6 +182,13 @@ struct Built {
 }
 
 impl Observers {
+    /// Forgets the observers handed to the reaper since the last pump.
+    pub(super) fn reap(&mut self) {
+        for id in self.reaper.take() {
+            self.by_id.remove(&id.0);
+        }
+    }
+
     fn add(&mut self, tab: TabId, key: RowKey, generation: u64) -> ObserverId {
         self.next_id += 1;
         self.by_id.insert(
@@ -361,6 +387,16 @@ impl TabSet {
     /// Forgets the observer and whatever waits for it; an id it does not know changes nothing.
     pub fn unobserve(&mut self, id: ObserverId) {
         self.observers.by_id.remove(&id.0);
+    }
+
+    /// How many observers are registered.
+    pub fn observer_count(&self) -> usize {
+        self.observers.by_id.len()
+    }
+
+    /// Where an owner that cannot reach the set when it goes leaves its observers' ids; the next pump forgets them.
+    pub fn observer_reaper(&self) -> ObserverReaper {
+        self.observers.reaper.clone()
     }
 
     /// Observers with something to take: frames queued, or a snapshot owed that can be built now.
@@ -935,10 +971,10 @@ mod tests {
         let big = "x".repeat(64 * 1024);
         let mut through = 2;
         let mut peak = 0;
-        // Twenty events of 64 KiB a pump, never taken, well past the cap.
+        // Ten events of 64 KiB a pump, a frame under the cap, never taken: two of them pass it.
         for _ in 0..5 {
-            provider.queue_all((0..20).map(|_| delta(&big)).collect());
-            through += 20;
+            provider.queue_all((0..10).map(|_| delta(&big)).collect());
+            through += 10;
             folded(&set, tab, through);
             set.pump(&dir, true);
             peak = peak.max(set.observers.by_id[&id.0].queued_bytes);
@@ -957,6 +993,68 @@ mod tests {
         );
         assert_eq!(set.observers.snapshots_built, 2);
         phone.apply(frames);
+        shut_down(&mut set);
+    }
+
+    #[test]
+    fn observer_queue_cap_is_one_mebibyte() {
+        assert_eq!(OBSERVER_QUEUE_CAP_BYTES, 1024 * 1024);
+        let (dir, mut set, tab, provider) = opened_tab("observers-cap-1mib");
+        let id = set.observe(&key(&set, tab)).unwrap();
+        set.take_observer_frames(id, usize::MAX);
+        provider.queue(started("t1"));
+        let mut through = 2;
+        folded(&set, tab, through);
+        set.pump(&dir, true);
+        // One frame of a 60 KiB event a pump, never taken: the queue grows until the next would pass 1 MiB.
+        let text = "z".repeat(60 * 1024);
+        let mut peak = 0;
+        let mut dropped = false;
+        for _ in 0..40 {
+            provider.queue(delta(&text));
+            through += 1;
+            folded(&set, tab, through);
+            set.pump(&dir, true);
+            let queued = set.observers.by_id[&id.0].queued_bytes;
+            if queued < peak {
+                dropped = true;
+                break;
+            }
+            peak = queued;
+        }
+        assert!(
+            dropped,
+            "the queue was dropped once it would pass the cap (peak {peak})"
+        );
+        assert!(peak <= OBSERVER_QUEUE_CAP_BYTES, "never above the cap: {peak}");
+        assert!(
+            peak > OBSERVER_QUEUE_CAP_BYTES - 64 * 1024,
+            "dropped only when one more frame would not fit: {peak}"
+        );
+        let frames = set.take_observer_frames(id, usize::MAX);
+        assert!(
+            matches!(&frames[..], [ObserverFrame::Snapshot { .. }, ..]),
+            "a snapshot follows the drop: {frames:?}"
+        );
+        shut_down(&mut set);
+    }
+
+    #[test]
+    fn observers_handed_to_the_reaper_are_forgotten_at_the_next_pump() {
+        let (dir, mut set, tab, _provider) = opened_tab("observers-reaper");
+        let first = set.observe(&key(&set, tab)).unwrap();
+        let second = set.observe(&key(&set, tab)).unwrap();
+        assert_eq!(set.observer_count(), 2);
+        let reaper = set.observer_reaper();
+        // Handed over from another thread, as a socket's owner going away may.
+        std::thread::spawn(move || reaper.hand_over([first])).join().unwrap();
+        assert_eq!(set.observer_count(), 2, "nothing is forgotten before a pump");
+        set.pump(&dir, true);
+        assert_eq!(set.observer_count(), 1, "the handed-over observer is forgotten");
+        assert_eq!(set.observers_with_frames(), [second]);
+        set.observer_reaper().hand_over([first, second, ObserverId(999)]);
+        set.pump(&dir, true);
+        assert_eq!(set.observer_count(), 0, "an id already gone changes nothing");
         shut_down(&mut set);
     }
 

@@ -36,7 +36,9 @@ mod moving;
 mod observers;
 mod shell;
 pub use moving::{FrozenChat, FrozenTab, MoveRefusedWhy, SendGate, Sent, TabHandoff};
-pub use observers::{GoneWhy, ObserveError, ObserverFrame, ObserverId, WorkMark, OBSERVER_QUEUE_CAP_BYTES};
+pub use observers::{
+    GoneWhy, ObserveError, ObserverFrame, ObserverId, ObserverReaper, WorkMark, OBSERVER_QUEUE_CAP_BYTES,
+};
 pub use shell::{shell_command, ShellEnded};
 
 #[cfg(test)]
@@ -3532,6 +3534,8 @@ impl TabSet {
     /// says whether a view's page is on screen now: what finishes in a tab whose page is not is left
     /// unread.
     pub fn pump_views(&mut self, project_root: &Path, mapped: &dyn Fn(ViewId) -> bool) -> PumpOutput {
+        // Observers an owner left behind when it went are forgotten before this pump queues anything for them.
+        self.observers.reap();
         let active = self.active;
         self.project_root = Some(project_root.to_path_buf());
         let mut out = match self.held_pump.take() {

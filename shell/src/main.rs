@@ -213,6 +213,18 @@ fn main() -> glib::ExitCode {
         );
         return glib::ExitCode::from(eitri_core::agents::cli::run(&args, &mut std::io::stdout(), &control) as u8);
     }
+    // `eitri remote <command>` is the remote server's and the device store's own command line; it never starts GTK.
+    if early_args.first().is_some_and(|a| a == "remote") {
+        let Some(args) = early_args[1..]
+            .iter()
+            .map(|arg| arg.to_str().map(str::to_owned))
+            .collect::<Option<Vec<_>>>()
+        else {
+            eprintln!("eitri remote: arguments must be valid UTF-8");
+            return glib::ExitCode::from(64);
+        };
+        return glib::ExitCode::from(eitri_remote::run(&args).clamp(0, 255) as u8);
+    }
     // `eitri panel` is its own command line: the project resolver below would read `panel` as a directory.
     if early_args.first().is_some_and(|a| a == "panel") {
         return companion::run(early_args[1..].to_vec());

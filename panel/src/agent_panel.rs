@@ -75,7 +75,7 @@ mod pair_review;
 mod path_menu;
 #[path = "remote_entry.rs"]
 mod remote_entry;
-#[path = "remote_socket.rs"]
+#[path = "remote_socket/mod.rs"]
 mod remote_socket;
 #[path = "restore.rs"]
 mod restore;
@@ -138,7 +138,9 @@ use pages::*;
 use pair_review::pair_outbound;
 pub use pair_review::{take_pair_outbound, PairOutbound, ReviewSettled, ReviewStep};
 use remote_entry::*;
-pub use remote_entry::{ExpectWork, RemoteInbound, RemoteOrigin, RemoteRefusal};
+pub use remote_entry::{
+    ExpectWork, RemoteInbound, RemoteOrigin, RemoteRefusal, COMMAND_LEDGER_PER_DEVICE, REMOTE_TEXT_MAX_BYTES,
+};
 pub use remote_socket::RemoteSocket;
 use restore::*;
 pub use review_glue::ReviewConfig;

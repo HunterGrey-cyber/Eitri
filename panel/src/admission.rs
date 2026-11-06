@@ -359,6 +359,12 @@ pub(super) fn admit_remote(
             }
             Ok(tab)
         }
+        // Parsed, and not carried out by this build: nothing reaches the tab.
+        RemoteInbound::Send { .. }
+        | RemoteInbound::Queue { .. }
+        | RemoteInbound::StopBackground { .. }
+        | RemoteInbound::StopTask { .. }
+        | RemoteInbound::TakeBack { .. } => Err(RemoteRefusal::NotYet),
     }
 }
 

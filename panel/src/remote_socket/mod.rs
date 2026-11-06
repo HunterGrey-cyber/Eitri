@@ -1,0 +1,305 @@
+//! The `rv-<instance>.sock` server: where a remote observer's server (`eitri remote serve`) follows this window's tabs,
+//! sends their remote messages and runs its errands about devices.
+//!
+//! The socket's posture is the control sockets': the control directory checked (`panel_control::ensure_dir`), the
+//! socket 0600 with its path built in `eitri-core` through `agent::socket_path::in_dir`, and a peer served only when
+//! its uid is this process's effective uid, checked before a byte is read. It is still a door any process of this
+//! user can open, an agent's own shell included, so reading is all it gives without more: `subscribe` follows a tab,
+//! which shows nothing such a process cannot read from the agent's transcript, while an `act` is acted on only when
+//! its device id and token match the device store and that device's grant allows steering, checked before the
+//! message reaches [`AgentPanelHandle::remote_message`] and its closed list. Nothing here answers a card, a question
+//! or a trust prompt; that list has no such message.
+//!
+//! No socket I/O happens on the tick's thread. One thread accepts, and each connection has a reader and a writer of
+//! its own (`conn`): the reader takes one line at a time and hands it to the tick through a bounded channel, raising
+//! the wake; the writer writes what the tick queued and raises the wake when it has room again after the tick found
+//! it full. [`RemoteSocket::pump`], called from the tick, handles the queued lines and then takes an observer's
+//! frames only while its connection's writer holds less than [`WRITER_BYTES`], so a peer that stops reading stops
+//! its frames where they are: its observer's own cap and snapshot take over, and nothing the tick does waits for it.
+//! What closes a connection, and the caps on its answers, are `conn`'s.
+//!
+//! Each kind of line has its handler file: `feed` (`subscribe`, `unsubscribe`, `more` and the frames), `acts`
+//! (`act`) and `devices` (`serve`'s errands); `ping` is answered here. A kind this build parses and does not carry out
+//! is answered `refused` with `not yet`.
+
+use super::*;
+use crate::panel_wake::PanelWake;
+use eitri_core::remote_devices::{DeviceStore, Grant};
+use eitri_core::remote_rv::{
+    frame_line, parse_rv_line, pong_line, refused_line, result_line, RvInbound, RvListener, COMMAND_ID_MAX_BYTES,
+    CONTROL_BYTES_MAX, RV_IDLE, RV_LINE_WITHIN, RV_MAX_CONNECTIONS, RV_MAX_LINE, RV_MAX_OBSERVERS_PER_CONNECTION,
+    RV_WRITE_STALL,
+};
+use eitri_core::tab_set::{ObserveError, ObserverFrame, ObserverId, ObserverReaper, RowKey};
+use std::cell::RefCell;
+use std::collections::BTreeMap;
+use std::io::{self, Read, Write};
+use std::net::Shutdown;
+use std::os::unix::net::UnixStream;
+use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
+use std::sync::mpsc::{self, Receiver, SyncSender};
+use std::sync::Arc;
+use std::time::{Duration, Instant};
+
+mod acts;
+mod conn;
+mod devices;
+mod feed;
+#[cfg(test)]
+mod tests;
+
+use acts::ActInbound;
+use conn::{start_connection, CloseWhy, Conn, Deadlines, Gauge};
+pub use conn::{CONTROL_LINES_MAX, WRITER_BYTES};
+use devices::DevicesInbound;
+use feed::FeedInbound;
+
+/// The lines the readers may have queued for the tick; a reader past it waits, and so does its peer.
+const INBOUND_LINES: usize = 64;
+
+/// The most queued lines one pump handles; the rest raise the wake for the next.
+const INBOUND_PER_PUMP: usize = 64;
+
+/// The `why` of a line this build parses and does not carry out.
+const NOT_YET: &str = "not yet";
+
+/// What a connection's threads hand the tick.
+enum Inbound {
+    Opened {
+        conn: u64,
+        stream: UnixStream,
+        out: mpsc::Sender<conn::Out>,
+        gauge: Arc<Gauge>,
+    },
+    Closed {
+        conn: u64,
+        why: CloseWhy,
+    },
+    Ping {
+        conn: u64,
+    },
+    Feed {
+        conn: u64,
+        line: FeedInbound,
+    },
+    Act {
+        conn: u64,
+        act: ActInbound,
+    },
+    Devices {
+        conn: u64,
+        line: DevicesInbound,
+    },
+}
+
+/// What the accepting and reading threads share.
+struct Shared {
+    inbound: SyncSender<Inbound>,
+    wake: agent::UiWake,
+    store: PathBuf,
+    deadlines: Deadlines,
+    live: AtomicUsize,
+    next_conn: AtomicU64,
+    /// The socket's owner is gone: a connection accepted from now on is shut at once.
+    stopped: AtomicBool,
+}
+
+/// A bound `rv-` socket, its threads, and what the tick holds of its connections.
+///
+/// Dropping it removes the socket while the name still holds the one bound and closes every connection; its
+/// observers are handed to the tab set's reaper, which forgets them at the next tick. [`RemoteSocket::close`] forgets
+/// them at once.
+pub struct RemoteSocket {
+    listener: Option<RvListener>,
+    shared: Arc<Shared>,
+    inbound: Receiver<Inbound>,
+    conns: RefCell<BTreeMap<u64, Conn>>,
+    /// The tab set's reaper, taken at the first subscription.
+    reaper: RefCell<Option<ObserverReaper>>,
+    /// Why each connection the tick forgot was closed, in order.
+    #[cfg(test)]
+    closes: RefCell<Vec<CloseWhy>>,
+}
+
+impl RemoteSocket {
+    /// Binds `rv-<instance>.sock` in `control_dir` and starts accepting. `act` lines are checked against the device
+    /// store at `store_path`, read again for each, so a device taken out of it can no longer steer. `wake` is raised
+    /// whenever a line waits for [`pump`](Self::pump) and whenever a writer that was full has room again.
+    ///
+    /// Fails, having created nothing, when the path would pass the socket path limit or `instance` is not an
+    /// instance id; fails when the directory is not private or the name is taken.
+    pub fn bind(control_dir: &Path, instance: &str, store_path: &Path, wake: &PanelWake) -> io::Result<RemoteSocket> {
+        RemoteSocket::bind_with(control_dir, instance, store_path, wake, Deadlines::default())
+    }
+
+    fn bind_with(
+        control_dir: &Path,
+        instance: &str,
+        store_path: &Path,
+        wake: &PanelWake,
+        deadlines: Deadlines,
+    ) -> io::Result<RemoteSocket> {
+        let (tx, rx) = mpsc::sync_channel(INBOUND_LINES);
+        let shared = Arc::new(Shared {
+            inbound: tx,
+            wake: wake.waker(),
+            store: store_path.to_path_buf(),
+            deadlines,
+            live: AtomicUsize::new(0),
+            next_conn: AtomicU64::new(1),
+            stopped: AtomicBool::new(false),
+        });
+        let accepting = Arc::clone(&shared);
+        let listener = RvListener::bind(control_dir, instance, move |stream| {
+            start_connection(stream, &accepting)
+        })?;
+        Ok(RemoteSocket {
+            listener: Some(listener),
+            shared,
+            inbound: rx,
+            conns: RefCell::new(BTreeMap::new()),
+            reaper: RefCell::new(None),
+            #[cfg(test)]
+            closes: RefCell::new(Vec::new()),
+        })
+    }
+
+    /// Called from the tick: handles queued inbound lines, then takes frames only for observers whose writer has
+    /// room. Never waits on a socket.
+    pub fn pump(&self, handle: &AgentPanelHandle) {
+        let mut handled = 0;
+        while handled < INBOUND_PER_PUMP {
+            let Ok(inbound) = self.inbound.try_recv() else {
+                break;
+            };
+            self.take(handle, inbound);
+            handled += 1;
+        }
+        if handled == INBOUND_PER_PUMP {
+            (self.shared.wake)();
+        }
+        self.send_frames(handle);
+    }
+
+    /// Forgets every observer of this socket's connections, then closes it.
+    pub fn close(self, handle: &AgentPanelHandle) {
+        let conns = std::mem::take(&mut *self.conns.borrow_mut());
+        let mut state = handle.state.borrow_mut();
+        for conn in conns.values() {
+            for id in conn.observers.values() {
+                state.tabs.unobserve(*id);
+            }
+            conn.close();
+        }
+    }
+
+    fn take(&self, handle: &AgentPanelHandle, inbound: Inbound) {
+        match inbound {
+            Inbound::Opened {
+                conn,
+                stream,
+                out,
+                gauge,
+            } => {
+                self.conns.borrow_mut().insert(
+                    conn,
+                    Conn {
+                        stream,
+                        out,
+                        gauge,
+                        observers: BTreeMap::new(),
+                    },
+                );
+            }
+            Inbound::Closed { conn, why } => {
+                if let Some(conn) = self.conns.borrow_mut().remove(&conn) {
+                    conn.close();
+                    let mut state = handle.state.borrow_mut();
+                    for id in conn.observers.values() {
+                        state.tabs.unobserve(*id);
+                    }
+                }
+                if matches!(why, CloseWhy::Idle | CloseWhy::WriteStall) {
+                    eprintln!("[agent_panel] remote: connection {conn} closed: {why:?}");
+                }
+                #[cfg(test)]
+                self.closes.borrow_mut().push(why);
+            }
+            Inbound::Ping { conn } => self.answer(conn, pong_line()),
+            Inbound::Feed { conn, line } => self.take_feed(handle, conn, line),
+            Inbound::Act { conn, act } => self.take_act(handle, conn, act),
+            Inbound::Devices { conn, line } => self.take_devices(handle, conn, line),
+        }
+    }
+
+    /// Queues an answer, or closes a connection whose peer has left too many unread, by count or by bytes.
+    fn answer(&self, conn: u64, line: String) {
+        let conns = self.conns.borrow();
+        let Some(c) = conns.get(&conn) else {
+            return;
+        };
+        if !c.gauge.control_fits(line.len() + 1) {
+            c.close();
+            return;
+        }
+        c.queue(line, true);
+    }
+}
+
+impl Drop for RemoteSocket {
+    fn drop(&mut self) {
+        // The socket goes first, so no new peer finds it while the connections close.
+        self.listener.take();
+        // The accepting thread is not waited for: a peer it is handing on now sees this and is shut.
+        self.shared.stopped.store(true, Ordering::SeqCst);
+        let conns = self.conns.borrow();
+        for conn in conns.values() {
+            conn.close();
+        }
+        // The tab set is out of reach here: its reaper forgets these observers at the next tick.
+        if let Some(reaper) = self.reaper.borrow().as_ref() {
+            reaper.hand_over(conns.values().flat_map(|c| c.observers.values().copied()));
+            (self.shared.wake)();
+        }
+        // Connections accepted but not yet taken in by a pump.
+        while let Ok(inbound) = self.inbound.try_recv() {
+            if let Inbound::Opened { stream, .. } = inbound {
+                let _ = stream.shutdown(Shutdown::Both);
+            }
+        }
+    }
+}
+
+/// Parses one line and hands it to the tick, raising the wake; its handler file reads it first, on this thread, so a
+/// credential it carries is checked or dropped here and goes no further. `false` for a line that closes the
+/// connection.
+fn hand_on(line: &[u8], conn: u64, shared: &Shared) -> bool {
+    let Ok(line) = parse_rv_line(line) else {
+        return false;
+    };
+    let inbound = match line {
+        RvInbound::Ping { .. } => Some(Inbound::Ping { conn }),
+        RvInbound::Subscribe { .. } | RvInbound::Unsubscribe { .. } | RvInbound::More { .. } => {
+            FeedInbound::read(line).map(|line| Inbound::Feed { conn, line })
+        }
+        RvInbound::Act { .. } => ActInbound::read(line, shared).map(|act| Inbound::Act { conn, act }),
+        RvInbound::Enroll { .. }
+        | RvInbound::StartEnroll { .. }
+        | RvInbound::GrantRequest { .. }
+        | RvInbound::ListenRequest { .. }
+        | RvInbound::RevokeSelf { .. }
+        | RvInbound::SetPushEndpoint { .. }
+        | RvInbound::DevicesConnected { .. } => {
+            DevicesInbound::read(line, shared).map(|line| Inbound::Devices { conn, line })
+        }
+    };
+    let Some(inbound) = inbound else {
+        return false;
+    };
+    if shared.inbound.send(inbound).is_err() {
+        return false;
+    }
+    (shared.wake)();
+    true
+}

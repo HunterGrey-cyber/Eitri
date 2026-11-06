@@ -1,31 +1,52 @@
 //! The enrolled devices a remote observer's state-changing messages are checked against.
 //!
-//! The file holds, for each device, its id, the name it was enrolled with, the SHA-256 of its bearer token and what it
-//! may do. The token itself is never stored: a device presents it with each message that would change something, and
-//! [`DeviceStore::verify`] hashes what was presented and compares the hashes in constant time, so how long a check
-//! takes says nothing about how much of a hash matched.
+//! The file holds, for each device, its id, the name it was enrolled with, the SHA-256 of its bearer token, what it
+//! may do, how it was enrolled and what is known of it since. The token itself is never stored: a device presents it
+//! with each message that would change something, and [`DeviceStore::verify`] hashes what was presented and compares
+//! the hashes in constant time, so how long a check takes says nothing about how much of a hash matched.
 //!
 //! The file decides who may stop an agent's work, so it counts only when it is a regular file of this user that no
 //! one else can read or write (no group or other bit in its mode), opened without following a link, and checked on
 //! the handle that is read. Anything else is refused whole: a store that is not trusted holds no device.
 //!
-//! The format, one JSON object, unknown fields refused:
+//! Several processes write it (each window, and `eitri remote` in a terminal), so every write goes through
+//! [`update`]: an `flock` on `devices.lock` beside it, held from before the read until after the new file is renamed
+//! into place, so a write never starts from a file another writer is about to replace.
+//!
+//! The format, one JSON object, unknown fields refused. Version 2:
 //!
 //! ```json
-//! {"v":1,"devices":[{"id":"d1","name":"Pixel 8","token_sha256":"<64 lowercase hex>","grant":"watch+steer"}]}
+//! {"v":2,"devices":[{"id":"d1","name":"Pixel 8","token_sha256":"<64 lowercase hex>","grant":"watch+steer",
+//!   "recipe":"ssh","confirmed":{"at":1762400000},"push_endpoint":null,"last_seen":null,"last_host":null,
+//!   "enrolled_host":"127.0.0.1:7341"}]}
 //! ```
+//!
+//! Version 1 (`id`, `name`, `token_sha256` and `grant` only) is still read; what it did not record reads as unknown
+//! (`recipe` `unknown`, no confirmation, `enrolled_host` empty), and the next write writes version 2.
 
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
-use std::io::{self, Read};
+use std::io::{self, Read, Write};
 use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
-use std::path::Path;
+use std::path::{Path, PathBuf};
+use std::time::{Duration, Instant};
 
-/// The only version of the store this build reads.
-pub const DEVICES_FORMAT_V: u32 = 1;
+/// The version of the store this build writes.
+pub const DEVICES_FORMAT_V: u32 = 2;
 
-/// The largest store read; a bigger file is refused unread.
+/// The older version this build still reads.
+const DEVICES_FORMAT_V1: u32 = 1;
+
+/// The largest store read or written; a bigger file is refused unread, and a change that would make one is not
+/// written.
 pub const DEVICES_MAX_BYTES: u64 = 1024 * 1024;
+
+/// How long [`update`] waits for another writer's lock: a read, a change and a rename of at most
+/// [`DEVICES_MAX_BYTES`] hold it far less.
+const LOCK_WITHIN: Duration = Duration::from_secs(2);
+
+/// The pause between two tries at the lock.
+const LOCK_PAUSE: Duration = Duration::from_millis(4);
 
 /// What a device may do.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -38,30 +59,105 @@ pub enum Grant {
     WatchSteer,
 }
 
-#[derive(Deserialize)]
+/// How a device reaches `serve`, as it was enrolled.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Recipe {
+    /// Through an SSH forward to the loopback listener.
+    Ssh,
+    /// To the listener directly (loopback, a tunnel's address, a reverse proxy).
+    Direct,
+    /// Enrolled before the store recorded it.
+    Unknown,
+}
+
+/// The desk's yes to a device, recorded with it, so every window sees the one confirmation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
-struct StoreFile {
-    v: u32,
-    devices: Vec<DeviceEntry>,
+pub struct Confirmed {
+    /// When, in seconds since the Unix epoch.
+    pub at: u64,
 }
 
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
-struct DeviceEntry {
+struct StoreFileV1 {
+    #[allow(dead_code)]
+    v: u32,
+    devices: Vec<DeviceEntryV1>,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct DeviceEntryV1 {
     id: String,
     name: String,
     token_sha256: String,
     grant: Grant,
 }
 
-struct Device {
+#[derive(Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct StoreFileV2 {
+    v: u32,
+    devices: Vec<DeviceEntryV2>,
+}
+
+#[derive(Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct DeviceEntryV2 {
     id: String,
     name: String,
-    token_sha256: [u8; 32],
+    token_sha256: String,
     grant: Grant,
+    recipe: Recipe,
+    confirmed: Option<Confirmed>,
+    push_endpoint: Option<String>,
+    last_seen: Option<u64>,
+    last_host: Option<String>,
+    enrolled_host: String,
+}
+
+/// One enrolled device.
+#[derive(Clone, PartialEq, Eq)]
+pub struct Device {
+    pub id: String,
+    pub name: String,
+    /// The SHA-256 of its bearer token; the token is never kept.
+    pub token_sha256: [u8; 32],
+    pub grant: Grant,
+    pub recipe: Recipe,
+    /// The desk's yes, if one was given.
+    pub confirmed: Option<Confirmed>,
+    /// Where its notifications go.
+    pub push_endpoint: Option<String>,
+    /// When it was last connected, in seconds since the Unix epoch.
+    pub last_seen: Option<u64>,
+    /// The `Host` it last reached `serve` through.
+    pub last_host: Option<String>,
+    /// The `Host` it enrolled through.
+    pub enrolled_host: String,
+}
+
+impl std::fmt::Debug for Device {
+    /// Neither the token's hash nor the push endpoint, which may itself be a credential.
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Device")
+            .field("id", &self.id)
+            .field("name", &self.name)
+            .field("grant", &self.grant)
+            .field("recipe", &self.recipe)
+            .field("confirmed", &self.confirmed)
+            .field("push_endpoint", &self.push_endpoint.as_ref().map(|_| "<set>"))
+            .field("last_seen", &self.last_seen)
+            .field("last_host", &self.last_host)
+            .field("enrolled_host", &self.enrolled_host)
+            .finish()
+    }
 }
 
 /// The devices of one read of the store.
+#[derive(Default)]
 pub struct DeviceStore {
     devices: Vec<Device>,
 }
@@ -78,8 +174,8 @@ impl std::fmt::Debug for DeviceStore {
 impl DeviceStore {
     /// Reads the store at `path`. Refuses (`PermissionDenied`) a link, anything but a regular file, a file of another
     /// user and one with any group or other permission bit; refuses (`InvalidData`) a file over
-    /// [`DEVICES_MAX_BYTES`], another version, a field it does not know, a hash that is not 64 lowercase hex digits
-    /// and an id given twice.
+    /// [`DEVICES_MAX_BYTES`], a version this build does not read, a field it does not know, a hash that is not 64
+    /// lowercase hex digits and an id given twice.
     pub fn load(path: &Path) -> io::Result<DeviceStore> {
         let file = std::fs::OpenOptions::new()
             .read(true)
@@ -111,15 +207,42 @@ impl DeviceStore {
 
     fn parse(bytes: &[u8]) -> io::Result<DeviceStore> {
         let invalid = |why: String| io::Error::new(io::ErrorKind::InvalidData, why);
-        let file: StoreFile = serde_json::from_slice(bytes).map_err(|e| invalid(format!("device store: {e}")))?;
-        if file.v != DEVICES_FORMAT_V {
-            return Err(invalid(format!(
-                "device store version {} is not {DEVICES_FORMAT_V}",
-                file.v
-            )));
-        }
-        let mut devices: Vec<Device> = Vec::with_capacity(file.devices.len());
-        for entry in file.devices {
+        let value: serde_json::Value =
+            serde_json::from_slice(bytes).map_err(|e| invalid(format!("device store: {e}")))?;
+        let version = value.get("v").and_then(serde_json::Value::as_u64);
+        let entries: Vec<DeviceEntryV2> = match version {
+            Some(v) if v == u64::from(DEVICES_FORMAT_V) => {
+                let file: StoreFileV2 =
+                    serde_json::from_value(value).map_err(|e| invalid(format!("device store: {e}")))?;
+                file.devices
+            }
+            Some(v) if v == u64::from(DEVICES_FORMAT_V1) => {
+                let file: StoreFileV1 =
+                    serde_json::from_value(value).map_err(|e| invalid(format!("device store: {e}")))?;
+                file.devices
+                    .into_iter()
+                    .map(|entry| DeviceEntryV2 {
+                        id: entry.id,
+                        name: entry.name,
+                        token_sha256: entry.token_sha256,
+                        grant: entry.grant,
+                        recipe: Recipe::Unknown,
+                        confirmed: None,
+                        push_endpoint: None,
+                        last_seen: None,
+                        last_host: None,
+                        enrolled_host: String::new(),
+                    })
+                    .collect()
+            }
+            other => {
+                return Err(invalid(format!(
+                    "device store version {other:?} is not {DEVICES_FORMAT_V1} or {DEVICES_FORMAT_V}"
+                )))
+            }
+        };
+        let mut devices: Vec<Device> = Vec::with_capacity(entries.len());
+        for entry in entries {
             if devices.iter().any(|d| d.id == entry.id) {
                 return Err(invalid(format!("device {:?} is listed twice", entry.id)));
             }
@@ -130,9 +253,68 @@ impl DeviceStore {
                 name: entry.name,
                 token_sha256,
                 grant: entry.grant,
+                recipe: entry.recipe,
+                confirmed: entry.confirmed,
+                push_endpoint: entry.push_endpoint,
+                last_seen: entry.last_seen,
+                last_host: entry.last_host,
+                enrolled_host: entry.enrolled_host,
             });
         }
         Ok(DeviceStore { devices })
+    }
+
+    /// The store as version 2 writes it.
+    fn to_bytes(&self) -> Vec<u8> {
+        let file = StoreFileV2 {
+            v: DEVICES_FORMAT_V,
+            devices: self
+                .devices
+                .iter()
+                .map(|d| DeviceEntryV2 {
+                    id: d.id.clone(),
+                    name: d.name.clone(),
+                    token_sha256: hex(&d.token_sha256),
+                    grant: d.grant,
+                    recipe: d.recipe,
+                    confirmed: d.confirmed,
+                    push_endpoint: d.push_endpoint.clone(),
+                    last_seen: d.last_seen,
+                    last_host: d.last_host.clone(),
+                    enrolled_host: d.enrolled_host.clone(),
+                })
+                .collect(),
+        };
+        // Strings, numbers and enums of unit variants always serialize.
+        serde_json::to_vec(&file).unwrap_or_default()
+    }
+
+    /// Every device, in the order they were added.
+    pub fn devices(&self) -> &[Device] {
+        &self.devices
+    }
+
+    pub fn get(&self, id: &str) -> Option<&Device> {
+        self.devices.iter().find(|d| d.id == id)
+    }
+
+    pub fn get_mut(&mut self, id: &str) -> Option<&mut Device> {
+        self.devices.iter_mut().find(|d| d.id == id)
+    }
+
+    /// Adds `device`; `false`, changing nothing, when its id is taken.
+    pub fn insert(&mut self, device: Device) -> bool {
+        if self.get(&device.id).is_some() {
+            return false;
+        }
+        self.devices.push(device);
+        true
+    }
+
+    /// Takes the device `id` out, and with it everything kept of it.
+    pub fn remove(&mut self, id: &str) -> Option<Device> {
+        let at = self.devices.iter().position(|d| d.id == id)?;
+        Some(self.devices.remove(at))
     }
 
     /// The name and grant of `device` when `token` is its token. The token's hash is compared with the stored one
@@ -148,6 +330,76 @@ impl DeviceStore {
             _ => None,
         }
     }
+}
+
+/// Reads the store at `path` under its lock, lets `f` change it, and writes it back when it changed: 0600, to a
+/// temporary file beside it, then renamed into place, so a reader sees the old store or the new one, never part of
+/// one. A missing store starts empty, and its directory is made (0700). A store [`DeviceStore::load`] refuses is left
+/// as it is and the error returned, so nothing is written over a file that was not ours to read. Waits up to two
+/// seconds for another writer's lock (`WouldBlock` after that): never call it on the UI thread.
+pub fn update<T>(path: &Path, f: impl FnOnce(&mut DeviceStore) -> T) -> io::Result<T> {
+    let dir = path
+        .parent()
+        .filter(|d| !d.as_os_str().is_empty())
+        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "a device store path with no directory"))?;
+    agent::private_fs::create_private_dir_all(dir, dir.parent().unwrap_or(dir))?;
+    let _lock = lock(path)?;
+    let mut store = match DeviceStore::load(path) {
+        Ok(store) => store,
+        Err(e) if e.kind() == io::ErrorKind::NotFound => DeviceStore::default(),
+        Err(e) => return Err(e),
+    };
+    let before = store.to_bytes();
+    let out = f(&mut store);
+    let after = store.to_bytes();
+    if after != before {
+        if after.len() as u64 > DEVICES_MAX_BYTES {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("the device store would pass {DEVICES_MAX_BYTES} bytes"),
+            ));
+        }
+        save(path, &after)?;
+    }
+    Ok(out)
+}
+
+/// `devices.lock` beside the store at `path`.
+fn lock_path(path: &Path) -> PathBuf {
+    path.with_extension("lock")
+}
+
+/// The store's lock, tried until [`LOCK_WITHIN`] has passed.
+fn lock(path: &Path) -> io::Result<agent::private_fs::PrivateLock> {
+    let lock = agent::private_fs::PrivateLock::open(&lock_path(path))?;
+    let deadline = Instant::now() + LOCK_WITHIN;
+    loop {
+        if lock.try_lock()? {
+            return Ok(lock);
+        }
+        if Instant::now() >= deadline {
+            return Err(io::Error::new(
+                io::ErrorKind::WouldBlock,
+                format!("another process is writing {}", path.display()),
+            ));
+        }
+        std::thread::sleep(LOCK_PAUSE);
+    }
+}
+
+/// Writes `bytes` beside `path` and renames them into place.
+fn save(path: &Path, bytes: &[u8]) -> io::Result<()> {
+    let tmp = crate::state_paths::temporary(path);
+    let written = (|| {
+        let mut file = agent::private_fs::open_private(&tmp)?;
+        file.write_all(bytes)?;
+        file.sync_all()?;
+        std::fs::rename(&tmp, path)
+    })();
+    if written.is_err() {
+        let _ = std::fs::remove_file(&tmp);
+    }
+    written
 }
 
 /// Whether the two hashes are equal, looking at every byte whatever the first difference.
@@ -179,10 +431,12 @@ fn parse_hash(text: &str) -> Option<[u8; 32]> {
 
 /// The store's text form of a token's hash: SHA-256, 64 lowercase hex digits.
 pub fn token_hash_hex(token: &str) -> String {
-    Sha256::digest(token.as_bytes())
-        .iter()
-        .map(|b| format!("{b:02x}"))
-        .collect()
+    hex(&Sha256::digest(token.as_bytes()).into())
+}
+
+/// `bytes` as lowercase hex digits.
+fn hex(bytes: &[u8; 32]) -> String {
+    bytes.iter().map(|b| format!("{b:02x}")).collect()
 }
 
 #[cfg(test)]
@@ -243,7 +497,7 @@ mod tests {
     fn store_refuses_malformed_content() {
         let hash = token_hash_hex("tok");
         for body in [
-            r#"{"v":2,"devices":[]}"#.to_owned(),
+            r#"{"v":3,"devices":[]}"#.to_owned(),
             r#"{"v":1,"devices":[],"extra":1}"#.to_owned(),
             format!(r#"{{"v":1,"devices":[{{"id":"d1","name":"p","token_sha256":"{hash}","grant":"admin"}}]}}"#),
             format!(
@@ -260,6 +514,113 @@ mod tests {
         ] {
             assert!(DeviceStore::parse(body.as_bytes()).is_err(), "{body}");
         }
+    }
+
+    fn hash_of(token: &str) -> [u8; 32] {
+        Sha256::digest(token.as_bytes()).into()
+    }
+
+    fn device(id: &str, token: &str) -> Device {
+        Device {
+            id: id.into(),
+            name: format!("phone {id}"),
+            token_sha256: hash_of(token),
+            grant: Grant::Watch,
+            recipe: Recipe::Ssh,
+            confirmed: Some(Confirmed { at: 1_762_400_000 }),
+            push_endpoint: None,
+            last_seen: None,
+            last_host: None,
+            enrolled_host: "127.0.0.1:7341".into(),
+        }
+    }
+
+    #[test]
+    fn store_v1_files_load_as_v2() {
+        let path = store_file("remote-devices-v1", &one_device("watch+steer"), 0o600);
+        let store = DeviceStore::load(&path).expect("a v1 store loads");
+        let d1 = store.get("d1").expect("its device");
+        assert_eq!(
+            (d1.recipe, d1.confirmed, d1.enrolled_host.as_str(), d1.last_seen),
+            (Recipe::Unknown, None, "", None),
+            "what v1 did not record is unknown"
+        );
+        assert_eq!(store.verify("d1", "tok"), Some(("phone".to_owned(), Grant::WatchSteer)));
+
+        update(&path, |store| store.get_mut("d1").unwrap().last_seen = Some(42)).expect("the update writes");
+        let text = std::fs::read_to_string(&path).unwrap();
+        let written: serde_json::Value = serde_json::from_str(&text).unwrap();
+        assert_eq!(written["v"], 2, "written back as v2: {text}");
+        let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o600);
+        let again = DeviceStore::load(&path).unwrap();
+        assert_eq!(again.get("d1").unwrap().last_seen, Some(42));
+        assert_eq!(again.verify("d1", "tok"), Some(("phone".to_owned(), Grant::WatchSteer)));
+    }
+
+    #[test]
+    fn store_v2_round_trips_every_field() {
+        let dir = agent::state_dirs::test_workspace_dir("remote-devices-v2");
+        let path = dir.join("remote").join("devices.json");
+        let mut full = device("d1", "tok");
+        full.push_endpoint = Some("https://ntfy.example/t".into());
+        full.last_host = Some("127.0.0.1:7341".into());
+        full.last_seen = Some(9);
+        let kept = full.clone();
+        assert!(
+            update(&path, move |store| store.insert(full)).unwrap(),
+            "a new id is taken"
+        );
+        assert!(
+            !update(&path, |store| store.insert(device("d1", "other"))).unwrap(),
+            "an id taken is refused"
+        );
+        let store = DeviceStore::load(&path).unwrap();
+        assert_eq!(store.devices(), [kept]);
+        let shown = format!("{store:?} {:?}", store.devices()[0]);
+        assert!(!shown.contains("ntfy"), "the endpoint is not shown: {shown}");
+        let dir_mode = std::fs::metadata(path.parent().unwrap()).unwrap().permissions().mode() & 0o777;
+        assert_eq!(dir_mode, 0o700, "the store's directory is made private");
+    }
+
+    #[test]
+    fn update_leaves_an_untrusted_store_alone() {
+        let path = store_file("remote-devices-untrusted", &one_device("watch"), 0o644);
+        let err = update(&path, |store| store.remove("d1")).expect_err("a store others can read is not used");
+        assert_eq!(err.kind(), io::ErrorKind::PermissionDenied);
+        assert_eq!(
+            std::fs::read_to_string(&path).unwrap(),
+            one_device("watch"),
+            "and not rewritten"
+        );
+    }
+
+    #[test]
+    fn interleaved_revoke_and_add_keep_the_revoke() {
+        let path = store_file("remote-devices-interleaved", &one_device("watch+steer"), 0o600);
+        let (inside, entered) = std::sync::mpsc::channel();
+        let revoking = {
+            let path = path.clone();
+            std::thread::spawn(move || {
+                update(&path, |store| {
+                    inside.send(()).unwrap();
+                    // The other writer starts now and must wait for this one's write.
+                    std::thread::sleep(std::time::Duration::from_millis(300));
+                    store.remove("d1")
+                })
+            })
+        };
+        entered.recv().unwrap();
+        let adding = {
+            let path = path.clone();
+            std::thread::spawn(move || update(&path, |store| store.insert(device("d2", "tok2"))))
+        };
+        assert!(revoking.join().unwrap().unwrap().is_some(), "d1 was there to revoke");
+        assert!(adding.join().unwrap().unwrap(), "d2 was added");
+        let store = DeviceStore::load(&path).unwrap();
+        assert!(store.get("d1").is_none(), "the revoke survives the add");
+        assert!(store.get("d2").is_some(), "and the add survives too");
+        assert_eq!(store.verify("d1", "tok"), None);
     }
 
     #[test]

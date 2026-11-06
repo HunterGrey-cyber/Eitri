@@ -4065,6 +4065,7 @@ dependencies = [
  "alacritty_terminal",
  "eitri-core",
  "eitri-panel",
+ "eitri-remote",
  "eitri-terminal",
  "futures-channel",
  "glib 0.22.9",
