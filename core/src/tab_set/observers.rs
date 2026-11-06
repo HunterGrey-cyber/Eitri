@@ -14,18 +14,34 @@
 //! put in place of the one it followed (a restart, a resume, a reset), a `Resync` that lost events, a change to the
 //! broker's cards (which no events frame carries), and an observer registered fresh all owe a snapshot the same way. A tab that closes, or is frozen to move to another window,
 //! ends each of its observers with a `Gone` after what was already queued; nothing follows it.
+//!
+//! A snapshot holds the last turns only, under a byte ceiling (`tail`); older turns come as one `Page` at a time, asked
+//! for with [`TabSet::observer_more`] and built at the observer's next take within that take's budget. A `/clear` in
+//! the session starts a conversation whose turns are numbered anew, so it owes each observer a snapshot and drops a
+//! page owed of the one before. A tab whose session fails or goes away sends `Ended` once for that session (once per
+//! backend generation), after what was queued; a change to whether a phone may send to the
+//! tab (its agent, its mode, whether it holds a session) sends `SendBlock`. Both are read from the tab when frames are
+//! taken, so nothing in the tick has to report them.
 
 use std::collections::{BTreeMap, VecDeque};
 use std::sync::{Arc, Mutex};
 
 use agent::AgentDomainEvent;
 
-use super::{RowKey, Tab, TabSet, UnseenStretch};
+use super::{AgentId, BypassScope, RowKey, SessionModeChoice, Tab, TabBackend, TabSet, UnseenStretch};
+use crate::agent_backend::ProjectionRef;
 use crate::agent_bridge::{
-    serialize_events_with_notes_and_revisions_for_js, serialize_snapshot_with_notes_for_js, CallNotes, SnapshotView,
-    TurnTime,
+    serialize_events_with_notes_and_revisions_for_js, serialize_snapshot_with_notes_for_js, serialize_tabs_for_js,
+    CallNotes, SnapshotView, TurnTime,
 };
+use crate::remote_greeting::{remote_theme, Greeting, PendingPrompt};
+use crate::remote_rv::{CutEntry, EndedHow, MoreRefusal, SendBlock};
 use crate::tabs::TabId;
+
+mod tail;
+use tail::{Turns, SNAPSHOT_CEILING_BYTES};
+#[cfg(test)]
+use tail::{CUT_KEEP_BYTES, MORE_PAGE_TURNS, SNAPSHOT_TURNS};
 
 /// An observer registered with [`TabSet::observe`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
@@ -56,11 +72,14 @@ pub struct WorkMark {
 /// `work` names the session and the unseen stretch as they stand there.
 #[derive(Debug, Clone)]
 pub enum ObserverFrame {
-    /// The tab's whole state through `through`; whatever the observer held before is replaced.
+    /// The tab's state through `through`, from turn `first_turn` on; whatever the observer held before is replaced.
+    /// `cut` names the entries it holds only the start of.
     Snapshot {
         key: RowKey,
         through: u64,
         work: WorkMark,
+        first_turn: u64,
+        cut: Vec<CutEntry>,
         json: Arc<str>,
     },
     /// The events after revision `from` through `through`, with their own revisions; `from` is where the previous
@@ -72,6 +91,19 @@ pub enum ObserverFrame {
         work: WorkMark,
         json: Arc<str>,
     },
+    /// Turns `from_turn` through `through_turn` of the session `mark` names, every entry whole: the answer to
+    /// [`TabSet::observer_more`]. The envelope is the snapshot's, holding only those turns.
+    Page {
+        key: RowKey,
+        mark: WorkMark,
+        from_turn: u64,
+        through_turn: u64,
+        json: Arc<str>,
+    },
+    /// The tab's session failed or went away; the tab is still here, and a new session's snapshot may follow.
+    Ended { key: RowKey, how: EndedHow },
+    /// Whether, and why not, a phone may send to the tab now.
+    SendBlock { key: RowKey, block: Option<SendBlock> },
     /// The last frame of this observer.
     Gone { key: RowKey, why: GoneWhy },
 }
@@ -80,8 +112,10 @@ impl ObserverFrame {
     /// What the frame counts against a queue's cap and a take's budget.
     fn bytes(&self) -> usize {
         match self {
-            ObserverFrame::Snapshot { json, .. } | ObserverFrame::Events { json, .. } => json.len(),
-            ObserverFrame::Gone { .. } => 0,
+            ObserverFrame::Snapshot { json, .. }
+            | ObserverFrame::Events { json, .. }
+            | ObserverFrame::Page { json, .. } => json.len(),
+            ObserverFrame::Ended { .. } | ObserverFrame::SendBlock { .. } | ObserverFrame::Gone { .. } => 0,
         }
     }
 }
@@ -140,6 +174,13 @@ pub(super) struct Observer {
     needs_snapshot: bool,
     /// `Gone` is queued: nothing more is.
     gone: bool,
+    /// The turn a page asked for with `more` ends before, until a take builds it.
+    owed_page: Option<u64>,
+    /// The tab's backend generation whose end the observer was told: `Ended` goes once per generation, whether or not
+    /// the observer ever had that generation's snapshot.
+    ended_of: Option<u64>,
+    /// What the observer was last told about sending to the tab (by its greeting, then by `SendBlock`).
+    send_block: Option<SendBlock>,
 }
 
 impl Observer {
@@ -189,7 +230,7 @@ impl Observers {
         }
     }
 
-    fn add(&mut self, tab: TabId, key: RowKey, generation: u64) -> ObserverId {
+    fn add(&mut self, tab: TabId, key: RowKey, generation: u64, send_block: Option<SendBlock>) -> ObserverId {
         self.next_id += 1;
         self.by_id.insert(
             self.next_id,
@@ -203,6 +244,9 @@ impl Observers {
                 queued_bytes: 0,
                 needs_snapshot: true,
                 gone: false,
+                owed_page: None,
+                ended_of: None,
+                send_block,
             },
         );
         ObserverId(self.next_id)
@@ -236,7 +280,18 @@ impl Observers {
         turn_times: &[TurnTime],
     ) {
         let mut built: Vec<(Position, Option<Built>)> = Vec::new();
+        // A `/clear` empties the conversation the observers' turn numbers and pages are of: each gets the new one as a
+        // snapshot, and a page owed of the old one is never built from the new one.
+        let reset = batch
+            .events
+            .iter()
+            .any(|event| matches!(event, AgentDomainEvent::ConversationReset { .. }));
         for observer in self.of(tab) {
+            if reset {
+                observer.want_snapshot();
+                observer.owed_page = None;
+                continue;
+            }
             if observer.generation != generation {
                 observer.want_snapshot();
                 continue;
@@ -338,9 +393,21 @@ fn events_frame(
     Some((watermark, through, Arc::from(json)))
 }
 
-/// The tab's snapshot for an observer: its revision, the work it shows, its envelope and the newest turn time it
-/// carries. Read from the same view as the desk's snapshot, and nothing of the tab's delivery state is changed.
-fn observer_snapshot(tab: &Tab) -> Option<(u64, WorkMark, String, Option<TurnTime>)> {
+/// An observer's snapshot as built: its revision, the work it shows, the first turn it holds, the entries it holds cut,
+/// its envelope, and the newest of the tab's turn times when it was read.
+struct BuiltSnapshot {
+    through: u64,
+    work: WorkMark,
+    first_turn: u64,
+    cut: Vec<CutEntry>,
+    json: String,
+    turn_time: Option<TurnTime>,
+}
+
+/// The tab's snapshot for an observer, tail-limited (`tail`). Read from the same view as the desk's snapshot, and
+/// nothing of the tab's delivery state is changed. A conversation that fits whole is serialized from the live view;
+/// otherwise the turns it keeps are copied while the projection is held, and serialized from the copy after.
+fn observer_snapshot(tab: &Tab) -> Option<BuiltSnapshot> {
     let backend = tab.live()?;
     let view = SnapshotView::of(backend, &tab.session.host_answered);
     // The clock as the last tick left it, and only for the turn this very snapshot names: a clock from the turn
@@ -351,18 +418,159 @@ fn observer_snapshot(tab: &Tab) -> Option<(u64, WorkMark, String, Option<TurnTim
         .as_ref()
         .filter(|(turn, _)| view.projection.active_turn_id.as_deref() == Some(turn.as_str()))
         .map(|(_, at)| *at);
-    let json = serialize_snapshot_with_notes_for_js(tab.id, &view, started_at, &tab.notes, &tab.session.editor_cards);
+    let through = view.projection.last_revision;
     // The stretch read beside the revision, under the same guard, as a stop's admission reads them.
     let work = WorkMark {
         generation: tab.backend_generation,
+        unseen: tab.unseen_stretch_at(through),
+    };
+    // Every turn time the tab had when the snapshot was read: the next events frame carries only those after it.
+    let turn_time = tab.notes.turn_times.last().cloned();
+    let cards = &tab.session.editor_cards;
+    let turns = Turns::of(&view.projection);
+    let mut tail = tail::choose_tail(&view.projection, &turns, SNAPSHOT_CEILING_BYTES);
+    if tail.is_whole() {
+        let json = serialize_snapshot_with_notes_for_js(tab.id, &view, started_at, &tab.notes, cards);
+        let over = json.len().saturating_sub(SNAPSHOT_CEILING_BYTES);
+        // One turn over the ceiling has its largest entries cut, as a last turn alone over it does.
+        let fewer = match (over, turns.count()) {
+            (0, _) => None,
+            (_, 1) => tail::cut_largest(tail, &view.projection, over),
+            _ => Some(tail::shorter(tail, &turns, 1)),
+        };
+        let Some(fewer) = fewer else {
+            // Under the ceiling, or nothing left to cut.
+            return Some(BuiltSnapshot {
+                through,
+                work,
+                first_turn: 0,
+                cut: Vec::new(),
+                json,
+                turn_time,
+            });
+        };
+        tail = fewer;
+    }
+    let SnapshotView {
+        backend: kind,
+        conversation_id,
+        session_id,
+        provider_session_id,
+        capabilities,
+        provider,
+        projection,
+        hidden_pending,
+    } = view;
+    let mut copy = tail::tail_copy(&projection, &tail);
+    drop(projection);
+    // The estimate keeps it under the ceiling; what the state beside the turns weighs is known only once serialized,
+    // so a snapshot still over drops the share of its turns it is over by, a few times at most.
+    for attempt in 0..4 {
+        let view = SnapshotView {
+            backend: kind,
+            conversation_id,
+            session_id,
+            provider_session_id: provider_session_id.clone(),
+            capabilities,
+            provider,
+            projection: ProjectionRef::Borrowed(&copy),
+            hidden_pending,
+        };
+        let notes = tail::notes_between(&tab.notes, tail.from_seq(), u64::MAX);
+        let json = serialize_snapshot_with_notes_for_js(tab.id, &view, started_at, &notes, cards);
+        drop(view);
+        let held = turns.count() as usize - tail.first_turn;
+        let over = json.len().saturating_sub(SNAPSHOT_CEILING_BYTES);
+        // Over the ceiling: drop the share of the turns it is over by, or, with one turn left, cut its largest entries.
+        let fewer = match (over, held, attempt) {
+            (0, _, _) | (_, _, 3) => None,
+            (_, 1, _) => tail::cut_largest(tail.clone(), &copy, over),
+            _ => Some(tail::shorter(
+                tail.clone(),
+                &turns,
+                (held * over).div_ceil(json.len()).max(1),
+            )),
+        };
+        let Some(fewer) = fewer else {
+            return Some(BuiltSnapshot {
+                through,
+                work,
+                first_turn: tail.first_turn as u64,
+                cut: tail.cut_entries(),
+                json,
+                turn_time,
+            });
+        };
+        tail = fewer;
+        copy = tail::tail_copy(&copy, &tail);
+    }
+    unreachable!("the last attempt returns")
+}
+
+/// A page of turns before `before_turn` for an observer, within `limit` bytes (at least one turn, however large): the
+/// work it is of, its first and last turn and its envelope. `None` when the tab holds no session or no such turn.
+fn observer_page(tab: &Tab, before_turn: u64, limit: usize) -> Option<(WorkMark, u64, u64, String)> {
+    let backend = tab.live()?;
+    let view = SnapshotView::of(backend, &tab.session.host_answered);
+    let mark = WorkMark {
+        generation: tab.backend_generation,
         unseen: tab.unseen_stretch_at(view.projection.last_revision),
     };
-    Some((
-        view.projection.last_revision,
-        work,
-        json,
-        tab.notes.turn_times.last().cloned(),
-    ))
+    let turns = Turns::of(&view.projection);
+    let (from, through) = tail::choose_page(&view.projection, &turns, before_turn, limit)?;
+    let SnapshotView {
+        backend: kind,
+        conversation_id,
+        session_id,
+        provider_session_id,
+        capabilities,
+        provider,
+        projection,
+        hidden_pending,
+    } = view;
+    let copy = tail::page_copy(&projection, &turns, from, through);
+    drop(projection);
+    let view = SnapshotView {
+        backend: kind,
+        conversation_id,
+        session_id,
+        provider_session_id,
+        capabilities,
+        provider,
+        projection: ProjectionRef::Borrowed(&copy),
+        hidden_pending,
+    };
+    let (lo, hi) = tail::page_seqs(&turns, from, through);
+    let notes = tail::notes_between(&tab.notes, lo, hi);
+    // No clock and no broker cards: a page is past turns, not the session as it stands.
+    let json = serialize_snapshot_with_notes_for_js(tab.id, &view, None, &notes, &[]);
+    Some((mark, from as u64, through as u64, json))
+}
+
+/// Why a phone may not send to `tab` now, if it may not: only a Claude tab holding a session takes a message, and
+/// never in Bypass.
+fn send_block_of(tab: &Tab) -> Option<SendBlock> {
+    if *tab.agent() != AgentId::Claude {
+        return Some(SendBlock::NotClaude);
+    }
+    if tab.live().is_none() {
+        return Some(SendBlock::NotStarted);
+    }
+    (tab.mode() == SessionModeChoice::Bypass).then_some(SendBlock::Bypass)
+}
+
+/// How `tab`'s session ended, when it has: failed (a failed start or tripwire, or a session the agent reported
+/// unavailable), or gone (closed, or taken out of the tab).
+fn ended_how(tab: &Tab) -> Option<EndedHow> {
+    match &tab.backend {
+        TabBackend::Live(backend) => match backend.projection().status {
+            agent::ProjectionStatus::Unavailable { .. } => Some(EndedHow::Failed),
+            agent::ProjectionStatus::Closed { .. } => Some(EndedHow::Lost),
+            agent::ProjectionStatus::Starting | agent::ProjectionStatus::Running => None,
+        },
+        TabBackend::Failed { .. } => Some(EndedHow::Failed),
+        TabBackend::NotStarted | TabBackend::Starting(_) | TabBackend::AwaitingTrust(_) => Some(EndedHow::Lost),
+    }
 }
 
 impl TabSet {
@@ -381,7 +589,94 @@ impl TabSet {
         if tab.live().is_none() || self.moving.contains(&tab.id.0) {
             return Err(ObserveError::NotLive);
         }
-        Ok(self.observers.add(tab.id, key.clone(), tab.backend_generation))
+        Ok(self
+            .observers
+            .add(tab.id, key.clone(), tab.backend_generation, send_block_of(tab)))
+    }
+
+    /// Asks for the turns of the session `generation` before `before_turn`, as one `Page` at the observer's next take.
+    /// Refused when that session is not the one the observer follows now, or while a snapshot is owed to it (a first
+    /// one, a new session's, the conversation a `/clear` started): its turn numbers are those of the snapshot it has
+    /// not had yet (`WorkChanged`); while a page is still owed
+    /// (`Outstanding`: one at a time, so a peer asking again and again holds at most one page), and for a turn the
+    /// session does not have (`NoSuchTurn`).
+    pub fn observer_more(&mut self, id: ObserverId, generation: u64, before_turn: u64) -> Result<(), MoreRefusal> {
+        let observer = self
+            .observers
+            .by_id
+            .get_mut(&id.0)
+            .filter(|o| !o.gone)
+            .ok_or(MoreRefusal::WorkChanged)?;
+        let tab = self
+            .tabs
+            .iter()
+            .find(|t| t.id == observer.tab)
+            .filter(|t| !self.moving.contains(&t.id.0))
+            .ok_or(MoreRefusal::WorkChanged)?;
+        if observer.needs_snapshot || observer.generation != generation || tab.backend_generation != generation {
+            return Err(MoreRefusal::WorkChanged);
+        }
+        let backend = tab.live().ok_or(MoreRefusal::WorkChanged)?;
+        if observer.owed_page.is_some() {
+            return Err(MoreRefusal::Outstanding);
+        }
+        let count = Turns::of(&backend.projection()).count();
+        if before_turn == 0 || before_turn > count {
+            return Err(MoreRefusal::NoSuchTurn);
+        }
+        observer.owed_page = Some(before_turn);
+        Ok(())
+    }
+
+    /// What a phone is shown of the tab `key` before its snapshot: the tab as the strip shows it (without the desk's
+    /// question drafts), a trust or bypass question it waits on (what it says, never what answers it), the live notices,
+    /// whether a `!` line runs, the window's colours and why a phone may not send to it. `root_note` and `theme` are the
+    /// window's. `None` for a tab this window does not hold.
+    pub fn remote_greeting(
+        &self,
+        key: &RowKey,
+        root_note: Option<&str>,
+        theme: &crate::theme::ThemeTokens,
+    ) -> Option<Greeting> {
+        let tab = self.tabs.iter().find(|t| t.row_key() == key)?;
+        let strip = serialize_tabs_for_js(tab.id, &[tab.view(tab.resumable(self.kind))], self.default_mode);
+        let mut entry = serde_json::from_str::<serde_json::Value>(&strip).ok()?["tabs"][0].take();
+        if let Some(fields) = entry.as_object_mut() {
+            fields.remove("questionDraft");
+        }
+        let prompt = match (&tab.backend, &self.pending_bypass) {
+            (TabBackend::AwaitingTrust(_), _) => Some(PendingPrompt::Trust),
+            (_, Some(plan)) if matches!(plan.scope, BypassScope::Tab(id) if id == tab.id) => {
+                Some(PendingPrompt::Bypass {
+                    lines: plan.lines.clone(),
+                })
+            }
+            _ => None,
+        };
+        let notices = tab
+            .live()
+            .map(|backend| {
+                let projection = backend.projection();
+                [
+                    &projection.api_retry,
+                    &projection.rate_limit_warning,
+                    &projection.notification,
+                ]
+                .into_iter()
+                .flatten()
+                .filter_map(|notice| notice.content.clone())
+                .collect()
+            })
+            .unwrap_or_default();
+        Some(Greeting {
+            tab: entry,
+            prompt,
+            root_note: root_note.map(str::to_owned),
+            notices,
+            shell_running: self.shell_line_runs(tab.id),
+            theme: remote_theme(theme),
+            send_block: send_block_of(tab),
+        })
     }
 
     /// Forgets the observer and whatever waits for it; an id it does not know changes nothing.
@@ -399,20 +694,28 @@ impl TabSet {
         self.observers.reaper.clone()
     }
 
-    /// Observers with something to take: frames queued, or a snapshot owed that can be built now.
+    /// Observers with something to take: frames queued, a snapshot or a page owed that can be built now, an `Ended`
+    /// or a `SendBlock` to tell.
     pub fn observers_with_frames(&self) -> Vec<ObserverId> {
         self.observers
             .by_id
             .iter()
             .filter(|(_, observer)| {
-                !observer.queue.is_empty()
-                    || (!observer.gone
-                        && self
-                            .tabs
-                            .iter()
-                            .find(|t| t.id == observer.tab)
-                            .filter(|t| t.live().is_some() && !self.moving.contains(&t.id.0))
-                            .is_some_and(|t| observer.needs_snapshot || observer.generation != t.backend_generation))
+                if !observer.queue.is_empty() {
+                    return true;
+                }
+                let Some(tab) = (!observer.gone)
+                    .then(|| self.tabs.iter().find(|t| t.id == observer.tab))
+                    .flatten()
+                    .filter(|t| !self.moving.contains(&t.id.0))
+                else {
+                    return false;
+                };
+                let renewed = observer.generation != tab.backend_generation;
+                let live = tab.live().is_some();
+                (live && (observer.needs_snapshot || renewed || observer.owed_page.is_some()))
+                    || (observer.ended_of != Some(tab.backend_generation) && ended_how(tab).is_some())
+                    || send_block_of(tab) != observer.send_block
             })
             .map(|(id, _)| ObserverId(*id))
             .collect()
@@ -432,27 +735,33 @@ impl TabSet {
             .iter()
             .find(|t| t.id == observer.tab)
             .filter(|t| !moving.contains(&t.id.0));
-        if let (false, Some(tab)) = (observer.gone, tab) {
-            // Frames of a backend that is no longer the tab's are not this session's history.
+        let tab = tab.filter(|_| !observer.gone);
+        if let Some(tab) = tab {
+            // Frames of a backend that is no longer the tab's are not this session's history, and its page is not
+            // this session's either. Whether its end was told is kept by generation (`ended_of`), never reset here:
+            // a new session that fails before its snapshot can be built is told once, not at every take.
             if observer.generation != tab.backend_generation {
                 observer.want_snapshot();
+                observer.owed_page = None;
             }
             if observer.needs_snapshot {
-                if let Some((through, work, json, turn_time)) = observer_snapshot(tab) {
+                if let Some(built) = observer_snapshot(tab) {
                     #[cfg(test)]
                     {
                         self.observers.snapshots_built += 1;
                     }
                     observer.needs_snapshot = false;
                     observer.generation = tab.backend_generation;
-                    observer.watermark = through;
-                    observer.turn_time_sent = turn_time;
-                    used = json.len();
+                    observer.watermark = built.through;
+                    observer.turn_time_sent = built.turn_time;
+                    used = built.json.len();
                     frames.push(ObserverFrame::Snapshot {
                         key: observer.key.clone(),
-                        through,
-                        work,
-                        json: Arc::from(json),
+                        through: built.through,
+                        work: built.work,
+                        first_turn: built.first_turn,
+                        cut: built.cut,
+                        json: Arc::from(built.json),
                     });
                 }
             }
@@ -466,6 +775,49 @@ impl TabSet {
             observer.queued_bytes -= bytes;
             frames.extend(observer.queue.pop_front());
         }
+        // What is read from the tab itself comes after every frame that was queued before it.
+        if let (Some(tab), true) = (tab, observer.queue.is_empty()) {
+            if let Some(before_turn) = observer.owed_page.filter(|_| !observer.needs_snapshot) {
+                // Within what the take has left; a page alone may be larger, as one frame always may.
+                let limit = if frames.is_empty() {
+                    max_bytes
+                } else {
+                    max_bytes.saturating_sub(used)
+                };
+                match observer_page(tab, before_turn, limit.min(SNAPSHOT_CEILING_BYTES)) {
+                    Some((_, _, _, json)) if !frames.is_empty() && used.saturating_add(json.len()) > max_bytes => {}
+                    Some((mark, from_turn, through_turn, json)) => {
+                        observer.owed_page = None;
+                        frames.push(ObserverFrame::Page {
+                            key: observer.key.clone(),
+                            mark,
+                            from_turn,
+                            through_turn,
+                            json: Arc::from(json),
+                        });
+                    }
+                    // No session to page through: its `Ended` says so.
+                    None => observer.owed_page = None,
+                }
+            }
+            if observer.ended_of != Some(tab.backend_generation) {
+                if let Some(how) = ended_how(tab) {
+                    observer.ended_of = Some(tab.backend_generation);
+                    frames.push(ObserverFrame::Ended {
+                        key: observer.key.clone(),
+                        how,
+                    });
+                }
+            }
+            let block = send_block_of(tab);
+            if block != observer.send_block {
+                observer.send_block = block;
+                frames.push(ObserverFrame::SendBlock {
+                    key: observer.key.clone(),
+                    block,
+                });
+            }
+        }
         if observer.gone && observer.queue.is_empty() {
             self.observers.by_id.remove(&id.0);
         }
@@ -477,6 +829,8 @@ impl TabSet {
 mod tests {
     use super::super::*;
     use super::*;
+
+    mod feed_tests;
     use crate::test_providers::RecordingProvider;
     use agent::{AgentConversation, AgentDomainEvent};
     use std::path::{Path, PathBuf};
@@ -586,6 +940,8 @@ mod tests {
         revisions: Vec<u64>,
         gone: Option<GoneWhy>,
         frames: usize,
+        /// The frames not about revisions (pages, ends, send blocks), in order.
+        others: Vec<ObserverFrame>,
     }
 
     impl Phone {
@@ -630,16 +986,16 @@ mod tests {
                         self.through = Some(through);
                     }
                     ObserverFrame::Gone { why, .. } => self.gone = Some(why),
+                    other @ (ObserverFrame::Page { .. }
+                    | ObserverFrame::Ended { .. }
+                    | ObserverFrame::SendBlock { .. }) => self.others.push(other),
                 }
             }
         }
     }
 
     fn frame_bytes(frame: &ObserverFrame) -> usize {
-        match frame {
-            ObserverFrame::Snapshot { json, .. } | ObserverFrame::Events { json, .. } => json.len(),
-            ObserverFrame::Gone { .. } => 0,
-        }
+        frame.bytes()
     }
 
     #[test]
@@ -1289,7 +1645,9 @@ mod tests {
             let mut bytes = 0;
             for _ in 0..9 {
                 let started = Instant::now();
-                let (_, _, text, _) = observer_snapshot(set.get(tab).unwrap()).expect("a live tab has a snapshot");
+                let text = observer_snapshot(set.get(tab).unwrap())
+                    .expect("a live tab has a snapshot")
+                    .json;
                 times.push(started.elapsed());
                 bytes = text.len();
             }

@@ -120,6 +120,8 @@ pub struct RemoteSocket {
     conns: RefCell<BTreeMap<u64, Conn>>,
     /// The tab set's reaper, taken at the first subscription.
     reaper: RefCell<Option<ObserverReaper>>,
+    /// What the feed keeps across pumps: the colours connections were told, the number of the next chunked line.
+    feed: feed::FeedState,
     /// Why each connection the tick forgot was closed, in order.
     #[cfg(test)]
     closes: RefCell<Vec<CloseWhy>>,
@@ -164,6 +166,7 @@ impl RemoteSocket {
             inbound: rx,
             conns: RefCell::new(BTreeMap::new()),
             reaper: RefCell::new(None),
+            feed: feed::FeedState::default(),
             #[cfg(test)]
             closes: RefCell::new(Vec::new()),
         })

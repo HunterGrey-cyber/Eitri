@@ -297,14 +297,20 @@ fn subscribe_streams_snapshot_then_events() {
     let mut client = rig.connect();
     rig.subscribe(&mut client, &key);
     let mut lines = rig.until(&mut client, "the snapshot", |l| l["kind"] == "snapshot");
-    assert_eq!(lines[0]["key"], key.as_str());
-    assert_eq!(lines[0]["frame"]["kind"], "snapshot", "the desk's own envelope");
+    assert_eq!(
+        (&lines[0]["kind"], &lines[0]["key"]),
+        (&serde_json::json!("greeting"), &serde_json::json!(key.as_str())),
+        "the tab's greeting comes first"
+    );
+    let snapshot = lines.last().unwrap().clone();
+    assert_eq!(snapshot["key"], key.as_str());
+    assert_eq!(snapshot["frame"]["kind"], "snapshot", "the desk's own envelope");
 
     provider.queue(delta("t1", "hello"));
     provider.queue(delta("t1", " world"));
     let target = {
         tick_handle_until(&rig.handle, "the deltas", || {
-            rig.revision(tab) >= lines[0]["through"].as_u64().unwrap() + 2
+            rig.revision(tab) >= snapshot["through"].as_u64().unwrap() + 2
         });
         rig.revision(tab)
     };
@@ -499,7 +505,7 @@ fn connection_and_observer_caps_hold() {
                 Err(_) => break,
             }
         }
-        if answered.is_some_and(|l| l["kind"] == "snapshot") {
+        if answered.is_some_and(|l| l["kind"] == "greeting" || l["kind"] == "snapshot") {
             break;
         }
     }
@@ -634,9 +640,9 @@ fn a_half_closed_peer_frees_its_writer() {
     let rig = Rig::new("remote-half-close");
     let (tab, provider, key) = rig.tab();
     rig.start_turn(tab, &provider, "t1");
-    // A snapshot of about 1 MB, far more than the socket holds unread.
+    // A snapshot of about 0.9 MB (whole, under the snapshot ceiling), far more than the socket holds unread.
     let text = "x".repeat(1024);
-    for _ in 0..10 {
+    for _ in 0..9 {
         rig.fold(tab, &provider, 100, &text);
     }
     let mut raw = UnixStream::connect(&rig.path).unwrap();
@@ -857,9 +863,9 @@ fn stalled_writer_is_closed_after_the_deadline() {
     );
     let (tab, provider, key) = rig.tab();
     rig.start_turn(tab, &provider, "t1");
-    // A snapshot of about 1 MB, far more than the socket holds unread.
+    // A snapshot of about 0.9 MB (whole, under the snapshot ceiling), far more than the socket holds unread.
     let text = "x".repeat(1024);
-    for _ in 0..10 {
+    for _ in 0..9 {
         rig.fold(tab, &provider, 100, &text);
     }
     let mut raw = UnixStream::connect(&rig.path).unwrap();
@@ -895,9 +901,9 @@ fn a_write_cut_short_by_the_deadline_is_the_stall() {
     let rig = Rig::with_deadlines("remote-write-short", deadlines(Duration::from_secs(3600), stall));
     let (tab, provider, key) = rig.tab();
     rig.start_turn(tab, &provider, "t1");
-    // A snapshot of about 1 MB: the first write moves what the socket holds unread at once, then waits.
+    // A snapshot of about 0.9 MB: the first write moves what the socket holds unread at once, then waits.
     let text = "x".repeat(1024);
-    for _ in 0..10 {
+    for _ in 0..9 {
         rig.fold(tab, &provider, 100, &text);
     }
     let mut raw = UnixStream::connect(&rig.path).unwrap();
@@ -960,9 +966,15 @@ fn every_new_kind_parses_and_is_refused_not_yet() {
         client.send(&line).unwrap();
         let lines = rig.until(&mut client, "the refusal", |l| l["kind"] == "refused");
         let refusal = lines.last().unwrap();
+        // `more` is carried out: about a tab this connection does not follow, it is refused as such.
+        let why = if matches!(line, RvInbound::More { .. }) {
+            "not subscribed"
+        } else {
+            "not yet"
+        };
         assert_eq!(
             (&refusal["why"], &refusal["key"]),
-            (&serde_json::json!("not yet"), &key),
+            (&serde_json::json!(why), &key),
             "{line:?}"
         );
     }

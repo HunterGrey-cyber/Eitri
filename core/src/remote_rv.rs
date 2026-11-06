@@ -8,8 +8,9 @@
 //! quiet connection open; the rest are `serve`'s errands about devices (an enrollment, a grant, the listen address,
 //! a self-revocation, a push endpoint, who is connected). Outbound ([`RvOutbound`]), from the Eitri process: the
 //! frames of a followed tab ([`frame_line`]), `result` for an `act` ([`result_line`]), `refused` for a line turned
-//! down ([`refused_line`]), `pong`, and the answers to `serve`'s errands. A credential in a line is a [`Secret`],
-//! whose `Debug` never shows it.
+//! down ([`refused_line`]), `pong`, and the answers to `serve`'s errands. A line longer than [`RV_MAX_LINE`] goes as
+//! `chunk` lines of at most [`CHUNK_BYTES`] each, the piece's escapes counted ([`chunk_lines`]). A credential in a line is a
+//! [`Secret`], whose `Debug` never shows it.
 //!
 //! The socket sits in the control directory beside `ag-<instance>.sock`, built through `agent::socket_path::in_dir`,
 //! which refuses a path over the socket path limit. [`RvListener`] binds it with the control sockets' posture (the
@@ -252,12 +253,38 @@ pub fn frame_line(frame: &ObserverFrame) -> String {
             key,
             through,
             work,
+            first_turn,
+            cut,
             json,
         } => format!(
-            r#"{{"v":{RV_PROTOCOL},"kind":"snapshot","key":{},"through":{through},{},"frame":{json}}}"#,
+            r#"{{"v":{RV_PROTOCOL},"kind":"snapshot","key":{},"through":{through},{},"first_turn":{first_turn},"cut":{},"frame":{json}}}"#,
             json_string(key.as_str()),
             work_fields(work),
+            serde_json::to_string(cut).unwrap_or_else(|_| "[]".to_owned()),
         ),
+        ObserverFrame::Page {
+            key,
+            mark,
+            from_turn,
+            through_turn,
+            json,
+        } => format!(
+            r#"{{"v":{RV_PROTOCOL},"kind":"page","key":{},{},"from_turn":{from_turn},"through_turn":{through_turn},"frame":{json}}}"#,
+            json_string(key.as_str()),
+            work_fields(mark),
+        ),
+        ObserverFrame::Ended { key, how } => RvOutbound::Ended {
+            v: RV_PROTOCOL,
+            key: key.as_str().to_owned(),
+            how: *how,
+        }
+        .line(),
+        ObserverFrame::SendBlock { key, block } => RvOutbound::SendBlock {
+            v: RV_PROTOCOL,
+            key: key.as_str().to_owned(),
+            block: *block,
+        }
+        .line(),
         ObserverFrame::Events {
             key,
             from,
@@ -296,6 +323,38 @@ pub enum SendBlock {
     WatchOnly,
 }
 
+/// An entry a snapshot holds only the start of, as the frame names it: `entry_id` is the collection of the desk's
+/// envelope and the entry's `seq` (`transcript:42`, `toolCalls:57`), `bytes` about how long the whole entry is. The
+/// whole entry comes in the `page` that `more` with a `before_turn` past the entry's turn returns.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct CutEntry {
+    pub entry_id: String,
+    pub bytes: u64,
+}
+
+/// Why a `more` line was turned down.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MoreRefusal {
+    /// The session it names is not the one the observer follows now (replaced, or not yet snapshotted).
+    WorkChanged,
+    /// A page is already owed to this observer; one at a time.
+    Outstanding,
+    /// No such turn in the session: `before_turn` is 0 or past the last turn.
+    NoSuchTurn,
+}
+
+impl MoreRefusal {
+    /// The `why` of the `refused` line.
+    pub fn why(self) -> &'static str {
+        match self {
+            MoreRefusal::WorkChanged => "the session changed",
+            MoreRefusal::Outstanding => "a page is on its way",
+            MoreRefusal::NoSuchTurn => "no such turn",
+        }
+    }
+}
+
 /// How a followed tab's session ended without the tab closing.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -315,7 +374,8 @@ pub enum EndedHow {
 pub enum RvOutbound {
     /// The answer to `ping`.
     Pong { v: u32 },
-    /// The followed tab's state through `through`.
+    /// The followed tab's state through `through`, from turn `first_turn` on; `cut` names the entries it holds only
+    /// the start of.
     Snapshot {
         v: u32,
         key: String,
@@ -323,6 +383,8 @@ pub enum RvOutbound {
         generation: u64,
         #[serde(deserialize_with = "present")]
         unseen: Option<u64>,
+        first_turn: u64,
+        cut: Vec<CutEntry>,
         frame: serde_json::Value,
     },
     /// The followed tab's events after `from` through `through`.
@@ -444,6 +506,72 @@ pub fn result_line(command_id: Option<&str>, outcome: Result<(), &str>) -> Strin
         why: outcome.err().map(str::to_owned),
     }
     .line()
+}
+
+/// What a byte of a string takes once JSON escapes it: a quote, a backslash or a control character more than itself.
+fn json_escaped_byte(byte: u8) -> usize {
+    match byte {
+        b'"' | b'\\' | b'\n' | b'\r' | b'\t' | 0x08 | 0x0c => 2,
+        0..=0x1f => 6,
+        _ => 1,
+    }
+}
+
+/// How many bytes `text` takes inside a JSON string, its escapes counted (its quotes not).
+pub fn json_escaped_len(text: &str) -> usize {
+    text.bytes().map(json_escaped_byte).sum()
+}
+
+/// What a `chunk` line takes beside its piece: the envelope, the largest numbers, and the newline.
+const CHUNK_ENVELOPE_BYTES: usize = 128;
+
+/// `line` as `chunk` lines numbered `of`, cut only between characters, so the pieces joined in order are `line` again.
+/// Each piece is sized by what it takes once escaped into its `data`, so every chunk line, newline included, is at most
+/// [`CHUNK_BYTES`] whatever the text holds. A line of at most [`RV_MAX_LINE`] is returned whole.
+pub fn chunk_lines(of: u64, line: &str) -> Vec<String> {
+    chunk_lines_over(of, line, RV_MAX_LINE)
+}
+
+/// [`chunk_lines`] for a line longer than `whole` bytes; one of at most `whole` is returned as it is.
+pub fn chunk_lines_over(of: u64, line: &str, whole: usize) -> Vec<String> {
+    if line.len() <= whole {
+        return vec![line.to_owned()];
+    }
+    const PIECE: usize = CHUNK_BYTES - CHUNK_ENVELOPE_BYTES;
+    let mut pieces = Vec::with_capacity(line.len() / PIECE + 1);
+    let mut rest = line;
+    while !rest.is_empty() {
+        let mut escaped = 0;
+        let mut end = 0;
+        for &byte in rest.as_bytes() {
+            let cost = json_escaped_byte(byte);
+            if escaped + cost > PIECE {
+                break;
+            }
+            escaped += cost;
+            end += 1;
+        }
+        while !rest.is_char_boundary(end) {
+            end -= 1;
+        }
+        pieces.push(&rest[..end]);
+        rest = &rest[end..];
+    }
+    let last = pieces.len() - 1;
+    pieces
+        .into_iter()
+        .enumerate()
+        .map(|(i, data)| {
+            RvOutbound::Chunk {
+                v: RV_PROTOCOL,
+                of,
+                i: u32::try_from(i).unwrap_or(u32::MAX),
+                last: i == last,
+                data: data.to_owned(),
+            }
+            .line()
+        })
+        .collect()
 }
 
 /// A subscription (`key`) or a line or connection (`None`) turned down, and why.
@@ -849,6 +977,11 @@ mod tests {
                 generation: 2,
                 unseen: None,
             },
+            first_turn: 7,
+            cut: vec![CutEntry {
+                entry_id: "transcript:42".into(),
+                bytes: 10_000_000,
+            }],
             json: Arc::from(r#"{"kind":"snapshot","tab":1}"#),
         };
         let line: serde_json::Value = serde_json::from_str(&frame_line(&snapshot)).unwrap();
@@ -859,6 +992,11 @@ mod tests {
         assert_eq!(line["generation"], 2);
         assert!(line["unseen"].is_null(), "a stretch not counted yet is named by none");
         assert_eq!(line["frame"]["kind"], "snapshot");
+        assert_eq!(line["first_turn"], 7);
+        assert_eq!(
+            line["cut"],
+            serde_json::json!([{"entry_id": "transcript:42", "bytes": 10_000_000}])
+        );
         let events = ObserverFrame::Events {
             key: key.clone(),
             from: 4,
@@ -970,7 +1108,28 @@ mod tests {
                 key: key.clone(),
                 through: 4,
                 work,
+                first_turn: 0,
+                cut: Vec::new(),
                 json: Arc::from(r#"{"kind":"snapshot"}"#),
+            },
+            ObserverFrame::Page {
+                key: key.clone(),
+                mark: work,
+                from_turn: 3,
+                through_turn: 9,
+                json: Arc::from(r#"{"kind":"snapshot"}"#),
+            },
+            ObserverFrame::Ended {
+                key: key.clone(),
+                how: EndedHow::Lost,
+            },
+            ObserverFrame::SendBlock {
+                key: key.clone(),
+                block: None,
+            },
+            ObserverFrame::SendBlock {
+                key: key.clone(),
+                block: Some(SendBlock::Bypass),
             },
             ObserverFrame::Events {
                 key: key.clone(),
@@ -1049,8 +1208,16 @@ mod tests {
     fn rv_outbound_optional_fields_must_be_written_out() {
         let lines = [
             (
-                r#"{"v":1,"kind":"snapshot","key":"k-1","through":4,"generation":2,"unseen":null,"frame":{}}"#,
+                r#"{"v":1,"kind":"snapshot","key":"k-1","through":4,"generation":2,"unseen":null,"first_turn":0,"cut":[],"frame":{}}"#,
                 "unseen",
+            ),
+            (
+                r#"{"v":1,"kind":"snapshot","key":"k-1","through":4,"generation":2,"unseen":null,"first_turn":0,"cut":[],"frame":{}}"#,
+                "first_turn",
+            ),
+            (
+                r#"{"v":1,"kind":"snapshot","key":"k-1","through":4,"generation":2,"unseen":null,"first_turn":0,"cut":[],"frame":{}}"#,
+                "cut",
             ),
             (
                 r#"{"v":1,"kind":"events","key":"k-1","from":4,"through":6,"generation":2,"unseen":1,"frame":{}}"#,
@@ -1081,6 +1248,52 @@ mod tests {
                 "a line leaving out `{field}` is not read as its empty value: {without}"
             );
         }
+    }
+
+    #[test]
+    fn a_line_over_the_cap_goes_as_chunks_that_join_to_it() {
+        let short = r#"{"v":1,"kind":"pong"}"#;
+        assert_eq!(chunk_lines(1, short), [short]);
+        // Multi-byte characters across every piece boundary: no piece is cut inside one.
+        let text = "é".repeat(RV_MAX_LINE) + "z";
+        let line = format!(r#"{{"v":1,"kind":"events","x":"{text}"}}"#);
+        let lines = chunk_lines(9, &line);
+        assert!(lines.len() > 2);
+        let mut joined = String::new();
+        for (n, piece) in lines.iter().enumerate() {
+            let RvOutbound::Chunk { of, i, last, data, .. } = parse_rv_outbound(piece.as_bytes()).unwrap() else {
+                panic!("a chunk: {piece:.80}");
+            };
+            assert_eq!((of, i as usize, last), (9, n, n == lines.len() - 1));
+            assert!(data.len() <= CHUNK_BYTES);
+            assert!(piece.len() < CHUNK_BYTES, "{} bytes", piece.len());
+            joined.push_str(&data);
+        }
+        assert_eq!(joined, line, "the pieces in order are the line");
+    }
+
+    #[test]
+    fn chunk_lines_stay_under_the_piece_size_once_escaped() {
+        // Every byte of these doubles (or more) when the piece is written as a JSON string.
+        for fill in ["\\", "\"", "\u{1}"] {
+            let line = format!(r#"{{"v":1,"kind":"page","x":"{}"}}"#, fill.repeat(RV_MAX_LINE + 1));
+            let lines = chunk_lines(3, &line);
+            assert!(lines.len() > 2, "{fill:?}");
+            let mut joined = String::new();
+            for piece in &lines {
+                assert!(
+                    piece.len() < CHUNK_BYTES && piece.len() < RV_MAX_LINE,
+                    "a chunk line of {} bytes for {fill:?}",
+                    piece.len()
+                );
+                let RvOutbound::Chunk { data, .. } = parse_rv_outbound(piece.as_bytes()).unwrap() else {
+                    panic!("a chunk");
+                };
+                joined.push_str(&data);
+            }
+            assert_eq!(joined, line, "the pieces in order are the line");
+        }
+        assert_eq!(json_escaped_len("a\"\\\n\u{1}é"), 1 + 2 + 2 + 2 + 6 + 2);
     }
 
     #[test]
