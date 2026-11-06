@@ -207,3 +207,24 @@ pub fn parse_process_file(bytes: &[u8]) -> Result<ProcessFile, WireError> {
     recut_file(&mut f);
     Ok(f)
 }
+
+/// The event name and callback argument a plugin page receives for a change.
+pub fn page_event(change: &Change) -> (&'static str, serde_json::Value) {
+    use crate::plugin::protocol::{
+        EVENT_AGENTS_GONE, EVENT_AGENTS_RESET, EVENT_AGENTS_ROUND, EVENT_AGENTS_ROW, EVENT_AGENTS_SELECTION,
+    };
+    use serde_json::{json, to_value};
+    match change {
+        Change::Row { row } => (EVENT_AGENTS_ROW, to_value(row).expect("a row is JSON")),
+        Change::Gone { id, key, why } => (EVENT_AGENTS_GONE, json!({ "id": id, "key": key, "why": why })),
+        Change::Reset { view } => (
+            EVENT_AGENTS_RESET,
+            serde_json::from_str(&view_json(view, SCHEMA_V)).expect("a view is JSON"),
+        ),
+        Change::Selection { selection } => (
+            EVENT_AGENTS_SELECTION,
+            to_value(selection).expect("a selection is JSON"),
+        ),
+        Change::Round { round } => (EVENT_AGENTS_ROUND, to_value(round).expect("a round is JSON")),
+    }
+}

@@ -1,5 +1,5 @@
 //! The normal dependency graphs of the toolkit-free crates must contain no GTK, GDK, GLib or
-//! WebKit packages. This checks `eitri-core`, `eitri-panel`, `eitri-mac`, `agent`,
+//! WebKit packages. This checks `eitri-core`, `eitri-remote`, `eitri-panel`, `eitri-mac`, `agent`,
 //! `eitri-terminal`, `terminal-render`, `terminal-frame`, `terminal-sync` and `terminal-input`.
 //!
 //! Each crate gets its own `cargo tree -p <crate> -e normal --offline --locked --prefix none`.
@@ -42,6 +42,7 @@ const BANNED_SUBSTRINGS: &[&str] = &[
 
 const TARGET_CRATES: &[&str] = &[
     "eitri-core",
+    "eitri-remote",
     "eitri-panel",
     "eitri-mac",
     "agent",

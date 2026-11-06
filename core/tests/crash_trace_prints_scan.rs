@@ -4,13 +4,14 @@
 
 use eitri_core::source_scan::{code_only, modules, rust_sources, without, word_ends, Source};
 
-const DIRS: [&str; 6] = [
+const DIRS: [&str; 7] = [
     "core/src",
     "agent/src",
     "panel/src",
     "shell/src",
     "neovide-editor/src",
     "terminal/engine/src",
+    "remote/src",
 ];
 const PRINTS: [&str; 4] = ["println", "eprintln", "print", "eprint"];
 /// A variable of one of these names holds what the person or the agent said, or a credential.

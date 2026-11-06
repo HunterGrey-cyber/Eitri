@@ -24,13 +24,14 @@ const FORBIDDEN: [&str; 10] = [
 ];
 
 /// Whole files that are the layer's, each with a token it is known to hold.
-const FILES: [(&str, &str); 6] = [
+const FILES: [(&str, &str); 7] = [
     ("core/src/tab_set/agent_rows.rs", "RowContext"),
     ("core/src/wm/reveal.rs", "RevealRequest"),
     ("core/src/plugin/host/agents.rs", "fn agents_verb"),
     ("panel/src/agents_glue.rs", "AgentsGlue"),
     ("shell/src/agents_host.rs", "fn focus_remote"),
     ("core/src/wm/agents_round.rs", "pub enum RoundKey"),
+    ("remote/src/agents_feed.rs", "pub struct AgentsFeed"),
 ];
 
 /// Each whole-word use of a forbidden name in `code`, as `name`.
@@ -122,7 +123,7 @@ fn the_agents_layer_never_reaches_an_answer_path() {
     }
 
     // A new file of the layer is scanned or says why not: a file added later cannot slip past by not being listed.
-    for path in agents_named(&["core/src", "panel/src", "shell/src"]) {
+    for path in agents_named(&["core/src", "panel/src", "shell/src", "remote/src"]) {
         assert!(
             FILES.iter().any(|(listed, _)| *listed == path) || NOT_SCANNED.iter().any(|(listed, _)| *listed == path),
             "{path} is named for the agents layer but this scan does not list it: add it to FILES with a token it holds"

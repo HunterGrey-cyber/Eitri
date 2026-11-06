@@ -38,9 +38,10 @@ use crate::agents::{
     wire, Change, Class, Intent, ReaderEvent, Row, View, GESTURE_MS, NEW_MIN_INTERVAL_MS, ROUND_MAX_IDLE_MS, SCHEMA_V,
 };
 use crate::layout::ModuleId;
+use crate::plugin::protocol::{self, AgentsRound, ErrorCode, Reply, RoundOp, Verb};
+#[cfg(test)]
 use crate::plugin::protocol::{
-    self, AgentsRound, ErrorCode, Reply, RoundOp, Verb, EVENT_AGENTS_GONE, EVENT_AGENTS_RESET, EVENT_AGENTS_ROUND,
-    EVENT_AGENTS_ROW, EVENT_AGENTS_SELECTION,
+    EVENT_AGENTS_GONE, EVENT_AGENTS_RESET, EVENT_AGENTS_ROUND, EVENT_AGENTS_ROW, EVENT_AGENTS_SELECTION,
 };
 
 /// How long a verb waits for the window it asked (or for the shared file it writes) before the page is told.
@@ -643,15 +644,8 @@ fn view_value(view: &View) -> Value {
 
 /// The event a change is to a page.
 fn change_event(change: &Change) -> String {
-    match change {
-        Change::Row { row } => protocol::event_text(EVENT_AGENTS_ROW, row),
-        Change::Gone { id, key, why } => {
-            protocol::event_text(EVENT_AGENTS_GONE, &json!({ "id": id, "key": key, "why": why }))
-        }
-        Change::Reset { view } => protocol::event_text(EVENT_AGENTS_RESET, &view_value(view)),
-        Change::Selection { selection } => protocol::event_text(EVENT_AGENTS_SELECTION, selection),
-        Change::Round { round } => protocol::event_text(EVENT_AGENTS_ROUND, round),
-    }
+    let (event, payload) = wire::page_event(change);
+    protocol::event_text(event, &payload)
 }
 
 /// A row id's process and tab: `<instance>.<tab>`.
@@ -1166,3 +1160,41 @@ impl PluginHost {
 
 #[cfg(test)]
 mod tests;
+
+#[cfg(test)]
+mod wire_regression_tests {
+    use super::*;
+
+    #[test]
+    fn plugin_events_unchanged() {
+        let changes = [
+            Change::Row { row: Row::default() },
+            Change::Gone {
+                id: "a.1".into(),
+                key: "k-1".into(),
+                why: crate::agents::GoneWhy::Closed,
+            },
+            Change::Reset { view: View::default() },
+            Change::Selection {
+                selection: Some(Default::default()),
+            },
+            Change::Round {
+                round: Some(Default::default()),
+            },
+            Change::Selection { selection: None },
+            Change::Round { round: None },
+        ];
+        for change in changes {
+            let before = match &change {
+                Change::Row { row } => protocol::event_text(EVENT_AGENTS_ROW, row),
+                Change::Gone { id, key, why } => {
+                    protocol::event_text(EVENT_AGENTS_GONE, &json!({"id":id,"key":key,"why":why}))
+                }
+                Change::Reset { view } => protocol::event_text(EVENT_AGENTS_RESET, &view_value(view)),
+                Change::Selection { selection } => protocol::event_text(EVENT_AGENTS_SELECTION, selection),
+                Change::Round { round } => protocol::event_text(EVENT_AGENTS_ROUND, round),
+            };
+            assert_eq!(change_event(&change).as_bytes(), before.as_bytes());
+        }
+    }
+}

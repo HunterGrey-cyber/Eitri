@@ -975,6 +975,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "eitri-remote"
+version = "0.3.0"
+dependencies = [
+ "agent",
+ "eitri-core",
+ "serde",
+ "serde_json",
+]
+
+[[package]]
 name = "eitri-terminal"
 version = "0.3.0"
 dependencies = [
