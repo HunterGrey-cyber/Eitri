@@ -394,6 +394,10 @@ fn handoff_of(tab: &Tab, review: Option<ReviewHandoff>) -> TabHandoff {
         view: _,
         // Read for what the tab held; a session is adopted from its own records.
         backend,
+        // Counts this window's backends; the window it lands in counts its own.
+        backend_generation: _,
+        // A stretch's number means something only in the window that counted it; the other window counts its own.
+        unseen_stretch: _,
         session,
         attention,
         failed_after_start,
@@ -1169,6 +1173,7 @@ impl TabSet {
         match &self.tabs[at].backend {
             TabBackend::NotStarted | TabBackend::AwaitingTrust(_) | TabBackend::Failed { .. } => {
                 self.moving.insert(tab.0);
+                self.observers.gone(tab, GoneWhy::Moved);
                 return Ok(FrozenTab {
                     tab: handoff_of(&self.tabs[at], None),
                     chat: None,
@@ -1222,6 +1227,8 @@ impl TabSet {
         };
         self.unbound_since.remove(&tab.0);
         self.moving.insert(tab.0);
+        // After the last pump: what it delivered reaches the tab's observers before they are told it left.
+        self.observers.gone(tab, GoneWhy::Moved);
         Ok(FrozenTab {
             tab: handoff_of(&self.tabs[at], review),
             chat: Some(FrozenChat {
@@ -1260,6 +1267,7 @@ impl TabSet {
             starting_since: &mut self.starting_since,
             held_sends: &self.pending_sends,
             untracked_starts: &mut self.untracked_starts,
+            observers: &mut self.observers,
             #[cfg(test)]
             after_drain: &mut self.after_drain,
             #[cfg(test)]
@@ -1372,6 +1380,8 @@ impl TabSet {
         let base_index = self.base_tabs().iter().position(|t| *t == tab);
         let before = self.active;
         let mut left = self.tabs.remove(at);
+        // A tab frozen here told its observers at the freeze; one adopted for a move that did not commit is told now.
+        self.observers.gone(tab, GoneWhy::Moved);
         left.cancel_review_watchers();
         if let Some(review) = self.turn_review.as_mut() {
             review.drop_moved(tab.0);

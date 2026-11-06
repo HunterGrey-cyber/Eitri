@@ -323,6 +323,18 @@ pub(super) fn apply_outcome(
     }
 }
 
+/// Stops the agent's work in `tab`, and nothing else: a `!` line running there is left alone. Refused while the tab
+/// is frozen for a move: its turn moves as it runs, and stopped here the record would not say so.
+pub(super) fn interrupt_agent(state: &mut AgentPanelState, tab: TabId) -> Result<(), BackendError> {
+    if state.tabs.is_moving(tab) {
+        return Err(BackendError {
+            message: eitri_core::tab_set::MOVING.to_string(),
+            benign: true,
+        });
+    }
+    backend_for(&mut state.tabs, tab).and_then(AgentBackend::interrupt)
+}
+
 /// What a reset of `tab` does once it is allowed: the tab goes back to its start screen, or a session its agent stopped
 /// with the conversation whole is continued in place. Answers `request_id` in `view`.
 pub(super) fn reset_tab(state: &mut AgentPanelState, tab: TabId, view: ViewId, request_id: &str, out: &mut Outbox) {
@@ -819,16 +831,11 @@ pub(super) fn handle_inbound_message(
         }
         InboundMessage::Interrupt { .. } => {
             let tab = tab_of(target);
-            // A frozen tab's turn moves as it runs: stopped here, the record would not say so.
+            // The desk's `!` line is the desk's to stop first; only then the agent's work.
             let outcome = if state.tabs.interrupt_shell_line(tab) {
                 Ok(())
-            } else if state.tabs.is_moving(tab) {
-                Err(BackendError {
-                    message: eitri_core::tab_set::MOVING.to_string(),
-                    benign: true,
-                })
             } else {
-                backend_for(&mut state.tabs, tab).and_then(AgentBackend::interrupt)
+                interrupt_agent(state, tab)
             };
             apply_command_outcome(state, screen, view, tab, &request_id, outcome, &mut out);
         }

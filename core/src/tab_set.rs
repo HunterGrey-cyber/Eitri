@@ -33,8 +33,10 @@ pub use agent_rows::{AgentWatch, RowContext, RowKey};
 mod live_edits;
 pub use live_edits::LiveEdit;
 mod moving;
+mod observers;
 mod shell;
 pub use moving::{FrozenChat, FrozenTab, MoveRefusedWhy, SendGate, Sent, TabHandoff};
+pub use observers::{GoneWhy, ObserveError, ObserverFrame, ObserverId, OBSERVER_QUEUE_CAP_BYTES};
 pub use shell::{shell_command, ShellEnded};
 
 #[cfg(test)]
@@ -394,6 +396,12 @@ pub struct Tab {
     /// Private so that a live backend leaves a tab only through the set, as a counted [`Retired`];
     /// [`Tab::backend`] reads it, [`TabSet::start`] puts a connect in.
     backend: TabBackend,
+    /// Counts the live backends put in this tab in this window: an observer's position in one session's
+    /// revisions means nothing in the next one's, which start over.
+    backend_generation: u64,
+    /// Numbers the stretches of work Claude Code did where this panel could not show it (`cli_unseen_busy`), in this
+    /// window, so a stop asked about one stretch can tell it from the next ([`Tab::unseen_stretch`]).
+    unseen_stretch: UnseenStretch,
     pub session: SessionState,
     pub attention: AttentionTracker,
     /// First sightings of waiting items and the current summary state, owned by this tab.
@@ -738,6 +746,8 @@ impl Tab {
             agent,
             view: ViewId::BASE,
             backend: TabBackend::NotStarted,
+            backend_generation: 0,
+            unseen_stretch: UnseenStretch::default(),
             session: SessionState::default(),
             attention: AttentionTracker::default(),
             agent_watch: AgentWatch::default(),
@@ -825,10 +835,19 @@ impl Tab {
     }
 
     /// Puts `backend` in place as it is and returns what was there, for a test that builds the state it
-    /// needs; nothing is counted or shut down.
+    /// needs; nothing is counted or shut down. Counts as a new backend for the tab's observers.
     #[cfg(any(test, feature = "test-support"))]
     pub fn set_backend(&mut self, backend: TabBackend) -> TabBackend {
+        self.backend_generation += 1;
+        self.unseen_stretch.counted_through = None;
         std::mem::replace(&mut self.backend, backend)
+    }
+
+    /// Puts a session that just connected in place of whatever the tab held.
+    fn install_live(&mut self, backend: AgentBackend) {
+        self.backend = TabBackend::Live(backend);
+        self.backend_generation += 1;
+        self.unseen_stretch.counted_through = None;
     }
 
     /// A tab the set no longer holds ([`TabSet::remove`], [`TabSet::take_all`]) hands over what is left
@@ -919,6 +938,20 @@ impl Tab {
     /// need to.
     pub fn cli_unseen_busy(&self) -> bool {
         self.live().is_some_and(|backend| backend.projection().cli_unseen_busy)
+    }
+
+    /// The number of the latest stretch of work the panel cannot show (0 before the first). The tick starts a new one
+    /// each time it sees [`Tab::cli_unseen_busy`] go from clear to set, and at every resync that finds it set: the
+    /// events a resync dropped may have ended one stretch and begun the next.
+    pub fn unseen_stretch(&self) -> u64 {
+        self.unseen_stretch.latest
+    }
+
+    /// [`Tab::unseen_stretch`] when the tick has counted every fold of this tab's backend through `revision` (the
+    /// projection's `last_revision`, read by the caller beside `cli_unseen_busy`), else `None`: work folded since the
+    /// last tick may have ended one stretch and begun the next, which the number does not show yet.
+    pub fn unseen_stretch_at(&self, revision: u64) -> Option<u64> {
+        (self.unseen_stretch.counted_through == Some(revision)).then_some(self.unseen_stretch.latest)
     }
 
     /// Applies what the provider reported about the messages this tab put into the running turn: one the
@@ -1506,6 +1539,8 @@ pub enum RestoreStep {
 
 pub struct TabSet {
     tabs: Vec<Tab>,
+    /// Whatever follows a tab from outside the desk ([`TabSet::observe`]), fed by the tick beside the pages.
+    observers: observers::Observers,
     active: TabId,
     last_active: Option<TabId>,
     next_id: u64,
@@ -1653,6 +1688,7 @@ impl TabSet {
         };
         let mut set = TabSet {
             tabs: Vec::new(),
+            observers: observers::Observers::default(),
             active: TabId(0),
             last_active: None,
             next_id: 1,
@@ -2261,12 +2297,18 @@ impl TabSet {
 
     /// The cards the panel's broker now holds for `tab`, the whole list: what the tray counts and a snapshot carries.
     /// They stay out of every list a sweep reads, so this is all a card ever is to the tab set.
+    /// A change reaches the tab's observers as a fresh snapshot, the frame that carries the cards.
     pub fn set_editor_cards(&mut self, tab: TabId, cards: Vec<crate::editor_tools::cards::EditorCardWire>) {
-        if let Some(tab) = self.get_mut(tab) {
-            tab.attention
-                .sync_editor_cards(cards.iter().map(|card| card.id.clone()));
-            tab.session.editor_cards = cards;
+        let Some(held) = self.get_mut(tab) else {
+            return;
+        };
+        held.attention
+            .sync_editor_cards(cards.iter().map(|card| card.id.clone()));
+        if held.session.editor_cards == cards {
+            return;
         }
+        held.session.editor_cards = cards;
+        self.observers.owe_snapshot(tab);
     }
 
     /// What `tab`'s external session was given, set before it starts or as it arrives from the other window: the
@@ -2480,6 +2522,7 @@ impl TabSet {
         }
         // Counted before the sync below, so the presence never drops between the turn and the shutdown.
         let retired = tab.retire_live(&mut self.retiring);
+        self.observers.gone(id, GoneWhy::Closed);
         self.forget_move_state(id);
         self.sync_presence();
         self.tab_left(&tab, base_index, before);
@@ -3511,6 +3554,7 @@ impl TabSet {
             starting_since: &mut self.starting_since,
             held_sends: &self.pending_sends,
             untracked_starts: &mut self.untracked_starts,
+            observers: &mut self.observers,
             #[cfg(test)]
             after_drain: &mut self.after_drain,
             #[cfg(test)]
@@ -3603,6 +3647,8 @@ impl TabSet {
         // for exactly a call the user approved on a card here is answered without a second card, once.
         // What was answered without a card becomes a note on its call's row when the call completes.
         let mut answered_for_you = crate::agent_backend::AnsweredForYou::default();
+        // Every fold through this revision is in this drain or an earlier one, whatever the drain then drops.
+        let folded_before = backend.projection().last_revision;
         let delivery = backend.take_revised_ui_delivery(
             tick.project_root,
             tick.rules,
@@ -3689,6 +3735,10 @@ impl TabSet {
             );
         }
         let resynced = matches!(delivery, RevisedDelivery::Resync);
+        // The tab's observers read this same drain, whether or not a page shows the tab, after its arm has folded
+        // it: what the gate answered and what the batch settled are then what the desk has.
+        let observed = tick.observers.watches(tab.id);
+        let generation = tab.backend_generation;
         let mut live = LiveTab {
             live_edits: tab.session.client_calls.live_edits_on,
             following: tab.following,
@@ -3698,8 +3748,11 @@ impl TabSet {
             session: &mut tab.session,
             notes: &mut tab.notes,
             attention: &mut tab.attention,
+            unseen_stretch: &mut tab.unseen_stretch,
         };
-        let arm = match delivery {
+        // The arms below count this drain's stretches; `pump_arm_events` and `pump_arm_resync` may raise this.
+        live.unseen_stretch.counted_through = Some(folded_before);
+        let mut arm = match delivery {
             RevisedDelivery::Nothing => ArmOutcome::default(),
             RevisedDelivery::Events(tagged) => Self::pump_arm_events(
                 &mut live,
@@ -3708,8 +3761,12 @@ impl TabSet {
                 tick.project_root,
                 review.as_deref_mut(),
                 place,
+                observed,
             ),
             RevisedDelivery::Resync => {
+                if observed {
+                    tick.observers.owe_snapshot(live.id);
+                }
                 let (turn_ended, pending) = Self::pump_arm_resync(&mut live);
                 // A resync in bypass sweeps whatever the overflow dropped through the same
                 // `approve_pending` a confirm uses, so a request never drawn as a card is never rebuilt
@@ -3734,6 +3791,9 @@ impl TabSet {
                 Self::pump_resync_show(&mut live, &pending, turn_ended, tick, place)
             }
         };
+        if let Some(batch) = arm.observed.take() {
+            tick.observers.feed(live.id, generation, &batch, &live.notes.turn_times);
+        }
         if arm.untracked_start {
             tick.untracked_starts.insert(live.id.0);
         }
@@ -3791,7 +3851,8 @@ impl TabSet {
     }
 
     /// The `Events` arm: folds the drained batch into the tab's own bookkeeping and, for a tab a page
-    /// shows, builds the payload of what the last snapshot did not already carry.
+    /// shows, builds the payload of what the last snapshot did not already carry. With `observed`, the
+    /// whole batch and the notes it settled are handed on for the tab's observers.
     fn pump_arm_events(
         live: &mut LiveTab<'_>,
         tagged: Vec<(u64, AgentDomainEvent)>,
@@ -3799,6 +3860,7 @@ impl TabSet {
         project_root: &Path,
         review: Option<&mut crate::turn_review::TurnReview>,
         place: PumpPlace,
+        observed: bool,
     ) -> ArmOutcome {
         let mut arm = ArmOutcome::default();
         // The tags strictly increase, so what the last snapshot already carried is a prefix of the
@@ -3811,6 +3873,8 @@ impl TabSet {
         // The envelope's bracket, from the events' own fold revisions: the revision before the first
         // one it carries, and that of the batch's last.
         let through_revision = tagged.last().map_or(0, |(revision, _)| *revision);
+        // The loop below counts every stretch this batch holds.
+        live.unseen_stretch.counted_through = live.unseen_stretch.counted_through.max(Some(through_revision));
         let from_revision = tagged
             .get(shown)
             .map_or(through_revision, |(revision, _)| revision.saturating_sub(1));
@@ -3820,7 +3884,13 @@ impl TabSet {
         for event in &events {
             match event {
                 AgentDomainEvent::TurnStarted { .. } => live.session.was_running = true,
-                AgentDomainEvent::CliWorkUnseen => live.session.was_unseen_busy = true,
+                // Only the first report of a stretch begins one; the further reports are the same work.
+                AgentDomainEvent::CliWorkUnseen => {
+                    if !live.session.was_unseen_busy {
+                        live.unseen_stretch.latest += 1;
+                    }
+                    live.session.was_unseen_busy = true;
+                }
                 // A completion that came with no turn of the backend's own open ends none of the panel's:
                 // a turn running here runs on, with the calls the user approved in it, which the CLI may
                 // still ask about. It ends the work the panel could not show, which a held message
@@ -3920,6 +3990,15 @@ impl TabSet {
         } else {
             live.session.stale = true;
         }
+        if observed {
+            // Each observer takes the tab's turn times from where it stands, not the desk's unsent count.
+            fresh_notes.turn_times = Vec::new();
+            arm.observed = Some(observers::ObservedBatch {
+                revisions,
+                events,
+                notes: fresh_notes,
+            });
+        }
         arm
     }
 
@@ -3944,6 +4023,12 @@ impl TabSet {
             let turn_ended =
                 (live.session.was_running && !running) || (live.session.was_unseen_busy && !projection.cli_unseen_busy);
             live.session.was_running = running;
+            // A new stretch whenever the work is on: whether it is the stretch seen before the drop is unknown, and a
+            // stop asked about that one must not reach another.
+            if projection.cli_unseen_busy {
+                live.unseen_stretch.latest += 1;
+            }
+            live.unseen_stretch.counted_through = Some(projection.last_revision);
             live.session.was_unseen_busy = projection.cli_unseen_busy;
             // Unconditionally: the dropped events may have held a turn's end and the next one's
             // start, which `was_running` cannot see, and an approval must never outlive its turn.
@@ -4190,7 +4275,7 @@ impl TabSet {
                     if let Some(wake) = &self.ui_wake {
                         backend.ensure_ui_wake(wake);
                     }
-                    tab.backend = TabBackend::Live(backend);
+                    tab.install_live(backend);
                     tab.session = std::mem::take(&mut tab.session).for_installed_backend();
                     tab.attention.restart();
                     tab.notes = CallNotes::default();
@@ -5311,6 +5396,7 @@ impl TabSet {
             })
             .collect();
         for tab in &removed {
+            self.observers.gone(tab.tab.id, GoneWhy::Closed);
             self.forget_move_state(tab.tab.id);
         }
         self.sync_presence();
@@ -6440,6 +6526,8 @@ struct PumpTick<'a> {
     held_sends: &'a BTreeMap<u64, moving::PendingSend>,
     /// `TabSet::untracked_starts`.
     untracked_starts: &'a mut BTreeSet<u64>,
+    /// `TabSet::observers`: fed from each tab's drain, whatever page shows it.
+    observers: &'a mut observers::Observers,
     #[cfg(test)]
     after_drain: &'a mut Option<BackendSeam>,
     #[cfg(test)]
@@ -6469,6 +6557,17 @@ struct LiveTab<'a> {
     session: &'a mut SessionState,
     notes: &'a mut CallNotes,
     attention: &'a mut AttentionTracker,
+    unseen_stretch: &'a mut UnseenStretch,
+}
+
+/// The stretches of work Claude Code did where the panel could not show it, as the tick counted them.
+#[derive(Debug, Default, Clone, Copy)]
+struct UnseenStretch {
+    /// The latest stretch's number, 0 before the first; it never goes down.
+    latest: u64,
+    /// The projection revision through which every fold of the tab's backend has been counted; `None` until the
+    /// first tick of a backend.
+    counted_through: Option<u64>,
 }
 
 /// What a pump arm leaves for the rest of its tab's tick.
@@ -6482,6 +6581,8 @@ struct ArmOutcome {
     saw_first_text: bool,
     /// The batch held a turn's start, and no turn review saw it.
     untracked_start: bool,
+    /// The drained batch, for the tab's observers; only when the tab has any.
+    observed: Option<observers::ObservedBatch>,
 }
 
 fn refresh_offers(tab: &mut Tab, project_root: &Path) -> bool {

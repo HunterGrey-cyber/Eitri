@@ -969,6 +969,7 @@ dependencies = [
  "agent",
  "base64",
  "eitri-core",
+ "serde",
  "serde_json",
  "sha2",
  "uuid",

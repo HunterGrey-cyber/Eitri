@@ -73,6 +73,8 @@ mod pages;
 mod pair_review;
 #[path = "path_menu.rs"]
 mod path_menu;
+#[path = "remote_entry.rs"]
+mod remote_entry;
 #[path = "restore.rs"]
 mod restore;
 #[path = "review_glue.rs"]
@@ -133,6 +135,8 @@ pub use links::{clicked_link_url, open_path_target};
 use pages::*;
 use pair_review::pair_outbound;
 pub use pair_review::{take_pair_outbound, PairOutbound, ReviewSettled, ReviewStep};
+use remote_entry::*;
+pub use remote_entry::{ExpectWork, RemoteInbound, RemoteOrigin, RemoteRefusal};
 use restore::*;
 pub use review_glue::ReviewConfig;
 use review_glue::*;

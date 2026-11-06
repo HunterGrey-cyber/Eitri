@@ -454,6 +454,36 @@ impl AgentPanelHandle {
         });
     }
 
+    /// A remote observer's message about the tab named `key` (a phone's, from `origin`): parsed only as a
+    /// [`RemoteInbound`], admitted apart from every page's message and answered to the caller, never to a page. It takes
+    /// no view and is never held for the editor's answer. A command id is taken once per device for the life of the
+    /// process, whatever became of it.
+    pub fn remote_message(
+        &self,
+        origin: &RemoteOrigin,
+        key: &eitri_core::tab_set::RowKey,
+        raw: &str,
+    ) -> Result<(), RemoteRefusal> {
+        self.wake();
+        let message = parse_remote_inbound(raw)?;
+        if !first_command_use(&origin.device, message.command_id()) {
+            return Err(RemoteRefusal::Duplicate);
+        }
+        // The window is closing and its tabs are gone.
+        if self.state.borrow().shutting_down {
+            return Err(RemoteRefusal::NoSuchTab);
+        }
+        let screen = Screen::read(&self.state, &self.pages);
+        let outcome = self.run(|state, out| handle_remote_message(state, &screen, origin, key, message, out));
+        if let Err(why) = &outcome {
+            eprintln!(
+                "[agent_panel] remote {} (connection {}): refused: {why:?}",
+                origin.device, origin.conn
+            );
+        }
+        outcome
+    }
+
     /// Sends the messages whose editor answers have come, each through the arm it was bound for with its sections in
     /// the turn. A tab that closed meanwhile is told so; a page that went is not.
     fn replay_mentions(&self) {
