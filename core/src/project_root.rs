@@ -43,15 +43,7 @@ const PROJECT_DIR_ENV: &str = "EITRI_PROJECT_DIR";
 /// option or a silently opened cwd.
 ///
 /// `--new-window` and `--raise` are read by [`resolve_launch_in`]; the directory-only resolvers step over them.
-const KNOWN_FLAGS: [&str; 7] = [
-    "--clean",
-    "--version",
-    "--help",
-    "-h",
-    "--legacy",
-    "--new-window",
-    "--raise",
-];
+const KNOWN_FLAGS: [&str; 5] = ["--clean", "--version", "--legacy", "--new-window", "--raise"];
 
 /// The conventional end-of-flags separator. What follows it is read verbatim, so a path whose name
 /// really does begin with `-` is reachable.

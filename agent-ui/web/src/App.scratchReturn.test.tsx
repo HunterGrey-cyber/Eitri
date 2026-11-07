@@ -165,6 +165,45 @@ describe("composer scratch return", () => {
     expect(composer(container)).toBeNull();
   });
 
+  it("a composer edit returning while an editor card waits gives the return up and sends nothing", () => {
+    const container = setup();
+    const field = composer(container)!;
+    fireEvent.change(field, { target: { value: "a draft" } });
+    leaveForEdit(field);
+    dispatch({ kind: "editor_cards", tab: 1, cards: [{
+      id: "ec-0123456789abcdef-1", seq: 1, tool: "open_file", toolUseId: null, title: "Show /etc/hosts in your editor?",
+      body: [{ kind: "code", text: "/etc/hosts" }],
+    }] });
+    dispatch({ kind: "draft", tab: 1, text: "a draft, edited" });
+    dispatch({ kind: "scratch", tab: 1, editing: false });
+    dispatch({ kind: "pane_focus", focused: true });
+    expect(composer(container)).toBeNull();
+    fireEvent.keyDown(document.activeElement ?? container, { key: "Enter" });
+    dispatch({ kind: "focus_permission", tab: 1 });
+    act(() => vi.advanceTimersByTime(1000));
+    expect(mode(container)).toBe("browse");
+    expect(posted.filter((m) => m.type === "send_message" || m.type === "editor_card_answer")).toHaveLength(0);
+  });
+
+  it("a composer edit returning while a question waits gives the return up and sends nothing", () => {
+    const container = setup();
+    const field = composer(container)!;
+    fireEvent.change(field, { target: { value: "a draft" } });
+    leaveForEdit(field);
+    // The question came while nvim had the draft.
+    dispatch({ kind: "snapshot", tab: 1, throughRevision: 5, state: {
+      ...initialState(), status: { kind: "running" }, transcript: [{ seq: 0, text: "Prior answer" }], questions: [question],
+    } });
+    dispatch({ kind: "draft", tab: 1, text: "a draft, edited" });
+    dispatch({ kind: "scratch", tab: 1, editing: false });
+    dispatch({ kind: "pane_focus", focused: true });
+    expect(mode(container)).toBe("browse");
+    fireEvent.keyDown(document.activeElement ?? container, { key: "Enter" });
+    dispatch({ kind: "focus_permission", tab: 1 });
+    act(() => vi.advanceTimersByTime(1000));
+    expect(posted.filter((m) => m.type === "send_message" || m.type === "question_answer")).toHaveLength(0);
+  });
+
   it("pane focus alone resumes INPUT and a later ordinary arrival still lands BROWSE", () => {
     const container = setup();
     leaveForEdit(composer(container)!);

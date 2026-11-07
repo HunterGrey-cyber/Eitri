@@ -52,6 +52,60 @@ fn meta_install_failure_leaves_no_temporary_file() {
 }
 
 #[test]
+fn meta_install_writes_nothing_through_a_linked_directory() {
+    let scratch = Scratch::new("luals-linked-dir");
+    let data = scratch.0.join("eitri");
+    let elsewhere = scratch.0.join("nvim-lua");
+    std::fs::create_dir_all(data.join("lua")).unwrap();
+    std::fs::create_dir(&elsewhere).unwrap();
+    std::os::unix::fs::symlink(&elsewhere, data.join("lua/meta")).unwrap();
+    let error = install_meta(&data).unwrap_err();
+    assert!(error.to_string().contains("not a directory of its own"), "{error}");
+    assert_eq!(
+        std::fs::read_dir(&elsewhere).unwrap().count(),
+        0,
+        "nothing landed where the link points"
+    );
+}
+
+#[test]
+fn meta_install_makes_nothing_inside_a_linked_eitri_or_lua_directory() {
+    for linked in ["", "lua"] {
+        let scratch = Scratch::new("luals-linked-parent");
+        let data = scratch.0.join("eitri");
+        let elsewhere = scratch.0.join("nvim-lua");
+        std::fs::create_dir(&elsewhere).unwrap();
+        if linked.is_empty() {
+            std::os::unix::fs::symlink(&elsewhere, &data).unwrap();
+        } else {
+            std::fs::create_dir(&data).unwrap();
+            std::os::unix::fs::symlink(&elsewhere, data.join(linked)).unwrap();
+        }
+        let error = install_meta(&data).unwrap_err();
+        assert!(
+            error.to_string().contains("not a directory of its own"),
+            "{linked:?}: {error}"
+        );
+        assert_eq!(
+            std::fs::read_dir(&elsewhere).unwrap().count(),
+            0,
+            "{linked:?}: nothing, not even an empty meta directory, was made where the link points"
+        );
+    }
+}
+
+#[test]
+fn meta_install_writes_nothing_in_a_directory_others_may_change() {
+    let scratch = Scratch::new("luals-shared-dir");
+    let data = scratch.0.join("eitri");
+    std::fs::create_dir_all(data.join("lua/meta")).unwrap();
+    std::fs::set_permissions(data.join("lua"), std::fs::Permissions::from_mode(0o777)).unwrap();
+    let error = install_meta(&data).unwrap_err();
+    assert!(error.to_string().contains("writable by others"), "{error}");
+    assert_eq!(std::fs::read_dir(data.join("lua/meta")).unwrap().count(), 0);
+}
+
+#[test]
 fn luarc_creates_json_and_installs_meta_only_inside_the_two_directories() {
     let scratch = Scratch::new("luals-home");
     let home = &scratch.0;
@@ -65,7 +119,7 @@ fn luarc_creates_json_and_installs_meta_only_inside_the_two_directories() {
     let json: serde_json::Value = serde_json::from_slice(&std::fs::read(config.join(".luarc.json")).unwrap()).unwrap();
     assert_eq!(
         json,
-        serde_json::json!({"workspace.library": [data.join("lua/meta")], "runtime.version": "LuaJIT"})
+        serde_json::json!({"workspace.library": [data.join("lua/meta")], "runtime.version": "Lua 5.4"})
     );
     assert_eq!(std::fs::read(data.join("lua/meta/eitri.lua")).unwrap(), META.as_bytes());
     fn files(dir: &Path, out: &mut BTreeSet<PathBuf>) {
@@ -449,7 +503,7 @@ fn meta_settings(meta: &str) -> BTreeSet<String> {
 
 #[test]
 fn meta_is_valid_lua_and_each_function_has_a_description_and_types() {
-    let source = crate::source_scan::read_required("core/src/luals/eitri.meta.lua");
+    let source = crate::source_scan::read_required("core/src/luals/eitri.meta");
     assert_eq!(source.text, META);
     assert!(META.starts_with("---@meta\n"));
     mlua::Lua::new().load(META).exec().unwrap();

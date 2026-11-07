@@ -87,7 +87,7 @@
 ---@class EitriOpenRule
 ---@field at? "side"|"bottom"|"main"|"below-editor"|"right"|"below"|"left"|"above"|"tab"
 ---@field float? boolean
----@field size? number|number[]|{w: number, h: number} A share or pixel count; a float takes two fractions.
+---@field size? number|string|number[]|{w: number, h: number} A share (a fraction) or a pixel size such as "120px"; a float takes two fractions.
 ---@field scratchpad? boolean
 ---@field focus? boolean
 
@@ -123,13 +123,13 @@ eitri = {}
 eitri.config = {}
 
 ---Settings are made with eitri.config.set(key, value); nil unsets the key again.
----@param key EitriSetting
+---@param key EitriSetting|string
 ---@param value string|number|boolean|nil
 ---@return nil
 function eitri.config.set(key, value) end
 
 ---A key of your own, read by your own Lua with eitri.config.get, is left alone.
----@param key EitriSetting
+---@param key EitriSetting|string
 ---@return string|boolean|nil value Numbers are stored as text; an unset key returns nil.
 function eitri.config.get(key) end
 

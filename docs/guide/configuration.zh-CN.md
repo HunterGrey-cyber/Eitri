@@ -1,5 +1,5 @@
 [English](configuration.md) | 简体中文
-<!-- translated-from: configuration.md sha256=47ad65a51dcb1549c30e96a820d848c06e8bdd53e0822a6f4db7234641bdef6f -->
+<!-- translated-from: configuration.md sha256=7ba70ebed5cb035d08e5439f48174544875ffdcbb80bc201bfda21a3aa18d11a -->
 
 # 配置
 
@@ -44,7 +44,7 @@ eitri setup lua-ls
 
 API 定义保存在 `$XDG_DATA_HOME/eitri/lua/meta/eitri.lua`；`XDG_DATA_HOME` 未设置或为相对路径时，
 则保存在 `~/.local/share/eitri/lua/meta/eitri.lua`。工作区文件指向该元数据目录的绝对路径，并设置
-`"runtime.version": "LuaJIT"`。每次窗口启动时都会更新定义，使其与正在运行的 Eitri 版本一致；
+`"runtime.version": "Lua 5.4"`（运行 `init.lua` 的就是 Lua 5.4）。每次窗口启动时都会更新定义，使其与正在运行的 Eitri 版本一致；
 只有内容不同时才会改写文件。
 
 <a id="settings"></a>

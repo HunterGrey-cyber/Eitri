@@ -70,7 +70,7 @@ It never overwrites either file and never touches `~/.config/nvim`.
 
 The API definition is kept at `$XDG_DATA_HOME/eitri/lua/meta/eitri.lua`, or
 `~/.local/share/eitri/lua/meta/eitri.lua` when `XDG_DATA_HOME` is unset or relative. The workspace file points
-at that absolute metadata directory and sets `"runtime.version": "LuaJIT"`. Each window start refreshes the
+at that absolute metadata directory and sets `"runtime.version": "Lua 5.4"`, the Lua that runs `init.lua`. Each window start refreshes the
 definition to match the Eitri version you run, changing the file only when its contents differ.
 
 ## Settings

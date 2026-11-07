@@ -207,21 +207,6 @@ fn main() -> glib::ExitCode {
             &mut std::io::stderr(),
         ));
     }
-    if matches!(early_args.as_slice(), [arg] if arg == "--help" || arg == "-h") {
-        println!(
-            "usage: eitri [--clean] [--legacy] [--new-window] [--raise] [PATH...]\n\
-             \nSubcommands:\n\
-             \x20 agents [OPTIONS]       Shared agent summaries\n\
-             \x20 remote COMMAND         Remote control from a phone\n\
-             \x20 panel [OPTIONS] [DIR]   Agent panel beside your editor\n\
-             \x20 page ID [OPTIONS]       Plugin page beside your editor\n\
-             \x20 split [OPTIONS] [DIR]   Editor and agent panel in separate windows\n\
-             \x20 open [OPTIONS]          Take over a terminal Neovim\n\
-             \x20 setup lua-ls            Completion and checks for Eitri's init.lua (lua_ls/luals also accepted)\n\
-             \nOptions: --help, -h, --version, --clean, --legacy, --new-window, --raise"
-        );
-        return glib::ExitCode::SUCCESS;
-    }
     // Agent summaries have their own arguments and never open a project or start GTK.
     #[cfg(target_os = "linux")]
     if early_args.first().is_some_and(|a| a == "agents") {
