@@ -31,6 +31,12 @@ pub struct JournalEntry {
 /// Where the journal's entries come from (`journalctl` in the CLI; a fixture in tests).
 pub trait JournalSource {
     fn entries(&self) -> io::Result<Vec<JournalEntry>>;
+
+    /// The parts of the last [`entries`](JournalSource::entries) that could not be read while another part was, as
+    /// `(part, why)`: entries only those parts hold were not seen. Empty for a source read whole.
+    fn unread_parts(&self) -> Vec<(String, String)> {
+        Vec::new()
+    }
 }
 
 /// What [`verify`] found; all empty and zero on a log nobody touched.
@@ -547,6 +553,32 @@ mod tests {
         let report = verify_from(&dir, &Entries(entries), EXE, SystemTime::now()).unwrap();
         assert_eq!(report.missing_from_journal, vec![future], "{report:?}");
         assert_eq!(report.written_during_check, 0);
+    }
+
+    #[test]
+    fn a_record_dated_past_the_files_reading_is_taken_only_within_a_second() {
+        // The check runs "at" a time ahead of the machine's clock, so the files' reading is that time.
+        let at = days_ms(30_000);
+        for (ahead_ms, counted) in [(0u64, true), (900, true), (1_100, false), (5_000, false)] {
+            let dir = audit_dir_for(&format!("audit-verify-slack-{ahead_ms}"));
+            let entries = written_at(&dir, 3, at - 2000);
+            let original = lines(&dir);
+            // The newest record re-dated `ahead_ms` past the reading, its copy not in the journal.
+            let time = object(&original[2])["time"].as_str().unwrap().to_string();
+            let ahead = format_time(ms(at + ahead_ms));
+            let tail = original[2].replace(&time, &ahead);
+            std::fs::write(
+                dir.join(CURRENT),
+                [&original[..2], &[tail.clone()]].concat().join("\n") + "\n",
+            )
+            .unwrap();
+            let report = verify_from(&dir, &Entries(entries[..2].to_vec()), EXE, ms(at)).unwrap();
+            if counted {
+                assert_eq!(report.written_during_check, 1, "{ahead_ms} ms: {report:?}");
+            } else {
+                assert_eq!(report.missing_from_journal, vec![tail], "{ahead_ms} ms: {report:?}");
+            }
+        }
     }
 
     #[test]

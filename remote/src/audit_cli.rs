@@ -7,9 +7,13 @@
 //!
 //! `eitri remote log --verify` checks the chain of the retained files and compares them with the journal's copy both
 //! ways (`journalctl` by its absolute path, [`JOURNALCTL_PATHS`], run here and never by `serve`; entries count as the
-//! log's only when the journal's `_EXE` is this binary): exit 0 when nothing is found, 1 when something is, 2 on bad
-//! arguments, 3 when the journal could not be read and the chain alone showed nothing, which is no proof the log is
-//! whole.
+//! log's only when the journal's `_EXE` is this binary): exit 0 when nothing is found and every retained record was
+//! checked, 1 when something is found, 2 on bad arguments, 3 when the journal could not be read (or holds none of the
+//! log's records) and the chain alone showed nothing, which is no proof the log is whole, and 4
+//! ([`VERIFY_INCOMPLETE`]) when nothing is found but not everything was checked: records counted as older than the
+//! journal or as written during the check, or one of the journal's two readings failed. A record counted as written
+//! during the check makes it read the journal once more after [`RECHECK_AFTER`], so only those still missing then
+//! stay unchecked.
 
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
@@ -23,10 +27,24 @@ use serde_json::Value;
 use crate::cli::shown;
 
 const USAGE: &str = "usage: eitri remote log [--since 24h|7d|<RFC 3339>] [--device NAME] [--event KIND] [--json]
-       eitri remote log --verify    (exit 0 clean, 1 something found, 3 the journal could not be read)";
+       eitri remote log --verify    (exit 0 clean, 1 something found, 3 the journal could not be read,
+                                    4 nothing found but not everything checked)";
 
 /// `--verify`'s exit when the journal could not be read and the chain alone showed nothing.
 pub const VERIFY_JOURNAL_UNREAD: i32 = 3;
+
+/// `--verify`'s exit when nothing was found but not every record was checked against the journal: some were counted
+/// as older than it or as written during the check, or a part of the journal could not be read. Its first line is
+/// `incomplete: ...`, then one `  not checked: ...` line per reason.
+pub const VERIFY_INCOMPLETE: i32 = 4;
+
+/// How long `--verify` waits before reading the journal again when records were counted as written during the check:
+/// a writer's send waits at most 50 ms for the journal (`SEND_WITHIN`), so a copy still on its way is there by then.
+#[cfg(not(test))]
+pub const RECHECK_AFTER: Duration = Duration::from_secs(1);
+/// No wait in this crate's own tests, whose second reading answers at once.
+#[cfg(test)]
+pub const RECHECK_AFTER: Duration = Duration::ZERO;
 
 /// Where `journalctl` is looked for, first found wins: the merged-`/usr` path, the old `/bin` one, and NixOS's system
 /// profile. Never through `PATH`, which a same-uid process (or the caller's shell) can point at a `journalctl` that
@@ -188,7 +206,7 @@ fn verify_at(dir: &Path, journal: &dyn JournalSource, our_exe: &str, out: &mut d
         );
     }
     // The journal is read once (each reading runs `journalctl` twice) and its entries handed to `verify`, with the
-    // time the reading began, from which a record at the files' end counts as written during the check.
+    // time the reading began, from which a record counts as written during the check.
     let started = SystemTime::now();
     let (entries, unread) = match journal.entries() {
         Ok(entries) => (entries, None),
@@ -200,14 +218,58 @@ fn verify_at(dir: &Path, journal: &dyn JournalSource, our_exe: &str, out: &mut d
             (Vec::new(), Some(e))
         }
     };
-    let report = verify_from(dir, &Fetched(entries), our_exe, started);
-    let report = match report {
+    let mut partial = journal.unread_parts();
+    let mut report = match verify_from(dir, &Fetched(entries.clone()), our_exe, started) {
         Ok(report) => report,
         Err(e) => {
             let _ = writeln!(err, "eitri remote log: {e}");
             return 1;
         }
     };
+    // A record counted as written during the check may only have had its copy on the way: once more, a moment later,
+    // so only the records still missing then are left to the window.
+    if unread.is_none() && report.written_during_check > 0 {
+        std::thread::sleep(RECHECK_AFTER);
+        match journal.entries() {
+            Ok(again) => {
+                // The journal only grows (its oldest entries aside), so both readings together are what it held: a
+                // part that failed in one reading and was read in the other is read, and a record the first reading
+                // saw is kept when the second misses it.
+                let again_partial = journal.unread_parts();
+                partial.retain(|(part, _)| again_partial.iter().any(|(p, _)| p == part));
+                let mut both = entries;
+                let mut seen: std::collections::HashSet<(Option<String>, Option<String>)> =
+                    both.iter().map(|e| (e.exe.clone(), e.record.clone())).collect();
+                both.extend(
+                    again
+                        .into_iter()
+                        .filter(|e| seen.insert((e.exe.clone(), e.record.clone()))),
+                );
+                report = match verify_from(dir, &Fetched(both), our_exe, started) {
+                    Ok(report) => report,
+                    Err(e) => {
+                        let _ = writeln!(err, "eitri remote log: {e}");
+                        return 1;
+                    }
+                };
+            }
+            Err(e) => {
+                let _ = writeln!(
+                    err,
+                    "eitri remote log: the journal's second reading failed ({e}); the first one stands"
+                );
+            }
+        }
+    }
+    for (part, why) in &partial {
+        let _ = writeln!(
+            err,
+            "eitri remote log: part of the journal could not be read (journalctl {}: {}); records only that part \
+             holds were not checked",
+            shown(part),
+            shown(why)
+        );
+    }
     let mut lines = Vec::new();
     for (file, n) in &report.chain_breaks {
         lines.push(format!("chain broken: {} line {n}", shown(file)));
@@ -269,24 +331,37 @@ fn verify_at(dir: &Path, journal: &dyn JournalSource, our_exe: &str, out: &mut d
             );
             return VERIFY_JOURNAL_UNREAD;
         }
-        let _ = writeln!(out, "clean");
+        let mut unchecked = Vec::new();
         if report.older_than_journal > 0 {
-            let _ = writeln!(
-                out,
+            unchecked.push(format!(
                 "  not checked: {} oldest records, older than anything of the log's the journal still holds",
                 report.older_than_journal
-            );
+            ));
         }
         if report.written_during_check > 0 {
-            let _ = writeln!(
-                out,
-                "  not checked: {} records written during the check (within {} s) and not in the journal yet; \
-                 run it again",
+            unchecked.push(format!(
+                "  not checked: {} records written during the check (within {} s) and not in the journal yet, also \
+                 when read again; run it again",
                 report.written_during_check,
                 WRITTEN_DURING_CHECK.as_secs()
-            );
+            ));
         }
-        return 0;
+        for (part, why) in &partial {
+            unchecked.push(format!(
+                "  not checked: what only this part of the journal holds: journalctl {}: {}",
+                shown(part),
+                shown(why)
+            ));
+        }
+        if unchecked.is_empty() {
+            let _ = writeln!(out, "clean");
+            return 0;
+        }
+        let _ = writeln!(out, "incomplete: nothing found, but not everything was checked");
+        for line in unchecked {
+            let _ = writeln!(out, "{line}");
+        }
+        return VERIFY_INCOMPLETE;
     }
     for line in lines {
         let _ = writeln!(out, "{line}");
@@ -307,8 +382,12 @@ impl JournalSource for Fetched {
 }
 
 /// The journal's `eitri-remote` entries through `journalctl`, found once ([`Journalctl::find`]): the user's journal,
-/// then the system journal's entries of this uid. `Err` when there is no `journalctl` or neither could be read.
-pub struct Journalctl(Option<PathBuf>);
+/// then the system journal's entries of this uid. `Err` when there is no `journalctl` or neither could be read; when
+/// one of the two fails, the other's entries, and the failure in [`JournalSource::unread_parts`].
+pub struct Journalctl {
+    bin: Option<PathBuf>,
+    failed: std::cell::RefCell<Vec<(String, String)>>,
+}
 
 /// The variable a `remote-test-hooks` build reads for the `journalctl` to run instead of [`JOURNALCTL_PATHS`]; with it
 /// unset or empty such a build finds none, so no test reads the machine's journal. A release build never reads it.
@@ -317,10 +396,18 @@ pub const JOURNALCTL_VAR: &str = "EITRI_REMOTE_TEST_JOURNALCTL";
 impl Journalctl {
     /// The first of [`JOURNALCTL_PATHS`] that is a file (in a `remote-test-hooks` build, [`JOURNALCTL_VAR`] alone).
     pub fn find() -> Journalctl {
-        Journalctl(journalctl_path_with(
+        Journalctl::at(journalctl_path_with(
             |name| std::env::var_os(name),
             |path| path.metadata().is_ok_and(|m| m.is_file()),
         ))
+    }
+
+    /// The `journalctl` at `bin`, or none.
+    fn at(bin: Option<PathBuf>) -> Journalctl {
+        Journalctl {
+            bin,
+            failed: Default::default(),
+        }
     }
 }
 
@@ -342,29 +429,40 @@ fn journalctl_path_with(
 
 impl JournalSource for Journalctl {
     fn entries(&self) -> io::Result<Vec<JournalEntry>> {
-        let Some(bin) = &self.0 else {
+        self.failed.borrow_mut().clear();
+        let Some(bin) = &self.bin else {
             return Err(io::Error::new(
                 io::ErrorKind::NotFound,
                 format!("no journalctl at {}", JOURNALCTL_PATHS.join(", ")),
             ));
         };
         let uid = agent::private_fs::euid().to_string();
-        let user = journalctl(bin, &["--user", "SYSLOG_IDENTIFIER=eitri-remote"]);
-        let system = journalctl(bin, &[&format!("_UID={uid}"), "SYSLOG_IDENTIFIER=eitri-remote"]);
+        let user = ["--user".to_owned(), "SYSLOG_IDENTIFIER=eitri-remote".to_owned()];
+        let system = [format!("_UID={uid}"), "SYSLOG_IDENTIFIER=eitri-remote".to_owned()];
         let (mut entries, mut failed) = (Vec::new(), Vec::new());
-        for result in [user, system] {
-            match result {
+        for matches in [user, system] {
+            let matches: Vec<&str> = matches.iter().map(String::as_str).collect();
+            match journalctl(bin, &matches) {
                 Ok(found) => entries.extend(found),
-                Err(e) => failed.push(e.to_string()),
+                Err(e) => failed.push((matches.join(" "), e.to_string())),
             }
         }
         if failed.len() == 2 {
-            return Err(io::Error::other(failed.join("; ")));
+            let all: Vec<String> = failed
+                .iter()
+                .map(|(part, why)| format!("journalctl {part}: {why}"))
+                .collect();
+            return Err(io::Error::other(all.join("; ")));
         }
+        *self.failed.borrow_mut() = failed;
         // An entry both readings return (a journal that is not split by user) is one entry.
         let mut seen = std::collections::HashSet::new();
         entries.retain(|e| seen.insert((e.exe.clone(), e.record.clone())));
         Ok(entries)
+    }
+
+    fn unread_parts(&self) -> Vec<(String, String)> {
+        self.failed.borrow().clone()
     }
 }
 
@@ -376,11 +474,13 @@ fn journalctl(bin: &Path, matches: &[&str]) -> io::Result<Vec<JournalEntry>> {
         .stdin(std::process::Stdio::null())
         .output()?;
     if !output.status.success() {
-        return Err(io::Error::other(format!(
-            "journalctl {}: {}",
-            matches.join(" "),
-            String::from_utf8_lossy(&output.stderr).trim()
-        )));
+        // The caller names the reading; this says why it failed.
+        let said = String::from_utf8_lossy(&output.stderr).trim().to_owned();
+        return Err(io::Error::other(if said.is_empty() {
+            output.status.to_string()
+        } else {
+            said
+        }));
     }
     Ok(String::from_utf8_lossy(&output.stdout)
         .lines()
@@ -994,7 +1094,7 @@ mod tests {
             assert_eq!(journalctl_path_with(env_with(""), |_| true), None);
         }
         // With none found, the reading fails, so `--verify` cannot call the log clean.
-        assert!(Journalctl(None).entries().is_err());
+        assert!(Journalctl::at(None).entries().is_err());
     }
 
     #[test]
@@ -1011,6 +1111,163 @@ mod tests {
         let (code, out, _) = run(&empty, &["--verify"], &Copy(Vec::new()));
         assert_eq!((code, out.trim()), (0, "clean"));
         std::fs::remove_dir_all(dir.parent().unwrap()).unwrap();
+    }
+
+    #[test]
+    fn excused_records_are_incomplete_not_clean() {
+        let dir = scratch("verify-excused");
+        let mut log = open(&dir);
+        for n in 0..3 {
+            log.record(conn_open(&format!("d{n}"), "phone")).unwrap();
+        }
+        drop(log);
+        // The journal was vacuumed past the first record (`Copy` lists them newest first).
+        let mut journal = Copy::of(&dir, OUR_EXE);
+        journal.0.pop();
+        let (code, out, _) = run(&dir, &["--verify"], &journal);
+        assert_eq!(code, VERIFY_INCOMPLETE, "{out}");
+        let lines: Vec<&str> = out.lines().collect();
+        assert_eq!(
+            lines[0], "incomplete: nothing found, but not everything was checked",
+            "{out}"
+        );
+        assert!(lines[1].starts_with("  not checked: 1 oldest records"), "{out}");
+        assert!(!out.contains("clean"), "{out}");
+        std::fs::remove_dir_all(dir.parent().unwrap()).unwrap();
+    }
+
+    /// The first reading lacks the newest record's copy, as when it was still on its way; later readings have it
+    /// unless `never` says the copy never came.
+    struct Late {
+        whole: Copy,
+        readings: std::cell::Cell<u32>,
+        never: bool,
+    }
+
+    impl JournalSource for Late {
+        fn entries(&self) -> io::Result<Vec<JournalEntry>> {
+            self.readings.set(self.readings.get() + 1);
+            let mut entries = self.whole.0.clone();
+            if self.readings.get() == 1 || self.never {
+                // `Copy` lists them newest first.
+                entries.remove(0);
+            }
+            Ok(entries)
+        }
+    }
+
+    #[test]
+    fn a_record_counted_as_written_during_the_check_is_read_again() {
+        let dir = scratch("verify-late");
+        let mut log = open(&dir);
+        for n in 0..3 {
+            log.record(conn_open(&format!("d{n}"), "phone")).unwrap();
+        }
+        drop(log);
+        // Its copy arrived by the second reading: clean.
+        let late = Late {
+            whole: Copy::of(&dir, OUR_EXE),
+            readings: std::cell::Cell::new(0),
+            never: false,
+        };
+        let (code, out, _) = run(&dir, &["--verify"], &late);
+        assert_eq!((code, out.trim()), (0, "clean"));
+        assert_eq!(late.readings.get(), 2, "read once more");
+        // Still missing then: incomplete, and said so.
+        let never = Late {
+            whole: Copy::of(&dir, OUR_EXE),
+            readings: std::cell::Cell::new(0),
+            never: true,
+        };
+        let (code, out, _) = run(&dir, &["--verify"], &never);
+        assert_eq!(code, VERIFY_INCOMPLETE, "{out}");
+        assert!(
+            out.contains("  not checked: 1 records written during the check"),
+            "{out}"
+        );
+        assert_eq!(never.readings.get(), 2);
+        std::fs::remove_dir_all(dir.parent().unwrap()).unwrap();
+    }
+
+    #[test]
+    fn a_partial_second_reading_keeps_what_the_first_saw() {
+        // First reading: every record but the newest. Second: the newest, but the part that held the others failed.
+        struct Retry {
+            whole: Copy,
+            readings: std::cell::Cell<u32>,
+        }
+        impl JournalSource for Retry {
+            fn entries(&self) -> io::Result<Vec<JournalEntry>> {
+                self.readings.set(self.readings.get() + 1);
+                let mut entries = self.whole.0.clone();
+                if self.readings.get() == 1 {
+                    entries.remove(0);
+                } else {
+                    entries.truncate(1);
+                }
+                Ok(entries)
+            }
+            fn unread_parts(&self) -> Vec<(String, String)> {
+                match self.readings.get() {
+                    1 => Vec::new(),
+                    _ => vec![("_UID=1".into(), "gone".into())],
+                }
+            }
+        }
+        let dir = scratch("verify-partial-retry");
+        let mut log = open(&dir);
+        for n in 0..3 {
+            log.record(conn_open(&format!("d{n}"), "phone")).unwrap();
+        }
+        drop(log);
+        let journal = Retry {
+            whole: Copy::of(&dir, OUR_EXE),
+            readings: std::cell::Cell::new(0),
+        };
+        // Nothing missing: the first reading had the older records, the second the newest, and the part the second
+        // could not read had been read whole the first time.
+        let (code, out, err) = run(&dir, &["--verify"], &journal);
+        assert_eq!((code, out.trim()), (0, "clean"), "{err}");
+        assert_eq!(journal.readings.get(), 2);
+        std::fs::remove_dir_all(dir.parent().unwrap()).unwrap();
+    }
+
+    #[test]
+    fn one_failed_journal_reading_is_incomplete_not_clean() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = scratch("verify-partial");
+        let mut log = open(&dir);
+        log.record(conn_open("d1", "phone")).unwrap();
+        drop(log);
+        // A journalctl whose user reading fails and whose system reading holds every record.
+        let base = dir.parent().unwrap();
+        let entries = base.join("entries.jsonl");
+        let text: String = Copy::of(&dir, OUR_EXE)
+            .0
+            .iter()
+            .map(|e| serde_json::json!({ "_EXE": e.exe, "EITRI_RECORD": e.record }).to_string() + "\n")
+            .collect();
+        std::fs::write(&entries, text).unwrap();
+        let bin = base.join("journalctl");
+        std::fs::write(
+            &bin,
+            format!(
+                "#!/bin/sh\ncase \"$*\" in *--user*) echo 'No journal files were opened' >&2; exit 1;; esac\ncat '{}'\n",
+                entries.display()
+            ),
+        )
+        .unwrap();
+        std::fs::set_permissions(&bin, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let journal = Journalctl::at(Some(bin));
+        let (code, out, err) = run(&dir, &["--verify"], &journal);
+        assert_eq!(code, VERIFY_INCOMPLETE, "{out}{err}");
+        assert!(err.contains("part of the journal could not be read"), "{err}");
+        assert!(
+            out.contains("No journal files were opened") && !out.contains("clean"),
+            "{out}"
+        );
+        assert_eq!(journal.unread_parts().len(), 1);
+        std::fs::remove_dir_all(base).unwrap();
     }
 
     #[test]

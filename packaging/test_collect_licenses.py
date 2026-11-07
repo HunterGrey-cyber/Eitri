@@ -742,6 +742,14 @@ class CFileClassification(unittest.TestCase):
             ("crtstuff.c", frozenset({"frame_dummy"})),
         ])
 
+    def test_ring_code_with_none_of_its_files_seen_is_named(self):
+        # A linker that left ring's symbols global gives FILE entries with no locals: none is classified, and the
+        # binary that still defines ring's prefixed code is named so the run fails.
+        prefix = "ring_core_0_17_14_"
+        syms = {"shell": {"main", prefix + "CRYPTO_memcmp"}, "eitri-run-guard": {"main"}}
+        self.assertEqual(cl.ring_code_without_its_files(syms, set(), prefix), ["shell"])
+        self.assertEqual(cl.ring_code_without_its_files(syms, {"shell"}, prefix), [])
+
     def test_rings_prefix_is_its_links_key(self):
         self.assertEqual(cl.ring_symbol_prefix({"version": "0.17.14", "links": "ring_core_0_17_14_"}),
                          "ring_core_0_17_14_")

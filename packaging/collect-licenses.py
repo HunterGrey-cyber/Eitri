@@ -646,6 +646,12 @@ def ring_symbol_prefix(pkg):
     return links
 
 
+def ring_code_without_its_files(syms, ring_bins, prefix):
+    """Sorted names of the binaries in `syms` ({binary: defined symbol names}) that define a symbol starting with
+    ring's `prefix` while not in `ring_bins`, the binaries some C file of ring's was classified in."""
+    return sorted(b for b, names in syms.items() if b not in ring_bins and any(n.startswith(prefix) for n in names))
+
+
 def ring_c_files(by_nv):
     """The ring crate's package (from cargo metadata) and the names of every C file its source tree
     holds, or (None, empty set) when the tree has no ring. ring's build script compiles its bundled C
@@ -811,6 +817,16 @@ def native_components(by_nv, shipped, binaries_dir, skia_license_dir=None):
                 raise Fail(f"{b} contains code compiled from {f}{why}, which belongs to no component this "
                            "script has a licence text for. Find which library it is and add it.")
             c_seen.setdefault(comp, set()).add(b)
+    # The other way round: a binary holding ring's prefixed code with none of ring's C files seen in it (a linker that
+    # keeps ring's symbols global, or lists them under no FILE entry of their own, leaves those entries without the
+    # locals classify_c_file() reads, so they would be skipped, not refused) fails rather than ships without ring's
+    # entry.
+    if ring_prefix:
+        missing = ring_code_without_its_files(syms, c_seen.get("ring", set()), ring_prefix)
+        if missing:
+            raise Fail(f"{', '.join(missing)} define symbols with ring's prefix {ring_prefix} but no C file of ring's "
+                       "was found owning them: the linker places them in a way this gate does not read. Look at "
+                       "`readelf -sW` of the binary and revisit classify_c_file().")
     if "GCC runtime" in c_seen:
         comps.append(gcc_runtime_component(c_seen["GCC runtime"]))
     if "ring" in c_seen:
