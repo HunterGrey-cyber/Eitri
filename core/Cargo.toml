@@ -11,6 +11,9 @@ test-support = []
 # Forwarded to `agent`, which holds every `cfg`; without it,
 # `AgentBackend::Legacy` still compiles but can never be constructed.
 legacy-backend = ["agent/legacy-backend"]
+# Test seams of the remote audit log (another journal socket through `EITRI_REMOTE_TEST_JOURNAL`). Only tests
+# enable it, as a dev-dependency feature; a release build is made with no features, so it never holds them.
+remote-test-hooks = []
 
 [dependencies]
 agent = { path = "../agent" }

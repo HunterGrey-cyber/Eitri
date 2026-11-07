@@ -60,6 +60,7 @@ pub mod project_root;
 pub mod project_trust;
 pub mod prompt_history;
 pub mod recent_projects;
+pub mod remote_audit;
 pub mod remote_devices;
 pub mod remote_greeting;
 pub mod remote_pairing;
