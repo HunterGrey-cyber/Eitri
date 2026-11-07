@@ -61,8 +61,32 @@ describe("the pass's keys", () => {
     expect(call).toHaveBeenCalledTimes(1);
   });
 
+  it("enter_with_no_round_starts_it_at_the_oldest_wait", async () => {
+    // Another page selected b; the pass shows only the oldest wait, a, and Enter starts the round there.
+    const rows = [row("b", "card", { waiting_since: 2_000 }), row("a", "card", { waiting_since: 1_000 })];
+    const fake = fakeStore(rows, null, "b");
+    const call = vi.fn();
+    const { base, installed } = kit();
+    const shared = vi.fn(() => true);
+    await passKeys(base, fake.store, call).install({ rows: [], run: shared });
+    expect(installed().run("agents.open", ev)).toBe(true);
+    expect(call).toHaveBeenLastCalledWith("agents.round", { op: "start", key: "a" });
+    expect(shared).not.toHaveBeenCalled();
+
+    // A finished round (no current stop) is no round either.
+    fake.set({ round: round(null, ["x"]) });
+    installed().run("agents.open", ev);
+    expect(call).toHaveBeenLastCalledWith("agents.round", { op: "start", key: "a" });
+
+    // Nothing waits: Enter is the shared key's (it goes to the selected row's chat).
+    fake.set({ rows: [row("b", "idle")], round: null });
+    installed().run("agents.open", ev);
+    expect(shared).toHaveBeenCalledWith("agents.open", ev);
+    expect(call).toHaveBeenCalledTimes(2);
+  });
+
   it("the_shared_keys_pass_through_unchanged", async () => {
-    const fake = fakeStore([row("a", "card")]);
+    const fake = fakeStore([row("a", "card")], round("a", ["a"]));
     const { base, installed } = kit();
     const shared = vi.fn(() => true);
     const rows = [{ action: "agents.next", keys: ["j"], context: "Agents", desc: "Next agent" }];

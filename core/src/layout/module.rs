@@ -192,6 +192,10 @@ pub enum Placement {
     LeftOfRoot,
     /// A new split below the whole root, full width. Lua `position = "bottom"`.
     BelowRoot,
+    /// A new split above the whole root, full width: where a rule's `above` goes when no module holds the keys to be
+    /// above (and where a module shown while agents wait first opens), so a one-line strip declared above opens at
+    /// the window's top edge. No Lua `position` names it.
+    AboveRoot,
     /// The editor's own leaf: the module takes the editor's place and the editor is **hidden**,
     /// not gone. Lua `position = "main"`.
     InPlaceOfEditor,

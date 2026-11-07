@@ -1,6 +1,7 @@
 // The pass: one line of the agents that wait for the person. With a round running it lists the waiting rows as
-// tickets, oldest first, the round's current stop marked with its place; with none, it counts them by glyph and
-// says how to start. With nothing waiting and no round it draws nothing.
+// tickets, oldest first, the round's current stop marked with its place; with none, it counts them by glyph, shows
+// the oldest wait as its one ticket (where `Enter` starts the round) and says how to start. With nothing waiting and
+// no round it draws nothing.
 
 /** The fields of a row (as the agents kit hands it) this page reads. */
 export type PassRow = {
@@ -58,6 +59,11 @@ function stops(rows: PassRow[]): string[][] {
     out.push([row.key]);
   }
   return out;
+}
+
+/** The row the pass shows with no round running, where `Enter` there starts one: the oldest wait. */
+export function firstWait(rows: PassRow[]): PassRow | undefined {
+  return waiting(rows)[0];
 }
 
 export function tickets(rows: PassRow[], round: PassRound | null, selection: string | null): Ticket[] {
@@ -224,14 +230,26 @@ export function render(
     const others = list.filter((t) => !t.current).length;
     if (others) parts.push(span("more", `+${others}`));
     parts.push(span("hint", "n next · prefix B back"));
-  } else {
-    parts.push(countsNode(rows, deps.glyph));
-    parts.push(span("hint", "waiting · prefix u to start"));
+    root.replaceChildren(...parts);
+    root.hidden = false;
+    root.querySelector<HTMLElement>(".current")?.scrollIntoView?.({ block: "nearest", inline: "nearest" });
+    return list;
   }
+  // No round: the counts, then the oldest wait as the line's one ticket, the row `Enter` here starts the round at
+  // (and `j`/`k` select), then how to start from anywhere.
+  parts.push(countsNode(rows, deps.glyph));
+  const first = list.slice(0, 1);
+  const line = span("tickets first", "");
+  for (const t of first) {
+    const el = ticketNode(t, deps.glyph, now, manyWindows(rows));
+    el.classList.add("first");
+    line.append(el);
+  }
+  parts.push(line);
+  parts.push(span("hint", "Enter or prefix u to start"));
   root.replaceChildren(...parts);
   root.hidden = false;
-  root.querySelector<HTMLElement>(".current")?.scrollIntoView?.({ block: "nearest", inline: "nearest" });
-  return list;
+  return first;
 }
 
 /** Draws the strip from the store now and at every change, and keeps the ages current while it is up. */

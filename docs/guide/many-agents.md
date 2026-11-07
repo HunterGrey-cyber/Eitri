@@ -21,8 +21,11 @@ do in one shows in the others, in every window.
 | role | page | where it sits | what it is for |
 |---|---|---|---|
 | glance | Strips, `agents-strips` | a sidebar at the left of the window | who needs you, always in view; rows never re-sort, so a row stays where you last saw it |
-| act | The pass, `agents-pass` | one line above the modules | what needs you, one at a time: the agents that wait, oldest first, the round's place, next and back; it appears only while something waits or a round runs |
+| act | The pass, `agents-pass` | one line above the editor | what needs you, one at a time: the agents that wait, oldest first, the round's place, next and back; it appears only while something waits or a round runs |
 | manage | the table, `agents-top` | a module in the main area, hidden until you open it | everything: sort, filter, open a new agent, ask to stop one |
+
+Each takes the keys as any module does: from the editor, `<prefix> Left` reaches Strips and `<prefix> Up` The pass,
+`<prefix> o` goes round every module, and the table's own key (below) opens it with the keys.
 
 All three are plugins that ship with Eitri and are off until `init.lua` loads them
 ([Plugins](configuration.md#plugins)):
@@ -134,6 +137,9 @@ eitri agents --json          # one line: the whole view
 eitri agents --watch         # the view, then one line per change
 eitri agents --schema 1      # refuse to run unless the rows are this version
 ```
+
+`WIN` is the window's name within its project (`1`, `2`, ...; the names are below), so the first window of every
+project reads `1`: `PROJECT` and `WIN` together name a window.
 
 It reads the same rows as the pages and needs no window to answer, so a hung window cannot stall it. With no Eitri
 window running the table says `no window shares agents` and the JSON has no rows; the exit code is 0. An unknown

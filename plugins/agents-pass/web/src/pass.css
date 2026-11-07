@@ -86,9 +86,9 @@ body {
 }
 /* A narrow module (a column of a split window, a laptop's half screen), while a round runs: the round's place, the
    current ticket and how many others wait. The other tickets and the hint are what `n` and the guide already say.
-   With no round the line is short: the counts and the hint, which gives way on its own. */
+   With no round the line is short: the counts, the oldest wait's ticket and the hint, which gives way on its own. */
 @container (max-width: 72ch) {
-  .ticket:not(.current), .sep, .tickets ~ .hint { display: none; }
+  .ticket:not(.current):not(.first), .sep, .tickets:not(.first) ~ .hint { display: none; }
   .more { display: inline; }
 }
 /* The keys kit draws its bar as a band along the page's bottom, which on this one-line page would cover the line.

@@ -90,6 +90,10 @@ pub(super) fn place_new(root: Node, id: &ModuleId, placement: Placement) -> (Nod
             Node::pinned(Axis::Column, BELOW_ROOT_SHARE, Branch::Second, root, leaf),
             false,
         ),
+        Placement::AboveRoot => (
+            Node::pinned(Axis::Column, 1.0 - BELOW_ROOT_SHARE, Branch::First, leaf, root),
+            false,
+        ),
         Placement::BelowEditor if root.leaves().contains(&ModuleId::editor()) => {
             let mut root = root;
             root.replace_leaf(&ModuleId::editor(), |editor| {

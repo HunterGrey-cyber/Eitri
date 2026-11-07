@@ -463,7 +463,8 @@ impl Controller {
             }
             return Batch::default();
         }
-        self.follow(win, module, show)
+        let cmd = if show { FollowCmd::Show } else { FollowCmd::Hide };
+        self.follow_cmd_from(win, module, cmd, Origin::WaitFollow)
     }
 
     /// A plugin's follow command for `module`, as nvim sent it. A window beside nvim decides every command itself.
@@ -471,6 +472,10 @@ impl Controller {
     /// shows (a show of a page on screen dropped, an `Auto` only for a hidden one), so a `Toggle` or an `Auto` that
     /// reaches one is logged and dropped rather than read as a show.
     pub fn follow_cmd(&mut self, win: WinId, module: &ModuleId, cmd: FollowCmd) -> Batch {
+        self.follow_cmd_from(win, module, cmd, Origin::Follow)
+    }
+
+    fn follow_cmd_from(&mut self, win: WinId, module: &ModuleId, cmd: FollowCmd, origin: Origin) -> Batch {
         let beside = self.windows.get(&win).is_some_and(Window::is_beside);
         let action = match cmd {
             FollowCmd::Hide => Action::ModuleHide,
@@ -486,7 +491,7 @@ impl Controller {
                 return Batch::default();
             }
         };
-        let mut batch = self.run_gated(win, action, Origin::Follow, Some((module, cmd)));
+        let mut batch = self.run_gated(win, action, origin, Some((module, cmd)));
         self.settle_chrome(&mut batch);
         batch
     }
@@ -2600,7 +2605,8 @@ impl Controller {
                 match subject {
                     Some((module, _)) => {
                         let show = matches!(action, Action::Module(_));
-                        module_verbs::follow(window, &cx, win, module, show, &mut batch);
+                        let at_rest = origin == Origin::WaitFollow;
+                        module_verbs::follow(window, &cx, win, module, show, at_rest, &mut batch);
                     }
                     None => {
                         module_verbs::run(window, &cx, win, &action, &origin, &mut batch);

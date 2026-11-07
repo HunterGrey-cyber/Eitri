@@ -64,10 +64,11 @@ const RECTS: [FloatRect; 4] = [
     },
 ];
 const DIRS: [Direction; 4] = [Direction::Left, Direction::Down, Direction::Up, Direction::Right];
-const PLACEMENTS: [Placement; 5] = [
+const PLACEMENTS: [Placement; 6] = [
     Placement::RightOfRoot,
     Placement::LeftOfRoot,
     Placement::BelowRoot,
+    Placement::AboveRoot,
     Placement::InPlaceOfEditor,
     Placement::BelowEditor,
 ];

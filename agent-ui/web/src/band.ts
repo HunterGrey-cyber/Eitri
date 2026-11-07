@@ -2,6 +2,7 @@ import type { PanelMode } from "./keymap";
 import type { BackgroundTaskRecord, EditorLink, TurnEnding, UsageInfo } from "./types";
 import { turnEndingBandText } from "./turnEnding";
 import { escapeText, isHiddenChar, revealedText } from "./revealHidden";
+import { SHORT_FLASH } from "./app/flashes";
 
 /** One segment's identity, in priority order (used only for lookups here --
  *  `bandLayout`'s own construction order, not this list, decides degrade order and render order). */
@@ -365,6 +366,16 @@ export function bandLayout(f: BandFacts, widthPx: number, charPx: number): Seg[]
   for (const apply of steps) {
     if (width(segs) <= budget) break;
     segs = apply(segs);
+  }
+  // A flash too wide for the row gives way to its short form, if it has one (`SHORT_FLASH`), before it wraps: a
+  // wrapped flash grows the band over the composer, and in a narrow chat a sentence takes six rows. Only where it
+  // helps: the whole sentence beside the mode's letter comes first, and a short form that does not fit either leaves
+  // the whole sentence to wrap.
+  const short = f.message === null ? undefined : SHORT_FLASH.get(f.message);
+  const letter = (s: Seg[]) => s.map((x) => (x.id === "mode" ? { ...x, text: MODE_LETTER[f.mode] } : x));
+  if (width(segs) > budget && short !== undefined && width(letter(segs)) > budget) {
+    const shortened = segs.map((x) => (x.id === "message" ? { ...x, text: short } : x));
+    if (width(shortened) <= budget || width(letter(shortened)) <= budget) segs = shortened;
   }
   // The mode shrinks to its letter last. Not for a flash that wraps anyway: five characters of mode
   // word would not make it fit, and the row it wraps onto would then lead with a bare letter ("B");

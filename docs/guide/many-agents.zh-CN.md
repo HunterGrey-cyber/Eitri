@@ -1,5 +1,5 @@
 [English](many-agents.md) | 简体中文
-<!-- translated-from: many-agents.md sha256=de147fca84d1da1dcfc01466965956cc3dedf0734407c8a66340e36062936a81 -->
+<!-- translated-from: many-agents.md sha256=6636e5a356c33b3dde1d20c7bc9fb3319859d62f806a3225309cb1b045ff01ae -->
 
 # 同时用很多 agent
 
@@ -17,8 +17,10 @@
 | 分工 | 页面 | 放在哪里 | 用来做什么 |
 |---|---|---|---|
 | 扫一眼 | Strips，`agents-strips` | 窗口左边的侧栏 | 谁需要你，始终看得见；行永远不重新排序，所以一行总在你上次看到的位置 |
-| 动手 | The pass，`agents-pass` | 模块上方的一行 | 什么需要你，一次一个：在等的 agent，最久的在前，这一轮走到哪了，下一个和回退；只有在有东西等、或者一轮在进行时才出现 |
+| 动手 | The pass，`agents-pass` | 编辑器上方的一行 | 什么需要你，一次一个：在等的 agent，最久的在前，这一轮走到哪了，下一个和回退；只有在有东西等、或者一轮在进行时才出现 |
 | 管理 | 表格，`agents-top` | 主区域里的一个模块，打开之前是隐藏的 | 所有东西：排序、过滤、新开一个 agent、请求停掉一个 |
+
+它们和别的模块一样用键拿到焦点：从编辑器按 `<prefix> Left` 到 Strips，`<prefix> Up` 到 The pass，`<prefix> o` 依次走过所有模块，表格用它自己的键（见下文）打开并拿到焦点。
 
 三个都是随 Eitri 一起发布的插件，在 `init.lua` 加载它们之前是关着的（[插件](configuration.zh-CN.md#plugins)）：
 
@@ -102,6 +104,8 @@ eitri agents --json          # one line: the whole view
 eitri agents --watch         # the view, then one line per change
 eitri agents --schema 1      # refuse to run unless the rows are this version
 ```
+
+`WIN` 是窗口在它的项目里的名字（`1`、`2`……，名字见下文），所以每个项目的第一个窗口都显示 `1`：`PROJECT` 和 `WIN` 合起来才指明一个窗口。
 
 它读的是和页面相同的行，不需要任何窗口来回答，所以一个卡住的窗口拖不住它。没有 Eitri 窗口在运行时，表格显示 `no window shares agents`，JSON 里没有行；退出码是 0。不认识的参数或不支持的模式版本，退出码是 64；读取出错是 1。管道被关闭时，`--watch` 安静地结束。
 

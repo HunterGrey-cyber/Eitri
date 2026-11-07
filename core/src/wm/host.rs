@@ -224,6 +224,10 @@ pub enum Origin {
     Chip,
     /// An automatic follow request.
     Follow,
+    /// A module shown or hidden because agents started or stopped waiting: a follow whose show, of a module the
+    /// layout does not hold yet, places it by its rule beside the editor, as if the editor held the keys (the person
+    /// did not choose where the keys were when an agent started waiting).
+    WaitFollow,
     /// A linked process.
     Peer,
     /// An action window 1 sent over the link to a module window: it runs there as it is, never sent back.

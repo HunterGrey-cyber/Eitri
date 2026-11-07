@@ -28,6 +28,7 @@ import {
   CTRL_Y_HELD_FLASH,
   CTRL_Y_EDITOR_CARD_FLASH,
   NOT_APPROVABLE_FLASH,
+  ESC_DOES_NOT_INTERRUPT_FLASH,
   NOTHING_IN_THE_BACKGROUND,
   CLAUDE_REPORTS_NO_BACKGROUND,
   nothingToStopWords,
@@ -5485,7 +5486,7 @@ export default function App() {
         break;
       case "esc-blocked":
         // `Esc` never interrupts -- this is the reminder, not the action.
-        showFlash("Esc does not interrupt — ctrl+c does");
+        showFlash(ESC_DOES_NOT_INTERRUPT_FLASH);
         break;
       case "toggle-expand": {
         const item = timeline[cursor];

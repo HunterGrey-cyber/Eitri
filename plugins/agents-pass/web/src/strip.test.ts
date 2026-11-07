@@ -61,14 +61,24 @@ describe("the pass", () => {
     expect(place(rows, round("a", ["a", "b"]))).toEqual({ at: 1, of: 2 });
   });
 
-  it("no_round_shows_counts_and_the_prefix_u_hint", () => {
-    const rows = [row("a", "card"), row("b", "question"), row("c", "card"), row("d", "running")];
-    const { root } = mount(fakeStore(rows).store);
+  it("no_round_shows_counts_the_oldest_wait_and_how_to_start", () => {
+    const rows = [
+      row("a", "card", { waiting_since: 3_000 }),
+      row("b", "question", { waiting_since: 1_000, number: 2, label: "probe flake" }),
+      row("c", "card", { waiting_since: 2_000 }),
+      row("d", "running"),
+    ];
+    const { root, strip } = mount(fakeStore(rows).store);
     expect(root.hidden).toBe(false);
-    expect(shown(root)).toEqual([]);
     const counts = [...root.querySelectorAll(".count")].map((c) => c.textContent);
     expect(counts).toEqual(["⚑ 2", "? 1"]);
-    expect(root.querySelector(".hint")?.textContent).toBe("waiting · prefix u to start");
+    // The oldest wait is the line's one ticket, the row Enter starts the round at; j/k have only it to select.
+    expect(shown(root)).toEqual(["b"]);
+    expect(root.querySelector(".ticket")?.textContent).toBe("? eitri·2 probe flake 3m19");
+    expect(root.querySelector(".current")).toBeNull();
+    expect(strip.order()).toEqual(["b"]);
+    expect([...root.children].map((c) => c.className)).toEqual(["counts", "tickets first", "hint"]);
+    expect(root.querySelector(".hint")?.textContent).toBe("Enter or prefix u to start");
   });
 
   it("nothing_waiting_and_no_round_hides_the_strip", () => {
@@ -112,8 +122,8 @@ describe("the pass", () => {
     fake.set({ rows: [row("a", "idle"), row("b", "card")] });
     expect(root.hidden).toBe(false);
     expect(root.querySelector(".lead")).toBeNull();
-    expect(shown(root)).toEqual([]);
-    expect(root.querySelector(".hint")?.textContent).toBe("waiting · prefix u to start");
+    expect(shown(root)).toEqual(["b"]);
+    expect(root.querySelector(".hint")?.textContent).toBe("Enter or prefix u to start");
   });
 
   it("a_window_s_trust_stop_stays_one_stop_after_it_is_answered", () => {
@@ -191,9 +201,12 @@ describe("the pass", () => {
       .replace(/\/\*[\s\S]*?\*\//g, "");
     const narrow = css.match(/@container \(max-width: (\d+)ch\) \{([\s\S]*?\})\s*\}/);
     expect(narrow).not.toBeNull();
-    // Hidden there: every ticket but the current one, the separators and the round's hint (the one after the
-    // tickets; with no round the hint follows the counts and stays); shown: the count.
-    expect(narrow![2]).toMatch(/\.ticket:not\(\.current\), \.sep, \.tickets ~ \.hint \{ display: none; \}/);
+    // Hidden there: every ticket but the current one (and, with no round, the oldest wait's), the separators and the
+    // round's hint (the one after the round's tickets; with no round the hint stays and gives way by itself); shown:
+    // the count.
+    expect(narrow![2]).toMatch(
+      /\.ticket:not\(\.current\):not\(\.first\), \.sep, \.tickets:not\(\.first\) ~ \.hint \{ display: none; \}/,
+    );
     expect(narrow![2]).toMatch(/\.more \{ display: inline; \}/);
     // The body is the container the rule measures.
     expect(css).toMatch(/body \{\s*container-type: inline-size;/);

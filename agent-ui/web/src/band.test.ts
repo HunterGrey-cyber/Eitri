@@ -1,6 +1,7 @@
 import { describe, expect, it } from "vitest";
 import { phoneTitle, backgroundSegment, bandLayout, cardSummary, liveTasks, taskWords, tasksLine, textWidth, usageSegment, type BandFacts } from "./band";
 import { applyEvent, initialState } from "./reducer";
+import { ESC_DOES_NOT_INTERRUPT_FLASH, SHORT_FLASH, TYPING_FLASH } from "./app/flashes";
 import type { BackgroundTask, BackgroundTaskRecord, TaskKind, TokenUsage } from "./types";
 
 const running: BandFacts = { mode: "input", pill: "⏵⏵ auto", showcmd: null, message: null, prompt: null, warn: null,
@@ -234,6 +235,50 @@ describe("a y/n prompt or a flash is never truncated", () => {
     const segs = bandLayout({ ...idle, message }, 44 * 7.2, 7.2);
     expect(segs.find((s) => s.id === "mode")!.text).toBe("B");
     expect(segs.find((s) => s.id === "message")!.wraps).toBeFalsy();
+  });
+
+  /* The card guard's refusal in a narrow chat (the films' 1280 px window at zoom 1.5: a band of about 37 columns beside
+     a manual pill) wrapped over six rows and covered the composer. Too wide for the row, it gives way to its short
+     form, and the mode its letter, which is what lets that fit; a wide band keeps the whole sentence. */
+  it("the card guard's refusal keeps one row in a narrow chat: its short form, not six wrapped rows", () => {
+    const narrow = { ...idle, pill: "⏵⏵ manual", cards: 3, message: TYPING_FLASH };
+    const segs = bandLayout(narrow, 37 * 7.2, 7.2);
+    const message = segs.find((s) => s.id === "message")!;
+    expect(message.text).toBe(SHORT_FLASH.get(TYPING_FLASH));
+    expect(message.wraps).toBeFalsy();
+    expect(segs.find((s) => s.id === "pill")!.text).toBe("⏵⏵ manual");
+    expect(segs.find((s) => s.id === "mode")!.text).toBe("B");
+    const wide = bandLayout(narrow, 160 * 7.2, 7.2);
+    expect(wide.find((s) => s.id === "message")!.text).toBe(TYPING_FLASH);
+    expect(wide.find((s) => s.id === "mode")!.text).toBe("BROWSE");
+  });
+
+  it("Esc's reminder keeps one row in a narrow chat too", () => {
+    const segs = bandLayout({ ...idle, pill: "⏵⏵ manual", message: ESC_DOES_NOT_INTERRUPT_FLASH }, 36 * 7.2, 7.2);
+    const message = segs.find((s) => s.id === "message")!;
+    expect(message.text).toBe("ctrl+c interrupts");
+    expect(message.wraps).toBeFalsy();
+  });
+
+  it("the short form only where it helps: the whole sentence beside the letter first, else the whole one wraps", () => {
+    // `B ⏵⏵ manual Esc does not interrupt — ctrl+c does`: 4 + 11 + 38 = 53 columns fit whole with the letter.
+    const esc = { ...idle, pill: "⏵⏵ manual", message: ESC_DOES_NOT_INTERRUPT_FLASH };
+    const fits = bandLayout(esc, 53 * 7.2, 7.2);
+    expect(fits.find((s) => s.id === "message")!.text).toBe(ESC_DOES_NOT_INTERRUPT_FLASH);
+    expect(fits.find((s) => s.id === "mode")!.text).toBe("B");
+    // 20 columns: not even `B ⏵⏵ manual ctrl+c interrupts` (34) fits, so the whole sentence wraps.
+    const wraps = bandLayout(esc, 20 * 7.2, 7.2).find((s) => s.id === "message")!;
+    expect(wraps.text).toBe(ESC_DOES_NOT_INTERRUPT_FLASH);
+    expect(wraps.wraps).toBe(true);
+  });
+
+  it("every short form fits one row beside a manual pill at 40 columns", () => {
+    // 40 columns: about the narrowest chat column a split 1280 px window gives at zoom 1.5.
+    for (const [full, short] of SHORT_FLASH) {
+      expect(textWidth(short)).toBeLessThan(textWidth(full));
+      const segs = bandLayout({ ...idle, pill: "⏵⏵ manual", cards: 1, message: full }, 40 * 7.2, 7.2);
+      expect(segs.find((s) => s.id === "message")!.wraps).toBeFalsy();
+    }
   });
 
   it("a short prompt still fits the row whole -- no wraps flag", () => {

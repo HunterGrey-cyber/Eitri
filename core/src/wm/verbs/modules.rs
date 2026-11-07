@@ -152,7 +152,7 @@ pub enum Ran {
 pub fn run(w: &mut Window, cx: &Cx, win: WinId, action: &Action, origin: &Origin, batch: &mut Batch) -> Ran {
     match action {
         Action::Module(id) if *origin == Origin::Chip => chip(w, cx, win, id, batch),
-        Action::Module(id) if *origin == Origin::Follow => follow(w, cx, win, id, true, batch),
+        Action::Module(id) if *origin == Origin::Follow => follow(w, cx, win, id, true, false, batch),
         Action::Module(id) if id.kind() == ModuleKind::Terminal => terminal_key(w, cx, win, id, batch),
         Action::Module(id) => module_key(w, cx, win, id, batch),
         Action::ModuleHide => {
@@ -567,7 +567,7 @@ pub(in crate::wm) fn reveal_and_focus(
     w.say(format!("[modules] {id}: {action:?}, asked from outside this window"));
     match action {
         KeyAction::Place | KeyAction::ShowAndFocus if starts_hidden(cx, id) => {
-            open_plugin_module(w, cx, win, id, Some(true), batch)
+            open_plugin_module(w, cx, win, id, Some(true), false, batch)
         }
         KeyAction::ShowAndFocus => {
             show_on_screen(w, cx, win, id, batch).and_then(|()| focus_and_arrive(w, win, id, batch))
@@ -635,7 +635,7 @@ fn open_module(w: &mut Window, cx: &Cx, win: WinId, id: &ModuleId, action: KeyAc
     w.say(format!("[modules] {id}: {action:?}"));
     let result = match action {
         KeyAction::Place | KeyAction::ShowAndFocus if starts_hidden(cx, id) => {
-            open_plugin_module(w, cx, win, id, Some(true), batch)
+            open_plugin_module(w, cx, win, id, Some(true), false, batch)
         }
         KeyAction::ShowAndFocus => {
             show_on_screen(w, cx, win, id, batch).and_then(|()| focus_and_arrive(w, win, id, batch))
@@ -698,15 +698,18 @@ fn opened_with_keys(w: &mut Window, win: WinId, id: &ModuleId, takes_keys: bool,
 }
 
 /// Puts a start-hidden plugin's module on screen: shown where it was if the layout holds it; else opened by its
-/// rule beside the module with the keys, and put hidden into every other workspace that lacks it, as a new instance
-/// is. The keys move only when it takes them. A zoom that would hide it ends first. Its page is built once it is on
-/// screen, so an open the layout refuses builds no page.
+/// rule beside the module with the keys (or, `at_rest`, beside the editor, the window's home, as if it held them: a
+/// show the person did not ask for, so where the keys happen to be says nothing about where it belongs; with no editor
+/// on screen, where the rule goes with no module holding the keys), and put hidden into
+/// every other workspace that lacks it, as a new instance is. The keys move only when it takes them. A zoom that
+/// would hide it ends first. Its page is built once it is on screen, so an open the layout refuses builds no page.
 fn open_plugin_module(
     w: &mut Window,
     cx: &Cx,
     win: WinId,
     id: &ModuleId,
     take_keys: Option<bool>,
+    at_rest: bool,
     batch: &mut Batch,
 ) -> Result<(), LayoutError> {
     let rule = plugin_open_rule(cx, id, take_keys);
@@ -737,10 +740,22 @@ fn open_plugin_module(
         return Err(LayoutError::NotInTree(id.clone()));
     }
     let keys = l.focus().clone();
-    let opened = layout::open_by_rule(&mut l, id, &rule, Some(&keys), cx.reads.grid_size(win))?;
+    let editor = ModuleId::editor();
+    // An editor on a tab behind another is not on screen: placed beside it, the module would be hidden with it.
+    let anchor = if !at_rest {
+        Some(&keys)
+    } else if l.is_tabbed_away(&editor) {
+        None
+    } else {
+        Some(&editor)
+    };
+    let opened = layout::rules::open_by_rule_at(&mut l, id, &rule, anchor, Some(&keys), cx.reads.grid_size(win))?;
     drop(l);
-    for note in &opened.notes {
-        w.say(format!("[layout] {note}"));
+    // At rest a fallback's note ("needs a module with the keys") would mislead: no keys were asked for.
+    if !at_rest {
+        for note in &opened.notes {
+            w.say(format!("[layout] {note}"));
+        }
     }
     let placement = plugin_hidden_placement(cx, id);
     let added = w
@@ -755,7 +770,12 @@ fn open_plugin_module(
     }
     opened_with_keys(w, win, id, opened.takes_keys, vec![], batch);
     w.say(format!(
-        "[modules] {id}: opened by its rule{}",
+        "[modules] {id}: opened by its rule{}{}",
+        if at_rest {
+            " beside the editor, since agents wait".to_string()
+        } else {
+            String::new()
+        },
         if opened.takes_keys {
             ""
         } else {
@@ -782,7 +802,7 @@ pub fn show_on_screen(
         return Ok(());
     };
     if !held && starts_hidden(cx, id) {
-        return open_plugin_module(w, cx, win, id, Some(false), batch);
+        return open_plugin_module(w, cx, win, id, Some(false), false, batch);
     }
     if !held {
         return Err(LayoutError::NotInTree(id.clone()));
@@ -1897,9 +1917,10 @@ pub(super) fn remaining_views(w: &Window) -> Vec<ViewId> {
 }
 
 /// A plugin's follow command for its module: shown puts it on screen (opening a start-hidden one by its rule the
-/// first time) with the keys where they are, and draws its tab unless that would hide the module with the keys;
-/// hidden sends the keys where any hide sends them. A refusal is logged; the editor asked, not the user.
-pub fn follow(w: &mut Window, cx: &Cx, win: WinId, module: &ModuleId, show: bool, batch: &mut Batch) {
+/// first time; `at_rest`, for a show because agents wait, beside the editor as if it held the keys) with
+/// the keys where they are, and draws its tab unless that would hide the module with the keys; hidden sends the keys
+/// where any hide sends them. A refusal is logged; the editor asked, not the user.
+pub fn follow(w: &mut Window, cx: &Cx, win: WinId, module: &ModuleId, show: bool, at_rest: bool, batch: &mut Batch) {
     if !show {
         if let Err(err) = hide(w, cx, win, module, batch) {
             w.say(format!(
@@ -1908,7 +1929,13 @@ pub fn follow(w: &mut Window, cx: &Cx, win: WinId, module: &ModuleId, show: bool
         }
         return;
     }
-    if let Err(err) = show_on_screen(w, cx, win, module, batch) {
+    let held = w.layout.try_borrow().is_ok_and(|layout| layout.contains(module));
+    let shown = if at_rest && !held && starts_hidden(cx, module) {
+        open_plugin_module(w, cx, win, module, Some(false), true, batch)
+    } else {
+        show_on_screen(w, cx, win, module, batch)
+    };
+    if let Err(err) = shown {
         w.say(format!(
             "[modules] {module}: the editor asked to show it, refused: {err}"
         ));
@@ -1932,7 +1959,7 @@ pub fn follow(w: &mut Window, cx: &Cx, win: WinId, module: &ModuleId, show: bool
 pub fn lua_show(w: &mut Window, cx: &Cx, win: WinId, id: &ModuleId, batch: &mut Batch) -> Result<(), LayoutError> {
     let held = w.layout.try_borrow().is_ok_and(|layout| layout.contains(id));
     if starts_hidden(cx, id) && !held {
-        return open_plugin_module(w, cx, win, id, None, batch);
+        return open_plugin_module(w, cx, win, id, None, false, batch);
     }
     show_on_screen(w, cx, win, id, batch)
 }

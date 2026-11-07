@@ -4,6 +4,17 @@
  *  is refused the same way when the two come close together, and "type" alone read as if the user
  *  had been typing. */
 export const TYPING_FLASH = "a / d answer a card only on their own — pause, then press again; i or Ctrl+j to type";
+/** What the band says when `Esc` is pressed while a turn runs: it never interrupts, and this is the reminder. */
+export const ESC_DOES_NOT_INTERRUPT_FLASH = "Esc does not interrupt — ctrl+c does";
+
+/** The short form the band shows of a flash too wide for its one row (`bandLayout`), tried once every segment that
+ *  can go has gone and before the mode shrinks to its letter: a narrow chat (a column of a split window, a laptop at
+ *  zoom 1.5) keeps one row and its composer uncovered, and still says what to do. A flash without a short form, or
+ *  whose short form does not fit either, wraps as before. */
+export const SHORT_FLASH: ReadonlyMap<string, string> = new Map([
+  [TYPING_FLASH, "pause, press again"],
+  [ESC_DOES_NOT_INTERRUPT_FLASH, "ctrl+c interrupts"],
+]);
 /** What the band says when `a`/`d`/`D`, or Enter/Space on a card's own button,
  *  came after a count (`3a`) -- a card answer takes no count, so the key answers nothing. */
 export const COUNT_ANSWER_FLASH = "a / d / D take no count — press it on its own";

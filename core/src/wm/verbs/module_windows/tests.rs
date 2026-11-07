@@ -1702,3 +1702,151 @@ fn another_processs_new_starts_the_next_chat_window_with_its_token_in_window_1()
     let batch = r.controller.agents_new(WIN, Some("tok".into()));
     assert!(ops(&batch).iter().all(|op| !is_new_op(op)), "{:?}", ops(&batch));
 }
+
+/// A controller holding editor | terminal, the keys on the terminal, with The pass declared start-hidden, its own
+/// rule `above` at 28 px without the keys, and its page deferred until its first show.
+fn with_the_pass() -> (Rig, ModuleId) {
+    let mut layout = editor_and_terminal();
+    layout.set_focus(&ModuleId::terminal()).unwrap();
+    with_the_pass_in(layout)
+}
+
+/// [`with_the_pass`] over `layout`, its keys where `layout` has them.
+fn with_the_pass_in(layout: Layout) -> (Rig, ModuleId) {
+    use crate::layout::rules::{At, OpenRule, RuleSize};
+    use crate::layout::Workspaces;
+    use crate::wm::module::SurfaceDecl;
+    use std::cell::RefCell;
+    let pass = ModuleId::lua("agents-pass");
+    let host = crate::wm::fake::FakeHost::new();
+    let scheduler = crate::wm::fake::FakeScheduler::new();
+    let mut controller = Controller::new(scheduler.clone());
+    controller.set_reads(host.clone());
+    host.set_grid_size(crate::layout::Size { w: 1200, h: 800 });
+    let mut hosted: Vec<SurfaceDecl> = layout.modules().iter().map(decl).collect();
+    hosted.push(SurfaceDecl {
+        module: pass.clone(),
+        kind: SurfaceKind::PluginPage {
+            plugin: "agents-pass".into(),
+        },
+        deferred: true,
+    });
+    let layout = Rc::new(RefCell::new(layout));
+    controller.open_window(
+        WIN,
+        WindowSpec {
+            role: WindowRole::Main,
+            presence: EditorPresence::Owned,
+            title: "project".into(),
+        },
+        WindowParts {
+            layout: layout.clone(),
+            workspaces: Rc::new(RefCell::new(Workspaces::single())),
+            saver: None,
+        },
+    );
+    controller.set_module_setup(
+        WIN,
+        crate::wm::verbs::modules::ModuleSetup {
+            start_hidden: vec![(
+                pass.clone(),
+                Some(OpenRule {
+                    at: Some(At::Beside(Direction::Up)),
+                    size: Some(RuleSize::Pixels(28)),
+                    focus: false,
+                    ..OpenRule::default()
+                }),
+            )],
+            ..Default::default()
+        },
+    );
+    let first = controller.first_apply(WIN, &hosted);
+    controller.window_mut(WIN).unwrap().tiling = Tiling::Eitri;
+    (
+        Rig {
+            host,
+            scheduler,
+            controller,
+            layout,
+            first,
+        },
+        pass,
+    )
+}
+
+/// Shown because an agent waits, a module that was never placed opens by its rule beside the editor, as if the editor
+/// held the keys: The pass's `above` is a line above the editor's column, whichever module had the keys, so a
+/// sidebar and the chat beside it never move; the keys stay where they were. The editor's follow command, which the
+/// person's buffer asked for, still opens it beside the module with the keys.
+#[test]
+fn a_module_shown_while_agents_wait_opens_beside_the_editor_whoever_has_the_keys() {
+    let (mut r, pass) = with_the_pass();
+    r.controller.wait_follow(WIN, &pass, true);
+    let layout = r.layout.borrow();
+    assert!(layout.is_shown(&pass));
+    assert_eq!(*layout.focus(), ModuleId::terminal(), "the keys stay");
+    let root = layout.root();
+    assert_eq!(root.layout, crate::layout::ConLayout::SplitH, "{root:?}");
+    let Node::Con(column) = &root.children[0].node else {
+        panic!("the editor's place holds a column: {root:?}")
+    };
+    assert_eq!(column.layout, crate::layout::ConLayout::SplitV);
+    assert_eq!(column.children[0].node, Node::Leaf(pass.clone()));
+    assert_eq!(column.children[0].fixed_px, Some(28));
+    assert_eq!(column.children[1].node, Node::Leaf(ModuleId::editor()));
+    assert_eq!(
+        root.children[1].node,
+        Node::Leaf(ModuleId::terminal()),
+        "the terminal is untouched"
+    );
+    drop(layout);
+
+    // Hidden when nothing waits, and shown again in that same place, the keys now on the editor.
+    r.controller.wait_follow(WIN, &pass, false);
+    assert!(!r.layout.borrow().is_shown(&pass));
+    r.layout.borrow_mut().set_focus(&ModuleId::editor()).unwrap();
+    r.controller.wait_follow(WIN, &pass, true);
+    assert!(r.layout.borrow().is_shown(&pass));
+    assert_eq!(
+        r.layout.borrow().root().children[1].node,
+        Node::Leaf(ModuleId::terminal())
+    );
+
+    let (mut by_editor, pass) = with_the_pass();
+    by_editor.controller.follow(WIN, &pass, true);
+    let layout = by_editor.layout.borrow();
+    let Node::Con(column) = &layout.root().children[1].node else {
+        panic!(
+            "a follow command opens it above the terminal, which has the keys: {:?}",
+            layout.root()
+        )
+    };
+    assert_eq!(column.children[0].node, Node::Leaf(pass.clone()));
+    assert_eq!(column.children[1].node, Node::Leaf(ModuleId::terminal()));
+}
+
+/// An editor on a tab behind the chat is not on screen: placed beside it, The pass would sit inside the hidden tab, and
+/// no follow could draw it without hiding the chat that has the keys. It goes where the rule goes with no module
+/// holding the keys instead: `above`, the window's top edge, on screen, the keys still on the chat.
+#[test]
+fn a_wait_show_does_not_anchor_on_an_editor_tabbed_away() {
+    let mut layout = editor_and_terminal();
+    crate::layout::place_as_tab(&mut layout, &agent(), &ModuleId::editor(), true).unwrap();
+    layout.set_focus(&agent()).unwrap();
+    assert!(
+        layout.is_tabbed_away(&ModuleId::editor()),
+        "the setup: the chat's tab is drawn"
+    );
+    let (mut r, pass) = with_the_pass_in(layout);
+    r.controller.wait_follow(WIN, &pass, true);
+    let layout = r.layout.borrow();
+    assert!(layout.is_visible(&pass), "on screen: {:?}", layout.root());
+    assert!(!layout.is_tabbed_away(&pass));
+    assert_eq!(
+        layout.root().children[0].node,
+        Node::Leaf(pass.clone()),
+        "the window's top edge"
+    );
+    assert_eq!(*layout.focus(), agent(), "the keys stay on the chat");
+    assert!(!layout.is_tabbed_away(&agent()));
+}

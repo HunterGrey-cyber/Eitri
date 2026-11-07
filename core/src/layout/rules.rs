@@ -221,14 +221,16 @@ pub fn builtin(id: &ModuleId, point: OpenPoint) -> OpenRule {
     }
 }
 
-/// Where `at` goes when no module holds the keys, and whether that is a fallback. `left` keeps its side: the window's
-/// left edge, full height, as `right` becomes the side.
+/// Where `at` goes when no module holds the keys, and whether that is a fallback. `left` and `above` keep their side:
+/// the window's left edge, full height, and its top edge, full width, as `right` becomes the side and `below` the
+/// bottom.
 pub fn without_keys(at: At) -> (Placement, bool) {
     match at {
         At::Placement(placement) => (placement, false),
         At::Beside(Direction::Right) | At::Tab => (Placement::RightOfRoot, true),
         At::Beside(Direction::Left) => (Placement::LeftOfRoot, true),
-        At::Beside(Direction::Down | Direction::Up) => (Placement::BelowRoot, true),
+        At::Beside(Direction::Down) => (Placement::BelowRoot, true),
+        At::Beside(Direction::Up) => (Placement::AboveRoot, true),
     }
 }
 
@@ -272,6 +274,7 @@ pub fn at_name(at: At) -> &'static str {
     match at {
         At::Placement(Placement::RightOfRoot) => "side",
         At::Placement(Placement::LeftOfRoot) => "window's left edge",
+        At::Placement(Placement::AboveRoot) => "window's top edge",
         At::Placement(Placement::BelowRoot) => "bottom",
         At::Placement(Placement::InPlaceOfEditor) => "main",
         At::Placement(Placement::BelowEditor) => "below-editor",
@@ -327,6 +330,20 @@ pub fn open_by_rule(
     keys: Option<&ModuleId>,
     grid: Size,
 ) -> Result<Opened, LayoutError> {
+    open_by_rule_at(layout, id, rule, keys, keys, grid)
+}
+
+/// [`open_by_rule`] with what a tiled rule is placed beside (`anchor`) apart from the module whose keys stay where
+/// they are when `focus` is false (`keys`): a module shown by the window itself, not by the person, is placed by its
+/// rule beside the editor whoever has the keys.
+pub fn open_by_rule_at(
+    layout: &mut Layout,
+    id: &ModuleId,
+    rule: &OpenRule,
+    anchor: Option<&ModuleId>,
+    keys: Option<&ModuleId>,
+    grid: Size,
+) -> Result<Opened, LayoutError> {
     if layout.contains(id) {
         return Err(LayoutError::Duplicate(id.clone()));
     }
@@ -353,7 +370,7 @@ pub fn open_by_rule(
             notes,
         });
     }
-    let anchor = keys
+    let anchor = anchor
         .and_then(|k| {
             if layout.is_floating(k) {
                 layout.tiled_anchor()
@@ -816,7 +833,7 @@ mod tests {
         assert_eq!(without_keys(At::Beside(Direction::Left)), (Placement::LeftOfRoot, true));
         assert_eq!(without_keys(At::Tab), (Placement::RightOfRoot, true));
         assert_eq!(without_keys(At::Beside(Direction::Down)), (Placement::BelowRoot, true));
-        assert_eq!(without_keys(At::Beside(Direction::Up)), (Placement::BelowRoot, true));
+        assert_eq!(without_keys(At::Beside(Direction::Up)), (Placement::AboveRoot, true));
         assert_eq!(
             without_keys(At::Placement(Placement::InPlaceOfEditor)),
             (Placement::InPlaceOfEditor, false)
@@ -1300,6 +1317,34 @@ mod tests {
                 .notes
                 .iter()
                 .any(|n| n.contains("'left'") && n.contains("window's left edge")),
+            "{:?}",
+            opened.notes
+        );
+        // `above` keeps its side too: the window's top edge, full width, at a pixel height when the rule gives one.
+        let mut layout = fixture("row(editor focus 0.6, agent)");
+        let rule = OpenRule {
+            at: Some(At::Beside(Direction::Up)),
+            size: Some(RuleSize::Pixels(28)),
+            ..OpenRule::default()
+        };
+        let opened = open_by_rule(&mut layout, &t2(), &rule, None, GRID).unwrap();
+        assert_eq!(layout.leaves().first(), Some(&t2()));
+        let r = rects(&layout, size);
+        assert_eq!(
+            (r[&t2()].x, r[&t2()].y, r[&t2()].w, r[&t2()].h),
+            (0, 0, size.w, 28),
+            "top edge, full width, one line"
+        );
+        assert_eq!(
+            r[&ModuleId::editor()].y,
+            r[&ModuleId::agent()].y,
+            "the rest sits below it, side by side"
+        );
+        assert!(
+            opened
+                .notes
+                .iter()
+                .any(|n| n.contains("'above'") && n.contains("window's top edge")),
             "{:?}",
             opened.notes
         );
