@@ -129,6 +129,33 @@ fn bare_chords(lessons: &str) -> Vec<String> {
 }
 
 #[test]
+fn only_lessons_2_and_6_explain_compositor_tiling_before_the_first_step() {
+    for (lang, source, heading) in [("en", LESSONS_EN, "Lesson "), ("zh", LESSONS_ZH, "第 ")] {
+        let sections: Vec<_> = source
+            .split("\n# ")
+            .filter(|section| section.starts_with(heading))
+            .collect();
+        assert_eq!(sections.len(), 8, "{lang}: lessons 0 through 7");
+        for (lesson, section) in sections.iter().enumerate() {
+            let intro = section.split("\n 1.").next().unwrap();
+            let count = usize::from(matches!(lesson, 2 | 6));
+            for marker in ["window.tiling", "\"eitri\""] {
+                assert_eq!(
+                    intro.matches(marker).count(),
+                    count,
+                    "{lang}: lesson {lesson} must explain {marker} before its first step"
+                );
+                assert_eq!(
+                    section.matches(marker).count(),
+                    count,
+                    "{lang}: lesson {lesson} must contain {marker} only in its introduction"
+                );
+            }
+        }
+    }
+}
+
+#[test]
 fn every_key_the_lessons_name_after_the_prefix_does_what_they_say_in_the_default_table() {
     let defaults = Keymap::defaults();
     assert_eq!(
@@ -771,9 +798,28 @@ fn substitution_touches_the_placeholder_and_nothing_else() {
 const STOCK_WORDS_EN: &str = include_str!("lessons/en/stock-words.txt");
 const STOCK_WORDS_ZH: &str = include_str!("lessons/zh/stock-words.txt");
 
-/// The passages the conversion rewrote on purpose, as (what the stock lessons said, what they say now), each
+/// Passages intentionally changed from the stock lessons, as (stock text, current text), each
 /// with whitespace normalised (the Chinese lessons without any, since a wrap there falls between characters).
 const REWRITTEN_EN: &[(&str, &str)] = &[
+    (
+        "** Ctrl+b % opens a module to the right, Ctrl+b \" below. **",
+        "** Ctrl+b % opens a module to the right, Ctrl+b \" below. ** \
+         NOTE: On Hyprland, sway and niri, Eitri leaves tiling to your window manager \
+         by default. The split and zoom keys here only show a hint in that mode. \
+         To use them, add `eitri.config.set(\"window.tiling\", \"eitri\")` to your \
+         init.lua and open a new Eitri window.",
+    ),
+    (
+        "** A float sits above the other modules, the scratchpad keeps floats out of \
+         sight, and a workspace keeps a whole arrangement under a name. **",
+        "** A float sits above the other modules, the scratchpad keeps floats out of \
+         sight, and a workspace keeps a whole arrangement under a name. ** \
+         NOTE: On Hyprland, sway and niri, Eitri leaves tiling to your window manager \
+         by default. The float, scratchpad and workspace keys only show a hint \
+         in that mode. To use them, add \
+         `eitri.config.set(\"window.tiling\", \"eitri\")` to your init.lua and open \
+         a new Eitri window.",
+    ),
     (
         "The keys are written for the default setup, with `Ctrl+b` as the prefix. If Eitri took another prefix \
          from your tmux config or your init.lua, press yours wherever this tutorial says Ctrl+b. Lesson 7 says \
@@ -798,6 +844,20 @@ const REWRITTEN_EN: &[(&str, &str)] = &[
     ),
 ];
 const REWRITTEN_ZH: &[(&str, &str)] = &[
+    (
+        "**Ctrl+b%在右边打开一个模块，Ctrl+b\"在下面打开。**",
+        "**Ctrl+b%在右边打开一个模块，Ctrl+b\"在下面打开。**\
+         注意：在Hyprland、sway和niri上，Eitri默认把平铺交给窗口管理器。\
+         这种模式下，分割和放大的键只会显示提示。要启用它们，在init.lua里加上\
+         `eitri.config.set(\"window.tiling\",\"eitri\")`，再打开一个Eitri窗口。",
+    ),
+    (
+        "**浮动窗口在其他模块之上，便笺板把浮动窗口收起来，工作区以一个名字保存一整套排布。**",
+        "**浮动窗口在其他模块之上，便笺板把浮动窗口收起来，工作区以一个名字保存一整套排布。**\
+         注意：在Hyprland、sway和niri上，Eitri默认把平铺交给窗口管理器。\
+         这种模式下，浮动窗口、便笺板和工作区的键只会显示提示。要启用它们，\
+         在init.lua里加上`eitri.config.set(\"window.tiling\",\"eitri\")`，再打开一个Eitri窗口。",
+    ),
     (
         "按键按默认设置来写，前缀是`Ctrl+b`。如果Eitri从你的tmux配置或init.lua里拿到了别的前缀，本教程写Ctrl+b的地方就\
          按你自己的。第7课讲它们从哪里来。如果你的tmux配置还改了前缀之后的键，`Ctrl+b?`会显示它们在这里做什么。",

@@ -47,6 +47,10 @@ Neovim 自己的按键在这里照常可用。用 `j`{normal} 往下翻这一页
 
 ** {prefix} % 在右边打开一个模块，{prefix} " 在下面打开。 **
 
+注意：在 Hyprland、sway 和 niri 上，Eitri 默认把平铺交给窗口管理器。
+      这种模式下，分割和放大的键只会显示提示。要启用它们，在 init.lua 里加上
+      `eitri.config.set("window.tiling", "eitri")`，再打开一个 Eitri 窗口。
+
 窗口由模块组成：这个编辑器、agent 面板和底部终端。分割键会再等一个键来指明
 是哪个模块：`e` 是编辑器，`a` 是 agent 面板，`t` 是终端。如果终端已经开着，
 分割键会把它移到那里。
@@ -177,6 +181,11 @@ agent 面板是你和 agent 对话的地方。在 BROWSE 里，它的按键是 v
 
 ** 浮动窗口在其他模块之上，便笺板把浮动窗口收起来，工作区以一个名字保存
    一整套排布。 **
+
+注意：在 Hyprland、sway 和 niri 上，Eitri 默认把平铺交给窗口管理器。
+      这种模式下，浮动窗口、便笺板和工作区的键只会显示提示。要启用它们，
+      在 init.lua 里加上
+      `eitri.config.set("window.tiling", "eitri")`，再打开一个 Eitri 窗口。
 
  1. 按 `{prefix} t` 显示终端并让它拿到按键。
 
