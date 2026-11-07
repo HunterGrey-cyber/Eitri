@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { editorRow } from "./editorRows";
+import { editorResult, editorRow } from "./editorRows";
 
 const done = (content: unknown) => ({ content, isError: false });
 
@@ -161,5 +161,130 @@ describe("nvim_exec summary", () => {
     expect(editorRow("apply_proposal", { id: "p-3" }, { content: "the stored copy of this proposal is gone", isError: true })).toBe(
       "could not apply `p-3`",
     );
+  });
+});
+
+
+describe("editorResult", () => {
+  const answer = (value: unknown) => done(JSON.stringify(value));
+  const place = { path: "a.py", line: 4, column: 2 };
+
+  it("reads the buffer answer's path, unsaved flag, lines and omission sentence", () => {
+    const value = { path: "/p/a.py", modified: true, first_line: 4, last_line: 5, text: "one\ntwo\n",
+      left_out: "lines 6 to 8 of 8 left out; read on with start_line 6" };
+    expect(editorResult("read_buffer", {}, answer(value))).toBe(
+      "/p/a.py:4-5 (unsaved)\none\ntwo\nlines 6 to 8 of 8 left out; read on with start_line 6",
+    );
+    expect(editorResult("read_buffer", {}, answer({ ...value, modified: false, left_out: undefined })))
+      .toBe("/p/a.py:4-5\none\ntwo\n");
+  });
+
+  it("uses the actual open line and reports where the file was shown", () => {
+    const value = { shown: true, where: "new_split", line: 3 };
+    expect(editorResult("open_file", { path: "a.py", line: 42 }, answer(value)))
+      .toBe("a.py:3\nshown in a new split in the editor");
+    expect(editorResult("open_file", { path: "a.py" }, answer({ ...value, on_screen: false, note: "editor hidden" })))
+      .toBe("a.py:3\nopened in a new split in the editor, which is not on screen\neditor hidden");
+    expect(editorResult("open_file", { path: "a.py" }, answer({ ...value, other_window: true, note: "may be covered" })))
+      .toBe("a.py:3\nopened in a new split in window 1's editor\nmay be covered");
+    expect(editorResult("open_file", { path: "a.py" }, answer({ ...value, where: "existing" })))
+      .toContain("an existing window");
+    expect(editorResult("open_file", { path: "a.py" }, answer({ ...value, where: "agent_window" })))
+      .toContain("the agent's window");
+  });
+
+  it("lists editor buffers and the current position without inventing windows", () => {
+    const value = { root: "/p", buffers: [
+      { path: "a.py", modified: true, lines: 8, filetype: "python", shown: true },
+      { path: "b.rs", modified: false, lines: 0, filetype: "", shown: false },
+    ], other_buffers: 2, current: { path: "a.py", line: 4 }, mode: "visual",
+      selection: { path: "a.py", start_line: 4, end_line: 5, text: "one\ntwo" }, buffers_left_out: 3 };
+    expect(editorResult("editor_state", {}, answer(value))).toBe(
+      "/p\na.py (unsaved) · 8 lines · python · shown\nb.rs · 0 lines · not shown\nand 3 more buffers\n2 other buffers\ncurrent: a.py:4 · visual\nselection: a.py:4-5\none\ntwo",
+    );
+    expect(editorResult("editor_state", {}, answer({ ...value, buffers: [], current: "a buffer with no file", selection: null })))
+      .toContain("current: a buffer with no file · visual");
+    expect(editorResult("editor_state", {}, answer({ ...value, selection: "a selection in a file outside the project" })))
+      .toContain("selection: a selection in a file outside the project");
+  });
+
+  it("lists diagnostics, omitted entries and unsaved files", () => {
+    const value = { entries: [{ ...place, end_line: 4, end_column: 3, severity: "warning", message: "bad name" }],
+      modified_files: ["a.py"], left_out: 7, baseline_cut: true };
+    expect(editorResult("diagnostics", {}, answer(value))).toBe(
+      "a.py:4:2 warning bad name\nand 7 more\nunsaved: a.py\nthe turn's diagnostic comparison is incomplete",
+    );
+    expect(editorResult("diagnostics", {}, answer({ entries: [], modified_files: [], left_out: 0 }))).toBe("0 diagnostics");
+  });
+
+  it("lists each usage part and keeps missing and unsupported answers visible", () => {
+    const value = { symbol: "foo", definitions: [{ ...place, text: "def foo():" }], implementations: [],
+      references: [{ path: "/outside.py", line: 1, column: 1 }], left_out: 2, missing: ["references"], unsupported: ["implementations"] };
+    expect(editorResult("usages", {}, answer(value))).toBe(
+      "definition: a.py:4:2 def foo():\nreference: /outside.py:1:1\nand 2 more\nmissing: references\nunsupported: implementations",
+    );
+    expect(editorResult("usages", {}, answer({ ...value, definitions: [], references: [], left_out: 0 })))
+      .toContain("0 usages");
+  });
+
+  it("shows hover source as literal text and says when it was cut", () => {
+    expect(editorResult("hover", {}, answer({ symbol: "foo", text: "**foo** <img src=x>\ncode", cut: false })))
+      .toBe("**foo** <img src=x>\ncode");
+    expect(editorResult("hover", {}, answer({ symbol: "foo", text: "words", cut: true })))
+      .toBe("words\nhover text was cut");
+  });
+
+  it("lists symbols with optional identity and outside positions only", () => {
+    const value = { symbols: [{ ...place, name: "foo", kind: "Function", container: "Thing" },
+      { path: "/outside.py", line: 1, column: 1 }], left_out: 9 };
+    expect(editorResult("symbols", {}, answer(value)))
+      .toBe("a.py:4:2 Function foo (Thing)\n/outside.py:1:1\nand 9 more");
+    expect(editorResult("symbols", {}, answer({ symbols: [], left_out: 0 }))).toBe("0 symbols");
+  });
+
+  it.each(["lsp_rename", "format", "apply_code_action"])("shows %s proposal paths and plain hunks", (tool) => {
+    const value = { proposal: "p-1", files: [{ path: "a.py", hunks: "@@ -1 +1 @@\n-old\n+new" }], left_out_lines: 2,
+      ...(tool === "apply_code_action" ? { title: "Add import" } : {}) };
+    expect(editorResult(tool, {}, answer(value))).toBe(
+      `${tool === "apply_code_action" ? "Add import\n" : ""}proposal p-1\na.py\n@@ -1 +1 @@\n-old\n+new\nand 2 more hunk lines`,
+    );
+  });
+
+  it("lists code actions and successful application paths", () => {
+    expect(editorResult("lsp_code_actions", {}, answer({ actions: [
+      { id: "a-1", title: "Add import", kind: "quickfix", disabled: null, applies: true },
+      { id: "a-2", title: "Other", kind: null, disabled: "unavailable", applies: false },
+    ], missing: ["code_actions"] }))).toBe(
+      "a-1: Add import (quickfix)\na-2: Other · unavailable · cannot apply\nmissing: code_actions",
+    );
+    expect(editorResult("apply_proposal", {}, answer({ applied: ["a.py", "b.py"], not_tried: [] })))
+      .toBe("applied a.py\napplied b.py");
+  });
+
+  it("returns no replacement for bad JSON, wrong shapes, errors, pending, exec or foreign tools", () => {
+    for (const tool of ["open_file", "read_buffer", "editor_state", "diagnostics", "usages", "hover", "symbols",
+      "lsp_rename", "format", "lsp_code_actions", "apply_code_action", "apply_proposal"]) {
+      for (const content of ["not json {", "null", "[]", "{}", '{"text":3}', '[{"type":"image"}]', null, undefined]) {
+        expect(editorResult(tool, { path: "a.py" }, done(content))).toBeNull();
+      }
+      expect(editorResult(tool, {}, null)).toBeNull();
+      expect(editorResult(tool, {}, { content: "failed", isError: true })).toBeNull();
+    }
+    const valid = answer({ symbol: "foo", text: "hover", cut: false });
+    expect(editorResult("hover", {}, { ...valid, isError: true })).toBeNull();
+    for (const tool of ["nvim_exec", "mcp__other__hover", "future_tool"]) expect(editorResult(tool, {}, valid)).toBeNull();
+    expect(editorResult("diagnostics", {}, answer({ entries: [null], modified_files: [], left_out: 0 }))).toBeNull();
+    expect(editorResult("symbols", {}, answer({ symbols: [{ ...place, name: 3 }], left_out: 0 }))).toBeNull();
+  });
+
+  it("reads MCP text envelopes and leaves the original tool result untouched", () => {
+    const text = JSON.stringify({ path: "a.py", modified: false, first_line: 1, last_line: 1, text: "one" });
+    const content = Object.freeze([Object.freeze({ type: "text", text })]);
+    for (const wrapped of [text, content, Object.freeze({ content })]) {
+      const result = Object.freeze(done(wrapped));
+      const before = JSON.stringify(result);
+      expect(editorResult("read_buffer", {}, result)).toBe("a.py:1-1\none");
+      expect(JSON.stringify(result)).toBe(before);
+    }
   });
 });

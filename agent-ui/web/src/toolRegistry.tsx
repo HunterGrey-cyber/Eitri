@@ -4,7 +4,7 @@ import type { InputChange, ToolCallDenial, ToolCallRecord } from "./types";
 import { codexChangePreview, editPreview, lineDiff, splitLines } from "./diff";
 import { EditDiff } from "./components/EditDiff";
 import { HiddenWarning, Revealed } from "./components/Revealed";
-import { editorRow } from "./editorRows";
+import { editorResult, editorRow } from "./editorRows";
 import { subagentOf } from "./externalTools";
 import { countEscapes, revealHidden } from "./revealHidden";
 import { toolCardLine } from "./display";
@@ -34,6 +34,9 @@ export type ToolRenderConfig = {
   /** Whether the call's answer is text another party wrote and is drawn through `revealHidden`, in the
    *  folded preview and expanded alike. Rows of the editor's own tools say yes; the others draw as before. */
   revealResult?: (input: unknown) => boolean;
+  /** A plain-text body for an ordinary expanded row; null keeps the original answer.
+   *  Detailed view always uses the original result, which is never rewritten. */
+  resultText?: (input: unknown, result: ToolCallRecord["result"]) => string | null;
 };
 
 /** How much of a tool result is rendered inline, head and tail respectively.
@@ -334,6 +337,7 @@ function editorToolRow(tool: string, input: unknown, result: ToolCallRecord["res
 function editorConfig(tool: string): ToolRenderConfig {
   return {
     label: tool,
+    resultText: (input, result) => editorResult(tool, input, result),
     revealResult: () => true,
     renderInvocation: (input, { result }) => editorToolRow(tool, input, result),
   };
@@ -366,6 +370,8 @@ const execConfig: ToolRenderConfig = {
 
 const codexMcp: ToolRenderConfig = {
   label: "Tool call",
+  resultText: (input, result) => textField(input, "server") === EDITOR_SERVER
+    ? editorResult(textField(input, "tool"), (input as { arguments?: unknown }).arguments, result) : null,
   revealResult: (input) => textField(input, "server") === EDITOR_SERVER,
   renderInvocation: (input, { expanded, result }) => {
     if (saysNothing(input)) return <div className="tool-card">tool call</div>;
@@ -556,11 +562,13 @@ const ToolResult = memo(function ToolResult({
   detailed = false,
   abandoned = false,
   reveal = false,
+  text = null,
 }: {
   result: ToolCallRecord["result"];
   detailed?: boolean;
   abandoned?: boolean;
   reveal?: boolean;
+  text?: string | null;
 }) {
   if (result === null) {
     // A `null` result the panel knows can never arrive -- the call predates the
@@ -582,7 +590,7 @@ const ToolResult = memo(function ToolResult({
 
   const { shown, hiddenChars } = detailed
     ? truncateResult(formatResultContent(result.content), DETAILED_HEAD_CHARS, DETAILED_TAIL_CHARS)
-    : truncateResult(formatResultContent(result.content));
+    : truncateResult(text ?? formatResultContent(result.content));
   const draw = (part: string): ReactNode => (reveal ? <Shown text={part} /> : part);
   return (
     <div className="tool-result" data-state={result.isError ? "error" : "done"}>
@@ -857,7 +865,7 @@ export function renderToolCall(
       {deniedNote}
       {changedNote}
       {!opts.gated && cardLine !== null && !specialInvocation && <div className="tool-rule-note">{withFailureWords(cardLine, (part) => <Shown text={part} />)}</div>}
-      {showOrdinaryResult && shown && <ToolResult result={call.result} detailed={opts.detailed === true} abandoned={opts.abandoned === true} reveal={reveal} />}
+      {showOrdinaryResult && shown && <ToolResult result={call.result} text={opts.detailed ? null : config?.resultText?.(call.input, call.result)} detailed={opts.detailed === true} abandoned={opts.abandoned === true} reveal={reveal} />}
       {showOrdinaryResult && !shown && call.result !== null && (config?.previewSuccess !== false || call.result.isError) && (
         <ToolResultPreview result={call.result} wrapped={call.denied !== undefined && call.result.isError} reveal={reveal} />
       )}

@@ -2364,6 +2364,9 @@ export default function App() {
       const questionReturn = payload.kind === "focus_permission" && payload.tab === edit?.tab && edit?.question !== undefined &&
         pageRef.current.state.pendingPermissions.length === 0 && pageRef.current.state.editorCards.length === 0;
       if (((payload.kind === "arrive" && payload.intent !== "stop") || questionReturn) && edit?.finished && edit.tab === activeTabRef.current) {
+        // The landing is the edit's own and is not drawn, but it is still an arrival: a key the person was still
+        // pressing as the keys came back answers nothing (INPUT's `Ctrl+y`, the question dock), as after any other.
+        noteArrival();
         edit.landingHandled = true;
         if (edit.resumed) editReturnRef.current = null;
         return;

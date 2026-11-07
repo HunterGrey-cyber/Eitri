@@ -1,5 +1,5 @@
 [English](keys.md) | 简体中文
-<!-- translated-from: keys.md sha256=44478e15fec8419ffc808e30451cec551a1790e78a2acbc478fca63689bea7fc -->
+<!-- translated-from: keys.md sha256=2cad7d058c2a8e4794b41fa221bd84a1cfbbaeb0f7cbb255043bd1f059ed88cd -->
 
 # 按键
 
@@ -468,7 +468,7 @@ end
 | `Ctrl+a` / `Ctrl+e` | 把光标移到当前行的行首 / 行尾 |
 | `Ctrl+c` | 中断正在运行的回合；空闲时，把输入框清空并存入历史 |
 | `Ctrl+y` | 批准这个标签页里等得最久的卡片，agent 的[编辑器工具](editor-tools.zh-CN.md#cards)的卡片除外（见[回答一张卡片](#answering-a-card)） |
-| `Ctrl+g` | 在 Neovim 里编辑草稿；`:wq` 把它带回输入框，回到 INSERT，光标在末尾，可以直接发送（`Enter` 发送）；`:q!` 也会这样返回，草稿不变，除非你已经用 `:w` 保存过，这时保存的文字会回来 |
+| `Ctrl+g` | 在 Neovim 里编辑草稿；`:wq` 把它带回输入框，回到 INSERT，光标在末尾，可以直接发送（`Enter` 发送），除非有卡片在等待，这时按键照常落在卡片上；`:q!` 也会这样返回，草稿不变，除非你已经用 `:w` 保存过，这时保存的文字会回来 |
 | `Ctrl+o` | 详细视图（BROWSE 里也有） |
 | `Shift+Tab` | 轮换标签页的模式：Manual、Auto、Bypass，然后再回到 Manual（没有 Manual 模式的 agent：在 Auto 和 Bypass 之间）；进入 Bypass 会先问，并且只能从 Auto 进入，回答 `y` 还会批准这个标签页里已经在等的 Claude Code 提问（你的 ask 规则引起的也算），并替你回答之后的提问，见[Claude Code 自己提问时](permissions.zh-CN.md#when-claude-code-itself-asks)；Claude 问你的选择题它永远不会回答（[Claude 的提问](#claudes-questions)） |
 | `Esc` | 停止输入，回到 BROWSE；命令菜单打开时，先关闭菜单并保留文字 |

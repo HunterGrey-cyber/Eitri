@@ -731,7 +731,7 @@ a message, and the band says when your choice takes effect. A Codex tab shows wh
 | `Ctrl+a` / `Ctrl+e` | move the caret to the start / end of the line it is on |
 | `Ctrl+c` | interrupt a running turn; when idle, clear the box into the history |
 | `Ctrl+y` | approve the oldest card waiting in this tab, leaving out a card from an agent's [editor tools](editor-tools.md#cards) (see [Answering a card](#answering-a-card)) |
-| `Ctrl+g` | edit the draft in Neovim; `:wq` brings it back into the box in INSERT, caret at the end, ready to send (`Enter` sends); `:q!` returns the same way with the draft unchanged unless you already saved it with `:w`, in which case the saved text comes back |
+| `Ctrl+g` | edit the draft in Neovim; `:wq` brings it back into the box in INSERT, caret at the end, ready to send (`Enter` sends), unless a card is waiting, which the keys land on as usual; `:q!` returns the same way with the draft unchanged unless you already saved it with `:w`, in which case the saved text comes back |
 | `Ctrl+o` | the detailed view (also in BROWSE) |
 | `Shift+Tab` | cycle the tab's mode: Manual, Auto, Bypass, then Manual again (an agent with no Manual mode: Auto and Bypass); entering Bypass asks first, only from Auto, and a `y` also approves the Claude Code questions already waiting in the tab (ones your ask rules caused too) and answers the later ones for you, see [When Claude Code itself asks](permissions.md#when-claude-code-itself-asks); it never answers a question Claude asks you ([Claude's questions](#claudes-questions)) |
 | `Esc` | stop typing and go back to BROWSE; with the command menu open, it closes the menu first and keeps the text |

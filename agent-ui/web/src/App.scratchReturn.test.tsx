@@ -110,6 +110,22 @@ describe("composer scratch return", () => {
     expect(sends()).toHaveLength(0);
   });
 
+  it("the return is an arrival: a Ctrl+y right as the keys come back approves nothing", () => {
+    const container = setup();
+    leaveForEdit(composer(container)!);
+    finishEdit("edited draft");
+    expect(mode(container)).toBe("input");
+    // A card that came while nvim had the draft, with no landing of its own.
+    dispatch({ kind: "events", tab: 1, fromRevision: 3, throughRevision: 4, events: [{
+      type: "permission_requested", permission_id: "p1", tool_use_id: null, tool_name: "Bash", input: { command: "rm file" },
+    }] });
+    const field = composer(container)!;
+    fireEvent.keyDown(field, { key: "y", code: "KeyY", ctrlKey: true });
+    fireEvent.keyUp(field, { key: "y", code: "KeyY", ctrlKey: true });
+    act(() => vi.advanceTimersByTime(1000));
+    expect(posted.filter((m) => m.type === "permission_response")).toHaveLength(0);
+  });
+
   it("pane focus alone resumes INPUT and a later ordinary arrival still lands BROWSE", () => {
     const container = setup();
     leaveForEdit(composer(container)!);
@@ -186,6 +202,10 @@ describe("question answer scratch return", () => {
     expect(document.activeElement).toBe(returned);
     expect([returned.selectionStart, returned.selectionEnd]).toEqual([returned.value.length, returned.value.length]);
     expect(posted.filter((m) => m.type === "question_answer")).toHaveLength(0);
+    // The return is an arrival: an Enter still being pressed as the keys came back answers nothing.
+    press(returned, "Enter");
+    expect(posted.filter((m) => m.type === "question_answer")).toHaveLength(0);
+    pause();
     press(returned, "Enter");
     expect(posted.filter((m) => m.type === "question_answer")).toEqual([
       expect.objectContaining({ tab: 1, answers: [{ question_index: 0, option_indexes: [], other_text: text ?? "original answer", notes: null }] }),

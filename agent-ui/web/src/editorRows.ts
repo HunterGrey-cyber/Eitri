@@ -192,3 +192,188 @@ export function editorRow(tool: string, input: unknown, result: Answer | null): 
       return null;
   }
 }
+
+function objectOf(value: unknown): Record<string, unknown> | null {
+  return value !== null && typeof value === "object" && !Array.isArray(value) ? value as Record<string, unknown> : null;
+}
+
+function natural(value: unknown): value is number {
+  return typeof value === "number" && Number.isSafeInteger(value) && value >= 0;
+}
+
+function positive(value: unknown): value is number {
+  return natural(value) && value > 0;
+}
+
+function optionalString(value: unknown): boolean {
+  return value === undefined || typeof value === "string";
+}
+
+function items(value: unknown, render: (item: Record<string, unknown>) => string | null): string[] | null {
+  if (!Array.isArray(value)) return null;
+  const lines: string[] = [];
+  for (const entry of value) {
+    const item = objectOf(entry);
+    const line = item === null ? null : render(item);
+    if (line === null) return null;
+    lines.push(line);
+  }
+  return lines;
+}
+
+function position(item: Record<string, unknown>): string | null {
+  return typeof item.path === "string" && positive(item.line) && positive(item.column)
+    ? `${item.path}:${item.line}:${item.column}` : null;
+}
+
+function withMore(lines: string[], leftOut: number, empty: string, noun = ""): string[] {
+  return [...(lines.length === 0 && leftOut === 0 ? [empty] : lines), ...(leftOut > 0 ? [`and ${leftOut} more${noun}`] : [])];
+}
+
+function partNotes(answer: Record<string, unknown>, lines: string[]): boolean {
+  for (const field of ["missing", "unsupported"]) {
+    if (answer[field] === undefined) continue;
+    const parts = stringList(answer[field]);
+    if (parts === null) return false;
+    if (parts.length > 0) lines.push(`${field}: ${parts.join(", ")}`);
+  }
+  return true;
+}
+
+function stateBody(answer: Record<string, unknown>): string | null {
+  if (typeof answer.root !== "string" || typeof answer.mode !== "string" || !natural(answer.other_buffers) ||
+    (answer.buffers_left_out !== undefined && !natural(answer.buffers_left_out))) return null;
+  const buffers = items(answer.buffers, (buffer) => {
+    if (typeof buffer.path !== "string" || typeof buffer.modified !== "boolean" || !natural(buffer.lines) ||
+      typeof buffer.filetype !== "string" || typeof buffer.shown !== "boolean") return null;
+    return `${buffer.path}${buffer.modified ? " (unsaved)" : ""} · ${count(buffer.lines, "line")}` +
+      `${buffer.filetype === "" ? "" : ` · ${buffer.filetype}`} · ${buffer.shown ? "shown" : "not shown"}`;
+  });
+  if (buffers === null) return null;
+  const current = objectOf(answer.current);
+  const currentText = typeof answer.current === "string" ? answer.current
+    : current !== null && typeof current.path === "string" && positive(current.line) ? `${current.path}:${current.line}` : null;
+  if (currentText === null) return null;
+  const lines = [answer.root, ...withMore(buffers, (answer.buffers_left_out as number | undefined) ?? 0, "0 buffers", " buffers")];
+  if (answer.other_buffers > 0) lines.push(`${answer.other_buffers} other buffers`);
+  lines.push(`current: ${currentText} · ${answer.mode}`);
+  if (typeof answer.selection === "string") lines.push(`selection: ${answer.selection}`);
+  else if (answer.selection !== null) {
+    const selection = objectOf(answer.selection);
+    if (selection === null || typeof selection.path !== "string" || !positive(selection.start_line) ||
+      !positive(selection.end_line) || typeof selection.text !== "string") return null;
+    lines.push(`selection: ${selection.path}:${selection.start_line}-${selection.end_line}`, selection.text);
+  }
+  return lines.join("\n");
+}
+
+/** A readable expanded answer, or no replacement when it is not a known successful answer.
+ *  This is display text only: the result stays intact for detailed view and the host owns delivery to the model.
+ *  Every returned character remains untrusted and must be drawn through `Shown`, never Markdown. */
+export function editorResult(tool: string, input: unknown, result: Answer | null): string | null {
+  if (result === null || result.isError) return null;
+  const answer = answerObject(result.content);
+  if (answer === null) return null;
+  switch (tool) {
+    case "open_file": {
+      const path = pathOf(input);
+      const places: Record<string, string> = {
+        existing: "an existing window", agent_window: "the agent's window", new_split: "a new split",
+      };
+      if (path === "" || answer.shown !== true || !positive(answer.line) || typeof answer.where !== "string" ||
+        !Object.prototype.hasOwnProperty.call(places, answer.where) || !optionalString(answer.note) ||
+        (answer.on_screen !== undefined && typeof answer.on_screen !== "boolean") ||
+        (answer.other_window !== undefined && typeof answer.other_window !== "boolean")) return null;
+      const away = answer.on_screen === false || answer.other_window === true;
+      const editor = answer.other_window === true ? "window 1's editor" : "the editor";
+      return `${path}:${answer.line}\n${away ? "opened" : "shown"} in ${places[answer.where]} in ${editor}` +
+        `${answer.on_screen === false ? ", which is not on screen" : ""}${answer.note ? `\n${answer.note}` : ""}`;
+    }
+    case "read_buffer": {
+      if (typeof answer.path !== "string" || typeof answer.modified !== "boolean" || typeof answer.text !== "string" ||
+        !positive(answer.first_line) || !natural(answer.last_line) || !optionalString(answer.left_out)) return null;
+      const header = `${answer.path}:${answer.first_line}-${answer.last_line}${answer.modified ? " (unsaved)" : ""}`;
+      return `${header}\n${answer.text}${answer.left_out ? `${answer.text.endsWith("\n") ? "" : "\n"}${answer.left_out}` : ""}`;
+    }
+    case "editor_state":
+      return stateBody(answer);
+    case "diagnostics": {
+      const modified = stringList(answer.modified_files);
+      if (modified === null || !natural(answer.left_out) ||
+        (answer.baseline_cut !== undefined && typeof answer.baseline_cut !== "boolean")) return null;
+      const entries = items(answer.entries, (entry) => {
+        const place = position(entry);
+        return place !== null && typeof entry.severity === "string" && typeof entry.message === "string"
+          ? `${place} ${entry.severity} ${entry.message}` : null;
+      });
+      if (entries === null) return null;
+      const lines = withMore(entries, answer.left_out, "0 diagnostics");
+      if (modified.length > 0) lines.push(`unsaved: ${modified.join(", ")}`);
+      if (answer.baseline_cut === true) lines.push("the turn's diagnostic comparison is incomplete");
+      return lines.join("\n");
+    }
+    case "usages": {
+      if (typeof answer.symbol !== "string" || !natural(answer.left_out) ||
+        stringList(answer.missing) === null || stringList(answer.unsupported) === null) return null;
+      const lines: string[] = [];
+      for (const [part, label] of [["definitions", "definition"], ["implementations", "implementation"], ["references", "reference"]]) {
+        if (answer[part] === undefined) continue;
+        const entries = items(answer[part], (entry) => {
+          const place = position(entry);
+          return place !== null && optionalString(entry.text) ? `${label}: ${place}${entry.text ? ` ${entry.text}` : ""}` : null;
+        });
+        if (entries === null) return null;
+        lines.push(...entries);
+      }
+      const body = withMore(lines, answer.left_out, "0 usages");
+      return partNotes(answer, body) ? body.join("\n") : null;
+    }
+    case "hover":
+      return typeof answer.symbol === "string" && typeof answer.text === "string" && typeof answer.cut === "boolean"
+        ? `${answer.text}${answer.cut ? "\nhover text was cut" : ""}` : null;
+    case "symbols": {
+      if (!natural(answer.left_out)) return null;
+      const symbols = items(answer.symbols, (symbol) => {
+        const place = position(symbol);
+        if (place === null || ![symbol.name, symbol.kind, symbol.container].every(optionalString)) return null;
+        return `${place}${symbol.kind ? ` ${symbol.kind}` : ""}${symbol.name ? ` ${symbol.name}` : ""}` +
+          `${symbol.container ? ` (${symbol.container})` : ""}`;
+      });
+      return symbols === null ? null : withMore(symbols, answer.left_out, "0 symbols").join("\n");
+    }
+    case "lsp_rename":
+    case "format":
+    case "apply_code_action": {
+      if (typeof answer.proposal !== "string" || !natural(answer.left_out_lines) || !optionalString(answer.title) ||
+        (answer.command_not_run !== undefined && typeof answer.command_not_run !== "boolean")) return null;
+      const files = items(answer.files, (file) => typeof file.path === "string" && typeof file.hunks === "string"
+        ? `${file.path}\n${file.hunks}` : null);
+      if (files === null) return null;
+      const lines = [...(answer.title ? [answer.title] : []), `proposal ${answer.proposal}`,
+        ...withMore(files, answer.left_out_lines, "0 files", " hunk lines")];
+      if (answer.command_not_run === true) lines.push("the code action's command was not run");
+      return lines.join("\n");
+    }
+    case "lsp_code_actions": {
+      const actions = items(answer.actions, (action) => {
+        if (typeof action.id !== "string" || typeof action.title !== "string" || typeof action.applies !== "boolean" ||
+          (action.kind !== null && typeof action.kind !== "string") ||
+          (action.disabled !== null && typeof action.disabled !== "string")) return null;
+        return `${action.id}: ${action.title}${action.kind ? ` (${action.kind})` : ""}` +
+          `${action.disabled ? ` · ${action.disabled}` : ""}${action.applies ? "" : " · cannot apply"}`;
+      });
+      if (actions === null) return null;
+      const lines = actions.length === 0 ? ["0 code actions"] : actions;
+      return partNotes(answer, lines) ? lines.join("\n") : null;
+    }
+    case "apply_proposal": {
+      const applied = stringList(answer.applied);
+      const notTried = stringList(answer.not_tried);
+      if (applied === null || notTried === null || answer.failed !== undefined) return null;
+      return [...(applied.length === 0 ? ["applied nothing"] : applied.map((path) => `applied ${path}`)),
+        ...notTried.map((path) => `not tried: ${path}`)].join("\n");
+    }
+    default:
+      return null;
+  }
+}
