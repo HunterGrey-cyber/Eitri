@@ -237,8 +237,17 @@ mod tests {
         let titles: Vec<&str> = groups.iter().map(|g| g.title).collect();
         assert_eq!(
             titles,
-            ["Tabs", "Modules", "Layout", "Workspaces", "Agents", "Projects", "Other"],
-            "no default binding is a Windows one, and an empty group is left out"
+            [
+                "Tabs",
+                "Modules",
+                "Layout",
+                "Workspaces",
+                "Windows",
+                "Agents",
+                "Projects",
+                "Other"
+            ],
+            "window.new gives the Windows group a default binding"
         );
         for binding in keymap.bindings() {
             let group = GROUPS[group_of(family(&binding.action))].0;

@@ -33,7 +33,6 @@ k.set("prefix", "C-M-Space", "float.toggle")                   -- Shift dropped:
 k.del("prefix", "M--")                                         -- $mod+minus: show the scratchpad
 k.set("prefix", "C-M--", "scratchpad.show")
 k.del("prefix", "M-_")                                         -- $mod+Shift+minus: move to the scratchpad
-k.set("prefix", "_", "scratchpad.move")                        -- Shift+minus is `_`; free in stock tmux and in the stock table
 for dir, key in pairs({ left = "Left", down = "Down", up = "Up", right = "Right" }) do
   k.del("prefix", "M-" .. key)                                 -- $mod+<arrow>: focus
   k.set("prefix", "C-M-" .. key, "resize." .. dir, { cells = 5, repeatable = true })

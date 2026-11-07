@@ -468,6 +468,27 @@ mod tests {
     }
 
     #[test]
+    fn use_i3_alt_keeps_the_default_scratchpad_key_without_an_override() {
+        let map = Keymap::apply_user(&run(r#"eitri.keymap.use("i3-alt")"#), &[]).unwrap();
+        let key = |text: &str| KeySpec::parse(text).unwrap();
+        assert!(map.lookup(&key("M-_")).is_none());
+        let binding = map.lookup(&key("_")).unwrap();
+        assert_eq!(binding.action, Action::ScratchpadMove);
+        assert!(!binding.repeatable);
+        assert_eq!(binding.source, crate::keymap::Source::Default);
+        assert!(map.user_overrides().is_empty(), "{:?}", map.user_overrides());
+    }
+
+    #[test]
+    fn a_user_can_take_w_and_gets_the_default_override_notice() {
+        let map = Keymap::apply_user(&run(r#"local k = eitri.keymap; k.set("prefix", "W", "zoom")"#), &[]).unwrap();
+        let binding = map.lookup(&KeySpec::parse("W").unwrap()).unwrap();
+        assert_eq!(binding.action, Action::Zoom);
+        assert_eq!(binding.source, crate::keymap::Source::User);
+        assert_eq!(map.user_overrides(), ["prefix W (was window.new)"]);
+    }
+
+    #[test]
     fn use_records_the_bundles_ops_in_place() {
         let ops = run(r#"
             eitri.keymap.use("i3-alt")
@@ -551,12 +572,16 @@ mod tests {
             .map(|(k, _, _)| key(k))
             .collect();
 
-        // Every grabbed row is gone from its Alt chord, and its action (with its repeat) is bound elsewhere.
+        // Every grabbed row is gone; the scratchpad keeps its plain default and the others move to new chords.
         for old in &grabbed {
             let was = stock
                 .lookup(old)
                 .unwrap_or_else(|| panic!("{old:?} is not a stock row"));
             assert!(map.lookup(old).is_none(), "{old:?} is still bound");
+            if *old == key("M-_") {
+                assert_eq!(map.lookup(&key("_")), stock.lookup(&key("_")));
+                continue;
+            }
             let moved_to: Vec<&KeySpec> = map
                 .bindings()
                 .iter()
@@ -573,7 +598,11 @@ mod tests {
             .map(|b| &b.key)
             .filter(|k| stock.lookup(k).is_none())
             .collect();
-        assert_eq!(added.len(), grabbed.len(), "{added:?}");
+        assert_eq!(
+            added.len(),
+            grabbed.len() - 1,
+            "the scratchpad keeps its default: {added:?}"
+        );
         for new in &added {
             assert!(!grabbed.contains(new), "{new:?} is a chord the config grabs");
             assert!(!tmux.contains(new), "{new:?} is bound in stock tmux's prefix table");

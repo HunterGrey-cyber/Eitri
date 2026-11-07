@@ -410,6 +410,33 @@ mod tests {
     }
 
     #[test]
+    fn plain_float_scratchpad_and_window_keys_are_refused_naming_the_action() {
+        let map = Keymap::defaults();
+        for (key, action) in [
+            ("F", "float.toggle"),
+            ("S", "scratchpad.show"),
+            ("W", "window.new"),
+            ("_", "scratchpad.move"),
+        ] {
+            let error = build_one(key, &map).unwrap_err();
+            assert_eq!(
+                error,
+                KeyError::Bound {
+                    panel: "notes".into(),
+                    key: key.chars().next().unwrap(),
+                    prefix: map.prefix().human(),
+                    action: action.into(),
+                    source: Source::Default,
+                }
+            );
+            assert!(error.to_string().contains(action), "{error}");
+            let (keys, errors) = ModuleKeys::build_settled(&[lua("notes", Some(key))], &map);
+            assert!(keys.module(key.chars().next().unwrap()).is_none());
+            assert_eq!(errors, [error]);
+        }
+    }
+
+    #[test]
     fn the_built_ins_answer_to_e_a_and_t() {
         let keys = ModuleKeys::built_in();
         assert_eq!(keys.module('e'), Some(&ModuleId::editor()));

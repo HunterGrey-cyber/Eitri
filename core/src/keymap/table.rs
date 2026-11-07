@@ -320,6 +320,10 @@ fn default_bindings() -> Vec<Binding> {
     bind("M-S-Space", Action::FloatToggle, false);
     bind("M--", Action::ScratchpadShow { module: None }, false);
     bind("M-_", Action::ScratchpadMove, false);
+    bind("F", Action::FloatToggle, false);
+    bind("S", Action::ScratchpadShow { module: None }, false);
+    bind("_", Action::ScratchpadMove, false);
+    bind("W", Action::WindowNew, false);
     bind(
         "%",
         Action::Split {
@@ -1233,6 +1237,10 @@ mod tests {
         ("M-S-Space", "float.toggle", false),
         ("M--", "scratchpad.show", false),
         ("M-_", "scratchpad.move", false),
+        ("F", "float.toggle", false),
+        ("S", "scratchpad.show", false),
+        ("_", "scratchpad.move", false),
+        ("W", "window.new", false),
         ("%", "split.right", false),
         ("\"", "split.below", false),
         ("z", "zoom", false),
@@ -1401,10 +1409,10 @@ mod tests {
     }
 
     #[test]
-    fn the_window_verbs_have_no_default_key() {
+    fn only_window_new_has_a_default_among_the_two_window_verbs() {
         let map = Keymap::defaults();
+        assert_eq!(map.keys_for(&Action::WindowNew), [k("W")]);
         for action in [
-            Action::WindowNew,
             Action::WindowOther,
             Action::WindowSetup,
             Action::MoveToWindow {
@@ -1428,6 +1436,25 @@ mod tests {
         assert_eq!(bound("M-S-Space"), Some((Action::FloatToggle, false)));
         assert_eq!(bound("M--"), Some((Action::ScratchpadShow { module: None }, false)));
         assert_eq!(bound("M-_"), Some((Action::ScratchpadMove, false)));
+        assert_eq!(bound("F"), Some((Action::FloatToggle, false)));
+        assert_eq!(bound("S"), Some((Action::ScratchpadShow { module: None }, false)));
+        assert_eq!(bound("_"), Some((Action::ScratchpadMove, false)));
+        assert_eq!(bound("W"), Some((Action::WindowNew, false)));
+        for key in ["F", "S", "_", "W"] {
+            let action = &map.lookup(&k(key)).unwrap().action;
+            assert_eq!(
+                super::super::companion::classify(action),
+                super::super::companion::CompanionVerb::Refuse
+            );
+            assert_eq!(
+                super::super::compositor::classify_window1(action),
+                super::super::compositor::HubVerb::Off
+            );
+            assert_eq!(
+                super::super::compositor::classify_module(action),
+                super::super::compositor::ModuleVerb::Off
+            );
+        }
         assert_eq!(bound("("), Some((Action::WorkspaceStep { forward: false }, false)));
         assert_eq!(bound(")"), Some((Action::WorkspaceStep { forward: true }, false)));
         assert_eq!(bound("L"), Some((Action::WorkspaceLast, false)));
@@ -1494,7 +1521,9 @@ mod tests {
         // `H J K` are vim's `<C-w>H/J/K`; the Alt chords are i3's `$mod` chords after the prefix.
         // The float and scratchpad chords are i3's `$mod+Shift+space`, `$mod+minus` and
         // `$mod+Shift+minus` after the prefix.
-        const EITRI_ONLY: [&str; 30] = [
+        // F and S are float and scratchpad mnemonics after the prefix; _ copies i3's Shift+minus without Alt.
+        // W opens or raises the second Window.
+        const EITRI_ONLY: [&str; 34] = [
             "O",
             "C-l",
             "C-h",
@@ -1523,6 +1552,10 @@ mod tests {
             "M-S-Space",
             "M--",
             "M-_",
+            "F",
+            "S",
+            "_",
+            "W",
             "u",
             "B",
         ];
@@ -1746,7 +1779,10 @@ mod tests {
 
     #[test]
     fn help_groups_adjacent_rows_with_the_same_meaning_under_the_prefix() {
-        let rows = Keymap::defaults().help(&ModuleKeys::built_in());
+        let map = Keymap::defaults();
+        let keys = ModuleKeys::built_in();
+        let rows = map.help(&keys);
+        let groups = map.panel_groups(&keys, &|id| id.to_string(), |_| true);
         let find = |keys: &str| {
             rows.iter()
                 .find(|r| r.keys == keys)
@@ -1760,6 +1796,24 @@ mod tests {
             "Select that session tab"
         );
         assert!(find("Ctrl+b %").what.contains("(e / a / t)"));
+        for (key, action) in [
+            ("F", Action::FloatToggle),
+            ("S", Action::ScratchpadShow { module: None }),
+            ("_", Action::ScratchpadMove),
+            ("W", Action::WindowNew),
+        ] {
+            assert_eq!(
+                find(&format!("Ctrl+b {key}")).what,
+                action.describe("Ctrl+b", "e / a / t")
+            );
+            assert!(
+                groups
+                    .iter()
+                    .flat_map(|group| &group.rows)
+                    .any(|row| row.keys == key && row.label == action.short_label()),
+                "{key}: {groups:?}"
+            );
+        }
         assert_eq!(
             find("Ctrl+b Ctrl+b").what,
             "Send Ctrl+b itself to the pane with the keys"

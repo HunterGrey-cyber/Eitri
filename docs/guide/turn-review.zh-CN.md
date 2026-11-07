@@ -1,5 +1,5 @@
 [English](turn-review.md) | 简体中文
-<!-- translated-from: turn-review.md sha256=7279f4e7344cc9d80b4a08c12199cfd831a15b7b42f07e3108c05a5d6524fa73 -->
+<!-- translated-from: turn-review.md sha256=b6e10a9d24fc7ae1c5e375eaf67ba4ca001bc25b826ea82a823b89e0a112fae3 -->
 
 # 审阅一个回合
 
@@ -13,7 +13,7 @@ agent 在你的项目上工作之后，回合审阅回答一个问题：在那�
 
 ## 它显示什么
 
-在有会话的标签页里，于浏览模式按 `c`，打开这个标签页最近一个回合的审阅。它画在对话之上，状态条仍然可见。标题行点出这个回合（“turn 3 of 5”）、它什么时候开始和结束，并写着 `changed on disk during this turn`。
+在有会话的标签页里，于浏览模式按 `c`，打开这个标签页最近一个回合的审阅。一个回合改动了文件之后，状态条会写着 `c to review`，直到你打开那次审阅或下一个回合开始。审阅画在对话之上，状态条仍然可见。标题行点出这个回合（“turn 3 of 5”）、它什么时候开始和结束，并写着 `changed on disk during this turn`。
 
 每个改动的文件是一行，带着它增加和删除的行数，前面有一个标记：
 
@@ -68,7 +68,7 @@ agent 在你的项目上工作之后，回合审阅回答一个问题：在那�
 
 审阅打开期间，它接管每一个键：比如回答权限卡片的那些键，在你关掉它之前什么都不做。补丁只用 diff 的颜色绘制，带有两列行号。
 
-默认情况下，没有任何东西告诉你有一个审阅在等着。如果你希望在每个改动了文件的回合之后得到一个提示，状态条可以写 `2 files changed · c to review`；回合进行期间，输入框上方还会有一行，统计它的编辑到目前为止改了什么（`2 files changed +14 −1`）。见[关掉它](#turning-it-off)。
+默认情况下，告诉你有一个审阅在等着的只有状态条里那句 `c to review`。想要更多，状态条可以写 `2 files changed · c to review`；回合进行期间，输入框上方还会有一行，统计它的编辑到目前为止改了什么（`2 files changed +14 −1`）。想要更少，它也可以什么都不说。见[关掉它](#turning-it-off)。
 
 ## 还原和撤销
 
@@ -157,11 +157,12 @@ Comments:
 
 ```lua
 eitri.config.set("review.enabled", false) -- take no snapshots at all; `c` says turn review is off
-eitri.config.set("review.hint", true)     -- say "N files changed · c to review" in the status band after a turn
+eitri.config.set("review.hint", true)     -- say "N files changed · c to review" after a turn, and count a running turn's edits
+eitri.config.set("review.hint", false)    -- or: say nothing in the status band after a turn
 eitri.config.set("review.live", true)     -- draw an agent's edits in your editor as they land (see Live drawings)
 ```
 
-每一个的默认值在[配置](configuration.zh-CN.md)的表里。`true` 或 `false` 之外的任何值会在启动时被列出来，并点出这个键，这个设置保持它的默认值；`review.enabled` 是 `false` 时，`review.live` 也会说它没有效果。审阅关闭时，不拍任何快照，也打不开任何审阅；不管 `review.hint` 是什么，状态条和输入框上方的那一行都不会提回合的改动。
+每一个的默认值在[配置](configuration.zh-CN.md)的表里。`review.hint` 还接受 `"key"`，这是它的默认值：改动了文件的回合之后，状态条只写 `c to review`，回合进行期间什么也不画。除此之外，`true` 或 `false` 以外的任何值会在启动时被列出来，并点出这个键，这个设置保持它的默认值；`review.enabled` 是 `false` 时，`review.live` 也会说它没有效果。审阅关闭时，不拍任何快照，也打不开任何审阅；不管 `review.hint` 是什么，状态条和输入框上方的那一行都不会提回合的改动。
 
 ## 快照存在哪里
 

@@ -44,7 +44,8 @@ fn moved(ops: &mut Vec<KeymapOp>, from: &str, to: &str, action: &str, opts: Vec<
 
 /// For an i3 or sway whose `$mod` is Alt: every Alt row of the stock prefix table that those configs grab
 /// moves to the same key with Ctrl added, but for what Eitri cannot read as a Ctrl chord (Ctrl+Shift with
-/// a character): the four window moves become Ctrl+Alt+h/j/k/l, and the scratchpad move becomes `_`.
+/// a character): the four window moves become Ctrl+Alt+h/j/k/l. The scratchpad move already has the plain
+/// default `_`, so its Alt chord is only deleted.
 fn i3_alt() -> Vec<KeymapOp> {
     let repeat = || vec![("repeatable", OptValue::Bool(true))];
     let mut ops = Vec::new();
@@ -70,7 +71,7 @@ fn i3_alt() -> Vec<KeymapOp> {
     );
     moved(&mut ops, "M-S-Space", "C-M-Space", "float.toggle", vec![]);
     moved(&mut ops, "M--", "C-M--", "scratchpad.show", vec![]);
-    moved(&mut ops, "M-_", "_", "scratchpad.move", vec![]);
+    ops.push(del("M-_"));
     for (dir, key) in [("left", "Left"), ("down", "Down"), ("up", "Up"), ("right", "Right")] {
         moved(
             &mut ops,
@@ -124,14 +125,20 @@ mod tests {
 
     /// The sample file, run through real Lua, is what `use("i3-alt")` records. The sample's `pairs()` order
     /// differs from one Lua state to the next, so the two are compared as multisets; what must hold in any
-    /// order is that a key's `del` comes before its `set` (a `set` on a bound key stops startup).
+    /// order is that a moved row's `del` comes before its `set`; `M-_` is deleted by itself because `_`
+    /// already reaches the scratchpad by default.
     #[test]
     fn the_i3_alt_bundle_is_the_sample_file() {
         let sample = Path::new(env!("CARGO_MANIFEST_DIR")).join("../docs/keymap/i3-alt-mod.lua");
         let kernel = Kernel::new(sample.parent().unwrap().to_path_buf(), refuse_panels).unwrap();
         kernel.run_and_check_init_file(&sample).unwrap();
         let from_sample = kernel.keymap.borrow().ops().to_vec();
-        for pair in from_sample.chunks(2) {
+        let moved_rows: Vec<_> = from_sample.iter().filter(|op| **op != del("M-_")).collect();
+        assert_eq!(from_sample.iter().filter(|op| **op == del("M-_")).count(), 1);
+        assert!(!from_sample
+            .iter()
+            .any(|op| matches!(op, KeymapOp::Set { key, .. } if key == "_")));
+        for pair in moved_rows.chunks(2) {
             assert!(
                 matches!(pair, [KeymapOp::Del { .. }, KeymapOp::Set { .. }]),
                 "a row's del comes right before its set: {pair:?}"
@@ -140,7 +147,7 @@ mod tests {
         let ours = bundle("i3-alt").unwrap();
         assert_eq!(normalized(ours.clone()), normalized(from_sample));
 
-        // Each `del` names a key the stock table binds, and comes before the `set` that takes its place.
+        // Each moved row deletes before setting its replacement; the scratchpad chord needs only deletion.
         let positions = |op_is_del: bool| -> Vec<(usize, String)> {
             ours.iter()
                 .enumerate()
@@ -149,8 +156,8 @@ mod tests {
                 .collect()
         };
         let (dels, sets) = (positions(true), positions(false));
-        assert_eq!(dels.len(), sets.len());
-        for ((del_at, _), (set_at, _)) in dels.iter().zip(&sets) {
+        assert_eq!(dels.len(), sets.len() + 1);
+        for ((del_at, _), (set_at, _)) in dels.iter().filter(|(_, key)| key != "M-_").zip(&sets) {
             assert!(del_at < set_at);
         }
         for (_, key) in &dels {

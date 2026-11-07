@@ -17,7 +17,8 @@ message box; see [Getting started](getting-started.md).
 
 ## What it shows
 
-Press `c` in browsing, in a tab that has a session, to open the review of the tab's latest turn. It is drawn over
+Press `c` in browsing, in a tab that has a session, to open the review of the tab's latest turn. After a turn that
+changed files, the status band says `c to review` until you open that review or the next turn starts. The review is drawn over
 the conversation, and the status band stays visible. The header names the turn
 ("turn 3 of 5"), when it started and ended, and says `changed on disk during this turn`.
 
@@ -95,9 +96,10 @@ other LF, the CRs show as `^M`, and a final newline added or removed shows as an
 While the review is open it takes every key: the keys that answer permission cards, for example, do nothing
 until you close it. Patches are drawn with the diff colours only, in two line-number columns.
 
-By default nothing tells you a review is waiting. If you want a hint after each turn that changed files, the
-status band can say `2 files changed · c to review`; while the turn runs, a line above the input box then
-counts what its edits have changed so far (`2 files changed +14 −1`). See [Turning it off](#turning-it-off).
+By default the only sign that a review is waiting is that `c to review` in the status band. If you want more, the
+band can say `2 files changed · c to review`; while the turn runs, a line above the input box then
+counts what its edits have changed so far (`2 files changed +14 −1`). If you want less, it can say nothing. See
+[Turning it off](#turning-it-off).
 
 ## Reverting and undoing
 
@@ -236,12 +238,14 @@ Three settings in your `init.lua` (see [Configuration](configuration.md)):
 
 ```lua
 eitri.config.set("review.enabled", false) -- take no snapshots at all; `c` says turn review is off
-eitri.config.set("review.hint", true)     -- say "N files changed · c to review" in the status band after a turn
+eitri.config.set("review.hint", true)     -- say "N files changed · c to review" after a turn, and count a running turn's edits
+eitri.config.set("review.hint", false)    -- or: say nothing in the status band after a turn
 eitri.config.set("review.live", true)     -- draw an agent's edits in your editor as they land (see Live drawings)
 ```
 
-The default of each is in the [Configuration](configuration.md) table. Anything but `true` or `false` is listed at
-startup, naming the key, and the setting keeps its default; `review.live` also says it has no effect while `review.enabled` is
+The default of each is in the [Configuration](configuration.md) table. `review.hint` also takes `"key"`, its default:
+the status band says only `c to review` after a turn that changed files, and nothing is drawn while a turn runs.
+Anything else that is not `true` or `false` is listed at startup, naming the key, and the setting keeps its default; `review.live` also says it has no effect while `review.enabled` is
 `false`. With review off, no snapshot is taken and no review can be opened, and
 neither the status band nor the line above the input box says anything about a turn's changes, whatever
 `review.hint` is.

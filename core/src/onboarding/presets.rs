@@ -889,6 +889,33 @@ mod tests {
 
         let super_mod = start_table(PresetId::I3Style, WmMod::Super, &running);
         assert_eq!(super_mod, running);
+        for preset in [
+            PresetId::NvimTmux,
+            PresetId::NvimNoTmux,
+            PresetId::OtherPrefix,
+            PresetId::I3Style,
+            PresetId::Compositor,
+        ] {
+            for wm_mod in [WmMod::Alt, WmMod::Super] {
+                let table = start_table(preset, wm_mod, &running);
+                for (spec, action) in [
+                    ("F", "float.toggle"),
+                    ("S", "scratchpad.show"),
+                    ("_", "scratchpad.move"),
+                    ("W", "window.new"),
+                ] {
+                    assert_eq!(
+                        bound_in(&table, &key(spec)).as_deref(),
+                        Some(action),
+                        "{preset:?} {wm_mod:?} {spec}"
+                    );
+                }
+                let mut c = choice(preset);
+                c.wm_mod = wm_mod;
+                let map = Keymap::apply_user(&generate(&c, COMPOSITOR_BUILD, Lang::En).ops, &[]).unwrap();
+                assert!(map.user_overrides().is_empty(), "{:?}", map.user_overrides());
+            }
+        }
     }
 
     #[test]
