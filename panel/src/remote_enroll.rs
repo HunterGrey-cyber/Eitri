@@ -113,9 +113,9 @@ pub(super) struct RemoteDesk {
     enroll: Option<Asking<EnrollAsk, EnrollReply>>,
     grant: Option<Asking<GrantAsk, EnrollReply>>,
     listen: Option<Asking<ListenAsk, bool>>,
-    /// The `remote_connected` envelope last sent, kept while phones are connected: a document that loads later
-    /// (a reload, a crash's recovery, a page made for a tab broken out) starts without it and is told on `ready`.
-    connected: Option<String>,
+    /// The last phone list and sandbox, replayed to each document on `ready`.
+    connected: Vec<ConnectedShown>,
+    sandbox: Option<String>,
 }
 
 impl RemoteDesk {
@@ -468,6 +468,7 @@ pub(super) fn show_flagged(device: &str, name: &str, out: &mut Outbox) {
 
 /// One phone connected now, as the base page is told: the store's name and grant for the device `serve` named, and
 /// the `Host` and time of the connection.
+#[derive(Clone)]
 pub(super) struct ConnectedShown {
     pub(super) device: String,
     pub(super) name: String,
@@ -493,7 +494,21 @@ impl ConnectedShown {
 /// phone mark off the status band. The list is kept for the documents that load after this call
 /// ([`connected_for_new_document`]).
 pub(super) fn show_connected(state: &mut AgentPanelState, connected: &[ConnectedShown], out: &mut Outbox) {
-    let devices: Vec<serde_json::Value> = connected
+    state.remote_desk.connected = connected.to_vec();
+    send_connected(state, out);
+}
+
+pub(super) fn show_sandbox(state: &mut AgentPanelState, sandbox: String, out: &mut Outbox) {
+    if state.remote_desk.sandbox.as_ref() != Some(&sandbox) {
+        state.remote_desk.sandbox = Some(sandbox);
+        send_connected(state, out);
+    }
+}
+
+fn connected_payload(state: &AgentPanelState) -> String {
+    let devices: Vec<serde_json::Value> = state
+        .remote_desk
+        .connected
         .iter()
         .map(|c| {
             serde_json::json!({
@@ -505,8 +520,12 @@ pub(super) fn show_connected(state: &mut AgentPanelState, connected: &[Connected
             })
         })
         .collect();
-    let payload = serde_json::json!({ "kind": "remote_connected", "devices": devices }).to_string();
-    state.remote_desk.connected = (!connected.is_empty()).then(|| payload.clone());
+    serde_json::json!({ "kind": "remote_connected", "devices": devices, "sandbox": state.remote_desk.sandbox })
+        .to_string()
+}
+
+fn send_connected(state: &AgentPanelState, out: &mut Outbox) {
+    let payload = connected_payload(state);
     let views: Vec<ViewId> = state.pages.keys().copied().collect();
     for view in views {
         out.send(view, payload.clone());
@@ -516,7 +535,7 @@ pub(super) fn show_connected(state: &mut AgentPanelState, connected: &[Connected
 /// What a document that has just said `ready` is owed about the phones: the last list, while any phone is
 /// connected (a document starts with none).
 pub(super) fn connected_for_new_document(state: &AgentPanelState) -> Option<String> {
-    state.remote_desk.connected.clone()
+    (!state.remote_desk.connected.is_empty()).then(|| connected_payload(state))
 }
 
 /// Shows the code waiting to be scanned in the base page.

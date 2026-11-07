@@ -79,7 +79,13 @@ export type BandFacts = {
    *  Unlike every other segment the mark is never dropped, shortened or hidden by a prompt while it is above `0`:
    *  the person at the desk must always see that someone else can watch. */
   phones?: number | null;
+  remoteSandbox?: string | null;
 };
+
+/** The phone mark's tooltip, from the host's sandbox report. */
+export function phoneTitle(sandbox?: string | null): string {
+  return `Remote control: connected phones${sandbox && sandbox !== "full" ? "; sandbox: partial" : ""}`;
+}
 
 /** The band's phone mark: how many phones are connected. `?` names them. */
 export function phoneSegment(count: number): string {

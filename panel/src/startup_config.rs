@@ -1,6 +1,7 @@
 //! `init.lua`'s settings, checked before anything reads them: a value that is not one, and a key nothing reads, is a
 //! line in the kernel's startup problems and no more. A bad value is taken out of the store, so every reader that
-//! comes after finds the key unset and uses its default; the window opens and says what it did.
+//! comes after finds the key unset and uses its default; the window opens and says what it did. A bad remote-control
+//! key also turns remote control off: a typo must not open a network listener with fallback settings.
 //!
 //! The checks are the readers' own parsers (`window_config::load` and the shell's later reads call the same
 //! functions), so what is refused here is exactly what would have stopped the start. Two settings are not here on
@@ -223,17 +224,26 @@ pub fn settle(kernel: &Kernel) {
             .map_or_else(|| format!("init.lua: {key}"), str::to_string);
         if let Some((_, check)) = checks(&agent_names).into_iter().find(|(known, _)| known == key) {
             if let Err(why) = check(value) {
-                let said = match fallback(key) {
-                    Fallback::Default => {
-                        kernel.config.borrow_mut().unset(key);
-                        DEFAULT_SAID
-                    }
-                    Fallback::Stricter { value, said } => {
-                        kernel.config.borrow_mut().set_text(key, value);
-                        said
-                    }
-                };
-                kernel.report_problem(format!("{origin}: {why}; {said}"));
+                if key.starts_with("remote.") {
+                    kernel.config.borrow_mut().unset(key);
+                    kernel
+                        .config
+                        .borrow_mut()
+                        .set_text(eitri_core::lua::config::REMOTE_ENABLED_KEY, "false");
+                    kernel.report_problem(format!("{origin}: Remote control: off: {why}"));
+                } else {
+                    let said = match fallback(key) {
+                        Fallback::Default => {
+                            kernel.config.borrow_mut().unset(key);
+                            DEFAULT_SAID
+                        }
+                        Fallback::Stricter { value, said } => {
+                            kernel.config.borrow_mut().set_text(key, value);
+                            said
+                        }
+                    };
+                    kernel.report_problem(format!("{origin}: {why}; {said}"));
+                }
             }
         } else if key.starts_with(TOOL_KEY_PREFIX) {
             let pair = [(key.clone(), value.clone())];
@@ -246,6 +256,13 @@ pub fn settle(kernel: &Kernel) {
             let hint = nearest(key, &known).map_or_else(String::new, |near| format!(" (did you mean {near}?)"));
             kernel.report_problem(format!("{origin}: no setting {key:?}{hint}"));
         }
+    }
+    if !kernel.config.borrow().refusals_under("remote.").is_empty() {
+        kernel
+            .config
+            .borrow_mut()
+            .set_text(eitri_core::lua::config::REMOTE_ENABLED_KEY, "false");
+        kernel.report_problem("Remote control: off: a remote.* setting could not be stored".to_owned());
     }
     // A value that could not be stored reads as unset, which for these settings is the looser side.
     for key in [
@@ -300,20 +317,21 @@ mod tests {
     }
 
     #[test]
-    fn a_wildcard_remote_listen_is_said_and_loopback_is_used() {
+    fn a_wildcard_remote_listen_is_said_and_remote_stays_off() {
         use eitri_core::lua::config::{RemoteListen, RemoteSettings};
         let (kernel, problems) =
             settled("eitri.config.set('remote.enabled', true)\neitri.config.set('remote.listen', '0.0.0.0')\n");
         let read = RemoteSettings::read(&kernel.config.borrow()).unwrap();
-        assert!(read.enabled);
+        assert!(!read.enabled);
         assert_eq!(read.listen, RemoteListen::Loopback);
         assert_eq!(problems.len(), 1, "{problems:?}");
+        assert!(problems[0].contains("Remote control: off:"));
         assert!(
             problems[0].contains("remote.listen") && problems[0].contains("wildcard"),
             "{problems:?}"
         );
         assert!(
-            problems[0].contains("the default is used") && problems[0].contains("init.lua:2:"),
+            problems[0].contains("Remote control: off:") && problems[0].contains("init.lua:2:"),
             "{problems:?}"
         );
     }
@@ -323,6 +341,32 @@ mod tests {
         let (_kernel, problems) = settled("eitri.config.set('remote.enable', true)\n");
         assert_eq!(problems.len(), 1, "{problems:?}");
         assert!(problems[0].contains("remote.enabled"), "{problems:?}");
+    }
+
+    #[test]
+    fn every_bad_remote_value_and_refused_store_keeps_remote_off() {
+        use eitri_core::lua::config::RemoteSettings;
+        for (key, bad) in [
+            ("remote.enabled", "'maybe'"),
+            ("remote.listen", "'0.0.0.0'"),
+            ("remote.port", "0"),
+            ("remote.origins", "'*'"),
+            ("remote.listen", "{}"),
+            ("remote.port", "{}"),
+            ("remote.origins", "{}"),
+        ] {
+            let (kernel, problems) = settled(&format!(
+                "eitri.config.set('remote.enabled', true)\neitri.config.set('{key}', {bad})\n"
+            ));
+            assert!(
+                !RemoteSettings::read(&kernel.config.borrow()).unwrap().enabled,
+                "{key}: {bad}"
+            );
+            assert!(
+                problems.iter().any(|line| line.contains("Remote control: off:")),
+                "{problems:?}"
+            );
+        }
     }
 
     #[test]

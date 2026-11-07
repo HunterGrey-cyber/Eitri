@@ -540,7 +540,7 @@ export type RemoteDeskEnvelope =
   /** A device in the store that no desk said yes to (something other than an enrollment wrote it). */
   | { kind: "remote_device_flagged"; device: string; name: string }
   /** Who is connected now, whole: it replaces the last list, and an empty one takes the band's phone mark away. */
-  | { kind: "remote_connected"; devices: RemoteConnectedDevice[] }
+  | { kind: "remote_connected"; devices: RemoteConnectedDevice[]; sandbox?: string | null }
   | { kind: "command_result"; requestId: string; ok: true }
   | { kind: "command_result"; requestId: string; ok: false; error: string };
 
@@ -585,7 +585,7 @@ function isWellFormedRemote(value: Record<string, unknown>): boolean {
     case "remote_device_flagged":
       return text(value.device) && text(value.name);
     case "remote_connected":
-      return Array.isArray(value.devices) && value.devices.every((d: unknown) => {
+      return (value.sandbox == null || typeof value.sandbox === "string") && Array.isArray(value.devices) && value.devices.every((d: unknown) => {
         const device = d as Record<string, unknown> | null;
         return device !== null && typeof device === "object" && text(device.device) && text(device.name) && isGrant(device.grant) &&
           text(device.host) && Number.isSafeInteger(device.since) && (device.since as number) >= 0;

@@ -127,6 +127,7 @@ struct Issued {
 
 /// What the errands share across the accepting, reading and writing threads.
 pub(super) struct DevicesShared {
+    pub(super) report_order: Mutex<()>,
     instance: String,
     issued: Mutex<Issued>,
     pairing: Mutex<Option<Pairing>>,
@@ -140,6 +141,7 @@ pub(super) struct DevicesShared {
 impl DevicesShared {
     pub(super) fn new(instance: &str) -> DevicesShared {
         DevicesShared {
+            report_order: Mutex::new(()),
             instance: instance.to_owned(),
             issued: Mutex::new(Issued {
                 codes: EnrollCodes::default(),
@@ -540,6 +542,34 @@ fn change_device(store: &Path, device: &str, change: impl FnOnce(&mut DeviceStor
 /// desk's yes that this process has not shown yet. On the reader's thread: it may wait for the store's lock.
 fn record_connected(shared: &Shared, connected: Vec<Connected>, now: u64) -> DevicesInbound {
     let mut previous = shared.devices.connected.lock().unwrap_or_else(|e| e.into_inner());
+    record_connected_locked(shared, connected, now, &mut previous)
+}
+
+/// Checks serve's liveness off the tick. The phone-list lock covers the probe and the empty report, so a new report
+/// cannot be erased by a check that began before it. No lock probe is requested while the list is empty.
+pub(super) fn check_serve(shared: &Shared) {
+    let _ordered = shared.devices.report_order.lock().unwrap_or_else(|e| e.into_inner());
+    let mut previous = shared.devices.connected.lock().unwrap_or_else(|e| e.into_inner());
+    let mut probe = shared.serve_probe.lock().unwrap_or_else(|e| e.into_inner());
+    let Some(probe) = probe.as_mut() else { return };
+    let (running, sandbox) = probe(!previous.is_empty());
+    if let Some(sandbox) = sandbox {
+        if shared.inbound.send(Inbound::Sandbox(sandbox)).is_ok() {
+            (shared.wake)();
+        }
+    }
+    if !previous.is_empty() && running == Some(false) {
+        let line = record_connected_locked(shared, Vec::new(), unix_now(), &mut previous);
+        hand_to_tick(shared, 0, line);
+    }
+}
+
+fn record_connected_locked(
+    shared: &Shared,
+    connected: Vec<Connected>,
+    now: u64,
+    previous: &mut BTreeSet<String>,
+) -> DevicesInbound {
     let named: BTreeSet<String> = connected.iter().map(|c| c.device.clone()).collect();
     let written = eitri_core::remote_devices::update(&shared.store, |s| {
         for c in &connected {
@@ -621,10 +651,21 @@ fn shown_connected(store: &DeviceStore, report: &[Connected]) -> Vec<ConnectedSh
 }
 
 impl RemoteSocket {
-    /// Where this window sends phones: the endpoint a pairing URI names, and the directory the desk's SSH host keys
-    /// are read from for the SSH recipe. Until it is set, `start_enroll` is refused.
+    /// Where this window sends phones: the routes a pairing URI names, and the directory the desk's SSH host keys are
+    /// read from for the SSH recipe. Until it is set, `start_enroll` is refused.
     pub fn set_pairing(&self, pairing: Pairing) {
         *self.shared.devices.pairing.lock().unwrap_or_else(|e| e.into_inner()) = Some(pairing);
+    }
+
+    /// The routes this window's enrollment codes send phones by. Read off the tick, like setting them.
+    pub fn pairing_routes(&self) -> Option<PairingRoutes> {
+        self.shared
+            .devices
+            .pairing
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .as_ref()
+            .map(|p| p.routes.clone())
     }
 
     /// Carries out an errand on the tick.

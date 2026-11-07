@@ -10,8 +10,9 @@
 //! A window that finds `serve` running pairs phones with what that `serve` listens on (its record), not with its own
 //! keys, which may have changed since it started. And it looks once more [`IDLE_EDGE`] later: a `serve` that had just
 //! seen no window, and so ends, may have held the lock when this window looked, and this window would otherwise be left
-//! with no `serve` until another window starts. That second look starts nothing when `eitri remote stop` ran after the
-//! first (`serve::stopped_since`): an explicit stop is not the idle exit it is there for.
+//! with no `serve` until another window starts. That second look starts nothing when `eitri remote stop` ran since
+//! `STOP_WAIT` before the first look (`serve::stopped_since`), including a stop still waiting for the lock to go:
+//! an explicit stop is not the idle exit it is there for.
 //!
 //! What keeps a window that asked for remote control from having it is said on the window's toast as well as on
 //! stderr, since a window started from the desktop has no terminal: the agents layer off, a socket or directory that
@@ -25,12 +26,12 @@ use std::time::{Duration, Instant, SystemTime};
 
 use eitri_core::lua::config::{ConfigStore, RemoteSettings};
 use eitri_core::remote_pairing::{DEVICES_FILE, ENROLL_CODE_TTL};
-use eitri_core::remote_runtime::{pairing_routes, start_serve, RemotePlan, ServeConfig};
+use eitri_core::remote_runtime::{pairing_routes, start_serve, RemotePlan, ServeConfig, Spawner};
 use eitri_core::remote_rv::RV_IDLE;
 use eitri_core::remote_rv::{parse_rv_outbound, rv_socket_path, RvClient, RvInbound, RvOutbound, RV_PROTOCOL};
 use eitri_panel::agent_panel::{Pairing, RemoteSocket};
 use eitri_remote::serve::spawn::{plan, running_config, ServeEnded, ServeSpawner};
-use eitri_remote::serve::{stopped_since, Dirs};
+use eitri_remote::serve::{stopped_since, Dirs, STOP_WAIT};
 use gtk4::glib;
 
 use crate::agent_panel::AgentPanelHandle;
@@ -78,13 +79,8 @@ pub(crate) fn start(
     config: &ConfigStore,
     notice: Rc<dyn Fn(String)>,
 ) {
-    let settings = match RemoteSettings::read(config) {
-        Ok(settings) => settings,
-        Err(e) => {
-            // A bad key is among the window's startup problems already.
-            eprintln!("[remote] off: {e}");
-            return;
-        }
+    let Some(settings) = read_settings(config, &*notice) else {
+        return;
     };
     if !settings.enabled {
         return;
@@ -119,7 +115,20 @@ pub(crate) fn start(
     let thread_notes = notes.clone();
     let spawned = std::thread::Builder::new()
         .name("eitri-remote-start".into())
-        .spawn(move || switch_on(&settings, &dirs, &instance, exe, wake, socket_tx, &thread_notes));
+        .spawn(move || {
+            let cfg = ServeConfig::from_settings(&settings);
+            let spawner = ServeSpawner::new(exe).on_end(on_serve_end(dirs.clone(), cfg, thread_notes.clone()));
+            switch_on(
+                &settings,
+                &dirs,
+                &instance,
+                wake,
+                socket_tx,
+                &thread_notes,
+                &spawner,
+                || std::thread::sleep(IDLE_EDGE),
+            );
+        });
     if let Err(e) = spawned {
         say(&notes, format!("off: could not start: {e}"));
         return;
@@ -132,17 +141,30 @@ pub(crate) fn start(
     });
 }
 
+/// Fail closed, including for settings read after startup validation or in a window without startup notices.
+fn read_settings(config: &ConfigStore, notice: &dyn Fn(String)) -> Option<RemoteSettings> {
+    match RemoteSettings::read(config) {
+        Ok(settings) => Some(settings),
+        Err(e) => {
+            eprintln!("[remote] off: {e}");
+            notice(format!("Remote control: off: {e}"));
+            None
+        }
+    }
+}
+
 /// The thread's work: decide, bind, hand the socket over, ask the desk if the address needs it, start `serve`.
 fn switch_on(
     settings: &RemoteSettings,
     dirs: &Dirs,
     instance: &str,
-    exe: PathBuf,
     wake: agent::UiWake,
     socket_to: futures_channel::oneshot::Sender<RemoteSocket>,
     notes: &Notes,
+    spawner: &dyn Spawner,
+    idle_wait: impl FnOnce(),
 ) {
-    // Taken before the first look, so a stop after it is seen by the second.
+    // Include a stop already in flight: it can hold the lock for STOP_WAIT after writing its note.
     let looked = SystemTime::now();
     let mut now = plan(settings, dirs);
     let RemotePlan::On {
@@ -179,6 +201,8 @@ fn switch_on(
             ..
         }
     );
+    let record_since = Arc::new(std::sync::Mutex::new((!found_running).then_some(looked)));
+    socket.watch_serve(serve_probe(dirs.clone(), notes.clone(), record_since.clone()));
     let paired = if found_running {
         paired_with_running(dirs, &cfg, notes)
     } else {
@@ -205,8 +229,8 @@ fn switch_on(
     println!("[remote] on: this window's tabs can be watched through eitri remote serve");
     let mut ask_listen = ask_listen;
     if found_running {
-        std::thread::sleep(IDLE_EDGE);
-        if stopped_since(dirs, looked) {
+        idle_wait();
+        if stopped_since(dirs, looked - STOP_WAIT) {
             println!("[remote] eitri remote stop ran: serve stays stopped until a window starts");
             return;
         }
@@ -235,12 +259,61 @@ fn switch_on(
             }
         }
     }
-    let spawner = ServeSpawner::new(exe).on_end(on_serve_end(dirs.clone(), cfg.clone(), notes.clone()));
-    match start_serve(&now, &spawner) {
-        Ok(true) => println!("[remote] started eitri remote serve {}", cfg.args().join(" ")),
+    let starting = SystemTime::now();
+    match start_serve(&now, spawner) {
+        Ok(true) => {
+            // The second look may have replaced a server whose sandbox was already read. Wait for the new record.
+            *record_since.lock().unwrap_or_else(|e| e.into_inner()) = Some(starting);
+            println!("[remote] started eitri remote serve {}", cfg.args().join(" "));
+        }
         Ok(false) => {}
         Err(e) => say(notes, format!("could not start eitri remote serve: {e}")),
     }
+}
+
+/// The socket's maintenance reader: no lock I/O without phones, and a sandbox warning only once per window.
+fn serve_probe(
+    dirs: Dirs,
+    notes: Notes,
+    record_since: Arc<std::sync::Mutex<Option<SystemTime>>>,
+) -> impl FnMut(bool) -> (Option<bool>, Option<String>) + Send {
+    let mut sandbox = None;
+    let mut warned = false;
+    let mut last_since = None;
+    move |phones| {
+        let since = *record_since.lock().unwrap_or_else(|e| e.into_inner());
+        if since != last_since {
+            sandbox = None;
+            last_since = since;
+        }
+        let previous = sandbox.clone();
+        let running = phones.then(|| eitri_remote::serve::is_running(&dirs).ok()).flatten();
+        if running != Some(false) && (phones || sandbox.is_none()) {
+            // A delayed start (the desk may still be answering about an address) must not use a dead server's record.
+            if let Some(since) = since {
+                let fresh = std::fs::metadata(dirs.control.join(eitri_remote::serve::RECORD_FILE))
+                    .and_then(|m| m.modified())
+                    .is_ok_and(|at| at >= since);
+                if !fresh {
+                    return (running, None);
+                }
+            }
+            if let Some((record, _)) = eitri_remote::serve::read_record(&dirs) {
+                if !warned {
+                    if let Some(text) = sandbox_text(&record.sandbox) {
+                        say(&notes, text);
+                        warned = true;
+                    }
+                }
+                sandbox = Some(record.sandbox);
+            }
+        }
+        (running, sandbox.clone().filter(|_| sandbox != previous))
+    }
+}
+
+fn sandbox_text(sandbox: &str) -> Option<String> {
+    (sandbox != "full").then(|| "serve runs with a partial sandbox; `eitri remote status` says more".to_owned())
 }
 
 /// What the reaper of a `serve` this window started tells the desk: a `serve` with other keys found running (named
@@ -342,11 +415,209 @@ mod tests {
     fn scratch(name: &str) -> PathBuf {
         let dir =
             PathBuf::from(option_env!("CARGO_TARGET_DIR").unwrap_or(concat!(env!("CARGO_MANIFEST_DIR"), "/../target")))
-                .join("tmp/remote-switch-tests")
+                .join("tmp/rs")
                 .join(format!("{name}-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         dir
+    }
+
+    struct Started(std::cell::RefCell<Vec<Vec<String>>>);
+
+    impl Spawner for Started {
+        fn spawn_serve(&self, cfg: &ServeConfig) -> std::io::Result<()> {
+            self.0.borrow_mut().push(cfg.args());
+            Ok(())
+        }
+    }
+
+    fn dirs_at(dir: &std::path::Path) -> Dirs {
+        let dirs = Dirs {
+            control: dir.join("c"),
+            state: dir.join("s"),
+        };
+        eitri_core::panel_control::ensure_dir(&dirs.control).unwrap();
+        dirs
+    }
+
+    fn write_record(dirs: &Dirs, sandbox: &str) {
+        agent::private_fs::write_private(
+            &dirs.control.join(eitri_remote::serve::RECORD_FILE),
+            serde_json::json!({"v":1,"pid":1,"args":["--listen","loopback","--port","7500"],"sandbox":sandbox})
+                .to_string()
+                .as_bytes(),
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn bad_remote_settings_are_off_and_visible() {
+        let mut config = ConfigStore::default();
+        config.set_text("remote.enabled", "true");
+        config.set_text("remote.listen", "0.0.0.0");
+        let said = std::cell::RefCell::new(Vec::new());
+        assert!(read_settings(&config, &|line| said.borrow_mut().push(line)).is_none());
+        let said = said.borrow();
+        assert_eq!(said.len(), 1);
+        assert!(said[0].starts_with("Remote control: off:"));
+        assert!(said[0].contains("remote.listen") && said[0].contains("wildcard"));
+    }
+
+    #[test]
+    fn a_partial_sandbox_is_said_once_whether_serve_was_started_or_found() {
+        for record_ready in [true, false] {
+            let dir = scratch(if record_ready {
+                "sandbox-found"
+            } else {
+                "sandbox-started"
+            });
+            let dirs = dirs_at(&dir);
+            let (notes, mut noted) = futures_channel::mpsc::unbounded();
+            if !record_ready {
+                write_record(&dirs, "full");
+            }
+            let since = Arc::new(std::sync::Mutex::new((!record_ready).then(SystemTime::now)));
+            let mut probe = serve_probe(dirs.clone(), notes, since);
+            if !record_ready {
+                assert_eq!(probe(false), (None, None));
+            }
+            write_record(&dirs, "partial");
+            assert_eq!(probe(false), (None, Some("partial".into())));
+            assert_eq!(
+                noted.try_recv().unwrap(),
+                "Remote control: serve runs with a partial sandbox; `eitri remote status` says more"
+            );
+            probe(false);
+            assert!(noted.try_recv().is_err());
+            assert!(sandbox_text("full").is_none());
+            std::fs::remove_dir_all(dir).unwrap();
+        }
+    }
+
+    #[test]
+    fn the_sandbox_is_read_again_after_an_idle_exit_replacement() {
+        let dir = scratch("sandbox-replaced");
+        let dirs = dirs_at(&dir);
+        let (notes, mut noted) = futures_channel::mpsc::unbounded();
+        let since = Arc::new(std::sync::Mutex::new(None));
+        let mut probe = serve_probe(dirs.clone(), notes, since.clone());
+        write_record(&dirs, "full");
+        assert_eq!(probe(false), (None, Some("full".into())));
+        *since.lock().unwrap() = Some(SystemTime::now());
+        assert_eq!(probe(false), (None, None), "the previous server's record is too old");
+        write_record(&dirs, "partial");
+        assert_eq!(probe(false), (None, Some("partial".into())));
+        assert!(noted.try_recv().unwrap().contains("partial sandbox"));
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn switch_on_binds_hands_over_pairs_and_starts_with_the_windows_args() {
+        let dir = scratch("start");
+        let dirs = dirs_at(&dir);
+        let settings = RemoteSettings {
+            enabled: true,
+            listen: eitri_core::lua::config::RemoteListen::Loopback,
+            port: Some(7500),
+            origins: vec!["desk.example".into()],
+        };
+        let started = Started(std::cell::RefCell::new(Vec::new()));
+        let (tx, mut rx) = futures_channel::oneshot::channel();
+        let (notes, _noted) = futures_channel::mpsc::unbounded();
+        switch_on(
+            &settings,
+            &dirs,
+            "0123456789abcdef",
+            Arc::new(|| {}),
+            tx,
+            &notes,
+            &started,
+            || panic!("no second look without a server"),
+        );
+        let socket = rx.try_recv().unwrap().unwrap();
+        assert!(rv_socket_path(&dirs.control, "0123456789abcdef").unwrap().exists());
+        let routes = socket.pairing_routes().expect("pairing is set before handover");
+        let endpoint = routes.pick(None).unwrap();
+        assert_eq!((endpoint.host.as_str(), endpoint.port), ("desk.example", 443));
+        assert_eq!(*started.0.borrow(), vec![ServeConfig::from_settings(&settings).args()]);
+        drop(socket);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn switch_on_rechecks_running_serve_and_honours_a_stop_already_in_flight() {
+        // The stop note is written before the first look, while the stand-in still holds the lock.
+        for case in ["same", "idle", "recent-stop", "old-stop", "during-stop"] {
+            let dir = scratch(case);
+            let dirs = dirs_at(&dir);
+            let lock =
+                agent::private_fs::PrivateLock::open(&dirs.control.join(eitri_remote::serve::LOCK_FILE)).unwrap();
+            assert!(lock.try_lock().unwrap());
+            write_record(&dirs, "full");
+            if matches!(case, "recent-stop" | "old-stop") {
+                let age = if case == "old-stop" {
+                    STOP_WAIT + Duration::from_secs(60)
+                } else {
+                    Duration::from_millis(1)
+                };
+                let at = (SystemTime::now() - age)
+                    .duration_since(SystemTime::UNIX_EPOCH)
+                    .unwrap()
+                    .as_nanos();
+                agent::private_fs::write_private(
+                    &dirs.control.join(eitri_remote::serve::STOPPED_FILE),
+                    at.to_string().as_bytes(),
+                )
+                .unwrap();
+            }
+            let settings = RemoteSettings {
+                enabled: true,
+                listen: eitri_core::lua::config::RemoteListen::Loopback,
+                port: None,
+                origins: vec![],
+            };
+            let started = Started(std::cell::RefCell::new(Vec::new()));
+            let (tx, mut rx) = futures_channel::oneshot::channel();
+            let (notes, mut noted) = futures_channel::mpsc::unbounded();
+            let mut held = Some(lock);
+            let mut waited = false;
+            switch_on(
+                &settings,
+                &dirs,
+                "0123456789abcdef",
+                Arc::new(|| {}),
+                tx,
+                &notes,
+                &started,
+                || {
+                    waited = true;
+                    if case != "same" {
+                        held.take();
+                    }
+                    if case == "during-stop" {
+                        eitri_remote::serve::mark_stopped(&dirs).unwrap();
+                    }
+                },
+            );
+            assert!(waited, "the first look saw the lock held");
+            let socket = rx.try_recv().unwrap().unwrap();
+            let routes = socket.pairing_routes().unwrap();
+            let endpoint = routes.pick(None).unwrap();
+            assert_eq!(
+                (endpoint.host.as_str(), endpoint.port),
+                ("127.0.0.1", 7500),
+                "pair with the record"
+            );
+            let expected = usize::from(matches!(case, "idle" | "old-stop"));
+            assert_eq!(started.0.borrow().len(), expected, "{case}");
+            if expected == 1 {
+                assert_eq!(started.0.borrow()[0], ServeConfig::from_settings(&settings).args());
+            }
+            assert!(noted.try_recv().is_err(), "same keys are quiet");
+            drop(socket);
+            drop(held);
+            std::fs::remove_dir_all(dir).unwrap();
+        }
     }
 
     /// A stand-in for a window's `rv-` socket: reads the one request it is sent, then writes `answers` back.

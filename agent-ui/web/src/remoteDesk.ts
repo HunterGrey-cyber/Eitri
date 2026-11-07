@@ -20,11 +20,12 @@ export type DeskView = {
   /** The phones connected now, as the window last said. Not part of what Escape takes down: the mark it feeds stays
    *  while a device is connected. */
   connected: RemoteConnectedDevice[];
+  sandbox: string | null;
   /** Bumped each time the shown question must be on screen afresh before a `y` counts. */
   asking: number;
 };
 
-const EMPTY: DeskView = { pairing: null, questions: [], refusal: null, flagged: [], connected: [], asking: 0 };
+const EMPTY: DeskView = { pairing: null, questions: [], refusal: null, flagged: [], connected: [], sandbox: null, asking: 0 };
 
 /** The window's remote-control questions, kept apart from the component that draws them: the panel draws that
  *  component in whichever layout is up, and a question must outlive a switch between them, since the window asks it
@@ -119,7 +120,7 @@ export class RemoteDesk {
         }
         return;
       case "remote_connected":
-        this.set({ connected: payload.devices });
+        this.set({ connected: payload.devices, sandbox: payload.sandbox ?? null });
         return;
       case "command_result": {
         if (this.pending === null || payload.requestId !== this.pending.requestId) return;

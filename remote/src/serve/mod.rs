@@ -85,7 +85,7 @@ mod linux {
 
     use super::config::{Record, ServeConfig, RECORD_V};
     use super::listen::{bind, iface_of, peer_in, Listeners};
-    use super::sandbox::{sandbox, SandboxState};
+    use super::sandbox::sandbox;
     use super::session::{Hub, Limits};
     use super::ws::{handshake, Conn};
 
@@ -108,6 +108,10 @@ mod linux {
     /// When `eitri remote stop` last ran, beside the lock: a window that found `serve` running and looks again later
     /// starts none after a stop.
     pub const STOPPED_FILE: &str = "remote-stopped";
+
+    /// How long `stop` waits for the signalled server to release its lock. A window's second look includes this
+    /// much time before its first look, since a stop may already be in flight while the lock is still held.
+    pub const STOP_WAIT: Duration = Duration::from_secs(5);
 
     /// `serve` could not start: an I/O failure or the sandbox.
     pub const EXIT_FAILED: i32 = 1;
@@ -202,8 +206,8 @@ mod linux {
 
         let state = sandbox(&dirs.agents(), &dirs.control, &dirs.state)
             .map_err(|e| failed(format!("could not confine itself: {e}")))?;
-        if state == SandboxState::NoLandlock {
-            eprintln!("[remote] this kernel has no Landlock: serving with seccomp and not dumpable only");
+        if let Some(missing) = state.missing() {
+            eprintln!("[remote] serving with a partial sandbox: {missing}");
         }
         let record = Record {
             v: RECORD_V,
@@ -526,7 +530,7 @@ mod linux {
             eprintln!("eitri remote stop: {}", io::Error::last_os_error());
             return EXIT_FAILED;
         }
-        let until = Instant::now() + Duration::from_secs(5);
+        let until = Instant::now() + STOP_WAIT;
         while Instant::now() < until {
             if !is_running(&dirs).unwrap_or(true) {
                 println!("stopped");

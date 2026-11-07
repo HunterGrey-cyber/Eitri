@@ -17,10 +17,10 @@ struct Scratch(PathBuf);
 impl Scratch {
     fn new() -> Scratch {
         static SERIAL: AtomicU32 = AtomicU32::new(0);
-        let base = std::env::var_os("XDG_RUNTIME_DIR")
-            .map(PathBuf::from)
-            .filter(|p| p.is_absolute())
-            .unwrap_or_else(std::env::temp_dir);
+        let base =
+            PathBuf::from(option_env!("CARGO_TARGET_DIR").unwrap_or(concat!(env!("CARGO_MANIFEST_DIR"), "/../target")))
+                .join("tmp");
+        std::fs::create_dir_all(&base).unwrap();
         let path = base.join(format!(
             "re-{}-{}",
             std::process::id(),
@@ -1206,4 +1206,72 @@ fn phone_errands_held_by_the_store_lock_are_bounded() {
     // With room again, the endpoint is taken.
     set_push(&mut client, &device, &token, "https://ntfy.example/up7f3a");
     assert_eq!(window.result(&mut client, "the endpoint")["ok"], true);
+}
+
+#[test]
+fn remote_phone_list_clears_when_the_serve_lock_is_released() {
+    let scratch = Scratch::new();
+    let window = Window::new(&scratch, INSTANCE_A);
+    let lock_path = scratch.0.join("remote.lock");
+    let lock = agent::private_fs::PrivateLock::open(&lock_path).unwrap();
+    assert!(lock.try_lock().unwrap());
+    let probes = Arc::new(AtomicUsize::new(0));
+    let counted = probes.clone();
+    window.socket.watch_serve(move |phones| {
+        let running = phones.then(|| {
+            counted.fetch_add(1, Ordering::SeqCst);
+            !agent::private_fs::PrivateLock::open(&lock_path)
+                .unwrap()
+                .try_lock()
+                .unwrap()
+        });
+        (running, Some("partial".into()))
+    });
+    let mut client = window.connect();
+    let (device, _) = window.enroll_with_yes(&mut client, "Pixel", "watch");
+    check_serve(&window.socket.shared);
+    assert_eq!(probes.load(Ordering::SeqCst), 0, "no lock check without phones");
+    report(&mut client, &[(&device, "127.0.0.1:43117")]);
+    window.turn_until("phone mark", || {
+        crate::agent_panel::remote_enroll::connected_for_new_document(&window.handle.state.borrow()).is_some()
+    });
+    check_serve(&window.socket.shared);
+    window.turn();
+    assert!(crate::agent_panel::remote_enroll::connected_for_new_document(&window.handle.state.borrow()).is_some());
+    let shown = window
+        .base
+        .sent
+        .borrow()
+        .iter()
+        .map(|s| json_of(s))
+        .filter(|v| v["kind"] == "remote_connected")
+        .last()
+        .unwrap();
+    assert_eq!(shown["sandbox"], "partial");
+    let store = scratch.store();
+    update(&store, |s| s.get_mut(&device).unwrap().last_seen = Some(0)).unwrap();
+    drop(lock);
+    check_serve(&window.socket.shared);
+    window.turn();
+    assert!(crate::agent_panel::remote_enroll::connected_for_new_document(&window.handle.state.borrow()).is_none());
+    assert!(stored(&store, &device).unwrap().last_seen.unwrap() > 0);
+    let shown = window
+        .base
+        .sent
+        .borrow()
+        .iter()
+        .map(|s| json_of(s))
+        .filter(|v| v["kind"] == "remote_connected")
+        .last()
+        .unwrap();
+    assert_eq!(shown["devices"], serde_json::json!([]));
+    let before = probes.load(Ordering::SeqCst);
+    check_serve(&window.socket.shared);
+    assert_eq!(probes.load(Ordering::SeqCst), before, "empty stays unchecked");
+    let restarted = agent::private_fs::PrivateLock::open(&scratch.0.join("remote.lock")).unwrap();
+    assert!(restarted.try_lock().unwrap());
+    report(&mut client, &[(&device, "127.0.0.1:43117")]);
+    window.turn_until("a later report", || {
+        crate::agent_panel::remote_enroll::connected_for_new_document(&window.handle.state.borrow()).is_some()
+    });
 }

@@ -1,3 +1,4 @@
+import { phoneTitle } from "./band";
 import { describe, expect, it } from "vitest";
 import { backgroundSegment, bandLayout, cardSummary, liveTasks, taskWords, tasksLine, textWidth, usageSegment, type BandFacts } from "./band";
 import { applyEvent, initialState } from "./reducer";
@@ -9,6 +10,11 @@ const idle: BandFacts = { ...running, mode: "browse", unread: null, cards: 0, qu
 const ids = (w: number, f: BandFacts) => bandLayout(f, w, 7.2).map((s) => s.id);
 
 describe("the phone mark", () => {
+  it("names a partial sandbox in the phone tooltip", () => {
+    expect(phoneTitle("partial")).toContain("sandbox: partial");
+    expect(phoneTitle("full")).not.toContain("partial");
+    expect(phoneTitle()).not.toContain("partial");
+  });
   it("phone_mark_counts_connected_devices", () => {
     const wide = bandLayout({ ...running, phones: 2 }, 900, 7.2);
     expect(wide.find((s) => s.id === "phone")).toEqual({ id: "phone", text: "☎2", side: "left" });

@@ -306,3 +306,13 @@ it("an effort nobody reported draws nothing, not even a place for it", () => {
   expect(container.querySelector("button.band-model")).not.toBeNull();
   expect(container.querySelector(".band-effort")).toBeNull();
 });
+
+it("shows the host's partial sandbox in the phone mark title", () => {
+  stubResizeObserver();
+  const { container, rerender } = render(<StatusBand facts={{ ...RUNNING, phones: 1, remoteSandbox: "partial" }} paneFocused />);
+  expect(container.querySelector(".band-phone")?.getAttribute("title")).toContain("sandbox: partial");
+  rerender(<StatusBand facts={{ ...RUNNING, phones: 1, remoteSandbox: "full" }} paneFocused />);
+  expect(container.querySelector(".band-phone")?.getAttribute("title")).not.toContain("partial");
+  rerender(<StatusBand facts={{ ...RUNNING, phones: 0, remoteSandbox: "partial" }} paneFocused />);
+  expect(container.querySelector(".band-phone")).toBeNull();
+});

@@ -67,6 +67,7 @@ const NOT_YET: &str = "not yet";
 
 /// What a connection's threads hand the tick.
 enum Inbound {
+    Sandbox(String),
     Opened {
         conn: u64,
         stream: UnixStream,
@@ -106,7 +107,11 @@ struct Shared {
     stopped: AtomicBool,
     /// What the errands about devices share across the threads: the code on show, where phones connect.
     devices: devices::DevicesShared,
+    serve_probe: std::sync::Mutex<Option<Box<ServeProbe>>>,
 }
+
+/// Checks the lock only when phones were reported; also reads the sandbox while its record is still pending.
+type ServeProbe = dyn FnMut(bool) -> (Option<bool>, Option<String>) + Send;
 
 /// A bound `rv-` socket, its threads, and what the tick holds of its connections.
 ///
@@ -166,11 +171,16 @@ impl RemoteSocket {
             next_conn: AtomicU64::new(1),
             stopped: AtomicBool::new(false),
             devices: devices::DevicesShared::new(instance),
+            serve_probe: std::sync::Mutex::new(None),
         });
         let accepting = Arc::clone(&shared);
-        let listener = RvListener::bind(control_dir, instance, move |stream| {
-            start_connection(stream, &accepting)
-        })?;
+        let maintained = Arc::clone(&shared);
+        let listener = RvListener::bind_maintained(
+            control_dir,
+            instance,
+            move |stream| start_connection(stream, &accepting),
+            move || devices::check_serve(&maintained),
+        )?;
         Ok(RemoteSocket {
             listener: Some(listener),
             shared,
@@ -181,6 +191,12 @@ impl RemoteSocket {
             #[cfg(test)]
             closes: RefCell::new(Vec::new()),
         })
+    }
+
+    /// Installs the host's lock/record reader. Called off the window's thread; the reader subsequently runs on the
+    /// socket's accepting thread every few seconds. `None` for the lock means it was not checked or was unreadable.
+    pub fn watch_serve(&self, probe: impl FnMut(bool) -> (Option<bool>, Option<String>) + Send + 'static) {
+        *self.shared.serve_probe.lock().unwrap_or_else(|e| e.into_inner()) = Some(Box::new(probe));
     }
 
     /// Called from the tick: answers no to the desk's questions left past their time (what that tells whoever asked
@@ -221,6 +237,9 @@ impl RemoteSocket {
 
     fn take(&self, handle: &AgentPanelHandle, inbound: Inbound) {
         match inbound {
+            Inbound::Sandbox(sandbox) => {
+                handle.run(|state, out| crate::agent_panel::remote_enroll::show_sandbox(state, sandbox, out))
+            }
             Inbound::Opened {
                 conn,
                 stream,
@@ -303,6 +322,9 @@ fn hand_on(line: &[u8], conn: u64, shared: &Shared) -> bool {
     let Ok(line) = parse_rv_line(line) else {
         return false;
     };
+    // Keep the store update and its page report ordered together, including a liveness check's empty report.
+    let _ordered = matches!(line, RvInbound::DevicesConnected { .. })
+        .then(|| shared.devices.report_order.lock().unwrap_or_else(|e| e.into_inner()));
     let inbound = match line {
         RvInbound::Ping { .. } => Some(Inbound::Ping { conn }),
         RvInbound::Subscribe { .. } | RvInbound::Unsubscribe { .. } | RvInbound::More { .. } => {

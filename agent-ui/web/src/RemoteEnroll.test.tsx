@@ -185,9 +185,11 @@ describe("RemoteEnroll", () => {
   it("remote_connected replaces the list of connected devices and outlasts Escape", () => {
     const first = { device: "d1", name: "Pixel", grant: "watch", host: "127.0.0.1:7341", since: 5 };
     const second = { device: "d2", name: "Tablet", grant: "watch+steer", host: "desk.example.org", since: 9 };
-    fromRust({ kind: "remote_connected", devices: [first, second] });
+    fromRust({ kind: "remote_connected", devices: [first, second], sandbox: "partial" });
+    expect(desk.snapshot().sandbox).toBe("partial");
     expect(desk.snapshot().connected.map((d) => d.name)).toEqual(["Pixel", "Tablet"]);
     fromRust({ kind: "remote_connected", devices: [second] });
+    expect(desk.snapshot().sandbox).toBeNull();
     expect(desk.snapshot().connected).toEqual([second]);
     // The warnings and the code go with Escape; who is connected does not.
     act(() => desk.dismiss());
@@ -203,6 +205,7 @@ describe("RemoteEnroll", () => {
     fromRust({ kind: "remote_connected", devices: [{ ...ok, grant: "admin" }] });
     fromRust({ kind: "remote_connected", devices: "none" });
     fromRust({ kind: "remote_connected", devices: [{ ...ok, since: -1 }] });
+    fromRust({ kind: "remote_connected", devices: [], sandbox: 7 });
     warn.mockRestore();
     expect(desk.snapshot().connected).toEqual([ok]);
   });

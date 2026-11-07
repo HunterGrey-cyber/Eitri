@@ -636,6 +636,23 @@ impl RvListener {
     ) -> io::Result<RvListener> {
         bind_with(control_dir, instance, crate::panel_control::peer_uid, serve)
     }
+
+    /// Like [`Self::bind`], with maintenance on the accepting thread at a modest interval, even without a peer.
+    /// File and lock checks belong here rather than on the window's thread.
+    pub fn bind_maintained(
+        control_dir: &Path,
+        instance: &str,
+        serve: impl FnMut(UnixStream) -> bool + Send + 'static,
+        maintenance: impl FnMut() + Send + 'static,
+    ) -> io::Result<RvListener> {
+        bind_maintained(
+            control_dir,
+            instance,
+            crate::panel_control::peer_uid,
+            serve,
+            Some(Box::new(maintenance)),
+        )
+    }
 }
 
 impl Drop for RvListener {
@@ -650,6 +667,19 @@ impl Drop for RvListener {
 type PeerUid = fn(&UnixStream) -> io::Result<u32>;
 
 fn bind_with<S>(control_dir: &Path, instance: &str, peer_uid: PeerUid, serve: S) -> io::Result<RvListener>
+where
+    S: FnMut(UnixStream) -> bool + Send + 'static,
+{
+    bind_maintained(control_dir, instance, peer_uid, serve, None)
+}
+
+fn bind_maintained<S>(
+    control_dir: &Path,
+    instance: &str,
+    peer_uid: PeerUid,
+    serve: S,
+    maintenance: Option<Box<dyn FnMut() + Send>>,
+) -> io::Result<RvListener>
 where
     S: FnMut(UnixStream) -> bool + Send + 'static,
 {
@@ -676,7 +706,7 @@ where
         let thread_stop = Arc::clone(&stop);
         std::thread::Builder::new()
             .name("eitri-remote-accept".into())
-            .spawn(move || accept_loop(&listener, &stop_rx, &thread_stop, peer_uid, serve))?;
+            .spawn(move || accept_loop(&listener, &stop_rx, &thread_stop, peer_uid, serve, maintenance))?;
         Ok((stop_pair, stop))
     })();
     match started {
@@ -701,9 +731,18 @@ fn accept_loop<S: FnMut(UnixStream) -> bool>(
     stop: &AtomicBool,
     peer_uid: PeerUid,
     mut serve: S,
+    mut maintenance: Option<Box<dyn FnMut() + Send>>,
 ) {
     let me = euid();
+    let interval = Duration::from_secs(3);
+    let mut next = Instant::now() + interval;
     while !stop.load(Ordering::Acquire) {
+        if let Some(maintain) = maintenance.as_mut() {
+            if Instant::now() >= next {
+                maintain();
+                next = Instant::now() + interval;
+            }
+        }
         let mut fds = [
             libc::pollfd {
                 fd: listener.as_raw_fd(),
@@ -716,9 +755,14 @@ fn accept_loop<S: FnMut(UnixStream) -> bool>(
                 revents: 0,
             },
         ];
+        let timeout = if maintenance.is_some() {
+            next.saturating_duration_since(Instant::now()).as_millis().max(1) as i32
+        } else {
+            -1
+        };
         // SAFETY: `fds` is a valid array of two initialized `pollfd`s whose descriptors stay open for the call; the
         // length passed is its length.
-        let rc = unsafe { libc::poll(fds.as_mut_ptr(), fds.len() as libc::nfds_t, -1) };
+        let rc = unsafe { libc::poll(fds.as_mut_ptr(), fds.len() as libc::nfds_t, timeout) };
         if rc < 0 {
             if io::Error::last_os_error().kind() != io::ErrorKind::Interrupted {
                 std::thread::sleep(ACCEPT_BACKOFF);

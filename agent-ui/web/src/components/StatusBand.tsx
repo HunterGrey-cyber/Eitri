@@ -1,5 +1,5 @@
 import { useLayoutEffect, useRef, useState } from "react";
-import { bandLayout } from "../band";
+import { bandLayout, phoneTitle } from "../band";
 import type { BandFacts, Seg } from "../band";
 
 type Props = {
@@ -78,7 +78,7 @@ function renderLeftSeg(
     );
   }
   return (
-    <span key={seg.id} className={`band-seg band-${seg.id}`} title={seg.id === "cards" && facts.questions ? `${facts.cards} permissions · ${facts.questions} questions` : undefined}>
+    <span key={seg.id} className={`band-seg band-${seg.id}`} title={seg.id === "phone" ? phoneTitle(facts.remoteSandbox) : seg.id === "cards" && facts.questions ? `${facts.cards} permissions · ${facts.questions} questions` : undefined}>
       {seg.text}
     </span>
   );

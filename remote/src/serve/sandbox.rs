@@ -28,6 +28,8 @@ use landlock::{
 pub enum SandboxState {
     /// Landlock, seccomp and not dumpable.
     Full,
+    /// The kernel enforces only the Landlock rights its older ABI supports, plus seccomp and not dumpable.
+    PartialLandlock,
     /// The kernel has no Landlock: seccomp and not dumpable only.
     NoLandlock,
 }
@@ -37,7 +39,16 @@ impl SandboxState {
     pub fn word(self) -> &'static str {
         match self {
             SandboxState::Full => "full",
-            SandboxState::NoLandlock => "partial",
+            SandboxState::PartialLandlock | SandboxState::NoLandlock => "partial",
+        }
+    }
+
+    /// Why confinement is incomplete, when it is.
+    pub fn missing(self) -> Option<&'static str> {
+        match self {
+            Self::Full => None,
+            Self::PartialLandlock => Some("this kernel lacks some Landlock rights requested by this build"),
+            Self::NoLandlock => Some("this kernel has no Landlock; seccomp and not dumpable only"),
         }
     }
 }
@@ -80,10 +91,15 @@ fn landlock(agents_dir: &Path, control_dir: &Path, store_dir: &Path) -> io::Resu
         .map_err(fail)?
         .restrict_self()
         .map_err(fail)?;
-    Ok(match status.ruleset {
+    Ok(from_ruleset_status(status.ruleset))
+}
+
+fn from_ruleset_status(status: RulesetStatus) -> SandboxState {
+    match status {
         RulesetStatus::NotEnforced => SandboxState::NoLandlock,
-        RulesetStatus::FullyEnforced | RulesetStatus::PartiallyEnforced => SandboxState::Full,
-    })
+        RulesetStatus::FullyEnforced => SandboxState::Full,
+        RulesetStatus::PartiallyEnforced => SandboxState::PartialLandlock,
+    }
 }
 
 fn thread_count() -> io::Result<usize> {
@@ -196,6 +212,20 @@ mod tests {
     fn the_status_words() {
         assert_eq!(SandboxState::Full.word(), "full");
         assert_eq!(SandboxState::NoLandlock.word(), "partial");
+        assert_eq!(SandboxState::PartialLandlock.word(), "partial");
+    }
+
+    #[test]
+    fn only_fully_enforced_landlock_is_full() {
+        for (status, expected) in [
+            (RulesetStatus::NotEnforced, SandboxState::NoLandlock),
+            (RulesetStatus::PartiallyEnforced, SandboxState::PartialLandlock),
+            (RulesetStatus::FullyEnforced, SandboxState::Full),
+        ] {
+            let state = from_ruleset_status(status);
+            assert_eq!(state, expected);
+            assert_eq!(state.missing().is_none(), state == SandboxState::Full);
+        }
     }
 
     #[test]

@@ -1498,6 +1498,7 @@ export default function App() {
   const [remoteDesk] = useState(() => new RemoteDesk());
   // Only the connected list: the questions' own changes do not render the whole panel.
   const connectedPhones = useSyncExternalStore(remoteDesk.subscribe, () => remoteDesk.snapshot().connected);
+  const remoteSandbox = useSyncExternalStore(remoteDesk.subscribe, () => remoteDesk.snapshot().sandbox);
   useEffect(() => {
     installRemoteDesk(remoteDesk.receive);
     return () => installRemoteDesk(null);
@@ -4118,6 +4119,7 @@ export default function App() {
             ending: null,
             // Phones watch other sessions too: the mark does not wait for this tab to start.
             phones: connectedPhones.length,
+            remoteSandbox,
           }}
           paneFocused={paneFocused}
           entryKey={panelEntryKey(keymapHelp.window, editorLink !== null)}
@@ -6467,6 +6469,7 @@ export default function App() {
           following: activeTab?.following,
           // Phones connected to this desk (remote control); the mark stays while there is one.
           phones: connectedPhones.length,
+            remoteSandbox,
           backgroundTasks: sessionEnded ? [] : state.backend === "sidecar" ? state.backgroundTasks.rows : undefined,
         }}
         paneFocused={paneFocused}
