@@ -9,6 +9,15 @@ use super::{chain, rotate, Record};
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::io;
 use std::path::Path;
+use std::time::{Duration, SystemTime};
+
+/// How long before the journal's reading began a record may be dated and still be taken as written while the check
+/// ran, before its journal copy could be read back (see [`verify_from`]).
+pub const WRITTEN_DURING_CHECK: Duration = Duration::from_secs(10);
+
+/// How far past the files' reading a record may be dated: every record read was stamped before it, so this only
+/// allows for the millisecond the time is written in.
+const READ_SLACK: Duration = Duration::from_secs(1);
 
 /// One journal entry of `SYSLOG_IDENTIFIER=eitri-remote`.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -32,6 +41,9 @@ pub struct VerifyReport {
     pub chain_breaks: Vec<(String, u64)>,
     /// Records the journal has that no retained file holds, as the journal has them.
     pub missing_from_file: Vec<String>,
+    /// Records the files hold whose `(writer, run, seq)` none of the journal's records has, as the file has them:
+    /// lines no Eitri writer sent the journal, or whose copy the journal dropped.
+    pub missing_from_journal: Vec<String>,
     /// Records whose `(writer, run, seq)` the file holds with other bytes, as the journal has them.
     pub altered: Vec<String>,
     /// Entries not sent by the Eitri binary, or that are not records.
@@ -41,12 +53,29 @@ pub struct VerifyReport {
     pub forged_senders: BTreeMap<String, usize>,
     /// `("<writer> <run>", seq, next seq)` where a run's journal copies skip numbers: messages the journal dropped.
     pub journal_gaps: Vec<(String, u64, u64)>,
+    /// Not findings: records only the files hold that come before every record the journal holds, while the journal
+    /// holds none of the log's older ones, so the journal may no longer reach back that far (vacuumed, or a journal
+    /// that is not persistent, since a reboot). Not checked against the journal.
+    pub older_than_journal: usize,
+    /// Not findings: records only the files hold dated within [`WRITTEN_DURING_CHECK`] of the check: taken as
+    /// written while it ran (two writers' journal copies may arrive in the other order than their lines, so where in
+    /// the files does not matter). Not checked against the journal.
+    pub written_during_check: usize,
+    /// Not a finding, but nothing was checked: the files hold records and the journal holds none of the log's (a
+    /// journal with no files, one that keeps none of these entries, a volatile one after a reboot before any new
+    /// record, or the check run as another user). Every record is then in `older_than_journal`.
+    pub journal_holds_none: bool,
 }
 
 impl VerifyReport {
-    /// Whether nothing was found.
+    /// Whether nothing was found (the two counts of records not checked are not findings).
     pub fn is_clean(&self) -> bool {
-        *self == VerifyReport::default()
+        VerifyReport {
+            older_than_journal: 0,
+            written_during_check: 0,
+            journal_holds_none: false,
+            ..self.clone()
+        } == VerifyReport::default()
     }
 }
 
@@ -63,9 +92,33 @@ impl VerifyReport {
 ///
 /// What this cannot tell from pruning: whole records deleted from before the anchor, with every line after them
 /// left as it was.
+///
+/// The other way, a record the files hold under a `(writer, run, seq)` none of the journal's records has is
+/// `missing_from_journal`: every writer sends each record to the journal as it writes it, and the journal drops its
+/// oldest entries first, so once it holds one of the files' records (or one older than them) it holds every later
+/// one, unless it dropped a message (a gap) or a send failed. Two kinds are not reported, only counted: records
+/// before the anchor (all of them, with no anchor) while the journal holds no record of the log from before the
+/// anchor that the files no longer hold (none at all, with no anchor), which a journal that no longer reaches back
+/// that far lacks (`older_than_journal`; a record the files still hold that is merely dated before the anchor, a
+/// clock set back, does not count); and records dated from [`WRITTEN_DURING_CHECK`] before `started` to a second
+/// after the files were read, which a writer appended while the check ran (`written_during_check`; anywhere in the
+/// files, since a writer appends its line and only then sends its copy, so another writer's later copy can arrive
+/// first). A record before the anchor cannot have been added later, since the
+/// anchor's `prev` pins every line before it through the chain.
 pub fn verify(dir: &Path, journal: &dyn JournalSource, our_exe: &str) -> io::Result<VerifyReport> {
+    verify_from(dir, journal, our_exe, SystemTime::now())
+}
+
+/// [`verify`], with `started` the time the journal's reading began (a caller that read it already says when).
+pub fn verify_from(
+    dir: &Path,
+    journal: &dyn JournalSource,
+    our_exe: &str,
+    started: SystemTime,
+) -> io::Result<VerifyReport> {
     // The journal first: a record written while this runs is then in the file but not yet in what was read of the
-    // journal, which is not reported, rather than the other way round, which would be.
+    // journal, which is excused at the files' end within a bounded window, rather than the other way round, which
+    // would be reported as missing from the file.
     let entries = journal.entries()?;
     let mut report = VerifyReport::default();
 
@@ -87,6 +140,7 @@ pub fn verify(dir: &Path, journal: &dyn JournalSource, our_exe: &str) -> io::Res
             retained.extend(record);
         }
     }
+    let read_at = SystemTime::now().max(started);
     // Every line the files hold under each key: a key held twice with different bytes is an edit too.
     let mut held: HashMap<Key<'_>, Vec<&str>> = HashMap::new();
     for record in &retained {
@@ -113,7 +167,8 @@ pub fn verify(dir: &Path, journal: &dyn JournalSource, our_exe: &str) -> io::Res
 
     // What may have been pruned, from the anchor.
     let mut before_anchor: HashSet<&str> = HashSet::new();
-    if let Some(anchor) = retained.iter().find(|r| in_journal.contains(r.line.as_str())) {
+    let anchor_at = retained.iter().position(|r| in_journal.contains(r.line.as_str()));
+    if let Some(anchor) = anchor_at.map(|i| &retained[i]) {
         let by_hash: HashMap<String, &Record> = ours.iter().map(|r| (chain::line_hash(r.line.as_bytes()), r)).collect();
         let mut at = anchor.prev.clone();
         while let Some(record) = by_hash.get(&at) {
@@ -150,6 +205,36 @@ pub fn verify(dir: &Path, journal: &dyn JournalSource, our_exe: &str) -> io::Res
             Some(_) => {}
         }
     }
+
+    // The files' records the journal has no copy of under their key.
+    let journal_keys: HashSet<Key<'_>> = ours.iter().map(key).collect();
+    // The journal reaches back past the anchor only through a record of the log the files no longer hold: one the
+    // files still hold that is merely dated before the anchor (a clock set back) says nothing about what was
+    // vacuumed.
+    let journal_reaches_back = match anchor_at {
+        Some(_) => ours.iter().any(pruned),
+        None => !ours.is_empty(),
+    };
+    let just_written = |record: &Record| {
+        record.at().is_some_and(|at| {
+            at >= started.checked_sub(WRITTEN_DURING_CHECK).unwrap_or(started)
+                && at <= read_at.checked_add(READ_SLACK).unwrap_or(read_at)
+        })
+    };
+    for (i, record) in retained.iter().enumerate() {
+        if journal_keys.contains(&key(record)) {
+            continue;
+        }
+        if anchor_at.is_none_or(|anchor| i < anchor) && !journal_reaches_back {
+            report.older_than_journal += 1;
+        } else if just_written(record) {
+            report.written_during_check += 1;
+        } else {
+            report.missing_from_journal.push(record.line.clone());
+        }
+    }
+
+    report.journal_holds_none = ours.is_empty() && !retained.is_empty();
 
     for ((writer, run), seqs) in seqs {
         let seqs: Vec<(u64, bool)> = seqs.into_iter().collect();
@@ -353,7 +438,169 @@ mod tests {
             report.missing_from_file.is_empty() && report.altered.is_empty(),
             "{report:?}"
         );
+        // The record the journal dropped is still in the files, which say so too.
+        assert_eq!(report.missing_from_journal, vec![retained[2].clone()], "{report:?}");
         assert!(report.chain_breaks.is_empty(), "{report:?}");
+    }
+
+    /// `template` as a record of `seq` chained after `after`: what a same-uid process appends to the file.
+    fn forged_after(template: &str, seq: u64, after: &str) -> String {
+        let have_seq = object(template)["seq"].as_u64().unwrap();
+        let have_prev = object(template)["prev"].as_str().unwrap().to_string();
+        let line = template
+            .replace(&format!(r#""seq":{have_seq},"#), &format!(r#""seq":{seq},"#))
+            .replace(
+                &format!(r#""prev":"{have_prev}""#),
+                &format!(r#""prev":"{}""#, hash_of(after)),
+            )
+            .replace(r#""device":"d1""#, r#""device":"d9""#);
+        assert_ne!(line, template);
+        line
+    }
+
+    /// `n` records on a fake clock one second apart from `from_ms`, and their journal entries.
+    fn written_at(dir: &Path, n: u64, from_ms: u64) -> Vec<JournalEntry> {
+        let journal = FakeJournal::bind();
+        let clock = FakeClock::at_ms(from_ms);
+        let mut log = open_at(dir, WriterKind::Serve, None, journal.target(), &clock);
+        (0..n)
+            .map(|i| {
+                clock.set_ms(from_ms + i * 1000);
+                log.record(cmd("d1", i)).unwrap();
+                journal.next_entry(EXE)
+            })
+            .collect()
+    }
+
+    fn ms(at_ms: u64) -> SystemTime {
+        std::time::UNIX_EPOCH + Duration::from_millis(at_ms)
+    }
+
+    #[test]
+    fn a_record_appended_after_disable_is_missing_from_the_journal() {
+        let dir = audit_dir_for("audit-verify-forged-tail");
+        let journal = FakeJournal::bind();
+        let clock = FakeClock::at_ms(days_ms(20_000));
+        let mut log = open_at(&dir, WriterKind::Serve, None, journal.target(), &clock);
+        let mut entries = Vec::new();
+        for n in 0..3 {
+            log.record(cmd("d1", n)).unwrap();
+            entries.push(journal.next_entry(EXE));
+        }
+        log.record(Event::Disable { why: "stopped".into() }).unwrap();
+        entries.push(journal.next_entry(EXE));
+        drop(log);
+        let original = lines(&dir);
+        // A command no phone sent, with the next free number of the run that ended and its `prev` the `disable`, so
+        // the chain holds and no key the journal has is reused; and one of a run that never was.
+        let forged = forged_after(&original[1], 5, &original[3]);
+        let other_run = object(&original[1])["run"].as_str().unwrap().to_string();
+        let second = forged_after(&original[1], 1, &forged).replace(&other_run, "0123456789abcdef");
+        std::fs::write(
+            dir.join(CURRENT),
+            [&original[..], &[forged.clone(), second.clone()]].concat().join("\n") + "\n",
+        )
+        .unwrap();
+        let report = verify(&dir, &Entries(entries), EXE).unwrap();
+        assert!(report.chain_breaks.is_empty(), "{report:?}");
+        assert_eq!(report.missing_from_journal, vec![forged, second], "{report:?}");
+        assert!(
+            report.missing_from_file.is_empty() && report.altered.is_empty() && report.journal_gaps.is_empty(),
+            "{report:?}"
+        );
+        assert!(!report.is_clean());
+    }
+
+    #[test]
+    fn records_written_during_the_check_are_counted_not_reported() {
+        let dir = audit_dir_for("audit-verify-during");
+        let from = days_ms(20_000);
+        let entries = written_at(&dir, 6, from);
+        let original = lines(&dir);
+        // The journal's reading began as the fifth record was written: the last two are not in it yet.
+        let read = entries[..4].to_vec();
+        let report = verify_from(&dir, &Entries(read.clone()), EXE, ms(from + 4000)).unwrap();
+        assert_eq!(report.written_during_check, 2, "{report:?}");
+        assert!(report.is_clean(), "{report:?}");
+        // Dated outside the window, they are not taken as written during the check.
+        let late = from + 5000 + WRITTEN_DURING_CHECK.as_millis() as u64 + 1;
+        let report = verify_from(&dir, &Entries(read.clone()), EXE, ms(late)).unwrap();
+        assert_eq!(report.missing_from_journal, original[4..].to_vec(), "{report:?}");
+        assert_eq!(report.written_during_check, 0);
+        // In the middle too, since another writer's later copy can reach the journal first, but only in the window.
+        let mut middle = entries.clone();
+        middle.remove(3);
+        let report = verify_from(&dir, &Entries(middle.clone()), EXE, ms(from + 3000)).unwrap();
+        assert_eq!(report.written_during_check, 1, "{report:?}");
+        assert!(report.missing_from_journal.is_empty(), "{report:?}");
+        let report = verify_from(&dir, &Entries(middle), EXE, ms(late - 1000)).unwrap();
+        assert_eq!(report.missing_from_journal, vec![original[3].clone()], "{report:?}");
+        assert_eq!(report.written_during_check, 0);
+        // Nor dated past the end of the check.
+        let time = object(&original[5])["time"].as_str().unwrap().to_string();
+        let future = forged_after(&original[5], 7, &original[5]).replace(&time, "2099-01-01T00:00:00.000Z");
+        std::fs::write(
+            dir.join(CURRENT),
+            [&original[..], &[future.clone()]].concat().join("\n") + "\n",
+        )
+        .unwrap();
+        let report = verify_from(&dir, &Entries(entries), EXE, SystemTime::now()).unwrap();
+        assert_eq!(report.missing_from_journal, vec![future], "{report:?}");
+        assert_eq!(report.written_during_check, 0);
+    }
+
+    #[test]
+    fn a_clock_set_back_does_not_make_the_journal_reach_back() {
+        let dir = audit_dir_for("audit-verify-clock-back");
+        let journal = FakeJournal::bind();
+        let clock = FakeClock::at_ms(days_ms(20_000));
+        let mut log = open_at(&dir, WriterKind::Serve, None, journal.target(), &clock);
+        let mut entries = Vec::new();
+        // Dated 10, 20, then 15 seconds in: the clock went back before the third.
+        for (n, s) in [10u64, 20, 15].into_iter().enumerate() {
+            clock.set_ms(days_ms(20_000) + s * 1000);
+            log.record(cmd("d1", n as u64)).unwrap();
+            entries.push(journal.next_entry(EXE));
+        }
+        // The journal was vacuumed past the first; the third, still in the files, is dated before the anchor.
+        let report = verify(&dir, &Entries(entries[1..].to_vec()), EXE).unwrap();
+        assert_eq!(report.older_than_journal, 1, "{report:?}");
+        assert!(report.is_clean(), "{report:?}");
+    }
+
+    #[test]
+    fn records_older_than_the_journal_are_counted_unless_it_reaches_back() {
+        let dir = audit_dir_for("audit-verify-older");
+        let entries = written_at(&dir, 5, days_ms(20_000));
+        // The journal was vacuumed past the first two (or is not persistent and the machine rebooted).
+        let report = verify(&dir, &Entries(entries[2..].to_vec()), EXE).unwrap();
+        assert_eq!(report.older_than_journal, 2, "{report:?}");
+        assert!(report.is_clean(), "{report:?}");
+        assert!(!report.journal_holds_none);
+        // A journal that holds none of them: all five counted, and the report says nothing was checked.
+        let report = verify(&dir, &Entries(Vec::new()), EXE).unwrap();
+        assert_eq!(report.older_than_journal, 5, "{report:?}");
+        assert!(report.journal_holds_none, "{report:?}");
+
+        // With older records pruned from the files that the journal still holds, it reaches back past the files'
+        // first records, so those it lacks are named.
+        let dir = audit_dir_for("audit-verify-older-pruned");
+        let journal = FakeJournal::bind();
+        let clock = FakeClock::at_ms(days_ms(20_000));
+        let mut log = open_at(&dir, WriterKind::Serve, None, journal.target(), &clock);
+        log.rotate_bytes = 1;
+        let mut entries = Vec::new();
+        for n in 0..20 {
+            clock.set_ms(days_ms(20_000) + n * 1000);
+            log.record(cmd("d1", n)).unwrap();
+            entries.push(journal.next_entry(EXE));
+        }
+        let retained = lines(&dir);
+        assert_eq!(object(&retained[0])["seq"], 16, "the oldest records were dropped");
+        entries.drain(15..17);
+        let report = verify(&dir, &Entries(entries), EXE).unwrap();
+        assert_eq!(report.missing_from_journal, retained[..2].to_vec(), "{report:?}");
+        assert_eq!(report.older_than_journal, 0, "{report:?}");
     }
 
     #[test]

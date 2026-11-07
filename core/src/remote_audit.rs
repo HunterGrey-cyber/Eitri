@@ -47,7 +47,7 @@ mod rotate;
 mod verify;
 
 pub use read::{newest_by_device, read, Filter, Record};
-pub use verify::{verify, JournalEntry, JournalSource, VerifyReport};
+pub use verify::{verify, verify_from, JournalEntry, JournalSource, VerifyReport, WRITTEN_DURING_CHECK};
 
 /// The record format this build writes.
 pub const AUDIT_V: u32 = 1;

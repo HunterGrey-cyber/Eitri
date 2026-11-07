@@ -36,6 +36,7 @@ use eitri_core::tabs::TabId;
 use eitri_core::test_providers::RecordingProvider;
 use eitri_panel::agent_panel::{AgentPanelHandle, Pairing, RemoteSocket, ViewId};
 use eitri_panel::panel_page::PageSurface;
+use eitri_remote::audit_cli::{JOURNALCTL_VAR, VERIFY_JOURNAL_UNREAD};
 use eitri_remote::serve::spawn::{plan, ServeSpawner};
 use eitri_remote::serve::Dirs;
 use serde_json::{json, Value};
@@ -136,7 +137,7 @@ impl Home {
     }
 
     /// Sends every record of every process of this home to `socket`, and makes the `journalctl` the CLI runs the stub
-    /// in `bin`.
+    /// in `bin` (a test build runs no other: `JOURNALCTL_VAR`).
     fn with_journal(mut self, socket: &Path, bin: &Path) -> Home {
         self.journal = Some((socket.to_owned(), bin.to_owned()));
         self
@@ -164,10 +165,7 @@ impl Home {
         ];
         if let Some((socket, bin)) = &self.journal {
             env.push((JOURNAL_SOCKET_VAR, socket.clone().into()));
-            let mut path = OsString::from(bin);
-            path.push(":");
-            path.push(std::env::var_os("PATH").unwrap_or_default());
-            env.push(("PATH", path));
+            env.push((JOURNALCTL_VAR, bin.join("journalctl").into()));
         }
         env
     }
@@ -1784,8 +1782,38 @@ fn the_audit_trail_end_to_end(shell: &str, dir: &Path) -> Result<(), String> {
         || format!("verify of a forged entry: {}", found.says()),
     )?;
 
-    // Put back, it is clean again.
+    // A record appended to the file that no writer sent the journal, chained to the last line and dated well before
+    // the check, under a seq the run never reached.
     write_entries(dir, &exe, &journal.records(), &[])?;
+    let last = *all_lines.last().ok_or("the log is empty")?;
+    let fields: Value = serde_json::from_str(last).map_err(|e| e.to_string())?;
+    let (time, seq, prev) = (
+        fields["time"].as_str().unwrap_or_default(),
+        fields["seq"].as_u64().unwrap_or_default(),
+        fields["prev"].as_str().unwrap_or_default(),
+    );
+    let appended = last
+        .replacen(time, "2020-01-01T00:00:00.000Z", 1)
+        .replacen(&format!("\"seq\":{seq},"), &format!("\"seq\":{},", seq + 1000), 1)
+        .replacen(prev, &eitri_core::remote_audit::text_digest(last).sha256, 1);
+    std::fs::write(&file, format!("{original}{appended}\n")).map_err(|e| e.to_string())?;
+    let found = verify(&home)?;
+    check(
+        found.code == Some(1) && says(&found, "not in the journal: ") == [appended.clone()],
+        || format!("verify of a record only the file holds: {}", found.says()),
+    )?;
+    std::fs::write(&file, &original).map_err(|e| e.to_string())?;
+
+    // No journal to read: not clean, and its own exit.
+    let mut unread = home.remote(shell, &["log", "--verify"]);
+    unread.env(JOURNALCTL_VAR, dir.join("no-such-journalctl"));
+    let found = run(unread)?;
+    check(
+        found.code == Some(VERIFY_JOURNAL_UNREAD) && found.stdout.starts_with("not verified: "),
+        || format!("verify without a journal: {}", found.says()),
+    )?;
+
+    // Put back, it is clean again.
     let clean = verify(&home)?;
     check(clean.code == Some(0) && clean.stdout.trim() == "clean", || {
         format!("verify after the log was put back: {}", clean.says())

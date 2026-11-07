@@ -5,22 +5,37 @@
 //! rest as `key=value`; every string from the record goes through `cli::shown`, since names, `Host`, `Origin` and
 //! peers came from the network. `--json` prints the stored lines as they are.
 //!
-//! `eitri remote log --verify` checks the chain of the retained files and compares them with the journal's copy
-//! (`journalctl`, run here and never by `serve`; entries count as the log's only when the journal's `_EXE` is this
-//! binary): exit 0 when nothing is found, 1 when something is, 2 on bad arguments. Without a journal it says so and
-//! checks the chain only.
+//! `eitri remote log --verify` checks the chain of the retained files and compares them with the journal's copy both
+//! ways (`journalctl` by its absolute path, [`JOURNALCTL_PATHS`], run here and never by `serve`; entries count as the
+//! log's only when the journal's `_EXE` is this binary): exit 0 when nothing is found, 1 when something is, 2 on bad
+//! arguments, 3 when the journal could not be read and the chain alone showed nothing, which is no proof the log is
+//! whole.
 
 use std::io::{self, Write};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-use eitri_core::remote_audit::{read, verify, Filter, JournalEntry, JournalSource, Record, AUDIT_ROTATED_FILES};
+use eitri_core::remote_audit::{
+    read, verify_from, Filter, JournalEntry, JournalSource, Record, AUDIT_ROTATED_FILES, WRITTEN_DURING_CHECK,
+};
 use serde_json::Value;
 
 use crate::cli::shown;
 
 const USAGE: &str = "usage: eitri remote log [--since 24h|7d|<RFC 3339>] [--device NAME] [--event KIND] [--json]
-       eitri remote log --verify";
+       eitri remote log --verify    (exit 0 clean, 1 something found, 3 the journal could not be read)";
+
+/// `--verify`'s exit when the journal could not be read and the chain alone showed nothing.
+pub const VERIFY_JOURNAL_UNREAD: i32 = 3;
+
+/// Where `journalctl` is looked for, first found wins: the merged-`/usr` path, the old `/bin` one, and NixOS's system
+/// profile. Never through `PATH`, which a same-uid process (or the caller's shell) can point at a `journalctl` that
+/// prints whatever matches the files.
+pub const JOURNALCTL_PATHS: &[&str] = &[
+    "/usr/bin/journalctl",
+    "/bin/journalctl",
+    "/run/current-system/sw/bin/journalctl",
+];
 
 /// The feature that holds the test-only overrides; never enabled by a shipped build.
 #[cfg(test)]
@@ -42,7 +57,7 @@ pub fn log(args: &[String]) -> i32 {
         .map(|p| p.to_string_lossy().into_owned())
         .unwrap_or_default();
     let (mut out, mut err) = (io::stdout().lock(), io::stderr().lock());
-    log_at(&dir, args, &Journalctl, &our_exe, &mut out, &mut err)
+    log_at(&dir, args, &Journalctl::find(), &our_exe, &mut out, &mut err)
 }
 
 /// What the arguments ask for.
@@ -172,18 +187,20 @@ fn verify_at(dir: &Path, journal: &dyn JournalSource, our_exe: &str, out: &mut d
             shown(&dir.display().to_string())
         );
     }
-    // The journal is read once (each reading runs `journalctl` twice) and its entries handed to `verify`.
-    let entries = match journal.entries() {
-        Ok(entries) => entries,
+    // The journal is read once (each reading runs `journalctl` twice) and its entries handed to `verify`, with the
+    // time the reading began, from which a record at the files' end counts as written during the check.
+    let started = SystemTime::now();
+    let (entries, unread) = match journal.entries() {
+        Ok(entries) => (entries, None),
         Err(e) => {
             let _ = writeln!(
                 err,
                 "eitri remote log: the journal could not be read ({e}); checking the chain only"
             );
-            Vec::new()
+            (Vec::new(), Some(e))
         }
     };
-    let report = verify(dir, &Fetched(entries), our_exe);
+    let report = verify_from(dir, &Fetched(entries), our_exe, started);
     let report = match report {
         Ok(report) => report,
         Err(e) => {
@@ -200,6 +217,12 @@ fn verify_at(dir: &Path, journal: &dyn JournalSource, our_exe: &str, out: &mut d
     }
     for line in &report.altered {
         lines.push(format!("altered in the file: {}", shown(line)));
+    }
+    // With no journal read every record is only the files', which says nothing.
+    if unread.is_none() {
+        for line in &report.missing_from_journal {
+            lines.push(format!("not in the journal: {}", shown(line)));
+        }
     }
     if report.forged > 0 {
         lines.push(format!(
@@ -228,7 +251,41 @@ fn verify_at(dir: &Path, journal: &dyn JournalSource, our_exe: &str, out: &mut d
         ));
     }
     if lines.is_empty() {
+        if let Some(e) = unread {
+            let _ = writeln!(
+                out,
+                "not verified: the chain holds, but the journal could not be read ({}), so a record deleted, added or \
+                 rewritten with every later line is not seen",
+                shown(&e.to_string())
+            );
+            return VERIFY_JOURNAL_UNREAD;
+        }
+        if report.journal_holds_none {
+            let _ = writeln!(
+                out,
+                "not verified: the chain holds, but the journal holds none of the log's {} records (no journal files, \
+                 none kept, a volatile journal since a reboot, or another user), so none was checked against it",
+                report.older_than_journal
+            );
+            return VERIFY_JOURNAL_UNREAD;
+        }
         let _ = writeln!(out, "clean");
+        if report.older_than_journal > 0 {
+            let _ = writeln!(
+                out,
+                "  not checked: {} oldest records, older than anything of the log's the journal still holds",
+                report.older_than_journal
+            );
+        }
+        if report.written_during_check > 0 {
+            let _ = writeln!(
+                out,
+                "  not checked: {} records written during the check (within {} s) and not in the journal yet; \
+                 run it again",
+                report.written_during_check,
+                WRITTEN_DURING_CHECK.as_secs()
+            );
+        }
         return 0;
     }
     for line in lines {
@@ -249,15 +306,51 @@ impl JournalSource for Fetched {
     }
 }
 
-/// The journal's `eitri-remote` entries through `journalctl`: the user's journal, then the system journal's entries
-/// of this uid. `Err` when neither could be read.
-pub struct Journalctl;
+/// The journal's `eitri-remote` entries through `journalctl`, found once ([`Journalctl::find`]): the user's journal,
+/// then the system journal's entries of this uid. `Err` when there is no `journalctl` or neither could be read.
+pub struct Journalctl(Option<PathBuf>);
+
+/// The variable a `remote-test-hooks` build reads for the `journalctl` to run instead of [`JOURNALCTL_PATHS`]; with it
+/// unset or empty such a build finds none, so no test reads the machine's journal. A release build never reads it.
+pub const JOURNALCTL_VAR: &str = "EITRI_REMOTE_TEST_JOURNALCTL";
+
+impl Journalctl {
+    /// The first of [`JOURNALCTL_PATHS`] that is a file (in a `remote-test-hooks` build, [`JOURNALCTL_VAR`] alone).
+    pub fn find() -> Journalctl {
+        Journalctl(journalctl_path_with(
+            |name| std::env::var_os(name),
+            |path| path.metadata().is_ok_and(|m| m.is_file()),
+        ))
+    }
+}
+
+fn journalctl_path_with(
+    env: impl Fn(&str) -> Option<std::ffi::OsString>,
+    is_file: impl Fn(&Path) -> bool,
+) -> Option<PathBuf> {
+    #[cfg(feature = "remote-test-hooks")]
+    {
+        let _ = is_file;
+        env(JOURNALCTL_VAR).filter(|v| !v.is_empty()).map(PathBuf::from)
+    }
+    #[cfg(not(feature = "remote-test-hooks"))]
+    {
+        let _ = env;
+        JOURNALCTL_PATHS.iter().map(PathBuf::from).find(|path| is_file(path))
+    }
+}
 
 impl JournalSource for Journalctl {
     fn entries(&self) -> io::Result<Vec<JournalEntry>> {
+        let Some(bin) = &self.0 else {
+            return Err(io::Error::new(
+                io::ErrorKind::NotFound,
+                format!("no journalctl at {}", JOURNALCTL_PATHS.join(", ")),
+            ));
+        };
         let uid = agent::private_fs::euid().to_string();
-        let user = journalctl(&["--user", "SYSLOG_IDENTIFIER=eitri-remote"]);
-        let system = journalctl(&[&format!("_UID={uid}"), "SYSLOG_IDENTIFIER=eitri-remote"]);
+        let user = journalctl(bin, &["--user", "SYSLOG_IDENTIFIER=eitri-remote"]);
+        let system = journalctl(bin, &[&format!("_UID={uid}"), "SYSLOG_IDENTIFIER=eitri-remote"]);
         let (mut entries, mut failed) = (Vec::new(), Vec::new());
         for result in [user, system] {
             match result {
@@ -275,9 +368,9 @@ impl JournalSource for Journalctl {
     }
 }
 
-/// One `journalctl -o json` reading with `matches`.
-fn journalctl(matches: &[&str]) -> io::Result<Vec<JournalEntry>> {
-    let output = std::process::Command::new("journalctl")
+/// One `<bin> -o json` reading with `matches`.
+fn journalctl(bin: &Path, matches: &[&str]) -> io::Result<Vec<JournalEntry>> {
+    let output = std::process::Command::new(bin)
         .args(["--no-pager", "--all", "-o", "json"])
         .args(matches)
         .stdin(std::process::Stdio::null())
@@ -761,10 +854,14 @@ mod tests {
         assert_eq!(code, 0, "{out}{err}");
         assert!(out.contains("clean"), "{out}");
 
-        // Without a journal it says so and checks the chain alone.
+        // Without a journal it says so, checks the chain alone, and does not call that clean.
         let (code, out, err) = run(&dir, &["--verify"], &NoJournal);
-        assert_eq!(code, 0, "{out}{err}");
-        assert!(format!("{out}{err}").contains("chain only"), "{out}{err}");
+        assert_eq!(code, VERIFY_JOURNAL_UNREAD, "{out}{err}");
+        assert!(err.contains("chain only"), "{err}");
+        assert!(out.starts_with("not verified: ") && !out.contains("clean"), "{out}");
+        // And with no file either: nothing proves the log was never there.
+        let empty = scratch("verify-no-journal-no-log");
+        assert_eq!(run(&empty, &["--verify"], &NoJournal).0, VERIFY_JOURNAL_UNREAD);
 
         // An edit in the middle of the file.
         let path = dir.join("audit.jsonl");
@@ -819,6 +916,104 @@ mod tests {
     }
 
     #[test]
+    fn verify_names_a_record_only_the_file_holds() {
+        let dir = scratch("verify-file-only");
+        let mut log = open(&dir);
+        for n in 0..3 {
+            log.record(conn_open(&format!("d{n}"), "phone")).unwrap();
+        }
+        drop(log);
+        let journal = Copy::of(&dir, OUR_EXE);
+        // A record appended after the journal's last one, chained to it and dated an hour back: no writer sent it.
+        let path = dir.join("audit.jsonl");
+        let text = std::fs::read_to_string(&path).unwrap();
+        let last = text.lines().last().unwrap().to_owned();
+        let record = eitri_core::remote_audit::read(&dir, &Default::default(), Some(1))
+            .unwrap()
+            .remove(0);
+        let hour_ago = {
+            let at = SystemTime::now() - Duration::from_secs(3600);
+            let secs = at.duration_since(UNIX_EPOCH).unwrap().as_secs() as i64;
+            let (days, rest) = (secs.div_euclid(86_400), secs.rem_euclid(86_400));
+            let (y, m, d) = civil_from_days(days);
+            format!(
+                "{y:04}-{m:02}-{d:02}T{:02}:{:02}:{:02}.000Z",
+                rest / 3600,
+                rest % 3600 / 60,
+                rest % 60
+            )
+        };
+        let forged = last
+            .replacen(&record.time, &hour_ago, 1)
+            .replacen(&format!("\"seq\":{},", record.seq), "\"seq\":9,", 1)
+            .replacen(&record.prev, &sha256_hex(last.as_bytes()), 1);
+        std::fs::write(&path, format!("{text}{forged}\n")).unwrap();
+        let (code, out, _) = run(&dir, &["--verify"], &journal);
+        assert_eq!(code, 1, "{out}");
+        assert_eq!(out.trim(), format!("not in the journal: {}", shown(&forged)), "{out}");
+        std::fs::remove_dir_all(dir.parent().unwrap()).unwrap();
+    }
+
+    /// `(year, month, day)` of a day count from 1970-01-01.
+    fn civil_from_days(z: i64) -> (i64, i64, i64) {
+        let z = z + 719_468;
+        let era = z.div_euclid(146_097);
+        let doe = z - era * 146_097;
+        let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365;
+        let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+        let mp = (5 * doy + 2) / 153;
+        let d = doy - (153 * mp + 2) / 5 + 1;
+        let m = if mp < 10 { mp + 3 } else { mp - 9 };
+        (yoe + era * 400 + i64::from(m <= 2), m, d)
+    }
+
+    /// A line's hash as the chain has it (the hex SHA-256 of its bytes).
+    fn sha256_hex(bytes: &[u8]) -> String {
+        eitri_core::remote_audit::text_digest(std::str::from_utf8(bytes).unwrap()).sha256
+    }
+
+    #[test]
+    fn journalctl_is_run_by_its_absolute_path_only() {
+        let env_with = |value: &'static str| move |name: &str| (name == JOURNALCTL_VAR).then(|| value.into());
+        #[cfg(not(feature = "remote-test-hooks"))]
+        {
+            // The first listed path that is a file; never a name for `PATH` to find, and never the variable.
+            let never_read = |_: &str| -> Option<std::ffi::OsString> { panic!("a release build read the variable") };
+            let found = journalctl_path_with(never_read, |p| p == Path::new("/bin/journalctl"));
+            assert_eq!(found, Some(PathBuf::from("/bin/journalctl")));
+            assert_eq!(journalctl_path_with(env_with("/tmp/fake"), |_| false), None);
+            assert!(JOURNALCTL_PATHS.iter().all(|p| p.starts_with('/')));
+        }
+        #[cfg(feature = "remote-test-hooks")]
+        {
+            // A test build runs only the variable's, and none without it, whatever the machine has.
+            assert_eq!(
+                journalctl_path_with(env_with("/tmp/fake"), |_| true),
+                Some(PathBuf::from("/tmp/fake"))
+            );
+            assert_eq!(journalctl_path_with(env_with(""), |_| true), None);
+        }
+        // With none found, the reading fails, so `--verify` cannot call the log clean.
+        assert!(Journalctl(None).entries().is_err());
+    }
+
+    #[test]
+    fn a_journal_holding_none_of_the_records_is_not_verified() {
+        let dir = scratch("verify-journal-empty");
+        let mut log = open(&dir);
+        log.record(conn_open("d1", "phone")).unwrap();
+        drop(log);
+        let (code, out, _) = run(&dir, &["--verify"], &Copy(Vec::new()));
+        assert_eq!(code, VERIFY_JOURNAL_UNREAD, "{out}");
+        assert!(out.starts_with("not verified: ") && !out.contains("clean"), "{out}");
+        // With no file either, the two agree there is nothing: clean.
+        let empty = scratch("verify-journal-empty-no-log");
+        let (code, out, _) = run(&empty, &["--verify"], &Copy(Vec::new()));
+        assert_eq!((code, out.trim()), (0, "clean"));
+        std::fs::remove_dir_all(dir.parent().unwrap()).unwrap();
+    }
+
+    #[test]
     fn verify_reads_the_journal_once() {
         struct Counted(Copy, std::cell::Cell<u32>);
         impl JournalSource for Counted {
@@ -842,7 +1037,8 @@ mod tests {
         assert_eq!(code, 0, "{err}");
         assert!(out.is_empty(), "{out}");
         assert!(err.contains("no remote audit log"), "{err}");
-        assert_eq!(run(&dir, &["--verify"], &NoJournal).0, 0);
+        // `--verify` with no journal either cannot tell a log never written from one deleted whole.
+        assert_eq!(run(&dir, &["--verify"], &NoJournal).0, VERIFY_JOURNAL_UNREAD);
         std::fs::remove_dir_all(dir.parent().unwrap()).unwrap();
     }
 

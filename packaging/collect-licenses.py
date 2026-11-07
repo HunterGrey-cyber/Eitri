@@ -604,10 +604,19 @@ GCC_RUNTIME_C_FILES = {"crtstuff.c"}
 GCC_RUNTIME_TITLE = "GCC runtime startup code (crtstuff.c)"
 
 
-def classify_c_file(f, lua_files, ring_files=frozenset()):
+def classify_c_file(f, lua_files, ring_files=frozenset(), symbols=frozenset(), ring_prefix=None):
     """The component a C source file (an STT_FILE name) belongs to, or None when this script has no
     licence text for it -- which fails the run (native_components()). `lua_files` and `ring_files`
-    are the C file names of the lua-src and ring crates' own source trees."""
+    are the C file names of the lua-src and ring crates' own source trees; `symbols` are the local
+    symbols the binary keeps under this FILE entry, and `ring_prefix` the prefix ring's build gives
+    every symbol it compiles (its `links` key).
+
+    An STT_FILE entry is the source's base name only (the compiler drops the directory) and a release
+    binary carries no DWARF, so the name cannot say which tree a file came from: a `mem.c` or
+    `crypto.c` of any other C library would pass as ring's by name alone. ring's file is told by what
+    its build did to it: every symbol ring compiles is named `<links>...` (ring_core_0_17_14_...),
+    hidden, so the link keeps it as a local under the file's own FILE entry. A file of ring's tree
+    whose kept code has no such symbol is not accepted as ring's."""
     if f in lua_files:
         return "Lua"
     if f in _FREETYPE_MODULES or re.match(r"^ft\w*\.c$", f):
@@ -620,16 +629,29 @@ def classify_c_file(f, lua_files, ring_files=frozenset()):
         return "Chromium zlib"
     if f in GCC_RUNTIME_C_FILES:
         return "GCC runtime"
-    if f in ring_files:
+    if f in ring_files and ring_prefix and any(s.startswith(ring_prefix) for s in symbols):
         return "ring"
     return None
+
+
+def ring_symbol_prefix(pkg):
+    """The prefix ring's build script gives every symbol of the C and assembly it compiles: the
+    crate's `links` key (`ring_core_<version with underscores>_`), from cargo metadata. Anything else
+    fails the run, since classify_c_file() would then accept no ring file at all or too many."""
+    links = pkg.get("links") or ""
+    want = "ring_core_" + pkg["version"].replace(".", "_").replace("-", "_") + "_"
+    if links != want:
+        raise Fail(f"ring {pkg['version']}'s links key is {links!r}, not {want!r}: its symbol prefix "
+                   "is what tells ring's C files from other files of the same name; re-check build.rs")
+    return links
 
 
 def ring_c_files(by_nv):
     """The ring crate's package (from cargo metadata) and the names of every C file its source tree
     holds, or (None, empty set) when the tree has no ring. ring's build script compiles its bundled C
     (BoringSSL-derived field arithmetic, AES, curve25519) and assembly into the binary with `cc`; the
-    crate's own licence files cover that code, so it is the crate's component, not a library of its own."""
+    crate's own licence files cover that code, so it is the crate's component, not a library of its own.
+    A name from this set is ring's only with ring's symbol prefix as well (classify_c_file())."""
     pkgs = [p for (n, _), ps in by_nv.items() if n == "ring" for p in ps]
     if not pkgs:
         return None, set()
@@ -661,27 +683,38 @@ def gcc_runtime_component(bins):
             "files": [("COPYING.RUNTIME", read_text(os.path.join(TEXTS, "gcc-COPYING.RUNTIME")))]}
 
 
-def c_files_with_code(path):
-    """Names of the C source files (STT_FILE entries ending in .c) that still own at least one
-    local symbol in a real section after --gc-sections.
+def c_file_entries_with_code(path):
+    """Each STT_FILE entry ending in .c that still owns at least one local symbol in a real section
+    after --gc-sections, as (name, frozenset of those symbols' names), in symbol-table order; two
+    entries of the same name (two libraries' `mem.c`) stay two entries.
 
     A FILE entry alone is not evidence: the prebuilt Skia archive leaves FILE entries for whole
     libraries whose code the linker then discarded (on 2026-09-19 `shell` carried FILE entries for
     HarfBuzz, ICU, libjpeg-turbo, expat and Wuffs, and not one symbol or runtime string of any of
     them). A C file that kept a local symbol did link code in."""
-    out = run(["readelf", "-sW", path], REPO)
-    cur, found = None, set()
-    for l in out.splitlines():
+    return parse_c_file_entries(run(["readelf", "-sW", path], REPO))
+
+
+def parse_c_file_entries(readelf_out):
+    """c_file_entries_with_code() on `readelf -sW` output."""
+    entries, cur, syms = [], None, None
+
+    def close():
+        if cur and cur.endswith(".c") and syms:
+            entries.append((cur, frozenset(syms)))
+
+    for l in readelf_out.splitlines():
         p = l.split()
         if len(p) < 8:
             continue
         if p[3] == "FILE":
-            cur = p[7]
+            close()
+            cur, syms = p[7], set()
             continue
         if cur and p[4] == "LOCAL" and p[6] not in ("ABS", "UND") and p[7] not in LINKER_LOCALS:
-            if cur.endswith(".c"):
-                found.add(cur)
-    return found
+            syms.add(p[7])
+    close()
+    return entries
 
 
 def font_copyright(path):
@@ -767,12 +800,15 @@ def native_components(by_nv, shipped, binaries_dir, skia_license_dir=None):
     for d in glob.glob(os.path.join(pkg_dir("lua-src"), "lua-*")):
         lua_files |= {f for f in os.listdir(d) if f.endswith(".c")}
     ring_pkg, ring_files = ring_c_files(by_nv)
+    ring_prefix = ring_symbol_prefix(ring_pkg) if ring_pkg else None
     c_seen = {}
     for b in SHIPPED_BINARIES:
-        for f in c_files_with_code(shipped[b]):
-            comp = classify_c_file(f, lua_files, ring_files)
+        for f, symbols in c_file_entries_with_code(shipped[b]):
+            comp = classify_c_file(f, lua_files, ring_files, symbols, ring_prefix)
             if comp is None:
-                raise Fail(f"{b} contains code compiled from {f}, which belongs to no component this "
+                why = (f" (a name ring's tree has, but none of its kept symbols has ring's prefix "
+                       f"{ring_prefix}, so it is another library's)" if f in ring_files else "")
+                raise Fail(f"{b} contains code compiled from {f}{why}, which belongs to no component this "
                            "script has a licence text for. Find which library it is and add it.")
             c_seen.setdefault(comp, set()).add(b)
     if "GCC runtime" in c_seen:

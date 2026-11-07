@@ -704,11 +704,50 @@ class CFileClassification(unittest.TestCase):
         # ring's file names are ring's only through the crate's own source list.
         self.assertIsNone(cl.classify_c_file("p256-nistz.c", {"lapi.c"}))
 
-    def test_a_file_of_the_ring_crate_is_rings(self):
-        ring = {"p256-nistz.c", "curve25519.c", "limbs.c"}
+    def test_a_file_of_the_ring_crate_is_rings_by_its_symbol_prefix(self):
+        ring = {"p256-nistz.c", "curve25519.c", "limbs.c", "mem.c"}
+        prefix = "ring_core_0_17_14_"
         for f in sorted(ring):
-            self.assertEqual(cl.classify_c_file(f, {"lapi.c"}, ring), "ring", f)
-        self.assertEqual(cl.classify_c_file("lapi.c", {"lapi.c"}, ring), "Lua")
+            kept = {prefix + "LIMBS_add_mod", "fiat_25519_carry_mul"}
+            self.assertEqual(cl.classify_c_file(f, {"lapi.c"}, ring, kept, prefix), "ring", f)
+        self.assertEqual(cl.classify_c_file("lapi.c", {"lapi.c"}, ring, set(), prefix), "Lua")
+
+    def test_a_same_named_file_without_rings_prefix_is_no_component(self):
+        # Another library's mem.c: the name is in ring's tree, the code is not ring's.
+        ring, prefix = {"mem.c", "crypto.c"}, "ring_core_0_17_14_"
+        for kept in ({"my_memcmp"}, {"ring_core_0_17_13_CRYPTO_memcmp"}, {"xring_core_0_17_14_x"}, set()):
+            self.assertIsNone(cl.classify_c_file("mem.c", set(), ring, kept, prefix), kept)
+        # No prefix known (no ring in the tree): nothing is ring's.
+        self.assertIsNone(cl.classify_c_file("mem.c", set(), ring, {prefix + "CRYPTO_memcmp"}, None))
+
+    def test_readelf_entries_keep_two_files_of_one_name_apart(self):
+        out = "\n".join([
+            "Symbol table '.symtab' contains 9 entries:",
+            "   Num:    Value          Size Type    Bind   Vis      Ndx Name",
+            "     1: 0000000000000000     0 FILE    LOCAL  DEFAULT  ABS mem.c",
+            "     2: 0000000000001000    40 FUNC    LOCAL  DEFAULT   14 ring_core_0_17_14__CRYPTO_memcmp",
+            "     3: 0000000000000000     0 FILE    LOCAL  DEFAULT  ABS mem.c",
+            "     4: 0000000000002000    20 FUNC    LOCAL  DEFAULT   14 other_memcmp",
+            "     5: 0000000000000000     0 FILE    LOCAL  DEFAULT  ABS empty.c",
+            "     6: 0000000000000000     0 FILE    LOCAL  DEFAULT  ABS main.rs",
+            "     7: 0000000000003000    10 FUNC    LOCAL  DEFAULT   14 rust_local",
+            "     8: 0000000000000000     0 FILE    LOCAL  DEFAULT  ABS crtstuff.c",
+            "     9: 0000000000004000     0 NOTYPE  LOCAL  DEFAULT   20 __TMC_END__",
+            "    10: 0000000000004010    10 FUNC    LOCAL  DEFAULT   14 frame_dummy",
+            "    11: 0000000000005000    30 FUNC    GLOBAL DEFAULT   14 main",
+        ])
+        self.assertEqual(cl.parse_c_file_entries(out), [
+            ("mem.c", frozenset({"ring_core_0_17_14__CRYPTO_memcmp"})),
+            ("mem.c", frozenset({"other_memcmp"})),
+            ("crtstuff.c", frozenset({"frame_dummy"})),
+        ])
+
+    def test_rings_prefix_is_its_links_key(self):
+        self.assertEqual(cl.ring_symbol_prefix({"version": "0.17.14", "links": "ring_core_0_17_14_"}),
+                         "ring_core_0_17_14_")
+        for links in (None, "", "ring_core_0_17_13_", "ring_core_"):
+            with self.assertRaises(cl.Fail):
+                cl.ring_symbol_prefix({"version": "0.17.14", "links": links})
 
     def test_the_trees_ring_lists_the_c_files_its_build_script_compiles(self):
         # The C files that kept code in a debug `shell` on 2026-11-07, all from ring's own tree.
@@ -718,6 +757,7 @@ class CFileClassification(unittest.TestCase):
         self.assertLessEqual({"p256-nistz.c", "curve25519.c", "gfp_p384.c", "aes_nohw.c", "limbs.c",
                               "curve25519_64_adx.c", "cpu_intel.c", "crypto.c", "mem.c"}, files)
         self.assertNotIn("lapi.c", files)
+        self.assertEqual(cl.ring_symbol_prefix(pkg), "ring_core_" + pkg["version"].replace(".", "_") + "_")
         entry = cl.ring_component(pkg, {"shell"})
         self.assertEqual(entry["title"], f"ring {pkg['version']} (C compiled by its build script)")
         self.assertEqual(entry["license"], pkg["license"])
