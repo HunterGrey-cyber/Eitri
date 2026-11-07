@@ -4,13 +4,20 @@
 use super::*;
 
 #[test]
-fn the_review_settings_envelope_carries_both_switches_by_name() {
-    for (enabled, hint) in [(false, false), (true, false), (false, true), (true, true)] {
-        let parsed: Value = serde_json::from_str(&serialize_review_settings_for_js(enabled, hint)).unwrap();
-        assert_eq!(
-            parsed,
-            json!({ "kind": "review_settings", "enabled": enabled, "hint": hint })
-        );
+fn the_review_settings_envelope_carries_each_hint_level_by_name() {
+    use crate::agent_prefs::ReviewHintLevel;
+    for enabled in [false, true] {
+        for (hint, word) in [
+            (ReviewHintLevel::Off, "off"),
+            (ReviewHintLevel::Key, "key"),
+            (ReviewHintLevel::Full, "full"),
+        ] {
+            let parsed: Value = serde_json::from_str(&serialize_review_settings_for_js(enabled, hint)).unwrap();
+            assert_eq!(
+                parsed,
+                json!({ "kind": "review_settings", "enabled": enabled, "hint": word })
+            );
+        }
     }
 }
 

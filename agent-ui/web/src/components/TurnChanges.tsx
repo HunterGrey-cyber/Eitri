@@ -47,17 +47,15 @@ export function latestTurnChanges(state: AgentUiState): TurnChangeSummary | null
   return files.size === 0 ? null : { files: files.size, added, removed };
 }
 
-/** Whether the change line may be drawn at all: only for a window that has a turn review to open
- *  (`enabled`) and whose user asked to be told about a turn's changes (`hint`). Turn review keeps out
- *  of the way unless asked, so a page told neither (or nothing) draws nothing. */
+/** The running change line is drawn only when review is installed and the full hint level was requested.
+ *  The key level offers only the finished turn's status-band pointer. */
 export function turnChangesWanted(review: ReviewSettings): boolean {
-  return review.enabled && review.hint;
+  return review.enabled && review.hint === "full";
 }
 
-/** One quiet line above the composer while a turn runs: what its finished edits changed so far. Drawn
- *  only when `turnChangesWanted`. It offers no key: once the turn is over the status band says how many
- *  files changed on disk and that `c` reviews them, counted from the snapshots the review opens (which
- *  include what a command changed), so the count and the key are said once, in one place. */
+/** One quiet line above the composer while a turn runs: what its finished edits changed so far.
+ *  Only the full hint level draws it. Once the turn ends, the band gives the count and `c` key,
+ *  counted from the snapshots the review opens, including what a command changed. */
 export function TurnChanges({ state, review }: { state: AgentUiState; review: ReviewSettings }) {
   if (!turnChangesWanted(review) || state.activeTurnId === null) return null;
   const changes = latestTurnChanges(state);

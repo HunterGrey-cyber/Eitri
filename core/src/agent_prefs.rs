@@ -139,7 +139,7 @@ pub fn parse_agents_enabled(value: Option<&str>) -> Result<bool, String> {
 /// The `init.lua` key: `eitri.config.set("review.enabled", true | false)`.
 pub const REVIEW_ENABLED_KEY: &str = "review.enabled";
 
-/// The `init.lua` key: `eitri.config.set("review.hint", true | false)`.
+/// The `init.lua` key: `eitri.config.set("review.hint", true | false | "key")`.
 pub const REVIEW_HINT_KEY: &str = "review.hint";
 
 /// Whether completed agent edits are drawn in buffers shown in the editor.
@@ -155,10 +155,39 @@ pub fn parse_review_enabled(value: Option<&str>) -> Result<bool, String> {
     crate::config_switch::parse_switch(REVIEW_ENABLED_KEY, value, true)
 }
 
-/// [`REVIEW_HINT_KEY`]: whether a finished turn that edited files puts a hint in the status band.
-/// Unset means it stays quiet; the review is still one key away.
-pub fn parse_review_hint(value: Option<&str>) -> Result<bool, String> {
-    crate::config_switch::parse_switch(REVIEW_HINT_KEY, value, false)
+/// How turn review offers its key and change counts in the panel.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ReviewHintLevel {
+    Off,
+    Key,
+    Full,
+}
+
+pub const REVIEW_HINT_DEFAULT: ReviewHintLevel = ReviewHintLevel::Key;
+
+impl ReviewHintLevel {
+    pub fn word(self) -> &'static str {
+        match self {
+            Self::Off => "off",
+            Self::Key => "key",
+            Self::Full => "full",
+        }
+    }
+}
+
+/// [`REVIEW_HINT_KEY`]: the finished turn's status-band hint and running turn's change line.
+/// Unset offers only `c to review`; true includes counts and the running change line, false hides both.
+pub fn parse_review_hint(value: Option<&str>) -> Result<ReviewHintLevel, String> {
+    match value.map(str::trim) {
+        None => Ok(REVIEW_HINT_DEFAULT),
+        Some("key") => Ok(ReviewHintLevel::Key),
+        Some("true" | "on") => Ok(ReviewHintLevel::Full),
+        Some("false" | "off") => Ok(ReviewHintLevel::Off),
+        Some(_) => Err(format!(
+            "eitri.config.set(\"{REVIEW_HINT_KEY}\", {:?}): must be true, false or \"key\"",
+            value.unwrap_or_default()
+        )),
+    }
 }
 
 /// The `init.lua` key: `eitri.config.set("agent.thinking", "collapsed" | "preview" | "expanded" | "hidden")`.
@@ -676,7 +705,6 @@ mod tests {
         for (value, expected) in [("off", false), ("on", true)] {
             assert_eq!(parse_user_settings(Some(value)), Ok(expected));
             assert_eq!(parse_review_enabled(Some(value)), Ok(expected));
-            assert_eq!(parse_review_hint(Some(value)), Ok(expected));
         }
     }
 
@@ -711,12 +739,10 @@ mod tests {
     }
 
     #[test]
-    fn review_switches_parse_like_user_settings() {
+    fn review_enabled_parses_like_user_settings() {
         assert_eq!(parse_review_enabled(None), Ok(true));
-        assert_eq!(parse_review_hint(None), Ok(false));
         for (text, want) in [("true", true), ("false", false), (" false ", false)] {
             assert_eq!(parse_review_enabled(Some(text)), Ok(want), "{text:?}");
-            assert_eq!(parse_review_hint(Some(text)), Ok(want), "{text:?}");
         }
         for bad in ["yes", "1", ""] {
             let err = parse_review_enabled(Some(bad)).unwrap_err();
@@ -724,10 +750,29 @@ mod tests {
                 err.contains("review.enabled") && err.contains(&format!("{bad:?}")),
                 "{err}"
             );
+        }
+    }
+
+    #[test]
+    fn review_hint_defaults_to_the_key_and_accepts_switch_spellings() {
+        assert_eq!(parse_review_hint(None), Ok(ReviewHintLevel::Key));
+        for (text, want) in [
+            ("key", ReviewHintLevel::Key),
+            (" key ", ReviewHintLevel::Key),
+            ("true", ReviewHintLevel::Full),
+            ("on", ReviewHintLevel::Full),
+            (" true ", ReviewHintLevel::Full),
+            ("false", ReviewHintLevel::Off),
+            ("off", ReviewHintLevel::Off),
+            (" false ", ReviewHintLevel::Off),
+        ] {
+            assert_eq!(parse_review_hint(Some(text)), Ok(want), "{text:?}");
+        }
+        for bad in ["yes", "1", "", "full", "Key", " yes "] {
             let err = parse_review_hint(Some(bad)).unwrap_err();
-            assert!(
-                err.contains("review.hint") && err.contains(&format!("{bad:?}")),
-                "{err}"
+            assert_eq!(
+                err,
+                format!("eitri.config.set(\"review.hint\", {bad:?}): must be true, false or \"key\"")
             );
         }
     }

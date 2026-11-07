@@ -334,9 +334,9 @@ fn read(kernel: &Kernel, panels: &[LuaPanelMeta]) -> Result<WindowConfig, String
     let tiling = parse_tiling(kernel.config.borrow().get(eitri_core::compositor::mode::TILING_KEY))?;
     refuse_compositor_on_mac(tiling, cfg!(target_os = "macos"))?;
 
-    // Whether turn review runs (`review.enabled`, default true) and whether a finished turn puts a
-    // hint in the status band (`review.hint`, default false). Anything but true/false is a startup
-    // failure naming the key, like `agent.user_settings` above.
+    // Whether turn review runs (`review.enabled`, default true) and how it offers its key
+    // (`review.hint`, default "key"). True adds counts and the running change line; false hides both.
+    // An invalid value is a startup failure naming the key.
     let mut review = ReviewConfig {
         enabled: eitri_core::agent_prefs::parse_review_enabled(
             kernel.config.borrow().get(eitri_core::agent_prefs::REVIEW_ENABLED_KEY),
@@ -446,6 +446,7 @@ mod tests {
     /// startup failure naming the key.
     #[test]
     fn window_config_reads_both_review_keys() {
+        use eitri_core::agent_prefs::ReviewHintLevel::{Full, Key};
         let scratch = std::env::temp_dir().join(format!("eitri-review-keys-{}", uuid::Uuid::new_v4()));
         let config_dir = scratch.join("config");
         std::fs::create_dir_all(&config_dir).unwrap();
@@ -459,9 +460,10 @@ mod tests {
                 eitri_core::agent_prefs::parse_review_hint(config.get(eitri_core::agent_prefs::REVIEW_HINT_KEY))?,
             ))
         };
-        assert_eq!(run("-- nothing set\n"), Ok((true, false)));
-        assert_eq!(run("eitri.config.set(\"review.hint\", true)\n"), Ok((true, true)));
-        assert_eq!(run("eitri.config.set(\"review.enabled\", false)\n"), Ok((false, false)));
+        assert_eq!(run("-- nothing set\n"), Ok((true, Key)));
+        assert_eq!(run("eitri.config.set(\"review.hint\", true)\n"), Ok((true, Full)));
+        assert_eq!(run("eitri.config.set(\"review.enabled\", false)\n"), Ok((false, Key)));
+        assert_eq!(run("eitri.config.set(\"review.hint\", \"key\")\n"), Ok((true, Key)));
         assert!(run("eitri.config.set(\"review.hint\", {})\n").is_err());
         std::fs::remove_dir_all(&scratch).unwrap();
     }

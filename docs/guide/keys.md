@@ -14,7 +14,9 @@ including anything you changed in [your configuration](configuration.md) or took
 >   Neovim's page up, and the key Claude Code uses to move a running command to the background when it runs in the
 >   bottom terminal.
 > - `Ctrl+h`, `Ctrl+j`, `Ctrl+k` and `Ctrl+l` move between modules, so in the bottom terminal the shell's clear-screen
->   is `Ctrl+b Ctrl+l` (and readline's `Ctrl+k` is `Ctrl+b Ctrl+k`).
+>   is `Ctrl+b Ctrl+l` (and readline's `Ctrl+k` is `Ctrl+b Ctrl+k`). In the agent panel `Ctrl+j` while browsing starts
+>   typing and `Ctrl+k` while typing goes back to browsing; otherwise they leave the panel
+>   ([Moving between panes](#moving-between-panes)).
 > - To have Eitri list the next keys when you pause after the prefix, put
 >   `eitri.config.set("keymap.which_key_delay", 200)` in your `init.lua` ([The hint panel](#the-hint-panel)).
 > - If you use tmux, your prefix and prefix-table bindings come from your tmux configuration

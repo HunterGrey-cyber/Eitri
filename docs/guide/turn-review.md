@@ -222,7 +222,7 @@ In a buffer with a drawing:
 | `<localleader>q` | close the drawing without remembering anything |
 | `:EitriReviewClear` | take every live drawing off, in all buffers |
 
-While the turn is still running, undo all and revert say so and do nothing (`Esc` in the panel interrupts the turn).
+While the turn is still running, undo all and revert say so and do nothing (`Ctrl+c` in the panel interrupts the turn).
 Undo all is all or nothing: if a change cannot be undone in the buffer (it creates or empties the file, changes its line
 endings, or is too large) or if some of the turn's changes are not drawn there, it changes nothing and tells you to use
 `x` in the panel. Both keep and undo act on the buffer you are in, not on the whole turn.

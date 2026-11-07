@@ -2,11 +2,11 @@
 import { describe, expect, it } from "vitest";
 import { render } from "@testing-library/react";
 import { initialState } from "../reducer";
-import type { AgentUiState, ToolCallRecord } from "../types";
+import type { AgentUiState, ReviewSettings, ToolCallRecord } from "../types";
 import { REVIEW_SETTINGS_OFF } from "../types";
 import { latestTurnChanges, latestTurnId, TurnChanges, turnChangesWanted } from "./TurnChanges";
 
-const HINT_ON = { enabled: true, hint: true };
+const HINT_ON: ReviewSettings = { enabled: true, hint: "full" };
 
 const edit = (seq: number, turnId: string, file: string, isError = false): ToolCallRecord => ({
   seq,
@@ -41,8 +41,14 @@ describe("the change line", () => {
 
   it("is off by default: no settings, or the hint off, draws nothing", () => {
     expect(render(<TurnChanges state={running} review={REVIEW_SETTINGS_OFF} />).container.textContent).toBe("");
-    expect(render(<TurnChanges state={running} review={{ enabled: true, hint: false }} />).container.textContent).toBe("");
+    expect(render(<TurnChanges state={running} review={{ enabled: true, hint: "off" }} />).container.textContent).toBe("");
     expect(turnChangesWanted(REVIEW_SETTINGS_OFF)).toBe(false);
+  });
+
+  it("keeps the running change line hidden at the key level", () => {
+    const key: ReviewSettings = { enabled: true, hint: "key" };
+    expect(turnChangesWanted(key)).toBe(false);
+    expect(render(<TurnChanges state={running} review={key} />).container.textContent).toBe("");
   });
 
   it("is drawn while the turn runs when review is on and the hint asked for", () => {
@@ -51,7 +57,7 @@ describe("the change line", () => {
   });
 
   it("draws nothing, and so offers no key, when review is off, even with the hint on", () => {
-    const off = { enabled: false, hint: true };
+    const off: ReviewSettings = { enabled: false, hint: "full" };
     expect(turnChangesWanted(off)).toBe(false);
     const { container } = render(<TurnChanges state={running} review={off} />);
     expect(container.textContent).toBe("");

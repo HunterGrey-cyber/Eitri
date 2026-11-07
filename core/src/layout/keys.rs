@@ -458,6 +458,41 @@ mod tests {
         assert!(refused.is_empty(), "{refused:#?}");
     }
 
+    /// The pages guide (and its Chinese twin) lists the lower-case letters a page may take with the default table.
+    /// The list is exactly the free ones: a named letter a page cannot take sends the reader into a startup problem,
+    /// and a free letter left out is one they never learn of.
+    #[test]
+    fn the_pages_guide_lists_exactly_the_free_lower_case_letters() {
+        let keymap = Keymap::defaults();
+        let free: Vec<char> = ('a'..='z')
+            .filter(|c| build_one(&c.to_string(), &keymap).is_ok())
+            .collect();
+        let guide = crate::guide_files::this_trees_guide();
+        for (page, marker) in [("pages.md", "are free by default"), ("pages.zh-CN.md", "是空着的")] {
+            let text = std::fs::read_to_string(guide.join(page)).unwrap_or_else(|e| panic!("{page}: {e}"));
+            let line = text
+                .lines()
+                .find(|line| line.contains(marker))
+                .unwrap_or_else(|| panic!("{page} no longer says which keys {marker:?}"));
+            // The letters are the backticked single characters in the sentence that carries the marker.
+            let at = line.find(marker).unwrap();
+            let start = line[..at]
+                .rfind(['.', '。'])
+                .map_or(0, |dot| dot + line[dot..].chars().next().map_or(1, char::len_utf8));
+            let end = at + line[at..].find(['.', '。']).unwrap_or(line.len() - at);
+            let named: Vec<char> = line[start..end]
+                .split('`')
+                .skip(1)
+                .step_by(2)
+                .filter_map(|word| {
+                    let mut chars = word.chars();
+                    chars.next().filter(|_| chars.next().is_none())
+                })
+                .collect();
+            assert_eq!(named, free, "{page}: the free keys it names");
+        }
+    }
+
     #[test]
     fn a_lua_panel_key_is_added_in_registration_order() {
         let keys = ModuleKeys::build(

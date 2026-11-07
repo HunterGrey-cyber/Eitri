@@ -1840,14 +1840,12 @@ pub fn serialize_review_hint_for_js(hint: &crate::turn_review::ReviewHint) -> St
     json!({ "kind": "review_hint", "tab": hint.tab, "turn": hint.turn, "files": hint.files }).to_string()
 }
 
-/// `{"kind":"review_settings","enabled":bool,"hint":bool}`: the window's turn review switches as the
-/// page needs them. `enabled` is whether a review is installed, so `c` can open one (`review.enabled`
-/// and a backend with turn boundaries); `hint` is `review.hint`. Window-level, sent in the `ready`
-/// batch before the tabs and again when `init.lua`'s values are applied. The page draws its running
-/// turn's change line only when both are true, and a page that never got this envelope treats both as
-/// false, so an older host leaves the page quiet.
-pub fn serialize_review_settings_for_js(enabled: bool, hint: bool) -> String {
-    json!({ "kind": "review_settings", "enabled": enabled, "hint": hint }).to_string()
+/// The window's turn review settings, sent before the tabs on every `ready` and when `init.lua`
+/// is applied. `enabled` says a review is installed. Hint `off` offers nothing, `key` draws only
+/// `c to review` after a changed turn, and `full` adds the finished file count and running change line.
+/// A page that receives no settings leaves its change line off.
+pub fn serialize_review_settings_for_js(enabled: bool, hint: crate::agent_prefs::ReviewHintLevel) -> String {
+    json!({ "kind": "review_settings", "enabled": enabled, "hint": hint.word() }).to_string()
 }
 
 /// `{"kind":"events","tab":...,"fromRevision":...,"throughRevision":...,"events":[<AgentDomainEvent JSON>, ...]}`.

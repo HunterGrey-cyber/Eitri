@@ -1,5 +1,5 @@
 [English](keys.md) | 简体中文
-<!-- translated-from: keys.md sha256=99d31c7acffbb18946c5b4ce8ffedc9c3b5ec6870777b6256bb949c524c8e0ea -->
+<!-- translated-from: keys.md sha256=24d0e5d63b3856c4a42c2176ac4d0694103739819135ae6c1e9bf28443c4a82c -->
 
 # 按键
 
@@ -11,7 +11,8 @@ Eitri 的按键来自三个地方，它们互不冲突：用于窗口本身（�
 > - `Ctrl+b` 归窗口所有，所以要把它交给当前拿着按键的东西，就连按两次：`Ctrl+b Ctrl+b` 是 Neovim 的向上翻页，
 >   在底部终端里运行 Claude Code 时，也是它把正在运行的命令移到后台的那个键。
 > - `Ctrl+h`、`Ctrl+j`、`Ctrl+k` 和 `Ctrl+l` 在模块之间移动，所以在底部终端里，shell 的清屏是 `Ctrl+b Ctrl+l`
->   （readline 的 `Ctrl+k` 是 `Ctrl+b Ctrl+k`）。
+>   （readline 的 `Ctrl+k` 是 `Ctrl+b Ctrl+k`）。在 agent 面板里，浏览时按 `Ctrl+j` 开始输入，输入时按 `Ctrl+k`
+>   回到浏览；其余情况下它们离开面板（[在窗格之间移动](#moving-between-panes)）。
 > - 想让 Eitri 在你按下前缀后停一下就列出接下来的键，在 `init.lua` 里写 `eitri.config.set("keymap.which_key_delay", 200)`（[提示面板](#the-hint-panel)）。
 > - 如果你用 tmux，你的前缀和前缀表里的绑定来自你的 tmux 配置（[你的 tmux 按键](#your-tmux-keys)），
 >   `Ctrl+b ?`（或者你自己的前缀加 `?`）会列出没拿过来的那些。

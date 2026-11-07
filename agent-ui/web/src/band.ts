@@ -59,9 +59,10 @@ export type BandFacts = {
    *  can be named. */
   link?: EditorLink | null;
   /** Turn review: a finished turn of this tab changed `files` files on disk, and `c` opens them. `null`,
-   *  or absent, says nothing. Never drawn over a prompt. A narrow band drops it right after the usage
-   *  figure and the context's shortening, ahead of the model: it is a pointer, not a state. */
-  review?: { files: number } | null;
+   *  or absent, says nothing; `keyOnly` omits the count and offers just `c to review`. Never drawn over a
+   *  prompt. A narrow band drops it right after the usage figure and the context's shortening, ahead
+   *  of the model: it is a pointer, not a state. */
+  review?: { files: number; keyOnly?: boolean } | null;
   /** A revert was interrupted and its journal entry is still there: the first one's `path`, and how many
    *  more there are. A half-written file is not a diff notice, so this is drawn whatever `review` says (the
    *  `review.hint` setting turns only the pointer off), and it outlasts every figure and pointer when the
@@ -152,8 +153,10 @@ export function effortSegment(effort: string): string {
 }
 
 /** The band's turn-review segment: how many files changed on disk during the last turn, and the key that
- *  shows them. Says "changed", not who changed them -- the overlay carries the attribution. */
-export function reviewSegment(files: number): string {
+ *  shows them, or just the key when `keyOnly`. Says "changed", not who changed them -- the overlay
+ *  carries the attribution. */
+export function reviewSegment(files: number, keyOnly = false): string {
+  if (keyOnly) return "c to review";
   return `${files} ${files === 1 ? "file" : "files"} changed · c to review`;
 }
 
@@ -330,7 +333,7 @@ export function bandLayout(f: BandFacts, widthPx: number, charPx: number): Seg[]
     ...(f.warn ? [{ id: "warn", text: "⚠", side: "right" } as Seg] : []),
     ...(link ? [{ id: "link", text: link.text, side: "right" } as Seg] : []),
     ...(ctxFull && !link ? [{ id: "context", text: ctxFull, side: "right" } as Seg] : []),
-    ...(f.review && f.review.files > 0 ? [{ id: "review", text: reviewSegment(f.review.files), side: "right" } as Seg] : []),
+    ...(f.review && f.review.files > 0 ? [{ id: "review", text: reviewSegment(f.review.files, f.review.keyOnly), side: "right" } as Seg] : []),
     ...(f.model ? [{ id: "model", text: f.model, side: "right" } as Seg] : []),
     ...(f.model && f.effort ? [{ id: "effort", text: effortSegment(f.effort), side: "right" } as Seg] : []),
     ...(f.usage ? [{ id: "usage", text: f.usage.text, side: "right" } as Seg] : []),

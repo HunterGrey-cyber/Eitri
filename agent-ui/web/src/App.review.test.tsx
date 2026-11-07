@@ -386,9 +386,26 @@ describe("Enter, o, y, [ ] and S", () => {
 });
 
 describe("the status band's pointer", () => {
+  it("offers the key without a file count at the key level", () => {
+    const { container } = started();
+    dispatch({ kind: "review_settings", enabled: true, hint: "key" });
+    dispatch({ kind: "review_hint", tab: 1, turn: 7, files: 2 });
+    expect(bandText(container)).toContain("c to review");
+    expect(bandText(container)).not.toContain("2 files changed");
+    expect(container.querySelector(".turn-changes")).toBeNull();
+  });
+
+  it("offers the count and key at the full level", () => {
+    const { container } = started();
+    dispatch({ kind: "review_settings", enabled: true, hint: "full" });
+    dispatch({ kind: "review_hint", tab: 1, turn: 7, files: 2 });
+    expect(bandText(container)).toContain("2 files changed · c to review");
+  });
+
   it("appears for the tab it names and says how many files changed", () => {
     const { container } = started();
     expect(bandText(container)).not.toContain("to review");
+    dispatch({ kind: "review_settings", enabled: true, hint: "off" });
     dispatch({ kind: "review_hint", tab: 1, turn: 7, files: 3 });
     expect(bandText(container)).toContain("3 files changed · c to review");
     dispatch({ kind: "review_hint", tab: 1, turn: 8, files: 1 });
@@ -781,25 +798,33 @@ describe("the change line above the composer", () => {
 
   it("is drawn while a turn runs once review is on and the hint asked for, and never offers the key", () => {
     const { container } = started();
-    dispatch({ kind: "review_settings", enabled: true, hint: true });
+    dispatch({ kind: "review_settings", enabled: true, hint: "full" });
     running();
     expect(line(container)!.textContent).toBe("1 file changed+2−1");
     expect(container.textContent).not.toContain("c to review");
   });
 
-  it("is not drawn with the hint off, nor with review off", () => {
+  it("keeps the running change line hidden at the key level", () => {
     const { container } = started();
-    dispatch({ kind: "review_settings", enabled: true, hint: false });
+    dispatch({ kind: "review_settings", enabled: true, hint: "key" });
     running();
     expect(line(container)).toBeNull();
-    dispatch({ kind: "review_settings", enabled: false, hint: true });
+    expect(container.textContent).not.toContain("c to review");
+  });
+
+  it("is not drawn with the hint off, nor with review off", () => {
+    const { container } = started();
+    dispatch({ kind: "review_settings", enabled: true, hint: "off" });
+    running();
+    expect(line(container)).toBeNull();
+    dispatch({ kind: "review_settings", enabled: false, hint: "full" });
     expect(line(container)).toBeNull();
     expect(container.textContent).not.toContain("c to review");
   });
 
   it("gives the finished turn to the band: the count and the key are said once", () => {
     const { container } = started();
-    dispatch({ kind: "review_settings", enabled: true, hint: true });
+    dispatch({ kind: "review_settings", enabled: true, hint: "full" });
     running();
     dispatch({ kind: "snapshot", tab: 1, throughRevision: 2, state: snapshotState({ activeTurnId: null, toolCalls: [edit] }) });
     dispatch({ kind: "review_hint", tab: 1, turn: 1, files: 1 });

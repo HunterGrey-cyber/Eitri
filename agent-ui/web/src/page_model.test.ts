@@ -19,6 +19,21 @@ function connected(): PageModel {
 }
 
 describe("pageModel", () => {
+  it("starts with review hints off until a host sends settings", () => {
+    expect(initialPageModel().reviewSettings).toEqual({ enabled: false, hint: "off" });
+  });
+
+  it.each([
+    ["key", "key"], ["full", "full"], [true, "full"], [false, "off"],
+    ["off", "off"], [undefined, "off"], ["garbage", "off"], [null, "off"], [1, "off"],
+  ])("reads review hint %j as %s", (hint, expected) => {
+    const payload = { kind: "review_settings", enabled: true, ...(hint === undefined ? {} : { hint }) } as InboundPayload;
+    const model = receive(connected(), payload);
+    expect(model.reviewSettings).toEqual({ enabled: true, hint: expected });
+    expect(receive(model, { kind: "review_settings", enabled: false, hint: "full" }).reviewSettings)
+      .toEqual({ enabled: false, hint: "full" });
+  });
+
   it("tabs_then_snapshot_in_one_batch_shows_the_new_active_tab", () => {
     const previous = pageModel(initialPageModel(), {
       kind: "tabs", active: 1, tabs: [tab(1), tab(2)], defaultMode: "auto", receivedAt: 100,

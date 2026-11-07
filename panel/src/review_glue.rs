@@ -2,9 +2,10 @@
 //! review flow's answers routed back to the page that asked, and the editor's answers to a draft edit.
 
 use super::*;
+use eitri_core::agent_prefs::ReviewHintLevel;
 
-/// The `review_settings` envelope for the state as it is: whether `c` can open a review, and whether
-/// the user asked to be told about a turn's changes.
+/// The `review_settings` envelope for the state as it is: whether `c` can open a review, and
+/// how its key and change counts are offered.
 pub(super) fn review_settings_payload(state: &AgentPanelState) -> String {
     eitri_core::agent_bridge::serialize_review_settings_for_js(state.review_enabled, state.review_hint)
 }
@@ -19,7 +20,7 @@ pub(super) struct ReviewRoots {
 /// `init.lua`'s review keys, applied once after it ran.
 pub struct ReviewConfig {
     pub enabled: bool,
-    pub hint: bool,
+    pub hint: ReviewHintLevel,
     pub live: bool,
 }
 
@@ -193,13 +194,12 @@ pub(super) fn finished_reviews_by_page(jobs: &mut Vec<PendingReview>) -> Reviews
     (payloads, cleared)
 }
 
-/// The hints a finished turn may show: all of them with `review.hint` on, none otherwise, so a
-/// quiet window never queues or dispatches one.
+/// A finished turn's hints reach the page at the key and full levels; off queues and dispatches none.
 pub(super) fn hints_to_keep(
-    hint_on: bool,
+    level: ReviewHintLevel,
     hints: Vec<eitri_core::turn_review::ReviewHint>,
 ) -> Vec<eitri_core::turn_review::ReviewHint> {
-    if hint_on {
+    if level != ReviewHintLevel::Off {
         hints
     } else {
         Vec::new()
@@ -761,37 +761,40 @@ mod tests {
         let (handle, page) = handle_with_strict_page();
         page.inner.visible.set(true);
         handle.page_message(ViewId::BASE, r#"{"type":"ready","request_id":"r1"}"#);
-        let settings = |page: &std::cell::RefCell<Vec<String>>| -> Vec<(bool, bool)> {
+        let settings = |page: &std::cell::RefCell<Vec<String>>| -> Vec<(bool, String)> {
             page.borrow()
                 .iter()
                 .filter(|e| kind_of(e) == "review_settings")
                 .map(|e| {
                     let v = serde_json::from_str::<serde_json::Value>(e).unwrap();
-                    (v["enabled"].as_bool().unwrap(), v["hint"].as_bool().unwrap())
+                    (v["enabled"].as_bool().unwrap(), v["hint"].as_str().unwrap().to_owned())
                 })
                 .collect()
         };
         let kinds: Vec<String> = page.inner.sent.borrow().iter().map(|e| kind_of(e)).collect();
         let at = |k: &str| kinds.iter().position(|x| x == k).unwrap();
         assert!(at("review_settings") < at("tabs"), "{kinds:?}");
-        assert_eq!(settings(&page.inner.sent), vec![(false, false)]);
+        assert_eq!(settings(&page.inner.sent), vec![(false, "off".into())]);
         handle.set_review(ReviewConfig {
             enabled: true,
-            hint: true,
+            hint: ReviewHintLevel::Full,
             live: false,
         });
-        assert_eq!(settings(&page.inner.sent), vec![(false, false), (true, true)]);
+        assert_eq!(
+            settings(&page.inner.sent),
+            vec![(false, "off".into()), (true, "full".into())]
+        );
         handle.page_message(ViewId::BASE, r#"{"type":"ready","request_id":"r2"}"#);
         assert_eq!(
             settings(&page.inner.sent),
-            vec![(false, false), (true, true), (true, true)]
+            vec![(false, "off".into()), (true, "full".into()), (true, "full".into())]
         );
         handle.set_review(ReviewConfig {
             enabled: false,
-            hint: true,
+            hint: ReviewHintLevel::Full,
             live: false,
         });
-        assert_eq!(settings(&page.inner.sent).last(), Some(&(false, true)));
+        assert_eq!(settings(&page.inner.sent).last(), Some(&(false, "full".into())));
     }
 
     /// `Ctrl+g` on a pending `Write` of a file that is not there yet: the page's message goes through the
@@ -1159,24 +1162,31 @@ mod tests {
         let state = state_for_hooks(TabSet::new(BackendKind::Sidecar, SessionModeChoice::Auto));
         state.borrow_mut().apply_review(ReviewConfig {
             enabled: true,
-            hint: false,
+            hint: ReviewHintLevel::Off,
             live: false,
         });
         assert!(state.borrow().tabs.turn_review().is_some());
         assert!(state.borrow().review_enabled);
-        assert!(!state.borrow().review_hint);
+        assert_eq!(state.borrow().review_hint, ReviewHintLevel::Off);
         state.borrow_mut().apply_review(ReviewConfig {
             enabled: true,
-            hint: true,
+            hint: ReviewHintLevel::Full,
             live: false,
         });
-        assert!(state.borrow().review_hint);
+        assert_eq!(state.borrow().review_hint, ReviewHintLevel::Full);
+
+        state.borrow_mut().apply_review(ReviewConfig {
+            enabled: true,
+            hint: ReviewHintLevel::Key,
+            live: false,
+        });
+        assert_eq!(state.borrow().review_hint, ReviewHintLevel::Key);
 
         // A backend without turn boundaries installs none, so the page is not told `c` would open one.
         let state = state_for_hooks(TabSet::new(BackendKind::Legacy, SessionModeChoice::Auto));
         state.borrow_mut().apply_review(ReviewConfig {
             enabled: true,
-            hint: true,
+            hint: ReviewHintLevel::Full,
             live: false,
         });
         assert!(state.borrow().tabs.turn_review().is_none());
@@ -1185,7 +1195,7 @@ mod tests {
         let state = state_for_hooks(TabSet::new(BackendKind::Sidecar, SessionModeChoice::Auto));
         state.borrow_mut().apply_review(ReviewConfig {
             enabled: false,
-            hint: true,
+            hint: ReviewHintLevel::Full,
             live: false,
         });
         let state = state.borrow();
@@ -1202,10 +1212,9 @@ mod tests {
         );
     }
 
-    /// Without `review.hint` a finished turn's hint is dropped before it is queued, so nothing is
-    /// ever dispatched; with it, every hint passes.
+    /// Off drops hints before they are queued; key and full both keep every hint.
     #[test]
-    fn hints_are_dropped_unless_opted_in() {
+    fn hints_are_kept_unless_off() {
         use eitri_core::turn_review::ReviewHint;
         let hints = || {
             vec![
@@ -1221,8 +1230,9 @@ mod tests {
                 },
             ]
         };
-        assert!(hints_to_keep(false, hints()).is_empty());
-        assert_eq!(hints_to_keep(true, hints()), hints());
+        assert!(hints_to_keep(ReviewHintLevel::Off, hints()).is_empty());
+        assert_eq!(hints_to_keep(ReviewHintLevel::Full, hints()), hints());
+        assert_eq!(hints_to_keep(ReviewHintLevel::Key, hints()), hints());
     }
 
     /// A hint that arrives while the page is not ready is kept for it, one per tab, the newest.

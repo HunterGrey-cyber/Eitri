@@ -385,6 +385,28 @@ mod tests {
     }
 
     #[test]
+    fn review_hint_accepts_key_and_reports_a_bad_value() {
+        use eitri_core::agent_prefs as prefs;
+        let (kernel, problems) = settled("eitri.config.set('review.hint', 'key')\n");
+        assert!(problems.is_empty(), "{problems:?}");
+        assert_eq!(
+            prefs::parse_review_hint(kernel.config.borrow().get(prefs::REVIEW_HINT_KEY)),
+            Ok(prefs::ReviewHintLevel::Key)
+        );
+        let (kernel, problems) = settled("eitri.config.set('review.hint', 'perhaps')\n");
+        assert_eq!(problems.len(), 1, "{problems:?}");
+        assert!(
+            problems[0].contains("review.hint") && problems[0].contains("perhaps"),
+            "{problems:?}"
+        );
+        assert!(
+            problems[0].contains("\"key\"") && problems[0].ends_with("the default is used"),
+            "{problems:?}"
+        );
+        assert_eq!(kernel.config.borrow().get(prefs::REVIEW_HINT_KEY), None);
+    }
+
+    #[test]
     fn a_bad_review_live_opens_on_the_default_and_is_said() {
         use eitri_core::agent_prefs::{parse_review_live, REVIEW_LIVE_DEFAULT, REVIEW_LIVE_KEY};
         let (kernel, problems) = settled("eitri.config.set('review.live', 'perhaps')\n");

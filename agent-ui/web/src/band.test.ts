@@ -103,6 +103,12 @@ describe("the band degrades by priority", () => {
     expect(seg(0)).toBeUndefined();
     expect(bandLayout({ ...idle, review: null }, 900, 7.2).map((s) => s.id)).not.toContain("review");
   });
+  it("offers only the key when the review pointer is key-only", () => {
+    const seg = (files: number) => bandLayout({ ...idle, review: { files, keyOnly: true } }, 900, 7.2).find((s) => s.id === "review");
+    expect(seg(2)).toEqual({ id: "review", text: "c to review", side: "right" });
+    expect(seg(1)?.text).toBe("c to review");
+    expect(seg(0)).toBeUndefined();
+  });
   it("names an interrupted revert whatever the review pointer says, with the key that opens it", () => {
     const seg = (more: number) => bandLayout({ ...idle, review: null, recovery: { path: "core/src/x.rs", more } }, 900, 7.2).find((s) => s.id === "recovery");
     expect(seg(0)).toEqual({ id: "recovery", text: "an interrupted revert left core/src/x.rs · c to review", side: "left" });

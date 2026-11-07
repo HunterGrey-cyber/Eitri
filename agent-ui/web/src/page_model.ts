@@ -353,8 +353,11 @@ function reduceEnvelope(model: PageModel, envelope: Envelope): PageModel {
     case "root_note":
       return typeof envelope.text === "string" && envelope.text !== "" ? { ...model, rootNote: envelope.text } : model;
     case "review_settings":
-      // Only a real `true` turns a switch on: anything else from the wire leaves the line undrawn.
-      return { ...model, reviewSettings: { enabled: envelope.enabled === true, hint: envelope.hint === true } };
+      // Older hosts send a boolean; unknown levels leave the hint off.
+      return { ...model, reviewSettings: {
+        enabled: envelope.enabled === true,
+        hint: envelope.hint === "full" || envelope.hint === true ? "full" : envelope.hint === "key" ? "key" : "off",
+      } };
     case "pane_focus":
       // The review overlay stays open: this envelope also reports the window being deactivated and activated
       // again (another window taking focus, a resize that comes with one), and an overlay the reader was in the

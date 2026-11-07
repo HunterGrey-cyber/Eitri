@@ -6480,7 +6480,8 @@ export default function App() {
           // The card INPUT's Ctrl+y would approve, while the box has the keys.
           approve: ctrlYCard,
           // A finished turn of this tab changed files on disk; `c` shows them.
-          review: activeTab !== null && reviewHints[activeTab.id] !== undefined ? { files: reviewHints[activeTab.id].files } : null,
+          review: activeTab !== null && reviewHints[activeTab.id] !== undefined
+            ? { files: reviewHints[activeTab.id].files, keyOnly: reviewSettings.hint === "key" } : null,
           // An interrupted revert is named whatever `review.hint` says: a half-written file is not a diff notice.
           recovery: reviewRecovery.length > 0 ? { path: reviewRecovery[0].path, more: reviewRecovery.length - 1 } : null,
           // Commands this tab's agent left running after its turns ended; nothing while there are none.

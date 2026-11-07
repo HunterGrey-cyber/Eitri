@@ -768,7 +768,7 @@ pub(super) mod tests {
         };
         state.borrow_mut().apply_review(ReviewConfig {
             enabled,
-            hint: false,
+            hint: eitri_core::agent_prefs::ReviewHintLevel::Off,
             live: false,
         });
         let state = state.borrow();

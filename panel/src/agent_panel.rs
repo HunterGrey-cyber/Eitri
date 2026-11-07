@@ -323,12 +323,12 @@ struct AgentPanelState {
     /// owed these again. Dropped when the tab's next turn starts, when that tab's review is answered
     /// with a review, and when a newer hint for the tab arrives.
     shown_hints: Vec<eitri_core::turn_review::ReviewHint>,
-    /// Whether a finished turn's hint reaches the status band (`review.hint`). Off until
+    /// How a finished turn's hint is drawn in the status band (`review.hint`). Off until
     /// `set_review` says otherwise: the review is still one key away.
-    review_hint: bool,
+    review_hint: eitri_core::agent_prefs::ReviewHintLevel,
     /// Whether a turn review is installed, so `c` can open one: `review.enabled` and a backend that
     /// has turn boundaries. Off until `set_review` installs one. Told to the page with `review_hint`
-    /// (`review_settings`), which draws nothing about the turn's changes unless both are on.
+    /// (`review_settings`), which draws a running change line only with the full hint level.
     review_enabled: bool,
     /// What `set_review` builds the turn review from: the state and home directories and the
     /// canonical project root, read once when the state is made.
@@ -643,7 +643,7 @@ impl AgentPanelState {
             cli_missing: std::sync::Arc::new(agent::claude_cli_missing_here),
             review_hints: Vec::new(),
             shown_hints: Vec::new(),
-            review_hint: false,
+            review_hint: eitri_core::agent_prefs::ReviewHintLevel::Off,
             review_enabled: false,
             home: review_roots.home.as_ref().map(PathBuf::from),
             review_roots,

@@ -1,4 +1,4 @@
-import type { AppliedSettings, EffortChoice, ModelOption, AgentDomainEvent, AgentUiSnapshot, ChooserEnvelope, ContextSummary, DetailRow, EditorCardWire, EditorLinkState, HandoffCommand, Hello, QueueItem, ReviewDiffEnvelope, ReviewDraftEnvelope, ReviewEnvelope, ReviewHintEnvelope, ReviewRecoveryEnvelope, ReviewScope, ReviewSendPreviewEnvelope, TabId, TabsEnvelope, ThinkingDisplay, TurnTimeWire } from "./types";
+import type { AppliedSettings, EffortChoice, ModelOption, AgentDomainEvent, AgentUiSnapshot, ChooserEnvelope, ContextSummary, DetailRow, EditorCardWire, EditorLinkState, HandoffCommand, Hello, QueueItem, ReviewDiffEnvelope, ReviewDraftEnvelope, ReviewEnvelope, ReviewHintEnvelope, ReviewHintLevel, ReviewRecoveryEnvelope, ReviewScope, ReviewSendPreviewEnvelope, TabId, TabsEnvelope, ThinkingDisplay, TurnTimeWire } from "./types";
 import type { KeymapHelp, PaneDirection, PluginKeysHelp } from "./keymap";
 import { isEditorCardWire } from "./editorCardWire";
 import { isHex64, isTrustRemember } from "./trust";
@@ -330,7 +330,7 @@ type InboundHandler = (
     | { kind: "root_note"; text: string }
     /** The window's turn review switches (`serialize_review_settings_for_js`, `core/src/agent_bridge.rs`).
      *  Window-level, sent on every `ready` before the tabs and again when `init.lua`'s values arrive. */
-    | { kind: "review_settings"; enabled: boolean; hint: boolean }
+    | { kind: "review_settings"; enabled: boolean; hint: ReviewHintLevel | boolean }
     /** Whether this panel's pane holds the window's keyboard focus. `shell` decides this from
      *  GTK's focus widget (the window controller's report, `eitri_core::wm::focus`). It is not
      *  decided from this page's own `window` focus/blur: `shell` arbitrates Ctrl+h/Ctrl+l, and the

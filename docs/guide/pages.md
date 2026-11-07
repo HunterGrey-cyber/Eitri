@@ -58,7 +58,7 @@ eitri.panel.register{
 - `position` is a first-launch hint only: after that the window keeps where you put the panel, and an
   [open rule](configuration.md#where-a-new-module-opens) for `lua:status` decides over it.
 - `key` must be one character that nothing after the prefix uses: not a default key, not one stock tmux binds after
-  its prefix, not `v`, and not `E`, `A`, `T` or `V`. `b`, `g`, `h`, `j`, `k`, `u` and `y` are free by default. A
+  its prefix, not `v`, and not `E`, `A`, `T` or `V`. `b`, `g`, `h`, `j`, `k` and `y` are free by default. A
   clash leaves the page without a key and is listed when Eitri starts, naming the key and what holds it.
 - The id must not be `terminal#2` to `terminal#9` or `agent#2` to `agent#9`; registering the same id again replaces
   the earlier panel.
