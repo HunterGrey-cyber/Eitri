@@ -9,6 +9,7 @@ use crate::compositor::Wm;
 use crate::keymap::Keymap;
 use crate::layout::{Frame, Layout, ModuleId, ModuleKeys, ModuleKind};
 use crate::tabs::ViewId;
+use crate::window_link::cm_file::CmTerminal;
 use crate::window_link::names::WindowName;
 use std::rc::Rc;
 
@@ -157,20 +158,26 @@ fn is_a_window(id: &ModuleId) -> bool {
 }
 
 /// What `start`, the layout the window would open as a tile set, is as a hub: the editor over the bottom terminal,
-/// that terminal shown only if `start` shows it, and every chat and page `start` shows as a module window to open, in
-/// leaf order. A hidden one stays closed, as it stays off screen in `eitri` mode; its key opens it. A panel whose id
-/// names no window is left out here and reported by [`unnamed_pages`].
-pub fn hub_layout(start: &Layout) -> (Layout, Vec<WindowName>) {
+/// that terminal hidden unless the user's own default shows it. A record supplies only its height. Every chat and
+/// page `start` shows becomes a module window to open, in leaf order. A hidden one stays closed, as it stays off screen
+/// in `eitri` mode; its key opens it. A panel whose id names no window is left out here and reported by [`unnamed_pages`].
+pub fn hub_layout(start: &Layout, users_default: bool, record: Option<&CmTerminal>) -> (Layout, Vec<WindowName>) {
     let terminal = ModuleId::terminal();
-    let mut layout = crate::layout::hub_tree().layout;
-    if !start.is_shown(&terminal) {
-        crate::layout::hide(
-            &mut layout,
-            &terminal,
-            &Frame::new(super::persist::FIRST_LAUNCH_FRAME, 1),
-        )
-        .expect("the keys are on the editor, so the terminal can hide");
-    }
+    let shown = users_default && start.is_shown(&terminal);
+    let layout = if let Some(record) = record {
+        record.layout(shown)
+    } else {
+        let mut layout = crate::layout::hub_tree().layout;
+        if !shown {
+            crate::layout::hide(
+                &mut layout,
+                &terminal,
+                &Frame::new(super::persist::FIRST_LAUNCH_FRAME, 1),
+            )
+            .expect("the keys are on the editor, so the terminal can hide");
+        }
+        layout
+    };
     let windows = start
         .modules()
         .iter()
@@ -1878,8 +1885,60 @@ mod tests {
         driver.start(WinId::MAIN, StartStep::Requests);
     }
 
-    fn hub_parts(start: &Layout) -> (WindowParts, StartWindows) {
-        let (layout, open) = hub_layout(start);
+    #[test]
+    fn a_start_layout_that_is_not_the_users_default_never_shows_the_terminal() {
+        let start = tree_of(&[ModuleId::editor(), ModuleId::agent(), ModuleId::terminal()]);
+        let (layout, windows) = hub_layout(&start, false, None);
+        assert!(!layout.is_shown(&ModuleId::terminal()));
+        assert_eq!(layout.leaves(), [ModuleId::editor(), ModuleId::terminal()]);
+        assert_eq!(windows, [WindowName::Chat(1)]);
+        let (layout, _) = hub_layout(&default_start(), false, None);
+        assert!(!layout.is_shown(&ModuleId::terminal()));
+    }
+
+    #[test]
+    fn a_record_that_had_the_terminal_shown_starts_it_hidden_with_its_height() {
+        let record = CmTerminal {
+            shown: true,
+            px: Some(300),
+        };
+        let start = default_start();
+        let (layout, _) = hub_layout(&start, false, Some(&record));
+        assert!(!layout.is_shown(&ModuleId::terminal()));
+        assert_eq!(CmTerminal::of(&layout).px, Some(300));
+
+        let (driver, host, scheduler) = setup_with_clock();
+        let (parts, windows) = hub_parts(&start, false, Some(&record));
+        let (view, _) = parts.views();
+        hub_start(&driver, &host, parts, windows);
+        scheduler.advance(std::time::Duration::ZERO);
+        assert!(!view.read().is_shown(&ModuleId::terminal()));
+        assert_eq!(view.read().focus(), &ModuleId::editor());
+    }
+
+    #[test]
+    fn the_users_default_showing_the_terminal_shows_it_at_every_start() {
+        let start = tree_of(&[ModuleId::editor(), ModuleId::agent(), ModuleId::terminal()]);
+        let (layout, _) = hub_layout(&start, true, None);
+        assert!(layout.is_shown(&ModuleId::terminal()));
+
+        let record = CmTerminal {
+            shown: false,
+            px: Some(250),
+        };
+        let (layout, _) = hub_layout(&start, true, Some(&record));
+        assert!(layout.is_shown(&ModuleId::terminal()));
+        assert_eq!(CmTerminal::of(&layout).px, Some(250));
+
+        let hidden = tree_of(&[ModuleId::editor(), ModuleId::agent()]);
+        for record in [None, Some(&record)] {
+            let (layout, _) = hub_layout(&hidden, true, record);
+            assert!(!layout.is_shown(&ModuleId::terminal()));
+        }
+    }
+
+    fn hub_parts(start: &Layout, users_default: bool, record: Option<&CmTerminal>) -> (WindowParts, StartWindows) {
+        let (layout, open) = hub_layout(start, users_default, record);
         let windows = StartWindows {
             open,
             unnamed: unnamed_pages(start),
@@ -1906,7 +1965,7 @@ mod tests {
     #[test]
     fn a_compositor_window_1_builds_no_chat_page_and_no_agent_module() {
         let (driver, host, scheduler) = setup_with_clock();
-        let (parts, windows) = hub_parts(&default_start());
+        let (parts, windows) = hub_parts(&default_start(), false, None);
         let (view, _) = parts.views();
         hub_start(&driver, &host, parts, windows);
         scheduler.advance(std::time::Duration::ZERO);
@@ -1924,7 +1983,7 @@ mod tests {
     #[test]
     fn a_hub_start_leaves_the_keys_in_the_editor() {
         let (driver, host, scheduler) = setup_with_clock();
-        let (parts, windows) = hub_parts(&default_start());
+        let (parts, windows) = hub_parts(&default_start(), false, None);
         let (view, _) = parts.views();
         hub_start(&driver, &host, parts, windows);
         scheduler.advance(std::time::Duration::ZERO);
@@ -1942,12 +2001,12 @@ mod tests {
 
     #[test]
     fn the_start_layouts_chats_and_pages_open_as_module_windows_in_order() {
-        assert_eq!(hub_layout(&default_start()).1, [WindowName::Chat(1)]);
+        assert_eq!(hub_layout(&default_start(), false, None).1, [WindowName::Chat(1)]);
 
         let chat3 = ModuleId::instance(ModuleKind::Agent, 3).unwrap();
         let start = tree_of(&[ModuleId::editor(), ModuleId::agent(), lua("markdown"), chat3]);
         assert_eq!(
-            hub_layout(&start).1,
+            hub_layout(&start, false, None).1,
             [
                 WindowName::Chat(1),
                 WindowName::Page("markdown".into()),
@@ -1957,7 +2016,7 @@ mod tests {
 
         // They go out once `shell:ready` has, in that order.
         let (driver, host, scheduler) = setup_with_clock();
-        let (parts, windows) = hub_parts(&start);
+        let (parts, windows) = hub_parts(&start, false, None);
         hub_start(&driver, &host, parts, windows);
         assert_eq!(opened(&host), [], "nothing is started inside the start's own batches");
         scheduler.advance(std::time::Duration::ZERO);
@@ -1987,14 +2046,14 @@ mod tests {
     }
 
     #[test]
-    fn the_terminal_a_start_layout_shows_stays_shown_and_a_hidden_chat_stays_closed() {
+    fn the_terminal_the_users_default_shows_stays_shown_and_a_hidden_chat_stays_closed() {
         let start = tree_of(&[
             ModuleId::editor(),
             ModuleId::agent(),
             ModuleId::terminal(),
             lua("notes"),
         ]);
-        let (layout, _) = hub_layout(&start);
+        let (layout, _) = hub_layout(&start, true, None);
         assert!(layout.is_shown(&ModuleId::terminal()));
         assert_eq!(layout.leaves(), [ModuleId::editor(), ModuleId::terminal()]);
 
@@ -2005,7 +2064,7 @@ mod tests {
             &crate::layout::Frame::new(crate::wm::persist::FIRST_LAUNCH_FRAME, 1),
         )
         .unwrap();
-        assert_eq!(hub_layout(&hidden).1, [WindowName::Page("notes".into())]);
+        assert_eq!(hub_layout(&hidden, true, None).1, [WindowName::Page("notes".into())]);
     }
 
     #[test]
@@ -2013,11 +2072,11 @@ mod tests {
         let plain = lua("Notes");
         let odd = lua("My Panel");
         let start = tree_of(&[ModuleId::editor(), odd.clone(), plain]);
-        assert_eq!(hub_layout(&start).1, [WindowName::Page("Notes".into())]);
+        assert_eq!(hub_layout(&start, false, None).1, [WindowName::Page("Notes".into())]);
         assert_eq!(unnamed_pages(&start), [odd]);
 
         let (driver, host, scheduler) = setup_with_clock();
-        let (parts, windows) = hub_parts(&start);
+        let (parts, windows) = hub_parts(&start, false, None);
         hub_start(&driver, &host, parts, windows);
         scheduler.advance(std::time::Duration::ZERO);
         assert_eq!(opened(&host), [WindowName::Page("Notes".into())]);
@@ -2031,11 +2090,15 @@ mod tests {
     #[test]
     fn a_window_already_linked_or_starting_is_not_opened_again() {
         let (driver, host, scheduler) = setup_with_clock();
-        let (parts, windows) = hub_parts(&tree_of(&[
-            ModuleId::editor(),
-            ModuleId::agent(),
-            ModuleId::instance(ModuleKind::Agent, 2).unwrap(),
-        ]));
+        let (parts, windows) = hub_parts(
+            &tree_of(&[
+                ModuleId::editor(),
+                ModuleId::agent(),
+                ModuleId::instance(ModuleKind::Agent, 2).unwrap(),
+            ]),
+            false,
+            None,
+        );
         hub_start(&driver, &host, parts, windows);
         // An orphan the start relinked is linked before the idle runs.
         driver.attach_peer(
@@ -2059,7 +2122,7 @@ mod tests {
 
         let start = |tiling: Tiling, layout_files: &std::path::Path| {
             let (driver, host, scheduler) = setup_with_clock();
-            let layout = hub_layout(&default_start()).0;
+            let layout = hub_layout(&default_start(), false, None).0;
             let workspaces = Workspaces::single();
             let saver = Saver::new(
                 Some(layout_files.to_path_buf()),

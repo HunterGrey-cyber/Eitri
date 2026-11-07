@@ -1,5 +1,5 @@
 [English](configuration.md) | 简体中文
-<!-- translated-from: configuration.md sha256=9a3c3367f221e57af47847e0cc195ed3716d6ba7a4ef2192224623481a0922d8 -->
+<!-- translated-from: configuration.md sha256=41aa3c5254a70807df6c1eefa94236a62007d3a1943c705dece1668419b541ff -->
 
 # 配置
 
@@ -57,7 +57,7 @@ Eitri 说的方式是右上角的一条提示：有几个问题，以及前五�
 | `keymap.from_tmux` | `true` / `"on"` 或 `false` / `"off"` | `"on"` | Eitri 是否从你的 tmux 配置里读取你的 tmux 前缀和前缀表按键。见[按键](#keys)。 |
 | `keymap.which_key_delay` | 0 到 5000 之间的整数，或 `false` / `"off"` | `"off"` | 前缀等第二个键等多少毫秒后，用一个面板列出接下来可以按的键；`0` 立刻显示。见[提示面板](keys.zh-CN.md#the-hint-panel)。companion 窗口和 Mac 上不画。 |
 | `keymap.nvim_prefix` | 一个最长 16 个字符的 Neovim 左端（`"<leader>W"`），或 `false` / `"off"` | `"off"` | 在 Neovim 的 Normal 模式里，把你前缀表里的布局键映射到这个左端之下，每个键运行对应的 `:Eitri` 动作。见[从 Neovim 用：`:Eitri`](keys.zh-CN.md#from-neovim-eitri)。 |
-| `window.restore` | `true` / `"on"` 或 `false` / `"off"` | `true` | 持有这对窗口的窗口，是否在下次启动时恢复这对窗口上次结束时仍开着的窗口 2，以及合成器窗口组的窗口 1 是否恢复它的窗口、它们的输出和底部终端。设为 `false` 时，窗口 1 收回窗口 2 持有的东西，并提供它保存的标签页。见[两个窗口](two-windows.zh-CN.md)和[合成器窗口](compositor-windows.zh-CN.md#coming-back)。 |
+| `window.restore` | `true` / `"on"` 或 `false` / `"off"` | `true` | 持有这对窗口的窗口，是否在下次启动时恢复这对窗口上次结束时仍开着的窗口 2，以及合成器窗口组的窗口 1 是否恢复它的窗口、它们的输出和底部终端的高度（终端启动时是隐藏的，除非 `eitri.layout.default` 显示它）。设为 `false` 时，窗口 1 收回窗口 2 持有的东西，并提供它保存的标签页。见[两个窗口](two-windows.zh-CN.md)和[合成器窗口](compositor-windows.zh-CN.md#coming-back)。 |
 | `window.desktop_start` | `"choose"`、`"last"` 或 `"cwd"` | `"choose"` | 从桌面启动 Eitri 而不带文件或文件夹时做什么。`"choose"` 先在一个小窗口里显示[你的项目列表](getting-started.md#打开一个项目)；`"last"` 不先显示窗口，直接打开你最近用过且还在的项目，没有这样的项目时才显示列表；`"cwd"` 打开启动器所在的目录，和有列表之前一样。其他值会在启动时被列出，设置保持 `"choose"`。只有这种桌面启动会读它：在终端里运行的 `eitri`、`<prefix> O` 列表和带路径的启动都不看它。 |
 | `window.tiling` | `"auto"`、`"eitri"` 或 `"compositor"` | `"auto"` | 聊天和页面由谁排布。`"auto"` 在 Hyprland、sway 或 niri 回答时让它们成为窗口管理器的窗口，在别的地方留在 Eitri 的窗口里；`"eitri"` 留在里面；`"compositor"` 在任何 Wayland 桌面上都让它们成为窗口。其他值会在启动时被列出，设置保持 `"auto"`。见[合成器窗口](compositor-windows.zh-CN.md)。 |
 | `companion.wm` | `"auto"`、`"hyprland"`、`"sway"`、`"niri"`、`"gnome"` 或 `"none"` | `"auto"` | 由哪个窗口管理器适配器在 [companion 窗口](companion.zh-CN.md)和你的编辑器之间移动焦点。`"auto"` 从会话里检测；`"none"` 从不向窗口管理器请求任何东西。 |

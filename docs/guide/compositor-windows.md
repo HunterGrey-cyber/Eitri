@@ -67,15 +67,16 @@ this time: chat windows were waiting to be relinked`).
 
 ## What opens
 
-- **Window 1** holds the editor and one bottom terminal, which its key shows and hides. It has one workspace, and its top
-  bar adds up the other windows' waiting cards and running turns (`chats: ⚑1 ●2`).
+- **Window 1** opens with the editor alone. Its one bottom terminal stays hidden until its key shows it, and the same
+  key hides it again. It has one workspace, and its top bar adds up the other windows' waiting cards and running turns (`chats: ⚑1 ●2`).
 - **A chat window** holds one chat view with its own tab strip. There are up to nine, `c1` to `c9`.
 - **A page window** holds one plugin page or Lua panel. A panel gets a window only if its id uses letters, digits, `.`,
   `_` and `-`, is at most 40 bytes long, and starts and ends with a letter or digit. Any other id opens nothing, and a
   toast names the rule.
 
 Your start layout decides which windows open. Every chat and page that `eitri.layout.default` shows becomes a window, in
-order, and a `terminal` in it becomes the bottom terminal. With no layout of your own, the first launch opens `c1`. A chat
+order, and a `terminal` it shows is shown below the editor: that is the one way window 1 starts with its terminal
+open. With no layout of your own, the first launch opens `c1`. A chat
 or page the layout hides stays closed until you press its key. Windows the start opens leave the keys in the editor; a
 window you open with a key comes forward.
 
@@ -212,8 +213,8 @@ ended`), and so does the message when the tab comes back, with `agent.restore = 
 
 When nvim exits in window 1 (`:qa` or `:wqa`, say), window 1 closes the same way: at once when everything is idle,
 and with that same question when something would be cut short. Answer `n` and the group stays: the bottom terminal
-takes the window and the keys, and `<prefix> e` starts nvim again. The terminal showing up here is not remembered: the
-next start shows it only if it was shown before nvim exited, or if you show it or change its height afterwards.
+takes the window and the keys, and `<prefix> e` starts nvim again. The next start opens window 1 with the editor alone,
+as every start does.
 
 Closing a chat window asks only while a turn runs (`close window? 1 running (y/n)`), and when it is idle it closes with no
 question. **This differs from `eitri` mode,** where closing a window always kept its tabs: here a chat window you close
@@ -224,8 +225,9 @@ Eitri window on the project links up to all of them.
 
 ## Coming back
 
-`window.restore` decides whether the group comes back: which windows open, which output each goes to, and whether the
-bottom terminal is shown and how tall it is. The keys end in window 1. With `false`, the start layout decides. Either
+`window.restore` decides whether the group comes back: which windows open, which output each goes to, and how tall the
+bottom terminal is when you next show it. The terminal itself starts hidden either way, unless your
+`eitri.layout.default` shows it. The keys end in window 1. With `false`, the start layout decides. Either
 way every chat window that has saved tabs opens too, unless `agent.restore` is `"off"`, and `agent.restore` decides
 whether the tabs return at once or wait for your answer.
 

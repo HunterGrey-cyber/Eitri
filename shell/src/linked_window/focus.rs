@@ -467,7 +467,7 @@ mod tests {
             shown: false,
             px: Some(220),
         };
-        session.terminal(&terminal.layout());
+        session.terminal(&terminal.layout(terminal.shown));
         assert_eq!(session.file.terminal, terminal);
         assert_eq!(session.file.windows.len(), 1);
         assert_eq!(session.file.windows[0].order, 0);

@@ -1957,13 +1957,17 @@ fn build_ui(
     // pages, panels and instances the pair does not give it marked away; an unpaired window's copy of window 1's
     // layout with every away mark dropped, since it builds its own instance of everything; window 1's layouts as
     // the pair file has them, which wins over its own file's away marks.
-    // A hub's shape is fixed: the layout chosen above decides which chats and pages open as windows, and nothing more.
+    // A hub's shape is fixed: only the user's default can show its terminal at start; the record keeps its height
+    // and window order, otherwise the layout chosen above decides which chats and pages open as windows.
     let mut restore_base: Option<(eitri_core::layout::Layout, eitri_core::layout::Workspaces)> = None;
     let mut hub_cm_start = None;
     if hub {
-        let (mut layout, mut open) = eitri_core::wm::start::hub_layout(&start_layout);
+        let (layout, mut open) = eitri_core::wm::start::hub_layout(
+            &start_layout,
+            lua_default.is_some(),
+            cm_restore.as_ref().map(|f| &f.terminal),
+        );
         if let Some(file) = &cm_restore {
-            layout = file.terminal.layout();
             open = file
                 .ordered_windows()
                 .into_iter()

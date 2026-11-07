@@ -64,7 +64,7 @@ fn a_hubs_top_bar_sums_its_chat_windows_under_one_word() {
 fn the_terminal_key_shows_the_bottom_terminal_in_window_1() {
     use crate::wm::start::hub_layout;
     let first_launch = crate::wm::persist::first_launch_layout(&[]).unwrap();
-    let mut r = rig_in(Tiling::Hub, hub_layout(&first_launch).0);
+    let mut r = rig_in(Tiling::Hub, hub_layout(&first_launch, false, None).0);
     let terminal = ModuleId::terminal();
     assert!(!r.layout.borrow().is_shown(&terminal));
     r.controller

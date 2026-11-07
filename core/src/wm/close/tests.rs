@@ -1330,7 +1330,7 @@ fn hub_of(running: &[u32]) -> Rig {
 /// [`hub_of`] links them.
 fn hub_start(running: &[u32]) -> Rig {
     let first_launch = crate::wm::persist::first_launch_layout(&[]).unwrap();
-    let r = driven_tiled(crate::wm::start::hub_layout(&first_launch).0, Tiling::Hub);
+    let r = driven_tiled(crate::wm::start::hub_layout(&first_launch, false, None).0, Tiling::Hub);
     link_chats(&r, running);
     r
 }
@@ -1914,7 +1914,7 @@ fn a_module_window_that_hears_window_1_close_closes_itself() {
 #[test]
 fn a_declined_close_after_a_hubs_nvim_exited_leaves_the_terminal_and_the_way_back() {
     let first_launch = crate::wm::persist::first_launch_layout(&[]).unwrap();
-    let mut hub = rig_with(crate::wm::start::hub_layout(&first_launch).0, |_, _| None);
+    let mut hub = rig_with(crate::wm::start::hub_layout(&first_launch, false, None).0, |_, _| None);
     let window = hub.controller.window_mut(WIN).unwrap();
     window.tiling = Tiling::Hub;
     window.editor_spawn = Some(EditorSpawn {

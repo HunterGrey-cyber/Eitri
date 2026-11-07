@@ -39,8 +39,9 @@ impl CmTerminal {
         }
     }
 
-    /// The shape stays the editor above the terminal; only the terminal's height and visibility are remembered.
-    pub fn layout(&self) -> Layout {
+    /// The record keeps the terminal's height below the editor; visibility comes from the caller, so a start never
+    /// brings the terminal back just because it was shown in the record.
+    pub fn layout(&self, shown: bool) -> Layout {
         let mut root = crate::layout::hub_tree().layout.root().clone();
         if let Some(px) = self.px.and_then(|px| i32::try_from(px).ok()).filter(|px| *px > 0) {
             if let Some(child) = root
@@ -53,7 +54,7 @@ impl CmTerminal {
         }
         let mut layout =
             Layout::new(Node::Con(root), ModuleId::editor()).expect("the hub has its editor above its terminal");
-        if !self.shown {
+        if !shown {
             crate::layout::hide(
                 &mut layout,
                 &ModuleId::terminal(),
@@ -291,10 +292,17 @@ mod tests {
         );
         assert_eq!(file.output(&WindowName::Chat(2)), None);
         assert_eq!(notes.len(), 4);
-        let layout = file.terminal.layout();
+        let layout = file.terminal.layout(file.terminal.shown);
         assert_eq!(CmTerminal::of(&layout), file.terminal);
         assert_eq!(layout.modules(), vec![ModuleId::editor(), ModuleId::terminal()]);
         assert_eq!(layout.focus(), &ModuleId::editor());
+        let terminal = CmTerminal {
+            shown: true,
+            px: file.terminal.px,
+        };
+        let layout = terminal.layout(false);
+        assert!(!layout.is_shown(&ModuleId::terminal()));
+        assert_eq!(CmTerminal::of(&layout).px, terminal.px);
     }
 
     #[test]
