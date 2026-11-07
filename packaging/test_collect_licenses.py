@@ -701,6 +701,32 @@ class CFileClassification(unittest.TestCase):
     def test_an_unknown_file_has_no_component(self):
         for f in ("crtstuff.cc", "start.c", "libgcc2.c", "hb-blob.c"):
             self.assertIsNone(cl.classify_c_file(f, set()), f)
+        # ring's file names are ring's only through the crate's own source list.
+        self.assertIsNone(cl.classify_c_file("p256-nistz.c", {"lapi.c"}))
+
+    def test_a_file_of_the_ring_crate_is_rings(self):
+        ring = {"p256-nistz.c", "curve25519.c", "limbs.c"}
+        for f in sorted(ring):
+            self.assertEqual(cl.classify_c_file(f, {"lapi.c"}, ring), "ring", f)
+        self.assertEqual(cl.classify_c_file("lapi.c", {"lapi.c"}, ring), "Lua")
+
+    def test_the_trees_ring_lists_the_c_files_its_build_script_compiles(self):
+        # The C files that kept code in a debug `shell` on 2026-11-07, all from ring's own tree.
+        _, by_nv = cl.cargo_packages()
+        pkg, files = cl.ring_c_files(by_nv)
+        self.assertIsNotNone(pkg, "the shipped tree has ring (rustls's provider)")
+        self.assertLessEqual({"p256-nistz.c", "curve25519.c", "gfp_p384.c", "aes_nohw.c", "limbs.c",
+                              "curve25519_64_adx.c", "cpu_intel.c", "crypto.c", "mem.c"}, files)
+        self.assertNotIn("lapi.c", files)
+        entry = cl.ring_component(pkg, {"shell"})
+        self.assertEqual(entry["title"], f"ring {pkg['version']} (C compiled by its build script)")
+        self.assertEqual(entry["license"], pkg["license"])
+        self.assertIn("into shell;", entry["note"])
+        self.assertIn("LICENSE", [name for name, _ in entry["files"]])
+        self.assertTrue(all(text.strip() for _, text in entry["files"]))
+
+    def test_no_ring_in_the_tree_means_no_ring_files(self):
+        self.assertEqual(cl.ring_c_files({("lua-src", "1"): [{"manifest_path": "/x/Cargo.toml"}]}), (None, set()))
 
     def test_the_gcc_runtime_entry_carries_the_pinned_exception_text(self):
         entry = cl.gcc_runtime_component({"shell", "eitri-editor-bridge"})

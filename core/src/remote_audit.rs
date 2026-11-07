@@ -362,10 +362,11 @@ pub enum Event {
         command_id: String,
         text: Option<TextDigest>,
     },
-    /// `dropped`: how many records the writer did not write since its last recorded one, carried on the next refusal
-    /// it writes. `serve` counts the refusals before any device was proved that it bounds (anyone who can reach a
-    /// listener can be refused); a window counts every record its full queue dropped, refusal or not, so a count there
-    /// can stand for commands and enrollments too, and waits for the window's next refusal.
+    /// `kind`: a phone command's kind word, only as [`command_kind`] gives it, so a phone's own text never reaches the
+    /// log through it. `dropped`: how many records the writer did not write since its last recorded one, carried on the
+    /// next refusal it writes. `serve` counts the refusals before any device was proved that it bounds (anyone who can
+    /// reach a listener can be refused); a window counts every record its full queue dropped, refusal or not, so a
+    /// count there can stand for commands and enrollments too, and waits for the window's next refusal.
     Refused {
         reason: Reason,
         device: Option<DeviceRef>,
@@ -375,6 +376,22 @@ pub enum Event {
         kind: Option<String>,
         dropped: Option<u64>,
     },
+}
+
+/// The kinds of command a phone may send, as `cmd` and `refused` records name them.
+pub const COMMAND_KINDS: [&str; 6] = [
+    "interrupt",
+    "send",
+    "queue",
+    "stop_background",
+    "stop_task",
+    "take_back",
+];
+
+/// The kind word of a phone command, when `word` is one; a word from the wire is recorded only as one of these, by
+/// `serve` and by a window alike.
+pub fn command_kind(word: &str) -> Option<&'static str> {
+    COMMAND_KINDS.into_iter().find(|kind| *kind == word)
 }
 
 /// An event's fields, in the order they are written.
@@ -995,6 +1012,23 @@ mod tests {
     use super::testing::*;
     use super::*;
     use std::os::unix::fs::PermissionsExt;
+
+    #[test]
+    fn only_a_known_command_kind_is_a_kind() {
+        for kind in COMMAND_KINDS {
+            assert_eq!(command_kind(kind), Some(kind));
+        }
+        for word in [
+            "",
+            "Send",
+            "send ",
+            "approve",
+            "my secret prompt",
+            "permission_response",
+        ] {
+            assert_eq!(command_kind(word), None, "{word:?}");
+        }
+    }
 
     #[test]
     fn record_has_required_fields_and_chain() {

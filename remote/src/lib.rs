@@ -23,7 +23,8 @@ pub const USAGE: &str = "usage: eitri remote <command>
 const COMMAND_USAGE: &[(&str, &str)] = &[
     (
         "serve",
-        "eitri remote serve [--listen loopback|socket|<address>] [--port <port>] [--origin <name>]...",
+        "eitri remote serve [--listen loopback|socket|<address>] [--port <port>] [--origin <name>]... \
+         [--audit-keep-days <days>] [--no-notify]",
     ),
     ("stop", "eitri remote stop"),
     ("status", "eitri remote status"),
@@ -165,6 +166,20 @@ mod tests {
             "{}",
             help(Some("serve"))
         );
+        // Every option `serve` parses is in its usage.
+        for option in [
+            "--listen",
+            "--port",
+            "--origin",
+            "--audit-keep-days <days>",
+            "--no-notify",
+        ] {
+            assert!(
+                help(Some("serve")).contains(option),
+                "{option}: {}",
+                help(Some("serve"))
+            );
+        }
         assert!(help(Some("ssh-key")).contains("ssh-key add <file>"));
         for (name, _) in COMMAND_USAGE {
             let text = help(Some(name));

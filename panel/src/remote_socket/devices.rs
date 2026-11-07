@@ -23,8 +23,8 @@
 //!
 //! A phone's `revoke_self` and `set_push_endpoint` carry its token: the token is checked against the store on the
 //! reader's thread and dropped there, so only the device id goes on. A push endpoint is checked there too (`http` or
-//! `https`, a host, no user information, at most [`PUSH_ENDPOINT_MAX_BYTES`]). Revoking takes the device out of the
-//! store, and its push endpoint with it. At most [`PHONE_ERRANDS_MAX`] of these are at work at once, each on a thread
+//! `https`, a host, no user information, at most [`eitri_core::remote_devices::PUSH_ENDPOINT_MAX_BYTES`]). Revoking
+//! takes the device out of the store, and its push endpoint with it. At most [`PHONE_ERRANDS_MAX`] of these are at work at once, each on a thread
 //! that may wait for the store's lock; one more is answered [`ERRANDS_BUSY`] at once.
 //!
 //! `devices_connected` is `serve`'s report, sent on every open and close, and written on the reader's thread in the
@@ -120,9 +120,9 @@ pub(super) const PHONE_ERRANDS_MAX: usize = 4;
 /// What a phone-sent errand is told when [`PHONE_ERRANDS_MAX`] are already at work.
 pub(super) const ERRANDS_BUSY: &str = "the desk is still changing the device store: try again";
 
+use eitri_core::remote_devices::push_endpoint_ok;
 #[cfg(test)]
-pub(super) use eitri_core::remote_devices::BAD_PUSH_ENDPOINT;
-pub use eitri_core::remote_devices::{push_endpoint_ok, PUSH_ENDPOINT_MAX_BYTES};
+pub(super) use eitri_core::remote_devices::{BAD_PUSH_ENDPOINT, PUSH_ENDPOINT_MAX_BYTES};
 
 /// The devices flagged in this process, by id: each is shown once, whichever window reads it first.
 static FLAGGED: Mutex<BTreeSet<String>> = Mutex::new(BTreeSet::new());

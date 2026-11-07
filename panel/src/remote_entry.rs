@@ -937,21 +937,6 @@ pub(super) fn audit_reason(why: &RemoteRefusal, at: RefusedAt) -> Reason {
     }
 }
 
-/// The kind word of a message a phone may send, when `word` is one; a word from the wire is recorded only as one of
-/// these.
-pub(super) fn known_kind(word: &str) -> Option<&'static str> {
-    [
-        "interrupt",
-        "send",
-        "queue",
-        "stop_background",
-        "stop_task",
-        "take_back",
-    ]
-    .into_iter()
-    .find(|kind| *kind == word)
-}
-
 /// What a remote message was, read once it parsed, for its record: its kind, its command id, its text's length and
 /// hash, and the tab's number and revision when the message was taken.
 pub(super) struct Taken {
@@ -1063,6 +1048,26 @@ mod tests {
     use super::*;
     use crate::agent_panel::tests::*;
     use eitri_core::tab_set::RowKey;
+
+    #[test]
+    fn every_message_kind_is_a_recordable_command_kind() {
+        let messages = [
+            r#"{"type":"interrupt","command_id":"c","expect_work":{"unseen":1}}"#,
+            r#"{"type":"send","command_id":"c","text":"t"}"#,
+            r#"{"type":"queue","command_id":"c","text":"t"}"#,
+            r#"{"type":"stop_background","command_id":"c"}"#,
+            r#"{"type":"stop_task","command_id":"c","task":"b1"}"#,
+            r#"{"type":"take_back","command_id":"c"}"#,
+        ];
+        let kinds: Vec<&str> = messages
+            .iter()
+            .map(|raw| serde_json::from_str::<RemoteInbound>(raw).unwrap().kind())
+            .collect();
+        assert_eq!(kinds, eitri_core::remote_audit::COMMAND_KINDS);
+        for kind in kinds {
+            assert_eq!(eitri_core::remote_audit::command_kind(kind), Some(kind));
+        }
+    }
 
     fn provenance_snapshot(handle: &AgentPanelHandle, tab: TabId) -> serde_json::Value {
         let payloads = handle.state.borrow_mut().tabs.state_payloads(tab);

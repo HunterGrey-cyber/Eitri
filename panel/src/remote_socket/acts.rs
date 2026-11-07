@@ -61,7 +61,7 @@ impl ActInbound {
         let kind = cmd
             .get("type")
             .and_then(serde_json::Value::as_str)
-            .and_then(crate::agent_panel::remote_entry::known_kind);
+            .and_then(eitri_core::remote_audit::command_kind);
         let command_id = cmd
             .get("command_id")
             .and_then(serde_json::Value::as_str)

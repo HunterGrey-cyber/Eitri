@@ -619,7 +619,7 @@ pub(super) fn handle_inbound_message(
                 }
                 // Whether remote control is on here, and who is connected from a phone: a new document starts with
                 // neither.
-                payloads.extend(super::remote_enroll::remote_on_for_new_document(state));
+                payloads.extend(super::remote_enroll::remote_on_for_new_document(state, view));
                 payloads.extend(super::remote_enroll::connected_for_new_document(state));
                 // The remote-control questions still waiting: the document that was here, if any, took them with it.
                 if view.is_base() {

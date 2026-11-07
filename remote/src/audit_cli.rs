@@ -206,6 +206,20 @@ fn verify_at(dir: &Path, journal: &dyn JournalSource, our_exe: &str, out: &mut d
             "journal entries not sent by this binary or not records: {}",
             report.forged
         ));
+        // Who sent them, as the journal names the executable: another Eitri build reads as its path.
+        for (exe, n) in report.forged_senders.iter().take(FORGED_SENDERS_SHOWN) {
+            match exe.as_str() {
+                "" => lines.push(format!("  from no executable the journal named: {n}")),
+                exe if exe == our_exe => lines.push(format!("  from this binary, not records: {n}")),
+                exe => lines.push(format!("  from {}: {n}", shown(exe))),
+            }
+        }
+        if report.forged_senders.len() > FORGED_SENDERS_SHOWN {
+            lines.push(format!(
+                "  and {} more executables",
+                report.forged_senders.len() - FORGED_SENDERS_SHOWN
+            ));
+        }
     }
     for (run, from, to) in &report.journal_gaps {
         lines.push(format!(
@@ -222,6 +236,9 @@ fn verify_at(dir: &Path, journal: &dyn JournalSource, our_exe: &str, out: &mut d
     }
     1
 }
+
+/// How many of the executables that sent entries not counted as records `--verify` names.
+const FORGED_SENDERS_SHOWN: usize = 8;
 
 /// The journal's entries as already read (none when it could not be read: the chain alone is checked).
 struct Fetched(Vec<JournalEntry>);
@@ -690,6 +707,45 @@ mod tests {
         for shown in ["\\u{1b}", "\\u{202e}", "\\u{2066}", "\\u{a}"] {
             assert!(out.contains(shown), "{shown} missing: {out}");
         }
+        std::fs::remove_dir_all(dir.parent().unwrap()).unwrap();
+    }
+
+    #[test]
+    fn verify_names_who_sent_the_entries_it_does_not_count() {
+        let dir = scratch("verify-senders");
+        let mut log = open(&dir);
+        for n in 0..2 {
+            log.record(conn_open(&format!("d{n}"), "phone")).unwrap();
+        }
+        let mut journal = Copy::of(&dir, OUR_EXE);
+        let other = Copy::of(&dir, "/home/me/eitri/target/debug/shell");
+        journal.0.extend(other.0);
+        journal.0.push(JournalEntry {
+            exe: Some("/srv/x\u{1b}[2J".into()),
+            record: Some("not a record".into()),
+        });
+        journal.0.push(JournalEntry {
+            exe: None,
+            record: None,
+        });
+        journal.0.push(JournalEntry {
+            exe: Some(OUR_EXE.into()),
+            record: Some("not a record".into()),
+        });
+        let (code, out, err) = run(&dir, &["--verify"], &journal);
+        assert_eq!(code, 1, "{out}{err}");
+        for line in [
+            "journal entries not sent by this binary or not records: 5",
+            "  from /home/me/eitri/target/debug/shell: 2",
+            "  from no executable the journal named: 1",
+            "  from this binary, not records: 1",
+        ] {
+            assert!(out.lines().any(|l| l == line), "{line:?} missing: {out}");
+        }
+        assert!(
+            !out.contains('\u{1b}'),
+            "a sender's path is shown, not printed as is: {out:?}"
+        );
         std::fs::remove_dir_all(dir.parent().unwrap()).unwrap();
     }
 

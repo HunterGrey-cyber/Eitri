@@ -1145,6 +1145,15 @@ const POLICY: u16 = 1008;
 const PROTOCOL_ERROR: u16 = 1002;
 const NORMAL: u16 = 1000;
 
+/// The kind of an `act`'s command, for its record: only a word of the closed list, so a phone cannot put text of its
+/// own into the log as a kind.
+fn act_kind(cmd: &serde_json::Value) -> Option<String> {
+    cmd.get("type")
+        .and_then(serde_json::Value::as_str)
+        .and_then(eitri_core::remote_audit::command_kind)
+        .map(str::to_owned)
+}
+
 /// How a session that ends on `event` says why in its `conn_close`; a close from outside says its own.
 fn ending_word(event: &Event) -> &'static str {
     match event {
@@ -1283,14 +1292,15 @@ impl Control {
         Ok(())
     }
 
-    /// Records a refusal of something this connection sent, where it came in.
+    /// Records a refusal of something this connection sent, where it came in. The tab key is the phone's, so it is
+    /// recorded only when it is a key at all.
     fn record_refusal(&self, reason: Reason, device: Option<DeviceRef>, key: Option<String>, kind: Option<String>) {
         self.hub.audit.record(AuditEvent::Refused {
             reason,
             device,
             listener: Some(self.listener.clone()),
             peer: Some(self.peer.clone()),
-            key,
+            key: key.filter(|key| RowKey::parse(key).is_some()),
             kind,
             dropped: None,
         });
@@ -1299,6 +1309,14 @@ impl Control {
     /// The device this connection's `hello` proved, as the log names it.
     fn named(&self) -> Option<DeviceRef> {
         self.opened.clone()
+    }
+
+    /// [`Self::named`], or the id `device` alone before the name is known.
+    fn device_named(&self, device: &str) -> DeviceRef {
+        self.named().unwrap_or_else(|| DeviceRef {
+            id: device.to_owned(),
+            name: String::new(),
+        })
     }
 
     fn verified(&self) -> Option<(&str, &Secret, Grant)> {
@@ -1441,8 +1459,16 @@ impl Control {
                             cmd,
                         },
                     ),
-                    (Grant::WatchSteer, Route::Refused(why)) => Err(why),
-                    (Grant::WatchSteer, _) => Err(NO_SUCH_TAB),
+                    (Grant::WatchSteer, routed) => {
+                        // No window will see this act: the refusal is recorded here, as a window records one for a
+                        // tab it does not hold.
+                        let named = self.device_named(&device);
+                        self.record_refusal(Reason::TabNotLive, Some(named), Some(key), act_kind(&cmd));
+                        Err(match routed {
+                            Route::Refused(why) => why,
+                            _ => NO_SUCH_TAB,
+                        })
+                    }
                 };
                 if let Err(why) = sent {
                     self.local(result_line(command_id.as_deref(), Err(why)));
@@ -1503,12 +1529,8 @@ impl Control {
     /// An `act` from a `watch` device, refused here: recorded with the command's kind (never its text), and the
     /// window that owns the tab is told, so the desk sees the attempt as it sees its own refusals.
     fn refuse_watch_act(&mut self, device: &str, key: &str, cmd: &serde_json::Value, routed: &Route) {
-        let kind = cmd.get("type").and_then(serde_json::Value::as_str).map(str::to_owned);
-        let named = self.named().unwrap_or_else(|| DeviceRef {
-            id: device.to_owned(),
-            name: String::new(),
-        });
-        self.record_refusal(Reason::Grant, Some(named.clone()), Some(key.to_owned()), kind);
+        let named = self.device_named(device);
+        self.record_refusal(Reason::Grant, Some(named.clone()), Some(key.to_owned()), act_kind(cmd));
         if let Route::Owner { instance } = routed {
             let notice = RvInbound::RefusedNotice {
                 v: RV_PROTOCOL,
@@ -2057,6 +2079,22 @@ mod tests {
         let records = answer["records"].as_array().unwrap();
         assert_eq!(records.len(), 1, "{answer}");
         assert_eq!(records[0]["device"], "d1");
+    }
+
+    #[test]
+    fn an_acts_kind_is_recorded_only_as_a_known_word() {
+        use serde_json::json;
+        assert_eq!(act_kind(&json!({"type": "send", "text": "t"})).as_deref(), Some("send"));
+        assert_eq!(act_kind(&json!({"type": "take_back"})).as_deref(), Some("take_back"));
+        for cmd in [
+            json!({"type": "a prompt the phone chose"}),
+            json!({"type": "Send"}),
+            json!({"type": 7}),
+            json!({"text": "no type"}),
+            json!("not an object"),
+        ] {
+            assert_eq!(act_kind(&cmd), None, "{cmd}");
+        }
     }
 
     #[test]

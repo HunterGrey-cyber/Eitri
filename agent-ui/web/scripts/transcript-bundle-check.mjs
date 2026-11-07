@@ -27,9 +27,10 @@ export const KEYMAP_MARKERS = [
  *  bundled, whatever happened to the help text and however the minifier wrote the call. */
 export const KEYMAP_CODE = ['AltGraph', 'Hyper'];
 
-/** Message kinds the desk's page sends to its host (`type` in `src/bridge.ts`) that answer, send, stop or copy: the
- *  phone's page sends only its own four (`ready`, `more`, `open_link`, `want_snapshot`), so any of these as a string
- *  in the page means a module that posts them was bundled, even where nothing draws it. */
+/** Message kinds the desk's page sends to its host (`type` in `src/bridge.ts`) that answer, send, stop, copy, or
+ *  open the device list, make an enrollment code from it or revoke a device: the phone's page sends only its own four
+ *  (`ready`, `more`, `open_link`, `want_snapshot`), so any of these as a string in the page means a module that posts
+ *  them was bundled, even where nothing draws it. */
 export const DESK_POSTS = [
   'permission_response',
   'question_answer',
@@ -44,6 +45,10 @@ export const DESK_POSTS = [
   'editor_card_answer',
   'remote_enroll_answer',
   'remote_listen_answer',
+  'remote_devices_open',
+  'remote_start_enroll',
+  'remote_revoke_ask',
+  'remote_revoke',
   'send_message',
   'send_now',
   'queue_message',

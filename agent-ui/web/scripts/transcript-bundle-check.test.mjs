@@ -55,7 +55,17 @@ test('keymap code in the built page fails', () => {
 });
 
 test('a desk message kind in the built page fails, in either quote', () => {
-  for (const kind of ['question_answer', 'trust_cancel', 'copy_primary', 'send_message', 'permission_response']) {
+  for (const kind of [
+    'question_answer',
+    'trust_cancel',
+    'copy_primary',
+    'send_message',
+    'permission_response',
+    'remote_devices_open',
+    'remote_start_enroll',
+    'remote_revoke_ask',
+    'remote_revoke',
+  ]) {
     assert.ok(DESK_POSTS.includes(kind), kind);
   }
   for (const kind of DESK_POSTS) {

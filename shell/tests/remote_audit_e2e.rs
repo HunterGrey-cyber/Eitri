@@ -27,7 +27,7 @@ use eitri_core::agent_backend::AgentId;
 use eitri_core::agent_bridge::SessionModeChoice;
 use eitri_core::agents::{new_instance, ProjectRef, Publisher, Row, WindowRef};
 use eitri_core::lua::config::{RemoteListen, RemoteSettings};
-use eitri_core::remote_audit::{audit_dir, read, Filter, Record, JOURNAL_SOCKET_VAR};
+use eitri_core::remote_audit::{audit_dir, command_kind, read, Filter, Record, JOURNAL_SOCKET_VAR};
 use eitri_core::remote_pairing::{Endpoint, PairMode, PairScheme, PairingRoutes};
 use eitri_core::remote_runtime::{start_serve, RemotePlan};
 use eitri_core::remote_rv::serve_socket_path;
@@ -860,34 +860,37 @@ impl Phone {
     }
 
     /// Like [`Self::act`], for a key whose row `serve` may not have read yet: until it has, `serve` answers "no such
-    /// tab" itself and records nothing, so the act is sent again, under a new command id, until `logged` says a window
-    /// recorded the refusal (waited for a moment after each "no such tab", which a window says too).
+    /// tab" itself and records that refusal as its own, so the act is sent again, under a new command id, until
+    /// `logged` says a window recorded the refusal (waited for a moment after each "no such tab", which a window says
+    /// too). The result, and how many of the attempts `serve` refused itself.
     fn act_routed(
         &mut self,
         windows: &[&Window],
         key: &RowKey,
         cmd: Value,
         logged: impl Fn() -> bool,
-    ) -> Result<Value, String> {
+    ) -> Result<(Value, usize), String> {
         let until = Instant::now() + PATIENCE;
         let id = cmd["command_id"].as_str().unwrap_or_default().to_owned();
+        let mut by_serve = 0;
         for attempt in 0.. {
             let mut cmd = cmd.clone();
             cmd["command_id"] = json!(format!("{id}-{attempt}"));
             let result = self.act(windows, key, cmd)?;
             if result["why"] != "no such tab" {
-                return Ok(result);
+                return Ok((result, by_serve));
             }
             let settle = Instant::now() + Duration::from_secs(1);
             while Instant::now() < settle {
                 if logged() {
-                    return Ok(result);
+                    return Ok((result, by_serve));
                 }
                 for window in windows {
                     window.turn();
                 }
                 std::thread::sleep(Duration::from_millis(20));
             }
+            by_serve += 1;
             if Instant::now() > until {
                 break;
             }
@@ -1299,6 +1302,7 @@ fn the_audit_trail_end_to_end(shell: &str, dir: &Path) -> Result<(), String> {
     )?;
     result_refused(&agent, "a stop the agent cannot carry out")?;
     // Tabs a send cannot reach: no tab behind the key, a Claude tab with no session yet, a Codex tab.
+    let mut serve_refused = 0;
     for (key, id, reason, what) in [
         (&ghost, "c-ghost", "tab_not_live", "a send to a tab that is gone"),
         (
@@ -1314,14 +1318,38 @@ fn the_audit_trail_end_to_end(shell: &str, dir: &Path) -> Result<(), String> {
                 field(r, "reason") == reason
             }) >= 1
         };
-        let refused = phone.act_routed(
+        let (refused, by_serve) = phone.act_routed(
             w,
             key,
             json!({ "type": "send", "command_id": id, "text": format!("{SENTINEL} {id}") }),
             logged,
         )?;
+        serve_refused += by_serve;
         result_refused(&refused, what)?;
     }
+    // A key no row names: no window sees the act, so `serve` records its refusal.
+    let nowhere = phone.act(
+        w,
+        &RowKey::new(),
+        json!({ "type": "send", "command_id": "c-nowhere", "text": format!("{SENTINEL} nowhere") }),
+    )?;
+    result_refused(&nowhere, "a send for a key no row names")?;
+    check(nowhere["why"] == "no such tab", || {
+        format!("a send for a key no row names: {nowhere}")
+    })?;
+    serve_refused += 1;
+    // Text that is no key at all: refused the same way, and recorded without it.
+    phone.send(json!({
+        "kind": "act", "key": format!("{SENTINEL} key"),
+        "cmd": { "type": "send", "command_id": "c-badkey", "text": "x" },
+    }));
+    let lines = phone.until(w, "the result of c-badkey", |l| {
+        l["kind"] == "result" && l["command_id"] == "c-badkey"
+    })?;
+    result_refused(lines.last().ok_or("no result")?, "a send for text that is no key")?;
+    serve_refused += 1;
+    let not_live = |r: &Record| field(r, "reason") == "tab_not_live";
+    wait_for(&home, w, "unrouted acts", By::Serve, "refused", serve_refused, not_live)?;
     // A send waits on the provider; a second one to the same tab is refused as busy meanwhile.
     window.set_mode(&tab_c, SessionModeChoice::Manual)?;
     let release = tab_c.provider.hold_calls();
@@ -1394,6 +1422,13 @@ fn the_audit_trail_end_to_end(shell: &str, dir: &Path) -> Result<(), String> {
         json!({ "type": "send", "command_id": "w-send", "text": format!("{SENTINEL} watcher") }),
     )?;
     result_refused(&denied, "an act of a watch-only device")?;
+    // A kind of the phone's own making is refused the same way, and recorded without it.
+    let odd = watcher.act(
+        w,
+        &tab_a.key,
+        json!({ "type": format!("{SENTINEL} kind"), "command_id": "w-odd" }),
+    )?;
+    result_refused(&odd, "a watch-only act of a kind no phone sends")?;
     let mut answered = false;
     let granted = run_while(home.remote(shell, &["grant", &watch_id, "steer"]), || {
         window.turn();
@@ -1482,7 +1517,7 @@ fn the_audit_trail_end_to_end(shell: &str, dir: &Path) -> Result<(), String> {
     exactly(&all, "the push endpoint", serve, "push_endpoint_set", 1, |r| {
         field(r, "host") == "ntfy.example.org"
     })?;
-    for word in ["bad_token", "revoked_token", "host", "origin", "path_prefix", "grant"] {
+    for word in ["bad_token", "revoked_token", "host", "origin", "path_prefix"] {
         exactly(
             &all,
             &format!("serve's {word} refusals"),
@@ -1491,6 +1526,18 @@ fn the_audit_trail_end_to_end(shell: &str, dir: &Path) -> Result<(), String> {
             1,
             reason(word),
         )?;
+    }
+    let watch_send = |r: &Record| field(r, "reason") == "grant" && field(r, "kind") == "send";
+    let watch_odd = |r: &Record| field(r, "reason") == "grant" && !r.fields.contains_key("kind");
+    let unrouted = |r: &Record| field(r, "reason") == "tab_not_live" && field(r, "kind") == "send";
+    exactly(&all, "watch-only sends", serve, "refused", 1, watch_send)?;
+    exactly(&all, "watch-only acts of no known kind", serve, "refused", 1, watch_odd)?;
+    exactly(&all, "unrouted acts", serve, "refused", serve_refused, unrouted)?;
+    // A kind is only ever one of the closed list, whoever wrote it.
+    for r in all.iter().filter(|r| r.fields.contains_key("kind")) {
+        check(command_kind(field(r, "kind")).is_some(), || {
+            format!("a record names a kind no phone command has: {}", r.line)
+        })?;
     }
     // The window: enrollment and the desk's answers.
     exactly(&all, "codes shown", me, "enroll_offered", 4, any)?;
@@ -1581,7 +1628,7 @@ fn the_audit_trail_end_to_end(shell: &str, dir: &Path) -> Result<(), String> {
         ("cmd/stop_task", 1),
         ("cmd/stop_background", 1),
         ("cmd/interrupt", 2),
-        ("refused", 21),
+        ("refused", 22 + serve_refused),
     ]
     .into_iter()
     .map(|(name, n)| (name.to_owned(), n))
@@ -1595,7 +1642,8 @@ fn the_audit_trail_end_to_end(shell: &str, dir: &Path) -> Result<(), String> {
         ("serve", "host", 1),
         ("serve", "origin", 1),
         ("serve", "path_prefix", 1),
-        ("serve", "grant", 1),
+        ("serve", "grant", 2),
+        ("serve", "tab_not_live", serve_refused),
         ("window", "enroll_code_invalid", 2),
         ("window", "not_allowed", 1),
         ("window", "slash_or_bang", 1),
@@ -1730,6 +1778,7 @@ fn the_audit_trail_end_to_end(shell: &str, dir: &Path) -> Result<(), String> {
     check(
         found.code == Some(1)
             && says(&found, "journal entries not sent by this binary or not records: ") == ["1"]
+            && says(&found, "  from /usr/bin/forger: ") == ["1"]
             && says(&found, "altered in the file: ").is_empty()
             && says(&found, "missing from the file: ").is_empty(),
         || format!("verify of a forged entry: {}", found.says()),

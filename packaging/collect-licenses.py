@@ -604,9 +604,10 @@ GCC_RUNTIME_C_FILES = {"crtstuff.c"}
 GCC_RUNTIME_TITLE = "GCC runtime startup code (crtstuff.c)"
 
 
-def classify_c_file(f, lua_files):
+def classify_c_file(f, lua_files, ring_files=frozenset()):
     """The component a C source file (an STT_FILE name) belongs to, or None when this script has no
-    licence text for it -- which fails the run (native_components())."""
+    licence text for it -- which fails the run (native_components()). `lua_files` and `ring_files`
+    are the C file names of the lua-src and ring crates' own source trees."""
     if f in lua_files:
         return "Lua"
     if f in _FREETYPE_MODULES or re.match(r"^ft\w*\.c$", f):
@@ -619,7 +620,37 @@ def classify_c_file(f, lua_files):
         return "Chromium zlib"
     if f in GCC_RUNTIME_C_FILES:
         return "GCC runtime"
+    if f in ring_files:
+        return "ring"
     return None
+
+
+def ring_c_files(by_nv):
+    """The ring crate's package (from cargo metadata) and the names of every C file its source tree
+    holds, or (None, empty set) when the tree has no ring. ring's build script compiles its bundled C
+    (BoringSSL-derived field arithmetic, AES, curve25519) and assembly into the binary with `cc`; the
+    crate's own licence files cover that code, so it is the crate's component, not a library of its own."""
+    pkgs = [p for (n, _), ps in by_nv.items() if n == "ring" for p in ps]
+    if not pkgs:
+        return None, set()
+    if len(pkgs) != 1:
+        raise Fail(f"expected at most one ring in cargo metadata, found {len(pkgs)}")
+    d = os.path.dirname(pkgs[0]["manifest_path"])
+    return pkgs[0], {f for _, _, files in os.walk(d) for f in files if f.endswith(".c")}
+
+
+def ring_component(pkg, bins):
+    """The entry for ring's C, compiled by its build script into `bins`, with the crate's own licence
+    files (the same texts as its cargo entry in part 1, so the output points back to them)."""
+    d = os.path.dirname(pkg["manifest_path"])
+    files = [(f, read_text(os.path.join(d, f))) for f in license_files(d)]
+    if not files:
+        raise Fail(f"ring {pkg['version']} ships no licence file for the C its build script compiles")
+    return {"title": f"ring {pkg['version']} (C compiled by its build script)", "license": pkg["license"],
+            "status": None,
+            "note": f"the ring crate's bundled C, compiled by its build script into {', '.join(sorted(bins))}; "
+                    "the crate's own licence files",
+            "files": files}
 
 
 def gcc_runtime_component(bins):
@@ -735,16 +766,19 @@ def native_components(by_nv, shipped, binaries_dir, skia_license_dir=None):
     lua_files = set()
     for d in glob.glob(os.path.join(pkg_dir("lua-src"), "lua-*")):
         lua_files |= {f for f in os.listdir(d) if f.endswith(".c")}
+    ring_pkg, ring_files = ring_c_files(by_nv)
     c_seen = {}
     for b in SHIPPED_BINARIES:
         for f in c_files_with_code(shipped[b]):
-            comp = classify_c_file(f, lua_files)
+            comp = classify_c_file(f, lua_files, ring_files)
             if comp is None:
                 raise Fail(f"{b} contains code compiled from {f}, which belongs to no component this "
                            "script has a licence text for. Find which library it is and add it.")
             c_seen.setdefault(comp, set()).add(b)
     if "GCC runtime" in c_seen:
         comps.append(gcc_runtime_component(c_seen["GCC runtime"]))
+    if "ring" in c_seen:
+        comps.append(ring_component(ring_pkg, c_seen["ring"]))
 
     # Lua, compiled from lua-src's vendored C by mlua-sys's build script.
     hit = any_sym({"lua_newstate"})
@@ -832,7 +866,8 @@ def native_components(by_nv, shipped, binaries_dir, skia_license_dir=None):
     need = {"Lua": lambda t: t.startswith("Lua "), "FreeType": lambda t: t == "FreeType",
             "libpng": lambda t: t == "libpng", "zlib": lambda t: t == "zlib (inflate)",
             "Chromium zlib": lambda t: t.startswith("Chromium zlib"),
-            "GCC runtime": lambda t: t == GCC_RUNTIME_TITLE}
+            "GCC runtime": lambda t: t == GCC_RUNTIME_TITLE,
+            "ring": lambda t: t.startswith("ring ")}
     for comp, bins in sorted(c_seen.items()):
         if not any(need[comp](t) for t in titles):
             raise Fail(f"{', '.join(sorted(bins))} contains {comp} code (by its C source files) but "

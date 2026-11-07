@@ -435,16 +435,16 @@ pub(super) fn take_requests(state: &mut AgentPanelState) -> Vec<DeskRequest> {
     state.remote_desk.requests.drain(..).collect()
 }
 
-/// Remote control is on in this window (its socket is with the panel): every page is told once, so the device list's
-/// key is offered from now on.
+/// Remote control is on in this window (its socket is with the panel): the base page is told once, so the device
+/// list's key is offered from now on. An extra chat view is never told: the list is the base page's, and a view that
+/// cannot open it does not offer its key.
 pub(super) fn switch_on(state: &mut AgentPanelState, out: &mut Outbox) {
     if state.remote_desk.on {
         return;
     }
     state.remote_desk.on = true;
-    let views: Vec<ViewId> = state.pages.keys().copied().collect();
-    for view in views {
-        out.send(view, remote_on_payload());
+    if state.pages.contains_key(&ViewId::BASE) {
+        out.send(ViewId::BASE, remote_on_payload());
     }
 }
 
@@ -452,9 +452,9 @@ fn remote_on_payload() -> String {
     serde_json::json!({ "kind": "remote_on" }).to_string()
 }
 
-/// What a document that has just said `ready` is told about remote control being on.
-pub(super) fn remote_on_for_new_document(state: &AgentPanelState) -> Option<String> {
-    state.remote_desk.on.then(remote_on_payload)
+/// What a document that has just said `ready` in `view` is told about remote control being on: only the base page's.
+pub(super) fn remote_on_for_new_document(state: &AgentPanelState, view: ViewId) -> Option<String> {
+    (state.remote_desk.on && view.is_base()).then(remote_on_payload)
 }
 
 /// One device of the list as the base page is shown it: the store's entry, where its notifications go (the host
@@ -1231,19 +1231,19 @@ mod tests {
         open(ViewId::BASE, "o1");
         assert_eq!(result_for(&base.sent.borrow(), "o1"), Some(Err(REMOTE_OFF.into())));
         assert!(base.sent.borrow().iter().all(|e| json_of(e)["kind"] != "remote_on"));
-        assert!(remote_on_for_new_document(&handle.state.borrow()).is_none());
+        assert!(remote_on_for_new_document(&handle.state.borrow(), ViewId::BASE).is_none());
         assert!(take_requests(&mut handle.state.borrow_mut()).is_empty());
 
         handle.run(|state, out| switch_on(state, out));
-        for page in [&base, &second] {
+        for (page, told) in [(&base, 1), (&second, 0)] {
             assert_eq!(
                 page.sent
                     .borrow()
                     .iter()
                     .filter(|e| json_of(e)["kind"] == "remote_on")
                     .count(),
-                1,
-                "every page is told once"
+                told,
+                "the base page is told once, an extra view never"
             );
         }
         handle.run(|state, out| switch_on(state, out));
@@ -1255,7 +1255,11 @@ mod tests {
                 .count(),
             1
         );
-        assert!(remote_on_for_new_document(&handle.state.borrow()).is_some());
+        assert!(remote_on_for_new_document(&handle.state.borrow(), ViewId::BASE).is_some());
+        assert!(
+            remote_on_for_new_document(&handle.state.borrow(), view(2)).is_none(),
+            "an extra view's new document does not offer the device list's key"
+        );
 
         open(view(2), "o2");
         assert_eq!(

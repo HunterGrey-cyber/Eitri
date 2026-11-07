@@ -36,6 +36,9 @@ pub struct VerifyReport {
     pub altered: Vec<String>,
     /// Entries not sent by the Eitri binary, or that are not records.
     pub forged: usize,
+    /// Those entries by the `_EXE` the journal gave them (empty for an entry without one), so another Eitri build of
+    /// the user's own can be told apart from a stranger.
+    pub forged_senders: BTreeMap<String, usize>,
     /// `("<writer> <run>", seq, next seq)` where a run's journal copies skip numbers: messages the journal dropped.
     pub journal_gaps: Vec<(String, u64, u64)>,
 }
@@ -99,7 +102,11 @@ pub fn verify(dir: &Path, journal: &dyn JournalSource, our_exe: &str) -> io::Res
     for entry in &entries {
         match entry.record.as_deref().and_then(Record::parse) {
             Some(record) if ours_exe(&entry.exe) => ours.push(record),
-            _ => report.forged += 1,
+            _ => {
+                report.forged += 1;
+                let sender = entry.exe.clone().unwrap_or_default();
+                *report.forged_senders.entry(sender).or_default() += 1;
+            }
         }
     }
     let in_journal: HashSet<&str> = ours.iter().map(|r| r.line.as_str()).collect();
@@ -420,7 +427,13 @@ mod tests {
                 ..e
             })
             .collect();
-        assert_eq!(verify(&dir, &Entries(other), EXE).unwrap().forged, 3);
+        let report = verify(&dir, &Entries(other), EXE).unwrap();
+        assert_eq!(report.forged, 3);
+        assert_eq!(
+            report.forged_senders,
+            BTreeMap::from([(format!("{EXE}-evil"), 3)]),
+            "the sender is named"
+        );
     }
 
     #[test]
