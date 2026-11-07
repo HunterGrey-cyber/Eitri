@@ -138,7 +138,8 @@ export function RemoteEnroll({
       {question?.kind === "remote_enroll" && (
         <div className="remote-question">
           <div>
-            Add device <Revealed pieces={revealHidden(question.name)} />, paired {question.target}, connecting
+            Add device <Revealed pieces={revealHidden(question.name)} />, paired{" "}
+            <Revealed pieces={revealHidden(question.target)} />, connecting
             through <Revealed pieces={revealHidden(question.host)} /> from{" "}
             <Revealed pieces={revealHidden(question.peer)} />? (y/n)
           </div>

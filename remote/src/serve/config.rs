@@ -150,6 +150,19 @@ pub struct Record {
     pub args: Vec<String>,
     /// `full` or `partial` ([`super::sandbox::SandboxState::word`]).
     pub sandbox: String,
+    /// Why the sandbox is partial; older records carry only the word.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sandbox_why: Option<String>,
+}
+
+impl Record {
+    /// The sandbox word and, when recorded, the reason for incomplete confinement.
+    pub fn sandbox_text(&self) -> String {
+        match &self.sandbox_why {
+            Some(why) if self.sandbox != "full" => format!("{} ({why})", self.sandbox),
+            _ => self.sandbox.clone(),
+        }
+    }
 }
 
 /// The version of [`Record`] this build writes and reads.
@@ -268,6 +281,17 @@ mod tests {
 
     fn parsed(words: &[&str]) -> Result<ServeConfig, String> {
         ServeConfig::from_args(&args(words), || Ok(41000), tailnet)
+    }
+
+    #[test]
+    fn sandbox_records_read_old_words_and_preserve_new_reasons() {
+        let old = r#"{"v":1,"pid":1,"args":[],"sandbox":"partial"}"#;
+        let mut record: Record = serde_json::from_str(old).unwrap();
+        assert_eq!(record.sandbox_why, None);
+        assert_eq!(record.sandbox_text(), "partial");
+        record.sandbox_why = Some("the kernel has no Landlock".into());
+        let record: Record = serde_json::from_slice(&serde_json::to_vec(&record).unwrap()).unwrap();
+        assert_eq!(record.sandbox_text(), "partial (the kernel has no Landlock)");
     }
 
     #[test]

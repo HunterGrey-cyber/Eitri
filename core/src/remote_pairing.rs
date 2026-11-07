@@ -528,7 +528,7 @@ pub fn interface_of(addr: IpAddr) -> Option<String> {
 /// Wildcards and loopback are not named addresses.
 pub fn named_listen_addr(text: &str) -> Option<IpAddr> {
     let bare = text.strip_prefix('[').and_then(|t| t.strip_suffix(']')).unwrap_or(text);
-    let addr: IpAddr = bare.parse().ok()?;
+    let addr: IpAddr = bare.parse::<IpAddr>().ok()?.to_canonical();
     if addr.is_unspecified() || addr.is_loopback() {
         return None;
     }
@@ -905,7 +905,22 @@ mod tests {
     fn named_listen_address_is_one_address_and_no_wildcard() {
         assert_eq!(named_listen_addr("198.51.100.2"), Some("198.51.100.2".parse().unwrap()));
         assert_eq!(named_listen_addr("[fd00::2]"), Some("fd00::2".parse().unwrap()));
-        for refused in ["0.0.0.0", "::", "127.0.0.1", "::1", "198.51.100.2:7341", "desk.lan", ""] {
+        assert_eq!(
+            named_listen_addr("::ffff:198.51.100.2"),
+            Some("198.51.100.2".parse().unwrap()),
+            "a mapped address is the IPv4 one"
+        );
+        for refused in [
+            "0.0.0.0",
+            "::",
+            "127.0.0.1",
+            "::1",
+            "::ffff:127.0.0.1",
+            "[::ffff:0.0.0.0]",
+            "198.51.100.2:7341",
+            "desk.lan",
+            "",
+        ] {
             assert_eq!(named_listen_addr(refused), None, "{refused}");
         }
     }

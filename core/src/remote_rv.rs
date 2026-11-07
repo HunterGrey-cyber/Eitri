@@ -474,8 +474,13 @@ pub enum RvOutbound {
     /// The enrollment was turned down, or the desk said no.
     EnrollRefused { v: u32, why: String },
     /// The answer to `start_enroll`: the window shows a code whose phone pairs by `recipe` and dials `target`
-    /// ([`crate::remote_pairing::Endpoint::describe`]).
-    EnrollShown { v: u32, recipe: PairMode, target: String },
+    /// ([`crate::remote_pairing::Endpoint::describe`]); `other` says whether the window has a route by the other recipe.
+    EnrollShown {
+        v: u32,
+        recipe: PairMode,
+        target: String,
+        other: bool,
+    },
     /// The desk's answer about listening on `addr`.
     ListenAnswer { v: u32, addr: String, yes: bool },
 }

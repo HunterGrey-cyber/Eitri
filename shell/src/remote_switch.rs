@@ -11,7 +11,7 @@
 //! keys, which may have changed since it started. And it looks once more [`IDLE_EDGE`] later: a `serve` that had just
 //! seen no window, and so ends, may have held the lock when this window looked, and this window would otherwise be left
 //! with no `serve` until another window starts. That second look starts nothing when `eitri remote stop` ran since
-//! `STOP_WAIT` before the first look (`serve::stopped_since`), including a stop still waiting for the lock to go:
+//! `STOP_NOTE_REACH` before the first look (`serve::stopped_since`), including a stop still waiting for the lock to go:
 //! an explicit stop is not the idle exit it is there for.
 //!
 //! What keeps a window that asked for remote control from having it is said on the window's toast as well as on
@@ -31,7 +31,7 @@ use eitri_core::remote_rv::RV_IDLE;
 use eitri_core::remote_rv::{parse_rv_outbound, rv_socket_path, RvClient, RvInbound, RvOutbound, RV_PROTOCOL};
 use eitri_panel::agent_panel::{Pairing, RemoteSocket};
 use eitri_remote::serve::spawn::{plan, running_config, ServeEnded, ServeSpawner};
-use eitri_remote::serve::{stopped_since, Dirs, STOP_WAIT};
+use eitri_remote::serve::{stopped_since, Dirs, STOP_NOTE_REACH};
 use gtk4::glib;
 
 use crate::agent_panel::AgentPanelHandle;
@@ -141,7 +141,16 @@ pub(crate) fn start(
     });
 }
 
-/// Fail closed, including for settings read after startup validation or in a window without startup notices.
+/// For a window without the full startup notice, forward the remote-off problems validation already recorded.
+pub(crate) fn startup_notices(problems: &[String], notice: &dyn Fn(String)) {
+    for problem in problems {
+        if let Some(at) = problem.find("Remote control: off:") {
+            notice(problem[at..].to_owned());
+        }
+    }
+}
+
+/// Fail closed if settings read outside startup validation are invalid; settled errors live in startup problems.
 fn read_settings(config: &ConfigStore, notice: &dyn Fn(String)) -> Option<RemoteSettings> {
     match RemoteSettings::read(config) {
         Ok(settings) => Some(settings),
@@ -164,7 +173,7 @@ fn switch_on(
     spawner: &dyn Spawner,
     idle_wait: impl FnOnce(),
 ) {
-    // Include a stop already in flight: it can hold the lock for STOP_WAIT after writing its note.
+    // Include a stop already in flight: serve can still hold the lock while stop checks, signals and waits.
     let looked = SystemTime::now();
     let mut now = plan(settings, dirs);
     let RemotePlan::On {
@@ -201,8 +210,7 @@ fn switch_on(
             ..
         }
     );
-    let record_since = Arc::new(std::sync::Mutex::new((!found_running).then_some(looked)));
-    socket.watch_serve(serve_probe(dirs.clone(), notes.clone(), record_since.clone()));
+    socket.watch_serve(serve_probe(dirs.clone(), notes.clone()));
     let paired = if found_running {
         paired_with_running(dirs, &cfg, notes)
     } else {
@@ -230,7 +238,7 @@ fn switch_on(
     let mut ask_listen = ask_listen;
     if found_running {
         idle_wait();
-        if stopped_since(dirs, looked - STOP_WAIT) {
+        if stopped_since(dirs, looked - STOP_NOTE_REACH) {
             println!("[remote] eitri remote stop ran: serve stays stopped until a window starts");
             return;
         }
@@ -259,11 +267,8 @@ fn switch_on(
             }
         }
     }
-    let starting = SystemTime::now();
     match start_serve(&now, spawner) {
         Ok(true) => {
-            // The second look may have replaced a server whose sandbox was already read. Wait for the new record.
-            *record_since.lock().unwrap_or_else(|e| e.into_inner()) = Some(starting);
             println!("[remote] started eitri remote serve {}", cfg.args().join(" "));
         }
         Ok(false) => {}
@@ -271,49 +276,40 @@ fn switch_on(
     }
 }
 
-/// The socket's maintenance reader: no lock I/O without phones, and a sandbox warning only once per window.
-fn serve_probe(
-    dirs: Dirs,
-    notes: Notes,
-    record_since: Arc<std::sync::Mutex<Option<SystemTime>>>,
-) -> impl FnMut(bool) -> (Option<bool>, Option<String>) + Send {
+/// The socket's maintenance reader: probe liveness only with phones; validate a new record under the held lock.
+/// A cached record needs no lock I/O without phones, and a sandbox warning is said only once per window.
+fn serve_probe(dirs: Dirs, notes: Notes) -> impl FnMut(bool) -> (Option<bool>, Option<String>) + Send {
+    let mut pid = None;
     let mut sandbox = None;
     let mut warned = false;
-    let mut last_since = None;
     move |phones| {
-        let since = *record_since.lock().unwrap_or_else(|e| e.into_inner());
-        if since != last_since {
-            sandbox = None;
-            last_since = since;
-        }
-        let previous = sandbox.clone();
         let running = phones.then(|| eitri_remote::serve::is_running(&dirs).ok()).flatten();
-        if running != Some(false) && (phones || sandbox.is_none()) {
-            // A delayed start (the desk may still be answering about an address) must not use a dead server's record.
-            if let Some(since) = since {
-                let fresh = std::fs::metadata(dirs.control.join(eitri_remote::serve::RECORD_FILE))
-                    .and_then(|m| m.modified())
-                    .is_ok_and(|at| at >= since);
-                if !fresh {
-                    return (running, None);
-                }
-            }
-            if let Some((record, _)) = eitri_remote::serve::read_record(&dirs) {
+        // A whole record is trusted only while serve holds its lock: it empties the old record on taking the lock
+        // and writes the new one before letting it go. A new pid also catches a replacement started by another window.
+        if let Some((record, _)) = eitri_remote::serve::read_record(&dirs) {
+            if pid != Some(record.pid) && running.or_else(|| eitri_remote::serve::is_running(&dirs).ok()) == Some(true)
+            {
+                pid = Some(record.pid);
                 if !warned {
-                    if let Some(text) = sandbox_text(&record.sandbox) {
+                    if let Some(text) = sandbox_text(&record) {
                         say(&notes, text);
                         warned = true;
                     }
                 }
+                let changed = sandbox.as_ref() != Some(&record.sandbox);
                 sandbox = Some(record.sandbox);
+                return (running, sandbox.clone().filter(|_| changed));
             }
         }
-        (running, sandbox.clone().filter(|_| sandbox != previous))
+        (running, None)
     }
 }
 
-fn sandbox_text(sandbox: &str) -> Option<String> {
-    (sandbox != "full").then(|| "serve runs with a partial sandbox; `eitri remote status` says more".to_owned())
+fn sandbox_text(record: &eitri_remote::serve::config::Record) -> Option<String> {
+    (record.sandbox != "full").then(|| match &record.sandbox_why {
+        Some(why) => format!("serve runs with a partial sandbox: {why}"),
+        None => "serve runs with a partial sandbox (no reason recorded)".to_owned(),
+    })
 }
 
 /// What the reaper of a `serve` this window started tells the desk: a `serve` with other keys found running (named
@@ -441,9 +437,13 @@ mod tests {
     }
 
     fn write_record(dirs: &Dirs, sandbox: &str) {
+        write_record_pid(dirs, sandbox, 1);
+    }
+
+    fn write_record_pid(dirs: &Dirs, sandbox: &str, pid: u32) {
         agent::private_fs::write_private(
             &dirs.control.join(eitri_remote::serve::RECORD_FILE),
-            serde_json::json!({"v":1,"pid":1,"args":["--listen","loopback","--port","7500"],"sandbox":sandbox})
+            serde_json::json!({"v":1,"pid":pid,"args":["--listen","loopback","--port","7500"],"sandbox":sandbox, "sandbox_why": (sandbox == "partial").then_some("the kernel has no Landlock")})
                 .to_string()
                 .as_bytes(),
         )
@@ -463,6 +463,30 @@ mod tests {
         assert!(said[0].contains("remote.listen") && said[0].contains("wildcard"));
     }
 
+    fn hold_serve(dirs: &Dirs) -> agent::private_fs::PrivateLock {
+        let lock = agent::private_fs::PrivateLock::open(&dirs.control.join(eitri_remote::serve::LOCK_FILE)).unwrap();
+        assert!(lock.try_lock().unwrap());
+        lock
+    }
+
+    #[test]
+    fn remote_startup_problems_are_forwarded_without_the_full_notice() {
+        let problems = vec![
+            "init.lua:3: Remote control: off: remote.listen refuses a wildcard".into(),
+            "Remote control: off: remote.port could not be stored (expected a string or number)".into(),
+            "init.lua:4: no setting agent.wrong".into(),
+        ];
+        let said = std::cell::RefCell::new(Vec::new());
+        startup_notices(&problems, &|line| said.borrow_mut().push(line));
+        assert_eq!(
+            *said.borrow(),
+            vec![
+                "Remote control: off: remote.listen refuses a wildcard",
+                "Remote control: off: remote.port could not be stored (expected a string or number)",
+            ]
+        );
+    }
+
     #[test]
     fn a_partial_sandbox_is_said_once_whether_serve_was_started_or_found() {
         for record_ready in [true, false] {
@@ -473,23 +497,32 @@ mod tests {
             });
             let dirs = dirs_at(&dir);
             let (notes, mut noted) = futures_channel::mpsc::unbounded();
+            let mut probe = serve_probe(dirs.clone(), notes);
+            write_record(&dirs, "full");
+            assert_eq!(probe(false), (None, None), "a dead server's record is ignored");
+            let held = hold_serve(&dirs);
             if !record_ready {
-                write_record(&dirs, "full");
-            }
-            let since = Arc::new(std::sync::Mutex::new((!record_ready).then(SystemTime::now)));
-            let mut probe = serve_probe(dirs.clone(), notes, since);
-            if !record_ready {
-                assert_eq!(probe(false), (None, None));
+                agent::private_fs::write_private(&dirs.control.join(eitri_remote::serve::RECORD_FILE), b"").unwrap();
+                assert_eq!(probe(false), (None, None), "wait for a whole record");
             }
             write_record(&dirs, "partial");
+            // Filesystems may round a write's timestamp down; neither that nor another window's start matters.
+            let file = std::fs::File::open(dirs.control.join(eitri_remote::serve::RECORD_FILE)).unwrap();
+            file.set_times(std::fs::FileTimes::new().set_modified(SystemTime::UNIX_EPOCH))
+                .unwrap();
             assert_eq!(probe(false), (None, Some("partial".into())));
             assert_eq!(
                 noted.try_recv().unwrap(),
-                "Remote control: serve runs with a partial sandbox; `eitri remote status` says more"
+                "Remote control: serve runs with a partial sandbox: the kernel has no Landlock"
             );
             probe(false);
             assert!(noted.try_recv().is_err());
-            assert!(sandbox_text("full").is_none());
+            write_record_pid(&dirs, "full", 2);
+            assert_eq!(probe(false), (None, Some("full".into())));
+            write_record_pid(&dirs, "partial", 3);
+            assert_eq!(probe(false), (None, Some("partial".into())));
+            assert!(noted.try_recv().is_err(), "once per window, even after replacement");
+            drop(held);
             std::fs::remove_dir_all(dir).unwrap();
         }
     }
@@ -499,15 +532,50 @@ mod tests {
         let dir = scratch("sandbox-replaced");
         let dirs = dirs_at(&dir);
         let (notes, mut noted) = futures_channel::mpsc::unbounded();
-        let since = Arc::new(std::sync::Mutex::new(None));
-        let mut probe = serve_probe(dirs.clone(), notes, since.clone());
+        let mut probe = serve_probe(dirs.clone(), notes);
+        let held = hold_serve(&dirs);
         write_record(&dirs, "full");
         assert_eq!(probe(false), (None, Some("full".into())));
-        *since.lock().unwrap() = Some(SystemTime::now());
-        assert_eq!(probe(false), (None, None), "the previous server's record is too old");
-        write_record(&dirs, "partial");
-        assert_eq!(probe(false), (None, Some("partial".into())));
-        assert!(noted.try_recv().unwrap().contains("partial sandbox"));
+        drop(held);
+        assert_eq!(probe(true), (Some(false), None));
+        write_record_pid(&dirs, "partial", 2);
+        assert_eq!(probe(false), (None, None), "an unlocked record is ignored");
+        let held = hold_serve(&dirs);
+        assert_eq!(
+            probe(false),
+            (None, Some("partial".into())),
+            "another window can start the replacement"
+        );
+        assert!(noted.try_recv().unwrap().contains("the kernel has no Landlock"));
+        drop(held);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn serve_probe_checks_the_real_lock_only_when_needed() {
+        let dir = scratch("probe-lock");
+        let dirs = dirs_at(&dir);
+        let (notes, _noted) = futures_channel::mpsc::unbounded();
+        let mut probe = serve_probe(dirs.clone(), notes);
+        let held = hold_serve(&dirs);
+        write_record(&dirs, "full");
+        assert_eq!(probe(true), (Some(true), Some("full".into())));
+        drop(held);
+        assert_eq!(probe(true), (Some(false), None));
+        // Opening a PrivateLock repairs its mode to 0600, making an accidental lock open observable.
+        use std::os::unix::fs::PermissionsExt;
+        let lock_path = dirs.control.join(eitri_remote::serve::LOCK_FILE);
+        std::fs::set_permissions(&lock_path, std::fs::Permissions::from_mode(0o640)).unwrap();
+        assert_eq!(probe(false), (None, None));
+        assert_eq!(
+            std::fs::metadata(&lock_path).unwrap().permissions().mode() & 0o777,
+            0o640
+        );
+        assert_eq!(probe(true), (Some(false), None));
+        assert_eq!(
+            std::fs::metadata(&lock_path).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
         std::fs::remove_dir_all(dir).unwrap();
     }
 
@@ -547,16 +615,25 @@ mod tests {
     #[test]
     fn switch_on_rechecks_running_serve_and_honours_a_stop_already_in_flight() {
         // The stop note is written before the first look, while the stand-in still holds the lock.
-        for case in ["same", "idle", "recent-stop", "old-stop", "during-stop"] {
+        for case in [
+            "same",
+            "idle",
+            "recent-stop",
+            "stop-overhead",
+            "old-stop",
+            "during-stop",
+        ] {
             let dir = scratch(case);
             let dirs = dirs_at(&dir);
             let lock =
                 agent::private_fs::PrivateLock::open(&dirs.control.join(eitri_remote::serve::LOCK_FILE)).unwrap();
             assert!(lock.try_lock().unwrap());
             write_record(&dirs, "full");
-            if matches!(case, "recent-stop" | "old-stop") {
+            if matches!(case, "recent-stop" | "stop-overhead" | "old-stop") {
                 let age = if case == "old-stop" {
-                    STOP_WAIT + Duration::from_secs(60)
+                    STOP_NOTE_REACH + Duration::from_secs(60)
+                } else if case == "stop-overhead" {
+                    eitri_remote::serve::STOP_WAIT + Duration::from_millis(500)
                 } else {
                     Duration::from_millis(1)
                 };

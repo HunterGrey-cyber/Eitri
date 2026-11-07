@@ -109,9 +109,11 @@ mod linux {
     /// starts none after a stop.
     pub const STOPPED_FILE: &str = "remote-stopped";
 
-    /// How long `stop` waits for the signalled server to release its lock. A window's second look includes this
-    /// much time before its first look, since a stop may already be in flight while the lock is still held.
+    /// How long `stop` waits for the signalled server to release its lock.
     pub const STOP_WAIT: Duration = Duration::from_secs(5);
+    /// A window's look-back for a stop already in flight: the note precedes the lock check, record read and signal,
+    /// so allow a second for those steps as well as the wait for serve to release its lock.
+    pub const STOP_NOTE_REACH: Duration = STOP_WAIT.saturating_add(Duration::from_secs(1));
 
     /// `serve` could not start: an I/O failure or the sandbox.
     pub const EXIT_FAILED: i32 = 1;
@@ -206,7 +208,8 @@ mod linux {
 
         let state = sandbox(&dirs.agents(), &dirs.control, &dirs.state)
             .map_err(|e| failed(format!("could not confine itself: {e}")))?;
-        if let Some(missing) = state.missing() {
+        let sandbox_why = state.missing();
+        if let Some(missing) = &sandbox_why {
             eprintln!("[remote] serving with a partial sandbox: {missing}");
         }
         let record = Record {
@@ -214,6 +217,7 @@ mod linux {
             pid: std::process::id(),
             args: cfg.to_args(),
             sandbox: state.word().to_owned(),
+            sandbox_why,
         };
         let mut line = serde_json::to_vec(&record).map_err(|e| failed(e.to_string()))?;
         line.push(b'\n');
@@ -450,22 +454,26 @@ mod linux {
         let mut out = io::stdout().lock();
         match read_record(&dirs) {
             Some((record, cfg)) => {
-                let origins = if cfg.origins.is_empty() {
-                    "none".to_owned()
-                } else {
-                    cfg.origins.join(" ")
-                };
-                let _ = writeln!(out, "running: pid {}", record.pid);
-                let _ = writeln!(out, "listen: {}", cfg.listen_text());
-                let _ = writeln!(out, "port: {}", cfg.port);
-                let _ = writeln!(out, "origins: {origins}");
-                let _ = writeln!(out, "sandbox: {}", record.sandbox);
+                let _ = write_status(&mut out, &record, &cfg);
             }
             None => {
                 let _ = writeln!(out, "running: starting");
             }
         }
         0
+    }
+
+    fn write_status(out: &mut impl Write, record: &Record, cfg: &ServeConfig) -> io::Result<()> {
+        let origins = if cfg.origins.is_empty() {
+            "none".to_owned()
+        } else {
+            cfg.origins.join(" ")
+        };
+        writeln!(out, "running: pid {}", record.pid)?;
+        writeln!(out, "listen: {}", cfg.listen_text())?;
+        writeln!(out, "port: {}", cfg.port)?;
+        writeln!(out, "origins: {origins}")?;
+        writeln!(out, "sandbox: {}", record.sandbox_text())
     }
 
     /// Notes that `eitri remote stop` runs now, for [`stopped_since`].
@@ -566,6 +574,20 @@ mod linux {
             let record = state.parent().unwrap().join("control").join(RECORD_FILE);
             *RECORD_AT_BIND.lock().unwrap() = Some(std::fs::read_to_string(record).unwrap_or_default());
             None
+        }
+
+        #[test]
+        fn status_prints_the_recorded_sandbox_reason() {
+            let record: Record = serde_json::from_str(
+                r#"{"v":1,"pid":1,"args":[],"sandbox":"partial","sandbox_why":"the kernel has no Landlock"}"#,
+            )
+            .unwrap();
+            let cfg = ServeConfig::from_args(&[], || Ok(7500), |_| None).unwrap();
+            let mut out = Vec::new();
+            write_status(&mut out, &record, &cfg).unwrap();
+            assert!(String::from_utf8(out)
+                .unwrap()
+                .ends_with("sandbox: partial (the kernel has no Landlock)\n"));
         }
 
         #[test]

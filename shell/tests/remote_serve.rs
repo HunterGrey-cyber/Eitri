@@ -234,8 +234,18 @@ fn shell_remote(shell: &str, home: &Home, args: &[&str]) -> Command {
     command
 }
 
+fn kernel_landlock_abi() -> u32 {
+    // SAFETY: the version query takes a null pointer and size zero and writes no memory.
+    let abi = unsafe { libc::syscall(libc::SYS_landlock_create_ruleset, std::ptr::null::<u8>(), 0usize, 1u32) };
+    if abi > 0 {
+        abi as u32
+    } else {
+        0
+    }
+}
+
 fn landlock_in_kernel() -> bool {
-    std::fs::read_to_string("/sys/kernel/security/lsm").is_ok_and(|lsm| lsm.split(',').any(|m| m.trim() == "landlock"))
+    kernel_landlock_abi() > 0
 }
 
 fn sandbox_forbids_exec_and_writes_in_every_thread(_shell: &str, dir: &Path) -> Result<(), String> {
@@ -246,7 +256,7 @@ fn sandbox_forbids_exec_and_writes_in_every_thread(_shell: &str, dir: &Path) -> 
     std::fs::write(home.home().join("truncate-me"), b"kept").unwrap();
     let run = run(home.child("sandbox-thread"))?;
     let out = &run.stdout;
-    let full = landlock_in_kernel();
+    let abi = kernel_landlock_abi();
     let mut wanted = vec![
         "state ok",
         "thread exec refused",
@@ -256,14 +266,9 @@ fn sandbox_forbids_exec_and_writes_in_every_thread(_shell: &str, dir: &Path) -> 
         "thread home-truncate EPERM",
         "dumpable false",
     ];
-    if full {
-        wanted.extend([
-            "sandbox full",
-            "thread home-write refused",
-            "thread store-write refused",
-        ]);
-    } else {
-        wanted.push("sandbox partial");
+    wanted.push(if abi >= 9 { "sandbox full" } else { "sandbox partial" });
+    if abi > 0 {
+        wanted.extend(["thread home-write refused", "thread store-write refused"]);
     }
     for line in wanted {
         if !out.lines().any(|l| l == line) {
@@ -274,7 +279,7 @@ fn sandbox_forbids_exec_and_writes_in_every_thread(_shell: &str, dir: &Path) -> 
         return Err(run.says());
     }
     // Without Landlock nothing stops that write; only seccomp's refusals hold there.
-    if full && home.home().join("written-by-a-thread").exists() {
+    if abi > 0 && home.home().join("written-by-a-thread").exists() {
         return Err("a thread wrote under $HOME".to_owned());
     }
     if std::fs::read(home.home().join("truncate-me")).ok().as_deref() != Some(b"kept".as_slice()) {
@@ -434,16 +439,18 @@ fn serve_is_not_dumpable_and_status_says_how_it_runs(shell: &str, dir: &Path) ->
     let home = Home::new(dir);
     let (serve, status) = start_serve(shell, &home)?;
     let pid = serve.0.id();
-    let wanted_sandbox = if landlock_in_kernel() {
-        "sandbox: full"
-    } else {
-        "sandbox: partial"
-    };
+    let record: eitri_remote::serve::config::Record =
+        serde_json::from_slice(&std::fs::read(home.control().join(eitri_remote::serve::RECORD_FILE)).unwrap()).unwrap();
+    let wanted_word = if kernel_landlock_abi() >= 9 { "full" } else { "partial" };
+    if record.sandbox != wanted_word || (wanted_word == "partial" && record.sandbox_why.is_none()) {
+        return Err(format!("sandbox record lacks the expected word or reason: {record:?}"));
+    }
+    let wanted_sandbox = format!("sandbox: {}", record.sandbox_text());
     for line in [
         &format!("running: pid {pid}") as &str,
         "listen: socket",
         "origins: none",
-        wanted_sandbox,
+        &wanted_sandbox,
     ] {
         if !status.stdout.lines().any(|l| l == line) {
             return Err(format!("status lacks {line:?}; {}", status.says()));

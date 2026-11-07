@@ -161,8 +161,9 @@ impl DevicesShared {
 
 /// An errand as the reader hands it to the tick.
 pub(super) enum DevicesInbound {
-    /// A code was made and is to be shown; `add-device` is told where its phone goes.
-    StartEnroll(PairingShown, Endpoint),
+    /// A code was made and is to be shown; `add-device` is told where its phone goes, and whether the window has a
+    /// route by the other recipe.
+    StartEnroll(PairingShown, Endpoint, bool),
     /// A phone presented this window's code in time: the desk is to be asked.
     Enroll(EnrollAsk),
     /// The desk said yes and the device is stored: the token goes to the phone.
@@ -251,10 +252,11 @@ impl DevicesInbound {
     }
 }
 
-/// Whether a phone that presented a code sending it to `endpoint` came the way the code says: it says it used the
-/// code's recipe, and a code for the SSH recipe came through an SSH forward, which `serve` sees as a loopback peer or
-/// its Unix socket. A direct code cannot be checked the same way (a proxy on the desk is a loopback peer too), so the
-/// desk's question names where the code sends phones.
+/// Whether a phone that presented a code sending it to `endpoint` agrees with it: it says it used the code's recipe,
+/// and a code for the SSH recipe came from a loopback peer or `serve`'s Unix socket, as an SSH forward on the desk
+/// does. This is a check of what the phone says against the code, not a proof of its transport: a proxy on the desk is
+/// a loopback peer too, so a phone that names the code's recipe falsely is not caught here, and the desk's question
+/// names where the code sends phones and where this one came from.
 fn transport_matches(endpoint: &Endpoint, recipe: PairMode, peer: &str) -> Result<(), &'static str> {
     if recipe != endpoint.mode {
         return Err(RECIPE_DIFFERS);
@@ -298,7 +300,11 @@ fn start_enroll(devices: &DevicesShared, recipe: Option<PairMode>, now: Instant)
     let mut issued = devices.issued.lock().unwrap_or_else(|e| e.into_inner());
     issued.codes.issue(code);
     issued.endpoint = Some(endpoint.clone());
-    DevicesInbound::StartEnroll(shown, endpoint)
+    let other = match endpoint.mode {
+        PairMode::Ssh => pairing.routes.direct.is_some(),
+        PairMode::Direct => pairing.routes.ssh.is_some(),
+    };
+    DevicesInbound::StartEnroll(shown, endpoint, other)
 }
 
 /// The store at `store`, or `None` (said why) when it cannot be read; a missing store holds no device.
@@ -706,12 +712,13 @@ impl RemoteSocket {
                 }
                 handle.run(|state, out| show_connected(state, &connected, out));
             }
-            DevicesInbound::StartEnroll(shown, endpoint) => {
+            DevicesInbound::StartEnroll(shown, endpoint, other) => {
                 handle.run(|_state, out| show_pairing(&shown, out));
                 let line = RvOutbound::EnrollShown {
                     v: RV_PROTOCOL,
                     recipe: endpoint.mode,
                     target: endpoint.describe(),
+                    other,
                 };
                 self.answer(conn, line.line());
             }

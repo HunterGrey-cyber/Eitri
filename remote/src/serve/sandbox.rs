@@ -44,17 +44,50 @@ impl SandboxState {
     }
 
     /// Why confinement is incomplete, when it is.
-    pub fn missing(self) -> Option<&'static str> {
+    pub fn missing(self) -> Option<String> {
+        self.missing_for_abi(kernel_abi())
+    }
+
+    fn missing_for_abi(self, abi: Option<u32>) -> Option<String> {
         match self {
             Self::Full => None,
-            Self::PartialLandlock => Some("this kernel lacks some Landlock rights requested by this build"),
-            Self::NoLandlock => Some("this kernel has no Landlock; seccomp and not dumpable only"),
+            Self::PartialLandlock => Some(match abi {
+                Some(abi) => {
+                    let mut lacks = Vec::new();
+                    if abi < 2 {
+                        lacks.push("rules for moving or linking files between directories are unavailable (Landlock denies those operations)");
+                    }
+                    if abi < 3 {
+                        lacks.push("file truncation is not restricted by Landlock (seccomp denies truncate)");
+                    }
+                    if abi < 5 {
+                        lacks.push("ioctl on devices is not restricted");
+                    }
+                    if abi < 9 {
+                        lacks.push("connecting to Unix sockets is not restricted");
+                    }
+                    format!(
+                        "kernel Landlock ABI {abi}; this build requests filesystem rights through ABI 9: {}",
+                        lacks.join("; ")
+                    )
+                }
+                None => "the kernel Landlock ABI could not be read; some requested filesystem rights are not enforced"
+                    .into(),
+            }),
+            Self::NoLandlock => Some("the kernel has no Landlock".into()),
         }
     }
 }
 
 /// The newest Landlock ABI this build knows; rights an older kernel lacks are left out by the binding.
 const LANDLOCK_ABI: ABI = ABI::V9;
+
+/// Reads the kernel's ABI for diagnostics only; the requested rights stay fixed across kernels.
+fn kernel_abi() -> Option<u32> {
+    // SAFETY: the version query takes a null attribute pointer and size zero, and writes no memory.
+    let abi = unsafe { libc::syscall(libc::SYS_landlock_create_ruleset, std::ptr::null::<u8>(), 0usize, 1u32) };
+    (abi > 0).then_some(abi as u32)
+}
 
 /// Confines this process for good. Call it from the main thread before any other thread starts; `Err` when another
 /// thread runs or a step fails, and the process must not go on to serve.
@@ -225,6 +258,26 @@ mod tests {
             let state = from_ruleset_status(status);
             assert_eq!(state, expected);
             assert_eq!(state.missing().is_none(), state == SandboxState::Full);
+        }
+    }
+
+    #[test]
+    fn partial_reasons_name_only_the_requested_rights_the_kernel_lacks() {
+        assert_eq!(
+            SandboxState::NoLandlock.missing_for_abi(None).as_deref(),
+            Some("the kernel has no Landlock")
+        );
+        assert_eq!(SandboxState::Full.missing_for_abi(Some(9)), None);
+        for abi in 1..9 {
+            let why = SandboxState::PartialLandlock.missing_for_abi(Some(abi)).unwrap();
+            assert!(why.contains(&format!("kernel Landlock ABI {abi}")));
+            assert!(why.contains("ABI 9"));
+            assert!(why.contains("connecting to Unix sockets is not restricted"));
+            assert_eq!(why.contains("ioctl on devices"), abi < 5);
+            assert_eq!(why.contains("truncation"), abi < 3);
+            assert_eq!(why.contains("moving or linking"), abi < 2);
+            // This ruleset requests filesystem rights, not AccessNet's TCP rights.
+            assert!(!why.contains("network"));
         }
     }
 

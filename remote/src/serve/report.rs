@@ -1,6 +1,6 @@
 //! Who is connected, told to every Eitri window.
 //!
-//! When a phone's connection is admitted and when it closes, `serve` sends every window's `rv-` socket a
+//! At startup, when a phone's connection is admitted and when it closes, `serve` sends every window's `rv-` socket a
 //! `devices_connected` line naming each phone connected now: its device, the `Host` its request named, the address it
 //! came from and when. A window keeps the device's last sighting from it. The lines go out on a thread of their own,
 //! so no phone's session waits for a window, and a report that finds a newer one queued behind it is skipped.
@@ -32,6 +32,8 @@ impl Reporter {
     /// Starts the reporting thread for the windows whose sockets are in `control_dir`.
     pub fn start(control_dir: &Path) -> std::io::Result<Reporter> {
         let (tx, rx) = mpsc::channel();
+        // A new serve has no phones, even if a window still names phones from the previous process.
+        tx.send(Vec::new()).expect("the report receiver is alive");
         let control = control_dir.to_owned();
         std::thread::Builder::new()
             .name("eitri-remote-report".into())
@@ -73,7 +75,7 @@ fn run(control: &Path, rx: Receiver<Vec<Connected>>) {
             Err(RecvTimeoutError::Timeout) => {}
             Err(RecvTimeoutError::Disconnected) => return,
         }
-        // Before the first report there is nobody to name, and a window starts out naming nobody.
+        // Startup queues an empty report; subsequent reports replace it through the same path.
         let Some(line) = &newest else { continue };
         let present: Vec<Bound> = window_sockets(control).into_iter().filter_map(bound).collect();
         told.retain(|socket| present.contains(socket));
@@ -151,6 +153,50 @@ pub fn window_instances(control: &Path) -> Vec<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_new_serve_reports_nobody_to_existing_and_later_windows() {
+        use std::io::{BufRead, BufReader};
+        use std::os::unix::net::UnixListener;
+        let dir =
+            PathBuf::from(option_env!("CARGO_TARGET_DIR").unwrap_or(concat!(env!("CARGO_MANIFEST_DIR"), "/../target")))
+                .join("tmp/remote-tests")
+                .join(format!("report-start-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        eitri_core::panel_control::ensure_dir(&dir).unwrap();
+        let first = UnixListener::bind(rv_socket_path(&dir, "a3f09c1d2e4b5f60").unwrap()).unwrap();
+        let reporter = Reporter::start(&dir).unwrap();
+        let empty = |listener: &UnixListener| {
+            listener.set_nonblocking(true).unwrap();
+            let until = std::time::Instant::now() + Duration::from_secs(30);
+            let stream = loop {
+                match listener.accept() {
+                    Ok((stream, _)) => break stream,
+                    Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                        assert!(std::time::Instant::now() < until, "no startup report arrived");
+                        std::thread::sleep(Duration::from_millis(10));
+                    }
+                    Err(e) => panic!("{e}"),
+                }
+            };
+            stream.set_read_timeout(Some(Duration::from_secs(30))).unwrap();
+            let mut line = String::new();
+            BufReader::new(stream).read_line(&mut line).unwrap();
+            assert_eq!(
+                eitri_core::remote_rv::parse_rv_line(line.trim_end().as_bytes()).unwrap(),
+                RvInbound::DevicesConnected {
+                    v: RV_PROTOCOL,
+                    devices: Vec::new()
+                }
+            );
+        };
+        empty(&first);
+        let later = UnixListener::bind(rv_socket_path(&dir, "b4e1c09a7d3f5e21").unwrap()).unwrap();
+        empty(&later);
+        drop(reporter);
+        drop((first, later));
+        std::fs::remove_dir_all(dir).unwrap();
+    }
 
     #[test]
     fn window_sockets_are_the_rv_sockets_of_instances() {

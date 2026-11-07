@@ -1,6 +1,5 @@
-import { phoneTitle } from "./band";
 import { describe, expect, it } from "vitest";
-import { backgroundSegment, bandLayout, cardSummary, liveTasks, taskWords, tasksLine, textWidth, usageSegment, type BandFacts } from "./band";
+import { phoneTitle, backgroundSegment, bandLayout, cardSummary, liveTasks, taskWords, tasksLine, textWidth, usageSegment, type BandFacts } from "./band";
 import { applyEvent, initialState } from "./reducer";
 import type { BackgroundTask, BackgroundTaskRecord, TaskKind, TokenUsage } from "./types";
 

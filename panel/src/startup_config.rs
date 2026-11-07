@@ -257,12 +257,15 @@ pub fn settle(kernel: &Kernel) {
             kernel.report_problem(format!("{origin}: no setting {key:?}{hint}"));
         }
     }
-    if !kernel.config.borrow().refusals_under("remote.").is_empty() {
+    let refused_remote = kernel.config.borrow().refusals_under("remote.");
+    if !refused_remote.is_empty() {
         kernel
             .config
             .borrow_mut()
             .set_text(eitri_core::lua::config::REMOTE_ENABLED_KEY, "false");
-        kernel.report_problem("Remote control: off: a remote.* setting could not be stored".to_owned());
+        for (key, why) in refused_remote {
+            kernel.report_problem(format!("Remote control: off: {key} could not be stored ({why})"));
+        }
     }
     // A value that could not be stored reads as unset, which for these settings is the looser side.
     for key in [
@@ -362,10 +365,15 @@ mod tests {
                 !RemoteSettings::read(&kernel.config.borrow()).unwrap().enabled,
                 "{key}: {bad}"
             );
-            assert!(
-                problems.iter().any(|line| line.contains("Remote control: off:")),
-                "{problems:?}"
-            );
+            let off = problems
+                .iter()
+                .find(|line| line.contains("Remote control: off:"))
+                .unwrap();
+            assert!(off.contains(key), "{problems:?}");
+            if bad == "{}" {
+                let why = kernel.config.borrow().refusal_for(key).unwrap();
+                assert!(off.contains(&why), "{problems:?}");
+            }
         }
     }
 

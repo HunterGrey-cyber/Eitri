@@ -422,7 +422,8 @@ fn a_phone_using_ssh_is_enrolled_to_watch() {
         ssh_dir: scratch.0.clone(),
     });
     let mut client = window.connect();
-    let code = window.start(&mut client);
+    let (code, answer) = window.start_by(&mut client, None);
+    assert_eq!(answer["other"], false, "the window has no direct route");
     let shown = window.asked("remote_pairing", 0);
     assert!(shown["uri"].as_str().unwrap().contains("&m=ssh&s=http&"), "{shown}");
     let before = window.count("remote_enroll");
@@ -478,6 +479,7 @@ fn each_enrollment_takes_the_recipe_it_asks_for() {
     let (_, answer) = window.start_by(&mut client, None);
     assert_eq!(answer["recipe"], "direct");
     assert_eq!(answer["target"], "directly to desk.tail1.ts.net:443 (https)");
+    assert_eq!(answer["other"], true, "the SSH route is there too");
     let shown = window.asked("remote_pairing", 0);
     assert!(
         shown["uri"]
@@ -490,6 +492,7 @@ fn each_enrollment_takes_the_recipe_it_asks_for() {
     // `--ssh` still enrolls through SSH alongside the direct route.
     let (code, answer) = window.start_by(&mut client, Some(PairMode::Ssh));
     assert_eq!(answer["recipe"], "ssh");
+    assert_eq!(answer["other"], true);
     assert_eq!(answer["target"], "through SSH to 127.0.0.1:41000 on this desk");
     let shown = window.asked("remote_pairing", 1);
     assert!(

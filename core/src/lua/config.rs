@@ -231,6 +231,8 @@ pub fn parse_remote_listen(value: Option<&str>) -> Result<RemoteListen, String> 
             let addr: std::net::IpAddr = text.parse().map_err(|_| {
                 format!("{REMOTE_LISTEN_KEY:?} must be loopback, socket or one address of this machine (got {value:?})")
             })?;
+            // An IPv4-mapped IPv6 spelling is the IPv4 address it maps: `::ffff:127.0.0.1` is loopback.
+            let addr = addr.to_canonical();
             if addr.is_unspecified() {
                 return Err(format!(
                     "{REMOTE_LISTEN_KEY:?} refuses the wildcard address {addr}: name the one address phones reach this machine by"

@@ -6469,7 +6469,7 @@ export default function App() {
           following: activeTab?.following,
           // Phones connected to this desk (remote control); the mark stays while there is one.
           phones: connectedPhones.length,
-            remoteSandbox,
+          remoteSandbox,
           backgroundTasks: sessionEnded ? [] : state.backend === "sidecar" ? state.backgroundTasks.rows : undefined,
         }}
         paneFocused={paneFocused}

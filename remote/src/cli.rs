@@ -121,20 +121,39 @@ pub fn add_device_at(path: &Path, name: &str, recipe: Option<PairMode>) -> i32 {
         }
     };
     match parse_rv_outbound(line.as_bytes()) {
-        Ok(RvOutbound::EnrollShown { target, .. }) => {
-            println!("{name} will connect {target}.");
-            if recipe.is_none() {
-                println!("(--ssh or --direct makes a code for the other recipe, where the window has one.)");
+        Ok(RvOutbound::EnrollShown {
+            recipe: shown_recipe,
+            target,
+            other,
+            ..
+        }) => {
+            if recipe.is_some_and(|asked| asked != shown_recipe) {
+                eprintln!(
+                    "eitri remote add-device: the window showed a code for the {} recipe, not the one asked for",
+                    shown_recipe.as_str()
+                );
+                return 1;
+            }
+            println!("{} will connect {}.", shown(name), shown(&target));
+            if recipe.is_none() && other {
+                let flag = match shown_recipe {
+                    PairMode::Ssh => "--direct",
+                    PairMode::Direct => "--ssh",
+                };
+                println!("(add-device {flag} makes a code for the window's other recipe.)");
             }
             println!("Scan the code the Eitri window shows with {name}, within three minutes; then answer y there.");
             0
         }
         Ok(RvOutbound::Result { why, .. }) => {
-            eprintln!("eitri remote add-device: {}", why.as_deref().unwrap_or("refused"));
+            eprintln!(
+                "eitri remote add-device: {}",
+                shown(why.as_deref().unwrap_or("refused"))
+            );
             1
         }
         Ok(RvOutbound::Refused { why, .. }) => {
-            eprintln!("eitri remote add-device: {why}");
+            eprintln!("eitri remote add-device: {}", shown(&why));
             1
         }
         _ => {
@@ -800,7 +819,7 @@ mod tests {
         let shown = serve_once(
             &path,
             None,
-            r#"{"v":1,"kind":"enroll_shown","recipe":"direct","target":"directly to desk.tail1.ts.net:443 (https)"}"#,
+            r#"{"v":1,"kind":"enroll_shown","recipe":"direct","target":"directly to desk.tail1.ts.net:443 (https)","other":true}"#,
         );
         assert_eq!(add_device_at(&path, "Pixel", None), 0, "a window shows the code");
         shown.join().unwrap();
@@ -822,10 +841,23 @@ mod tests {
         let ssh = serve_once(
             &path,
             Some("ssh"),
-            r#"{"v":1,"kind":"enroll_shown","recipe":"ssh","target":"through SSH to 127.0.0.1:41000 on this desk"}"#,
+            r#"{"v":1,"kind":"enroll_shown","recipe":"ssh","target":"through SSH to 127.0.0.1:41000 on this desk","other":false}"#,
         );
         assert_eq!(add_device_at(&path, "Pixel", Some(PairMode::Ssh)), 0);
         ssh.join().unwrap();
+        std::fs::remove_file(&path).unwrap();
+
+        let other = serve_once(
+            &path,
+            Some("ssh"),
+            r#"{"v":1,"kind":"enroll_shown","recipe":"direct","target":"directly to desk.tail1.ts.net:443 (https)","other":true}"#,
+        );
+        assert_eq!(
+            add_device_at(&path, "Pixel", Some(PairMode::Ssh)),
+            1,
+            "a code for another recipe than the one asked for"
+        );
+        other.join().unwrap();
         std::fs::remove_file(&path).unwrap();
         let _ = std::fs::remove_dir(&dir);
 

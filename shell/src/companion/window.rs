@@ -693,6 +693,8 @@ pub(crate) fn build(app: &Application, start: &Start) -> Rc<CompanionWindow> {
     // Remote control, as in a full window: this panel's tabs are published, so a phone that sees them reaches them
     // through this window's `rv-` socket.
     #[cfg(target_os = "linux")]
+    crate::remote_switch::startup_notices(&lua.startup_problems(), &*crate::remote_switch::toast_notice(&toast));
+    #[cfg(target_os = "linux")]
     crate::remote_switch::start(
         &agent,
         agents.as_ref().map(|host| host.instance()),
