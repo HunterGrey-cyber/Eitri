@@ -1,15 +1,64 @@
 //! Where `eitri.plugin.load(<name>)` finds a plugin: the user's data directory, the copy beside the running binary
-//! (and, in a debug build, the source tree the binary was built from), then the system data directories. Apart from
-//! `stat` calls on the candidate directories everything here works on its arguments; only
-//! [`SearchEnv::from_process`] reads the real environment.
+//! (and, in a debug build, the source tree the binary was built from), then the system data directories. Lookup
+//! and the shipped-page listing use explicit search directories; only [`SearchEnv::from_process`] reads the real
+//! environment.
 
+use std::collections::BTreeSet;
 use std::ffi::OsString;
 use std::path::{Path, PathBuf};
 
-use super::manifest::id_ok;
+use super::manifest::{id_ok, parse_manifest};
 
 /// The file whose presence makes a directory a plugin directory.
 pub const MANIFEST: &str = "eitri-plugin.toml";
+
+/// A shipped page available to load in this window.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PageOffer {
+    pub id: String,
+    pub title: String,
+    pub summary: Option<String>,
+}
+
+/// Shipped names not loaded in this window, with metadata from the copy normal lookup would load.
+/// Reading an offer never prepares settings, roots or plugin state on disk.
+pub fn offers(env: &SearchEnv, loaded: &[String]) -> Vec<PageOffer> {
+    let mut names = BTreeSet::new();
+    for (base, step) in candidates("", env) {
+        if step == SearchStep::UserData {
+            continue;
+        }
+        let Ok(entries) = std::fs::read_dir(base) else {
+            continue;
+        };
+        for entry in entries.flatten() {
+            let Ok(name) = entry.file_name().into_string() else {
+                continue;
+            };
+            if id_ok(&name) && !loaded.contains(&name) && entry.path().join(MANIFEST).is_file() {
+                names.insert(name);
+            }
+        }
+    }
+    let mut pages = Vec::new();
+    for name in names {
+        let Ok(found) = find_plugin(&name, env) else {
+            continue;
+        };
+        let manifest = std::fs::read_to_string(found.dir.join(MANIFEST))
+            .map_err(|e| e.to_string())
+            .and_then(|text| parse_manifest(&text));
+        match manifest {
+            Ok(manifest) => pages.push(PageOffer {
+                id: name,
+                title: manifest.title,
+                summary: manifest.summary,
+            }),
+            Err(error) => eprintln!("[plugin {name}] page offer skipped: {}", error.escape_debug()),
+        }
+    }
+    pages
+}
 
 /// Below a data directory, where plugin directories live: `<data dir>/eitri/plugins/<name>`.
 const DATA_SUBDIR: &str = "eitri/plugins";
@@ -168,6 +217,105 @@ mod tests {
     use crate::plugin::test_support::Scratch;
 
     const NAME: &str = "md";
+
+    fn page_at(dir: &Path, id: &str, title: &str, summary: Option<&str>) {
+        std::fs::create_dir_all(dir).unwrap();
+        let summary = summary.map(|s| format!("summary = {s:?}\n")).unwrap_or_default();
+        std::fs::write(
+            dir.join(MANIFEST),
+            format!("id = {id:?}\ntitle = {title:?}\n{summary}protocol = 1\nsite = 'unbuilt'\nentry = 'index.html'\n"),
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn page_offers_are_sorted_unique_and_use_the_users_override() {
+        let s = Scratch::new("offers-order");
+        let env = env_in(&s.0);
+        page_at(&s.0.join("sys2/eitri/plugins/zulu"), "zulu", "Last", None);
+        page_at(&s.0.join("sys1/eitri/plugins/alpha"), "alpha", "System", None);
+        page_at(&s.0.join("lib/eitri/plugins/alpha"), "alpha", "Installed", None);
+        page_at(
+            &s.0.join("data-home/eitri/plugins/alpha"),
+            "alpha",
+            "Personal",
+            Some("My page"),
+        );
+        page_at(&s.0.join("src/plugins/middle"), "middle", "Source", None);
+        let pages = offers(&env, &[]);
+        assert_eq!(
+            pages.iter().map(|p| p.id.as_str()).collect::<Vec<_>>(),
+            ["alpha", "middle", "zulu"]
+        );
+        assert_eq!(pages[0].title, "Personal");
+        assert_eq!(pages[0].summary.as_deref(), Some("My page"));
+        assert_eq!(pages[1].summary, None);
+    }
+
+    #[test]
+    fn page_offers_skip_broken_manifests_and_invalid_names() {
+        let s = Scratch::new("offers-broken");
+        let env = env_in(&s.0);
+        let base = s.0.join("lib/eitri/plugins");
+        for id in ["good", "broken", "overridden", "Bad", "-bad", "no-manifest"] {
+            page_at(&base.join(id), "good", "Page", None);
+        }
+        std::fs::write(base.join("broken").join(MANIFEST), "broken = [[[").unwrap();
+        let user = s.0.join("data-home/eitri/plugins/overridden");
+        page_at(&user, "overridden", "Personal", None);
+        std::fs::write(user.join(MANIFEST), "broken = [[[").unwrap();
+        std::fs::remove_file(base.join("no-manifest").join(MANIFEST)).unwrap();
+        std::fs::create_dir(base.join("no-manifest").join(MANIFEST)).unwrap();
+        let pages = offers(&env, &[]);
+        assert_eq!(pages.iter().map(|p| p.id.as_str()).collect::<Vec<_>>(), ["good"]);
+    }
+
+    #[test]
+    fn page_offers_omit_loaded_and_user_only_plugins() {
+        let s = Scratch::new("offers-loaded");
+        let env = env_in(&s.0);
+        page_at(&s.0.join("lib/eitri/plugins/loaded"), "loaded", "Loaded", None);
+        page_at(&s.0.join("sys1/eitri/plugins/other"), "other", "Other", None);
+        page_at(&s.0.join("data-home/eitri/plugins/private"), "private", "Private", None);
+        let pages = offers(&env, &["loaded".into()]);
+        assert_eq!(pages.iter().map(|p| p.id.as_str()).collect::<Vec<_>>(), ["other"]);
+    }
+
+    #[test]
+    fn page_offers_read_only_manifest_metadata_without_creating_anything() {
+        fn tree(root: &Path) -> Vec<(PathBuf, Option<Vec<u8>>)> {
+            let mut entries = Vec::new();
+            for entry in std::fs::read_dir(root).unwrap() {
+                let path = entry.unwrap().path();
+                if path.is_dir() {
+                    entries.push((path.clone(), None));
+                    entries.extend(tree(&path));
+                } else {
+                    entries.push((path.clone(), Some(std::fs::read(path).unwrap())));
+                }
+            }
+            entries.sort();
+            entries
+        }
+        let s = Scratch::new("offers-read-only");
+        let env = env_in(&s.0);
+        let dir = s.0.join("lib/eitri/plugins/demo");
+        page_at(&dir, "demo", "Demo", None);
+        let path = dir.join(MANIFEST);
+        let text = std::fs::read_to_string(&path).unwrap();
+        std::fs::write(
+            path,
+            format!(
+                "{text}\n[settings.work]\nkind = 'dir'\ndefault = {:?}\n",
+                s.0.join("must-not-exist").to_str().unwrap()
+            ),
+        )
+        .unwrap();
+        let before = tree(&s.0);
+        let pages = offers(&env, &[]);
+        assert_eq!(pages.iter().map(|p| p.id.as_str()).collect::<Vec<_>>(), ["demo"]);
+        assert_eq!(tree(&s.0), before);
+    }
 
     fn os(path: &Path) -> OsString {
         path.as_os_str().to_os_string()

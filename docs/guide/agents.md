@@ -516,9 +516,9 @@ say). A chat that a float covers by any amount is still running, and it is treat
 - **A card cannot be answered from it.** A card answer from the covered page (`a`, `d`, `D`, `Ctrl+y`, a button),
   or the `y` that enters bypass mode, is refused and the card stays waiting. The app name flashes, and the toast and
   the page say which float covers it and the key that clears it, pressed with the keys in that float:
-  `agent is under terminal 2: <prefix> Alt+- from terminal 2 stows it` for a scratch float, `agent is under
-  terminal: <prefix> Alt+Shift+Space from terminal sinks it` for any other (the action's name when it has no key).
-  From the chat, the first `<prefix> Alt+-` moves the keys into a shown scratch float and the second stows it. The
+  `agent is under terminal 2: <prefix> S from terminal 2 stows it` for a scratch float, `agent is under
+  terminal: <prefix> F from terminal sinks it` for any other (the action's name when it has no key).
+  From the chat, the first `<prefix> S` moves the keys into a shown scratch float and the second stows it. The
   check is made when you answer, against where the floats are then, so the answer goes through the moment the
   float has moved off or been put away.
 - **With `modules.chat.on_permission = "reveal"`**, a new card puts away the scratch floats that cover the chat,

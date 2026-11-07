@@ -1,5 +1,6 @@
 id = "markdown"
 title = "Markdown preview"
+summary = "A live preview of the Markdown file in your editor"
 protocol = 1
 site = "web/dist"                   # the build directory, the same path installed and in the source tree
 entry = "index.html"

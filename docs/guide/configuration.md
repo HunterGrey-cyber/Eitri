@@ -281,7 +281,7 @@ eitri.command.register({
 - **`eitri.layout.float(id, rect?)`** floats that module: at `rect` (`{ cx = 0.5, cy = 0.4, w = 600, h = 300 }`: the
   centre as a fraction of the window, the size in pixels, the bar included), else at the rectangle it last floated
   at, else centred at 60% of the window. On a module that already floats it moves it to `rect`. The editor never
-  floats. Like `<prefix> Alt+Shift+Space`, it refuses the last tiled module in view.
+  floats. Like `<prefix> F`, it refuses the last tiled module in view.
 - **`eitri.layout.rule(target, opts)`**, in `init.lua` only, says where a module opens when the window opens it by
   itself; it is described under [Where a new module opens](#where-a-new-module-opens).
 - **`eitri.layout.open(kind, opts?)`** opens a new instance of a kind, `"terminal"` or `"agent"` (a new chat view

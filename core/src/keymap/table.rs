@@ -317,12 +317,13 @@ fn default_bindings() -> Vec<Binding> {
         },
         false,
     );
-    bind("M-S-Space", Action::FloatToggle, false);
-    bind("M--", Action::ScratchpadShow { module: None }, false);
-    bind("M-_", Action::ScratchpadMove, false);
+    // The plain keys come first: a refusal names an action's first key (`key_text`), and these are the ones to learn.
     bind("F", Action::FloatToggle, false);
     bind("S", Action::ScratchpadShow { module: None }, false);
     bind("_", Action::ScratchpadMove, false);
+    bind("M-S-Space", Action::FloatToggle, false);
+    bind("M--", Action::ScratchpadShow { module: None }, false);
+    bind("M-_", Action::ScratchpadMove, false);
     bind("W", Action::WindowNew, false);
     bind(
         "%",
@@ -1234,12 +1235,12 @@ mod tests {
         ("M-a", "focus.parent", false),
         ("M-d", "focus.child", false),
         ("M-Enter", "instance.new kind=terminal", false),
-        ("M-S-Space", "float.toggle", false),
-        ("M--", "scratchpad.show", false),
-        ("M-_", "scratchpad.move", false),
         ("F", "float.toggle", false),
         ("S", "scratchpad.show", false),
         ("_", "scratchpad.move", false),
+        ("M-S-Space", "float.toggle", false),
+        ("M--", "scratchpad.show", false),
+        ("M-_", "scratchpad.move", false),
         ("W", "window.new", false),
         ("%", "split.right", false),
         ("\"", "split.below", false),

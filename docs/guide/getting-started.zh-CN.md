@@ -1,5 +1,5 @@
 [English](getting-started.md) | 简体中文
-<!-- translated-from: getting-started.md sha256=f84b438bba380adbb9000aa165140ef839f3d09c72b1de1a92cdd3975149c456 -->
+<!-- translated-from: getting-started.md sha256=4afd2f5c2ca1dd97c3bb7766bd5b3f27b7dc8343d67bd6ff0bbaa2202889db4f -->
 
 # 快速上手
 
@@ -108,7 +108,7 @@ Claude 回答时，回复会作为渲染好的 markdown 边流式输出边显示
 1. 按键在 agent 面板里时，按 `<prefix> "`，再按 `t`：底部终端会在它下面打开，并拿到按键。`<prefix> %` 则向右分割；两种分割都会等你选一个模块，把它打开或移到那里。
 2. 按 `<prefix> o` 把按键交给屏幕上的下一个模块，一直按到按键回到终端。`<prefix> Left`、`Right`、`Up` 和 `Down` 则去那一侧的模块。
 3. 在终端里按 `<prefix> Alt+Enter`，在它右边打开第二个终端，有自己的 shell，从项目根目录开始。
-4. 第二个终端拿着按键时，按 `<prefix> Alt+Shift+Space` 让它浮起来，再按 `<prefix> Alt+_` 把它收进便笺板。`<prefix> Alt+-` 把它叫回来；再按一遍这个序列，又把它收起来。
+4. 第二个终端拿着按键时，按 `<prefix> F` 让它浮起来，再按 `<prefix> _` 把它收进便笺板。`<prefix> S` 把它叫回来；再按一遍这个序列，又把它收起来。
 5. 按 `<prefix> s`，再按 `c`，复制当前排布，建一个第二工作区并切过去。`<prefix> L` 回到之前的工作区。模块是同一批，每个工作区保留自己的排布。
 6. 移到基础 agent 面板。按 `<prefix> c` 添加第二个聊天标签页，再按 `<prefix> !` 把这个标签页拆进面板旁边独立的视图。基础视图必须至少留下一个标签页。在新视图里按 `<prefix> !`，就把标签页并回去。
 7. 要为还没有保存过布局的项目设置起始布局，在 `$XDG_CONFIG_HOME/eitri/init.lua`（默认 `~/.config/eitri/init.lua`）里写 `eitri.layout.default(...)`。窗口运行起来之后，`eitri.layout.export()` 会返回能粘贴到那里的布局调用，包括工作区和浮动窗口；[配置](configuration.zh-CN.md#layout-from-lua)里有用 Lua 命令把这段文字存下来的例子。导出会略去编号聊天视图：它们要有保存的标签页才能在启动后留下来，所以用[打开规则](configuration.zh-CN.md#where-a-new-module-opens)安排新视图的位置。
@@ -158,7 +158,7 @@ Claude 回答时，回复会作为渲染好的 markdown 边流式输出边显示
 
 **继续一个对话。** 关闭标签页不会删除它的对话。在空标签页上按 `r` 继续最近一次保存的会话，`<prefix> w`（或空标签页上的 `w`）按从新到旧列出它们，每个都带着名字或标题；另一个窗口当前占用的会话会显示出来，但不能选。一个项目保留最新的 200 个会话：存满之后，列表会写 `only the newest 200 are kept`，下一个新会话会把最旧的那个从列表里去掉（它的对话仍在 Claude Code 自己的 `claude --resume` 里）。
 
-**恢复上次的标签页。** Eitri 记得一个项目上一个窗口里开着哪些标签页：它们的顺序、名字和模式，以及当时在屏幕上的是哪一个。默认情况下，空标签页会把它们作为 `Restore last session`（在面板里按 `s`）提供出来。按键一开始在编辑器里，那里的 `s` 是 nvim 的；从那里按 `<prefix> w` 打开会话列表，光标就在 `Restore last session` 这一行上，按 `Enter` 即可。在你的 `init.lua` 里把 `agent.restore` 设为 `"auto"`，启动时不用按任何键就把它们带回来，`"off"` 则既不提供也不记录；见[配置](configuration.zh-CN.md)。如果某个标签页保存的对话已经没了，或者被另一个窗口占着，它会被跳过，并在一条简短的消息里点名。曾经处于 bypass 的标签页不会不经询问就以 bypass 回来：`s` 会先问（回答 `n` 就让它以 Auto 回来），自动恢复则让它以 Auto 回来并告诉你。曾经处于 manual 的标签页会以 manual 回来。唯一的例外是你事先给出的回答：在你的 `init.lua` 里把 `agent.default_mode` 设为 `"bypass"`，保存下来的 bypass 标签页就不用提问直接以 bypass 回来。
+**恢复上次的标签页。** Eitri 记得一个项目上一个窗口里开着哪些标签页：它们的顺序、名字和模式，以及当时在屏幕上的是哪一个。默认情况下，空标签页会把它们作为 `Restore last session`（在面板里按 `s`）提供出来。按键一开始在编辑器里，那里的 `s` 是 nvim 的；按键在编辑器里时，空标签页会写出哪个键把它们带到面板（`Ctrl+l to use these keys`）；在编辑器里按 `<prefix> w` 也能打开会话列表，光标就在 `Restore last session` 这一行上，按 `Enter` 即可。在你的 `init.lua` 里把 `agent.restore` 设为 `"auto"`，启动时不用按任何键就把它们带回来，`"off"` 则既不提供也不记录；见[配置](configuration.zh-CN.md)。如果某个标签页保存的对话已经没了，或者被另一个窗口占着，它会被跳过，并在一条简短的消息里点名。曾经处于 bypass 的标签页不会不经询问就以 bypass 回来：`s` 会先问（回答 `n` 就让它以 Auto 回来），自动恢复则让它以 Auto 回来并告诉你。曾经处于 manual 的标签页会以 manual 回来。唯一的例外是你事先给出的回答：在你的 `init.lua` 里把 `agent.default_mode` 设为 `"bypass"`，保存下来的 bypass 标签页就不用提问直接以 bypass 回来。
 
 标签页里没发送的文字会随它一起保存，按 `s` 时回到输入框，最多保存 256 KiB。回不来的文字（在还没有会话的标签页里，或者太长存不下）会计入窗口的关闭问题：`close window? 1 unsent draft (y/n)`。如果不按 `s` 而是开始新的内容，保存的东西会被替换，没发送的文字也一起没了。
 

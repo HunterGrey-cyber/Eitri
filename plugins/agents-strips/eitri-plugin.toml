@@ -1,5 +1,6 @@
 id = "agents-strips"
 title = "Agents"
+summary = "A sidebar showing your agents and who needs you"
 protocol = 1
 site = "web/dist"                   # the build directory, the same path installed and in the source tree
 entry = "index.html"

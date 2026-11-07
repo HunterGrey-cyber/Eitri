@@ -14,11 +14,32 @@ use mlua::{Lua, Table, Value};
 use super::panel::PanelSlot;
 use crate::layout::rules::{At, OpenRule, RuleSize};
 use crate::plugin::load::{check_window_roots, load_plugin_with, LoadedPlugin};
-use crate::plugin::manifest::{ModuleStart, SettingValue};
+use crate::plugin::manifest::{id_ok, ModuleStart, SettingValue};
 use crate::plugin::search::{classify, find_plugin, LoadArg, SearchEnv};
 use crate::plugin::state::PluginStore;
 
 const PREFIX: &str = "eitri.plugin.load";
+
+/// Load a plugin by name with default settings, without Lua values or panel registration.
+/// The caller checks `window_root` against the window's other plugins with `check_window_roots`.
+pub fn load_named(
+    name: &str,
+    state_root: Option<&Path>,
+    home: Option<&Path>,
+    env: &SearchEnv,
+    log: &dyn Fn(&str),
+) -> Result<LoadedPlugin, String> {
+    if !id_ok(name) {
+        return Err("plugin.load takes a plugin name".into());
+    }
+    let (plugin, label) = load_configured(name, &BTreeMap::new(), state_root, home, env, log)?;
+    log(&format!(
+        "[plugin {}] loaded {} ({label})",
+        plugin.manifest.id,
+        plugin.dir.display()
+    ));
+    Ok(plugin)
+}
 
 pub struct PluginRegistration {
     pub plugin: Rc<LoadedPlugin>,
@@ -163,7 +184,28 @@ fn register(
             }
         }
     }
-    let (raw_dir, label) = match classify(&dir) {
+    let (plugin, label) = load_configured(&dir, &settings, state_root, home, search, log)?;
+    Ok((
+        PluginRegistration {
+            plugin: Rc::new(plugin),
+            key,
+            slot: position.unwrap_or(PanelSlot::Side),
+            position,
+        },
+        label,
+    ))
+}
+
+/// The disk work shared by init.lua registration and a runtime load.
+fn load_configured(
+    dir: &str,
+    settings: &BTreeMap<String, SettingValue>,
+    state_root: Option<&Path>,
+    home: Option<&Path>,
+    search: &SearchEnv,
+    log: &dyn Fn(&str),
+) -> Result<(LoadedPlugin, &'static str), String> {
+    let (raw_dir, label) = match classify(dir) {
         LoadArg::Path(path) => (path.to_string(), "path"),
         LoadArg::Name(name) => {
             let found = find_plugin(name, search);
@@ -195,9 +237,9 @@ fn register(
             }
         }
     };
-    let plugin = load_plugin_with(&raw_dir, &settings, home).map_err(|e| format!("{PREFIX}({dir}): {e}"))?;
+    let plugin = load_plugin_with(&raw_dir, settings, home).map_err(|e| format!("{PREFIX}({dir}): {e}"))?;
     // A load by name always gives the module, keymap table and origin the user wrote.
-    if let LoadArg::Name(name) = classify(&dir) {
+    if let LoadArg::Name(name) = classify(dir) {
         if plugin.manifest.id != name {
             return Err(format!(
                 "{PREFIX}(\"{name}\"): {} holds plugin {}, not {name}",
@@ -220,15 +262,7 @@ fn register(
             }
         }
     }
-    Ok((
-        PluginRegistration {
-            plugin: Rc::new(plugin),
-            key,
-            slot: position.unwrap_or(PanelSlot::Side),
-            position,
-        },
-        label,
-    ))
+    Ok((plugin, label))
 }
 
 pub fn install(
@@ -366,6 +400,98 @@ mod tests {
     use crate::plugin::search::SearchEnv;
     use crate::plugin::test_support::{demo_plugin, Scratch};
     use std::ffi::OsString;
+
+    #[test]
+    fn named_load_uses_defaults_creates_private_directories_and_records_capabilities() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let s = Scratch::new("named-defaults");
+        let env = search_in(&s.0);
+        let dir = s.0.join("lib/plugins/demo");
+        demo_at(&s.0, &dir);
+        let path = dir.join("eitri-plugin.toml");
+        let text = std::fs::read_to_string(&path).unwrap();
+        std::fs::write(path, text.replace("~/demo-work", "~/fresh/work")).unwrap();
+        let state = s.0.join("state");
+        let lines = RefCell::new(Vec::new());
+        let plugin = load_named("demo", Some(&state), Some(&s.0), &env, &|line| {
+            lines.borrow_mut().push(line.to_string());
+        })
+        .unwrap();
+        assert_eq!(plugin.dir, dir);
+        assert_eq!(plugin.settings["work"], s.0.join("fresh/work").display().to_string());
+        assert_eq!(
+            std::fs::metadata(s.0.join("fresh/work")).unwrap().permissions().mode() & 0o777,
+            0o700
+        );
+        assert_eq!(plugin.bool_setting("auto"), Some(false));
+        assert_eq!(plugin.values["images"], SettingValue::Text("https".into()));
+        let saved: Vec<String> =
+            serde_json::from_slice(&std::fs::read(state.join("plugins/demo/capabilities.json")).unwrap()).unwrap();
+        assert_eq!(
+            saved,
+            plugin
+                .manifest
+                .capabilities
+                .iter()
+                .map(|c| c.as_str())
+                .collect::<Vec<_>>()
+        );
+        assert!(lines
+            .borrow()
+            .iter()
+            .any(|line| line.contains(&format!("loaded {}", dir.display()))));
+    }
+
+    #[test]
+    fn named_load_refuses_paths_and_invalid_ids_without_writing() {
+        let s = Scratch::new("named-path");
+        let env = search_in(&s.0);
+        let state = s.0.join("state");
+        for name in [
+            s.0.to_str().unwrap(),
+            "./demo",
+            "~/demo",
+            "demo/child",
+            "Demo",
+            "-demo",
+            "demo-",
+            "",
+        ] {
+            let error = load_named(name, Some(&state), None, &env, &|_| {}).unwrap_err();
+            assert!(error.contains("plugin.load takes a plugin name"), "{name:?}: {error}");
+        }
+        assert!(!state.exists());
+    }
+
+    #[test]
+    fn named_load_checks_identity_and_returns_the_resolved_window_root() {
+        let s = Scratch::new("named-window");
+        let env = search_in(&s.0);
+        let dir = s.0.join("lib/plugins/demo");
+        demo_at(&s.0, &dir);
+        let path = dir.join("eitri-plugin.toml");
+        let text = std::fs::read_to_string(&path).unwrap();
+        let text = text.replace("~/demo-work", "~/fresh/work");
+        std::fs::write(
+            &path,
+            format!("{text}\n[window]\nroot = '${{work}}'\ntitle = 'Demo'\nlayout = 'page'\n"),
+        )
+        .unwrap();
+        let plugin = load_named("demo", None, Some(&s.0), &env, &|_| {}).unwrap();
+        assert_eq!(plugin.window_root, Some(s.0.join("fresh/work")));
+        std::fs::write(&path, text.replace("id = \"demo\"", "id = \"other\"")).unwrap();
+        let state = s.0.join("state");
+        let error = load_named("demo", Some(&state), Some(&s.0), &env, &|_| {}).unwrap_err();
+        assert!(error.contains("holds plugin other, not demo"), "{error}");
+        assert!(!state.exists());
+    }
+
+    #[test]
+    fn loaded_plugin_can_be_sent_from_a_worker() {
+        fn assert_send<T: Send>() {}
+        assert_send::<LoadedPlugin>();
+    }
 
     /// A search with no user step and no system directory that exists: a load by name finds nothing unless a
     /// test puts a copy where `env` points.

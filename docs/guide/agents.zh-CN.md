@@ -1,5 +1,5 @@
 [English](agents.md) | 简体中文
-<!-- translated-from: agents.md sha256=95281c40e5818184af0dd4ae06588044a5d6a9092796de9ad90e9423a21bdb2d -->
+<!-- translated-from: agents.md sha256=f36d763aecac3abf90dc01d734d5afd653b4a10f5d40e46854c069fe44cb1213 -->
 
 # Codex 与其他 agent
 
@@ -278,7 +278,7 @@ ACP 没有办法把消息插进正在运行的回合，所以回合运行时按 
 agent 面板，或者任何一个[聊天视图](#chat-views)，可以放在一个[浮动窗口](keys.zh-CN.md#floats-the-scratchpad-and-workspaces)下面（比如便笺板里的一个终端）。聊天只要被某个浮动窗口盖住了任何一点，它仍在运行，但按“被盖住”处理，而不是按“显示着”处理：
 
 - **它在顶栏里的芯片回来了。** 有卡片等着时读作 `agent ⚑N`，和聊天被隐藏时一样。被盖住时结束的一轮会留下 `agent •`，浮动窗口离开聊天后它才消失。
-- **不能在它上面回答卡片。** 在被盖住的页面上回答卡片（`a`、`d`、`D`、`Ctrl+y`、按钮），或者按进入 bypass 模式的 `y`，都会被拒绝，卡片继续等着。应用名会闪一下，提示和页面会说是哪个浮动窗口盖住了它，以及怎样解除（按键要在那个浮动窗口里时按）：便笺浮动窗口读作 `agent is under terminal 2: <prefix> Alt+- from terminal 2 stows it`，其他浮动窗口读作 `agent is under terminal: <prefix> Alt+Shift+Space from terminal sinks it`（没有键时写动作的名字）。在聊天里按时，第一次 `<prefix> Alt+-` 把按键移进一个显示着的便笺浮动窗口，第二次才把它收起。检查是在你回答的那一刻、按浮动窗口当时的位置做的，所以浮动窗口一挪开或被收起，回答立刻就能通过。
+- **不能在它上面回答卡片。** 在被盖住的页面上回答卡片（`a`、`d`、`D`、`Ctrl+y`、按钮），或者按进入 bypass 模式的 `y`，都会被拒绝，卡片继续等着。应用名会闪一下，提示和页面会说是哪个浮动窗口盖住了它，以及怎样解除（按键要在那个浮动窗口里时按）：便笺浮动窗口读作 `agent is under terminal 2: <prefix> S from terminal 2 stows it`，其他浮动窗口读作 `agent is under terminal: <prefix> F from terminal sinks it`（没有键时写动作的名字）。在聊天里按时，第一次 `<prefix> S` 把按键移进一个显示着的便笺浮动窗口，第二次才把它收起。检查是在你回答的那一刻、按浮动窗口当时的位置做的，所以浮动窗口一挪开或被收起，回答立刻就能通过。
 - **`modules.chat.on_permission = "reveal"` 时**，新来的卡片会收起盖住聊天的便笺浮动窗口，拿着按键的那个除外（按键不动）。这之后仍盖着聊天的浮动窗口，或者默认的 `"badge"` 下的任何遮盖，只得到芯片和提示。
 
 <a id="known-limits"></a>

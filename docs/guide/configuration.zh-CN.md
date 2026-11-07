@@ -1,5 +1,5 @@
 [English](configuration.md) | 简体中文
-<!-- translated-from: configuration.md sha256=28d1c1e7e568a77afb9a3f66a6034dbfb785e94ff5340d436f7ca32400c06557 -->
+<!-- translated-from: configuration.md sha256=56bde4b3b470fd196fc10a3c5066a7ce6f59d64c17e32cb47043370a70432337 -->
 
 # 配置
 
@@ -176,7 +176,7 @@ eitri.command.register({
   })
   ```
 
-- **`eitri.layout.float(id, rect?)`** 把那个模块浮起来：放在 `rect`（`{ cx = 0.5, cy = 0.4, w = 600, h = 300 }`：中心是窗口的一个比例，大小以像素计，包括那条栏）；没有就用它上次浮动的矩形；再没有就居中、占窗口的 60%。对一个已经浮动的模块，它把它移到 `rect`。编辑器从不浮动。和 `<prefix> Alt+Shift+Space` 一样，它会拒绝视野里最后一个平铺模块。
+- **`eitri.layout.float(id, rect?)`** 把那个模块浮起来：放在 `rect`（`{ cx = 0.5, cy = 0.4, w = 600, h = 300 }`：中心是窗口的一个比例，大小以像素计，包括那条栏）；没有就用它上次浮动的矩形；再没有就居中、占窗口的 60%。对一个已经浮动的模块，它把它移到 `rect`。编辑器从不浮动。和 `<prefix> F` 一样，它会拒绝视野里最后一个平铺模块。
 - **`eitri.layout.rule(target, opts)`** 只能在 `init.lua` 里用，决定窗口自己打开一个模块时把它放在哪里；见[新模块开在哪里](#where-a-new-module-opens)。
 - **`eitri.layout.open(kind, opts?)`** 打开一种模块的新实例，`kind` 是 `"terminal"` 或 `"agent"`（后者是一个带新的空标签页的新聊天视图），和 `eitri.layout.run("instance.new", { kind = ... })` 一样，只是放在哪里由你来定。不带 `opts` 时由你的[打开规则](#where-a-new-module-opens)决定，没有规则就开在拿着按键的模块右边。带 `opts` 时（键和值与规则的相同），它们只决定这一次打开，不影响别的。和其他运行期调用一样，`init.lua` 还在加载时它会被拒绝；别的 `kind` 会让它带着信息停下；运行时的拒绝（没有空闲编号：`at most 9 terminals`、`at most 9 chat views`）会像按键那样记入日志并显示出来。
 - **`eitri.layout.workspace(name, tree)`** 只能在 `init.lua` 里用，按 `default` 接受的形状定义一个工作区。窗口里没有保存过同名工作区时就得到它，排在已保存的之后，按调用的先后顺序；`main` 属于 `eitri.layout.default`，在这里会被拒绝。用这种方式定义的工作区，你在窗口里删除或重命名之后，**下次启动会从它的定义里回来**，所以要彻底去掉一个，就去掉它的调用。没有定义的工作区，删除或重命名之后保持原样。

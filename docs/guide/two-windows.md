@@ -7,8 +7,7 @@ floats, chats and terminals, and it has no editor: the editor, and the one Neovi
 You start it from the first window, move terminals, chats and pages between the two while they keep running, and each
 window remembers the monitor it was on.
 
-Nothing about this is on by default and no key is bound to it. Without a call in your `init.lua` or a command from the
-panel, Eitri is one window, as before.
+Nothing about this is on by default. Until you press `<prefix> W`, Eitri is one window, as before.
 
 There is no second window on Hyprland, sway or niri unless you set `window.tiling` to `"eitri"`: there, chats and pages
 are windows of your window manager by default, and its workspaces and outputs do this page's job. See
@@ -16,7 +15,8 @@ are windows of your window manager by default, and its workspaces and outputs do
 
 ## Open the second window
 
-Five verbs make up the feature. None has a default key, so bind the ones you want in
+`<prefix> W` starts the second window, or brings it to the front when it is open. Five verbs make up the feature;
+`window.new` is the one with a default key (`W`), so bind the others you want in
 `$XDG_CONFIG_HOME/eitri/init.lua` (default `~/.config/eitri/init.lua`):
 
 | verb | what it does |
@@ -29,7 +29,6 @@ Five verbs make up the feature. None has a default key, so bind the ones you wan
 
 ```lua
 local k = eitri.keymap
-k.set("prefix", "F5", "window.new")
 k.set("prefix", "F6", "window.other")
 k.set("prefix", "F7", "move.to-window", { follow = true })
 k.set("prefix", "F8", "workspace.to-window")

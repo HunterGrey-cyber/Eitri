@@ -199,8 +199,8 @@ the next key or chord, as in tmux. These are the defaults; if Eitri has picked u
    terminal. `<prefix> Left`, `Right`, `Up` and `Down` go to the module on that side.
 3. In the terminal, press `<prefix> Alt+Enter` to open a second terminal to its right, with its own shell
    in the project root.
-4. With the second terminal focused, press `<prefix> Alt+Shift+Space` to float it. Then `<prefix> Alt+_`
-   stows it in the scratchpad. `<prefix> Alt+-` calls it back; press that sequence again to stow it again.
+4. With the second terminal focused, press `<prefix> F` to float it. Then `<prefix> _`
+   stows it in the scratchpad. `<prefix> S` calls it back; press that sequence again to stow it again.
 5. Press `<prefix> s`, then `c` to create a second workspace as a copy of this arrangement and switch to it.
    `<prefix> L` returns to the previous workspace. The modules are shared; each workspace keeps its own arrangement.
 6. Move to the base agent panel. Press `<prefix> c` to add a second chat tab, then `<prefix> !` to break that
@@ -286,7 +286,8 @@ oldest one from it (its conversation stays in Claude Code's own `claude --resume
 
 **Restoring the last tabs.** Eitri remembers which tabs the last window on a project had open: their order,
 names and modes, and which one was on screen. By default the empty tab offers them as `Restore last session`
-(`s` in the panel). The keys start in the editor, where `s` is nvim's; from there `<prefix> w` opens the session list
+(`s` in the panel). The keys start in the editor, where `s` is nvim's, and while they are there the empty tab says
+which key brings them to the panel (`Ctrl+l to use these keys`); from the editor `<prefix> w` also opens the session list
 with the cursor on a `Restore last session` row, and `Enter` takes it. Setting `agent.restore` to `"auto"` in your `init.lua` brings them back at launch with no key pressed,
 and `"off"` neither offers nor remembers; see [Configuration](configuration.md). A tab is skipped, and named
 in a short message, when its saved conversation is gone or another window holds it. A tab that was in bypass

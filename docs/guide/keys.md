@@ -64,6 +64,10 @@ status line says `no agent waits for you`. They share their walk with the pages 
 in a companion window too. With `agents.enabled` off they say `agents are off in this window`. See
 [Many agents at once](many-agents.md).
 
+**A second window.** `<prefix> W` opens a [second Eitri window](two-windows.md), for a second monitor, or brings it to the
+front when it is open. It does nothing in [compositor windows](compositor-windows.md) and in a companion window,
+where it says why.
+
 **Projects.** `<prefix> O` (also `:Eitri project.choose`, a click on the project's name in the top bar, or `p` on an empty
 chat tab) lays a list over the window: your other projects, the one you used last first, with a line to filter it or to
 type a path. It works in every window, the chat and page windows of [compositor windows](compositor-windows.md) included,
@@ -374,9 +378,9 @@ shown at a time.
 
 | keys | what they do |
 |---|---|
-| `<prefix> Alt+Shift+Space` | float this module at the size and place it last floated at, else centred at 60% of the window; with the keys on a float, put it back into the layout next to the tiled module you used last. The editor and the last tiled module in view are refused |
-| `<prefix> Alt+_` | send this module to the scratchpad: it floats and is put away |
-| `<prefix> Alt+-` | the scratchpad: put away the shown scratch float that has the keys; else raise a shown scratch float; else show the one put away longest. Repeated presses cycle through them. An empty scratchpad flashes and says how to fill it |
+| `<prefix> F` (or `Alt+Shift+Space`) | float this module at the size and place it last floated at, else centred at 60% of the window; with the keys on a float, put it back into the layout next to the tiled module you used last. The editor and the last tiled module in view are refused |
+| `<prefix> _` (or `Alt+_`) | send this module to the scratchpad: it floats and is put away |
+| `<prefix> S` (or `Alt+-`) | the scratchpad: put away the shown scratch float that has the keys; else raise a shown scratch float; else show the one put away longest. Repeated presses cycle through them. An empty scratchpad flashes and says how to fill it |
 | `<prefix> Alt+H`, `Alt+J`, `Alt+K`, `Alt+L` | with the keys on a float: move it five cells that way, inside the window (repeats) |
 | `<prefix> Ctrl+Left` ... `Ctrl+Down`, `Alt+Left` ... `Alt+Down` | with the keys on a float: resize it one / five cells with its centre staying put: `Right` and `Down` grow it, `Left` and `Up` shrink it, never below the module's minimum and never beyond the window (repeats) |
 | `<prefix> H` / `J` / `K` | with the keys on a float: dock it as a tiled module at the far left / bottom / top edge |
@@ -393,7 +397,7 @@ remembered when it sinks, for the next time it floats, and kept in the layout fi
 **What a float does not have.** It has no neighbours in a split, so the keys that arrange the tiled tree either
 leave the floats alone or refuse. The presets (`Alt+1` ... `Alt+5`, `Space`), the flips, rotate and `layout.undo`
 act on the tiled modules only. `E`, tabbed and stacked, `Alt+e`, `Alt+a`, `Alt+d` and the swaps refuse with the
-keys on a float, and the toast reads `a float has no split: <prefix> Alt+Shift+Space sinks it`. A split key with the
+keys on a float, and the toast reads `a float has no split: <prefix> F sinks it`. A split key with the
 keys on a float opens its module beside the tiled module you used last; a split key that names a floating module
 moves it out of the floats into the tree there. Zooming a tiled module takes every float off the screen (each one
 keeps a chip in the top bar); zooming a float shows it alone.
@@ -430,10 +434,10 @@ from a tile, a tile from a float; `Alt+Space` is GNOME's, so it has no key). `wo
 free number, and `workspace.switch` takes a `name` (`eitri.keymap.set("prefix", "F3", "workspace.switch", { name =
 "study" })`), making the workspace first when none has that name. Neither has a key; bind them as above.
 
-**The `del` each new default needs.** `Alt+Shift+Space`, `Alt+-`, `Alt+_`, `(`, `)`, `L`, `s` and `$` are
+**The `del` each new default needs.** `F`, `S`, `_`, `W`, `Alt+Shift+Space`, `Alt+-`, `Alt+_`, `(`, `)`, `L`, `s` and `$` are
 defaults now, and so is `!` (`tab.break`, tmux's `break-pane`), so an `init.lua` that already sets any of them stops at
 startup until it puts `k.del("prefix", "<key>")` before that `set` (the spelling is the one `eitri.keymap` takes:
-`M-S-Space`, `M--`, `M-_`, `(`, `)`, `L`, `s`, `$`, `!`; for `!` that is `k.del("prefix", "!")`). The rule is the one under "Setting a key that already has an action" above,
+`F`, `S`, `_`, `W`, `M-S-Space`, `M--`, `M-_`, `(`, `)`, `L`, `s`, `$`, `!`; for `!` that is `k.del("prefix", "!")`). The rule is the one under "Setting a key that already has an action" above,
 tmux import included.
 
 ### The hint panel

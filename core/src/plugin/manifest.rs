@@ -399,6 +399,7 @@ pub struct WindowDecl {
 pub struct Manifest {
     pub id: String,
     pub title: String,
+    pub summary: Option<String>,
     pub site: String,
     pub entry: String,
     /// In the order the manifest lists them, without repeats.
@@ -431,6 +432,7 @@ impl Manifest {
 struct RawManifest {
     id: String,
     title: String,
+    summary: Option<String>,
     protocol: u32,
     site: String,
     entry: String,
@@ -670,6 +672,14 @@ pub fn parse_manifest(text: &str) -> Result<Manifest, String> {
         || raw.title.chars().any(char::is_control)
     {
         return fail("title", format!("must be 1-{MAX_TITLE_CHARS} printable characters"));
+    }
+    if let Some(summary) = &raw.summary {
+        if summary.is_empty() || summary.chars().count() > 80 || summary.chars().any(super::keys::hidden) {
+            return fail(
+                "summary",
+                "must be 1-80 characters without controls or hidden characters".into(),
+            );
+        }
     }
     if raw.protocol != PROTOCOL {
         return fail(
@@ -1173,6 +1183,7 @@ pub fn parse_manifest(text: &str) -> Result<Manifest, String> {
     Ok(Manifest {
         id: raw.id,
         title: raw.title,
+        summary: raw.summary,
         site: raw.site,
         entry: raw.entry,
         capabilities,
@@ -1193,6 +1204,52 @@ pub fn parse_manifest(text: &str) -> Result<Manifest, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn summary_is_optional_and_accepts_one_to_eighty_visible_characters() {
+        assert_eq!(parse_manifest(WINDOW_BASE).unwrap().summary, None);
+        for summary in ["A live preview".to_string(), "字".repeat(80), "x".to_string()] {
+            let text = format!("summary = {}\n{WINDOW_BASE}", toml::Value::String(summary.clone()));
+            assert_eq!(parse_manifest(&text).unwrap().summary, Some(summary));
+        }
+    }
+
+    #[test]
+    fn summary_refuses_controls_hidden_characters_empty_and_eighty_one_characters() {
+        let accepted = format!("summary = 'A page'\n{WINDOW_BASE}");
+        assert!(parse_manifest(&accepted).is_ok());
+        for summary in [
+            "".to_string(),
+            "x".repeat(81),
+            "a\nb".to_string(),
+            "a\tb".to_string(),
+            "a\u{7f}b".to_string(),
+            "a\u{202e}b".to_string(),
+            "a\u{2066}b".to_string(),
+            "a\u{2028}b".to_string(),
+            "a\u{2029}b".to_string(),
+            "a\u{200b}b".to_string(),
+        ] {
+            let text = format!("summary = {}\n{WINDOW_BASE}", toml::Value::String(summary.clone()));
+            let err = parse_manifest(&text).unwrap_err();
+            assert!(err.contains("summary"), "{summary:?}: {err}");
+        }
+    }
+
+    #[test]
+    fn every_shipped_manifest_has_a_summary() {
+        let shipped = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../plugins");
+        let mut count = 0;
+        for entry in std::fs::read_dir(shipped).unwrap() {
+            let path = entry.unwrap().path().join("eitri-plugin.toml");
+            if path.is_file() {
+                let manifest = parse_manifest(&std::fs::read_to_string(&path).unwrap()).unwrap();
+                assert!(manifest.summary.is_some(), "{} has no summary", path.display());
+                count += 1;
+            }
+        }
+        assert!(count > 0);
+    }
 
     const EXAMPLE: &str = include_str!("testdata/demo-manifest.toml");
 

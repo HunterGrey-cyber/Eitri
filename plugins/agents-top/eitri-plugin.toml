@@ -1,5 +1,6 @@
 id = "agents-top"
 title = "Agents"
+summary = "Sort, filter and manage your agents in a table"
 protocol = 1
 site = "web/dist"
 entry = "index.html"

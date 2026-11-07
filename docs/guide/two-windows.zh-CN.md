@@ -1,17 +1,17 @@
 [English](two-windows.md) | 简体中文
-<!-- translated-from: two-windows.md sha256=2b77adb9a737aa4704f81e40bc5b39ebe3949573cd34e18b6b95ce3971dcc9b8 -->
+<!-- translated-from: two-windows.md sha256=baa0a2f5270464ef904d424b83df33631362f766fa18c0551cbe492f33aa8aae -->
 
 # 两个窗口
 
 Eitri 可以再开一个窗口，给第二块显示器用。它是一个完整的 Eitri 窗口，有自己的顶栏、工作区、浮动窗口、聊天和终端，但没有编辑器：编辑器，以及它背后唯一的那个 Neovim，留在第一个窗口里。你从第一个窗口启动它，终端、聊天和页面可以在两个窗口之间移动，移动时它们照常运行，每个窗口还会记住自己所在的显示器。
 
-这一切默认都不开，也没有绑定任何键。你不在 `init.lua` 里写调用、也不在面板里下命令，Eitri 就还是一个窗口，和以前一样。
+这一切默认都不开。在你按下 `<prefix> W` 之前，Eitri 就还是一个窗口，和以前一样。
 
 在 Hyprland、sway 或 niri 上，除非你把 `window.tiling` 设成 `"eitri"`，否则没有第二个窗口：在那里聊天和页面默认就是窗口管理器的窗口，这一页的事由它的工作区和输出来做。见[合成器窗口](compositor-windows.zh-CN.md)。
 
 ## 打开第二个窗口
 
-整个功能由五个动词构成。它们都没有默认按键，需要哪个就在 `$XDG_CONFIG_HOME/eitri/init.lua`（默认 `~/.config/eitri/init.lua`）里绑定哪个：
+`<prefix> W` 启动第二个窗口，已经开着时把它带到前面。整个功能由五个动词构成；只有 `window.new` 有默认按键（`W`），其他的需要哪个就在 `$XDG_CONFIG_HOME/eitri/init.lua`（默认 `~/.config/eitri/init.lua`）里绑定哪个：
 
 | 动词 | 作用 |
 |---|---|
@@ -23,7 +23,6 @@ Eitri 可以再开一个窗口，给第二块显示器用。它是一个完整�
 
 ```lua
 local k = eitri.keymap
-k.set("prefix", "F5", "window.new")
 k.set("prefix", "F6", "window.other")
 k.set("prefix", "F7", "move.to-window", { follow = true })
 k.set("prefix", "F8", "workspace.to-window")

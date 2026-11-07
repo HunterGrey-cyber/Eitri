@@ -161,6 +161,15 @@ fn the_no_split_refusal_names_the_key_that_sinks_the_float() {
             key_text(&keymap, &Action::FloatToggle)
         )
     );
+    // With the defaults it names the plain key, not the Alt chord bound to the same action.
+    assert!(text.ends_with(" F sinks it"), "{text}");
+    for (action, key) in [
+        (Action::ScratchpadShow { module: None }, " S"),
+        (Action::ScratchpadMove, " _"),
+    ] {
+        let named = key_text(&keymap, &action);
+        assert!(named.ends_with(key), "{named}");
+    }
 }
 
 /// One value of every action, and whether the runner decides it here: a match with no catch-all, so a new

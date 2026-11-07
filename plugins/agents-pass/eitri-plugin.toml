@@ -1,5 +1,6 @@
 id = "agents-pass"
 title = "The pass"
+summary = "Step through the agents waiting for you, oldest first"
 protocol = 1
 site = "web/dist"                   # the build directory, the same path installed and in the source tree
 entry = "index.html"
