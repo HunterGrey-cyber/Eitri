@@ -170,6 +170,7 @@ import { SlashPicker } from "./components/SlashPicker";
 import type { SlashPickerKind } from "./components/SlashPicker";
 import { PanelErrorBoundary } from "./components/PanelErrorBoundary";
 import { RemoteEnroll } from "./RemoteEnroll";
+import { DeviceList } from "./DeviceList";
 import { RemoteDesk } from "./remoteDesk";
 import type { SlashAction } from "./slashCommands";
 import { barePickerCommand, completionSource, settingCommand } from "./slashCommands";
@@ -901,6 +902,9 @@ export default function App() {
       case "tab.stop-background":
         askStopBackgroundOfActiveTab();
         break;
+      case "remote.devices":
+        if (!remoteDesk.openList()) showFlash("remote control is off in this window");
+        break;
       case "mode.cycle":
         // Disabled in the box once the tab is fixed (`modeFixed`, `leader.ts`'s own `boxEntries` doc
         // comment): cycling makes no sense any more, so this flashes rather than posting. Routed
@@ -1267,8 +1271,20 @@ export default function App() {
    *  request the same way `composerFocusRequest` is, so it carries no `seq` of its own. */
   const [composerCaret, setComposerCaret] = useState<"kept" | "end">("kept");
   const [keysRequest, setKeysRequest] = useState(0);
-  /** The panel's own which-key table, read off `keymapHelp`. */
-  const panelTable = keymapHelp.panel;
+  /* The window's remote-control questions and its device list, kept here so a switch between the empty tab and the
+     conversation (each draws them) loses none. While another overlay owns the keys they take none: a `y` typed into
+     the chooser's filter is the filter's. */
+  const [remoteDesk] = useState(() => new RemoteDesk());
+  const remoteOn = useSyncExternalStore(remoteDesk.subscribe, () => remoteDesk.snapshot().on);
+  /** The panel's own which-key table, read off `keymapHelp`; the device list's key only while remote control is on
+   *  in this window. */
+  const panelTable = useMemo(
+    () =>
+      remoteOn
+        ? keymapHelp.panel
+        : { ...keymapHelp.panel, bindings: keymapHelp.panel.bindings.filter((b) => b.action !== "remote.devices") },
+    [keymapHelp.panel, remoteOn],
+  );
   /** Mirrors of state the document-capture Shift+Tab router (below, `onModeKey`)
    *  must read live -- refs so that effect, installed once with an empty dependency array, always
    *  sees this render's values rather than the one from when it was installed. Assigned here in the
@@ -1493,10 +1509,6 @@ export default function App() {
     }
   }, [typingGuard, keymapOpen, detail, handoffOpen, pathPick, linkPick, confirm, overlayOpen]);
   useEffect(() => () => void typingGuard.cancel(), [typingGuard]);
-  /* The window's remote-control questions, kept here so a switch between the empty tab and the conversation (each
-     draws them) loses none. While another overlay owns the keys they take none: a `y` typed into the chooser's
-     filter is the filter's. */
-  const [remoteDesk] = useState(() => new RemoteDesk());
   // Only the connected list: the questions' own changes do not render the whole panel.
   const connectedPhones = useSyncExternalStore(remoteDesk.subscribe, () => remoteDesk.snapshot().connected);
   const remoteSandbox = useSyncExternalStore(remoteDesk.subscribe, () => remoteDesk.snapshot().sandbox);
@@ -4100,6 +4112,7 @@ export default function App() {
             `Footer` the same way it replaces the conversation's; the editor context (once
             `EmptyTab`'s own `ContextLine`) is its `context` fact. */}
         {commandLineOverlay}
+        <DeviceList desk={remoteDesk} covered={remoteCovered} />
         <RemoteEnroll desk={remoteDesk} covered={remoteCovered} />
         <StatusBand
           facts={{
@@ -4121,6 +4134,7 @@ export default function App() {
             ending: null,
             // Phones watch other sessions too: the mark does not wait for this tab to start.
             phones: connectedPhones.length,
+            phoneDevices: connectedPhones,
             remoteSandbox,
           }}
           paneFocused={paneFocused}
@@ -4187,6 +4201,7 @@ export default function App() {
               companion={editorLink !== null}
               plugin={keymapPlugin ?? undefined}
               phones={connectedPhones}
+              deviceList={remoteOn}
               startAt={keymapOpening.current !== null && keymapPlugin === null ? "prefix" : undefined}
               startRequest={keymapRequest}
               claudeSlashCommands={!isExternalAgent(activeTab?.agent)}
@@ -6154,6 +6169,7 @@ export default function App() {
               companion={editorLink !== null}
               plugin={keymapPlugin ?? undefined}
               phones={connectedPhones}
+              deviceList={remoteOn}
               startAt={keymapOpening.current !== null && keymapPlugin === null ? "prefix" : undefined}
               startRequest={keymapRequest}
               claudeSlashCommands={!isExternalAgent(activeTab?.agent)}
@@ -6424,6 +6440,7 @@ export default function App() {
         </PanelErrorBoundary>
       )}
       {commandLineOverlay}
+      <DeviceList desk={remoteDesk} covered={remoteCovered} />
       <RemoteEnroll desk={remoteDesk} covered={remoteCovered} />
       {/* The bottom band: replaces `StatusRow`, `Footer`,
           `NewPill` and `ContextLine` with one vim-statusline row. `showcmd` reads the same `box`
@@ -6471,6 +6488,7 @@ export default function App() {
           following: activeTab?.following,
           // Phones connected to this desk (remote control); the mark stays while there is one.
           phones: connectedPhones.length,
+          phoneDevices: connectedPhones,
           remoteSandbox,
           backgroundTasks: sessionEnded ? [] : state.backend === "sidecar" ? state.backgroundTasks.rows : undefined,
         }}

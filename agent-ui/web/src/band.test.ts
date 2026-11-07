@@ -15,6 +15,17 @@ describe("the phone mark", () => {
     expect(phoneTitle("full")).not.toContain("partial");
     expect(phoneTitle()).not.toContain("partial");
   });
+  it("band_question_mark_names_grant_and_host: the mark's title names each phone, its grant and the Host it came through", () => {
+    const title = phoneTitle("full", [
+      { device: "d1", name: "Pixel\u202e9", grant: "watch+steer", host: "127.0.0.1:7341", since: 5 },
+      { device: "d2", name: "Tablet", grant: "watch", host: "desk.tail1\u200b.ts.net", since: 9 },
+    ]);
+    expect(title).toContain("Pixel⟨U+202E⟩9 (watch+steer, through 127.0.0.1:7341)");
+    expect(title).toContain("Tablet (watch, through desk.tail1⟨U+200B⟩.ts.net)");
+    expect(title).not.toContain("\u202e");
+    expect(title).not.toContain("\u200b");
+    expect(phoneTitle("partial", [])).toContain("sandbox: partial");
+  });
   it("phone_mark_counts_connected_devices", () => {
     const wide = bandLayout({ ...running, phones: 2 }, 900, 7.2);
     expect(wide.find((s) => s.id === "phone")).toEqual({ id: "phone", text: "☎2", side: "left" });

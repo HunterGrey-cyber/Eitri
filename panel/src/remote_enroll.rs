@@ -14,6 +14,13 @@
 //! remote socket's pump at or after that time ([`expire_questions`]), the next question of its kind, or the page's
 //! late answer. Each question tells the page how long it waits, and the page takes it down then on its own.
 //!
+//! The device list is the window's too, asked for from the base page (`remote_devices_open`, `remote_start_enroll`,
+//! `remote_revoke_ask`): each is kept as a [`DeskRequest`] for the `rv-` socket's next pump, which reads the store
+//! and the audit log, makes a code or reads the device's name on a thread of its own. Only while remote control is on
+//! in the window ([`switch_on`], when its socket is with the panel); before that each is refused. A revoke from the
+//! list is the fourth question, "Revoke <name>? (y/n)" (`remote_revoke_ask`), answered by `remote_revoke` under its
+//! nonce and gated as the others are; one waits at a time, and a newer one replaces it, since only the desk asks it.
+//!
 //! A question may be asked before the base page's document is ready (an address asked about as the window opens) or
 //! outlive the document it was shown in (a reload): every question still waiting in time is shown again, with the time
 //! it has left, to each new base document on its `ready` ([`questions_for_new_document`]).
@@ -55,6 +62,39 @@ const NOT_THE_GRANT_ASKED: &str = "that is not the grant the desk was asked abou
 
 /// The longest device name, host or peer the question shows; a longer one is refused before the desk is asked.
 pub(super) const REMOTE_FIELD_MAX_BYTES: usize = 256;
+
+/// What an extra page is told when it asks for the device list or a code.
+pub(super) const REMOTE_IS_THE_BASE_PAGES: &str = "protocol: remote control's device list is in the base view";
+
+/// What the base page is told when it asks for the device list while remote control is off in the window.
+pub(super) const REMOTE_OFF: &str = "remote control is off in this window (remote.enabled)";
+
+/// What the base page is told when it asks for more than the socket has taken yet.
+pub(super) const DESK_BUSY: &str = "the window is still reading the device list: try again";
+
+/// What a page is told when its revoke names another device than the question asked about.
+pub(super) const NOT_THE_DEVICE_ASKED: &str = "that is not the device the desk was asked about";
+
+/// The device list's requests kept for the socket's next pump; one more is refused ([`DESK_BUSY`]).
+pub(super) const DESK_REQUESTS_MAX: usize = 8;
+
+/// What the base page asked of the device list, carried out by the `rv-` socket off the tick.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(super) enum DeskRequest {
+    /// Read the device store and each device's last audit records (`remote_devices`).
+    List,
+    /// Make an enrollment code by this recipe, the window's default with `None`.
+    StartEnroll(Option<PairMode>),
+    /// Read the device's name and ask the base page whether to revoke it.
+    RevokeAsk(String),
+}
+
+/// A revoke from the device list as the desk is asked about it: the device's id and its name in the store.
+#[derive(Debug, Clone)]
+pub(super) struct RevokeAsk {
+    pub(super) device: String,
+    pub(super) name: String,
+}
 
 /// A phone's enrollment as the desk is asked about it: the name it claims, the `Host` it reached `serve` through,
 /// the address it came from, and how the code it presented said it connects.
@@ -113,6 +153,12 @@ pub(super) struct RemoteDesk {
     enroll: Option<Asking<EnrollAsk, EnrollReply>>,
     grant: Option<Asking<GrantAsk, EnrollReply>>,
     listen: Option<Asking<ListenAsk, bool>>,
+    /// Called only on a yes: a no decides nothing, so the page takes its question down without a word.
+    revoke: Option<Asking<RevokeAsk, ()>>,
+    /// Remote control is on in this window: its `rv-` socket is with the panel.
+    on: bool,
+    /// What the base page asked of the device list, for the socket's next pump.
+    requests: std::collections::VecDeque<DeskRequest>,
     /// The last phone list and sandbox, replayed to each document on `ready`.
     connected: Vec<ConnectedShown>,
     sandbox: Option<String>,
@@ -134,6 +180,12 @@ impl RemoteDesk {
     #[cfg(test)]
     pub(super) fn grant_nonce(&self) -> Option<u64> {
         self.grant.as_ref().map(|a| a.nonce)
+    }
+
+    /// The nonce of the revoke question waiting, if any.
+    #[cfg(test)]
+    pub(super) fn revoke_nonce(&self) -> Option<u64> {
+        self.revoke.as_ref().map(|a| a.nonce)
     }
 }
 
@@ -184,6 +236,18 @@ fn grant_payload(nonce: u64, ask: &GrantAsk, left: Duration) -> String {
     .to_string()
 }
 
+/// The revoke question `nonce` about `ask`, waiting `left` more.
+fn revoke_payload(nonce: u64, ask: &RevokeAsk, left: Duration) -> String {
+    serde_json::json!({
+        "kind": "remote_revoke_ask",
+        "expiresInMs": left.as_millis() as u64,
+        "nonce": nonce,
+        "device": ask.device,
+        "name": ask.name,
+    })
+    .to_string()
+}
+
 /// The address question `nonce` about `ask`, waiting `left` more.
 fn listen_payload(nonce: u64, ask: &ListenAsk, left: Duration) -> String {
     serde_json::json!({
@@ -216,6 +280,9 @@ pub(super) fn questions_for_new_document(state: &AgentPanelState, now: Instant) 
     }
     if let Some((a, left)) = desk.listen.as_ref().and_then(|a| Some((a, left(a.asked)?))) {
         shown.push(listen_payload(a.nonce, &a.ask, left));
+    }
+    if let Some((a, left)) = desk.revoke.as_ref().and_then(|a| Some((a, left(a.asked)?))) {
+        shown.push(revoke_payload(a.nonce, &a.ask, left));
     }
     shown
 }
@@ -305,6 +372,130 @@ pub(super) fn ask_listen(
         reply,
     });
     Ok(())
+}
+
+/// Asks the base page whether the device `ask` names may be revoked; `reply` is called once, on a yes. A revoke
+/// question waiting is replaced: only the desk asks one, and the newest is the one the desk means.
+pub(super) fn ask_revoke(
+    state: &mut AgentPanelState,
+    ask: RevokeAsk,
+    now: Instant,
+    reply: Reply<()>,
+    out: &mut Outbox,
+) {
+    let desk = &mut state.remote_desk;
+    let nonce = desk.nonce();
+    out.send(ViewId::BASE, revoke_payload(nonce, &ask, QUESTION_WITHIN));
+    desk.revoke = Some(Asking {
+        nonce,
+        asked: now,
+        ask,
+        reply,
+    });
+}
+
+/// The page's yes to the revoke question `nonce` about `device`, already admitted (the base page, past the window's
+/// gate). Only the question waiting, in time and about that device is answered; otherwise nothing changes and the
+/// page is told why. A question past its time is taken out.
+pub(super) fn answer_revoke(state: &mut AgentPanelState, nonce: u64, device: &str, now: Instant) -> Result<(), String> {
+    let desk = &mut state.remote_desk;
+    let Some(waiting) = desk.revoke.as_ref().filter(|a| a.nonce == nonce) else {
+        return Err(NO_LONGER_CURRENT.into());
+    };
+    if now.duration_since(waiting.asked) >= QUESTION_WITHIN {
+        desk.revoke = None;
+        return Err(NO_LONGER_CURRENT.into());
+    }
+    if waiting.ask.device != device {
+        return Err(NOT_THE_DEVICE_ASKED.into());
+    }
+    let Some(asking) = desk.revoke.take() else {
+        return Err(NO_LONGER_CURRENT.into());
+    };
+    (asking.reply)(());
+    Ok(())
+}
+
+/// Keeps what the base page asked of the device list for the socket's next pump. Refused while remote control is off
+/// in the window, and past [`DESK_REQUESTS_MAX`] waiting.
+pub(super) fn want(state: &mut AgentPanelState, request: DeskRequest) -> Result<(), &'static str> {
+    let desk = &mut state.remote_desk;
+    if !desk.on {
+        return Err(REMOTE_OFF);
+    }
+    if desk.requests.len() >= DESK_REQUESTS_MAX {
+        return Err(DESK_BUSY);
+    }
+    desk.requests.push_back(request);
+    Ok(())
+}
+
+/// What the base page asked of the device list since the last pump, oldest first.
+pub(super) fn take_requests(state: &mut AgentPanelState) -> Vec<DeskRequest> {
+    state.remote_desk.requests.drain(..).collect()
+}
+
+/// Remote control is on in this window (its socket is with the panel): every page is told once, so the device list's
+/// key is offered from now on.
+pub(super) fn switch_on(state: &mut AgentPanelState, out: &mut Outbox) {
+    if state.remote_desk.on {
+        return;
+    }
+    state.remote_desk.on = true;
+    let views: Vec<ViewId> = state.pages.keys().copied().collect();
+    for view in views {
+        out.send(view, remote_on_payload());
+    }
+}
+
+fn remote_on_payload() -> String {
+    serde_json::json!({ "kind": "remote_on" }).to_string()
+}
+
+/// What a document that has just said `ready` is told about remote control being on.
+pub(super) fn remote_on_for_new_document(state: &AgentPanelState) -> Option<String> {
+    state.remote_desk.on.then(remote_on_payload)
+}
+
+/// One device of the list as the base page is shown it: the store's entry, where its notifications go (the host
+/// only: the rest of an endpoint can be a credential) and its newest audit records, each `{ time, event, writer,
+/// fields }` with every field as `[name, text]`.
+#[derive(Debug, Clone)]
+pub(super) struct DeviceRow {
+    pub(super) id: String,
+    pub(super) name: String,
+    pub(super) grant: Grant,
+    pub(super) recipe: &'static str,
+    pub(super) enrolled_at: Option<u64>,
+    pub(super) last_seen: Option<u64>,
+    pub(super) last_host: Option<String>,
+    pub(super) push_host: Option<String>,
+    pub(super) records: Vec<serde_json::Value>,
+}
+
+/// Shows the device list in the base page; a device is `connected` when the last phone list names it.
+pub(super) fn show_devices(state: &AgentPanelState, rows: &[DeviceRow], out: &mut Outbox) {
+    let devices: Vec<serde_json::Value> = rows
+        .iter()
+        .map(|d| {
+            serde_json::json!({
+                "id": d.id,
+                "name": d.name,
+                "grant": grant_word(d.grant),
+                "recipe": d.recipe,
+                "enrolled_at": d.enrolled_at,
+                "last_seen": d.last_seen,
+                "last_host": d.last_host,
+                "connected": state.remote_desk.connected.iter().any(|c| c.device == d.id),
+                "push_host": d.push_host,
+                "records": d.records,
+            })
+        })
+        .collect();
+    out.send(
+        ViewId::BASE,
+        serde_json::json!({ "kind": "remote_devices", "devices": devices }).to_string(),
+    );
 }
 
 /// The page's answer to the phone question or the grant question `nonce`, already admitted (the base page; a `yes`
@@ -411,6 +602,10 @@ pub(super) fn expire_questions(state: &mut AgentPanelState, now: Instant, out: &
         closed.push(stale.nonce);
         (stale.reply)(false);
     }
+    if desk.revoke.as_ref().is_some_and(|a| late(a.asked)) {
+        let stale = desk.revoke.take().expect("checked above");
+        closed.push(stale.nonce);
+    }
     for nonce in closed {
         out.send(
             ViewId::BASE,
@@ -422,7 +617,7 @@ pub(super) fn expire_questions(state: &mut AgentPanelState, now: Instant, out: &
 impl RemoteDesk {
     /// Whether any question waits.
     pub(super) fn any_waiting(&self) -> bool {
-        self.enroll.is_some() || self.grant.is_some() || self.listen.is_some()
+        self.enroll.is_some() || self.grant.is_some() || self.listen.is_some() || self.revoke.is_some()
     }
 }
 
@@ -920,5 +1115,163 @@ mod tests {
             .all(|r| r.len() == rows.len() && r.chars().all(|c| c == '0' || c == '1')));
         // The finder pattern's top row.
         assert!(rows[0].starts_with("1111111"));
+    }
+
+    fn revoke(handle: &AgentPanelHandle, from: ViewId, request: &str, device: &str, nonce: u64) {
+        handle.page_message(
+            from,
+            &format!(r#"{{"type":"remote_revoke","request_id":"{request}","device":"{device}","nonce":{nonce}}}"#),
+        );
+    }
+
+    #[test]
+    fn revoke_needs_the_windows_painted_yes() {
+        let (handle, base, second) = handle_with_two_pages();
+        let covered = Rc::new(Cell::new(true));
+        let asked = recording_gate(&handle, &[1], covered.clone());
+        let revoked = Rc::new(Cell::new(0));
+        let sink = revoked.clone();
+        handle.run(|state, out| {
+            ask_revoke(
+                state,
+                RevokeAsk {
+                    device: "d1".into(),
+                    name: "Pixel".into(),
+                },
+                Instant::now(),
+                Box::new(move |()| sink.set(sink.get() + 1)),
+                out,
+            )
+        });
+        let shown = base
+            .sent
+            .borrow()
+            .iter()
+            .map(|e| json_of(e))
+            .find(|v| v["kind"] == "remote_revoke_ask")
+            .expect("the base page is asked");
+        assert_eq!(
+            (shown["device"].as_str(), shown["name"].as_str()),
+            (Some("d1"), Some("Pixel"))
+        );
+        assert!(shown["expiresInMs"].as_u64().unwrap() > 0);
+        let nonce = shown["nonce"].as_u64().unwrap();
+
+        // Another page's yes never reaches the window or the question.
+        revoke(&handle, view(2), "v2", "d1", nonce);
+        assert!(asked.borrow().is_empty());
+        assert_eq!(
+            result_for(&second.sent.borrow(), "v2"),
+            Some(Err(REMOTE_QUESTIONS_ARE_THE_BASE_PAGES.into()))
+        );
+
+        // A covered base page's yes is refused by the window, and the question keeps its nonce.
+        revoke(&handle, ViewId::BASE, "v1", "d1", nonce);
+        assert_eq!(*asked.borrow(), vec![ViewId::BASE]);
+        assert!(matches!(result_for(&base.sent.borrow(), "v1"), Some(Err(_))));
+        assert_eq!(revoked.get(), 0);
+        assert_eq!(handle.state.borrow().remote_desk.revoke_nonce(), Some(nonce));
+
+        // Uncovered: a yes about another device, or under another nonce, answers nothing.
+        covered.set(false);
+        revoke(&handle, ViewId::BASE, "v3", "d2", nonce);
+        assert_eq!(
+            result_for(&base.sent.borrow(), "v3"),
+            Some(Err(NOT_THE_DEVICE_ASKED.into()))
+        );
+        revoke(&handle, ViewId::BASE, "v4", "d1", nonce + 5);
+        assert_eq!(
+            result_for(&base.sent.borrow(), "v4"),
+            Some(Err(NO_LONGER_CURRENT.into()))
+        );
+        assert_eq!(revoked.get(), 0);
+
+        // The yes to the question shown is taken, once.
+        revoke(&handle, ViewId::BASE, "v5", "d1", nonce);
+        assert_eq!(result_for(&base.sent.borrow(), "v5"), Some(Ok(())));
+        assert_eq!(revoked.get(), 1);
+        revoke(&handle, ViewId::BASE, "v6", "d1", nonce);
+        assert_eq!(
+            result_for(&base.sent.borrow(), "v6"),
+            Some(Err(NO_LONGER_CURRENT.into()))
+        );
+        assert_eq!(revoked.get(), 1);
+
+        // Past its time the question is taken down and answers nothing.
+        handle.run(|state, out| {
+            ask_revoke(
+                state,
+                RevokeAsk {
+                    device: "d1".into(),
+                    name: "Pixel".into(),
+                },
+                Instant::now(),
+                Box::new(|()| panic!("a late yes revokes nothing")),
+                out,
+            )
+        });
+        let late = Instant::now() + QUESTION_WITHIN;
+        let nonce = handle.state.borrow().remote_desk.revoke_nonce().unwrap();
+        assert_eq!(
+            answer_revoke(&mut handle.state.borrow_mut(), nonce, "d1", late),
+            Err(NO_LONGER_CURRENT.into())
+        );
+        assert_eq!(handle.state.borrow().remote_desk.revoke_nonce(), None);
+    }
+
+    #[test]
+    fn the_device_list_is_asked_for_only_while_remote_control_is_on() {
+        let (handle, base, second) = handle_with_two_pages();
+        let open = |from: ViewId, request: &str| {
+            handle.page_message(
+                from,
+                &format!(r#"{{"type":"remote_devices_open","request_id":"{request}"}}"#),
+            );
+        };
+        open(ViewId::BASE, "o1");
+        assert_eq!(result_for(&base.sent.borrow(), "o1"), Some(Err(REMOTE_OFF.into())));
+        assert!(base.sent.borrow().iter().all(|e| json_of(e)["kind"] != "remote_on"));
+        assert!(remote_on_for_new_document(&handle.state.borrow()).is_none());
+        assert!(take_requests(&mut handle.state.borrow_mut()).is_empty());
+
+        handle.run(|state, out| switch_on(state, out));
+        for page in [&base, &second] {
+            assert_eq!(
+                page.sent
+                    .borrow()
+                    .iter()
+                    .filter(|e| json_of(e)["kind"] == "remote_on")
+                    .count(),
+                1,
+                "every page is told once"
+            );
+        }
+        handle.run(|state, out| switch_on(state, out));
+        assert_eq!(
+            base.sent
+                .borrow()
+                .iter()
+                .filter(|e| json_of(e)["kind"] == "remote_on")
+                .count(),
+            1
+        );
+        assert!(remote_on_for_new_document(&handle.state.borrow()).is_some());
+
+        open(view(2), "o2");
+        assert_eq!(
+            result_for(&second.sent.borrow(), "o2"),
+            Some(Err(REMOTE_IS_THE_BASE_PAGES.into()))
+        );
+        open(ViewId::BASE, "o3");
+        assert_eq!(result_for(&base.sent.borrow(), "o3"), Some(Ok(())));
+        assert_eq!(take_requests(&mut handle.state.borrow_mut()), vec![DeskRequest::List]);
+        for n in 0..=DESK_REQUESTS_MAX {
+            open(ViewId::BASE, &format!("f{n}"));
+        }
+        assert_eq!(
+            result_for(&base.sent.borrow(), &format!("f{DESK_REQUESTS_MAX}")),
+            Some(Err(DESK_BUSY.into()))
+        );
+        assert_eq!(take_requests(&mut handle.state.borrow_mut()).len(), DESK_REQUESTS_MAX);
     }
 }

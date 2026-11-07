@@ -1098,3 +1098,106 @@ fn a_refused_notice_for_a_device_not_in_the_store_is_dropped() {
     }
     assert!(notices(&rig.base.sent.borrow()).is_empty());
 }
+
+/// Every record of `rig`'s window log so far, oldest first.
+fn audit_records(rig: &Rig) -> Vec<eitri_core::remote_audit::Record> {
+    rig.socket().audit().flush();
+    let dir = eitri_core::remote_audit::audit_dir(&rig._scratch.0);
+    let mut records = eitri_core::remote_audit::read(&dir, &Default::default(), None).unwrap_or_default();
+    records.reverse();
+    records
+}
+
+fn audit_field<'a>(record: &'a eitri_core::remote_audit::Record, name: &str) -> Option<&'a str> {
+    record.fields.get(name).and_then(serde_json::Value::as_str)
+}
+
+#[test]
+fn rv_peer_without_a_token_is_recorded() {
+    let rig = Rig::new("remote-audit-peer");
+    let (_tab, _provider, key) = rig.tab();
+    let mut client = rig.connect();
+    let send = serde_json::json!({ "type": "send", "command_id": "x1", "text": "hello" });
+    // A peer of this user with no token, a watch-only device, and a key that is no key.
+    rig.act(&mut client, "d1", "not-the-token", &key, send.clone());
+    rig.until(&mut client, "the refusal", |l| l["kind"] == "result");
+    rig.act(&mut client, "d2", "wtok", &key, send.clone());
+    rig.until(&mut client, "the refusal", |l| l["kind"] == "result");
+    client
+        .send(&RvInbound::Act {
+            v: 1,
+            device: "d1".into(),
+            token: "tok".into(),
+            key: "not a key".into(),
+            cmd: send,
+        })
+        .unwrap();
+    rig.until(&mut client, "the refusal", |l| l["kind"] == "result");
+    let records = audit_records(&rig);
+    let seen: Vec<_> = records
+        .iter()
+        .filter(|r| r.event == "refused")
+        .map(|r| {
+            (
+                audit_field(r, "reason"),
+                audit_field(r, "device"),
+                audit_field(r, "device_name"),
+                audit_field(r, "key"),
+                audit_field(r, "kind"),
+            )
+        })
+        .collect();
+    assert_eq!(
+        seen,
+        [
+            (
+                Some("bad_token"),
+                Some("d1"),
+                Some(""),
+                Some(key.as_str()),
+                Some("send")
+            ),
+            (
+                Some("grant"),
+                Some("d2"),
+                Some("tablet"),
+                Some(key.as_str()),
+                Some("send")
+            ),
+            (
+                Some("tab_not_live"),
+                Some("d1"),
+                Some("phone"),
+                Some("not a key"),
+                Some("send")
+            ),
+        ]
+    );
+    assert!(records
+        .iter()
+        .all(|r| !r.line.contains("not-the-token") && !r.line.contains("wtok")));
+    assert!(records.iter().all(|r| r.writer == INSTANCE));
+}
+
+#[test]
+fn unopenable_log_is_said_once_in_the_window() {
+    let rig = Rig::new("remote-audit-unopenable");
+    // A file where the audit directory goes.
+    std::fs::write(eitri_core::remote_audit::audit_dir(&rig._scratch.0), b"not a directory").unwrap();
+    let (_tab, _provider, key) = rig.tab();
+    let mut client = rig.connect();
+    for n in 0..3 {
+        let send = serde_json::json!({ "type": "send", "command_id": format!("u{n}"), "text": "hello" });
+        rig.act(&mut client, "d1", "wrong", &key, send);
+        rig.until(&mut client, "the refusal", |l| l["kind"] == "result");
+    }
+    rig.socket().audit().flush();
+    for _ in 0..5 {
+        rig.turn();
+    }
+    let told: Vec<String> = notices(&rig.base.sent.borrow())
+        .into_iter()
+        .filter(|n| n.contains("remote audit log"))
+        .collect();
+    assert_eq!(told.len(), 1, "said once: {told:?}");
+}

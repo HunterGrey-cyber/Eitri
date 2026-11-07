@@ -9,6 +9,7 @@ import type { RemoteConnectedDevice } from "../bridge";
 import { revealHidden } from "../revealHidden";
 import { Revealed } from "./Revealed";
 import { modeConsequence } from "./Dashboard";
+import { DEVICE_LIST_KEYS, DEVICE_LIST_NOTE } from "../DeviceList";
 
 type Props = {
   /** Requested by a backdrop click only -- `App.tsx` owns `?`/`Escape`/`q`, which it intercepts
@@ -42,6 +43,8 @@ type Props = {
   /** The phones connected to this desk now (remote control): named first, with the grant each has and the `Host` it
    *  came through, since the band's phone mark only counts them. No section when there are none. */
   phones?: RemoteConnectedDevice[];
+  /** Remote control is on in this window: the device list's keys get a section. */
+  deviceList?: boolean;
   /** Open at the window prefix keys when no plugin section takes precedence. */
   startAt?: "prefix";
   /** Which opening request `startAt` belongs to. A different number while the sheet is up positions it again;
@@ -75,6 +78,12 @@ function PhonesSection({ phones }: { phones: RemoteConnectedDevice[] }) {
 }
 
 const ALL_MODES: PermissionModeChoice[] = ["manual", "auto", "bypass"];
+
+/** The keys that open the device list as a person reads them (`Space r d`), or what to bind when none does. */
+function deviceListKey(panel: PanelTable): string {
+  const binding = panel.bindings.find((b) => b.action === "remote.devices");
+  return binding === undefined ? "bind remote.devices in init.lua's panel table" : sequenceTitle(panel, binding.keys);
+}
 
 /** A plugin page's section when the page has not declared its keys. A page that declared and kept no key
  *  gets an empty section instead: it did register, so this sentence would be untrue of it. */
@@ -264,7 +273,7 @@ function SlashCommands() {
  *  so reading the sheet never acts on a card underneath. Only a click on the backdrop closes it here:
  *  a click inside a table must still allow reading a row or selecting its text. */
 export const KeymapOverlay = forwardRef<HTMLDivElement, Props>(function KeymapOverlay(
-  { onClose, windowKeys, prefixKeys, prefixLabel, panel, tmuxSkipped, companion = false, claudeSlashCommands = true, agent = null, modes = ALL_MODES, plugin, phones, startAt, startRequest = 0 },
+  { onClose, windowKeys, prefixKeys, prefixLabel, panel, tmuxSkipped, companion = false, claudeSlashCommands = true, agent = null, modes = ALL_MODES, plugin, phones, deviceList = false, startAt, startRequest = 0 },
   ref,
 ) {
   const prefixHeading = useRef<HTMLHeadingElement>(null);
@@ -320,6 +329,13 @@ export const KeymapOverlay = forwardRef<HTMLDivElement, Props>(function KeymapOv
         note="Opened with c in BROWSE. It owns every key while it is open and changes nothing on disk."
       />
       <LeaderAndTabKeys panel={panel} />
+      {deviceList && (
+        <Section
+          title={`Phones (${deviceListKey(panel)})`}
+          rows={DEVICE_LIST_KEYS}
+          note={`The remote-control device list. ${DEVICE_LIST_NOTE}`}
+        />
+      )}
       {/* What Enter sends beyond the typed text is one sentence
           about Enter, not a key of its own -- `Composer` sends it and `resolveKey` never sees it, so it
           is this group's `note`, not a row of `INPUT_KEYS` (tied to `COMPOSER_CHORDS` both ways). It reads

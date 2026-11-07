@@ -462,7 +462,9 @@ impl AgentPanelHandle {
     /// [`RemoteInbound`], admitted apart from every page's message and answered to the caller, never to a page. It takes
     /// no view and is never held for the editor's answer. A command id is taken once per device for the life of the
     /// process, whatever became of it. A call that waits on the provider is answered [`RemoteAccepted::Pending`], and
-    /// its result comes later from [`Self::take_remote_results`]; this never waits on the provider.
+    /// its result comes later from [`Self::take_remote_results`]; this never waits on the provider. Whatever the
+    /// outcome, it is recorded in the window's audit log once the socket has handed the panel one: a `cmd` for a
+    /// message taken, a `refused` naming why for any other.
     pub fn remote_message(
         &self,
         origin: &RemoteOrigin,
@@ -470,17 +472,21 @@ impl AgentPanelHandle {
         raw: &str,
     ) -> Result<RemoteAccepted, RemoteRefusal> {
         self.wake();
+        let mut taken: Option<super::remote_entry::Taken> = None;
         let outcome = (|| {
             let message = parse_remote_inbound(raw)?;
+            let taken = taken.insert(super::remote_entry::Taken::of(&message));
             if !first_command_use(&origin.device_id, message.command_id()) {
                 return Err(RemoteRefusal::Duplicate);
             }
             if self.state.borrow().shutting_down {
                 return Err(RemoteRefusal::NoSuchTab);
             }
+            taken.read_tab(&self.state.borrow(), key);
             let screen = Screen::read(&self.state, &self.pages);
             self.run(|state, out| handle_remote_message(state, &screen, origin, key, message, out))
         })();
+        super::remote_entry::record_remote_message(&self.state.borrow(), origin, key, taken, &outcome);
         if let Err(why) = &outcome {
             let mut state = self.state.borrow_mut();
             if let Some(tab) = state.tabs.tab_by_key(key) {

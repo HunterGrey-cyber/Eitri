@@ -1340,3 +1340,512 @@ fn remote_phone_list_clears_when_the_serve_lock_is_released() {
         crate::agent_panel::remote_enroll::connected_for_new_document(&window.handle.state.borrow()).is_some()
     });
 }
+
+// The window's audit records of enrollments and the desk's answers about devices.
+
+/// Every record of `window`'s log so far, oldest first.
+fn audit_records(window: &Window, scratch: &Scratch) -> Vec<eitri_core::remote_audit::Record> {
+    window.socket.audit().flush();
+    let dir = eitri_core::remote_audit::audit_dir(scratch.store().parent().unwrap());
+    let mut records = eitri_core::remote_audit::read(&dir, &Default::default(), None).unwrap_or_default();
+    records.reverse();
+    records
+}
+
+fn audit_field<'a>(record: &'a eitri_core::remote_audit::Record, name: &str) -> Option<&'a str> {
+    record.fields.get(name).and_then(serde_json::Value::as_str)
+}
+
+/// The records of `event`.
+fn of_event<'a>(
+    records: &'a [eitri_core::remote_audit::Record],
+    event: &str,
+) -> Vec<&'a eitri_core::remote_audit::Record> {
+    records.iter().filter(|r| r.event == event).collect()
+}
+
+#[test]
+fn enrollment_records_each_outcome() {
+    let scratch = Scratch::new();
+    let window = Window::new(&scratch, INSTANCE_A);
+    let mut client = window.connect();
+    let covered = Rc::new(Cell::new(false));
+    let _gate = recording_gate(&window.handle, &[1], covered);
+
+    // `y`: offered, then confirmed once the device is stored.
+    let (device, token) = window.enroll_with_yes(&mut client, "Pixel", "watch");
+    let records = audit_records(&window, &scratch);
+    let offered = of_event(&records, "enroll_offered");
+    assert_eq!(offered.len(), 1);
+    assert_eq!(
+        (audit_field(offered[0], "recipe"), audit_field(offered[0], "instance")),
+        (Some("direct"), Some(INSTANCE_A))
+    );
+    let confirmed = of_event(&records, "enroll_confirmed");
+    assert_eq!(confirmed.len(), 1);
+    assert_eq!(
+        (
+            audit_field(confirmed[0], "device"),
+            audit_field(confirmed[0], "device_name"),
+            audit_field(confirmed[0], "recipe"),
+            audit_field(confirmed[0], "grant"),
+            audit_field(confirmed[0], "host"),
+            audit_field(confirmed[0], "peer"),
+        ),
+        (
+            Some(device.as_str()),
+            Some("Pixel"),
+            Some("direct"),
+            Some("watch"),
+            Some("127.0.0.1:7341"),
+            Some("127.0.0.1:50122")
+        )
+    );
+    assert!(records.iter().all(|r| r.writer == INSTANCE_A));
+
+    // `n`: refused, why the desk's no.
+    let code = window.start(&mut client);
+    let before = window.count("remote_enroll");
+    Window::enroll(&mut client, &code, "Tablet");
+    let asked = window.asked("remote_enroll", before);
+    window.answer("no", asked["nonce"].as_u64().unwrap(), false, "watch");
+    window.until(&mut client, "the refusal", |v| v["kind"] == "enroll_refused");
+    let records = audit_records(&window, &scratch);
+    let refused = of_event(&records, "enroll_refused");
+    assert_eq!(refused.len(), 1);
+    assert_eq!(
+        (audit_field(refused[0], "device_name"), audit_field(refused[0], "why")),
+        (Some("Tablet"), Some("desk_said_no"))
+    );
+    assert!(of_event(&records, "enroll_confirmed").len() == 1, "no second device");
+
+    // A wrong code: refused as an invalid code, naming the phone as it claims to be.
+    let shown = window.start(&mut client);
+    Window::enroll(&mut client, "AAAAAAAAAAAAAAAAAAAAAA", "Stranger");
+    window.until(&mut client, "the refusal", |v| v["kind"] == "enroll_refused");
+    let records = audit_records(&window, &scratch);
+    let invalid: Vec<_> = of_event(&records, "refused")
+        .into_iter()
+        .filter(|r| audit_field(r, "reason") == Some("enroll_code_invalid"))
+        .collect();
+    assert_eq!(invalid.len(), 1);
+    assert_eq!(audit_field(invalid[0], "device_name"), Some("Stranger"));
+
+    // A code left unused: expired once, when a newer one replaces it or its time runs out.
+    window.socket.note_lapsed_at(Instant::now());
+    assert!(
+        of_event(&audit_records(&window, &scratch), "enroll_expired").is_empty(),
+        "still in time"
+    );
+    let _ = window.start(&mut client);
+    let later = Instant::now() + eitri_core::remote_pairing::ENROLL_CODE_TTL + Duration::from_secs(1);
+    window.socket.note_lapsed_at(later);
+    window.socket.note_lapsed_at(later);
+    let records = audit_records(&window, &scratch);
+    let expired = of_event(&records, "enroll_expired");
+    assert_eq!(
+        expired.len(),
+        2,
+        "the code replaced unused, and the one that ran out, each once"
+    );
+    assert!(expired.iter().all(|r| audit_field(r, "instance") == Some(INSTANCE_A)));
+
+    // Never a code or a token.
+    let bytes = std::fs::read_to_string(
+        eitri_core::remote_audit::audit_dir(scratch.store().parent().unwrap()).join("audit.jsonl"),
+    )
+    .unwrap();
+    for secret in [token.as_str(), code.as_str(), shown.as_str()] {
+        assert!(!bytes.contains(secret), "a secret reached the log");
+    }
+}
+
+#[test]
+fn listen_and_grant_answers_are_recorded() {
+    let scratch = Scratch::new();
+    let window = Window::new(&scratch, INSTANCE_A);
+    window
+        .socket
+        .set_link_of(|ip| (ip.to_string() == "198.51.100.20").then(|| ("eth0".to_owned(), IfaceKind::Plain)));
+    let mut client = window.connect();
+    let covered = Rc::new(Cell::new(false));
+    let _gate = recording_gate(&window.handle, &[1], covered);
+    let listen = |client: &mut RvClient| {
+        client
+            .send(&RvInbound::ListenRequest {
+                v: RV_PROTOCOL,
+                addr: "198.51.100.20".into(),
+            })
+            .unwrap();
+    };
+
+    // `n` records nothing; `y` records the address, its link and its kind.
+    listen(&mut client);
+    let asked = window.asked("remote_listen", 0);
+    window.listen_answer("n", asked["nonce"].as_u64().unwrap(), false);
+    window.until(&mut client, "the no", |v| v["kind"] == "listen_answer");
+    assert!(of_event(&audit_records(&window, &scratch), "listen_changed").is_empty());
+    listen(&mut client);
+    let asked = window.asked("remote_listen", 1);
+    window.listen_answer("y", asked["nonce"].as_u64().unwrap(), true);
+    window.until(&mut client, "the yes", |v| v["kind"] == "listen_answer");
+    let records = audit_records(&window, &scratch);
+    let changed = of_event(&records, "listen_changed");
+    assert_eq!(changed.len(), 1);
+    assert_eq!(
+        (
+            audit_field(changed[0], "listener"),
+            audit_field(changed[0], "listen_addr"),
+            audit_field(changed[0], "listen_iface"),
+            audit_field(changed[0], "listen_kind"),
+            changed[0].fields.get("confirmed").and_then(serde_json::Value::as_bool),
+        ),
+        (
+            Some("address"),
+            Some("198.51.100.20"),
+            Some("eth0"),
+            Some(IfaceKind::Plain.as_str()),
+            Some(true)
+        )
+    );
+
+    // A grant: `n` records nothing, `y` the change once written.
+    let (device, _token) = window.enroll_with_yes(&mut client, "Pixel", "watch");
+    grant_request(&mut client, &device, Grant::WatchSteer);
+    let asked = window.asked("remote_grant", 0);
+    window.answer("gn", asked["nonce"].as_u64().unwrap(), false, "watch+steer");
+    window.result(&mut client, "the no");
+    assert!(of_event(&audit_records(&window, &scratch), "grant_changed").is_empty());
+    grant_request(&mut client, &device, Grant::WatchSteer);
+    let asked = window.asked("remote_grant", 1);
+    window.answer("gy", asked["nonce"].as_u64().unwrap(), true, "watch+steer");
+    assert_eq!(window.result(&mut client, "the yes")["ok"], true);
+    let records = audit_records(&window, &scratch);
+    let granted = of_event(&records, "grant_changed");
+    assert_eq!(granted.len(), 1);
+    assert_eq!(
+        (
+            audit_field(granted[0], "device"),
+            audit_field(granted[0], "device_name"),
+            audit_field(granted[0], "from"),
+            audit_field(granted[0], "to"),
+        ),
+        (Some(device.as_str()), Some("Pixel"), Some("watch"), Some("watch+steer"))
+    );
+}
+
+#[test]
+fn revoke_self_records_by_device() {
+    let scratch = Scratch::new();
+    let window = Window::new(&scratch, INSTANCE_A);
+    let mut client = window.connect();
+    let covered = Rc::new(Cell::new(false));
+    let _gate = recording_gate(&window.handle, &[1], covered);
+    let (device, token) = window.enroll_with_yes(&mut client, "Pixel", "watch");
+    revoke_self(&mut client, &device, "wrong");
+    window.result(&mut client, "the refusal");
+    assert!(
+        of_event(&audit_records(&window, &scratch), "revoke").is_empty(),
+        "a wrong token revokes nothing"
+    );
+    revoke_self(&mut client, &device, &token);
+    assert_eq!(window.result(&mut client, "the revocation")["ok"], true);
+    let records = audit_records(&window, &scratch);
+    let revoked = of_event(&records, "revoke");
+    assert_eq!(revoked.len(), 1);
+    assert_eq!(
+        (
+            audit_field(revoked[0], "device"),
+            audit_field(revoked[0], "device_name"),
+            audit_field(revoked[0], "by"),
+        ),
+        (Some(device.as_str()), Some("Pixel"), Some("device"))
+    );
+    assert!(!revoked[0].line.contains(&token), "never the token");
+}
+
+impl Window {
+    /// A page kind from `from`, its request id `request`, with `fields` (a JSON object's inside, may be empty).
+    fn page(&self, from: ViewId, kind: &str, request: &str, fields: &str) {
+        let comma = if fields.is_empty() { "" } else { "," };
+        self.handle.page_message(
+            from,
+            &format!(r#"{{"type":"{kind}","request_id":"{request}"{comma}{fields}}}"#),
+        );
+    }
+
+    /// The device list the base page was sent after `after` of them.
+    fn listed(&self, after: usize) -> Vec<serde_json::Value> {
+        let list = self.asked("remote_devices", after);
+        list["devices"].as_array().expect("a list of devices").clone()
+    }
+
+    /// Asks the base page to revoke `device` through the list's `x`, and says yes; the question it was shown.
+    fn revoke_from_the_list(&self, device: &str) -> serde_json::Value {
+        let before = self.count("remote_revoke_ask");
+        self.page(
+            ViewId::BASE,
+            "remote_revoke_ask",
+            "x",
+            &format!(r#""device":"{device}""#),
+        );
+        let asked = self.asked("remote_revoke_ask", before);
+        let nonce = asked["nonce"].as_u64().unwrap();
+        self.page(
+            ViewId::BASE,
+            "remote_revoke",
+            "y",
+            &format!(r#""device":"{device}","nonce":{nonce}"#),
+        );
+        asked
+    }
+}
+
+#[test]
+fn start_enroll_only_from_the_base_page() {
+    let scratch = Scratch::new();
+    let window = Window::new(&scratch, INSTANCE_A);
+    window.turn();
+    window.page(view(2), "remote_start_enroll", "s2", r#""recipe":"auto""#);
+    window.page(view(2), "remote_devices_open", "o2", "");
+    for request in ["s2", "o2"] {
+        assert_eq!(
+            result_for(&window.second.sent.borrow(), request),
+            Some(Err(crate::agent_panel::remote_enroll::REMOTE_IS_THE_BASE_PAGES.into())),
+            "{request}"
+        );
+    }
+    window.settle();
+    assert_eq!(window.count("remote_pairing"), 0, "another page makes no code");
+
+    window.page(ViewId::BASE, "remote_start_enroll", "s1", r#""recipe":"direct""#);
+    assert_eq!(result_for(&window.base.sent.borrow(), "s1"), Some(Ok(())));
+    let shown = window.asked("remote_pairing", 0);
+    let code = shown["code"].as_str().unwrap().to_owned();
+    assert!(shown["uri"].as_str().unwrap().contains("m=direct"), "{shown}");
+    let offered = of_event(&audit_records(&window, &scratch), "enroll_offered").len();
+    assert_eq!(offered, 1);
+
+    // The code is the one `add-device` would show: a phone presenting it still waits for the desk's yes.
+    let mut client = window.connect();
+    Window::enroll(&mut client, &code, "Pixel");
+    let asked = window.asked("remote_enroll", 0);
+    assert_eq!(asked["name"], "Pixel");
+    assert!(
+        devices_in(&scratch.store()).is_empty(),
+        "nothing is stored before the desk's yes"
+    );
+
+    // A recipe this window has no route for is said in the base page, and no code is made.
+    let notices = window.count("notice");
+    window.page(ViewId::BASE, "remote_start_enroll", "s3", r#""recipe":"ssh""#);
+    window.asked("notice", notices);
+    assert_eq!(window.count("remote_pairing"), 1);
+}
+
+#[test]
+fn desk_revoke_is_recorded_by_desk() {
+    let scratch = Scratch::new();
+    let window = Window::new(&scratch, INSTANCE_A);
+    let mut client = window.connect();
+    let _gate = recording_gate(&window.handle, &[1], Rc::new(Cell::new(false)));
+    let (device, token) = window.enroll_with_yes(&mut client, "Pixel", "watch");
+    let asked = window.revoke_from_the_list(&device);
+    assert_eq!(asked["name"], "Pixel");
+    window.turn_until("the device leaves the store", || {
+        stored(&scratch.store(), &device).is_none()
+    });
+    let records = audit_records(&window, &scratch);
+    let revoked = of_event(&records, "revoke");
+    assert_eq!(revoked.len(), 1);
+    assert_eq!(
+        (
+            audit_field(revoked[0], "device"),
+            audit_field(revoked[0], "device_name"),
+            audit_field(revoked[0], "by"),
+        ),
+        (Some(device.as_str()), Some("Pixel"), Some("desk"))
+    );
+    assert!(!revoked[0].line.contains(&token), "never the token");
+}
+
+#[test]
+fn revoke_from_the_list_closes_the_phone() {
+    let scratch = Scratch::new();
+    let window = Window::new(&scratch, INSTANCE_A);
+    let mut client = window.connect();
+    let covered = Rc::new(Cell::new(true));
+    let _gate = recording_gate(&window.handle, &[1], covered.clone());
+    covered.set(false);
+    let (device, token) = window.enroll_with_yes(&mut client, "Pixel", "watch+steer");
+    let (other, _) = window.enroll_with_yes(&mut client, "Tablet", "watch");
+    let lists = window.count("remote_devices");
+
+    // A covered chat's yes takes nothing out.
+    covered.set(true);
+    window.revoke_from_the_list(&device);
+    window.settle();
+    assert!(stored(&scratch.store(), &device).is_some());
+    covered.set(false);
+
+    window.revoke_from_the_list(&device);
+    window.turn_until("the device leaves the store", || {
+        stored(&scratch.store(), &device).is_none()
+    });
+    // Taken out through the store's update: the token no longer names a device, which is what `serve` watches for.
+    let store = DeviceStore::load(&scratch.store()).unwrap();
+    assert!(store.verify(&device, &token).is_none());
+    assert!(store.get(&other).is_some(), "only that device goes");
+    // The list is drawn again without it.
+    let after = window.listed(lists);
+    let ids: Vec<&str> = after.iter().map(|d| d["id"].as_str().unwrap()).collect();
+    assert_eq!(ids, [other.as_str()]);
+}
+
+#[test]
+fn device_list_reads_off_the_tick() {
+    let scratch = Scratch::new();
+    let window = Window::new(&scratch, INSTANCE_A);
+    let mut client = window.connect();
+    let _gate = recording_gate(&window.handle, &[1], Rc::new(Cell::new(false)));
+    let (device, _token) = window.enroll_with_yes(&mut client, "Pixel\u{202e}9", "watch");
+    report(&mut client, &[(&device, "desk.tail1.ts.net")]);
+    window.turn_until("the report is shown", || window.count("remote_connected") >= 1);
+    window.socket.audit().flush();
+
+    let (release, held) = std::sync::mpsc::channel::<()>();
+    let held = std::sync::Mutex::new(held);
+    let reading = Arc::new(AtomicBool::new(false));
+    let read = Arc::clone(&reading);
+    window.socket.set_list_reader(move |store| {
+        read.store(true, Ordering::SeqCst);
+        let _ = held.lock().unwrap().recv();
+        device_rows(store)
+    });
+    window.page(ViewId::BASE, "remote_devices_open", "o1", "");
+    assert_eq!(result_for(&window.base.sent.borrow(), "o1"), Some(Ok(())));
+    window.turn_until("the read starts", || reading.load(Ordering::SeqCst));
+    // The read is held on its own thread: the tick goes on and is not answered yet.
+    for _ in 0..5 {
+        window.turn();
+    }
+    assert_eq!(window.count("remote_devices"), 0);
+    release.send(()).unwrap();
+    let devices = window.listed(0);
+    assert_eq!(devices.len(), 1);
+    let row = &devices[0];
+    assert_eq!(row["id"], device.as_str());
+    assert_eq!(row["name"], "Pixel\u{202e}9", "the name as stored; the page escapes it");
+    assert_eq!(
+        (row["grant"].as_str(), row["recipe"].as_str()),
+        (Some("watch"), Some("direct"))
+    );
+    assert_eq!(row["connected"], true);
+    assert_eq!(row["last_host"], "desk.tail1.ts.net");
+    assert!(row["enrolled_at"].as_u64().is_some());
+    assert!(row["push_host"].is_null());
+    let events: Vec<&str> = row["records"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|r| r["event"].as_str().unwrap())
+        .collect();
+    assert_eq!(events.first(), Some(&"enroll_confirmed"), "newest first: {events:?}");
+    assert!(events.len() <= DEVICE_RECORDS);
+    let fields = row["records"][0]["fields"].as_array().unwrap();
+    assert!(
+        fields.iter().any(|f| f[0] == "device_name" && f[1] == "Pixel\u{202e}9"),
+        "{fields:?}"
+    );
+}
+
+#[test]
+fn device_list_reads_run_one_at_a_time_and_coalesce() {
+    let scratch = Scratch::new();
+    let window = Window::new(&scratch, INSTANCE_A);
+    let mut client = window.connect();
+    let _gate = recording_gate(&window.handle, &[1], Rc::new(Cell::new(false)));
+    let (device, _token) = window.enroll_with_yes(&mut client, "Pixel", "watch");
+
+    let (release, held) = std::sync::mpsc::channel::<()>();
+    let held = std::sync::Mutex::new(held);
+    let at_once = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let most = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let reads = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let (now, top, count) = (Arc::clone(&at_once), Arc::clone(&most), Arc::clone(&reads));
+    window.socket.set_list_reader(move |store| {
+        top.fetch_max(now.fetch_add(1, Ordering::SeqCst) + 1, Ordering::SeqCst);
+        count.fetch_add(1, Ordering::SeqCst);
+        let _ = held.lock().unwrap().recv();
+        now.fetch_sub(1, Ordering::SeqCst);
+        device_rows(store)
+    });
+    // `r` held down: one request after another while the first read is still held.
+    for n in 0..24 {
+        window.page(ViewId::BASE, "remote_devices_open", &format!("o{n}"), "");
+        window.turn();
+    }
+    window.turn_until("the first read starts", || reads.load(Ordering::SeqCst) >= 1);
+    for _ in 0..5 {
+        window.turn();
+    }
+    assert_eq!(most.load(Ordering::SeqCst), 1, "one read at a time");
+    assert_eq!(reads.load(Ordering::SeqCst), 1, "the others wait for it");
+    drop(release);
+    let devices = window.listed(0);
+    assert_eq!(devices[0]["id"], device.as_str());
+    window.settle();
+    assert_eq!(
+        reads.load(Ordering::SeqCst),
+        2,
+        "the requests made during the read are answered by one more"
+    );
+    assert_eq!(window.count("remote_devices"), 1, "and only the newer list is drawn");
+    assert_eq!(most.load(Ordering::SeqCst), 1);
+}
+
+#[test]
+fn a_device_shows_its_last_twenty_records_and_the_push_host_only() {
+    let scratch = Scratch::new();
+    let window = Window::new(&scratch, INSTANCE_A);
+    let mut client = window.connect();
+    let _gate = recording_gate(&window.handle, &[1], Rc::new(Cell::new(false)));
+    let (device, token) = window.enroll_with_yes(&mut client, "Pixel", "watch");
+    set_push(
+        &mut client,
+        &device,
+        &token,
+        "https://ntfy.example.net/upAbCdEfSecretTopic?up=1",
+    );
+    assert_eq!(window.result(&mut client, "the push endpoint")["ok"], true);
+    for n in 0..(DEVICE_RECORDS + 5) {
+        window
+            .socket
+            .audit()
+            .record(eitri_core::remote_audit::Event::GrantChanged {
+                device: eitri_core::remote_audit::DeviceRef {
+                    id: device.clone(),
+                    name: format!("Pixel {n}"),
+                },
+                from: "watch".into(),
+                to: "watch".into(),
+            });
+    }
+    window.socket.audit().flush();
+    window.page(ViewId::BASE, "remote_devices_open", "o1", "");
+    let devices = window.listed(0);
+    let row = &devices[0];
+    assert_eq!(row["push_host"], "ntfy.example.net");
+    assert!(
+        !row.to_string().contains("SecretTopic"),
+        "the endpoint's path can be a credential"
+    );
+    let records = row["records"].as_array().unwrap();
+    assert_eq!(records.len(), DEVICE_RECORDS);
+    let newest = &records[0]["fields"];
+    assert!(newest
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|f| f[1] == format!("Pixel {}", DEVICE_RECORDS + 4)));
+}

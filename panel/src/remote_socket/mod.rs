@@ -25,9 +25,21 @@
 //! The line carries no token, so any process of this user could send it: the device must be in the store, the name
 //! shown is the store's, the reason one of the audit log's words, and the text a fixed phrase for it; nothing is
 //! answered. A kind this build parses and does not carry out is answered `refused` with `not yet`.
+//!
+//! The device list's requests from the base page (`remote_enroll::DeskRequest`) are taken at each pump and carried
+//! out on threads of their own by `devices`: the store and the log are read, a code is made, a device's name is read
+//! for the revoke question; what they find comes back through the same queue as the readers' lines, under the
+//! connection number [`DESK`], which no peer has.
+//!
+//! The socket holds the window's audit log ([`AuditSink`], in `audit/` beside the device store, under the instance
+//! id); each pump hands it to the panel, so the commands the panel takes and the refusals it decides are recorded
+//! there, and the handlers record what only they see: a peer's token and grant refused (`acts`), the enrollments and
+//! the desk's answers about devices (`devices`). The sink writes on a thread of its own and never makes the tick wait;
+//! the first time a record cannot be written, the base page is told once.
 
 use super::*;
 use crate::panel_wake::PanelWake;
+use crate::remote_audit_sink::AuditSink;
 use eitri_core::remote_devices::{DeviceStore, Grant};
 use eitri_core::remote_rv::{
     frame_line, parse_rv_line, pong_line, refused_line, result_line, RvInbound, RvListener, COMMAND_ID_MAX_BYTES,
@@ -68,6 +80,10 @@ const INBOUND_PER_PUMP: usize = 64;
 
 /// The `why` of a line this build parses and does not carry out.
 const NOT_YET: &str = "not yet";
+
+/// The connection number of what the desk's own page asked for (the device list's requests): connections are
+/// numbered from 1, so nothing is answered on a socket for it, and a refusal is said in the base page instead.
+const DESK: u64 = 0;
 
 /// What a connection's threads hand the tick.
 enum Inbound {
@@ -119,6 +135,8 @@ struct Shared {
     /// What the errands about devices share across the threads: the code on show, where phones connect.
     devices: devices::DevicesShared,
     serve_probe: std::sync::Mutex<Option<Box<ServeProbe>>>,
+    /// The window's audit log.
+    audit: AuditSink,
 }
 
 /// Checks the lock only when phones were reported; also reads the sandbox while its record is still pending.
@@ -173,6 +191,11 @@ impl RemoteSocket {
         deadlines: Deadlines,
     ) -> io::Result<RemoteSocket> {
         let (tx, rx) = mpsc::sync_channel(INBOUND_LINES);
+        let audit = AuditSink::open(
+            store_path.parent().unwrap_or(Path::new("")),
+            instance,
+            Arc::clone(&wake),
+        );
         let shared = Arc::new(Shared {
             inbound: tx,
             wake,
@@ -183,6 +206,7 @@ impl RemoteSocket {
             stopped: AtomicBool::new(false),
             devices: devices::DevicesShared::new(instance),
             serve_probe: std::sync::Mutex::new(None),
+            audit,
         });
         let accepting = Arc::clone(&shared);
         let maintained = Arc::clone(&shared);
@@ -214,6 +238,11 @@ impl RemoteSocket {
     /// is handled below, in the same pump), handles queued inbound lines, then takes frames only for observers whose
     /// writer has room. Never waits on a socket.
     pub fn pump(&self, handle: &AgentPanelHandle) {
+        self.hand_over_audit(handle);
+        let asked = handle.run(|state, _out| crate::agent_panel::remote_enroll::take_requests(state));
+        for request in asked {
+            self.desk_request(request);
+        }
         if handle.state.borrow().remote_desk.any_waiting() {
             handle.run(|state, out| {
                 crate::agent_panel::remote_enroll::expire_questions(state, std::time::Instant::now(), out)
@@ -232,6 +261,32 @@ impl RemoteSocket {
         }
         self.deliver_results(handle);
         self.send_frames(handle);
+    }
+
+    /// Gives the panel this socket's audit log, so what it takes and refuses is recorded there, and shows the base page
+    /// once why the log cannot be written, when it cannot.
+    fn hand_over_audit(&self, handle: &AgentPanelHandle) {
+        {
+            let mut state = handle.state.borrow_mut();
+            if !state
+                .remote
+                .audit
+                .as_ref()
+                .is_some_and(|held| held.is(&self.shared.audit))
+            {
+                state.remote.audit = Some(self.shared.audit.clone());
+            }
+        }
+        handle.run(crate::agent_panel::remote_enroll::switch_on);
+        if let Some(why) = self.shared.audit.take_notice() {
+            handle.run(|_state, out| out.send(ViewId::BASE, eitri_core::agent_bridge::serialize_notice_for_js(&why)));
+        }
+    }
+
+    /// The window's audit log, for a test to wait for its records.
+    #[cfg(test)]
+    pub(super) fn audit(&self) -> &AuditSink {
+        &self.shared.audit
     }
 
     /// Forgets every observer of this socket's connections, then closes it.

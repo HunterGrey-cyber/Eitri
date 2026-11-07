@@ -617,7 +617,9 @@ pub(super) fn handle_inbound_message(
                 for hint in hints_for_new_document(state, view) {
                     payloads.push(eitri_core::agent_bridge::serialize_review_hint_for_js(&hint));
                 }
-                // Who is connected from a phone: a new document starts with nobody.
+                // Whether remote control is on here, and who is connected from a phone: a new document starts with
+                // neither.
+                payloads.extend(super::remote_enroll::remote_on_for_new_document(state));
                 payloads.extend(super::remote_enroll::connected_for_new_document(state));
                 // The remote-control questions still waiting: the document that was here, if any, took them with it.
                 if view.is_base() {
@@ -1743,6 +1745,36 @@ pub(super) fn handle_inbound_message(
         }
         InboundMessage::RemoteListenAnswer { nonce, yes, .. } => {
             match super::remote_enroll::answer_listen(state, nonce, yes, std::time::Instant::now()) {
+                Ok(()) => ok(&mut out),
+                Err(why) => refuse(&mut out, &why),
+            }
+        }
+        // The device list's requests: base page only (admission), carried out by the `rv-` socket off the tick.
+        InboundMessage::RemoteDevicesOpen { .. } => {
+            match super::remote_enroll::want(state, super::remote_enroll::DeskRequest::List) {
+                Ok(()) => ok(&mut out),
+                Err(why) => refuse(&mut out, why),
+            }
+        }
+        InboundMessage::RemoteStartEnroll { recipe, .. } => {
+            match super::remote_enroll::want(state, super::remote_enroll::DeskRequest::StartEnroll(recipe.mode())) {
+                Ok(()) => ok(&mut out),
+                Err(why) => refuse(&mut out, why),
+            }
+        }
+        InboundMessage::RemoteRevokeAsk { device, .. } => {
+            if device.is_empty() || device.len() > super::remote_enroll::REMOTE_FIELD_MAX_BYTES {
+                refuse(&mut out, "no such device");
+            } else {
+                match super::remote_enroll::want(state, super::remote_enroll::DeskRequest::RevokeAsk(device)) {
+                    Ok(()) => ok(&mut out),
+                    Err(why) => refuse(&mut out, why),
+                }
+            }
+        }
+        // A revoke's yes: admitted from the base page only, past the window's gate.
+        InboundMessage::RemoteRevoke { device, nonce, .. } => {
+            match super::remote_enroll::answer_revoke(state, nonce, &device, std::time::Instant::now()) {
                 Ok(()) => ok(&mut out),
                 Err(why) => refuse(&mut out, &why),
             }

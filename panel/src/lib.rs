@@ -11,6 +11,7 @@ pub mod panel_document;
 pub mod panel_pacer;
 pub mod panel_page;
 pub mod panel_wake;
+pub mod remote_audit_sink;
 pub mod review_editor;
 pub mod startup_config;
 pub mod terminal_handoff;

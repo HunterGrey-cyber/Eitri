@@ -2,6 +2,7 @@
 
 use super::{chain, parse_time, rotate, AUDIT_ROTATE_BYTES};
 use serde_json::{Map, Value};
+use std::collections::HashMap;
 use std::io;
 use std::path::Path;
 use std::time::SystemTime;
@@ -93,6 +94,34 @@ pub fn read(dir: &Path, filter: &Filter, limit: Option<usize>) -> io::Result<Vec
             };
             if filter.passes(&record) {
                 out.push(record);
+            }
+        }
+    }
+    Ok(out)
+}
+
+/// The newest records about each of `devices` (by id), at most `per_device` of each, newest first, from one pass over
+/// the retained files: what a list of devices shows, without reading the log once per device. A device with no record
+/// has an empty list; the pass stops once every device has its `per_device`.
+pub fn newest_by_device(dir: &Path, devices: &[&str], per_device: usize) -> io::Result<HashMap<String, Vec<Record>>> {
+    let mut out: HashMap<String, Vec<Record>> = devices.iter().map(|d| ((*d).to_owned(), Vec::new())).collect();
+    let mut wanting = if per_device == 0 { 0 } else { out.len() };
+    for (_, bytes) in rotate::snapshot(dir)?.into_iter().rev() {
+        for line in chain::split_lines(&bytes).into_iter().rev() {
+            if wanting == 0 {
+                return Ok(out);
+            }
+            let Some(record) = std::str::from_utf8(line).ok().and_then(Record::parse) else {
+                continue;
+            };
+            let Some(kept) = record.device().and_then(|d| out.get_mut(d)) else {
+                continue;
+            };
+            if kept.len() < per_device {
+                kept.push(record);
+                if kept.len() == per_device {
+                    wanting -= 1;
+                }
             }
         }
     }
@@ -213,6 +242,37 @@ mod tests {
 
         let two = read(&dir, &Filter::default(), Some(2)).unwrap();
         assert_eq!(two.iter().map(|r| r.seq).collect::<Vec<_>>(), vec![11, 10]);
+    }
+
+    #[test]
+    fn newest_by_device_matches_a_read_per_device_in_one_pass() {
+        let dir = audit_dir_for("audit-read-by-device");
+        let clock = FakeClock::at_ms(days_ms(20_000));
+        let mut log = open_at(&dir, WriterKind::Serve, None, JournalTarget::Off, &clock);
+        log.rotate_bytes = 1200;
+        for n in 0..12 {
+            clock.set_ms(days_ms(20_000) + n * 1000);
+            log.record(cmd(["a", "b", "c"][(n % 3) as usize], n)).unwrap();
+        }
+        assert!(dir.join(rotated_name(1)).exists(), "the read spans files");
+        let found = newest_by_device(&dir, &["a", "b", "none"], 3).unwrap();
+        for id in ["a", "b", "none"] {
+            let one = read(
+                &dir,
+                &Filter {
+                    device_id: Some(id.into()),
+                    ..Filter::default()
+                },
+                Some(3),
+            )
+            .unwrap();
+            assert_eq!(found[id], one, "{id}");
+        }
+        assert_eq!(found["a"].len(), 3);
+        assert!(found["none"].is_empty());
+        assert!(!found.contains_key("c"), "only the devices asked for");
+        assert!(newest_by_device(&dir, &["a"], 0).unwrap()["a"].is_empty());
+        assert!(newest_by_device(&audit_dir_for("audit-read-by-device-none"), &["a"], 3).unwrap()["a"].is_empty());
     }
 
     #[test]

@@ -2369,6 +2369,31 @@ button.band-background {
 .question-preview { font-family: var(--nv-font-mono); max-width: 100%; overflow: auto; }
 .question-footer { color: var(--nv-fg); }
 
+/* The device list sits in the panel's column above the band: its height is bounded, so a device's records scroll
+   inside it and the window's y/n drawn under it stays on screen. */
+.device-list {
+  flex: 0 0 auto;
+  max-height: 45vh;
+  overflow-y: auto;
+  overflow-x: hidden;
+  overflow-wrap: anywhere;
+  padding: 8px var(--page-pad);
+  border-top: 1px solid var(--rule-frame);
+}
+.device-rows, .device-records {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+}
+.device-records {
+  padding-left: 1.5em;
+  font-family: var(--nv-font-mono);
+  font-size: var(--fs-code);
+}
+.device-row.selected > div:first-child {
+  background: var(--nv-cursorline);
+}
+
 /* The pairing address under the enrollment QR code: long, one word, and there to be selected and copied. */
 .remote-pairing-uri {
   display: block;

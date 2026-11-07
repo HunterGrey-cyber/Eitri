@@ -28,6 +28,8 @@ pub enum PanelAction {
     /// after a y/n question.
     StopBackground,
     Follow,
+    /// The remote-control device list (only offered while remote control is on in the window).
+    RemoteDevices,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -101,6 +103,7 @@ pub fn parse_action(name: &str) -> Result<PanelAction, String> {
         "effort.pick" => PanelAction::EffortPick,
         "tab.stop-background" => PanelAction::StopBackground,
         "tab.follow" => PanelAction::Follow,
+        "remote.devices" => PanelAction::RemoteDevices,
         other => {
             return Err(format!(
                 "{other:?} is not a panel action (init.lua's panel table names)"
@@ -133,6 +136,7 @@ impl PanelAction {
             PanelAction::EffortPick => "effort.pick",
             PanelAction::StopBackground => "tab.stop-background",
             PanelAction::Follow => "tab.follow",
+            PanelAction::RemoteDevices => "remote.devices",
         }
     }
 
@@ -159,6 +163,7 @@ impl PanelAction {
             PanelAction::EffortPick => "effort",
             PanelAction::StopBackground => "stop background work",
             PanelAction::Follow => "follow in the editor",
+            PanelAction::RemoteDevices => "phones (remote control)",
         }
     }
 }
@@ -226,9 +231,10 @@ pub fn reserved(seq: &PanelSeq) -> Option<String> {
 /// `lazyvim: plugins/editor.lua:84-91`, renamed since the thing here is a tab, not a buffer);
 /// `<leader>f` is `+new` (LazyVim's `+file/find`, `editor.lua:72`; the only entry here makes a
 /// new tab).
-pub const DEFAULT_GROUPS: &[(&str, &str)] = &[("<leader>b", "+tab"), ("<leader>f", "+new")];
+/// `<leader>r` is `+remote`, the remote-control keys (an Eitri-only group).
+pub const DEFAULT_GROUPS: &[(&str, &str)] = &[("<leader>b", "+tab"), ("<leader>f", "+new"), ("<leader>r", "+remote")];
 
-/// The 20 default rows, in table order: direct
+/// The 21 default rows, in table order: direct
 /// tab-as-buffer keys first, then the `<leader>` rows. Every row's source is the
 /// LazyVim/nvim/which-key line it copies, or `eitri-only` with why, so no row is invented.
 pub fn default_bindings() -> Vec<PanelBinding> {
@@ -349,6 +355,13 @@ pub fn default_bindings() -> Vec<PanelBinding> {
         PanelBinding {
             seq: parse_seq("<leader>e").unwrap(),
             action: PanelAction::Follow,
+            source: PanelSource::Default,
+        },
+        // eitri-only: LazyVim binds no `<leader>r` group; `r` as in remote, `d` as in devices. The page offers it only
+        // while remote control is on in the window.
+        PanelBinding {
+            seq: parse_seq("<leader>rd").unwrap(),
+            action: PanelAction::RemoteDevices,
             source: PanelSource::Default,
         },
         // lazyvim: plugins/editor.lua:105-110 ("Buffer Keymaps (which-key)")
@@ -622,6 +635,7 @@ mod tests {
             ("Space E", "effort.pick"),
             ("Space k", "tab.stop-background"),
             ("Space e", "tab.follow"),
+            ("Space r d", "remote.devices"),
             ("Space ?", "panel.keymap"),
         ];
         assert_eq!(
@@ -650,6 +664,7 @@ mod tests {
             "effort.pick",
             "tab.stop-background",
             "tab.follow",
+            "remote.devices",
         ] {
             assert_eq!(parse_action(name).unwrap().name(), name);
         }

@@ -586,6 +586,31 @@ pub enum InboundMessage {
         nonce: u64,
         yes: bool,
     },
+    /// The device list's key in the base page, and its `r`: the window reads the device store and each device's last
+    /// audit records off the tick and answers with `remote_devices`. Window-level and base-page only; it reads and
+    /// decides nothing.
+    RemoteDevicesOpen {
+        request_id: String,
+    },
+    /// `a` in the device list: make an enrollment code, as `eitri remote add-device` does, by `recipe` (`auto` is the
+    /// window's default route). A phone presenting it is still added only after the desk's `y`. Base-page only.
+    RemoteStartEnroll {
+        request_id: String,
+        recipe: RemoteRecipe,
+    },
+    /// `x` on a device in the list: the window asks the base page `Revoke <name>? (y/n)` (`remote_revoke_ask`).
+    /// Asking decides nothing. Base-page only.
+    RemoteRevokeAsk {
+        request_id: String,
+        device: String,
+    },
+    /// `y` to the window's revoke question: gated like `confirm_bypass`, and only the question waiting under `nonce`,
+    /// about `device`, is answered. No field has a default.
+    RemoteRevoke {
+        request_id: String,
+        device: String,
+        nonce: u64,
+    },
     /// `s` on the launch dashboard: bring back the tabs the last window had open, the first into
     /// this empty tab and the rest into new ones. Names the tab it was pressed in.
     RestoreLast {
@@ -650,6 +675,26 @@ pub enum InboundMessage {
 pub enum TrustAction {
     Trust,
     Untrust,
+}
+
+/// Which route a code made from the device list sends phones by: the window's default, or one recipe.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RemoteRecipe {
+    Auto,
+    Ssh,
+    Direct,
+}
+
+impl RemoteRecipe {
+    /// The recipe asked for, `None` for the window's default (as `eitri remote add-device` with no flag).
+    pub fn mode(self) -> Option<crate::remote_pairing::PairMode> {
+        match self {
+            RemoteRecipe::Auto => None,
+            RemoteRecipe::Ssh => Some(crate::remote_pairing::PairMode::Ssh),
+            RemoteRecipe::Direct => Some(crate::remote_pairing::PairMode::Direct),
+        }
+    }
 }
 
 /// The wire spelling of `crate::tab_set::BypassScope`. Kept separate from that type (rather than
@@ -734,6 +779,10 @@ impl InboundMessage {
             | InboundMessage::TrustCommand { .. }
             | InboundMessage::RemoteEnrollAnswer { .. }
             | InboundMessage::RemoteListenAnswer { .. }
+            | InboundMessage::RemoteDevicesOpen { .. }
+            | InboundMessage::RemoteStartEnroll { .. }
+            | InboundMessage::RemoteRevokeAsk { .. }
+            | InboundMessage::RemoteRevoke { .. }
             | InboundMessage::OpenUrl { .. } => return TabRef::WindowLevel,
             // These two name their tab as a plain number: a message without one does not parse.
             InboundMessage::TrustAnswer { tab, .. } | InboundMessage::TrustCancel { tab, .. } => Some(*tab),
@@ -999,6 +1048,10 @@ impl InboundMessage {
             | InboundMessage::TrustCommand { request_id, .. }
             | InboundMessage::RemoteEnrollAnswer { request_id, .. }
             | InboundMessage::RemoteListenAnswer { request_id, .. }
+            | InboundMessage::RemoteDevicesOpen { request_id }
+            | InboundMessage::RemoteStartEnroll { request_id, .. }
+            | InboundMessage::RemoteRevokeAsk { request_id, .. }
+            | InboundMessage::RemoteRevoke { request_id, .. }
             | InboundMessage::OpenUrl { request_id, .. } => request_id,
         }
     }

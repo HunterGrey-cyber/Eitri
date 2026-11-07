@@ -1,4 +1,5 @@
 import type { PanelMode } from "./keymap";
+import type { RemoteConnectedDevice } from "./bridge";
 import type { BackgroundTaskRecord, EditorLink, TurnEnding, UsageInfo } from "./types";
 import { turnEndingBandText } from "./turnEnding";
 import { escapeText, isHiddenChar, revealedText } from "./revealHidden";
@@ -81,11 +82,15 @@ export type BandFacts = {
    *  the person at the desk must always see that someone else can watch. */
   phones?: number | null;
   remoteSandbox?: string | null;
+  /** The phones connected, for the mark's title: each named with its grant and the `Host` it came through. */
+  phoneDevices?: RemoteConnectedDevice[];
 };
 
-/** The phone mark's tooltip, from the host's sandbox report. */
-export function phoneTitle(sandbox?: string | null): string {
-  return `Remote control: connected phones${sandbox && sandbox !== "full" ? "; sandbox: partial" : ""}`;
+/** The phone mark's tooltip: each connected phone with its grant and the `Host` it came through (a phone's and the
+ *  network's words, with their hidden characters written as escapes), and the host's sandbox report. */
+export function phoneTitle(sandbox?: string | null, devices: RemoteConnectedDevice[] = []): string {
+  const named = devices.map((d) => `${revealedText(d.name)} (${d.grant}, through ${revealedText(d.host)})`).join(", ");
+  return `Remote control: connected phones${named === "" ? "" : `: ${named}`}${sandbox && sandbox !== "full" ? "; sandbox: partial" : ""}`;
 }
 
 /** The band's phone mark: how many phones are connected. `?` names them. */

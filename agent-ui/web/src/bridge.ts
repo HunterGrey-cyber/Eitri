@@ -189,6 +189,16 @@ export type OutboundMessage =
   | { type: "remote_enroll_answer"; request_id: string; nonce: number; yes: boolean; grant: RemoteGrant }
   /** `y` or `n`/Escape/Enter to the window's question about listening for phones on a named address. */
   | { type: "remote_listen_answer"; request_id: string; nonce: number; yes: boolean }
+  /** The device list's key (`remote.devices`) and its `r`: the window answers with `remote_devices`. Base page only;
+   *  `InboundMessage::RemoteDevicesOpen`. */
+  | { type: "remote_devices_open"; request_id: string }
+  /** `a` in the device list: a code, as `eitri remote add-device` makes, by the recipe chosen (`auto` is the window's
+   *  default route). A phone presenting it is still added only after the desk's `y`. */
+  | { type: "remote_start_enroll"; request_id: string; recipe: RemoteRecipeChoice }
+  /** `x` in the device list: the window asks `Revoke <name>? (y/n)` (`remote_revoke_ask`). */
+  | { type: "remote_revoke_ask"; request_id: string; device: string }
+  /** `y` to the window's revoke question, gated by the window like any answer's `y`. A no is never sent. */
+  | { type: "remote_revoke"; request_id: string; device: string; nonce: number }
   /** `c` in BROWSE, and `[`/`]`/`S` inside the review overlay: the files that changed on disk during this
    *  tab's turn (`"latest"`, or a turn number) or, with `scope: "session"`, since the session's first
    *  baseline. Names the tab, as every tab-scoped command does; the reply is a `review` envelope carrying the
@@ -508,6 +518,28 @@ function isWellFormedTrustPrompt(value: unknown): boolean {
 /** What a phone may do, as the desk grants it. */
 export type RemoteGrant = "watch" | "watch+steer";
 
+/** The route a code made from the device list sends phones by. */
+export type RemoteRecipeChoice = "auto" | "ssh" | "direct";
+
+/** One audit record of a device, as the device list draws it: every field of its own as `[name, text]`, plain text
+ *  drawn through `revealHidden`. */
+export type RemoteDeviceRecord = { time: string; event: string; writer: string; fields: [string, string][] };
+
+/** One enrolled device, as the device list shows it (`panel/src/remote_enroll.rs`'s `show_devices`): the store's
+ *  entry, whether it is connected now, the host its notifications go to, and its newest audit records first. */
+export type RemoteDeviceRow = {
+  id: string;
+  name: string;
+  grant: RemoteGrant;
+  recipe: "ssh" | "direct" | "unknown";
+  enrolled_at: number | null;
+  last_seen: number | null;
+  last_host: string | null;
+  connected: boolean;
+  push_host: string | null;
+  records: RemoteDeviceRecord[];
+};
+
 /** One phone connected to this desk now (`panel/src/remote_socket/devices.rs`): its name as the store holds it, the
  *  grant it has, the `Host` its request named and when it connected (seconds since the Unix epoch). The name and
  *  host are plain text, drawn through `revealHidden`. */
@@ -531,6 +563,12 @@ export type RemoteDeskEnvelope =
   | { kind: "remote_device_flagged"; device: string; name: string }
   /** Who is connected now, whole: it replaces the last list, and an empty one takes the band's phone mark away. */
   | { kind: "remote_connected"; devices: RemoteConnectedDevice[]; sandbox?: string | null }
+  /** Remote control is on in this window: the device list's key is offered. */
+  | { kind: "remote_on" }
+  /** The device list, whole, read for the base page. */
+  | { kind: "remote_devices"; devices: RemoteDeviceRow[] }
+  /** The window's y/n before a device is revoked from the list; a `y` is `remote_revoke` under its nonce. */
+  | { kind: "remote_revoke_ask"; nonce: number; device: string; name: string; expiresInMs: number }
   | { kind: "command_result"; requestId: string; ok: true }
   | { kind: "command_result"; requestId: string; ok: false; error: string };
 
@@ -543,14 +581,35 @@ export function installRemoteDesk(handler: ((payload: RemoteDeskEnvelope) => voi
   remoteDesk = handler;
 }
 
-/** Sends an answer to a remote-control question; its `command_result` goes to the remote desk, not the panel. */
-export function postRemoteAnswer(message: Extract<OutboundMessage, { type: "remote_enroll_answer" | "remote_listen_answer" }>): void {
+/** Sends an answer to a remote-control question, or a request of the device list; its `command_result` goes to the
+ *  remote desk, not the panel. */
+export function postRemoteAnswer(
+  message: Extract<
+    OutboundMessage,
+    { type: "remote_enroll_answer" | "remote_listen_answer" | "remote_devices_open" | "remote_start_enroll" | "remote_revoke_ask" | "remote_revoke" }
+  >,
+): void {
   remoteRequests.add(message.request_id);
   postToRust(message);
 }
 
 function isGrant(value: unknown): value is RemoteGrant {
   return value === "watch" || value === "watch+steer";
+}
+
+function isWellFormedDeviceRow(value: unknown): boolean {
+  const d = value as Record<string, unknown> | null;
+  const text = (v: unknown) => typeof v === "string";
+  const time = (v: unknown) => v === null || (Number.isSafeInteger(v) && (v as number) >= 0);
+  return d !== null && typeof d === "object" && text(d.id) && text(d.name) && isGrant(d.grant) &&
+    (d.recipe === "ssh" || d.recipe === "direct" || d.recipe === "unknown") && time(d.enrolled_at) &&
+    time(d.last_seen) && (d.last_host === null || text(d.last_host)) && typeof d.connected === "boolean" &&
+    (d.push_host === null || text(d.push_host)) && Array.isArray(d.records) && d.records.every((r: unknown) => {
+      const record = r as Record<string, unknown> | null;
+      return record !== null && typeof record === "object" && text(record.time) && text(record.event) &&
+        text(record.writer) && Array.isArray(record.fields) &&
+        record.fields.every((f: unknown) => Array.isArray(f) && f.length === 2 && text(f[0]) && text(f[1]));
+    });
 }
 
 function isWellFormedRemote(value: Record<string, unknown>): boolean {
@@ -580,6 +639,12 @@ function isWellFormedRemote(value: Record<string, unknown>): boolean {
         return device !== null && typeof device === "object" && text(device.device) && text(device.name) && isGrant(device.grant) &&
           text(device.host) && Number.isSafeInteger(device.since) && (device.since as number) >= 0;
       });
+    case "remote_on":
+      return true;
+    case "remote_devices":
+      return Array.isArray(value.devices) && value.devices.every(isWellFormedDeviceRow);
+    case "remote_revoke_ask":
+      return nonce && expires && text(value.device) && text(value.name);
     default:
       return false;
   }
@@ -605,7 +670,10 @@ export function installDispatch(handler: InboundHandler): void {
         obj.kind === "remote_grant" ||
         obj.kind === "remote_question_closed" ||
         obj.kind === "remote_device_flagged" ||
-        obj.kind === "remote_connected"
+        obj.kind === "remote_connected" ||
+        obj.kind === "remote_on" ||
+        obj.kind === "remote_devices" ||
+        obj.kind === "remote_revoke_ask"
       ) {
         if (!isWellFormedRemote(parsed as Record<string, unknown>)) {
           console.warn("agent-ui: __eitriDispatch received a malformed remote-control envelope", parsed);

@@ -7,11 +7,13 @@
 //! can type too. `ssh-key add` edits `~/.ssh/authorized_keys`
 //! after a y/n here: it gives a phone's key one forward to the loopback port and nothing else.
 
+use eitri_core::remote_audit::{audit_dir, AuditLog, DeviceRef, Event as AuditEvent, JournalTarget, WriterKind};
 use eitri_core::remote_devices::{Device, DeviceStore, Grant, Recipe};
 use eitri_core::remote_pairing::{public_key_fingerprint, remote_state_dir, PairMode, DEVICES_FILE};
 use eitri_core::remote_rv::{
     parse_rv_outbound, serve_control_socket_path, RvClient, RvInbound, RvOutbound, RV_PROTOCOL,
 };
+use std::collections::HashMap;
 use std::io::{self, BufRead, Read, Write};
 use std::os::unix::fs::{DirBuilderExt, MetadataExt, OpenOptionsExt};
 use std::path::{Path, PathBuf};
@@ -142,7 +144,10 @@ pub fn add_device_at(path: &Path, name: &str, recipe: Option<PairMode>) -> i32 {
                 };
                 println!("(add-device {flag} makes a code for the window's other recipe.)");
             }
-            println!("Scan the code the Eitri window shows with {name}, within three minutes; then answer y there.");
+            println!(
+                "Scan the code the Eitri window shows with {}, within three minutes; then answer y there.",
+                shown(name)
+            );
             0
         }
         Ok(RvOutbound::Result { why, .. }) => {
@@ -269,8 +274,28 @@ pub fn devices(args: &[String]) -> i32 {
     }
 }
 
+/// The newest audit record about each of `devices` in `dir`, as `<event> <time>`, from one read of the log; none when
+/// the log cannot be read (said on `err`).
+fn last_records(dir: &Path, devices: &[&str], err: &mut dyn Write) -> HashMap<String, String> {
+    match eitri_core::remote_audit::newest_by_device(dir, devices, 1) {
+        Ok(found) => found
+            .into_iter()
+            .filter_map(|(id, records)| {
+                let r = records.first()?;
+                Some((id, format!("{} {}", shown(&r.event), shown(&r.time))))
+            })
+            .collect(),
+        Err(e) if e.kind() == io::ErrorKind::NotFound => HashMap::new(),
+        Err(e) => {
+            let _ = writeln!(err, "eitri remote devices: the audit log in {}: {e}", dir.display());
+            HashMap::new()
+        }
+    }
+}
+
 /// [`devices`] from the store at `path`: one row per device (id, name, grant, recipe, the `Host` it enrolled
-/// through, the `Host` and time it was last connected), then a line for each device no desk said yes to.
+/// through, the `Host` and time it was last connected, its newest record in the audit log beside the store), then a
+/// line for each device no desk said yes to.
 pub fn devices_at(path: &Path, out: &mut dyn Write, err: &mut dyn Write) -> i32 {
     let store = match load_store(path) {
         Ok(store) => store,
@@ -291,8 +316,13 @@ pub fn devices_at(path: &Path, out: &mut dyn Write, err: &mut dyn Write) -> i32 
         "ENROLLED THROUGH".to_owned(),
         "LAST HOST".to_owned(),
         "LAST SEEN".to_owned(),
+        "LAST RECORD".to_owned(),
     ]];
+    let audit = audit_dir(path.parent().unwrap_or(Path::new("")));
+    let ids: Vec<&str> = store.devices().iter().map(|d| d.id.as_str()).collect();
+    let mut last_of = last_records(&audit, &ids, err);
     for d in store.devices() {
+        let last = last_of.remove(&d.id).unwrap_or_else(|| "-".to_owned());
         rows.push([
             shown(&d.id),
             shown(&d.name),
@@ -305,9 +335,10 @@ pub fn devices_at(path: &Path, out: &mut dyn Write, err: &mut dyn Write) -> i32 
             },
             d.last_host.as_deref().map_or_else(|| "-".to_owned(), shown),
             d.last_seen.map_or_else(|| "never".to_owned(), utc),
+            last,
         ]);
     }
-    let widths: Vec<usize> = (0..7)
+    let widths: Vec<usize> = (0..8)
         .map(|i| rows.iter().map(|r| r[i].chars().count()).max().unwrap_or(0))
         .collect();
     for row in &rows {
@@ -329,6 +360,23 @@ pub fn devices_at(path: &Path, out: &mut dyn Write, err: &mut dyn Write) -> i32 
     0
 }
 
+/// Records `event` as `eitri remote` in the terminal, only when the audit directory beside the store at `store` is
+/// there: remote control was on at some time. A record that cannot be written is said on `err` and fails nothing.
+fn record_beside(store: &Path, journal: JournalTarget, event: AuditEvent, err: &mut dyn Write) {
+    let dir = audit_dir(store.parent().unwrap_or(Path::new("")));
+    if !dir.is_dir() {
+        return;
+    }
+    let written = AuditLog::open(&dir, WriterKind::Cli, None, journal).and_then(|mut log| log.record(event));
+    if let Err(e) = written {
+        let _ = writeln!(
+            err,
+            "eitri remote: the audit log in {} was not written: {e}",
+            dir.display()
+        );
+    }
+}
+
 /// `eitri remote revoke <device>`: takes a device out of the store, by id or by a name only it has.
 pub fn revoke(args: &[String]) -> i32 {
     let [device] = args else {
@@ -336,7 +384,13 @@ pub fn revoke(args: &[String]) -> i32 {
         return 2;
     };
     match store_path() {
-        Ok(path) => revoke_at(&path, device, &mut io::stdout().lock(), &mut io::stderr().lock()),
+        Ok(path) => revoke_journaled(
+            &path,
+            device,
+            eitri_core::remote_audit::journal_target(),
+            &mut io::stdout().lock(),
+            &mut io::stderr().lock(),
+        ),
         Err(e) => {
             eprintln!("eitri remote revoke: {e}");
             1
@@ -344,16 +398,36 @@ pub fn revoke(args: &[String]) -> i32 {
     }
 }
 
-/// [`revoke`] on the store at `path`. The device goes with everything kept of it, its push endpoint included;
-/// `serve`, watching the store, closes its connections.
+/// [`revoke`] on the store at `path`, its record sent to no journal. The device goes with everything kept of it, its
+/// push endpoint included; `serve`, watching the store, closes its connections.
 pub fn revoke_at(path: &Path, word: &str, out: &mut dyn Write, err: &mut dyn Write) -> i32 {
+    revoke_journaled(path, word, JournalTarget::Off, out, err)
+}
+
+/// [`revoke_at`], recording the revoke (`by: cli`) in the audit log beside the store when remote control was ever on
+/// there, with its journal copy sent to `journal`.
+pub fn revoke_journaled(
+    path: &Path,
+    word: &str,
+    journal: JournalTarget,
+    out: &mut dyn Write,
+    err: &mut dyn Write,
+) -> i32 {
     let removed = eitri_core::remote_devices::update(path, |store| {
         let id = resolve(store, word)?.id.clone();
         store.remove(&id).ok_or_else(|| format!("no device {}", shown(word)))
     });
     match removed {
         Ok(Ok(device)) => {
-            let _ = writeln!(out, "revoked {} ({})", device.id, shown(&device.name));
+            let event = AuditEvent::Revoke {
+                device: DeviceRef {
+                    id: device.id.clone(),
+                    name: device.name.clone(),
+                },
+                by: "cli".into(),
+            };
+            record_beside(path, journal, event, err);
+            let _ = writeln!(out, "revoked {} ({})", shown(&device.id), shown(&device.name));
             if device.recipe != Recipe::Ssh {
                 return 0;
             }
@@ -414,13 +488,14 @@ pub fn grant_at(serve: &Path, store: &Path, word: &str, grant: Grant, out: &mut 
     {
         Ok(id) => id,
         Err(why) => {
-            let _ = writeln!(err, "eitri remote grant: {why}");
+            let _ = writeln!(err, "eitri remote grant: {}", shown(&why));
             return 1;
         }
     };
     let _ = writeln!(
         out,
-        "Asking the Eitri window: answer y there (within three minutes) to let {device} {}.",
+        "Asking the Eitri window: answer y there (within three minutes) to let {} {}.",
+        shown(&device),
         match grant {
             Grant::Watch => "only watch",
             Grant::WatchSteer => "watch and steer",
@@ -434,11 +509,11 @@ pub fn grant_at(serve: &Path, store: &Path, word: &str, grant: Grant, out: &mut 
     };
     match ask_serve(serve, &frame, GRANT_ANSWER_WITHIN) {
         Ok(()) => {
-            let _ = writeln!(out, "{device} may now {}", grant_text(grant));
+            let _ = writeln!(out, "{} may now {}", shown(&device), grant_text(grant));
             0
         }
         Err(why) => {
-            let _ = writeln!(err, "eitri remote grant: {why}");
+            let _ = writeln!(err, "eitri remote grant: {}", shown(&why));
             1
         }
     }
@@ -991,7 +1066,10 @@ mod tests {
             "a hidden character is shown, not obeyed: {out}"
         );
         assert!(lines[1].contains("watch") && lines[1].contains("ssh") && lines[1].contains("2025-11-06 14:05 UTC"));
-        assert!(lines[2].contains("unknown") && lines[2].ends_with("never"), "{out}");
+        assert!(
+            lines[2].contains("unknown") && lines[2].split_whitespace().rev().take(2).eq(["-", "never"]),
+            "{out}"
+        );
         assert!(lines[4].starts_with("d2: no desk said yes"), "{out}");
         assert!(
             lines[5].starts_with("d3\\u{1b}]0;owned\\u{7}: no desk said yes"),
@@ -1191,5 +1269,98 @@ mod tests {
         assert_eq!(ssh_key(&args(&["add"])), 2);
         assert_eq!(ssh_key(&args(&["remove", "x"])), 2);
         assert_eq!(ssh_key(&args(&["add", "x", "--port", "0"])), 2);
+    }
+
+    fn audit_lines(dir: &Tidy) -> Vec<eitri_core::remote_audit::Record> {
+        let audit = eitri_core::remote_audit::audit_dir(&dir.0.join("remote"));
+        eitri_core::remote_audit::read(&audit, &Default::default(), None).unwrap()
+    }
+
+    #[test]
+    fn cli_revoke_records_by_cli() {
+        let dir = Tidy::new("revoke-audit");
+        let path = store_with(&dir, vec![device("d1", "Pixel", Recipe::Direct)]);
+        // Remote control was on once: the directory is there.
+        std::fs::create_dir_all(eitri_core::remote_audit::audit_dir(path.parent().unwrap())).unwrap();
+        let (mut out, mut err) = (Vec::new(), Vec::new());
+        assert_eq!(revoke_journaled(&path, "d1", JournalTarget::Off, &mut out, &mut err), 0);
+        let records = audit_lines(&dir);
+        assert_eq!(records.len(), 1);
+        let r = &records[0];
+        assert_eq!((r.writer.as_str(), r.event.as_str()), ("cli", "revoke"));
+        let field = |name: &str| r.fields.get(name).and_then(serde_json::Value::as_str);
+        assert_eq!(
+            (field("device"), field("device_name"), field("by")),
+            (Some("d1"), Some("Pixel"), Some("cli"))
+        );
+        // A revoke that takes nothing out records nothing.
+        let (mut out, mut err) = (Vec::new(), Vec::new());
+        assert_eq!(revoke_journaled(&path, "d1", JournalTarget::Off, &mut out, &mut err), 1);
+        assert_eq!(audit_lines(&dir).len(), 1);
+    }
+
+    #[test]
+    fn cli_revoke_writes_no_log_when_remote_was_never_on() {
+        let dir = Tidy::new("revoke-no-audit");
+        let path = store_with(&dir, vec![device("d1", "Pixel", Recipe::Direct)]);
+        let (mut out, mut err) = (Vec::new(), Vec::new());
+        assert_eq!(revoke_journaled(&path, "d1", JournalTarget::Off, &mut out, &mut err), 0);
+        assert!(
+            !eitri_core::remote_audit::audit_dir(path.parent().unwrap()).exists(),
+            "no audit directory is made"
+        );
+    }
+
+    #[test]
+    fn devices_shows_the_last_record() {
+        let dir = Tidy::new("devices-last");
+        let path = store_with(
+            &dir,
+            vec![
+                device("d1", "Pixel", Recipe::Direct),
+                device("d2", "Tablet", Recipe::Direct),
+            ],
+        );
+        let audit = eitri_core::remote_audit::audit_dir(path.parent().unwrap());
+        let mut log = eitri_core::remote_audit::AuditLog::open(
+            &audit,
+            eitri_core::remote_audit::WriterKind::Serve,
+            None,
+            JournalTarget::Off,
+        )
+        .unwrap();
+        let pixel = eitri_core::remote_audit::DeviceRef {
+            id: "d1".into(),
+            name: "Pixel".into(),
+        };
+        log.record(eitri_core::remote_audit::Event::GrantChanged {
+            device: pixel.clone(),
+            from: "watch".into(),
+            to: "watch+steer".into(),
+        })
+        .unwrap();
+        log.record(eitri_core::remote_audit::Event::ConnClose {
+            device: pixel,
+            why: "closed\u{1b}[2J".into(),
+            secs: 3,
+            bytes_in: 1,
+            bytes_out: 2,
+        })
+        .unwrap();
+        let newest = eitri_core::remote_audit::read(&audit, &Default::default(), Some(1)).unwrap();
+        let (mut out, mut err) = (Vec::new(), Vec::new());
+        assert_eq!(devices_at(&path, &mut out, &mut err), 0);
+        let out = texts(out);
+        let lines: Vec<&str> = out.lines().collect();
+        assert!(lines[0].trim_end().ends_with("LAST RECORD"), "{out}");
+        assert!(
+            lines[1].trim_end().ends_with(&format!("conn_close {}", newest[0].time)),
+            "the device's newest record: {out}"
+        );
+        assert!(
+            lines[2].split_whitespace().rev().take(2).eq(["-", "never"]),
+            "a device with no record: {out}"
+        );
+        assert!(!out.contains('\u{1b}'), "{out:?}");
     }
 }

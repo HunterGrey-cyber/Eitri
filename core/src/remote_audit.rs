@@ -46,7 +46,7 @@ mod read;
 mod rotate;
 mod verify;
 
-pub use read::{read, Filter, Record};
+pub use read::{newest_by_device, read, Filter, Record};
 pub use verify::{verify, JournalEntry, JournalSource, VerifyReport};
 
 /// The record format this build writes.
@@ -362,8 +362,10 @@ pub enum Event {
         command_id: String,
         text: Option<TextDigest>,
     },
-    /// `dropped`: how many refusals before any device was proved went unrecorded since the last recorded one (a
-    /// writer bounds those, since anyone who can reach a listener can be refused).
+    /// `dropped`: how many records the writer did not write since its last recorded one, carried on the next refusal
+    /// it writes. `serve` counts the refusals before any device was proved that it bounds (anyone who can reach a
+    /// listener can be refused); a window counts every record its full queue dropped, refusal or not, so a count there
+    /// can stand for commands and enrollments too, and waits for the window's next refusal.
     Refused {
         reason: Reason,
         device: Option<DeviceRef>,

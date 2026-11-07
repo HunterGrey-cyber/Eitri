@@ -163,6 +163,26 @@ pub(super) fn admission(
                 Admission::Ungated
             }
         }
+        // A revoke's `y` takes a device out of the store, so it meets the window's gate as the other questions' `y`
+        // does; a no is never sent (it decides nothing).
+        InboundMessage::RemoteRevoke { .. } => {
+            if view.is_base() {
+                Admission::Gated(view)
+            } else {
+                Admission::Refused(super::remote_enroll::REMOTE_QUESTIONS_ARE_THE_BASE_PAGES.into())
+            }
+        }
+        // The device list is the base page's. Opening it reads; `a` makes a code a phone can present, which adds
+        // nothing without the desk's own gated `y`; `x` only asks. None of them decides anything.
+        InboundMessage::RemoteDevicesOpen { .. }
+        | InboundMessage::RemoteStartEnroll { .. }
+        | InboundMessage::RemoteRevokeAsk { .. } => {
+            if view.is_base() {
+                Admission::Ungated
+            } else {
+                Admission::Refused(super::remote_enroll::REMOTE_IS_THE_BASE_PAGES.into())
+            }
+        }
         // None of these answers a card or a question, or loosens a permission.
         InboundMessage::Ready { .. }
         | InboundMessage::PathComplete { .. }

@@ -620,3 +620,46 @@ fn remote_answers_parse_as_window_level_and_need_every_field() {
         assert!(parse_inbound_message(bad).is_none(), "{bad}");
     }
 }
+
+/// The device list's page kinds are window-level and name every field: the recipe a code is made by is one of three
+/// words, and a revoke answers one question about one device.
+#[test]
+fn device_list_kinds_parse_as_window_level_and_need_every_field() {
+    let open = parse_inbound_message(r#"{"type":"remote_devices_open","request_id":"o1"}"#).unwrap();
+    assert_eq!(open.tab_ref(), TabRef::WindowLevel);
+    assert_eq!(open.request_id(), "o1");
+    for (word, mode) in [
+        ("auto", None),
+        ("ssh", Some(crate::remote_pairing::PairMode::Ssh)),
+        ("direct", Some(crate::remote_pairing::PairMode::Direct)),
+    ] {
+        let start = parse_inbound_message(&format!(
+            r#"{{"type":"remote_start_enroll","request_id":"s1","recipe":"{word}"}}"#
+        ))
+        .unwrap();
+        assert_eq!(start.tab_ref(), TabRef::WindowLevel);
+        match start {
+            InboundMessage::RemoteStartEnroll { recipe, .. } => assert_eq!(recipe.mode(), mode, "{word}"),
+            other => panic!("{other:?}"),
+        }
+    }
+    let ask = parse_inbound_message(r#"{"type":"remote_revoke_ask","request_id":"a1","device":"d1"}"#).unwrap();
+    assert_eq!(ask.tab_ref(), TabRef::WindowLevel);
+    let revoke =
+        parse_inbound_message(r#"{"type":"remote_revoke","request_id":"v1","device":"d1","nonce":7}"#).unwrap();
+    assert_eq!(revoke.tab_ref(), TabRef::WindowLevel);
+    assert_eq!(revoke.request_id(), "v1");
+    match revoke {
+        InboundMessage::RemoteRevoke { device, nonce, .. } => assert_eq!((device.as_str(), nonce), ("d1", 7)),
+        other => panic!("{other:?}"),
+    }
+    for bad in [
+        r#"{"type":"remote_start_enroll","request_id":"r"}"#,
+        r#"{"type":"remote_start_enroll","request_id":"r","recipe":"tor"}"#,
+        r#"{"type":"remote_revoke_ask","request_id":"r"}"#,
+        r#"{"type":"remote_revoke","request_id":"r","device":"d1"}"#,
+        r#"{"type":"remote_revoke","request_id":"r","nonce":7}"#,
+    ] {
+        assert!(parse_inbound_message(bad).is_none(), "{bad}");
+    }
+}

@@ -7,7 +7,12 @@ import { bypassYesCounts } from "./modeKey";
 import { isModifierKey } from "./typingGuard";
 import { revealHidden } from "./revealHidden";
 import { HiddenWarning, Revealed } from "./components/Revealed";
-import type { RemoteDesk } from "./remoteDesk";
+import type { Question, RemoteDesk } from "./remoteDesk";
+
+/** Whether Tab is the waiting question's: an enrollment that offers more than one grant, which Tab moves between. */
+export function tabChangesGrant(question: Question): boolean {
+  return question.kind === "remote_enroll" && question.grants.length > 1;
+}
 
 /** What the window says about a link that is not a tunnel before it listens there. */
 export const PLAIN_LINK_WARNING = "traffic on this network is plain text; anyone on it who gets a token can use it";
@@ -111,7 +116,7 @@ export function RemoteEnroll({
       } else if (event.key === "Escape" || (plain && (event.key === "n" || event.key === "N" || event.key === "Enter"))) {
         take();
         desk.answer(false);
-      } else if (plain && event.key === "Tab" && q.kind === "remote_enroll" && q.grants.length > 1) {
+      } else if (plain && event.key === "Tab" && tabChangesGrant(q)) {
         take();
         desk.nextGrant();
       }
@@ -158,6 +163,17 @@ export function RemoteEnroll({
             {grantWords(question.to)}{" "}
             (now it may {grantWords(question.from)})? (y/n)
           </div>
+          <HiddenWarning count={hiddenCount(question.name)} what="device name" />
+          {refusal !== null && <div className="remote-refusal">{refusal}</div>}
+        </div>
+      )}
+      {question?.kind === "remote_revoke_ask" && (
+        <div className="remote-question">
+          <div>
+            Revoke <Revealed pieces={revealHidden(question.name)} /> (<Revealed pieces={revealHidden(question.device)} />)?
+            (y/n)
+          </div>
+          <div className="remote-hint">It can no longer connect, and a connection it has open now is closed.</div>
           <HiddenWarning count={hiddenCount(question.name)} what="device name" />
           {refusal !== null && <div className="remote-refusal">{refusal}</div>}
         </div>

@@ -34,6 +34,23 @@
 //! report also goes to every chat page whole (`remote_connected`: who is connected, with name, grant and `Host`; one
 //! entry per device however many connections it holds), so the status band counts the phones that can watch; a report
 //! that names nobody clears the mark. The window keeps the last list, and a document that says `ready` is told it.
+//!
+//! The base page's device list (`remote_enroll::DeskRequest`, taken at each pump) is carried out on threads of its
+//! own: the list reads the store and each device's last [`DEVICE_RECORDS`] audit records (`remote_devices`; where a
+//! device's notifications go is shown by host only), `a` makes a code exactly as `start_enroll` does, and `x` reads
+//! the device's name from the store and asks the base page "Revoke <name>?". Only the desk's gated `y` to that takes
+//! the device out, through `remote_devices::update` off the tick; it is recorded as `revoke` with `by: desk`, the list
+//! is read again, and `serve`, which watches the store, closes the phone. What the page asked for that cannot be done
+//! is said in the base page, since no connection asked.
+//!
+//! What only the window sees goes to its audit log: a code made (`enroll_offered`), a presented code that is not the
+//! one on show or ran out (`refused` with `enroll_code_invalid`), a code that lapsed unused (`enroll_expired`: its time
+//! ran out, read at the socket's upkeep every few seconds and at the next presented code, or a newer code replaced
+//! it), the desk's `y` once the device is stored (`enroll_confirmed`), every other end of an enrollment
+//! (`enroll_refused`, why as a word), the listen question's `y` once recorded (`listen_changed`), the grant question's
+//! `y` once written (`grant_changed`), a phone's `revoke_self` once done (`revoke`, `by: device`) and a device found
+//! with no desk's yes (`device_flagged`). A name, `Host` or peer a phone gave is stored as given; a code or a token
+//! never is.
 
 use super::*;
 use crate::agent_panel::remote_enroll::{
@@ -43,6 +60,9 @@ use crate::agent_panel::remote_enroll::{
 use crate::agent_panel::remote_enroll::{
     ask_grant, grants_for, show_connected, show_flagged, ConnectedShown, GrantAsk, SSH_ONLY_WATCHES,
 };
+use crate::agent_panel::remote_enroll::{ask_revoke, show_devices, DeskRequest, DeviceRow, RevokeAsk};
+use crate::agent_panel::remote_enroll::{grant_word, ANOTHER_DEVICE_WAITS, THE_DESK_DID_NOT_ANSWER, THE_DESK_SAID_NO};
+use eitri_core::remote_audit::{DeviceRef, Event as AuditEvent, Listener, Reason};
 use eitri_core::remote_devices::{Confirmed, Device, DeviceStore, Recipe};
 use eitri_core::remote_pairing::{
     base64url, confirmed_listen_with_kind, interface_kind, interface_of, named_listen_addr, pairing_uri, random_fill,
@@ -50,7 +70,7 @@ use eitri_core::remote_pairing::{
 };
 use eitri_core::remote_rv::{Connected, RvOutbound, Secret, RV_PROTOCOL};
 use sha2::Digest;
-use std::collections::BTreeSet;
+use std::collections::{BTreeSet, HashMap};
 use std::net::IpAddr;
 use std::sync::Mutex;
 
@@ -86,6 +106,12 @@ pub(super) const UNKNOWN_RECIPE_ONLY_WATCHES: &str = "a device whose recipe is n
 /// What a grant change is told when the device's grant changed while the desk was asked.
 const GRANT_MOVED: &str = "the device's grant changed while the desk was asked";
 
+/// What the base page is told when the device store cannot be read for the list.
+const STORE_UNREAD: &str = "the device store could not be read";
+
+/// The newest audit records the device list shows for each device.
+pub(super) const DEVICE_RECORDS: usize = 20;
+
 /// The phone-sent errands (a self-revocation, a push endpoint) that may be at work on the store at once. Each waits
 /// for the store's lock on a thread of its own, so a phone that repeats them while the lock is held would otherwise
 /// leave a thread behind for every one.
@@ -108,6 +134,9 @@ const DEVICE_ID_BYTES: usize = 8;
 /// The link an address is on: its interface's name and kind, or `None` when no link holds it.
 type LinkOf = dyn Fn(IpAddr) -> Option<(String, IfaceKind)> + Send + Sync;
 
+/// What reads the device list for the store at a path ([`device_rows`], a test's stand-in).
+type ListReader = dyn Fn(&Path) -> DevicesInbound + Send + Sync;
+
 /// Where phones connect, by each recipe the window has, and where the desk's SSH host keys are read for the SSH one.
 #[derive(Debug, Clone)]
 pub struct Pairing {
@@ -120,6 +149,59 @@ pub struct Pairing {
 struct Issued {
     codes: EnrollCodes,
     endpoint: Option<Endpoint>,
+    /// When the code on show runs out, until it is presented or its lapse is recorded.
+    lapses: Option<Instant>,
+}
+
+/// Records `enroll_expired` once when the code on show ran out unused by `now`.
+fn note_lapsed(issued: &mut Issued, audit: &AuditSink, instance: &str, now: Instant) {
+    if issued.lapses.is_some_and(|at| now >= at) {
+        issued.lapses = None;
+        audit.record(AuditEvent::EnrollExpired {
+            instance: instance.to_owned(),
+        });
+    }
+}
+
+/// An enrolling phone as the log names it: by the name it claims, since it has no id yet.
+fn claimed(name: &str) -> DeviceRef {
+    DeviceRef {
+        id: String::new(),
+        name: name.to_owned(),
+    }
+}
+
+/// `enroll_refused` for the phone `ask` describes, `why` a word.
+fn enroll_refused(audit: &AuditSink, ask: &EnrollAsk, why: &str) {
+    audit.record(AuditEvent::EnrollRefused {
+        device: claimed(&ask.name),
+        recipe: ask.mode.as_str().to_owned(),
+        host: ask.host.clone(),
+        peer: ask.peer.clone(),
+        why: why.to_owned(),
+    });
+}
+
+/// The log's word for what a phone was told when its enrollment ended without a device.
+fn refusal_word(why: &str) -> &'static str {
+    match why {
+        THE_DESK_SAID_NO => "desk_said_no",
+        THE_DESK_DID_NOT_ANSWER => "desk_did_not_answer",
+        ANOTHER_DEVICE_WAITS => "another_device_waits",
+        NOT_STORED => "not_stored",
+        RECIPE_DIFFERS => "recipe_differs",
+        SSH_CODE_NOT_FORWARDED => "ssh_code_not_forwarded",
+        NO_ENDPOINT => "no_endpoint",
+        BAD_ENROLL => "bad_fields",
+        _ => "refused",
+    }
+}
+
+/// Whether the device list is being read, and whether it was asked for again meanwhile.
+#[derive(Default)]
+struct Listing {
+    running: bool,
+    again: bool,
 }
 
 /// What the errands share across the accepting, reading and writing threads.
@@ -131,6 +213,9 @@ pub(super) struct DevicesShared {
     issued: Mutex<Issued>,
     pairing: Mutex<Option<Pairing>>,
     link_of: Mutex<Arc<LinkOf>>,
+    list_reader: Mutex<Arc<ListReader>>,
+    /// The device list's read: at most one runs, and the requests made while it runs are answered by one more.
+    listing: Mutex<Listing>,
     /// The devices `serve`'s last report named, so the next tells which closed.
     connected: Mutex<BTreeSet<String>>,
     /// The phone-sent errands at work now, at most [`PHONE_ERRANDS_MAX`].
@@ -146,6 +231,7 @@ impl DevicesShared {
             issued: Mutex::new(Issued {
                 codes: EnrollCodes::default(),
                 endpoint: None,
+                lapses: None,
             }),
             pairing: Mutex::new(None),
             link_of: Mutex::new(Arc::new(|addr| {
@@ -153,6 +239,8 @@ impl DevicesShared {
                 let kind = interface_kind(&iface);
                 Some((iface, kind))
             })),
+            list_reader: Mutex::new(Arc::new(device_rows)),
+            listing: Mutex::new(Listing::default()),
             connected: Mutex::new(BTreeSet::new()),
             phone_errands: Arc::new(AtomicUsize::new(0)),
         }
@@ -166,8 +254,12 @@ pub(super) enum DevicesInbound {
     StartEnroll(PairingShown, Endpoint, bool),
     /// A phone presented this window's code in time: the desk is to be asked.
     Enroll(EnrollAsk),
-    /// The desk said yes and the device is stored: the token goes to the phone.
-    Enrolled { device: String, token: Secret },
+    /// The desk said yes and the device (`name`) is stored: the token goes to the phone.
+    Enrolled {
+        device: String,
+        name: String,
+        token: Secret,
+    },
     /// The enrollment ends here, and the phone is told why.
     EnrollRefused(&'static str),
     /// The desk is to be asked about listening on an address.
@@ -180,10 +272,14 @@ pub(super) enum DevicesInbound {
     AskGrant(GrantAsk),
     /// The errand is over: `serve` is told how it went.
     Done(Result<(), &'static str>),
-    /// The device whose token was checked takes itself out.
-    RevokeSelf { device: String },
+    /// The device whose token was checked (the store's `name` for it) takes itself out.
+    RevokeSelf { device: String, name: String },
     /// The device whose token was checked names its push endpoint, already checked.
     SetPushEndpoint { device: String, url: Secret },
+    /// The device list, read for the base page.
+    Listed(Vec<DeviceRow>),
+    /// The base page is to be asked whether to revoke a device.
+    AskRevoke(RevokeAsk),
     /// `serve`'s report was written: the devices with no desk's yes not shown before in this process (`(id, name)`),
     /// and who is connected now, for the base page to count and name.
     Reported {
@@ -197,7 +293,7 @@ impl DevicesInbound {
     pub(super) fn read(line: RvInbound, shared: &Shared) -> Option<DevicesInbound> {
         let devices = &shared.devices;
         Some(match line {
-            RvInbound::StartEnroll { recipe, .. } => start_enroll(devices, recipe, Instant::now()),
+            RvInbound::StartEnroll { recipe, .. } => start_enroll(devices, &shared.audit, recipe, Instant::now()),
             RvInbound::Enroll {
                 code,
                 device_name,
@@ -206,18 +302,32 @@ impl DevicesInbound {
                 recipe,
                 ..
             } => {
+                let audit = &shared.audit;
+                let refused_as = |mode: PairMode, why: &'static str| {
+                    audit.record(AuditEvent::EnrollRefused {
+                        device: claimed(&device_name),
+                        recipe: mode.as_str().to_owned(),
+                        host: host.clone(),
+                        peer: peer.clone(),
+                        why: refusal_word(why).to_owned(),
+                    });
+                    Some(DevicesInbound::EnrollRefused(why))
+                };
                 let fits = |text: &str| !text.is_empty() && text.len() <= REMOTE_FIELD_MAX_BYTES;
                 if !(fits(&device_name) && fits(&host) && fits(&peer)) {
-                    return Some(DevicesInbound::EnrollRefused(BAD_ENROLL));
+                    return refused_as(recipe, BAD_ENROLL);
                 }
+                let now = Instant::now();
                 let mut issued = devices.issued.lock().unwrap_or_else(|e| e.into_inner());
-                match issued.codes.take(code.expose(), Instant::now()) {
+                note_lapsed(&mut issued, audit, &devices.instance, now);
+                match issued.codes.take(code.expose(), now) {
                     Ok(_) => {
+                        issued.lapses = None;
                         let Some(endpoint) = issued.endpoint.take() else {
-                            return Some(DevicesInbound::EnrollRefused(NO_ENDPOINT));
+                            return refused_as(recipe, NO_ENDPOINT);
                         };
                         if let Err(why) = transport_matches(&endpoint, recipe, &peer) {
-                            return Some(DevicesInbound::EnrollRefused(why));
+                            return refused_as(endpoint.mode, why);
                         }
                         DevicesInbound::Enroll(EnrollAsk {
                             name: device_name,
@@ -227,13 +337,24 @@ impl DevicesInbound {
                             target: endpoint.describe(),
                         })
                     }
-                    Err(refused) => DevicesInbound::EnrollRefused(refused.why()),
+                    Err(refused) => {
+                        audit.record(AuditEvent::Refused {
+                            reason: Reason::EnrollCodeInvalid,
+                            device: Some(claimed(&device_name)),
+                            listener: None,
+                            peer: Some(peer.clone()),
+                            key: None,
+                            kind: None,
+                            dropped: None,
+                        });
+                        DevicesInbound::EnrollRefused(refused.why())
+                    }
                 }
             }
             RvInbound::ListenRequest { addr, .. } => read_listen(shared, addr),
             RvInbound::GrantRequest { device, grant, .. } => read_grant(&shared.store, device, grant),
             RvInbound::RevokeSelf { device, token, .. } => match verified(&shared.store, &device, &token) {
-                Ok(()) => DevicesInbound::RevokeSelf { device },
+                Ok(name) => DevicesInbound::RevokeSelf { device, name },
                 Err(why) => DevicesInbound::Done(Err(why)),
             },
             RvInbound::SetPushEndpoint { device, token, url, .. } => {
@@ -241,7 +362,7 @@ impl DevicesInbound {
                     return Some(DevicesInbound::Done(Err(why)));
                 }
                 match verified(&shared.store, &device, &token) {
-                    Ok(()) => DevicesInbound::SetPushEndpoint { device, url },
+                    Ok(_) => DevicesInbound::SetPushEndpoint { device, url },
                     Err(why) => DevicesInbound::Done(Err(why)),
                 }
             }
@@ -283,8 +404,8 @@ fn transport_matches(endpoint: &Endpoint, recipe: PairMode, peer: &str) -> Resul
 }
 
 /// Makes a code for the route `recipe` asks for (the window's default with `None`), keeps it for the readers and
-/// builds what the page shows.
-fn start_enroll(devices: &DevicesShared, recipe: Option<PairMode>, now: Instant) -> DevicesInbound {
+/// builds what the page shows. The code on show before it, unused, is recorded as lapsed.
+fn start_enroll(devices: &DevicesShared, audit: &AuditSink, recipe: Option<PairMode>, now: Instant) -> DevicesInbound {
     let Some(pairing) = devices.pairing.lock().unwrap_or_else(|e| e.into_inner()).clone() else {
         return DevicesInbound::Refused(NO_ENDPOINT);
     };
@@ -309,6 +430,13 @@ fn start_enroll(devices: &DevicesShared, recipe: Option<PairMode>, now: Instant)
         modules,
     };
     let mut issued = devices.issued.lock().unwrap_or_else(|e| e.into_inner());
+    // The code on show until now can no longer be presented: unused, it lapses here.
+    if issued.lapses.take().is_some() {
+        audit.record(AuditEvent::EnrollExpired {
+            instance: devices.instance.clone(),
+        });
+    }
+    issued.lapses = Some(code.expires);
     issued.codes.issue(code);
     issued.endpoint = Some(endpoint.clone());
     let other = match endpoint.mode {
@@ -316,6 +444,120 @@ fn start_enroll(devices: &DevicesShared, recipe: Option<PairMode>, now: Instant)
         PairMode::Direct => pairing.routes.ssh.is_some(),
     };
     DevicesInbound::StartEnroll(shown, endpoint, other)
+}
+
+/// The device list for the store at `store`: each device with its newest [`DEVICE_RECORDS`] records from the audit
+/// log beside it. Off the tick: it reads every retained file of the log.
+pub(super) fn device_rows(store: &Path) -> DevicesInbound {
+    let Some(read) = read_store(store) else {
+        return DevicesInbound::Refused(STORE_UNREAD);
+    };
+    let ids: Vec<&str> = read.devices().iter().map(|d| d.id.as_str()).collect();
+    let mut records = store
+        .parent()
+        .map(|state| last_records(&eitri_core::remote_audit::audit_dir(state), &ids))
+        .unwrap_or_default();
+    let rows = read
+        .devices()
+        .iter()
+        .map(|d| DeviceRow {
+            id: d.id.clone(),
+            name: d.name.clone(),
+            grant: d.grant,
+            recipe: match d.recipe {
+                Recipe::Ssh => "ssh",
+                Recipe::Direct => "direct",
+                Recipe::Unknown => "unknown",
+            },
+            enrolled_at: d.confirmed.map(|c| c.at),
+            last_seen: d.last_seen,
+            last_host: d.last_host.clone(),
+            push_host: d.push_endpoint.as_deref().and_then(push_host),
+            records: records.remove(&d.id).unwrap_or_default(),
+        })
+        .collect();
+    DevicesInbound::Listed(rows)
+}
+
+/// The newest records about each of `devices` in the log at `dir`, each as the page draws it, from one read of the
+/// log; none when the log cannot be read (said on stderr).
+fn last_records(dir: &Path, devices: &[&str]) -> HashMap<String, Vec<serde_json::Value>> {
+    match eitri_core::remote_audit::newest_by_device(dir, devices, DEVICE_RECORDS) {
+        Ok(found) => found
+            .into_iter()
+            .map(|(id, records)| (id, records.iter().map(record_shown).collect()))
+            .collect(),
+        Err(e) if e.kind() == io::ErrorKind::NotFound => HashMap::new(),
+        Err(e) => {
+            eprintln!("[agent_panel] remote: the audit log was not read for the device list: {e}");
+            HashMap::new()
+        }
+    }
+}
+
+/// A record as the device list draws it: its time, event and writer, and every field of its own as `[name, text]`
+/// (a string as it is, anything else as its JSON).
+fn record_shown(record: &eitri_core::remote_audit::Record) -> serde_json::Value {
+    let fields: Vec<[String; 2]> = record
+        .fields
+        .iter()
+        .map(|(name, value)| {
+            let text = match value {
+                serde_json::Value::String(s) => s.clone(),
+                other => other.to_string(),
+            };
+            [name.clone(), text]
+        })
+        .collect();
+    serde_json::json!({
+        "time": record.time,
+        "event": record.event,
+        "writer": record.writer,
+        "fields": fields,
+    })
+}
+
+/// The host (and port) of a push endpoint: its path and query can hold the topic that lets anyone post to the phone.
+fn push_host(url: &str) -> Option<String> {
+    let (_, rest) = url.split_once("://")?;
+    let host = rest.split(['/', '?', '#']).next()?;
+    (!host.is_empty()).then(|| host.to_owned())
+}
+
+/// The store's name for `device`, for the revoke question, or why the desk cannot be asked.
+fn read_revoke(store: &Path, device: String) -> DevicesInbound {
+    let Some(read) = read_store(store) else {
+        return DevicesInbound::Refused(STORE_UNREAD);
+    };
+    match read.get(&device) {
+        Some(found) => DevicesInbound::AskRevoke(RevokeAsk {
+            name: found.name.clone(),
+            device,
+        }),
+        None => DevicesInbound::Refused(NO_SUCH_DEVICE),
+    }
+}
+
+/// Takes `ask`'s device out of the store after the desk's yes, records it, and reads the list again. Off the tick.
+fn revoke_by_desk(shared: &Shared, ask: &RevokeAsk) -> DevicesInbound {
+    match eitri_core::remote_devices::update(&shared.store, |s| s.remove(&ask.device).is_some()) {
+        Ok(true) => {
+            shared.audit.record(AuditEvent::Revoke {
+                device: DeviceRef {
+                    id: ask.device.clone(),
+                    name: ask.name.clone(),
+                },
+                by: "desk".into(),
+            });
+            let read = Arc::clone(&*shared.devices.list_reader.lock().unwrap_or_else(|e| e.into_inner()));
+            read(&shared.store)
+        }
+        Ok(false) => DevicesInbound::Refused(NO_SUCH_DEVICE),
+        Err(e) => {
+            eprintln!("[agent_panel] remote: the revoke was not written: {e}");
+            DevicesInbound::Refused(NOT_CHANGED)
+        }
+    }
 }
 
 /// The store at `store`, or `None` (said why) when it cannot be read; a missing store holds no device.
@@ -330,10 +572,10 @@ fn read_store(store: &Path) -> Option<DeviceStore> {
     }
 }
 
-/// Whether `token` is the token of `device` in the store. Read on the reader's thread, so the token goes no further.
-fn verified(store: &Path, device: &str, token: &Secret) -> Result<(), &'static str> {
+/// The store's name for `device` when `token` is its token. Read on the reader's thread, so the token goes no further.
+fn verified(store: &Path, device: &str, token: &Secret) -> Result<String, &'static str> {
     let known = read_store(store).and_then(|store| store.verify(device, token.expose()));
-    known.map(|_| ()).ok_or(NOT_THIS_DEVICE)
+    known.map(|(name, _)| name).ok_or(NOT_THIS_DEVICE)
 }
 
 /// Reads a grant request: refused for an unknown device or a grant its recipe does not allow, answered yes when the
@@ -403,14 +645,69 @@ fn hand_to_tick(shared: &Shared, conn: u64, line: DevicesInbound) {
     }
 }
 
+fn lock<T>(m: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
+    m.lock().unwrap_or_else(|e| e.into_inner())
+}
+
 /// Runs `work` on a thread of its own, then hands what it made to the tick for `conn`.
 fn off_the_tick(shared: Arc<Shared>, conn: u64, work: impl FnOnce(&Shared) -> DevicesInbound + Send + 'static) {
+    started_off_the_tick(shared, conn, work);
+}
+
+/// [`off_the_tick`], saying whether a thread could be had (when not, it is said on stderr and `work` never runs).
+fn started_off_the_tick(
+    shared: Arc<Shared>,
+    conn: u64,
+    work: impl FnOnce(&Shared) -> DevicesInbound + Send + 'static,
+) -> bool {
     let spawned = std::thread::Builder::new().name("rv-devices".into()).spawn(move || {
         let line = work(&shared);
         hand_to_tick(&shared, conn, line);
     });
     if let Err(e) = spawned {
         eprintln!("[agent_panel] remote: no thread for a device errand: {e}");
+        return false;
+    }
+    true
+}
+
+/// Lets the list be read again when a read panics, which would otherwise leave it marked as running for good.
+struct ListingReset<'a>(&'a Mutex<Listing>);
+
+impl Drop for ListingReset<'_> {
+    fn drop(&mut self) {
+        if std::thread::panicking() {
+            *lock(self.0) = Listing::default();
+        }
+    }
+}
+
+/// Reads the device list for the desk off the tick. Each read takes the store and every retained file of the audit
+/// log, so one runs at a time: a request made while it runs (`r` held down) is answered by a single read after it,
+/// and only that newer list is drawn.
+fn list_off_the_tick(shared: Arc<Shared>) {
+    {
+        let mut listing = lock(&shared.devices.listing);
+        if listing.running {
+            listing.again = true;
+            return;
+        }
+        listing.running = true;
+    }
+    let mine = Arc::clone(&shared);
+    let started = started_off_the_tick(shared, DESK, |shared| loop {
+        let _reset = ListingReset(&shared.devices.listing);
+        let read = Arc::clone(&*lock(&shared.devices.list_reader));
+        let line = read(&shared.store);
+        let mut listing = lock(&shared.devices.listing);
+        if std::mem::take(&mut listing.again) {
+            continue;
+        }
+        listing.running = false;
+        return line;
+    });
+    if !started {
+        *lock(&mine.devices.listing) = Listing::default();
     }
 }
 
@@ -471,6 +768,7 @@ fn store_device(store: &Path, ask: &EnrollAsk, grant: Grant) -> DevicesInbound {
     match eitri_core::remote_devices::update(store, |s| s.insert(device)) {
         Ok(true) => DevicesInbound::Enrolled {
             device: id,
+            name: ask.name.clone(),
             token: Secret::new(token),
         },
         Ok(false) => DevicesInbound::EnrollRefused(NOT_STORED),
@@ -524,6 +822,7 @@ fn record_connected(shared: &Shared, connected: Vec<Connected>, now: u64) -> Dev
 /// Checks serve's liveness off the tick. The phone-list lock covers the probe and the empty report, so a new report
 /// cannot be erased by a check that began before it. No lock probe is requested while the list is empty.
 pub(super) fn check_serve(shared: &Shared) {
+    note_lapsed_now(shared, Instant::now());
     let _ordered = shared.devices.report_order.lock().unwrap_or_else(|e| e.into_inner());
     let mut previous = shared.devices.connected.lock().unwrap_or_else(|e| e.into_inner());
     let mut probe = shared.serve_probe.lock().unwrap_or_else(|e| e.into_inner());
@@ -538,6 +837,13 @@ pub(super) fn check_serve(shared: &Shared) {
         let line = record_connected_locked(shared, Vec::new(), unix_now(), &mut previous);
         hand_to_tick(shared, 0, line);
     }
+}
+
+/// Records the code on show as lapsed when it ran out unused by `now`.
+fn note_lapsed_now(shared: &Shared, now: Instant) {
+    let devices = &shared.devices;
+    let mut issued = devices.issued.lock().unwrap_or_else(|e| e.into_inner());
+    note_lapsed(&mut issued, &shared.audit, &devices.instance, now);
 }
 
 fn record_connected_locked(
@@ -644,29 +950,76 @@ impl RemoteSocket {
             .map(|p| p.routes.clone())
     }
 
+    /// Starts what the base page asked of the device list on a thread of its own; what it finds comes back as an
+    /// errand of the connection [`DESK`].
+    pub(super) fn desk_request(&self, request: DeskRequest) {
+        let shared = Arc::clone(&self.shared);
+        match request {
+            DeskRequest::List => list_off_the_tick(shared),
+            DeskRequest::StartEnroll(recipe) => off_the_tick(shared, DESK, move |shared| {
+                start_enroll(&shared.devices, &shared.audit, recipe, Instant::now())
+            }),
+            DeskRequest::RevokeAsk(device) => {
+                off_the_tick(shared, DESK, move |shared| read_revoke(&shared.store, device))
+            }
+        }
+    }
+
     /// Carries out an errand on the tick.
     pub(super) fn take_devices(&self, handle: &AgentPanelHandle, conn: u64, line: DevicesInbound) {
         match line {
+            DevicesInbound::Refused(why) | DevicesInbound::Done(Err(why)) if conn == DESK => {
+                let text = format!("Remote control: {why}");
+                handle.run(|_state, out| {
+                    out.send(ViewId::BASE, eitri_core::agent_bridge::serialize_notice_for_js(&text))
+                });
+            }
             DevicesInbound::Refused(why) => self.answer(conn, refused_line(None, why)),
             DevicesInbound::Done(outcome) => self.answer(conn, result_line(None, outcome)),
+            DevicesInbound::Listed(rows) => handle.run(|state, out| show_devices(state, &rows, out)),
+            DevicesInbound::AskRevoke(ask) => {
+                let shared = Arc::clone(&self.shared);
+                let asked = ask.clone();
+                let reply =
+                    Box::new(move |()| off_the_tick(shared, DESK, move |shared| revoke_by_desk(shared, &asked)));
+                handle.run(|state, out| ask_revoke(state, ask, Instant::now(), reply, out));
+            }
             DevicesInbound::AskGrant(ask) => {
                 let shared = Arc::clone(&self.shared);
                 let asked = ask.clone();
                 let reply = Box::new(move |answer: EnrollReply| match answer {
                     EnrollReply::No(why) => off_the_tick(shared, conn, move |_| DevicesInbound::Done(Err(why))),
-                    EnrollReply::Yes(to) => {
-                        off_the_tick(shared, conn, move |shared| change_grant(&shared.store, &asked, to))
-                    }
+                    EnrollReply::Yes(to) => off_the_tick(shared, conn, move |shared| {
+                        let changed = change_grant(&shared.store, &asked, to);
+                        if matches!(changed, DevicesInbound::Done(Ok(()))) {
+                            shared.audit.record(AuditEvent::GrantChanged {
+                                device: DeviceRef {
+                                    id: asked.device.clone(),
+                                    name: asked.name.clone(),
+                                },
+                                from: grant_word(asked.from).to_owned(),
+                                to: grant_word(to).to_owned(),
+                            });
+                        }
+                        changed
+                    }),
                 });
                 let outcome = handle.run(|state, out| ask_grant(state, ask, Instant::now(), reply, out));
                 if let Err(why) = outcome {
                     self.answer(conn, result_line(None, Err(why)));
                 }
             }
-            DevicesInbound::RevokeSelf { device } => self.phone_errand(conn, move |shared| {
-                change_device(&shared.store, &device, |s| {
+            DevicesInbound::RevokeSelf { device, name } => self.phone_errand(conn, move |shared| {
+                let done = change_device(&shared.store, &device, |s| {
                     s.remove(&device);
-                })
+                });
+                if matches!(done, DevicesInbound::Done(Ok(()))) {
+                    shared.audit.record(AuditEvent::Revoke {
+                        device: DeviceRef { id: device, name },
+                        by: "device".into(),
+                    });
+                }
+                done
             }),
             DevicesInbound::SetPushEndpoint { device, url } => self.phone_errand(conn, move |shared| {
                 change_device(&shared.store, &device, |s| {
@@ -678,11 +1031,21 @@ impl RemoteSocket {
             DevicesInbound::Reported { flagged, connected } => {
                 for (device, name) in flagged {
                     eprintln!("[agent_panel] remote: device {device:?} is in the device store with no desk's yes");
+                    self.shared.audit.record(AuditEvent::DeviceFlagged {
+                        device: DeviceRef {
+                            id: device.clone(),
+                            name: name.clone(),
+                        },
+                    });
                     handle.run(|_state, out| show_flagged(&device, &name, out));
                 }
                 handle.run(|state, out| show_connected(state, &connected, out));
             }
             DevicesInbound::StartEnroll(shown, endpoint, other) => {
+                self.shared.audit.record(AuditEvent::EnrollOffered {
+                    recipe: endpoint.mode.as_str().to_owned(),
+                    instance: self.shared.devices.instance.clone(),
+                });
                 handle.run(|_state, out| show_pairing(&shown, out));
                 let line = RvOutbound::EnrollShown {
                     v: RV_PROTOCOL,
@@ -695,19 +1058,50 @@ impl RemoteSocket {
             DevicesInbound::Enroll(ask) => {
                 let shared = Arc::clone(&self.shared);
                 let asked = ask.clone();
+                let refused = ask.clone();
                 let reply = Box::new(move |answer: EnrollReply| match answer {
-                    EnrollReply::No(why) => off_the_tick(shared, conn, move |_| DevicesInbound::EnrollRefused(why)),
-                    EnrollReply::Yes(grant) => {
-                        off_the_tick(shared, conn, move |shared| store_device(&shared.store, &asked, grant))
+                    EnrollReply::No(why) => {
+                        enroll_refused(&shared.audit, &asked, refusal_word(why));
+                        off_the_tick(shared, conn, move |_| DevicesInbound::EnrollRefused(why))
                     }
+                    EnrollReply::Yes(grant) => off_the_tick(shared, conn, move |shared| {
+                        let stored = store_device(&shared.store, &asked, grant);
+                        match &stored {
+                            DevicesInbound::Enrolled { device, .. } => {
+                                shared.audit.record(AuditEvent::EnrollConfirmed {
+                                    device: DeviceRef {
+                                        id: device.clone(),
+                                        name: asked.name.clone(),
+                                    },
+                                    recipe: asked.mode.as_str().to_owned(),
+                                    grant: grant_word(grant).to_owned(),
+                                    host: asked.host.clone(),
+                                    peer: asked.peer.clone(),
+                                })
+                            }
+                            _ => enroll_refused(&shared.audit, &asked, refusal_word(NOT_STORED)),
+                        }
+                        stored
+                    }),
                 });
                 let outcome = handle.run(|state, out| ask_enroll(state, ask, Instant::now(), reply, out));
                 if let Err(why) = outcome {
+                    enroll_refused(&self.shared.audit, &refused, refusal_word(why));
                     self.answer(conn, enroll_refused_line(why));
                 }
             }
-            DevicesInbound::Enrolled { device, token } => {
+            DevicesInbound::Enrolled { device, name, token } => {
                 if !self.conns.borrow().contains_key(&conn) {
+                    self.shared.audit.record(AuditEvent::EnrollRefused {
+                        device: DeviceRef {
+                            id: device.clone(),
+                            name,
+                        },
+                        recipe: String::new(),
+                        host: String::new(),
+                        peer: String::new(),
+                        why: "phone_left".into(),
+                    });
                     // The phone left before its token could reach it: nobody holds the token, so the device goes.
                     let store = self.shared.store.clone();
                     let spawned = std::thread::Builder::new().name("rv-devices".into()).spawn(move || {
@@ -742,6 +1136,16 @@ impl RemoteSocket {
                                     })
                                     .is_ok()
                             });
+                        if recorded {
+                            shared.audit.record(AuditEvent::ListenChanged {
+                                listener: Listener::Address {
+                                    addr: asked.addr.clone(),
+                                    iface: asked.iface.clone(),
+                                    kind: asked.kind.as_str().to_owned(),
+                                },
+                                confirmed: true,
+                            });
+                        }
                         DevicesInbound::ListenAnswer {
                             addr: asked.addr,
                             yes: recorded,
@@ -771,6 +1175,23 @@ impl RemoteSocket {
             drop(slot);
             line
         });
+    }
+
+    /// Records the code on show as lapsed when it would have run out unused by `now`, as the upkeep does.
+    #[cfg(test)]
+    pub(super) fn note_lapsed_at(&self, now: Instant) {
+        note_lapsed_now(&self.shared, now);
+    }
+
+    /// Reads the device list with `read` in place of [`device_rows`].
+    #[cfg(test)]
+    pub(super) fn set_list_reader(&self, read: impl Fn(&Path) -> DevicesInbound + Send + Sync + 'static) {
+        *self
+            .shared
+            .devices
+            .list_reader
+            .lock()
+            .unwrap_or_else(|e| e.into_inner()) = Arc::new(read);
     }
 
     /// Reads which link holds an address with `link_of` in place of this machine's own links.

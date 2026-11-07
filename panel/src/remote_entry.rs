@@ -14,6 +14,8 @@
 //! [`RemoteAccepted::Pending`] and its result follows from the tick ([`poll_remote`]), with the desk's notice.
 
 use super::*;
+use crate::remote_audit_sink::AuditSink;
+use eitri_core::remote_audit::{text_digest, DeviceRef, Event as AuditEvent, Reason, TextDigest};
 use eitri_core::remote_rv::COMMAND_ID_MAX_BYTES;
 use eitri_core::tab_set::RemoteAsker;
 use serde::Deserialize;
@@ -75,6 +77,18 @@ impl RemoteInbound {
             | RemoteInbound::StopBackground { command_id }
             | RemoteInbound::StopTask { command_id, .. }
             | RemoteInbound::TakeBack { command_id } => command_id,
+        }
+    }
+
+    /// The kind's word, as the message names it.
+    pub(super) fn kind(&self) -> &'static str {
+        match self {
+            RemoteInbound::Interrupt { .. } => "interrupt",
+            RemoteInbound::Send { .. } => "send",
+            RemoteInbound::Queue { .. } => "queue",
+            RemoteInbound::StopBackground { .. } => "stop_background",
+            RemoteInbound::StopTask { .. } => "stop_task",
+            RemoteInbound::TakeBack { .. } => "take_back",
         }
     }
 
@@ -550,6 +564,9 @@ pub(super) const REMOTE_NOTICES_MAX: usize = 64;
 /// owed to tabs no ready page shows.
 #[derive(Default)]
 pub(super) struct RemoteCalls {
+    /// The window's audit log, once its `rv-` socket has pumped: what every command taken and every refusal is
+    /// recorded in.
+    pub(super) audit: Option<AuditSink>,
     calls: Vec<Waiting>,
     refusals: HashMap<(u64, String), (std::time::Instant, u64)>,
     results: std::collections::VecDeque<RemoteResult>,
@@ -711,6 +728,21 @@ fn poll_remote_answers(state: &mut AgentPanelState, screen: &Screen, out: &mut O
             }
         }
         log_refusal(&origin.device, &origin.device_id, origin.conn, &result);
+        if let Err(why) = &result {
+            let kind = match call {
+                Call::Stop => "interrupt",
+                Call::StopTask => "stop_task",
+            };
+            audit_refused(
+                state,
+                tab,
+                &origin.device_id,
+                &origin.device,
+                kind,
+                why,
+                RefusedAt::Send,
+            );
+        }
         state.remote.result(Some(origin.conn), command_id, result);
     }
     for sent in state.tabs.poll_remote_sends() {
@@ -747,6 +779,17 @@ fn poll_remote_answers(state: &mut AgentPanelState, screen: &Screen, out: &mut O
         }
         let conn = asker.conn.unwrap_or_default();
         log_refusal(&asker.device, &asker.device_id, conn, &result);
+        if let Err(why) = &result {
+            audit_refused(
+                state,
+                tab,
+                &asker.device_id,
+                &asker.device,
+                "send",
+                why,
+                RefusedAt::Send,
+            );
+        }
         state.remote.result(asker.conn, asker.command_id, result);
     }
     for refused in state.tabs.take_remote_refused() {
@@ -771,6 +814,15 @@ fn poll_remote_answers(state: &mut AgentPanelState, screen: &Screen, out: &mut O
             std::time::Instant::now(),
         );
         send_queue(state, tab, out);
+        audit_refused(
+            state,
+            tab,
+            &asker.device_id,
+            &asker.device,
+            "queue",
+            &RemoteRefusal::ModeNotAllowed,
+            RefusedAt::Flush,
+        );
         state
             .remote
             .result(asker.conn, asker.command_id, Err(RemoteRefusal::ModeNotAllowed));
@@ -853,6 +905,151 @@ fn mode_name(mode: SessionModeChoice) -> &'static str {
         SessionModeChoice::Auto => "Auto",
         SessionModeChoice::Bypass => "Bypass",
     }
+}
+
+/// Where a refusal was decided: at the message's own handling (or its provider's answer), or at a flush that took a
+/// held phone message out unsent.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum RefusedAt {
+    Send,
+    Flush,
+}
+
+/// The audit log's word for a refusal. Every variant is named, so a new refusal cannot reach the log without one; an
+/// agent's or the host's own words (`Agent`, `Busy`) are never recorded, since an agent's can quote the conversation.
+pub(super) fn audit_reason(why: &RemoteRefusal, at: RefusedAt) -> Reason {
+    match why {
+        RemoteRefusal::Parse | RemoteRefusal::NotYet => Reason::NotAllowed,
+        RemoteRefusal::NoSuchTab | RemoteRefusal::NotLive => Reason::TabNotLive,
+        RemoteRefusal::NotClaude => Reason::NotClaude,
+        RemoteRefusal::NotStarted => Reason::NotStarted,
+        RemoteRefusal::WorkChanged => Reason::WorkChanged,
+        RemoteRefusal::Duplicate => Reason::DuplicateCommand,
+        RemoteRefusal::ModeNotAllowed => match at {
+            RefusedAt::Send => Reason::Bypass,
+            RefusedAt::Flush => Reason::ModeWidened,
+        },
+        RemoteRefusal::SlashOrBang => Reason::SlashOrBang,
+        RemoteRefusal::TooLong => Reason::TooLong,
+        RemoteRefusal::NotYours => Reason::NotYours,
+        RemoteRefusal::Busy(_) => Reason::Busy,
+        RemoteRefusal::Agent(_) => Reason::Agent,
+    }
+}
+
+/// The kind word of a message a phone may send, when `word` is one; a word from the wire is recorded only as one of
+/// these.
+pub(super) fn known_kind(word: &str) -> Option<&'static str> {
+    [
+        "interrupt",
+        "send",
+        "queue",
+        "stop_background",
+        "stop_task",
+        "take_back",
+    ]
+    .into_iter()
+    .find(|kind| *kind == word)
+}
+
+/// What a remote message was, read once it parsed, for its record: its kind, its command id, its text's length and
+/// hash, and the tab's number and revision when the message was taken.
+pub(super) struct Taken {
+    pub(super) kind: &'static str,
+    pub(super) command_id: String,
+    pub(super) text: Option<TextDigest>,
+    pub(super) at: Option<(u16, u64)>,
+}
+
+impl Taken {
+    pub(super) fn of(message: &RemoteInbound) -> Taken {
+        Taken {
+            kind: message.kind(),
+            command_id: message.command_id().to_owned(),
+            text: message.text().map(text_digest),
+            at: None,
+        }
+    }
+
+    /// Notes the number and revision of the tab `key` names now, if one does.
+    pub(super) fn read_tab(&mut self, state: &AgentPanelState, key: &eitri_core::tab_set::RowKey) {
+        self.at = state
+            .tabs
+            .tab_by_key(key)
+            .and_then(|tab| state.tabs.get(tab))
+            .map(|held| {
+                let revision = held.live().map_or(0, |backend| backend.projection().last_revision);
+                (held.number, revision)
+            });
+    }
+}
+
+fn device_ref(device_id: &str, device: &str) -> DeviceRef {
+    DeviceRef {
+        id: device_id.to_owned(),
+        name: device.to_owned(),
+    }
+}
+
+/// Records what became of a remote message at its own handling ([`AgentPanelHandle::remote_message`]): a `cmd` for a
+/// message taken (its text only as length and hash), else a `refused` with the kind when it parsed. Every message
+/// passes here, whatever refused it.
+pub(super) fn record_remote_message(
+    state: &AgentPanelState,
+    origin: &RemoteOrigin,
+    key: &eitri_core::tab_set::RowKey,
+    taken: Option<Taken>,
+    outcome: &Result<RemoteAccepted, RemoteRefusal>,
+) {
+    let Some(audit) = &state.remote.audit else { return };
+    match (outcome, taken) {
+        (Ok(_), Some(taken)) => {
+            let (tab, revision) = taken.at.unwrap_or((0, 0));
+            audit.record(AuditEvent::Cmd {
+                device: device_ref(&origin.device_id, &origin.device),
+                kind: taken.kind.to_owned(),
+                instance: audit.instance().to_owned(),
+                key: key.as_str().to_owned(),
+                tab,
+                revision,
+                command_id: taken.command_id,
+                text: taken.text,
+            })
+        }
+        (Ok(_), None) => {}
+        (Err(why), taken) => audit.record(AuditEvent::Refused {
+            reason: audit_reason(why, RefusedAt::Send),
+            device: Some(device_ref(&origin.device_id, &origin.device)),
+            listener: None,
+            peer: None,
+            key: Some(key.as_str().to_owned()),
+            kind: taken.map(|t| t.kind.to_owned()),
+            dropped: None,
+        }),
+    }
+}
+
+/// Records a refusal decided after the message was taken (a provider's answer, a send the tab set let go of, a held
+/// message taken out at a flush), about `tab` when the window still holds it.
+fn audit_refused(
+    state: &AgentPanelState,
+    tab: TabId,
+    device_id: &str,
+    device: &str,
+    kind: &'static str,
+    why: &RemoteRefusal,
+    at: RefusedAt,
+) {
+    let Some(audit) = &state.remote.audit else { return };
+    audit.record(AuditEvent::Refused {
+        reason: audit_reason(why, at),
+        device: Some(device_ref(device_id, device)),
+        listener: None,
+        peer: None,
+        key: state.tabs.get(tab).map(|held| held.row_key().as_str().to_owned()),
+        kind: Some(kind.to_owned()),
+        dropped: None,
+    });
 }
 
 fn log_refusal(device: &str, device_id: &str, conn: u64, result: &Result<(), RemoteRefusal>) {
@@ -2782,5 +2979,246 @@ mod tests {
             }
         }
         assert!(taken > 1000, "the inputs reach the parser's accepting paths: {taken}");
+    }
+
+    // The window's audit records of remote messages.
+
+    const AUDIT_INSTANCE: &str = "c0ffee00d15ea5e1";
+
+    /// Gives the panel a sink writing in a fresh state directory; the sink and its audit directory.
+    fn audited(handle: &AgentPanelHandle, label: &str) -> (crate::remote_audit_sink::AuditSink, PathBuf) {
+        let state_dir = agent::state_dirs::test_workspace_dir(label);
+        let sink = crate::remote_audit_sink::AuditSink::open(&state_dir, AUDIT_INSTANCE, std::sync::Arc::new(|| {}));
+        handle.state.borrow_mut().remote.audit = Some(sink.clone());
+        (sink, eitri_core::remote_audit::audit_dir(&state_dir))
+    }
+
+    /// Every record so far, oldest first.
+    fn audit_records(sink: &crate::remote_audit_sink::AuditSink, dir: &Path) -> Vec<eitri_core::remote_audit::Record> {
+        sink.flush();
+        let mut records = eitri_core::remote_audit::read(dir, &Default::default(), None).unwrap_or_default();
+        records.reverse();
+        records
+    }
+
+    fn field<'a>(record: &'a eitri_core::remote_audit::Record, name: &str) -> Option<&'a str> {
+        record.fields.get(name).and_then(serde_json::Value::as_str)
+    }
+
+    /// The refusals' reasons and kinds, oldest first.
+    fn refusals(records: &[eitri_core::remote_audit::Record]) -> Vec<(String, Option<String>)> {
+        records
+            .iter()
+            .filter(|r| r.event == "refused")
+            .map(|r| {
+                (
+                    field(r, "reason").unwrap().to_owned(),
+                    field(r, "kind").map(str::to_owned),
+                )
+            })
+            .collect()
+    }
+
+    #[test]
+    fn every_refusal_maps_to_a_reason() {
+        use eitri_core::remote_audit::Reason as R;
+        let at_send = |why: RemoteRefusal| audit_reason(&why, RefusedAt::Send);
+        assert_eq!(at_send(RemoteRefusal::Parse), R::NotAllowed);
+        assert_eq!(at_send(RemoteRefusal::NotYet), R::NotAllowed);
+        assert_eq!(at_send(RemoteRefusal::NoSuchTab), R::TabNotLive);
+        assert_eq!(at_send(RemoteRefusal::NotLive), R::TabNotLive);
+        assert_eq!(at_send(RemoteRefusal::NotClaude), R::NotClaude);
+        assert_eq!(at_send(RemoteRefusal::NotStarted), R::NotStarted);
+        assert_eq!(at_send(RemoteRefusal::WorkChanged), R::WorkChanged);
+        assert_eq!(at_send(RemoteRefusal::Duplicate), R::DuplicateCommand);
+        assert_eq!(at_send(RemoteRefusal::ModeNotAllowed), R::Bypass);
+        assert_eq!(
+            audit_reason(&RemoteRefusal::ModeNotAllowed, RefusedAt::Flush),
+            R::ModeWidened
+        );
+        assert_eq!(at_send(RemoteRefusal::SlashOrBang), R::SlashOrBang);
+        assert_eq!(at_send(RemoteRefusal::TooLong), R::TooLong);
+        assert_eq!(at_send(RemoteRefusal::NotYours), R::NotYours);
+        assert_eq!(at_send(RemoteRefusal::Busy("a card waits".into())), R::Busy);
+        assert_eq!(at_send(RemoteRefusal::Agent("the agent's words".into())), R::Agent);
+    }
+
+    #[test]
+    fn sync_refusal_is_recorded() {
+        agent::state_dirs::redirect_state_to_a_test_root();
+        let dir = agent::state_dirs::test_workspace_dir("audit-sync-refusal");
+        let (handle, base, _second) = handle_with_two_pages();
+        let (sink, audit) = audited(&handle, "audit-sync-refusal-state");
+        let (tab, _provider, key) = interruptible_tab(&handle, &dir);
+        handle.tick();
+        set_mode(&handle, &base, tab, SessionModeChoice::Manual);
+        assert_eq!(
+            handle.remote_message(&phone(), &key, &send("a1", "/compact")),
+            Err(RemoteRefusal::SlashOrBang)
+        );
+        assert_eq!(
+            handle.remote_message(&phone(), &key, "not a message"),
+            Err(RemoteRefusal::Parse)
+        );
+        assert_eq!(
+            handle.remote_message(&phone(), &key, &send("a1", "again")),
+            Err(RemoteRefusal::Duplicate)
+        );
+        let elsewhere = RowKey::parse("k-0000000000000000").unwrap();
+        assert_eq!(
+            handle.remote_message(&phone(), &elsewhere, &send("a2", "hello")),
+            Err(RemoteRefusal::NoSuchTab)
+        );
+        let records = audit_records(&sink, &audit);
+        assert_eq!(
+            refusals(&records),
+            [
+                ("slash_or_bang".to_owned(), Some("send".to_owned())),
+                ("not_allowed".to_owned(), None),
+                ("duplicate_command".to_owned(), Some("send".to_owned())),
+                ("tab_not_live".to_owned(), Some("send".to_owned())),
+            ]
+        );
+        let first = &records[0];
+        assert_eq!(first.writer, AUDIT_INSTANCE);
+        assert_eq!(
+            (field(first, "device"), field(first, "device_name"), field(first, "key")),
+            (Some("d1"), Some("Pixel 8"), Some(key.as_str()))
+        );
+        assert!(records.iter().all(|r| r.event != "cmd"), "nothing was taken");
+        shut_down_every_tab(&handle);
+    }
+
+    #[test]
+    fn provider_refusal_is_recorded() {
+        agent::state_dirs::redirect_state_to_a_test_root();
+        let dir = agent::state_dirs::test_workspace_dir("audit-provider-refusal");
+        let (handle, _base, _second) = handle_with_two_pages();
+        let (sink, audit) = audited(&handle, "audit-provider-refusal-state");
+        // A provider that cannot interrupt answers the stop with its own words.
+        let (tab, provider, key) = tab_of(&handle, &dir, RecordingProvider::default());
+        start_turn(&handle, tab, &provider, "t1");
+        let refused = settle(&handle, &phone(), &key, &interrupt("c1", turn(&handle, tab, "t1")));
+        let Err(RemoteRefusal::Agent(words)) = refused else {
+            panic!("the agent refused: {refused:?}")
+        };
+        let records = audit_records(&sink, &audit);
+        let events: Vec<&str> = records.iter().map(|r| r.event.as_str()).collect();
+        assert_eq!(events, ["cmd", "refused"], "taken, then refused by the agent");
+        assert_eq!(refusals(&records), [("agent".to_owned(), Some("interrupt".to_owned()))]);
+        let line = &records[1].line;
+        assert!(!line.contains(&words), "the agent's words are not recorded: {line}");
+        let mut fields: Vec<&str> = records[1].fields.keys().map(String::as_str).collect();
+        fields.sort_unstable();
+        assert_eq!(fields, ["device", "device_name", "key", "kind", "reason"]);
+        shut_down_every_tab(&handle);
+    }
+
+    #[test]
+    fn mode_widened_flush_is_recorded() {
+        agent::state_dirs::redirect_state_to_a_test_root();
+        let dir = agent::state_dirs::test_workspace_dir("audit-mode-widened");
+        let (handle, base, _second) = handle_with_two_pages();
+        let (sink, audit) = audited(&handle, "audit-mode-widened-state");
+        let (tab, provider, key) = interruptible_tab(&handle, &dir);
+        handle.tick();
+        set_mode(&handle, &base, tab, SessionModeChoice::Manual);
+        start_turn(&handle, tab, &provider, "t1");
+        assert_eq!(
+            handle.remote_message(&phone(), &key, &queue("q1", "do it")),
+            Ok(RemoteAccepted::Done)
+        );
+        set_mode(&handle, &base, tab, SessionModeChoice::Auto);
+        end_turn(&handle, tab, &provider, "t1");
+        assert_eq!(result_of(&handle, "q1").outcome, Err(RemoteRefusal::ModeNotAllowed));
+        let records = audit_records(&sink, &audit);
+        assert_eq!(records[0].event, "cmd");
+        assert_eq!(field(&records[0], "kind"), Some("queue"));
+        assert_eq!(
+            refusals(&records),
+            [("mode_widened".to_owned(), Some("queue".to_owned()))]
+        );
+        assert_eq!(field(records.last().unwrap(), "key"), Some(key.as_str()));
+        shut_down_every_tab(&handle);
+    }
+
+    #[test]
+    fn accepted_send_records_cmd_with_length_and_hash() {
+        const SENTINEL: &str = "sentinel-prompt-9f3c1e7a never in the log";
+        agent::state_dirs::redirect_state_to_a_test_root();
+        let dir = agent::state_dirs::test_workspace_dir("audit-accepted-send");
+        let (handle, base, _second) = handle_with_two_pages();
+        let (sink, audit) = audited(&handle, "audit-accepted-send-state");
+        let (tab, _provider, key) = interruptible_tab(&handle, &dir);
+        handle.tick();
+        set_mode(&handle, &base, tab, SessionModeChoice::Manual);
+        assert_eq!(settle(&handle, &phone(), &key, &send("s1", SENTINEL)), Ok(()));
+        let records = audit_records(&sink, &audit);
+        let cmd: Vec<_> = records.iter().filter(|r| r.event == "cmd").collect();
+        assert_eq!(cmd.len(), 1, "one command taken");
+        let digest = eitri_core::remote_audit::text_digest(SENTINEL);
+        assert_eq!(
+            cmd[0].fields.get("text_len").and_then(serde_json::Value::as_u64),
+            Some(SENTINEL.len() as u64)
+        );
+        assert_eq!(field(cmd[0], "text_sha256"), Some(digest.sha256.as_str()));
+        assert_eq!(
+            (field(cmd[0], "kind"), field(cmd[0], "command_id")),
+            (Some("send"), Some("s1"))
+        );
+        let bytes = std::fs::read(audit.join("audit.jsonl")).unwrap();
+        let text = String::from_utf8_lossy(&bytes);
+        assert!(!text.contains(SENTINEL), "the text never reaches the file");
+        shut_down_every_tab(&handle);
+    }
+
+    #[test]
+    fn cmd_names_tab_key_number_and_revision() {
+        agent::state_dirs::redirect_state_to_a_test_root();
+        let dir = agent::state_dirs::test_workspace_dir("audit-cmd-fields");
+        let (handle, _base, _second) = handle_with_two_pages();
+        let (sink, audit) = audited(&handle, "audit-cmd-fields-state");
+        // Another tab first, so the number is not the first one.
+        let _first = interruptible_tab(&handle, &dir);
+        let (tab, provider, key) = interruptible_tab(&handle, &dir);
+        start_turn(&handle, tab, &provider, "t1");
+        let (number, revision) = {
+            let state = handle.state.borrow();
+            let held = state.tabs.get(tab).unwrap();
+            let read = (held.number, held.live().unwrap().projection().last_revision);
+            read
+        };
+        assert_eq!(
+            handle.remote_message(&phone(), &key, &interrupt("i1", turn(&handle, tab, "t1"))),
+            Ok(RemoteAccepted::Pending)
+        );
+        let records = audit_records(&sink, &audit);
+        let cmd = records.iter().find(|r| r.event == "cmd").expect("the stop is recorded");
+        assert_eq!(
+            (
+                field(cmd, "kind"),
+                field(cmd, "key"),
+                field(cmd, "instance"),
+                field(cmd, "command_id"),
+                field(cmd, "device"),
+            ),
+            (
+                Some("interrupt"),
+                Some(key.as_str()),
+                Some(AUDIT_INSTANCE),
+                Some("i1"),
+                Some("d1")
+            )
+        );
+        assert_eq!(
+            (
+                cmd.fields.get("tab").and_then(serde_json::Value::as_u64),
+                cmd.fields.get("revision").and_then(serde_json::Value::as_u64)
+            ),
+            (Some(u64::from(number)), Some(revision))
+        );
+        assert!(!cmd.fields.contains_key("text_len"), "a stop carries no text");
+        let _ = result_of(&handle, "i1");
+        shut_down_every_tab(&handle);
     }
 }

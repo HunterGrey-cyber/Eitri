@@ -204,6 +204,55 @@ fn panel_table_keeps_every_pinned_binding() {
     );
 }
 
+/// The default panel rows added since the v1 fixture was taken, each with why it is there. A new default key is a
+/// decision: it is named here when it is made, so a row in neither the fixture nor this list fails.
+const PANEL_ROWS_ADDED_AFTER_V1: &[(&str, &str, &str)] = &[
+    (
+        "<leader> M",
+        "model.pick",
+        "eitri-only: capital M, since lowercase m stays the mode key",
+    ),
+    (
+        "<leader> E",
+        "effort.pick",
+        "eitri-only: capital E, since lowercase e stays the following key",
+    ),
+    (
+        "<leader> k",
+        "tab.stop-background",
+        "eitri-only: k as in tmux's kill-* verbs; it asks y/n first",
+    ),
+    (
+        "<leader> r d",
+        "remote.devices",
+        "eitri-only: the remote-control device list, r as in remote and d as in devices; LazyVim binds no <leader>r \
+         group, and the page offers it only while remote control is on",
+    ),
+];
+
+#[test]
+fn panel_rows_added_after_v1_are_named_with_their_reason() {
+    let fixture: Vec<PanelFixtureRow> = read_fixture(&panel_fixture_path());
+    let pinned: Vec<String> = fixture.iter().map(|r| r.keys.join(" ")).collect();
+    let unnamed: Vec<String> = current_panel_rows()
+        .into_iter()
+        .map(|r| (r.keys.join(" "), r.action))
+        .filter(|(keys, action)| {
+            !pinned.contains(keys)
+                && !PANEL_ROWS_ADDED_AFTER_V1
+                    .iter()
+                    .any(|(k, a, why)| k == keys && a == action && !why.is_empty())
+        })
+        .map(|(keys, action)| format!("{keys} -> {action}"))
+        .collect();
+    assert!(
+        unnamed.is_empty(),
+        "default panel rows that are neither pinned by {} nor named in PANEL_ROWS_ADDED_AFTER_V1 with a reason: \
+         {unnamed:?}",
+        panel_fixture_path().display(),
+    );
+}
+
 /// `--ignored`, by design: this writes today's tables over the checked-in fixtures. Run it only after
 /// a deliberate, approved change to the default bindings, then review the diff by hand before committing --
 /// this test has no way to tell an intended change from a regression it should have caught.

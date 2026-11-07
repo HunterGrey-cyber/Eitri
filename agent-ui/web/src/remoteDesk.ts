@@ -1,11 +1,12 @@
 import { nextRequestId, postRemoteAnswer } from "./bridge";
-import type { RemoteConnectedDevice, RemoteDeskEnvelope, RemoteGrant } from "./bridge";
+import type { RemoteConnectedDevice, RemoteDeskEnvelope, RemoteDeviceRow, RemoteGrant, RemoteRecipeChoice } from "./bridge";
 
 export type Pairing = Extract<RemoteDeskEnvelope, { kind: "remote_pairing" }>;
 export type Question =
   | (Extract<RemoteDeskEnvelope, { kind: "remote_enroll" }> & { chosen: RemoteGrant })
   | Extract<RemoteDeskEnvelope, { kind: "remote_listen" }>
-  | Extract<RemoteDeskEnvelope, { kind: "remote_grant" }>;
+  | Extract<RemoteDeskEnvelope, { kind: "remote_grant" }>
+  | Extract<RemoteDeskEnvelope, { kind: "remote_revoke_ask" }>;
 export type Flagged = Extract<RemoteDeskEnvelope, { kind: "remote_device_flagged" }>;
 
 /** What the window's remote-control questions look like now. */
@@ -23,9 +24,29 @@ export type DeskView = {
   sandbox: string | null;
   /** Bumped each time the shown question must be on screen afresh before a `y` counts. */
   asking: number;
+  /** Remote control is on in this window: the device list may open. */
+  on: boolean;
+  /** The device list is open. */
+  listOpen: boolean;
+  /** The devices as the window last read them for the list; `null` until it answers. */
+  devices: RemoteDeviceRow[] | null;
+  /** What the window said when it could not do what the list asked. */
+  listNote: string | null;
 };
 
-const EMPTY: DeskView = { pairing: null, questions: [], refusal: null, flagged: [], connected: [], sandbox: null, asking: 0 };
+const EMPTY: DeskView = {
+  pairing: null,
+  questions: [],
+  refusal: null,
+  flagged: [],
+  connected: [],
+  sandbox: null,
+  asking: 0,
+  on: false,
+  listOpen: false,
+  devices: null,
+  listNote: null,
+};
 
 /** The window's remote-control questions, kept apart from the component that draws them: the panel draws that
  *  component in whichever layout is up, and a question must outlive a switch between them, since the window asks it
@@ -37,6 +58,8 @@ export class RemoteDesk {
   private pending: { requestId: string; nonce: number } | null = null;
   private pairingTimer: ReturnType<typeof setTimeout> | null = null;
   private questionTimers = new Map<number, ReturnType<typeof setTimeout>>();
+  /** The device list's requests the window has not answered yet. */
+  private listRequests = new Set<string>();
 
   subscribe = (listener: () => void): (() => void) => {
     this.listeners.add(listener);
@@ -109,7 +132,15 @@ export class RemoteDesk {
         return;
       case "remote_grant":
       case "remote_listen":
+      case "remote_revoke_ask":
         this.ask(payload, payload.expiresInMs);
+        return;
+      case "remote_on":
+        if (!this.view.on) this.set({ on: true });
+        return;
+      case "remote_devices":
+        // Only an open list is drawn; one that arrives after Escape is not reopened by it.
+        if (this.view.listOpen) this.set({ devices: payload.devices });
         return;
       case "remote_question_closed":
         this.close(payload.nonce);
@@ -123,6 +154,10 @@ export class RemoteDesk {
         this.set({ connected: payload.devices, sandbox: payload.sandbox ?? null });
         return;
       case "command_result": {
+        if (this.listRequests.delete(payload.requestId)) {
+          if (!payload.ok && this.view.listOpen) this.set({ listNote: payload.error });
+          return;
+        }
         if (this.pending === null || payload.requestId !== this.pending.requestId) return;
         const { nonce } = this.pending;
         this.pending = null;
@@ -146,6 +181,13 @@ export class RemoteDesk {
       postRemoteAnswer({ type: "remote_enroll_answer", request_id, nonce: q.nonce, yes, grant: q.chosen });
     } else if (q.kind === "remote_grant") {
       postRemoteAnswer({ type: "remote_enroll_answer", request_id, nonce: q.nonce, yes, grant: q.to });
+    } else if (q.kind === "remote_revoke_ask") {
+      // A no decides nothing, so it is not sent: the question just goes.
+      if (!yes) {
+        this.close(q.nonce);
+        return;
+      }
+      postRemoteAnswer({ type: "remote_revoke", request_id, device: q.device, nonce: q.nonce });
     } else {
       postRemoteAnswer({ type: "remote_listen_answer", request_id, nonce: q.nonce, yes });
     }
@@ -162,6 +204,46 @@ export class RemoteDesk {
     if (q?.kind !== "remote_enroll" || q.grants.length < 2) return;
     const chosen = q.grants[(q.grants.indexOf(q.chosen) + 1) % q.grants.length];
     this.set({ questions: [{ ...q, chosen }, ...rest] });
+  }
+
+  private listRequest(message: Parameters<typeof postRemoteAnswer>[0]): void {
+    this.listRequests.add(message.request_id);
+    postRemoteAnswer(message);
+  }
+
+  /** The device list's key: opens the list and asks the window to read it. `false`, and nothing sent, while remote
+   *  control is off in this window. */
+  openList(): boolean {
+    if (!this.view.on) return false;
+    this.set({ listOpen: true, listNote: null });
+    this.listRequest({ type: "remote_devices_open", request_id: nextRequestId() });
+    return true;
+  }
+
+  /** `r` in the list: the window reads it again. */
+  refreshList(): void {
+    if (!this.view.listOpen) return;
+    this.set({ listNote: null });
+    this.listRequest({ type: "remote_devices_open", request_id: nextRequestId() });
+  }
+
+  /** `a` in the list: a code by `recipe`, shown as `eitri remote add-device` shows it. */
+  startEnroll(recipe: RemoteRecipeChoice): void {
+    if (!this.view.listOpen) return;
+    this.set({ listNote: null });
+    this.listRequest({ type: "remote_start_enroll", request_id: nextRequestId(), recipe });
+  }
+
+  /** `x` in the list: the window is asked whether `device` may be revoked; it asks the desk in turn. */
+  askRevoke(device: string): void {
+    if (!this.view.listOpen) return;
+    this.set({ listNote: null });
+    this.listRequest({ type: "remote_revoke_ask", request_id: nextRequestId(), device });
+  }
+
+  /** Escape in the list. */
+  closeList(): void {
+    this.set({ listOpen: false, devices: null, listNote: null });
   }
 
   /** Escape with no question shown: the code and the warnings go. */

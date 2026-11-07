@@ -3,8 +3,20 @@
 //! [`AgentPanelHandle::remote_message`] and its closed list, and the connection gets its `result`: at once, or, for a
 //! call that waits on the provider, from a later pump ([`RemoteSocket::deliver_results`]). A queued message the tab
 //! later takes out unsent (its mode widened) gets a second `result`, a refusal.
+//!
+//! The socket's own verdicts are recorded in the window's audit log: a device and token the store does not hold as a
+//! pair (`bad_token`, naming the device id as the peer gave it), a device that may only watch (`grant`), and a row key
+//! that is not a key (`tab_not_live`), each with the kind when it is one a phone may send. What
+//! [`AgentPanelHandle::remote_message`] decides it records itself.
 
 use super::*;
+use eitri_core::remote_audit::{DeviceRef, Event as AuditEvent, Reason};
+
+/// Why an `act` from a device that may only watch is refused.
+const WATCH_ONLY: &str = "watch only";
+
+/// Why an `act` whose device and token the store does not hold as a pair is refused.
+const NOT_AUTHORIZED: &str = "not authorized";
 
 /// An `act` as the reader hands it to the tick.
 pub(super) struct ActInbound {
@@ -15,6 +27,11 @@ pub(super) struct ActInbound {
     /// The message's command id, when it gave one no longer than [`COMMAND_ID_MAX_BYTES`]; a longer one is never
     /// copied.
     command_id: Option<String>,
+    /// The device id as the peer gave it, and the store's name for it when the token matched.
+    device: String,
+    name: Option<String>,
+    /// The message's kind, when it names one a phone may send.
+    kind: Option<&'static str>,
 }
 
 impl ActInbound {
@@ -30,17 +47,21 @@ impl ActInbound {
         else {
             return None;
         };
-        let verdict = match DeviceStore::load(&shared.store) {
+        let (verdict, name) = match DeviceStore::load(&shared.store) {
             Ok(store) => match store.verify(&device, token.expose()) {
-                Some((name, Grant::WatchSteer)) => Ok((device, name)),
-                Some((_, Grant::Watch)) => Err("watch only"),
-                None => Err("not authorized"),
+                Some((name, Grant::WatchSteer)) => (Ok((device.clone(), name.clone())), Some(name)),
+                Some((name, Grant::Watch)) => (Err(WATCH_ONLY), Some(name)),
+                None => (Err(NOT_AUTHORIZED), None),
             },
             Err(e) => {
                 eprintln!("[agent_panel] remote: the device store is not used: {e}");
-                Err("not authorized")
+                (Err(NOT_AUTHORIZED), None)
             }
         };
+        let kind = cmd
+            .get("type")
+            .and_then(serde_json::Value::as_str)
+            .and_then(crate::agent_panel::remote_entry::known_kind);
         let command_id = cmd
             .get("command_id")
             .and_then(serde_json::Value::as_str)
@@ -51,6 +72,9 @@ impl ActInbound {
             verdict,
             raw: cmd.to_string(),
             command_id,
+            device,
+            name,
+            kind,
         })
     }
 }
@@ -58,15 +82,38 @@ impl ActInbound {
 impl RemoteSocket {
     /// Carries out an `act` on the tick and answers it.
     pub(super) fn take_act(&self, handle: &AgentPanelHandle, conn: u64, act: ActInbound) {
-        if !self.conns.borrow().contains_key(&conn) {
-            return;
-        }
         let ActInbound {
             key,
             verdict,
             raw,
             command_id,
+            device,
+            name,
+            kind,
         } = act;
+        let refused = match (&verdict, RowKey::parse(&key)) {
+            (Err(why), _) if *why == WATCH_ONLY => Some(Reason::Grant),
+            (Err(_), _) => Some(Reason::BadToken),
+            (Ok(_), None) => Some(Reason::TabNotLive),
+            (Ok(_), Some(_)) => None,
+        };
+        if let Some(reason) = refused {
+            self.shared.audit.record(AuditEvent::Refused {
+                reason,
+                device: Some(DeviceRef {
+                    id: device,
+                    name: name.unwrap_or_default(),
+                }),
+                listener: None,
+                peer: None,
+                key: Some(key.clone()),
+                kind: kind.map(str::to_owned),
+                dropped: None,
+            });
+        }
+        if !self.conns.borrow().contains_key(&conn) {
+            return;
+        }
         let outcome = match (verdict, RowKey::parse(&key)) {
             (Err(why), _) => Err(why.to_owned()),
             (Ok(_), None) => Err(refusal_text(&RemoteRefusal::NoSuchTab)),
