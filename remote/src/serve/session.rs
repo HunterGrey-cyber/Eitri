@@ -985,6 +985,7 @@ impl Control {
                 instance,
                 code,
                 device_name,
+                recipe,
             } => {
                 let line = RvInbound::Enroll {
                     v: RV_PROTOCOL,
@@ -992,6 +993,7 @@ impl Control {
                     device_name,
                     host: self.host.clone(),
                     peer: self.peer.clone(),
+                    recipe,
                 };
                 let sent = if is_instance(&instance) {
                     self.send_to(&instance, &line)

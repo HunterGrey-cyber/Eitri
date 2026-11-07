@@ -4,7 +4,7 @@
 use super::*;
 use crate::agent_panel::tests::*;
 use eitri_core::remote_devices::{update, DeviceStore};
-use eitri_core::remote_pairing::confirmed_listen;
+use eitri_core::remote_pairing::{confirmed_listen, PairScheme};
 use eitri_core::remote_rv::{rv_socket_path, RvClient};
 use std::os::unix::fs::DirBuilderExt;
 use std::sync::atomic::AtomicU32;
@@ -59,10 +59,14 @@ impl Window {
         let wake = PanelWake::new().unwrap();
         let socket = RemoteSocket::bind(&scratch.0, instance, &scratch.store(), &wake).expect("the socket binds");
         socket.set_pairing(Pairing {
-            endpoint: Endpoint {
-                mode: PairMode::Direct,
-                host: "127.0.0.1".into(),
-                port: 7341,
+            routes: PairingRoutes {
+                ssh: None,
+                direct: Some(Endpoint {
+                    mode: PairMode::Direct,
+                    scheme: PairScheme::Http,
+                    host: "127.0.0.1".into(),
+                    port: 7341,
+                }),
             },
             ssh_dir: scratch.0.clone(),
         });
@@ -138,24 +142,36 @@ impl Window {
 
     /// `start_enroll` through `client`; the code the base page shows.
     fn start(&self, client: &mut RvClient) -> String {
-        let before = self.count("remote_pairing");
-        client.send(&RvInbound::StartEnroll { v: RV_PROTOCOL }).unwrap();
-        let answer = self.until(client, "start_enroll's result", |v| {
-            v["kind"] == "result" || v["kind"] == "refused"
-        });
-        assert_eq!(answer["ok"], true, "{answer}");
-        let shown = self.asked("remote_pairing", before);
-        shown["code"].as_str().unwrap().to_owned()
+        self.start_by(client, None).0
     }
 
+    /// `start_enroll` asking for `recipe` through `client`; the code the base page shows, and the answer `add-device`
+    /// reads.
+    fn start_by(&self, client: &mut RvClient, recipe: Option<PairMode>) -> (String, serde_json::Value) {
+        let before = self.count("remote_pairing");
+        client.send(&RvInbound::StartEnroll { v: RV_PROTOCOL, recipe }).unwrap();
+        let answer = self.until(client, "start_enroll's answer", |v| {
+            v["kind"] == "enroll_shown" || v["kind"] == "result" || v["kind"] == "refused"
+        });
+        assert_eq!(answer["kind"], "enroll_shown", "{answer}");
+        let shown = self.asked("remote_pairing", before);
+        (shown["code"].as_str().unwrap().to_owned(), answer)
+    }
+
+    /// A phone's enrollment by the direct recipe, from a loopback peer (a proxy on the desk, as `serve` sees it).
     fn enroll(client: &mut RvClient, code: &str, name: &str) {
+        Window::enroll_by(client, code, name, PairMode::Direct, "127.0.0.1:50122");
+    }
+
+    fn enroll_by(client: &mut RvClient, code: &str, name: &str, recipe: PairMode, peer: &str) {
         client
             .send(&RvInbound::Enroll {
                 v: RV_PROTOCOL,
                 code: Secret::new(code),
                 device_name: name.into(),
                 host: "127.0.0.1:7341".into(),
-                peer: "127.0.0.1:50122".into(),
+                peer: peer.into(),
+                recipe,
             })
             .unwrap();
     }
@@ -399,21 +415,22 @@ fn a_phone_using_ssh_is_enrolled_to_watch() {
     let scratch = Scratch::new();
     let window = Window::new(&scratch, INSTANCE_A);
     window.socket.set_pairing(Pairing {
-        endpoint: Endpoint {
-            mode: PairMode::Ssh,
-            host: "desk.example.net".into(),
-            port: 7341,
+        routes: PairingRoutes {
+            ssh: Some(ssh_endpoint()),
+            direct: None,
         },
         ssh_dir: scratch.0.clone(),
     });
     let mut client = window.connect();
     let code = window.start(&mut client);
     let shown = window.asked("remote_pairing", 0);
-    assert!(shown["uri"].as_str().unwrap().contains("&m=ssh&"), "{shown}");
+    assert!(shown["uri"].as_str().unwrap().contains("&m=ssh&s=http&"), "{shown}");
     let before = window.count("remote_enroll");
-    Window::enroll(&mut client, &code, "Pixel");
+    Window::enroll_by(&mut client, &code, "Pixel", PairMode::Ssh, "127.0.0.1:50122");
     let asked = window.asked("remote_enroll", before);
     assert_eq!(asked["grants"], serde_json::json!(["watch"]));
+    assert_eq!(asked["recipe"], "ssh");
+    assert_eq!(asked["target"], "through SSH to 127.0.0.1:41000 on this desk");
     window.answer("steer", asked["nonce"].as_u64().unwrap(), true, "watch+steer");
     assert!(matches!(result_for(&window.base.sent.borrow(), "steer"), Some(Err(_))));
     window.answer("watch", asked["nonce"].as_u64().unwrap(), true, "watch");
@@ -421,6 +438,168 @@ fn a_phone_using_ssh_is_enrolled_to_watch() {
     let store = DeviceStore::load(&scratch.store()).unwrap();
     let stored = store.get(enrolled["device"].as_str().unwrap()).unwrap();
     assert_eq!((stored.grant, stored.recipe), (Grant::Watch, Recipe::Ssh));
+}
+
+/// The SSH route of a loopback `serve` on port 41000.
+fn ssh_endpoint() -> Endpoint {
+    Endpoint {
+        mode: PairMode::Ssh,
+        scheme: PairScheme::Http,
+        host: "127.0.0.1".into(),
+        port: 41000,
+    }
+}
+
+/// A window whose `serve` listens on loopback behind Tailscale Serve: both routes.
+fn window_with_both_routes(scratch: &Scratch) -> Window {
+    let window = Window::new(scratch, INSTANCE_A);
+    window.socket.set_pairing(Pairing {
+        routes: PairingRoutes {
+            ssh: Some(ssh_endpoint()),
+            direct: Some(Endpoint {
+                mode: PairMode::Direct,
+                scheme: PairScheme::Https,
+                host: "desk.tail1.ts.net".into(),
+                port: 443,
+            }),
+        },
+        ssh_dir: scratch.0.clone(),
+    });
+    window
+}
+
+#[test]
+fn each_enrollment_takes_the_recipe_it_asks_for() {
+    let scratch = Scratch::new();
+    let window = window_with_both_routes(&scratch);
+    let mut client = window.connect();
+
+    // With none asked, the name set up for phones.
+    let (_, answer) = window.start_by(&mut client, None);
+    assert_eq!(answer["recipe"], "direct");
+    assert_eq!(answer["target"], "directly to desk.tail1.ts.net:443 (https)");
+    let shown = window.asked("remote_pairing", 0);
+    assert!(
+        shown["uri"]
+            .as_str()
+            .unwrap()
+            .contains("&m=direct&s=https&h=desk.tail1.ts.net&p=443"),
+        "{shown}"
+    );
+
+    // `--ssh` still enrolls through SSH alongside the direct route.
+    let (code, answer) = window.start_by(&mut client, Some(PairMode::Ssh));
+    assert_eq!(answer["recipe"], "ssh");
+    assert_eq!(answer["target"], "through SSH to 127.0.0.1:41000 on this desk");
+    let shown = window.asked("remote_pairing", 1);
+    assert!(
+        shown["uri"]
+            .as_str()
+            .unwrap()
+            .contains("&m=ssh&s=http&h=127.0.0.1&p=41000"),
+        "{shown}"
+    );
+    let before = window.count("remote_enroll");
+    Window::enroll_by(&mut client, &code, "Pixel", PairMode::Ssh, "127.0.0.1:50122");
+    let asked = window.asked("remote_enroll", before);
+    assert_eq!(asked["target"], "through SSH to 127.0.0.1:41000 on this desk");
+    assert_eq!(asked["grants"], serde_json::json!(["watch"]));
+    window.answer("yes", asked["nonce"].as_u64().unwrap(), true, "watch");
+    let enrolled = window.until(&mut client, "enrolled", |v| v["kind"] == "enrolled");
+    let stored = stored(&scratch.store(), enrolled["device"].as_str().unwrap()).unwrap();
+    assert_eq!(
+        (stored.grant, stored.recipe),
+        (Grant::Watch, Recipe::Ssh),
+        "the code's recipe"
+    );
+}
+
+#[test]
+fn an_enrollment_by_another_recipe_than_its_code_is_refused() {
+    let scratch = Scratch::new();
+    let window = window_with_both_routes(&scratch);
+    let mut client = window.connect();
+    let refused = |window: &Window, client: &mut RvClient, why: &str| {
+        let told = window.until(client, "the refusal", |v| v["kind"] == "enroll_refused");
+        assert_eq!(told["why"], why);
+        assert_eq!(window.count("remote_enroll"), 0, "the desk is not asked");
+        assert!(devices_in(&scratch.store()).is_empty(), "nothing is stored");
+    };
+
+    // A direct code presented by a phone that came through its SSH forward is not stored as direct.
+    let code = window.start(&mut client);
+    Window::enroll_by(&mut client, &code, "Pixel", PairMode::Ssh, "127.0.0.1:50122");
+    refused(&window, &mut client, RECIPE_DIFFERS);
+
+    // An SSH code from a phone that says direct.
+    let (code, _) = window.start_by(&mut client, Some(PairMode::Ssh));
+    Window::enroll_by(&mut client, &code, "Pixel", PairMode::Direct, "127.0.0.1:50122");
+    refused(&window, &mut client, RECIPE_DIFFERS);
+
+    // An SSH code over a connection that came from another machine, not through a forward on the desk.
+    for peer in ["198.51.100.9:50122", "[fd00::9]:50122", "unknown"] {
+        let (code, _) = window.start_by(&mut client, Some(PairMode::Ssh));
+        Window::enroll_by(&mut client, &code, "Pixel", PairMode::Ssh, peer);
+        refused(&window, &mut client, SSH_CODE_NOT_FORWARDED);
+    }
+
+    // The code is spent by a refused try: the same code again is unknown.
+    let (code, _) = window.start_by(&mut client, Some(PairMode::Ssh));
+    Window::enroll_by(&mut client, &code, "Pixel", PairMode::Direct, "127.0.0.1:50122");
+    refused(&window, &mut client, RECIPE_DIFFERS);
+    Window::enroll_by(&mut client, &code, "Pixel", PairMode::Ssh, "127.0.0.1:50122");
+    refused(
+        &window,
+        &mut client,
+        "that enrollment code is not this desk's, or was already used",
+    );
+
+    // Through the Unix socket, or a loopback peer in IPv4-mapped form, an SSH code is forwarded.
+    for peer in ["unix", "[::ffff:127.0.0.1]:50122", "[::1]:50122"] {
+        let (code, _) = window.start_by(&mut client, Some(PairMode::Ssh));
+        let before = window.count("remote_enroll");
+        Window::enroll_by(&mut client, &code, "Pixel", PairMode::Ssh, peer);
+        let asked = window.asked("remote_enroll", before);
+        window.answer("no", asked["nonce"].as_u64().unwrap(), false, "watch");
+        window.until(&mut client, "the desk's no", |v| v["kind"] == "enroll_refused");
+    }
+}
+
+#[test]
+fn a_recipe_the_window_has_no_route_for_is_refused_and_shows_nothing() {
+    let scratch = Scratch::new();
+    // A named address: direct only.
+    let window = Window::new(&scratch, INSTANCE_A);
+    let mut client = window.connect();
+    client
+        .send(&RvInbound::StartEnroll {
+            v: RV_PROTOCOL,
+            recipe: Some(PairMode::Ssh),
+        })
+        .unwrap();
+    let told = window.until(&mut client, "the refusal", |v| {
+        v["kind"] == "refused" || v["kind"] == "result"
+    });
+    assert_eq!(told["why"], eitri_core::remote_pairing::NO_SSH_ROUTE, "{told}");
+    assert_eq!(window.count("remote_pairing"), 0);
+    window.socket.set_pairing(Pairing {
+        routes: PairingRoutes {
+            ssh: Some(ssh_endpoint()),
+            direct: None,
+        },
+        ssh_dir: scratch.0.clone(),
+    });
+    client
+        .send(&RvInbound::StartEnroll {
+            v: RV_PROTOCOL,
+            recipe: Some(PairMode::Direct),
+        })
+        .unwrap();
+    let told = window.until(&mut client, "the refusal", |v| {
+        v["kind"] == "refused" || v["kind"] == "result"
+    });
+    assert_eq!(told["why"], eitri_core::remote_pairing::NO_DIRECT_ROUTE, "{told}");
+    assert_eq!(window.count("remote_pairing"), 0);
 }
 
 #[test]
@@ -461,7 +640,12 @@ fn start_enroll_without_an_address_for_phones_is_refused() {
     let wake = PanelWake::new().unwrap();
     let socket = RemoteSocket::bind(&scratch.0, INSTANCE_A, &scratch.store(), &wake).unwrap();
     let mut client = RvClient::connect(&rv_socket_path(&scratch.0, INSTANCE_A).unwrap()).unwrap();
-    client.send(&RvInbound::StartEnroll { v: RV_PROTOCOL }).unwrap();
+    client
+        .send(&RvInbound::StartEnroll {
+            v: RV_PROTOCOL,
+            recipe: None,
+        })
+        .unwrap();
     let deadline = Instant::now() + PATIENCE;
     let line = loop {
         assert!(Instant::now() < deadline);

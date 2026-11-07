@@ -25,7 +25,7 @@ use std::time::{Duration, Instant, SystemTime};
 
 use eitri_core::lua::config::{ConfigStore, RemoteSettings};
 use eitri_core::remote_pairing::{DEVICES_FILE, ENROLL_CODE_TTL};
-use eitri_core::remote_runtime::{pairing_endpoint, start_serve, RemotePlan, ServeConfig};
+use eitri_core::remote_runtime::{pairing_routes, start_serve, RemotePlan, ServeConfig};
 use eitri_core::remote_rv::RV_IDLE;
 use eitri_core::remote_rv::{parse_rv_outbound, rv_socket_path, RvClient, RvInbound, RvOutbound, RV_PROTOCOL};
 use eitri_panel::agent_panel::{Pairing, RemoteSocket};
@@ -188,9 +188,9 @@ fn switch_on(
         Some(port) => Ok(port),
         None => eitri_remote::serve::stable_port(&dirs.state),
     };
-    match port.and_then(|port| pairing_endpoint(&paired, port, &dirs.control)) {
-        Ok(endpoint) => socket.set_pairing(Pairing {
-            endpoint,
+    match port.and_then(|port| pairing_routes(&paired, port, &dirs.control)) {
+        Ok(routes) => socket.set_pairing(Pairing {
+            routes,
             ssh_dir: PathBuf::from(SSH_HOST_KEYS_DIR),
         }),
         Err(e) => say(

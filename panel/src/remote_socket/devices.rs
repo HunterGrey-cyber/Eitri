@@ -46,7 +46,7 @@ use crate::agent_panel::remote_enroll::{
 use eitri_core::remote_devices::{Confirmed, Device, DeviceStore, Recipe};
 use eitri_core::remote_pairing::{
     base64url, confirmed_listen_with_kind, interface_kind, interface_of, named_listen_addr, pairing_uri, random_fill,
-    record_listen, ssh_host_key_fingerprints, Endpoint, EnrollCode, EnrollCodes, IfaceKind, PairMode,
+    record_listen, ssh_host_key_fingerprints, Endpoint, EnrollCode, EnrollCodes, IfaceKind, PairMode, PairingRoutes,
 };
 use eitri_core::remote_rv::{Connected, RvOutbound, Secret, RV_PROTOCOL};
 use sha2::Digest;
@@ -56,6 +56,14 @@ use std::sync::Mutex;
 
 /// What a `start_enroll` is told while this window has nowhere to send phones.
 const NO_ENDPOINT: &str = "remote control has no address for phones in this window";
+
+/// What a phone is told when it says it reached `serve` by another recipe than its code's.
+pub(super) const RECIPE_DIFFERS: &str = "the phone says it reached the desk by another recipe than the code it shows: \
+                                         show a code for that recipe (eitri remote add-device --ssh or --direct)";
+
+/// What a phone presenting an SSH code over a connection that did not come through an SSH forward is told.
+pub(super) const SSH_CODE_NOT_FORWARDED: &str =
+    "the code is for the SSH recipe, and this connection did not come through an SSH forward on the desk";
 
 /// What a phone is told when its name, `Host` or address is empty or too long to show.
 const BAD_ENROLL: &str = "the enrollment names no device, or names it at more length than the desk shows";
@@ -103,17 +111,18 @@ const DEVICE_ID_BYTES: usize = 8;
 /// The link an address is on: its interface's name and kind, or `None` when no link holds it.
 type LinkOf = dyn Fn(IpAddr) -> Option<(String, IfaceKind)> + Send + Sync;
 
-/// Where phones connect, and where the desk's SSH host keys are read for the SSH recipe.
+/// Where phones connect, by each recipe the window has, and where the desk's SSH host keys are read for the SSH one.
 #[derive(Debug, Clone)]
 pub struct Pairing {
-    pub endpoint: Endpoint,
+    pub routes: PairingRoutes,
     pub ssh_dir: PathBuf,
 }
 
-/// The code on show and how it said phones connect.
+/// The code on show and where it sends phones: an enrollment is stored under that code's recipe, never under what
+/// the window would pair with by the time the phone presents it.
 struct Issued {
     codes: EnrollCodes,
-    mode: PairMode,
+    endpoint: Option<Endpoint>,
 }
 
 /// What the errands share across the accepting, reading and writing threads.
@@ -134,7 +143,7 @@ impl DevicesShared {
             instance: instance.to_owned(),
             issued: Mutex::new(Issued {
                 codes: EnrollCodes::default(),
-                mode: PairMode::Direct,
+                endpoint: None,
             }),
             pairing: Mutex::new(None),
             link_of: Mutex::new(Arc::new(|addr| {
@@ -150,8 +159,8 @@ impl DevicesShared {
 
 /// An errand as the reader hands it to the tick.
 pub(super) enum DevicesInbound {
-    /// A code was made and is to be shown.
-    StartEnroll(PairingShown),
+    /// A code was made and is to be shown; `add-device` is told where its phone goes.
+    StartEnroll(PairingShown, Endpoint),
     /// A phone presented this window's code in time: the desk is to be asked.
     Enroll(EnrollAsk),
     /// The desk said yes and the device is stored: the token goes to the phone.
@@ -185,12 +194,13 @@ impl DevicesInbound {
     pub(super) fn read(line: RvInbound, shared: &Shared) -> Option<DevicesInbound> {
         let devices = &shared.devices;
         Some(match line {
-            RvInbound::StartEnroll { .. } => start_enroll(devices, Instant::now()),
+            RvInbound::StartEnroll { recipe, .. } => start_enroll(devices, recipe, Instant::now()),
             RvInbound::Enroll {
                 code,
                 device_name,
                 host,
                 peer,
+                recipe,
                 ..
             } => {
                 let fits = |text: &str| !text.is_empty() && text.len() <= REMOTE_FIELD_MAX_BYTES;
@@ -199,12 +209,21 @@ impl DevicesInbound {
                 }
                 let mut issued = devices.issued.lock().unwrap_or_else(|e| e.into_inner());
                 match issued.codes.take(code.expose(), Instant::now()) {
-                    Ok(_) => DevicesInbound::Enroll(EnrollAsk {
-                        name: device_name,
-                        host,
-                        peer,
-                        mode: issued.mode,
-                    }),
+                    Ok(_) => {
+                        let Some(endpoint) = issued.endpoint.take() else {
+                            return Some(DevicesInbound::EnrollRefused(NO_ENDPOINT));
+                        };
+                        if let Err(why) = transport_matches(&endpoint, recipe, &peer) {
+                            return Some(DevicesInbound::EnrollRefused(why));
+                        }
+                        DevicesInbound::Enroll(EnrollAsk {
+                            name: device_name,
+                            host,
+                            peer,
+                            mode: endpoint.mode,
+                            target: endpoint.describe(),
+                        })
+                    }
                     Err(refused) => DevicesInbound::EnrollRefused(refused.why()),
                 }
             }
@@ -230,19 +249,42 @@ impl DevicesInbound {
     }
 }
 
-/// Makes a code, keeps it for the readers and builds what the page shows.
-fn start_enroll(devices: &DevicesShared, now: Instant) -> DevicesInbound {
+/// Whether a phone that presented a code sending it to `endpoint` came the way the code says: it says it used the
+/// code's recipe, and a code for the SSH recipe came through an SSH forward, which `serve` sees as a loopback peer or
+/// its Unix socket. A direct code cannot be checked the same way (a proxy on the desk is a loopback peer too), so the
+/// desk's question names where the code sends phones.
+fn transport_matches(endpoint: &Endpoint, recipe: PairMode, peer: &str) -> Result<(), &'static str> {
+    if recipe != endpoint.mode {
+        return Err(RECIPE_DIFFERS);
+    }
+    let forwarded = peer == "unix"
+        || peer
+            .parse::<std::net::SocketAddr>()
+            .is_ok_and(|addr| addr.ip().to_canonical().is_loopback());
+    if endpoint.mode == PairMode::Ssh && !forwarded {
+        return Err(SSH_CODE_NOT_FORWARDED);
+    }
+    Ok(())
+}
+
+/// Makes a code for the route `recipe` asks for (the window's default with `None`), keeps it for the readers and
+/// builds what the page shows.
+fn start_enroll(devices: &DevicesShared, recipe: Option<PairMode>, now: Instant) -> DevicesInbound {
     let Some(pairing) = devices.pairing.lock().unwrap_or_else(|e| e.into_inner()).clone() else {
         return DevicesInbound::Refused(NO_ENDPOINT);
+    };
+    let endpoint = match pairing.routes.pick(recipe) {
+        Ok(endpoint) => endpoint.clone(),
+        Err(why) => return DevicesInbound::Refused(why),
     };
     let Ok(code) = EnrollCode::new(&devices.instance, now) else {
         return DevicesInbound::Refused("no random bytes for a code");
     };
-    let keys = match pairing.endpoint.mode {
+    let keys = match endpoint.mode {
         PairMode::Ssh => ssh_host_key_fingerprints(&pairing.ssh_dir),
         PairMode::Direct => Vec::new(),
     };
-    let uri = pairing_uri(&code, &pairing.endpoint, &keys);
+    let uri = pairing_uri(&code, &endpoint, &keys);
     let Some(modules) = qr_rows(&uri) else {
         return DevicesInbound::Refused("the pairing address is too long for a QR code");
     };
@@ -253,8 +295,8 @@ fn start_enroll(devices: &DevicesShared, now: Instant) -> DevicesInbound {
     };
     let mut issued = devices.issued.lock().unwrap_or_else(|e| e.into_inner());
     issued.codes.issue(code);
-    issued.mode = pairing.endpoint.mode;
-    DevicesInbound::StartEnroll(shown)
+    issued.endpoint = Some(endpoint.clone());
+    DevicesInbound::StartEnroll(shown, endpoint)
 }
 
 /// The store at `store`, or `None` (said why) when it cannot be read; a missing store holds no device.
@@ -623,9 +665,14 @@ impl RemoteSocket {
                 }
                 handle.run(|state, out| show_connected(state, &connected, out));
             }
-            DevicesInbound::StartEnroll(shown) => {
+            DevicesInbound::StartEnroll(shown, endpoint) => {
                 handle.run(|_state, out| show_pairing(&shown, out));
-                self.answer(conn, result_line(None, Ok(())));
+                let line = RvOutbound::EnrollShown {
+                    v: RV_PROTOCOL,
+                    recipe: endpoint.mode,
+                    target: endpoint.describe(),
+                };
+                self.answer(conn, line.line());
             }
             DevicesInbound::Enroll(ask) => {
                 let shared = Arc::clone(&self.shared);

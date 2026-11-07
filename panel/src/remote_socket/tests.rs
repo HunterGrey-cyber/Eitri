@@ -982,7 +982,7 @@ fn every_new_kind_parses_and_is_refused_not_yet() {
     assert_eq!(provider.interrupts(), 0, "nothing reached the agent");
 
     // A field none of them has closes the connection, as any line that does not parse does.
-    let mut line = serde_json::to_value(RvInbound::StartEnroll { v: 1 }).unwrap();
+    let mut line = serde_json::to_value(RvInbound::StartEnroll { v: 1, recipe: None }).unwrap();
     line["x"] = serde_json::json!(1);
     let mut stream = UnixStream::connect(&rig.path).unwrap();
     stream.write_all(format!("{line}\n").as_bytes()).unwrap();

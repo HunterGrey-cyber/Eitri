@@ -10,9 +10,9 @@
 //! `serve` ends on its own once no window has had a live `rv-` socket for [`SERVE_IDLE_EXIT`].
 
 use crate::lua::config::{RemoteListen, RemoteSettings};
-use crate::remote_pairing::{Endpoint, PairMode};
+use crate::remote_pairing::{Endpoint, PairMode, PairScheme, PairingRoutes};
 use std::io;
-use std::net::IpAddr;
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 use std::path::Path;
 use std::time::Duration;
 
@@ -150,55 +150,60 @@ pub trait Spawner {
     fn spawn_serve(&self, cfg: &ServeConfig) -> io::Result<()>;
 }
 
-/// Where a pairing code sends phones for a `serve` started with `cfg` on `port` (the port it listens on; `control_dir`
-/// holds its Unix socket). A named address is reached directly. On loopback or the Unix socket, a name in `origins` is
-/// the proxy or Tailscale Serve in front of `serve`, and phones are sent to it directly: the first entry that names a
-/// host other than a loopback one ([`direct_origin`]), so with several the person puts the one phones use first.
-/// With none, loopback is reached through the phone's SSH client, to the desk's loopback port, and the Unix socket
-/// through an SSH forward of the socket, named by its path.
-pub fn pairing_endpoint(cfg: &ServeConfig, port: u16, control_dir: &Path) -> io::Result<Endpoint> {
-    if !matches!(cfg.listen, RemoteListen::Address(_)) {
-        if let Some((host, port)) = cfg.origins.iter().find_map(|entry| direct_origin(entry)) {
-            return Ok(Endpoint {
-                mode: PairMode::Direct,
-                host,
-                port,
-            });
-        }
-    }
+/// The ways a pairing code can send phones to a `serve` started with `cfg` on `port` (the port it listens on;
+/// `control_dir` holds its Unix socket). A named address is reached directly, over plain HTTP, and has no SSH route:
+/// `serve` listens on nothing else. On loopback the SSH recipe reaches the desk's loopback port through the phone's SSH
+/// client, and on the Unix socket an SSH forward of the socket, named by its path; and a name in `origins` is the proxy
+/// or Tailscale Serve in front of `serve`, reached directly: the first entry that can stand for the desk
+/// ([`direct_origin`]), so with several the person puts the one phones use first.
+pub fn pairing_routes(cfg: &ServeConfig, port: u16, control_dir: &Path) -> io::Result<PairingRoutes> {
+    let origin = || cfg.origins.iter().find_map(|entry| direct_origin(entry));
     Ok(match &cfg.listen {
-        RemoteListen::Loopback => Endpoint {
-            mode: PairMode::Ssh,
-            host: "127.0.0.1".to_owned(),
-            port,
+        RemoteListen::Address(addr) => PairingRoutes {
+            ssh: None,
+            direct: Some(Endpoint {
+                mode: PairMode::Direct,
+                scheme: PairScheme::Http,
+                host: addr.to_string(),
+                port,
+            }),
         },
-        RemoteListen::Address(addr) => Endpoint {
-            mode: PairMode::Direct,
-            host: addr.to_string(),
-            port,
+        RemoteListen::Loopback => PairingRoutes {
+            ssh: Some(Endpoint {
+                mode: PairMode::Ssh,
+                scheme: PairScheme::Http,
+                host: "127.0.0.1".to_owned(),
+                port,
+            }),
+            direct: origin(),
         },
-        RemoteListen::Socket => Endpoint {
-            mode: PairMode::Ssh,
-            host: crate::remote_rv::serve_socket_path(control_dir)?
-                .to_string_lossy()
-                .into_owned(),
-            port: 0,
+        RemoteListen::Socket => PairingRoutes {
+            ssh: Some(Endpoint {
+                mode: PairMode::Ssh,
+                scheme: PairScheme::Http,
+                host: crate::remote_rv::serve_socket_path(control_dir)?
+                    .to_string_lossy()
+                    .into_owned(),
+                port: 0,
+            }),
+            direct: origin(),
         },
     })
 }
 
-/// The host and port a phone reaches through one `remote.origins` entry (`name`, `name:port`, `http(s)://name[:port]`,
-/// an IPv6 host in brackets), lowercased and without the brackets, as the pairing URI names a host. Without a port an
-/// `http` origin is port 80 and anything else 443: a bare name is a proxy's or Tailscale Serve's HTTPS name. `None`
-/// for a loopback name (a phone-side loopback URL could be any app on the phone, so it never stands for the desk), a
-/// scheme other than `http` or `https`, a path, user information or anything that is not a host.
-pub fn direct_origin(entry: &str) -> Option<(String, u16)> {
+/// Where a phone is sent through one `remote.origins` entry (`name`, `name:port`, `http(s)://name[:port]`, an IPv6
+/// host in brackets): the host lowercased and without the brackets, as the pairing URI names a host, the port, and
+/// the scheme. Without a port an `http` origin is port 80 and anything else 443, and a bare name is HTTPS: a proxy's
+/// or Tailscale Serve's name. `None` for a host that is this desk itself ([`is_desk_itself`]: a phone-side loopback
+/// URL could be any app on the phone, so it never stands for the desk), a scheme other than `http` or `https`, a path,
+/// user information or anything that is not a host.
+pub fn direct_origin(entry: &str) -> Option<Endpoint> {
     let lower = entry.to_ascii_lowercase();
-    let (default_port, authority) = match lower.split_once("://") {
-        Some(("https", rest)) => (443, rest),
-        Some(("http", rest)) => (80, rest),
+    let (scheme, default_port, authority) = match lower.split_once("://") {
+        Some(("https", rest)) => (PairScheme::Https, 443, rest),
+        Some(("http", rest)) => (PairScheme::Http, 80, rest),
         Some(_) => return None,
-        None => (443, lower.as_str()),
+        None => (PairScheme::Https, 443, lower.as_str()),
     };
     if authority.is_empty() || authority.contains(['/', '?', '#', '@', '*']) {
         return None;
@@ -206,7 +211,7 @@ pub fn direct_origin(entry: &str) -> Option<(String, u16)> {
     let (host, port) = match authority.strip_prefix('[') {
         Some(rest) => {
             let (inside, after) = rest.split_once(']')?;
-            inside.parse::<std::net::Ipv6Addr>().ok()?;
+            inside.parse::<Ipv6Addr>().ok()?;
             let port = match after {
                 "" => None,
                 _ => Some(after.strip_prefix(':')?),
@@ -231,15 +236,76 @@ pub fn direct_origin(entry: &str) -> Option<(String, u16)> {
             .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'-' | b'.' | b':'))
         && !host.starts_with('.')
         && !host.contains("..");
-    if !host_ok || is_loopback_host(host) {
+    if !host_ok || is_desk_itself(host) {
         return None;
     }
-    Some((host.to_owned(), port))
+    Some(Endpoint {
+        mode: PairMode::Direct,
+        scheme,
+        host: host.to_owned(),
+        port,
+    })
 }
 
-/// `localhost`, a name under it, or a loopback address.
-fn is_loopback_host(host: &str) -> bool {
-    host == "localhost" || host.ends_with(".localhost") || host.parse::<IpAddr>().is_ok_and(|addr| addr.is_loopback())
+/// Whether a phone dialling `host` would reach itself or nothing rather than the desk: `localhost` or a name under it,
+/// a loopback or unspecified address in any spelling a resolver reads (`127.1`, `0x7f.1`, `2130706433`, `017700000001`,
+/// `0`), `::`, `::1`, and an IPv6 address that maps or embeds one of those (`::ffff:127.0.0.1`, `::127.0.0.1`). One
+/// trailing dot (the root of a fully qualified name) is read past. A name that only resolves to loopback cannot be
+/// told without resolving it; the phone's own refusal of a loopback connection covers that.
+fn is_desk_itself(host: &str) -> bool {
+    let host = host.strip_suffix('.').unwrap_or(host);
+    if host == "localhost" || host.ends_with(".localhost") {
+        return true;
+    }
+    let v4_local = |addr: Ipv4Addr| addr.is_loopback() || addr.octets()[0] == 0;
+    if let Ok(addr) = host.parse::<Ipv6Addr>() {
+        return addr.is_loopback()
+            || addr.is_unspecified()
+            || addr.to_ipv4_mapped().is_some_and(v4_local)
+            || addr.to_ipv4().is_some_and(v4_local);
+    }
+    inet_aton(host).is_some_and(v4_local)
+}
+
+/// `text` read as an IPv4 address the way `inet_aton(3)`, and so a resolver, reads it: one to four parts separated by
+/// dots, each decimal, octal (a leading `0`) or hexadecimal (`0x`), the last part filling every byte the others left.
+/// `None` for anything else, a part too large for the bytes it fills among them.
+fn inet_aton(text: &str) -> Option<Ipv4Addr> {
+    let parts: Vec<&str> = text.split('.').collect();
+    if parts.len() > 4 {
+        return None;
+    }
+    let mut values = Vec::with_capacity(parts.len());
+    for part in &parts {
+        let (digits, radix) = if let Some(hex) = part.strip_prefix("0x").or_else(|| part.strip_prefix("0X")) {
+            (hex, 16)
+        } else if part.len() > 1 && part.starts_with('0') {
+            (&part[1..], 8)
+        } else {
+            (*part, 10)
+        };
+        let value = match (digits, radix) {
+            // `0x` alone is zero to `inet_aton`.
+            ("", 16) => 0,
+            ("", _) => return None,
+            _ if !digits.chars().all(|c| c.is_digit(radix)) => return None,
+            _ => u32::from_str_radix(digits, radix).ok()?,
+        };
+        values.push(value);
+    }
+    let (last, leading) = values.split_last()?;
+    if leading.iter().any(|&v| v > 0xff) {
+        return None;
+    }
+    let last_bytes = 4 - leading.len() as u32;
+    if last_bytes < 4 && *last >= 1u32 << (8 * last_bytes) {
+        return None;
+    }
+    let mut addr = *last;
+    for (i, &v) in leading.iter().enumerate() {
+        addr |= v << (24 - 8 * i as u32);
+    }
+    Some(Ipv4Addr::from(addr))
 }
 
 #[cfg(test)]
@@ -423,92 +489,226 @@ mod tests {
         );
     }
 
+    /// The routes for `listen` and `origins` on port 41000, each as (mode, scheme, host, port).
+    fn routes(listen: RemoteListen, origins: &[&str]) -> (Option<Route>, Option<Route>) {
+        let cfg = ServeConfig {
+            listen,
+            port: None,
+            origins: origins.iter().map(|o| (*o).to_owned()).collect(),
+        };
+        let r = pairing_routes(&cfg, 41000, Path::new("/run/user/1000/eitri")).unwrap();
+        (r.ssh.map(route), r.direct.map(route))
+    }
+
+    type Route = (PairMode, PairScheme, String, u16);
+
+    fn route(e: Endpoint) -> Route {
+        (e.mode, e.scheme, e.host, e.port)
+    }
+
+    fn direct(scheme: PairScheme, host: &str, port: u16) -> Option<Route> {
+        Some((PairMode::Direct, scheme, host.to_owned(), port))
+    }
+
     #[test]
     fn pairing_follows_the_listener() {
-        let control = Path::new("/run/user/1000/eitri");
-        let of = |listen| {
-            let cfg = ServeConfig {
-                listen,
-                port: None,
-                origins: Vec::new(),
-            };
-            let e = pairing_endpoint(&cfg, 41000, control).unwrap();
-            (e.mode, e.host, e.port)
-        };
+        let loopback_ssh = Some((PairMode::Ssh, PairScheme::Http, "127.0.0.1".to_owned(), 41000));
+        assert_eq!(routes(RemoteListen::Loopback, &[]), (loopback_ssh, None));
         assert_eq!(
-            of(RemoteListen::Loopback),
-            (PairMode::Ssh, "127.0.0.1".to_owned(), 41000)
+            routes(RemoteListen::Address("198.51.100.2".parse().unwrap()), &[]),
+            (None, direct(PairScheme::Http, "198.51.100.2", 41000)),
+            "a named address has no SSH route: serve listens on nothing else"
         );
+        let socket = crate::remote_rv::serve_socket_path(Path::new("/run/user/1000/eitri")).unwrap();
         assert_eq!(
-            of(RemoteListen::Address("198.51.100.2".parse().unwrap())),
-            (PairMode::Direct, "198.51.100.2".to_owned(), 41000)
-        );
-        let socket = crate::remote_rv::serve_socket_path(control).unwrap();
-        assert_eq!(
-            of(RemoteListen::Socket),
-            (PairMode::Ssh, socket.to_string_lossy().into_owned(), 0)
+            routes(RemoteListen::Socket, &[]),
+            (
+                Some((
+                    PairMode::Ssh,
+                    PairScheme::Http,
+                    socket.to_string_lossy().into_owned(),
+                    0
+                )),
+                None
+            )
         );
     }
 
     #[test]
-    fn a_proxy_or_tailscale_name_in_origins_pairs_directly() {
-        let control = Path::new("/run/user/1000/eitri");
-        let of = |listen, origins: &[&str]| {
-            let cfg = ServeConfig {
-                listen,
-                port: None,
-                origins: origins.iter().map(|o| (*o).to_owned()).collect(),
-            };
-            let e = pairing_endpoint(&cfg, 41000, control).unwrap();
-            (e.mode, e.host, e.port)
-        };
-        let direct = |host: &str, port| (PairMode::Direct, host.to_owned(), port);
-        // Tailscale Serve and an own proxy are HTTPS names in front of a loopback `serve`.
+    fn a_proxy_or_tailscale_name_in_origins_adds_the_direct_route_and_keeps_ssh() {
+        let https = |host, port| direct(PairScheme::Https, host, port);
+        // Tailscale Serve and an own proxy are HTTPS names in front of a loopback `serve`; the SSH route stays.
+        let (ssh, d) = routes(RemoteListen::Loopback, &["desk.tail1.ts.net"]);
+        assert_eq!(ssh.unwrap().0, PairMode::Ssh);
+        assert_eq!(d, https("desk.tail1.ts.net", 443));
         assert_eq!(
-            of(RemoteListen::Loopback, &["desk.tail1.ts.net"]),
-            direct("desk.tail1.ts.net", 443)
+            routes(RemoteListen::Loopback, &["https://Phone.Example.org:8443"]).1,
+            https("phone.example.org", 8443)
         );
         assert_eq!(
-            of(RemoteListen::Loopback, &["https://Phone.Example.org:8443"]),
-            direct("phone.example.org", 8443)
+            routes(RemoteListen::Loopback, &["http://198.51.100.7"]).1,
+            direct(PairScheme::Http, "198.51.100.7", 80)
         );
         assert_eq!(
-            of(RemoteListen::Loopback, &["http://198.51.100.7"]),
-            direct("198.51.100.7", 80)
+            routes(RemoteListen::Loopback, &["http://desk.example:8080"]).1,
+            direct(PairScheme::Http, "desk.example", 8080)
         );
+        let (ssh, d) = routes(RemoteListen::Socket, &["desk.tail1.ts.net"]);
+        assert_eq!(ssh.unwrap().0, PairMode::Ssh);
+        assert_eq!(d, https("desk.tail1.ts.net", 443));
         assert_eq!(
-            of(RemoteListen::Socket, &["desk.tail1.ts.net"]),
-            direct("desk.tail1.ts.net", 443)
+            routes(RemoteListen::Loopback, &["[fd00::2]:8443"]).1,
+            https("fd00::2", 8443)
         );
-        assert_eq!(of(RemoteListen::Loopback, &["[fd00::2]:8443"]), direct("fd00::2", 8443));
         // Several: the first that can stand for the desk; a loopback name never does.
         assert_eq!(
-            of(
+            routes(
                 RemoteListen::Loopback,
                 &["localhost:8765", "127.0.0.1", "a.example", "b.example"]
-            ),
-            direct("a.example", 443)
+            )
+            .1,
+            https("a.example", 443)
         );
         assert_eq!(
-            of(
+            routes(
                 RemoteListen::Loopback,
                 &["ftp://a.example", "a.example/eitri", "b.example"]
-            ),
-            direct("b.example", 443)
+            )
+            .1,
+            https("b.example", 443)
         );
-        // Loopback or the socket with no usable name stays the SSH recipe.
+        // Loopback or the socket with no usable name has the SSH route only.
         assert_eq!(
-            of(RemoteListen::Loopback, &["localhost", "x.localhost:9000", "[::1]:8765"]),
-            (PairMode::Ssh, "127.0.0.1".to_owned(), 41000)
+            routes(RemoteListen::Loopback, &["localhost", "x.localhost:9000", "[::1]:8765"]).1,
+            None
         );
-        assert_eq!(of(RemoteListen::Socket, &[]).0, PairMode::Ssh);
         // A named address is what phones reach, whatever names a proxy also has.
         assert_eq!(
-            of(
+            routes(
                 RemoteListen::Address("198.51.100.2".parse().unwrap()),
                 &["desk.tail1.ts.net"]
             ),
-            direct("198.51.100.2", 41000)
+            (None, direct(PairScheme::Http, "198.51.100.2", 41000))
+        );
+    }
+
+    #[test]
+    fn an_origin_that_is_the_desk_itself_in_any_spelling_is_no_phone_target() {
+        for entry in [
+            "localhost",
+            "localhost.",
+            "a.localhost",
+            "127.0.0.1",
+            "127.0.0.1.",
+            "127.1",
+            "127.0.1",
+            "127.255.255.254",
+            "0x7f.1",
+            "0X7F.0.0.1",
+            "0x7f000001",
+            "2130706433",
+            "017700000001",
+            "0177.0.0.1",
+            "0",
+            "0.0.0.0",
+            "0x0",
+            "00",
+            "0.1.2.3",
+            "https://127.1:8443",
+            "http://2130706433",
+            "[::1]",
+            "[::]",
+            "[::ffff:127.0.0.1]",
+            "[::ffff:7f00:1]",
+            "[::ffff:0.0.0.0]",
+            "[::127.0.0.1]",
+            "[0:0:0:0:0:0:0:1]:8443",
+        ] {
+            assert_eq!(direct_origin(entry), None, "{entry}");
+        }
+    }
+
+    #[test]
+    fn an_origin_that_only_looks_numeric_is_a_name() {
+        for (entry, host) in [
+            ("198.51.100.7", "198.51.100.7"),
+            ("0xc6.51.100.7", "0xc6.51.100.7"),
+            ("1e100.net", "1e100.net"),
+            ("128.0.0.1", "128.0.0.1"),
+            ("deadbeef", "deadbeef"),
+            ("0x7f.example", "0x7f.example"),
+            ("127.0.0.1.example", "127.0.0.1.example"),
+            ("[fd00::127]", "fd00::127"),
+            ("[::ffff:198.51.100.2]", "::ffff:198.51.100.2"),
+        ] {
+            assert_eq!(direct_origin(entry).map(|e| e.host), Some(host.to_owned()), "{entry}");
+        }
+    }
+
+    #[test]
+    fn inet_aton_reads_every_ipv4_spelling() {
+        let of = |text| inet_aton(text).map(|a| a.to_string());
+        for (text, addr) in [
+            ("127.1", "127.0.0.1"),
+            ("127.0.1", "127.0.0.1"),
+            ("0x7f.1", "127.0.0.1"),
+            ("2130706433", "127.0.0.1"),
+            ("017700000001", "127.0.0.1"),
+            ("0177.0.0.01", "127.0.0.1"),
+            ("1.2.3.4", "1.2.3.4"),
+            ("198.65535", "198.0.255.255"),
+            ("4294967295", "255.255.255.255"),
+            ("0x", "0.0.0.0"),
+        ] {
+            assert_eq!(of(text).as_deref(), Some(addr), "{text}");
+        }
+        for text in [
+            "",
+            "1.2.3.4.5",
+            "256.1",
+            "1.2.65536",
+            "4294967296",
+            "08",
+            "0x1g",
+            "1..2",
+            "a.b",
+            "1.2.3.-4",
+        ] {
+            assert_eq!(of(text), None, "{text}");
+        }
+    }
+
+    #[test]
+    fn a_route_is_picked_as_asked_or_by_default() {
+        let both = PairingRoutes {
+            ssh: Some(Endpoint {
+                mode: PairMode::Ssh,
+                scheme: PairScheme::Http,
+                host: "127.0.0.1".into(),
+                port: 41000,
+            }),
+            direct: direct_origin("desk.tail1.ts.net"),
+        };
+        assert_eq!(
+            both.pick(None).unwrap().mode,
+            PairMode::Direct,
+            "the name set up for phones first"
+        );
+        assert_eq!(both.pick(Some(PairMode::Ssh)).unwrap().mode, PairMode::Ssh);
+        assert_eq!(both.pick(Some(PairMode::Direct)).unwrap().host, "desk.tail1.ts.net");
+        let ssh_only = PairingRoutes {
+            direct: None,
+            ..both.clone()
+        };
+        assert_eq!(ssh_only.pick(None).unwrap().mode, PairMode::Ssh);
+        assert_eq!(
+            ssh_only.pick(Some(PairMode::Direct)),
+            Err(crate::remote_pairing::NO_DIRECT_ROUTE)
+        );
+        let direct_only = PairingRoutes { ssh: None, ..both };
+        assert_eq!(
+            direct_only.pick(Some(PairMode::Ssh)),
+            Err(crate::remote_pairing::NO_SSH_ROUTE)
         );
     }
 }

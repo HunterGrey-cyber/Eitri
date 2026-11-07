@@ -6,9 +6,13 @@
 //! screen recording or a scanner's history that kept it holds nothing once it was used or ran out. It is not the
 //! device's token; that is minted only after the desk's `y`, and only its hash is stored.
 //!
-//! The pairing URI is `eitri-pair:v=1&c=<code>&i=<instance>&m=<ssh|direct>&h=<host>&p=<port>&k=<fingerprint>...`,
-//! with one `k` per SSH host key of the desk, so a phone using the SSH recipe refuses any other host key on the
-//! connection that carries its token. Every value is percent-encoded (a fingerprint's base64 has `+` and `/`).
+//! The pairing URI is
+//! `eitri-pair:v=1&c=<code>&i=<instance>&m=<ssh|direct>&s=<https|http>&h=<host>&p=<port>&k=<fingerprint>...`, with
+//! one `k` per SSH host key of the desk, so a phone using the SSH recipe refuses any other host key on the connection
+//! that carries its token. `m` is the recipe the phone uses and also says in its `enroll`; `s` is what it speaks to
+//! `h:p`: `https` to a proxy or Tailscale Serve name, `http` to `serve` itself (a tunnel's address, a confirmed LAN
+//! address, or the far end of the SSH forward), which has no TLS of its own. Every value is percent-encoded (a
+//! fingerprint's base64 has `+` and `/`).
 //!
 //! A named listen address takes effect only after the desk's yes ([`record_listen`], read back by
 //! [`confirmed_listen`]): a link that is not a known tunnel carries the traffic in plain text, so the desk is told so
@@ -202,7 +206,8 @@ pub enum PairMode {
 }
 
 impl PairMode {
-    fn as_str(self) -> &'static str {
+    /// The word the pairing URI's `m` and the phone's `enroll` carry.
+    pub fn as_str(self) -> &'static str {
         match self {
             PairMode::Ssh => "ssh",
             PairMode::Direct => "direct",
@@ -210,12 +215,81 @@ impl PairMode {
     }
 }
 
-/// Where the phone connects: the mode, the host it names and the port.
+/// What the phone speaks to the pairing URI's `h:p`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PairScheme {
+    /// TLS, ended by the proxy or Tailscale Serve in front of `serve`.
+    Https,
+    /// Plain HTTP and WebSocket: `serve` itself, reached over a tunnel, a confirmed address or an SSH forward.
+    Http,
+}
+
+impl PairScheme {
+    /// The word the pairing URI's `s` carries.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            PairScheme::Https => "https",
+            PairScheme::Http => "http",
+        }
+    }
+}
+
+/// Where the phone connects: the recipe, what it speaks, the host it names and the port.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Endpoint {
     pub mode: PairMode,
+    pub scheme: PairScheme,
     pub host: String,
+    /// 0 when `host` is the path of `serve`'s Unix socket, which an SSH forward reaches by its path.
     pub port: u16,
+}
+
+impl Endpoint {
+    /// What a phone paired with this endpoint dials, as the desk is told it: "directly to <host>:<port> (https)",
+    /// "through SSH to <host>:<port> on this desk" or "through SSH to the socket <path> on this desk". An IPv6 host is
+    /// put in brackets.
+    pub fn describe(&self) -> String {
+        let host_port = || {
+            if self.host.contains(':') {
+                format!("[{}]:{}", self.host, self.port)
+            } else {
+                format!("{}:{}", self.host, self.port)
+            }
+        };
+        match (self.mode, self.port) {
+            (PairMode::Direct, _) => format!("directly to {} ({})", host_port(), self.scheme.as_str()),
+            (PairMode::Ssh, 0) => format!("through SSH to the socket {} on this desk", self.host),
+            (PairMode::Ssh, _) => format!("through SSH to {} on this desk", host_port()),
+        }
+    }
+}
+
+/// The ways a window can send phones to `serve`: the SSH recipe and the direct one, where each exists. A plain `eitri
+/// remote add-device` takes the direct one when there is one (a proxy, Tailscale Serve or a named address is what the
+/// person set up for phones) and the SSH one otherwise; `--ssh` and `--direct` ask for one.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PairingRoutes {
+    pub ssh: Option<Endpoint>,
+    pub direct: Option<Endpoint>,
+}
+
+/// What an enrollment asking for the SSH recipe is told when there is none.
+pub const NO_SSH_ROUTE: &str = "this window has no SSH route for phones: serve listens on the address remote.listen \
+                                names; the SSH recipe needs remote.listen = \"loopback\" or \"socket\"";
+
+/// What an enrollment asking for the direct recipe is told when there is none.
+pub const NO_DIRECT_ROUTE: &str = "this window has no direct address for phones: name the proxy or Tailscale Serve in \
+                                   front of serve in remote.origins, or an address in remote.listen";
+
+impl PairingRoutes {
+    /// The endpoint for `asked`, or with `None` the default one; `Err` says why there is none.
+    pub fn pick(&self, asked: Option<PairMode>) -> Result<&Endpoint, &'static str> {
+        match asked {
+            Some(PairMode::Ssh) => self.ssh.as_ref().ok_or(NO_SSH_ROUTE),
+            Some(PairMode::Direct) => self.direct.as_ref().ok_or(NO_DIRECT_ROUTE),
+            None => self.direct.as_ref().or(self.ssh.as_ref()).ok_or(NO_DIRECT_ROUTE),
+        }
+    }
 }
 
 /// One SSH host key's fingerprint in OpenSSH's form, `SHA256:<unpadded base64 of the key blob's SHA-256>`, and the
@@ -229,10 +303,11 @@ pub struct SshKeyFingerprint {
 /// The pairing URI for `code`, reaching `endpoint`, pinning `ssh_host_keys`.
 pub fn pairing_uri(code: &EnrollCode, endpoint: &Endpoint, ssh_host_keys: &[SshKeyFingerprint]) -> String {
     let mut uri = format!(
-        "eitri-pair:v={PAIRING_URI_V}&c={}&i={}&m={}&h={}&p={}",
+        "eitri-pair:v={PAIRING_URI_V}&c={}&i={}&m={}&s={}&h={}&p={}",
         percent(&code.text()),
         percent(&code.instance),
         endpoint.mode.as_str(),
+        endpoint.scheme.as_str(),
         percent(&endpoint.host),
         endpoint.port
     );
@@ -673,13 +748,14 @@ mod tests {
         };
         let endpoint = Endpoint {
             mode: PairMode::Ssh,
+            scheme: PairScheme::Http,
             host: "desk.example.net".into(),
             port: 7341,
         };
         let uri = pairing_uri(&shown, &endpoint, &keys);
         assert!(
             uri.starts_with(
-                "eitri-pair:v=1&c=BwcHBwcHBwcHBwcHBwcHBw&i=b4e1c09a7d3f5e21&m=ssh&h=desk.example.net&p=7341&k="
+                "eitri-pair:v=1&c=BwcHBwcHBwcHBwcHBwcHBw&i=b4e1c09a7d3f5e21&m=ssh&s=http&h=desk.example.net&p=7341&k="
             ),
             "{uri}"
         );
@@ -693,12 +769,42 @@ mod tests {
             &shown,
             &Endpoint {
                 mode: PairMode::Direct,
+                scheme: PairScheme::Https,
                 host: "fd00::2".into(),
                 port: 7341,
             },
             &[],
         );
-        assert!(direct.ends_with("&m=direct&h=fd00%3A%3A2&p=7341"), "{direct}");
+        assert!(direct.ends_with("&m=direct&s=https&h=fd00%3A%3A2&p=7341"), "{direct}");
+    }
+
+    #[test]
+    fn an_endpoint_is_described_as_the_phone_dials_it() {
+        let of = |mode, scheme, host: &str, port| {
+            Endpoint {
+                mode,
+                scheme,
+                host: host.into(),
+                port,
+            }
+            .describe()
+        };
+        assert_eq!(
+            of(PairMode::Direct, PairScheme::Https, "desk.tail1.ts.net", 443),
+            "directly to desk.tail1.ts.net:443 (https)"
+        );
+        assert_eq!(
+            of(PairMode::Direct, PairScheme::Http, "fd00::2", 7341),
+            "directly to [fd00::2]:7341 (http)"
+        );
+        assert_eq!(
+            of(PairMode::Ssh, PairScheme::Http, "127.0.0.1", 41000),
+            "through SSH to 127.0.0.1:41000 on this desk"
+        );
+        assert_eq!(
+            of(PairMode::Ssh, PairScheme::Http, "/run/user/1000/eitri/remote.sock", 0),
+            "through SSH to the socket /run/user/1000/eitri/remote.sock on this desk"
+        );
     }
 
     #[test]

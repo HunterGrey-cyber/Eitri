@@ -530,7 +530,7 @@ export type RemoteDeskEnvelope =
    *  one string of `0`/`1` per row. */
   | { kind: "remote_pairing"; code: string; uri: string; modules: string[]; expiresInMs: number }
   /** Each question says how long the window waits for it (`expiresInMs`); past that it is no. */
-  | { kind: "remote_enroll"; nonce: number; name: string; host: string; peer: string; grants: RemoteGrant[]; grant: RemoteGrant; expiresInMs: number }
+  | { kind: "remote_enroll"; nonce: number; name: string; host: string; peer: string; recipe: "ssh" | "direct"; target: string; grants: RemoteGrant[]; grant: RemoteGrant; expiresInMs: number }
   | { kind: "remote_listen"; nonce: number; addr: string; iface: string; link: string; plain: boolean; expiresInMs: number }
   /** `eitri remote grant` asks whether a device's grant may change from `from` to `to`; answered with
    *  `remote_enroll_answer` under its nonce, a `yes` naming `to`. */
@@ -573,7 +573,8 @@ function isWellFormedRemote(value: Record<string, unknown>): boolean {
         value.modules.every((row) => typeof row === "string" && /^[01]*$/.test(row) && row.length === (value.modules as unknown[]).length) &&
         typeof value.expiresInMs === "number";
     case "remote_enroll":
-      return nonce && expires && text(value.name) && text(value.host) && text(value.peer) && Array.isArray(value.grants) &&
+      return nonce && expires && text(value.name) && text(value.host) && text(value.peer) &&
+        (value.recipe === "ssh" || value.recipe === "direct") && text(value.target) && Array.isArray(value.grants) &&
         value.grants.length > 0 && value.grants.every(isGrant) && isGrant(value.grant);
     case "remote_listen":
       return nonce && expires && text(value.addr) && text(value.iface) && text(value.link) && typeof value.plain === "boolean";

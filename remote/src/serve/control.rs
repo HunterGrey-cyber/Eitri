@@ -209,7 +209,9 @@ fn ask_window(control: &Path, instance: &str, request: &RvInbound) -> io::Result
             continue;
         };
         match parse_rv_outbound(line.as_bytes()) {
-            Ok(RvOutbound::Result { .. } | RvOutbound::Refused { .. }) => return Ok(line),
+            Ok(RvOutbound::Result { .. } | RvOutbound::Refused { .. } | RvOutbound::EnrollShown { .. }) => {
+                return Ok(line)
+            }
             _ => {}
         }
     }

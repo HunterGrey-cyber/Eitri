@@ -1,7 +1,7 @@
 //! JSON frames shared by remote observation and the phone's inbound transport.
 
 use crate::agents::{wire, Change, View};
-use crate::remote_rv::Secret;
+use crate::remote_rv::{PairMode, Secret};
 use serde::Deserialize;
 use serde_json::{json, Value};
 
@@ -71,11 +71,14 @@ pub enum PhoneInbound {
     /// Keeps a quiet connection open.
     #[serde(deserialize_with = "empty_body")]
     Ping,
-    /// Enrolls with the one-time `code` that the window `instance` showed, as `device_name`.
+    /// Enrolls with the one-time `code` that the window `instance` showed, as `device_name`, by `recipe`: the pairing
+    /// URI's `m`, the recipe the phone used to reach `serve`. A phone that reached it another way says so, and the
+    /// window refuses the enrollment rather than store it under the code's recipe.
     Enroll {
         instance: String,
         code: Secret,
         device_name: String,
+        recipe: PairMode,
     },
     /// The phone takes itself out of the store.
     #[serde(deserialize_with = "empty_body")]
@@ -249,7 +252,8 @@ mod tests {
         for body in [
             json!({"kind":"ping"}),
             json!({"kind":"more", "key":"k-1", "generation":3, "before_turn":12}),
-            json!({"kind":"enroll", "instance":"a3f09c1d2e4b5f60", "code":"c0de", "device_name":"Pixel"}),
+            json!({"kind":"enroll", "instance":"a3f09c1d2e4b5f60", "code":"c0de", "device_name":"Pixel", "recipe":"ssh"}),
+            json!({"kind":"enroll", "instance":"a3f09c1d2e4b5f60", "code":"c0de", "device_name":"Pixel", "recipe":"direct"}),
             json!({"kind":"revoke_self"}),
             json!({"kind":"set_push_endpoint", "url":"https://ntfy.example/t"}),
             json!({"kind":"hello", "device":"phone", "layout":"slab", "protocol":1}),
@@ -276,6 +280,9 @@ mod tests {
         for body in [
             json!({"kind":"more", "key":"k-1", "generation":3}),
             json!({"kind":"enroll", "code":"c0de", "device_name":"Pixel"}),
+            // The recipe is required, and only the two the pairing URI names.
+            json!({"kind":"enroll", "instance":"a3f09c1d2e4b5f60", "code":"c0de", "device_name":"Pixel"}),
+            json!({"kind":"enroll", "instance":"a3f09c1d2e4b5f60", "code":"c0de", "device_name":"Pixel", "recipe":"tor"}),
             json!({"kind":"ping", "x":1}),
             json!({"kind":"revoke_self", "token":"t"}),
         ] {

@@ -96,6 +96,15 @@ function lastOfType(type: string): Record<string, unknown> | undefined {
   return matching[matching.length - 1];
 }
 
+/** jsdom stamps keys with `Date.now()`, while arrivals and held-key repeats also read
+ *  `performance.now()`. Advance both with the timers so a real delay cannot move an arrival
+ *  relative to a key while the test's event timestamps stand still. */
+function fakeClock() {
+  vi.useFakeTimers({
+    toFake: ["setTimeout", "clearTimeout", "setInterval", "clearInterval", "setImmediate", "clearImmediate", "Date", "performance"],
+  });
+}
+
 /** The panel opens in BROWSE, where the composer renders a hint line rather than a textarea.
  *  Every test below that types into the box goes through the same `i` the real keyboard
  *  table (`./keymap`) offers, rather than reaching for the textarea directly -- which is also what
@@ -467,12 +476,17 @@ describe("focus_permission (the tray's agent chip, or Ctrl+a a, with a card wait
     expect(current.textContent).toContain("Permission requested: Bash");
   });
 
-  it("leaves INPUT for the card, so a lone a answers it (after the typing guard's wait)", () => {
-    vi.useFakeTimers();
+  it.each([0, 100])("leaves INPUT for the card, so a lone a answers it (after the typing guard's wait; %i ms real delay)", (realDelay) => {
+    // A delay between the key and the arrival must not move a clock the test leaves running real.
+    // Install underneath fake timers so omitting `performance` exposes this jump to the guard.
+    let realNow = 1000;
+    const performanceSpy = vi.spyOn(performance, "now").mockImplementation(() => realNow);
+    fakeClock();
     try {
       const { container } = withTwoCards();
       enterInputMode(container);
       expect(modeBlock(container).dataset.mode).toBe("input");
+      realNow += realDelay;
       dispatch({ kind: "focus_permission", tab: 1 });
       expect(modeBlock(container).dataset.mode).toBe("browse");
       // The `i` above is a key: a lone `a` is one nothing came near.
@@ -482,6 +496,7 @@ describe("focus_permission (the tray's agent chip, or Ctrl+a a, with a card wait
       expect(lastOfType("permission_response")).toMatchObject({ permission_id: "perm-1", decision: "allow" });
     } finally {
       vi.useRealTimers();
+      performanceSpy.mockRestore();
     }
   });
 
@@ -1029,7 +1044,7 @@ describe("slash command pickers", () => {
   });
 
   it("a click on the band leaves the box's draft where a tab switch finds it", () => {
-    vi.useFakeTimers();
+    fakeClock();
     const widen = stubBandWidth();
     try {
       const { container } = startedApp();
@@ -1267,7 +1282,7 @@ describe("slash command pickers", () => {
     const current = (container: HTMLElement) => container.querySelector(".row-current .row-body")?.textContent ?? null;
     const wait = (ms: number) => act(() => vi.advanceTimersByTime(ms));
     beforeEach(() => {
-      vi.useFakeTimers();
+      fakeClock();
     });
     afterEach(() => {
       vi.useRealTimers();
@@ -1407,7 +1422,7 @@ describe("the in-flight motion indicator's elapsed clock", () => {
   });
 
   it("does not restart -- keyed on the turn id, so a resync that repeats it leaves `since` untouched", () => {
-    vi.useFakeTimers();
+    fakeClock();
     try {
       const { container } = render(<App />);
       dispatch({ kind: "hello", ...HELLO });
@@ -1450,7 +1465,7 @@ describe("the in-flight motion indicator's elapsed clock", () => {
      an answer. Both paths, driven end to end, with the repeated id as the probe. */
   for (const reset of ["a fatal error", "a terminal handoff"] as const) {
     it(`${reset} leaves no stale clock behind, even for a turn id that comes back`, () => {
-      vi.useFakeTimers();
+      fakeClock();
       try {
         const { container } = render(<App />);
         dispatch({ kind: "hello", ...HELLO });
@@ -1489,7 +1504,7 @@ describe("the in-flight motion indicator's elapsed clock", () => {
      panel holds only the active tab and restarted the clock at the snapshot. The tab set now keeps
      when the turn started and the snapshot carries it (`turnStartedAtMs`). */
   it("keeps a running turn's real elapsed time across a tab switch", () => {
-    vi.useFakeTimers();
+    fakeClock();
     try {
       const { container } = render(<App />);
       dispatch({ kind: "hello", ...HELLO });
@@ -1771,7 +1786,7 @@ describe("App keyboard: BROWSE/INPUT and the cursor", () => {
   /* Rust refuses `r` on a tab whose `claude` is still missing and leaves the row up: the refusal is a footer flash,
      not the banner reserved for what breaks the conversation. */
   it("says in the footer, not the banner, that a refused r left the tab as it was", () => {
-    vi.useFakeTimers();
+    fakeClock();
     const widen = stubBandWidth();
     try {
       const { container } = startedApp();
@@ -2262,7 +2277,7 @@ describe("App keyboard: BROWSE/INPUT and the cursor", () => {
        nothing. Enter is pressed with no key just before it, since the typing guard refuses one right
        after typing; that half is `typing never answers a card`'s. */
     it("claims Enter and Space on the card's own buttons, and an Enter nothing landed presses nothing", () => {
-      vi.useFakeTimers();
+      fakeClock();
       const widen = stubBandWidth();
       try {
         const { container } = withAToolCallAndAPermission();
@@ -2381,7 +2396,7 @@ describe("App: the which-key box", () => {
     // which-key STRIP -- every pending prefix now shows in the which-key BOX instead, after
     // `WHICH_KEY_DELAY_MS` (200ms, widened from the strip's old `g`-only 400ms).
     it("shows nothing before the delay, `first row` once it elapses, and clears on the next key", () => {
-      vi.useFakeTimers();
+      fakeClock();
       try {
         const { container } = started();
         events({ type: "user_prompt_submitted", text: "hi" });
@@ -2399,7 +2414,7 @@ describe("App: the which-key box", () => {
     });
 
     it("gg inside the delay never shows the box", () => {
-      vi.useFakeTimers();
+      fakeClock();
       try {
         const { container } = started();
         events({ type: "user_prompt_submitted", text: "hi" });
@@ -2542,7 +2557,7 @@ describe("Ctrl+w h/j/k/l in BROWSE: the keys to the module that way", () => {
   });
 
   it("is BROWSE's: in INPUT the composer keeps Ctrl+w, and no prefix is left waiting behind it", () => {
-    vi.useFakeTimers();
+    fakeClock();
     try {
       const { container } = browsing();
       press("i");
@@ -2595,7 +2610,7 @@ describe("Ctrl+w h/j/k/l in BROWSE: the keys to the module that way", () => {
   });
 
   describe("the which-key box after Ctrl+w (200 ms, titled Ctrl+w)", () => {
-    beforeEach(() => vi.useFakeTimers());
+    beforeEach(fakeClock);
     afterEach(() => vi.useRealTimers());
     const box = (c: HTMLElement) => c.querySelector(".which-key-box");
 
@@ -2743,7 +2758,7 @@ describe("the leader", () => {
   });
 
   it("lists model and effort in which-key and the question-mark overlay from the panel table", () => {
-    vi.useFakeTimers();
+    fakeClock();
     try {
       const { container } = started();
       sendTable(pickerTable);
@@ -2766,7 +2781,7 @@ describe("the leader", () => {
   });
 
   it("lowercase m still cycles mode and lowercase e still toggles following", () => {
-    vi.useFakeTimers();
+    fakeClock();
     try {
       const { container } = started();
       sendTable(pickerTable);
@@ -2785,7 +2800,7 @@ describe("the leader", () => {
   });
 
   it("the_leader_key_posts_the_toggle_for_the_active_tab", () => {
-    vi.useFakeTimers();
+    fakeClock();
     const widen = stubBandWidth();
     try {
       const { container } = started();
@@ -2810,7 +2825,7 @@ describe("the leader", () => {
   });
 
   it("a_refused_toggle_flashes_in_the_band_and_raises_no_banner", () => {
-    vi.useFakeTimers();
+    fakeClock();
     const widen = stubBandWidth();
     try {
       const { container } = started();
@@ -2830,7 +2845,7 @@ describe("the leader", () => {
   });
 
   it("shows the box 200ms after Space, titled Space, with m/b/f in order", () => {
-    vi.useFakeTimers();
+    fakeClock();
     try {
       const { container } = started();
       sendTable();
@@ -2849,7 +2864,7 @@ describe("the leader", () => {
   });
 
   it("Space b d typed within 50ms never shows the box, and closes the tab", () => {
-    vi.useFakeTimers();
+    fakeClock();
     try {
       const { container } = started();
       sendTable();
@@ -2872,7 +2887,7 @@ describe("the leader", () => {
    *  reserved two-key prefix `resolveKey` itself owns, completed on the SECOND key), so they are
    *  untouched and still run at once. */
   it("H posts tab_verb prev TYPING_GUARD_MS later, [ b posts prev via the table at once, [ [ is still a prompt jump", () => {
-    vi.useFakeTimers();
+    fakeClock();
     try {
       const { container } = started();
       sendTable();
@@ -2902,7 +2917,7 @@ describe("the leader", () => {
    *  the `a`/`d` text for every cancelled key, card or no card (`TypingGuard.defer`'s
    *  `cancelledFlash`). */
   it('"Looks good" at 80 ms a key posts no tab_verb, and the band names L, not a / d', () => {
-    vi.useFakeTimers();
+    fakeClock();
     const widen = stubBandWidth();
     try {
       const { container } = started();
@@ -2931,7 +2946,7 @@ describe("the leader", () => {
    *  refuses at once and says so with its own message: `k` (an ordinary move) then `L` within the
    *  window. */
   it("k then L at 80 ms a key: L refuses at once, and the band names it", () => {
-    vi.useFakeTimers();
+    fakeClock();
     const widen = stubBandWidth();
     try {
       const { container } = started();
@@ -2953,7 +2968,7 @@ describe("the leader", () => {
   /** The same key alone after a pause still works: a real deliberate `L`, nothing else typed near
    *  it, runs `TYPING_GUARD_MS` later exactly as the fixed test above already pins for `H`. */
   it("a lone L still posts tab_verb next, just TYPING_GUARD_MS later", () => {
-    vi.useFakeTimers();
+    fakeClock();
     try {
       const { container } = started();
       sendTable();
@@ -2975,7 +2990,7 @@ describe("the leader", () => {
    *  Replacing the table must cancel both so neither can execute a stale binding
    *  after the wait. */
   it("a table replaced mid-guard-window drops the deferred L binding entirely", () => {
-    vi.useFakeTimers();
+    fakeClock();
     try {
       const { container } = started();
       sendTable();
@@ -2997,7 +3012,7 @@ describe("the leader", () => {
    *  run of motion keys does not exempt them. `mayActAfterMotion` cannot protect a first key
    *  because no motion run precedes it. */
   it("k k then H at 80 ms a key still defers (no motion-run exception, unlike the leader)", () => {
-    vi.useFakeTimers();
+    fakeClock();
     try {
       const { container } = started();
       sendTable();
@@ -3080,7 +3095,7 @@ describe("the leader", () => {
   });
 
   it("Space with the Approve button focused starts no sequence, and no longer activates it", () => {
-    vi.useFakeTimers();
+    fakeClock();
     try {
       const { container } = started();
       sendTable();
@@ -3104,7 +3119,7 @@ describe("the leader", () => {
   });
 
   it("a composing Space starts nothing", () => {
-    vi.useFakeTimers();
+    fakeClock();
     try {
       const { container } = started();
       sendTable();
@@ -3120,7 +3135,7 @@ describe("the leader", () => {
   });
 
   it("a new keymap envelope cancels a pending sequence", () => {
-    vi.useFakeTimers();
+    fakeClock();
     try {
       const { container } = started();
       sendTable();
@@ -3139,7 +3154,7 @@ describe("the leader", () => {
   });
 
   it("an ambiguous node runs at timeoutlen with no key", () => {
-    vi.useFakeTimers();
+    fakeClock();
     try {
       const { container } = started();
       const ambiguous: PanelTable = { ...TABLE, bindings: [...TABLE.bindings, binding(["<leader>", "b"], "tab.next")] };
@@ -3158,7 +3173,7 @@ describe("the leader", () => {
   });
 
   it("with timeout: false, an ambiguous node never runs on its own", () => {
-    vi.useFakeTimers();
+    fakeClock();
     try {
       const { container } = started();
       const noTimeout: PanelTable = {
@@ -3212,7 +3227,7 @@ describe("the leader", () => {
     ["confirm_close", { kind: "confirm_close", tab: 1, lines: ["close 1? (y/n)"] }],
     ["confirm_close_others", { kind: "confirm_close_others", tabs: [2], lines: ["close 1 other tab? (y/n)"] }],
   ])("%s cancels a pending sequence", (_name, envelope) => {
-    vi.useFakeTimers();
+    fakeClock();
     try {
       const { container } = started();
       sendTable();
@@ -3258,7 +3273,7 @@ describe("the leader", () => {
     // Fake time, and a pause before each leader: the leader starts a sequence only on a key that
     // stands alone (`TypingGuard.mayActAfterMotion`), and three sequences fired
     // back to back in real time would read as typing.
-    vi.useFakeTimers();
+    fakeClock();
     try {
       const pause = () => act(() => vi.advanceTimersByTime(300));
       const { container } = started();
@@ -3291,7 +3306,7 @@ describe("the leader", () => {
   });
 
   it("handoff flashes in codex tab", () => {
-    vi.useFakeTimers();
+    fakeClock();
     try {
       const pause = () => act(() => vi.advanceTimersByTime(300));
       const widen = stubBandWidth();
@@ -3329,7 +3344,7 @@ describe("typing never answers a card", () => {
   const ELSEWHERE = "a / d answer the card under the cursor — j / k onto it, then a / d";
   let widen: (container: HTMLElement) => void;
   beforeEach(() => {
-    vi.useFakeTimers();
+    fakeClock();
     widen = stubBandWidth();
   });
   afterEach(() => {
@@ -5068,7 +5083,7 @@ describe("App keyboard: every control is reachable with hjkl", () => {
 
   // `a`/`d` answer after the typing guard's wait, and only when nothing came near them.
   it("a on the tool call answers the card that gates it, without moving onto the card", () => {
-    vi.useFakeTimers();
+    fakeClock();
     try {
       const { container } = withACardAndStop();
       press("a");
@@ -5110,7 +5125,7 @@ describe("App keyboard: every control is reachable with hjkl", () => {
    *  (INPUT), the CLI's own prompt arrived, Esc, then one `j` lands on the tool call -- and `a` there
    *  answers the provider prompt that names that call, by its own permission id. */
   it("Esc, j onto the tool call, a: answers the CLI's own prompt for that call", () => {
-    vi.useFakeTimers();
+    fakeClock();
     try {
       const { container } = withAProviderPromptAndStop();
       press("i");
@@ -5128,7 +5143,7 @@ describe("App keyboard: every control is reachable with hjkl", () => {
   });
 
   it("d on the tool call denies the CLI's own prompt for that call, and only that one", () => {
-    vi.useFakeTimers();
+    fakeClock();
     try {
       const { container } = withAProviderPromptAndStop();
       press("i");
@@ -5147,7 +5162,7 @@ describe("App keyboard: every control is reachable with hjkl", () => {
   /** A prompt that names another call is not this call's card: `a` on the tool row of `toolu_1` must
    *  not answer the one waiting on `toolu_2`, however near it sits. */
   it("a on a tool call does not answer a provider prompt that names a different call", () => {
-    vi.useFakeTimers();
+    fakeClock();
     try {
       const rendered = started({ capabilities: { ...initialState().capabilities, interrupt: true } });
       events(
@@ -5175,7 +5190,7 @@ describe("App keyboard: every control is reachable with hjkl", () => {
   });
 
   it("d on the card itself denies it", () => {
-    vi.useFakeTimers();
+    fakeClock();
     try {
       withACardAndStop();
       press("j");
@@ -5209,7 +5224,7 @@ describe("App keyboard: every control is reachable with hjkl", () => {
   });
 
   it("i dims the row cursor while the composer has the keys, and Esc brightens it again", () => {
-    vi.useFakeTimers();
+    fakeClock();
     try {
       const { container } = withACardAndStop();
       dispatch({ kind: "pane_focus", focused: true });
@@ -5237,7 +5252,7 @@ describe("App keyboard: every control is reachable with hjkl", () => {
   });
 
   it("does not answer a card from Stop, where the row cursor is not what the keys act on", () => {
-    vi.useFakeTimers();
+    fakeClock();
     try {
       withACardAndStop();
       press("j");
@@ -5346,7 +5361,7 @@ describe("App global HINT: the panel's half", () => {
     // `f` is always the first key of whatever typed it, so it defers the same
     // `TYPING_GUARD_MS` `a`/`d` do rather than asking `shell` at once -- a lone `f` still asks, just
     // that much later.
-    vi.useFakeTimers();
+    fakeClock();
     try {
       const { container } = conversation();
       press("f");
@@ -5372,7 +5387,7 @@ describe("App global HINT: the panel's half", () => {
    *  ever posts, and the band says so in `f`'s own words, not the `a`/`d` text it used to show with
    *  no card anywhere. */
   it('"fix this" at 80 ms a key asks shell for no HINT, and the band names f, not a / d', () => {
-    vi.useFakeTimers();
+    fakeClock();
     const widen = stubBandWidth();
     try {
       const { container } = conversation();
@@ -5399,7 +5414,7 @@ describe("App global HINT: the panel's half", () => {
    *  refuses at once and says so with its own message: `j` (an ordinary move) then `f` within the
    *  window. */
   it("j then f at 80 ms a key: f refuses at once, and the band names it", () => {
-    vi.useFakeTimers();
+    fakeClock();
     const widen = stubBandWidth();
     try {
       const { container } = conversation();
@@ -5440,7 +5455,7 @@ describe("App global HINT: the panel's half", () => {
     });
 
     it("i does not open the composer, j does not move, a second f asks nothing", () => {
-      vi.useFakeTimers();
+      fakeClock();
       try {
         const { container } = onTheCard();
         // The first `f` stands alone and is left to run after its typing guard
@@ -5459,7 +5474,7 @@ describe("App global HINT: the panel's half", () => {
     });
 
     it("once the HINT it asked for has ended, the keys are the panel's again", () => {
-      vi.useFakeTimers();
+      fakeClock();
       try {
         const { container } = onTheCard();
         press("f");
@@ -5477,7 +5492,7 @@ describe("App global HINT: the panel's half", () => {
     });
 
     it("a shell that never answers costs a second of dead keys, not a stuck panel", () => {
-      vi.useFakeTimers();
+      fakeClock();
       try {
         const { container } = onTheCard();
         press("f");
@@ -5652,7 +5667,7 @@ describe("App global HINT: the panel's half", () => {
     // (called unconditionally, ahead of the mode check, this file's own doc comment) even though
     // the mode gate swallows it, so the SECOND `f` below needs a real gap behind it too, or the
     // guard reads it as arriving too soon after the first -- the thing it exists to catch.
-    vi.useFakeTimers();
+    fakeClock();
     try {
       const { container } = render(<App />);
       dispatch({ kind: "hello", ...HELLO });
@@ -5739,7 +5754,7 @@ describe("App global HINT: the panel's half", () => {
   /* A HINT landing is a landing -- the Enter right after it presses the button,
      `TYPING_GUARD_MS` later, as `l` then Enter does. A key in between makes it none. */
   it("a HINT landing on Approve, then Enter, approves after the typing guard's wait", () => {
-    vi.useFakeTimers();
+    fakeClock();
     try {
       conversation();
       show(1, collect(1));
@@ -5754,7 +5769,7 @@ describe("App global HINT: the panel's half", () => {
     }
   });
   it("a HINT landing on Approve, then x, then Enter, presses nothing", () => {
-    vi.useFakeTimers();
+    fakeClock();
     try {
       conversation();
       show(1, collect(1));
@@ -5853,7 +5868,7 @@ describe("App global HINT: the panel's half", () => {
     });
 
     it("a landed link is not a card button: Enter on it answers nothing, however long after", () => {
-      vi.useFakeTimers();
+      fakeClock();
       try {
         const { at } = withLink();
         show(1, collect(1));
@@ -7748,7 +7763,7 @@ describe("App refused commands", () => {
      panel needs before a later tab switch can bring it back (`shell::tabs::set_draft` keeps
      whatever it is told regardless of how the send that produced it was refused). */
   it("mirrors a restored refused send back to Rust when the box was left untouched", () => {
-    vi.useFakeTimers();
+    fakeClock();
     try {
       const { container } = startedApp();
       const box = container.querySelector("textarea")!;
@@ -7769,7 +7784,7 @@ describe("App refused commands", () => {
      destroyed by the refused text coming back -- the refused text goes BEFORE what was typed,
      separated by a newline, and the combined text is what reaches Rust. */
   it("keeps text typed while a send was refused, with the refused text placed before it", () => {
-    vi.useFakeTimers();
+    fakeClock();
     try {
       const { container } = startedApp();
       const box = container.querySelector("textarea")!;
@@ -7794,7 +7809,7 @@ describe("App refused commands", () => {
      own still replaces the box. Here Rust's copy is longer than the box (text deleted after it was mirrored),
      so no rule about prefixes of the box could tell it apart: only the refusal it names does. */
   it("keeps text typed since a refused send when Rust's draft echo of it trails the box", () => {
-    vi.useFakeTimers();
+    fakeClock();
     try {
       const { container } = startedApp();
       const box = container.querySelector("textarea")!;
@@ -7819,7 +7834,7 @@ describe("App refused commands", () => {
      sends on its own right after it (a scratch-editor return) is applied, even one that starts with the
      refused message. */
   it("applies a draft Rust sends on its own right after a refused send that names no refusal", () => {
-    vi.useFakeTimers();
+    fakeClock();
     try {
       const { container } = startedApp();
       const box = container.querySelector("textarea")!;
@@ -7838,7 +7853,7 @@ describe("App refused commands", () => {
   /* The echo is skipped only within `REFUSED_ECHO_MS` of its refusal, measured on the page's clock even when no
      timer has run (the mirror's timer, which also forgets it, can be held up). */
   it("applies an echo of a refused send that comes later than REFUSED_ECHO_MS", () => {
-    vi.useFakeTimers();
+    fakeClock();
     const now = vi.spyOn(performance, "now");
     try {
       const { container } = startedApp();
@@ -7867,7 +7882,7 @@ describe("App refused commands", () => {
   });
 
   it("keeps an edit made in place since a refused send, which Rust's stale copy would overwrite", () => {
-    vi.useFakeTimers();
+    fakeClock();
     try {
       const { container } = startedApp();
       const box = container.querySelector("textarea")!;
@@ -7886,7 +7901,7 @@ describe("App refused commands", () => {
   });
 
   it("applies a draft Rust sends on its own, even one that is the start of unmirrored text", () => {
-    vi.useFakeTimers();
+    fakeClock();
     try {
       const { container } = startedApp();
       const box = container.querySelector("textarea")!;
@@ -7911,7 +7926,7 @@ describe("App refused commands", () => {
      same restore code as send_message -- this is the probe's own second case, unchanged-since-send
      on that path. */
   it("mirrors a restored refused queue_message back to Rust", () => {
-    vi.useFakeTimers();
+    fakeClock();
     try {
       const { container } = runningApp();
       const box = container.querySelector("textarea")!;
@@ -7936,7 +7951,7 @@ describe("App refused commands", () => {
      each tab's draft from Rust" test), never the actual race where `flushDraft` in the `tabs`
      handler is what has to deliver the recovered text on a switch nobody waited out. */
   it("shows the recovered text again after switching tabs and back", () => {
-    vi.useFakeTimers();
+    fakeClock();
     try {
       const { container } = startedApp();
       const box = container.querySelector("textarea")!;
@@ -7974,7 +7989,7 @@ describe("App refused commands", () => {
      text reached neither the box nor Rust. Fixed by flushing the pending mirror before `reset_tab`,
      the same way a real tab switch already does. */
   it("flushes a still-pending recovered draft before reset_tab, so a restart cannot erase it", () => {
-    vi.useFakeTimers();
+    fakeClock();
     try {
       const { container } = startedApp();
       const box = container.querySelector("textarea")!;
@@ -8010,7 +8025,7 @@ describe("App refused commands", () => {
      follows at once), so what was typed in the last debounce window has to reach Rust now, not when
      the timer fires on a page that no longer shows the tab. */
   it("pane_focus false posts the pending draft at once", () => {
-    vi.useFakeTimers();
+    fakeClock();
     try {
       const { container } = startedApp();
       const box = container.querySelector("textarea")!;
@@ -8029,7 +8044,7 @@ describe("App refused commands", () => {
   /* After a join or a break-out, the page the tab left can post its last mirror after the tab's new page was
      given Rust's older copy; Rust offers it on, marked late. It must not wipe what was typed here since. */
   it("a late draft replaces the box only while the box still holds the copy Rust gave it", () => {
-    vi.useFakeTimers();
+    fakeClock();
     try {
       const { container } = startedApp();
       const box = container.querySelector("textarea")!;
@@ -8755,7 +8770,7 @@ describe("the tab bar", () => {
   });
 
   it("mirrors the draft to Rust 300ms after the last change, and at once when the tab is left", () => {
-    vi.useFakeTimers();
+    fakeClock();
     try {
       const { container } = render(<App />);
       dispatch({ kind: "hello", ...HELLO });
@@ -8914,7 +8929,7 @@ describe("the band's message, queue and prompt lines", () => {
    *  case that still flashes rather than posting is a tab that has already ENDED and is not already
    *  in bypass, which can never be asked to ENTER bypass, only leave it. */
   it("flashes that the mode is fixed once a session has ended, and never offers a cycle into bypass", () => {
-    vi.useFakeTimers();
+    fakeClock();
     const widen = stubBandWidth();
     try {
       const { container } = render(<App />);
@@ -9014,7 +9029,7 @@ describe("the keys land on a card that waits", () => {
      `a` acts on the cursor's card only. The flash it shows instead is `v1: typing never answers a
      card`'s. The wait is long enough that the typing guard is not what refuses it. */
   it("a from another row does not answer the only card", () => {
-    vi.useFakeTimers();
+    fakeClock();
     try {
       const { container } = oneCard();
       const root = container.querySelector(".agent-ui-conversation")!;
@@ -9671,7 +9686,7 @@ describe("copying with y and Y, and answering through the card, in the conversat
   }
 
   it("y copies the command and flashes the row; Y copies the output", () => {
-    vi.useFakeTimers();
+    fakeClock();
     const widen = stubBandWidth();
     try {
       const clipboard = stubClipboard();
@@ -9707,7 +9722,7 @@ describe("copying with y and Y, and answering through the card, in the conversat
 
   it("D puts the keys in the card's reason box; Enter there denies with the reason", () => {
     // `D` acts on the cursor's card only, after the wait.
-    vi.useFakeTimers();
+    fakeClock();
     try {
       const { container } = withBash();
       const root = container.querySelector(".agent-ui-conversation")!;
@@ -10914,7 +10929,7 @@ describe("Shift+Tab anywhere in the chat", () => {
     dispatch({ kind: "keymap", prefix: "Ctrl+b", window: [], prefixKeys: [], panel: TABLE, newTabChord: "Ctrl+b c" });
     const root = container.querySelector(".agent-ui-conversation")!;
     act(() => (root as HTMLElement).focus());
-    vi.useFakeTimers();
+    fakeClock();
     try {
       fireEvent.keyDown(root, { key: " " });
       act(() => vi.advanceTimersByTime(WHICH_KEY_DELAY_MS));
@@ -11030,7 +11045,7 @@ describe("the empty tab: every cancel route drops its waiting prefix and leader"
     expect(composer(container)).not.toBeNull();
   });
   it("Space, then Shift+Tab, then m never reaches <leader>m", () => {
-    vi.useFakeTimers();
+    fakeClock();
     try {
       const { container } = emptyInBrowse();
       dispatch({ kind: "keymap", prefix: "Ctrl+b", window: [], prefixKeys: [], panel: TABLE, newTabChord: "Ctrl+b c" });
@@ -11091,12 +11106,6 @@ describe("the empty tab: every cancel route drops its waiting prefix and leader"
  *  `now`/`openedAt`/`lastKeyAt` combination) is `modeKey.test.ts`'s; this file wires it through a
  *  real `App` render, a real `confirm_bypass` envelope and real keydowns. */
 describe("entering bypass asks first", () => {
-  /** Fakes `performance.now()` alongside the timer functions -- plain `vi.useFakeTimers()` leaves
-   *  `performance.now()` real (confirmed empirically), and `App.tsx`'s guard reads the clock through
-   *  nothing else. */
-  function fakeClock() {
-    vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout", "setInterval", "clearInterval", "Date", "performance"] });
-  }
   function dispatchBypassConfirm(
     over: Partial<{ tab: number | null; scope: "tab" | "default"; nonce: number; lines: string[] }> = {},
   ) {
@@ -11248,7 +11257,7 @@ describe("entering bypass asks first", () => {
     const { container, root } = liveConversation();
     dispatch({ kind: "keymap", prefix: "Ctrl+b", window: [], prefixKeys: [], panel: TABLE, newTabChord: "Ctrl+b c" });
     act(() => (root as HTMLElement).focus());
-    vi.useFakeTimers();
+    fakeClock();
     try {
       fireEvent.keyDown(root, { key: " " });
       act(() => vi.advanceTimersByTime(WHICH_KEY_DELAY_MS));
@@ -11601,9 +11610,6 @@ describe("entering bypass asks first", () => {
  *  answered a prompt, a held `y` counted, the chooser's `y` was handled twice, and the chooser's own
  *  inputs kept Enter/Escape from the prompt. */
 describe("the prompt and the chooser take the keys whole", () => {
-  function fakeClock() {
-    vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout", "setInterval", "clearInterval", "Date", "performance"] });
-  }
   afterEach(() => {
     vi.useRealTimers();
     vi.unstubAllGlobals();
@@ -12023,7 +12029,7 @@ describe("nav_key and its fallthrough", () => {
   // pending `g`/`z`/`[`/`]` prefix or leader sequence. Without that here, `g`, Ctrl+j, a draft,
   // Ctrl+k left the box drawn over the composer and one later `g` completed the stale `gg`.
   it("a claimed nav_key cancels a pending g prefix and hides its box", () => {
-    vi.useFakeTimers();
+    fakeClock();
     try {
       const { container } = render(<App />);
       dispatch({ kind: "hello", ...HELLO });
@@ -12051,7 +12057,7 @@ describe("nav_key and its fallthrough", () => {
   });
 
   it("a claimed nav_key cancels a pending leader sequence", () => {
-    vi.useFakeTimers();
+    fakeClock();
     try {
       const { container } = startedApp();
       dispatch({ kind: "keymap", prefix: "Ctrl+b", window: [], prefixKeys: [], panel: TABLE, newTabChord: "Ctrl+b c" });
@@ -12240,7 +12246,7 @@ describe("o/A and the caret, j at the end, Esc while running", () => {
   /* Holding `j` to the bottom never flashed -- every step after the
      first is a repeat. The first repeat that stops after moving now flashes; the ones after it do not. */
   it("a held j that reaches the last stop by repeat flashes once", () => {
-    vi.useFakeTimers();
+    fakeClock();
     const widen = stubBandWidth();
     try {
       const { container } = render(<App />);
@@ -12530,7 +12536,7 @@ describe("BROWSE visual mode", () => {
   });
 
   it("v then a, d and Shift+D answer no card in CARET, and v v in VISUAL -- the region, not BROWSE, owns those keys", () => {
-    vi.useFakeTimers();
+    fakeClock();
     try {
       const { root } = startedOnPromptRow();
       // The cursor must be ON the card for this test to prove anything:
@@ -12568,7 +12574,7 @@ describe("BROWSE visual mode", () => {
   });
 
   it("control for the test above: from the SAME permission row, in ordinary BROWSE (no VISUAL), a lone a DOES answer -- proving the row is a real card, not vacuous setup", () => {
-    vi.useFakeTimers();
+    fakeClock();
     try {
       const { root } = startedOnPromptRow();
       fireEvent.keyDown(root, { key: "j" });
@@ -12663,7 +12669,7 @@ describe("BROWSE visual mode", () => {
   });
 
   it("any other unbound key ends CARET and says so, never its BROWSE meaning", () => {
-    vi.useFakeTimers();
+    fakeClock();
     try {
       const { container, root } = startedOnPromptRow();
       fireEvent.keyDown(root, { key: "v" });
@@ -12678,7 +12684,7 @@ describe("BROWSE visual mode", () => {
   });
 
   it("any other unbound key ends VISUAL (the whole region) and says so, never its BROWSE meaning", () => {
-    vi.useFakeTimers();
+    fakeClock();
     try {
       const { container, root } = startedOnPromptRow();
       fireEvent.keyDown(root, { key: "v" });
@@ -12746,7 +12752,7 @@ describe("BROWSE visual mode", () => {
   });
 
   it("a leader on v means v starts the leader, and V then v reaches VISUAL", () => {
-    vi.useFakeTimers();
+    fakeClock();
     try {
       const { container, root } = startedOnPromptRow();
       // `binding` (testFixtures.ts): builds a `PanelTable` entry the `keymap` envelope carries.
@@ -12786,7 +12792,7 @@ describe("BROWSE visual mode", () => {
   });
 
   it("a plain (non-leader) panel binding on V wins over VISUAL entry too -- the rule is not leader-only", () => {
-    vi.useFakeTimers();
+    fakeClock();
     try {
       const { container, root } = startedOnPromptRow();
       dispatch({
@@ -12937,7 +12943,7 @@ describe("BROWSE visual mode", () => {
   });
 
   it("a session ending during VISUAL, then a tab switch to a DIFFERENT card, does not let a stale frozen card's key answer the new tab's card", () => {
-    vi.useFakeTimers();
+    fakeClock();
     try {
       const { container, root } = startedOnPromptRow();
       fireEvent.keyDown(root, { key: "j" }); // onto tab 1's own "rm build" card
@@ -12955,7 +12961,6 @@ describe("BROWSE visual mode", () => {
         events: [{ type: "session_closed", reason: "provider exited" }],
       });
       expect(container.querySelector('[data-testid="mode-block"]')?.getAttribute("data-mode")).toBe("browse");
-      act(() => vi.advanceTimersByTime(TYPING_GUARD_MS + 10));
       // A second tab, with its own DIFFERENT, dangerous card.
       dispatch({
         kind: "tabs",
@@ -12978,6 +12983,8 @@ describe("BROWSE visual mode", () => {
       // substring of "rm -rf build".)
       expect(container.textContent).toContain("rm -rf build");
       expect(container.textContent).not.toContain("rm build");
+      // The pause belongs after the arrival, which counts as a key of its own.
+      act(() => vi.advanceTimersByTime(TYPING_GUARD_MS + 10));
       const liveRoot = container.querySelector(".agent-ui-conversation")! as HTMLElement;
       fireEvent.keyDown(liveRoot, { key: "a" });
       act(() => vi.advanceTimersByTime(TYPING_GUARD_MS + 10));
@@ -13217,7 +13224,7 @@ describe("BROWSE visual mode", () => {
      the key that ENDED VISUAL looks alone: "ver" then `d` -- prose after a stray `v`, the
      "verify" example -- denied the card. The reviewer's probe, kept as the test. */
   it("the keys VISUAL takes count as typing -- a d right after the key that ended VISUAL answers no card", () => {
-    vi.useFakeTimers();
+    fakeClock();
     try {
       const { container, root } = startedOnPromptRow();
       fireEvent.keyDown(root, { key: "j" });
@@ -13558,7 +13565,7 @@ describe("BROWSE visual mode", () => {
   });
 
   it("> quotes the selection into the draft and enters INPUT with the caret at the end; a second quote appends below", () => {
-    vi.useFakeTimers();
+    fakeClock();
     try {
       const { container, root } = startedOnPromptRow();
       fireEvent.keyDown(root, { key: "v" }); // CARET
@@ -13606,7 +13613,7 @@ describe("BROWSE visual mode", () => {
   // permission row (nothing else moves the BROWSE cursor during the region); the fix must move it to
   // the prompt row instead.
   it("> moves the row cursor to the selection's start row, not wherever BROWSE was when the region started", () => {
-    vi.useFakeTimers();
+    fakeClock();
     try {
       const { container, root } = startedOnPromptRow();
       fireEvent.keyDown(root, { key: "j" }); // BROWSE: down onto the permission row (the list's last)
@@ -13864,7 +13871,7 @@ describe("BROWSE visual mode", () => {
    *  Fixed: a dedicated in-flight kind (`"picker-send"`) whose refusal is a footer flash alone --
    *  the draft (whatever it holds) is left exactly as the user last set it. */
   it("a refused picker choice flashes and leaves an already-quoted draft untouched", () => {
-    vi.useFakeTimers();
+    fakeClock();
     try {
       const MODEL_REPLY =
         "Current model: `Haiku 4.5` (effort: high)\n" +
@@ -14096,7 +14103,7 @@ describe("r on a failed empty tab", () => {
   });
 
   it("a key replayed off <body> on the empty layout reaches the empty tab (a Dismiss that removed its own banner)", () => {
-    vi.useFakeTimers();
+    fakeClock();
     try {
       const { container } = render(<App />);
       dispatch({ kind: "hello", ...HELLO });
@@ -14154,7 +14161,7 @@ describe("r on a failed empty tab", () => {
   });
 
   it("r twice on a failed tab resets once per press, and the reset dashboard's own r does not resume by accident", () => {
-    vi.useFakeTimers();
+    fakeClock();
     try {
       const resumable: Hello = {
         ...HELLO,
@@ -14684,7 +14691,7 @@ describe("j reaches the box from the last stop", () => {
   const HINT = "i or Ctrl+j to type";
   let widen: (container: HTMLElement) => void;
   beforeEach(() => {
-    vi.useFakeTimers();
+    fakeClock();
     widen = stubBandWidth();
   });
   afterEach(() => {
@@ -14868,7 +14875,7 @@ describe("typing in BROWSE never starts INPUT mid-word", () => {
   const HINT = "i or Ctrl+j to type";
   let widen: (container: HTMLElement) => void;
   beforeEach(() => {
-    vi.useFakeTimers();
+    fakeClock();
     widen = stubBandWidth();
   });
   afterEach(() => {
@@ -15076,7 +15083,7 @@ describe("typing in BROWSE never starts INPUT mid-word", () => {
 describe("prefix : opens the panel's command line", () => {
   let widen: (container: HTMLElement) => void;
   beforeEach(() => {
-    vi.useFakeTimers();
+    fakeClock();
     widen = stubBandWidth();
   });
   afterEach(() => {
@@ -15321,7 +15328,7 @@ describe("prefix : opens the panel's command line", () => {
 describe("a route that hands the keys elsewhere ends every pending y/n prompt and a gf picker", () => {
   let widen: (container: HTMLElement) => void;
   beforeEach(() => {
-    vi.useFakeTimers();
+    fakeClock();
     widen = stubBandWidth();
   });
   afterEach(() => {
@@ -15467,10 +15474,6 @@ describe("restoring the last session's tabs", () => {
   const OFFER = { labels: ["api", "docs"], bypass: 1 };
   const SIDECAR_HELLO: Hello = { ...HELLO, backend: "sidecar", restore: OFFER };
 
-  /** A fake clock for the on-screen wait a bypass `y` needs, as the bypass prompt's own tests use. */
-  function fakeClock() {
-    vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout", "setInterval", "clearInterval", "Date", "performance"] });
-  }
 
   function emptyTabWithOffer(hello: Hello = SIDECAR_HELLO, options: { browse?: boolean } = {}) {
     const widen = stubBandWidth();
@@ -15483,7 +15486,7 @@ describe("restoring the last session's tabs", () => {
   }
 
   it("draws the line and `s` asks Rust for the tabs, naming the tab it was pressed in", () => {
-    vi.useFakeTimers();
+    fakeClock();
     try {
       const { container, root } = emptyTabWithOffer();
       const row = Array.from(container.querySelectorAll<HTMLElement>(".dash-item")).find((el) => el.textContent?.includes("Restore"))!;
@@ -15497,7 +15500,7 @@ describe("restoring the last session's tabs", () => {
   });
 
   it("draws no line, and `s` does nothing, once Rust stops offering", () => {
-    vi.useFakeTimers();
+    fakeClock();
     try {
       const { container, root } = emptyTabWithOffer();
       dispatch({ kind: "hello", ...SIDECAR_HELLO, restore: null });
@@ -15733,7 +15736,7 @@ it("draws an unread prompt once above activity and keeps the running hint while 
 });
 
 it("flashes a notification's plain text in the band without adding a row, then expires it", () => {
-  vi.useFakeTimers();
+  fakeClock();
   const widen = stubBandWidth();
   try {
     const { container } = render(<App />);
@@ -15812,7 +15815,7 @@ it("shows retry and rate warnings and the reported fallback model in the band", 
 describe("a broker card in the page", () => {
   let widen: (container: HTMLElement) => void;
   beforeEach(() => {
-    vi.useFakeTimers();
+    fakeClock();
     widen = stubBandWidth();
   });
   afterEach(() => {

@@ -21,7 +21,7 @@ use std::time::{Duration, Instant};
 use eitri_core::agents::{new_instance, ProjectRef, Publisher, Row, WindowRef};
 use eitri_core::lua::config::{RemoteListen, RemoteSettings};
 use eitri_core::remote_devices::{DeviceStore, Grant};
-use eitri_core::remote_pairing::{Endpoint, PairMode};
+use eitri_core::remote_pairing::{Endpoint, PairMode, PairScheme, PairingRoutes};
 use eitri_core::remote_runtime::{start_serve, RemotePlan, ServeConfig, Spawner};
 use eitri_core::remote_rv::{rv_socket_path, serve_socket_path};
 use eitri_core::tab_set::RowKey;
@@ -277,14 +277,30 @@ fn run_while(mut command: Command, mut each: impl FnMut() -> Result<(), String>)
 
 /// `eitri remote add-device Pixel` while `window` turns: the code its page was shown.
 fn add_device(shell: &str, home: &Home, window: &Window) -> Result<String, String> {
+    add_device_by(
+        shell,
+        home,
+        window,
+        &[],
+        "Pixel will connect directly to 127.0.0.1:41000 (http).",
+    )
+}
+
+/// `eitri remote add-device <flags> Pixel` while `window` turns, which says `endpoint`: the code its page was shown.
+fn add_device_by(shell: &str, home: &Home, window: &Window, flags: &[&str], endpoint: &str) -> Result<String, String> {
     let before = window.envelopes("remote_pairing").len();
-    let added = run_while(home.remote(shell, &["add-device", "Pixel"]), || {
+    let args: Vec<&str> = std::iter::once("add-device")
+        .chain(flags.iter().copied())
+        .chain(["Pixel"])
+        .collect();
+    let added = run_while(home.remote(shell, &args), || {
         window.turn();
         Ok(())
     })?;
-    check(added.code == Some(0) && added.stdout.contains("Scan the code"), || {
-        format!("add-device: {}", added.says())
-    })?;
+    check(
+        added.code == Some(0) && added.stdout.contains("Scan the code") && added.stdout.contains(endpoint),
+        || format!("add-device: {}", added.says()),
+    )?;
     let shown = window.asked("remote_pairing", before)?;
     shown["code"]
         .as_str()
@@ -400,13 +416,22 @@ impl Window {
                 window.handle.remote_waker(),
             )
             .map_err(|e| format!("the rv- socket did not bind: {e}"))?;
-            // A phone reaches this window's `serve` directly here, as it does a confirmed address, so its grant may
-            // steer; the listener itself is the home's Unix socket.
+            // A phone reaches this window's `serve` directly by default here, as it does a confirmed address, so its
+            // grant may steer; the listener itself is the home's Unix socket. `--ssh` takes the SSH route.
             socket.set_pairing(Pairing {
-                endpoint: Endpoint {
-                    mode: PairMode::Direct,
-                    host: "127.0.0.1".into(),
-                    port: 41000,
+                routes: PairingRoutes {
+                    ssh: Some(Endpoint {
+                        mode: PairMode::Ssh,
+                        scheme: PairScheme::Http,
+                        host: "127.0.0.1".into(),
+                        port: 41000,
+                    }),
+                    direct: Some(Endpoint {
+                        mode: PairMode::Direct,
+                        scheme: PairScheme::Http,
+                        host: "127.0.0.1".into(),
+                        port: 41000,
+                    }),
                 },
                 ssh_dir: dirs.state.clone(),
             });
@@ -730,7 +755,9 @@ fn enrolled(shell: &str, home: &Home, label: &str) -> Result<(Window, Tab, Strin
 
     let mut phone = Phone::connect(&dirs)?;
     phone.hello("", None);
-    phone.send(json!({ "kind": "enroll", "instance": window.instance, "code": code, "device_name": "Pixel" }));
+    phone.send(json!({
+        "kind": "enroll", "instance": window.instance, "code": code, "device_name": "Pixel", "recipe": "direct"
+    }));
     let asked = window.asked("remote_enroll", 0)?;
     check(asked["name"] == "Pixel", || format!("the desk was asked {asked}"))?;
     let nonce = asked["nonce"].as_u64().ok_or_else(|| format!("no nonce in {asked}"))?;
@@ -828,6 +855,26 @@ fn add_device_reaches_the_window_whatever_serve_listens_on(shell: &str, dir: &Pa
         home.until_running(shell).map_err(said)?;
         let code = add_device(shell, &home, &window).map_err(said)?;
         check(code.len() >= 16, || said(format!("the code shown is {code:?}")))?;
+        let shown = window.asked("remote_pairing", window.envelopes("remote_pairing").len() - 1)?;
+        check(
+            shown["uri"]
+                .as_str()
+                .is_some_and(|uri| uri.contains("&m=direct&s=http&")),
+            || said(format!("the pairing shown is {shown}")),
+        )?;
+        add_device_by(
+            shell,
+            &home,
+            &window,
+            &["--ssh"],
+            "Pixel will connect through SSH to 127.0.0.1:41000 on this desk.",
+        )
+        .map_err(said)?;
+        let shown = window.asked("remote_pairing", window.envelopes("remote_pairing").len() - 1)?;
+        check(
+            shown["uri"].as_str().is_some_and(|uri| uri.contains("&m=ssh&s=http&")),
+            || said(format!("the pairing shown is {shown}")),
+        )?;
         drop(window);
         let _ = run(home.remote(shell, &["stop"]));
     }

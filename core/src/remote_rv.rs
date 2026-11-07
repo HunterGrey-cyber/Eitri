@@ -20,6 +20,7 @@
 
 use crate::panel_control::euid;
 use crate::remote_devices::Grant;
+pub use crate::remote_pairing::PairMode;
 use crate::tab_set::{GoneWhy, ObserverFrame, RowKey, WorkMark};
 use agent::private_fs::{remove_if_same, FileIdentity};
 use serde::{Deserialize, Serialize};
@@ -191,16 +192,23 @@ pub enum RvInbound {
         generation: u64,
         before_turn: u64,
     },
-    /// A phone's enrollment with the one-time `code`, as `name`, reaching `serve` through `host` from `peer`.
+    /// A phone's enrollment with the one-time `code`, as `name`, reaching `serve` through `host` from `peer` (`unix`
+    /// for `serve`'s Unix socket), by the recipe the phone says it used.
     Enroll {
         v: u32,
         code: Secret,
         device_name: String,
         host: String,
         peer: String,
+        recipe: PairMode,
     },
-    /// `eitri remote add-device`: the window that has the focus starts an enrollment.
-    StartEnroll { v: u32 },
+    /// `eitri remote add-device`: the window that has the focus starts an enrollment, by `recipe` when it names one
+    /// (`--ssh`, `--direct`), else by the window's default.
+    StartEnroll {
+        v: u32,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        recipe: Option<PairMode>,
+    },
     /// `eitri remote grant`: the window asks its y/n before `device`'s grant becomes `grant`.
     GrantRequest { v: u32, device: String, grant: Grant },
     /// `remote.listen` names `addr`: the window asks its y/n before `serve` listens there.
@@ -465,6 +473,9 @@ pub enum RvOutbound {
     Enrolled { v: u32, device: String, token: Secret },
     /// The enrollment was turned down, or the desk said no.
     EnrollRefused { v: u32, why: String },
+    /// The answer to `start_enroll`: the window shows a code whose phone pairs by `recipe` and dials `target`
+    /// ([`crate::remote_pairing::Endpoint::describe`]).
+    EnrollShown { v: u32, recipe: PairMode, target: String },
     /// The desk's answer about listening on `addr`.
     ListenAnswer { v: u32, addr: String, yes: bool },
 }
@@ -1064,8 +1075,9 @@ mod tests {
         let lines = [
             r#"{"v":1,"kind":"ping"}"#,
             r#"{"v":1,"kind":"more","key":"k-1","generation":2,"before_turn":40}"#,
-            r#"{"v":1,"kind":"enroll","code":"c0de","device_name":"Pixel","host":"127.0.0.1:7341","peer":"127.0.0.1:5000"}"#,
+            r#"{"v":1,"kind":"enroll","code":"c0de","device_name":"Pixel","host":"127.0.0.1:7341","peer":"127.0.0.1:5000","recipe":"ssh"}"#,
             r#"{"v":1,"kind":"start_enroll"}"#,
+            r#"{"v":1,"kind":"start_enroll","recipe":"direct"}"#,
             r#"{"v":1,"kind":"grant_request","device":"d1","grant":"watch+steer"}"#,
             r#"{"v":1,"kind":"listen_request","addr":"192.0.2.10:7341"}"#,
             r#"{"v":1,"kind":"revoke_self","device":"d1","token":"tok"}"#,

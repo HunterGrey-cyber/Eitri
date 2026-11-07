@@ -138,9 +138,9 @@ export function RemoteEnroll({
       {question?.kind === "remote_enroll" && (
         <div className="remote-question">
           <div>
-            Add device <Revealed pieces={revealHidden(question.name)} /> connecting through{" "}
-            <Revealed pieces={revealHidden(question.host)} /> from <Revealed pieces={revealHidden(question.peer)} />?
-            (y/n)
+            Add device <Revealed pieces={revealHidden(question.name)} />, paired {question.target}, connecting
+            through <Revealed pieces={revealHidden(question.host)} /> from{" "}
+            <Revealed pieces={revealHidden(question.peer)} />? (y/n)
           </div>
           <HiddenWarning count={hiddenCount(question.name)} what="device name" />
           <div className="remote-grant">

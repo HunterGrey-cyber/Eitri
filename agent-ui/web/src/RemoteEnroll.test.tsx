@@ -45,6 +45,8 @@ const ENROLL = {
   name: "Pixel",
   host: "127.0.0.1:7341",
   peer: "127.0.0.1:50122",
+  recipe: "direct",
+  target: "directly to desk.tail1.ts.net:443 (https)",
   grants: ["watch", "watch+steer"],
   grant: "watch",
   expiresInMs: 180_000,
@@ -57,10 +59,24 @@ describe("RemoteEnroll", () => {
     const { container } = render(<RemoteEnroll desk={desk} now={now} />);
     fromRust({ ...ENROLL, name: "Pixel‮9 ​desk" });
     const text = container.textContent ?? "";
-    expect(text).toContain("Add device Pixel⟨U+202E⟩9 ⟨U+200B⟩desk connecting through 127.0.0.1:7341 from 127.0.0.1:50122?");
+    expect(text).toContain(
+      "Add device Pixel⟨U+202E⟩9 ⟨U+200B⟩desk, paired directly to desk.tail1.ts.net:443 (https), connecting through 127.0.0.1:7341 from 127.0.0.1:50122?",
+    );
     expect(text).not.toContain("‮");
     expect(text).toContain("the device name holds 2 invisible or direction-changing characters");
     expect(container.querySelectorAll(".permission-card-escape").length).toBe(2);
+  });
+
+  it("names the recipe and where the code sends phones, and drops a question that names neither", () => {
+    const { container } = render(<RemoteEnroll desk={desk} now={now} />);
+    fromRust({ ...ENROLL, recipe: "ssh", target: "through SSH to 127.0.0.1:41000 on this desk", grants: ["watch"] });
+    expect(container.textContent).toContain("Add device Pixel, paired through SSH to 127.0.0.1:41000 on this desk, connecting through");
+    press("n");
+    expect(container.textContent).toBe("");
+    for (const bad of [{ recipe: undefined }, { recipe: "tor" }, { target: undefined }, { target: 7 }]) {
+      fromRust({ ...ENROLL, nonce: 9, ...bad });
+      expect(container.textContent).toBe("");
+    }
   });
 
   it("a y before the question is painted, or right after another key, answers nothing", () => {

@@ -63,7 +63,10 @@ pub(super) struct EnrollAsk {
     pub(super) name: String,
     pub(super) host: String,
     pub(super) peer: String,
+    /// The recipe of the code the phone presented, which the device is stored under.
     pub(super) mode: PairMode,
+    /// Where that code sends phones, as the desk is told it ([`eitri_core::remote_pairing::Endpoint::describe`]).
+    pub(super) target: String,
 }
 
 /// A named listen address as the desk is asked about it.
@@ -159,6 +162,8 @@ fn enroll_payload(nonce: u64, ask: &EnrollAsk, left: Duration) -> String {
         "name": ask.name,
         "host": ask.host,
         "peer": ask.peer,
+        "recipe": ask.mode.as_str(),
+        "target": ask.target,
         "grants": grants,
         "grant": grant_word(Grant::Watch),
     })
@@ -555,6 +560,7 @@ mod tests {
                         host: "127.0.0.1:7341".into(),
                         peer: "127.0.0.1:50122".into(),
                         mode,
+                        target: "directly to 127.0.0.1:7341 (http)".into(),
                     },
                     Instant::now(),
                     Box::new(move |r| sink.borrow_mut().push(r)),
@@ -783,6 +789,7 @@ mod tests {
                     host: "h".into(),
                     peer: "p".into(),
                     mode: PairMode::Direct,
+                    target: "directly to h:7341 (http)".into(),
                 },
                 Instant::now(),
                 Box::new(|_| {}),

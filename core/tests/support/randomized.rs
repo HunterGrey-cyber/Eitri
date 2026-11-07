@@ -84,7 +84,7 @@ pub const PHONE: &[&str] = &[
     r#"{"v":1,"seq":0,"ack":0,"kind":"more","key":"tab","generation":1,"before_turn":2}"#,
     r#"{"v":1,"seq":0,"ack":0,"kind":"act","key":"tab","cmd":{"kind":"send","text":"hello"}}"#,
     r#"{"v":1,"seq":0,"ack":0,"kind":"ping"}"#,
-    r#"{"v":1,"seq":0,"ack":0,"kind":"enroll","instance":"0123456789abcdef","code":"test","device_name":"phone"}"#,
+    r#"{"v":1,"seq":0,"ack":0,"kind":"enroll","instance":"0123456789abcdef","code":"test","device_name":"phone","recipe":"ssh"}"#,
     r#"{"v":1,"seq":0,"ack":0,"kind":"revoke_self"}"#,
     r#"{"v":1,"seq":0,"ack":0,"kind":"set_push_endpoint","url":"https://example.org/push"}"#,
 ];

@@ -10,7 +10,7 @@ pub const USAGE: &str = "usage: eitri remote <command>
   serve                       run the server phones connect to
   stop                        stop the server and close every phone
   status                      say whether the server runs, and how
-  add-device <name>           enroll a phone through the focused window
+  add-device [--ssh|--direct] <name>  enroll a phone through the focused window
   devices                     list the enrolled devices
   revoke <device>             take a device out
   grant <device> watch|steer  change what a device may do, after the window's yes
@@ -24,7 +24,7 @@ const COMMAND_USAGE: &[(&str, &str)] = &[
     ),
     ("stop", "eitri remote stop"),
     ("status", "eitri remote status"),
-    ("add-device", "eitri remote add-device <name>"),
+    ("add-device", "eitri remote add-device [--ssh | --direct] <name>"),
     ("devices", "eitri remote devices"),
     ("revoke", "eitri remote revoke <device>"),
     ("grant", "eitri remote grant <device> watch|steer"),
@@ -124,6 +124,8 @@ mod tests {
             // `add-device` would ask a window for an enrollment, `ssh-key add` read a file of that name.
             for words in [
                 vec!["add-device", help],
+                vec!["add-device", "--ssh", "Pixel", help],
+                vec!["add-device", help, "--direct", "Pixel"],
                 vec!["devices", help],
                 vec!["grant", help],
                 vec!["grant", "d1", help],
@@ -148,7 +150,7 @@ mod tests {
     fn each_command_has_its_usage_and_what_it_does() {
         assert_eq!(
             help(Some("add-device")),
-            "usage: eitri remote add-device <name>\n  enroll a phone through the focused window"
+            "usage: eitri remote add-device [--ssh | --direct] <name>\n  enroll a phone through the focused window"
         );
         assert!(
             help(Some("serve")).ends_with("\n  run the server phones connect to"),
@@ -168,6 +170,17 @@ mod tests {
     fn a_device_name_that_reads_as_an_option_is_refused() {
         for name in ["-x", "--name", "-"] {
             assert_eq!(cli::add_device(&args(&[name])), 2, "{name}");
+            assert_eq!(cli::add_device(&args(&["--ssh", name])), 2, "{name}");
+        }
+        // No name, two names, both recipes: refused before any socket is looked for.
+        for words in [
+            vec!["--ssh"],
+            vec!["--direct"],
+            vec!["Pixel", "Fold"],
+            vec!["--ssh", "--direct", "Pixel"],
+            vec!["Pixel", "--direct", "--ssh"],
+        ] {
+            assert_eq!(cli::add_device(&args(&words)), 2, "{words:?}");
         }
     }
 }

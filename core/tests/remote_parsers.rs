@@ -25,7 +25,7 @@ fn remote_rv_inbound_randomized() {
             r#"{"v":1,"kind":"act","device":"phone","token":"test","key":"tab","cmd":{}}"#,
             r#"{"v":1,"kind":"ping"}"#,
             r#"{"v":1,"kind":"more","key":"tab","generation":1,"before_turn":2}"#,
-            r#"{"v":1,"kind":"enroll","code":"test","device_name":"phone","host":"localhost","peer":"local"}"#,
+            r#"{"v":1,"kind":"enroll","code":"test","device_name":"phone","host":"localhost","peer":"local","recipe":"direct"}"#,
             r#"{"v":1,"kind":"start_enroll"}"#,
             r#"{"v":1,"kind":"grant_request","device":"phone","grant":"watch"}"#,
             r#"{"v":1,"kind":"listen_request","addr":"198.51.100.2"}"#,

@@ -8,7 +8,7 @@
 //! after a y/n here: it gives a phone's key one forward to the loopback port and nothing else.
 
 use eitri_core::remote_devices::{Device, DeviceStore, Grant, Recipe};
-use eitri_core::remote_pairing::{public_key_fingerprint, remote_state_dir, DEVICES_FILE};
+use eitri_core::remote_pairing::{public_key_fingerprint, remote_state_dir, PairMode, DEVICES_FILE};
 use eitri_core::remote_rv::{
     parse_rv_outbound, serve_control_socket_path, RvClient, RvInbound, RvOutbound, RV_PROTOCOL,
 };
@@ -44,24 +44,48 @@ const KEY_TYPES: &[&str] = &[
     "ssh-rsa",
 ];
 
-/// `eitri remote add-device <name>`: asks the focused window, through `serve`, to show a one-time enrollment code for
-/// the phone `name`. Nothing is enrolled here: the phone presents the code and the desk says yes in that window. With
-/// no server or no window it exits 1. A name that starts with `-` is refused (exit 2): it is an option typed where the
-/// name goes, and would otherwise start an enrollment.
+/// The usage line of `add-device`.
+const ADD_DEVICE_USAGE: &str = "usage: eitri remote add-device [--ssh | --direct] <name>";
+
+/// `eitri remote add-device [--ssh | --direct] <name>`: asks the focused window, through `serve`, to show a one-time
+/// enrollment code for the phone `name`, and says where that phone will connect. `--ssh` makes a code for the SSH
+/// recipe and `--direct` one for the direct address (`remote.origins` or `remote.listen`); with neither the window
+/// takes the direct address when it has one, else SSH. Nothing is enrolled here: the phone presents the code and the
+/// desk says yes in that window. With no server or no window, or a recipe the window has no route for, it exits 1. A
+/// name that starts with `-`, an unknown option, both recipes or no name is refused (exit 2): an option typed where
+/// the name goes would otherwise start an enrollment.
 pub fn add_device(args: &[String]) -> i32 {
-    let [name] = args else {
-        eprintln!("usage: eitri remote add-device <name>");
+    let mut recipe = None;
+    let mut names = Vec::new();
+    for arg in args {
+        let asked = match arg.as_str() {
+            "--ssh" => PairMode::Ssh,
+            "--direct" => PairMode::Direct,
+            word if word.starts_with('-') => {
+                eprintln!("eitri remote add-device: {word:?} is not a device name (it reads as an option)");
+                eprintln!("{ADD_DEVICE_USAGE}");
+                return 2;
+            }
+            _ => {
+                names.push(arg);
+                continue;
+            }
+        };
+        if recipe.is_some_and(|had| had != asked) {
+            eprintln!("eitri remote add-device: --ssh and --direct are two recipes; a code is for one");
+            eprintln!("{ADD_DEVICE_USAGE}");
+            return 2;
+        }
+        recipe = Some(asked);
+    }
+    let [name] = names.as_slice() else {
+        eprintln!("{ADD_DEVICE_USAGE}");
         return 2;
     };
-    if name.starts_with('-') {
-        eprintln!("eitri remote add-device: {name:?} is not a device name (it reads as an option)");
-        eprintln!("usage: eitri remote add-device <name>");
-        return 2;
-    }
     let control_dir =
         eitri_core::panel_control::control_dir(std::env::var_os("XDG_RUNTIME_DIR").as_deref(), &std::env::temp_dir());
     match serve_control_socket_path(&control_dir) {
-        Ok(path) => add_device_at(&path, name),
+        Ok(path) => add_device_at(&path, name, recipe),
         Err(e) => {
             eprintln!("eitri remote add-device: {e}");
             1
@@ -70,7 +94,7 @@ pub fn add_device(args: &[String]) -> i32 {
 }
 
 /// [`add_device`] through the server socket at `path`.
-pub fn add_device_at(path: &Path, name: &str) -> i32 {
+pub fn add_device_at(path: &Path, name: &str, recipe: Option<PairMode>) -> i32 {
     let mut client = match RvClient::connect(path) {
         Ok(client) => client,
         Err(e) => {
@@ -81,7 +105,7 @@ pub fn add_device_at(path: &Path, name: &str) -> i32 {
             return 1;
         }
     };
-    if let Err(e) = client.send(&RvInbound::StartEnroll { v: RV_PROTOCOL }) {
+    if let Err(e) = client.send(&RvInbound::StartEnroll { v: RV_PROTOCOL, recipe }) {
         eprintln!("eitri remote add-device: the server did not take the request: {e}");
         return 1;
     }
@@ -97,7 +121,11 @@ pub fn add_device_at(path: &Path, name: &str) -> i32 {
         }
     };
     match parse_rv_outbound(line.as_bytes()) {
-        Ok(RvOutbound::Result { ok: true, .. }) => {
+        Ok(RvOutbound::EnrollShown { target, .. }) => {
+            println!("{name} will connect {target}.");
+            if recipe.is_none() {
+                println!("(--ssh or --direct makes a code for the other recipe, where the window has one.)");
+            }
             println!("Scan the code the Eitri window shows with {name}, within three minutes; then answer y there.");
             0
         }
@@ -736,15 +764,19 @@ mod tests {
         dir
     }
 
-    /// A server that reads one line, checks it is `start_enroll`, and answers `answer`.
-    fn serve_once(path: &Path, answer: &'static str) -> std::thread::JoinHandle<()> {
+    /// A server that reads one line, checks it is `start_enroll` asking for `recipe`, and answers `answer`.
+    fn serve_once(path: &Path, recipe: Option<&'static str>, answer: &'static str) -> std::thread::JoinHandle<()> {
         let listener = UnixListener::bind(path).unwrap();
         std::thread::spawn(move || {
             let (stream, _) = listener.accept().unwrap();
             let mut line = String::new();
             BufReader::new(&stream).read_line(&mut line).unwrap();
             let asked: serde_json::Value = serde_json::from_str(&line).unwrap();
-            assert_eq!(asked, serde_json::json!({"kind": "start_enroll", "v": 1}));
+            let mut wanted = serde_json::json!({"kind": "start_enroll", "v": 1});
+            if let Some(recipe) = recipe {
+                wanted["recipe"] = recipe.into();
+            }
+            assert_eq!(asked, wanted);
             (&stream).write_all(format!("{answer}\n").as_bytes()).unwrap();
         })
     }
@@ -754,22 +786,46 @@ mod tests {
         let dir = scratch("none");
         let path = dir.join("remote.sock");
         let _ = std::fs::remove_file(&path);
-        assert_eq!(add_device_at(&path, "Pixel"), 1, "nothing serves the socket");
+        assert_eq!(add_device_at(&path, "Pixel", None), 1, "nothing serves the socket");
 
         let refused = serve_once(
             &path,
+            None,
             r#"{"v":1,"kind":"refused","key":null,"why":"no Eitri window has the focus"}"#,
         );
-        assert_eq!(add_device_at(&path, "Pixel"), 1, "serve has no window to ask");
+        assert_eq!(add_device_at(&path, "Pixel", None), 1, "serve has no window to ask");
         refused.join().unwrap();
         std::fs::remove_file(&path).unwrap();
 
         let shown = serve_once(
             &path,
-            r#"{"v":1,"kind":"result","command_id":null,"ok":true,"why":null}"#,
+            None,
+            r#"{"v":1,"kind":"enroll_shown","recipe":"direct","target":"directly to desk.tail1.ts.net:443 (https)"}"#,
         );
-        assert_eq!(add_device_at(&path, "Pixel"), 0, "a window shows the code");
+        assert_eq!(add_device_at(&path, "Pixel", None), 0, "a window shows the code");
         shown.join().unwrap();
+        std::fs::remove_file(&path).unwrap();
+
+        let no_route = serve_once(
+            &path,
+            Some("ssh"),
+            r#"{"v":1,"kind":"result","command_id":null,"ok":false,"why":"this window has no SSH route for phones"}"#,
+        );
+        assert_eq!(
+            add_device_at(&path, "Pixel", Some(PairMode::Ssh)),
+            1,
+            "the window has no route for the recipe asked"
+        );
+        no_route.join().unwrap();
+        std::fs::remove_file(&path).unwrap();
+
+        let ssh = serve_once(
+            &path,
+            Some("ssh"),
+            r#"{"v":1,"kind":"enroll_shown","recipe":"ssh","target":"through SSH to 127.0.0.1:41000 on this desk"}"#,
+        );
+        assert_eq!(add_device_at(&path, "Pixel", Some(PairMode::Ssh)), 0);
+        ssh.join().unwrap();
         std::fs::remove_file(&path).unwrap();
         let _ = std::fs::remove_dir(&dir);
 

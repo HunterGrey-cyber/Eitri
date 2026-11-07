@@ -188,7 +188,7 @@ mod tests {
         assert_eq!(
             route(
                 &frame(&format!(
-                    r#""kind":"enroll","instance":"{B}","code":"c","device_name":"p""#
+                    r#""kind":"enroll","instance":"{B}","code":"c","device_name":"p","recipe":"ssh""#
                 )),
                 &rows
             ),
@@ -196,7 +196,7 @@ mod tests {
         );
         assert_eq!(
             route(
-                &frame(r#""kind":"enroll","instance":"../x","code":"c","device_name":"p""#),
+                &frame(r#""kind":"enroll","instance":"../x","code":"c","device_name":"p","recipe":"ssh""#),
                 &rows
             ),
             Route::Refused(NO_SUCH_WINDOW)
