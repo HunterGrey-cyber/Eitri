@@ -27,6 +27,7 @@
 #                          go back to the sidecar Eitri came with; no network
 #   eitri sidecar use VERSION
 #                          select an update already built
+#   eitri setup lua-ls     completion and checks for Eitri's init.lua (lua_ls/luals also accepted)
 #   eitri setup [args]     build the sidecar (and offer nvim), or --nvim-only/--uninstall/
 #                            --sidecar-only for one of those alone (eitri setup --help)
 set -euo pipefail
@@ -127,6 +128,9 @@ fi
 # --yes/--with-nvim are ignored by --sidecar-only and read by --nvim-offer itself.
 if [[ "${1:-}" == setup ]]; then
 	shift
+	case "${1:-}" in
+		lua-ls | lua_ls | luals) exec "$LIBDIR/shell" setup "$@" ;;
+	esac
 	for a in "$@"; do
 		case "$a" in
 		--nvim-only | --nvim-offer | --uninstall | --sidecar-only | --sidecar-status | --sidecar-check | --sidecar-update | --sidecar-use | --from-source | --build-sidecar-into | -h | --help)

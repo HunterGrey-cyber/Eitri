@@ -1902,8 +1902,20 @@ export default function App() {
     }
     // The host returns the text and clears scratch before returning the pane's keys. :q! has no text envelope.
     if (!edit.finished || !paneFocused || edit.resumed) return;
+    // A card waiting is the host's to land on (`focus_permission`, which a question counts as for a composer edit): the
+    // return gives up rather than putting the keys in a box for the moment before that landing, where a fresh Enter
+    // would send the draft or the answer.
+    const cards = stateRef.current;
+    if (cards.pendingPermissions.length > 0 || cards.editorCards.length > 0 ||
+        (edit.question === undefined && waitingQuestion !== undefined)) {
+      editReturnRef.current = null;
+      return;
+    }
     // EditorDone also sends a landing after pane_focus. Keep that one tail from undoing the resumed input.
     edit.resumed = true;
+    // The keys are back from now, before the host's landing envelope arrives: the arrival counts from here, so a key
+    // pressed between the two (an Enter in the answer field this focuses) answers nothing, as after any arrival.
+    noteArrival();
     if (edit.landingHandled) editReturnRef.current = null;
     if (edit.question !== undefined) {
       questionDock.current?.focusEditedInput(edit.question.index);

@@ -506,6 +506,10 @@ export function Composer({
     // `modeKey.ts` claims Shift+Tab in document capture before this handler.
     if (e.key === "Enter" && !e.shiftKey) {
       e.preventDefault();
+      // A held Enter's repeat sends nothing: only a fresh press does. The keys can come back to this box while a key
+      // pressed elsewhere is still held -- the Enter of `:wq` after `Ctrl+g` -- and its repeats would send the draft
+      // nobody asked to send.
+      if (e.repeat) return;
       // Alt+Enter and a backslash right before the caret are Claude Code's own
       // newline keys, not a send. Not while nvim owns the draft (`editingInNvim`): `readOnly`
       // stops typing but not this handler, and a newline added here would be lost to nvim's own write.

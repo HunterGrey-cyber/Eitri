@@ -1,0 +1,273 @@
+---@meta
+
+---The settings Eitri reads when a window starts.
+---@alias EitriSetting
+---| "agent.account"
+---| "agent.codex.command"
+---| "agent.default"
+---| "agent.default_mode"
+---| "agent.editor.follow"
+---| "agent.editor.tool.apply_code_action"
+---| "agent.editor.tool.apply_proposal"
+---| "agent.editor.tool.diagnostics"
+---| "agent.editor.tool.editor_state"
+---| "agent.editor.tool.format"
+---| "agent.editor.tool.hover"
+---| "agent.editor.tool.lsp_code_actions"
+---| "agent.editor.tool.lsp_rename"
+---| "agent.editor.tool.nvim_exec"
+---| "agent.editor.tool.open_file"
+---| "agent.editor.tool.read_buffer"
+---| "agent.editor.tool.symbols"
+---| "agent.editor.tool.usages"
+---| "agent.editor.tools"
+---| "agent.font_size"
+---| "agent.restore"
+---| "agent.thinking"
+---| "agent.typing_cadence_hz"
+---| "agent.user_settings"
+---| "agents.enabled"
+---| "companion.wm"
+---| "editor.presentation"
+---| "editor.restore"
+---| "editor.takeover"
+---| "keymap.from_tmux"
+---| "keymap.nvim_prefix"
+---| "keymap.which_key_delay"
+---| "modules.chat.on_permission"
+---| "plugins.keys.find_case"
+---| "plugins.keys.hint_chars"
+---| "plugins.keys.prefix_wait"
+---| "plugins.keys.scroll_step"
+---| "plugins.keys.smooth"
+---| "plugins.keys.which_key_delay"
+---| "remote.audit.keep_days"
+---| "remote.enabled"
+---| "remote.listen"
+---| "remote.notify"
+---| "remote.origins"
+---| "remote.port"
+---| "review.enabled"
+---| "review.hint"
+---| "review.live"
+---| "terminal.claude_ide"
+---| "terminal.font"
+---| "window.desktop_start"
+---| "window.restore"
+---| "window.tiling"
+
+---@alias EitriModule string A module id: editor, agent, terminal, agent#2, terminal#2, or lua:<id>.
+---@alias EitriKeymapTable "prefix"|"root"|"panel"|string A plugin page uses "plugin:<id>".
+---@alias EitriOptions table<string, string|number|boolean>
+
+---@class EitriFloatRect
+---@field cx number Fractional horizontal centre, from 0 to 1.
+---@field cy number Fractional vertical centre, from 0 to 1.
+---@field w integer Width in pixels, from 1 to 16384.
+---@field h integer Height in pixels, from 1 to 16384.
+
+---@class EitriFloat: EitriFloatRect
+---@field [1] EitriModule
+---@field scratch? boolean
+
+---A module leaf, or a row/column/tabbed/stacked container with children and optional shares.
+---@class EitriLayout: table<integer, string|number|EitriLayout>
+---@field share? number This container's share of its parent.
+---@field active? integer The shown child of a tabbed or stacked container, counting from 1.
+---@field floating? EitriFloat[]
+---@field hidden? EitriModule[]
+---@field focus? EitriModule The module with the keys (get only).
+---@field away? EitriModule[] Modules held by another window (get only).
+---@field window? string This window's name (get only).
+---@field zoomed? EitriModule The zoomed module (get only).
+---@field marked? EitriModule The marked module (get only).
+---@field workspace? string The current workspace (get only).
+---@field workspaces? string[] Every workspace name, in order (get only).
+
+---@class EitriOpenRule
+---@field at? "side"|"bottom"|"main"|"below-editor"|"right"|"below"|"left"|"above"|"tab"
+---@field float? boolean
+---@field size? number|number[]|{w: number, h: number} A share or pixel count; a float takes two fractions.
+---@field scratchpad? boolean
+---@field focus? boolean
+
+---@class EitriCommand
+---@field id string ASCII letters, digits, hyphens and dots.
+---@field title string
+---@field keybinding? string
+---@field action fun()
+
+---@class EitriAgent
+---@field name string The name used by :tabnew and agent.default.
+---@field command string[] A program on PATH or an absolute path, followed by its arguments.
+---@field project_files string[] Project files and directory names ending in /, shown by the trust question.
+---@field auto_mode? string The agent's ACP mode id for Auto.
+---@field read_only_mode? string The agent's ACP mode id for read-only work.
+
+---@class EitriPanel
+---@field id string
+---@field title string
+---@field position "main"|"side"|"bottom"
+---@field content {type: "webview", url: string}
+---@field key? string A module key after the prefix.
+
+---@class EitriPluginOptions: table<string, string|number|boolean>
+---@field key? string A module key after the prefix.
+---@field position? "main"|"side"|"bottom"
+
+---Eitri's configuration API runs once at startup, separately from Neovim's own Lua.
+---@class Eitri
+---@field window? string This window's name: "1", "2", "c3", "p:markdown", or nil.
+eitri = {}
+
+eitri.config = {}
+
+---Settings are made with eitri.config.set(key, value); nil unsets the key again.
+---@param key EitriSetting
+---@param value string|number|boolean|nil
+---@return nil
+function eitri.config.set(key, value) end
+
+---A key of your own, read by your own Lua with eitri.config.get, is left alone.
+---@param key EitriSetting
+---@return string|boolean|nil value Numbers are stored as text; an unset key returns nil.
+function eitri.config.get(key) end
+
+eitri.keymap = {}
+
+---Changes the prefix key.
+---@param key string
+---@return nil
+function eitri.keymap.prefix(key) end
+
+---Binds a key to an action; keys in the root table work without the prefix.
+---@param map EitriKeymapTable
+---@param key string
+---@param action string
+---@param options? EitriOptions
+---@return nil
+function eitri.keymap.set(map, key, action, options) end
+
+---Removes a binding.
+---@param map EitriKeymapTable
+---@param key string
+---@return nil
+function eitri.keymap.del(map, key) end
+
+---Records a named set of these calls in one line; your own calls after it win.
+---@param name "i3-alt"
+---@return nil
+function eitri.keymap.use(name) end
+
+eitri.layout = {}
+
+---Runtime layout calls run in commands or event handlers, once the window exists.
+
+---Shapes the first layout of main; only in init.lua, before the window exists.
+---@param tree EitriLayout
+---@return nil
+function eitri.layout.default(tree) end
+
+---Defines a workspace in the shape default takes; main already has default's definition.
+---@param name string
+---@param tree EitriLayout
+---@return nil
+function eitri.layout.workspace(name, tree) end
+
+---Says where a module opens when the window opens it by itself; only in init.lua.
+---@param target EitriModule A module id or a kind such as terminal or agent.
+---@param options EitriOpenRule
+---@return nil
+function eitri.layout.rule(target, options) end
+
+---Opens a new instance of a kind, with the choice of where it opens.
+---@param kind "terminal"|"agent"
+---@param options? EitriOpenRule
+---@return nil
+function eitri.layout.open(kind, options) end
+
+---Goes to that workspace, making it first when there is none.
+---@param name string
+---@return nil
+function eitri.layout.switch(name) end
+
+---Brings a hidden module back where it was.
+---@param id EitriModule
+---@return nil
+function eitri.layout.show(id) end
+
+---Hides a module and remembers its place.
+---@param id EitriModule
+---@return nil
+function eitri.layout.hide(id) end
+
+---Gives a module the keys.
+---@param id EitriModule
+---@return nil
+function eitri.layout.focus(id) end
+
+---Splits the module with the keys to its right or below, putting id in the new pane.
+---@param id EitriModule
+---@param direction "right"|"below"
+---@return nil
+function eitri.layout.split(id, direction) end
+
+---Runs one layout action on the module that has the keys, by its eitri.keymap name.
+---@param name string
+---@param options? EitriOptions
+---@return nil
+function eitri.layout.run(name, options) end
+
+---Floats that module at rect, or at its remembered size when rect is absent; the editor never floats.
+---@param id EitriModule
+---@param rect? EitriFloatRect
+---@return nil
+function eitri.layout.float(id, rect) end
+
+---Marks that module without moving the keys.
+---@param id EitriModule
+---@return nil
+function eitri.layout.mark(id) end
+
+---Returns a new table describing the layout as it is now, in the shape default takes.
+---@return EitriLayout
+function eitri.layout.get() end
+
+---Returns the window's layout as the init.lua calls that make it at a first launch.
+---@return string
+function eitri.layout.export() end
+
+eitri.panel = {}
+
+---Adds a Lua panel whose content is a WebView, placed and keyed as a module.
+---@param spec EitriPanel
+---@return nil
+function eitri.panel.register(spec) end
+
+eitri.plugin = {}
+
+---Loads a local plugin by name or path, with its own settings plus key and position.
+---@param name_or_dir string An installed plugin name, an absolute path or a path starting with ~.
+---@param options? EitriPluginOptions
+---@return nil
+function eitri.plugin.load(name_or_dir, options) end
+
+eitri.agent = {}
+
+---Adds an agent that speaks ACP over standard input and output, so :tabnew and agent.default can use it.
+---@param spec EitriAgent
+---@return nil
+function eitri.agent.register(spec) end
+
+eitri.command = {}
+
+---Registers a command whose action runs when its keybinding is pressed.
+---@param spec EitriCommand
+---@return nil
+function eitri.command.register(spec) end
+
+---Runs a handler when the named event occurs; layout calls may run once the window exists.
+---@param event string
+---@param handler fun(payload: any)
+---@return nil
+function eitri.on(event, handler) end

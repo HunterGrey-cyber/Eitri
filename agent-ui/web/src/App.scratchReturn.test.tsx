@@ -110,6 +110,24 @@ describe("composer scratch return", () => {
     expect(sends()).toHaveLength(0);
   });
 
+  it.each([false, true])("the held Enter of :wq, repeating into the box, sends nothing; a fresh Enter does (empty=%s)", (empty) => {
+    const container = setup(empty);
+    const field = composer(container)!;
+    fireEvent.change(field, { target: { value: "a draft" } });
+    leaveForEdit(field);
+    finishEdit("a draft, edited");
+    const returned = composer(container)!;
+    expect(mode(container)).toBe("input");
+    fireEvent.keyDown(returned, { key: "Enter", repeat: true });
+    fireEvent.keyDown(returned, { key: "Enter", repeat: true });
+    fireEvent.keyUp(returned, { key: "Enter" });
+    expect(sends()).toHaveLength(0);
+    expect(composer(container)!.value).toBe("a draft, edited");
+    pause();
+    press(composer(container)!, "Enter");
+    expect(sends()).toEqual([expect.objectContaining({ tab: 1, text: "a draft, edited" })]);
+  });
+
   it("the return is an arrival: a Ctrl+y right as the keys come back approves nothing", () => {
     const container = setup();
     leaveForEdit(composer(container)!);
@@ -124,6 +142,27 @@ describe("composer scratch return", () => {
     fireEvent.keyUp(field, { key: "y", code: "KeyY", ctrlKey: true });
     act(() => vi.advanceTimersByTime(1000));
     expect(posted.filter((m) => m.type === "permission_response")).toHaveLength(0);
+  });
+
+  it("a composer edit returning while a permission card waits lands on the card in BROWSE and sends nothing", () => {
+    const container = setup();
+    const field = composer(container)!;
+    fireEvent.change(field, { target: { value: "a draft" } });
+    leaveForEdit(field);
+    dispatch({ kind: "events", tab: 1, fromRevision: 3, throughRevision: 4, events: [{
+      type: "permission_requested", permission_id: "p1", tool_use_id: null, tool_name: "Bash", input: { command: "rm file" },
+    }] });
+    dispatch({ kind: "draft", tab: 1, text: "a draft, edited" });
+    dispatch({ kind: "scratch", tab: 1, editing: false });
+    dispatch({ kind: "pane_focus", focused: true });
+    // A key between the keys coming back and the card landing answers nothing either.
+    fireEvent.keyDown(document.activeElement ?? container, { key: "Enter" });
+    dispatch({ kind: "focus_permission", tab: 1 });
+    act(() => vi.advanceTimersByTime(1000));
+    expect(mode(container)).toBe("browse");
+    expect(container.querySelector(".row-current")?.textContent ?? "").toContain("rm file");
+    expect(posted.filter((m) => m.type === "permission_response" || m.type === "send_message")).toHaveLength(0);
+    expect(composer(container)).toBeNull();
   });
 
   it("pane focus alone resumes INPUT and a later ordinary arrival still lands BROWSE", () => {
@@ -210,6 +249,25 @@ describe("question answer scratch return", () => {
     expect(posted.filter((m) => m.type === "question_answer")).toEqual([
       expect.objectContaining({ tab: 1, answers: [{ question_index: 0, option_indexes: [], other_text: text ?? "original answer", notes: null }] }),
     ]);
+  });
+
+  it("a fresh Enter between the keys coming back and the landing answers nothing", () => {
+    const container = setup(false, [question]);
+    press(container.querySelector(".question-dock")!, "2");
+    const field = container.querySelector<HTMLTextAreaElement>('[aria-label="Type something"]')!;
+    fireEvent.change(field, { target: { value: "original answer" } });
+    act(() => field.focus());
+    leaveForEdit(field);
+    dispatch({ kind: "question_other_edited", tab: 1, interaction_id: "q1", question_index: 0, text: "edited answer" });
+    dispatch({ kind: "scratch", tab: 1, editing: false });
+    dispatch({ kind: "pane_focus", focused: true });
+    const returned = container.querySelector<HTMLTextAreaElement>('[aria-label="Type something"]')!;
+    expect(document.activeElement).toBe(returned);
+    fireEvent.keyDown(returned, { key: "Enter" });
+    fireEvent.keyUp(returned, { key: "Enter" });
+    dispatch({ kind: "focus_permission", tab: 1 });
+    act(() => vi.advanceTimersByTime(1000));
+    expect(posted.filter((m) => m.type === "question_answer")).toHaveLength(0);
   });
 
   it("a permission card waiting on return keeps its BROWSE landing", () => {

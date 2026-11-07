@@ -679,13 +679,17 @@ const ToolResultPreview = memo(function ToolResultPreview({
   result,
   wrapped = false,
   reveal = false,
+  text = null,
 }: {
   result: NonNullable<ToolCallRecord["result"]>;
   wrapped?: boolean;
   reveal?: boolean;
+  /** The row's readable body (`ToolRenderConfig.resultText`), whose first lines the fold shows; `null` keeps the
+   *  answer's own text. The same body the row shows expanded, so folding and unfolding read alike. */
+  text?: string | null;
 }) {
   const touch = useContext(TouchRows);
-  const { shown, total } = previewLines(formatResultContent(result.content), result.isError ? 1 : PREVIEW_LINES, wrapped ? WRAPPED_LINE_CHARS : PREVIEW_LINE_CHARS);
+  const { shown, total } = previewLines(text ?? formatResultContent(result.content), result.isError ? 1 : PREVIEW_LINES, wrapped ? WRAPPED_LINE_CHARS : PREVIEW_LINE_CHARS);
   if (total === 0) return null;
   const hidden = total - shown.length;
   const draw = (part: string): ReactNode => (reveal ? <Shown text={part} /> : part);
@@ -867,7 +871,7 @@ export function renderToolCall(
       {!opts.gated && cardLine !== null && !specialInvocation && <div className="tool-rule-note">{withFailureWords(cardLine, (part) => <Shown text={part} />)}</div>}
       {showOrdinaryResult && shown && <ToolResult result={call.result} text={opts.detailed ? null : config?.resultText?.(call.input, call.result)} detailed={opts.detailed === true} abandoned={opts.abandoned === true} reveal={reveal} />}
       {showOrdinaryResult && !shown && call.result !== null && (config?.previewSuccess !== false || call.result.isError) && (
-        <ToolResultPreview result={call.result} wrapped={call.denied !== undefined && call.result.isError} reveal={reveal} />
+        <ToolResultPreview result={call.result} text={opts.detailed ? null : config?.resultText?.(call.input, call.result)} wrapped={call.denied !== undefined && call.result.isError} reveal={reveal} />
       )}
     </div>
   );

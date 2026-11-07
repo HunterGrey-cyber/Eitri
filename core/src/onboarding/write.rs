@@ -17,6 +17,32 @@ const INIT_MODE: u32 = 0o644;
 /// Creates `init.lua` in `config_dir` with `text`, making the directory when it is missing. Blocks on
 /// the file system, so it runs on a worker thread.
 pub fn write_init(config_dir: &Path, text: &str, lang: Lang) -> WriteOutcome {
+    let outcome = write_init_only(config_dir, text, lang);
+    if matches!(outcome, WriteOutcome::Written(_)) {
+        match crate::luals::data_dir(&|key| std::env::var_os(key)) {
+            Ok(data_dir) => install_after_written(&outcome, config_dir, &data_dir),
+            Err(error) => eprintln!("[lua-ls] {error}"),
+        }
+    }
+    outcome
+}
+
+#[cfg(test)]
+pub(crate) fn write_init_with_data(config_dir: &Path, data_dir: &Path, text: &str, lang: Lang) -> WriteOutcome {
+    let outcome = write_init_only(config_dir, text, lang);
+    install_after_written(&outcome, config_dir, data_dir);
+    outcome
+}
+
+pub(crate) fn install_after_written(outcome: &WriteOutcome, config_dir: &Path, data_dir: &Path) {
+    if matches!(outcome, WriteOutcome::Written(_)) {
+        if let Err(error) = crate::luals::write_luarc(config_dir, data_dir) {
+            eprintln!("[lua-ls] could not prepare editor completion: {error}");
+        }
+    }
+}
+
+fn write_init_only(config_dir: &Path, text: &str, lang: Lang) -> WriteOutcome {
     let dir = match open_user_config_dir(config_dir) {
         Ok(dir) => dir,
         Err(refusal) => {
@@ -61,6 +87,10 @@ mod tests {
 
     use super::*;
     use crate::source_scan::{code_only, rust_sources, without, word_ends, Source};
+
+    fn write_init(config_dir: &Path, text: &str, lang: Lang) -> WriteOutcome {
+        super::write_init_with_data(config_dir, &config_dir.parent().unwrap().join("data"), text, lang)
+    }
 
     fn scratch(label: &str) -> PathBuf {
         let dir = std::env::temp_dir().join(format!("eitri-write-{label}-{}", uuid::Uuid::new_v4().simple()));

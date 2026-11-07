@@ -42,7 +42,8 @@ file appears in a side window; the window Eitri opened for the agent earlier is 
 the one that changes. The highlight goes after four seconds, or when you enter that window. The tab's row says what
 happened, for example "showed `b.py:42` in the editor".
 
-In a Claude Code or Codex tab, expand an editor-tool row with `Enter`, `za` or `zo` in BROWSE to read its answer:
+In a Claude Code or Codex tab, a folded editor-tool row shows the first lines of its answer; expand it with `Enter`,
+`za` or `zo` in BROWSE to read all of it:
 buffer lines, diagnostics, symbol locations, hover text or a proposal's paths and hunks. Unsaved buffers and omitted
 items are marked. `Ctrl+o` opens the detailed view with the original answer; press it again to return. Tool text is
 shown literally, including any Markdown or HTML in it. Other agents keep their own tool titles and bodies.

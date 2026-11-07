@@ -54,6 +54,25 @@ changes to `package.path` or `package.cpath` have no effect.
 
 Both windows read the same file: the one-window mode and the [companion window](companion.md).
 
+## Completion and checks in your editor (lua_ls)
+
+When the first-start screen writes your `init.lua`, it also creates `.luarc.json` beside it so Neovim's
+`lua_ls` can complete `eitri.*`, show parameter types and check API names. For an existing configuration, run:
+
+```sh
+eitri setup lua-ls
+```
+
+`lua_ls` and `luals` are also accepted as the target. The command uses Eitri's configuration directory,
+including `EITRI_CONFIG_DIR`, and prints the new `.luarc.json` path. If `.luarc.json` or `.luarc.jsonc` already
+exists, Eitri leaves it alone and prints the `"workspace.library"` line to add yourself.
+It never overwrites either file and never touches `~/.config/nvim`.
+
+The API definition is kept at `$XDG_DATA_HOME/eitri/lua/meta/eitri.lua`, or
+`~/.local/share/eitri/lua/meta/eitri.lua` when `XDG_DATA_HOME` is unset or relative. The workspace file points
+at that absolute metadata directory and sets `"runtime.version": "LuaJIT"`. Each window start refreshes the
+definition to match the Eitri version you run, changing the file only when its contents differ.
+
 ## Settings
 
 | key | value | default | what it does |

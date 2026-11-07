@@ -1,5 +1,5 @@
 [English](editor-tools.md) | 简体中文
-<!-- translated-from: editor-tools.md sha256=848ae37d317a9adc8c6c65285724edf6f66bd32be3c0e4480a9a090471c6cb56 -->
+<!-- translated-from: editor-tools.md sha256=757f9fc2833558ff93ba25f01684c7537b61a2befceb576efde8e7c582d1aa94 -->
 
 # 从 agent 标签页使用你的编辑器
 
@@ -33,7 +33,7 @@
 
 打开一个文件，不会改变你当前的窗口、光标、模式和文本。如果 agent 打开文件的时候你正在插入模式里打字，你仍在插入模式里，下一个按键落在原来该落的地方。文件出现在一个侧边窗口里；Eitri 之前为 agent 开的那个窗口会被复用，变的从来不是你自己的窗口。高亮在四秒后消失，或者你进入那个窗口时消失。标签页的那一行会写明发生了什么，例如“showed `b.py:42` in the editor”。
 
-在 Claude Code 或 Codex 标签页里，处于 BROWSE 时用 `Enter`、`za` 或 `zo` 展开编辑器工具的那一行，就能读到它的回答：缓冲区文本、诊断、符号位置、悬浮说明，或者提议的文件路径和改动片段。未保存的缓冲区和省略的内容都会标出。`Ctrl+o` 打开详细视图，显示原始回答；再按一次就返回。工具文本按原样显示，其中的 Markdown 或 HTML 也只是文本。其他 agent 保留自己的工具标题和正文。
+在 Claude Code 或 Codex 标签页里，折叠的编辑器工具那一行显示它回答的前几行；处于 BROWSE 时用 `Enter`、`za` 或 `zo` 展开它，就能读到完整的回答：缓冲区文本、诊断、符号位置、悬浮说明，或者提议的文件路径和改动片段。未保存的缓冲区和省略的内容都会标出。`Ctrl+o` 打开详细视图，显示原始回答；再按一次就返回。工具文本按原样显示，其中的 Markdown 或 HTML 也只是文本。其他 agent 保留自己的工具标题和正文。
 
 <a id="when-the-editor-is-out-of-sight"></a>
 ## 编辑器不在视线里的时候

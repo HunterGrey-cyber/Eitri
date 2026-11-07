@@ -476,6 +476,7 @@ pub(crate) fn build(app: &Application, start: &Start) -> Rc<CompanionWindow> {
     let theme_css = crate::theme::gtk_css::ThemeCss::install(&fallback, None);
 
     let config_dir = crate::config_dir();
+    eitri_core::luals::refresh_in_background();
     let lua = Rc::new(LuaEngine::without_plugins(config_dir.clone()).expect("LuaEngine construction must not fail"));
     lua.load_init_file(&config_dir.join("init.lua"));
     // A companion window has no place for a Lua panel or command, and nothing runs `shell:ready`.

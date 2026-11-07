@@ -39,6 +39,14 @@ describe("editor tool expanded answers in App", () => {
     expect(body()?.textContent).not.toContain('{"');
   });
 
+  it("folded, the preview shows the readable text's first lines, not the JSON (the CLI's MCP block shape)", () => {
+    const { container } = mount("mcp__eitri__read_buffer", { path: "a.py" }, [{ type: "text", text: raw }]);
+    const preview = container.querySelector(".tool-result-preview");
+    expect(preview?.textContent).toContain("/p/a.py:4-5 (unsaved)");
+    expect(preview?.textContent).not.toContain('"text"');
+    expect(preview?.textContent).not.toContain("{");
+  });
+
   it("Ctrl+o shows the raw answer, and returning restores the readable body", () => {
     const { body, press } = mount();
     press("Enter");

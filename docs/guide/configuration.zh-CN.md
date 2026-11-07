@@ -1,5 +1,5 @@
 [English](configuration.md) | 简体中文
-<!-- translated-from: configuration.md sha256=020383cc9fd360766c3dc5c10b51b33883f1b8dcf81f3ddcf4ef57fb0019ee45 -->
+<!-- translated-from: configuration.md sha256=47ad65a51dcb1549c30e96a820d848c06e8bdd53e0822a6f4db7234641bdef6f -->
 
 # 配置
 
@@ -27,6 +27,25 @@ Eitri 说的方式是右上角的一条提示：有几个问题，以及前五�
 `require` 只在 `init.lua` 旁边的 `lua/` 目录下找模块：`require("mine")` 加载该配置目录下的 `lua/mine.lua` 或 `lua/mine/init.lua`，`require("a.b")` 加载 `lua/a/b.lua` 或 `lua/a/b/init.lua`。它从不在你打开的项目或当前目录里找，改动 `package.path` 或 `package.cpath` 也没有效果。
 
 两种窗口读的是同一个文件：单窗口模式和 [companion 窗口](companion.zh-CN.md)。
+
+<a id="completion-and-checks-in-your-editor-lua_ls"></a>
+## 编辑器中的补全与检查（lua_ls）
+
+首次启动界面写入 `init.lua` 时，也会在旁边创建 `.luarc.json`，让 Neovim 的 `lua_ls` 能补全
+`eitri.*`、显示参数类型并检查 API 名称。已有配置的用户可以运行：
+
+```sh
+eitri setup lua-ls
+```
+
+目标名称也可以写成 `lua_ls` 或 `luals`。命令使用 Eitri 的配置目录（包括 `EITRI_CONFIG_DIR` 的覆盖），
+并打印新建的 `.luarc.json` 路径。如果已有 `.luarc.json` 或 `.luarc.jsonc`，Eitri 会保留原文件，
+打印需要自行添加的 `"workspace.library"` 行。它不会覆盖这两个文件，也不会触碰 `~/.config/nvim`。
+
+API 定义保存在 `$XDG_DATA_HOME/eitri/lua/meta/eitri.lua`；`XDG_DATA_HOME` 未设置或为相对路径时，
+则保存在 `~/.local/share/eitri/lua/meta/eitri.lua`。工作区文件指向该元数据目录的绝对路径，并设置
+`"runtime.version": "LuaJIT"`。每次窗口启动时都会更新定义，使其与正在运行的 Eitri 版本一致；
+只有内容不同时才会改写文件。
 
 <a id="settings"></a>
 ## 设置

@@ -297,6 +297,15 @@ assert_contains "$out" "no sidecar built yet" "an absolute XDG_DATA_HOME is hono
 # skips an adequate PATH nvim and tolerates a download failure, so setup does not turn
 # nothing-to-do or a temporary network failure into a hard failure. The stub cannot check
 # that behaviour; packaging/tests/install/test_nvim.sh exercises the installer-side offer.
+echo "== LuaLS setup reaches the binary without invoking the installer =="
+for target in lua-ls lua_ls luals; do
+	out="$(run_launcher setup "$target")"
+	assert_contains "$out" "STUB_ARG:setup" "setup $target reaches shell setup"
+	assert_contains "$out" "STUB_ARG:$target" "setup $target keeps the target"
+	assert_not_contains "$out" "STUB_SETUP_CALL" "setup $target starts no installer"
+	assert_not_contains "$out" "no sidecar built yet" "setup $target prints no sidecar hint"
+done
+
 echo "== plain 'eitri setup' builds the sidecar and then runs the nvim offer =="
 EXTRA_ENV=()
 out="$(run_launcher setup)"
