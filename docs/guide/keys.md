@@ -707,7 +707,8 @@ stops at the last row, so it never types `jjjj` into your draft. On the empty ta
 same keys walk the rows and then enter it. A waiting card, a question, an open list and the search line keep `j`
 for themselves. `i`, `o`, `A`, `f` and this `j` act only on a key that stands alone: if another key is pressed
 within about a quarter of a second of it, it does nothing, so the first letters of a sentence typed right after a
-reply arrives do not start HINT or open the box in the middle of a word.
+reply arrives do not start HINT or open the box in the middle of a word. The one exception is vim's `Esc i`: right after
+the `Esc` that left INSERT, `i`, `o` and `A` go back in at once.
 
 The band's right side names the agent's model, and the effort beside it when the agent has said what it is. On a
 Claude tab a click on either opens the list of models or efforts, also while a turn runs: nothing is sent to Claude as
@@ -730,7 +731,7 @@ a message, and the band says when your choice takes effect. A Codex tab shows wh
 | `Ctrl+a` / `Ctrl+e` | move the caret to the start / end of the line it is on |
 | `Ctrl+c` | interrupt a running turn; when idle, clear the box into the history |
 | `Ctrl+y` | approve the oldest card waiting in this tab, leaving out a card from an agent's [editor tools](editor-tools.md#cards) (see [Answering a card](#answering-a-card)) |
-| `Ctrl+g` | edit the draft in Neovim; `:wq` brings it back; `:q!` changes nothing unless you already saved the draft with `:w`, in which case the saved text comes back |
+| `Ctrl+g` | edit the draft in Neovim; `:wq` brings it back into the box in INSERT, caret at the end, ready to send (`Enter` sends); `:q!` returns the same way with the draft unchanged unless you already saved it with `:w`, in which case the saved text comes back |
 | `Ctrl+o` | the detailed view (also in BROWSE) |
 | `Shift+Tab` | cycle the tab's mode: Manual, Auto, Bypass, then Manual again (an agent with no Manual mode: Auto and Bypass); entering Bypass asks first, only from Auto, and a `y` also approves the Claude Code questions already waiting in the tab (ones your ask rules caused too) and answers the later ones for you, see [When Claude Code itself asks](permissions.md#when-claude-code-itself-asks); it never answers a question Claude asks you ([Claude's questions](#claudes-questions)) |
 | `Esc` | stop typing and go back to BROWSE; with the command menu open, it closes the menu first and keeps the text |

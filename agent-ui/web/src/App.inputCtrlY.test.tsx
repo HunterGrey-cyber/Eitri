@@ -415,6 +415,30 @@ describe("INPUT Ctrl+y approves the active tab's oldest waiting card", () => {
       expect(answered()).toEqual([]);
     });
 
+    it("Esc then a at once answers nothing: the Esc that left INPUT gives card answers no exception", () => {
+      const { container, box } = inInput(1);
+      fireEvent.keyDown(box, { key: "Escape" });
+      fireEvent.keyDown(root(container), { key: "a" });
+      wait(1000);
+      expect(answered()).toEqual([]);
+      // The same a after a pause answers the card, so the refusal above was the guard's.
+      fireEvent.keyDown(root(container), { key: "a" });
+      wait(1000);
+      expect(answered()).toEqual([expect.objectContaining({ permission_id: "perm-1", decision: "allow" })]);
+    });
+
+    it("Esc, i and Ctrl+y at once approve nothing: Ctrl+y keeps its own pause after the fast re-entry", () => {
+      const { container, box } = inInput(1);
+      fireEvent.keyDown(box, { key: "Escape" });
+      fireEvent.keyDown(root(container), { key: "i" });
+      const again = textarea(container);
+      expect(again).not.toBeNull();
+      ctrlY(again!);
+      wait(1000);
+      expect(answered()).toEqual([]);
+      expect(bandMessage(container)).toBe(TYPING_FLASH);
+    });
+
     it("the bare Control keydown before the y is not a key: a lone Ctrl+y still approves", () => {
       const { box } = inInput(1);
       fireEvent.keyDown(box, { key: "Control", ctrlKey: true });

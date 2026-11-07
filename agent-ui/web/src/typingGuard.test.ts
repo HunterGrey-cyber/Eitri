@@ -444,6 +444,94 @@ describe("TypingGuard.mayStartInput: i/o/A need a pause, never a motion run", ()
   });
 });
 
+/* vim's `Esc i`: no prose holds an Esc, so an `i`/`o`/`A` right after the Esc that just left INPUT
+   (`noteLeftInput`) is a command, not a letter, and needs no pause. Any other Esc gets no exception. */
+describe("TypingGuard.mayStartInput: Esc then i at once", () => {
+  it("the Esc that left INPUT, typed fast after the draft, lets i in at once", () => {
+    guard.onKey("x", 0);
+    guard.onKey("Escape", 60);
+    guard.noteLeftInput();
+    guard.onKey("i", 120);
+    expect(guard.mayStartInput(120, false)).toBe(true);
+  });
+
+  it("o and A the same way", () => {
+    for (const k of ["o", "A"]) {
+      const g = new TypingGuard();
+      g.onKey("x", 0);
+      g.onKey("Escape", 60);
+      g.noteLeftInput();
+      g.onKey(k, 100);
+      expect(g.mayStartInput(100, false), k).toBe(true);
+    }
+  });
+
+  it("an Esc that did not leave INPUT is no exception, even standing alone: Esc then i at once may not", () => {
+    guard.onKey("Escape", 0);
+    guard.onKey("i", 50);
+    expect(guard.mayStartInput(50, false)).toBe(false);
+  });
+
+  it("the Esc that left INPUT counts inside an arrival's window too: the page only goes back to INPUT", () => {
+    guard.noteArrival(0);
+    guard.onKey("Escape", 60);
+    guard.noteLeftInput();
+    guard.onKey("i", 120);
+    expect(guard.mayStartInput(120, false)).toBe(true);
+  });
+
+  it("an Esc inside a burst while in BROWSE is no exception: j, Esc, i at 80 ms a key may not", () => {
+    guard.onKey("j", 0);
+    guard.onKey("Escape", 80);
+    guard.onKey("i", 160);
+    expect(guard.mayStartInput(160, false)).toBe(false);
+  });
+
+  it("an arrival right after the Esc refuses the i: the arrival is the key before it", () => {
+    guard.onKey("x", 0);
+    guard.onKey("Escape", 60);
+    guard.noteLeftInput();
+    guard.noteArrival(80);
+    guard.onKey("i", 120);
+    expect(guard.mayStartInput(120, false)).toBe(false);
+  });
+
+  it("an Esc right after an arrival that did not leave INPUT is no exception", () => {
+    guard.noteArrival(0);
+    guard.onKey("Escape", 60);
+    guard.onKey("i", 120);
+    expect(guard.mayStartInput(120, false)).toBe(false);
+  });
+
+  it("only the key right after the Esc: Esc, j, then i fast is a word's letter again", () => {
+    guard.onKey("x", 0);
+    guard.onKey("Escape", 60);
+    guard.noteLeftInput();
+    guard.onKey("j", 100);
+    guard.onKey("i", 140);
+    expect(guard.mayStartInput(140, false)).toBe(false);
+  });
+
+  it("a held i's repeat never may, even right after the Esc", () => {
+    guard.onKey("Escape", 0);
+    guard.noteLeftInput();
+    guard.onKey("i", 50);
+    expect(guard.mayStartInput(50, true)).toBe(false);
+  });
+
+  it("card answers keep their pause: Esc then a at once answers nothing", () => {
+    guard.onKey("x", 0);
+    guard.onKey("Escape", 60);
+    guard.noteLeftInput();
+    vi.setSystemTime(100);
+    key("a");
+    vi.advanceTimersByTime(TYPING_GUARD_MS * 4);
+    expect(answers).toEqual([]);
+    expect(guard.mayAnswerNow("a", 100, false)).toBe(false);
+    expect(guard.mayActAfterMotion(100, false)).toBe(false);
+  });
+});
+
 describe("TypingGuard.onRelease: a held key counts until it is let go", () => {
   it("an a right after letting go of a held j waits, however long ago its last repeat was", () => {
     const guard = new TypingGuard();

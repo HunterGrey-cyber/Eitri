@@ -35,7 +35,10 @@
  *
  *  INPUT entry (`i`/`o`/`A`) requires a pure pause with no motion exception: `look at` would walk
  *  with `l` then enter with `o`, and `explain` or `follow-up` would lose their prefixes. A swallowed
- *  key says `TYPE_HINT_FLASH`. BROWSE's `y` copies immediately and opens a typing burst: following
+ *  key says `TYPE_HINT_FLASH`. The one key it may follow at once is the Esc that just took this page
+ *  from INPUT to BROWSE (`noteLeftInput`), as in vim's `Esc i`: no prose holds an Esc, and the key
+ *  only returns the page to the INPUT it was in, so nothing becomes reachable that was not already.
+ *  Any other Esc (BROWSE's, a region's) gets no exception. BROWSE's `y` copies immediately and opens a typing burst: following
  *  keys within the window are swallowed, so `y i w` cannot copy, enter INPUT and type `w`.
  *  The clipboard is still overwritten; text without `i` is still dropped. A lone `i` after a pause works.
  *
@@ -195,6 +198,9 @@ export class TypingGuard {
    *  so `App.tsx` can tie a landing it saw to the key that made it -- never a guess from a key's
    *  name. */
   private recorded = 0;
+  /** The key `noteLeftInput` was told of: the Esc that took this page from INPUT to BROWSE. Kept as the very
+   *  record `onKey` made, so any key or arrival recorded after it is not it. */
+  private leftInput: Keydown | null = null;
   /** When a BROWSE `y` last copied (its keydown's timestamp), for `afterCopy`. */
   private copiedAt: number | null = null;
 
@@ -285,6 +291,13 @@ export class TypingGuard {
     if (this.latest !== null && this.latest.key === key && t > this.latest.t) this.latest = { key, t };
   }
 
+  /** The key `onKey` just recorded is an Esc that took this page from INPUT to BROWSE. The next key, if it is
+   *  `i`/`o`/`A` and nothing (no other key, no arrival) came between, may enter INPUT again at once
+   *  (`mayStartInput`). Called where the mode changes, never guessed from a key's name. */
+  noteLeftInput(): void {
+    this.leftInput = this.latest;
+  }
+
   /** The number of keys `onKey` has recorded so far. The key being handled right now is the
    *  last of them, so a landing recorded as `keyCount()` by one key is "the key right before" the
    *  next one exactly when that next key reads `keyCount() - 1` for it. */
@@ -334,8 +347,17 @@ export class TypingGuard {
    *  exception either**. A lone `h`/`j`/`k`/`l`/`G` is as much the first letter of a word as a motion, so
    *  with that exception "look at" walked with `l` and opened INPUT with `o` ("ok at"), and "how", "hi",
    *  "like", "join" and "Good" did the same. The price, stated: a fast `ji` chord now needs a pause. A
-   *  repeat never may. */
+   *  repeat never may.
+   *
+   *  The exception is the key right after the Esc that left INPUT (`noteLeftInput`; vim's `Esc i`, `Esc A`),
+   *  however fast and wherever that Esc fell, an arrival's window included: no word holds an Esc, and the key only
+   *  takes the page back to the INPUT it was just in, where every key that answers (INPUT's `Ctrl+y`, the
+   *  question dock's) was already live and keeps its own guard. A key or an arrival between the Esc and this key
+   *  ends the exception. Any other Esc, BROWSE's own or a region's, gets none, so no sequence that starts in
+   *  BROWSE reaches INPUT sooner than before. */
   mayStartInput(t: number, repeat: boolean): boolean {
+    if (repeat) return false;
+    if (this.previous !== null && this.previous === this.leftInput) return true;
     return this.mayAnswerNow("", t, repeat);
   }
 

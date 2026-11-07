@@ -65,6 +65,8 @@ export type EmptyTabProps = {
    *  round trip, or an overlay closing, must never leave the keys on `document.body`. Landed on the composer (INPUT)
    *  or this screen's own root (BROWSE), whichever currently has the live control. */
   keysRequest: number;
+  /** A completed composer scratch edit returns to INPUT with the caret after the draft. */
+  editReturnRequest?: number;
   /** Window cancel requests drop this screen's pending prefix and leader sequence too,
    *  so `g`, Shift+Tab, `i` cannot swallow the INPUT request as a stale continuation.
    *  Optional for callers with no window. */
@@ -185,9 +187,10 @@ export function EmptyTab(props: EmptyTabProps) {
    *  the moment it actually runs `TYPING_GUARD_MS` later. */
   const modeRef = useRef(mode);
   modeRef.current = mode;
-  // The counts this screen mounted with (see `landing`'s doc): the two request effects below act
+  // The counts this screen mounted with (see `landing`'s doc): the request effects below act
   // only on a count that changed after that.
   const focusAtMount = useRef(props.focusRequest);
+  const editReturnAtMount = useRef(props.editReturnRequest);
   const arriveAtMount = useRef(props.arriveRequest);
   /** A start put off until the trust question is answered. Everything that treats a starting tab as busy
    *  (the composer queues behind it, no dashboard, no focus request) applies to it too, so `starting` stays
@@ -373,6 +376,13 @@ export function EmptyTab(props: EmptyTabProps) {
     }
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [props.focusRequest]);
+  useEffect(() => {
+    if (props.editReturnRequest === editReturnAtMount.current || props.overlayOpen || starting || failed) return;
+    setMode("input");
+    setComposerCaret("end");
+    setComposerFocus((n) => n + 1);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [props.editReturnRequest]);
   /* An `arrive` that lands here -- a launch that starts with the
      keys already in the chat -- ends INPUT the way it ends a live tab's, rather than leaving the
      fresh prompt's default composer focused. No `!starting && !failed` guard: unlike `focusRequest`,
@@ -579,6 +589,8 @@ export function EmptyTab(props: EmptyTabProps) {
       if (event.key === "Escape" && !event.nativeEvent.isComposing) {
         event.preventDefault();
         rootRef.current?.focus({ preventScroll: true });
+        // An `i`/`o`/`A` right after this Esc goes back into the box at once (vim's `Esc i`; `mayStartInput`).
+        typingGuard.noteLeftInput();
         setMode("browse");
       }
       return;

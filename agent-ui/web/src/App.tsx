@@ -353,7 +353,10 @@ export default function App() {
       questionArrival.current.held.delete(e.code || e.key);
     };
     const blur = () => { questionHeld.current.clear(); questionArrival.current.held.clear(); };
-    const pointer = () => { arrivalRunRef.current = false; };
+    const pointer = () => {
+      arrivalRunRef.current = false;
+      if (editReturnRef.current?.resumed) editReturnRef.current = null;
+    };
     window.addEventListener("keydown", down, true);
     window.addEventListener("keyup", up, true);
     window.addEventListener("blur", blur);
@@ -557,6 +560,17 @@ export default function App() {
   /** How many times `Ctrl+g` has viewed each broker card's proposal, by card id: the next press shows the next file. */
   const cardViews = useRef(new Map<string, number>());
   const taskScratchTab = useRef<TabId | null>(null);
+  // Only a locally requested draft/answer edit resumes typing. Row views and later landings keep their modes.
+  const editReturnRef = useRef<{
+    tab: TabId;
+    requestId: string;
+    question?: { identity: string; index: number };
+    started: boolean;
+    finished: boolean;
+    resumed?: boolean;
+    landingHandled?: boolean;
+  } | null>(null);
+  const [emptyEditReturnRequest, setEmptyEditReturnRequest] = useState(0);
   const stopTasksSignature = useRef("");
   /** The footer's transient line. `seq` so the same text twice is two flashes. */
   const [flash, setFlash] = useState<{ text: string; seq: number } | null>(null);
@@ -1696,6 +1710,7 @@ export default function App() {
      hand the keys to GTK's window `move-focus` once WebKit ran out of focusable elements. */
   useEffect(() => {
     function onModeKey(event: globalThis.KeyboardEvent) {
+      if (editReturnRef.current?.resumed) editReturnRef.current = null;
       // Recorded for EVERY non-modifier keydown, before `isModeCycleKey` returns early for
       // everything but Shift+Tab -- this is the guard's only source of "another key landed
       // recently", and it must see a key whether or not this effect goes on to act on it itself.
@@ -1876,6 +1891,31 @@ export default function App() {
   /** The session is gone (lost or closed). Read before the start-screen branch below, because the
    *  effect under it is a hook and cannot live after a conditional return. */
   const sessionEnded = state.status.kind === "unavailable" || state.status.kind === "closed";
+  useEffect(() => {
+    const edit = editReturnRef.current;
+    if (edit === null) return;
+    if (edit.tab !== activeTabRef.current || overlayOpen || keymapOpen || detail !== null || handoffOpen || confirm !== null ||
+        (sessionStarted && sessionEnded) || activeTab?.state === "failed" ||
+        (edit.question !== undefined && edit.question.identity !== questionIdentity)) {
+      editReturnRef.current = null;
+      return;
+    }
+    // The host returns the text and clears scratch before returning the pane's keys. :q! has no text envelope.
+    if (!edit.finished || !paneFocused || edit.resumed) return;
+    // EditorDone also sends a landing after pane_focus. Keep that one tail from undoing the resumed input.
+    edit.resumed = true;
+    if (edit.landingHandled) editReturnRef.current = null;
+    if (edit.question !== undefined) {
+      questionDock.current?.focusEditedInput(edit.question.index);
+    } else if (!sessionStarted) {
+      setEmptyEditReturnRequest((n) => n + 1);
+    } else if (questionIdentity === null) {
+      setMode("input");
+      setComposerCaret("end");
+      setComposerFocusRequest((n) => n + 1);
+    }
+  }, [scratchEditing, paneFocused, overlayOpen, keymapOpen, detail, handoffOpen, confirm,
+    sessionStarted, sessionEnded, activeTab?.state, questionIdentity]);
   /** The card INPUT's `Ctrl+y` would approve right now -- the active tab's oldest
    *  waiting card (`approveOldestByKey` picks the same one) -- for the band to name, only while the
    *  composer has the keys (INPUT, this pane focused) on a live session. `null` otherwise. */
@@ -2315,6 +2355,19 @@ export default function App() {
 
   useEffect(() => {
     installDispatch((payload) => {
+      if (payload.kind === "command_result" && !payload.ok && payload.requestId === editReturnRef.current?.requestId) {
+        editReturnRef.current = null;
+      }
+      const edit = editReturnRef.current;
+      // A waiting question counts as a card to the host. Its own edit comes back via focus_permission even
+      // without a permission card; that fallback would focus the hidden composer instead of the answer field.
+      const questionReturn = payload.kind === "focus_permission" && payload.tab === edit?.tab && edit?.question !== undefined &&
+        pageRef.current.state.pendingPermissions.length === 0 && pageRef.current.state.editorCards.length === 0;
+      if (((payload.kind === "arrive" && payload.intent !== "stop") || questionReturn) && edit?.finished && edit.tab === activeTabRef.current) {
+        edit.landingHandled = true;
+        if (edit.resumed) editReturnRef.current = null;
+        return;
+      }
       if (questionDock.current?.reply(payload)) return;
       if (payload.kind === "question_other_edited") return;
       if ((payload.kind === "task_output_result" || payload.kind === "command_result") && taskRequests.current.has(payload.requestId)) {
@@ -2349,6 +2402,10 @@ export default function App() {
       pageRef.current = nextPage;
       stateRef.current = nextPage.state;
       setPage(nextPage);
+      // Redirects cancel synchronously too: their return envelopes can share one render with the scratch end.
+      if (nextPage.chooser !== null || nextPage.renaming !== null || nextPage.confirm !== null || nextPage.review !== null ||
+          payload.kind === "open_keymap" || payload.kind === "open_command_line" || payload.kind === "tab_detail" ||
+          payload.kind === "hint_collect") editReturnRef.current = null;
       // A waiting `a`/`d`/`D` was aimed at a card these envelopes take the keys or the view from. Cancelled here,
       // in the same task as the envelope, so its timer can never come due in between and answer a card that is
       // no longer the one in front of the user.
@@ -2378,6 +2435,7 @@ export default function App() {
           break;
         }
         case "pane_focus": {
+          if (!payload.focused && editReturnRef.current?.resumed) editReturnRef.current = null;
           // The keys leaving can be the first half of the tab leaving this page (a join back into the base page
           // follows at once); a draft still waiting out its debounce would then be posted by a page that no
           // longer shows the tab, so it goes out now.
@@ -2431,6 +2489,7 @@ export default function App() {
           break;
         }
         case "enter_input": {
+          editReturnRef.current = null;
           // This puts the caret in the composer, so no overlay may be left covering it and eating what gets
           // typed. Its only sender is a brand-new tab, so there is never a card waiting to land on instead.
           closeTransientOverlays();
@@ -2441,6 +2500,7 @@ export default function App() {
           break;
         }
         case "arrive": {
+          editReturnRef.current = null;
           // A scratch return keeps the task detail; other arrivals land on the conversation in BROWSE.
           closeTransientOverlays(taskScratchTab.current === activeTabRef.current && taskScratchTab.current !== null);
           taskScratchTab.current = null;
@@ -2455,6 +2515,7 @@ export default function App() {
           break;
         }
         case "focus_permission": {
+          editReturnRef.current = null;
           // An overlay or landing that takes the keys ends a pending sequence, box and reserved prefix included,
           // so a key the overlay lets bubble can never advance a stale one. The overlays would cover the card the
           // cursor is about to land on.
@@ -2580,6 +2641,7 @@ export default function App() {
           // clears its part) before the new tab's snapshot arrives. The first `tabs` this page sees takes this
           // branch too, since `activeTabRef.current` starts `null`.
           if (payload.active !== activeTabRef.current) {
+            editReturnRef.current = null;
             setTasksOpen(false);
             taskScratchTab.current = null;
             switchedRef.current = true;
@@ -2882,6 +2944,14 @@ export default function App() {
           }
           break;
         }
+        case "scratch": {
+          const edit = editReturnRef.current;
+          if (edit?.tab === payload.tab) {
+            if (payload.editing) edit.started = true;
+            else if (edit.started) edit.finished = true;
+          }
+          break;
+        }
         case "draft": {
           // The page this tab just left sent its last mirror after the tab arrived here, and the box has been
           // edited since: that edit is newer, and its own mirror tells Rust so.
@@ -3101,7 +3171,10 @@ export default function App() {
     const tab = activeTabRef.current;
     if (tab === null) return;
     const requestId = nextRequestId();
-    if (message.type === "edit_draft") trackRequest(requestId, { kind: "editor", tab });
+    if (message.type === "edit_draft") {
+      editReturnRef.current = { tab, requestId, started: false, finished: false };
+      trackRequest(requestId, { kind: "editor", tab });
+    }
     if (message.type === "toggle_following") trackRequest(requestId, { kind: "follow", tab });
     postToRust({ ...message, request_id: requestId, tab } as unknown as OutboundMessage);
   }
@@ -4044,6 +4117,7 @@ export default function App() {
               // `keysRequest` bump both reach it directly rather than through `App`'s own
               // `containerRef`, which does not exist on this layout.
               keysRequest={emptyKeysRequest}
+              editReturnRequest={emptyEditReturnRequest}
               dropKeysRequest={emptyDropKeys}
               overlayOpen={overlayOpen}
               landing={emptyLanding}
@@ -5495,6 +5569,8 @@ export default function App() {
           if (cancelled === null) showFlash(TYPE_HINT_FLASH);
           break;
         }
+        // INPUT's Esc: an `i`/`o`/`A` right after it re-enters at once (vim's `Esc i`; `mayStartInput`).
+        if (action.to === "browse") typingGuard.noteLeftInput();
         setMode(action.to);
         // Entering INPUT (`i`/`o`/`A`) asks `Composer` to place the caret itself, rather than
         // leaving it to whatever a bare `autoFocus` on a freshly re-mounted, non-empty box happens
@@ -6324,6 +6400,10 @@ export default function App() {
         key={questionIdentity} ref={questionDock} tab={activeTab.id} record={waitingQuestion}
         draft={activeTab.questionDraft?.[waitingQuestion.interactionId]}
         active={mode === "input" && paneFocused} blocked={questionBlocked} onActivate={() => setMode("input")}
+        onEditStart={(requestId, index) => {
+          editReturnRef.current = { tab: activeTab.id, requestId,
+            question: { identity: questionIdentity!, index }, started: false, finished: false };
+        }}
         stillWaiting={questionStillWaiting(activeTab.id, waitingQuestion.interactionId)}
       />}
       <Composer

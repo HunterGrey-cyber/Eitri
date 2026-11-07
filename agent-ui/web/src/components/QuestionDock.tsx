@@ -17,6 +17,7 @@ export type QuestionDraft = {
 export type QuestionDockHandle = {
   key: (event: KeyboardEvent<HTMLElement>) => void;
   focus: () => void;
+  focusEditedInput: (index: number) => void;
   /** Sends a draft still waiting out the mirror's delay now; nothing when none is pending. */
   flush: () => void;
   reply: (payload: InboundPayload) => boolean;
@@ -28,6 +29,7 @@ type Props = {
   active: boolean;
   blocked: () => boolean;
   onActivate: () => void;
+  onEditStart?: (requestId: string, index: number) => void;
   /** Whether this question still waits for an answer in its tab, read from the page as it is now rather than
    *  from this dock's last render: a dock unmounts after its question settled or its tab closed as well as when a
    *  switch takes its tab off screen, and only the last keeps a draft worth storing. */
@@ -53,7 +55,7 @@ function restored(record: QuestionRecord, raw: unknown): QuestionDraft {
   };
 }
 
-export const QuestionDock = forwardRef<QuestionDockHandle, Props>(function QuestionDock({ tab, record, draft: initialDraft, active, blocked, onActivate, stillWaiting }, ref) {
+export const QuestionDock = forwardRef<QuestionDockHandle, Props>(function QuestionDock({ tab, record, draft: initialDraft, active, blocked, onActivate, onEditStart, stillWaiting }, ref) {
   // A request restored from the mirror was sent by an earlier mount of this dock, and its reply may have come
   // while none was mounted to read it. The host marks a set answering as it takes an answer and puts it back to
   // waiting when the answer is refused, so a restored request on a set that waits has already had its reply.
@@ -69,6 +71,7 @@ export const QuestionDock = forwardRef<QuestionDockHandle, Props>(function Quest
   const root = useRef<HTMLDivElement>(null);
   const otherField = useRef<HTMLTextAreaElement>(null);
   const notesField = useRef<HTMLTextAreaElement>(null);
+  const [editFocus, setEditFocus] = useState<{ index: number } | null>(null);
   const [error, setError] = useState("");
   const [sending, setSending] = useState<string | null>(draft.pendingRequest ?? null);
   const request = useRef<string | null>(draft.pendingRequest ?? null);
@@ -123,6 +126,15 @@ export const QuestionDock = forwardRef<QuestionDockHandle, Props>(function Quest
   useLayoutEffect(() => {
     if (active) root.current?.focus({ preventScroll: true });
   }, [active]);
+  useLayoutEffect(() => {
+    if (editFocus === null || editFocus.index !== page || !active || busy) return;
+    const field = otherField.current;
+    if (field === null) return;
+    field.focus({ preventScroll: true });
+    field.setSelectionRange(field.value.length, field.value.length);
+    // The return request is an edge: a later activation keeps the dock's ordinary focus behaviour.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [editFocus]);
 
   function change(next: QuestionDraft, pageChange = false) {
     draftRef.current = next;
@@ -231,12 +243,19 @@ export const QuestionDock = forwardRef<QuestionDockHandle, Props>(function Quest
       setTimeout(() => notesField.current?.focus(), 0);
     } else if (intent.type === "edit" && question && (input ? event.target === otherField.current : focus === custom)) {
       mirror();
-      postToRust({ type: "edit_question_other", request_id: nextRequestId(), tab, interaction_id: record.interactionId, question_index: page, text: answer.text });
+      const requestId = nextRequestId();
+      onEditStart?.(requestId, page);
+      postToRust({ type: "edit_question_other", request_id: requestId, tab, interaction_id: record.interactionId, question_index: page, text: answer.text });
     }
   }
   useImperativeHandle(ref, () => ({
     key,
     focus: () => root.current?.focus({ preventScroll: true }),
+    focusEditedInput: (index) => {
+      if (index !== page || busy) return;
+      onActivate();
+      setEditFocus({ index });
+    },
     flush: () => { if (mirrorTimer.current !== null) mirror(); },
     reply: (payload) => {
       // A restored request dropped while the page's record still read waiting can be answered later: its reply

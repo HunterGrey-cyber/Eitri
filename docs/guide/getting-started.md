@@ -315,8 +315,9 @@ turn still running.
 
 ## When you start again
 
-Close Eitri, or lose it to a crash or a reboot, and the next start in the same project opens the editor where you left
-it. The files you had in windows come back split the way they were, in the same tab pages, each window at the line and
+Close Eitri (`:qa` in the editor closes it as it closes Neovim, and so does closing the window; either asks first only
+when something would be interrupted, such as a running turn), or lose it to a crash or a reboot, and the next start in
+the same project opens the editor where you left it. The files you had in windows come back split the way they were, in the same tab pages, each window at the line and
 scroll position it had, with the same window holding the cursor. Files you had listed but not on screen are back in
 `:ls`. A split keeps its proportions, so a 30/70 split is still 30/70 on a narrower pane. When everything came back,
 Eitri says nothing.
