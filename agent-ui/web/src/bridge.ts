@@ -5,6 +5,8 @@ import { isHex64, isTrustRemember } from "./trust";
 import type { TrustPromptEnvelope } from "./trust";
 import type { ProposedChange } from "./proposal";
 import type { TabViewState } from "./tabs";
+import { detectTransport } from "./transport";
+import type { Transport } from "./transport";
 
 export type QuestionAnswerWire = { question_index: number; option_indexes: number[]; other_text?: string | null; notes?: string | null };
 
@@ -235,42 +237,30 @@ export type NavKeyDirection = "down" | "up";
  *  honours only for a permission id it itself offered a rule for. */
 export type PermissionDecision = "allow" | "deny";
 
-declare global {
-  interface Window {
-    webkit?: { messageHandlers?: { eitriAgent?: { postMessage: (msg: string) => void } } };
-    __eitriDispatch?: (json: string) => void;
-  }
+let transport: Transport | undefined;
+function activeTransport(): Transport {
+  return transport ??= detectTransport(window);
 }
 
-let requestCounter = 0;
-/** A per-page-load monotonic counter is enough uniqueness here -- this bridge only ever talks to
- * the one Rust host process behind this exact WebView instance, never a shared or multi-client
- * server, so there is no cross-client collision risk a random UUID would guard against. */
+/** Each transport owns its request-id space for this page load. Requests and mirrors share
+ *  its monotonic counter, with a transport-specific prefix keeping their origins distinct. */
 export function nextRequestId(): string {
-  requestCounter += 1;
-  return `req-${requestCounter}`;
+  return activeTransport().nextId("req");
 }
 
-const MIRROR_PREFIX = "mirror-";
 /** The id of a mirror (`draft`, `question_draft`): a copy of what the page holds, kept by Rust so a reload or a
  *  switch finds it again. Rust answers a mirror only to refuse it, and nothing on the page waits for that answer,
  *  so the id itself says what it was: a refusal can arrive after the dock or the tab that sent it is gone, and a
  *  table of mirrors in flight would grow with every one Rust took without a word. */
 export function nextMirrorId(): string {
-  requestCounter += 1;
-  return `${MIRROR_PREFIX}${requestCounter}`;
+  return activeTransport().nextId("mirror");
 }
 export function isMirrorRequest(requestId: string): boolean {
-  return requestId.startsWith(MIRROR_PREFIX);
+  return requestId.startsWith("mirror-") || requestId.startsWith("a-mirror-");
 }
 
 export function postToRust(message: OutboundMessage): void {
-  const handler = window.webkit?.messageHandlers?.eitriAgent;
-  if (!handler) {
-    console.warn("agent-ui: no WebKitGTK message handler present, message dropped", message);
-    return;
-  }
-  handler.postMessage(JSON.stringify(message));
+  activeTransport().post(JSON.stringify(message));
 }
 
 type InboundHandler = (
@@ -596,7 +586,7 @@ function isWellFormedRemote(value: Record<string, unknown>): boolean {
 }
 
 export function installDispatch(handler: InboundHandler): void {
-  window.__eitriDispatch = (json: string) => {
+  activeTransport().listen((json: string) => {
     let parsed: unknown;
     try {
       parsed = JSON.parse(json);
@@ -733,5 +723,5 @@ export function installDispatch(handler: InboundHandler): void {
       }
     }
     console.warn("agent-ui: __eitriDispatch received an unrecognized envelope shape", parsed);
-  };
+  });
 }

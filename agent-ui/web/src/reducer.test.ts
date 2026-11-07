@@ -24,6 +24,30 @@ import cliTurns from "./fixtures/cli-turns.json";
 /** The broker cards as Rust serialises them (`EditorCardWire`); `core/src/editor_tools/cards.rs` checks the same file byte for byte. */
 import editorCardsFixture from "./fixtures/editor-cards.json";
 
+it("desk_reducer_unchanged_without_the_hook", () => {
+  const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+  const before = initialState();
+  const event = { type: "future_event" } as unknown as AgentDomainEvent;
+  expect(applyEvent(before, event)).toEqual({ ...before, nextSeq: 1 });
+  expect(warn).toHaveBeenCalledWith("agent-ui: completely unhandled event shape from Rust", event);
+  const onUnknown = vi.fn();
+  expect(applyEvent(before, event, onUnknown)).toEqual(applyEvent(before, event));
+  expect(onUnknown).toHaveBeenCalledWith(event);
+  expect([event].reduce(applyEvent, before)).toEqual(applyEvent(before, event));
+  const nested = { type: "subagent_frame", parent_tool_use_id: "tool-1", frame: event } as unknown as AgentDomainEvent;
+  const quiet = applyEvent(before, nested);
+  onUnknown.mockClear();
+  expect(applyEvent(before, nested, onUnknown)).toEqual(quiet);
+  expect(onUnknown).toHaveBeenCalledTimes(1);
+  expect(onUnknown).toHaveBeenCalledWith(event);
+  const known = { type: "subagent_frame", parent_tool_use_id: "tool-1",
+    frame: { type: "model_reported", model: "inner" } } as unknown as AgentDomainEvent;
+  onUnknown.mockClear();
+  applyEvent(before, known, onUnknown);
+  expect(onUnknown).not.toHaveBeenCalled();
+  warn.mockRestore();
+});
+
 describe("applyEvent", () => {
   it("session_opened populates identity and sets status to running", () => {
     const event: AgentDomainEvent = { type: "session_opened", session_id: "abc-123", provider_session_id: "claude-abc-123", model: "claude-sonnet-5", cwd: "/tmp" };

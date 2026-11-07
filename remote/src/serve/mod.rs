@@ -46,6 +46,9 @@ pub mod spawn;
 #[cfg(target_os = "linux")]
 pub mod ws;
 
+#[cfg(test)]
+mod phone_fixtures;
+
 #[cfg(target_os = "linux")]
 pub use linux::*;
 

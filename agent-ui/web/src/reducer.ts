@@ -182,6 +182,7 @@ export function resetToStartScreen(state: AgentUiState): AgentUiState {
  */
 export function applyEvents(
   state: AgentUiState, events: readonly AgentDomainEvent[], revisions?: readonly number[],
+  onUnknown?: (event: AgentDomainEvent) => void,
 ): AgentUiState {
   let folded = state;
   let i = 0;
@@ -205,7 +206,7 @@ export function applyEvents(
       }
     }
     if (end - i === 1) {
-      folded = applyEvent(folded, first);
+      folded = applyEvent(folded, first, onUnknown);
     } else {
       const run = events.slice(i, end) as ContentDelta[];
       // Only a thinking run skips its empty head (see above); a text delta with no text still opens a
@@ -255,7 +256,11 @@ export function transcriptEntriesCopiedCount(): number {
  * it folds. The host can omit requests it answered itself; their revisions remain gaps in the
  * delivered tags. A resync ends in a snapshot, which re-seeds this counter rather than continuing it.
  */
-export function applyEvent(incoming: AgentUiState, event: AgentDomainEvent): AgentUiState {
+export function applyEvent(incoming: AgentUiState, event: AgentDomainEvent, onUnknown: ((event: AgentDomainEvent) => void) | undefined): AgentUiState;
+export function applyEvent(incoming: AgentUiState, event: AgentDomainEvent): AgentUiState;
+export function applyEvent(
+  incoming: AgentUiState, event: AgentDomainEvent, onUnknown?: ((event: AgentDomainEvent) => void) | number,
+): AgentUiState {
   const seq = incoming.nextSeq;
   // Advanced once, here, so every `return state` below carries it -- including the arms that change
   // nothing else. An event with no visible effect is still a real, ordered occurrence.
@@ -293,11 +298,39 @@ export function applyEvent(incoming: AgentUiState, event: AgentDomainEvent): Age
   if (event.type === "session_servers" || event.type === "client_tool_call" || event.type === "client_tool_call_settled") {
     return { ...incoming, nextSeq: seq + 1 };
   }
-  if (event.type === "subagent_frame") return subagents.fold({ ...state, turnThinking: incoming.turnThinking }, event, foldEvent);
-  return foldEvent(state, event, seq);
+  const unknown = typeof onUnknown === "function" ? onUnknown : undefined;
+  if (event.type === "subagent_frame") {
+    // A nested kind this build knows but does not show is dropped on purpose; only one it has no
+    // name for reaches the hook.
+    if (unknown) {
+      let leaf: unknown = event;
+      while (typeof leaf === "object" && leaf !== null && (leaf as { type?: unknown }).type === "subagent_frame") {
+        leaf = (leaf as { frame?: unknown }).frame;
+      }
+      const type = typeof leaf === "object" && leaf !== null ? (leaf as { type?: unknown }).type : undefined;
+      if (typeof type !== "string" || !knownEventTypes.has(type)) unknown(leaf as AgentDomainEvent);
+    }
+    return subagents.fold({ ...state, turnThinking: incoming.turnThinking }, event, foldEvent);
+  }
+  return foldEvent(state, event, seq, unknown);
 }
 
-function foldEvent(state: AgentUiState, event: AgentDomainEvent, seq: Seq): AgentUiState {
+/** Every event type this build folds; the record's type makes the compiler keep it complete. */
+const knownEventTypes: ReadonlySet<string> = new Set(Object.keys({
+  account_limits: true, assistant_message_boundary: true, background_calls: true, background_tasks_changed: true,
+  cli_cycle_started: true, client_tool_call: true, client_tool_call_settled: true, cli_permission_mode: true,
+  cli_work_unseen: true, commands_available: true, content_delta: true, conversation_reset: true,
+  effort_reported: true, model_reported: true, permission_mode_changed: true, permission_requested: true,
+  permission_denied: true, permission_resolved: true, policy_mismatch: true, question_asked: true,
+  question_settled: true, resume_outcome: true,
+  session_closed: true, session_notice: true, session_opened: true, session_servers: true,
+  session_unavailable: true, subagent_frame: true, task_event: true, tool_call_completed: true,
+  tool_call_started: true, tool_input_changed: true, turn_attributed: true, turn_cause_updated: true,
+  turn_completed: true, turn_started: true, user_message_delivered: true, user_message_dropped: true,
+  user_prompt_submitted: true, user_prompt_withdrawn: true,
+} satisfies Record<AgentDomainEvent["type"], true>));
+
+function foldEvent(state: AgentUiState, event: AgentDomainEvent, seq: Seq, onUnknown?: (event: AgentDomainEvent) => void): AgentUiState {
   switch (event.type) {
     case "turn_cause_updated": {
       // The cause the turn's close named replaces what its start said; a turn with no start row keeps
@@ -747,6 +780,7 @@ function foldEvent(state: AgentUiState, event: AgentDomainEvent, seq: Seq): Agen
       // Exhaustiveness guard: a new AgentDomainEvent variant added on the Rust side without a
       // matching TS case lands here at runtime -- observable, never silently dropped.
       console.warn("agent-ui: completely unhandled event shape from Rust", event);
+      onUnknown?.(event);
       return state;
     }
   }
