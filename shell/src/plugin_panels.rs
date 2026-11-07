@@ -1,4 +1,4 @@
-//! The window's plugin pages. Each plugin `init.lua` loaded becomes a Lua panel module `lua:<id>` whose
+//! The window's plugin pages. Each loaded plugin becomes a Lua panel module `lua:<id>` whose
 //! content is the plugin's page, with its host pumped from a GLib watch on a wake its threads raise, plus a
 //! one-shot timer only when the host asks for one: a plugin with nothing running costs no wake-up. Kill,
 //! window close, the layout and the window's editor are connected here.
@@ -21,6 +21,7 @@ use eitri_core::plugin::host::{
     SharedWrite, TerminalAtAnswer, WaitShow,
 };
 use eitri_core::plugin::keys::EffectiveRow;
+use eitri_core::plugin::kit_settings::KeysSettings;
 use eitri_core::plugin::load::LoadedPlugin;
 use eitri_core::plugin::manifest::{Capability, ShownWhile};
 use eitri_core::plugin::page_policy;
@@ -673,7 +674,7 @@ type LoadPage = Rc<dyn Fn(Option<&str>) -> bool>;
 
 /// One plugin's module: its host (none where WebKit cannot start), the port its host sends through, and the page
 /// build, which runs whenever the module has no page here.
-struct Panel {
+pub(crate) struct Panel {
     module: ModuleId,
     pump: Option<Rc<Pump>>,
     port: Rc<LazyPort>,
@@ -696,7 +697,7 @@ struct Panel {
     gesture: Option<Rc<GestureClock>>,
 }
 
-/// What `init.lua` registered for one plugin, read once at startup.
+/// One plugin registration, kept independently of the Lua registry's borrow.
 struct Registered {
     plugin: Rc<LoadedPlugin>,
     key: Option<String>,
@@ -948,23 +949,88 @@ impl FollowTotals {
     }
 }
 
+type MoveEvents = Rc<dyn Fn(eitri_core::wm::HostEvent)>;
+type HolderHook = Rc<dyn Fn(&str, bool)>;
+type GridTop = Rc<dyn Fn() -> Option<f64>>;
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Fact {
+    MoveEvents,
+    LinkEditor,
+    WindowRoot,
+    OwnWindow,
+    ScratchPrefix,
+    FollowRefused,
+    Editor,
+    GridTop,
+    Layout,
+    Agents,
+    WaitWindow,
+    Timeoutlen,
+    PageBuilt,
+    Holder,
+    Theme,
+    FollowFeed,
+    EditorGone,
+}
+
+/// The latest window settings, in the order they were applied. Replacing a setting moves it to the end,
+/// so a direct editor and an editor proxy retain the window's choice of which was installed last.
+#[derive(Clone)]
+struct WindowFacts {
+    order: Vec<Fact>,
+    move_events: Option<MoveEvents>,
+    link_editor: Option<Rc<crate::linked_window::editor::EditorOps>>,
+    window_root: Option<PathBuf>,
+    own_window: Option<Option<String>>,
+    scratch_prefix: Option<Option<PathBuf>>,
+    follow_refused: Option<Rc<dyn Fn()>>,
+    editor: Option<Rc<dyn EditorRpc>>,
+    grid_top: Option<GridTop>,
+    layout: Option<(ShowAndFocus, TerminalAt)>,
+    agents: Option<Option<Rc<WindowAgents>>>,
+    agents_feed: Option<Rc<AgentsFeed>>,
+    wait_window: Option<(Weak<PluginPanels>, Rc<dyn FollowWindow>)>,
+    timeoutlen: Option<u32>,
+    page_built: Option<PageBuilt>,
+    holder: Option<HolderHook>,
+    theme: PageTheme,
+    text_px: Option<f32>,
+    follow_feed: Option<(PathBuf, Option<PathBuf>)>,
+    editor_gone: bool,
+}
+
+impl WindowFacts {
+    fn new(theme: PageTheme) -> Self {
+        Self {
+            order: vec![Fact::Theme],
+            move_events: None,
+            link_editor: None,
+            window_root: None,
+            own_window: None,
+            scratch_prefix: None,
+            follow_refused: None,
+            editor: None,
+            grid_top: None,
+            layout: None,
+            agents: None,
+            agents_feed: None,
+            wait_window: None,
+            timeoutlen: None,
+            page_built: None,
+            holder: None,
+            theme,
+            text_px: None,
+            follow_feed: None,
+            editor_gone: false,
+        }
+    }
+}
+
 pub(crate) struct PluginPanels {
-    panels: Vec<Panel>,
-    /// The window's theme as the pages last got it: what a page built later starts with.
-    theme: RefCell<PageTheme>,
-    /// The editor's text size in the pages' CSS px, which every theme this window sends carries as
-    /// `--nv-text-size`; `None` in a window with no editor font to follow (one beside a person's own nvim).
-    text_px: Cell<Option<f32>>,
+    panels: RefCell<Vec<Rc<Panel>>>,
+    facts: RefCell<WindowFacts>,
     follow_totals: RefCell<FollowTotals>,
-    /// The editor's end was told to the hosts and no editor session has been seen since: an exit that is reported
-    /// twice (nvim's own exit, then the editor's retirement) tells the pages once.
-    editor_gone: Cell<bool>,
-    /// Told of each page's view once it exists, so the window's text size reaches it.
-    page_built: RefCell<Option<PageBuilt>>,
-    holder: RefCell<Option<Rc<dyn Fn(&str, bool)>>>,
-    /// The window's one agents feed, once [`PluginPanels::set_agents`] made it: what the modules shown while agents
-    /// wait are shown and hidden by.
-    agents_feed: RefCell<Option<Rc<AgentsFeed>>>,
 }
 
 /// What [`PluginPanels::set_page_built`] calls with a module and its new view.
@@ -978,163 +1044,329 @@ impl PluginPanels {
     /// `Err` is a startup failure's text.
     pub(crate) fn install(engine: &LuaEngine, keymap: &Keymap, theme: &PageTheme) -> Result<PluginPanels, String> {
         let loaded: Vec<Registered> = engine.plugins.borrow().plugins().iter().map(Registered::of).collect();
-        let store_root = PluginStore::eitri_root_from_env();
         let mut panels = Vec::new();
         let keys_settings =
             eitri_core::plugin::kit_settings::from_config(|key| engine.config.borrow().get(key).map(str::to_owned))?;
         for registration in loaded {
-            let plugin = registration.plugin.clone();
-            let key = registration.key.clone();
-            let slot = registration.slot;
-            let id = plugin.manifest.id.clone();
-            let clash = engine.panels.borrow().entries().iter().any(|e| e.id == id);
-            if clash {
-                return Err(format!("eitri.plugin.load: plugin {id} has the id of a Lua panel"));
-            }
-            let url = page_policy::entry_uri(&id, &plugin.manifest.entry);
-            let title = plugin.manifest.title.clone();
-            let wake = if crate::webkit_sandbox::decision().allows_webviews() {
-                PanelWake::new()
-                    .map_err(|e| eprintln!("[plugin {id}] cannot start: {e}"))
-                    .ok()
-            } else {
-                eprintln!("[plugin {id}] not loading its page: WebKit's sandbox cannot start here");
-                None
-            };
-            let port = Rc::new(LazyPort::default());
-            let gesture = plugin
-                .manifest
-                .has(Capability::Agents)
-                .then(|| Rc::new(GestureClock::default()));
-            let webview: Rc<RefCell<Option<webkit6::WebView>>> = Rc::default();
-            let crash_guard = Rc::new(RefCell::new(WebViewCrashGuard::with_defaults()));
-            let (widget, pump, build) = match wake {
-                Some(wake) => {
-                    let cell: Rc<OnceCell<Rc<Pump>>> = Rc::new(OnceCell::new());
-                    let hooks = PageHooks {
-                        on_message: {
-                            let cell = cell.clone();
-                            Rc::new(move |raw: &str| {
-                                if let Some(pump) = cell.get() {
-                                    pump.host.page_message(raw, Instant::now());
-                                    pump.kick();
-                                }
-                            })
-                        },
-                        on_committed: {
-                            let cell = cell.clone();
-                            Rc::new(move || {
-                                if let Some(pump) = cell.get() {
-                                    pump.committed();
-                                }
-                            })
-                        },
-                        open_outside: Rc::new(plugin_page::open_outside),
-                    };
-                    let doc_slot = plugin
-                        .manifest
-                        .has(Capability::EditorFollow)
-                        .then(|| Rc::new(RefCell::new(DocSlot::default())));
-                    let spec = PageSpec {
-                        id: id.clone(),
-                        site_root: plugin.site_root.clone(),
-                        entry: plugin.manifest.entry.clone(),
-                        origins: plugin.manifest.origins.clone(),
-                        downloads: downloads_dir(),
-                        doc_slot: doc_slot.clone(),
-                        remote_images: plugin.remote_images,
-                        console_to_stdout: eitri_core::plugin::trace::enabled(),
-                        agents_kit: plugin.manifest.has(Capability::Agents),
-                    };
-                    let store = store_root.clone().map(|root| PluginStore::new(root, &id));
-                    let overrides = keymap.plugin_user(&id).to_vec();
-                    let host = Rc::new(PluginHost::new(
-                        plugin.clone(),
-                        port.clone(),
-                        wake.waker(),
-                        store,
-                        overrides,
-                    ));
-                    host.set_prefix_key(keymap.prefix());
-                    host.set_keys_settings(keys_settings.clone());
-                    // A view built now or later wears `theme`; the host records it so it sends nothing for the
-                    // same set.
-                    host.set_theme(theme);
-                    host.set_module_key(key.as_deref());
-                    // The host fills the slot with the followed document's project; the page's scheme handler
-                    // reads the same slot.
-                    if let Some(slot) = &doc_slot {
-                        host.set_doc_slot(slot.clone());
-                    }
-                    let pump = Pump::start(host, wake, webview.clone());
-                    let _ = cell.set(pump.clone());
-                    // The grid holds the slot, never the view: a view is dropped when its page leaves for the
-                    // other window and a new one is built into the same slot when it comes back, so the module's
-                    // grid host stays as it is.
-                    let slot_widget = page_slot::PageSlot::new();
-                    let build: BuildPage = {
-                        let id = id.clone();
-                        let url = url.clone();
-                        let crash_guard = crash_guard.clone();
-                        let webview = webview.clone();
-                        let slot_widget = slot_widget.clone();
-                        let gesture = gesture.clone();
-                        Rc::new(move |theme: &PageTheme| {
-                            let view = plugin_page::build(&spec, hooks.clone(), theme);
-                            if let Some(clock) = &gesture {
-                                plugin_page::observe_gestures(&view, clock.clone());
-                            }
-                            slot_widget.set_page(&view);
-                            install_crash_recovery_into(
-                                &view,
-                                id.clone(),
-                                url.clone(),
-                                Some(page_policy::host_page_base(&id)),
-                                crash_guard.clone(),
-                            );
-                            let page: Rc<dyn PagePort> = Rc::new(WebKitPluginPage(view.downgrade()));
-                            *webview.borrow_mut() = Some(view);
-                            eitri_core::plugin::trace::line(&id, "page built", "");
-                            Some(page)
-                        })
-                    };
-                    // Page creation waits until the window's layout and ownership have been decided.
-                    (slot_widget.upcast::<gtk4::Widget>(), Some(pump), Some(build))
-                }
-                None => (crate::webkit_sandbox::lua_panel_placeholder(&title), None, None),
-            };
-            engine.panels.borrow_mut().register(PanelEntry {
-                id,
-                title,
-                slot,
-                key,
-                url,
-                widget,
-                crash_guard,
-            });
-            let mut panel = Panel::new(&registration, pump, port, build, webview);
-            panel.gesture = gesture;
-            panels.push(panel);
+            panels.push(Self::make_panel(engine, keymap, theme, &registration, &keys_settings)?);
         }
         Ok(PluginPanels {
-            panels,
-            theme: RefCell::new(theme.clone()),
-            text_px: Cell::new(None),
+            panels: RefCell::new(panels),
+            facts: RefCell::new(WindowFacts::new(theme.clone())),
             follow_totals: RefCell::default(),
-            editor_gone: Cell::new(false),
-            page_built: RefCell::new(None),
-            holder: RefCell::new(None),
-            agents_feed: RefCell::new(None),
         })
+    }
+
+    fn make_panel(
+        engine: &LuaEngine,
+        keymap: &Keymap,
+        theme: &PageTheme,
+        registration: &Registered,
+        keys_settings: &KeysSettings,
+    ) -> Result<Rc<Panel>, String> {
+        let store_root = PluginStore::eitri_root_from_env();
+        let plugin = registration.plugin.clone();
+        let key = registration.key.clone();
+        let slot = registration.slot;
+        let id = plugin.manifest.id.clone();
+        let clash = engine.panels.borrow().entries().iter().any(|e| e.id == id);
+        if clash {
+            return Err(format!("eitri.plugin.load: plugin {id} has the id of a Lua panel"));
+        }
+        let url = page_policy::entry_uri(&id, &plugin.manifest.entry);
+        let title = plugin.manifest.title.clone();
+        let wake = if crate::webkit_sandbox::decision().allows_webviews() {
+            PanelWake::new()
+                .map_err(|e| eprintln!("[plugin {id}] cannot start: {e}"))
+                .ok()
+        } else {
+            eprintln!("[plugin {id}] not loading its page: WebKit's sandbox cannot start here");
+            None
+        };
+        let port = Rc::new(LazyPort::default());
+        let gesture = plugin
+            .manifest
+            .has(Capability::Agents)
+            .then(|| Rc::new(GestureClock::default()));
+        let webview: Rc<RefCell<Option<webkit6::WebView>>> = Rc::default();
+        let crash_guard = Rc::new(RefCell::new(WebViewCrashGuard::with_defaults()));
+        let (widget, pump, build) = match wake {
+            Some(wake) => {
+                let cell: Rc<OnceCell<Rc<Pump>>> = Rc::new(OnceCell::new());
+                let hooks = PageHooks {
+                    on_message: {
+                        let cell = cell.clone();
+                        Rc::new(move |raw: &str| {
+                            if let Some(pump) = cell.get() {
+                                pump.host.page_message(raw, Instant::now());
+                                pump.kick();
+                            }
+                        })
+                    },
+                    on_committed: {
+                        let cell = cell.clone();
+                        Rc::new(move || {
+                            if let Some(pump) = cell.get() {
+                                pump.committed();
+                            }
+                        })
+                    },
+                    open_outside: Rc::new(plugin_page::open_outside),
+                };
+                let doc_slot = plugin
+                    .manifest
+                    .has(Capability::EditorFollow)
+                    .then(|| Rc::new(RefCell::new(DocSlot::default())));
+                let spec = PageSpec {
+                    id: id.clone(),
+                    site_root: plugin.site_root.clone(),
+                    entry: plugin.manifest.entry.clone(),
+                    origins: plugin.manifest.origins.clone(),
+                    downloads: downloads_dir(),
+                    doc_slot: doc_slot.clone(),
+                    remote_images: plugin.remote_images,
+                    console_to_stdout: eitri_core::plugin::trace::enabled(),
+                    agents_kit: plugin.manifest.has(Capability::Agents),
+                };
+                let store = store_root.clone().map(|root| PluginStore::new(root, &id));
+                let overrides = keymap.plugin_user(&id).to_vec();
+                let host = Rc::new(PluginHost::new(
+                    plugin.clone(),
+                    port.clone(),
+                    wake.waker(),
+                    store,
+                    overrides,
+                ));
+                host.set_prefix_key(keymap.prefix());
+                host.set_keys_settings(keys_settings.clone());
+                // A view built now or later wears `theme`; the host records it so it sends nothing for the
+                // same set.
+                host.set_theme(theme);
+                host.set_module_key(key.as_deref());
+                // The host fills the slot with the followed document's project; the page's scheme handler
+                // reads the same slot.
+                if let Some(slot) = &doc_slot {
+                    host.set_doc_slot(slot.clone());
+                }
+                let pump = Pump::start(host, wake, webview.clone());
+                let _ = cell.set(pump.clone());
+                // The grid holds the slot, never the view: a view is dropped when its page leaves for the
+                // other window and a new one is built into the same slot when it comes back, so the module's
+                // grid host stays as it is.
+                let slot_widget = page_slot::PageSlot::new();
+                let build: BuildPage = {
+                    let id = id.clone();
+                    let url = url.clone();
+                    let crash_guard = crash_guard.clone();
+                    let webview = webview.clone();
+                    let slot_widget = slot_widget.clone();
+                    let gesture = gesture.clone();
+                    Rc::new(move |theme: &PageTheme| {
+                        let view = plugin_page::build(&spec, hooks.clone(), theme);
+                        if let Some(clock) = &gesture {
+                            plugin_page::observe_gestures(&view, clock.clone());
+                        }
+                        slot_widget.set_page(&view);
+                        install_crash_recovery_into(
+                            &view,
+                            id.clone(),
+                            url.clone(),
+                            Some(page_policy::host_page_base(&id)),
+                            crash_guard.clone(),
+                        );
+                        let page: Rc<dyn PagePort> = Rc::new(WebKitPluginPage(view.downgrade()));
+                        *webview.borrow_mut() = Some(view);
+                        eitri_core::plugin::trace::line(&id, "page built", "");
+                        Some(page)
+                    })
+                };
+                // Page creation waits until the window's layout and ownership have been decided.
+                (slot_widget.upcast::<gtk4::Widget>(), Some(pump), Some(build))
+            }
+            None => (crate::webkit_sandbox::lua_panel_placeholder(&title), None, None),
+        };
+        engine.panels.borrow_mut().register(PanelEntry {
+            id,
+            title,
+            slot,
+            key,
+            url,
+            widget,
+            crash_guard,
+        });
+        let mut panel = Panel::new(registration, pump, port, build, webview);
+        panel.gesture = gesture;
+        Ok(Rc::new(panel))
+    }
+
+    /// Registers a page for this run. Its slot is placed by the caller after the window's facts reach its host.
+    pub(crate) fn join(
+        &self,
+        engine: &LuaEngine,
+        keymap: &Keymap,
+        registration: &PluginRegistration,
+    ) -> Result<Rc<Panel>, String> {
+        let registration = Registered::of(registration);
+        self.join_with(&registration, || {
+            let keys_settings = eitri_core::plugin::kit_settings::from_config(|key| {
+                engine.config.borrow().get(key).map(str::to_owned)
+            })?;
+            Self::make_panel(engine, keymap, &self.theme(), &registration, &keys_settings)
+        })
+    }
+
+    /// The factory also lets display-free tests supply a host without constructing a GTK slot.
+    fn join_with(
+        &self,
+        registration: &Registered,
+        make: impl FnOnce() -> Result<Rc<Panel>, String>,
+    ) -> Result<Rc<Panel>, String> {
+        let module = ModuleId::lua(&registration.plugin.manifest.id);
+        if self.panel(&module).is_some() {
+            return Err(format!("plugin {} is already loaded", registration.plugin.manifest.id));
+        }
+        let panel = make()?;
+        let facts = self.facts.borrow().clone();
+        for fact in &facts.order {
+            self.apply_fact(&panel, &facts, *fact, true);
+        }
+        if let Some(pump) = &panel.pump {
+            pump.host.set_own_window(false);
+        }
+        self.panels.borrow_mut().push(panel.clone());
+        if facts.editor.is_some() || facts.link_editor.is_some() {
+            if let Some(pump) = &panel.pump {
+                pump.host.editor_session(Instant::now());
+            }
+        }
+        Ok(panel)
+    }
+
+    /// No collection borrow crosses a host call, a hook or GTK: any of those may enter this window again.
+    fn snapshot(&self) -> Vec<Rc<Panel>> {
+        self.panels.borrow().clone()
+    }
+
+    fn record(&self, fact: Fact, update: impl FnOnce(&mut WindowFacts)) {
+        let facts = {
+            let mut facts = self.facts.borrow_mut();
+            update(&mut facts);
+            facts.order.retain(|old| *old != fact);
+            facts.order.push(fact);
+            facts.clone()
+        };
+        for panel in self.snapshot() {
+            self.apply_fact(&panel, &facts, fact, false);
+        }
+    }
+
+    fn apply_fact(&self, panel: &Rc<Panel>, facts: &WindowFacts, fact: Fact, joined: bool) {
+        match fact {
+            Fact::Holder => {}
+            Fact::PageBuilt => {
+                let view = panel.webview.borrow().clone();
+                if let (Some(hook), Some(view)) = (&facts.page_built, view) {
+                    hook(&panel.module, &view);
+                }
+            }
+            Fact::WaitWindow => {
+                if let (Some(feed), Some((panels, window))) = (&facts.agents_feed, &facts.wait_window) {
+                    Self::watch_agents_wait(panel, feed, panels, window, joined);
+                }
+            }
+            _ => {
+                let Some(pump) = &panel.pump else { return };
+                let host = &pump.host;
+                match fact {
+                    Fact::MoveEvents => *pump.events.borrow_mut() = facts.move_events.clone(),
+                    Fact::LinkEditor => {
+                        if let Some(ops) = &facts.link_editor {
+                            host.set_editor(Rc::new(crate::linked_window::editor::PluginEditorRpc::new(
+                                host.plugin().manifest.id.clone(),
+                                host.plugin().roots.clone(),
+                                ops.clone(),
+                            )));
+                        }
+                    }
+                    Fact::WindowRoot => {
+                        if let Some(root) = &facts.window_root {
+                            host.set_window_root(root.clone());
+                        }
+                    }
+                    Fact::OwnWindow => host.set_own_window(
+                        !joined
+                            && facts.own_window.as_ref().and_then(|owner| owner.as_deref())
+                                == Some(host.plugin().manifest.id.as_str()),
+                    ),
+                    Fact::ScratchPrefix if host.wants_follow_feed() => {
+                        if let Some(prefix) = &facts.scratch_prefix {
+                            host.set_scratch_prefix(prefix.clone());
+                        }
+                    }
+                    Fact::FollowRefused => {
+                        if let Some(hook) = &facts.follow_refused {
+                            host.on_follow_refused(hook.clone());
+                        }
+                    }
+                    Fact::Editor => {
+                        if let Some(editor) = &facts.editor {
+                            host.set_editor(editor.clone());
+                        }
+                    }
+                    Fact::GridTop => {
+                        if let Some(source) = &facts.grid_top {
+                            host.set_grid_top(source.clone());
+                        }
+                    }
+                    Fact::Layout => {
+                        if let Some((show_and_focus, terminal_at)) = &facts.layout {
+                            host.set_layout(Rc::new(WindowLayout {
+                                own: panel.module.clone(),
+                                plugin: host.plugin().manifest.id.clone(),
+                                show_and_focus: show_and_focus.clone(),
+                                terminal_at: terminal_at.clone(),
+                            }));
+                        }
+                    }
+                    Fact::Agents => match facts.agents.as_ref() {
+                        Some(Some(window)) => {
+                            if let (Some(feed), Some(gesture)) = (&facts.agents_feed, &panel.gesture) {
+                                host.set_agents(Some(AgentsServices {
+                                    feed: feed.clone(),
+                                    port: window.clone(),
+                                    gesture: gesture.clone(),
+                                }));
+                            }
+                        }
+                        Some(None) => host.set_agents(None),
+                        None => {}
+                    },
+                    Fact::Timeoutlen => {
+                        if let Some(ms) = facts.timeoutlen {
+                            host.set_timeoutlen(ms);
+                        }
+                    }
+                    Fact::Theme if !panel.away.get() => host.set_theme(&facts.theme),
+                    Fact::FollowFeed if host.wants_follow_feed() => {
+                        if let Some((socket, scratch)) = &facts.follow_feed {
+                            host.set_follow_feed(socket.clone(), scratch.clone());
+                        }
+                    }
+                    Fact::EditorGone if facts.editor_gone && !panel.away.get() => {
+                        host.editor_closed(Instant::now());
+                        if !joined {
+                            pump.kick();
+                        }
+                    }
+                    _ => {}
+                }
+            }
+        }
     }
 
     /// Routes lifecycle facts to the controller; the pump consumes each ready indication once.
     pub(crate) fn set_move_events(&self, hook: Rc<dyn Fn(eitri_core::wm::HostEvent)>) {
-        for panel in &self.panels {
-            if let Some(pump) = &panel.pump {
-                *pump.events.borrow_mut() = Some(hook.clone());
-            }
-        }
+        self.record(Fact::MoveEvents, |facts| facts.move_events = Some(hook));
     }
 
     pub(crate) fn freeze(
@@ -1145,25 +1377,25 @@ impl PluginPanels {
     ) -> Result<(), String> {
         let pump = self
             .panel(module)
-            .and_then(|p| p.pump.as_ref())
+            .and_then(|p| p.pump.clone())
             .ok_or("the page has no running host")?;
         pump.freeze(win, module.clone(), mv)
     }
 
     pub(crate) fn resume(&self, module: &ModuleId) {
-        if let Some(pump) = self.panel(module).and_then(|p| p.pump.as_ref()) {
+        if let Some(pump) = self.panel(module).and_then(|p| p.pump.clone()) {
             pump.resume();
         }
     }
 
     /// Ownership changes also retarget follow lines in the window that holds the editor.
     pub(crate) fn set_holder_hook(&self, hook: Rc<dyn Fn(&str, bool)>) {
-        *self.holder.borrow_mut() = Some(hook);
+        self.record(Fact::Holder, |facts| facts.holder = Some(hook));
     }
 
     fn holder_changed(&self, panel: &Panel, held: bool) {
         panel.away.set(!held);
-        let hook = self.holder.borrow().clone();
+        let hook = self.facts.borrow().holder.clone();
         if let (Some(hook), Some(pump)) = (hook, &panel.pump) {
             hook(&pump.host.plugin().manifest.id, held);
         }
@@ -1186,12 +1418,12 @@ impl PluginPanels {
         // Whether the page is drawn here is told afresh when it comes back: its host forgot it with the document.
         panel.on_screen.set(None);
         panel.fresh_page.set(false);
-        self.holder_changed(panel, false);
+        self.holder_changed(&panel, false);
         if let Some(pump) = &panel.pump {
             pump.paused.borrow_mut().clear();
             pump.host.forget_moved();
         }
-        self.drop_view(panel);
+        self.drop_view(&panel);
     }
 
     /// The page left this window, so its view goes: its web process ends (a deliberate end, which the crash guard
@@ -1220,7 +1452,7 @@ impl PluginPanels {
         if pump.restoring.borrow().is_some() {
             return Err("the page is already adopting tasks".into());
         }
-        self.holder_changed(panel, true);
+        self.holder_changed(&panel, true);
         pump.host.set_theme(&self.theme());
         pump.adopting.set(true);
         pump.host.accept_moved();
@@ -1309,20 +1541,11 @@ impl PluginPanels {
     }
 
     pub(crate) fn set_link_editor(&self, ops: Rc<crate::linked_window::editor::EditorOps>) {
-        for panel in &self.panels {
-            if let Some(pump) = &panel.pump {
-                pump.host
-                    .set_editor(Rc::new(crate::linked_window::editor::PluginEditorRpc::new(
-                        pump.host.plugin().manifest.id.clone(),
-                        pump.host.plugin().roots.clone(),
-                        ops.clone(),
-                    )));
-            }
-        }
+        self.record(Fact::LinkEditor, |facts| facts.link_editor = Some(ops));
     }
 
-    fn panel(&self, module: &ModuleId) -> Option<&Panel> {
-        self.panels.iter().find(|p| p.module == *module)
+    fn panel(&self, module: &ModuleId) -> Option<Rc<Panel>> {
+        self.snapshot().into_iter().find(|p| p.module == *module)
     }
 
     /// Whether `module` is a plugin's that starts hidden: the window never places it by itself.
@@ -1346,7 +1569,7 @@ impl PluginPanels {
     pub(crate) fn activate_holding(&self, module: &ModuleId) {
         if let Some(panel) = self.panel(module) {
             if panel.away.get() {
-                self.holder_changed(panel, true);
+                self.holder_changed(&panel, true);
                 if let Some(pump) = &panel.pump {
                     pump.host.accept_moved();
                     pump.host.set_theme(&self.theme());
@@ -1371,7 +1594,7 @@ impl PluginPanels {
         let page = build(theme);
         panel.fresh_page.set(page.is_some());
         *panel.port.0.borrow_mut() = page;
-        let (hook, view) = (self.page_built.borrow().clone(), panel.webview.borrow().clone());
+        let (hook, view) = (self.facts.borrow().page_built.clone(), panel.webview.borrow().clone());
         if let (Some(hook), Some(view)) = (hook, view) {
             hook(&panel.module, &view);
         }
@@ -1407,18 +1630,12 @@ impl PluginPanels {
     /// `hook` hears of every page's view: now, of each built already (a page that starts shown is built at
     /// startup, before the window's text size exists), and later of each built at its first show.
     pub(crate) fn set_page_built(&self, hook: PageBuilt) {
-        for panel in &self.panels {
-            let view = panel.webview.borrow().clone();
-            if let Some(view) = view {
-                hook(&panel.module, &view);
-            }
-        }
-        *self.page_built.borrow_mut() = Some(hook);
+        self.record(Fact::PageBuilt, |facts| facts.page_built = Some(hook));
     }
 
     /// The window's theme as the pages last got it (what a page built later starts with).
     pub(crate) fn theme(&self) -> PageTheme {
-        self.theme.borrow().clone()
+        self.facts.borrow().theme.clone()
     }
 
     /// The module's built view, for a kill (its web process ended) and a revive (loaded again).
@@ -1426,26 +1643,26 @@ impl PluginPanels {
         self.panel(module).and_then(|p| p.webview.borrow().clone())
     }
 
-    fn hosts(&self) -> impl Iterator<Item = (&ModuleId, &Rc<Pump>)> {
-        self.panels
-            .iter()
-            .filter_map(|panel| panel.pump.as_ref().map(|p| (&panel.module, p)))
+    fn hosts(&self) -> impl Iterator<Item = (ModuleId, Rc<Pump>)> {
+        self.snapshot()
+            .into_iter()
+            .filter_map(|panel| panel.pump.clone().map(|pump| (panel.module.clone(), pump)))
     }
 
-    fn held_hosts(&self) -> impl Iterator<Item = (&ModuleId, &Rc<Pump>)> {
-        self.panels
-            .iter()
+    fn held_hosts(&self) -> impl Iterator<Item = (ModuleId, Rc<Pump>)> {
+        self.snapshot()
+            .into_iter()
             .filter(|panel| !panel.away.get())
-            .filter_map(|panel| panel.pump.as_ref().map(|pump| (&panel.module, pump)))
+            .filter_map(|panel| panel.pump.clone().map(|pump| (panel.module.clone(), pump)))
     }
 
-    /// Every plugin's module, in the order `init.lua` loaded them.
+    /// Every plugin's module, in load order.
     pub(crate) fn modules(&self) -> Vec<ModuleId> {
-        self.panels.iter().map(|p| p.module.clone()).collect()
+        self.snapshot().into_iter().map(|p| p.module.clone()).collect()
     }
 
     /// The host of the plugin `owner` names, when it is loaded here and wants the follow socket's lines.
-    fn follower(&self, owner: &str) -> Option<&Rc<Pump>> {
+    fn follower(&self, owner: &str) -> Option<Rc<Pump>> {
         self.held_hosts()
             .map(|(_, pump)| pump)
             .find(|pump| pump.host.plugin().manifest.id == owner && pump.host.wants_follow_feed())
@@ -1458,12 +1675,9 @@ impl PluginPanels {
 
     /// The window's follow socket and Eitri's scratch directory, to every host that wants them.
     pub(crate) fn set_follow_feed(&self, socket: &Path, scratch_dir: Option<&Path>) {
-        for (_, pump) in self.hosts() {
-            if pump.host.wants_follow_feed() {
-                pump.host
-                    .set_follow_feed(socket.to_path_buf(), scratch_dir.map(Path::to_path_buf));
-            }
-        }
+        self.record(Fact::FollowFeed, |facts| {
+            facts.follow_feed = Some((socket.to_owned(), scratch_dir.map(Path::to_owned)))
+        });
     }
 
     /// Views and gone lines to their hosts (each host pumped once after); commands back in order for the window:
@@ -1492,14 +1706,14 @@ impl PluginPanels {
                 touched.push(pump.clone());
             }
         };
-        let editor_gone = self.editor_gone.get();
+        let editor_gone = self.facts.borrow().editor_gone;
         for view in batch.views {
             if editor_gone {
                 break;
             }
             if let Some(pump) = self.follower(&view.owner) {
                 pump.host.follow_view(view, now);
-                touch(pump);
+                touch(&pump);
             }
         }
         let mut commands = Vec::new();
@@ -1511,7 +1725,7 @@ impl PluginPanels {
                     }
                     if let Some(pump) = self.follower(&owner) {
                         pump.host.follow_gone(buf, now);
-                        touch(pump);
+                        touch(&pump);
                     }
                 }
                 Ordered::Cmd { owner, cmd, .. } => {
@@ -1543,29 +1757,22 @@ impl PluginPanels {
 
     /// The window's project root: a followed document inside it has it as its project.
     pub(crate) fn set_window_root(&self, root: &Path) {
-        for (_, pump) in self.hosts() {
-            pump.host.set_window_root(root.to_path_buf());
-        }
+        self.record(Fact::WindowRoot, |facts| facts.window_root = Some(root.to_owned()));
     }
 
     /// Exactly the host whose declared root owns this window receives the own-window grant.
     pub(crate) fn set_own_window(&self, owner: Option<&str>) {
-        for (_, pump) in self.hosts() {
-            pump.host
-                .set_own_window(owner == Some(pump.host.plugin().manifest.id.as_str()));
-        }
+        self.record(Fact::OwnWindow, |facts| {
+            facts.own_window = Some(owner.map(str::to_owned))
+        });
     }
 
     /// The window's editor's nvim ended: every following page is told, once, until a new nvim runs.
     pub(crate) fn editor_closed(&self) {
-        if self.editor_gone.replace(true) {
+        if self.facts.borrow().editor_gone {
             return;
         }
-        let now = Instant::now();
-        for (_, pump) in self.held_hosts() {
-            pump.host.editor_closed(now);
-            pump.kick();
-        }
+        self.record(Fact::EditorGone, |facts| facts.editor_gone = true);
     }
 
     /// The window's editor runs a new nvim, in the pane whose nvim ended: what [`editor_closed`](Self::editor_closed)
@@ -1577,7 +1784,7 @@ impl PluginPanels {
 
     /// Each host looks at the editor's session now (nvim may have just started).
     pub(crate) fn editor_session(&self) {
-        self.editor_gone.set(false);
+        self.facts.borrow_mut().editor_gone = false;
         let now = Instant::now();
         for (_, pump) in self.held_hosts() {
             pump.host.editor_session(now);
@@ -1587,66 +1794,39 @@ impl PluginPanels {
     /// Excludes every Eitri scratch directory under `prefix` from following, the agent window's drafts among them, for
     /// every host that follows the editor.
     pub(crate) fn set_scratch_prefix(&self, prefix: Option<PathBuf>) {
-        for (_, pump) in self.hosts() {
-            if pump.host.wants_follow_feed() {
-                pump.host.set_scratch_prefix(prefix.clone());
-            }
-        }
+        self.record(Fact::ScratchPrefix, |facts| facts.scratch_prefix = Some(prefix));
     }
 
     /// What runs when the editor refuses a host's follow snippet: the hosts never try it again themselves.
     pub(crate) fn on_follow_refused(&self, hook: Rc<dyn Fn()>) {
-        for (_, pump) in self.hosts() {
-            pump.host.on_follow_refused(hook.clone());
-        }
+        self.record(Fact::FollowRefused, |facts| facts.follow_refused = Some(hook));
     }
 
     /// The window's one editor handle, shared with the chat.
     pub(crate) fn set_editor(&self, editor: Rc<dyn EditorRpc>) {
-        for (_, pump) in self.hosts() {
-            pump.host.set_editor(editor.clone());
-        }
+        self.record(Fact::Editor, |facts| facts.editor = Some(editor));
     }
 
     /// Where the window's editor draws nvim's grid (the share of its height above the first row), for views.
     pub(crate) fn set_grid_top(&self, source: Rc<dyn Fn() -> Option<f64>>) {
-        for (_, pump) in self.hosts() {
-            pump.host.set_grid_top(source.clone());
-        }
+        self.record(Fact::GridTop, |facts| facts.grid_top = Some(source));
     }
 
     pub(crate) fn set_layout(&self, show_and_focus: ShowAndFocus, terminal_at: TerminalAt) {
-        for (module, pump) in self.hosts() {
-            pump.host.set_layout(Rc::new(WindowLayout {
-                own: module.clone(),
-                plugin: pump.host.plugin().manifest.id.clone(),
-                show_and_focus: show_and_focus.clone(),
-                terminal_at: terminal_at.clone(),
-            }));
-        }
+        self.record(Fact::Layout, |facts| facts.layout = Some((show_and_focus, terminal_at)));
     }
 
     /// The agents layer for the pages that declare `agents`: one feed for the whole window, so every such page
     /// reads the same reader, and the window's port. `None` (the layer is off) leaves each of them answering
     /// `disabled`.
     pub(crate) fn set_agents(&self, window: Option<Rc<WindowAgents>>) {
-        let Some(window) = window else {
-            for (_, pump) in self.hosts() {
-                pump.host.set_agents(None);
-            }
-            return;
-        };
-        let feed = AgentsFeed::of_dir(window.control_dir.clone());
-        *self.agents_feed.borrow_mut() = Some(feed.clone());
-        for panel in &self.panels {
-            if let (Some(pump), Some(gesture)) = (&panel.pump, &panel.gesture) {
-                pump.host.set_agents(Some(AgentsServices {
-                    feed: feed.clone(),
-                    port: window.clone(),
-                    gesture: gesture.clone(),
-                }));
-            }
-        }
+        let feed = window
+            .as_ref()
+            .map(|window| AgentsFeed::of_dir(window.control_dir.clone()));
+        self.record(Fact::Agents, |facts| {
+            facts.agents = Some(window);
+            facts.agents_feed = feed;
+        });
     }
 
     /// Shows and hides each module declared `[module] shown_while = "agents-wait"` from the window's agents feed
@@ -1654,47 +1834,63 @@ impl PluginPanels {
     /// stop, hidden when neither holds, each time the answer changes, so a show or hide the person makes in between
     /// stands until the next change. A module handed to another window is left alone.
     pub(crate) fn show_while_agents_wait(self: &Rc<Self>, window: Rc<dyn FollowWindow>) {
-        let Some(feed) = self.agents_feed.borrow().clone() else {
+        let panels = Rc::downgrade(self);
+        self.record(Fact::WaitWindow, |facts| facts.wait_window = Some((panels, window)));
+    }
+
+    fn watch_agents_wait(
+        panel: &Panel,
+        feed: &Rc<AgentsFeed>,
+        panels: &Weak<PluginPanels>,
+        window: &Rc<dyn FollowWindow>,
+        joined: bool,
+    ) {
+        let declared = panel
+            .pump
+            .as_ref()
+            .and_then(|pump| pump.host.plugin().manifest.module.as_ref().and_then(|m| m.shown_while));
+        if declared != Some(ShownWhile::AgentsWait) {
             return;
+        }
+        let module = panel.module.clone();
+        let wake = match PanelWake::new() {
+            Ok(wake) => wake,
+            Err(e) => {
+                eprintln!("[plugin] {module:?} cannot follow the agents that wait: {e}");
+                return;
+            }
         };
-        for panel in &self.panels {
-            let declared = panel
-                .pump
-                .as_ref()
-                .and_then(|pump| pump.host.plugin().manifest.module.as_ref().and_then(|m| m.shown_while));
-            if declared != Some(ShownWhile::AgentsWait) {
-                continue;
-            }
-            let module = panel.module.clone();
-            let wake = match PanelWake::new() {
-                Ok(wake) => wake,
-                Err(e) => {
-                    eprintln!("[plugin] {module:?} cannot follow the agents that wait: {e}");
-                    continue;
-                }
-            };
-            let follow = Rc::new(WaitFollow {
-                show: WaitShow::new(feed.clone(), wake.waker()),
-                panels: Rc::downgrade(self),
-                window: window.clone(),
-                module,
-                recheck: RefCell::new(None),
-            });
-            let fd = wake.fd();
-            let named = format!("{:?}", follow.module);
-            let watched = neovide_editor::fd_watch::add_local(
-                fd,
-                glib::IOCondition::IN | glib::IOCondition::ERR | glib::IOCondition::HUP,
-                glib::ffi::G_PRIORITY_DEFAULT,
-                move |_| {
-                    wake.take();
+        let follow = Rc::new(WaitFollow {
+            show: WaitShow::new(feed.clone(), wake.waker()),
+            panels: panels.clone(),
+            window: window.clone(),
+            module,
+            recheck: RefCell::new(None),
+        });
+        if joined {
+            // The panel enters the collection and the controller declares its module after these facts are
+            // replayed. Wait until idle so the first pump can show it from the feed's cached state.
+            let weak = Rc::downgrade(&follow);
+            glib::idle_add_local_once(move || {
+                if let Some(follow) = weak.upgrade() {
                     WaitFollow::pump(&follow);
-                    glib::ControlFlow::Continue
-                },
-            );
-            if watched.is_err() {
-                eprintln!("[plugin] {named} cannot follow the agents that wait: its wake cannot be watched here");
-            }
+                }
+            });
+        }
+        let fd = wake.fd();
+        let named = format!("{:?}", follow.module);
+        let watched = neovide_editor::fd_watch::add_local(
+            fd,
+            glib::IOCondition::IN | glib::IOCondition::ERR | glib::IOCondition::HUP,
+            glib::ffi::G_PRIORITY_DEFAULT,
+            move |_| {
+                wake.take();
+                WaitFollow::pump(&follow);
+                glib::ControlFlow::Continue
+            },
+        );
+        if watched.is_err() {
+            eprintln!("[plugin] {named} cannot follow the agents that wait: its wake cannot be watched here");
         }
     }
 
@@ -1703,8 +1899,7 @@ impl PluginPanels {
         let pump = self
             .held_hosts()
             .map(|(_, pump)| pump)
-            .find(|pump| pump.host.plugin().manifest.id == plugin)
-            .cloned();
+            .find(|pump| pump.host.plugin().manifest.id == plugin);
         match pump {
             Some(pump) => pump.host.terminal_at_answered(ticket, answer, Instant::now()),
             None => eprintln!("[plugin {plugin}] terminal.at {ticket}: answered for a plugin not held here; dropped"),
@@ -1713,7 +1908,7 @@ impl PluginPanels {
 
     /// Whether a plugin's module holds the keys, from the window's focus tracking. Any other module: nothing.
     pub(crate) fn set_has_keys(&self, module: &ModuleId, has_keys: bool) {
-        if let Some((_, pump)) = self.held_hosts().find(|(m, _)| *m == module) {
+        if let Some((_, pump)) = self.held_hosts().find(|(m, _)| m == module) {
             pump.host.set_has_keys(has_keys);
         }
     }
@@ -1721,41 +1916,37 @@ impl PluginPanels {
     /// Every page follows the window's colorscheme. A change that leaves the page's set as it was (a size
     /// alone, say) sends nothing.
     pub(crate) fn set_theme(&self, tokens: &ThemeTokens) {
-        self.send_theme(PageTheme::from_tokens(tokens).with_text_size(self.text_px.get()));
+        let text_px = self.facts.borrow().text_px;
+        self.send_theme(PageTheme::from_tokens(tokens).with_text_size(text_px));
     }
 
     /// Remembers the editor's text size without sending anything: for a caller that calls [`Self::set_theme`] next, so
     /// a payload that moves the size and the colourscheme together reaches the pages as one theme event, not two.
     pub(crate) fn store_text_size(&self, css_px: Option<f32>) {
-        self.text_px.set(css_px);
+        self.facts.borrow_mut().text_px = css_px;
     }
 
     /// The editor's text size in the pages' CSS px (`EditorFont::css_px`), which a page that wants its prose the
     /// editor's size reads as `--nv-text-size`; `None` takes it away. Sent on a change only, like any theme.
     pub(crate) fn set_text_size(&self, css_px: Option<f32>) {
         self.store_text_size(css_px);
-        let theme = self.theme.borrow().clone().with_text_size(css_px);
+        let theme = self.facts.borrow().theme.clone().with_text_size(css_px);
         self.send_theme(theme);
     }
 
     fn send_theme(&self, theme: PageTheme) {
-        *self.theme.borrow_mut() = theme.clone();
-        for (_, pump) in self.held_hosts() {
-            pump.host.set_theme(&theme);
-        }
+        self.record(Fact::Theme, |facts| facts.theme = theme);
     }
 
     /// The editor's `timeoutlen`, which every page's multi-key sequences wait for.
     pub(crate) fn set_timeoutlen(&self, ms: u32) {
-        for (_, pump) in self.hosts() {
-            pump.host.set_timeoutlen(ms);
-        }
+        self.record(Fact::Timeoutlen, |facts| facts.timeoutlen = Some(ms));
     }
 
     /// The plugin's title and the key table its current page declared (`None` inside: not declared yet), or
     /// `None` when `module` is not a plugin page with a running host.
     pub(crate) fn declared_rows(&self, module: &ModuleId) -> Option<(String, Option<Vec<EffectiveRow>>)> {
-        let (_, pump) = self.held_hosts().find(|(m, _)| *m == module)?;
+        let (_, pump) = self.held_hosts().find(|(m, _)| m == module)?;
         Some((pump.host.plugin().manifest.title.clone(), pump.host.declared_rows()))
     }
 
@@ -1769,7 +1960,7 @@ impl PluginPanels {
 
     /// `prefix x` on a plugin's module: its runs stop and its assist is put back.
     pub(crate) fn stop(&self, module: &ModuleId) {
-        if let Some((_, pump)) = self.held_hosts().find(|(m, _)| *m == module) {
+        if let Some((_, pump)) = self.held_hosts().find(|(m, _)| m == module) {
             pump.host.stop(Instant::now());
             pump.kick();
         }
@@ -1804,6 +1995,253 @@ mod tests {
     use eitri_core::plugin::load::load_plugin;
     use eitri_core::plugin::test_support::{demo_plugin, Scratch};
     use eitri_core::wm::{Batch, Decide, HostEvent, HostOp, PairEvent, PairOp, PluginEvent, PluginOp, WinId};
+
+    #[derive(Default)]
+    struct FakeWindow;
+
+    impl FollowWindow for FakeWindow {
+        fn is_shown(&self, _: &ModuleId) -> bool {
+            false
+        }
+        fn is_on_screen(&self, _: &ModuleId) -> bool {
+            false
+        }
+        fn show(&self, _: &ModuleId) {}
+        fn hide(&self, _: &ModuleId) {}
+        fn command(&self, _: &ModuleId, _: FollowCmd) {}
+    }
+
+    #[test]
+    fn joined_panel_inherits_window_facts() {
+        let _turn = crate::layout_state::default_context_turn();
+        let context = glib::MainContext::default();
+        let _owner = context.acquire().unwrap();
+        let scratch = Scratch::new("panels-join-facts");
+        let registration = registered(&scratch, "demo", true, None);
+        let before = Rc::new(Recorded::default());
+        let after = Rc::new(Recorded::default());
+        let make = |page: Rc<Recorded>| {
+            let port = Rc::new(LazyPort::default());
+            *port.0.borrow_mut() = Some(page);
+            panel(&registration, port, None)
+        };
+        let installed = Rc::new(plugin_panels(vec![make(before.clone())]));
+        let joined = Rc::new(plugin_panels(Vec::new()));
+        let editor = Rc::new(RecordingEditor::default());
+        editor.target.set(Some(7));
+        let events: Rc<dyn Fn(HostEvent)> = Rc::new(|_| {});
+        let holding_calls = Rc::new(RefCell::new(Vec::new()));
+        let holders: Rc<dyn Fn(&str, bool)> = {
+            let calls = holding_calls.clone();
+            Rc::new(move |id, held| calls.borrow_mut().push((id.to_owned(), held)))
+        };
+        let built: PageBuilt = Rc::new(|_, _| {});
+        let refused: Rc<dyn Fn()> = Rc::new(|| {});
+        let link = crate::linked_window::editor::EditorOps::new(Rc::new(|_, _| {}));
+        let focused = Rc::new(RefCell::new(Vec::new()));
+        let focus: ShowAndFocus = {
+            let focused = focused.clone();
+            Rc::new(move |module| {
+                focused.borrow_mut().push(module.clone());
+                Ok(())
+            })
+        };
+        let grid_reads = Rc::new(Cell::new(0));
+        let grid: GridTop = {
+            let reads = grid_reads.clone();
+            Rc::new(move || {
+                reads.set(reads.get() + 1);
+                Some(0.125)
+            })
+        };
+        for panels in [&installed, &joined] {
+            panels.set_move_events(events.clone());
+            panels.set_text_size(Some(19.0));
+            panels.set_scratch_prefix(Some(scratch.0.join("drafts")));
+            panels.on_follow_refused(refused.clone());
+            panels.set_holder_hook(holders.clone());
+            panels.set_follow_feed(&scratch.0.join("follow"), Some(&scratch.0));
+            panels.set_timeoutlen(317);
+            panels.set_window_root(&scratch.0);
+            panels.set_own_window(Some("demo"));
+            panels.set_theme(&tokens("light", 0x575279, 0xfaf4ed));
+            panels.set_page_built(built.clone());
+            panels.set_layout(focus.clone(), Rc::new(|_, _, _| Ok(())));
+            panels.set_link_editor(link.clone());
+            panels.set_editor(editor.clone());
+            panels.set_grid_top(grid.clone());
+            panels.set_agents(None);
+            panels.show_while_agents_wait(Rc::new(FakeWindow::default()));
+            panels.editor_closed();
+        }
+        let added = joined
+            .join_with(&registration, || Ok(Rc::new(make(after.clone()))))
+            .unwrap();
+        let host = &added.pump.as_ref().unwrap().host;
+        let original = installed.panel(&ModuleId::lua("demo")).unwrap();
+        assert!(original.pump.as_ref().unwrap().host.own_window());
+        assert_eq!(host.theme(), original.pump.as_ref().unwrap().host.theme());
+        assert!(!host.own_window());
+        assert!(Rc::ptr_eq(
+            added.pump.as_ref().unwrap().events.borrow().as_ref().unwrap(),
+            &events
+        ));
+        before.0.borrow_mut().clear();
+        after.0.borrow_mut().clear();
+        before.2.borrow_mut().clear();
+        after.2.borrow_mut().clear();
+        for (panels, panel) in [(&installed, &original), (&joined, &added)] {
+            let host = &panel.pump.as_ref().unwrap().host;
+            for (id, verb, args) in [
+                (1, "host.hello", serde_json::json!({})),
+                (2, "editor.follow", serde_json::json!({})),
+                (3, "layout.focus", serde_json::json!({"target": "self"})),
+            ] {
+                host.page_message(
+                    &serde_json::json!({"v": 1, "id": id, "verb": verb, "args": args}).to_string(),
+                    Instant::now(),
+                );
+            }
+            panels.set_on_screen(&panel.module, true);
+            host.follow_view(view("demo"), Instant::now());
+            panels.mark_away(&panel.module);
+            panels.activate_holding(&panel.module);
+        }
+        assert_eq!(grid_reads.get(), 2, "both hosts read the window's grid geometry");
+        assert_eq!(*focused.borrow(), [ModuleId::lua("demo"), ModuleId::lua("demo")]);
+        assert_eq!(
+            *holding_calls.borrow(),
+            [("demo".to_owned(), true), ("demo".to_owned(), true)]
+        );
+        assert_eq!(*before.0.borrow(), *after.0.borrow());
+        before.1.borrow_mut()[0]["result"]["own_window"] = serde_json::json!(false);
+        assert_eq!(*before.1.borrow(), *after.1.borrow());
+        before.2.borrow_mut()[0]["result"]["own_window"] = serde_json::json!(false);
+        assert_eq!(*before.2.borrow(), *after.2.borrow());
+        assert_eq!(after.1.borrow()[0]["result"]["timeoutlen"], 317);
+        assert!(after
+            .2
+            .borrow()
+            .iter()
+            .any(|message| message["event"] == "editor.closed"));
+        assert_eq!(joined.modules(), [ModuleId::lua("demo")]);
+    }
+
+    #[test]
+    fn joining_checks_the_running_editor_session() {
+        let scratch = Scratch::new("panels-join-editor");
+        let registration = registered(&scratch, "demo", true, None);
+        let panels = plugin_panels(Vec::new());
+        let editor = Rc::new(RecordingEditor::default());
+        editor.target.set(Some(9));
+        panels.set_follow_feed(&scratch.0.join("follow"), Some(&scratch.0));
+        panels.set_scratch_prefix(Some(scratch.0.join("drafts")));
+        panels.set_editor(editor.clone());
+        let wakes = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let joined = panels
+            .join_with(&registration, || {
+                let wakes = wakes.clone();
+                Ok(Rc::new(panel_waking(
+                    &registration,
+                    Rc::default(),
+                    None,
+                    std::sync::Arc::new(move || {
+                        wakes.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    }),
+                )))
+            })
+            .unwrap();
+        assert_eq!(editor.targets.get(), 1, "join checks the editor before any pump runs");
+        assert!(
+            wakes.load(std::sync::atomic::Ordering::Relaxed) > 0,
+            "the session check wakes the follow host"
+        );
+        let pump = joined.pump.as_ref().unwrap();
+        pump.host.pump(Instant::now());
+        let installs = editor.installs();
+        assert_eq!(installs.len(), 1, "the running nvim gets the joined plugin's snippet");
+        let args = installs[0][1].as_map().unwrap();
+        for (key, path) in [
+            ("socket", scratch.0.join("follow")),
+            ("scratch_dir", scratch.0.clone()),
+            ("scratch_prefix", scratch.0.join("drafts")),
+        ] {
+            let value = &args.iter().find(|(name, _)| name.as_str() == Some(key)).unwrap().1;
+            assert_eq!(
+                value,
+                &rmpv::Value::Binary(path.as_os_str().as_encoded_bytes().to_vec()),
+                "{key}"
+            );
+        }
+    }
+
+    #[test]
+    fn joining_without_an_editor_does_not_check_a_session() {
+        let scratch = Scratch::new("panels-join-no-editor");
+        let registration = registered(&scratch, "demo", true, None);
+        let panels = plugin_panels(Vec::new());
+        panels.set_follow_feed(&scratch.0.join("follow"), None);
+        let wakes = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        panels
+            .join_with(&registration, || {
+                let wakes = wakes.clone();
+                Ok(Rc::new(panel_waking(
+                    &registration,
+                    Rc::default(),
+                    None,
+                    std::sync::Arc::new(move || {
+                        wakes.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    }),
+                )))
+            })
+            .unwrap();
+        assert_eq!(
+            wakes.load(std::sync::atomic::Ordering::Relaxed),
+            1,
+            "only setting the follow feed wakes the host"
+        );
+    }
+
+    #[test]
+    fn joining_refuses_a_duplicate_before_making_a_panel() {
+        let scratch = Scratch::new("panels-join-duplicate");
+        let registration = registered(&scratch, "demo", true, None);
+        let panels = plugin_panels(Vec::new());
+        panels
+            .join_with(&registration, || Ok(Rc::new(panel(&registration, Rc::default(), None))))
+            .unwrap();
+        let result = panels.join_with(&registration, || {
+            panic!("a duplicate must not build or register anything")
+        });
+        assert!(result.is_err());
+        assert_eq!(panels.modules(), [ModuleId::lua("demo")]);
+    }
+
+    #[test]
+    fn a_setter_hook_can_read_and_join_panels() {
+        struct Reentrant(Rc<dyn Fn()>);
+        impl PagePort for Reentrant {
+            fn send(&self, _: &str) {}
+            fn set_theme(&self, _: &PageTheme) {
+                (self.0)();
+            }
+        }
+        let scratch = Scratch::new("panels-join-reentrant");
+        let first = registered(&scratch, "first", false, None);
+        let second = registered(&scratch, "second", false, None);
+        let port = Rc::new(LazyPort::default());
+        let panels = Rc::new(plugin_panels(vec![panel(&first, port.clone(), None)]));
+        let weak = Rc::downgrade(&panels);
+        *port.0.borrow_mut() = Some(Rc::new(Reentrant(Rc::new(move || {
+            let panels = weak.upgrade().unwrap();
+            assert_eq!(panels.modules(), [ModuleId::lua("first")]);
+            panels
+                .join_with(&second, || Ok(Rc::new(panel(&second, Rc::default(), None))))
+                .unwrap();
+        }))));
+        panels.set_theme(&tokens("light", 0x575279, 0xfaf4ed));
+        assert_eq!(panels.modules().len(), 2);
+    }
 
     fn saved_page(
         handoff: bool,
@@ -2028,11 +2466,16 @@ mod tests {
 
     /// What a host did to its page: theme updates and event names, with replies recorded separately.
     #[derive(Default)]
-    struct Recorded(RefCell<Vec<String>>, RefCell<Vec<serde_json::Value>>);
+    struct Recorded(
+        RefCell<Vec<String>>,
+        RefCell<Vec<serde_json::Value>>,
+        RefCell<Vec<serde_json::Value>>,
+    );
 
     impl eitri_core::plugin::host::PagePort for Recorded {
         fn send(&self, message: &str) {
             let value: serde_json::Value = serde_json::from_str(message).expect("the host sends JSON");
+            self.2.borrow_mut().push(value.clone());
             let event = value["event"].as_str().unwrap_or("(not an event)").to_owned();
             self.0.borrow_mut().push(event);
             if value.get("re").is_some() {
@@ -2120,14 +2563,9 @@ mod tests {
 
     fn plugin_panels(panels: Vec<Panel>) -> PluginPanels {
         PluginPanels {
-            panels,
-            theme: RefCell::new(PageTheme::fallback()),
-            text_px: Cell::new(None),
+            panels: RefCell::new(panels.into_iter().map(Rc::new).collect()),
+            facts: RefCell::new(WindowFacts::new(PageTheme::fallback())),
             follow_totals: RefCell::default(),
-            editor_gone: Cell::new(false),
-            page_built: RefCell::new(None),
-            holder: RefCell::new(None),
-            agents_feed: RefCell::new(None),
         }
     }
 
@@ -2143,7 +2581,7 @@ mod tests {
         for (id, pages, own) in [("demo", demo_pages, true), ("other", other_pages, false)] {
             let module = ModuleId::lua(id);
             panels.build_page(&module, &panels.theme());
-            let host = &panels.panel(&module).unwrap().pump.as_ref().unwrap().host;
+            let host = panels.panel(&module).unwrap().pump.as_ref().unwrap().host.clone();
             host.page_committed();
             host.page_message(r#"{"v":1,"id":1,"verb":"host.hello","args":{}}"#, Instant::now());
             assert_eq!(pages.borrow()[0].1.borrow()[0]["result"]["own_window"], own);
@@ -2399,7 +2837,7 @@ mod tests {
             panels.follower("demo").is_some(),
             "the returned page is held here again"
         );
-        let host = &panels.panel(&demo()).unwrap().pump.as_ref().unwrap().host;
+        let host = panels.panel(&demo()).unwrap().pump.as_ref().unwrap().host.clone();
         host.page_committed();
         host.page_message(r#"{"v":1,"id":7,"verb":"host.hello","args":{}}"#, Instant::now());
         let pages = pages.borrow();
@@ -2470,7 +2908,7 @@ mod tests {
                 assert_eq!(panels.is_built(&demo()), retained, "Hold never builds a missing view");
 
                 let hello = || {
-                    let host = &panels.panel(&demo()).unwrap().pump.as_ref().unwrap().host;
+                    let host = panels.panel(&demo()).unwrap().pump.as_ref().unwrap().host.clone();
                     host.page_committed();
                     host.page_message(r#"{"v":1,"id":9,"verb":"host.hello","args":{}}"#, Instant::now());
                     let pages = pages.borrow();
@@ -2639,7 +3077,7 @@ mod tests {
         assert!(crate::linked_window::reload_page_back(&panels, &Rc::default(), &demo()));
         assert_eq!(loads.get(), 2, "one initial load and one return load");
         assert_eq!(pages.borrow().len(), 1, "the retained view is reused");
-        let host = &panels.panel(&demo()).unwrap().pump.as_ref().unwrap().host;
+        let host = panels.panel(&demo()).unwrap().pump.as_ref().unwrap().host.clone();
         host.page_committed();
         host.page_message(r#"{"v":1,"id":8,"verb":"host.hello","args":{}}"#, Instant::now());
         let pages = pages.borrow();
@@ -2772,6 +3210,14 @@ mod tests {
         let install = scan::functions(&code, "install");
         assert_eq!(install.len(), 1);
         let install: String = install[0].split_whitespace().collect();
+        assert!(install.contains("Self::make_panel(engine,keymap,theme,&registration,&keys_settings)?"));
+        let join = scan::functions(&code, "join");
+        assert_eq!(join.len(), 1);
+        let join: String = join[0].split_whitespace().collect();
+        assert!(join.contains("Self::make_panel(engine,keymap,&self.theme(),&registration,&keys_settings)"));
+        let factory = scan::functions(&code, "make_panel");
+        assert_eq!(factory.len(), 1);
+        let install: String = factory[0].split_whitespace().collect();
         assert_eq!(
             install.matches("page_slot::PageSlot::new()").count(),
             1,
@@ -2995,15 +3441,15 @@ mod tests {
 
     /// The window as the commands see it: a start-hidden module whose show builds its page, as the grid's change
     /// hook does.
-    struct RecordingWindow<'a> {
-        panels: &'a PluginPanels,
+    struct RecordingWindow {
+        panels: Weak<PluginPanels>,
         shown: Cell<bool>,
         /// Shown but kept off screen (behind a zoom, on a tab not drawn) until a show brings it forward.
         covered: Cell<bool>,
         calls: RefCell<Vec<&'static str>>,
     }
 
-    impl FollowWindow for RecordingWindow<'_> {
+    impl FollowWindow for RecordingWindow {
         fn is_shown(&self, module: &ModuleId) -> bool {
             *module == demo() && self.shown.get()
         }
@@ -3016,7 +3462,8 @@ mod tests {
             self.calls.borrow_mut().push("show");
             self.shown.set(true);
             self.covered.set(false);
-            self.panels.build_page(module, &self.panels.theme());
+            let panels = self.panels.upgrade().expect("the window still holds its panels");
+            panels.build_page(module, &panels.theme());
         }
 
         fn hide(&self, _module: &ModuleId) {
@@ -3042,9 +3489,9 @@ mod tests {
                 Some(Rc::new(Recorded::default()) as Rc<dyn PagePort>)
             })
         };
-        let panels = plugin_panels(vec![panel(&registered, Rc::default(), Some(build))]);
+        let panels = Rc::new(plugin_panels(vec![panel(&registered, Rc::default(), Some(build))]));
         let window = RecordingWindow {
-            panels: &panels,
+            panels: Rc::downgrade(&panels),
             shown: Cell::new(false),
             covered: Cell::new(false),
             calls: RefCell::default(),
@@ -3070,9 +3517,9 @@ mod tests {
         let scratch = Scratch::new("panels-wait-show");
         let registered = registered(&scratch, "demo", true, None);
         let build: BuildPage = Rc::new(|_: &PageTheme| Some(Rc::new(Recorded::default()) as Rc<dyn PagePort>));
-        let panels = plugin_panels(vec![panel(&registered, Rc::default(), Some(build))]);
+        let panels = Rc::new(plugin_panels(vec![panel(&registered, Rc::default(), Some(build))]));
         let window = RecordingWindow {
-            panels: &panels,
+            panels: Rc::downgrade(&panels),
             shown: Cell::new(false),
             covered: Cell::new(false),
             calls: RefCell::default(),
@@ -3093,12 +3540,87 @@ mod tests {
     }
 
     #[test]
+    fn only_a_joined_wait_panel_shows_the_cached_wait_on_idle() {
+        use eitri_core::agents::{Change, Class, ReaderEvent, Row, View};
+        use eitri_core::plugin::host::{AgentsSource, ReaderSink};
+
+        struct WaitingSource;
+
+        impl AgentsSource for WaitingSource {
+            fn start(&self, sink: ReaderSink) -> Box<dyn std::any::Any> {
+                sink(ReaderEvent::Change(Change::Reset {
+                    view: View {
+                        rows: vec![Row {
+                            class: Class::Needs,
+                            ..Row::default()
+                        }],
+                        ..View::default()
+                    },
+                }));
+                Box::new(())
+            }
+        }
+
+        let _turn = crate::layout_state::default_context_turn();
+        let context = glib::MainContext::default();
+        let _owner = context.acquire().unwrap();
+        let scratch = Scratch::new("panels-join-wait");
+        let registration = registered_with(&scratch, "demo", true, None, |text| {
+            text.replace("\"net\"", "\"agents\"")
+                .replace(
+                    "[net]\norigins = [\"https://learn.example.org\"]\nimages = \"${images}\"\n",
+                    "",
+                )
+                .replace("[module]\n", "[module]\nshown_while = \"agents-wait\"\n")
+        });
+
+        for joined in [false, true] {
+            let feed = AgentsFeed::new(Box::new(WaitingSource));
+            let keep_reading = WaitShow::new(feed.clone(), std::sync::Arc::new(|| {}));
+            assert_eq!(keep_reading.pump_at(wall_clock_ms()), Some(true));
+            let initial = if joined {
+                Vec::new()
+            } else {
+                vec![panel(&registration, Rc::default(), None)]
+            };
+            let panels = Rc::new(plugin_panels(initial));
+            let window = Rc::new(RecordingWindow {
+                panels: Rc::downgrade(&panels),
+                shown: Cell::new(false),
+                covered: Cell::new(false),
+                calls: RefCell::default(),
+            });
+            panels.record(Fact::Agents, |facts| facts.agents_feed = Some(feed));
+            panels.show_while_agents_wait(window.clone());
+            if joined {
+                panels
+                    .join_with(&registration, || Ok(Rc::new(panel(&registration, Rc::default(), None))))
+                    .unwrap();
+            }
+            assert!(window.calls.borrow().is_empty(), "showing must wait for the next idle");
+            while context.pending() {
+                context.iteration(false);
+            }
+            if joined {
+                assert_eq!(
+                    *window.calls.borrow(),
+                    ["show"],
+                    "the joined module sees the cached wait"
+                );
+                assert!(window.is_shown(&demo()));
+            } else {
+                assert!(window.calls.borrow().is_empty(), "startup adds no idle show");
+            }
+        }
+    }
+
+    #[test]
     fn a_shown_module_off_screen_is_brought_on_screen_by_show_and_toggle_but_not_by_auto() {
         let scratch = Scratch::new("panels-follow-covered");
         let registered = registered(&scratch, "demo", true, None);
-        let panels = plugin_panels(vec![panel(&registered, Rc::default(), None)]);
+        let panels = Rc::new(plugin_panels(vec![panel(&registered, Rc::default(), None)]));
         let window = RecordingWindow {
-            panels: &panels,
+            panels: Rc::downgrade(&panels),
             shown: Cell::new(true),
             covered: Cell::new(true),
             calls: RefCell::default(),
@@ -3132,8 +3654,9 @@ mod tests {
     fn an_automatic_show_routed_from_the_feed_leaves_a_zoomed_preview_alone() {
         let scratch = Scratch::new("panels-follow-auto-zoom");
         let (panels, _) = demo_and_other(&scratch, true);
+        let panels = Rc::new(panels);
         let window = RecordingWindow {
-            panels: &panels,
+            panels: Rc::downgrade(&panels),
             shown: Cell::new(true),
             covered: Cell::new(true),
             calls: RefCell::default(),
@@ -3337,6 +3860,7 @@ mod tests {
     struct RecordingEditor {
         calls: RefCell<Vec<(&'static str, Vec<rmpv::Value>)>>,
         target: Cell<Option<u64>>,
+        targets: Cell<usize>,
     }
 
     impl RecordingEditor {
@@ -3361,6 +3885,7 @@ mod tests {
         }
 
         fn target(&self) -> Option<u64> {
+            self.targets.set(self.targets.get() + 1);
             self.target.get()
         }
     }

@@ -1,11 +1,11 @@
 {
   "expect": {
     "29": "Press the prefix, then this key, to list every key: {prefix} ?",
-    "91": "Zoom this module, or restore it: {prefix} z",
-    "126": "Go back to the module that had the keys before: {prefix} ;",
-    "168": "Open a new tab in the agent panel: {prefix} c",
-    "204": "Clear the terminal's screen: {prefix} Ctrl+l",
-    "245": "Float this module, or put a float back: {prefix} Alt+Shift+Space",
-    "274": "eitri.keymap.prefix(\"C-a\")"
+    "86": "Zoom this module, or restore it: {prefix} z",
+    "121": "Go back to the module that had the keys before: {prefix} ;",
+    "163": "Open a new tab in the agent panel: {prefix} c",
+    "199": "Clear the terminal's screen: {prefix} Ctrl+l",
+    "236": "Float this module, or put a float back: {prefix} F",
+    "265": "eitri.keymap.prefix(\"C-a\")"
   }
 }

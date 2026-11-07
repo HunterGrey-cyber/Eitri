@@ -75,7 +75,7 @@ Both windows read the same file: the one-window mode and the [companion window](
 | `modules.chat.on_permission` | `"badge"` or `"reveal"` | `"badge"` | What happens when a permission card arrives while the agent panel is hidden. `"badge"` shows `agent ⚑N` in the top bar and a toast; `"reveal"` brings the panel back where it was, without moving the keys. While another pane is zoomed `"reveal"` shows the badge instead, because showing the panel would not put it on screen. A companion window never hides its panel, so the key does nothing there. |
 | `agents.enabled` | `true` / `"on"` or `false` / `"off"` | `true` | Whether this window publishes a row for each of its agent tabs and reads everyone's, which is what [`<prefix> u` and `<prefix> B`](keys.md#the-prefix), the pages that show your agents and `eitri agents` stand on. `false` publishes and reads nothing, and in this window those keys only say `agents are off in this window`. See [Many agents at once](many-agents.md#turn-it-off). |
 | `review.enabled` | `true` / `"on"` or `false` / `"off"` | `true` | Whether [turn review](turn-review.md) runs at all. `false` takes no snapshots and offers no review. |
-| `review.hint` | `"key"`, `true` / `"on"` or `false` / `"off"` | `"key"` | What the status band says after a finished turn that changed files. `"key"`: only `c to review`. `true`: `N files changed · c to review`, and a running turn's edits are counted on a line above the input box. `false`: nothing. The review is one key away either way. |
+| `review.hint` | `"key"`, `true` / `"on"` or `false` / `"off"` | `false` | What the status band says after a finished turn that changed files. `false`: nothing. `"key"`: only `c to review`. `true`: `N files changed · c to review`, and a running turn's edits are counted on a line above the input box. The review is one key away either way. |
 | `review.live` | `true` / `"on"` or `false` / `"off"` | `false` | Whether a file the agent edits is drawn in your editor as the edit lands, and again when the turn ends, with keep all and undo all in the buffer ([live drawings](turn-review.md#live-drawings)). Read once at start; it does nothing while `review.enabled` is `false`, and Eitri says so at startup. |
 | `terminal.font` | a font in `guifont`'s form, `"<families>:h<points>"` | your `guifont` | The terminal's font, for every terminal of the window: `"Iosevka:h12"` sets both, `"Iosevka"` only the family (the size still follows your `guifont`), `":h12"` only the size. Families are comma-separated and tried in order, `_` or `\ ` stand for a space, as in `guifont`. Unset, the terminal draws in the editor's families and size, so a terminal under the editor looks like it; an empty `guifont` draws in `monospace`. The size is zoomed with the editor's, see [Keys](keys.md). |
 | `terminal.claude_ide` | `true` / `"on"` or `false` / `"off"` | `false` | Whether a `claude` you run in the bottom terminal can attach to the window's editor: Eitri then listens on `127.0.0.1`, writes `~/.claude/ide/<port>.lock` while it runs and sets `CLAUDE_CODE_SSE_PORT` in its terminals' shells. Read once by the window that holds the editor; the second window follows it. See [The `claude` in your terminal](terminal-claude.md). |
@@ -456,6 +456,16 @@ eitri.plugin.load("~/src/my-plugin", { key = "y" })    -- by path
   delete that directory's saved layout file ([where the layout is kept](#layout-from-lua)).
 - Loading a plugin trusts it as you trust any program you run: it is your own local directory. Load only plugins you
   trust. Plugins are not available in the companion window.
+
+**For this run only.** `:Eitri plugin load <name>` in the window's Neovim (or the action `plugin.load` with
+`name = "..."`, or `Enter` on a row of the empty tab's Pages list) loads a plugin by name into the running window, with
+its default settings and no module key, and says `<title> loaded for this run`. A page that starts hidden is shown once;
+one that shows itself while an agent waits (The pass) is only made ready. It is reached as any page is: `<prefix> o`, its
+chip in the top bar while hidden, `:Eitri show lua:<id>` and its own commands. Nothing is written to your `init.lua`: the
+next window does not have it unless you add the line (`o` on its Pages row shows it). It cannot move to a second window
+(`<title> is loaded for this run in this window only`), and it is refused in [compositor windows](compositor-windows.md),
+in a second window and in a companion window. Loading one that is already there shows it. The Pages list holds the
+pages Eitri ships; a plugin of your own loads by name the same way.
 
 ### Keys in a plugin page
 

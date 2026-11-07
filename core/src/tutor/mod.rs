@@ -30,6 +30,7 @@ use std::time::{Duration, Instant};
 
 use rmpv::Value;
 
+use crate::compositor::mode::Mode;
 use crate::editor_rpc::EditorRpc;
 use crate::nvim_rpc::Pending;
 
@@ -67,9 +68,27 @@ pub const FILES: [(&str, &str); 4] = [
     ("tutor/zh/eitri.tutor.json", CHECKS_ZH),
 ];
 
-/// Every file of the runtime directory, by its path inside it, for a window whose prefix is `prefix`.
-pub fn files(prefix: &str) -> Vec<(&'static str, String)> {
-    FILES
+/// The compositor lessons use the same runtime names, so nvim's language selection and command stay the same.
+pub const COMPOSITOR_FILES: [(&str, &str); 4] = [
+    ("tutor/en/eitri.tutor", include_str!("lessons/en/compositor.tutor")),
+    (
+        "tutor/en/eitri.tutor.json",
+        include_str!("lessons/en/compositor.tutor.json"),
+    ),
+    ("tutor/zh/eitri.tutor", include_str!("lessons/zh/compositor.tutor")),
+    (
+        "tutor/zh/eitri.tutor.json",
+        include_str!("lessons/zh/compositor.tutor.json"),
+    ),
+];
+
+/// The window's lessons for its prefix and resolved mode; an unknown mode uses Eitri's own tiling lessons.
+pub fn files(prefix: &str, mode: Option<Mode>) -> Vec<(&'static str, String)> {
+    let sources = match mode {
+        Some(Mode::Compositor) => &COMPOSITOR_FILES,
+        Some(Mode::Eitri) | None => &FILES,
+    };
+    sources
         .iter()
         .map(|(rel, text)| {
             let text = if rel.ends_with(".json") {
@@ -189,17 +208,17 @@ impl Drop for TutorDir {
 }
 
 /// Asks the editor to define `:EitriTutor` for `dir`, handing it the lessons to write there when the command runs,
-/// written for `prefix`.
-pub fn install(rpc: &dyn EditorRpc, dir: &Path, prefix: &str) -> Pending {
-    rpc.exec_lua(INSTALL_TUTOR_LUA, vec![install_opts(dir, prefix)])
+/// written for `prefix` and the window's mode.
+pub fn install(rpc: &dyn EditorRpc, dir: &Path, prefix: &str, mode: Option<Mode>) -> Pending {
+    rpc.exec_lua(INSTALL_TUTOR_LUA, vec![install_opts(dir, prefix, mode)])
 }
 
 /// The snippet's one argument: `{dir, uid, files}`, the directory as bytes, the effective uid the directory and
 /// everything in it must belong to, and each file's text by its path inside the directory, with `prefix` (as a
 /// person reads it, `Ctrl+a`) where the lessons name the prefix. The snippet writes what it is given.
-pub fn install_opts(dir: &Path, prefix: &str) -> Value {
+pub fn install_opts(dir: &Path, prefix: &str, mode: Option<Mode>) -> Value {
     use std::os::unix::ffi::OsStrExt;
-    let files = files(prefix)
+    let files = files(prefix, mode)
         .into_iter()
         .map(|(rel, text)| (Value::from(rel), Value::from(text)))
         .collect();
@@ -279,6 +298,7 @@ pub struct TutorInstaller {
     dir: Option<TutorDir>,
     dir_failed: bool,
     prefix: String,
+    mode: Option<Mode>,
     editor: Option<Rc<dyn EditorRpc>>,
     installed_for: Option<u64>,
     out: Option<Out>,
@@ -304,6 +324,7 @@ impl TutorInstaller {
             dir: None,
             dir_failed: false,
             prefix: DEFAULT_PREFIX.to_string(),
+            mode: None,
             editor: None,
             installed_for: None,
             out: None,
@@ -316,6 +337,11 @@ impl TutorInstaller {
     /// editor session reports.
     pub fn set_prefix(&mut self, human: String) {
         self.prefix = human;
+    }
+
+    /// The mode resolved at window startup, set before the first editor session and kept across nvim restarts.
+    pub fn set_mode(&mut self, mode: Mode) {
+        self.mode = Some(mode);
     }
 
     /// The window's editor handle.
@@ -444,7 +470,7 @@ impl TutorInstaller {
         let (Some(dir), Some(editor)) = (&self.dir, &self.editor) else {
             return None;
         };
-        let pending = install(&**editor, dir.path(), &self.prefix);
+        let pending = install(&**editor, dir.path(), &self.prefix, self.mode);
         self.out = Some(Out {
             target,
             pending: Some(pending),

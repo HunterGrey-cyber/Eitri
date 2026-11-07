@@ -2136,6 +2136,26 @@ impl Decide for Controller {
                     super::moves::frozen(window, win, kind, &module, mv, record, handoff, &mut batch);
                 }
             }
+            HostEvent::Plugin(PluginEvent::Loaded {
+                win,
+                module,
+                title,
+                shown_while,
+                own_rule,
+            }) => {
+                if self.windows.contains_key(&win) {
+                    let setup = self.setups.entry(win).or_default();
+                    verbs::plugins::add_rule(Rc::make_mut(setup), &module, own_rule);
+                    self.modules_event(win, &mut batch, |w, cx, batch| {
+                        batch.append(verbs::plugins::loaded(w, cx, win, module, title, shown_while));
+                    });
+                }
+            }
+            HostEvent::Plugin(PluginEvent::LoadFailed { win, name, why }) => {
+                if let Some(window) = self.windows.get_mut(&win) {
+                    batch.append(verbs::plugins::failed(window, &name, why));
+                }
+            }
             HostEvent::Plugin(PluginEvent::Frozen {
                 win,
                 module,

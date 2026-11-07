@@ -1,5 +1,5 @@
 [English](getting-started.md) | 简体中文
-<!-- translated-from: getting-started.md sha256=4afd2f5c2ca1dd97c3bb7766bd5b3f27b7dc8343d67bd6ff0bbaa2202889db4f -->
+<!-- translated-from: getting-started.md sha256=d990b0f8469425de4c1536c027dc2ef153fea872a2a660545307b69012629f0f -->
 
 # 快速上手
 
@@ -40,6 +40,8 @@ eitri [DIR]
 | `p` | 打开另一个项目（你其他项目的列表；见[按键](keys.md#前缀)） |
 | `Shift+Tab` | 在开始之前轮换模式（Manual、Auto、Bypass；当前模式显示在面板底部） |
 | `?` | 列出所有按键 |
+
+菜单下面的 **Pages** 列出随 Eitri 一起发布、但这个窗口还没加载的页面（几个 agent 页面和 Markdown 预览，每个附一行说明）。用 `j`/`k` 移到它们上面；`Enter` 为这次运行加载一个并显示它，`o` 在 Neovim 的一个临时缓冲区里打开每次都加载它的那行 `init.lua`，供你复制（Eitri 不会写你的 `init.lua`）。见[插件](configuration.zh-CN.md#plugins)。
 
 `Ctrl+h` 和 `Ctrl+l` 在编辑器和面板之间移动按键焦点。
 

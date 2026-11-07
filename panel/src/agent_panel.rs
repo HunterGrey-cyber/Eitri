@@ -224,6 +224,10 @@ struct AgentPanelState {
     /// The `?` overlay's rows (`serialize_keymap_for_js`), sent with the theme on every `ready` so
     /// a reloaded document is told the keymap it needs, not the one baked into a hand list.
     keymap_help: Option<String>,
+    /// The pages offered to the base document. None keeps the feature absent until the host opts in.
+    page_lines: Option<Vec<eitri_core::agent_bridge::PageLine>>,
+    load_page_hook: Option<Rc<dyn Fn(String)>>,
+    page_line_hook: Option<Rc<dyn Fn(String)>>,
     /// Why the project folder is no boundary, when it is not one: sent after the `hello` of every `ready`.
     root_note: Option<String>,
     /// One record per chat page that is attached and live, by the view it shows, and always one for
@@ -606,6 +610,9 @@ impl AgentPanelState {
             ticks_run: 0,
             theme,
             keymap_help: None,
+            page_lines: None,
+            load_page_hook: None,
+            page_line_hook: None,
             root_note,
             // The base view's record is there from the start: its page is the window's, attached or not.
             pages: BTreeMap::from([(ViewId::BASE, PageState::default())]),

@@ -91,7 +91,9 @@ pub(super) enum Effect {
         handed: Vec<ViewId>,
     },
     /// Running or queued work changed in these views.
-    Busy { changed: Vec<(ViewId, bool)> },
+    Busy {
+        changed: Vec<(ViewId, bool)>,
+    },
     /// The window's aggregate busy state flipped: some tab has a running turn or running background
     /// work, or none has any more.
     BusyChanged(bool),
@@ -103,6 +105,8 @@ pub(super) enum Effect {
     EditSelection,
     /// The empty tab requests the window's project chooser.
     ChooseProject,
+    LoadPage(String),
+    PageLine(String),
     /// The editor opened a file for the review: the window brings the editor to the user.
     EditorOpened,
     /// One of the panel's HINT messages, for the window's HINT session.
@@ -112,12 +116,18 @@ pub(super) enum Effect {
     /// A focus move out of a page, with that page's view.
     Nav(ViewId, Direction),
     /// The `?` overlay a page showed was closed.
-    KeymapClosed { opening: u64, return_keys: bool },
+    KeymapClosed {
+        opening: u64,
+        return_keys: bool,
+    },
     /// An address already checked, for the system's handler.
     OpenExternal(String),
     /// A request for nvim: the window shows the editor and hands it the request. What the window answers
     /// decides `then`, which is a step of its own.
-    AskEditor { request: ScratchRequest, then: EditorThen },
+    AskEditor {
+        request: ScratchRequest,
+        then: EditorThen,
+    },
     /// What the link owes the other window of a linked pair, for the window's link.
     PairOutbound(super::PairOutbound),
     /// A move's answer for the window: a tab frozen or not, a presence held or not.
@@ -315,6 +325,18 @@ impl Outbox {
                     let hook = state.borrow().editor_done_hook.clone();
                     if let Some(hook) = hook {
                         hook(view);
+                    }
+                }
+                Effect::LoadPage(id) => {
+                    let hook = state.borrow().load_page_hook.clone();
+                    if let Some(hook) = hook {
+                        hook(id);
+                    }
+                }
+                Effect::PageLine(id) => {
+                    let hook = state.borrow().page_line_hook.clone();
+                    if let Some(hook) = hook {
+                        hook(id);
                     }
                 }
                 Effect::ChooseProject => {

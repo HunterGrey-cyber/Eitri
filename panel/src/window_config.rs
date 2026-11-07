@@ -40,6 +40,8 @@ pub struct WindowConfig {
     pub acp_agents: Vec<eitri_core::lua::agent::AgentRegistration>,
     pub on_permission: eitri_core::attention::ChatOnPermission,
     pub keymap: Rc<eitri_core::keymap::Keymap>,
+    /// The automatic prefix-key moves this window applied, if the startup probe had answered in time.
+    pub alt_mod: Option<eitri_core::keymap::alt_mod::Applied>,
     pub tmux_import: Option<eitri_core::keymap::TmuxImport>,
     pub tmux_skipped: Vec<eitri_core::keymap::HelpRow>,
     /// `keymap.which_key_delay`: how long the prefix waits for a key before the hint panel shows; `None` (the
@@ -167,8 +169,26 @@ pub fn load(kernel: &Kernel, panels: &[LuaPanelMeta]) -> Result<WindowConfig, St
     read(kernel, panels)
 }
 
+/// Loads a full window with the probe's answer as it stands. Other hosts use [`load`] without automatic moves.
+pub fn load_with_alt_mod(
+    kernel: &Kernel,
+    panels: &[LuaPanelMeta],
+    probe_now: impl FnOnce() -> Option<eitri_core::keymap::alt_mod::Answer>,
+) -> Result<WindowConfig, String> {
+    settle(kernel);
+    read_with_alt_mod(kernel, panels, probe_now)
+}
+
 /// [`load`] without the settling: the first setting that is not one is the `Err`.
 fn read(kernel: &Kernel, panels: &[LuaPanelMeta]) -> Result<WindowConfig, String> {
+    read_with_alt_mod(kernel, panels, || None)
+}
+
+fn read_with_alt_mod(
+    kernel: &Kernel,
+    panels: &[LuaPanelMeta],
+    probe_now: impl FnOnce() -> Option<eitri_core::keymap::alt_mod::Answer>,
+) -> Result<WindowConfig, String> {
     let panel_font_size = parse_panel_font_size(kernel.config.borrow().get("agent.font_size"))?;
     let panel_font_follows_editor = kernel.config.borrow().get("agent.font_size").is_none();
 
@@ -280,7 +300,7 @@ fn read(kernel: &Kernel, panels: &[LuaPanelMeta]) -> Result<WindowConfig, String
         .get(eitri_core::keymap::tmux::SETTING)
         .map(str::to_owned);
     let home_dir = std::env::var_os("HOME").map(std::path::PathBuf::from);
-    let settled = eitri_core::keymap::Keymap::for_startup_settled(
+    let mut settled = eitri_core::keymap::Keymap::for_startup_settled(
         kernel.keymap.borrow().ops(),
         kernel.keymap.borrow().origins(),
         &lua_panel_ids,
@@ -291,6 +311,7 @@ fn read(kernel: &Kernel, panels: &[LuaPanelMeta]) -> Result<WindowConfig, String
     for problem in settled.problems {
         kernel.report_problem(problem);
     }
+    let alt_mod = eitri_core::keymap::alt_mod::apply(&mut settled.keymap, probe_now(), kernel.keymap.borrow().ops());
     let (keymap, tmux_import) = (Rc::new(settled.keymap), settled.import);
     eprintln!(
         "{}",
@@ -390,6 +411,7 @@ fn read(kernel: &Kernel, panels: &[LuaPanelMeta]) -> Result<WindowConfig, String
         acp_agents,
         on_permission,
         keymap,
+        alt_mod,
         tmux_import,
         tmux_skipped,
         which_key_delay,
@@ -446,7 +468,7 @@ mod tests {
     /// startup failure naming the key.
     #[test]
     fn window_config_reads_both_review_keys() {
-        use eitri_core::agent_prefs::ReviewHintLevel::{Full, Key};
+        use eitri_core::agent_prefs::ReviewHintLevel::{Full, Key, Off};
         let scratch = std::env::temp_dir().join(format!("eitri-review-keys-{}", uuid::Uuid::new_v4()));
         let config_dir = scratch.join("config");
         std::fs::create_dir_all(&config_dir).unwrap();
@@ -460,9 +482,9 @@ mod tests {
                 eitri_core::agent_prefs::parse_review_hint(config.get(eitri_core::agent_prefs::REVIEW_HINT_KEY))?,
             ))
         };
-        assert_eq!(run("-- nothing set\n"), Ok((true, Key)));
+        assert_eq!(run("-- nothing set\n"), Ok((true, Off)));
         assert_eq!(run("eitri.config.set(\"review.hint\", true)\n"), Ok((true, Full)));
-        assert_eq!(run("eitri.config.set(\"review.enabled\", false)\n"), Ok((false, Key)));
+        assert_eq!(run("eitri.config.set(\"review.enabled\", false)\n"), Ok((false, Off)));
         assert_eq!(run("eitri.config.set(\"review.hint\", \"key\")\n"), Ok((true, Key)));
         assert!(run("eitri.config.set(\"review.hint\", {})\n").is_err());
         std::fs::remove_dir_all(&scratch).unwrap();
@@ -531,12 +553,25 @@ mod tests {
     fn load_checks_eitri_codex() {
         use eitri_core::source_scan as scan;
         let read = scan::rust_sources(&["panel/src"]);
-        let source = scan::file_with(&read, "fn read(kernel: &Kernel");
+        let source = scan::file_with(&read, "pub struct WindowConfig");
         let code = scan::code_only(&source.text);
-        let load = scan::functions(&code, "read");
-        assert_eq!(load.len(), 1, "load not found");
-        assert_eq!(scan::calls(load[0], "check_codex_env"), 1);
-        assert!(load[0].contains("CODEX_ENV"));
+        let reader = scan::functions(&code, "read_with_alt_mod");
+        assert_eq!(reader.len(), 1, "shared reader not found");
+        assert_eq!(scan::calls(reader[0], "check_codex_env"), 1);
+        assert!(reader[0].contains("CODEX_ENV"));
+        for (entry, delegate) in [
+            ("load", "read"),
+            ("read", "read_with_alt_mod"),
+            ("load_with_alt_mod", "read_with_alt_mod"),
+        ] {
+            let functions = scan::functions(&code, entry);
+            assert_eq!(functions.len(), 1, "{entry} not found");
+            assert_eq!(
+                scan::calls(functions[0], delegate),
+                1,
+                "{entry} must reach the shared reader"
+            );
+        }
     }
 
     #[test]
@@ -779,6 +814,47 @@ mod tests {
 
     fn load_defaults() -> WindowConfig {
         settled_from("").0
+    }
+
+    #[test]
+    fn keymap_alt_mod_is_applied_during_window_config_after_the_users_calls() {
+        use eitri_core::keymap::{alt_mod, KeySpec};
+        let scratch = eitri_core::plugin::test_support::Scratch::new("window-alt-mod");
+        let init = scratch.0.join("init.lua");
+        for (calls, automatic) in [
+            ("", true),
+            ("eitri.keymap.use('i3-alt')", false),
+            ("eitri.keymap.del('prefix', 'M-w')", false),
+            ("eitri.keymap.set('prefix', 'M-w', 'zoom')", false),
+            ("eitri.keymap.del('prefix', 'C-M-w')", false),
+        ] {
+            std::fs::write(&init, format!("eitri.config.set('keymap.from_tmux', 'off')\n{calls}")).unwrap();
+            let kernel = Kernel::new(scratch.0.clone(), eitri_core::lua::kernel::refuse_panels).unwrap();
+            kernel.load_init_file(&init);
+            let config = load_with_alt_mod(&kernel, &[], || {
+                Some(alt_mod::Answer {
+                    desktop: alt_mod::Desktop::Sway,
+                    modifier: Some(eitri_core::onboarding::WmMod::Alt),
+                })
+            })
+            .unwrap();
+            let row = config.keymap.lookup(&KeySpec::parse("C-M-w").unwrap());
+            if automatic {
+                assert!(
+                    row.is_some(),
+                    "the window applies the bundle when the answer is already in"
+                );
+                assert!(config.keymap.user_overrides().is_empty());
+                assert!(kernel.startup_problems().is_empty());
+            } else if calls.contains("use") {
+                assert_eq!(row.unwrap().source, eitri_core::keymap::Source::User);
+            } else {
+                assert!(
+                    row.is_none(),
+                    "a user choice stops the entire automatic bundle: {calls}"
+                );
+            }
+        }
     }
 
     #[test]

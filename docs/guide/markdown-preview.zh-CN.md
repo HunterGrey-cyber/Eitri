@@ -1,5 +1,5 @@
 [English](markdown-preview.md) | 简体中文
-<!-- translated-from: markdown-preview.md sha256=7a83dd13e7d9da0f193f72b5b9d1a2eaa1856261a89dc804fba061c93dfdfcd1 -->
+<!-- translated-from: markdown-preview.md sha256=6a0391c3d45a753b46775dc0c1e941e61800af7e4453210034737f4eba48da51 -->
 
 # Markdown 预览
 
@@ -16,7 +16,7 @@ Eitri 可以把你正在编辑的 Markdown 文件渲染出来，显示在编辑�
 eitri.plugin.load("markdown")
 ```
 
-在你打开预览之前，屏幕上什么都不会变。没有这一行，窗口里就没有预览的任何东西：没有模块，没有 Neovim 命令，也没有任何东西在运行。
+在你打开预览之前，屏幕上什么都不会变。没有这一行，窗口里就没有预览的任何东西：没有模块，没有 Neovim 命令，也没有任何东西在运行。想先试一下的话，在空标签页的 Pages 下面的 `Markdown preview` 上按 `Enter`，或者运行 `:Eitri plugin load markdown`，就会把它加载进当前窗口，只在这次运行里有效（[插件](configuration.zh-CN.md#plugins)）。
 
 <a id="open-and-close-it"></a>
 ## 打开和关闭预览

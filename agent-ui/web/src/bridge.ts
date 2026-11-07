@@ -1,4 +1,4 @@
-import type { AppliedSettings, EffortChoice, ModelOption, AgentDomainEvent, AgentUiSnapshot, ChooserEnvelope, ContextSummary, DetailRow, EditorCardWire, EditorLinkState, HandoffCommand, Hello, QueueItem, ReviewDiffEnvelope, ReviewDraftEnvelope, ReviewEnvelope, ReviewHintEnvelope, ReviewHintLevel, ReviewRecoveryEnvelope, ReviewScope, ReviewSendPreviewEnvelope, TabId, TabsEnvelope, ThinkingDisplay, TurnTimeWire } from "./types";
+import type { PageLine, AppliedSettings, EffortChoice, ModelOption, AgentDomainEvent, AgentUiSnapshot, ChooserEnvelope, ContextSummary, DetailRow, EditorCardWire, EditorLinkState, HandoffCommand, Hello, QueueItem, ReviewDiffEnvelope, ReviewDraftEnvelope, ReviewEnvelope, ReviewHintEnvelope, ReviewHintLevel, ReviewRecoveryEnvelope, ReviewScope, ReviewSendPreviewEnvelope, TabId, TabsEnvelope, ThinkingDisplay, TurnTimeWire } from "./types";
 import type { KeymapHelp, PaneDirection, PluginKeysHelp } from "./keymap";
 import { isEditorCardWire } from "./editorCardWire";
 import { isHex64, isTrustRemember } from "./trust";
@@ -168,6 +168,8 @@ export type OutboundMessage =
   /** The empty tab's "Open another project" row (`p`) was used. It carries no path: the window opens its own
    *  project chooser. Window-level; `InboundMessage::ChooseProject`, `core/src/agent_bridge.rs`. */
   | { type: "choose_project"; request_id: string }
+  | { type: "load_page"; id: string }
+  | { type: "page_line"; id: string }
   /** The `?` overlay that `prefix ?` opened was closed. `opening` is the number its `open_keymap` carried, so a
    *  close that arrives after a newer `prefix ?` is told apart; `return_keys` is true only for the overlay's own
    *  keys (`?`, `Esc`, `q`) or a click outside it, never for a close another route forced. Window-level; the
@@ -352,6 +354,7 @@ type InboundHandler = (
      *  `serialize_arrive_for_js` in `core/src/agent_bridge.rs`. `intent` says why the keys came (a reveal to look,
      *  or to stop the tab: then the chat asks its own y/n question); it never acts by itself. */
     | { kind: "arrive"; intent?: "show" | "stop" }
+    | { kind: "pages"; pages: PageLine[] }
     /** `shell`'s keys for the `?` overlay (`serialize_keymap_for_js`). */
     | ({ kind: "keymap" } & KeymapHelp)
     /** `send-prefix`/`send-keys` with this panel holding the keys: WebKitGTK cannot be handed the
@@ -745,6 +748,7 @@ export function installDispatch(handler: InboundHandler): void {
         obj.kind === "editor_typing" ||
         obj.kind === "enter_input" ||
         obj.kind === "arrive" ||
+        obj.kind === "pages" ||
         obj.kind === "keymap" ||
         obj.kind === "literal_key" ||
         obj.kind === "open_keymap" ||

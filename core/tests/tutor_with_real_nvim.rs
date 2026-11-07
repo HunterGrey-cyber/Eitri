@@ -13,6 +13,7 @@ mod embed_client;
 use std::os::unix::fs::PermissionsExt;
 use std::path::PathBuf;
 
+use eitri_core::compositor::mode::Mode;
 use eitri_core::tutor::prefix_text::substitute_checks;
 use eitri_core::tutor::{files, install_opts, TutorDir, CHECKS_EN, COMMAND, DEFAULT_PREFIX, FILES, INSTALL_TUTOR_LUA};
 use embed_client::Embed;
@@ -38,7 +39,8 @@ fn case(name: &str, args: &[&str], env: &[(&str, &str)]) -> Case {
 }
 
 fn case_under_umask(name: &str, args: &[&str], env: &[(&str, &str)], umask: Option<u32>) -> Case {
-    let dir = std::env::temp_dir().join(format!("tut-{}-{name}", std::process::id()));
+    // The target's own scratch, not `/tmp`: a build host's `/tmp` is a tmpfs whose inodes every suite shares.
+    let dir = PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join(format!("tut-{}-{name}", std::process::id()));
     let _ = std::fs::remove_dir_all(&dir);
     std::fs::create_dir_all(&dir).unwrap();
     let dir = std::fs::canonicalize(&dir).unwrap();
@@ -55,7 +57,7 @@ fn started(name: &str, args: &[&str], env: &[(&str, &str)]) -> Case {
 }
 
 fn install(c: &mut Case) -> Value {
-    let opts = install_opts(c.lessons.path(), DEFAULT_PREFIX);
+    let opts = install_opts(c.lessons.path(), DEFAULT_PREFIX, None);
     c.nvim.lua(INSTALL_TUTOR_LUA, vec![opts])
 }
 
@@ -82,7 +84,7 @@ fn assert_written(c: &Case) {
     for sub in ["", "tutor", "tutor/en", "tutor/zh"] {
         assert_eq!(mode(&c.lessons.path().join(sub)), 0o700, "{sub}/");
     }
-    for (rel, text) in files(DEFAULT_PREFIX) {
+    for (rel, text) in files(DEFAULT_PREFIX, None) {
         let path = c.lessons.path().join(rel);
         assert_eq!(std::fs::read_to_string(&path).unwrap(), text, "{rel}");
         assert_eq!(mode(&path) & 0o077, 0, "{rel}");
@@ -486,4 +488,42 @@ fn install_before_vimenter_defines_nothing_and_says_early() {
     let done = install(&mut c);
     assert_eq!(field(&done, "ok"), &Value::from(true));
     assert_eq!(c.nvim.eval("exists(':EitriTutor')"), Value::from(2));
+}
+
+#[test]
+#[ignore = "needs a real nvim on PATH; spends no tokens and needs no display"]
+fn compositor_tutor_opens_in_both_languages_and_its_checks_work() {
+    for (lang, env) in [("en", EN), ("zh", ZH)] {
+        let mut c = started(&format!("compositor-{lang}"), &[], env);
+        let source =
+            eitri_core::source_scan::read_required(&format!("core/src/tutor/lessons/{lang}/compositor.tutor")).text;
+        let opts = install_opts(c.lessons.path(), DEFAULT_PREFIX, Some(Mode::Compositor));
+        let answer = c.nvim.lua(INSTALL_TUTOR_LUA, vec![opts]);
+        assert_eq!(field(&answer, "ok"), &Value::from(true));
+        c.nvim.command(COMMAND);
+        let actual = string(c.nvim.eval(r#"join(getline(1, '$'), "\n")"#));
+        assert_eq!(
+            actual,
+            eitri_core::tutor::prefix_text::substitute(&source, DEFAULT_PREFIX).trim_end()
+        );
+        assert_eq!(current_file(&mut c), lesson_file(&c, lang));
+        let checks =
+            eitri_core::source_scan::read_required(&format!("core/src/tutor/lessons/{lang}/compositor.tutor.json"))
+                .text;
+        let checks: serde_json::Value = serde_json::from_str(&substitute_checks(&checks, DEFAULT_PREFIX)).unwrap();
+        let drawn = marks(&mut c).expect("nvim tutor marks");
+        assert_eq!(drawn.len(), checks["expect"].as_object().unwrap().len());
+        assert!(drawn.iter().all(|(_, sign)| sign == "✗"));
+        for (n, want) in checks["expect"].as_object().unwrap() {
+            c.nvim.lua(
+                FIX_LUA,
+                vec![
+                    Value::from(n.parse::<u64>().unwrap()),
+                    Value::from(want.as_str().unwrap()),
+                ],
+            );
+        }
+        assert!(marks(&mut c).unwrap().iter().all(|(_, sign)| sign == "✓"));
+        assert_eq!(on_rtp(&mut c), 0);
+    }
 }

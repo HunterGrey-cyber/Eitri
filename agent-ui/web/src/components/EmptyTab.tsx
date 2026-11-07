@@ -1,7 +1,7 @@
 import { useEffect, useLayoutEffect, useRef, useState } from "react";
 import type { KeyboardEvent } from "react";
 import type { NavKeyDirection } from "../bridge";
-import type { EditorLink, HandoffCommand, Hello, QueueItem, TabInfo } from "../types";
+import type { PageLine, EditorLink, HandoffCommand, Hello, QueueItem, TabInfo } from "../types";
 import { EMPTY_PANEL_TABLE } from "../keymap";
 import type { PanelBinding, PanelMode, PanelTable } from "../keymap";
 import { advanceSequence, boxEntries, isPendingFirst, pendingPairBinding, sequenceTitle, startSequence, WHICH_KEY_DELAY_MS } from "../leader";
@@ -45,6 +45,9 @@ export function screenOrder(count: number): number[] {
 
 export type EmptyTabProps = {
   hello: Hello | null;
+  pages?: PageLine[];
+  onLoadPage?: (id: string) => void;
+  onPageLine?: (id: string) => void;
   tab: TabInfo;
   handoff: HandoffCommand | null;
   failure: string | null;
@@ -207,6 +210,10 @@ export function EmptyTab(props: EmptyTabProps) {
   const showDashboard = hello !== null && !starting && !failed;
   const editorLink = props.editorLink ?? null;
   const [dashCursor, setDashCursor] = useState(0);
+  const dashCount = (hello === null ? 0 : dashItems(hello).length) + (props.pages?.length ?? 0);
+  useEffect(() => {
+    setDashCursor((cursor) => Math.min(cursor, Math.max(0, dashCount - 1)));
+  }, [dashCount]);
   const rootRef = useRef<HTMLDivElement>(null);
   /** "The first start on a fresh Verdandi checkout also builds the sidecar." used
    *  to be shown unconditionally on every starting screen, which is irrelevant on an installed
@@ -722,7 +729,7 @@ export function EmptyTab(props: EmptyTabProps) {
     if (event.key === "j" || event.key === "k" || event.key === "ArrowDown" || event.key === "ArrowUp") {
       event.preventDefault();
       const delta = event.key === "j" || event.key === "ArrowDown" ? 1 : -1;
-      const order = screenOrder(items.length);
+      const order = screenOrder(dashCount);
       // The box is the last stop, so `j` on it walks in, by the conversation's own rule (`TypingGuard.walkIntoBox`).
       if (delta === 1 && dashCursor === order[order.length - 1]) {
         const walks = typingGuard.walkIntoBox(event, typedAt, () => {
@@ -741,6 +748,17 @@ export function EmptyTab(props: EmptyTabProps) {
       event.preventDefault();
       const item = items[dashCursor];
       if (item !== undefined) runItem(item);
+      else {
+        const page = props.pages?.[dashCursor - items.length];
+        if (page !== undefined) props.onLoadPage?.(page.id);
+      }
+      return;
+    }
+    const page = props.pages?.[dashCursor - items.length];
+    if (event.key === "o" && !event.ctrlKey && !event.altKey && !event.metaKey && page !== undefined) {
+      event.preventDefault();
+      if (typingGuard.mayActAfterMotion(typedAt, event.repeat)) props.onPageLine?.(page.id);
+      else if (cancelled === null) props.onFlash?.(TYPE_HINT_FLASH);
       return;
     }
     // Bare `m` collides with prose such as "make" and "mode"; mode changes use Shift+Tab or
@@ -874,6 +892,8 @@ export function EmptyTab(props: EmptyTabProps) {
         </div>
         {inDashboard && hello !== null && (
           <DashboardItems
+            pages={props.pages}
+            onLoadPage={props.onLoadPage}
             hello={hello}
             mode={tab.mode}
             cursor={dashCursor}

@@ -1,8 +1,9 @@
 //! JSON message types and (de)serialization for the Rust<->JS bridge between `shell` and
 //! `agent-ui/web`'s embedded frontend, v2 protocol: every
-//! JS->Rust command carries a `requestId`; Rust replies with exactly one `command_result` per
-//! command, and pushes a revisioned `events`/`snapshot` envelope independently of any specific
-//! command. See agent-ui/web/src/types.ts for the exact TS-side shapes these must match.
+//! ordinary JS->Rust command carries a `requestId`; Rust replies with exactly one `command_result` per
+//! command. Page-load and page-line requests are one-way window messages, naming only an offered id.
+//! Rust pushes a revisioned `events`/`snapshot` envelope independently of any specific command.
+//! See agent-ui/web/src/types.ts for the exact TS-side shapes these must match.
 
 use std::collections::BTreeMap;
 
@@ -539,6 +540,12 @@ pub enum InboundMessage {
         request_id: String,
         direction: PaneNavDirection,
     },
+    LoadPage {
+        id: String,
+    },
+    PageLine {
+        id: String,
+    },
     /// Requests the window's project chooser without passing project data to the page.
     ChooseProject {
         request_id: String,
@@ -772,6 +779,8 @@ impl InboundMessage {
             | InboundMessage::PanelKeys { .. }
             | InboundMessage::NavFallthrough { .. }
             | InboundMessage::PaneNav { .. }
+            | InboundMessage::LoadPage { .. }
+            | InboundMessage::PageLine { .. }
             | InboundMessage::ChooseProject { .. }
             | InboundMessage::KeymapClosed { .. }
             | InboundMessage::ViewExported { .. }
@@ -983,6 +992,7 @@ impl DecisionChoice {
 impl InboundMessage {
     pub fn request_id(&self) -> &str {
         match self {
+            InboundMessage::LoadPage { .. } | InboundMessage::PageLine { .. } => "",
             InboundMessage::Ready { request_id }
             | InboundMessage::SendMessage { request_id, .. }
             | InboundMessage::RunShell { request_id, .. }
@@ -1838,6 +1848,18 @@ pub fn serialize_review_diff_for_js(
 /// differing between its snapshots, for the status band. `files: 0` clears the hint.
 pub fn serialize_review_hint_for_js(hint: &crate::turn_review::ReviewHint) -> String {
     json!({ "kind": "review_hint", "tab": hint.tab, "turn": hint.turn, "files": hint.files }).to_string()
+}
+
+/// A plugin page offered by this window for loading during this run.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct PageLine {
+    pub id: String,
+    pub title: String,
+    pub summary: Option<String>,
+}
+
+pub fn serialize_pages_for_js(pages: &[PageLine]) -> String {
+    json!({ "kind": "pages", "pages": pages }).to_string()
 }
 
 /// The window's turn review settings, sent before the tabs on every `ready` and when `init.lua`

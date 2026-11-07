@@ -615,11 +615,17 @@ fn every_host_gets_its_controllers_from_wire_host() {
         .expect("the surface constructors");
     assert_eq!(
         scan::calls(surfaces, "wire_host"),
-        2,
-        "the surface maker wires a terminal and a chat view"
+        3,
+        "the surface maker wires a terminal, a chat view and a page loaded into the running window"
+    );
+    let plain: String = surfaces.split_whitespace().collect();
+    assert!(
+        arm(&plain, "CreateRoute::LatePage=>{", "CreateRoute::")
+            .contains("wire_host(WireKind::PluginPage,module,&host,&self.wire_deps);"),
+        "a late page's host is wired as a plugin page's"
     );
     let total: usize = files.iter().map(|(_, code)| scan::calls(code, "wire_host")).sum();
-    assert_eq!(total, 4, "no other path wires a host");
+    assert_eq!(total, 5, "no other path wires a host");
 
     // A plugin page built on its first show fills a slot whose host was wired at startup.
     let (_, build_page) = scan::function_in(&scan::rust_sources(&["shell/src"]), "build_page");
@@ -885,8 +891,30 @@ fn the_follow_feed_is_wired_only_for_plugins_that_want_it() {
     assert!(code.contains("plugin_panels.set_follow_feed(socket.socket_path(),scratch_path.as_deref());"));
     assert!(code.contains("plugin_panels.set_window_root(project_root);"));
 
-    let listen = code.find("feed_pump.listen_follow(").expect("the follow listener");
-    let closure = scan::braced(&code, listen + code[listen..].find('{').unwrap());
+    // The window's one reader of the follow socket's lines; the socket bound at start is read with it, and so is one
+    // the first loaded page that follows the editor binds.
+    let closure = let_block(&code, "letfollow_reader:plugin_load::FollowReader=");
+    let listen = code
+        .find("feed_pump.listen_follow(")
+        .expect("the startup socket's listener");
+    assert!(
+        call_texts(&code[listen..], "feed_pump.listen_follow(")[0] == "(socket,move|batch|reader(batch))",
+        "the startup socket is read by the one reader"
+    );
+    assert!(code.contains("*follow_slot.borrow_mut()=follow_socket.take();"));
+    assert!(code.contains("loads.set_follow(feed_pump.clone(),follow_reader.clone());"));
+    let late = file_code("shell/src/plugin_load.rs");
+    assert_eq!(late.matches("FollowSocket::bind()").count(), 1, "one late bind");
+    assert!(late.contains("letsocket=ifbind_follow&&wants_follow(&plugin.manifest){FollowSocket::bind()}else{None};"));
+    assert!(late.contains("letbind_follow=self.follow_slot.borrow().is_none();"));
+    let take = file_code("shell/src/plugin_load.rs");
+    let at = take.find("fntake_follow_socket(").expect("the late socket's reader");
+    let take = scan::braced(&take, at + take[at..].find('{').unwrap());
+    assert!(take.contains("feed_pump.listen_follow(&mutsocket,move|batch|reader(batch));"));
+    assert!(
+        take.contains("self.follow_slot.borrow().is_none()"),
+        "never a second reader"
+    );
     let route = closure
         .find("letcommands=plugin_panels.route_follow(")
         .expect("the lines routed");
@@ -936,7 +964,7 @@ fn the_follow_feed_is_wired_only_for_plugins_that_want_it() {
     // The plugins' follow socket goes with the editor's feeds, at the window's teardown.
     let at = services.find("fnfeeds(&self){").expect("the teardown's feeds step");
     let feeds = scan::braced(&services, at + services[at..].find('{').unwrap());
-    assert!(feeds.contains("socket.cleanup();"));
+    assert!(feeds.contains("ifletSome(socket)=self.follow_socket.borrow().as_ref(){socket.cleanup();}"));
     assert!(arm(&services, "CleanupOp::Feeds=>", "}").contains("teardown.feeds()"));
 
     // The switch's attribute and variable are literals, which the code-only text blanks: read the source.
@@ -1126,7 +1154,7 @@ fn no_lifecycle_hook_is_left_in_build_ui() {
     assert!(arm(&services, "TermOp::Start{", "TermOp::").contains("start_pane(&self.terminals,module)"));
     assert!(arm(&services, "ChatOp::OpenChooser{", "ChatOp::").contains("self.agent.open_chooser(*view);"));
     let reload = arm(&services, "PluginOp::Reload{", "PluginOp::");
-    assert!(reload.contains("webview.load_uri(url);") && reload.contains("crash_guard.borrow_mut().reset();"));
+    assert!(reload.contains("webview.load_uri(&url);") && reload.contains("crash_guard.borrow_mut().reset();"));
 }
 
 /// The selection, the tray, the mark and the workspace's name are the controller's chrome model, drawn when its
@@ -1544,22 +1572,30 @@ fn window_2s_paths_follow_the_panels_own_rule() {
 fn window_2s_follow_lines_go_through_the_controllers_follow_window() {
     let code = build_ui_code();
     let follow_window = "letwindow=GridFollowWindow{driver:Rc::downgrade(&driver),};";
-    for listener in ["feed_pump.listen_follow(", "two.on_follow("] {
-        let at = code.find(listener).unwrap_or_else(|| panic!("`{listener}`"));
-        let made = code[..at]
-            .rfind(follow_window)
-            .unwrap_or_else(|| panic!("`{listener}` has a follow window over the controller"));
-        let between = &code[made + follow_window.len()..at];
-        assert!(
-            !between.contains("letwindow=") && between.len() < 200,
-            "the follow window `{listener}` applies is that one: {between}"
-        );
-        let handed = call_texts(&code[at..], listener)[0];
-        assert!(
-            handed.contains("plugin_panels::apply_follow_commands(&window,"),
-            "{handed}"
-        );
-    }
+    // Window 1's own socket's lines: the reader makes its follow window first, and only that one.
+    let reader = let_block(&code, "letfollow_reader:plugin_load::FollowReader=");
+    assert!(reader.starts_with(&format!("{{{follow_window}")), "{reader}");
+    assert_eq!(reader.matches("letwindow=").count(), 1, "{reader}");
+    assert!(
+        reader.contains("plugin_panels::apply_follow_commands(&window,"),
+        "{reader}"
+    );
+    // Window 2's lines from window 1.
+    let listener = "two.on_follow(";
+    let at = code.find(listener).unwrap_or_else(|| panic!("`{listener}`"));
+    let made = code[..at]
+        .rfind(follow_window)
+        .unwrap_or_else(|| panic!("`{listener}` has a follow window over the controller"));
+    let between = &code[made + follow_window.len()..at];
+    assert!(
+        !between.contains("letwindow=") && between.len() < 200,
+        "the follow window `{listener}` applies is that one: {between}"
+    );
+    let handed = call_texts(&code[at..], listener)[0];
+    assert!(
+        handed.contains("plugin_panels::apply_follow_commands(&window,"),
+        "{handed}"
+    );
 }
 
 /// The workspace verbs are the controller's: `build_ui` makes no closure that switches, makes, renames or deletes a
@@ -1872,4 +1908,65 @@ fn the_busy_hook_posts_chat_busy() {
     assert_eq!(calls.len(), 1);
     assert!(calls[0].contains("HostEvent::Chat(eitri_core::wm::ChatEvent::Busy{win:WinId::MAIN,view,busy,"));
     assert!(calls[0].contains("for&(view,busy)inchanged"));
+}
+
+/// A page loaded into the running window: the controller's `PluginOp::Load` reaches the window's loads, whose worker
+/// does the disk work; on the GTK thread the page joins, its slot is entered among the Lua pages and its tray chip is
+/// made before the controller hears `Loaded`, so the batch that answers finds the slot to host. The empty tab's Enter
+/// is the runner's `plugin.load`, and its `o` only shows the line.
+#[test]
+fn a_loaded_page_joins_before_the_controller_hears_of_it() {
+    let services = file_code("shell/src/gtk_host/services.rs");
+    let load = arm(&services, "PluginOp::Load{win,name}=>", "PluginOp::");
+    assert!(load.contains("Some(loads)=>loads.load(*win,name),"), "{load}");
+    assert!(load.contains("PluginEvent::LoadFailed{"), "{load}");
+    assert!(arm(&services, "PluginOp::ShutdownAll{", "PluginOp::").contains("loads.window_closing();"));
+
+    let late = file_code("shell/src/plugin_load.rs");
+    let at = late.find("pub(crate)fnload(self:&Rc<Self>,").expect("the load");
+    let load = scan::braced(&late, at + late[at..].find('{').unwrap());
+    let worker = load.find("gtk4::gio::spawn_blocking(").expect("a worker");
+    assert!(
+        load[worker..].contains("eitri_core::lua::plugin::load_named("),
+        "the disk work is the worker's"
+    );
+    assert!(
+        load.contains("me.upgrade().filter(|me|!me.closing.get())"),
+        "a closing window takes nothing"
+    );
+    let at = late.find("fnjoin(&self,").expect("the join");
+    let join = scan::braced(&late, at + late[at..].find('{').unwrap());
+    let order = [
+        "self.check_roots(&plugin)",
+        ".join(&self.deps.engine,&self.deps.keymap,&registration)",
+        "self.deps.lua_pages.borrow_mut().push(entry)",
+        "chip(&module,",
+        "self.post(loaded_event(win,&registration));",
+        "self.refresh_offers();",
+    ];
+    let found: Vec<usize> = order
+        .iter()
+        .map(|part| join.find(part).unwrap_or_else(|| panic!("`{part}` in the join")))
+        .collect();
+    assert!(found.windows(2).all(|w| w[0] < w[1]), "the join's order: {order:?}");
+
+    let code = build_ui_code();
+    let enter = call_texts(&code, "panel_hooks.on_load_page=Some(");
+    assert_eq!(enter.len(), 1);
+    assert!(enter[0].contains("driver.run(WinId::MAIN,Action::PluginLoad{name},Origin::Chip);"));
+    let line = call_texts(&code, "panel_hooks.on_page_line=Some(");
+    assert_eq!(line.len(), 1);
+    assert!(line[0].contains("eitri_core::plugin::line::plugin_line(&id)"));
+    assert!(
+        line[0].contains("glib::idle_add_local_once("),
+        "after the panel's call returns"
+    );
+    assert!(
+        line[0].contains("panel.view_in_editor_later(plugin_load::PAGE_LINE_TITLE,"),
+        "a scratch buffer, written on the panel's worker"
+    );
+    assert!(
+        !line[0].contains("panel.view_in_editor("),
+        "never the call that writes on the GTK thread"
+    );
 }

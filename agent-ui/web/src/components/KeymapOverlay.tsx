@@ -4,7 +4,7 @@ import { browseKeys, CARET_KEYS, INPUT_KEYS, QUESTION_KEYS, REVIEW_KEYS, TASKS_K
 import type { KeyHelp, PanelBinding, PanelTable, PluginKeysHelp } from "../keymap";
 import { sequenceTitle } from "../leader";
 import { listedSlashCommands } from "../slashCommands";
-import type { PermissionModeChoice } from "../types";
+import type { PageLine, PermissionModeChoice } from "../types";
 import type { RemoteConnectedDevice } from "../bridge";
 import { revealHidden } from "../revealHidden";
 import { Revealed } from "./Revealed";
@@ -12,6 +12,7 @@ import { modeConsequence } from "./Dashboard";
 import { DEVICE_LIST_KEYS, DEVICE_LIST_NOTE } from "../DeviceList";
 
 type Props = {
+  pages?: PageLine[];
   /** Requested by a backdrop click only -- `App.tsx` owns `?`/`Escape`/`q`, which it intercepts
    *  before `resolveKey` ever runs, and calls this the same way. */
   onClose: () => void;
@@ -273,7 +274,7 @@ function SlashCommands() {
  *  so reading the sheet never acts on a card underneath. Only a click on the backdrop closes it here:
  *  a click inside a table must still allow reading a row or selecting its text. */
 export const KeymapOverlay = forwardRef<HTMLDivElement, Props>(function KeymapOverlay(
-  { onClose, windowKeys, prefixKeys, prefixLabel, panel, tmuxSkipped, companion = false, claudeSlashCommands = true, agent = null, modes = ALL_MODES, plugin, phones, deviceList = false, startAt, startRequest = 0 },
+  { pages = [], onClose, windowKeys, prefixKeys, prefixLabel, panel, tmuxSkipped, companion = false, claudeSlashCommands = true, agent = null, modes = ALL_MODES, plugin, phones, deviceList = false, startAt, startRequest = 0 },
   ref,
 ) {
   const prefixHeading = useRef<HTMLHeadingElement>(null);
@@ -320,6 +321,16 @@ export const KeymapOverlay = forwardRef<HTMLDivElement, Props>(function KeymapOv
           .map((mode) => `${mode} — ${modeConsequence(mode, agent, prefixLabel)}`)
           .join(" ")}`}
       />
+      {pages.length > 0 && (
+        <section>
+          <h2>Pages</h2>
+          <ul>
+            {pages.map((page) => (
+              <li key={page.id}>{page.title} <code>:Eitri plugin load {page.id}</code></li>
+            ))}
+          </ul>
+        </section>
+      )}
       <Selecting panel={panel} />
       {/* The review overlay (`c`): its keys are `./review`'s, not `resolveKey`'s, so they are a section of
           their own, tied to that table both ways by `review.test.ts`. */}

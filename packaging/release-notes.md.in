@@ -35,12 +35,28 @@ you. Your Neovim stays the editor: a real `nvim --embed` with your own `init.lua
 - Chat windows have the app id `cn.huntergrey.eitri.Panel`, page windows `cn.huntergrey.eitri.Page`, and titles that
   never change, so a window rule can place them; a rule's placement wins over what Eitri remembers. The guide's new
   "Compositor windows" page has a rule for each compositor.
-- `:EitriTutor` still teaches Eitri's own layout keys, which are off in this mode; the page says which keys still work.
+- `:EitriTutor` follows the mode: in a window that opened in compositor mode it teaches that mode's keys (chat windows,
+  the bottom terminal, moving out to your compositor) instead of Eitri's own layout.
 - A finished turn in another window no longer shows as running, in the top bar or in the close question.
 - Run on sway 1.12 in a headless session, and in a virtual machine on Hyprland 0.57.0 (Lua config), 0.56.2 (`hyprland.conf`
   and Lua config) and niri 26.04; not on real hardware, and not on GNOME or KDE. Each chat window costs 51.4 MiB more than
   the same chat as a tile with four projects open (release build, medians). The page's "Known gaps" lists what does not
   work yet.
+
+**Keys you can find without the guide**
+
+- `review.hint` takes a third value, `"key"`: after a turn that changed files the status band says only
+  `c to review`, with no count, nothing above the box, nothing opening. `true` still gives the count and the running
+  line; the default stays `false`, nothing.
+- While the keys are in the editor, the empty tab says which key brings them to the panel (`Ctrl+l to use these keys`).
+- Floats and the scratchpad have plain keys after the prefix: `F` floats a module or puts it back, `_` sends it to
+  the scratchpad, `S` shows the scratchpad. The Alt chords still work.
+- `<prefix> W` opens the second window, or brings it to the front.
+- On sway or i3 with Alt as `$mod`, which takes Eitri's Alt keys after the prefix, Eitri moves them to Ctrl+Alt for
+  that window by itself and says so once. `eitri.keymap.use("i3-alt")` keeps the moves; a key of your own stops them.
+- The bundled pages (Strips, The pass, the table, the Markdown preview) are listed on the empty tab under "Pages":
+  `Enter` loads one into this window for this run, and `o` opens its `init.lua` line in a scratch buffer so you can
+  keep it. `:Eitri plugin load <name>` does the same from Neovim. Eitri does not write your `init.lua`.
 
 **Sidecar updates, without a new Eitri**
 
@@ -72,6 +88,11 @@ you. Your Neovim stays the editor: a real `nvim --embed` with your own `init.lua
   kept for it either way.
 - **In that mode, closing a chat window forgets its tabs,** with no question when it is idle. Closing the editor's
   window keeps them.
+- **New default keys after the prefix: `F`, `S`, `_` and `W`.** An `init.lua` that sets one of them stops at start until
+  it puts `eitri.keymap.del("prefix", "<key>")` first, and a page loaded with `key = "F"` (or `S`, `W`, `_`) is refused;
+  the startup message names the key and what holds it.
+- **On sway or i3 with Alt as `$mod`, the Alt keys after the prefix move to Ctrl+Alt** unless your `init.lua` touches
+  any of them.
 - **In companion mode on Hyprland, a key at a real edge now stops there.** Hyprland's own move picks a window even when
   nothing lies that way, so `Ctrl+k` and `Ctrl+j` could leave for the panel. Windows that overlap are still left to it.
 

@@ -1,0 +1,293 @@
+# Eitri's keys
+
+This tutorial teaches the keys of the Eitri window around this editor: the
+prefix, chat and page windows, the agent panel and the bottom terminal.
+It takes about fifteen minutes if you do every step.
+
+Neovim's own keys work here as always. Move down this page with `j`{normal}.
+What you type into this page is never written to disk.
+
+# Lesson 0
+
+Most steps in this tutorial happen outside nvim, in the window: each one says
+what you should see and how to come back here. One way back always works:
+`{prefix} e` raises window 1 and gives the keys to this editor. Window 1
+holds the editor and one optional bottom terminal. Chats and pages each have
+a separate window, arranged by your compositor.
+
+The keys are written with `{prefix}` as the prefix, the one Eitri has now (the
+default prefix is `Ctrl+b`). Lesson 7 says where another one comes from. This
+tutorial teaches the stock keys after the prefix: if your tmux config rebinds
+some of them, `{prefix} ?` shows what they do here.
+
+When a line has a ✗ at its left, you fix it. Most of these lines ask for a
+key: press `A`{normal}, type a space and the key as this tutorial spells it
+(for a chord, its letters, such as Ctrl+l), then press `<Esc>`{normal}. The ✗
+turns into ✓ when the line is right. Try it on the line below, which wants a
+`?`:
+
+Press the prefix, then this key, to list every key: {prefix}
+
+# Lesson 1: THE PREFIX
+
+** Press {prefix}, let go, then press one more key. **
+
+The window's own keys start with a prefix, as in tmux. Eitri reads it before
+the editor, the agent panel or the terminal sees the key, so it works wherever
+the keys are.
+
+ 1. Press `{prefix}` and let go. The top bar shows a strip of what can follow,
+    ending with `? keys`. In a chat or page window the strip floats at the
+    top right instead.
+
+ 2. Press `<Esc>`. The strip goes away and nothing else happens. A key the
+    prefix does not bind also ends the wait without doing anything.
+
+ 3. Press `{prefix} ?`. The agent panel shows the full list of keys, starting
+    at the ones that follow the prefix. Your own changes and anything taken
+    from tmux are in it. The chat window comes forward. Close the list with
+    `q` or `<Esc>`, then press `{prefix} e` to come back here.
+
+NOTE: The keys in this tutorial are the most used ones. `{prefix} ?` always
+      shows all of them, and the hint strip shows what may follow the prefix.
+
+# Lesson 2: CHAT WINDOWS AND THE BOTTOM TERMINAL
+
+** {prefix} a raises or starts a chat window; {prefix} t shows the
+   bottom terminal. **
+
+Your compositor arranges chats and pages as separate windows. Window 1 keeps
+this editor and one optional terminal below it. Eitri's layout keys are off:
+splits, zoom, moving and swapping modules, containers, layouts, resizing,
+marks, floats, the scratchpad, workspaces, window.* and move.to-window show
+a toast on their first press. Use your compositor's own keys to arrange
+windows instead.
+
+ 1. Press `{prefix} a`. A chat window comes forward, or starts if none is
+    open. A chat waiting on you comes first. Press `{prefix} e` in that
+    window to raise window 1 and come back here.
+
+ 2. Press `{prefix} t`. The bottom terminal opens and takes the keys.
+    Press `{prefix} t` again there to hide it; its shell keeps running.
+
+ 3. Press `{prefix} a`, then `{prefix} c` in the chat window to make an
+    empty tab. On a tab with a session, `{prefix} !` sends it from c1 to a
+    new chat window, or back to c1 from another chat window. On this empty
+    tab, press `{prefix} !`: a new empty chat window opens and the tab
+    stays where it was. If all nine chat windows are open, a toast says so;
+    skip step 4 then. Press `{prefix} e` to come back here.
+
+ 4. Return to the new chat window with your compositor's focus keys. Press
+    `{prefix} x` there to close it, as the compositor's close key does.
+    An idle chat closes without a question; a running turn asks first.
+    Closing a chat removes its tabs from the tab list; saved conversations
+    remain in the chooser. Press `{prefix} e` in any remaining Eitri
+    window to come back here.
+
+NOTE: In window 1, `{prefix} x` quits the editor, or ends the terminal
+      after a y/n. Do not quit the editor during this tutorial. Do not end
+      a terminal running anything you need. `{prefix} d` hides the terminal;
+      it does not close a chat or page window. Use the compositor to close
+      pages, or `{prefix} x` in that page's window.
+
+ 5. Fix the line below:
+
+Raise or start a chat window: {prefix}
+
+# Lesson 3: MOVING WITH CTRL+H, CTRL+J, CTRL+K, CTRL+L
+
+** Ctrl+h, Ctrl+j, Ctrl+k and Ctrl+l move the keys left, down, up and
+   right. **
+
+These four need no prefix. In window 1 they go through nvim's splits first,
+then the bottom terminal, then your compositor's focus move at the edge.
+The chat panel is a separate window; its position is the compositor's choice.
+In a chat, `Ctrl+h` and `Ctrl+l` move focus through the compositor. `Ctrl+j`
+starts typing in BROWSE and leaves downward from INSERT; `Ctrl+k` returns
+from INSERT to BROWSE and leaves upward from BROWSE (lesson 4).
+
+ 1. Press `{prefix} t` to show the terminal. Press `Ctrl+k` to reach the
+    editor above it, `Ctrl+j` to return to the terminal, then `Ctrl+k` to
+    reach this editor again.
+
+ 2. Press `Ctrl+l` at the editor's right edge. Your compositor moves focus
+    to a window on that side, if there is one. It need not be the chat.
+    Use your compositor's focus keys to return to an Eitri window, then
+    `{prefix} e` to return to this editor.
+
+ 3. Type `:vsplit`{vim} and press `<Enter>`. Now `Ctrl+l` first moves to
+    the right half of nvim; a second `Ctrl+l` reaches the compositor.
+    Return with your compositor's focus keys and `{prefix} e`, then press
+    `Ctrl+h` to reach the left half and type
+    `:only`{vim}.
+
+ 4. Press `Ctrl+j` to reach the bottom terminal, then `{prefix} t` there
+    to hide it and return here. `{prefix} a` raises a chat window;
+    `{prefix} e` there raises this editor. `{prefix} f` labels the modules
+    and buttons in window 1 that you can jump to; type a label to go there.
+
+NOTE: If your nvim config maps `Ctrl+h`, `Ctrl+j`, `Ctrl+k` or `Ctrl+l` to
+      something else, your mapping wins and Eitri leaves that key alone. Use
+      the arrows after the prefix then, such as `{prefix} Left`.
+
+ 5. Fix the line below:
+
+Give the keys to the editor in window 1: {prefix}
+
+# Lesson 4: THE AGENT PANEL
+
+** The panel has two modes: INSERT is the message box, BROWSE is the
+   conversation. **
+
+The agent panel is where you talk to an agent. In BROWSE its keys are vim's.
+The left end of its bottom band shows the mode, the way your statusline shows
+nvim's.
+
+ 1. Press `{prefix} a` to raise the chat window. If the band says BROWSE,
+    press `i`.
+
+ 2. Type a few words, then press `Ctrl+u` to delete them. Do not press
+    `<Enter>` in this lesson: it would send what you typed to the agent and
+    start a turn.
+
+ 3. Press `<Esc>`. The band says BROWSE. Here `j` and `k` move over the rows of
+    the conversation, `?` lists the panel's keys (`q` closes the list), and
+    `i` goes back to the box.
+
+ 4. Each conversation is a tab. Press `{prefix} c`: a new, empty tab opens
+    and waits for its first message. `{prefix} n` and `{prefix} p` go to the
+    next and the previous tab, `{prefix} 1` to the first. `{prefix} &`
+    closes the tab you are on after a `y`. Close the new one that way: go
+    back to it (`{prefix} n` until you are on it), then press `{prefix} &`
+    and `y`. In BROWSE, `H` and `L` also step through the tabs.
+
+ 5. When an agent wants to run a tool that needs your approval, a card waits
+    in the conversation. There is none now, so read this one:
+    In BROWSE, `a` approves the card under the cursor, `d` denies it and `D`
+    denies with a reason you type (in Claude tabs; Codex and ACP agents take
+    no reason, and `D` says so). `]p` and `[p` move to the next and the
+    previous waiting card. In INSERT, `Ctrl+y` approves the oldest card;
+    right after `Ctrl+u`, a first `Ctrl+y` answers nothing and says why, and
+    a second one answers. These keys answer only when you press them on their
+    own, so a word you are typing cannot answer a card by accident.
+
+ 6. Press `{prefix} e` to raise window 1 and come back here.
+
+ 7. Fix the line below:
+
+Open a new tab in the agent panel: {prefix}
+
+# Lesson 5: THE BOTTOM TERMINAL, AND THE PREFIX TWICE
+
+** {prefix} t shows the terminal; {prefix} {prefix} sends {prefix}
+   itself. **
+
+In the terminal, the prefix and the four moving keys belong to Eitri, so the
+shell never sees them. The prefix gives them back.
+
+ 1. Press `{prefix} t`. The terminal opens below the editor with the keys. Its
+    shell starts in the project's directory.
+
+ 2. Type `ls` and press `<Enter>`. To clear the screen, `Ctrl+l` will not do:
+    it moves the keys. Press `{prefix} Ctrl+l` instead, which sends Ctrl+l to
+    the shell. `{prefix} Ctrl+h`, `{prefix} Ctrl+j` and `{prefix} Ctrl+k`
+    do the same for those keys, such as readline's Ctrl+k, which deletes to
+    the end of the line.
+
+ 3. Press `{prefix} [` to scroll back through the terminal's output. `k` and
+    `j` move a line, `q` leaves.
+
+ 4. Press `{prefix} {prefix}` to send {prefix} to the program. For Ctrl+b,
+    a shell moves the cursor back one character, and Claude Code running in
+    this terminal takes it as the key that moves a running command to the
+    background.
+
+ 5. Press `Ctrl+k`. The keys come back here, to the editor above. With the
+    keys in the terminal, `{prefix} t` hides it again.
+
+ 6. The same goes for nvim, where Ctrl+b scrolls a page back. Press
+    `<C-f>`{normal} to go a page forward, then `{prefix} {prefix}`: nvim
+    gets {prefix}; for Ctrl+b that goes a page back to this lesson.
+
+ 7. Fix the line below:
+
+Clear the terminal's screen: {prefix}
+
+# Lesson 6: YOUR WINDOW MANAGER'S FLOATS AND WORKSPACES
+
+** Your window manager arranges these windows. **
+
+Use your window manager's own floating, scratchpad and workspace keys here.
+Eitri's floats, scratchpad, workspaces and other layout keys are off in this
+mode. Window 2 is off too: your compositor's workspaces and outputs do that
+job. No exercise is needed for this lesson.
+
+To use Eitri's own tiling, add this to ~/.config/eitri/init.lua:
+
+    eitri.config.set("window.tiling", "eitri")
+
+Then open a new Eitri window. The setting is read once per window, so this
+window keeps its current mode. The new window's tutorial teaches splits,
+floats, scratchpad and workspaces instead.
+
+# Lesson 7: YOUR TMUX CONFIG, AND INIT.LUA
+
+** Eitri takes your tmux prefix and bindings; init.lua changes the rest. **
+
+If you use tmux, Eitri read your tmux config when it started (the files tmux
+reads, such as ~/.tmux.conf or ~/.config/tmux/tmux.conf). Your prefix and the
+bindings that match an Eitri action work here too. A notice says what came
+across, once for each change, and `{prefix} ?` lists every line that did not,
+with the reason. Eitri only reads those files; it never starts or asks tmux.
+
+Your own changes go in ~/.config/eitri/init.lua (with $XDG_CONFIG_HOME set,
+in $XDG_CONFIG_HOME/eitri/init.lua). Eitri reads it when it starts, and what
+it says wins over what came from tmux. The calls look like this:
+
+~~~ lua
+local k = eitri.keymap
+k.prefix("C-a")                   -- the prefix becomes Ctrl+a
+k.del("prefix", "C-b")            -- Ctrl+b after the prefix sent Ctrl+b
+k.set("prefix", "C-a", "send-prefix")  -- now Ctrl+a twice sends Ctrl+a
+~~~
+
+A key that already has an action must be deleted with `k.del` before `k.set`
+gives it another; otherwise Eitri stops at startup and says which call to fix.
+
+ 1. The sample line below sets a prefix to Ctrl+b. Change it to Ctrl+a: move
+    the cursor onto the `b` and press `ra`{normal}.
+
+eitri.keymap.prefix("C-b")
+
+ 2. To turn the tmux import off, init.lua says:
+
+    eitri.config.set("keymap.from_tmux", "off")
+
+Two samples come with Eitri's source, in docs/keymap/: tmux-ctrl-a.lua moves
+the prefix to Ctrl+a with the rest of a common tmux setup, and i3-alt-mod.lua
+is for i3 or sway with Alt as $mod. Such a window manager takes the Alt chords
+before Eitri sees them (`{prefix} Alt+w`, for example, which is off in this
+mode). The sample moves them to Ctrl+Alt chords; Eitri's layout keys stay
+off here.
+
+# THE END
+
+These are the keys from this tutorial:
+
+    `{prefix} ?`                  every key, in a chat window
+    `{prefix} a`                  raise or start a chat window
+    `{prefix} e`                  raise window 1 and focus the editor
+    `{prefix} t`                  show or hide the bottom terminal
+    `{prefix} !`                  send a tab from c1 to its own window,
+                                 or back to c1 from another chat window
+    `{prefix} x`                  close a chat or page window;
+                                 in window 1: quit editor or end terminal
+    `Ctrl+h` `Ctrl+j` `Ctrl+k` `Ctrl+l`   nvim splits, terminal, compositor
+    `{prefix} c`, `{prefix} n`, `{prefix} p`    new, next, previous tab
+    `{prefix} {prefix}`          send {prefix} to the module with the keys
+    `{prefix} Ctrl+l`             send Ctrl+l (clear a shell's screen)
+
+The guide on https://eitri.cc/docs/ has every key and setting. Run
+`:EitriTutor`{vim} to start this tutorial again.
+
+// vim: nowrap

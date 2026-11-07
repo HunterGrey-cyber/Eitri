@@ -47,10 +47,6 @@ Neovim 自己的按键在这里照常可用。用 `j`{normal} 往下翻这一页
 
 ** {prefix} % 在右边打开一个模块，{prefix} " 在下面打开。 **
 
-注意：在 Hyprland、sway 和 niri 上，Eitri 默认把平铺交给窗口管理器。
-      这种模式下，分割和放大的键只会显示提示。要启用它们，在 init.lua 里加上
-      `eitri.config.set("window.tiling", "eitri")`，再打开一个 Eitri 窗口。
-
 窗口由模块组成：这个编辑器、agent 面板和底部终端。分割键会再等一个键来指明
 是哪个模块：`e` 是编辑器，`a` 是 agent 面板，`t` 是终端。如果终端已经开着，
 分割键会把它移到那里。
@@ -182,24 +178,20 @@ agent 面板是你和 agent 对话的地方。在 BROWSE 里，它的按键是 v
 ** 浮动窗口在其他模块之上，便笺板把浮动窗口收起来，工作区以一个名字保存
    一整套排布。 **
 
-注意：在 Hyprland、sway 和 niri 上，Eitri 默认把平铺交给窗口管理器。
-      这种模式下，浮动窗口、便笺板和工作区的键只会显示提示。要启用它们，
-      在 init.lua 里加上
-      `eitri.config.set("window.tiling", "eitri")`，再打开一个 Eitri 窗口。
-
  1. 按 `{prefix} t` 显示终端并让它拿到按键。
 
- 2. 按 `{prefix} Alt+Shift+Space`。终端浮在窗口中间、其他模块之上。编辑器
-    从不浮动。
+ 2. 按 `{prefix} F`。终端浮在窗口中间、其他模块之上。编辑器从不浮动。
 
- 3. 按 `{prefix} Alt+_`（在大多数键盘上就是 Alt、Shift 和减号键）。浮动窗口
-    进了便笺板，看不见了。它在顶栏里的名字现在以 `⌁` 结尾，它的 shell 照常
-    运行。
+ 3. 按 `{prefix} _`。浮动窗口进了便笺板，看不见了。它在顶栏里的名字
+    现在以 `⌁` 结尾，它的 shell 照常运行。
 
- 4. 按 `{prefix} Alt+-`。它回来了。再按一次，它又收起来；再按一次，又回来。
+ 4. 按 `{prefix} S`。它回来了。再按一次，它又收起来；再按一次，又回来。
 
- 5. 按键在浮动窗口上时，按 `{prefix} Alt+Shift+Space` 把它放回其他模块中间。
+ 5. 按键在浮动窗口上时，按 `{prefix} F` 把它放回其他模块中间。
     然后按 `{prefix} e` 回到这里。
+
+前缀后的 Alt 组合键作用相同：Alt+Shift+Space 对应 `{prefix} F`，
+Alt+_ 对应 `{prefix} _`，Alt+- 对应 `{prefix} S`。
 
  6. 按 `{prefix} s`。提示条列出各个工作区，最后是 `c new · x delete`。按 `c`：
     Eitri 建出一个新工作区，它是当前排布的一份复制，名字取从 2 起最小的空闲
@@ -250,9 +242,9 @@ eitri.keymap.prefix("C-b")
 Eitri 的源码里带了两个示例，在 docs/keymap/ 下：tmux-ctrl-a.lua 把前缀移到
 Ctrl+a，并带上一套常见的 tmux 设置；i3-alt-mod.lua 给 $mod 是 Alt 的 i3 或
 sway 用。这样的窗口管理器会在 Eitri 之前拿走那些 Alt 组合键（`{prefix} Alt+w`
-等等），这个示例把它们改成了 Ctrl+Alt 组合键：用了它，第 6 课的
-{prefix} Alt+Shift+Space 变成 {prefix} Ctrl+Alt+Space，{prefix} Alt+_ 变成
-{prefix} _。
+等等），这个示例把它们改成了 Ctrl+Alt 组合键：用了它，别名
+{prefix} Alt+Shift+Space 变成 {prefix} Ctrl+Alt+Space。
+第 6 课的普通按键不用这样改。
 
 # 结束
 
@@ -269,8 +261,8 @@ sway 用。这样的窗口管理器会在 Eitri 之前拿走那些 Alt 组合键
     `{prefix} c`、`{prefix} n`、`{prefix} p`    新建、下一个、上一个标签页
     `{prefix} {prefix}`             把 {prefix} 发给拿着按键的模块
     `{prefix} Ctrl+l`             发送 Ctrl+l（清空 shell 的屏幕）
-    `{prefix} Alt+Shift+Space`    浮起来，或者放回去
-    `{prefix} Alt+_`、`{prefix} Alt+-`        收进便笺板，再叫回来
+    `{prefix} F`                 浮起来，或者放回去
+    `{prefix} _`、`{prefix} S`    收进便笺板，再叫回来
     `{prefix} s`、`{prefix} L`      选择工作区，回到上一个工作区
 
 https://eitri.cc/docs/ 上的指南列出了所有按键和设置。运行 `:EitriTutor`{vim}

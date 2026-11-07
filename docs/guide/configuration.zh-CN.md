@@ -1,5 +1,5 @@
 [English](configuration.md) | 简体中文
-<!-- translated-from: configuration.md sha256=56bde4b3b470fd196fc10a3c5066a7ce6f59d64c17e32cb47043370a70432337 -->
+<!-- translated-from: configuration.md sha256=020383cc9fd360766c3dc5c10b51b33883f1b8dcf81f3ddcf4ef57fb0019ee45 -->
 
 # 配置
 
@@ -50,7 +50,7 @@ Eitri 说的方式是右上角的一条提示：有几个问题，以及前五�
 | `modules.chat.on_permission` | `"badge"` 或 `"reveal"` | `"badge"` | agent 面板被隐藏时来了一张权限卡片，会怎样。`"badge"` 在顶栏显示 `agent ⚑N` 并弹出一条提示；`"reveal"` 把面板带回它原来的位置，但不移动按键焦点。当另一个窗格被放大时，`"reveal"` 改为显示标记，因为显示面板并不会让它出现在屏幕上。companion 窗口从不隐藏它的面板，所以这个键在那里不起作用。 |
 | `agents.enabled` | `true` / `"on"` 或 `false` / `"off"` | `true` | 这个窗口是否为自己的每个 agent 标签页发布一行，并读取所有窗口的行；[`<prefix> u` 和 `<prefix> B`](keys.zh-CN.md)、显示你的 agent 的那些页面和 `eitri agents` 都建立在它之上。`false` 什么都不发布也不读取，这两个键在这个窗口里只会显示 `agents are off in this window`。见[同时用很多 agent](many-agents.zh-CN.md#turn-it-off)。 |
 | `review.enabled` | `true` / `"on"` 或 `false` / `"off"` | `true` | [回合审阅](turn-review.zh-CN.md)是否运行。`false` 不拍快照，也不提供审阅。 |
-| `review.hint` | `"key"`、`true` / `"on"` 或 `false` / `"off"` | `"key"` | 一个改动了文件的回合结束后，状态条说什么。`"key"`：只写 `c to review`。`true`：写 `N files changed · c to review`，并且回合进行期间在输入框上方用一行统计它的编辑。`false`：什么都不写。无论如何，审阅都只差一个键。 |
+| `review.hint` | `"key"`、`true` / `"on"` 或 `false` / `"off"` | `false` | 一个改动了文件的回合结束后，状态条说什么。`false`：什么都不写。`"key"`：只写 `c to review`。`true`：写 `N files changed · c to review`，并且回合进行期间在输入框上方用一行统计它的编辑。无论如何，审阅都只差一个键。 |
 | `review.live` | `true` / `"on"` 或 `false` / `"off"` | `false` | agent 编辑的文件是否在编辑落地时就画在你的编辑器里，回合结束时再画一遍，并在缓冲区里提供全部保留和全部撤回（[实时画出改动](turn-review.zh-CN.md#live-drawings)）。启动时读取一次；`review.enabled` 是 `false` 时它不起作用，Eitri 会在启动时说明。 |
 | `terminal.font` | `guifont` 格式的字体，`"<字体>:h<磅数>"` | 你的 `guifont` | 终端的字体，窗口里每个终端都用它：`"Iosevka:h12"` 同时设字体和字号，`"Iosevka"` 只设字体（字号仍跟着你的 `guifont`），`":h12"` 只设字号。多个字体用逗号分开、按顺序尝试，`_` 或 `\ ` 表示空格，和 `guifont` 一样。不设置时，终端用编辑器的字体和字号，这样编辑器下面的终端看起来和编辑器一致；`guifont` 为空时用 `monospace`。字号和编辑器一起缩放，见[按键](keys.zh-CN.md)。 |
 | `terminal.claude_ide` | `true` / `"on"` 或 `false` / `"off"` | `false` | 你在底部终端里运行的 `claude` 能否连上本窗口的编辑器：打开后 Eitri 在 `127.0.0.1` 上监听，运行期间写下 `~/.claude/ide/<port>.lock`，并在终端的 shell 里设置 `CLAUDE_CODE_SSE_PORT`。由持有编辑器的窗口读取一次，第二个窗口跟随它。见[终端里的 `claude`](terminal-claude.zh-CN.md)。 |
@@ -248,6 +248,8 @@ eitri.plugin.load("~/src/my-plugin", { key = "y" })    -- 按路径
 - 选项是插件自己的设置，外加 `key`（前缀之后的模块按键）和 `position`（`"side"`、`"bottom"` 或 `"main"`）。插件按[打开规则](#where-a-new-module-opens)打开，模块名是 `lua:<id>`。
 - 插件可以在清单里（`[window]`）指定一个属于它自己的目录。在那个目录里启动 Eitri，这个窗口就是插件的：顶栏和窗口标题显示插件的标题，而不是项目名。没有保存过布局时，插件的布局排在你的 `eitri.layout.default` 前面，它没有放进去的编辑器或聊天先隐藏着（按它们的键就回来）。已保存的布局仍然优先，只有一个例外：布局里没有插件的页面，或者页面是隐藏的，每次启动都会把页面放回它的位置。想要回到插件的整套布局，删掉那个目录保存的布局文件（见[布局保存在哪里](#layout-from-lua)）。
 - 加载一个插件，就像运行任何程序一样信任它：它是你自己的本地目录。只加载你信任的插件。companion 窗口里没有插件。
+
+**只为这次运行加载。** 在窗口的 Neovim 里运行 `:Eitri plugin load <name>`（或者带 `name = "..."` 的动作 `plugin.load`，或者在空标签页的 Pages 列表的一行上按 `Enter`），会按名字把一个插件加载进正在运行的窗口，用它的默认设置，不带模块键，并提示 `<title> loaded for this run`。启动时隐藏的页面会显示一次；在有 agent 等你时才出现的页面（The pass）只是准备好。它和任何页面一样可以找到：`<prefix> o`、隐藏时顶栏里它的标签、`:Eitri show lua:<id>` 以及它自己的命令。不会往你的 `init.lua` 写任何东西：下一个窗口没有它，除非你加上那一行（在它的 Pages 行上按 `o` 会显示这一行）。它不能移到第二个窗口（`<title> is loaded for this run in this window only`），在[合成器窗口](compositor-windows.zh-CN.md)、第二个窗口和 companion 窗口里会被拒绝。加载一个已经在的页面会显示它。Pages 列表里是 Eitri 自带的页面；你自己的插件也可以用同样的方式按名字加载。
 
 <a id="keys-in-a-plugin-page"></a>
 ### 插件页面里的按键

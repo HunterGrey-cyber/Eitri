@@ -29,7 +29,7 @@ use crate::agent_panel::{AgentPanelHandle, ChatMoveEvent, HintInbound, ViewId};
 /// Every hook registration on the panel handle, in the order `wire_panel` makes them. Read by the
 /// tests that hold each window to what it leaves out.
 #[cfg_attr(not(test), allow(dead_code))]
-pub(crate) const HOOKS: [&str; 20] = [
+pub(crate) const HOOKS: [&str; 22] = [
     "on_hint",
     "on_attention",
     "on_toast",
@@ -50,16 +50,21 @@ pub(crate) const HOOKS: [&str; 20] = [
     "on_chat_move",
     "on_busy_changed",
     "on_turn_ended",
+    "on_load_page",
+    "on_page_line",
 ];
 
 /// The registrations the companion window leaves out. It has no tray, no chat view but the base one,
 /// no extra views and no `prefix ?` sheet of the window's own to give keys back from, so the attention,
 /// show-view, view-empty and keymap-closed hooks have nothing to act on; with one chat view that
 /// nothing can float over, there is no covered chat for an answer gate to refuse; and it is never one of a
-/// linked pair, so no chat moves out of it. It cannot choose another project either.
+/// linked pair, so no chat moves out of it. It cannot choose another project either, and it loads no plugin page, so
+/// its empty tab offers none.
 #[cfg_attr(not(test), allow(dead_code))]
 pub(crate) const COMPANION_OMITS: &[&str] = &[
     "on_choose_project",
+    "on_load_page",
+    "on_page_line",
     "on_attention",
     "on_show_view",
     "on_view_empty",
@@ -108,6 +113,10 @@ pub(crate) struct PanelHooks {
     pub(crate) on_busy_changed: Option<Box<dyn Fn(bool)>>,
     /// One tab's turn ended.
     pub(crate) on_turn_ended: Option<Box<dyn Fn()>>,
+    /// Enter on a page the empty tab offers: load it into the window, with its id.
+    pub(crate) on_load_page: Option<Box<dyn Fn(String)>>,
+    /// `o` on a page the empty tab offers: show its `init.lua` line, with its id.
+    pub(crate) on_page_line: Option<Box<dyn Fn(String)>>,
 }
 
 impl PanelHooks {
@@ -135,6 +144,8 @@ impl PanelHooks {
             self.on_chat_move.is_some(),
             self.on_busy_changed.is_some(),
             self.on_turn_ended.is_some(),
+            self.on_load_page.is_some(),
+            self.on_page_line.is_some(),
         ];
         HOOKS
             .iter()
@@ -169,6 +180,8 @@ pub(crate) fn wire_panel(panel: &AgentPanelHandle, hooks: PanelHooks) {
         on_chat_move,
         on_busy_changed,
         on_turn_ended,
+        on_load_page,
+        on_page_line,
     } = hooks;
     if let Some(hook) = on_hint {
         panel.on_hint(hook);
@@ -229,6 +242,12 @@ pub(crate) fn wire_panel(panel: &AgentPanelHandle, hooks: PanelHooks) {
     }
     if let Some(hook) = on_turn_ended {
         panel.on_turn_ended(hook);
+    }
+    if let Some(hook) = on_load_page {
+        panel.on_load_page(hook);
+    }
+    if let Some(hook) = on_page_line {
+        panel.on_page_line(hook);
     }
 }
 

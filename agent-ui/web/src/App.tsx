@@ -204,7 +204,7 @@ export default function App() {
     state, hello, tabs, fatalError, handoff, handoffRequests, commandNotice, rootNote, turnClock, turnDurations, thinkingDisplay, paneFocused,
     queue, queueError, queueNote, queueSteers, shellRunning, history, ruleOffers, editorContext, editorLink, scratchEditing,
     review, reviewHints, reviewRecovery, reviewSettings, chooser,
-    inputRequest, arriveRequest, permissionRequest, navKey, keymapHelp, heldTrust, confirm, renaming, queueTaken,
+    inputRequest, arriveRequest, permissionRequest, navKey, keymapHelp, pages, heldTrust, confirm, renaming, queueTaken,
   } = page;
   const {
     setFatalError, setHandoffRequests, setCommandNotice, setRootNote, setReview, setReviewHints, setChooser,
@@ -4023,6 +4023,9 @@ export default function App() {
             </div>
           ) : (
             <EmptyTab
+              pages={pages}
+              onLoadPage={(id) => postToRust({ type: "load_page", id })}
+              onPageLine={(id) => postToRust({ type: "page_line", id })}
               onSlashAction={runSlashAction}
               hello={hello}
               tab={activeTab}
@@ -4191,6 +4194,7 @@ export default function App() {
         {keymapOpen && (
           <PanelErrorBoundary name="keys overlay" onError={() => overlayFailed("keys overlay", () => setKeymapOpen(false))}>
             <KeymapOverlay
+              pages={pages}
               ref={keymapOverlayRef}
               onClose={closeKeymapByKey}
               windowKeys={keymapHelp.window}
@@ -6159,6 +6163,7 @@ export default function App() {
         {keymapOpen && (
           <PanelErrorBoundary name="keys overlay" onError={() => overlayFailed("keys overlay", () => setKeymapOpen(false))}>
             <KeymapOverlay
+              pages={pages}
               ref={keymapOverlayRef}
               onClose={closeKeymapByKey}
               windowKeys={keymapHelp.window}

@@ -58,6 +58,7 @@ pub fn classify_window1(action: &Action) -> HubVerb {
         | Action::ModuleHideByKey
         | Action::ModuleKill
         | Action::ProjectChoose
+        | Action::PluginLoad { .. }
         | Action::AgentsNext
         | Action::AgentsBack => HubVerb::AsToday,
         Action::Module(id) => match id.kind() {
@@ -126,6 +127,7 @@ pub fn classify_module(action: &Action) -> ModuleVerb {
         | Action::SendKeys(_)
         | Action::ModuleKill
         | Action::ProjectChoose
+        | Action::PluginLoad { .. }
         | Action::AgentsNext
         | Action::AgentsBack => ModuleVerb::AsToday,
         Action::Select(dir) => ModuleVerb::EdgeToCompositor(*dir),

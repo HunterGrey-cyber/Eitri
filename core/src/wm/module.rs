@@ -48,6 +48,7 @@ struct Module {
     start_dir: Option<PathBuf>,
     built: bool,
     reload_at_show: bool,
+    session_title: Option<String>,
 }
 
 /// One module's entry as it was, or that it had none: what a declaration that never came to be is undone to.
@@ -79,6 +80,7 @@ impl Lifecycle {
             start_dir: None,
             built: false,
             reload_at_show: false,
+            session_title: None,
         };
         if let Some(old) = self.modules.iter_mut().find(|m| m.decl.module == decl.module) {
             *old = module;
@@ -137,6 +139,21 @@ impl Lifecycle {
             .iter()
             .find(|m| &m.decl.module == module)
             .map(|m| &m.decl.kind)
+    }
+
+    /// A runtime page belongs to this window for the rest of this process.
+    pub(super) fn mark_session_only(&mut self, id: &ModuleId, title: String) {
+        if let Some(module) = self.modules.iter_mut().find(|m| m.decl.module == *id) {
+            module.session_title = Some(title);
+        }
+    }
+
+    pub(super) fn session_title(&self, id: &ModuleId) -> Option<&str> {
+        self.modules
+            .iter()
+            .find(|m| m.decl.module == *id)?
+            .session_title
+            .as_deref()
     }
 
     /// A start-hidden page already has a registered host even before its first show adds a layout leaf.

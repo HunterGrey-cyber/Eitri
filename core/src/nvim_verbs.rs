@@ -9,7 +9,8 @@
 //!
 //! Any descendant of the embedded nvim can write the socket (it holds the path in its environment),
 //! so what a line can ask for is bounded here: a [`NvimVerb`] is a layout request, the key sheet or the
-//! first-start screen, and what it carries is a parsed action, a module id or a workspace name -- never text that
+//! first-start screen or a named plugin load, and what it carries is a parsed action, a module id, a workspace name
+//! or a plugin id accepted by the manifest parser -- never text that
 //! is typed somewhere, sent to the agent or run as a command. No toolkit and no I/O here; [`install`] only asks the
 //! editor to define `:Eitri`.
 
@@ -33,7 +34,17 @@ pub enum NvimVerb {
 }
 
 /// The first words `:Eitri` reads as its own verbs; any other first word is an action name.
-pub const VERBS: [&str; 8] = ["split", "focus", "show", "hide", "open", "workspace", "keys", "setup"];
+pub const VERBS: [&str; 9] = [
+    "split",
+    "focus",
+    "show",
+    "hide",
+    "open",
+    "workspace",
+    "keys",
+    "setup",
+    "plugin",
+];
 
 /// The request `words` make, or why not as one line starting `:Eitri `. `lua_panels` are the ids of
 /// the Lua panels `init.lua` registered, which `module.<id>` may name (as for `eitri.layout.run`).
@@ -44,6 +55,7 @@ pub const VERBS: [&str; 8] = ["split", "focus", "show", "hide", "open", "workspa
 /// - `workspace <name>`: [`LayoutRequest::Switch`].
 /// - `keys`: [`NvimVerb::Keys`].
 /// - `setup`: [`NvimVerb::Setup`], the first-start screen again.
+/// - `plugin load <name>`: [`LayoutRequest::Run`], loading one plugin page for this run.
 /// - `<action> [key=value …]`: [`LayoutRequest::Run`]; a value that is a whole number is a number,
 ///   `true` and `false` are booleans, anything else a string, as Lua would have passed them.
 pub fn parse_words(words: &[String], lua_panels: &[String]) -> Result<NvimVerb, String> {
@@ -95,6 +107,10 @@ pub fn parse_words(words: &[String], lua_panels: &[String]) -> Result<NvimVerb, 
         ("keys", _) => return Err(":Eitri keys takes no more words".to_string()),
         ("setup", []) => return Ok(NvimVerb::Setup),
         ("setup", _) => return Err(usage("setup", "no words")),
+        ("plugin", ["load", name]) if crate::plugin::manifest::id_ok(name) => {
+            LayoutRequest::Run(run_action("plugin.load", &[&format!("name={name}")], lua_panels)?)
+        }
+        ("plugin", _) => return Err("usage: :Eitri plugin load <name>".into()),
         (name, options) => LayoutRequest::Run(run_action(name, options, lua_panels)?),
     };
     Ok(NvimVerb::Request(request))
@@ -204,6 +220,80 @@ fn option_value(key: &str, text: &str) -> OptValue {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn plugin_completion_offers_load_and_no_page_names() {
+        let lua = mlua::Lua::new();
+        lua.load(
+            r#"
+            local commands = {}
+            vim = {
+                v = { vim_did_enter = 1 }, g = { eitri = 1 },
+                api = {
+                    nvim_get_commands = function() return commands end,
+                    nvim_buf_get_commands = function() return {} end,
+                    nvim_create_user_command = function(name, callback, opts)
+                        commands[name] = { callback = callback, definition = opts.desc }
+                        completion = opts.complete
+                    end,
+                },
+            }
+        "#,
+        )
+        .exec()
+        .unwrap();
+        let opts = lua.create_table().unwrap();
+        opts.set("socket", "/unused").unwrap();
+        opts.set("words", lua.create_sequence_from(["plugin"]).unwrap())
+            .unwrap();
+        opts.set("names", lua.create_sequence_from(["plugin"]).unwrap())
+            .unwrap();
+        opts.set("modules", lua.create_sequence_from(["editor"]).unwrap())
+            .unwrap();
+        lua.load(include_str!("nvim_verbs/eitri_commands.lua"))
+            .call::<mlua::Value>(opts)
+            .unwrap();
+        let complete: mlua::Function = lua.globals().get("completion").unwrap();
+        let words = |lead: &str, line: &str| complete.call::<Vec<String>>((lead, line, line.len())).unwrap();
+        assert_eq!(words("", "Eitri plugin "), vec!["load"]);
+        assert_eq!(words("lo", "Eitri plugin lo"), vec!["load"]);
+        assert!(words("", "Eitri plugin load ").is_empty());
+        assert!(words("ma", "Eitri plugin load ma").is_empty());
+    }
+    #[test]
+    fn plugin_load_sugar_and_action_ask_for_the_same_page() {
+        let sugar = request("plugin load agents-top");
+        assert_eq!(sugar, request("plugin.load name=agents-top"));
+        let LayoutRequest::Run(action) = sugar else {
+            panic!("plugin load must run an action")
+        };
+        assert_eq!(action.name(), "plugin.load");
+        assert_eq!(
+            action.options(),
+            vec![("name".into(), OptValue::Str("agents-top".into()))]
+        );
+    }
+
+    #[test]
+    fn plugin_load_refuses_bad_words_with_usage() {
+        for line in [
+            "plugin",
+            "plugin load",
+            "plugin load markdown extra",
+            "plugin reload markdown",
+            "plugin load Bad",
+            "plugin load lua:markdown",
+            "plugin load foo_bar",
+        ] {
+            assert!(refusal(line).contains(":Eitri plugin load <name>"), "{line}");
+        }
+    }
+
+    #[test]
+    fn plugin_is_a_known_completed_verb() {
+        let words = completion_words(&[], &[]);
+        assert!(words.first.contains(&"plugin".into()));
+        assert!(words.known.contains(&"plugin".into()));
+    }
     use super::*;
     use crate::keymap::action::{required_options, NAMES};
     use crate::layout::Direction;

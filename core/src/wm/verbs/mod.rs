@@ -8,6 +8,7 @@ pub mod focus;
 pub mod keys;
 pub mod module_windows;
 pub mod modules;
+pub mod plugins;
 pub mod project;
 pub mod tabs;
 pub mod text_size;
@@ -83,6 +84,7 @@ pub fn family(action: &Action) -> Family {
         }
         Action::WindowImmersive | Action::WindowSetup => Family::Chrome,
         Action::Module(_)
+        | Action::PluginLoad { .. }
         | Action::ModuleHide
         | Action::ModuleHideByKey
         | Action::ModuleKill

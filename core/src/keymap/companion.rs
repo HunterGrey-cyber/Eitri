@@ -61,6 +61,7 @@ pub fn classify(action: &Action) -> CompanionVerb {
         Action::Select(dir) => CompanionVerb::Select(*dir),
         Action::Module(id) if id.kind() == ModuleKind::LuaWebview => CompanionVerb::Page(id.clone()),
         Action::ProjectChoose
+        | Action::PluginLoad { .. }
         | Action::FloatToggle
         | Action::FocusModeToggle
         | Action::ScratchpadShow { .. }

@@ -621,6 +621,47 @@ fn remote_answers_parse_as_window_level_and_need_every_field() {
     }
 }
 
+#[test]
+fn pages_serialize_titles_summaries_and_empty_lists() {
+    let pages = vec![
+        PageLine {
+            id: "markdown".into(),
+            title: "Markdown \"preview\"".into(),
+            summary: Some("<b>Read</b>".into()),
+        },
+        PageLine {
+            id: "agents-top".into(),
+            title: "Agents".into(),
+            summary: None,
+        },
+    ];
+    let value: Value = serde_json::from_str(&serialize_pages_for_js(&pages)).unwrap();
+    assert_eq!(
+        value,
+        json!({"kind":"pages","pages":[
+            {"id":"markdown","title":"Markdown \"preview\"","summary":"<b>Read</b>"},
+            {"id":"agents-top","title":"Agents","summary":null}
+        ]})
+    );
+    assert_eq!(
+        serde_json::from_str::<Value>(&serialize_pages_for_js(&[])).unwrap(),
+        json!({"kind":"pages","pages":[]})
+    );
+}
+
+#[test]
+fn page_requests_carry_an_id_without_a_tab_or_request_id() {
+    for kind in ["load_page", "page_line"] {
+        let message = parse_inbound_message(&json!({"type":kind,"id":"markdown"}).to_string()).unwrap();
+        assert!(matches!(message.tab_ref(), TabRef::WindowLevel));
+        match message {
+            InboundMessage::LoadPage { id } | InboundMessage::PageLine { id } => assert_eq!(id, "markdown"),
+            _ => panic!("a page request"),
+        }
+        assert!(parse_inbound_message(&json!({"type":kind}).to_string()).is_none());
+    }
+}
+
 /// The device list's page kinds are window-level and name every field: the recipe a code is made by is one of three
 /// words, and a revoke answers one question about one device.
 #[test]

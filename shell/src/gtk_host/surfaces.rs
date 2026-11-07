@@ -37,7 +37,7 @@ use neovide_editor::{NeovideEditorPane, NeovideEditorPaneOptions};
 use crate::agent_panel::{self, AgentPanelHandle};
 use crate::gtk_host::instance_pool::Reused;
 use crate::gtk_host::{BasePageMaker, GtkHost, SurfaceMaker};
-use crate::gtk_host_services::{LuaPages, Registry};
+use crate::gtk_host_services::{lua_page, LuaPages, Registry};
 use crate::module_grid::{HostKind, ModuleGrid};
 use crate::plugin_panels::PluginPanels;
 use crate::terminal::registry::Pane;
@@ -269,13 +269,9 @@ impl SurfaceMaker for Surfaces {
                 Ok(())
             }
             StartupPlace::RegisteredView => {
-                let widget = self
-                    .lua_pages
-                    .iter()
-                    .find(|(id, _, _, _)| id == module)
-                    .map(|(_, widget, _, _)| widget.clone())
+                let (_, widget, _, _) = lua_page(&self.lua_pages, module)
                     .ok_or_else(|| format!("{module} is not a Lua panel this window registered"))?;
-                self.lua_panel(module, &widget)
+                self.lua_panel(module, &widget).map(drop)
             }
             StartupPlace::TerminalPane => {
                 if module.kind() != ModuleKind::Terminal {
@@ -361,11 +357,22 @@ impl Surfaces {
     }
 
     /// A Lua panel's host, a plugin's page among them: its registered view (a start-hidden plugin's
-    /// slot, which holds no view until its page is built) at (0,0) of a `WebHost`.
-    pub(crate) fn lua_panel(&self, id: &ModuleId, widget: &gtk4::Widget) -> Result<(), String> {
+    /// slot, which holds no view until its page is built) at (0,0) of a `WebHost`. The host, for its maker to wire.
+    pub(crate) fn lua_panel(&self, id: &ModuleId, widget: &gtk4::Widget) -> Result<gtk4::Widget, String> {
         let grid = self.grid()?;
-        self.place(&grid, id, &WebHost::new(widget), widget, self.web_host);
-        Ok(())
+        let host = WebHost::new(widget);
+        self.place(&grid, id, &host, widget, self.web_host);
+        Ok(host.upcast())
+    }
+
+    /// The host of a plugin page loaded into the running window: its slot, entered among the Lua pages as it
+    /// joined, at (0,0) of a `WebHost`, off screen until a placement shows it. The host, for the caller to wire.
+    pub(crate) fn late_page(&self, id: &ModuleId) -> Result<gtk4::Widget, String> {
+        let (_, widget, _, _) =
+            lua_page(&self.lua_pages, id).ok_or_else(|| format!("{id} is not a plugin page this window loaded"))?;
+        let host = self.lua_panel(id, &widget)?;
+        host.set_child_visible(false);
+        Ok(host)
     }
 
     /// A terminal instance's pane, with its shell to start in `dir`: the registry's idle pane of that
@@ -456,7 +463,7 @@ impl Surfaces {
     /// A killed web module's web process ends: the plugin's own view, for a page built after startup,
     /// else the view in its slot. A page never built has no web process to end.
     pub(crate) fn end_web_process(&self, id: &ModuleId) {
-        let Some((_, widget, _, _)) = self.lua_pages.iter().find(|(m, _, _, _)| m == id) else {
+        let Some((_, widget, _, _)) = lua_page(&self.lua_pages, id) else {
             return;
         };
         let webview = self
@@ -486,9 +493,12 @@ fn in_use<T: Pane + Clone, C: Clone>(id: &ModuleId, terminals: &Registry<T>, cha
 enum CreateRoute {
     /// The grid's host is in use: it keeps its controllers, since wiring it again would install a second set.
     Keep,
-    /// Made once, at startup: the editor with its pane, the base view with the panel, every registered Lua panel
-    /// and plugin page.
+    /// Made once, at startup: the editor with its pane, the base view with the panel, every Lua panel and every
+    /// plugin page `init.lua` loaded.
     Refuse,
+    /// A plugin page loaded into the running window, which the window's plugin panels hold and the grid has no
+    /// host for yet: its slot gets its host, wired here.
+    LatePage,
     /// The chat view's constructor, which takes an idle page back out with a fresh document, or builds one.
     ChatView,
     /// A held chat view where WebKit cannot start: the notice is the whole view and nothing waits in the pool.
@@ -502,11 +512,13 @@ enum CreateRoute {
 /// A killed terminal's pane and a dropped chat view's page wait idle in their pools while their hosts stay in the
 /// grid, so a held host short-circuits only while `live`; the rest go to their constructors, which take the idle
 /// one back out and, finding the host, leave it as it is.
-fn create_route(kind: &SurfaceKind, held: bool, live: bool, webviews: bool) -> CreateRoute {
+/// `joined`: the window's plugin panels hold the module, as a page loaded at run time is held once it joined.
+fn create_route(kind: &SurfaceKind, held: bool, live: bool, webviews: bool, joined: bool) -> CreateRoute {
     if held && live {
         return CreateRoute::Keep;
     }
     match kind {
+        SurfaceKind::PluginPage { .. } if !held && joined => CreateRoute::LatePage,
         SurfaceKind::Editor { .. } | SurfaceKind::LuaPanel { .. } | SurfaceKind::PluginPage { .. } => {
             CreateRoute::Refuse
         }
@@ -558,7 +570,9 @@ impl SurfaceMaker for SurfaceOps {
         }
         let held = self.surfaces.grid()?.has_host(module);
         let live = held && in_use(module, &self.surfaces.terminals, &self.surfaces.chat_views);
-        match create_route(kind, held, live, self.surfaces.base_webview.is_some()) {
+        let joined =
+            matches!(kind, SurfaceKind::PluginPage { .. }) && self.surfaces.plugin_panels.modules().contains(module);
+        match create_route(kind, held, live, self.surfaces.base_webview.is_some(), joined) {
             CreateRoute::Keep | CreateRoute::HeldNotice => Ok(()),
             CreateRoute::Refuse => Err(match kind {
                 SurfaceKind::Editor { .. } => "the editor's host is made with its pane at startup".into(),
@@ -567,6 +581,12 @@ impl SurfaceMaker for SurfaceOps {
             }),
             CreateRoute::NoWebKit => Err(CHAT_VIEWS_NEED_WEBKIT.into()),
             CreateRoute::ChatView => self.chat_view_wired(module),
+            CreateRoute::LatePage => {
+                let host = self.surfaces.late_page(module)?;
+                wire_host(WireKind::PluginPage, module, &host, &self.wire_deps);
+                println!("[plugin] {module}: its host made for this run");
+                Ok(())
+            }
             CreateRoute::Terminal => {
                 if module.kind() != ModuleKind::Terminal {
                     return Err(format!("{module} is not a terminal"));
@@ -847,13 +867,13 @@ mod tests {
             (&chat, false, false, false, CreateRoute::NoWebKit, "new, no WebKit"),
         ];
         for (kind, held, live, webviews, want, what) in cases {
-            assert_eq!(create_route(kind, held, live, webviews), want, "{what}");
+            assert_eq!(create_route(kind, held, live, webviews, false), want, "{what}");
         }
 
         // A held pane or page that is not live always reaches a constructor, whether WebKit can start or not.
         for webviews in [true, false] {
             for kind in [&terminal, &chat] {
-                let got = create_route(kind, true, false, webviews);
+                let got = create_route(kind, true, false, webviews, false);
                 assert_ne!(got, CreateRoute::Keep, "{kind:?}");
             }
         }
@@ -879,10 +899,40 @@ mod tests {
             },
         ];
         for kind in &startup_only {
-            let held = create_route(kind, true, true, true);
+            let held = create_route(kind, true, true, true, false);
             assert_eq!(held, CreateRoute::Keep, "{kind:?} held");
-            let missing = create_route(kind, false, false, true);
+            let missing = create_route(kind, false, false, true, false);
             assert_eq!(missing, CreateRoute::Refuse, "{kind:?} not held");
         }
+    }
+
+    /// A plugin page loaded into the running window has joined the window's plugin panels before the controller asks
+    /// for its host: that one gets a host the first time, and keeps it after. Anything else not held is still refused,
+    /// so no Lua panel or start page is made twice.
+    #[test]
+    fn a_joined_page_with_no_host_gets_one_and_nothing_else_does() {
+        let page = SurfaceKind::PluginPage {
+            plugin: "markdown".into(),
+        };
+        assert_eq!(create_route(&page, false, false, true, true), CreateRoute::LatePage);
+        assert_eq!(
+            create_route(&page, true, true, true, true),
+            CreateRoute::Keep,
+            "made once"
+        );
+        assert_eq!(
+            create_route(&page, false, false, true, false),
+            CreateRoute::Refuse,
+            "not joined"
+        );
+        let panel = SurfaceKind::LuaPanel {
+            url: "about:blank".into(),
+            title: "panel".into(),
+        };
+        assert_eq!(create_route(&panel, false, false, true, true), CreateRoute::Refuse);
+        let terminal = SurfaceKind::Terminal {
+            cwd: PathBuf::from("/project"),
+        };
+        assert_eq!(create_route(&terminal, false, false, true, true), CreateRoute::Terminal);
     }
 }

@@ -239,8 +239,8 @@ below the chat, and back in `c3` when you return. The layout you had in `eitri` 
 - `<prefix> ?` in a page window shows the chat sheet of the last chat window, not the page's keys. The page's own `?`
   lists them. In window 1 it opens the same sheet, which leaves out keys that work only there, such as `<prefix> d`, `[`,
   `o` and `;`.
-- `:EitriTutor` teaches the keys of Eitri's own layout, and its lessons on splits, zoom, floats, the scratchpad and
-  workspaces meet keys that are off here. It does not change with the mode.
+- `:EitriTutor` follows the mode: in a window that opened in compositor mode its lessons teach this mode's keys (chat
+  windows, the bottom terminal, moving out to your compositor) instead of Eitri's own layout.
 - `:EitriMarkdownToggle` opens the page's window and leaves the keys in the editor, but it cannot close it. Only the
   compositor can.
 - On Hyprland, `Ctrl+h/j/k/l` stops at a floating window's edge when the next float sits diagonally, sharing no row or

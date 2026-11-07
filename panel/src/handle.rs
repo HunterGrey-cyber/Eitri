@@ -363,7 +363,7 @@ impl AgentPanelHandle {
             state.proposal_jobs.retain(|job| job.view != view);
             // The same for a view still being written: the file is left in the scratch directory, which the
             // window's close removes, and the editor is not raised for a page that is gone.
-            state.view_jobs.retain(|job| job.view != view);
+            state.view_jobs.retain(|job| job.asker.page() != Some(view));
             if !state.shutting_down {
                 state.tabs.drop_bypass_prompt_in(view);
             }
@@ -1722,6 +1722,24 @@ impl AgentPanelHandle {
         self.dispatch_every(payload);
     }
 
+    /// Offers pages to the base document now and to every replacement of that document.
+    pub fn set_pages(&self, pages: Vec<eitri_core::agent_bridge::PageLine>) {
+        self.wake();
+        let payload = eitri_core::agent_bridge::serialize_pages_for_js(&pages);
+        self.state.borrow_mut().page_lines = Some(pages);
+        self.dispatch(ViewId::BASE, payload);
+    }
+
+    pub fn on_load_page(&self, f: Box<dyn Fn(String)>) {
+        self.wake();
+        self.state.borrow_mut().load_page_hook = Some(Rc::from(f));
+    }
+
+    pub fn on_page_line(&self, f: Box<dyn Fn(String)>) {
+        self.wake();
+        self.state.borrow_mut().page_line_hook = Some(Rc::from(f));
+    }
+
     /// `send-prefix`/`send-keys` with `view`'s page holding the keys.
     pub fn literal_key(&self, view: ViewId, key: &eitri_core::keymap::KeySpec) {
         self.wake();
@@ -1852,6 +1870,20 @@ impl AgentPanelHandle {
         })?;
         let answered = answer.borrow_mut().take();
         answered.unwrap_or_else(|| Err("the editor did not answer".to_string()))
+    }
+
+    /// Shows `text` under `title` in a scratch buffer of the editor without waiting on a disk: the file is named here,
+    /// written on a worker, and the tick hands nvim the view. `failed` hears why, if the file could not be written or
+    /// the editor did not take it; `Err` is a view that could not even start (no scratch directory, too many out).
+    pub fn view_in_editor_later(
+        &self,
+        title: &str,
+        text: String,
+        failed: impl Fn(&str) + 'static,
+    ) -> Result<(), String> {
+        self.wake();
+        let failed: Rc<dyn Fn(&str)> = Rc::new(failed);
+        self.run(|state, _out| start_view_job(state, ViewAsker::Window { failed }, title, text))
     }
 
     /// The window's way to ask its editor something (the embedded pane, or the companion's link).
@@ -2831,6 +2863,89 @@ fn tabs_cannot_close(state: &AgentPanelState, view: ViewId) -> Option<&'static s
 mod tests {
     use super::*;
     use crate::agent_panel::tests::*;
+
+    fn offered_pages() -> Vec<eitri_core::agent_bridge::PageLine> {
+        vec![eitri_core::agent_bridge::PageLine {
+            id: "markdown".into(),
+            title: "Markdown".into(),
+            summary: Some("Read".into()),
+        }]
+    }
+
+    #[test]
+    fn pages_are_opt_in_sent_now_and_resent_on_every_ready() {
+        let (handle, page, _) = handle_with_recording_page();
+        handle.page_message(ViewId::BASE, READY);
+        assert!(!page.sent.borrow().iter().any(|s| s.contains("\"kind\":\"pages\"")));
+        page.sent.borrow_mut().clear();
+        handle.set_pages(offered_pages());
+        let offered = eitri_core::agent_bridge::serialize_pages_for_js(&offered_pages());
+        assert_eq!(*page.sent.borrow(), [offered.clone()]);
+        for _ in 0..2 {
+            page.sent.borrow_mut().clear();
+            handle.page_message(ViewId::BASE, READY);
+            assert_eq!(page.sent.borrow().iter().filter(|s| **s == offered).count(), 1);
+        }
+        handle.set_pages(vec![]);
+        page.sent.borrow_mut().clear();
+        handle.page_message(ViewId::BASE, READY);
+        assert!(page.sent.borrow().iter().any(|s| s == r#"{"kind":"pages","pages":[]}"#));
+    }
+
+    #[test]
+    fn page_requests_only_call_hooks_for_ids_offered_to_the_base_page() {
+        let (handle, _page, second) = handle_with_two_pages();
+        let called = Rc::new(RefCell::new(Vec::new()));
+        let load_called = called.clone();
+        let state = handle.state.clone();
+        handle.on_load_page(Box::new(move |id| {
+            let _released = state.borrow_mut();
+            load_called.borrow_mut().push(("load", id));
+        }));
+        let line_called = called.clone();
+        let state = handle.state.clone();
+        handle.on_page_line(Box::new(move |id| {
+            let _released = state.borrow_mut();
+            line_called.borrow_mut().push(("line", id));
+        }));
+        for kind in ["load_page", "page_line"] {
+            let offered = serde_json::json!({"type":kind,"id":"markdown"}).to_string();
+            handle.page_message(ViewId::BASE, &offered);
+            assert!(called.borrow().is_empty());
+        }
+        second.sent.borrow_mut().clear();
+        handle.set_pages(offered_pages());
+        handle.page_message(view(2), READY);
+        assert!(!second.sent.borrow().iter().any(|s| json_of(s)["kind"] == "pages"));
+        for kind in ["load_page", "page_line"] {
+            handle.page_message(view(2), &serde_json::json!({"type":kind,"id":"markdown"}).to_string());
+        }
+        assert!(called.borrow().is_empty());
+        for kind in ["load_page", "page_line"] {
+            handle.page_message(ViewId::BASE, &serde_json::json!({"type":kind,"id":"other"}).to_string());
+        }
+        assert!(called.borrow().is_empty());
+        handle.page_message(ViewId::BASE, r#"{"type":"load_page","id":"markdown"}"#);
+        handle.page_message(ViewId::BASE, r#"{"type":"page_line","id":"markdown"}"#);
+        assert_eq!(
+            *called.borrow(),
+            [("load", "markdown".into()), ("line", "markdown".into())]
+        );
+        handle.set_pages(vec![]);
+        for kind in ["load_page", "page_line"] {
+            handle.page_message(
+                ViewId::BASE,
+                &serde_json::json!({"type":kind,"id":"markdown"}).to_string(),
+            );
+        }
+        assert_eq!(called.borrow().len(), 2);
+        let (unwired, page, _) = handle_with_recording_page();
+        unwired.set_pages(offered_pages());
+        page.sent.borrow_mut().clear();
+        unwired.page_message(ViewId::BASE, r#"{"type":"load_page","id":"markdown"}"#);
+        unwired.page_message(ViewId::BASE, r#"{"type":"page_line","id":"markdown"}"#);
+        assert!(page.sent.borrow().is_empty());
+    }
 
     #[test]
     fn card_first_lands_on_that_tabs_card_when_another_tab_holds_an_older_one() {

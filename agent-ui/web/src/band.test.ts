@@ -134,17 +134,34 @@ describe("the band degrades by priority", () => {
     ]);
     expect(ids(900, { ...facts, prompt: "close? (y/n)" })).toEqual(["mode", "prompt"]);
   });
-  it("drops the review pointer before the model, and never over a prompt", () => {
-    const facts: BandFacts = { ...idle, review: { files: 3 } };
+  it("shortens the review pointer to its key, and keeps it past the effort, the model and the position", () => {
+    const facts: BandFacts = { ...idle, review: { files: 3 }, effort: "high" };
     expect(ids(900, facts)).toContain("review");
-    // Narrow enough that the model has to go too: the pointer went first.
-    const narrow = bandLayout(facts, 200, 7.2).map((s) => s.id);
-    expect(narrow).not.toContain("review");
-    for (let width = 100; width < 900; width += 10) {
-      const shown = bandLayout(facts, width, 7.2).map((s) => s.id);
-      if (shown.includes("review")) expect(shown, `width ${width}`).toContain("model");
+    const texts = new Set<string>();
+    for (let width = 100; width < 900; width += 5) {
+      const segs = bandLayout(facts, width, 7.2);
+      const shown = segs.map((s) => s.id);
+      const review = segs.find((s) => s.id === "review");
+      if (review !== undefined) texts.add(review.text);
+      // The figures go first: while any of them is still there, so is the pointer.
+      for (const figure of ["effort", "model", "position"] as const) {
+        if (shown.includes(figure)) expect(shown, `width ${width}`).toContain("review");
+      }
+      // Its short form comes before any figure goes.
+      if (review?.text === "3 files changed · c to review") expect(shown, `width ${width}`).toEqual(expect.arrayContaining(["effort", "model", "position"]));
     }
+    expect([...texts].sort()).toEqual(["3 files changed · c to review", "c to review"]);
+    expect(ids(100, facts)).not.toContain("review");
     expect(ids(900, { ...facts, prompt: "close? (y/n)" })).toEqual(["mode", "prompt"]);
+  });
+  it("keeps the pointer in a narrow chat whose bypass pill fills the band, at both levels", () => {
+    // The chat column of the newcomer-pointers scenario: 600 px of band at 11.4 px a cell, bypass on.
+    const facts: BandFacts = { ...idle, pill: "⏵⏵ bypass permissions on", model: "opus-5-5", position: "4/4" };
+    for (const review of [{ files: 1, keyOnly: true }, { files: 1 }]) {
+      const segs = bandLayout({ ...facts, review }, 600, 11.4);
+      expect(segs.find((s) => s.id === "review")?.text, JSON.stringify(review)).toBe("c to review");
+      expect(segs.map((s) => s.id)).toEqual(expect.arrayContaining(["mode", "pill"]));
+    }
   });
   it("puts the effort right after the model, and shows none it was not told", () => {
     const facts: BandFacts = { ...idle, effort: "xhigh" };
@@ -155,17 +172,17 @@ describe("the band degrades by priority", () => {
     expect(ids(900, { ...idle, effort: null })).not.toContain("effort");
     expect(ids(900, { ...idle, model: null, effort: "xhigh" })).not.toContain("effort");
   });
-  it("drops the effort after the review pointer and before the model, and never leaves it alone", () => {
+  it("drops the effort before the model and the review pointer, and never leaves it alone", () => {
     const facts: BandFacts = { ...idle, effort: "xhigh", review: { files: 3 } };
     expect(ids(900, facts)).toContain("effort");
     const widths = Array.from({ length: 80 }, (_, i) => 100 + i * 10);
     const shown = widths.map((width) => bandLayout(facts, width, 7.2).map((s) => s.id));
     for (const [i, row] of shown.entries()) {
       if (row.includes("effort")) expect(row, `width ${widths[i]}`).toContain("model");
-      if (row.includes("review")) expect(row, `width ${widths[i]}`).toContain("effort");
+      if (row.includes("effort")) expect(row, `width ${widths[i]}`).toContain("review");
     }
     expect(shown.some((row) => row.includes("model") && !row.includes("effort")), "a width keeps the model alone").toBe(true);
-    expect(shown.some((row) => row.includes("effort") && !row.includes("review")), "a width keeps the effort").toBe(true);
+    expect(shown.some((row) => row.includes("review") && !row.includes("effort")), "a width keeps the pointer").toBe(true);
     // Its width counts: wide enough for the band without it, too narrow with it.
     expect(bandLayout({ ...idle, effort: "xhigh" }, 300, 7.2).map((s) => s.id)).not.toContain("effort");
   });
@@ -655,3 +672,4 @@ it("names the newest live workflow's progress, usage, pause and fallback", () =>
   tasks[1].live = false;
   expect(liveTasks(tasks)).toHaveLength(0);
 });
+

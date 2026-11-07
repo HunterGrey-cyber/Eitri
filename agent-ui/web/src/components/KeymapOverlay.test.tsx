@@ -615,3 +615,15 @@ describe("KeymapOverlay opening position", () => {
     expect(container.querySelector("h2")?.textContent).toBe("Page keys");
   });
 });
+
+it("lists Pages with their load verb as text, without controls, and hides an empty section", () => {
+  const props = { onClose: vi.fn(), windowKeys: WINDOW, prefixKeys: PREFIX, prefixLabel: "Ctrl+b", panel: EMPTY_PANEL_TABLE };
+  const rendered = render(<KeymapOverlay {...props} pages={[{ id: "markdown", title: "<b>Markdown</b>", summary: null }]} />);
+  const section = sectionTitled(rendered.container, "Pages");
+  expect(section).toBeDefined();
+  expect(section.textContent).toContain("<b>Markdown</b>");
+  expect(section.textContent).toContain(":Eitri plugin load markdown");
+  expect(section.querySelector("b, button, [tabindex], [aria-current]")).toBeNull();
+  rendered.rerender(<KeymapOverlay {...props} pages={[]} />);
+  expect(sectionTitled(rendered.container, "Pages")).toBeUndefined();
+});

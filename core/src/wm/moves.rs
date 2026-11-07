@@ -102,7 +102,7 @@ pub enum MovePlan {
         peer: PeerId,
     },
     Refused {
-        why: &'static str,
+        why: String,
     },
 }
 
@@ -110,27 +110,32 @@ pub enum MovePlan {
 /// offered ([`HostReads::chat_move`]); a page's built state decides whether anything needs freezing. A module away
 /// here is the other window's to offer, whatever its kind: that window decides whether it can go.
 pub fn plan(w: &Window, module: &ModuleId, target: &MoveTarget) -> MovePlan {
+    if let Some(title) = w.lifecycle.session_title(module) {
+        return MovePlan::Refused {
+            why: format!("{title} is loaded for this run in this window only"),
+        };
+    }
     let peer = match target {
         MoveTarget::Local(_) => {
             return MovePlan::Refused {
-                why: feedback::LOCAL_MOVE_TEXT,
+                why: feedback::LOCAL_MOVE_TEXT.into(),
             }
         }
         MoveTarget::Peer(peer) => *peer,
     };
     if *module == ModuleId::editor() {
         return MovePlan::Refused {
-            why: feedback::EDITOR_MOVE_TEXT,
+            why: feedback::EDITOR_MOVE_TEXT.into(),
         };
     }
     let Ok(layout) = w.layout.try_borrow() else {
         return MovePlan::Refused {
-            why: feedback::LAYOUT_CHANGING_TEXT,
+            why: feedback::LAYOUT_CHANGING_TEXT.into(),
         };
     };
     if !layout.contains(module) && !w.lifecycle.deferred_holding(module) {
         return MovePlan::Refused {
-            why: feedback::NOT_HELD_TEXT,
+            why: feedback::NOT_HELD_TEXT.into(),
         };
     }
     if layout.is_away(module) {
@@ -144,7 +149,7 @@ pub fn plan(w: &Window, module: &ModuleId, target: &MoveTarget) -> MovePlan {
         .any(|(_, p)| p.moving(module) || p.pages_waiting.contains_key(module))
     {
         return MovePlan::Refused {
-            why: feedback::MOVING_TEXT,
+            why: feedback::MOVING_TEXT.into(),
         };
     }
     match w.lifecycle.kind(module).and_then(MoveKind::of) {
@@ -154,7 +159,7 @@ pub fn plan(w: &Window, module: &ModuleId, target: &MoveTarget) -> MovePlan {
             kind,
         },
         None => MovePlan::Refused {
-            why: feedback::NOT_HELD_TEXT,
+            why: feedback::NOT_HELD_TEXT.into(),
         },
     }
 }
@@ -588,8 +593,8 @@ fn offer_selected(
     };
     let kind = match planned {
         MovePlan::Refused { why } => {
-            refuse(w, win, why, batch);
-            return Err(why.to_owned());
+            refuse(w, win, &why, batch);
+            return Err(why);
         }
         MovePlan::Ask { module, .. } => {
             ask(w, peer, &module, follow);

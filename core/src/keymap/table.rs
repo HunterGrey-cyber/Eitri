@@ -24,6 +24,7 @@ pub enum Source {
     Default,
     Tmux,
     User,
+    AltMod,
 }
 
 impl fmt::Display for Source {
@@ -32,6 +33,7 @@ impl fmt::Display for Source {
             Source::Default => "default",
             Source::Tmux => "from your tmux config",
             Source::User => "set earlier in init.lua",
+            Source::AltMod => "moved for Alt $mod in this window",
         })
     }
 }
@@ -758,6 +760,25 @@ impl Keymap {
         }
     }
 
+    /// Applies the automatic bundle atomically, keeping its rows and takeovers separate from the user's own.
+    pub(super) fn apply_alt_mod(&mut self, ops: &[KeymapOp]) -> bool {
+        let Ok(mut map) = self.clone().then_user(ops, &[]) else {
+            return false;
+        };
+        for op in ops {
+            if let KeymapOp::Set { key, .. } = op {
+                let key = KeySpec::parse(key).expect("the bundle's keys parse");
+                if let Some(binding) = map.bindings.iter_mut().find(|binding| binding.key == key) {
+                    binding.source = Source::AltMod;
+                }
+            }
+        }
+        // These rows belong to the window's rule. Only the user's own takeovers belong in their startup notice.
+        map.overrides = self.overrides.clone();
+        *self = map;
+        true
+    }
+
     /// The defaults with `ops` applied in order. `lua_panels`: the ids `module.<id>` may name.
     pub fn apply_user(ops: &[KeymapOp], lua_panels: &[String]) -> Result<Keymap, KeymapError> {
         Keymap::defaults().then_user(ops, lua_panels)
@@ -1083,6 +1104,9 @@ impl Keymap {
             }
             if binding.source == Source::Tmux {
                 what.push_str(" (tmux)");
+            }
+            if binding.source == Source::AltMod {
+                what.push_str(" (moved for Alt $mod in this window)");
             }
             let key = binding.key.human();
             match rows.last_mut() {

@@ -163,7 +163,8 @@ pub enum ReviewHintLevel {
     Full,
 }
 
-pub const REVIEW_HINT_DEFAULT: ReviewHintLevel = ReviewHintLevel::Key;
+/// Unset, the band says nothing after a turn; `"key"` and `true` are asked for in `init.lua`.
+pub const REVIEW_HINT_DEFAULT: ReviewHintLevel = ReviewHintLevel::Off;
 
 impl ReviewHintLevel {
     pub fn word(self) -> &'static str {
@@ -176,7 +177,7 @@ impl ReviewHintLevel {
 }
 
 /// [`REVIEW_HINT_KEY`]: the finished turn's status-band hint and running turn's change line.
-/// Unset offers only `c to review`; true includes counts and the running change line, false hides both.
+/// Unset hides both, as false does; "key" offers only `c to review`; true includes counts and the running change line.
 pub fn parse_review_hint(value: Option<&str>) -> Result<ReviewHintLevel, String> {
     match value.map(str::trim) {
         None => Ok(REVIEW_HINT_DEFAULT),
@@ -754,8 +755,9 @@ mod tests {
     }
 
     #[test]
-    fn review_hint_defaults_to_the_key_and_accepts_switch_spellings() {
-        assert_eq!(parse_review_hint(None), Ok(ReviewHintLevel::Key));
+    fn review_hint_defaults_to_off_and_accepts_key_and_switch_spellings() {
+        assert_eq!(parse_review_hint(None), Ok(ReviewHintLevel::Off));
+        assert_eq!(parse_review_hint(None), Ok(REVIEW_HINT_DEFAULT));
         for (text, want) in [
             ("key", ReviewHintLevel::Key),
             (" key ", ReviewHintLevel::Key),

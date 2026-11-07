@@ -1151,3 +1151,5 @@ export type ReviewDiffEnvelope = {
 };
 /** A finished turn changed `files` files on disk; `0` clears the hint. */
 export type ReviewHintEnvelope = { tab: TabId; turn: number; files: number };
+
+export type PageLine = { id: string; title: string; summary: string | null };

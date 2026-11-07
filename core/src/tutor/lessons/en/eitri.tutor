@@ -53,11 +53,6 @@ NOTE: The keys in this tutorial are the most used ones. `{prefix} ?` always
 
 ** {prefix} % opens a module to the right, {prefix} " below. **
 
-NOTE: On Hyprland, sway and niri, Eitri leaves tiling to your window manager
-      by default. The split and zoom keys here only show a hint in that mode.
-      To use them, add `eitri.config.set("window.tiling", "eitri")` to your
-      init.lua and open a new Eitri window.
-
 The window is made of modules: this editor, the agent panel and the bottom
 terminal. A split key waits for a second key that names the module: `e` for
 the editor, `a` for the agent panel, `t` for the terminal. If the terminal is
@@ -208,26 +203,22 @@ Clear the terminal's screen: {prefix}
 ** A float sits above the other modules, the scratchpad keeps floats out of
    sight, and a workspace keeps a whole arrangement under a name. **
 
-NOTE: On Hyprland, sway and niri, Eitri leaves tiling to your window manager
-      by default. The float, scratchpad and workspace keys only show a hint
-      in that mode. To use them, add
-      `eitri.config.set("window.tiling", "eitri")` to your init.lua and open
-      a new Eitri window.
-
  1. Press `{prefix} t` to show the terminal and give it the keys.
 
- 2. Press `{prefix} Alt+Shift+Space`. The terminal floats in the middle of the
-    window, above the others. The editor never floats.
+ 2. Press `{prefix} F`. The terminal floats in the middle of the window,
+    above the others. The editor never floats.
 
- 3. Press `{prefix} Alt+_` (on most keyboards that is Alt, Shift and the minus
-    key). The float goes to the scratchpad, out of sight. Its name in the top
-    bar now ends with `⌁`, and its shell keeps running.
+ 3. Press `{prefix} _`. The float goes to the scratchpad, out of sight. Its
+    name in the top bar now ends with `⌁`, and its shell keeps running.
 
- 4. Press `{prefix} Alt+-`. It comes back. Press it again and it goes away;
+ 4. Press `{prefix} S`. It comes back. Press it again and it goes away;
     once more brings it back.
 
- 5. With the keys on the float, press `{prefix} Alt+Shift+Space` to put it
+ 5. With the keys on the float, press `{prefix} F` to put it
     back among the other modules. Then press `{prefix} e` to come back here.
+
+The Alt chords after the prefix do the same: Alt+Shift+Space for
+`{prefix} F`, Alt+_ for `{prefix} _`, and Alt+- for `{prefix} S`.
 
  6. Press `{prefix} s`. The hint strip lists the workspaces and ends with
     `c new · x delete`. Press `c`: Eitri makes a new workspace, a copy of
@@ -281,8 +272,8 @@ Two samples come with Eitri's source, in docs/keymap/: tmux-ctrl-a.lua moves
 the prefix to Ctrl+a with the rest of a common tmux setup, and i3-alt-mod.lua
 is for i3 or sway with Alt as $mod. Such a window manager takes the Alt chords
 before Eitri sees them (`{prefix} Alt+w` and the others), and the sample moves
-them to Ctrl+Alt chords: with it, lesson 6's {prefix} Alt+Shift+Space becomes
-{prefix} Ctrl+Alt+Space, and its {prefix} Alt+_ becomes {prefix} _.
+them to Ctrl+Alt chords: with it, the alias {prefix} Alt+Shift+Space becomes
+{prefix} Ctrl+Alt+Space. Lesson 6's plain keys need no such change.
 
 # THE END
 
@@ -299,8 +290,8 @@ These are the keys from this tutorial:
     `{prefix} c`, `{prefix} n`, `{prefix} p`    new, next, previous tab
     `{prefix} {prefix}`          send {prefix} to the module with the keys
     `{prefix} Ctrl+l`             send Ctrl+l (clear a shell's screen)
-    `{prefix} Alt+Shift+Space`    float, or put back
-    `{prefix} Alt+_`, `{prefix} Alt+-`        to the scratchpad, and back
+    `{prefix} F`                 float, or put back
+    `{prefix} _`, `{prefix} S`    to the scratchpad, and back
     `{prefix} s`, `{prefix} L`      choose a workspace, the last one
 
 The guide on https://eitri.cc/docs/ has every key and setting. Run

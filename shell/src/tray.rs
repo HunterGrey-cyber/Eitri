@@ -6,7 +6,7 @@
 //!
 //! One chip per module, made once and never reparented, in a fixed order (the editor, the agent,
 //! `agent 2` to `agent 9`, the terminal, `terminal 2` to `terminal 9`, then each Lua panel as it
-//! registered: [`chip_order`])
+//! registered: [`chip_order`]; a plugin page loaded into the running window gets its chip at the end, [`Tray::add`])
 //! -- a chip does not move as the layout
 //! changes; only whether it shows does. Each is a top-bar item (`topbar-item`), so `Ctrl+k` then
 //! `h`/`l`/`Enter` reaches it, HINT labels it (`Slot::Top`), and a click works. Activating one is
@@ -27,8 +27,9 @@ type ActivateHook = Rc<dyn Fn(&ModuleId)>;
 
 pub(crate) struct Tray {
     widget: gtk4::Box,
-    chips: Vec<(ModuleId, gtk4::Button)>,
+    chips: RefCell<Vec<(ModuleId, gtk4::Button)>>,
     on_activate: RefCell<Option<ActivateHook>>,
+    me: std::rc::Weak<Tray>,
 }
 
 impl Tray {
@@ -41,31 +42,30 @@ impl Tray {
             let chips: Vec<(ModuleId, gtk4::Button)> = modules
                 .iter()
                 .map(|(id, title)| {
-                    let chip = gtk4::Button::with_label(title);
-                    chip.add_css_class("tray-chip");
-                    chip.add_css_class("topbar-item");
-                    chip.set_valign(gtk4::Align::Center);
-                    chip.set_visible(false);
-                    let weak = weak.clone();
-                    let target = id.clone();
-                    chip.connect_clicked(move |_| {
-                        let Some(tray) = weak.upgrade() else { return };
-                        // Cloned out: activating re-enters the tray through the layout's change hook.
-                        let hook = tray.on_activate.borrow().clone();
-                        if let Some(hook) = hook {
-                            hook(&target);
-                        }
-                    });
+                    let chip = chip(weak, id, title);
                     widget.append(&chip);
                     (id.clone(), chip)
                 })
                 .collect();
             Tray {
                 widget,
-                chips,
+                chips: RefCell::new(chips),
                 on_activate: RefCell::new(None),
+                me: weak.clone(),
             }
         })
+    }
+
+    /// A chip for `id`, a module the window gained after it started, after every other chip, hidden until
+    /// [`Tray::set_chip`] shows it. The new chip, for the top bar's items; `None` when `id` has one already.
+    pub(crate) fn add(&self, id: &ModuleId, title: &str) -> Option<gtk4::Button> {
+        if self.chips.borrow().iter().any(|(module, _)| module == id) {
+            return None;
+        }
+        let chip = chip(&self.me, id, title);
+        self.widget.append(&chip);
+        self.chips.borrow_mut().push((id.clone(), chip.clone()));
+        Some(chip)
     }
 
     pub(crate) fn widget(&self) -> &gtk4::Box {
@@ -74,7 +74,11 @@ impl Tray {
 
     /// Every chip, in order: top-bar items, before the bar's own.
     pub(crate) fn items(&self) -> Vec<gtk4::Widget> {
-        self.chips.iter().map(|(_, chip)| chip.clone().upcast()).collect()
+        self.chips
+            .borrow()
+            .iter()
+            .map(|(_, chip)| chip.clone().upcast())
+            .collect()
     }
 
     /// What activating a chip does. `main.rs` sets it once `open_module` exists.
@@ -85,7 +89,14 @@ impl Tray {
     /// Draws `chip` as the model has it: its text (as plain text), its attention mark and whether it shows. A
     /// module the tray has no chip for draws nothing.
     pub(crate) fn set_chip(&self, chip: &Chip) {
-        let Some((_, button)) = self.chips.iter().find(|(id, _)| *id == chip.module) else {
+        // Cloned out: no borrow of the chips is held while GTK draws one.
+        let button = self
+            .chips
+            .borrow()
+            .iter()
+            .find(|(id, _)| *id == chip.module)
+            .map(|(_, button)| button.clone());
+        let Some(button) = button else {
             return;
         };
         if chip.shown {
@@ -100,4 +111,24 @@ impl Tray {
         }
         button.set_visible(chip.shown);
     }
+}
+
+/// One chip: its title, hidden, and a click that runs the tray's activation for `id`.
+fn chip(tray: &std::rc::Weak<Tray>, id: &ModuleId, title: &str) -> gtk4::Button {
+    let chip = gtk4::Button::with_label(title);
+    chip.add_css_class("tray-chip");
+    chip.add_css_class("topbar-item");
+    chip.set_valign(gtk4::Align::Center);
+    chip.set_visible(false);
+    let weak = tray.clone();
+    let target = id.clone();
+    chip.connect_clicked(move |_| {
+        let Some(tray) = weak.upgrade() else { return };
+        // Cloned out: activating re-enters the tray through the layout's change hook.
+        let hook = tray.on_activate.borrow().clone();
+        if let Some(hook) = hook {
+            hook(&target);
+        }
+    });
+    chip
 }

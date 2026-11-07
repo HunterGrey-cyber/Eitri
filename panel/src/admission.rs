@@ -42,6 +42,18 @@ pub(super) fn admission(
         Err(why) => Admission::Refused(why),
     };
     match msg {
+        InboundMessage::LoadPage { id } | InboundMessage::PageLine { id } => {
+            if view.is_base()
+                && state
+                    .page_lines
+                    .as_ref()
+                    .is_some_and(|pages| pages.iter().any(|page| page.id == *id))
+            {
+                Admission::Ungated
+            } else {
+                Admission::Refused("page was not offered to this document".into())
+            }
+        }
         InboundMessage::StopTask { task_id, .. } | InboundMessage::TaskOutput { task_id, .. } => {
             let Some(tab) = target else {
                 return Admission::Refused("no active session".into());

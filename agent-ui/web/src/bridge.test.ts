@@ -512,3 +512,11 @@ describe("path completion envelopes", () => {
     warning.mockRestore();
   });
 });
+
+it("demuxes window pages", () => {
+  const handler = vi.fn();
+  installDispatch(handler);
+  const payload = { kind: "pages", pages: [{ id: "markdown", title: "Markdown", summary: null }] };
+  window.__eitriDispatch!(JSON.stringify(payload));
+  expect(handler).toHaveBeenCalledWith(payload);
+});

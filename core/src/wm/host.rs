@@ -1152,6 +1152,16 @@ pub enum TermOp {
 /// Facts from a plugin page's move and its first restored frame.
 #[derive(Debug, Clone, PartialEq)]
 pub enum PluginEvent {
+    /// A worker loaded a page's manifest and default settings; its view waits for the first show.
+    Loaded {
+        win: WinId,
+        module: ModuleId,
+        title: String,
+        shown_while: bool,
+        own_rule: Option<crate::layout::OpenRule>,
+    },
+    /// A runtime load ended without registering a page.
+    LoadFailed { win: WinId, name: String, why: String },
     /// The page was frozen for move `mv`: its tasks paused, `record` what moves with it (its saved state `null`
     /// after the one-second bound or for a page without a handoff) and `handoff` its tasks' descriptors.
     Frozen {
@@ -1175,6 +1185,8 @@ pub enum PluginEvent {
 /// Commands sent to plugin services.
 #[derive(Debug, Clone, PartialEq)]
 pub enum PluginOp {
+    /// Loads a named plugin's default settings on a worker for this window.
+    Load { win: WinId, name: String },
     /// Pauses task readers and asks the page for state, bounded by one second; the move id matches its answer.
     Freeze {
         win: WinId,

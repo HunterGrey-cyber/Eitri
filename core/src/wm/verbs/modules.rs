@@ -151,6 +151,7 @@ pub enum Ran {
 /// hides, and a follow command's show keeps the keys where they are.
 pub fn run(w: &mut Window, cx: &Cx, win: WinId, action: &Action, origin: &Origin, batch: &mut Batch) -> Ran {
     match action {
+        Action::PluginLoad { name } => batch.append(super::plugins::run(w, cx, win, name)),
         Action::Module(id) if *origin == Origin::Chip => chip(w, cx, win, id, batch),
         Action::Module(id) if *origin == Origin::Follow => follow(w, cx, win, id, true, false, batch),
         Action::Module(id) if id.kind() == ModuleKind::Terminal => terminal_key(w, cx, win, id, batch),
@@ -703,7 +704,7 @@ fn opened_with_keys(w: &mut Window, win: WinId, id: &ModuleId, takes_keys: bool,
 /// on screen, where the rule goes with no module holding the keys), and put hidden into
 /// every other workspace that lacks it, as a new instance is. The keys move only when it takes them. A zoom that
 /// would hide it ends first. Its page is built once it is on screen, so an open the layout refuses builds no page.
-fn open_plugin_module(
+pub(in crate::wm) fn open_plugin_module(
     w: &mut Window,
     cx: &Cx,
     win: WinId,

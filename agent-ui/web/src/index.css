@@ -1176,6 +1176,12 @@ pre {
   width: min(100%, 340px);
   align-self: center;
 }
+.dash-pages h2 {
+  margin: 12px 10px 4px;
+  font-size: var(--fs-sm);
+  font-weight: 500;
+  color: var(--nv-muted);
+}
 .dash-item {
   display: flex;
   align-items: center;

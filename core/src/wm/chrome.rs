@@ -343,6 +343,17 @@ pub(super) fn title(w: &Window, id: &ModuleId) -> String {
     titles::module_title(id, &w.chrome_state.titles.lua)
 }
 
+/// A page loaded during this run joins the tray with the title its manifest declared.
+pub(super) fn plugin_title(w: &mut Window, id: &ModuleId, title: &str) {
+    let mut titles = w.chrome_state.titles.clone();
+    titles.lua.retain(|(module, _)| module != id);
+    titles.lua.push((id.clone(), title.into()));
+    if !titles.tray.contains(id) {
+        titles.tray.push(id.clone());
+    }
+    set_titles(w, titles);
+}
+
 /// The names the chrome uses changed.
 pub(super) fn set_titles(w: &mut Window, titles: ChromeTitles) {
     let state = &mut w.chrome_state;

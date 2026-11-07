@@ -18,7 +18,7 @@ import { durationsFromSnapshot, durationsWith, NO_TURN_DURATIONS } from "./turnT
 import type { TurnDurations } from "./turnTimes";
 import { REVIEW_SETTINGS_OFF, THINKING_DISPLAYS } from "./types";
 import type {
-  AgentUiState, ChooserEnvelope, ContextSummary, EditorLink, HandoffCommand, Hello, QueueItem,
+  PageLine, AgentUiState, ChooserEnvelope, ContextSummary, EditorLink, HandoffCommand, Hello, QueueItem,
   ReviewRecoveryEntry, ReviewSettings, TabId, TabsEnvelope, ThinkingDisplay, TurnClock,
 } from "./types";
 
@@ -132,6 +132,7 @@ export type PageModel = {
    *  `ready`, right after the theme). `prefix` is `Ctrl+b`, the stock tmux default, and the panel table has no
    *  bindings until that envelope arrives. */
   keymapHelp: KeymapHelp;
+  pages: PageLine[];
   /** The trust question Rust sent last, held until it can take the keys. It is not drawn on arrival: Rust asks
    *  again whenever a tab waiting for the answer is on screen without its question, including the moment after a
    *  close prompt, a rename field or the chooser took the keys. Drawing it at once could take the `y` meant for
@@ -235,6 +236,7 @@ export type PageModel = {
 export function initialPageModel(): PageModel {
   return {
     answerEpoch: 0, inputRequest: 0, arriveRequest: 0, permissionRequest: 0, navKey: null,
+    pages: [],
     keymapHelp: { prefix: "Ctrl+b", window: [], prefixKeys: [], panel: EMPTY_PANEL_TABLE, newTabChord: "" },
     heldTrust: null, confirm: null, renaming: null, queueTaken: null, queueTakenSequence: 0,
     state: initialState(), hello: null, tabs: null, keptStates: new Map(), fatalError: null,
@@ -307,6 +309,8 @@ function reduceEnvelope(model: PageModel, envelope: Envelope): PageModel {
       return { ...model, review: null, chooser: null };
     case "nav_key":
       return { ...model, navKey: { seq: (model.navKey?.seq ?? 0) + 1, direction: envelope.direction } };
+    case "pages":
+      return { ...model, pages: envelope.pages };
     case "keymap":
       return {
         ...model, keymapHelp: {

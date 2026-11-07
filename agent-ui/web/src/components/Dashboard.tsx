@@ -1,4 +1,4 @@
-import type { EditorLink, Hello, PermissionModeChoice } from "../types";
+import type { PageLine, EditorLink, Hello, PermissionModeChoice } from "../types";
 
 /** LazyVim-style dashboard rows: a centred name and one key per action. `"resume"` is the newest
  *  remembered session; the chooser (`w`/`prefix w`) lists every record. */
@@ -206,6 +206,8 @@ function ItemLabel({ item, hello, mode, agent }: { item: DashItem; hello: Hello;
 
 type Props = {
   hello: Hello;
+  pages?: PageLine[];
+  onLoadPage?: (id: string) => void;
   /** This tab's own mode (`TabInfo.mode`, not a choice from `hello`) -- the mode a session started
    *  here would actually run in. */
   mode: PermissionModeChoice;
@@ -239,11 +241,13 @@ type Props = {
  * here is ever really DOM-focused. A real, focused `<button>` would eat a `Space` keydown as
  * native activation before it ever reached the leader system (`App.tsx`'s root `onKeyDown`), which
  * is exactly the key this screen's own `j`/`k`/letters/`Enter` must never intercept from. */
-export function Dashboard({ hello, mode, cursor, narrow, onItem, paneFocused, entryKey, editorLink = null, agent = null }: Props) {
+export function Dashboard({ hello, pages, onLoadPage, mode, cursor, narrow, onItem, paneFocused, entryKey, editorLink = null, agent = null }: Props) {
   return (
     <div className="dashboard">
       <DashboardHead hello={hello} narrow={narrow} agent={agent} />
       <DashboardItems
+        pages={pages}
+        onLoadPage={onLoadPage}
         hello={hello}
         mode={mode}
         cursor={cursor}
@@ -278,6 +282,8 @@ export function DashboardHead({ hello, narrow, agent = null }: { hello: Hello; n
  *  right-aligned before its key; a narrow panel leaves it out so the title keeps the room. */
 export function DashboardItems({
   hello,
+  pages = [],
+  onLoadPage,
   mode,
   cursor,
   onItem,
@@ -313,6 +319,27 @@ export function DashboardItems({
               <kbd className="dash-key">{DASH_ITEM_KEY[item]}</kbd>
             </div>
           ),
+        )}
+        {pages.length > 0 && (
+          <section className="dash-pages" aria-label="Pages">
+            <h2>Pages</h2>
+            {pages.map((page, index) => (
+              <div
+                key={page.id}
+                className="dash-item"
+                role="button"
+                tabIndex={-1}
+                data-nav-stop="dash"
+                aria-current={items.length + index === cursor ? "true" : undefined}
+                onClick={() => onLoadPage?.(page.id)}
+              >
+                <span className="dash-label">
+                  {page.title}
+                  {page.summary !== null && <span className="dash-detail">{page.summary}</span>}
+                </span>
+              </div>
+            ))}
+          </section>
         )}
         <div className="dash-entry-slot">
           {!paneFocused && entryKey != null && <div className="dash-entry-hint">{entryKey} to use these keys</div>}

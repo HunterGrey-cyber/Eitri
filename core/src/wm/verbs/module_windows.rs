@@ -53,6 +53,10 @@ impl Asked {
 /// Decides `action` by the window's tiling: `true` when it was decided here and its ops are in `batch`, `false`
 /// when it goes on to the family routing as it does in `eitri` mode.
 pub fn gate(w: &mut Window, reads: &dyn HostReads, win: WinId, action: &Action, batch: &mut Batch) -> bool {
+    // Runtime page loads have their own refusal, which the module family's verb decides in every mode.
+    if matches!(action, Action::PluginLoad { .. }) {
+        return false;
+    }
     match w.tiling {
         Tiling::Eitri => false,
         Tiling::Hub => run_hub(w, reads, win, action, batch),

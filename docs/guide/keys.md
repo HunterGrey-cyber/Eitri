@@ -21,8 +21,9 @@ including anything you changed in [your configuration](configuration.md) or took
 >   `eitri.config.set("keymap.which_key_delay", 200)` in your `init.lua` ([The hint panel](#the-hint-panel)).
 > - If you use tmux, your prefix and prefix-table bindings come from your tmux configuration
 >   ([Your tmux keys](#your-tmux-keys)), and `Ctrl+b ?` (or your own prefix and `?`) lists what did not come across.
-> - For a `Ctrl+a` prefix, start from [`docs/keymap/tmux-ctrl-a.lua`](../keymap/tmux-ctrl-a.lua); for i3 or sway with
->   Alt as `$mod`, from [`docs/keymap/i3-alt-mod.lua`](../keymap/i3-alt-mod.lua).
+> - For a `Ctrl+a` prefix, start from [`docs/keymap/tmux-ctrl-a.lua`](../keymap/tmux-ctrl-a.lua). On i3 or sway with
+>   Alt as `$mod`, Eitri moves its Alt keys after the prefix to Ctrl+Alt by itself and says so once
+>   ([below](#containers-and-terminals)); [`docs/keymap/i3-alt-mod.lua`](../keymap/i3-alt-mod.lua) is the same moves as a file.
 > - On a first launch without an `init.lua`, Eitri offers to set the keys up and write one
 >   ([First start](configuration.md#first-start)); `:Eitri setup` brings the screen back.
 > - `:EitriTutor` in the editor walks you through these keys, step by step, in English or Simplified Chinese
@@ -31,7 +32,8 @@ including anything you changed in [your configuration](configuration.md) or took
 >   reflected; your prefix and `?` list yours.
 > - **On Hyprland, sway and niri this page's layout keys are off by default,** because your window manager arranges
 >   the windows: `Ctrl+b %` shows one hint and does nothing else. [Compositor windows](compositor-windows.md#keys) says
->   which keys still work there, and `window.tiling = "eitri"` brings the rest back. The tutor teaches them either way.
+>   which keys still work there, and `window.tiling = "eitri"` brings the rest back. There `:EitriTutor` teaches that
+>   mode's keys instead.
 
 ## The prefix
 
@@ -288,7 +290,7 @@ as `$mod`, pressed after the prefix. A title is the module's name as the top bar
 | `<prefix> Alt+a` / `Alt+d` | select the parent container of what is selected / go back down to the child that has the keys (i3's `focus parent` and `focus child`) |
 | `<prefix> Alt+Enter` | open a new terminal to the right of the module that has the keys; its shell starts in the project root |
 
-If your i3 or sway `$mod` is Alt, the window manager takes those chords before Eitri sees them, and the rows never run. [`docs/keymap/i3-alt-mod.lua`](../keymap/i3-alt-mod.lua) moves the rows it grabs: each keeps its key with Ctrl added (`<prefix> Ctrl+Alt+w`, `Ctrl+Alt+Enter`, and so on). The rows whose key has Shift in it drop the Shift instead of keeping it: Eitri does not read Ctrl+Shift+<character> as a chord, so the four moves (`Alt+H`, `Alt+J`, `Alt+K`, `Alt+L`) become `<prefix> Ctrl+Alt+h`, `Ctrl+Alt+j`, `Ctrl+Alt+k`, `Ctrl+Alt+l`, and the move-to-scratchpad row (`Alt+_`) becomes `<prefix> _`; the float toggle (`Alt+Shift+Space`) becomes `<prefix> Ctrl+Alt+Space`, since Ctrl+Shift+Space switches the input method on many setups. Paste it into your `init.lua`.
+If your i3 or sway `$mod` is Alt, the window manager takes those chords before Eitri sees them. Eitri finds that out at start (from the running window manager's configuration, else its config file) and, unless your `init.lua` already sets or deletes one of those keys, moves them for that window, as [`docs/keymap/i3-alt-mod.lua`](../keymap/i3-alt-mod.lua) does, saying so once: `sway's $mod is Alt, so Eitri moved its Alt keys after the prefix to Ctrl+Alt for this window`. `eitri.keymap.use("i3-alt")` in your `init.lua` makes the moves yours; setting or deleting any of those keys yourself stops it. The `?` sheet marks the moved rows. The file moves the rows it grabs: each keeps its key with Ctrl added (`<prefix> Ctrl+Alt+w`, `Ctrl+Alt+Enter`, and so on). The rows whose key has Shift in it drop the Shift instead of keeping it: Eitri does not read Ctrl+Shift+<character> as a chord, so the four moves (`Alt+H`, `Alt+J`, `Alt+K`, `Alt+L`) become `<prefix> Ctrl+Alt+h`, `Ctrl+Alt+j`, `Ctrl+Alt+k`, `Ctrl+Alt+l`, and the move-to-scratchpad row (`Alt+_`) is only deleted, since `<prefix> _` already does it; the float toggle (`Alt+Shift+Space`) becomes `<prefix> Ctrl+Alt+Space`, since Ctrl+Shift+Space switches the input method on many setups. Paste it into your `init.lua`.
 
 **Tabs and stacks.** Click a title, or press `f` and type the title's label (HINT labels every title), to bring
 that module forward and give it the keys. From the keyboard, `Ctrl+h` / `Ctrl+l` step to the tab on the left /
@@ -540,6 +542,7 @@ not in a second window, which has no Neovim.
 
 | command | what it does |
 |---|---|
+| `:Eitri plugin load <name>` | load a plugin page into this window for this run ([Plugins](configuration.md#plugins)) |
 | `:Eitri <action> [key=value ...]` | any action `eitri.layout.run` takes, by its `eitri.keymap` name: `:Eitri zoom`, `:Eitri resize.left cells=5`, `:Eitri module.agent`, `:Eitri layout.even-horizontal`, `:Eitri float.toggle` |
 | `:Eitri split right` or `below <module>` | open a module beside the editor, or move it there; `<module>` is `editor`, `agent`, `terminal`, `terminal#2`, `agent#3` or `lua:<panel id>` |
 | `:Eitri focus`, `show` or `hide <module>` | as `eitri.layout.focus`, `show` and `hide` |

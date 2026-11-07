@@ -19,7 +19,9 @@ eitri.plugin.load("markdown")
 ```
 
 Nothing changes on screen until you open the preview. Without that line nothing of the preview exists in the window:
-no module, no Neovim command, nothing running.
+no module, no Neovim command, nothing running. To try it first, `Enter` on `Markdown preview` under the empty tab's
+Pages, or `:Eitri plugin load markdown`, loads it into the window you are in, for this run only
+([Plugins](configuration.md#plugins)).
 
 ## Open and close it
 

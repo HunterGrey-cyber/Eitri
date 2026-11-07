@@ -97,6 +97,10 @@ pub enum Action {
     WorkspaceChoose,
     /// Open the project chooser in this window.
     ProjectChoose,
+    /// Load a plugin page with default settings for this window's current run.
+    PluginLoad {
+        name: String,
+    },
     /// tmux's `rename-session` prompt.
     WorkspaceRename,
     WorkspaceSwitch {
@@ -369,6 +373,7 @@ pub fn is_text_option(name: &str) -> bool {
 /// Every name [`parse`] accepts, without its options, except `module.<id>` of a Lua panel (an id
 /// `init.lua` chooses). A name that needs an option to parse has it in [`required_options`].
 pub const NAMES: &[&str] = &[
+    "plugin.load",
     "send-prefix",
     "send-keys",
     "split.right",
@@ -495,6 +500,7 @@ pub fn required_options(name: &str) -> Vec<(String, OptValue)> {
         "send-keys" => vec![("keys".into(), OptValue::Str("C-a".into()))],
         "instance.new" => vec![("kind".into(), OptValue::Str("terminal".into()))],
         "workspace.switch" => vec![("name".into(), OptValue::Str("main".into()))],
+        "plugin.load" => vec![("name".into(), OptValue::Str("markdown".into()))],
         "tab.select" => vec![("n".into(), OptValue::Int(1))],
         _ => Vec::new(),
     }
@@ -568,6 +574,19 @@ pub fn parse(name: &str, opts: &[(String, OptValue)], lua_panels: &[String]) -> 
                 .transpose()
                 .map_err(|err| bad("module", format!("must be a module id: {err}")))?;
             (Action::ScratchpadShow { module }, &["module"])
+        }
+        "plugin.load" => {
+            let name = o
+                .name
+                .as_deref()
+                .ok_or_else(|| bad("name", "is required: the plugin's name"))?;
+            if !crate::plugin::manifest::id_ok(name) {
+                return Err(bad(
+                    "name",
+                    "must be a plugin id (lower-case letters, digits and hyphens)",
+                ));
+            }
+            (Action::PluginLoad { name: name.into() }, &["name"])
         }
         "workspace.switch" => {
             let value = o
@@ -742,7 +761,8 @@ pub fn parse(name: &str, opts: &[(String, OptValue)], lua_panels: &[String]) -> 
 impl Action {
     pub fn on_a_float(&self) -> FloatRule {
         match self {
-            Action::ProjectChoose
+            Action::PluginLoad { .. }
+            | Action::ProjectChoose
             | Action::Even(_)
             | Action::MainHorizontal
             | Action::MainVertical
@@ -810,7 +830,8 @@ impl Action {
 
     pub fn selection_rule(&self) -> SelectionRule {
         match self {
-            Action::ProjectChoose
+            Action::PluginLoad { .. }
+            | Action::ProjectChoose
             | Action::Move(_)
             | Action::MoveFar(_)
             | Action::Zoom
@@ -879,7 +900,7 @@ impl Action {
     /// What `eitri.layout.run` accepts; every new action must decide here whether it is layout.
     pub fn is_layout(&self) -> bool {
         match self {
-            Action::ProjectChoose => true,
+            Action::ProjectChoose | Action::PluginLoad { .. } => true,
             Action::Move(_)
             | Action::ContainerTabbed
             | Action::ContainerStacked
@@ -971,6 +992,7 @@ impl Action {
             Action::WorkspaceStep { forward: true } => "workspace.next".into(),
             Action::WorkspaceLast => "workspace.last".into(),
             Action::ProjectChoose => "project.choose".into(),
+            Action::PluginLoad { .. } => "plugin.load".into(),
             Action::WorkspaceChoose => "workspace.choose".into(),
             Action::WorkspaceRename => "workspace.rename".into(),
             Action::WorkspaceSwitch { .. } => "workspace.switch".into(),
@@ -1048,7 +1070,9 @@ impl Action {
     pub fn options(&self) -> Vec<(String, OptValue)> {
         match self {
             Action::ScratchpadShow { module: Some(id) } => vec![("module".into(), OptValue::Str(id.as_str().into()))],
-            Action::WorkspaceSwitch { name } => vec![("name".into(), OptValue::Str(name.clone()))],
+            Action::WorkspaceSwitch { name } | Action::PluginLoad { name } => {
+                vec![("name".into(), OptValue::Str(name.clone()))]
+            }
             Action::MoveToWindow { module, follow } => {
                 let mut out = Vec::new();
                 if let Some(id) = module {
@@ -1120,6 +1144,7 @@ impl Action {
             Action::WorkspaceStep { forward: true } => "Switch to the next workspace".into(),
             Action::WorkspaceLast => "Switch to the workspace used before this one".into(),
             Action::ProjectChoose => "Open a project".into(),
+            Action::PluginLoad { .. } => "Load a plugin page for this run".into(),
             Action::WorkspaceChoose => {
                 "Choose a workspace: a digit switches, c makes a new one, x then a digit deletes one".into()
             }
@@ -1261,6 +1286,7 @@ impl Action {
             Action::WorkspaceStep { forward: false } => "previous workspace",
             Action::WorkspaceLast => "last workspace",
             Action::ProjectChoose => "open a project",
+            Action::PluginLoad { .. } => "load plugin page",
             Action::WorkspaceChoose => "choose workspace",
             Action::WorkspaceRename => "rename workspace",
             Action::WorkspaceSwitch { .. } => "switch workspace",
@@ -1355,6 +1381,44 @@ impl Action {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn plugin_load_reaches_the_controller_in_compositor_windows() {
+        use crate::keymap::compositor::{classify_module, classify_window1, HubVerb, ModuleVerb};
+
+        let action = Action::PluginLoad {
+            name: "markdown".into(),
+        };
+        assert_eq!(classify_window1(&action), HubVerb::AsToday);
+        assert_eq!(classify_module(&action), ModuleVerb::AsToday);
+    }
+
+    #[test]
+    fn plugin_load_is_refused_by_the_companion_keymap() {
+        use crate::keymap::companion::{beside_keep, classify, companion_root_keep, CompanionVerb};
+
+        let action = Action::PluginLoad {
+            name: "markdown".into(),
+        };
+        assert_eq!(classify(&action), CompanionVerb::Refuse);
+        assert!(!companion_root_keep(&action));
+        assert!(!beside_keep(&action));
+    }
+
+    #[test]
+    fn plugin_load_is_a_named_runtime_action() {
+        let opts = vec![("name".into(), OptValue::Str("agents-top".into()))];
+        let parsed = parse("plugin.load", &opts, &[]).unwrap();
+        assert_eq!(parsed.action.name(), "plugin.load");
+        assert_eq!(parsed.action.options(), opts);
+        assert!(parsed.action.is_layout());
+        assert_eq!(parsed.action.describe("Ctrl+b", ""), "Load a plugin page for this run");
+        assert!(NAMES.contains(&"plugin.load"));
+        assert!(parse("plugin.load", &[], &[])
+            .unwrap_err()
+            .to_string()
+            .contains("required"));
+        assert!(parse("plugin.load", &[("name".into(), OptValue::Bool(true))], &[]).is_err());
+    }
     use super::*;
     use crate::keymap::table::Keymap;
 
@@ -1363,6 +1427,9 @@ mod tests {
         let dirs = [Direction::Left, Direction::Down, Direction::Up, Direction::Right];
         let axes = [Axis::Row, Axis::Column];
         let mut all = vec![
+            Action::PluginLoad {
+                name: "markdown".into(),
+            },
             Action::ContainerTabbed,
             Action::ContainerStacked,
             Action::FocusParent,
@@ -1538,7 +1605,8 @@ mod tests {
     #[allow(dead_code)]
     fn _every_variant_is_listed(a: &Action) {
         match a {
-            Action::Move(_)
+            Action::PluginLoad { .. }
+            | Action::Move(_)
             | Action::ContainerTabbed
             | Action::ContainerStacked
             | Action::FocusParent

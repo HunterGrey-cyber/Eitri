@@ -1418,10 +1418,11 @@ fn action_number(action: &Action) -> usize {
         Action::CopyMode { .. } => 60,
         Action::AgentsNext => 61,
         Action::AgentsBack => 62,
+        Action::PluginLoad { .. } => 63,
     }
 }
 
-const ACTION_VARIANTS: usize = 63;
+const ACTION_VARIANTS: usize = 64;
 
 /// One action of every variant, and every kind of module key and `instance.new`, which a beside window tells apart.
 fn every_action() -> Vec<Action> {

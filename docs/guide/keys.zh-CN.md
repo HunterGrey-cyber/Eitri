@@ -1,5 +1,5 @@
 [English](keys.md) | 简体中文
-<!-- translated-from: keys.md sha256=1f5ce027d9771f4efbbc90b36850b68d004c10652d319527e53d1a4880b4f949 -->
+<!-- translated-from: keys.md sha256=18d5fcc23742934c15377997e534a6399062a57b18de20d42105be3736647252 -->
 
 # 按键
 
@@ -16,15 +16,16 @@ Eitri 的按键来自三个地方，它们互不冲突：用于窗口本身（�
 > - 想让 Eitri 在你按下前缀后停一下就列出接下来的键，在 `init.lua` 里写 `eitri.config.set("keymap.which_key_delay", 200)`（[提示面板](#the-hint-panel)）。
 > - 如果你用 tmux，你的前缀和前缀表里的绑定来自你的 tmux 配置（[你的 tmux 按键](#your-tmux-keys)），
 >   `Ctrl+b ?`（或者你自己的前缀加 `?`）会列出没拿过来的那些。
-> - 想用 `Ctrl+a` 当前缀，从 [`docs/keymap/tmux-ctrl-a.lua`](../keymap/tmux-ctrl-a.lua) 开始；i3 或 sway 把 Alt
->   当 `$mod` 的话，从 [`docs/keymap/i3-alt-mod.lua`](../keymap/i3-alt-mod.lua) 开始。
+> - 想用 `Ctrl+a` 当前缀，从 [`docs/keymap/tmux-ctrl-a.lua`](../keymap/tmux-ctrl-a.lua) 开始。i3 或 sway 把 Alt
+>   当 `$mod` 时，Eitri 会自己把前缀之后的 Alt 键改到 Ctrl+Alt，并说一次（[见下文](#containers-and-terminals)）；
+>   [`docs/keymap/i3-alt-mod.lua`](../keymap/i3-alt-mod.lua) 是写成文件的同一组改动。
 > - 没有 `init.lua` 的第一次启动，Eitri 会提议设置按键并写入一个（[首次启动](configuration.zh-CN.md#first-start)）；
 >   `:Eitri setup` 可以把这个界面叫回来。
 > - 在编辑器里运行 `:EitriTutor`，会一步步带你把这些键走一遍，用英文或简体中文（按你的语言环境来选，和
 >   Neovim 的 `:Tutor` 一样）。课文里凡是指“你的前缀”的地方都写你自己的前缀，教的是前缀之后的默认键，所以被
 >   tmux 配置改过的键不会体现在里面；你的前缀加 `?` 会列出你的键。
 > - **在 Hyprland、sway 和 niri 上，这一页的布局键默认关闭**，因为窗口由你的窗口管理器排布：`Ctrl+b %` 只显示一条提示，不做别的。
->   [合成器窗口](compositor-windows.zh-CN.md#keys)说明哪些键在那里仍然有效，`window.tiling = "eitri"` 把其余的键带回来。教程不管怎样都会教这些键。
+>   [合成器窗口](compositor-windows.zh-CN.md#keys)说明哪些键在那里仍然有效，`window.tiling = "eitri"` 把其余的键带回来。在那种模式下，`:EitriTutor` 教的是那种模式的键。
 
 ## 前缀
 
@@ -216,7 +217,7 @@ companion 窗口（见 [Companion 模式](companion.zh-CN.md)）没有自己的�
 | `<prefix> Alt+a` / `Alt+d` | 选中当前所选之物的父容器 / 回到拿着按键的那个子项（i3 的 `focus parent` 和 `focus child`） |
 | `<prefix> Alt+Enter` | 在拿着按键的模块右边打开一个新的终端；它的 shell 从项目根目录启动 |
 
-如果你的 i3 或 sway 的 `$mod` 是 Alt，这些组合键会先被窗口管理器拿走，Eitri 看不到，这些行就永远不会运行。[`docs/keymap/i3-alt-mod.lua`](../keymap/i3-alt-mod.lua) 会把被拿走的那些行移开：每一行保留原来的键并加上 Ctrl（`<prefix> Ctrl+Alt+w`、`Ctrl+Alt+Enter`，等等）。键里带 Shift 的那几行则去掉 Shift，而不是保留它：Eitri 不把 Ctrl+Shift+<字符> 当作组合键来读，所以四个移动键（`Alt+H`、`Alt+J`、`Alt+K`、`Alt+L`）变成 `<prefix> Ctrl+Alt+h`、`Ctrl+Alt+j`、`Ctrl+Alt+k`、`Ctrl+Alt+l`，移入便笺板那一行（`Alt+_`）变成 `<prefix> _`；浮动切换（`Alt+Shift+Space`）变成 `<prefix> Ctrl+Alt+Space`，因为在很多环境里 Ctrl+Shift+Space 是切换输入法的键。把它粘贴进你的 `init.lua`。
+如果你的 i3 或 sway 的 `$mod` 是 Alt，这些组合键会先被窗口管理器拿走，Eitri 看不到。Eitri 在启动时会查出这一点（先看正在运行的窗口管理器的配置，否则读它的配置文件），只要你的 `init.lua` 没有设置或删除其中任何一个键，就为这个窗口把它们移开，和 [`docs/keymap/i3-alt-mod.lua`](../keymap/i3-alt-mod.lua) 做的一样，并说一次：`sway's $mod is Alt, so Eitri moved its Alt keys after the prefix to Ctrl+Alt for this window`。在 `init.lua` 里写 `eitri.keymap.use("i3-alt")` 会让这些改动成为你自己的；你自己设置或删除其中任何一个键，它就不再这样做。`?` 清单会标出被移开的行。这个文件会把被拿走的那些行移开：每一行保留原来的键并加上 Ctrl（`<prefix> Ctrl+Alt+w`、`Ctrl+Alt+Enter`，等等）。键里带 Shift 的那几行则去掉 Shift，而不是保留它：Eitri 不把 Ctrl+Shift+<字符> 当作组合键来读，所以四个移动键（`Alt+H`、`Alt+J`、`Alt+K`、`Alt+L`）变成 `<prefix> Ctrl+Alt+h`、`Ctrl+Alt+j`、`Ctrl+Alt+k`、`Ctrl+Alt+l`，移入便笺板那一行（`Alt+_`）只是删掉，因为 `<prefix> _` 已经做这件事；浮动切换（`Alt+Shift+Space`）变成 `<prefix> Ctrl+Alt+Space`，因为在很多环境里 Ctrl+Shift+Space 是切换输入法的键。把它粘贴进你的 `init.lua`。
 
 **标签页和堆叠。** 点一下标题，或者按 `f` 再输入标题的标签（HINT 会给每个标题标上标签），就能把那个模块带到前面并让它拿到按键。用键盘的话，在标签页式容器里 `Ctrl+h` / `Ctrl+l` 移到左边 / 右边的标签页，在堆叠式容器里 `Ctrl+k` / `Ctrl+j` 移到上面 / 下面那一个；那个方向没有标签页时，它们就像在模块之间一样继续往外走。拿着按键的模块永远是显示出来的那个，所以隐藏或关闭它会把按键交给接着显示的标签页。没有显示的标签页照常运行：那里的终端继续输出，回来时能看到这些行；聊天保持着它的会话。不在显示中的标签页上的聊天，在有卡片等待时，标题上带着 `agent ⚑N`；`modules.chat.on_permission` 设为 `"reveal"` 时，新卡片会把它的标签页带到前面，除非按键正在同一容器的另一个标签页上：那时你只会看到提示，什么都不动。
 
@@ -351,6 +352,7 @@ require("smart-splits").setup({
 
 | 命令 | 作用 |
 |---|---|
+| `:Eitri plugin load <name>` | 为这次运行把一个插件页面加载进这个窗口（[插件](configuration.zh-CN.md#plugins)） |
 | `:Eitri <action> [key=value ...]` | `eitri.layout.run` 接受的任何动作，用它在 `eitri.keymap` 里的名字：`:Eitri zoom`、`:Eitri resize.left cells=5`、`:Eitri module.agent`、`:Eitri layout.even-horizontal`、`:Eitri float.toggle` |
 | `:Eitri split right` 或 `below <module>` | 在编辑器旁边打开一个模块，或者把它移到那里；`<module>` 是 `editor`、`agent`、`terminal`、`terminal#2`、`agent#3` 或 `lua:<panel id>` |
 | `:Eitri focus`、`show` 或 `hide <module>` | 同 `eitri.layout.focus`、`show`、`hide` |

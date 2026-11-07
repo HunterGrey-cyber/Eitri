@@ -1,5 +1,5 @@
 [English](many-agents.md) | 简体中文
-<!-- translated-from: many-agents.md sha256=6636e5a356c33b3dde1d20c7bc9fb3319859d62f806a3225309cb1b045ff01ae -->
+<!-- translated-from: many-agents.md sha256=27efda2c5080ffb029ca91e0f31517f23c7da3f2780e9e888c9766e973ad17ec -->
 
 # 同时用很多 agent
 
@@ -22,7 +22,7 @@
 
 它们和别的模块一样用键拿到焦点：从编辑器按 `<prefix> Left` 到 Strips，`<prefix> Up` 到 The pass，`<prefix> o` 依次走过所有模块，表格用它自己的键（见下文）打开并拿到焦点。
 
-三个都是随 Eitri 一起发布的插件，在 `init.lua` 加载它们之前是关着的（[插件](configuration.zh-CN.md#plugins)）：
+三个都是随 Eitri 一起发布的插件，在 `init.lua` 加载它们之前是关着的（[插件](configuration.zh-CN.md#plugins)）；想在当前窗口里试一个，在空标签页的 Pages 下面它的那一行上按 `Enter`，或者运行 `:Eitri plugin load agents-top`（只在这次运行里有效）：
 
 ```lua
 eitri.plugin.load("agents-strips")

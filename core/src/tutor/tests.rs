@@ -39,6 +39,9 @@ const PREFIX_KEYS: &[(&str, &str)] = &[
     ("Ctrl+j", "send-keys"),
     ("Ctrl+k", "send-keys"),
     ("Ctrl+l", "send-keys"),
+    ("F", "float.toggle"),
+    ("S", "scratchpad.show"),
+    ("_", "scratchpad.move"),
     ("Alt+Shift+Space", "float.toggle"),
     ("Alt+_", "scratchpad.move"),
     ("Alt+-", "scratchpad.show"),
@@ -128,30 +131,211 @@ fn bare_chords(lessons: &str) -> Vec<String> {
         .collect()
 }
 
+fn compositor_lessons_for(prefix: &str) -> [(&'static str, String, String); 2] {
+    ["en", "zh"].map(|lang| {
+        let base = format!("core/src/tutor/lessons/{lang}/compositor.tutor");
+        let text = crate::source_scan::read_required(&base).text;
+        let checks = crate::source_scan::read_required(&format!("{base}.json")).text;
+        (lang, substitute(&text, prefix), substitute_checks(&checks, prefix))
+    })
+}
+
 #[test]
-fn only_lessons_2_and_6_explain_compositor_tiling_before_the_first_step() {
-    for (lang, source, heading) in [("en", LESSONS_EN, "Lesson "), ("zh", LESSONS_ZH, "第 ")] {
-        let sections: Vec<_> = source
-            .split("\n# ")
-            .filter(|section| section.starts_with(heading))
-            .collect();
-        assert_eq!(sections.len(), 8, "{lang}: lessons 0 through 7");
-        for (lesson, section) in sections.iter().enumerate() {
-            let intro = section.split("\n 1.").next().unwrap();
-            let count = usize::from(matches!(lesson, 2 | 6));
-            for marker in ["window.tiling", "\"eitri\""] {
+fn files_select_the_windows_mode_at_the_same_runtime_paths() {
+    use crate::compositor::mode::Mode;
+    for prefix in PREFIXES {
+        let stock = super::files(prefix, Some(Mode::Eitri));
+        assert_eq!(super::files(prefix, None), stock, "unknown mode uses Eitri");
+        for (lang, text, checks) in lessons_for(prefix) {
+            assert!(stock.contains(&(
+                if lang == "en" {
+                    "tutor/en/eitri.tutor"
+                } else {
+                    "tutor/zh/eitri.tutor"
+                },
+                text
+            )));
+            assert!(stock
+                .iter()
+                .any(|(path, body)| path.ends_with(&format!("{lang}/eitri.tutor.json")) && body == &checks));
+        }
+        let compositor = super::files(prefix, Some(Mode::Compositor));
+        assert_ne!(compositor, stock, "compositor mode needs its own lessons");
+        assert_eq!(compositor.len(), 4);
+        for (lang, text, checks) in compositor_lessons_for(prefix) {
+            for (suffix, expected) in [("", text), (".json", checks)] {
+                let path = format!("tutor/{lang}/eitri.tutor{suffix}");
                 assert_eq!(
-                    intro.matches(marker).count(),
-                    count,
-                    "{lang}: lesson {lesson} must explain {marker} before its first step"
-                );
-                assert_eq!(
-                    section.matches(marker).count(),
-                    count,
-                    "{lang}: lesson {lesson} must contain {marker} only in its introduction"
+                    compositor.iter().find(|(p, _)| *p == path).map(|(_, t)| t),
+                    Some(&expected)
                 );
             }
         }
+    }
+}
+
+#[test]
+fn compositor_lessons_name_only_keys_available_in_the_window_they_teach() {
+    use crate::keymap::compositor::{classify_module, classify_window1, HubVerb, ModuleVerb};
+    let defaults = Keymap::defaults();
+    // Lesson 7 names this alias only to explain compositor interception and rebinding; lesson 6 says layout keys are off.
+    let off_mentions = [("Alt+w", "the tmux/init.lua sample describes an off container key")];
+    let chat_keys = ["?", "a", "e", "t", "!", "x", "c", "n", "p", "1", "&"];
+    for (lang, text, checks) in compositor_lessons_for(DEFAULT_PREFIX) {
+        let source = crate::source_scan::read_required(&format!("core/src/tutor/lessons/{lang}/compositor.tutor")).text;
+        let mut keys = prefix_keys(&text, &checks);
+        // Bold headings name keys too; inline code and completed exercise lines are covered above.
+        for heading in source.split("**").skip(1).step_by(2) {
+            for (at, _) in heading.match_indices("{prefix} ") {
+                if heading[..at].ends_with("{prefix} ") {
+                    continue;
+                }
+                let after = &heading[at + "{prefix} ".len()..];
+                let key = if after.starts_with("{prefix}") {
+                    DEFAULT_PREFIX
+                } else {
+                    after.split_whitespace().next().expect("a key follows the prefix")
+                };
+                // Chinese prose after the prefix describes the prefix itself; the named keys use ASCII.
+                if key.is_ascii() {
+                    keys.push(key.to_string());
+                }
+            }
+        }
+        assert!(keys.len() > 20, "{lang}: the walk names real keys");
+        assert!(
+            keys.iter().any(|key| key == "!"),
+            "{lang}: teach sending a tab to its own window"
+        );
+        for key in keys {
+            let action = &defaults
+                .bindings()
+                .iter()
+                .find(|b| b.key.human() == key)
+                .unwrap_or_else(|| panic!("{lang}: unknown prefix key {key}"))
+                .action;
+            if let Some((_, reason)) = off_mentions.iter().find(|(off, _)| *off == key) {
+                assert!(!reason.is_empty());
+                assert_eq!(classify_window1(action), HubVerb::Off);
+                continue;
+            }
+            assert_ne!(classify_window1(action), HubVerb::Off, "{lang}: {key}");
+            if chat_keys.contains(&key.as_str()) {
+                assert_ne!(classify_module(action), ModuleVerb::Off, "{lang}: chat key {key}");
+                assert_ne!(
+                    classify_module(action),
+                    ModuleVerb::LogOnly,
+                    "{lang}: chat key {key} must act"
+                );
+            }
+        }
+    }
+}
+
+#[test]
+fn compositor_checks_point_at_unfinished_exercises_for_every_prefix() {
+    for prefix in PREFIXES {
+        let lessons = compositor_lessons_for(prefix);
+        for (lang, text, checks) in &lessons {
+            let expect = expect_of(checks);
+            assert_eq!(expect.len(), 6, "{lang}: lesson 6 is reading only");
+            for (n, want) in expect {
+                let line = text.lines().nth(n - 1).expect("exercise line exists");
+                assert_ne!(line, want, "{lang} {prefix}: starts unfinished");
+                assert_eq!(completed(line, &want), want, "{lang} {prefix}: line {n}");
+            }
+        }
+        let answers = |checks: &str| {
+            expect_of(checks)
+                .values()
+                .map(|want| {
+                    want.rsplit_once(&format!("{prefix} "))
+                        .map_or(want.clone(), |(_, key)| key.to_string())
+                })
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(answers(&lessons[0].2), answers(&lessons[1].2));
+    }
+}
+
+#[test]
+fn compositor_translation_follows_english_and_names_the_same_keys() {
+    let [(_, en, ec), (_, zh, zc)] = compositor_lessons_for(DEFAULT_PREFIX);
+    let mut en_keys = prefix_keys(&en, &ec);
+    let mut zh_keys = prefix_keys(&zh, &zc);
+    en_keys.sort();
+    zh_keys.sort();
+    assert_eq!(en_keys, zh_keys);
+    let en = crate::source_scan::read_required("core/src/tutor/lessons/en/compositor.tutor").text;
+    let json: serde_json::Value = serde_json::from_str(&zc).unwrap();
+    assert_eq!(json["translated-from"]["file"], "en/compositor.tutor");
+    assert_eq!(
+        json["translated-from"]["sha256"],
+        format!("{:x}", Sha256::digest(en.as_bytes()))
+    );
+}
+
+#[test]
+fn eitri_lesson_6_teaches_the_plain_float_keys() {
+    for (lang, text, checks) in lessons() {
+        let start = if lang == "en" { "# Lesson 6:" } else { "# 第 6 课：" };
+        let section = text.split(start).nth(1).unwrap().split("\n# ").next().unwrap();
+        for key in ["F", "_", "S"] {
+            assert!(
+                section.contains(&format!("`Ctrl+b {key}`")),
+                "{lang}: lesson 6 teaches {key}"
+            );
+        }
+        assert!(
+            expect_of(&checks).values().any(|want| want.ends_with("Ctrl+b F")),
+            "{lang}: float exercise uses F"
+        );
+    }
+}
+
+#[test]
+fn neither_lesson_set_carries_the_static_compositor_note() {
+    for (lang, text, _) in lessons().into_iter().chain(compositor_lessons_for(DEFAULT_PREFIX)) {
+        for old in ["only show a hint", "只会显示提示"] {
+            assert!(!text.contains(old), "{lang}: stale mode note");
+        }
+    }
+}
+
+#[test]
+fn installer_uses_the_mode_before_the_first_session_and_keeps_it_on_retry() {
+    use crate::compositor::mode::Mode;
+    for mode in [None, Some(Mode::Eitri), Some(Mode::Compositor)] {
+        let editor = Rc::new(FakeEditor::default());
+        let mut tutor = installer(&editor);
+        if let Some(mode) = mode {
+            tutor.set_mode(mode);
+        }
+        tutor.set_prefix("Ctrl+Space".to_string());
+        editor.target.set(Some(1));
+        let now = Instant::now();
+        tutor.editor_session(now);
+        let expected = if mode == Some(Mode::Compositor) {
+            compositor_lessons_for("Ctrl+Space")
+        } else {
+            lessons_for("Ctrl+Space")
+        };
+        let check = |opts: &Value| {
+            let sent = sent_files(opts);
+            for (lang, text, _) in &expected {
+                assert_eq!(sent[&format!("tutor/{lang}/eitri.tutor")], *text);
+            }
+        };
+        check(&editor.calls.borrow()[0].0);
+        editor.answer(Ok(early()));
+        let again = tutor.poll(now).unwrap();
+        tutor.poll(again);
+        check(&editor.calls.borrow()[0].0);
+        editor.answer(Ok(done(&[])));
+        tutor.poll(again);
+        editor.target.set(Some(2));
+        tutor.editor_session(again);
+        check(&editor.calls.borrow()[0].0);
     }
 }
 
@@ -281,7 +465,7 @@ fn the_translation_follows_the_current_english_lessons() {
 #[test]
 fn every_line_is_within_80_columns() {
     for prefix in PREFIXES {
-        for (lang, lessons, _) in lessons_for(prefix) {
+        for (lang, lessons, _) in lessons_for(prefix).into_iter().chain(compositor_lessons_for(prefix)) {
             for (i, line) in lessons.lines().enumerate() {
                 let width: usize = line
                     .chars()
@@ -316,13 +500,42 @@ fn the_files_are_laid_out_as_nvim_looks_for_tutorials_and_the_snippet_writes_eac
     }
 }
 
-/// A directory of the test's own under the temp directory, of exactly `mode`.
-fn scratch(label: &str, mode: u32) -> PathBuf {
+/// A directory of the test's own, of exactly `mode`, beside the test binary in the target dir rather than in `/tmp`
+/// (a build host's `/tmp` is a tmpfs whose inodes every suite shares). Removed when it drops, a panic included.
+fn scratch(label: &str, mode: u32) -> Scratch {
     use std::os::unix::fs::PermissionsExt;
-    let dir = std::env::temp_dir().join(format!("nv-tutor-test-{label}-{}", uuid::Uuid::new_v4().simple()));
+    let exe = std::env::current_exe().unwrap();
+    let root = exe.parent().and_then(Path::parent).unwrap().join("tutor-tests");
+    std::fs::create_dir_all(&root).unwrap();
+    let dir = root.join(format!("{label}-{}", uuid::Uuid::new_v4().simple()));
     std::fs::create_dir(&dir).unwrap_or_else(|e| panic!("create_dir {dir:?}: {e}"));
     std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(mode)).unwrap();
-    dir
+    Scratch(dir)
+}
+
+/// [`scratch`]'s directory, removed with whatever is left in it when the test ends however it ends.
+struct Scratch(PathBuf);
+
+impl std::ops::Deref for Scratch {
+    type Target = PathBuf;
+    fn deref(&self) -> &PathBuf {
+        &self.0
+    }
+}
+
+impl AsRef<Path> for Scratch {
+    fn as_ref(&self) -> &Path {
+        &self.0
+    }
+}
+
+impl Drop for Scratch {
+    fn drop(&mut self) {
+        use std::os::unix::fs::PermissionsExt;
+        // A test may have left it with a mode its owner cannot list.
+        let _ = std::fs::set_permissions(&self.0, std::fs::Permissions::from_mode(0o700));
+        let _ = std::fs::remove_dir_all(&self.0);
+    }
 }
 
 fn mode(path: &Path) -> u32 {
@@ -382,7 +595,7 @@ fn a_temp_dir_others_can_rename_entries_in_is_refused_and_nothing_is_made() {
 fn a_private_runtime_dir_is_preferred_and_a_loose_or_relative_one_is_not() {
     let tmp = scratch("tmp", 0o755);
     let runtime = scratch("runtime", 0o700);
-    let dir = TutorDir::in_base(Some(&runtime), &tmp).expect("made");
+    let dir = TutorDir::in_base(Some(runtime.as_path()), &tmp).expect("made");
     assert_eq!(dir.path().parent(), Some(runtime.as_path()));
     dir.cleanup();
 
@@ -390,7 +603,7 @@ fn a_private_runtime_dir_is_preferred_and_a_loose_or_relative_one_is_not() {
         use std::os::unix::fs::PermissionsExt;
         std::fs::set_permissions(&runtime, std::fs::Permissions::from_mode(0o755)).unwrap();
     }
-    let dir = TutorDir::in_base(Some(&runtime), &tmp).expect("made");
+    let dir = TutorDir::in_base(Some(runtime.as_path()), &tmp).expect("made");
     assert_eq!(
         dir.path().parent(),
         Some(tmp.as_path()),
@@ -399,7 +612,7 @@ fn a_private_runtime_dir_is_preferred_and_a_loose_or_relative_one_is_not() {
     dir.cleanup();
 
     let relative = Path::new("relative-runtime-dir");
-    assert_eq!(TutorDir::base(Some(relative), &tmp).unwrap(), tmp);
+    assert_eq!(TutorDir::base(Some(relative), &tmp).unwrap(), *tmp);
     std::fs::remove_dir(&runtime).unwrap();
     std::fs::remove_dir(&tmp).unwrap();
 }
@@ -488,7 +701,9 @@ fn early() -> Value {
 }
 
 fn installer(editor: &Rc<FakeEditor>) -> TutorInstaller {
-    let mut tutor = TutorInstaller::with_dir(Box::new(|| TutorDir::in_dir(&std::env::temp_dir()).ok()));
+    // The installer owns the scratch through its closure, so the lessons directory goes with it.
+    let base = scratch("installer", 0o700);
+    let mut tutor = TutorInstaller::with_dir(Box::new(move || TutorDir::in_dir(&base).ok()));
     tutor.set_editor(editor.clone());
     tutor
 }
@@ -509,7 +724,7 @@ fn each_nvim_session_is_installed_once_with_the_lessons_directory() {
     {
         let calls = editor.calls.borrow();
         let opts = &calls[0].0;
-        assert_eq!(opts, &install_opts(&dir, DEFAULT_PREFIX));
+        assert_eq!(opts, &install_opts(&dir, DEFAULT_PREFIX, None));
         let dir_arg = opts.as_map().unwrap().iter().find(|(k, _)| k.as_str() == Some("dir"));
         assert_eq!(
             dir_arg.and_then(|(_, v)| v.as_slice()),
@@ -525,7 +740,7 @@ fn each_nvim_session_is_installed_once_with_the_lessons_directory() {
             .and_then(|(_, v)| v.as_map())
             .expect("the lessons go with the call");
         assert_eq!(files.len(), FILES.len());
-        for (rel, text) in super::files(DEFAULT_PREFIX) {
+        for (rel, text) in super::files(DEFAULT_PREFIX, None) {
             let sent = files
                 .iter()
                 .find(|(k, _)| k.as_str() == Some(rel))
@@ -686,7 +901,7 @@ fn the_installer_sends_the_stock_prefix_until_it_is_told_another() {
     editor.target.set(Some(2));
     tutor.editor_session(now);
     let second = sent_files(&editor.calls.borrow()[0].0);
-    for (rel, text) in super::files("Ctrl+Space") {
+    for (rel, text) in super::files("Ctrl+Space", None) {
         assert_eq!(second[rel], text, "{rel}");
     }
     assert!(second["tutor/zh/eitri.tutor"].contains("`Ctrl+Space ?`"));
@@ -745,7 +960,7 @@ fn no_placeholder_survives() {
     assert!(LESSONS_EN.contains(prefix_text::PLACEHOLDER));
     assert!(LESSONS_ZH.contains(prefix_text::PLACEHOLDER));
     for prefix in PREFIXES {
-        for (lang, lessons, checks) in lessons_for(prefix) {
+        for (lang, lessons, checks) in lessons_for(prefix).into_iter().chain(compositor_lessons_for(prefix)) {
             assert!(!lessons.contains(prefix_text::PLACEHOLDER), "{lang} {prefix}");
             assert!(!checks.contains(prefix_text::PLACEHOLDER), "{lang} {prefix}");
         }
@@ -755,24 +970,27 @@ fn no_placeholder_survives() {
 #[test]
 fn every_json_stays_valid() {
     for prefix in PREFIXES {
-        for (lang, _, checks) in lessons_for(prefix) {
-            let json: serde_json::Value =
-                serde_json::from_str(&checks).unwrap_or_else(|e| panic!("{lang} {prefix}: {e}"));
-            let source = if lang == "en" { CHECKS_EN } else { CHECKS_ZH };
-            let source: serde_json::Value = serde_json::from_str(source).unwrap();
-            let lines = |v: &serde_json::Value| v["expect"].as_object().unwrap().keys().cloned().collect::<Vec<_>>();
-            assert_eq!(
-                lines(&json),
-                lines(&source),
-                "{lang} {prefix}: the check lines never move"
-            );
-            assert_eq!(json["translated-from"], source["translated-from"], "{lang} {prefix}");
-            for want in json["expect"].as_object().unwrap().values() {
-                let want = want.as_str().unwrap();
-                assert!(
-                    want.contains(prefix) || want.starts_with("eitri.keymap.prefix"),
-                    "{lang}: {want:?} names the prefix {prefix}"
+        for sources in [&FILES, &COMPOSITOR_FILES] {
+            for (path, source) in sources.iter().filter(|(path, _)| path.ends_with(".json")) {
+                let checks = substitute_checks(source, prefix);
+                let json: serde_json::Value =
+                    serde_json::from_str(&checks).unwrap_or_else(|e| panic!("{path} {prefix}: {e}"));
+                let source: serde_json::Value = serde_json::from_str(source).unwrap();
+                let lines =
+                    |v: &serde_json::Value| v["expect"].as_object().unwrap().keys().cloned().collect::<Vec<_>>();
+                assert_eq!(
+                    lines(&json),
+                    lines(&source),
+                    "{path} {prefix}: the check lines never move"
                 );
+                assert_eq!(json["translated-from"], source["translated-from"], "{path} {prefix}");
+                for want in json["expect"].as_object().unwrap().values() {
+                    let want = want.as_str().unwrap();
+                    assert!(
+                        want.contains(prefix) || want.starts_with("eitri.keymap.prefix"),
+                        "{path}: {want:?} names the prefix {prefix}"
+                    );
+                }
             }
         }
     }
@@ -802,23 +1020,44 @@ const STOCK_WORDS_ZH: &str = include_str!("lessons/zh/stock-words.txt");
 /// with whitespace normalised (the Chinese lessons without any, since a wrap there falls between characters).
 const REWRITTEN_EN: &[(&str, &str)] = &[
     (
-        "** Ctrl+b % opens a module to the right, Ctrl+b \" below. **",
-        "** Ctrl+b % opens a module to the right, Ctrl+b \" below. ** \
-         NOTE: On Hyprland, sway and niri, Eitri leaves tiling to your window manager \
-         by default. The split and zoom keys here only show a hint in that mode. \
-         To use them, add `eitri.config.set(\"window.tiling\", \"eitri\")` to your \
-         init.lua and open a new Eitri window.",
+        "6. Press `Ctrl+b s`.",
+        "The Alt chords after the prefix do the same: Alt+Shift+Space for `Ctrl+b F`, Alt+_ for `Ctrl+b \
+         _`, and Alt+- for `Ctrl+b S`. 6. Press `Ctrl+b s`.",
     ),
     (
-        "** A float sits above the other modules, the scratchpad keeps floats out of \
-         sight, and a workspace keeps a whole arrangement under a name. **",
-        "** A float sits above the other modules, the scratchpad keeps floats out of \
-         sight, and a workspace keeps a whole arrangement under a name. ** \
-         NOTE: On Hyprland, sway and niri, Eitri leaves tiling to your window manager \
-         by default. The float, scratchpad and workspace keys only show a hint \
-         in that mode. To use them, add \
-         `eitri.config.set(\"window.tiling\", \"eitri\")` to your init.lua and open \
-         a new Eitri window.",
+        "2. Press `Ctrl+b Alt+Shift+Space`. The terminal floats in the middle of the window, above the \
+         others. The editor never floats.",
+        "2. Press `Ctrl+b F`. The terminal floats in the middle of the window, above the others. The \
+         editor never floats.",
+    ),
+    (
+        "3. Press `Ctrl+b Alt+_` (on most keyboards that is Alt, Shift and the minus key). The float \
+         goes to the scratchpad, out of sight. Its name in the top bar now ends with `⌁`, and its shell \
+         keeps running.",
+        "3. Press `Ctrl+b _`. The float goes to the scratchpad, out of sight. Its name in the top bar \
+         now ends with `⌁`, and its shell keeps running.",
+    ),
+    (
+        "4. Press `Ctrl+b Alt+-`. It comes back. Press it again and it goes away;",
+        "4. Press `Ctrl+b S`. It comes back. Press it again and it goes away;",
+    ),
+    (
+        "5. With the keys on the float, press `Ctrl+b Alt+Shift+Space` to put it",
+        "5. With the keys on the float, press `Ctrl+b F` to put it",
+    ),
+    (
+        "them to Ctrl+Alt chords: with it, lesson 6's Ctrl+b Alt+Shift+Space becomes Ctrl+b \
+         Ctrl+Alt+Space, and its Ctrl+b Alt+_ becomes Ctrl+b _.",
+        "them to Ctrl+Alt chords: with it, the alias Ctrl+b Alt+Shift+Space becomes Ctrl+b \
+         Ctrl+Alt+Space. Lesson 6's plain keys need no such change.",
+    ),
+    (
+        "`Ctrl+b Alt+Shift+Space` float, or put back",
+        "`Ctrl+b F` float, or put back",
+    ),
+    (
+        "`Ctrl+b Alt+_`, `Ctrl+b Alt+-` to the scratchpad, and back",
+        "`Ctrl+b _`, `Ctrl+b S` to the scratchpad, and back",
     ),
     (
         "The keys are written for the default setup, with `Ctrl+b` as the prefix. If Eitri took another prefix \
@@ -845,18 +1084,37 @@ const REWRITTEN_EN: &[(&str, &str)] = &[
 ];
 const REWRITTEN_ZH: &[(&str, &str)] = &[
     (
-        "**Ctrl+b%在右边打开一个模块，Ctrl+b\"在下面打开。**",
-        "**Ctrl+b%在右边打开一个模块，Ctrl+b\"在下面打开。**\
-         注意：在Hyprland、sway和niri上，Eitri默认把平铺交给窗口管理器。\
-         这种模式下，分割和放大的键只会显示提示。要启用它们，在init.lua里加上\
-         `eitri.config.set(\"window.tiling\",\"eitri\")`，再打开一个Eitri窗口。",
+        "6.按`Ctrl+bs`。",
+        "前缀后的Alt组合键作用相同：Alt+Shift+Space对应`Ctrl+bF`，Alt+_对应`Ctrl+b_`，Alt+-对应`Ctrl+bS`。6.按`\
+         Ctrl+bs`。",
     ),
     (
-        "**浮动窗口在其他模块之上，便笺板把浮动窗口收起来，工作区以一个名字保存一整套排布。**",
-        "**浮动窗口在其他模块之上，便笺板把浮动窗口收起来，工作区以一个名字保存一整套排布。**\
-         注意：在Hyprland、sway和niri上，Eitri默认把平铺交给窗口管理器。\
-         这种模式下，浮动窗口、便笺板和工作区的键只会显示提示。要启用它们，\
-         在init.lua里加上`eitri.config.set(\"window.tiling\",\"eitri\")`，再打开一个Eitri窗口。",
+        "2.按`Ctrl+bAlt+Shift+Space`。终端浮在窗口中间、其他模块之上。编辑器从不浮动。",
+        "2.按`Ctrl+bF`。终端浮在窗口中间、其他模块之上。编辑器从不浮动。",
+    ),
+    (
+        "3.按`Ctrl+bAlt+_`（在大多数键盘上就是Alt、Shift和减号键）。浮动窗口进了便笺板，看不见了。它在顶栏里的名字现在以`⌁`结尾，它的shell照常运行。",
+        "3.按`Ctrl+b_`。浮动窗口进了便笺板，看不见了。它在顶栏里的名字现在以`⌁`结尾，它的shell照常运行。",
+    ),
+    (
+        "4.按`Ctrl+bAlt+-`。它回来了。再按一次，它又收起来；再按一次，又回来。",
+        "4.按`Ctrl+bS`。它回来了。再按一次，它又收起来；再按一次，又回来。",
+    ),
+    (
+        "5.按键在浮动窗口上时，按`Ctrl+bAlt+Shift+Space`把它放回其他模块中间。",
+        "5.按键在浮动窗口上时，按`Ctrl+bF`把它放回其他模块中间。",
+    ),
+    (
+        "等等），这个示例把它们改成了Ctrl+Alt组合键：用了它，第6课的Ctrl+bAlt+Shift+Space变成Ctrl+bCtrl+Alt+Space，Ctrl+bAlt+_变成Ctrl+b_。",
+        "等等），这个示例把它们改成了Ctrl+Alt组合键：用了它，别名Ctrl+bAlt+Shift+Space变成Ctrl+bCtrl+Alt+Space。第6课的普通按键不用这样改。",
+    ),
+    (
+        "`Ctrl+bAlt+Shift+Space`浮起来，或者放回去",
+        "`Ctrl+bF`浮起来，或者放回去",
+    ),
+    (
+        "`Ctrl+bAlt+_`、`Ctrl+bAlt+-`收进便笺板，再叫回来",
+        "`Ctrl+b_`、`Ctrl+bS`收进便笺板，再叫回来",
     ),
     (
         "按键按默认设置来写，前缀是`Ctrl+b`。如果Eitri从你的tmux配置或init.lua里拿到了别的前缀，本教程写Ctrl+b的地方就\

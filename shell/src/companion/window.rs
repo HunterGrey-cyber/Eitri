@@ -707,7 +707,7 @@ pub(crate) fn build(app: &Application, start: &Start) -> Rc<CompanionWindow> {
     let hint = crate::hint::HintCoordinator::new(crate::hint::HintWidgets {
         window: window.clone(),
         overlay: overlay.clone(),
-        top_items: vec![],
+        top_items: Rc::default(),
         editor: None,
         agent_widget: agent_widget.clone(),
         modules: {

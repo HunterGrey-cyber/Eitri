@@ -55,6 +55,8 @@ pub(super) enum EditorThen {
     Answer { view: ViewId, request_id: String },
     /// The window's own request, with no page to answer: the answer is left in the cell for the caller that asked.
     Report(std::rc::Rc<std::cell::RefCell<Option<Result<(), String>>>>),
+    /// The window's own view, asked for without waiting: `failed` is told why, if the editor did not take it.
+    Notify(std::rc::Rc<dyn Fn(&str)>),
     /// A draft edit of `tab`: on its way, the draft is `text` and the edit is polled until it comes
     /// back; refused, the edit is undone. Then the page's request is answered.
     Draft {
@@ -73,6 +75,11 @@ pub(super) fn editor_answered(state: &mut AgentPanelState, then: EditorThen, ans
     match then {
         EditorThen::Report(slot) => {
             *slot.borrow_mut() = Some(answer);
+        }
+        EditorThen::Notify(failed) => {
+            if let Err(why) = answer {
+                failed(&why);
+            }
         }
         EditorThen::Answer { view, request_id } => {
             out.send(
@@ -330,10 +337,26 @@ pub(super) const MAX_VIEW_JOBS: usize = MAX_REVIEW_JOBS;
 
 /// One view's scratch file being written on a worker thread.
 pub(super) struct PendingView {
-    pub(super) request_id: String,
-    /// The page that asked: the answer goes there, whether the editor took the view or the write failed.
-    pub(super) view: ViewId,
+    pub(super) asker: ViewAsker,
     pub(super) rx: mpsc::Receiver<std::io::Result<eitri_core::scratch::ScratchRequest>>,
+}
+
+/// Who asked for a view, and so who hears how it went.
+pub(super) enum ViewAsker {
+    /// `view`'s page, as `request_id`: the answer goes there, whether the editor took the view or the write failed.
+    Page { view: ViewId, request_id: String },
+    /// The window itself, with no page to answer: `failed` is told why the view did not open.
+    Window { failed: std::rc::Rc<dyn Fn(&str)> },
+}
+
+impl ViewAsker {
+    /// The page this view answers, if a page asked.
+    pub(super) fn page(&self) -> Option<ViewId> {
+        match self {
+            Self::Page { view, .. } => Some(*view),
+            Self::Window { .. } => None,
+        }
+    }
 }
 
 /// Writes `text` as a scratch file on a worker thread and has the tick hand nvim the view (see [`poll_view_jobs`]):
@@ -342,8 +365,7 @@ pub(super) struct PendingView {
 /// a view of its own, shown after the earlier one, so the last press is the one on screen.
 pub(super) fn start_view_job(
     state: &mut AgentPanelState,
-    view: ViewId,
-    request_id: &str,
+    asker: ViewAsker,
     title: &str,
     text: String,
 ) -> Result<(), String> {
@@ -361,11 +383,7 @@ pub(super) fn start_view_job(
             .spawn(job)
             .map(|_| ())
     })?;
-    state.view_jobs.push(PendingView {
-        request_id: request_id.to_string(),
-        view,
-        rx,
-    });
+    state.view_jobs.push(PendingView { asker, rx });
     Ok(())
 }
 
@@ -399,15 +417,19 @@ pub(super) fn poll_view_jobs(state: &mut AgentPanelState, out: &mut Outbox) {
             }
         };
         let job = state.view_jobs.remove(0);
-        match written {
-            Ok(request) => out.effect(Effect::AskEditor {
+        match (written, job.asker) {
+            (Ok(request), ViewAsker::Page { view, request_id }) => out.effect(Effect::AskEditor {
                 request,
-                then: EditorThen::Answer {
-                    view: job.view,
-                    request_id: job.request_id,
-                },
+                then: EditorThen::Answer { view, request_id },
             }),
-            Err(why) => out.send(job.view, serialize_command_result_for_js(&job.request_id, Err(&why))),
+            (Ok(request), ViewAsker::Window { failed }) => out.effect(Effect::AskEditor {
+                request,
+                then: EditorThen::Notify(failed),
+            }),
+            (Err(why), ViewAsker::Page { view, request_id }) => {
+                out.send(view, serialize_command_result_for_js(&request_id, Err(&why)))
+            }
+            (Err(why), ViewAsker::Window { failed }) => failed(&why),
         }
     }
 }
@@ -942,6 +964,73 @@ mod tests {
         root.cleanup();
     }
 
+    /// The window's own view (the init.lua line of an offered page): the call returns with the write still to do, the
+    /// editor is asked from a tick once the file holds the text, and only a failure is reported.
+    #[test]
+    fn a_window_view_is_written_on_a_worker_and_reports_only_a_failure() {
+        let (handle, page, root, asked) = panel_with_recording_editor();
+        let failures: Rc<RefCell<Vec<String>>> = Rc::default();
+        let seen = failures.clone();
+        let text = "line\n".repeat(200_000);
+        let results = || {
+            page.sent
+                .borrow()
+                .iter()
+                .filter(|p| p.contains("command_result"))
+                .count()
+        };
+        let answered_before = results();
+        handle
+            .view_in_editor_later("init.lua line", text.clone(), move |why| {
+                seen.borrow_mut().push(why.to_string())
+            })
+            .unwrap();
+        assert!(
+            asked.borrow().is_empty(),
+            "the editor is asked from the tick, after the write"
+        );
+        assert_eq!(handle.state.borrow().view_jobs.len(), 1);
+        tick_until(&handle, "the view never reached the editor", || {
+            !asked.borrow().is_empty()
+        });
+        let request = asked.borrow()[0].clone();
+        assert_eq!(request["op"], "view");
+        assert_eq!(
+            std::fs::read_to_string(request["path"].as_str().unwrap()).unwrap(),
+            text
+        );
+        assert!(failures.borrow().is_empty(), "{:?}", failures.borrow());
+        assert!(handle.state.borrow().view_jobs.is_empty());
+        assert_eq!(results(), answered_before, "no page asked, so none is answered");
+
+        // A write that failed is the window's to hear about, and the editor is not asked.
+        let (tx, rx) = mpsc::channel();
+        let seen = failures.clone();
+        handle.state.borrow_mut().view_jobs.push(PendingView {
+            asker: ViewAsker::Window {
+                failed: Rc::new(move |why: &str| seen.borrow_mut().push(why.to_string())),
+            },
+            rx,
+        });
+        tx.send(Err(std::io::Error::new(
+            std::io::ErrorKind::StorageFull,
+            "no space left on device",
+        )))
+        .unwrap();
+        tick_until(&handle, "the failure never arrived", || !failures.borrow().is_empty());
+        assert_eq!(asked.borrow().len(), 1, "the editor was not asked again");
+        assert!(
+            failures.borrow()[0].contains("no space left on device"),
+            "{:?}",
+            failures.borrow()
+        );
+        let panel_scratch = handle.state.borrow_mut().scratch.take();
+        if let Some(dir) = panel_scratch {
+            dir.cleanup();
+        }
+        root.cleanup();
+    }
+
     /// A second press while the first is still being written is a view of its own, shown after the first, so the
     /// last press is what ends up on screen -- however the two writes finish.
     #[test]
@@ -952,8 +1041,10 @@ mod tests {
             let (tx, rx) = mpsc::channel();
             senders.push(tx);
             handle.state.borrow_mut().view_jobs.push(PendingView {
-                request_id: id.into(),
-                view: ViewId::BASE,
+                asker: ViewAsker::Page {
+                    view: ViewId::BASE,
+                    request_id: id.into(),
+                },
                 rx,
             });
         }
@@ -1023,8 +1114,10 @@ mod tests {
         let (dead_tx, dead_rx) = mpsc::channel::<std::io::Result<eitri_core::scratch::ScratchRequest>>();
         for (id, rx) in [("failed", failed_rx), ("dead", dead_rx)] {
             handle.state.borrow_mut().view_jobs.push(PendingView {
-                request_id: id.into(),
-                view: ViewId::BASE,
+                asker: ViewAsker::Page {
+                    view: ViewId::BASE,
+                    request_id: id.into(),
+                },
                 rx,
             });
         }
@@ -1090,8 +1183,10 @@ mod tests {
             let (tx, rx) = mpsc::channel();
             senders.push(tx);
             handle.state.borrow_mut().view_jobs.push(PendingView {
-                request_id: format!("busy{i}"),
-                view: ViewId::BASE,
+                asker: ViewAsker::Page {
+                    view: ViewId::BASE,
+                    request_id: format!("busy{i}"),
+                },
                 rx,
             });
         }
@@ -1129,8 +1224,10 @@ mod tests {
             let (tx, rx) = mpsc::channel();
             senders.push(tx);
             handle.state.borrow_mut().view_jobs.push(PendingView {
-                request_id: id.into(),
-                view: page_view,
+                asker: ViewAsker::Page {
+                    view: page_view,
+                    request_id: id.into(),
+                },
                 rx,
             });
         }
@@ -1140,7 +1237,10 @@ mod tests {
             .borrow()
             .view_jobs
             .iter()
-            .map(|job| job.request_id.clone())
+            .map(|job| match &job.asker {
+                ViewAsker::Page { request_id, .. } => request_id.clone(),
+                ViewAsker::Window { .. } => "window".to_string(),
+            })
             .collect();
         assert_eq!(left, vec!["v-base".to_string()], "only the idle page's view goes");
         clear(&[&base, &second]);

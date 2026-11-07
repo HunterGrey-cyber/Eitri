@@ -129,10 +129,18 @@ pub(crate) fn apply_tab_call(agent: &AgentPanelHandle, call: &TabCall) -> bool {
     tab_call(agent, call)
 }
 
-/// Every Lua panel's module, its view as `init.lua` registered it, its URL and its crash guard: what
-/// a reload loads again and what a kill ends. A plugin page built after startup has its own view in
-/// `PluginPanels`, which is asked first.
-pub(crate) type LuaPages = Rc<Vec<(ModuleId, gtk4::Widget, String, Rc<RefCell<WebViewCrashGuard>>)>>;
+/// One Lua panel's module, its view as it registered it, its URL and its crash guard.
+pub(crate) type LuaPage = (ModuleId, gtk4::Widget, String, Rc<RefCell<WebViewCrashGuard>>);
+
+/// Every Lua panel's [`LuaPage`]: what a reload loads again and what a kill ends. A page built after its
+/// registration has its own view in `PluginPanels`, which is asked first. It grows when a plugin page is loaded
+/// into the running window; every read clones its entry out ([`lua_page`]), so no borrow outlives the lookup.
+pub(crate) type LuaPages = Rc<RefCell<Vec<LuaPage>>>;
+
+/// `module`'s entry in `pages`, cloned.
+pub(crate) fn lua_page(pages: &LuaPages, module: &ModuleId) -> Option<LuaPage> {
+    pages.borrow().iter().find(|(id, _, _, _)| id == module).cloned()
+}
 
 /// One of the window's pools of panes or pages -- the terminals, the extra chat views' pages -- shared by the
 /// services, the surface constructors and the shell's hooks. Every read hands out clones and every write is one call,
@@ -289,7 +297,8 @@ pub(crate) struct Teardown {
     pub(crate) theme_feed: Option<crate::theme::feed::ThemeFeed>,
     pub(crate) context_feed: Option<eitri_core::editor_context::feed::EditorContextFeed>,
     pub(crate) nvim_keys_feed: Option<eitri_core::nvim_keys::feed::NvimKeysFeed>,
-    pub(crate) follow_socket: Option<eitri_core::plugin::follow_feed::FollowSocket>,
+    /// Bound at start or by the first loaded page that follows the editor (`crate::plugin_load`).
+    pub(crate) follow_socket: crate::plugin_load::FollowSlot,
     /// The tutorial's lessons, written for this window's nvim; the next window's sweep is only a backstop.
     pub(crate) tutor: Option<Rc<crate::tutor::Tutor>>,
     /// The window's open socket and what waits on it; `None` in a window that holds none.
@@ -364,7 +373,7 @@ impl Teardown {
         if let Some(feed) = &self.nvim_keys_feed {
             feed.cleanup();
         }
-        if let Some(socket) = &self.follow_socket {
+        if let Some(socket) = self.follow_socket.borrow().as_ref() {
             socket.cleanup();
         }
         if let Some(requests) = &self.open_requests {
@@ -414,6 +423,8 @@ pub(crate) struct Services {
     /// A window over a person's own nvim (`eitri open`): where its editor's detach and the close's ask are carried
     /// out. `None` in every other window.
     pub(crate) takeover: Option<Rc<crate::takeover::WindowSide>>,
+    /// Where a plugin page is loaded into the running window; `None` in a window that takes no such load.
+    pub(crate) late_loads: Option<Rc<crate::plugin_load::LateLoads>>,
 }
 
 /// [`Services::review_hold`]: the session, whether to hold, and whether this window holds the session after a
@@ -905,6 +916,22 @@ impl ServiceSet for Services {
 
     fn plugin(&self, op: &PluginOp) -> Result<(), String> {
         match op {
+            // On a worker; its answer is `PluginEvent::Loaded` or `LoadFailed`, whichever way it ends.
+            PluginOp::Load { win, name } => {
+                match &self.late_loads {
+                    Some(loads) => loads.load(*win, name),
+                    None => {
+                        if let Some(sink) = self.sink.upgrade() {
+                            sink.post(HostEvent::Plugin(eitri_core::wm::PluginEvent::LoadFailed {
+                                win: *win,
+                                name: name.clone(),
+                                why: "plugins load in window 1".into(),
+                            }));
+                        }
+                    }
+                }
+                Ok(())
+            }
             PluginOp::Freeze { win, module, mv } => {
                 if let Err(why) = self.plugin_panels.freeze(*win, module, *mv) {
                     if let Some(sink) = self.sink.upgrade() {
@@ -936,9 +963,7 @@ impl ServiceSet for Services {
                     .plugin_panels
                     .webview(module)
                     .or_else(|| {
-                        self.lua_pages
-                            .iter()
-                            .find(|(id, _, _, _)| id == module)
+                        lua_page(&self.lua_pages, module)
                             .and_then(|(_, widget, _, _)| widget.downcast_ref::<webkit6::WebView>().cloned())
                     })
                     .ok_or_else(|| format!("{module}: no page view"))?;
@@ -953,6 +978,9 @@ impl ServiceSet for Services {
             }
             // Every plugin task ends with the window; the application waits for them, at most the grace.
             PluginOp::ShutdownAll { .. } => {
+                if let Some(loads) = &self.late_loads {
+                    loads.window_closing();
+                }
                 self.plugin_panels.shutdown(&self.app()?);
                 Ok(())
             }
@@ -974,7 +1002,7 @@ impl ServiceSet for Services {
             PluginOp::Reload {
                 module, reset_guard, ..
             } => {
-                let Some((_, widget, url, crash_guard)) = self.lua_pages.iter().find(|(m, _, _, _)| m == module) else {
+                let Some((_, widget, url, crash_guard)) = lua_page(&self.lua_pages, module) else {
                     return Err(format!("{module} is not a Lua panel"));
                 };
                 println!("[modules] {module}: shown again after a kill, starting it fresh");
@@ -984,7 +1012,7 @@ impl ServiceSet for Services {
                     .or_else(|| widget.downcast_ref::<webkit6::WebView>().cloned());
                 if let Some(webview) = webview {
                     use webkit6::prelude::*;
-                    webview.load_uri(url);
+                    webview.load_uri(&url);
                 }
                 // The manual recovery a give-up message points the user at (`prefix x`, then this panel's own
                 // key): the guard is armed again, so a later, unrelated crash is caught fresh rather than

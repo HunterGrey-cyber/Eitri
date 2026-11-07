@@ -238,12 +238,14 @@ fn decided_here(action: &Action) -> bool {
         | Action::Text(_)
         | Action::TextAll(_)
         | Action::AgentsNext
-        | Action::AgentsBack => true,
+        | Action::AgentsBack
+        | Action::PluginLoad { .. } => true,
     }
 }
 
 pub(super) fn one_of_each() -> Vec<Action> {
     vec![
+        Action::PluginLoad { name: "demo".into() },
         Action::Move(Direction::Left),
         Action::ContainerTabbed,
         Action::ContainerStacked,

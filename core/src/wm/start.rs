@@ -460,7 +460,11 @@ pub(super) fn event_window(event: &HostEvent) -> Option<WinId> {
             | EditorEvent::Followed { win, .. },
         )
         | HostEvent::Plugin(
-            PluginEvent::Frozen { win, .. } | PluginEvent::FreezeRefused { win, .. } | PluginEvent::Ready { win, .. },
+            PluginEvent::Frozen { win, .. }
+            | PluginEvent::FreezeRefused { win, .. }
+            | PluginEvent::Ready { win, .. }
+            | PluginEvent::Loaded { win, .. }
+            | PluginEvent::LoadFailed { win, .. },
         )
         | HostEvent::Chat(
             ChatEvent::Attention { win, .. }

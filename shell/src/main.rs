@@ -26,6 +26,7 @@ mod hint;
 mod host_clipboard;
 #[cfg(target_os = "linux")]
 mod ide_wiring;
+mod keymap_alt_mod;
 mod kill_pane;
 mod launch;
 mod layout;
@@ -40,6 +41,7 @@ mod open_requests;
 mod page_window;
 mod pane_switch;
 mod panel_super;
+mod plugin_load;
 mod plugin_page;
 mod plugin_panels;
 mod prefix_strip;
@@ -446,6 +448,7 @@ fn main() -> glib::ExitCode {
         let wm = eitri_core::compositor::detect(&|name: &str| std::env::var_os(name));
         compositor_mode::start_probe(wm);
     }
+    keymap_alt_mod::start_probe(matches!(start, linked_window::WindowStart::Full));
     let kind = AppKind::of(&start);
     let start = RefCell::new(Some(start));
     let app = build_application(kind);
@@ -1041,7 +1044,7 @@ fn build_ui(
 
     // The window config, the keymap, the plugins' panels, the module keys and the keys help; the config phase is
     // told what they built at the end of the block.
-    let config = match window_config::load(&lua_engine) {
+    let config = match window_config::load_with_alt_mod(&lua_engine, keymap_alt_mod::probe_now) {
         Ok(config) => config,
         Err(message) => {
             eprintln!("eitri: {message}");
@@ -1111,6 +1114,11 @@ fn build_ui(
     config.apply_to_panel(&agent_panel_handle);
     let keymap = config.keymap.clone();
     if let Some(tutor) = &tutor {
+        tutor.set_mode(if tiling == eitri_core::wm::window::Tiling::Hub {
+            eitri_core::compositor::mode::Mode::Compositor
+        } else {
+            eitri_core::compositor::mode::Mode::Eitri
+        });
         tutor.set_prefix(keymap.prefix().human());
     }
     for line in keymap.dropped_for_root() {
@@ -1389,7 +1397,7 @@ fn build_ui(
     };
     // A killed panel reloads its URL on reopening. Manual recovery resets the same shared guard
     // that its view's crash handler checks, including a deferred plugin page's handler.
-    let lua_pages: gtk_host_services::LuaPages = Rc::new({
+    let lua_pages: gtk_host_services::LuaPages = Rc::new(RefCell::new({
         let panels = lua_engine.panels.borrow();
         panels
             .entries()
@@ -1407,7 +1415,7 @@ fn build_ui(
                 )
             })
             .collect()
-    });
+    }));
     // The plugin modules that start hidden: the window never places them by itself. Each has its host, its
     // page entry and its module key from startup; its page is built the first time it is shown, and its
     // first show opens it by its own rule (the controller's `open_plugin_module`).
@@ -2391,6 +2399,38 @@ fn build_ui(
             None => Rc::new(linked_window::NoEditor),
         },
     };
+    // A plugin page loaded into the running window (`plugin_load`): only a full window 1 in Eitri's own tiling takes
+    // one, and only there does the empty tab offer the shipped pages. The window's follow socket, bound above when a
+    // plugin from `init.lua` wants it, is kept in one slot with whatever a later page binds, for the teardown.
+    let follow_slot: plugin_load::FollowSlot = Rc::default();
+    let window_kind = plugin_load::WindowKind {
+        tiling,
+        owns_editor,
+        module_window: module_window.is_some(),
+        beside: pair.is_beside(),
+    };
+    let late_loads = window_kind.takes_loads().then(|| {
+        plugin_load::LateLoads::new(
+            plugin_load::LateDeps {
+                engine: lua_engine.clone(),
+                keymap: keymap.clone(),
+                plugin_panels: plugin_panels.clone(),
+                lua_pages: lua_pages.clone(),
+                sink: {
+                    let sink: Rc<dyn eitri_core::wm::HostSink> = driver.clone();
+                    Rc::downgrade(&sink)
+                },
+                state_root: eitri_core::plugin::state::PluginStore::eitri_root_from_env(),
+                home: std::env::var_os("HOME").map(PathBuf::from),
+                scratch_path: scratch_path.clone(),
+                window1: window1_editor.clone(),
+                agent: agent_panel_handle.clone(),
+                offers_pages: window_kind.offers_pages(webkit_sandbox::decision().allows_webviews()),
+                webviews: webkit_sandbox::decision().allows_webviews(),
+            },
+            follow_slot.clone(),
+        )
+    });
     wm_host.set_services(Rc::new(PanelServices {
         cm_session: cm_session.clone().map(|session| (session, app.clone())),
         inner: gtk_host_services::Services {
@@ -2420,6 +2460,7 @@ fn build_ui(
                 hold
             }),
             takeover: takeover_side.clone(),
+            late_loads: late_loads.clone(),
         },
     }));
     // The startup layout is the controller's first layout batch: what the layout shows mapped (every host
@@ -2751,7 +2792,8 @@ fn build_ui(
             controller.attach_page(id.clone(), view);
         }));
         let plugin_modules = plugin_panels.modules();
-        for (id, widget, _, _) in lua_pages.iter() {
+        let pages = lua_pages.borrow().clone();
+        for (id, widget, _, _) in pages.iter() {
             if plugin_modules.contains(id) {
                 continue;
             }
@@ -2809,6 +2851,21 @@ fn build_ui(
         .chain(tray.items())
         .chain(top_bar.items.iter().cloned())
         .collect();
+    let top_items: hint::TopItems = Rc::new(RefCell::new(top_items));
+    // A plugin page loaded into the running window gets its tray chip as it joins, before the controller hears of it,
+    // and the chip is a top-bar item after the other chips: the project and the workspace come first, then the chips.
+    if let Some(loads) = &late_loads {
+        let tray = tray.clone();
+        let top_items = top_items.clone();
+        loads.set_chip(Rc::new(move |id: &ModuleId, title: &str| {
+            if let Some(chip) = tray.add(id, title) {
+                let at = 2 + tray.items().len() - 1;
+                let mut items = top_items.borrow_mut();
+                let at = at.min(items.len());
+                items.insert(at, chip.upcast());
+            }
+        }));
+    }
     // The measured root supplies the window's minimum size above the backdrop. HINT labels, toasts and prompts
     // share its overlay and draw above the content; the HINT labels never take a click.
     let hint_overlay = gtk4::Overlay::new();
@@ -3333,6 +3390,10 @@ fn build_ui(
             std::env::var_os("HOME").as_deref(),
         ),
     });
+    keymap_alt_mod::announce(config.alt_mod, toast.clone(), {
+        let host = Rc::downgrade(&onboarding_host);
+        move || host.upgrade().is_none_or(|host| host.start_settled())
+    });
 
     // A top-bar item given the keys by the controller (`Ctrl+k` with nothing above): the bar brought out first if
     // it is hidden, then the first item showing from that index on -- a tray chip, or `↻` when the tray is empty.
@@ -3341,12 +3402,13 @@ fn build_ui(
         let window_modes = window_modes.clone();
         wm_host.set_top_bar(Rc::new(move |_, from: u32| {
             window_modes.reveal_top_bar();
-            let visible: Vec<bool> = top_items
+            let items = top_items.borrow().clone();
+            let visible: Vec<bool> = items
                 .iter()
                 .enumerate()
                 .map(|(i, item)| i >= from as usize && item.is_visible())
                 .collect();
-            eitri_core::wm::titles::step_item(&visible, None, 1).is_some_and(|i| top_items[i].grab_focus())
+            eitri_core::wm::titles::step_item(&visible, None, 1).is_some_and(|i| items[i].grab_focus())
         }));
     }
     // The rename entry given the keys by the controller (`workspace.rename`): the bar brought out first if it is
@@ -3559,15 +3621,16 @@ fn build_ui(
     }
     // The follow socket's lines: views and gone buffers to their plugins, and the plugins' nvim commands applied to
     // their modules in the order they were typed, the keys left where they are. The socket is read here, as the
-    // service glue; what each command does to its module is the controller's.
-    if let Some(socket) = follow_socket.as_mut() {
+    // service glue; what each command does to its module is the controller's. The same reader reads a socket the
+    // first loaded page that follows the editor binds, when no plugin from `init.lua` wanted one.
+    let follow_reader: plugin_load::FollowReader = {
         let window = GridFollowWindow {
             driver: Rc::downgrade(&driver),
         };
         let plugin_panels = plugin_panels.clone();
         let one = window1_editor.clone();
         let beside = pair.is_beside();
-        feed_pump.listen_follow(socket, move |batch| {
+        Rc::new(move |batch| {
             // The lines for a page window 2 holds go there; nvim's side of them stays here.
             let batch = match &one {
                 Some(one) => one.route_follow(batch),
@@ -3584,7 +3647,15 @@ fn build_ui(
             } else {
                 plugin_panels::apply_follow_commands(&window, commands);
             }
-        });
+        })
+    };
+    if let Some(socket) = follow_socket.as_mut() {
+        let reader = follow_reader.clone();
+        feed_pump.listen_follow(socket, move |batch| reader(batch));
+    }
+    *follow_slot.borrow_mut() = follow_socket.take();
+    if let Some(loads) = &late_loads {
+        loads.set_follow(feed_pump.clone(), follow_reader.clone());
     }
     // Window 2's pages follow window 1's editor through the lines window 1 sends them.
     if let Some(two) = &window2_editor {
@@ -3802,6 +3873,39 @@ fn build_ui(
         let driver = driver.clone();
         panel_hooks.on_choose_project = Some(Box::new(move || {
             driver.run(WinId::MAIN, Action::ProjectChoose, Origin::Chip)
+        }));
+    }
+    // Enter on a page the empty tab offers: `plugin.load` through the window's runner, as the bound key runs it, so
+    // the controller refuses or starts it.
+    {
+        let driver = Rc::downgrade(&driver);
+        panel_hooks.on_load_page = Some(Box::new(move |name: String| {
+            if let Some(driver) = driver.upgrade() {
+                driver.run(WinId::MAIN, Action::PluginLoad { name }, Origin::Chip);
+            }
+        }));
+    }
+    // `o` on an offered page: the `init.lua` line that would load it at every start, in a scratch buffer of the
+    // editor. Nothing writes `init.lua`; asked for from an idle, once the panel's call has returned. The panel names
+    // the scratch file here and writes it on a worker, so the GTK thread never waits on the disk.
+    {
+        let panel = agent_panel_handle.clone();
+        let toast = toast.clone();
+        panel_hooks.on_page_line = Some(Box::new(move |id: String| {
+            let Some(line) = eitri_core::plugin::line::plugin_line(&id) else {
+                return;
+            };
+            let (panel, toast) = (panel.clone(), toast.clone());
+            glib::idle_add_local_once(move || {
+                let failed = {
+                    let toast = toast.clone();
+                    move |why: &str| toast.show_for(why, toast::NOTICE_FOR)
+                };
+                if let Err(why) = panel.view_in_editor_later(plugin_load::PAGE_LINE_TITLE, format!("{line}\n"), failed)
+                {
+                    toast.show_for(&why, toast::NOTICE_FOR);
+                }
+            });
         }));
     }
     {
@@ -4043,6 +4147,10 @@ fn build_ui(
     // have made the panel call one, since the window is still being built and no page message is
     // read before the main loop runs again.
     panel_wiring::wire_panel(&agent_panel_handle, panel_hooks);
+    // The empty tab's Pages row, read off the GTK thread now and after each page loaded into the window.
+    if let Some(loads) = &late_loads {
+        loads.refresh_offers();
+    }
 
     // The window's key layers, in their declared order (`gtk_host::keys::window_layers`): HINT's while a HINT
     // runs, then the y/n prompt's while it is open, then the prefix's, which hands every other key to the
@@ -4194,10 +4302,11 @@ fn build_ui(
                 _ => return glib::Propagation::Proceed,
             };
             // Over the items that are showing: a tray chip whose module is on screen is stepped over.
-            let current = top_items.iter().position(|item| Some(item) == focus.as_ref());
-            let visible: Vec<bool> = top_items.iter().map(|item| item.is_visible()).collect();
+            let items = top_items.borrow().clone();
+            let current = items.iter().position(|item| Some(item) == focus.as_ref());
+            let visible: Vec<bool> = items.iter().map(|item| item.is_visible()).collect();
             if let Some(next) = eitri_core::wm::titles::step_item(&visible, current, step) {
-                top_items[next].grab_focus();
+                items[next].grab_focus();
             }
             glib::Propagation::Stop
         });
@@ -4885,7 +4994,7 @@ fn build_ui(
         theme_feed,
         context_feed,
         nvim_keys_feed,
-        follow_socket,
+        follow_socket: follow_slot.clone(),
         tutor,
         open_requests: incoming_opens.clone(),
         lua_engine: lua_engine.clone(),

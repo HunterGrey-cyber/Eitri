@@ -358,12 +358,12 @@ pub(crate) fn reload_page_back(
     if plugin_panels.modules().contains(module) {
         return plugin_panels.reload_back(module);
     }
-    let Some((_, widget, url, _)) = lua_pages.iter().find(|(m, _, _, _)| m == module) else {
+    let Some((_, widget, url, _)) = crate::gtk_host_services::lua_page(lua_pages, module) else {
         return false;
     };
     match widget.downcast_ref::<webkit6::WebView>() {
         Some(view) => {
-            view.load_uri(url);
+            view.load_uri(&url);
             true
         }
         None => false,

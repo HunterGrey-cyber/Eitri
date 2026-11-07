@@ -864,7 +864,7 @@ fn a_local_move_is_refused_with_one_reason() {
         *plans.borrow(),
         vec![
             MovePlan::Refused {
-                why: crate::wm::feedback::LOCAL_MOVE_TEXT
+                why: crate::wm::feedback::LOCAL_MOVE_TEXT.into()
             };
             3
         ]

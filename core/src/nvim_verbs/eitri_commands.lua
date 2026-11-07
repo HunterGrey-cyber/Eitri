@@ -135,6 +135,8 @@ local function candidates(done)
     return module_words
   elseif verb == "open" and #done == 1 then
     return KINDS
+  elseif verb == "plugin" and #done == 1 then
+    return { "load" }
   end
   return {}
 end

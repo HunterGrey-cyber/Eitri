@@ -506,6 +506,13 @@ pub(super) fn handle_inbound_message(
         out.send(view, serialize_command_result_for_js(&request_id, Err(why)));
     };
     if let Some(why) = refused {
+        if matches!(
+            &message,
+            InboundMessage::LoadPage { .. } | InboundMessage::PageLine { .. }
+        ) {
+            eprintln!("[agent_panel] dropped page request: {why}");
+            return out;
+        }
         // A trust question whose answer the window turned down is asked again (`refuse_trust_answer`);
         // every other refusal is the command's, and what it answered is left waiting.
         let trust = match (&message, target) {
@@ -572,6 +579,11 @@ pub(super) fn handle_inbound_message(
                 );
                 // Whether the page may speak of a turn's changes, before the tabs it would speak of.
                 window.insert(1, review_settings_payload(state));
+                if view.is_base() {
+                    if let Some(pages) = &state.page_lines {
+                        window.push(eitri_core::agent_bridge::serialize_pages_for_js(pages));
+                    }
+                }
                 // The other window's page's view of a tab that arrived before this document was ready, before
                 // the tabs whose switch takes it up.
                 window.extend(chat_moves::take_held_imports(state, view));
@@ -1417,7 +1429,11 @@ pub(super) fn handle_inbound_message(
         // The text is written to the scratch file on a worker; the tick hands nvim the view, or tells the page why
         // it could not be written.
         InboundMessage::ViewInEditor { title, text, .. } => {
-            if let Err(why) = start_view_job(state, view, &request_id, &title, text) {
+            let asker = ViewAsker::Page {
+                view,
+                request_id: request_id.clone(),
+            };
+            if let Err(why) = start_view_job(state, asker, &title, text) {
                 refuse(&mut out, &why);
             }
         }
@@ -1628,6 +1644,8 @@ pub(super) fn handle_inbound_message(
             Ok(()) => ok(&mut out),
             Err(why) => refuse(&mut out, why),
         },
+        InboundMessage::LoadPage { id } => out.effect(Effect::LoadPage(id)),
+        InboundMessage::PageLine { id } => out.effect(Effect::PageLine(id)),
         InboundMessage::ChooseProject { .. } => {
             out.effect(Effect::ChooseProject);
             ok(&mut out);

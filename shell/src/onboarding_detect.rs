@@ -70,7 +70,7 @@ impl DetectContext {
 /// A regular file's text, at most one config's worth; anything else (a missing file, a directory, a FIFO, text that is
 /// not UTF-8, a file that is too large) is `None`. The file is opened without waiting for a writer, so a FIFO with
 /// none is refused by the check on the handle and never holds the worker in `open`.
-fn read_regular_file(path: &Path) -> Option<String> {
+pub(crate) fn read_regular_file(path: &Path) -> Option<String> {
     use std::os::unix::fs::OpenOptionsExt;
     let file = std::fs::OpenOptions::new()
         .read(true)

@@ -118,6 +118,8 @@ pub(crate) struct OnboardingHost {
     editor: RefCell<Option<Rc<dyn EditorRpc>>>,
     /// What the start knew when it started the trigger, for a check that is not asked for.
     inputs: RefCell<Option<trigger::Inputs>>,
+    /// The initial trigger has answered. Before that, an absent screen can still be about to open.
+    start_decided: Cell<bool>,
     /// The view last drawn, for the log.
     shown: RefCell<Option<OnboardingView>>,
 }
@@ -135,6 +137,7 @@ impl OnboardingHost {
             report: RefCell::new(None),
             editor: RefCell::new(None),
             inputs: RefCell::new(None),
+            start_decided: Cell::new(false),
             shown: RefCell::new(None),
         })
     }
@@ -186,6 +189,16 @@ impl OnboardingHost {
         self.decide(0, inputs);
     }
 
+    /// Startup notices wait for the trigger's answer and for the screen to close, even while a trust card hides it.
+    pub(crate) fn start_settled(&self) -> bool {
+        self.start_decided.get()
+            && self
+                .deps
+                .driver
+                .upgrade()
+                .is_none_or(|driver| driver.onboarding_generation(self.deps.win).is_none())
+    }
+
     fn decide(self: &Rc<Self>, generation: u64, inputs: trigger::Inputs) {
         let asked = self.spawn("onboarding-trigger", None, move |tx| {
             let (decision, log) = trigger::decide(&inputs);
@@ -204,6 +217,9 @@ impl OnboardingHost {
         });
         // Nothing will answer, and with nobody asked no screen opens.
         if !asked {
+            if generation == 0 {
+                self.start_decided.set(true);
+            }
             self.post(OnboardingEvent::NoScreen { win: self.deps.win });
         }
     }
@@ -581,10 +597,16 @@ impl OnboardingHost {
                 show_why,
                 today,
             } => {
+                if generation == 0 {
+                    self.start_decided.set(true);
+                }
                 let opening = self.opening(generation, mode, show_why, today);
                 self.post(OnboardingEvent::Open { win, opening });
             }
-            Msg::NoScreen => self.post(OnboardingEvent::NoScreen { win }),
+            Msg::NoScreen => {
+                self.start_decided.set(true);
+                self.post(OnboardingEvent::NoScreen { win });
+            }
             Msg::Found { generation, found } => self.post(OnboardingEvent::Found { win, generation, found }),
             Msg::Written { generation, outcome } => self.post(OnboardingEvent::Written {
                 win,

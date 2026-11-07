@@ -28,7 +28,8 @@ Each takes the keys as any module does: from the editor, `<prefix> Left` reaches
 `<prefix> o` goes round every module, and the table's own key (below) opens it with the keys.
 
 All three are plugins that ship with Eitri and are off until `init.lua` loads them
-([Plugins](configuration.md#plugins)):
+([Plugins](configuration.md#plugins)); to try one in the window you are in, `Enter` on it under the empty tab's Pages, or
+`:Eitri plugin load agents-top` (for this run only):
 
 ```lua
 eitri.plugin.load("agents-strips")

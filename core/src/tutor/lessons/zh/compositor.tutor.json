@@ -1,0 +1,14 @@
+{
+  "expect": {
+    "24": "先按前缀，再按这个键，列出所有按键：{prefix} ?",
+    "80": "唤起或启动一个聊天窗口：{prefix} a",
+    "114": "把按键交给 1 号窗口的编辑器：{prefix} e",
+    "150": "在 agent 面板里新建一个标签页：{prefix} c",
+    "182": "清空终端屏幕：{prefix} Ctrl+l",
+    "226": "eitri.keymap.prefix(\"C-a\")"
+  },
+  "translated-from": {
+    "file": "en/compositor.tutor",
+    "sha256": "889107b6a1ea0b3f7389f8c2e7a1e1357252b43db2f7a566cd34c03eff7b2ad8"
+  }
+}

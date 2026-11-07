@@ -62,6 +62,11 @@ account when one is configured, and a short menu:
 | `Shift+Tab` | cycle the mode (Manual, Auto, Bypass) before you start (the mode is shown at the bottom of the panel) |
 | `?` | list all the keys |
 
+Under the menu, **Pages** lists the pages that ship with Eitri and are not loaded in this window (the agents
+pages and the Markdown preview, each with one line of what it is). `j`/`k` reach them; `Enter` loads one for this run
+and shows it, and `o` opens the `init.lua` line that loads it every time in a scratch buffer in Neovim, for you to
+copy (Eitri does not write your `init.lua`). See [Plugins](configuration.md#plugins).
+
 `Ctrl+h` and `Ctrl+l` move the keys between the editor and the panel.
 
 Two options are worth knowing. `eitri --version` prints the version and exits. `eitri --clean` starts the

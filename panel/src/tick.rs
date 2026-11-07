@@ -901,8 +901,10 @@ mod tests {
 
         let (_view_tx, view_rx) = mpsc::channel();
         handle.state.borrow_mut().view_jobs.push(PendingView {
-            request_id: "v".into(),
-            view: ViewId::BASE,
+            asker: ViewAsker::Page {
+                view: ViewId::BASE,
+                request_id: "v".into(),
+            },
             rx: view_rx,
         });
         assert!(polls(&handle), "a view being written");
@@ -1834,5 +1836,84 @@ mod tests {
         assert_eq!(ends.get(), 0, "a session that closed ended no turn");
         assert!(!handle.busy());
         let _ = handle.shutdown();
+    }
+
+    /// A turn that changed one file, through the tick: its page is told the turn ended, then sent the
+    /// status band's hint with the count, at the default `"key"` level.
+    #[test]
+    fn a_turn_that_changed_a_file_sends_its_page_the_band_hint_after_the_turns_end() {
+        agent::state_dirs::redirect_state_to_a_test_root();
+        let dir = agent::state_dirs::test_workspace_dir("panel-probe-band-hint");
+        std::fs::write(dir.join("w.txt"), "one\ntwo\n").unwrap();
+        let review_dir = agent::state_dirs::test_workspace_dir("panel-probe-band-hint-store");
+        let (handle, page) = settled_panel();
+        {
+            let mut state = handle.state.borrow_mut();
+            state.review_hint = eitri_core::agent_prefs::ReviewHintLevel::Key;
+            let options = eitri_core::turn_review::ReviewOptions {
+                excludes: Some(None),
+                trim_every: std::time::Duration::MAX,
+                ..eitri_core::turn_review::ReviewOptions::default()
+            };
+            state
+                .tabs
+                .install_turn_review(eitri_core::turn_review::TurnReview::with_options(
+                    Some(review_dir),
+                    &dir,
+                    options,
+                ))
+                .unwrap();
+        }
+        let (tab, provider) = live_tab(&handle, &dir);
+        provider.open_session("sess-probe", &dir);
+        provider.queue(agent::AgentDomainEvent::TurnStarted { turn_id: "t1".into() });
+        tick_handle_until(&handle, "the base", || {
+            handle
+                .state
+                .borrow()
+                .tabs
+                .turn_review()
+                .unwrap()
+                .turns("sess-probe")
+                .first()
+                .is_some_and(|r| matches!(r.base, eitri_core::turn_review::Snap::Taken { .. }))
+        });
+        std::fs::write(dir.join("w.txt"), "one\nthree\n").unwrap();
+        provider.queue(agent::AgentDomainEvent::TurnCompleted {
+            turn_id: "t1".into(),
+            outcome: agent::TurnOutcome::Completed,
+            result_text: String::new(),
+            stop_reason: None,
+            usage: None,
+            detail: Default::default(),
+        });
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(3);
+        while std::time::Instant::now() < deadline {
+            handle.tick();
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        let sent = page.sent.borrow();
+        let kinds: Vec<serde_json::Value> = sent.iter().map(|p| serde_json::from_str(p).unwrap()).collect();
+        let ended = kinds
+            .iter()
+            .position(|v| {
+                v["kind"] == "events"
+                    && v["events"]
+                        .as_array()
+                        .is_some_and(|e| e.iter().any(|e| e["type"] == "turn_completed"))
+            })
+            .expect("the turn's end reached the page");
+        let hints: Vec<(usize, &serde_json::Value)> = kinds
+            .iter()
+            .enumerate()
+            .filter(|(_, v)| v["kind"] == "review_hint")
+            .collect();
+        assert_eq!(hints.len(), 1, "{sent:?}");
+        let (at, hint) = hints[0];
+        assert!(at > ended, "the hint follows the turn's end: {sent:?}");
+        assert_eq!(
+            (hint["tab"].as_u64(), hint["turn"].as_u64(), hint["files"].as_u64()),
+            (Some(tab.0), Some(1), Some(1))
+        );
     }
 }

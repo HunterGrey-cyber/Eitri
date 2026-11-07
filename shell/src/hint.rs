@@ -178,7 +178,7 @@ pub(crate) struct HintCoordinator {
     window: gtk4::ApplicationWindow,
     /// Wraps the window's root; labels are its overlay children.
     overlay: gtk4::Overlay,
-    top_items: Vec<gtk4::Widget>,
+    top_items: TopItems,
     /// `None` in a window with no editor: the editor arm of a focus restore then matches nothing.
     editor: Option<Rc<NeovideEditorPane>>,
     editor_widget: Option<gtk4::Widget>,
@@ -205,7 +205,7 @@ pub(crate) struct HintCoordinator {
 pub(crate) struct HintWidgets {
     pub(crate) window: gtk4::ApplicationWindow,
     pub(crate) overlay: gtk4::Overlay,
-    pub(crate) top_items: Vec<gtk4::Widget>,
+    pub(crate) top_items: TopItems,
     pub(crate) editor: Option<Rc<NeovideEditorPane>>,
     /// The panel's `WebView` itself, which a panel landing grabs -- never its module host, a
     /// `WebHost` that refuses a grab (`web_host`'s module doc).
@@ -225,6 +225,10 @@ pub(crate) struct HintWidgets {
     pub(crate) activate_strip: Rc<dyn Fn(&ModuleId)>,
     pub(crate) agent: AgentPanelHandle,
 }
+
+/// The top bar's items in order: the project, the workspace, every tray chip, then the bar's own. A chip made for a
+/// page loaded into the running window is entered after the other chips; every read clones what it needs out.
+pub(crate) type TopItems = Rc<RefCell<Vec<gtk4::Widget>>>;
 
 /// Strip entries with their modules, read when a HINT starts.
 pub(crate) type StripEntries = Rc<dyn Fn() -> Vec<(ModuleId, gtk4::Widget)>>;
@@ -294,6 +298,7 @@ impl HintCoordinator {
         WindowLayout {
             top_visible: self
                 .top_items
+                .borrow()
                 .iter()
                 .chain(strips.iter().map(|(_, w)| w))
                 .map(visible)
@@ -307,14 +312,14 @@ impl HintCoordinator {
 
     /// The strip entry a top slot past the top bar's items stands for, in the HINT that is up.
     fn strip_entry(&self, i: usize) -> Option<(ModuleId, gtk4::Widget)> {
-        let k = i.checked_sub(self.top_items.len())?;
+        let k = i.checked_sub(self.top_items.borrow().len())?;
         self.active.borrow().as_ref()?.strips.get(k).cloned()
     }
 
     fn slot_widget(&self, slot: &Slot) -> Option<gtk4::Widget> {
         match slot {
-            Slot::Top(i) if *i >= self.top_items.len() => self.strip_entry(*i).map(|(_, w)| w),
-            Slot::Top(i) => self.top_items.get(*i).cloned(),
+            Slot::Top(i) if *i >= self.top_items.borrow().len() => self.strip_entry(*i).map(|(_, w)| w),
+            Slot::Top(i) => self.top_items.borrow().get(*i).cloned(),
             Slot::Module(id) => (self.modules)()
                 .into_iter()
                 .find(|(m, _)| m == id)
@@ -356,7 +361,7 @@ impl HintCoordinator {
         println!("[hint] session {session_id} started (held={held:?})");
 
         let strips = (self.strips)();
-        let order = strips_after_modules(order_targets(&self.layout(&strips)), self.top_items.len());
+        let order = strips_after_modules(order_targets(&self.layout(&strips)), self.top_items.borrow().len());
         let panel_asked = order.ask_panel;
         let restore_focus = gtk4::prelude::GtkWindowExt::focus(&self.window);
 
@@ -681,7 +686,7 @@ impl HintCoordinator {
                         (self.focus_module)(id);
                     }
                     // A strip entry: as if it were clicked, which chooses its tab.
-                    Slot::Top(i) if *i >= self.top_items.len() => {
+                    Slot::Top(i) if *i >= self.top_items.borrow().len() => {
                         if let Some((id, _)) = self.strip_entry(*i) {
                             (self.activate_strip)(&id);
                         }

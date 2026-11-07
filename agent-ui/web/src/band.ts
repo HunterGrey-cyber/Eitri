@@ -347,11 +347,15 @@ export function bandLayout(f: BandFacts, widthPx: number, charPx: number): Seg[]
     // is shortened, so a narrow panel never trades the file it is showing for a running total.
     (s) => s.filter((x) => x.id !== "usage"),
     (s) => s.map((x) => (x.id === "context" && f.context ? { ...x, text: `⧉ ${f.context.file}` } : x)),
-    (s) => s.filter((x) => x.id !== "review"),
+    // The review pointer is the only place the band offers `c`, so it gives up its count before any figure goes,
+    // and outlasts the effort, the model and the position: they say what the user chose or where they are, and
+    // come back by themselves; the pointer is gone with the next turn.
+    (s) => s.map((x) => (x.id === "review" && f.review ? { ...x, text: reviewSegment(f.review.files, true) } : x)),
     // The effort qualifies the model, so it goes first, and never stands without it.
     (s) => s.filter((x) => x.id !== "effort"),
     (s) => s.filter((x) => x.id !== "model"),
     (s) => s.filter((x) => x.id !== "position"),
+    (s) => s.filter((x) => x.id !== "review"),
     (s) => s.filter((x) => x.id !== "context" && x.id !== "link"),
     (s) => s.filter((x) => x.id !== "queue"),
     (s) => s.filter((x) => x.id !== "following"),

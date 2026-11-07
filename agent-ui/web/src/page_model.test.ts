@@ -186,3 +186,13 @@ describe("the stop question across a rebuilt conversation", () => {
     expect(away.state.cliUnseenEpisode).toBeGreaterThanOrEqual(asked.state.cliUnseenEpisode);
   });
 });
+
+it("keeps the latest pages across tab switches and clears a spent offer", () => {
+  const pages = [{ id: "markdown", title: "Markdown", summary: "Read" }];
+  const offered = receive(connected(), { kind: "pages", pages });
+  expect(offered.pages).toEqual(pages);
+  expect(initialPageModel().pages).toEqual([]);
+  const switched = receive(offered, { kind: "tabs", active: 2, tabs: [tab(1), tab(2)], defaultMode: "auto" });
+  expect(switched.pages).toEqual(pages);
+  expect(receive(switched, { kind: "pages", pages: [] }).pages).toEqual([]);
+});

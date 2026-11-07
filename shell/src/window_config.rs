@@ -10,6 +10,14 @@ use crate::lua::LuaEngine;
 /// [`eitri_panel::window_config::load`] with this engine's panels. A call `init.lua` made that was refused did
 /// nothing and is one of the engine's startup problems, not a failure here.
 pub(crate) fn load(lua_engine: &LuaEngine) -> Result<WindowConfig, String> {
+    load_with_alt_mod(lua_engine, || None)
+}
+
+/// The full window's loader with the startup probe's current answer; other window kinds keep the shared defaults.
+pub(crate) fn load_with_alt_mod(
+    lua_engine: &LuaEngine,
+    probe_now: impl FnOnce() -> Option<eitri_core::keymap::alt_mod::Answer>,
+) -> Result<WindowConfig, String> {
     let panels: Vec<LuaPanelMeta> = lua_engine
         .panels
         .borrow()
@@ -20,7 +28,7 @@ pub(crate) fn load(lua_engine: &LuaEngine) -> Result<WindowConfig, String> {
             key: entry.key.clone(),
         })
         .collect();
-    eitri_panel::window_config::load(lua_engine, &panels)
+    eitri_panel::window_config::load_with_alt_mod(lua_engine, &panels, probe_now)
 }
 
 #[cfg(test)]
