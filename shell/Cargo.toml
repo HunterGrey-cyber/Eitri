@@ -286,3 +286,10 @@ harness = false
 [[test]]
 name = "remote_e2e"
 harness = false
+
+# The remote audit trail end to end: a window and `serve` write the log and the journal copy, a headless phone drives
+# every command and refusal it can reach, and `eitri remote log --verify` is clean, then names each tampering.
+# `own_display_scan` requires a test that starts the product binary to isolate its display in `main`.
+[[test]]
+name = "remote_audit_e2e"
+harness = false

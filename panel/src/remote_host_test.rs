@@ -26,6 +26,18 @@ impl AgentPanelHandle {
         (tab, key)
     }
 
+    /// Opens a tab of `agent` that holds no session, as a tab is before its first send, and returns it with its row key.
+    pub fn open_unstarted_tab_for_host_test(&self, agent: AgentId) -> eitri_core::tab_set::RowKey {
+        let mut state = self.state.borrow_mut();
+        let tab = state.tabs.open(agent);
+        state.tabs.get(tab).expect("the tab just opened").row_key().clone()
+    }
+
+    /// The tab's session mode.
+    pub fn mode_for_host_test(&self, tab: TabId) -> SessionModeChoice {
+        self.state.borrow().tabs.get(tab).expect("the tab is open").mode()
+    }
+
     /// The tab's backend generation, its active turn and the last revision its projection folded.
     pub fn tab_progress_for_host_test(&self, tab: TabId) -> (u64, Option<String>, u64) {
         let state = self.state.borrow();
