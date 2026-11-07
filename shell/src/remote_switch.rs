@@ -267,6 +267,19 @@ fn switch_on(
             }
         }
     }
+    // A stop that ran while this window waited, or while the desk was asked, wins: looked at again right before the
+    // start, not only before the second look. A window that found `serve` running counts a stop from shortly before its
+    // first look (one already in flight); one that found none, only a stop after it, so a window opened just after a
+    // stop still starts `serve`. What is left is the moment between this look and the new `serve` taking the lock.
+    let stop_since = if found_running {
+        looked - STOP_NOTE_REACH
+    } else {
+        looked
+    };
+    if stopped_since(dirs, stop_since) {
+        println!("[remote] eitri remote stop ran: serve stays stopped until a window starts");
+        return;
+    }
     match start_serve(&now, spawner) {
         Ok(true) => {
             println!("[remote] started eitri remote serve {}", cfg.args().join(" "));
@@ -463,6 +476,17 @@ mod tests {
         assert!(said[0].contains("remote.listen") && said[0].contains("wildcard"));
     }
 
+    /// Lets `held` go and waits until the lock is free: a child another test forks shares the lock's open file until
+    /// its `exec` closes it, so the lock can stay held a moment after the drop.
+    fn release(dirs: &Dirs, held: agent::private_fs::PrivateLock) {
+        drop(held);
+        let until = Instant::now() + Duration::from_secs(10);
+        while eitri_remote::serve::is_running(dirs).unwrap() {
+            assert!(Instant::now() < until, "the lock was never let go");
+            std::thread::sleep(Duration::from_millis(5));
+        }
+    }
+
     fn hold_serve(dirs: &Dirs) -> agent::private_fs::PrivateLock {
         let lock = agent::private_fs::PrivateLock::open(&dirs.control.join(eitri_remote::serve::LOCK_FILE)).unwrap();
         assert!(lock.try_lock().unwrap());
@@ -536,7 +560,7 @@ mod tests {
         let held = hold_serve(&dirs);
         write_record(&dirs, "full");
         assert_eq!(probe(false), (None, Some("full".into())));
-        drop(held);
+        release(&dirs, held);
         assert_eq!(probe(true), (Some(false), None));
         write_record_pid(&dirs, "partial", 2);
         assert_eq!(probe(false), (None, None), "an unlocked record is ignored");
@@ -560,7 +584,7 @@ mod tests {
         let held = hold_serve(&dirs);
         write_record(&dirs, "full");
         assert_eq!(probe(true), (Some(true), Some("full".into())));
-        drop(held);
+        release(&dirs, held);
         assert_eq!(probe(true), (Some(false), None));
         // Opening a PrivateLock repairs its mode to 0600, making an accidental lock open observable.
         use std::os::unix::fs::PermissionsExt;
@@ -669,7 +693,9 @@ mod tests {
                 || {
                     waited = true;
                     if case != "same" {
-                        held.take();
+                        if let Some(lock) = held.take() {
+                            release(&dirs, lock);
+                        }
                     }
                     if case == "during-stop" {
                         eitri_remote::serve::mark_stopped(&dirs).unwrap();

@@ -31,7 +31,7 @@ fn remote_rv_inbound_randomized() {
             r#"{"v":1,"kind":"listen_request","addr":"198.51.100.2"}"#,
             r#"{"v":1,"kind":"revoke_self","device":"phone","token":"test"}"#,
             r#"{"v":1,"kind":"set_push_endpoint","device":"phone","token":"test","url":"https://example.org/push"}"#,
-            r#"{"v":1,"kind":"devices_connected","devices":[{"device":"phone","host":"localhost","peer":"local","since":0}]}"#,
+            r#"{"v":1,"kind":"devices_connected","devices":[{"device":"phone","host":"localhost","peer":"local","since":0}],"epoch":1,"seq":0}"#,
         ],
         0x15f0_9876_1234_abcd,
     );

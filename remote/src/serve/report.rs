@@ -35,9 +35,10 @@ impl Reporter {
         // A new serve has no phones, even if a window still names phones from the previous process.
         tx.send(Vec::new()).expect("the report receiver is alive");
         let control = control_dir.to_owned();
+        let epoch = boot_clock_ns();
         std::thread::Builder::new()
             .name("eitri-remote-report".into())
-            .spawn(move || run(&control, rx))?;
+            .spawn(move || run(&control, epoch, rx))?;
         Ok(Reporter { tx })
     }
 
@@ -45,6 +46,20 @@ impl Reporter {
     pub fn report(&self, now: Vec<Connected>) {
         let _ = self.tx.send(now);
     }
+}
+
+/// Nanoseconds on `CLOCK_BOOTTIME`: one clock for every process of the machine, which never goes back (a wall clock
+/// set back would make a later `serve` look older than an earlier one) and restarts only with the machine, which no
+/// window outlives.
+fn boot_clock_ns() -> u64 {
+    let mut ts = libc::timespec { tv_sec: 0, tv_nsec: 0 };
+    // SAFETY: `clock_gettime` writes one `timespec` into the live value it is given.
+    if unsafe { libc::clock_gettime(libc::CLOCK_BOOTTIME, &mut ts) } != 0 {
+        return 0;
+    }
+    (ts.tv_sec as u64)
+        .saturating_mul(1_000_000_000)
+        .saturating_add(ts.tv_nsec as u64)
 }
 
 /// A socket as one bind made it: its path, inode and change time, so a socket bound again at the same path is another.
@@ -55,9 +70,10 @@ fn bound(path: PathBuf) -> Option<Bound> {
     Some((path, meta.ino(), meta.ctime(), meta.ctime_nsec()))
 }
 
-fn run(control: &Path, rx: Receiver<Vec<Connected>>) {
-    // The newest report, and the sockets that have taken it.
+fn run(control: &Path, epoch: u64, rx: Receiver<Vec<Connected>>) {
+    // The newest report, the number the next one gets, and the sockets that have taken the newest.
     let mut newest: Option<RvInbound> = None;
+    let mut seq = 0u64;
     let mut told: BTreeSet<Bound> = BTreeSet::new();
     loop {
         match rx.recv_timeout(LOOK_EVERY) {
@@ -69,7 +85,10 @@ fn run(control: &Path, rx: Receiver<Vec<Connected>>) {
                 newest = Some(RvInbound::DevicesConnected {
                     v: RV_PROTOCOL,
                     devices: now,
+                    epoch,
+                    seq,
                 });
+                seq += 1;
                 told.clear();
             }
             Err(RecvTimeoutError::Timeout) => {}
@@ -186,7 +205,12 @@ mod tests {
                 eitri_core::remote_rv::parse_rv_line(line.trim_end().as_bytes()).unwrap(),
                 RvInbound::DevicesConnected {
                     v: RV_PROTOCOL,
-                    devices: Vec::new()
+                    devices: Vec::new(),
+                    epoch: match eitri_core::remote_rv::parse_rv_line(line.trim_end().as_bytes()).unwrap() {
+                        RvInbound::DevicesConnected { epoch, .. } => epoch,
+                        other => panic!("{other:?}"),
+                    },
+                    seq: 0,
                 }
             );
         };

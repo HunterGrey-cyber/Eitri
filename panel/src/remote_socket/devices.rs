@@ -128,6 +128,8 @@ struct Issued {
 /// What the errands share across the accepting, reading and writing threads.
 pub(super) struct DevicesShared {
     pub(super) report_order: Mutex<()>,
+    /// The `(epoch, seq)` of the last report taken: an older one, read late off another connection, is dropped.
+    last_report: Mutex<Option<(u64, u64)>>,
     instance: String,
     issued: Mutex<Issued>,
     pairing: Mutex<Option<Pairing>>,
@@ -142,6 +144,7 @@ impl DevicesShared {
     pub(super) fn new(instance: &str) -> DevicesShared {
         DevicesShared {
             report_order: Mutex::new(()),
+            last_report: Mutex::new(None),
             instance: instance.to_owned(),
             issued: Mutex::new(Issued {
                 codes: EnrollCodes::default(),
@@ -246,7 +249,18 @@ impl DevicesInbound {
                 }
             }
             // Written here, on the reader's thread, so two reports are written in the order `serve` sent them.
-            RvInbound::DevicesConnected { devices, .. } => record_connected(shared, devices, unix_now()),
+            RvInbound::DevicesConnected {
+                devices, epoch, seq, ..
+            } => {
+                // Under `report_order` (taken by the reader for this kind), so the check and the write are one step.
+                let mut last = shared.devices.last_report.lock().unwrap_or_else(|e| e.into_inner());
+                if last.is_some_and(|taken| (epoch, seq) <= taken) {
+                    return None;
+                }
+                *last = Some((epoch, seq));
+                drop(last);
+                record_connected(shared, devices, unix_now())
+            }
             _ => return None,
         })
     }

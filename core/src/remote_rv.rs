@@ -222,8 +222,16 @@ pub enum RvInbound {
         token: Secret,
         url: Secret,
     },
-    /// `serve`'s report of the phones connected now.
-    DevicesConnected { v: u32, devices: Vec<Connected> },
+    /// `serve`'s report of the phones connected now: report `seq` (from 0, its first, which names nobody) of the
+    /// `serve` that started at `epoch` (nanoseconds on the machine's boot clock, which no wall-clock change moves). Each report reaches a window over a
+    /// connection of its own, so two may be read out of order; a window takes a report only if it is newer, by
+    /// `(epoch, seq)`, than the last it took.
+    DevicesConnected {
+        v: u32,
+        devices: Vec<Connected>,
+        epoch: u64,
+        seq: u64,
+    },
 }
 
 /// Why an inbound line was not read.
@@ -1131,7 +1139,7 @@ mod tests {
             r#"{"v":1,"kind":"listen_request","addr":"192.0.2.10:7341"}"#,
             r#"{"v":1,"kind":"revoke_self","device":"d1","token":"tok"}"#,
             r#"{"v":1,"kind":"set_push_endpoint","device":"d1","token":"tok","url":"https://ntfy.example/t"}"#,
-            r#"{"v":1,"kind":"devices_connected","devices":[{"device":"d1","host":"h","peer":"p","since":7}]}"#,
+            r#"{"v":1,"kind":"devices_connected","devices":[{"device":"d1","host":"h","peer":"p","since":7}],"epoch":1,"seq":0}"#,
         ];
         for line in lines {
             let parsed = parse_rv_line(line.as_bytes()).unwrap_or_else(|e| panic!("{line}: {e:?}"));
@@ -1148,8 +1156,7 @@ mod tests {
                 "an unknown field: {extra}"
             );
         }
-        let nested =
-            r#"{"v":1,"kind":"devices_connected","devices":[{"device":"d1","host":"h","peer":"p","since":7,"x":1}]}"#;
+        let nested = r#"{"v":1,"kind":"devices_connected","devices":[{"device":"d1","host":"h","peer":"p","since":7,"x":1}],"epoch":1,"seq":0}"#;
         assert_eq!(parse_rv_line(nested.as_bytes()), Err(RvLineError::Malformed));
         let grant = r#"{"v":1,"kind":"grant_request","device":"d1","grant":"admin"}"#;
         assert_eq!(parse_rv_line(grant.as_bytes()), Err(RvLineError::Malformed));

@@ -802,8 +802,8 @@ mod tests {
             "through SSH to 127.0.0.1:41000 on this desk"
         );
         assert_eq!(
-            of(PairMode::Ssh, PairScheme::Http, "/run/user/1000/eitri/remote.sock", 0),
-            "through SSH to the socket /run/user/1000/eitri/remote.sock on this desk"
+            of(PairMode::Ssh, PairScheme::Http, "/run/user/1000/eitri/serve-socket", 0),
+            "through SSH to the socket /run/user/1000/eitri/serve-socket on this desk"
         );
     }
 

@@ -278,11 +278,23 @@ fn set_push(client: &mut RvClient, device: &str, token: &str, url: &str) {
         .unwrap();
 }
 
+/// The number the next report of the tests' stand-in `serve` gets: one sequence for every test, so each window sees its
+/// reports in the order they were sent.
+static REPORT_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+
 /// `serve`'s report that the devices in `connected` (id, `Host`) are connected now.
 fn report(client: &mut RvClient, connected: &[(&str, &str)]) {
+    let seq = REPORT_SEQ.fetch_add(1, Ordering::SeqCst);
+    report_as(client, connected, 1, seq);
+}
+
+/// [`report`] as report `seq` of the `serve` that started at `epoch`.
+fn report_as(client: &mut RvClient, connected: &[(&str, &str)], epoch: u64, seq: u64) {
     client
         .send(&RvInbound::DevicesConnected {
             v: RV_PROTOCOL,
+            epoch,
+            seq,
             devices: connected
                 .iter()
                 .map(|(device, host)| Connected {
@@ -489,7 +501,7 @@ fn each_enrollment_takes_the_recipe_it_asks_for() {
         "{shown}"
     );
 
-    // `--ssh` still enrolls through SSH alongside the direct route.
+    // `--ssh`: a phone's own SSH route still enrolls beside the Tailscale name.
     let (code, answer) = window.start_by(&mut client, Some(PairMode::Ssh));
     assert_eq!(answer["recipe"], "ssh");
     assert_eq!(answer["other"], true);
@@ -1008,6 +1020,56 @@ fn last_seen_and_host_follow_devices_connected() {
     // A report is not answered.
     window.settle();
     assert!(client.recv(Duration::from_millis(20)).unwrap().is_none());
+}
+
+#[test]
+fn a_report_older_than_the_last_one_taken_is_dropped() {
+    let scratch = Scratch::new();
+    let window = Window::new(&scratch, INSTANCE_A);
+    let mut client = window.connect();
+    let (a, _) = window.enroll_with_yes(&mut client, "Pixel", "watch");
+    let sent = || window.count("remote_connected");
+    let latest = || {
+        let all: Vec<serde_json::Value> = window
+            .base
+            .sent
+            .borrow()
+            .iter()
+            .map(|e| json_of(e))
+            .filter(|v| v["kind"] == "remote_connected")
+            .collect();
+        all.last().cloned()
+    };
+    // Each report on a connection of its own, as `serve` sends them.
+    let send = |connected: &[(&str, &str)], epoch, seq| {
+        let mut one = window.connect();
+        report_as(&mut one, connected, epoch, seq);
+        one
+    };
+
+    // A serve that started at 2000 reports a phone as its second report.
+    let _held = send(&[(&a, "127.0.0.1:43117")], 2000, 1);
+    window.turn_until("the phone's report", || sent() >= 1);
+    assert_eq!(latest().unwrap()["devices"].as_array().unwrap().len(), 1);
+
+    // Its first report, the empty one, read late: dropped, the phone stays listed.
+    let _late = send(&[], 2000, 0);
+    // A report of an earlier serve, read after the newer serve's: dropped too.
+    let _dead = send(&[], 1000, 9);
+    // The same report again: nothing new.
+    let _again = send(&[(&a, "127.0.0.1:43117")], 2000, 1);
+    window.settle();
+    assert_eq!(sent(), 1, "{:?}", latest());
+
+    // The next report of that serve, and the first of a later one, are taken.
+    let _next = send(&[], 2000, 2);
+    window.turn_until("the close", || sent() >= 2);
+    assert_eq!(latest().unwrap()["devices"], serde_json::json!([]));
+    let _newer = send(&[(&a, "127.0.0.1:43117")], 3000, 0);
+    window.turn_until("the later serve's report", || sent() >= 3);
+    assert_eq!(latest().unwrap()["devices"].as_array().unwrap().len(), 1);
+    window.settle();
+    assert_eq!(sent(), 3, "no dropped report was taken late");
 }
 
 #[test]

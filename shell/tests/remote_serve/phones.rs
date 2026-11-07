@@ -376,6 +376,18 @@ impl FakeWindow {
     }
 
     /// The next line of `kind` that reached it, skipping others, within `within`.
+    /// The next `devices_connected` that names a phone: `serve`'s first report names nobody, and a window bound before
+    /// the reporting thread's first look takes it first.
+    fn next_naming(&self, within: Duration) -> Option<Value> {
+        let deadline = Instant::now() + within;
+        loop {
+            let line = self.next_of("devices_connected", deadline.saturating_duration_since(Instant::now()))?;
+            if line["devices"].as_array().is_some_and(|d| !d.is_empty()) {
+                return Some(line);
+            }
+        }
+    }
+
     fn next_of(&self, kind: &str, within: Duration) -> Option<Value> {
         let deadline = Instant::now() + within;
         loop {
@@ -1132,7 +1144,7 @@ fn devices_connected_reaches_every_panel(dir: &Path) -> Result<(), String> {
     let mut seen = BTreeMap::new();
     for window in [&first, &second] {
         let line = window
-            .next_of("devices_connected", PATIENCE)
+            .next_naming(PATIENCE)
             .ok_or_else(|| format!("{} was never told", window.instance))?;
         let devices = line["devices"].as_array().cloned().unwrap_or_default();
         check(
@@ -1166,9 +1178,7 @@ fn a_window_opened_later_is_told_who_is_connected(dir: &Path) -> Result<(), Stri
     let world = World::new(dir, Limits::default());
     let first = FakeWindow::open(&world);
     let _phone = world.phone_as(WATCH);
-    first
-        .next_of("devices_connected", PATIENCE)
-        .ok_or("the first window was never told")?;
+    first.next_naming(PATIENCE).ok_or("the first window was never told")?;
     let names_the_phone = |line: &Value| {
         let devices = line["devices"].as_array().cloned().unwrap_or_default();
         devices.len() == 1 && devices[0]["device"] == WATCH.0
@@ -1273,7 +1283,9 @@ fn a_window_that_turns_every_connection_away_is_tried_with_pauses(dir: &Path) ->
             summary(&lines)
         )
     })?;
-    check((2..=12).contains(&tries), || {
+    // The count includes `serve`'s own report connections: its first, empty report and the one for the phone's open,
+    // each one connection that this window turns away as well.
+    check((2..=14).contains(&tries), || {
         format!("the window was tried {tries} times")
     })?;
     check(lines.len() <= 3, || {
