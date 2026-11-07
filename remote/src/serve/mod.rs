@@ -18,6 +18,18 @@
 //!
 //! A window with `remote.enabled` starts it ([`spawn`]); it ends with exit 0 once no window has had a live `rv-` socket
 //! for [`SERVE_IDLE_EXIT`], and `eitri remote stop` ends it at once.
+//!
+//! **Its records.** `serve` opens the audit log (`<state>/eitri/remote/audit/`, `remote.audit.keep_days` of rotated
+//! files kept, pruned at the open and at each rotation) before its sandbox, which then lets it write beneath that
+//! directory and nowhere else, and writes it through one handle its threads share ([`session::Audit`]). It records
+//! `enable` once it listens and is confined, and `disable` when it ends: at the idle exit, on `SIGTERM` (`eitri remote
+//! stop`) or `SIGINT`, which a thread of its own waits for and then ends the process by the same signal, and when it
+//! fails after `enable`. It records the refusals it makes before any `hello` (`host`, `origin`, `path_prefix`,
+//! `peer_outside_interface`, with the listener and peer and no device) and, through its sessions, the rest.
+//!
+//! **Another build.** The record names its build; a reader from another build (an Eitri window or `eitri remote
+//! status` after a package upgrade) sees [`Recorded::OtherBuild`] and says to restart the windows, rather than taking
+//! the record for one still being written.
 
 #[cfg(target_os = "linux")]
 pub mod config;
@@ -86,11 +98,13 @@ mod linux {
     use agent::private_fs::PrivateLock;
     pub use eitri_core::remote_runtime::SERVE_IDLE_EXIT;
 
-    use super::config::{Record, ServeConfig, RECORD_V};
-    use super::listen::{bind, iface_of, peer_in, Listeners};
+    use eitri_core::remote_audit::{AuditLog, Event, JournalTarget, Listener, Reason, WriterKind};
+
+    use super::config::{this_build, Record, ServeConfig, RECORD_V};
+    use super::listen::{audit_listener, bind, iface_of, peer_in, Listeners};
     use super::sandbox::sandbox;
-    use super::session::{Hub, Limits};
-    use super::ws::{handshake, Conn};
+    use super::session::{Arrival, Audit, Hub, Limits};
+    use super::ws::{handshake, Conn, Handshake};
 
     pub use super::config::Listen;
     pub use super::origin::check_request;
@@ -128,6 +142,14 @@ mod linux {
     pub const EXIT_RUNNING_DIFFERENT: i32 = 4;
     /// `status`'s exit code when no `serve` runs.
     pub const EXIT_NOT_RUNNING: i32 = 3;
+
+    /// The variable a test build (`remote-test-hooks`) reads for `serve`'s idle deadline in milliseconds; a release
+    /// build has no such feature and never reads it.
+    pub const IDLE_TEST_VAR: &str = "EITRI_REMOTE_TEST_IDLE_MS";
+
+    /// What a window should do when the `serve` it found is another build's.
+    pub const OTHER_BUILD_FIX: &str =
+        "Eitri was upgraded: run eitri remote stop, then restart the Eitri windows, so the new serve starts";
 
     /// The directories `serve` works in, from the environment.
     #[derive(Debug, Clone)]
@@ -174,12 +196,36 @@ mod linux {
                 return EXIT_FAILED;
             }
         };
-        let Err((code, line)) = run_serve(&dirs, args, confirmed_listen, SERVE_IDLE_EXIT);
+        let Err((code, line)) = run_serve(&dirs, args, confirmed_listen, idle_deadline());
         eprintln!("eitri remote serve: {line}");
         code
     }
 
     enum Never {}
+
+    /// [`SERVE_IDLE_EXIT`], or a test build's [`IDLE_TEST_VAR`].
+    fn idle_deadline() -> Duration {
+        #[cfg(feature = "remote-test-hooks")]
+        if let Some(ms) = std::env::var(IDLE_TEST_VAR).ok().and_then(|v| v.parse::<u64>().ok()) {
+            return Duration::from_millis(ms);
+        }
+        SERVE_IDLE_EXIT
+    }
+
+    /// Where the journal copy goes: the journal's socket, while its directory exists (the sandbox can grant only a
+    /// directory that is there), and that directory.
+    fn journal() -> (JournalTarget, Option<PathBuf>) {
+        match eitri_core::remote_audit::journal_target() {
+            JournalTarget::Socket(path) => match path.parent().filter(|dir| dir.is_dir()) {
+                Some(dir) => {
+                    let dir = dir.to_path_buf();
+                    (JournalTarget::Socket(path), Some(dir))
+                }
+                None => (JournalTarget::Off, None),
+            },
+            JournalTarget::Off => (JournalTarget::Off, None),
+        }
+    }
 
     /// Runs `serve` until no window has had a live `rv-` socket for `idle` (then `Err` with exit 0), or fails.
     fn run_serve(
@@ -208,19 +254,37 @@ mod linux {
 
         let listeners = bind(&cfg, &dirs.control, confirmed(&dirs.state).as_deref()).map_err(|e| (EXIT_REFUSED, e))?;
         let (control, _control_path) = super::control::bind_control(&dirs.control).map_err(failed)?;
+        // Before the sandbox: it makes the audit directory, and the link's kind is read where the sandbox reads not.
+        let place = audit_listener(&cfg.listen);
+        let audit_dir = eitri_core::remote_audit::audit_dir(&dirs.state);
+        let (journal, journal_dir) = journal();
+        let log = AuditLog::open(&audit_dir, WriterKind::Serve, Some(cfg.audit_keep_days), journal)
+            .map_err(|e| failed(format!("could not open the audit log in {}: {e}", audit_dir.display())))?;
 
-        let state = sandbox(&dirs.agents(), &dirs.control, &dirs.state)
-            .map_err(|e| failed(format!("could not confine itself: {e}")))?;
+        let state = sandbox(
+            &dirs.agents(),
+            &dirs.control,
+            &dirs.state,
+            &audit_dir,
+            journal_dir.as_deref(),
+        )
+        .map_err(|e| failed(format!("could not confine itself: {e}")))?;
+        let audit = Audit::new(log, &audit_dir);
         let sandbox_why = state.missing();
         if let Some(missing) = &sandbox_why {
             eprintln!("[remote] serving with a partial sandbox: {missing}");
         }
+        // Blocked before any thread starts, so every thread inherits the mask and only the waiter takes them, and
+        // before the record that `eitri remote stop` reads the pid from: a stop from then on is held for the waiter,
+        // which records `disable` after `enable`.
+        let signals = block_end_signals();
         let record = Record {
             v: RECORD_V,
             pid: std::process::id(),
             args: cfg.to_args(),
             sandbox: state.word().to_owned(),
             sandbox_why,
+            build: Some(this_build()),
         };
         let mut line = serde_json::to_vec(&record).map_err(|e| failed(e.to_string()))?;
         line.push(b'\n');
@@ -229,18 +293,85 @@ mod linux {
             .map_err(|e| failed(format!("could not write the record: {e}")))?;
         drop(record_file);
 
-        let hub = Hub::start(&dirs.control, &dirs.state.join(DEVICES_FILE), Limits::default())
-            .map_err(|e| failed(format!("could not start serving: {e}")))?;
-        accept_all(listeners, Arc::new(cfg), hub);
+        audit.record(Event::Enable {
+            listener: place.clone(),
+            confirmed: matches!(cfg.listen, super::config::Listen::Address { .. }),
+        });
+        let ended = |e: String| {
+            audit.disable_once("failed");
+            failed(e)
+        };
+        std::thread::Builder::new()
+            .name("eitri-remote-signals".into())
+            .spawn({
+                let audit = audit.clone();
+                move || end_on_signal(signals, &audit)
+            })
+            .map_err(|e| ended(format!("could not start: {e}")))?;
+        let hub = Hub::start_audited(
+            &dirs.control,
+            &dirs.state.join(DEVICES_FILE),
+            Limits::default(),
+            audit.clone(),
+        )
+        .map_err(|e| ended(format!("could not start serving: {e}")))?;
+        accept_all(listeners, Arc::new(cfg), hub, Arc::new(place));
         super::control::serve_control(control, dirs.control.clone())
-            .map_err(|e| failed(format!("could not answer the control socket: {e}")))?;
+            .map_err(|e| ended(format!("could not answer the control socket: {e}")))?;
         // The lock is held for as long as the process runs: a window that looks while it waits here sees it running.
         let _held = lock;
         wait_for_no_window(&dirs.control, idle, idle_poll(idle));
+        audit.disable_once("idle");
         Err((
             0,
-            format!("no window has had remote control on for {} s; ending", idle.as_secs()),
+            format!(
+                "no window has had remote control on for {} ms; ending",
+                idle.as_millis()
+            ),
         ))
+    }
+
+    /// The signals that end `serve` and are recorded first: `SIGTERM` (`eitri remote stop`) and, unless it was
+    /// ignored when `serve` started, `SIGINT`. Blocked in the calling thread; the set to wait for is returned.
+    fn block_end_signals() -> libc::sigset_t {
+        // SAFETY: `set` is a local `sigset_t` initialised by `sigemptyset` before use; `old` is written by `sigaction`
+        // with a null new action, which changes nothing; `pthread_sigmask` reads `set` only.
+        unsafe {
+            let mut set: libc::sigset_t = std::mem::zeroed();
+            libc::sigemptyset(&mut set);
+            libc::sigaddset(&mut set, libc::SIGTERM);
+            let mut old: libc::sigaction = std::mem::zeroed();
+            if libc::sigaction(libc::SIGINT, std::ptr::null(), &mut old) == 0 && old.sa_sigaction != libc::SIG_IGN {
+                libc::sigaddset(&mut set, libc::SIGINT);
+            }
+            libc::pthread_sigmask(libc::SIG_BLOCK, &set, std::ptr::null_mut());
+            set
+        }
+    }
+
+    /// Waits for one of `signals`, records `disable`, and ends the process by that same signal, so whoever waits for
+    /// it sees it end as it would have without the record.
+    fn end_on_signal(signals: libc::sigset_t, audit: &Audit) {
+        let mut signal: libc::c_int = 0;
+        // SAFETY: `signals` is an initialised set and `signal` a local the call writes.
+        if unsafe { libc::sigwait(&signals, &mut signal) } != 0 {
+            return;
+        }
+        audit.disable_once(if signal == libc::SIGTERM {
+            "stopped"
+        } else {
+            "interrupted"
+        });
+        // SAFETY: restores the default action for `signal`, unblocks it in this thread and raises it here; the
+        // default action ends the process. No pointer outlives its call.
+        unsafe {
+            libc::signal(signal, libc::SIG_DFL);
+            let mut one: libc::sigset_t = std::mem::zeroed();
+            libc::sigemptyset(&mut one);
+            libc::sigaddset(&mut one, signal);
+            libc::pthread_sigmask(libc::SIG_UNBLOCK, &one, std::ptr::null_mut());
+            libc::raise(signal);
+        }
     }
 
     /// How often the windows are looked for while `serve` waits for the last to go.
@@ -283,11 +414,17 @@ mod linux {
 
     /// What a second `serve` says: the running one's pid and how this one's configuration differs from it.
     fn already_running(dirs: &Dirs, asked: &ServeConfig) -> (i32, String) {
-        let Some((record, running)) = read_record(dirs) else {
-            return (
-                EXIT_RUNNING_SAME,
-                "already running (still starting: its record is not written yet)".to_owned(),
-            );
+        let (record, running) = match read_recorded(dirs) {
+            Recorded::Whole(record, running) => (record, running),
+            Recorded::OtherBuild { pid, build } => {
+                return (EXIT_RUNNING_DIFFERENT, other_build_text(pid, build.as_deref()));
+            }
+            Recorded::NotYet => {
+                return (
+                    EXIT_RUNNING_SAME,
+                    "already running (still starting: its record is not written yet)".to_owned(),
+                )
+            }
         };
         let differences = running.differences(asked);
         if differences.is_empty() {
@@ -304,16 +441,78 @@ mod linux {
         }
     }
 
-    /// The running `serve`'s record and the configuration it holds, when the record is whole.
-    pub fn read_record(dirs: &Dirs) -> Option<(Record, ServeConfig)> {
-        let text = agent::private_fs::read_private_nofollow_capped(&dirs.control.join(RECORD_FILE), 64 * 1024).ok()?;
-        let record: Record = serde_json::from_str(text.trim_end()).ok()?;
+    /// What the record of the running `serve` says.
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    pub enum Recorded {
+        /// A record of this build, whole, and the configuration it holds.
+        Whole(Record, ServeConfig),
+        /// A record another build wrote (`build` is its own name for itself, `None` from a build that named none): only
+        /// its pid is read.
+        OtherBuild { pid: u32, build: Option<String> },
+        /// Nothing whole yet: `serve` empties it when it takes the lock and writes it once it is confined.
+        NotYet,
+    }
+
+    /// Reads the record beside the lock. Its build is looked at first, in a reading that takes any fields, so a record
+    /// of another build is named as such whatever its shape; only this build's is read field by field.
+    pub fn read_recorded(dirs: &Dirs) -> Recorded {
+        let Ok(text) = agent::private_fs::read_private_nofollow_capped(&dirs.control.join(RECORD_FILE), 64 * 1024)
+        else {
+            return Recorded::NotYet;
+        };
+        let Ok(loose) = serde_json::from_str::<serde_json::Value>(text.trim_end()) else {
+            return Recorded::NotYet;
+        };
+        let build = loose.get("build").and_then(serde_json::Value::as_str);
+        if build != Some(this_build().as_str()) {
+            return match loose
+                .get("pid")
+                .and_then(serde_json::Value::as_u64)
+                .and_then(|p| u32::try_from(p).ok())
+            {
+                Some(pid) => Recorded::OtherBuild {
+                    pid,
+                    build: build.map(str::to_owned),
+                },
+                None => Recorded::NotYet,
+            };
+        }
+        let Ok(record) = serde_json::from_value::<Record>(loose) else {
+            return Recorded::NotYet;
+        };
         if record.v != RECORD_V {
-            return None;
+            return Recorded::NotYet;
         }
         // The interface was looked up when it started; an address this machine no longer has keeps an empty name.
-        let cfg = ServeConfig::from_args(&record.args, || Ok(0), |addr| iface_of(addr).or(Some(String::new()))).ok()?;
-        Some((record, cfg))
+        match ServeConfig::from_args(&record.args, || Ok(0), |addr| iface_of(addr).or(Some(String::new()))) {
+            Ok(cfg) => Recorded::Whole(record, cfg),
+            Err(_) => Recorded::NotYet,
+        }
+    }
+
+    /// The running `serve`'s record and the configuration it holds, when the record is whole and this build's.
+    pub fn read_record(dirs: &Dirs) -> Option<(Record, ServeConfig)> {
+        match read_recorded(dirs) {
+            Recorded::Whole(record, cfg) => Some((record, cfg)),
+            Recorded::OtherBuild { .. } | Recorded::NotYet => None,
+        }
+    }
+
+    /// When the running `serve`'s record is another build's, what the desk is told.
+    pub fn other_build(dirs: &Dirs) -> Option<String> {
+        match read_recorded(dirs) {
+            Recorded::OtherBuild { pid, build } => Some(other_build_text(pid, build.as_deref())),
+            Recorded::Whole(..) | Recorded::NotYet => None,
+        }
+    }
+
+    /// What is said of a running `serve` that another build started.
+    pub fn other_build_text(pid: u32, build: Option<&str>) -> String {
+        let theirs = build.map_or_else(|| "an earlier build".to_owned(), |b| format!("build {b}"));
+        format!(
+            "eitri remote serve (pid {pid}) is from another Eitri build ({theirs}; this is {}): {OTHER_BUILD_FIX}",
+            this_build()
+        )
     }
 
     /// Whether a `serve` holds the lock now.
@@ -327,12 +526,13 @@ mod linux {
         Ok(!PrivateLock::open(&path)?.try_lock()?)
     }
 
-    fn accept_all(listeners: Listeners, cfg: Arc<ServeConfig>, hub: Arc<Hub>) {
+    fn accept_all(listeners: Listeners, cfg: Arc<ServeConfig>, hub: Arc<Hub>, place: Arc<Listener>) {
         let open = Arc::new(AtomicUsize::new(0));
         let ranges = Arc::new(listeners.peer_ranges);
         for listener in listeners.tcp {
-            let (cfg, open, ranges, hub) = (cfg.clone(), open.clone(), ranges.clone(), hub.clone());
-            std::thread::spawn(move || accept_tcp(listener, cfg, open, ranges, hub));
+            let (cfg, open, ranges, hub, place) =
+                (cfg.clone(), open.clone(), ranges.clone(), hub.clone(), place.clone());
+            std::thread::spawn(move || accept_tcp(listener, cfg, open, ranges, hub, place));
         }
         if let Some((listener, _path)) = listeners.unix {
             std::thread::spawn(move || accept_unix(listener, cfg, open, hub));
@@ -374,27 +574,34 @@ mod linux {
         open: Arc<AtomicUsize>,
         ranges: Arc<Option<Vec<(std::net::IpAddr, u8)>>>,
         hub: Arc<Hub>,
+        place: Arc<Listener>,
     ) {
         for stream in listener.incoming() {
             let Ok(stream) = stream else {
                 pause_after_accept_error();
                 continue;
             };
+            let peer = stream
+                .peer_addr()
+                .map_or_else(|_| "unknown".to_owned(), |peer| peer.to_string());
             if let Some(networks) = ranges.as_ref() {
                 if !stream.peer_addr().is_ok_and(|peer| peer_in(peer.ip(), networks)) {
+                    record_early_refusal(&hub, Reason::PeerOutsideInterface, &place, &peer);
                     continue;
                 }
             }
             let Some(slot) = Slot::take(&open) else { continue };
-            let (cfg, hub) = (cfg.clone(), hub.clone());
-            let peer = stream
-                .peer_addr()
-                .map_or_else(|_| "unknown".to_owned(), |peer| peer.to_string());
+            let (cfg, hub, place) = (cfg.clone(), hub.clone(), place.clone());
             std::thread::spawn(move || {
                 let _slot = slot;
-                answer(Box::new(stream), &cfg, &hub, peer);
+                answer(Box::new(stream), &cfg, &hub, peer, &place);
             });
         }
+    }
+
+    /// A refusal before any `hello`: where it came in and from, and no device.
+    fn record_early_refusal(hub: &Hub, reason: Reason, place: &Listener, peer: &str) {
+        hub.audit().record_early_refusal(reason, None, place, peer);
     }
 
     fn accept_unix(listener: UnixListener, cfg: Arc<ServeConfig>, open: Arc<AtomicUsize>, hub: Arc<Hub>) {
@@ -412,7 +619,7 @@ mod linux {
             std::thread::spawn(move || {
                 let _slot = slot;
                 // An SSH forward or a local client: the address says nothing more.
-                answer(Box::new(stream), &cfg, &hub, "unix".to_owned());
+                answer(Box::new(stream), &cfg, &hub, "unix".to_owned(), &Listener::Socket);
             });
         }
     }
@@ -423,9 +630,23 @@ mod linux {
         std::thread::sleep(Duration::from_millis(50));
     }
 
-    fn answer(mut stream: Box<dyn Conn>, cfg: &ServeConfig, hub: &Arc<Hub>, peer: String) {
-        if let Ok(Some(host)) = handshake(stream.as_mut(), cfg) {
-            hub.serve_phone(stream, host, peer);
+    fn answer(mut stream: Box<dyn Conn>, cfg: &ServeConfig, hub: &Arc<Hub>, peer: String, place: &Listener) {
+        match handshake(stream.as_mut(), cfg) {
+            Ok(Handshake::Upgraded { host, origin }) => {
+                let arrival = Arrival {
+                    host,
+                    origin,
+                    peer,
+                    listener: place.clone(),
+                };
+                hub.serve_phone_from(stream, arrival);
+            }
+            Ok(Handshake::Refused(why)) => {
+                if let Some(reason) = super::origin::refusal_reason(why) {
+                    record_early_refusal(hub, reason, place, &peer);
+                }
+            }
+            Ok(Handshake::Gone) | Err(_) => {}
         }
     }
 
@@ -455,15 +676,20 @@ mod linux {
             }
         }
         let mut out = io::stdout().lock();
-        match read_record(&dirs) {
-            Some((record, cfg)) => {
-                let _ = write_status(&mut out, &record, &cfg);
-            }
-            None => {
-                let _ = writeln!(out, "running: starting");
-            }
-        }
+        let _ = write_status_of(&mut out, &read_recorded(&dirs));
         0
+    }
+
+    /// What `status` prints for a running `serve` whose record says `recorded`.
+    fn write_status_of(out: &mut impl Write, recorded: &Recorded) -> io::Result<()> {
+        match recorded {
+            Recorded::Whole(record, cfg) => write_status(out, record, cfg),
+            Recorded::OtherBuild { pid, build } => {
+                writeln!(out, "running: pid {pid}")?;
+                writeln!(out, "build: {}", other_build_text(*pid, build.as_deref()))
+            }
+            Recorded::NotYet => writeln!(out, "running: starting"),
+        }
     }
 
     fn write_status(out: &mut impl Write, record: &Record, cfg: &ServeConfig) -> io::Result<()> {
@@ -529,15 +755,20 @@ mod linux {
             println!("not running");
             return 0;
         }
-        let Some((record, _)) = read_record(&dirs) else {
-            eprintln!("eitri remote stop: it is still starting; try again");
-            return EXIT_FAILED;
+        // Another build's `serve` is stopped all the same: only its pid is needed.
+        let pid = match read_recorded(&dirs) {
+            Recorded::Whole(record, _) => record.pid,
+            Recorded::OtherBuild { pid, .. } => pid,
+            Recorded::NotYet => {
+                eprintln!("eitri remote stop: it is still starting; try again");
+                return EXIT_FAILED;
+            }
         };
         // The holder empties the record as soon as it takes the lock and writes it only while holding it, and the
         // lock goes with the process, so a pid read while it is held names the holder (unless the holder ended
         // between the two looks and its pid was taken again in that moment).
         // SAFETY: `kill` takes no pointers.
-        if unsafe { libc::kill(record.pid as libc::pid_t, libc::SIGTERM) } != 0 {
+        if unsafe { libc::kill(pid as libc::pid_t, libc::SIGTERM) } != 0 {
             eprintln!("eitri remote stop: {}", io::Error::last_os_error());
             return EXIT_FAILED;
         }
@@ -549,7 +780,7 @@ mod linux {
             }
             std::thread::sleep(Duration::from_millis(50));
         }
-        eprintln!("eitri remote stop: pid {} still holds the lock after 5 s", record.pid);
+        eprintln!("eitri remote stop: pid {pid} still holds the lock after 5 s");
         EXIT_FAILED
     }
     #[cfg(test)]
@@ -705,6 +936,108 @@ mod linux {
                 "a lock held only for a look was taken as a running serve"
             );
             release.join().unwrap();
+        }
+
+        #[test]
+        fn a_serve_from_another_build_says_to_restart_the_windows() {
+            let dir = scratch("skew");
+            let dirs = Dirs {
+                control: dir.join("control"),
+                state: dir.join("state"),
+            };
+            eitri_core::panel_control::ensure_dir(&dirs.control).unwrap();
+            let cfg =
+                ServeConfig::from_args(&["--listen".to_owned(), "socket".to_owned()], || Ok(7500), |_| None).unwrap();
+            for (body, build) in [
+                // A build from before the record named its build.
+                (r#"{"v":1,"pid":7,"args":["--listen","socket"],"sandbox":"full"}"#, None),
+                // A later build's, with a field this one does not know.
+                (
+                    r#"{"v":1,"pid":7,"args":["--listen","socket"],"sandbox":"full","build":"9.9.9-0","later":1}"#,
+                    Some("9.9.9-0"),
+                ),
+            ] {
+                std::fs::write(dirs.control.join(RECORD_FILE), format!("{body}\n")).unwrap();
+                assert!(read_record(&dirs).is_none(), "{body}");
+                assert_eq!(
+                    read_recorded(&dirs),
+                    Recorded::OtherBuild {
+                        pid: 7,
+                        build: build.map(str::to_owned)
+                    },
+                    "{body}"
+                );
+                let mut out = Vec::new();
+                write_status_of(&mut out, &read_recorded(&dirs)).unwrap();
+                let text = String::from_utf8(out).unwrap();
+                assert!(text.starts_with("running: pid 7\n"), "{text}");
+                assert!(
+                    text.contains("Eitri was upgraded") && text.contains("restart the Eitri windows"),
+                    "{text}"
+                );
+                let (code, line) = already_running(&dirs, &cfg);
+                assert_eq!(code, EXIT_RUNNING_DIFFERENT, "{line}");
+                assert!(line.contains("Eitri was upgraded"), "{line}");
+            }
+            let ours = serde_json::json!({
+                "v": RECORD_V, "pid": 8, "args": ["--listen", "socket", "--port", "7500"], "sandbox": "full",
+                "build": super::super::config::this_build(),
+            });
+            std::fs::write(dirs.control.join(RECORD_FILE), format!("{ours}\n")).unwrap();
+            assert!(matches!(read_recorded(&dirs), Recorded::Whole(record, _) if record.pid == 8));
+            assert_eq!(already_running(&dirs, &cfg).0, EXIT_RUNNING_SAME);
+        }
+
+        #[test]
+        fn a_peer_outside_the_interface_is_recorded() {
+            use eitri_core::remote_audit::{read, AuditLog, Filter, JournalTarget, Listener, WriterKind};
+            let dir = scratch("outside");
+            let control = dir.join("control");
+            eitri_core::panel_control::ensure_dir(&control).unwrap();
+            let audit_dir = dir.join("audit");
+            let log = AuditLog::open(&audit_dir, WriterKind::Serve, None, JournalTarget::Off).unwrap();
+            let hub = Hub::start_audited(
+                &control,
+                &dir.join(DEVICES_FILE),
+                Limits::default(),
+                super::super::session::Audit::new(log, &audit_dir),
+            )
+            .unwrap();
+            let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+            let addr = listener.local_addr().unwrap();
+            let cfg = Arc::new(ServeConfig::from_args(&[], || Ok(addr.port()), |_| None).unwrap());
+            let ranges = Arc::new(Some(vec![("198.51.100.0".parse().unwrap(), 24)]));
+            let place = Arc::new(Listener::Address {
+                addr: "198.51.100.2".into(),
+                iface: "wg0".into(),
+                kind: "wireguard".into(),
+            });
+            let open = Arc::new(AtomicUsize::new(0));
+            std::thread::spawn(move || accept_tcp(listener, cfg, open, ranges, hub, place));
+            let _peer = std::net::TcpStream::connect(addr).unwrap();
+            let until = Instant::now() + Duration::from_secs(30);
+            let refused = loop {
+                let got = read(&audit_dir, &Filter::default(), None).unwrap();
+                if let Some(record) = got.into_iter().find(|r| r.event == "refused") {
+                    break record;
+                }
+                assert!(Instant::now() < until, "no refusal was recorded");
+                std::thread::sleep(Duration::from_millis(10));
+            };
+            assert_eq!(refused.fields["reason"], "peer_outside_interface");
+            assert_eq!(refused.fields["listener"], "address");
+            assert_eq!(refused.fields["listen_iface"], "wg0");
+            assert!(
+                refused.fields["peer"]
+                    .as_str()
+                    .is_some_and(|p| p.starts_with("127.0.0.1:")),
+                "{:?}",
+                refused.fields
+            );
+            assert!(
+                refused.fields.get("device").is_none(),
+                "a refusal before hello names no device"
+            );
         }
 
         #[test]

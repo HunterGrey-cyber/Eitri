@@ -789,13 +789,10 @@ fn note_stop(state: &mut AgentPanelState, tab: TabId, id: String, origin: &Remot
     }
 }
 
-/// Leaves the targeted tab a bounded refusal notice. Callers with a device id use it as the counter key.
-pub fn refusal_notice(state: &mut AgentPanelState, tab: TabId, device: &str, reason: &str) {
-    refusal_notice_at(state, tab, device, reason, std::time::Instant::now());
-}
-
-fn refusal_notice_at(state: &mut AgentPanelState, tab: TabId, device: &str, reason: &str, now: std::time::Instant) {
-    refusal_notice_for(state, tab, device, device, reason, now);
+/// Leaves the targeted tab a bounded refusal notice naming `device`, counted under the store's `device_id` with every
+/// other refusal of that device on the tab, wherever it was decided.
+pub fn refusal_notice(state: &mut AgentPanelState, tab: TabId, device_id: &str, device: &str, reason: &str) {
+    refusal_notice_for(state, tab, device_id, device, reason, std::time::Instant::now());
 }
 
 pub(super) fn refusal_notice_for(
@@ -926,17 +923,19 @@ mod tests {
         handle.tick();
         clear(&[&base]);
         let now = std::time::Instant::now();
-        for _ in 0..100 {
-            refusal_notice_at(&mut handle.state.borrow_mut(), tab, "Pixel 8", "no grant", now);
+        refusal_notice(&mut handle.state.borrow_mut(), tab, "dev-1", "Pixel 8", "no grant");
+        for _ in 0..99 {
+            refusal_notice_for(&mut handle.state.borrow_mut(), tab, "dev-1", "Pixel 8", "no grant", now);
         }
         handle.tick();
         assert_eq!(notices(&base.sent.borrow()), ["refused from Pixel 8: no grant"]);
-        refusal_notice_at(
+        refusal_notice_for(
             &mut handle.state.borrow_mut(),
             tab,
+            "dev-1",
             "Pixel 8",
             "no grant",
-            now + std::time::Duration::from_secs(10),
+            std::time::Instant::now() + std::time::Duration::from_secs(10),
         );
         handle.tick();
         assert_eq!(
@@ -944,7 +943,8 @@ mod tests {
             [
                 "refused from Pixel 8: no grant",
                 "refused from Pixel 8: no grant (and 99 more)"
-            ]
+            ],
+            "the public entry and the window's own refusals share one counter per device id"
         );
         shut_down_every_tab(&handle);
     }

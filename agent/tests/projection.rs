@@ -1924,7 +1924,8 @@ fn a_message_put_into_the_turn_is_a_prompt_where_the_agent_read_it() {
     assert_eq!(projection.active_turn_id.as_deref(), Some("t1"), "the turn goes on");
     assert_eq!(
         projection.steer_outcome("eitri-1-1"),
-        Some(&agent::SteerOutcome::Delivered)
+        Some(&agent::SteerOutcome::Delivered { seq: before }),
+        "the outcome names the prompt it became"
     );
 
     let prompts = projection.user_prompts.clone();

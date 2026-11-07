@@ -123,12 +123,14 @@ impl WakeRules {
     pub fn tick(&mut self, now: Instant, ctx: &Ctx<'_>) -> Vec<(Target, Wake)> {
         self.reconcile(ctx);
         let desk_active = ctx.desk_active_until.is_some_and(|until| now < until);
+        // A row on its way to another window keeps a held wake, which goes only once a row here needs the person.
+        let needs_here = self.rows.values().any(|class| *class == Class::Needs);
         let mut due = Vec::new();
         for target in ctx.targets {
             let Some(device) = self.devices.get_mut(&target.device_id) else {
                 continue;
             };
-            if !desk_active && device.needs_you.take_due(now, NEEDS_YOU_COALESCE) {
+            if !desk_active && needs_here && device.needs_you.take_due(now, NEEDS_YOU_COALESCE) {
                 due.push((target.clone(), Wake::NeedsYou));
             }
             if device.finished.take_due(now, FINISHED_COALESCE) {
@@ -139,7 +141,11 @@ impl WakeRules {
     }
 
     fn reconcile(&mut self, ctx: &Ctx<'_>) {
-        let needs_you = self.rows.values().any(|class| *class == Class::Needs);
+        let needs_you = self
+            .rows
+            .values()
+            .chain(self.moved.values())
+            .any(|class| *class == Class::Needs);
         self.devices
             .retain(|id, _| ctx.targets.iter().any(|target| target.device_id == *id));
         for (id, device) in &mut self.devices {
@@ -472,6 +478,33 @@ mod tests {
         assert_eq!(
             rules.on_change(&row("y", Class::Quiet), later, &ctx),
             vec![(targets[0].clone(), Wake::Finished)]
+        );
+    }
+
+    #[test]
+    fn moved_row_keeps_its_held_wake_until_it_lands() {
+        let now = Instant::now();
+        let targets = [target("a", &[])];
+        let connected = BTreeSet::new();
+        let mut ctx = ctx(&targets, &connected);
+        ctx.desk_active_until = Some(now + DESK_ACTIVE_HOLD);
+        let mut rules = WakeRules::new();
+        assert!(rules.on_change(&row("x", Class::Needs), now, &ctx).is_empty());
+        rules.on_change(&gone("x", GoneWhy::Moved), now, &ctx);
+        assert!(rules.on_change(&row("x", Class::Needs), now, &ctx).is_empty());
+        assert_eq!(
+            rules.tick(now + DESK_ACTIVE_HOLD, &ctx),
+            vec![(targets[0].clone(), Wake::NeedsYou)],
+            "the tab still needs the person where it landed"
+        );
+
+        let mut rules = WakeRules::new();
+        rules.on_change(&row("x", Class::Needs), now, &ctx);
+        rules.on_change(&gone("x", GoneWhy::Moved), now, &ctx);
+        rules.on_change(&row("x", Class::Quiet), now, &ctx);
+        assert!(
+            rules.tick(now + DESK_ACTIVE_HOLD, &ctx).is_empty(),
+            "it landed no longer needing anyone"
         );
     }
 

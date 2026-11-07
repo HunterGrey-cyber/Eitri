@@ -49,8 +49,15 @@ fn passed_to_serve(key: &OsStr) -> bool {
     let Some(key) = key.to_str() else {
         return false;
     };
-    matches!(key, "HOME" | "PATH" | "TMPDIR" | "LANG" | "LANGUAGE") || key.starts_with("XDG_") || key.starts_with("LC_")
+    let hooks = cfg!(feature = "remote-test-hooks") && matches!(key, super::IDLE_TEST_VAR | JOURNAL_SOCKET_VAR);
+    hooks
+        || matches!(key, "HOME" | "PATH" | "TMPDIR" | "LANG" | "LANGUAGE")
+        || key.starts_with("XDG_")
+        || key.starts_with("LC_")
 }
+
+/// A test build's journal socket, handed on to the `serve` a window starts in a test.
+const JOURNAL_SOCKET_VAR: &str = eitri_core::remote_audit::JOURNAL_SOCKET_VAR;
 
 /// The part of `vars` (a window's environment) `serve` is started with.
 pub fn serve_env(vars: impl IntoIterator<Item = (OsString, OsString)>) -> Vec<(OsString, OsString)> {
@@ -59,7 +66,7 @@ pub fn serve_env(vars: impl IntoIterator<Item = (OsString, OsString)>) -> Vec<(O
 
 /// The configuration the running `serve` holds, from its record, in the window's terms (its port settled): what a
 /// window that finds `serve` running pairs phones with, whatever its own `remote.*` keys say. `None` when no record is
-/// whole (no `serve`, or one still starting).
+/// whole (no `serve`, or one still starting) or the record is another build's (`serve::other_build` says so).
 pub fn running_config(dirs: &Dirs) -> Option<ServeConfig> {
     let (_, running) = read_record(dirs)?;
     Some(ServeConfig {
@@ -70,6 +77,7 @@ pub fn running_config(dirs: &Dirs) -> Option<ServeConfig> {
         },
         port: Some(running.port),
         origins: running.origins,
+        audit_keep_days: running.audit_keep_days,
     })
 }
 
@@ -241,7 +249,11 @@ mod tests {
             let mut file = agent::private_fs::open_private(&path).unwrap();
             std::io::Write::write_all(
                 &mut file,
-                format!(r#"{{"v":1,"pid":1,"args":{args},"sandbox":"full"}}"#).as_bytes(),
+                format!(
+                    r#"{{"v":1,"pid":1,"args":{args},"sandbox":"full","build":{}}}"#,
+                    serde_json::json!(super::super::config::this_build())
+                )
+                .as_bytes(),
             )
             .unwrap();
             let cfg = running_config(&dirs).unwrap_or_else(|| panic!("{args} was not read"));
@@ -258,6 +270,7 @@ mod tests {
             listen: RemoteListen::Loopback,
             port: None,
             origins: Vec::new(),
+            audit_keep_days: eitri_core::remote_audit::AUDIT_KEEP_DAYS_DEFAULT,
         };
         for (body, want) in [
             ("exit 4", ServeEnded::RunningDifferent),
@@ -347,6 +360,7 @@ mod tests {
             listen: RemoteListen::Loopback,
             port: None,
             origins: Vec::new(),
+            audit_keep_days: eitri_core::remote_audit::AUDIT_KEEP_DAYS_DEFAULT,
         };
         ServeSpawner::new(exe.clone())
             .env("XDG_RUNTIME_DIR", &dir)

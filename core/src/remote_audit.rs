@@ -130,23 +130,30 @@ pub enum JournalTarget {
 }
 
 /// The journal's socket when it exists, else [`JournalTarget::Off`]. A build with the `remote-test-hooks` feature
-/// takes a non-empty [`JOURNAL_SOCKET_VAR`] first, so tests never write to the real journal; a release build has no
-/// such feature and never reads the variable.
+/// (every test build of the workspace, since `shell`'s tests enable it) takes a non-empty [`JOURNAL_SOCKET_VAR`] and
+/// otherwise sends no copy, so no test writes to the real journal; a release build has no such feature and never
+/// reads the variable.
 pub fn journal_target() -> JournalTarget {
     journal_target_with(|name| std::env::var_os(name), |path| path.exists())
 }
 
 fn journal_target_with(env: impl Fn(&str) -> Option<OsString>, socket_exists: impl Fn(&Path) -> bool) -> JournalTarget {
     #[cfg(feature = "remote-test-hooks")]
-    if let Some(path) = env(JOURNAL_SOCKET_VAR).filter(|v| !v.is_empty()) {
-        return JournalTarget::Socket(PathBuf::from(path));
+    {
+        let _ = socket_exists;
+        match env(JOURNAL_SOCKET_VAR).filter(|v| !v.is_empty()) {
+            Some(path) => JournalTarget::Socket(PathBuf::from(path)),
+            None => JournalTarget::Off,
+        }
     }
     #[cfg(not(feature = "remote-test-hooks"))]
-    let _ = env;
-    if socket_exists(Path::new(JOURNAL_SOCKET)) {
-        JournalTarget::Socket(PathBuf::from(JOURNAL_SOCKET))
-    } else {
-        JournalTarget::Off
+    {
+        let _ = env;
+        if socket_exists(Path::new(JOURNAL_SOCKET)) {
+            JournalTarget::Socket(PathBuf::from(JOURNAL_SOCKET))
+        } else {
+            JournalTarget::Off
+        }
     }
 }
 
@@ -355,6 +362,8 @@ pub enum Event {
         command_id: String,
         text: Option<TextDigest>,
     },
+    /// `dropped`: how many refusals before any device was proved went unrecorded since the last recorded one (a
+    /// writer bounds those, since anyone who can reach a listener can be refused).
     Refused {
         reason: Reason,
         device: Option<DeviceRef>,
@@ -362,6 +371,7 @@ pub enum Event {
         peer: Option<String>,
         key: Option<String>,
         kind: Option<String>,
+        dropped: Option<u64>,
     },
 }
 
@@ -533,6 +543,7 @@ impl Event {
                 peer,
                 key,
                 kind,
+                dropped,
             } => {
                 put_str(&mut f, "reason", reason.as_str().into());
                 if let Some(device) = device {
@@ -545,6 +556,9 @@ impl Event {
                     if let Some(value) = value {
                         put_str(&mut f, name, value);
                     }
+                }
+                if let Some(dropped) = dropped {
+                    f.push(("dropped", dropped.into()));
                 }
             }
         }
@@ -562,6 +576,8 @@ pub struct AuditLog {
     writer: String,
     run: String,
     seq: u64,
+    /// The hash of the last line this writer appended: what a record the file refused names as its `prev`.
+    last_hash: Option<String>,
     keep_days: Option<u32>,
     journal: journal::Journal,
     now: Clock,
@@ -593,6 +609,7 @@ impl AuditLog {
             writer: writer.name().to_string(),
             run: new_run_id(),
             seq: 0,
+            last_hash: None,
             keep_days,
             journal: journal::Journal::new(journal),
             now,
@@ -611,52 +628,79 @@ impl AuditLog {
     }
 
     /// Appends `event` as one line chained to the line before it, rotates when the file has passed its size, and
-    /// sends the line to the journal. Fails only when the line could not be written to the file.
+    /// sends the line to the journal. Fails only when the line could not be written to the file; the journal gets
+    /// the record then too, under its own number, so a file made unwritable cannot silence the journal's copy:
+    /// `verify` names it as missing from the file.
     pub fn record(&mut self, event: Event) -> io::Result<()> {
         let name = event.name();
         let fields = event.into_fields();
-        let line = {
-            let _lock = self.lock()?;
-            let mut file = chain::open_current(&self.dir)?;
-            let (prev, open_tail) = match chain::tail(&file)? {
-                Some(tail) => (tail.hash, !tail.closed),
-                None => (chain::previous_file_hash(&self.dir)?, false),
-            };
-            let seq = self.seq + 1;
-            let header = chain::Header {
-                time: format_time((self.now)()),
-                writer: &self.writer,
-                run: &self.run,
-                seq,
-                event: name,
-                prev: &prev,
-            };
-            let line = chain::render_within(&header, fields)?;
-            // A writer that died mid-line leaves a tail without its newline; the new line must not be glued onto
-            // it. The fragment becomes a line of its own, which no reader parses and the chain still covers.
-            let mut bytes = Vec::with_capacity(line.len() + 2);
-            if open_tail {
-                bytes.push(b'\n');
+        let seq = self.seq + 1;
+        let written = self.append(name, seq, fields.clone());
+        self.seq = seq;
+        let line = match written {
+            Ok(line) => {
+                self.last_hash = Some(chain::line_hash(line.as_bytes()));
+                line
             }
-            bytes.extend_from_slice(line.as_bytes());
+            Err(e) => {
+                let prev = self.last_hash.clone().unwrap_or_else(|| chain::ZERO_PREV.to_string());
+                let header = chain::Header {
+                    time: format_time((self.now)()),
+                    writer: &self.writer,
+                    run: &self.run,
+                    seq,
+                    event: name,
+                    prev: &prev,
+                };
+                if let Ok(line) = chain::render_within(&header, fields) {
+                    self.journal.send(name, &self.writer, &self.run, seq, &line);
+                }
+                return Err(e);
+            }
+        };
+        self.journal.send(name, &self.writer, &self.run, seq, &line);
+        Ok(())
+    }
+
+    /// Writes one record numbered `seq` to the file under the lock, rotating after it when the file has passed its
+    /// size; the line written.
+    fn append(&mut self, name: &'static str, seq: u64, fields: Fields) -> io::Result<String> {
+        let _lock = self.lock()?;
+        let mut file = chain::open_current(&self.dir)?;
+        let (prev, open_tail) = match chain::tail(&file)? {
+            Some(tail) => (tail.hash, !tail.closed),
+            None => (chain::previous_file_hash(&self.dir)?, false),
+        };
+        let header = chain::Header {
+            time: format_time((self.now)()),
+            writer: &self.writer,
+            run: &self.run,
+            seq,
+            event: name,
+            prev: &prev,
+        };
+        let line = chain::render_within(&header, fields)?;
+        // A writer that died mid-line leaves a tail without its newline; the new line must not be glued onto
+        // it. The fragment becomes a line of its own, which no reader parses and the chain still covers.
+        let mut bytes = Vec::with_capacity(line.len() + 2);
+        if open_tail {
             bytes.push(b'\n');
-            chain::append(&mut file, &bytes)?;
-            self.seq = seq;
-            let size = file.metadata().map(|m| m.len()).unwrap_or(0);
-            drop(file);
-            if size > self.rotate_bytes {
-                if let Err(e) = rotate::rotate(&self.dir) {
-                    eprintln!("eitri: the remote audit log was not rotated (tried again with the next record): {e}");
-                } else if let Some(days) = self.keep_days {
-                    if let Err(e) = rotate::prune(&self.dir, days, (self.now)()) {
-                        eprintln!("eitri: old remote audit files were not removed: {e}");
-                    }
+        }
+        bytes.extend_from_slice(line.as_bytes());
+        bytes.push(b'\n');
+        chain::append(&mut file, &bytes)?;
+        let size = file.metadata().map(|m| m.len()).unwrap_or(0);
+        drop(file);
+        if size > self.rotate_bytes {
+            if let Err(e) = rotate::rotate(&self.dir) {
+                eprintln!("eitri: the remote audit log was not rotated (tried again with the next record): {e}");
+            } else if let Some(days) = self.keep_days {
+                if let Err(e) = rotate::prune(&self.dir, days, (self.now)()) {
+                    eprintln!("eitri: old remote audit files were not removed: {e}");
                 }
             }
-            line
-        };
-        self.journal.send(name, &self.writer, &self.run, self.seq, &line);
-        Ok(())
+        }
+        Ok(line)
     }
 
     /// The log's lock, tried until [`LOCK_WITHIN`] has passed. A directory someone removed is made again.
@@ -1156,6 +1200,11 @@ mod tests {
             journal_target_with(|_| Some(OsString::new()), |_| false),
             JournalTarget::Off,
             "an empty variable counts as unset"
+        );
+        assert_eq!(
+            journal_target_with(|_| None, |_| true),
+            JournalTarget::Off,
+            "a test build with no override never writes to the real journal"
         );
     }
 }

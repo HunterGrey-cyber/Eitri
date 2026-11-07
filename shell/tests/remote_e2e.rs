@@ -327,6 +327,7 @@ fn settings(enabled: bool) -> RemoteSettings {
         listen: RemoteListen::Socket,
         port: None,
         origins: Vec::new(),
+        audit_keep_days: 90,
     }
 }
 

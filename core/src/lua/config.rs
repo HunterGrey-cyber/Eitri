@@ -185,6 +185,11 @@ pub const REMOTE_LISTEN_KEY: &str = "remote.listen";
 pub const REMOTE_PORT_KEY: &str = "remote.port";
 /// Public names a proxy or a tunnel reaches `serve` by, separated by commas or spaces.
 pub const REMOTE_ORIGINS_KEY: &str = "remote.origins";
+/// How many days `serve` keeps rotated files of the remote audit log, from 1 to 3650; unset is 90.
+pub const REMOTE_AUDIT_KEEP_DAYS_KEY: &str = "remote.audit.keep_days";
+/// The fewest and the most days [`REMOTE_AUDIT_KEEP_DAYS_KEY`] takes.
+pub const REMOTE_AUDIT_KEEP_DAYS_MIN: u32 = 1;
+pub const REMOTE_AUDIT_KEEP_DAYS_MAX: u32 = 3650;
 
 /// The longest `remote.origins` entry taken, and how many: a DNS name is at most 253 bytes, and a scheme and port
 /// add a few.
@@ -202,7 +207,7 @@ pub enum RemoteListen {
     Address(std::net::IpAddr),
 }
 
-/// The four `remote.*` keys as one reading of the store.
+/// The `remote.*` keys as one reading of the store.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RemoteSettings {
     pub enabled: bool,
@@ -210,6 +215,8 @@ pub struct RemoteSettings {
     /// `None` is the port chosen once for this user.
     pub port: Option<u16>,
     pub origins: Vec<String>,
+    /// Days of rotated audit files `serve` keeps.
+    pub audit_keep_days: u32,
 }
 
 /// [`REMOTE_ENABLED_KEY`] as stored. Unset means off: it opens a socket and starts a listener, which only someone
@@ -290,14 +297,35 @@ pub fn parse_remote_origins(value: Option<&str>) -> Result<Vec<String>, String> 
     Ok(origins)
 }
 
+/// [`REMOTE_AUDIT_KEEP_DAYS_KEY`] as stored: whole days from 1 to 3650, or unset for 90.
+pub fn parse_remote_audit_keep_days(value: Option<&str>) -> Result<u32, String> {
+    let Some(value) = value else {
+        return Ok(crate::remote_audit::AUDIT_KEEP_DAYS_DEFAULT);
+    };
+    let text = value.trim();
+    match text.parse::<u32>() {
+        Ok(days)
+            if text.bytes().all(|b| b.is_ascii_digit())
+                && (REMOTE_AUDIT_KEEP_DAYS_MIN..=REMOTE_AUDIT_KEEP_DAYS_MAX).contains(&days) =>
+        {
+            Ok(days)
+        }
+        _ => Err(format!(
+            "{REMOTE_AUDIT_KEEP_DAYS_KEY:?} must be a number of days from {REMOTE_AUDIT_KEEP_DAYS_MIN} to \
+             {REMOTE_AUDIT_KEEP_DAYS_MAX} (got {value:?})"
+        )),
+    }
+}
+
 impl RemoteSettings {
-    /// The four keys of `store`; the first bad one is the error.
+    /// The `remote.*` keys of `store`; the first bad one is the error.
     pub fn read(store: &ConfigStore) -> Result<RemoteSettings, String> {
         Ok(RemoteSettings {
             enabled: parse_remote_enabled(store.get(REMOTE_ENABLED_KEY))?,
             listen: parse_remote_listen(store.get(REMOTE_LISTEN_KEY))?,
             port: parse_remote_port(store.get(REMOTE_PORT_KEY))?,
             origins: parse_remote_origins(store.get(REMOTE_ORIGINS_KEY))?,
+            audit_keep_days: parse_remote_audit_keep_days(store.get(REMOTE_AUDIT_KEEP_DAYS_KEY))?,
         })
     }
 }
@@ -463,8 +491,37 @@ mod tests {
                 listen: RemoteListen::Loopback,
                 port: None,
                 origins: Vec::new(),
+                audit_keep_days: 90,
             }
         );
+    }
+
+    #[test]
+    fn keep_days_key_defaults_to_90() {
+        assert_eq!(REMOTE_AUDIT_KEEP_DAYS_KEY, "remote.audit.keep_days");
+        assert_eq!(parse_remote_audit_keep_days(None), Ok(90));
+        assert_eq!(
+            RemoteSettings::read(&ConfigStore::default()).unwrap().audit_keep_days,
+            crate::remote_audit::AUDIT_KEEP_DAYS_DEFAULT
+        );
+        let store = store_with("eitri.config.set('remote.audit.keep_days', 30)");
+        assert_eq!(RemoteSettings::read(&store.borrow()).unwrap().audit_keep_days, 30);
+    }
+
+    #[test]
+    fn keep_days_must_be_1_to_3650() {
+        for (value, days) in [("1", 1), ("3650", 3650), (" 7 ", 7)] {
+            assert_eq!(parse_remote_audit_keep_days(Some(value)), Ok(days), "{value:?}");
+        }
+        for bad in ["0", "3651", "-1", "7d", "", "1e2", "90.5", "99999999999"] {
+            let err = parse_remote_audit_keep_days(Some(bad)).unwrap_err();
+            assert!(
+                err.contains("remote.audit.keep_days") && err.contains("1 to 3650"),
+                "{bad:?}: {err}"
+            );
+        }
+        let store = store_with("eitri.config.set('remote.audit.keep_days', 0)");
+        assert!(RemoteSettings::read(&store.borrow()).is_err());
     }
 
     #[test]

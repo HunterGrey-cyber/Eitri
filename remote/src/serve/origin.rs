@@ -40,6 +40,18 @@ pub fn check_request(host: &str, origin: Option<&str>, cfg: &ServeConfig) -> Res
 
 /// Whether the lowercase `authority` is a loopback name on any port, the listen address on this port, or an
 /// `--origin` name. With `scheme` (an `Origin`'s), an `--origin` entry that names a scheme must name that one.
+/// The audit log's word for a refusal of the handshake ([`HOST_REFUSED`], [`ORIGIN_REFUSED`], the path's), `None`
+/// for one it has no word for (a malformed request, a request that asks no upgrade).
+pub fn refusal_reason(why: &str) -> Option<eitri_core::remote_audit::Reason> {
+    use eitri_core::remote_audit::Reason;
+    match why {
+        HOST_REFUSED => Some(Reason::Host),
+        ORIGIN_REFUSED => Some(Reason::Origin),
+        super::ws::PATH_REFUSED => Some(Reason::PathPrefix),
+        _ => None,
+    }
+}
+
 fn authority_allowed(authority: &str, scheme: Option<&str>, cfg: &ServeConfig) -> bool {
     let Some((host, port)) = split_authority(authority) else {
         return false;
@@ -83,6 +95,7 @@ mod tests {
             listen,
             port: 41000,
             origins: origins.iter().map(|o| (*o).to_owned()).collect(),
+            audit_keep_days: eitri_core::remote_audit::AUDIT_KEEP_DAYS_DEFAULT,
         }
     }
 
@@ -209,5 +222,14 @@ mod tests {
             Err(ORIGIN_REFUSED)
         );
         assert_eq!(check_request("other.ts.net", None, &cfg), Err(HOST_REFUSED));
+    }
+
+    #[test]
+    fn each_refusal_names_its_audit_reason() {
+        use eitri_core::remote_audit::Reason;
+        assert_eq!(refusal_reason(HOST_REFUSED), Some(Reason::Host));
+        assert_eq!(refusal_reason(ORIGIN_REFUSED), Some(Reason::Origin));
+        assert_eq!(refusal_reason(super::super::ws::PATH_REFUSED), Some(Reason::PathPrefix));
+        assert_eq!(refusal_reason("not a well-formed request"), None);
     }
 }

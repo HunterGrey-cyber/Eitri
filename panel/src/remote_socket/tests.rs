@@ -5,6 +5,7 @@ use crate::agent_panel::tests::*;
 use eitri_core::remote_devices::token_hash_hex;
 use eitri_core::remote_rv::{rv_socket_path, RvClient};
 use std::os::unix::fs::DirBuilderExt;
+use std::rc::Rc;
 use std::sync::atomic::AtomicU32;
 
 /// How long any one step may take on a loaded machine; a test that passes never waits it out.
@@ -56,6 +57,8 @@ fn write_store(dir: &Path) -> PathBuf {
 
 pub(super) struct Rig {
     pub(super) handle: AgentPanelHandle,
+    /// The base page, which shows the desk's notices.
+    pub(super) base: Rc<RecordingPage>,
     pub(super) socket: Option<RemoteSocket>,
     pub(super) path: PathBuf,
     pub(super) wake: PanelWake,
@@ -72,7 +75,7 @@ impl Rig {
     pub(super) fn with_deadlines(label: &str, deadlines: Deadlines) -> Rig {
         agent::state_dirs::redirect_state_to_a_test_root();
         let dir = agent::state_dirs::test_workspace_dir(label);
-        let (handle, _base, _second) = handle_with_two_pages();
+        let (handle, base, _second) = handle_with_two_pages();
         let scratch = Scratch::new();
         let store = write_store(&scratch.0);
         let wake = PanelWake::new().unwrap();
@@ -81,6 +84,7 @@ impl Rig {
         let path = rv_socket_path(&scratch.0, INSTANCE).unwrap();
         Rig {
             handle,
+            base,
             socket: Some(socket),
             path,
             wake,
@@ -1002,4 +1006,95 @@ fn every_new_kind_parses_and_is_refused_not_yet() {
             Err(_) => {}
         }
     }
+}
+
+/// What `serve` tells the window when it refused something from a device itself.
+fn refused_notice(device_id: &str, device: &str, key: &RowKey, reason: &str) -> RvInbound {
+    RvInbound::RefusedNotice {
+        v: 1,
+        device: device.into(),
+        device_id: device_id.into(),
+        key: key.to_string(),
+        reason: reason.into(),
+    }
+}
+
+/// Turns until the base page has been sent `want` notices, then a little longer, and returns them all.
+fn notices_after(rig: &Rig, want: usize) -> Vec<String> {
+    let deadline = Instant::now() + PATIENCE;
+    while notices(&rig.base.sent.borrow()).len() < want {
+        assert!(Instant::now() < deadline, "no notice came");
+        rig.turn();
+        std::thread::sleep(Duration::from_millis(2));
+    }
+    for _ in 0..20 {
+        rig.turn();
+    }
+    notices(&rig.base.sent.borrow())
+}
+
+#[test]
+fn watch_device_act_leaves_the_tab_one_notice() {
+    let rig = Rig::new("remote-serve-notice");
+    let (_tab, _provider, key) = rig.tab();
+    rig.turn();
+    clear(&[&rig.base]);
+    let mut client = rig.connect();
+    // A flood from serve: the device's name is the store's, whatever the line says.
+    for _ in 0..50 {
+        client
+            .send(&refused_notice("d2", "spoofed name", &key, "grant"))
+            .unwrap();
+    }
+    client.send(&RvInbound::Ping { v: 1 }).unwrap();
+    rig.until(&mut client, "the pong after the notices", |l| l["kind"] == "pong");
+    assert_eq!(
+        notices_after(&rig, 1),
+        ["refused from tablet: the device may only watch"]
+    );
+}
+
+#[test]
+fn refusals_from_serve_and_the_window_share_one_notice() {
+    let rig = Rig::new("remote-serve-notice-mixed");
+    let (tab, _provider, key) = rig.tab();
+    rig.turn();
+    clear(&[&rig.base]);
+    let mut client = rig.connect();
+    // The window refuses this one itself (no turn runs), then serve reports one of its own for the same device.
+    rig.act(
+        &mut client,
+        "d1",
+        "tok",
+        &key,
+        interrupt("c1", "no-such-turn", rig.generation(tab)),
+    );
+    rig.until(&mut client, "the window's refusal", |l| l["kind"] == "result");
+    client.send(&refused_notice("d1", "phone", &key, "grant")).unwrap();
+    client.send(&RvInbound::Ping { v: 1 }).unwrap();
+    rig.until(&mut client, "the pong", |l| l["kind"] == "pong");
+    let shown = notices_after(&rig, 1);
+    assert_eq!(shown.len(), 1, "one notice per device and tab: {shown:?}");
+    assert!(shown[0].starts_with("refused from phone: "), "{shown:?}");
+}
+
+#[test]
+fn a_refused_notice_for_a_device_not_in_the_store_is_dropped() {
+    let rig = Rig::new("remote-serve-notice-unknown");
+    let (_tab, _provider, key) = rig.tab();
+    rig.turn();
+    clear(&[&rig.base]);
+    let mut client = rig.connect();
+    client.send(&refused_notice("d9", "anyone", &key, "grant")).unwrap();
+    client
+        .send(&refused_notice("d2", "tablet", &key, "not a reason"))
+        .unwrap();
+    client.send(&RvInbound::Ping { v: 1 }).unwrap();
+    rig.until(&mut client, "the pong: the connection stays open", |l| {
+        l["kind"] == "pong"
+    });
+    for _ in 0..20 {
+        rig.turn();
+    }
+    assert!(notices(&rig.base.sent.borrow()).is_empty());
 }

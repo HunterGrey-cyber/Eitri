@@ -105,6 +105,13 @@ const PIXEL = { device: "d1", name: "Pixel", grant: "watch", host: "127.0.0.1:73
 const TABLET = { device: "d2", name: "Tablet", grant: "watch+steer", host: "desk.example.org", since: 9 };
 
 describe("phones connected to this desk", () => {
+  it("a notice naming a phone shows the hidden characters of its claimed name", () => {
+    const { container } = started();
+    dispatch({ kind: "notice", text: "refused from Pix\u202Eel\u200B: the work has changed" });
+    expect(container.querySelector(".status-band .band-message")?.textContent)
+      .toBe("refused from Pix⟨U+202E⟩el⟨U+200B⟩: the work has changed");
+  });
+
   it("the band shows nothing until a phone connects, counts them, and drops the mark when the last one goes", () => {
     const { container } = started();
     expect(bandText(container)).not.toContain("☎");

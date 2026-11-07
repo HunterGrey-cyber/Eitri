@@ -207,6 +207,41 @@ mod tests {
     }
 
     #[test]
+    fn a_record_the_file_refuses_still_reaches_the_journal_and_is_named() {
+        let dir = audit_dir_for("audit-verify-file-refused");
+        let journal = FakeJournal::bind();
+        let mut log = AuditLog::open(&dir, WriterKind::Serve, None, journal.target()).unwrap();
+        log.record(cmd("d1", 0)).unwrap();
+        let mut entries = vec![journal.next_entry(EXE)];
+        // A link in the file's place, which the writer never follows.
+        let current = dir.join(CURRENT);
+        let kept = std::fs::read(&current).unwrap();
+        std::fs::remove_file(&current).unwrap();
+        std::os::unix::fs::symlink(dir.join("elsewhere"), &current).unwrap();
+        assert!(
+            log.record(cmd("d1", 1)).is_err(),
+            "the file took a record through a link"
+        );
+        entries.push(journal.next_entry(EXE));
+        // The file put back as it was, and the writer goes on.
+        std::fs::remove_file(&current).unwrap();
+        agent::private_fs::write_private(&current, &kept).unwrap();
+        log.record(cmd("d1", 2)).unwrap();
+        entries.push(journal.next_entry(EXE));
+        let seqs: Vec<u64> = entries
+            .iter()
+            .map(|e| Record::parse(&record_line(e)).unwrap().seq)
+            .collect();
+        assert_eq!(seqs, [1, 2, 3], "the refused record keeps its number");
+        let report = verify(&dir, &Entries(entries.clone()), EXE).unwrap();
+        assert_eq!(report.missing_from_file, vec![record_line(&entries[1])], "{report:?}");
+        assert!(
+            report.chain_breaks.is_empty() && report.altered.is_empty() && report.journal_gaps.is_empty(),
+            "{report:?}"
+        );
+    }
+
+    #[test]
     fn a_first_line_pointing_at_the_newest_record_hides_nothing() {
         let dir = audit_dir_for("audit-verify-fake-prev");
         let entries = written(&dir, 6);

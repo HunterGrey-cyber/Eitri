@@ -77,6 +77,9 @@ eitri-core = { path = "../core", features = ["test-support"] }
 glib = "0.22"
 # `AgentPanelHandle::for_host_test`, for counting how often the panel's own loop wakes. Tests only.
 eitri-panel = { path = "../panel", features = ["test-support"] }
+# The remote audit log's test overrides (a journal socket of the test's own, a short idle deadline) for
+# `tests/remote_serve.rs` and the product binary it starts; a dev-dependency only, so no shipped build has them.
+eitri-remote = { path = "../remote", features = ["remote-test-hooks"] }
 # Only for `tests/nvim_bin_override.rs`: that test drives a real,
 # headless `LiveHarness` directly, which needs the fork crate itself, not just `neovide-editor`'s
 # wrapper around it. Same rev as `neovide-editor/Cargo.toml`'s own (non-dev) dependency -- Cargo

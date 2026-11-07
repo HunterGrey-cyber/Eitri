@@ -6,9 +6,12 @@
 //! - **Landlock** (Linux 5.13 and later): files may be read beneath the control directory, the device store's directory
 //!   and `/proc`, and read, written and removed beneath the agents directory, where the agents reader opens writers'
 //!   locks for writing and removes what a dead writer left there. Nothing is removed beneath the control directory, so a
-//!   dead writer's `ag-<instance>.sock` there, and its lock, are left for a window's reader to clean. Pathname Unix
-//!   sockets may be connected to beneath the control directory only (where the kernel can say so). Nothing else of the
-//!   file system: no write anywhere else, and no socket or file made.
+//!   dead writer's `ag-<instance>.sock` there, and its lock, are left for a window's reader to clean. Beneath the audit
+//!   directory (`audit/`, inside the store's directory, so the store beside it stays read-only) regular files may be
+//!   made, written and removed: the audit log, its lock and its rotation. Pathname Unix sockets may be connected to
+//!   beneath the control directory and, when it exists, the journal's directory (the journal copy). Nothing else of
+//!   the file system: no write anywhere else, and no socket made. A rule is added only for a directory that exists: a
+//!   missing one gets none (and so no access) rather than failing the ruleset.
 //! - **seccomp**: `execve`, `execveat` and `truncate` fail with `EPERM`, in every thread (`SECCOMP_FILTER_FLAG_TSYNC`):
 //!   `truncate` because Landlock before ABI 3 does not govern it. An x32 call fails with `EPERM` too; a system call
 //!   from another architecture's table ends the process.
@@ -91,7 +94,13 @@ fn kernel_abi() -> Option<u32> {
 
 /// Confines this process for good. Call it from the main thread before any other thread starts; `Err` when another
 /// thread runs or a step fails, and the process must not go on to serve.
-pub fn sandbox(agents_dir: &Path, control_dir: &Path, store_dir: &Path) -> Result<SandboxState, io::Error> {
+pub fn sandbox(
+    agents_dir: &Path,
+    control_dir: &Path,
+    store_dir: &Path,
+    audit_dir: &Path,
+    journal_dir: Option<&Path>,
+) -> Result<SandboxState, io::Error> {
     let threads = thread_count()?;
     if threads != 1 {
         return Err(io::Error::other(format!(
@@ -101,30 +110,51 @@ pub fn sandbox(agents_dir: &Path, control_dir: &Path, store_dir: &Path) -> Resul
     set_not_dumpable()?;
     // Asked of the kernel here too, so seccomp is allowed where Landlock is missing and set nothing.
     prctl(libc::PR_SET_NO_NEW_PRIVS, 1)?;
-    let state = landlock(agents_dir, control_dir, store_dir)?;
+    let state = landlock(agents_dir, control_dir, store_dir, audit_dir, journal_dir)?;
     deny_exec()?;
     Ok(state)
 }
 
-fn landlock(agents_dir: &Path, control_dir: &Path, store_dir: &Path) -> io::Result<SandboxState> {
+fn landlock(
+    agents_dir: &Path,
+    control_dir: &Path,
+    store_dir: &Path,
+    audit_dir: &Path,
+    journal_dir: Option<&Path>,
+) -> io::Result<SandboxState> {
     let fail = |e: landlock::RulesetError| io::Error::other(format!("Landlock: {e}"));
     let read: BitFlags<AccessFs> = AccessFs::ReadFile | AccessFs::ReadDir;
     let agents: BitFlags<AccessFs> = read | AccessFs::WriteFile | AccessFs::RemoveFile;
-    let control: BitFlags<AccessFs> = AccessFs::ResolveUnix.into();
+    let audit: BitFlags<AccessFs> = read | AccessFs::WriteFile | AccessFs::MakeReg | AccessFs::RemoveFile;
+    let connect: BitFlags<AccessFs> = AccessFs::ResolveUnix.into();
     let status = Ruleset::default()
         .handle_access(AccessFs::from_all(LANDLOCK_ABI))
         .map_err(fail)?
         .create()
         .map_err(fail)?
-        .add_rules(path_beneath_rules([control_dir, store_dir, Path::new("/proc")], read))
+        .add_rules(path_beneath_rules(
+            existing([control_dir, store_dir, Path::new("/proc")]),
+            read,
+        ))
         .map_err(fail)?
-        .add_rules(path_beneath_rules([control_dir], control))
+        .add_rules(path_beneath_rules(
+            existing([Some(control_dir), journal_dir].into_iter().flatten()),
+            connect,
+        ))
         .map_err(fail)?
-        .add_rules(path_beneath_rules([agents_dir], agents))
+        .add_rules(path_beneath_rules(existing([agents_dir]), agents))
+        .map_err(fail)?
+        .add_rules(path_beneath_rules(existing([audit_dir]), audit))
         .map_err(fail)?
         .restrict_self()
         .map_err(fail)?;
     Ok(from_ruleset_status(status.ruleset))
+}
+
+/// The directories of `dirs` that exist now. A rule for a path that is not there would fail the whole ruleset; a
+/// missing directory is left with no rule, which grants nothing beneath it.
+fn existing<'a>(dirs: impl IntoIterator<Item = &'a Path>) -> Vec<&'a Path> {
+    dirs.into_iter().filter(|dir| dir.is_dir()).collect()
 }
 
 fn from_ruleset_status(status: RulesetStatus) -> SandboxState {
@@ -289,6 +319,8 @@ mod tests {
             Path::new("/nonexistent"),
             Path::new("/nonexistent"),
             Path::new("/nonexistent"),
+            Path::new("/nonexistent"),
+            Some(Path::new("/nonexistent")),
         )
         .unwrap_err();
         assert!(err.to_string().contains("before any thread starts"), "{err}");

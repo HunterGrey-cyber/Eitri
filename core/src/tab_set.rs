@@ -317,7 +317,7 @@ fn settle_opening(
     // row is still there, so it is not also a queue line, and it is not sent again.
     if matches!(
         projection.steer_outcome(&id),
-        Some(agent::SteerOutcome::Delivered | agent::SteerOutcome::Dropped { .. })
+        Some(agent::SteerOutcome::Delivered { .. } | agent::SteerOutcome::Dropped { .. })
     ) || (projection.active_turn_id.is_none() && projection.opening_prompt.is_none())
     {
         *opening_prompt = None;
@@ -1258,10 +1258,12 @@ fn settle_against(
     let mut dropped = None;
     queue.retain_mut(|item| {
         // Reported dropped under an earlier id, and read by the agent after all.
-        let read_late = item
-            .dropped_as
-            .iter()
-            .any(|id| matches!(projection.steer_outcome(id), Some(agent::SteerOutcome::Delivered)));
+        let read_late = item.dropped_as.iter().any(|id| {
+            matches!(
+                projection.steer_outcome(id),
+                Some(agent::SteerOutcome::Delivered { .. })
+            )
+        });
         let QueuedState::Steered { client_id, .. } = &item.state else {
             if read_late {
                 changed = true;
@@ -1270,7 +1272,7 @@ fn settle_against(
             return true;
         };
         match projection.steer_outcome(client_id) {
-            Some(agent::SteerOutcome::Delivered) => {
+            Some(agent::SteerOutcome::Delivered { .. }) => {
                 changed = true;
                 false
             }
@@ -3777,6 +3779,8 @@ impl TabSet {
                     _ => {}
                 }
             }
+        } else if matches!(delivery, RevisedDelivery::Resync) {
+            tab.notes.recover_remote_senders(&backend.projection());
         }
         let remote_notes_dirty = tab.notes.remote_notes_dirty;
         let resynced = matches!(delivery, RevisedDelivery::Resync);

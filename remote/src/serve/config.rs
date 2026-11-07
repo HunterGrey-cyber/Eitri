@@ -1,7 +1,7 @@
 //! What `eitri remote serve` listens on and answers to: given on its command line by the window that starts it, and
 //! recorded beside its lock so a window that wants something else can say what differs.
 //!
-//! `serve [--listen loopback|socket|<address>] [--port <port>] [--origin <name>]...`
+//! `serve [--listen loopback|socket|<address>] [--port <port>] [--origin <name>]... [--audit-keep-days <days>]`
 //!
 //! - `--listen`: `loopback` (the default: `127.0.0.1` and `::1`), `socket` (a Unix socket in the runtime directory), or
 //!   exactly one address of this machine. A wildcard (`0.0.0.0`, `::`) is refused: it would take every network the
@@ -10,10 +10,16 @@
 //! - `--origin`: a public name a proxy or Tailscale Serve reaches the server by, as a bare host (`desk.tail1.ts.net`,
 //!   with `:<port>` when it is not the scheme's default) or an origin (`https://desk.tail1.ts.net`). A path, a query,
 //!   user information or a wildcard is refused: the server answers on one path only, at the root of its origin.
+//! - `--audit-keep-days`: how many days of rotated audit files to keep, 1 to 3650; without it, 90 (`remote.audit.keep_days`).
+//!
+//! The record names the build that wrote it ([`this_build`]): a window or `eitri remote status` from another build
+//! (after a package upgrade, an old window meets a new `serve` or the other way round) reads only its pid and says the
+//! windows need restarting, rather than reading a record whose shape may have changed.
 
 use std::collections::BTreeSet;
 use std::net::IpAddr;
 
+use eitri_core::remote_audit::AUDIT_KEEP_DAYS_DEFAULT;
 use serde::{Deserialize, Serialize};
 
 /// Where the server listens.
@@ -35,6 +41,8 @@ pub struct ServeConfig {
     /// Normalised entries of `--origin`: a lowercase authority (`name` or `name:port`), or a lowercase origin
     /// (`https://name[:port]`).
     pub origins: Vec<String>,
+    /// Days of rotated audit files kept.
+    pub audit_keep_days: u32,
 }
 
 /// The longest `--origin` entry taken: a DNS name is at most 253 bytes, and a scheme and port add a few.
@@ -50,6 +58,7 @@ impl ServeConfig {
     ) -> Result<ServeConfig, String> {
         let mut listen = None;
         let mut given_port = None;
+        let mut keep_days = None;
         let mut origins = Vec::new();
         let mut rest = args.iter();
         while let Some(arg) = rest.next() {
@@ -63,7 +72,8 @@ impl ServeConfig {
                         origins.push(entry);
                     }
                 }
-                "--listen" | "--port" => return Err(format!("{arg} is given twice")),
+                "--audit-keep-days" if keep_days.is_none() => keep_days = Some(parse_keep_days(&value(arg)?)?),
+                "--listen" | "--port" | "--audit-keep-days" => return Err(format!("{arg} is given twice")),
                 other => return Err(format!("unknown argument {other:?}")),
             }
         }
@@ -75,6 +85,7 @@ impl ServeConfig {
             listen: listen.unwrap_or(Listen::Loopback),
             port,
             origins,
+            audit_keep_days: keep_days.unwrap_or(AUDIT_KEEP_DAYS_DEFAULT),
         })
     }
 
@@ -90,6 +101,11 @@ impl ServeConfig {
         for origin in &self.origins {
             args.push("--origin".to_owned());
             args.push(origin.clone());
+        }
+        // Left out on the default, so the record reads the same in a build from before the flag.
+        if self.audit_keep_days != AUDIT_KEEP_DAYS_DEFAULT {
+            args.push("--audit-keep-days".to_owned());
+            args.push(self.audit_keep_days.to_string());
         }
         args
     }
@@ -136,6 +152,12 @@ impl ServeConfig {
             };
             out.push(format!("origins: running {}, asked {}", list(&ours), list(&theirs)));
         }
+        if self.audit_keep_days != other.audit_keep_days {
+            out.push(format!(
+                "audit keep days: running {}, asked {}",
+                self.audit_keep_days, other.audit_keep_days
+            ));
+        }
         out
     }
 }
@@ -153,6 +175,9 @@ pub struct Record {
     /// Why the sandbox is partial; older records carry only the word.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub sandbox_why: Option<String>,
+    /// The build that wrote it ([`this_build`]); a build from before the field wrote none.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub build: Option<String>,
 }
 
 impl Record {
@@ -167,6 +192,41 @@ impl Record {
 
 /// The version of [`Record`] this build writes and reads.
 pub const RECORD_V: u32 = 1;
+
+const fn fnv1a(mut hash: u64, bytes: &[u8]) -> u64 {
+    let mut i = 0;
+    while i < bytes.len() {
+        hash ^= bytes[i] as u64;
+        hash = hash.wrapping_mul(0x0100_0000_01b3);
+        i += 1;
+    }
+    hash
+}
+
+/// A hash of what `serve` and a window must agree on: the `rv-` grammar, the phone's, and this record. Two builds of
+/// the same version that differ there differ here.
+const SPOKEN_HASH: u64 = fnv1a(
+    fnv1a(
+        fnv1a(0xcbf2_9ce4_8422_2325, include_bytes!("../../../core/src/remote_rv.rs")),
+        include_bytes!("../../../core/src/remote_wire.rs"),
+    ),
+    include_bytes!("config.rs"),
+);
+
+/// This build, as its record names it: the version and [`SPOKEN_HASH`].
+pub fn this_build() -> String {
+    format!("{}-{SPOKEN_HASH:016x}", env!("CARGO_PKG_VERSION"))
+}
+
+fn parse_keep_days(value: &str) -> Result<u32, String> {
+    use eitri_core::lua::config::{REMOTE_AUDIT_KEEP_DAYS_MAX as MAX, REMOTE_AUDIT_KEEP_DAYS_MIN as MIN};
+    match value.parse::<u32>() {
+        Ok(days) if value.bytes().all(|b| b.is_ascii_digit()) && (MIN..=MAX).contains(&days) => Ok(days),
+        _ => Err(format!(
+            "--audit-keep-days takes a number of days from {MIN} to {MAX}, not {value:?}"
+        )),
+    }
+}
 
 fn parse_listen(value: &str, iface_of: &impl Fn(IpAddr) -> Option<String>) -> Result<Listen, String> {
     match value {
@@ -388,5 +448,44 @@ mod tests {
                 "origins: running a.example b.example, asked none".to_owned(),
             ]
         );
+    }
+
+    #[test]
+    fn differences_names_keep_days() {
+        let running = parsed(&[]).unwrap();
+        assert_eq!(
+            running.audit_keep_days,
+            eitri_core::remote_audit::AUDIT_KEEP_DAYS_DEFAULT
+        );
+        let asked = parsed(&["--audit-keep-days", "30"]).unwrap();
+        assert_eq!(asked.audit_keep_days, 30);
+        assert_eq!(running.differences(&asked), ["audit keep days: running 90, asked 30"]);
+        assert_eq!(
+            ServeConfig::from_args(&asked.to_args(), || Ok(1), tailnet).unwrap(),
+            asked,
+            "the record reads back the same"
+        );
+        assert!(
+            !running.to_args().iter().any(|a| a == "--audit-keep-days"),
+            "the default is not written, so a record reads the same in a build that predates the key"
+        );
+    }
+
+    #[test]
+    fn keep_days_is_1_to_3650() {
+        assert_eq!(parsed(&["--audit-keep-days", "1"]).unwrap().audit_keep_days, 1);
+        assert_eq!(parsed(&["--audit-keep-days", "3650"]).unwrap().audit_keep_days, 3650);
+        for bad in ["0", "3651", "-3", "7d", "", "+7"] {
+            let err = parsed(&["--audit-keep-days", bad]).unwrap_err();
+            assert!(err.contains("--audit-keep-days"), "{bad:?}: {err}");
+        }
+        assert!(parsed(&["--audit-keep-days", "7", "--audit-keep-days", "8"]).is_err());
+    }
+
+    #[test]
+    fn this_build_names_the_version() {
+        let build = this_build();
+        assert!(build.starts_with(env!("CARGO_PKG_VERSION")), "{build}");
+        assert_eq!(build, this_build(), "a build names itself the same every time");
     }
 }

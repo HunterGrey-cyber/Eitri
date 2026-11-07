@@ -4,6 +4,11 @@ version.workspace = true
 edition.workspace = true
 publish.workspace = true
 
+[features]
+# Test-only overrides (the journal socket, `serve`'s idle deadline): enabled only by `shell`'s dev-dependencies, so no
+# `cargo build` of the product has them (`remote_test_hooks_only_in_dev_dependencies` scans every manifest).
+remote-test-hooks = ["eitri-core/remote-test-hooks"]
+
 [dependencies]
 eitri-core = { path = "../core" }
 agent = { path = "../agent" }

@@ -73,6 +73,8 @@ pub struct Filter {
     pub since: Option<SystemTime>,
     /// About this device, by its id or its name.
     pub device: Option<String>,
+    /// About this device, by its id only.
+    pub device_id: Option<String>,
     /// Of this event.
     pub event: Option<String>,
 }
@@ -105,8 +107,12 @@ impl Filter {
                 .iter()
                 .any(|key| record.fields.get(*key).and_then(Value::as_str) == Some(wanted))
         });
+        let device_id = self
+            .device_id
+            .as_deref()
+            .is_none_or(|wanted| record.device() == Some(wanted));
         let event = self.event.as_deref().is_none_or(|wanted| record.event == wanted);
-        since && device && event
+        since && device && device_id && event
     }
 }
 

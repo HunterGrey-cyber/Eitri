@@ -439,6 +439,54 @@ fn hex(bytes: &[u8; 32]) -> String {
     bytes.iter().map(|b| format!("{b:02x}")).collect()
 }
 
+/// The longest push endpoint kept.
+pub const PUSH_ENDPOINT_MAX_BYTES: usize = 512;
+
+/// What a phone is told when its push endpoint is not one.
+pub const BAD_PUSH_ENDPOINT: &str =
+    "a push endpoint is an http or https URL of at most 512 bytes, with a host and no user information";
+
+/// Whether `url` may be kept as a push endpoint: ASCII without spaces or control characters, at most
+/// [`PUSH_ENDPOINT_MAX_BYTES`], `http://` or `https://`, then an authority with a host, no `@` (user information
+/// would be a password kept beside the store's hashes), and a port of digits if one is given.
+pub fn push_endpoint_ok(url: &str) -> Result<(), &'static str> {
+    let bad = Err(BAD_PUSH_ENDPOINT);
+    if url.len() > PUSH_ENDPOINT_MAX_BYTES || !url.bytes().all(|b| b.is_ascii_graphic()) || url.contains('\\') {
+        return bad;
+    }
+    let lower = url.to_ascii_lowercase();
+    let Some(rest) = lower.strip_prefix("https://").or_else(|| lower.strip_prefix("http://")) else {
+        return bad;
+    };
+    let authority = rest.split(['/', '?', '#']).next().unwrap_or_default();
+    if authority.contains('@') {
+        return bad;
+    }
+    let (host, port) = match authority.strip_prefix('[') {
+        Some(bracketed) => match bracketed.split_once(']') {
+            Some((host, "")) => (host, None),
+            Some((host, after)) => match after.strip_prefix(':') {
+                Some(port) => (host, Some(port)),
+                None => return bad,
+            },
+            None => return bad,
+        },
+        None => match authority.split_once(':') {
+            Some((host, port)) => (host, Some(port)),
+            None => (authority, None),
+        },
+    };
+    if host.is_empty() || (!authority.starts_with('[') && host.contains(['[', ']'])) {
+        return bad;
+    }
+    if let Some(port) = port {
+        if !port.bytes().all(|b| b.is_ascii_digit()) || !matches!(port.parse::<u16>(), Ok(p) if p > 0) {
+            return bad;
+        }
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

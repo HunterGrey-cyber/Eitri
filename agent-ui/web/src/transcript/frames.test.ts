@@ -78,6 +78,30 @@ describe("phone frames", () => {
     expect(after.firstTurn).toBe(2);
   });
 
+  it("page_through_the_last_turn_applies_only_where_the_view_stands", () => {
+    const open = { ...snapshot(), cut: [{ entry_id: "transcript:17", bytes: 5000 }] };
+    open.frame.state = { ...open.frame.state, activeTurnId: "t3", assistantMessageOpen: true,
+      transcript: [{ seq: 12, text: "cut" }, { seq: 17, text: "Hello" }] };
+    const before = { ...applyFrame(applyFrame(initialTranscript(), host), open), owedPage: true };
+    const whole = (through: number, text: string) => ({ ...page(3, 3), frame: { kind: "snapshot",
+      throughRevision: through, state: { ...initialState(), userPrompts: [{ seq: 15, text: "three" }],
+        transcript: [{ seq: 17, text }] } } });
+    const delta = { ...events(20), through: 21, frame: { kind: "events", revisions: [21],
+      events: [{ type: "content_delta", turn_id: "t3", kind: "text", text: " phone" }] } };
+    // Read after the delta was folded and before it was sent: the delta would land on it again.
+    const ahead = applyFrame(before, whole(21, "Hello phone"));
+    expect(ahead.state).toBe(before.state);
+    expect(ahead.cut).toEqual(before.cut);
+    expect(ahead.owedPage).toBe(false);
+    const next = applyFrame(ahead, delta);
+    expect(next.wantSnapshot).toBe(false);
+    expect(next.state.transcript.map((e) => e.text)).toEqual(["cut", "Hello phone"]);
+    // Read where the view stands: it applies, and the delta after it lands once.
+    const atView = applyFrame(before, whole(20, "Hello"));
+    expect(atView.cut).toEqual([]);
+    expect(applyFrame(atView, delta).state.transcript.map((e) => e.text)).toEqual(["cut", "Hello phone"]);
+  });
+
   it("page_from_an_old_generation_is_dropped", () => {
     const before = { ...ready(), owedPage: true };
     expect(applyFrame(before, page(0, 1, 0))).toBe(before);

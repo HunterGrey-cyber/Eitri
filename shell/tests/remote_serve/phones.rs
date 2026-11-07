@@ -12,6 +12,7 @@ use std::sync::{mpsc, Arc};
 use std::time::{Duration, Instant};
 
 use eitri_core::agents::{new_instance, ProjectRef, Publisher, Row, WindowRef};
+use eitri_core::remote_audit::{AuditLog, Filter, JournalTarget, Record, WriterKind};
 use eitri_core::remote_devices::token_hash_hex;
 use eitri_core::remote_rv::{
     refused_line, rv_socket_path, serve_socket_path, RvClient, RvInbound, RvListener, RV_MAX_CONNECTIONS,
@@ -25,7 +26,7 @@ use eitri_panel::panel_page::PageSurface;
 use eitri_panel::panel_wake::PanelWake;
 use eitri_remote::serve::config::{Listen, ServeConfig};
 use eitri_remote::serve::serve_unix;
-use eitri_remote::serve::session::{Hub, Limits};
+use eitri_remote::serve::session::{Audit, Hub, Limits};
 use serde_json::{json, Value};
 
 /// How long any one step may take on a loaded machine; a check that passes never waits it out.
@@ -76,6 +77,27 @@ pub fn checks() -> Vec<(&'static str, Check)> {
             a_window_that_turns_every_connection_away_is_tried_with_pauses,
         ),
         ("a_full_panel_is_not_hammered", a_full_panel_is_not_hammered),
+        (
+            "bad_token_is_recorded_without_the_token",
+            bad_token_is_recorded_without_the_token,
+        ),
+        (
+            "revoked_device_is_recorded_as_revoked",
+            revoked_device_is_recorded_as_revoked,
+        ),
+        (
+            "host_origin_and_path_refusals_are_recorded",
+            host_origin_and_path_refusals_are_recorded,
+        ),
+        ("watch_device_act_is_recorded_once", watch_device_act_is_recorded_once),
+        (
+            "push_endpoint_set_records_the_host_only",
+            push_endpoint_set_records_the_host_only,
+        ),
+        (
+            "audit_mine_returns_only_this_devices_records",
+            audit_mine_returns_only_this_devices_records,
+        ),
     ]
 }
 
@@ -93,6 +115,8 @@ fn check(ok: bool, what: impl FnOnce() -> String) -> Result<(), String> {
 struct World {
     control: PathBuf,
     store: PathBuf,
+    /// The audit directory beside the store, as `serve` has it.
+    audit: PathBuf,
     hub: Arc<Hub>,
     socket: PathBuf,
 }
@@ -116,21 +140,65 @@ impl World {
             ],
         });
         agent::private_fs::write_private(&store, body.to_string().as_bytes()).unwrap();
-        let hub = Hub::start(&control, &store, limits).expect("the hub starts");
+        let audit = eitri_core::remote_audit::audit_dir(&store_dir);
+        let hub = World::start_hub(&control, &store, &audit, limits);
         let socket = serve_socket_path(&control).unwrap();
         let listener = UnixListener::bind(&socket).expect("serve's socket binds");
         let cfg = ServeConfig {
             listen: Listen::Socket,
             port: 41000,
             origins: Vec::new(),
+            audit_keep_days: eitri_core::remote_audit::AUDIT_KEEP_DAYS_DEFAULT,
         };
         serve_unix(listener, Arc::new(cfg), hub.clone()).unwrap();
         World {
             control,
             store,
+            audit,
             hub,
             socket,
         }
+    }
+
+    /// A hub writing the audit log as `serve` does (no journal here: a test never writes to the real one).
+    fn start_hub(control: &Path, store: &Path, audit: &Path, limits: Limits) -> Arc<Hub> {
+        let log = AuditLog::open(audit, WriterKind::Serve, Some(90), JournalTarget::Off).expect("the audit log opens");
+        Hub::start_audited(control, store, limits, Audit::new(log, audit)).expect("the hub starts")
+    }
+
+    /// Every record so far, newest first.
+    fn records(&self) -> Vec<Record> {
+        eitri_core::remote_audit::read(&self.audit, &Filter::default(), None).unwrap_or_default()
+    }
+
+    /// Waits until a record `wanted` accepts is in the log; every record then.
+    fn record_where(&self, what: &str, wanted: impl Fn(&Record) -> bool) -> Result<Vec<Record>, String> {
+        let deadline = Instant::now() + PATIENCE;
+        loop {
+            let records = self.records();
+            if records.iter().any(&wanted) {
+                return Ok(records);
+            }
+            if Instant::now() > deadline {
+                return Err(format!("no record of {what}: {}", lines_of(&records)));
+            }
+            std::thread::sleep(Duration::from_millis(5));
+        }
+    }
+
+    /// The log's bytes, every file.
+    fn log_bytes(&self) -> Vec<u8> {
+        let mut bytes = Vec::new();
+        for entry in std::fs::read_dir(&self.audit).unwrap() {
+            let path = entry.unwrap().path();
+            if path
+                .file_name()
+                .is_some_and(|n| n.to_string_lossy().starts_with("audit.jsonl"))
+            {
+                bytes.extend(std::fs::read(path).unwrap());
+            }
+        }
+        bytes
     }
 
     fn phone(&self) -> Phone {
@@ -437,7 +505,7 @@ fn serve_fake(stream: UnixStream, tx: &mpsc::Sender<Value>, me: &str) {
 // ---------------------------------------------------------------------------------------------------------------
 // The phone: a WebSocket client over the Unix socket.
 
-struct Phone {
+pub(crate) struct Phone {
     stream: UnixStream,
     buf: Vec<u8>,
     seq: u64,
@@ -449,7 +517,7 @@ struct Phone {
 }
 
 impl Phone {
-    fn connect(socket: &Path) -> Phone {
+    pub(crate) fn connect(socket: &Path) -> Phone {
         let mut stream = UnixStream::connect(socket).expect("serve's socket answers");
         stream
             .write_all(
@@ -496,7 +564,7 @@ impl Phone {
         let _ = self.stream.write_all(&bytes);
     }
 
-    fn send(&mut self, mut body: Value) {
+    pub(crate) fn send(&mut self, mut body: Value) {
         self.seq += 1;
         body["v"] = json!(1);
         body["seq"] = json!(self.seq);
@@ -504,7 +572,16 @@ impl Phone {
         self.send_raw(body);
     }
 
-    fn hello(&mut self, device: &str, token: Option<&str>) {
+    /// A close frame with code 1000, as a phone that leaves sends it.
+    pub(crate) fn close(&mut self) {
+        let key = [0x11u8, 0x22, 0x33, 0x44];
+        let mut bytes = vec![0x88, 0x82];
+        bytes.extend_from_slice(&key);
+        bytes.extend([0x03 ^ key[0], 0xe8 ^ key[1]]);
+        let _ = self.stream.write_all(&bytes);
+    }
+
+    pub(crate) fn hello(&mut self, device: &str, token: Option<&str>) {
         let mut body = json!({ "kind": "hello", "device": device, "layout": "slab", "protocol": 1 });
         if let Some(token) = token {
             body["token"] = json!(token);
@@ -513,7 +590,7 @@ impl Phone {
     }
 
     /// The next whole text message, `Ok(None)` when none came within `within`, `Err` when the server closed.
-    fn recv(&mut self, within: Duration) -> Result<Option<Value>, String> {
+    pub(crate) fn recv(&mut self, within: Duration) -> Result<Option<Value>, String> {
         let deadline = Instant::now() + within;
         loop {
             if let Some(message) = self.take_message()? {
@@ -581,7 +658,7 @@ impl Phone {
     }
 
     /// Reads until the server closes; every byte that came (none, for a close with no reply).
-    fn bytes_until_closed(&mut self, within: Duration) -> Result<Vec<u8>, String> {
+    pub(crate) fn bytes_until_closed(&mut self, within: Duration) -> Result<Vec<u8>, String> {
         let deadline = Instant::now() + within;
         let mut got = std::mem::take(&mut self.buf);
         loop {
@@ -1332,6 +1409,289 @@ fn a_full_panel_is_not_hammered(dir: &Path) -> Result<(), String> {
     phone.send(json!({ "kind": "subscribe", "key": key }));
     phone.until(&[&window], "the snapshot once there is room", |l| {
         l["kind"] == "snapshot" && l["key"] == key
+    })?;
+    phone.seqs_contiguous()
+}
+
+fn lines_of(records: &[Record]) -> String {
+    records.iter().map(|r| r.line.as_str()).collect::<Vec<_>>().join("\n")
+}
+
+fn field<'a>(record: &'a Record, name: &str) -> &'a Value {
+    record.fields.get(name).unwrap_or(&Value::Null)
+}
+
+fn bad_token_is_recorded_without_the_token(dir: &Path) -> Result<(), String> {
+    let world = World::new(dir, Limits::default());
+    let sentinel = "token-sentinel-4c1e";
+    let mut phone = world.phone();
+    phone.hello(STEER.0, Some(sentinel));
+    phone.bytes_until_closed(PATIENCE)?;
+    let records = world.record_where("the bad token", |r| r.event == "refused")?;
+    let refused: Vec<&Record> = records.iter().filter(|r| r.event == "refused").collect();
+    check(refused.len() == 1, || {
+        format!("{} refusals: {}", refused.len(), lines_of(&records))
+    })?;
+    let r = refused[0];
+    check(
+        field(r, "reason") == "bad_token"
+            && field(r, "device") == STEER.0
+            && field(r, "device_name") == "phone"
+            && field(r, "listener") == "socket"
+            && field(r, "peer") == "unix",
+        || format!("the refusal: {}", r.line),
+    )?;
+    check(!records.iter().any(|r| r.event == "conn_open"), || {
+        "a refused hello opened a connection".into()
+    })?;
+    // The sentinel is the only token sent; it is long enough that no record word holds it by chance.
+    check(!String::from_utf8_lossy(&world.log_bytes()).contains(sentinel), || {
+        "the token is in the log".into()
+    })
+}
+
+fn revoked_device_is_recorded_as_revoked(dir: &Path) -> Result<(), String> {
+    let world = World::new(dir, Limits::default());
+    // Seen by serve while it runs: the store forgets the device, and serve remembers it left.
+    let mut first = world.phone_as(STEER);
+    first.send(json!({ "kind": "ping" }));
+    first.until(&[], "the pong", |l| l["kind"] == "pong")?;
+    eitri_core::remote_devices::update(&world.store, |store| store.remove(STEER.0)).map_err(|e| e.to_string())?;
+    first.bytes_until_closed(PATIENCE)?;
+    let mut again = world.phone();
+    again.hello(STEER.0, Some(STEER.1));
+    again.bytes_until_closed(PATIENCE)?;
+    let records = world.record_where("the revoked token", |r| field(r, "reason") == "revoked_token")?;
+    let revoked = records.iter().find(|r| field(r, "reason") == "revoked_token").unwrap();
+    check(
+        field(revoked, "device") == STEER.0 && field(revoked, "device_name") == "phone",
+        || format!("the refusal names the device as it was: {}", revoked.line),
+    )?;
+    check(
+        records
+            .iter()
+            .any(|r| r.event == "conn_close" && field(r, "device") == STEER.0 && field(r, "why") == "revoked"),
+        || format!("the revoked phone's close: {}", lines_of(&records)),
+    )?;
+    // A device that was never in the store is a bad token, not a revoked one.
+    let mut stranger = world.phone();
+    stranger.hello("d9", Some("nothing"));
+    stranger.bytes_until_closed(PATIENCE)?;
+    world.record_where("the stranger", |r| {
+        field(r, "device") == "d9" && field(r, "reason") == "bad_token"
+    })?;
+
+    // After a restart: the store no longer names the watch device, and the only trace is the log's `revoke`, as
+    // `eitri remote revoke` writes it.
+    eitri_core::remote_devices::update(&world.store, |store| store.remove(WATCH.0)).map_err(|e| e.to_string())?;
+    let mut cli = AuditLog::open(&world.audit, WriterKind::Cli, None, JournalTarget::Off).map_err(|e| e.to_string())?;
+    cli.record(eitri_core::remote_audit::Event::Revoke {
+        device: eitri_core::remote_audit::DeviceRef {
+            id: WATCH.0.into(),
+            name: "tablet".into(),
+        },
+        by: "cli".into(),
+    })
+    .map_err(|e| e.to_string())?;
+    let restarted_dir = dir.join("restarted");
+    let socket = restarted_dir.join("serve.sock");
+    std::fs::create_dir_all(&restarted_dir).unwrap();
+    let hub = World::start_hub(&world.control, &world.store, &world.audit, Limits::default());
+    let cfg = ServeConfig {
+        listen: Listen::Socket,
+        port: 41000,
+        origins: Vec::new(),
+        audit_keep_days: eitri_core::remote_audit::AUDIT_KEEP_DAYS_DEFAULT,
+    };
+    serve_unix(UnixListener::bind(&socket).unwrap(), Arc::new(cfg), hub).unwrap();
+    let mut late = Phone::connect(&socket);
+    late.hello(WATCH.0, Some(WATCH.1));
+    late.bytes_until_closed(PATIENCE)?;
+    let records = world.record_where("the revoked token after a restart", |r| {
+        field(r, "reason") == "revoked_token" && field(r, "device") == WATCH.0
+    })?;
+    let late = records
+        .iter()
+        .find(|r| field(r, "reason") == "revoked_token" && field(r, "device") == WATCH.0)
+        .unwrap();
+    check(field(late, "device_name") == "tablet", || format!("{}", late.line))
+}
+
+fn host_origin_and_path_refusals_are_recorded(dir: &Path) -> Result<(), String> {
+    let world = World::new(dir, Limits::default());
+    let upgrade = |target: &str, extra: &str| {
+        format!(
+            "GET {target} HTTP/1.1\r\n{extra}Upgrade: websocket\r\nConnection: Upgrade\r\n\
+             Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\nSec-WebSocket-Version: 13\r\n\r\n"
+        )
+    };
+    for request in [
+        upgrade("/v1/ws", "Host: evil.example\r\n"),
+        upgrade("/v1/ws", "Host: localhost\r\nOrigin: https://evil.example\r\n"),
+        upgrade("/eitri/v1/ws", "Host: localhost\r\n"),
+    ] {
+        let mut stream = UnixStream::connect(&world.socket).unwrap();
+        stream.set_read_timeout(Some(PATIENCE)).unwrap();
+        stream.write_all(request.as_bytes()).unwrap();
+        let mut answer = Vec::new();
+        let _ = stream.read_to_end(&mut answer);
+    }
+    let deadline = Instant::now() + PATIENCE;
+    let records = loop {
+        let records = world.records();
+        if records.iter().filter(|r| r.event == "refused").count() >= 3 || Instant::now() > deadline {
+            break records;
+        }
+        std::thread::sleep(Duration::from_millis(5));
+    };
+    let mut reasons: Vec<&str> = records
+        .iter()
+        .filter(|r| r.event == "refused")
+        .map(|r| field(r, "reason").as_str().unwrap_or("?"))
+        .collect();
+    reasons.sort_unstable();
+    check(reasons == ["host", "origin", "path_prefix"], || lines_of(&records))?;
+    for r in records.iter().filter(|r| r.event == "refused") {
+        check(
+            field(r, "listener") == "socket" && field(r, "peer") == "unix" && r.fields.get("device").is_none(),
+            || {
+                format!(
+                    "a refusal before hello names its listener and peer, and no device: {}",
+                    r.line
+                )
+            },
+        )?;
+    }
+    Ok(())
+}
+
+fn watch_device_act_is_recorded_once(dir: &Path) -> Result<(), String> {
+    let world = World::new(dir, Limits::default());
+    let stand_in = FakeWindow::open(&world);
+    let key = "k-00000000000000c1";
+    stand_in.publish(&[key]);
+    let mut phone = world.phone_as(WATCH);
+    phone.send(json!({ "kind": "subscribe", "key": key }));
+    phone.until(&[], "the stand-in's snapshot", |l| l["kind"] == "snapshot")?;
+    let sentinel = "act-text-sentinel-91";
+    phone.send(json!({ "kind": "act", "key": key, "cmd": { "type": "send", "text": sentinel, "command_id": "w1" } }));
+    let lines = phone.until(&[], "the result", |l| l["kind"] == "result")?;
+    check(lines.last().unwrap()["why"] == "watch only", || summary(&lines))?;
+    let notice = stand_in
+        .next_of("refused_notice", PATIENCE)
+        .ok_or("the window was not told of the refusal")?;
+    check(
+        notice["device_id"] == WATCH.0
+            && notice["device"] == "tablet"
+            && notice["key"] == key
+            && notice["reason"] == "grant",
+        || format!("the notice: {notice}"),
+    )?;
+    check(
+        !notice.to_string().contains(sentinel) && !notice.to_string().contains("w1"),
+        || format!("the notice carries the command: {notice}"),
+    )?;
+    check(stand_in.next_of("act", Duration::from_millis(300)).is_none(), || {
+        "the act reached the window".into()
+    })?;
+    let records = world.record_where("the refusal", |r| field(r, "reason") == "grant")?;
+    let grants: Vec<&Record> = records.iter().filter(|r| field(r, "reason") == "grant").collect();
+    check(grants.len() == 1, || {
+        format!("{} grant refusals: {}", grants.len(), lines_of(&records))
+    })?;
+    check(
+        field(grants[0], "device") == WATCH.0 && field(grants[0], "key") == key && field(grants[0], "kind") == "send",
+        || grants[0].line.clone(),
+    )?;
+    check(!String::from_utf8_lossy(&world.log_bytes()).contains(sentinel), || {
+        "the command's text is in the log".into()
+    })
+}
+
+fn push_endpoint_set_records_the_host_only(dir: &Path) -> Result<(), String> {
+    let world = World::new(dir, Limits::default());
+    let stand_in = FakeWindow::open(&world);
+    stand_in.publish(&["k-00000000000000d1"]);
+    let mut phone = world.phone_as(STEER);
+    // User information in the URL, as some push services carry a topic's credentials there: the window refuses to
+    // keep it, so nothing is recorded as set.
+    let with_user = concat!("https://topic-user:topic-secret", "@", "ntfy.example.org/up/AbCdEf123");
+    phone.send(json!({ "kind": "set_push_endpoint", "url": with_user }));
+    stand_in
+        .next_of("set_push_endpoint", PATIENCE)
+        .ok_or("the endpoint reached no window")?;
+    phone.send(json!({ "kind": "set_push_endpoint", "url": "https://Push.example.net:8443/up/AbCdEf123?x=1" }));
+    stand_in
+        .next_of("set_push_endpoint", PATIENCE)
+        .ok_or("the second endpoint reached no window")?;
+    let records = world.record_where("the endpoint", |r| {
+        r.event == "push_endpoint_set" && field(r, "host") == "push.example.net"
+    })?;
+    let sets: Vec<&Record> = records.iter().filter(|r| r.event == "push_endpoint_set").collect();
+    check(sets.len() == 1, || {
+        format!(
+            "an endpoint the window refuses is recorded as set: {}",
+            lines_of(&records)
+        )
+    })?;
+    let set = sets[0];
+    check(
+        field(set, "host") == "push.example.net" && field(set, "device") == STEER.0,
+        || set.line.clone(),
+    )?;
+    let log = String::from_utf8_lossy(&world.log_bytes()).into_owned();
+    for part in ["topic-secret", "topic-user", "AbCdEf123", "8443", "/up"] {
+        check(!log.contains(part), || format!("{part} is in the log"))?;
+    }
+    Ok(())
+}
+
+fn audit_mine_returns_only_this_devices_records(dir: &Path) -> Result<(), String> {
+    let world = World::new(dir, Limits::default());
+    let mut watcher = world.phone_as(WATCH);
+    watcher.send(json!({ "kind": "ping" }));
+    watcher.until(&[], "the pong", |l| l["kind"] == "pong")?;
+    // A record about another device whose claimed name is this device's id.
+    let mut window = AuditLog::open(
+        &world.audit,
+        WriterKind::Instance("a3f09c1d2e4b5f60".into()),
+        None,
+        JournalTarget::Off,
+    )
+    .map_err(|e| e.to_string())?;
+    window
+        .record(eitri_core::remote_audit::Event::DeviceFlagged {
+            device: eitri_core::remote_audit::DeviceRef {
+                id: "d5".into(),
+                name: STEER.0.into(),
+            },
+        })
+        .map_err(|e| e.to_string())?;
+    let mut phone = world.phone_as(STEER);
+    world.record_where("this phone's open", |r| {
+        r.event == "conn_open" && field(r, "device") == STEER.0
+    })?;
+    phone.send(json!({ "kind": "audit_mine", "limit": 500 }));
+    let lines = phone.until(&[], "the records", |l| l["kind"] == "audit_mine")?;
+    let answer = lines.last().unwrap();
+    let records = answer["records"].as_array().ok_or("no records array")?;
+    check(!records.is_empty(), || format!("{answer}"))?;
+    check(records.len() <= 200, || format!("{} records", records.len()))?;
+    check(records.iter().all(|r| r["device"] == STEER.0), || {
+        format!("another device's records: {answer}")
+    })?;
+    check(records[0]["event"] == "conn_open", || format!("newest first: {answer}"))?;
+    // Each answer reads the log: a second ask within a second is turned down, and answered after it.
+    phone.send(json!({ "kind": "audit_mine", "limit": 0 }));
+    let lines = phone.until(&[], "the refusal", |l| {
+        l["kind"] == "refused" || l["kind"] == "audit_mine"
+    })?;
+    check(lines.last().unwrap()["kind"] == "refused", || summary(&lines))?;
+    std::thread::sleep(Duration::from_millis(1100));
+    phone.send(json!({ "kind": "audit_mine", "limit": 0 }));
+    let lines = phone.until(&[], "no records", |l| l["kind"] == "audit_mine")?;
+    check(lines.last().unwrap()["records"] == json!([]), || {
+        format!("{}", lines.last().unwrap())
     })?;
     phone.seqs_contiguous()
 }

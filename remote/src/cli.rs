@@ -208,7 +208,7 @@ fn resolve<'a>(store: &'a DeviceStore, word: &str) -> Result<&'a Device, String>
 
 /// `text` with its control, invisible and direction-changing characters written as `\u{...}`, so a name a phone
 /// chose cannot move the cursor, hide itself or reorder the line it is printed on.
-fn shown(text: &str) -> String {
+pub(crate) fn shown(text: &str) -> String {
     text.chars()
         .map(|c| {
             let hidden = c.is_control()

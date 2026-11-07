@@ -232,6 +232,16 @@ pub enum RvInbound {
         epoch: u64,
         seq: u64,
     },
+    /// `serve` refused something the device `device_id` (named `device`) sent about the tab `key`, for `reason` (an
+    /// audit reason word), without passing it on: the window that owns the tab leaves it a notice, as for its own
+    /// refusals. It carries nothing of the command.
+    RefusedNotice {
+        v: u32,
+        device: String,
+        device_id: String,
+        key: String,
+        reason: String,
+    },
 }
 
 /// Why an inbound line was not read.
@@ -1140,6 +1150,7 @@ mod tests {
             r#"{"v":1,"kind":"revoke_self","device":"d1","token":"tok"}"#,
             r#"{"v":1,"kind":"set_push_endpoint","device":"d1","token":"tok","url":"https://ntfy.example/t"}"#,
             r#"{"v":1,"kind":"devices_connected","devices":[{"device":"d1","host":"h","peer":"p","since":7}],"epoch":1,"seq":0}"#,
+            r#"{"v":1,"kind":"refused_notice","device":"tablet","device_id":"d2","key":"k-1","reason":"grant"}"#,
         ];
         for line in lines {
             let parsed = parse_rv_line(line.as_bytes()).unwrap_or_else(|e| panic!("{line}: {e:?}"));
@@ -1160,6 +1171,9 @@ mod tests {
         assert_eq!(parse_rv_line(nested.as_bytes()), Err(RvLineError::Malformed));
         let grant = r#"{"v":1,"kind":"grant_request","device":"d1","grant":"admin"}"#;
         assert_eq!(parse_rv_line(grant.as_bytes()), Err(RvLineError::Malformed));
+        // A refusal notice carries no command: nothing of what the phone asked for reaches the window.
+        let with_text = r#"{"v":1,"kind":"refused_notice","device":"tablet","device_id":"d2","key":"k-1","reason":"grant","text":"hello"}"#;
+        assert_eq!(parse_rv_line(with_text.as_bytes()), Err(RvLineError::Malformed));
         let without_token = r#"{"v":1,"kind":"revoke_self","device":"d1"}"#;
         assert_eq!(parse_rv_line(without_token.as_bytes()), Err(RvLineError::Malformed));
 

@@ -130,6 +130,7 @@ mod tests {
             peer: Some("127.0.0.1:4000".into()),
             key: None,
             kind: None,
+            dropped: None,
         })
         .unwrap();
         let lines = lines(&dir);

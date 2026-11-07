@@ -1162,8 +1162,13 @@ pub const CLI_REFUSED_DROP: &str = "Claude refused it";
 /// What became of a message put into the running turn, as the provider reported it.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum SteerOutcome {
-    Delivered,
-    Dropped { reason: String },
+    /// Read by the agent, as the user prompt whose `seq` this is.
+    Delivered {
+        seq: u64,
+    },
+    Dropped {
+        reason: String,
+    },
 }
 
 /// One prompt the user sent, with the position it occupies among everything else.
@@ -2494,7 +2499,7 @@ impl AgentSessionProjection {
                 // and so is the thought: the next one sits below this prompt, not in the block above it.
                 self.assistant_message_open = false;
                 self.thinking_open = false;
-                self.note_steer_outcome(client_message_id, SteerOutcome::Delivered);
+                self.note_steer_outcome(client_message_id, SteerOutcome::Delivered { seq });
             }
             AgentDomainEvent::UserMessageDropped {
                 client_message_id,

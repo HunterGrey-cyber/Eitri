@@ -1916,6 +1916,25 @@ impl CallNotes {
         self.remote_senders.remove(at).map(|(_, from)| from)
     }
 
+    /// After a resync dropped the events that named them back: each phone message the projection says the agent read is
+    /// noted at the prompt it became, and taken out. One whose prompt the projection no longer holds (a reset in the
+    /// dropped events) is taken out with no note.
+    pub fn recover_remote_senders(&mut self, projection: &agent::AgentSessionProjection) {
+        let mut noted = false;
+        let sent_from = &mut self.sent_from;
+        self.remote_senders.retain(|(id, from)| {
+            let Some(agent::SteerOutcome::Delivered { seq }) = projection.steer_outcome(id) else {
+                return true;
+            };
+            if projection.user_prompts.iter().any(|prompt| prompt.seq == *seq) {
+                sent_from.insert(*seq, from.clone());
+                noted = true;
+            }
+            false
+        });
+        self.remote_notes_dirty |= noted;
+    }
+
     /// A conversation reset at fold revision `revision`: which phone sent or stopped what in the conversation
     /// before it goes with that conversation, as the view's reset drops it. A prompt after the reset has a
     /// `seq` of at least `revision`.

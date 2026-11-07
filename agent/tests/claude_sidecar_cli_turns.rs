@@ -297,7 +297,9 @@ fn a_prompt_claude_code_reads_after_work_of_its_own_moves_where_it_was_read() {
     assert!(projection.user_prompts[0].seq > woken.seq, "read after the woken work");
     assert_eq!(
         projection.steer_outcome("eitri-7"),
-        Some(&agent::SteerOutcome::Delivered)
+        Some(&agent::SteerOutcome::Delivered {
+            seq: projection.user_prompts[0].seq
+        })
     );
 }
 

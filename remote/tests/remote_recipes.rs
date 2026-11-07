@@ -6,6 +6,7 @@ fn recipe(listen: Listen, host: &str, origin: &str, allowed: &[&str]) {
         listen,
         port: 8765,
         origins: allowed.iter().map(|s| s.to_string()).collect(),
+        audit_keep_days: eitri_core::remote_audit::AUDIT_KEEP_DAYS_DEFAULT,
     };
     assert_eq!(check_request(host, Some(origin), &cfg), Ok(()));
     assert_eq!(check_request(host, None, &cfg), Ok(()));

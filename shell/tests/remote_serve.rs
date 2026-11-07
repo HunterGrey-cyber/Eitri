@@ -59,6 +59,27 @@ fn main() {
             "serve_is_not_dumpable_and_status_says_how_it_runs",
             serve_is_not_dumpable_and_status_says_how_it_runs,
         ),
+        (
+            "sandbox_lets_serve_write_the_audit_dir_but_not_the_store",
+            sandbox_lets_serve_write_the_audit_dir_but_not_the_store,
+        ),
+        (
+            "sandbox_lets_serve_reach_the_journal_socket",
+            sandbox_lets_serve_reach_the_journal_socket,
+        ),
+        (
+            "missing_journal_dir_still_sandboxes",
+            missing_journal_dir_still_sandboxes,
+        ),
+        ("serve_records_enable_and_disable", serve_records_enable_and_disable),
+        (
+            "conn_open_and_close_name_the_device",
+            conn_open_and_close_name_the_device,
+        ),
+        (
+            "a_stop_closes_the_open_connections_in_the_log",
+            a_stop_closes_the_open_connections_in_the_log,
+        ),
     ];
     // `cargo test --test remote_serve -- <part of a name>` runs the checks whose names hold it.
     let filter = std::env::args().skip(1).find(|arg| !arg.starts_with('-'));
@@ -134,6 +155,16 @@ impl Home {
         self.root.join("state").join("eitri").join("remote")
     }
 
+    fn audit(&self) -> PathBuf {
+        eitri_core::remote_audit::audit_dir(&self.store())
+    }
+
+    /// Where the journal copy goes in this home: a test never writes to the real journal. Nothing listens there
+    /// unless a check binds it, and while its directory is missing `serve` sends no copy.
+    fn journal(&self) -> PathBuf {
+        self.root.join("journal").join("socket")
+    }
+
     /// The control, agents and store directories, made as `serve` makes them.
     fn make_dirs(&self) {
         use std::os::unix::fs::PermissionsExt;
@@ -153,6 +184,7 @@ impl Home {
             .env("XDG_STATE_HOME", self.root.join("state"))
             .env("XDG_CACHE_HOME", self.root.join("cache"))
             .env("XDG_RUNTIME_DIR", self.root.join("run"))
+            .env(eitri_core::remote_audit::JOURNAL_SOCKET_VAR, self.journal())
             .env_remove("DISPLAY")
             .env_remove("WAYLAND_DISPLAY")
             .env_remove("WAYLAND_SOCKET")
@@ -173,6 +205,8 @@ impl Home {
             .env("RS_AGENTS", self.agents())
             .env("RS_CONTROL", self.control())
             .env("RS_STORE", self.store())
+            .env("RS_AUDIT", self.audit())
+            .env("RS_JOURNAL_DIR", self.journal().parent().unwrap())
             .env("RS_HOME", self.home());
         command
     }
@@ -413,7 +447,13 @@ fn unconfirmed_address_is_not_bound(shell: &str, dir: &Path) -> Result<(), Strin
 
 /// Starts `serve` on the home's Unix socket and waits until `status` reports it.
 fn start_serve(shell: &str, home: &Home) -> Result<(Running, Run), String> {
+    start_serve_with(shell, home, &[])
+}
+
+/// [`start_serve`] with more variables in `serve`'s environment.
+fn start_serve_with(shell: &str, home: &Home, env: &[(&str, &str)]) -> Result<(Running, Run), String> {
     let serve = shell_remote(shell, home, &["serve", "--listen", "socket"])
+        .envs(env.iter().copied())
         .stdout(Stdio::null())
         .stderr(Stdio::inherit())
         .spawn()
@@ -565,6 +605,251 @@ fn only_the_ws_path_upgrades_end_to_end(home: &Home) -> Result<(), String> {
     Ok(())
 }
 
+fn sandbox_lets_serve_write_the_audit_dir_but_not_the_store(_shell: &str, dir: &Path) -> Result<(), String> {
+    let home = Home::new(dir);
+    home.make_dirs();
+    std::fs::write(home.store().join("devices.json"), b"{\"v\":1,\"devices\":[]}").unwrap();
+    let run = run(home.child("sandbox-audit"))?;
+    let mut wanted = vec![
+        "audit-append ok",
+        "audit-rotate ok",
+        "audit-prune ok",
+        "audit-after-rotation ok",
+        "audit-new ok",
+    ];
+    if landlock_in_kernel() {
+        wanted.extend(["store-write refused", "store-new refused"]);
+    }
+    for line in wanted {
+        if !run.stdout.lines().any(|l| l == line) {
+            return Err(format!("no line {line:?}; {}", run.says()));
+        }
+    }
+    if run.code != Some(0) {
+        return Err(run.says());
+    }
+    let rotated = std::fs::read_to_string(home.audit().join("audit.jsonl.1")).map_err(|e| e.to_string())?;
+    let log = std::fs::read_to_string(home.audit().join("audit.jsonl")).map_err(|e| e.to_string())?;
+    if !rotated.ends_with("\"why\":\"probe\"}\n") || !log.contains("\"why\":\"after-rotation\"") {
+        return Err(format!("the records are not in the log: {log:?}"));
+    }
+    if landlock_in_kernel()
+        && std::fs::read(home.store().join("devices.json")).ok().as_deref()
+            != Some(b"{\"v\":1,\"devices\":[]}".as_slice())
+    {
+        return Err("the store was written under the sandbox".into());
+    }
+    Ok(())
+}
+
+fn sandbox_lets_serve_reach_the_journal_socket(_shell: &str, dir: &Path) -> Result<(), String> {
+    let home = Home::new(dir);
+    home.make_dirs();
+    std::fs::create_dir_all(home.audit()).unwrap();
+    std::fs::create_dir_all(home.journal().parent().unwrap()).unwrap();
+    let journal = std::os::unix::net::UnixDatagram::bind(home.journal()).map_err(|e| e.to_string())?;
+    journal.set_read_timeout(Some(HANG)).unwrap();
+    let run = run(home.child("sandbox-journal"))?;
+    if run.code != Some(0) || !run.stdout.lines().any(|l| l == "journal-send ok") {
+        return Err(run.says());
+    }
+    let mut buf = [0u8; 256];
+    let got = journal
+        .recv(&mut buf)
+        .map_err(|e| format!("nothing reached the journal socket: {e}"))?;
+    if &buf[..got] != b"MESSAGE=probe\n" {
+        return Err(format!("the journal socket got {:?}", &buf[..got]));
+    }
+    Ok(())
+}
+
+fn missing_journal_dir_still_sandboxes(_shell: &str, dir: &Path) -> Result<(), String> {
+    let home = Home::new(dir);
+    home.make_dirs();
+    std::fs::create_dir_all(home.audit()).unwrap();
+    std::fs::create_dir_all(home.journal().parent().unwrap()).unwrap();
+    let run = run(home.child("sandbox-no-journal"))?;
+    if run.code != Some(0) || !run.stdout.lines().any(|l| l.starts_with("state ok ")) {
+        return Err(run.says());
+    }
+    Ok(())
+}
+
+/// The log's records, oldest first, each as its JSON object.
+fn audit_records(home: &Home) -> Vec<serde_json::Value> {
+    std::fs::read_to_string(home.audit().join("audit.jsonl"))
+        .unwrap_or_default()
+        .lines()
+        .filter_map(|line| serde_json::from_str(line).ok())
+        .collect()
+}
+
+/// Waits until the log holds a record `wanted` accepts.
+fn wait_for_record(
+    home: &Home,
+    what: &str,
+    wanted: impl Fn(&serde_json::Value) -> bool,
+) -> Result<Vec<serde_json::Value>, String> {
+    let until = Instant::now() + HANG;
+    loop {
+        let records = audit_records(home);
+        if records.iter().any(&wanted) {
+            return Ok(records);
+        }
+        if Instant::now() > until {
+            return Err(format!("no record of {what}: {records:?}"));
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
+}
+
+fn serve_records_enable_and_disable(shell: &str, dir: &Path) -> Result<(), String> {
+    let home = Home::new(dir);
+    // No window: `serve` ends at its idle deadline, shortened for the test.
+    let mut idle = shell_remote(shell, &home, &["serve", "--listen", "socket"]);
+    idle.env(eitri_remote::serve::IDLE_TEST_VAR, "300");
+    let ran = run(idle)?;
+    if ran.code != Some(0) {
+        return Err(format!("the idle serve: {}", ran.says()));
+    }
+    let records = audit_records(&home);
+    let events: Vec<&str> = records.iter().filter_map(|r| r["event"].as_str()).collect();
+    if events != ["enable", "disable"] {
+        return Err(format!("after an idle exit: {records:?}"));
+    }
+    if records[0]["listener"] != "socket" || records[0]["writer"] != "serve" || records[1]["why"] != "idle" {
+        return Err(format!("after an idle exit: {records:?}"));
+    }
+    // And through `eitri remote stop`.
+    let (serve, _) = start_serve(shell, &home)?;
+    wait_for_record(&home, "the second enable", |r| {
+        r["event"] == "enable" && r["run"] != records[0]["run"]
+    })?;
+    let stopped = run(shell_remote(shell, &home, &["stop"]))?;
+    if stopped.code != Some(0) {
+        return Err(format!("stop: {}", stopped.says()));
+    }
+    let records = wait_for_record(&home, "the stop", |r| r["event"] == "disable" && r["why"] == "stopped")?;
+    drop(serve);
+    let disables = records.iter().filter(|r| r["event"] == "disable").count();
+    if disables != 2 {
+        return Err(format!("{disables} disables: {records:?}"));
+    }
+    Ok(())
+}
+
+fn conn_open_and_close_name_the_device(shell: &str, dir: &Path) -> Result<(), String> {
+    let home = Home::new(dir);
+    home.make_dirs();
+    let token = "conn-token-sentinel-5d";
+    let store = serde_json::json!({
+        "v": 1,
+        "devices": [{ "id": "d1", "name": "Pixel 8", "token_sha256": eitri_core::remote_devices::token_hash_hex(token), "grant": "watch" }],
+    });
+    agent::private_fs::write_private(&home.store().join("devices.json"), store.to_string().as_bytes()).unwrap();
+    std::fs::create_dir_all(home.journal().parent().unwrap()).unwrap();
+    let journal = std::os::unix::net::UnixDatagram::bind(home.journal()).map_err(|e| e.to_string())?;
+    journal.set_read_timeout(Some(Duration::from_millis(200))).unwrap();
+    let (serve, _) = start_serve(shell, &home)?;
+    let mut phone = phones::Phone::connect(&home.control().join("remote.sock"));
+    phone.hello("d1", Some(token));
+    phone.send(serde_json::json!({ "kind": "ping" }));
+    let pong = phone.recv(HANG)?.ok_or("no pong")?;
+    if pong["kind"] != "pong" {
+        return Err(format!("the first answer: {pong}"));
+    }
+    phone.close();
+    let _ = phone.bytes_until_closed(HANG);
+    let records = wait_for_record(&home, "the close", |r| r["event"] == "conn_close")?;
+    let open = records
+        .iter()
+        .find(|r| r["event"] == "conn_open")
+        .ok_or("no conn_open")?;
+    let close = records.iter().find(|r| r["event"] == "conn_close").unwrap();
+    let opened_right = open["device"] == "d1"
+        && open["device_name"] == "Pixel 8"
+        && open["listener"] == "socket"
+        && open["peer"] == "unix"
+        && open["host"] == "localhost"
+        && open["origin"].is_null();
+    let closed_right = close["device"] == "d1"
+        && close["device_name"] == "Pixel 8"
+        && close["why"] == "closed"
+        && close["secs"].is_u64()
+        && close["bytes_in"].as_u64().is_some_and(|n| n > 0)
+        && close["bytes_out"].as_u64().is_some_and(|n| n > 0);
+    if !opened_right || !closed_right {
+        return Err(format!("the records: {open} {close}"));
+    }
+    let stopped = run(shell_remote(shell, &home, &["stop"]))?;
+    drop(serve);
+    if stopped.code != Some(0) {
+        return Err(stopped.says());
+    }
+    // The journal copy: each record as its own datagram, and never the token.
+    let mut copies = Vec::new();
+    let mut buf = vec![0u8; 16 * 1024];
+    while let Ok(got) = journal.recv(&mut buf) {
+        copies.push(String::from_utf8_lossy(&buf[..got]).into_owned());
+    }
+    for event in ["enable", "conn_open", "conn_close", "disable"] {
+        let wanted = format!("EITRI_EVENT={event}\n");
+        if !copies
+            .iter()
+            .any(|c| c.contains(&wanted) && c.contains("SYSLOG_IDENTIFIER=eitri-remote\n"))
+        {
+            return Err(format!("no journal copy of {event}: {copies:?}"));
+        }
+    }
+    let log = std::fs::read_to_string(home.audit().join("audit.jsonl")).unwrap_or_default();
+    if log.contains(token) || copies.iter().any(|c| c.contains(token)) {
+        return Err("the token reached the log or the journal".into());
+    }
+    Ok(())
+}
+
+fn a_stop_closes_the_open_connections_in_the_log(shell: &str, dir: &Path) -> Result<(), String> {
+    let home = Home::new(dir);
+    home.make_dirs();
+    let token = "stop-token-sentinel-3c";
+    let store = serde_json::json!({
+        "v": 1,
+        "devices": [{ "id": "d1", "name": "Pixel 8", "token_sha256": eitri_core::remote_devices::token_hash_hex(token), "grant": "watch" }],
+    });
+    agent::private_fs::write_private(&home.store().join("devices.json"), store.to_string().as_bytes()).unwrap();
+    let (serve, _) = start_serve(shell, &home)?;
+    let mut phone = phones::Phone::connect(&home.control().join("remote.sock"));
+    phone.hello("d1", Some(token));
+    phone.send(serde_json::json!({ "kind": "ping" }));
+    let pong = phone.recv(HANG)?.ok_or("no pong")?;
+    if pong["kind"] != "pong" {
+        return Err(format!("the first answer: {pong}"));
+    }
+    wait_for_record(&home, "the open", |r| r["event"] == "conn_open")?;
+    // Stopped while the phone is still connected.
+    let stopped = run(shell_remote(shell, &home, &["stop"]))?;
+    drop(serve);
+    if stopped.code != Some(0) {
+        return Err(stopped.says());
+    }
+    let records = audit_records(&home);
+    let events: Vec<&str> = records.iter().filter_map(|r| r["event"].as_str()).collect();
+    if events != ["enable", "conn_open", "conn_close", "disable"] {
+        return Err(format!("the records: {records:?}"));
+    }
+    let close = &records[2];
+    let closed_right = close["device"] == "d1"
+        && close["device_name"] == "Pixel 8"
+        && close["why"] == "serve_ended"
+        && close["secs"].is_u64()
+        && close["bytes_in"].as_u64().is_some_and(|n| n > 0)
+        && close["bytes_out"].as_u64().is_some_and(|n| n > 0);
+    if !closed_right || records[3]["why"] != "stopped" {
+        return Err(format!("the records: {records:?}"));
+    }
+    Ok(())
+}
+
 /// What a child of this test does, by its role. Each prints one line per thing it saw.
 mod child {
     use std::io::Write;
@@ -585,6 +870,9 @@ mod child {
             "sandbox-busy" => sandbox_busy(),
             "publisher" => publisher(),
             "feed-sandboxed" => feed_sandboxed(),
+            "sandbox-audit" => sandbox_audit(),
+            "sandbox-journal" => sandbox_journal(),
+            "sandbox-no-journal" => sandbox_no_journal(),
             other => {
                 eprintln!("unknown role {other:?}");
                 2
@@ -601,7 +889,7 @@ mod child {
 
     fn sandbox_thread() -> i32 {
         let (agents, control, store, home) = (dir("RS_AGENTS"), dir("RS_CONTROL"), dir("RS_STORE"), dir("RS_HOME"));
-        let state = match sandbox(&agents, &control, &store) {
+        let state = match sandbox(&agents, &control, &store, &store.join("audit"), None) {
             Ok(state) => state,
             Err(e) => {
                 println!("state failed: {e}");
@@ -658,7 +946,13 @@ mod child {
             let _ = stop_rx.recv();
         });
         started.recv().unwrap();
-        match sandbox(&dir("RS_AGENTS"), &dir("RS_CONTROL"), &dir("RS_STORE")) {
+        match sandbox(
+            &dir("RS_AGENTS"),
+            &dir("RS_CONTROL"),
+            &dir("RS_STORE"),
+            &dir("RS_AUDIT"),
+            None,
+        ) {
             Err(e) if e.to_string().contains("before any thread starts") => {
                 println!("refused, and dumpable {}", is_dumpable().unwrap_or(false));
                 0
@@ -720,7 +1014,7 @@ mod child {
 
     fn feed_sandboxed() -> i32 {
         let (agents, control, store) = (dir("RS_AGENTS"), dir("RS_CONTROL"), dir("RS_STORE"));
-        if let Err(e) = sandbox(&agents, &control, &store) {
+        if let Err(e) = sandbox(&agents, &control, &store, &store.join("audit"), None) {
             println!("sandbox failed: {e}");
             return 1;
         }
@@ -742,6 +1036,102 @@ mod child {
         println!("kind {}", view["kind"]);
         println!("rows {}", view["view"]["rows"].as_array().map_or(usize::MAX, Vec::len));
         feed.stop();
+        let _ = std::io::stdout().flush();
+        0
+    }
+
+    /// Opens the log as `serve` does, before the sandbox, then appends from a thread under it and tries the store.
+    fn sandbox_audit() -> i32 {
+        use eitri_core::remote_audit::{AuditLog, Event, JournalTarget, WriterKind};
+        let (agents, control, store, audit) = (dir("RS_AGENTS"), dir("RS_CONTROL"), dir("RS_STORE"), dir("RS_AUDIT"));
+        // A current file past its size, so the next record rotates it, and a rotated file older than the kept days
+        // that the rotation moves to the last place, where the prune that follows removes it.
+        agent::private_fs::create_private_dir_all(&audit, audit.parent().unwrap()).unwrap();
+        let filler = format!("{}\n", "x".repeat(1023)).repeat(10 * 1024 + 1);
+        agent::private_fs::write_private(&audit.join("audit.jsonl"), filler.as_bytes()).unwrap();
+        let old = concat!(
+            r#"{"v":1,"time":"2001-01-01T00:00:00.000Z","writer":"serve","run":"0000000000000001","seq":1,"#,
+            r#""event":"disable","prev":"0000000000000000000000000000000000000000000000000000000000000000","why":"old"}"#,
+            "\n"
+        );
+        agent::private_fs::write_private(&audit.join("audit.jsonl.4"), old.as_bytes()).unwrap();
+        agent::private_fs::write_private(&audit.join("audit.jsonl.5"), b"not a record\n").unwrap();
+        let mut log = match AuditLog::open(&audit, WriterKind::Serve, Some(90), JournalTarget::Off) {
+            Ok(log) => log,
+            Err(e) => {
+                println!("open failed: {e}");
+                return 1;
+            }
+        };
+        if let Err(e) = sandbox(&agents, &control, &store, &audit, None) {
+            println!("sandbox failed: {e}");
+            return 1;
+        }
+        let thread = std::thread::spawn(move || {
+            let appended = log.record(Event::Disable { why: "probe".into() });
+            println!("audit-append {}", outcome(appended));
+            let rotated = std::fs::metadata(audit.join("audit.jsonl.1")).is_ok_and(|m| m.len() > 10 * 1024 * 1024)
+                && !audit.join("audit.jsonl").exists();
+            let pruned = !audit.join("audit.jsonl.5").exists() && !audit.join("audit.jsonl.4").exists();
+            println!("audit-rotate {}", if rotated { "ok" } else { "refused" });
+            println!("audit-prune {}", if pruned { "ok" } else { "refused" });
+            let after = log.record(Event::Disable {
+                why: "after-rotation".into(),
+            });
+            println!("audit-after-rotation {}", outcome(after));
+            println!(
+                "audit-new {}",
+                outcome(std::fs::write(audit.join("made-under-the-sandbox"), b"x"))
+            );
+            println!(
+                "store-write {}",
+                outcome(std::fs::write(store.join("devices.json"), b"{}"))
+            );
+            println!(
+                "store-new {}",
+                outcome(std::fs::write(store.join("made-beside-the-store"), b"x"))
+            );
+        });
+        if thread.join().is_err() {
+            return 1;
+        }
+        let _ = std::io::stdout().flush();
+        0
+    }
+
+    /// Sends a datagram to the journal socket the parent bound, under the sandbox.
+    fn sandbox_journal() -> i32 {
+        let journal = dir("RS_JOURNAL_DIR");
+        if let Err(e) = sandbox(
+            &dir("RS_AGENTS"),
+            &dir("RS_CONTROL"),
+            &dir("RS_STORE"),
+            &dir("RS_AUDIT"),
+            Some(&journal),
+        ) {
+            println!("sandbox failed: {e}");
+            return 1;
+        }
+        let sent = std::os::unix::net::UnixDatagram::unbound()
+            .and_then(|socket| socket.send_to(b"MESSAGE=probe\n", journal.join("socket")));
+        println!("journal-send {}", outcome(sent));
+        let _ = std::io::stdout().flush();
+        0
+    }
+
+    /// The sandbox with a journal directory that is not there.
+    fn sandbox_no_journal() -> i32 {
+        let missing = dir("RS_JOURNAL_DIR").join("not-there");
+        match sandbox(
+            &dir("RS_AGENTS"),
+            &dir("RS_CONTROL"),
+            &dir("RS_STORE"),
+            &dir("RS_AUDIT"),
+            Some(&missing),
+        ) {
+            Ok(state) => println!("state ok {}", state.word()),
+            Err(e) => println!("sandbox failed: {e}"),
+        }
         let _ = std::io::stdout().flush();
         0
     }

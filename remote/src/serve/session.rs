@@ -23,8 +23,22 @@
 //! The queue's overflow cuts every `rv-` connection and the feed, and its resync makes them again.
 //!
 //! [`Hub`] holds what the connections share: the rows index (one agents reader for the whole server), the device
-//! store's view and its watch, which closes the connections of a device that is revoked or whose grant fell, and the
-//! report of who is connected that every window gets ([`report`](super::report)).
+//! store's view and its watch, which closes the connections of a device that is revoked or whose grant fell, the
+//! report of who is connected that every window gets ([`report`](super::report)), and `serve`'s audit log ([`Audit`]).
+//!
+//! **What a session records.** `conn_open` once a `hello` with a token is accepted (the device by its store id and
+//! name, the listener, the peer, `Host` and `Origin`) and `conn_close` when that connection ends (why, how long, the
+//! bytes each way after the 101); `refused` with `bad_token`, or `revoked_token` for a device the store has let go
+//! ([`StoreView::revoked`]), for a `hello` whose token is not the device's; `refused` with `grant` for an `act` from a
+//! `watch` device, which also sends the window that owns the tab a `refused_notice` (no command text) so the desk
+//! sees the attempt; `push_endpoint_set` with the endpoint's host only, for an endpoint the window's own check takes
+//! (one it refuses is not recorded; one its store write then fails on still is). `audit_mine` is answered here from
+//! the log, with the session's own device's records alone, newest first, once a second per device. No record holds a
+//! token or a command's text.
+//!
+//! Refusals made before a device is proved (before `hello`, and of the `hello` itself) are bounded: anyone who can
+//! reach a listener can cause one, so past a burst each is counted on the next recorded one (`dropped`). When `serve`
+//! ends (`disable`), every connection still open gets its `conn_close` (`serve_ended`) first.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::io::{self, Read, Write};
@@ -38,6 +52,7 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use eitri_core::agents::{Reader, ReaderEvent, SCHEMA_V};
 use eitri_core::ide_server::frames::{close_frame, pong_frame, Decoder, Inbound};
+use eitri_core::remote_audit::{AuditLog, DeviceRef, Event as AuditEvent, Filter, Listener, Reason};
 use eitri_core::remote_devices::Grant;
 use eitri_core::remote_rv::{
     parse_rv_outbound, pong_line, refused_line, result_line, rv_socket_path, Connected, RvClient, RvInbound,
@@ -72,6 +87,315 @@ pub const RECONNECT_PAUSE: Duration = Duration::from_millis(200);
 pub const MAX_FOLLOWED: usize = 64;
 /// The phone's frames read ahead of the session; past it, the phone's reader waits and so does the phone.
 const PHONE_FRAMES_AHEAD: usize = 16;
+/// The most records one `audit_mine` answer holds.
+pub const AUDIT_MINE_MAX: u32 = 200;
+/// The most bytes of records one `audit_mine` answer holds; the newest that fit are sent.
+const AUDIT_MINE_BYTES: usize = 256 * 1024;
+/// How often a device is answered `audit_mine`, across all its connections: each answer reads the retained log, so a
+/// phone asking in a loop is told to wait, and so is one asking while another device's answer is being read.
+const AUDIT_MINE_EVERY: Duration = Duration::from_secs(1);
+/// How many refusals before any `hello` are recorded one after another, and how often one more may be once those are
+/// used: anyone who can reach a listener can be refused, so a flood is recorded as a count on the next record rather
+/// than record by record, which would rotate the log's older files out and push the journal past its rate limit.
+const EARLY_REFUSALS_BURST: u32 = 30;
+const EARLY_REFUSAL_EVERY: Duration = Duration::from_secs(30);
+
+/// `serve`'s one writer of the audit log, shared by its threads; a record holds the log's lock for that record only.
+/// A record that cannot be written is said on stderr (the first time and every thousandth after) and never stops what
+/// it records.
+pub struct Audit {
+    log: Option<Mutex<AuditLog>>,
+    dir: Option<PathBuf>,
+    failed: AtomicU64,
+    disabled: AtomicBool,
+    /// The connections whose `conn_open` is recorded and whose `conn_close` is not yet; `None` once `serve` ended,
+    /// when `disable` recorded their close.
+    open: Mutex<Option<BTreeMap<u64, OpenConn>>>,
+    early: Mutex<EarlyRefusals>,
+    /// When each device was last answered `audit_mine`.
+    mine_last: Mutex<BTreeMap<String, Instant>>,
+    /// Held while an `audit_mine` answer reads the log, so one reading runs at a time.
+    mine_reading: Mutex<()>,
+}
+
+/// A connection whose `hello` was accepted, as its `conn_close` will name it.
+struct OpenConn {
+    device: DeviceRef,
+    at: Instant,
+    kill: Arc<Kill>,
+}
+
+/// The bound on refusals before `hello`: a bucket of [`EARLY_REFUSALS_BURST`] that gains one every
+/// [`EARLY_REFUSAL_EVERY`], and the count of those not recorded since the last that was.
+struct EarlyRefusals {
+    tokens: u32,
+    refilled: Instant,
+    dropped: u64,
+    last_dropped: Option<Reason>,
+}
+
+impl EarlyRefusals {
+    fn new(now: Instant) -> EarlyRefusals {
+        EarlyRefusals {
+            tokens: EARLY_REFUSALS_BURST,
+            refilled: now,
+            dropped: 0,
+            last_dropped: None,
+        }
+    }
+
+    /// Whether a refusal of `reason` at `now` is recorded: `Some` with how many were not since the last that was
+    /// (`None` inside when there were none), or `None` when this one is only counted.
+    fn take(&mut self, reason: Reason, now: Instant) -> Option<Option<u64>> {
+        let gained = now.saturating_duration_since(self.refilled).as_nanos() / EARLY_REFUSAL_EVERY.as_nanos();
+        if gained > 0 {
+            let gained = u32::try_from(gained).unwrap_or(u32::MAX);
+            self.tokens = self.tokens.saturating_add(gained).min(EARLY_REFUSALS_BURST);
+            self.refilled = if self.tokens == EARLY_REFUSALS_BURST {
+                now
+            } else {
+                self.refilled + EARLY_REFUSAL_EVERY * gained
+            };
+        }
+        if self.tokens == 0 {
+            self.dropped += 1;
+            self.last_dropped = Some(reason);
+            return None;
+        }
+        self.tokens -= 1;
+        self.last_dropped = None;
+        let dropped = std::mem::take(&mut self.dropped);
+        Some((dropped > 0).then_some(dropped))
+    }
+
+    /// The refusals counted and not yet recorded, with the reason of the last; emptied.
+    fn take_dropped(&mut self) -> Option<(Reason, u64)> {
+        let reason = self.last_dropped.take()?;
+        Some((reason, std::mem::take(&mut self.dropped)))
+    }
+}
+
+impl Audit {
+    /// Records through `log`, which was opened on `dir`.
+    pub fn new(log: AuditLog, dir: &Path) -> Arc<Audit> {
+        Audit::with(Some(log), Some(dir.to_owned()))
+    }
+
+    /// Records nothing.
+    pub fn off() -> Arc<Audit> {
+        Audit::with(None, None)
+    }
+
+    fn with(log: Option<AuditLog>, dir: Option<PathBuf>) -> Arc<Audit> {
+        Arc::new(Audit {
+            log: log.map(Mutex::new),
+            dir,
+            failed: AtomicU64::new(0),
+            disabled: AtomicBool::new(false),
+            open: Mutex::new(Some(BTreeMap::new())),
+            early: Mutex::new(EarlyRefusals::new(Instant::now())),
+            mine_last: Mutex::new(BTreeMap::new()),
+            mine_reading: Mutex::new(()),
+        })
+    }
+
+    pub fn record(&self, event: AuditEvent) {
+        let Some(log) = &self.log else { return };
+        if let Err(e) = lock(log).record(event) {
+            let failed = self.failed.fetch_add(1, Ordering::Relaxed);
+            if failed % 1000 == 0 {
+                eprintln!(
+                    "[remote] a record was not written to the audit log ({} so far): {e}",
+                    failed + 1
+                );
+            }
+        }
+    }
+
+    /// Records `disable` with `why` the first time it is called: whichever end comes first (the idle exit, a signal, a
+    /// failure) is the one recorded. Before it, the refusals before `hello` still only counted, and a `conn_close`
+    /// (`serve_ended`) for each connection still open, since `serve` ends without their sessions' own.
+    pub fn disable_once(&self, why: &str) {
+        if self.disabled.swap(true, Ordering::SeqCst) {
+            return;
+        }
+        if let Some((reason, dropped)) = lock(&self.early).take_dropped() {
+            self.record(AuditEvent::Refused {
+                reason,
+                device: None,
+                listener: None,
+                peer: None,
+                key: None,
+                kind: None,
+                dropped: Some(dropped),
+            });
+        }
+        let open = lock(&self.open).take().unwrap_or_default();
+        for conn in open.into_values() {
+            self.record(conn.close("serve_ended"));
+        }
+        self.record(AuditEvent::Disable { why: why.to_owned() });
+    }
+
+    /// A refusal before any device was proved (before `hello`, or of the `hello` itself, naming the device it
+    /// claimed): where it came in and from; within [`EARLY_REFUSALS_BURST`] and [`EARLY_REFUSAL_EVERY`], past which
+    /// it is counted on the next one recorded.
+    pub fn record_early_refusal(&self, reason: Reason, device: Option<DeviceRef>, listener: &Listener, peer: &str) {
+        self.record_early_refusal_at(reason, device, listener, peer, Instant::now());
+    }
+
+    fn record_early_refusal_at(
+        &self,
+        reason: Reason,
+        device: Option<DeviceRef>,
+        listener: &Listener,
+        peer: &str,
+        now: Instant,
+    ) {
+        let Some(dropped) = lock(&self.early).take(reason, now) else {
+            return;
+        };
+        self.record(AuditEvent::Refused {
+            reason,
+            device,
+            listener: Some(listener.clone()),
+            peer: Some(peer.to_owned()),
+            key: None,
+            kind: None,
+            dropped,
+        });
+    }
+
+    /// Notes connection `id`, whose `conn_open` naming `device` was just recorded.
+    fn opened(&self, id: u64, device: DeviceRef, kill: &Arc<Kill>) {
+        if let Some(open) = lock(&self.open).as_mut() {
+            open.insert(
+                id,
+                OpenConn {
+                    device,
+                    at: Instant::now(),
+                    kill: kill.clone(),
+                },
+            );
+        }
+    }
+
+    /// Records connection `id`'s `conn_close` with `why`, unless `disable` recorded it or it never opened.
+    fn closed(&self, id: u64, why: &str) {
+        let conn = lock(&self.open).as_mut().and_then(|open| open.remove(&id));
+        if let Some(conn) = conn {
+            self.record(conn.close(why));
+        }
+    }
+
+    /// The devices the retained log's `revoke` records name, with their names.
+    pub fn revoked_in_log(&self) -> Vec<(String, String)> {
+        let Some(dir) = &self.dir else { return Vec::new() };
+        let filter = Filter {
+            event: Some("revoke".to_owned()),
+            ..Filter::default()
+        };
+        let records = eitri_core::remote_audit::read(dir, &filter, None).unwrap_or_else(|e| {
+            eprintln!("[remote] the audit log's revocations were not read: {e}");
+            Vec::new()
+        });
+        records
+            .into_iter()
+            .filter_map(|r| {
+                let name = r
+                    .fields
+                    .get("device_name")
+                    .and_then(serde_json::Value::as_str)
+                    .unwrap_or("");
+                Some((r.device()?.to_owned(), name.to_owned()))
+            })
+            .collect()
+    }
+
+    /// The `audit_mine` answer: the newest records about `device` by its id (a record about another device whose
+    /// claimed name is this id is not this device's), at most `limit` and [`AUDIT_MINE_MAX`], within
+    /// [`AUDIT_MINE_BYTES`]. `None` when `device` was answered less than [`AUDIT_MINE_EVERY`] ago, on any of its
+    /// connections, or another answer is reading the log now.
+    fn mine(&self, device: &str, limit: u32) -> Option<String> {
+        let now = Instant::now();
+        {
+            let mut last = lock(&self.mine_last);
+            if last
+                .get(device)
+                .is_some_and(|at| now.duration_since(*at) < AUDIT_MINE_EVERY)
+            {
+                return None;
+            }
+            last.retain(|_, at| now.duration_since(*at) < AUDIT_MINE_EVERY);
+            last.insert(device.to_owned(), now);
+        }
+        let _reading = match self.mine_reading.try_lock() {
+            Ok(guard) => guard,
+            Err(std::sync::TryLockError::Poisoned(poisoned)) => poisoned.into_inner(),
+            Err(std::sync::TryLockError::WouldBlock) => return None,
+        };
+        let limit = limit.min(AUDIT_MINE_MAX) as usize;
+        let mut records: Vec<serde_json::Value> = Vec::new();
+        if let (Some(dir), true) = (&self.dir, limit > 0) {
+            let filter = Filter {
+                device_id: Some(device.to_owned()),
+                ..Filter::default()
+            };
+            let found = eitri_core::remote_audit::read(dir, &filter, Some(limit)).unwrap_or_default();
+            let mut bytes = 0;
+            for record in found {
+                bytes += record.line.len() + 1;
+                if bytes > AUDIT_MINE_BYTES {
+                    break;
+                }
+                if let Ok(value) = serde_json::from_str(&record.line) {
+                    records.push(value);
+                }
+            }
+        }
+        Some(serde_json::json!({ "v": REMOTE_PROTOCOL, "kind": "audit_mine", "records": records }).to_string())
+    }
+}
+
+impl OpenConn {
+    fn close(self, why: &str) -> AuditEvent {
+        AuditEvent::ConnClose {
+            device: self.device,
+            why: why.to_owned(),
+            secs: self.at.elapsed().as_secs(),
+            bytes_in: self.kill.bytes_in.load(Ordering::Relaxed),
+            bytes_out: self.kill.bytes_out.load(Ordering::Relaxed),
+        }
+    }
+}
+
+/// The host of a push endpoint, lowercase, without user information, port or path: what the audit log keeps of it.
+/// `None` for what has no host.
+pub fn endpoint_host(url: &str) -> Option<String> {
+    let (scheme, rest) = url.split_once("://")?;
+    if scheme.is_empty() || !scheme.bytes().all(|b| b.is_ascii_alphanumeric() || b"+-.".contains(&b)) {
+        return None;
+    }
+    let authority = rest.split(['/', '?', '#']).next()?;
+    let host_port = authority.rsplit_once('@').map_or(authority, |(_, after)| after);
+    let host = match host_port.strip_prefix('[') {
+        Some(v6) => format!("[{}]", v6.split_once(']')?.0),
+        None => host_port.split(':').next()?.to_owned(),
+    };
+    (!host.is_empty() && host != "[]").then(|| host.to_ascii_lowercase())
+}
+
+/// Where a connection came from, as `serve` saw it before its 101.
+#[derive(Debug, Clone)]
+pub struct Arrival {
+    /// The `Host` its request named.
+    pub host: String,
+    /// Its `Origin`, when it sent one.
+    pub origin: Option<String>,
+    /// The peer address and port, or `unix`.
+    pub peer: String,
+    pub listener: Listener,
+}
 
 /// A device id as the store names it.
 pub type DeviceId = String;
@@ -156,9 +480,39 @@ struct Kill {
     upstreams: Mutex<BTreeMap<u64, UnixStream>>,
     out: Arc<Outbound>,
     events: Sender<Event>,
+    /// Why it was closed from outside, when it was.
+    why: Mutex<Option<&'static str>>,
+    /// The bytes read from and written to the phone after the 101.
+    bytes_in: AtomicU64,
+    bytes_out: AtomicU64,
 }
 
 impl Kill {
+    fn new(phone: Box<dyn Conn>, out: Arc<Outbound>, events: Sender<Event>) -> Kill {
+        Kill {
+            dead: AtomicBool::new(false),
+            phone,
+            upstreams: Mutex::new(BTreeMap::new()),
+            out,
+            events,
+            why: Mutex::new(None),
+            bytes_in: AtomicU64::new(0),
+            bytes_out: AtomicU64::new(0),
+        }
+    }
+
+    /// Closes it, saying why, unless it was closed already.
+    fn kill_because(&self, why: &'static str) {
+        if !self.dead() {
+            lock(&self.why).get_or_insert(why);
+        }
+        self.kill();
+    }
+
+    fn why(&self) -> Option<&'static str> {
+        *lock(&self.why)
+    }
+
     fn kill(&self) {
         if self.dead.swap(true, Ordering::SeqCst) {
             return;
@@ -199,21 +553,38 @@ pub struct Hub {
     limits: Limits,
     reporter: Reporter,
     reader: Mutex<Option<Reader>>,
+    audit: Arc<Audit>,
 }
 
 impl Hub {
-    /// Starts reading the rows of every window in `control_dir`, watching the device store at `store_path` and the
-    /// reporting thread. Starts threads: call it after the sandbox.
+    /// [`Hub::start_audited`] with no audit log.
     pub fn start(control_dir: &Path, store_path: &Path, limits: Limits) -> io::Result<Arc<Hub>> {
+        Hub::start_audited(control_dir, store_path, limits, Audit::off())
+    }
+
+    /// Starts reading the rows of every window in `control_dir`, watching the device store at `store_path` and the
+    /// reporting thread, recording through `audit`; the devices its retained `revoke` records name count as revoked.
+    /// Starts threads: call it after the sandbox.
+    pub fn start_audited(
+        control_dir: &Path,
+        store_path: &Path,
+        limits: Limits,
+        audit: Arc<Audit>,
+    ) -> io::Result<Arc<Hub>> {
+        let store = Arc::new(StoreView::new(store_path));
+        store.remember_revoked(audit.revoked_in_log());
+        // The first reading: a device that leaves the store from now on is seen leaving.
+        store.refresh();
         let hub = Arc::new(Hub {
             control: control_dir.to_owned(),
-            store: Arc::new(StoreView::new(store_path)),
+            store,
             rows: Mutex::new(RowsIndex::default()),
             links: Mutex::new(BTreeMap::new()),
             next_id: AtomicU64::new(1),
             limits,
             reporter: Reporter::start(control_dir)?,
             reader: Mutex::new(None),
+            audit,
         });
         let weak = Arc::downgrade(&hub);
         let reader = Reader::start(control_dir, SCHEMA_V, move |event| match event {
@@ -250,19 +621,32 @@ impl Hub {
         }
     }
 
+    /// `serve`'s audit log.
+    pub fn audit(&self) -> &Arc<Audit> {
+        &self.audit
+    }
+
     /// Closes the connection of every device the store no longer holds with its token, or whose grant fell.
     pub fn recheck_devices(&self) {
-        let doomed: Vec<Arc<Kill>> = lock(&self.links)
+        // Read even with no connection open, so a device that leaves the store is seen leaving.
+        self.store.refresh();
+        let doomed: Vec<(Arc<Kill>, &'static str)> = lock(&self.links)
             .values()
-            .filter(|link| {
-                link.device
-                    .as_ref()
-                    .is_some_and(|(device, token, grant)| !self.store.still(device, token.expose(), *grant))
+            .filter_map(|link| {
+                let (device, token, grant) = link.device.as_ref()?;
+                if self.store.still(device, token.expose(), *grant) {
+                    return None;
+                }
+                let why = if self.store.verify(device, token.expose()).is_none() {
+                    "revoked"
+                } else {
+                    "grant_lowered"
+                };
+                Some((link.kill.clone(), why))
             })
-            .map(|link| link.kill.clone())
             .collect();
-        for kill in doomed {
-            kill.kill();
+        for (kill, why) in doomed {
+            kill.kill_because(why);
         }
     }
 
@@ -285,8 +669,19 @@ impl Hub {
     }
 
     /// Serves one upgraded connection until it ends. `host` is the `Host` its request named, `peer` where it came
-    /// from.
+    /// from; it came in on the Unix socket and sent no `Origin`.
     pub fn serve_phone(self: &Arc<Hub>, stream: Box<dyn Conn>, host: String, peer: String) {
+        let arrival = Arrival {
+            host,
+            origin: None,
+            peer,
+            listener: Listener::Socket,
+        };
+        self.serve_phone_from(stream, arrival);
+    }
+
+    /// Serves one upgraded connection that came as `arrival` says until it ends.
+    pub fn serve_phone_from(self: &Arc<Hub>, stream: Box<dyn Conn>, arrival: Arrival) {
         let Ok(phone) = stream.try_clone_conn() else { return };
         let Ok(writer_stream) = stream.try_clone_conn() else {
             return;
@@ -299,13 +694,7 @@ impl Hub {
                 let _ = lock(&told).send(Event::Overflowed);
             }
         });
-        let kill = Arc::new(Kill {
-            dead: AtomicBool::new(false),
-            phone,
-            upstreams: Mutex::new(BTreeMap::new()),
-            out: out.clone(),
-            events: tx.clone(),
-        });
+        let kill = Arc::new(Kill::new(phone, out.clone(), tx.clone()));
         lock(&self.links).insert(
             id,
             Link {
@@ -354,8 +743,12 @@ impl Hub {
             credits,
             device,
             session: PhoneSession::default(),
-            host,
-            peer,
+            host: arrival.host,
+            peer: arrival.peer,
+            origin: arrival.origin,
+            listener: arrival.listener,
+            opened: None,
+            why: "ended",
             subs: BTreeMap::new(),
             upstreams: BTreeMap::new(),
             rows_wanted: false,
@@ -366,6 +759,7 @@ impl Hub {
         control.run(&rx);
         control.stop_feed();
         kill.kill();
+        self.audit.closed(id, kill.why().unwrap_or(control.why));
         let connected = lock(&self.links).remove(&id).and_then(|link| link.connected);
         if connected.is_some() {
             self.report();
@@ -442,6 +836,7 @@ fn read_phone(
                 return;
             }
         };
+        kill.bytes_in.fetch_add(got as u64, Ordering::Relaxed);
         decoder.feed(&buf[..got], &mut inbound);
         for frame in inbound.drain(..) {
             match frame {
@@ -505,12 +900,17 @@ fn write_phone(
             Next::Write { bytes, last, .. } => {
                 if let Some((id, token, grant)) = device.get() {
                     if !store.still(id, token.expose(), *grant) {
-                        kill.kill();
+                        kill.kill_because("revoked");
                         return;
                     }
                 }
                 let written = write_through(&mut stream, &bytes, stall, &|| out.stalled(), &|| kill.dead());
-                if written.is_err() || last {
+                if written.is_err() {
+                    kill.kill_because("write_failed");
+                    return;
+                }
+                kill.bytes_out.fetch_add(bytes.len() as u64, Ordering::Relaxed);
+                if last {
                     kill.kill();
                     return;
                 }
@@ -670,6 +1070,12 @@ struct Control {
     session: PhoneSession,
     host: String,
     peer: String,
+    origin: Option<String>,
+    listener: Listener,
+    /// The device, once its `hello` was accepted: what this connection's records name.
+    opened: Option<DeviceRef>,
+    /// Why the session ended, as `conn_close` says it, when nothing outside closed it.
+    why: &'static str,
     subs: BTreeMap<String, Sub>,
     upstreams: BTreeMap<u64, Upstream>,
     rows_wanted: bool,
@@ -695,6 +1101,17 @@ const POLICY: u16 = 1008;
 const PROTOCOL_ERROR: u16 = 1002;
 const NORMAL: u16 = 1000;
 
+/// How a session that ends on `event` says why in its `conn_close`; a close from outside says its own.
+fn ending_word(event: &Event) -> &'static str {
+    match event {
+        Event::Phone(_) => "protocol",
+        Event::Bad => "bad_frame",
+        Event::Closing(_) => "closed",
+        Event::Killed => "killed",
+        _ => "ended",
+    }
+}
+
 impl Control {
     fn run(&mut self, rx: &Receiver<Event>) {
         match self.hello(rx) {
@@ -711,7 +1128,9 @@ impl Control {
                 }
                 Err(RecvTimeoutError::Disconnected) => return,
             };
+            let word = ending_word(&event);
             if let Err(end) = self.take(event) {
+                self.why = word;
                 return self.end(end, rx);
             }
             if self.kill.dead() {
@@ -772,6 +1191,17 @@ impl Control {
             return Ok(());
         };
         let Some(grant) = self.hub.store.verify(&device, token.expose()) else {
+            let (reason, name) = match self.hub.store.revoked(&device) {
+                Some(name) => (Reason::RevokedToken, name),
+                None => (Reason::BadToken, self.hub.store.name_of(&device).unwrap_or_default()),
+            };
+            // Refused before any device is proved, so as bounded as a refusal before `hello`.
+            self.hub.audit.record_early_refusal(
+                reason,
+                Some(DeviceRef { id: device, name }),
+                &self.listener,
+                &self.peer,
+            );
             return Err(End::Quiet);
         };
         let _ = self.device.set((device.clone(), token.clone(), grant));
@@ -792,8 +1222,39 @@ impl Control {
         if !self.hub.store.still(&device, token.expose(), grant) {
             return Err(End::Quiet);
         }
+        let named = DeviceRef {
+            name: self.hub.store.name_of(&device).unwrap_or_default(),
+            id: device,
+        };
+        self.hub.audit.record(AuditEvent::ConnOpen {
+            device: named.clone(),
+            listener: self.listener.clone(),
+            peer: self.peer.clone(),
+            host: self.host.clone(),
+            origin: self.origin.clone(),
+        });
+        self.hub.audit.opened(self.id, named.clone(), &self.kill);
+        self.opened = Some(named);
         self.hub.report();
         Ok(())
+    }
+
+    /// Records a refusal of something this connection sent, where it came in.
+    fn record_refusal(&self, reason: Reason, device: Option<DeviceRef>, key: Option<String>, kind: Option<String>) {
+        self.hub.audit.record(AuditEvent::Refused {
+            reason,
+            device,
+            listener: Some(self.listener.clone()),
+            peer: Some(self.peer.clone()),
+            key,
+            kind,
+            dropped: None,
+        });
+    }
+
+    /// The device this connection's `hello` proved, as the log names it.
+    fn named(&self) -> Option<DeviceRef> {
+        self.opened.clone()
     }
 
     fn verified(&self) -> Option<(&str, &Secret, Grant)> {
@@ -922,7 +1383,10 @@ impl Control {
                     .and_then(serde_json::Value::as_str)
                     .map(str::to_owned);
                 let sent = match (grant, routed) {
-                    (Grant::Watch, _) => Err("watch only"),
+                    (Grant::Watch, routed) => {
+                        self.refuse_watch_act(&device, &key, &cmd, &routed);
+                        Err("watch only")
+                    }
                     (Grant::WatchSteer, Route::Owner { instance }) => self.send_to(
                         &instance,
                         &RvInbound::Act {
@@ -960,18 +1424,56 @@ impl Control {
                 }
             }
             PhoneInbound::SetPushEndpoint { url } => {
+                // Only an endpoint the window keeps is recorded as set: it refuses one that fails this same check.
+                let host = eitri_core::remote_devices::push_endpoint_ok(url.expose())
+                    .ok()
+                    .and_then(|()| endpoint_host(url.expose()));
                 let line = RvInbound::SetPushEndpoint {
                     v: RV_PROTOCOL,
                     device,
                     token,
                     url,
                 };
-                if let Err(why) = self.send_to_any(&line) {
-                    self.local(refused_line(None, why));
+                match self.send_to_any(&line) {
+                    Err(why) => self.local(refused_line(None, why)),
+                    // The window checks the endpoint again and keeps it; only its host is ever recorded.
+                    Ok(()) => {
+                        if let (Some(device), Some(host)) = (self.named(), host) {
+                            self.hub.audit.record(AuditEvent::PushEndpointSet {
+                                device,
+                                host: Some(host),
+                            });
+                        }
+                    }
                 }
             }
+            PhoneInbound::AuditMine { limit } => match self.hub.audit.mine(&device, limit) {
+                Some(line) => self.local(line),
+                None => self.local(refused_line(None, "audit_mine: too often; ask again in a second")),
+            },
         }
         Ok(())
+    }
+
+    /// An `act` from a `watch` device, refused here: recorded with the command's kind (never its text), and the
+    /// window that owns the tab is told, so the desk sees the attempt as it sees its own refusals.
+    fn refuse_watch_act(&mut self, device: &str, key: &str, cmd: &serde_json::Value, routed: &Route) {
+        let kind = cmd.get("type").and_then(serde_json::Value::as_str).map(str::to_owned);
+        let named = self.named().unwrap_or_else(|| DeviceRef {
+            id: device.to_owned(),
+            name: String::new(),
+        });
+        self.record_refusal(Reason::Grant, Some(named.clone()), Some(key.to_owned()), kind);
+        if let Route::Owner { instance } = routed {
+            let notice = RvInbound::RefusedNotice {
+                v: RV_PROTOCOL,
+                device: named.name,
+                device_id: named.id,
+                key: key.to_owned(),
+                reason: Reason::Grant.as_str().to_owned(),
+            };
+            let _ = self.send_to(instance, &notice);
+        }
     }
 
     /// A frame from a phone with no token: only `enroll` (and `ping`).
@@ -1443,6 +1945,74 @@ impl Control {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use eitri_core::remote_audit::{JournalTarget, WriterKind};
+
+    fn audit_in(label: &str) -> (Arc<Audit>, PathBuf) {
+        let dir = agent::state_dirs::test_workspace_dir(label).join("audit");
+        let log = AuditLog::open(&dir, WriterKind::Serve, None, JournalTarget::Off).unwrap();
+        (Audit::new(log, &dir), dir)
+    }
+
+    #[test]
+    fn refusals_before_a_device_is_proved_are_bounded_and_counted() {
+        let (audit, dir) = audit_in("audit-early-bound");
+        let all = || eitri_core::remote_audit::read(&dir, &Filter::default(), None).unwrap();
+        let start = Instant::now();
+        let refuse = |reason, at| audit.record_early_refusal_at(reason, None, &Listener::Socket, "unix", at);
+        for _ in 0..EARLY_REFUSALS_BURST + 10 {
+            refuse(Reason::Host, start);
+        }
+        assert_eq!(
+            all().len(),
+            EARLY_REFUSALS_BURST as usize,
+            "a burst is recorded, then counted"
+        );
+        // One more after the pause, with the count of those that were not recorded.
+        refuse(Reason::Origin, start + EARLY_REFUSAL_EVERY);
+        let records = all();
+        assert_eq!(records.len(), EARLY_REFUSALS_BURST as usize + 1);
+        assert_eq!(records[0].fields["reason"], "origin");
+        assert_eq!(records[0].fields["dropped"], 10);
+        assert!(records[1].fields.get("dropped").is_none(), "{}", records[1].line);
+        // Those still only counted when `serve` ends are recorded before its `disable`.
+        for _ in 0..3 {
+            refuse(Reason::PathPrefix, start + EARLY_REFUSAL_EVERY);
+        }
+        audit.disable_once("idle");
+        let records = all();
+        assert_eq!(records[0].event, "disable");
+        assert_eq!(records[1].fields["reason"], "path_prefix");
+        assert_eq!(records[1].fields["dropped"], 3);
+        assert!(records[1].fields.get("peer").is_none(), "{}", records[1].line);
+        // A long pause fills the bucket again, and no further.
+        let later = start + EARLY_REFUSAL_EVERY * 1000;
+        let before = all().len();
+        for _ in 0..EARLY_REFUSALS_BURST + 1 {
+            refuse(Reason::Host, later);
+        }
+        assert_eq!(all().len() - before, EARLY_REFUSALS_BURST as usize);
+    }
+
+    #[test]
+    fn audit_mine_finds_this_devices_records_behind_another_device_named_like_it() {
+        let (audit, _dir) = audit_in("audit-mine-named-like");
+        let named = |id: &str, name: &str| DeviceRef {
+            id: id.into(),
+            name: name.into(),
+        };
+        audit.record(AuditEvent::DeviceFlagged {
+            device: named("d1", "phone"),
+        });
+        for _ in 0..56 {
+            audit.record(AuditEvent::DeviceFlagged {
+                device: named("d5", "d1"),
+            });
+        }
+        let answer: serde_json::Value = serde_json::from_str(&audit.mine("d1", 20).unwrap()).unwrap();
+        let records = answer["records"].as_array().unwrap();
+        assert_eq!(records.len(), 1, "{answer}");
+        assert_eq!(records[0]["device"], "d1");
+    }
 
     #[test]
     fn chunks_come_together_only_in_order() {
@@ -1456,13 +2026,7 @@ mod tests {
     }
 
     fn kill_for(phone: &dyn Conn, out: &Arc<Outbound>, events: &Sender<Event>) -> Arc<Kill> {
-        Arc::new(Kill {
-            dead: AtomicBool::new(false),
-            phone: phone.try_clone_conn().unwrap(),
-            upstreams: Mutex::new(BTreeMap::new()),
-            out: out.clone(),
-            events: events.clone(),
-        })
+        Arc::new(Kill::new(phone.try_clone_conn().unwrap(), out.clone(), events.clone()))
     }
 
     #[test]
@@ -1507,6 +2071,24 @@ mod tests {
             matches!(rx.try_recv(), Ok(Event::Closing(1000))),
             "the reader stopped and told the session nothing: no deadline would end it"
         );
+    }
+
+    #[test]
+    fn an_endpoint_is_recorded_by_its_host_alone() {
+        for (url, host) in [
+            (
+                concat!("https://user:secret", "@", "ntfy.example.org:8443/up/abc?x=1"),
+                Some("ntfy.example.org"),
+            ),
+            ("https://[2001:db8::1]:443/t", Some("[2001:db8::1]")),
+            ("http://push.example", Some("push.example")),
+            ("HTTPS://Push.Example/t", Some("push.example")),
+            ("not a url", None),
+            ("https:///path", None),
+            ("https://:8443/path", None),
+        ] {
+            assert_eq!(endpoint_host(url).as_deref(), host, "{url}");
+        }
     }
 
     #[test]

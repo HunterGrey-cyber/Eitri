@@ -33,6 +33,8 @@ pub struct ServeConfig {
     /// `None`: the port kept for this user, which `serve` settles itself.
     pub port: Option<u16>,
     pub origins: Vec<String>,
+    /// `remote.audit.keep_days`.
+    pub audit_keep_days: u32,
 }
 
 impl ServeConfig {
@@ -41,6 +43,7 @@ impl ServeConfig {
             listen: settings.listen.clone(),
             port: settings.port,
             origins: settings.origins.clone(),
+            audit_keep_days: settings.audit_keep_days,
         }
     }
 
@@ -57,6 +60,10 @@ impl ServeConfig {
         }
         for origin in &self.origins {
             args.extend(["--origin".to_owned(), origin.clone()]);
+        }
+        // The default is `serve`'s own, so a window on the default starts the same `serve` a build before the key did.
+        if self.audit_keep_days != crate::remote_audit::AUDIT_KEEP_DAYS_DEFAULT {
+            args.extend(["--audit-keep-days".to_owned(), self.audit_keep_days.to_string()]);
         }
         args
     }
@@ -93,6 +100,12 @@ impl ServeConfig {
                 "origins: running {}, this window {}",
                 list(&running),
                 list(&ours)
+            ));
+        }
+        if self.audit_keep_days != own.audit_keep_days {
+            out.push(format!(
+                "remote.audit.keep_days: running {}, this window {}",
+                self.audit_keep_days, own.audit_keep_days
             ));
         }
         out
@@ -319,6 +332,7 @@ mod tests {
             listen,
             port: None,
             origins: Vec::new(),
+            audit_keep_days: 90,
         }
     }
 
@@ -440,6 +454,7 @@ mod tests {
             listen: RemoteListen::Socket,
             port: Some(7400),
             origins: vec!["desk.tail1.ts.net".to_owned(), "https://phone.example.org".to_owned()],
+            audit_keep_days: 30,
         };
         assert_eq!(
             cfg.args(),
@@ -451,9 +466,38 @@ mod tests {
                 "--origin",
                 "desk.tail1.ts.net",
                 "--origin",
-                "https://phone.example.org"
+                "https://phone.example.org",
+                "--audit-keep-days",
+                "30"
             ]
         );
+    }
+
+    #[test]
+    fn differences_names_keep_days() {
+        let running = ServeConfig {
+            listen: RemoteListen::Loopback,
+            port: Some(41000),
+            origins: Vec::new(),
+            audit_keep_days: 90,
+        };
+        let mut own = running.clone();
+        assert!(running.differences(&own).is_empty());
+        assert!(
+            !own.args().iter().any(|a| a == "--audit-keep-days"),
+            "the default is left to serve: {:?}",
+            own.args()
+        );
+        own.audit_keep_days = 7;
+        assert_eq!(
+            running.differences(&own),
+            ["remote.audit.keep_days: running 90, this window 7"]
+        );
+        let settings = RemoteSettings {
+            audit_keep_days: 7,
+            ..settings(true, RemoteListen::Loopback)
+        };
+        assert_eq!(ServeConfig::from_settings(&settings).audit_keep_days, 7);
     }
 
     #[test]
@@ -462,11 +506,13 @@ mod tests {
             listen: RemoteListen::Loopback,
             port: Some(41000),
             origins: vec!["desk.tail1.ts.net".to_owned(), "b.example".to_owned()],
+            audit_keep_days: 90,
         };
         let mut own = ServeConfig {
             listen: RemoteListen::Loopback,
             port: None,
             origins: vec!["B.example".to_owned(), "desk.tail1.ts.net".to_owned()],
+            audit_keep_days: 90,
         };
         assert!(
             running.differences(&own).is_empty(),
@@ -478,6 +524,7 @@ mod tests {
             listen: RemoteListen::Address("198.51.100.2".parse().unwrap()),
             port: Some(7341),
             origins: Vec::new(),
+            audit_keep_days: 90,
         };
         assert_eq!(
             running.differences(&own),
@@ -495,6 +542,7 @@ mod tests {
             listen,
             port: None,
             origins: origins.iter().map(|o| (*o).to_owned()).collect(),
+            audit_keep_days: 90,
         };
         let r = pairing_routes(&cfg, 41000, Path::new("/run/user/1000/eitri")).unwrap();
         (r.ssh.map(route), r.direct.map(route))

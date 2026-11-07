@@ -2,6 +2,7 @@
 
 #[cfg(target_os = "linux")]
 pub mod agents_feed;
+pub mod audit_cli;
 pub mod cli;
 pub mod notify;
 pub mod serve;
@@ -15,7 +16,8 @@ pub const USAGE: &str = "usage: eitri remote <command>
   devices                     list the enrolled devices
   revoke <device>             take a device out
   grant <device> watch|steer  change what a device may do, after the window's yes
-  ssh-key add <file>          let a phone's SSH key forward to the server";
+  ssh-key add <file>          let a phone's SSH key forward to the server
+  log [--verify]              print the remote audit log, newest first, or check it against the journal";
 
 /// Each command's own usage, for `eitri remote <command> --help`.
 const COMMAND_USAGE: &[(&str, &str)] = &[
@@ -32,6 +34,10 @@ const COMMAND_USAGE: &[(&str, &str)] = &[
     (
         "ssh-key",
         "eitri remote ssh-key add <file> [--name <name>] [--port <port>]",
+    ),
+    (
+        "log",
+        "eitri remote log [--since 24h|7d|<RFC 3339>] [--device <name>] [--event <kind>] [--json] | --verify",
     ),
 ];
 
@@ -82,6 +88,7 @@ pub fn run(args: &[String]) -> i32 {
         Some("revoke") => cli::revoke(rest),
         Some("grant") => cli::grant(rest),
         Some("ssh-key") => cli::ssh_key(rest),
+        Some("log") => audit_cli::log(rest),
         _ => {
             eprintln!("{USAGE}");
             2

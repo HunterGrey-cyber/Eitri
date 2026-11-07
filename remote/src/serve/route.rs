@@ -84,7 +84,7 @@ pub enum Route {
     /// The `rv-` socket of any Eitri process: the errand concerns the device store, which every window shares
     /// (`revoke_self`, `set_push_endpoint`).
     AnyInstance,
-    /// Answered by `serve` itself (`ping`).
+    /// Answered by `serve` itself (`ping`, `audit_mine`).
     Local,
     /// Turned down here, with the reason the phone is told.
     Refused(&'static str),
@@ -120,7 +120,7 @@ pub fn route(frame: &PhoneInbound, rows: &RowsIndex) -> Route {
             }
         }
         PhoneInbound::RevokeSelf | PhoneInbound::SetPushEndpoint { .. } => Route::AnyInstance,
-        PhoneInbound::Ping => Route::Local,
+        PhoneInbound::Ping | PhoneInbound::AuditMine { .. } => Route::Local,
     }
 }
 

@@ -87,6 +87,10 @@ pub enum PhoneInbound {
     SetPushEndpoint {
         url: Secret,
     },
+    /// The newest audit records about this phone itself, at most `limit` (and never more than `serve` allows).
+    AuditMine {
+        limit: u32,
+    },
 }
 
 // Serde's internally tagged unit visitor ignores fields; use an empty struct to reject them.
@@ -256,6 +260,7 @@ mod tests {
             json!({"kind":"enroll", "instance":"a3f09c1d2e4b5f60", "code":"c0de", "device_name":"Pixel", "recipe":"direct"}),
             json!({"kind":"revoke_self"}),
             json!({"kind":"set_push_endpoint", "url":"https://ntfy.example/t"}),
+            json!({"kind":"audit_mine", "limit":20}),
             json!({"kind":"hello", "device":"phone", "layout":"slab", "protocol":1}),
             json!({"kind":"hello", "device":"phone", "token":"secret", "layout":"slab", "protocol":1}),
         ] {
@@ -285,6 +290,9 @@ mod tests {
             json!({"kind":"enroll", "instance":"a3f09c1d2e4b5f60", "code":"c0de", "device_name":"Pixel", "recipe":"tor"}),
             json!({"kind":"ping", "x":1}),
             json!({"kind":"revoke_self", "token":"t"}),
+            json!({"kind":"audit_mine"}),
+            json!({"kind":"audit_mine", "limit":-1}),
+            json!({"kind":"audit_mine", "limit":20, "device":"d1"}),
         ] {
             assert!(serde_json::from_value::<PhoneInbound>(body.clone()).is_err(), "{body}");
         }

@@ -330,8 +330,7 @@ fn sandbox_text(record: &eitri_remote::serve::config::Record) -> Option<String> 
 fn on_serve_end(dirs: Dirs, own: ServeConfig, notes: Notes) -> eitri_remote::serve::spawn::OnServeEnd {
     let notes = std::sync::Mutex::new(notes);
     Arc::new(move |ended| {
-        let differences = || running_config(&dirs).map(|running| running.differences(&own));
-        if let Some(text) = ended_text(&ended, differences) {
+        if let Some(text) = ended_text_at(&dirs, &ended, &own) {
             // The reaper said its own line on stderr already.
             let _ = notes
                 .lock()
@@ -339,6 +338,16 @@ fn on_serve_end(dirs: Dirs, own: ServeConfig, notes: Notes) -> eitri_remote::ser
                 .unbounded_send(format!("Remote control: {text}"));
         }
     })
+}
+
+/// [`ended_text`] for the `serve` whose record is in `dirs`: one of another build is said as such, not as other keys.
+fn ended_text_at(dirs: &Dirs, ended: &ServeEnded, own: &ServeConfig) -> Option<String> {
+    if *ended == ServeEnded::RunningDifferent {
+        if let Some(text) = eitri_remote::serve::other_build(dirs) {
+            return Some(text);
+        }
+    }
+    ended_text(ended, || running_config(dirs).map(|running| running.differences(own)))
 }
 
 /// The desk's line for how a `serve` this window started ended, if it needs one; `differences` reads how the `serve`
@@ -370,6 +379,11 @@ fn mismatch_text(differences: &[String]) -> String {
 /// not this window's own; this window's own while the record is not whole yet.
 fn paired_with_running(dirs: &Dirs, own: &ServeConfig, notes: &Notes) -> ServeConfig {
     let Some(running) = running_config(dirs) else {
+        // Another build's `serve` (the package was upgraded under running windows) speaks what this window may not:
+        // the desk is told what to do rather than left with phones that silently fail.
+        if let Some(text) = eitri_remote::serve::other_build(dirs) {
+            say(notes, text);
+        }
         return own.clone();
     };
     let differences = running.differences(own);
@@ -456,7 +470,7 @@ mod tests {
     fn write_record_pid(dirs: &Dirs, sandbox: &str, pid: u32) {
         agent::private_fs::write_private(
             &dirs.control.join(eitri_remote::serve::RECORD_FILE),
-            serde_json::json!({"v":1,"pid":pid,"args":["--listen","loopback","--port","7500"],"sandbox":sandbox, "sandbox_why": (sandbox == "partial").then_some("the kernel has no Landlock")})
+            serde_json::json!({"v":1,"pid":pid,"args":["--listen","loopback","--port","7500"],"sandbox":sandbox, "sandbox_why": (sandbox == "partial").then_some("the kernel has no Landlock"), "build": eitri_remote::serve::config::this_build()})
                 .to_string()
                 .as_bytes(),
         )
@@ -612,6 +626,7 @@ mod tests {
             listen: eitri_core::lua::config::RemoteListen::Loopback,
             port: Some(7500),
             origins: vec!["desk.example".into()],
+            audit_keep_days: 90,
         };
         let started = Started(std::cell::RefCell::new(Vec::new()));
         let (tx, mut rx) = futures_channel::oneshot::channel();
@@ -676,6 +691,7 @@ mod tests {
                 listen: eitri_core::lua::config::RemoteListen::Loopback,
                 port: None,
                 origins: vec![],
+                audit_keep_days: 90,
             };
             let started = Started(std::cell::RefCell::new(Vec::new()));
             let (tx, mut rx) = futures_channel::oneshot::channel();
@@ -783,15 +799,16 @@ mod tests {
         eitri_core::panel_control::ensure_dir(&dirs.control).unwrap();
         let record = dirs.control.join(eitri_remote::serve::RECORD_FILE);
         let mut file = agent::private_fs::open_private(&record).unwrap();
-        std::io::Write::write_all(
-            &mut file,
-            br#"{"v":1,"pid":1,"args":["--listen","loopback","--port","7500"],"sandbox":"full"}"#,
-        )
-        .unwrap();
+        let body = serde_json::json!({
+            "v": 1, "pid": 1, "args": ["--listen", "loopback", "--port", "7500"], "sandbox": "full",
+            "build": eitri_remote::serve::config::this_build(),
+        });
+        std::io::Write::write_all(&mut file, body.to_string().as_bytes()).unwrap();
         let own = |listen| ServeConfig {
             listen,
             port: None,
             origins: Vec::new(),
+            audit_keep_days: 90,
         };
         let (notes, mut noted) = futures_channel::mpsc::unbounded::<String>();
         let paired = paired_with_running(&dirs, &own(eitri_core::lua::config::RemoteListen::Loopback), &notes);
@@ -863,6 +880,39 @@ mod tests {
         let silent = window_answering(&socket, Vec::new());
         assert!(!ask_desk_at(&socket, "198.51.100.2", Duration::from_millis(200)).unwrap());
         silent.join().unwrap();
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_serve_from_another_build_says_to_restart_the_windows() {
+        let dir = scratch("skew");
+        let dirs = dirs_at(&dir);
+        // A `serve` from before the upgrade: its record names no build.
+        agent::private_fs::write_private(
+            &dirs.control.join(eitri_remote::serve::RECORD_FILE),
+            br#"{"v":1,"pid":41,"args":["--listen","loopback","--port","7500"],"sandbox":"full"}"#,
+        )
+        .unwrap();
+        let own = ServeConfig {
+            listen: eitri_core::lua::config::RemoteListen::Loopback,
+            port: None,
+            origins: Vec::new(),
+            audit_keep_days: 90,
+        };
+        let (notes, mut noted) = futures_channel::mpsc::unbounded::<String>();
+        let paired = paired_with_running(&dirs, &own, &notes);
+        assert_eq!(paired, own, "nothing of another build's record is taken");
+        let text = noted.try_recv().expect("the desk is told");
+        assert!(text.starts_with("Remote control: "), "{text}");
+        assert!(
+            text.contains("pid 41")
+                && text.contains("Eitri was upgraded")
+                && text.contains("restart the Eitri windows"),
+            "{text}"
+        );
+        let ended = ended_text_at(&dirs, &ServeEnded::RunningDifferent, &own).unwrap();
+        assert!(ended.contains("Eitri was upgraded"), "{ended}");
+        assert!(!ended.contains("other keys"), "{ended}");
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

@@ -2844,7 +2844,8 @@ export default function App() {
           break;
         }
         case "notice": {
-          showFlash(payload.text);
+          // A notice can carry a name a phone claimed or an agent's words: its hidden characters are shown.
+          showFlash(revealedText(payload.text));
           break;
         }
         case "view_export": {

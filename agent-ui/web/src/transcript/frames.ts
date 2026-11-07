@@ -71,9 +71,12 @@ function applyPage(m: TranscriptModel, f: ObjectValue): TranscriptModel {
   const overlaps = f.from_turn <= lastTurn && f.through_turn >= m.firstTurn && f.through_turn <= lastTurn;
   if (!prepend && !overlaps) return m;
 
-  const incoming = applySnapshot(initialState(), f.frame.state, m.throughRevision);
   const lo = f.from_turn < m.firstTurn ? 0 : boundaries[f.from_turn - m.firstTurn] ?? 0;
   const hi = boundaries[f.through_turn - m.firstTurn + 1] ?? Infinity;
+  // A page through the last turn held replaces what later events still add to: it must be read where this view
+  // stands, or those events would apply a second time. Dropped, it can be asked for again.
+  if (hi === Infinity && f.frame.throughRevision !== m.throughRevision) return { ...m, owedPage: false };
+  const incoming = applySnapshot(initialState(), f.frame.state, m.throughRevision);
   const state = { ...m.state };
   const replaced = new Set<string>();
   for (const name of collections) {

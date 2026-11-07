@@ -10,7 +10,13 @@
 //! connection whose device is gone or whose grant fell, before it reads anything else from them. The writer of each
 //! connection asks the view again before every frame, so a frame is not written to a phone the store no longer holds
 //! even in the moment before the watch's callback runs.
+//!
+//! **Revoked or bad.** A revocation takes the device out of the store, so the store cannot say whether a token it
+//! does not know was ever good. The view keeps every device it saw leave the store while `serve` runs (between two
+//! readings that both parsed: a store that could not be read revokes nobody), and `serve` adds, at its start, the
+//! devices that the retained audit log's `revoke` records name. A `hello` from one of those is `revoked_token`.
 
+use std::collections::BTreeMap;
 use std::ffi::CString;
 use std::io;
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
@@ -51,10 +57,22 @@ struct Cached {
     store: Arc<DeviceStore>,
 }
 
+/// The most devices remembered as revoked; past it the oldest-named are kept and new ones dropped, since each is only
+/// a word in a refusal's record.
+const REVOKED_MAX: usize = 4096;
+
 /// The store at one path, read again when it changes.
 pub struct StoreView {
     path: PathBuf,
     cached: Mutex<Option<Cached>>,
+    /// The devices of the last reading that parsed, by id, with their names.
+    last_parsed: Mutex<Option<BTreeMap<String, String>>>,
+    /// Devices seen leaving the store, or named by the log's `revoke` records, with their names.
+    revoked: Mutex<BTreeMap<String, String>>,
+}
+
+fn lock<T>(mutex: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
+    mutex.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
 }
 
 impl StoreView {
@@ -62,7 +80,49 @@ impl StoreView {
         StoreView {
             path: path.to_owned(),
             cached: Mutex::new(None),
+            last_parsed: Mutex::new(None),
+            revoked: Mutex::new(BTreeMap::new()),
         }
+    }
+
+    /// Reads the store again if it changed, noting the devices that left it.
+    pub fn refresh(&self) {
+        let _ = self.current();
+    }
+
+    /// The name of `device` when it left the store while this view watched it, or the log said it was revoked.
+    pub fn revoked(&self, device: &str) -> Option<String> {
+        self.refresh();
+        lock(&self.revoked).get(device).cloned()
+    }
+
+    /// Adds devices known to have been revoked before this view watched the store (the log's `revoke` records).
+    pub fn remember_revoked(&self, devices: impl IntoIterator<Item = (String, String)>) {
+        let mut revoked = lock(&self.revoked);
+        for (id, name) in devices {
+            if revoked.len() >= REVOKED_MAX && !revoked.contains_key(&id) {
+                continue;
+            }
+            revoked.insert(id, name);
+        }
+    }
+
+    /// The store's name for `device` now.
+    pub fn name_of(&self, device: &str) -> Option<String> {
+        self.current().get(device).map(|d| d.name.clone())
+    }
+
+    /// Notes which devices of the last parsed reading `now` no longer holds.
+    fn compare(&self, now: &DeviceStore) {
+        let ids: BTreeMap<String, String> = now.devices().iter().map(|d| (d.id.clone(), d.name.clone())).collect();
+        let mut last = lock(&self.last_parsed);
+        if let Some(before) = last.as_ref() {
+            let gone = before.iter().filter(|(id, _)| !ids.contains_key(*id));
+            self.remember_revoked(gone.map(|(id, name)| (id.clone(), name.clone())));
+        }
+        // A device back in the store under the same id is not revoked any more.
+        lock(&self.revoked).retain(|id, _| !ids.contains_key(id));
+        *last = Some(ids);
     }
 
     pub fn path(&self) -> &Path {
@@ -79,10 +139,16 @@ impl StoreView {
         }
         let store = match now {
             None => DeviceStore::default(),
-            Some(_) => DeviceStore::load(&self.path).unwrap_or_else(|e| {
-                eprintln!("[remote] the device store holds no device: {e}");
-                DeviceStore::default()
-            }),
+            Some(_) => match DeviceStore::load(&self.path) {
+                Ok(store) => {
+                    self.compare(&store);
+                    store
+                }
+                Err(e) => {
+                    eprintln!("[remote] the device store holds no device: {e}");
+                    DeviceStore::default()
+                }
+            },
         };
         let store = Arc::new(store);
         *cached = Some(Cached {
@@ -255,6 +321,31 @@ mod tests {
             assert!(std::time::Instant::now() < deadline, "the removal was never seen");
         }
         drop(rx);
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn the_view_remembers_devices_that_left_the_store() {
+        let dir = scratch("store-left");
+        let path = dir.join("devices.json");
+        let view = StoreView::new(&path);
+        write_store(&path, "watch+steer");
+        assert!(view.verify("d1", "tok").is_some());
+        assert_eq!(view.name_of("d1").as_deref(), Some("phone"));
+        assert_eq!(view.revoked("d1"), None);
+        std::fs::write(&path, b"not json").unwrap();
+        view.refresh();
+        assert_eq!(view.revoked("d1"), None, "a store that cannot be read revokes nobody");
+        write_store(&path, "watch+steer");
+        view.refresh();
+        assert_eq!(view.revoked("d1"), None);
+        update(&path, |store| store.remove("d1")).unwrap();
+        view.refresh();
+        assert_eq!(view.revoked("d1").as_deref(), Some("phone"), "it left the store");
+        assert_eq!(view.name_of("d1"), None);
+        view.remember_revoked([("d7".to_owned(), "old phone".to_owned())]);
+        assert_eq!(view.revoked("d7").as_deref(), Some("old phone"));
+        assert_eq!(view.revoked("d8"), None);
         std::fs::remove_dir_all(&dir).unwrap();
     }
 }

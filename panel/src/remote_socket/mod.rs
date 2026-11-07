@@ -19,8 +19,12 @@
 //! What closes a connection, and the caps on its answers, are `conn`'s.
 //!
 //! Each kind of line has its handler file: `feed` (`subscribe`, `unsubscribe`, `more` and the frames), `acts`
-//! (`act`) and `devices` (`serve`'s errands); `ping` is answered here. A kind this build parses and does not carry out
-//! is answered `refused` with `not yet`.
+//! (`act`) and `devices` (`serve`'s errands); `ping` is answered here, and so is `refused_notice`: `serve` refused a
+//! device's command itself (an `act` from a `watch` device), and the targeted tab gets the same bounded notice as for
+//! the window's own refusals (`remote_entry::refusal_notice`, one counter per tab and device id, whichever refused).
+//! The line carries no token, so any process of this user could send it: the device must be in the store, the name
+//! shown is the store's, the reason one of the audit log's words, and the text a fixed phrase for it; nothing is
+//! answered. A kind this build parses and does not carry out is answered `refused` with `not yet`.
 
 use super::*;
 use crate::panel_wake::PanelWake;
@@ -92,6 +96,13 @@ enum Inbound {
     Devices {
         conn: u64,
         line: DevicesInbound,
+    },
+    /// `serve` refused `device_id` (the store's `device`) something about the tab `key`.
+    RefusedNotice {
+        key: String,
+        device_id: String,
+        device: String,
+        reason: eitri_core::remote_audit::Reason,
     },
 }
 
@@ -274,6 +285,19 @@ impl RemoteSocket {
             Inbound::Feed { conn, line } => self.take_feed(handle, conn, line),
             Inbound::Act { conn, act } => self.take_act(handle, conn, act),
             Inbound::Devices { conn, line } => self.take_devices(handle, conn, line),
+            Inbound::RefusedNotice {
+                key,
+                device_id,
+                device,
+                reason,
+            } => {
+                let Some(key) = RowKey::parse(&key) else { return };
+                let mut state = handle.state.borrow_mut();
+                let Some(tab) = state.tabs.tab_by_key(&key) else { return };
+                super::remote_entry::refusal_notice(&mut state, tab, &device_id, &device, notice_words(reason));
+                drop(state);
+                (self.shared.wake)();
+            }
         }
     }
 
@@ -315,6 +339,14 @@ impl Drop for RemoteSocket {
     }
 }
 
+/// The notice's words for a refusal `serve` made: fixed, so nothing a peer sends is shown.
+fn notice_words(reason: eitri_core::remote_audit::Reason) -> &'static str {
+    match reason {
+        eitri_core::remote_audit::Reason::Grant => "the device may only watch",
+        other => other.as_str(),
+    }
+}
+
 /// Parses one line and hands it to the tick, raising the wake; its handler file reads it first, on this thread, so a
 /// credential it carries is checked or dropped here and goes no further. `false` for a line that closes the
 /// connection.
@@ -331,6 +363,27 @@ fn hand_on(line: &[u8], conn: u64, shared: &Shared) -> bool {
             FeedInbound::read(line).map(|line| Inbound::Feed { conn, line })
         }
         RvInbound::Act { .. } => ActInbound::read(line, shared).map(|act| Inbound::Act { conn, act }),
+        RvInbound::RefusedNotice {
+            device_id, key, reason, ..
+        } => {
+            let Some(reason) = eitri_core::remote_audit::Reason::parse(&reason) else {
+                return true;
+            };
+            // The store's name, read here off the tick; a device it does not hold leaves no notice.
+            let device = match DeviceStore::load(&shared.store) {
+                Ok(store) => store.get(&device_id).map(|d| d.name.clone()),
+                Err(_) => None,
+            };
+            let Some(device) = device else {
+                return true;
+            };
+            Some(Inbound::RefusedNotice {
+                key,
+                device_id,
+                device,
+                reason,
+            })
+        }
         RvInbound::Enroll { .. }
         | RvInbound::StartEnroll { .. }
         | RvInbound::GrantRequest { .. }

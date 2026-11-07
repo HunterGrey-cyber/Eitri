@@ -29,15 +29,23 @@ pub const SESSION_IDLE: Duration = Duration::from_secs(120);
 pub enum Answer {
     /// No blank line yet, and under the cap.
     NeedMore,
-    /// The 101: write it, and the connection speaks WebSocket from then on. `host` is the request's `Host`.
-    Upgrade { answer: Vec<u8>, host: String },
+    /// The 101: write it, and the connection speaks WebSocket from then on. `host` is the request's `Host`, `origin`
+    /// its `Origin` when it sent one.
+    Upgrade {
+        answer: Vec<u8>,
+        host: String,
+        origin: Option<String>,
+    },
     /// An HTTP error: write it, then close. `why` is a constant naming the check, so nothing of the request reaches a
     /// log through it.
     Refuse { answer: Vec<u8>, why: &'static str },
 }
 
 const MALFORMED: &str = "not a well-formed request";
-const NOT_FOUND: &str = "not the WebSocket upgrade on the one path served";
+/// A request for another path than [`WS_PATH`] (a proxy serving it under a prefix, a query, any page).
+pub const PATH_REFUSED: &str = "not the one path served";
+/// A request for [`WS_PATH`] that asks no WebSocket upgrade.
+pub const NOT_UPGRADE: &str = "not a WebSocket upgrade";
 
 fn refuse(status: &str, why: &'static str) -> Answer {
     Answer::Refuse {
@@ -68,12 +76,16 @@ pub fn answer(head: &[u8], cfg: &ServeConfig) -> Answer {
     if let Err(why) = check_request(host, origin, cfg) {
         return refuse("403 Forbidden", why);
     }
+    if request.target() != WS_PATH {
+        return refuse("404 Not Found", PATH_REFUSED);
+    }
     match request.websocket_key() {
-        Some(key) if request.target() == WS_PATH => Answer::Upgrade {
+        Some(key) => Answer::Upgrade {
             answer: upgrade_answer_with(key, None),
             host: host.to_owned(),
+            origin: origin.map(str::to_owned),
         },
-        _ => refuse("404 Not Found", NOT_FOUND),
+        None => refuse("404 Not Found", NOT_UPGRADE),
     }
 }
 
@@ -123,37 +135,49 @@ impl Conn for UnixStream {
     }
 }
 
-/// Reads a request from `stream` within [`HEAD_WITHIN`] and answers it. Returns the request's `Host` when it upgraded;
-/// a refusal is written and logged (each reason once in the process's life, so a client knocking cannot fill the
-/// log).
-pub fn handshake(stream: &mut dyn Conn, cfg: &ServeConfig) -> io::Result<Option<String>> {
+/// How a connection's request ended.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Handshake {
+    /// The 101 was written: the request's `Host`, and its `Origin` when it sent one.
+    Upgraded { host: String, origin: Option<String> },
+    /// The request was refused for `why` (one of this module's or `origin`'s constants) and the answer written.
+    Refused(&'static str),
+    /// The client sent no whole request in time, or left.
+    Gone,
+}
+
+/// Reads a request from `stream` within [`HEAD_WITHIN`] and answers it. A refusal is written, said on stderr (each
+/// reason once in the process's life, so a client knocking cannot fill it) and returned, so the caller can record it.
+pub fn handshake(stream: &mut dyn Conn, cfg: &ServeConfig) -> io::Result<Handshake> {
     let started = Instant::now();
     let mut head = Vec::with_capacity(1024);
     let mut buf = [0u8; 1024];
     loop {
         let left = HEAD_WITHIN.saturating_sub(started.elapsed());
         if left.is_zero() {
-            return Ok(None);
+            return Ok(Handshake::Gone);
         }
         stream.set_read_deadline(Some(left))?;
         let got = match stream.read(&mut buf) {
-            Ok(0) => return Ok(None),
+            Ok(0) => return Ok(Handshake::Gone),
             Ok(got) => got,
-            Err(e) if matches!(e.kind(), io::ErrorKind::WouldBlock | io::ErrorKind::TimedOut) => return Ok(None),
+            Err(e) if matches!(e.kind(), io::ErrorKind::WouldBlock | io::ErrorKind::TimedOut) => {
+                return Ok(Handshake::Gone)
+            }
             Err(e) if e.kind() == io::ErrorKind::Interrupted => continue,
             Err(e) => return Err(e),
         };
         head.extend_from_slice(&buf[..got]);
         match answer(&head, cfg) {
             Answer::NeedMore => {}
-            Answer::Upgrade { answer, host } => {
+            Answer::Upgrade { answer, host, origin } => {
                 stream.write_all(&answer)?;
-                return Ok(Some(host));
+                return Ok(Handshake::Upgraded { host, origin });
             }
             Answer::Refuse { answer, why } => {
                 log_refusal(why);
                 let _ = stream.write_all(&answer);
-                return Ok(None);
+                return Ok(Handshake::Refused(why));
             }
         }
     }
@@ -164,7 +188,8 @@ fn log_refusal(why: &'static str) {
     static LOGGED: AtomicU32 = AtomicU32::new(0);
     let reasons = [
         MALFORMED,
-        NOT_FOUND,
+        PATH_REFUSED,
+        NOT_UPGRADE,
         super::origin::HOST_REFUSED,
         super::origin::ORIGIN_REFUSED,
     ];
@@ -187,6 +212,7 @@ mod tests {
             listen: Listen::Loopback,
             port: 41000,
             origins: vec!["desk.tail1.ts.net".to_owned()],
+            audit_keep_days: eitri_core::remote_audit::AUDIT_KEEP_DAYS_DEFAULT,
         }
     }
 
@@ -214,13 +240,24 @@ mod tests {
     fn only_the_ws_path_upgrades() {
         let upgraded = answer(&request(WS_PATH, &[]), &cfg());
         assert_eq!(status(&upgraded), 101);
-        let Answer::Upgrade { answer: bytes, host } = upgraded else {
+        let Answer::Upgrade {
+            answer: bytes,
+            host,
+            origin,
+        } = upgraded
+        else {
             unreachable!()
         };
         assert_eq!(
             host, "127.0.0.1:41000",
             "the session is told the Host it was reached through"
         );
+        assert_eq!(origin, None, "a native client sends no Origin");
+        let Answer::Upgrade { origin, .. } = answer(&request(WS_PATH, &[("Origin", "http://localhost:5173")]), &cfg())
+        else {
+            panic!("a loopback page's Origin upgrades")
+        };
+        assert_eq!(origin.as_deref(), Some("http://localhost:5173"));
         let text = String::from_utf8(bytes).unwrap();
         assert!(text.contains(ACCEPT), "{text}");
         assert!(!text.contains("Sec-WebSocket-Protocol"), "{text}");
@@ -239,12 +276,18 @@ mod tests {
         }
         let plain_get = b"GET /v1/ws HTTP/1.1\r\nHost: 127.0.0.1:41000\r\n\r\n";
         assert_eq!(status(&answer(plain_get, &cfg())), 404, "a GET that asks no upgrade");
+        assert!(
+            matches!(answer(plain_get, &cfg()), Answer::Refuse { why: NOT_UPGRADE, .. }),
+            "the right path without an upgrade is not a path refusal"
+        );
     }
 
     #[test]
     fn path_prefix_is_refused() {
         for target in ["/eitri/v1/ws", "/v1/ws?token=x", "/v1/ws#x", "/./v1/ws", "//v1/ws"] {
-            assert_eq!(status(&answer(&request(target, &[]), &cfg())), 404, "{target}");
+            let refused = answer(&request(target, &[]), &cfg());
+            assert_eq!(status(&refused), 404, "{target}");
+            assert!(matches!(refused, Answer::Refuse { why: PATH_REFUSED, .. }), "{target}");
         }
     }
 

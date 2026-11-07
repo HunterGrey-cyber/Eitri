@@ -29,6 +29,21 @@ pub struct Listeners {
     pub peer_ranges: Option<Vec<(IpAddr, u8)>>,
 }
 
+/// Where `listen` takes connections, as the audit log names it. A named address's link kind is read from
+/// `/sys/class/net` here, so call it before the sandbox, which does not let `serve` read there.
+pub fn audit_listener(listen: &Listen) -> eitri_core::remote_audit::Listener {
+    use eitri_core::remote_audit::Listener;
+    match listen {
+        Listen::Loopback => Listener::Loopback,
+        Listen::Socket => Listener::Socket,
+        Listen::Address { addr, iface } => Listener::Address {
+            addr: addr.to_string(),
+            iface: iface.clone(),
+            kind: eitri_core::remote_pairing::interface_kind(iface).as_str().to_owned(),
+        },
+    }
+}
+
 /// The address the desk confirmed, if any. `confirmed` is what was recorded: an address, or an address and port.
 pub fn confirmed_ip(confirmed: Option<&str>) -> Option<IpAddr> {
     let text = confirmed?;
@@ -337,6 +352,7 @@ mod tests {
             },
             port,
             origins: Vec::new(),
+            audit_keep_days: eitri_core::remote_audit::AUDIT_KEEP_DAYS_DEFAULT,
         };
         let dir = scratch("unconfirmed");
         for confirmed in [None, Some("192.0.2.1"), Some("not an address")] {
@@ -361,6 +377,7 @@ mod tests {
             listen: Listen::Socket,
             port: 41000,
             origins: Vec::new(),
+            audit_keep_days: eitri_core::remote_audit::AUDIT_KEEP_DAYS_DEFAULT,
         };
         let first = bind(&cfg, &dir, None).unwrap();
         let (_, path) = first.unix.as_ref().unwrap();

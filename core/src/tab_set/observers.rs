@@ -510,17 +510,48 @@ fn observer_snapshot(tab: &Tab) -> Option<BuiltSnapshot> {
     unreachable!("the last attempt returns")
 }
 
-/// A page of turns before `before_turn` for an observer, within `limit` bytes (at least one turn, however large): the
-/// work it is of, its first and last turn and its envelope. `None` when the tab holds no session or no such turn.
-fn observer_page(tab: &Tab, before_turn: u64, limit: usize) -> Option<(WorkMark, u64, u64, String)> {
-    let backend = tab.live()?;
+/// What a take reads for an owed page.
+enum PageRead {
+    /// The work it is of, its first and last turn and its envelope.
+    Page(WorkMark, u64, u64, String),
+    /// Its turns may still change by events the observer has not been sent: a later take builds it.
+    Later,
+    /// The tab holds no session or no such turn.
+    None,
+}
+
+/// Whether a page of the turns before `before_turn` waits for a later take. The projection can be folded past what the
+/// tick has sent the observer (`watermark`); while it is, a page whose last turn is the last one the observer was sent
+/// the start of would hold what the events still to come add to it, and the phone would apply those twice. A page of
+/// turns that ended before the watermark goes at once.
+fn page_waits(projection: &agent::AgentSessionProjection, turns: &Turns, before_turn: u64, watermark: u64) -> bool {
+    if projection.last_revision == watermark || before_turn == 0 || before_turn > turns.count() {
+        return false;
+    }
+    let last = (before_turn - 1) as usize;
+    // The turn after the page starts at `next`; that fold is revision `next + 1`.
+    let (_, next) = tail::page_seqs(turns, last, last);
+    next >= watermark
+}
+
+/// A page of turns before `before_turn` for an observer standing at `watermark`, within `limit` bytes (at least one
+/// turn, however large), unless it waits ([`page_waits`]).
+fn observer_page(tab: &Tab, before_turn: u64, limit: usize, watermark: u64) -> PageRead {
+    let Some(backend) = tab.live() else {
+        return PageRead::None;
+    };
     let view = SnapshotView::of(backend, &tab.session.host_answered);
     let mark = WorkMark {
         generation: tab.backend_generation,
         unseen: tab.unseen_stretch_at(view.projection.last_revision),
     };
     let turns = Turns::of(&view.projection);
-    let (from, through) = tail::choose_page(&view.projection, &turns, before_turn, limit)?;
+    if page_waits(&view.projection, &turns, before_turn, watermark) {
+        return PageRead::Later;
+    }
+    let Some((from, through)) = tail::choose_page(&view.projection, &turns, before_turn, limit) else {
+        return PageRead::None;
+    };
     let SnapshotView {
         backend: kind,
         conversation_id,
@@ -547,7 +578,7 @@ fn observer_page(tab: &Tab, before_turn: u64, limit: usize) -> Option<(WorkMark,
     let notes = tail::notes_between(&tab.notes, lo, hi);
     // No clock and no broker cards: a page is past turns, not the session as it stands.
     let json = serialize_snapshot_with_notes_for_js(tab.id, &view, None, &notes, &[]);
-    Some((mark, from as u64, through as u64, json))
+    PageRead::Page(mark, from as u64, through as u64, json)
 }
 
 /// Why a phone may not send to `tab` now, if it may not: only a Claude tab holding a session takes a message, and
@@ -715,8 +746,13 @@ impl TabSet {
                     return false;
                 };
                 let renewed = observer.generation != tab.backend_generation;
-                let live = tab.live().is_some();
-                (live && (observer.needs_snapshot || renewed || observer.owed_page.is_some()))
+                let live = tab.live();
+                // A page that waits for events is taken with them: the tick that sends them lists the observer.
+                let page_now = observer.owed_page.zip(live).is_some_and(|(before_turn, backend)| {
+                    let projection = backend.projection();
+                    !page_waits(&projection, &Turns::of(&projection), before_turn, observer.watermark)
+                });
+                (live.is_some() && (observer.needs_snapshot || renewed || page_now))
                     || (observer.ended_of != Some(tab.backend_generation) && ended_how(tab).is_some())
                     || send_block_of(tab) != observer.send_block
             })
@@ -787,9 +823,11 @@ impl TabSet {
                 } else {
                     max_bytes.saturating_sub(used)
                 };
-                match observer_page(tab, before_turn, limit.min(SNAPSHOT_CEILING_BYTES)) {
-                    Some((_, _, _, json)) if !frames.is_empty() && used.saturating_add(json.len()) > max_bytes => {}
-                    Some((mark, from_turn, through_turn, json)) => {
+                match observer_page(tab, before_turn, limit.min(SNAPSHOT_CEILING_BYTES), observer.watermark) {
+                    PageRead::Page(_, _, _, json)
+                        if !frames.is_empty() && used.saturating_add(json.len()) > max_bytes => {}
+                    PageRead::Later => {}
+                    PageRead::Page(mark, from_turn, through_turn, json) => {
                         observer.owed_page = None;
                         frames.push(ObserverFrame::Page {
                             key: observer.key.clone(),
@@ -800,7 +838,7 @@ impl TabSet {
                         });
                     }
                     // No session to page through: its `Ended` says so.
-                    None => observer.owed_page = None,
+                    PageRead::None => observer.owed_page = None,
                 }
             }
             if observer.ended_of != Some(tab.backend_generation) {
@@ -1722,6 +1760,139 @@ mod tests {
             "the answered card is gone from it"
         );
         phone.apply(frames);
+        shut_down(&mut set);
+    }
+
+    #[test]
+    fn a_phone_message_read_in_events_a_resync_dropped_keeps_its_sender() {
+        let (dir, mut set, tab, provider) = opened_tab("observers-resync-sender");
+        let pixel = crate::agent_bridge::SentFrom {
+            device_id: "d1".into(),
+            name: "Pixel".into(),
+        };
+        set.get_mut(tab)
+            .unwrap()
+            .notes
+            .note_remote_sender("m1".into(), pixel.clone());
+        let mut batch = vec![
+            started("t1"),
+            AgentDomainEvent::UserMessageDelivered {
+                client_message_id: "m1".into(),
+                turn_id: "t1".into(),
+                text: "and the tests".into(),
+            },
+        ];
+        batch.extend((0..(agent::UI_EVENT_QUEUE_CAPACITY + 20)).map(|i| delta(&format!("chunk {i}"))));
+        let last = 1 + batch.len() as u64;
+        provider.queue_all(batch);
+        folded(&set, tab, last);
+        let out = set.pump(&dir, true);
+        let payload = json(&out.active_payload.expect("a payload"));
+        assert_eq!(payload["kind"], "snapshot", "the overflow became a resync");
+        let prompt = &payload["state"]["userPrompts"][0];
+        assert_eq!(prompt["text"], "and the tests");
+        let seq = prompt["seq"].as_u64().unwrap();
+        assert_eq!(
+            payload["state"]["sentFrom"][seq.to_string()],
+            serde_json::json!({"deviceId": "d1", "name": "Pixel"}),
+            "the desk's snapshot names the phone"
+        );
+        assert_eq!(set.get(tab).unwrap().notes.sent_from.get(&seq), Some(&pixel));
+        assert!(set.get(tab).unwrap().notes.remote_senders.is_empty(), "taken once");
+
+        let id = set.observe(&key(&set, tab)).unwrap();
+        let frames = set.take_observer_frames(id, usize::MAX);
+        let Some(ObserverFrame::Snapshot { json: text, .. }) = frames.first() else {
+            panic!("a snapshot first: {frames:?}");
+        };
+        assert_eq!(json(text)["state"]["sentFrom"][seq.to_string()]["name"], "Pixel");
+        shut_down(&mut set);
+    }
+
+    /// A tab with one finished turn and one running turn whose reply has begun, delivered to the desk and to an
+    /// observer that has taken its snapshot.
+    fn observed_running_turn(label: &str) -> (PathBuf, TabSet, TabId, Arc<RecordingProvider>, ObserverId, Phone) {
+        let (dir, mut set, tab, provider) = opened_tab(label);
+        provider.queue_all(vec![
+            started("t0"),
+            AgentDomainEvent::UserPromptSubmitted { text: "first".into() },
+            AgentDomainEvent::TurnCompleted {
+                turn_id: "t0".into(),
+                outcome: agent::TurnOutcome::Completed,
+                result_text: String::new(),
+                stop_reason: None,
+                usage: None,
+                detail: Default::default(),
+            },
+            started("t1"),
+            AgentDomainEvent::UserPromptSubmitted { text: "second".into() },
+            delta("Hello"),
+        ]);
+        folded(&set, tab, 7);
+        set.pump(&dir, true);
+        let id = set.observe(&key(&set, tab)).unwrap();
+        let mut phone = Phone::default();
+        phone.apply(set.take_observer_frames(id, usize::MAX));
+        assert_eq!(phone.snapshots, [7]);
+        (dir, set, tab, provider, id, phone)
+    }
+
+    fn page_through(frames: &[ObserverFrame]) -> Option<(u64, u64, u64)> {
+        frames.iter().find_map(|frame| match frame {
+            ObserverFrame::Page {
+                from_turn,
+                through_turn,
+                json: text,
+                ..
+            } => Some((
+                *from_turn,
+                *through_turn,
+                json(text)["throughRevision"].as_u64().unwrap(),
+            )),
+            _ => None,
+        })
+    }
+
+    #[test]
+    fn a_page_of_the_running_turn_waits_until_the_observer_stands_where_it_was_read() {
+        let (dir, mut set, tab, provider, id, mut phone) = observed_running_turn("observers-page-running");
+        let generation = set.get(tab).unwrap().backend_generation();
+        set.observer_more(id, generation, 2).unwrap();
+        // Folded and not yet pumped: the page would hold a delta the observer is still to be sent.
+        provider.queue(delta(" phone"));
+        folded(&set, tab, 8);
+        assert!(
+            set.observers_with_frames().is_empty(),
+            "nothing to take until the delta is sent"
+        );
+        let frames = set.take_observer_frames(id, usize::MAX);
+        assert_eq!(page_through(&frames), None, "no page ahead of the observer: {frames:?}");
+        phone.apply(frames);
+        set.pump(&dir, true);
+        let frames = set.take_observer_frames(id, usize::MAX);
+        assert_eq!(
+            page_through(&frames),
+            Some((0, 1, 8)),
+            "the page once the delta was sent: {frames:?}"
+        );
+        phone.apply(frames);
+        assert_eq!(phone.revisions, [8]);
+        shut_down(&mut set);
+    }
+
+    #[test]
+    fn a_page_of_finished_turns_does_not_wait_for_the_running_turn() {
+        let (dir, mut set, tab, provider, id, _phone) = observed_running_turn("observers-page-finished");
+        let generation = set.get(tab).unwrap().backend_generation();
+        set.observer_more(id, generation, 1).unwrap();
+        provider.queue(delta(" phone"));
+        folded(&set, tab, 8);
+        let frames = set.take_observer_frames(id, usize::MAX);
+        assert_eq!(
+            page_through(&frames).map(|(from, through, _)| (from, through)),
+            Some((0, 0))
+        );
+        set.pump(&dir, true);
         shut_down(&mut set);
     }
 }
