@@ -80,6 +80,24 @@ function toBrowse(rendered: RenderResult, props: EmptyTabProps): HTMLElement {
    box is now the menu's New session row: between the name and the other rows, as wide as they are, its key in
    their key column. */
 describe("EmptyTab: the box is the dashboard's New session row", () => {
+  it.each(["Ctrl+l", "Alt+p"])("passes the live %s entry key and pane focus to the dashboard", (entryKey) => {
+    const rendered = renderEmpty({ paneFocused: false, entryKey });
+    const hint = () => rendered.container.querySelector(".dash-entry-hint");
+    expect(hint()?.textContent).toBe(`${entryKey} to use these keys`);
+    rendered.rerender(<EmptyTab {...rendered.props} paneFocused />);
+    expect(hint()).toBeNull();
+    for (const unknown of [null, undefined]) {
+      rendered.rerender(<EmptyTab {...rendered.props} entryKey={unknown} />);
+      expect(hint()).toBeNull();
+    }
+    rendered.rerender(<EmptyTab {...rendered.props} entryKey="Alt+p" />);
+    expect(hint()?.textContent).toBe("Alt+p to use these keys");
+    for (const state of ["starting", "failed"] as const) {
+      rendered.rerender(<EmptyTab {...rendered.props} tab={{ ...TAB, state }} />);
+      expect(hint()).toBeNull();
+    }
+  });
+
   it("sits after the name and the where-line and before the other rows, with its key where theirs are", () => {
     const rendered = renderEmpty({ landing: "browse" });
     const dashboard = rendered.container.querySelector(".dashboard")!;

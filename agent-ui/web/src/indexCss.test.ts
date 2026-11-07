@@ -1804,6 +1804,18 @@ describe("index.css cascade (which rule actually wins)", () => {
     expect(rule(".composer").declarations).toMatch(/margin:\s*10px var\(--page-pad\) 14px;/);
   });
 
+  it("keeps the dashboard's entry-key pointer muted, passive and on one reserved line with an ellipsis", () => {
+    const html = '<div class="dash-items"><div class="dash-entry-slot"><div class="dash-entry-hint">Ctrl+l to use these keys</div></div></div>';
+    expect(winningDeclaration(html, ".dash-entry-hint", "color")).toBe("var(--nv-muted)");
+    expect(winningDeclaration(html, ".dash-entry-hint", "white-space")).toBe("nowrap");
+    expect(winningDeclaration(html, ".dash-entry-hint", "overflow")).toBe("hidden");
+    expect(winningDeclaration(html, ".dash-entry-hint", "text-overflow")).toBe("ellipsis");
+    expect(winningDeclaration(html, ".dash-entry-slot", "pointer-events")).toBe("none");
+    expect(winningDeclaration(html, ".dash-entry-slot", "font-size")).toBe("var(--fs-prose)");
+    expect(winningDeclaration(html, ".dash-entry-slot", "line-height")).toBe("1.5");
+    expect(winningDeclaration(html, ".dash-entry-slot", "min-height")).toBe("1.5em");
+  });
+
   /* The start screen's box keeps its bright frame only while the panel holds the keys. */
   it("quiets the start screen's box without the keys, and gives it INPUT's colour with the caret in it", () => {
     const box = (focused: string) =>

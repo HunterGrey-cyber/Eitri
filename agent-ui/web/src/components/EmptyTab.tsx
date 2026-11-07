@@ -882,6 +882,8 @@ export function EmptyTab(props: EmptyTabProps) {
             agent={isExternalAgent(tab.agent) ? agentTitle(tab.agent) : null}
             boxIsNew
             narrow={narrow}
+            paneFocused={props.paneFocused}
+            entryKey={props.entryKey}
           />
         )}
       </div>

@@ -28,7 +28,7 @@ function session(over: Partial<ResumableSession> = {}): ResumableSession {
 }
 
 function renderDash(
-  over: { hello?: Hello; mode?: PermissionModeChoice; cursor?: number; narrow?: boolean; onItem?: (i: DashItem) => void; editorLink?: EditorLink | null; agent?: string | null } = {},
+  over: { hello?: Hello; mode?: PermissionModeChoice; cursor?: number; narrow?: boolean; onItem?: (i: DashItem) => void; editorLink?: EditorLink | null; agent?: string | null; paneFocused?: boolean; entryKey?: string | null } = {},
 ) {
   const onItem = over.onItem ?? vi.fn();
   const props = {
@@ -39,9 +39,40 @@ function renderDash(
     onItem,
     editorLink: over.editorLink ?? null,
     agent: over.agent ?? null,
+    paneFocused: over.paneFocused ?? true,
+    entryKey: over.entryKey,
   };
-  return { onItem, ...render(<Dashboard {...props} />) };
+  return { props, onItem, ...render(<Dashboard {...props} />) };
 }
+
+describe("Dashboard: the entry-key pointer", () => {
+  it.each(["Ctrl+l", "Alt+p"])("names %s only while the editor has the keys", (entryKey) => {
+    const rendered = renderDash({ paneFocused: false, entryKey });
+    const { container, props, onItem } = rendered;
+    const hint = container.querySelector<HTMLElement>(".dash-entry-hint");
+    expect(hint?.textContent).toBe(`${entryKey} to use these keys`);
+    expect(container.querySelector(".dash-items")!.lastElementChild!.contains(hint)).toBe(true);
+    expect(hint!.closest('[data-nav-stop], [role="button"], button, a, [tabindex]')).toBeNull();
+    fireEvent.click(hint!);
+    expect(onItem).not.toHaveBeenCalled();
+    const slot = container.querySelector(".dash-entry-slot");
+    const rows = () => Array.from(container.querySelectorAll('[data-nav-stop="dash"]'));
+    const before = rows();
+    expect(before.map((row) => row.textContent)).toEqual(["New sessioni", "All sessionsw", "Keys?"]);
+    expect(DASH_ITEM_KEY).toEqual({
+      new: "i", restore: "s", resume: "r", sessions: "w", project: "p", mode: "⇧Tab", keys: "?",
+    });
+    for (const state of [{ paneFocused: true, entryKey }, { paneFocused: false, entryKey: null },
+      { paneFocused: false, entryKey: undefined }]) {
+      rendered.rerender(<Dashboard {...props} {...state} />);
+      expect(container.querySelector(".dash-entry-hint")).toBeNull();
+      expect(container.querySelector(".dash-entry-slot")).toBe(slot);
+      expect(slot!.childNodes).toHaveLength(0);
+      expect(rows()).toEqual(before);
+      expect(rows().map((row) => row.getAttribute("aria-current"))).toEqual(["true", null, null]);
+    }
+  });
+});
 
 describe("dashItems", () => {
   it("omits resume with no records", () => {
@@ -249,9 +280,8 @@ describe("Dashboard", () => {
     expect(resume.textContent).toBe(longTitle);
   });
 
-  /* The start screen carries no hints of its own. The status band under it names the mode, and
-     the `?` sheet (the last item) says what a mode does, what a message carries and the window's keys. */
-  it("draws nothing but the name, the where-line and the items: no mode row and no notes under them", () => {
+  /* The status band names the mode; its consequences and the window's keys live in the `?` sheet. */
+  it("keeps mode guidance in the band and keys sheet, leaving the head and action rows alone", () => {
     for (const mode of ["auto", "bypass"] as const) {
       const { container, unmount } = renderDash({ mode });
       expect(container.querySelector(".mode-glyph")).toBeNull();
@@ -312,9 +342,8 @@ describe("Dashboard", () => {
   });
 });
 
-/** A companion window with no editor attached is the one case the start screen says a line under its items:
- *  it is something to fix (attach an editor), not something to learn, so it is said where it is seen. With
- *  an editor attached, or in the one-window mode, nothing is said. */
+/** A companion window with no editor attached says how to attach one under its items. With
+ *  an editor attached, or in the one-window mode, no attachment notice is needed. */
 describe("Dashboard: the companion line", () => {
   it("says how to attach an editor while none is attached", () => {
     for (const state of ["none", "attaching", "detached", "failed"] as const) {

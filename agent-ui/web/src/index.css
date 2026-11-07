@@ -1217,6 +1217,20 @@ pre {
   margin-left: 0.4em;
   color: var(--nv-muted);
 }
+/* Reserve one line even without the pointer so focus changes never shift the centred rows. */
+.dash-entry-slot {
+  min-height: 1.5em;
+  font-size: var(--fs-prose);
+  line-height: 1.5;
+  padding-inline: 10px;
+  pointer-events: none;
+}
+.dash-entry-hint {
+  color: var(--nv-muted);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
 /* When Resume last's session was last opened (a clock time, or a date before today), right-aligned before the key. */
 .dash-when {
   flex: none;

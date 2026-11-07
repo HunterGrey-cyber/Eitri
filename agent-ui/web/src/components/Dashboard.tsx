@@ -215,6 +215,8 @@ type Props = {
   cursor: number;
   narrow: boolean;
   onItem: (item: DashItem) => void;
+  paneFocused?: boolean;
+  entryKey?: string | null;
   /** Companion mode (`App.tsx`'s `editorLink`, `null` in the one-window mode): the start screen then
    *  speaks for a window that holds only this panel. Optional so a caller with no editor beside it
    *  needs no stand-in. */
@@ -225,10 +227,10 @@ type Props = {
 };
 
 /** The empty tab's dashboard: Eitri's mark, a centred question, the
- *  where-line and one row per `dashItems(hello)`, each with its key -- and nothing else. What a mode
+ *  where-line and one row per `dashItems(hello)`, each with its key. What a mode
  *  does, what a message carries from the editor and the window's keys are all in the `?` sheet, which
- *  the last row opens; only a companion window with no editor attached says one more line, because
- *  that is a problem to fix, not a fact to learn.
+ *  the last row opens. While the editor has the keys, a pointer under the rows names the key that
+ *  brings them here; a companion window with no editor attached says how to attach one.
  *
  * Items carry `data-nav-stop="dash"` for the same CSS/grid symmetry the rest of the panel's rows
  * have, but they are deliberately NOT `nav.ts` stops (`controlsOf`'s selector has no `[role=
@@ -237,7 +239,7 @@ type Props = {
  * here is ever really DOM-focused. A real, focused `<button>` would eat a `Space` keydown as
  * native activation before it ever reached the leader system (`App.tsx`'s root `onKeyDown`), which
  * is exactly the key this screen's own `j`/`k`/letters/`Enter` must never intercept from. */
-export function Dashboard({ hello, mode, cursor, narrow, onItem, editorLink = null, agent = null }: Props) {
+export function Dashboard({ hello, mode, cursor, narrow, onItem, paneFocused, entryKey, editorLink = null, agent = null }: Props) {
   return (
     <div className="dashboard">
       <DashboardHead hello={hello} narrow={narrow} agent={agent} />
@@ -247,6 +249,8 @@ export function Dashboard({ hello, mode, cursor, narrow, onItem, editorLink = nu
         cursor={cursor}
         narrow={narrow}
         onItem={onItem}
+        paneFocused={paneFocused}
+        entryKey={entryKey}
         editorLink={editorLink}
         agent={agent}
       />
@@ -266,7 +270,7 @@ export function DashboardHead({ hello, narrow, agent = null }: { hello: Hello; n
   );
 }
 
-/** The dashboard's rows and, in a companion window with no editor, its one line under them. With
+/** The dashboard's rows, their entry-key pointer and the companion window's editor notice. With
  *  `boxIsNew`, the New session row is not drawn here: the box above the rows is that row (`EmptyTab`), and
  *  the cursor's index still counts it, so `j`/`k` and Enter mean what they did.
  *
@@ -281,6 +285,8 @@ export function DashboardItems({
   agent = null,
   boxIsNew = false,
   narrow = false,
+  paneFocused = true,
+  entryKey,
 }: Omit<Props, "narrow"> & { boxIsNew?: boolean; narrow?: boolean }) {
   const items = dashItems(hello);
   const newest = hello.resumableSessions[0] as Hello["resumableSessions"][number] | undefined;
@@ -308,6 +314,9 @@ export function DashboardItems({
             </div>
           ),
         )}
+        <div className="dash-entry-slot">
+          {!paneFocused && entryKey != null && <div className="dash-entry-hint">{entryKey} to use these keys</div>}
+        </div>
       </div>
       {hello.restore?.cutNote && <div className="dash-context dash-cut-note">{hello.restore.cutNote}</div>}
       {editorLink !== null && editorLink.state !== "attached" && (
