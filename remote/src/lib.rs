@@ -3,6 +3,7 @@
 #[cfg(target_os = "linux")]
 pub mod agents_feed;
 pub mod cli;
+pub mod notify;
 pub mod serve;
 
 /// What `eitri remote` takes, printed when it is given something else.
