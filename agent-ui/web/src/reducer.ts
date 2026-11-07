@@ -789,6 +789,8 @@ function foldEvent(state: AgentUiState, event: AgentDomainEvent, seq: Seq, onUnk
 /** What the events envelope says beyond its events (Rust's `CallNotes`): the saved rule that
  *  answered a call and the `Write` cards raised over no file. */
 export type CallNotes = {
+  sentFrom?: AgentUiState["sentFrom"];
+  stoppedFrom?: AgentUiState["stoppedFrom"];
   ruleNotes?: readonly { toolUseId: string; rule: string }[];
   createsFile?: readonly { permissionId: string; toolUseId: string | null }[];
   /** Calls whose CLI prompt was answered without a card, with their row's note. */
@@ -817,6 +819,7 @@ export function applyCallNotes(state: AgentUiState, notes: CallNotes): AgentUiSt
   const promptNotes = new Map((notes.promptNotes ?? []).map((n) => [n.toolUseId, n.note]));
   const autoNotes = new Set(notes.autoNotes ?? []);
   if (
+    notes.sentFrom === undefined && notes.stoppedFrom === undefined &&
     rules.size === 0 &&
     newFileCards.size === 0 &&
     autoNewFileCalls.size === 0 &&
@@ -826,6 +829,8 @@ export function applyCallNotes(state: AgentUiState, notes: CallNotes): AgentUiSt
     return state;
   return {
     ...state,
+    ...(notes.sentFrom === undefined ? {} : { sentFrom: { ...state.sentFrom, ...notes.sentFrom } }),
+    ...(notes.stoppedFrom === undefined ? {} : { stoppedFrom: { ...state.stoppedFrom, ...notes.stoppedFrom } }),
     toolCalls: state.toolCalls.map((call) => {
       const rule = rules.get(call.toolUseId);
       const creates = newFileCalls.has(call.toolUseId) || autoNewFileCalls.has(call.toolUseId);

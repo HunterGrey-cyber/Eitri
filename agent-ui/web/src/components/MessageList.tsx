@@ -650,8 +650,22 @@ export function MessageList({
   // changes which rows there are on none of them.
   const newestReply = state.transcript[state.transcript.length - 1]?.seq;
   const footers = useMemo(
-    () => workedFooters(state, turnDurations),
-    [state.activeTurnId, state.turnEndings, state.transcript.length, newestReply, state.thinking, state.toolCalls, state.pendingPermissions, state.editorCards, turnDurations],
+    () => {
+      const lines = new Map(workedFooters(state, turnDurations));
+      for (const [id, from] of Object.entries(state.stoppedFrom ?? {})) {
+        const ending = state.turnEndings.find((ending) => ending.turnId === id);
+        const task = state.backgroundTasks.rows.find((row) => row.task_id === id);
+        const call = state.toolCalls.find((call) => call.toolUseId === id);
+        const anchor = ending?.seq ?? call?.seq ?? (task ? state.toolCalls.find((call) => call.toolUseId === task.tool_use_id)?.seq : undefined)
+          ?? turnDurations.get(id)?.anchorSeq;
+        if (anchor !== undefined && anchor !== null) {
+          const label = `stopped from ${revealHidden(from.name).map((piece) => "text" in piece ? piece.text : piece.escape).join("")}`;
+          lines.set(anchor, lines.has(anchor) ? `${lines.get(anchor)} · ${label}` : label);
+        }
+      }
+      return lines;
+    },
+    [state.activeTurnId, state.turnEndings, state.transcript.length, newestReply, state.thinking, state.toolCalls, state.pendingPermissions, state.editorCards, state.stoppedFrom, state.backgroundTasks, turnDurations],
   );
   // By row key, over the rows actually drawn: a turn's newest row may be a hidden or folded thought.
   const placedFooters = useMemo(() => placeFooters(timeline, footers), [timeline, footers]);
@@ -698,6 +712,7 @@ export function MessageList({
           const abandoned = call !== null && isAbandonedCall(call, state, sessionEnded);
           const props: TimelineRowProps = {
             item,
+            sentFrom: item.kind === "prompt" ? state.sentFrom?.[String(item.seq)]?.name ?? null : null,
             current: index === cursor,
             yanked: item.key === yankedKey,
             expanded: expanded[item.key] === true,
@@ -762,8 +777,9 @@ type HeldRow = { props: TimelineRowProps; footer: string | null; element: ReactE
 
 /** Every prop by name, so a prop added to `TimelineRowProps` without a line here fails to compile. */
 function sameRowProps(a: TimelineRowProps, b: TimelineRowProps): boolean {
+  if (a.sentFrom !== b.sentFrom) return false;
   const {
-    item, current, yanked, expanded, detailed, thinkingDisplay, sessionEnded, abandoned, cardLine, agent, gated,
+    sentFrom, item, current, yanked, expanded, detailed, thinkingDisplay, sessionEnded, abandoned, cardLine, agent, gated,
     ruleOffer, alreadyAnswered, ranFor, handlers, streaming, selecting, ...none
   } = a;
   const _exhaustive: Record<string, never> = none;
@@ -778,6 +794,7 @@ function sameRowProps(a: TimelineRowProps, b: TimelineRowProps): boolean {
 }
 
 type TimelineRowProps = {
+  sentFrom: string | null;
   item: TimelineItem;
   current: boolean;
   yanked: boolean;
@@ -816,6 +833,7 @@ export function timelineRowRenderCount(): number {
  *  a batch renders the one row it wrote to. Anything a row draws must come from its item or from a
  *  prop here, or the row keeps showing what it showed before. */
 const TimelineRow = memo(function TimelineRow({
+  sentFrom,
   item,
   current,
   yanked,
@@ -847,6 +865,7 @@ const TimelineRow = memo(function TimelineRow({
       return (
         <Row kind="prompt" sign="›" current={current} className={promptClass || undefined} navStop="row">
           {item.text}
+          {sentFrom !== null && <div className="phone-source"><small>from <Revealed pieces={revealHidden(sentFrom)} /></small></div>}
         </Row>
       );
     }

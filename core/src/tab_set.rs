@@ -3762,6 +3762,23 @@ impl TabSet {
                 wall_clock_ms(),
             );
         }
+        if let RevisedDelivery::Events(tagged) = &delivery {
+            // In order: a reset drops the notes of the conversation before it, and a delivery after it in the
+            // same batch is noted afresh.
+            for (revision, event) in tagged {
+                match event {
+                    AgentDomainEvent::UserMessageDelivered { client_message_id, .. } => {
+                        if let Some(from) = tab.notes.take_remote_sender(client_message_id) {
+                            tab.notes.sent_from.insert(revision.saturating_sub(1), from);
+                            tab.notes.remote_notes_dirty = true;
+                        }
+                    }
+                    AgentDomainEvent::ConversationReset { .. } => tab.notes.forget_remote_notes_before(*revision),
+                    _ => {}
+                }
+            }
+        }
+        let remote_notes_dirty = tab.notes.remote_notes_dirty;
         let resynced = matches!(delivery, RevisedDelivery::Resync);
         // The tab's observers read this same drain, whether or not a page shows the tab, after its arm has folded
         // it: what the gate answered and what the batch settled are then what the desk has.
@@ -3781,6 +3798,15 @@ impl TabSet {
         // The arms below count this drain's stretches; `pump_arm_events` and `pump_arm_resync` may raise this.
         live.unseen_stretch.counted_through = Some(folded_before);
         let mut arm = match delivery {
+            RevisedDelivery::Nothing if remote_notes_dirty => Self::pump_arm_events(
+                &mut live,
+                Vec::new(),
+                covered,
+                tick.project_root,
+                review.as_deref_mut(),
+                place,
+                observed,
+            ),
             RevisedDelivery::Nothing => ArmOutcome::default(),
             RevisedDelivery::Events(tagged) => Self::pump_arm_events(
                 &mut live,
@@ -3906,7 +3932,9 @@ impl TabSet {
         });
         // The envelope's bracket, from the events' own fold revisions: the revision before the first
         // one it carries, and that of the batch's last.
-        let through_revision = tagged.last().map_or(0, |(revision, _)| *revision);
+        let through_revision = tagged
+            .last()
+            .map_or_else(|| live.backend.projection().last_revision, |(revision, _)| *revision);
         // The loop below counts every stretch this batch holds.
         live.unseen_stretch.counted_through = live.unseen_stretch.counted_through.max(Some(through_revision));
         let from_revision = tagged
@@ -3974,6 +4002,16 @@ impl TabSet {
             }
         }
         let mut fresh_notes = CallNotes {
+            sent_from: if live.notes.remote_notes_dirty {
+                live.notes.sent_from.clone()
+            } else {
+                BTreeMap::new()
+            },
+            stopped_from: if live.notes.remote_notes_dirty {
+                live.notes.stopped_from.clone()
+            } else {
+                BTreeMap::new()
+            },
             creates_file: note_new_files(&mut live.notes.creates_file, &events, project_root),
             auto_creates_file: std::mem::take(&mut live.session.creates_file_unsent),
             // Only a shown tab's payload leaves here; a background tab's turns wait for the snapshot
@@ -3988,6 +4026,7 @@ impl TabSet {
             },
             ..CallNotes::default()
         };
+        live.notes.remote_notes_dirty = false;
         live.session.note_ledger.fold(&events, live.notes, &mut fresh_notes);
         // Every card in the batch is counted, those the snapshot drew included: they are pending all
         // the same, and this tab has not counted them yet.
@@ -4747,6 +4786,9 @@ impl TabSet {
             let client_id = format!("eitri-{}-{next}", id.0);
             match backend.steer(turn, &client_id, &item.wire, &item.text, item.origin()) {
                 Ok(()) => {
+                    if let QueuedFrom::Remote { asker, .. } = &item.from {
+                        tab.notes.note_remote_sender(client_id.clone(), asker.sent_from());
+                    }
                     next += 1;
                     item.state = QueuedState::Steered {
                         client_id,
@@ -4912,6 +4954,12 @@ impl TabSet {
                         .send_turn_in(&wire, &typed, mode, root.as_deref(), origin);
                 match &outcome {
                     Ok(submitted) => {
+                        if let QueuedFrom::Remote { asker, .. } = &tab.session.queue[turn[0]].from {
+                            let from = asker.sent_from();
+                            tab.notes
+                                .note_remote_sender(submitted.client_message_id.clone(), from.clone());
+                            tab.note_remote_prompt(&typed, submitted.after_revision, from);
+                        }
                         let mut message = Queued::held(&typed, wire, wall_clock_ms());
                         // One sender's items only (`next_turn`): handed back to the queue, it is still theirs.
                         message.from = tab.session.queue[turn[0]].from.clone();

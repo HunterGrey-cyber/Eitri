@@ -2462,3 +2462,14 @@ describe("rows are children of one list", () => {
     error.mockRestore();
   });
 });
+
+for (const [test, name] of [["user_row_names_the_phone", "Pixel 8"], ["phone_name_shows_hidden_characters", "Pixel\u202e8"]]) {
+  it(test, () => {
+    const view = render(<MessageList state={state({userPrompts: [{seq: 1, text: "hello"}], sentFrom: {"1": {deviceId: "d1", name}}})} sessionEnded={false} expanded={{}} cursor={-1} onAnswerPermission={() => {}} />);
+    expect(view.container.textContent).toContain(name === "Pixel 8" ? "from Pixel 8" : "U+202E");
+  });
+}
+it("footer_names_the_phone_that_stopped", () => {
+ const view = render(<MessageList state={state({turnEndings: [{seq: 2, turnId: "t1", kind: "interrupted", reason: null, apiErrorStatus: null, message: null}], stoppedFrom: {t1: {deviceId: "d1", name: "Pixel 8"}}})} sessionEnded={false} expanded={{}} cursor={-1} onAnswerPermission={() => {}} />);
+ expect(view.container.textContent).toContain("stopped from Pixel 8");
+});

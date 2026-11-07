@@ -24,6 +24,9 @@ const EMPTIED = {
   thinkingOpen: false,
   // What was restored belonged to the old conversation.
   history: null,
+  // Which phone sent or stopped what: notes on the old conversation's rows and turns.
+  sentFrom: {},
+  stoppedFrom: {},
 } satisfies Partial<AgentUiState>;
 
 /** The fields the process still holds, which a reset leaves as they are. */

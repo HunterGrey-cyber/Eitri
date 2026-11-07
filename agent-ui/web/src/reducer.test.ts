@@ -1997,3 +1997,19 @@ describe("broker cards", () => {
     expect(resetToStartScreen(state).editorCards).toEqual([]);
   });
 });
+
+it("call_notes_reducer_keeps_sent_from", () => {
+  const phone = { deviceId: "d1", name: "Pixel 8" };
+  const state = applyCallNotes(initialState(), { sentFrom: { "3": phone }, stoppedFrom: { t1: phone } });
+  expect(state.sentFrom).toEqual({ "3": phone });
+  expect(applyCallNotes(state, {}).stoppedFrom).toEqual({ t1: phone });
+  expect(applySnapshot(state, initialState(), 0).sentFrom ?? {}).toEqual({});
+});
+
+it("conversation_reset_clears_phone_notes", () => {
+  const phone = { deviceId: "d1", name: "Pixel 8" };
+  const state = applyCallNotes(initialState(), { sentFrom: { "3": phone }, stoppedFrom: { t1: phone } });
+  const cleared = applyEvent(state, { type: "conversation_reset", new_conversation_id: "new", trigger: null });
+  expect(cleared.sentFrom).toEqual({});
+  expect(cleared.stoppedFrom).toEqual({});
+});

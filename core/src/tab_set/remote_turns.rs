@@ -22,6 +22,15 @@ pub struct RemoteAsker {
     pub conn: Option<u64>,
 }
 
+impl RemoteAsker {
+    pub(super) fn sent_from(&self) -> crate::agent_bridge::SentFrom {
+        crate::agent_bridge::SentFrom {
+            device_id: self.device_id.clone(),
+            name: self.device.clone(),
+        }
+    }
+}
+
 /// Who put a queued item there.
 #[derive(Debug, Clone, PartialEq, Eq, Default, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -121,6 +130,26 @@ pub struct RemoteSent {
 }
 
 impl Tab {
+    pub fn note_remote_stop(&mut self, id: String, from: crate::agent_bridge::SentFrom) {
+        self.notes.stopped_from.insert(id, from);
+        self.notes.remote_notes_dirty = true;
+    }
+
+    pub(super) fn note_remote_prompt(&mut self, text: &str, after: u64, from: crate::agent_bridge::SentFrom) {
+        let seq = self.live().and_then(|backend| {
+            backend
+                .projection()
+                .user_prompts
+                .iter()
+                .find(|p| p.seq >= after && p.text == text && !p.delivered)
+                .map(|p| p.seq)
+        });
+        if let Some(seq) = seq {
+            self.notes.sent_from.insert(seq, from);
+            self.notes.remote_notes_dirty = true;
+        }
+    }
+
     /// Takes the phone's messages the tab's mode no longer lets go out of its queue, and says which. A message
     /// already put into the running turn stays unless `steered_too`: the queue is about to send again whatever
     /// the agent never said it read, and a phone's goes out again only as one held would.
@@ -399,6 +428,9 @@ impl TabSet {
                     if let Some(backend) = t.live_mut() {
                         backend.note_accepted_prompt(&typed);
                     }
+                    t.note_remote_prompt(&typed, spawned.after_revision, asker.sent_from());
+                    t.notes
+                        .note_remote_sender(spawned.client_message_id.clone(), asker.sent_from());
                     let mut message = Queued::held(&typed, typed.clone(), wall_clock_ms());
                     message.from = QueuedFrom::Remote {
                         asker: asker.clone(),

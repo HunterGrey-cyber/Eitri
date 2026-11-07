@@ -470,17 +470,29 @@ impl AgentPanelHandle {
         raw: &str,
     ) -> Result<RemoteAccepted, RemoteRefusal> {
         self.wake();
-        let message = parse_remote_inbound(raw)?;
-        if !first_command_use(&origin.device_id, message.command_id()) {
-            return Err(RemoteRefusal::Duplicate);
-        }
-        // The window is closing and its tabs are gone.
-        if self.state.borrow().shutting_down {
-            return Err(RemoteRefusal::NoSuchTab);
-        }
-        let screen = Screen::read(&self.state, &self.pages);
-        let outcome = self.run(|state, out| handle_remote_message(state, &screen, origin, key, message, out));
+        let outcome = (|| {
+            let message = parse_remote_inbound(raw)?;
+            if !first_command_use(&origin.device_id, message.command_id()) {
+                return Err(RemoteRefusal::Duplicate);
+            }
+            if self.state.borrow().shutting_down {
+                return Err(RemoteRefusal::NoSuchTab);
+            }
+            let screen = Screen::read(&self.state, &self.pages);
+            self.run(|state, out| handle_remote_message(state, &screen, origin, key, message, out))
+        })();
         if let Err(why) = &outcome {
+            let mut state = self.state.borrow_mut();
+            if let Some(tab) = state.tabs.tab_by_key(key) {
+                super::remote_entry::refusal_notice_for(
+                    &mut state,
+                    tab,
+                    &origin.device_id,
+                    &origin.device,
+                    super::remote_entry::refusal_words(why),
+                    std::time::Instant::now(),
+                );
+            }
             eprintln!(
                 "[agent_panel] remote {} ({}, connection {}): refused: {why:?}",
                 origin.device, origin.device_id, origin.conn

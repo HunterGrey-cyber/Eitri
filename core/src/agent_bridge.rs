@@ -1820,6 +1820,18 @@ pub fn serialize_events_for_js(
 /// a payload without notes is byte-identical to one from before they existed.
 #[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct CallNotes {
+    /// The phone behind each message id the provider may still name back with `UserMessageDelivered`
+    /// (a steer, or a sent prompt the agent reads only after work of its own), newest last, at most
+    /// [`REMOTE_SENDERS_KEPT`]: an id the provider never names back is not kept for the tab's life.
+    /// Not taken out at a drop: a message given up on may still be read under the same id.
+    #[serde(default, skip_serializing_if = "std::collections::VecDeque::is_empty")]
+    pub remote_senders: std::collections::VecDeque<(String, SentFrom)>,
+    #[serde(skip)]
+    pub remote_notes_dirty: bool,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub sent_from: BTreeMap<u64, SentFrom>,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub stopped_from: BTreeMap<String, SentFrom>,
     /// Tool-use id -> the saved prefix rule that answered its permission request (`Bash(git log *)`,
     /// shown as the row's note).
     pub allowed_by_rule: BTreeMap<String, String>,
@@ -1853,6 +1865,14 @@ pub struct CallNotes {
     pub turn_times: Vec<TurnTime>,
 }
 
+/// The enrolled device responsible for a transcript action.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SentFrom {
+    pub device_id: String,
+    pub name: String,
+}
+
 /// When one finished turn started and ended, on the panel's `Date.now()` clock. Both ends are read
 /// from the tab's tick, so a turn is at most one tick (about 33 ms) longer than it was.
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
@@ -1876,9 +1896,38 @@ impl TurnTime {
     }
 }
 
+/// How many message ids [`CallNotes::remote_senders`] keeps: more than a provider can still name back
+/// (it keeps 64 of each kind of message it may report late).
+pub const REMOTE_SENDERS_KEPT: usize = 256;
+
 impl CallNotes {
+    /// Remembers which phone sent the message `id`, so its delivery is noted with that phone.
+    pub fn note_remote_sender(&mut self, id: String, from: SentFrom) {
+        self.remote_senders.retain(|(kept, _)| *kept != id);
+        while self.remote_senders.len() >= REMOTE_SENDERS_KEPT {
+            self.remote_senders.pop_front();
+        }
+        self.remote_senders.push_back((id, from));
+    }
+
+    /// The phone that sent the message `id`, if one did, taken out.
+    pub fn take_remote_sender(&mut self, id: &str) -> Option<SentFrom> {
+        let at = self.remote_senders.iter().position(|(kept, _)| kept == id)?;
+        self.remote_senders.remove(at).map(|(_, from)| from)
+    }
+
+    /// A conversation reset at fold revision `revision`: which phone sent or stopped what in the conversation
+    /// before it goes with that conversation, as the view's reset drops it. A prompt after the reset has a
+    /// `seq` of at least `revision`.
+    pub fn forget_remote_notes_before(&mut self, revision: u64) {
+        self.sent_from.retain(|seq, _| *seq >= revision);
+        self.stopped_from.clear();
+    }
+
     pub fn is_empty(&self) -> bool {
-        self.allowed_by_rule.is_empty()
+        self.sent_from.is_empty()
+            && self.stopped_from.is_empty()
+            && self.allowed_by_rule.is_empty()
             && self.creates_file.is_empty()
             && self.prompt_notes.is_empty()
             && self.allowed_by_auto.is_empty()
@@ -1967,7 +2016,17 @@ pub fn serialize_events_with_notes_and_revisions_for_js(
     if !notes.turn_times.is_empty() {
         payload["turnTimes"] = notes.turn_times.iter().map(TurnTime::to_json).collect();
     }
+    add_remote_notes(&mut payload, notes);
     payload.to_string()
+}
+
+fn add_remote_notes(value: &mut Value, notes: &CallNotes) {
+    if !notes.sent_from.is_empty() {
+        value["sentFrom"] = json!(notes.sent_from);
+    }
+    if !notes.stopped_from.is_empty() {
+        value["stoppedFrom"] = json!(notes.stopped_from);
+    }
 }
 
 /// Everything one snapshot needs, gathered from wherever it actually lives.
@@ -2373,6 +2432,8 @@ pub fn serialize_snapshot_with_notes_for_js(
     if projection.running_turn_cli {
         state["runningTurnCli"] = Value::Bool(true);
     }
+
+    add_remote_notes(&mut state, notes);
 
     // When the running turn started (wall clock ms, `Date.now()`'s clock), which the tab set keeps
     // per tab so a switch or a reload shows the turn's real elapsed time rather than `0s+`. On the
@@ -3057,3 +3118,52 @@ pub fn serialize_confirm_restore_for_js(prompt: &crate::tab_set::RestorePrompt) 
 mod question_message_tests;
 #[cfg(test)]
 mod tests;
+
+#[cfg(test)]
+mod remote_note_tests {
+    use super::*;
+
+    #[test]
+    fn notes_without_sent_from_are_byte_identical() {
+        let tab = crate::tabs::TabId(1);
+        let events = [AgentDomainEvent::UserPromptSubmitted { text: "desk".into() }];
+        let expected =
+            json!({"kind":"events", "tab":1, "fromRevision":0, "throughRevision":1, "events":events}).to_string();
+        assert_eq!(
+            serialize_events_with_notes_for_js(tab, 0, 1, &events, &CallNotes::default()),
+            expected
+        );
+    }
+
+    fn phone(n: usize) -> SentFrom {
+        SentFrom {
+            device_id: format!("d{n}"),
+            name: "Pixel 8".into(),
+        }
+    }
+
+    #[test]
+    fn remote_senders_keep_only_the_newest_ids() {
+        let mut notes = CallNotes::default();
+        for n in 0..=REMOTE_SENDERS_KEPT {
+            notes.note_remote_sender(format!("m{n}"), phone(n));
+        }
+        assert_eq!(notes.remote_senders.len(), REMOTE_SENDERS_KEPT);
+        assert_eq!(notes.take_remote_sender("m0"), None, "the oldest id is let go");
+        assert_eq!(notes.take_remote_sender("m1"), Some(phone(1)));
+        assert_eq!(notes.take_remote_sender("m1"), None, "taken once");
+        let newest = format!("m{REMOTE_SENDERS_KEPT}");
+        assert_eq!(notes.take_remote_sender(&newest), Some(phone(REMOTE_SENDERS_KEPT)));
+    }
+
+    #[test]
+    fn a_reset_forgets_the_conversation_before_it() {
+        let mut notes = CallNotes::default();
+        notes.sent_from.insert(3, phone(1));
+        notes.sent_from.insert(9, phone(2));
+        notes.stopped_from.insert("t1".into(), phone(1));
+        notes.forget_remote_notes_before(9);
+        assert_eq!(notes.sent_from.keys().copied().collect::<Vec<_>>(), [9]);
+        assert!(notes.stopped_from.is_empty());
+    }
+}

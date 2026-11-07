@@ -21,6 +21,8 @@ export type TranscriptMessage = { seq: Seq; text: string };
  * backends, and Rust deliberately records the pre-composition text (`agent/src/projection.rs`'s
  * `UserPromptSubmitted`). Rendering the wire text would show the user a file path and a selection
  * they never wrote. */
+export type SentFrom = { deviceId: string; name: string };
+
 export type UserPromptRecord = {
   seq: Seq;
   text: string;
@@ -488,6 +490,8 @@ export type AgentUiState = {
    *  tab is the usual state: its wire carries none, and only the CLI's own `/model` and `/effort` replies say it. */
   effort: string | null;
   userPrompts: UserPromptRecord[];
+  sentFrom?: Readonly<Record<string, SentFrom>>;
+  stoppedFrom?: Readonly<Record<string, SentFrom>>;
   transcript: TranscriptMessage[]; toolCalls: ToolCallRecord[]; status: SessionStatus;
   activeTurnId: string | null; pendingPermissions: PermissionRequestRecord[];
   /** The cards Eitri's own tool broker is waiting on, as records the card view draws like a provider's. A snapshot

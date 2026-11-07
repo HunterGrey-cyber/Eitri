@@ -253,6 +253,12 @@ pre {
   color: var(--nv-tint-muted);
   font-size: var(--fs-xs);
 }
+/* The enrolled phone a prompt came from, as quiet as the delivered line. */
+.row-prompt .phone-source {
+  margin-top: 5px;
+  color: var(--nv-tint-muted);
+  font-size: var(--fs-xs);
+}
 .message-list > .row-assistant {
   margin-top: 24px;
   margin-bottom: 24px;
