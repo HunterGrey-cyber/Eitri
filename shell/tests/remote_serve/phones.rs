@@ -98,6 +98,11 @@ pub fn checks() -> Vec<(&'static str, Check)> {
             "audit_mine_returns_only_this_devices_records",
             audit_mine_returns_only_this_devices_records,
         ),
+        (
+            "finished_keys_wake_only_belled_tabs",
+            finished_keys_wake_only_belled_tabs,
+        ),
+        ("connected_device_is_not_woken", connected_device_is_not_woken),
     ]
 }
 
@@ -149,6 +154,7 @@ impl World {
             port: 41000,
             origins: Vec::new(),
             audit_keep_days: eitri_core::remote_audit::AUDIT_KEEP_DAYS_DEFAULT,
+            notify: true,
         };
         serve_unix(listener, Arc::new(cfg), hub.clone()).unwrap();
         World {
@@ -1502,6 +1508,7 @@ fn revoked_device_is_recorded_as_revoked(dir: &Path) -> Result<(), String> {
         port: 41000,
         origins: Vec::new(),
         audit_keep_days: eitri_core::remote_audit::AUDIT_KEEP_DAYS_DEFAULT,
+        notify: true,
     };
     serve_unix(UnixListener::bind(&socket).unwrap(), Arc::new(cfg), hub).unwrap();
     let mut late = Phone::connect(&socket);
@@ -1694,4 +1701,146 @@ fn audit_mine_returns_only_this_devices_records(dir: &Path) -> Result<(), String
         format!("{}", lines.last().unwrap())
     })?;
     phone.seqs_contiguous()
+}
+
+// ---------------------------------------------------------------------------------------------------------------
+// The notifier over the hub: whom a wake goes to.
+
+/// Where the notifier's wakes went, in order; every one answered 200.
+#[derive(Clone, Default)]
+struct Posted(Arc<std::sync::Mutex<Vec<String>>>);
+
+impl eitri_remote::serve::notifier::Poster for Posted {
+    fn post(
+        &self,
+        endpoint: &str,
+        _still_due: eitri_remote::serve::notifier::StillDue,
+        done: Box<dyn FnOnce(String) + Send>,
+    ) -> std::io::Result<()> {
+        self.0.lock().unwrap().push(endpoint.to_owned());
+        done("200".to_owned());
+        Ok(())
+    }
+}
+
+impl Posted {
+    fn now(&self) -> Vec<String> {
+        self.0.lock().unwrap().clone()
+    }
+}
+
+/// Gives both of the world's devices a push endpoint and starts a notifier over its hub, posting to `posted`.
+fn notifier_over(world: &World, posted: &Posted) -> Result<(), String> {
+    eitri_core::remote_devices::update(&world.store, |store| {
+        for id in [STEER.0, WATCH.0] {
+            store.get_mut(id).unwrap().push_endpoint = Some(format!("https://push.example/up/{id}"));
+        }
+    })
+    .map_err(|e| format!("the store: {e}"))?;
+    let sources = eitri_remote::serve::notifier::Sources::of_hub(&world.hub, &world.control);
+    eitri_remote::serve::notifier::start_with(&world.control, sources, posted.clone(), world.hub.audit().clone())
+        .map_err(|e| format!("the notifier: {e}"))
+}
+
+fn classed(instance: &str, key: &str, number: u16, class: eitri_core::agents::Class) -> Row {
+    Row {
+        class,
+        ..row(instance, key, number)
+    }
+}
+
+/// Waits `within` for `posted` to hold `count` wakes.
+fn wakes(posted: &Posted, count: usize, within: Duration) -> Vec<String> {
+    let deadline = Instant::now() + within;
+    while posted.now().len() < count && Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    posted.now()
+}
+
+/// Long enough for a change the notifier would act on to reach it: its reader is woken by the file's change.
+const NO_WAKE_WITHIN: Duration = Duration::from_millis(1500);
+
+fn finished_keys_wake_only_belled_tabs(dir: &Path) -> Result<(), String> {
+    use eitri_core::agents::Class;
+    let world = World::new(dir, Limits::default());
+    let instance = new_instance();
+    let rows = Publisher::start(&world.control, &instance, project(), window_ref(&instance)).unwrap();
+    let (belled, other) = ("k-00000000000000b1", "k-00000000000000b2");
+    rows.offer_now(vec![
+        classed(&instance, belled, 1, Class::Working),
+        classed(&instance, other, 2, Class::Working),
+    ]);
+    let posted = Posted::default();
+    notifier_over(&world, &posted)?;
+    // The phone bells one tab, then leaves: its wakes are for when it is not connected.
+    let mut phone = world.phone_as(STEER);
+    phone.send(json!({ "kind": "set_finished_keys", "keys": [belled] }));
+    phone.send(json!({ "kind": "ping" }));
+    phone.until(&[], "the pong", |l| l["kind"] == "pong")?;
+    phone.close();
+    drop(phone);
+    let deadline = Instant::now() + PATIENCE;
+    while !world.hub.connected_devices().is_empty() {
+        if Instant::now() > deadline {
+            return Err("the phone was still connected".into());
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    rows.offer_now(vec![
+        classed(&instance, belled, 1, Class::Working),
+        classed(&instance, other, 2, Class::Quiet),
+    ]);
+    let early = wakes(&posted, 1, NO_WAKE_WITHIN);
+    check(early.is_empty(), || format!("an unbelled tab's end woke {early:?}"))?;
+    rows.offer_now(vec![
+        classed(&instance, belled, 1, Class::Quiet),
+        classed(&instance, other, 2, Class::Quiet),
+    ]);
+    let got = wakes(&posted, 1, PATIENCE);
+    check(got == ["https://push.example/up/d1"], || {
+        format!("the belled tab's end woke {got:?}")
+    })?;
+    let records = world.record_where("the push", |r| r.event == "push")?;
+    let pushes: Vec<&Record> = records.iter().filter(|r| r.event == "push").collect();
+    check(
+        pushes.len() == 1
+            && pushes[0].fields["wake"] == "finished"
+            && pushes[0].fields["host"] == "push.example"
+            && pushes[0].fields["status"] == "200",
+        || lines_of(&records),
+    )
+}
+
+fn connected_device_is_not_woken(dir: &Path) -> Result<(), String> {
+    use eitri_core::agents::Class;
+    let world = World::new(dir, Limits::default());
+    let instance = new_instance();
+    let rows = Publisher::start(&world.control, &instance, project(), window_ref(&instance)).unwrap();
+    let key = "k-00000000000000c1";
+    rows.offer_now(vec![classed(&instance, key, 1, Class::Quiet)]);
+    let posted = Posted::default();
+    notifier_over(&world, &posted)?;
+    let mut phone = world.phone_as(STEER);
+    phone.send(json!({ "kind": "ping" }));
+    phone.until(&[], "the pong", |l| l["kind"] == "pong")?;
+    check(world.hub.connected_devices().contains(STEER.0), || {
+        "the steering phone is not counted as connected".to_owned()
+    })?;
+    rows.offer_now(vec![classed(&instance, key, 1, Class::Needs)]);
+    let got = wakes(&posted, 1, PATIENCE);
+    // Anything more would have come with the first.
+    std::thread::sleep(NO_WAKE_WITHIN);
+    let got_later = posted.now();
+    check(got == ["https://push.example/up/d2"] && got_later == got, || {
+        format!("a needs-you woke {got_later:?}")
+    })?;
+    let records = world.record_where("the push", |r| r.event == "push")?;
+    let pushes: Vec<&Record> = records.iter().filter(|r| r.event == "push").collect();
+    check(
+        pushes.len() == 1 && pushes[0].fields["device"] == WATCH.0 && pushes[0].fields["wake"] == "needs_you",
+        || lines_of(&records),
+    )?;
+    drop(phone);
+    Ok(())
 }

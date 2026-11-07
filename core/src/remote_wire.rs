@@ -91,6 +91,36 @@ pub enum PhoneInbound {
     AuditMine {
         limit: u32,
     },
+    /// The tabs whose finished turns wake this phone (its bells), by key; it replaces what the phone sent before, and
+    /// the phone sends it again at each connect. At most [`MAX_FINISHED_KEYS`], each at most
+    /// [`MAX_FINISHED_KEY_BYTES`].
+    SetFinishedKeys {
+        #[serde(deserialize_with = "finished_keys")]
+        keys: Vec<String>,
+    },
+}
+
+/// The most tab keys one `set_finished_keys` names.
+pub const MAX_FINISHED_KEYS: usize = 64;
+/// The longest tab key it takes.
+pub const MAX_FINISHED_KEY_BYTES: usize = 256;
+
+fn finished_keys<'de, D: serde::Deserializer<'de>>(deserializer: D) -> Result<Vec<String>, D::Error> {
+    let keys = Vec::<String>::deserialize(deserializer)?;
+    if keys.len() > MAX_FINISHED_KEYS {
+        return Err(serde::de::Error::custom(format!(
+            "set_finished_keys names at most {MAX_FINISHED_KEYS} keys"
+        )));
+    }
+    if keys
+        .iter()
+        .any(|key| key.is_empty() || key.len() > MAX_FINISHED_KEY_BYTES)
+    {
+        return Err(serde::de::Error::custom(format!(
+            "a finished key is 1 to {MAX_FINISHED_KEY_BYTES} bytes"
+        )));
+    }
+    Ok(keys)
 }
 
 // Serde's internally tagged unit visitor ignores fields; use an empty struct to reject them.
@@ -261,6 +291,8 @@ mod tests {
             json!({"kind":"revoke_self"}),
             json!({"kind":"set_push_endpoint", "url":"https://ntfy.example/t"}),
             json!({"kind":"audit_mine", "limit":20}),
+            json!({"kind":"set_finished_keys", "keys":["k-0000000000000001"]}),
+            json!({"kind":"set_finished_keys", "keys":[]}),
             json!({"kind":"hello", "device":"phone", "layout":"slab", "protocol":1}),
             json!({"kind":"hello", "device":"phone", "token":"secret", "layout":"slab", "protocol":1}),
         ] {
@@ -293,9 +325,26 @@ mod tests {
             json!({"kind":"audit_mine"}),
             json!({"kind":"audit_mine", "limit":-1}),
             json!({"kind":"audit_mine", "limit":20, "device":"d1"}),
+            json!({"kind":"set_finished_keys"}),
+            json!({"kind":"set_finished_keys", "keys":"k-1"}),
+            json!({"kind":"set_finished_keys", "keys":[""]}),
+            json!({"kind":"set_finished_keys", "keys":["k".repeat(257)]}),
         ] {
             assert!(serde_json::from_value::<PhoneInbound>(body.clone()).is_err(), "{body}");
         }
+    }
+
+    #[test]
+    fn set_finished_keys_takes_at_most_64() {
+        let keys = |n: usize| (0..n).map(|i| format!("k-{i:016x}")).collect::<Vec<_>>();
+        match serde_json::from_value::<PhoneInbound>(json!({"kind":"set_finished_keys", "keys": keys(64)})) {
+            Ok(PhoneInbound::SetFinishedKeys { keys: got }) => assert_eq!(got, keys(64)),
+            other => panic!("{other:?}"),
+        }
+        let err = serde_json::from_value::<PhoneInbound>(json!({"kind":"set_finished_keys", "keys": keys(65)}))
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("at most 64"), "{err}");
     }
 
     #[test]

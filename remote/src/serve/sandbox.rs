@@ -16,6 +16,9 @@
 //!   `truncate` because Landlock before ABI 3 does not govern it. An x32 call fails with `EPERM` too; a system call
 //!   from another architecture's table ends the process.
 //!
+//! The notifier's helper, a process `serve` forks before anything else, confines itself the same way with other
+//! rules ([`sandbox_helper`]): it reads the resolver's and the TLS roots' files and writes nothing.
+//!
 //! Landlock binds the calling thread and the threads it starts afterwards, never one already running, so [`sandbox`]
 //! refuses to run while a second thread exists. Without Landlock the other two still apply, and the state says so.
 
@@ -113,6 +116,79 @@ pub fn sandbox(
     let state = landlock(agents_dir, control_dir, store_dir, audit_dir, journal_dir)?;
     deny_exec()?;
     Ok(state)
+}
+
+/// What the notifier's helper may read beneath, where each exists: the system's configuration (the resolver's,
+/// `nsswitch.conf`, `hosts`, the CA bundles beneath `/etc`), its libraries (the resolver's NSS modules), the other
+/// places CA certificates are kept, and the directories a resolver's `resolv.conf` is kept in (by systemd-resolved,
+/// NetworkManager, resolvconf or connman). Directories, not files: a `resolv.conf` replaced on a network change is a
+/// new file in the same directory, still readable.
+pub const HELPER_READ_DIRS: &[&str] = &[
+    "/etc",
+    "/usr/lib",
+    "/usr/lib64",
+    "/usr/lib32",
+    "/lib",
+    "/lib64",
+    "/lib32",
+    "/usr/local/lib",
+    "/usr/share/ca-certificates",
+    "/usr/local/share/ca-certificates",
+    "/usr/share/pki",
+    "/run/systemd/resolve",
+    "/run/NetworkManager",
+    "/run/resolvconf",
+    "/run/connman",
+    "/run/nscd",
+];
+
+/// Where the helper may connect to a Unix socket: systemd-resolved's and nscd's, which the system's resolver asks.
+pub const HELPER_CONNECT_DIRS: &[&str] = &["/run/systemd/resolve", "/run/nscd"];
+
+/// Confines the notifier's helper for good: not dumpable, no new privileges, Landlock reading beneath
+/// [`HELPER_READ_DIRS`] (and the directory `/etc/resolv.conf` resolves into, when that is beneath `/run`) and
+/// connecting to Unix sockets beneath [`HELPER_CONNECT_DIRS`], writing nowhere, and seccomp's exec ban. Call it in a
+/// process with one thread, after the TLS roots are loaded.
+pub fn sandbox_helper() -> Result<SandboxState, io::Error> {
+    let mut read: Vec<std::path::PathBuf> = HELPER_READ_DIRS.iter().map(Into::into).collect();
+    if let Some(dir) = std::fs::canonicalize("/etc/resolv.conf")
+        .ok()
+        .and_then(|real| real.parent().map(Path::to_path_buf))
+        .filter(|dir| dir.starts_with("/run") && dir.components().count() > 2)
+    {
+        read.push(dir);
+    }
+    let read: Vec<&Path> = read.iter().map(|p| p.as_path()).collect();
+    let connect: Vec<&Path> = HELPER_CONNECT_DIRS.iter().map(Path::new).collect();
+    sandbox_helper_beneath(&read, &connect)
+}
+
+/// [`sandbox_helper`] with the directories given: a rule for each that exists, none for one that does not.
+pub fn sandbox_helper_beneath(read: &[&Path], connect: &[&Path]) -> Result<SandboxState, io::Error> {
+    let threads = thread_count()?;
+    if threads != 1 {
+        return Err(io::Error::other(format!(
+            "the helper's sandbox must be set up while it has one thread, and {threads} threads run"
+        )));
+    }
+    set_not_dumpable()?;
+    prctl(libc::PR_SET_NO_NEW_PRIVS, 1)?;
+    let fail = |e: landlock::RulesetError| io::Error::other(format!("Landlock: {e}"));
+    let reading: BitFlags<AccessFs> = AccessFs::ReadFile | AccessFs::ReadDir;
+    let connecting: BitFlags<AccessFs> = AccessFs::ResolveUnix.into();
+    let status = Ruleset::default()
+        .handle_access(AccessFs::from_all(LANDLOCK_ABI))
+        .map_err(fail)?
+        .create()
+        .map_err(fail)?
+        .add_rules(path_beneath_rules(existing(read.iter().copied()), reading))
+        .map_err(fail)?
+        .add_rules(path_beneath_rules(existing(connect.iter().copied()), connecting))
+        .map_err(fail)?
+        .restrict_self()
+        .map_err(fail)?;
+    deny_exec()?;
+    Ok(from_ruleset_status(status.ruleset))
 }
 
 fn landlock(

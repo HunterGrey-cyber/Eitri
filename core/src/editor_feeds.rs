@@ -34,6 +34,10 @@ pub struct FeedEvents {
     pub pane: Vec<PaneMessage>,
     /// The context source answers something new: a host whose panel reads it only when woken must wake it.
     pub context: bool,
+    /// A context line came about a buffer the person put in the editor: a file, or one of Eitri's scratch buffers (a
+    /// draft or a row view), which never becomes the context; not a view an agent's proposal opened. The person is
+    /// moving about that nvim, which may be a companion panel's in a terminal the window never sees.
+    pub person_moved: bool,
     /// What the plugin follow socket brought: commands in order, the newest view of each plugin.
     pub follow: FollowBatch,
 }
@@ -106,22 +110,23 @@ impl ContextFeed {
     /// moments after they made it, which is exactly when they move to the panel to ask about it. A report
     /// naming one of Eitri's own scratch buffers (a draft or a view) is dropped too, so the context stays
     /// on the file the user was in before it.
-    /// Whether the cache took a new context.
-    fn poll(&self) -> bool {
+    /// Whether the cache took a new context, and whether the line was about a buffer the person put in the editor
+    /// ([`FeedEvents::person_moved`]).
+    fn poll(&self) -> (bool, bool) {
         let Some(update) = self.reader.borrow_mut().poll_update() else {
-            return false;
+            return (false, false);
         };
         let file = &update.context.file;
-        let scratch = self
-            .scratch_dir
-            .as_deref()
-            .is_some_and(|dir| crate::scratch::holds(dir, file))
-            || file.starts_with(IDE_FILE_SCHEME)
-            || file.starts_with(IDE_PROPOSAL_SCHEME);
+        let view = file.starts_with(IDE_FILE_SCHEME) || file.starts_with(IDE_PROPOSAL_SCHEME);
+        let scratch = view
+            || self
+                .scratch_dir
+                .as_deref()
+                .is_some_and(|dir| crate::scratch::holds(dir, file));
         if !scratch {
             *self.cache.borrow_mut() = Some(update);
         }
-        !scratch
+        (!scratch, !view)
     }
 }
 
@@ -257,7 +262,7 @@ impl EditorFeeds {
             events.keys = reader.poll();
         }
         if let Some(feed) = self.context.as_mut().and_then(|feed| feed.due(now)) {
-            events.context = feed.poll();
+            (events.context, events.person_moved) = feed.poll();
         }
         if let Some(reader) = self.pane.as_mut().and_then(|feed| feed.due(now)) {
             events.pane = reader.poll();
@@ -404,6 +409,33 @@ mod tests {
             assert!(!feeds.poll(now + every * (i as u32 + 2)).context);
             assert_eq!(file(&source), Some("/p/a.rs".into()));
         }
+    }
+
+    #[test]
+    fn a_draft_counts_as_the_person_moving_and_a_proposal_view_does_not() {
+        use crate::editor_context::compose::{IDE_FILE_SCHEME, IDE_PROPOSAL_SCHEME};
+        let (mut feeds, feed, _source, _reset, now) = context_feeds(Some(PathBuf::from("/s")));
+        let every = crate::editor_context::feed::POLL_INTERVAL;
+        let mut at = now;
+        let mut read = |line: Option<String>| {
+            if let Some(line) = line {
+                send(feed.socket_path(), &line);
+            }
+            at += every;
+            let events = feeds.poll(at);
+            (events.context, events.person_moved)
+        };
+        assert_eq!(read(Some(context_line("/p/a.rs"))), (true, true), "a file");
+        assert_eq!(read(Some(context_line("/s/1-draft.md"))), (false, true), "a draft");
+        for scheme in [IDE_FILE_SCHEME, IDE_PROPOSAL_SCHEME] {
+            assert_eq!(
+                read(Some(context_line(&format!("{scheme}1/a.rs")))),
+                (false, false),
+                "{scheme}"
+            );
+        }
+        assert_eq!(read(None), (false, false), "no line");
+        feed.cleanup();
     }
 
     #[test]

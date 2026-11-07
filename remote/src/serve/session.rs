@@ -39,6 +39,11 @@
 //! Refusals made before a device is proved (before `hello`, and of the `hello` itself) are bounded: anyone who can
 //! reach a listener can cause one, so past a burst each is counted on the next recorded one (`dropped`). When `serve`
 //! ends (`disable`), every connection still open gets its `conn_close` (`serve_ended`) first.
+//!
+//! **What the notifier reads here.** `set_finished_keys` is kept by the hub, per device, with no reply: the tabs whose
+//! finished turns wake that phone (its bells), replaced by each new one, kept past its connection and sent again by
+//! the phone at each connect. [`Hub::push_targets`] pairs them with the store's push endpoints, and
+//! [`Hub::connected_devices`] names the devices connected now, which are not woken.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::io::{self, Read, Write};
@@ -554,6 +559,9 @@ pub struct Hub {
     reporter: Reporter,
     reader: Mutex<Option<Reader>>,
     audit: Arc<Audit>,
+    /// The tabs whose finished turns wake each device, as it last said (`set_finished_keys`); kept while `serve`
+    /// runs, past the device's connection, since the wakes are for when it is not connected.
+    finished_keys: Mutex<BTreeMap<DeviceId, BTreeSet<String>>>,
 }
 
 impl Hub {
@@ -585,6 +593,7 @@ impl Hub {
             reporter: Reporter::start(control_dir)?,
             reader: Mutex::new(None),
             audit,
+            finished_keys: Mutex::new(BTreeMap::new()),
         });
         let weak = Arc::downgrade(&hub);
         let reader = Reader::start(control_dir, SCHEMA_V, move |event| match event {
@@ -624,6 +633,41 @@ impl Hub {
     /// `serve`'s audit log.
     pub fn audit(&self) -> &Arc<Audit> {
         &self.audit
+    }
+
+    /// Keeps `keys` as the tabs whose finished turns wake `device`, in place of what it said before.
+    pub fn set_finished_keys(&self, device: &str, keys: Vec<String>) {
+        lock(&self.finished_keys).insert(device.to_owned(), keys.into_iter().collect());
+    }
+
+    /// The devices of the store with a push endpoint, each with the finished keys it set: whom a wake can reach.
+    pub fn push_targets(&self) -> Vec<crate::notify::Target> {
+        let store = self.store.devices();
+        let keys = lock(&self.finished_keys);
+        store
+            .devices()
+            .iter()
+            .filter_map(|device| {
+                Some(crate::notify::Target {
+                    device_id: device.id.clone(),
+                    endpoint: device.push_endpoint.clone()?,
+                    finished_keys: keys.get(&device.id).cloned().unwrap_or_default(),
+                })
+            })
+            .collect()
+    }
+
+    /// The devices with a connection whose `hello` was accepted, open now.
+    pub fn connected_devices(&self) -> BTreeSet<DeviceId> {
+        lock(&self.links)
+            .values()
+            .filter_map(|link| link.device.as_ref().map(|(device, _, _)| device.clone()))
+            .collect()
+    }
+
+    /// The store's name for `device` now.
+    pub fn device_name(&self, device: &str) -> Option<String> {
+        self.store.name_of(device)
     }
 
     /// Closes the connection of every device the store no longer holds with its token, or whose grant fell.
@@ -1447,6 +1491,7 @@ impl Control {
                     }
                 }
             }
+            PhoneInbound::SetFinishedKeys { keys } => self.hub.set_finished_keys(&device, keys),
             PhoneInbound::AuditMine { limit } => match self.hub.audit.mine(&device, limit) {
                 Some(line) => self.local(line),
                 None => self.local(refused_line(None, "audit_mine: too often; ask again in a second")),

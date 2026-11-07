@@ -213,6 +213,7 @@ mod tests {
             port: 41000,
             origins: vec!["desk.tail1.ts.net".to_owned()],
             audit_keep_days: eitri_core::remote_audit::AUDIT_KEEP_DAYS_DEFAULT,
+            notify: true,
         }
     }
 

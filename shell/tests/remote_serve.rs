@@ -80,6 +80,25 @@ fn main() {
             "a_stop_closes_the_open_connections_in_the_log",
             a_stop_closes_the_open_connections_in_the_log,
         ),
+        ("helper_holds_only_its_socket", helper_holds_only_its_socket),
+        ("helper_exits_when_serve_goes", helper_exits_when_serve_goes),
+        (
+            "helper_cannot_read_the_store_or_exec",
+            helper_cannot_read_the_store_or_exec,
+        ),
+        (
+            "helper_resolves_and_loads_roots_under_its_sandbox",
+            helper_resolves_and_loads_roots_under_its_sandbox,
+        ),
+        (
+            "missing_etc_files_do_not_fail_the_helper_sandbox",
+            missing_etc_files_do_not_fail_the_helper_sandbox,
+        ),
+        (
+            "needs_you_reaches_the_endpoint_end_to_end",
+            needs_you_reaches_the_endpoint_end_to_end,
+        ),
+        ("no_notify_forks_no_helper", no_notify_forks_no_helper),
     ];
     // `cargo test --test remote_serve -- <part of a name>` runs the checks whose names hold it.
     let filter = std::env::args().skip(1).find(|arg| !arg.starts_with('-'));
@@ -452,7 +471,14 @@ fn start_serve(shell: &str, home: &Home) -> Result<(Running, Run), String> {
 
 /// [`start_serve`] with more variables in `serve`'s environment.
 fn start_serve_with(shell: &str, home: &Home, env: &[(&str, &str)]) -> Result<(Running, Run), String> {
-    let serve = shell_remote(shell, home, &["serve", "--listen", "socket"])
+    start_serve_args(shell, home, &[], env)
+}
+
+/// [`start_serve_with`] with more arguments after `--listen socket`.
+fn start_serve_args(shell: &str, home: &Home, args: &[&str], env: &[(&str, &str)]) -> Result<(Running, Run), String> {
+    let mut words = vec!["serve", "--listen", "socket"];
+    words.extend_from_slice(args);
+    let serve = shell_remote(shell, home, &words)
         .envs(env.iter().copied())
         .stdout(Stdio::null())
         .stderr(Stdio::inherit())
@@ -851,6 +877,214 @@ fn a_stop_closes_the_open_connections_in_the_log(shell: &str, dir: &Path) -> Res
 }
 
 /// What a child of this test does, by its role. Each prints one line per thing it saw.
+// ---------------------------------------------------------------------------------------------------------------
+// The notifier's helper, in children of this test, and the wakes of a `serve` end to end.
+
+/// The lines of `run`'s stdout, or why the child failed.
+fn lines_of(run: &Run) -> Vec<&str> {
+    run.stdout.lines().collect()
+}
+
+fn wants(run: &Run, lines: &[&str]) -> Result<(), String> {
+    for line in lines {
+        if !run.stdout.lines().any(|l| l == *line) {
+            return Err(format!("no line {line:?}; {}", run.says()));
+        }
+    }
+    if run.code != Some(0) {
+        return Err(run.says());
+    }
+    Ok(())
+}
+
+fn helper_holds_only_its_socket(_shell: &str, dir: &Path) -> Result<(), String> {
+    let home = Home::new(dir);
+    let run = run(home.child("helper-fds"))?;
+    let fds = lines_of(&run)
+        .into_iter()
+        .find_map(|l| l.strip_prefix("helper fds "))
+        .ok_or_else(|| run.says())?;
+    let fds: Vec<i32> = fds.split(',').filter_map(|fd| fd.parse().ok()).collect();
+    if fds.len() != 4 || fds[..3] != [0, 1, 2] || fds[3] < 3 {
+        return Err(format!("the helper held {fds:?}; {}", run.says()));
+    }
+    let sandbox = if kernel_landlock_abi() >= 9 { "full" } else { "partial" };
+    wants(&run, &[&format!("helper sandbox {sandbox}")])
+}
+
+fn helper_exits_when_serve_goes(_shell: &str, dir: &Path) -> Result<(), String> {
+    let home = Home::new(dir);
+    let run = run(home.child("helper-exit"))?;
+    wants(&run, &["helper exited 0"])
+}
+
+fn helper_cannot_read_the_store_or_exec(_shell: &str, dir: &Path) -> Result<(), String> {
+    let home = Home::new(dir);
+    home.make_dirs();
+    std::fs::write(home.store().join("devices.json"), b"{}").unwrap();
+    let run = run(home.child("helper-sandbox"))?;
+    let mut lines = vec!["state ok", "exec refused", "dumpable false"];
+    if landlock_in_kernel() {
+        lines.extend(["store-read refused", "home-write refused"]);
+    }
+    wants(&run, &lines)?;
+    if landlock_in_kernel() && home.home().join("by-the-helper").exists() {
+        return Err("the helper wrote under $HOME".to_owned());
+    }
+    Ok(())
+}
+
+fn helper_resolves_and_loads_roots_under_its_sandbox(_shell: &str, dir: &Path) -> Result<(), String> {
+    let home = Home::new(dir);
+    let run = run(home.child("helper-resolve"))?;
+    let sandbox = if kernel_landlock_abi() >= 9 { "full" } else { "partial" };
+    wants(
+        &run,
+        &[
+            &format!("state ok {sandbox}"),
+            "roots loaded",
+            "own ok",
+            "resolve ok",
+            "post refused",
+        ],
+    )
+}
+
+fn missing_etc_files_do_not_fail_the_helper_sandbox(_shell: &str, dir: &Path) -> Result<(), String> {
+    let home = Home::new(dir);
+    let run = run(home.child("helper-missing"))?;
+    let sandbox = if kernel_landlock_abi() >= 9 { "full" } else { "partial" };
+    wants(&run, &[&format!("state ok {sandbox}"), "etc-read ok"])
+}
+
+/// The processes whose parent is `pid`, from `/proc`.
+fn children_of(pid: u32) -> Vec<u32> {
+    let Ok(entries) = std::fs::read_dir("/proc") else {
+        return Vec::new();
+    };
+    entries
+        .filter_map(Result::ok)
+        .filter_map(|entry| {
+            let child: u32 = entry.file_name().to_str()?.parse().ok()?;
+            let stat = std::fs::read_to_string(entry.path().join("stat")).ok()?;
+            // `pid (comm) state ppid ...`, where the name may hold spaces and parentheses.
+            let after = &stat[stat.rfind(')')? + 1..];
+            let ppid: u32 = after.split_whitespace().nth(1)?.parse().ok()?;
+            (ppid == pid).then_some(child)
+        })
+        .collect()
+}
+
+/// A loopback HTTP server that answers every request 200 and hands each request's bytes over.
+fn push_server() -> (std::net::SocketAddr, mpsc::Receiver<Vec<u8>>) {
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("a loopback port");
+    let addr = listener.local_addr().unwrap();
+    let (tx, rx) = mpsc::channel();
+    std::thread::spawn(move || {
+        for stream in listener.incoming() {
+            let Ok(mut stream) = stream else { return };
+            let tx = tx.clone();
+            std::thread::spawn(move || {
+                let _ = stream.set_read_timeout(Some(HANG));
+                let mut seen = Vec::new();
+                let mut buf = [0u8; 1024];
+                while let Ok(n) = stream.read(&mut buf) {
+                    if n == 0 {
+                        break;
+                    }
+                    seen.extend_from_slice(&buf[..n]);
+                    if seen.ends_with(eitri_remote::notify::post::WAKE_BODY) {
+                        break;
+                    }
+                }
+                let _ = stream.write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n");
+                let _ = tx.send(seen);
+            });
+        }
+    });
+    (addr, rx)
+}
+
+fn needs_you_reaches_the_endpoint_end_to_end(shell: &str, dir: &Path) -> Result<(), String> {
+    let home = Home::new(dir);
+    home.make_dirs();
+    let (addr, posts) = push_server();
+    let endpoint = format!("http://127.0.0.1:{}/up/e2e", addr.port());
+    let store = serde_json::json!({
+        "v": 1,
+        "devices": [{
+            "id": "d1", "name": "phone", "token_sha256": eitri_core::remote_devices::token_hash_hex("tok"),
+            "grant": "watch",
+        }],
+    });
+    let store_path = home.store().join("devices.json");
+    agent::private_fs::write_private(&store_path, store.to_string().as_bytes())
+        .map_err(|e| format!("the store: {e}"))?;
+    eitri_core::remote_devices::update(&store_path, |store| {
+        store.get_mut("d1").unwrap().push_endpoint = Some(endpoint.clone());
+    })
+    .map_err(|e| format!("the store's endpoint: {e}"))?;
+    // A window's row, quiet, before `serve` reads the rows: the notifier's baseline.
+    let mut publisher = home.child("publisher-needs");
+    publisher.stdin(Stdio::piped()).stderr(Stdio::inherit());
+    let mut publisher = Running(publisher.spawn().map_err(|e| format!("the publisher: {e}"))?);
+    let mut said = BufReader::new(publisher.0.stdout.take().unwrap());
+    let mut line = String::new();
+    said.read_line(&mut line).map_err(|e| e.to_string())?;
+    if !line.starts_with("ready ") {
+        return Err(format!("the publisher said {line:?}"));
+    }
+    let allow = addr.to_string();
+    let (serve, _) = start_serve_with(shell, &home, &[("EITRI_REMOTE_TEST_POST_ALLOW", allow.as_str())])?;
+    let helpers = children_of(serve.0.id());
+    if helpers.len() != 1 {
+        return Err(format!("serve has {} children, not its one helper", helpers.len()));
+    }
+    // The row needs the person now; nobody is at the desk and no phone is connected.
+    writeln!(publisher.0.stdin.as_mut().unwrap()).map_err(|e| e.to_string())?;
+    let request = posts
+        .recv_timeout(HANG)
+        .map_err(|_| "no wake reached the endpoint".to_owned())?;
+    let text = String::from_utf8_lossy(&request);
+    if !text.starts_with("POST /up/e2e HTTP/1.1\r\n") || !request.ends_with(eitri_remote::notify::post::WAKE_BODY) {
+        return Err(format!("the endpoint got {text:?}"));
+    }
+    wait_for_record(&home, "the push", |r| r["event"] == "push")?;
+    if let Ok(more) = posts.recv_timeout(Duration::from_millis(1500)) {
+        return Err(format!("a second wake: {}", String::from_utf8_lossy(&more)));
+    }
+    let records = audit_records(&home);
+    let pushes: Vec<&serde_json::Value> = records.iter().filter(|r| r["event"] == "push").collect();
+    if pushes.len() != 1
+        || pushes[0]["device"] != "d1"
+        || pushes[0]["wake"] != "needs_you"
+        || pushes[0]["host"] != "127.0.0.1"
+        || pushes[0]["status"] != "200"
+        || pushes[0].to_string().contains("/up/e2e")
+    {
+        return Err(format!("the log: {records:?}"));
+    }
+    let _ = run(shell_remote(shell, &home, &["stop"]));
+    drop(serve);
+    Ok(())
+}
+
+fn no_notify_forks_no_helper(shell: &str, dir: &Path) -> Result<(), String> {
+    let home = Home::new(dir);
+    let (serve, _) = start_serve_args(shell, &home, &["--no-notify"], &[])?;
+    let children = children_of(serve.0.id());
+    let status = run(shell_remote(shell, &home, &["status"]))?;
+    let _ = run(shell_remote(shell, &home, &["stop"]));
+    drop(serve);
+    if !children.is_empty() {
+        return Err(format!("serve --no-notify has children {children:?}"));
+    }
+    if !status.stdout.lines().any(|l| l == "notify: off") {
+        return Err(format!("status does not say wakes are off: {}", status.says()));
+    }
+    Ok(())
+}
+
 mod child {
     use std::io::Write;
     use std::os::unix::ffi::OsStringExt;
@@ -873,6 +1107,12 @@ mod child {
             "sandbox-audit" => sandbox_audit(),
             "sandbox-journal" => sandbox_journal(),
             "sandbox-no-journal" => sandbox_no_journal(),
+            "helper-fds" => helper_fds(),
+            "helper-exit" => helper_exit(),
+            "helper-sandbox" => helper_sandbox(),
+            "helper-resolve" => helper_resolve(),
+            "helper-missing" => helper_missing(),
+            "publisher-needs" => publisher_needs(),
             other => {
                 eprintln!("unknown role {other:?}");
                 2
@@ -1134,5 +1374,168 @@ mod child {
         }
         let _ = std::io::stdout().flush();
         0
+    }
+
+    fn helper_fds() -> i32 {
+        // Descriptors a `serve` would hold by then, none of which the helper may keep.
+        let _file = std::fs::File::open("/proc/self/status").unwrap();
+        let _listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let _socket = std::os::unix::net::UnixDatagram::unbound().unwrap();
+        let helper = match eitri_remote::notify::helper::Helper::spawn() {
+            Ok(helper) => helper,
+            Err(e) => {
+                println!("spawn failed: {e}");
+                return 1;
+            }
+        };
+        let fds: Vec<String> = helper.ready().fds.iter().map(|fd| fd.to_string()).collect();
+        println!("helper fds {}", fds.join(","));
+        println!("helper sandbox {}", helper.ready().sandbox);
+        0
+    }
+
+    fn helper_exit() -> i32 {
+        let helper = match eitri_remote::notify::helper::Helper::spawn() {
+            Ok(helper) => helper,
+            Err(e) => {
+                println!("spawn failed: {e}");
+                return 1;
+            }
+        };
+        let pid = helper.pid();
+        // As when `serve` goes: its end of the pair closes.
+        drop(helper);
+        let deadline = std::time::Instant::now() + Duration::from_secs(30);
+        loop {
+            let mut status = 0;
+            // SAFETY: `status` is a local the call writes; `pid` is this process's own child.
+            let reaped = unsafe { libc::waitpid(pid, &mut status, libc::WNOHANG) };
+            if reaped == pid {
+                println!("helper exited {}", libc::WEXITSTATUS(status));
+                return 0;
+            }
+            if std::time::Instant::now() > deadline {
+                println!("helper still running");
+                // SAFETY: `kill` takes no pointers; the pid is this process's own child.
+                unsafe { libc::kill(pid, libc::SIGKILL) };
+                return 1;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+    }
+
+    fn helper_sandbox() -> i32 {
+        let (store, home) = (dir("RS_STORE"), dir("RS_HOME"));
+        eitri_remote::notify::post::load_roots();
+        let state = match eitri_remote::serve::sandbox::sandbox_helper() {
+            Ok(state) => state,
+            Err(e) => {
+                println!("state failed: {e}");
+                return 1;
+            }
+        };
+        println!("state ok");
+        println!("sandbox {}", state.word());
+        println!("store-read {}", outcome(std::fs::read(store.join("devices.json"))));
+        println!(
+            "home-write {}",
+            outcome(std::fs::write(home.join("by-the-helper"), b"x"))
+        );
+        println!("exec {}", outcome(std::process::Command::new("/bin/true").status()));
+        println!("dumpable {}", is_dumpable().unwrap_or(true));
+        0
+    }
+
+    fn helper_resolve() -> i32 {
+        use eitri_remote::notify::post::{load_roots, own_addresses, post_wake, system_resolve, PostError};
+        let roots = load_roots();
+        let state = match eitri_remote::serve::sandbox::sandbox_helper() {
+            Ok(state) => state,
+            Err(e) => {
+                println!("state failed: {e}");
+                return 1;
+            }
+        };
+        println!("state ok {}", state.word());
+        println!("roots {}", if roots > 0 { "loaded" } else { "none" });
+        match own_addresses() {
+            Ok(_) => println!("own ok"),
+            Err(e) => println!("own failed: {e}"),
+        }
+        match system_resolve("localhost", 9, Duration::from_secs(10)) {
+            Ok(addrs) if !addrs.is_empty() => println!("resolve ok"),
+            Ok(_) => println!("resolve empty"),
+            Err(e) => println!("resolve failed: {e}"),
+        }
+        match post_wake("http://localhost:9/up", &system_resolve, &own_addresses) {
+            Err(PostError::Refused(_)) => println!("post refused"),
+            other => println!("post {other:?}"),
+        }
+        0
+    }
+
+    fn helper_missing() -> i32 {
+        let home = dir("RS_HOME");
+        let missing = home.join("no-such-dir");
+        let read = [
+            std::path::Path::new("/etc"),
+            missing.as_path(),
+            std::path::Path::new("/nonexistent-eitri/lib"),
+        ];
+        let connect = [std::path::Path::new("/nonexistent-eitri/run")];
+        match eitri_remote::serve::sandbox::sandbox_helper_beneath(&read, &connect) {
+            Ok(state) => println!("state ok {}", state.word()),
+            Err(e) => {
+                println!("state failed: {e}");
+                return 1;
+            }
+        }
+        println!("etc-read {}", outcome(std::fs::read_dir("/etc").map(|d| d.count())));
+        0
+    }
+
+    fn publisher_needs() -> i32 {
+        use eitri_core::agents::{new_instance, Class, ProjectRef, Publisher, Row, WindowRef};
+        use std::io::BufRead;
+        let control = dir("RS_CONTROL");
+        let instance = new_instance();
+        let project = ProjectRef {
+            key: "9b2c4e7a10f3d856".into(),
+            name: "project".into(),
+        };
+        let window = WindowRef {
+            instance: instance.clone(),
+            name: "1".into(),
+            focused: true,
+        };
+        let publisher = match Publisher::start(&control, &instance, project.clone(), window.clone()) {
+            Ok(publisher) => publisher,
+            Err(e) => {
+                eprintln!("publisher: {e}");
+                return 1;
+            }
+        };
+        let row = |state: &str, class: Class| Row {
+            id: format!("{instance}.1"),
+            key: "k-00000000000000e1".into(),
+            agent: "claude".into(),
+            project: project.clone(),
+            window: window.clone(),
+            number: 1,
+            state: state.into(),
+            class,
+            ..Row::default()
+        };
+        publisher.offer_now(vec![row("idle", Class::Quiet)]);
+        println!("ready {instance}");
+        let _ = std::io::stdout().flush();
+        let mut line = String::new();
+        let _ = std::io::stdin().lock().read_line(&mut line);
+        publisher.offer_now(vec![row("card", Class::Needs)]);
+        println!("needs");
+        let _ = std::io::stdout().flush();
+        loop {
+            std::thread::park();
+        }
     }
 }

@@ -353,6 +353,7 @@ mod tests {
             port,
             origins: Vec::new(),
             audit_keep_days: eitri_core::remote_audit::AUDIT_KEEP_DAYS_DEFAULT,
+            notify: true,
         };
         let dir = scratch("unconfirmed");
         for confirmed in [None, Some("192.0.2.1"), Some("not an address")] {
@@ -378,6 +379,7 @@ mod tests {
             port: 41000,
             origins: Vec::new(),
             audit_keep_days: eitri_core::remote_audit::AUDIT_KEEP_DAYS_DEFAULT,
+            notify: true,
         };
         let first = bind(&cfg, &dir, None).unwrap();
         let (_, path) = first.unix.as_ref().unwrap();

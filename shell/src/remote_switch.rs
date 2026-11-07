@@ -14,6 +14,10 @@
 //! `STOP_NOTE_REACH` before the first look (`serve::stopped_since`), including a stop still waiting for the lock to go:
 //! an explicit stop is not the idle exit it is there for.
 //!
+//! With remote control on, the window also tells `serve` when its person is at the desk
+//! ([`crate::remote_presence`]); `remote.notify = false` starts `serve` with `--no-notify`, through the configuration's
+//! arguments, so it wakes no phone.
+//!
 //! What keeps a window that asked for remote control from having it is said on the window's toast as well as on
 //! stderr, since a window started from the desktop has no terminal: the agents layer off, a socket or directory that
 //! could not be made, a `serve` already running with other keys, the desk's no to an address, and a `serve` that could
@@ -33,6 +37,7 @@ use eitri_panel::agent_panel::{Pairing, RemoteSocket};
 use eitri_remote::serve::spawn::{plan, running_config, ServeEnded, ServeSpawner};
 use eitri_remote::serve::{stopped_since, Dirs, STOP_NOTE_REACH};
 use gtk4::glib;
+use gtk4::prelude::*;
 
 use crate::agent_panel::AgentPanelHandle;
 
@@ -74,6 +79,7 @@ fn say(notes: &Notes, text: String) {
 /// with the agents layer off), when `config` says so. What keeps it off, or keeps phones from reaching the desk, goes
 /// to `notice` on the GTK thread.
 pub(crate) fn start(
+    window: &gtk4::ApplicationWindow,
     panel: &AgentPanelHandle,
     instance: Option<&str>,
     config: &ConfigStore,
@@ -109,6 +115,9 @@ pub(crate) fn start(
             return;
         }
     };
+    // While remote control is on, `serve` is told when the person is at the desk, so it holds a phone's needs-you wake.
+    let presence = std::cell::RefCell::new(Some(crate::remote_presence::attach(window, &dirs.control, instance)));
+    window.connect_destroy(move |_| drop(presence.borrow_mut().take()));
     let wake = panel.remote_waker();
     let (socket_tx, socket_rx) = futures_channel::oneshot::channel::<RemoteSocket>();
     let instance = instance.to_owned();
@@ -627,6 +636,7 @@ mod tests {
             port: Some(7500),
             origins: vec!["desk.example".into()],
             audit_keep_days: 90,
+            notify: true,
         };
         let started = Started(std::cell::RefCell::new(Vec::new()));
         let (tx, mut rx) = futures_channel::oneshot::channel();
@@ -692,6 +702,7 @@ mod tests {
                 port: None,
                 origins: vec![],
                 audit_keep_days: 90,
+                notify: true,
             };
             let started = Started(std::cell::RefCell::new(Vec::new()));
             let (tx, mut rx) = futures_channel::oneshot::channel();
@@ -809,6 +820,7 @@ mod tests {
             port: None,
             origins: Vec::new(),
             audit_keep_days: 90,
+            notify: true,
         };
         let (notes, mut noted) = futures_channel::mpsc::unbounded::<String>();
         let paired = paired_with_running(&dirs, &own(eitri_core::lua::config::RemoteListen::Loopback), &notes);
@@ -898,6 +910,7 @@ mod tests {
             port: None,
             origins: Vec::new(),
             audit_keep_days: 90,
+            notify: true,
         };
         let (notes, mut noted) = futures_channel::mpsc::unbounded::<String>();
         let paired = paired_with_running(&dirs, &own, &notes);

@@ -96,6 +96,7 @@ mod tests {
             port: 41000,
             origins: origins.iter().map(|o| (*o).to_owned()).collect(),
             audit_keep_days: eitri_core::remote_audit::AUDIT_KEEP_DAYS_DEFAULT,
+            notify: true,
         }
     }
 

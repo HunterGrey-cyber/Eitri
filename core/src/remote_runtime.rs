@@ -35,6 +35,8 @@ pub struct ServeConfig {
     pub origins: Vec<String>,
     /// `remote.audit.keep_days`.
     pub audit_keep_days: u32,
+    /// `remote.notify`: `false` starts `serve` with `--no-notify`.
+    pub notify: bool,
 }
 
 impl ServeConfig {
@@ -44,6 +46,7 @@ impl ServeConfig {
             port: settings.port,
             origins: settings.origins.clone(),
             audit_keep_days: settings.audit_keep_days,
+            notify: settings.notify,
         }
     }
 
@@ -64,6 +67,10 @@ impl ServeConfig {
         // The default is `serve`'s own, so a window on the default starts the same `serve` a build before the key did.
         if self.audit_keep_days != crate::remote_audit::AUDIT_KEEP_DAYS_DEFAULT {
             args.extend(["--audit-keep-days".to_owned(), self.audit_keep_days.to_string()]);
+        }
+        // Left out when on, as `serve`'s own default is, so a window on the default starts what an older one did.
+        if !self.notify {
+            args.push("--no-notify".to_owned());
         }
         args
     }
@@ -106,6 +113,14 @@ impl ServeConfig {
             out.push(format!(
                 "remote.audit.keep_days: running {}, this window {}",
                 self.audit_keep_days, own.audit_keep_days
+            ));
+        }
+        if self.notify != own.notify {
+            let word = |on: bool| if on { "true" } else { "false" };
+            out.push(format!(
+                "remote.notify: running {}, this window {}",
+                word(self.notify),
+                word(own.notify)
             ));
         }
         out
@@ -333,6 +348,7 @@ mod tests {
             port: None,
             origins: Vec::new(),
             audit_keep_days: 90,
+            notify: true,
         }
     }
 
@@ -455,6 +471,7 @@ mod tests {
             port: Some(7400),
             origins: vec!["desk.tail1.ts.net".to_owned(), "https://phone.example.org".to_owned()],
             audit_keep_days: 30,
+            notify: true,
         };
         assert_eq!(
             cfg.args(),
@@ -480,6 +497,7 @@ mod tests {
             port: Some(41000),
             origins: Vec::new(),
             audit_keep_days: 90,
+            notify: true,
         };
         let mut own = running.clone();
         assert!(running.differences(&own).is_empty());
@@ -495,9 +513,26 @@ mod tests {
         );
         let settings = RemoteSettings {
             audit_keep_days: 7,
+            notify: true,
             ..settings(true, RemoteListen::Loopback)
         };
         assert_eq!(ServeConfig::from_settings(&settings).audit_keep_days, 7);
+    }
+
+    #[test]
+    fn differences_names_notify() {
+        let running = ServeConfig::from_settings(&settings(true, RemoteListen::Loopback));
+        assert!(running.notify);
+        assert!(!running.args().iter().any(|a| a == "--no-notify"));
+        let own = ServeConfig::from_settings(&RemoteSettings {
+            notify: false,
+            ..settings(true, RemoteListen::Loopback)
+        });
+        assert_eq!(own.args().last().map(String::as_str), Some("--no-notify"));
+        assert_eq!(
+            running.differences(&own),
+            ["remote.notify: running true, this window false"]
+        );
     }
 
     #[test]
@@ -507,12 +542,14 @@ mod tests {
             port: Some(41000),
             origins: vec!["desk.tail1.ts.net".to_owned(), "b.example".to_owned()],
             audit_keep_days: 90,
+            notify: true,
         };
         let mut own = ServeConfig {
             listen: RemoteListen::Loopback,
             port: None,
             origins: vec!["B.example".to_owned(), "desk.tail1.ts.net".to_owned()],
             audit_keep_days: 90,
+            notify: true,
         };
         assert!(
             running.differences(&own).is_empty(),
@@ -525,6 +562,7 @@ mod tests {
             port: Some(7341),
             origins: Vec::new(),
             audit_keep_days: 90,
+            notify: true,
         };
         assert_eq!(
             running.differences(&own),
@@ -543,6 +581,7 @@ mod tests {
             port: None,
             origins: origins.iter().map(|o| (*o).to_owned()).collect(),
             audit_keep_days: 90,
+            notify: true,
         };
         let r = pairing_routes(&cfg, 41000, Path::new("/run/user/1000/eitri")).unwrap();
         (r.ssh.map(route), r.direct.map(route))

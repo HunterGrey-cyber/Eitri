@@ -107,6 +107,11 @@ impl StoreView {
         }
     }
 
+    /// The store as it reads now.
+    pub fn devices(&self) -> Arc<DeviceStore> {
+        self.current()
+    }
+
     /// The store's name for `device` now.
     pub fn name_of(&self, device: &str) -> Option<String> {
         self.current().get(device).map(|d| d.name.clone())

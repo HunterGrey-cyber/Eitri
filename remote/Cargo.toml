@@ -5,7 +5,8 @@ edition.workspace = true
 publish.workspace = true
 
 [features]
-# Test-only overrides (the journal socket, `serve`'s idle deadline): enabled only by `shell`'s dev-dependencies, so no
+# Test-only overrides (the journal socket, `serve`'s idle deadline, the one push address the address checks let
+# through): enabled only by `shell`'s dev-dependencies, so no
 # `cargo build` of the product has them (`remote_test_hooks_only_in_dev_dependencies` scans every manifest).
 remote-test-hooks = ["eitri-core/remote-test-hooks"]
 
@@ -20,3 +21,7 @@ libc = "0.2"
 # maintainers; no build script; its dependencies (`enumflags2`, `libc`, `thiserror` 2) were already in the lock.
 [target.'cfg(target_os = "linux")'.dependencies]
 landlock = "0.4.7"
+# The notifier's one outbound path (`src/notify/post.rs`): TLS for a phone's push endpoint. rustls with ring and none of
+# its default features (no aws-lc build), and the system's trust roots, read before the helper confines itself.
+rustls = { version = "0.23.46", default-features = false, features = ["ring", "std", "tls12"] }
+rustls-native-certs = "0.8.5"

@@ -95,6 +95,7 @@ fn checks<'a>(agents: &'a [&'a str]) -> Vec<(&'static str, Check<'a>)> {
             cfg::REMOTE_AUDIT_KEEP_DAYS_KEY,
             check(cfg::parse_remote_audit_keep_days),
         ),
+        (cfg::REMOTE_NOTIFY_KEY, check(cfg::parse_remote_notify)),
     ];
     for key in KIT_KEYS {
         all.push((
@@ -359,6 +360,7 @@ mod tests {
             ("remote.port", "0"),
             ("remote.origins", "'*'"),
             ("remote.audit.keep_days", "0"),
+            ("remote.notify", "'maybe'"),
             ("remote.listen", "{}"),
             ("remote.port", "{}"),
             ("remote.origins", "{}"),

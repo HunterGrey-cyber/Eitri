@@ -696,6 +696,7 @@ pub(crate) fn build(app: &Application, start: &Start) -> Rc<CompanionWindow> {
     crate::remote_switch::startup_notices(&lua.startup_problems(), &*crate::remote_switch::toast_notice(&toast));
     #[cfg(target_os = "linux")]
     crate::remote_switch::start(
+        &window,
         &agent,
         agents.as_ref().map(|host| host.instance()),
         &lua.config.borrow(),

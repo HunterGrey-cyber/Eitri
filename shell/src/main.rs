@@ -49,6 +49,8 @@ mod project_reader;
 mod project_stamp;
 mod project_start;
 #[cfg(target_os = "linux")]
+mod remote_presence;
+#[cfg(target_os = "linux")]
 mod remote_switch;
 mod root_conflicts;
 mod sidecar_probe;
@@ -4946,6 +4948,7 @@ fn build_ui(
     #[cfg(target_os = "linux")]
     if shows_a_chat && !hub {
         remote_switch::start(
+            &window,
             &agent_panel_handle,
             window_agents_host.as_ref().map(|host| host.instance()),
             &lua_engine.config.borrow(),

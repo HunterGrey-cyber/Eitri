@@ -27,6 +27,12 @@
 //! fails after `enable`. It records the refusals it makes before any `hello` (`host`, `origin`, `path_prefix`,
 //! `peer_outside_interface`, with the listener and peer and no device) and, through its sessions, the rest.
 //!
+//! **Its wakes.** Unless it was started with `--no-notify` (`remote.notify = false`), the first thing `serve` does is
+//! fork the notifier's helper ([`crate::notify::helper`]), while it has one thread and before it takes the lock or
+//! opens its record, listeners, control socket or audit log, none of which the helper then holds. After the hub
+//! starts, [`notifier`] sends it each wake the rules make due. A helper that could not start is said on stderr and
+//! `serve` runs on without wakes.
+//!
 //! **Another build.** The record names its build; a reader from another build (an Eitri window or `eitri remote
 //! status` after a package upgrade) sees [`Recorded::OtherBuild`] and says to restart the windows, rather than taking
 //! the record for one still being written.
@@ -37,6 +43,8 @@ pub mod config;
 pub mod control;
 #[cfg(target_os = "linux")]
 pub mod listen;
+#[cfg(target_os = "linux")]
+pub mod notifier;
 #[cfg(target_os = "linux")]
 pub mod origin;
 #[cfg(target_os = "linux")]
@@ -235,6 +243,18 @@ mod linux {
         idle: Duration,
     ) -> Result<Never, (i32, String)> {
         let failed = |e: String| (EXIT_FAILED, e);
+        // First, while this process has one thread and holds nothing it opens below.
+        let helper = if super::config::wants_notify(args) {
+            match crate::notify::helper::Helper::spawn() {
+                Ok(helper) => Some(helper),
+                Err(e) => {
+                    eprintln!("[remote] serving with no wakes: the notifier's helper did not start: {e}");
+                    None
+                }
+            }
+        } else {
+            None
+        };
         eitri_core::panel_control::ensure_dir(&dirs.control).map_err(failed)?;
         agent::private_fs::create_private_dir_all(&dirs.agents(), &dirs.control)
             .map_err(|e| failed(format!("could not make {}: {e}", dirs.agents().display())))?;
@@ -315,6 +335,14 @@ mod linux {
             audit.clone(),
         )
         .map_err(|e| ended(format!("could not start serving: {e}")))?;
+        if let Some(helper) = helper {
+            if helper.ready().sandbox != "full" {
+                eprintln!("[remote] the notifier's helper runs with a partial sandbox");
+            }
+            if let Err(e) = super::notifier::start(&dirs.control, &hub, helper) {
+                eprintln!("[remote] serving with no wakes: the notifier did not start: {e}");
+            }
+        }
         accept_all(listeners, Arc::new(cfg), hub, Arc::new(place));
         super::control::serve_control(control, dirs.control.clone())
             .map_err(|e| ended(format!("could not answer the control socket: {e}")))?;
@@ -702,6 +730,7 @@ mod linux {
         writeln!(out, "listen: {}", cfg.listen_text())?;
         writeln!(out, "port: {}", cfg.port)?;
         writeln!(out, "origins: {origins}")?;
+        writeln!(out, "notify: {}", if cfg.notify { "on" } else { "off" })?;
         writeln!(out, "sandbox: {}", record.sandbox_text())
     }
 

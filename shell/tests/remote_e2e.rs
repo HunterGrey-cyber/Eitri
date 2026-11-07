@@ -328,6 +328,7 @@ fn settings(enabled: bool) -> RemoteSettings {
         port: None,
         origins: Vec::new(),
         audit_keep_days: 90,
+        notify: true,
     }
 }
 

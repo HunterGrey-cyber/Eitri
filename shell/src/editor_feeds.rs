@@ -218,6 +218,12 @@ impl FeedPump {
         if events.context {
             self.context_changed();
         }
+        // The person moved about an nvim this pump reads: a companion panel's, in a terminal, is outside the window's
+        // own event controllers, and a draft there never becomes the context.
+        #[cfg(target_os = "linux")]
+        if events.person_moved {
+            crate::remote_presence::stamp();
+        }
     }
 
     /// Calls the context hookup ([`on_context`](Self::on_context)), as a new context does.
@@ -602,6 +608,35 @@ mod tests {
                 file.path
             );
         }
+    }
+
+    /// A context line from the editor about a file or a draft counts as the person at the desk: for a companion panel
+    /// it is the only sign of them, since they type in a terminal's nvim beside the window.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn companion_feed_counts_as_presence() {
+        let _turn = crate::layout_state::default_context_turn();
+        let context = glib::MainContext::default();
+        let _owner = context.acquire().expect("glib's default main context");
+        let pump = FeedPump::start();
+        let mut feed = EditorContextFeed::new().unwrap();
+        // No panel listens: the stamp does not depend on one.
+        let _ = pump.listen_context(&mut feed, Some(std::path::PathBuf::from("/p/scratch")));
+        iterate_until(200, || false);
+        // A file, then a draft in Eitri's scratch directory, which never becomes the context.
+        for file in ["/p/b.rs", "/p/scratch/1-draft.md"] {
+            let before = crate::remote_presence::last_stamp();
+            std::thread::sleep(Duration::from_millis(2));
+            send(
+                feed.socket_path(),
+                &format!(r#"{{"v":1,"file":"{file}","selection":null}}"#),
+            );
+            assert!(
+                iterate_until(2000, || crate::remote_presence::last_stamp() > before),
+                "moving about {file} did not count as presence"
+            );
+        }
+        feed.cleanup();
     }
 
     /// Once the editor follows a `:connect` away from the window's own nvim, the context that nvim fed is nothing to

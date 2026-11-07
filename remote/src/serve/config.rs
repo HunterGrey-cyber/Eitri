@@ -1,7 +1,8 @@
 //! What `eitri remote serve` listens on and answers to: given on its command line by the window that starts it, and
 //! recorded beside its lock so a window that wants something else can say what differs.
 //!
-//! `serve [--listen loopback|socket|<address>] [--port <port>] [--origin <name>]... [--audit-keep-days <days>]`
+//! `serve [--listen loopback|socket|<address>] [--port <port>] [--origin <name>]... [--audit-keep-days <days>]
+//! [--no-notify]`
 //!
 //! - `--listen`: `loopback` (the default: `127.0.0.1` and `::1`), `socket` (a Unix socket in the runtime directory), or
 //!   exactly one address of this machine. A wildcard (`0.0.0.0`, `::`) is refused: it would take every network the
@@ -11,6 +12,7 @@
 //!   with `:<port>` when it is not the scheme's default) or an origin (`https://desk.tail1.ts.net`). A path, a query,
 //!   user information or a wildcard is refused: the server answers on one path only, at the root of its origin.
 //! - `--audit-keep-days`: how many days of rotated audit files to keep, 1 to 3650; without it, 90 (`remote.audit.keep_days`).
+//! - `--no-notify`: fork no notifier helper and post no wake (`remote.notify = false`).
 //!
 //! The record names the build that wrote it ([`this_build`]): a window or `eitri remote status` from another build
 //! (after a package upgrade, an old window meets a new `serve` or the other way round) reads only its pid and says the
@@ -43,6 +45,14 @@ pub struct ServeConfig {
     pub origins: Vec<String>,
     /// Days of rotated audit files kept.
     pub audit_keep_days: u32,
+    /// Whether phones' push endpoints are woken.
+    pub notify: bool,
+}
+
+/// Whether `args` leave the notifier on: read before anything else, since the helper is forked before the rest of
+/// the arguments are checked. A command line that is then refused ends the helper with `serve`.
+pub fn wants_notify(args: &[String]) -> bool {
+    !args.iter().any(|arg| arg == "--no-notify")
 }
 
 /// The longest `--origin` entry taken: a DNS name is at most 253 bytes, and a scheme and port add a few.
@@ -59,6 +69,7 @@ impl ServeConfig {
         let mut listen = None;
         let mut given_port = None;
         let mut keep_days = None;
+        let mut notify = true;
         let mut origins = Vec::new();
         let mut rest = args.iter();
         while let Some(arg) = rest.next() {
@@ -73,7 +84,10 @@ impl ServeConfig {
                     }
                 }
                 "--audit-keep-days" if keep_days.is_none() => keep_days = Some(parse_keep_days(&value(arg)?)?),
-                "--listen" | "--port" | "--audit-keep-days" => return Err(format!("{arg} is given twice")),
+                "--no-notify" if notify => notify = false,
+                "--listen" | "--port" | "--audit-keep-days" | "--no-notify" => {
+                    return Err(format!("{arg} is given twice"))
+                }
                 other => return Err(format!("unknown argument {other:?}")),
             }
         }
@@ -86,6 +100,7 @@ impl ServeConfig {
             port,
             origins,
             audit_keep_days: keep_days.unwrap_or(AUDIT_KEEP_DAYS_DEFAULT),
+            notify,
         })
     }
 
@@ -106,6 +121,9 @@ impl ServeConfig {
         if self.audit_keep_days != AUDIT_KEEP_DAYS_DEFAULT {
             args.push("--audit-keep-days".to_owned());
             args.push(self.audit_keep_days.to_string());
+        }
+        if !self.notify {
+            args.push("--no-notify".to_owned());
         }
         args
     }
@@ -156,6 +174,14 @@ impl ServeConfig {
             out.push(format!(
                 "audit keep days: running {}, asked {}",
                 self.audit_keep_days, other.audit_keep_days
+            ));
+        }
+        if self.notify != other.notify {
+            let word = |on: bool| if on { "on" } else { "off" };
+            out.push(format!(
+                "notify: running {}, asked {}",
+                word(self.notify),
+                word(other.notify)
             ));
         }
         out
@@ -448,6 +474,27 @@ mod tests {
                 "origins: running a.example b.example, asked none".to_owned(),
             ]
         );
+    }
+
+    #[test]
+    fn no_notify_is_read_back_and_named() {
+        let running = parsed(&[]).unwrap();
+        assert!(running.notify);
+        assert!(!running.to_args().contains(&"--no-notify".to_owned()));
+        let asked = parsed(&["--no-notify"]).unwrap();
+        assert!(!asked.notify);
+        assert_eq!(
+            ServeConfig::from_args(&asked.to_args(), || Ok(1), tailnet).unwrap(),
+            asked
+        );
+        assert_eq!(running.differences(&asked), ["notify: running on, asked off"]);
+        assert!(parsed(&["--no-notify", "--no-notify"]).is_err());
+        assert!(wants_notify(&[]));
+        assert!(!wants_notify(&[
+            "--listen".to_owned(),
+            "socket".to_owned(),
+            "--no-notify".to_owned()
+        ]));
     }
 
     #[test]

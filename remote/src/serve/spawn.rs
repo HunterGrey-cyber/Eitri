@@ -78,6 +78,7 @@ pub fn running_config(dirs: &Dirs) -> Option<ServeConfig> {
         port: Some(running.port),
         origins: running.origins,
         audit_keep_days: running.audit_keep_days,
+        notify: running.notify,
     })
 }
 
@@ -271,6 +272,7 @@ mod tests {
             port: None,
             origins: Vec::new(),
             audit_keep_days: eitri_core::remote_audit::AUDIT_KEEP_DAYS_DEFAULT,
+            notify: true,
         };
         for (body, want) in [
             ("exit 4", ServeEnded::RunningDifferent),
@@ -361,6 +363,7 @@ mod tests {
             port: None,
             origins: Vec::new(),
             audit_keep_days: eitri_core::remote_audit::AUDIT_KEEP_DAYS_DEFAULT,
+            notify: true,
         };
         ServeSpawner::new(exe.clone())
             .env("XDG_RUNTIME_DIR", &dir)

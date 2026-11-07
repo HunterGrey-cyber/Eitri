@@ -187,6 +187,9 @@ pub const REMOTE_PORT_KEY: &str = "remote.port";
 pub const REMOTE_ORIGINS_KEY: &str = "remote.origins";
 /// How many days `serve` keeps rotated files of the remote audit log, from 1 to 3650; unset is 90.
 pub const REMOTE_AUDIT_KEEP_DAYS_KEY: &str = "remote.audit.keep_days";
+/// Whether `serve` wakes the phones that gave it a push endpoint when an agent needs the person or a belled tab
+/// finishes; unset is on. Off, `serve` forks no notifier and posts nothing.
+pub const REMOTE_NOTIFY_KEY: &str = "remote.notify";
 /// The fewest and the most days [`REMOTE_AUDIT_KEEP_DAYS_KEY`] takes.
 pub const REMOTE_AUDIT_KEEP_DAYS_MIN: u32 = 1;
 pub const REMOTE_AUDIT_KEEP_DAYS_MAX: u32 = 3650;
@@ -217,6 +220,8 @@ pub struct RemoteSettings {
     pub origins: Vec<String>,
     /// Days of rotated audit files `serve` keeps.
     pub audit_keep_days: u32,
+    /// Whether `serve` posts wakes to phones' push endpoints.
+    pub notify: bool,
 }
 
 /// [`REMOTE_ENABLED_KEY`] as stored. Unset means off: it opens a socket and starts a listener, which only someone
@@ -317,6 +322,11 @@ pub fn parse_remote_audit_keep_days(value: Option<&str>) -> Result<u32, String> 
     }
 }
 
+/// [`REMOTE_NOTIFY_KEY`] as stored. Unset means on: nothing is posted until a phone gives `serve` an endpoint.
+pub fn parse_remote_notify(value: Option<&str>) -> Result<bool, String> {
+    crate::config_switch::parse_switch(REMOTE_NOTIFY_KEY, value, true)
+}
+
 impl RemoteSettings {
     /// The `remote.*` keys of `store`; the first bad one is the error.
     pub fn read(store: &ConfigStore) -> Result<RemoteSettings, String> {
@@ -326,6 +336,7 @@ impl RemoteSettings {
             port: parse_remote_port(store.get(REMOTE_PORT_KEY))?,
             origins: parse_remote_origins(store.get(REMOTE_ORIGINS_KEY))?,
             audit_keep_days: parse_remote_audit_keep_days(store.get(REMOTE_AUDIT_KEEP_DAYS_KEY))?,
+            notify: parse_remote_notify(store.get(REMOTE_NOTIFY_KEY))?,
         })
     }
 }
@@ -492,8 +503,21 @@ mod tests {
                 port: None,
                 origins: Vec::new(),
                 audit_keep_days: 90,
+                notify: true,
             }
         );
+    }
+
+    #[test]
+    fn notify_key_defaults_true() {
+        assert_eq!(REMOTE_NOTIFY_KEY, "remote.notify");
+        assert_eq!(parse_remote_notify(None), Ok(true));
+        assert!(RemoteSettings::read(&ConfigStore::default()).unwrap().notify);
+        let store = store_with("eitri.config.set('remote.notify', false)");
+        assert!(!RemoteSettings::read(&store.borrow()).unwrap().notify);
+        let store = store_with("eitri.config.set('remote.notify', 'maybe')");
+        let err = RemoteSettings::read(&store.borrow()).unwrap_err();
+        assert!(err.contains("remote.notify"), "{err}");
     }
 
     #[test]
