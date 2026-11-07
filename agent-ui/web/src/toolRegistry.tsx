@@ -1,4 +1,4 @@
-import { memo } from "react";
+import { createContext, memo, useContext } from "react";
 import type { ReactNode } from "react";
 import type { InputChange, ToolCallDenial, ToolCallRecord } from "./types";
 import { codexChangePreview, editPreview, lineDiff, splitLines } from "./diff";
@@ -653,6 +653,9 @@ function cutLine(raw: string, chars: number): string {
   return line.length > chars ? `${line.slice(0, headEnd(line, chars - 1))}…` : line;
 }
 
+/** Whether rows open by a tap rather than by a key (the phone's transcript page): a fold then says so. */
+export const TouchRows = createContext(false);
+
 /** What a folded, finished call shows under its invocation: the first `PREVIEW_LINES` of its result, then
  *  a muted count of the lines not shown and how to see them. A failure shows its first line only, in the same
  *  text as any other result, with only the words that say it failed coloured (`withFailureWords`). Nothing when
@@ -673,6 +676,7 @@ const ToolResultPreview = memo(function ToolResultPreview({
   wrapped?: boolean;
   reveal?: boolean;
 }) {
+  const touch = useContext(TouchRows);
   const { shown, total } = previewLines(formatResultContent(result.content), result.isError ? 1 : PREVIEW_LINES, wrapped ? WRAPPED_LINE_CHARS : PREVIEW_LINE_CHARS);
   if (total === 0) return null;
   const hidden = total - shown.length;
@@ -689,7 +693,7 @@ const ToolResultPreview = memo(function ToolResultPreview({
       ))}
       {hidden > 0 && (
         <div className="tool-result-preview-more">
-          {`… +${hidden.toLocaleString("en-US")} ${hidden === 1 ? "line" : "lines"} (Enter to expand, Ctrl+o for all)`}
+          {`… +${hidden.toLocaleString("en-US")} ${hidden === 1 ? "line" : "lines"} ${touch ? "· tap to show" : "(Enter to expand, Ctrl+o for all)"}`}
         </div>
       )}
     </div>

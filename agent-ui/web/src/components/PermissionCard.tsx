@@ -20,6 +20,7 @@ import { EditDiff } from "./EditDiff";
 import { countEscapes, revealHidden } from "../revealHidden";
 import { HiddenWarning, Revealed } from "./Revealed";
 import { NO_TEXT_ASSIST } from "../textField";
+import { AnswerAtDesk } from "./AtDesk";
 
 /** Card views read the same conversation as the list, including its frozen visual selection. */
 export const PermissionCardContext = createContext<{
@@ -45,9 +46,17 @@ type Props = {
   /** The reason box as it is typed into, and `""` when the card goes away: `d` sends the same
    *  reason this card's Deny would, so the two ways of denying never disagree. */
   onReasonChange?: (permissionId: string, reason: string) => void;
+  /** `false` on a page that may not answer (the phone's transcript): the card shows what it asks, and in place of
+   *  the reason box and the buttons one line saying where it is answered. Defaults to `true`. */
+  controls?: boolean;
+  /** Where the card is answered, as the phone's top bar names the tab (`project · window N · tab M`); read only
+   *  without controls. */
+  deskLocation?: string;
 };
 
-export function PermissionCard({ request, sessionEnded, ruleOffer, alreadyAnswered = false, onAnswer, onReasonChange }: Props) {
+export function PermissionCard({
+  request, sessionEnded, ruleOffer, alreadyAnswered = false, onAnswer, onReasonChange, controls = true, deskLocation = "",
+}: Props) {
   const view = useContext(PermissionCardContext);
   const [reason, setReason] = useState("");
   const [clicked, setClicked] = useState(false);
@@ -114,7 +123,8 @@ export function PermissionCard({ request, sessionEnded, ruleOffer, alreadyAnswer
         <ToolInput toolName={request.toolName} input={request.input} createsFile={request.createsFile} />}
       {/* A deny from another agent carries no reason (Codex's decline has no field for one), so there is
           no box to type into; `D` says so (`App.tsx`). */}
-      {!external && (
+      {!controls && <AnswerAtDesk location={deskLocation} stop="Stop on this phone ends the turn and denies this card." />}
+      {controls && !external && (
         <input
           type="text"
           {...NO_TEXT_ASSIST}
@@ -134,7 +144,7 @@ export function PermissionCard({ request, sessionEnded, ruleOffer, alreadyAnswer
           disabled={inert}
         />
       )}
-      <div className="permission-card-buttons">
+      {controls && <div className="permission-card-buttons">
         {/* `data-nav-order` puts Approve first for `l`, one keypress away, then Deny, then the third
             (Always allow) button when Rust offered one, then the reason box above them.
             `a`/`d` do NOT press these buttons: they answer this card by
@@ -159,7 +169,7 @@ export function PermissionCard({ request, sessionEnded, ruleOffer, alreadyAnswer
             Always allow <ShownInline text={ruleOffer} /> in this project
           </button>
         )}
-      </div>
+      </div>}
       {sessionEnded && !answered && (
         <div className="permission-card-stale">
           This session ended before the request was answered, so it can no longer be allowed or denied.

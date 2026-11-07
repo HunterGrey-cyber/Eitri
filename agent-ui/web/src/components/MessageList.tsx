@@ -1,7 +1,8 @@
+/// <reference types="vite/client" />
 import { rowCardLine, rowAgentCard, isAgentCall } from "../display";
-import { Fragment, memo, useEffect, useLayoutEffect, useMemo, useRef, useState, type ReactElement } from "react";
+import { Fragment, memo, useEffect, useLayoutEffect, useMemo, useRef, useState, type ReactElement, type ReactNode } from "react";
 import type { AgentUiState, ThinkingBlock, ThinkingDisplay, ToolCallRecord } from "../types";
-import { renderToolCall } from "../toolRegistry";
+import { renderToolCall, TouchRows } from "../toolRegistry";
 import { allCards, buildTimeline, isUsableLink, noticeText, noticeBody, wakeText, questionLines, type TimelineItem } from "../timeline";
 import { buildDisplay, runSummary } from "../display";
 import { forgetMarkdown, renderMarkdown, streamMarkdown, type StreamedMarkdown } from "../markdown";
@@ -9,6 +10,7 @@ import { turnEndingText } from "../turnEnding";
 import { endingDuration, NO_TURN_DURATIONS, placeFooters, workedFooters } from "../turnTimes";
 import type { TurnDurations } from "../turnTimes";
 import { HistoryNotice } from "./HistoryNotice";
+import { historyNoticeText } from "../history";
 import { PermissionCard } from "./PermissionCard";
 import { Row } from "./Row";
 import { Revealed } from "./Revealed";
@@ -20,7 +22,7 @@ import { pillLabel, pillShown } from "../pill";
 import { parsePath } from "../paths";
 import type { PathRef } from "../paths";
 import { CursorBand, type BandBox } from "../cursorBand";
-import { conversationRows } from "../nav";
+import { conversationRows, stopOf } from "../nav";
 
 type Props = {
   /** The conversation's identity: row keys can be shared by different tabs. */
@@ -101,7 +103,44 @@ type Props = {
    *  `.row-current` overrides) -- nothing else here reads it, since the region's own selection is
    *  built directly on the DOM by `App.tsx`, not through props. */
   visual?: "caret" | "visual" | "vline" | null;
+  /** The phone's transcript page: rows open and close by a tap (`onToggle`), a fold says "tap to show", and there
+   *  is no cursor band, no visual selection and no keyboard steering of the follow; cards and questions show no
+   *  controls (`deskLocation` says where they are answered). Defaults to `false`, the desk. */
+  touch?: boolean;
+  /** Where a card is answered (`project · window N · tab M`), shown in its place of the controls under `touch`. */
+  deskLocation?: string;
+  /** This phone's device id under `touch`: what it sent reads "sent from this phone", what it stopped "stopped from
+   *  this phone". */
+  thisDevice?: string | null;
+  /** Entries a snapshot holds only the start of, by `seq`, with about how many bytes the whole entry is; each row
+   *  says so and loads it whole on a tap (`onLoadWhole`). Touch only. */
+  cut?: ReadonlyMap<number, number>;
+  /** The cut entry whose tap waits for a page already on its way; its row says it loads once that page is in. */
+  cutWaiting?: number | null;
+  onLoadWhole?: (seq: number) => void;
+  /** A tap on a row that folds (a call, a run, a thought, a notice or wake with more to say). Touch only. */
+  onToggle?: (key: string) => void;
+  /** The list reached its top, by a scroll or because it does not fill the view. Touch only. */
+  onReachTop?: () => void;
+  /** Drawn after the last row, inside the scroll box: a page's own blocks that follow the conversation. */
+  after?: ReactNode;
 };
+
+/** The row kinds a tap opens and closes under `touch`: those `Enter` toggles on the desk. */
+const TAP_TOGGLES: ReadonlySet<TimelineItem["kind"]> = new Set(["tool", "run", "thinking", "notice", "wake"]);
+/** How close to the top of the list counts as having reached it, for loading older turns. */
+const TOP_REACHED_PX = 48;
+/** The desk's history notice, whose button copies the desk's file path into the desk's selection. The phone's page
+ *  is built with `EITRI_PHONE_PAGE` set (`vite.transcript.config.ts`), which leaves the notice, and the message it
+ *  posts to the desk's host, out of that page; under `touch` the notice is drawn as text only in any build. */
+const DeskHistoryNotice = import.meta.env.EITRI_PHONE_PAGE === true ? null : HistoryNotice;
+
+/** A cut entry's size, for its row: bytes up to a kilobyte, then KB and MB with one decimal. */
+export function cutSize(bytes: number): string {
+  if (bytes < 1024) return `${bytes} bytes`;
+  if (bytes < 1024 * 1024) return `${(bytes / 1024).toFixed(1)} KB`;
+  return `${(bytes / (1024 * 1024)).toFixed(1)} MB`;
+}
 
 /** Whether a finished tool call succeeded, failed, is still running, or was abandoned -- the state a
  * row's sign glyph carries. A call with no result yet is never "done with nothing to say"; see
@@ -219,7 +258,23 @@ export function MessageList({
   onUnreadChange,
   unseenSeed,
   visual = null,
+  touch = false,
+  deskLocation = "",
+  thisDevice = null,
+  cut,
+  cutWaiting = null,
+  onLoadWhole,
+  onToggle,
+  onReachTop,
+  after,
 }: Props) {
+  /** Fixed for the list's life: the listeners below are attached once. */
+  const touchRef = useRef(touch);
+  /** Through a ref: a held row's element keeps the handler it was made with. */
+  const loadWholeRef = useRef(onLoadWhole);
+  loadWholeRef.current = onLoadWhole;
+  const toggleRef = useRef(onToggle);
+  toggleRef.current = onToggle;
   const listRef = useRef<HTMLDivElement>(null);
   /** One observer for the list and its children, and the set it watches; `null` without one (jsdom). */
   const resizeObserverRef = useRef<ResizeObserver | null>(null);
@@ -522,7 +577,8 @@ export function MessageList({
       onScrollRef.current();
     };
     list.addEventListener("wheel", onWheel, { passive: true });
-    list.addEventListener("keydown", onKeyDown, { passive: true });
+    // A touch page has no keys to steer the follow with.
+    if (!touchRef.current) list.addEventListener("keydown", onKeyDown, { passive: true });
     // Focus landing on something inside the list (Tab, a click) scrolls it into view, either way.
     list.addEventListener("focusin", steer, { passive: true });
     list.addEventListener("touchmove", steer, { passive: true });
@@ -552,6 +608,43 @@ export function MessageList({
       settleTimerRef.current = null;
     };
   }, []);
+  /* Under `touch`, older turns arrive above what is being read: the view keeps its place by moving down as far as
+     the list grew, when the old first row is still there (a prepend, not a new conversation) and the view is not
+     following the tail. Runs before the follow effect below, every render, and records the height it left. */
+  const topRowRef = useRef<{ key: string; height: number } | null>(null);
+  useLayoutEffect(() => {
+    const list = listRef.current;
+    if (!touch || list === null) return;
+    const first = timeline[0]?.key;
+    const held = topRowRef.current;
+    if (held !== null && first !== undefined && first !== held.key && !followingRef.current &&
+      timeline.some((item) => item.key === held.key)) {
+      list.scrollTop += list.scrollHeight - held.height;
+      lastScrollTopRef.current = list.scrollTop;
+    }
+    topRowRef.current = first === undefined ? null : { key: first, height: list.scrollHeight };
+  });
+  /** Under `touch`, tells the page the top is reached: by a scroll that came within `TOP_REACHED_PX` of it, or
+   *  (`fill`) because the rows do not fill the view, so no scroll could ever reach it. */
+  const reachTop = (fill: boolean) => {
+    const list = listRef.current;
+    if (!touch || list === null || onReachTop === undefined) return;
+    if (fill ? list.scrollHeight - list.clientHeight <= TOP_REACHED_PX : list.scrollTop <= TOP_REACHED_PX) onReachTop();
+  };
+  /** Under `touch`, a tap on a row that folds opens or closes it; not a tap that a link, a control or a selection
+   *  owns, and not one a handler above already took. */
+  const tapRow = (target: Element, taken: boolean) => {
+    const list = listRef.current;
+    if (list === null || onToggle === undefined || taken) return;
+    if (target.closest("a[href], button, input, textarea, select") !== null) return;
+    const selection = window.getSelection();
+    if (selection !== null && !selection.isCollapsed) return;
+    const stop = stopOf(list, target);
+    if (stop === null) return;
+    const item = timeline[conversationRows(list).indexOf(stop)];
+    if (item !== undefined && TAP_TOGGLES.has(item.kind)) onToggle(item.key);
+  };
+
   // Follow every state change, including streamed growth. Read the scroll position first: a user
   // scroll in the steering window may be ahead of its event. k also stops through `noteUserScroll`.
   // Run before paint: a passive effect leaves freshly streamed lines below the fold for a frame.
@@ -566,6 +659,11 @@ export function MessageList({
     observeChildren(list);
     if (followingRef.current) follow(list);
     updatePill();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [state]);
+  // After the follow: a list that does not fill the view has reached its top already.
+  useLayoutEffect(() => {
+    reachTop(true);
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [state]);
   /* The rows are watched after every change of the timeline, not only of `state`: `expanded` is the
@@ -659,13 +757,14 @@ export function MessageList({
         const anchor = ending?.seq ?? call?.seq ?? (task ? state.toolCalls.find((call) => call.toolUseId === task.tool_use_id)?.seq : undefined)
           ?? turnDurations.get(id)?.anchorSeq;
         if (anchor !== undefined && anchor !== null) {
-          const label = `stopped from ${revealHidden(from.name).map((piece) => "text" in piece ? piece.text : piece.escape).join("")}`;
+          const label = touch && thisDevice !== null && from.deviceId === thisDevice ? "stopped from this phone"
+            : `stopped from ${revealHidden(from.name).map((piece) => "text" in piece ? piece.text : piece.escape).join("")}`;
           lines.set(anchor, lines.has(anchor) ? `${lines.get(anchor)} · ${label}` : label);
         }
       }
       return lines;
     },
-    [state.activeTurnId, state.turnEndings, state.transcript.length, newestReply, state.thinking, state.toolCalls, state.pendingPermissions, state.editorCards, state.stoppedFrom, state.backgroundTasks, turnDurations],
+    [state.activeTurnId, state.turnEndings, state.transcript.length, newestReply, state.thinking, state.toolCalls, state.pendingPermissions, state.editorCards, state.stoppedFrom, state.backgroundTasks, turnDurations, touch, thisDevice],
   );
   // By row key, over the rows actually drawn: a turn's newest row may be a hidden or folded thought.
   const placedFooters = useMemo(() => placeFooters(timeline, footers), [timeline, footers]);
@@ -684,12 +783,16 @@ export function MessageList({
         data-focused={String(focused)}
         data-visual={visual ?? undefined}
         ref={listRef}
-        onScroll={onScroll}
+        onScroll={touch ? () => { onScroll(); reachTop(false); } : onScroll}
         // A click on a path -- the tool registry's own `.path-link` spans, or an inline code
         // span in an assistant reply that happens to parse as one. Never a fenced code BLOCK
         // (`pre code`): that is a real snippet, not a path, and HINT's own `y` already owns copying
         // it.
         onClick={(event) => {
+          if (touch) {
+            tapRow(event.target as Element, event.defaultPrevented);
+            return;
+          }
           if (onOpenPath === undefined) return;
           const target = (event.target as HTMLElement).closest<HTMLElement>(".path-link, .row-assistant code:not(pre code)");
           if (target === null) return;
@@ -702,7 +805,11 @@ export function MessageList({
             rather than pinned over it. It is not a `TimelineItem` and holds no `seq` -- see
             `HistoryNotice` for why it must never become a row. `null` for every fresh session, which
             is most of them. */}
-        {state.history !== null && <HistoryNotice notice={state.history} />}
+        <TouchRows.Provider value={touch}>
+        {state.history !== null && (touch || DeskHistoryNotice === null
+          // The desk's notice copies the desk's file path to the desk's own selection; the phone only reads it.
+          ? <div className="history-notice"><span>{historyNoticeText(state.history)}</span></div>
+          : <DeskHistoryNotice notice={state.history} />)}
         {timeline.map((item, index) => {
           // Everything a row draws is in these props, each a value or the timeline's own item, so a
           // cursor move renders the two rows it changes and no other (`TimelineRow`).
@@ -710,9 +817,13 @@ export function MessageList({
           const permissionId = item.kind === "permission" ? item.request.permissionId : null;
           const footer = placedFooters.get(item.key) ?? null;
           const abandoned = call !== null && isAbandonedCall(call, state, sessionEnded);
+          const source = item.kind === "prompt" ? state.sentFrom?.[String(item.seq)] ?? null : null;
+          const sentHere = touch && source !== null && thisDevice !== null && source.deviceId === thisDevice;
           const props: TimelineRowProps = {
             item,
-            sentFrom: item.kind === "prompt" ? state.sentFrom?.[String(item.seq)]?.name ?? null : null,
+            sentFrom: sentHere ? null : source?.name ?? null,
+            sentHere,
+            atDesk: touch ? deskLocation : null,
             current: index === cursor,
             yanked: item.key === yankedKey,
             expanded: expanded[item.key] === true,
@@ -730,12 +841,40 @@ export function MessageList({
             streaming: item.key === streamingKey && !item.depth,
             selecting: visual !== null,
           };
+          const cutBytes = touch ? cut?.get(item.seq) ?? null : null;
+          const waiting = cutBytes !== null && cutWaiting === item.seq;
+          // An opened run's calls stand in rows of their own, the run's row gone: under `touch` the first of them
+          // carries the tap that folds them back into it (the run's key is its first call's).
+          const foldsRun = touch && item.kind === "tool" && expanded[`r-${item.seq}`] === true;
           const held = heldRows.get(item);
-          if (held !== undefined && held.footer === footer && sameRowProps(held.props, props)) return held.element;
+          if (held !== undefined && held.footer === footer && held.cutBytes === cutBytes && held.waiting === waiting &&
+            held.foldsRun === foldsRun && sameRowProps(held.props, props)) {
+            return held.element;
+          }
           const row = <TimelineRow {...props} />;
           const element = (
             <Fragment key={item.key}>
+              {foldsRun && (
+                // Not a row, like the cut entry's button: a tap here folds the run and opens nothing else.
+                <button type="button" className="fold-run" onClick={(event) => {
+                  event.stopPropagation();
+                  toggleRef.current?.(`r-${item.seq}`);
+                }}>
+                  ▴ these calls · tap to fold them
+                </button>
+              )}
               {item.depth ? <div className="subagent-child" style={{ marginInlineStart: `${item.depth * 1.5}em` }} data-depth={item.depth}>{row}</div> : row}
+              {cutBytes !== null && (
+                // Not a row: no `data-nav-stop`, so a tap on it never also opens the row above.
+                <button type="button" className="cut-entry" onClick={(event) => {
+                  event.stopPropagation();
+                  loadWholeRef.current?.(item.seq);
+                }}>
+                  {waiting
+                    ? `Only the start is here · ${cutSize(cutBytes)} in all · loads once the older turns arrive`
+                    : `Only the start is here · ${cutSize(cutBytes)} in all · tap to load it whole`}
+                </button>
+              )}
               {footer !== null && (
                 // Chrome, not a row: no `data-nav-stop`, so `j`/`k` and `y` never see it, and the inner
                 // `aria-hidden` span is what VISUAL's copy leaves out (`VISUAL_CHROME`).
@@ -745,14 +884,16 @@ export function MessageList({
               )}
             </Fragment>
           );
-          heldRows.set(item, { props, footer, element });
+          heldRows.set(item, { props, footer, cutBytes, waiting, foldsRun, element });
           return element;
         })}
+        {after}
+        </TouchRows.Provider>
         {/* The cursor's fill, behind the rows (`../cursorBand`). Hidden from assistive technology and from
-            VISUAL's selection (`[aria-hidden="true"]` is chrome there). */}
-        <div className="cursor-band" aria-hidden="true" ref={bandElRef} />
+            VISUAL's selection (`[aria-hidden="true"]` is chrome there). A touch page has neither. */}
+        {!touch && <div className="cursor-band" aria-hidden="true" ref={bandElRef} />}
         {/* VISUAL and V-LINE's selection (`../visualPaint`), over the rows. */}
-        <div className="visual-paint" aria-hidden="true" ref={paintElRef} />
+        {!touch && <div className="visual-paint" aria-hidden="true" ref={paintElRef} />}
       </div>
     </>
   );
@@ -773,13 +914,16 @@ function sameRowShape(a: RowShape, b: RowShape): boolean {
   return a.rows === b.rows || a.rows.every((item, i) => item.key === b.rows[i].key && item.depth === b.rows[i].depth);
 }
 
-type HeldRow = { props: TimelineRowProps; footer: string | null; element: ReactElement };
+type HeldRow = {
+  props: TimelineRowProps; footer: string | null; cutBytes: number | null; waiting: boolean; foldsRun: boolean;
+  element: ReactElement;
+};
 
 /** Every prop by name, so a prop added to `TimelineRowProps` without a line here fails to compile. */
 function sameRowProps(a: TimelineRowProps, b: TimelineRowProps): boolean {
-  if (a.sentFrom !== b.sentFrom) return false;
+  if (a.sentFrom !== b.sentFrom || a.sentHere !== b.sentHere || a.atDesk !== b.atDesk) return false;
   const {
-    sentFrom, item, current, yanked, expanded, detailed, thinkingDisplay, sessionEnded, abandoned, cardLine, agent, gated,
+    sentFrom, sentHere, atDesk, item, current, yanked, expanded, detailed, thinkingDisplay, sessionEnded, abandoned, cardLine, agent, gated,
     ruleOffer, alreadyAnswered, ranFor, handlers, streaming, selecting, ...none
   } = a;
   const _exhaustive: Record<string, never> = none;
@@ -795,6 +939,10 @@ function sameRowProps(a: TimelineRowProps, b: TimelineRowProps): boolean {
 
 type TimelineRowProps = {
   sentFrom: string | null;
+  /** This phone sent the prompt (the touch page). */
+  sentHere: boolean;
+  /** Where cards and questions are answered, on a page that shows them without controls; `null` on the desk. */
+  atDesk: string | null;
   item: TimelineItem;
   current: boolean;
   yanked: boolean;
@@ -834,6 +982,8 @@ export function timelineRowRenderCount(): number {
  *  prop here, or the row keeps showing what it showed before. */
 const TimelineRow = memo(function TimelineRow({
   sentFrom,
+  sentHere,
+  atDesk,
   item,
   current,
   yanked,
@@ -865,6 +1015,7 @@ const TimelineRow = memo(function TimelineRow({
       return (
         <Row kind="prompt" sign="›" current={current} className={promptClass || undefined} navStop="row">
           {item.text}
+          {sentHere && <div className="phone-source"><small>sent from this phone</small></div>}
           {sentFrom !== null && <div className="phone-source"><small>from <Revealed pieces={revealHidden(sentFrom)} /></small></div>}
         </Row>
       );
@@ -923,6 +1074,8 @@ const TimelineRow = memo(function TimelineRow({
         <Row kind="permission" sign="!" current={current} className={yankedClass} navStop="row">
           <PermissionCard
             request={item.request}
+            controls={atDesk === null}
+            deskLocation={atDesk ?? ""}
             sessionEnded={sessionEnded}
             ruleOffer={ruleOffer}
             alreadyAnswered={alreadyAnswered}

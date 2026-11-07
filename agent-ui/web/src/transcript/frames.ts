@@ -52,7 +52,7 @@ function cuts(v: unknown): v is CutEntry[] {
 }
 
 /** A turn starts at a prompt or a CLI turn start. Turn zero also owns entries before the first prompt. */
-function starts(state: AgentUiState, firstTurn: number): number[] {
+export function starts(state: AgentUiState, firstTurn: number): number[] {
   const seqs = [...new Set([...state.userPrompts, ...state.turnStarts].map((entry) => entry.seq))].sort((a, b) => a - b);
   if (firstTurn === 0) {
     if (seqs.length === 0) seqs.push(0);

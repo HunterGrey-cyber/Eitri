@@ -1,0 +1,120 @@
+/* The phone's transcript page: the panel's message list, made touchable. The desk's stylesheet (`index.css`) draws
+   the rows; this adds the page's own frame and the phone's type, and gives every control a thumb-sized target. */
+:root {
+  /* The desk's font names mean nothing on a phone: prose in the system sans, code in the system monospace, on the
+     phone's 18px base (the host's text zoom scales it with the system font size). */
+  --nv-font-prose: system-ui, Roboto, "Noto Sans CJK SC", sans-serif;
+  --nv-font-mono: monospace;
+  --nv-font-size: 18px;
+  --page-pad: 14px;
+  -webkit-text-size-adjust: 100%;
+  text-size-adjust: 100%;
+}
+body {
+  background: var(--nv-bg);
+  color: var(--nv-fg);
+  -webkit-tap-highlight-color: transparent;
+}
+.transcript-app {
+  position: relative;
+  display: flex;
+  flex-direction: column;
+  height: 100%;
+  min-height: 0;
+}
+.transcript-app .message-list {
+  -webkit-user-select: text;
+  user-select: text;
+  overscroll-behavior: contain;
+  padding-bottom: 72px;
+  /* Older turns prepended above the view keep the reader's place by the list's own bookkeeping (it moves down as far
+     as the list grew); the engine's scroll anchoring would move it as well, twice the distance. */
+  overflow-anchor: none;
+}
+.transcript-status:empty {
+  display: none;
+}
+.transcript-status > div {
+  padding: 8px var(--page-pad);
+  font-size: var(--fs-sm);
+  border-bottom: 1px solid var(--rule-soft);
+  color: var(--nv-muted);
+}
+.transcript-status > .update-row {
+  background: var(--nv-warn-tint);
+  color: var(--nv-warn-tint-fg);
+}
+.transcript-status > .shell-running {
+  color: var(--nv-fg);
+}
+.answer-at-desk {
+  margin-top: 10px;
+  padding: 10px 12px;
+  border-radius: 6px;
+  background: var(--nv-warn-tint);
+  color: var(--nv-warn-tint-fg);
+  font-size: var(--fs-md);
+}
+.transcript-at-desk {
+  display: grid;
+  gap: 12px;
+  margin-top: 12px;
+}
+.prompt-at-desk,
+.question-at-desk {
+  padding: 14px;
+  border: 1px solid var(--rule-frame);
+  border-radius: var(--radius-block);
+  background: var(--nv-surface);
+  color: var(--nv-surface-fg);
+}
+.prompt-at-desk p,
+.question-at-desk p {
+  margin: 0 0 8px;
+}
+.question-at-desk-options {
+  margin: 0;
+  padding-inline-start: 1.6em;
+}
+.question-at-desk-options li {
+  margin: 4px 0;
+}
+.question-at-desk-options .question-description {
+  display: block;
+  color: var(--nv-surface-muted);
+}
+.cut-entry,
+.fold-run,
+.transcript-latest {
+  min-height: 48px;
+  font: inherit;
+  font-size: var(--fs-sm);
+  border-radius: 10px;
+  border: 1px solid var(--rule-frame);
+  background: var(--nv-surface);
+  color: var(--nv-surface-fg);
+}
+.cut-entry {
+  display: block;
+  width: 100%;
+  margin: 4px 0 12px;
+  padding: 8px 12px;
+  text-align: start;
+}
+.fold-run {
+  display: block;
+  width: 100%;
+  margin: 4px 0;
+  padding: 8px 12px;
+  text-align: start;
+  color: var(--nv-muted);
+}
+.transcript-latest {
+  position: absolute;
+  right: 16px;
+  bottom: 16px;
+  padding: 0 16px;
+}
+.tool-result-preview-more {
+  min-height: 32px;
+}

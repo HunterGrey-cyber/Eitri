@@ -3556,31 +3556,110 @@ mod tests {
         assert_eq!(set_mode(&state, tab), SessionModeChoice::Auto, "nothing changed");
     }
 
-    /// No source that builds the panel document or its policy may allow inline script by keyword:
-    /// the Rust sources of this crate, and the web frontend's own `index.html` and sources. Matches
-    /// on content only, so where a line ends does not matter; the needle is split so this test does
-    /// not find itself.
+    /// Whether `text` holds a `script-src` directive (or `script-src-elem`/`-attr`) that lists `'unsafe-inline'`
+    /// among its sources (`directive_sources`). Never stops at a line end, so a policy written over several lines
+    /// is read whole.
+    fn allows_inline_script(text: &str) -> bool {
+        let keyword = concat!("'unsafe", "-inline'");
+        text.match_indices("script-src")
+            .any(|(at, name)| directive_sources(&text[at + name.len()..]).contains(keyword))
+    }
+
+    /// The text of a directive's sources, from just after its name: up to the end of the directive (`;`), the next
+    /// directive's name, the end of the element it sits in (`<`, `>`), or the end of the string it sits in -- a `"`
+    /// or backtick that another string does not continue. A policy built from pieces (`"script-src 'self'",` then
+    /// another string on the next line, or joined with `+`) is read on into the next piece.
+    fn directive_sources(rest: &str) -> &str {
+        let bytes = rest.as_bytes();
+        let mut i = 0;
+        while i < bytes.len() {
+            match bytes[i] {
+                b';' | b'<' | b'>' => return &rest[..i],
+                b'"' | b'`' => {
+                    let mut next = i + 1;
+                    while next < bytes.len() && matches!(bytes[next], b' ' | b'\t' | b'\r' | b'\n' | b',' | b'+') {
+                        next += 1;
+                    }
+                    if !matches!(bytes.get(next), Some(b'"' | b'`')) {
+                        return &rest[..i];
+                    }
+                    i = next + 1;
+                    continue;
+                }
+                b'a'..=b'z' if i == 0 || matches!(bytes[i - 1], b' ' | b'\t' | b'\r' | b'\n' | b'"' | b'`') => {
+                    let word = rest[i..]
+                        .split(|c: char| !(c.is_ascii_lowercase() || c == '-'))
+                        .next()
+                        .unwrap_or("");
+                    let directive = word.ends_with("-src")
+                        || [
+                            "frame-ancestors",
+                            "base-uri",
+                            "form-action",
+                            "sandbox",
+                            "report-uri",
+                            "report-to",
+                        ]
+                        .contains(&word);
+                    if directive {
+                        return &rest[..i];
+                    }
+                }
+                _ => {}
+            }
+            i += 1;
+        }
+        rest
+    }
+
+    /// No source that builds a page's policy may let a `script-src` allow inline script by keyword, whatever else it
+    /// lists: the Rust sources of this crate and the shell, the web frontend's sources, both of its pages, and the
+    /// transcript build's config and the module it takes that page's policy from. Matches on content only, so where a line ends does
+    /// not matter; the keyword is split so this test does not find itself.
     #[test]
-    fn no_shell_source_allows_inline_script_by_keyword() {
+    fn no_script_src_unsafe_inline_anywhere() {
         use eitri_core::source_scan as scan;
         const SCANNED: &[&str] = &["shell/src", "panel/src"];
         const WEB: &[&str] = &["agent-ui/web/src"];
-        let needle = concat!("script-src ", "'unsafe-inline'");
+        const PAGES: &[&str] = &[
+            "agent-ui/web/index.html",
+            "agent-ui/web/index.transcript.html",
+            "agent-ui/web/vite.transcript.config.ts",
+            "agent-ui/web/scripts/transcript-bundle-check.mjs",
+        ];
+        let inline = concat!("'unsafe", "-inline'");
+        for caught in [
+            format!("script-src 'self' {inline}"),
+            format!("default-src 'none'; script-src 'sha256-x'\n  {inline}; style-src {inline}"),
+            format!("<meta content=\"script-src-elem {inline}\">"),
+            format!("[\"script-src 'self'\", \"{inline}\"]"),
+            format!("\"script-src 'self' \" +\n  `{inline}`"),
+        ] {
+            assert!(allows_inline_script(&caught), "not caught: {caught}");
+        }
+        for allowed in [
+            format!("default-src 'none'; script-src 'sha256-x'; style-src {inline}"),
+            format!("`script-src {{hash}}; style-src {inline}`"),
+            format!("[\"script-src 'sha256-x'\",\n  \"style-src {inline}\"].join('; ')"),
+            format!("// `script-src` is pinned by hash, and `{inline}` sits on `style-src` only"),
+        ] {
+            assert!(!allows_inline_script(&allowed), "caught wrongly: {allowed}");
+        }
         let rust = scan::rust_sources(SCANNED);
         scan::require_anchors(&rust, &["fn content_security_policy_for(", "impl PanelDocument"]);
         let web = scan::sources(WEB, &["ts", "tsx", "js", "jsx", "css", "html"]);
-        let page = scan::read_required("agent-ui/web/index.html");
-        // The raw text, not the code: the policy is a string literal.
+        let pages: Vec<_> = PAGES.iter().map(|path| scan::read_required(path)).collect();
+        // The raw text, not the code: a policy is a string literal.
         let offenders: Vec<&str> = rust
             .iter()
             .chain(&web)
-            .chain(std::iter::once(&page))
-            .filter(|source| source.text.contains(needle))
+            .chain(&pages)
+            .filter(|source| allows_inline_script(&source.text))
             .map(|source| source.path.as_str())
             .collect();
         assert!(
             offenders.is_empty(),
-            "inline script allowed by keyword in: {offenders:?}"
+            "a script-src allows inline script by keyword in: {offenders:?}"
         );
     }
 

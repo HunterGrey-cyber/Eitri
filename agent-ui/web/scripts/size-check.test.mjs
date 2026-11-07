@@ -3,7 +3,7 @@ import assert from 'node:assert/strict';
 import { spawnSync } from 'node:child_process';
 import { mkdtempSync, mkdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
-import { join } from 'node:path';
+import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { test } from 'node:test';
 import { gzipSync } from 'node:zlib';
@@ -11,12 +11,12 @@ import { gzipSync } from 'node:zlib';
 const script = fileURLToPath(new URL('./size-check.mjs', import.meta.url));
 const LIMIT = 240000;
 
-function check(bytes, args = [String(LIMIT)]) {
+function check(bytes, args = [String(LIMIT)], file = 'dist/index.html') {
   const cwd = mkdtempSync(join(tmpdir(), 'eitri-size-'));
   try {
     if (bytes !== undefined) {
-      mkdirSync(join(cwd, 'dist'));
-      writeFileSync(join(cwd, 'dist/index.html'), bytes);
+      mkdirSync(join(cwd, dirname(file)), { recursive: true });
+      writeFileSync(join(cwd, file), bytes);
     }
     const run = spawnSync(process.execPath, [script, ...args], { cwd, encoding: 'utf8' });
     return { status: run.status, stdout: run.stdout, stderr: run.stderr };
@@ -58,7 +58,7 @@ test('a missing build fails', () => {
 
 test('a missing or malformed limit fails before measuring', () => {
   const bytes = Buffer.from('<html></html>');
-  for (const args of [[], ['0'], ['-1'], ['12kb'], ['1.5']]) {
+  for (const args of [[], ['0'], ['-1'], ['12kb'], ['1.5'], ['100', 'dist/index.html', 'extra'], ['100', '']]) {
     const result = check(bytes, args);
     assert.equal(result.status, 2, `limit ${JSON.stringify(args)}: ${result.stderr}`);
     assert.match(result.stderr, /usage/);
@@ -87,4 +87,14 @@ test('exactly the limit passes and one more byte fails', () => {
     const result = check(input);
     assert.equal(result.status, delta > 0 ? 1 : 0, result.stderr);
   }
+});
+
+test('a second argument names the file to measure', () => {
+  const bytes = Buffer.from('<html>transcript</html>'.repeat(1000));
+  const file = 'dist-transcript/index.html';
+  const result = check(bytes, ['200000', file], file);
+  assert.equal(result.status, 0, result.stderr);
+  assert.match(result.stdout, new RegExp(`^dist-transcript/index\\.html: ${gzipSync(bytes, { level: 9 }).length} bytes`));
+  assert.match(result.stdout, /limit 200000 bytes/);
+  assert.notEqual(check(bytes, ['200000', 'dist/index.html'], file).status, 0, 'the default file is not there');
 });
