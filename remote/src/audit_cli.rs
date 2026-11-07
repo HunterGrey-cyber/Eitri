@@ -27,8 +27,8 @@ use serde_json::Value;
 use crate::cli::shown;
 
 const USAGE: &str = "usage: eitri remote log [--since 24h|7d|<RFC 3339>] [--device NAME] [--event KIND] [--json]
-       eitri remote log --verify    (exit 0 clean, 1 something found, 3 the journal could not be read,
-                                    4 nothing found but not everything checked)";
+       eitri remote log --verify    (exit 0 clean, 1 something found, 3 the journal could not be read or
+                                    holds none of the log's records, 4 nothing found but not everything checked)";
 
 /// `--verify`'s exit when the journal could not be read and the chain alone showed nothing.
 pub const VERIFY_JOURNAL_UNREAD: i32 = 3;
@@ -1268,6 +1268,96 @@ mod tests {
         );
         assert_eq!(journal.unread_parts().len(), 1);
         std::fs::remove_dir_all(base).unwrap();
+    }
+
+    /// Every reading returns `whole` (its newest record held back from the first reading when `late`), and reports
+    /// the same `unread` parts each time.
+    struct Parts {
+        whole: Copy,
+        unread: Vec<(String, String)>,
+        late: bool,
+        readings: std::cell::Cell<u32>,
+    }
+
+    impl JournalSource for Parts {
+        fn entries(&self) -> io::Result<Vec<JournalEntry>> {
+            self.readings.set(self.readings.get() + 1);
+            let mut entries = self.whole.0.clone();
+            if self.late && self.readings.get() == 1 {
+                // `Copy` lists them newest first.
+                entries.remove(0);
+            }
+            Ok(entries)
+        }
+        fn unread_parts(&self) -> Vec<(String, String)> {
+            self.unread.clone()
+        }
+    }
+
+    fn user_part_fails() -> Vec<(String, String)> {
+        vec![("--user SYSLOG_IDENTIFIER=eitri-remote".into(), "nope".into())]
+    }
+
+    #[test]
+    fn a_part_unread_in_both_readings_is_named_and_incomplete() {
+        let dir = scratch("verify-unread-twice");
+        let mut log = open(&dir);
+        for n in 0..3 {
+            log.record(conn_open(&format!("d{n}"), "phone")).unwrap();
+        }
+        drop(log);
+        // The newest record's copy comes with the second reading; the user part fails both times.
+        let journal = Parts {
+            whole: Copy::of(&dir, OUR_EXE),
+            unread: user_part_fails(),
+            late: true,
+            readings: std::cell::Cell::new(0),
+        };
+        let (code, out, err) = run(&dir, &["--verify"], &journal);
+        assert_eq!(code, VERIFY_INCOMPLETE, "{out}{err}");
+        assert_eq!(journal.readings.get(), 2, "read once more");
+        assert_eq!(
+            out.lines().collect::<Vec<_>>(),
+            [
+                "incomplete: nothing found, but not everything was checked",
+                "  not checked: what only this part of the journal holds: journalctl --user \
+                 SYSLOG_IDENTIFIER=eitri-remote: nope",
+            ],
+            "{out}"
+        );
+        assert!(
+            err.contains("journalctl --user SYSLOG_IDENTIFIER=eitri-remote: nope"),
+            "{err}"
+        );
+        std::fs::remove_dir_all(dir.parent().unwrap()).unwrap();
+    }
+
+    #[test]
+    fn a_finding_beside_an_unread_part_is_a_finding() {
+        let dir = scratch("verify-finding-and-unread");
+        let mut log = open(&dir);
+        for n in 0..3 {
+            log.record(conn_open(&format!("d{n}"), "phone")).unwrap();
+        }
+        drop(log);
+        let journal = Parts {
+            whole: Copy::of(&dir, OUR_EXE),
+            unread: user_part_fails(),
+            late: false,
+            readings: std::cell::Cell::new(0),
+        };
+        // An edit in the middle of the file.
+        let path = dir.join("audit.jsonl");
+        let text = std::fs::read_to_string(&path).unwrap();
+        std::fs::write(&path, text.replacen("\"d1\"", "\"dX\"", 1)).unwrap();
+        let (code, out, err) = run(&dir, &["--verify"], &journal);
+        assert_eq!(code, 1, "{out}{err}");
+        assert!(
+            out.contains("altered in the file: ") && !out.contains("incomplete"),
+            "{out}"
+        );
+        assert!(err.contains("part of the journal could not be read"), "{err}");
+        std::fs::remove_dir_all(dir.parent().unwrap()).unwrap();
     }
 
     #[test]

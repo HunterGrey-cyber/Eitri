@@ -39,7 +39,8 @@ const COMMAND_USAGE: &[(&str, &str)] = &[
     (
         "log",
         "eitri remote log [--since 24h|7d|<RFC 3339>] [--device <name>] [--event <kind>] [--json] | --verify \
-         (exit 0 clean, 1 something found, 3 the journal could not be read, 4 nothing found but not all checked)",
+         (exit 0 clean, 1 something found, 3 the journal could not be read or holds none of the log's records, \
+         4 nothing found but not all checked)",
     ),
 ];
 

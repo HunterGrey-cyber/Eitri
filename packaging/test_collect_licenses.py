@@ -742,6 +742,41 @@ class CFileClassification(unittest.TestCase):
             ("crtstuff.c", frozenset({"frame_dummy"})),
         ])
 
+    def test_native_components_fails_ring_code_with_no_ring_file_seen(self):
+        # The whole native half, its readers stubbed: `shell` defines ring's prefixed code but keeps no local under any
+        # FILE entry (a linker that left ring's symbols global), so no C file is classified at all.
+        d = _scratch_dir()
+        self.addCleanup(shutil.rmtree, d, ignore_errors=True)
+        os.makedirs(os.path.join(d, "lua-src", "lua-5.4.9"))
+        open(os.path.join(d, "lua-src", "lua-5.4.9", "lapi.c"), "w").close()
+        os.makedirs(os.path.join(d, "ring", "crypto"))
+        open(os.path.join(d, "ring", "crypto", "mem.c"), "w").close()
+        by_nv = {
+            ("lua-src", "1"): [{"manifest_path": os.path.join(d, "lua-src", "Cargo.toml")}],
+            ("ring", "0.17.14"): [{"manifest_path": os.path.join(d, "ring", "Cargo.toml"), "version": "0.17.14",
+                                   "links": "ring_core_0_17_14_", "license": "Apache-2.0 AND ISC"}],
+        }
+        shipped = {}
+        for b in cl.SHIPPED_BINARIES:
+            shipped[b] = os.path.join(d, b)
+            open(shipped[b], "wb").close()
+        syms = {path: {"main"} for path in shipped.values()}
+        syms[shipped["shell"]] |= {"ring_core_0_17_14_CRYPTO_memcmp"}
+        with mock.patch.object(cl, "defined_symbols", lambda path: syms[path]), \
+                mock.patch.object(cl, "c_file_entries_with_code", lambda path: []):
+            with self.assertRaises(cl.Fail) as ctx:
+                cl.native_components(by_nv, shipped, d)
+        self.assertIn("shell define symbols with ring's prefix ring_core_0_17_14_", str(ctx.exception))
+        # With ring's mem.c recognised under its FILE entry, that check passes (the run goes on to later steps,
+        # which these stubs do not satisfy, so only the message is compared).
+        entries = {shipped["shell"]: [("mem.c", frozenset({"ring_core_0_17_14_CRYPTO_memcmp"}))]}
+        with mock.patch.object(cl, "defined_symbols", lambda path: syms[path]), \
+                mock.patch.object(cl, "c_file_entries_with_code", lambda path: entries.get(path, [])):
+            try:
+                cl.native_components(by_nv, shipped, d)
+            except cl.Fail as e:
+                self.assertNotIn("ring's prefix", str(e))
+
     def test_ring_code_with_none_of_its_files_seen_is_named(self):
         # A linker that left ring's symbols global gives FILE entries with no locals: none is classified, and the
         # binary that still defines ring's prefixed code is named so the run fails.
