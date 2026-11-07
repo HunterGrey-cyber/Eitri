@@ -46,12 +46,18 @@ const KEY_TYPES: &[&str] = &[
 
 /// `eitri remote add-device <name>`: asks the focused window, through `serve`, to show a one-time enrollment code for
 /// the phone `name`. Nothing is enrolled here: the phone presents the code and the desk says yes in that window. With
-/// no server or no window it exits 1.
+/// no server or no window it exits 1. A name that starts with `-` is refused (exit 2): it is an option typed where the
+/// name goes, and would otherwise start an enrollment.
 pub fn add_device(args: &[String]) -> i32 {
     let [name] = args else {
         eprintln!("usage: eitri remote add-device <name>");
         return 2;
     };
+    if name.starts_with('-') {
+        eprintln!("eitri remote add-device: {name:?} is not a device name (it reads as an option)");
+        eprintln!("usage: eitri remote add-device <name>");
+        return 2;
+    }
     let control_dir =
         eitri_core::panel_control::control_dir(std::env::var_os("XDG_RUNTIME_DIR").as_deref(), &std::env::temp_dir());
     match serve_control_socket_path(&control_dir) {

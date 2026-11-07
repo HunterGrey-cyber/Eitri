@@ -4,14 +4,23 @@
 //! `devices_connected` line naming each phone connected now: its device, the `Host` its request named, the address it
 //! came from and when. A window keeps the device's last sighting from it. The lines go out on a thread of their own,
 //! so no phone's session waits for a window, and a report that finds a newer one queued behind it is skipped.
+//!
+//! The same thread looks for windows every [`LOOK_EVERY`] between reports and tells each `rv-` socket that has not yet
+//! taken the newest report (a window opened since, one whose socket was bound again, one that could not be reached),
+//! so a window that opens while a phone is connected shows it without waiting for another phone to come or go.
 
 use std::collections::{BTreeMap, BTreeSet};
+use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
-use std::sync::mpsc::{self, Receiver, Sender};
+use std::sync::mpsc::{self, Receiver, RecvTimeoutError, Sender};
+use std::time::Duration;
 
 use eitri_core::remote_rv::{rv_socket_path, Connected, RvClient, RvInbound, RV_PROTOCOL};
 
 use super::route::is_instance;
+
+/// How often the windows are looked for between reports.
+pub const LOOK_EVERY: Duration = Duration::from_secs(1);
 
 /// Sends the connected phones to every window; cheap to clone.
 #[derive(Clone)]
@@ -36,22 +45,48 @@ impl Reporter {
     }
 }
 
+/// A socket as one bind made it: its path, inode and change time, so a socket bound again at the same path is another.
+type Bound = (PathBuf, u64, i64, i64);
+
+fn bound(path: PathBuf) -> Option<Bound> {
+    let meta = std::fs::symlink_metadata(&path).ok()?;
+    Some((path, meta.ino(), meta.ctime(), meta.ctime_nsec()))
+}
+
 fn run(control: &Path, rx: Receiver<Vec<Connected>>) {
-    while let Ok(mut now) = rx.recv() {
-        // Only the newest report matters.
-        while let Ok(newer) = rx.try_recv() {
-            now = newer;
+    // The newest report, and the sockets that have taken it.
+    let mut newest: Option<RvInbound> = None;
+    let mut told: BTreeSet<Bound> = BTreeSet::new();
+    loop {
+        match rx.recv_timeout(LOOK_EVERY) {
+            Ok(mut now) => {
+                // Only the newest report matters.
+                while let Ok(newer) = rx.try_recv() {
+                    now = newer;
+                }
+                newest = Some(RvInbound::DevicesConnected {
+                    v: RV_PROTOCOL,
+                    devices: now,
+                });
+                told.clear();
+            }
+            Err(RecvTimeoutError::Timeout) => {}
+            Err(RecvTimeoutError::Disconnected) => return,
         }
-        let line = RvInbound::DevicesConnected {
-            v: RV_PROTOCOL,
-            devices: now,
-        };
-        // A window that cannot be reached is going away; it is told at the next report, if it stays.
-        for socket in window_sockets(control) {
-            if let Ok(mut client) = RvClient::connect(&socket) {
-                if let Err(e) = client.send(&line) {
+        // Before the first report there is nobody to name, and a window starts out naming nobody.
+        let Some(line) = &newest else { continue };
+        let present: Vec<Bound> = window_sockets(control).into_iter().filter_map(bound).collect();
+        told.retain(|socket| present.contains(socket));
+        for socket in present {
+            if told.contains(&socket) {
+                continue;
+            }
+            // A window that cannot be reached is going away, or not listening yet: it is tried at the next look.
+            if let Ok(mut client) = RvClient::connect(&socket.0) {
+                if let Err(e) = client.send(line) {
                     eprintln!("[remote] could not report the connected phones: {e}");
                 }
+                told.insert(socket);
             }
         }
     }

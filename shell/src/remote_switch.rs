@@ -10,10 +10,18 @@
 //! A window that finds `serve` running pairs phones with what that `serve` listens on (its record), not with its own
 //! keys, which may have changed since it started. And it looks once more [`IDLE_EDGE`] later: a `serve` that had just
 //! seen no window, and so ends, may have held the lock when this window looked, and this window would otherwise be left
-//! with no `serve` until another window starts.
+//! with no `serve` until another window starts. That second look starts nothing when `eitri remote stop` ran after the
+//! first (`serve::stopped_since`): an explicit stop is not the idle exit it is there for.
+//!
+//! What keeps a window that asked for remote control from having it is said on the window's toast as well as on
+//! stderr, since a window started from the desktop has no terminal: the agents layer off, a socket or directory that
+//! could not be made, a `serve` already running with other keys, the desk's no to an address, and a `serve` that could
+//! not start or ended with an error. Each line goes from the thread to the GTK thread through the main loop.
 
 use std::path::PathBuf;
-use std::time::{Duration, Instant};
+use std::rc::Rc;
+use std::sync::Arc;
+use std::time::{Duration, Instant, SystemTime};
 
 use eitri_core::lua::config::{ConfigStore, RemoteSettings};
 use eitri_core::remote_pairing::{DEVICES_FILE, ENROLL_CODE_TTL};
@@ -21,8 +29,8 @@ use eitri_core::remote_runtime::{pairing_endpoint, start_serve, RemotePlan, Serv
 use eitri_core::remote_rv::RV_IDLE;
 use eitri_core::remote_rv::{parse_rv_outbound, rv_socket_path, RvClient, RvInbound, RvOutbound, RV_PROTOCOL};
 use eitri_panel::agent_panel::{Pairing, RemoteSocket};
-use eitri_remote::serve::spawn::{plan, running_config, ServeSpawner};
-use eitri_remote::serve::Dirs;
+use eitri_remote::serve::spawn::{plan, running_config, ServeEnded, ServeSpawner};
+use eitri_remote::serve::{stopped_since, Dirs};
 use gtk4::glib;
 
 use crate::agent_panel::AgentPanelHandle;
@@ -39,12 +47,41 @@ const _: () = assert!(ASK_KEEPALIVE.as_secs() * 2 < RV_IDLE.as_secs());
 /// window, well inside this.
 const IDLE_EDGE: Duration = Duration::from_secs(10);
 
-/// Switches remote control on for the window whose panel is `panel` and whose agents instance is `instance`, when
-/// `config` says so.
-pub(crate) fn start(panel: &AgentPanelHandle, instance: &str, config: &ConfigStore) {
+/// What a window that asked for remote control says when the agents layer, which remote control follows, is off.
+const AGENTS_OFF: &str = "off: it follows the agents layer, and agents.enabled is false";
+
+/// A line for the desk, sent from a thread of this module to the window's toast.
+type Notes = futures_channel::mpsc::UnboundedSender<String>;
+
+/// The desk's notices on `toast`, each after what is up there now; nothing once the window is gone.
+pub(crate) fn toast_notice(toast: &Rc<crate::toast::Toast>) -> Rc<dyn Fn(String)> {
+    let toast = Rc::downgrade(toast);
+    Rc::new(move |text| {
+        if let Some(toast) = toast.upgrade() {
+            toast.show_notice_when_free(text);
+        }
+    })
+}
+
+/// Says `text` on stderr as a `[remote]` line and sends it to the desk.
+fn say(notes: &Notes, text: String) {
+    eprintln!("[remote] {text}");
+    let _ = notes.unbounded_send(format!("Remote control: {text}"));
+}
+
+/// Switches remote control on for the window whose panel is `panel` and whose agents instance is `instance` (`None`
+/// with the agents layer off), when `config` says so. What keeps it off, or keeps phones from reaching the desk, goes
+/// to `notice` on the GTK thread.
+pub(crate) fn start(
+    panel: &AgentPanelHandle,
+    instance: Option<&str>,
+    config: &ConfigStore,
+    notice: Rc<dyn Fn(String)>,
+) {
     let settings = match RemoteSettings::read(config) {
         Ok(settings) => settings,
         Err(e) => {
+            // A bad key is among the window's startup problems already.
             eprintln!("[remote] off: {e}");
             return;
         }
@@ -52,28 +89,39 @@ pub(crate) fn start(panel: &AgentPanelHandle, instance: &str, config: &ConfigSto
     if !settings.enabled {
         return;
     }
+    let (notes, mut noted) = futures_channel::mpsc::unbounded::<String>();
+    glib::spawn_future_local(async move {
+        while let Ok(text) = noted.recv().await {
+            notice(text);
+        }
+    });
+    let Some(instance) = instance else {
+        say(&notes, AGENTS_OFF.to_owned());
+        return;
+    };
     let dirs = match Dirs::from_env() {
         Ok(dirs) => dirs,
         Err(e) => {
-            eprintln!("[remote] off: {e}");
+            say(&notes, format!("off: {e}"));
             return;
         }
     };
     let exe = match std::env::current_exe() {
         Ok(exe) => exe,
         Err(e) => {
-            eprintln!("[remote] off: this program's own path is unknown: {e}");
+            say(&notes, format!("off: this program's own path is unknown: {e}"));
             return;
         }
     };
     let wake = panel.remote_waker();
     let (socket_tx, socket_rx) = futures_channel::oneshot::channel::<RemoteSocket>();
     let instance = instance.to_owned();
+    let thread_notes = notes.clone();
     let spawned = std::thread::Builder::new()
         .name("eitri-remote-start".into())
-        .spawn(move || switch_on(&settings, &dirs, &instance, exe, wake, socket_tx));
+        .spawn(move || switch_on(&settings, &dirs, &instance, exe, wake, socket_tx, &thread_notes));
     if let Err(e) = spawned {
-        eprintln!("[remote] off: could not start: {e}");
+        say(&notes, format!("off: could not start: {e}"));
         return;
     }
     let panel = panel.clone();
@@ -92,7 +140,10 @@ fn switch_on(
     exe: PathBuf,
     wake: agent::UiWake,
     socket_to: futures_channel::oneshot::Sender<RemoteSocket>,
+    notes: &Notes,
 ) {
+    // Taken before the first look, so a stop after it is seen by the second.
+    let looked = SystemTime::now();
     let mut now = plan(settings, dirs);
     let RemotePlan::On {
         bind_rv: true,
@@ -104,17 +155,17 @@ fn switch_on(
     };
     let ask_listen = ask_listen.clone();
     if let Err(e) = eitri_core::panel_control::ensure_dir(&dirs.control) {
-        eprintln!("[remote] off: {e}");
+        say(notes, format!("off: {e}"));
         return;
     }
     if let Err(e) = eitri_core::state_paths::create_state_dir(&dirs.state) {
-        eprintln!("[remote] off: could not make {}: {e}", dirs.state.display());
+        say(notes, format!("off: could not make {}: {e}", dirs.state.display()));
         return;
     }
     let socket = match RemoteSocket::bind_waking(&dirs.control, instance, &dirs.state.join(DEVICES_FILE), wake) {
         Ok(socket) => socket,
         Err(e) => {
-            eprintln!("[remote] off: could not bind this window's rv- socket: {e}");
+            say(notes, format!("off: could not bind this window's rv- socket: {e}"));
             return;
         }
     };
@@ -129,7 +180,7 @@ fn switch_on(
         }
     );
     let paired = if found_running {
-        paired_with_running(dirs, &cfg)
+        paired_with_running(dirs, &cfg, notes)
     } else {
         cfg.clone()
     };
@@ -142,7 +193,10 @@ fn switch_on(
             endpoint,
             ssh_dir: PathBuf::from(SSH_HOST_KEYS_DIR),
         }),
-        Err(e) => eprintln!("[remote] this window cannot enroll phones: no port for serve: {e}"),
+        Err(e) => say(
+            notes,
+            format!("this window cannot enroll phones: no port for serve: {e}"),
+        ),
     }
     if socket_to.send(socket).is_err() {
         // The window went while this ran; the socket closed with the value.
@@ -152,6 +206,10 @@ fn switch_on(
     let mut ask_listen = ask_listen;
     if found_running {
         std::thread::sleep(IDLE_EDGE);
+        if stopped_since(dirs, looked) {
+            println!("[remote] eitri remote stop ran: serve stays stopped until a window starts");
+            return;
+        }
         now = plan(settings, dirs);
         ask_listen = match &now {
             RemotePlan::On { ask_listen, .. } => ask_listen.clone(),
@@ -162,35 +220,79 @@ fn switch_on(
         match ask_desk(dirs, instance, &addr) {
             Ok(true) => now = plan(settings, dirs),
             Ok(false) => {
-                eprintln!("[remote] serve not started: the desk did not say yes to listening on {addr}");
+                say(
+                    notes,
+                    format!("serve not started: the desk did not say yes to listening on {addr}"),
+                );
                 return;
             }
             Err(e) => {
-                eprintln!("[remote] serve not started: the desk could not be asked about {addr}: {e}");
+                say(
+                    notes,
+                    format!("serve not started: the desk could not be asked about {addr}: {e}"),
+                );
                 return;
             }
         }
     }
-    match start_serve(&now, &ServeSpawner::new(exe)) {
+    let spawner = ServeSpawner::new(exe).on_end(on_serve_end(dirs.clone(), cfg.clone(), notes.clone()));
+    match start_serve(&now, &spawner) {
         Ok(true) => println!("[remote] started eitri remote serve {}", cfg.args().join(" ")),
         Ok(false) => {}
-        Err(e) => eprintln!("[remote] could not start eitri remote serve: {e}"),
+        Err(e) => say(notes, format!("could not start eitri remote serve: {e}")),
     }
 }
 
-/// What phones are paired with when `serve` already runs: its configuration as recorded, said when it is not this
-/// window's own; this window's own while the record is not whole yet.
-fn paired_with_running(dirs: &Dirs, own: &ServeConfig) -> ServeConfig {
+/// What the reaper of a `serve` this window started tells the desk: a `serve` with other keys found running (named
+/// key by key, from its record), or one that ended with an error.
+fn on_serve_end(dirs: Dirs, own: ServeConfig, notes: Notes) -> eitri_remote::serve::spawn::OnServeEnd {
+    let notes = std::sync::Mutex::new(notes);
+    Arc::new(move |ended| {
+        let differences = || running_config(&dirs).map(|running| running.differences(&own));
+        if let Some(text) = ended_text(&ended, differences) {
+            // The reaper said its own line on stderr already.
+            let _ = notes
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .unbounded_send(format!("Remote control: {text}"));
+        }
+    })
+}
+
+/// The desk's line for how a `serve` this window started ended, if it needs one; `differences` reads how the `serve`
+/// running instead differs from this window's keys.
+fn ended_text(ended: &ServeEnded, differences: impl FnOnce() -> Option<Vec<String>>) -> Option<String> {
+    match ended {
+        ServeEnded::RunningDifferent => Some(mismatch_text(&differences().unwrap_or_default())),
+        ServeEnded::Failed(code) => Some(format!(
+            "eitri remote serve ended with exit {code}, so phones cannot reach this desk (the window's log says why)"
+        )),
+        ServeEnded::Idle | ServeEnded::RunningSame | ServeEnded::Signalled | ServeEnded::Unknown => None,
+    }
+}
+
+/// The line for a `serve` already running with other keys than this window's.
+fn mismatch_text(differences: &[String]) -> String {
+    let named = if differences.is_empty() {
+        String::new()
+    } else {
+        format!(" ({})", differences.join("; "))
+    };
+    format!(
+        "eitri remote serve already runs with other keys than this window's{named}; phones pair with what runs, and \
+         this window's take effect after eitri remote stop and a new window"
+    )
+}
+
+/// What phones are paired with when `serve` already runs: its configuration as recorded, said to the desk when it is
+/// not this window's own; this window's own while the record is not whole yet.
+fn paired_with_running(dirs: &Dirs, own: &ServeConfig, notes: &Notes) -> ServeConfig {
     let Some(running) = running_config(dirs) else {
         return own.clone();
     };
-    let differs = running.listen != own.listen || own.port.is_some_and(|port| running.port != Some(port));
-    if differs {
-        eprintln!(
-            "[remote] eitri remote serve already runs with {}; this window's remote.* keys ({}) take effect after              eitri remote stop and a new window",
-            running.args().join(" "),
-            own.args().join(" ")
-        );
+    let differences = running.differences(own);
+    if !differences.is_empty() {
+        say(notes, mismatch_text(&differences));
     }
     running
 }
@@ -268,6 +370,72 @@ mod tests {
 
     fn line(out: RvOutbound) -> String {
         out.line()
+    }
+
+    #[test]
+    fn the_desk_hears_of_a_serve_with_other_keys_or_one_that_failed() {
+        let named = vec!["listen: running loopback, this window socket".to_owned()];
+        let text = ended_text(&ServeEnded::RunningDifferent, || Some(named.clone())).unwrap();
+        assert!(
+            text.contains("(listen: running loopback, this window socket)"),
+            "{text}"
+        );
+        assert!(text.contains("eitri remote stop"), "{text}");
+        // Its record not read: still said, without the list.
+        let text = ended_text(&ServeEnded::RunningDifferent, || None).unwrap();
+        assert!(
+            text.starts_with("eitri remote serve already runs with other keys than this window's;"),
+            "{text}"
+        );
+        let text = ended_text(&ServeEnded::Failed(2), || unreachable!()).unwrap();
+        assert!(text.contains("exit 2"), "{text}");
+        for quiet in [
+            ServeEnded::Idle,
+            ServeEnded::RunningSame,
+            ServeEnded::Signalled,
+            ServeEnded::Unknown,
+        ] {
+            assert_eq!(ended_text(&quiet, || unreachable!()), None, "{quiet:?}");
+        }
+    }
+
+    #[test]
+    fn a_window_paired_with_a_running_serve_tells_the_desk_how_its_keys_differ() {
+        let dir = scratch("differs");
+        let dirs = Dirs {
+            control: dir.join("control"),
+            state: dir.join("state"),
+        };
+        eitri_core::panel_control::ensure_dir(&dirs.control).unwrap();
+        let record = dirs.control.join(eitri_remote::serve::RECORD_FILE);
+        let mut file = agent::private_fs::open_private(&record).unwrap();
+        std::io::Write::write_all(
+            &mut file,
+            br#"{"v":1,"pid":1,"args":["--listen","loopback","--port","7500"],"sandbox":"full"}"#,
+        )
+        .unwrap();
+        let own = |listen| ServeConfig {
+            listen,
+            port: None,
+            origins: Vec::new(),
+        };
+        let (notes, mut noted) = futures_channel::mpsc::unbounded::<String>();
+        let paired = paired_with_running(&dirs, &own(eitri_core::lua::config::RemoteListen::Loopback), &notes);
+        assert_eq!(paired.port, Some(7500));
+        assert!(noted.try_recv().is_err(), "the same keys say nothing");
+        let paired = paired_with_running(&dirs, &own(eitri_core::lua::config::RemoteListen::Socket), &notes);
+        assert_eq!(
+            paired.listen,
+            eitri_core::lua::config::RemoteListen::Loopback,
+            "paired with what runs"
+        );
+        let text = noted.try_recv().unwrap();
+        assert!(
+            text.starts_with("Remote control: eitri remote serve already runs"),
+            "{text}"
+        );
+        assert!(text.contains("listen: running loopback, this window socket"), "{text}");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

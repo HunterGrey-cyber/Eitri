@@ -64,6 +64,10 @@ pub fn checks() -> Vec<(&'static str, Check)> {
             devices_connected_reaches_every_panel,
         ),
         (
+            "a_window_opened_later_is_told_who_is_connected",
+            a_window_opened_later_is_told_who_is_connected,
+        ),
+        (
             "a_refused_more_keeps_the_subscription",
             a_refused_more_keeps_the_subscription,
         ),
@@ -322,7 +326,7 @@ fn turn_all(windows: &[&Window]) {
 struct FakeWindow {
     instance: String,
     lines: mpsc::Receiver<Value>,
-    _listener: RvListener,
+    listener: Option<RvListener>,
     publisher: Option<Publisher>,
 }
 
@@ -341,9 +345,25 @@ impl FakeWindow {
         FakeWindow {
             instance,
             lines,
-            _listener: listener,
+            listener: Some(listener),
             publisher: Some(publisher),
         }
+    }
+
+    /// Closes its `rv-` socket and binds the same instance's again: a new listener at the same path.
+    fn rebind(&mut self, world: &World) {
+        drop(self.listener.take());
+        let (tx, lines) = mpsc::channel();
+        let me = self.instance.clone();
+        self.listener = Some(
+            RvListener::bind(&world.control, &self.instance, move |stream| {
+                let (tx, me) = (tx.clone(), me.clone());
+                std::thread::spawn(move || serve_fake(stream, &tx, &me));
+                true
+            })
+            .unwrap(),
+        );
+        self.lines = lines;
     }
 
     fn publish(&self, keys: &[&str]) {
@@ -1138,6 +1158,37 @@ fn devices_connected_reaches_every_panel(dir: &Path) -> Result<(), String> {
     check(world.hub.connections() <= 1, || {
         format!("{} connections left", world.hub.connections())
     })
+}
+
+/// A window that opens while a phone is connected is told who is connected without waiting for another phone to come
+/// or go, and so is a window whose socket is bound again.
+fn a_window_opened_later_is_told_who_is_connected(dir: &Path) -> Result<(), String> {
+    let world = World::new(dir, Limits::default());
+    let first = FakeWindow::open(&world);
+    let _phone = world.phone_as(WATCH);
+    first
+        .next_of("devices_connected", PATIENCE)
+        .ok_or("the first window was never told")?;
+    let names_the_phone = |line: &Value| {
+        let devices = line["devices"].as_array().cloned().unwrap_or_default();
+        devices.len() == 1 && devices[0]["device"] == WATCH.0
+    };
+    let mut later = FakeWindow::open(&world);
+    let line = later
+        .next_of("devices_connected", PATIENCE)
+        .ok_or("a window opened after the phone connected was never told")?;
+    check(names_the_phone(&line), || format!("{}: {line}", later.instance))?;
+    // Told once: the next look does not tell it again.
+    check(
+        later.next_of("devices_connected", Duration::from_secs(3)).is_none(),
+        || format!("{} was told twice", later.instance),
+    )?;
+    // The same window's socket bound again is a window to tell again.
+    later.rebind(&world);
+    let line = later
+        .next_of("devices_connected", PATIENCE)
+        .ok_or("a socket bound again was never told")?;
+    check(names_the_phone(&line), || format!("{}: {line}", later.instance))
 }
 
 fn a_refused_more_keeps_the_subscription(dir: &Path) -> Result<(), String> {

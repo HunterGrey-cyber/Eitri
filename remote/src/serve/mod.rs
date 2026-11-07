@@ -105,6 +105,9 @@ mod linux {
     pub const LOCK_FILE: &str = "remote.lock";
     /// What the running `serve` records of itself, beside the lock.
     pub const RECORD_FILE: &str = "remote-serve.json";
+    /// When `eitri remote stop` last ran, beside the lock: a window that found `serve` running and looks again later
+    /// starts none after a stop.
+    pub const STOPPED_FILE: &str = "remote-stopped";
 
     /// `serve` could not start: an I/O failure or the sandbox.
     pub const EXIT_FAILED: i32 = 1;
@@ -461,8 +464,31 @@ mod linux {
         0
     }
 
+    /// Notes that `eitri remote stop` runs now, for [`stopped_since`].
+    pub fn mark_stopped(dirs: &Dirs) -> io::Result<()> {
+        let at = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_err(io::Error::other)?
+            .as_nanos();
+        agent::private_fs::write_private(&dirs.control.join(STOPPED_FILE), format!("{at}\n").as_bytes())
+    }
+
+    /// Whether `eitri remote stop` ran at or after `since`. A note that cannot be read is no stop.
+    pub fn stopped_since(dirs: &Dirs, since: std::time::SystemTime) -> bool {
+        let Ok(text) = agent::private_fs::read_private_nofollow_capped(&dirs.control.join(STOPPED_FILE), 64) else {
+            return false;
+        };
+        let Ok(at) = text.trim_end().parse::<u128>() else {
+            return false;
+        };
+        since
+            .duration_since(std::time::UNIX_EPOCH)
+            .is_ok_and(|since| at >= since.as_nanos())
+    }
+
     /// `eitri remote stop`: ends the running `serve`, and every phone's connection with it, then waits up to 5 s for
-    /// its lock to be let go. A window starts it again only at its own next start, while remote control is on.
+    /// its lock to be let go. A window starts it again only at its own next start, while remote control is on: the
+    /// stop is noted first ([`mark_stopped`]), so a window that found `serve` running and looks again does not.
     pub fn stop(args: &[String]) -> i32 {
         if !args.is_empty() {
             eprintln!("usage: eitri remote stop");
@@ -475,6 +501,15 @@ mod linux {
                 return EXIT_FAILED;
             }
         };
+        // Noted even when none runs: a window may be about to look again for one that had just ended.
+        match mark_stopped(&dirs) {
+            // No control directory: no window has started, so none looks again.
+            Err(e) if e.kind() == io::ErrorKind::NotFound => {}
+            Err(e) => {
+                eprintln!("eitri remote stop: not noted ({e}); a window started in the last 10 s may start it again")
+            }
+            Ok(()) => {}
+        }
         if !is_running(&dirs).unwrap_or(false) {
             println!("not running");
             return 0;
@@ -603,6 +638,27 @@ mod linux {
             done.recv_timeout(Duration::from_secs(30))
                 .expect("it did not end after the last window went");
             drop(window);
+        }
+
+        #[test]
+        fn a_stop_is_seen_only_by_a_look_before_it() {
+            let dir = scratch("stopped");
+            let dirs = Dirs {
+                control: dir.join("control"),
+                state: dir.join("state"),
+            };
+            eitri_core::panel_control::ensure_dir(&dirs.control).unwrap();
+            let looked = std::time::SystemTime::now();
+            assert!(!stopped_since(&dirs, looked), "no stop was noted yet");
+            mark_stopped(&dirs).unwrap();
+            assert!(stopped_since(&dirs, looked));
+            std::thread::sleep(Duration::from_millis(5));
+            assert!(
+                !stopped_since(&dirs, std::time::SystemTime::now()),
+                "a stop before the look counted"
+            );
+            std::fs::write(dirs.control.join(STOPPED_FILE), b"not a time\n").unwrap();
+            assert!(!stopped_since(&dirs, looked), "an unreadable note counted as a stop");
         }
 
         #[test]

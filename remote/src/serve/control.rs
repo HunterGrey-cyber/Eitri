@@ -11,7 +11,7 @@
 //! and none focused the request is refused, naming why (a terminal outside Eitri holds the focus itself).
 
 use std::collections::BTreeSet;
-use std::io::{self, BufRead, BufReader, Read, Write};
+use std::io::{self, Read, Write};
 use std::os::unix::fs::PermissionsExt;
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
@@ -107,13 +107,41 @@ fn answer(mut stream: UnixStream, control: &Path) {
 
 /// The request on `stream`: one line within [`RV_LINE_WITHIN`], at most [`RV_MAX_LINE`] bytes, one of the two kinds.
 fn read_request(stream: &UnixStream) -> Result<RvInbound, &'static str> {
-    stream
-        .set_read_timeout(Some(RV_LINE_WITHIN))
-        .map_err(|_| "the request could not be read")?;
+    read_request_within(stream, RV_LINE_WITHIN)
+}
+
+/// [`read_request`], the whole line due within `within` of the first read: each read waits only what is left, so a
+/// peer that sends a byte now and then cannot hold the request open.
+fn read_request_within(stream: &UnixStream, within: Duration) -> Result<RvInbound, &'static str> {
+    let until = Instant::now() + within;
     let mut line = Vec::new();
-    BufReader::new(stream.take(RV_MAX_LINE as u64 + 1))
-        .read_until(b'\n', &mut line)
-        .map_err(|_| "no request came in time")?;
+    let mut chunk = [0u8; 4096];
+    while line.last() != Some(&b'\n') {
+        let left = until.saturating_duration_since(Instant::now());
+        if left.is_zero() {
+            return Err("no request came in time");
+        }
+        // A zero timeout means none at all.
+        stream
+            .set_read_timeout(Some(left.max(Duration::from_millis(1))))
+            .map_err(|_| "the request could not be read")?;
+        let room = (RV_MAX_LINE + 1 - line.len()).min(chunk.len());
+        match (&*stream).read(&mut chunk[..room]) {
+            Ok(0) => break,
+            Ok(n) => {
+                // One line per connection: anything after its newline is not read.
+                match chunk[..n].iter().position(|&b| b == b'\n') {
+                    Some(at) => line.extend_from_slice(&chunk[..=at]),
+                    None => line.extend_from_slice(&chunk[..n]),
+                }
+                if line.len() > RV_MAX_LINE {
+                    break;
+                }
+            }
+            Err(e) if e.kind() == io::ErrorKind::Interrupted => {}
+            Err(_) => return Err("no request came in time"),
+        }
+    }
     if line.last() != Some(&b'\n') {
         return Err("the request is not one line");
     }
@@ -198,6 +226,50 @@ mod tests {
 
     fn set(names: &[&str]) -> BTreeSet<String> {
         names.iter().map(|n| n.to_string()).collect()
+    }
+
+    #[test]
+    fn a_request_sent_a_byte_at_a_time_ends_at_its_deadline() {
+        let (reader, mut writer) = UnixStream::pair().unwrap();
+        let within = Duration::from_millis(400);
+        let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let dripping = {
+            let stop = stop.clone();
+            std::thread::spawn(move || {
+                // Each byte well inside the deadline, and never a newline.
+                let started = Instant::now();
+                while !stop.load(Ordering::SeqCst) && started.elapsed() < Duration::from_secs(20) {
+                    if writer.write_all(b"x").is_err() {
+                        return;
+                    }
+                    std::thread::sleep(within / 4);
+                }
+            })
+        };
+        let started = Instant::now();
+        let read = read_request_within(&reader, within);
+        let took = started.elapsed();
+        stop.store(true, Ordering::SeqCst);
+        dripping.join().unwrap();
+        assert!(read.is_err());
+        // Ten deadlines: far more than one, and far less than the drip runs.
+        assert!(took < within * 10, "a dripped request was read for {took:?}");
+    }
+
+    #[test]
+    fn a_whole_request_is_read() {
+        let (reader, mut writer) = UnixStream::pair().unwrap();
+        writer.write_all(b"{\"v\":1,\"kind\":\"start_enroll\"}\n").unwrap();
+        assert!(matches!(
+            read_request_within(&reader, Duration::from_secs(5)),
+            Ok(RvInbound::StartEnroll { .. })
+        ));
+        writer.write_all(b"{\"v\":1,\"kind\":\"ping\"}").unwrap();
+        drop(writer);
+        assert_eq!(
+            read_request_within(&reader, Duration::from_secs(5)).err(),
+            Some("the request is not one line")
+        );
     }
 
     #[test]

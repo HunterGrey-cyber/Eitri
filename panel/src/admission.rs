@@ -372,7 +372,8 @@ pub(super) fn admit_remote(
             }
             Ok(tab)
         }
-        // Parsed, and not carried out by this build: nothing reaches the tab.
+        // These are admitted by `admit_remote_arm`, which `handle_remote_message` sends every kind but `interrupt`
+        // to; one that reaches this path anyway is refused, and nothing reaches the tab.
         RemoteInbound::Send { .. }
         | RemoteInbound::Queue { .. }
         | RemoteInbound::StopBackground { .. }

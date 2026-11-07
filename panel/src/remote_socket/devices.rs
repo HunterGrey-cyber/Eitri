@@ -24,7 +24,8 @@
 //! A phone's `revoke_self` and `set_push_endpoint` carry its token: the token is checked against the store on the
 //! reader's thread and dropped there, so only the device id goes on. A push endpoint is checked there too (`http` or
 //! `https`, a host, no user information, at most [`PUSH_ENDPOINT_MAX_BYTES`]). Revoking takes the device out of the
-//! store, and its push endpoint with it.
+//! store, and its push endpoint with it. At most [`PHONE_ERRANDS_MAX`] of these are at work at once, each on a thread
+//! that may wait for the store's lock; one more is answered [`ERRANDS_BUSY`] at once.
 //!
 //! `devices_connected` is `serve`'s report, sent on every open and close, and written on the reader's thread in the
 //! order it came: the devices it names get `last_seen` and `last_host`, and those named by the previous report and not
@@ -77,6 +78,14 @@ pub(super) const UNKNOWN_RECIPE_ONLY_WATCHES: &str = "a device whose recipe is n
 /// What a grant change is told when the device's grant changed while the desk was asked.
 const GRANT_MOVED: &str = "the device's grant changed while the desk was asked";
 
+/// The phone-sent errands (a self-revocation, a push endpoint) that may be at work on the store at once. Each waits
+/// for the store's lock on a thread of its own, so a phone that repeats them while the lock is held would otherwise
+/// leave a thread behind for every one.
+pub(super) const PHONE_ERRANDS_MAX: usize = 4;
+
+/// What a phone-sent errand is told when [`PHONE_ERRANDS_MAX`] are already at work.
+pub(super) const ERRANDS_BUSY: &str = "the desk is still changing the device store: try again";
+
 /// The longest push endpoint kept.
 pub const PUSH_ENDPOINT_MAX_BYTES: usize = 512;
 
@@ -115,6 +124,8 @@ pub(super) struct DevicesShared {
     link_of: Mutex<Arc<LinkOf>>,
     /// The devices `serve`'s last report named, so the next tells which closed.
     connected: Mutex<BTreeSet<String>>,
+    /// The phone-sent errands at work now, at most [`PHONE_ERRANDS_MAX`].
+    pub(super) phone_errands: Arc<AtomicUsize>,
 }
 
 impl DevicesShared {
@@ -132,6 +143,7 @@ impl DevicesShared {
                 Some((iface, kind))
             })),
             connected: Mutex::new(BTreeSet::new()),
+            phone_errands: Arc::new(AtomicUsize::new(0)),
         }
     }
 }
@@ -382,6 +394,26 @@ fn off_the_tick(shared: Arc<Shared>, conn: u64, work: impl FnOnce(&Shared) -> De
     }
 }
 
+/// One of the [`PHONE_ERRANDS_MAX`] phone-sent errands at work, given back when dropped.
+struct ErrandSlot(Arc<AtomicUsize>);
+
+impl ErrandSlot {
+    fn take(count: &Arc<AtomicUsize>) -> Option<ErrandSlot> {
+        count
+            .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |n| {
+                (n < PHONE_ERRANDS_MAX).then_some(n + 1)
+            })
+            .ok()?;
+        Some(ErrandSlot(Arc::clone(count)))
+    }
+}
+
+impl Drop for ErrandSlot {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, Ordering::SeqCst);
+    }
+}
+
 /// The seconds since the Unix epoch now.
 fn unix_now() -> u64 {
     std::time::SystemTime::now()
@@ -572,22 +604,18 @@ impl RemoteSocket {
                     self.answer(conn, result_line(None, Err(why)));
                 }
             }
-            DevicesInbound::RevokeSelf { device } => {
-                off_the_tick(Arc::clone(&self.shared), conn, move |shared| {
-                    change_device(&shared.store, &device, |s| {
-                        s.remove(&device);
-                    })
-                });
-            }
-            DevicesInbound::SetPushEndpoint { device, url } => {
-                off_the_tick(Arc::clone(&self.shared), conn, move |shared| {
-                    change_device(&shared.store, &device, |s| {
-                        if let Some(d) = s.get_mut(&device) {
-                            d.push_endpoint = Some(url.expose().to_owned());
-                        }
-                    })
-                });
-            }
+            DevicesInbound::RevokeSelf { device } => self.phone_errand(conn, move |shared| {
+                change_device(&shared.store, &device, |s| {
+                    s.remove(&device);
+                })
+            }),
+            DevicesInbound::SetPushEndpoint { device, url } => self.phone_errand(conn, move |shared| {
+                change_device(&shared.store, &device, |s| {
+                    if let Some(d) = s.get_mut(&device) {
+                        d.push_endpoint = Some(url.expose().to_owned());
+                    }
+                })
+            }),
             DevicesInbound::Reported { flagged, connected } => {
                 for (device, name) in flagged {
                     eprintln!("[agent_panel] remote: device {device:?} is in the device store with no desk's yes");
@@ -663,6 +691,21 @@ impl RemoteSocket {
             }
             DevicesInbound::ListenAnswer { addr, yes } => self.answer(conn, listen_answer_line(addr, yes)),
         }
+    }
+
+    /// Runs a phone-sent errand off the tick when fewer than [`PHONE_ERRANDS_MAX`] are at work, else answers
+    /// [`ERRANDS_BUSY`] at once. The desk's answers are not counted: one question is asked at a time.
+    fn phone_errand(&self, conn: u64, work: impl FnOnce(&Shared) -> DevicesInbound + Send + 'static) {
+        let Some(slot) = ErrandSlot::take(&self.shared.devices.phone_errands) else {
+            self.answer(conn, result_line(None, Err(ERRANDS_BUSY)));
+            return;
+        };
+        // The slot goes with the closure: when the work is done, or when no thread could take it.
+        off_the_tick(Arc::clone(&self.shared), conn, move |shared| {
+            let line = work(shared);
+            drop(slot);
+            line
+        });
     }
 
     /// Reads which link holds an address with `link_of` in place of this machine's own links.

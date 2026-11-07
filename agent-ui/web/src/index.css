@@ -2362,3 +2362,12 @@ button.band-background {
 }
 .question-preview { font-family: var(--nv-font-mono); max-width: 100%; overflow: auto; }
 .question-footer { color: var(--nv-fg); }
+
+/* The pairing address under the enrollment QR code: long, one word, and there to be selected and copied. */
+.remote-pairing-uri {
+  display: block;
+  font-family: var(--nv-font-mono);
+  font-size: var(--fs-code);
+  overflow-wrap: anywhere;
+  user-select: text;
+}

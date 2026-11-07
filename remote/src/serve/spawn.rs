@@ -73,16 +73,60 @@ pub fn running_config(dirs: &Dirs) -> Option<ServeConfig> {
     })
 }
 
+/// How a `serve` a window started ended, as its reaper saw it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ServeEnded {
+    /// Exit 0: no window had remote control on.
+    Idle,
+    /// A `serve` with the same configuration already ran.
+    RunningSame,
+    /// A `serve` with another configuration already runs; this one's stderr named each difference.
+    RunningDifferent,
+    /// Any other exit code: it could not start, its configuration was refused, or it failed later, and said why on
+    /// the window's stderr.
+    Failed(i32),
+    /// Ended by a signal: `eitri remote stop`'s `SIGTERM`, or one sent by hand.
+    Signalled,
+    /// Waiting for it failed, so how it ended is unknown.
+    Unknown,
+}
+
+impl ServeEnded {
+    fn of(status: std::process::ExitStatus) -> ServeEnded {
+        match status.code() {
+            Some(0) => ServeEnded::Idle,
+            Some(EXIT_RUNNING_SAME) => ServeEnded::RunningSame,
+            Some(EXIT_RUNNING_DIFFERENT) => ServeEnded::RunningDifferent,
+            Some(code) => ServeEnded::Failed(code),
+            None => ServeEnded::Signalled,
+        }
+    }
+}
+
+/// What a window is told when a `serve` it started ends; called on the reaper's thread.
+pub type OnServeEnd = std::sync::Arc<dyn Fn(ServeEnded) + Send + Sync>;
+
 /// Starts `serve` as `<exe> remote serve`.
 pub struct ServeSpawner {
     exe: PathBuf,
     envs: Vec<(OsString, OsString)>,
+    on_end: Option<OnServeEnd>,
 }
 
 impl ServeSpawner {
     /// `exe` is the product binary: the running one, for a window.
     pub fn new(exe: PathBuf) -> ServeSpawner {
-        ServeSpawner { exe, envs: Vec::new() }
+        ServeSpawner {
+            exe,
+            envs: Vec::new(),
+            on_end: None,
+        }
+    }
+
+    /// Tells `hook` how each `serve` started through this ended, after the line on stderr.
+    pub fn on_end(mut self, hook: OnServeEnd) -> ServeSpawner {
+        self.on_end = Some(hook);
+        self
     }
 
     /// Sets `key` in the started process's environment, beside what [`serve_env`] passes on from this process's.
@@ -119,20 +163,35 @@ impl Spawner for ServeSpawner {
         }
         let mut child = command.spawn()?;
         let pid = child.id();
+        let on_end = self.on_end.clone();
         let reaped = std::thread::Builder::new()
             .name("eitri-remote-serve".into())
-            .spawn(move || match child.wait() {
-                Ok(status) => match status.code() {
-                    Some(0) => eprintln!("[remote] serve (pid {pid}) ended: no window had remote control on"),
-                    Some(EXIT_RUNNING_SAME) => {}
-                    Some(EXIT_RUNNING_DIFFERENT) => eprintln!(
-                        "[remote] a serve with another configuration already runs (the line above names each \
-                         difference): `eitri remote stop`, then start a window, for this window's"
-                    ),
-                    // A stop's SIGTERM, or a failure `serve` printed itself.
-                    _ => eprintln!("[remote] serve (pid {pid}) ended: {status}"),
-                },
-                Err(e) => eprintln!("[remote] could not wait for serve (pid {pid}): {e}"),
+            .spawn(move || {
+                let ended = match child.wait() {
+                    Ok(status) => {
+                        let ended = ServeEnded::of(status);
+                        match ended {
+                            ServeEnded::Idle => {
+                                eprintln!("[remote] serve (pid {pid}) ended: no window had remote control on")
+                            }
+                            ServeEnded::RunningSame => {}
+                            ServeEnded::RunningDifferent => eprintln!(
+                                "[remote] a serve with another configuration already runs (the line above names each \
+                                 difference): `eitri remote stop`, then start a window, for this window's"
+                            ),
+                            // A stop's SIGTERM, or a failure `serve` printed itself.
+                            _ => eprintln!("[remote] serve (pid {pid}) ended: {status}"),
+                        }
+                        ended
+                    }
+                    Err(e) => {
+                        eprintln!("[remote] could not wait for serve (pid {pid}): {e}");
+                        ServeEnded::Unknown
+                    }
+                };
+                if let Some(on_end) = on_end {
+                    on_end(ended);
+                }
             });
         if let Err(e) = reaped {
             eprintln!("[remote] serve (pid {pid}) runs unwatched: {e}");
@@ -189,6 +248,38 @@ mod tests {
             assert_eq!(cfg.listen, listen, "{args}");
             let port: u16 = args.rsplit('"').nth(1).unwrap().parse().unwrap();
             assert_eq!(cfg.port, Some(port), "{args}");
+        }
+    }
+
+    #[test]
+    fn the_window_is_told_how_a_serve_it_started_ended() {
+        let dir = scratch("ended");
+        let cfg = eitri_core::remote_runtime::ServeConfig {
+            listen: RemoteListen::Loopback,
+            port: None,
+            origins: Vec::new(),
+        };
+        for (body, want) in [
+            ("exit 4", ServeEnded::RunningDifferent),
+            ("exit 3", ServeEnded::RunningSame),
+            ("exit 1", ServeEnded::Failed(1)),
+            ("exit 0", ServeEnded::Idle),
+            ("kill -TERM $$", ServeEnded::Signalled),
+        ] {
+            let exe = dir.join("serve-stand-in");
+            let _ = std::fs::remove_file(&exe);
+            std::fs::write(&exe, format!("#!/bin/sh\n{body}\n")).unwrap();
+            std::fs::set_permissions(&exe, std::fs::Permissions::from_mode(0o700)).unwrap();
+            let (tx, rx) = std::sync::mpsc::channel();
+            let tx = std::sync::Mutex::new(tx);
+            ServeSpawner::new(exe)
+                .env("XDG_RUNTIME_DIR", &dir)
+                .on_end(std::sync::Arc::new(move |ended| {
+                    let _ = tx.lock().unwrap().send(ended);
+                }))
+                .spawn_serve(&cfg)
+                .unwrap();
+            assert_eq!(rx.recv_timeout(Duration::from_secs(30)), Ok(want), "{body}");
         }
     }
 

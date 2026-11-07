@@ -127,7 +127,11 @@ export function RemoteEnroll({
       {question === null && pairing !== null && (
         <div className="remote-pairing">
           <QrCode modules={pairing.modules} />
-          <div>Scan this with the Eitri app within three minutes, or type the code: {pairing.code}</div>
+          <div>
+            Within three minutes, scan this with the phone, or give its client this pairing address (it names this
+            window and where to connect; the code in it works once):
+          </div>
+          <code className="remote-pairing-uri">{pairing.uri}</code>
           <div className="remote-hint">Esc closes</div>
         </div>
       )}

@@ -987,3 +987,39 @@ fn device_without_confirmation_is_flagged_once_per_process() {
         "a device the desk said yes to is not flagged"
     );
 }
+
+#[test]
+fn phone_errands_held_by_the_store_lock_are_bounded() {
+    let scratch = Scratch::new();
+    let window = Window::new(&scratch, INSTANCE_A);
+    let mut client = window.connect();
+    let (device, token) = window.enroll_with_yes(&mut client, "Pixel", "watch");
+    // Another process holds the store's lock: every errand that reaches the store waits for it.
+    let lock = agent::private_fs::PrivateLock::open(&scratch.store().with_extension("lock")).unwrap();
+    assert!(lock.try_lock().unwrap());
+    let sent = PHONE_ERRANDS_MAX + 6;
+    for _ in 0..sent {
+        set_push(&mut client, &device, &token, "https://ntfy.example/up7f3a");
+    }
+    // The ones past the bound are told at once; the others wait for the lock, and give up on it in time.
+    let mut busy = 0;
+    for _ in 0..sent {
+        let told = window.result(&mut client, "an errand's answer");
+        assert!(window.socket.shared.devices.phone_errands.load(Ordering::SeqCst) <= PHONE_ERRANDS_MAX);
+        assert_ne!(
+            told["ok"], true,
+            "the store was changed while its lock was held: {told}"
+        );
+        if told["why"] == ERRANDS_BUSY {
+            busy += 1;
+        }
+    }
+    assert!(busy >= 1, "every errand waited on a thread of its own");
+    drop(lock);
+    window.turn_until("every errand's thread to end", || {
+        window.socket.shared.devices.phone_errands.load(Ordering::SeqCst) == 0
+    });
+    // With room again, the endpoint is taken.
+    set_push(&mut client, &device, &token, "https://ntfy.example/up7f3a");
+    assert_eq!(window.result(&mut client, "the endpoint")["ok"], true);
+}

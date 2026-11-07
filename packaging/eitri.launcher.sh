@@ -16,6 +16,8 @@
 #   eitri split [DIR]      open the editor (Neovide) and the agent panel as two windows (needs Neovide)
 #   eitri agents [--json] [--watch] [--schema 1]
 #                          the agents every open window shares: a table, one JSON view, or a stream
+#   eitri remote COMMAND   remote control from a phone: serve, stop, status, add-device, devices,
+#                            revoke, grant, ssh-key (eitri remote --help lists them)
 #   eitri --version        print the version and exit
 #   eitri sidecar status   what new tabs run, what is bundled, what is kept; no network
 #   eitri sidecar check    ask for the newest sidecar release; changes nothing
@@ -106,6 +108,13 @@ fi
 if [[ "${1:-}" == agents ]]; then
 	shift
 	exec "$LIBDIR/shell" agents "$@"
+fi
+
+# `eitri remote` opens no project or window either, and its commands take options and --help of their
+# own, which the option loop would refuse or answer with this file's help: it goes to the binary as typed.
+if [[ "${1:-}" == remote ]]; then
+	shift
+	exec "$LIBDIR/shell" remote "$@"
 fi
 
 # Handle setup before flag parsing: it opens no project or window. Invoke the POSIX installer
@@ -208,7 +217,7 @@ while [[ $# -gt 0 ]]; do
 		           ACCOUNT="${2:?--account needs a name}"; ACCOUNT_FROM_FLAG=1; shift 2 ;;
 		--quiet)   [[ $MODE != page ]] || { echo "$CMD_NAME: unknown option --quiet" >&2; exit 64; }
 		           QUIET=1; shift ;;
-		-h|--help) sed -n '2,29p' "$0" | sed 's/^# \?//'; exit 0 ;;
+		-h|--help) sed -n '2,/^set -euo pipefail$/p' "$0" | sed -e '$d' -e 's/^# \?//'; exit 0 ;;
 		--) SAW_DASHES=1; shift
 		    if [[ $MODE == window ]]; then AFTER=("$@"); FIRST="${FIRST:-${1:-}}"
 		    elif [[ $MODE == page ]]; then PAGE_POSITIONALS+=("$@")
@@ -415,7 +424,7 @@ fi
 # same directory.
 if [[ ${#SHELL_ARGS[@]} -eq 0 && ${#BEFORE[@]} -gt 0 ]]; then
 	case "${BEFORE[0]}" in
-		open | panel | split | page | agents | run-guard | linked-window | choose-project) BEFORE[0]="./${BEFORE[0]}" ;;
+		open | panel | split | page | agents | remote | run-guard | linked-window | choose-project) BEFORE[0]="./${BEFORE[0]}" ;;
 	esac
 fi
 if [[ -n "$SAW_DASHES" ]]; then

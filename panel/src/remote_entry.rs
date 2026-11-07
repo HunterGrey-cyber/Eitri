@@ -107,7 +107,7 @@ pub enum RemoteRefusal {
     Duplicate,
     /// The agent turned the command down or failed it, in its own words.
     Agent(String),
-    /// A kind this build parses and does not carry out yet.
+    /// A kind that reached a path which does not carry it out.
     NotYet,
     /// The tab's mode is Bypass, or wider than when a queued message was taken.
     ModeNotAllowed,

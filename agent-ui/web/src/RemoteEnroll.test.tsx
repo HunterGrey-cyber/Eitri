@@ -193,9 +193,14 @@ describe("RemoteEnroll", () => {
 
   it("shows the code to scan until a phone presents it, and drops a malformed question", () => {
     const { container } = render(<RemoteEnroll desk={desk} now={now} />);
-    fromRust({ kind: "remote_pairing", code: "BwcHBwcHBwcHBwcHBwcHBw", uri: "eitri-pair:v=1", modules: ["10", "01"], expiresInMs: 180000 });
+    const uri = "eitri-pair:v=1&c=BwcHBwcHBwcHBwcHBwcHBw&i=w1&m=direct&h=desk.tail1.ts.net&p=443";
+    fromRust({ kind: "remote_pairing", code: "BwcHBwcHBwcHBwcHBwcHBw", uri, modules: ["10", "01"], expiresInMs: 180000 });
     expect(container.querySelectorAll(".remote-qr rect").length).toBe(3);
-    expect(container.textContent).toContain("BwcHBwcHBwcHBwcHBwcHBw");
+    // The code alone enrolls nothing: what is offered to copy is the whole pairing address, which names the window
+    // and where to connect, and no app that may not exist is promised.
+    expect(container.querySelector(".remote-pairing-uri")?.textContent).toBe(uri);
+    expect(container.textContent).not.toContain("Eitri app");
+    expect(container.textContent).not.toContain("type the code");
     fromRust({ ...ENROLL, grant: "root" });
     expect(container.textContent).not.toContain("Add device");
     fromRust(ENROLL);
