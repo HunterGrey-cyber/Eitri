@@ -239,8 +239,14 @@ pub fn without_keys(at: At) -> (Placement, bool) {
 pub fn parse_pixels(text: &str, at: Option<At>) -> Result<i32, String> {
     let (range, what) = match at {
         Some(At::Beside(Direction::Up | Direction::Down)) => (FIXED_HEIGHT_PX, "height"),
-        Some(At::Beside(Direction::Left | Direction::Right)) => (FIXED_WIDTH_PX, "width"),
-        _ => return Err("a pixel size requires at = above or below (a height), or left or right (a width)".into()),
+        Some(At::Beside(Direction::Left | Direction::Right) | At::Placement(Placement::LeftOfRoot)) => {
+            (FIXED_WIDTH_PX, "width")
+        }
+        _ => {
+            return Err(
+                "a pixel size requires at = above or below (a height), or left, right or left-edge (a width)".into(),
+            )
+        }
     };
     text.strip_suffix("px")
         .filter(|n| !n.is_empty() && n.bytes().all(|b| b.is_ascii_digit()))
@@ -258,6 +264,8 @@ pub fn parse_pixels(text: &str, at: Option<At>) -> Result<i32, String> {
 pub fn parse_at(name: &str) -> Option<At> {
     Some(match name {
         "side" => At::Placement(Placement::RightOfRoot),
+        // The window's left edge, full height, wherever the keys are: a sidebar's place.
+        "left-edge" => At::Placement(Placement::LeftOfRoot),
         "bottom" => At::Placement(Placement::BelowRoot),
         "main" => At::Placement(Placement::InPlaceOfEditor),
         "below-editor" => At::Placement(Placement::BelowEditor),
@@ -1526,6 +1534,42 @@ mod tests {
             opened.notes[0].contains("opened at the window's left edge"),
             "{:?}",
             opened.notes
+        );
+    }
+
+    /// `left-edge` is the window's left edge, full height, wherever the keys are: a sidebar opened at run time with
+    /// the keys in the right-hand column is not put between the columns. It takes a pixel width, as `left` does.
+    #[test]
+    fn left_edge_opens_at_the_windows_left_edge_wherever_the_keys_are() {
+        assert_eq!(parse_at("left-edge"), Some(At::Placement(Placement::LeftOfRoot)));
+        let rail = id("lua:rail");
+        for keys in ["agent", "editor"] {
+            let mut layout = fixture(&format!(
+                "row(column(editor{e} 0.6, terminal), agent{a})",
+                e = if keys == "editor" { " focus" } else { "" },
+                a = if keys == "agent" { " focus" } else { "" },
+            ));
+            let holder = layout.focus().clone();
+            let rule = OpenRule {
+                at: parse_at("left-edge"),
+                size: Some(RuleSize::Share(0.2)),
+                focus: false,
+                ..OpenRule::default()
+            };
+            let opened = open_by_rule(&mut layout, &rail, &rule, Some(&holder), NOMINAL_GRID).unwrap();
+            assert!(opened.notes.is_empty(), "{:?}", opened.notes);
+            let r = rect_of(&layout, 1000, &rail);
+            assert_eq!((r.x, r.y, r.h), (0, 0, 1000), "keys on {keys}: {r:?}");
+            assert_eq!(r.w, 200, "a fifth of 1000");
+            assert_eq!(layout.focus(), &holder, "focus = false leaves the keys");
+            for other in [ModuleId::editor(), ModuleId::terminal(), ModuleId::agent()] {
+                assert!(rect_of(&layout, 1000, &other).x >= r.w, "{other} is right of the rail");
+            }
+        }
+        assert_eq!(parse_pixels("62px", parse_at("left-edge")), Ok(62));
+        assert!(
+            parse_pixels("62px", parse_at("side")).is_err(),
+            "only the left edge gains a width"
         );
     }
 

@@ -340,6 +340,10 @@ pub struct ModuleTable {
     /// right); mutually exclusive with the fractional size.
     pub fixed_px: Option<i32>,
     pub focus: bool,
+    /// The module key after the prefix the plugin asks for when `init.lua` gives it none (`key` in the load's
+    /// options wins, `key = false` declines it). Always one character no keymap could make a panel's
+    /// (`layout::keys::never_a_panel_key`); one the window's keymap or another panel holds is left unused.
+    pub key: Option<char>,
 }
 
 impl ModuleTable {
@@ -595,6 +599,7 @@ struct RawModule {
     at: Option<String>,
     size: Option<toml::Value>,
     focus: Option<bool>,
+    key: Option<String>,
 }
 
 /// `[a-z0-9_]`, starting with a letter, at most 32: a setting, variable, root or task name.
@@ -1142,8 +1147,8 @@ pub fn parse_manifest(text: &str) -> Result<Manifest, String> {
                         return fail(
                             "module.at",
                             format!(
-                                "{name:?} is not a place (side, bottom, main, below-editor, right, below, left, \
-                                 above, tab)"
+                                "{name:?} is not a place (side, left-edge, bottom, main, below-editor, right, below, \
+                                 left, above, tab)"
                             ),
                         );
                     }
@@ -1169,6 +1174,20 @@ pub fn parse_manifest(text: &str) -> Result<Manifest, String> {
                     );
                 }
             };
+            let key = match m.key.as_deref() {
+                None => None,
+                Some(text) => {
+                    let mut chars = text.chars();
+                    let key = match (chars.next(), chars.next()) {
+                        (Some(c), None) if !c.is_whitespace() && !c.is_control() => c,
+                        _ => return fail("module.key", format!("{text:?} is not one character, not a space")),
+                    };
+                    if let Some(why) = crate::layout::keys::never_a_panel_key(key) {
+                        return fail("module.key", format!("{text:?} {why}"));
+                    }
+                    Some(key)
+                }
+            };
             Some(ModuleTable {
                 start,
                 shown_while,
@@ -1176,6 +1195,7 @@ pub fn parse_manifest(text: &str) -> Result<Manifest, String> {
                 size,
                 fixed_px,
                 focus: m.focus.unwrap_or(true),
+                key,
             })
         }
     };
@@ -1329,6 +1349,33 @@ work = "${plugin}"
         for (text, err) in refused {
             assert_eq!(parse_manifest(&text).unwrap_err(), err, "{text}");
         }
+    }
+
+    #[test]
+    fn a_module_key_is_one_character_no_keymap_could_give_a_panel() {
+        let key = |line: &str| parse_manifest(&one_line_strip("\"agents\"", line)).map(|m| m.module.unwrap().key);
+        assert_eq!(key(""), Ok(None), "no key unless the manifest gives one");
+        assert_eq!(key("key = \"U\"\n"), Ok(Some('U')));
+        assert_eq!(key("key = \"g\"\n"), Ok(Some('g')));
+        for (line, err) in [
+            ("key = \"ab\"\n", "module.key: \"ab\" is not one character, not a space"),
+            ("key = \"\"\n", "module.key: \"\" is not one character, not a space"),
+            ("key = \" \"\n", "module.key: \" \" is not one character, not a space"),
+            (
+                "key = \"A\"\n",
+                "module.key: \"A\" is Shift+'a', which Eitri reads as 'a' after a split key",
+            ),
+            ("key = \"v\"\n", "module.key: \"v\" is reserved for the canvas"),
+            ("key = \"e\"\n", "module.key: \"e\" is the editor's key"),
+            (
+                "key = \"c\"\n",
+                "module.key: \"c\" is stock tmux's new-window after its prefix",
+            ),
+        ] {
+            assert_eq!(key(line).unwrap_err(), format!("eitri-plugin.toml: {err}"), "{line}");
+        }
+        let error = parse_manifest(&one_line_strip("\"agents\"", "key = 7\n")).unwrap_err();
+        assert!(error.contains("key"), "{error}");
     }
 
     #[test]
@@ -1638,7 +1685,8 @@ layout = { row = [ { module = "page", share = 0.42 }, { column = [ { module = "e
                 at: parse_at("right"),
                 size: Some(0.4),
                 fixed_px: None,
-                focus: false
+                focus: false,
+                key: None
             })
         );
         assert_eq!(Capability::ALL.len(), 12);
@@ -2064,7 +2112,8 @@ layout = { row = [ { module = "page", share = 0.42 }, { column = [ { module = "e
                 at: None,
                 size: None,
                 fixed_px: None,
-                focus: true
+                focus: true,
+                key: None
             })
         );
         let origins_only = EXAMPLE.replacen("images = \"${images}\"\n", "", 1);

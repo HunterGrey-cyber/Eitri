@@ -39,6 +39,26 @@ pub const BUILT_IN_CAPITALS: [char; 4] = ['E', 'A', 'T', 'V'];
 /// built (this module's doc) without a v1 config having to give it back up.
 pub const RESERVED_FOR_CANVAS: char = 'v';
 
+/// Why `key` can never be a Lua panel's, whatever the keymap says: a built-in module's key, its capital, the canvas's
+/// `v`, or a key stock tmux binds after its prefix. `None` when only the effective keymap and the other panels decide.
+/// A plugin manifest's default key is checked with this when the manifest is read.
+pub fn never_a_panel_key(key: char) -> Option<String> {
+    if let Some((_, id)) = BUILT_IN.iter().find(|(k, _)| *k == key) {
+        return Some(format!("is the {}'s key", id().as_str()));
+    }
+    if key == RESERVED_FOR_CANVAS {
+        return Some("is reserved for the canvas".into());
+    }
+    if BUILT_IN_CAPITALS.contains(&key) {
+        let lower = key.to_ascii_lowercase();
+        return Some(format!(
+            "is Shift+'{lower}', which Eitri reads as '{lower}' after a split key"
+        ));
+    }
+    stock::stock_command(&KeySpec::char(key, false, false))
+        .map(|command| format!("is stock tmux's {command} after its prefix"))
+}
+
 /// Every module key this window answers to, in the order the prefix strip shows them: the built-ins,
 /// then each Lua panel's in registration order.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -75,32 +95,50 @@ pub enum KeyError {
 
 impl fmt::Display for KeyError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let panel = self.panel();
         match self {
-            KeyError::Malformed { panel, key } => write!(
-                f,
-                "eitri.panel.register{{ id = {panel:?}, key = {key:?} }}: a key is one character, not a space"
-            ),
+            KeyError::Malformed { key, .. } => write!(f, "eitri.panel.register{{ id = {panel:?}, key = {key:?} }}: ")?,
+            KeyError::Bound { key, .. }
+            | KeyError::StockTmux { key, .. }
+            | KeyError::Taken { key, .. }
+            | KeyError::ShiftOfBuiltIn { key, .. }
+            | KeyError::Reserved { key, .. } => {
+                write!(f, "eitri.panel.register{{ id = {panel:?}, key = \"{key}\" }}: ")?
+            }
+        }
+        f.write_str(&self.why())
+    }
+}
+
+impl KeyError {
+    /// The panel the refused key was for.
+    pub fn panel(&self) -> &str {
+        match self {
+            KeyError::Malformed { panel, .. }
+            | KeyError::Bound { panel, .. }
+            | KeyError::StockTmux { panel, .. }
+            | KeyError::Taken { panel, .. }
+            | KeyError::ShiftOfBuiltIn { panel, .. }
+            | KeyError::Reserved { panel, .. } => panel,
+        }
+    }
+
+    /// Why the key cannot be the panel's, without the call it would have come from (what `Display` puts after it).
+    pub fn why(&self) -> String {
+        match self {
+            KeyError::Malformed { .. } => "a key is one character, not a space".into(),
             KeyError::Bound {
-                panel,
                 key,
                 prefix,
                 action,
                 source,
-            } => write!(
-                f,
-                "eitri.panel.register{{ id = {panel:?}, key = \"{key}\" }}: '{key}' is bound after {prefix} to \
-                 {action} ({source})"
-            ),
-            KeyError::StockTmux { panel, key, command } => write!(
-                f,
-                "eitri.panel.register{{ id = {panel:?}, key = \"{key}\" }}: '{key}' is stock tmux's {command} \
-                 after its prefix, kept free for Eitri"
-            ),
-            KeyError::Taken { panel, key, by } => write!(
-                f,
-                "eitri.panel.register{{ id = {panel:?}, key = \"{key}\" }}: '{key}' is already {by:?}'s key"
-            ),
-            KeyError::ShiftOfBuiltIn { panel, key } => {
+                ..
+            } => format!("'{key}' is bound after {prefix} to {action} ({source})"),
+            KeyError::StockTmux { key, command, .. } => {
+                format!("'{key}' is stock tmux's {command} after its prefix, kept free for Eitri")
+            }
+            KeyError::Taken { key, by, .. } => format!("'{key}' is already {by:?}'s key"),
+            KeyError::ShiftOfBuiltIn { key, .. } => {
                 let lower = key.to_ascii_lowercase();
                 let whose = match lower {
                     'e' => "the editor's",
@@ -108,16 +146,9 @@ impl fmt::Display for KeyError {
                     't' => "the terminal's",
                     _ => "the canvas's, once it exists,",
                 };
-                write!(
-                    f,
-                    "eitri.panel.register{{ id = {panel:?}, key = \"{key}\" }}: '{key}' is Shift+'{lower}', and \
-                     after a split key Eitri reads it as '{lower}', {whose} key"
-                )
+                format!("'{key}' is Shift+'{lower}', and after a split key Eitri reads it as '{lower}', {whose} key")
             }
-            KeyError::Reserved { panel, key } => write!(
-                f,
-                "eitri.panel.register{{ id = {panel:?}, key = \"{key}\" }}: '{key}' is reserved for the canvas"
-            ),
+            KeyError::Reserved { key, .. } => format!("'{key}' is reserved for the canvas"),
         }
     }
 }
@@ -154,6 +185,46 @@ impl ModuleKeys {
             }
         }
         (keys, refused)
+    }
+
+    /// [`ModuleKeys::build_settled`] with each plugin's default key from its manifest, `defaults` (its module, the
+    /// key), for a panel `lua` gives no key. A default never takes a key from its holder: one the effective keymap
+    /// binds, one any written key in `lua` holds (wherever that panel is registered), or one an earlier default
+    /// took, leaves its module with no key, its reason in the third list; the order of the keys stays the order of
+    /// registration. The written keys' refusals are the second list, as `build_settled` returns them.
+    pub fn build_with_defaults(
+        lua: &[(ModuleId, Option<String>)],
+        defaults: &[(ModuleId, char)],
+        keymap: &Keymap,
+    ) -> (ModuleKeys, Vec<KeyError>, Vec<KeyError>) {
+        let (written, _) = ModuleKeys::build_settled(lua, keymap);
+        let mut keys = ModuleKeys::built_in();
+        let mut refused = Vec::new();
+        let mut unused = Vec::new();
+        for (id, key) in lua {
+            if key.is_some() {
+                if let Err(error) = keys.add_lua(id, key.as_deref(), keymap) {
+                    refused.push(error);
+                }
+                continue;
+            }
+            let Some(&(_, default)) = defaults.iter().find(|(module, _)| module == id) else {
+                continue;
+            };
+            let panel = id.as_str().trim_start_matches("lua:").to_string();
+            if let Some(by) = written.module(default).filter(|by| *by != id) {
+                unused.push(KeyError::Taken {
+                    panel,
+                    key: default,
+                    by: by.as_str().trim_start_matches("lua:").to_string(),
+                });
+                continue;
+            }
+            if let Err(error) = keys.add_lua(id, Some(&default.to_string()), keymap) {
+                unused.push(error);
+            }
+        }
+        (keys, refused, unused)
     }
 
     /// Adds the Lua panel `id`'s key `text`, if it has one and can have it.
@@ -557,6 +628,94 @@ mod tests {
                 "{c} is bound but a panel could take it"
             );
         }
+    }
+
+    /// A plugin's default key is its module's only while nothing else claims it: a written key wins wherever its
+    /// panel is registered, a binding of the keymap wins, and between two defaults the first registered. A default
+    /// that yields leaves its module with no key and says why; a written key that cannot be one is still refused.
+    #[test]
+    fn a_default_key_never_takes_a_key_from_its_holder() {
+        let map = Keymap::defaults();
+        let strips = ModuleId::lua("strips");
+        let defaults = [(strips.clone(), 'U')];
+
+        let (keys, refused, unused) = ModuleKeys::build_with_defaults(&[lua("strips", None)], &defaults, &map);
+        assert_eq!(keys.module('U'), Some(&strips));
+        assert!(refused.is_empty() && unused.is_empty(), "{refused:?} {unused:?}");
+
+        // A panel registered later that wrote the same key keeps it; the order stays the registration's.
+        let panels = [lua("strips", None), lua("first", Some("g")), lua("notes", Some("U"))];
+        let (keys, refused, unused) = ModuleKeys::build_with_defaults(&panels, &defaults, &map);
+        assert_eq!(keys.module('U'), Some(&ModuleId::lua("notes")));
+        assert_eq!(keys.key_of(&strips), None);
+        assert!(refused.is_empty(), "{refused:?}");
+        assert_eq!(
+            unused,
+            [KeyError::Taken {
+                panel: "strips".into(),
+                key: 'U',
+                by: "notes".into()
+            }]
+        );
+        assert_eq!(unused[0].why(), "'U' is already \"notes\"'s key");
+        assert_eq!(keys.lua_keys(), ['g', 'U']);
+
+        // A key the user's keymap binds (or a tmux import) is the binding's.
+        let bound = Keymap::apply_user(
+            &[KeymapOp::Set {
+                table: "prefix".into(),
+                key: "U".into(),
+                action: "zoom".into(),
+                opts: vec![],
+            }],
+            &[],
+        )
+        .unwrap();
+        let (keys, refused, unused) = ModuleKeys::build_with_defaults(&[lua("strips", None)], &defaults, &bound);
+        assert_eq!(keys.key_of(&strips), None);
+        assert!(refused.is_empty());
+        assert!(
+            matches!(&unused[..], [KeyError::Bound { key: 'U', action, .. }] if action == "zoom"),
+            "{unused:?}"
+        );
+
+        // Two defaults on one key: the first registered keeps it.
+        let (keys, _, unused) = ModuleKeys::build_with_defaults(
+            &[lua("strips", None), lua("other", None)],
+            &[(strips.clone(), 'U'), (ModuleId::lua("other"), 'U')],
+            &map,
+        );
+        assert_eq!(keys.module('U'), Some(&strips));
+        assert!(matches!(&unused[..], [KeyError::Taken { panel, by, .. }] if panel == "other" && by == "strips"));
+
+        // A written key is never replaced by the default, even when it is refused; a refused one is reported as
+        // `build_settled` reports it.
+        let (keys, refused, unused) = ModuleKeys::build_with_defaults(&[lua("strips", Some("F"))], &defaults, &map);
+        assert_eq!(keys.key_of(&strips), None);
+        assert!(
+            matches!(&refused[..], [KeyError::Bound { key: 'F', .. }]),
+            "{refused:?}"
+        );
+        assert!(unused.is_empty());
+    }
+
+    /// The keys no keymap could hand a panel are known without one: what a manifest's default key is checked
+    /// against when it is read. Every one of them `ModuleKeys::build` refuses under the default table.
+    #[test]
+    fn never_a_panel_key_names_what_no_keymap_frees() {
+        let map = Keymap::defaults();
+        for c in (' '..='~').filter(|c| !c.is_whitespace()) {
+            if never_a_panel_key(c).is_some() {
+                assert!(build_one(&c.to_string(), &map).is_err(), "{c}");
+            }
+        }
+        assert_eq!(
+            never_a_panel_key('A').as_deref(),
+            Some("is Shift+'a', which Eitri reads as 'a' after a split key")
+        );
+        assert_eq!(never_a_panel_key('U'), None);
+        assert_eq!(never_a_panel_key('g'), None);
+        assert_eq!(never_a_panel_key('F'), None, "a default binding the user may delete");
     }
 
     #[test]

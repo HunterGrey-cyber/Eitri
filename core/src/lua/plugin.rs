@@ -45,6 +45,8 @@ pub struct PluginRegistration {
     pub plugin: Rc<LoadedPlugin>,
     /// The panel's module key after the prefix, as written; checked with every panel's by `ModuleKeys::build`.
     pub key: Option<String>,
+    /// `key = false`: no module key, not even the manifest's.
+    pub no_key: bool,
     /// Where the panel goes the first time; `side` unless `position` says otherwise.
     pub slot: PanelSlot,
     /// The `position` option as `init.lua` gave it; `None` when it gave none.
@@ -73,6 +75,16 @@ impl PluginRegistration {
             float: false,
             scratchpad: false,
         })
+    }
+
+    /// The manifest's `[module] key`, which the module takes when `init.lua` wrote no `key` and did not decline one
+    /// with `key = false`. Unlike a written key it yields: one the window's keymap or any panel's written key holds
+    /// leaves the module with no key (`ModuleKeys::build_with_defaults`).
+    pub fn default_key(&self) -> Option<char> {
+        if self.key.is_some() || self.no_key {
+            return None;
+        }
+        self.plugin.manifest.module.as_ref().and_then(|m| m.key)
     }
 
     /// `[module] start = "hidden"`: the window never places the module by itself; `position` does not change that.
@@ -157,6 +169,7 @@ fn register(
         _ => return Err(format!("{PREFIX}({dir}): the options must be a table")),
     };
     let mut key = None;
+    let mut no_key = false;
     let mut position = None;
     let mut settings: BTreeMap<String, SettingValue> = BTreeMap::new();
     if let Some(opts) = opts {
@@ -165,9 +178,11 @@ fn register(
             let k = text(k, "an option name", &dir)?;
             let v = option_value(v, &k, &dir)?;
             match k.as_str() {
+                "key" if matches!(v, SettingValue::Bool(false)) => no_key = true,
                 "key" | "position" => {
                     let SettingValue::Text(v) = v else {
-                        return Err(format!("{PREFIX}({dir}): option {k} must be a string"));
+                        let or_false = if k == "key" { ", or false for no key" } else { "" };
+                        return Err(format!("{PREFIX}({dir}): option {k} must be a string{or_false}"));
                     };
                     if k == "key" {
                         key = Some(v);
@@ -189,6 +204,7 @@ fn register(
         PluginRegistration {
             plugin: Rc::new(plugin),
             key,
+            no_key,
             slot: position.unwrap_or(PanelSlot::Side),
             position,
         },
@@ -580,6 +596,55 @@ mod tests {
         assert_eq!(p.position, Some(PanelSlot::Main));
         assert!(s.0.join("state/plugins/demo/capabilities.json").exists());
         assert_eq!(registry.refused(), None);
+    }
+
+    /// The manifest's `[module] key` is the module's when `init.lua` writes none; a written key replaces it and
+    /// `key = false` declines it. `key = true` is refused, naming both spellings that work.
+    #[test]
+    fn a_manifest_key_is_the_default_a_written_key_or_false_replaces() {
+        let s = Scratch::new("lua-default-key");
+        let (dir, settings) = demo_plugin(&s.0);
+        let manifest = dir.join("eitri-plugin.toml");
+        let text = std::fs::read_to_string(&manifest).unwrap();
+        assert_eq!(
+            text.matches("focus = false\n").count(),
+            1,
+            "the example's [module] table"
+        );
+        std::fs::write(
+            &manifest,
+            text.replacen("focus = false\n", "focus = false\nkey = \"U\"\n", 1),
+        )
+        .unwrap();
+        let load = |opts: &str| {
+            let (lua, registry) = engine(&s.0.join("state"));
+            lua.load(format!(
+                "eitri.plugin.load({:?}, {{ work = {:?}{opts} }})",
+                dir.display().to_string(),
+                settings["work"]
+            ))
+            .exec()
+            .unwrap();
+            let p = registry.take().plugins.remove(0);
+            (p.key.clone(), p.no_key, p.default_key())
+        };
+        assert_eq!(load(""), (None, false, Some('U')));
+        assert_eq!(load(", key = 'y'"), (Some("y".into()), false, None));
+        assert_eq!(load(", key = false"), (None, true, None));
+
+        let (lua, _registry) = engine(&s.0.join("state"));
+        let error = refusal(
+            &lua,
+            &format!(
+                "eitri.plugin.load, {:?}, {{ work = {:?}, key = true }}",
+                dir.display().to_string(),
+                settings["work"]
+            ),
+        );
+        assert!(
+            error.contains("option key must be a string, or false for no key"),
+            "{error}"
+        );
     }
 
     #[test]

@@ -1,5 +1,5 @@
 [English](keys.md) | 简体中文
-<!-- translated-from: keys.md sha256=2cad7d058c2a8e4794b41fa221bd84a1cfbbaeb0f7cbb255043bd1f059ed88cd -->
+<!-- translated-from: keys.md sha256=44a5899f8c3d3b4524c5057622c1741d625bc6c26c685d7ba68973a7091858d2 -->
 
 # 按键
 
@@ -46,7 +46,7 @@ Eitri 的按键来自三个地方，它们互不冲突：用于窗口本身（�
 | `<prefix> w` | 选一个会话：上一个窗口的标签页可以恢复时，第一行是 `Restore last session`（在编辑器里要拿到它就用这个键，那里的 `s` 是 nvim 的），然后是已打开的标签页，再是可以继续的已保存会话 |
 | `<prefix> i` | 这个会话的详情 |
 
-**在等你的 agent。** `<prefix> u` 会去到等你最久的那个 agent，不管它在哪个窗口，之后每按一次去下一个；`<prefix> B` 结束这一轮，回到出发的地方。两个键都不替你回答任何东西：卡片就摆在你面前，用那个聊天里的卡片键回答它。没有谁在等时，状态行显示 `no agent waits for you`。这一轮和显示你的 agent 的那些页面共用，在伴随窗口里也能用。`agents.enabled` 关掉时，它们会显示 `agents are off in this window`。见[同时用很多 agent](many-agents.zh-CN.md)。
+**在等你的 agent。** `<prefix> u` 会去到等你最久的那个 agent，不管它在哪个窗口，之后每按一次去下一个；`<prefix> B` 结束这一轮，回到出发的地方。两个键都不替你回答任何东西：卡片就摆在你面前，用那个聊天里的卡片键回答它。没有谁在等时，状态行显示 `no agent waits for you`。这一轮和显示你的 agent 的那些页面共用，在伴随窗口里也能用。`agents.enabled` 关掉时，它们会显示 `agents are off in this window`。见[同时用很多 agent](many-agents.zh-CN.md)。`init.lua` 加载 Strips（`eitri.plugin.load("agents-strips")`）之后，`<prefix> U` 显示列出你的 agent 的 Strips 侧栏并让它拿到焦点，在那里再按一次就把它隐藏。
 
 **第二个窗口。** `<prefix> W` 打开[第二个 Eitri 窗口](two-windows.zh-CN.md)（给第二块显示器用），已经开着时把它带到前面。它在[合成器窗口](compositor-windows.zh-CN.md)和伴随窗口里不起作用，并会说明原因。
 

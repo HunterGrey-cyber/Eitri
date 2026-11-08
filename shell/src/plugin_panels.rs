@@ -687,6 +687,7 @@ pub(crate) struct Panel {
     fresh_page: Cell<bool>,
     load: LoadPage,
     own_rule: Option<OpenRule>,
+    default_key: Option<char>,
     /// Filled by the build.
     webview: Rc<RefCell<Option<webkit6::WebView>>>,
     /// Whether the host was last told its module is drawn; `None` until it is first told. A layout change that
@@ -701,6 +702,8 @@ pub(crate) struct Panel {
 struct Registered {
     plugin: Rc<LoadedPlugin>,
     key: Option<String>,
+    /// The manifest's key, for a registration that wrote none and did not decline one.
+    default_key: Option<char>,
     slot: PanelSlot,
     hidden_start: bool,
     own_rule: Option<OpenRule>,
@@ -711,6 +714,7 @@ impl Registered {
         Registered {
             plugin: registration.plugin.clone(),
             key: registration.key.clone(),
+            default_key: registration.default_key(),
             slot: registration.slot,
             hidden_start: registration.starts_hidden(),
             own_rule: registration.own_rule(),
@@ -754,6 +758,7 @@ impl Panel {
             fresh_page: Cell::new(false),
             load,
             own_rule: registered.own_rule.clone(),
+            default_key: registered.default_key,
             webview,
             on_screen: Cell::new(None),
             gesture: None,
@@ -1546,6 +1551,26 @@ impl PluginPanels {
 
     fn panel(&self, module: &ModuleId) -> Option<Rc<Panel>> {
         self.snapshot().into_iter().find(|p| p.module == *module)
+    }
+
+    /// Each plugin's default key from its manifest, for those `init.lua` gave no `key` and did not give
+    /// `key = false`, in registration order: what `ModuleKeys::build_with_defaults` weighs beside the written keys.
+    pub(crate) fn default_keys(&self) -> Vec<(ModuleId, char)> {
+        self.snapshot()
+            .iter()
+            .filter_map(|p| p.default_key.map(|key| (p.module.clone(), key)))
+            .collect()
+    }
+
+    /// Tells each host the key its module ended up with once the window's keys are built (a written key the window
+    /// refused, or a default that yielded, is none), so a page never shows a key the prefix does not answer.
+    pub(crate) fn settle_module_keys(&self, keys: &eitri_core::layout::ModuleKeys) {
+        for panel in self.snapshot() {
+            if let Some(pump) = &panel.pump {
+                let key = keys.key_of(&panel.module).map(|key| key.to_string());
+                pump.host.set_module_key(key.as_deref());
+            }
+        }
     }
 
     /// Whether `module` is a plugin's that starts hidden: the window never places it by itself.
@@ -2520,6 +2545,7 @@ mod tests {
         Registered::of(&PluginRegistration {
             plugin,
             key: None,
+            no_key: false,
             slot: position.unwrap_or(PanelSlot::Side),
             position,
         })

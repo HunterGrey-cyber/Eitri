@@ -85,7 +85,7 @@
 ---@field workspaces? string[] Every workspace name, in order (get only).
 
 ---@class EitriOpenRule
----@field at? "side"|"bottom"|"main"|"below-editor"|"right"|"below"|"left"|"above"|"tab"
+---@field at? "side"|"left-edge"|"bottom"|"main"|"below-editor"|"right"|"below"|"left"|"above"|"tab"
 ---@field float? boolean
 ---@field size? number|string|number[]|{w: number, h: number} A share (a fraction) or a pixel size such as "120px"; a float takes two fractions.
 ---@field scratchpad? boolean
@@ -112,7 +112,7 @@
 ---@field key? string A module key after the prefix.
 
 ---@class EitriPluginOptions: table<string, string|number|boolean>
----@field key? string A module key after the prefix.
+---@field key? string|false A module key after the prefix; false for none, not even the plugin's own.
 ---@field position? "main"|"side"|"bottom"
 
 ---Eitri's configuration API runs once at startup, separately from Neovim's own Lua.

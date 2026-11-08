@@ -20,22 +20,30 @@ do in one shows in the others, in every window.
 
 | role | page | where it sits | what it is for |
 |---|---|---|---|
-| glance | Strips, `agents-strips` | a sidebar at the left of the window | who needs you, always in view; rows never re-sort, so a row stays where you last saw it |
+| glance | Strips, `agents-strips` | a sidebar at the left of the window, hidden until you open it with `<prefix> U` | who needs you, one key away; rows never re-sort, so a row stays where you last saw it |
 | act | The pass, `agents-pass` | one line above the editor | what needs you, one at a time: the agents that wait, oldest first, the round's place, next and back; it appears only while something waits or a round runs |
 | manage | the table, `agents-top` | a module in the main area, hidden until you open it | everything: sort, filter, open a new agent, ask to stop one |
 
-Each takes the keys as any module does: from the editor, `<prefix> Left` reaches Strips and `<prefix> Up` The pass,
-`<prefix> o` goes round every module, and the table's own key (below) opens it with the keys.
+Each takes the keys as any module does: from the editor, `<prefix> Left` reaches Strips once it is open and `<prefix> Up`
+The pass, `<prefix> o` goes round every module, and a page's own key opens it with the keys and, pressed again with the
+keys on it, hides it. Strips comes with its own key, `<prefix> U` (beside `u` and `B`, the round's keys below); the
+table has one only if you give it one, as below.
 
 All three are plugins that ship with Eitri and are off until `init.lua` loads them
 ([Plugins](configuration.md#plugins)); to try one in the window you are in, `Enter` on it under the empty tab's Pages, or
 `:Eitri plugin load agents-top` (for this run only):
 
 ```lua
-eitri.plugin.load("agents-strips")
+eitri.plugin.load("agents-strips")                -- prefix then U shows or hides the sidebar
 eitri.plugin.load("agents-pass")
 eitri.plugin.load("agents-top", { key = "g" })    -- prefix then g shows or hides the table
 ```
+
+`eitri.plugin.load("agents-strips", { key = "y" })` gives Strips another key instead, and `{ key = false }` none. If
+something already uses `U` (a binding in your `init.lua` or your tmux configuration, or another page you gave
+`key = "U"`), that keeps it: Strips loads with no key, and the terminal you started Eitri from says why. Once you have
+opened Strips, a layout you saved keeps it open at the next start; a layout saved by an Eitri that showed Strips at
+start keeps it shown too, and `<prefix> U` hides it from there.
 
 Strips has two settings: `narrow` (a narrow rail, drawn for a module about 62 pixels wide, with a glyph, what waits and the
 tab number, instead of the full sidebar) and `show_idle` (`false` keeps idle rows in their place but draws only their glyph):
@@ -49,10 +57,10 @@ Give the rail its width in pixels with an [open rule](configuration.md#where-a-n
 pixels stays the same however wide the window is:
 
 ```lua
-eitri.layout.rule("lua:agents-strips", { at = "left", size = "62px" })
+eitri.layout.rule("lua:agents-strips", { at = "left-edge", size = "62px" })
 ```
 
-A rule places the column when the window places it, at a first launch; a layout you saved keeps the column as it was.
+A rule places the column when it first opens; a layout you saved keeps the column as it was.
 Closed and shown again, the rail comes back at its width. Drag its edge, or use `<prefix> Ctrl+Left`/`Ctrl+Right` with the keys on it, to
 change the width in pixels (16 to 400). Beside the pixel width the column keeps a share of the window, at first the
 smallest there is (a twentieth), growing and shrinking as you drag the width; that share is what you see only where the width does not apply: in a layout an older Eitri

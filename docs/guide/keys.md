@@ -64,7 +64,8 @@ further press goes to the next one; `<prefix> B` leaves the walk and goes back t
 anything: the card is in front of you, and you answer it with the card keys of that chat. With nothing waiting the
 status line says `no agent waits for you`. They share their walk with the pages that show your agents, and they work
 in a companion window too. With `agents.enabled` off they say `agents are off in this window`. See
-[Many agents at once](many-agents.md).
+[Many agents at once](many-agents.md). `<prefix> U` shows the Strips sidebar of your agents with the keys on it,
+and hides it again from there, once `init.lua` loads it (`eitri.plugin.load("agents-strips")`).
 
 **A second window.** `<prefix> W` opens a [second Eitri window](two-windows.md), for a second monitor, or brings it to the
 front when it is open. It does nothing in [compositor windows](compositor-windows.md) and in a companion window,

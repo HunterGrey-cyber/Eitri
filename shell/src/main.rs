@@ -1467,11 +1467,22 @@ fn build_ui(
         // A page window beside nvim builds one page; another page's key starts or raises that page's own window.
         .chain(lua_engine.other_page_keys())
         .collect();
+    // A plugin's default key from its manifest yields to every key the user wrote or bound: one line says so, and
+    // the module has no key (`ModuleKeys::build_with_defaults`).
     let module_keys = {
-        let (keys, refused) = ModuleKeys::build_settled(&lua_keys, &keymap);
+        let (keys, refused, unused) =
+            ModuleKeys::build_with_defaults(&lua_keys, &plugin_panels.default_keys(), &keymap);
         for error in refused {
             lua_engine.report_problem(format!("{error}; the panel has no key"));
         }
+        for error in unused {
+            eprintln!(
+                "[plugin {}] no module key: its manifest's default {}; a key in its init.lua load options gives it one",
+                error.panel(),
+                error.why()
+            );
+        }
+        plugin_panels.settle_module_keys(&keys);
         Rc::new(keys)
     };
     // `:Eitri`, for window 1's nvim only: it sends its words to the pane-switch socket, and what it completes and

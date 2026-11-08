@@ -2047,3 +2047,123 @@ fn an_open_in_a_workspace_that_lacks_the_editor_places_it_beside_the_keys_and_an
         "{ops:#?}"
     );
 }
+
+/// The Strips sidebar as shipped: its manifest starts it hidden with a default key, the window takes that key when
+/// `init.lua` wrote none, and the prefix then that key shows the sidebar by its own rule with the keys on it, and
+/// hides it again from there.
+#[test]
+fn the_strips_sidebar_starts_hidden_and_its_default_key_shows_then_hides_it() {
+    let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../plugins/agents-strips/eitri-plugin.toml");
+    let text = std::fs::read_to_string(&path).unwrap_or_else(|e| panic!("{}: {e}", path.display()));
+    let manifest = crate::plugin::manifest::parse_manifest(&text).unwrap();
+    let table = manifest.module.clone().expect("a [module] table");
+    assert_eq!(
+        table.start,
+        crate::plugin::manifest::ModuleStart::Hidden,
+        "a panel you open"
+    );
+    let default = table.key.expect("a default key");
+    assert_eq!(default, 'U');
+
+    let strips = ModuleId::lua(&manifest.id);
+    let keymap = Keymap::defaults();
+    let (module_keys, refused, unused) =
+        ModuleKeys::build_with_defaults(&[(strips.clone(), None)], &[(strips.clone(), default)], &keymap);
+    assert!(refused.is_empty() && unused.is_empty(), "{refused:?} {unused:?}");
+    assert_eq!(module_keys.module(default), Some(&strips));
+
+    let layout = three(editor());
+    let host = FakeHost::new();
+    host.set_grid_size(GRID);
+    let scheduler = FakeScheduler::new();
+    let mut controller = Controller::new(scheduler.clone());
+    controller.set_reads(host.clone());
+    controller.set_keymap(WIN, Rc::new(keymap), Rc::new(module_keys));
+    let mut hosted: Vec<_> = layout.modules().iter().map(decl).collect();
+    hosted.push(SurfaceDecl {
+        module: strips.clone(),
+        kind: SurfaceKind::PluginPage {
+            plugin: manifest.id.as_str().into(),
+        },
+        deferred: true,
+    });
+    for d in &hosted {
+        host.with_surface(WIN, d.module.clone(), d.kind.clone(), false);
+    }
+    let layout = Rc::new(RefCell::new(layout));
+    controller.open_window(
+        WIN,
+        WindowSpec {
+            role: WindowRole::Main,
+            presence: EditorPresence::Owned,
+            title: "project".into(),
+        },
+        WindowParts {
+            layout: layout.clone(),
+            workspaces: Rc::new(RefCell::new(Workspaces::single())),
+            saver: None,
+        },
+    );
+    controller.set_module_setup(
+        WIN,
+        ModuleSetup {
+            start_hidden: vec![(
+                strips.clone(),
+                Some(crate::layout::rules::OpenRule {
+                    at: table.at,
+                    size: table.rule_size(),
+                    focus: table.focus,
+                    ..Default::default()
+                }),
+            )],
+            ..ModuleSetup::default()
+        },
+    );
+    let driver = Driver::new(controller, host.clone(), scheduler.clone());
+    let sink: Rc<dyn HostSink> = driver.clone();
+    host.attach(Rc::downgrade(&sink));
+    scheduler.attach(Rc::downgrade(&sink));
+    driver.first_apply(WIN, hosted);
+    let r = Rig {
+        driver,
+        host,
+        layout,
+        workspaces: Rc::new(RefCell::new(Workspaces::single())),
+        saids: RefCell::default(),
+    };
+    // The keys in the right-hand column: a sidebar still opens at the window's left edge, not beside them.
+    r.native(&agent());
+    assert!(!r.layout.borrow().contains(&strips), "not placed at start");
+
+    let prefix_then_key = |r: &Rig| {
+        assert_eq!(r.window_key(key("C-b", PREFIX)), Verdict::Consumed);
+        assert_eq!(r.window_key(key(&default.to_string(), K1)), Verdict::Consumed);
+    };
+    prefix_then_key(&r);
+    r.native(&strips);
+    {
+        let layout = r.layout.borrow();
+        assert!(layout.is_shown(&strips), "shown by the key");
+        assert_eq!(layout.focus(), &strips, "with the keys, whatever its rule's focus says");
+        let root = layout.root();
+        assert_eq!(root.layout, crate::layout::ConLayout::SplitH, "{root:?}");
+        assert_eq!(
+            root.children[0].node,
+            Node::Leaf(strips.clone()),
+            "the window's left edge: {root:?}"
+        );
+    }
+    let applied = r.applied_since(0);
+    assert!(
+        applied.iter().any(
+            |(op, done)| matches!(op, HostOp::Focus { to: FocusTo::Module(m), .. } if *m == strips)
+                && *done == Applied::Done
+        ),
+        "the key gives it the keys: {applied:?}"
+    );
+
+    prefix_then_key(&r);
+    let layout = r.layout.borrow();
+    assert!(!layout.is_shown(&strips), "the same key hides it from there");
+    assert_ne!(layout.focus(), &strips);
+}

@@ -412,13 +412,13 @@ eitri.layout.rule("terminal#3", { scratchpad = true, focus = false })  -- termin
 - **The options** are `at` (a place, below), `float` (a boolean), `size`, `scratchpad` (a boolean: it floats and
   opens put away, and implies `float`) and `focus` (a boolean, `true` by default: whether the new module takes the
   keys; with `false` the keys stay where they were, unless the new module takes the place of the editor that had
-  them). `at` is one of `side` (a new column to the right of the whole window), `bottom` (a new row below the whole
-  window), `main` (in the editor's place, hiding the editor), `below-editor` (a row below the editor's column, a
+  them). `at` is one of `side` (a new column to the right of the whole window), `left-edge` (a new column at the
+  left of the whole window, wherever the keys are), `bottom` (a new row below the whole window), `main` (in the editor's place, hiding the editor), `below-editor` (a row below the editor's column, a
   terminal's default place), `right`, `below`, `left`, `above` (beside the module that has the keys, taking half of its space) and `tab` (as a tab of the
   container the module with the keys is in, which is made tabbed with the two of them if it is split). `size` is the
   share of its container when the module is tiled (a number above 0 and below 1), or a length in pixels, `"<n>px"`,
   that stays the same however big the window is: a height from 16 to 200 for a module `above` or `below`, a width from
-  16 to 400 for one `left` or `right`. It is `{ w, h }` or `{ w = ..., h = ... }`, fractions of the window above 0 and
+  16 to 400 for one `left`, `right` or `left-edge`. It is `{ w, h }` or `{ w = ..., h = ... }`, fractions of the window above 0 and
   at most 1, when the module floats; a float with no size opens centred at 60% of the window on each axis.
 - **What is refused,** listed at startup with a message that names the call, the rule not applied: an option that is not one of those, a value of the wrong type or out of range, a
   tiled size given as a table or a floating one as a number, `float` or `scratchpad` together with `at`, a
@@ -467,6 +467,11 @@ eitri.plugin.load("~/src/my-plugin", { key = "y" })    -- by path
   stops Eitri at startup with a message listing every directory it looked in.
 - The options are the plugin's own settings, plus `key` (a module key after the prefix) and `position` (`"side"`,
   `"bottom"` or `"main"`). A plugin opens where [open rules](#where-a-new-module-opens) say, as `lua:<id>`.
+- A plugin may bring a key of its own (`[module] key` in its manifest): of the shipped ones only Strips does, `U`. A
+  `key` you write replaces it, and `key = false` loads the page with no key. A plugin's own key never takes a key that
+  is already in use: if your `init.lua` or your tmux configuration binds it after the prefix, or another page's
+  `key` is the same, that one keeps it, and the page loads with no key and a line in the terminal saying why. A `key`
+  you write that clashes is shown as a startup problem instead, and that page has no key.
 - A plugin may name a directory of its own in its manifest (`[window]`). Start Eitri in that directory and the window
   is the plugin's: the top bar and the window title show the plugin's title instead of the project's name. With no
   saved layout, the plugin's layout is used before your `eitri.layout.default`, and the editor or chat it leaves out

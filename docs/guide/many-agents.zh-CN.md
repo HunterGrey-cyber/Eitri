@@ -1,5 +1,5 @@
 [English](many-agents.md) | 简体中文
-<!-- translated-from: many-agents.md sha256=27efda2c5080ffb029ca91e0f31517f23c7da3f2780e9e888c9766e973ad17ec -->
+<!-- translated-from: many-agents.md sha256=7b3b8106f80e38e330e0dc7f6e681021c6c2cf4f5877fe3a2e384f05338c6a92 -->
 
 # 同时用很多 agent
 
@@ -16,19 +16,21 @@
 
 | 分工 | 页面 | 放在哪里 | 用来做什么 |
 |---|---|---|---|
-| 扫一眼 | Strips，`agents-strips` | 窗口左边的侧栏 | 谁需要你，始终看得见；行永远不重新排序，所以一行总在你上次看到的位置 |
+| 扫一眼 | Strips，`agents-strips` | 窗口左边的侧栏，用 `<prefix> U` 打开之前是隐藏的 | 谁需要你，一个键就能看到；行永远不重新排序，所以一行总在你上次看到的位置 |
 | 动手 | The pass，`agents-pass` | 编辑器上方的一行 | 什么需要你，一次一个：在等的 agent，最久的在前，这一轮走到哪了，下一个和回退；只有在有东西等、或者一轮在进行时才出现 |
 | 管理 | 表格，`agents-top` | 主区域里的一个模块，打开之前是隐藏的 | 所有东西：排序、过滤、新开一个 agent、请求停掉一个 |
 
-它们和别的模块一样用键拿到焦点：从编辑器按 `<prefix> Left` 到 Strips，`<prefix> Up` 到 The pass，`<prefix> o` 依次走过所有模块，表格用它自己的键（见下文）打开并拿到焦点。
+它们和别的模块一样用键拿到焦点：Strips 打开后，从编辑器按 `<prefix> Left` 到 Strips，`<prefix> Up` 到 The pass，`<prefix> o` 依次走过所有模块；页面自己的键打开它并让它拿到焦点，焦点在它上面时再按一次就把它隐藏。Strips 自带一个键 `<prefix> U`（挨着下文那一轮用的 `u` 和 `B`）；表格只有在你给它一个键时才有，见下面。
 
 三个都是随 Eitri 一起发布的插件，在 `init.lua` 加载它们之前是关着的（[插件](configuration.zh-CN.md#plugins)）；想在当前窗口里试一个，在空标签页的 Pages 下面它的那一行上按 `Enter`，或者运行 `:Eitri plugin load agents-top`（只在这次运行里有效）：
 
 ```lua
-eitri.plugin.load("agents-strips")
+eitri.plugin.load("agents-strips")                -- prefix then U shows or hides the sidebar
 eitri.plugin.load("agents-pass")
 eitri.plugin.load("agents-top", { key = "g" })    -- prefix then g shows or hides the table
 ```
+
+`eitri.plugin.load("agents-strips", { key = "y" })` 给 Strips 换一个键，`{ key = false }` 让它没有键。如果 `U` 已经被别的用上了（你 `init.lua` 或 tmux 配置里的一个绑定，或者另一个你写了 `key = "U"` 的页面），就归那边：Strips 加载时没有键，启动 Eitri 的那个终端里会说明原因。打开过 Strips 之后，你保存的布局会让它在下次启动时还开着；以前启动时就显示 Strips 的 Eitri 保存的布局也让它保持显示，在那里按 `<prefix> U` 就能把它隐藏。
 
 Strips 有两个设置：`narrow`（窄条：给一个约 62 像素宽的模块画，只有一个图标、在等的状态和标签页编号，而不是完整的侧栏）和 `show_idle`（`false` 时空闲的行留在原位，但只画它们的图标）：
 
@@ -39,10 +41,10 @@ eitri.plugin.load("agents-strips", { narrow = true })
 `narrow` 改变的是 Strips 画什么，而不是它那一列有多宽：这一列仍占窗口原来的份额（五分之一）。用你自己的一条[打开规则](configuration.zh-CN.md#where-a-new-module-opens)以像素给窄条定宽；以像素给的宽度不随窗口宽窄而变：
 
 ```lua
-eitri.layout.rule("lua:agents-strips", { at = "left", size = "62px" })
+eitri.layout.rule("lua:agents-strips", { at = "left-edge", size = "62px" })
 ```
 
-规则在窗口放置这一列时（第一次启动时）决定它的位置和宽度；你保存过的布局保持这一列原来的样子。关掉再显示，窄条仍是原来的宽度。拖动它的边缘，或者在按键在它上面时用 `<prefix> Ctrl+Left`/`Ctrl+Right`，可以按像素改宽度（16 到 400）。除了像素宽度，这一列还保留一个占窗口的份额，起初是最小的份额（二十分之一），随你拖动宽度而增减；只有在像素宽度不起作用的地方才会看到这个份额：较旧版本的 Eitri 读到的布局里，或者窄条被移进上下排列的一列模块时。
+规则在这一列第一次打开时决定它的位置和宽度；你保存过的布局保持这一列原来的样子。关掉再显示，窄条仍是原来的宽度。拖动它的边缘，或者在按键在它上面时用 `<prefix> Ctrl+Left`/`Ctrl+Right`，可以按像素改宽度（16 到 400）。除了像素宽度，这一列还保留一个占窗口的份额，起初是最小的份额（二十分之一），随你拖动宽度而增减；只有在像素宽度不起作用的地方才会看到这个份额：较旧版本的 Eitri 读到的布局里，或者窄条被移进上下排列的一列模块时。
 
 列窄的时候，完整的侧栏保留标签，也就是让你分清各个 agent 的那部分：先省掉工具名，再省掉时长。鼠标停在一行上会显示它的全名。
 

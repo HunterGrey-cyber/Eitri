@@ -97,6 +97,7 @@ pub(crate) fn registration_of(plugin: Rc<LoadedPlugin>) -> PluginRegistration {
     PluginRegistration {
         plugin,
         key: None,
+        no_key: false,
         slot: PanelSlot::Side,
         position: None,
     }

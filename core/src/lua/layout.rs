@@ -655,8 +655,8 @@ fn parse_rule(call: &str, opts: &Value, editor: bool) -> Result<OpenRule, String
                 let s = s.to_str().map_err(|e| format!("{call}: {e}"))?.to_string();
                 rule.at = Some(crate::layout::rules::parse_at(&s).ok_or_else(|| {
                     format!(
-                        "{call}: at '{s}' is not one of side, bottom, main, below-editor, right, below, left, \
-                         above, tab"
+                        "{call}: at '{s}' is not one of side, left-edge, bottom, main, below-editor, right, below, \
+                         left, above, tab"
                     )
                 })?);
             }
@@ -1225,7 +1225,7 @@ mod tests {
         for (source, why) in [
             (
                 "eitri.layout.rule('terminal', { at = 'top' })",
-                "at 'top' is not one of side, bottom, main, below-editor, right, below, left, above, tab",
+                "at 'top' is not one of side, left-edge, bottom, main, below-editor, right, below, left, above, tab",
             ),
             (
                 "eitri.layout.rule('terminal', { at = 3 })",
@@ -1261,7 +1261,7 @@ mod tests {
             ),
             (
                 "eitri.layout.rule('terminal', { size = 'big' })",
-                "size \"big\": a pixel size requires at = above or below (a height), or left or right (a width)",
+                "size \"big\": a pixel size requires at = above or below (a height), or left, right or left-edge (a width)",
             ),
             (
                 "eitri.layout.rule('terminal', { at = 'left', size = 'big' })",
@@ -1273,7 +1273,7 @@ mod tests {
             ),
             (
                 "eitri.layout.rule('terminal', { at = 'side', size = '62px' })",
-                "size \"62px\": a pixel size requires at = above or below (a height), or left or right (a width)",
+                "size \"62px\": a pixel size requires at = above or below (a height), or left, right or left-edge (a width)",
             ),
             (
                 "eitri.layout.rule('terminal', { size = { 0.5, 0.5 } })",
