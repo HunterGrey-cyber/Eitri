@@ -2146,25 +2146,25 @@ fn hold_application() -> Option<gtk4::gio::ApplicationHoldGuard> {
     gtk4::gio::Application::default().map(|app| app.hold())
 }
 
-/// Holds the application until the ending thread has finished, looking from the main loop so nothing waits on the
-/// caller; the thread itself is bounded by its grace.
+/// Holds the application until the ending thread has finished; the thread itself is bounded by its grace.
 fn hold_until_finished(ending: JoinHandle<Ending>) {
     let Some(hold) = hold_application() else {
         return;
     };
-    let mut hold = Some(hold);
-    let mut ending = Some(ending);
-    gtk4::glib::timeout_add_local(REAP_RETRY, move || {
-        if ending.as_ref().is_some_and(|ending| !ending.is_finished()) {
-            return gtk4::glib::ControlFlow::Continue;
-        }
-        if let Some(ending) = ending.take() {
-            let _ = ending.join();
-        }
-        // Released from inside the source, once the ending is done, so the exit it allows never waits on GLib
-        // freeing this closure.
-        hold.take();
-        gtk4::glib::ControlFlow::Break
+    release_when_finished(ending, move || drop(hold));
+}
+
+/// Runs `release` on the main loop as soon as `ending` has finished. The join happens on GLib's worker pool and wakes
+/// the main loop when it returns, so nothing waits on the caller and nothing polls: a window that is already gone lets
+/// the process exit at once, not at the next look of a timer (which cost every close in compositor mode about 100
+/// ms).
+fn release_when_finished<T: Send + 'static>(ending: JoinHandle<T>, release: impl FnOnce() + 'static) {
+    let joined = gtk4::gio::spawn_blocking(move || {
+        let _ = ending.join();
+    });
+    gtk4::glib::spawn_future_local(async move {
+        let _ = joined.await;
+        release();
     });
 }
 
@@ -2717,6 +2717,39 @@ pub(crate) mod tests {
     /// Ignored because `g_application_run` iterates the default main context, which two tests in two threads would
     /// fight over. Run it alone:
     /// `cargo test -p shell the_application_outlives_an_ending_in_its_grace -- --ignored --exact`.
+    /// The release follows the ending thread's end on the main loop, not a timer's next look: with a marker timer at
+    /// half the old polling period, the release must come first. Runs on a private main context, so it does not
+    /// fight the suite over the default one; the marker is attached to that context, and nothing blocks on it.
+    #[test]
+    fn a_finished_ending_is_released_without_waiting_for_a_timer() {
+        use std::sync::{Arc, Mutex};
+        let context = gtk4::glib::MainContext::new();
+        let order: Arc<Mutex<Vec<&str>>> = Arc::default();
+        context
+            .with_thread_default(|| {
+                let ending = std::thread::spawn(|| ());
+                {
+                    let order = order.clone();
+                    release_when_finished(ending, move || order.lock().unwrap().push("released"));
+                }
+                let marker = {
+                    let order = order.clone();
+                    gtk4::glib::timeout_source_new(REAP_RETRY / 2, None, gtk4::glib::Priority::DEFAULT, move || {
+                        order.lock().unwrap().push("marker");
+                        gtk4::glib::ControlFlow::Break
+                    })
+                };
+                marker.attach(Some(&context));
+                let deadline = Instant::now() + Duration::from_secs(10);
+                while order.lock().unwrap().len() < 2 && Instant::now() < deadline {
+                    context.iteration(false);
+                    std::thread::sleep(Duration::from_millis(1));
+                }
+            })
+            .unwrap();
+        assert_eq!(*order.lock().unwrap(), ["released", "marker"]);
+    }
+
     #[test]
     #[ignore = "runs a real gio main loop on the default main context; must not race the rest of the suite"]
     fn the_application_outlives_an_ending_in_its_grace() {
