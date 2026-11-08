@@ -91,17 +91,22 @@ distinguish real refresh-period feedback from the fallback clock.
   If you want the lowest latency, run Neovim's own `:terminal` in the editor, which is drawn the way the editor is
   (typing in a buffer took 1.7 ms at the median in the same run). A `:terminal` buffer's own latency has not been
   measured, and none of this has been measured on a physical display.
-- **Memory:** one tab uses 253 to 283 MiB more than native Neovide, more than the 256 MiB we aim for, and each
-  extra chat view about 28 MB more. That is the window's own share. Each Claude session behind a chat view also
-  runs its own `claude` process (about 113 MB) and its own sidecar (86 to 145 MB), so a session costs about 230 MB
-  rather than 28: seven of them held 2.0 GB after three hours on 0.3.0, part of it the growth below.
+- **Memory:** an idle window with one tab uses 232 MiB more than native Neovide when the panel is inside the
+  window, and 245 MiB more in compositor mode, where the panel is a window of its own (the default on a tiling
+  compositor). Both are under the 256 MiB we aim for. That was measured on a development build after 0.3.0, on the
+  AMD desktop's Radeon RX 9070; on the same machine's integrated GPU the window used 248 to 259 MiB more. The first
+  Claude tab adds about 85 MiB, its sidecar included (79 MiB of it), and each further tab about 63 MiB (about 55 of it
+  its own sidecar). Each Claude session also runs the `claude` CLI you installed. That is your program, not part of
+  Eitri: it used about 109 MiB per session once idle, more during a turn, on top of these figures.
 - **In 0.3.0 an idle session's sidecar keeps growing; the next release fixes it.** With seven sessions left idle,
   each sidecar grew 30 to 47 MB an hour, with no plateau in three hours. A forced garbage collection every five
   minutes did not slow it, so it is memory the sidecar still holds, not memory it has yet to collect. At that rate a
   window with five tabs left open for a week would reach about 30 GB (extrapolated, not run). Quitting the window
   gives it back. The release after 0.3.0 bundles a sidecar that stays flat at rest: in the same 25-minute test of one
   idle session, its memory held at 102.6 MB from the fifth minute, where 0.3.0's grew 22 MB an hour (its JavaScript
-  heap 44 MB an hour, against 0.3 for the new one). 0.3.0 cannot take the fix as a sidecar update.
+  heap 44 MB an hour, against 0.3 for the new one). In a window on a development build after 0.3.0, four idle
+  sessions' sidecars held 248 MiB between them for 30 minutes, each within 0.1 MiB. 0.3.0 cannot take the fix as a
+  sidecar update.
 - **At high refresh rates under load the editor drops frames.** At 165 Hz on an Intel laptop, with other work
   keeping the machine 17-28 % busy, it drew 137-149 frames a second where native Neovide drew 160, and 111 at 34 %
   busy, with one 83.6 ms frame in four runs. That was measured before 0.2.0's typing-latency fix and not since.
