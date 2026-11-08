@@ -93,8 +93,8 @@ distinguish real refresh-period feedback from the fallback clock.
   measured, and none of this has been measured on a physical display.
 - **Memory:** an idle window with one tab uses 232 MiB more than native Neovide when the panel is inside the
   window, and 245 MiB more in compositor mode, where the panel is a window of its own (the default on a tiling
-  compositor). Both are under the 256 MiB we aim for. That was measured on a development build after 0.3.0, on the
-  AMD desktop's Radeon RX 9070; on the same machine's integrated GPU the window used 248 to 259 MiB more. The first
+  compositor). Both are under the 256 MiB we aim for. That was measured on a development build after 0.3.0, on an
+  AMD Radeon RX 9070; on the integrated GPU beside it the window used 248 to 259 MiB more. The first
   Claude tab adds about 85 MiB, its sidecar included (79 MiB of it), and each further tab about 63 MiB (about 55 of it
   its own sidecar). Each Claude session also runs the `claude` CLI you installed. That is your program, not part of
   Eitri: it used about 109 MiB per session once idle, more during a turn, on top of these figures.
