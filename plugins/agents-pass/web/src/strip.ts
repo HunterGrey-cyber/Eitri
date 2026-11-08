@@ -135,6 +135,14 @@ export function age(now: number, since: number): string {
   return `${Math.floor(seconds / 3600)}h${String(Math.floor(seconds / 60) % 60).padStart(2, "0")}`;
 }
 
+/** How long until [age] from `since` reads differently at `now`: a second while it shows seconds (under an hour),
+ *  a minute after that. */
+export function ageChangesIn(now: number, since: number): number {
+  const elapsed = Math.max(0, now - since);
+  const step = elapsed < 3_600_000 ? 1_000 : 60_000;
+  return (Math.floor(elapsed / step) + 1) * step - (now - since);
+}
+
 // Every piece of text goes in as a text node: labels come from the person's prompts.
 function span(cls: string, text: string): HTMLSpanElement {
   const el = document.createElement("span");
@@ -196,24 +204,51 @@ export type StripDeps = {
   store: PassStore;
   glyph: (row: PassRow) => string;
   now?: () => number;
-  /** Runs `fn` every `ms` until the returned function is called; ages tick only while the strip is up. */
-  every?: (ms: number, fn: () => void) => () => void;
+  /** Runs `fn` once after `ms` unless the returned function is called first; the strip asks for one only while it is
+   *  up and an age it shows is about to read differently. */
+  after?: (ms: number, fn: () => void) => () => void;
 };
+
+/** What a draw found: the tickets on the line, whether the page was written, and when the earliest age it shows
+ *  reads differently (`null`: the strip is down, so the clock alone changes nothing). */
+export type Drawn = { list: Ticket[]; wrote: boolean; next: number | null };
+
+/** The markup each root was last given. A draw that comes out the same writes nothing: replacing identical nodes
+ *  still costs the page a style, layout and paint pass, once a second while nothing on screen moves. */
+const shown = new WeakMap<HTMLElement, { nodes: Node[]; html: string }>();
+
+function put(root: HTMLElement, parts: Node[]): boolean {
+  const html = parts.map((part) => (part instanceof Element ? part.outerHTML : part.textContent ?? "")).join("\u0000");
+  const last = shown.get(root);
+  const same =
+    last !== undefined &&
+    last.html === html &&
+    root.hidden === (parts.length === 0) &&
+    root.childNodes.length === last.nodes.length &&
+    last.nodes.every((node, i) => root.childNodes[i] === node);
+  if (same) return false;
+  root.replaceChildren(...parts);
+  root.hidden = parts.length === 0;
+  shown.set(root, { nodes: parts, html });
+  return true;
+}
 
 export function render(
   root: HTMLElement,
   deps: Required<StripDeps>,
   groups: Map<string, string> = new Map(),
-): Ticket[] {
+): Drawn {
   const rows = deps.store.rows();
   const round = deps.store.round();
   const list = tickets(rows, round, deps.store.selection());
-  if (!wanted(rows, round)) {
-    root.replaceChildren();
-    root.hidden = true;
-    return list;
-  }
+  if (!wanted(rows, round)) return { list, wrote: put(root, []), next: null };
   const now = deps.now();
+  let next: number | null = null;
+  const ticket = (t: Ticket, many: boolean) => {
+    const at = now + ageChangesIn(now, waited(t.row));
+    if (next === null || at < next) next = at;
+    return ticketNode(t, deps.glyph, now, many);
+  };
   const parts: Node[] = [];
   if (running(round, rows)) {
     const at = place(rows, round, groups)!;
@@ -222,7 +257,7 @@ export function render(
     const many = manyWindows(rows);
     list.forEach((t, i) => {
       if (i) line.append(span("sep", "│"));
-      line.append(ticketNode(t, deps.glyph, now, many));
+      line.append(ticket(t, many));
     });
     parts.push(line);
     // A module too narrow for every ticket shows the current one and how many others wait (the stylesheet decides).
@@ -230,10 +265,9 @@ export function render(
     const others = list.filter((t) => !t.current).length;
     if (others) parts.push(span("more", `+${others}`));
     parts.push(span("hint", "n next · prefix B back"));
-    root.replaceChildren(...parts);
-    root.hidden = false;
-    root.querySelector<HTMLElement>(".current")?.scrollIntoView?.({ block: "nearest", inline: "nearest" });
-    return list;
+    const wrote = put(root, parts);
+    if (wrote) root.querySelector<HTMLElement>(".current")?.scrollIntoView?.({ block: "nearest", inline: "nearest" });
+    return { list, wrote, next };
   }
   // No round: the counts, then the oldest wait as the line's one ticket, the row `Enter` here starts the round at
   // (and `j`/`k` select), then how to start from anywhere.
@@ -241,29 +275,29 @@ export function render(
   const first = list.slice(0, 1);
   const line = span("tickets first", "");
   for (const t of first) {
-    const el = ticketNode(t, deps.glyph, now, manyWindows(rows));
+    const el = ticket(t, manyWindows(rows));
     el.classList.add("first");
     line.append(el);
   }
   parts.push(line);
   parts.push(span("hint", "Enter or prefix u to start"));
-  root.replaceChildren(...parts);
-  root.hidden = false;
-  return first;
+  return { list: first, wrote: put(root, parts), next };
 }
 
-/** Draws the strip from the store now and at every change, and keeps the ages current while it is up. */
+/** Draws the strip from the store now and at every change, and keeps the ages current while it is up: one timer for
+ *  the moment the earliest age it shows reads differently, none while the strip is down. */
 export function mountStrip(root: HTMLElement, deps: StripDeps) {
   const full: Required<StripDeps> = {
     now: () => Date.now(),
-    every: (ms, fn) => {
-      const id = setInterval(fn, ms);
-      return () => clearInterval(id);
+    after: (ms, fn) => {
+      const id = setTimeout(fn, ms);
+      return () => clearTimeout(id);
     },
     ...deps,
   };
   let order: string[] = [];
   let tick: (() => void) | undefined;
+  let tickAt: number | null = null;
   // The stops of the round that runs now, kept while it runs: a new round starts with none.
   const groups = new Map<string, string>();
   let roundOf: number | null = null;
@@ -273,12 +307,18 @@ export function mountStrip(root: HTMLElement, deps: StripDeps) {
     if (now !== roundOf) groups.clear();
     roundOf = now;
     if (now !== null) noteStops(deps.store.rows(), groups);
-    order = render(root, full, groups).map((t) => t.row.key);
-    if (!root.hidden && !tick) tick = full.every(1000, draw);
-    else if (root.hidden && tick) {
-      tick();
+    const drawn = render(root, full, groups);
+    order = drawn.list.map((t) => t.row.key);
+    if (drawn.next === tickAt && (tickAt === null || tick)) return;
+    tick?.();
+    tick = undefined;
+    tickAt = drawn.next;
+    if (tickAt === null) return;
+    tick = full.after(Math.max(0, tickAt - full.now()), () => {
       tick = undefined;
-    }
+      tickAt = null;
+      draw();
+    });
   };
   const off = deps.store.on(draw);
   draw();

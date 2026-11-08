@@ -10,6 +10,21 @@ export function age(since: number, now = Date.now()): string {
   if (minutes < 60) return `${minutes}m${String(seconds % 60).padStart(2, "0")}`;
   return `${Math.floor(minutes / 60)}h${String(minutes % 60).padStart(2, "0")}`;
 }
+/** How long until [age] of `since` reads differently at `now`: a second while it shows seconds (under an hour), a
+ *  minute after that. */
+export function ageChangesIn(since: number, now = Date.now()): number {
+  const elapsed = Math.max(0, now - since);
+  const step = elapsed < 3_600_000 ? 1_000 : 60_000;
+  return (Math.floor(elapsed / step) + 1) * step - (now - since);
+}
+// A text or attribute set to the value it already has still counts as a change to the page, which then styles, lays
+// out and paints again; these write only what differs.
+function setText(el: Node, value: string): void {
+  if (el.textContent !== value) el.textContent = value;
+}
+function setAttr(el: Element, name: string, value: string): void {
+  if (el.getAttribute(name) !== value) el.setAttribute(name, value);
+}
 function background(row: Row): string {
   const bg = row.background;
   if (!bg.calls) return "";
@@ -55,11 +70,30 @@ export function createTable(root: HTMLElement, kit: Kit, select?: (key: string) 
   const footer = document.createElement("footer");
   footer.textContent = "j/k move · Enter go/round · c new · x stop · s sort · S reverse · / filter · Esc editor · host keys close";
   root.replaceChildren(heading, controls, table, empty, footer);
+  // One timer, for the moment the earliest age on screen reads differently; none while no row shows one, or while
+  // the page is not on screen (it draws again when it comes back).
+  let clock: number | undefined;
+  let clockAt: number | null = null;
+  function schedule(next: number | null) {
+    const want = document.hidden ? null : next;
+    if (want === clockAt && (want === null || clock !== undefined)) return;
+    if (clock !== undefined) window.clearTimeout(clock);
+    clock = undefined;
+    clockAt = want;
+    if (want === null) return;
+    clock = window.setTimeout(() => {
+      clock = undefined;
+      clockAt = null;
+      draw();
+    }, Math.max(0, want - Date.now()));
+  }
   function draw() {
     const rows = kit.store.rows();
-    heading.textContent = `eitri agents — ${rows.length} agents, ${rows.filter(r => r.class === "needs").length} waiting`;
-    sortButton.textContent = `Sort: ${sort} ${reverse ? "▴" : "▾"} (s)`;
-    reverseButton.setAttribute("aria-pressed", String(reverse));
+    const now = Date.now();
+    let next: number | null = null;
+    setText(heading, `eitri agents — ${rows.length} agents, ${rows.filter(r => r.class === "needs").length} waiting`);
+    setText(sortButton, `Sort: ${sort} ${reverse ? "▴" : "▾"} (s)`);
+    setAttr(reverseButton, "aria-pressed", String(reverse));
     visible = sortRows(rows, sort, reverse).filter(row => [kit.word(row), row.project.name, row.window.name,
       String(row.number), row.agent, row.mode, row.tool ?? "", row.label].join(" ").toLowerCase().includes(query));
     const round = kit.store.round();
@@ -87,9 +121,11 @@ export function createTable(root: HTMLElement, kit: Kit, select?: (key: string) 
       tr.classList.toggle("selected", selected === row.key);
       tr.classList.toggle("current", round?.current === row.key);
       tr.classList.toggle("visited", visited.has(row.key));
-      tr.setAttribute("aria-label", `${row.label}${visited.has(row.key) ? ", visited" : ""}${round?.current === row.key ? ", current round stop" : ""}`);
+      setAttr(tr, "aria-label", `${row.label}${visited.has(row.key) ? ", visited" : ""}${round?.current === row.key ? ", current round stop" : ""}`);
       const marker = round?.current === row.key ? "▸" : visited.has(row.key) ? "✓" : " ";
-      const values = [`${marker}${kit.glyph(row)} ${kit.word(row)}`, age(row.since), row.project.name,
+      const at = now + ageChangesIn(row.since, now);
+      if (next === null || at < next) next = at;
+      const values = [`${marker}${kit.glyph(row)} ${kit.word(row)}`, age(row.since, now), row.project.name,
         row.window.name, String(row.number), row.agent, row.mode, row.tool ?? "", background(row), row.label];
       values.forEach((value, i) => {
         const cell = tr.cells[i];
@@ -107,8 +143,10 @@ export function createTable(root: HTMLElement, kit: Kit, select?: (key: string) 
       const tr = selected ? rowEls.get(selected) : undefined;
       if (tr) reveal(tr);
     }
-    empty.textContent = visible.length ? "" : rows.length ? "No matching agents" : "No window shares agents";
+    setText(empty, visible.length ? "" : rows.length ? "No matching agents" : "No window shares agents");
+    schedule(next);
   }
+  const onVisibility = () => { if (document.hidden) schedule(null); else draw(); };
   function handleKey(key: string): boolean {
     if (key === "s") sort = SORTS[(SORTS.indexOf(sort) + 1) % SORTS.length];
     else if (key === "S") reverse = !reverse;
@@ -119,7 +157,7 @@ export function createTable(root: HTMLElement, kit: Kit, select?: (key: string) 
   sortButton.onclick = () => handleKey("s");
   reverseButton.onclick = () => handleKey("S");
   const remove = kit.store.on(draw);
-  const timer = window.setInterval(draw, 1000);
+  document.addEventListener("visibilitychange", onVisibility);
   draw();
   return {
     order: () => visible.map(row => row.key),
@@ -127,6 +165,12 @@ export function createTable(root: HTMLElement, kit: Kit, select?: (key: string) 
     setSort(value: Sort) { sort = value; draw(); },
     setFilter(value: string) { query = value.toLowerCase(); draw(); },
     handleKey,
-    destroy() { remove(); window.clearInterval(timer); root.replaceChildren(); },
+    destroy() {
+      remove();
+      document.removeEventListener("visibilitychange", onVisibility);
+      if (clock !== undefined) window.clearTimeout(clock);
+      clock = undefined;
+      root.replaceChildren();
+    },
   };
 }

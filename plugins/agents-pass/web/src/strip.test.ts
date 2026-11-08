@@ -9,7 +9,7 @@ const NOW = 200_000;
 function mount(store: ReturnType<typeof fakeStore>["store"]) {
   const root = document.createElement("div");
   document.body.replaceChildren(root);
-  const strip = mountStrip(root, { store, glyph, now: () => NOW, every: () => () => {} });
+  const strip = mountStrip(root, { store, glyph, now: () => NOW, after: () => () => {} });
   return { root, strip };
 }
 const shown = (root: HTMLElement) => [...root.querySelectorAll<HTMLElement>(".ticket")].map((t) => t.dataset.key);
@@ -220,5 +220,84 @@ describe("the pass", () => {
     expect(age(95_000, 0)).toBe("1m35");
     expect(age(4_320_000, 0)).toBe("1h12");
     expect(age(0, 5_000)).toBe("0s");
+  });
+});
+
+describe("idle", () => {
+  // A hand-run clock: `after` records the one timer the strip asks for, `fire` moves time to it and runs it.
+  function clocked(store: ReturnType<typeof fakeStore>["store"], start: number) {
+    const root = document.createElement("div");
+    document.body.replaceChildren(root);
+    let now = start;
+    const timers: Array<{ at: number; fn: () => void; live: boolean }> = [];
+    const strip = mountStrip(root, {
+      store, glyph, now: () => now,
+      after: (ms, fn) => {
+        const t = { at: now + ms, fn, live: true };
+        timers.push(t);
+        return () => { t.live = false; };
+      },
+    });
+    const live = () => timers.filter((t) => t.live);
+    const fire = () => {
+      const t = live().sort((a, b) => a.at - b.at)[0];
+      t.live = false;
+      now = t.at;
+      t.fn();
+    };
+    const observer = new MutationObserver(() => {});
+    observer.observe(root, { subtree: true, childList: true, characterData: true, attributes: true });
+    return { root, strip, live, fire, writes: () => observer.takeRecords().length, at: () => now };
+  }
+
+  it("with_nothing_waiting_it_writes_nothing_and_keeps_no_timer", () => {
+    const s = fakeStore([row("a", "running"), row("b", "idle")]);
+    const c = clocked(s.store, NOW);
+    expect(c.root.hidden).toBe(true);
+    expect(c.live()).toHaveLength(0);
+    c.writes();
+    s.set({ rows: [row("a", "background"), row("b", "done")] });
+    s.set({});
+    expect(c.writes()).toBe(0);
+    expect(c.live()).toHaveLength(0);
+  });
+
+  it("an_unchanged_line_is_not_written_again", () => {
+    const s = fakeStore([row("a", "card", { waiting_since: NOW - 5_000 })]);
+    const c = clocked(s.store, NOW);
+    c.writes();
+    s.set({});
+    expect(c.writes()).toBe(0);
+  });
+
+  it("a_new_wait_shows_the_strip_and_its_age_ticks_each_second", () => {
+    const s = fakeStore([]);
+    const c = clocked(s.store, NOW);
+    expect(c.live()).toHaveLength(0);
+    s.set({ rows: [row("a", "card", { waiting_since: NOW - 5_400 })] });
+    expect(c.root.hidden).toBe(false);
+    expect(c.root.querySelector(".age")?.textContent).toBe("5s");
+    expect(c.live()).toHaveLength(1);
+    // Due when the age turns 6 s, not a whole second from now.
+    expect(c.live()[0].at).toBe(NOW + 600);
+    c.fire();
+    expect(c.root.querySelector(".age")?.textContent).toBe("6s");
+    expect(c.live()).toHaveLength(1);
+    // The wait answered: the strip goes down and the timer with it.
+    s.set({ rows: [] });
+    expect(c.root.hidden).toBe(true);
+    expect(c.live()).toHaveLength(0);
+  });
+
+  it("an_age_in_hours_waits_for_the_minute", () => {
+    const since = NOW - (3_600_000 + 12 * 60_000 + 30_000);
+    const s = fakeStore([row("a", "card", { waiting_since: since })]);
+    const c = clocked(s.store, NOW);
+    expect(c.root.querySelector(".age")?.textContent).toBe("1h12");
+    expect(c.live()[0].at).toBe(NOW + 30_000);
+    c.writes();
+    c.fire();
+    expect(c.root.querySelector(".age")?.textContent).toBe("1h13");
+    expect(c.writes()).toBeGreaterThan(0);
   });
 });

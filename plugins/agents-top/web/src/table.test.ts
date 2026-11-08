@@ -181,3 +181,77 @@ it("the_table_fits_a_narrow_module", () => {
   expect(drops).toEqual([[96, ["agent", "mode"]], [72, ["background"]], [52, ["tool"]]]);
   expect(SHEET).toMatch(/body \{[^}]*container-type: inline-size;/);
 });
+
+// The table's clock: one timer for the moment the earliest age on screen reads differently, none with nothing to move.
+function idleSetup(rows: Row[]) {
+  const { store, apply } = createStore();
+  apply("agents.reset", { rows, selection: null, round: null });
+  const root = document.createElement("main");
+  document.body.append(root);
+  const table = createTable(root, { store, glyph, word });
+  cleanups.push(table.destroy);
+  const observer = new MutationObserver(() => {});
+  observer.observe(root, { subtree: true, childList: true, characterData: true, attributes: true });
+  return { root, apply, writes: () => observer.takeRecords().length };
+}
+const T0 = 1_793_865_600_000;
+const ageOf = (root: HTMLElement, key: string) =>
+  root.querySelector(`tr[data-key="${key}"] [data-column="age"] span`)?.textContent;
+
+it("with_no_agents_the_table_keeps_no_timer_and_writes_nothing", () => {
+  vi.useFakeTimers();
+  try {
+    vi.setSystemTime(T0);
+    const page = idleSetup([]);
+    expect(page.root.textContent).toContain("No window shares agents");
+    expect(vi.getTimerCount()).toBe(0);
+    vi.advanceTimersByTime(10_000);
+    expect(page.writes()).toBe(0);
+    // An event that changes nothing on screen writes nothing either.
+    page.apply("agents.selection", null);
+    expect(page.writes()).toBe(0);
+  } finally {
+    vi.useRealTimers();
+  }
+});
+
+it("an_agent_starts_the_clock_and_its_age_ticks_each_second", () => {
+  vi.useFakeTimers();
+  try {
+    vi.setSystemTime(T0);
+    const page = idleSetup([]);
+    page.apply("agents.row", row("a", { since: T0 - 5_400 }));
+    expect(ageOf(page.root, "a")).toBe("5s");
+    expect(vi.getTimerCount()).toBe(1);
+    page.writes();
+    vi.advanceTimersByTime(599);
+    expect(page.writes()).toBe(0);
+    vi.advanceTimersByTime(1);
+    expect(ageOf(page.root, "a")).toBe("6s");
+    // Only the age cell moved: its text and its title.
+    const records = page.writes();
+    expect(records).toBeGreaterThan(0);
+    expect(records).toBeLessThanOrEqual(2);
+    // The agent gone, the clock stops.
+    page.apply("agents.gone", { key: "a", id: "instance:a" });
+    expect(vi.getTimerCount()).toBe(0);
+  } finally {
+    vi.useRealTimers();
+  }
+});
+
+it("an_age_in_hours_redraws_once_a_minute", () => {
+  vi.useFakeTimers();
+  try {
+    vi.setSystemTime(T0);
+    const page = idleSetup([row("a", { since: T0 - (3_600_000 + 12 * 60_000 + 30_000) })]);
+    expect(ageOf(page.root, "a")).toBe("1h12");
+    page.writes();
+    vi.advanceTimersByTime(29_999);
+    expect(page.writes()).toBe(0);
+    vi.advanceTimersByTime(1);
+    expect(ageOf(page.root, "a")).toBe("1h13");
+  } finally {
+    vi.useRealTimers();
+  }
+});

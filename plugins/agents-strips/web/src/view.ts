@@ -35,6 +35,14 @@ export function age(ms: number): string {
   return `${Math.floor(h / 24)}d`;
 }
 
+/** How long until [age] of `ms` reads differently: a second while it shows seconds (under ten minutes), a minute
+ *  while it shows minutes, a day once it shows days. */
+export function ageChangesIn(ms: number): number {
+  const elapsed = Math.max(0, ms);
+  const step = elapsed < 600_000 ? 1_000 : elapsed < 86_400_000 ? 60_000 : 86_400_000;
+  return (Math.floor(elapsed / step) + 1) * step - ms;
+}
+
 /** How long a row has been what it is; a row that waits counts from its oldest wait. */
 export function since(row: Row): number {
   return row.class === "needs" && typeof row.waiting_since === "number" ? row.waiting_since : row.since;
@@ -80,7 +88,11 @@ export function matches(row: Row, word: string, filter: string): boolean {
   return !filter || tag(row, word).toLowerCase().includes(filter.toLowerCase());
 }
 
-function rowNode(row: Row, m: Model, manyWindows: boolean): HTMLLIElement {
+/** What drawing the list found: whether it wrote the page, and when the earliest age it shows reads differently
+ *  (`null`: no age is shown, so the clock alone changes nothing). */
+export type Drawn = { wrote: boolean; next: number | null };
+
+function rowNode(row: Row, m: Model, manyWindows: boolean, clock: { next: number | null }): HTMLLIElement {
   const word = m.kit.word(row);
   const round = m.kit.store.round();
   const li = el("li", "row");
@@ -112,13 +124,18 @@ function rowNode(row: Row, m: Model, manyWindows: boolean): HTMLLIElement {
   if (manyWindows) num.title = number;
   const label = el("span", "label", hushed ? "" : row.label || row.agent);
   if (!row.label) label.classList.add("unnamed");
+  const aged = !hushed && row.state !== "new";
+  if (aged) {
+    const at = m.now + ageChangesIn(m.now - since(row));
+    if (clock.next === null || at < clock.next) clock.next = at;
+  }
   li.append(
     el("span", "stop", current ? "▸" : marked ? "*" : ""),
     num,
     label,
     el("span", "glyph", m.kit.glyph(row)),
     el("span", "what", hushed ? "" : row.moving ? "moving" : detail(row, word)),
-    el("span", "age", hushed || row.state === "new" ? "" : age(m.now - since(row))),
+    el("span", "age", aged ? age(m.now - since(row)) : ""),
     el("span", "edge", out ? "◀" : ""),
   );
   return li;
@@ -142,14 +159,29 @@ function emptyNode(narrow: boolean): HTMLLIElement {
   return li;
 }
 
+/** The markup each root was last given, and the frame that holds it. A draw that comes out the same as the last one
+ *  writes nothing: replacing an identical list still costs the page a style, layout and paint pass, once a second
+ *  while nothing on screen moves. */
+const shown = new WeakMap<HTMLElement, { frame: Element; html: string }>();
+
+function put(root: HTMLElement, frame: HTMLElement): boolean {
+  const html = frame.outerHTML;
+  const last = shown.get(root);
+  if (last && last.html === html && root.childNodes.length === 1 && root.firstChild === last.frame) return false;
+  root.replaceChildren(frame);
+  shown.set(root, { frame, html });
+  return true;
+}
+
 /** One line in place of the list: the layer is off, or the page is not in Eitri. */
 export function renderLine(root: HTMLElement, text: string): void {
   const frame = el("div", "strips");
   frame.append(el("p", "off", text));
-  root.replaceChildren(frame);
+  put(root, frame);
 }
 
-export function render(root: HTMLElement, m: Model): void {
+export function render(root: HTMLElement, m: Model): Drawn {
+  const clock = { next: null as number | null };
   const frame = el("div", m.narrow ? "strips narrow" : "strips");
   const list = el("ol", "list");
   let total = 0;
@@ -171,7 +203,7 @@ export function render(root: HTMLElement, m: Model): void {
       }
       total += 1;
       if (row.class === "needs") needs += 1;
-      list.append(rowNode(row, m, manyWindows));
+      list.append(rowNode(row, m, manyWindows, clock));
     }
   }
   // Only a list that names windows widens the column; a bare tab number fits the stylesheet's default. The column is a
@@ -186,5 +218,5 @@ export function render(root: HTMLElement, m: Model): void {
   if (!m.groups.length) frame.append(el("p", "none", m.narrow ? "·" : "no agents"));
   frame.append(list);
   if (!m.narrow) frame.append(el("footer", "keys", KEYS_LINE));
-  root.replaceChildren(frame);
+  return { wrote: put(root, frame), next: clock.next };
 }

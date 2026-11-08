@@ -77,15 +77,24 @@ export async function boot(doc: Document, win: Host, opts: BootOptions = {}): Pr
   const marks = new Set<string>();
   let filter = "";
   let cursor: string | null = null;
+  // When the list would next read differently with nothing else happening: the earliest age it shows moving on, or a
+  // held place turning empty. `null`: only an event can change it.
+  let next: number | null = null;
+  // Starts and stops the timers after each draw; installed below, once the marks can be read.
+  let schedule = () => {};
   const draw = () => {
-    slots.update(kit.store.rows(), now());
-    render(root, { groups: slots.groups(), kit, marks, filter, now: now(), narrow, showIdle });
+    const at = now();
+    slots.update(kit.store.rows(), at);
+    const drawn = render(root, { groups: slots.groups(), kit, marks, filter, now: at, narrow, showIdle });
+    const expiry = slots.nextExpiry();
+    next = drawn.next === null ? expiry : expiry === null ? drawn.next : Math.min(drawn.next, expiry);
     const selected = kit.store.selection();
     if (selected !== cursor) {
       cursor = selected;
       const node = [...root.querySelectorAll<HTMLElement>(".row[data-key]")].find(n => n.dataset.key === selected);
       node?.scrollIntoView?.({ block: "nearest" });
     }
+    schedule();
   };
   cleanups.push(kit.store.on(draw));
   draw();
@@ -190,8 +199,8 @@ export async function boot(doc: Document, win: Host, opts: BootOptions = {}): Pr
     if (row?.class === "needs") ask("agents.round", { op: "start", key: row.key });
     else if (row) ask("agents.focus", { id: row.id });
   };
-  // The list is drawn afresh every second and at every event, and a click (or double click) whose pressed node left
-  // the document before the release reaches no row: an engine sends none, or sends it to an ancestor. So a click is
+  // The list is drawn afresh whenever what it shows changes (each second while it shows an age in seconds), and a
+  // click (or double click) whose pressed node left the document before the release reaches no row: an engine sends none, or sends it to an ancestor. So a click is
   // a press and a release on the same row, matched by the row's key rather than its node: the release selects, and
   // the release of a double click (its click count) opens, as `Enter` does.
   // A press whose release the list never sees (released outside the sidebar or the page, or a cancelled pointer) is
@@ -231,20 +240,59 @@ export async function boot(doc: Document, win: Host, opts: BootOptions = {}): Pr
   );
 
   // The plugin store sends no event when another window's sidebar writes the marks, so a page on screen reads them
-  // again now and then, and at once when it comes back on screen.
-  const seen = () => { if (!doc.hidden) void refresh(); };
-  doc.addEventListener("visibilitychange", seen);
-  cleanups.push(() => doc.removeEventListener("visibilitychange", seen));
+  // again now and then while it shows rows to mark, and at once when it comes back on screen. Every timer here runs
+  // only while the page is on screen and has something it would change: with no agents nothing runs.
   const every = opts.marksEvery ?? (opts.tick === false ? 0 : MARKS_EVERY_MS);
-  if (every > 0) {
-    const timer = win.setInterval(seen, every);
-    cleanups.push(() => win.clearInterval(timer));
-  }
-
-  if (opts.tick !== false) {
-    // Ages move every second; a page not on screen has nothing to show them on.
-    const timer = win.setInterval(() => { if (!doc.hidden) draw(); }, 1_000);
-    cleanups.push(() => win.clearInterval(timer));
-  }
+  let marksTimer: number | undefined;
+  let marksRuns = 0;
+  let clockTimer: number | undefined;
+  let clockAt: number | null = null;
+  const stopClock = () => {
+    if (clockTimer !== undefined) win.clearTimeout(clockTimer);
+    clockTimer = undefined;
+    clockAt = null;
+  };
+  const stopMarks = () => {
+    if (marksTimer !== undefined) win.clearInterval(marksTimer);
+    marksTimer = undefined;
+  };
+  schedule = () => {
+    const visible = !doc.hidden;
+    const wantMarks = every > 0 && visible && slots.groups().length > 0;
+    if (wantMarks && marksTimer === undefined) {
+      marksTimer = win.setInterval(() => void refresh(), every);
+      // Rows came back after a stretch with none: another window may have marked meanwhile.
+      if (marksRuns++ > 0) void refresh();
+    } else if (!wantMarks) {
+      stopMarks();
+    }
+    const want = opts.tick !== false && visible ? next : null;
+    if (want === clockAt && (want === null || clockTimer !== undefined)) return;
+    stopClock();
+    if (want === null) return;
+    clockAt = want;
+    clockTimer = win.setTimeout(() => {
+      clockTimer = undefined;
+      clockAt = null;
+      draw();
+    }, Math.max(0, want - now()));
+  };
+  const onVisibility = () => {
+    if (doc.hidden) {
+      schedule();
+      return;
+    }
+    // Back on screen: the ages moved while it was away.
+    draw();
+    void refresh();
+  };
+  doc.addEventListener("visibilitychange", onVisibility);
+  cleanups.push(() => {
+    doc.removeEventListener("visibilitychange", onVisibility);
+    schedule = () => {};
+    stopClock();
+    stopMarks();
+  });
+  schedule();
   return page;
 }

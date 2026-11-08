@@ -67,4 +67,17 @@ export class Slots {
   holding(): boolean {
     return this.list.some(group => group.slots.some(slot => slot.key !== null && slot.left !== null));
   }
+
+  /** When the first held place gives up its key and turns empty; `null` while none is held. */
+  nextExpiry(): number | null {
+    let next: number | null = null;
+    for (const group of this.list) {
+      for (const slot of group.slots) {
+        if (slot.key === null || slot.left === null) continue;
+        const at = slot.left + HOLD_MS;
+        if (next === null || at < next) next = at;
+      }
+    }
+    return next;
+  }
 }

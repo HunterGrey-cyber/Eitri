@@ -46,6 +46,8 @@ type OpenOpts = {
   /** A `state.write` that fails, with this error. */
   writeFails?: () => Error | undefined;
   marksEvery?: number;
+  tick?: boolean;
+  now?: () => number;
 };
 
 async function open(rows: unknown[], opts: OpenOpts = {}) {
@@ -91,7 +93,9 @@ async function open(rows: unknown[], opts: OpenOpts = {}) {
   });
   await import("../../../../plugin-kit/agents/src/index");
   const { boot } = await import("./app");
-  const page = await boot(document, window, { now: () => NOW, tick: false, marksEvery: opts.marksEvery });
+  const page = await boot(document, window, {
+    now: opts.now ?? (() => NOW), tick: opts.tick ?? false, marksEvery: opts.marksEvery,
+  });
   stop = page.stop;
   const root = document.getElementById("strips")!;
   const emit = (event: string, data: unknown) => listeners.get(event)?.forEach(fn => fn(data));
@@ -488,4 +492,98 @@ it("one_window_keeps_the_narrow_number_column", async () => {
   const page = await open([row("k-a", { number: 3 })]);
   expect(page.at("k-a").querySelector(".num")!.textContent).toBe("3");
   expect(page.root.querySelector<HTMLElement>(".list")!.style.getPropertyValue("--num-w")).toBe("");
+});
+
+// The page's clock and marks timers: they run only while something they would change is on screen.
+async function idleOpen(rows: unknown[], opts: OpenOpts = {}) {
+  const page = await open(rows, { ...opts, tick: true, now: () => Date.now() });
+  const observer = new MutationObserver(() => {});
+  observer.observe(page.root, { subtree: true, childList: true, characterData: true, attributes: true });
+  const reads = () => page.call.mock.calls.filter(([verb]) => verb === "state.read").length;
+  return { ...page, writes: () => observer.takeRecords().length, reads };
+}
+
+it("with_no_agents_nothing_is_written_and_no_timer_runs", async () => {
+  vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout", "setInterval", "clearInterval", "Date"] });
+  try {
+    vi.setSystemTime(NOW);
+    const page = await idleOpen([], { marksEvery: 2_000 });
+    expect(page.root.textContent).toContain("no agents");
+    expect(vi.getTimerCount()).toBe(0);
+    const reads = page.reads();
+    page.writes();
+    vi.advanceTimersByTime(20_000);
+    expect(page.writes()).toBe(0);
+    expect(page.reads()).toBe(reads);
+    // An event that changes nothing drawn writes nothing.
+    page.emit("agents.selection", null);
+    expect(page.writes()).toBe(0);
+  } finally {
+    vi.useRealTimers();
+  }
+});
+
+it("a_new_agent_starts_the_clock_and_an_unchanged_draw_writes_nothing", async () => {
+  vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout", "setInterval", "clearInterval", "Date"] });
+  try {
+    vi.setSystemTime(NOW);
+    const page = await idleOpen([], { marksEvery: 0 });
+    const a = row("k-a", { since: NOW - 5_400 });
+    page.emit("agents.row", a);
+    expect(page.at("k-a").querySelector(".age")!.textContent).toBe("5s");
+    expect(vi.getTimerCount()).toBe(1);
+    page.writes();
+    // The same row again changes nothing on screen.
+    page.emit("agents.row", a);
+    vi.advanceTimersByTime(599);
+    expect(page.writes()).toBe(0);
+    vi.advanceTimersByTime(1);
+    expect(page.at("k-a").querySelector(".age")!.textContent).toBe("6s");
+    expect(page.writes()).toBeGreaterThan(0);
+  } finally {
+    vi.useRealTimers();
+  }
+});
+
+it("an_age_in_minutes_waits_for_the_minute", async () => {
+  vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout", "setInterval", "clearInterval", "Date"] });
+  try {
+    vi.setSystemTime(NOW);
+    const page = await idleOpen([row("k-a", { since: NOW - (20 * 60_000 + 30_000) })], { marksEvery: 0 });
+    expect(page.at("k-a").querySelector(".age")!.textContent).toBe("20m");
+    page.writes();
+    vi.advanceTimersByTime(29_999);
+    expect(page.writes()).toBe(0);
+    vi.advanceTimersByTime(1);
+    expect(page.at("k-a").querySelector(".age")!.textContent).toBe("21m");
+  } finally {
+    vi.useRealTimers();
+  }
+});
+
+it("the_last_agent_gone_its_place_empties_on_time_then_every_timer_stops_until_one_comes", async () => {
+  vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout", "setInterval", "clearInterval", "Date"] });
+  try {
+    vi.setSystemTime(NOW);
+    const a = row("k-a", { state: "new" });
+    const page = await idleOpen([a], { marksEvery: 2_000 });
+    // A new row shows no age: only the marks read runs.
+    expect(vi.getTimerCount()).toBe(1);
+    page.emit("agents.gone", { id: a.id, key: "k-a", why: "closed" });
+    expect(page.slots()).toEqual([""]);
+    // The held place turns empty when its hold ends, with no event behind it.
+    await vi.advanceTimersByTimeAsync(5_000);
+    expect(page.slots()).toEqual([]);
+    expect(vi.getTimerCount()).toBe(0);
+    const reads = page.reads();
+    vi.advanceTimersByTime(20_000);
+    expect(page.reads()).toBe(reads);
+    // An agent comes: the marks are read at once (another window may have marked meanwhile) and again every 2 s.
+    page.emit("agents.row", row("k-b", { state: "new" }));
+    await vi.waitFor(() => expect(page.reads()).toBe(reads + 1));
+    await vi.advanceTimersByTimeAsync(2_000);
+    expect(page.reads()).toBe(reads + 2);
+  } finally {
+    vi.useRealTimers();
+  }
 });
