@@ -459,6 +459,15 @@ impl EditorGlArea {
         *self.imp().cover.borrow_mut() = Some(cover);
     }
 
+    /// The cover colour as opaque 8-bit RGB: what the subsurface's underlay shows where a compositor cuts the
+    /// editor's own corners. `None` before the pane set a cover.
+    pub(crate) fn cover_rgb(&self) -> Option<[u8; 3]> {
+        let cover = self.imp().cover.borrow().clone()?;
+        let color = cover();
+        let byte = |channel: f32| (channel.clamp(0.0, 1.0) * 255.0).round() as u8;
+        Some([byte(color.r), byte(color.g), byte(color.b)])
+    }
+
     pub(crate) fn set_hole_changed(&self, callback: Rc<dyn Fn()>) {
         *self.imp().hole_changed.borrow_mut() = Some(callback);
     }

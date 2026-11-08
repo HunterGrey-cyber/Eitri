@@ -1,22 +1,36 @@
 //! Child-surface requests stay on the GTK thread, with layout changes cached until the parent paints.
 
+use std::os::fd::{AsFd, FromRawFd, OwnedFd};
+
 use wayland_client::{
     protocol::{
-        wl_buffer::WlBuffer, wl_callback::WlCallback, wl_compositor::WlCompositor, wl_region::WlRegion,
-        wl_subcompositor::WlSubcompositor, wl_subsurface::WlSubsurface, wl_surface::WlSurface,
+        wl_buffer::WlBuffer,
+        wl_callback::WlCallback,
+        wl_compositor::WlCompositor,
+        wl_region::WlRegion,
+        wl_shm::{self, WlShm},
+        wl_shm_pool::WlShmPool,
+        wl_subcompositor::WlSubcompositor,
+        wl_subsurface::WlSubsurface,
+        wl_surface::WlSurface,
     },
     Dispatch, Proxy, QueueHandle,
 };
 use wayland_protocols::wp::{
     presentation_time::client::{wp_presentation::WpPresentation, wp_presentation_feedback::WpPresentationFeedback},
+    single_pixel_buffer::v1::client::wp_single_pixel_buffer_manager_v1::WpSinglePixelBufferManagerV1,
     viewporter::client::{wp_viewport::WpViewport, wp_viewporter::WpViewporter},
 };
 
 use super::{
-    geometry::Placement,
+    geometry::{Placement, Rect},
     types::{FrameData, Globals, PaneId},
 };
 use crate::dmabuf_target::Chosen;
+
+/// The user data of the underlay's `wl_buffer`. Its one event, `release`, needs no answer: the buffer's pixel never
+/// changes, and a new colour is a new buffer.
+pub(crate) struct Underlay;
 
 /// Owns one child's protocol objects. Constructors report failure instead of using an inert proxy.
 /// All other methods send only when their target and referenced objects remain alive.
@@ -44,6 +58,21 @@ pub(crate) trait ChildRequests {
     fn destroy_surface(&mut self);
     fn is_ready(&self) -> bool;
     fn buffer_is_alive(&self, buffer: &WlBuffer) -> bool;
+    /// The underlay: a second child surface of the same parent, with a viewport, no input and an opaque region over
+    /// all of it, left in sync mode for its whole life so each of its changes lands with a parent commit. False
+    /// (and nothing left behind) without a viewporter, or with neither single-pixel buffers nor `wl_shm`.
+    fn create_underlay(&mut self) -> bool;
+    fn place_underlay_below_child(&mut self);
+    /// Attaches a new one-pixel buffer of this colour to the underlay; the one it replaces is destroyed once the
+    /// next underlay commit is sent. False when no buffer could be made.
+    fn underlay_buffer(&mut self, rgb: [u8; 3]) -> bool;
+    /// The underlay's position (parent state) and its viewport's destination (its own).
+    fn underlay_rect(&mut self, rect: Rect);
+    fn underlay_attach_null(&mut self);
+    fn underlay_commit(&mut self);
+    /// Destroys the buffers an earlier underlay commit replaced, once the parent has committed and so applied it.
+    fn release_retired_underlay_buffers(&mut self);
+    fn destroy_underlay(&mut self);
 }
 
 pub(crate) struct WaylandRequests<D> {
@@ -51,11 +80,50 @@ pub(crate) struct WaylandRequests<D> {
     subcompositor: WlSubcompositor,
     viewporter: Option<WpViewporter>,
     presentation: Option<WpPresentation>,
+    single_pixel: Option<WpSinglePixelBufferManagerV1>,
+    shm: Option<WlShm>,
     qh: QueueHandle<D>,
     surface: Option<WlSurface>,
     subsurface: Option<WlSubsurface>,
     viewport: Option<WpViewport>,
     parent: Option<WlSurface>,
+    underlay: Option<UnderlayObjects>,
+}
+
+struct UnderlayObjects {
+    surface: WlSurface,
+    subsurface: WlSubsurface,
+    viewport: WpViewport,
+    buffer: Option<WlBuffer>,
+    /// Replaced buffers, destroyed after the parent commit that applies the underlay commit replacing them (the
+    /// underlay is in sync mode, so its own commit is only cached). Their pixel is never written again either way.
+    retired: Vec<WlBuffer>,
+}
+
+impl UnderlayObjects {
+    fn alive(&self) -> bool {
+        self.surface.is_alive() && self.subsurface.is_alive() && self.viewport.is_alive()
+    }
+}
+
+/// One opaque pixel in an anonymous file, `wl_shm`'s `xrgb8888` (little-endian B, G, R, X).
+fn shm_pixel(rgb: [u8; 3]) -> Option<OwnedFd> {
+    // SAFETY: a plain syscall with a NUL-terminated name; a valid descriptor is owned by the `OwnedFd` from here on.
+    let fd = unsafe { libc::memfd_create(c"eitri-underlay".as_ptr(), libc::MFD_CLOEXEC) };
+    if fd < 0 {
+        return None;
+    }
+    // SAFETY: `fd` was just returned by `memfd_create` and nothing else owns it.
+    let fd = unsafe { OwnedFd::from_raw_fd(fd) };
+    let pixel = [rgb[2], rgb[1], rgb[0], 0xff];
+    let mut file = std::fs::File::from(fd);
+    std::io::Write::write_all(&mut file, &pixel).ok()?;
+    Some(OwnedFd::from(file))
+}
+
+/// A colour channel spread over the whole `u32` range, as `wp_single_pixel_buffer_manager_v1` takes it.
+fn channel32(value: u8) -> u32 {
+    u32::from(value) * 0x0101_0101
 }
 
 impl<D> WaylandRequests<D> {
@@ -65,12 +133,35 @@ impl<D> WaylandRequests<D> {
             subcompositor: globals.subcompositor.clone(),
             viewporter: globals.viewporter.clone(),
             presentation: globals.presentation.clone(),
+            single_pixel: globals.single_pixel.clone(),
+            shm: globals.shm.clone(),
             qh,
             surface: None,
             subsurface: None,
             viewport: None,
             parent: None,
+            underlay: None,
         }
+    }
+    fn underlay(&mut self) -> Option<&mut UnderlayObjects> {
+        self.underlay.as_mut().filter(|underlay| underlay.alive())
+    }
+    fn new_underlay_buffer(&self, rgb: [u8; 3]) -> Option<WlBuffer>
+    where
+        D: Dispatch<WlBuffer, Underlay> + Dispatch<WlShmPool, ()> + 'static,
+    {
+        if let Some(manager) = self.single_pixel.as_ref().filter(|m| m.is_alive()) {
+            let [r, g, b] = rgb.map(channel32);
+            let buffer = manager.create_u32_rgba_buffer(r, g, b, u32::MAX, &self.qh, Underlay);
+            return buffer.is_alive().then_some(buffer);
+        }
+        let shm = self.shm.as_ref().filter(|shm| shm.is_alive())?;
+        let fd = shm_pixel(rgb)?;
+        let pool = shm.create_pool(fd.as_fd(), 4, &self.qh, ());
+        let buffer = pool.create_buffer(0, 1, 1, 4, wl_shm::Format::Xrgb8888, &self.qh, Underlay);
+        // The buffer keeps the pool's memory; the pool object itself is no longer needed.
+        pool.destroy();
+        buffer.is_alive().then_some(buffer)
     }
     fn surface(&self) -> Option<&WlSurface> {
         self.surface.as_ref().filter(|surface| surface.is_alive())
@@ -91,6 +182,8 @@ where
         + Dispatch<WpViewport, ()>
         + Dispatch<WlCallback, FrameData>
         + Dispatch<WpPresentationFeedback, FrameData>
+        + Dispatch<WlBuffer, Underlay>
+        + Dispatch<WlShmPool, ()>
         + 'static,
 {
     fn create_surface(&mut self) -> bool {
@@ -255,6 +348,117 @@ where
                 .surface()
                 .is_some_and(|s| s.backend().upgrade() == buffer.backend().upgrade())
     }
+    fn create_underlay(&mut self) -> bool {
+        if self.underlay.is_some() || !self.compositor.is_alive() || !self.subcompositor.is_alive() {
+            return false;
+        }
+        let single_pixel = self.single_pixel.as_ref().is_some_and(|m| m.is_alive());
+        let shm = self.shm.as_ref().is_some_and(|shm| shm.is_alive());
+        let (Some(parent), Some(viewporter)) = (
+            self.parent.clone().filter(|parent| parent.is_alive()),
+            self.viewporter.clone().filter(|v| v.is_alive()),
+        ) else {
+            return false;
+        };
+        if !single_pixel && !shm {
+            return false;
+        }
+        let surface = self.compositor.create_surface(&self.qh, ());
+        let subsurface = self.subcompositor.get_subsurface(&surface, &parent, &self.qh, ());
+        let viewport = viewporter.get_viewport(&surface, &self.qh, ());
+        let input = self.compositor.create_region(&self.qh, ());
+        surface.set_input_region(Some(&input));
+        input.destroy();
+        let opaque = self.compositor.create_region(&self.qh, ());
+        // The compositor clips this region, so any size stays opaque without another request.
+        opaque.add(0, 0, i32::MAX, i32::MAX);
+        surface.set_opaque_region(Some(&opaque));
+        opaque.destroy();
+        let objects = UnderlayObjects {
+            surface,
+            subsurface,
+            viewport,
+            buffer: None,
+            retired: Vec::new(),
+        };
+        if !objects.alive() {
+            objects.viewport.destroy();
+            objects.subsurface.destroy();
+            objects.surface.destroy();
+            return false;
+        }
+        self.underlay = Some(objects);
+        true
+    }
+    fn place_underlay_below_child(&mut self) {
+        let Some(child) = self.surface().cloned() else { return };
+        if let Some(underlay) = self.underlay() {
+            underlay.subsurface.place_below(&child);
+        }
+    }
+    fn underlay_buffer(&mut self, rgb: [u8; 3]) -> bool {
+        if self.underlay().is_none() {
+            return false;
+        }
+        let Some(buffer) = self.new_underlay_buffer(rgb) else {
+            return false;
+        };
+        let Some(underlay) = self.underlay() else {
+            buffer.destroy();
+            return false;
+        };
+        underlay.surface.attach(Some(&buffer), 0, 0);
+        underlay.surface.damage_buffer(0, 0, 1, 1);
+        if let Some(old) = underlay.buffer.replace(buffer) {
+            underlay.retired.push(old);
+        }
+        true
+    }
+    fn underlay_rect(&mut self, rect: Rect) {
+        if let Some(underlay) = self.underlay() {
+            underlay.subsurface.set_position(rect.0, rect.1);
+            underlay.viewport.set_destination(rect.2, rect.3);
+        }
+    }
+    fn underlay_attach_null(&mut self) {
+        if let Some(underlay) = self.underlay() {
+            underlay.surface.attach(None, 0, 0);
+            if let Some(old) = underlay.buffer.take() {
+                underlay.retired.push(old);
+            }
+        }
+    }
+    fn underlay_commit(&mut self) {
+        if let Some(underlay) = self.underlay() {
+            underlay.surface.commit();
+        }
+    }
+    fn release_retired_underlay_buffers(&mut self) {
+        if let Some(underlay) = self.underlay() {
+            for buffer in underlay.retired.drain(..) {
+                if buffer.is_alive() {
+                    buffer.destroy();
+                }
+            }
+        }
+    }
+    fn destroy_underlay(&mut self) {
+        let Some(underlay) = self.underlay.take() else { return };
+        if underlay.subsurface.is_alive() {
+            underlay.subsurface.destroy();
+        }
+        if underlay.viewport.is_alive() {
+            underlay.viewport.destroy();
+        }
+        if underlay.surface.is_alive() {
+            underlay.surface.destroy();
+        }
+        for buffer in underlay.buffer.into_iter().chain(underlay.retired) {
+            if buffer.is_alive() {
+                buffer.destroy();
+            }
+        }
+    }
 }
 
 pub(crate) struct Child<R: ChildRequests> {
@@ -266,6 +470,19 @@ pub(crate) struct Child<R: ChildRequests> {
     attached: bool,
     placement: Option<Placement>,
     seq: u64,
+    /// The underlay was made (a viewporter and a way to make a one-pixel buffer) and has not failed since.
+    underlay: bool,
+    /// Its colour, once the pane has named one.
+    underlay_color: Option<[u8; 3]>,
+    /// What the compositor has been sent for it: the rectangle and the colour, while a buffer is attached.
+    underlay_shown: Option<(Rect, [u8; 3])>,
+    /// Set when a buffer for it could not be made; the pane says so once.
+    underlay_lost: bool,
+    /// Set when the underlay was sent a change: being in sync mode, it waits for the parent's next commit, which the
+    /// pane then asks GDK for.
+    underlay_sent: bool,
+    /// Set when that change replaced a buffer, which the next `after_paint` releases.
+    underlay_retired: bool,
 }
 
 impl<R: ChildRequests> Child<R> {
@@ -290,6 +507,11 @@ impl<R: ChildRequests> Child<R> {
             requests.destroy_viewport();
             requests.destroy_surface();
         }
+        // Only a viewport can stretch one pixel over the editor and past it; without one there is no underlay.
+        let underlay = ready && viewporter && requests.create_underlay();
+        if underlay {
+            requests.place_underlay_below_child();
+        }
         Self {
             requests,
             parent: parent.clone(),
@@ -299,7 +521,83 @@ impl<R: ChildRequests> Child<R> {
             attached: false,
             placement: None,
             seq: 0,
+            underlay,
+            underlay_color: None,
+            underlay_shown: None,
+            underlay_lost: false,
+            underlay_sent: false,
+            underlay_retired: false,
         }
+    }
+
+    /// True once after the underlay was sent a change that waits for a parent commit.
+    pub(crate) fn take_underlay_sent(&mut self) -> bool {
+        std::mem::take(&mut self.underlay_sent)
+    }
+
+    /// The underlay exists (it may not be shown yet).
+    pub(crate) fn has_underlay(&self) -> bool {
+        self.underlay
+    }
+
+    /// True once after a buffer for the underlay could not be made and it was taken down.
+    pub(crate) fn take_underlay_lost(&mut self) -> bool {
+        std::mem::take(&mut self.underlay_lost)
+    }
+
+    /// Names the underlay's colour, the editor's background. Returns true when that sent the underlay a change,
+    /// which, the underlay being in sync mode, the compositor applies at the parent's next commit: the caller makes
+    /// sure GTK paints the parent.
+    pub(crate) fn set_underlay_color(&mut self, rgb: [u8; 3]) -> bool {
+        self.underlay_color = Some(rgb);
+        self.show_underlay()
+    }
+
+    /// Brings the underlay to the current placement and colour: shown under an attached child with a placement that
+    /// names its rectangle, taken away otherwise. Sends nothing when nothing changed.
+    fn show_underlay(&mut self) -> bool {
+        if !self.underlay || !self.is_ready() {
+            return false;
+        }
+        let want = match (
+            self.attached,
+            self.placement.and_then(|p| p.underlay),
+            self.underlay_color,
+        ) {
+            (true, Some(rect), Some(color)) => Some((rect, color)),
+            _ => None,
+        };
+        if want == self.underlay_shown {
+            return false;
+        }
+        match want {
+            Some((rect, color)) => {
+                if self.underlay_shown.map(|(shown, _)| shown) != Some(rect) {
+                    self.requests.underlay_rect(rect);
+                }
+                if self.underlay_shown.map(|(_, shown)| shown) != Some(color) && !self.requests.underlay_buffer(color) {
+                    self.requests.destroy_underlay();
+                    self.underlay = false;
+                    self.underlay_shown = None;
+                    self.underlay_lost = true;
+                    return false;
+                }
+                self.requests.underlay_commit();
+            }
+            None => {
+                self.requests.underlay_attach_null();
+                self.requests.underlay_commit();
+            }
+        }
+        // A new buffer over a shown one, or a null attach, leaves the previous buffer for `after_paint` to release.
+        self.underlay_retired |= match (self.underlay_shown, want) {
+            (Some((_, shown)), Some((_, color))) => shown != color,
+            (Some(_), None) => true,
+            (None, _) => false,
+        };
+        self.underlay_shown = want;
+        self.underlay_sent = true;
+        true
     }
 
     pub(crate) fn is_ready(&self) -> bool {
@@ -348,6 +646,7 @@ impl<R: ChildRequests> Child<R> {
         self.requests.commit();
         self.seq = seq;
         self.attached = true;
+        self.show_underlay();
         seq
     }
 
@@ -372,15 +671,25 @@ impl<R: ChildRequests> Child<R> {
             }
             self.transaction = false;
         }
+        if self.underlay_retired {
+            self.requests.release_retired_underlay_buffers();
+            self.underlay_retired = false;
+        }
     }
 
     pub(crate) fn move_to(&mut self, placement: &Placement) {
         if !self.is_ready() || !self.valid_placement(placement) || self.placement.as_ref() == Some(placement) {
             return;
         }
-        self.begin_transaction();
-        self.requests.set_position(placement.position.0, placement.position.1);
+        // A change to the underlay alone (the window's edge moved, the editor did not) leaves the editor's surface
+        // out of sync mode: its frames keep committing at once, and the underlay's change lands at the next parent
+        // commit.
+        if self.placement.map(Placement::without_underlay) != Some(placement.without_underlay()) {
+            self.begin_transaction();
+            self.requests.set_position(placement.position.0, placement.position.1);
+        }
         self.placement = Some(*placement);
+        self.show_underlay();
     }
 
     pub(crate) fn hide(&mut self) {
@@ -392,6 +701,7 @@ impl<R: ChildRequests> Child<R> {
         self.requests.commit();
         self.attached = false;
         self.placement = None;
+        self.show_underlay();
     }
 
     pub(crate) fn has_buffer(&self) -> bool {
@@ -402,6 +712,9 @@ impl<R: ChildRequests> Child<R> {
     }
 
     pub(crate) fn destroy(mut self) {
+        if self.underlay {
+            self.requests.destroy_underlay();
+        }
         if self.ready {
             self.requests.destroy_subsurface();
             self.requests.destroy_viewport();
@@ -412,6 +725,9 @@ impl<R: ChildRequests> Child<R> {
     fn valid_placement(&self, placement: &Placement) -> bool {
         let p = placement;
         if p.logical.0 < 1 || p.logical.1 < 1 || p.content.0 < 1 || p.content.1 < 1 {
+            return false;
+        }
+        if p.underlay.is_some_and(|(_, _, width, height)| width < 1 || height < 1) {
             return false;
         }
         if self.viewporter {
@@ -470,6 +786,14 @@ mod tests {
         DestroySubsurface,
         DestroyViewport,
         DestroySurface,
+        CreateUnderlay,
+        UnderlayBelowChild,
+        UnderlayBuffer([u8; 3]),
+        UnderlayRect(Rect),
+        UnderlayAttachNull,
+        UnderlayCommit,
+        ReleaseRetired,
+        DestroyUnderlay,
     }
     use Request::*;
 
@@ -479,6 +803,10 @@ mod tests {
         viewport: bool,
         presentation: bool,
         refuse: bool,
+        /// The compositor can make one-pixel buffers: `create_underlay` succeeds. Off, it records nothing.
+        underlay: bool,
+        /// Making an underlay buffer fails.
+        refuse_buffer: bool,
     }
     impl ChildRequests for Recording {
         fn create_surface(&mut self) -> bool {
@@ -560,6 +888,34 @@ mod tests {
         fn buffer_is_alive(&self, _: &WlBuffer) -> bool {
             true
         }
+        fn create_underlay(&mut self) -> bool {
+            if self.underlay {
+                self.sent.borrow_mut().push(CreateUnderlay);
+            }
+            self.underlay
+        }
+        fn place_underlay_below_child(&mut self) {
+            self.sent.borrow_mut().push(UnderlayBelowChild);
+        }
+        fn underlay_buffer(&mut self, rgb: [u8; 3]) -> bool {
+            self.sent.borrow_mut().push(UnderlayBuffer(rgb));
+            !self.refuse_buffer
+        }
+        fn underlay_rect(&mut self, rect: Rect) {
+            self.sent.borrow_mut().push(UnderlayRect(rect));
+        }
+        fn underlay_attach_null(&mut self) {
+            self.sent.borrow_mut().push(UnderlayAttachNull);
+        }
+        fn underlay_commit(&mut self) {
+            self.sent.borrow_mut().push(UnderlayCommit);
+        }
+        fn release_retired_underlay_buffers(&mut self) {
+            self.sent.borrow_mut().push(ReleaseRetired);
+        }
+        fn destroy_underlay(&mut self) {
+            self.sent.borrow_mut().push(DestroyUnderlay);
+        }
     }
 
     struct State;
@@ -568,6 +924,20 @@ mod tests {
     delegate_noop!(State: ignore WlSubsurface);
     delegate_noop!(State: ignore WlRegion);
     delegate_noop!(State: ignore WpViewport);
+    delegate_noop!(State: ignore WlShmPool);
+    delegate_noop!(State: ignore WlShm);
+    delegate_noop!(State: ignore WpSinglePixelBufferManagerV1);
+    impl Dispatch<WlBuffer, Underlay> for State {
+        fn event(
+            _: &mut Self,
+            _: &WlBuffer,
+            _: <WlBuffer as Proxy>::Event,
+            _: &Underlay,
+            _: &Connection,
+            _: &QueueHandle<Self>,
+        ) {
+        }
+    }
     delegate_noop!(State: ignore wayland_client::protocol::wl_compositor::WlCompositor);
     delegate_noop!(State: ignore wayland_client::protocol::wl_subcompositor::WlSubcompositor);
     delegate_noop!(State: ignore wayland_protocols::wp::linux_dmabuf::zv1::client::zwp_linux_dmabuf_v1::ZwpLinuxDmabufV1);
@@ -635,6 +1005,8 @@ mod tests {
                 dmabuf: registry.bind(3, 4, &qh, ()),
                 viewporter: viewport.then(|| registry.bind(4, 1, &qh, ())),
                 presentation: None,
+                single_pixel: viewport.then(|| registry.bind(5, 1, &qh, ())),
+                shm: None,
                 feedback: super::super::types::DmabufFeedback {
                     main_device: 0,
                     formats: vec![],
@@ -676,6 +1048,26 @@ mod tests {
             &chosen(opaque),
             viewport,
         )
+    }
+    /// A child on a compositor that can make one-pixel buffers, with the editor's background named.
+    fn setup_with_underlay(objects: &Objects, viewport: bool) -> Child<Recording> {
+        let mut child = Child::new(
+            Recording {
+                underlay: true,
+                ..Recording::default()
+            },
+            &objects.parent,
+            &chosen(true),
+            viewport,
+        );
+        child.set_underlay_color(BACKGROUND);
+        child
+    }
+    const BACKGROUND: [u8; 3] = [30, 32, 48];
+    fn underlay_placement(position: (i32, i32)) -> Placement {
+        let mut p = placement(true);
+        p.position = position;
+        p.with_underlay((0.0, 0.0), (1600, 1000))
     }
     fn take(child: &Child<Recording>) -> Vec<Request> {
         std::mem::take(&mut *child.requests.sent.borrow_mut())
@@ -1127,5 +1519,301 @@ mod tests {
         assert!(!child.is_ready());
         assert!(child.requests.surface.is_none());
         assert!(child.requests.subsurface.is_none());
+    }
+
+    #[test]
+    fn the_underlay_is_made_below_the_child_and_left_in_sync_mode() {
+        let o = Objects::new();
+        let child = setup_with_underlay(&o, true);
+        assert!(child.has_underlay());
+        assert_eq!(
+            take(&child),
+            vec![
+                CreateSurface,
+                GetSubsurface,
+                PlaceBelow,
+                EmptyInput,
+                Opaque(0, 0, i32::MAX, i32::MAX),
+                GetViewport,
+                Desync,
+                CreateUnderlay,
+                UnderlayBelowChild
+            ]
+        );
+    }
+
+    #[test]
+    fn without_a_viewport_there_is_no_underlay() {
+        let o = Objects::new();
+        let mut child = setup_with_underlay(&o, false);
+        assert!(!child.has_underlay());
+        take(&child);
+        present(
+            &mut child,
+            &o.buffer,
+            &placement(false).with_underlay((0.0, 0.0), (1600, 1000)),
+            (1602, 1202),
+        );
+        assert!(!take(&child).iter().any(|r| matches!(
+            r,
+            CreateUnderlay | UnderlayBuffer(_) | UnderlayRect(_) | UnderlayCommit | UnderlayAttachNull
+        )));
+    }
+
+    #[test]
+    fn the_opening_shows_the_underlay_before_the_parent_commits() {
+        let o = Objects::new();
+        let mut child = setup_with_underlay(&o, true);
+        take(&child);
+        let p = underlay_placement((7, 9));
+        let r = super::super::geometry::UNDERLAY_REACH;
+        present(&mut child, &o.buffer, &p, (1280, 1024));
+        child.requests.sent.borrow_mut().push(ParentCommit);
+        child.after_paint();
+        assert_eq!(
+            take(&child),
+            vec![
+                Sync,
+                Position(7, 9),
+                Source(0, 0, 1202, 902),
+                Destination(801, 601),
+                Attach,
+                Damage(0, 0, 1280, 1024),
+                Frame(PaneId(3), 1),
+                Commit,
+                UnderlayRect((0, 0, 7 + 801 + r, 9 + 601 + r)),
+                UnderlayBuffer(BACKGROUND),
+                UnderlayCommit,
+                ParentCommit,
+                Desync
+            ]
+        );
+    }
+
+    #[test]
+    fn a_move_takes_the_underlay_along_in_the_same_transaction() {
+        let o = Objects::new();
+        let mut child = setup_with_underlay(&o, true);
+        present(&mut child, &o.buffer, &underlay_placement((7, 9)), (1280, 1024));
+        child.after_paint();
+        take(&child);
+        let moved = underlay_placement((100, 120));
+        let r = super::super::geometry::UNDERLAY_REACH;
+        child.move_to(&moved);
+        child.requests.sent.borrow_mut().push(ParentCommit);
+        child.after_paint();
+        assert_eq!(
+            take(&child),
+            vec![
+                Sync,
+                Position(100, 120),
+                UnderlayRect((100 - r, 120 - r, 801 + 2 * r, 601 + 2 * r)),
+                UnderlayCommit,
+                ParentCommit,
+                Desync
+            ]
+        );
+        // An unchanged frame sends the underlay nothing.
+        present(&mut child, &o.buffer, &moved, (1280, 1024));
+        assert!(!take(&child)
+            .iter()
+            .any(|r| matches!(r, UnderlayRect(_) | UnderlayBuffer(_) | UnderlayCommit)));
+    }
+
+    #[test]
+    fn move_to_with_only_the_underlay_changed_sends_only_the_underlay_and_opens_no_transaction() {
+        let o = Objects::new();
+        let mut child = setup_with_underlay(&o, true);
+        let p = underlay_placement((7, 9));
+        present(&mut child, &o.buffer, &p, (1280, 1024));
+        child.after_paint();
+        take(&child);
+        assert!(child.take_underlay_sent());
+        // The window shrinks to the editor's right edge plus 10 px: the editor stays, the underlay is cut there.
+        let narrower = p.without_underlay().with_underlay((0.0, 0.0), (7 + 801 + 10, 1000));
+        assert_eq!(narrower.without_underlay(), p.without_underlay());
+        child.move_to(&narrower);
+        assert!(
+            !child.in_transaction(),
+            "the editor's own surface stays out of sync mode"
+        );
+        let r = super::super::geometry::UNDERLAY_REACH;
+        assert_eq!(
+            take(&child),
+            vec![UnderlayRect((0, 0, 7 + 801 + 10, 9 + 601 + r)), UnderlayCommit]
+        );
+        assert!(child.take_underlay_sent(), "the pane asks GDK for a parent commit");
+        assert!(!child.take_underlay_sent());
+        child.move_to(&narrower);
+        assert_eq!(take(&child), vec![]);
+        assert!(!child.take_underlay_sent());
+    }
+
+    #[test]
+    fn a_new_background_is_a_new_buffer_and_the_same_one_sends_nothing() {
+        let o = Objects::new();
+        let mut child = setup_with_underlay(&o, true);
+        present(&mut child, &o.buffer, &underlay_placement((7, 9)), (1280, 1024));
+        child.after_paint();
+        take(&child);
+        assert!(!child.set_underlay_color(BACKGROUND));
+        assert_eq!(take(&child), vec![]);
+        assert!(child.set_underlay_color([250, 244, 237]));
+        assert_eq!(take(&child), vec![UnderlayBuffer([250, 244, 237]), UnderlayCommit]);
+        // The replaced buffer goes once the parent has painted (and so committed the cached underlay), and only once.
+        child.after_paint();
+        assert_eq!(take(&child), vec![ReleaseRetired]);
+        child.after_paint();
+        assert_eq!(take(&child), vec![]);
+    }
+
+    #[test]
+    fn a_colour_named_after_the_opening_shows_the_underlay_then() {
+        let o = Objects::new();
+        let mut child = Child::new(
+            Recording {
+                underlay: true,
+                ..Recording::default()
+            },
+            &o.parent,
+            &chosen(true),
+            true,
+        );
+        present(&mut child, &o.buffer, &underlay_placement((7, 9)), (1280, 1024));
+        assert!(!take(&child)
+            .iter()
+            .any(|r| matches!(r, UnderlayBuffer(_) | UnderlayCommit)));
+        assert!(child.set_underlay_color(BACKGROUND));
+        let r = super::super::geometry::UNDERLAY_REACH;
+        assert_eq!(
+            take(&child),
+            vec![
+                UnderlayRect((0, 0, 7 + 801 + r, 9 + 601 + r)),
+                UnderlayBuffer(BACKGROUND),
+                UnderlayCommit
+            ]
+        );
+    }
+
+    #[test]
+    fn hiding_takes_the_underlay_away_and_the_reopening_brings_it_back() {
+        let o = Objects::new();
+        let mut child = setup_with_underlay(&o, true);
+        let p = underlay_placement((7, 9));
+        present(&mut child, &o.buffer, &p, (1280, 1024));
+        child.after_paint();
+        take(&child);
+        child.hide();
+        assert_eq!(
+            take(&child),
+            vec![Sync, AttachNull, Commit, UnderlayAttachNull, UnderlayCommit]
+        );
+        child.after_paint();
+        take(&child);
+        present(&mut child, &o.buffer, &p, (1280, 1024));
+        let sent = take(&child);
+        let r = super::super::geometry::UNDERLAY_REACH;
+        assert_eq!(
+            sent[sent.len() - 3..],
+            [
+                UnderlayRect((0, 0, 7 + 801 + r, 9 + 601 + r)),
+                UnderlayBuffer(BACKGROUND),
+                UnderlayCommit
+            ]
+        );
+    }
+
+    #[test]
+    fn a_buffer_that_cannot_be_made_takes_the_underlay_down_once() {
+        let o = Objects::new();
+        let mut child = Child::new(
+            Recording {
+                underlay: true,
+                refuse_buffer: true,
+                ..Recording::default()
+            },
+            &o.parent,
+            &chosen(true),
+            true,
+        );
+        child.set_underlay_color(BACKGROUND);
+        present(&mut child, &o.buffer, &underlay_placement((7, 9)), (1280, 1024));
+        let sent = take(&child);
+        assert_eq!(sent[sent.len() - 2..], [UnderlayBuffer(BACKGROUND), DestroyUnderlay]);
+        assert!(!child.has_underlay());
+        assert!(child.take_underlay_lost());
+        assert!(!child.take_underlay_lost());
+        assert!(child.is_ready(), "the editor itself goes on");
+        child.set_underlay_color([1, 2, 3]);
+        child.destroy();
+    }
+
+    #[test]
+    fn destroy_takes_the_underlay_down_before_the_child() {
+        let o = Objects::new();
+        let child = setup_with_underlay(&o, true);
+        let sent = child.requests.sent.clone();
+        take(&child);
+        child.destroy();
+        assert_eq!(
+            *sent.borrow(),
+            vec![DestroyUnderlay, DestroySubsurface, DestroyViewport, DestroySurface]
+        );
+    }
+
+    #[test]
+    fn wayland_requests_make_the_underlay_below_the_child_and_free_replaced_buffers() {
+        let o = Objects::new();
+        let globals = o.globals(true);
+        let qh = o.conn.new_event_queue::<State>().handle();
+        let mut requests = WaylandRequests::new(&globals, qh);
+        assert!(requests.create_surface());
+        assert!(requests.get_subsurface(&o.parent));
+        assert!(requests.create_underlay());
+        assert!(!requests.create_underlay(), "one underlay per child");
+        requests.place_underlay_below_child();
+        assert!(requests.underlay_buffer([1, 2, 3]));
+        let first = requests.underlay.as_ref().unwrap().buffer.clone().unwrap();
+        assert!(requests.underlay_buffer([4, 5, 6]));
+        assert!(
+            first.is_alive(),
+            "a replaced buffer lives until the commit that stops using it"
+        );
+        requests.underlay_rect((1, 2, 3, 4));
+        requests.underlay_commit();
+        assert!(first.is_alive(), "the commit is cached until the parent commits");
+        requests.release_retired_underlay_buffers();
+        assert!(!first.is_alive());
+        let second = requests.underlay.as_ref().unwrap().buffer.clone().unwrap();
+        requests.underlay_attach_null();
+        requests.underlay_commit();
+        requests.release_retired_underlay_buffers();
+        assert!(!second.is_alive());
+        o.take_wire();
+        requests.destroy_underlay();
+        assert!(!o.take_wire().is_empty());
+        requests.underlay_rect((1, 2, 3, 4));
+        assert!(!requests.underlay_buffer([1, 2, 3]));
+        requests.underlay_commit();
+        assert!(o.take_wire().is_empty());
+    }
+
+    #[test]
+    fn no_viewporter_or_no_pixel_source_makes_no_underlay() {
+        let o = Objects::new();
+        let qh = o.conn.new_event_queue::<State>().handle();
+        let mut requests = WaylandRequests::new(&o.globals(false), qh.clone());
+        assert!(requests.create_surface());
+        assert!(requests.get_subsurface(&o.parent));
+        o.take_wire();
+        assert!(!requests.create_underlay());
+        let mut globals = o.globals(true);
+        globals.single_pixel = None;
+        let mut requests = WaylandRequests::new(&globals, qh);
+        assert!(requests.create_surface());
+        assert!(requests.get_subsurface(&o.parent));
+        o.take_wire();
+        assert!(!requests.create_underlay());
+        assert!(o.take_wire().is_empty());
     }
 }

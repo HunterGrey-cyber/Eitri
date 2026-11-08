@@ -41,6 +41,8 @@ use wayland_client::{
         wl_compositor::WlCompositor,
         wl_region::WlRegion,
         wl_registry::{self, WlRegistry},
+        wl_shm::WlShm,
+        wl_shm_pool::WlShmPool,
         wl_subcompositor::WlSubcompositor,
         wl_subsurface::WlSubsurface,
         wl_surface::WlSurface,
@@ -57,9 +59,11 @@ use wayland_protocols::wp::{
         wp_presentation::WpPresentation,
         wp_presentation_feedback::{self, WpPresentationFeedback},
     },
+    single_pixel_buffer::v1::client::wp_single_pixel_buffer_manager_v1::WpSinglePixelBufferManagerV1,
     viewporter::client::{wp_viewport::WpViewport, wp_viewporter::WpViewporter},
 };
 
+use super::child::Underlay;
 use super::foreign::connection_for;
 use super::types::{BufferKey, DmabufFeedback, FrameData, Globals, PaneId, PresentEvent, PresentSink};
 use crate::fd_watch;
@@ -207,6 +211,8 @@ struct Chosen {
     dmabuf: (u32, u32),
     viewporter: Option<(u32, u32)>,
     presentation: Option<(u32, u32)>,
+    single_pixel: Option<(u32, u32)>,
+    shm: Option<(u32, u32)>,
 }
 
 /// Picks the globals from what the registry advertised, or says why the subsurface path cannot run.
@@ -241,6 +247,8 @@ fn choose_globals(advertised: &[Advertised]) -> Result<Chosen, String> {
         dmabuf: (dmabuf, DMABUF_VERSION),
         viewporter: find("wp_viewporter").map(|(name, _)| (name, 1)),
         presentation: find("wp_presentation").map(|(name, _)| (name, 1)),
+        single_pixel: find("wp_single_pixel_buffer_manager_v1").map(|(name, _)| (name, 1)),
+        shm: find("wl_shm").map(|(name, _)| (name, 1)),
     })
 }
 
@@ -523,6 +531,12 @@ impl Dispatch<WlBuffer, CreatedBuffer> for ThreadState {
     }
 }
 
+// The underlay's buffer is never replaced while the compositor holds it for anything but the colour, so its release
+// says nothing the pane waits for.
+impl Dispatch<WlBuffer, Underlay> for ThreadState {
+    fn event(_: &mut Self, _: &WlBuffer, _: wl_buffer::Event, _: &Underlay, _: &Connection, _: &QueueHandle<Self>) {}
+}
+
 impl Dispatch<WlBuffer, BufferKey> for ThreadState {
     fn event(
         state: &mut Self,
@@ -574,6 +588,9 @@ delegate_noop!(ThreadState: ignore WlSubcompositor);
 delegate_noop!(ThreadState: ignore ZwpLinuxDmabufV1);
 delegate_noop!(ThreadState: ignore WpViewporter);
 delegate_noop!(ThreadState: ignore WpPresentation);
+delegate_noop!(ThreadState: ignore WpSinglePixelBufferManagerV1);
+delegate_noop!(ThreadState: ignore WlShm);
+delegate_noop!(ThreadState: ignore WlShmPool);
 delegate_noop!(ThreadState: ignore WlSurface);
 delegate_noop!(ThreadState: ignore WlSubsurface);
 delegate_noop!(ThreadState: ignore WpViewport);
@@ -639,6 +656,12 @@ impl Loop {
         let presentation = chosen
             .presentation
             .map(|(name, version)| registry.bind::<WpPresentation, _, _>(name, version, &qh, ()));
+        let single_pixel = chosen
+            .single_pixel
+            .map(|(name, version)| registry.bind::<WpSinglePixelBufferManagerV1, _, _>(name, version, &qh, ()));
+        let shm = chosen
+            .shm
+            .map(|(name, version)| registry.bind::<WlShm, _, _>(name, version, &qh, ()));
         self.feedback = Some(dmabuf.get_default_feedback(&qh, ()));
         self.roundtrip()?;
         let event = match self.state.latest_feedback.clone() {
@@ -654,6 +677,8 @@ impl Loop {
                     dmabuf,
                     viewporter,
                     presentation,
+                    single_pixel,
+                    shm,
                     feedback,
                 }))
             }
@@ -1237,6 +1262,8 @@ mod tests {
             ("zwp_linux_dmabuf_v1", 5),
             ("wp_viewporter", 1),
             ("wp_presentation", 2),
+            ("wp_single_pixel_buffer_manager_v1", 1),
+            ("wl_shm", 2),
         ]))
         .unwrap();
         assert_eq!(
@@ -1247,6 +1274,8 @@ mod tests {
                 dmabuf: (3, 4),
                 viewporter: Some((4, 1)),
                 presentation: Some((5, 1)),
+                single_pixel: Some((6, 1)),
+                shm: Some((7, 1)),
             }
         );
     }
@@ -1259,7 +1288,10 @@ mod tests {
             ("zwp_linux_dmabuf_v1", 4),
         ]))
         .unwrap();
-        assert_eq!((chosen.viewporter, chosen.presentation), (None, None));
+        assert_eq!(
+            (chosen.viewporter, chosen.presentation, chosen.single_pixel, chosen.shm),
+            (None, None, None, None)
+        );
     }
 
     #[test]

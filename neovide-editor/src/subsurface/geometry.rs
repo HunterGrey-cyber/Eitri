@@ -3,6 +3,9 @@
 //! GTK maps native coordinates to surface coordinates by adding the native's surface transform.
 //! A window shadow makes that transform positive, placing the content inside the shadow's extent.
 
+/// A rectangle in the parent surface's logical coordinates: x, y, width, height.
+pub(crate) type Rect = (i32, i32, i32, i32);
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct Placement {
     pub position: (i32, i32),
@@ -10,7 +13,20 @@ pub(crate) struct Placement {
     pub content: (i32, i32),
     pub buffer_scale: i32,
     pub viewport: Option<(i32, i32)>,
+    /// Where the underlay goes: the editor's rectangle grown by [`UNDERLAY_REACH`] on each side and cut to the
+    /// window. `None` until [`Placement::with_underlay`] names the window, and when nothing of it is left.
+    pub underlay: Option<Rect>,
 }
+
+/// How far the underlay reaches past the editor on each side, in logical pixels.
+///
+/// A compositor may round or clip every surface of a window at the surface's own corners (Hyprland 0.56 rounds each
+/// one by the window's `decoration:rounding`), the editor's included, and what shows in a cut-off corner is whatever
+/// lies under the editor: the parent leaves a transparent hole there, so without the underlay it is the desktop. The
+/// underlay is opaque and in the editor's background colour; reaching further than any such radius, its own cut
+/// corners lie under the parent's opaque pixels around the hole. At the window's edge it stops at the edge, where
+/// the window's own corner is rounded the same way anyway.
+pub(crate) const UNDERLAY_REACH: i32 = 32;
 
 pub(crate) const BUCKET: i32 = 128;
 
@@ -70,7 +86,38 @@ pub(crate) fn placement(
         content,
         buffer_scale,
         viewport,
+        underlay: None,
     })
+}
+
+impl Placement {
+    /// The editor's own part of the placement, the underlay left out: what its surface and viewport are sent.
+    pub(crate) fn without_underlay(self) -> Placement {
+        Placement { underlay: None, ..self }
+    }
+
+    /// The same placement with its underlay: the editor's rectangle grown by [`UNDERLAY_REACH`] and cut to the
+    /// window, whose origin in the surface is the native's surface transform and whose size is the native's.
+    pub(crate) fn with_underlay(mut self, window_origin: (f64, f64), window_size: (i32, i32)) -> Placement {
+        let wx = window_origin.0.round() as i32;
+        let wy = window_origin.1.round() as i32;
+        let x0 = self.position.0.saturating_sub(UNDERLAY_REACH).max(wx);
+        let y0 = self.position.1.saturating_sub(UNDERLAY_REACH).max(wy);
+        let x1 = (self
+            .position
+            .0
+            .saturating_add(self.logical.0)
+            .saturating_add(UNDERLAY_REACH))
+        .min(wx.saturating_add(window_size.0));
+        let y1 = (self
+            .position
+            .1
+            .saturating_add(self.logical.1)
+            .saturating_add(UNDERLAY_REACH))
+        .min(wy.saturating_add(window_size.1));
+        self.underlay = (x1 > x0 && y1 > y0).then(|| (x0, y0, x1 - x0, y1 - y0));
+        self
+    }
 }
 
 pub(crate) fn os_scale(placement: &Placement, scale: f64) -> f64 {
@@ -84,6 +131,32 @@ pub(crate) fn os_scale(placement: &Placement, scale: f64) -> f64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_underlay_reaches_past_the_editor_and_stops_at_the_window() {
+        let inside = placement((100.0, 80.0), (0.0, 0.0), (800, 600), 1.25, 2, true).unwrap();
+        assert_eq!(inside.underlay, None);
+        let r = UNDERLAY_REACH;
+        assert_eq!(
+            inside.with_underlay((0.0, 0.0), (1200, 900)).underlay,
+            Some((100 - r, 80 - r, 800 + 2 * r, 600 + 2 * r))
+        );
+        // An editor on the window's left and bottom edges: the underlay stops there, in the window's corner.
+        let edge = placement((0.0, 40.0), (0.0, 0.0), (800, 860), 1.25, 2, true).unwrap();
+        assert_eq!(
+            edge.with_underlay((0.0, 0.0), (1200, 900)).underlay,
+            Some((0, 40 - r, 800 + r, 860 + r))
+        );
+        // A window shadow moves the window inside the surface; the underlay stays out of the shadow.
+        let shadowed = placement((0.0, 0.0), (24.0, 18.0), (400, 300), 1.0, 1, true).unwrap();
+        assert_eq!(shadowed.position, (24, 18));
+        assert_eq!(
+            shadowed.with_underlay((24.0, 18.0), (400, 300)).underlay,
+            Some((24, 18, 400, 300))
+        );
+        // Nothing of it in the window: none.
+        assert_eq!(shadowed.with_underlay((2000.0, 0.0), (400, 300)).underlay, None);
+    }
 
     #[test]
     fn the_transform_is_added() {

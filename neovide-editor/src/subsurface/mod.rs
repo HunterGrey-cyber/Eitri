@@ -94,6 +94,16 @@ struct Geometry {
     scale: f64,
 }
 
+impl Geometry {
+    /// The editor's own part: what its surface is sent and what a frame is rendered for.
+    fn without_underlay(self) -> Geometry {
+        Geometry {
+            placement: self.placement.without_underlay(),
+            ..self
+        }
+    }
+}
+
 // Keeping the transition's effects behind this boundary lets it run without a display.
 trait PaneIo {
     fn log(&self) -> Option<Rc<PaneLog>> {
@@ -382,7 +392,9 @@ impl SubsurfacePane {
             self.io.queue_render();
             return;
         }
-        if self.io.geometry() != self.last.get() {
+        let geometry = self.io.geometry();
+        self.move_underlay_alone(geometry);
+        if geometry != self.last.get() {
             self.geometry_changed();
             return;
         }
@@ -390,10 +402,28 @@ impl SubsurfacePane {
         self.act(action);
     }
 
+    /// When `geometry` differs from the last one drawn only in the underlay's rectangle (the window's edge moved, the
+    /// editor did not), moves the underlay alone and records the geometry as drawn: no transaction, no render. Returns
+    /// whether it did.
+    fn move_underlay_alone(&self, geometry: Option<Geometry>) -> bool {
+        let (Some(now), Some(last)) = (geometry, self.last.get()) else {
+            return false;
+        };
+        if now == last || now.without_underlay() != last.without_underlay() {
+            return false;
+        }
+        self.io.move_to(now);
+        self.last.set(Some(now));
+        true
+    }
+
     fn act(&self, action: Action) {
         match action {
             Action::Render => match self.io.geometry() {
-                Some(geometry) if Some(geometry) == self.last.get() && !self.transaction.get() => {
+                Some(geometry)
+                    if !self.transaction.get()
+                        && (self.move_underlay_alone(Some(geometry)) || Some(geometry) == self.last.get()) =>
+                {
                     self.draw(geometry, false);
                 }
                 // An unplaceable allocation also goes through the layout handler, which closes the hole.
@@ -429,6 +459,9 @@ impl SubsurfacePane {
             self.close_unplaceable();
             return;
         };
+        if !self.transaction.get() && self.move_underlay_alone(Some(geometry)) {
+            return;
+        }
         if self.transaction.replace(false) || self.last.get() != Some(geometry) {
             self.draw(geometry, true);
         }
@@ -710,6 +743,25 @@ struct WaylandPane {
 }
 
 impl WaylandPane {
+    /// After the underlay was sent a change: it stays in sync mode, so the change waits for a parent commit, and a
+    /// parent frame in which nothing GTK draws changed is committed only when GDK is told something is pending
+    /// (a colour change, or a window edge that moved while the editor did not, comes with no GTK change of its own).
+    /// A lost underlay is said once.
+    fn underlay_changed(&self, area: &EditorGlArea, child: &mut Child<WaylandRequests<ThreadState>>) {
+        if child.take_underlay_sent() {
+            if let Some(surface) = area.native().and_then(|native| native.surface()) {
+                foreign::force_next_commit(&surface);
+            }
+            area.queue_draw();
+        }
+        if child.take_underlay_lost() {
+            eprintln!(
+                "[editor] subsurface: no buffer could be made for the editor's underlay; a compositor that rounds \
+                 the editor's corners shows the desktop there"
+            );
+        }
+    }
+
     fn current(&self) -> Result<EditorGlArea, String> {
         let area = self.area.upgrade().ok_or("the editor area is gone")?;
         area.make_current();
@@ -806,6 +858,12 @@ impl PaneIo for WaylandPane {
             pool.release(true);
             return Err("the child surface could not be created".into());
         }
+        if viewporter && !child.has_underlay() {
+            eprintln!(
+                "[editor] subsurface: no underlay under the editor (no single-pixel buffers or wl_shm); a compositor \
+                 that rounds the editor's corners shows the desktop there"
+            );
+        }
         child.continue_after(self.last_seq.get());
         *self.resources.borrow_mut() = Some(Resources {
             child,
@@ -833,7 +891,8 @@ impl PaneIo for WaylandPane {
                 scale,
                 area.scale_factor(),
                 viewporter,
-            )?,
+            )?
+            .with_underlay(native.surface_transform(), (widget.width(), widget.height())),
             scale,
         })
     }
@@ -880,10 +939,14 @@ impl PaneIo for WaylandPane {
             .cloned()
             .ok_or("the presentation buffer is gone")?;
         resources.pool.submit(slot);
+        if let Some(rgb) = area.cover_rgb() {
+            resources.child.set_underlay_color(rgb);
+        }
         let seq = resources.child.present(&buffer, size, &geometry.placement, self.id);
         if seq == 0 {
             return Err("the child refused the presentation buffer or geometry".into());
         }
+        self.underlay_changed(&area, &mut resources.child);
         debug_assert!(resources.child.has_buffer());
         self.last_seq.set(seq);
         drop(globals);
@@ -892,8 +955,13 @@ impl PaneIo for WaylandPane {
     }
 
     fn move_to(&self, geometry: Geometry) {
+        let Some(area) = self.area.upgrade() else { return };
         if let Some(resources) = self.resources.borrow_mut().as_mut() {
+            if let Some(rgb) = area.cover_rgb() {
+                resources.child.set_underlay_color(rgb);
+            }
             resources.child.move_to(&geometry.placement);
+            self.underlay_changed(&area, &mut resources.child);
         }
     }
 
@@ -921,15 +989,16 @@ impl PaneIo for WaylandPane {
     fn hide(&self) {
         if let Some(resources) = self.resources.borrow_mut().as_mut() {
             resources.child.hide();
+            // The underlay's null attach rides on the hide's own parent commit.
+            resources.child.take_underlay_sent();
         }
         self.flush();
     }
 
     fn after_paint(&self) {
         if let Some(resources) = self.resources.borrow_mut().as_mut() {
-            if resources.child.in_transaction() {
-                resources.child.after_paint();
-            }
+            // Ends a transaction if one is open, and lets go of underlay buffers the parent's commit replaced.
+            resources.child.after_paint();
         }
         self.flush();
     }
@@ -1310,6 +1379,51 @@ mod tests {
             assert_eq!(pane.hole(), Hole::Open);
             pane.after_paint();
             assert_eq!(io.take(), ["set_desync"]);
+        });
+    }
+
+    #[test]
+    fn a_window_edge_that_moves_alone_moves_the_underlay_without_a_transaction_or_a_render() {
+        with_pane(|pane, io| {
+            let mut geometry = io.geometry.get();
+            geometry.placement = geometry.placement.with_underlay((0.0, 0.0), (1600, 1000));
+            io.geometry.set(geometry);
+            open(&pane, &io);
+            // The window's right edge comes to within 10 px of the editor: only the underlay's rectangle changes.
+            let mut narrower = geometry;
+            narrower.placement = geometry
+                .placement
+                .without_underlay()
+                .with_underlay((0.0, 0.0), (10 + 801 + 10, 1000));
+            assert_ne!(narrower, geometry);
+            io.geometry.set(narrower);
+            pane.layout();
+            assert_eq!(io.take(), ["move"]);
+            pane.after_paint();
+            assert_eq!(io.take(), Vec::<&str>::new(), "no transaction to end");
+            // The same through a frame request: the underlay moves, nothing opens a transaction.
+            let mut narrower_still = narrower;
+            narrower_still.placement = geometry
+                .placement
+                .without_underlay()
+                .with_underlay((0.0, 0.0), (10 + 801 + 4, 1000));
+            io.geometry.set(narrower_still);
+            pane.request(FrameReason::Batch);
+            let calls = io.take();
+            assert_eq!(calls.first(), Some(&"move"), "{calls:?}");
+            assert!(
+                !calls.contains(&"set_sync") && !calls.contains(&"queue_draw"),
+                "{calls:?}"
+            );
+            // A later layout with nothing changed sends nothing.
+            pane.layout();
+            assert!(!io.take().contains(&"set_sync"));
+            // The editor itself moving is still a transaction.
+            let mut moved = narrower_still;
+            moved.placement.position.0 += 3;
+            io.geometry.set(moved);
+            pane.layout();
+            assert_eq!(io.take(), ["set_sync", "render", "attach", "commit", "hole_changed"]);
         });
     }
 

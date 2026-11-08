@@ -1,4 +1,5 @@
 use std::ffi::c_void;
+use std::sync::OnceLock;
 
 use gtk4::{gdk, glib, prelude::*};
 use wayland_backend::client::{Backend, ObjectId};
@@ -8,6 +9,39 @@ use wayland_client::{protocol::wl_surface::WlSurface, Connection, Proxy};
 extern "C" {
     fn gdk_wayland_display_get_wl_display(display: *mut gdk::ffi::GdkDisplay) -> *mut c_void;
     fn gdk_wayland_surface_get_wl_surface(surface: *mut gdk::ffi::GdkSurface) -> *mut c_void;
+}
+
+type ForceNextCommit = unsafe extern "C" fn(*mut gdk::ffi::GdkSurface);
+
+/// GDK's `gdk_wayland_surface_force_next_commit` (GTK 4.18), looked up at run time: the build floor's GTK (4.14) has
+/// no such symbol. `auto` takes the subsurface path only on GTK 4.24 or later, but an explicit `subsurface` takes it on
+/// any GTK, so the lookup can find nothing.
+fn force_next_commit_fn() -> Option<ForceNextCommit> {
+    static FOUND: OnceLock<Option<ForceNextCommit>> = OnceLock::new();
+    *FOUND.get_or_init(|| {
+        // SAFETY: a lookup in the symbols already loaded into the process, with a NUL-terminated name.
+        let symbol = unsafe { libc::dlsym(libc::RTLD_DEFAULT, c"gdk_wayland_surface_force_next_commit".as_ptr()) };
+        // SAFETY: GDK declares the symbol as `void (GdkSurface *)`, which is `ForceNextCommit`.
+        (!symbol.is_null()).then(|| unsafe { std::mem::transmute::<*mut c_void, ForceNextCommit>(symbol) })
+    })
+}
+
+/// Makes GDK commit the surface at its next frame even when nothing GTK draws changed, so the state a sync child
+/// surface cached is applied: a frame whose render nodes did not change is an empty frame, which GDK commits only
+/// when it knows something of the surface is pending. Returns false when the surface is not a live Wayland one or the
+/// function is missing; the caller still queues a draw.
+pub(crate) fn force_next_commit(surface: &gdk::Surface) -> bool {
+    let display = surface.display();
+    if surface.is_destroyed() || display.is_closed() || !is_wayland_display_name(display.type_().name()) {
+        return false;
+    }
+    let Some(force) = force_next_commit_fn() else {
+        return false;
+    };
+    // SAFETY: the live surface belongs to a Wayland display (checked above) and is borrowed for the call; the
+    // function only sets a flag on it.
+    unsafe { force(surface.as_ptr()) };
+    true
 }
 
 fn is_wayland_display_name(name: &str) -> bool {

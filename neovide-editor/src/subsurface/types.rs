@@ -4,10 +4,14 @@
 
 use std::time::Instant;
 
-use wayland_client::protocol::{wl_buffer::WlBuffer, wl_compositor::WlCompositor, wl_subcompositor::WlSubcompositor};
+use wayland_client::protocol::{
+    wl_buffer::WlBuffer, wl_compositor::WlCompositor, wl_shm::WlShm, wl_subcompositor::WlSubcompositor,
+};
 use wayland_protocols::wp::{
     linux_dmabuf::zv1::client::zwp_linux_dmabuf_v1::ZwpLinuxDmabufV1,
-    presentation_time::client::wp_presentation::WpPresentation, viewporter::client::wp_viewporter::WpViewporter,
+    presentation_time::client::wp_presentation::WpPresentation,
+    single_pixel_buffer::v1::client::wp_single_pixel_buffer_manager_v1::WpSinglePixelBufferManagerV1,
+    viewporter::client::wp_viewporter::WpViewporter,
 };
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -37,6 +41,9 @@ pub struct Globals {
     pub dmabuf: ZwpLinuxDmabufV1,
     pub viewporter: Option<WpViewporter>,
     pub presentation: Option<WpPresentation>,
+    /// The underlay's colour: a single-pixel buffer, else a 1x1 shm buffer (both stretched by the viewport).
+    pub single_pixel: Option<WpSinglePixelBufferManagerV1>,
+    pub shm: Option<WlShm>,
     pub feedback: DmabufFeedback,
 }
 
