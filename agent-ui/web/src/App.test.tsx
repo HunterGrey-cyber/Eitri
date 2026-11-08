@@ -1,6 +1,6 @@
 // @vitest-environment jsdom
 import { afterEach, beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
-import { act, cleanup, fireEvent, render } from "@testing-library/react";
+import { act, cleanup, fireEvent, render, waitFor } from "@testing-library/react";
 import App from "./App";
 import { accumulateMotionCount, HINT_PENDING_TIMEOUT_MS, jumpTarget, MAX_MOTION_COUNT } from "./app/motion";
 import { statusWarning } from "./app/status";
@@ -10642,7 +10642,7 @@ describe("A parked tab's unread count includes what arrived while it was away", 
     Object.defineProperty(list, "scrollTop", { value: dims.scrollTop, configurable: true, writable: true });
   }
 
-  it("counts the rows a parked tab gained while it was away", () => {
+  it("counts the rows a parked tab gained while it was away", async () => {
     const widen = stubBandWidth();
     const { container } = render(<App />);
     dispatch({ kind: "hello", ...HELLO });
@@ -10713,7 +10713,8 @@ describe("A parked tab's unread count includes what arrived while it was away", 
     act(() => widen(container));
     fireEvent.scroll(list);
 
-    expect(container.querySelector(".band-unread")?.textContent).toBe("↓3");
+    // The band draws `↓N` once the unseen rows have been there half a second (`UNREAD_SHOW_MS`).
+    await waitFor(() => expect(container.querySelector(".band-unread")?.textContent).toBe("↓3"));
     vi.unstubAllGlobals();
   });
 

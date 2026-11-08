@@ -1,6 +1,15 @@
 import { useLayoutEffect, useRef, useState } from "react";
-import { bandLayout, phoneTitle } from "../band";
-import type { BandFacts, Seg } from "../band";
+import type { CSSProperties } from "react";
+import { bandLayoutSteady, phoneTitle } from "../band";
+import type { BandFacts, LayoutHold, Seg } from "../band";
+import { initialSteady, steadyFacts } from "../steadyBand";
+
+/** A figure's kept width: its `cells` as `ch`, which on the band's monospace font is one cell. The `↓N` button adds
+ *  its own horizontal padding (4px each side, `index.css`). */
+function cellsStyle(seg: Seg): CSSProperties | undefined {
+  if (seg.cells === undefined) return undefined;
+  return { minWidth: seg.id === "unread" ? `calc(${seg.cells}ch + 8px)` : `${seg.cells}ch` };
+}
 
 type Props = {
   facts: BandFacts;
@@ -113,7 +122,28 @@ export function StatusBand({ facts, paneFocused, entryKey, onOpenDetail, onJump,
     return () => observer.disconnect();
   }, []);
 
-  const segs = bandLayout(facts, widthPx, charPx);
+  // The band draws steady facts, not the live ones: while a turn streams a figure changes at most once a second
+  // and keeps its width, `↓N` waits half a second before it shows, and a segment dropped for room comes back only
+  // with room to spare (`steadyBand.ts`, `bandLayoutSteady`). What each render settled is kept for the next in
+  // a layout effect, and one timer redraws the band when something held back is due, even if nothing else renders it.
+  const memoRef = useRef(initialSteady());
+  const holdRef = useRef<LayoutHold | null>(null);
+  const [, setTick] = useState(0);
+  const now = Date.now();
+  // Another tab's band: what this one dropped for room says nothing about that one.
+  if (facts.scope !== memoRef.current.scope) holdRef.current = null;
+  const steady = steadyFacts(memoRef.current, facts, now);
+  const laid = bandLayoutSteady(steady.facts, widthPx, charPx, { hold: holdRef.current, now, reserve: steady.reserve });
+  const due = steady.due === null ? laid.due : laid.due === null ? steady.due : Math.min(steady.due, laid.due);
+  useLayoutEffect(() => {
+    memoRef.current = steady.memo;
+    holdRef.current = laid.hold;
+    if (due === null) return;
+    const timer = setTimeout(() => setTick((n) => n + 1), Math.max(0, due - Date.now()));
+    return () => clearTimeout(timer);
+  });
+  facts = steady.facts;
+  const segs = laid.segs;
   const left = segs.filter((seg) => seg.side === "left");
   const right = segs.filter((seg) => seg.side === "right");
   const glyphMode = pillGlyphMode(facts.pill);
@@ -158,7 +188,7 @@ export function StatusBand({ facts, paneFocused, entryKey, onOpenDetail, onJump,
         {right.map((seg) => {
           if (seg.id === "unread") {
             return (
-              <button key="unread" type="button" className="band-seg band-unread" onClick={onJump} title="G">
+              <button key="unread" type="button" className="band-seg band-unread" onClick={onJump} title="G" style={cellsStyle(seg)}>
                 {seg.text}
               </button>
             );
@@ -182,13 +212,13 @@ export function StatusBand({ facts, paneFocused, entryKey, onOpenDetail, onJump,
           // (each token part, the exact cost, and what the figure is), as `⚠`'s carries its warning.
           if (seg.id === "usage") {
             return (
-              <span key="usage" className="band-seg band-usage" title={facts.usage?.title}>
+              <span key="usage" className="band-seg band-usage" title={facts.usage?.title} style={cellsStyle(seg)}>
                 {seg.text}
               </span>
             );
           }
           return (
-            <span key={seg.id} className={`band-seg band-${seg.id}`} data-testid={seg.id === "showcmd" ? "showcmd" : seg.id === "link" ? "band-link" : undefined}>
+            <span key={seg.id} className={`band-seg band-${seg.id}`} data-testid={seg.id === "showcmd" ? "showcmd" : seg.id === "link" ? "band-link" : undefined} style={cellsStyle(seg)}>
               {seg.text}
             </span>
           );

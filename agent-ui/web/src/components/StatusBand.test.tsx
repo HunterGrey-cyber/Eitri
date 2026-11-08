@@ -2,7 +2,8 @@
 import { afterEach, expect, it, vi } from "vitest";
 import { act, cleanup, fireEvent, render } from "@testing-library/react";
 import { StatusBand } from "./StatusBand";
-import type { BandFacts } from "../band";
+import { bandLayout, type BandFacts } from "../band";
+import { UNREAD_SHOW_MS } from "../steadyBand";
 
 afterEach(cleanup);
 
@@ -81,9 +82,20 @@ it("draws the mode glyph in its own span, named for the permission mode", () => 
   expect(bypass.container.querySelector<HTMLElement>(".mode-glyph")!.dataset.modeName).toBe("bypass");
 });
 
+/** `renderWide`, then the half second `↓N` waits before it is drawn (`UNREAD_SHOW_MS`). */
+function renderWideUnread(facts: BandFacts, onOpenDetail = vi.fn(), onJump = vi.fn()) {
+  vi.useFakeTimers();
+  const rendered = renderWide(facts, onOpenDetail, onJump);
+  act(() => {
+    vi.advanceTimersByTime(UNREAD_SHOW_MS);
+  });
+  vi.useRealTimers();
+  return rendered;
+}
+
 it("the ↓N segment is a button that jumps and carries title G", () => {
   const onJump = vi.fn();
-  const { container } = renderWide(RUNNING, vi.fn(), onJump);
+  const { container } = renderWideUnread(RUNNING, vi.fn(), onJump);
   const unread = container.querySelector<HTMLButtonElement>(".band-unread")!;
   expect(unread.tagName).toBe("BUTTON");
   expect(unread.title).toBe("G");
@@ -95,7 +107,7 @@ it("the ↓N segment is a button that jumps and carries title G", () => {
 it("a click elsewhere on the band opens the detail popover, not a click on ↓N", () => {
   const onOpenDetail = vi.fn();
   const onJump = vi.fn();
-  const { container } = renderWide(RUNNING, onOpenDetail, onJump);
+  const { container } = renderWideUnread(RUNNING, onOpenDetail, onJump);
   fireEvent.click(container.querySelector(".band-unread")!);
   expect(onOpenDetail).not.toHaveBeenCalled();
   fireEvent.click(container.querySelector(".band-open")!);
@@ -315,4 +327,85 @@ it("shows the host's partial sandbox in the phone mark title", () => {
   expect(container.querySelector(".band-phone")?.getAttribute("title")).not.toContain("partial");
   rerender(<StatusBand facts={{ ...RUNNING, phones: 0, remoteSandbox: "partial" }} paneFocused />);
   expect(container.querySelector(".band-phone")).toBeNull();
+});
+
+/** The band as a turn streams: `facts` re-rendered every 100 ms, as the panel renders on every item. */
+function streamBand(make: (i: number) => BandFacts, n: number) {
+  vi.useFakeTimers();
+  vi.setSystemTime(100_000);
+  const observers = stubResizeObserver();
+  const rendered = render(<StatusBand facts={make(0)} paneFocused={true} onOpenDetail={vi.fn()} onJump={vi.fn()} />);
+  act(() => {
+    resize(observers[0], rendered.container.querySelector(".band-measure")!, 7.2);
+    resize(observers[0], rendered.container.querySelector(".status-band")!, 900);
+  });
+  const drawn: (string | null)[][] = [];
+  const read = () => [".band-position", ".band-unread", ".band-usage"].map((sel) => rendered.container.querySelector(sel)?.textContent ?? null);
+  for (let i = 1; i < n; i++) {
+    act(() => {
+      vi.advanceTimersByTime(100);
+    });
+    rendered.rerender(<StatusBand facts={make(i)} paneFocused={true} onOpenDetail={vi.fn()} onJump={vi.fn()} />);
+    drawn.push(read());
+  }
+  return { ...rendered, drawn, read };
+}
+const redraws = (drawn: (string | null)[][], k: number) => drawn.filter((d, i) => i > 0 && d[k] !== drawn[i - 1][k]).length;
+
+it("while a turn streams the position is redrawn at most about once a second, then lands on the newest", () => {
+  const band = streamBand((i) => ({ ...RUNNING, unread: null, streaming: true, position: `${i + 1}/${i + 1}` }), 40);
+  expect(redraws(band.drawn, 0)).toBeLessThanOrEqual(4);
+  act(() => {
+    vi.advanceTimersByTime(1000);
+  });
+  expect(band.read()[0]).toBe("40/40");
+  vi.useRealTimers();
+});
+
+it("↓N is not drawn for a passing moment of unseen rows, and stays once it has been up", () => {
+  const band = streamBand((i) => ({ ...RUNNING, streaming: true, unread: i < 3 ? null : i < 5 ? "↓1" : i < 7 ? null : `↓${i - 6}` }), 30);
+  // i = 3..4: unseen for 200 ms, then gone -- never drawn.
+  expect(band.drawn.slice(0, 7).every((d) => d[1] === null)).toBe(true);
+  // From i = 7 on it is there for good: drawn after half a second, and never taken away again.
+  const first = band.drawn.findIndex((d) => d[1] !== null);
+  expect(first).toBeGreaterThanOrEqual(10);
+  expect(band.drawn.slice(first).every((d) => d[1] !== null)).toBe(true);
+  expect(redraws(band.drawn.slice(first), 1)).toBeLessThanOrEqual(2);
+  vi.useRealTimers();
+});
+
+it("a figure keeps its reserved width, so a count gaining a digit moves nothing beside it", () => {
+  const band = streamBand((i) => ({ ...RUNNING, unread: null, streaming: true, position: `${i + 1}/120` }), 3);
+  const seg = band.container.querySelector<HTMLElement>(".band-position")!;
+  expect(seg.style.minWidth).toBe("7ch");
+  vi.useRealTimers();
+});
+
+it("a tab switch starts the band's layout afresh: nothing dropped on the last tab stays dropped on this one", () => {
+  vi.useFakeTimers();
+  vi.setSystemTime(100_000);
+  const observers = stubResizeObserver();
+  const narrowA: BandFacts = { ...RUNNING, unread: null, showcmd: null, warn: null, cards: 0, queued: 0, context: null, position: "100/100", scope: 1 };
+  const rendered = render(<StatusBand facts={narrowA} paneFocused={true} onOpenDetail={vi.fn()} onJump={vi.fn()} />);
+  // Wide enough for every segment of tab B, too narrow for A's model beside its wide position.
+  const cells = (() => {
+    for (let n = 20; n < 80; n++) {
+      const room = n * 7.2;
+      const a = bandLayout(narrowA, room, 7.2).map((x) => x.id);
+      const b = bandLayout({ ...narrowA, position: "1/1" }, room + 3 * 7.2, 7.2).map((x) => x.id);
+      if (!a.includes("model") && b.includes("model") && bandLayout({ ...narrowA, position: "1/1" }, room, 7.2).some((x) => x.id === "model")) return n;
+    }
+    throw new Error("no such width");
+  })();
+  act(() => {
+    resize(observers[0], rendered.container.querySelector(".band-measure")!, 7.2);
+    resize(observers[0], rendered.container.querySelector(".status-band")!, cells * 7.2);
+  });
+  expect(rendered.container.querySelector(".band-model")).toBeNull();
+  act(() => {
+    vi.advanceTimersByTime(50);
+  });
+  rendered.rerender(<StatusBand facts={{ ...narrowA, position: "1/1", scope: 2 }} paneFocused={true} onOpenDetail={vi.fn()} onJump={vi.fn()} />);
+  expect(rendered.container.querySelector(".band-model")).not.toBeNull();
+  vi.useRealTimers();
 });

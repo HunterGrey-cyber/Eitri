@@ -6571,6 +6571,10 @@ export default function App() {
           // About the window, not the session: an ended session still has an editor beside it.
           link: editorLink,
           position: timeline.length === 0 ? null : `${cursor + 1}/${timeline.length}`,
+          // While this tab's turn runs the band redraws its figures at most once a second (`steadyBand.ts`).
+          streaming: state.activeTurnId !== null,
+          scope: activeTab?.id ?? null,
+          keyAge: Number.isFinite(currentKeyAtRef.current) ? performance.now() - currentKeyAtRef.current : undefined,
           model: shortModel(state.fallbackModel === null ? state.model : revealedText(state.fallbackModel)),
           effort: state.effort,
           // This tab's last reported usage, right of the model; nothing until one arrives.

@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { phoneTitle, backgroundSegment, bandLayout, cardSummary, liveTasks, taskWords, tasksLine, textWidth, usageSegment, type BandFacts } from "./band";
+import { phoneTitle, backgroundSegment, bandLayout, bandLayoutSteady, cardSummary, liveTasks, taskWords, tasksLine, textWidth, usageSegment, RETURN_COOLDOWN_MS, RETURN_MARGIN, type BandFacts, type LayoutHold } from "./band";
 import { applyEvent, initialState } from "./reducer";
 import { ESC_DOES_NOT_INTERRUPT_FLASH, SHORT_FLASH, TYPING_FLASH } from "./app/flashes";
 import type { BackgroundTask, BackgroundTaskRecord, TaskKind, TokenUsage } from "./types";
@@ -673,3 +673,66 @@ it("names the newest live workflow's progress, usage, pause and fallback", () =>
   expect(liveTasks(tasks)).toHaveLength(0);
 });
 
+
+describe("a segment dropped for room does not come straight back", () => {
+  const facts: BandFacts = { ...running, unread: null, usage: { text: "12.3k tok $0.10", title: "t" } };
+  // The narrowest band, in whole characters, that still holds the usage figure.
+  const fits = (() => {
+    for (let cells = 20; cells < 200; cells++) if (ids(cells * 7.2, facts).includes("usage")) return cells;
+    throw new Error("never fits");
+  })();
+  const at = (cells: number) => cells * 7.2;
+
+  it("a width that wobbles across the edge drops the figure once and keeps it dropped", () => {
+    let hold: LayoutHold | null = null;
+    const seen: boolean[] = [];
+    for (let i = 0; i < 20; i++) {
+      const r = bandLayoutSteady(facts, at(i % 2 === 0 ? fits - 1 : fits), 7.2, { hold, now: 10_000 + i * 100 });
+      hold = r.hold;
+      seen.push(r.segs.some((s) => s.id === "usage"));
+    }
+    expect(seen[0]).toBe(false);
+    expect(seen.some((s) => s)).toBe(false);
+  });
+
+  it("it comes back once there is room plus a margin, and not within a second of going", () => {
+    let r = bandLayoutSteady(facts, at(fits - 1), 7.2, { hold: null, now: 10_000 });
+    expect(r.segs.some((s) => s.id === "usage")).toBe(false);
+    r = bandLayoutSteady(facts, at(fits + RETURN_MARGIN), 7.2, { hold: r.hold, now: 10_500 });
+    expect(r.segs.some((s) => s.id === "usage")).toBe(false);
+    expect(r.due).toBe(10_000 + RETURN_COOLDOWN_MS);
+    r = bandLayoutSteady(facts, at(fits + RETURN_MARGIN - 1), 7.2, { hold: r.hold, now: 11_200 });
+    expect(r.segs.some((s) => s.id === "usage")).toBe(false);
+    r = bandLayoutSteady(facts, at(fits + RETURN_MARGIN), 7.2, { hold: r.hold, now: 11_300 });
+    expect(r.segs.some((s) => s.id === "usage")).toBe(true);
+  });
+
+  it("a segment that no longer fits goes at once, hold or not", () => {
+    const wide = bandLayoutSteady(facts, at(fits + 10), 7.2, { hold: null, now: 10_000 });
+    expect(wide.segs.some((s) => s.id === "usage")).toBe(true);
+    const narrow = bandLayoutSteady(facts, at(fits - 1), 7.2, { hold: wide.hold, now: 10_050 });
+    expect(narrow.segs.some((s) => s.id === "usage")).toBe(false);
+  });
+
+  it("a reserved width counts toward what fits, and is carried on the segment", () => {
+    const r = bandLayoutSteady({ ...facts, position: "9/120" }, at(200), 7.2, { hold: null, now: 0, reserve: { position: 7 } });
+    expect(r.segs.find((s) => s.id === "position")?.cells).toBe(7);
+    const plain = bandLayoutSteady({ ...facts, position: "9/120" }, at(fits), 7.2, { hold: null, now: 0 });
+    const reserved = bandLayoutSteady({ ...facts, position: "9/120" }, at(fits), 7.2, { hold: null, now: 0, reserve: { position: 40 } });
+    expect(plain.segs.length).toBeGreaterThan(reserved.segs.length);
+  });
+
+  it("only what was dropped is held back: an indicator that appears later is laid out on its own merits", () => {
+    // A long flash pushes the band through every step, the card step included, with no card on the band.
+    const narrow = 25 * 7.2;
+    const quiet: BandFacts = { ...idle, unread: null, position: null, model: null, usage: null, context: null, pill: "⏵⏵ manual" };
+    const flash = bandLayoutSteady({ ...quiet, message: "a flash far too long for a band of twenty-five cells" }, narrow, 7.2, { hold: null, now: 10_000 });
+    // The flash goes and a card arrives at once: `⚑1` fits, and was never dropped, so it is drawn.
+    const card = bandLayoutSteady({ ...quiet, cards: 1 }, narrow, 7.2, { hold: flash.hold, now: 10_100 });
+    expect(card.segs.map((x) => x.id)).toContain("cards");
+  });
+
+  it("bandLayout without a hold is unchanged: no cells on any segment", () => {
+    expect(bandLayout(facts, at(200), 7.2).some((s) => s.cells !== undefined)).toBe(false);
+  });
+});

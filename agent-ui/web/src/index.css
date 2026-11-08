@@ -2062,6 +2062,12 @@ input::placeholder {
 .band-seg {
   white-space: nowrap;
 }
+/* A figure keeps a width while a turn streams (`cells`, drawn as an inline min-width in `ch`); its digits sit at the
+   right of that width, as a ruler's do, so the segments beside it stay where they are. */
+.status-band .band-position,
+.status-band .band-usage {
+  text-align: right;
+}
 /* The model and the effort where a click chooses them: they stay the text they were beside their neighbours. */
 .status-band .band-pick {
   background: none;

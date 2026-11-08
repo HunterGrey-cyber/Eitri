@@ -21,6 +21,10 @@ export type Seg = {
    *  `StatusBand` wraps it at auto height so a prompt keeps its trailing `(y/n)` and a flash keeps
    *  its explanation. Absent on every other segment, which still degrades by priority. */
   wraps?: boolean;
+  /** The width this segment keeps, in cells, when its text is narrower: a figure (`position`, `usage`, `unread`)
+   *  given a `reserve` by `bandLayoutSteady`, so its text changing does not move the segments beside it. Counted
+   *  in place of the text's own width when it is wider. Absent everywhere else. */
+  cells?: number;
 };
 
 /** What the band has to say this render, gathered by `App.tsx` from state that already exists
@@ -85,6 +89,14 @@ export type BandFacts = {
   remoteSandbox?: string | null;
   /** The phones connected, for the mark's title: each named with its grant and the `Host` it came through. */
   phoneDevices?: RemoteConnectedDevice[];
+  /** A turn of this tab is running. While it is, `StatusBand` redraws the figures at most once a second and keeps
+   *  each at the widest it has been (`steadyBand.ts`). Absent is no turn. */
+  streaming?: boolean;
+  /** Whose band this is (the active tab): `StatusBand` carries nothing it held back or kept wide across a change. */
+  scope?: string | number | null;
+  /** Milliseconds from the panel's last key to this render; absent when there has been none. A position change
+   *  within `OWN_MOVE_MS` of a key outside INSERT is the reader's own move and is drawn at once (`steadyBand.ts`). */
+  keyAge?: number;
 };
 
 /** The phone mark's tooltip: each connected phone with its grant and the `Host` it came through (a phone's and the
@@ -303,15 +315,40 @@ const MODE_LETTER: Record<PanelMode, string> = { input: "I", browse: "B", hint: 
  *  or `charPx <= 0` (the hidden measuring span not yet laid out) shows only mode
  *  and pill -- priorities 1 and 2's own floor, never dropped once a real width is known either. */
 export function bandLayout(f: BandFacts, widthPx: number, charPx: number): Seg[] {
+  return bandLayoutSteady(f, widthPx, charPx, { hold: null, now: 0 }).segs;
+}
+
+/** Room, in cells, beyond the bare fit a segment dropped for room needs before it comes back. */
+export const RETURN_MARGIN = 3;
+/** How long, in milliseconds, after the band last dropped something for room, before anything comes back. */
+export const RETURN_COOLDOWN_MS = 1000;
+
+/** What the band dropped or shortened for room on its last layout -- each such segment's id and the cells it was
+ *  drawn in then, `0` for gone -- and when it last took a segment narrower than before. Kept by `StatusBand` between
+ *  renders, and let go on a tab switch. */
+export type LayoutHold = { dropped: Partial<Record<SegId, number>>; droppedAt: number };
+
+/** `bandLayout` with memory, so nothing on the band oscillates. A segment dropped for room comes back only when it
+ *  fits with `RETURN_MARGIN` cells to spare, and no sooner than `RETURN_COOLDOWN_MS` after the band last dropped
+ *  something; one that no longer fits still goes at once. `reserve` gives figures the width they keep (`cells` on
+ *  the segment, counted toward the fit). `due` is when something held out may come back, `null` if nothing waits. */
+export function bandLayoutSteady(
+  f: BandFacts,
+  widthPx: number,
+  charPx: number,
+  opts: { hold: LayoutHold | null; now: number; reserve?: Partial<Record<SegId, number>> },
+): { segs: Seg[]; hold: LayoutHold | null; due: number | null } {
+  const { hold, now } = opts;
+  const unchanged = (segs: Seg[]) => ({ segs, hold, due: null });
   const mode: Seg = { id: "mode", text: MODE_TEXT[f.mode], side: "left" };
   const pill: Seg = { id: "pill", text: f.pill, side: "left" };
   const phone: Seg[] = f.phones && f.phones > 0 ? [{ id: "phone", text: phoneSegment(f.phones), side: "left" }] : [];
-  if (widthPx <= 0 || charPx <= 0) return [mode, pill, ...phone];
+  if (widthPx <= 0 || charPx <= 0) return unchanged([mode, pill, ...phone]);
   const budget = Math.floor(widthPx / charPx);
   if (f.prompt !== null) {
     const taken = phone.reduce((n, x) => n + textWidth(x.text) + PAD, 0);
     const roomForPrompt = budget - textWidth(mode.text) - MODE_ARROW - 2 * PAD - taken;
-    return [mode, { id: "prompt", text: f.prompt, side: "left", wraps: textWidth(f.prompt) > roomForPrompt }, ...phone];
+    return unchanged([mode, { id: "prompt", text: f.prompt, side: "left", wraps: textWidth(f.prompt) > roomForPrompt }, ...phone]);
   }
   const ctxFull = f.context && (f.context.lines ? `⧉ ${f.context.file}:${f.context.lines[0]}-${f.context.lines[1]}` : `⧉ ${f.context.file}`);
   const link = f.link && f.link.state !== "attached" && f.link.text !== "" ? f.link : null;
@@ -340,7 +377,10 @@ export function bandLayout(f: BandFacts, widthPx: number, charPx: number): Seg[]
     ...(f.position ? [{ id: "position", text: f.position, side: "right" } as Seg] : []),
     ...(f.unread ? [{ id: "unread", text: f.unread, side: "right" } as Seg] : []),
   ];
-  const width = (s: Seg[]) => s.reduce((n, x) => n + textWidth(x.text) + PAD + (x.id === "mode" ? MODE_ARROW : 0), 0);
+  const reserve = opts.reserve ?? {};
+  segs = segs.map((x) => (reserve[x.id] !== undefined && reserve[x.id]! > textWidth(x.text) ? { ...x, cells: reserve[x.id] } : x));
+  const cellsOf = (x: Seg) => Math.max(textWidth(x.text), x.cells ?? 0);
+  const width = (s: Seg[]) => s.reduce((n, x) => n + cellsOf(x) + PAD + (x.id === "mode" ? MODE_ARROW : 0), 0);
   const steps: ((s: Seg[]) => Seg[])[] = [
     (s) => tasks === null ? s : s.map((x) => x.id === "background" ? { ...x, text: backgroundFallback(tasks.length) } : x),
     // The usage figure is the least urgent thing on the band -- it goes before even the context
@@ -375,10 +415,58 @@ export function bandLayout(f: BandFacts, widthPx: number, charPx: number): Seg[]
     (s) => s.map((x) => (x.id === "recovery" && f.recovery ? { ...x, text: recoverySegment(f.recovery.path.split("/").pop() ?? f.recovery.path, f.recovery.more) } : x)),
     (s) => s.filter((x) => x.id !== "recovery"),
   ];
-  for (const apply of steps) {
-    if (width(segs) <= budget) break;
-    segs = apply(segs);
+  // How many steps it takes to fit `room`; then the band at that many steps.
+  const all = segs;
+  const levelFor = (room: number) => {
+    let s = all;
+    let n = 0;
+    for (const apply of steps) {
+      if (width(s) <= room) break;
+      s = apply(s);
+      n++;
+    }
+    return n;
+  };
+  // The band after each number of steps, and which of its segments that many steps dropped or shortened. The steps
+  // only ever take more away, so a later step's set holds every earlier one's.
+  const levels: Seg[][] = [all];
+  for (const apply of steps) levels.push(apply(levels[levels.length - 1]));
+  const shownCells = (s: Seg[], id: SegId) => {
+    const x = s.find((y) => y.id === id);
+    return x === undefined ? 0 : cellsOf(x);
+  };
+  const affected = (s: Seg[]) => {
+    const out: Partial<Record<SegId, number>> = {};
+    for (const x of all) if (!s.some((y) => y.id === x.id && y.text === x.text)) out[x.id] = shownCells(s, x.id);
+    return out;
+  };
+  const fit = levelFor(budget);
+  let level = fit;
+  let due: number | null = null;
+  if (hold !== null) {
+    // Only a segment the band really dropped or shortened last time is held -- drawn no wider than it was then; one
+    // that has appeared since is laid out on its own merits. A held segment comes back (or back to its full text)
+    // only with room to spare, and not within a second of the band's last drop.
+    const held = (Object.entries(hold.dropped) as [SegId, number][]).filter(([id]) => all.some((x) => x.id === id));
+    const keeps = (n: number) => held.every(([id, cells]) => shownCells(levels[n], id) <= cells);
+    let keep = fit;
+    while (keep < steps.length && !keeps(keep)) keep++;
+    if (keep > fit) {
+      const roomy = Math.max(fit, levelFor(budget - RETURN_MARGIN));
+      if (now - hold.droppedAt < RETURN_COOLDOWN_MS) {
+        level = keep;
+        due = hold.droppedAt + RETURN_COOLDOWN_MS;
+      } else {
+        level = Math.min(keep, roomy);
+      }
+    }
   }
+  const dropped = affected(levels[level]);
+  const fresh = (Object.entries(dropped) as [SegId, number][]).some(
+    ([id, cells]) => hold === null || hold.dropped[id] === undefined || cells < hold.dropped[id]!,
+  );
+  const droppedAt = fresh ? now : hold === null ? -Infinity : hold.droppedAt;
+  segs = levels[level];
   // A flash too wide for the row gives way to its short form, if it has one (`SHORT_FLASH`), before it wraps: a
   // wrapped flash grows the band over the composer, and in a narrow chat a sentence takes six rows. Only where it
   // helps: the whole sentence beside the mode's letter comes first, and a short form that does not fit either leaves
@@ -402,7 +490,7 @@ export function bandLayout(f: BandFacts, widthPx: number, charPx: number): Seg[]
   // of a flash like the explanation of what `y` does.
   const over = width(segs) - budget;
   if (over > 0) segs = segs.map((x) => (x.id === "message" ? { ...x, wraps: true } : x));
-  return segs;
+  return { segs, hold: { dropped, droppedAt }, due };
 }
 
 /** The model without its leading `claude-`, which every Claude model carries: `"claude-sonnet-5"` ->
