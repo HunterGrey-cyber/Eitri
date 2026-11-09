@@ -22,6 +22,9 @@ pub struct BufferKey {
     pub pane: PaneId,
     pub generation: u64,
     pub id: u64,
+    /// 0 for the child's own `wl_buffer` of a pool buffer; 1-4 for the corner patches' views of the same dmabuf,
+    /// one `wl_buffer` per patch, since the release of a `wl_buffer` committed to more than one surface is undefined.
+    pub view: u8,
 }
 
 pub struct FrameData {

@@ -120,6 +120,122 @@ impl Placement {
     }
 }
 
+/// One of the editor's four corners.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Corner {
+    TopLeft,
+    TopRight,
+    BottomLeft,
+    BottomRight,
+}
+
+impl Corner {
+    pub(crate) const ALL: [Corner; 4] = [
+        Corner::TopLeft,
+        Corner::TopRight,
+        Corner::BottomLeft,
+        Corner::BottomRight,
+    ];
+
+    pub(crate) fn index(self) -> usize {
+        self as usize
+    }
+
+    fn right(self) -> bool {
+        matches!(self, Corner::TopRight | Corner::BottomRight)
+    }
+
+    fn bottom(self) -> bool {
+        matches!(self, Corner::BottomLeft | Corner::BottomRight)
+    }
+}
+
+/// A source rectangle in 1/256ths of a buffer pixel (`wl_fixed`'s resolution): x, y, width, height.
+pub(crate) type FixedRect = (i32, i32, i32, i32);
+
+/// One corner patch: a child of the editor's own surface, below it, showing one point of the editor's frame
+/// stretched over a square around that corner.
+///
+/// A compositor that rounds every surface at its own corners (Hyprland 0.56) cuts the editor's corners off, and the
+/// cut shows what lies below the editor. The patch lies below it and has the colour the editor itself has at that
+/// corner: its source is the corner pixel's centre and one `wl_fixed` step inward, so a linear filter mixes in
+/// nothing from past the frame's edge. The patch is rounded at its own corners too, so it reaches [`UNDERLAY_REACH`]
+/// past the editor (cut to the window, as the underlay is), where the parent's opaque pixels cover its cut corners,
+/// and as far into the editor (at most half the editor, so it never reaches another corner), where the editor's own
+/// pixels cover its inner corner as long as the radius is at most half that reach.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct CornerPatch {
+    /// In the editor surface's coordinates (logical pixels from its top-left).
+    pub rect: Rect,
+    /// In the editor's buffer, whose top-left `content` pixels are the frame.
+    pub source: FixedRect,
+}
+
+/// Where each corner patch goes, in [`Corner::ALL`] order, for an editor at `position` (parent surface coordinates)
+/// showing a frame of `logical` size from `content` buffer pixels, with `underlay` the editor's rectangle grown and
+/// cut to the window ([`Placement::with_underlay`]). A corner gets none when the window leaves no room past it: that
+/// corner is the window's own, rounded the same way anyway.
+pub(crate) fn corner_patches(
+    position: (i32, i32),
+    logical: (i32, i32),
+    content: (i32, i32),
+    underlay: Option<Rect>,
+) -> [Option<CornerPatch>; 4] {
+    let (w, h) = logical;
+    let reach_x = UNDERLAY_REACH.min(w / 2);
+    let reach_y = UNDERLAY_REACH.min(h / 2);
+    let Some((ux, uy, uw, uh)) = underlay.filter(|_| reach_x >= 1 && reach_y >= 1 && content.0 >= 1 && content.1 >= 1)
+    else {
+        return [None; 4];
+    };
+    // The window's cut, in the editor surface's own coordinates.
+    let (cx0, cy0) = (ux.saturating_sub(position.0), uy.saturating_sub(position.1));
+    let (cx1, cy1) = (cx0.saturating_add(uw), cy0.saturating_add(uh));
+    // From the centre of a corner pixel one `wl_fixed` step inward.
+    let sample = |far: bool, side: i32| {
+        if far {
+            side.saturating_mul(256).saturating_sub(128 + 1)
+        } else {
+            128
+        }
+    };
+    Corner::ALL.map(|corner| {
+        let (x0, x1) = if corner.right() {
+            (w - reach_x, w.saturating_add(UNDERLAY_REACH))
+        } else {
+            (-UNDERLAY_REACH, reach_x)
+        };
+        let (y0, y1) = if corner.bottom() {
+            (h - reach_y, h.saturating_add(UNDERLAY_REACH))
+        } else {
+            (-UNDERLAY_REACH, reach_y)
+        };
+        let (x0, x1, y0, y1) = (x0.max(cx0), x1.min(cx1), y0.max(cy0), y1.min(cy1));
+        // The patch must still hold the editor's corner square, and reach past the editor on at least one side.
+        let holds_x = if corner.right() {
+            x0 <= w - reach_x && x1 >= w
+        } else {
+            x0 <= 0 && x1 >= reach_x
+        };
+        let holds_y = if corner.bottom() {
+            y0 <= h - reach_y && y1 >= h
+        } else {
+            y0 <= 0 && y1 >= reach_y
+        };
+        let past_x = if corner.right() { x1 > w } else { x0 < 0 };
+        let past_y = if corner.bottom() { y1 > h } else { y0 < 0 };
+        (holds_x && holds_y && (past_x || past_y)).then(|| CornerPatch {
+            rect: (x0, y0, x1 - x0, y1 - y0),
+            source: (
+                sample(corner.right(), content.0),
+                sample(corner.bottom(), content.1),
+                1,
+                1,
+            ),
+        })
+    })
+}
+
 pub(crate) fn os_scale(placement: &Placement, scale: f64) -> f64 {
     if placement.viewport.is_some() {
         scale
@@ -156,6 +272,102 @@ mod tests {
         );
         // Nothing of it in the window: none.
         assert_eq!(shadowed.with_underlay((2000.0, 0.0), (400, 300)).underlay, None);
+    }
+
+    #[test]
+    fn corner_patches_reach_past_the_editor_and_into_it_and_sample_each_corner_pixel_from_inside() {
+        let r = UNDERLAY_REACH;
+        // An editor inside the window on every side: four patches, each a square of 2r around its corner.
+        let p = placement((100.0, 80.0), (0.0, 0.0), (800, 600), 1.25, 2, true)
+            .unwrap()
+            .with_underlay((0.0, 0.0), (1200, 900));
+        let patches = corner_patches(p.position, p.logical, p.content, p.underlay);
+        let (cw, ch) = p.content;
+        assert_eq!((cw, ch), (1000, 750));
+        assert_eq!(
+            patches,
+            [
+                Some(CornerPatch {
+                    rect: (-r, -r, 2 * r, 2 * r),
+                    source: (128, 128, 1, 1)
+                }),
+                Some(CornerPatch {
+                    rect: (800 - r, -r, 2 * r, 2 * r),
+                    source: (cw * 256 - 129, 128, 1, 1)
+                }),
+                Some(CornerPatch {
+                    rect: (-r, 600 - r, 2 * r, 2 * r),
+                    source: (128, ch * 256 - 129, 1, 1)
+                }),
+                Some(CornerPatch {
+                    rect: (800 - r, 600 - r, 2 * r, 2 * r),
+                    source: (cw * 256 - 129, ch * 256 - 129, 1, 1)
+                }),
+            ]
+        );
+        // Every source lies inside the frame, from a pixel's centre inward.
+        for patch in patches.iter().flatten() {
+            let (x, y, w, h) = patch.source;
+            assert!(x >= 0 && y >= 0 && x + w <= cw * 256 && y + h <= ch * 256);
+            assert!(x % 256 == 128 || (x + w) % 256 == 128);
+            assert!(y % 256 == 128 || (y + h) % 256 == 128);
+        }
+    }
+
+    #[test]
+    fn a_corner_on_the_window_corner_gets_no_patch_and_one_on_an_edge_reaches_along_it() {
+        let r = UNDERLAY_REACH;
+        // The editor on the window's left and bottom edges, as a left split above nothing.
+        let p = placement((0.0, 40.0), (0.0, 0.0), (800, 860), 1.0, 1, true)
+            .unwrap()
+            .with_underlay((0.0, 0.0), (1200, 900));
+        let [tl, tr, bl, br] = corner_patches(p.position, p.logical, p.content, p.underlay);
+        assert_eq!(bl, None, "the window's own corner");
+        assert_eq!(
+            tl.unwrap().rect,
+            (0, -r, r, 2 * r),
+            "cut at the window's left edge, reaching up"
+        );
+        assert_eq!(tr.unwrap().rect, (800 - r, -r, 2 * r, 2 * r));
+        assert_eq!(
+            br.unwrap().rect,
+            (800 - r, 860 - r, 2 * r, r),
+            "cut at the window's bottom edge"
+        );
+        // A window edge 5 px past the editor: the patch stops there.
+        let near = p.without_underlay().with_underlay((0.0, 0.0), (805, 900));
+        let [_, tr, _, br] = corner_patches(near.position, near.logical, near.content, near.underlay);
+        assert_eq!(tr.unwrap().rect, (800 - r, -r, r + 5, 2 * r));
+        assert_eq!(br.unwrap().rect, (800 - r, 860 - r, r + 5, r));
+        // No window known: no patches.
+        assert_eq!(corner_patches(p.position, p.logical, p.content, None), [None; 4]);
+    }
+
+    #[test]
+    fn corner_patches_of_a_small_editor_never_reach_another_corner() {
+        let p = placement((300.0, 300.0), (0.0, 0.0), (21, 9), 2.0, 2, true)
+            .unwrap()
+            .with_underlay((0.0, 0.0), (1200, 900));
+        let patches = corner_patches(p.position, p.logical, p.content, p.underlay);
+        let rects: Vec<Rect> = patches.iter().map(|patch| patch.unwrap().rect).collect();
+        let r = UNDERLAY_REACH;
+        assert_eq!(
+            rects,
+            vec![
+                (-r, -r, r + 10, r + 4),
+                (11, -r, 10 + r, r + 4),
+                (-r, 5, r + 10, 4 + r),
+                (11, 5, 10 + r, 4 + r)
+            ]
+        );
+        // A side of one pixel leaves no half to reach into.
+        let thin = placement((300.0, 300.0), (0.0, 0.0), (1, 9), 2.0, 2, true)
+            .unwrap()
+            .with_underlay((0.0, 0.0), (1200, 900));
+        assert_eq!(
+            corner_patches(thin.position, thin.logical, thin.content, thin.underlay),
+            [None; 4]
+        );
     }
 
     #[test]

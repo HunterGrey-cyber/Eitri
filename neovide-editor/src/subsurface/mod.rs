@@ -858,7 +858,13 @@ impl PaneIo for WaylandPane {
             pool.release(true);
             return Err("the child surface could not be created".into());
         }
-        if viewporter && !child.has_underlay() {
+        if viewporter && !child.has_corners() {
+            eprintln!(
+                "[editor] subsurface: no corner patches under the editor; a compositor that rounds the editor's \
+                 corners shows the underlay's colour there"
+            );
+        }
+        if viewporter && !child.has_corners() && !child.has_underlay() {
             eprintln!(
                 "[editor] subsurface: no underlay under the editor (no single-pixel buffers or wl_shm); a compositor \
                  that rounds the editor's corners shows the desktop there"
@@ -938,14 +944,25 @@ impl PaneIo for WaylandPane {
             .wl_buffer(slot)
             .cloned()
             .ok_or("the presentation buffer is gone")?;
+        // The corner patches show the same frame through views of its dmabuf, a `wl_buffer` of their own each.
+        let views = resources
+            .child
+            .has_corners()
+            .then(|| resources.pool.corner_views(&globals, &self.thread.queue_handle(), slot))
+            .flatten();
         resources.pool.submit(slot);
         if let Some(rgb) = area.cover_rgb() {
             resources.child.set_underlay_color(rgb);
         }
-        let seq = resources.child.present(&buffer, size, &geometry.placement, self.id);
+        let seq = resources
+            .child
+            .present(&buffer, views.as_ref(), size, &geometry.placement, self.id);
         if seq == 0 {
             return Err("the child refused the presentation buffer or geometry".into());
         }
+        resources
+            .pool
+            .corner_views_committed(slot, resources.child.corner_views_committed());
         self.underlay_changed(&area, &mut resources.child);
         debug_assert!(resources.child.has_buffer());
         self.last_seq.set(seq);
@@ -962,6 +979,16 @@ impl PaneIo for WaylandPane {
             }
             resources.child.move_to(&geometry.placement);
             self.underlay_changed(&area, &mut resources.child);
+            // A corner that left the window's corner while the editor stayed shows its patch from the next frame,
+            // asked for once this move is done.
+            if resources.child.take_corner_wants_frame() {
+                let area = area.downgrade();
+                glib::idle_add_local_once(move || {
+                    if let Some(pane) = area.upgrade().and_then(|area| area.subsurface()) {
+                        pane.request(FrameReason::Map);
+                    }
+                });
+            }
         }
     }
 
@@ -1250,6 +1277,7 @@ mod tests {
                 pane: PaneId(1),
                 generation: 1,
                 id: 1,
+                view: 0,
             };
             pane.event(PresentEvent::BufferFailed { key });
             pane.event(PresentEvent::BufferFailed { key });

@@ -23,7 +23,7 @@ use wayland_protocols::wp::{
 };
 
 use super::{
-    geometry::{Placement, Rect},
+    geometry::{corner_patches, Corner, CornerPatch, FixedRect, Placement, Rect},
     types::{FrameData, Globals, PaneId},
 };
 use crate::dmabuf_target::Chosen;
@@ -73,6 +73,18 @@ pub(crate) trait ChildRequests {
     /// Destroys the buffers an earlier underlay commit replaced, once the parent has committed and so applied it.
     fn release_retired_underlay_buffers(&mut self);
     fn destroy_underlay(&mut self);
+    /// The four corner patches: children of the child's own surface, each with a viewport, no input and an opaque
+    /// region over all of it, placed below the child and left in sync mode, so each of their changes lands with the
+    /// child's next commit. False (and nothing left behind) without a viewporter or a child surface.
+    fn create_corners(&mut self) -> bool;
+    /// A patch's position (the child's state) and its viewport's destination (its own).
+    fn corner_rect(&mut self, corner: Corner, rect: Rect);
+    fn corner_source(&mut self, corner: Corner, source: FixedRect);
+    /// Attaches the child's own buffer to a patch and damages the buffer pixels `damage` names.
+    fn corner_attach(&mut self, corner: Corner, buffer: &WlBuffer, damage: Rect);
+    fn corner_attach_null(&mut self, corner: Corner);
+    fn corner_commit(&mut self, corner: Corner);
+    fn destroy_corners(&mut self);
 }
 
 pub(crate) struct WaylandRequests<D> {
@@ -88,6 +100,31 @@ pub(crate) struct WaylandRequests<D> {
     viewport: Option<WpViewport>,
     parent: Option<WlSurface>,
     underlay: Option<UnderlayObjects>,
+    corners: Option<[CornerObjects; 4]>,
+}
+
+struct CornerObjects {
+    surface: WlSurface,
+    subsurface: WlSubsurface,
+    viewport: WpViewport,
+}
+
+impl CornerObjects {
+    fn alive(&self) -> bool {
+        self.surface.is_alive() && self.subsurface.is_alive() && self.viewport.is_alive()
+    }
+
+    fn destroy(self) {
+        if self.subsurface.is_alive() {
+            self.subsurface.destroy();
+        }
+        if self.viewport.is_alive() {
+            self.viewport.destroy();
+        }
+        if self.surface.is_alive() {
+            self.surface.destroy();
+        }
+    }
 }
 
 struct UnderlayObjects {
@@ -141,10 +178,15 @@ impl<D> WaylandRequests<D> {
             viewport: None,
             parent: None,
             underlay: None,
+            corners: None,
         }
     }
     fn underlay(&mut self) -> Option<&mut UnderlayObjects> {
         self.underlay.as_mut().filter(|underlay| underlay.alive())
+    }
+    fn corner(&self, corner: Corner) -> Option<&CornerObjects> {
+        let objects = &self.corners.as_ref()?[corner.index()];
+        objects.alive().then_some(objects)
     }
     fn new_underlay_buffer(&self, rgb: [u8; 3]) -> Option<WlBuffer>
     where
@@ -459,6 +501,82 @@ where
             }
         }
     }
+    fn create_corners(&mut self) -> bool {
+        if self.corners.is_some() || !self.compositor.is_alive() || !self.subcompositor.is_alive() {
+            return false;
+        }
+        let (Some(child), Some(viewporter)) = (
+            self.surface().cloned(),
+            self.viewporter.clone().filter(|v| v.is_alive()),
+        ) else {
+            return false;
+        };
+        let make = || {
+            let surface = self.compositor.create_surface(&self.qh, ());
+            let subsurface = self.subcompositor.get_subsurface(&surface, &child, &self.qh, ());
+            let viewport = viewporter.get_viewport(&surface, &self.qh, ());
+            let input = self.compositor.create_region(&self.qh, ());
+            surface.set_input_region(Some(&input));
+            input.destroy();
+            let opaque = self.compositor.create_region(&self.qh, ());
+            // The compositor clips this region, so any size stays opaque without another request.
+            opaque.add(0, 0, i32::MAX, i32::MAX);
+            surface.set_opaque_region(Some(&opaque));
+            opaque.destroy();
+            // A new subsurface starts in sync mode and is left there.
+            subsurface.place_below(&child);
+            CornerObjects {
+                surface,
+                subsurface,
+                viewport,
+            }
+        };
+        let corners = [make(), make(), make(), make()];
+        if !corners.iter().all(CornerObjects::alive) {
+            corners.into_iter().for_each(CornerObjects::destroy);
+            return false;
+        }
+        self.corners = Some(corners);
+        true
+    }
+    fn corner_rect(&mut self, corner: Corner, rect: Rect) {
+        if let Some(objects) = self.corner(corner) {
+            objects.subsurface.set_position(rect.0, rect.1);
+            objects.viewport.set_destination(rect.2, rect.3);
+        }
+    }
+    fn corner_source(&mut self, corner: Corner, source: FixedRect) {
+        if let Some(objects) = self.corner(corner) {
+            let fixed = |value: i32| f64::from(value) / 256.0;
+            objects
+                .viewport
+                .set_source(fixed(source.0), fixed(source.1), fixed(source.2), fixed(source.3));
+        }
+    }
+    fn corner_attach(&mut self, corner: Corner, buffer: &WlBuffer, damage: Rect) {
+        if !self.buffer_is_alive(buffer) {
+            return;
+        }
+        if let Some(objects) = self.corner(corner) {
+            objects.surface.attach(Some(buffer), 0, 0);
+            objects.surface.damage_buffer(damage.0, damage.1, damage.2, damage.3);
+        }
+    }
+    fn corner_attach_null(&mut self, corner: Corner) {
+        if let Some(objects) = self.corner(corner) {
+            objects.surface.attach(None, 0, 0);
+        }
+    }
+    fn corner_commit(&mut self, corner: Corner) {
+        if let Some(objects) = self.corner(corner) {
+            objects.surface.commit();
+        }
+    }
+    fn destroy_corners(&mut self) {
+        if let Some(corners) = self.corners.take() {
+            corners.into_iter().for_each(CornerObjects::destroy);
+        }
+    }
 }
 
 pub(crate) struct Child<R: ChildRequests> {
@@ -483,6 +601,28 @@ pub(crate) struct Child<R: ChildRequests> {
     underlay_sent: bool,
     /// Set when that change replaced a buffer, which the next `after_paint` releases.
     underlay_retired: bool,
+    /// The corner patches were made (a viewporter) and are not destroyed.
+    corners: bool,
+    /// What each patch has been sent (the compositor keeps it while the patch has no buffer), in `Corner::ALL` order.
+    corner_sent: [Option<CornerPatch>; 4],
+    /// Which patches show the child's current buffer.
+    corner_mapped: [bool; 4],
+    /// The logical size and buffer content of the frame on screen, which the patches sample.
+    shown: Option<((i32, i32), (i32, i32))>,
+    /// Set when a patch is wanted that has no buffer yet (a corner left the window's corner while the editor stayed):
+    /// it gets one with the child's next frame, which the pane then asks for.
+    corner_wants_frame: bool,
+    /// The views the last frame committed to the patches (bit `Corner::index`).
+    corner_views: u8,
+}
+
+/// What the corner patches are brought to.
+#[derive(Clone, Copy)]
+enum CornerFrame<'a> {
+    /// The frame on screen stays.
+    Same,
+    /// A new frame, with each patch's view of its buffer, or none to take the patches away.
+    New(Option<&'a [WlBuffer; 4]>),
 }
 
 impl<R: ChildRequests> Child<R> {
@@ -507,8 +647,13 @@ impl<R: ChildRequests> Child<R> {
             requests.destroy_viewport();
             requests.destroy_surface();
         }
-        // Only a viewport can stretch one pixel over the editor and past it; without one there is no underlay.
-        let underlay = ready && viewporter && requests.create_underlay();
+        // The patches stretch one point of the child's buffer, which needs a viewport.
+        let corners = ready && viewporter && requests.create_corners();
+        // With the patches there is no underlay: they cover every corner it did, and a compositor that draws a
+        // window's surfaces breadth first (Hyprland 0.56 draws the children below every surface of one depth before
+        // all of that depth) would draw them below an underlay, which then hides them. Without them the underlay
+        // gives the cut the background colour. Only a viewport can stretch its one pixel; without one there is none.
+        let underlay = ready && viewporter && !corners && requests.create_underlay();
         if underlay {
             requests.place_underlay_below_child();
         }
@@ -527,7 +672,95 @@ impl<R: ChildRequests> Child<R> {
             underlay_lost: false,
             underlay_sent: false,
             underlay_retired: false,
+            corners,
+            corner_sent: [None; 4],
+            corner_mapped: [false; 4],
+            shown: None,
+            corner_wants_frame: false,
+            corner_views: 0,
         }
+    }
+
+    /// The corner patches exist (they may not be shown).
+    pub(crate) fn has_corners(&self) -> bool {
+        self.corners
+    }
+
+    /// True once after a patch was wanted that only the child's next frame can show.
+    pub(crate) fn take_corner_wants_frame(&mut self) -> bool {
+        std::mem::take(&mut self.corner_wants_frame)
+    }
+
+    /// The views of the frame's buffer the last `present` committed to the patches (bit `Corner::index`), which the
+    /// pool holds until each is released.
+    pub(crate) fn corner_views_committed(&self) -> u8 {
+        self.corner_views
+    }
+
+    /// Brings the corner patches to the frame on screen, the current placement's position and the window's cut: a
+    /// patch is shown where [`corner_patches`] names one, with its view of a new frame's buffer when the child is
+    /// attaching one (the patch then samples that frame), and taken away where it names none, or when a new frame
+    /// comes without views. Every request a patch is sent lands with the child's next commit, which the caller sends:
+    /// returns whether there was any.
+    fn show_corners(&mut self, frame: CornerFrame<'_>) -> bool {
+        if !self.corners || !self.is_ready() {
+            return false;
+        }
+        let wanted = match (self.attached, self.placement, self.shown, frame) {
+            (_, _, _, CornerFrame::New(None)) => [None; 4],
+            (true, Some(p), Some((logical, content)), _) => corner_patches(p.position, logical, content, p.underlay),
+            _ => [None; 4],
+        };
+        if let CornerFrame::New(_) = frame {
+            self.corner_views = 0;
+        }
+        let mut sent = false;
+        for corner in Corner::ALL {
+            let i = corner.index();
+            let buffer = match frame {
+                CornerFrame::New(Some(views)) => Some(&views[i]),
+                _ => None,
+            };
+            match wanted[i] {
+                Some(patch) => {
+                    if !self.corner_mapped[i] && buffer.is_none() {
+                        self.corner_wants_frame = true;
+                        continue;
+                    }
+                    let last = self.corner_sent[i];
+                    let mut changed = false;
+                    if last.map(|p| p.rect) != Some(patch.rect) {
+                        self.requests.corner_rect(corner, patch.rect);
+                        changed = true;
+                    }
+                    if last.map(|p| p.source) != Some(patch.source) {
+                        self.requests.corner_source(corner, patch.source);
+                        changed = true;
+                    }
+                    self.corner_sent[i] = Some(patch);
+                    if let Some(buffer) = buffer {
+                        // The whole pixel the source lies in.
+                        let (x, y, ..) = patch.source;
+                        self.requests.corner_attach(corner, buffer, (x / 256, y / 256, 1, 1));
+                        self.corner_mapped[i] = true;
+                        self.corner_views |= 1 << i;
+                        changed = true;
+                    }
+                    if changed {
+                        self.requests.corner_commit(corner);
+                        sent = true;
+                    }
+                }
+                None if self.corner_mapped[i] => {
+                    self.requests.corner_attach_null(corner);
+                    self.requests.corner_commit(corner);
+                    self.corner_mapped[i] = false;
+                    sent = true;
+                }
+                None => {}
+            }
+        }
+        sent
     }
 
     /// True once after the underlay was sent a change that waits for a parent commit.
@@ -617,9 +850,13 @@ impl<R: ChildRequests> Child<R> {
     /// Only the opening and a new placement open a transaction; a different allocation behind the same placement
     /// leaves the surface's size and position unchanged, so it commits at once without waiting for the parent.
     /// Returns zero when no commit could be sent. The caller keeps the cover and falls back when not ready.
+    ///
+    /// `views` are the corner patches' own `wl_buffer`s of the same dmabuf, one per patch in `Corner::ALL` order; with
+    /// none the patches are taken away for this frame.
     pub(crate) fn present(
         &mut self,
         buffer: &WlBuffer,
+        views: Option<&[WlBuffer; 4]>,
         buffer_size: (i32, i32),
         placement: &Placement,
         pane: PaneId,
@@ -632,7 +869,7 @@ impl<R: ChildRequests> Child<R> {
         if !self.attached {
             self.begin_transaction();
         }
-        self.move_to(placement);
+        self.move_editor(placement);
         if self.viewporter {
             self.requests.set_source(0, 0, placement.content.0, placement.content.1);
             self.requests.set_destination(placement.logical.0, placement.logical.1);
@@ -643,9 +880,13 @@ impl<R: ChildRequests> Child<R> {
         self.requests.damage_buffer(0, 0, size.0, size.1);
         self.requests.frame(FrameData { pane, seq });
         self.requests.feedback(FrameData { pane, seq });
+        self.attached = true;
+        self.shown = Some((placement.logical, placement.content));
+        // The patches sample this same frame, through views of its dmabuf, and come before the child's own commit
+        // below (sync mode caches theirs until it): each corner's colour changes in the very frame that changed it.
+        self.show_corners(CornerFrame::New(views));
         self.requests.commit();
         self.seq = seq;
-        self.attached = true;
         self.show_underlay();
         seq
     }
@@ -677,9 +918,18 @@ impl<R: ChildRequests> Child<R> {
         }
     }
 
+    /// Moves the child without a new frame: the patches follow the window's cut (the frame they sample stays), and
+    /// a commit of the child's own surface, holding no buffer, applies their change.
     pub(crate) fn move_to(&mut self, placement: &Placement) {
+        if self.move_editor(placement) && self.show_corners(CornerFrame::Same) {
+            self.requests.commit();
+        }
+    }
+
+    /// The child's position and the underlay; true when the placement changed.
+    fn move_editor(&mut self, placement: &Placement) -> bool {
         if !self.is_ready() || !self.valid_placement(placement) || self.placement.as_ref() == Some(placement) {
-            return;
+            return false;
         }
         // A change to the underlay alone (the window's edge moved, the editor did not) leaves the editor's surface
         // out of sync mode: its frames keep committing at once, and the underlay's change lands at the next parent
@@ -690,6 +940,7 @@ impl<R: ChildRequests> Child<R> {
         }
         self.placement = Some(*placement);
         self.show_underlay();
+        true
     }
 
     pub(crate) fn hide(&mut self) {
@@ -698,9 +949,12 @@ impl<R: ChildRequests> Child<R> {
         }
         self.begin_transaction();
         self.requests.attach_null();
-        self.requests.commit();
         self.attached = false;
         self.placement = None;
+        self.shown = None;
+        // The patches let go of their views in the same commit as the child: the pool gets the dmabuf back as before.
+        self.show_corners(CornerFrame::Same);
+        self.requests.commit();
         self.show_underlay();
     }
 
@@ -714,6 +968,9 @@ impl<R: ChildRequests> Child<R> {
     pub(crate) fn destroy(mut self) {
         if self.underlay {
             self.requests.destroy_underlay();
+        }
+        if self.corners {
+            self.requests.destroy_corners();
         }
         if self.ready {
             self.requests.destroy_subsurface();
@@ -794,6 +1051,13 @@ mod tests {
         UnderlayCommit,
         ReleaseRetired,
         DestroyUnderlay,
+        CreateCorners,
+        CornerRect(Corner, Rect),
+        CornerSource(Corner, FixedRect),
+        CornerAttach(Corner, Rect),
+        CornerAttachNull(Corner),
+        CornerCommit(Corner),
+        DestroyCorners,
     }
     use Request::*;
 
@@ -807,6 +1071,8 @@ mod tests {
         underlay: bool,
         /// Making an underlay buffer fails.
         refuse_buffer: bool,
+        /// `create_corners` succeeds. Off, it records nothing.
+        corners: bool,
     }
     impl ChildRequests for Recording {
         fn create_surface(&mut self) -> bool {
@@ -915,6 +1181,30 @@ mod tests {
         }
         fn destroy_underlay(&mut self) {
             self.sent.borrow_mut().push(DestroyUnderlay);
+        }
+        fn create_corners(&mut self) -> bool {
+            if self.corners {
+                self.sent.borrow_mut().push(CreateCorners);
+            }
+            self.corners
+        }
+        fn corner_rect(&mut self, corner: Corner, rect: Rect) {
+            self.sent.borrow_mut().push(CornerRect(corner, rect));
+        }
+        fn corner_source(&mut self, corner: Corner, source: FixedRect) {
+            self.sent.borrow_mut().push(CornerSource(corner, source));
+        }
+        fn corner_attach(&mut self, corner: Corner, _: &WlBuffer, damage: Rect) {
+            self.sent.borrow_mut().push(CornerAttach(corner, damage));
+        }
+        fn corner_attach_null(&mut self, corner: Corner) {
+            self.sent.borrow_mut().push(CornerAttachNull(corner));
+        }
+        fn corner_commit(&mut self, corner: Corner) {
+            self.sent.borrow_mut().push(CornerCommit(corner));
+        }
+        fn destroy_corners(&mut self) {
+            self.sent.borrow_mut().push(DestroyCorners);
         }
     }
 
@@ -1073,7 +1363,8 @@ mod tests {
         std::mem::take(&mut *child.requests.sent.borrow_mut())
     }
     fn present(child: &mut Child<Recording>, buffer: &WlBuffer, p: &Placement, size: (i32, i32)) -> u64 {
-        child.present(buffer, size, p, PaneId(3))
+        let views = [buffer.clone(), buffer.clone(), buffer.clone(), buffer.clone()];
+        child.present(buffer, Some(&views), size, p, PaneId(3))
     }
 
     #[test]
@@ -1795,6 +2086,408 @@ mod tests {
         requests.underlay_rect((1, 2, 3, 4));
         assert!(!requests.underlay_buffer([1, 2, 3]));
         requests.underlay_commit();
+        assert!(o.take_wire().is_empty());
+    }
+
+    /// A child on a compositor that rounds nothing in particular, with the corner patches and no underlay.
+    fn setup_with_corners(objects: &Objects, viewport: bool) -> Child<Recording> {
+        Child::new(
+            Recording {
+                corners: true,
+                ..Recording::default()
+            },
+            &objects.parent,
+            &chosen(true),
+            viewport,
+        )
+    }
+    // `placement(true)` in `underlay_placement((7, 9))`'s window: 801x601 logical from 1202x902 pixels at (7, 9),
+    // the window 1600x1000 from (0, 0), so the patches are cut 7 px left of the editor and 9 px above it.
+    const CW: i32 = 1202 * 256 - 129;
+    const CH: i32 = 902 * 256 - 129;
+    fn first_corners() -> Vec<Request> {
+        use Corner::*;
+        vec![
+            CornerRect(TopLeft, (-7, -9, 39, 41)),
+            CornerSource(TopLeft, (128, 128, 1, 1)),
+            CornerAttach(TopLeft, (0, 0, 1, 1)),
+            CornerCommit(TopLeft),
+            CornerRect(TopRight, (769, -9, 64, 41)),
+            CornerSource(TopRight, (CW, 128, 1, 1)),
+            CornerAttach(TopRight, (1201, 0, 1, 1)),
+            CornerCommit(TopRight),
+            CornerRect(BottomLeft, (-7, 569, 39, 64)),
+            CornerSource(BottomLeft, (128, CH, 1, 1)),
+            CornerAttach(BottomLeft, (0, 901, 1, 1)),
+            CornerCommit(BottomLeft),
+            CornerRect(BottomRight, (769, 569, 64, 64)),
+            CornerSource(BottomRight, (CW, CH, 1, 1)),
+            CornerAttach(BottomRight, (1201, 901, 1, 1)),
+            CornerCommit(BottomRight),
+        ]
+    }
+
+    #[test]
+    fn the_corner_patches_are_made_after_the_child_and_only_with_a_viewport() {
+        let o = Objects::new();
+        let child = setup_with_corners(&o, true);
+        assert!(child.has_corners());
+        assert_eq!(
+            take(&child),
+            vec![
+                CreateSurface,
+                GetSubsurface,
+                PlaceBelow,
+                EmptyInput,
+                Opaque(0, 0, i32::MAX, i32::MAX),
+                GetViewport,
+                Desync,
+                CreateCorners
+            ]
+        );
+        let mut child = setup_with_corners(&o, false);
+        assert!(!child.has_corners());
+        take(&child);
+        present(
+            &mut child,
+            &o.buffer,
+            &placement(false).with_underlay((0.0, 0.0), (1600, 1000)),
+            (1602, 1202),
+        );
+        assert!(!take(&child).iter().any(|r| matches!(
+            r,
+            CreateCorners | CornerRect(..) | CornerSource(..) | CornerAttach(..) | CornerCommit(_)
+        )));
+    }
+
+    #[test]
+    fn the_opening_places_each_patch_and_commits_it_before_the_child() {
+        let o = Objects::new();
+        let mut child = setup_with_corners(&o, true);
+        take(&child);
+        present(&mut child, &o.buffer, &underlay_placement((7, 9)), (1280, 1024));
+        child.requests.sent.borrow_mut().push(ParentCommit);
+        child.after_paint();
+        let mut expected = vec![
+            Sync,
+            Position(7, 9),
+            Source(0, 0, 1202, 902),
+            Destination(801, 601),
+            Attach,
+            Damage(0, 0, 1280, 1024),
+            Frame(PaneId(3), 1),
+        ];
+        expected.extend(first_corners());
+        expected.extend([Commit, ParentCommit, Desync]);
+        assert_eq!(take(&child), expected);
+    }
+
+    #[test]
+    fn every_frame_hands_the_patches_its_buffer_in_the_childs_own_commit() {
+        // The patches sample the frame itself, so a frame that recolours a corner (a mode change recolouring the
+        // statusline) recolours its patch in the same commit: each patch's commit is cached (sync mode) until the
+        // child's, which comes last. Nothing about a patch but its buffer is sent again.
+        let o = Objects::new();
+        let mut child = setup_with_corners(&o, true);
+        let p = underlay_placement((7, 9));
+        present(&mut child, &o.buffer, &p, (1280, 1024));
+        child.after_paint();
+        take(&child);
+        for seq in 2..4 {
+            assert_eq!(present(&mut child, &o.buffer, &p, (1280, 1024)), seq);
+            assert!(!child.in_transaction());
+            let mut expected = vec![
+                Source(0, 0, 1202, 902),
+                Destination(801, 601),
+                Attach,
+                Damage(0, 0, 1280, 1024),
+                Frame(PaneId(3), seq),
+            ];
+            for corner in Corner::ALL {
+                let damage = first_corners()
+                    .into_iter()
+                    .find_map(|r| match r {
+                        CornerAttach(c, damage) if c == corner => Some(damage),
+                        _ => None,
+                    })
+                    .unwrap();
+                expected.extend([CornerAttach(corner, damage), CornerCommit(corner)]);
+            }
+            expected.push(Commit);
+            assert_eq!(take(&child), expected);
+        }
+    }
+
+    #[test]
+    fn a_frame_without_views_takes_the_patches_away_and_the_pool_is_told_which_views_it_committed() {
+        let o = Objects::new();
+        let mut child = setup_with_corners(&o, true);
+        let p = underlay_placement((7, 9));
+        present(&mut child, &o.buffer, &p, (1280, 1024));
+        assert_eq!(child.corner_views_committed(), 0b1111);
+        child.after_paint();
+        take(&child);
+        assert_eq!(child.present(&o.buffer, None, (1280, 1024), &p, PaneId(3)), 2);
+        let sent = take(&child);
+        for corner in Corner::ALL {
+            assert!(sent.contains(&CornerAttachNull(corner)), "{corner:?} in {sent:?}");
+        }
+        assert!(!sent.iter().any(|r| matches!(r, CornerAttach(..))));
+        assert_eq!(sent.last(), Some(&Commit));
+        assert_eq!(child.corner_views_committed(), 0);
+        // On the window's corner a patch is not shown, and its view is not committed.
+        let flush = p.without_underlay().with_underlay((0.0, 0.0), (7 + 801, 9 + 601));
+        present(&mut child, &o.buffer, &flush, (1280, 1024));
+        assert_eq!(child.corner_views_committed(), 0b0111);
+    }
+
+    #[test]
+    fn a_new_frame_size_moves_the_far_patches_and_their_samples() {
+        let o = Objects::new();
+        let mut child = setup_with_corners(&o, true);
+        let p = underlay_placement((7, 9));
+        present(&mut child, &o.buffer, &p, (1280, 1024));
+        child.after_paint();
+        take(&child);
+        let mut wider = p.without_underlay();
+        wider.logical = (811, 601);
+        wider.content = (1217, 902);
+        wider.viewport = Some(wider.logical);
+        let wider = wider.with_underlay((0.0, 0.0), (1600, 1000));
+        present(&mut child, &o.buffer, &wider, (1280, 1024));
+        let sent = take(&child);
+        use Corner::*;
+        let cw = 1217 * 256 - 129;
+        for expected in [
+            CornerRect(TopRight, (779, -9, 64, 41)),
+            CornerSource(TopRight, (cw, 128, 1, 1)),
+            CornerAttach(TopRight, (1216, 0, 1, 1)),
+            CornerRect(BottomRight, (779, 569, 64, 64)),
+            CornerSource(BottomRight, (cw, CH, 1, 1)),
+        ] {
+            assert!(sent.contains(&expected), "{expected:?} in {sent:?}");
+        }
+        assert!(!sent.iter().any(|r| matches!(
+            r,
+            CornerRect(TopLeft | BottomLeft, _) | CornerSource(TopLeft | BottomLeft, _)
+        )));
+        assert_eq!(sent.last(), Some(&Commit));
+        assert!(sent.iter().rposition(|r| matches!(r, CornerCommit(_))).unwrap() < sent.len() - 1);
+    }
+
+    #[test]
+    fn a_window_edge_that_moves_alone_recuts_the_patches_in_a_bufferless_commit_of_the_child() {
+        let o = Objects::new();
+        let mut child = setup_with_corners(&o, true);
+        let p = underlay_placement((7, 9));
+        present(&mut child, &o.buffer, &p, (1280, 1024));
+        child.after_paint();
+        take(&child);
+        // The window's right edge comes to 10 px past the editor.
+        let narrower = p.without_underlay().with_underlay((0.0, 0.0), (7 + 801 + 10, 1000));
+        child.move_to(&narrower);
+        assert!(!child.in_transaction());
+        use Corner::*;
+        assert_eq!(
+            take(&child),
+            vec![
+                CornerRect(TopRight, (769, -9, 42, 41)),
+                CornerCommit(TopRight),
+                CornerRect(BottomRight, (769, 569, 42, 64)),
+                CornerCommit(BottomRight),
+                Commit
+            ]
+        );
+        assert!(!child.take_corner_wants_frame());
+        // The same placement again sends nothing.
+        child.move_to(&narrower);
+        assert_eq!(take(&child), vec![]);
+    }
+
+    #[test]
+    fn a_corner_on_the_window_corner_loses_its_patch_and_gets_it_back_with_the_next_frame() {
+        let o = Objects::new();
+        let mut child = setup_with_corners(&o, true);
+        let p = underlay_placement((7, 9));
+        present(&mut child, &o.buffer, &p, (1280, 1024));
+        child.after_paint();
+        take(&child);
+        // The window shrinks to the editor's bottom-right corner.
+        let flush = p.without_underlay().with_underlay((0.0, 0.0), (7 + 801, 9 + 601));
+        child.move_to(&flush);
+        use Corner::*;
+        assert_eq!(
+            take(&child),
+            vec![
+                CornerRect(TopRight, (769, -9, 32, 41)),
+                CornerCommit(TopRight),
+                CornerRect(BottomLeft, (-7, 569, 39, 32)),
+                CornerCommit(BottomLeft),
+                CornerAttachNull(BottomRight),
+                CornerCommit(BottomRight),
+                Commit
+            ]
+        );
+        // It grows back: the bottom-right patch has no buffer to show until the child's next frame.
+        child.move_to(&p);
+        let sent = take(&child);
+        assert!(!sent
+            .iter()
+            .any(|r| matches!(r, CornerRect(BottomRight, _) | CornerAttach(BottomRight, _))));
+        assert!(child.take_corner_wants_frame(), "the pane asks for a frame");
+        present(&mut child, &o.buffer, &p, (1280, 1024));
+        let sent = take(&child);
+        assert!(sent.contains(&CornerAttach(BottomRight, (1201, 901, 1, 1))));
+        assert!(
+            !sent.iter().any(|r| matches!(r, CornerRect(BottomRight, _))),
+            "the compositor kept its place while it had no buffer"
+        );
+        assert_eq!(sent.last(), Some(&Commit));
+    }
+
+    #[test]
+    fn a_move_recuts_the_patches_in_the_childs_transaction() {
+        let o = Objects::new();
+        let mut child = setup_with_corners(&o, true);
+        present(&mut child, &o.buffer, &underlay_placement((7, 9)), (1280, 1024));
+        child.after_paint();
+        take(&child);
+        // Away from the window's edges: the left and top patches are no longer cut.
+        child.move_to(&underlay_placement((100, 120)));
+        child.requests.sent.borrow_mut().push(ParentCommit);
+        child.after_paint();
+        use Corner::*;
+        assert_eq!(
+            take(&child),
+            vec![
+                Sync,
+                Position(100, 120),
+                CornerRect(TopLeft, (-32, -32, 64, 64)),
+                CornerCommit(TopLeft),
+                CornerRect(TopRight, (769, -32, 64, 64)),
+                CornerCommit(TopRight),
+                CornerRect(BottomLeft, (-32, 569, 64, 64)),
+                CornerCommit(BottomLeft),
+                Commit,
+                ParentCommit,
+                Desync
+            ]
+        );
+    }
+
+    #[test]
+    fn hiding_lets_the_patches_go_of_the_buffer_in_the_childs_commit_and_the_reopening_reattaches() {
+        let o = Objects::new();
+        let mut child = setup_with_corners(&o, true);
+        let p = underlay_placement((7, 9));
+        present(&mut child, &o.buffer, &p, (1280, 1024));
+        child.after_paint();
+        take(&child);
+        child.hide();
+        let mut expected = vec![Sync, AttachNull];
+        for corner in Corner::ALL {
+            expected.extend([CornerAttachNull(corner), CornerCommit(corner)]);
+        }
+        expected.push(Commit);
+        assert_eq!(take(&child), expected);
+        child.after_paint();
+        take(&child);
+        // The compositor kept each patch's place and source: the reopening attaches and commits only.
+        present(&mut child, &o.buffer, &p, (1280, 1024));
+        let sent = take(&child);
+        assert!(!sent.iter().any(|r| matches!(r, CornerRect(..) | CornerSource(..))));
+        assert_eq!(sent.iter().filter(|r| matches!(r, CornerAttach(..))).count(), 4);
+        assert_eq!(sent.last(), Some(&Commit));
+    }
+
+    fn both(o: &Objects) -> Child<Recording> {
+        Child::new(
+            Recording {
+                underlay: true,
+                corners: true,
+                ..Recording::default()
+            },
+            &o.parent,
+            &chosen(true),
+            true,
+        )
+    }
+
+    #[test]
+    fn with_the_patches_there_is_no_underlay() {
+        // A compositor that draws a window's surfaces breadth first would draw the patches below the underlay.
+        let o = Objects::new();
+        let mut child = both(&o);
+        assert!(child.has_corners() && !child.has_underlay());
+        let sent = take(&child);
+        assert!(sent.contains(&CreateCorners));
+        assert!(!sent.iter().any(|r| matches!(r, CreateUnderlay | UnderlayBelowChild)));
+        child.set_underlay_color(BACKGROUND);
+        present(&mut child, &o.buffer, &underlay_placement((7, 9)), (1280, 1024));
+        assert!(!take(&child)
+            .iter()
+            .any(|r| matches!(r, UnderlayRect(_) | UnderlayBuffer(_) | UnderlayCommit)));
+        // Patches that cannot be made leave the underlay as it was.
+        let child = Child::new(
+            Recording {
+                underlay: true,
+                ..Recording::default()
+            },
+            &o.parent,
+            &chosen(true),
+            true,
+        );
+        assert!(!child.has_corners() && child.has_underlay());
+    }
+
+    #[test]
+    fn destroy_takes_the_patches_down_before_the_child() {
+        let o = Objects::new();
+        let child = both(&o);
+        let sent = child.requests.sent.clone();
+        take(&child);
+        child.destroy();
+        assert_eq!(
+            *sent.borrow(),
+            vec![DestroyCorners, DestroySubsurface, DestroyViewport, DestroySurface]
+        );
+    }
+
+    #[test]
+    fn wayland_requests_make_four_patches_under_the_child_and_stop_sending_after_destruction() {
+        let o = Objects::new();
+        let globals = o.globals(true);
+        let qh = o.conn.new_event_queue::<State>().handle();
+        let mut requests = WaylandRequests::new(&globals, qh);
+        assert!(!requests.create_corners(), "no child surface yet");
+        assert!(requests.create_surface());
+        assert!(requests.get_subsurface(&o.parent));
+        o.take_wire();
+        assert!(requests.create_corners());
+        assert!(!o.take_wire().is_empty());
+        assert!(!requests.create_corners(), "one set per child");
+        let corners = requests.corners.as_ref().unwrap();
+        let child = requests.surface().unwrap().clone();
+        assert!(corners.iter().all(|c| c.alive() && c.surface != child));
+        requests.corner_rect(Corner::TopRight, (1, 2, 3, 4));
+        requests.corner_source(Corner::TopRight, (128, 128, 1, 1));
+        requests.corner_attach_null(Corner::TopRight);
+        requests.corner_commit(Corner::TopRight);
+        assert!(!o.take_wire().is_empty());
+        requests.destroy_corners();
+        assert!(!o.take_wire().is_empty());
+        requests.corner_rect(Corner::TopRight, (1, 2, 3, 4));
+        requests.corner_source(Corner::TopRight, (128, 128, 1, 1));
+        requests.corner_attach(Corner::TopRight, &o.buffer, (0, 0, 1, 1));
+        requests.corner_attach_null(Corner::TopRight);
+        requests.corner_commit(Corner::TopRight);
+        assert!(o.take_wire().is_empty());
+        // No viewporter: none.
+        let mut requests = WaylandRequests::new(&o.globals(false), o.conn.new_event_queue::<State>().handle());
+        assert!(requests.create_surface());
+        assert!(requests.get_subsurface(&o.parent));
+        o.take_wire();
+        assert!(!requests.create_corners());
         assert!(o.take_wire().is_empty());
     }
 
