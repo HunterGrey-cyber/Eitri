@@ -1,8 +1,8 @@
 //! Bytes in, a `PaintList` out, and the answers the terminal owes the program.
 //!
-//! Feed only parses and marks dirty; rendering on every PTY read would tie full-frame work to
-//! output throughput. The session renders at most once a frame. Replies return to the program
-//! through [`Screen::take_replies`].
+//! Feed parses, marks dirty and retains a bounded complete-frame snapshot; rendering on every PTY
+//! read would tie full-frame work to output throughput. The session renders at most once a frame.
+//! Replies return to the program through [`Screen::take_replies`].
 //! Scrollback holds 10,000 lines (`Config::scrolling_history`, alacritty's default), and
 //! [`Screen::scroll`] moves the view through it.
 //!
@@ -21,22 +21,11 @@
 //! session's render clock. Snapshotting on every publication would pay O(rows x cols) per PTY
 //! read, even for plain output and while hidden.
 //!
-//! A synchronized update cannot mutate Term before its BSU is dispatched. [`Screen::feed`]
-//! therefore steps the driver one byte at a time and snapshots exactly at the false-to-true
-//! in_sync transition, before any content of the new update. Later publications need no snapshot:
-//! they either close the update, letting render read the live Term, or open another update whose
-//! transition captures the complete frame. In `BSU CUP ED "frame\r\nplus1" ESU BSU CUP ED "HEL"`
-//! fed without an intervening render, the second BSU must capture frame/plus1 and none of HEL.
-//! `resize` needs no snapshot: `render` reads the live grid once the update ends. That holds even
-//! for a resize inside an update that then ends without publishing anything (an ESU or abort with
-//! no dispatch between it and the BSU, so the barrier's `dirty` flag never latches): `end_sync` and
-//! `abort_sync` clear `in_sync` regardless of `dirty`, so `open_update()` is `None` the moment the
-//! update ends and the next `render()` reads the live, resized `Term`. A snapshot taken only on a
-//! publication would miss that resize and keep reporting the old grid size.
-//! This is still `Projector::full`'s own documented safety property doing the work: it "does
-//! **not** touch damage, so it is safe to call for a newly attached consumer at any moment" -- an
-//! extra full snapshot, wherever one is taken, is not the delta-stream-stealing hazard
-//! `Projector::next` guards against, since `Screen` never calls `next`.
+//! An update opening captures the complete grid preceding it, with at most one changed-grid
+//! opening snapshot between renders. Later openings reuse that snapshot until a render replenishes the
+//! allowance, so hidden output cannot keep copying the grid. Once no update is open, rendering
+//! projects the current grid, including any resize, and a render during an open update owes
+//! another frame when it closes (`redraw_at_end`).
 
 use alacritty_terminal::event::WindowSize;
 use alacritty_terminal::grid::Dimensions;
@@ -240,15 +229,14 @@ pub struct Screen {
     cursor_coloring: CursorColoring,
     size: PtySize,
     dirty: bool,
-    /// The frame taken at the last transition into a synchronized update (or the empty grid at
-    /// construction). Read by [`Self::render`] only while an update is open AND the view is
-    /// following the live bottom -- outside one, `render` projects the live `term` directly instead,
-    /// since it is then guaranteed quiescent.
+    /// A complete grid captured at render or at an update opening (initially the empty grid).
+    /// Reused while an update is open, so its partial changes never reach the live view.
     frame: TerminalFrame,
-    /// [`Self::content_revision`] when `frame` was projected: a snapshot is taken again only once
-    /// the `Term` has changed since. An empty synchronized update (`ESC[?2026h ESC[?2026l`, what
-    /// nvim sends when a redraw changes nothing) otherwise paid a whole-screen projection at every
-    /// opening, hidden or not, and every render re-projected an unchanged screen.
+    /// An update opening has copied a changed grid since the last render. Further openings reuse
+    /// that snapshot, bounding full-grid work even when the terminal stays hidden.
+    opening_snapshot: bool,
+    /// [`Self::content_revision`] when `frame` was projected. An unchanged grid needs no projection
+    /// and consumes no opening-snapshot allowance, so empty updates cannot hide a later change.
     frame_revision: u64,
     /// How many times the grid was resized: the one change to the `Term` that is not a parser
     /// dispatch, counted into [`Self::content_revision`].
@@ -319,6 +307,7 @@ impl Screen {
             size,
             dirty: true,
             frame,
+            opening_snapshot: false,
             frame_revision: 0,
             resizes: 0,
             published_revision: 0,
@@ -443,16 +432,6 @@ impl Screen {
 
     /// Parses one chunk of output. Marks the screen dirty when the chunk reached a publication
     /// point (`terminal-sync`'s rule: never mid-`DECSET 2026` update).
-    ///
-    /// Steps `terminal-sync` one byte at a time (matching what it already does internally -- see
-    /// its own "WHY BYTE AT A TIME" doc -- so this adds no real iteration cost) so it can catch the
-    /// exact byte where an update opens (`in_sync` false -> true) and snapshot `self.frame` right
-    /// there, before any of that update's own content can mutate `term`. That is the only point a
-    /// snapshot is structurally required (module doc); every other publication in this
-    /// call needs none, because `Self::render` reprojects the live `term` itself once no update is
-    /// open. A `feed()` call may carry more than one such transition (`BSU ... ESU BSU ...`); each
-    /// one replaces `self.frame`, so what is left after the call is the state right before the
-    /// *last* update that opened in this read, never that update's own half-drawn content.
     pub fn feed(&mut self, bytes: &[u8]) {
         for &byte in bytes {
             let was_in_sync = self.sync.barrier().in_sync();
@@ -481,8 +460,10 @@ impl Screen {
             if published && self.publication_is_visible() {
                 self.dirty = true;
             }
-            if !was_in_sync && self.sync.barrier().in_sync() {
+            if !was_in_sync && self.sync.barrier().in_sync() && !self.opening_snapshot {
+                let previous = self.frame_revision;
                 self.refresh_frame();
+                self.opening_snapshot = self.frame_revision != previous;
             }
             if was_in_sync && !self.sync.barrier().in_sync() && std::mem::take(&mut self.redraw_at_end) {
                 self.dirty = true;
@@ -545,14 +526,9 @@ impl Screen {
     /// A grid below one cell is stored as one cell, the size `TIOCSWINSZ` gets too, so a
     /// `CSI 18 t` never answers `0x0`.
     ///
-    /// Takes no *frame* snapshot itself -- `Term::resize` is geometry, not a parser dispatch, so it
-    /// cannot be the transition [`Self::feed`] watches for, and `Self::render` already reprojects
-    /// the live `term` (new size included) the next time it is called with no update open. That
-    /// covers this even when an update IS open at resize time and goes on to publish nothing of its
-    /// own (an ESU/abort with no dispatch in between never latches `SyncBarrier`'s `dirty` flag):
-    /// both still clear `in_sync` unconditionally, so `open_update()` still reports `None` once it
-    /// ends, and the next `render()` picks up the resize. That next render is owed even when one
-    /// already ran inside the update and drew the old snapshot (`redraw_at_end`).
+    /// Takes no frame snapshot: the next render outside an open synchronized update projects
+    /// the resized grid. A render during the update keeps the complete cached frame and owes a
+    /// redraw when the update closes, even if the update itself changed no cells.
     ///
     /// **Re-aligns the scrollback anchor.** A resize reflows the grid -- how many logical
     /// lines/rows exist -- which can shift or evict what a pinned [`ScrollView`] anchor points at,
@@ -688,8 +664,8 @@ impl Screen {
     /// means `terminal-sync` is not mid-tear), so this reprojects it fresh, at most once per call
     /// -- bounded by however often the caller renders, not by the PTY's own read rate. While an
     /// update is open, that would show the update's own half-drawn content, so this reads
-    /// `self.frame` instead: the snapshot `Self::feed` took at the exact byte the update opened,
-    /// before any of its content could mutate `term`. `self.frame`
+    /// `self.frame` instead: the complete grid retained at an update opening, subject to the
+    /// one-snapshot allowance between renders. Outside an update it
     /// is kept up to date every such call regardless of scroll position -- it is what
     /// [`Self::cursor_cell`] reports from, and typing always lands on the live screen, never on a
     /// scrolled-back one.
@@ -748,6 +724,7 @@ impl Screen {
         if let Some((above, history)) = self.copy_mode_indicator() {
             list.ops.extend(indicator_ops(above, history, list.cols, &palette));
         }
+        self.opening_snapshot = false;
         list
     }
 
@@ -1194,7 +1171,7 @@ mod tests {
 
     /// The cursor must belong to the frame `render` just
     /// produced, especially while a synchronized update is open, when that frame is the
-    /// snapshot taken as the update opened. The session renders then (a focus change, a resize, a
+    /// retained complete grid. The session renders then (a focus change, a resize, a
     /// title inside nvim's `DECSET 2026` redraw), and a cursor read off the live `Term` would put the
     /// preedit and the candidate window at the half-drawn update's cursor. Checked red against a
     /// `cursor_cell` that reads `self.term`.
@@ -1243,8 +1220,63 @@ mod tests {
         assert!(screen.take_dirty(), "and the snap is drawn");
     }
 
+    #[test]
+    fn an_update_opening_after_closed_output_keeps_that_complete_frame() {
+        let mut screen = Screen::new(SIZE, TerminalColors::default());
+        screen.feed(b"before");
+        screen.render(true);
+        screen.feed(b"\rcomplete\x1b[?2026h\rpartial");
+        assert!(screen.open_update().is_some());
+        assert_eq!(screen.render(true).row_text(0), "complete");
+        assert_eq!(screen.cursor_cell().col, 8, "the complete frame's cursor");
+    }
+
+    #[test]
+    fn tiny_sync_cycles_take_at_most_one_opening_snapshot_between_renders() {
+        let mut screen = Screen::new(SIZE, TerminalColors::default());
+        for _ in 0..10 {
+            let before = screen.snapshots();
+            for _ in 0..10_000 {
+                screen.feed(b"\x1b[?2026hX\x1b[?2026l");
+            }
+            assert!(screen.snapshots() <= before + 1, "one opening snapshot between renders");
+            screen.render(true);
+        }
+    }
+
+    #[test]
+    fn hidden_sync_cycles_take_one_snapshot_and_show_the_latest_complete_grid() {
+        let mut screen = Screen::new(SIZE, TerminalColors::default());
+        screen.feed(b"before");
+        screen.render(true);
+        let initial = screen.snapshots();
+        for _ in 0..10_000 {
+            screen.feed(b"\x1b[?2026h\rX\x1b[?2026l");
+        }
+        assert_eq!(screen.snapshots(), initial + 1, "one opening snapshot while hidden");
+        for _ in 0..10_000 {
+            screen.feed(b"\x1b[?2026h\rX\x1b[?2026l");
+        }
+        assert_eq!(
+            screen.snapshots(),
+            initial + 1,
+            "further hidden cycles take no snapshots"
+        );
+        screen.feed(b"\x1b[?2026h\rhalf");
+        assert_eq!(
+            screen.render(true).row_text(0),
+            "Xefore",
+            "closed updates reach the retained complete frame"
+        );
+        assert_eq!(screen.cursor_cell().col, 1, "the retained complete frame's cursor");
+        screen.feed(b"\x1b[?2026l");
+        assert_eq!(screen.render(true).row_text(0), "halfre");
+        assert_eq!(screen.snapshots(), initial + 2);
+    }
+
     /// An empty synchronized update changes nothing, so its opening takes no snapshot, and a render
-    /// of a screen nothing has touched projects nothing either. A real change still does both.
+    /// of a screen nothing has touched projects nothing either. A real change is projected at the
+    /// next eligible opening or render.
     #[test]
     fn an_unchanged_screen_is_not_projected_again() {
         let mut screen = Screen::new(SIZE, TerminalColors::default());
@@ -1530,11 +1562,13 @@ mod tests {
 
     /// One read carries a complete, published frame ("frame"/
     /// "plus1") followed immediately by a second, still-open update that has only written "HEL"
-    /// so far. `render()` must keep showing the last PUBLISHED frame, never the live `Term`'s
+    /// so far. `render()` must keep showing the retained complete frame, never the live `Term`'s
     /// current, torn content -- that is the whole point of the publication barrier.
     #[test]
     fn render_never_shows_a_frame_torn_by_a_later_update_in_the_same_read() {
         let mut screen = Screen::new(SIZE, TerminalColors::default());
+        screen.feed(b"previous");
+        screen.render(true);
         screen.take_dirty();
         screen.feed(b"\x1b[?2026h\x1b[1;1H\x1b[2Jframe\r\nplus1\x1b[?2026l\x1b[?2026h\x1b[1;1H\x1b[2JHEL");
         assert!(screen.take_dirty(), "the first update published inside this one read");
@@ -1542,17 +1576,19 @@ mod tests {
             screen.open_update().is_some(),
             "a second update is still open, unpublished"
         );
-        let frame = screen.render(true);
+        let complete = screen.render(true);
+        assert_eq!(complete.row_text(0), "frame");
+        assert_eq!(complete.row_text(1), "plus1");
+        screen.feed(b"\x1b[?2026l");
         assert_eq!(
-            frame.row_text(0),
-            "frame",
-            "must show the published frame, not the torn one"
+            screen.render(true).row_text(0),
+            "HEL",
+            "catch up when the update closes"
         );
-        assert_eq!(frame.row_text(1), "plus1");
     }
 
     /// The same hazard from a second call site: a caller renders once (correctly, mid-update,
-    /// showing the last publish), the update ends, and a LATER `render()` call must pick up the
+    /// showing the retained complete frame), the update ends, and a LATER `render()` call must pick up the
     /// newly published content -- caching must not go stale forever.
     #[test]
     fn render_catches_up_once_the_pending_update_publishes() {

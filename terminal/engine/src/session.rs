@@ -70,7 +70,7 @@ use crate::select::SelectCommand;
 const READ_CHUNK: usize = 64 * 1024;
 /// Bytes read per wake-up before the thread renders and looks at commands again. Whatever is left
 /// stays in the kernel, where it blocks the child.
-const READ_BUDGET: usize = 1024 * 1024;
+const READ_BUDGET: usize = 16 * 1024;
 /// How long a synchronized update may hold publication back before it is ended as if its
 /// `ESC[?2026l` had arrived: alacritty's own deadline (`vte-0.15.0` `SYNC_UPDATE_TIMEOUT`), which
 /// its event loop enforces and `terminal-sync` leaves to ours (`SyncBarrier::abort_sync`).
@@ -1191,7 +1191,8 @@ impl Worker<'_> {
     fn read_output(&mut self, buf: &mut [u8]) -> Flow {
         let mut total = 0;
         while total < READ_BUDGET {
-            match self.pty.read(buf) {
+            let remaining = (READ_BUDGET - total).min(buf.len());
+            match self.pty.read(&mut buf[..remaining]) {
                 Ok(0) => return Flow::ChildGone,
                 Ok(n) => {
                     total += n;
@@ -1421,6 +1422,63 @@ impl Worker<'_> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_command_queued_during_output_runs_before_the_burst_ends() {
+        // A pipe stands in for continuously readable output. The tap replenishes every read,
+        // so reaching WouldBlock cannot accidentally give the command its turn.
+        let (output, mut writer) = std::io::pipe().unwrap();
+        writer.write_all(&[b'X'; 1024]).unwrap();
+        let (unused_pidfd, _held) = std::io::pipe().unwrap();
+        let pty = PtyChild::adopt_uncommitted(output.into(), unused_pidfd.into(), 0).unwrap();
+        let (doorbell, _bell) = std::io::pipe().unwrap();
+        let (commands, receiver) = mpsc::channel();
+        let tapped = Arc::new(AtomicUsize::new(0));
+        let count = tapped.clone();
+        let size = PtySize {
+            cols: 20,
+            rows: 5,
+            cell_width_px: 9,
+            cell_height_px: 18,
+        };
+        let mut worker = Worker {
+            pty,
+            screen: Screen::new(size, TerminalColors::default()),
+            size,
+            colors: TerminalColors::default(),
+            focused: true,
+            visible: true,
+            detached: false,
+            report_due: None,
+            phase: Phase::Live,
+            commands: receiver,
+            doorbell,
+            shared: Arc::new(Shared::new()),
+            wake: &|| {},
+            tap: Some(Box::new(move |bytes| {
+                if count.fetch_add(bytes.len(), Ordering::SeqCst) == 0 {
+                    commands.send(SessionCommand::Focus(false)).unwrap();
+                }
+                writer.write_all(bytes).unwrap();
+            })),
+            clock: RenderClock::new(FRAME_INTERVAL),
+            outbox: Outbox::new(),
+            sync_deadline: None,
+            events_pending: false,
+            frame_owed: false,
+            last_mouse: None,
+        };
+        let mut buf = vec![0; READ_CHUNK];
+        assert!(matches!(worker.read_output(&mut buf), Flow::Continue));
+        assert!(
+            tapped.load(Ordering::SeqCst) <= 16 * 1024,
+            "parsing must yield after 16 KiB"
+        );
+        assert!(matches!(worker.handle_commands(), Next::Continue));
+        assert!(!worker.focused, "the command queued by the first read was handled");
+        assert_eq!(worker.pty.read(&mut buf).unwrap(), 1024, "the burst is still readable");
+    }
 
     /// A frame the session rendered,
     /// rang the host for and the host has not taken yet, followed by a panic on the thread. The

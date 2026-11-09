@@ -88,8 +88,8 @@ use std::sync::mpsc::Receiver;
 use std::time::{Duration, Instant};
 
 use gtk4::gdk::{Clipboard, ModifierType, Rectangle};
-use gtk4::glib;
 use gtk4::prelude::*;
+use gtk4::{gio, glib};
 use gtk4::{
     EventControllerFocus, EventControllerKey, EventControllerScroll, EventControllerScrollFlags, GLArea, GestureClick,
     GestureDrag, IMMulticontext, InputPurpose,
@@ -172,6 +172,8 @@ struct State {
     delivered: DeliveredKeys,
     /// What is bound for the shell and waits behind a paste still being read (phase 2).
     queue: InputQueue,
+    /// Clipboard transfers still owned by this shell, cancelled when their tickets end.
+    paste_reads: Vec<(PasteTicket, gio::Cancellable)>,
     /// The bell's flash (phase 2).
     bell: BellFlash,
     /// The last selection a drag finished: kept host-side so `Ctrl+Shift+C`
@@ -264,6 +266,7 @@ impl State {
             repeats: RepeatTracker::new(),
             delivered: DeliveredKeys::new(),
             queue: InputQueue::new(),
+            paste_reads: Vec::new(),
             bell: BellFlash::new(),
             last_selection: None,
             mouse: MouseModes::default(),
@@ -417,9 +420,12 @@ impl State {
     }
 
     /// Accepts a paste before its clipboard read answers, so a restart cannot discard it meanwhile.
-    fn begin_paste(&mut self) -> PasteTicket {
+    fn begin_paste(&mut self) -> (PasteTicket, gio::Cancellable) {
         self.typed += 1;
-        self.queue.begin_paste()
+        let ticket = self.queue.begin_paste();
+        let cancellable = gio::Cancellable::new();
+        self.paste_reads.push((ticket, cancellable.clone()));
+        (ticket, cancellable)
     }
 
     /// The queue belongs to this pane and cannot follow a session to the other window.
@@ -460,6 +466,9 @@ impl State {
     /// Ends one paste and sends what it was holding back. `false`: the paste had already been given
     /// up on (the timeout, or a restart), and its text is not sent.
     fn finish_paste(&mut self, ticket: PasteTicket, input: Option<NormalizedInput>) -> bool {
+        if let Some(at) = self.paste_reads.iter().position(|(pending, _)| *pending == ticket) {
+            self.paste_reads.swap_remove(at).1.cancel();
+        }
         match self.queue.finish(ticket, input) {
             Some(ready) => {
                 for input in ready {
@@ -477,6 +486,9 @@ impl State {
         self.session = None;
         self.exited = false;
         self.queue.clear();
+        for (_, read) in self.paste_reads.drain(..) {
+            read.cancel();
+        }
         self.cursor = None;
         self.last_selection = None;
         self.mouse = MouseModes::default();
@@ -2054,12 +2066,15 @@ fn paste_from(
     label: &'static str,
 ) {
     discard_composition(state, im, area);
-    let ticket = state.borrow_mut().begin_paste();
-    let read = clipboard.read_text_future();
+    let (ticket, cancellable) = state.borrow_mut().begin_paste();
     {
         let state = Rc::downgrade(state);
-        glib::spawn_future_local(async move {
-            let text = match read.await {
+        let cancelled = cancellable.clone();
+        clipboard.read_text_async(Some(&cancellable), move |result| {
+            if cancelled.is_cancelled() {
+                return;
+            }
+            let text = match result {
                 Ok(Some(text)) => text.to_string(),
                 Ok(None) => {
                     println!("[terminal] {label}: the clipboard holds no text");
@@ -2091,6 +2106,38 @@ fn paste_from(
 mod tests {
     use super::*;
     use gtk4::gdk::ScrollUnit;
+
+    #[test]
+    fn a_timed_out_paste_cancels_its_read_and_releases_typing() {
+        let mut state = State::new(PathBuf::from("/work"));
+        let (ticket, _) = state.begin_paste();
+        let read = state.paste_reads[0].1.clone();
+        state.submit(PaneInput::Key(keys::paste("next").unwrap()));
+        assert!(state.finish_paste(ticket, None));
+        assert!(read.is_cancelled());
+        assert!(state.paste_reads.is_empty());
+        assert!(state.queue.is_empty());
+        assert!(!state.finish_paste(ticket, keys::paste("late")));
+    }
+
+    #[test]
+    fn closing_or_restarting_cancels_every_paste_read() {
+        for close in [false, true] {
+            let mut state = State::new(PathBuf::from("/work"));
+            let tickets = [state.begin_paste().0, state.begin_paste().0];
+            let reads: Vec<_> = state.paste_reads.iter().map(|(_, read)| read.clone()).collect();
+            if close {
+                state.close();
+            } else {
+                state.forget_session();
+            }
+            assert!(reads.iter().all(|read| read.is_cancelled()));
+            assert!(state.paste_reads.is_empty());
+            for ticket in tickets {
+                assert!(!state.finish_paste(ticket, keys::paste("late")));
+            }
+        }
+    }
 
     #[test]
     fn the_fallback_spec_keeps_the_extra_list() {
@@ -2224,7 +2271,7 @@ mod tests {
     fn a_terminal_with_input_waiting_behind_a_paste_is_not_frozen_for_a_move() {
         let mut state = State::new(PathBuf::from("/tmp"));
         assert!(state.freeze_refusal().is_none());
-        let ticket = state.begin_paste();
+        let (ticket, _) = state.begin_paste();
         state.submit(PaneInput::Key(keys::paste("x").unwrap()));
         assert!(state.freeze_refusal().is_some());
         assert!(state.finish_paste(ticket, None));
