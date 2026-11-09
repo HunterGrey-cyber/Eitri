@@ -78,11 +78,18 @@ impl ThemeFeed {
     /// and the window stays on `ThemeTokens::fallback()`.
     pub fn new() -> Option<Self> {
         let tmp = std::env::temp_dir();
+        let base = match crate::instance_dir::feed_base("theme snippets") {
+            Ok(base) => base,
+            Err(e) => {
+                eprintln!("[theme] {e} -- colours stay on the built-in fallback");
+                return None;
+            }
+        };
         for (prefix, socket_name) in SWEPT_NAMES {
-            crate::instance_dir::sweep_stale_instance_dirs(&tmp, prefix, socket_name, "theme");
+            crate::instance_dir::sweep_stale_dirs_in_bases(&base, &tmp, prefix, socket_name, "theme");
         }
 
-        let dir = crate::instance_dir::instance_dir_path(&tmp, DIR_PREFIX);
+        let dir = crate::instance_dir::instance_dir_path(&base, DIR_PREFIX);
         // 0700: the socket accepts colours from anyone who can connect to it.
         if let Err(e) = crate::instance_dir::create_private_dir(&dir) {
             eprintln!(
@@ -368,6 +375,7 @@ mod tests {
     /// [`SWEPT_NAMES`] rather than one pair is what closes that.
     #[test]
     fn the_sweep_still_reclaims_a_directory_under_the_old_prefix() {
+        use std::os::unix::fs::PermissionsExt;
         // Own root, so this never touches a real window's directory and never races a sibling test.
         let root = std::env::temp_dir().join(format!("nv-th-sweeptest-{}", uuid::Uuid::new_v4().simple()));
         // pid 0 is rejected before any syscall by `pid_is_alive`, and `std::process::id()` never
@@ -377,6 +385,7 @@ mod tests {
         let legacy = root.join(format!("neovibe-theme-0-{}", uuid::Uuid::new_v4()));
         for dir in [&current, &legacy] {
             std::fs::create_dir_all(dir).expect("build the fixture");
+            std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700)).unwrap();
         }
 
         for (prefix, socket_name) in SWEPT_NAMES {

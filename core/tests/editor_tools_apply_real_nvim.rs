@@ -121,6 +121,7 @@ impl Test {
 
     /// Two project files, the first loaded in no window, with a language server that answers a rename in both.
     fn loaded() -> Test {
+        agent::state_dirs::redirect_state_to_a_test_root();
         static N: AtomicUsize = AtomicUsize::new(0);
         let dir = PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join(format!(
             "apply-{}-{}",

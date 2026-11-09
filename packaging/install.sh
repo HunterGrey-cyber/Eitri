@@ -2564,6 +2564,33 @@ version_name() {
 	if printf '%s\n' "$1" | grep -Eqx "$NV_SIDECAR_VERSION_ERE"; then VN=1; fi
 }
 
+# Read only an owned regular selection without other-write permission. A group-writable link
+# is refused too: the host can tighten an old regular selection, but never a symlink's target.
+# Sets NV_SELECTED_READABLE; NV_SELECTED_REFUSAL keeps the ownership or write-bit refusal for status.
+selected_readable() {
+	NV_SELECTED_READABLE=0
+	NV_SELECTED_REFUSAL=
+	_sr_ok=$(find -H "$1" -prune -type f -user "$(id -u)" ! -perm -0002 -print 2>/dev/null) || return 0
+	if [ -z "$_sr_ok" ]; then
+		_sr_foreign=$(find -H "$1" -prune -type f ! -user "$(id -u)" -print 2>/dev/null) || return 0
+		if [ -n "$_sr_foreign" ]; then
+			NV_SELECTED_REFUSAL="refused: not yours"
+		else
+			_sr_writable=$(find -H "$1" -prune -type f -perm -0002 -print 2>/dev/null) || return 0
+			if [ -n "$_sr_writable" ]; then NV_SELECTED_REFUSAL="refused: writable by others"; fi
+		fi
+		return 0
+	fi
+	if [ -L "$1" ]; then
+		_sr_ok=$(find -H "$1" -prune ! -perm -0020 -print 2>/dev/null) || return 0
+		if [ -z "$_sr_ok" ]; then
+			NV_SELECTED_REFUSAL="refused: writable by others"
+			return 0
+		fi
+	fi
+	NV_SELECTED_READABLE=1
+}
+
 # read_selected sets NV_SELECTED_VERSION to the version `selected` names, or nothing: absent, or not
 # exactly one line of `version=` and a version, is no selection, the same answer a tab gets. Nothing else
 # is read from that file. $() would drop every trailing newline, and the x keeps them; a NUL it would
@@ -2571,7 +2598,8 @@ version_name() {
 # none is that long.
 read_selected() {
 	NV_SELECTED_VERSION=
-	if [ ! -f "$NV_SIDECAR_SELECTED" ]; then return 0; fi
+	selected_readable "$NV_SIDECAR_SELECTED"
+	if [ "$NV_SELECTED_READABLE" != 1 ]; then return 0; fi
 	_rs=$(head -c 256 -- "$NV_SIDECAR_SELECTED" 2>/dev/null | tr '\000' '?'; printf x)
 	_rs=${_rs%x}
 	_rs=${_rs%"$NV_NL"}
@@ -2601,6 +2629,7 @@ write_selected() {
 	selected_replaceable
 	NV_SELECTED_TMP=$NV_SIDECAR_ROOT/.selected.tmp.$$
 	printf 'version=%s\n' "$1" >"$NV_SELECTED_TMP" || die "cannot write $NV_SELECTED_TMP"
+	chmod 600 "$NV_SELECTED_TMP" || die "cannot make $NV_SELECTED_TMP private"
 	mv -- "$NV_SELECTED_TMP" "$NV_SIDECAR_SELECTED" || die "cannot move $NV_SELECTED_TMP to $NV_SIDECAR_SELECTED"
 	NV_SELECTED_TMP=
 }
@@ -3008,7 +3037,11 @@ status_selected() {
 	SS_UPDATE=
 	SS_NOTE=
 	if [ -z "$NV_SELECTED_VERSION" ]; then
-		if [ -e "$NV_SIDECAR_SELECTED" ] || [ -L "$NV_SIDECAR_SELECTED" ]; then SS_NOTE="names no version, so unused"; fi
+		if [ -n "${NV_SELECTED_REFUSAL-}" ]; then
+			SS_NOTE=$NV_SELECTED_REFUSAL
+		elif [ -e "$NV_SIDECAR_SELECTED" ] || [ -L "$NV_SIDECAR_SELECTED" ]; then
+			SS_NOTE="names no version, so unused"
+		fi
 		return 0
 	fi
 	_ss_cmp=$(semver_cmp "$NV_SELECTED_VERSION" "$REL_SIDECAR_VERSION")

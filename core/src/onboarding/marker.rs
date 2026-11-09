@@ -217,7 +217,7 @@ mod tests {
     fn a_marker_that_cannot_be_parsed_counts_as_absent_with_a_note() {
         let dir = scratch("corrupt");
         let path = dir.join(FILE_NAME);
-        std::fs::write(&path, "{ not json").unwrap();
+        crate::test_scratch_dir::write_private(&path, "{ not json").unwrap();
         let (marker, note) = read(&path);
         assert_eq!(marker, Marker::default());
         assert!(note.unwrap().contains("counted as absent"));
@@ -228,7 +228,7 @@ mod tests {
     fn unknown_and_missing_keys_are_accepted() {
         let dir = scratch("keys");
         let path = dir.join(FILE_NAME);
-        std::fs::write(&path, r#"{"declined":"2026-11-01","extra":true}"#).unwrap();
+        crate::test_scratch_dir::write_private(&path, r#"{"declined":"2026-11-01","extra":true}"#).unwrap();
         assert_eq!(
             read(&path),
             (

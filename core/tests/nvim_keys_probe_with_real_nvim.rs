@@ -79,6 +79,7 @@ impl Rig {
     /// Runs nvim headless with the feed loaded and `commands` as `-c` commands, then quits; returns
     /// every report it sent, in order.
     fn run(&self, commands: &[&str]) -> Vec<NvimReport> {
+        agent::state_dirs::redirect_state_to_a_test_root();
         let mut feed = NvimKeysFeed::new().expect("the feed must bind");
         let listener = feed.take_listener().unwrap();
         let mut command = std::process::Command::new("timeout");

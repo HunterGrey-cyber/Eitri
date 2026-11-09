@@ -100,3 +100,8 @@ mod tests {
         assert!(!path.exists(), "{path:?} survived");
     }
 }
+
+/// Writes a private-state fixture with the production mode regardless of the test runner's umask.
+pub(crate) fn write_private(path: impl AsRef<Path>, bytes: impl AsRef<[u8]>) -> std::io::Result<()> {
+    crate::private_fs::write_private(path.as_ref(), bytes.as_ref())
+}

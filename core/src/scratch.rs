@@ -368,20 +368,25 @@ pub struct ScratchDir {
 impl ScratchDir {
     /// `None`, logged, when the directory cannot be made: `Ctrl+g` then answers with a notice.
     pub fn new() -> Option<Self> {
-        // The snippet accepts only absolute paths, and a relative `TMPDIR` would hand it relative ones.
-        let tmp = match std::path::absolute(std::env::temp_dir()) {
-            Ok(tmp) => tmp,
+        let base = match crate::instance_dir::feed_base("scratch snippets") {
+            Ok(base) => base,
             Err(e) => {
-                // An empty `TMPDIR` has no absolute form; say so rather than leaving `Ctrl+g` unexplained.
-                eprintln!(
-                    "[scratch] could not make the temporary directory {} absolute: {e} -- Ctrl+g is unavailable",
-                    std::env::temp_dir().display()
-                );
+                eprintln!("[scratch] {e} -- Ctrl+g is unavailable");
                 return None;
             }
         };
-        crate::instance_dir::sweep_stale_instance_dirs(&tmp, DIR_PREFIX, NO_SOCKET, "scratch");
-        Self::in_dir(&tmp)
+        // The snippet accepts only absolute paths, including when TMPDIR was relative.
+        let base = match std::path::absolute(base) {
+            Ok(base) => base,
+            Err(e) => {
+                eprintln!("[scratch] could not make the scratch base absolute: {e} -- Ctrl+g is unavailable");
+                return None;
+            }
+        };
+        if let Ok(tmp) = std::path::absolute(std::env::temp_dir()) {
+            crate::instance_dir::sweep_stale_dirs_in_bases(&base, &tmp, DIR_PREFIX, NO_SOCKET, "scratch");
+        }
+        Self::in_dir(&base)
     }
 
     pub fn in_dir(tmp: &Path) -> Option<Self> {

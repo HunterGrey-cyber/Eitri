@@ -63,6 +63,7 @@ fn start(case: &str) -> Nvim {
 
 /// [`start`] with the feed loaded as the embedded editor loads it, in a scratch directory with every link resolved.
 fn start_fed(case: &str) -> Nvim {
+    agent::state_dirs::redirect_state_to_a_test_root();
     let dir = std::env::temp_dir().join(format!("eto-read-{}-{case}", std::process::id()));
     let _ = std::fs::remove_dir_all(&dir);
     std::fs::create_dir_all(dir.join("project")).expect("project dir");
@@ -242,6 +243,7 @@ fn a_buffer_read_through_a_link_keeps_where_it_came_from() {
 #[test]
 #[ignore = "needs nvim on PATH"]
 fn a_buffer_with_no_record_is_not_told() {
+    agent::state_dirs::redirect_state_to_a_test_root();
     let mut nvim = start("no-record");
     let feed = EditorContextFeed::new().expect("the feed must bind");
     let file = nvim.file("a.rs", "one\n");

@@ -97,6 +97,7 @@ impl Drop for Replay {
 
 impl Replay {
     fn start(case: &str) -> Replay {
+        agent::state_dirs::redirect_state_to_a_test_root();
         // Under the system temp dir and short: the socket inside it is capped at 103 bytes, which a target
         // directory's absolute path can exceed on its own.
         let dir = std::env::temp_dir().join(format!("irp-{}-{case}", std::process::id()));

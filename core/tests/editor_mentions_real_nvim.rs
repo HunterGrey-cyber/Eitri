@@ -41,6 +41,7 @@ impl Drop for Nvim {
 }
 
 fn start(case: &str) -> Nvim {
+    agent::state_dirs::redirect_state_to_a_test_root();
     let dir = std::env::temp_dir().join(format!("eto-mention-{}-{case}", std::process::id()));
     let _ = std::fs::remove_dir_all(&dir);
     std::fs::create_dir_all(dir.join("project")).expect("project dir");

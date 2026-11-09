@@ -17,6 +17,7 @@ use eitri_core::editor_context::feed::{EditorContextFeed, EditorContextReader};
 use eitri_core::editor_context::EditorContext;
 
 fn selection_facts(body: &str, commands: &[&str]) -> eitri_core::editor_context::feed::PushFacts {
+    agent::state_dirs::redirect_state_to_a_test_root();
     let dir = std::env::temp_dir().join(format!("nv-w1-cols-{}", uuid::Uuid::new_v4().simple()));
     std::fs::create_dir_all(&dir).unwrap();
     let file = dir.join("t.txt");
@@ -127,6 +128,7 @@ impl Drop for LinkedOut {
 /// The update nvim sent last, after `commands`, on a buffer opened at `case.name` through its link.
 #[cfg(target_os = "linux")]
 fn drive_linked(case: &LinkedOut, commands: &[String]) -> eitri_core::editor_context::feed::FeedUpdate {
+    agent::state_dirs::redirect_state_to_a_test_root();
     let mut feed = EditorContextFeed::new().expect("the feed must bind");
     let mut reader = EditorContextReader::new(feed.take_listener().unwrap());
     let commands: Vec<&str> = commands.iter().map(String::as_str).collect();
@@ -255,6 +257,7 @@ fn drive_nvim_update(
 #[test]
 #[ignore = "needs a real nvim on PATH; spends no tokens and needs no display"]
 fn a_real_nvim_reports_each_selection_state_the_way_this_crate_parses_it() {
+    agent::state_dirs::redirect_state_to_a_test_root();
     let dir = std::env::temp_dir().join(format!("nv-w1-test-{}", uuid::Uuid::new_v4().simple()));
     std::fs::create_dir_all(&dir).unwrap();
     let file = dir.join("t.txt");
@@ -322,6 +325,7 @@ fn a_real_nvim_reports_each_selection_state_the_way_this_crate_parses_it() {
 #[test]
 #[ignore = "needs a real nvim on PATH; spends no tokens and needs no display"]
 fn a_large_unicode_selection_replaces_old_context_with_bounded_text_and_its_true_range() {
+    agent::state_dirs::redirect_state_to_a_test_root();
     let dir = std::env::temp_dir().join(format!("nv-w1-large-{}", uuid::Uuid::new_v4().simple()));
     std::fs::create_dir_all(&dir).unwrap();
     let previous_file = dir.join("previous.txt");
@@ -358,6 +362,7 @@ fn a_large_unicode_selection_replaces_old_context_with_bounded_text_and_its_true
 #[test]
 #[ignore = "needs a real nvim on PATH; spends no tokens and needs no display"]
 fn the_sender_marks_only_selections_longer_than_2000_unicode_characters() {
+    agent::state_dirs::redirect_state_to_a_test_root();
     let dir = std::env::temp_dir().join(format!("nv-w1-limit-{}", uuid::Uuid::new_v4().simple()));
     std::fs::create_dir_all(&dir).unwrap();
     let file = dir.join("boundary.txt");
@@ -384,6 +389,7 @@ fn the_sender_marks_only_selections_longer_than_2000_unicode_characters() {
 #[test]
 #[ignore = "needs a real nvim on PATH; spends no tokens and needs no display"]
 fn a_selection_past_the_line_cap_marks_truncation_even_under_the_character_limit() {
+    agent::state_dirs::redirect_state_to_a_test_root();
     let dir = std::env::temp_dir().join(format!("nv-w1-linecap-{}", uuid::Uuid::new_v4().simple()));
     std::fs::create_dir_all(&dir).unwrap();
     let file = dir.join("short_lines.txt");
@@ -434,6 +440,7 @@ fn a_selection_past_the_line_cap_marks_truncation_even_under_the_character_limit
 #[test]
 #[ignore = "needs a real nvim on PATH; spends no tokens and needs no display"]
 fn a_capped_block_selection_sends_only_the_selected_columns() {
+    agent::state_dirs::redirect_state_to_a_test_root();
     let dir = std::env::temp_dir().join(format!("nv-w1-block-{}", uuid::Uuid::new_v4().simple()));
     std::fs::create_dir_all(&dir).unwrap();
     let file = dir.join("wide_lines.txt");
@@ -487,6 +494,7 @@ fn a_capped_block_selection_sends_only_the_selected_columns() {
 #[test]
 #[ignore = "needs a real nvim on PATH; spends no tokens and needs no display"]
 fn a_capped_block_selection_keeps_its_display_columns_across_a_tab() {
+    agent::state_dirs::redirect_state_to_a_test_root();
     let dir = std::env::temp_dir().join(format!("nv-w1-blocktab-{}", uuid::Uuid::new_v4().simple()));
     std::fs::create_dir_all(&dir).unwrap();
     let file = dir.join("tab_at_the_cap.txt");
@@ -574,6 +582,7 @@ mod embed_client;
 #[test]
 #[ignore = "needs a real nvim on PATH; spends no tokens and needs no display"]
 fn injected_editor_context_reports_and_tears_down() {
+    agent::state_dirs::redirect_state_to_a_test_root();
     use embed_client::{opts_map, Embed};
     use rmpv::Value;
 
@@ -634,6 +643,7 @@ struct Recording {
 
 impl Recording {
     fn start(case: &str, extra_args: &[&str]) -> Recording {
+        agent::state_dirs::redirect_state_to_a_test_root();
         let dir =
             std::path::Path::new(env!("CARGO_TARGET_TMPDIR")).join(format!("ec-rec-{}-{case}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
@@ -763,6 +773,7 @@ fn a_reloaded_buffer_records_what_was_read() {
 #[test]
 #[ignore = "needs a real nvim on PATH; spends no tokens and needs no display"]
 fn a_file_argument_is_recorded_from_the_start() {
+    agent::state_dirs::redirect_state_to_a_test_root();
     let dir = std::path::Path::new(env!("CARGO_TARGET_TMPDIR")).join(format!("ec-rec-{}-arg", std::process::id()));
     let _ = std::fs::remove_dir_all(&dir);
     std::fs::create_dir_all(&dir).unwrap();
@@ -793,6 +804,7 @@ fn a_file_argument_is_recorded_from_the_start() {
 #[test]
 #[ignore = "needs a real nvim on PATH; spends no tokens and needs no display"]
 fn a_load_does_not_pull_in_vim_diagnostic() {
+    agent::state_dirs::redirect_state_to_a_test_root();
     use embed_client::Embed;
     use rmpv::Value;
 
@@ -817,6 +829,7 @@ fn a_load_does_not_pull_in_vim_diagnostic() {
 #[test]
 #[ignore = "needs a real nvim on PATH; spends no tokens and needs no display"]
 fn a_teardown_forgets_the_records() {
+    agent::state_dirs::redirect_state_to_a_test_root();
     use embed_client::{opts_map, Embed};
     use rmpv::Value;
 
@@ -859,6 +872,7 @@ fn a_teardown_forgets_the_records() {
 #[test]
 #[ignore = "needs a real nvim on PATH; spends no tokens and needs no display"]
 fn an_idle_snippet_leaves_no_timer_running() {
+    agent::state_dirs::redirect_state_to_a_test_root();
     let dir = std::env::temp_dir().join(format!("nv-w1-idle-{}", uuid::Uuid::new_v4().simple()));
     std::fs::create_dir_all(&dir).unwrap();
     let file = dir.join("t.txt");
@@ -887,6 +901,7 @@ fn an_idle_snippet_leaves_no_timer_running() {
 #[test]
 #[ignore = "needs a real nvim on PATH; spends no tokens and needs no display"]
 fn a_selection_of_long_lines_fetches_no_more_than_it_sends() {
+    agent::state_dirs::redirect_state_to_a_test_root();
     let dir = std::env::temp_dir().join(format!("nv-w1-long-{}", uuid::Uuid::new_v4().simple()));
     std::fs::create_dir_all(&dir).unwrap();
     let file = dir.join("long.txt");

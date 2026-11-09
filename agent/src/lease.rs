@@ -592,7 +592,7 @@ mod tests {
             "{}.lock",
             lease_key_hash("claude", "/tmp/project", "prov-free")
         ));
-        std::fs::File::create(&never_locked).unwrap();
+        crate::test_tmp::write_private(&never_locked, b"").unwrap();
         assert!(!SessionLease::is_held("claude", "/tmp/project", "prov-free").unwrap());
         let _taken = SessionLease::try_acquire("claude", "/tmp/project", "prov-free")
             .expect("a probe must leave the lease free to take");

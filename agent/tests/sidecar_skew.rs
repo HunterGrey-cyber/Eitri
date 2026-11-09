@@ -868,7 +868,7 @@ impl Installed {
     }
 
     fn select(&self, contents: &[u8]) {
-        std::fs::write(self.sidecar_root.join("selected"), contents).unwrap();
+        agent::private_fs::write_private(&self.sidecar_root.join("selected"), contents).unwrap();
     }
 
     /// Everything the helper printed, `EITRI_SIDECAR_BINARY` set to `named` if there is one.

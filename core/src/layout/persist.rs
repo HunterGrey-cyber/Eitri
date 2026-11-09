@@ -2159,7 +2159,7 @@ mod tests {
         let dir = a_dir("layout-v1-untouched");
         let v1 = dir.join(file_name(&root()));
         let (_, text, _) = v1_cases().remove(4);
-        std::fs::write(&v1, &text).unwrap();
+        crate::test_scratch_dir::write_private(&v1, &text).unwrap();
         let mtime = std::fs::metadata(&v1).unwrap().modified().unwrap();
         std::thread::sleep(std::time::Duration::from_millis(20));
 
@@ -2182,7 +2182,7 @@ mod tests {
         assert!(matches!(load(&dir, &root(), &[]), Loaded::Missing), "neither file");
 
         let (_, v1, _) = v1_cases().remove(1);
-        std::fs::write(dir.join(file_name(&root())), &v1).unwrap();
+        crate::test_scratch_dir::write_private(dir.join(file_name(&root())), &v1).unwrap();
         match load(&dir, &root(), &[]) {
             Loaded::Migrated(opened) => {
                 assert_eq!(opened.notes, ["migrated from the version 1 layout file"]);
@@ -2207,7 +2207,7 @@ mod tests {
         }
 
         let v2 = dir.join(file_name_v2(&root()));
-        std::fs::write(&v2, "{ a typo").unwrap();
+        crate::test_scratch_dir::write_private(&v2, "{ a typo").unwrap();
         match load(&dir, &root(), &[]) {
             Loaded::Migrated(opened) => {
                 assert_eq!(opened.notes.len(), 2, "{:?}", opened.notes);
@@ -2223,7 +2223,7 @@ mod tests {
             other => panic!("{other:?}"),
         }
 
-        std::fs::write(dir.join(file_name(&root())), "{ another typo").unwrap();
+        crate::test_scratch_dir::write_private(dir.join(file_name(&root())), "{ another typo").unwrap();
         match load(&dir, &root(), &[]) {
             Loaded::Unusable(why) => {
                 assert!(why.contains(&file_name_v2(&root())), "{why}");
@@ -2772,11 +2772,11 @@ mod tests {
         use std::os::unix::fs::PermissionsExt;
         let dir = a_dir("layout-v2-asides");
         let path = dir.join(file_name_v2(&root()));
-        std::fs::write(&path, "partly").unwrap();
+        crate::test_scratch_dir::write_private(&path, "partly").unwrap();
         let partial = copy_aside_v2(&dir, &root(), "partly").unwrap();
         assert_eq!(partial, dir.join(format!("{}.partial", file_name_v2(&root()))));
         assert_eq!(std::fs::metadata(&partial).unwrap().permissions().mode() & 0o777, 0o600);
-        std::fs::write(&path, "{ wholly unusable").unwrap();
+        crate::test_scratch_dir::write_private(&path, "{ wholly unusable").unwrap();
         let unusable = set_aside_v2(&dir, &root()).unwrap();
         assert_eq!(unusable, dir.join(format!("{}.unusable", file_name_v2(&root()))));
         assert_eq!(std::fs::read_to_string(&partial).unwrap(), "partly");
@@ -2786,7 +2786,7 @@ mod tests {
         copy_aside_v2(&dir, &root(), "partly, later").unwrap();
         assert_eq!(std::fs::read_to_string(&partial).unwrap(), "partly, later");
         assert_eq!(std::fs::read_to_string(&unusable).unwrap(), "{ wholly unusable");
-        std::fs::write(&path, "{ unusable again").unwrap();
+        crate::test_scratch_dir::write_private(&path, "{ unusable again").unwrap();
         set_aside_v2(&dir, &root()).unwrap();
         assert_eq!(std::fs::read_to_string(&unusable).unwrap(), "{ unusable again");
         assert_eq!(std::fs::read_to_string(&partial).unwrap(), "partly, later");
@@ -2813,7 +2813,7 @@ mod tests {
         ));
         value["workspaces"][1]["overlays"] = json!([]);
         let path = dir.join(file_name_v2(&root()));
-        std::fs::write(&path, value.to_string()).unwrap();
+        crate::test_scratch_dir::write_private(&path, value.to_string()).unwrap();
         let V2State::Usable(text, kept) = v2_state(&dir, &root(), &[]) else {
             panic!("usable")
         };
@@ -2822,9 +2822,9 @@ mod tests {
         assert_eq!(text, value.to_string());
 
         value["workspaces"][0]["tiled"]["layout"] = json!("scroll");
-        std::fs::write(&path, value.to_string()).unwrap();
+        crate::test_scratch_dir::write_private(&path, value.to_string()).unwrap();
         assert!(matches!(v2_state(&dir, &root(), &[]), V2State::Partly(text, _) if text == value.to_string()));
-        std::fs::write(&path, "{").unwrap();
+        crate::test_scratch_dir::write_private(&path, "{").unwrap();
         assert!(matches!(v2_state(&dir, &root(), &[]), V2State::Unusable(_)));
     }
 
@@ -2911,7 +2911,7 @@ mod tests {
             dir.join(format!("{}.1.tmp", file_name_v2(&root()))),
         ];
         for other in &others {
-            std::fs::write(other, "{ half of another window's").unwrap();
+            crate::test_scratch_dir::write_private(other, "{ half of another window's").unwrap();
         }
         let (layout, lua) = left_as();
         save(&dir, &root(), &Workspaces::single(), &layout).unwrap();
@@ -2929,7 +2929,7 @@ mod tests {
         let dir = a_dir("layout-persist-failed");
         let path = dir.join(file_name_v2(&root()));
         std::fs::create_dir(&path).unwrap();
-        std::fs::write(path.join("in the way"), "").unwrap();
+        crate::test_scratch_dir::write_private(path.join("in the way"), "").unwrap();
         let (layout, _) = left_as();
         assert!(save(&dir, &root(), &Workspaces::single(), &layout).is_err());
         assert_eq!(names_in(&dir), [file_name_v2(&root())], "no .tmp is left behind");
@@ -2939,7 +2939,7 @@ mod tests {
     fn a_missing_file_is_missing_and_a_corrupt_one_is_unusable() {
         let dir = a_dir("layout-persist-missing");
         assert!(matches!(load(&dir, &root(), &[]), Loaded::Missing));
-        std::fs::write(dir.join(file_name_v2(&root())), "\u{0}garbage").unwrap();
+        crate::test_scratch_dir::write_private(dir.join(file_name_v2(&root())), "\u{0}garbage").unwrap();
         match load(&dir, &root(), &[]) {
             Loaded::Unusable(why) => assert!(why.contains("not a layout file"), "{why}"),
             other => panic!("{other:?}"),
@@ -2952,7 +2952,7 @@ mod tests {
     fn an_unusable_file_is_set_aside_whole() {
         let dir = a_dir("layout-persist-aside");
         let text = "{ \"version\": 2, \"a typo\" ";
-        std::fs::write(dir.join(file_name_v2(&root())), text).unwrap();
+        crate::test_scratch_dir::write_private(dir.join(file_name_v2(&root())), text).unwrap();
         assert!(matches!(load(&dir, &root(), &[]), Loaded::Unusable(_)));
         let aside = set_aside_v2(&dir, &root()).unwrap();
         assert_eq!(aside, dir.join(format!("{}.unusable", file_name_v2(&root()))));
@@ -3947,7 +3947,7 @@ mod tests {
         ));
         assert!(matches!(load(&dir, &root(), &lua), Loaded::Missing));
         // A version 1 file is window 1's past only.
-        std::fs::write(dir.join(file_name(&root())), "{}").unwrap();
+        crate::test_scratch_dir::write_private(dir.join(file_name(&root())), "{}").unwrap();
         assert!(matches!(
             load_as(&dir, &root(), Role::Unpaired, &lua, &[]),
             Loaded::Missing

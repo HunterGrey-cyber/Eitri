@@ -422,6 +422,7 @@ mod tests {
     /// them.
     #[test]
     fn an_idle_pump_is_not_woken_and_a_message_still_arrives() {
+        agent::state_dirs::redirect_state_to_a_test_root();
         let _turn = crate::layout_state::default_context_turn();
         let context = glib::MainContext::default();
         let _owner = context
@@ -522,6 +523,7 @@ mod tests {
     /// goes quiet again.
     #[test]
     fn a_reader_added_by_a_handler_is_read_and_the_pump_goes_quiet() {
+        agent::state_dirs::redirect_state_to_a_test_root();
         let _turn = crate::layout_state::default_context_turn();
         let context = glib::MainContext::default();
         let _owner = context
@@ -571,6 +573,7 @@ mod tests {
     /// dropped the call would leave its panel showing an old context until something else woke it.
     #[test]
     fn a_new_context_wakes_the_panel_in_both_windows() {
+        agent::state_dirs::redirect_state_to_a_test_root();
         let _turn = crate::layout_state::default_context_turn();
         let context = glib::MainContext::default();
         let _owner = context.acquire().expect("glib's default main context");
@@ -615,6 +618,7 @@ mod tests {
     #[cfg(target_os = "linux")]
     #[test]
     fn companion_feed_counts_as_presence() {
+        agent::state_dirs::redirect_state_to_a_test_root();
         let _turn = crate::layout_state::default_context_turn();
         let context = glib::MainContext::default();
         let _owner = context.acquire().expect("glib's default main context");
@@ -644,6 +648,7 @@ mod tests {
     /// editor's, and the hookup hears the change once.
     #[test]
     fn a_context_left_behind_by_a_followed_connect_is_nothing() {
+        agent::state_dirs::redirect_state_to_a_test_root();
         let _turn = crate::layout_state::default_context_turn();
         let context = glib::MainContext::default();
         let _owner = context.acquire().expect("glib's default main context");

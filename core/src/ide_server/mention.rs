@@ -344,7 +344,18 @@ impl Default for LiveMentions {
 
 impl MentionPort for LiveMentions {
     fn open(&mut self) -> Option<PathBuf> {
-        self.open_in(&std::env::temp_dir())
+        let base = match crate::instance_dir::feed_base("editor mention socket") {
+            Ok(base) => base,
+            Err(e) => {
+                eprintln!("[ide-mention] {e} -- :EitriMention is unavailable");
+                return None;
+            }
+        };
+        let tmp = std::env::temp_dir();
+        if base != tmp {
+            crate::instance_dir::sweep_stale_instance_dirs(&tmp, DIR_PREFIX, SOCKET_NAME, "ide-mention");
+        }
+        self.open_in(&base)
     }
 
     /// The listener is left out while nothing would accept it: with every pending slot taken or `accept` resting, a
@@ -473,6 +484,7 @@ mod tests {
     fn the_directory_is_0700_and_the_socket_0600() {
         let (_mentions, path) = opened();
         let dir = path.parent().unwrap();
+        assert_eq!(dir.parent(), agent::state_dirs::runtime_dir().as_deref());
         assert!(
             dir.file_name().unwrap().to_string_lossy().starts_with(DIR_PREFIX),
             "{dir:?}"
@@ -486,7 +498,7 @@ mod tests {
     fn opening_sweeps_a_dead_instances_directory() {
         // Pid 0 is never alive, and nothing in the directory answers.
         let stale = std::env::temp_dir().join(format!("{DIR_PREFIX}0-{}", uuid::Uuid::new_v4().simple()));
-        std::fs::create_dir(&stale).unwrap();
+        crate::instance_dir::create_private_dir(&stale).unwrap();
         let (_mentions, _path) = opened();
         let gone = !stale.exists();
         let _ = std::fs::remove_dir_all(&stale);

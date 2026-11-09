@@ -1639,7 +1639,7 @@ mod tests {
                  "transcript":[{{"seq":2,"text":"hello"}}],"tool_calls":[]}}"#,
             store::HISTORY_FORMAT_VERSION
         );
-        std::fs::write(&path, text).unwrap();
+        crate::test_tmp::write_private(&path, text).unwrap();
         let loaded = store::load(&conversation_id, "sess-old").expect("an older file loads");
         assert!(loaded.turn_starts.is_empty() && loaded.notices.is_empty() && loaded.questions.is_empty());
 

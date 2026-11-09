@@ -331,7 +331,7 @@ mod tests {
         let file = path(&s.dir(), &s.root());
         let mut json: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(&file).unwrap()).unwrap();
         json["payload"]["options"].as_object_mut().unwrap().remove("cmdheight");
-        std::fs::write(file, serde_json::to_string(&json).unwrap()).unwrap();
+        crate::test_scratch_dir::write_private(file, serde_json::to_string(&json).unwrap()).unwrap();
         assert_eq!(load(&s.dir(), &s.root()), Loaded::Remembered(p));
     }
     #[test]
@@ -370,7 +370,7 @@ mod tests {
             (protocol.to_string(), "payload version 2"),
             ("x".repeat(MAX_FILE_BYTES as usize + 1), "over the"),
         ] {
-            std::fs::write(&file, text).unwrap();
+            crate::test_scratch_dir::write_private(&file, text).unwrap();
             let Loaded::Unusable(why) = load(&s.dir(), &s.root()) else {
                 panic!("accepted unusable file")
             };

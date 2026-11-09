@@ -17,6 +17,7 @@ struct Rig {
 
 impl Rig {
     fn new(label: &str) -> Rig {
+        agent::state_dirs::redirect_state_to_a_test_root();
         let root = Path::new(env!("CARGO_TARGET_TMPDIR")).join(format!("editor-watch-{label}-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&root);
         std::fs::create_dir_all(root.join("project/src")).unwrap();

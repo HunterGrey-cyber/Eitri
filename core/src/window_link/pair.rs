@@ -400,7 +400,7 @@ mod tests {
         assert_eq!(std::fs::read(&path).unwrap(), root().as_os_str().as_bytes());
         assert!(mtime(&path) > long_ago);
 
-        std::fs::write(&path, "x".repeat(root().as_os_str().len() + 40)).unwrap();
+        crate::test_scratch_dir::write_private(&path, "x".repeat(root().as_os_str().len() + 40)).unwrap();
         let not_utf8 = PathBuf::from(std::ffi::OsStr::from_bytes(b"/home/\xff/project"));
         PairLock::stamp_root(&lock.share().unwrap(), &not_utf8).unwrap();
         assert_eq!(
@@ -547,7 +547,7 @@ mod tests {
             .exists());
         let mut value: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
         value["later"] = serde_json::json!(1);
-        std::fs::write(&path, value.to_string()).unwrap();
+        crate::test_scratch_dir::write_private(&path, value.to_string()).unwrap();
         assert_eq!(read_pair(&dir, &root()), ReadPair::Read(file));
     }
 
@@ -555,9 +555,9 @@ mod tests {
     fn garbage_or_another_version_is_unusable() {
         let dir = ScratchDir::new("nv-pair", "bad");
         let path = dir.join(pair_file_name(&root()));
-        std::fs::write(&path, "{").unwrap();
+        crate::test_scratch_dir::write_private(&path, "{").unwrap();
         assert!(matches!(read_pair(&dir, &root()), ReadPair::Unusable(_)));
-        std::fs::write(&path, r#"{"version":2}"#).unwrap();
+        crate::test_scratch_dir::write_private(&path, r#"{"version":2}"#).unwrap();
         assert!(matches!(read_pair(&dir, &root()), ReadPair::Unusable(why) if why.contains("version 2")));
     }
 
@@ -565,7 +565,7 @@ mod tests {
     fn mark_taken_renames_beside() {
         let dir = ScratchDir::new("nv-pair", "taken");
         let path = dir.join("x-w2.json");
-        std::fs::write(&path, "{}").unwrap();
+        crate::test_scratch_dir::write_private(&path, "{}").unwrap();
         let taken = mark_taken(&path).unwrap();
         assert_eq!(taken, dir.join("x-w2.json.taken"));
         assert!(!path.exists() && taken.exists());

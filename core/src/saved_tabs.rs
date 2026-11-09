@@ -1640,7 +1640,7 @@ mod tests {
     fn a_write_that_failed_is_written_again_with_nothing_changing() {
         let dir = ScratchDir::new("nv-saved-tabs", "retry");
         let state = dir.join("state");
-        std::fs::write(&state, "").unwrap();
+        crate::test_scratch_dir::write_private(&state, "").unwrap();
         let first = SavedTabs::from_parts(vec![tab("s-one", None, SessionModeChoice::Auto)], 0, Vec::new(), None);
         let run = |retry: std::time::Duration, state: PathBuf, queued: SavedTabs| {
             let shared = std::sync::Arc::new(WriterShared::default());
@@ -1686,7 +1686,7 @@ mod tests {
 
         // Far from its pause: only the close can write it.
         std::fs::remove_dir_all(&state).unwrap();
-        std::fs::write(&state, "").unwrap();
+        crate::test_scratch_dir::write_private(&state, "").unwrap();
         let (shared, thread) = run(std::time::Duration::from_secs(600), state.clone(), first.clone());
         settled(&shared);
         std::fs::remove_file(&state).unwrap();
@@ -1697,7 +1697,7 @@ mod tests {
 
         // A close on a disk still full tries once and ends: the window is waiting on this thread.
         std::fs::remove_dir_all(&state).unwrap();
-        std::fs::write(&state, "").unwrap();
+        crate::test_scratch_dir::write_private(&state, "").unwrap();
         let (shared, thread) = run(std::time::Duration::from_secs(600), state.clone(), first);
         settled(&shared);
         shared.queue.lock().unwrap().finished = true;
@@ -1992,7 +1992,7 @@ mod tests {
     fn an_unusable_file_is_set_aside_whole_at_startup() {
         let dir = ScratchDir::new("nv-saved-tabs", "unusable");
         let path = dir.join(file_name(&root()));
-        std::fs::write(&path, "{ not json").unwrap();
+        crate::test_scratch_dir::write_private(&path, "{ not json").unwrap();
         let (saved, notes) = startup(Some(&dir), &root());
         assert_eq!(saved, None);
         assert!(notes.iter().any(|n| n.contains("unusable")), "{notes:?}");
@@ -2001,7 +2001,7 @@ mod tests {
         assert_eq!(std::fs::read_to_string(aside).unwrap(), "{ not json");
 
         // A newer build's file is set aside the same way.
-        std::fs::write(
+        crate::test_scratch_dir::write_private(
             &path,
             encode(&two(), &root()).replace("\"version\": 1", "\"version\": 7"),
         )
@@ -2290,7 +2290,7 @@ mod tests {
         let dir = ScratchDir::new("nv-saved-tabs", "failing");
         // A file where the directory should be: every write under it fails.
         let blocker = dir.join("blocked");
-        std::fs::write(&blocker, "").unwrap();
+        crate::test_scratch_dir::write_private(&blocker, "").unwrap();
         let mut memory = TabMemory::new(Some(blocker.join("tabs")), root());
         assert!(matches!(memory.observe(Some(two())), Some(Err(_))));
         assert!(
@@ -2317,7 +2317,7 @@ mod tests {
         let dir = ScratchDir::new("nv-saved-tabs", "aside-blocked");
         let mut memory = memory(&dir);
         let path = dir.join(file_name(&root()));
-        std::fs::write(&path, "typo").unwrap();
+        crate::test_scratch_dir::write_private(&path, "typo").unwrap();
         // The place it would go is a directory that is not empty, so the rename fails.
         let aside = dir.join(format!("{}.unusable", file_name(&root())));
         std::fs::create_dir_all(aside.join("occupied")).unwrap();
@@ -2338,7 +2338,7 @@ mod tests {
         let dir = ScratchDir::new("nv-saved-tabs", "went-bad");
         let mut memory = memory(&dir);
         std::fs::create_dir_all(&*dir).unwrap();
-        std::fs::write(dir.join(file_name(&root())), "typo").unwrap();
+        crate::test_scratch_dir::write_private(dir.join(file_name(&root())), "typo").unwrap();
         let written = memory.observe(Some(two())).unwrap().unwrap();
         let aside = written.set_aside.expect("the bad file was set aside");
         assert_eq!(std::fs::read_to_string(aside).unwrap(), "typo");
@@ -2853,7 +2853,7 @@ mod tests {
     fn an_unusable_file_of_another_window_is_not_offered_and_not_moved() {
         let dir = ScratchDir::new("nv-tabs-roles", "unusable");
         let second = dir.join(file_name_as(&root(), Role::Second));
-        std::fs::write(&second, "{").unwrap();
+        crate::test_scratch_dir::write_private(&second, "{").unwrap();
         let (offer, notes, takeovers) = startup_with(Some(&dir), &root(), Role::Main, &[Role::Second]);
         assert!(offer.is_none() && takeovers.is_empty());
         assert!(notes.iter().any(|n| n.contains("unusable")), "{notes:?}");

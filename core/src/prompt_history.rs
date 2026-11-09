@@ -669,7 +669,7 @@ mod tests {
     fn a_launch_leaves_an_unusable_file_another_window_is_writing() {
         let dir = scratch("startup-busy");
         let file = path(&dir, &root());
-        std::fs::write(&file, "not json\n").unwrap();
+        crate::test_scratch_dir::write_private(&file, "not json\n").unwrap();
         let held = held_by_another_window(&file);
         let (entries, notes) = startup(Some(&dir), &root());
         assert!(entries.is_empty());
@@ -956,7 +956,7 @@ mod tests {
     #[test]
     fn an_unreadable_file_is_set_aside_and_read_as_empty() {
         let dir = scratch("unusable");
-        std::fs::write(path(&dir, &root()), "{\"text\":\"ok\",\"at\":1}\nnot json\n").unwrap();
+        crate::test_scratch_dir::write_private(path(&dir, &root()), "{\"text\":\"ok\",\"at\":1}\nnot json\n").unwrap();
         assert!(matches!(load(&dir, &root()), Loaded::Unusable(_)));
         let (entries, notes) = startup(Some(&dir), &root());
         assert!(entries.is_empty());

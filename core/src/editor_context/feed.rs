@@ -79,11 +79,18 @@ impl EditorContextFeed {
     /// gets no extra env or args, and turns are sent with no editor context.
     pub fn new() -> Option<Self> {
         let tmp = std::env::temp_dir();
+        let base = match crate::instance_dir::feed_base("editor-context snippets") {
+            Ok(base) => base,
+            Err(e) => {
+                eprintln!("[editor-context] {e} -- turns will carry no editor context");
+                return None;
+            }
+        };
         for (prefix, socket_name) in SWEPT_NAMES {
-            crate::instance_dir::sweep_stale_instance_dirs(&tmp, prefix, socket_name, "editor-context");
+            crate::instance_dir::sweep_stale_dirs_in_bases(&base, &tmp, prefix, socket_name, "editor-context");
         }
 
-        let dir = crate::instance_dir::instance_dir_path(&tmp, DIR_PREFIX);
+        let dir = crate::instance_dir::instance_dir_path(&base, DIR_PREFIX);
         // 0700: whatever can connect to this socket can tell the agent what the user is looking at.
         if let Err(e) = crate::instance_dir::create_private_dir(&dir) {
             eprintln!(

@@ -46,6 +46,7 @@ fn usable(name: &str, socket: &Path) -> PathBuf {
 
 #[test]
 fn every_instance_directory_is_exactly_private_under_umask_0277() {
+    agent::state_dirs::redirect_state_to_a_test_root();
     let _umask = Umask::set(0o277);
     let tmp = std::env::temp_dir();
 

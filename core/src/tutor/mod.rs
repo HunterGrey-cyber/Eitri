@@ -124,7 +124,7 @@ impl TutorDir {
     /// Under `$XDG_RUNTIME_DIR` or `TMPDIR` ([`TutorDir::in_base`]), after sweeping the directories of windows
     /// that are gone. `None`, logged, when it cannot be made: the window then has no `:EitriTutor`.
     pub fn new() -> Option<TutorDir> {
-        let runtime = std::env::var_os("XDG_RUNTIME_DIR").map(PathBuf::from);
+        let runtime = agent::state_dirs::runtime_dir();
         // The snippet takes only an absolute path, and a relative `TMPDIR` would hand it a relative one.
         let tmp = match std::path::absolute(std::env::temp_dir()) {
             Ok(tmp) => tmp,
@@ -151,17 +151,13 @@ impl TutorDir {
     /// nothing ages files out of it), else `tmp` when nobody else can rename entries in it
     /// (`agent::private_fs::require_safe_parent`), else an error.
     pub fn base(runtime_dir: Option<&Path>, tmp: &Path) -> io::Result<PathBuf> {
-        if let Some(runtime) = runtime_dir.filter(|d| d.is_absolute() && agent::private_fs::is_private_dir(d)) {
-            return Ok(runtime.to_path_buf());
-        }
-        agent::private_fs::require_safe_parent(tmp, "the tutorial's lessons")?;
-        Ok(tmp.to_path_buf())
+        crate::instance_dir::private_base(runtime_dir, tmp, "the tutorial's lessons")
     }
 
     /// Sweeps the stale lessons' directories in [`TutorDir::base`], then makes this window's there.
     pub fn in_base(runtime_dir: Option<&Path>, tmp: &Path) -> io::Result<TutorDir> {
         let base = TutorDir::base(runtime_dir, tmp)?;
-        crate::instance_dir::sweep_stale_instance_dirs(&base, DIR_PREFIX, NO_SOCKET, "tutor");
+        crate::instance_dir::sweep_stale_dirs_in_bases(&base, tmp, DIR_PREFIX, NO_SOCKET, "tutor");
         TutorDir::in_dir(&base)
     }
 

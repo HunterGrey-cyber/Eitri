@@ -83,14 +83,27 @@ local LOG_KEEP = 400
 local function keep_whole(stderr)
   pcall(function()
     local dir = vim.fn.stdpath("log")
+    local uv = vim.uv
     vim.fn.mkdir(dir, "p", 448) -- 0700: the log holds what windows wrote
+    local stat = uv.fs_lstat(dir)
+    if not stat or stat.type ~= "directory" or stat.uid ~= uv.getuid() or stat.mode % 64 ~= 0 then return end
     local path = dir .. "/eitri.log"
+    local old = uv.fs_lstat(path)
+    if old and (old.type ~= "file" or old.uid ~= uv.getuid()) then return end
     local lines = vim.fn.filereadable(path) == 1 and vim.fn.readfile(path, "", -LOG_KEEP) or {}
     local stamp = os.date("%Y-%m-%d %H:%M:%S")
     for _, line in ipairs(stderr) do
       if line ~= "" then table.insert(lines, stamp .. " " .. line) end
     end
-    vim.fn.writefile(vim.list_slice(lines, math.max(#lines - LOG_KEEP + 1, 1)), path)
+    local kept = vim.list_slice(lines, math.max(#lines - LOG_KEEP + 1, 1))
+    local body = table.concat(kept, "\n")
+    if #kept > 0 then body = body .. "\n" end
+    local tmp = path .. "." .. uv.os_getpid() .. "." .. uv.hrtime() .. ".tmp"
+    local fd = uv.fs_open(tmp, "wx", 384) -- 0600, before any diagnostic text is written
+    if not fd then return end
+    local written = uv.fs_write(fd, body, 0)
+    local closed = uv.fs_close(fd)
+    if written ~= #body or not closed or not uv.fs_rename(tmp, path) then uv.fs_unlink(tmp) end
   end)
 end
 

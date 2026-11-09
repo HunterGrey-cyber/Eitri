@@ -786,9 +786,10 @@ mod tests {
         );
         st.append("events", &[json!(0)]).unwrap();
         let log = s.0.join("eitri/plugins/demo/log");
-        std::fs::write(log.join("events.0000.jsonl"), format!("{}\n", "x".repeat(2500))).unwrap();
+        crate::test_scratch_dir::write_private(log.join("events.0000.jsonl"), format!("{}\n", "x".repeat(2500)))
+            .unwrap();
         let good = json!("g".repeat(1000));
-        std::fs::write(log.join("events.0001.jsonl"), format!("{good}\n")).unwrap();
+        crate::test_scratch_dir::write_private(log.join("events.0001.jsonl"), format!("{good}\n")).unwrap();
         let mut got = Vec::new();
         let mut from: Option<String> = None;
         for _ in 0..5 {

@@ -1,4 +1,4 @@
-//! Private per-instance directories under `TMPDIR`, and the sweep that reclaims ones whose process
+//! Private per-instance directories and safe bases for nvim feeds, with a sweep for ones whose process
 //! died without cleaning up.
 //!
 //! Each window needs a unique directory holding a socket; SIGKILL can leave it behind.
@@ -21,6 +21,32 @@ use std::os::unix::fs::{FileTypeExt, MetadataExt};
 use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
+
+/// Chooses the base for directories holding code nvim loads by pathname. A private runtime directory
+/// wins; otherwise the temporary directory must prevent other users from replacing entries in it.
+pub fn private_base(runtime: Option<&Path>, tmp: &Path, what: &str) -> io::Result<PathBuf> {
+    if let Some(runtime) = runtime.filter(|dir| dir.is_absolute() && agent::private_fs::is_private_dir(dir)) {
+        return Ok(runtime.to_path_buf());
+    }
+    agent::private_fs::require_safe_parent(tmp, what)?;
+    Ok(tmp.to_path_buf())
+}
+
+/// The shared base choice for feeds in the running host.
+pub(crate) fn feed_base(what: &str) -> io::Result<PathBuf> {
+    #[cfg(test)]
+    agent::state_dirs::redirect_state_to_a_test_root();
+    let runtime = agent::state_dirs::runtime_dir();
+    private_base(runtime.as_deref(), &std::env::temp_dir(), what)
+}
+
+/// Reclaims both the selected base's leftovers and those left in the temporary directory.
+pub(crate) fn sweep_stale_dirs_in_bases(base: &Path, tmp: &Path, prefix: &str, socket: &str, tag: &str) {
+    sweep_stale_instance_dirs(base, prefix, socket, tag);
+    if base != tmp {
+        sweep_stale_instance_dirs(tmp, prefix, socket, tag);
+    }
+}
 
 /// `tmp/<prefix><pid>-<32 hex uuid>`.
 ///
@@ -459,6 +485,82 @@ pub(crate) mod tests {
 
     const PREFIX: &str = "neovibe-pane-switch-";
 
+    fn base_scratch(label: &str, mode: u32) -> crate::test_scratch_dir::ScratchDir {
+        let dir = crate::test_scratch_dir::ScratchDir::new("nv-base", label);
+        std::fs::set_permissions(&*dir, std::fs::Permissions::from_mode(mode)).unwrap();
+        dir
+    }
+
+    #[test]
+    fn feed_base_redirects_tests_before_reading_the_runtime_directory() {
+        // A fresh process ensures another test has not already installed the state redirect.
+        if std::env::var_os("EITRI_FEED_BASE_CHILD").is_none() {
+            let runtime = base_scratch("outside-test-state", 0o700);
+            let output = std::process::Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "instance_dir::tests::feed_base_redirects_tests_before_reading_the_runtime_directory",
+                ])
+                .env("EITRI_FEED_BASE_CHILD", "1")
+                .env("XDG_RUNTIME_DIR", &*runtime)
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "{}{}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+            assert!(String::from_utf8_lossy(&output.stdout).contains("1 passed"));
+            return;
+        }
+        let base = feed_base("test feed").unwrap();
+        assert_eq!(base, agent::state_dirs::redirect_state_to_a_test_root().join("run"));
+        assert!(agent::private_fs::is_private_dir(&base));
+    }
+
+    #[test]
+    fn private_base_prefers_a_private_absolute_runtime() {
+        let runtime = base_scratch("runtime", 0o700);
+        let tmp = base_scratch("unsafe-tmp", 0o777);
+        assert_eq!(private_base(Some(&runtime), &tmp, "test feed").unwrap(), *runtime);
+    }
+
+    #[test]
+    fn private_base_falls_back_to_safe_tmp() {
+        let runtime = base_scratch("loose-runtime", 0o755);
+        for mode in [0o700, 0o1777] {
+            let tmp = base_scratch("safe-tmp", mode);
+            for runtime in [Some(&*runtime), Some(Path::new("relative")), None] {
+                assert_eq!(private_base(runtime, &tmp, "test feed").unwrap(), *tmp);
+            }
+        }
+    }
+
+    #[test]
+    fn private_base_refuses_a_replaceable_tmp() {
+        let tmp = base_scratch("replaceable", 0o777);
+        let err = private_base(None, &tmp, "test feed").unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::PermissionDenied);
+        assert!(err.to_string().contains("test feed"));
+        assert!(err.to_string().contains(&tmp.display().to_string()));
+        assert_eq!(std::fs::read_dir(&*tmp).unwrap().count(), 0);
+    }
+
+    #[test]
+    fn stale_feed_directories_are_swept_in_both_bases() {
+        let runtime = base_scratch("sweep-runtime", 0o700);
+        let tmp = base_scratch("sweep-tmp", 0o1777);
+        for base in [&runtime, &tmp] {
+            let stale = base.join(format!("{PREFIX}0-{}", uuid::Uuid::new_v4().simple()));
+            create_private_dir(&stale).unwrap();
+        }
+        sweep_stale_dirs_in_bases(&runtime, &tmp, PREFIX, "no-socket", "test");
+        for base in [&runtime, &tmp] {
+            assert_eq!(std::fs::read_dir(&**base).unwrap().count(), 0);
+        }
+    }
+
     #[test]
     fn only_this_prefixes_own_directory_names_are_sweep_candidates() {
         let uuid = uuid::Uuid::new_v4();
@@ -511,7 +613,7 @@ pub(crate) mod tests {
         std::fs::create_dir_all(&root).unwrap();
         // A directory of a dead pid with no socket in it: the sweep must reclaim it on the way.
         let stale = root.join(format!("{CID_PREFIX}0-{}", uuid::Uuid::new_v4().simple()));
-        std::fs::create_dir(&stale).unwrap();
+        create_private_dir(&stale).unwrap();
 
         let a = create_instance_dir(&root, CID_PREFIX, "n", "test").unwrap();
         let b = create_instance_dir(&root, CID_PREFIX, "n", "test").unwrap();
@@ -564,6 +666,7 @@ pub(crate) mod tests {
         let unrelated = root.join("some-other-tools-directory");
         for dir in [&dead, &dead_old_shape, &live, &stranger, &unrelated] {
             std::fs::create_dir_all(dir.join("bin")).expect("build the fixture");
+            std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700)).unwrap();
         }
 
         sweep_stale_instance_dirs(&root, PREFIX, "switch.sock", "test");
@@ -598,6 +701,10 @@ pub(crate) mod tests {
         let silent = root.join(format!("{BIND_PREFIX}0-{}", uuid::Uuid::new_v4().simple()));
         std::fs::create_dir_all(&listening).expect("build the fixture");
         std::fs::create_dir_all(&silent).expect("build the fixture");
+        // Both candidates must pass the mode check before their socket liveness is judged.
+        for dir in [&listening, &silent] {
+            std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o755)).expect("chmod 0755");
+        }
         // Through `in_dir` like every other bind in this workspace, so an over-cap fixture is
         // refused naming its own length rather than failing inside `bind` with std's message.
         let listener =
@@ -626,6 +733,7 @@ pub(crate) mod tests {
         let root = std::env::temp_dir().join(format!("nvo{}", std::process::id()));
         let candidate = root.join(format!("{BIND_PREFIX}0-{}", uuid::Uuid::new_v4().simple()));
         std::fs::create_dir_all(&candidate).expect("build the fixture");
+        std::fs::set_permissions(&candidate, std::fs::Permissions::from_mode(0o755)).expect("chmod 0755");
         let listener =
             UnixListener::bind(agent::socket_path::in_dir(&candidate, "s.sock").expect("under the cap")).expect("bind");
         listener.set_nonblocking(true).expect("non-blocking");
@@ -689,6 +797,8 @@ pub(crate) mod tests {
         let root = std::env::temp_dir().join(format!("nvb{}", std::process::id()));
         let candidate = root.join(format!("{BIND_PREFIX}0-{}", uuid::Uuid::new_v4().simple()));
         std::fs::create_dir_all(&candidate).expect("build the fixture");
+        // Reach the full listener even when the caller's umask permits group writes.
+        std::fs::set_permissions(&candidate, std::fs::Permissions::from_mode(0o755)).expect("chmod 0755");
         let sock_path = agent::socket_path::in_dir(&candidate, "s.sock").expect("under the cap");
 
         let listener_fd = raw_bind_listen(&sock_path, 0);

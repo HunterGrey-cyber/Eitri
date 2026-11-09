@@ -118,6 +118,7 @@ impl Nvim {
     /// `before`/`after` are `--cmd`s placed before and after the loader's own, so a mapping can be
     /// in place when the snippet loads, and an autocommand can be defined after the snippet's.
     fn start(case: &str, loader: Loader, before: &[&str], after: &[&str]) -> Self {
+        agent::state_dirs::redirect_state_to_a_test_root();
         // Under the target directory, never `/tmp`; nothing here is a socket, so no length cap.
         let scratch = Path::new(env!("CARGO_TARGET_TMPDIR")).join(format!("nav-{}-{case}", std::process::id()));
         let _ = std::fs::remove_dir_all(&scratch);
@@ -750,6 +751,7 @@ fn a_users_own_insert_ctrl_l_is_left_alone() {
 #[test]
 #[ignore = "needs a real nvim on PATH; spends no tokens and needs no display"]
 fn the_letter_is_already_written_before_the_mapping_returns_even_if_nvim_dies_right_after() {
+    agent::state_dirs::redirect_state_to_a_test_root();
     let scratch = Path::new(env!("CARGO_TARGET_TMPDIR")).join(format!("nav-sync-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&scratch);
     std::fs::create_dir_all(&scratch).expect("scratch dir");

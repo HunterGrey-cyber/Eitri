@@ -9,6 +9,7 @@
 #![cfg(test)]
 
 use std::ops::Deref;
+use std::os::unix::fs::DirBuilderExt;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
@@ -38,7 +39,11 @@ impl ScratchDir {
         #[cfg(target_os = "macos")]
         let _ = (prefix, label);
         let dir = outer.join("state");
-        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::DirBuilder::new()
+            .recursive(true)
+            .mode(0o700)
+            .create(&dir)
+            .unwrap();
         ScratchDir { outer, dir }
     }
 }
@@ -73,4 +78,9 @@ impl Drop for ScratchDir {
             std::thread::sleep(Duration::from_millis(5));
         }
     }
+}
+
+/// Writes a private-state fixture with the production mode regardless of the test runner's umask.
+pub(crate) fn write_private(path: impl AsRef<Path>, bytes: impl AsRef<[u8]>) -> std::io::Result<()> {
+    agent::private_fs::write_private(path.as_ref(), bytes.as_ref())
 }

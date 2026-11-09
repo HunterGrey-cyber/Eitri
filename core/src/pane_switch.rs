@@ -174,8 +174,9 @@ pub struct PaneSwitchChannel {
 /// give up (`shell` cannot bind without its shim binary, and still owes the sweep).
 pub fn sweep_stale_dirs() {
     let tmp = std::env::temp_dir();
+    let base = crate::instance_dir::feed_base("pane-switch snippets").unwrap_or_else(|_| tmp.clone());
     for (prefix, socket_name) in SWEPT_NAMES {
-        crate::instance_dir::sweep_stale_instance_dirs(&tmp, prefix, socket_name, "pane_switch");
+        crate::instance_dir::sweep_stale_dirs_in_bases(&base, &tmp, prefix, socket_name, "pane_switch");
     }
 }
 
@@ -197,7 +198,14 @@ impl PaneSwitchChannel {
     }
 
     fn bind_with(shim: Option<&Path>) -> Option<Self> {
-        let dir = crate::instance_dir::instance_dir_path(&std::env::temp_dir(), DIR_PREFIX);
+        let base = match crate::instance_dir::feed_base("pane-switch snippets") {
+            Ok(base) => base,
+            Err(e) => {
+                eprintln!("[pane_switch] {e} -- Ctrl+h/j/k/l out of nvim disabled");
+                return None;
+            }
+        };
+        let dir = crate::instance_dir::instance_dir_path(&base, DIR_PREFIX);
         let bin_dir = dir.join("bin");
         // No `remove_dir_all` first: `instance_dir_path` returns a path that has never existed, so
         // there is nothing to clear -- and an unconditional recursive delete of a `TMPDIR`-derived
@@ -1842,6 +1850,7 @@ mod tests {
     /// [`sweep_stale_instance_dirs`]: crate::instance_dir::sweep_stale_instance_dirs
     #[test]
     fn the_sweep_still_reclaims_a_directory_under_the_old_prefix() {
+        use std::os::unix::fs::PermissionsExt;
         // Own root, so this never touches a real window's directory and never races the sibling
         // tests that plant fixtures of their own.
         let root = std::env::temp_dir().join(format!("nv-ps-sweeptest-{}", uuid::Uuid::new_v4().simple()));
@@ -1852,6 +1861,7 @@ mod tests {
         let legacy = root.join(format!("neovibe-pane-switch-0-{}", uuid::Uuid::new_v4()));
         for dir in [&current, &legacy] {
             std::fs::create_dir_all(dir.join("bin")).expect("build the fixture");
+            std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700)).unwrap();
         }
 
         for (prefix, socket_name) in SWEPT_NAMES {

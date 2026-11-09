@@ -146,6 +146,75 @@ SH
 chmod +x "$SCRATCH/fake-eitri"
 EITRI_TEST_OUT="$SCRATCH/argv.txt" EITRI_TEST_SCRIPT="$SCRATCH/fake-eitri" check ":EitriPanel runs eitri panel --nvim <its own address> -- <dir>" "$SCRATCH/args.lua"
 
+# Drive a failed page's callbacks without starting a window or binding a socket.
+cat >"$SCRATCH/log.lua" <<'LUA'
+local uv = vim.uv
+local dir = vim.env.EITRI_TEST_LOG_DIR
+vim.fn.stdpath = function() return dir end
+vim.fn.serverstart = function() return "unused-test-address" end
+vim.o.columns = 20
+local notices = 0
+vim.notify = function() notices = notices + 1 end
+local line = "eitri page: " .. string.rep("failure text ", 30)
+vim.fn.jobstart = function(_, opts)
+  opts.on_stderr(1, { line, "" })
+  opts.on_exit(1, 1)
+  return 1
+end
+local function report()
+  local before = notices
+  require("eitri").page("test")
+  assert(vim.wait(1000, function() return notices > before end), "no shortened notice")
+end
+local path = dir .. "/eitri.log"
+vim.fn.mkdir(dir, "p", 448)
+local mode = tonumber(vim.env.EITRI_TEST_LOG_MODE)
+assert(uv.fs_chmod(dir, mode))
+if mode == 448 then
+  report()
+  assert(uv.fs_stat(path).mode % 512 == 384, "the log is not 0600")
+  assert(#vim.fn.readfile(path) == 1 and vim.fn.readfile(path)[1]:find(line, 1, true))
+  local inode = uv.fs_stat(path).ino
+  assert(uv.fs_chmod(path, 420)) -- an existing 0644 log is replaced privately
+  report()
+  assert(#vim.fn.readfile(path) == 2, "previous lines were lost")
+  assert(uv.fs_stat(path).ino ~= inode, "the log was not replaced atomically")
+  assert(uv.fs_stat(path).mode % 512 == 384)
+  local real_rename = uv.fs_rename
+  uv.fs_rename = function() return nil, "refused" end
+  report()
+  uv.fs_rename = real_rename
+  assert(#vim.fn.readfile(path) == 2, "a failed rename changed the old log")
+  assert(#vim.fn.glob(dir .. "/*.tmp", false, true) == 0, "a temporary file was left behind")
+  local real_lstat = uv.fs_lstat
+  for _, foreign in ipairs({ dir, path }) do
+    uv.fs_lstat = function(name)
+      local stat = real_lstat(name)
+      if name == foreign then stat.uid = uv.getuid() + 1 end
+      return stat
+    end
+    report()
+    assert(#vim.fn.readfile(path) == 2, "a foreign directory or file was used")
+  end
+  uv.fs_lstat = real_lstat
+  assert(uv.fs_unlink(path))
+  local target = dir .. "/target"
+  vim.fn.writefile({ "leave alone" }, target)
+  assert(uv.fs_symlink(target, path))
+  report()
+  assert(uv.fs_lstat(path).type == "link", "a linked log was used")
+  assert(vim.fn.readfile(target)[1] == "leave alone")
+else
+  report()
+  assert(uv.fs_lstat(path) == nil, "an accessible directory was used")
+end
+io.stdout:write("OK\n")
+LUA
+for mode in 448 488 455 493; do # 0700, 0750, 0707, 0755
+  EITRI_TEST_LOG_DIR="$SCRATCH/log-$mode" EITRI_TEST_LOG_MODE="$mode" \
+    check "page logs are private and atomic (directory mode $mode)" "$SCRATCH/log.lua"
+done
+
 echo
 echo "$CHECKS checks, $FAILURES failed"
 [[ "$FAILURES" -eq 0 ]]

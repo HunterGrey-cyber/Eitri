@@ -44,6 +44,7 @@ struct Session {
 
 impl Session {
     fn new(name: &str) -> Session {
+        agent::state_dirs::redirect_state_to_a_test_root();
         let scratch = Scratch::new();
         let file = scratch.0.join(name);
         let text: String = (1..=10).map(|n| format!("line {n}\n")).collect();

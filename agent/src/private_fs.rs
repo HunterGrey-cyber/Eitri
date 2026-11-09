@@ -14,8 +14,10 @@
 //! Also the one place `eitri-core` asks "is this ours?" ([`current_uid`]): its stale-instance
 //! sweep must skip another user's entries in a shared `TMPDIR` before connecting to anything.
 //!
-//! Modes are changed with `fchmod` on a handle opened without following a symlink, never by path:
-//! the handle is `fstat`ed for its owner first, so what is checked is what is changed. (This also
+//! Modes are changed with `fchmod` on a handle, never by path. Handles are opened without following
+//! a symlink except in the sidecar selection reader: it tightens a followed handle only when an
+//! `lstat` of the name identifies a regular file with the handle's device and inode. The handle is
+//! `fstat`ed for its owner first, so what is checked is what is changed. (This also
 //! keeps the prost-setter token `wire_guard` forbids out of this crate's production code.)
 //!
 //! **Walking by handle, not by path.** Tightening `root/a/b/...` by re-opening each successive *path*
@@ -504,13 +506,14 @@ pub fn create_private_file_at(dir: BorrowedFd<'_>, name: &CStr) -> std::io::Resu
     Ok(file)
 }
 
-/// Reads `path` whole as UTF-8, but only when it is a regular file owned by this user; anything
+/// Reads `path` whole as UTF-8, but only when it is a regular file owned by this user and not
+/// writable by group or others; anything
 /// else is refused with `PermissionDenied` before a byte is read (a missing file is still
 /// `NotFound`). Every loader of Eitri's own state reads through this: those files decide what is
 /// answered without a card and how a window comes back, so one that another user put in place --
 /// in a state home they could write to -- must not count, and a FIFO in a file's place must not
 /// block a launch. `O_NONBLOCK` makes opening a FIFO return at once, and the type and owner are
-/// read from the open handle, so what is checked is what is read.
+/// read from the open handle, as are its write permissions, so what is checked is what is read.
 pub fn read_private_to_string(path: &Path) -> std::io::Result<String> {
     use std::io::Read;
     let mut file = std::fs::OpenOptions::new()
@@ -522,6 +525,12 @@ pub fn read_private_to_string(path: &Path) -> std::io::Result<String> {
         return Err(std::io::Error::new(
             std::io::ErrorKind::PermissionDenied,
             format!("{} is not a regular file of this user", path.display()),
+        ));
+    }
+    if meta.mode() & 0o022 != 0 {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::PermissionDenied,
+            format!("{} is writable by its group or by others", path.display()),
         ));
     }
     let mut text = String::new();
@@ -691,11 +700,36 @@ mod lock_test_hooks {
 }
 
 /// Reads private UTF-8 state within a byte cap, checked before reading and while the file may grow.
+/// The opened file must be regular, owned by the euid and not writable by group or others.
 pub fn read_private_to_string_capped(path: &Path, max_bytes: u64) -> std::io::Result<String> {
     let file = std::fs::OpenOptions::new()
         .read(true)
         .custom_flags(libc::O_NONBLOCK | libc::O_CLOEXEC)
         .open(path)?;
+    read_capped(file, path, max_bytes)
+}
+
+/// Reads the sidecar selection, tightening an owned group-writable file from an older installer.
+/// Other-writable files still fail the private reader's check; type and owner are checked before chmod.
+/// Selection symlinks are followed for reads, but their targets are never tightened.
+pub(crate) fn read_sidecar_selection_capped(path: &Path, max_bytes: u64) -> std::io::Result<String> {
+    let file = std::fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NONBLOCK | libc::O_CLOEXEC)
+        .open(path)?;
+    let meta = file.metadata()?;
+    if !meta.is_file() || meta.uid() != euid() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "not a regular file of this user",
+        ));
+    }
+    if meta.mode() & 0o022 == 0o020
+        && std::fs::symlink_metadata(path)
+            .is_ok_and(|named| named.is_file() && named.dev() == meta.dev() && named.ino() == meta.ino())
+    {
+        fchmod(&file, PRIVATE_FILE_MODE)?;
+    }
     read_capped(file, path, max_bytes)
 }
 
@@ -732,6 +766,12 @@ fn read_capped_bytes(file: std::fs::File, path: &Path, max_bytes: u64) -> std::i
         return Err(Error::new(
             ErrorKind::PermissionDenied,
             format!("{} is not a regular file of this user", path.display()),
+        ));
+    }
+    if meta.mode() & 0o022 != 0 {
+        return Err(Error::new(
+            ErrorKind::PermissionDenied,
+            format!("{} is writable by its group or by others", path.display()),
         ));
     }
     let over_cap = |n| {
@@ -1277,10 +1317,31 @@ mod tests {
     use std::os::unix::fs::PermissionsExt;
 
     #[test]
+    fn sidecar_selection_never_tightens_a_symlink_target() {
+        let dir = scratch("selection-link");
+        let target = dir.join("target");
+        let selected = dir.join("selected");
+        write_private(&target, b"version=0.3.2\n").unwrap();
+        std::os::unix::fs::symlink(&target, &selected).unwrap();
+        for permissions in [0o664, 0o602, 0o666] {
+            std::fs::set_permissions(&target, std::fs::Permissions::from_mode(permissions)).unwrap();
+            let error = read_sidecar_selection_capped(&selected, 256).unwrap_err();
+            assert_eq!(error.kind(), std::io::ErrorKind::PermissionDenied);
+            assert_eq!(mode(&target), permissions);
+        }
+        std::fs::set_permissions(&target, std::fs::Permissions::from_mode(0o644)).unwrap();
+        assert_eq!(
+            read_sidecar_selection_capped(&selected, 256).unwrap(),
+            "version=0.3.2\n"
+        );
+        assert_eq!(mode(&target), 0o644);
+    }
+
+    #[test]
     fn a_capped_read_refuses_a_file_over_the_cap_before_reading_it() {
         let dir = scratch("capped-large");
         let path = dir.join("theme.json");
-        std::fs::File::create(&path).unwrap().set_len(257).unwrap();
+        open_private(&path).unwrap().set_len(257).unwrap();
         let err = read_private_to_string_capped(&path, 256).unwrap_err();
         assert_eq!(err.kind(), std::io::ErrorKind::InvalidData);
         assert!(err.to_string().contains("257 bytes, over the 256-byte cap"));
@@ -1942,6 +2003,35 @@ mod tests {
             );
         }
         std::fs::remove_dir_all(&base).unwrap();
+    }
+
+    #[test]
+    fn private_reads_refuse_group_or_other_writable_files() {
+        let base = scratch("writable-read");
+        let file = base.join("rules.json");
+        write_private(&file, b"{}").unwrap();
+        let link = base.join("linked-rules.json");
+        std::os::unix::fs::symlink(&file, &link).unwrap();
+        for mode in [0o620, 0o602, 0o600, 0o400] {
+            set_mode(&file, mode);
+            let reads = [
+                read_private_to_string(&file),
+                read_private_to_string(&link),
+                read_private_to_string_capped(&file, 16),
+                read_private_to_string_capped(&link, 16),
+                read_private_nofollow_capped(&file, 16),
+                read_private_nofollow_bytes_capped(&file, 16).map(|b| String::from_utf8(b).unwrap()),
+            ];
+            for read in reads {
+                if mode & 0o022 != 0 {
+                    let err = read.unwrap_err();
+                    assert_eq!(err.kind(), std::io::ErrorKind::PermissionDenied);
+                    assert!(err.to_string().contains("writable"), "{err}");
+                } else {
+                    assert_eq!(read.unwrap(), "{}");
+                }
+            }
+        }
     }
 
     fn set_mode(path: &Path, mode: u32) {

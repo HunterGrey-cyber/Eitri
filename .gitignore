@@ -14,3 +14,4 @@ __pycache__/
 # regenerates it.
 .aider.tags.cache.v4/
 .codex/
+/nvim.log

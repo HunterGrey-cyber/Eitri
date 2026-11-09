@@ -318,6 +318,17 @@ version_newer() {
 	((10#${1##*-rc.} > 10#${2##*-rc.}))
 }
 
+# Read only an owned regular selection without other-write permission. A group-writable link
+# is refused too: the host can tighten an old regular selection, but never a symlink's target.
+selected_readable() {
+	_sr_ok=$(find -H "$1" -prune -type f -user "$(id -u)" ! -perm -0002 -print 2>/dev/null) || return 1
+	[ -n "$_sr_ok" ] || return 1
+	if [ -L "$1" ]; then
+		_sr_ok=$(find -H "$1" -prune ! -perm -0020 -print 2>/dev/null) || return 1
+	fi
+	[ -n "$_sr_ok" ]
+}
+
 # The update a tab would start: eitri-setup beside the binary, `selected` naming a version strictly
 # newer than the bundled one, and its directory holding the binary and BUILD. Older than bundled is
 # passed over, also when the bundled one is not built. `selected` reads as a tab reads it: one line,
@@ -328,7 +339,7 @@ selected_update_found() {
 	local number='(0|[1-9][0-9]{0,17})' version_re root selected version bundled
 	version_re="$number\\.$number\\.$number(-rc\\.$number)?"
 	root="$(xdg_data_home)/eitri/sidecar"
-	[[ -f "$root/selected" ]] || return 1
+	selected_readable "$root/selected" || return 1
 	selected="$(head -c 256 -- "$root/selected" 2>/dev/null | tr '\000' '?'; printf x)"
 	selected="${selected%x}"
 	selected="${selected%$'\n'}"

@@ -282,6 +282,29 @@ _RULING_CITATION_PATTERN = re.compile(
 )
 
 
+@pytest.mark.parametrize("existing_temp", [False, True])
+def test_selected_is_private_under_group_writable_umask(tmp_path, existing_temp):
+    source = INSTALLER.read_text()
+    functions = source[source.index("selected_replaceable() {"):source.index("# sidecar_probe PATH:")]
+    script = functions + r"""
+set -e
+die() { echo "$*" >&2; exit 1; }
+NV_SIDECAR_ROOT=$1
+NV_SIDECAR_SELECTED=$1/selected
+umask 002
+if [ "$2" = yes ]; then
+    printf old >"$NV_SIDECAR_ROOT/.selected.tmp.$$"
+fi
+write_selected 0.3.2
+"""
+    proc = subprocess.run(["sh", "-c", script, "test", str(tmp_path), "yes" if existing_temp else "no"],
+                          capture_output=True, text=True)
+    assert proc.returncode == 0, report(proc)
+    selected = tmp_path / "selected"
+    assert selected.read_text() == "version=0.3.2\n"
+    assert selected.stat().st_mode & 0o777 == 0o600
+
+
 def test_help_cites_no_internal_ruling_or_spec_section():
     """`install.sh --help` is what a stranger
     running the curl installer actually reads. It used to cite a spec section and a ruling id
@@ -563,3 +586,63 @@ def test_the_dash_image_tag_follows_what_the_image_is_built_from():
     assert dash_image_tag(1000, 1000) != dash_image_tag(1001, 1000)
     assert dash_image_tag(1000, 1000) != dash_image_tag(1000, 1001)
     assert re.fullmatch(rf"{IMAGE_NAME}:[0-9a-f]{{12}}", dash_image_tag(1000, 1000))
+
+
+@pytest.mark.parametrize("reader", ["installer", "launcher"])
+@pytest.mark.parametrize("mode,linked,foreign,accepted", [
+    (0o600, False, False, True), (0o664, False, False, True),
+    (0o602, False, False, False), (0o666, False, False, False),
+    (0o600, False, True, False), (0o644, True, False, True),
+    (0o664, True, False, False), (0o602, True, False, False),
+])
+def test_selection_readers_check_owner_and_write_bits(tmp_path, reader, mode, linked, foreign, accepted):
+    root = tmp_path / "eitri" / "sidecar"
+    root.mkdir(parents=True)
+    selected = root / "selected"
+    target = root / "target" if linked else selected
+    target.write_text("version=0.3.2\n")
+    target.chmod(mode)
+    if linked:
+        selected.symlink_to(target)
+    # A different effective uid exercises the foreign-owner branch without needing chown privileges.
+    uid = os.geteuid() + 1 if foreign else os.geteuid()
+    prelude = f'id() {{ printf "%s\\n" {uid}; }}\n'
+    if reader == "installer":
+        source = INSTALLER.read_text()
+        functions = source[source.index("version_name() {"):source.index("# update_intact VERSION:")]
+        functions += source[source.index("status_selected() {"):source.index("# status_named sets")]
+        script = prelude + functions + r'''
+NV_NL='
+'
+NV_SIDECAR_VERSION_ERE='[0-9]+\.[0-9]+\.[0-9]+'
+NV_SIDECAR_SELECTED=$1/eitri/sidecar/selected
+read_selected
+if [ -z "$NV_SELECTED_VERSION" ]; then
+    status_selected
+    printf '%s\n' "$SS_NOTE"
+fi
+[ "$NV_SELECTED_VERSION" = 0.3.2 ]
+'''
+        shell = "sh"
+    else:
+        source = (HERE / "eitri.launcher.sh").read_text()
+        functions = source[source.index("# Read only an owned regular selection"):source.index("sidecar_found() {")]
+        (tmp_path / "eitri-setup").touch()
+        (tmp_path / "RELEASE").write_text("SIDECAR_VERSION=0.3.1\n")
+        update = root / "updates" / "0.3.2"
+        update.mkdir(parents=True)
+        for name in ("BUILD", "verdandi-claude-sidecar"):
+            (update / name).touch()
+        script = prelude + functions + r'''
+LIBDIR=$1
+xdg_data_home() { printf '%s\n' "$LIBDIR"; }
+version_newer() { return 0; }
+selected_update_found
+'''
+        shell = "bash"
+    proc = subprocess.run([shell, "-c", script, "test", str(tmp_path)], capture_output=True, text=True)
+    assert proc.returncode == (0 if accepted else 1), report(proc)
+    if reader == "installer" and not accepted:
+        reason = "not yours" if foreign else "writable by others"
+        assert proc.stdout.strip() == f"refused: {reason}", report(proc)
+    assert target.stat().st_mode & 0o777 == mode

@@ -74,7 +74,8 @@ fn handoffs(answers: &[WriterAnswer]) -> Vec<(String, Option<Record>)> {
 /// A handoff file as nvim leaves it, in `dir`.
 fn put_handoff(dir: &Path, token: &str, record: &Record, same: bool) -> PathBuf {
     let path = dir.join(format!("reopen-out-{token}.json"));
-    std::fs::write(&path, format!("{{\"same\":{same},\"record\":{}}}", record.to_json())).unwrap();
+    crate::test_scratch_dir::write_private(&path, format!("{{\"same\":{same},\"record\":{}}}", record.to_json()))
+        .unwrap();
     path
 }
 

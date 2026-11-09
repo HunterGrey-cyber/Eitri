@@ -1173,7 +1173,12 @@ fn build_ui(
     // Beside the person's nvim: the agent window's drafts live under the same temporary prefix as this window's, and
     // neither is followed; a follow snippet the editor refuses closes the window, with no second try.
     if let Some(start) = &beside {
-        plugin_panels.set_scratch_prefix(Some(std::env::temp_dir().join("nv-sc-")));
+        plugin_panels.set_scratch_prefix(
+            scratch_path
+                .as_deref()
+                .and_then(Path::parent)
+                .map(|base| base.join("nv-sc-")),
+        );
         let driver = Rc::downgrade(&driver);
         let starter = start.starter.clone();
         plugin_panels.on_follow_refused(Rc::new(move || {

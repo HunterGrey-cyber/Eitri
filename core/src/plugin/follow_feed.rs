@@ -224,12 +224,19 @@ impl FollowSocket {
     /// Sweeps stale directories, makes this window's 0700 directory and binds its 0600 socket -- or logs why not
     /// and returns `None`; then no plugin gets nvim commands or a followed buffer in this window.
     pub fn bind() -> Option<FollowSocket> {
+        let base = match crate::instance_dir::feed_base("plugin follow socket") {
+            Ok(base) => base,
+            Err(e) => {
+                eprintln!("[follow] {e} -- no plugin gets editor commands or a followed buffer");
+                return None;
+            }
+        };
         let tmp = std::env::temp_dir();
         for (prefix, socket_name) in SWEPT_NAMES {
-            crate::instance_dir::sweep_stale_instance_dirs(&tmp, prefix, socket_name, "follow");
+            crate::instance_dir::sweep_stale_dirs_in_bases(&base, &tmp, prefix, socket_name, "follow");
         }
 
-        let dir = crate::instance_dir::instance_dir_path(&tmp, DIR_PREFIX);
+        let dir = crate::instance_dir::instance_dir_path(&base, DIR_PREFIX);
         // 0700: whatever can connect to this socket can show, hide and steer a plugin's page.
         if let Err(e) = crate::instance_dir::create_private_dir(&dir) {
             eprintln!(
@@ -753,6 +760,7 @@ mod tests {
         };
         let path = socket.socket_path().to_path_buf();
         let dir = path.parent().unwrap().to_path_buf();
+        assert_eq!(dir.parent(), agent::state_dirs::runtime_dir().as_deref());
         assert!(
             dir.file_name().unwrap().to_string_lossy().starts_with(DIR_PREFIX),
             "{dir:?}"

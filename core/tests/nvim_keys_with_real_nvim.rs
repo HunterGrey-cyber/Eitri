@@ -41,6 +41,7 @@ fn drain_all_lines(listener: UnixListener) -> Vec<String> {
 #[test]
 #[ignore = "needs a real nvim on PATH; spends no tokens and needs no display"]
 fn a_real_nvim_reports_its_leader_and_buffer_maps_and_only_on_change() {
+    agent::state_dirs::redirect_state_to_a_test_root();
     let mut feed = NvimKeysFeed::new().expect("the feed must bind");
     let listener = feed.take_listener().unwrap();
     let mut command = std::process::Command::new("nvim");

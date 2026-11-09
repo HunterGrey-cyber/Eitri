@@ -31,10 +31,23 @@ pub const NPMRC_CAP: u64 = 64 * 1024;
 
 /// A configuration file of the user's own, read so that nothing there can hang or grow the read: opened without
 /// blocking (a FIFO answers at once), a regular file owned by this process's effective user, at most `cap` bytes
-/// (`private_fs::read_private_to_string_capped`). Anything else is `None`. A link is followed: what it reaches must
-/// pass the same checks.
+/// long. Anything else is `None`. A link is followed: what it reaches must pass the same checks.
+/// User-edited configuration may be group-writable; the installed program and its ancestors are checked separately.
 pub fn read_user_file(path: &Path, cap: u64) -> Option<String> {
-    crate::private_fs::read_private_to_string_capped(path, cap).ok()
+    use std::io::Read;
+    use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
+    let file = std::fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NONBLOCK | libc::O_CLOEXEC)
+        .open(path)
+        .ok()?;
+    let meta = file.metadata().ok()?;
+    if !meta.is_file() || meta.uid() != crate::private_fs::euid() || meta.len() > cap {
+        return None;
+    }
+    let mut text = String::new();
+    file.take(cap.saturating_add(1)).read_to_string(&mut text).ok()?;
+    (text.len() as u64 <= cap).then_some(text)
 }
 
 /// npm's global prefix as the user set it: `NPM_CONFIG_PREFIX` (npm reads its variables in either case), else the
@@ -542,11 +555,15 @@ pub(crate) mod tests {
     #[test]
     fn a_user_file_is_read_only_when_it_is_a_small_regular_file_of_this_user() {
         use std::os::unix::ffi::OsStrExt;
-        let root = trusted_scratch_base().join(format!("eitri-npmrc-{}", uuid::Uuid::new_v4()));
-        std::fs::create_dir_all(&root).unwrap();
+        use std::os::unix::fs::PermissionsExt;
+        let root = crate::test_tmp::TmpDir::new("eitri-npmrc", "reader");
         let good = root.join("good");
         std::fs::write(&good, "prefix=/opt/x\n").unwrap();
+        std::fs::set_permissions(&good, std::fs::Permissions::from_mode(0o664)).unwrap();
         assert_eq!(read_user_file(&good, NPMRC_CAP).as_deref(), Some("prefix=/opt/x\n"));
+        let link = root.join("link");
+        std::os::unix::fs::symlink(&good, &link).unwrap();
+        assert_eq!(read_user_file(&link, NPMRC_CAP).as_deref(), Some("prefix=/opt/x\n"));
         let fifo = root.join("fifo");
         let c = std::ffi::CString::new(fifo.as_os_str().as_bytes()).unwrap();
         // SAFETY: `c` is a NUL-terminated path that outlives the call.
@@ -566,7 +583,6 @@ pub(crate) mod tests {
             std::os::unix::fs::symlink("/etc/passwd", &other).unwrap();
             assert_eq!(read_user_file(&other, NPMRC_CAP), None);
         }
-        let _ = std::fs::remove_dir_all(&root);
     }
 
     #[test]

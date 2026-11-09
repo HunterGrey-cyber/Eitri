@@ -44,6 +44,7 @@ fn call(hex: &str) -> String {
 #[test]
 #[ignore = "needs a real nvim on PATH; spends no tokens and needs no display"]
 fn wq_returns_the_edited_draft_and_q_bang_changes_nothing() {
+    agent::state_dirs::redirect_state_to_a_test_root();
     let mut dir = ScratchDir::new().expect("a scratch directory");
     let (request, edit) = dir.prepare_edit("first draft").unwrap();
     nvim(
@@ -77,6 +78,7 @@ fn wq_returns_the_edited_draft_and_q_bang_changes_nothing() {
 #[test]
 #[ignore = "needs a real nvim on PATH; spends no tokens and needs no display"]
 fn a_view_is_read_only_and_a_bad_request_says_why() {
+    agent::state_dirs::redirect_state_to_a_test_root();
     let mut dir = ScratchDir::new().expect("a scratch directory");
     let probe = dir.path().join("probe.txt");
     let request = dir.prepare_view("Bash: ls", "a\nb").unwrap();
@@ -106,6 +108,7 @@ fn a_view_is_read_only_and_a_bad_request_says_why() {
 #[test]
 #[ignore = "needs a real nvim on PATH; spends no tokens and needs no display"]
 fn a_new_view_takes_the_window_of_the_view_before_it() {
+    agent::state_dirs::redirect_state_to_a_test_root();
     let mut dir = ScratchDir::new().expect("a scratch directory");
     let probe = dir.path().join("probe.txt");
     let other = dir.path().join("other.txt");
@@ -151,6 +154,7 @@ fn a_new_view_takes_the_window_of_the_view_before_it() {
 #[test]
 #[ignore = "needs a real nvim on PATH; spends no tokens and needs no display"]
 fn a_view_in_another_tab_page_is_not_taken_over() {
+    agent::state_dirs::redirect_state_to_a_test_root();
     let mut dir = ScratchDir::new().expect("a scratch directory");
     let probe = dir.path().join("probe.txt");
     let first = dir.prepare_view("Bash: one", "text of one").unwrap();
@@ -187,6 +191,7 @@ fn write_buffer_name(out: &std::path::Path) -> String {
 #[test]
 #[ignore = "needs a real nvim on PATH; spends no tokens and needs no display"]
 fn a_newline_in_an_opened_path_is_part_of_the_name_and_runs_nothing() {
+    agent::state_dirs::redirect_state_to_a_test_root();
     let dir = ScratchDir::new().expect("a scratch directory");
     let marker = dir.path().join("injected");
     let name = format!(
@@ -213,6 +218,7 @@ fn a_newline_in_an_opened_path_is_part_of_the_name_and_runs_nothing() {
 #[test]
 #[ignore = "needs a real nvim on PATH; spends no tokens and needs no display"]
 fn a_relative_path_is_refused_and_runs_nothing() {
+    agent::state_dirs::redirect_state_to_a_test_root();
     let dir = ScratchDir::new().expect("a scratch directory");
     let pwned = dir.path().join("pwned");
     let lua = format!(
@@ -235,6 +241,7 @@ fn a_relative_path_is_refused_and_runs_nothing() {
 #[test]
 #[ignore = "needs a real nvim on PATH; spends no tokens and needs no display"]
 fn a_relative_path_for_an_edit_is_refused_and_reported_through_done() {
+    agent::state_dirs::redirect_state_to_a_test_root();
     let mut dir = ScratchDir::new().expect("a scratch directory");
     let pwned = dir.path().join("pwned");
     let lua = format!(
@@ -264,6 +271,7 @@ fn a_relative_path_for_an_edit_is_refused_and_reported_through_done() {
 #[test]
 #[ignore = "needs a real nvim on PATH; spends no tokens and needs no display"]
 fn an_opened_path_is_never_expanded() {
+    agent::state_dirs::redirect_state_to_a_test_root();
     let dir = ScratchDir::new().expect("a scratch directory");
     let odd = dir.path().join("a %b #c d\\e.txt");
     std::fs::write(&odd, "x\n").unwrap();
@@ -279,6 +287,7 @@ fn an_opened_path_is_never_expanded() {
 #[test]
 #[ignore = "needs a real nvim on PATH; spends no tokens and needs no display"]
 fn a_view_reads_no_modeline() {
+    agent::state_dirs::redirect_state_to_a_test_root();
     let mut dir = ScratchDir::new().expect("a scratch directory");
     let probe = dir.path().join("probe.txt");
     let request = dir
@@ -303,6 +312,7 @@ fn a_view_reads_no_modeline() {
 #[test]
 #[ignore = "needs a real nvim on PATH; spends no tokens and needs no display"]
 fn a_view_reads_crlf_line_ends_the_way_split_would() {
+    agent::state_dirs::redirect_state_to_a_test_root();
     let mut dir = ScratchDir::new().expect("a scratch directory");
     for (text, want) in [
         ("one\r\ntwo\r\n", "2 3 3"),
@@ -349,6 +359,7 @@ fn write_tab_state(out: &std::path::Path) -> String {
 #[test]
 #[ignore = "needs a real nvim on PATH; spends no tokens and needs no display"]
 fn the_diff_op_opens_two_read_only_buffers_in_a_new_tab() {
+    agent::state_dirs::redirect_state_to_a_test_root();
     let mut dir = ScratchDir::new().expect("a scratch directory");
     let mine = dir.path().join("mine.txt");
     std::fs::write(&mine, "the user's own text\n").unwrap();
@@ -406,6 +417,7 @@ fn the_diff_op_opens_two_read_only_buffers_in_a_new_tab() {
 #[test]
 #[ignore = "needs a real nvim on PATH; spends no tokens and needs no display"]
 fn a_modeline_in_a_proposal_never_runs() {
+    agent::state_dirs::redirect_state_to_a_test_root();
     let mut dir = ScratchDir::new().expect("a scratch directory");
     let request = dir
         .prepare_proposal(
@@ -449,6 +461,7 @@ fn write_tab_lines(out: &std::path::Path) -> String {
 #[test]
 #[ignore = "needs a real nvim on PATH; spends no tokens and needs no display"]
 fn a_change_of_line_ends_alone_still_shows_in_the_diff() {
+    agent::state_dirs::redirect_state_to_a_test_root();
     let mut dir = ScratchDir::new().expect("a scratch directory");
     for (base, proposed, want) in [
         // CR-LF made LF: the CRs stay on the left.
@@ -477,6 +490,7 @@ fn a_change_of_line_ends_alone_still_shows_in_the_diff() {
 #[test]
 #[ignore = "needs a real nvim on PATH; spends no tokens and needs no display"]
 fn q_in_the_last_tab_leaves_no_window_in_diff_mode() {
+    agent::state_dirs::redirect_state_to_a_test_root();
     let mut dir = ScratchDir::new().expect("a scratch directory");
     let request = dir.prepare_proposal("main.rs", "a\n", "b\n").unwrap();
     let probe = dir.path().join("after");

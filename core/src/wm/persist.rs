@@ -2608,7 +2608,7 @@ mod tests {
     fn nothing_is_written_until_the_layout_changes_and_an_unusable_file_is_kept() {
         let dir = agent::state_dirs::test_workspace_dir("layout-saver");
         let path = dir.join(persist::file_name_v2(root()));
-        std::fs::write(&path, "{ a typo").unwrap();
+        crate::test_scratch_dir::write_private(&path, "{ a typo").unwrap();
         let layout = Rc::new(RefCell::new(first_launch_layout(&[]).unwrap()));
         let saver = saver_for(&dir, &layout);
         layout.borrow_mut().set_focus(&ModuleId::agent()).unwrap();
@@ -2625,7 +2625,7 @@ mod tests {
         assert_eq!(std::fs::read_to_string(&aside).unwrap(), "{ a typo");
         assert!(matches!(persist::load(&dir, root(), &[]), Loaded::Restored(_)));
 
-        std::fs::write(&path, "written by someone else").unwrap();
+        crate::test_scratch_dir::write_private(&path, "written by someone else").unwrap();
         saver.save_now();
         assert_eq!(
             std::fs::read_to_string(&path).unwrap(),
@@ -2975,7 +2975,7 @@ mod tests {
     #[test]
     fn a_second_window_does_not_set_aside_the_file_the_first_one_wrote() {
         let dir = agent::state_dirs::test_workspace_dir("layout-saver-two-windows");
-        std::fs::write(dir.join(persist::file_name_v2(root())), "{ a typo").unwrap();
+        crate::test_scratch_dir::write_private(dir.join(persist::file_name_v2(root())), "{ a typo").unwrap();
         let first = Rc::new(RefCell::new(first_launch_layout(&[]).unwrap()));
         let second = Rc::new(RefCell::new(first_launch_layout(&[]).unwrap()));
         let first_saver = saver_for(&dir, &first);
@@ -3004,7 +3004,7 @@ mod tests {
         persist::save(&dir, root(), &Workspaces::single(), &first_launch_layout(&[]).unwrap()).unwrap();
         let layout = opened(&dir, &[]);
         let saver = saver_for(&dir, &layout);
-        std::fs::write(&path, "{ \"version\": 1, a typo made in nvim").unwrap();
+        crate::test_scratch_dir::write_private(&path, "{ \"version\": 1, a typo made in nvim").unwrap();
         layout.borrow_mut().show(&ModuleId::terminal()).unwrap();
         saver.save_now();
         assert_eq!(
@@ -3015,7 +3015,7 @@ mod tests {
 
         // Edited into garbage again: a click leaves it alone, and the next arrangement change sets
         // it aside too.
-        std::fs::write(&path, "garbage").unwrap();
+        crate::test_scratch_dir::write_private(&path, "garbage").unwrap();
         layout.borrow_mut().set_focus(&ModuleId::agent()).unwrap();
         saver.save_now();
         assert_eq!(
@@ -3487,7 +3487,7 @@ mod tests {
     fn a_close_whose_write_fails_does_not_say_the_file_holds_the_window() {
         let base = agent::state_dirs::test_workspace_dir("layout-saver-close-fails");
         let dir = base.join("state");
-        std::fs::write(&dir, "a file where the state directory goes").unwrap();
+        crate::test_scratch_dir::write_private(&dir, "a file where the state directory goes").unwrap();
         let window = Driven::open(&dir, first_launch_layout(&[]).unwrap(), Workspaces::single());
         window.layout.borrow_mut().show(&ModuleId::terminal()).unwrap();
         window.changed();
@@ -3683,7 +3683,7 @@ mod tests {
         let dir = agent::state_dirs::test_workspace_dir("layout-saver-set-aside-fails");
         let path = dir.join(persist::file_name_v2(root()));
         let aside = dir.join(format!("{}.unusable", persist::file_name_v2(root())));
-        std::fs::write(&path, "{ a typo").unwrap();
+        crate::test_scratch_dir::write_private(&path, "{ a typo").unwrap();
         std::fs::create_dir_all(aside.join("in the way")).unwrap();
         let layout = Rc::new(RefCell::new(first_launch_layout(&[]).unwrap()));
         let saver = saver_for(&dir, &layout);
@@ -4233,7 +4233,7 @@ mod tests {
                     "second": {"type": "leaf", "module": "terminal"}},
                 "second": {"type": "leaf", "module": "agent"}},
             "hidden": [], "focus": "editor"}"#;
-        std::fs::write(&v1, text).unwrap();
+        crate::test_scratch_dir::write_private(&v1, text).unwrap();
         let (workspaces, layout, notes, keep_copy) = choose_startup_layout(
             None,
             None,
@@ -4270,7 +4270,7 @@ mod tests {
     fn the_saver_copies_a_partly_unusable_file_before_its_first_write() {
         let dir = agent::state_dirs::test_workspace_dir("layout-saver-partial");
         let text = partly_usable_text();
-        std::fs::write(dir.join(persist::file_name_v2(root())), &text).unwrap();
+        crate::test_scratch_dir::write_private(dir.join(persist::file_name_v2(root())), &text).unwrap();
         let window = Window::open(&dir);
         assert_eq!(window.workspaces.borrow().order(), ["main"]);
         window.layout.borrow_mut().set_focus(&ModuleId::agent()).unwrap();
@@ -4292,7 +4292,7 @@ mod tests {
     fn a_second_window_does_not_copy_aside_the_file_the_first_one_wrote() {
         let dir = agent::state_dirs::test_workspace_dir("layout-saver-partial-two");
         let text = partly_usable_text();
-        std::fs::write(dir.join(persist::file_name_v2(root())), &text).unwrap();
+        crate::test_scratch_dir::write_private(dir.join(persist::file_name_v2(root())), &text).unwrap();
         let (first, second) = (Window::open(&dir), Window::open(&dir));
         first.change();
         first.saver.save_now();
@@ -4303,7 +4303,7 @@ mod tests {
         // the copy is of that text now.
         let later = text.replace("\"chat\"", "\"pane\"");
         assert_ne!(later, text);
-        std::fs::write(dir.join(persist::file_name_v2(root())), &later).unwrap();
+        crate::test_scratch_dir::write_private(dir.join(persist::file_name_v2(root())), &later).unwrap();
         first.change();
         first.saver.save_now();
         assert_eq!(std::fs::read_to_string(partial(&dir)).unwrap(), later);
@@ -4605,7 +4605,7 @@ mod tests {
         persist::save(&dir, root(), &Workspaces::single(), &first_launch_layout(&[]).unwrap()).unwrap();
         let window = Window::open(&dir);
         let text = partly_usable_text();
-        std::fs::write(dir.join(persist::file_name_v2(root())), &text).unwrap();
+        crate::test_scratch_dir::write_private(dir.join(persist::file_name_v2(root())), &text).unwrap();
         window.change();
         window.saver.save_now();
         assert_eq!(std::fs::read_to_string(partial(&dir)).unwrap(), text);
@@ -4624,7 +4624,7 @@ mod tests {
         let overlays = serde_json::json!([{"module": "terminal#2", "opacity": 0.8}]);
         value["workspaces"][0]["overlays"] = overlays.clone();
         value["future"] = serde_json::json!({"a": 1});
-        std::fs::write(
+        crate::test_scratch_dir::write_private(
             dir.join(persist::file_name_v2(root())),
             serde_json::to_string_pretty(&value).unwrap(),
         )
@@ -4655,7 +4655,7 @@ mod tests {
         value["workspaces"][0]["overlays"] = serde_json::json!([{"module": "terminal#2", "w": 900, "h": 420}]);
         value["workspaces"][0]["overlay_memory"] = serde_json::json!({"x": 1});
         let later = serde_json::to_string_pretty(&value).unwrap();
-        std::fs::write(dir.join(persist::file_name_v2(root())), &later).unwrap();
+        crate::test_scratch_dir::write_private(dir.join(persist::file_name_v2(root())), &later).unwrap();
 
         window.saver.save_now();
         let again: serde_json::Value = serde_json::from_str(&file_text(&dir)).unwrap();

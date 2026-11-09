@@ -857,7 +857,7 @@ mod tests {
     fn one_unreadable_record_does_not_hide_the_rest() {
         let conv = unique_conversation_id("corrupt");
         save_conversation_record(&record(&conv, "prov-good", "2000")).unwrap();
-        std::fs::write(
+        crate::test_tmp::write_private(
             conversations_dir().unwrap().join(&conv).join("prov-corrupt.json"),
             "{ this is not json",
         )
@@ -875,7 +875,7 @@ mod tests {
         let dir = conversations_dir().unwrap();
         std::fs::create_dir_all(&dir).unwrap();
         let legacy = record(&conv, "prov-legacy", "2000");
-        std::fs::write(
+        crate::test_tmp::write_private(
             dir.join(format!("{conv}.json")),
             serde_json::to_string(&legacy).unwrap(),
         )
@@ -898,7 +898,7 @@ mod tests {
         let dir = conversations_dir().unwrap();
         std::fs::create_dir_all(&dir).unwrap();
         let legacy = record(&conv, "prov-legacy", "2000");
-        std::fs::write(
+        crate::test_tmp::write_private(
             dir.join(format!("{conv}.json")),
             serde_json::to_string(&legacy).unwrap(),
         )
@@ -909,7 +909,7 @@ mod tests {
         let older = unique_conversation_id("new-vs-legacy");
         std::fs::create_dir_all(&dir).unwrap();
         let legacy = record(&older, "prov-legacy", "3000");
-        std::fs::write(
+        crate::test_tmp::write_private(
             dir.join(format!("{older}.json")),
             serde_json::to_string(&legacy).unwrap(),
         )
@@ -1076,8 +1076,8 @@ mod tests {
 
         let fresh = dir.join(".fresh.tmp");
         let stale = dir.join(".stale.tmp");
-        std::fs::write(&fresh, b"x").unwrap();
-        std::fs::write(&stale, b"x").unwrap();
+        crate::test_tmp::write_private(&fresh, b"x").unwrap();
+        crate::test_tmp::write_private(&stale, b"x").unwrap();
         let old = std::time::SystemTime::now() - (STALE_TEMP_AGE * 2);
         std::fs::File::open(&stale).unwrap().set_modified(old).unwrap();
 
@@ -1146,7 +1146,7 @@ mod tests {
         let dir = conversations_dir().unwrap();
         std::fs::create_dir_all(&dir).unwrap();
         let legacy = record(&conv, "prov-legacy", "9000");
-        std::fs::write(
+        crate::test_tmp::write_private(
             dir.join(format!("{conv}.json")),
             serde_json::to_string(&legacy).unwrap(),
         )
@@ -1181,7 +1181,7 @@ mod tests {
         let dir = conversations_dir().unwrap();
         std::fs::create_dir_all(&dir).unwrap();
         let legacy = record(&conv, "prov-same", "4000");
-        std::fs::write(
+        crate::test_tmp::write_private(
             dir.join(format!("{conv}.json")),
             serde_json::to_string(&legacy).unwrap(),
         )
@@ -1233,7 +1233,7 @@ mod tests {
         std::fs::create_dir_all(&dir).unwrap();
         let mut legacy = record(&conv, "prov-same", "2000");
         legacy.created_at = "1234".into();
-        std::fs::write(
+        crate::test_tmp::write_private(
             dir.join(format!("{conv}.json")),
             serde_json::to_string(&legacy).unwrap(),
         )
@@ -1255,7 +1255,7 @@ mod tests {
         std::fs::create_dir_all(&dir).unwrap();
         let mut legacy = record(&conv, "prov-other", "2000");
         legacy.created_at = "1234".into();
-        std::fs::write(
+        crate::test_tmp::write_private(
             dir.join(format!("{conv}.json")),
             serde_json::to_string(&legacy).unwrap(),
         )
@@ -1272,7 +1272,7 @@ mod tests {
         std::fs::create_dir_all(&dir).unwrap();
         let mut legacy = record(&conv, "prov-same", "2000");
         legacy.created_at = "1234".into();
-        std::fs::write(
+        crate::test_tmp::write_private(
             dir.join(format!("{conv}.json")),
             serde_json::to_string(&legacy).unwrap(),
         )

@@ -295,7 +295,7 @@ mod tests {
     fn a_line_that_is_not_a_prefix_rule_is_skipped_not_fatal() {
         let dir = scratch("skip");
         let root = root();
-        std::fs::write(
+        crate::test_scratch_dir::write_private(
             path(&dir, &root),
             format!(
                 "{{\"version\":1,\"project_root\":{:?},\"rules\":[\"Bash(npm ci *)\",\"Read(*)\",\"Bash(rm)\"]}}",
@@ -316,7 +316,7 @@ mod tests {
     fn a_rule_the_card_never_offers_is_skipped_on_load() {
         let dir = scratch("wrapper");
         let root = root();
-        std::fs::write(
+        crate::test_scratch_dir::write_private(
             path(&dir, &root),
             format!(
                 "{{\"version\":1,\"project_root\":{:?},\"rules\":[\"Bash(env *)\",\"Bash(timeout *)\",\"Bash(git log *)\"]}}",
@@ -340,7 +340,7 @@ mod tests {
     fn saving_a_rule_keeps_the_lines_the_loader_refused() {
         let dir = scratch("keep-refused");
         let root = root();
-        std::fs::write(
+        crate::test_scratch_dir::write_private(
             path(&dir, &root),
             format!(
                 "{{\"version\":1,\"project_root\":{:?},\"rules\":[\"Bash(git st\\u00e4tus *)\",\"Bash(npm ci *)\",\"Bash(env *)\",\"Read(*)\",\"Bash(npm ci *)\"]}}",
@@ -493,7 +493,7 @@ mod tests {
     fn a_launch_leaves_an_unusable_file_another_window_is_writing() {
         let dir = scratch("startup-busy");
         let file = path(&dir, &root());
-        std::fs::write(&file, "{ not json").unwrap();
+        crate::test_scratch_dir::write_private(&file, "{ not json").unwrap();
         let held = held_by_another_window(&file);
         let (rules, notes) = startup(Some(&dir), &root());
         assert!(rules.is_empty());
@@ -512,13 +512,13 @@ mod tests {
     #[test]
     fn a_broken_or_foreign_file_is_set_aside_and_read_as_no_rules() {
         let dir = scratch("unusable");
-        std::fs::write(path(&dir, &root()), "{ not json").unwrap();
+        crate::test_scratch_dir::write_private(path(&dir, &root()), "{ not json").unwrap();
         let (rules, notes) = startup(Some(&dir), &root());
         assert!(rules.is_empty());
         assert!(notes.iter().any(|n| n.contains("set aside")), "{notes:?}");
         assert_eq!(load(&dir, &root()), LoadedRules::Missing);
         let foreign = "{\"version\":1,\"project_root\":\"/elsewhere\",\"rules\":[\"Bash(rm *)\"]}";
-        std::fs::write(path(&dir, &root()), foreign).unwrap();
+        crate::test_scratch_dir::write_private(path(&dir, &root()), foreign).unwrap();
         assert!(matches!(load(&dir, &root()), LoadedRules::Unusable(why) if why.contains("written for")));
         assert!(startup(None, &root()).0.is_empty());
     }

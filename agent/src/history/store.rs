@@ -824,7 +824,7 @@ mod tests {
         written.version = HISTORY_FORMAT_VERSION + 7;
         let path = history_path(&conversation_id, "sess-future").unwrap();
         std::fs::create_dir_all(path.parent().unwrap()).unwrap();
-        std::fs::write(&path, serde_json::to_string(&written).unwrap()).unwrap();
+        crate::test_tmp::write_private(&path, serde_json::to_string(&written).unwrap()).unwrap();
 
         match load(&conversation_id, "sess-future") {
             Err(HistoryLoadError::UnknownVersion { found, expected }) => {
@@ -1018,7 +1018,7 @@ mod tests {
         save(&history(&conversation_id, "sess-orphan")).unwrap();
         remove(&conversation_id, "sess-orphan").unwrap();
         let orphan = history_path(&conversation_id, "sess-orphan").unwrap();
-        std::fs::write(
+        crate::test_tmp::write_private(
             &orphan,
             serde_json::to_string(&history(&conversation_id, "sess-orphan")).unwrap(),
         )

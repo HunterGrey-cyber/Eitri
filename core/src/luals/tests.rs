@@ -2,7 +2,11 @@ use super::*;
 use crate::onboarding::{write::write_init_with_data, Lang, WriteOutcome};
 use crate::plugin::test_support::Scratch;
 use std::collections::BTreeSet;
-use std::os::unix::fs::{MetadataExt, PermissionsExt};
+use std::os::unix::fs::{DirBuilderExt, MetadataExt, PermissionsExt};
+
+fn create_dirs(path: impl AsRef<Path>) -> std::io::Result<()> {
+    std::fs::DirBuilder::new().recursive(true).mode(0o700).create(path)
+}
 
 fn env_at(home: &Path) -> impl Fn(&str) -> Option<OsString> + '_ {
     move |key| (key == "HOME").then(|| home.as_os_str().to_owned())
@@ -46,7 +50,7 @@ fn meta_install_writes_only_changed_bytes_and_replaces_atomically() {
 fn meta_install_failure_leaves_no_temporary_file() {
     let scratch = Scratch::new("luals-install-failure");
     let data = scratch.0.join("eitri");
-    std::fs::create_dir_all(data.join("lua/meta/eitri.lua")).unwrap();
+    create_dirs(data.join("lua/meta/eitri.lua")).unwrap();
     assert!(install_meta(&data).is_err());
     assert_eq!(std::fs::read_dir(data.join("lua/meta")).unwrap().count(), 1);
 }
@@ -56,8 +60,8 @@ fn meta_install_writes_nothing_through_a_linked_directory() {
     let scratch = Scratch::new("luals-linked-dir");
     let data = scratch.0.join("eitri");
     let elsewhere = scratch.0.join("nvim-lua");
-    std::fs::create_dir_all(data.join("lua")).unwrap();
-    std::fs::create_dir(&elsewhere).unwrap();
+    create_dirs(data.join("lua")).unwrap();
+    create_dirs(&elsewhere).unwrap();
     std::os::unix::fs::symlink(&elsewhere, data.join("lua/meta")).unwrap();
     let error = install_meta(&data).unwrap_err();
     assert!(error.to_string().contains("not a directory of its own"), "{error}");
@@ -74,11 +78,11 @@ fn meta_install_makes_nothing_inside_a_linked_eitri_or_lua_directory() {
         let scratch = Scratch::new("luals-linked-parent");
         let data = scratch.0.join("eitri");
         let elsewhere = scratch.0.join("nvim-lua");
-        std::fs::create_dir(&elsewhere).unwrap();
+        create_dirs(&elsewhere).unwrap();
         if linked.is_empty() {
             std::os::unix::fs::symlink(&elsewhere, &data).unwrap();
         } else {
-            std::fs::create_dir(&data).unwrap();
+            create_dirs(&data).unwrap();
             std::os::unix::fs::symlink(&elsewhere, data.join(linked)).unwrap();
         }
         let error = install_meta(&data).unwrap_err();
@@ -98,7 +102,7 @@ fn meta_install_makes_nothing_inside_a_linked_eitri_or_lua_directory() {
 fn meta_install_writes_nothing_in_a_directory_others_may_change() {
     let scratch = Scratch::new("luals-shared-dir");
     let data = scratch.0.join("eitri");
-    std::fs::create_dir_all(data.join("lua/meta")).unwrap();
+    create_dirs(data.join("lua/meta")).unwrap();
     std::fs::set_permissions(data.join("lua"), std::fs::Permissions::from_mode(0o777)).unwrap();
     let error = install_meta(&data).unwrap_err();
     assert!(error.to_string().contains("writable by others"), "{error}");
@@ -110,7 +114,7 @@ fn luarc_creates_json_and_installs_meta_only_inside_the_two_directories() {
     let scratch = Scratch::new("luals-home");
     let home = &scratch.0;
     let config = home.join(".config/eitri");
-    std::fs::create_dir(home.join(".config")).unwrap();
+    create_dirs(home.join(".config")).unwrap();
     let data = home.join(".local/share/eitri");
     assert_eq!(
         write_luarc(&config, &data).unwrap(),
@@ -147,7 +151,7 @@ fn luarc_preserves_existing_json_jsonc_and_dangling_links() {
         for link in [false, true] {
             let scratch = Scratch::new("luals-existing");
             let config = scratch.0.join("config");
-            std::fs::create_dir(&config).unwrap();
+            create_dirs(&config).unwrap();
             let data = scratch.0.join("data/eitri");
             let path = config.join(name);
             if link {
@@ -189,7 +193,7 @@ fn onboarding_adds_luarc_only_after_written_and_keeps_the_init_outcome_on_failur
     ));
     assert!(!config.join(".luarc.json").exists());
     let refused = scratch.0.join("refused");
-    std::fs::create_dir(&refused).unwrap();
+    create_dirs(&refused).unwrap();
     std::fs::set_permissions(&refused, std::fs::Permissions::from_mode(0o777)).unwrap();
     assert!(matches!(
         write_init_with_data(&refused, &data, "text", Lang::En),
@@ -210,7 +214,7 @@ fn onboarding_adds_luarc_only_after_written_and_keeps_the_init_outcome_on_failur
 fn onboarding_never_overwrites_a_workspace() {
     let scratch = Scratch::new("luals-onboarding-existing");
     let config = scratch.0.join("config");
-    std::fs::create_dir(&config).unwrap();
+    create_dirs(&config).unwrap();
     std::fs::write(config.join(".luarc.json"), "user bytes").unwrap();
     assert!(matches!(
         write_init_with_data(&config, &scratch.0.join("data"), "init", Lang::En),
@@ -256,7 +260,7 @@ fn data_dir_obeys_absolute_xdg_and_home_fallback() {
 fn setup_aliases_create_and_existing_prints_the_line_with_exit_zero() {
     for target in ["lua-ls", "lua_ls", "luals"] {
         let scratch = Scratch::new("luals-setup");
-        std::fs::create_dir(scratch.0.join(".config")).unwrap();
+        create_dirs(scratch.0.join(".config")).unwrap();
         let mut out = Vec::new();
         let mut err = Vec::new();
         let args = [OsString::from(target)];

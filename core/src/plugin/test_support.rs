@@ -11,6 +11,7 @@ impl Scratch {
     pub fn new(label: &str) -> Scratch {
         let dir = std::env::temp_dir().join(format!("eitri-plugin-{label}-{}", uuid::Uuid::new_v4().simple()));
         std::fs::create_dir_all(&dir).unwrap();
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700)).unwrap();
         // Canonical, so tests compare with the paths the code under test canonicalises.
         Scratch(std::fs::canonicalize(&dir).unwrap())
     }

@@ -1291,13 +1291,16 @@ pub(crate) fn update_choice(
 /// private reader's refusals name the path, so only the OS's own errors are quoted.
 fn read_selected(path: &Path) -> Result<Option<(String, SidecarVersion)>, String> {
     let not_a_version = || "the selected file does not name a version".to_string();
-    let text = match crate::private_fs::read_private_to_string_capped(path, MAX_SELECTED_BYTES) {
+    let text = match crate::private_fs::read_sidecar_selection_capped(path, MAX_SELECTED_BYTES) {
         Ok(text) => text,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
         // Over the cap, or not text.
         Err(error) if error.kind() == std::io::ErrorKind::InvalidData => return Err(not_a_version()),
         Err(error) if error.raw_os_error().is_some() => {
             return Err(format!("the selected file cannot be read ({error})"))
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::PermissionDenied => {
+            return Err("the selected file is writable by its group or by others".to_string())
         }
         Err(_) => return Err("the selected file is not a regular file of this user".to_string()),
     };
@@ -3320,7 +3323,7 @@ mod tests {
         }
 
         fn select(&self, contents: impl AsRef<[u8]>) {
-            std::fs::write(self.sidecar_dir().join("selected"), contents).unwrap();
+            crate::test_tmp::write_private(self.sidecar_dir().join("selected"), contents).unwrap();
         }
 
         fn build(&self, version: &str) -> PathBuf {
@@ -3453,6 +3456,32 @@ mod tests {
         contents.resize(1024 * 1024, b'x');
         fixture.select(&contents);
         assert_eq!(fixture.unusable(), "the selected file does not name a version");
+    }
+
+    #[test]
+    fn a_group_writable_selected_file_is_tightened_and_used() {
+        use std::os::unix::fs::PermissionsExt;
+        let fixture = UpdateFixture::new();
+        fixture.select("version=0.3.2\n");
+        fixture.build("0.3.2");
+        let path = fixture.sidecar_dir().join("selected");
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o664)).unwrap();
+        assert!(matches!(fixture.choice(), UpdateChoice::Use { .. }));
+        assert_eq!(std::fs::metadata(path).unwrap().permissions().mode() & 0o777, 0o600);
+    }
+
+    #[test]
+    fn an_other_writable_selected_file_reports_its_permissions() {
+        use std::os::unix::fs::PermissionsExt;
+        let fixture = UpdateFixture::new();
+        fixture.select("version=0.3.2\n");
+        let path = fixture.sidecar_dir().join("selected");
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o602)).unwrap();
+        assert_eq!(
+            fixture.unusable(),
+            "the selected file is writable by its group or by others"
+        );
+        assert_eq!(std::fs::metadata(path).unwrap().permissions().mode() & 0o777, 0o602);
     }
 
     #[test]
@@ -3624,7 +3653,7 @@ mod tests {
             std::fs::create_dir_all(sidecar.join("updates/0.3.2")).unwrap();
             std::fs::write(sidecar.join("updates/0.3.2/BUILD"), b"built\n").unwrap();
             std::fs::write(sidecar.join("updates/0.3.2").join(PACKAGED_SIDECAR_BINARY), b"x").unwrap();
-            std::fs::write(sidecar.join("selected"), b"version=0.3.2\n").unwrap();
+            crate::test_tmp::write_private(sidecar.join("selected"), b"version=0.3.2\n").unwrap();
         }
         let path_with = |xdg: Option<&OsStr>| match update_choice(
             None,

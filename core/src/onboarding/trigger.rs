@@ -398,7 +398,7 @@ mod tests {
         let inputs = s.inputs();
         let path = inputs.marker.clone().unwrap();
         std::fs::create_dir_all(path.parent().unwrap()).unwrap();
-        std::fs::write(&path, text).unwrap();
+        crate::test_scratch_dir::write_private(&path, text).unwrap();
         inputs
     }
 

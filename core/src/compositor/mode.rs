@@ -496,9 +496,9 @@ mod tests {
         assert_eq!(read_mode_state(&dir, Path::new("/other")), ModeState::default());
         let file = state_file(&dir, root);
         assert!(file.to_string_lossy().ends_with(".cm-mode.json"));
-        std::fs::write(&file, "{not json").unwrap();
+        crate::test_scratch_dir::write_private(&file, "{not json").unwrap();
         assert_eq!(read_mode_state(&dir, root), ModeState::default());
-        std::fs::write(&file, vec![b' '; 10_000]).unwrap();
+        crate::test_scratch_dir::write_private(&file, vec![b' '; 10_000]).unwrap();
         assert_eq!(read_mode_state(&dir, root), ModeState::default());
     }
 

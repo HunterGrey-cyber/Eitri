@@ -563,7 +563,7 @@ mod tests {
             "{{\"version\":1,\"project_root\":{:?},\"permission_mode\":\"bypass\"}}",
             root().to_string_lossy()
         );
-        std::fs::write(&path, &raw).unwrap();
+        crate::test_scratch_dir::write_private(&path, &raw).unwrap();
         assert_eq!(
             load_mode(&dir, &root()),
             LoadedMode::Remembered(SessionModeChoice::Bypass),
@@ -593,7 +593,7 @@ mod tests {
     #[test]
     fn another_projects_file_or_a_broken_one_is_unusable_and_set_aside_at_startup() {
         let dir = scratch("unusable");
-        std::fs::write(dir.join(crate::state_paths::file_name(&root())), "{ not json").unwrap();
+        crate::test_scratch_dir::write_private(dir.join(crate::state_paths::file_name(&root())), "{ not json").unwrap();
         assert!(matches!(load_mode(&dir, &root()), LoadedMode::Unusable(_)));
         let (mode, notes) = startup_mode(Some(&dir), &root());
         assert_eq!(mode, SessionModeChoice::Auto, "read as nothing: the startup default");
@@ -608,7 +608,7 @@ mod tests {
         );
 
         let foreign = "{\"version\":1,\"project_root\":\"/home/user/elsewhere\",\"permission_mode\":\"bypass\"}";
-        std::fs::write(dir.join(crate::state_paths::file_name(&root())), foreign).unwrap();
+        crate::test_scratch_dir::write_private(dir.join(crate::state_paths::file_name(&root())), foreign).unwrap();
         assert!(
             matches!(load_mode(&dir, &root()), LoadedMode::Unusable(why) if why.contains("written for")),
             "a file under this project's name but written for another root is not this project's"
@@ -793,12 +793,12 @@ mod tests {
             "{{\"version\":1,\"project_root\":{:?},\"permission_mode\":\"bypass\"}}",
             root().to_string_lossy()
         );
-        std::fs::write(&path, raw).unwrap();
+        crate::test_scratch_dir::write_private(&path, raw).unwrap();
         assert!(
             !remembers_a_choice(Some(&dir), &root()),
             "a pre-v1 bypass is not a choice"
         );
-        std::fs::write(&path, "{ not json").unwrap();
+        crate::test_scratch_dir::write_private(&path, "{ not json").unwrap();
         assert!(!remembers_a_choice(Some(&dir), &root()));
         assert!(path.exists(), "asking never moves the file");
     }
