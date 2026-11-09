@@ -910,7 +910,9 @@ mod tests {
         assert!(polls(&handle), "a view being written");
         handle.state.borrow_mut().view_jobs.clear();
 
-        let mut scratch = eitri_core::scratch::ScratchDir::new().expect("a scratch directory");
+        // In a workspace under the state root, which is removed with it, not loose in the shared temp dir.
+        let scratch_root = agent::state_dirs::test_workspace_dir("panel-scratch-polls");
+        let mut scratch = eitri_core::scratch::ScratchDir::in_dir(&scratch_root).expect("a scratch directory");
         let (_request, edit) = scratch.prepare_edit("draft").unwrap();
         handle.state.borrow_mut().pending_edits.push(edit);
         assert!(polls(&handle), "a scratch edit");

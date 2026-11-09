@@ -3049,7 +3049,9 @@ mod tests {
         let why = handle.view_in_editor("init.lua lines", "x").unwrap_err();
         assert!(why.contains("scratch directory"), "{why}");
         assert_eq!(*asked.borrow(), 0, "the editor was not asked");
-        handle.state.borrow_mut().scratch = Some(eitri_core::scratch::ScratchDir::new().unwrap());
+        // In a workspace under the state root, which is removed with it, not loose in the shared temp dir.
+        let scratch_root = agent::state_dirs::test_workspace_dir("panel-view-scratch");
+        handle.state.borrow_mut().scratch = Some(eitri_core::scratch::ScratchDir::in_dir(&scratch_root).unwrap());
         handle.view_in_editor("init.lua lines", "x").unwrap();
         assert_eq!(*asked.borrow(), 1);
     }

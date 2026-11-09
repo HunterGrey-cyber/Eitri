@@ -592,9 +592,20 @@ impl PrivateLock {
     /// One try at the exclusive lock, never waiting: `true` when this now holds it (or already did),
     /// `false` when another open of the file holds it.
     pub fn try_lock(&self) -> std::io::Result<bool> {
+        self.try_flock(libc::LOCK_EX)
+    }
+
+    /// One try at a shared hold, never waiting: `true` when no other open of the file holds the exclusive
+    /// lock. Shared holds never exclude each other, so a look taken this way cannot make another look fail;
+    /// it does keep [`try_lock`](Self::try_lock) from succeeding elsewhere for as long as it is held.
+    pub fn try_lock_shared(&self) -> std::io::Result<bool> {
+        self.try_flock(libc::LOCK_SH)
+    }
+
+    fn try_flock(&self, kind: libc::c_int) -> std::io::Result<bool> {
         loop {
             // SAFETY: the descriptor is `self.file`'s own and open for the call; `flock` takes no pointers.
-            if unsafe { libc::flock(self.file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } == 0 {
+            if unsafe { libc::flock(self.file.as_raw_fd(), kind | libc::LOCK_NB) } == 0 {
                 return Ok(true);
             }
             let err = std::io::Error::last_os_error();

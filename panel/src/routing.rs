@@ -957,7 +957,8 @@ mod tests {
         handle.on_editor_done(move |_view| {
             hooked.focus_oldest_card(ViewId::BASE);
         });
-        let mut scratch = eitri_core::scratch::ScratchDir::new().expect("a scratch directory");
+        // In the test's workspace, which goes with the state root, not loose in the shared temp dir.
+        let mut scratch = eitri_core::scratch::ScratchDir::in_dir(&dir).expect("a scratch directory");
         let (_request, edit) = scratch.prepare_edit("draft").unwrap();
         handle
             .state

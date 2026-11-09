@@ -1552,7 +1552,8 @@ mod question_tests {
         let dir = agent::state_dirs::test_workspace_dir(label);
         let (handle, base, _) = handle_with_two_pages();
         let (tab, provider) = live_tab(&handle, &dir);
-        handle.state.borrow_mut().scratch = Some(eitri_core::scratch::ScratchDir::new().unwrap());
+        // In the test's workspace, which goes with the state root, not loose in the shared temp dir.
+        handle.state.borrow_mut().scratch = Some(eitri_core::scratch::ScratchDir::in_dir(&dir).unwrap());
         provider.queue(asked("q1"));
         tick_handle_until(&handle, "question", || question_state(&handle, tab, "q1").is_some());
         handle.set_answer_gate(Rc::new(|_| panic!("editing a question answers nothing")));

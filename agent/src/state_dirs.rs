@@ -202,13 +202,13 @@ fn account_home_dir() -> std::io::Result<PathBuf> {
 /// call wins and every later one returns the same root, so a test file can call it from each of its
 /// own helpers without coordinating.
 ///
-/// The root is `$TMPDIR/eitri-agent-test-state/<pid>`. Keyed on the pid rather than a fresh uuid
-/// deliberately: libtest has no after-all-tests hook, so nothing can delete the root when the run
-/// ends, and a uuid would leave one directory behind per `cargo test` invocation forever. A pid can
-/// instead be checked for liveness by the NEXT run, which is what `prune_dead_roots` does below --
-/// so what accumulates is one directory per test binary currently running, not one per run ever
-/// made. It is still true that a root outlives its own run until something prunes it; the claim
-/// here is bounded growth, not immediate cleanup.
+/// The root is `$TMPDIR/eitri-agent-test-state/<pid>`. libtest has no after-all-tests hook, so the
+/// root is removed by a C `atexit` handler ([`remove_test_root_at_exit`]), which runs when the test
+/// binary returns from `main` or calls `exit`, passing or failing; the parent goes with it when no
+/// other running binary has a root there. A run that is killed runs no handler, so its root is left;
+/// keyed on the pid, it is found by the next run's `prune_dead_roots` once that pid is gone (a root
+/// made inside another pid namespace may name a pid that is alive out here, and is only ever
+/// removed by its own handler).
 #[doc(hidden)]
 pub fn redirect_state_to_a_test_root() -> PathBuf {
     TEST_ROOT
@@ -220,9 +220,44 @@ pub fn redirect_state_to_a_test_root() -> PathBuf {
             // exist. Start it empty rather than inheriting someone else's records.
             let _ = std::fs::remove_dir_all(&root);
             std::fs::create_dir_all(&root).expect("creating the test state root should succeed");
+            ROOT_OWNER.store(std::process::id(), std::sync::atomic::Ordering::SeqCst);
+            // SAFETY: registers a plain `extern "C"` function with no arguments; it never unwinds.
+            unsafe { libc::atexit(remove_test_root_at_exit) };
             root
         })
         .clone()
+}
+
+/// The pid that made [`TEST_ROOT`]: a child forked from the test process that calls `exit` instead of
+/// `_exit` runs the parent's `atexit` handlers too, and must not remove a root the parent still uses.
+static ROOT_OWNER: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+
+/// Removes this process's test root, then its parent if that is empty. Never panics (it runs inside
+/// `exit`): a root that cannot be removed is left for `prune_dead_roots`. A thread nothing joins (a
+/// prompt history's writer) can still be writing into the root while the process exits and make part
+/// of it again, so the root is removed until it has stayed gone for 50 ms, for at most 5 s; the
+/// process ends right after, and such a thread with it.
+extern "C" fn remove_test_root_at_exit() {
+    use std::time::{Duration, Instant};
+    if ROOT_OWNER.load(std::sync::atomic::Ordering::SeqCst) != std::process::id() {
+        return;
+    }
+    let Some(root) = TEST_ROOT.get() else { return };
+    let give_up = Instant::now() + Duration::from_secs(5);
+    let mut gone_since = None;
+    while Instant::now() < give_up {
+        if std::fs::symlink_metadata(root).is_ok() {
+            let _ = std::fs::remove_dir_all(root);
+            gone_since = None;
+        } else if gone_since.get_or_insert_with(Instant::now).elapsed() >= Duration::from_millis(50) {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    // Only an empty parent goes: another test binary running now keeps its own root there.
+    if let Some(parent) = root.parent() {
+        let _ = std::fs::remove_dir(parent);
+    }
 }
 
 /// A workspace directory under the test root, created and returned.
@@ -285,6 +320,43 @@ fn prune_dead_roots(parent: &Path) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A test binary that redirected its state leaves nothing in the temp dir once it exits: a
+    /// fresh copy of this binary under a private `TMPDIR` makes a workspace in its root and ends,
+    /// and neither the root nor `eitri-agent-test-state` is there afterwards.
+    #[test]
+    fn a_test_binary_leaves_no_state_root_behind_when_it_exits() {
+        const CHILD: &str = "EITRI_TEST_STATE_ROOT_CHILD";
+        if std::env::var_os(CHILD).is_some() {
+            let dir = test_workspace_dir("exit");
+            std::fs::write(dir.join("record"), "kept until exit").unwrap();
+            assert!(dir.starts_with(std::env::temp_dir()), "{dir:?}");
+            return;
+        }
+        let tmp = crate::test_tmp::TmpDir::new("nv-state-exit", "child");
+        let out = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "state_dirs::tests::a_test_binary_leaves_no_state_root_behind_when_it_exits",
+                "--exact",
+                "--test-threads=1",
+            ])
+            .env(CHILD, "1")
+            .env("TMPDIR", &*tmp)
+            .output()
+            .unwrap();
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        assert!(
+            out.status.success() && stdout.contains("1 passed"),
+            "the child run failed or ran nothing:\n{stdout}\n{}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        let left: Vec<_> = std::fs::read_dir(&*tmp)
+            .unwrap()
+            .flatten()
+            .map(|entry| entry.file_name())
+            .collect();
+        assert!(left.is_empty(), "left in the child's TMPDIR: {left:?}");
+    }
 
     /// Both directories must land under the redirect, or a test run writes into the developer's
     /// real XDG directories -- the defect this module exists to close.

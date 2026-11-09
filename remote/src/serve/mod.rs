@@ -543,7 +543,10 @@ mod linux {
         )
     }
 
-    /// Whether a `serve` holds the lock now.
+    /// Whether a `serve` holds the lock now. Looked at with a shared hold, so only `serve`'s exclusive one reads as
+    /// held: two looks at once (two windows, or a window's switch and its socket's maintenance poll) never take each
+    /// other for a running `serve`, and neither does a look whose descriptor a child forked in that moment still holds
+    /// until its `exec`. A look still keeps `serve` from taking the lock for its moment, which `take_lock` waits out.
     pub fn is_running(dirs: &Dirs) -> io::Result<bool> {
         let path = dirs.control.join(LOCK_FILE);
         match std::fs::symlink_metadata(&path) {
@@ -551,7 +554,7 @@ mod linux {
             Err(e) => return Err(e),
             Ok(_) => {}
         }
-        Ok(!PrivateLock::open(&path)?.try_lock()?)
+        Ok(!PrivateLock::open(&path)?.try_lock_shared()?)
     }
 
     fn accept_all(listeners: Listeners, cfg: Arc<ServeConfig>, hub: Arc<Hub>, place: Arc<Listener>) {
@@ -1067,6 +1070,54 @@ mod linux {
                 refused.fields.get("device").is_none(),
                 "a refusal before hello names no device"
             );
+        }
+
+        /// Two looks at a free lock at once: an exclusive look made the other one fail and read a stopped `serve` as
+        /// running, which a window then did not start.
+        #[test]
+        fn two_looks_at_once_never_read_a_stopped_serve_as_running() {
+            let dir = scratch("looks");
+            let dirs = Dirs {
+                control: dir.join("control"),
+                state: dir.join("state"),
+            };
+            std::fs::create_dir_all(&dirs.control).unwrap();
+            drop(PrivateLock::open(&dirs.control.join(LOCK_FILE)).unwrap());
+            let held = std::sync::atomic::AtomicUsize::new(0);
+            std::thread::scope(|s| {
+                for _ in 0..2 {
+                    s.spawn(|| {
+                        for _ in 0..5000 {
+                            if is_running(&dirs).unwrap() {
+                                held.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                            }
+                        }
+                    });
+                }
+            });
+            assert_eq!(held.into_inner(), 0, "looks read as a running serve");
+        }
+
+        /// A look's hold left open (the descriptor of a child forked during the look, until its `exec`) is no running
+        /// `serve`; `serve`'s own exclusive hold is.
+        #[test]
+        fn only_an_exclusive_hold_is_a_running_serve() {
+            let dir = scratch("holds");
+            let dirs = Dirs {
+                control: dir.join("control"),
+                state: dir.join("state"),
+            };
+            std::fs::create_dir_all(&dirs.control).unwrap();
+            let path = dirs.control.join(LOCK_FILE);
+            let look = PrivateLock::open(&path).unwrap();
+            assert!(look.try_lock_shared().unwrap());
+            assert!(!is_running(&dirs).unwrap(), "a look's shared hold read as serve");
+            drop(look);
+            let serve = PrivateLock::open(&path).unwrap();
+            assert!(serve.try_lock().unwrap());
+            assert!(is_running(&dirs).unwrap());
+            drop(serve);
+            assert!(!is_running(&dirs).unwrap());
         }
 
         #[test]

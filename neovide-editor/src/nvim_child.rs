@@ -586,10 +586,22 @@ mod tests {
         dir
     }
 
+    /// Waits until `pid` shows the argv it was spawned with (`--embed` in it), which [`NvimChild::find_new`]
+    /// reads. `spawn` can return before that: glibc's vfork-based `posix_spawn` lets the parent run on as soon
+    /// as the child has its new address space, before the kernel has set its argv and `exe`, so for a moment
+    /// `/proc/<pid>/cmdline` is empty and the child is no `--embed` child yet. The deadline is a hang guard.
+    fn exec_seen(pid: u32) {
+        let deadline = Instant::now() + Duration::from_secs(60);
+        while !imp::argv_has_embed(pid) {
+            assert!(Instant::now() < deadline, "pid {pid} never showed its --embed argv");
+            std::thread::sleep(Duration::from_millis(1));
+        }
+    }
+
     /// `nvim --embed`, as the fork starts it, with nothing attached: it waits on its stdin for a UI,
-    /// which is as good as hung for a quit that never gets answered.
+    /// which is as good as hung for a quit that never gets answered. Returns once its exec shows ([`exec_seen`]).
     fn spawn_embed(dir: &Path, extra: &[&str]) -> Child {
-        Command::new("nvim")
+        let child = Command::new("nvim")
             .args(["--clean", "--embed", "--headless"])
             .args(extra)
             .current_dir(dir)
@@ -600,7 +612,9 @@ mod tests {
             .stdout(Stdio::piped())
             .stderr(Stdio::null())
             .spawn()
-            .expect("nvim must be on PATH for this test")
+            .expect("nvim must be on PATH for this test");
+        exec_seen(child.id());
+        child
     }
 
     fn running(pid: u32) -> bool {
@@ -882,11 +896,7 @@ mod tests {
             .args(["-c", "sleep 30; :", "--embed"])
             .spawn()
             .expect("sh");
-        let deadline = Instant::now() + Duration::from_secs(5);
-        while !imp::argv_has_embed(other.id()) {
-            assert!(Instant::now() < deadline, "sh never started");
-            std::thread::sleep(Duration::from_millis(10));
-        }
+        exec_seen(other.id());
         let process = NvimProcess::new(NvimChild::find_new(&before));
         let watched = process.nvim_pid();
         let ended = end(&process, Instant::now(), QUICK, &mut || {});
@@ -934,6 +944,7 @@ mod tests {
             })
             .expect("the wrapper");
         let launcher = launched.id().expect("pid");
+        exec_seen(launcher);
         let process = NvimProcess::new(NvimChild::find_new(&before));
         assert_eq!(process.launched_pid(), Some(launcher));
         let reported = crate::nvim_rpc::block_on(nvim.call_function("getpid", vec![]))
@@ -1076,6 +1087,7 @@ mod tests {
             .stderr(Stdio::null())
             .spawn()
             .expect("nvim must be on PATH for this test");
+        exec_seen(nvim.id());
         let process = NvimProcess::new(NvimChild::find_new(&before));
         let mut stdout = nvim.stdout.take().expect("stdout");
         std::thread::spawn(move || std::io::copy(&mut stdout, &mut std::io::sink()));
