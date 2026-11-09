@@ -5,9 +5,9 @@
 //! later takes out unsent (its mode widened) gets a second `result`, a refusal.
 //!
 //! The socket's own verdicts are recorded in the window's audit log: a device and token the store does not hold as a
-//! pair (`bad_token`, naming the device id as the peer gave it), a device that may only watch (`grant`), and a row key
-//! that is not a key (`tab_not_live`), each with the kind when it is one a phone may send. What
-//! [`AgentPanelHandle::remote_message`] decides it records itself.
+//! pair (`bad_token`, naming the device id as the peer gave it), authority withdrawn before dispatch (`revoked_token`),
+//! a device that may only watch (`grant`), and a row key that is not a key (`tab_not_live`), each with the kind when it
+//! is one a phone may send. What [`AgentPanelHandle::remote_message`] decides it records itself.
 
 use super::*;
 use eitri_core::remote_audit::{DeviceRef, Event as AuditEvent, Reason};
@@ -21,6 +21,7 @@ const NOT_AUTHORIZED: &str = "not authorized";
 /// An `act` as the reader hands it to the tick.
 pub(super) struct ActInbound {
     key: String,
+    authority: Option<eitri_core::remote_devices::AuthorizationStamp>,
     /// The device's id and name when it may steer, else why not.
     verdict: Result<(String, String), &'static str>,
     raw: String,
@@ -47,17 +48,18 @@ impl ActInbound {
         else {
             return None;
         };
-        let (verdict, name) = match DeviceStore::load(&shared.store) {
-            Ok(store) => match store.verify(&device, token.expose()) {
-                Some((name, Grant::WatchSteer)) => (Ok((device.clone(), name.clone())), Some(name)),
-                Some((name, Grant::Watch)) => (Err(WATCH_ONLY), Some(name)),
-                None => (Err(NOT_AUTHORIZED), None),
-            },
-            Err(e) => {
-                eprintln!("[agent_panel] remote: the device store is not used: {e}");
-                (Err(NOT_AUTHORIZED), None)
-            }
-        };
+        let (verdict, name, authority) =
+            match eitri_core::remote_devices::authorize_act(&shared.store, &device, token.expose()) {
+                Ok(Some((name, Grant::WatchSteer, stamp))) => {
+                    (Ok((device.clone(), name.clone())), Some(name), Some(stamp))
+                }
+                Ok(Some((name, Grant::Watch, _))) => (Err(WATCH_ONLY), Some(name), None),
+                Ok(None) => (Err(NOT_AUTHORIZED), None, None),
+                Err(e) => {
+                    eprintln!("[agent_panel] remote: the device store is not used: {e}");
+                    (Err(NOT_AUTHORIZED), None, None)
+                }
+            };
         let kind = cmd
             .get("type")
             .and_then(serde_json::Value::as_str)
@@ -68,6 +70,7 @@ impl ActInbound {
             .filter(|id| id.len() <= COMMAND_ID_MAX_BYTES)
             .map(str::to_owned);
         Some(ActInbound {
+            authority,
             key,
             verdict,
             raw: cmd.to_string(),
@@ -83,6 +86,7 @@ impl RemoteSocket {
     /// Carries out an `act` on the tick and answers it.
     pub(super) fn take_act(&self, handle: &AgentPanelHandle, conn: u64, act: ActInbound) {
         let ActInbound {
+            authority,
             key,
             verdict,
             raw,
@@ -91,7 +95,10 @@ impl RemoteSocket {
             name,
             kind,
         } = act;
+        let withdrawn = verdict.is_ok() && authority.is_none_or(|stamp| !stamp.is_current());
+        let verdict = if withdrawn { Err(NOT_AUTHORIZED) } else { verdict };
         let refused = match (&verdict, RowKey::parse(&key)) {
+            (Err(_), _) if withdrawn => Some(Reason::RevokedToken),
             (Err(why), _) if *why == WATCH_ONLY => Some(Reason::Grant),
             (Err(_), _) => Some(Reason::BadToken),
             (Ok(_), None) => Some(Reason::TabNotLive),
@@ -180,6 +187,107 @@ pub(super) fn refusal_text(why: &RemoteRefusal) -> String {
 mod tests {
     use super::super::tests::{Rig, PATIENCE};
     use super::*;
+
+    #[test]
+    fn an_act_withdrawn_before_dispatch_is_refused_without_reaching_the_tab() {
+        use crate::agent_panel::tests::{handle_with_two_pages, live_tab};
+        use eitri_core::remote_devices::{token_hash_hex, update};
+        for withdrawal in ["revoke", "downgrade", "replace-token"] {
+            let dir = agent::state_dirs::test_workspace_dir(withdrawal);
+            let store = dir.join("devices.json");
+            agent::private_fs::write_private(
+                &store,
+                serde_json::json!({"v": 1, "devices": [{
+                    "id": "d1", "name": "phone", "token_sha256": token_hash_hex("tok"), "grant": "watch+steer",
+                }]})
+                .to_string()
+                .as_bytes(),
+            )
+            .unwrap();
+            let (handle, _, _) = handle_with_two_pages();
+            let (tab, provider) = live_tab(&handle, &dir);
+            let key = handle
+                .state
+                .borrow()
+                .tabs
+                .get(tab)
+                .unwrap()
+                .row_key()
+                .as_str()
+                .to_owned();
+            let (inbound, rx) = mpsc::sync_channel(INBOUND_LINES);
+            let wake: agent::UiWake = Arc::new(|| {});
+            let shared = Arc::new(Shared {
+                inbound,
+                wake: wake.clone(),
+                store: store.clone(),
+                deadlines: Deadlines::default(),
+                live: AtomicUsize::new(0),
+                next_conn: AtomicU64::new(1),
+                stopped: AtomicBool::new(false),
+                devices: devices::DevicesShared::new("b4e1c09a7d3f5e21"),
+                serve_probe: std::sync::Mutex::new(None),
+                audit: AuditSink::open(&dir, "b4e1c09a7d3f5e21", wake),
+            });
+            let (stream, _peer) = UnixStream::pair().unwrap();
+            let (out, answers) = mpsc::channel();
+            let socket = RemoteSocket {
+                listener: None,
+                shared,
+                inbound: rx,
+                conns: RefCell::new(BTreeMap::from([(
+                    1,
+                    Conn {
+                        stream,
+                        out,
+                        gauge: Arc::new(Gauge::default()),
+                        observers: BTreeMap::new(),
+                    },
+                )])),
+                reaper: RefCell::new(None),
+                feed: feed::FeedState::default(),
+                closes: RefCell::new(Vec::new()),
+            };
+            let act = ActInbound::read(
+                RvInbound::Act {
+                    v: eitri_core::remote_rv::RV_PROTOCOL,
+                    device: "d1".into(),
+                    token: eitri_core::remote_rv::Secret::new("tok"),
+                    key,
+                    cmd: serde_json::json!({"type": "send", "command_id": "withdrawn", "text": "hello"}),
+                },
+                &socket.shared,
+            )
+            .unwrap();
+            assert!(act.verdict.is_ok());
+            update(&store, |s| match withdrawal {
+                "revoke" => {
+                    s.remove("d1");
+                }
+                "downgrade" => s.get_mut("d1").unwrap().grant = Grant::Watch,
+                _ => s.get_mut("d1").unwrap().token_sha256 = [42; 32],
+            })
+            .unwrap();
+            socket.take_act(&handle, 1, act);
+            let result: serde_json::Value =
+                serde_json::from_str(&answers.try_recv().expect("a refusal is answered").line).unwrap();
+            assert_eq!(result["ok"], false);
+            assert_eq!(result["why"], NOT_AUTHORIZED);
+            socket.audit().flush();
+            let records =
+                eitri_core::remote_audit::read(&eitri_core::remote_audit::audit_dir(&dir), &Default::default(), None)
+                    .unwrap();
+            assert!(records
+                .iter()
+                .any(|record| record.fields.get("reason") == Some(&serde_json::json!("revoked_token"))));
+            assert!(!records
+                .iter()
+                .any(|record| record.fields.get("reason") == Some(&serde_json::json!("bad_token"))));
+            assert_eq!(result["command_id"], "withdrawn");
+            assert!(provider.turns().is_empty());
+            assert_eq!(handle.state.borrow().tabs.remote_sends_out(), 0);
+        }
+    }
 
     #[test]
     fn a_pending_call_is_answered_on_its_connection_once_the_provider_answers() {

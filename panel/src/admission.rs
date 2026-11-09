@@ -107,17 +107,15 @@ pub(super) fn admission(
         }
         // A question is answered the way a card is: only from the page showing its tab, and only
         // while the window agrees that page is not covered.
-        InboundMessage::PermissionResponse { .. }
-        | InboundMessage::QuestionAnswer { .. }
-        | InboundMessage::QuestionDecline { .. } => match target {
+        InboundMessage::QuestionAnswer { .. } | InboundMessage::QuestionDecline { .. } => match target {
             Some(tab) => from_its_page(tab),
             // Unreachable (an answer names its tab, or it was refused when resolved); asking the
             // window is the side that refuses more.
             None => Admission::Gated(view),
         },
-        // A broker card meets the same gates. A tab frozen for a move answers no card: its calls end when it leaves,
-        // and one queued again now would run for a window the agent no longer talks to.
-        InboundMessage::EditorCardAnswer { .. } => match target {
+        // A frozen tab answers no card in the source window. Refuse before an answer can save a permission rule
+        // or queue an editor call for a window the agent is leaving.
+        InboundMessage::PermissionResponse { .. } | InboundMessage::EditorCardAnswer { .. } => match target {
             Some(tab) => match from_its_page(tab) {
                 Admission::Gated(_) if state.tabs.is_moving(tab) => {
                     Admission::Refused(eitri_core::tab_set::MOVING.into())

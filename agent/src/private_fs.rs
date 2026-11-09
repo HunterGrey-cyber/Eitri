@@ -586,6 +586,11 @@ impl PrivateLock {
         ))
     }
 
+    /// Opens an existing backing file with the same checks as [`Self::open`], without creating one.
+    pub fn open_existing(path: &Path) -> std::io::Result<PrivateLock> {
+        PrivateLock::checked(open_lock_file(path, false)?, path)
+    }
+
     fn checked(file: std::fs::File, path: &Path) -> std::io::Result<PrivateLock> {
         let meta = file.metadata()?;
         if !meta.is_file() || meta.uid() != euid() {
@@ -596,6 +601,12 @@ impl PrivateLock {
         }
         fchmod(&file, PRIVATE_FILE_MODE)?;
         Ok(PrivateLock { file })
+    }
+
+    /// The backing file, for shared metadata whose access the caller synchronizes. Never replace or truncate it
+    /// while another process may have it open.
+    pub fn as_file(&self) -> &std::fs::File {
+        &self.file
     }
 
     /// One try at the exclusive lock, never waiting: `true` when this now holds it (or already did),

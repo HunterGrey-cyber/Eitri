@@ -177,10 +177,7 @@ mod tests {
     fn a_new_serve_reports_nobody_to_existing_and_later_windows() {
         use std::io::{BufRead, BufReader};
         use std::os::unix::net::UnixListener;
-        let dir =
-            PathBuf::from(option_env!("CARGO_TARGET_DIR").unwrap_or(concat!(env!("CARGO_MANIFEST_DIR"), "/../target")))
-                .join("tmp/remote-tests")
-                .join(format!("report-start-{}", std::process::id()));
+        let dir = agent::state_dirs::redirect_state_to_a_test_root().join("report-start");
         let _ = std::fs::remove_dir_all(&dir);
         eitri_core::panel_control::ensure_dir(&dir).unwrap();
         let first = UnixListener::bind(rv_socket_path(&dir, "a3f09c1d2e4b5f60").unwrap()).unwrap();

@@ -66,7 +66,17 @@ fn authority_allowed(authority: &str, scheme: Option<&str>, cfg: &ServeConfig) -
     }
     cfg.origins.iter().any(|entry| match entry.split_once("://") {
         Some((entry_scheme, entry_authority)) => {
-            entry_authority == authority && scheme.is_none_or(|scheme| scheme == entry_scheme)
+            let Some((entry_host, entry_port)) = split_authority(entry_authority) else {
+                return false;
+            };
+            let default_port = match entry_scheme {
+                "https" => 443,
+                "http" => 80,
+                _ => return false,
+            };
+            entry_host.eq_ignore_ascii_case(host)
+                && port.unwrap_or(default_port) == entry_port.unwrap_or(default_port)
+                && scheme.is_none_or(|scheme| scheme == entry_scheme)
         }
         None => entry == authority,
     })
@@ -223,6 +233,38 @@ mod tests {
             Err(ORIGIN_REFUSED)
         );
         assert_eq!(check_request("other.ts.net", None, &cfg), Err(HOST_REFUSED));
+    }
+
+    #[test]
+    fn configured_default_ports_match_omitted_ports() {
+        for (scheme, port) in [("https", 443), ("http", 80)] {
+            for configured in [
+                format!("{scheme}://desk.example:{port}"),
+                format!("{scheme}://desk.example"),
+            ] {
+                let cfg = cfg(Listen::Loopback, &[&configured]);
+                for host in ["DESK.example".to_owned(), format!("desk.example:{port}")] {
+                    for origin in [
+                        format!("{scheme}://DESK.example"),
+                        format!("{scheme}://desk.example:{port}"),
+                    ] {
+                        assert_eq!(check_request(&host, Some(&origin), &cfg), Ok(()));
+                    }
+                }
+                assert_eq!(check_request("desk.example:8443", None, &cfg), Err(HOST_REFUSED));
+                let other = if scheme == "https" { "http" } else { "https" };
+                assert_eq!(
+                    check_request("desk.example", Some(&format!("{other}://desk.example:{port}")), &cfg),
+                    Err(ORIGIN_REFUSED)
+                );
+            }
+        }
+        let cfg = cfg(Listen::Loopback, &["https://desk.example:8443"]);
+        assert_eq!(check_request("desk.example", None, &cfg), Err(HOST_REFUSED));
+        assert_eq!(
+            check_request("desk.example:8443", Some("https://desk.example"), &cfg),
+            Err(ORIGIN_REFUSED)
+        );
     }
 
     #[test]

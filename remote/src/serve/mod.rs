@@ -822,11 +822,9 @@ mod linux {
         use std::sync::Mutex;
 
         fn scratch(name: &str) -> PathBuf {
-            let dir = PathBuf::from(
-                option_env!("CARGO_TARGET_DIR").unwrap_or(concat!(env!("CARGO_MANIFEST_DIR"), "/../target")),
-            )
-            .join("tmp/remote-serve-tests")
-            .join(format!("{name}-{}", std::process::id()));
+            let dir = agent::state_dirs::redirect_state_to_a_test_root()
+                .join("remote-serve")
+                .join(name);
             let _ = std::fs::remove_dir_all(&dir);
             std::fs::create_dir_all(&dir).unwrap();
             std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700)).unwrap();

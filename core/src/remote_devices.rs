@@ -10,8 +10,9 @@
 //! the handle that is read. Anything else is refused whole: a store that is not trusted holds no device.
 //!
 //! Several processes write it (each window, and `eitri remote` in a terminal), so every write goes through
-//! [`update`]: an `flock` on `devices.lock` beside it, held from before the read until after the new file is renamed
-//! into place, so a write never starts from a file another writer is about to replace.
+//! [`update`]: exclusive flocks on `devices.wlock` then `devices.lock` beside it, held from before the read until
+//! after the new file is renamed into place. The first stops new readers while existing readers drain; the second
+//! keeps a write from starting from a file another writer is about to replace.
 //!
 //! The format, one JSON object, unknown fields refused. Version 2:
 //!
@@ -27,8 +28,10 @@
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::io::{self, Read, Write};
+use std::os::fd::AsRawFd;
 use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
 /// The version of the store this build writes.
@@ -343,13 +346,18 @@ pub fn update<T>(path: &Path, f: impl FnOnce(&mut DeviceStore) -> T) -> io::Resu
         .filter(|d| !d.as_os_str().is_empty())
         .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "a device store path with no directory"))?;
     agent::private_fs::create_private_dir_all(dir, dir.parent().unwrap_or(dir))?;
-    let _lock = lock(path)?;
+    let _lock = lock(path, false)?;
     let mut store = match DeviceStore::load(path) {
         Ok(store) => store,
         Err(e) if e.kind() == io::ErrorKind::NotFound => DeviceStore::default(),
         Err(e) => return Err(e),
     };
     let before = store.to_bytes();
+    let authority: Vec<_> = store
+        .devices()
+        .iter()
+        .map(|d| (d.id.clone(), d.token_sha256, d.grant))
+        .collect();
     let out = f(&mut store);
     let after = store.to_bytes();
     if after != before {
@@ -359,9 +367,115 @@ pub fn update<T>(path: &Path, f: impl FnOnce(&mut DeviceStore) -> T) -> io::Resu
                 format!("the device store would pass {DEVICES_MAX_BYTES} bytes"),
             ));
         }
+        for (id, token, grant) in &authority {
+            let withdrawn = store
+                .get(id)
+                .is_none_or(|d| d.token_sha256 != *token || (*grant == Grant::WatchSteer && d.grant == Grant::Watch));
+            if withdrawn {
+                // Invalidate before publishing when possible, but a broken counter must not keep a device enrolled.
+                match SharedGeneration::open(path, id, false) {
+                    Ok(generation) => {
+                        generation.value().fetch_add(1, Ordering::SeqCst);
+                    }
+                    Err(e) if e.kind() == io::ErrorKind::NotFound => {}
+                    Err(e) => eprintln!("[remote] cannot advance device authority; saving withdrawal anyway: {e}"),
+                }
+            }
+        }
         save(path, &after)?;
     }
     Ok(out)
+}
+
+/// The generation of the authority under which an act was read. Checking it touches only shared memory.
+/// A withdrawal in any process invalidates this device's pending acts; admitted tab messages are unaffected.
+pub struct AuthorizationStamp {
+    generation: SharedGeneration,
+    read_at: u64,
+}
+
+impl AuthorizationStamp {
+    pub fn is_current(&self) -> bool {
+        self.generation.value().load(Ordering::SeqCst) == self.read_at
+    }
+}
+
+/// Reads credentials and stamps their authority under a shared hold of the device-store lock.
+/// This opens files and may wait for a writer, so it belongs on the socket reader, never the UI thread.
+pub fn authorize_act(
+    path: &Path,
+    device: &str,
+    token: &str,
+) -> io::Result<Option<(String, Grant, AuthorizationStamp)>> {
+    let _held = lock(path, true)?;
+    let store = DeviceStore::load(path)?;
+    let Some((name, grant)) = store.verify(device, token) else {
+        return Ok(None);
+    };
+    let generation = SharedGeneration::open(path, device, true)?;
+    let read_at = generation.value().load(Ordering::SeqCst);
+    Ok(Some((name, grant, AuthorizationStamp { generation, read_at })))
+}
+
+/// A per-device atomic counter shared by all processes using this store. Its file is never removed, replaced or
+/// truncated, even on revocation: a reused id must not revive an old stamp. The store lock excludes authority writes
+/// from credential reads and idempotent initialization. The mapping holds no flock, so dispatch never waits for a
+/// writer. Only a same-uid process can truncate this private file; doing so while mapped can SIGBUS the window.
+struct SharedGeneration(*mut AtomicU64);
+
+// SAFETY: the mapping stays live until drop, and its counter is accessed only through atomic operations.
+unsafe impl Send for SharedGeneration {}
+unsafe impl Sync for SharedGeneration {}
+
+impl SharedGeneration {
+    fn open(store: &Path, device: &str, create: bool) -> io::Result<Self> {
+        let path = store.with_extension(format!("authority-{}", token_hash_hex(device)));
+        let backing = if create {
+            agent::private_fs::PrivateLock::open(&path)?
+        } else {
+            agent::private_fs::PrivateLock::open_existing(&path)?
+        };
+        let file = backing.as_file();
+        let size = std::mem::size_of::<AtomicU64>();
+        match file.metadata()?.len() {
+            0 if create => file.set_len(size as u64)?,
+            n if n == size as u64 => {}
+            _ => {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "invalid device authority counter",
+                ))
+            }
+        }
+        // SAFETY: the file is open for reading and writing, at least size bytes long, and remains that long.
+        // mmap returns page-aligned storage, sufficient for AtomicU64. All accesses use the atomic type.
+        let mapped = unsafe {
+            libc::mmap(
+                std::ptr::null_mut(),
+                size,
+                libc::PROT_READ | libc::PROT_WRITE,
+                libc::MAP_SHARED,
+                file.as_raw_fd(),
+                0,
+            )
+        };
+        if mapped == libc::MAP_FAILED {
+            return Err(io::Error::last_os_error());
+        }
+        Ok(Self(mapped.cast()))
+    }
+
+    fn value(&self) -> &AtomicU64 {
+        // SAFETY: open mapped enough aligned bytes, and self owns the mapping until drop.
+        unsafe { &*self.0 }
+    }
+}
+
+impl Drop for SharedGeneration {
+    fn drop(&mut self) {
+        // SAFETY: this is the mapping returned by open, with its original length, no longer accessed.
+        unsafe { libc::munmap(self.0.cast(), std::mem::size_of::<AtomicU64>()) };
+    }
 }
 
 /// `devices.lock` beside the store at `path`.
@@ -369,12 +483,28 @@ fn lock_path(path: &Path) -> PathBuf {
     path.with_extension("lock")
 }
 
-/// The store's lock, tried until [`LOCK_WITHIN`] has passed.
-fn lock(path: &Path) -> io::Result<agent::private_fs::PrivateLock> {
-    let lock = agent::private_fs::PrivateLock::open(&lock_path(path))?;
+/// Readers release the priority lock once admitted, so a writer can stop new readers while existing ones drain.
+/// Writers retain both locks until the store is published, releasing the store lock first.
+fn lock(
+    path: &Path,
+    shared: bool,
+) -> io::Result<(agent::private_fs::PrivateLock, Option<agent::private_fs::PrivateLock>)> {
     let deadline = Instant::now() + LOCK_WITHIN;
+    let priority = lock_until(&path.with_extension("wlock"), shared, deadline)?;
+    let store = lock_until(&lock_path(path), shared, deadline)?;
+    let writer = if shared { None } else { Some(priority) };
+    Ok((store, writer))
+}
+
+/// Both acquisitions use one deadline; each flock attempt is non-blocking.
+fn lock_until(path: &Path, shared: bool, deadline: Instant) -> io::Result<agent::private_fs::PrivateLock> {
+    let lock = agent::private_fs::PrivateLock::open(path)?;
     loop {
-        if lock.try_lock()? {
+        if if shared {
+            lock.try_lock_shared()?
+        } else {
+            lock.try_lock()?
+        } {
             return Ok(lock);
         }
         if Instant::now() >= deadline {
@@ -506,6 +636,169 @@ mod tests {
             r#"{{"v":1,"devices":[{{"id":"d1","name":"phone","token_sha256":"{}","grant":"{grant}"}}]}}"#,
             token_hash_hex("tok")
         )
+    }
+
+    #[test]
+    fn withdrawal_survives_an_invalid_counter() {
+        for revoke in [false, true] {
+            let path = store_file("invalid-counter", &one_device("watch+steer"), 0o600);
+            let counter = path.with_extension(format!("authority-{}", token_hash_hex("d1")));
+            agent::private_fs::write_private(&counter, b"bad").unwrap();
+            assert!(authorize_act(&path, "d1", "tok").is_err());
+            update(&path, |store| {
+                if revoke {
+                    store.remove("d1");
+                } else {
+                    store.get_mut("d1").unwrap().grant = Grant::Watch;
+                }
+            })
+            .expect("a broken counter must not prevent withdrawal");
+            let store = DeviceStore::load(&path).unwrap();
+            if revoke {
+                assert!(store.devices().is_empty());
+                assert!(authorize_act(&path, "d1", "tok").unwrap().is_none());
+            } else {
+                assert_eq!(store.get("d1").unwrap().grant, Grant::Watch);
+            }
+            assert_eq!(std::fs::read(&counter).unwrap(), b"bad");
+        }
+    }
+
+    #[test]
+    fn withdrawal_does_not_create_a_counter() {
+        let path = store_file("missing-counter", &one_device("watch+steer"), 0o600);
+        let counter = path.with_extension(format!("authority-{}", token_hash_hex("d1")));
+        update(&path, |store| store.remove("d1")).unwrap();
+        assert!(DeviceStore::load(&path).unwrap().devices().is_empty());
+        assert!(!counter.exists(), "no act was stamped, so no counter is needed");
+    }
+
+    #[test]
+    fn act_authorization_can_share_the_store_lock() {
+        let path = store_file("shared-authorization", &one_device("watch+steer"), 0o600);
+        let held = agent::private_fs::PrivateLock::open(&lock_path(&path)).unwrap();
+        assert!(held.try_lock_shared().unwrap());
+        assert!(authorize_act(&path, "d1", "bad-token").unwrap().is_none());
+        let (_, grant, stamp) = authorize_act(&path, "d1", "tok").unwrap().unwrap();
+        assert_eq!(grant, Grant::WatchSteer);
+        assert!(stamp.is_current());
+        let writer = agent::private_fs::PrivateLock::open(&lock_path(&path)).unwrap();
+        assert!(!writer.try_lock().unwrap(), "writers still need an exclusive lock");
+        drop(held);
+        assert!(writer.try_lock().unwrap(), "a stamp holds no lock");
+    }
+
+    #[test]
+    fn a_withdrawal_finishes_while_readers_keep_overlapping() {
+        use std::sync::{atomic::AtomicBool, Barrier};
+        let path = store_file("writer-priority", &one_device("watch+steer"), 0o600);
+        let stop = AtomicBool::new(false);
+        let ready = Barrier::new(9);
+        std::thread::scope(|scope| {
+            for reader in 0..8 {
+                let (path, stop, ready) = (&path, &stop, &ready);
+                scope.spawn(move || {
+                    let mut held = lock(path, true).unwrap();
+                    ready.wait();
+                    while !stop.load(Ordering::SeqCst) {
+                        std::thread::sleep(LOCK_PAUSE * (reader + 3));
+                        drop(held);
+                        held = lock(path, true).unwrap();
+                    }
+                });
+            }
+            ready.wait();
+            // update's own LOCK_WITHIN deadline decides success; this is not a speed assertion.
+            let result = update(&path, |store| store.remove("d1"));
+            stop.store(true, Ordering::SeqCst);
+            assert!(result.unwrap().is_some(), "revocation must survive ongoing readers");
+        });
+        assert!(DeviceStore::load(&path).unwrap().devices().is_empty());
+    }
+
+    #[test]
+    fn acts_fail_closed_while_a_writer_has_priority() {
+        let path = store_file("writer-blocks-acts", &one_device("watch+steer"), 0o600);
+        let writer = agent::private_fs::PrivateLock::open(&path.with_extension("wlock")).unwrap();
+        assert!(writer.try_lock().unwrap());
+        for token in ["tok", "bad-token"] {
+            assert!(matches!(authorize_act(&path, "d1", token), Err(e) if e.kind() == io::ErrorKind::WouldBlock));
+        }
+    }
+
+    #[test]
+    fn authority_withdrawal_is_visible_across_processes() {
+        const CHILD_PATH: &str = "EITRI_TEST_AUTHORITY_STORE";
+        if let Some(path) = std::env::var_os(CHILD_PATH) {
+            update(Path::new(&path), |store| store.remove("d1")).unwrap();
+            return;
+        }
+        let path = store_file("authority-process", &one_device("watch+steer"), 0o600);
+        let (_, _, stamp) = authorize_act(&path, "d1", "tok").unwrap().unwrap();
+        let child = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "remote_devices::tests::authority_withdrawal_is_visible_across_processes",
+            ])
+            .env(CHILD_PATH, &path)
+            .output()
+            .unwrap();
+        assert!(child.status.success(), "{}", String::from_utf8_lossy(&child.stderr));
+        assert!(!stamp.is_current(), "the other process withdrew this authority");
+    }
+
+    #[test]
+    fn withdrawing_authority_invalidates_stamps_from_independent_reads() {
+        for revoke in [false, true] {
+            let path = store_file(
+                if revoke {
+                    "authority-revoke"
+                } else {
+                    "authority-downgrade"
+                },
+                &one_device("watch+steer"),
+                0o600,
+            );
+            let (_, _, first) = authorize_act(&path, "d1", "tok").unwrap().unwrap();
+            let (_, _, second) = authorize_act(&path, "d1", "tok").unwrap().unwrap();
+            update(&path, |store| {
+                let mut other = store.get("d1").unwrap().clone();
+                other.id = "d2".into();
+                store.devices.push(other);
+            })
+            .unwrap();
+            let (_, _, other) = authorize_act(&path, "d2", "tok").unwrap().unwrap();
+            update(&path, |store| store.get_mut("d1").unwrap().last_seen = Some(1)).unwrap();
+            assert!(first.is_current(), "presence metadata does not withdraw authority");
+            update(&path, |store| {
+                if revoke {
+                    store.remove("d1");
+                } else {
+                    store.get_mut("d1").unwrap().grant = Grant::Watch;
+                }
+            })
+            .unwrap();
+            assert!(!first.is_current());
+            assert!(!second.is_current());
+            assert!(other.is_current(), "another device keeps its authority");
+            if revoke {
+                assert!(authorize_act(&path, "d1", "tok").unwrap().is_none());
+            } else {
+                let (_, grant, fresh) = authorize_act(&path, "d1", "tok").unwrap().unwrap();
+                assert_eq!(grant, Grant::Watch);
+                assert!(fresh.is_current());
+            }
+            update(&path, |store| {
+                let mut restored = store.get("d2").unwrap().clone();
+                restored.id = "d1".into();
+                store.remove("d1");
+                store.devices.push(restored);
+            })
+            .unwrap();
+            assert!(!first.is_current(), "restoring a device cannot revive its old stamps");
+            let (_, _, fresh) = authorize_act(&path, "d1", "tok").unwrap().unwrap();
+            assert!(fresh.is_current());
+        }
     }
 
     #[test]

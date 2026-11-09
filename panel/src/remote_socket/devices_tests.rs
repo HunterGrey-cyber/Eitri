@@ -1650,11 +1650,14 @@ fn desk_revoke_is_recorded_by_desk() {
     let mut client = window.connect();
     let _gate = recording_gate(&window.handle, &[1], Rc::new(Cell::new(false)));
     let (device, token) = window.enroll_with_yes(&mut client, "Pixel", "watch");
+    let lists = window.count("remote_devices");
     let asked = window.revoke_from_the_list(&device);
     assert_eq!(asked["name"], "Pixel");
     window.turn_until("the device leaves the store", || {
         stored(&scratch.store(), &device).is_none()
     });
+    // The worker queues the audit record after publishing the store, before returning the refreshed list.
+    assert!(window.listed(lists).is_empty());
     let records = audit_records(&window, &scratch);
     let revoked = of_event(&records, "revoke");
     assert_eq!(revoked.len(), 1);

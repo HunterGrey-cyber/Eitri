@@ -108,6 +108,9 @@ pub(super) fn answer_permission_response(
     page: ViewId,
     answer: PermissionAnswer,
 ) -> Result<Result<(), BackendError>, String> {
+    if tabs.is_moving(tab) {
+        return Err(eitri_core::tab_set::MOVING.into());
+    }
     let remembered = {
         let t = tabs.get(tab).ok_or_else(|| format!("protocol: no tab {}", tab.0))?;
         // Read right before the save, so an id that is no longer
@@ -2642,6 +2645,74 @@ mod tests {
         assert!(
             rule_to_remember(t, "perm-1", DecisionChoice::Allow, true, false).is_err(),
             "not pending any more, whatever the offer still says"
+        );
+    }
+
+    #[test]
+    fn a_moving_permission_response_saves_and_installs_no_rule() {
+        agent::state_dirs::redirect_state_to_a_test_root();
+        let dir = agent::state_dirs::test_repository_dir("moving-permission-remember");
+        let rules_dir = dir.join("rules");
+        let (handle, _, _) = handle_with_two_pages();
+        handle.state.borrow_mut().project_dir = dir.clone();
+        let (tab, provider) = live_tab(&handle, &dir);
+        provider.queue(agent::AgentDomainEvent::PermissionRequested {
+            permission_id: "perm-moving".into(),
+            tool_use_id: None,
+            tool_name: "Bash".into(),
+            input: serde_json::json!({"command": "git push origin main"}),
+            provider_prompt: None,
+        });
+        tick_handle_until(&handle, "the rule offer", || {
+            handle
+                .state
+                .borrow()
+                .tabs
+                .get(tab)
+                .unwrap()
+                .session
+                .rule_offers
+                .contains_key("perm-moving")
+        });
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        loop {
+            let frozen = handle.state.borrow_mut().tabs.freeze_for_move(tab);
+            match frozen {
+                Ok(_) => break,
+                Err(eitri_core::tab_set::MoveRefusedWhy::Folding) if std::time::Instant::now() < deadline => {}
+                Err(why) => panic!("cannot freeze: {why:?}"),
+            }
+            std::thread::yield_now();
+        }
+        let message = parse_inbound_message(
+            &serde_json::json!({
+                "type": "permission_response", "request_id": "r", "tab": tab.0,
+                "permission_id": "perm-moving", "decision": "allow", "remember": true,
+            })
+            .to_string(),
+        )
+        .unwrap();
+        let mut state = handle.state.borrow_mut();
+        let admitted = super::super::admission::admission(&state, &message, ViewId::BASE, Some(tab));
+        let rules_before = format!("{:?}", state.tabs.rules());
+        let result = answer_permission_response(
+            &mut state.tabs,
+            Some(&rules_dir),
+            &dir,
+            tab,
+            ViewId::BASE,
+            PermissionAnswer::of(message).unwrap(),
+        );
+        assert_eq!(
+            eitri_core::permission_store::load(&rules_dir, &dir),
+            eitri_core::permission_store::LoadedRules::Missing
+        );
+        assert_eq!(format!("{:?}", state.tabs.rules()), rules_before);
+        assert!(provider.resolutions().is_empty());
+        assert_eq!(result.map(|_| ()), Err(eitri_core::tab_set::MOVING.into()));
+        assert_eq!(
+            admitted,
+            super::super::admission::Admission::Refused(eitri_core::tab_set::MOVING.into())
         );
     }
 

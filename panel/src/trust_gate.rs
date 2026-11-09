@@ -392,6 +392,7 @@ enum Purpose {
 
 enum Job {
     Check {
+        epoch: u64,
         generation: u64,
         profile: Profile,
     },
@@ -411,6 +412,7 @@ enum Job {
         kept: Kept,
     },
     CommandCheck {
+        epoch: u64,
         request_id: String,
         tab: TabId,
         profile: Profile,
@@ -424,6 +426,7 @@ enum Job {
 
 enum Done {
     Checked {
+        epoch: u64,
         generation: u64,
         state: TrustState,
     },
@@ -439,6 +442,7 @@ enum Done {
         state: TrustState,
     },
     Moved {
+        epoch: u64,
         purpose: Purpose,
         state: TrustState,
     },
@@ -448,6 +452,7 @@ enum Done {
         reason: String,
     },
     CommandChecked {
+        epoch: u64,
         request_id: String,
         tab: TabId,
         state: TrustState,
@@ -483,8 +488,7 @@ pub(crate) struct TrustGate {
     done: mpsc::Receiver<Msg>,
     /// The last check queued, of any profile.
     generation: u64,
-    /// Moved by `:untrust` of a profile: a record of it queued before is not trust any more when it
-    /// lands.
+    /// Moved by `:untrust` of a profile: a check or record queued before it cannot authorize a start.
     epochs: HashMap<ProfileKey, u64>,
     /// Per profile, the newest result of any check of it, in the order they were queued.
     latest: HashMap<ProfileKey, Arc<TrustState>>,
@@ -643,7 +647,9 @@ impl TrustGate {
         };
         const NO_WORKER: &str = "the trust check is not running";
         match job {
-            Job::Check { generation, profile } => {
+            Job::Check {
+                generation, profile, ..
+            } => {
                 let key = profile.key();
                 let (resolved, kept): (Vec<_>, Vec<_>) = self
                     .waiting
@@ -689,6 +695,7 @@ impl TrustGate {
         self.generation += 1;
         let generation = self.generation;
         self.queue(Job::Check {
+            epoch: self.epoch_of(&profile.key()),
             generation,
             profile: profile.clone(),
         });
@@ -743,8 +750,19 @@ impl TrustGate {
             // Each result's prompts go in with its state; nothing else of this message uses them.
             let mut prompts = prompts;
             match done {
-                Done::Checked { generation, state } => {
-                    let key = state_profile(&state).key();
+                Done::Checked {
+                    generation,
+                    epoch,
+                    state,
+                } => {
+                    let profile = state_profile(&state);
+                    let key = profile.key();
+                    if epoch != self.epoch_of(&key) {
+                        if self.waiting.iter().any(|(_, p, g)| *p == key && *g <= generation) {
+                            self.begin_check(profile);
+                        }
+                        continue;
+                    }
                     self.take_latest(state, seq, prompts.take(), &mut events);
                     let (resolved, kept): (Vec<_>, Vec<_>) = self
                         .waiting
@@ -786,7 +804,7 @@ impl TrustGate {
                     } else {
                         // A `:untrust` came after this `y` and its forget runs next: the later
                         // command wins, so nothing here is trust.
-                        events.push(refused(purpose, WITHDRAWN.to_string()));
+                        events.push(refused_withdrawn(purpose));
                     }
                 }
                 Done::Confirmed {
@@ -797,7 +815,7 @@ impl TrustGate {
                 } => {
                     let key = state_profile(&state).key();
                     if epoch != self.epoch_of(&key) {
-                        events.push(refused(purpose, WITHDRAWN.to_string()));
+                        events.push(refused_withdrawn(purpose));
                         continue;
                     }
                     let fingerprint = discovery_of(&state).map(|d| d.fingerprint);
@@ -827,8 +845,10 @@ impl TrustGate {
                         },
                     });
                 }
-                Done::Moved { purpose, state } => {
-                    self.take_latest(state, seq, prompts.take(), &mut events);
+                Done::Moved { purpose, epoch, state } => {
+                    if epoch == self.epoch_of(&state_profile(&state).key()) {
+                        self.take_latest(state, seq, prompts.take(), &mut events);
+                    }
                     events.push(refused(purpose, CHANGED_WHILE_READING.to_string()));
                 }
                 Done::RecordFailed {
@@ -849,8 +869,17 @@ impl TrustGate {
                     }
                     events.push(refused(purpose, notice));
                 }
-                Done::CommandChecked { request_id, tab, state } => {
+                Done::CommandChecked {
+                    request_id,
+                    tab,
+                    epoch,
+                    state,
+                } => {
                     let key = state_profile(&state).key();
+                    if epoch != self.epoch_of(&key) {
+                        events.push(refused_withdrawn(Purpose::Command(request_id)));
+                        continue;
+                    }
                     self.take_latest(state, seq, prompts.take(), &mut events);
                     self.drop_command_prompt_into(&mut events);
                     events.push(self.command_check_result(request_id, tab, key));
@@ -1212,6 +1241,7 @@ impl TrustGate {
     pub(crate) fn command(&mut self, request_id: String, action: TrustAction, tab: TabId, profile: &Profile) {
         match action {
             TrustAction::Trust => self.queue(Job::CommandCheck {
+                epoch: self.epoch_of(&profile.key()),
                 request_id,
                 tab,
                 profile: profile.clone(),
@@ -1224,6 +1254,8 @@ impl TrustGate {
                     .answered
                     .remove(&key)
                     .is_some_and(|answered| answered.trust == ProjectTrust::Trusted);
+                self.latest.remove(&key);
+                self.prompts.remove(&key);
                 *self.epochs.entry(key).or_insert(0) += 1;
                 let mut dropped = Vec::new();
                 self.drop_command_prompt_into(&mut dropped);
@@ -1832,6 +1864,14 @@ impl DoneSender {
     }
 }
 
+fn refused_withdrawn(purpose: Purpose) -> GateEvent {
+    let notice = match &purpose {
+        Purpose::ForTab(_) => WITHDRAWN,
+        Purpose::Command(_) => ":trust was overtaken by :untrust",
+    };
+    refused(purpose, notice.to_string())
+}
+
 fn refused(purpose: Purpose, notice: String) -> GateEvent {
     match purpose {
         Purpose::ForTab(tab) => GateEvent::RecordRefused { tab, notice },
@@ -2127,7 +2167,12 @@ fn run_worker(
         // is rebuilt from it.
         let mut asked: Option<(u64, Arc<TrustState>)> = None;
         let result = match job {
-            Job::Check { generation, profile } => Done::Checked {
+            Job::Check {
+                generation,
+                epoch,
+                profile,
+            } => Done::Checked {
+                epoch,
                 generation,
                 state: check(&store, &profile),
             },
@@ -2144,6 +2189,7 @@ fn run_worker(
                 let fresh = rediscover(&shown.profile);
                 if fresh.fingerprint != shown.fingerprint {
                     Done::Moved {
+                        epoch,
                         purpose,
                         state: store.state(fresh),
                     }
@@ -2177,6 +2223,7 @@ fn run_worker(
                 let fresh = rediscover(&shown.profile);
                 if fresh.fingerprint != shown.fingerprint {
                     Done::Moved {
+                        epoch,
                         purpose,
                         state: store.state(fresh),
                     }
@@ -2190,10 +2237,12 @@ fn run_worker(
                 }
             }
             Job::CommandCheck {
+                epoch,
                 request_id,
                 tab,
                 profile,
             } => Done::CommandChecked {
+                epoch,
                 request_id,
                 tab,
                 state: check(&store, &profile),
@@ -2832,6 +2881,157 @@ mod tests {
     }
 
     #[test]
+    fn untrust_after_a_queued_command_check_does_not_restore_trust() {
+        let fx = Fx::new("untrust-command-check");
+        fx.write(SETTINGS, &hook("touch /tmp/a"));
+        let (mut gate, jobs, done) = TrustGate::detached(fx.root.clone());
+        gate.command("t".into(), TrustAction::Trust, A, &CLAUDE);
+        assert!(matches!(jobs.try_recv(), Ok(Job::CommandCheck { epoch: 0, .. })));
+        gate.command("u".into(), TrustAction::Untrust, A, &CLAUDE);
+        assert!(matches!(jobs.try_recv(), Ok(Job::Forget { .. })));
+        // Another window recorded trust before this command's check reached the disk.
+        fx.trust_now(1_790_000_000);
+        done.send(Done::CommandChecked {
+            epoch: 0,
+            request_id: "t".into(),
+            tab: A,
+            state: checked(&fx),
+        })
+        .unwrap();
+        let events = gate.poll();
+        assert_eq!(
+            gate.current_route(&CLAUDE),
+            None,
+            "the awaiting-tab sweep cannot start trusted"
+        );
+        assert_eq!(
+            command_done(&events, "t"),
+            Some((false, Some(":trust was overtaken by :untrust".to_string())))
+        );
+        assert!(gate.command_prompt().is_none());
+    }
+
+    #[test]
+    fn untrust_after_a_queued_command_answer_does_not_promise_to_ask_again() {
+        for confirmed in [false, true] {
+            let fx = Fx::new("untrust-command-answer");
+            fx.write(SETTINGS, &hook("touch /tmp/a"));
+            let (mut gate, jobs, done) = TrustGate::detached(fx.root.clone());
+            gate.command("u".into(), TrustAction::Untrust, A, &CLAUDE);
+            assert!(matches!(jobs.try_recv(), Ok(Job::Forget { .. })));
+            fx.trust_now(1_790_000_000);
+            let purpose = Purpose::Command("t".into());
+            let state = checked(&fx);
+            done.send(if confirmed {
+                Done::Confirmed {
+                    purpose,
+                    epoch: 0,
+                    kept: Kept {
+                        window_only: None,
+                        notice: "trusted once".into(),
+                    },
+                    state,
+                }
+            } else {
+                Done::Recorded {
+                    purpose,
+                    epoch: 0,
+                    state,
+                }
+            })
+            .unwrap();
+            let events = gate.poll();
+            assert_eq!(
+                command_done(&events, "t"),
+                Some((false, Some(":trust was overtaken by :untrust".to_string())))
+            );
+            assert_eq!(gate.current_route(&CLAUDE), None);
+            assert!(gate.command_prompt().is_none());
+        }
+    }
+
+    #[test]
+    fn untrust_after_a_queued_moved_record_does_not_restore_trust() {
+        let fx = Fx::new("untrust-moved-record");
+        fx.write(SETTINGS, &hook("touch /tmp/a"));
+        let (mut gate, jobs, done) = TrustGate::detached(fx.root.clone());
+        let state = checked(&fx);
+        let prompts = prepare(&state, None, 1);
+        gate.take_latest(state, 1, prompts, &mut Vec::new());
+        let view = gate.show(A, 1, &CLAUDE).unwrap();
+        assert_eq!(answer(&mut gate, &view, true), AnswerOutcome::Recording);
+        let Ok(Job::Record { purpose, .. }) = jobs.try_recv() else {
+            panic!("a record is queued");
+        };
+        gate.command("u".into(), TrustAction::Untrust, A, &CLAUDE);
+        assert!(matches!(jobs.try_recv(), Ok(Job::Forget { .. })));
+        fx.write(SETTINGS, &hook("touch /tmp/b"));
+        fx.trust_now(1_790_000_000);
+        done.send(Done::Moved {
+            epoch: 0,
+            purpose,
+            state: checked(&fx),
+        })
+        .unwrap();
+        let events = gate.poll();
+        assert_eq!(
+            gate.current_route(&CLAUDE),
+            None,
+            "the awaiting-tab sweep cannot start trusted"
+        );
+        assert_eq!(
+            events,
+            vec![GateEvent::RecordRefused {
+                tab: A,
+                notice: CHANGED_WHILE_READING.to_string(),
+            }]
+        );
+    }
+
+    #[test]
+    fn untrust_after_a_queued_check_waits_for_a_fresh_check() {
+        let fx = Fx::new("untrust-queued-check");
+        fx.write(SETTINGS, &hook("touch /tmp/a"));
+        fx.trust_now(1_790_000_000);
+        let trusted = checked(&fx);
+        let (mut gate, jobs, done) = TrustGate::detached(fx.root.clone());
+        gate.take_latest(trusted.clone(), 0, None, &mut Vec::new());
+        assert_eq!(gate.current_route(&CLAUDE), Some(Route::Start(ProjectTrust::Trusted)));
+        gate.wait_for(A, &CLAUDE);
+        let generation = gate.begin_check(&CLAUDE);
+        assert!(matches!(jobs.try_recv(), Ok(Job::Check { epoch: 0, .. })));
+        gate.command("u".into(), TrustAction::Untrust, A, &CLAUDE);
+        assert_eq!(
+            gate.current_route(&CLAUDE),
+            None,
+            "withdrawal clears cached trust at once"
+        );
+        assert!(matches!(jobs.try_recv(), Ok(Job::Forget { .. })));
+        done.send(Done::Checked {
+            epoch: 0,
+            generation,
+            state: trusted,
+        })
+        .unwrap();
+        assert!(gate.poll().is_empty(), "the stale trusted result alone starts nothing");
+        assert!(gate.is_waiting(A));
+        assert!(gate.latest_state(&CLAUDE.key()).is_none());
+        let Ok(Job::Check { epoch, generation, .. }) = jobs.try_recv() else {
+            panic!("a fresh check must follow the forget");
+        };
+        assert_eq!(epoch, 1);
+        fx.store().forget(&fx.root, &CLAUDE).unwrap();
+        done.send(Done::Checked {
+            epoch,
+            generation,
+            state: checked(&fx),
+        })
+        .unwrap();
+        assert_eq!(gate.poll(), vec![GateEvent::Route(A, Route::Ask)]);
+        assert!(!gate.is_waiting(A));
+    }
+
+    #[test]
     fn the_row_for_each_state() {
         let fx = Fx::new("row");
         let mut gate = fx.gate();
@@ -2882,6 +3082,7 @@ mod tests {
         assert!(matches!(jobs.try_recv(), Ok(Job::Check { generation, .. }) if generation == first));
         assert!(matches!(jobs.try_recv(), Ok(Job::Check { generation, .. }) if generation == second));
         done.send(Done::Checked {
+            epoch: 0,
             generation: first,
             state: state.clone(),
         })
@@ -2889,6 +3090,7 @@ mod tests {
         assert!(gate.poll().is_empty(), "a check queued before the wait answers nothing");
         assert!(gate.is_waiting(A));
         done.send(Done::Checked {
+            epoch: 0,
             generation: second,
             state,
         })
@@ -2914,7 +3116,12 @@ mod tests {
         let (mut gate, jobs, done) = TrustGate::detached(fx.root.clone());
         gate.wait_for(A, &CLAUDE);
         gate.begin_check(&CLAUDE);
-        done.send(Done::Checked { generation: 1, state }).unwrap();
+        done.send(Done::Checked {
+            epoch: 0,
+            generation: 1,
+            state,
+        })
+        .unwrap();
         assert_eq!(gate.poll(), vec![GateEvent::Route(A, Route::Ask)]);
         let _ = jobs.try_recv();
         let view = gate.show(A, 7, &CLAUDE).unwrap();
@@ -3316,11 +3523,13 @@ mod tests {
         gate.wait_for(B, &CLAUDE);
         let second = gate.begin_check(&CLAUDE);
         done.send(Done::Checked {
+            epoch: 0,
             generation: first,
             state: trusted.clone(),
         })
         .unwrap();
         done.send(Done::Checked {
+            epoch: 0,
             generation: second,
             state: changed,
         })
@@ -3348,11 +3557,13 @@ mod tests {
         gate.wait_for(B, &CLAUDE);
         let second = gate.begin_check(&CLAUDE);
         done.send(Done::Checked {
+            epoch: 0,
             generation: first,
             state: untrusted_first,
         })
         .unwrap();
         done.send(Done::Checked {
+            epoch: 0,
             generation: second,
             state: trusted,
         })
@@ -3383,6 +3594,7 @@ mod tests {
         gate.wait_for(A, &CLAUDE);
         let first = gate.begin_check(&CLAUDE);
         done.send(Done::Checked {
+            epoch: 0,
             generation: first,
             state: untrusted,
         })
@@ -3419,6 +3631,7 @@ mod tests {
         })
         .unwrap();
         done.send(Done::Checked {
+            epoch: 0,
             generation: second,
             state: changed,
         })
@@ -3452,7 +3665,10 @@ mod tests {
         let seen = drain(&mut gate, |seen| {
             command_done(seen, "t").is_some() && command_done(seen, "u").is_some()
         });
-        assert_eq!(command_done(&seen, "t"), Some((true, Some(NOTHING_HERE.to_string()))));
+        assert_eq!(
+            command_done(&seen, "t"),
+            Some((false, Some(":trust was overtaken by :untrust".to_string())))
+        );
         assert_eq!(
             command_done(&seen, "u"),
             Some((true, Some(WAS_NOT_TRUSTED.to_string())))
@@ -3600,6 +3816,7 @@ mod tests {
         };
         let (mut gate, _jobs, done) = TrustGate::detached(p("/home/u/p"));
         done.send(Done::Checked {
+            epoch: 0,
             generation: 0,
             state: TrustState::Untrusted {
                 discovery,
@@ -4672,7 +4889,11 @@ mod tests {
         done.tx
             .send(Msg {
                 seq: 1,
-                done: Done::Checked { generation: 1, state },
+                done: Done::Checked {
+                    epoch: 0,
+                    generation: 1,
+                    state,
+                },
                 prompts: Some(Prompts {
                     key: gem().key(),
                     for_seq: 1,
@@ -4975,7 +5196,11 @@ mod tests {
         done.tx
             .send(Msg {
                 seq: 1,
-                done: Done::Checked { generation: 1, state },
+                done: Done::Checked {
+                    epoch: 0,
+                    generation: 1,
+                    state,
+                },
                 prompts: None,
             })
             .unwrap();
@@ -4998,6 +5223,7 @@ mod tests {
             .send(Msg {
                 seq: 2,
                 done: Done::CommandChecked {
+                    epoch: 0,
                     request_id: "c".into(),
                     tab: A,
                     state,
@@ -5075,6 +5301,7 @@ mod tests {
         gate.begin_check(&CLAUDE);
         assert!(matches!(jobs.try_recv(), Ok(Job::Check { .. })));
         done.send(Done::Checked {
+            epoch: 0,
             generation: 1,
             state: claude_state(fx),
         })
@@ -5095,6 +5322,7 @@ mod tests {
         gate.begin_check(&CLAUDE);
         assert!(matches!(jobs.try_recv(), Ok(Job::Check { .. })));
         done.send(Done::Checked {
+            epoch: 0,
             generation: 2,
             state: claude_state(&fx),
         })
@@ -5124,6 +5352,7 @@ mod tests {
         assert!(matches!(jobs.try_recv(), Ok(Job::Check { .. })));
         let second = claude_state(&fx);
         done.send(Done::Checked {
+            epoch: 0,
             generation: 2,
             state: claude_state(&fx),
         })
