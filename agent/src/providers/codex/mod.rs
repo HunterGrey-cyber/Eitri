@@ -29,7 +29,7 @@ pub mod translate;
 pub mod tripwire;
 pub mod wire;
 
-pub use locate::{decide_codex, locate_codex, LocateError};
+pub use locate::{codex_install_places, decide_codex, locate_codex, or_installed, LocateError, CODEX_LOOKED_IN};
 pub use provider::{
     refuse_codex_home, refuse_relative_codex_home, CodexLaunch, CodexProvider, CodexProviderHandoff, EDITOR_TOOLS_OFF,
     HIGHEST_TESTED_CODEX, MIN_CODEX,

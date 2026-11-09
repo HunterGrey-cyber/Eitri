@@ -94,8 +94,11 @@ wording! {
         "claude"
         "claude"
     ClaudeMissing "claude.missing"
-        "Claude Code was not found: {url}"
-        "未找到 Claude Code：{url}"
+        "Claude Code was not found in {looked}: {url}"
+        "在 {looked} 中未找到 Claude Code：{url}"
+    ClaudeRefused "claude.refused"
+        "Claude Code was found but not used (another user could change it, or what it starts is not on PATH; the log says which): {url}"
+        "找到了 Claude Code 但没有使用（其他用户能改动它，或它要启动的程序不在 PATH 上；日志里写明了原因）：{url}"
     RowLooking "row.looking"
         "looking…"
         "查找中…"
@@ -358,7 +361,7 @@ wording! {
 
 /// The hash of the English column the Chinese was translated from: a changed English string fails a test
 /// until the Chinese has been brought up to date and this is set again.
-pub const TRANSLATED_FROM: &str = "cf852a8b41f5262a74ca01e2a03d505f20908d110ffa6b1fc1510906f3e99500";
+pub const TRANSLATED_FROM: &str = "12c7dc04fd7be55fad6315c3df35fd9e2c3f455b712010169400f4db027a536f";
 
 /// The template of `id` in `lang`.
 pub fn text(lang: Lang, id: TextId) -> &'static str {

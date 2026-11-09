@@ -5,9 +5,16 @@ English | [简体中文](getting-started.zh-CN.md)
 This page takes you from the command to a first finished turn: opening a project, sending a prompt,
 answering the cards Eitri shows, working with several sessions, and what the panel says when a turn does not
 end well. It assumes Eitri is [installed](../../INSTALL.md) and the `claude` command is signed in to your
-account. If Eitri cannot find `claude`, the first-start screen and a Claude tab's failure row say so and give
-the address to get it from, <https://code.claude.com/docs/en/quickstart>; install it, make sure `claude` runs in
-a terminal, then press `r` in the tab.
+account. Eitri runs the `claude` on its `PATH`; when that has none, which is common for a window started from
+a desktop launcher or a menu rather than a terminal, it looks where Claude Code's installers put it, in this
+order: `~/.local/bin/claude` (the installer from the quickstart page), `~/.claude/local/claude` (older local
+installs), and the `bin` directory of npm's global prefix when you set one yourself (`NPM_CONFIG_PREFIX`, or
+`prefix` in `~/.npmrc`). It takes the first that is a regular file you may run, owned by you or by root, which
+neither it nor any directory on the way to it (links followed) can be written by other users; anything else there
+is skipped and the window's log says why. Setting `VERDANDI_CLAUDE_CLI_PATH` to a path chooses the program
+yourself, and Eitri then looks nowhere else. If Eitri cannot find `claude`, the first-start screen and a Claude
+tab's failure row say so, name the places it looked, and give the address to get it from,
+<https://code.claude.com/docs/en/quickstart>; install it, then press `r` in the tab.
 
 Keys are written for the default setup: the prefix is `Ctrl+b`, and "the leader" is `Space` unless your
 Neovim configuration sets another `mapleader` of a single key the panel can use (a longer or reserved one falls

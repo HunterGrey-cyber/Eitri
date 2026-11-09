@@ -251,7 +251,7 @@ describe("EmptyTab", () => {
     const problem = container.querySelector(".row-problem")!;
     expect(problem.querySelector("strong")!.textContent).toBe("Claude Code (claude) was not found.");
     expect(problem.querySelector(".row-problem-remedy")!.textContent).toBe(
-      "Install it and make sure claude runs in a terminal, then press r.",
+      "Looked in PATH, ~/.local/bin, ~/.claude/local, npm's global bin. Install it, then press r.",
     );
   });
   /* A tab that failed because `claude` is not there shows where to get it, as a link a click or HINT reaches, and

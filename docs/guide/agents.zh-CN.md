@@ -1,5 +1,5 @@
 [English](agents.md) | 简体中文
-<!-- translated-from: agents.md sha256=f36d763aecac3abf90dc01d734d5afd653b4a10f5d40e46854c069fe44cb1213 -->
+<!-- translated-from: agents.md sha256=8a0be0e1f59db78db37a3613e42cf6caeb767ad031e0d007f3834189c0ed49e0 -->
 
 # Codex 与其他 agent
 
@@ -106,7 +106,7 @@ Claude Code 终端里把正在运行的前台命令移到后台的 `Ctrl+B`，�
 - `codex` 命令，已经安装，并用 `codex login` 登录。没有登录时，标签页会说 “Codex is not signed in: run `codex login` in a terminal”。
 - Codex 0.160.0 或更新。Eitri 的 Codex 测试跑过从 0.160.0 到 0.166.0 的每个版本；标签页的 `agent` 一行会这么写。更新的 Codex 仍然能运行，这一行会写 “untested Codex”，后面跟着它的版本和试过的最新版本。更旧的会被拒绝，并提示 “update Codex”。
 
-Eitri 按这个顺序挑选程序：环境变量 `EITRI_CODEX`（一个文件的绝对路径），然后是 `init.lua` 里的 `agent.codex.command`（绝对路径，或在 `PATH` 里查找的裸命令名），最后是 `PATH` 上的 `codex`。`EITRI_CODEX` 不是一个现有文件的绝对路径，Eitri 会在启动时停下并点出这个变量；`agent.codex.command` 是带目录部分的相对路径时也一样。其他找不到 `codex` 的情况只让 Codex 标签页的启动失败：`PATH` 上什么都没有时，消息是 “codex not found: install it and run `codex login`, or set EITRI_CODEX”，而 `agent.codex.command` 指向的文件不存在时，消息会点出它的名字。`PATH` 里为空或相对的条目会被跳过，因为 agent 是在你的项目目录里运行的，这样的条目会指向项目自己放的文件。
+Eitri 按这个顺序挑选程序：环境变量 `EITRI_CODEX`（一个文件的绝对路径），然后是 `init.lua` 里的 `agent.codex.command`（绝对路径，或在 `PATH` 里查找的裸命令名），然后是 `PATH` 上的 `codex`，`PATH` 上没有时再去 Codex 的安装程序放它的地方找（从桌面启动器打开的窗口常常没有 `~/.local/bin`）：先是 `~/.local/bin/codex`（独立安装程序），再是你自己设过的 npm 全局前缀下的 `bin` 目录（`NPM_CONFIG_PREFIX`，或 `~/.npmrc` 里的 `prefix`）；每一个都只在它是你能运行的普通文件、属于你或 root、而且它本身和通往它的每一个目录都不能被其他用户写入时才会用。`EITRI_CODEX` 不是一个现有文件的绝对路径，Eitri 会在启动时停下并点出这个变量；`agent.codex.command` 是带目录部分的相对路径时也一样。其他找不到 `codex` 的情况只让 Codex 标签页的启动失败：哪里都没找到时，消息是 “codex not found in PATH, ~/.local/bin, npm's global bin: install it and run `codex login`, or set EITRI_CODEX”，而 `agent.codex.command` 指向的文件不存在时，消息会点出它的名字。`PATH` 里为空或相对的条目会被跳过，因为 agent 是在你的项目目录里运行的，这样的条目会指向项目自己放的文件。
 
 <a id="trust-the-question-codex-tabs-ask"></a>
 ### 信任：Codex 标签页会问的问题

@@ -1,5 +1,5 @@
 [English](configuration.md) | 简体中文
-<!-- translated-from: configuration.md sha256=cb9f2f1e31e3a5642ad8a636b2e63fe7ec75d9e7a49f568cd8f84d07cc0b2a8b -->
+<!-- translated-from: configuration.md sha256=521d7227179479cb1b3bbcc7b358b40a9dc49be1b3e27ac373e78bc7877dec51 -->
 
 # 配置
 
@@ -56,7 +56,7 @@ API 定义保存在 `$XDG_DATA_HOME/eitri/lua/meta/eitri.lua`；`XDG_DATA_HOME` 
 | `agent.font_size` | 9 到 32 之间的数字 | 编辑器的字号 | agent 面板的基础字号，单位是像素。对话按基础字号的 12/14 绘制（回复、工具行和代码），所以读起来比编辑器的文字略小；面板底部的状态行按基础字号本身绘制，这样它和编辑器的状态栏对齐。不设置时，基础字号就是编辑器（`guifont`）的字号。 |
 | `agent.typing_cadence_hz` | 1 到 60 之间的整数，或 `false` / `"off"` | `5` | 你在编辑器里输入时，agent 面板每秒最多允许更新多少次。稳定的较慢频率可以避免面板在你输入时重绘；`"off"` 让它全速更新。 |
 | `agent.default` | `"claude"`、`"codex"`，或用 `eitri.agent.register` 注册的 agent 的名字 | `"claude"` | 新标签页，以及新窗口的第一个标签页，运行哪个 agent。见 [Codex 与其他 agent](agents.zh-CN.md)。 |
-| `agent.codex.command` | 绝对路径，或裸命令名 | 未设置 | Codex 标签页运行的 `codex`。`EITRI_CODEX` 优先于它；两者都没有时用 `PATH` 上的 `codex`。带目录部分的相对路径会被拒绝，这个设置保持未设置。 |
+| `agent.codex.command` | 绝对路径，或裸命令名 | 未设置 | Codex 标签页运行的 `codex`。`EITRI_CODEX` 优先于它；两者都没有时用 `PATH` 上的 `codex`，再去 Codex 的安装程序放它的地方找（[Agent](agents.zh-CN.md)）。带目录部分的相对路径会被拒绝，这个设置保持未设置。 |
 | `agent.default_mode` | `"manual"`、`"auto"` 或 `"bypass"` | `"auto"` | 新标签页开始时所处的模式。见[一次启动怎样开始](#how-a-launch-starts)。 |
 | `agent.restore` | `"offer"`、`"auto"`、`"off"` 或 `false` | `"offer"` | 对这个项目上一个窗口里开着的标签页怎么办。见[一次启动怎样开始](#how-a-launch-starts)。 |
 | `agent.thinking` | `"collapsed"`、`"preview"`、`"expanded"` 或 `"hidden"` | `"collapsed"` | agent 面板怎样显示 agent 的思考过程。`"collapsed"` 每段思考画成一行不显眼的行，像工具输出一样用 `Enter` 展开；`"preview"` 在一段思考还在写的时候，另外在一个不会变高的框里显示它最新的几行；`"expanded"` 完整显示每段思考；`"hidden"` 一段也不显示。无论这里怎么设，`Ctrl+o` 都会完整显示每段思考。 |

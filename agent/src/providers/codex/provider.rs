@@ -123,7 +123,8 @@ const REVIEW_ROW_PREFIX: &str = "eitri-review-";
 const REVIEW_RATIONALE_CHARS: usize = 2000;
 
 /// The notice for a Codex that is not installed.
-pub const NOT_FOUND: &str = "codex not found: install it and run `codex login`, or set EITRI_CODEX";
+pub const NOT_FOUND: &str =
+    "codex not found in PATH, ~/.local/bin, npm's global bin: install it and run `codex login`, or set EITRI_CODEX";
 
 /// Where and how a Codex child is started.
 #[derive(Debug, Clone)]

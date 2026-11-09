@@ -221,6 +221,7 @@ pub struct Screen {
     input: Option<InputRow>,
     /// Whether detection found no `claude` to run; stays `false` until it says so, and the screen does not wait for it.
     claude_missing: bool,
+    claude_refused: bool,
     preset: PresetId,
     prefix: Option<KeySpec>,
     wm_mod: Option<WmMod>,
@@ -249,6 +250,7 @@ impl Screen {
             neovim: None,
             input: None,
             claude_missing: false,
+            claude_refused: false,
             prefix: None,
             wm_mod: None,
             tiling_choice: None,
@@ -760,6 +762,7 @@ impl Screen {
             Found::Neovim(row) => self.neovim = Some(row),
             Found::Input(row) => self.input = Some(row),
             Found::ClaudeMissing => self.claude_missing = true,
+            Found::ClaudeRefused => self.claude_refused = true,
             Found::TrustOpen(open) => return if open { self.hold() } else { self.release() },
         }
         self.resync();
@@ -1003,10 +1006,19 @@ impl Screen {
             Some(_) => self.row(TextId::RowInput, not_found(), String::new()),
         });
 
-        if self.claude_missing {
+        if self.claude_refused {
             view.rows.push(self.row(
                 TextId::RowClaude,
-                self.say(TextId::ClaudeMissing, &[("url", agent::CLAUDE_INSTALL_URL)]),
+                self.say(TextId::ClaudeRefused, &[("url", agent::CLAUDE_INSTALL_URL)]),
+                String::new(),
+            ));
+        } else if self.claude_missing {
+            view.rows.push(self.row(
+                TextId::RowClaude,
+                self.say(
+                    TextId::ClaudeMissing,
+                    &[("looked", agent::CLAUDE_LOOKED_IN), ("url", agent::CLAUDE_INSTALL_URL)],
+                ),
                 String::new(),
             ));
         }
@@ -1467,7 +1479,10 @@ mod tests {
             .expect("the row");
         assert_eq!(
             row.text,
-            "Claude Code was not found: https://code.claude.com/docs/en/quickstart"
+            format!(
+                "Claude Code was not found in {}: https://code.claude.com/docs/en/quickstart",
+                agent::CLAUDE_LOOKED_IN
+            )
         );
         assert_eq!(after.rows.len(), before.rows.len() + 1);
         // No step, key, choice or footer is added or removed by it.
@@ -1479,6 +1494,26 @@ mod tests {
         // The keys work as they did: 2 chooses a preset and moves on.
         go(&mut s, '2');
         assert_eq!(view(&s).step, "2 / 2");
+    }
+
+    #[test]
+    fn a_refused_claude_says_it_was_found_but_not_used() {
+        let mut s = screen();
+        let before = view(&s);
+        assert_eq!(s.found(Found::ClaudeRefused), Vec::<Effect>::new());
+        let after = view(&s);
+        let row = after
+            .rows
+            .iter()
+            .find(|r| r.label == en(TextId::RowClaude))
+            .expect("the row");
+        assert_eq!(
+            row.text,
+            "Claude Code was found but not used (another user could change it, or what it starts is not on PATH; \
+             the log says which): https://code.claude.com/docs/en/quickstart"
+        );
+        assert_eq!(after.rows.len(), before.rows.len() + 1);
+        assert_eq!(after.items, before.items);
     }
 
     #[test]

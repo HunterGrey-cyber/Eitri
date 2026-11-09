@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { CLAUDE_INSTALL_URL, classify, failureEvidence, neverOpenedReason, sidecarStopped } from "./problems";
+import { CLAUDE_INSTALL_URL, CLAUDE_LOOKED_IN, CLAUDE_REFUSED_NOTE, classify, failureEvidence, neverOpenedReason, sidecarStopped } from "./problems";
 import cliLocateRs from "../../../agent/src/providers/claude_sidecar/cli_locate.rs?raw";
 import installSh from "../../../packaging/install.sh?raw";
 import watchRs from "../../../agent/src/providers/claude_sidecar/watch.rs?raw";
@@ -14,7 +14,7 @@ describe("classify", () => {
     const problem = classify(cliMissingFixture);
     expect(problem).toEqual({
       headline: "Claude Code (claude) was not found.",
-      remedy: "Install it and make sure claude runs in a terminal, then press r.",
+      remedy: "Looked in PATH, ~/.local/bin, ~/.claude/local, npm's global bin. Install it, then press r.",
       link: "https://code.claude.com/docs/en/quickstart",
     });
   });
@@ -27,12 +27,34 @@ describe("classify", () => {
     expect(installSh).toContain(CLAUDE_INSTALL_URL);
   });
 
+  /* A claude that started and exited was found: the row says so and never "not found". A refused one says it was found
+     but not used. Rust's own test of the same words is `failure_names_missing_cli`. */
+  it("tells a spawn error from a claude that started and exited, and a refused claude from a missing one", () => {
+    const marker = /pub const CLI_MISSING_FAILURE_MARKER: &str = "([^"]+)";/.exec(cliLocateRs)![1];
+    const exited = classify(
+      `${marker} via "/home/u/.npm/bin/claude" (exit status 127; stderr: /usr/bin/env: 'node': No such file or directory)`,
+    );
+    expect(exited?.headline).toBe("Claude Code (claude) was found but could not run.");
+    expect(exited?.link).toBeUndefined();
+    const refused = classify(`claude-sidecar exited with exit status: 1 before binding "/x". ${CLAUDE_REFUSED_NOTE}; its stderr said:\n${marker} via "claude" (spawn error: spawnSync claude ENOENT)`);
+    expect(refused?.headline).toBe("Claude Code (claude) was found but not used.");
+    expect(refused?.link).toBe(CLAUDE_INSTALL_URL);
+    // The note and the spawn-error marker are spelled as the Rust constants are.
+    expect(cliLocateRs.replace(/\\\n\s*/g, "")).toContain(`"${CLAUDE_REFUSED_NOTE}"`);
+    expect(cliLocateRs).toContain('pub const CLI_SPAWN_ERROR_MARKER: &str = "(spawn error:";');
+  });
+
+  /* The row and the first-start screen name the same places, in the order the Rust lookup looks. */
+  it("names where it looked as the Rust constant does", () => {
+    expect(cliLocateRs).toContain(`pub const CLAUDE_LOOKED_IN: &str = "${CLAUDE_LOOKED_IN}";`);
+  });
+
   /* The page recognises a not-found failure by the sidecar's words; Rust holds `r` on the same words until a lookup
      finds `claude`, so the two spell them alike. */
   it("spells the not-found failure marker as the Rust constant does", () => {
     const marker = /pub const CLI_MISSING_FAILURE_MARKER: &str = "([^"]+)";/.exec(cliLocateRs)![1];
     expect(cliMissingFixture).toContain(marker);
-    expect(classify(`${marker} via "/x"`)?.headline).toBe("Claude Code (claude) was not found.");
+    expect(classify(`${marker} via "/x" (spawn error: spawnSync /x ENOENT)`)?.headline).toBe("Claude Code (claude) was not found.");
   });
 
   it("recognises the captured CLI-out-of-range fixture and names the real versions", () => {

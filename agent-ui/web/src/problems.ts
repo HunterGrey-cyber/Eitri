@@ -22,6 +22,10 @@ export type Problem = {
  *  first-start screen and `packaging/install.sh` gives its warning (a test reads all three). */
 export const CLAUDE_INSTALL_URL = "https://code.claude.com/docs/en/quickstart";
 
+/** Where a window looks for `claude`, in its order; the same words `agent::CLAUDE_LOOKED_IN` gives the first-start
+ *  screen (a test reads both). */
+export const CLAUDE_LOOKED_IN = "PATH, ~/.local/bin, ~/.claude/local, npm's global bin";
+
 /** `agent::sidecar_missing_message`'s exact opening sentence (agent/src/providers/claude_sidecar/
  *  spawn.rs). Recognising it literally, rather than re-deriving it, is deliberate: this text is
  *  produced by this project's own Rust, not by the sidecar or the CLI, so there is nothing to
@@ -40,12 +44,43 @@ function classifySidecarMissing(text: string): Problem | null {
  *  (ENOENT), before any version parsing is attempted. */
 const CLI_MISSING_MARKER = "could not determine the installed claude CLI version";
 
+/** What the sidecar's sentence carries when the program could not be started at all; a program that started and
+ *  exited says `exit status N` instead (`agent::CLI_SPAWN_ERROR_MARKER`). */
+const CLI_SPAWN_ERROR_MARKER = "(spawn error:";
+
+/** `agent::CLAUDE_REFUSED_NOTE`: a window start adds it when an install place held a `claude` it would not hand over. */
+export const CLAUDE_REFUSED_NOTE =
+  "A claude was found but not used: another user could change it, or what it starts is not on this window's PATH; the window's log says which.";
+
+/** The line holding the sidecar's sentence, or null. */
+function cliSentence(text: string): string | null {
+  const at = text.indexOf(CLI_MISSING_MARKER);
+  if (at === -1) return null;
+  return text.slice(at).split("\n")[0];
+}
+
 function classifyCliMissing(text: string): Problem | null {
-  if (!text.includes(CLI_MISSING_MARKER)) return null;
+  const sentence = cliSentence(text);
+  if (sentence === null) return null;
+  if (sentence.includes(CLI_SPAWN_ERROR_MARKER)) {
+    if (text.includes(CLAUDE_REFUSED_NOTE)) {
+      return {
+        headline: "Claude Code (claude) was found but not used.",
+        remedy:
+          "Another user could change it, or what it starts is not on this window's PATH; the window's log says which. Fix that, then press r.",
+        link: CLAUDE_INSTALL_URL,
+      };
+    }
+    return {
+      headline: "Claude Code (claude) was not found.",
+      remedy: `Looked in ${CLAUDE_LOOKED_IN}. Install it, then press r.`,
+      link: CLAUDE_INSTALL_URL,
+    };
+  }
+  // It started and exited before saying its version: found, but it could not run from this window.
   return {
-    headline: "Claude Code (claude) was not found.",
-    remedy: "Install it and make sure claude runs in a terminal, then press r.",
-    link: CLAUDE_INSTALL_URL,
+    headline: "Claude Code (claude) was found but could not run.",
+    remedy: "It exited before saying its version; the text below says why. Fix that, then press r.",
   };
 }
 

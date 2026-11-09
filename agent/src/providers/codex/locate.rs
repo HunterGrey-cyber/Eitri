@@ -1,12 +1,16 @@
 //! Which `codex` to run: a pure decision over injected lookups, so every rule has a test that needs
 //! no process and no `PATH`.
 //!
-//! The order is the variable, then the `init.lua` key, then `PATH`. Every `PATH` lookup skips empty and
-//! relative entries and yields an absolute path: the child runs in the project root, where a relative
-//! name would resolve to a file the project supplied.
+//! The order is the variable, then the `init.lua` key, then `PATH`, then the places Codex's installers put
+//! `codex` ([`codex_install_places`]), which a window started from a desktop launcher may not have on its `PATH`.
+//! Every `PATH` lookup skips empty and relative entries and yields an absolute path: the child runs in the
+//! project root, where a relative name would resolve to a file the project supplied. An install place is taken
+//! only when `installed_cli::inspect_installed` accepts it (a regular executable file only its owner, this user
+//! or root, can change, through directories only their owners can change).
 
+use crate::installed_cli::{inspect_for_window, npm_prefix, read_user_file, Inspected, NPMRC_CAP};
 use crate::jsonrpc_link::resolve_program;
-use std::ffi::OsStr;
+use std::ffi::{OsStr, OsString};
 use std::fmt;
 use std::path::{Path, PathBuf};
 
@@ -92,13 +96,73 @@ pub fn decide_codex(
     resolve_program(OsStr::new(CODEX_NAME), path_var, &is_file).ok_or(LocateError::NotOnPath)
 }
 
-/// [`decide_codex`] over this process's environment and file system.
+/// Where a Codex tab looks for `codex` when neither the variable nor the key names one, in its order; the
+/// not-found message says the same (a test compares).
+pub const CODEX_LOOKED_IN: &str = "PATH, ~/.local/bin, npm's global bin";
+
+/// Where Codex's installers put `codex`, in the order looked at: the standalone installer's default
+/// (`~/.local/bin/codex`, a link into `~/.codex/packages/standalone/`), then npm's global `bin` under the user's
+/// own prefix (`installed_cli::npm_prefix`; npm's default prefix is the system's, whose `bin` is on every `PATH`).
+/// A `HOME` that is not absolute gives no home place. (A macOS app started from the Finder takes its `PATH`,
+/// Homebrew's included, from the login shell before this runs.)
+pub fn codex_install_places(
+    env: &dyn Fn(&str) -> Option<OsString>,
+    read_file: &dyn Fn(&Path) -> Option<String>,
+) -> Vec<PathBuf> {
+    let home = env("HOME").map(PathBuf::from).filter(|h| h.is_absolute());
+    let mut out = Vec::new();
+    if let Some(home) = &home {
+        out.push(home.join(".local/bin").join(CODEX_NAME));
+    }
+    if let Some(prefix) = npm_prefix(env, home.as_deref(), read_file) {
+        let npm = prefix.join("bin").join(CODEX_NAME);
+        if !out.contains(&npm) {
+            out.push(npm);
+        }
+    }
+    out
+}
+
+/// [`decide_codex`]'s answer, with the install places tried in order when it found nothing on the `PATH`, and only
+/// then: a variable or key the user set is never replaced by an install place, and `places` (which reads `~/.npmrc`)
+/// is not called at all otherwise. Each refusal is logged, escaped.
+pub fn or_installed(
+    decided: Result<PathBuf, LocateError>,
+    places: impl FnOnce() -> Vec<PathBuf>,
+    inspect: &dyn Fn(&Path) -> Inspected,
+) -> Result<PathBuf, LocateError> {
+    match decided {
+        Err(LocateError::NotOnPath) => {
+            for place in places() {
+                match inspect(&place) {
+                    Inspected::Usable => return Ok(place),
+                    Inspected::Refused(why) => eprintln!(
+                        "agent: not running {}: {}",
+                        place.display().to_string().escape_debug(),
+                        why.escape_debug()
+                    ),
+                    Inspected::Absent => {}
+                }
+            }
+            Err(LocateError::NotOnPath)
+        }
+        other => other,
+    }
+}
+
+/// [`decide_codex`], then [`or_installed`], over this process's environment and file system.
 pub fn locate_codex(config_command: Option<&str>) -> Result<PathBuf, LocateError> {
-    decide_codex(
+    let decided = decide_codex(
         std::env::var_os(CODEX_ENV).as_deref(),
         config_command,
         std::env::var_os("PATH").as_deref(),
         |p| p.is_file(),
+    );
+    let path_var = std::env::var_os("PATH");
+    or_installed(
+        decided,
+        || codex_install_places(&|name| std::env::var_os(name), &|p| read_user_file(p, NPMRC_CAP)),
+        &|p| inspect_for_window(p, path_var.as_deref()),
     )
 }
 
@@ -183,5 +247,75 @@ mod tests {
         );
         // No PATH at all.
         assert_eq!(decide_codex(None, None, None, &is_file), Err(LocateError::NotOnPath));
+    }
+    fn env_of(pairs: &[(&str, &str)]) -> impl Fn(&str) -> Option<std::ffi::OsString> {
+        let owned: Vec<(String, String)> = pairs.iter().map(|(k, v)| (k.to_string(), v.to_string())).collect();
+        move |name| {
+            owned
+                .iter()
+                .find(|(k, _)| k == name)
+                .map(|(_, v)| std::ffi::OsString::from(v))
+        }
+    }
+
+    #[test]
+    fn the_install_places_are_the_standalone_installers_then_npms_prefix() {
+        let env = env_of(&[("HOME", "/home/u")]);
+        let npmrc = |p: &Path| (p == Path::new("/home/u/.npmrc")).then(|| "prefix=~/.npm-global".to_string());
+        assert_eq!(
+            codex_install_places(&env, &npmrc),
+            vec![
+                PathBuf::from("/home/u/.local/bin/codex"),
+                PathBuf::from("/home/u/.npm-global/bin/codex")
+            ]
+        );
+        // npm's prefix in `~/.local` is the same place, looked at once.
+        let local = |_: &Path| Some("prefix=/home/u/.local".to_string());
+        assert_eq!(
+            codex_install_places(&env, &local),
+            vec![PathBuf::from("/home/u/.local/bin/codex")]
+        );
+        assert_eq!(
+            codex_install_places(&env_of(&[("HOME", "home")]), &|_| None),
+            Vec::<PathBuf>::new()
+        );
+    }
+
+    #[test]
+    fn an_install_place_is_tried_only_when_nothing_is_on_the_path() {
+        let places = vec![
+            PathBuf::from("/home/u/.local/bin/codex"),
+            PathBuf::from("/opt/npm/bin/codex"),
+        ];
+        let inspect = |p: &Path| {
+            if p == Path::new("/opt/npm/bin/codex") {
+                Inspected::Usable
+            } else {
+                Inspected::Refused("can be written by other users".into())
+            }
+        };
+        assert_eq!(
+            or_installed(Err(LocateError::NotOnPath), || places.clone(), &inspect),
+            Ok(PathBuf::from("/opt/npm/bin/codex"))
+        );
+        assert_eq!(
+            or_installed(Err(LocateError::NotOnPath), || places.clone(), &|_| Inspected::Absent),
+            Err(LocateError::NotOnPath)
+        );
+        // Found on the PATH, or a variable or key that was wrong: left as it is, and the places (which read
+        // `~/.npmrc`) are never worked out.
+        for decided in [
+            Ok(PathBuf::from("/usr/bin/codex")),
+            Err(LocateError::EnvNotAFile(PathBuf::from("/env/missing"))),
+            Err(LocateError::CommandNotFound("mycodex".into())),
+        ] {
+            let never = || -> Vec<PathBuf> { panic!("the install places were worked out for {decided:?}") };
+            assert_eq!(or_installed(decided.clone(), never, &inspect), decided);
+        }
+    }
+
+    #[test]
+    fn the_not_found_message_says_where_it_looked() {
+        assert!(LocateError::NotOnPath.to_string().contains(CODEX_LOOKED_IN));
     }
 }

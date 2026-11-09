@@ -1,9 +1,9 @@
 [English](getting-started.md) | 简体中文
-<!-- translated-from: getting-started.md sha256=b248af7ea68b18aea34c42ffff70f00197df3c7646b1282f980626f342bcdb80 -->
+<!-- translated-from: getting-started.md sha256=0f6771129fcb39d6cc2b70d2b7d1c42c6785bfac3dd4e241d6362367d76d36c2 -->
 
 # 快速上手
 
-这一页带你从命令走到第一个完成的回合：打开一个项目、发送提示、回应 Eitri 弹出的卡片、同时使用多个会话，以及某个回合没有顺利结束时面板会说什么。它假定 Eitri 已经[安装好](../../INSTALL.zh-CN.md)，并且 `claude` 命令已经登录到你的账号。如果 Eitri 找不到 `claude`，首次启动界面和 Claude 标签页的失败提示都会说明，并给出获取地址 <https://code.claude.com/docs/en/quickstart>；装好后确认 `claude` 能在终端里运行，再在该标签页里按 `r`。
+这一页带你从命令走到第一个完成的回合：打开一个项目、发送提示、回应 Eitri 弹出的卡片、同时使用多个会话，以及某个回合没有顺利结束时面板会说什么。它假定 Eitri 已经[安装好](../../INSTALL.zh-CN.md)，并且 `claude` 命令已经登录到你的账号。Eitri 运行它的 `PATH` 上的 `claude`；那里没有的时候（从桌面启动器或菜单而不是终端打开的窗口常常如此），它会按这个顺序去 Claude Code 的安装程序放它的地方找：`~/.local/bin/claude`（快速上手页面里的安装程序）、`~/.claude/local/claude`（较早的本地安装），以及你自己设过的 npm 全局前缀下的 `bin` 目录（`NPM_CONFIG_PREFIX`，或 `~/.npmrc` 里的 `prefix`）。它取第一个满足条件的：一个你能运行的普通文件，属于你或 root，而且它本身和通往它的每一个目录（链接会跟过去）都不能被其他用户写入；不满足的会被跳过，窗口的日志会写明原因。把 `VERDANDI_CLAUDE_CLI_PATH` 设成一个路径就是自己指定程序，这时 Eitri 不再去别处找。如果 Eitri 找不到 `claude`，首次启动界面和 Claude 标签页的失败提示都会说明，列出它找过的地方，并给出获取地址 <https://code.claude.com/docs/en/quickstart>；装好后在该标签页里按 `r`。
 
 文中的按键按默认设置来写：前缀是 `Ctrl+b`，“leader”是 `Space`，除非你的 Neovim 配置设了别的、面板能用的单个键的 `mapleader`（更长的或被保留的会退回到 `Space`）。完整的按键列表在[按键](keys.zh-CN.md)里，在面板里按 `?` 也能看到。
 

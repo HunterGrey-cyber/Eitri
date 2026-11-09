@@ -24,8 +24,8 @@ mod watch;
 mod runtime_policy_verification;
 
 pub use cli_locate::{
-    claude_cli_missing, claude_cli_missing_here, failure_names_missing_cli, CLAUDE_INSTALL_URL,
-    CLI_MISSING_FAILURE_MARKER,
+    claude_cli_missing_here, claude_problem_here, failure_names_missing_cli, locate_claude_here, ClaudeCli,
+    ClaudeProblem, CLAUDE_INSTALL_URL, CLAUDE_LOOKED_IN, CLAUDE_REFUSED_NOTE, CLI_MISSING_FAILURE_MARKER,
 };
 pub use contract::{
     missing_required, SidecarVersion, BUNDLED_SIDECAR_VERSION, REFUSED_CLAUDE_NOTE, REQUIRED_CAPABILITIES,

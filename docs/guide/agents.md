@@ -189,11 +189,15 @@ including `runs without asking` and `mode lag`.
 
 Eitri picks the program in this order: the `EITRI_CODEX` environment variable (an absolute path to a file),
 then `agent.codex.command` in `init.lua` (an absolute path, or a bare command name looked up on `PATH`), then
-`codex` on `PATH`. An `EITRI_CODEX` that is not an absolute path to an existing file stops Eitri at startup and names the
-variable, and so does an `agent.codex.command` that is a relative path with a directory part. A `codex` that
-cannot be found otherwise fails only the Codex tab's start: with nothing on `PATH` the message is "codex not
-found: install it and run `codex login`, or set EITRI_CODEX", and an `agent.codex.command` that names no file
-says so by name. `PATH` entries that are empty or relative are skipped, because the
+`codex` on `PATH`, then the places Codex's installers put it when `PATH` has none (a window started from a
+desktop launcher often lacks `~/.local/bin`): `~/.local/bin/codex` (the standalone installer), then the `bin`
+directory of npm's global prefix when you set one yourself (`NPM_CONFIG_PREFIX`, or `prefix` in `~/.npmrc`), each
+taken only if it is a regular file you may run, owned by you or by root, that neither it nor any directory on the
+way to it can be written by other users. An `EITRI_CODEX` that is not an absolute path to an existing file stops
+Eitri at startup and names the variable, and so does an `agent.codex.command` that is a relative path with a
+directory part. A `codex` that cannot be found otherwise fails only the Codex tab's start: with nothing found the
+message is "codex not found in PATH, ~/.local/bin, npm's global bin: install it and run `codex login`, or set
+EITRI_CODEX", and an `agent.codex.command` that names no file says so by name. `PATH` entries that are empty or relative are skipped, because the
 agent runs in your project directory and such an entry would name a file the project supplied.
 
 ### Trust: the question Codex tabs ask

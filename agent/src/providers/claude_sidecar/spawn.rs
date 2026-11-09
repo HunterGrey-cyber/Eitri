@@ -1507,6 +1507,27 @@ fn sidecar_command_for(
     command
 }
 
+/// What a sidecar that exited before binding is said to have done; with `claude_refused` (an install place held a
+/// `claude` the lookup would not hand over) [`super::cli_locate::CLAUDE_REFUSED_NOTE`] follows, so the panel can say it
+/// was found but not used rather than not found.
+fn exit_summary(status: &ExitStatus, socket_path: &Path, claude_refused: bool) -> String {
+    let mut summary = format!("claude-sidecar exited with {status} before binding {socket_path:?}");
+    if claude_refused {
+        summary.push_str(". ");
+        summary.push_str(super::cli_locate::CLAUDE_REFUSED_NOTE);
+    }
+    summary
+}
+
+/// Gives the sidecar the `claude` the lookup found where an installer puts it, in the one variable the sidecar reads
+/// to pick the CLI. `None` (the person set the variable, `claude` is on the `PATH`, or nothing was found) leaves the
+/// environment as this process has it.
+fn hand_over_cli(command: &mut Command, found: Option<&Path>) {
+    if let Some(found) = found {
+        command.env(super::cli_locate::CLI_PATH_VAR, found);
+    }
+}
+
 /// Verdandi's test seams: they are inherited by the sidecar only when [`TEST_SEAMS_VAR`] is `1`.
 const TEST_SEAM_VARS: [&str; 3] = [
     "VERDANDI_CLAUDE_SIDECAR_RING_CAPACITY",
@@ -1628,6 +1649,14 @@ fn spawn_resolved(
         );
     }
     let mut command = sidecar_command(program_path, program_args, &socket_path, account);
+    // A window started from a launcher can lack the `PATH` entry its person's `claude` is on; the lookup then looks
+    // where Claude Code's installers put it, and the sidecar is given what it found (`cli_locate`).
+    let located = super::cli_locate::locate_claude_here();
+    for line in super::cli_locate::located_log_lines(&located) {
+        eprintln!("agent: {line}");
+    }
+    hand_over_cli(&mut command, super::cli_locate::sidecar_cli_path(&located));
+    let claude_refused = super::cli_locate::claude_problem(&located) == Some(super::cli_locate::ClaudeProblem::Refused);
 
     let mut child = command.spawn()?;
     let (Some(stdin), Some(stdout), Some(stderr)) = (child.stdin.take(), child.stdout.take(), child.stderr.take())
@@ -1685,7 +1714,7 @@ fn spawn_resolved(
             std::thread::sleep(Duration::from_millis(100));
             return Err(startup_failure(
                 std::io::ErrorKind::Other,
-                &format!("claude-sidecar exited with {status} before binding {socket_path:?}"),
+                &exit_summary(&status, &socket_path, claude_refused),
                 format!("exited with {status}"),
                 &stderr_tail,
             ));
@@ -2410,6 +2439,60 @@ mod tests {
         let (description, _) = describe_checkout(&checkout);
         assert!(!description.contains("prebuilt"), "{description}");
         std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
+    fn an_early_exit_says_a_refused_claude_was_found_but_not_used() {
+        use std::os::unix::process::ExitStatusExt;
+        let status = ExitStatus::from_raw(1 << 8);
+        let socket = crate::socket_path::sidecar_socket(Path::new("/tmp"), "exit-summary-test").unwrap();
+        let plain = exit_summary(&status, &socket, false);
+        assert_eq!(
+            plain,
+            format!("claude-sidecar exited with {status} before binding {socket:?}")
+        );
+        let refused = exit_summary(&status, &socket, true);
+        assert!(refused.starts_with(&plain), "{refused}");
+        assert!(
+            refused.contains(super::super::cli_locate::CLAUDE_REFUSED_NOTE),
+            "{refused}"
+        );
+    }
+
+    /// The `claude` found at an install place reaches the sidecar child as `VERDANDI_CLAUDE_CLI_PATH`; nothing found
+    /// (or nothing to hand over) adds no variable, so one the person set is inherited as it is.
+    #[test]
+    fn a_claude_found_at_an_install_place_reaches_the_sidecar_as_its_cli_path() {
+        let socket = crate::socket_path::sidecar_socket(Path::new("/tmp"), "cli-path-test").unwrap();
+        let program = Path::new("/usr/lib/eitri/verdandi-claude-sidecar");
+        let cli_path_of = |command: &Command| {
+            command
+                .get_envs()
+                .find(|(k, _)| *k == OsStr::new("VERDANDI_CLAUDE_CLI_PATH"))
+                .map(|(_, v)| v.map(|v| v.to_os_string()))
+        };
+        let mut command = sidecar_command_for(program, &[], &socket, None, false, None);
+        hand_over_cli(&mut command, Some(Path::new("/home/u/.local/bin/claude")));
+        assert_eq!(
+            cli_path_of(&command),
+            Some(Some(std::ffi::OsString::from("/home/u/.local/bin/claude")))
+        );
+        let mut command = sidecar_command_for(program, &[], &socket, None, false, None);
+        hand_over_cli(&mut command, None);
+        assert_eq!(cli_path_of(&command), None);
+        // What the lookup hands over for each answer: only an install place.
+        use super::super::cli_locate::{sidecar_cli_path, ClaudeCli};
+        assert_eq!(
+            sidecar_cli_path(&ClaudeCli::Installed(PathBuf::from("/home/u/.local/bin/claude"))),
+            Some(Path::new("/home/u/.local/bin/claude"))
+        );
+        for answer in [
+            ClaudeCli::Named,
+            ClaudeCli::OnPath,
+            ClaudeCli::Missing { refused: Vec::new() },
+        ] {
+            assert_eq!(sidecar_cli_path(&answer), None, "{answer:?}");
+        }
     }
 
     /// Reads the account back off the real `Command` the real spawn path builds -- the env map, not

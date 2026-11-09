@@ -41,8 +41,8 @@ pub(crate) struct DetectContext {
     /// What the window's own tmux import found, from the config phase.
     pub(crate) tmux: Option<TmuxImport>,
     pub(crate) build: Build,
-    /// Whether no `claude` a Claude tab could start is there: the sidecar's own lookup over this process's environment.
-    pub(crate) claude_missing: Box<dyn Fn() -> bool + Send>,
+    /// Why no `claude` a Claude tab could start is there, if so: the sidecar's own lookup over this process's environment.
+    pub(crate) claude_problem: Box<dyn Fn() -> Option<agent::ClaudeProblem> + Send>,
 }
 
 impl DetectContext {
@@ -62,7 +62,7 @@ impl DetectContext {
             read: Box::new(read_regular_file),
             tmux,
             build,
-            claude_missing: Box::new(agent::claude_cli_missing_here),
+            claude_problem: Box::new(agent::claude_problem_here),
         }
     }
 }
@@ -95,8 +95,10 @@ pub(crate) fn read_regular_file(path: &Path) -> Option<String> {
 pub(crate) fn run(ctx: DetectContext, send: impl Fn(Found)) {
     // First, because it is a few `stat`s and the rows below may wait on a command; and only when missing, so a machine
     // that has `claude` sees no change.
-    if (ctx.claude_missing)() {
-        send(Found::ClaudeMissing);
+    match (ctx.claude_problem)() {
+        Some(agent::ClaudeProblem::Missing) => send(Found::ClaudeMissing),
+        Some(agent::ClaudeProblem::Refused) => send(Found::ClaudeRefused),
+        None => {}
     }
     let home = (ctx.env)("HOME").filter(|h| !h.is_empty()).map(PathBuf::from);
     send(Found::Tmux(detect::tmux_row(ctx.tmux.as_ref(), home.as_deref())));
@@ -245,7 +247,7 @@ mod tests {
             read: Box::new(|_| None),
             tmux: None,
             build: Build::THIS_BINARY,
-            claude_missing: Box::new(|| false),
+            claude_problem: Box::new(|| None),
         }
     }
 
@@ -300,7 +302,7 @@ mod tests {
                 Found::Neovim(_) => "neovim",
                 Found::Input(_) => "input",
                 Found::TrustOpen(_) => "trust",
-                Found::ClaudeMissing => "claude",
+                Found::ClaudeMissing | Found::ClaudeRefused => "claude",
             })
             .collect();
         assert_eq!(kinds, ["tmux", "input", "desktop", "windows"], "{rows:?}");
@@ -317,14 +319,17 @@ mod tests {
 
     #[test]
     fn a_missing_claude_is_sent_first_and_only_when_missing() {
-        let rows = |missing: bool| {
+        let rows = |problem: Option<agent::ClaudeProblem>| {
             let mut ctx = fake(&[("HOME", "/home/u")], Box::new(|_| Err("not here".to_string())));
-            ctx.claude_missing = Box::new(move || missing);
+            ctx.claude_problem = Box::new(move || problem);
             collect(ctx)
         };
-        assert_eq!(rows(true)[0], Found::ClaudeMissing);
-        assert_eq!(rows(true).len(), rows(false).len() + 1);
-        assert!(!rows(false).contains(&Found::ClaudeMissing));
+        let missing = Some(agent::ClaudeProblem::Missing);
+        let refused = Some(agent::ClaudeProblem::Refused);
+        assert_eq!(rows(missing)[0], Found::ClaudeMissing);
+        assert_eq!(rows(refused)[0], Found::ClaudeRefused);
+        assert_eq!(rows(missing).len(), rows(None).len() + 1);
+        assert!(!rows(None).contains(&Found::ClaudeMissing) && !rows(None).contains(&Found::ClaudeRefused));
     }
 
     fn sway_row(answer: &'static str, file: Option<&'static str>) -> DesktopRow {

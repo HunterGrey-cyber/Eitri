@@ -161,6 +161,9 @@ pub enum Found {
     TrustOpen(bool),
     /// No `claude` the agent panel could start was found. Sent only when so: a machine that has it says nothing.
     ClaudeMissing,
+    /// None was used, but an install place held a `claude` the lookup refused (another user could change it, or the
+    /// interpreter its first line names is not on the `PATH`); the window's log names it. Carries nothing.
+    ClaudeRefused,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
