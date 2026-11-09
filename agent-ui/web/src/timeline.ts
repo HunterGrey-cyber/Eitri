@@ -174,15 +174,12 @@ function taskNoticeItem(notice: NoticeRecord, known: TurnCause | undefined): Wak
   return item;
 }
 
-/** A run of empty scheduled ticks folds into its first row, which keeps its identity while the run is
- *  as long as it was: one folded item per first row and count. */
-const foldedWakes = new WeakMap<WakeItem, Map<number, WakeItem>>();
+/** A run of empty scheduled ticks keeps only its latest combined item beside its first row. */
+const foldedWakes = new WeakMap<WakeItem, WakeItem>();
 
 function foldedWake(first: WakeItem, count: number): WakeItem {
-  let byCount = foldedWakes.get(first);
-  if (!byCount) foldedWakes.set(first, (byCount = new Map()));
-  let item = byCount.get(count);
-  if (!item) byCount.set(count, (item = { ...first, count }));
+  let item = foldedWakes.get(first);
+  if (item?.count !== count) foldedWakes.set(first, (item = { ...first, count }));
   return item;
 }
 
@@ -509,21 +506,18 @@ export function buildTimeline(state: AgentUiState): TimelineItem[] {
     }
   }
   const folded: TimelineItem[] = [];
-  let previous: WakeItem | null = null;
-  let first: WakeItem | null = null;
-  for (const item of out) {
-    if (item.kind === "wake" && item.scheduled) {
-      const finished = emptyScheduled.has(item.seq);
-      if (previous && first && finished) {
-        const combined = foldedWake(first, previous.count + 1);
-        folded[folded.length - 1] = combined;
-        previous = combined;
-        continue;
+  for (let i = 0; i < out.length; i++) {
+    const item = out[i];
+    if (item.kind === "wake" && item.scheduled && emptyScheduled.has(item.seq)) {
+      let end = i + 1;
+      while (end < out.length) {
+        const next = out[end];
+        if (next.kind !== "wake" || !next.scheduled || !emptyScheduled.has(next.seq)) break;
+        end++;
       }
-      previous = finished ? item : null;
-      first = previous;
-    } else previous = null;
-    folded.push(item);
+      folded.push(end > i + 1 ? foldedWake(item, end - i) : item);
+      i = end - 1;
+    } else folded.push(item);
   }
   return folded;
 }

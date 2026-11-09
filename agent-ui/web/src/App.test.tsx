@@ -16318,6 +16318,36 @@ describe("a broker card in the page", () => {
     expect(band(container)).toBe("1 of 2: src/a.rs");
   });
 
+  it.each(["editor_cards", "snapshot", "closed tab"])("forgets a proposal view after %s removes its card", (removal) => {
+    const card = proposalCard(["src/a.rs", "src/b.rs"]);
+    const { container } = arrivedOnABrokerCard([card]);
+    ctrlG(container);
+    if (removal === "closed tab") {
+      dispatch({ kind: "tabs", active: 2, tabs: [{ ...LIVE_TAB, id: 2 }] });
+      dispatch({ kind: "tabs", active: 1, tabs: [LIVE_TAB] });
+    } else if (removal === "snapshot") {
+      dispatch({ kind: "snapshot", tab: 1, throughRevision: 5, state: snapshotState() });
+    } else dispatch({ kind: "editor_cards", tab: 1, cards: [] });
+    dispatch({ kind: "editor_cards", tab: 1, cards: [card] });
+    dispatch({ kind: "focus_permission", tab: 1 });
+    ctrlG(container);
+    expect(views().map((m) => m.file)).toEqual([0, 0]);
+  });
+
+  it("keeps a pending proposal's next file across a tab switch and its following snapshot", () => {
+    const card = proposalCard(["src/a.rs", "src/b.rs"]);
+    const { container } = arrivedOnABrokerCard([card]);
+    ctrlG(container);
+    const tabs = [LIVE_TAB, { ...LIVE_TAB, id: 2 }];
+    dispatch({ kind: "tabs", active: 2, tabs });
+    dispatch({ kind: "snapshot", tab: 2, throughRevision: 0, state: snapshotState() });
+    dispatch({ kind: "tabs", active: 1, tabs });
+    dispatch({ kind: "snapshot", tab: 1, throughRevision: 5, state: { ...snapshotState(), editorCards: [card] } });
+    dispatch({ kind: "focus_permission", tab: 1 });
+    ctrlG(container);
+    expect(views().map((m) => m.file)).toEqual([0, 1]);
+  });
+
   it("ctrl_g_on_another_editor_card_views_its_text", () => {
     const { container } = arrivedOnABrokerCard();
     ctrlG(container);

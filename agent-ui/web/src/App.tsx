@@ -52,6 +52,8 @@ import type { KeyboardEvent, SetStateAction } from "react";
 import { ProjectDirContext } from "./projectPath";
 import { initialPageModel, pageModel, withoutHint } from "./page_model";
 import type { CommandRecord, PageModel } from "./page_model";
+import { pruneCardViews, pruneTabEntries } from "./pageLookups";
+import type { CardView } from "./pageLookups";
 import { installDispatch, installRemoteDesk, postToRust, nextMirrorId, nextRequestId } from "./bridge";
 import type { OutboundMessage, PanelKeysMode, PermissionDecision } from "./bridge";
 import { noteUserScroll, resumeFollowing, watchUserScroll } from "./follow";
@@ -562,12 +564,12 @@ export default function App() {
   const [tasksInitialId, setTasksInitialId] = useState<string | null>(null);
   const tasksRef = useRef<TasksOverlayHandle>(null);
   const taskRequests = useRef(new Map<string, TabId>());
-  const [atPathsByTab, setAtPathsByTab] = useState<Record<number, { items: string[]; seq: number }>>({});
-  const atPaths = activeTab === null ? null : atPathsByTab[activeTab.id] ?? null;
+  const [atPathsByTab, setAtPathsByTab] = useState<Map<TabId, { items: string[]; seq: number }>>(() => new Map());
+  const atPaths = activeTab === null ? null : atPathsByTab.get(activeTab.id) ?? null;
   const atLastAsked = useRef(new Map<TabId, number>());
   const settingsRequests = useRef(new Map<string, SettingsRequest>());
   /** How many times `Ctrl+g` has viewed each broker card's proposal, by card id: the next press shows the next file. */
-  const cardViews = useRef(new Map<string, number>());
+  const cardViews = useRef(new Map<string, CardView>());
   const taskScratchTab = useRef<TabId | null>(null);
   // Only a locally requested draft/answer edit resumes typing. Row views and later landings keep their modes.
   const editReturnRef = useRef<{
@@ -2496,7 +2498,7 @@ export default function App() {
       }
       if (payload.kind === "path_completions") {
         if (payload.seq !== atLastAsked.current.get(payload.tab)) return;
-        setAtPathsByTab((previous) => ({ ...previous, [payload.tab]: { items: payload.items, seq: payload.seq } }));
+        setAtPathsByTab((previous) => new Map(previous).set(payload.tab, { items: payload.items, seq: payload.seq }));
         return;
       }
       // Every session-scoped envelope names its tab, and the page keeps only the active tab's state, so one for
@@ -2506,6 +2508,19 @@ export default function App() {
       const receivedAt = performance.now();
       const previousPage = pageRef.current;
       const nextPage = pageModel(previousPage, { ...payload, receivedAt: Date.now(), monotonicAt: receivedAt });
+      if (nextPage.tabs !== null && (payload.kind === "tabs" || payload.kind === "snapshot" ||
+          nextPage.state.editorCards !== previousPage.state.editorCards)) {
+        const live = new Set(nextPage.tabs.tabs.map((tab) => tab.id));
+        if (payload.kind === "tabs") {
+          atLastAsked.current = pruneTabEntries(atLastAsked.current, live);
+          setAtPathsByTab((previous) => pruneTabEntries(previous, live));
+        }
+        // A switch clears the page before its snapshot arrives; that empty state says nothing about its cards.
+        cardViews.current = pruneCardViews(cardViews.current, live, payload.kind === "tabs" ? undefined : {
+          tab: nextPage.tabs.active,
+          pending: new Set(nextPage.state.editorCards.map((card) => card.permissionId)),
+        });
+      }
       // The refs at once, not at the next render: the next envelope of this batch (an `error` for the tab just
       // switched to, a snapshot after `tabs`) must start from this one's result.
       pageRef.current = nextPage;
@@ -6211,8 +6226,8 @@ export default function App() {
         if (item.kind === "permission" && stored !== undefined && tab !== null) {
           // A proposal an editor tool computed: the shell holds both sides of each file, and one file shows per press.
           const { files } = stored;
-          const shown = (cardViews.current.get(item.request.permissionId) ?? 0) % files.length;
-          cardViews.current.set(item.request.permissionId, shown + 1);
+          const shown = (cardViews.current.get(item.request.permissionId)?.shown ?? 0) % files.length;
+          cardViews.current.set(item.request.permissionId, { tab, shown: shown + 1 });
           if (files.length > 1) {
             const path = revealedPathText(files[shown]);
             showFlash(`${shown + 1} of ${files.length}: ${path}`, { path });

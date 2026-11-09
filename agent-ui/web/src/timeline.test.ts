@@ -1,4 +1,4 @@
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 import { allCards, buildTimeline, oldestPendingPermission, oldestWaitingPermission, promptIndex, questionLines, waitingCardAfter, waitingCardIndex } from "./timeline";
 import type { TimelineItem } from "./timeline";
 import { primaryText } from "./copyText";
@@ -284,6 +284,34 @@ describe("buildTimeline's identity for wake rows", () => {
   const cause = (over: Partial<import("./types").TurnCause>): import("./types").TurnCause => ({
     kind: "unknown", taskId: null, taskKind: null, taskStatus: null, description: null, summary: null,
     peerName: null, text: null, wakeupSource: null, scheduledForMs: null, scheduleReason: null, cronId: null, prompt: null, ...over,
+  });
+
+  it("caches only the final combined item for a 1000-wake run and replaces it as the run grows", () => {
+    const turnStarts = Array.from({ length: 1001 }, (_, i) => ({
+      seq: i + 1, turnId: `t${i + 1}`, origin: "cli" as const, cause: cause({ kind: "scheduled" }),
+    }));
+    const writes = vi.spyOn(WeakMap.prototype, "set");
+    try {
+      const s = state({ turnStarts: turnStarts.slice(0, 1000) });
+      const rows = buildTimeline(s);
+      expect(rows).toEqual([{
+        kind: "wake", seq: 1, key: "w-1", text: "Scheduled wake-up", body: null,
+        scheduled: true, count: 1000, inlineBody: false,
+      }]);
+      expect(primaryText(rows[0])).toBe("Scheduled wake-up ×1000");
+      const combinedWrites = () => writes.mock.calls.filter(([key]) => "kind" in key && key.kind === "wake");
+      expect(combinedWrites()).toHaveLength(1);
+      const [first, cached] = combinedWrites()[0];
+      expect(cached === rows[0]).toBe(true);
+      expect(buildTimeline(s)[0]).toBe(rows[0]);
+      expect(combinedWrites()).toHaveLength(1);
+      const longer = buildTimeline(state({ turnStarts }));
+      expect(longer[0]).toMatchObject({ key: "w-1", count: 1001 });
+      expect(combinedWrites()).toHaveLength(2);
+      expect(combinedWrites()[1]).toEqual([first, longer[0]]);
+    } finally {
+      writes.mockRestore();
+    }
   });
 
   it("hands back the same wake, task notice and folded item while their records are the same", () => {

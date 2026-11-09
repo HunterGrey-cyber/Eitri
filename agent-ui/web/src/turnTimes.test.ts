@@ -50,6 +50,18 @@ describe("the duration table", () => {
     const table = durationsFromSnapshot([{ turnId: "t1", startedAtMs: 10, endedAtMs: 5, anchorSeq: 1 }]);
     expect(table.get("t1")?.durationMs).toBe(0);
   });
+
+  it("keeps the newest 1000 of 1200 received times, in receipt order rather than timestamp order", () => {
+    const times = Array.from({ length: 1200 }, (_, i) => ({ ...wire(`t${i}`, i), startedAtMs: 10_000 - i }));
+    const expected = times.slice(200).map((time) => time.turnId);
+    const current = durationsFromSnapshot(times.slice(0, 900));
+    const merged = durationsWith(current, times.slice(900));
+    expect([...merged.keys()]).toEqual(expected);
+    expect(current.size).toBe(900);
+    expect(merged.get("t1199")).toEqual({ durationMs: times[1199].endedAtMs - times[1199].startedAtMs, anchorSeq: 5 });
+    expect([...durationsWith(NO_TURN_DURATIONS, times).keys()]).toEqual(expected);
+    expect([...durationsFromSnapshot(times).keys()]).toEqual(expected);
+  });
 });
 
 describe("workedFooters", () => {

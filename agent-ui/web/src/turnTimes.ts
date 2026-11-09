@@ -12,19 +12,30 @@ export type TurnDurations = ReadonlyMap<string, TurnDuration>;
 
 export const NO_TURN_DURATIONS: TurnDurations = new Map();
 
+const MAX_TURN_TIMES = 1000;
+
+/** Match the host's receipt-order retention: discard the oldest finished turns first. */
+function bounded(table: Map<string, TurnDuration>): TurnDurations {
+  for (const id of table.keys()) {
+    if (table.size <= MAX_TURN_TIMES) break;
+    table.delete(id);
+  }
+  return table;
+}
+
 function entry(time: TurnTimeWire): [string, TurnDuration] {
   return [time.turnId, { durationMs: Math.max(0, time.endedAtMs - time.startedAtMs), anchorSeq: time.anchorSeq ?? null }];
 }
 
 /** A snapshot's `turnTimes` as the whole table. A sender that predates the field reads as no times. */
 export function durationsFromSnapshot(times: readonly TurnTimeWire[] | undefined): TurnDurations {
-  return new Map((times ?? []).map(entry));
+  return bounded(new Map((times ?? []).map(entry)));
 }
 
 /** An events envelope's `turnTimes` added to what the panel holds; `current` itself when it carries none. */
 export function durationsWith(current: TurnDurations, times: readonly TurnTimeWire[] | undefined): TurnDurations {
   if (times === undefined || times.length === 0) return current;
-  return new Map([...current, ...times.map(entry)]);
+  return bounded(new Map([...current, ...times.map(entry)]));
 }
 
 /** `8s`, `1m 23s`, `1h 02m`: seconds under a minute, minutes with zero-padded seconds under an hour,
