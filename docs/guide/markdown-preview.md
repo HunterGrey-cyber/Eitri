@@ -246,6 +246,12 @@ to it (an image opens at its own size when it is smaller than the viewer). A dia
   nearest folder above the document that holds `.git`, else the document's own folder; your home folder and `/` never
   count as a project. An image outside the project shows as a box saying `outside the project`, and an unsaved buffer's
   relative images as `save the file to show local images`.
+- Images with multiple hard links (for example from `cp -al` or hard-link deduplication tools) are refused. Copy
+  them as separate files to show them. A symlink leading outside the project is also refused. On Linux 5.6 or newer,
+  relative symlinked folders that stay inside the project work; older Linux kernels and macOS refuse symlinked
+  folders. The image file itself cannot be a symlink. A refused image shows as a box saying `outside the project`,
+  including a hard-linked image inside the project. System restrictions on Linux can also prevent symlinked
+  folders from loading.
 - Remote images follow VS Code's default: `https` images load, `http` images do not (a box says `http image not
   loaded`). The status line counts the images that were not loaded.
 - **Privacy:** loading a remote image tells the server that hosts it your address and the time you opened the

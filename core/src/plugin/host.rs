@@ -56,6 +56,8 @@ pub const FOLLOW_LATE_POLL: Duration = Duration::from_millis(250);
 /// How long a page-supplied path (or a task's program and working directory) may take to check before the
 /// page is told the filesystem did not answer.
 pub const CHECK_DEADLINE: Duration = Duration::from_secs(5);
+/// Maximum queued path jobs and completed results per plugin.
+const MAX_PATH_JOBS: usize = 64;
 /// How long a store operation (`state.*`, `log.*`) may take before the page is told the store did not answer.
 pub const STORE_DEADLINE: Duration = Duration::from_secs(5);
 /// How long a key sequence waits for its next key until the editor reports its own `timeoutlen`: vim's
@@ -323,19 +325,29 @@ fn line_fragment(fragment: &str) -> Option<u32> {
 /// One worker thread per plugin, started at the first check. Checks run in order; one stalled on the
 /// filesystem holds the ones behind it, which then run out their deadlines rather than piling up threads.
 struct PathChecker {
-    tx: mpsc::Sender<(u64, CheckJob)>,
+    tx: mpsc::SyncSender<PathJob>,
     rx: mpsc::Receiver<(u64, Checked)>,
+}
+
+type PathJob = (u64, Option<Instant>, CheckJob);
+
+fn job_queue() -> (mpsc::SyncSender<PathJob>, mpsc::Receiver<PathJob>) {
+    mpsc::sync_channel(MAX_PATH_JOBS)
 }
 
 impl PathChecker {
     fn spawn(plugin: LoadedPlugin, wake: agent::UiWake, gate: Option<mpsc::Receiver<()>>) -> std::io::Result<Self> {
-        let (tx, jobs) = mpsc::channel::<(u64, CheckJob)>();
-        let (done, rx) = mpsc::channel();
+        let (tx, jobs) = job_queue();
+        let (done, rx) = mpsc::sync_channel(MAX_PATH_JOBS);
         std::thread::Builder::new().name("plugin-paths".into()).spawn(move || {
-            for (ticket, job) in jobs {
+            for (ticket, deadline, job) in jobs {
                 if let Some(gate) = &gate {
                     // A closed gate lets everything through.
                     let _ = gate.recv();
+                }
+                // A timed-out page no longer needs this payload or any filesystem work it would do.
+                if deadline.is_some_and(|deadline| Instant::now() >= deadline) {
+                    continue;
                 }
                 let checked = match job {
                     CheckJob::Diff(mut args) => {
@@ -1036,25 +1048,32 @@ impl PluginHost {
     }
 
     /// Hands a check to the worker; the ticket names its answer.
-    fn submit_check(&self, job: CheckJob) -> Result<u64, String> {
+    fn submit_check(&self, job: CheckJob, deadline: Option<Instant>) -> Result<u64, (ErrorCode, String)> {
         let mut st = self.state.borrow_mut();
         if st.checker.is_none() {
             let gate = st.check_gate.take();
             let spawned = PathChecker::spawn((*self.plugin).clone(), self.wake.clone(), gate);
-            st.checker = Some(spawned.map_err(|e| format!("the path checker's thread could not start: {e}"))?);
+            st.checker =
+                Some(spawned.map_err(|e| (ErrorCode::Io, format!("the path checker's thread could not start: {e}")))?);
         }
         let ticket = st.next_ticket;
         st.next_ticket += 1;
         if let Some(checker) = st.checker.as_ref() {
-            let _ = checker.tx.send((ticket, job));
+            checker
+                .tx
+                .try_send((ticket, deadline, job))
+                .map_err(|error| match error {
+                    mpsc::TrySendError::Full(_) => (ErrorCode::Busy, "the path checker is busy".to_owned()),
+                    mpsc::TrySendError::Disconnected(_) => (ErrorCode::Io, "the path checker stopped".to_owned()),
+                })?;
         }
         Ok(ticket)
     }
 
     fn check_then(&self, re: u64, job: CheckJob, then: Then, now: Instant) -> Option<Reply> {
-        let ticket = match self.submit_check(job) {
+        let ticket = match self.submit_check(job, Some(now + CHECK_DEADLINE)) {
             Ok(ticket) => ticket,
-            Err(why) => return Some(Reply::err(re, ErrorCode::Io, &why)),
+            Err((code, why)) => return Some(Reply::err(re, code, &why)),
         };
         let mut st = self.state.borrow_mut();
         let document = st.document;
@@ -1192,11 +1211,11 @@ impl PluginHost {
                 home: st.home.clone(),
             }
         };
-        match self.submit_check(job) {
+        match self.submit_check(job, None) {
             Ok(ticket) => {
                 self.state.borrow_mut().project_asked.insert(ticket, name.to_owned());
             }
-            Err(why) => eprintln!(
+            Err((_, why)) => eprintln!(
                 "[plugin {}] the document's project could not be looked up: {why}",
                 self.id()
             ),
@@ -2663,9 +2682,10 @@ impl PluginHost {
                 "this window has no editor running",
             ));
         }
-        let ticket = match self.submit_check(CheckJob::Diff(args)) {
+        let deadline = now + EDITOR_DEADLINE;
+        let ticket = match self.submit_check(CheckJob::Diff(args), Some(deadline)) {
             Ok(ticket) => ticket,
-            Err(why) => return Some(Reply::err(re, ErrorCode::Io, &why)),
+            Err((code, why)) => return Some(Reply::err(re, code, &why)),
         };
         let mut st = self.state.borrow_mut();
         st.diffed = true;
@@ -2673,7 +2693,7 @@ impl PluginHost {
         st.parked.push_back(Pending::new(
             Some(re),
             document,
-            now + EDITOR_DEADLINE,
+            deadline,
             ScopedOp::CheckingDiff { ticket },
         ));
         None
@@ -2714,9 +2734,10 @@ impl PluginHost {
         } else {
             CheckJob::Dir(raw.to_owned())
         };
-        let ticket = match self.submit_check(job) {
+        let deadline = now + CHECK_DEADLINE;
+        let ticket = match self.submit_check(job, Some(deadline)) {
             Ok(ticket) => ticket,
-            Err(why) => return Some(Reply::err(re, ErrorCode::Io, &why)),
+            Err((code, why)) => return Some(Reply::err(re, code, &why)),
         };
         // Marked before the check finishes: a stop while it is pending still clears the change.
         let mut st = self.state.borrow_mut();
@@ -2732,8 +2753,7 @@ impl PluginHost {
             raw: raw.to_owned(),
             op,
         };
-        st.parked
-            .push_back(Pending::new(Some(re), document, now + EDITOR_DEADLINE, op));
+        st.parked.push_back(Pending::new(Some(re), document, deadline, op));
         None
     }
 
@@ -3708,6 +3728,48 @@ mod tests {
             r.host.pump(now + EDITOR_DEADLINE);
             assert!(r.page.take().is_empty());
         }
+    }
+
+    #[test]
+    fn the_65th_queued_path_job_is_busy() {
+        let (r, _) = buffers_rig();
+        // Keep the receiver idle so admission is independent of worker scheduling.
+        let (tx, _jobs) = job_queue();
+        let (_done, rx) = mpsc::channel();
+        r.host.state.borrow_mut().checker = Some(PathChecker { tx, rx });
+        for id in 0..64 {
+            assert!(r
+                .host
+                .editor_diff(id, serde_json::from_value(text_diff()).unwrap(), Instant::now())
+                .is_none());
+        }
+        let reply = r
+            .host
+            .editor_diff(65, serde_json::from_value(text_diff()).unwrap(), Instant::now());
+        assert!(reply.is_some(), "a full path queue must refuse immediately");
+        assert_eq!(error_code(&serde_json::to_value(reply.unwrap()).unwrap()), "busy");
+    }
+
+    #[test]
+    fn an_expired_path_job_is_skipped_before_checking() {
+        let (r, _) = buffers_rig();
+        let past = Instant::now() - EDITOR_DEADLINE;
+        assert!(r
+            .host
+            .editor_diff(1, serde_json::from_value(text_diff()).unwrap(), past)
+            .is_none());
+        assert!(r
+            .host
+            .editor_diff(2, serde_json::from_value(text_diff()).unwrap(), Instant::now())
+            .is_none());
+        let state = r.host.state.borrow();
+        let checker = state.checker.as_ref().unwrap();
+        let (ticket, _) = checker.rx.recv_timeout(Duration::from_secs(60)).unwrap();
+        assert_eq!(
+            ticket,
+            state.next_ticket - 1,
+            "only the live job produces a checked result"
+        );
     }
 
     #[test]

@@ -1,12 +1,17 @@
 //! The document route: `/.eitri/doc/<generation>/<path>` in a following plugin's origin serves the image files
 //! of the followed document's project, so a page that renders the document can show its local images. The
-//! document is untrusted text, so only regular image files inside the project are served, by canonical path,
-//! and a request names the generation of the project it was rendered against: once the followed document moves
-//! to another project, addresses made for the old one stop resolving.
+//! document is untrusted text, so only regular image files with at most one link inside the project are served
+//! from checked descriptors. A request names the project generation it was rendered against: once the followed
+//! document moves to another project, addresses made for the old one stop resolving.
 
-use std::path::{Path, PathBuf};
+use std::ffi::{CString, OsStr};
+use std::fs::{File, OpenOptions};
+use std::os::fd::{AsRawFd, FromRawFd};
+use std::os::unix::ffi::OsStrExt;
+use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
+use std::path::{Component, Path, PathBuf};
 
-use super::page_policy::{decoded, encode_path, mime_for, origin, request_path, SiteFile, SiteRefusal};
+use super::page_policy::{decoded, encode_path, mime_for, origin, request_path, SiteRefusal};
 use super::protocol::DocPrefixes;
 
 /// The route's place in a plugin's origin, as a decoded request path starts.
@@ -103,38 +108,142 @@ fn is_image_name(name: &str) -> bool {
         .is_some_and(|(_, ext)| IMAGE_TYPES.contains(&ext.to_ascii_lowercase().as_str()))
 }
 
-/// The file a document-route path names under `project_dir`: a regular file whose canonical path stays inside
-/// the project and whose name, both as asked for and as it resolves, has an image type. Reads the filesystem:
-/// a worker thread only.
-///
-/// `project_dir` is the canonical directory that was approved (as `project_dir` returns it), and containment is
-/// judged against exactly that path. It is not resolved again: if the directory has since been replaced by a
-/// symlink, following it would move the boundary to wherever the link points, so a project that no longer
-/// resolves to itself serves nothing.
-pub fn doc_file(project_dir: &Path, rel: &str) -> Result<SiteFile, SiteRefusal> {
+/// An image opened and checked on the worker. Readers must use this descriptor, never its former name.
+#[derive(Debug)]
+pub struct DocFile {
+    pub file: File,
+    pub mime: &'static str,
+    pub len: u64,
+}
+
+#[cfg(target_os = "linux")]
+const DIRECTORY_ACCESS: libc::c_int = libc::O_PATH;
+#[cfg(not(target_os = "linux"))]
+const DIRECTORY_ACCESS: libc::c_int = libc::O_RDONLY;
+
+/// Opens one component against a held directory; neither a renamed parent nor a symlink redirects it.
+fn open_component(parent: &File, name: &OsStr, directory: bool) -> Result<File, SiteRefusal> {
+    let name = CString::new(name.as_bytes()).map_err(|_| SiteRefusal::BadPath)?;
+    let flags = libc::O_NOFOLLOW
+        | libc::O_CLOEXEC
+        | if directory {
+            DIRECTORY_ACCESS | libc::O_DIRECTORY
+        } else {
+            libc::O_RDONLY | libc::O_NONBLOCK
+        };
+    // SAFETY: the parent descriptor and NUL-terminated component are valid for this call.
+    let fd = unsafe { libc::openat(parent.as_raw_fd(), name.as_ptr(), flags) };
+    if fd < 0 {
+        return Err(match std::io::Error::last_os_error().raw_os_error() {
+            Some(libc::ELOOP | libc::ENOTDIR) => SiteRefusal::OutsideSite,
+            _ => SiteRefusal::NotFound,
+        });
+    }
+    // SAFETY: openat returned a new descriptor, owned solely by this File.
+    Ok(unsafe { File::from_raw_fd(fd) })
+}
+
+/// Opens the whole relative path while the kernel keeps symlink resolution beneath the held project.
+#[cfg(target_os = "linux")]
+fn open_beneath(project: &File, rel: &str) -> std::io::Result<File> {
+    let name = CString::new(rel)?;
+    // SAFETY: all-zero is a valid open_how, including its reserved fields.
+    let mut how: libc::open_how = unsafe { std::mem::zeroed() };
+    how.flags = (libc::O_RDONLY | libc::O_NONBLOCK | libc::O_CLOEXEC | libc::O_NOFOLLOW) as u64;
+    how.resolve = libc::RESOLVE_BENEATH | libc::RESOLVE_NO_MAGICLINKS;
+    // SAFETY: project stays open, and both the path and open_how buffers outlive this call with their given size.
+    let fd = unsafe {
+        libc::syscall(
+            libc::SYS_openat2,
+            project.as_raw_fd(),
+            name.as_ptr(),
+            &how as *const libc::open_how,
+            std::mem::size_of::<libc::open_how>(),
+        )
+    };
+    if fd < 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    // SAFETY: openat2 returned a new descriptor, owned solely by this File.
+    Ok(unsafe { File::from_raw_fd(fd as libc::c_int) })
+}
+
+/// The fallback refuses all symlinks because openat alone cannot constrain their resolution.
+fn walk_image(mut directory: File, rel: &str) -> Result<File, SiteRefusal> {
+    let mut components = rel.split('/').peekable();
+    while let Some(name) = components.next() {
+        directory = open_component(&directory, OsStr::new(name), components.peek().is_some())?;
+    }
+    Ok(directory)
+}
+
+fn open_image(project: File, rel: &str) -> Result<File, SiteRefusal> {
+    #[cfg(target_os = "linux")]
+    return open_image_with(project, rel, open_beneath);
+    #[cfg(not(target_os = "linux"))]
+    walk_image(project, rel)
+}
+
+#[cfg(target_os = "linux")]
+fn open_image_with(
+    project: File,
+    rel: &str,
+    mut open: impl FnMut(&File, &str) -> std::io::Result<File>,
+) -> Result<File, SiteRefusal> {
+    // Renames can interrupt the kernel's containment check; bound retries before the stricter walk.
+    for _ in 0..8 {
+        match open(&project, rel) {
+            Ok(file) => return Ok(file),
+            Err(error) => match error.raw_os_error() {
+                Some(libc::EAGAIN | libc::EINTR) => continue,
+                Some(libc::ENOSYS | libc::EPERM) => break,
+                Some(libc::ELOOP | libc::ENOTDIR | libc::EXDEV) => return Err(SiteRefusal::OutsideSite),
+                _ => return Err(SiteRefusal::NotFound),
+            },
+        }
+    }
+    walk_image(project, rel)
+}
+
+/// Opens a regular image with at most one link beneath the approved canonical project directory. All filesystem
+/// operations belong on a worker thread. The checked descriptor is handed to the reader without reopening.
+pub fn doc_file(project_dir: &Path, rel: &str) -> Result<DocFile, SiteRefusal> {
     if !is_image_name(rel) {
         return Err(SiteRefusal::UnknownType);
+    }
+    if rel.split('/').any(|c| c.is_empty() || c == "." || c == "..") || rel.contains('\\') {
+        return Err(SiteRefusal::OutsideSite);
     }
     if std::fs::canonicalize(project_dir).ok().as_deref() != Some(project_dir) {
         return Err(SiteRefusal::OutsideSite);
     }
-    let canonical = std::fs::canonicalize(project_dir.join(rel)).map_err(|_| SiteRefusal::NotFound)?;
-    if !canonical.starts_with(project_dir) {
-        return Err(SiteRefusal::OutsideSite);
+    // Walk the approved absolute name too: an ancestor replaced by a symlink must not move the project.
+    let mut file = OpenOptions::new()
+        .read(true)
+        .custom_flags(DIRECTORY_ACCESS | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC)
+        .open("/")
+        .map_err(|_| SiteRefusal::NotFound)?;
+    for component in project_dir.components() {
+        match component {
+            Component::RootDir => {}
+            Component::Normal(name) => file = open_component(&file, name, true)?,
+            _ => return Err(SiteRefusal::OutsideSite),
+        }
     }
-    // A link named like an image may point at any other file of the project; only an image is served.
-    let target = canonical.to_string_lossy();
-    if !is_image_name(&target) {
-        return Err(SiteRefusal::UnknownType);
-    }
-    let mime = mime_for(&target).ok_or(SiteRefusal::UnknownType)?;
-    let meta = std::fs::metadata(&canonical).map_err(|_| SiteRefusal::NotFound)?;
+    check_image(open_image(file, rel)?, rel)
+}
+
+fn check_image(file: File, rel: &str) -> Result<DocFile, SiteRefusal> {
+    let meta = file.metadata().map_err(|_| SiteRefusal::NotFound)?;
     if !meta.is_file() {
         return Err(SiteRefusal::NotFound);
     }
-    Ok(SiteFile {
-        path: canonical,
-        mime,
+    if meta.nlink() > 1 {
+        return Err(SiteRefusal::OutsideSite);
+    }
+    Ok(DocFile {
+        file,
+        mime: mime_for(rel).ok_or(SiteRefusal::UnknownType)?,
         len: meta.len(),
     })
 }
@@ -287,23 +396,25 @@ mod tests {
         symlink("../../secret.png", proj.join("img/up.png")).unwrap();
 
         let a = doc_file(&proj, "img/a.png").unwrap();
-        assert_eq!((a.path, a.mime, a.len), (proj.join("img/a.png"), "image/png", 5));
+        assert_eq!((a.mime, a.len), ("image/png", 5));
+        let mut bytes = Vec::new();
+        std::io::Read::read_to_end(&mut &a.file, &mut bytes).unwrap();
+        assert_eq!(bytes, b"12345");
         assert_eq!(doc_file(&proj, "img/A.PNG").unwrap().mime, "image/png");
-        assert_eq!(doc_file(&proj, "notes.md"), Err(SiteRefusal::UnknownType));
-        assert_eq!(doc_file(&proj, "noext"), Err(SiteRefusal::UnknownType));
-        assert_eq!(doc_file(&proj, "img/missing.png"), Err(SiteRefusal::NotFound));
-        assert_eq!(doc_file(&proj, "dir.png"), Err(SiteRefusal::NotFound));
-        assert_eq!(doc_file(&proj, "out.png"), Err(SiteRefusal::OutsideSite));
-        assert_eq!(doc_file(&proj, "img/up.png"), Err(SiteRefusal::OutsideSite));
-        assert_eq!(doc_file(&proj, "../secret.png"), Err(SiteRefusal::OutsideSite));
-        let inside = doc_file(&proj, "in.svg").unwrap();
-        assert_eq!((inside.path, inside.mime), (proj.join("img/x.svg"), "image/svg+xml"));
-        // A link named like an image that resolves to another kind of file of the project is not an image.
+        assert_eq!(doc_file(&proj, "notes.md").unwrap_err(), SiteRefusal::UnknownType);
+        assert_eq!(doc_file(&proj, "noext").unwrap_err(), SiteRefusal::UnknownType);
+        assert_eq!(doc_file(&proj, "img/missing.png").unwrap_err(), SiteRefusal::NotFound);
+        assert_eq!(doc_file(&proj, "dir.png").unwrap_err(), SiteRefusal::NotFound);
+        assert_eq!(doc_file(&proj, "out.png").unwrap_err(), SiteRefusal::OutsideSite);
+        assert_eq!(doc_file(&proj, "img/up.png").unwrap_err(), SiteRefusal::OutsideSite);
+        assert_eq!(doc_file(&proj, "../secret.png").unwrap_err(), SiteRefusal::OutsideSite);
+        assert_eq!(doc_file(&proj, "in.svg").unwrap_err(), SiteRefusal::OutsideSite);
+        // Symlinks are refused regardless of the target's type.
         symlink(proj.join("notes.md"), proj.join("pic.png")).unwrap();
-        assert_eq!(doc_file(&proj, "pic.png"), Err(SiteRefusal::UnknownType));
-        // The type served is the one of the file the link resolves to.
+        assert_eq!(doc_file(&proj, "pic.png").unwrap_err(), SiteRefusal::OutsideSite);
+        // A symlink cannot select a different image type either.
         symlink(proj.join("img/x.svg"), proj.join("logo.png")).unwrap();
-        assert_eq!(doc_file(&proj, "logo.png").unwrap().mime, "image/svg+xml");
+        assert_eq!(doc_file(&proj, "logo.png").unwrap_err(), SiteRefusal::OutsideSite);
         assert_eq!(doc_file(&proj, "x.avif").unwrap().mime, "image/avif");
         assert_eq!(doc_file(&proj, "x.bmp").unwrap().mime, "image/bmp");
         for ext in IMAGE_TYPES {
@@ -312,6 +423,177 @@ mod tests {
                 "{ext}"
             );
         }
+    }
+
+    #[test]
+    fn outside_symlinked_directories_and_hard_linked_images_are_refused() {
+        let s = Scratch::new("doc-links");
+        let proj = s.0.join("proj");
+        fs::create_dir_all(proj.join("img")).unwrap();
+        fs::write(proj.join("img/a.png"), "image").unwrap();
+        fs::write(s.0.join("outside.png"), "private").unwrap();
+        symlink("..", proj.join("alias")).unwrap();
+        assert_eq!(
+            doc_file(&proj, "alias/outside.png").unwrap_err(),
+            SiteRefusal::OutsideSite
+        );
+        fs::hard_link(s.0.join("outside.png"), proj.join("linked.png")).unwrap();
+        assert!(doc_file(&proj, "linked.png").is_err());
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn search_only_directories_still_serve_images() {
+        use std::os::unix::fs::PermissionsExt;
+        let s = Scratch::new("doc-search");
+        let ancestor = s.0.join("ancestor");
+        let proj = ancestor.join("proj");
+        let images = proj.join("img");
+        touch(&images.join("a.png"));
+        let ancestor_handle = File::open(&ancestor).unwrap();
+        fs::set_permissions(&ancestor, fs::Permissions::from_mode(0o111)).unwrap();
+        fs::set_permissions(&proj, fs::Permissions::from_mode(0o311)).unwrap();
+        fs::set_permissions(&images, fs::Permissions::from_mode(0o311)).unwrap();
+        let result = doc_file(&proj, "img/a.png");
+        let fallback = open_component(&ancestor_handle, OsStr::new("proj"), true)
+            .and_then(|project| walk_image(project, "img/a.png"));
+        // Restore permissions before asserting so scratch cleanup can always traverse the tree.
+        for dir in [&ancestor, &proj, &images] {
+            fs::set_permissions(dir, fs::Permissions::from_mode(0o700)).unwrap();
+        }
+        assert_eq!(result.unwrap().len, 1);
+        assert!(fallback.is_ok());
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn in_project_symlinked_directories_serve_images() {
+        let s = Scratch::new("doc-internal-link");
+        let proj = s.0.join("proj");
+        touch(&proj.join("assets/a.png"));
+        fs::create_dir(proj.join("docs")).unwrap();
+        symlink("../assets", proj.join("docs/img")).unwrap();
+        assert_eq!(doc_file(&proj, "docs/img/a.png").unwrap().len, 1);
+    }
+
+    #[test]
+    fn an_open_image_with_zero_reported_links_is_served() {
+        let s = Scratch::new("doc-zero-links");
+        let path = s.0.join("a.png");
+        fs::write(&path, "image").unwrap();
+        let file = File::open(&path).unwrap();
+        fs::remove_file(&path).unwrap();
+        assert_eq!(file.metadata().unwrap().nlink(), 0);
+        assert_eq!(check_image(file, "a.png").unwrap().len, 5);
+    }
+
+    #[test]
+    fn the_fallback_serves_regular_images_and_refuses_symlinks() {
+        let s = Scratch::new("doc-fallback");
+        touch(&s.0.join("img/a.png"));
+        symlink("img", s.0.join("alias")).unwrap();
+        assert!(walk_image(File::open(&s.0).unwrap(), "img/a.png").is_ok());
+        assert!(walk_image(File::open(&s.0).unwrap(), "alias/a.png").is_err());
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn unavailable_open_beneath_falls_back_without_following_symlinks() {
+        let s = Scratch::new("doc-open-unavailable");
+        touch(&s.0.join("img/a.png"));
+        symlink("img", s.0.join("alias")).unwrap();
+        for errno in [libc::ENOSYS, libc::EPERM] {
+            for (rel, expected) in [("img/a.png", Ok(())), ("alias/a.png", Err(SiteRefusal::OutsideSite))] {
+                let mut calls = 0;
+                let result = open_image_with(File::open(&s.0).unwrap(), rel, |_, _| {
+                    calls += 1;
+                    Err(std::io::Error::from_raw_os_error(errno))
+                });
+                assert_eq!(calls, 1);
+                assert_eq!(result.map(|_| ()), expected, "errno {errno}, path {rel}");
+            }
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn transient_open_beneath_errors_retry_until_success() {
+        let s = Scratch::new("doc-open-retry");
+        touch(&s.0.join("img/a.png"));
+        symlink("img", s.0.join("alias")).unwrap();
+        for failures in 0..8 {
+            let mut calls = 0;
+            let file = open_image_with(File::open(&s.0).unwrap(), "alias/a.png", |project, rel| {
+                assert_eq!(rel, "alias/a.png");
+                assert!(project.metadata().unwrap().is_dir());
+                calls += 1;
+                if calls <= failures {
+                    let errno = if calls % 2 == 0 { libc::EINTR } else { libc::EAGAIN };
+                    Err(std::io::Error::from_raw_os_error(errno))
+                } else {
+                    File::open(s.0.join("img/a.png"))
+                }
+            })
+            .unwrap();
+            assert_eq!(calls, failures + 1);
+            assert_eq!(file.metadata().unwrap().len(), 1);
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn exhausted_open_beneath_retries_fall_back_without_following_symlinks() {
+        let s = Scratch::new("doc-open-exhausted");
+        touch(&s.0.join("img/a.png"));
+        symlink("img", s.0.join("alias")).unwrap();
+        for errno in [libc::EAGAIN, libc::EINTR] {
+            for (rel, expected) in [("img/a.png", Ok(())), ("alias/a.png", Err(SiteRefusal::OutsideSite))] {
+                let mut calls = 0;
+                let result = open_image_with(File::open(&s.0).unwrap(), rel, |_, _| {
+                    calls += 1;
+                    Err(std::io::Error::from_raw_os_error(errno))
+                });
+                assert_eq!(calls, 8);
+                assert_eq!(result.map(|_| ()), expected, "errno {errno}, path {rel}");
+            }
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn permanent_open_beneath_errors_neither_retry_nor_fall_back() {
+        let s = Scratch::new("doc-open-permanent");
+        touch(&s.0.join("a.png"));
+        for (errno, expected) in [
+            (libc::EACCES, SiteRefusal::NotFound),
+            (libc::ENOENT, SiteRefusal::NotFound),
+            (libc::ELOOP, SiteRefusal::OutsideSite),
+            (libc::ENOTDIR, SiteRefusal::OutsideSite),
+            (libc::EXDEV, SiteRefusal::OutsideSite),
+        ] {
+            let mut calls = 0;
+            let result = open_image_with(File::open(&s.0).unwrap(), "a.png", |_, _| {
+                calls += 1;
+                Err(std::io::Error::from_raw_os_error(errno))
+            });
+            assert_eq!(calls, 1);
+            assert_eq!(result.unwrap_err(), expected, "errno {errno}");
+        }
+    }
+
+    #[test]
+    fn image_bytes_come_from_the_opened_descriptor() {
+        let s = Scratch::new("doc-descriptor");
+        let proj = s.0.join("proj");
+        fs::create_dir_all(proj.join("img")).unwrap();
+        fs::write(proj.join("img/a.png"), "original").unwrap();
+        let image = doc_file(&proj, "img/a.png").unwrap();
+        fs::rename(proj.join("img"), proj.join("moved")).unwrap();
+        fs::create_dir(proj.join("img")).unwrap();
+        fs::write(proj.join("img/a.png"), "replacement").unwrap();
+        let mut bytes = Vec::new();
+        std::io::Read::read_to_end(&mut &image.file, &mut bytes).unwrap();
+        assert_eq!(bytes, b"original");
     }
 
     #[test]
@@ -327,11 +609,14 @@ mod tests {
         // The approved directory moves away and a link to home takes its name.
         fs::rename(&proj, s.0.join("moved")).unwrap();
         symlink(&home, &proj).unwrap();
-        assert_eq!(doc_file(&proj, "pictures/private.png"), Err(SiteRefusal::OutsideSite));
+        assert_eq!(
+            doc_file(&proj, "pictures/private.png").unwrap_err(),
+            SiteRefusal::OutsideSite
+        );
         // A directory that was never canonical is refused the same way, whatever it would resolve to.
         assert_eq!(
-            doc_file(&s.0.join("home/../moved"), "img/a.png"),
-            Err(SiteRefusal::OutsideSite)
+            doc_file(&s.0.join("home/../moved"), "img/a.png").unwrap_err(),
+            SiteRefusal::OutsideSite
         );
         assert!(doc_file(&s.0.join("moved"), "img/a.png").is_ok());
     }

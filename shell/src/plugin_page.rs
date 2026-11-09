@@ -114,9 +114,9 @@ fn route(id: &str, uri: &str, doc_slot: Option<&DocSlot>) -> Route {
     }
 }
 
-/// Serves one request of the plugin's scheme. Checking the path touches the disk (`canonicalize`, `metadata`),
-/// which can stall on a slow or hung filesystem, so it runs on a worker thread; the request is answered back on
-/// the main context, and the file itself is read without blocking this thread.
+/// Serves one request of the plugin's scheme. Site path checks and document image opening and descriptor
+/// checks touch the disk and can stall on a slow or hung filesystem, so they run on a worker thread. The
+/// request is answered on the main context, and the file itself is read without blocking this thread.
 fn serve(request: &URISchemeRequest, site_root: &Path, id: &str, entry: &str, doc_slot: Option<&Rc<RefCell<DocSlot>>>) {
     let uri = request.uri().map(|u| u.to_string()).unwrap_or_default();
     if trace::enabled() {
@@ -166,7 +166,7 @@ fn answer(
     uri: &str,
 ) {
     match checked {
-        Ok(file) => read_file(request, file),
+        Ok(file) => read_site_file(request, file),
         Err(SiteRefusal::NotFound) if page_policy::is_entry(id, entry, uri) => {
             respond_static(request, page_policy::NOT_BUILT_HTML, "text/html")
         }
@@ -181,8 +181,14 @@ fn answer(
     }
 }
 
+/// Hands WebKit the already-open document image; asynchronous stream reads keep disk I/O off this thread.
+fn read_file(request: &URISchemeRequest, file: doc_route::DocFile) {
+    let stream = gio::ReadInputStream::new(file.file);
+    respond(request, &stream, i64::try_from(file.len).unwrap_or(-1), file.mime);
+}
+
 /// Answers with a checked file, read without blocking this thread.
-fn read_file(request: &URISchemeRequest, file: page_policy::SiteFile) {
+fn read_site_file(request: &URISchemeRequest, file: page_policy::SiteFile) {
     let request = request.clone();
     let (mime, len) = (file.mime, i64::try_from(file.len).unwrap_or(-1));
     gio::File::for_path(&file.path).read_async(glib::Priority::DEFAULT, None::<&gio::Cancellable>, move |opened| {

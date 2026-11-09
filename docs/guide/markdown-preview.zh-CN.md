@@ -1,5 +1,5 @@
 [English](markdown-preview.md) | 简体中文
-<!-- translated-from: markdown-preview.md sha256=066b28284497dc739ce1d3165a8a8744c212c371f102357adce922f70587ce11 -->
+<!-- translated-from: markdown-preview.md sha256=462e8e4afcd63d81c8f1d7877fb3890a4afc015187d67e46f24c2dc4ea37d411 -->
 
 # Markdown 预览
 
@@ -169,6 +169,7 @@ eitri.keymap.set("plugin:markdown", "e", "edit.here")
 ## 图片
 
 - 项目里的图片会显示：相对路径从文档所在的文件夹算起，以 `/` 开头的路径从项目的顶层文件夹算起。文档在 Eitri 启动时所在的文件夹里面时，项目就是那个文件夹；否则是文档上方最近的一个含有 `.git` 的文件夹；再否则是文档自己的文件夹；你的主目录和 `/` 永远不算项目。项目以外的图片显示为一个写着 `outside the project` 的方框，未保存的缓冲区里的相对路径图片显示为 `save the file to show local images`。
+- 有多个硬链接的图片（例如由 `cp -al` 或硬链接去重工具创建）不会加载；要显示它们，请复制为独立文件。指向项目外的符号链接也会被拒绝。在 Linux 5.6 及更新内核上，目标仍在项目内的相对目录符号链接可以使用；旧版 Linux 内核和 macOS 不接受目录符号链接。图片文件本身不能是符号链接。被拒绝的图片会显示为一个写着 `outside the project` 的方框，项目内的硬链接图片也是如此。Linux 上的系统限制也可能导致目录符号链接无法加载。
 - 远程图片按 VS Code 的默认方式处理：`https` 图片会加载，`http` 图片不会（方框里写着 `http image not loaded`）。状态行会统计没有加载的图片数量。
 - **隐私：** 加载一张远程图片，会让托管它的服务器知道你的地址和你打开文档的时间。要一张远程图片都不加载：
 
