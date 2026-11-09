@@ -26,8 +26,9 @@
  *  against each other in Rust (`tokens.rs`). */
 import { useLayoutEffect, useRef, useState } from "react";
 import type { CSSProperties } from "react";
-import { clipBox, firstShownLine, visibleBox } from "../nav";
+import { clipBox, firstShownLine, pathShownLine, visibleBox } from "../nav";
 import type { HintTarget } from "../nav";
+import { pathTargetPass } from "../pathTargets";
 
 export type ShownHint = { target: HintTarget; label: string };
 
@@ -114,23 +115,29 @@ type Rect = { top: number; left: number; right: number; bottom: number };
 
 function place(root: HTMLElement, hints: ShownHint[], label: { width: number; height: number }): Placement[] {
   const origin = root.getBoundingClientRect();
+  const paths = pathTargetPass(root);
   // Each placed label's furthest right (root-relative), for the nudge below.
   const limits: Array<number | null> = [];
   const placed = hints.map(({ target }, i): Placement => {
     limits[i] = null;
-    if (!target.el.isConnected) return null;
+    const el = target.kind === "path" ? paths.row(target.rowKey) : target.el;
+    if (el === null || !el.isConnected) return null;
     // Everything is placed on the part of the target that shows, and every label's top is clamped
     // into the box that part shows in, so a target scrolled half out of the list -- or a sliver at
     // either edge -- keeps its label on screen rather than over the band above the list or past its
     // end. A label on screen matters more than one flush with its target (Vimium's rule: a hint on the
     // visible part of its target).
-    const vis = visibleBox(target.el, root);
-    const clip = vis === null ? null : clipBox(target.el, root);
+    const vis = visibleBox(el, root);
+    const clip = vis === null ? null : clipBox(el, root);
     if (vis === null || clip === null) return null;
     limits[i] = clip.right - label.width - origin.left;
     const clampTop = (want: number) => Math.max(clip.top, Math.min(want, clip.bottom - label.height)) - origin.top;
     // Sideways too -- a link in a wide table scrolled sideways starts left of its box.
     const clampLeft = (want: number) => Math.max(clip.left, Math.min(want, clip.right - label.width)) - origin.left;
+    if (target.kind === "path") {
+      const at = pathShownLine(target, root, paths);
+      return at === null ? null : { top: clampTop(at.top), left: clampLeft(at.left) };
+    }
     if (target.kind === "code") return { top: clampTop(vis.top + 4), left: vis.right - origin.left - 4, shift: true };
     if (target.kind === "row") {
       const sign = target.el.querySelector<HTMLElement>(".row-sign");
@@ -179,7 +186,9 @@ function place(root: HTMLElement, hints: ShownHint[], label: { width: number; he
   return placed;
 }
 
-export function HintLayer({ root, hints, typed }: { root: HTMLElement | null; hints: ShownHint[]; typed: string }) {
+export function HintLayer({ root, hints, typed, onPlaced }: {
+  root: HTMLElement | null; hints: ShownHint[]; typed: string; onPlaced?: (labels: string[]) => void;
+}) {
   const [placements, setPlacements] = useState<Placement[]>([]);
   const layerRef = useRef<HTMLDivElement>(null);
   // Whether the commit this effect is about to run for was caused by its own `setPlacements` below, and how many
@@ -193,6 +202,9 @@ export function HintLayer({ root, hints, typed }: { root: HTMLElement | null; hi
     selfPasses.current = ownUpdate.current ? selfPasses.current + 1 : 0;
     ownUpdate.current = false;
     const next = root === null ? [] : place(root, hints, labelSize(layerRef.current));
+    // The path picker lists every unplaced target in its footer, after this commit's DOM changes.
+    const shown = selfPasses.current >= MAX_SELF_PASSES ? placements : next;
+    onPlaced?.(hints.flatMap(({ label }, i) => shown[i] == null ? [] : [label]));
     if (samePlacements(next, placements) || selfPasses.current >= MAX_SELF_PASSES) return;
     ownUpdate.current = true;
     setPlacements(next);

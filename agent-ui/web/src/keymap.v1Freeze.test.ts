@@ -53,9 +53,15 @@ function visualToken(token: string): KeyLike {
   if (token === "Esc") return key("Escape");
   if (token === "1-9") return key("3");
   if (token === "gg") return key("g");
+  if (token === "gf") return key("f");
   if (token.startsWith("Ctrl+")) return key(token.slice("Ctrl+".length), { ctrlKey: true });
   if (/^[A-Z?]$/.test(token)) return key(token, { shiftKey: true });
   return key(token);
+}
+
+/** `"gf"` is the SECOND of its two presses, read with the region's pending `g`. */
+function visualCtx(token: string): { sessionEnded: boolean; pending?: PendingPrefix } {
+  return token === "gf" ? { sessionEnded: false, pending: "g" } : { sessionEnded: false };
 }
 
 type ResolveKeyCase = {
@@ -135,7 +141,7 @@ const RESOLVE_KEY_CASES: ResolveKeyCase[] = [
         label: `${mode}: ${token}`,
         mode,
         event: visualToken(token),
-        ctx: { sessionEnded: false },
+        ctx: visualCtx(token),
       })),
     ),
   ),
@@ -151,7 +157,7 @@ const RESOLVE_KEY_CASES: ResolveKeyCase[] = [
       label: `caret: ${token}`,
       mode: "caret" as const,
       event: visualToken(token),
-      ctx: { sessionEnded: false },
+      ctx: visualCtx(token),
     })),
   ),
   { label: "caret: d", mode: "caret", event: key("d"), ctx: { sessionEnded: false } },

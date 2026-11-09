@@ -71,6 +71,8 @@ mod outbox;
 mod pages;
 #[path = "pair_review.rs"]
 mod pair_review;
+#[path = "path_lookup.rs"]
+mod path_lookup;
 #[path = "path_menu.rs"]
 mod path_menu;
 #[path = "remote_enroll.rs"]
@@ -181,6 +183,7 @@ struct AgentPanelState {
     backend_kind: BackendKind,
     project_dir: PathBuf,
     path_menu: path_menu::PathMenu,
+    path_lookup: path_lookup::PathLookup,
     /// Messages that name the editor's own sources and wait for its answer.
     mentions: mentions::Desk,
     /// The window's questions about remote control waiting for the base page's answer.
@@ -598,6 +601,7 @@ impl AgentPanelState {
             backend_kind,
             project_dir,
             path_menu: path_menu::PathMenu::default(),
+            path_lookup: path_lookup::PathLookup::default(),
             mentions: mentions::Desk::default(),
             remote_desk: remote_enroll::RemoteDesk::default(),
             mention_sections: None,

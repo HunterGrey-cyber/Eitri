@@ -15,6 +15,7 @@ import type { PanelTable } from "./keymap";
 // the real `isPlainAnswerKey` export and prove the bypass-y handler actually calls it, rather than
 // a same-shaped hand-written copy -- see that test's own comment for what this can and cannot catch.
 import * as keymapModule from "./keymap";
+import * as navModule from "./nav";
 import { binding, TABLE } from "./testFixtures";
 import { modeFixedMessage } from "./modeKey";
 import { hintTypingFlash, tableKeyTypingFlash, TYPE_HINT_FLASH, TYPING_GUARD_MS } from "./typingGuard";
@@ -9751,10 +9752,10 @@ describe("copying with y and Y, and answering through the card, in the conversat
 });
 
 describe("the editor round trips", () => {
-  function withPaths(text: string) {
+  function withPaths(text: string, streaming = false) {
     const rendered = render(<App />);
     dispatch({ kind: "hello", ...HELLO });
-    dispatchLiveTab(snapshotState({ transcript: [{ seq: 1, text }] }), 2);
+    dispatchLiveTab(snapshotState({ transcript: [{ seq: 1, text }], assistantMessageOpen: streaming, nextSeq: 2 }), 2);
     return rendered;
   }
 
@@ -9766,7 +9767,7 @@ describe("the editor round trips", () => {
     expect(lastOfType("open_path")).toMatchObject({ path: "src/parser.rs", line: 42 });
   });
 
-  it("gf with several paths lists them with letters, and the letter picks one", () => {
+  it("gf lists unplaced paths in the footer, and the letter picks one", () => {
     const { container } = withPaths("compare a.rs and b.rs");
     const root = container.querySelector(".agent-ui-conversation")!;
     fireEvent.keyDown(root, { key: "g" });
@@ -9780,6 +9781,157 @@ describe("the editor round trips", () => {
     fireEvent.keyDown(root, { key: "Escape" });
     expect(container.querySelector(".path-pick")).toBeNull();
     expect(posted.filter((m) => m.type === "open_path")).toHaveLength(1);
+  });
+
+  const twentyPaths = Array.from({ length: 20 }, (_, i) => `src/file${i + 1}.rs`);
+  const twentyLabels = "aa as ad aj ak al ag ah aw ae ar au ai ao sa ss sd sj sk sl".split(" ");
+
+  function pickTwenty() {
+    const rendered = withPaths(twentyPaths.join(", "));
+    const root = rendered.container.querySelector(".agent-ui-conversation")!;
+    const press = (key: string, extra = {}) => fireEvent.keyDown(root, { key, ...extra });
+    press("g"); press("f");
+    const list = rendered.container.querySelector(".path-pick")!;
+    expect(list.textContent).toBe(twentyPaths.map((path, i) => `${twentyLabels[i]} ${path}`).join(" · "));
+    expect(list.children).toHaveLength(20);
+    return { ...rendered, press };
+  }
+
+  it.each([["as", 1], ["sl", 19]])("gf keeps all twenty paths reachable: %s opens index %i", (label, index) => {
+    const { container, press } = pickTwenty();
+    press(label[0]);
+    expect(lastOfType("open_path")).toBeUndefined();
+    expect(container.querySelector(".path-pick .hint-typed")?.textContent).toBe(label[0]);
+    press(label[1]);
+    expect(lastOfType("open_path")).toMatchObject({ path: twentyPaths[index] });
+    expect(container.querySelector(".path-pick")).toBeNull();
+  });
+
+  it("Backspace erases a letter and at an empty prefix keeps the pick", () => {
+    const { container, press } = pickTwenty();
+    press("Backspace");
+    expect(container.querySelector(".path-pick")).not.toBeNull();
+    press("a"); press("Backspace");
+    expect(container.querySelector(".path-pick .hint-typed")?.textContent).toBe("");
+    press("s"); press("a");
+    expect(lastOfType("open_path")).toMatchObject({ path: twentyPaths[14] });
+  });
+
+  it("a held label key never supplies its second letter", () => {
+    const { press } = pickTwenty();
+    press("a"); press("a", { repeat: true });
+    expect(lastOfType("open_path")).toBeUndefined();
+    press("s");
+    expect(lastOfType("open_path")).toMatchObject({ path: twentyPaths[1] });
+  });
+
+  it.each([{}, { afterPrefix: true }, { chord: true }])("cancels without opening or passing a key through: %j", (test) => {
+    const { container, press } = pickTwenty();
+    if ("afterPrefix" in test) press("a");
+    if ("chord" in test) press("a", { ctrlKey: true });
+    else press("Escape");
+    expect(container.querySelector(".path-pick")).toBeNull();
+    expect(lastOfType("open_path")).toBeUndefined();
+    expect(container.querySelector(".hint-label")).toBeNull();
+  });
+
+  it("a path written twice gets one label", () => {
+    const { container } = withPaths("a.rs b.rs a.rs");
+    const root = container.querySelector(".agent-ui-conversation")!;
+    fireEvent.keyDown(root, { key: "g" });
+    fireEvent.keyDown(root, { key: "f" });
+    expect(container.querySelector(".path-pick")?.textContent).toBe("a a.rs · s b.rs");
+  });
+
+  it("gf draws all twenty two-letter labels with HintLayer when the text is shown", () => {
+    const { container } = withPaths(twentyPaths.join(", "));
+    const box = () => ({ top: 0, left: 0, right: 600, bottom: 600, width: 600, height: 600 }) as DOMRect;
+    for (const el of container.querySelectorAll(".agent-ui-root, .message-list, .row-assistant")) el.getBoundingClientRect = box;
+    const root = container.querySelector(".agent-ui-conversation")!;
+    fireEvent.keyDown(root, { key: "g" });
+    fireEvent.keyDown(root, { key: "f" });
+    expect(Array.from(container.querySelectorAll(".hint-layer .hint-path"), (el) => el.textContent)).toEqual(twentyLabels);
+    expect(container.querySelector(".path-pick")).toBeNull();
+    fireEvent.keyDown(root, { key: "s" });
+    expect(container.querySelectorAll(".hint-path.hint-off")).toHaveLength(14);
+    fireEvent.keyDown(root, { key: "l" });
+    expect(lastOfType("open_path")).toMatchObject({ path: twentyPaths[19] });
+  });
+
+  it("gf keeps twenty labels on new reply nodes when the row re-renders during the pick", () => {
+    const { container } = withPaths(twentyPaths.join(", "), true);
+    const box = () => ({ top: 0, left: 0, right: 600, bottom: 600, width: 600, height: 600 }) as DOMRect;
+    for (const el of container.querySelectorAll(".agent-ui-root, .message-list, .row-assistant")) el.getBoundingClientRect = box;
+    const original = Object.getOwnPropertyDescriptor(Range.prototype, "getClientRects");
+    const measured = new Map<string, Node>();
+    Object.defineProperty(Range.prototype, "getClientRects", { configurable: true, value: function(this: Range) {
+      measured.set(this.toString(), this.startContainer);
+      return [box()];
+    } });
+    try {
+      const root = container.querySelector(".agent-ui-conversation")!;
+      fireEvent.keyDown(root, { key: "g" });
+      fireEvent.keyDown(root, { key: "f" });
+      const labels = () => Array.from(container.querySelectorAll(".hint-path"), (el) => el.textContent);
+      expect(labels()).toEqual(twentyLabels);
+      const oldNode = measured.get(twentyPaths[0])!;
+      measured.clear();
+      dispatch({ kind: "events", tab: 1, fromRevision: 2, throughRevision: 3, events: [
+        { type: "content_delta", turn_id: "t1", kind: "text", text: " More detail." },
+      ] });
+      expect(oldNode.isConnected).toBe(false);
+      expect(labels()).toEqual(twentyLabels);
+      expect(container.querySelector(".path-pick")).toBeNull();
+      for (const path of twentyPaths) {
+        const node = measured.get(path);
+        expect(node?.isConnected, path).toBe(true);
+        expect(node).not.toBe(oldNode);
+      }
+      fireEvent.keyDown(root, { key: "s" });
+      fireEvent.keyDown(root, { key: "l" });
+      expect(lastOfType("open_path")).toMatchObject({ path: twentyPaths[19] });
+    } finally {
+      if (original) Object.defineProperty(Range.prototype, "getClientRects", original);
+      else delete (Range.prototype as unknown as Record<string, unknown>).getClientRects;
+    }
+  });
+
+  it("gf moves paths whose text changes during the pick to the footer", () => {
+    const { container } = withPaths("a.rs b.rs c.rs");
+    const box = () => ({ top: 0, left: 0, right: 600, bottom: 600, width: 600, height: 600 }) as DOMRect;
+    for (const el of container.querySelectorAll(".agent-ui-root, .message-list, .row-assistant")) el.getBoundingClientRect = box;
+    const root = container.querySelector(".agent-ui-conversation")!;
+    fireEvent.keyDown(root, { key: "g" });
+    fireEvent.keyDown(root, { key: "f" });
+    expect(container.querySelectorAll(".hint-path")).toHaveLength(3);
+    dispatchLiveTab(snapshotState({ transcript: [{ seq: 1, text: "a.rs x.rs c.rs" }] }), 3);
+    expect(Array.from(container.querySelectorAll(".hint-path"), (el) => el.textContent)).toEqual(["a", "d"]);
+    expect(container.querySelector(".path-pick")?.textContent).toBe("s b.rs");
+    fireEvent.keyDown(root, { key: "s" });
+    expect(lastOfType("open_path")).toMatchObject({ path: "b.rs" });
+  });
+
+  it("keeps only paths outside the clip in the footer with their original labels", () => {
+    const { container } = withPaths("a.rs b.rs c.rs");
+    const box = () => ({ top: 0, left: 0, right: 600, bottom: 600, width: 600, height: 600 }) as DOMRect;
+    for (const el of container.querySelectorAll(".agent-ui-root, .message-list, .row-assistant")) el.getBoundingClientRect = box;
+    const original = Object.getOwnPropertyDescriptor(Range.prototype, "getClientRects");
+    Object.defineProperty(Range.prototype, "getClientRects", { configurable: true, value: function(this: Range) {
+      const top = this.toString() === "b.rs" ? 700 : 50;
+      return [{ ...box(), top, bottom: top + 20, height: 20 }];
+    } });
+    try {
+      const root = container.querySelector(".agent-ui-conversation")!;
+      fireEvent.keyDown(root, { key: "g" });
+      fireEvent.keyDown(root, { key: "f" });
+      expect(Array.from(container.querySelectorAll(".hint-path"), (el) => el.textContent)).toEqual(["a", "d"]);
+      expect(container.querySelector(".path-pick")?.textContent).toBe("s b.rs");
+      fireEvent.keyDown(root, { key: "s" });
+      expect(lastOfType("open_path")).toMatchObject({ path: "b.rs" });
+    } finally {
+      if (original) Object.defineProperty(Range.prototype, "getClientRects", original);
+      else delete (Range.prototype as Partial<Range>).getClientRects;
+    }
   });
 
   /** A `gf` picker left open over tab 1's conversation named paths that meant
@@ -16025,4 +16177,349 @@ describe("a broker card in the page", () => {
     expect(views()).toEqual([]);
     expect(lastOfType("view_in_editor")).toMatchObject({ text: "Show /etc/hosts in your editor?\n/etc/hosts" });
   });
+});
+
+
+describe("gf from CARET and selections", () => {
+  let restoreModify: () => void;
+  beforeEach(() => { restoreModify = stubSelectionModify(); });
+  afterEach(() => {
+    restoreModify();
+    window.getSelection()?.removeAllRanges();
+    vi.unstubAllGlobals();
+  });
+  function setup(text: string, reply = false, overrides: Partial<AgentUiState> = {}) {
+    const widen = stubBandWidth();
+    const { container } = render(<App />);
+    dispatch({ kind: "hello", ...HELLO });
+    dispatchLiveTab(snapshotState({ ...(reply ? { transcript: [{ seq: 1, text }], assistantMessageOpen: true, nextSeq: 2 } : { userPrompts: [{ seq: 1, text }] }), ...overrides }), 2);
+    dispatch({ kind: "pane_focus", focused: true });
+    act(() => widen(container));
+    const root = container.querySelector(".agent-ui-conversation")! as HTMLElement;
+    const press = (key: string, extra = {}) => {
+      fireEvent.keyDown(root, { key, ...extra });
+      fireEvent.keyUp(root, { key });
+    };
+    const gf = () => { press("g"); press("f"); };
+    const mode = () => container.querySelector('[data-testid="mode-block"]')?.getAttribute("data-mode");
+    const select = () => {
+      press("v"); press("v");
+      for (let i = 1; i < text.length; i++) press("l");
+    };
+    return { container, root, press, gf, mode, select };
+  }
+  it.each(["wheel", "touch", "pointer", "mouse", "released drag", "announced"])("a list scroll after %s cancels the pick without opening or flashing", (gesture) => {
+    const { container, gf, press } = setup("a.rs b.rs");
+    gf();
+    const list = container.querySelector<HTMLElement>(".message-list")!;
+    expect(container.querySelector(".path-pick")).not.toBeNull();
+    if (gesture === "wheel") fireEvent.wheel(list, { deltaY: 40 });
+    if (gesture === "touch") fireEvent.touchMove(list);
+    if (gesture === "pointer" || gesture === "released drag") fireEvent.pointerDown(list);
+    if (gesture === "mouse") fireEvent.mouseDown(list);
+    if (gesture === "released drag") fireEvent.pointerUp(window);
+    if (gesture === "announced") list.dispatchEvent(new CustomEvent(USER_SCROLL_EVENT, { detail: "down" }));
+    list.scrollTop += 40;
+    fireEvent.scroll(list);
+    expect(container.querySelector(".path-pick")).toBeNull();
+    expect(container.querySelector(".hint-path")).toBeNull();
+    press("s");
+    expect(lastOfType("open_path")).toBeUndefined();
+    expect(container.querySelector(".band-message")).toBeNull();
+  });
+  it("opening and page scrolls keep the pick; an inner box's scroll does too", () => {
+    const { container, gf, press } = setup("a.rs b.rs");
+    const list = container.querySelector<HTMLElement>(".message-list")!;
+    list.dispatchEvent(new CustomEvent(USER_SCROLL_EVENT, { detail: "down" }));
+    gf();
+    list.scrollTop = 40;
+    fireEvent.scroll(list);
+    expect(container.querySelector(".path-pick")).not.toBeNull();
+    const inner = document.createElement("div");
+    list.append(inner);
+    fireEvent.wheel(inner, { deltaY: 40 });
+    fireEvent.scroll(inner);
+    expect(container.querySelector(".path-pick")).not.toBeNull();
+    press("s");
+    expect(lastOfType("open_path")).toMatchObject({ path: "b.rs" });
+  });
+  it("a programmatic list scroll keeps the pick and places its labels again", () => {
+    const { container, gf, press } = setup("a.rs b.rs");
+    const box = () => ({ top: 0, left: 0, right: 600, bottom: 600, width: 600, height: 600 }) as DOMRect;
+    for (const el of container.querySelectorAll(".agent-ui-root, .message-list, .row-prompt")) el.getBoundingClientRect = box;
+    const placement = vi.spyOn(navModule, "pathShownLine");
+    try {
+      gf();
+      expect(Array.from(container.querySelectorAll(".hint-path"), (el) => el.textContent)).toEqual(["a", "s"]);
+      placement.mockClear();
+      const list = container.querySelector<HTMLElement>(".message-list")!;
+      list.scrollTop += 40;
+      fireEvent.scroll(list);
+      expect(placement).toHaveBeenCalledTimes(2);
+      placement.mockClear();
+      list.scrollLeft += 20;
+      fireEvent.scroll(list);
+      expect(placement).toHaveBeenCalledTimes(2);
+      placement.mockClear();
+      fireEvent.scroll(list);
+      expect(placement).not.toHaveBeenCalled();
+      expect(Array.from(container.querySelectorAll(".hint-path"), (el) => el.textContent)).toEqual(["a", "s"]);
+      press("s");
+      expect(lastOfType("open_path")).toMatchObject({ path: "b.rs" });
+    } finally { placement.mockRestore(); }
+  });
+  it.each(["prompt with phone metadata", "div per line"])("CARET gf reads its block in a row with %s", (kind) => {
+    const { container, press, gf } = setup("fix src/a.rs");
+    const row = container.querySelector<HTMLElement>('[data-nav-stop="row"]')!;
+    const content = row.querySelector<HTMLElement>(".row-body")!;
+    content.innerHTML = kind === "prompt with phone metadata"
+      ? '<span>fix src/a.rs</span><div>sent from this phone</div>'
+      : '<div>fix <span>src/</span><span>a.rs</span></div><div>next line</div>';
+    press("v");
+    for (let i = 0; i < 5; i++) press("l");
+    gf();
+    expect(lastOfType("open_path")).toMatchObject({ path: "src/a.rs" });
+  });
+  it.each(["question", "plain"])("CARET gf reads the path in an actual %s row with a div per line", (kind) => {
+    const { container, press, gf } = setup("", false, {
+      userPrompts: [],
+      ...(kind === "question" ? { questions: [{
+        seq: 1, interactionId: "q1", toolUseId: null, turnId: "t1", unsupportedReason: null,
+        state: { kind: "waiting" }, questions: [{ question: "fix src/a.rs", header: "", multiSelect: false, options: [] }],
+      }] } : { toolCalls: [{ seq: 1, toolUseId: "q1", name: "AskUserQuestion", input: {},
+        result: { content: "fix src/a.rs\nnext line", isError: false } }] }),
+    });
+    expect(container.querySelectorAll(".row-question .question-line").length).toBeGreaterThan(1);
+    press("v");
+    for (let i = 0; i < 12; i++) {
+      const selection = window.getSelection()!;
+      const text = selection.anchorNode?.textContent ?? "";
+      const start = text.indexOf("src/a.rs");
+      if (start >= 0 && selection.anchorOffset >= start && selection.anchorOffset < start + 8) break;
+      press("w");
+    }
+    expect(window.getSelection()?.anchorNode?.textContent).toContain("src/a.rs");
+    gf();
+    expect(lastOfType("open_path")).toMatchObject({ path: "src/a.rs" });
+  });
+  it("VISUAL gf reveals hidden characters in its refusal", () => {
+    const { container, select, gf } = setup("bad\u202E\u200B");
+    select(); gf();
+    expect(container.querySelector(".band-message")?.textContent).toBe("gf: the selection is not a path: bad⟨U+202E⟩⟨U+200B⟩");
+    expect(lastOfType("open_path")).toBeUndefined();
+  });
+  it.each([undefined, null, "stopped after 1 s"])("path_choices with one match stays a pick, stopped=%s", (stopped) => {
+    const { container, gf, press } = setup("a.rs");
+    gf();
+    const request = lastOfType("open_path")!;
+    const before = posted.filter((msg) => msg.type === "open_path").length;
+    dispatch({ kind: "path_choices", requestId: request.request_id, tab: 1,
+      paths: [{ path: "src/a.rs", line: 12 }], stopped });
+    expect(container.querySelector(".path-pick")?.textContent).toBe("a src/a.rs:12");
+    expect(posted.filter((msg) => msg.type === "open_path")).toHaveLength(before);
+    if (stopped != null) expect(container.querySelector(".band-message")?.textContent).toBe(`gf: ${stopped}; the list may be incomplete`);
+    press("a");
+    expect(lastOfType("open_path")).toMatchObject({ path: "src/a.rs", line: 12 });
+  });
+  it("a stopped path_choices under an overlay says why the matches may be incomplete", () => {
+    const { container, gf } = setup("a.rs");
+    gf();
+    const request = lastOfType("open_path")!;
+    dispatch({ kind: "open_keymap" });
+    dispatch({ kind: "path_choices", requestId: request.request_id, tab: 1,
+      paths: [{ path: "src/a.rs", line: null }], stopped: "stopped after 200000 files" });
+    expect(container.querySelector(".path-pick")).toBeNull();
+    expect(container.querySelector(".band-message")?.textContent).toBe("gf: 1 files match; gf again to choose (stopped after 200000 files)");
+  });
+  it.each(["transport/proto/frame_test.go", "a/b.rs:12"])("CARET gf opens %s and returns to BROWSE", (text) => {
+    const { press, gf, mode } = setup(text);
+    press("v"); press("l"); gf();
+    expect(lastOfType("open_path")).toMatchObject(text.endsWith(":12")
+      ? { path: "a/b.rs", line: 12 } : { path: text });
+    expect(mode()).toBe("browse");
+  });
+  it("CARET gf on plain words flashes and keeps the caret", () => {
+    const { container, press, gf, mode } = setup("plain words");
+    press("v"); gf();
+    expect(container.querySelector(".band-message")?.textContent).toBe("no path under the caret");
+    expect(mode()).toBe("caret");
+    expect(lastOfType("open_path")).toBeUndefined();
+  });
+  it("VISUAL gf opens exactly the selected path", () => {
+    const { gf, mode, select } = setup("src/a.rs:12");
+    select(); gf();
+    expect(lastOfType("open_path")).toMatchObject({ path: "src/a.rs", line: 12 });
+    expect(mode()).toBe("browse");
+  });
+  it("VISUAL gf refuses two words and keeps the selection", () => {
+    const { container, gf, mode, select } = setup("two words");
+    select(); gf();
+    expect(container.querySelector(".band-message")?.textContent).toBe("gf: the selection is not one path (it holds a space or a line break)");
+    expect(mode()).toBe("visual");
+    expect(lastOfType("open_path")).toBeUndefined();
+  });
+  it("VISUAL gf refuses a 300-character path and keeps the selection", () => {
+    const path = `${"dir/".repeat(74)}a.rs`;
+    const { container, gf, mode, select } = setup(path);
+    select(); gf();
+    expect(container.querySelector(".band-message")?.textContent).toBe(`gf: the selection is not a path: ${path.slice(0, 60)}…`);
+    expect(mode()).toBe("visual");
+    expect(lastOfType("open_path")).toBeUndefined();
+  });
+  it("clicking a 300-character path header opens it", () => {
+    const path = `${"dir/".repeat(74)}a.rs`;
+    const { container } = setup("", false, { toolCalls: [{ seq: 1, toolUseId: "read", name: "Read",
+      input: { file_path: path }, result: { content: "file text", isError: false } }] });
+    fireEvent.click(container.querySelector(".path-link")!);
+    expect(lastOfType("open_path")).toMatchObject({ path });
+  });
+  it("V-LINE gf offers three letters and a letter opens its path in BROWSE", () => {
+    const { container, press, gf, mode } = setup("compare a.rs, b.rs and c.rs, then a.rs again");
+    press("V", { shiftKey: true }); gf();
+    expect(mode()).toBe("browse");
+    expect(container.querySelector(".path-pick")?.textContent).toBe("a a.rs · s b.rs · d c.rs");
+    expect(lastOfType("open_path")).toBeUndefined();
+    press("s");
+    expect(lastOfType("open_path")).toMatchObject({ path: "b.rs" });
+  });
+  it("V-LINE gf places three single-letter labels on shown paths", () => {
+    const { container, press, gf } = setup("a.rs b.rs c.rs");
+    const box = () => ({ top: 0, left: 0, right: 600, bottom: 600, width: 600, height: 600 }) as DOMRect;
+    for (const el of container.querySelectorAll(".agent-ui-root, .message-list, .row-prompt")) el.getBoundingClientRect = box;
+    press("V", { shiftKey: true }); gf();
+    expect(Array.from(container.querySelectorAll(".hint-path"), (el) => el.textContent)).toEqual(["a", "s", "d"]);
+    expect(container.querySelector(".path-pick")).toBeNull();
+    press("d");
+    expect(lastOfType("open_path")).toMatchObject({ path: "c.rs" });
+  });
+  it("V-LINE gf keeps every reply path visible after ending the frozen region", () => {
+    const paths = ["transport/proto/frame_test.go", "internal/session/forward_test.go", "internal/session/mesh_test.go"];
+    const { container, press, gf, mode } = setup(`Updated ${paths[0]}, ${paths[1]} and ${paths[2]}.`, true);
+    const box = () => ({ top: 0, left: 0, right: 600, bottom: 600, width: 600, height: 600 }) as DOMRect;
+    for (const el of container.querySelectorAll(".agent-ui-root, .message-list, .row-assistant")) el.getBoundingClientRect = box;
+    const connected: boolean[] = [];
+    const original = Object.getOwnPropertyDescriptor(Range.prototype, "getClientRects");
+    Object.defineProperty(Range.prototype, "getClientRects", { configurable: true, value: function(this: Range) {
+      if (paths.includes(this.toString())) connected.push(this.startContainer.isConnected && this.endContainer.isConnected);
+      return [box()];
+    } });
+    try {
+      press("V", { shiftKey: true });
+      const frozenText = container.querySelector(".row-assistant p")!.firstChild!;
+      dispatch({ kind: "events", tab: 1, fromRevision: 2, throughRevision: 3, events: [
+        { type: "content_delta", turn_id: "t1", kind: "text", text: " More detail." },
+      ] });
+      expect(container.querySelector(".row-assistant p")!.firstChild).toBe(frozenText);
+      gf();
+      expect(mode()).toBe("browse");
+      expect(frozenText.isConnected).toBe(false);
+      const labels = Array.from(container.querySelectorAll(".hint-path"), (el) => el.textContent);
+      const footer = container.querySelector(".path-pick")?.textContent ?? "";
+      for (const [i, label] of ["a", "s", "d"].entries()) {
+        expect(labels.includes(label) || footer.includes(`${label} ${paths[i]}`), paths[i]).toBe(true);
+      }
+      expect(labels).toEqual(["a", "s", "d"]);
+      expect(connected.length).toBeGreaterThan(0);
+      expect(connected.every(Boolean)).toBe(true);
+      press("s");
+      expect(lastOfType("open_path")).toMatchObject({ path: paths[1] });
+    } finally {
+      if (original) Object.defineProperty(Range.prototype, "getClientRects", original);
+      else delete (Range.prototype as unknown as Record<string, unknown>).getClientRects;
+    }
+  });
+  it("V-LINE gf opens a single path directly", () => {
+    const { press, gf, mode } = setup("look at src/a.rs:12");
+    press("V", { shiftKey: true }); gf();
+    expect(lastOfType("open_path")).toMatchObject({ path: "src/a.rs", line: 12 });
+    expect(mode()).toBe("browse");
+  });
+  it("V-LINE gf without a path keeps the selection", () => {
+    const { container, press, gf, mode } = setup("plain words");
+    press("V", { shiftKey: true }); gf();
+    expect(container.querySelector(".band-message")?.textContent).toBe("gf: no path in the selected lines");
+    expect(mode()).toBe("vline");
+  });
+  it("CARET gg still moves to the first character", () => {
+    const { press, gf } = setup("a.rs b.rs");
+    press("v"); press("w"); press("g"); press("g"); gf();
+    expect(lastOfType("open_path")).toMatchObject({ path: "a.rs" });
+  });
+  it("path_choices settles an editor request and offers ordinary relative opens", () => {
+    const { container, press, gf } = setup("a.rs");
+    gf();
+    const request = lastOfType("open_path")!;
+    const payload = { kind: "path_choices", requestId: request.request_id, tab: 1,
+      paths: [{ path: "src/a.rs", line: 12 }, { path: "test/a.rs", line: 12 }, { path: "lib/a.rs", line: 12 }] };
+    dispatch(payload);
+    expect(container.querySelector(".path-pick")?.textContent).toBe("a src/a.rs:12 · s test/a.rs:12 · d lib/a.rs:12");
+    press("s");
+    expect(lastOfType("open_path")).toMatchObject({ path: "test/a.rs", line: 12 });
+    dispatch(payload);
+    expect(container.querySelector(".path-pick")).toBeNull();
+  });
+  it("path_choices for a switched-away tab settles without opening a pick", () => {
+    const { container, gf } = setup("a.rs");
+    gf();
+    const request = lastOfType("open_path")!;
+    dispatch({ kind: "tabs", active: 2, tabs: [LIVE_TAB, { ...LIVE_TAB, id: 2, number: 2, label: "2 new" }] });
+    dispatch({ kind: "path_choices", requestId: request.request_id, tab: 1,
+      paths: [{ path: "src/a.rs", line: null }, { path: "test/a.rs", line: null }] });
+    expect(container.querySelector(".path-pick")).toBeNull();
+    expect(container.querySelector(".band-message")?.textContent ?? "").not.toContain("files match");
+  });
+  it("path_choices flashes the match count without taking keys from an overlay", () => {
+    const { container, gf } = setup("a.rs");
+    gf();
+    const request = lastOfType("open_path")!;
+    dispatch({ kind: "open_keymap" });
+    expect(container.querySelector(".keymap-overlay")).not.toBeNull();
+    dispatch({ kind: "path_choices", requestId: request.request_id, tab: 1,
+      paths: [{ path: "src/a.rs", line: null }, { path: "test/a.rs", line: null }] });
+    expect(container.querySelector(".path-pick")).toBeNull();
+    expect(container.querySelector(".keymap-overlay")).not.toBeNull();
+    expect(container.querySelector(".band-message")?.textContent).toBe("gf: 2 files match; gf again to choose");
+  });
+  it("path_choices arriving in the same batch as a keys overlay cannot cover it", () => {
+    const { container, gf } = setup("a.rs");
+    gf();
+    const request = lastOfType("open_path")!;
+    act(() => {
+      window.__eitriDispatch!(JSON.stringify({ kind: "open_keymap" }));
+      window.__eitriDispatch!(JSON.stringify({ kind: "path_choices", requestId: request.request_id, tab: 1,
+        paths: [{ path: "src/a.rs", line: null }, { path: "test/a.rs", line: null }] }));
+    });
+    expect(container.querySelector(".path-pick")).toBeNull();
+    expect(container.querySelector(".keymap-overlay")).not.toBeNull();
+    expect(container.querySelector(".band-message")?.textContent).toBe("gf: 2 files match; gf again to choose");
+  });
+  it("a changed VISUAL selection opens nothing and ends the region", () => {
+    const { container, select, gf, mode } = setup("src/a.rs");
+    select();
+    window.getSelection()?.removeAllRanges();
+    gf();
+    expect(lastOfType("open_path")).toBeUndefined();
+    expect(container.querySelector(".band-message")?.textContent).toBe("selection changed under it — nothing opened; v to start again");
+    expect(mode()).toBe("browse");
+  });
+  it("a repeated f completing gf opens nothing and leaves CARET", () => {
+    const { root, press, mode } = setup("src/a.rs");
+    press("v"); press("g");
+    fireEvent.keyDown(root, { key: "f", repeat: true });
+    expect(lastOfType("open_path")).toBeUndefined();
+    expect(mode()).toBe("caret");
+  });
+
+  it("path_choices does not take keys from a remote-control overlay", () => {
+    const { container, gf } = setup("a.rs");
+    gf();
+    const request = lastOfType("open_path")!;
+    dispatch({ kind: "remote_pairing", code: "BwcHBwcHBwcHBwcHBwcHBw", uri: "eitri://pair/code",
+      modules: ["10", "01"], expiresInMs: 180000 });
+    expect(container.querySelector(".remote-pairing")).not.toBeNull();
+    dispatch({ kind: "path_choices", requestId: request.request_id, tab: 1,
+      paths: [{ path: "src/a.rs", line: null }, { path: "test/a.rs", line: null }] });
+    expect(container.querySelector(".path-pick")).toBeNull();
+  });
+
 });

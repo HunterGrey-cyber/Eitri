@@ -1131,6 +1131,21 @@ pub fn serialize_path_completions_for_js(tab: crate::tabs::TabId, seq: u64, item
     .to_string()
 }
 
+/// Suffix matches offered as ordinary project-relative `open_path` choices.
+pub fn serialize_path_choices_for_js(
+    request_id: &str,
+    tab: crate::tabs::TabId,
+    paths: &[String],
+    line: Option<u32>,
+    stopped: Option<&str>,
+) -> String {
+    serde_json::json!({
+        "kind": "path_choices", "requestId": request_id, "tab": tab.0, "stopped": stopped,
+        "paths": paths.iter().map(|path| serde_json::json!({"path": path, "line": line})).collect::<Vec<_>>()
+    })
+    .to_string()
+}
+
 /// A read reply, correlated with its request and its tab even after a switch.
 pub fn serialize_task_output_for_js(
     request_id: &str,

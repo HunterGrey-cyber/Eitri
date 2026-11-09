@@ -283,6 +283,8 @@ type InboundHandler = (
     | { kind: "command_result"; requestId: string; ok: false; error: string }
     /** Plain text: render through revealHidden, never as Markdown or HTML. */
     | { kind: "task_output_result"; requestId: string; tab: TabId; taskId: string; output: string; totalBytes: number; truncated: boolean; offset?: number }
+    /** Project-relative suffix matches for the existing gf letter picker. */
+    | { kind: "path_choices"; requestId: string; tab: TabId; stopped?: string | null; paths: { path: string; line: number | null }[] }
     /** Repository names are plain text, through revealHidden. */
     | { kind: "path_completions"; tab: TabId; seq: number; items: string[] }
     /** Every word is the CLI's: plain text, through revealHidden. */
@@ -717,6 +719,16 @@ export function installDispatch(handler: InboundHandler): void {
         console.warn("agent-ui: __eitriDispatch received a malformed editor_cards envelope", parsed);
         return;
       }
+      if (obj.kind === "path_choices") {
+        const value = parsed as Record<string, unknown>;
+        if (typeof value.requestId !== "string" || !Number.isSafeInteger(value.tab) || !Array.isArray(value.paths) ||
+            (value.stopped !== undefined && value.stopped !== null && typeof value.stopped !== "string") ||
+            !value.paths.every((item) => item !== null && typeof item === "object" && typeof item.path === "string" &&
+              (item.line === null || (Number.isSafeInteger(item.line) && item.line >= 0)))) {
+          console.warn("agent-ui: malformed path_choices envelope", parsed);
+          return;
+        }
+      }
       if (obj.kind === "path_completions") {
         const value = parsed as Record<string, unknown>;
         if (
@@ -729,6 +741,7 @@ export function installDispatch(handler: InboundHandler): void {
         }
       }
       if (
+        obj.kind === "path_choices" ||
         obj.kind === "path_completions" ||
         obj.kind === "hello" ||
         obj.kind === "command_result" ||

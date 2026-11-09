@@ -240,6 +240,8 @@ export type PanelAction =
   | { kind: "vswap" }
   /** `y` inside VISUAL/V-LINE: copy what is highlighted and end the region, back to BROWSE. */
   | { kind: "vyank" }
+  /** `gf`: open the caret's path, the VISUAL path, or V-LINE's paths, returning to BROWSE on success. */
+  | { kind: "vopen-path" }
   /** `>` inside VISUAL/V-LINE: quote the highlighted text into the tab's draft and end the
    *  region into INPUT. `App.tsx` does the whole thing (the copy check, `./quote`'s formatting, the
    *  draft/mode/caret side effects) -- this table only names the key. */
@@ -389,12 +391,13 @@ export type KeyContext = {
  *  `PanelAction` when the pending-`g` case is fully handled (the pending marker itself, the `gg`
  *  motion, or `gv`'s own "nothing"); `"fallthrough"` means "not a pending-`g` case, keep resolving
  *  this key normally" -- which is how `g` followed by any other key ends up handled on its own
- *  (`g` then any key but `g` drops the `g` and handles that key alone). `G`
+ *  (`g` then any key but `g`, `f` or `v` drops the `g` and handles that key alone). `G`
  *  (Shift+`g`) never reaches this at all: it is a single keystroke, resolved as its own motion in
  *  each caller's switch below. */
 function resolveRegionPendingG(event: KeyLike, ctx: KeyContext): PanelAction | "fallthrough" {
   if (ctx.pending === "g") {
     if (event.key === "g") return { kind: "vmove", motion: "gg" };
+    if (event.key === "f") return { kind: "vopen-path" };
     // `gv` is reserved for vim's reselect, even unbuilt -- swallowed as "nothing" rather than
     // falling through to `vtoggle`'s own `v` handling.
     if (event.key === "v") return null;
@@ -1002,6 +1005,7 @@ export const CARET_KEYS: KeyHelp[] = [
   { keys: "w / b / e", what: "Next word / previous word / end of this or the next word" },
   { keys: "0 / $", what: "Start / end of the line" },
   { keys: "gg / G", what: "First / last character of the conversation" },
+  { keys: "gf", what: "Open the path under the caret" },
   { keys: "1-9", what: "A count for the next motion (3w moves three words)" },
   { keys: "v / V", what: "Select from here: VISUAL by character, V-LINE by line" },
   { keys: "Ctrl+e / Ctrl+y", what: "Scroll the list one line down / up (a count repeats it); the caret stays put" },
@@ -1019,6 +1023,7 @@ export const VISUAL_KEYS: KeyHelp[] = [
   { keys: "w / b / e", what: "Next word / previous word / end of this or the next word" },
   { keys: "0 / $", what: "Start / end of the line" },
   { keys: "gg / G", what: "Extend to the conversation's first / last character" },
+  { keys: "gf", what: "Open the selection as one path; in V-LINE, pick from the selected lines' paths" },
   { keys: "1-9", what: "A count for the next motion (3w moves three words)" },
   { keys: "o", what: "Swap which end of the selection moves" },
   { keys: "v / V", what: "Switch to VISUAL / V-LINE; the mode's own key goes back to the caret" },

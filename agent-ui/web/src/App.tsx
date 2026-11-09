@@ -54,7 +54,7 @@ import { initialPageModel, pageModel, withoutHint } from "./page_model";
 import type { CommandRecord, PageModel } from "./page_model";
 import { installDispatch, installRemoteDesk, postToRust, nextMirrorId, nextRequestId } from "./bridge";
 import type { OutboundMessage, PanelKeysMode, PermissionDecision } from "./bridge";
-import { noteUserScroll, resumeFollowing } from "./follow";
+import { noteUserScroll, resumeFollowing, watchUserScroll } from "./follow";
 import {
   computedLineHeight,
   rowTextElement,
@@ -95,6 +95,7 @@ import { countCodePoints } from "./toolRegistry";
 import { findMatch } from "./search";
 import { SearchBar } from "./components/SearchBar";
 import {
+  assignLabels,
   controlsOf,
   conversationRows,
   countedStop,
@@ -114,7 +115,9 @@ import {
 import type { ShownLink } from "./nav";
 import type { AnswerableItem, HintTarget } from "./nav";
 import type { TimelineItem } from "./timeline";
-import { pathsIn, viewText } from "./paths";
+import { parsePath, pathsIn, pathsInText, viewText } from "./paths";
+import { pathAtCaret, pathRanges, pathSelectionOffsets } from "./pathTargets";
+import type { PathTarget } from "./pathTargets";
 import { proposalOf } from "./proposal";
 import type { PathRef } from "./paths";
 import { PathPick } from "./components/PathPick";
@@ -800,6 +803,7 @@ export default function App() {
     // A `gx` pick waiting for its letter is a pending key too -- left up across a
     // cancel route, the next letter typed would open a link and be swallowed.
     setLinkPick(null);
+    setPathPick(null);
   }
   useEffect(() => {
     cancelBoxTimer();
@@ -1018,9 +1022,40 @@ export default function App() {
    *  pane-focus change, a tab switch, `enter_input`/`arrive`, `focus_permission`, `hint_collect`,
    *  a rename/close-prompt/chooser opening, an `error`/`handoff` whole-state reset) and by `Esc`. */
   const [handoffOpen, setHandoffOpen] = useState(false);
-  /** A `gf` with several paths waiting for its letter, or `null` between them. Set
-   *  by the `open-path` action below, cleared by whichever letter (or anything else) answers it. */
-  const [pathPick, setPathPick] = useState<PathRef[] | null>(null);
+  /** A `gf` pick owns the keys until its full label is answered or it is cancelled.
+   *  Row keys and text offsets survive DOM replacements; placement decides which paths need the footer. */
+  const [pathPick, setPathPick] = useState<{
+    refs: PathRef[]; labels: string[]; targets: (PathTarget | null)[]; shown: string[]; typed: string;
+  } | null>(null);
+
+  const pathPickOpen = pathPick !== null;
+  useEffect(() => {
+    if (!pathPickOpen) return;
+    const list = containerRef.current?.querySelector<HTMLElement>(".message-list");
+    if (list) return watchUserScroll(list, () => setPathPick(null), () => {
+      // A follow snap or layout re-anchor keeps the pick and commits so HintLayer measures the moved text.
+      setPathPick((pick) => pick === null ? null : { ...pick });
+    });
+  }, [pathPickOpen]);
+
+  function beginPathPick(refs: PathRef[], rows: HTMLElement[] = [], selection?: Range) {
+    const targets: (PathTarget | null)[] = refs.map(() => null);
+    for (const row of rows) {
+      const rowKey = row.getAttribute("data-row-key");
+      if (rowKey === null) continue;
+      const limit = selection === undefined ? undefined : pathSelectionOffsets(row, selection);
+      pathRanges(row, refs, limit).forEach((offsets, i) => {
+        if (offsets === null || targets[i] !== null) return;
+        const ref = refs[i];
+        targets[i] = { kind: "path", rowKey, ...offsets, text: ref.path + (ref.line === null ? "" : `:${ref.line}`) };
+      });
+    }
+    setPathPick({ refs, labels: assignLabels(refs.length), targets, shown: [], typed: "" });
+  }
+  const pathLabelsPlaced = useCallback((shown: string[]) => {
+    setPathPick((pick) => pick === null || (pick.shown.length === shown.length && pick.shown.every((label, i) => label === shown[i]))
+      ? pick : { ...pick, shown });
+  }, []);
   /** `gx` with several links -- or a titled one, or one nobody can see -- waiting for
    *  its letter: the full normalized addresses it lists, in order, or `null` between picks. Like `pathPick`
    *  it owns every key while set (`onKeyDown`, ahead of the key table), but it is also dropped by every route
@@ -1028,8 +1063,8 @@ export default function App() {
    *  conversation that no longer holds it. */
   const [linkPick, setLinkPick] = useState<string[] | null>(null);
   /** `open_path` and `view_in_editor` share `"editor"` in-flight bookkeeping with
-   *  `edit_draft` (see `inFlight`'s own doc comment). Neither carries a `tab`-scoped reply payload of
-   *  its own to restore, only a refusal to flash. */
+   *  `edit_draft` (see `inFlight`'s own doc comment). A suffix lookup may answer with `path_choices`;
+   *  direct opens answer with a command result, whose refusal flashes in the band. */
   function openPath(ref: PathRef) {
     const requestId = nextRequestId();
     trackRequest(requestId, { kind: "editor", tab: activeTabRef.current ?? 0 });
@@ -1561,6 +1596,8 @@ export default function App() {
     linkPick !== null ||
     confirm !== null ||
     mode !== "browse";
+  const pathChoicesCoveredRef = useRef(true);
+  pathChoicesCoveredRef.current = reviewCovered || overlayOpen;
   useEffect(() => {
     if (reviewCovered) setReview(null);
   }, [reviewCovered]);
@@ -2366,7 +2403,26 @@ export default function App() {
   }
 
   useEffect(() => {
-    installDispatch((payload) => {
+    installDispatch(function receive(payload) {
+      if (payload.kind === "path_choices") {
+        const record = pageRef.current.inFlight.get(payload.requestId);
+        if (record?.kind !== "editor") return;
+        // A choices envelope is the successful answer to the original editor request.
+        receive({ kind: "command_result", requestId: payload.requestId, ok: true });
+        const remote = remoteDesk.snapshot();
+        const remoteOwnsKeys = remote.listOpen || remote.pairing !== null || remote.questions.length > 0 || remote.flagged.length > 0;
+        if (payload.tab === activeTabRef.current && record.tab === payload.tab &&
+            modeRef.current === "browse" && !pathChoicesCoveredRef.current && !remoteOwnsKeys &&
+            hintPendingRef.current === null && !isEditableElement(document.activeElement)) {
+          dropPendingKeys();
+          beginPathPick(payload.paths);
+          if (payload.stopped != null) showFlash(`gf: ${payload.stopped}; the list may be incomplete`);
+          pathChoicesCoveredRef.current = true;
+        } else if (payload.tab === activeTabRef.current) {
+          showFlash(`gf: ${payload.paths.length} files match; gf again to choose${payload.stopped == null ? "" : ` (${payload.stopped})`}`);
+        }
+        return;
+      }
       if (payload.kind === "command_result" && !payload.ok && payload.requestId === editReturnRef.current?.requestId) {
         editReturnRef.current = null;
       }
@@ -2421,6 +2477,12 @@ export default function App() {
       if (nextPage.chooser !== null || nextPage.renaming !== null || nextPage.confirm !== null || nextPage.review !== null ||
           payload.kind === "open_keymap" || payload.kind === "open_command_line" || payload.kind === "tab_detail" ||
           payload.kind === "hint_collect") editReturnRef.current = null;
+      // Envelopes can arrive in one batch before React renders the overlay that takes the keys.
+      if (nextPage.chooser !== null || nextPage.renaming !== null || nextPage.confirm !== null || nextPage.review !== null ||
+          payload.kind === "open_keymap" || payload.kind === "open_command_line" || payload.kind === "tab_detail" ||
+          payload.kind === "hint_collect" || payload.kind === "enter_input" || payload.kind === "focus_permission") {
+        pathChoicesCoveredRef.current = true;
+      }
       // A waiting `a`/`d`/`D` was aimed at a card these envelopes take the keys or the view from. Cancelled here,
       // in the same task as the envelope, so its timer can never come due in between and answer a card that is
       // no longer the one in front of the user.
@@ -3102,7 +3164,7 @@ export default function App() {
    *  element has left the DOM since it was frozen lands nowhere rather than somewhere else. */
   function landOnHint(target: HintTarget | undefined) {
     markLandedCode(null);
-    if (target === undefined || !target.el.isConnected) return;
+    if (target === undefined || target.kind === "path" || !target.el.isConnected) return;
     const root = containerRef.current;
     // Landing can scroll the conversation (a focused control, the cursor's row revealed), and that
     // scroll is the user's -- see the note on `noteUserScroll` in `onKeyDown`.
@@ -4814,6 +4876,61 @@ export default function App() {
         promptSwallowKeyRef.current = event.key;
         return;
       }
+      case "vopen-path": {
+        if (event.repeat) return;
+        if (currentMode === "caret") {
+          const row = rowElementOfCaret(model.cursor);
+          const ref = row !== null && listEl?.contains(row)
+            ? pathAtCaret(row, model.cursor.node, model.cursor.offset) : null;
+          if (ref === null) {
+            showFlash("no path under the caret");
+            return;
+          }
+          landCursorOnRowKey(rowKeyOfCaret(model.cursor));
+          endRegionFromKey();
+          openPath(ref);
+          return;
+        }
+        if (sel === null || listEl === null) {
+          endRegionFromKey();
+          return;
+        }
+        const built = visualBuiltRef.current;
+        if (built === null || !selectionMatchesBuild(sel as unknown as SelectionLike, built, listEl)) {
+          showFlash("selection changed under it — nothing opened; v to start again");
+          endRegionFromKey();
+          return;
+        }
+        const text = copySelectionText(sel as unknown as SelectionLike, root, model);
+        let paths: PathRef[];
+        if (currentMode === "vline") {
+          paths = pathsInText(text);
+          if (paths.length === 0) {
+            showFlash("gf: no path in the selected lines");
+            return;
+          }
+        } else {
+          const ref = text.trim().length > 256 ? null : parsePath(text);
+          if (ref === null) {
+            const trimmed = text.trim();
+            const clean = revealedText(trimmed);
+            const chars = Array.from(clean);
+            showFlash(trimmed === "" ? "gf: nothing selected" : /[\s]/.test(trimmed)
+              ? "gf: the selection is not one path (it holds a space or a line break)"
+              : `gf: the selection is not a path: ${chars.slice(0, 60).join("")}${chars.length > 60 ? "…" : ""}`);
+            return;
+          }
+          paths = [ref];
+        }
+        const earlier = compareCarets(model.anchor, model.cursor) <= 0 ? model.anchor : model.cursor;
+        if (paths.length > 1) {
+          beginPathPick(paths, sel.rangeCount > 0 ? conversationRows(root) : [], sel.rangeCount > 0 ? sel.getRangeAt(0).cloneRange() : undefined);
+        }
+        landCursorOnRowKey(rowKeyOfCaret(earlier));
+        endRegionFromKey();
+        if (paths.length === 1) openPath(paths[0]);
+        return;
+      }
       case "vyank": {
         // A repeated `y` does nothing (and must not fall through as BROWSE's own `y`, which
         // `endRegionFromKey`'s `promptSwallowKeyRef` guards against for the repeat that follows).
@@ -5054,14 +5171,24 @@ export default function App() {
     // handler `stopPropagation`s every key it claims, so this only ever runs for a key it does
     // not -- exactly the chooser's own reasoning just above).
     if (slashPicker !== null) return;
-    // A `gf` with several paths waits here for its letter, ahead of the overlays below (the same
-    // reason the close prompt is first) -- `Esc`, or anything else, simply cancels it rather than
-    // falling through to whatever that key would otherwise do, since a stray `j`/`k` landing on a
-    // path instead of moving the cursor would be a surprise.
+    // A path pick owns each key until its full label is typed. Cancelling keys never fall
+    // through to the conversation underneath it, and auto-repeat never adds another letter.
     if (pathPick !== null) {
       event.preventDefault();
-      const index = HINT_ALPHABET.indexOf(event.key);
-      if (index !== -1 && index < pathPick.length) openPath(pathPick[index]);
+      if (event.repeat) return;
+      if (event.key === "Backspace") {
+        setPathPick({ ...pathPick, typed: pathPick.typed.slice(0, -1) });
+        return;
+      }
+      if (isPlainAnswerKey(event.nativeEvent as unknown as KeyLike)) {
+        const next = pathPick.typed + event.key;
+        const index = pathPick.labels.indexOf(next);
+        if (index !== -1) openPath(pathPick.refs[index]);
+        else if (pathPick.labels.some((label) => label.startsWith(next))) {
+          setPathPick({ ...pathPick, typed: next });
+          return;
+        }
+      }
       setPathPick(null);
       return;
     }
@@ -6009,10 +6136,13 @@ export default function App() {
         // A tool's own path field, or a path found in prose -- never a guess at what
         // the model meant, only what `pathsIn` (`../paths.ts`) can actually read off the row.
         const item = timeline[cursor];
-        const paths = item === undefined ? [] : pathsIn(item).slice(0, HINT_ALPHABET.length);
+        const paths = item === undefined ? [] : pathsIn(item);
         if (paths.length === 0) showFlash("no path on this row");
         else if (paths.length === 1) openPath(paths[0]);
-        else setPathPick(paths);
+        else {
+          const row = cursorRow();
+          beginPathPick(paths, row === null ? [] : [row]);
+        }
         break;
       }
       case "open-link": {
@@ -6492,7 +6622,17 @@ export default function App() {
           lines are inputs that DO hold it, so they hand the keys back the way their own Esc does. */}
       {pathPick !== null && (
         <PanelErrorBoundary name="path picker" onError={() => overlayFailed("path picker", () => setPathPick(null))}>
-          <PathPick paths={pathPick} />
+          <PathPick
+            refs={pathPick.refs.filter((_, i) => !pathPick.shown.includes(pathPick.labels[i]))}
+            labels={pathPick.labels.filter((label) => !pathPick.shown.includes(label))}
+            typed={pathPick.typed}
+          />
+          <HintLayer
+            root={containerRef.current}
+            hints={pathPick.targets.flatMap((target, i) => target === null ? [] : [{ target, label: pathPick.labels[i] }])}
+            typed={pathPick.typed}
+            onPlaced={pathLabelsPlaced}
+          />
         </PanelErrorBoundary>
       )}
       {linkPick !== null && (

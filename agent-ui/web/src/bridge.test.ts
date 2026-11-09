@@ -520,3 +520,22 @@ it("demuxes window pages", () => {
   window.__eitriDispatch!(JSON.stringify(payload));
   expect(handler).toHaveBeenCalledWith(payload);
 });
+
+describe("path_choices stopped reason", () => {
+  it.each([undefined, null, "stopped after 1 s"])("accepts %s", (stopped) => {
+    const handler = vi.fn();
+    installDispatch(handler);
+    const envelope = { kind: "path_choices", requestId: "p1", tab: 1, paths: [{ path: "src/a.rs", line: null }], stopped };
+    window.__eitriDispatch!(JSON.stringify(envelope));
+    expect(handler).toHaveBeenCalledWith(JSON.parse(JSON.stringify(envelope)));
+  });
+  it.each([12, false, {}, []])("rejects a malformed stopped reason %s", (stopped) => {
+    const handler = vi.fn();
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+    installDispatch(handler);
+    window.__eitriDispatch!(JSON.stringify({ kind: "path_choices", requestId: "p1", tab: 1,
+      paths: [{ path: "src/a.rs", line: null }], stopped }));
+    warn.mockRestore();
+    expect(handler).not.toHaveBeenCalled();
+  });
+});

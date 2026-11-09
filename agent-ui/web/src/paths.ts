@@ -9,7 +9,15 @@ export type PathRef = { path: string; line: number | null };
  *  Checked against a URL separately: the scheme's `://` rules a token out. */
 export const PATH_RE = /(?:[\w.\-]+\/)+[\w.\-]+|[\w\-]+\.[A-Za-z][A-Za-z0-9]{0,7}\b/g;
 
+/** Trailing dots belong to the surrounding prose, outside the path and its caret span. */
+function trimTrailingDots(text: string): string {
+  while (text.endsWith(".")) text = text.slice(0, -1);
+  return text;
+}
+
 function withLine(text: string, start: number, match: string): PathRef | null {
+  match = trimTrailingDots(match);
+  if (match === "" || match.endsWith("/")) return null;
   const before = text.slice(Math.max(0, start - 3), start);
   if (before.endsWith("://") || /^\w+:\/\//.test(text.slice(start))) return null;
   if (text.slice(start - 1, start) === "/") return null;
@@ -19,10 +27,12 @@ function withLine(text: string, start: number, match: string): PathRef | null {
 }
 
 export function parsePath(text: string): PathRef | null {
-  const trimmed = text.trim();
+  const selection = text.trim();
+  if (selection.length > 4096) return null;
+  const trimmed = trimTrailingDots(selection);
   if (/^\w+:\/\//.test(trimmed)) return null;
   const m = /^((?:[\w.\-]+\/)+[\w.\-]+|[\w\-]+\.[A-Za-z][A-Za-z0-9]{0,7})(?::(\d+))?$/.exec(trimmed);
-  return m ? { path: m[1], line: m[2] ? Number(m[2]) : null } : null;
+  return m ? withLine(trimmed, 0, m[1]) : null;
 }
 
 /** U+0000-U+001F and U+007F. A tool's path field is whatever the model or a repository put there,
@@ -49,7 +59,7 @@ function fieldPaths(name: string, input: unknown): PathRef[] {
  *  length, so this bounds the work per character of a reply. */
 const MAX_PATH_RUN = 256;
 
-function prosePaths(text: string): PathRef[] {
+export function pathsInText(text: string): PathRef[] {
   const out: PathRef[] = [];
   const seen = new Set<string>();
   for (const run of text.matchAll(/[\w.\-/]+/g)) {
@@ -69,6 +79,22 @@ function prosePaths(text: string): PathRef[] {
   return out;
 }
 
+/** The prose path whose span contains the caret, including a directly following `:line`. */
+export function pathAt(text: string, offset: number): PathRef | null {
+  for (const run of text.matchAll(/[\w.\-/]+/g)) {
+    if (run[0].length > MAX_PATH_RUN || !/[./]/.test(run[0])) continue;
+    for (const match of run[0].matchAll(PATH_RE)) {
+      const start = run.index! + match.index!;
+      const ref = withLine(text, start, match[0]);
+      if (ref === null) continue;
+      const suffix = /^:\d+/.exec(text.slice(start + ref.path.length));
+      const end = start + ref.path.length + (suffix?.[0].length ?? 0);
+      if (offset >= start && offset < end) return ref;
+    }
+  }
+  return null;
+}
+
 /** The paths `gf` can open on this row, including the file headers it draws. */
 export function pathsIn(item: TimelineItem): PathRef[] {
   switch (item.kind) {
@@ -78,7 +104,7 @@ export function pathsIn(item: TimelineItem): PathRef[] {
       return fieldPaths(item.request.toolName, item.request.input);
     case "prompt":
     case "message":
-      return prosePaths(item.text);
+      return pathsInText(item.text);
     case "run":
     case "ending":
     // A notice names no file it is about.

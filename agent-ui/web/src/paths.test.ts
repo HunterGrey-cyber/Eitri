@@ -1,5 +1,5 @@
-import { describe, expect, it } from "vitest";
-import { parsePath, pathsIn, viewText } from "./paths";
+import { describe, expect, it, vi } from "vitest";
+import { pathAt, parsePath, pathsIn, pathsInText, viewText } from "./paths";
 import type { TimelineItem } from "./timeline";
 
 describe("the paths a card or row offers to open", () => {
@@ -117,5 +117,83 @@ describe("paths in long replies", () => {
     best(1000);
     // Eightfold input: linear work grows about 8 times, a scan retried at every start about 64 times.
     expect(best(64000)).toBeLessThan(24 * best(8000));
+  });
+});
+
+
+describe("paths under a caret and in selected text", () => {
+  it("refuses 5000 characters before running any regex", () => {
+    const exec = vi.spyOn(RegExp.prototype, "exec");
+    const result = parsePath(`${".".repeat(4999)}x`);
+    const calls = exec.mock.calls.length;
+    exec.mockRestore();
+    expect(result).toBeNull();
+    expect(calls).toBe(0);
+  });
+  it.each([300, 4096])("parses a %i-character path", (length) => {
+    const path = `${"dir/".repeat((length - 4) / 4)}a.rs`;
+    expect(parsePath(path)).toEqual({ path, line: null });
+  });
+  it.each(["...", "...),", "... next"])("leaves a sentence dot run outside the path: %s", (dots) => {
+    const text = `see src/a.rs${dots}`;
+    expect(pathsInText(text)).toEqual([{ path: "src/a.rs", line: null }]);
+    expect(pathAt(text, 10)).toEqual({ path: "src/a.rs", line: null });
+    expect(pathAt(text, 12)).toBeNull();
+  });
+  it("leaves sentence-final dots out of all three prose paths", () => {
+    expect(pathsInText("Updated transport/proto/frame_test.go, internal/session/forward_test.go and internal/session/mesh_test.go.")).toEqual([
+      { path: "transport/proto/frame_test.go", line: null },
+      { path: "internal/session/forward_test.go", line: null },
+      { path: "internal/session/mesh_test.go", line: null },
+    ]);
+  });
+  it.each([
+    ["a.rs.", "a.rs", null],
+    ["a/b.rs.", "a/b.rs", null],
+    ["./x/y.rs..", "./x/y.rs", null],
+    ["a/b.rs:12.", "a/b.rs", 12],
+  ] as const)("strips trailing dots from prose, caret and selection paths in %s", (text, path, line) => {
+    const ref = { path, line };
+    expect(pathsInText(text)).toEqual([ref]);
+    expect(parsePath(text)).toEqual(ref);
+    expect(pathAt(text, path.length - 1)).toEqual(ref);
+    for (let offset = text.length - 1; text[offset] === "."; offset--) {
+      expect(pathAt(text, offset)).toBeNull();
+    }
+    if (line !== null) expect(pathAt(text, text.length - 2)).toEqual(ref);
+  });
+  it("ends a Go path before the sentence-final dot", () => {
+    const text = "and internal/session/mesh_test.go.";
+    expect(pathAt(text, text.length - 2)).toEqual({ path: "internal/session/mesh_test.go", line: null });
+    expect(pathAt(text, text.length - 1)).toBeNull();
+  });
+  it.each(["...", "./...", "../..."])("refuses a path made only of dots in %s", (text) => {
+    expect(pathsInText(text)).toEqual([]);
+    expect(parsePath(text)).toBeNull();
+    for (let offset = 0; offset < text.length; offset++) expect(pathAt(text, offset)).toBeNull();
+  });
+  it("finds a path at its first, middle and last characters", () => {
+    const path = "transport/proto/frame_test.go";
+    const text = `look at ${path} here`;
+    for (const offset of [8, 12, 8 + path.length - 1]) {
+      expect(pathAt(text, offset)).toEqual({ path, line: null });
+    }
+  });
+  it("includes the entire line suffix in the caret span", () => {
+    for (const offset of [6, 7, 8]) expect(pathAt("a/b.rs:12", offset)).toEqual({ path: "a/b.rs", line: 12 });
+    expect(pathAt("a/b.rs:12", 9)).toBeNull();
+  });
+  it("refuses plain words, URLs and overlong path runs", () => {
+    expect(pathAt("two words", 3)).toBeNull();
+    const url = "https://x.y/a.rs";
+    for (let i = 0; i < url.length; i++) expect(pathAt(url, i)).toBeNull();
+    const long = `${"a".repeat(257)}/b.rs`;
+    expect(pathAt(long, 260)).toBeNull();
+    expect(pathsInText(long)).toEqual([]);
+  });
+  it("lists selected prose with lines, de-duplicating repeated references", () => {
+    expect(pathsInText("src/a.rs:12 and b.rs and src/a.rs:12\nhttps://x.y/a.rs")).toEqual([
+      { path: "src/a.rs", line: 12 }, { path: "b.rs", line: null },
+    ]);
   });
 });

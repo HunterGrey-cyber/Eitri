@@ -781,7 +781,7 @@ of an agent you registered, `/model` and `/effort` choose from the options the a
 | `y` | copy the row (the message, command or path), or the code block HINT landed on; the copy also goes to the primary selection, so a middle-click pastes it too |
 | `Y` | copy a tool row's whole output |
 | `Ctrl+g` | open this row's whole text in a scratch buffer in Neovim; on a pending edit card for one file (a Claude `Edit`, `MultiEdit` or `Write`, a Codex change that adds one file, an ACP agent's edit of one file), the file as it is on disk beside the file as the edit would leave it, read-only, in a new Neovim tab page (`q` closes it; see [Reviewing a turn](turn-review.md#before-you-approve)); on a card of an agent's [proposal](editor-tools.md#proposals), the same view of one of its files, the next file at each press; any other card shows its text, as before |
-| `gf` | open the file path on this row in the editor, including a card's or edit row's file headers (several: pick by letter) |
+| `gf` | open the file path on this row in the editor, including a card's or edit row's file headers. Several paths get HINT labels at the paths (two letters past 14); type a label to open, `Backspace` deletes a letter, `Esc` cancels. Paths not on screen are listed under the conversation. If the project root does not hold the path, look up the end of its name: one match opens, several offer labels, more than 14 lookup matches ask you to narrow it. A lookup that stops early never opens by itself: it offers the matches it found as labels and says the list may be incomplete; more than 14 matches still ask you to narrow it |
 | `gx` | open this row's web link in your browser (several: pick by letter) |
 | `/` | search the conversation; `Enter` keeps the match, `Esc` goes back |
 | `n` / `N` | the next / the previous match, wrapping |
@@ -875,6 +875,11 @@ questions in [Codex and other agents](agents.md#claudes-questions).
   end moves, `v` and `V` switch between the two modes (a mode's own key goes back to the caret), `y` copies what
   is highlighted (to the clipboard and the primary selection) and returns to BROWSE, `>` quotes it into your message and starts typing, and `Esc` goes back
   to the caret.
+- `gf` opens the path under the caret, the VISUAL selection as one path, or the paths in V-LINE's selected
+  lines. Several paths get HINT labels at their selected occurrences (two letters past 14); type a label to open,
+  `Backspace` deletes a letter, and `Esc` cancels. Paths not on screen are listed under the conversation.
+  Opening or choosing returns to BROWSE; text without a usable path keeps the current mode.
+  As with `y`, a changed selection, or no selection left, ends the region with a flash.
 - `Ctrl+e` and `Ctrl+y` scroll one line without moving the caret or the selection, and `Ctrl+c` still
   interrupts a running turn. Any other plain key ends the selection with a note naming it; other chords with
   `Ctrl` or `Alt` are ignored.

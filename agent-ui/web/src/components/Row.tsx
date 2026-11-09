@@ -41,6 +41,8 @@ type RowProps = {
   /** Makes this row a keyboard stop (`../nav`): `"row"` for a conversation row, which carries the
    *  cursor; any other name for a row that is reached by focusing it, like a start-screen choice. */
   navStop?: string;
+  /** The timeline identity, kept on the row across replacements of its drawn text. */
+  rowKey?: string;
   /** When `children` carries a startup failure's raw text, `problem` is that
    *  text's `classify()` result -- a headline and remedy drawn ABOVE `children`, which stays
    *  exactly as it was ("never hide the evidence"). `null`/omitted (the common case: an
@@ -62,6 +64,7 @@ export function Row({
   "aria-checked": ariaChecked,
   onClick,
   navStop,
+  rowKey,
   problem,
   children,
 }: RowProps) {
@@ -106,7 +109,7 @@ export function Row({
     );
   }
   return (
-    <div className={classes} data-sign={sign} data-nav-stop={navStop} role={role} aria-current={current || undefined}>
+    <div className={classes} data-sign={sign} data-nav-stop={navStop} data-row-key={rowKey} role={role} aria-current={current || undefined}>
       {cells}
     </div>
   );

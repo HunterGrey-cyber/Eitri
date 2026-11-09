@@ -6,8 +6,32 @@
 /// in a name has been able to end one command and start another, and no real file name the agent
 /// shows needs one.
 pub fn open_path_target(project_dir: &std::path::Path, path: &str) -> Result<std::path::PathBuf, String> {
-    if path.chars().any(|c| c.is_ascii_control()) {
-        return Err(format!("refused to open a path holding a control character: {path:?}"));
+    open_path_exact(project_dir, path).map_err(|why| why.message(path))
+}
+
+#[derive(Debug, PartialEq, Eq)]
+pub(super) enum OpenPathRefusal {
+    ControlChar,
+    Missing,
+    NotFileOrDirectory,
+}
+impl OpenPathRefusal {
+    pub(super) fn message(&self, path: &str) -> String {
+        match self {
+            Self::ControlChar => format!("refused to open a path holding a control character: {path:?}"),
+            Self::Missing => format!("no such file: {path}"),
+            Self::NotFileOrDirectory => format!("refused to open {path}: not a regular file or a directory"),
+        }
+    }
+}
+
+/// The exact check shared by direct opens and the caller that may start a suffix lookup.
+pub(super) fn open_path_exact(
+    project_dir: &std::path::Path,
+    path: &str,
+) -> Result<std::path::PathBuf, OpenPathRefusal> {
+    if eitri_core::agent_bridge::path_holds_control(path) {
+        return Err(OpenPathRefusal::ControlChar);
     }
     let candidate = std::path::Path::new(path);
     let resolved = if candidate.is_absolute() {
@@ -15,8 +39,9 @@ pub fn open_path_target(project_dir: &std::path::Path, path: &str) -> Result<std
     } else {
         project_dir.join(candidate)
     };
-    if !resolved.exists() {
-        return Err(format!("no such file: {path}"));
+    let metadata = std::fs::metadata(&resolved).map_err(|_| OpenPathRefusal::Missing)?;
+    if !metadata.is_file() && !metadata.is_dir() {
+        return Err(OpenPathRefusal::NotFileOrDirectory);
     }
     Ok(resolved)
 }
@@ -132,12 +157,29 @@ mod tests {
     use super::*;
     use crate::agent_panel::tests::*;
 
+    struct PathScratch(PathBuf);
+    impl PathScratch {
+        fn new() -> Self {
+            let dir = std::env::temp_dir().join(format!(
+                "eitri-open-path-{}",
+                &uuid::Uuid::new_v4().simple().to_string()[..12]
+            ));
+            std::fs::create_dir(&dir).unwrap();
+            Self(dir)
+        }
+    }
+    impl Drop for PathScratch {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
     /// A path `gf` sends the editor is a file name, and no file name the agent shows needs a control
     /// character; one holding a newline is refused before nvim sees it, whatever exists on disk.
     #[test]
     fn open_path_refuses_a_control_character_before_looking_at_the_disk() {
-        let dir = std::env::temp_dir().join(format!("eitri-open-path-{}", uuid::Uuid::new_v4()));
-        std::fs::create_dir(&dir).unwrap();
+        let scratch = PathScratch::new();
+        let dir = &scratch.0;
         std::fs::write(dir.join("plain.rs"), "").unwrap();
         let hostile = "notes\nlua(io.open)(string.char(47),string.char(119))";
         std::fs::write(dir.join(hostile), "").unwrap();
@@ -157,7 +199,58 @@ mod tests {
         assert!(open_path_target(&dir, "missing.rs")
             .unwrap_err()
             .contains("no such file"));
-        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn open_path_refuses_special_files_and_follows_symlinks_for_the_kind_check() {
+        let scratch = PathScratch::new();
+        let dir = &scratch.0;
+        std::fs::write(dir.join("file"), "").unwrap();
+        std::fs::create_dir(dir.join("directory")).unwrap();
+        assert!(std::process::Command::new("mkfifo")
+            .arg(dir.join("fifo"))
+            .status()
+            .unwrap()
+            .success());
+        for name in ["file", "directory", "fifo"] {
+            std::os::unix::fs::symlink(dir.join(name), dir.join(format!("link-{name}"))).unwrap();
+        }
+        for name in ["fifo", "link-fifo", "/dev/null"] {
+            assert_eq!(open_path_exact(&dir, name), Err(OpenPathRefusal::NotFileOrDirectory));
+            assert_eq!(
+                open_path_target(&dir, name).unwrap_err(),
+                format!("refused to open {name}: not a regular file or a directory")
+            );
+        }
+        for name in ["file", "directory", "link-file", "link-directory"] {
+            assert_eq!(open_path_target(&dir, name), Ok(dir.join(name)));
+        }
+    }
+
+    #[test]
+    fn open_path_refuses_a_unix_socket() {
+        let scratch = PathScratch::new();
+        let dir = &scratch.0;
+        let socket = dir.join("socket");
+        let listener = std::os::unix::net::UnixListener::bind(&socket).unwrap();
+        assert_eq!(
+            open_path_exact(&dir, "socket"),
+            Err(OpenPathRefusal::NotFileOrDirectory)
+        );
+        drop(listener);
+    }
+
+    #[test]
+    fn open_path_refuses_c1_and_bidi_before_disk_access() {
+        for path in ["bad\u{85}.rs", "bad\u{202e}.rs"] {
+            assert_eq!(
+                open_path_exact(Path::new("/missing"), path),
+                Err(OpenPathRefusal::ControlChar)
+            );
+            assert!(open_path_target(Path::new("/missing"), path)
+                .unwrap_err()
+                .contains("control character"));
+        }
     }
 
     /// A proposal may create its file, so the resolver lets a missing path through (what is there is the

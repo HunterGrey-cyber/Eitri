@@ -1373,13 +1373,37 @@ pub(super) fn handle_inbound_message(
             ok(&mut out);
         }
         // `gf`: the window shows the editor and hands it the file; its answer is the page's.
-        InboundMessage::OpenPath { path, line, .. } => match open_path_target(&state.project_dir, &path) {
-            Ok(resolved) => out.effect(Effect::AskEditor {
-                request: eitri_core::scratch::open_request(&resolved, line),
-                then: EditorThen::Answer { view, request_id },
-            }),
-            Err(why) => refuse(&mut out, &why),
-        },
+        InboundMessage::OpenPath { path, line, .. } => {
+            let tab = if view.is_base() {
+                state.tabs.active()
+            } else {
+                let Some(tab) = state.tabs.tab_in(view) else {
+                    refuse(&mut out, "no tab in this view");
+                    return out;
+                };
+                tab
+            };
+            if let Some(result) = super::path_lookup::pick(state, &path, line, view, &request_id, tab) {
+                if let Err(why) = result {
+                    refuse(&mut out, &why);
+                }
+            } else {
+                match super::links::open_path_exact(&state.project_dir, &path) {
+                    Ok(resolved) => out.effect(Effect::AskEditor {
+                        request: eitri_core::scratch::open_request(&resolved, line),
+                        then: EditorThen::Answer { view, request_id },
+                    }),
+                    Err(super::links::OpenPathRefusal::Missing)
+                        if eitri_core::path_complete::suffix_wanted(&path).is_some() =>
+                    {
+                        if let Err(why) = super::path_lookup::start(state, path, line, view, request_id.clone(), tab) {
+                            refuse(&mut out, &why);
+                        }
+                    }
+                    Err(why) => refuse(&mut out, &why.message(&path)),
+                }
+            }
+        }
         // `c` in BROWSE: the jobs are built here, from this tab's own session and edit calls, and run
         // on a worker; the answer is an envelope carrying the request id, sent by the tick.
         InboundMessage::ReviewRequest { turn, scope, .. } => {

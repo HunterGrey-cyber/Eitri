@@ -394,6 +394,12 @@
     }
   },
   {
+    "label": "visual: gf",
+    "expected": {
+      "kind": "vopen-path"
+    }
+  },
+  {
     "label": "visual: 1-9",
     "expected": {
       "kind": "count",
@@ -532,6 +538,12 @@
     "expected": {
       "kind": "vmove",
       "motion": "G"
+    }
+  },
+  {
+    "label": "vline: gf",
+    "expected": {
+      "kind": "vopen-path"
     }
   },
   {
@@ -700,6 +712,12 @@
     "expected": {
       "kind": "vmove",
       "motion": "G"
+    }
+  },
+  {
+    "label": "caret: gf",
+    "expected": {
+      "kind": "vopen-path"
     }
   },
   {

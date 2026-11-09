@@ -1,6 +1,7 @@
 // @vitest-environment jsdom
 import { afterEach, describe, expect, it } from "vitest";
 import {
+  assignLabels,
   clampStep,
   clipBox,
   controlsOf,
@@ -28,6 +29,32 @@ import type { AnswerableItem } from "./nav";
 
 afterEach(() => {
   document.body.innerHTML = "";
+});
+
+describe("assignLabels matches core::hint::assign_labels", () => {
+  const one = "a s d j k l g h w e r u i o".split(" ");
+  const two = `aa as ad aj ak al ag ah aw ae ar au ai ao
+sa ss sd sj sk sl sg sh sw se sr su si so
+da ds dd dj dk dl dg dh dw de dr du di do
+ja js jd jj jk jl jg jh jw je jr ju ji jo
+ka ks kd kj kk kl kg kh kw ke kr ku ki ko
+la ls ld lj lk ll lg lh lw le lr lu li lo
+ga gs gd gj gk gl gg gh gw ge gr gu gi go
+ha hs hd hj hk hl hg hh hw he hr hu hi ho
+wa ws wd wj wk wl wg wh ww we wr wu wi wo
+ea es ed ej ek el eg eh ew ee er eu ei eo
+ra rs rd rj rk rl rg rh rw re rr ru ri ro
+ua us ud uj uk ul ug uh uw ue ur uu ui uo
+ia is id ij ik il ig ih iw ie ir iu ii io
+oa os od oj ok ol og oh ow oe or ou oi oo`.split(/\s+/);
+  it.each([
+    [0, []], [1, ["a"]], [14, one],
+    [15, "aa as ad aj ak al ag ah aw ae ar au ai ao sa".split(" ")],
+    [20, "aa as ad aj ak al ag ah aw ae ar au ai ao sa ss sd sj sk sl".split(" ")],
+    [196, two], [197, [...two.map((label) => `a${label}`), "saa"]],
+  ] as const)("%i labels", (count, expected) => {
+    expect(assignLabels(count)).toEqual(expected);
+  });
 });
 
 /** A panel-shaped document: two rows (the second a permission card whose reason box sits ABOVE its

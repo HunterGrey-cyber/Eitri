@@ -1,4 +1,4 @@
-//! Project-relative names for the composer's path picker. No file contents are opened.
+//! Project-relative names for path completion and suffix lookup. No file contents are opened.
 use std::collections::BTreeSet;
 use std::path::Path;
 use std::time::Duration;
@@ -80,6 +80,138 @@ fn walk(root: &Path, paths: &mut BTreeSet<String>, max_entries: usize, max_depth
             }
         }
     }
+}
+
+/// Bounds a suffix listing on its worker thread.
+#[derive(Clone, Copy)]
+pub struct SuffixLimits {
+    pub max_files: usize,
+    pub deadline: Duration,
+}
+
+#[derive(Debug, PartialEq, Eq)]
+pub enum Stopped {
+    Files(usize),
+    Time,
+}
+
+#[derive(Debug, Default)]
+pub struct SuffixLookup {
+    pub matches: Vec<String>,
+    pub stopped: Option<Stopped>,
+}
+
+/// Only relative, control-free names without parent traversal may start a suffix search.
+pub fn suffix_wanted(wanted: &str) -> Option<&str> {
+    let wanted = wanted.strip_prefix("./").unwrap_or(wanted);
+    (!wanted.is_empty()
+        && !Path::new(wanted).is_absolute()
+        && !wanted.split('/').any(|part| part == "..")
+        && !crate::agent_bridge::path_holds_control(wanted))
+    .then_some(wanted)
+}
+
+/// Finds every file with this exact name or path suffix, using Git's ignores when available.
+/// Disk access and child-process waiting belong on a worker thread.
+pub fn find_by_suffix(root: &Path, wanted: &str, limits: SuffixLimits) -> SuffixLookup {
+    let mut result = SuffixLookup::default();
+    let Some(wanted) = suffix_wanted(wanted) else {
+        return result;
+    };
+    let started = std::time::Instant::now();
+    let mut listed = 0;
+    if started.elapsed() >= limits.deadline {
+        result.stopped = Some(Stopped::Time);
+        return result;
+    }
+    if limits.max_files == 0 {
+        result.stopped = Some(Stopped::Files(0));
+        return result;
+    }
+    let mut git = crate::turn_review::git::user_read_only(root);
+    git.args([
+        "-c",
+        "core.fsmonitor=false",
+        "ls-files",
+        "--cached",
+        "--others",
+        "--exclude-standard",
+        "-z",
+    ]);
+    let listing = crate::turn_review::git::run(git, limits.deadline.saturating_sub(started.elapsed()));
+    // Keep the time budget shared by Git and the fallback walk.
+    if started.elapsed() >= limits.deadline {
+        result.stopped = Some(Stopped::Time);
+        return result;
+    }
+    let consider = |name: &str, result: &mut SuffixLookup| {
+        if name == wanted || name.strip_suffix(wanted).is_some_and(|prefix| prefix.ends_with('/')) {
+            if suffix_wanted(name).is_some() && root.join(name).is_file() {
+                result.matches.push(name.to_owned());
+            }
+        }
+    };
+    if let Some(output) = listing
+        .as_ref()
+        .ok()
+        .filter(|output| output.status.success() && output.stdout.iter().any(|byte| *byte != 0))
+    {
+        for bytes in output.stdout.split(|b| *b == 0).filter(|bytes| !bytes.is_empty()) {
+            if started.elapsed() >= limits.deadline {
+                result.stopped = Some(Stopped::Time);
+                break;
+            }
+            if listed >= limits.max_files {
+                result.stopped = Some(Stopped::Files(listed));
+                break;
+            }
+            listed += 1;
+            if let Ok(name) = std::str::from_utf8(bytes) {
+                consider(name, &mut result);
+            }
+        }
+    } else {
+        let mut pending = vec![root.to_path_buf()];
+        'walk: while let Some(dir) = pending.pop() {
+            if started.elapsed() >= limits.deadline {
+                result.stopped = Some(Stopped::Time);
+                break;
+            }
+            let Ok(entries) = std::fs::read_dir(dir) else { continue };
+            for entry in entries.flatten() {
+                if started.elapsed() >= limits.deadline {
+                    result.stopped = Some(Stopped::Time);
+                    break 'walk;
+                }
+                if listed >= limits.max_files {
+                    result.stopped = Some(Stopped::Files(listed));
+                    break 'walk;
+                }
+                // Bound visited entries too, so a tree of empty directories cannot evade the limit.
+                listed += 1;
+                let Ok(kind) = entry.file_type() else { continue };
+                if kind.is_dir() {
+                    let name = entry.file_name();
+                    let name = name.to_string_lossy();
+                    if !name.starts_with('.') && name != "target" && name != "node_modules" {
+                        pending.push(entry.path());
+                    }
+                } else if kind.is_file() || kind.is_symlink() {
+                    if let Some(name) = entry.path().strip_prefix(root).ok().and_then(Path::to_str) {
+                        consider(name, &mut result);
+                    }
+                }
+            }
+        }
+    }
+    if result.stopped.is_none() && started.elapsed() >= limits.deadline {
+        result.stopped = Some(Stopped::Time);
+    }
+    result
+        .matches
+        .sort_by(|a, b| a.len().cmp(&b.len()).then_with(|| a.cmp(b)));
+    result.matches.dedup();
+    result
 }
 
 /// Matches names case-insensitively, with stronger matches before shorter and alphabetical names.
@@ -320,5 +452,246 @@ mod tests {
         assert_eq!(payload["tab"], 7);
         assert_eq!(payload["seq"], 3);
         assert_eq!(payload["items"].as_array().unwrap().len(), 50);
+    }
+    fn suffix(root: &Path, wanted: &str) -> SuffixLookup {
+        find_by_suffix(
+            root,
+            wanted,
+            SuffixLimits {
+                max_files: 200_000,
+                deadline: Duration::from_secs(1),
+            },
+        )
+    }
+    fn write_names(root: &Path, names: &[&str]) {
+        for name in names {
+            let path = root.join(name);
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(path, "").unwrap();
+        }
+    }
+    #[test]
+    fn suffix_exact_single_multiple_and_none() {
+        for git in [false, true] {
+            let dir = TempDir::new();
+            if git {
+                assert!(Command::new("git")
+                    .args(["init", "-q"])
+                    .arg(dir.path())
+                    .status()
+                    .unwrap()
+                    .success());
+            }
+            write_names(
+                dir.path(),
+                &["a.rs", "internal/session/forward_test.go", "a/mod.rs", "longer/mod.rs"],
+            );
+            assert_eq!(suffix(dir.path(), "./a.rs").matches, paths(&["a.rs"]));
+            assert_eq!(
+                suffix(dir.path(), "session/forward_test.go").matches,
+                paths(&["internal/session/forward_test.go"])
+            );
+            assert_eq!(
+                suffix(dir.path(), "mod.rs").matches,
+                paths(&["a/mod.rs", "longer/mod.rs"])
+            );
+            assert!(suffix(dir.path(), "absent.rs").matches.is_empty());
+            assert!(suffix(dir.path(), "od.rs").matches.is_empty());
+        }
+    }
+    #[test]
+    fn suffix_invalid_names_start_no_search() {
+        for name in ["", "../x.rs", "a/../b.rs", "/a.rs", "a\nb.rs", "a\u{85}.rs"] {
+            let result = find_by_suffix(
+                Path::new("/not/a/project"),
+                name,
+                SuffixLimits {
+                    max_files: 0,
+                    deadline: Duration::ZERO,
+                },
+            );
+            assert!(result.matches.is_empty(), "{name:?}");
+            assert_eq!(result.stopped, None, "{name:?}");
+        }
+    }
+    #[test]
+    fn suffix_walk_skips_hidden_build_and_linked_directories() {
+        let dir = TempDir::new();
+        let outside = TempDir::new();
+        write_names(
+            dir.path(),
+            &[".hidden/x.rs", "target/x.rs", "node_modules/x.rs", "src/x.rs"],
+        );
+        write_names(outside.path(), &["x.rs"]);
+        std::os::unix::fs::symlink(outside.path(), dir.path().join("linked")).unwrap();
+        assert_eq!(suffix(dir.path(), "x.rs").matches, paths(&["src/x.rs"]));
+    }
+    #[test]
+    fn suffix_listing_obeys_file_and_time_bounds() {
+        for git in [false, true] {
+            let dir = TempDir::new();
+            if git {
+                assert!(Command::new("git")
+                    .args(["init", "-q"])
+                    .arg(dir.path())
+                    .status()
+                    .unwrap()
+                    .success());
+            }
+            for i in 0..10 {
+                write_names(dir.path(), &[&format!("file{i}.rs")]);
+            }
+            let result = find_by_suffix(
+                dir.path(),
+                "missing.rs",
+                SuffixLimits {
+                    max_files: 3,
+                    deadline: Duration::from_secs(1),
+                },
+            );
+            assert_eq!(result.stopped, Some(Stopped::Files(3)));
+            let result = find_by_suffix(
+                dir.path(),
+                "missing.rs",
+                SuffixLimits {
+                    max_files: 10,
+                    deadline: Duration::ZERO,
+                },
+            );
+            assert_eq!(result.stopped, Some(Stopped::Time));
+        }
+    }
+    #[test]
+    fn suffix_git_ignores_and_never_runs_the_repositorys_monitor() {
+        let dir = TempDir::new();
+        let root = dir.path();
+        assert!(Command::new("git")
+            .args(["init", "-q"])
+            .arg(root)
+            .status()
+            .unwrap()
+            .success());
+        write_names(root, &["src/a.rs", "ignored/a.rs"]);
+        std::fs::write(root.join(".gitignore"), "ignored/\n").unwrap();
+        let marker = root.join("ran");
+        let program = root.join("monitor.sh");
+        std::fs::write(&program, format!("#!/bin/sh\ntouch {}\n", marker.display())).unwrap();
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&program, std::fs::Permissions::from_mode(0o755)).unwrap();
+        assert!(Command::new("git")
+            .arg("-C")
+            .arg(root)
+            .args(["config", "core.fsmonitor", program.to_str().unwrap()])
+            .status()
+            .unwrap()
+            .success());
+        assert_eq!(suffix(root, "a.rs").matches, paths(&["src/a.rs"]));
+        assert!(!marker.exists());
+    }
+    #[test]
+    fn suffix_empty_git_listing_falls_back_to_walk() {
+        let dir = TempDir::new();
+        assert!(Command::new("git")
+            .args(["init", "-q"])
+            .arg(dir.path())
+            .status()
+            .unwrap()
+            .success());
+        std::fs::write(dir.path().join(".gitignore"), "*\n").unwrap();
+        write_names(dir.path(), &["src/a.rs"]);
+        assert_eq!(suffix(dir.path(), "a.rs").matches, paths(&["src/a.rs"]));
+    }
+
+    #[test]
+    fn suffix_refuses_bidi_in_wanted_and_drops_bidi_matches() {
+        let dir = TempDir::new();
+        write_names(dir.path(), &["bad\u{202e}/a.rs", "good/a.rs", "bad\u{202e}.rs"]);
+        assert!(suffix_wanted("bad\u{202e}.rs").is_none());
+        assert!(suffix(dir.path(), "bad\u{202e}.rs").matches.is_empty());
+        assert_eq!(suffix(dir.path(), "a.rs").matches, paths(&["good/a.rs"]));
+    }
+
+    #[test]
+    fn suffix_drops_directories_fifos_and_links_to_them() {
+        use std::os::unix::fs::symlink;
+        for git in [false, true] {
+            let dir = TempDir::new();
+            if git {
+                assert!(Command::new("git")
+                    .args(["init", "-q"])
+                    .arg(dir.path())
+                    .status()
+                    .unwrap()
+                    .success());
+            }
+            std::fs::create_dir(dir.path().join("dir.rs")).unwrap();
+            assert!(Command::new("mkfifo")
+                .arg(dir.path().join("pipe.rs"))
+                .status()
+                .unwrap()
+                .success());
+            symlink(dir.path().join("dir.rs"), dir.path().join("dir-link.rs")).unwrap();
+            symlink(dir.path().join("pipe.rs"), dir.path().join("pipe-link.rs")).unwrap();
+            for name in ["dir.rs", "pipe.rs", "dir-link.rs", "pipe-link.rs"] {
+                assert!(suffix(dir.path(), name).matches.is_empty(), "{name}");
+            }
+        }
+    }
+
+    #[test]
+    fn suffix_slow_git_is_killed_and_reaped_at_deadline() {
+        // A subprocess isolates PATH from other tests; the stand-in records the process and group
+        // that the real read-only command builder and runner must terminate.
+        const CHILD: &str = "EITRI_SUFFIX_SLOW_GIT_CHILD";
+        if let Some(root) = std::env::var_os(CHILD) {
+            let root = Path::new(&root);
+            let result = find_by_suffix(
+                root,
+                "a.rs",
+                SuffixLimits {
+                    max_files: 100,
+                    deadline: Duration::from_secs(1),
+                },
+            );
+            assert_eq!(result.stopped, Some(Stopped::Time));
+            assert!(result.matches.is_empty(), "a timed-out git must not start the walk");
+            let pid: libc::pid_t = std::fs::read_to_string(root.join("pid"))
+                .unwrap()
+                .trim()
+                .parse()
+                .unwrap();
+            // SAFETY: These calls take no pointers; the pid belongs to the stand-in just run.
+            unsafe {
+                assert_eq!(libc::kill(pid, 0), -1, "git still lives");
+                assert_eq!(std::io::Error::last_os_error().raw_os_error(), Some(libc::ESRCH));
+                assert_eq!(libc::waitpid(pid, std::ptr::null_mut(), libc::WNOHANG), -1);
+                assert_eq!(
+                    std::io::Error::last_os_error().raw_os_error(),
+                    Some(libc::ECHILD),
+                    "git was not reaped"
+                );
+                assert_eq!(libc::kill(-pid, 0), -1, "git's process group still lives");
+            }
+            return;
+        }
+        use std::os::unix::fs::PermissionsExt;
+        let dir = TempDir::new();
+        write_names(dir.path(), &["src/a.rs"]);
+        let bin = dir.path().join("bin");
+        std::fs::create_dir(&bin).unwrap();
+        let fake = bin.join("git");
+        std::fs::write(&fake, "#!/bin/sh\necho $$ > pid\nexec /bin/sleep 60\n").unwrap();
+        std::fs::set_permissions(&fake, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let status = Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "path_complete::tests::suffix_slow_git_is_killed_and_reaped_at_deadline",
+                "--nocapture",
+            ])
+            .env(CHILD, dir.path())
+            .env("PATH", bin)
+            .status()
+            .unwrap();
+        assert!(status.success());
     }
 }

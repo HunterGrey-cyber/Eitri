@@ -1015,7 +1015,7 @@ const TimelineRow = memo(function TimelineRow({
         .filter((name) => name !== null)
         .join(" ");
       return (
-        <Row kind="prompt" sign="›" current={current} className={promptClass || undefined} navStop="row">
+        <Row kind="prompt" sign="›" current={current} className={promptClass || undefined} navStop="row" rowKey={item.key}>
           {item.text}
           {sentHere && <div className="phone-source"><small>sent from this phone</small></div>}
           {sentFrom !== null && <div className="phone-source"><small>from <Revealed pieces={revealHidden(sentFrom)} /></small></div>}
@@ -1025,7 +1025,7 @@ const TimelineRow = memo(function TimelineRow({
     case "message": {
       if (item.question || item.plain) {
         const lines = item.question ? questionLines(item.question) : item.text.split("\n").map((text, i) => ({ text, muted: i > 0 }));
-        return <Row kind="question" sign="?" current={current} className={yanked ? "row-yanked" : undefined} navStop="row">
+        return <Row kind="question" sign="?" current={current} className={yanked ? "row-yanked" : undefined} navStop="row" rowKey={item.key}>
           {lines.map((line, i) => <div key={i} className={line.muted ? "question-line question-status" : "question-line"}>
             <Revealed pieces={revealHidden(line.text)} />
           </div>)}
@@ -1033,7 +1033,7 @@ const TimelineRow = memo(function TimelineRow({
       }
       const yankedClass = yanked ? "row-yanked" : undefined;
       return (
-        <Row kind="assistant" sign="" current={current} className={yankedClass} navStop="row">
+        <Row kind="assistant" sign="" current={current} className={yankedClass} navStop="row" rowKey={item.key}>
           {/* `renderMarkdown` (`../markdown.ts`) is marked.parse, now with a `code` renderer
               that runs highlight.js against nvim's own syntax colours, then DOMPurify.sanitize
               -- one function so no caller can run half of it. */}
@@ -1044,7 +1044,7 @@ const TimelineRow = memo(function TimelineRow({
     case "tool": {
       if (agent) {
         const whole = !agent.background && (expanded || detailed);
-        return <Row kind="subagent" sign={toolSign(item.call, abandoned)} current={current} className={yanked ? "row-yanked" : undefined} navStop="row">
+        return <Row kind="subagent" sign={toolSign(item.call, abandoned)} current={current} className={yanked ? "row-yanked" : undefined} navStop="row" rowKey={item.key}>
           <div className="subagent-heading"><Revealed pieces={revealHidden(agent.header)} />{!agent.background && <span className="fold-marker" aria-label={whole ? "expanded" : "collapsed"}>{whole ? "▾" : "▸"}</span>}</div>
           {agent.warnings.map((warning, i) => <div key={i} className="subagent-warning"><Revealed pieces={revealHidden(warning)} /></div>)}
           <div className="subagent-status"><Revealed pieces={revealHidden(agent.line)} /></div>
@@ -1053,7 +1053,7 @@ const TimelineRow = memo(function TimelineRow({
       }
       const yankedClass = yanked ? "row-yanked" : undefined;
       return (
-        <Row kind="tool" sign={toolSign(item.call, abandoned)} current={current} className={yankedClass} navStop="row">
+        <Row kind="tool" sign={toolSign(item.call, abandoned)} current={current} className={yankedClass} navStop="row" rowKey={item.key}>
           <div data-awaiting-permission={gated ? "true" : undefined}>
             {/* A call a card is waiting on no longer repeats its own invocation below the
                 card too -- the gated line above says "waiting for approval" already, so the
@@ -1074,7 +1074,7 @@ const TimelineRow = memo(function TimelineRow({
     case "permission": {
       const yankedClass = yanked ? "row-yanked" : undefined;
       return (
-        <Row kind="permission" sign="!" current={current} className={yankedClass} navStop="row">
+        <Row kind="permission" sign="!" current={current} className={yankedClass} navStop="row" rowKey={item.key}>
           <PermissionCard
             request={item.request}
             controls={atDesk === null}
@@ -1095,7 +1095,7 @@ const TimelineRow = memo(function TimelineRow({
       // provider's, and its line breaks are kept by the row's own CSS.
       const yankedClass = yanked ? "row-yanked" : undefined;
       return (
-        <Row kind="ending" sign="·" current={current} className={yankedClass} navStop="row">
+        <Row kind="ending" sign="·" current={current} className={yankedClass} navStop="row" rowKey={item.key}>
           {/* The reset time the ending itself kept: a later limit report never changes an older row. */}
           {turnEndingText(item.ending, item.ending.resetsAt ?? null, ranFor)}
         </Row>
@@ -1103,7 +1103,7 @@ const TimelineRow = memo(function TimelineRow({
     }
     case "wake": {
       return (
-        <Row kind="wake" sign="●" current={current} className={yanked ? "row-yanked" : undefined} navStop="row">
+        <Row kind="wake" sign="●" current={current} className={yanked ? "row-yanked" : undefined} navStop="row" rowKey={item.key}>
           <div className="wake-head"><span className="wake-text"><Revealed pieces={revealHidden(wakeText(item))} /></span>
             {item.body && !item.inlineBody && <span className="fold-marker" aria-label={expanded ? "expanded" : "collapsed"}>{expanded ? "▾" : "▸"}</span>}</div>
           {item.body && (expanded || detailed || item.inlineBody) && <div className="wake-body"><Revealed pieces={revealHidden(item.body)} /></div>}
@@ -1120,7 +1120,7 @@ const TimelineRow = memo(function TimelineRow({
       // What a person's `!` line printed: a program's text, opened where it is rather than repeated below.
       const shell = item.notice.kind === "shell_output";
       return (
-        <Row kind="notice" sign={warning ? "⚠" : shell ? "⎿" : "·"} current={current} className={[yankedClass, warning ? "notice-prominent" : "", item.notice.kind === "compaction" ? "notice-compaction" : ""].filter(Boolean).join(" ")} navStop="row">
+        <Row kind="notice" sign={warning ? "⚠" : shell ? "⎿" : "·"} current={current} className={[yankedClass, warning ? "notice-prominent" : "", item.notice.kind === "compaction" ? "notice-compaction" : ""].filter(Boolean).join(" ")} navStop="row" rowKey={item.key}>
           <div className={shell && (expanded || detailed) ? "notice-text notice-open" : "notice-text"} data-notice-kind={item.notice.kind}>
             <Revealed pieces={revealHidden(noticeText(item.notice))} />
           </div>
@@ -1134,7 +1134,7 @@ const TimelineRow = memo(function TimelineRow({
       // `expanded[key]` like a tool's result) unless the level or the detailed view shows it whole.
       const yankedClass = yanked ? "row-yanked" : undefined;
       return (
-        <Row kind="thinking" sign="∴" current={current} className={yankedClass} navStop="row">
+        <Row kind="thinking" sign="∴" current={current} className={yankedClass} navStop="row" rowKey={item.key}>
           <ThinkingBody block={item.block} open={item.open} level={thinkingDisplay} expanded={expanded} detailed={detailed} />
         </Row>
       );
@@ -1144,7 +1144,7 @@ const TimelineRow = memo(function TimelineRow({
       // (`toggle-expand`, keyed on this row's OWN key) puts them back.
       const yankedClass = yanked ? "row-yanked" : undefined;
       return (
-        <Row kind="tool-run" sign="✓" current={current} className={yankedClass} navStop="row">
+        <Row kind="tool-run" sign="✓" current={current} className={yankedClass} navStop="row" rowKey={item.key}>
           <div className="tool-card tool-card-run">
             {runSummary(item.calls)} <span className="fold-marker" aria-label="collapsed">▸</span>
           </div>

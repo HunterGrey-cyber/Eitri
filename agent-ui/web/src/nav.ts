@@ -22,12 +22,30 @@
  *   activate it natively.
  */
 
+import { pathTargetPass } from "./pathTargets";
+import type { PathTarget } from "./pathTargets";
+
 export const STOP_ATTR = "data-nav-stop";
 
 /** The label alphabet `eitri_core::hint` uses for the window-wide `f` HINT (no `f` itself, since
  *  that key starts the HINT). The `gf` path picker (`components/PathPick.tsx`) reuses it for its
- *  own letter-per-path footer list, and so does `gx`'s link picker (`components/LinkPick.tsx`). */
+ *  own path labels, and so does `gx`'s link picker (`components/LinkPick.tsx`). */
 export const HINT_ALPHABET = "asdjklghweruio";
+
+/** Must equal `core::hint::assign_labels`: equal-length, prefix-free labels in alphabet order. */
+export function assignLabels(count: number): string[] {
+  let length = 1;
+  const base = HINT_ALPHABET.length;
+  while (base ** length < count) length++;
+  return Array.from({ length: count }, (_, index) => {
+    const letters = Array<string>(length);
+    for (let slot = length - 1; slot >= 0; slot--) {
+      letters[slot] = HINT_ALPHABET[index % base];
+      index = Math.floor(index / base);
+    }
+    return letters.join("");
+  });
+}
 
 /** A web link as `web_url` (`panel/src/links.rs`) will re-check it -- `http(s)`
  *  by the WHATWG parser with no base (the parser the browser opens it with, so `https://%65itri.invalid/x`
@@ -439,11 +457,13 @@ export function permissionTarget(items: AnswerableItem[], cursor: number): numbe
 /** One panel target of the global `f` HINT: a conversation row, a fenced code block inside one (which remembers its
  *  row, because landing on it moves the row cursor there), a web link inside one (the anchor, which likewise
  *  remembers its row -- landing focuses it and never clicks it; a problem row's link on a start screen has no row),
- *  or an enabled control from `controlsOf`. The list is
+ *  or an enabled control from `controlsOf`. A `gf` path pick stores its row key, drawn-text offsets and expected
+ *  text, resolving a fresh range on each measure; those targets belong to the pick's own list. The global list is
  *  frozen at `hint_collect` and `shell` addresses its entries by index from then on. `rowIndex` is the row's index at
  *  that moment only; landing re-reads it from the element, because rows can be inserted above it while the labels are
  *  up. */
 export type HintTarget =
+  | PathTarget
   | { kind: "row"; el: HTMLElement; rowIndex: number }
   | { kind: "control"; el: HTMLElement }
   | { kind: "code"; el: HTMLElement; rowIndex: number }
@@ -537,12 +557,25 @@ export function firstShownLine(el: HTMLElement, root: HTMLElement): DOMRect {
   return el.getBoundingClientRect();
 }
 
+/** The first drawn line of a path inside its row's clip box. A missing Range geometry API
+ *  (jsdom) uses the row's box; real ranges with no visible rect have no label. */
+export function pathShownLine(
+  target: Extract<HintTarget, { kind: "path" }>, root: HTMLElement, pass = pathTargetPass(root),
+): DOMRect | null {
+  const row = pass.row(target.rowKey);
+  if (row === null || !row.isConnected || visibleBox(row, root) === null) return null;
+  const range = pass.resolve(target);
+  if (range === null) return null;
+  if (typeof range.getClientRects !== "function") return row.getBoundingClientRect();
+  return Array.from(range.getClientRects()).find((rect) => boxShows(rect, row, root)) ?? null;
+}
+
 /** Visible HINT targets under `root`, in document order: for each stop (row or other), the stop
  *  itself (if it's a row), then its code blocks, then its web links (a row's only), then its controls;
  *  for a non-row stop, its controls only. The composer, when marked (`HINT_COMPOSER_ATTR`), takes its
  *  place in document order among the stops. "Visible" is `hintVisible` above. */
-export function hintTargets(root: HTMLElement): HintTarget[] {
-  const targets: HintTarget[] = [];
+export function hintTargets(root: HTMLElement): Exclude<HintTarget, PathTarget>[] {
+  const targets: Exclude<HintTarget, PathTarget>[] = [];
   // The composer is in no stop; a marker inside one is a reply's own HTML, not the composer.
   const markers = Array.from(root.querySelectorAll<HTMLElement>(`[${HINT_COMPOSER_ATTR}]`));
   const composerEl = markers.find((el) => stopOf(root, el) === null) ?? null;

@@ -30,3 +30,39 @@ export const RESUME_FOLLOW_EVENT = "nv-resume-follow";
 export function resumeFollowing(list: Element | null | undefined): void {
   list?.dispatchEvent(new CustomEvent(RESUME_FOLLOW_EVENT));
 }
+
+/** Observe actual list movement after user intent. Layout and follow scrolls alone do not steer,
+ *  but anchored labels still need to follow them. */
+export function watchUserScroll(list: HTMLElement, moved: () => void, reanchor: () => void): () => void {
+  let until = -Infinity;
+  let held = false;
+  let top = list.scrollTop;
+  let left = list.scrollLeft;
+  const steer = () => { until = performance.now() + 300; };
+  const down = () => { held = true; };
+  const up = () => {
+    if (!held) return;
+    held = false;
+    steer();
+  };
+  const scroll = (event: Event) => {
+    if (event.target !== list) return;
+    const changed = list.scrollTop !== top || list.scrollLeft !== left;
+    top = list.scrollTop;
+    left = list.scrollLeft;
+    if (!changed) return;
+    if (held || performance.now() <= until) moved();
+    else reanchor();
+  };
+  const signals: [string, EventListener][] = [
+    ["wheel", steer], ["touchmove", steer], ["pointerdown", down], ["mousedown", down], [USER_SCROLL_EVENT, steer],
+    ["scroll", scroll],
+  ];
+  const releases = ["pointerup", "pointercancel", "mouseup"];
+  for (const [name, listener] of signals) list.addEventListener(name, listener, { passive: true });
+  for (const name of releases) window.addEventListener(name, up, { passive: true });
+  return () => {
+    for (const [name, listener] of signals) list.removeEventListener(name, listener);
+    for (const name of releases) window.removeEventListener(name, up);
+  };
+}

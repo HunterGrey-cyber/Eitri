@@ -1,4 +1,5 @@
 import { describe, expect, it } from "vitest";
+import { HINT_ALPHABET } from "./nav";
 import { noteKey } from "./heldSuper";
 import { BROWSE_KEYS, CARET_KEYS, FIXED_PAIRS, INPUT_KEYS, VISUAL_KEYS, isPlainAnswerKey, panelEntryKey, pluginKeysHelp, resolveKey } from "./keymap";
 import type { KeyContext, KeyLike, PanelBinding, PanelTable, PendingPrefix } from "./keymap";
@@ -992,7 +993,7 @@ describe("BROWSE_KEYS <-> resolveKey", () => {
 });
 
 /** VISUAL/V-LINE's own token parser, mirroring `parseKeyToken` above but for the shape `VISUAL_KEYS`
- *  rows actually take: no two-key sequences, `"1-9"` a representative digit, `"Esc"` the display
+ *  rows actually take: region-local g pairs, `"1-9"` a representative digit, `"Esc"` the display
  *  spelling of the real `key: "Escape"`, `"Ctrl+x"` -> Ctrl held with `x` (the
  *  CARET_KEYS/VISUAL_KEYS "Ctrl+e / Ctrl+y" row needs the modifier, unlike the
  *  plain-letter rows), and every bare uppercase letter or `?` carries Shift, the same reason
@@ -1003,7 +1004,7 @@ function parseVisualToken(token: string): KeyLike {
   // `gg` is a two-key sequence (two presses); the round-trip tests below only need the FIRST
   // press here (which arms the region-local pending marker, a non-null result) -- `gg`'s own full
   // resolution is checked directly, by name, alongside `G`.
-  if (token === "gg") return key("g");
+  if (token === "gg" || token === "gf") return key("g");
   if (token.startsWith("Ctrl+")) return key(token.slice("Ctrl+".length), { ctrlKey: true });
   if (/^[A-Z?]$/.test(token)) return key(token, { shiftKey: true });
   return key(token);
@@ -1353,4 +1354,21 @@ describe("pluginKeysHelp: open_keymap's plugin section", () => {
     expect(pluginKeysHelp({ title: "Snotra", rows: [] })).toEqual({ title: "Snotra", declared: false, rows: [] });
     expect(pluginKeysHelp({ title: "Snotra", declared: "yes", rows: [] })).toBeNull();
   });
+});
+
+
+describe("gf in the region modes", () => {
+  it.each(["caret", "visual", "vline"] as const)("resolves gf and gg in %s, leaving f alone unbound", (mode) => {
+    const context = { sessionEnded: false, turnRunning: false };
+    expect(resolveKey(mode, key("g"), context)).toEqual({ kind: "pending", prefix: "g" });
+    expect(resolveKey(mode, key("f"), { ...context, pending: "g" })).toEqual({ kind: "vopen-path" });
+    expect(resolveKey(mode, key("g"), { ...context, pending: "g" })).toEqual({ kind: "vmove", motion: "gg" });
+    expect(resolveKey(mode, key("f"), context)?.kind).toBe("vend");
+  });
+});
+
+
+it("keeps the path choice alphabet in sync with Rust", () => {
+  // panel/src/path_lookup.rs PATH_PICK_MAX bounds the same letter picker.
+  expect(HINT_ALPHABET.length).toBe(14);
 });
