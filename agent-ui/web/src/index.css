@@ -683,6 +683,10 @@ pre {
 }
 .diff-text {
   min-width: 0;
+  /* Each flex item lays out its own text in storage order. */
+  direction: ltr;
+  unicode-bidi: bidi-override;
+  unicode-bidi: isolate-override;
 }
 .diff-added {
   background: var(--nv-bg);

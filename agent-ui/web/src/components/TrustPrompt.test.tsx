@@ -251,6 +251,9 @@ describe("TrustPrompt", () => {
 
   it("lays a diff's text out in storage order on the text itself", () => {
     expect(css).toMatch(/\.trust-text-diff \.diff-text \{[^}]*unicode-bidi: bidi-override/);
+    const rule = css.match(/^\.diff-text \{([^}]+)\}/m)![1];
+    expect(rule).toMatch(/direction:\s*ltr;/);
+    expect(rule).toMatch(/unicode-bidi:\s*bidi-override;[\s\S]*unicode-bidi:\s*isolate-override;/);
   });
 
   it("reveals and counts drawn lines once for the same hunks while the overlay stays open", () => {

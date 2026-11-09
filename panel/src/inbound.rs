@@ -1374,6 +1374,10 @@ pub(super) fn handle_inbound_message(
         }
         // `gf`: the window shows the editor and hands it the file; its answer is the page's.
         InboundMessage::OpenPath { path, line, .. } => {
+            if let Err(why) = super::path_lookup::check_path_length(&path) {
+                refuse(&mut out, &why);
+                return out;
+            }
             let tab = if view.is_base() {
                 state.tabs.active()
             } else {

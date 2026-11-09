@@ -109,11 +109,32 @@ export function webLinks(row: HTMLElement): { el: HTMLAnchorElement; url: string
  *  drawn when their anchor is (a reply's `class` and `style` are stripped, so nothing it writes hides a text
  *  node by itself), so `childElementCount === 0` is exactly "what is drawn is `textContent`" -- marked's
  *  autolink and a bare-URL link both are. A comment node renders nothing and is not in `textContent`. A link
- *  wrapping `<b>` or `<code>` picks, which costs one keypress and never opens an address unseen. */
+ *  wrapping `<b>` or `<code>` picks, which costs one keypress and never opens an address unseen.
+ *  The anchor must be wholly on screen (`whollyVisible`). */
 export function linkOpensAtOnce(link: { el: HTMLAnchorElement; url: string }, root: HTMLElement): boolean {
   if (link.el.childElementCount !== 0) return false;
   const text = link.el.textContent?.trim() ?? "";
-  return (text === link.url || `${text}/` === link.url) && hintVisible(link.el, root);
+  return (text === link.url || `${text}/` === link.url) && whollyVisible(link.el, root);
+}
+
+/** Immediate opening requires the whole address box inside every clipping ancestor and the root. */
+function whollyVisible(el: HTMLElement, root: HTMLElement): boolean {
+  const box = el.getBoundingClientRect();
+  let clip: Box | null = boxOf(root.getBoundingClientRect());
+  for (let a = el.parentElement; a !== null && clip !== null; a = a.parentElement) {
+    if (clips(a)) {
+      const bounds = a.getBoundingClientRect();
+      const left = bounds.left + a.clientLeft;
+      const top = bounds.top + a.clientTop;
+      clip = overlap(clip, {
+        left, top, right: left + a.clientWidth, bottom: top + a.clientHeight,
+        width: a.clientWidth, height: a.clientHeight,
+      });
+    }
+    if (a === root) break;
+  }
+  return box.width > 0 && box.height > 0 && clip !== null
+    && box.left >= clip.left && box.right <= clip.right && box.top >= clip.top && box.bottom <= clip.bottom;
 }
 
 /** How soon after a click showed a link's address a second click on it may open it. Under the lower bound
@@ -156,7 +177,7 @@ export function linkClickNeedsLook(
   if (url === null) return null;
   if (mailto) {
     const text = anchor.textContent?.trim() ?? "";
-    if (anchor.childElementCount === 0 && (text === url || text === url.slice("mailto:".length)) && hintVisible(anchor, root)) return null;
+    if (anchor.childElementCount === 0 && (text === url || text === url.slice("mailto:".length)) && whollyVisible(anchor, root)) return null;
   } else if (linkOpensAtOnce({ el: anchor, url }, root)) return null;
   if (shown !== null && shown.url === url && sameLink(shown, anchor, root)) {
     const since = now - shown.at;

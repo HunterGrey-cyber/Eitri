@@ -11,6 +11,7 @@ pub fn open_path_target(project_dir: &std::path::Path, path: &str) -> Result<std
 
 #[derive(Debug, PartialEq, Eq)]
 pub(super) enum OpenPathRefusal {
+    TooLong,
     ControlChar,
     Missing,
     NotFileOrDirectory,
@@ -18,6 +19,7 @@ pub(super) enum OpenPathRefusal {
 impl OpenPathRefusal {
     pub(super) fn message(&self, path: &str) -> String {
         match self {
+            Self::TooLong => "path is longer than 4096 bytes".into(),
             Self::ControlChar => format!("refused to open a path holding a control character: {path:?}"),
             Self::Missing => format!("no such file: {path}"),
             Self::NotFileOrDirectory => format!("refused to open {path}: not a regular file or a directory"),
@@ -30,6 +32,7 @@ pub(super) fn open_path_exact(
     project_dir: &std::path::Path,
     path: &str,
 ) -> Result<std::path::PathBuf, OpenPathRefusal> {
+    super::path_lookup::check_path_length(path).map_err(|_| OpenPathRefusal::TooLong)?;
     if eitri_core::agent_bridge::path_holds_control(path) {
         return Err(OpenPathRefusal::ControlChar);
     }
@@ -238,6 +241,21 @@ mod tests {
             Err(OpenPathRefusal::NotFileOrDirectory)
         );
         drop(listener);
+    }
+
+    #[test]
+    fn open_path_refuses_long_utf8_paths_without_echoing_them() {
+        let root = Path::new("/missing");
+        for path in ["x".repeat(4097), "é".repeat(2049)] {
+            assert_eq!(
+                open_path_target(root, &path),
+                Err("path is longer than 4096 bytes".into())
+            );
+            assert_eq!(open_path_exact(root, &path), Err(OpenPathRefusal::TooLong));
+        }
+        for path in ["x".repeat(4096), "é".repeat(2048)] {
+            assert_eq!(open_path_exact(root, &path), Err(OpenPathRefusal::Missing));
+        }
     }
 
     #[test]

@@ -40,6 +40,10 @@ function started(text?: string) {
   dispatch({ kind: "arrive" });
   const box = (el: Element) => {
     el.getBoundingClientRect = () => ({ top: 0, bottom: 100, left: 0, right: 100, width: 100, height: 100, x: 0, y: 0 }) as DOMRect;
+    Object.defineProperties(el, {
+      clientWidth: { configurable: true, value: 100 },
+      clientHeight: { configurable: true, value: 100 },
+    });
   };
   box(rendered.container.querySelector(".agent-ui-conversation")!);
   box(rendered.container.querySelector(".message-list")!);

@@ -1,4 +1,5 @@
 import type { PathRef } from "../paths";
+import { revealedPathText } from "../revealHidden";
 /** The compact footer list of `gf` paths without a shown target when the pick opens.
  *  Full HINT labels stay reachable here, with the typed prefix marked as on the in-place labels. */
 export function PathPick({ refs, labels, typed }: { refs: PathRef[]; labels: string[]; typed: string }) {
@@ -13,7 +14,7 @@ export function PathPick({ refs, labels, typed }: { refs: PathRef[]; labels: str
             {i > 0 && " · "}
             <span className={matches ? undefined : "hint-off"}>
               {matches ? <><span className="hint-typed">{typed}</span>{label.slice(typed.length)}</> : label}
-              {` ${ref.path}${ref.line === null ? "" : `:${ref.line}`}`}
+              {` ${revealedPathText(ref.path)}${ref.line === null ? "" : `:${ref.line}`}`}
             </span>
           </span>
         );

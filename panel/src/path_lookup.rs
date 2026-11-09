@@ -179,6 +179,13 @@ fn start_worker(
     Ok(())
 }
 
+pub(super) fn check_path_length(path: &str) -> Result<(), String> {
+    if path.len() > 4096 {
+        return Err("path is longer than 4096 bytes".into());
+    }
+    Ok(())
+}
+
 pub(super) fn start(
     state: &mut AgentPanelState,
     path: String,
@@ -187,6 +194,7 @@ pub(super) fn start(
     request_id: String,
     tab: TabId,
 ) -> Result<(), String> {
+    check_path_length(&path)?;
     let root = state.project_dir.clone();
     let limits = state.path_lookup.limits;
     let request = Request {
@@ -342,6 +350,33 @@ pub(super) fn poll(state: &mut AgentPanelState, out: &mut Outbox) {
 mod tests {
     use super::*;
     use crate::agent_panel::tests::*;
+
+    #[test]
+    fn path_lookup_refuses_oversized_paths_before_starting_work() {
+        for path in ["a".repeat(4097), "é".repeat(2049), format!("/{}", "a".repeat(4096))] {
+            let (handle, page, _) = handle_with_recording_page();
+            ask(&handle, &path);
+            let answer = response(&page).expect("an oversized open is refused synchronously");
+            assert_eq!(answer["ok"], false);
+            assert_eq!(answer["error"], "path is longer than 4096 bytes");
+            let mut state = handle.state.borrow_mut();
+            let tab = state.tabs.active();
+            assert_eq!(
+                start(&mut state, path, None, ViewId::BASE, "long".into(), tab),
+                Err("path is longer than 4096 bytes".into())
+            );
+            assert!(!state.path_lookup.is_running());
+            assert_eq!(state.path_lookup.live_workers.load(Ordering::SeqCst), 0);
+        }
+    }
+
+    #[test]
+    fn path_lookup_length_limit_counts_bytes_and_accepts_the_boundary() {
+        assert_eq!(check_path_length(&"a".repeat(4096)), Ok(()));
+        assert_eq!(check_path_length(&"é".repeat(2048)), Ok(()));
+        assert_eq!(check_path_length(""), Ok(()));
+        assert!(check_path_length(&"é".repeat(2049)).is_err());
+    }
 
     struct Project(PathBuf);
     impl Project {

@@ -287,6 +287,35 @@ function markHiddenInCode(html: string): string {
   return out;
 }
 
+/** Sanitized code may contain entity-decoded characters or nested markup. Replace only text nodes,
+ *  using fixed spans and text children, so revealing a character cannot introduce active HTML. */
+function revealCodeText(fragment: DocumentFragment): void {
+  const walker = document.createTreeWalker(fragment, NodeFilter.SHOW_TEXT);
+  const texts: Text[] = [];
+  while (walker.nextNode()) {
+    if (walker.currentNode.parentElement?.closest("code, pre, kbd, samp, tt")) texts.push(walker.currentNode as Text);
+  }
+  for (const node of texts) {
+    const parts = document.createDocumentFragment();
+    let plain = "";
+    let marked = false;
+    for (const ch of node.data) {
+      if (!isHiddenChar(ch)) { plain += ch; continue; }
+      parts.append(document.createTextNode(plain));
+      plain = "";
+      const span = document.createElement("span");
+      span.className = "code-escape";
+      span.textContent = escapeText(ch);
+      parts.append(span);
+      marked = true;
+    }
+    if (marked) {
+      parts.append(document.createTextNode(plain));
+      node.replaceWith(parts);
+    }
+  }
+}
+
 function escapeHtml(text: string): string {
   return text.replace(/[&<>"']/g, (c) =>
     ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" })[c] as string,
@@ -347,7 +376,15 @@ function draw(text: string): string {
   installSanitizeHooks();
   fencedTexts = [];
   try {
-    return DOMPurify.sanitize(wrapTables(marked.parse(text) as string), SANITIZE_CONFIG);
+    const html = wrapTables(marked.parse(text) as string);
+    if (!/<(code|pre|kbd|samp|tt)\b/i.test(html)) return DOMPurify.sanitize(html, SANITIZE_CONFIG);
+    const fragment = DOMPurify.sanitize(html, {
+      ...SANITIZE_CONFIG, RETURN_DOM_FRAGMENT: true,
+    });
+    revealCodeText(fragment);
+    const container = document.createElement("div");
+    container.append(fragment);
+    return container.innerHTML;
   } finally {
     fencedTexts = [];
   }

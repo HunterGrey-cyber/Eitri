@@ -10039,6 +10039,10 @@ describe("gx: web links on a row", () => {
   const boxOf = (el: Element, top: number, height: number) => {
     (el as HTMLElement).getBoundingClientRect = () =>
       ({ top, bottom: top + height, left: 0, right: 100, width: 100, height, x: 0, y: top }) as DOMRect;
+    Object.defineProperties(el, {
+      clientWidth: { configurable: true, value: 100 },
+      clientHeight: { configurable: true, value: height },
+    });
   };
   /** Every anchor that is not `hidden` is on screen, one below the other. */
   function boxLinks(container: HTMLElement) {

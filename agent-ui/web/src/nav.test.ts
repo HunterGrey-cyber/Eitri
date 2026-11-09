@@ -196,6 +196,10 @@ describe("permissionTarget", () => {
 function rect(el: HTMLElement, top: number, height: number, left = 0, width = 100) {
   el.getBoundingClientRect = () =>
     ({ top, bottom: top + height, left, right: left + width, width, height, x: left, y: top }) as DOMRect;
+  Object.defineProperties(el, {
+    clientWidth: { configurable: true, value: width },
+    clientHeight: { configurable: true, value: height },
+  });
 }
 
 function hintDoc(): HTMLElement {
@@ -520,6 +524,59 @@ describe("linkClickNeedsLook: a click on a reply link whose text is not its addr
     const { a, root } = anchorWith("https://good.example/x", "https://good.example/x");
     expect(linkClickNeedsLook(a, root, null, 0)).toBeNull();
   });
+
+  it.each([
+    ["https://good.example.evil.example/", "https://good.example.evil.example/"],
+    ["mailto:person@example.com", "person@example.com"],
+    ["mailto:person@example.com", "mailto:person@example.com"],
+  ])("shows a clipped equal-text address first: %s / %s", (url, text) => {
+    const { a, root } = anchorWith(url, text);
+    const outer = document.createElement("div");
+    const table = document.createElement("div");
+    outer.style.overflow = "hidden";
+    table.style.overflowX = "auto";
+    a.replaceWith(outer);
+    outer.append(table);
+    table.append(a);
+    rect(root, 0, 200, 0, 500);
+    rect(outer, 0, 100, 0, 400);
+    rect(table, 0, 100, 0, 300);
+    rect(a, 10, 20, 0, 300);
+    expect(linkClickNeedsLook(a, root, null, 0)).toBeNull();
+    for (const clip of [table, outer, root]) {
+      rect(clip, 0, 100, 0, 150);
+      expect(linkClickNeedsLook(a, root, null, 0)).toBe(url);
+      if (url.startsWith("https:")) expect(linkOpensAtOnce({ el: a, url }, root)).toBe(false);
+      rect(clip, 0, 200, 0, 500);
+    }
+    rect(a, -1, 20, 0, 100);
+    expect(linkClickNeedsLook(a, root, null, 0)).toBe(url);
+  });
+
+  it.each(["https://good.example.evil.example/", "mailto:person@example.com"])(
+    "shows an address clipped by a scroller's border or scrollbar first: %s", (url) => {
+      const { a, root } = anchorWith(url, url);
+      const scroller = document.createElement("div");
+      scroller.style.overflow = "auto";
+      a.replaceWith(scroller);
+      scroller.append(a);
+      rect(root, 0, 300, 0, 500);
+      rect(scroller, 10, 100, 20, 300);
+      Object.defineProperties(scroller, {
+        clientLeft: { value: 5 }, clientTop: { value: 3 },
+        clientWidth: { value: 280 }, clientHeight: { value: 80 },
+      });
+      rect(a, 13, 20, 25, 280);
+      expect(linkClickNeedsLook(a, root, null, 0)).toBeNull();
+      for (const [top, height, left, width] of [
+        [13, 20, 25, 281], [13, 20, 24, 280], [12, 20, 25, 280], [74, 20, 25, 280],
+      ]) {
+        rect(a, top, height, left, width);
+        expect(linkClickNeedsLook(a, root, null, 0)).toBe(url);
+        if (url.startsWith("https:")) expect(linkOpensAtOnce({ el: a, url }, root)).toBe(false);
+      }
+    },
+  );
 
   it("shows the normalized address of a link that says something else", () => {
     for (const [href, text, url] of [

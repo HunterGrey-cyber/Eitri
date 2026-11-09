@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { phoneTitle, backgroundSegment, bandLayout, cutFlash, bandLayoutSteady, cardSummary, liveTasks, taskWords, tasksLine, textWidth, usageSegment, RETURN_COOLDOWN_MS, RETURN_MARGIN, type BandFacts, type LayoutHold } from "./band";
+import { phoneTitle, backgroundSegment, bandLayout, closingPath, cutFlash, bandLayoutSteady, cardSummary, liveTasks, taskWords, tasksLine, textWidth, usageSegment, RETURN_COOLDOWN_MS, RETURN_MARGIN, type BandFacts, type LayoutHold } from "./band";
 import { applyEvent, initialState } from "./reducer";
 import { revealedPathText } from "./revealHidden";
 import { ESC_DOES_NOT_INTERRUPT_FLASH, NO_CARD_FLASH, SHORT_FLASH, TYPING_FLASH } from "./app/flashes";
@@ -880,5 +880,23 @@ describe("a segment dropped for room does not come straight back", () => {
 
   it("bandLayout without a hold is unchanged: no cells on any segment", () => {
     expect(bandLayout(facts, at(200), 7.2).some((s) => s.cells !== undefined)).toBe(false);
+  });
+});
+
+it("finds no closing path in a long slash-free flash", () => {
+  expect(closingPath("a".repeat(200_000))).toBeNull();
+});
+
+it.each([
+  ["no such file: a/b  ", 14],
+  ["no such file: a/b\n\t", 14],
+  ["x /", 2],
+  ["x a/b c", null],
+  ["\u00a0a/b\u2028", 1],
+  ["   ", null],
+  ["", null],
+])("keeps the closing word and its trailing whitespace: %j", (text, start) => {
+  expect(closingPath(text)).toEqual(start === null ? null : {
+    text: text.slice(0, start) + revealedPathText(text.slice(start)), start,
   });
 });

@@ -2,7 +2,7 @@
 /// <reference types="vite/client" />
 import { describe, expect, it } from "vitest";
 import css from "./index.css?raw";
-import { CODE_TEXT_ATTR, codeBlockText, markdownParseCount, renderMarkdown, setMarkdownCacheChars } from "./markdown";
+import { CODE_TEXT_ATTR, codeBlockText, markdownParseCount, renderedText, renderMarkdown, setMarkdownCacheChars } from "./markdown";
 
 describe("renderMarkdown", () => {
   it("highlights a fenced block in a language it knows", () => {
@@ -524,4 +524,22 @@ it.each(["not JSON", "null", "42", "{}"])("falls back to rendered code for an in
   block.innerHTML = "<code>visible code</code>";
   block.setAttribute(CODE_TEXT_ATTR, value);
   expect(codeBlockText(block)).toBe("visible code");
+});
+
+it.each([
+  "`a\u200bb`",
+  "<code>a\u200bb</code>",
+  "<code>a&#x200b;b</code>",
+  "<pre>a\u200bb</pre>",
+  "<kbd>a\u200bb</kbd>",
+  "<samp>a\u200bb</samp>",
+  "<tt>a\u200bb</tt>",
+  '<pre><code><span class="hljs-string">a\u200bb</span></code></pre>',
+  "<code>a<code>\u200b</code>b</code>",
+])("reveals hidden code characters in %s and copies the shown row text", (md) => {
+  const el = document.createElement("div");
+  el.innerHTML = renderMarkdown(md);
+  expect(el.querySelectorAll(".code-escape")).toHaveLength(1);
+  expect(el.querySelector("code, pre, kbd, samp, tt")!.textContent).toBe("a⟨U+200B⟩b");
+  expect(renderedText(el).trim()).toBe("a⟨U+200B⟩b");
 });

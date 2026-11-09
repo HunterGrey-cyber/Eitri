@@ -318,12 +318,17 @@ export function textWidth(text: string): number {
 /** Where a flash's closing path starts and the flash with that path made visible: `path` when the caller names it
  *  (the text ends with it, already drawn visible), else the flash's last run of non-space text holding a `/`, with the
  *  spaces after it, which `revealedPathText` writes as escapes. `null` when it ends in no path. */
-function closingPath(text: string, path?: string): { text: string; start: number } | null {
+export function closingPath(text: string, path?: string): { text: string; start: number } | null {
   if (path !== undefined && path !== "" && text.endsWith(path)) return { text, start: text.length - path.length };
-  const m = /\S*\/\S*\s*$/u.exec(text);
-  if (m === null || !m[0].includes("/")) return null;
-  const start = m.index;
-  return { text: text.slice(0, start) + revealedPathText(m[0]), start };
+  let start = text.length;
+  while (start > 0 && /\s/u.test(text[start - 1])) start--;
+  let slash = false;
+  while (start > 0 && !/\s/u.test(text[start - 1])) {
+    start--;
+    if (text[start] === "/") slash = true;
+  }
+  if (!slash) return null;
+  return { text: text.slice(0, start) + revealedPathText(text.slice(start)), start };
 }
 
 /** A flash that ends in a path (`path`, or its last word holding a `/`), with the spaces that end the path made visible,
