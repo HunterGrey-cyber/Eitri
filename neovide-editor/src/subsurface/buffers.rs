@@ -540,10 +540,27 @@ impl<S: SlotSource, B: Destroy, P: Destroy> Pool<S, B, P> {
         // refused from now on, and the ones already made stay until their buffer goes, so a committed one is still
         // released.
         if key.view != 0 {
-            if self.entries.iter().any(|e| e.key == BufferKey { view: 0, ..key }) {
-                self.views_refused = true;
+            let own = BufferKey { view: 0, ..key };
+            let Some(i) = self.entries.iter().position(|e| e.key == own) else {
+                return PoolChange::None;
+            };
+            self.views_refused = true;
+            // A failed import holds no reference to the dmabuf, and the compositor may never release it: a commit of
+            // it held nothing, so the buffer is free once nothing else holds it, as at a release.
+            let e = &mut self.entries[i];
+            let bit = 1u8 << ((key.view - 1) & 3);
+            if e.views_held & bit == 0 {
+                return PoolChange::None;
             }
-            return PoolChange::None;
+            e.views_held &= !bit;
+            if e.held() {
+                return PoolChange::None;
+            }
+            self.source.set_busy(self.entries[i].slot, false);
+            if self.entries[i].retire {
+                self.remove(i);
+            }
+            return PoolChange::Freed;
         }
         if let Some(i) = self.entries.iter().position(|e| e.key == key) {
             if let Some(params) = self.entries[i].params.take() {
@@ -1327,6 +1344,29 @@ mod tests {
             "no view is tried again"
         );
         assert!(p.views(slot).is_none());
+    }
+
+    #[test]
+    fn a_committed_view_that_fails_holds_its_buffer_no_longer() {
+        let (mut p, mut r, slot, key, views) = with_views();
+        p.submit(slot);
+        p.views_committed(slot, 0b0100);
+        assert_eq!(p.released(key), PoolChange::None, "the committed view still holds it");
+        assert_ne!(p.acquire(&mut r, (900, 400)), Acquire::Ready(slot));
+        // Its import fails: no release will come, and none is needed.
+        assert_eq!(p.failed(views[2]), PoolChange::Freed);
+        assert_eq!(p.acquire(&mut r, (900, 400)), Acquire::Ready(slot));
+        // A second failure of the same view frees nothing twice.
+        assert_eq!(p.failed(views[2]), PoolChange::None);
+        // A failed view whose buffer is retired takes the buffer with it once nothing else holds it.
+        let (mut p, mut r, slot, key, views) = with_views();
+        p.submit(slot);
+        p.views_committed(slot, 0b0001);
+        assert_eq!(p.released(key), PoolChange::None);
+        p.acquire(&mut r, (100, 100));
+        assert!(p.entries.iter().any(|e| e.slot == slot && e.retire));
+        assert_eq!(p.failed(views[0]), PoolChange::Freed);
+        assert!(!p.entries.iter().any(|e| e.slot == slot));
     }
 
     #[test]

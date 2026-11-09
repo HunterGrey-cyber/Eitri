@@ -614,8 +614,10 @@ pub(crate) struct Child<R: ChildRequests> {
     underlay_sent: bool,
     /// Set when that change replaced a buffer, which the next `after_paint` releases.
     underlay_retired: bool,
-    /// The corner patches were made (a viewporter) and are not destroyed.
+    /// The corner patches were made (a viewporter) and are in use.
     corners: bool,
+    /// The patches gave the corners to the underlay; they stay, unmapped, until the child is destroyed.
+    corners_parked: bool,
     /// What each patch has been sent (the compositor keeps it while the patch has no buffer), in `Corner::ALL` order.
     corner_sent: [Option<CornerPatch>; 4],
     /// Which patches show the child's current buffer.
@@ -686,6 +688,7 @@ impl<R: ChildRequests> Child<R> {
             underlay_sent: false,
             underlay_retired: false,
             corners,
+            corners_parked: false,
             corner_sent: [None; 4],
             corner_mapped: [false; 4],
             shown: None,
@@ -721,15 +724,18 @@ impl<R: ChildRequests> Child<R> {
         self.corners
     }
 
-    /// Takes the corner patches down for the underlay, once a frame without views has taken every patch's view
-    /// away (the pool refused views). True when it did; the underlay then shows with the next change sent to it,
-    /// which `take_underlay_sent` reports.
+    /// Gives the corners to the underlay, once a frame without views has taken every patch's view away (the pool
+    /// refused views). True when it did; the underlay then shows with the next change sent to it, which
+    /// `take_underlay_sent` reports. The patches stay, null-attached and so unmapped (an unmapped surface is not
+    /// drawn, so it hides nothing under a compositor that draws breadth first), until the child is destroyed: this
+    /// frame may be a transaction whose null attaches are still cached, and a patch destroyed now would leave the
+    /// screen before them.
     pub(crate) fn corners_to_underlay(&mut self) -> bool {
         if !self.corners || !self.is_ready() || self.corner_mapped.iter().any(|mapped| *mapped) {
             return false;
         }
-        self.requests.destroy_corners();
         self.corners = false;
+        self.corners_parked = true;
         self.corner_sent = [None; 4];
         self.corner_views = 0;
         self.underlay = self.viewporter && self.requests.create_underlay();
@@ -1030,7 +1036,7 @@ impl<R: ChildRequests> Child<R> {
         if self.underlay {
             self.requests.destroy_underlay();
         }
-        if self.corners {
+        if self.corners || self.corners_parked {
             self.requests.destroy_corners();
         }
         if self.ready {
@@ -2402,10 +2408,9 @@ mod tests {
         assert_eq!(source.committed, vec![0b1111, 0]);
         let sent = take(&child);
         let commit = sent.iter().position(|r| *r == Commit).unwrap();
-        let destroyed = sent.iter().position(|r| *r == DestroyCorners).unwrap();
         assert!(
-            commit < destroyed,
-            "the null attaches are committed before the patches go: {sent:?}"
+            !sent.contains(&DestroyCorners),
+            "the patches stay, unmapped, while their null attaches may be cached in a transaction: {sent:?}"
         );
         assert!(
             sent[..commit]
@@ -2414,16 +2419,34 @@ mod tests {
                 .count()
                 == 4
         );
-        assert!(sent[destroyed..].contains(&CreateUnderlay) && sent.contains(&UnderlayCommit));
+        assert!(sent[commit..].contains(&CreateUnderlay) && sent.contains(&UnderlayCommit));
         assert!(!child.has_corners() && child.has_underlay());
         assert!(
             child.take_underlay_sent(),
             "the pane asks GDK for the parent commit that shows it"
         );
-        // Afterwards no views are asked for or committed.
+        // Afterwards no views are asked for or committed, and the patches are sent nothing.
         source.refused = false;
+        take(&child);
         child.present_with_views(&mut source, SLOT, &o.buffer, (1280, 1024), &p, PaneId(3));
         assert_eq!(source.committed.last(), Some(&0));
+        assert!(!take(&child).iter().any(|r| matches!(
+            r,
+            CornerRect(..) | CornerSource(..) | CornerAttach(..) | CornerAttachNull(_) | CornerCommit(_)
+        )));
+        // They go with the child, after the underlay and before the child's own objects.
+        let sent = child.requests.sent.clone();
+        child.destroy();
+        assert_eq!(
+            *sent.borrow(),
+            vec![
+                DestroyUnderlay,
+                DestroyCorners,
+                DestroySubsurface,
+                DestroyViewport,
+                DestroySurface
+            ]
+        );
     }
 
     #[test]
