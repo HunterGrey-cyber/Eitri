@@ -1,5 +1,5 @@
 [English](keys.md) | 简体中文
-<!-- translated-from: keys.md sha256=44a5899f8c3d3b4524c5057622c1741d625bc6c26c685d7ba68973a7091858d2 -->
+<!-- translated-from: keys.md sha256=a3b1bdf31f896f0785fe277f5bee39ae6dbeb4f604875cda3792c4f3ac9b5b62 -->
 
 # 按键
 
@@ -217,7 +217,7 @@ companion 窗口（见 [Companion 模式](companion.zh-CN.md)）没有自己的�
 | `<prefix> Alt+a` / `Alt+d` | 选中当前所选之物的父容器 / 回到拿着按键的那个子项（i3 的 `focus parent` 和 `focus child`） |
 | `<prefix> Alt+Enter` | 在拿着按键的模块右边打开一个新的终端；它的 shell 从项目根目录启动 |
 
-如果你的 i3 或 sway 的 `$mod` 是 Alt，这些组合键会先被窗口管理器拿走，Eitri 看不到。Eitri 在启动时会查出这一点（先看正在运行的窗口管理器的配置，否则读它的配置文件），只要你的 `init.lua` 没有设置或删除其中任何一个键，就为这个窗口把它们移开，和 [`docs/keymap/i3-alt-mod.lua`](../keymap/i3-alt-mod.lua) 做的一样，并说一次：`sway's $mod is Alt, so Eitri moved its Alt keys after the prefix to Ctrl+Alt for this window`。在 `init.lua` 里写 `eitri.keymap.use("i3-alt")` 会让这些改动成为你自己的；你自己设置或删除其中任何一个键，它就不再这样做。`?` 清单会标出被移开的行。这个文件会把被拿走的那些行移开：每一行保留原来的键并加上 Ctrl（`<prefix> Ctrl+Alt+w`、`Ctrl+Alt+Enter`，等等）。键里带 Shift 的那几行则去掉 Shift，而不是保留它：Eitri 不把 Ctrl+Shift+<字符> 当作组合键来读，所以四个移动键（`Alt+H`、`Alt+J`、`Alt+K`、`Alt+L`）变成 `<prefix> Ctrl+Alt+h`、`Ctrl+Alt+j`、`Ctrl+Alt+k`、`Ctrl+Alt+l`，移入便笺板那一行（`Alt+_`）只是删掉，因为 `<prefix> _` 已经做这件事；浮动切换（`Alt+Shift+Space`）变成 `<prefix> Ctrl+Alt+Space`，因为在很多环境里 Ctrl+Shift+Space 是切换输入法的键。把它粘贴进你的 `init.lua`。
+如果你的 i3 或 sway 的 `$mod` 是 Alt，这些组合键会先被窗口管理器拿走，Eitri 看不到。Eitri 在启动时会查出这一点（先看正在运行的窗口管理器的配置，否则读它的配置文件），只要你的 `init.lua` 没有设置或删除其中任何一个键，你的 tmux 配置（经 `keymap.from_tmux` 读入）也没有绑定或解绑其中任何一个，就为这个窗口把它们移开，和 [`docs/keymap/i3-alt-mod.lua`](../keymap/i3-alt-mod.lua) 做的一样，并说一次：`sway's $mod is Alt, so Eitri moved its Alt keys after the prefix to Ctrl+Alt for this window`。在 `init.lua` 里写 `eitri.keymap.use("i3-alt")` 会让这些改动成为你自己的；你自己设置或删除其中任何一个键，它就不再这样做。`?` 清单会标出被移开的行。这个文件会把被拿走的那些行移开：每一行保留原来的键并加上 Ctrl（`<prefix> Ctrl+Alt+w`、`Ctrl+Alt+Enter`，等等）。键里带 Shift 的那几行则去掉 Shift，而不是保留它：Eitri 不把 Ctrl+Shift+<字符> 当作组合键来读，所以四个移动键（`Alt+H`、`Alt+J`、`Alt+K`、`Alt+L`）变成 `<prefix> Ctrl+Alt+h`、`Ctrl+Alt+j`、`Ctrl+Alt+k`、`Ctrl+Alt+l`，移入便笺板那一行（`Alt+_`）只是删掉，因为 `<prefix> _` 已经做这件事；浮动切换（`Alt+Shift+Space`）变成 `<prefix> Ctrl+Alt+Space`，因为在很多环境里 Ctrl+Shift+Space 是切换输入法的键。把它粘贴进你的 `init.lua`。
 
 **标签页和堆叠。** 点一下标题，或者按 `f` 再输入标题的标签（HINT 会给每个标题标上标签），就能把那个模块带到前面并让它拿到按键。用键盘的话，在标签页式容器里 `Ctrl+h` / `Ctrl+l` 移到左边 / 右边的标签页，在堆叠式容器里 `Ctrl+k` / `Ctrl+j` 移到上面 / 下面那一个；那个方向没有标签页时，它们就像在模块之间一样继续往外走。拿着按键的模块永远是显示出来的那个，所以隐藏或关闭它会把按键交给接着显示的标签页。没有显示的标签页照常运行：那里的终端继续输出，回来时能看到这些行；聊天保持着它的会话。不在显示中的标签页上的聊天，在有卡片等待时，标题上带着 `agent ⚑N`；`modules.chat.on_permission` 设为 `"reveal"` 时，新卡片会把它的标签页带到前面，除非按键正在同一容器的另一个标签页上：那时你只会看到提示，什么都不动。
 

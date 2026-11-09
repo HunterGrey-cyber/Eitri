@@ -1271,6 +1271,24 @@ mod tests {
         assert!(count > 0);
     }
 
+    /// A shipped page's title is what the empty tab's Pages row, its load toast, its top-bar chip and its page
+    /// window's title show; two pages with one title would be told apart only by their summaries.
+    #[test]
+    fn every_shipped_manifest_has_its_own_title() {
+        let shipped = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../plugins");
+        let mut titles = std::collections::BTreeMap::new();
+        for entry in std::fs::read_dir(shipped).unwrap() {
+            let path = entry.unwrap().path().join("eitri-plugin.toml");
+            if path.is_file() {
+                let manifest = parse_manifest(&std::fs::read_to_string(&path).unwrap()).unwrap();
+                if let Some(other) = titles.insert(manifest.title.clone(), manifest.id.clone()) {
+                    panic!("{} and {other} are both titled {:?}", manifest.id, manifest.title);
+                }
+            }
+        }
+        assert!(titles.len() > 1);
+    }
+
     const EXAMPLE: &str = include_str!("testdata/demo-manifest.toml");
 
     const WINDOW_BASE: &str = r#"id = "demo"

@@ -81,6 +81,18 @@ describe("the pass", () => {
     expect(root.querySelector(".hint")?.textContent).toBe("Enter or prefix u to start");
   });
 
+  it("waits_with_no_key_are_counted_but_offer_no_start", () => {
+    // A row without a key is no stop a round can visit: the counts say it waits, and the line offers no ticket and no
+    // way to start, since Enter and prefix u would start nothing.
+    const { root, strip } = mount(fakeStore([row("", "card"), row("d", "running")]).store);
+    expect(root.hidden).toBe(false);
+    expect([...root.querySelectorAll(".count")].map((c) => c.textContent)).toEqual(["⚑ 1"]);
+    expect(shown(root)).toEqual([]);
+    expect(strip.order()).toEqual([]);
+    expect(root.querySelector(".hint")).toBeNull();
+    expect([...root.children].map((c) => c.className)).toEqual(["counts"]);
+  });
+
   it("nothing_waiting_and_no_round_hides_the_strip", () => {
     const { root } = mount(fakeStore([row("a", "running"), row("b", "idle"), row("c", "failed")]).store);
     expect(root.hidden).toBe(true);

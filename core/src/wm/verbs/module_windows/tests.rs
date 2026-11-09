@@ -1712,10 +1712,29 @@ fn with_the_pass() -> (Rig, ModuleId) {
     with_the_pass_in(layout)
 }
 
+/// The pass's own rule: `above` at 28 px, without the keys.
+fn the_pass_rule() -> crate::layout::rules::OpenRule {
+    use crate::layout::rules::{At, OpenRule, RuleSize};
+    OpenRule {
+        at: Some(At::Beside(Direction::Up)),
+        size: Some(RuleSize::Pixels(28)),
+        focus: false,
+        ..OpenRule::default()
+    }
+}
+
 /// [`with_the_pass`] over `layout`, its keys where `layout` has them.
 fn with_the_pass_in(layout: Layout) -> (Rig, ModuleId) {
-    use crate::layout::rules::{At, OpenRule, RuleSize};
-    use crate::layout::Workspaces;
+    let (r, pass, _) = with_the_pass_ruled(layout, the_pass_rule(), crate::layout::Workspaces::single());
+    (r, pass)
+}
+
+/// [`with_the_pass_in`] with The pass's rule `rule` and the window's workspaces `workspaces`, which it returns.
+fn with_the_pass_ruled(
+    layout: Layout,
+    rule: crate::layout::rules::OpenRule,
+    workspaces: crate::layout::Workspaces,
+) -> (Rig, ModuleId, Rc<std::cell::RefCell<crate::layout::Workspaces>>) {
     use crate::wm::module::SurfaceDecl;
     use std::cell::RefCell;
     let pass = ModuleId::lua("agents-pass");
@@ -1733,6 +1752,7 @@ fn with_the_pass_in(layout: Layout) -> (Rig, ModuleId) {
         deferred: true,
     });
     let layout = Rc::new(RefCell::new(layout));
+    let workspaces = Rc::new(RefCell::new(workspaces));
     controller.open_window(
         WIN,
         WindowSpec {
@@ -1742,22 +1762,14 @@ fn with_the_pass_in(layout: Layout) -> (Rig, ModuleId) {
         },
         WindowParts {
             layout: layout.clone(),
-            workspaces: Rc::new(RefCell::new(Workspaces::single())),
+            workspaces: workspaces.clone(),
             saver: None,
         },
     );
     controller.set_module_setup(
         WIN,
         crate::wm::verbs::modules::ModuleSetup {
-            start_hidden: vec![(
-                pass.clone(),
-                Some(OpenRule {
-                    at: Some(At::Beside(Direction::Up)),
-                    size: Some(RuleSize::Pixels(28)),
-                    focus: false,
-                    ..OpenRule::default()
-                }),
-            )],
+            start_hidden: vec![(pass.clone(), Some(rule))],
             ..Default::default()
         },
     );
@@ -1772,7 +1784,179 @@ fn with_the_pass_in(layout: Layout) -> (Rig, ModuleId) {
             first,
         },
         pass,
+        workspaces,
     )
+}
+
+/// The pinned length `id`'s tile carries in `con`, wherever it sits; `None` when it has none or is not a tile there.
+fn fixed_px_of(con: &crate::layout::Con, id: &ModuleId) -> Option<i32> {
+    con.children.iter().find_map(|child| match &child.node {
+        Node::Leaf(m) if m == id => child.fixed_px,
+        Node::Con(inner) => fixed_px_of(inner, id),
+        _ => None,
+    })
+}
+
+fn notes_with(r: &Rig, part: &str) -> usize {
+    r.controller
+        .notes(WIN)
+        .iter()
+        .filter(|note| note.contains(part))
+        .count()
+}
+
+/// Placed hidden in the window's other workspaces, The pass gets its rule's 28 px there too: placed without them it
+/// would take a third of the window's height the first time it showed in one of them.
+#[test]
+fn the_pass_placed_hidden_in_another_workspace_keeps_its_rule_s_length() {
+    let layout = {
+        let mut layout = editor_and_terminal();
+        layout.set_focus(&ModuleId::terminal()).unwrap();
+        layout
+    };
+    let mut workspaces = crate::layout::Workspaces::single();
+    let other = workspaces.create_copy(&layout);
+    let (mut r, pass, workspaces) = with_the_pass_ruled(layout, the_pass_rule(), workspaces);
+    r.controller.wait_follow(WIN, &pass, true);
+    assert_eq!(fixed_px_of(r.layout.borrow().root(), &pass), Some(28), "here");
+    let workspaces = workspaces.borrow();
+    let stored = workspaces.stored(&other).expect("the other workspace");
+    assert!(stored.hidden().contains(&pass), "hidden there");
+    assert_eq!(
+        fixed_px_of(stored.root(), &pass),
+        Some(28),
+        "there: {:?}",
+        stored.root()
+    );
+}
+
+/// Behind a zoom the person set, a show because agents wait draws no tab: with The pass a tab of the zoomed editor,
+/// drawing it would leave the editor on an undrawn tab, the keys on it once the zoom ended, and the next show anywhere
+/// ending the zoom by itself. The tab is drawn when the person asks (the editor's follow command, which ends the zoom).
+#[test]
+fn a_wait_show_behind_a_zoom_switches_no_tab() {
+    let tab = crate::layout::rules::OpenRule {
+        at: Some(crate::layout::rules::At::Tab),
+        focus: false,
+        ..crate::layout::rules::OpenRule::default()
+    };
+    let (mut r, pass, _) = with_the_pass_ruled(editor_and_terminal(), tab, crate::layout::Workspaces::single());
+    assert_eq!(
+        *r.layout.borrow().focus(),
+        ModuleId::editor(),
+        "the setup: the keys on the editor"
+    );
+    assert_eq!(
+        r.layout.borrow_mut().toggle_zoom(&ModuleId::editor()),
+        crate::layout::ZoomChange::Zoomed
+    );
+    for round in 0..2 {
+        r.controller.wait_follow(WIN, &pass, true);
+        let layout = r.layout.borrow();
+        assert!(layout.is_shown(&pass), "round {round}: {:?}", layout.root());
+        assert!(
+            !layout.is_tabbed_away(&ModuleId::editor()),
+            "round {round}: the editor's tab stays drawn"
+        );
+        assert_eq!(
+            layout.zoomed(),
+            Some(&ModuleId::editor()),
+            "round {round}: the zoom stands"
+        );
+        assert_eq!(*layout.focus(), ModuleId::editor());
+        drop(layout);
+        r.controller.wait_follow(WIN, &pass, false);
+    }
+    r.controller.wait_follow(WIN, &pass, true);
+    r.layout.borrow_mut().unzoom();
+    let layout = r.layout.borrow();
+    assert!(
+        !layout.is_tabbed_away(&ModuleId::editor()),
+        "the keys' module is drawn once the zoom ends"
+    );
+    assert!(layout.is_visible(&ModuleId::editor()));
+}
+
+/// The log line of a show because agents wait names where the module went: beside the editor, the window's edge
+/// when no editor is on screen, or its float.
+#[test]
+fn a_wait_show_s_log_line_names_where_the_module_went() {
+    let (mut r, pass) = with_the_pass();
+    r.controller.wait_follow(WIN, &pass, true);
+    assert_eq!(
+        notes_with(&r, "opened by its rule beside the editor, since agents wait"),
+        1
+    );
+
+    let mut layout = editor_and_terminal();
+    crate::layout::place_as_tab(&mut layout, &agent(), &ModuleId::editor(), true).unwrap();
+    layout.set_focus(&agent()).unwrap();
+    let (mut tabbed, pass) = with_the_pass_in(layout);
+    tabbed.controller.wait_follow(WIN, &pass, true);
+    assert_eq!(
+        notes_with(
+            &tabbed,
+            "opened by its rule at the window's top edge, since agents wait"
+        ),
+        1,
+        "{:?}",
+        tabbed.controller.notes(WIN)
+    );
+    assert_eq!(notes_with(&tabbed, "beside the editor"), 0);
+
+    let float = crate::layout::rules::OpenRule {
+        float: true,
+        focus: false,
+        ..crate::layout::rules::OpenRule::default()
+    };
+    let (mut floated, pass, _) = with_the_pass_ruled(editor_and_terminal(), float, crate::layout::Workspaces::single());
+    floated.controller.wait_follow(WIN, &pass, true);
+    assert!(floated.layout.borrow().is_floating(&pass));
+    assert_eq!(
+        notes_with(&floated, "opened by its rule as its rule's float, since agents wait"),
+        1,
+        "{:?}",
+        floated.controller.notes(WIN)
+    );
+}
+
+/// A show because agents wait is not the person's: a zoom they set stands. The pass goes where it would have gone,
+/// behind the zoom, and comes on screen when the zoom ends; the same for each later show after a hide.
+#[test]
+fn a_wait_show_leaves_the_person_s_zoom_standing() {
+    let (mut r, pass) = with_the_pass();
+    assert_eq!(
+        r.layout.borrow_mut().toggle_zoom(&ModuleId::terminal()),
+        crate::layout::ZoomChange::Zoomed
+    );
+    r.controller.wait_follow(WIN, &pass, true);
+    {
+        let layout = r.layout.borrow();
+        assert!(layout.is_shown(&pass), "placed");
+        assert!(!layout.is_visible(&pass), "behind the zoom");
+        assert_eq!(layout.zoomed(), Some(&ModuleId::terminal()), "the zoom stands");
+        assert_eq!(*layout.focus(), ModuleId::terminal(), "the keys stay");
+    }
+    r.controller.wait_follow(WIN, &pass, false);
+    r.controller.wait_follow(WIN, &pass, true);
+    {
+        let layout = r.layout.borrow();
+        assert!(layout.is_shown(&pass));
+        assert_eq!(
+            layout.zoomed(),
+            Some(&ModuleId::terminal()),
+            "a later show leaves it too"
+        );
+    }
+    r.layout.borrow_mut().unzoom();
+    assert!(r.layout.borrow().is_visible(&pass), "on screen once the zoom ends");
+
+    // A show the person asks for (the editor's follow command) still ends the zoom.
+    let (mut asked, pass) = with_the_pass();
+    asked.layout.borrow_mut().toggle_zoom(&ModuleId::terminal());
+    asked.controller.follow(WIN, &pass, true);
+    assert!(asked.layout.borrow().is_visible(&pass));
+    assert!(!asked.layout.borrow().is_zoomed());
 }
 
 /// Shown because an agent waits, a module that was never placed opens by its rule beside the editor, as if the editor

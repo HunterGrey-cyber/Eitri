@@ -87,7 +87,7 @@ function renderLeftSeg(
     );
   }
   return (
-    <span key={seg.id} className={`band-seg band-${seg.id}`} title={seg.id === "phone" ? phoneTitle(facts.remoteSandbox, facts.phoneDevices) : seg.id === "cards" && facts.questions ? `${facts.cards} permissions · ${facts.questions} questions` : undefined}>
+    <span key={seg.id} className={`band-seg band-${seg.id}`} title={seg.id === "phone" ? phoneTitle(facts.remoteSandbox, facts.phoneDevices) : seg.id === "cards" && facts.questions ? `${facts.cards} permissions · ${facts.questions} questions` : seg.full}>
       {seg.text}
     </span>
   );

@@ -8,9 +8,10 @@ export const TYPING_FLASH = "a / d answer a card only on their own — pause, th
 export const ESC_DOES_NOT_INTERRUPT_FLASH = "Esc does not interrupt — ctrl+c does";
 
 /** The short form the band shows of a flash too wide for its one row (`bandLayout`), tried once every segment that
- *  can go has gone and before the mode shrinks to its letter: a narrow chat (a column of a split window, a laptop at
- *  zoom 1.5) keeps one row and its composer uncovered, and still says what to do. A flash without a short form, or
- *  whose short form does not fit either, wraps as before. */
+ *  can go has gone and the whole sentence does not fit beside the mode's letter either: a narrow chat (a column of a
+ *  split window, a laptop at zoom 1.5) keeps one row and its composer uncovered, and still says what to do. The whole
+ *  sentence stays the segment's title. A flash without a short form, or whose short form does not fit either, wraps
+ *  whole. */
 export const SHORT_FLASH: ReadonlyMap<string, string> = new Map([
   [TYPING_FLASH, "pause, press again"],
   [ESC_DOES_NOT_INTERRUPT_FLASH, "ctrl+c interrupts"],

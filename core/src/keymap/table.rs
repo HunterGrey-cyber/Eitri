@@ -760,6 +760,15 @@ impl Keymap {
         }
     }
 
+    /// Whether the tmux import bound `key` or unbound it: the user's own choice, as an `init.lua` call on it is.
+    pub(super) fn tmux_chose(&self, key: &KeySpec) -> bool {
+        self.removed_by_import.contains(key)
+            || self
+                .bindings
+                .iter()
+                .any(|binding| binding.key == *key && binding.source == Source::Tmux)
+    }
+
     /// Applies the automatic bundle atomically, keeping its rows and takeovers separate from the user's own.
     pub(super) fn apply_alt_mod(&mut self, ops: &[KeymapOp]) -> bool {
         let Ok(mut map) = self.clone().then_user(ops, &[]) else {

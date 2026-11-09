@@ -4,6 +4,7 @@ import { act, cleanup, fireEvent, render } from "@testing-library/react";
 import { StatusBand } from "./StatusBand";
 import { bandLayout, type BandFacts } from "../band";
 import { UNREAD_SHOW_MS } from "../steadyBand";
+import { SHORT_FLASH, TYPING_FLASH } from "../app/flashes";
 
 afterEach(cleanup);
 
@@ -408,4 +409,18 @@ it("a tab switch starts the band's layout afresh: nothing dropped on the last ta
   rendered.rerender(<StatusBand facts={{ ...narrowA, position: "1/1", scope: 2 }} paneFocused={true} onOpenDetail={vi.fn()} onJump={vi.fn()} />);
   expect(rendered.container.querySelector(".band-model")).not.toBeNull();
   vi.useRealTimers();
+});
+
+it("a flash drawn in its short form carries the whole sentence as its title", () => {
+  const observers = stubResizeObserver();
+  const facts: BandFacts = { ...RUNNING, mode: "browse", unread: null, showcmd: null, warn: null, cards: 3, queued: 0, context: null, pill: "⏵⏵ manual", message: TYPING_FLASH };
+  const rendered = render(<StatusBand facts={facts} paneFocused={true} onOpenDetail={vi.fn()} onJump={vi.fn()} />);
+  act(() => {
+    resize(observers[0], rendered.container.querySelector(".band-measure")!, 7.2);
+    resize(observers[0], rendered.container.querySelector(".status-band")!, 37 * 7.2);
+  });
+  const message = rendered.container.querySelector<HTMLElement>(".band-message")!;
+  expect(message.textContent).toBe(SHORT_FLASH.get(TYPING_FLASH));
+  expect(message.title).toBe(TYPING_FLASH);
+  vi.unstubAllGlobals();
 });

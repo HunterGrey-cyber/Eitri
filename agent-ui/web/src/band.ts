@@ -25,6 +25,9 @@ export type Seg = {
    *  given a `reserve` by `bandLayoutSteady`, so its text changing does not move the segments beside it. Counted
    *  in place of the text's own width when it is wider. Absent everywhere else. */
   cells?: number;
+  /** Set only on `"message"` while it shows its short form (`SHORT_FLASH`): the whole sentence, which the short
+   *  form leaves words out of, for `StatusBand` to carry as the segment's title. */
+  full?: string;
 };
 
 /** What the band has to say this render, gathered by `App.tsx` from state that already exists
@@ -474,7 +477,7 @@ export function bandLayoutSteady(
   const short = f.message === null ? undefined : SHORT_FLASH.get(f.message);
   const letter = (s: Seg[]) => s.map((x) => (x.id === "mode" ? { ...x, text: MODE_LETTER[f.mode] } : x));
   if (width(segs) > budget && short !== undefined && width(letter(segs)) > budget) {
-    const shortened = segs.map((x) => (x.id === "message" ? { ...x, text: short } : x));
+    const shortened = segs.map((x) => (x.id === "message" ? { ...x, text: short, full: x.text } : x));
     if (width(shortened) <= budget || width(letter(shortened)) <= budget) segs = shortened;
   }
   // The mode shrinks to its letter last. Not for a flash that wraps anyway: five characters of mode

@@ -422,11 +422,7 @@ pub fn open_by_rule_at(
             layout.hide_unfocused(&ModuleId::editor())?;
         }
     }
-    match rule.size {
-        Some(RuleSize::Share(share)) => notes.extend(set_share(layout, id, share)),
-        Some(RuleSize::Pixels(px)) => set_fixed_length(layout, id, px),
-        _ => {}
-    }
+    notes.extend(apply_tiled_size(layout, id, rule.size));
     if takes_keys {
         layout.set_focus(id)?;
     } else if let Some(k) = keys {
@@ -439,6 +435,20 @@ pub fn open_by_rule_at(
         stowed: false,
         notes,
     })
+}
+
+/// A rule's tiled `size` for `id`, a tile `layout` holds: its share of its container, or its length in pixels along
+/// the container's axis. A float's size, or none, changes nothing; a share that would push a sibling below the
+/// smallest one is refused with a note.
+pub fn apply_tiled_size(layout: &mut Layout, id: &ModuleId, size: Option<RuleSize>) -> Vec<String> {
+    match size {
+        Some(RuleSize::Share(share)) => set_share(layout, id, share),
+        Some(RuleSize::Pixels(px)) => {
+            set_fixed_length(layout, id, px);
+            Vec::new()
+        }
+        _ => Vec::new(),
+    }
 }
 
 /// A rule's float, scratchpad or share for `id`, which a first launch has just placed tiled (sized against `grid`,

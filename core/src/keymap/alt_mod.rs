@@ -81,12 +81,16 @@ fn touched_key(op: &KeymapOp) -> Option<KeySpec> {
 }
 
 /// A single user choice anywhere in the moved set keeps the whole bundle in the user's hands. Expanded `use` calls
-/// touch those same keys, so they opt out too. Even a call left out at startup remains an explicit choice.
+/// touch those same keys, so they opt out too. Even a call left out at startup remains an explicit choice. A key the
+/// tmux import bound or unbound is a choice too: applied over it, the bundle would delete or replace the user's own
+/// tmux binding without a word.
 pub fn apply(map: &mut Keymap, answer: Option<Answer>, user: &[KeymapOp]) -> Option<Applied> {
     let answer = answer.filter(|answer| answer.modifier == Some(WmMod::Alt))?;
     let ops = bundles::bundle("i3-alt").expect("the built-in bundle exists");
     let moved: Vec<_> = ops.iter().filter_map(touched_key).collect();
-    if user.iter().filter_map(touched_key).any(|key| moved.contains(&key)) {
+    if user.iter().filter_map(touched_key).any(|key| moved.contains(&key))
+        || moved.iter().any(|key| map.tmux_chose(key))
+    {
         return None;
     }
     if !map.apply_alt_mod(&ops) {
@@ -151,6 +155,30 @@ mod tests {
         assert!(map.user_overrides().is_empty());
         let keys = crate::layout::ModuleKeys::build(&[], &map).unwrap();
         assert!(map.help(&keys).iter().any(|row| row.what.contains("Alt $mod")));
+    }
+
+    /// The tmux import's rows on a moved key are the user's, as `init.lua`'s are: the bundle leaves the whole table as
+    /// it is. A tmux config that touches none of them still gets it.
+    #[test]
+    fn alt_mod_leaves_a_keymap_whose_tmux_import_touched_a_moved_key() {
+        let imported = |conf: &str| {
+            let home = crate::test_scratch_dir::ScratchDir::new("eitri-tmux", "alt-mod");
+            std::fs::write(home.join(".tmux.conf"), conf).unwrap();
+            let read = crate::keymap::tmux::read(&crate::keymap::tmux::tests::env_for(&home));
+            Keymap::with_tmux(&read, &crate::keymap::LuaClaims::default()).0
+        };
+        for conf in [
+            "bind M-1 select-layout tiled\n",
+            "unbind M-H\n",
+            "bind -r M-Up resize-pane -U 5\n",
+        ] {
+            let mut map = imported(conf);
+            let before = map.clone();
+            assert_eq!(apply(&mut map, alt(), &[]), None, "{conf}");
+            assert_eq!(map, before, "{conf}");
+        }
+        let mut map = imported("bind M-y select-layout tiled\nunbind z\n");
+        assert!(apply(&mut map, alt(), &[]).is_some());
     }
 
     #[test]

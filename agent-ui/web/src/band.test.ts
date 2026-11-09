@@ -287,6 +287,20 @@ describe("a y/n prompt or a flash is never truncated", () => {
     expect(wide.find((s) => s.id === "mode")!.text).toBe("BROWSE");
   });
 
+  /* A short form drops words a person may want (the guard's "i or Ctrl+j to type"), so the shown segment keeps the
+     whole sentence for `StatusBand`'s title; a flash shown whole carries none. */
+  it("a flash shown in its short form keeps its whole text for the title, a whole one carries none", () => {
+    const narrow = { ...idle, pill: "⏵⏵ manual", cards: 3, message: TYPING_FLASH };
+    const short = bandLayout(narrow, 37 * 7.2, 7.2).find((s) => s.id === "message")!;
+    expect(short.text).toBe(SHORT_FLASH.get(TYPING_FLASH));
+    expect(short.full).toBe(TYPING_FLASH);
+    expect(bandLayout(narrow, 160 * 7.2, 7.2).find((s) => s.id === "message")!.full).toBeUndefined();
+    // Wrapped whole (not even the short form fits): the text is the whole sentence already.
+    const wrapped = bandLayout(narrow, 12 * 7.2, 7.2).find((s) => s.id === "message")!;
+    expect(wrapped.text).toBe(TYPING_FLASH);
+    expect(wrapped.full).toBeUndefined();
+  });
+
   it("Esc's reminder keeps one row in a narrow chat too", () => {
     const segs = bandLayout({ ...idle, pill: "⏵⏵ manual", message: ESC_DOES_NOT_INTERRUPT_FLASH }, 36 * 7.2, 7.2);
     const message = segs.find((s) => s.id === "message")!;

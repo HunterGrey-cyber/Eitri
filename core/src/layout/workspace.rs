@@ -520,11 +520,20 @@ impl Workspaces {
 
     /// Adds a hidden module at `placement` in each stored workspace that lacks it.
     pub fn add_everywhere_at(&mut self, id: &ModuleId, placement: Placement) {
+        self.add_everywhere_sized(id, placement, None);
+    }
+
+    /// [`Workspaces::add_everywhere_at`], each copy given `size` (a rule's tiled size) as the current workspace's
+    /// copy was: a copy placed without it takes a default share there, so a one-line strip shown in another
+    /// workspace would come up a third of the window tall.
+    pub fn add_everywhere_sized(&mut self, id: &ModuleId, placement: Placement, size: Option<super::rules::RuleSize>) {
         for layout in self.stored_mut() {
             if !layout.contains(id) {
                 let root = super::tree::place_new(layout.root_node(), id, placement).0;
                 layout.replace_root(root);
                 layout.hide_unfocused(id).expect("another module remains shown");
+                // A refused share leaves the copy where `place_new` put it; nothing here can report it.
+                let _ = super::rules::apply_tiled_size(layout, id, size);
             }
         }
     }

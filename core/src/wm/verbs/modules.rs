@@ -34,7 +34,7 @@ use super::super::window::{
 };
 use crate::keymap::action::{Action, SplitCwd};
 use crate::keymap::Keymap;
-use crate::layout::rules::{without_keys, At, OpenPoint};
+use crate::layout::rules::{without_keys, At, OpenPoint, RuleSize};
 use crate::layout::{
     self, covering, declared_placement, Axis, Direction, KeyAction, Layout, LayoutError, ModuleDecl, ModuleId,
     ModuleKind, OpenRule, OpenRules, Opened, Placement, Reopen, ScratchShow, SplitChoice,
@@ -677,10 +677,12 @@ fn plugin_open_rule(cx: &Cx, id: &ModuleId, take_keys: Option<bool>) -> OpenRule
 }
 
 /// Where a start-hidden plugin's module goes, hidden, in a workspace that lacks it once another holds it: its rule's
-/// place as a tiled one, since hidden there it needs no float.
-fn plugin_hidden_placement(cx: &Cx, id: &ModuleId) -> Placement {
+/// place as a tiled one, since hidden there it needs no float, with the rule's tiled size (a float's size is no
+/// tile's).
+fn plugin_hidden_placement(cx: &Cx, id: &ModuleId) -> (Placement, Option<RuleSize>) {
     let rule = plugin_open_rule(cx, id, None);
-    without_keys(rule.at.unwrap_or(At::Beside(Direction::Right))).0
+    let size = rule.size.filter(|size| !matches!(size, RuleSize::Float { .. }));
+    (without_keys(rule.at.unwrap_or(At::Beside(Direction::Right))).0, size)
 }
 
 /// A change that opened or placed `id`: laid out, and `id` given the keys when it takes them. A tile is given them
@@ -703,7 +705,8 @@ fn opened_with_keys(w: &mut Window, win: WinId, id: &ModuleId, takes_keys: bool,
 /// show the person did not ask for, so where the keys happen to be says nothing about where it belongs; with no editor
 /// on screen, where the rule goes with no module holding the keys), and put hidden into
 /// every other workspace that lacks it, as a new instance is. The keys move only when it takes them. A zoom that
-/// would hide it ends first. Its page is built once it is on screen, so an open the layout refuses builds no page.
+/// would hide it ends first, except `at_rest`: that zoom stands and the module waits behind it. Its page is built
+/// once it is on screen, so an open the layout refuses builds no page.
 pub(in crate::wm) fn open_plugin_module(
     w: &mut Window,
     cx: &Cx,
@@ -720,7 +723,7 @@ pub(in crate::wm) fn open_plugin_module(
         return Ok(());
     };
     if l.contains(id) {
-        let unzoomed = l.zoom_hides(id) && l.unzoom();
+        let unzoomed = !at_rest && l.zoom_hides(id) && l.unzoom();
         let shown = l.show(id);
         drop(l);
         match shown {
@@ -750,7 +753,30 @@ pub(in crate::wm) fn open_plugin_module(
     } else {
         Some(&editor)
     };
+    let at = rule.at.unwrap_or(At::Beside(Direction::Right));
+    let anchored = anchor.is_some_and(|a| l.leaves().contains(a) && l.is_shown(a));
+    let place = if rule.scratchpad {
+        "in the scratchpad".to_string()
+    } else if rule.float {
+        "as its rule's float".to_string()
+    } else if let At::Placement(placement) = at {
+        format!("at the {}", layout::rules::at_name(At::Placement(placement)))
+    } else if anchored && at == At::Tab {
+        "as a tab of the editor".to_string()
+    } else if anchored {
+        "beside the editor".to_string()
+    } else {
+        format!("at the {}", layout::rules::at_name(At::Placement(without_keys(at).0)))
+    };
+    // A show the person did not ask for leaves their zoom standing: placed behind it, the module comes on screen when
+    // the zoom ends, as one already shown behind a zoom is left there.
+    let zoom = if at_rest { l.zoom().cloned() } else { None };
     let opened = layout::rules::open_by_rule_at(&mut l, id, &rule, anchor, Some(&keys), cx.reads.grid_size(win))?;
+    if let Some(zoom) = zoom {
+        if !l.is_zoomed() && !l.restore_zoom(&zoom, &keys) {
+            w.say(format!("[modules] {id}: its zoom could not be put back"));
+        }
+    }
     drop(l);
     // At rest a fallback's note ("needs a module with the keys") would mislead: no keys were asked for.
     if !at_rest {
@@ -758,11 +784,11 @@ pub(in crate::wm) fn open_plugin_module(
             w.say(format!("[layout] {note}"));
         }
     }
-    let placement = plugin_hidden_placement(cx, id);
+    let (placement, size) = plugin_hidden_placement(cx, id);
     let added = w
         .workspaces
         .try_borrow_mut()
-        .map(|mut workspaces| workspaces.add_everywhere_at(id, placement))
+        .map(|mut workspaces| workspaces.add_everywhere_sized(id, placement, size))
         .is_ok();
     if !added {
         w.warn(format!(
@@ -773,7 +799,7 @@ pub(in crate::wm) fn open_plugin_module(
     w.say(format!(
         "[modules] {id}: opened by its rule{}{}",
         if at_rest {
-            " beside the editor, since agents wait".to_string()
+            format!(" {place}, since agents wait")
         } else {
             String::new()
         },
@@ -808,11 +834,24 @@ pub fn show_on_screen(
     if !held {
         return Err(LayoutError::NotInTree(id.clone()));
     }
+    show_held(w, cx, win, id, false, batch)
+}
+
+/// Shows `id`, which the layout holds, where it was hidden from. With `keep_zoom`, a show the person did not ask for,
+/// a zoom stands: the module is shown behind it and on screen once the zoom ends.
+fn show_held(
+    w: &mut Window,
+    cx: &Cx,
+    win: WinId,
+    id: &ModuleId,
+    keep_zoom: bool,
+    batch: &mut Batch,
+) -> Result<(), LayoutError> {
     let layout = w.layout.clone();
     let Ok(mut l) = layout.try_borrow_mut() else {
         return Ok(());
     };
-    let unzoomed = l.zoom_hides(id) && l.unzoom();
+    let unzoomed = !keep_zoom && l.zoom_hides(id) && l.unzoom();
     if unzoomed {
         w.say("[module_grid] unzoomed".into());
     }
@@ -1114,9 +1153,9 @@ pub fn place_then(
         restart_editor(w, cx, win, batch);
     }
     if starts_hidden(cx, id) {
-        let placement = plugin_hidden_placement(cx, id);
+        let (placement, size) = plugin_hidden_placement(cx, id);
         if let Ok(mut workspaces) = w.workspaces.try_borrow_mut() {
-            workspaces.add_everywhere_at(id, placement);
+            workspaces.add_everywhere_sized(id, placement, size);
         }
     }
     change_then_give(w, win, true, id, on_grab, batch);
@@ -1918,7 +1957,8 @@ pub(super) fn remaining_views(w: &Window) -> Vec<ViewId> {
 }
 
 /// A plugin's follow command for its module: shown puts it on screen (opening a start-hidden one by its rule the
-/// first time; `at_rest`, for a show because agents wait, beside the editor as if it held the keys) with
+/// first time; `at_rest`, for a show because agents wait, beside the editor as if it held the keys, and behind a zoom
+/// the person set rather than ending it) with
 /// the keys where they are, and draws its tab unless that would hide the module with the keys; hidden sends the keys
 /// where any hide sends them. A refusal is logged; the editor asked, not the user.
 pub fn follow(w: &mut Window, cx: &Cx, win: WinId, module: &ModuleId, show: bool, at_rest: bool, batch: &mut Batch) {
@@ -1933,6 +1973,8 @@ pub fn follow(w: &mut Window, cx: &Cx, win: WinId, module: &ModuleId, show: bool
     let held = w.layout.try_borrow().is_ok_and(|layout| layout.contains(module));
     let shown = if at_rest && !held && starts_hidden(cx, module) {
         open_plugin_module(w, cx, win, module, Some(false), true, batch)
+    } else if at_rest && held {
+        show_held(w, cx, win, module, true, batch)
     } else {
         show_on_screen(w, cx, win, module, batch)
     };
@@ -1942,10 +1984,13 @@ pub fn follow(w: &mut Window, cx: &Cx, win: WinId, module: &ModuleId, show: bool
         ));
         return;
     }
-    let brought = w
-        .layout
-        .try_borrow_mut()
-        .is_ok_and(|mut layout| layout.is_tabbed_away(module) && layout.bring_forward(module));
+    // Behind a zoom the person set, a tab is never switched: the zoomed module would be left on an undrawn tab, so
+    // the keys would sit there once the zoom ended and the next show anywhere would end the zoom by itself.
+    let behind_zoom = at_rest && w.layout.try_borrow().is_ok_and(|layout| layout.zoom_hides(module));
+    let brought = !behind_zoom
+        && w.layout
+            .try_borrow_mut()
+            .is_ok_and(|mut layout| layout.is_tabbed_away(module) && layout.bring_forward(module));
     if brought {
         w.changed_by_controller(win, batch);
     } else if w.layout.try_borrow().is_ok_and(|layout| layout.is_tabbed_away(module)) {

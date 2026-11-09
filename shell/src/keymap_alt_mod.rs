@@ -1,4 +1,7 @@
-//! The start's optional Alt-modifier probe. The window reads its answer without waiting.
+//! The start's optional Alt-modifier probe. The window reads its answer without waiting, and reads no file itself: the
+//! worker reads the window manager's config files first and publishes what they say, then asks `swaymsg` or `i3-msg`,
+//! whose answer replaces it. A keymap built while the command is still out is decided by the files, so a slow command
+//! no longer leaves the Alt keys where they were for that run.
 
 use std::ffi::OsString;
 use std::path::Path;
@@ -15,6 +18,8 @@ type Read = Arc<dyn Fn(&Path) -> Option<String> + Send + Sync>;
 
 struct Probe {
     answer: Arc<OnceLock<Answer>>,
+    /// What the config files alone say, published by the worker before it runs the command.
+    files: Arc<OnceLock<Answer>>,
     #[cfg(test)]
     worker: std::sync::Mutex<Option<std::thread::JoinHandle<()>>>,
 }
@@ -27,9 +32,10 @@ impl Probe {
         run: Run,
         read: Read,
     ) -> Self {
-        let answer = Arc::new(OnceLock::new());
+        let (answer, files) = (Arc::new(OnceLock::new()), Arc::new(OnceLock::new()));
         let probe = Self {
             answer: answer.clone(),
+            files: files.clone(),
             #[cfg(test)]
             worker: std::sync::Mutex::new(None),
         };
@@ -42,6 +48,7 @@ impl Probe {
         let spawned = std::thread::Builder::new()
             .name("keymap-alt-mod".into())
             .spawn(move || {
+                let _ = files.set(alt_mod::from_texts(desktop, None, &env, &*read));
                 let reply = run(desktop.argv()).ok();
                 let found = alt_mod::from_texts(desktop, reply.as_deref(), &env, &*read);
                 let _ = answer.set(found);
@@ -59,6 +66,21 @@ impl Probe {
 
     fn now(&self) -> Option<Answer> {
         self.answer.get().copied()
+    }
+
+    /// The answer the keymap is built from, as it stands: the command's when it came, else the config files' while
+    /// the command is still out. Neither yet (the worker has not read the files) answers nothing, logged.
+    fn for_keymap(&self) -> Option<Answer> {
+        if let Some(answer) = self.now() {
+            return Some(answer);
+        }
+        let files = self.files.get().copied();
+        if files.is_some() {
+            eprintln!(
+                "[keymap] the Alt $mod probe's command had not answered; the window manager's config files decide"
+            );
+        }
+        files
     }
 
     #[cfg(test)]
@@ -85,7 +107,7 @@ pub(crate) fn start_probe(full: bool) {
 }
 
 pub(crate) fn probe_now() -> Option<Answer> {
-    PROBE.get().and_then(Probe::now)
+    PROBE.get().and_then(Probe::for_keymap)
 }
 
 /// Check the notice record on a worker, then wait for both the first-start screen and the current toast. Remember
@@ -242,5 +264,61 @@ mod tests {
         release.send(()).unwrap();
         probe.finish();
         assert_eq!(probe.now().unwrap().modifier, Some(WmMod::Alt));
+    }
+
+    /// A keymap built while the worker still waits on its command is decided by the config files the worker read
+    /// first, so a slow `swaymsg` does not leave the Alt keys where they are for that run; once the command answers,
+    /// its answer is used. The caller's thread (the GTK thread at start) reads no file.
+    #[test]
+    fn keymap_alt_mod_probe_answers_a_keymap_built_early_from_the_files() {
+        let (began, started) = mpsc::channel();
+        let (release, released) = mpsc::channel();
+        let released = Mutex::new(released);
+        let caller = std::thread::current().id();
+        let read_here = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let flag = read_here.clone();
+        let probe = Probe::start_with(
+            true,
+            false,
+            env(&[("SWAYSOCK", "/s"), ("HOME", "/home/u")]),
+            Arc::new(move |_| {
+                began.send(()).unwrap();
+                released.lock().unwrap().recv().unwrap();
+                Ok("set $mod Mod4\n".into())
+            }),
+            Arc::new(move |path| {
+                if std::thread::current().id() == caller {
+                    flag.store(true, std::sync::atomic::Ordering::SeqCst);
+                }
+                (path == Path::new("/home/u/.config/sway/config")).then(|| "set $mod Mod1\n".into())
+            }),
+        );
+        started
+            .recv_timeout(Duration::from_secs(60))
+            .expect("the worker started independently");
+        assert_eq!(probe.now(), None, "the worker is still asking");
+        let early = probe.for_keymap().expect("the files answer");
+        assert_eq!(early.desktop, Desktop::Sway);
+        assert_eq!(early.modifier, Some(WmMod::Alt));
+        release.send(()).unwrap();
+        probe.finish();
+        assert_eq!(
+            probe.for_keymap().unwrap().modifier,
+            Some(WmMod::Super),
+            "the command's answer once it came"
+        );
+        assert!(
+            !read_here.load(std::sync::atomic::Ordering::SeqCst),
+            "no file was read on the caller's thread"
+        );
+
+        let none = Probe::start_with(
+            true,
+            false,
+            env(&[]),
+            Arc::new(|_| Ok(String::new())),
+            Arc::new(|_| None),
+        );
+        assert_eq!(none.for_keymap(), None, "nothing is asked off sway and i3");
     }
 }

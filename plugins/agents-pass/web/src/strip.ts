@@ -37,9 +37,14 @@ export type Ticket = { row: PassRow; current: boolean; visited: boolean; selecte
 
 const waited = (row: PassRow) => row.waiting_since ?? row.since;
 
-/** The rows that wait for the person, the oldest wait first; equal waits keep the view's order. */
+/** Every row that waits for the person, the oldest wait first; equal waits keep the view's order. */
+function needing(rows: PassRow[]): PassRow[] {
+  return rows.filter((row) => row.class === "needs").sort((a, b) => waited(a) - waited(b));
+}
+
+/** The waiting rows a round can stop at: [needing] without the rows that have no key, which nothing can visit. */
 function waiting(rows: PassRow[]): PassRow[] {
-  return rows.filter((row) => row.class === "needs" && row.key !== "").sort((a, b) => waited(a) - waited(b));
+  return needing(rows).filter((row) => row.key !== "");
 }
 
 /** The round's stops as the host counts them: each waiting row, except that a window's trust rows, which one
@@ -185,7 +190,8 @@ function ticketNode(t: Ticket, glyph: (row: PassRow) => string, now: number, man
 
 function countsNode(rows: PassRow[], glyph: (row: PassRow) => string): HTMLElement {
   const counts = new Map<string, number>();
-  for (const row of waiting(rows)) counts.set(glyph(row), (counts.get(glyph(row)) ?? 0) + 1);
+  // Every wait counts, a row without a key too: it waits all the same, though no round stops at it.
+  for (const row of needing(rows)) counts.set(glyph(row), (counts.get(glyph(row)) ?? 0) + 1);
   // Cards first, then questions, then any other glyph a newer state brings, in the order it first waited.
   const rank = (g: string) => (g === "⚑" ? 0 : g === "?" ? 1 : 2);
   const el = span("counts", "");
@@ -270,17 +276,20 @@ export function render(
     return { list, wrote, next };
   }
   // No round: the counts, then the oldest wait as the line's one ticket, the row `Enter` here starts the round at
-  // (and `j`/`k` select), then how to start from anywhere.
+  // (and `j`/`k` select), then how to start from anywhere. Rows without a key are counted but are no stop, so with
+  // only those waiting there is nothing to start and the line is the counts alone.
   parts.push(countsNode(rows, deps.glyph));
   const first = list.slice(0, 1);
-  const line = span("tickets first", "");
-  for (const t of first) {
-    const el = ticket(t, manyWindows(rows));
-    el.classList.add("first");
-    line.append(el);
+  if (first.length) {
+    const line = span("tickets first", "");
+    for (const t of first) {
+      const el = ticket(t, manyWindows(rows));
+      el.classList.add("first");
+      line.append(el);
+    }
+    parts.push(line);
+    parts.push(span("hint", "Enter or prefix u to start"));
   }
-  parts.push(line);
-  parts.push(span("hint", "Enter or prefix u to start"));
   return { list: first, wrote: put(root, parts), next };
 }
 

@@ -850,7 +850,10 @@ fn a_start_hidden_plugin_is_built_when_first_shown_and_opened_by_its_rule() {
     );
 
     let (_, opener) = scan::function_in(&verbs, "open_plugin_module");
-    assert!(opener.contains("plugin_open_rule(") && opener.contains("add_everywhere_at("));
+    assert!(
+        opener.contains("plugin_open_rule(") && opener.contains("add_everywhere_sized("),
+        "opened by its rule, and put hidden into the other workspaces at its rule's size"
+    );
     assert!(
         !opener.contains("build_page(") && !opener.contains("PluginOp::Build"),
         "an open the layout refuses builds no page: the lifecycle builds it once it is shown"
