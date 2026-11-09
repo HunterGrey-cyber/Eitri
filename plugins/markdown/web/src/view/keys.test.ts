@@ -5,6 +5,7 @@ import type { MermaidRunner } from "../render/mermaid";
 import { installFakeLayout, type FakeLayout } from "./fakelayout";
 import { editHere, installKeys, jumpTo, PAGE_CONTEXT, PAGE_ROWS, pageRows } from "./keys";
 import { Preview } from "./preview";
+import { VIEWER_CONTEXT } from "./viewer";
 
 const DOC = { root: "eitri-plugin://markdown/.eitri/doc/4/", base: "eitri-plugin://markdown/.eitri/doc/4/" };
 const FENCE = "`".repeat(3);
@@ -66,9 +67,11 @@ describe("the page's rows", () => {
       ["cursor.first", ["gg"]], ["cursor.last", ["G"]],
       ["block.next", ["}"]], ["block.prev", ["{"]],
       ["heading.next", ["]]"]], ["heading.prev", ["[["]], ["scroll.left", ["zh"]], ["scroll.right", ["zl"]],
-      ["block.yank", ["yy"]], ["edit.here", ["<CR>"]],
+      ["block.yank", ["yy"]], ["edit.here", ["<CR>"]], ["viewer.open", ["o"]],
+      // The diagram viewer's own rows (viewer.test.ts).
+      ...PAGE_ROWS.filter((r) => r.context === VIEWER_CONTEXT).map((r) => [r.action, r.keys]),
     ]);
-    expect(PAGE_ROWS.every((r) => r.context === PAGE_CONTEXT && r.desc.length > 0)).toBe(true);
+    expect(PAGE_ROWS.every((r) => (r.context === PAGE_CONTEXT || r.context === VIEWER_CONTEXT) && r.desc.length > 0)).toBe(true);
     preview.onFocus(true);
     await install(preview, { run: () => false, timeoutlen: 300, prefix: "Ctrl+b", settings: { scroll_step: 40 } });
     // The stock prefix costs the page its <C-b> row, as it costs the kit its own <C-b>.

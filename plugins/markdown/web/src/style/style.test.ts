@@ -16,6 +16,11 @@ function rules(text: string): { selector: string; body: string }[] {
 }
 
 describe("the page's stylesheets", () => {
+  it("hide the page's scroll bar while the diagram viewer is open", () => {
+    const rule = rules(css["chrome.css"]).find((r) => r.selector === "html.mdp-viewer-open");
+    expect(rule?.body).toMatch(/overflow:\s*hidden/);
+  });
+
   it("open with VS Code's notice, which the licence check finds in the build", () => {
     expect(css["markdown.css"].split("\n")[0]).toBe(
       "/*! Adapted from Visual Studio Code's Markdown preview (extensions/markdown-language-features), Copyright (c) Microsoft Corporation, MIT License. */");

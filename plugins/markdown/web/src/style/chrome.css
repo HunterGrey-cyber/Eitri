@@ -137,3 +137,100 @@ html[data-eitri-visual] .mdp-cursor-line {
 .mdp-root > div.code-line:last-child:empty {
   min-height: 1px;
 }
+
+/* The diagram viewer (`o`): one diagram or image over the whole page, above everything but the kit's HUD, find
+   prompt and `?` sheet. The picture is placed by the page (a diagram's viewBox, an image's size and place); the
+   stage only clips it. The keys hint is one quiet line in the top right corner, in the code font, sized from the
+   page's text like every other text of the page. The 20 px left at the bottom is the kit's HUD. */
+.mdp-viewer {
+  position: fixed;
+  inset: 0 0 20px 0;
+  z-index: 2147483000;
+  display: flex;
+  flex-direction: column;
+  background-color: var(--nv-bg);
+  color: var(--nv-fg);
+}
+
+/* The page's own scroll bar would show beside the viewer; it is gone while the viewer is open. */
+html.mdp-viewer-open {
+  overflow: hidden;
+}
+
+.mdp-viewer-stage {
+  position: relative;
+  flex: 1 1 auto;
+  min-height: 0;
+  overflow: hidden;
+  cursor: grab;
+  touch-action: none;
+}
+
+.mdp-viewer-stage.mdp-viewer-dragging {
+  cursor: grabbing;
+}
+
+.mdp-viewer-stage > svg {
+  display: block;
+  width: 100%;
+  height: 100%;
+  max-width: none;
+}
+
+.mdp-viewer-stage.mdp-viewer-image > img {
+  position: absolute;
+  max-width: none;
+  user-select: none;
+}
+
+.mdp-viewer-hint {
+  position: absolute;
+  top: 0;
+  right: 0;
+  display: flex;
+  gap: 1em;
+  align-items: baseline;
+  padding: 0 0 0 8px;
+  border-bottom-left-radius: 3px;
+  background-color: var(--nv-surface);
+  color: var(--nv-muted);
+  font-family: var(--nv-font-mono, monospace);
+  font-size: 0.85em;
+  line-height: 1.6;
+  white-space: nowrap;
+  opacity: 0.85;
+  max-width: 100%;
+  box-sizing: border-box;
+}
+
+/* A narrow preview cuts the keys short first; the scale and the close button always show. */
+.mdp-viewer-keys {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.mdp-viewer-count, .mdp-viewer-zoom, .mdp-viewer-close {
+  flex: none;
+}
+
+.mdp-viewer-count:empty {
+  display: none;
+}
+
+.mdp-viewer-count, .mdp-viewer-zoom {
+  color: var(--nv-surface-fg);
+}
+
+.mdp-viewer-close {
+  padding: 0 8px;
+  border: 0;
+  background: none;
+  color: inherit;
+  font: inherit;
+  cursor: pointer;
+}
+
+.mdp-viewer-close:hover {
+  color: var(--nv-surface-fg);
+}

@@ -127,6 +127,7 @@ Give the preview the keys with your key, with `Ctrl+l` from the editor, or by cl
 | `f` | labels on links, footnote links and fold toggles; type a label to follow it |
 | `yy` | copy the current block's Markdown source (for a code block, the code without the fence lines) |
 | `Enter` | edit here: move Neovim's cursor to this place and give Neovim the keys |
+| `o` | open the diagram or image under the cursor in the viewer ([A diagram up close](#a-diagram-up-close)) |
 | `v` / `V` | select text from the cursor, by characters / by whole lines ([Selecting text](#selecting-text)) |
 | `H` or `Ctrl+o` / `L` or `Ctrl+i` | back / forward between jumps inside the document: `gg`, `G`, `}`, `{`, `]]`, `[[`, a search and `n`/`N`, a heading link, a footnote |
 | `?` | the list of these keys |
@@ -140,7 +141,7 @@ Give the preview the keys with your key, with `Ctrl+l` from the editor, or by cl
 - Moves that jump (`gg`, `G`, `}`, `{`, `]]`, `[[`, a search and `n`/`N`, a link inside the document, `H` and `L`) take the
   cursor to the target and scroll only when it is outside the margins: as little as needed when it is near, centred
   when it is far, as in Neovim. Scrolling glides, or jumps at once when smooth scrolling is off or your desktop asks
-  for reduced motion. A count (`5j`) is not read.
+  for reduced motion. A count (`5j`) is not read, except in the diagram viewer.
 - By default the search ignores case unless it has a capital letter, as in Vim's `smartcase`
   (`plugins.keys.find_case` changes that). The status line shows `[3/12]`, and `search hit BOTTOM, continuing at TOP`
   when it wraps.
@@ -192,13 +193,51 @@ eitri.keymap.set("plugin:markdown", "e", "edit.here")
 `cursor.up`, `cursor.half_down`, `cursor.half_up`, `cursor.page_down`, `cursor.page_up`, `cursor.first`,
 `cursor.last`, `block.next`, `block.prev`, `scroll.down`, `scroll.up`, `heading.next`, `heading.prev`, `scroll.left`, `scroll.right`, `find.start`,
 `find.next`, `find.prev`, `hint.start`, `block.yank`, `edit.here`, `history.back`, `history.forward`, `sheet.open`,
-`mode.escape`, `visual.char` and `visual.line`. If you changed these keys for a release candidate, rename an override
+`mode.escape`, `visual.char`, `visual.line`, and the viewer's `viewer.open`, `viewer.close`, `viewer.left`,
+`viewer.right`, `viewer.left_edge`, `viewer.right_edge`, `viewer.zoom_in`, `viewer.zoom_out`, `viewer.actual`,
+`viewer.fit`, `viewer.fit_width` and `count` (the digits `1` to `9`). If you changed these keys for a release candidate, rename an override
 of `scroll.half_down`, `scroll.half_up`, `scroll.page_down`, `scroll.page_up`, `scroll.top` or `scroll.bottom` to the
 matching `cursor.` action (`cursor.half_down`, ..., `cursor.first`, `cursor.last`): the preview no longer has those `scroll.` actions.
 
 How far a step scrolls, whether scrolling is animated, how long a key such as `g` waits, when the list of following
 keys appears, the letters hint labels use and how the search treats case are settings shared by every plugin page:
 see [Keys in a plugin page](configuration.md#keys-in-a-plugin-page).
+
+## A diagram up close
+
+With the cursor on a diagram (or an image), `o` opens it in a viewer that covers the preview, the whole diagram fitted
+to it (an image opens at its own size when it is smaller than the viewer). A diagram stays sharp however large you make it. In the viewer:
+
+| keys | what it does |
+|---|---|
+| `h` / `j` / `k` / `l` | move left / down / up / right by a fifth of the view; a count moves further (`5l`) |
+| `d` or `Ctrl+d` / `u` or `Ctrl+u` | half a view down / up |
+| `Ctrl+f` / `Ctrl+b` | a whole view down / up |
+| `0` / `$` | the left / right edge |
+| `gg` / `G` | the top / bottom edge |
+| `+` / `-` | larger / smaller, around the middle of the view; a count takes more steps (`3+`) |
+| `=` | actual size (100%); with a count, that percentage (`200=`) |
+| `a` | fit the whole diagram |
+| `s` | fit its width |
+| `Enter` | close the viewer and edit the diagram in Neovim, as `Enter` does on the page |
+| `q` or `Esc` | close the viewer; the cursor is on the diagram again (`Esc` first drops a count you started) |
+
+- These are zathura's and nsxiv's keys. The corner of the viewer lists the main ones, the size in percent and a
+  count you are typing.
+- With the mouse: the wheel moves, `Ctrl` and the wheel (or a touchpad pinch) changes the size at the pointer, dragging
+  moves, and a double-click switches between the view it opened at and twice that size.
+- While the viewer is open, the page's other keys, searching, `H`/`L` and selecting do nothing; `?` still lists the
+  keys.
+- Editing the diagram in Neovim while the viewer is open redraws it there and keeps your place and size (a fitted view
+  fits the new drawing). While the new version does not draw (an error), the viewer keeps the last drawing and the
+  status line says `the diagram does not draw now; showing its last drawing`. If you delete the diagram, or the preview
+  moves to another file, the viewer closes, saying `the diagram is no longer in the document`.
+- `o` on anything else says `no diagram or image at the cursor`, and on a diagram still being drawn
+  `the diagram is not drawn yet`.
+- An image opens fitted when it is larger than the viewer and at 100% when it is smaller, as nsxiv opens one; `a`
+  fits it anyway. It is shown at its own resolution: past 100% its pixels are drawn larger.
+- The viewer covers the preview, not the window. To have the preview fill the window first, zoom its module with
+  `<prefix> z` ([Keys](keys.md)).
 
 ## Images
 

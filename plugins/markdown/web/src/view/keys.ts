@@ -6,6 +6,7 @@ import { boxAt, currentBlock, noteClick, pickedLine } from "./current";
 import { lineToY, yToLine } from "./sync";
 import { FIND_MESSAGES, HUD, statusText } from "./notices";
 import type { Preview } from "./preview";
+import { Viewer, VIEWER_CONTEXT } from "./viewer";
 
 export const PAGE_CONTEXT = "preview";
 /* The page's own reading keys. The kit declares its generic rows first (scrolling, half pages, history, find, hints);
@@ -13,14 +14,14 @@ export const PAGE_CONTEXT = "preview";
    and those rows drop out, and the cursor's keys leave the kit's scrolling `<C-e>`/`<C-y>` alone (they scroll the
    page, and the cursor stays on its row unless a margin pushes it, as in nvim). */
 export const PAGE_ROWS: Row[] = [
-  { action: "cursor.down", keys: ["j"], context: PAGE_CONTEXT, desc: "cursor a row down" },
-  { action: "cursor.up", keys: ["k"], context: PAGE_CONTEXT, desc: "cursor a row up" },
+  { action: "cursor.down", keys: ["j"], context: PAGE_CONTEXT, desc: "cursor a row down (viewer: move down)" },
+  { action: "cursor.up", keys: ["k"], context: PAGE_CONTEXT, desc: "cursor a row up (viewer: move up)" },
   { action: "cursor.half_down", keys: ["d", "<C-d>"], context: PAGE_CONTEXT, desc: "half a page down" },
   { action: "cursor.half_up", keys: ["u", "<C-u>"], context: PAGE_CONTEXT, desc: "half a page up" },
   { action: "cursor.page_down", keys: ["<C-f>"], context: PAGE_CONTEXT, desc: "a page down" },
   { action: "cursor.page_up", keys: ["<C-b>"], context: PAGE_CONTEXT, desc: "a page up" },
-  { action: "cursor.first", keys: ["gg"], context: PAGE_CONTEXT, desc: "first row" },
-  { action: "cursor.last", keys: ["G"], context: PAGE_CONTEXT, desc: "last row" },
+  { action: "cursor.first", keys: ["gg"], context: PAGE_CONTEXT, desc: "first row (viewer: top edge)" },
+  { action: "cursor.last", keys: ["G"], context: PAGE_CONTEXT, desc: "last row (viewer: bottom edge)" },
   { action: "block.next", keys: ["}"], context: PAGE_CONTEXT, desc: "next block" },
   { action: "block.prev", keys: ["{"], context: PAGE_CONTEXT, desc: "previous block" },
   { action: "heading.next", keys: ["]]"], context: PAGE_CONTEXT, desc: "next heading" },
@@ -29,6 +30,22 @@ export const PAGE_ROWS: Row[] = [
   { action: "scroll.right", keys: ["zl"], context: PAGE_CONTEXT, desc: "scroll the block right" },
   { action: "block.yank", keys: ["yy"], context: PAGE_CONTEXT, desc: "copy the block's Markdown" },
   { action: "edit.here", keys: ["<CR>"], context: PAGE_CONTEXT, desc: "edit here in the editor" },
+  { action: "viewer.open", keys: ["o"], context: PAGE_CONTEXT, desc: "open the diagram or image at the cursor" },
+  // The viewer's own keys (`viewer.ts`); in it `j`/`k`, `d`/`u`, `<C-d>`/`<C-u>`, `<C-f>`/`<C-b>`, `gg`/`G`, `<CR>` and
+  // `<Esc>` are the rows above, acting on the view. zathura's and nsxiv's keys: `+`/`-` zoom, `=` 100% (`150=`:
+  // 150%), zathura's `a` best fit and `s` width.
+  { action: "viewer.close", keys: ["q"], context: VIEWER_CONTEXT, desc: "close the viewer" },
+  { action: "viewer.left", keys: ["h"], context: VIEWER_CONTEXT, desc: "move left" },
+  { action: "viewer.right", keys: ["l"], context: VIEWER_CONTEXT, desc: "move right" },
+  { action: "viewer.left_edge", keys: ["0"], context: VIEWER_CONTEXT, desc: "left edge" },
+  { action: "viewer.right_edge", keys: ["$"], context: VIEWER_CONTEXT, desc: "right edge" },
+  { action: "viewer.zoom_in", keys: ["+"], context: VIEWER_CONTEXT, desc: "zoom in" },
+  { action: "viewer.zoom_out", keys: ["-"], context: VIEWER_CONTEXT, desc: "zoom out" },
+  { action: "viewer.actual", keys: ["="], context: VIEWER_CONTEXT, desc: "100%, or the count in percent" },
+  { action: "viewer.fit", keys: ["a"], context: VIEWER_CONTEXT, desc: "fit the whole picture" },
+  { action: "viewer.fit_width", keys: ["s"], context: VIEWER_CONTEXT, desc: "fit the width" },
+  { action: "count", keys: ["1", "2", "3", "4", "5", "6", "7", "8", "9"], context: VIEWER_CONTEXT,
+    desc: "a count: 5l moves five steps, 3+ zooms three" },
 ];
 
 /** The page's rows for the window's prefix (`host.hello`'s spelling, `Ctrl+b`): a key equal to the prefix is
@@ -264,9 +281,18 @@ export async function installKeys(
       k?.status(status);
     }
   };
+  // The diagram viewer takes every page key while it is open; Enter there closes it and edits at the diagram.
+  const viewer = new Viewer(p);
   // The kit runs its generic actions itself (scrolling, history, hints); the page's own actions come here, and
   // what the page does not know (yank) goes to the caller.
   const run = (action: string, ev: KeyboardEvent): boolean => {
+    if (viewer.isOpen()) {
+      if (action !== "edit.here") return viewer.run(action, ev);
+      const y = viewer.targetTop();
+      viewer.close();
+      if (y !== null) void editHere(p, y + ROW_PROBE_PX);
+      return true;
+    }
     switch (action) {
       case "cursor.down": p.moveRows(1); return true;
       case "cursor.up": p.moveRows(-1); return true;
@@ -285,6 +311,7 @@ export async function installKeys(
       case "scroll.left": sideways(p, -SIDEWAYS_PX); return true;
       case "scroll.right": sideways(p, SIDEWAYS_PX); return true;
       case "edit.here": void editHere(p); return true;
+      case "viewer.open": viewer.openAtCursor(currentBlock(p)?.el ?? null); return true;
       // Nothing of the page's is open for Esc to close; false lets the kit move focus off a focused link or toggle.
       case "mode.escape": return false;
       default: return extra.run(action, ev);
@@ -367,6 +394,7 @@ export async function installKeys(
     : () => {};
   refresh();
   return () => {
+    viewer.close();
     remove();
     off();
     root?.removeEventListener("click", onClick);

@@ -1,5 +1,5 @@
 [English](markdown-preview.md) | 简体中文
-<!-- translated-from: markdown-preview.md sha256=6a0391c3d45a753b46775dc0c1e941e61800af7e4453210034737f4eba48da51 -->
+<!-- translated-from: markdown-preview.md sha256=066b28284497dc739ce1d3165a8a8744c212c371f102357adce922f70587ce11 -->
 
 # Markdown 预览
 
@@ -90,6 +90,7 @@ eitri.plugin.load("markdown", { auto = true })
 | `f` | 在链接、脚注链接和折叠开关上显示标签；输入标签就跟随它 |
 | `yy` | 复制当前块的 Markdown 源码（代码块只复制代码，不含围栏那两行） |
 | `Enter` | 在这里编辑：把 Neovim 的光标移到这个位置，并把按键交给 Neovim |
+| `o` | 在查看器里打开光标处的图表或图片（见[近看一张图表](#近看一张图表)） |
 | `v` / `V` | 从光标处开始选中文字，按字符 / 按整行（见[选中文字](#选中文字)） |
 | `H` 或 `Ctrl+o` / `L` 或 `Ctrl+i` | 在文档内部的跳转之间后退 / 前进：`gg`、`G`、`}`、`{`、`]]`、`[[`、搜索和 `n`/`N`、标题链接、脚注 |
 | `?` | 列出这些按键 |
@@ -98,7 +99,7 @@ eitri.plugin.load("markdown", { auto = true })
 - 当前块是光标所在的那一块；边栏里另有一条竖线标出它。点击会把光标放到你点的那一行。双击一个块，等于在那里按 `Enter`。
 - 如果 Neovim 的光标已经在预览光标所在的那一行上（移动时放到那里的，或者进入预览时带进来的那一行，这时连所在的列也不变），`Enter` 让它留在那一行，所以 Neovim 的窗口不会滚动。
 - `}` 和 `{` 一块一块走过的，就是边栏竖线标出的那些块。
-- 跳转类的移动（`gg`、`G`、`}`、`{`、`]]`、`[[`、搜索和 `n`/`N`、文档内的链接、`H` 和 `L`）把光标移到目标上，只有目标在边距之外时才滚动：离得近就只滚动需要的那一点，离得远就把它放到中间，和 Neovim 一样。滚动是平滑的；关掉平滑滚动，或者桌面要求减少动画时，就立即跳过去。不支持计数（`5j`）。
+- 跳转类的移动（`gg`、`G`、`}`、`{`、`]]`、`[[`、搜索和 `n`/`N`、文档内的链接、`H` 和 `L`）把光标移到目标上，只有目标在边距之外时才滚动：离得近就只滚动需要的那一点，离得远就把它放到中间，和 Neovim 一样。滚动是平滑的；关掉平滑滚动，或者桌面要求减少动画时，就立即跳过去。不支持计数（`5j`），图表查看器里除外。
 - 默认情况下，搜索不区分大小写，除非搜索里有大写字母，和 Vim 的 `smartcase` 一样（`plugins.keys.find_case` 可以改）。状态行显示 `[3/12]`，到头接着找时显示 `search hit BOTTOM, continuing at TOP`。
 - 按下一个较长按键的第一个键（`g`、`z`、`y`、`[`、`]`）之后，状态行会列出接下来可以按的键。
 - 如果你的 Eitri 前缀是这些 Ctrl 键中的一个，它仍然是前缀，预览里就没有这个键：用默认前缀 `Ctrl+b` 时，没有 `Ctrl+b` 向上翻页。
@@ -134,11 +135,37 @@ eitri.plugin.load("markdown", { auto = true })
 eitri.keymap.set("plugin:markdown", "e", "edit.here")
 ```
 
-焦点在预览上时，`<prefix> ?` 会在 Eitri 自己的按键列表里先列出它的按键。动作名是 `cursor.down`、`cursor.up`、`cursor.half_down`、`cursor.half_up`、`cursor.page_down`、`cursor.page_up`、`cursor.first`、`cursor.last`、`block.next`、`block.prev`、`scroll.down`、`scroll.up`、`heading.next`、`heading.prev`、`scroll.left`、`scroll.right`、`find.start`、`find.next`、`find.prev`、`hint.start`、`block.yank`、`edit.here`、`history.back`、`history.forward`、`sheet.open`、`mode.escape`、`visual.char` 和 `visual.line`。如果你在候选版本里改过这些按键，把对 `scroll.half_down`、`scroll.half_up`、`scroll.page_down`、`scroll.page_up`、`scroll.top` 或 `scroll.bottom` 的修改改成对应的 `cursor.` 动作（`cursor.half_down`……`cursor.first`、`cursor.last`）：预览里已经没有这几个 `scroll.` 动作了。
+焦点在预览上时，`<prefix> ?` 会在 Eitri 自己的按键列表里先列出它的按键。动作名是 `cursor.down`、`cursor.up`、`cursor.half_down`、`cursor.half_up`、`cursor.page_down`、`cursor.page_up`、`cursor.first`、`cursor.last`、`block.next`、`block.prev`、`scroll.down`、`scroll.up`、`heading.next`、`heading.prev`、`scroll.left`、`scroll.right`、`find.start`、`find.next`、`find.prev`、`hint.start`、`block.yank`、`edit.here`、`history.back`、`history.forward`、`sheet.open`、`mode.escape`、`visual.char`、`visual.line`，以及查看器的 `viewer.open`、`viewer.close`、`viewer.left`、`viewer.right`、`viewer.left_edge`、`viewer.right_edge`、`viewer.zoom_in`、`viewer.zoom_out`、`viewer.actual`、`viewer.fit`、`viewer.fit_width` 和 `count`（数字 `1` 到 `9`）。如果你在候选版本里改过这些按键，把对 `scroll.half_down`、`scroll.half_up`、`scroll.page_down`、`scroll.page_up`、`scroll.top` 或 `scroll.bottom` 的修改改成对应的 `cursor.` 动作（`cursor.half_down`……`cursor.first`、`cursor.last`）：预览里已经没有这几个 `scroll.` 动作了。
 
 一步滚动多远、滚动是否带动画、`g` 这样的键等多久、什么时候列出接下来的键、提示标签用哪些字母、搜索怎样处理大小写，这些是所有插件页面共用的设置：见[插件页面里的按键](configuration.zh-CN.md#keys-in-a-plugin-page)。
 
 <a id="images"></a>
+## 近看一张图表
+
+光标在一张图表（或一张图片）上时，按 `o` 会在一个盖住整个预览的查看器里打开它，先让整张图表正好放得下（图片比查看器小时，按它自己的大小打开）。图表无论调到多大都是清晰的。在查看器里：
+
+| 按键 | 作用 |
+|---|---|
+| `h` / `j` / `k` / `l` | 向左 / 下 / 上 / 右移动视图的五分之一；加计数移得更远（`5l`） |
+| `d` 或 `Ctrl+d` / `u` 或 `Ctrl+u` | 向下 / 上移动半个视图 |
+| `Ctrl+f` / `Ctrl+b` | 向下 / 上移动一整个视图 |
+| `0` / `$` | 左 / 右边缘 |
+| `gg` / `G` | 上 / 下边缘 |
+| `+` / `-` | 以视图中间为中心变大 / 变小；加计数多走几步（`3+`） |
+| `=` | 原始大小（100%）；加计数就是那个百分比（`200=`） |
+| `a` | 让整张图表正好放得下 |
+| `s` | 让它的宽度正好放得下 |
+| `Enter` | 关掉查看器，在 Neovim 里编辑这张图表，和在页面上按 `Enter` 一样 |
+| `q` 或 `Esc` | 关掉查看器，光标回到这张图表上（如果你开始输入计数，`Esc` 先清掉计数） |
+
+- 这些是 zathura 和 nsxiv 的按键。查看器的角上列出主要的几个按键、当前大小的百分比和你正在输入的计数。
+- 用鼠标：滚轮移动，按住 `Ctrl` 滚动滚轮（或在触摸板上捏合）以指针为中心改变大小，拖动来移动，双击在打开时的样子和它的两倍之间切换。
+- 查看器开着时，页面的其他按键、搜索、`H`/`L` 和选中文字都不起作用；`?` 仍然列出按键。
+- 查看器开着时在 Neovim 里编辑这张图表，它会在查看器里重新画出来，位置和大小不变（原来是“正好放得下”的，新图也正好放得下）。新版本画不出来（有错误）时，查看器保留上一次的图，状态行显示 `the diagram does not draw now; showing its last drawing`。如果你删掉了这张图表，或者预览换到了别的文件，查看器会关掉，并显示 `the diagram is no longer in the document`。
+- 在别的东西上按 `o` 会显示 `no diagram or image at the cursor`；在还没画好的图表上显示 `the diagram is not drawn yet`。
+- 图片比查看器大时，打开时正好放得下；比查看器小时按 100% 打开，和 nsxiv 一样；按 `a` 仍然可以让它正好放得下。图片按它自己的分辨率显示：超过 100% 时，看到的是变大的像素。
+- 查看器盖住的是预览，不是整个窗口。想让预览先占满窗口，用 `<prefix> z` 放大它所在的模块（见[按键](keys.zh-CN.md)）。
+
 ## 图片
 
 - 项目里的图片会显示：相对路径从文档所在的文件夹算起，以 `/` 开头的路径从项目的顶层文件夹算起。文档在 Eitri 启动时所在的文件夹里面时，项目就是那个文件夹；否则是文档上方最近的一个含有 `.git` 的文件夹；再否则是文档自己的文件夹；你的主目录和 `/` 永远不算项目。项目以外的图片显示为一个写着 `outside the project` 的方框，未保存的缓冲区里的相对路径图片显示为 `save the file to show local images`。
