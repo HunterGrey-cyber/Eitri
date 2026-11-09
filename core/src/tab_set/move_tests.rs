@@ -1158,12 +1158,15 @@ fn phone() -> RemoteAsker {
 }
 
 /// A linked window whose presence never answers, with a live Claude tab in Auto: a send waits for the presence
-/// until the link ends.
-fn linked_with_a_waiting_presence(label: &str, pid: u32) -> (PathBuf, TabSet, TabId, Arc<RecordingProvider>) {
+/// until the link ends. The caller keeps the parking sender alive: dropping it releases the presence thread.
+fn linked_with_a_waiting_presence(
+    label: &str,
+    pid: u32,
+) -> (PathBuf, TabSet, TabId, Arc<RecordingProvider>, mpsc::Sender<()>) {
     let scratch = scratch(label);
     let dir = scratch.join("project");
     let mut set = set();
-    let (holder, _parked) = PresenceHolder::start_parked(scratch.join("state/eitri/review/0123456789abcdef"), pid);
+    let (holder, parked) = PresenceHolder::start_parked(scratch.join("state/eitri/review/0123456789abcdef"), pid);
     set.hold_presence(holder);
     let (provider, tab) = live_tab(&mut set, &dir);
     provider.queue(opened(&dir));
@@ -1172,14 +1175,14 @@ fn linked_with_a_waiting_presence(label: &str, pid: u32) -> (PathBuf, TabSet, Ta
     });
     set.get_mut(tab).unwrap().set_mode_for_test(SessionModeChoice::Auto);
     let _ = set.set_partner(Some(partner()));
-    (scratch, set, tab, provider)
+    (scratch, set, tab, provider, parked)
 }
 
 /// A phone's send let go by the presence after the desk widened the tab's mode is refused, as the queue refuses
 /// one: nothing reaches the agent, and the phone is told why.
 #[test]
 fn a_phone_send_released_by_the_presence_is_refused_once_the_mode_widened() {
-    let (scratch, mut set, tab, provider) = linked_with_a_waiting_presence("move-remote-widened", 4252);
+    let (scratch, mut set, tab, provider, _parked) = linked_with_a_waiting_presence("move-remote-widened", 4252);
     set.send_remote(tab, "phone words", phone()).unwrap();
     assert!(set.send_is_held(tab), "linked, it waits for the presence");
     set.get_mut(tab).unwrap().set_mode_for_test(SessionModeChoice::Bypass);
@@ -1201,7 +1204,7 @@ fn a_phone_send_released_by_the_presence_is_refused_once_the_mode_widened() {
 /// not go, and nothing goes into a session stopped on the user.
 #[test]
 fn a_phone_send_released_by_the_presence_is_not_sent_behind_a_card_that_arrived_meanwhile() {
-    let (scratch, mut set, tab, provider) = linked_with_a_waiting_presence("move-remote-card", 4253);
+    let (scratch, mut set, tab, provider, _parked) = linked_with_a_waiting_presence("move-remote-card", 4253);
     let dir = scratch.join("project");
     set.send_remote(tab, "phone words", phone()).unwrap();
     assert!(set.send_is_held(tab));
@@ -1234,7 +1237,7 @@ fn a_phone_send_released_by_the_presence_is_not_sent_behind_a_card_that_arrived_
 /// A phone's send still waiting for the presence when its tab closes is answered: it never went.
 #[test]
 fn a_phone_send_held_when_its_tab_closes_is_answered() {
-    let (scratch, mut set, tab, provider) = linked_with_a_waiting_presence("move-remote-closed", 4254);
+    let (scratch, mut set, tab, provider, _parked) = linked_with_a_waiting_presence("move-remote-closed", 4254);
     set.send_remote(tab, "phone words", phone()).unwrap();
     assert!(set.send_is_held(tab));
     let removed = set.remove(tab).expect("the tab closes");

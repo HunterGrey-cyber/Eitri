@@ -1028,7 +1028,7 @@ impl ClaudeSidecarProvider {
         let asks_questions = self.capabilities.structured_questions_v1;
         #[cfg(target_os = "linux")]
         let watched = session_id.clone();
-        let task = self.runtime.handle().spawn(async move {
+        let watch = async move {
             // The single exit for every abnormal path. Nothing here may return quietly except the
             // one genuinely normal ending: a session that closed on its own terms.
             let report = |reason: String| {
@@ -1167,6 +1167,10 @@ impl ClaudeSidecarProvider {
                     }
                 }
             }
+        };
+        let events = Arc::clone(&self.events);
+        let task = self.runtime.handle().spawn(async move {
+            events.observe(watch).await;
         });
         #[cfg(target_os = "linux")]
         lock(&self.watches).push(Watch {
@@ -1870,8 +1874,8 @@ impl AgentProvider for ClaudeSidecarProvider {
     /// withdraws a queued message, so each is reported as what the CLI did with it.
     ///
     /// **Refusals** arrive as `UserMessageDropped`, worded for the host's held note (`steer_refusal`).
-    /// `Err` only when the gate refuses it here (the id is open already, or too many are open), when
-    /// nothing was sent either.
+    /// `Err` when admission refuses it here (the id is already open, too many are open, that turn
+    /// has a refusal or lost-answer barrier, or the incoming queue overflowed); nothing was sent.
     fn steer_turn(&self, request: SteerTurnRequest) -> Result<(), ProviderError> {
         self.steer_turn_stamped(request, TurnStamp::default())
     }
@@ -2255,17 +2259,45 @@ impl AgentProvider for ClaudeSidecarProvider {
 #[cfg(target_os = "linux")]
 const MOVE_UNFOLDED_LIMIT: u64 = 500;
 
+const EVENT_QUEUE_BYTES: usize = 64 * 1024 * 1024;
+const EVENT_QUEUE_LOST: &str =
+    "Claude event queue exceeded its memory limit; buffered events were lost and observation stopped";
+
+/// Count every variant's payload without allocating a second copy. Include the inline event and
+/// room for collection overhead; this is a byte estimate, not an allocator measurement.
+fn event_bytes(event: &AgentDomainEvent) -> usize {
+    struct Counter(usize);
+    impl std::io::Write for Counter {
+        fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+            self.0 = self.0.saturating_add(bytes.len());
+            Ok(bytes.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+    let mut count = Counter(std::mem::size_of::<AgentDomainEvent>());
+    if serde_json::to_writer(&mut count, event).is_err() {
+        return EVENT_QUEUE_BYTES + 1;
+    }
+    count.0.saturating_mul(2)
+}
+
 struct EventQueue {
     state: Mutex<QueueState>,
     signal: Arc<crate::provider::EventSignal>,
     /// How long a held turn end waits for its follow-up turn: `steer::FOLLOW_UP_WAIT`, shorter only
     /// in tests.
     follow_up_wait: Duration,
+    /// Cancels the watch even when it is awaiting headers, a reconnect or the next event.
+    overflow: tokio::sync::Notify,
 }
 
 #[derive(Default)]
 struct QueueState {
     ready: Vec<AgentDomainEvent>,
+    ready_bytes: usize,
+    overflowed: bool,
     gate: steer::SteerGate<ProtoSteerTurnRequest>,
     /// The watch's position after the last wire event queued.
     latest: Option<WatchMark>,
@@ -2323,11 +2355,20 @@ impl Default for EventQueue {
 }
 
 impl EventQueue {
+    async fn observe(&self, watch: impl std::future::Future<Output = ()>) {
+        tokio::select! {
+            biased;
+            _ = self.overflow.notified() => {}
+            _ = watch => {}
+        }
+    }
+
     fn with_follow_up_wait(follow_up_wait: Duration) -> Self {
         Self {
             state: Mutex::default(),
             signal: Arc::default(),
             follow_up_wait,
+            overflow: tokio::sync::Notify::new(),
         }
     }
 
@@ -2349,9 +2390,46 @@ impl EventQueue {
 
     /// Makes `events` ready, in order, and wakes the reader when there are any.
     fn deliver(&self, state: &mut QueueState, events: Vec<AgentDomainEvent>) {
+        if state.overflowed {
+            return;
+        }
+        let bytes = events
+            .iter()
+            .fold(state.ready_bytes, |sum, event| sum.saturating_add(event_bytes(event)));
+        if bytes.saturating_add(state.gate.held_bytes()) > EVENT_QUEUE_BYTES {
+            // Preserve message outcomes so the host can settle its sent queue, then drop every
+            // still-open message before the loss. No other prefix represents the session faithfully.
+            eprintln!(
+                "agent: ClaudeSidecarProvider: event queue overflow ({} estimated bytes); observation stopped",
+                bytes.saturating_add(state.gate.held_bytes())
+            );
+            state.overflowed = true;
+            state.ready = std::mem::take(&mut state.ready)
+                .into_iter()
+                .chain(events)
+                .chain(state.gate.release())
+                .filter(|event| {
+                    matches!(
+                        event,
+                        AgentDomainEvent::UserMessageDelivered { .. } | AgentDomainEvent::UserMessageDropped { .. }
+                    )
+                })
+                .collect();
+            state.ready.extend(state.gate.give_up(steer::SESSION_ENDED));
+            state.ready.push(AgentDomainEvent::SessionUnavailable {
+                reason: EVENT_QUEUE_LOST.into(),
+            });
+            state.ready_bytes = state.ready.iter().map(event_bytes).sum();
+            state.gate = steer::SteerGate::default();
+            state.effort_ask = None;
+            self.overflow.notify_one();
+            self.signal.raise();
+            return;
+        }
         if events.is_empty() {
             return;
         }
+        state.ready_bytes = bytes;
         state.ready.extend(events);
         self.signal.raise();
     }
@@ -2361,6 +2439,9 @@ impl EventQueue {
     fn push(self: &Arc<Self>, event: AgentDomainEvent) {
         let hold_started = {
             let mut state = self.lock();
+            if state.overflowed {
+                return;
+            }
             let passed = state.gate.pass(event);
             self.deliver(&mut state, passed.ready);
             self.settle(&mut state);
@@ -2379,6 +2460,9 @@ impl EventQueue {
         {
             let mut state = self.lock();
             for event in events {
+                if state.overflowed {
+                    return;
+                }
                 let passed = state.gate.pass(event);
                 self.deliver(&mut state, passed.ready);
                 holds.extend(passed.hold_started);
@@ -2420,6 +2504,10 @@ impl EventQueue {
             steer::SteerBusy::HoldingTurnEnd => MoveRefusedWhy::HoldingTurnEnd,
         };
         let mut state = self.lock();
+        if state.overflowed {
+            // The discarded backlog cannot be folded, so no replay-safe handoff position exists.
+            return Err(MoveRefusedWhy::FoldBehind);
+        }
         state.gate.hand_over().map_err(busy)?;
         if state.steering > 0 {
             return Err(MoveRefusedWhy::SteerInFlight);
@@ -2498,7 +2586,14 @@ impl EventQueue {
         request: ProtoSteerTurnRequest,
     ) -> Result<Option<ProtoSteerTurnRequest>, ProviderError> {
         let mut state = self.lock();
-        let opened = state.gate.open(client_id, as_typed, request)?;
+        if state.overflowed {
+            return Err(ProviderError::Provider {
+                code: ProviderErrorCode::ProviderUnavailable,
+                message: EVENT_QUEUE_LOST.into(),
+            });
+        }
+        let turn_id = request.expected_turn_id.clone();
+        let opened = state.gate.open(&turn_id, client_id, as_typed, request)?;
         state.opened_since_take = true;
         Ok(opened)
     }
@@ -2672,7 +2767,10 @@ impl EventQueue {
             }
         }
         state.opened_since_take = false;
-        std::mem::take(&mut state.ready)
+        state.ready_bytes = 0;
+        let events = std::mem::take(&mut state.ready);
+        state.gate.taken(&events);
+        events
     }
 
     /// Frozen for a move, or for good once handed on.
@@ -3012,28 +3110,30 @@ pub fn replay_frames(
     let mut pending: Vec<&ReplaySteer> = steers.iter().collect();
     pending.sort_by_key(|s| s.after_events);
     let mut pending = pending.into_iter().peekable();
+    let mut turn_id = String::new();
 
-    let hand_in = |gate: &mut steer::SteerGate<()>, out: &mut Vec<AgentDomainEvent>, steer: &ReplaySteer| {
-        if steer.outcome == ReplaySteerOutcome::Sent {
-            gate.note_sent(&steer.client_message_id, steer.as_typed.clone());
-            return Ok(());
-        }
-        gate.open(&steer.client_message_id, steer.as_typed.clone(), ())
-            .map_err(|e| format!("steered message {}: {e}", steer.client_message_id))?;
-        match &steer.outcome {
-            ReplaySteerOutcome::Accepted => {
-                gate.accepted(&steer.client_message_id);
+    let hand_in =
+        |gate: &mut steer::SteerGate<()>, out: &mut Vec<AgentDomainEvent>, steer: &ReplaySteer, turn: &str| {
+            if steer.outcome == ReplaySteerOutcome::Sent {
+                gate.note_sent(&steer.client_message_id, steer.as_typed.clone());
+                return Ok(());
             }
-            ReplaySteerOutcome::Refused(reason) => out.extend(gate.refused(&steer.client_message_id, reason)),
-            ReplaySteerOutcome::Unknown => out.extend(gate.unknown(&steer.client_message_id)),
-            ReplaySteerOutcome::Sent => unreachable!("noted above"),
-        }
-        Ok::<(), String>(())
-    };
+            gate.open(turn, &steer.client_message_id, steer.as_typed.clone(), ())
+                .map_err(|e| format!("steered message {}: {e}", steer.client_message_id))?;
+            match &steer.outcome {
+                ReplaySteerOutcome::Accepted => {
+                    gate.accepted(&steer.client_message_id);
+                }
+                ReplaySteerOutcome::Refused(reason) => out.extend(gate.refused(&steer.client_message_id, reason)),
+                ReplaySteerOutcome::Unknown => out.extend(gate.unknown(&steer.client_message_id)),
+                ReplaySteerOutcome::Sent => unreachable!("noted above"),
+            }
+            Ok::<(), String>(())
+        };
 
     for (at, event) in frames.iter().enumerate() {
         while let Some(steer) = pending.next_if(|s| s.after_events <= at) {
-            hand_in(&mut gate, &mut out, steer)?;
+            hand_in(&mut gate, &mut out, steer, &turn_id)?;
         }
         if let Some((generation, since)) = hold {
             if event.occurred_at.saturating_sub(since) >= wait_ms {
@@ -3053,6 +3153,9 @@ pub fn replay_frames(
         }
         translated.extend(translate::translate(event.clone(), settings.requested_cli_mode));
         for domain_event in translated {
+            if let AgentDomainEvent::TurnStarted { turn_id: started } = &domain_event {
+                turn_id = started.clone();
+            }
             let passed = gate.pass(domain_event);
             out.extend(passed.ready);
             if let Some(generation) = passed.hold_started {
@@ -3064,7 +3167,7 @@ pub fn replay_frames(
         }
     }
     for steer in pending {
-        hand_in(&mut gate, &mut out, steer)?;
+        hand_in(&mut gate, &mut out, steer, &turn_id)?;
     }
     if let Some((generation, _)) = hold {
         out.extend(gate.expire(generation));
@@ -4461,6 +4564,240 @@ mod tests {
         );
     }
 
+    #[test]
+    fn a_stalled_reader_gets_one_loss_after_a_flood() {
+        assert_flood_is_bounded(false);
+    }
+
+    #[test]
+    fn a_stalled_reader_gets_one_loss_after_a_flood_behind_a_held_end() {
+        assert_flood_is_bounded(true);
+    }
+
+    fn assert_flood_is_bounded(held: bool) {
+        current_thread_runtime().block_on(async {
+            let queue = Arc::new(EventQueue::default());
+            if held {
+                queue
+                    .open_steer("a", "typed".into(), ProtoSteerTurnRequest::default())
+                    .unwrap();
+                queue.steer_accepted("a");
+                queue.push(turn_completed("t1"));
+            }
+            let seen = queue.signal.seen();
+            let chunk = "x".repeat(1024 * 1024);
+            for sequence in 1..=70 {
+                queue.push_wire(vec![text(&chunk)], mark(sequence, "m1"));
+                let state = queue.lock();
+                assert!(state.ready_bytes + state.gate.held_bytes() <= EVENT_QUEUE_BYTES);
+            }
+            assert_eq!(
+                queue.len(),
+                if held { 2 } else { 1 },
+                "open messages are dropped before loss"
+            );
+            assert_ne!(queue.signal.seen(), seen, "loss wakes the stalled reader");
+            let mut events = queue.take();
+            if held {
+                assert_eq!(
+                    events.remove(0),
+                    AgentDomainEvent::UserMessageDropped {
+                        client_message_id: "a".into(),
+                        reason: steer::SESSION_ENDED.into(),
+                    }
+                );
+            }
+            assert!(
+                matches!(&events[..], [AgentDomainEvent::SessionUnavailable { reason }] if reason.contains("queue"))
+            );
+            queue.push_wire(vec![text("later")], mark(71, "m1"));
+            queue.push(AgentDomainEvent::SessionUnavailable {
+                reason: "later loss".into(),
+            });
+            assert!(queue.take().is_empty(), "overflow is terminal and reported only once");
+            assert!(queue
+                .open_steer("later", "typed".into(), ProtoSteerTurnRequest::default())
+                .is_err());
+            #[cfg(target_os = "linux")]
+            assert!(matches!(queue.freeze(), Err(MoveRefusedWhy::FoldBehind)));
+        });
+    }
+
+    #[test]
+    fn queue_overflow_cancels_a_pending_watch_even_before_its_first_poll() {
+        current_thread_runtime().block_on(async {
+            for poll_first in [false, true] {
+                let queue = Arc::new(EventQueue::default());
+                let watching = Arc::clone(&queue);
+                let task = tokio::spawn(async move { watching.observe(std::future::pending()).await });
+                if poll_first {
+                    tokio::task::yield_now().await;
+                }
+                // Start at the accounting boundary so one event exercises overflow and cancellation.
+                queue.lock().ready_bytes = EVENT_QUEUE_BYTES;
+                queue.push(text("over the bound"));
+                tokio::time::timeout(Duration::from_secs(60), task)
+                    .await
+                    .unwrap()
+                    .unwrap();
+            }
+        });
+    }
+
+    #[test]
+    fn taking_events_reclaims_the_queue_budget_and_releasing_a_hold_moves_its_bytes() {
+        current_thread_runtime().block_on(async {
+            let queue = Arc::new(EventQueue::default());
+            let chunk = "x".repeat(1024 * 1024);
+            for _ in 0..70 {
+                queue.push(text(&chunk));
+                assert_eq!(queue.take(), [text(&chunk)]);
+                assert_eq!(queue.lock().ready_bytes, 0);
+            }
+            queue
+                .open_steer("a", "typed".into(), ProtoSteerTurnRequest::default())
+                .unwrap();
+            queue.push(turn_completed("t1"));
+            assert!(queue.lock().gate.held_bytes() > 0);
+            assert!(queue.take().is_empty());
+            assert!(
+                queue.lock().gate.held_bytes() > 0,
+                "taking ready events leaves the held charge"
+            );
+            queue.steer_refused("a", "refused");
+            let state = queue.lock();
+            assert_eq!(state.gate.held_bytes(), 0);
+            assert_eq!(state.ready_bytes, state.ready.iter().map(event_bytes).sum::<usize>());
+        });
+    }
+
+    #[test]
+    fn a_refused_steer_blocks_later_messages_even_after_the_reader_takes_the_drops() {
+        let queue = Arc::new(EventQueue::default());
+        let request = |turn: &str| ProtoSteerTurnRequest {
+            expected_turn_id: turn.into(),
+            ..Default::default()
+        };
+        assert!(queue.open_steer("a", "A".into(), request("t1")).unwrap().is_some());
+        assert!(queue.open_steer("b", "B".into(), request("t1")).unwrap().is_none());
+        queue.steer_refused("a", "Claude is still starting the first turn");
+        assert!(queue.open_steer("c", "C".into(), request("t1")).is_err());
+        let drops = queue.take();
+        assert_eq!(drops.len(), 2);
+        assert!(
+            matches!(&drops[0], AgentDomainEvent::UserMessageDropped { client_message_id, .. } if client_message_id == "a")
+        );
+        assert!(
+            matches!(&drops[1], AgentDomainEvent::UserMessageDropped { client_message_id, .. } if client_message_id == "b")
+        );
+        // Taking events is not folding them: history writes can still hold ingestion here.
+        assert!(queue.open_steer("c", "C".into(), request("t1")).is_err());
+        let mut projection = crate::AgentSessionProjection::default();
+        for event in &drops {
+            projection.apply(event);
+        }
+        assert!(projection.steer_outcome("a").is_some());
+        assert!(projection.steer_outcome("b").is_some());
+        queue.take(); // The next pump follows the fold, even if no new events arrived.
+        assert!(queue
+            .open_steer("retry", "A/B taken back and resubmitted".into(), request("t1"))
+            .unwrap()
+            .is_some());
+        queue.steer_accepted("retry");
+        assert!(queue
+            .open_steer("next", "next turn".into(), request("t2"))
+            .unwrap()
+            .is_some());
+    }
+
+    #[test]
+    fn an_unknown_steer_blocks_overtaking_until_its_waiting_drop_is_folded() {
+        let queue = Arc::new(EventQueue::default());
+        let request = || ProtoSteerTurnRequest {
+            expected_turn_id: "t1".into(),
+            ..Default::default()
+        };
+        queue.open_steer("a", "A".into(), request()).unwrap();
+        queue.open_steer("b", "B".into(), request()).unwrap();
+        queue.steer_unknown("a");
+        assert!(queue.open_steer("c", "C".into(), request()).is_err());
+        let drops = queue.take();
+        assert_eq!(
+            drops,
+            [AgentDomainEvent::UserMessageDropped {
+                client_message_id: "b".into(),
+                reason: steer::BEHIND_AN_UNKNOWN.into(),
+            }]
+        );
+        assert!(queue.open_steer("c", "C".into(), request()).is_err());
+        let mut projection = crate::AgentSessionProjection::default();
+        for event in &drops {
+            projection.apply(event);
+        }
+        assert!(projection.steer_outcome("b").is_some());
+        assert!(queue.take().is_empty());
+        assert!(queue
+            .open_steer("retry", "B taken back".into(), request())
+            .unwrap()
+            .is_some());
+    }
+
+    #[test]
+    fn overflow_preserves_ready_held_and_incoming_steer_outcomes_before_loss() {
+        current_thread_runtime().block_on(async {
+            for location in ["ready", "held", "incoming"] {
+                let queue = Arc::new(EventQueue::default());
+                let request = || ProtoSteerTurnRequest::default();
+                queue.open_steer("open", "still open".into(), request()).unwrap();
+                queue.steer_accepted("open");
+                if location == "held" {
+                    queue.push(turn_completed("t1"));
+                }
+                queue.note_sent("delivered", "read by Claude".into());
+                let delivery = AgentDomainEvent::UserMessageDelivered {
+                    client_message_id: "delivered".into(),
+                    turn_id: "t1".into(),
+                    text: "read by Claude".into(),
+                };
+                queue.push(delivery.clone());
+                queue.open_steer("a", "A".into(), request()).unwrap();
+                queue.open_steer("b", "B".into(), request()).unwrap();
+                if location == "incoming" {
+                    queue.lock().ready_bytes = EVENT_QUEUE_BYTES;
+                }
+                queue.steer_refused("a", "refused");
+                if location != "incoming" {
+                    queue.lock().ready_bytes = EVENT_QUEUE_BYTES;
+                    queue.push(text("overflow"));
+                }
+                let events = queue.take();
+                assert_eq!(
+                    events,
+                    [
+                        delivery,
+                        AgentDomainEvent::UserMessageDropped {
+                            client_message_id: "a".into(),
+                            reason: "refused".into()
+                        },
+                        AgentDomainEvent::UserMessageDropped {
+                            client_message_id: "b".into(),
+                            reason: crate::steer_gate::BEHIND_A_REFUSAL.into()
+                        },
+                        AgentDomainEvent::UserMessageDropped {
+                            client_message_id: "open".into(),
+                            reason: steer::SESSION_ENDED.into()
+                        },
+                        AgentDomainEvent::SessionUnavailable {
+                            reason: EVENT_QUEUE_LOST.into()
+                        },
+                    ],
+                    "{location}"
+                );
+                assert!(queue.take().is_empty());
+            }
+        });
+    }
+
     /// The timer a hold arms runs on the runtime without blocking it, and when no follow-up comes it
     /// drops the open message ahead of the held end and wakes the reader.
     #[test]
@@ -4945,7 +5282,6 @@ mod tests {
         assert!(queue.freeze().is_ok());
     }
 
-    #[cfg(target_os = "linux")]
     fn current_thread_runtime() -> tokio::runtime::Runtime {
         tokio::runtime::Builder::new_current_thread()
             .enable_time()

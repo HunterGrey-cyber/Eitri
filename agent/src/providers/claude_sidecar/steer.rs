@@ -43,8 +43,7 @@
 //! the sending, so every rule here is tested without a sidecar or a runtime. `R` is the request the
 //! caller sends; it is only kept and handed back.
 
-use crate::provider::ProviderError;
-#[cfg(test)]
+use crate::provider::{ProviderError, ProviderErrorCode};
 use crate::steer_gate::BEHIND_A_REFUSAL;
 pub(crate) use crate::steer_gate::MAX_OPEN_STEERS;
 use crate::steer_gate::{self, SteerEntry};
@@ -83,6 +82,7 @@ enum Sending<R> {
 #[derive(Debug)]
 struct OpenSteer<R> {
     client_id: String,
+    turn_id: String,
     /// What the user typed: the wire's delivery event carries no text, and the transcript row shows
     /// this.
     as_typed: String,
@@ -121,12 +121,24 @@ pub(crate) struct Passed {
     pub(crate) hold_started: Option<u64>,
 }
 
+/// Admission stays closed until ingestion has folded the last drop in this batch.
+#[derive(Debug)]
+struct AdmissionBarrier {
+    turn: String,
+    last_drop: String,
+    reason: &'static str,
+    taken: bool,
+}
+
 #[derive(Debug)]
 pub(crate) struct SteerGate<R> {
     /// In the order the host handed them over.
     open: steer_gate::SteerOrder<OpenSteer<R>>,
     /// The held `TurnCompleted` and everything after it, while `holding` is set.
     held: Vec<AgentDomainEvent>,
+    held_bytes: usize,
+    /// A refusal or lost answer closes admission until the host folds its drops.
+    barrier: Option<AdmissionBarrier>,
     /// The generation of the hold in force, so a timer armed for an earlier one does nothing.
     holding: Option<u64>,
     generations: u64,
@@ -153,6 +165,8 @@ impl<R> Default for SteerGate<R> {
         Self {
             open: steer_gate::SteerOrder::default(),
             held: Vec::new(),
+            held_bytes: 0,
+            barrier: None,
             holding: None,
             generations: 0,
             given_up: VecDeque::new(),
@@ -166,8 +180,21 @@ impl<R> Default for SteerGate<R> {
 impl<R> SteerGate<R> {
     /// Takes a message from the host. `Some(request)` means send it now; `None` means it waits for the
     /// message before it to be answered, and [`Self::accepted`] hands it out then. Refused, nothing
-    /// recorded, when the id is already open or too many are open; the host holds it for the turn's end.
-    pub(crate) fn open(&mut self, client_id: &str, as_typed: String, request: R) -> Result<Option<R>, ProviderError> {
+    /// recorded, when the id is already open, too many are open, or that turn has drops awaiting
+    /// the host's fold; the host holds it for the turn's end.
+    pub(crate) fn open(
+        &mut self,
+        turn_id: &str,
+        client_id: &str,
+        as_typed: String,
+        request: R,
+    ) -> Result<Option<R>, ProviderError> {
+        if let Some(barrier) = self.barrier.as_ref().filter(|barrier| barrier.turn == turn_id) {
+            return Err(ProviderError::Provider {
+                code: ProviderErrorCode::SteerUnavailable,
+                message: barrier.reason.into(),
+            });
+        }
         let mut now = None;
         self.open.open(client_id, "Claude", |behind| {
             let sending = if behind {
@@ -178,11 +205,28 @@ impl<R> SteerGate<R> {
             };
             Ok(OpenSteer {
                 client_id: client_id.to_string(),
+                turn_id: turn_id.to_string(),
                 as_typed,
                 sending,
             })
         })?;
         Ok(now)
+    }
+
+    /// Ingestion is the sole production reader and holds `pump_gate` through pump and fold.
+    /// Taking the drops is not a fold acknowledgement; the next take proves that fold finished.
+    pub(crate) fn taken(&mut self, events: &[AgentDomainEvent]) {
+        if self.barrier.as_ref().is_some_and(|barrier| barrier.taken) {
+            self.barrier = None;
+        }
+        if let Some(barrier) = &mut self.barrier {
+            barrier.taken = events.iter().any(|event| {
+                matches!(event,
+                    AgentDomainEvent::UserMessageDropped { client_message_id, .. }
+                        if client_message_id == &barrier.last_drop
+                )
+            });
+        }
     }
 
     /// A prompt is about to be sent with `SendTurn` under `client_id`: its delivery or drop, if Claude
@@ -214,7 +258,17 @@ impl<R> SteerGate<R> {
         let Some(at) = self.open.iter().position(|s| s.client_id == client_id) else {
             return Vec::new();
         };
+        let turn = self.open[at].turn_id.clone();
         let out = self.open.refused(at, reason);
+        let Some(AgentDomainEvent::UserMessageDropped { client_message_id, .. }) = out.last() else {
+            unreachable!("the refused message is dropped");
+        };
+        self.barrier = Some(AdmissionBarrier {
+            turn,
+            last_drop: client_message_id.clone(),
+            reason: BEHIND_A_REFUSAL,
+            taken: false,
+        });
         self.settled(out)
     }
 
@@ -282,6 +336,7 @@ impl<R> SteerGate<R> {
         );
         if self.holding.is_some() {
             let started = matches!(event, AgentDomainEvent::TurnStarted { .. });
+            self.held_bytes = self.held_bytes.saturating_add(super::event_bytes(&event));
             self.held.push(event);
             if terminal {
                 passed.ready = self.give_up_then_release(SESSION_ENDED);
@@ -298,6 +353,7 @@ impl<R> SteerGate<R> {
         if matches!(event, AgentDomainEvent::TurnCompleted { .. }) && !self.open.is_empty() {
             self.generations += 1;
             self.holding = Some(self.generations);
+            self.held_bytes = super::event_bytes(&event);
             self.held.push(event);
             passed.hold_started = self.holding;
             return passed;
@@ -346,6 +402,10 @@ impl<R> SteerGate<R> {
         self.held.len()
     }
 
+    pub(crate) fn held_bytes(&self) -> usize {
+        self.held_bytes
+    }
+
     /// Whether a turn's end is held back for its follow-up.
     pub(crate) fn holding(&self) -> bool {
         self.holding.is_some()
@@ -361,6 +421,9 @@ impl<R> SteerGate<R> {
         let SteerGate {
             open,
             held,
+            held_bytes: _,
+            // A move waits for ingestion's fold. After that the host's held messages enforce order.
+            barrier: _,
             holding,
             // Rebuilt: a gate taken over holds nothing, so it starts counting its holds afresh.
             generations: _,
@@ -409,12 +472,21 @@ impl<R> SteerGate<R> {
         Some((steer.client_id.clone(), request))
     }
 
-    /// Drops every message not sent yet. Nothing of them reached the CLI, so nothing is remembered.
+    /// Drops every unsent message and blocks admission until their fold. Their text is not kept
+    /// for a later delivery because none reached the CLI.
     fn drop_waiting(&mut self, reason: &str) -> Vec<AgentDomainEvent> {
         let (waiting, kept): (Vec<_>, Vec<_>) = std::mem::take(&mut self.open)
             .into_iter()
             .partition(|s| matches!(s.sending, Sending::Waiting(_)));
         self.open = kept.into_iter().collect();
+        if let Some(last) = waiting.last() {
+            self.barrier = Some(AdmissionBarrier {
+                turn: last.turn_id.clone(),
+                last_drop: last.client_id.clone(),
+                reason: BEHIND_AN_UNKNOWN,
+                taken: false,
+            });
+        }
         waiting.into_iter().map(|s| dropped(s.client_id, reason)).collect()
     }
 
@@ -429,6 +501,9 @@ impl<R> SteerGate<R> {
             out.extend(self.release());
             out
         } else {
+            self.held_bytes = out.iter().fold(self.held_bytes, |sum, event| {
+                sum.saturating_add(super::event_bytes(event))
+            });
             self.held.append(&mut out);
             Vec::new()
         }
@@ -436,7 +511,7 @@ impl<R> SteerGate<R> {
 
     /// Every open message is reported dropped with `reason`; those that may have reached the CLI are
     /// remembered, so a delivery that still comes is honoured.
-    fn give_up(&mut self, reason: &str) -> Vec<AgentDomainEvent> {
+    pub(crate) fn give_up(&mut self, reason: &str) -> Vec<AgentDomainEvent> {
         let open = std::mem::take(&mut self.open);
         let mut out = Vec::with_capacity(open.len());
         for steer in open {
@@ -457,8 +532,9 @@ impl<R> SteerGate<R> {
         out
     }
 
-    fn release(&mut self) -> Vec<AgentDomainEvent> {
+    pub(crate) fn release(&mut self) -> Vec<AgentDomainEvent> {
         self.holding = None;
+        self.held_bytes = 0;
         std::mem::take(&mut self.held)
     }
 }
@@ -524,7 +600,7 @@ mod tests {
     /// A gate with one message sent and answered.
     fn one_sent() -> Gate {
         let mut gate = Gate::default();
-        assert_eq!(gate.open("m1", "typed one".into(), "req1").unwrap(), Some("req1"));
+        assert_eq!(gate.open("t1", "m1", "typed one".into(), "req1").unwrap(), Some("req1"));
         assert!(gate.accepted("m1").is_none());
         gate
     }
@@ -589,7 +665,7 @@ mod tests {
     #[test]
     fn the_wait_running_out_drops_the_open_messages_before_the_held_end() {
         let mut gate = one_sent();
-        assert_eq!(gate.open("m2", "typed two".into(), "req2").unwrap(), Some("req2"));
+        assert_eq!(gate.open("t1", "m2", "typed two".into(), "req2").unwrap(), Some("req2"));
         gate.accepted("m2");
         let generation = gate.pass(completed("t1")).hold_started.unwrap();
         assert_eq!(
@@ -703,7 +779,7 @@ mod tests {
     #[test]
     fn a_refusal_of_the_last_open_message_releases_the_hold_with_the_drop_first() {
         let mut gate = Gate::default();
-        gate.open("m1", "typed".into(), "req1").unwrap();
+        gate.open("t1", "m1", "typed".into(), "req1").unwrap();
         assert!(
             gate.pass(completed("t1")).hold_started.is_some(),
             "in flight counts as open"
@@ -723,22 +799,22 @@ mod tests {
     #[test]
     fn a_later_message_waits_unsent_until_the_earlier_one_is_answered() {
         let mut gate = Gate::default();
-        assert_eq!(gate.open("m1", "one".into(), "req1").unwrap(), Some("req1"));
-        assert_eq!(gate.open("m2", "two".into(), "req2").unwrap(), None, "waits");
-        assert_eq!(gate.open("m3", "three".into(), "req3").unwrap(), None, "waits");
+        assert_eq!(gate.open("t1", "m1", "one".into(), "req1").unwrap(), Some("req1"));
+        assert_eq!(gate.open("t1", "m2", "two".into(), "req2").unwrap(), None, "waits");
+        assert_eq!(gate.open("t1", "m3", "three".into(), "req3").unwrap(), None, "waits");
         assert_eq!(gate.accepted("m1"), Some(("m2".to_string(), "req2")));
         assert_eq!(gate.accepted("m2"), Some(("m3".to_string(), "req3")));
         assert_eq!(gate.accepted("m3"), None);
         // With all answered, a new one goes at once.
-        assert_eq!(gate.open("m4", "four".into(), "req4").unwrap(), Some("req4"));
+        assert_eq!(gate.open("t1", "m4", "four".into(), "req4").unwrap(), Some("req4"));
     }
 
     #[test]
     fn a_refusal_drops_the_messages_waiting_behind_it_unsent() {
         let mut gate = Gate::default();
-        gate.open("m1", "one".into(), "req1").unwrap();
-        gate.open("m2", "two".into(), "req2").unwrap();
-        gate.open("m3", "three".into(), "req3").unwrap();
+        gate.open("t1", "m1", "one".into(), "req1").unwrap();
+        gate.open("t1", "m2", "two".into(), "req2").unwrap();
+        gate.open("t1", "m3", "three".into(), "req3").unwrap();
         assert_eq!(
             gate.refused("m1", "why"),
             [
@@ -747,7 +823,8 @@ mod tests {
                 drop_of("m3", BEHIND_A_REFUSAL)
             ]
         );
-        assert_eq!(gate.open("m4", "four".into(), "req4").unwrap(), Some("req4"));
+        assert!(gate.open("t1", "m4", "four".into(), "req4").is_err());
+        assert_eq!(gate.open("t2", "m4", "four".into(), "req4").unwrap(), Some("req4"));
     }
 
     /// A lost answer: the message may be with the CLI, so it stays open for its outcome; what waits
@@ -755,8 +832,8 @@ mod tests {
     #[test]
     fn a_lost_answer_keeps_the_message_open_and_drops_what_waits_behind_it() {
         let mut gate = Gate::default();
-        gate.open("m1", "one".into(), "req1").unwrap();
-        gate.open("m2", "two".into(), "req2").unwrap();
+        gate.open("t1", "m1", "one".into(), "req1").unwrap();
+        gate.open("t1", "m2", "two".into(), "req2").unwrap();
         assert_eq!(gate.unknown("m1"), [drop_of("m2", BEHIND_AN_UNKNOWN)]);
         assert_eq!(
             gate.pass(delivered("m1", "t1")).ready,
@@ -765,10 +842,49 @@ mod tests {
     }
 
     #[test]
+    fn a_lost_answer_without_waiting_messages_needs_no_barrier() {
+        let mut gate = Gate::default();
+        gate.open("t1", "a", "A".into(), "a").unwrap();
+        assert!(gate.unknown("a").is_empty());
+        assert_eq!(gate.open("t1", "b", "B".into(), "b").unwrap(), Some("b"));
+    }
+
+    #[test]
+    fn takes_before_the_barriers_held_drop_do_not_acknowledge_it() {
+        let mut gate = Gate::default();
+        gate.open("t1", "a", "A".into(), "a").unwrap();
+        gate.open("t1", "b", "B".into(), "b").unwrap();
+        gate.pass(completed("t1"));
+        assert!(gate.unknown("a").is_empty(), "B's drop is held behind the end");
+        gate.taken(&[drop_of("unrelated", "refused")]);
+        gate.taken(&[]);
+        assert!(gate.open("t1", "c", "C".into(), "c").is_err());
+        let released = gate.pass(started("t2")).ready;
+        gate.taken(&released);
+        assert!(gate.open("t1", "c", "C".into(), "c").is_err());
+        gate.taken(&[]);
+        assert_eq!(gate.open("t1", "c", "C".into(), "c").unwrap(), Some("c"));
+    }
+
+    #[test]
+    fn a_new_barrier_cannot_be_acknowledged_by_an_older_drops_take() {
+        let mut gate = Gate::default();
+        gate.open("t1", "a", "A".into(), "a").unwrap();
+        let first = gate.refused("a", "refused");
+        gate.taken(&first);
+        gate.open("t2", "b", "B".into(), "b").unwrap();
+        let second = gate.refused("b", "refused");
+        gate.taken(&second);
+        assert!(gate.open("t2", "c", "C".into(), "c").is_err());
+        gate.taken(&[]);
+        assert_eq!(gate.open("t2", "c", "C".into(), "c").unwrap(), Some("c"));
+    }
+
+    #[test]
     fn a_message_never_sent_is_not_remembered_when_the_wait_runs_out() {
         let mut gate = Gate::default();
-        gate.open("m1", "one".into(), "req1").unwrap();
-        gate.open("m2", "two".into(), "req2").unwrap();
+        gate.open("t1", "m1", "one".into(), "req1").unwrap();
+        gate.open("t1", "m2", "two".into(), "req2").unwrap();
         let generation = gate.pass(completed("t1")).hold_started.unwrap();
         gate.expire(generation);
         assert!(gate.pass(delivered("m2", "t2")).ready.is_empty(), "m2 never left");
@@ -778,20 +894,20 @@ mod tests {
     #[test]
     fn an_id_already_open_and_too_many_open_are_refused() {
         let mut gate = one_sent();
-        assert!(gate.open("m1", "again".into(), "x").is_err());
+        assert!(gate.open("t1", "m1", "again".into(), "x").is_err());
         for n in 2..=MAX_OPEN_STEERS {
             let id = format!("m{n}");
-            gate.open(&id, String::new(), "x").unwrap();
+            gate.open("t1", &id, String::new(), "x").unwrap();
             gate.accepted(&id);
         }
-        assert!(gate.open("one-more", String::new(), "x").is_err());
+        assert!(gate.open("t1", "one-more", String::new(), "x").is_err());
     }
 
     #[test]
     fn a_gate_with_a_message_open_or_a_held_end_is_not_handed_over() {
         let mut gate: Gate = SteerGate::default();
         assert_eq!(gate.hand_over(), Ok(Vec::new()));
-        assert_eq!(gate.open("a", "typed".into(), "req").unwrap(), Some("req"));
+        assert_eq!(gate.open("t1", "a", "typed".into(), "req").unwrap(), Some("req"));
         assert_eq!(gate.hand_over(), Err(SteerBusy::Open), "sent, not answered");
         gate.accepted("a");
         assert_eq!(gate.hand_over(), Err(SteerBusy::Open), "answered, not delivered");
@@ -806,7 +922,7 @@ mod tests {
     #[test]
     fn a_message_given_up_on_is_handed_over_and_a_late_delivery_is_honoured_by_the_taker() {
         let mut gate: Gate = SteerGate::default();
-        gate.open("a", "typed".into(), "req").unwrap();
+        gate.open("t1", "a", "typed".into(), "req").unwrap();
         gate.accepted("a");
         let generation = gate.pass(completed("t1")).hold_started.unwrap();
         gate.expire(generation);
@@ -894,7 +1010,7 @@ mod tests {
         for n in 0..MAX_OPEN_STEERS {
             gate.note_sent(&format!("p{n}"), String::new());
         }
-        gate.open("steer", "typed steer".into(), "req").unwrap();
+        gate.open("t1", "steer", "typed steer".into(), "req").unwrap();
         gate.accepted("steer");
         let generation = gate.pass(completed("t1")).hold_started.unwrap();
         gate.expire(generation);
@@ -921,7 +1037,7 @@ mod tests {
             .collect();
         let mut middle: Gate = SteerGate::taken_over(handed);
         middle.note_sent("mine", "typed here".into());
-        middle.open("steer", "typed steer".into(), "req").unwrap();
+        middle.open("t1", "steer", "typed steer".into(), "req").unwrap();
         middle.accepted("steer");
         let generation = middle.pass(completed("t1")).hold_started.unwrap();
         middle.expire(generation);
