@@ -209,8 +209,14 @@ fn this_program(state: &AgentPanelState) -> std::io::Result<PathBuf> {
 /// without tools, and the next start tries again.
 fn bridge_host(state: &mut AgentPanelState) -> Option<&BridgeHost> {
     if state.editor_bridge.is_none() {
-        let runtime = std::env::var_os("XDG_RUNTIME_DIR");
-        let dir = eitri_core::panel_control::control_dir(runtime.as_deref(), &std::env::temp_dir());
+        // A test's bridge sockets go in its own test root, never the shared temp dir or the user's runtime dir.
+        #[cfg(test)]
+        agent::state_dirs::redirect_state_to_a_test_root();
+        let runtime = agent::state_dirs::runtime_dir();
+        let dir = eitri_core::panel_control::control_dir(
+            runtime.as_deref().map(std::path::Path::as_os_str),
+            &std::env::temp_dir(),
+        );
         let wake = state.wake.as_ref().map_or_else(
             || std::sync::Arc::new(|| ()) as agent::UiWake,
             crate::panel_wake::PanelWake::waker,

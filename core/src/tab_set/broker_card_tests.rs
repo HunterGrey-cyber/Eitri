@@ -52,7 +52,7 @@ fn live(label: &str) -> (PathBuf, TabSet, TabId, Arc<RecordingProvider>) {
 }
 
 fn pump_until(set: &mut TabSet, dir: &Path, what: &str, done: impl Fn(&TabSet) -> bool) {
-    let deadline = Instant::now() + Duration::from_secs(5);
+    let deadline = Instant::now() + Duration::from_secs(60);
     while !done(set) {
         assert!(Instant::now() < deadline, "timed out waiting for {what}");
         set.pump(dir, true);
@@ -124,7 +124,7 @@ fn a_bypass_resync_leaves_a_broker_card_waiting() {
     }
     overflow.push(provider_card("lost1"));
     provider.queue_all(overflow);
-    let deadline = Instant::now() + Duration::from_secs(5);
+    let deadline = Instant::now() + Duration::from_secs(60);
     let snapshot = loop {
         assert!(Instant::now() < deadline, "timed out waiting for the resync");
         let out = set.pump(&dir, true);

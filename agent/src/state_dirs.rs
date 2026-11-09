@@ -196,6 +196,38 @@ fn account_home_dir() -> std::io::Result<PathBuf> {
     }
 }
 
+/// The runtime directory a socket's private directory goes under: `$XDG_RUNTIME_DIR` as set, or, once
+/// [`redirect_state_to_a_test_root`] has run in this process, `<test root>/run` (created 0700).
+///
+/// Every site that binds a socket another process connects to (the sidecar's, the editor bridge's) reads
+/// it here rather than from the environment. Under a test root a test's sockets stay in what the test
+/// owns: without it a run with no `XDG_RUNTIME_DIR` leaves `<TMPDIR>/eitri-<uid>` in the shared temp dir
+/// (the fallback `socket_path::private_socket_dir` uses), and a run with one binds beside a real window's
+/// sockets in the user's own `$XDG_RUNTIME_DIR/eitri`. `None` when neither applies, or when the test
+/// root's directory cannot be made (the caller then falls back as it would without the variable).
+pub fn runtime_dir() -> Option<PathBuf> {
+    if let Some(root) = test_root() {
+        return test_runtime_dir(root).ok();
+    }
+    std::env::var_os("XDG_RUNTIME_DIR").map(PathBuf::from)
+}
+
+fn test_runtime_dir(root: &Path) -> std::io::Result<PathBuf> {
+    use std::os::unix::fs::DirBuilderExt;
+    let dir = root.join("run");
+    match std::fs::DirBuilder::new()
+        .mode(crate::private_fs::PRIVATE_DIR_MODE)
+        .create(&dir)
+    {
+        // Created here: the umask may have taken bits off the mode, and a runtime directory open to others is not
+        // used (the socket code then falls back as it would with no runtime directory).
+        Ok(()) => crate::private_fs::make_dir_private(&dir)?,
+        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {}
+        Err(e) => return Err(e),
+    }
+    Ok(dir)
+}
+
 /// Points every directory above at a disposable root for the rest of this PROCESS, and returns it.
 ///
 /// Test-only (see this module's header for why it is not `#[cfg(test)]`). Idempotent: the first

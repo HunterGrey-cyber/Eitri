@@ -153,6 +153,13 @@ fn scratch_dir(case: &str) -> std::path::PathBuf {
     std::env::temp_dir().join(format!("eq-{}-{case}", std::process::id()))
 }
 
+/// `<scratch>/t`, made here: nvim falls back to `/tmp` when `TMPDIR` names no directory.
+fn scratch_tmp(scratch: &Path) -> std::path::PathBuf {
+    let tmp = scratch.join("t");
+    std::fs::create_dir_all(&tmp).expect("the scratch's temp dir");
+    tmp
+}
+
 fn spawn_nvim(scratch: &Path, socket_path: &Path) -> Child {
     spawn_nvim_with(scratch, socket_path, &["-n"])
 }
@@ -166,6 +173,8 @@ fn spawn_nvim_with(scratch: &Path, socket_path: &Path, extra: &[&str]) -> Child 
         .env("XDG_STATE_HOME", scratch.join("state"))
         .env("XDG_DATA_HOME", scratch.join("data"))
         .env("XDG_CONFIG_HOME", scratch.join("config"))
+        // nvim's own `nvim.<user>` temp directory goes in the scratch, not in the shared temp dir it would outlive.
+        .env("TMPDIR", scratch_tmp(scratch))
         .env("EITRI_PANE_SWITCH_SOCKET", socket_path)
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())

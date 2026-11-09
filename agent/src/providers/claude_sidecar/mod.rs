@@ -771,6 +771,8 @@ impl ClaudeSidecarProvider {
     #[cfg(feature = "test-support")]
     #[doc(hidden)]
     pub fn connect_to_program(instance_id: &str, program: &std::path::Path) -> std::io::Result<Self> {
+        // A stand-in's socket and records go in the test's own root, never the shared temp dir.
+        crate::state_dirs::redirect_state_to_a_test_root();
         Self::around(spawn::spawn_program(instance_id, program)?)
     }
 
@@ -782,6 +784,7 @@ impl ClaudeSidecarProvider {
         program: &std::path::Path,
         exe_dir: &std::path::Path,
     ) -> std::io::Result<Self> {
+        crate::state_dirs::redirect_state_to_a_test_root();
         spawn::spawn_program(instance_id, program)
             .and_then(|sidecar| Self::around_in(sidecar, Some(exe_dir)))
             .map_err(|error| with_failure_notes(error, Some(exe_dir)))

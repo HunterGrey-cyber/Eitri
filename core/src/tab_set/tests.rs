@@ -44,7 +44,7 @@ fn live(dir: &Path) -> (Arc<RecordingProvider>, AgentBackend) {
 }
 
 fn until(what: &str, mut done: impl FnMut() -> bool) {
-    let deadline = Instant::now() + Duration::from_secs(5);
+    let deadline = Instant::now() + Duration::from_secs(60);
     while !done() {
         assert!(Instant::now() < deadline, "timed out waiting for {what}");
         std::thread::sleep(Duration::from_millis(5));

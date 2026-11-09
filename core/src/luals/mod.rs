@@ -223,11 +223,18 @@ pub fn setup(
         let config = crate::config_dir::resolve(env)?;
         let data = data_dir(env)?;
         let outcome = write_luarc(&config, &data).map_err(|e| e.to_string())?;
+        // What was set up and the one step left: lua_ls reads a workspace file when it starts on the workspace.
         match outcome {
-            LuarcOutcome::Created(path) => writeln!(out, "{}", path.display()),
+            LuarcOutcome::Created(path) => writeln!(
+                out,
+                "created {}: lua_ls now completes and checks eitri.* in {}\n\
+                 reopen init.lua in your editor (or restart lua_ls there) to use it",
+                path.display(),
+                config.join("init.lua").display()
+            ),
             LuarcOutcome::Existing { path, line } => writeln!(
                 out,
-                "{} already exists; left unchanged. Add this line to it:\n{line}",
+                "{} already exists; left unchanged. Add this line to it so lua_ls knows eitri.*:\n{line}",
                 path.display()
             ),
         }

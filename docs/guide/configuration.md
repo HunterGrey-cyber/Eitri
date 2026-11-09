@@ -64,7 +64,8 @@ eitri setup lua-ls
 ```
 
 `lua_ls` and `luals` are also accepted as the target. The command uses Eitri's configuration directory,
-including `EITRI_CONFIG_DIR`, and prints the new `.luarc.json` path. If `.luarc.json` or `.luarc.jsonc` already
+including `EITRI_CONFIG_DIR`, says which `.luarc.json` it created, and tells you to reopen `init.lua` (or restart
+`lua_ls`) so it takes effect. If `.luarc.json` or `.luarc.jsonc` already
 exists, Eitri leaves it alone and prints the `"workspace.library"` line to add yourself.
 It never overwrites either file and never touches `~/.config/nvim`.
 

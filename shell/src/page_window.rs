@@ -747,13 +747,15 @@ mod tests {
 
     const PATIENCE: Duration = Duration::from_secs(30);
 
-    /// A private scratch directory of the test's own, removed when dropped.
+    /// A private scratch directory of the test's own, removed when dropped. Its name is short because control
+    /// sockets are bound inside it and a socket path may not pass 103 bytes, whatever `TMPDIR` the run has.
     struct Scratch(PathBuf);
 
     impl Scratch {
         fn new(label: &str) -> Scratch {
             use std::os::unix::fs::PermissionsExt;
-            let dir = std::env::temp_dir().join(format!("eitri-page-window-{label}-{}", uuid::Uuid::new_v4().simple()));
+            let id = &uuid::Uuid::new_v4().simple().to_string()[..12];
+            let dir = std::env::temp_dir().join(format!("epw-{label}-{id}"));
             std::fs::create_dir(&dir).unwrap();
             std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700)).unwrap();
             Scratch(dir)

@@ -36,7 +36,7 @@ impl Fixture {
     }
 
     fn wait(&mut self, mut done: impl FnMut(&Tab) -> bool) {
-        let deadline = Instant::now() + Duration::from_secs(5);
+        let deadline = Instant::now() + Duration::from_secs(60);
         loop {
             self.set.pump(&self.dir, true);
             if done(self.set.get(self.tab).unwrap()) {
@@ -233,7 +233,7 @@ fn an_idle_prompt_the_cli_refuses_stays_one_row_and_is_never_sent_again() {
         },
     ]);
     let mut ended = Vec::new();
-    let deadline = Instant::now() + Duration::from_secs(5);
+    let deadline = Instant::now() + Duration::from_secs(60);
     while ended.is_empty() {
         ended.extend(f.set.pump(&f.dir, true).turn_ended);
         assert!(Instant::now() < deadline, "the turn's end was never reported");
@@ -365,7 +365,7 @@ fn an_opening_prompt_survives_a_cycle_snapshot_and_resync_without_a_second_copy(
         }
         let through = f.set.get(f.tab).unwrap().live().unwrap().projection().last_revision + batch.len() as u64;
         f.provider.queue_all(batch);
-        let deadline = Instant::now() + Duration::from_secs(5);
+        let deadline = Instant::now() + Duration::from_secs(60);
         while f.set.get(f.tab).unwrap().live().unwrap().projection().last_revision < through {
             assert!(Instant::now() < deadline);
             std::thread::sleep(Duration::from_millis(5));

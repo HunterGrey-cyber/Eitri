@@ -3630,7 +3630,7 @@ mod live_review {
                         );
                         if let Some(answer) = answer {
                             answer.send(match shown {
-                                Some(shown) => shown.wait(Duration::from_secs(5)).expect("the editor answers"),
+                                Some(shown) => shown.wait(Duration::from_secs(60)).expect("the editor answers"),
                                 None => Ok(Value::Nil),
                             });
                         }

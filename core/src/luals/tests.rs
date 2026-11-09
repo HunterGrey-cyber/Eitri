@@ -262,9 +262,18 @@ fn setup_aliases_create_and_existing_prints_the_line_with_exit_zero() {
         let args = [OsString::from(target)];
         assert_eq!(setup(&args, &env_at(&scratch.0), &mut out, &mut err), 0);
         assert!(err.is_empty());
+        let said = String::from_utf8_lossy(&out).into_owned();
+        // It names the file it made, what that gives, and what to do for it to take effect.
         assert!(
-            String::from_utf8_lossy(&out).contains(&scratch.0.join(".config/eitri/.luarc.json").display().to_string())
+            said.contains(&format!(
+                "created {}",
+                scratch.0.join(".config/eitri/.luarc.json").display()
+            )),
+            "{said}"
         );
+        assert!(said.contains("lua_ls") && said.contains("init.lua"), "{said}");
+        assert!(said.contains("restart lua_ls"), "{said}");
+        assert!(said.lines().count() <= 3, "brief: {said}");
         out.clear();
         assert_eq!(setup(&args, &env_at(&scratch.0), &mut out, &mut err), 0);
         let said = String::from_utf8(out).unwrap();

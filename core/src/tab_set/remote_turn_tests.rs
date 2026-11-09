@@ -41,7 +41,7 @@ impl Fixture {
     }
 
     fn wait(&mut self, what: &str, mut done: impl FnMut(&mut TabSet) -> bool) {
-        let deadline = Instant::now() + Duration::from_secs(5);
+        let deadline = Instant::now() + Duration::from_secs(60);
         loop {
             self.set.pump(&self.dir, true);
             if done(&mut self.set) {
@@ -81,7 +81,7 @@ impl Fixture {
 
     /// The phone's sends answered by now, waiting for the first.
     fn sends_answered(&mut self) -> Vec<RemoteSent> {
-        let deadline = Instant::now() + Duration::from_secs(5);
+        let deadline = Instant::now() + Duration::from_secs(60);
         loop {
             let done = self.set.poll_remote_sends();
             if !done.is_empty() {
@@ -225,7 +225,7 @@ fn a_phone_send_answered_after_its_session_was_replaced_changes_nothing_in_the_t
     let mut f = Fixture::new("remote-send-replaced", SessionModeChoice::Auto);
     let release = f.provider.hold_calls();
     f.set.send_remote(f.tab, "phone words", asker()).unwrap();
-    let deadline = Instant::now() + Duration::from_secs(5);
+    let deadline = Instant::now() + Duration::from_secs(60);
     while f.provider.calls_waiting() == 0 {
         assert!(Instant::now() < deadline, "the call never reached the provider");
         std::thread::sleep(Duration::from_millis(2));

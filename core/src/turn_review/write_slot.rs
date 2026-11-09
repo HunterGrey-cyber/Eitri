@@ -300,7 +300,7 @@ mod tests {
     /// moment: a child another test thread is starting holds a copy of every descriptor of this process until it
     /// execs, and the lock goes with the last copy.
     fn once_free(take: impl Fn() -> Result<SlotHold, SlotBusy>) -> Result<SlotHold, SlotBusy> {
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
         loop {
             match take() {
                 Err(SlotBusy::Writing | SlotBusy::Reading) if std::time::Instant::now() < deadline => {

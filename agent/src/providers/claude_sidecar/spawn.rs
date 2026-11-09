@@ -1612,7 +1612,7 @@ fn spawn_resolved(
     // SAFETY: `geteuid` has no preconditions and cannot fail.
     let euid = unsafe { libc::geteuid() };
     let socket_dir = crate::socket_path::private_socket_dir(
-        std::env::var_os("XDG_RUNTIME_DIR").map(PathBuf::from).as_deref(),
+        crate::state_dirs::runtime_dir().as_deref(),
         &std::env::temp_dir(),
         euid,
     )?;

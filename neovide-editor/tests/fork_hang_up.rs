@@ -31,7 +31,8 @@ fn runtime() -> tokio::runtime::Runtime {
 fn scratch(case: &str) -> PathBuf {
     let dir = std::env::temp_dir().join(format!("nvhang-{}-{case}", std::process::id()));
     let _ = std::fs::remove_dir_all(&dir);
-    std::fs::create_dir_all(&dir).expect("scratch dir");
+    // nvim's own `nvim.<user>` temp directory goes in here, not in the shared temp dir it would outlive.
+    std::fs::create_dir_all(dir.join("t")).expect("scratch dir");
     dir
 }
 
@@ -42,7 +43,8 @@ fn embedded(program: &Path, args: &[&str], dir: &Path) -> NeovimInstance {
         .current_dir(dir)
         .env("XDG_STATE_HOME", dir.join("state"))
         .env("XDG_CONFIG_HOME", dir.join("config"))
-        .env("XDG_DATA_HOME", dir.join("data"));
+        .env("XDG_DATA_HOME", dir.join("data"))
+        .env("TMPDIR", dir.join("t"));
     NeovimInstance::Embedded(command)
 }
 
@@ -114,6 +116,7 @@ fn a_hang_up_on_a_server_session_closes_the_servers_channel() {
         .arg(&socket)
         .current_dir(&dir)
         .env("XDG_STATE_HOME", dir.join("state"))
+        .env("TMPDIR", dir.join("t"))
         .spawn()
         .expect("nvim must be on PATH for this test");
     let deadline = Instant::now() + Duration::from_secs(5);

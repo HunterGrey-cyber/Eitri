@@ -582,7 +582,8 @@ mod tests {
     fn scratch(case: &str) -> PathBuf {
         let dir = std::env::temp_dir().join(format!("nvchild-{}-{case}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).expect("scratch dir");
+        // nvim's own `nvim.<user>` temp directory goes in here, not in the shared temp dir it would outlive.
+        std::fs::create_dir_all(dir.join("t")).expect("scratch dir");
         dir
     }
 
@@ -608,6 +609,7 @@ mod tests {
             .env("XDG_STATE_HOME", dir.join("state"))
             .env("XDG_DATA_HOME", dir.join("data"))
             .env("XDG_CONFIG_HOME", dir.join("config"))
+            .env("TMPDIR", dir.join("t"))
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::null())
@@ -675,6 +677,7 @@ mod tests {
             .env("XDG_STATE_HOME", dir.join("state"))
             .env("XDG_DATA_HOME", dir.join("data"))
             .env("XDG_CONFIG_HOME", dir.join("config"))
+            .env("TMPDIR", dir.join("t"))
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::null())
@@ -698,6 +701,7 @@ mod tests {
             .env("XDG_STATE_HOME", dir.join("state"))
             .env("XDG_DATA_HOME", dir.join("data"))
             .env("XDG_CONFIG_HOME", dir.join("config"))
+            .env("TMPDIR", dir.join("t"))
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::null())
@@ -852,6 +856,7 @@ mod tests {
             .env("XDG_STATE_HOME", dir.join("state"))
             .env("XDG_DATA_HOME", dir.join("data"))
             .env("XDG_CONFIG_HOME", dir.join("config"))
+            .env("TMPDIR", dir.join("t"))
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::null())
@@ -937,7 +942,8 @@ mod tests {
                     tokio::process::Command::new(&wrapper)
                         .args(["--clean", "--embed", "-n"])
                         .current_dir(&dir)
-                        .env("XDG_STATE_HOME", dir.join("state")),
+                        .env("XDG_STATE_HOME", dir.join("state"))
+                        .env("TMPDIR", dir.join("t")),
                     Dummy::new(),
                 )
                 .await
@@ -995,7 +1001,8 @@ mod tests {
                     tokio::process::Command::new(&wrapper)
                         .args(["--clean", "--embed", "-n"])
                         .current_dir(&dir)
-                        .env("XDG_STATE_HOME", dir.join("state")),
+                        .env("XDG_STATE_HOME", dir.join("state"))
+                        .env("TMPDIR", dir.join("t")),
                     Dummy::new(),
                 )
                 .await
@@ -1082,6 +1089,7 @@ mod tests {
             .env("XDG_STATE_HOME", dir.join("state"))
             .env("XDG_DATA_HOME", dir.join("data"))
             .env("XDG_CONFIG_HOME", dir.join("config"))
+            .env("TMPDIR", dir.join("t"))
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::null())
@@ -1297,7 +1305,8 @@ mod tests {
             .current_dir(&dir)
             .env("XDG_STATE_HOME", dir.join("state"))
             .env("XDG_DATA_HOME", dir.join("data"))
-            .env("XDG_CONFIG_HOME", dir.join("config"));
+            .env("XDG_CONFIG_HOME", dir.join("config"))
+            .env("TMPDIR", dir.join("t"));
         let session = runtime
             .block_on(neovide::bridge::session::NeovimSession::new(
                 neovide::bridge::session::NeovimInstance::Embedded(command),

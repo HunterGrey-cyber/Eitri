@@ -8,7 +8,7 @@ import { editorResult, editorRow } from "./editorRows";
 import { subagentOf } from "./externalTools";
 import { countEscapes, revealHidden } from "./revealHidden";
 import { toolCardLine } from "./display";
-import { useProjectRelative } from "./projectPath";
+import { ProjectDirContext, useProjectRelative } from "./projectPath";
 
 export type ToolRenderConfig = {
   label: string;
@@ -34,9 +34,10 @@ export type ToolRenderConfig = {
   /** Whether the call's answer is text another party wrote and is drawn through `revealHidden`, in the
    *  folded preview and expanded alike. Rows of the editor's own tools say yes; the others draw as before. */
   revealResult?: (input: unknown) => boolean;
-  /** A plain-text body for an ordinary expanded row; null keeps the original answer.
+  /** A plain-text body for an ordinary expanded row; null keeps the original answer. A path under `projectDir` (the
+   *  panel's project root, `""` before it is known) is drawn relative to it.
    *  Detailed view always uses the original result, which is never rewritten. */
-  resultText?: (input: unknown, result: ToolCallRecord["result"]) => string | null;
+  resultText?: (input: unknown, result: ToolCallRecord["result"], projectDir: string) => string | null;
 };
 
 /** How much of a tool result is rendered inline, head and tail respectively.
@@ -326,10 +327,11 @@ const EDITOR_TOOL_PREFIX = `mcp__${EDITOR_SERVER}__`;
 
 /** One editor tool's row: what happened in words (`editorRows.ts`), the tool's name and a one-line summary of
  *  its input for a tool that table does not know. */
-function editorToolRow(tool: string, input: unknown, result: ToolCallRecord["result"] | undefined): ReactNode {
+function EditorToolRow({ tool, input, result }: { tool: string; input: unknown; result: ToolCallRecord["result"] | undefined }) {
+  const projectDir = useContext(ProjectDirContext);
   return (
     <div className="tool-card">
-      <Shown text={editorRow(tool, input, result ?? null) ?? `${tool}: ${summarizeInput(input)}`} />
+      <Shown text={editorRow(tool, input, result ?? null, projectDir) ?? `${tool}: ${summarizeInput(input)}`} />
     </div>
   );
 }
@@ -337,9 +339,9 @@ function editorToolRow(tool: string, input: unknown, result: ToolCallRecord["res
 function editorConfig(tool: string): ToolRenderConfig {
   return {
     label: tool,
-    resultText: (input, result) => editorResult(tool, input, result),
+    resultText: (input, result, projectDir) => editorResult(tool, input, result, projectDir),
     revealResult: () => true,
-    renderInvocation: (input, { result }) => editorToolRow(tool, input, result),
+    renderInvocation: (input, { result }) => <EditorToolRow tool={tool} input={input} result={result} />,
   };
 }
 
@@ -370,15 +372,15 @@ const execConfig: ToolRenderConfig = {
 
 const codexMcp: ToolRenderConfig = {
   label: "Tool call",
-  resultText: (input, result) => textField(input, "server") === EDITOR_SERVER
-    ? editorResult(textField(input, "tool"), (input as { arguments?: unknown }).arguments, result) : null,
+  resultText: (input, result, projectDir) => textField(input, "server") === EDITOR_SERVER
+    ? editorResult(textField(input, "tool"), (input as { arguments?: unknown }).arguments, result, projectDir) : null,
   revealResult: (input) => textField(input, "server") === EDITOR_SERVER,
   renderInvocation: (input, { expanded, result }) => {
     if (saysNothing(input)) return <div className="tool-card">tool call</div>;
     const args = input && typeof input === "object" ? (input as Record<string, unknown>).arguments : undefined;
     if (textField(input, "server") === EDITOR_SERVER) {
       if (textField(input, "tool") === "nvim_exec") return execConfig.renderInvocation(args, { expanded, result });
-      return editorToolRow(textField(input, "tool"), args, result);
+      return <EditorToolRow tool={textField(input, "tool")} input={args} result={result} />;
     }
     return (
       <div className="tool-card">
@@ -783,7 +785,15 @@ function ChangedInputNote({ name, change }: { name: string; change: InputChange 
 export function renderToolCall(
   call: ToolCallRecord,
   showResult = true,
-  opts: { gated?: boolean; detailed?: boolean; expanded?: boolean; abandoned?: boolean; cardLine?: string | null } = {},
+  opts: {
+    gated?: boolean;
+    detailed?: boolean;
+    expanded?: boolean;
+    abandoned?: boolean;
+    cardLine?: string | null;
+    /** The panel's project root, for the paths a readable body draws (`ToolRenderConfig.resultText`). */
+    projectDir?: string;
+  } = {},
 ): ReactNode {
   const config = lookupTool(call.name);
   const cardLine = opts.cardLine === undefined ? toolCardLine(call) : opts.cardLine;
@@ -869,9 +879,9 @@ export function renderToolCall(
       {deniedNote}
       {changedNote}
       {!opts.gated && cardLine !== null && !specialInvocation && <div className="tool-rule-note">{withFailureWords(cardLine, (part) => <Shown text={part} />)}</div>}
-      {showOrdinaryResult && shown && <ToolResult result={call.result} text={opts.detailed ? null : config?.resultText?.(call.input, call.result)} detailed={opts.detailed === true} abandoned={opts.abandoned === true} reveal={reveal} />}
+      {showOrdinaryResult && shown && <ToolResult result={call.result} text={opts.detailed ? null : config?.resultText?.(call.input, call.result, opts.projectDir ?? "")} detailed={opts.detailed === true} abandoned={opts.abandoned === true} reveal={reveal} />}
       {showOrdinaryResult && !shown && call.result !== null && (config?.previewSuccess !== false || call.result.isError) && (
-        <ToolResultPreview result={call.result} text={opts.detailed ? null : config?.resultText?.(call.input, call.result)} wrapped={call.denied !== undefined && call.result.isError} reveal={reveal} />
+        <ToolResultPreview result={call.result} text={opts.detailed ? null : config?.resultText?.(call.input, call.result, opts.projectDir ?? "")} wrapped={call.denied !== undefined && call.result.isError} reveal={reveal} />
       )}
     </div>
   );

@@ -1,5 +1,5 @@
 [English](configuration.md) | 简体中文
-<!-- translated-from: configuration.md sha256=42f32f01a4d604020e62f84ef2e12b06f9d30e7908c38e2e228bf5b964b467c8 -->
+<!-- translated-from: configuration.md sha256=cb9f2f1e31e3a5642ad8a636b2e63fe7ec75d9e7a49f568cd8f84d07cc0b2a8b -->
 
 # 配置
 
@@ -39,7 +39,7 @@ eitri setup lua-ls
 ```
 
 目标名称也可以写成 `lua_ls` 或 `luals`。命令使用 Eitri 的配置目录（包括 `EITRI_CONFIG_DIR` 的覆盖），
-并打印新建的 `.luarc.json` 路径。如果已有 `.luarc.json` 或 `.luarc.jsonc`，Eitri 会保留原文件，
+说明新建了哪个 `.luarc.json`，并提示重新打开 `init.lua`（或重启 `lua_ls`）使其生效。如果已有 `.luarc.json` 或 `.luarc.jsonc`，Eitri 会保留原文件，
 打印需要自行添加的 `"workspace.library"` 行。它不会覆盖这两个文件，也不会触碰 `~/.config/nvim`。
 
 API 定义保存在 `$XDG_DATA_HOME/eitri/lua/meta/eitri.lua`；`XDG_DATA_HOME` 未设置或为相对路径时，

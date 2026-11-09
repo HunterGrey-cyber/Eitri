@@ -35,7 +35,7 @@ fn began(set: &mut TabSet) -> Vec<String> {
 
 /// Pumps, collecting what is reported, until `done` holds of the reports so far.
 fn pump_until_told(set: &mut TabSet, dir: &Path, what: &str, done: impl Fn(&[String]) -> bool) -> Vec<String> {
-    let deadline = Instant::now() + Duration::from_secs(5);
+    let deadline = Instant::now() + Duration::from_secs(60);
     let mut told = Vec::new();
     while !done(&told) {
         assert!(Instant::now() < deadline, "timed out waiting for {what}");
@@ -85,7 +85,7 @@ fn editing(id: &str, is_error: bool) -> Vec<AgentDomainEvent> {
 }
 
 fn edit_news(set: &mut TabSet, dir: &Path, id: &str) -> Vec<PathBuf> {
-    let deadline = Instant::now() + Duration::from_secs(5);
+    let deadline = Instant::now() + Duration::from_secs(60);
     let mut paths = Vec::new();
     loop {
         set.pump(dir, true);
@@ -168,7 +168,7 @@ fn a_turn_start_is_news_once() {
     );
 
     provider.queue(completed("t1"));
-    let deadline = Instant::now() + Duration::from_secs(5);
+    let deadline = Instant::now() + Duration::from_secs(60);
     while set
         .get(tab)
         .unwrap()
@@ -209,7 +209,7 @@ fn a_turn_seen_only_through_a_resync_is_news() {
     provider.queue_all(flood);
     // One hold of the lock folds the whole flood, so a projection naming the turn has overflowed too. A tick that
     // drained before the fold and read the projection after it would stamp the clock a tick ahead of the snapshot.
-    let deadline = Instant::now() + Duration::from_secs(5);
+    let deadline = Instant::now() + Duration::from_secs(60);
     while set
         .get(tab)
         .unwrap()

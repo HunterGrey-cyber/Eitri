@@ -31,18 +31,32 @@ function mount(name = "mcp__eitri__read_buffer", input: unknown = { path: "a.py"
 }
 
 describe("editor tool expanded answers in App", () => {
+  it("draws a path under the project relative to it, in the row and its body, and any other path as it came", () => {
+    const outside = JSON.stringify({ path: "/elsewhere/b.py", modified: false, first_line: 1, last_line: 1, text: "x\n" });
+    const inside = mount("mcp__eitri__read_buffer", { path: "/p/a.py" });
+    expect(inside.container.querySelector(".tool-card")?.textContent).toBe("read a.py from the editor (unsaved)");
+    inside.press("Enter");
+    expect(inside.body()?.textContent?.split("\n")[0]).toBe("a.py:4-5 (unsaved)");
+    cleanup();
+    const away = mount("mcp__eitri__read_buffer", { path: "/elsewhere/b.py" }, outside);
+    expect(away.container.querySelector(".tool-card")?.textContent).toBe("read /elsewhere/b.py from the editor");
+    away.press("Enter");
+    expect(away.body()?.textContent?.split("\n")[0]).toBe("/elsewhere/b.py:1-1");
+  });
+
   it.each(["Enter", "za", "zo"])("%s expands to readable buffer text", (key) => {
     const { body, press } = mount();
     expect(body()).toBeNull();
     for (const part of key === "Enter" ? [key] : [...key]) press(part);
-    expect(body()?.textContent).toBe("/p/a.py:4-5 (unsaved)\none\ntwo\n");
+    expect(body()?.textContent).toBe("a.py:4-5 (unsaved)\none\ntwo\n");
     expect(body()?.textContent).not.toContain('{"');
   });
 
   it("folded, the preview shows the readable text's first lines, not the JSON (the CLI's MCP block shape)", () => {
     const { container } = mount("mcp__eitri__read_buffer", { path: "a.py" }, [{ type: "text", text: raw }]);
     const preview = container.querySelector(".tool-result-preview");
-    expect(preview?.textContent).toContain("/p/a.py:4-5 (unsaved)");
+    expect(preview?.textContent).toContain("a.py:4-5 (unsaved)");
+    expect(preview?.textContent).not.toContain("/p/");
     expect(preview?.textContent).not.toContain('"text"');
     expect(preview?.textContent).not.toContain("{");
   });
@@ -53,14 +67,14 @@ describe("editor tool expanded answers in App", () => {
     press("o", true);
     expect(body()?.textContent).toBe(raw);
     press("o", true);
-    expect(body()?.textContent).toBe("/p/a.py:4-5 (unsaved)\none\ntwo\n");
+    expect(body()?.textContent).toBe("a.py:4-5 (unsaved)\none\ntwo\n");
   });
 
   it("uses the same readable body for Codex's eitri MCP call", () => {
     const { body, press } = mount("mcpToolCall", { server: "eitri", tool: "read_buffer", arguments: { path: "a.py" } },
       { content: [{ type: "text", text: raw }] });
     press("Enter");
-    expect(body()?.textContent).toBe("/p/a.py:4-5 (unsaved)\none\ntwo\n");
+    expect(body()?.textContent).toBe("a.py:4-5 (unsaved)\none\ntwo\n");
     press("o", true);
     expect(body()?.textContent).toContain('"type": "text"');
     expect(body()?.textContent).toContain('\\"modified\\":true');

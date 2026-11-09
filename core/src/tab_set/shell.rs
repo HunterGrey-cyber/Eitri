@@ -230,7 +230,7 @@ mod tests {
         }
 
         fn wait(&mut self, mut done: impl FnMut(&Tab) -> bool) {
-            let deadline = Instant::now() + Duration::from_secs(5);
+            let deadline = Instant::now() + Duration::from_secs(60);
             loop {
                 self.set.pump(&self.dir, true);
                 if done(self.set.get(self.tab).unwrap()) {

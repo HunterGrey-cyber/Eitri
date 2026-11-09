@@ -1,8 +1,9 @@
 /// <reference types="vite/client" />
 import { rowCardLine, rowAgentCard, isAgentCall } from "../display";
-import { Fragment, memo, useEffect, useLayoutEffect, useMemo, useRef, useState, type ReactElement, type ReactNode } from "react";
+import { Fragment, memo, useContext, useEffect, useLayoutEffect, useMemo, useRef, useState, type ReactElement, type ReactNode } from "react";
 import type { AgentUiState, ThinkingBlock, ThinkingDisplay, ToolCallRecord } from "../types";
 import { renderToolCall, TouchRows } from "../toolRegistry";
+import { ProjectDirContext } from "../projectPath";
 import { allCards, buildTimeline, isUsableLink, noticeText, noticeBody, wakeText, questionLines, type TimelineItem } from "../timeline";
 import { buildDisplay, runSummary } from "../display";
 import { forgetMarkdown, renderMarkdown, streamMarkdown, type StreamedMarkdown } from "../markdown";
@@ -1003,6 +1004,7 @@ const TimelineRow = memo(function TimelineRow({
   selecting,
 }: TimelineRowProps) {
   rowRenders += 1;
+  const projectDir = useContext(ProjectDirContext);
   switch (item.kind) {
     case "prompt": {
       // Plain text, never markdown: this is what the user typed, and parsing it would render
@@ -1063,6 +1065,7 @@ const TimelineRow = memo(function TimelineRow({
               expanded,
               abandoned,
               cardLine,
+              projectDir,
             })}
           </div>
         </Row>

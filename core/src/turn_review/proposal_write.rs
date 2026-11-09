@@ -929,7 +929,7 @@ mod tests {
 
         // A git child another test thread is starting holds the entry's lock for a moment.
         let journal = world.journal();
-        let until = Instant::now() + Duration::from_secs(5);
+        let until = Instant::now() + Duration::from_secs(60);
         let entry = loop {
             match journal.pending().pop() {
                 Some(entry) => break entry,

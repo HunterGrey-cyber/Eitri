@@ -288,3 +288,31 @@ describe("editorResult", () => {
     }
   });
 });
+
+describe("paths under the project", () => {
+  const answer = (value: unknown) => done(JSON.stringify(value));
+  const at = (path: string) => ({ path, line: 3, column: 1 });
+
+  it("are drawn relative to the project root in the row and the body; other paths as they came", () => {
+    expect(editorRow("read_buffer", { path: "/p/src/a.rs" }, answer({ modified: false }), "/p")).toBe("read src/a.rs from the editor");
+    expect(editorRow("read_buffer", { path: "/q/a.rs" }, answer({ modified: false }), "/p")).toBe("read /q/a.rs from the editor");
+    expect(editorRow("format", { path: "/p/a.rs" }, answer({ proposal: "f1" }), "/p")).toBe("proposed formatting `a.rs`");
+    const read = { path: "/p/src/a.rs", modified: false, first_line: 1, last_line: 1, text: "x" };
+    expect(editorResult("read_buffer", {}, answer(read), "/p")).toBe("src/a.rs:1-1\nx");
+    expect(editorResult("read_buffer", {}, answer(read), "/pro")).toBe("/p/src/a.rs:1-1\nx");
+    expect(editorResult("read_buffer", {}, answer(read))).toBe("/p/src/a.rs:1-1\nx");
+    const diagnostics = { entries: [{ ...at("/p/a.rs"), severity: "error", message: "m" }], left_out: 0,
+      modified_files: ["/p/b.rs", "/q/c.rs"] };
+    expect(editorResult("diagnostics", {}, answer(diagnostics), "/p")).toBe("a.rs:3:1 error m\nunsaved: b.rs, /q/c.rs");
+    expect(editorResult("apply_proposal", {}, answer({ applied: ["/p/a.rs"], not_tried: ["/p/b.rs"] }), "/p"))
+      .toBe("applied a.rs\nnot tried: b.rs");
+  });
+
+  it("leave the editor state's root line absolute: it says which project", () => {
+    const state = { root: "/p", mode: "n", other_buffers: 0, current: { path: "/p/a.rs", line: 2 }, selection: null,
+      buffers: [{ path: "/p/a.rs", modified: false, lines: 9, filetype: "rust", shown: true }] };
+    expect(editorResult("editor_state", {}, answer(state), "/p")?.split("\n")).toEqual(
+      ["/p", "a.rs · 9 lines · rust · shown", "current: a.rs:2 · n"],
+    );
+  });
+});

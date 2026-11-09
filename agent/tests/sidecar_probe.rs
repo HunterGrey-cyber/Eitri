@@ -21,6 +21,8 @@ struct Scratch(PathBuf);
 
 impl Scratch {
     fn new() -> Self {
+        // The probe binds the sidecar's socket under the runtime dir: the test's own, never the shared temp dir.
+        agent::state_dirs::redirect_state_to_a_test_root();
         let dir = Path::new(env!("CARGO_TARGET_TMPDIR")).join(format!("sidecar-probe-{}", uuid::Uuid::new_v4()));
         std::fs::create_dir_all(&dir).unwrap();
         Scratch(dir)

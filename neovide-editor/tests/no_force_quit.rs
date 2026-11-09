@@ -602,6 +602,28 @@ fn the_pinned_forks_harness_never_force_quits_nvim() {
     );
 }
 
+/// A temp directory for one probe nvim, removed when dropped. nvim makes its own `nvim.<user>` directory under
+/// `TMPDIR` (for `tempname()` and, with no `XDG_RUNTIME_DIR`, its server socket) and leaves it there when it exits,
+/// so a probe given the shared temp dir would leave one behind. Under `std::env::temp_dir()` with a short name, not
+/// `CARGO_TARGET_TMPDIR`: nvim's socket inside it must stay within the socket path limit.
+struct NvimTmp(PathBuf);
+
+impl NvimTmp {
+    fn new() -> Self {
+        static NEXT: AtomicUsize = AtomicUsize::new(0);
+        let n = NEXT.fetch_add(1, Ordering::Relaxed);
+        let dir = std::env::temp_dir().join(format!("nfq-{}-{n}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("the probe nvim's temp dir");
+        NvimTmp(dir)
+    }
+}
+
+impl Drop for NvimTmp {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.0);
+    }
+}
+
 /// A probe script's path, distinct for every call: the tests of this binary run on parallel threads
 /// of one process, and each probe file is deleted as soon as its nvim exits, so a path shared by two
 /// calls could vanish before the other call's nvim has read it.
@@ -649,8 +671,10 @@ os.exit(0)
     let init = fork_root().join("lua/init.lua");
     let probe = probe_path("fork-super-q");
     std::fs::write(&probe, PROBE).expect("write the probe");
+    let tmp = NvimTmp::new();
     let output = Command::new("nvim")
         .args(["--clean", "--headless", "-l"])
+        .env("TMPDIR", &tmp.0)
         .arg(&probe)
         .arg(&init)
         .arg(macunix.to_string())
@@ -725,8 +749,10 @@ os.exit(0)
     let handler = fork_root().join("lua/exit_handler.lua");
     let probe = probe_path("fork-exit-handler");
     std::fs::write(&probe, PROBE).expect("write the probe");
+    let tmp = NvimTmp::new();
     let output = Command::new("nvim")
         .args(["--clean", "--headless", "-n", "-i", "NONE", "-l"])
+        .env("TMPDIR", &tmp.0)
         .arg(&probe)
         .arg(&handler)
         .arg(if always_detach { "detach" } else { "ask" })

@@ -3,8 +3,17 @@
  *  model wrote in the input, so a caller draws it through `revealHidden`. */
 
 import { splitLines } from "./diff";
+import { projectRelative } from "./projectPath";
 
 type Answer = { content: unknown; isError: boolean };
+
+/** How a path is drawn: relative to the project root when it is under it (`projectRelative`), as Claude Code's
+ *  own tool lines print one; any other path as it came. */
+type Rel = (path: string) => string;
+
+function relTo(projectDir: string): Rel {
+  return (path) => projectRelative(path, projectDir);
+}
 
 function pathOf(input: unknown): string {
   if (input === null || typeof input !== "object") return "";
@@ -80,9 +89,11 @@ function named(tool: string, path: string): string {
 
 /** The row for `tool` (the bare tool name, without its server) called with `input`, or `null` for a tool
  *  this table does not know. `result` is `null` while the call runs. An error, a call still running and an
- *  answer that cannot be read give the name and the path only; exec calls give their kind. */
-export function editorRow(tool: string, input: unknown, result: Answer | null): string | null {
-  const path = pathOf(input);
+ *  answer that cannot be read give the name and the path only; exec calls give their kind. A path under
+ *  `projectDir` is drawn relative to it. */
+export function editorRow(tool: string, input: unknown, result: Answer | null, projectDir = ""): string | null {
+  const rel = relTo(projectDir);
+  const path = rel(pathOf(input));
   switch (tool) {
     case "nvim_exec": {
       const fields = input !== null && typeof input === "object" ? (input as Record<string, unknown>) : {};
@@ -180,7 +191,7 @@ export function editorRow(tool: string, input: unknown, result: Answer | null): 
       if (answer === null || applied === null) return result.isError ? `could not apply ${quoted(id)}` : named(tool, id);
       const failed = answer.failed !== null && typeof answer.failed === "object" ? (answer.failed as { path?: unknown }).path : undefined;
       const notTried = stringList(answer.not_tried) ?? [];
-      const stopped = typeof failed === "string" ? `, \`${failed}\` failed` : "";
+      const stopped = typeof failed === "string" ? `, \`${rel(failed)}\` failed` : "";
       if (applied.length === 0) return `applied nothing${stopped}`;
       if (failed === undefined && notTried.length === 0) return `applied ${quoted(id)} to ${count(applied.length, "file")}`;
       const of = applied.length + notTried.length + (failed === undefined ? 0 : 1);
@@ -221,9 +232,9 @@ function items(value: unknown, render: (item: Record<string, unknown>) => string
   return lines;
 }
 
-function position(item: Record<string, unknown>): string | null {
+function position(item: Record<string, unknown>, rel: Rel): string | null {
   return typeof item.path === "string" && positive(item.line) && positive(item.column)
-    ? `${item.path}:${item.line}:${item.column}` : null;
+    ? `${rel(item.path)}:${item.line}:${item.column}` : null;
 }
 
 function withMore(lines: string[], leftOut: number, empty: string, noun = ""): string[] {
@@ -240,19 +251,20 @@ function partNotes(answer: Record<string, unknown>, lines: string[]): boolean {
   return true;
 }
 
-function stateBody(answer: Record<string, unknown>): string | null {
+/** The editor's state. Its first line is the root itself, which stays absolute: it says which project. */
+function stateBody(answer: Record<string, unknown>, rel: Rel): string | null {
   if (typeof answer.root !== "string" || typeof answer.mode !== "string" || !natural(answer.other_buffers) ||
     (answer.buffers_left_out !== undefined && !natural(answer.buffers_left_out))) return null;
   const buffers = items(answer.buffers, (buffer) => {
     if (typeof buffer.path !== "string" || typeof buffer.modified !== "boolean" || !natural(buffer.lines) ||
       typeof buffer.filetype !== "string" || typeof buffer.shown !== "boolean") return null;
-    return `${buffer.path}${buffer.modified ? " (unsaved)" : ""} · ${count(buffer.lines, "line")}` +
+    return `${rel(buffer.path)}${buffer.modified ? " (unsaved)" : ""} · ${count(buffer.lines, "line")}` +
       `${buffer.filetype === "" ? "" : ` · ${buffer.filetype}`} · ${buffer.shown ? "shown" : "not shown"}`;
   });
   if (buffers === null) return null;
   const current = objectOf(answer.current);
   const currentText = typeof answer.current === "string" ? answer.current
-    : current !== null && typeof current.path === "string" && positive(current.line) ? `${current.path}:${current.line}` : null;
+    : current !== null && typeof current.path === "string" && positive(current.line) ? `${rel(current.path)}:${current.line}` : null;
   if (currentText === null) return null;
   const lines = [answer.root, ...withMore(buffers, (answer.buffers_left_out as number | undefined) ?? 0, "0 buffers", " buffers")];
   if (answer.other_buffers > 0) lines.push(`${answer.other_buffers} other buffers`);
@@ -262,21 +274,23 @@ function stateBody(answer: Record<string, unknown>): string | null {
     const selection = objectOf(answer.selection);
     if (selection === null || typeof selection.path !== "string" || !positive(selection.start_line) ||
       !positive(selection.end_line) || typeof selection.text !== "string") return null;
-    lines.push(`selection: ${selection.path}:${selection.start_line}-${selection.end_line}`, selection.text);
+    lines.push(`selection: ${rel(selection.path)}:${selection.start_line}-${selection.end_line}`, selection.text);
   }
   return lines.join("\n");
 }
 
 /** A readable expanded answer, or no replacement when it is not a known successful answer.
  *  This is display text only: the result stays intact for detailed view and the host owns delivery to the model.
- *  Every returned character remains untrusted and must be drawn through `Shown`, never Markdown. */
-export function editorResult(tool: string, input: unknown, result: Answer | null): string | null {
+ *  Every returned character remains untrusted and must be drawn through `Shown`, never Markdown. A path under
+ *  `projectDir` is drawn relative to it, as in the row above the body. */
+export function editorResult(tool: string, input: unknown, result: Answer | null, projectDir = ""): string | null {
+  const rel = relTo(projectDir);
   if (result === null || result.isError) return null;
   const answer = answerObject(result.content);
   if (answer === null) return null;
   switch (tool) {
     case "open_file": {
-      const path = pathOf(input);
+      const path = rel(pathOf(input));
       const places: Record<string, string> = {
         existing: "an existing window", agent_window: "the agent's window", new_split: "a new split",
       };
@@ -292,23 +306,23 @@ export function editorResult(tool: string, input: unknown, result: Answer | null
     case "read_buffer": {
       if (typeof answer.path !== "string" || typeof answer.modified !== "boolean" || typeof answer.text !== "string" ||
         !positive(answer.first_line) || !natural(answer.last_line) || !optionalString(answer.left_out)) return null;
-      const header = `${answer.path}:${answer.first_line}-${answer.last_line}${answer.modified ? " (unsaved)" : ""}`;
+      const header = `${rel(answer.path)}:${answer.first_line}-${answer.last_line}${answer.modified ? " (unsaved)" : ""}`;
       return `${header}\n${answer.text}${answer.left_out ? `${answer.text.endsWith("\n") ? "" : "\n"}${answer.left_out}` : ""}`;
     }
     case "editor_state":
-      return stateBody(answer);
+      return stateBody(answer, rel);
     case "diagnostics": {
       const modified = stringList(answer.modified_files);
       if (modified === null || !natural(answer.left_out) ||
         (answer.baseline_cut !== undefined && typeof answer.baseline_cut !== "boolean")) return null;
       const entries = items(answer.entries, (entry) => {
-        const place = position(entry);
+        const place = position(entry, rel);
         return place !== null && typeof entry.severity === "string" && typeof entry.message === "string"
           ? `${place} ${entry.severity} ${entry.message}` : null;
       });
       if (entries === null) return null;
       const lines = withMore(entries, answer.left_out, "0 diagnostics");
-      if (modified.length > 0) lines.push(`unsaved: ${modified.join(", ")}`);
+      if (modified.length > 0) lines.push(`unsaved: ${modified.map(rel).join(", ")}`);
       if (answer.baseline_cut === true) lines.push("the turn's diagnostic comparison is incomplete");
       return lines.join("\n");
     }
@@ -319,7 +333,7 @@ export function editorResult(tool: string, input: unknown, result: Answer | null
       for (const [part, label] of [["definitions", "definition"], ["implementations", "implementation"], ["references", "reference"]]) {
         if (answer[part] === undefined) continue;
         const entries = items(answer[part], (entry) => {
-          const place = position(entry);
+          const place = position(entry, rel);
           return place !== null && optionalString(entry.text) ? `${label}: ${place}${entry.text ? ` ${entry.text}` : ""}` : null;
         });
         if (entries === null) return null;
@@ -334,7 +348,7 @@ export function editorResult(tool: string, input: unknown, result: Answer | null
     case "symbols": {
       if (!natural(answer.left_out)) return null;
       const symbols = items(answer.symbols, (symbol) => {
-        const place = position(symbol);
+        const place = position(symbol, rel);
         if (place === null || ![symbol.name, symbol.kind, symbol.container].every(optionalString)) return null;
         return `${place}${symbol.kind ? ` ${symbol.kind}` : ""}${symbol.name ? ` ${symbol.name}` : ""}` +
           `${symbol.container ? ` (${symbol.container})` : ""}`;
@@ -347,7 +361,7 @@ export function editorResult(tool: string, input: unknown, result: Answer | null
       if (typeof answer.proposal !== "string" || !natural(answer.left_out_lines) || !optionalString(answer.title) ||
         (answer.command_not_run !== undefined && typeof answer.command_not_run !== "boolean")) return null;
       const files = items(answer.files, (file) => typeof file.path === "string" && typeof file.hunks === "string"
-        ? `${file.path}\n${file.hunks}` : null);
+        ? `${rel(file.path)}\n${file.hunks}` : null);
       if (files === null) return null;
       const lines = [...(answer.title ? [answer.title] : []), `proposal ${answer.proposal}`,
         ...withMore(files, answer.left_out_lines, "0 files", " hunk lines")];
@@ -370,8 +384,8 @@ export function editorResult(tool: string, input: unknown, result: Answer | null
       const applied = stringList(answer.applied);
       const notTried = stringList(answer.not_tried);
       if (applied === null || notTried === null || answer.failed !== undefined) return null;
-      return [...(applied.length === 0 ? ["applied nothing"] : applied.map((path) => `applied ${path}`)),
-        ...notTried.map((path) => `not tried: ${path}`)].join("\n");
+      return [...(applied.length === 0 ? ["applied nothing"] : applied.map((path) => `applied ${rel(path)}`)),
+        ...notTried.map((path) => `not tried: ${rel(path)}`)].join("\n");
     }
     default:
       return null;

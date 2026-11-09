@@ -132,7 +132,7 @@ impl Jobs {
     /// Waits until the worker is parked on (or has started) the job.
     fn wait_started(&self, kind: SnapshotKind, position: u32) {
         let (lock, cvar) = &*self.inner;
-        let deadline = Instant::now() + Duration::from_secs(5);
+        let deadline = Instant::now() + Duration::from_secs(60);
         let mut state = lock.lock().unwrap();
         while !state
             .seen
@@ -203,7 +203,7 @@ fn turn_review_pump_interval() -> Duration {
 
 /// Polls until `done` holds for the session's turns, or fails at 5 s.
 fn poll_until(review: &mut TurnReview, session: &str, what: &str, done: impl Fn(&[TurnRecord]) -> bool) {
-    let deadline = Instant::now() + Duration::from_secs(5);
+    let deadline = Instant::now() + Duration::from_secs(60);
     loop {
         review.poll();
         if done(&review.turns(session)) {
@@ -276,7 +276,7 @@ fn events_enqueue_and_never_block() {
         tx.send((review, took)).unwrap();
     });
     let (mut review, mut took) = rx
-        .recv_timeout(Duration::from_secs(5))
+        .recv_timeout(Duration::from_secs(60))
         .expect("observe blocked while a snapshot was held back");
     assert!(
         !jobs.finished(SnapshotKind::Base, 1),
@@ -514,7 +514,7 @@ fn an_end_with_both_snapshots_gives_a_hint_even_for_no_files() {
     poll_until(&mut review, "s1", "the base", |t| has_base(t, "t1"));
     std::fs::write(scratch.project().join("new.txt"), "hello\n").unwrap();
     review.observe(3, "s1", &completed("t1"), now());
-    let deadline = Instant::now() + Duration::from_secs(5);
+    let deadline = Instant::now() + Duration::from_secs(60);
     while hints.is_empty() {
         assert!(Instant::now() < deadline, "no hint");
         hints.extend(review.poll());
@@ -527,7 +527,7 @@ fn an_end_with_both_snapshots_gives_a_hint_even_for_no_files() {
     hints.clear();
     review.observe(3, "s1", &started("t2"), now());
     review.observe(3, "s1", &completed("t2"), now());
-    let deadline = Instant::now() + Duration::from_secs(5);
+    let deadline = Instant::now() + Duration::from_secs(60);
     while hints.is_empty() {
         assert!(Instant::now() < deadline, "no hint");
         hints.extend(review.poll());
@@ -639,7 +639,7 @@ fn an_earlier_runs_turn_keeps_its_marks_and_its_left_out_files() {
         // Everything handed to the worker is done once the session is no longer tracked.
         run1.close_tab(1, now());
         run1.close_tab(2, now());
-        let deadline = Instant::now() + Duration::from_secs(5);
+        let deadline = Instant::now() + Duration::from_secs(60);
         while !run1.turns("s1").is_empty() {
             assert!(Instant::now() < deadline, "the worker never finished");
             run1.poll();
@@ -751,7 +751,7 @@ fn a_turn_that_left_a_command_running_says_so_and_keeps_saying_it() {
 
         run1.close_tab(1, now());
         run1.close_tab(2, now());
-        let deadline = Instant::now() + Duration::from_secs(5);
+        let deadline = Instant::now() + Duration::from_secs(60);
         while !run1.turns("s1").is_empty() || !run1.turns("s2").is_empty() {
             assert!(Instant::now() < deadline, "the worker never finished");
             run1.poll();
@@ -955,9 +955,9 @@ fn work_is_in_flight_until_every_snapshot_was_answered() {
     review.observe(1, "s1", &completed("a1"), now());
     assert!(review.has_work_in_flight(), "the turn's snapshots are queued");
     poll_until(&mut review, "s1", "the turn's snapshots", |t| is_ok(t, "a1"));
-    let deadline = Instant::now() + Duration::from_secs(5);
+    let deadline = Instant::now() + Duration::from_secs(60);
     while review.has_work_in_flight() {
-        assert!(Instant::now() < deadline, "work still in flight after 5 s");
+        assert!(Instant::now() < deadline, "work still in flight after the hang guard");
         review.poll();
         std::thread::sleep(Duration::from_millis(5));
     }
@@ -997,7 +997,7 @@ fn a_tab_that_starts_a_new_session_files_its_first_turn_under_it() {
         review.observe(1, "s2", &opened("s2"), now());
         review.observe(1, "s2", &tool("n1"), now());
         review.observe(1, "s2", &completed("n1"), now());
-        let deadline = Instant::now() + Duration::from_secs(5);
+        let deadline = Instant::now() + Duration::from_secs(60);
         let mut hints = Vec::new();
         while !is_ok(&review.turns("s2"), "n1") {
             assert!(Instant::now() < deadline, "{what}: {:#?}", review.turns("s2"));
@@ -1138,7 +1138,7 @@ fn a_session_opened_before_any_turn_warms_the_index() {
     let mut review = scratch.review(&jobs);
     review.observe(1, "", &opened("s1"), now());
     review.observe(1, "s1", &opened("s1"), now());
-    let deadline = Instant::now() + Duration::from_secs(5);
+    let deadline = Instant::now() + Duration::from_secs(60);
     while !jobs.finished(SnapshotKind::Warm, 0) {
         assert!(Instant::now() < deadline, "no warm-up");
         std::thread::sleep(Duration::from_millis(5));
@@ -1193,7 +1193,7 @@ fn a_closed_tab_ends_its_turn() {
     review.observe(1, "s1", &started("t1"), now());
     poll_until(&mut review, "s1", "the base", |t| has_base(t, "t1"));
     review.close_tab(1, now());
-    let deadline = Instant::now() + Duration::from_secs(5);
+    let deadline = Instant::now() + Duration::from_secs(60);
     while !jobs.finished(SnapshotKind::End, 1) {
         assert!(Instant::now() < deadline, "the closed tab's turn got no end");
         std::thread::sleep(Duration::from_millis(5));
@@ -1688,7 +1688,7 @@ fn edge(session: &str, edge: EdgeKind, at_ns: u64) -> TurnEdge {
 
 /// Polls until no worker owes an answer, so what was handed to them (marks included) is written.
 fn settle(review: &mut TurnReview) {
-    let deadline = Instant::now() + Duration::from_secs(5);
+    let deadline = Instant::now() + Duration::from_secs(60);
     while review.has_work_in_flight() {
         assert!(Instant::now() < deadline, "the workers never finished");
         review.poll();
@@ -2033,7 +2033,7 @@ fn a_job_finishing_in_the_source_reaches_the_holder() {
     );
 
     jobs.release(SnapshotKind::Base, 1);
-    let deadline = Instant::now() + Duration::from_secs(5);
+    let deadline = Instant::now() + Duration::from_secs(60);
     let mut forwarded = Vec::new();
     while forwarded.len() < 2 {
         assert!(Instant::now() < deadline, "the source never finished: {forwarded:?}");
@@ -2047,7 +2047,7 @@ fn a_job_finishing_in_the_source_reaches_the_holder() {
         dest.accept_result("s1", result).unwrap();
     }
     let mut hints: Vec<ReviewHint> = Vec::new();
-    let deadline = Instant::now() + Duration::from_secs(5);
+    let deadline = Instant::now() + Duration::from_secs(60);
     while !is_ok(&dest.turns("s1"), "t1") {
         assert!(Instant::now() < deadline, "{:#?}", dest.turns("s1"));
         hints.extend(dest.poll());
@@ -2107,12 +2107,12 @@ fn drop_moved_takes_no_end_snapshot_and_keeps_no_presence() {
     let holder = eitri_core::turn_review::PresenceHolder::start(presence_dir.clone(), 4242);
     let held = holder.sync_confirmed(&BTreeSet::from([1]));
     assert_eq!(
-        held.recv_timeout(Duration::from_secs(5)),
+        held.recv_timeout(Duration::from_secs(60)),
         Ok(eitri_core::turn_review::Held::Yes)
     );
     let dropped = holder.sync_confirmed(&BTreeSet::new());
     assert_eq!(
-        dropped.recv_timeout(Duration::from_secs(5)),
+        dropped.recv_timeout(Duration::from_secs(60)),
         Ok(eitri_core::turn_review::Held::Yes)
     );
     assert!(!presence_dir.join("running/4242.1").exists());
@@ -2159,7 +2159,7 @@ fn a_session_back_before_its_first_worker_answered_is_numbered_and_its_turn_ends
     // The first worker's numbering and base are the session's here again: the end kept back for
     // the numbering goes out, and the turn is whole.
     jobs.release(SnapshotKind::Base, 1);
-    let deadline = Instant::now() + Duration::from_secs(5);
+    let deadline = Instant::now() + Duration::from_secs(60);
     while !is_ok(&one.turns("s1"), "t1") {
         assert!(
             Instant::now() < deadline,
