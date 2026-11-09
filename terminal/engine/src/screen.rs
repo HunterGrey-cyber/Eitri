@@ -54,15 +54,17 @@ use terminal_render::{
 };
 use terminal_sync::SyncDriver;
 
+mod osc;
+
 use crate::listener::{HostEvents, Listener, Reply};
 use crate::paint::indicator_ops;
 use crate::pty::PtySize;
-use crate::replay::boundary::BoundaryTracker;
 use crate::replay::gate::Gate;
 use crate::replay::screen_replay::{self, ReplayRefused, ScreenReplay};
 use crate::replay::shadow::{Shadowed, Shadows};
 use crate::scroll::{ScrollRequest, ScrollView};
 use crate::select::{self, SelectCommand};
+use osc::OscFilter;
 
 /// The colours phase 1 takes from the window's theme: so a light colorscheme does
 /// not get a black box under it. The sixteen ANSI colours stay xterm's until phase 4.
@@ -199,8 +201,7 @@ fn saturate_cell_px(cells: u16, cell_px: u16) -> u16 {
 }
 
 /// The most bytes of an unfinished sequence kept for a move: one more than a move may carry, so a
-/// longer one is known to be too long without keeping all of it (a streamed OSC 52 copy can run to
-/// megabytes).
+/// longer one is known to be too long without keeping all of it.
 const UNFINISHED_KEPT: usize = crate::session::RAW_TAIL_MAX + 1;
 
 /// What the user sees of a terminal beside its grid, carried with it when it moves: how far back
@@ -287,8 +288,8 @@ pub struct Screen {
     /// What alacritty keeps without a getter, recorded on the way to `term`: a moving terminal's
     /// replay needs it.
     shadows: Shadows,
-    /// Where the parser stands, fed the same bytes: a move cuts the stream only between sequences.
-    boundary: BoundaryTracker,
+    /// Bounds OSC before parsing and tracks sequence boundaries for moves, including held bytes.
+    osc: OscFilter,
     /// The bytes fed since the parser last stood between sequences (at most [`UNFINISHED_KEPT`]),
     /// how many there were in all, and how many handler calls they caused: what a move carries
     /// when a sequence is still open, so the new parser can be brought to the same point.
@@ -329,7 +330,7 @@ impl Screen {
             pending_selection: None,
             copy_mode: false,
             shadows,
-            boundary: BoundaryTracker::new(),
+            osc: OscFilter::default(),
             unfinished: Vec::new(),
             unfinished_len: 0,
             unfinished_calls: 0,
@@ -368,7 +369,7 @@ impl Screen {
 
     /// Whether the parser stands between two sequences, with no partial character.
     pub fn at_boundary(&self) -> bool {
-        self.boundary.at_boundary()
+        self.osc.at_boundary()
     }
 
     /// The bytes fed since the parser last stood at a boundary (kept up to one more than a move
@@ -456,15 +457,16 @@ impl Screen {
         for &byte in bytes {
             let was_in_sync = self.sync.barrier().in_sync();
             let mut published = false;
+            let filtered = self.osc.byte(byte);
             let calls = {
                 let mut shadowed = Shadowed::new(&mut self.term, &mut self.shadows);
                 let mut gate = Gate::new(&mut shadowed, self.swallow);
-                self.sync.feed(&mut gate, &[byte], |_term, _reason| published = true);
+                self.sync.feed(&mut gate, filtered, |_term, _reason| published = true);
                 gate.seen()
             };
+            self.osc.clear_released();
             self.swallow -= calls.min(self.swallow);
-            self.boundary.byte(byte);
-            if self.boundary.at_boundary() {
+            if self.osc.at_boundary() {
                 self.unfinished.clear();
                 self.unfinished_len = 0;
                 self.unfinished_calls = 0;
@@ -892,6 +894,163 @@ mod tests {
             background: RgbColor::new(0x12, 0x34, 0x56),
             foreground: RgbColor::new(0xee, 0xdd, 0xcc),
             cursor: Some(RgbColor::new(0xee, 0xdd, 0xcc)),
+        }
+    }
+
+    #[test]
+    fn oversized_osc_is_discarded_and_the_next_sequence_works() {
+        for end in [b"\x07".as_slice(), b"\x1b\\", b"\x18", b"\x1a"] {
+            let mut screen = Screen::new(SIZE, TerminalColors::default());
+            screen.feed(b"\x1b]2;");
+            for _ in 0..1280 {
+                screen.feed(&[b'x'; 8192]);
+            }
+            assert!(!screen.at_boundary());
+            for byte in end {
+                screen.feed(&[*byte]);
+            }
+            assert!(screen.take_events().title.is_none());
+            assert!(screen.at_boundary());
+            screen.feed(b"ok\x1b[6n\x1b]2;normal\x07\x1b]52;c;aGk=\x07");
+            assert_eq!(screen.take_replies(), b"\x1b[1;3R");
+            let events = screen.take_events();
+            assert_eq!(events.title, Some(Some("normal".into())));
+            assert_eq!(events.clipboard.as_deref(), Some("hi"));
+        }
+    }
+
+    #[test]
+    fn titles_and_both_stacks_have_a_byte_budget() {
+        let mut screen = Screen::new(SIZE, TerminalColors::default());
+        // A multibyte character straddles the byte cap.
+        let title = format!("{}é", "x".repeat(4095));
+        screen.feed(format!("\x1b]2;{title}\x07").as_bytes());
+        let capped = "x".repeat(4095);
+        assert_eq!(screen.take_events().title, Some(Some(capped.clone())));
+        assert_eq!(screen.shadows.title.as_ref(), Some(&capped));
+        // Distinguish the oldest entry from the full-sized titles that follow it.
+        screen.feed(b"\x1b]2;oldest\x07\x1b[22t");
+        let title = "y".repeat(4096);
+        screen.feed(format!("\x1b]2;{title}truncated\x07").as_bytes());
+        for _ in 0..4096 {
+            screen.feed(b"\x1b[22t");
+        }
+        assert_eq!(screen.shadows.title_stack.len(), 4096);
+        let bytes: usize = screen.shadows.title_stack.iter().flatten().map(String::len).sum();
+        assert!(bytes <= 16 * 1024 * 1024);
+        assert!(screen.shadows.title_stack.iter().all(|t| t.as_ref() == Some(&title)));
+        // Read the emulator's private stack through its pop events, not just the shadow.
+        screen.feed(b"\x1b]2;current\x07");
+        screen.take_events();
+        for _ in 0..4096 {
+            screen.feed(b"\x1b[23t");
+            assert_eq!(screen.take_events().title, Some(Some(title.clone())));
+        }
+        screen.feed(b"\x1b[23t");
+        assert_eq!(screen.take_events().title, None);
+    }
+
+    #[test]
+    fn keyboard_push_overflow_without_titles_keeps_the_screen_alive() {
+        let mut screen = Screen::new(SIZE, TerminalColors::default());
+        for _ in 0..4096 {
+            screen.feed(b"\x1b[>1u");
+        }
+        screen.feed(b"\x1b[>3u\x1b[?u");
+        assert_eq!(screen.shadows.keyboard_active.len(), 4096);
+        assert_eq!(screen.take_replies(), b"\x1b[?1u");
+        screen.feed(b"\x1b[<4096u\x1b[?uok\x1b[6n");
+        assert!(screen.shadows.keyboard_active.is_empty());
+        assert_eq!(screen.take_replies(), b"\x1b[?0u\x1b[1;3R");
+    }
+
+    #[test]
+    fn osc_limit_accepts_the_cap_and_rejects_one_more_byte() {
+        for extra in [0, 1] {
+            let mut screen = Screen::new(SIZE, TerminalColors::default());
+            screen.feed(b"\x1b]2;");
+            screen.feed(&vec![b'x'; osc::OSC_BYTES_MAX - 2 + extra]);
+            screen.feed(b"\x07");
+            let title = screen.take_events().title.flatten();
+            assert_eq!(title.as_ref().map(String::len), (extra == 0).then_some(4096));
+            assert!(screen.at_boundary());
+        }
+    }
+
+    #[test]
+    fn oversized_osc_ends_at_escape_and_reset_still_works() {
+        let mut screen = Screen::new(SIZE, TerminalColors::default());
+        screen.feed(b"ab\x1b]2;");
+        screen.feed(&vec![b'x'; osc::OSC_BYTES_MAX]);
+        screen.feed(b"\x1b");
+        screen.feed(b"[6n");
+        assert_eq!(screen.take_replies(), b"\x1b[1;3R");
+        assert!(screen.take_events().title.is_none());
+        screen.feed(b"\x1b");
+        screen.feed(b"c\x1b[6n");
+        assert_eq!(screen.take_replies(), b"\x1b[1;1R");
+        assert!(screen.at_boundary());
+    }
+
+    #[test]
+    fn oversized_osc_keeps_c1_st_and_utf8_in_the_payload() {
+        // Exercise 0x9c both at the first excess byte and after discard has begun.
+        for extra in [0, 1] {
+            let mut screen = Screen::new(SIZE, TerminalColors::default());
+            screen.feed(b"\x1b]2;");
+            screen.feed(&vec![b'x'; osc::OSC_BYTES_MAX - 2 + extra]);
+            screen.feed(b"\x9cleaked");
+            for &byte in "“more payload".as_bytes() {
+                screen.feed(&[byte]);
+            }
+            assert!(!screen.at_boundary());
+            screen.feed(b"\x07\x1b[6n");
+            assert_eq!(screen.take_replies(), b"\x1b[1;1R");
+            assert!(screen.take_events().title.is_none());
+        }
+    }
+
+    #[test]
+    fn osc52_works_up_to_the_clipboard_cap_and_drops_oversized_copies() {
+        let text_limit = 16 * 1024 * 1024;
+        for extra_blocks in [0, 1] {
+            let mut screen = Screen::new(SIZE, TerminalColors::default());
+            screen.feed(b"\x1b]52;c;");
+            let encoded = "eHh4".repeat(text_limit / 3 + extra_blocks);
+            for chunk in encoded.as_bytes().chunks(8192) {
+                screen.feed(chunk);
+            }
+            screen.feed(b"eA==\x1b\\");
+            let clipboard = screen.take_events().clipboard;
+            assert_eq!(clipboard.is_some(), extra_blocks == 0);
+            if let Some(text) = clipboard {
+                assert_eq!(text.len(), text_limit);
+                assert!(text.bytes().all(|byte| byte == b'x'));
+            }
+            assert!(screen.at_boundary());
+            screen.feed(b"\x1b]52;c;aGk=\x07");
+            assert_eq!(screen.take_events().clipboard.as_deref(), Some("hi"));
+        }
+    }
+
+    #[test]
+    fn an_osc_split_at_every_byte_survives_replay() {
+        let sequence = "\x1b]2;标题\x1b\\".as_bytes();
+        for cut in 0..=sequence.len() {
+            let mut source = Screen::new(SIZE, TerminalColors::default());
+            source.feed(&sequence[..cut]);
+            let (raw, len, calls) = source.unfinished();
+            assert_eq!(raw.len(), len);
+            let raw = raw.to_vec();
+            let replay = source.read_for_move().unwrap();
+            let mut moved = Screen::replayed(&replay, SIZE, TerminalColors::default());
+            moved.feed_unfinished(&raw, calls);
+            moved.feed(&sequence[cut..]);
+            assert_eq!(moved.shadows.title.as_deref(), Some("标题"));
+            assert!(moved.at_boundary());
+            moved.feed(b"\x1b]52;c;aGk=\x07ok\x1b[6n");
+            assert_eq!(moved.take_events().clipboard.as_deref(), Some("hi"));
+            assert_eq!(moved.take_replies(), b"\x1b[1;3R");
         }
     }
 

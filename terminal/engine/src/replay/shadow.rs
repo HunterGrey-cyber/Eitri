@@ -15,6 +15,12 @@ use terminal_sync::ZeroWidthTarget;
 
 /// alacritty's title and keyboard-mode stack depth.
 pub const KEYBOARD_STACK_MAX: usize = 4096;
+const TITLE_BYTES_MAX: usize = 4096;
+const TITLE_STACK_BYTES_MAX: usize = 16 * 1024 * 1024;
+// Reserve a full title per entry. This also matches the emulator's oldest-first depth eviction.
+const TITLE_STACK_MAX: usize = TITLE_STACK_BYTES_MAX / TITLE_BYTES_MAX;
+// Both depths must match alacritty so keyboard overflow sees the same title stack in each.
+const _: () = assert!(TITLE_STACK_MAX == KEYBOARD_STACK_MAX);
 const TAB_EVERY: usize = 8;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -97,7 +103,7 @@ impl<L: EventListener> ShadowTarget for Term<L> {
     }
 }
 
-/// Forwards every call to `inner` and records the shadowed state on the way.
+/// Records handler state on its way to `inner`, bounding titles and refusing pushes that would panic.
 pub struct Shadowed<'a, H> {
     inner: &'a mut H,
     shadows: &'a mut Shadows,
@@ -140,7 +146,16 @@ impl<H: ShadowTarget> ShadowTarget for Shadowed<'_, H> {
 
 #[rustfmt::skip]
 impl<H: Handler + ShadowTarget> Handler for Shadowed<'_, H> {
-    fn set_title(&mut self, a0: Option<String>) { self.shadows.title = a0.clone(); self.inner.set_title(a0); }
+    fn set_title(&mut self, mut a0: Option<String>) {
+        if let Some(title) = &mut a0 {
+            let mut end = title.len().min(TITLE_BYTES_MAX);
+            while !title.is_char_boundary(end) { end -= 1; }
+            title.truncate(end);
+            title.shrink_to_fit();
+        }
+        self.shadows.title = a0.clone();
+        self.inner.set_title(a0);
+    }
     fn set_cursor_style(&mut self, a0: Option<CursorStyle>) { self.inner.set_cursor_style(a0); }
     fn set_cursor_shape(&mut self, a0: CursorShape) { self.inner.set_cursor_shape(a0); }
     fn input(&mut self, a0: char) { self.shadows.last_input = Some(a0); self.inner.input(a0); }
@@ -214,7 +229,7 @@ impl<H: Handler + ShadowTarget> Handler for Shadowed<'_, H> {
     fn clipboard_load(&mut self, a0: u8, a1: &str) { self.inner.clipboard_load(a0, a1); }
     fn decaln(&mut self) { self.inner.decaln(); }
     fn push_title(&mut self) {
-        if self.shadows.title_stack.len() >= KEYBOARD_STACK_MAX { self.shadows.title_stack.remove(0); }
+        if self.shadows.title_stack.len() >= TITLE_STACK_MAX { self.shadows.title_stack.remove(0); }
         self.shadows.title_stack.push(self.shadows.title.clone());
         self.inner.push_title();
     }
@@ -229,7 +244,10 @@ impl<H: Handler + ShadowTarget> Handler for Shadowed<'_, H> {
     fn report_keyboard_mode(&mut self) { self.inner.report_keyboard_mode(); }
     fn push_keyboard_mode(&mut self, a0: KeyboardModes) {
         if self.shadows.kitty_keyboard {
-            if self.shadows.keyboard_active.len() >= KEYBOARD_STACK_MAX && !self.shadows.title_stack.is_empty() {
+            if self.shadows.keyboard_active.len() >= KEYBOARD_STACK_MAX {
+                // The pinned emulator removes a title here, and panics if none exists.
+                // Dropping the call leaves both keyboard stacks and the active mode unchanged.
+                if self.shadows.title_stack.is_empty() { return; }
                 self.shadows.title_stack.remove(0);
             }
             self.shadows.keyboard_active.push(a0);

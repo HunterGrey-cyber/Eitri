@@ -36,6 +36,18 @@ fn typed_keys_are_echoed_by_the_shell() {
     });
 }
 
+#[test]
+fn keyboard_push_overflow_does_not_hang_up_the_shell() {
+    let script = r#"i=0; while [ "$i" -lt 4097 ]; do printf '\033[>1u'; i=$((i + 1)); done
+printf '\033[<4096uready\n'; read answer; printf 'received=%s\n' "$answer""#;
+    let mut h = Harness::start(spec("/bin/sh", &["-c", script]), size(80, 10));
+    h.wait_for(WAIT, |h| h.exited.is_some() || h.has_line("ready"));
+    assert!(h.exited.is_none(), "the shell must still be waiting for input");
+    h.type_str("still-here\n");
+    h.wait_for(WAIT, |h| h.exited.is_some());
+    assert!(h.has_line("received=still-here"), "{}", h.text().join("\n"));
+}
+
 /// `Ctrl+a Ctrl+a` hands the program a literal Ctrl+a, as a doubled tmux prefix does: 0x01 through
 /// the encoder, not a raw byte, and it arrives -- `cat -v` shows it.
 #[test]

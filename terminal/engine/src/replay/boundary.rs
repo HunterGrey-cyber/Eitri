@@ -45,6 +45,10 @@ impl BoundaryTracker {
         self.state == State::Ground && self.partial_len == 0
     }
 
+    pub(crate) fn in_osc(&self) -> bool {
+        self.state == State::OscString
+    }
+
     pub fn feed(&mut self, bytes: &[u8]) {
         for &b in bytes {
             self.byte(b);
