@@ -13,7 +13,7 @@ import { initialState } from "./reducer";
 import { EMPTY_PANEL_TABLE } from "./keymap";
 import { TYPING_GUARD_MS } from "./typingGuard";
 import type { AgentDomainEvent, AgentUiState, Hello, ThinkingDisplay } from "./types";
-import { timelineRowRenderCount } from "./components/MessageList";
+import { lastThoughtLines, MessageList, timelineRowRenderCount } from "./components/MessageList";
 
 afterEach(cleanup);
 
@@ -401,5 +401,42 @@ describe("subagent navigation and folds", () => {
     key("o", { ctrlKey: true });
     expect(container.querySelector(".subagent-child")).toBeNull();
     expect(container.querySelector(".row-subagent .fold-marker")).toBeNull();
+  });
+});
+
+describe("thinking text work", () => {
+  it("gets the same preview as splitting, including trailing newlines and CRLF, without splitting", () => {
+    for (const text of ["", "\n\n", "\na", "\n\na", "one", "a\nb\nc\nd\ne\n\n", "a\r\nb\r\n\r\n", "\r\n", "a\nb\n", "x\r"]) {
+      for (const count of [1, 2, 4, 10]) {
+        const expected = text.replace(/\n+$/, "").split("\n").slice(-count).join("\n");
+        const split = vi.spyOn(String.prototype, "split");
+        const result = lastThoughtLines(text, count);
+        const calls = split.mock.calls.length;
+        split.mockRestore();
+        expect(result).toBe(expected);
+        expect(calls).toBe(0);
+      }
+    }
+  });
+
+  it("counts and checks blankness only after closure, and keeps the result across fold changes", () => {
+    const text = "a long thought\n".repeat(500);
+    const original = String.prototype.trim;
+    let trims = 0;
+    const trim = vi.spyOn(String.prototype, "trim").mockImplementation(function (this: string) {
+      if (String(this) === text) trims++;
+      return original.call(this);
+    });
+    const current = thinkingState({ thinking: [{ seq: 1, turnId: "t1", text }], thinkingOpen: true });
+    const props = { state: current, sessionEnded: false, expanded: {}, cursor: -1, onAnswerPermission: vi.fn() };
+    try {
+      const view = render(<MessageList {...props} />);
+      expect(trims).toBe(0);
+      view.rerender(<MessageList {...props} state={{ ...current, thinkingOpen: false }} />);
+      expect(view.container.querySelector(".thinking-head")!.textContent).toContain("500 lines");
+      expect(trims).toBe(1);
+      view.rerender(<MessageList {...props} state={{ ...current, thinkingOpen: false }} expanded={{ "k-1": true }} />);
+      expect(trims).toBe(1);
+    } finally { trim.mockRestore(); }
   });
 });

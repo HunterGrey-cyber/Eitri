@@ -254,3 +254,31 @@ describe("a run's identity", () => {
     expect(shorter.thoughts).toBeUndefined();
   });
 });
+
+it("reuses expanded child items until their record, depth or open state changes", () => {
+  const childCall = call(2, "Read");
+  const block = { seq: 4, turnId: "t", text: "thinking" };
+  const message = { seq: 3, text: "child reply" };
+  const stream = { toolCalls: [childCall], transcript: [message], thinking: [block],
+    assistantMessageOpen: false, thinkingOpen: true };
+  const parent = { ...call(1, "Agent"), children: stream };
+  const options = { ...opts, expanded: { "t-1": true, "t-5": true } };
+  const build = (record = parent) => buildDisplay([tool(record), msg(10)], options);
+  const first = build();
+  const again = build({ ...parent });
+  for (let i = 1; i <= 3; i++) expect(again[i]).toBe(first[i]);
+  const closed = build({ ...parent, children: { ...stream, thinkingOpen: false } });
+  expect(closed[1]).toBe(first[1]);
+  expect(closed[2]).toBe(first[2]);
+  expect(closed[3]).not.toBe(first[3]);
+  expect(closed[3]).toMatchObject({ kind: "thinking", open: false, depth: 1 });
+  const changed = build({ ...parent, children: { ...stream, transcript: [{ ...message, text: "changed" }] } });
+  expect(changed[2]).not.toBe(first[2]);
+  expect(changed[2]).toMatchObject({ text: "changed" });
+  const nested = { ...call(5, "Agent"), children: stream };
+  const deeper = buildDisplay([tool(nested)], { ...options, detailed: true });
+  const deepest = buildDisplay([tool({ ...parent, children: { ...stream, toolCalls: [nested], transcript: [], thinking: [] } })],
+    { ...options, detailed: true });
+  expect(deepest[2]).not.toBe(deeper[1]);
+  expect(deepest[2]).toMatchObject({ key: "t-2", depth: 2 });
+});

@@ -83,11 +83,19 @@ export function placeFooters(items: readonly TimelineItem[], footers: ReadonlyMa
   // Each row by every `seq` it holds, the first row to hold one: a turn's line is looked up once per turn, and
   // walking the rows for each of them is a turn count times a row count on every streamed batch.
   const holders = new Map<Seq, TimelineItem>();
+  const fallback: { seq: Seq; item: TimelineItem }[] = [];
+  let promptSeq = -Infinity;
   const hold = (seq: Seq, item: TimelineItem) => {
     if (!holders.has(seq)) holders.set(seq, item);
   };
   for (const item of items) {
     if (isEditorCardItem(item)) continue;
+    if (item.kind === "prompt") promptSeq = Math.max(promptSeq, item.seq);
+    // A row is reachable only past every preceding prompt and its own sequence. A later row
+    // with a lower threshold supersedes earlier candidates, even when display order differs from seq.
+    const seq = Math.max(promptSeq, item.seq);
+    while (fallback.length > 0 && fallback[fallback.length - 1].seq >= seq) fallback.pop();
+    fallback.push({ seq, item });
     if (item.kind !== "run") {
       hold(item.seq, item);
       continue;
@@ -102,12 +110,14 @@ export function placeFooters(items: readonly TimelineItem[], footers: ReadonlyMa
     else if (!out.has(at.key)) out.set(at.key, footers.get(anchor)!);
   }
   for (const anchor of left) {
-    let under: TimelineItem | null = null;
-    for (const item of items) {
-      if (item.kind === "prompt" && item.seq > anchor) break;
-      if (item.seq <= anchor && !isEditorCardItem(item)) under = item;
+    let low = 0, high = fallback.length;
+    while (low < high) {
+      const mid = Math.floor((low + high) / 2);
+      if (fallback[mid].seq <= anchor) low = mid + 1;
+      else high = mid;
     }
-    if (under !== null && !out.has(under.key)) out.set(under.key, footers.get(anchor)!);
+    const under = fallback[low - 1]?.item;
+    if (under !== undefined && !out.has(under.key)) out.set(under.key, footers.get(anchor)!);
   }
   return out;
 }

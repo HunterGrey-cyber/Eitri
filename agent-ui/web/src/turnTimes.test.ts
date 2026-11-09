@@ -2,8 +2,8 @@ import { describe, expect, it } from "vitest";
 import { durationsFromSnapshot, durationsWith, endingDuration, formatDuration, NO_TURN_DURATIONS, placeFooters, workedFooters } from "./turnTimes";
 import { turnEndingText } from "./turnEnding";
 import { applyEvent, applySnapshot, initialState, withEditorCards } from "./reducer";
-import { buildTimeline } from "./timeline";
-import type { AgentUiSnapshot, EditorCardWire, TurnEnding, TurnTimeWire } from "./types";
+import { buildTimeline, type TimelineItem } from "./timeline";
+import type { AgentUiSnapshot, EditorCardWire, Seq, TurnEnding, TurnTimeWire } from "./types";
 
 const wire = (turnId: string, durationMs: number, anchorSeq: number | null = 5): TurnTimeWire => ({
   turnId,
@@ -154,5 +154,72 @@ describe("a turn-ending row's duration", () => {
     expect(turnEndingText(failed, null, "1m 23s")).toBe("the turn ended with an error (HTTP 529) after 1m 23s: Overloaded");
     const lost = { kind: "lost", reason: null, apiErrorStatus: null, message: null } as const;
     expect(turnEndingText(lost, null, "3s")).toBe("the turn did not finish: the session ended after 3s");
+  });
+});
+
+function oldPlaceFooters(items: readonly TimelineItem[], footers: ReadonlyMap<Seq, string>): ReadonlyMap<string, string> {
+  const out = new Map<string, string>();
+  if (footers.size === 0) return out;
+  const anchors = [...footers.keys()].sort((a, b) => a - b);
+  // Each row by every `seq` it holds, the first row to hold one: a turn's line is looked up once per turn, and
+  // walking the rows for each of them is a turn count times a row count on every streamed batch.
+  const holders = new Map<Seq, TimelineItem>();
+  const hold = (seq: Seq, item: TimelineItem) => {
+    if (!holders.has(seq)) holders.set(seq, item);
+  };
+  for (const item of items) {
+    if ((item.kind === "permission" && item.request.editorCard !== undefined)) continue;
+    if (item.kind !== "run") {
+      hold(item.seq, item);
+      continue;
+    }
+    for (const call of item.calls) hold(call.seq, item);
+    for (const thought of item.thoughts ?? []) hold(thought.seq, item);
+  }
+  const left: Seq[] = [];
+  for (const anchor of anchors) {
+    const at = holders.get(anchor);
+    if (at === undefined) left.push(anchor);
+    else if (!out.has(at.key)) out.set(at.key, footers.get(anchor)!);
+  }
+  for (const anchor of left) {
+    let under: TimelineItem | null = null;
+    for (const item of items) {
+      if (item.kind === "prompt" && item.seq > anchor) break;
+      if (item.seq <= anchor && !(item.kind === "permission" && item.request.editorCard !== undefined)) under = item;
+    }
+    if (under !== null && !out.has(under.key)) out.set(under.key, footers.get(anchor)!);
+  }
+  return out;
+}
+
+
+describe("footer fallback placement", () => {
+  const message = (seq: number): TimelineItem => ({ kind: "message", seq, key: `m-${seq}`, text: "reply" });
+  const prompt = (seq: number): TimelineItem => ({ kind: "prompt", seq, key: `u-${seq}`, text: "prompt" });
+
+  it("matches the scan for many hidden anchors, including displayed-order and prompt boundaries", () => {
+    const items: TimelineItem[] = [];
+    const footers = new Map<number, string>();
+    for (let i = 0; i < 500; i++) {
+      const seq = i * 10;
+      items.push(prompt(seq), message(seq + 1), message(seq + 8), message(seq + 2));
+      footers.set(seq + 3, `hidden ${i}`);
+      if (i % 3 === 0) footers.set(seq + 1, `direct ${i}`);
+      if (i % 5 === 0) footers.set(seq + 4, `second hidden ${i}`);
+    }
+    // A high prompt stops every older anchor even if later displayed rows have smaller sequences.
+    items.splice(300, 0, prompt(9_999));
+    expect([...placeFooters(items, footers)]).toEqual([...oldPlaceFooters(items, footers)]);
+  });
+
+  it("indexes missing anchors without revisiting timeline sequences per turn", () => {
+    let reads = 0;
+    const items = Array.from({ length: 500 }, (_, i): TimelineItem => ({
+      kind: "message", get seq() { reads++; return i * 2; }, key: `m-${i * 2}`, text: "reply",
+    }));
+    const footers = new Map(items.map((_, i) => [i * 2 + 1, `turn ${i}`]));
+    expect(placeFooters(items, footers).size).toBe(500);
+    expect(reads).toBeLessThan(items.length * 12);
   });
 });

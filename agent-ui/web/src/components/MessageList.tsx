@@ -1277,7 +1277,16 @@ export const THINKING_PREVIEW_LINES = 4;
 
 /** The last `count` lines of a thought, without the line breaks at its end. */
 export function lastThoughtLines(text: string, count: number): string {
-  return text.replace(/\n+$/, "").split("\n").slice(-count).join("\n");
+  let end = text.length;
+  while (end > 0 && text[end - 1] === "\n") end--;
+  if (!(count > 0) || !Number.isInteger(count)) return text.slice(0, end).split("\n").slice(-count).join("\n");
+  let start = end;
+  for (let line = 0; line < count; line++) {
+    if (start === 0) return text.slice(0, end);
+    start = text.lastIndexOf("\n", start - 1);
+    if (start < 0) return text.slice(0, end);
+  }
+  return text.slice(start + 1, end);
 }
 
 /** One thinking block as its level draws it. The text is a React text child in a `pre-wrap` box, never
@@ -1299,10 +1308,11 @@ function ThinkingBody({
 }) {
   const always = detailed || level === "expanded";
   const whole = always || expanded;
-  const lines = thoughtLineCount(block.text);
   // A thought of only spaces and line breaks has nothing to count: "0 lines" or "3 lines" of nothing
   // would both mislead, so its head says just `Thought`.
-  const counted = block.text.trim() !== "";
+  const { lines, counted } = useMemo(() => open ? { lines: 0, counted: false } : {
+    lines: thoughtLineCount(block.text), counted: block.text.trim() !== "",
+  }, [open, block.text]);
   return (
     <div className="thinking" data-open={open ? "true" : undefined} data-whole={whole ? "true" : undefined}>
       <div className="thinking-head">

@@ -582,6 +582,30 @@ describe("CLI wake and notice rows", () => {
     expect(wake({ kind: "task", taskKind, taskStatus, summary, description: "build" })).toMatchObject({ text });
   });
 
+  it("matches the notice search for many tasks with one pass over notice ids", () => {
+    const N = 300;
+    let reads = 0;
+    const notices = Array.from({ length: N }, (_, i) => notice("task", {
+      seq: i * 10 + 2, taskId: `task-${i}`, taskStatus: "completed",
+    }));
+    notices.forEach((n, i) => Object.defineProperty(n, "taskId", { get() { reads++; return `task-${i}`; } }));
+    // Duplicates are deliberately out of sequence order; the earliest match wins.
+    notices.push(notice("task", { seq: 0, taskId: "task-0" }));
+    notices.push(notice("informational", { seq: 0, taskId: "missing" }));
+    const starts = Array.from({ length: N }, (_, i) => ({
+      seq: i * 10 + (i % 2 ? 3 : 1), turnId: `turn-${i}`, origin: "cli" as const,
+      cause: cause({ kind: "task", taskId: `task-${i}` }),
+    }));
+    starts.push({ seq: 4_000, turnId: "missing", origin: "cli", cause: cause({ taskId: "missing" }) });
+    const expected = starts.filter((start) => !notices.some((n) =>
+      n.kind === "task" && n.taskId === start.cause.taskId && n.seq <= start.seq)).map((start) => `w-${start.seq}`);
+    reads = 0;
+    const rows = buildTimeline(state({ notices, turnStarts: starts }));
+    const actual = rows.filter((row) => starts.some((start) => row.seq === start.seq)).map((row) => row.key);
+    expect(actual).toEqual(expected);
+    expect(reads).toBeLessThan(N * 12);
+  });
+
   it("uses a task notification as the following turn's single cause row, worded by the turn's cause", () => {
     const rows = buildTimeline(state({
       notices: [notice("task", { taskId: "task1", taskStatus: "completed", content: "done" })],

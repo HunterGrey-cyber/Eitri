@@ -13,7 +13,7 @@ beforeEach(() => {
   vi.setSystemTime(100_000);
   Element.prototype.scrollIntoView = vi.fn();
 });
-afterEach(() => { cleanup(); vi.useRealTimers(); });
+afterEach(() => { cleanup(); vi.restoreAllMocks(); vi.useRealTimers(); });
 
 function task(id: string, kind: TaskKind = "shell", extra: Partial<BackgroundTaskRecord> = {}): BackgroundTaskRecord {
   return { task_id: id, run_id: "1", kind, task_type: kind, description: id, subagent_type: null,
@@ -38,6 +38,47 @@ function setup(current = state([task("build"), task("watch", "monitor")]), extra
 }
 
 describe("background tasks", () => {
+  it("has no idle clock, ticks running elapsed times, then expires once and stops", () => {
+    const intervals = vi.spyOn(window, "setInterval");
+    const timeouts = vi.spyOn(window, "setTimeout");
+    const clear = vi.spyOn(window, "clearInterval");
+    const view = setup(state([]));
+    expect(intervals).not.toHaveBeenCalled();
+    const deadlines = () => timeouts.mock.calls.map((args) => args[1]).filter((delay) => (delay ?? 0) > 0);
+    expect(deadlines()).toEqual([]);
+    view.update(state([task("build")]));
+    expect(intervals).toHaveBeenCalledOnce();
+    expect(view.container.querySelector(".tasks-elapsed")!.textContent).toBe("0m 40s");
+    act(() => vi.advanceTimersByTime(1_000));
+    expect(view.container.querySelector(".tasks-elapsed")!.textContent).toBe("0m 41s");
+    view.update(state([task("build", "shell", { status: "completed", live: false, ended_at: Date.now() })]));
+    expect(clear).toHaveBeenCalledWith(intervals.mock.results[0].value);
+    expect(deadlines()).toEqual([30_000]);
+    const scheduled = deadlines().length;
+    act(() => vi.advanceTimersByTime(29_999));
+    expect(view.getByText("build")).toBeTruthy();
+    act(() => vi.advanceTimersByTime(1));
+    expect(view.queryByText("build")).toBeNull();
+    act(() => vi.advanceTimersByTime(60_000));
+    expect(deadlines().length).toBe(scheduled);
+    expect(intervals).toHaveBeenCalledOnce();
+  });
+
+  it("does not tick elapsed times hidden in system tasks or behind another task's detail", () => {
+    const intervals = vi.spyOn(window, "setInterval");
+    const clear = vi.spyOn(window, "clearInterval");
+    const view = setup(state([task("housekeeping", "local_agent", { ambient: true }),
+      task("done", "local_agent", { status: "completed", live: false, ended_at: 100_000 })]));
+    expect(intervals).not.toHaveBeenCalled();
+    fireEvent.click(view.getByText("▸ System tasks (1)"));
+    expect(intervals).toHaveBeenCalledOnce();
+    fireEvent.click(view.getByText("done"));
+    expect(clear).toHaveBeenCalledWith(intervals.mock.results[0].value);
+    act(() => vi.advanceTimersByTime(30_000));
+    expect(view.getByRole("listbox")).toBeTruthy();
+    expect(intervals).toHaveBeenCalledTimes(2);
+  });
+
   it("groups live work before recent completions and folds system work", () => {
     const view = setup(state([task("workflow", "workflow"), task("monitor", "monitor"), task("agent", "local_agent"),
       task("shell"), task("done", "shell", { live: false, status: "completed", ended_at: 99_000 }),
@@ -49,6 +90,19 @@ describe("background tasks", () => {
     fireEvent.click(view.getByText("▸ System tasks (1)"));
     expect(view.getByText("housekeeping")).toBeTruthy();
     expect(view.getByText(TASKS_KEY_LINE)).toBeTruthy();
+  });
+
+  it("uses the current time for rows arriving after the clock has stopped", () => {
+    const view = setup(state([]));
+    act(() => vi.advanceTimersByTime(90_000));
+    view.update(state([task("clocked", "local_agent", { status: "completed", live: false, ended_at: Date.now() }),
+      task("no clock", "local_agent", { status: "completed", live: false, ended_at: 42, finished_seq: 42 })]));
+    act(() => vi.advanceTimersByTime(29_999));
+    expect(view.getByText("clocked")).toBeTruthy();
+    expect(view.getByText("no clock")).toBeTruthy();
+    act(() => vi.advanceTimersByTime(1));
+    expect(view.queryByText("clocked")).toBeNull();
+    expect(view.queryByText("no clock")).toBeNull();
   });
 
   it("keeps a completed row for thirty seconds on a running clock", () => {

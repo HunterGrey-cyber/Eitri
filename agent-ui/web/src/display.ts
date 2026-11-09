@@ -56,6 +56,16 @@ const neverFolded = (call: ToolCallRecord): boolean =>
   // A subagent's call keeps its own row, so whose it is stays on screen instead of inside a count.
   subagentOf(call.name, call.input) !== null;
 
+// Child rows hold their identity across unrelated parent-stream changes, just like top-level rows.
+const childItems = new WeakMap<object, { depth: number; open: boolean; item: TimelineItem }>();
+function childItem(record: object, depth: number, make: () => TimelineItem, open = false): TimelineItem {
+  const held = childItems.get(record);
+  if (held && held.depth === depth && held.open === open) return held.item;
+  const item = { ...make(), depth };
+  childItems.set(record, { depth, open, item });
+  return item;
+}
+
 /** Consecutive finished, ungated tool calls -- two or more, with something after
  *  them or a turn that is over -- become one `run` row. Expanded runs and the detailed view keep
  *  every call.
@@ -81,15 +91,20 @@ const neverFolded = (call: ToolCallRecord): boolean =>
 export function buildDisplay(timeline: TimelineItem[], opts: Options): TimelineItem[] {
   const tree: TimelineItem[] = [];
   const visit = (item: TimelineItem, depth: number) => {
-    tree.push(depth === 0 ? item : { ...item, depth });
+    tree.push(item);
     if (item.kind !== "tool" || !isAgentCall(item.call) || isBackgroundAgent(item.call) ||
         !(opts.expanded[item.key] || opts.detailed) || !item.call.children) return;
     const stream = item.call.children;
     const children: TimelineItem[] = [
-      ...stream.toolCalls.map((call): TimelineItem => ({ kind: "tool", seq: call.seq, key: `t-${call.seq}`, call })),
-      ...stream.transcript.map((message): TimelineItem => ({ kind: "message", seq: message.seq, key: `m-${message.seq}`, text: message.text })),
-      ...stream.thinking.map((block, i): TimelineItem => ({ kind: "thinking", seq: block.seq, key: `k-${block.seq}`, block,
-        open: stream.thinkingOpen && i === stream.thinking.length - 1 })),
+      ...stream.toolCalls.map((call) => childItem(call, depth + 1,
+        () => ({ kind: "tool", seq: call.seq, key: `t-${call.seq}`, call }))),
+      ...stream.transcript.map((message) => childItem(message, depth + 1,
+        () => ({ kind: "message", seq: message.seq, key: `m-${message.seq}`, text: message.text }))),
+      ...stream.thinking.map((block, i) => {
+        const open = stream.thinkingOpen && i === stream.thinking.length - 1;
+        return childItem(block, depth + 1,
+          () => ({ kind: "thinking", seq: block.seq, key: `k-${block.seq}`, block, open }), open);
+      }),
     ];
     children.sort((a, b) => a.seq - b.seq).forEach((child) => visit(child, depth + 1));
   };

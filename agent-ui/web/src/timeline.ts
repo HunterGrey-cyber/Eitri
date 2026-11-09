@@ -432,6 +432,12 @@ function questionFallback(call: ToolCallRecord): TimelineItem {
 }
 
 export function buildTimeline(state: AgentUiState): TimelineItem[] {
+  const firstTaskNotice = new Map<string, Seq>();
+  for (const notice of state.notices ?? []) {
+    if (notice.kind !== "task" || !notice.taskId) continue;
+    const previous = firstTaskNotice.get(notice.taskId);
+    if (previous === undefined || notice.seq < previous) firstTaskNotice.set(notice.taskId, notice.seq);
+  }
   timelineBuilds += 1;
   const causes = taskCauses(state.turnStarts ?? []);
   // Which linked cards hang off which call. A call may gate more than one.
@@ -472,9 +478,8 @@ export function buildTimeline(state: AgentUiState): TimelineItem[] {
     ...(state.notices ?? []).filter(drawsNotice).map(noticeItem),
     ...(state.notices ?? []).filter((notice) => notice.kind === "task").map((notice) => taskNoticeItem(notice, causes.get(notice.taskId ?? ""))),
     // A turn a task started whose notification is already a row draws nothing more.
-    ...(state.turnStarts ?? []).filter((start) => !start.cause?.taskId || !(state.notices ?? []).some(
-      (notice) => notice.kind === "task" && notice.taskId === start.cause?.taskId && notice.seq <= start.seq,
-    )).map(wakeItem),
+    ...(state.turnStarts ?? []).filter((start) => !start.cause?.taskId ||
+      (firstTaskNotice.get(start.cause.taskId) ?? Infinity) > start.seq).map(wakeItem),
     // A snapshot from a build before thinking was kept has none (`applySnapshot` fills `[]`); the
     // `?? []` covers a hand-built state in a test.
     ...(state.thinking ?? []).map((block, i, all) => thinkingItem(block, state.thinkingOpen === true && i === all.length - 1)),

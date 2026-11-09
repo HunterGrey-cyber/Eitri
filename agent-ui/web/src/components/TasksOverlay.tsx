@@ -127,7 +127,8 @@ export const TasksOverlay = forwardRef<TasksOverlayHandle, Props>(function Tasks
   { state, workflows = false, initialTaskId = null, onClose, onRequest, onOpen }, ref,
 ) {
   const root = useRef<HTMLDivElement>(null);
-  const [now, setNow] = useState(Date.now);
+  const [, setNow] = useState(Date.now);
+  const now = Date.now();
   // When this overlay first saw a row that ended without a clock time: its thirty seconds count from there.
   const firstSeenEnded = useRef(new Map<string, number>());
   const endedAt = (t: BackgroundTaskRecord): number | null => {
@@ -167,9 +168,20 @@ export const TasksOverlay = forwardRef<TasksOverlayHandle, Props>(function Tasks
 
   useEffect(() => {
     root.current?.focus();
-    const timer = window.setInterval(() => setNow(Date.now()), 1000);
-    return () => window.clearInterval(timer);
   }, []);
+  const timedRows = detail && task ? [task] : rows;
+  const ticking = timedRows.some((row) => row.ended_at === null);
+  const nextExpiry = Math.min(...visible.filter(finished).map((row) => endedAt(row)! + 30_000));
+  useEffect(() => {
+    if (ticking) {
+      const timer = window.setInterval(() => setNow(Date.now()), 1000);
+      return () => window.clearInterval(timer);
+    }
+    if (Number.isFinite(nextExpiry)) {
+      const timer = window.setTimeout(() => setNow(Date.now()), Math.max(0, nextExpiry - Date.now()));
+      return () => window.clearTimeout(timer);
+    }
+  }, [ticking, nextExpiry]);
   useEffect(() => {
     if (initialTaskId !== null && task) view(task);
     if (workflows) root.current?.querySelector<HTMLElement>('[data-task-group="workflow"]')?.scrollIntoView?.({ block: "start" });
