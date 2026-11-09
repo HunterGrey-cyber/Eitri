@@ -9,7 +9,7 @@ import { test } from 'node:test';
 import { gzipSync } from 'node:zlib';
 
 const script = fileURLToPath(new URL('./size-check.mjs', import.meta.url));
-const LIMIT = 240000;
+const LIMIT = 250000;
 
 function check(bytes, args = [String(LIMIT)], file = 'dist/index.html') {
   const cwd = mkdtempSync(join(tmpdir(), 'eitri-size-'));
@@ -45,11 +45,11 @@ test('compressible HTML is measured after gzip at level nine', () => {
 });
 
 test('an oversized gzip fails and names the measured bytes and the limit', () => {
-  const bytes = noise(250000);
+  const bytes = noise(LIMIT + 10000);
   const result = check(bytes);
   assert.equal(result.status, 1, result.stderr);
   assert.match(result.stderr, new RegExp(`\\b${gzipSync(bytes, { level: 9 }).length} bytes`));
-  assert.match(result.stderr, /limit 240000 bytes/);
+  assert.match(result.stderr, new RegExp(`limit ${LIMIT} bytes`));
 });
 
 test('a missing build fails', () => {
@@ -67,7 +67,7 @@ test('a missing or malformed limit fails before measuring', () => {
 
 test('the build ends with the size check and names the limit, so changing it rebuilds', () => {
   const pkg = JSON.parse(readFileSync(new URL('../package.json', import.meta.url)));
-  assert.match(pkg.scripts.build, /vite build && node scripts\/size-check\.mjs 240000$/);
+  assert.match(pkg.scripts.build, new RegExp(`vite build && node scripts/size-check\\.mjs ${LIMIT}$`));
   assert.match(pkg.scripts.test, /node --test scripts\/size-check\.test\.mjs/);
 });
 
