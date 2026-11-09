@@ -957,6 +957,12 @@ pub struct TurnReview {
     /// The number the next worker started here is known by.
     next_worker: u64,
     sessions: BTreeMap<String, SessionTrack>,
+    trimmed_waiting: Arc<AtomicUsize>,
+    trimmed_tx: mpsc::Sender<Vec<(String, u32)>>,
+    trimmed_rx: mpsc::Receiver<Vec<(String, u32)>>,
+    expired: BTreeSet<(String, u32)>,
+    /// The latest review requested by each tab may still be open in its page.
+    review_holds: Mutex<BTreeMap<u64, (String, BTreeSet<u32>)>>,
     tabs: BTreeMap<u64, TabTrack>,
     /// Counts [`poll`](Self::poll)s, which open every pump: events of different tabs are drained one
     /// tab after another, so their order within one pump, or across two neighbouring ones, is not
@@ -1019,6 +1025,7 @@ impl TurnReview {
     pub fn with_options(review_dir: Option<PathBuf>, project_root: &Path, options: ReviewOptions) -> TurnReview {
         let (done_tx, done_rx) = mpsc::channel();
         let (forwarded_tx, forwarded_rx) = mpsc::channel();
+        let (trimmed_tx, trimmed_rx) = mpsc::channel();
         TurnReview {
             spec: ShadowSpec {
                 review_dir,
@@ -1031,6 +1038,11 @@ impl TurnReview {
             done_rx,
             next_worker: 0,
             sessions: BTreeMap::new(),
+            trimmed_waiting: Arc::new(AtomicUsize::new(0)),
+            trimmed_tx,
+            trimmed_rx,
+            expired: BTreeSet::new(),
+            review_holds: Mutex::new(BTreeMap::new()),
             tabs: BTreeMap::new(),
             pump: 0,
             last_poll: None,
@@ -1587,11 +1599,13 @@ impl TurnReview {
 
     /// Whether a worker still owes an answer for a snapshot or a mark it was handed. A session's
     /// numbering is read by its worker before its first task and sent ahead of that task's answer, so it
-    /// is covered too. Until this is false, [`poll`](Self::poll) has to be called again.
+    /// is covered too, as is retention until ref deletion is reported (not the remaining collection).
+    /// Until this is false, [`poll`](Self::poll) has to be called again.
     pub fn has_work_in_flight(&self) -> bool {
         self.sessions.values().any(|s| s.outstanding > 0)
             || self.forwarding.values().any(|s| s.outstanding > 0)
             || self.forwarded_waiting.load(Ordering::SeqCst) > 0
+            || self.trimmed_waiting.load(Ordering::SeqCst) > 0
     }
 
     /// Takes in what the workers finished, without waiting, and returns a hint for every turn whose
@@ -1657,10 +1671,73 @@ impl TurnReview {
         for (session, offset) in released {
             self.release_held(&session, offset);
         }
+        self.prune_trimmed_records();
         // A session no open tab holds is dropped once its worker reported everything; dropping
         // its sender is what lets the worker end.
         self.sessions.retain(|_, s| !s.tabs.is_empty() || s.outstanding > 0);
         hints
+    }
+
+    /// Records supplied to a tab's review remain available for its later file requests. The page
+    /// reports no close, so conservatively hold its last requested view until the tab leaves.
+    pub(crate) fn hold_review(&self, tab: u64, session: &str) {
+        let mut turns = BTreeSet::new();
+        if let Some(track) = self.sessions.get(session) {
+            if let Some(offset) = track.known_offset() {
+                turns.extend(track.records.iter().map(|rec| offset + rec.position));
+            }
+        }
+        self.review_holds
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert(tab, (session.to_owned(), turns));
+    }
+
+    fn prune_trimmed_records(&mut self) {
+        while let Ok(removed) = self.trimmed_rx.try_recv() {
+            self.trimmed_waiting.fetch_sub(1, Ordering::SeqCst);
+            self.expired.extend(removed);
+        }
+        let mut holds = self.review_holds.lock().unwrap_or_else(|e| e.into_inner());
+        holds.retain(|tab, (session, _)| self.tabs.get(tab).and_then(|t| t.session.as_ref()) == Some(session));
+        if self.expired.is_empty() {
+            return;
+        }
+        for (session, track) in &mut self.sessions {
+            let Some(offset) = track.known_offset() else { continue };
+            // Answers and moves can still address records by position; wait until they settle.
+            if track.outstanding > 0
+                || self
+                    .forwarding
+                    .iter()
+                    .any(|((s, _), track)| s == session && track.outstanding > 0)
+                || self.handing_over.contains(session)
+            {
+                continue;
+            }
+            track.records.retain(|rec| {
+                let n = offset + rec.position;
+                !self.expired.contains(&(session.clone(), n))
+                    || !rec.ended
+                    || matches!(rec.record.base, Snap::Pending)
+                    || matches!(rec.record.end, Snap::Pending)
+                    || self.tabs.values().any(|tab| {
+                        [&tab.active, &tab.latest].iter().any(|active| {
+                            matches!(active, Some(Active::Bound { session: s, position })
+                                if s == session && *position == rec.position)
+                        })
+                    })
+                    || holds.values().any(|(s, turns)| s == session && turns.contains(&n))
+            });
+        }
+        // Keep deferred removals only while a protected record still needs them.
+        self.expired.retain(|(session, n)| {
+            self.sessions.get(session).is_some_and(|track| {
+                track
+                    .known_offset()
+                    .is_none_or(|offset| track.records.iter().any(|rec| offset + rec.position == *n))
+            })
+        });
     }
 
     /// Takes one worker answer in. `counted`: the answer is to a job this window's worker was
@@ -2405,6 +2482,8 @@ impl TurnReview {
             spec: self.spec.clone(),
             options: self.options.clone(),
             trim_stamp: self.trim_stamp.clone(),
+            trimmed: self.trimmed_tx.clone(),
+            trimmed_waiting: self.trimmed_waiting.clone(),
             done: self.done_tx.clone(),
         };
         let spawned = std::thread::Builder::new()
@@ -2532,6 +2611,8 @@ struct Worker {
     spec: ShadowSpec,
     options: ReviewOptions,
     trim_stamp: Arc<AtomicU64>,
+    trimmed: mpsc::Sender<Vec<(String, u32)>>,
+    trimmed_waiting: Arc<AtomicUsize>,
     done: mpsc::Sender<(String, u64, Done)>,
 }
 
@@ -2735,14 +2816,26 @@ impl Worker {
         }
         let shadow = shadow.clone();
         let (keep, max_age) = (self.options.keep, self.options.max_age);
+        let trimmed = self.trimmed.clone();
+        let waiting = self.trimmed_waiting.clone();
+        waiting.fetch_add(1, Ordering::SeqCst);
         let spawned = std::thread::Builder::new()
             .name("eitri-review-trim".into())
             .spawn(move || {
-                if let Err(e) = shadow.trim(keep, max_age, now, "1.hour.ago") {
+                let mut reported = false;
+                let result = shadow.trim_notifying(keep, max_age, now, "1.hour.ago", |removed| {
+                    let _ = trimmed.send(removed);
+                    reported = true;
+                });
+                if !reported {
+                    let _ = trimmed.send(Vec::new());
+                }
+                if let Err(e) = result {
                     eprintln!("[turn-review] retention could not run: {e}");
                 }
             });
         if let Err(e) = spawned {
+            waiting.fetch_sub(1, Ordering::SeqCst);
             eprintln!("[turn-review] retention could not start: {e}");
         }
     }
@@ -3376,6 +3469,111 @@ mod tests {
             left_out: LeftOutSides::default(),
             earlier_run: false,
         }
+    }
+
+    fn finish_jobs(review: &mut TurnReview) {
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while review.has_work_in_flight() {
+            review.poll();
+            assert!(Instant::now() < deadline, "snapshot replies arrive");
+            std::thread::yield_now();
+        }
+    }
+
+    fn bound_turns(hold_first: bool) -> TurnReview {
+        let mut review = TurnReview::with_options(None, Path::new("/unused"), ReviewOptions::default());
+        review.bind(1, "s1", 0, false);
+        // Exercise ref numbers that differ from the worker's positions.
+        review.sessions.get_mut("s1").unwrap().offset = Some(40);
+        for n in 1..=150 {
+            review.start_turn(1, &format!("t{n}"), n * 2, false);
+            review.end_active(1, n * 2 + 1, false);
+            if n == 1 && hold_first {
+                finish_jobs(&mut review);
+                review.hold_review(1, "s1");
+            }
+        }
+        finish_jobs(&mut review);
+        assert_eq!(review.turns("s1").len(), 150);
+        review
+    }
+
+    #[test]
+    fn retention_polls_until_the_ref_deletion_report_even_when_it_is_empty() {
+        let mut review = TurnReview::with_options(None, Path::new("/unused"), ReviewOptions::default());
+        assert!(!review.has_work_in_flight());
+        review.trimmed_waiting.fetch_add(1, Ordering::SeqCst);
+        assert!(review.has_work_in_flight());
+        review.trimmed_tx.send(Vec::new()).unwrap();
+        review.poll();
+        assert!(
+            !review.has_work_in_flight(),
+            "collection after ref deletion needs no polling"
+        );
+    }
+
+    #[test]
+    fn retention_prunes_removed_records_after_150_bound_turns() {
+        let mut review = bound_turns(false);
+        review.trimmed_waiting.fetch_add(1, Ordering::SeqCst);
+        review
+            .trimmed_tx
+            .send((41..=90).map(|n| ("s1".into(), n)).collect())
+            .unwrap();
+        review.poll();
+        assert_eq!(
+            review.turns("s1").iter().map(|r| r.n).collect::<Vec<_>>(),
+            (91..=190).collect::<Vec<_>>()
+        );
+        assert!(review.expired.is_empty(), "processed removals do not accumulate");
+    }
+
+    #[test]
+    fn retention_keeps_an_open_reviews_records_until_its_tab_leaves() {
+        let mut review = bound_turns(true);
+        review.trimmed_waiting.fetch_add(1, Ordering::SeqCst);
+        review
+            .trimmed_tx
+            .send((41..=90).map(|n| ("s1".into(), n)).collect())
+            .unwrap();
+        review.poll();
+        assert_eq!(review.turns("s1").len(), 101);
+        assert_eq!(review.turns("s1")[0].n, 41);
+        review.bind(2, "s1", 400, false);
+        review.close_tab(1, 401);
+        review.poll();
+        assert_eq!(review.turns("s1").len(), 100);
+        assert!(review.review_holds.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn retention_defers_jobs_latest_state_and_pending_snapshots_then_retries() {
+        let mut review = bound_turns(false);
+        // The session's former workers remain known after their replies have all arrived.
+        review.sessions.get_mut("s1").unwrap().earlier.insert(999);
+        review.sessions.get_mut("s1").unwrap().outstanding = 1;
+        review.trimmed_waiting.fetch_add(1, Ordering::SeqCst);
+        review
+            .trimmed_tx
+            .send(vec![("s1".into(), 41), ("s1".into(), 42), ("s1".into(), 190)])
+            .unwrap();
+        review.poll();
+        assert_eq!(review.turns("s1").len(), 150, "an outstanding job protects its session");
+        let track = review.sessions.get_mut("s1").unwrap();
+        track.outstanding = 0;
+        track.records[1].record.base = Snap::Pending;
+        review.poll();
+        assert_eq!(review.turns("s1").len(), 149);
+        assert!(review.turns("s1").iter().any(|r| r.n == 42));
+        assert!(
+            review.turns("s1").iter().any(|r| r.n == 190),
+            "latest turn survives even age retention"
+        );
+        review.sessions.get_mut("s1").unwrap().records[0].record.base = Snap::Unavailable("gone".into());
+        review.tabs.get_mut(&1).unwrap().latest = None;
+        review.poll();
+        assert_eq!(review.turns("s1").len(), 147);
+        assert!(review.expired.is_empty());
     }
 
     fn taken(c: &str) -> Snap {

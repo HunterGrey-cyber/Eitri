@@ -11,12 +11,14 @@
 //! says so ([`TitleCache::take_changed`]); the window then sends `hello` again with the new title. So a
 //! row shows something true at once and the CLI's title a moment later, and the window never waits.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::path::PathBuf;
 use std::sync::{mpsc, Arc, Mutex};
 use std::time::SystemTime;
 
 use agent::ResumableSession;
+
+const MAX_TITLES: usize = 512;
 
 /// What the worker last found for one transcript.
 #[derive(Clone)]
@@ -29,6 +31,7 @@ struct Seen {
 #[derive(Default)]
 struct Shared {
     seen: HashMap<PathBuf, Seen>,
+    oldest: VecDeque<PathBuf>,
     /// A title differs from the one memory held before the worker's last read.
     changed: bool,
     /// Paths handed to the worker and not read yet, so a picker opened twice asks once.
@@ -158,6 +161,14 @@ fn read_loop(jobs: &mpsc::Receiver<PathBuf>, shared: &Mutex<Shared>, wake: Optio
             let mut shared = shared.lock().unwrap_or_else(|e| e.into_inner());
             let before = shared.seen.get(&path).and_then(|seen| seen.title.clone());
             let differs = before != title;
+            if !shared.seen.contains_key(&path) {
+                if shared.oldest.len() == MAX_TITLES {
+                    if let Some(oldest) = shared.oldest.pop_front() {
+                        shared.seen.remove(&oldest);
+                    }
+                }
+                shared.oldest.push_back(path.clone());
+            }
             shared.seen.insert(path.clone(), Seen { stamp, title });
             shared.queued.remove(&path);
             shared.pending = shared.pending.saturating_sub(1);
@@ -257,6 +268,45 @@ mod tests {
         cache.apply("/nonexistent/for/titles", &mut rows);
         assert!(rows.iter().all(|r| r.title.as_deref() == Some("own")));
         assert!(cache.wait_read(std::time::Duration::from_secs(5)));
+    }
+
+    #[test]
+    fn positive_and_missing_titles_share_a_bounded_cache_and_evicted_paths_can_return() {
+        let dir = crate::test_scratch_dir::ScratchDir::new("eitri-titles", "retention");
+        let shared = Mutex::new(Shared::default());
+        let read = |path: PathBuf| {
+            let (tx, rx) = mpsc::channel();
+            tx.send(path).unwrap();
+            drop(tx);
+            read_loop(&rx, &shared, None);
+        };
+        for i in 0..600 {
+            let path = dir.join(format!("s{i}"));
+            if i % 2 == 0 {
+                std::fs::write(&path, title_line("title")).unwrap();
+            }
+            read(path);
+        }
+        {
+            let state = shared.lock().unwrap();
+            assert_eq!(state.seen.len(), MAX_TITLES);
+            assert_eq!(state.oldest.len(), MAX_TITLES);
+            assert!(!state.seen.contains_key(&dir.join("s0")));
+            assert!(!state.seen.contains_key(&dir.join("s1")));
+            assert_eq!(state.seen[&dir.join("s598")].title.as_deref(), Some("title"));
+            assert!(state.seen[&dir.join("s599")].title.is_none());
+        }
+        std::fs::write(dir.join("s1"), title_line("now present")).unwrap();
+        read(dir.join("s0"));
+        read(dir.join("s1"));
+        // Refreshing an existing entry does not give it another place in the eviction queue.
+        read(dir.join("s1"));
+        let state = shared.lock().unwrap();
+        assert_eq!(state.seen.len(), MAX_TITLES);
+        assert_eq!(state.oldest.len(), MAX_TITLES);
+        assert_eq!(state.seen[&dir.join("s0")].title.as_deref(), Some("title"));
+        assert_eq!(state.seen[&dir.join("s1")].title.as_deref(), Some("now present"));
+        assert!(!state.seen.contains_key(&dir.join("s89")));
     }
 
     /// What the window's thread spends titling sixteen rows whose transcripts are 1 MB each: reading them

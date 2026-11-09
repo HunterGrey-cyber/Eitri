@@ -530,24 +530,19 @@ impl AcpProvider {
     /// Waits for `pending` while serving what the agent says meanwhile (a replay, a mode report, a request
     /// it makes), so its queue never fills behind the wait.
     fn serve(&self, mut pending: Pending, within: Duration, boot: &mut Boot) -> Result<Value, LinkError> {
-        let deadline = Instant::now() + within;
-        loop {
-            // The answer first: the reader files every message before it ahead of the answer, so reading
-            // the queue afterwards leaves nothing of the replay behind.
-            let answer = pending.try_take();
-            loop {
-                let next = external_link::try_recv(&self.link);
-                let Some(message) = next else { break };
+        serve_replay(
+            || pending.try_take(),
+            || {
+                let Some(message) = external_link::try_recv(&self.link) else {
+                    return false;
+                };
                 self.fold_boot(message, boot);
-            }
-            if let Some(answer) = answer {
-                return answer;
-            }
-            if Instant::now() >= deadline {
-                return Err(LinkError::Timeout);
-            }
-            std::thread::sleep(POLL);
-        }
+                true
+            },
+            Instant::now() + within,
+            Instant::now,
+            || std::thread::sleep(POLL),
+        )
     }
 
     fn fold_boot(&self, message: Incoming, boot: &mut Boot) {
@@ -1921,5 +1916,110 @@ impl ExternalProvider for AcpProvider {
             turn_id: turn_id.clone(),
         });
         Ok(turn_id)
+    }
+}
+
+/// Drain replay in bounded batches so an agent that keeps talking cannot hide the load deadline.
+/// A captured answer still waits for the queue to empty: earlier replay messages must all be folded.
+fn serve_replay(
+    mut take_answer: impl FnMut() -> Option<Result<Value, LinkError>>,
+    mut fold_one: impl FnMut() -> bool,
+    deadline: Instant,
+    mut now: impl FnMut() -> Instant,
+    mut pause: impl FnMut(),
+) -> Result<Value, LinkError> {
+    let mut answer = None;
+    loop {
+        if answer.is_none() {
+            answer = take_answer();
+        }
+        let mut empty = false;
+        for _ in 0..256 {
+            if !fold_one() {
+                empty = true;
+                break;
+            }
+        }
+        if empty {
+            if let Some(answer) = answer {
+                return answer;
+            }
+        }
+        if now() >= deadline {
+            return Err(LinkError::Timeout);
+        }
+        if empty {
+            pause();
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::cell::Cell;
+
+    #[test]
+    fn acp_replay_checks_the_deadline_while_the_queue_stays_full() {
+        let start = Instant::now();
+        let messages = Cell::new(0);
+        let polls = Cell::new(0);
+        let result = serve_replay(
+            || {
+                polls.set(polls.get() + 1);
+                None
+            },
+            || {
+                messages.set(messages.get() + 1);
+                // Finite fallback lets the regression fail without hanging on an unbounded drain.
+                messages.get() < 100_000
+            },
+            start + Duration::from_millis(300),
+            || start + Duration::from_millis(messages.get()),
+            || panic!("a full queue needs no sleep"),
+        );
+        assert!(matches!(result, Err(LinkError::Timeout)));
+        assert_eq!(messages.get(), 512, "deadline checked after each 256 messages");
+        assert_eq!(polls.get(), 2, "answer checked between batches too");
+    }
+
+    #[test]
+    fn acp_replay_deadline_also_limits_a_full_queue_after_the_answer() {
+        let start = Instant::now();
+        let messages = Cell::new(0);
+        let mut answer = Some(Ok(Value::Null));
+        let result = serve_replay(
+            || answer.take(),
+            || {
+                messages.set(messages.get() + 1);
+                messages.get() < 100_000
+            },
+            start + Duration::from_millis(300),
+            || start + Duration::from_millis(messages.get()),
+            || panic!("a full queue needs no sleep"),
+        );
+        assert!(matches!(result, Err(LinkError::Timeout)));
+        assert_eq!(messages.get(), 512);
+    }
+
+    #[test]
+    fn acp_replay_folds_all_preceding_messages_before_returning_a_captured_answer() {
+        let remaining = Cell::new(600_u32);
+        let mut answer = Some(Ok(json!({"sessionId": "saved"})));
+        let start = Instant::now();
+        let result = serve_replay(
+            || answer.take(),
+            || {
+                let before = remaining.get();
+                remaining.set(before.saturating_sub(1));
+                before > 0
+            },
+            start + Duration::from_secs(1),
+            || start,
+            || panic!("the captured answer should return without a sleep"),
+        )
+        .unwrap();
+        assert_eq!(remaining.get(), 0);
+        assert_eq!(result["sessionId"], "saved");
     }
 }

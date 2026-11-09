@@ -2061,6 +2061,7 @@ impl TabSet {
             }
             None => crate::turn_review::NamedPaths::default(),
         };
+        review.hold_review(tab.0, &session);
         Ok(review.overview_job(&session, turn, scope, named))
     }
 

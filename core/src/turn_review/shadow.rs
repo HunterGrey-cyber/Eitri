@@ -1360,11 +1360,23 @@ impl Shadow {
     /// Only one collection of the project runs at a time: one that finds another window's running
     /// waits for it on `collect.lock`, so two `git gc` never meet in the store.
     pub fn trim(&self, keep: usize, max_age: Duration, now_ms: u64, prune_expiry: &str) -> Result<(), ShadowError> {
+        self.trim_notifying(keep, max_age, now_ms, prune_expiry, |_| {})
+    }
+
+    /// Reports removed turns as soon as their refs are deleted, even if later collection fails.
+    pub(crate) fn trim_notifying(
+        &self,
+        keep: usize,
+        max_age: Duration,
+        now_ms: u64,
+        prune_expiry: &str,
+        removed: impl FnOnce(Vec<(String, u32)>),
+    ) -> Result<(), ShadowError> {
         let _collecting = flock_file(&self.review_dir.join("collect.lock"), libc::LOCK_EX, None)?;
         // Collection is not bounded by the snapshot timeout: it runs in the background, and
         // stopping it halfway only wastes the work.
         let deadline = Instant::now() + Duration::from_secs(600);
-        self.drop_expired(keep, max_age, now_ms, deadline)?;
+        self.drop_expired(keep, max_age, now_ms, deadline, removed)?;
         {
             let _lock = self.lock_shared()?;
             #[cfg(test)]
@@ -1410,7 +1422,14 @@ impl Shadow {
 
     /// Step 1 of [`trim`](Self::trim): the expired refs and the indexes of sessions with nothing
     /// left, with the lock held exclusively.
-    fn drop_expired(&self, keep: usize, max_age: Duration, now_ms: u64, deadline: Instant) -> Result<(), ShadowError> {
+    fn drop_expired(
+        &self,
+        keep: usize,
+        max_age: Duration,
+        now_ms: u64,
+        deadline: Instant,
+        removed: impl FnOnce(Vec<(String, u32)>),
+    ) -> Result<(), ShadowError> {
         let _lock = self.lock_exclusive()?;
         // A ref lock or `packed-refs.lock` left by a killed snapshot or collection would make the
         // ref deletion below fail, and with it every collection from then on.
@@ -1442,6 +1461,7 @@ impl Shadow {
         let oldest_kept = now_ms.saturating_sub(u64::try_from(max_age.as_millis()).unwrap_or(u64::MAX));
 
         let mut delete = Vec::new();
+        let mut removed_turns = Vec::new();
         let mut kept_sessions = BTreeSet::new();
         let mut finished = 0;
         for ((session, turn), (time, names)) in ordered {
@@ -1453,6 +1473,7 @@ impl Shadow {
                 finished += 1;
             }
             if over_count || time < oldest_kept {
+                removed_turns.push((session, turn));
                 delete.extend(names);
             } else {
                 kept_sessions.insert(session);
@@ -1465,6 +1486,7 @@ impl Shadow {
             update.args(["update-ref", "--stdin"]);
             self.run_ok("update-ref", update, Some(input.as_bytes()), deadline)?;
         }
+        removed(removed_turns);
 
         for entry in std::fs::read_dir(&self.review_dir)? {
             let name = entry?.file_name();
@@ -1807,6 +1829,42 @@ fn write_atomically(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn trim_reports_deleted_turns_even_when_collection_later_fails() {
+        let dir = crate::test_scratch_dir::ScratchDir::new("eitri-review-trim", "notification");
+        let project = dir.join("project");
+        std::fs::create_dir(&project).unwrap();
+        std::fs::write(project.join("file"), "text").unwrap();
+        let shadow = Shadow::open_with_excludes(&dir.join("review"), &project, None).unwrap();
+        for turn in 1..=2 {
+            for kind in [SnapshotKind::Base, SnapshotKind::End] {
+                let label = SnapshotLabel {
+                    turn,
+                    kind,
+                    turn_id: format!("t{turn}"),
+                    tab: 1,
+                    time_ms: u64::from(turn),
+                };
+                assert!(matches!(
+                    shadow.snapshot("s1", &label, &Limits::default()),
+                    SnapshotOutcome::Taken(_)
+                ));
+            }
+        }
+        let removed = std::sync::Arc::new(std::sync::Mutex::new(None));
+        let notified = removed.clone();
+        let config = shadow.git_dir().join("config");
+        super::super::test_hooks::set(&super::super::test_hooks::BEFORE_GC, move || {
+            assert_eq!(*notified.lock().unwrap(), Some(vec![("s1".to_owned(), 1)]));
+            std::fs::write(config, "[invalid config").unwrap();
+        });
+        let result = shadow.trim_notifying(1, Duration::from_secs(3600), 3, "now", |turns| {
+            *removed.lock().unwrap() = Some(turns);
+        });
+        assert!(result.is_err(), "the ref deletion preceded the failed collection");
+        assert_eq!(*removed.lock().unwrap(), Some(vec![("s1".to_owned(), 1)]));
+    }
 
     thread_local! {
         /// Run once, on this thread, between a snapshot's listing of the work tree and its add: the
