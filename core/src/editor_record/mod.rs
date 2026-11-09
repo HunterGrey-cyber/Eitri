@@ -137,8 +137,8 @@ impl Record {
 
     /// Makes the JSON at most `max` bytes by dropping listed buffers from the end, then whole tabs from the end.
     /// The first tab is never dropped: with every count bound held, one tab is well under [`RECORD_MAX`], so a
-    /// record trimmed to that always fits. A current tab that goes leaves `tab` empty. Returns what was dropped,
-    /// one line each, for the log.
+    /// record trimmed to that always fits. A current tab that goes leaves `tab` empty. Returns one description
+    /// per omitted entry; these descriptions contain private names and must not be logged.
     pub fn fit_budget(&mut self, max: usize) -> Vec<String> {
         let mut dropped = Vec::new();
         let mut len = self.to_json().len();

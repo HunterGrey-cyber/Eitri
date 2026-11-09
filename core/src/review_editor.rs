@@ -35,7 +35,7 @@ pub const REVIEW_LUA: &str =
     crate::editor_rpc::takeover_chunk!(concat!(include_str!("find_buf.lua"), include_str!("review.lua")), "");
 
 /// Bumped whenever `find_buf.lua` or `review.lua` changes.
-pub const REVIEW_LUA_VERSION: i64 = 16;
+pub const REVIEW_LUA_VERSION: i64 = 17;
 
 /// Every call into an installed module first checks that one is there, and answers
 /// `{ missing = true }` when it is not (another panel's teardown, or nvim restarted) rather than

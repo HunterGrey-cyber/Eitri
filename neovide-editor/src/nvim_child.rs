@@ -579,12 +579,48 @@ mod tests {
     use std::path::{Path, PathBuf};
     use std::process::{Child, Command, Stdio};
 
-    fn scratch(case: &str) -> PathBuf {
+    struct Scratch(PathBuf);
+
+    impl std::ops::Deref for Scratch {
+        type Target = Path;
+
+        fn deref(&self) -> &Path {
+            &self.0
+        }
+    }
+
+    impl AsRef<Path> for Scratch {
+        fn as_ref(&self) -> &Path {
+            &self.0
+        }
+    }
+
+    impl Drop for Scratch {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    fn scratch(case: &str) -> Scratch {
         let dir = std::env::temp_dir().join(format!("nvchild-{}-{case}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
+        let dir = Scratch(dir);
         // nvim's own `nvim.<user>` temp directory goes in here, not in the shared temp dir it would outlive.
         std::fs::create_dir_all(dir.join("t")).expect("scratch dir");
         dir
+    }
+
+    #[test]
+    fn scratch_is_removed_when_a_test_panics() {
+        let mut path = PathBuf::new();
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let dir = scratch("panic-cleanup");
+            path = dir.to_path_buf();
+            std::fs::write(dir.join("nested"), "scratch").unwrap();
+            panic!("unwind the scratch owner");
+        }));
+        assert!(result.is_err());
+        assert!(!path.exists(), "scratch must be removed during unwinding");
     }
 
     /// Waits until `pid` shows the argv it was spawned with (`--embed` in it), which [`NvimChild::find_new`]
@@ -652,7 +688,6 @@ mod tests {
         let _ = other.wait();
         let _ = nvim.kill();
         let _ = nvim.wait();
-        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// The out-of-reach line names a launcher only for nvim run behind one: the fork's own nvim child is not, an nvim a
@@ -729,7 +764,6 @@ mod tests {
             let _ = imp::signal(nvim, libc::SIGKILL);
         }
         drop(left);
-        let _ = std::fs::remove_dir_all(&dir);
         assert!(!direct_behind, "the fork's own nvim child");
         assert!(wrapped_behind, "a launcher in front of nvim");
         assert!(learned, "the premise: nvim's own pid is held");
@@ -763,7 +797,6 @@ mod tests {
         let _ = nvim.kill();
         let _ = nvim.wait();
         let after_reap = readable(0);
-        let _ = std::fs::remove_dir_all(&dir);
         assert!(!while_running, "nothing to wake while nvim runs");
         assert!(after_exit, "its exit wakes the watch");
         assert!(after_reap, "and stays readable once reaped");
@@ -794,7 +827,6 @@ mod tests {
             started.elapsed() < Duration::from_millis(100),
             "no wait for what is gone"
         );
-        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// A `nvim` on `PATH` that is a shell script running nvim without `exec`.
@@ -883,7 +915,6 @@ mod tests {
         }
         let _ = launched.kill();
         let _ = launched.wait();
-        let _ = std::fs::remove_dir_all(&dir);
         assert_eq!(watched, Some(nvim), "nvim is what is watched, not its launcher");
         assert_eq!(ended, Ended::Killed);
         assert!(nvim_gone, "nvim itself was ended");
@@ -974,7 +1005,6 @@ mod tests {
             unsafe { libc::kill(reported as libc::pid_t, libc::SIGKILL) };
         }
         let _ = runtime.block_on(launched.wait());
-        let _ = std::fs::remove_dir_all(&dir);
         assert_eq!(ended, Ended::Terminated);
         assert!(nvim_gone, "nvim itself is gone");
     }
@@ -1032,7 +1062,6 @@ mod tests {
             // SAFETY: the nvim this test's own wrapper started.
             unsafe { libc::kill(reported as libc::pid_t, libc::SIGKILL) };
         }
-        let _ = std::fs::remove_dir_all(&dir);
         assert!(orphan_alive, "the case: nvim outlives its launcher");
         assert_eq!(
             seen_found,
@@ -1159,7 +1188,6 @@ mod tests {
             let _ = nvim.kill();
         }
         let _ = nvim.wait();
-        let _ = std::fs::remove_dir_all(&dir);
         assert!(gone, "{case}: nvim is gone after end() ({ended:?})");
         assert!(!swap_files.is_empty(), "{case}: the swap file stays ({ended:?})");
         assert!(!written, "{case}: nothing was written over the file");
@@ -1265,7 +1293,7 @@ mod tests {
         session: neovide::bridge::session::NeovimSession,
         process: NvimProcess,
         pid: u32,
-        dir: PathBuf,
+        dir: Scratch,
         swap: PathBuf,
     }
 
@@ -1442,10 +1470,8 @@ mod tests {
         });
         let kept = swap_holds(&fork.swap, LATE_EDIT);
         let untouched = std::fs::read_to_string(fork.dir.join("a.txt")).is_ok_and(|text| text == "original\n");
-        let dir = fork.dir.clone();
         drop(fork.session);
         fork.runtime.shutdown_timeout(Duration::from_secs(1));
-        let _ = std::fs::remove_dir_all(&dir);
         assert!(gone, "{case}: nvim is gone after end() ({ended:?})");
         assert!(untouched, "{case}: nothing was written over the file");
         Outcome {

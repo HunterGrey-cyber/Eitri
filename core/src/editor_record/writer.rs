@@ -391,10 +391,8 @@ impl Worker {
                 }
             }
             Op::ClearMarkerIf(token) => {
-                if let Some(skipping) = &self.session {
-                    eprintln!(
-                        "[editor] reopen: the restore marker stays until a record is written for nvim {skipping}"
-                    );
+                if self.session.is_some() {
+                    eprintln!("[editor] reopen: the restore marker stays until a record is written for nvim");
                     return;
                 }
                 let cleared = self.locked(|file| match file.marker() {
@@ -442,8 +440,9 @@ impl Worker {
             return;
         }
         let mut fitted = record.clone();
-        for dropped in fitted.fit_budget(RECORD_MAX) {
-            eprintln!("[editor] reopen: the record is too large; left out {dropped}");
+        let dropped = fitted.fit_budget(RECORD_MAX).len();
+        if dropped > 0 {
+            eprintln!("[editor] reopen: the record is too large; left out {dropped} entries");
         }
         let written = self.locked(|file| {
             file.write(&fitted)?;
@@ -464,8 +463,8 @@ impl Worker {
             }
             Err(e) => {
                 eprintln!(
-                    "[editor] reopen: could not save the editor's open files to {}: {e}",
-                    self.file.path().display()
+                    "[editor] reopen: could not save the editor's open files: {:?}",
+                    e.kind()
                 );
                 if self.last_failed.as_ref() != Some(&record) {
                     save_health::failed(SaveKind::Editor, &e);

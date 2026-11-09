@@ -825,7 +825,8 @@ mod tests {
     #[test]
     fn a_view_proposal_for_a_new_file_reaches_the_editor() {
         let (handle, page) = settled_panel();
-        let scratch = eitri_core::scratch::ScratchDir::new().expect("a scratch directory");
+        let workspace = agent::state_dirs::test_workspace_dir("review-proposal");
+        let scratch = eitri_core::scratch::ScratchDir::in_dir(&workspace).expect("a scratch directory");
         let project = scratch.path().join("project");
         std::fs::create_dir(&project).unwrap();
         let scratch_root = scratch.path().to_path_buf();
@@ -895,7 +896,8 @@ mod tests {
         Rc<RefCell<Vec<serde_json::Value>>>,
     ) {
         let (handle, page) = settled_panel();
-        let root = eitri_core::scratch::ScratchDir::new().expect("a scratch directory");
+        let workspace = agent::state_dirs::test_workspace_dir("review-editor");
+        let root = eitri_core::scratch::ScratchDir::in_dir(&workspace).expect("a scratch directory");
         handle.state.borrow_mut().scratch =
             Some(eitri_core::scratch::ScratchDir::in_dir(root.path()).expect("a panel scratch directory"));
         let asked: Rc<RefCell<Vec<serde_json::Value>>> = Rc::default();
@@ -1153,7 +1155,8 @@ mod tests {
     /// A thread the OS will not start is a refusal the page hears, with nothing queued and nothing written.
     #[test]
     fn a_view_whose_thread_cannot_start_answers_the_page_with_why() {
-        let mut dir = eitri_core::scratch::ScratchDir::new().expect("a scratch directory");
+        let workspace = agent::state_dirs::test_workspace_dir("review-write-refused");
+        let mut dir = eitri_core::scratch::ScratchDir::in_dir(&workspace).expect("a scratch directory");
         let file = dir.reserve_view("Bash: ls");
         let refused =
             spawn_view_write(file, "text".into(), |_job| Err(std::io::Error::from_raw_os_error(11))).unwrap_err();

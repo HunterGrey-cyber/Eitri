@@ -1735,6 +1735,10 @@ fn a_command_list_replaces_the_one_before_and_an_empty_one_withdraws_them() {
 fn thinking_open_after_says_what_apply_does() {
     let t = || "t1".to_string();
     let events = vec![
+        AgentDomainEvent::ConversationReset {
+            new_conversation_id: "new".into(),
+            trigger: Some("clear".into()),
+        },
         AgentDomainEvent::SessionOpened {
             session_id: "s".into(),
             provider_session_id: "p".into(),

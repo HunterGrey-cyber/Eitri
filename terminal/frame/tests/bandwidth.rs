@@ -9,12 +9,11 @@
 //!
 //! ON FAILABILITY
 //! --------------
-//! `the_bandwidth_gate_is_runnable_here` is deliberately NOT `#[ignore]`d. Every
-//! other test in this file is, so a plain `cargo test` is green while the whole
-//! measurement silently does not run -- and a measurement that can silently not
-//! run is worse than no measurement, because the README still quotes numbers
-//! from it. The sentinel asserts the gate is RUNNABLE; if the programs are
-//! missing, that is a red test, not a quiet skip.
+//! `the_bandwidth_gate_is_runnable_here` runs with the opt-in measurements and
+//! asserts their prerequisites are present. Missing programs fail that run;
+//! ordinary library tests do not require a Claude installation. A plain
+//! `cargo test` runs `the_meter_actually_meters` to check the meter with a shell
+//! child, but does not reproduce the README's bandwidth figures.
 //!
 //! Every measuring test also asserts a floor on what it observed (frames seen,
 //! PTY bytes read, screen actually touched), so "0 frames, 0 bytes, 0 B/s" can
@@ -463,11 +462,12 @@ done
 }
 
 // ===========================================================================
-// UNGATED SENTINEL
+// MEASUREMENT PREREQUISITES AND METER SMOKE TEST
 // ===========================================================================
 
-/// Deliberately NOT `#[ignore]`d. See the module docs.
+/// Required by the opt-in measurements, including the Claude TUI workload.
 #[test]
+#[ignore = "bandwidth measurement prerequisites: bash, sh, nvim, seq and claude"]
 fn the_bandwidth_gate_is_runnable_here() {
     let missing: Vec<&str> = ["bash", "sh", "nvim", "seq", "claude"]
         .into_iter()
@@ -475,15 +475,13 @@ fn the_bandwidth_gate_is_runnable_here() {
         .collect();
     assert!(
         missing.is_empty(),
-        "the bandwidth gate cannot run here -- missing: {missing:?}. Every other test in this \
-         file is #[ignore]d, so without these the suite is green while the README quotes \
-         numbers nothing produced. Install them, or run \
+        "the bandwidth measurements cannot run here -- missing: {missing:?}. Install them, or run \
          `cargo test --release --test bandwidth -- --ignored --nocapture --test-threads=1` \
          elsewhere and record the result."
     );
 }
 
-/// A second sentinel, for the thing a missing binary cannot catch: the meter
+/// A smoke test for the thing a missing binary cannot catch: the meter
 /// itself silently measuring nothing. Runs a trivial child, ungated, in under a
 /// second.
 #[test]

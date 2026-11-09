@@ -2906,8 +2906,9 @@ impl AgentSessionProjection {
 ///
 /// Two differences, on the safe side: a `ResumeOutcome` counts as closing, though one that attached to
 /// the session asked for leaves the block open; and so does a `TurnCompleted`, though one naming a
-/// turn the projection is not running leaves it open. A provider that takes an open block for closed only
-/// leaves out a separator; one that took a closed block for open would start the next block with one.
+/// turn the projection is not running leaves it open. `ConversationReset` closes the block as it clears
+/// the conversation. A provider that takes an open block for closed only leaves out a separator; one
+/// that took a closed block for open would start the next block with one.
 /// No wildcard arm, so a new event has to say which it is.
 pub fn thinking_open_after(open: bool, event: &AgentDomainEvent) -> bool {
     match event {
@@ -2933,6 +2934,7 @@ pub fn thinking_open_after(open: bool, event: &AgentDomainEvent) -> bool {
         | AgentDomainEvent::SessionUnavailable { .. }
         | AgentDomainEvent::SessionClosed { .. }
         | AgentDomainEvent::QuestionAsked { .. }
+        | AgentDomainEvent::ConversationReset { .. }
         // A row of its own when it names the running turn.
         | AgentDomainEvent::CliCycleStarted { .. } => false,
         AgentDomainEvent::SessionOpened { .. }
@@ -2964,7 +2966,6 @@ pub fn thinking_open_after(open: bool, event: &AgentDomainEvent) -> bool {
         | AgentDomainEvent::TurnCauseUpdated { .. }
         | AgentDomainEvent::BackgroundTasksChanged { .. }
         | AgentDomainEvent::TaskEvent { .. }
-        | AgentDomainEvent::ConversationReset { .. }
         | AgentDomainEvent::SubagentFrame { .. }
         // The host's own records of a tool it serves: no row, in any view.
         | AgentDomainEvent::ClientToolCall { .. }

@@ -307,6 +307,41 @@ fn a_view_reads_no_modeline() {
     dir.cleanup();
 }
 
+#[test]
+#[ignore = "needs a real nvim on PATH; spends no tokens and needs no display"]
+fn an_edit_reads_no_modeline_and_restores_the_previous_option() {
+    let root = agent::state_dirs::test_workspace_dir("scratch-edit-modeline");
+    let mut dir = ScratchDir::in_dir(&root).expect("a scratch directory");
+    for enabled in [true, false] {
+        let probe = dir.path().join("probe.txt");
+        let (request, edit) = dir.prepare_edit("first\nvim: set textwidth=77 :\nlast").unwrap();
+        nvim(
+            &dir,
+            &[
+                format!("set {}modeline textwidth=0", if enabled { "" } else { "no" }),
+                "let g:previous = bufnr()".into(),
+                call(request.hex()),
+                format!(
+                    "call writefile([string(&l:modeline), string(&textwidth), string(&g:modeline), \
+                     string(getbufvar(g:previous, '&modeline'))], '{}')",
+                    probe.display()
+                ),
+                "wq".into(),
+            ],
+        );
+        let option = i32::from(enabled);
+        assert_eq!(
+            std::fs::read_to_string(&probe).unwrap(),
+            format!("0\n0\n{option}\n{option}\n")
+        );
+        assert_eq!(
+            edit.poll(),
+            Some(EditDone::Written("first\nvim: set textwidth=77 :\nlast".into()))
+        );
+    }
+    dir.cleanup();
+}
+
 /// A view decides line ends the way opening the file would have: CR-LF throughout reads as plain
 /// lines, and one bare LF among them keeps every CR as text.
 #[test]

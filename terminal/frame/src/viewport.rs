@@ -617,17 +617,23 @@ mod tests {
     /// must be found in linear time.
     #[test]
     fn align_on_a_history_of_repeated_lines_is_linear() {
-        let n = 200_000;
-        let mut prev = vec![7u64; n];
-        prev[n - 2] = 9; // the distinct penultimate line
-        let next = vec![7u64; n];
-        let started = std::time::Instant::now();
-        assert_eq!(align(&prev, &next), None);
-        assert!(
-            started.elapsed() < std::time::Duration::from_secs(1),
-            "{:?} for {n} lines",
-            started.elapsed()
-        );
+        fn time(n: usize) -> std::time::Duration {
+            let mut prev = vec![7u64; n];
+            prev[n - 2] = 9; // the distinct penultimate line
+            let next = vec![7u64; n];
+            // The fastest sample avoids charging a descheduled test thread to the algorithm.
+            (0..5)
+                .map(|_| {
+                    let started = std::time::Instant::now();
+                    assert_eq!(std::hint::black_box(align(&prev, &next)), None);
+                    started.elapsed()
+                })
+                .min()
+                .unwrap()
+        }
+        let small = time(50_000);
+        let large = time(200_000);
+        assert!(large < small * 8, "4x lines took {large:?}, against {small:?}");
     }
 
     /// `align` against trying every offset on the repeated-line history at the

@@ -550,7 +550,7 @@ upstream's keyboard encoder.)
 | `tests/delta_equals_full.rs` | **The differential.** 6 tests, 290 corpora; after every frame the delta-assembled screen must equal the terminal itself, cell for cell, cursor, modes and palette included. Plus the negative control, with exact divergence counts per policy, and a test that pins the corpus size so it cannot silently shrink. |
 | `tests/encode.rs` | 11 tests. Exact round-trip of 2 180 frames / 951 761 cells through both encodings, an exhaustive pass over all 2^15 flag combinations, truncation and trailing-byte rejection, the threshold sweep, and the best/typical/worst ceilings. |
 | `tests/viewport.rs` | 6 tests. The unclamped read returning erased scrollback, and the one-clamp-is-enough argument swept over absurd offsets. |
-| `tests/bandwidth.rs` | The measurement: 7 `#[ignore]`d workloads plus TWO ungated sentinels. |
+| `tests/bandwidth.rs` | The measurement: 7 `#[ignore]`d workloads, an ignored prerequisite check and a default meter smoke test. |
 | `tests/common/reference.rs` | An **independently written** projection from `alacritty_terminal`'s own types. The truth every correctness test compares against. |
 
 ### Why the oracle had to be rewritten
@@ -570,17 +570,20 @@ one green.
 palette a frame *should* carry, derived from `Term` in upstream's vocabulary,
 sharing no code with the crate under test.
 
-### On the ungated sentinels
+### Measurement prerequisites and the meter smoke test
 
-`tests/bandwidth.rs` is entirely `#[ignore]`d, so a plain `cargo test` would be
-green while the whole measurement silently did not run — and the README above
-quotes numbers from it. Two tests are therefore **not** ignored:
+Plain `cargo test` checks the meter but does not reproduce the figures above.
+The measurement workloads and their prerequisite check run with the explicit
+`--ignored` command above:
 
-* `the_bandwidth_gate_is_runnable_here` — asserts `bash`, `sh`, `nvim`, `seq`
-  and `claude` are all present. Missing programs are a red test, not a skip.
+* `the_bandwidth_gate_is_runnable_here` — an ignored prerequisite check that
+  asserts `bash`, `sh`, `nvim`, `seq` and `claude` are all present. Missing
+  programs fail the explicit measurement run. Ordinary library tests do not
+  require a Claude installation.
 * `the_meter_actually_meters` — runs a trivial child on a real PTY in under a
   second and asserts the meter read bytes, produced frames, and encoded both
-  ways. A missing binary cannot catch the meter silently measuring nothing.
+  ways. It runs by default: a missing binary cannot catch the meter silently
+  measuring nothing.
 
 Every measuring test also asserts a floor on what it observed (frames, PTY
 bytes, cells touched), so "0 frames, 0 bytes, 0 B/s" can never be reported as a

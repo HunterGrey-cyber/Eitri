@@ -1275,6 +1275,16 @@ local function must_leave(buf)
   return false
 end
 
+-- A turn that cannot draw its final hunks must not leave its earlier drawing marked running.
+-- This also runs for hidden buffers, without opening them or changing the person's position.
+local function settle_running(buf, meta)
+  local ov = buf and state.overlays[buf]
+  if not meta.running and ov and ov.live and ov.running and ov.meta.session == meta.session
+    and ov.meta.turn_id == meta.turn_id then
+    remove_overlay(buf, 'settled')
+  end
+end
+
 function state.live_show(path, meta, hunks)
   check_path(path)
   check_meta(meta)
@@ -1286,16 +1296,13 @@ function state.live_show(path, meta, hunks)
   end
   local buf = find_buf(path)
   local answer = { drawn = 0, shown = is_shown(buf), left = false, skipped = 0 }
-  if not answer.shown then return status(answer) end
+  if not answer.shown then
+    settle_running(buf, meta)
+    return status(answer)
+  end
   if must_leave(buf) then
     answer.left = true
-    -- The turn ended but its exact hunks cannot go over this buffer: its drawing from the running
-    -- turn would otherwise stay marked running, and undo would keep refusing for a turn that is over.
-    local ov = state.overlays[buf]
-    if not meta.running and ov and ov.live and ov.running and ov.meta.session == meta.session
-      and ov.meta.turn_id == meta.turn_id then
-      remove_overlay(buf, 'settled')
-    end
+    settle_running(buf, meta)
     return status(answer)
   end
   local autoread = api.nvim_get_option_value('autoread', { buf = buf })
@@ -1313,6 +1320,7 @@ function state.live_show(path, meta, hunks)
     answer.left = answer.shown
     -- The reload took the old drawing off without an event, as one replacing it was due; none is.
     if before and not state.overlays[buf] then queue_off(before.path, 'reload') end
+    settle_running(buf, meta)
     return status(answer)
   end
   remove_overlay(buf, nil)

@@ -2579,6 +2579,32 @@ fn a_settle_over_a_modified_buffer_takes_its_own_running_drawing_off() {
 
 #[test]
 #[ignore = "needs nvim"]
+fn a_settle_takes_its_own_hidden_running_drawing_off() {
+    let mut fx = Fx::new("live-settle-hidden");
+    let (path, two) = live_two(&mut fx);
+    draw_running(&mut fx, &path, &two.hunks);
+    assert!(fx.marks().count > 0);
+    fx.nvim.command("set hidden");
+    fx.nvim.command("enew");
+    let position = fx.nvim.lua(EDITOR_POSITION_LUA, vec![]);
+    // A different turn cannot settle this drawing.
+    live_show(&mut fx, &path, "t2", 32, &two.hunks);
+    assert_eq!(
+        fx.nvim.lua("return vim.tbl_count(_G.__eitri_review.overlays)", vec![]),
+        Value::from(1)
+    );
+    let answer = live_show(&mut fx, &path, "t1", 32, &two.hunks);
+    assert_eq!(get(&answer, "shown"), &Value::from(false));
+    assert_eq!(count(&answer, "drawn"), 0);
+    assert_eq!(fx.nvim.lua(EDITOR_POSITION_LUA, vec![]), position);
+    assert_eq!(fx.event_kinds(), vec!["off"]);
+    fx.open(&path);
+    assert_eq!(fx.marks().count, 0);
+    assert!(fx.review_maps().is_empty());
+}
+
+#[test]
+#[ignore = "needs nvim"]
 fn live_show_never_replaces_an_overlay_that_is_not_live() {
     let mut fx = Fx::new("live-explicit");
     let (path, two) = live_two(&mut fx);

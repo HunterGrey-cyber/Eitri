@@ -13,6 +13,46 @@ const T1: &str = "0123456789abcdef";
 const T2: &str = "fedcba9876543210";
 const LONG: Duration = Duration::from_secs(20);
 
+#[test]
+fn writer_diagnostics_reveal_no_record_names_or_tokens() {
+    const CHILD: &str = "EITRI_TEST_RECORD_LOG_DIR";
+    if let Some(dir) = std::env::var_os(CHILD) {
+        let file = RecordFile::for_window(Some(&dir), None, &root(), Role::Main).unwrap();
+        file.write(&rec("old.rs")).unwrap();
+        std::fs::create_dir(crate::state_paths::temporary(file.path())).unwrap();
+        let writer = RecordWriter::start(file, root(), None);
+        writer.begin_session(T2.to_string(), true);
+        writer.clear_marker_if(T1.to_string());
+        let mut record = rec("new.rs");
+        record.bufs = vec![format!("private-omitted-name{}", "x".repeat(4096)).into_bytes(); 64];
+        writer.offer(1, record, false);
+        assert!(writer.flush(LONG));
+        return;
+    }
+    let dir = ScratchDir::new("nv-record-writer", "logs");
+    let output = std::process::Command::new(std::env::current_exe().unwrap())
+        .args([
+            "--exact",
+            "editor_record::writer::tests::writer_diagnostics_reveal_no_record_names_or_tokens",
+            "--nocapture",
+        ])
+        .env(CHILD, dir.as_os_str())
+        .output()
+        .unwrap();
+    assert!(output.status.success(), "{output:?}");
+    let log = String::from_utf8(output.stderr).unwrap();
+    for expected in [
+        "restore marker stays",
+        "record is too large",
+        "could not save the editor's open files",
+    ] {
+        assert!(log.contains(expected), "missing diagnostic: {expected}");
+    }
+    for private in [T2, "private-omitted-name", file_in(&dir).path().to_str().unwrap()] {
+        assert!(!log.contains(private), "private value in writer diagnostic");
+    }
+}
+
 fn root() -> PathBuf {
     PathBuf::from("/home/someone/project")
 }

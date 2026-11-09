@@ -45,8 +45,16 @@ end
 local function split(path)
   -- `noswapfile` on the command itself: setting 'swapfile' after the split is too late, the swap
   -- file (and the user's swap directory) would already have been created for a throwaway file.
-  run('split', path, { split = 'botright', noswapfile = true })
+  -- Disable modelines for the read itself, then restore the person's option even if opening fails.
+  local previous = vim.api.nvim_get_current_buf()
+  local modeline, global_modeline = vim.bo[previous].modeline, vim.go.modeline
+  vim.o.modeline = false
+  local ok, err = pcall(run, 'split', path, { split = 'botright', noswapfile = true })
+  vim.go.modeline = global_modeline
+  if vim.api.nvim_buf_is_valid(previous) then vim.bo[previous].modeline = modeline end
+  if not ok then error(err) end
   local buf = vim.api.nvim_get_current_buf()
+  vim.bo[buf].modeline = false
   vim.bo[buf].swapfile = false
   vim.bo[buf].bufhidden = 'wipe'
   vim.bo[buf].filetype = 'markdown'
