@@ -51,6 +51,24 @@ the launch with a message instead of opening some other directory; to open a dir
 mistyped directory name opens an empty buffer of that name. To open a file instead of a directory, see
 [Open a file](#open-a-file).
 
+Started from a terminal, `eitri` gives you the prompt back as soon as the window is up and prints nothing: the
+window runs on its own, so closing that terminal, `exit`, a tmux pane you kill or an ssh session that drops leave it
+running, and its output goes to its log (`~/.local/state/eitri/log/`). If the window ends before it is up, the
+command says so, shows what it printed and exits with its code. `eitri --no-fork DIR` keeps the old way: the window
+in the foreground, its output in the terminal, and it ends with the terminal. Commands that are not a window
+(`eitri agents`, `eitri sidecar ...`, `eitri setup`, `eitri panel`, `eitri page`, `eitri split`, `eitri open`)
+always stay in the terminal.
+
+A window started from a desktop launcher, a menu or your compositor's key binding has the `PATH` your session gave
+it, which often lacks what your shell configuration adds (`~/.local/bin`, `~/.cargo/bin`, a version manager's
+directory). So such a start asks your login shell once (`$SHELL -i -l -c`, at most 2 seconds) for its `PATH` and
+uses that for the window, its Neovim, the bottom terminal and the agents; with a heavy shell configuration that
+adds its run time to the start (about 0.3 s for a zsh with a banner). Your configuration sees
+`EITRI_RESOLVING_ENVIRONMENT=1` then, if it wants to skip something. If the shell takes too long or fails, the
+window keeps the `PATH` it was given and its log says why. To skip this, set `EITRI_LOGIN_PATH=off`; the other way
+to give every program you start from the desktop the same `PATH` is a file in `~/.config/environment.d/` (for
+example `PATH=$HOME/.local/bin:$PATH` in `10-path.conf`), which systemd's user session reads at login.
+
 Each directory you open is its own window with its own Neovim, its own sessions and its own project root, so you can
 have several projects open at once. The window's title names the project (`myproject — Eitri`, and with two workspaces
 the one on screen: `myproject — Eitri · docs`), which is what a window switcher or a compositor's window rule reads.

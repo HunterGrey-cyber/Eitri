@@ -430,6 +430,7 @@ impl LaunchWindow {
         let effects = this.chooser.borrow_mut().shown();
         this.carry(effects);
         window.present();
+        crate::launch_env::window_up();
         this.view.focus();
         this
     }

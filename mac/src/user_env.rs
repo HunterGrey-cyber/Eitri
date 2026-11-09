@@ -5,20 +5,20 @@
 //! `claude` installed by its own installer, Homebrew or npm is found: the sidecar's probe of bare `claude` failed
 //! and no session started. Neovide meets the same problem for nvim and solves it by starting nvim through the
 //! user's login shell when its parent is launchd (pid 1): `/usr/bin/login -fpq <user> <shell> -c <command>`.
-//! Its function is private to the fork, so the same rule is applied here, once, at start: on such a start the
+//! Its function is private to the fork, so the same rule is applied here, once, at start (the reader is
+//! `eitri_core::login_path`'s, which the Linux window uses with its own invocation): on such a start the
 //! login shell is asked for its `PATH`, which becomes this process's (so every child inherits it, as nvim's
 //! environment comes from that shell), and `claude` is resolved on it to an absolute path handed to the sidecar
 //! as `VERDANDI_CLAUDE_CLI_PATH`, the one variable it reads to pick the CLI. A start from a terminal keeps the
 //! environment it was given, as Neovide does.
 
-use std::ffi::{CStr, OsStr, OsString};
-use std::io::Read;
-use std::os::unix::ffi::{OsStrExt, OsStringExt};
+pub use eitri_core::login_path::{
+    absolute_entries, error_tail, path_from_output, print_path_script, user_and_shell, with_error_tail, BEGIN, END,
+};
+use std::ffi::{OsStr, OsString};
 use std::os::unix::fs::PermissionsExt;
-use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
-use std::process::{Command, Stdio};
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 /// The variable the sidecar reads to pick which `claude` its SDK runs.
 pub const CLI_PATH_VAR: &str = "VERDANDI_CLAUDE_CLI_PATH";
@@ -29,15 +29,6 @@ pub const LOGIN_SHELL_BUDGET: Duration = Duration::from_secs(5);
 
 /// The program Neovide runs nvim through on a start from the desktop.
 pub const LOGIN: &str = "/usr/bin/login";
-
-/// What the shell prints around its `PATH`, so whatever a shell configuration prints itself is not taken for it.
-const BEGIN: &str = "__EITRI_PATH_BEGIN__";
-const END: &str = "__EITRI_PATH_END__";
-
-/// The shell command that prints `PATH` between the markers.
-fn print_path_script() -> String {
-    format!("printf '\\n%s%s%s\\n' {BEGIN} \"$PATH\" {END}")
-}
 
 /// Whether the app was started the way Neovide's rule calls a start from the desktop: its parent is launchd.
 pub fn started_from_the_desktop(parent_pid: i32) -> bool {
@@ -57,170 +48,11 @@ pub fn login_shell_command(user: &OsStr, shell: &Path) -> (PathBuf, Vec<OsString
     (PathBuf::from(LOGIN), args)
 }
 
-/// The `PATH` between the last pair of markers in a shell's output. `None` without one, or when it is empty.
-pub fn path_from_output(stdout: &[u8]) -> Option<OsString> {
-    let begin = find_last(stdout, BEGIN.as_bytes())? + BEGIN.len();
-    let rest = &stdout[begin..];
-    let end = find_first(rest, END.as_bytes())?;
-    let path = &rest[..end];
-    (!path.is_empty()).then(|| OsString::from_vec(path.to_vec()))
-}
-
-fn find_last(haystack: &[u8], needle: &[u8]) -> Option<usize> {
-    haystack.windows(needle.len()).rposition(|w| w == needle)
-}
-
-fn find_first(haystack: &[u8], needle: &[u8]) -> Option<usize> {
-    haystack.windows(needle.len()).position(|w| w == needle)
-}
-
-/// The most of a shell's output kept; what a configuration prints past it is read and dropped.
-const OUTPUT_CAP: usize = 1 << 20;
-
-/// The most read from one stream before the deadline is looked at again: a configuration that prints without
-/// end (a stray `yes`) never leaves the pipe empty, and must not hold the read past the budget.
-const READ_PER_ROUND: usize = 64 * 1024;
-
-/// How much of the shell's error output is kept for the log, from its end.
-const ERROR_TAIL_BYTES: usize = 2048;
-
-/// How many of the error output's last lines a failure reason quotes.
-const ERROR_TAIL_LINES: usize = 5;
-
-/// What one [`read_round`] left the pipe as.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum Pipe {
-    /// Every writer closed it.
-    Closed,
-    /// Nothing to read now.
-    Empty,
-    /// The round ended at its byte bound or the deadline with more perhaps waiting.
-    More,
-}
-
-/// Reads what `reader` has now into `into`: at most [`READ_PER_ROUND`] bytes, and never past `deadline`. Past
-/// `cap`, the oldest bytes are dropped when `keep_tail`, else the newest.
-fn read_round(reader: &mut dyn Read, into: &mut Vec<u8>, cap: usize, keep_tail: bool, deadline: Instant) -> Pipe {
-    let mut chunk = [0u8; 4096];
-    let mut read = 0;
-    while read < READ_PER_ROUND && Instant::now() < deadline {
-        match reader.read(&mut chunk) {
-            Ok(0) => return Pipe::Closed,
-            Ok(n) => {
-                read += n;
-                if keep_tail {
-                    into.extend_from_slice(&chunk[..n]);
-                    let over = into.len().saturating_sub(cap);
-                    into.drain(..over);
-                } else if into.len() < cap {
-                    into.extend_from_slice(&chunk[..n]);
-                }
-            }
-            Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {}
-            Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => return Pipe::Empty,
-            Err(_) => return Pipe::Closed,
-        }
-    }
-    Pipe::More
-}
-
-fn set_nonblocking(fd: &impl std::os::fd::AsRawFd) {
-    let fd = fd.as_raw_fd();
-    // SAFETY: `fcntl` on a pipe's read end, which the caller owns for the length of the call.
-    unsafe { libc::fcntl(fd, libc::F_SETFL, libc::fcntl(fd, libc::F_GETFL) | libc::O_NONBLOCK) };
-}
-
-/// The last few non-blank lines of a shell's error output, joined for one log line; empty when it said nothing.
-pub fn error_tail(stderr: &[u8]) -> String {
-    let text = String::from_utf8_lossy(stderr);
-    let lines: Vec<&str> = text.lines().map(str::trim).filter(|l| !l.is_empty()).collect();
-    lines[lines.len().saturating_sub(ERROR_TAIL_LINES)..].join(" | ")
-}
-
-/// A failure reason with the shell's last error lines after it, when it printed any.
-fn with_error_tail(why: String, stderr: &[u8]) -> String {
-    match error_tail(stderr) {
-        tail if tail.is_empty() => why,
-        tail => format!("{why}; it said: {tail}"),
-    }
-}
-
-/// Runs `program` with `args` and reads the `PATH` it prints between the markers, within `budget`. Its input is
-/// `/dev/null`; the end of its error output is kept for the failure reason. Past the budget its whole process
-/// group (it is started as the leader of its own) is killed by the pid it was given, so a shell configuration's
-/// own children go too; a shell that prints without end is no exception, since no read outlasts the budget.
+/// [`eitri_core::login_path::path_from_command`], with the crate's spawn gate held across the spawn in tests.
 pub fn path_from_command(program: &Path, args: &[OsString], budget: Duration) -> Result<OsString, String> {
-    let spawned = {
-        #[cfg(test)]
-        let _spawning = crate::spawn_gate::spawning();
-        Command::new(program)
-            .args(args)
-            .stdin(Stdio::null())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .process_group(0)
-            .spawn()
-    };
-    let mut child = spawned.map_err(|e| format!("{} could not start: {e}", program.display()))?;
-    let pid = child.id() as libc::pid_t;
-    let mut stdout = child.stdout.take().expect("stdout is piped");
-    let mut stderr = child.stderr.take().expect("stderr is piped");
-    // Read without blocking, so a shell that never ends is still timed out.
-    set_nonblocking(&stdout);
-    set_nonblocking(&stderr);
-    let deadline = Instant::now() + budget;
-    let mut output = Vec::new();
-    let mut errors = Vec::new();
-    let (mut out, mut err) = (Pipe::Empty, Pipe::Empty);
-    let status = loop {
-        if out != Pipe::Closed {
-            out = read_round(&mut stdout, &mut output, OUTPUT_CAP, false, deadline);
-        }
-        if err != Pipe::Closed {
-            err = read_round(&mut stderr, &mut errors, ERROR_TAIL_BYTES, true, deadline);
-        }
-        match child.try_wait() {
-            Ok(Some(status)) => break status,
-            Ok(None) if Instant::now() < deadline => std::thread::sleep(Duration::from_millis(10)),
-            Ok(None) | Err(_) => {
-                // SAFETY: `pid` is the child just started, the leader of its own process group; it has not been
-                // waited for, so the number still names it.
-                unsafe { libc::kill(-pid, libc::SIGKILL) };
-                let _ = child.wait();
-                let why = format!("{} gave no answer within {budget:?}", program.display());
-                return Err(with_error_tail(why, &errors));
-            }
-        }
-    };
-    // What it wrote just before it ended, until the pipe is empty. A child it left behind may hold the pipe open
-    // and keep writing; the reads still end at the budget.
-    while out != Pipe::Closed && Instant::now() < deadline {
-        out = read_round(&mut stdout, &mut output, OUTPUT_CAP, false, deadline);
-        if out == Pipe::Empty {
-            break;
-        }
-    }
-    while err != Pipe::Closed && Instant::now() < deadline {
-        err = read_round(&mut stderr, &mut errors, ERROR_TAIL_BYTES, true, deadline);
-        if err == Pipe::Empty {
-            break;
-        }
-    }
-    path_from_output(&output)
-        .ok_or_else(|| with_error_tail(format!("{} printed no PATH ({status})", program.display()), &errors))
-}
-
-/// `path` with every entry that is not an absolute directory left out (a relative or empty one would search the
-/// working directory, the project; a shell that does not expand `"$PATH"`, such as nushell, yields the literal
-/// text), and the entries left out. `None` when no entry is absolute.
-pub fn absolute_entries(path: &OsStr) -> Option<(OsString, Vec<String>)> {
-    let (kept, dropped): (Vec<PathBuf>, Vec<PathBuf>) = std::env::split_paths(path).partition(|dir| dir.is_absolute());
-    if kept.is_empty() {
-        return None;
-    }
-    let joined = std::env::join_paths(&kept).ok()?;
-    let dropped = dropped.iter().map(|dir| format!("{:?}", dir.as_os_str())).collect();
-    Some((joined, dropped))
+    #[cfg(test)]
+    let _spawning = crate::spawn_gate::spawning();
+    eitri_core::login_path::path_from_command(program, args, budget)
 }
 
 /// The first executable regular file named `name` in an absolute directory of `path`. Relative and empty entries
@@ -316,27 +148,6 @@ pub fn decide(
     }
 }
 
-/// This user's name and login shell, from the password database.
-pub fn user_and_shell() -> Option<(OsString, PathBuf)> {
-    // SAFETY: `getpwuid_r` fills `entry` with pointers into `buffer`, both alive for the reads below; a zero
-    // return with a non-null result means the entry is complete.
-    unsafe {
-        let mut entry: libc::passwd = std::mem::zeroed();
-        let mut buffer = vec![0 as libc::c_char; 4096];
-        let mut result: *mut libc::passwd = std::ptr::null_mut();
-        let uid = libc::geteuid();
-        if libc::getpwuid_r(uid, &mut entry, buffer.as_mut_ptr(), buffer.len(), &mut result) != 0 || result.is_null() {
-            return None;
-        }
-        if entry.pw_name.is_null() || entry.pw_shell.is_null() {
-            return None;
-        }
-        let name = OsStr::from_bytes(CStr::from_ptr(entry.pw_name).to_bytes()).to_owned();
-        let shell = PathBuf::from(OsStr::from_bytes(CStr::from_ptr(entry.pw_shell).to_bytes()));
-        (!name.is_empty() && shell.is_absolute()).then_some((name, shell))
-    }
-}
-
 /// The login shell's `PATH`, by Neovide's invocation.
 pub fn login_shell_path() -> Result<OsString, String> {
     let (user, shell) = user_and_shell().ok_or("no user or login shell in the password database")?;
@@ -370,6 +181,7 @@ pub fn apply() -> Vec<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::time::Instant;
 
     const LAUNCHSERVICES_PATH: &str = "/usr/bin:/bin:/usr/sbin:/sbin";
 

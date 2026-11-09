@@ -40,6 +40,7 @@ pub mod instance_dir;
 pub mod keymap;
 pub mod layout;
 pub mod line_feed;
+pub mod login_path;
 pub mod lua;
 pub mod luals;
 pub mod mentions;

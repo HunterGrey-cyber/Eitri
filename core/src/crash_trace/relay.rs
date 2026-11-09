@@ -272,6 +272,8 @@ struct Shared {
     /// Where a panic's own words go when fd 2 is the relay's. They can quote what the program was handling, so they
     /// never reach the log; the crash record says what may be said.
     panic_stderr: Option<File>,
+    /// The descriptors of the copies `tee` and `panic_stderr` write to, for [`forget_old_destinations`].
+    old_destinations: Vec<RawFd>,
     /// Set once the threads run and the streams have moved.
     started: AtomicBool,
 }
@@ -318,6 +320,12 @@ pub fn start(start: Start) -> io::Result<bool> {
     if readers.is_empty() {
         return Ok(false);
     }
+    let old_destinations: Vec<RawFd> = tee
+        .iter()
+        .flatten()
+        .chain(panic_stderr.iter())
+        .map(|file| file.as_raw_fd())
+        .collect();
     let (wake_read, wake_write) = io::pipe()?;
     let (sender, receiver) = mpsc::channel();
     let shared = Shared {
@@ -329,6 +337,7 @@ pub fn start(start: Start) -> io::Result<bool> {
         queued: AtomicUsize::new(0),
         tail: Mutex::new(Tail::new()),
         panic_stderr,
+        old_destinations,
         started: AtomicBool::new(false),
     };
     if RELAY.set(shared).is_err() {
@@ -502,6 +511,34 @@ pub fn flush(wait: Duration) {
     let end = Instant::now() + wait;
     while shared.done.load(Ordering::Acquire) < asked && Instant::now() < end {
         std::thread::sleep(Duration::from_millis(1));
+    }
+}
+
+/// Points where the streams went before the relay at `/dev/null`, so the relay goes on into the log alone: for a
+/// window whose launcher read its first output and has gone. `false` when no relay runs (the caller then moves the
+/// standard descriptors itself) or `/dev/null` cannot be opened.
+pub fn forget_old_destinations() -> bool {
+    let Some(shared) = started() else { return false };
+    let Ok(null) = File::options().write(true).open("/dev/null") else {
+        return false;
+    };
+    for fd in &shared.old_destinations {
+        // SAFETY: `dup2` replaces a descriptor this relay owns for the process's life atomically, so the writer
+        // thread's next write lands in one place or the other; both descriptors are open.
+        unsafe { libc::dup2(null.as_raw_fd(), *fd) };
+    }
+    true
+}
+
+/// Makes the relay's writes to where the streams went before it never wait: for a window whose first output goes to a
+/// launcher that can stop reading (stopped with Ctrl+Z while it waits for the window). A write that would wait is
+/// dropped, so the log goes on. Nothing happens when no relay runs. The relay's own pipes now hold the standard
+/// descriptors, so only its copies share the old destination's flags.
+pub fn old_destinations_never_wait() {
+    let Some(shared) = started() else { return };
+    for fd in &shared.old_destinations {
+        // SAFETY: `fcntl` on a descriptor this relay owns for the process's life.
+        unsafe { libc::fcntl(*fd, libc::F_SETFL, libc::fcntl(*fd, libc::F_GETFL) | libc::O_NONBLOCK) };
     }
 }
 

@@ -9,6 +9,13 @@
 # fallback) resolve inside the scratch tree rather than the real user's.
 set -u
 
+# Everything below but the detach cases runs as a start from the desktop: no controlling terminal and no terminal on
+# a standard descriptor, so the launcher execs the stub as it always did. The detach cases give the launcher a
+# terminal of their own (`script`). Run with a controlling terminal, this file runs itself again without one.
+if [[ -z "${LAUNCHER_TEST_NO_TTY:-}" ]] && { { : </dev/tty; } 2>/dev/null || [[ -t 0 ]]; }; then
+	LAUNCHER_TEST_NO_TTY=1 exec setsid -w "$BASH" "${BASH_SOURCE[0]}" "$@" </dev/null
+fi
+
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 LAUNCHER="$HERE/eitri.launcher.sh"
 
@@ -925,6 +932,467 @@ out="$(run_in_filedir --quiet "$D1" "$D2")"
 assert_eq "$(launches_of "$out")" "1" "typed, two folders stay one launch for shell to refuse"
 out="$(run_in_filedir panel --quiet --from-desktop)"
 assert_contains "$out" "eitri panel: unknown option --from-desktop" "panel refuses --from-desktop"
+
+echo "== a window started from a terminal leaves it =="
+# A second install whose stub `shell` acts out a window: it records what it was given, then, by STUB_MODE, says it
+# is up on the launcher's descriptor and lives on (`ready`), ends first with an error (`fail`), ends at once with 0 as
+# a launch a running window took (`handover`), or never answers (`hang`). A living stub keeps a heartbeat file fresh
+# and is ended by the pid it writes.
+D_ROOT="$SCRATCH_ROOT/install-detach"
+D_STATE="$SCRATCH_ROOT/detach-state"
+mkdir -p "$D_ROOT/bin" "$D_ROOT/lib/eitri" "$D_STATE"
+cp "$LAUNCHER" "$D_ROOT/bin/eitri"
+chmod +x "$D_ROOT/bin/eitri"
+cat >"$D_ROOT/lib/eitri/shell" <<'STUB'
+#!/usr/bin/env bash
+state="$STUB_STATE"
+[[ -t 0 ]] && in0=tty || in0=not-tty
+[[ -t 1 ]] && out1=tty || out1=not-tty
+[[ -t 2 ]] && err2=tty || err2=not-tty
+# The descriptors that reach the launcher's pipes, by number, and where the output pipe was made (read before the
+# record's own redirection moves descriptor 1).
+launch_fds=""
+for f in /proc/$$/fd/*; do
+	[[ "$(readlink "$f")" == *eitri-launch.* ]] && launch_fds+="${f##*/} "
+done
+out_at="$(readlink /proc/$$/fd/1)"
+# The real binary's first act on a detached start (STUB_NO_STARTED: a start that never reached it).
+[[ -n "${EITRI_LAUNCH_READY_FD:-}" && -z "${STUB_NO_STARTED:-}" ]] && echo started >&"$EITRI_LAUNCH_READY_FD"
+{
+	echo "pid=$$"
+	echo "sid=$(ps -o sid= -p $$ | tr -d ' ')"
+	echo "from=${EITRI_LAUNCHED_FROM:-<unset>}"
+	echo "readyfd=${EITRI_LAUNCH_READY_FD:-<unset>}"
+	echo "stdin=$in0"
+	echo "stdout=$out1"
+	echo "stderr=$err2"
+	{ : </dev/tty; } 2>/dev/null && echo "ctty=yes" || echo "ctty=no"
+	echo "sigign=$(awk '/^SigIgn/{print $2}' /proc/$$/status)"
+	# A child run in the foreground inherits the stub's dispositions as they are (`&` here would add its own).
+	echo "child_sigign=$(awk '/^SigIgn/{print $2}' /proc/self/status)"
+	echo "tmux=${TMUX:-<unset>} pane=${TMUX_PANE:-<unset>} term_program=${TERM_PROGRAM:-<unset>}"
+	echo "zellij=${ZELLIJ:-<unset>},${ZELLIJ_SESSION_NAME:-<unset>},${ZELLIJ_PANE_ID:-<unset>} screen=${STY:-<unset>},${WINDOW:-<unset>}"
+	echo "cgroup=$(cat /proc/$$/cgroup)"
+	echo "note=${EITRI_LAUNCH_NOTE:-<unset>}"
+	echo "launch_fds=${launch_fds% }"
+	echo "out_at=$out_at"
+	for a in "$@"; do echo "arg=$a"; done
+} >"$state/record"
+echo "start $(grep -E '^(readyfd|ctty|from)=' "$state/record" | tr '\n' ' ')args=$*" >>"$state/starts"
+case "${STUB_MODE:-ready}" in
+ready)
+	echo "starting up, said before ready"
+	[[ -n "${EITRI_LAUNCH_READY_FD:-}" ]] && echo ready >&"$EITRI_LAUNCH_READY_FD"
+	trap '' HUP
+	for _ in $(seq 1 300); do date +%s%N >"$state/heartbeat"; sleep 0.1; done
+	;;
+fail)
+	echo "eitri: no such directory: /nowhere" >&2
+	exit 3
+	;;
+handover)
+	echo "handed to the running window"
+	exit 0
+	;;
+hang)
+	sleep 30
+	;;
+flood)
+	# Output without pause, and never ready.
+	exec yes "a line the window prints again and again"
+	;;
+pacedflood)
+	# Lines a little under 20 ms apart, and never ready.
+	while :; do echo "a line the window prints now and then"; sleep 0.012; done
+	;;
+nostart)
+	exit 5
+	;;
+latestarted)
+	# A window handed to a running one: it prints while the launcher reads its output, says `started` and ends at
+	# once, all inside one round of the launcher's output read.
+	for _ in $(seq 1 30); do echo "passing the paths on"; sleep 0.005; done
+	echo started >&"$EITRI_LAUNCH_READY_FD"
+	exit 0
+	;;
+floodready)
+	yes "a line the window prints again and again" &
+	flood=$!
+	sleep 0.5
+	echo ready >&"$EITRI_LAUNCH_READY_FD"
+	kill "$flood"
+	;;
+esac
+STUB
+chmod +x "$D_ROOT/lib/eitri/shell"
+# A sidecar beside it, so the launcher's "no sidecar built yet" hint (a real problem, printed in every mode) is not
+# what these cases read.
+printf '#!/bin/sh\nexit 0\n' >"$D_ROOT/lib/eitri/verdandi-claude-sidecar"
+chmod +x "$D_ROOT/lib/eitri/verdandi-claude-sidecar"
+D_PROJECT="$SCRATCH_ROOT/detach-project"
+mkdir -p "$D_PROJECT"
+
+# A user manager stand-in first on the detach cases' PATH: `systemctl` answers with STUB_SYSTEMCTL_RC (0 by default),
+# and `systemd-run` writes its arguments down and runs the command after `--` in its place, as --scope does.
+D_SYSBIN="$SCRATCH_ROOT/sysbin"
+mkdir -p "$D_SYSBIN"
+cat >"$D_SYSBIN/systemctl" <<'STUB'
+#!/bin/sh
+# STUB_SYSTEMCTL_HANG: a user manager that never answers.
+[ -n "${STUB_SYSTEMCTL_HANG:-}" ] && exec sleep 30
+exit "${STUB_SYSTEMCTL_RC:-0}"
+STUB
+cat >"$D_SYSBIN/systemd-run" <<'STUB'
+#!/bin/sh
+printf '%s\n' "$@" >"$STUB_STATE/systemd-run"
+# STUB_SYSTEMD_RUN_RC: the manager refuses the scope, and systemd-run ends before it runs anything.
+if [ -n "${STUB_SYSTEMD_RUN_RC:-}" ]; then
+	echo "Failed to start transient scope unit: Access denied" >&2
+	exit "$STUB_SYSTEMD_RUN_RC"
+fi
+while [ "$#" -gt 0 ] && [ "$1" != -- ]; do shift; done
+shift
+exec "$@"
+STUB
+chmod +x "$D_SYSBIN/systemctl" "$D_SYSBIN/systemd-run"
+D_PATH="$D_SYSBIN:$PATH"
+
+# in_terminal COMMAND...: runs COMMAND with a pty as its terminal (stdin, stdout, stderr and the controlling terminal),
+# and the terminal gone when it returns; prints what the terminal showed, and returns COMMAND's exit code.
+in_terminal() {
+	local cmd
+	cmd="$(printf '%q ' "$@")"
+	env -i HOME="$FAKE_HOME" PATH="${D_PATH_FOR:-$D_PATH}" TERM=dumb STUB_SYSTEMCTL_RC="${STUB_SYSTEMCTL_RC:-0}" \
+		STUB_SYSTEMCTL_HANG="${STUB_SYSTEMCTL_HANG:-}" STUB_SYSTEMD_RUN_RC="${STUB_SYSTEMD_RUN_RC:-}" \
+		STUB_NO_STARTED="${STUB_NO_STARTED:-}" STUB_STATE="$D_STATE" STUB_MODE="${STUB_MODE:-ready}" "${TERM_ENV[@]}" \
+		EITRI_LAUNCH_WAIT="${EITRI_LAUNCH_WAIT:-10}" script -qefc "$cmd" /dev/null </dev/null
+}
+
+stub_pid() { sed -n 's/^pid=//p' "$D_STATE/record" 2>/dev/null; }
+end_stub() {
+	local pid
+	pid="$(stub_pid)"
+	[[ -n "$pid" ]] && kill "$pid" 2>/dev/null
+	rm -f "$D_STATE/record" "$D_STATE/heartbeat" "$D_STATE/starts" "$D_STATE/systemd-run"
+}
+# alive_after_terminal: whether the stub's heartbeat moved on after the terminal ended
+# (the stub rewrites the file, so a read can meet it empty: such a read is made again)
+heartbeat() {
+	local beat="" _
+	for _ in 1 2 3 4 5 6 7 8 9 10; do
+		beat="$(cat "$D_STATE/heartbeat" 2>/dev/null)"
+		[[ -n "$beat" ]] && break
+		sleep 0.03
+	done
+	printf '%s' "$beat"
+}
+alive_after_terminal() {
+	local before after
+	before="$(heartbeat)"
+	sleep 0.6
+	after="$(heartbeat)"
+	[[ -n "$after" && "$after" != "$before" ]] && kill -0 "$(stub_pid)" 2>/dev/null
+}
+
+TERM_ENV=()
+# sig_bits HEX: the SIGHUP, SIGINT and SIGQUIT bits of a SigIgn mask (signals 1-3).
+sig_bits() { printf '%d' $((0x$1 & 0x7)); }
+rm -f "$D_STATE/record"
+started=$SECONDS
+out="$(STUB_MODE=ready in_terminal "$D_ROOT/bin/eitri" "$D_PROJECT")"
+status=$?
+assert_eq "$status" "0" "a window that comes up gives the prompt back with 0"
+assert_eq "$(tr -d '\r' <<<"$out")" "" "nothing is printed on a normal start, not even what the window said before it was up"
+record="$(cat "$D_STATE/record" 2>/dev/null)"
+assert_contains "$record" "from=terminal" "the window is told it came from a terminal"
+assert_contains "$record" "readyfd=3" "and where to say it is up"
+assert_contains "$record" "stdin=not-tty" "its input is not the terminal"
+assert_contains "$record" "stdout=not-tty" "nor its output"
+assert_contains "$record" "stderr=not-tty" "nor its errors"
+assert_contains "$record" "ctty=no" "and it has no controlling terminal: a session of its own"
+assert_contains "$record" "arg=$D_PROJECT" "it opens what was asked"
+# What a detached window and its child ignore of SIGHUP, SIGINT and SIGQUIT, held against --no-fork's below: a
+# background job of the launcher's bash would add SIGINT and SIGQUIT.
+DETACHED_SIG="$(sig_bits "$(sed -n 's/^sigign=//p' <<<"$record")")"
+DETACHED_CHILD_SIG="$(sig_bits "$(sed -n 's/^child_sigign=//p' <<<"$record")")"
+CHECKS=$((CHECKS + 1))
+if alive_after_terminal; then
+	echo "ok - the window lives on after its terminal has gone"
+else
+	echo "FAIL - the window lives on after its terminal has gone"
+	FAILURES=$((FAILURES + 1))
+fi
+end_stub
+
+# The terminal's shell ends with a hangup of its process group while the window runs: nothing reaches the window.
+out="$(STUB_MODE=ready in_terminal bash -c '"$0" "$1"; kill -HUP 0' "$D_ROOT/bin/eitri" "$D_PROJECT")"
+CHECKS=$((CHECKS + 1))
+if alive_after_terminal; then
+	echo "ok - a hangup of the terminal's process group does not reach the window"
+else
+	echo "FAIL - a hangup of the terminal's process group does not reach the window"
+	FAILURES=$((FAILURES + 1))
+fi
+end_stub
+
+# Started inside tmux: the window that left the pane leaves its variables behind; --no-fork keeps them.
+TERM_ENV=(TMUX=/tmp/tmux-1000/default,123,0 TMUX_PANE=%7 TERM_PROGRAM=tmux TERM_PROGRAM_VERSION=3.5)
+out="$(STUB_MODE=handover in_terminal "$D_ROOT/bin/eitri" "$D_PROJECT")"
+assert_contains "$(cat "$D_STATE/record")" "tmux=<unset> pane=<unset> term_program=<unset>" "a detached start drops the tmux pane's variables"
+out="$(STUB_MODE=handover in_terminal "$D_ROOT/bin/eitri" --no-fork "$D_PROJECT")"
+assert_contains "$(cat "$D_STATE/record")" "tmux=/tmp/tmux-1000/default,123,0 pane=%7 term_program=tmux" "--no-fork keeps them"
+TERM_ENV=()
+end_stub
+
+out="$(STUB_MODE=fail in_terminal "$D_ROOT/bin/eitri" "$D_PROJECT")"
+status=$?
+assert_eq "$status" "3" "a window that ends before it is up gives its exit code"
+assert_contains "$out" "eitri: the window ended before it was up (exit 3)" "and says so"
+assert_contains "$out" "no such directory: /nowhere" "with what it printed"
+end_stub
+
+out="$(STUB_MODE=handover in_terminal "$D_ROOT/bin/eitri" "$D_PROJECT")"
+status=$?
+assert_eq "$status" "0" "a launch a running window takes returns 0"
+assert_eq "$(tr -d '\r' <<<"$out")" "" "and prints nothing"
+end_stub
+
+started=$SECONDS
+out="$(STUB_MODE=hang EITRI_LAUNCH_WAIT=1 in_terminal "$D_ROOT/bin/eitri" "$D_PROJECT")"
+status=$?
+assert_eq "$status" "0" "a window that does not answer in time still gives the prompt back"
+assert_contains "$out" "has not said it is up after 1 s" "saying so"
+CHECKS=$((CHECKS + 1))
+if ((SECONDS - started < 8)); then echo "ok - within the wait"; else echo "FAIL - within the wait ($((SECONDS - started)) s)"; FAILURES=$((FAILURES + 1)); fi
+end_stub
+
+rm -f "$D_STATE/record"
+out="$(STUB_MODE=ready in_terminal "$D_ROOT/bin/eitri" --nvim /x.sock)"
+status=$?
+assert_eq "$status" "64" "the launcher's own checks still fail in the terminal with their exit code"
+assert_contains "$out" "eitri: unknown option --nvim" "with their message"
+assert_eq "$(cat "$D_STATE/record" 2>/dev/null)" "" "and no window was started"
+
+out="$(STUB_MODE=ready in_terminal "$D_ROOT/bin/eitri" --bogus)"
+assert_contains "$out" "eitri: unknown option --bogus" "an unknown option is refused before anything starts"
+
+# --no-fork: the window in the foreground, on the terminal, and its output shown.
+out="$(STUB_MODE=handover in_terminal "$D_ROOT/bin/eitri" --no-fork "$D_PROJECT")"
+record="$(cat "$D_STATE/record" 2>/dev/null)"
+assert_contains "$out" "handed to the running window" "--no-fork shows the window's output"
+assert_contains "$out" "eitri    open $D_PROJECT" "and the banner"
+assert_contains "$record" "stdout=tty" "--no-fork keeps the terminal as the window's output"
+assert_contains "$record" "ctty=yes" "and as its controlling terminal"
+assert_contains "$record" "readyfd=<unset>" "with no descriptor to say it is up on"
+assert_contains "$record" "from=terminal" "still told it came from a terminal"
+assert_eq "$DETACHED_SIG" "$(sig_bits "$(sed -n 's/^sigign=//p' <<<"$record")")" \
+	"a detached window ignores no more of SIGHUP, SIGINT, SIGQUIT than a --no-fork one"
+assert_eq "$DETACHED_CHILD_SIG" "$(sig_bits "$(sed -n 's/^child_sigign=//p' <<<"$record")")" \
+	"and neither does a child it starts"
+end_stub
+out="$(STUB_MODE=ready in_terminal "$D_ROOT/bin/eitri" panel --no-fork)"
+assert_contains "$out" "eitri panel: unknown option --no-fork" "--no-fork is the window's alone"
+
+# Subcommands stay attached: they run in the terminal as before.
+for sub in "agents" "remote status" "panel" "split" "--version"; do
+	rm -f "$D_STATE/record"
+	# shellcheck disable=SC2086
+	out="$(STUB_MODE=handover in_terminal "$D_ROOT/bin/eitri" $sub)"
+	record="$(cat "$D_STATE/record" 2>/dev/null)"
+	assert_contains "$record" "ctty=yes" "eitri $sub stays on the terminal"
+	assert_contains "$record" "readyfd=<unset>" "eitri $sub is not detached"
+done
+
+echo "== leaving the terminal: its pipes, a scope of its own, a flood, odd directories, other multiplexers =="
+end_stub
+out="$(STUB_MODE=ready in_terminal "$D_ROOT/bin/eitri" "$D_PROJECT")"
+record="$(cat "$D_STATE/record" 2>/dev/null)"
+assert_contains "$record" "launch_fds=1 2 3" "the window holds the launcher's pipes on 1, 2 and 3 alone"
+run_args="$(cat "$D_STATE/systemd-run" 2>/dev/null)"
+assert_contains "$run_args" "--user" "a reachable user manager starts the window through systemd-run --user"
+assert_contains "$run_args" "--scope" "in a scope of its own"
+assert_contains "$run_args" "--slice=app.slice" "under app.slice"
+assert_contains "$run_args" "--unit=app-eitri-" "named as an app's scope"
+end_stub
+
+out="$(STUB_SYSTEMCTL_RC=1 STUB_MODE=handover in_terminal "$D_ROOT/bin/eitri" "$D_PROJECT")"
+record="$(cat "$D_STATE/record" 2>/dev/null)"
+assert_eq "$(cat "$D_STATE/systemd-run" 2>/dev/null)" "" "with no user manager there is no scope"
+assert_contains "$record" "readyfd=3" "and the window still leaves the terminal"
+assert_contains "$record" "ctty=no" "in a session of its own"
+end_stub
+out="$(STUB_MODE=handover in_terminal "$D_ROOT/bin/eitri" --no-fork "$D_PROJECT")"
+assert_eq "$(cat "$D_STATE/systemd-run" 2>/dev/null)" "" "--no-fork has no scope"
+end_stub
+
+# The real user manager, where this run can reach one: the window's control group is a scope of its own.
+REAL_RT="/run/user/$(id -u)"
+if command -v systemd-run >/dev/null 2>&1 &&
+	XDG_RUNTIME_DIR="$REAL_RT" systemctl --user show --property=Version --value >/dev/null 2>&1; then
+	TERM_ENV=(XDG_RUNTIME_DIR="$REAL_RT")
+	out="$(D_PATH_FOR="$PATH" STUB_MODE=ready in_terminal "$D_ROOT/bin/eitri" "$D_PROJECT")"
+	record="$(cat "$D_STATE/record" 2>/dev/null)"
+	assert_contains "$record" "app.slice/app-eitri-" "with a real user manager the window runs in an app-eitri scope"
+	assert_not_contains "$record" "cgroup=$(cat /proc/$$/cgroup)" "not in the control group it was started from"
+	TERM_ENV=()
+	end_stub
+else
+	echo "skip - no user manager reachable here: the real scope is not tried"
+fi
+
+started=$SECONDS
+out="$(STUB_MODE=flood EITRI_LAUNCH_WAIT=2 in_terminal "$D_ROOT/bin/eitri" "$D_PROJECT")"
+status=$?
+assert_eq "$status" "0" "a window that floods its output and never says it is up still gives the prompt back"
+assert_contains "$out" "has not said it is up after 2 s" "at the wait, saying so"
+CHECKS=$((CHECKS + 1))
+if ((SECONDS - started < 8)); then echo "ok - a flood does not hold the wait open"; else echo "FAIL - a flood does not hold the wait open ($((SECONDS - started)) s)"; FAILURES=$((FAILURES + 1)); fi
+end_stub
+started=$SECONDS
+out="$(STUB_MODE=floodready EITRI_LAUNCH_WAIT=10 in_terminal "$D_ROOT/bin/eitri" "$D_PROJECT")"
+status=$?
+assert_eq "$status" "0" "a window that floods and then says it is up gives the prompt back with 0"
+assert_eq "$(tr -d '\r' <<<"$out")" "" "printing nothing"
+CHECKS=$((CHECKS + 1))
+if ((SECONDS - started < 5)); then echo "ok - at its ready line, not at the wait"; else echo "FAIL - at its ready line, not at the wait ($((SECONDS - started)) s)"; FAILURES=$((FAILURES + 1)); fi
+end_stub
+
+# The pipes' directory: the first of XDG_RUNTIME_DIR, TMPDIR and /tmp that takes it, and removed once they are open.
+touch "$SCRATCH_ROOT/not-a-dir"
+mkdir -p "$SCRATCH_ROOT/rt-ro" "$SCRATCH_ROOT/rt-ok"
+chmod 500 "$SCRATCH_ROOT/rt-ro"
+chmod 700 "$SCRATCH_ROOT/rt-ok"
+TERM_ENV=(XDG_RUNTIME_DIR="$SCRATCH_ROOT/rt-ro" TMPDIR="$SCRATCH_ROOT/not-a-dir")
+out="$(STUB_MODE=handover in_terminal "$D_ROOT/bin/eitri" "$D_PROJECT")"
+status=$?
+record="$(cat "$D_STATE/record" 2>/dev/null)"
+assert_eq "$status" "0" "an unusable XDG_RUNTIME_DIR and TMPDIR do not stop a start"
+assert_contains "$record" "out_at=/tmp/eitri-launch." "the pipes are made in /tmp then"
+end_stub
+TERM_ENV=(XDG_RUNTIME_DIR="$SCRATCH_ROOT/rt-ok" TMPDIR="$SCRATCH_ROOT/not-a-dir")
+out="$(STUB_MODE=handover in_terminal "$D_ROOT/bin/eitri" "$D_PROJECT")"
+record="$(cat "$D_STATE/record" 2>/dev/null)"
+assert_contains "$record" "out_at=$SCRATCH_ROOT/rt-ok/eitri-launch." "a usable XDG_RUNTIME_DIR comes first"
+assert_eq "$(ls -A "$SCRATCH_ROOT/rt-ok" "$SCRATCH_ROOT/rt-ro")" "$(printf '%s:\n\n%s:' "$SCRATCH_ROOT/rt-ok" "$SCRATCH_ROOT/rt-ro")" \
+	"and no directory is left in either"
+chmod 700 "$SCRATCH_ROOT/rt-ro"
+TERM_ENV=()
+end_stub
+
+# zellij's and screen's variables go the way tmux's do; WINDOW alone (no STY) is no screen's and stays.
+TERM_ENV=(ZELLIJ=0 ZELLIJ_SESSION_NAME=s1 ZELLIJ_PANE_ID=4 STY=123.pts-1.host WINDOW=2)
+out="$(STUB_MODE=handover in_terminal "$D_ROOT/bin/eitri" "$D_PROJECT")"
+assert_contains "$(cat "$D_STATE/record")" "zellij=<unset>,<unset>,<unset> screen=<unset>,<unset>" "a detached start drops zellij's and screen's variables"
+out="$(STUB_MODE=handover in_terminal "$D_ROOT/bin/eitri" --no-fork "$D_PROJECT")"
+assert_contains "$(cat "$D_STATE/record")" "zellij=0,s1,4 screen=123.pts-1.host,2" "--no-fork keeps them"
+TERM_ENV=(WINDOW=5)
+out="$(STUB_MODE=handover in_terminal "$D_ROOT/bin/eitri" "$D_PROJECT")"
+assert_contains "$(cat "$D_STATE/record")" "screen=<unset>,5" "WINDOW without STY is left alone"
+TERM_ENV=()
+end_stub
+
+# Where a start came from: a pty on a standard descriptor, or the foreground of the controlling terminal. A start
+# in the background of its terminal (a job of its own) with none of its descriptors on the terminal is the desktop's.
+out="$(STUB_MODE=handover in_terminal bash -c '"$0" "$1" </dev/null >/dev/null 2>&1' "$D_ROOT/bin/eitri" "$D_PROJECT")"
+record="$(cat "$D_STATE/record" 2>/dev/null)"
+assert_contains "$record" "from=terminal" "a start in the terminal's foreground with no descriptor on it is a terminal start"
+assert_contains "$record" "readyfd=3" "and leaves it"
+end_stub
+# A background job with every descriptor elsewhere (`eitri ... </dev/null >/dev/null 2>&1 &`) still has the pty as
+# its controlling terminal, whose shell hangs up its jobs when it closes: a terminal start, detached.
+out="$(STUB_MODE=handover in_terminal bash -c 'set -m; "$0" "$1" </dev/null >/dev/null 2>&1 & wait' "$D_ROOT/bin/eitri" "$D_PROJECT")"
+record="$(cat "$D_STATE/record" 2>/dev/null)"
+assert_contains "$record" "from=terminal" "a background job of a terminal's shell, its descriptors elsewhere, is a terminal start"
+assert_contains "$record" "readyfd=3" "and leaves the terminal"
+assert_contains "$record" "ctty=no" "into a session of its own"
+end_stub
+
+# A scope the user manager refuses after it answered: systemd-run ends before the window ran, and the window is
+# started once more with setsid alone.
+out="$(STUB_SYSTEMD_RUN_RC=1 STUB_MODE=ready in_terminal "$D_ROOT/bin/eitri" "$D_PROJECT")"
+status=$?
+record="$(cat "$D_STATE/record" 2>/dev/null)"
+assert_eq "$status" "0" "a refused scope still gives a window and the prompt back with 0"
+assert_eq "$(tr -d '\r' <<<"$out")" "" "printing nothing, not even systemd-run's refusal"
+assert_contains "$(cat "$D_STATE/systemd-run" 2>/dev/null)" "--scope" "the scope was asked for"
+assert_contains "$record" "readyfd=3" "the window it fell back to left the terminal"
+assert_contains "$record" "ctty=no" "in a session of its own"
+assert_eq "$(grep -c '^start ' "$D_STATE/starts" 2>/dev/null)" "1" "and it was started once"
+assert_contains "$record" "note=a scope of its own was refused (systemd-run exit 1: Failed to start transient scope unit: Access denied); started with setsid alone" \
+	"the refusal's last line goes to the window for its log"
+end_stub
+out="$(STUB_MODE=handover in_terminal "$D_ROOT/bin/eitri" "$D_PROJECT")"
+assert_contains "$(cat "$D_STATE/record" 2>/dev/null)" "note=<unset>" "a start whose scope was not refused has no note"
+end_stub
+# `started` written while the launcher reads the window's output, and the window gone before it looks at the pid:
+# the line is still read, so a handed-over launch is not started a second time (five times, to meet the gap).
+latestarted_starts=""
+for _ in 1 2 3 4 5; do
+	out="$(STUB_NO_STARTED=1 STUB_MODE=latestarted in_terminal "$D_ROOT/bin/eitri" "$D_PROJECT")"
+	latestarted_starts+="$(grep -c '^start ' "$D_STATE/starts" 2>/dev/null) "
+	end_stub
+done
+assert_eq "$latestarted_starts" "1 1 1 1 1 " "a window that said started and ended at once is started once, every time"
+# A window that ran (said started) and then failed is not started again.
+out="$(STUB_MODE=fail in_terminal "$D_ROOT/bin/eitri" "$D_PROJECT")"
+status=$?
+assert_eq "$status" "3" "a window that ran and failed gives its exit code"
+assert_eq "$(grep -c '^start ' "$D_STATE/starts" 2>/dev/null)" "1" "and is started once"
+end_stub
+# A start that never reached the window: once more without the scope, and then its failure is shown.
+out="$(STUB_NO_STARTED=1 STUB_MODE=nostart in_terminal "$D_ROOT/bin/eitri" "$D_PROJECT")"
+status=$?
+assert_eq "$status" "5" "a start that fails before the window runs, with and without the scope, gives its exit code"
+assert_eq "$(grep -c '^start ' "$D_STATE/starts" 2>/dev/null)" "2" "after one more try without the scope"
+assert_contains "$(cat "$D_STATE/systemd-run" 2>/dev/null)" "--scope" "the first through systemd-run"
+end_stub
+out="$(STUB_SYSTEMCTL_RC=1 STUB_NO_STARTED=1 STUB_MODE=nostart in_terminal "$D_ROOT/bin/eitri" "$D_PROJECT")"
+status=$?
+assert_eq "$status" "5" "with no scope there is no second try"
+assert_eq "$(grep -c '^start ' "$D_STATE/starts" 2>/dev/null)" "1" "the window is started once"
+end_stub
+
+# A user manager that hangs: a second, then the window starts with setsid alone.
+started_ns=$(date +%s%N)
+out="$(STUB_SYSTEMCTL_HANG=1 STUB_MODE=handover in_terminal "$D_ROOT/bin/eitri" "$D_PROJECT")"
+took_ms=$((($(date +%s%N) - started_ns) / 1000000))
+record="$(cat "$D_STATE/record" 2>/dev/null)"
+assert_contains "$record" "readyfd=3" "a hung user manager still lets the window leave the terminal"
+assert_eq "$(cat "$D_STATE/systemd-run" 2>/dev/null)" "" "with no scope"
+CHECKS=$((CHECKS + 1))
+if ((took_ms < 4000)); then echo "ok - within a second or so ($took_ms ms)"; else echo "FAIL - within a second or so ($took_ms ms)"; FAILURES=$((FAILURES + 1)); fi
+end_stub
+
+# Lines a little under the read's 20 ms apart: the wait still ends at EITRI_LAUNCH_WAIT, not a 256-line round later.
+started_ns=$(date +%s%N)
+out="$(STUB_MODE=pacedflood EITRI_LAUNCH_WAIT=1 in_terminal "$D_ROOT/bin/eitri" "$D_PROJECT")"
+took_ms=$((($(date +%s%N) - started_ns) / 1000000))
+assert_contains "$out" "has not said it is up after 1 s" "a paced flood is answered at the wait"
+CHECKS=$((CHECKS + 1))
+if ((took_ms < 3000)); then echo "ok - at the wait, not a round past it ($took_ms ms)"; else echo "FAIL - at the wait, not a round past it ($took_ms ms)"; FAILURES=$((FAILURES + 1)); fi
+end_stub
+
+# The desktop entry's list from a terminal: each folder and the files together, each window detached on its own.
+mkdir -p "$D_PROJECT/a" "$D_PROJECT/b"
+touch "$D_PROJECT/f.txt"
+out="$(STUB_MODE=handover in_terminal "$D_ROOT/bin/eitri" --from-desktop "$D_PROJECT/a" "$D_PROJECT/b" "$D_PROJECT/f.txt")"
+status=$?
+starts="$(cat "$D_STATE/starts" 2>/dev/null)"
+assert_eq "$status" "0" "a desktop list with folders after the first returns 0"
+assert_eq "$(grep -c 'from=terminal readyfd=3 ctty=no ' <<<"$starts")" "3" "three windows, each detached ($starts)"
+assert_contains "$starts" "$D_PROJECT/a" "one for the first folder"
+assert_contains "$starts" "$D_PROJECT/b" "one for the second"
+assert_contains "$starts" "$D_PROJECT/f.txt" "and one for the file"
+end_stub
+
+# From the desktop: no terminal, so no detach, and the window is told so.
+rm -f "$D_STATE/record"
+out="$(cd "$D_PROJECT" && env -i HOME="$FAKE_HOME" PATH="$PATH" STUB_STATE="$D_STATE" STUB_MODE=handover "$D_ROOT/bin/eitri" 2>&1 </dev/null)"
+record="$(cat "$D_STATE/record" 2>/dev/null)"
+assert_contains "$record" "from=desktop" "a start with no terminal is told it came from the desktop"
+assert_contains "$record" "readyfd=<unset>" "and is not detached"
+assert_contains "$out" "handed to the running window" "its output is as before"
+end_stub
 
 echo
 echo "$CHECKS checks, $FAILURES failed"

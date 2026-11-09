@@ -58,6 +58,10 @@ mod own_x_server;
 #[allow(unused_imports)]
 #[path = "../src/gtk_host/mod.rs"]
 mod gtk_host;
+// `gtk_host` tells a waiting launcher the window is up; nothing here has one, so the call does nothing.
+#[allow(dead_code)]
+#[path = "../src/launch_env.rs"]
+mod launch_env;
 
 #[allow(dead_code, unused_imports)]
 #[path = "../src/editor_hole.rs"]

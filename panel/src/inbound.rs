@@ -412,6 +412,8 @@ pub(super) fn reset_tab(state: &mut AgentPanelState, tab: TabId, view: ViewId, r
 
 /// What a failed tab's `r` says while no `claude` can be found: the row stays and says so, and nothing starts.
 const STILL_NOT_FOUND: &str = "claude is still not found";
+/// The same while the only `claude` found is one the lookup refuses, as the row says (found but not used).
+const STILL_NOT_USED: &str = "claude is still found but not used; the window's log says why";
 
 /// A failed tab's reset waiting on the lookup of `claude`, which runs on a worker.
 pub(super) struct PendingResetCheck {
@@ -419,7 +421,7 @@ pub(super) struct PendingResetCheck {
     /// The page that pressed `r`: the answer goes there.
     view: ViewId,
     request_id: String,
-    rx: mpsc::Receiver<bool>,
+    rx: mpsc::Receiver<Option<agent::ClaudeProblem>>,
 }
 
 /// Starts the lookup a failed tab's `r` waits for. A second `r` while one is out for the tab is refused rather than
@@ -461,7 +463,7 @@ pub(super) fn poll_reset_checks(state: &mut AgentPanelState, out: &mut Outbox) {
                 continue;
             }
             // A lookup that never answered is not a reason to start over on a guess.
-            Err(mpsc::TryRecvError::Disconnected) => true,
+            Err(mpsc::TryRecvError::Disconnected) => Some(agent::ClaudeProblem::Missing),
         };
         let check = state.reset_checks.remove(i);
         let still_failed = state
@@ -473,10 +475,14 @@ pub(super) fn poll_reset_checks(state: &mut AgentPanelState, out: &mut Outbox) {
                 check.view,
                 serialize_command_result_for_js(&check.request_id, Err("the tab is no longer waiting for Claude Code")),
             );
-        } else if missing {
+        } else if let Some(problem) = missing {
+            let words = match problem {
+                agent::ClaudeProblem::Missing => STILL_NOT_FOUND,
+                agent::ClaudeProblem::Refused => STILL_NOT_USED,
+            };
             out.send(
                 check.view,
-                serialize_command_result_for_js(&check.request_id, Err(STILL_NOT_FOUND)),
+                serialize_command_result_for_js(&check.request_id, Err(words)),
             );
         } else {
             reset_tab(state, check.tab, check.view, &check.request_id, out);
@@ -2743,15 +2749,20 @@ mod tests {
     /// is answered by the tick, not by the message.
     #[test]
     fn r_on_a_not_found_tab_starts_over_only_once_claude_is_there() {
-        use std::sync::atomic::{AtomicBool, Ordering};
+        use std::sync::atomic::{AtomicU8, Ordering};
         use std::sync::Arc;
         let (handle, page, _host) = handle_with_recording_page();
         page.visible.set(true);
-        let missing = Arc::new(AtomicBool::new(true));
+        let missing = Arc::new(AtomicU8::new(1));
         let tab = {
             let mut state = handle.state.borrow_mut();
             let flag = missing.clone();
-            state.cli_missing = Arc::new(move || flag.load(Ordering::SeqCst));
+            // 1: nothing found, 2: one found and refused, 0: found.
+            state.cli_missing = Arc::new(move || match flag.load(Ordering::SeqCst) {
+                1 => Some(agent::ClaudeProblem::Missing),
+                2 => Some(agent::ClaudeProblem::Refused),
+                _ => None,
+            });
             let tab = state.tabs.active();
             let reason = format!(
                 "{} via \"/no/such/claude\" (spawn error: ENOENT)",
@@ -2795,7 +2806,15 @@ mod tests {
         assert!(is_failed(), "the row stays: the tab is as it was");
         assert!(handle.state.borrow().reset_checks.is_empty());
 
-        missing.store(false, Ordering::SeqCst);
+        // A refused one: the answer says what the row says, found but not used.
+        missing.store(2, Ordering::SeqCst);
+        reset("r1b");
+        tick_handle_until(&handle, "the refusal", || !answered("r1b").is_empty());
+        let refusal = answered("r1b").remove(0);
+        assert!(refusal.contains("found but not used"), "{refusal}");
+        assert!(is_failed(), "the row stays for a refused one too");
+
+        missing.store(0, Ordering::SeqCst);
         reset("r2");
         tick_handle_until(&handle, "the reset", || !answered("r2").is_empty());
         assert!(answered("r2")[0].contains("\"ok\":true"), "{}", answered("r2")[0]);

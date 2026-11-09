@@ -8,6 +8,8 @@
 #   eitri --legacy ~/p     use the older in-process Claude backend (development builds only --
 #                            a release build refuses it, saying it is not in this build)
 #   eitri --clean ~/p      start nvim with --clean (no init.lua, no plugins) for this window
+#   eitri --no-fork ~/p    stay in the foreground: the window's output in this terminal, and the window
+#                            ends with it (without it, a window started from a terminal leaves it once up)
 #   eitri --account work   bill a specific Claude account (and read its history)
 #   eitri panel --nvim ADDR [DIR]
 #                          open the agent panel beside the nvim at ADDR (:EitriPanel runs this)
@@ -173,6 +175,7 @@ PROJECT=""
 QUIET=""
 NEW_WINDOW=""
 FROM_DESKTOP=""
+NO_FORK=""
 CHOOSE=""
 FIRST=""
 # Window mode keeps what was typed, in order: BEFORE is everything ahead of the user's `--` (a `+N`
@@ -214,6 +217,9 @@ while [[ $# -gt 0 ]]; do
 		# below: reusing a window would drop the account the flag selects.
 		--new-window) [[ $MODE == window ]] || { echo "$CMD_NAME: unknown option --new-window" >&2; exit 64; }
 		           NEW_WINDOW=1; shift ;;
+		# A window started from a terminal leaves it once it is up; this keeps it in the foreground, as before.
+		--no-fork) [[ $MODE == window ]] || { echo "$CMD_NAME: unknown option --no-fork" >&2; exit 64; }
+		           NO_FORK=1; shift ;;
 		# Only the desktop entry passes this, in front of its `%F` list: see the end of this file.
 		--from-desktop) [[ $MODE == window ]] || { echo "$CMD_NAME: unknown option --from-desktop" >&2; exit 64; }
 		           FROM_DESKTOP=1; shift ;;
@@ -354,6 +360,40 @@ if [[ -z "$QUIET" ]] && ! sidecar_found; then
 	echo 'eitri: no sidecar built yet -- run "eitri setup" to build one' >&2
 fi
 
+# Where this start came from, decided before anything detaches: a terminal when a standard descriptor is a
+# pseudo-terminal (a terminal emulator, tmux, ssh: major 136-143), or when the launcher runs in the foreground of its
+# controlling terminal (typed at a console), or when its controlling terminal is a pseudo-terminal (a background
+# job of a terminal's shell); else the desktop (a launcher, a menu, a session manager). A session started from a
+# console (`exec sway` in a login profile, greetd, startx) can hand that console to every app it starts, so a console
+# on a descriptor, or a controlling console whose foreground is someone else, is the desktop.
+# The window is told (EITRI_LAUNCHED_FROM): a start from the desktop takes its PATH from the login shell, one from a
+# terminal keeps this one's.
+from_terminal() {
+	local fd major stat
+	for fd in 0 1 2; do
+		[[ -t $fd ]] || continue
+		major="$(stat -L -c %t "/proc/$$/fd/$fd" 2>/dev/null)" || continue
+		[[ "$major" =~ ^[0-9a-f]+$ ]] || continue
+		((16#$major >= 136 && 16#$major <= 143)) && return 0
+	done
+	{ read -r stat <"/proc/$$/stat"; } 2>/dev/null || return 1
+	# After the command name: state ppid pgrp session tty_nr tpgid ...
+	read -r -a stat <<<"${stat##*) }"
+	((${#stat[@]} > 5 && stat[4] != 0)) || return 1
+	# A controlling terminal that is a pseudo-terminal: a terminal start even from the background (`eitri ... &` with
+	# every descriptor elsewhere), whose shell would hang up its jobs when the terminal closes. A console counts
+	# only with the launcher in its foreground.
+	major=$(((stat[4] >> 8) & 0xfff))
+	((major >= 136 && major <= 143)) && return 0
+	((stat[5] == stat[2]))
+}
+STARTED_FROM=desktop
+from_terminal && STARTED_FROM=terminal
+# A window started from a terminal leaves it: a session of its own, none of the terminal's descriptors, and the
+# prompt back once the window is up (start_window). --no-fork keeps it in the foreground.
+DETACH=""
+[[ $MODE == window && $STARTED_FROM == terminal && -z "$NO_FORK" ]] && DETACH=1
+
 # A launch that names a file may end in a running window, which keeps the account it has, so here nothing has been
 # picked yet. If it goes on to a window of its own, the binary says what it took.
 MAY_HAND_OVER=""
@@ -361,7 +401,7 @@ if [[ $MODE == window && -z "$PROJECT" && -z "$NEW_WINDOW" && ${#SHELL_ARGS[@]} 
 	[[ $((${#BEFORE[@]} + ${#AFTER[@]})) -eq 1 && -d "$FIRST" ]] || MAY_HAND_OVER=1
 fi
 
-if [[ -z "$QUIET" ]]; then
+if [[ -z "$QUIET" && -z "$DETACH" ]]; then
 	{
 		if [[ $MODE == open && -z "$OPEN_DIR_GIVEN" ]]; then
 			echo "eitri    project (the editor's working directory)"
@@ -384,6 +424,173 @@ if [[ -z "$QUIET" ]]; then
 	} >&2
 fi
 
+# How long a detached start waits for the window to say it is up before it gives the prompt back anyway.
+LAUNCH_WAIT="${EITRI_LAUNCH_WAIT:-20}"
+[[ "$LAUNCH_WAIT" =~ ^[1-9][0-9]{0,3}$ ]] || LAUNCH_WAIT=20
+
+# Whether process $1 still runs: there and not a zombie (`kill -0` answers for a zombie too).
+still_running() {
+	local stat
+	{ read -r stat <"/proc/$1/stat"; } 2>/dev/null || return 1
+	stat="${stat##*) }"
+	[[ "${stat:0:1}" != Z ]]
+}
+
+# Opens the two FIFOs in a private directory under the first of XDG_RUNTIME_DIR, TMPDIR and /tmp that takes them,
+# and removes the directory again (the open descriptors are all that is needed). Sets ready_rd, ready_wr, out_rd,
+# out_wr; fails when no place does.
+open_launch_pipes() {
+	local base dir fd
+	for base in "${XDG_RUNTIME_DIR:-}" "${TMPDIR:-}" /tmp; do
+		[[ -n "$base" && -d "$base" ]] || continue
+		dir="$(mktemp -d "$base/eitri-launch.XXXXXX" 2>/dev/null)" || continue
+		# Read ends opened read-write, so neither open waits for a writer; write ends for the window.
+		if mkfifo -m 600 "$dir/ready" "$dir/out" 2>/dev/null &&
+			exec {ready_rd}<>"$dir/ready" {out_rd}<>"$dir/out" {ready_wr}>"$dir/ready" {out_wr}>"$dir/out"; then
+			rm -rf "$dir"
+			return 0
+		fi 2>/dev/null
+		# Whatever did open is closed again, so no later window inherits it.
+		for fd in "$ready_rd" "$out_rd" "$ready_wr" "$out_wr"; do
+			[[ "$fd" =~ ^[0-9]+$ ]] && eval "exec $fd>&-"
+		done
+		ready_rd="" out_rd="" ready_wr="" out_wr=""
+		rm -rf "$dir"
+	done
+	return 1
+}
+
+# Whether the user's service manager answers, so the window can have a scope of its own (systemd-run --user). A
+# manager that hangs is given a second: past it, no scope.
+user_manager_reachable() {
+	command -v systemd-run >/dev/null 2>&1 && command -v systemctl >/dev/null 2>&1 &&
+		timeout 1 systemctl --user show --property=Version --value >/dev/null 2>&1
+}
+
+# Starts the window in the background on the launcher's pipes, through "${scope[@]}" when that is set, and sets pid.
+# A background job of a non-interactive bash starts with SIGINT and SIGQUIT ignored, and an ignored signal stays
+# ignored across exec, into the window and everything it starts: the subshell puts both back first. A window that
+# left its terminal is no longer in that terminal's tmux, zellij or screen window, so their variables do not go with
+# it. A note for the window's log (launch_note: why a scope was given up) goes as EITRI_LAUNCH_NOTE.
+spawn_window() {
+	(
+		trap - INT QUIT
+		unset TMUX TMUX_PANE ZELLIJ ZELLIJ_SESSION_NAME ZELLIJ_PANE_ID
+		[[ "${TERM_PROGRAM:-}" == tmux ]] && unset TERM_PROGRAM TERM_PROGRAM_VERSION
+		[[ -n "${STY:-}" ]] && unset STY WINDOW
+		if [[ -n "$launch_note" ]]; then export EITRI_LAUNCH_NOTE="$launch_note"; fi
+		EITRI_LAUNCH_READY_FD=3 exec setsid "${scope[@]}" "$@" </dev/null >&"$out_wr" 2>&"$out_wr" 3>&"$ready_wr" \
+			{ready_rd}<&- {out_rd}<&- {ready_wr}>&- {out_wr}>&-
+	) &
+	pid=$!
+}
+
+# Starts the window detached and waits for it: `setsid` gives it a session of its own, its input is /dev/null and its
+# output a pipe this reads until the window writes `ready` on descriptor 3 (EITRI_LAUNCH_READY_FD; `started` comes
+# first, as soon as the binary runs), after which the window's output goes to its log alone. Nothing is printed on the
+# way. A window that ends first has its exit code returned and the end of what it printed shown; exit 0 there is a
+# launch a running window took. Past LAUNCH_WAIT seconds the prompt comes back with a line saying so, and the window
+# goes on.
+launch_detached() {
+	local ready_rd="" ready_wr="" out_rd="" out_wr="" pid line="" status=0 deadline drain_end output="" chunk="" n
+	local started="" scope=() launch_note="" refusal
+	if ! open_launch_pipes; then
+		echo "eitri: could not make the pipes to start the window with (tried XDG_RUNTIME_DIR, TMPDIR and /tmp)" >&2
+		exit 1
+	fi
+	# setsid leaves the window in the terminal's control group, and a terminal run as a service of its own (or an
+	# ssh session whose scope is ended with it) takes the whole group down when it goes. A scope of its own under
+	# app.slice, as the desktop's launchers give an app, keeps it out of that; systemd-run --scope execs the window
+	# in place, so its descriptors and pid stay. Without a reachable user manager, setsid alone; and when the scope
+	# is refused (systemd-run ends before the window has said `started`, its first act), setsid alone once more.
+	if user_manager_reachable; then
+		scope=(systemd-run --user --scope --collect --quiet --slice=app.slice --description=Eitri
+			"--unit=app-eitri-$$-$RANDOM.scope" --)
+	fi
+	# The launcher keeps its own write ends of both FIFOs open until it exits, on purpose: a second start (below) is
+	# given them, and since the read ends are open read-write too, holding them changes nothing a reader sees.
+	spawn_window "$@"
+	deadline=$((SECONDS + LAUNCH_WAIT))
+	while :; do
+		while IFS= read -r -t 0.1 -u "$ready_rd" line; do
+			[[ "$line" == ready ]] && return 0
+			[[ "$line" == started ]] && started=1
+		done
+		# What the window printed so far, a bounded number of lines a round and never past the deadline, so a
+		# window that floods its output still has its ready line, its end and the deadline looked at; only the
+		# newest 8-16 KiB are kept.
+		n=0
+		while ((n < 256 && SECONDS < deadline)); do
+			if IFS= read -r -t 0.02 -u "$out_rd" chunk; then
+				output+="$chunk"$'\n'
+			else
+				output+="$chunk"
+				n=256
+			fi
+			chunk=""
+			n=$((n + 1))
+			((${#output} > 16384)) && output="${output: -8192}"
+		done
+		if ! still_running "$pid"; then
+			status=0
+			wait "$pid" || status=$?
+			# `started` may have come while the output was read: a window handed to a running one says it and ends
+			# within milliseconds. Read what is left on the ready pipe before deciding it never ran.
+			while IFS= read -r -t 0.01 -u "$ready_rd" line; do
+				[[ "$line" == started || "$line" == ready ]] && started=1
+			done
+			if [[ -z "$started" && ${#scope[@]} -gt 0 ]]; then
+				# The scope was refused before the window ran: once more with setsid alone, and the refusal's last
+				# line, all of it read first, goes to the window's log.
+				n=0
+				while ((n < 256)) && IFS= read -r -t 0.02 -u "$out_rd" chunk; do
+					output+="$chunk"$'\n'
+					chunk=""
+					n=$((n + 1))
+				done
+				output+="$chunk"
+				chunk=""
+				refusal="$(printf '%s\n' "$output" | tr -d '\r' | sed '/^[[:space:]]*$/d' | tail -n 1)"
+				launch_note="a scope of its own was refused (systemd-run exit $status: ${refusal:0:300}); started with setsid alone"
+				scope=()
+				output=""
+				spawn_window "$@"
+				continue
+			fi
+			# What it wrote last; a child it left behind may go on writing, so this too is bounded, in lines and
+			# to two seconds.
+			n=0
+			drain_end=$((SECONDS + 2))
+			while ((n < 4096 && SECONDS < drain_end)) && IFS= read -r -t 0.05 -u "$out_rd" chunk; do
+				output+="$chunk"$'\n'
+				chunk=""
+				n=$((n + 1))
+				((${#output} > 16384)) && output="${output: -8192}"
+			done
+			[[ -n "$chunk" ]] && output+="$chunk"$'\n'
+			((status == 0)) && return 0
+			echo "eitri: the window ended before it was up (exit $status)" >&2
+			[[ -n "$output" ]] && printf '%s' "$output" | tail -n 20 >&2
+			exit "$status"
+		fi
+		if ((SECONDS >= deadline)); then
+			echo "eitri: the window has not said it is up after $LAUNCH_WAIT s; it goes on starting (its log: ${XDG_STATE_HOME:-$HOME/.local/state}/eitri/log/)" >&2
+			return 0
+		fi
+	done
+}
+
+# Starts the window: detached (launch_detached) from a terminal, else in place of this process as before. Either way
+# the window is told where the start came from.
+start_window() {
+	export EITRI_LAUNCHED_FROM="$STARTED_FROM"
+	if [[ -n "$DETACH" ]]; then
+		launch_detached "$@"
+		exit 0
+	fi
+	exec "$@"
+}
+
 if [[ $MODE == split ]]; then
 	exec "$LIBDIR/shell" split -- "$PROJECT"
 fi
@@ -396,7 +603,7 @@ fi
 if [[ $MODE == panel ]]; then
 	exec "$LIBDIR/shell" panel "${PANEL_ARGS[@]}" -- "$PROJECT"
 fi
-[[ -n "$CHOOSE" ]] && exec "$LIBDIR/shell" choose-project "${SHELL_ARGS[@]}"
+[[ -n "$CHOOSE" ]] && start_window "$LIBDIR/shell" choose-project "${SHELL_ARGS[@]}"
 [[ -n "$NEW_WINDOW" ]] && SHELL_ARGS+=(--new-window)
 # A file manager gives the desktop entry everything selected as one list, and a folder after the first path is a
 # refusal no screen would show. So each folder gets a window of its own, as it would from one launch per item, and
@@ -408,14 +615,19 @@ if [[ -n "$FROM_DESKTOP" ]]; then
 	done
 	if [[ -n "$FOLDER_LATER" ]]; then
 		FILES=()
+		export EITRI_LAUNCHED_FROM="$STARTED_FROM"
 		for a in "${BEFORE[@]}"; do
-			if [[ -d "$a" ]]; then
-				"$LIBDIR/shell" "${SHELL_ARGS[@]}" -- "$a" &
-			else
+			if [[ ! -d "$a" ]]; then
 				FILES+=("$a")
+			elif [[ -n "$DETACH" ]]; then
+				(launch_detached "$LIBDIR/shell" "${SHELL_ARGS[@]}" -- "$a")
+			else
+				"$LIBDIR/shell" "${SHELL_ARGS[@]}" -- "$a" &
 			fi
 		done
-		if [[ ${#FILES[@]} -gt 0 ]]; then
+		if [[ ${#FILES[@]} -gt 0 && -n "$DETACH" ]]; then
+			(launch_detached "$LIBDIR/shell" "${SHELL_ARGS[@]}" -- "${FILES[@]}")
+		elif [[ ${#FILES[@]} -gt 0 ]]; then
 			"$LIBDIR/shell" "${SHELL_ARGS[@]}" -- "${FILES[@]}" &
 		fi
 		wait
@@ -432,6 +644,6 @@ if [[ ${#SHELL_ARGS[@]} -eq 0 && ${#BEFORE[@]} -gt 0 ]]; then
 	esac
 fi
 if [[ -n "$SAW_DASHES" ]]; then
-	exec "$LIBDIR/shell" "${SHELL_ARGS[@]}" "${BEFORE[@]}" -- "${AFTER[@]}"
+	start_window "$LIBDIR/shell" "${SHELL_ARGS[@]}" "${BEFORE[@]}" -- "${AFTER[@]}"
 fi
-exec "$LIBDIR/shell" "${SHELL_ARGS[@]}" "${BEFORE[@]}"
+start_window "$LIBDIR/shell" "${SHELL_ARGS[@]}" "${BEFORE[@]}"

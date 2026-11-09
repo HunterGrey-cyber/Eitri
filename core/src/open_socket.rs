@@ -1487,9 +1487,14 @@ mod tests {
         let file = fixture.file("a.rs");
         drop(UnixListener::bind(fixture.root_socket()).unwrap());
         let before = identity(&fixture.root_socket()).unwrap();
+        // A second name keeps the stale socket's inode alive, so the file system cannot hand the same number to the
+        // new one (ext4 reuses a freed inode in the same directory at once) and a reclaim always shows.
+        let kept = fixture.dir.join("stale-socket-kept");
+        std::fs::hard_link(fixture.root_socket(), &kept).unwrap();
         let server = fixture.server();
         assert_eq!(server.socket(), fixture.root_socket());
         assert_ne!(identity(&fixture.root_socket()).unwrap(), before);
+        let _ = std::fs::remove_file(&kept);
         let client = ask_later(server.socket(), request(&file));
         let (_, answering) = next_request(&server).take().unwrap();
         answering.answer(Answer::Accepted);

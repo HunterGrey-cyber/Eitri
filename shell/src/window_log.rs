@@ -19,11 +19,44 @@ fn install() -> bool {
     true
 }
 
+/// What [`start_early`] starts.
+#[derive(Debug, PartialEq, Eq)]
+enum Early {
+    /// The relay, the panic hook and later the log.
+    Logged,
+    /// The log is off, but a launcher reads the first output and then goes: the relay alone, so neither the window's
+    /// prints nor its children's ever write into the launcher's pipe once nobody reads it.
+    Unlogged,
+    /// The log is off and the streams stay as they are.
+    Nothing,
+}
+
+fn early(log_on: bool, launcher_reads: bool) -> Early {
+    match (log_on, launcher_reads) {
+        (true, _) => Early::Logged,
+        (false, true) => Early::Unlogged,
+        (false, false) => Early::Nothing,
+    }
+}
+
 /// A main window, before its project is known: every print from here on is safe, and a panic leaves a record. The
-/// threads this starts never read the environment, which `main()` goes on setting.
+/// threads this starts never read the environment, which `main()` goes on setting. A launcher that reads the first
+/// output may be stopped (Ctrl+Z) while it waits, so writes to it never wait.
 pub(crate) fn start_early() {
-    if install() {
-        crash_trace::keep_output(None, crash_trace::route_for(1), crash_trace::route_for(2));
+    let launcher_reads = crate::launch_env::launcher_reads();
+    let log_on = !crash_trace::is_off(std::env::var_os(crash_trace::OFF_ENV).as_deref());
+    match early(log_on, launcher_reads) {
+        Early::Logged => {
+            install();
+            crash_trace::keep_output(None, crash_trace::route_for(1), crash_trace::route_for(2));
+        }
+        Early::Unlogged => {
+            crash_trace::keep_output_unlogged(crash_trace::route_for(1), crash_trace::route_for(2));
+        }
+        Early::Nothing => {}
+    }
+    if launcher_reads {
+        crash_trace::relay::old_destinations_never_wait();
     }
 }
 
@@ -114,5 +147,18 @@ pub(crate) mod probe {
             "print" => println!("[probe] a line after the disk filled"),
             other => eprintln!("[probe] unknown crash probe {other:?}"),
         });
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_window_whose_log_is_off_still_has_the_relay_while_a_launcher_reads_its_output() {
+        assert_eq!(early(true, false), Early::Logged);
+        assert_eq!(early(true, true), Early::Logged);
+        assert_eq!(early(false, true), Early::Unlogged);
+        assert_eq!(early(false, false), Early::Nothing);
     }
 }

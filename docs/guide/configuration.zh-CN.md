@@ -1,5 +1,5 @@
 [English](configuration.md) | 简体中文
-<!-- translated-from: configuration.md sha256=521d7227179479cb1b3bbcc7b358b40a9dc49be1b3e27ac373e78bc7877dec51 -->
+<!-- translated-from: configuration.md sha256=491c4ae84163d671c8420638061a77c906f7c0fbd58ac84559a2909061792b95 -->
 
 # 配置
 
@@ -337,6 +337,7 @@ eitri.config.set("agent.default_mode", "auto")    -- "manual", "auto" (the defau
 | `EITRI_NVIM` | 要运行的 `nvim` 的绝对路径。它优先于下面的一切。不是指向现有文件的绝对路径的值会让启动停下。 |
 | `NEOVIM_BIN` | 在没有设置 `EITRI_NVIM` 时读取：规则相同，要求指向现有文件的绝对路径。两者都没有时，Eitri 用 `PATH` 上的 `nvim`；如果它不存在或者比 0.11 旧，并且你在 `eitri setup` 里接受过一个私有副本，就用 `$XDG_DATA_HOME/eitri/nvim/` 下最新的那个副本。 |
 | `EITRI_CODEX` | Codex 标签页运行的 `codex`：一个现有文件的绝对路径，否则 Eitri 会在启动时停下并点出这个变量。它优先于 `agent.codex.command` 和 `PATH`。空值算作未设置。Eitri 不为 Codex 标签页设置 `CODEX_HOME`；Codex 读的是你的，而相对的 `CODEX_HOME` 会让每一次 Codex 启动都被拒绝。 |
+| `EITRI_LOGIN_PATH` | `off`：从桌面启动器打开的窗口保留它拿到的 `PATH`，不再向你的登录 shell 询问（[快速上手](getting-started.zh-CN.md#open-a-project)）。 |
 | `EITRI_NEOVIDE` | `eitri split` 启动的那个 Neovide。它必须指向一个现有文件；没设置时用 `PATH` 上的 `neovide`。 |
 | `EITRI_PROJECT_DIR` | 命令行上没有给目录时要打开的项目。命令行上的目录优先于它，它优先于当前目录。已安装的 `eitri` 命令不读它：没有给目录时，它打开当前目录。它只指目录；文件用 `eitri FILE` 打开。 |
 | `EITRI_CONFIG_DIR` | 从这个目录读取 `init.lua` 和它的 `lua/` 模块，覆盖 Linux 的 XDG 配置目录或 `~/.config/eitri`。空值视为未设置，相对路径会拒绝启动。 |

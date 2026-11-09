@@ -89,6 +89,8 @@ const STDERR_TAIL_CAPACITY: usize = 40;
 #[derive(Default)]
 struct StderrTail {
     lines: VecDeque<String>,
+    /// Set by the drain when the pipe reached its end: every line the sidecar wrote is in `lines`.
+    ended: bool,
 }
 
 impl StderrTail {
@@ -282,6 +284,9 @@ fn drain(
                 if !partial.is_empty() {
                     print_line(&std::mem::take(&mut partial), stream_name, tail.as_ref());
                 }
+                if let Some(Ok(mut tail)) = tail.as_ref().map(|tail| tail.lock()) {
+                    tail.ended = true;
+                }
                 return Drained {
                     pipe,
                     partial,
@@ -300,11 +305,14 @@ fn drain(
             }
             Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {}
             Err(_) => {
+                if let Some(Ok(mut tail)) = tail.as_ref().map(|tail| tail.lock()) {
+                    tail.ended = true;
+                }
                 return Drained {
                     pipe,
                     partial,
                     ended: true,
-                }
+                };
             }
         }
     }
@@ -1507,6 +1515,19 @@ fn sidecar_command_for(
     command
 }
 
+/// How long a sidecar that exited before binding is given for its stderr to reach its end: a process it left behind
+/// can hold the pipe open, and the reason is then built from what arrived.
+const STDERR_END_WAIT: Duration = Duration::from_secs(2);
+
+/// Waits, at most `limit`, for the stderr drain to reach the pipe's end, so a reason built from the tail has the last
+/// line the sidecar wrote before it exited: a fixed pause lost it on a loaded machine.
+fn wait_for_stderr_end(tail: &Arc<Mutex<StderrTail>>, limit: Duration) {
+    let until = std::time::Instant::now() + limit;
+    while std::time::Instant::now() < until && !tail.lock().map(|tail| tail.ended).unwrap_or(true) {
+        std::thread::sleep(Duration::from_millis(2));
+    }
+}
+
 /// What a sidecar that exited before binding is said to have done; with `claude_refused` (an install place held a
 /// `claude` the lookup would not hand over) [`super::cli_locate::CLAUDE_REFUSED_NOTE`] follows, so the panel can say it
 /// was found but not used rather than not found.
@@ -1711,7 +1732,7 @@ fn spawn_resolved(
             // The drain threads may still be flushing the final lines the child wrote on its way
             // out; those lines are the entire diagnosis, so give them a moment to land rather than
             // reporting an empty cause.
-            std::thread::sleep(Duration::from_millis(100));
+            wait_for_stderr_end(&stderr_tail, STDERR_END_WAIT);
             return Err(startup_failure(
                 std::io::ErrorKind::Other,
                 &exit_summary(&status, &socket_path, claude_refused),
@@ -2439,6 +2460,27 @@ mod tests {
         let (description, _) = describe_checkout(&checkout);
         assert!(!description.contains("prebuilt"), "{description}");
         std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    /// The reason of an early exit is built once the stderr drain has every line: a line written just before the exit
+    /// that the drain has not read yet is waited for, and a pipe that never ends is waited for no longer than the limit.
+    #[test]
+    fn an_early_exit_waits_for_the_last_stderr_line() {
+        let tail = Arc::new(Mutex::new(StderrTail::default()));
+        let late = Arc::clone(&tail);
+        let writer = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(300));
+            let mut tail = late.lock().unwrap();
+            tail.push("gone".to_string());
+            tail.ended = true;
+        });
+        wait_for_stderr_end(&tail, Duration::from_secs(10));
+        assert_eq!(tail.lock().unwrap().snapshot(), vec!["gone".to_string()]);
+        writer.join().unwrap();
+        let open = Arc::new(Mutex::new(StderrTail::default()));
+        let started = std::time::Instant::now();
+        wait_for_stderr_end(&open, Duration::from_millis(200));
+        assert!(started.elapsed() >= Duration::from_millis(200) && started.elapsed() < Duration::from_secs(5));
     }
 
     #[test]

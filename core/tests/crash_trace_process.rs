@@ -249,8 +249,131 @@ fn child_entry_runs_only_when_a_test_runs_this_binary_again() {
             }
             std::process::exit(0);
         }
+        // A window whose log is off, started by a launcher that has already gone (its pipe has no reader): a child
+        // it starts then writes, and so does the window itself.
+        "launcher-gone" | "launcher-gone-no-relay" => {
+            // The launcher's pipe, with its reader gone, under both streams.
+            let (read, write) = std::io::pipe().unwrap();
+            drop(read);
+            for fd in [1, 2] {
+                // SAFETY: both descriptors are open; this process's own streams are replaced on purpose.
+                unsafe { libc::dup2(write.as_raw_fd(), fd) };
+            }
+            drop(write);
+            if mode == "launcher-gone" {
+                assert!(crash_trace::keep_output_unlogged(
+                    crash_trace::route_for(1),
+                    crash_trace::route_for(2)
+                ));
+                relay::old_destinations_never_wait();
+            }
+            let status = Command::new("sh")
+                .args([
+                    "-c",
+                    "echo a line from a child; echo and an error >&2; echo second line",
+                ])
+                .status()
+                .unwrap();
+            std::fs::write(dir.join("child-status"), status.to_string()).unwrap();
+            println!("the window's own line");
+            eprintln!("and its own error");
+            relay::flush(Duration::from_secs(2));
+            std::process::exit(0);
+        }
+        // A launcher that stopped reading (Ctrl+Z while it waits): the window prints more than its pipe holds.
+        "launcher-stopped" | "launcher-stopped-blocking" => {
+            logged_tee(&dir);
+            if mode == "launcher-stopped" {
+                relay::old_destinations_never_wait();
+            }
+            let line = "z".repeat(2048);
+            for _ in 0..200 {
+                println!("{line}");
+            }
+            println!("the last line");
+            relay::flush(Duration::from_secs(3));
+            std::process::exit(0);
+        }
         other => panic!("unknown mode {other}"),
     }
+}
+
+/// The relay with a log and copies on to where the streams went (a launcher's pipe).
+fn logged_tee(dir: &Path) {
+    crash_trace::install(VERSION, Some(dir), std::env::var_os("HOME").as_deref());
+    let log = relay::open_log(dir, "main-test.log").unwrap();
+    assert!(crash_trace::keep_output(
+        Some(log),
+        crash_trace::route_for(1),
+        crash_trace::route_for(2)
+    ));
+}
+
+/// Runs `mode`, which puts its streams on a pipe with no reader (a launcher that has gone), and returns how it and
+/// its child ended.
+fn run_with_launcher_gone(mode: &str, dir: &Scratch) -> (std::process::ExitStatus, String) {
+    let status = run(mode, dir).status;
+    let child_status = std::fs::read_to_string(dir.join("child-status")).unwrap_or_default();
+    (status, child_status)
+}
+
+#[test]
+fn a_window_with_its_log_off_keeps_its_children_off_a_launcher_pipe_nobody_reads() {
+    // The control: without the relay, the child writes into the dead pipe and SIGPIPE ends it.
+    let dir = scratch("gone-control");
+    let (status, child) = run_with_launcher_gone("launcher-gone-no-relay", &dir);
+    assert!(
+        child.contains("SIGPIPE"),
+        "the control's child: {child:?} (window {status:?})"
+    );
+    let dir = scratch("gone");
+    let (status, child) = run_with_launcher_gone("launcher-gone", &dir);
+    assert!(status.success(), "the window: {status:?}");
+    assert_eq!(child, "exit status: 0", "the child");
+}
+
+/// Runs `mode` with stdout a pipe nobody reads until it ends, and returns what reached the log.
+fn run_with_launcher_stopped(mode: &str, dir: &Scratch) -> String {
+    let mut started = child(mode, dir).spawn().unwrap();
+    let stdout = started.stdout.take().unwrap();
+    let mut stderr = started.stderr.take().unwrap();
+    let drain = std::thread::spawn(move || {
+        let mut sink = Vec::new();
+        let _ = stderr.read_to_end(&mut sink);
+    });
+    let end = Instant::now() + Duration::from_secs(60);
+    let status = loop {
+        if let Some(status) = started.try_wait().unwrap() {
+            break Some(status);
+        }
+        if Instant::now() >= end {
+            break None;
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    };
+    drop(stdout);
+    if status.is_none() {
+        started.kill().unwrap();
+        let _ = started.wait();
+    }
+    drain.join().unwrap();
+    assert!(status.is_some_and(|status| status.success()), "{status:?}");
+    std::fs::read_to_string(dir.join("main-test.log")).unwrap()
+}
+
+#[test]
+fn a_stopped_launcher_holds_up_neither_the_log_nor_the_window() {
+    // The control: copies that wait for the launcher stop the log behind them.
+    let dir = scratch("stopped-control");
+    let log = run_with_launcher_stopped("launcher-stopped-blocking", &dir);
+    assert!(!log.contains("the last line"), "the control reached the log's end");
+    let dir = scratch("stopped");
+    let log = run_with_launcher_stopped("launcher-stopped", &dir);
+    assert!(
+        log.contains("the last line"),
+        "{} bytes of log without the last line",
+        log.len()
+    );
 }
 
 #[test]

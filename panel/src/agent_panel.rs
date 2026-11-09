@@ -317,8 +317,8 @@ struct AgentPanelState {
     /// Failed tabs whose `r` waits for the lookup of `claude`, polled by the tick: the lookup reads the disk, so it
     /// never runs on the GTK thread.
     reset_checks: Vec<inbound::PendingResetCheck>,
-    /// Whether no `claude` can be found: the real lookup, or a test's stand-in.
-    cli_missing: std::sync::Arc<dyn Fn() -> bool + Send + Sync>,
+    /// Why no `claude` can be run, if so: the real lookup, or a test's stand-in.
+    cli_missing: std::sync::Arc<dyn Fn() -> Option<agent::ClaudeProblem> + Send + Sync>,
     /// Status-band hints not yet shown: the page was not ready (loading, or reloading) when they
     /// arrived. At most one per tab, the newest.
     review_hints: Vec<eitri_core::turn_review::ReviewHint>,
@@ -647,7 +647,7 @@ impl AgentPanelState {
             proposal_jobs: Vec::new(),
             view_jobs: Vec::new(),
             reset_checks: Vec::new(),
-            cli_missing: std::sync::Arc::new(agent::claude_cli_missing_here),
+            cli_missing: std::sync::Arc::new(agent::claude_problem_here),
             review_hints: Vec::new(),
             shown_hints: Vec::new(),
             review_hint: eitri_core::agent_prefs::ReviewHintLevel::Off,

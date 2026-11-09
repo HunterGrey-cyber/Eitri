@@ -1365,6 +1365,7 @@ impl GtkHost {
             }
             window.present();
         }
+        crate::launch_env::window_up();
         Applied::Done
     }
 

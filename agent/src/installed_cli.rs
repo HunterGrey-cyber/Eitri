@@ -125,12 +125,15 @@ fn ini_value(value: &str) -> String {
     out.trim().to_string()
 }
 
-/// The most of a file's start read to find its `#!` line.
-const SHEBANG_CAP: usize = 256;
+/// The most of a file's start read: its `#!` line, and for a wrapper script the `exec` line after it.
+const START_CAP: usize = 4096;
+
+/// `env`'s options that take the next word as their value (GNU's and BSD's): that word is no program.
+const ENV_VALUE_OPTIONS: [&str; 7] = ["-u", "--unset", "-C", "--chdir", "-a", "--argv0", "-P"];
 
 /// The program a script's first line asks `env` to find on the `PATH` (`#!/usr/bin/env node`, `#!/bin/env -S node
-/// --flag`, after any `-` option and `NAME=value`), else `None` (no `#!`, or an interpreter named by its path, which
-/// the kernel finds itself).
+/// --flag`, `#!/usr/bin/env -u NAME node`), past `env`'s options, their values and `NAME=value` words, else `None`
+/// (no `#!`, or an interpreter named by its path, which the kernel finds itself).
 pub fn env_interpreter(start: &[u8]) -> Option<String> {
     let rest = start.strip_prefix(b"#!")?;
     let line = rest.split(|b| *b == b'\n').next()?;
@@ -140,12 +143,55 @@ pub fn env_interpreter(start: &[u8]) -> Option<String> {
     if program != "/usr/bin/env" && program != "/bin/env" {
         return None;
     }
-    words
-        .find(|w| !w.starts_with('-') && !w.contains('='))
-        .map(str::to_string)
+    while let Some(word) = words.next() {
+        if word == "--" {
+            return words.next().map(str::to_string);
+        }
+        if ENV_VALUE_OPTIONS.contains(&word) {
+            words.next();
+            continue;
+        }
+        if word.starts_with("--") || word.contains('=') {
+            continue;
+        }
+        if let Some(flags) = word.strip_prefix('-') {
+            // A cluster such as `-iu NAME`: a value option last in it takes the next word; one before its end
+            // (`-uNAME`) has its value attached.
+            if !flags.is_empty() && flags.find(|c| "uCaP".contains(c)) == Some(flags.len() - 1) {
+                words.next();
+            }
+            continue;
+        }
+        return Some(word.to_string());
+    }
+    None
 }
 
-/// The start of `path`, at most [`SHEBANG_CAP`] bytes, read without blocking; `None` when it cannot be read.
+/// The absolute program a wrapper script runs with `exec` (`exec "/home/u/.claude/local/node_modules/.bin/claude"
+/// "$@"`, the old local install's launcher), the first such line after its `#!` line; quotes around the path are
+/// dropped. `None` for anything else.
+pub fn wrapper_exec(start: &[u8]) -> Option<PathBuf> {
+    let text = std::str::from_utf8(start).ok().or_else(|| {
+        // A start cut inside a character: what comes before it.
+        let valid = std::str::from_utf8(start).err()?.valid_up_to();
+        std::str::from_utf8(&start[..valid]).ok()
+    })?;
+    if !text.starts_with("#!") {
+        return None;
+    }
+    text.lines().skip(1).find_map(|line| {
+        let rest = line.trim_start().strip_prefix("exec")?;
+        if !rest.starts_with(char::is_whitespace) {
+            return None;
+        }
+        let word = rest.split_whitespace().next()?;
+        let word = word.trim_matches(|c| c == '"' || c == '\'');
+        let path = PathBuf::from(word);
+        path.is_absolute().then_some(path)
+    })
+}
+
+/// The start of `path`, at most [`START_CAP`] bytes, read without blocking; `None` when it cannot be read.
 pub fn read_start(path: &Path) -> Option<Vec<u8>> {
     use std::io::Read;
     use std::os::unix::fs::OpenOptionsExt;
@@ -158,7 +204,7 @@ pub fn read_start(path: &Path) -> Option<Vec<u8>> {
         return None;
     }
     let mut start = Vec::new();
-    file.take(SHEBANG_CAP as u64).read_to_end(&mut start).ok()?;
+    file.take(START_CAP as u64).read_to_end(&mut start).ok()?;
     Some(start)
 }
 
@@ -367,12 +413,30 @@ pub fn inspect_installed(path: &Path) -> Inspected {
 /// a window may hand over.
 pub fn inspect_for_window(path: &Path, path_var: Option<&std::ffi::OsStr>) -> Inspected {
     match inspect_installed(path) {
-        Inspected::Usable => match interpreter_refusal(path, read_start(path).as_deref(), path_var, &runnable_file) {
+        Inspected::Usable => match start_refusal(path, path_var, &read_start, &runnable_file) {
             Some(why) => Inspected::Refused(why),
             None => Inspected::Usable,
         },
         other => other,
     }
+}
+
+/// [`interpreter_refusal`] for `path`, and, when `path` is a wrapper whose `exec` runs an absolute program
+/// ([`wrapper_exec`]), for that program too (one level: the old local install's `~/.claude/local/claude` runs
+/// `node_modules/.bin/claude`, a `#!/usr/bin/env node` script).
+pub fn start_refusal(
+    path: &Path,
+    path_var: Option<&std::ffi::OsStr>,
+    read: &dyn Fn(&Path) -> Option<Vec<u8>>,
+    runnable: &dyn Fn(&Path) -> bool,
+) -> Option<String> {
+    let start = read(path);
+    if let Some(why) = interpreter_refusal(path, start.as_deref(), path_var, runnable) {
+        return Some(why);
+    }
+    let target = wrapper_exec(start.as_deref()?)?;
+    interpreter_refusal(&target, read(&target).as_deref(), path_var, runnable)
+        .map(|why| format!("{} runs {}, and {why}", path.display(), target.display()))
 }
 
 #[cfg(test)]
@@ -519,6 +583,61 @@ pub(crate) mod tests {
         assert_eq!(env_interpreter(b"#!/bin/sh\nexec x"), None);
         assert_eq!(env_interpreter(b"\x7fELF\x02\x01"), None);
         assert_eq!(env_interpreter(b"#!/usr/bin/env"), None);
+    }
+
+    #[test]
+    fn env_options_that_take_a_value_are_no_program() {
+        assert_eq!(env_interpreter(b"#!/usr/bin/env -u NAME node\n"), Some("node".into()));
+        assert_eq!(
+            env_interpreter(b"#!/usr/bin/env --unset NAME node\n"),
+            Some("node".into())
+        );
+        assert_eq!(
+            env_interpreter(b"#!/usr/bin/env --unset=NAME node\n"),
+            Some("node".into())
+        );
+        assert_eq!(env_interpreter(b"#!/usr/bin/env -uNAME node\n"), Some("node".into()));
+        assert_eq!(env_interpreter(b"#!/usr/bin/env -iu NAME node\n"), Some("node".into()));
+        assert_eq!(
+            env_interpreter(b"#!/usr/bin/env -C /tmp -S node --x\n"),
+            Some("node".into())
+        );
+        assert_eq!(env_interpreter(b"#!/usr/bin/env -- node\n"), Some("node".into()));
+        assert_eq!(env_interpreter(b"#!/usr/bin/env - node\n"), Some("node".into()));
+        assert_eq!(env_interpreter(b"#!/usr/bin/env -u NAME\n"), None);
+    }
+
+    #[test]
+    fn a_wrappers_exec_target_is_checked_too() {
+        let wrapper = b"#!/bin/bash\nexec \"/home/u/.claude/local/node_modules/.bin/claude\" \"$@\"\n".to_vec();
+        assert_eq!(
+            wrapper_exec(&wrapper),
+            Some(PathBuf::from("/home/u/.claude/local/node_modules/.bin/claude"))
+        );
+        assert_eq!(
+            wrapper_exec(b"#!/bin/sh\nexec node \"$0.js\"\n"),
+            None,
+            "not an absolute program"
+        );
+        assert_eq!(wrapper_exec(b"#!/bin/sh\nexecutable=/x\n"), None);
+        assert_eq!(wrapper_exec(b"\x7fELF exec /x"), None);
+        let files = |p: &Path| match p.to_str() {
+            Some("/home/u/.claude/local/claude") => Some(wrapper.clone()),
+            Some("/home/u/.claude/local/node_modules/.bin/claude") => Some(b"#!/usr/bin/env node\n".to_vec()),
+            _ => None,
+        };
+        let has_node = |p: &Path| p == Path::new("/usr/bin/node");
+        let wrapper_path = Path::new("/home/u/.claude/local/claude");
+        let why = start_refusal(wrapper_path, Some(OsStr::new("/usr/local/bin")), &files, &has_node)
+            .expect("node is not on that PATH");
+        assert!(
+            why.contains("runs /home/u/.claude/local/node_modules/.bin/claude") && why.contains("env node"),
+            "{why}"
+        );
+        assert_eq!(
+            start_refusal(wrapper_path, Some(OsStr::new("/usr/bin")), &files, &has_node),
+            None
+        );
     }
 
     #[test]

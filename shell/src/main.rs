@@ -29,6 +29,7 @@ mod ide_wiring;
 mod keymap_alt_mod;
 mod kill_pane;
 mod launch;
+mod launch_env;
 mod layout;
 mod layout_state;
 mod linked_window;
@@ -145,6 +146,9 @@ fn followed_chunk_check() -> neovide_editor::ChunkCheck {
 }
 
 fn main() -> glib::ExitCode {
+    // What the launcher says about this start, first: a start from the desktop takes its `PATH` from the login shell
+    // here, before any thread or child, and the lines about it (and the launcher's note) wait for the log below.
+    let launch_lines = launch_env::take(std::env::args_os().nth(1).as_deref());
     // setenv is not thread-safe, so settle the display before any thread or GTK code runs: the window (GTK), the
     // editor (winit), compositor detection and every child started later read these variables, and they must
     // name one display server. A write that fails to print must not stop the start, so not `eprintln!`.
@@ -289,6 +293,9 @@ fn main() -> glib::ExitCode {
     // `second_first_acts`.
     if matches!(start, linked_window::WindowStart::Full) {
         window_log::start_early();
+    }
+    for line in launch_lines {
+        eprintln!("[launch] {line}");
     }
 
     // A desktop launch that named no path. After the relay, so a failed print from `init.lua` cannot panic; before the

@@ -344,6 +344,19 @@ pub fn keep_output(log: Option<(File, PathBuf)>, stdout: Route, stderr: Route) -
     .unwrap_or(false)
 }
 
+/// The relay with no log and no panic hook: for a window whose log is off but whose first output goes to a launcher
+/// that goes away once the window is up. Its children then inherit the relay's pipes, never the launcher's, and its
+/// own prints never meet a pipe with no reader. False when it did not start.
+pub fn keep_output_unlogged(stdout: Route, stderr: Route) -> bool {
+    relay::start(relay::Start {
+        log: None,
+        stdout,
+        stderr,
+        home: None,
+    })
+    .unwrap_or(false)
+}
+
 /// Gives a relay started without one its log.
 pub fn attach_log(file: File, path: PathBuf) {
     if let Some(hook) = HOOK.get() {

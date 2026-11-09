@@ -1,5 +1,5 @@
 [English](getting-started.md) | 简体中文
-<!-- translated-from: getting-started.md sha256=0f6771129fcb39d6cc2b70d2b7d1c42c6785bfac3dd4e241d6362367d76d36c2 -->
+<!-- translated-from: getting-started.md sha256=f872c9de0cafc9b7c65f62062002d055718e6907bd517b44158066f84b3a4a5f -->
 
 # 快速上手
 
@@ -26,6 +26,10 @@ eitri [DIR]
 ```
 
 `DIR` 是项目目录。不写的话，Eitri 在设置了 `$EITRI_PROJECT_DIR` 时用它，否则用你运行命令时所在的目录。如果路径所在的文件夹不存在，或者给了 Eitri 不认识的选项，启动会直接带着一条消息停下，而不是去打开别的目录；要打开名字以 `-` 开头的目录，在它前面加 `--`（`eitri -- -notes`）。文件夹存在而名字不存在时，这个名字算新文件，所以目录名打错时会打开一个以它命名的空缓冲区。要打开文件而不是目录，见[打开文件](#open-a-file)。
+
+从终端启动时，窗口一出来 `eitri` 就把提示符还给你，什么也不打印：窗口自己运行，所以关掉那个终端、`exit`、杀掉 tmux 面板或者 ssh 断线，它都照常运行，输出写进它的日志（`~/.local/state/eitri/log/`）。如果窗口没出来就结束了，命令会说明，显示它打印的内容，并以它的退出码退出。`eitri --no-fork DIR` 保留原来的方式：窗口在前台，输出在终端里，终端结束它也结束。不是窗口的命令（`eitri agents`、`eitri sidecar ...`、`eitri setup`、`eitri panel`、`eitri page`、`eitri split`、`eitri open`）始终留在终端里。
+
+从桌面启动器、菜单或合成器的快捷键启动的窗口，拿到的是会话给的 `PATH`，常常缺少你的 shell 配置加上的目录（`~/.local/bin`、`~/.cargo/bin`、版本管理器的目录）。所以这样启动时，Eitri 会向你的登录 shell 问一次 `PATH`（`$SHELL -i -l -c`，最多 2 秒），用在窗口、它的 Neovim、底部终端和 agent 上；shell 配置较重时，启动会多出它的运行时间（带横幅的 zsh 大约 0.3 秒）。这时你的配置能看到 `EITRI_RESOLVING_ENVIRONMENT=1`，可以借此跳过某些内容。shell 太慢或出错时，窗口保留原来的 `PATH`，日志会写明原因。要跳过这一步，设置 `EITRI_LOGIN_PATH=off`；另一种让桌面启动的所有程序拿到同一个 `PATH` 的办法是在 `~/.config/environment.d/` 里放一个文件（例如在 `10-path.conf` 里写 `PATH=$HOME/.local/bin:$PATH`），systemd 的用户会话会在登录时读取它。
 
 打开的每个目录都是一个独立的窗口，有自己的 Neovim、自己的会话和自己的项目根目录，所以你可以同时打开好几个项目。窗口标题写着项目名（`myproject — Eitri`；有两个工作区时再加上当前显示的那个：`myproject — Eitri · docs`），窗口切换器和合成器的窗口规则读的就是它。
 
