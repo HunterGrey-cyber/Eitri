@@ -315,6 +315,33 @@ mod tests {
     }
 
     #[test]
+    fn every_source_lies_inside_the_frame_at_every_scale_and_small_size() {
+        for scale in [1.0, 1.25, 1.5, 2.0] {
+            for w in [1, 2, 3, 5, 21, 63, 64, 65, 801] {
+                for h in [1, 2, 9, 40, 601] {
+                    let p = placement((300.0, 200.0), (0.0, 0.0), (w, h), scale, 2, true)
+                        .unwrap()
+                        .with_underlay((0.0, 0.0), (2000, 1500));
+                    let (cw, ch) = p.content;
+                    for patch in corner_patches(p.position, p.logical, p.content, p.underlay)
+                        .iter()
+                        .flatten()
+                    {
+                        let (x, y, sw, sh) = patch.source;
+                        assert!(sw > 0 && sh > 0, "{scale} {w}x{h}");
+                        assert!(
+                            x >= 0 && y >= 0 && x + sw <= cw * 256 && y + sh <= ch * 256,
+                            "{scale} {w}x{h} {patch:?}"
+                        );
+                        let (_, _, rw, rh) = patch.rect;
+                        assert!(rw > 0 && rh > 0, "{scale} {w}x{h} {patch:?}");
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
     fn a_corner_on_the_window_corner_gets_no_patch_and_one_on_an_edge_reaches_along_it() {
         let r = UNDERLAY_REACH;
         // The editor on the window's left and bottom edges, as a left split above nothing.

@@ -169,6 +169,11 @@ struct Pool<S, B: Destroy, P: Destroy> {
     /// The compositor has created a buffer of this pool's format and modifier, so later buffers may be created
     /// immediately.
     proven: bool,
+    /// The child has corner patches: every buffer gets its four views as soon as it exists.
+    views_wanted: bool,
+    /// A view could not be made, or the compositor failed one: no views are made or handed out again (the buffers
+    /// and the frames go on; views already committed stay until released).
+    views_refused: bool,
 }
 impl<S: SlotSource, B: Destroy, P: Destroy> Pool<S, B, P> {
     fn new(source: S, chosen: Chosen, pane: PaneId, viewporter: bool) -> Self {
@@ -185,6 +190,8 @@ impl<S: SlotSource, B: Destroy, P: Destroy> Pool<S, B, P> {
             created_count: 0,
             last_content: None,
             proven: false,
+            views_wanted: false,
+            views_refused: false,
         }
     }
     fn size(entry: &Entry<B, P>) -> (i32, i32) {
@@ -327,6 +334,8 @@ impl<S: SlotSource, B: Destroy, P: Destroy> Pool<S, B, P> {
         }
         let last = self.last_content.replace(content).unwrap_or(content);
         self.trim(content);
+        // Buffers created since the last frame (an answered create) get their views before one is chosen.
+        self.ensure_views(requests);
         let selected = self
             .entries
             .iter()
@@ -413,6 +422,7 @@ impl<S: SlotSource, B: Destroy, P: Destroy> Pool<S, B, P> {
                     views_held: 0,
                 });
                 self.created_count += 1;
+                self.ensure_views(requests);
                 Some(slot)
             }
             Err(err) => {
@@ -526,8 +536,15 @@ impl<S: SlotSource, B: Destroy, P: Destroy> Pool<S, B, P> {
         PoolChange::Created
     }
     fn failed(&mut self, key: BufferKey) -> PoolChange {
-        // A view's import failing fails the buffer it views.
-        let key = BufferKey { view: 0, ..key };
+        // A view's import failing does not fail the buffer it views, which the child shows as before: views are
+        // refused from now on, and the ones already made stay until their buffer goes, so a committed one is still
+        // released.
+        if key.view != 0 {
+            if self.entries.iter().any(|e| e.key == BufferKey { view: 0, ..key }) {
+                self.views_refused = true;
+            }
+            return PoolChange::None;
+        }
         if let Some(i) = self.entries.iter().position(|e| e.key == key) {
             if let Some(params) = self.entries[i].params.take() {
                 params.destroy();
@@ -570,16 +587,18 @@ impl<S: SlotSource, B: Destroy, P: Destroy> Pool<S, B, P> {
         }
         PoolChange::Freed
     }
-    /// The corner patches' views of `slot`'s dmabuf, made at once on first use; None when they cannot be made (and
-    /// they are not tried again for this buffer).
-    fn views<R: CreateRequest<S, Buffer = B, Params = P>>(
-        &mut self,
-        requests: &mut R,
-        slot: FrameSlot,
-    ) -> Option<&[(P, B)]> {
-        let i = self.entries.iter().position(|e| e.slot == slot && e.buffer.is_some())?;
-        if self.entries[i].views.is_empty() {
-            let key = self.entries[i].key;
+    /// Makes the four views of every created buffer that has none, while views are wanted and not refused. One that
+    /// cannot be made refuses views for the pool: they are not tried again, every frame.
+    fn ensure_views<R: CreateRequest<S, Buffer = B, Params = P>>(&mut self, requests: &mut R) {
+        if !self.views_wanted || self.views_refused {
+            return;
+        }
+        for i in 0..self.entries.len() {
+            let e = &self.entries[i];
+            if e.buffer.is_none() || !e.views.is_empty() {
+                continue;
+            }
+            let (slot, key) = (e.slot, e.key);
             let mut views = Vec::with_capacity(4);
             for view in 1..=4 {
                 match requests.create_immed(&self.source, slot, BufferKey { view, ..key }, &self.chosen) {
@@ -592,11 +611,20 @@ impl<S: SlotSource, B: Destroy, P: Destroy> Pool<S, B, P> {
                     params.destroy();
                     buffer.destroy();
                 }
-                return None;
+                self.views_refused = true;
+                return;
             }
             self.entries[i].views = views;
         }
-        Some(&self.entries[i].views)
+    }
+    /// The corner patches' views of `slot`'s dmabuf, made when the buffer was (`ensure_views`); None when views are
+    /// refused or this buffer has none.
+    fn views(&self, slot: FrameSlot) -> Option<&[(P, B)]> {
+        if self.views_refused {
+            return None;
+        }
+        let e = self.entries.iter().find(|e| e.slot == slot && e.buffer.is_some())?;
+        (e.views.len() == 4).then_some(&e.views[..])
     }
     /// The views `mask` names (bit `corner index`) are committed to their patches with this frame.
     fn views_committed(&mut self, slot: FrameSlot, mask: u8) {
@@ -752,25 +780,39 @@ impl WlBufferPool {
             .as_ref()
             .filter(|b| b.is_alive())
     }
-    /// The four corner patches' own `wl_buffer`s of `slot`'s dmabuf, in `Corner::ALL` order; None when they could
-    /// not be made.
-    pub(crate) fn corner_views<D>(
-        &mut self,
-        globals: &Globals,
-        qh: &QueueHandle<D>,
-        slot: FrameSlot,
-    ) -> Option<[WlBuffer; 4]>
-    where
-        D: Dispatch<ZwpLinuxBufferParamsV1, BufferKey> + Dispatch<WlBuffer, BufferKey> + 'static,
-    {
-        let views = self.inner.views(&mut WaylandCreate { globals, qh }, slot)?;
-        let alive: Vec<WlBuffer> = views.iter().map(|(_, b)| b.clone()).filter(|b| b.is_alive()).collect();
-        alive.try_into().ok()
+    /// Asks for the corner patches' views: from now on every buffer gets four more `wl_buffer`s of its dmabuf as
+    /// soon as it exists.
+    pub(crate) fn want_corner_views(&mut self) {
+        self.inner.views_wanted = true;
+    }
+    /// True once views were refused (one could not be made or the compositor failed one).
+    pub(crate) fn corner_views_refused(&self) -> bool {
+        self.inner.views_refused
+    }
+    /// The four corner patches' own `wl_buffer`s of `slot`'s dmabuf, in `Corner::ALL` order; None when the buffer has
+    /// none, views are refused, or one is no longer alive.
+    pub(crate) fn corner_views(&self, slot: FrameSlot) -> Option<[WlBuffer; 4]> {
+        let views = self.inner.views(slot)?;
+        let alive = views.iter().all(|(_, b)| b.is_alive());
+        alive.then(|| std::array::from_fn(|i| views[i].1.clone()))
     }
     /// Marks the views `mask` names (bit `Corner::index`) as committed with `slot`'s frame.
     pub(crate) fn corner_views_committed(&mut self, slot: FrameSlot, mask: u8) {
         self.inner.views_committed(slot, mask);
     }
+}
+impl super::child::CornerViews for WlBufferPool {
+    fn views(&self, slot: FrameSlot) -> Option<[WlBuffer; 4]> {
+        self.corner_views(slot)
+    }
+    fn committed(&mut self, slot: FrameSlot, mask: u8) {
+        self.corner_views_committed(slot, mask);
+    }
+    fn refused(&self) -> bool {
+        self.corner_views_refused()
+    }
+}
+impl WlBufferPool {
     pub(crate) fn buffer_size(&self, slot: FrameSlot) -> (i32, i32) {
         self.inner
             .entries
@@ -792,6 +834,23 @@ impl WlBufferPool {
     /// Includes both resolved GPU paths when a device mismatch produced the last local failure.
     pub(crate) fn failure_reason(&self) -> Option<&str> {
         self.last_failure.as_deref()
+    }
+    /// Routes a compositor answer; a created buffer gets its corner views at once (`want_corner_views`), so the frame
+    /// that first shows it does not make them.
+    pub(crate) fn on_event_with<D>(
+        &mut self,
+        globals: &Globals,
+        qh: &QueueHandle<D>,
+        event: &PresentEvent,
+    ) -> PoolChange
+    where
+        D: Dispatch<ZwpLinuxBufferParamsV1, BufferKey> + Dispatch<WlBuffer, BufferKey> + 'static,
+    {
+        let change = self.on_event(event);
+        if change == PoolChange::Created {
+            self.inner.ensure_views(&mut WaylandCreate { globals, qh });
+        }
+        change
     }
     pub(crate) fn on_event(&mut self, event: &PresentEvent) -> PoolChange {
         match event {
@@ -930,6 +989,8 @@ mod tests {
         /// The keys of immediate creates (also in `keys`) and their buffers' destroy counts.
         immediate: Vec<BufferKey>,
         immediate_buffers: Vec<Rc<Cell<usize>>>,
+        /// Immediate creates past this many are refused.
+        immediate_limit: Option<usize>,
     }
     impl CreateRequest<FakeSlots> for Requests {
         type Buffer = FakeObject;
@@ -950,6 +1011,9 @@ mod tests {
             key: BufferKey,
             chosen: &Chosen,
         ) -> Result<(FakeObject, FakeObject), String> {
+            if self.immediate_limit.is_some_and(|limit| self.immediate.len() >= limit) {
+                return Err("immediate create refused".into());
+            }
             let params = self.create(source, slot, key, chosen)?;
             self.immediate.push(key);
             let buffer = FakeObject::default();
@@ -1158,18 +1222,44 @@ mod tests {
         assert!(matches!(p.acquire(&mut r, (900, 400)), Acquire::Ready(_)));
     }
 
-    #[test]
-    fn a_dmabuf_is_free_only_once_its_buffer_and_every_committed_view_are_released() {
+    /// A pool that wants views, one created buffer of (900, 400) with its views, and the views' keys.
+    fn with_views() -> (FakePool, Requests, FrameSlot, BufferKey, Vec<BufferKey>) {
         let (mut p, mut r) = (pool(true), Requests::default());
+        p.views_wanted = true;
         let slot = ready(&mut p, &mut r, (900, 400));
         let key = r.keys[0];
-        let before = r.immediate.len();
-        assert_eq!(p.views(&mut r, slot).map(<[_]>::len), Some(4));
-        let views: Vec<BufferKey> = r.immediate[before..].to_vec();
+        let views: Vec<BufferKey> = r
+            .immediate
+            .iter()
+            .copied()
+            .filter(|k| BufferKey { view: 0, ..*k } == key && k.view != 0)
+            .collect();
+        (p, r, slot, key, views)
+    }
+
+    #[test]
+    fn a_buffer_gets_its_views_when_it_is_created_and_once() {
+        let (mut p, mut r, slot, _, views) = with_views();
         assert_eq!(views.iter().map(|k| k.view).collect::<Vec<_>>(), vec![1, 2, 3, 4]);
-        assert!(views.iter().all(|k| BufferKey { view: 0, ..*k } == key));
-        p.views(&mut r, slot);
-        assert_eq!(r.immediate.len(), before + 4, "made once per buffer");
+        assert_eq!(p.views(slot).map(<[_]>::len), Some(4));
+        let made = r.immediate.len();
+        p.acquire(&mut r, (900, 400));
+        assert_eq!(
+            r.immediate.iter().filter(|k| views.contains(k)).count(),
+            4,
+            "made once per buffer"
+        );
+        assert!(r.immediate.len() >= made);
+        // A pool that wants none makes none.
+        let (mut q, mut s) = (pool(true), Requests::default());
+        let slot = ready(&mut q, &mut s, (900, 400));
+        assert!(q.views(slot).is_none());
+        assert!(s.immediate.iter().all(|k| k.view == 0));
+    }
+
+    #[test]
+    fn a_dmabuf_is_free_only_once_its_buffer_and_every_committed_view_are_released() {
+        let (mut p, mut r, slot, key, views) = with_views();
         p.submit(slot);
         p.views_committed(slot, 0b0101);
         assert_eq!(p.released(key), PoolChange::None, "two views still hold the dmabuf");
@@ -1185,22 +1275,78 @@ mod tests {
     }
 
     #[test]
-    fn views_that_cannot_be_made_are_none_and_a_failed_view_fails_its_buffer_with_its_views() {
-        let (mut p, mut r) = (pool(true), Requests::default());
-        let slot = ready(&mut p, &mut r, (900, 400));
-        r.refuse = true;
-        assert!(p.views(&mut r, slot).is_none());
-        r.refuse = false;
-        let before = r.immediate_buffers.len();
-        assert!(p.views(&mut r, slot).is_some());
-        let made: Vec<_> = r.immediate_buffers[before..].to_vec();
-        let view = *r.immediate.last().unwrap();
-        assert_eq!(p.failed(view), PoolChange::Failed);
+    fn a_retired_buffer_held_only_by_a_view_goes_at_that_views_release() {
+        let (mut p, mut r, slot, key, views) = with_views();
+        p.submit(slot);
+        p.views_committed(slot, 0b1000);
+        assert_eq!(p.released(key), PoolChange::None);
+        // A much smaller frame retires the (900, 400) buffer, now too large, while a view still holds it.
+        p.acquire(&mut r, (100, 100));
+        let e = p.entries.iter().find(|e| e.slot == slot).expect("held, so kept");
+        assert!(e.retire && e.held());
+        assert_eq!(p.released(views[3]), PoolChange::Freed);
         assert!(!p.entries.iter().any(|e| e.slot == slot));
+        assert!(p.source.freed.contains(&slot.id));
+    }
+
+    #[test]
+    fn buffers_held_only_by_views_make_the_pool_full() {
+        let (mut p, mut r) = (pool(false), Requests::default());
+        p.views_wanted = true;
+        let mut slots = Vec::new();
+        for _ in 0..MAX_BUFFERS {
+            let slot = ready(&mut p, &mut r, (900, 400));
+            p.submit(slot);
+            p.views_committed(slot, 0b0001);
+            slots.push(slot);
+        }
+        for e in p.entries.iter_mut() {
+            e.busy = false;
+        }
+        assert!(p.entries.iter().all(|e| !e.busy && e.held()));
+        assert_eq!(p.acquire(&mut r, (900, 400)), Acquire::Full);
+    }
+
+    #[test]
+    fn views_partly_made_are_destroyed_and_views_are_not_tried_again() {
+        let (mut p, mut r) = (pool(true), Requests::default());
+        p.views_wanted = true;
+        // The buffer's own create is not immediate; two of its views are made, the third refused.
+        r.immediate_limit = Some(2);
+        let slot = ready(&mut p, &mut r, (900, 400));
+        assert!(p.views_refused);
+        assert!(p.views(slot).is_none());
+        assert_eq!(r.immediate_buffers.len(), 2);
+        assert!(r.immediate_buffers.iter().all(|destroyed| destroyed.get() == 1));
+        r.immediate_limit = None;
+        let before = r.immediate.len();
+        p.acquire(&mut r, (900, 400));
+        p.acquire(&mut r, (900, 400));
         assert!(
-            made.iter().all(|destroyed| destroyed.get() == 1),
-            "the views go with their buffer"
+            r.immediate[before..].iter().all(|k| k.view == 0),
+            "no view is tried again"
         );
+        assert!(p.views(slot).is_none());
+    }
+
+    #[test]
+    fn a_failed_view_refuses_views_and_leaves_its_buffer_and_held_views_alone() {
+        let (mut p, mut r, slot, key, views) = with_views();
+        p.submit(slot);
+        p.views_committed(slot, 0b0011);
+        assert_eq!(p.failed(views[3]), PoolChange::None, "the buffer goes on");
+        assert!(p.views_refused);
+        assert!(p.views(slot).is_none());
+        let e = p.entries.iter().find(|e| e.slot == slot).unwrap();
+        assert!(e.buffer.is_some() && e.views.len() == 4);
+        assert_eq!(p.released(key), PoolChange::None);
+        assert_eq!(p.released(views[0]), PoolChange::None);
+        assert_eq!(p.released(views[1]), PoolChange::Freed);
+        assert_eq!(p.acquire(&mut r, (900, 400)), Acquire::Ready(slot));
+        // A failure for an unknown buffer's view refuses nothing.
+        let (mut q, _) = (pool(true), Requests::default());
+        assert_eq!(q.failed(views[0]), PoolChange::None);
+        assert!(!q.views_refused);
     }
 
     #[test]

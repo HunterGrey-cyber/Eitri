@@ -871,9 +871,13 @@ impl PaneIo for WaylandPane {
             );
         }
         child.continue_after(self.last_seq.get());
+        let mut pool = WlBufferPool::new(pool, chosen, self.id, viewporter);
+        if child.has_corners() {
+            pool.want_corner_views();
+        }
         *self.resources.borrow_mut() = Some(Resources {
             child,
-            pool: WlBufferPool::new(pool, chosen, self.id, viewporter),
+            pool,
             viewporter,
         });
         self.flush();
@@ -944,25 +948,22 @@ impl PaneIo for WaylandPane {
             .wl_buffer(slot)
             .cloned()
             .ok_or("the presentation buffer is gone")?;
-        // The corner patches show the same frame through views of its dmabuf, a `wl_buffer` of their own each.
-        let views = resources
-            .child
-            .has_corners()
-            .then(|| resources.pool.corner_views(&globals, &self.thread.queue_handle(), slot))
-            .flatten();
         resources.pool.submit(slot);
         if let Some(rgb) = area.cover_rgb() {
             resources.child.set_underlay_color(rgb);
         }
-        let seq = resources
-            .child
-            .present(&buffer, views.as_ref(), size, &geometry.placement, self.id);
+        // The corner patches show the same frame through views of its dmabuf, a `wl_buffer` of their own each.
+        let Resources { child, pool, .. } = &mut *resources;
+        let (seq, switched) = child.present_with_views(pool, slot, &buffer, size, &geometry.placement, self.id);
         if seq == 0 {
             return Err("the child refused the presentation buffer or geometry".into());
         }
-        resources
-            .pool
-            .corner_views_committed(slot, resources.child.corner_views_committed());
+        if switched {
+            eprintln!(
+                "[editor] subsurface: the corner patches' views of the editor's buffers could not be made; the \
+                 underlay shows the background colour in a rounded corner instead"
+            );
+        }
         self.underlay_changed(&area, &mut resources.child);
         debug_assert!(resources.child.has_buffer());
         self.last_seq.set(seq);
@@ -1060,7 +1061,12 @@ impl PaneIo for WaylandPane {
             }
         }
         if let Some(resources) = self.resources.borrow_mut().as_mut() {
-            resources.pool.on_event(event)
+            match self.thread.globals() {
+                Some(globals) => resources
+                    .pool
+                    .on_event_with(&globals, &self.thread.queue_handle(), event),
+                None => resources.pool.on_event(event),
+            }
         } else {
             if let PresentEvent::BufferCreated { buffer, .. } = event {
                 if buffer.is_alive() {

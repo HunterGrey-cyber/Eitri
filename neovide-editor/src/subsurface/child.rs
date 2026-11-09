@@ -26,7 +26,7 @@ use super::{
     geometry::{corner_patches, Corner, CornerPatch, FixedRect, Placement, Rect},
     types::{FrameData, Globals, PaneId},
 };
-use crate::dmabuf_target::Chosen;
+use crate::dmabuf_target::{Chosen, FrameSlot};
 
 /// The user data of the underlay's `wl_buffer`. Its one event, `release`, needs no answer: the buffer's pixel never
 /// changes, and a new colour is a new buffer.
@@ -80,8 +80,9 @@ pub(crate) trait ChildRequests {
     /// A patch's position (the child's state) and its viewport's destination (its own).
     fn corner_rect(&mut self, corner: Corner, rect: Rect);
     fn corner_source(&mut self, corner: Corner, source: FixedRect);
-    /// Attaches the child's own buffer to a patch and damages the buffer pixels `damage` names.
-    fn corner_attach(&mut self, corner: Corner, buffer: &WlBuffer, damage: Rect);
+    /// Attaches a view of the frame's buffer to a patch and damages the buffer pixels `damage` names; false (and
+    /// nothing sent) when the buffer or the patch is gone.
+    fn corner_attach(&mut self, corner: Corner, buffer: &WlBuffer, damage: Rect) -> bool;
     fn corner_attach_null(&mut self, corner: Corner);
     fn corner_commit(&mut self, corner: Corner);
     fn destroy_corners(&mut self);
@@ -553,14 +554,16 @@ where
                 .set_source(fixed(source.0), fixed(source.1), fixed(source.2), fixed(source.3));
         }
     }
-    fn corner_attach(&mut self, corner: Corner, buffer: &WlBuffer, damage: Rect) {
+    fn corner_attach(&mut self, corner: Corner, buffer: &WlBuffer, damage: Rect) -> bool {
         if !self.buffer_is_alive(buffer) {
-            return;
+            return false;
         }
-        if let Some(objects) = self.corner(corner) {
-            objects.surface.attach(Some(buffer), 0, 0);
-            objects.surface.damage_buffer(damage.0, damage.1, damage.2, damage.3);
-        }
+        let Some(objects) = self.corner(corner) else {
+            return false;
+        };
+        objects.surface.attach(Some(buffer), 0, 0);
+        objects.surface.damage_buffer(damage.0, damage.1, damage.2, damage.3);
+        true
     }
     fn corner_attach_null(&mut self, corner: Corner) {
         if let Some(objects) = self.corner(corner) {
@@ -577,6 +580,16 @@ where
             corners.into_iter().for_each(CornerObjects::destroy);
         }
     }
+}
+
+/// Where a frame's corner views come from: the buffer pool (`WlBufferPool`), or a test's stand-in.
+pub(crate) trait CornerViews {
+    /// The four views of `slot`'s buffer, in `Corner::ALL` order; None when it has none or views are refused.
+    fn views(&self, slot: FrameSlot) -> Option<[WlBuffer; 4]>;
+    /// The views `mask` names (bit `Corner::index`) are committed with `slot`'s frame.
+    fn committed(&mut self, slot: FrameSlot, mask: u8);
+    /// No views are made or handed out any more.
+    fn refused(&self) -> bool;
 }
 
 pub(crate) struct Child<R: ChildRequests> {
@@ -681,9 +694,50 @@ impl<R: ChildRequests> Child<R> {
         }
     }
 
+    /// Presents `buffer`, `slot`'s frame, with the corner patches' views of it from `source`, tells `source` which
+    /// views this frame committed, and once `source` refuses views and this frame has taken them all away, takes the
+    /// patches down for the underlay. Returns the sequence (0: nothing presented) and whether the patches went.
+    pub(crate) fn present_with_views(
+        &mut self,
+        source: &mut impl CornerViews,
+        slot: FrameSlot,
+        buffer: &WlBuffer,
+        buffer_size: (i32, i32),
+        placement: &Placement,
+        pane: PaneId,
+    ) -> (u64, bool) {
+        let views = if self.corners { source.views(slot) } else { None };
+        let seq = self.present(buffer, views.as_ref(), buffer_size, placement, pane);
+        if seq == 0 {
+            return (0, false);
+        }
+        source.committed(slot, self.corner_views);
+        let switched = source.refused() && self.corners_to_underlay();
+        (seq, switched)
+    }
+
     /// The corner patches exist (they may not be shown).
     pub(crate) fn has_corners(&self) -> bool {
         self.corners
+    }
+
+    /// Takes the corner patches down for the underlay, once a frame without views has taken every patch's view
+    /// away (the pool refused views). True when it did; the underlay then shows with the next change sent to it,
+    /// which `take_underlay_sent` reports.
+    pub(crate) fn corners_to_underlay(&mut self) -> bool {
+        if !self.corners || !self.is_ready() || self.corner_mapped.iter().any(|mapped| *mapped) {
+            return false;
+        }
+        self.requests.destroy_corners();
+        self.corners = false;
+        self.corner_sent = [None; 4];
+        self.corner_views = 0;
+        self.underlay = self.viewporter && self.requests.create_underlay();
+        if self.underlay {
+            self.requests.place_underlay_below_child();
+            self.show_underlay();
+        }
+        true
     }
 
     /// True once after a patch was wanted that only the child's next frame can show.
@@ -693,6 +747,7 @@ impl<R: ChildRequests> Child<R> {
 
     /// The views of the frame's buffer the last `present` committed to the patches (bit `Corner::index`), which the
     /// pool holds until each is released.
+    #[cfg(test)]
     pub(crate) fn corner_views_committed(&self) -> u8 {
         self.corner_views
     }
@@ -738,12 +793,18 @@ impl<R: ChildRequests> Child<R> {
                         changed = true;
                     }
                     self.corner_sent[i] = Some(patch);
+                    // The whole pixel the source lies in. Only an attach that was sent holds the view: one the pool
+                    // counted as committed but never was would keep its dmabuf forever.
+                    let (x, y, ..) = patch.source;
                     if let Some(buffer) = buffer {
-                        // The whole pixel the source lies in.
-                        let (x, y, ..) = patch.source;
-                        self.requests.corner_attach(corner, buffer, (x / 256, y / 256, 1, 1));
-                        self.corner_mapped[i] = true;
-                        self.corner_views |= 1 << i;
+                        if self.requests.corner_attach(corner, buffer, (x / 256, y / 256, 1, 1)) {
+                            self.corner_mapped[i] = true;
+                            self.corner_views |= 1 << i;
+                        } else if self.corner_mapped[i] {
+                            // It must not keep the previous frame's view either.
+                            self.requests.corner_attach_null(corner);
+                            self.corner_mapped[i] = false;
+                        }
                         changed = true;
                     }
                     if changed {
@@ -1073,6 +1134,8 @@ mod tests {
         refuse_buffer: bool,
         /// `create_corners` succeeds. Off, it records nothing.
         corners: bool,
+        /// A patch's attach finds its buffer or objects gone.
+        refuse_attach: bool,
     }
     impl ChildRequests for Recording {
         fn create_surface(&mut self) -> bool {
@@ -1194,8 +1257,12 @@ mod tests {
         fn corner_source(&mut self, corner: Corner, source: FixedRect) {
             self.sent.borrow_mut().push(CornerSource(corner, source));
         }
-        fn corner_attach(&mut self, corner: Corner, _: &WlBuffer, damage: Rect) {
+        fn corner_attach(&mut self, corner: Corner, _: &WlBuffer, damage: Rect) -> bool {
+            if self.refuse_attach {
+                return false;
+            }
             self.sent.borrow_mut().push(CornerAttach(corner, damage));
+            true
         }
         fn corner_attach_null(&mut self, corner: Corner) {
             self.sent.borrow_mut().push(CornerAttachNull(corner));
@@ -2239,6 +2306,124 @@ mod tests {
         let flush = p.without_underlay().with_underlay((0.0, 0.0), (7 + 801, 9 + 601));
         present(&mut child, &o.buffer, &flush, (1280, 1024));
         assert_eq!(child.corner_views_committed(), 0b0111);
+    }
+
+    #[test]
+    fn an_attach_that_was_not_sent_holds_no_view_and_drops_the_previous_one() {
+        let o = Objects::new();
+        let mut child = setup_with_corners(&o, true);
+        let p = underlay_placement((7, 9));
+        present(&mut child, &o.buffer, &p, (1280, 1024));
+        child.after_paint();
+        take(&child);
+        child.requests.refuse_attach = true;
+        present(&mut child, &o.buffer, &p, (1280, 1024));
+        assert_eq!(child.corner_views_committed(), 0, "no view the pool would wait for");
+        let sent = take(&child);
+        for corner in Corner::ALL {
+            assert!(
+                sent.contains(&CornerAttachNull(corner)),
+                "{corner:?} lets the previous view go"
+            );
+        }
+        assert_eq!(sent.last(), Some(&Commit));
+        // Never mapped: a refused attach maps nothing and holds nothing.
+        let mut fresh = setup_with_corners(&o, true);
+        fresh.requests.refuse_attach = true;
+        present(&mut fresh, &o.buffer, &p, (1280, 1024));
+        assert_eq!(fresh.corner_views_committed(), 0);
+        assert!(!take(&fresh)
+            .iter()
+            .any(|r| matches!(r, CornerAttach(..) | CornerAttachNull(_))));
+    }
+
+    /// The pool's side of `present_with_views`.
+    struct Views {
+        views: Option<[WlBuffer; 4]>,
+        committed: Vec<u8>,
+        refused: bool,
+    }
+    impl CornerViews for Views {
+        fn views(&self, _: FrameSlot) -> Option<[WlBuffer; 4]> {
+            if self.refused {
+                None
+            } else {
+                self.views.clone()
+            }
+        }
+        fn committed(&mut self, _: FrameSlot, mask: u8) {
+            self.committed.push(mask);
+        }
+        fn refused(&self) -> bool {
+            self.refused
+        }
+    }
+    const SLOT: FrameSlot = FrameSlot {
+        id: 0,
+        framebuffer: 0,
+        width: 1280,
+        height: 1024,
+    };
+
+    #[test]
+    fn present_with_views_tells_the_pool_what_it_committed_and_moves_to_the_underlay_once_refused() {
+        let o = Objects::new();
+        let mut child = Child::new(
+            Recording {
+                underlay: true,
+                corners: true,
+                ..Recording::default()
+            },
+            &o.parent,
+            &chosen(true),
+            true,
+        );
+        child.set_underlay_color(BACKGROUND);
+        let b = o.buffer.clone();
+        let mut source = Views {
+            views: Some([b.clone(), b.clone(), b.clone(), b.clone()]),
+            committed: vec![],
+            refused: false,
+        };
+        let p = underlay_placement((7, 9));
+        assert_eq!(
+            child.present_with_views(&mut source, SLOT, &o.buffer, (1280, 1024), &p, PaneId(3)),
+            (1, false)
+        );
+        assert_eq!(source.committed, vec![0b1111]);
+        child.after_paint();
+        take(&child);
+        // Views refused: this frame takes the patches away, then they go and the underlay comes.
+        source.refused = true;
+        assert_eq!(
+            child.present_with_views(&mut source, SLOT, &o.buffer, (1280, 1024), &p, PaneId(3)),
+            (2, true)
+        );
+        assert_eq!(source.committed, vec![0b1111, 0]);
+        let sent = take(&child);
+        let commit = sent.iter().position(|r| *r == Commit).unwrap();
+        let destroyed = sent.iter().position(|r| *r == DestroyCorners).unwrap();
+        assert!(
+            commit < destroyed,
+            "the null attaches are committed before the patches go: {sent:?}"
+        );
+        assert!(
+            sent[..commit]
+                .iter()
+                .filter(|r| matches!(r, CornerAttachNull(_)))
+                .count()
+                == 4
+        );
+        assert!(sent[destroyed..].contains(&CreateUnderlay) && sent.contains(&UnderlayCommit));
+        assert!(!child.has_corners() && child.has_underlay());
+        assert!(
+            child.take_underlay_sent(),
+            "the pane asks GDK for the parent commit that shows it"
+        );
+        // Afterwards no views are asked for or committed.
+        source.refused = false;
+        child.present_with_views(&mut source, SLOT, &o.buffer, (1280, 1024), &p, PaneId(3));
+        assert_eq!(source.committed.last(), Some(&0));
     }
 
     #[test]
