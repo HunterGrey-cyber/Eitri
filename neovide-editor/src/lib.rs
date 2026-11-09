@@ -167,7 +167,33 @@ pub(crate) enum RenderTarget {
     },
 }
 
-type RenderFn = Rc<dyn Fn(&GLArea, RenderTarget) -> glib::Propagation>;
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum RenderError {
+    SubmissionFailed,
+    Unavailable(String),
+}
+
+impl From<String> for RenderError {
+    fn from(reason: String) -> Self {
+        Self::Unavailable(reason)
+    }
+}
+
+impl From<&str> for RenderError {
+    fn from(reason: &str) -> Self {
+        Self::Unavailable(reason.to_owned())
+    }
+}
+
+type RenderFn = Rc<dyn Fn(&GLArea, RenderTarget) -> Result<(), RenderError>>;
+
+fn submission_failure(context_lost: bool) -> RenderError {
+    if context_lost {
+        RenderError::Unavailable("Skia's GPU context is lost".into())
+    } else {
+        RenderError::SubmissionFailed
+    }
+}
 
 fn current_target(widget: &GLArea) -> RenderTarget {
     let os_scale = f64::from(widget.scale_factor().max(1));
@@ -1966,16 +1992,20 @@ impl NeovideEditorPane {
             click.set_button(0);
             {
                 let live_state = live_state.clone();
-                let gl_area = gl_area.clone();
                 click.connect_pressed(move |gesture, _n_press, x, y| {
-                    mouse::handle_mouse_button(&live_state, &gl_area, gesture, x, y, true);
+                    let Some(widget) = gesture.widget().and_downcast::<GLArea>() else {
+                        return;
+                    };
+                    mouse::handle_mouse_button(&live_state, &widget, gesture, x, y, true);
                 });
             }
             {
                 let live_state = live_state.clone();
-                let gl_area = gl_area.clone();
                 click.connect_released(move |gesture, _n_press, x, y| {
-                    mouse::handle_mouse_button(&live_state, &gl_area, gesture, x, y, false);
+                    let Some(widget) = gesture.widget().and_downcast::<GLArea>() else {
+                        return;
+                    };
+                    mouse::handle_mouse_button(&live_state, &widget, gesture, x, y, false);
                 });
             }
             gl_area.add_controller(click);
@@ -2064,10 +2094,17 @@ impl NeovideEditorPane {
 
                 let mut state_slot = skia_state.borrow_mut();
 
+                if state_slot
+                    .as_mut()
+                    .is_some_and(|state| state.gr_context.is_device_lost())
+                {
+                    state_slot.take().unwrap().release(false);
+                    return Err(submission_failure(true));
+                }
                 if state_slot.is_none() {
                     let interface = make_gl_interface();
                     let Some(gr_context) = direct_contexts::make_gl(interface, None) else {
-                        return glib::Propagation::Proceed;
+                        return Err("Skia could not create a render target".into());
                     };
                     let width = (f64::from(widget.width()) * shared.device_scale()).round() as i32;
                     let height = (f64::from(widget.height()) * shared.device_scale()).round() as i32;
@@ -2085,7 +2122,7 @@ impl NeovideEditorPane {
                 }
 
                 let Some(state) = state_slot.as_mut() else {
-                    return glib::Propagation::Proceed;
+                    return Err("Skia could not create a render target".into());
                 };
                 // Must come before anything draws this frame: GTK shares this GL context with us
                 // and rebinds textures behind Skia's back (on a resize in particular), which makes
@@ -2120,7 +2157,7 @@ impl NeovideEditorPane {
                         None,
                     );
                     if surface.is_none() {
-                        return glib::Propagation::Proceed;
+                        return Err("Skia could not create a render target".into());
                     }
                     state.render_surface = None;
                     surface
@@ -2131,7 +2168,7 @@ impl NeovideEditorPane {
                 };
 
                 let Some(gtk_surface) = separate_surface.as_mut().or(state.gtk_surface.as_mut()) else {
-                    return glib::Propagation::Proceed;
+                    return Err("Skia could not create a render target".into());
                 };
 
                 let (fb_w, fb_h) = fb_size.get();
@@ -2550,12 +2587,6 @@ impl NeovideEditorPane {
                 }
                 drop(live);
 
-                match tick_wanted_after_render {
-                    Some(true) => tick_driver_for_render.kick(),
-                    Some(false) => tick_driver_for_render.stop_after_render(),
-                    None => {}
-                }
-
                 if let Some(message) = start_failed_message {
                     if let Some(cb) = start_failed_callback_for_render.borrow().as_ref() {
                         cb(&message);
@@ -2588,13 +2619,29 @@ impl NeovideEditorPane {
                     );
                 }
                 if let Err(error) = state.gr_context.flush_and_submit() {
-                    // The frame is lost; the next render draws a whole one again. Said once a process,
-                    // since a context that fails once tends to fail every frame.
+                    // A failed submission cannot be presented, even when animation has settled.
                     static SAID: std::sync::Once = std::sync::Once::new();
                     SAID.call_once(|| eprintln!("[editor] skia flush failed: {error:?}"));
+                    let context_lost = state.gr_context.is_device_lost();
+                    if context_lost {
+                        // Abandon before dropping surfaces; the GTK fallback must create fresh Skia state.
+                        drop(separate_surface);
+                        state_slot.take().unwrap().release(false);
+                    }
+                    if let LiveState::Ready(session) = &*live_state.borrow() {
+                        session.wants_frame.set(true);
+                    }
+                    failed_painted_for_render.set(false);
+                    tick_driver_for_render.kick();
+                    return Err(submission_failure(context_lost));
                 }
 
-                glib::Propagation::Stop
+                match tick_wanted_after_render {
+                    Some(true) => tick_driver_for_render.kick(),
+                    Some(false) => tick_driver_for_render.stop_after_render(),
+                    None => {}
+                }
+                Ok(())
             })
         };
         {
@@ -2607,12 +2654,14 @@ impl NeovideEditorPane {
                     log.begin_render();
                 }
                 let result = render(widget, current_target(widget));
-                if result == glib::Propagation::Stop {
+                if result.is_ok() {
                     if let Some(log) = log {
                         log.commit(0);
                     }
+                    glib::Propagation::Stop
+                } else {
+                    glib::Propagation::Proceed
                 }
-                result
             });
         }
 

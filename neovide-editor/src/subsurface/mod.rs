@@ -32,7 +32,7 @@ use thread::ThreadState;
 
 use crate::dmabuf_target::{DmabufPool, ModifierSource};
 use crate::editor_area::{EditorGlArea, PresentationCounts};
-use crate::{FrameReason, RenderFn, RenderTarget};
+use crate::{FrameReason, RenderError, RenderFn, RenderTarget};
 
 pub(crate) fn subsurface_target(
     placement: &Placement,
@@ -119,7 +119,7 @@ trait PaneIo {
     /// None while the parent/globals are unavailable; true when a new child replaced the old one.
     fn setup(&self) -> Result<Option<bool>, String>;
     fn geometry(&self) -> Option<Geometry>;
-    fn render(&self, geometry: Geometry, transaction: bool) -> Result<Option<u64>, String>;
+    fn render(&self, geometry: Geometry, transaction: bool) -> Result<Option<u64>, RenderError>;
     fn move_to(&self, geometry: Geometry);
     fn queue_transaction(&self);
     fn queue_render(&self);
@@ -145,6 +145,7 @@ pub(crate) struct SubsurfacePane {
     switched: Cell<bool>,
     again: Cell<bool>,
     blocked: Cell<bool>,
+    submission_failures: Cell<u8>,
     last: Cell<Option<Geometry>>,
     destroy_pending: Cell<bool>,
     /// A hide asked for while a draw is running; the value is whether the hole was open when it was asked.
@@ -170,6 +171,7 @@ impl SubsurfacePane {
             switched: Cell::new(false),
             again: Cell::new(false),
             blocked: Cell::new(false),
+            submission_failures: Cell::new(0),
             last: Cell::new(None),
             destroy_pending: Cell::new(false),
             hide_pending: Cell::new(None),
@@ -501,6 +503,7 @@ impl SubsurfacePane {
         }
         match self.io.render(geometry, transaction) {
             Ok(Some(seq)) if self.is_active() && self.mapped.get() => {
+                self.submission_failures.set(0);
                 self.io.count(|c| c.child_commits += 1);
                 self.pending_seq.set(Some(seq));
                 if let Some(log) = &self.log {
@@ -535,7 +538,17 @@ impl SubsurfacePane {
                     self.io.hole_changed();
                 }
             }
-            Err(reason) => self.fall_back(&reason),
+            Err(RenderError::SubmissionFailed) => {
+                let failures = self.submission_failures.get() + 1;
+                self.submission_failures.set(failures);
+                if failures >= 3 {
+                    self.fall_back("Skia failed to submit three consecutive frames");
+                } else {
+                    // No new commit means no callback will wake a retry. Keep a layout pending instead.
+                    self.geometry_changed();
+                }
+            }
+            Err(RenderError::Unavailable(reason)) => self.fall_back(&reason),
         }
         self.drawing.set(false);
         if let Some(hole_was_open) = self.hide_pending.take() {
@@ -907,7 +920,7 @@ impl PaneIo for WaylandPane {
         })
     }
 
-    fn render(&self, geometry: Geometry, transaction: bool) -> Result<Option<u64>, String> {
+    fn render(&self, geometry: Geometry, transaction: bool) -> Result<Option<u64>, RenderError> {
         #[cfg(feature = "fault-injection")]
         if log::fault_requested(log::Fault::Alloc) {
             return Err("injected buffer allocation failure".into());
@@ -927,7 +940,8 @@ impl PaneIo for WaylandPane {
                 .pool
                 .failure_reason()
                 .unwrap_or("a presentation buffer failed")
-                .to_owned());
+                .to_owned()
+                .into());
         }
         let Acquire::Ready(slot) = slot else {
             self.flush();
@@ -935,13 +949,10 @@ impl PaneIo for WaylandPane {
         };
         debug_assert!(resources.pool.created_count() > 0);
         let size = resources.pool.buffer_size(slot);
-        let result = (self.render)(
+        (self.render)(
             area.upcast_ref(),
             subsurface_target(&geometry.placement, size, slot.framebuffer, geometry.scale),
-        );
-        if result != glib::Propagation::Stop {
-            return Err("Skia could not render the presentation buffer".into());
-        }
+        )?;
         self.current()?;
         let buffer = resources
             .pool
@@ -1092,6 +1103,8 @@ mod tests {
         seq: Cell<u64>,
         transaction: Cell<bool>,
         buffers: Cell<bool>,
+        submission_failed: Cell<bool>,
+        context_lost: Cell<bool>,
         counts: Cell<PresentationCounts>,
     }
 
@@ -1117,7 +1130,7 @@ mod tests {
         fn geometry(&self) -> Option<Geometry> {
             self.placeable.get().then(|| self.geometry.get())
         }
-        fn render(&self, _: Geometry, transaction: bool) -> Result<Option<u64>, String> {
+        fn render(&self, _: Geometry, transaction: bool) -> Result<Option<u64>, RenderError> {
             if !self.ready.get() {
                 return Ok(None);
             }
@@ -1126,6 +1139,9 @@ mod tests {
                 self.transaction.set(true);
             }
             self.record("render");
+            if self.submission_failed.get() {
+                return Err(crate::submission_failure(self.context_lost.get()));
+            }
             self.record("attach");
             self.record("commit");
             self.seq.set(self.seq.get() + 1);
@@ -1193,6 +1209,8 @@ mod tests {
             seq: Cell::new(0),
             transaction: Cell::new(false),
             buffers: Cell::new(false),
+            submission_failed: Cell::new(false),
+            context_lost: Cell::new(false),
             counts: Cell::new(PresentationCounts::default()),
         });
         test(SubsurfacePane::with_io(Box::new(io.clone())), io);
@@ -1207,6 +1225,100 @@ mod tests {
         io.take();
         pane.after_paint();
         io.take();
+    }
+
+    #[test]
+    fn a_failed_final_submission_retries_without_committing_or_waiting_for_a_callback() {
+        with_pane(|pane, io| {
+            open(&pane, &io);
+            pane.pacer.borrow_mut().frame_done(1, Instant::now());
+            io.submission_failed.set(true);
+            pane.request(FrameReason::Batch);
+            assert_eq!(io.take(), ["render", "queue_draw"]);
+            assert_eq!(io.counts.get().child_commits, 1);
+            assert!(!pane.pacer.borrow().callback_pending());
+            assert!(
+                pane.transaction.get(),
+                "the retry is still pending after the final animation frame"
+            );
+
+            io.submission_failed.set(false);
+            pane.layout();
+            assert_eq!(io.take(), ["set_sync", "render", "attach", "commit", "hole_changed"]);
+            assert_eq!(io.counts.get().child_commits, 2);
+            assert!(!pane.transaction.get());
+            assert!(pane.pacer.borrow().callback_pending());
+            assert!(pane.is_active());
+        });
+    }
+
+    #[test]
+    fn three_failed_submissions_fall_back_once_and_success_resets_the_count() {
+        with_pane(|pane, io| {
+            open(&pane, &io);
+            for _ in 0..2 {
+                io.submission_failed.set(true);
+                pane.geometry_changed();
+                pane.layout();
+                assert!(pane.is_active());
+                assert!(!io.take().contains(&"commit"));
+            }
+            io.submission_failed.set(false);
+            pane.layout();
+            assert!(io.take().contains(&"commit"));
+            io.submission_failed.set(true);
+            for attempt in 1..=3 {
+                pane.geometry_changed();
+                pane.layout();
+                assert_eq!(pane.is_active(), attempt < 3);
+                let calls = io.take();
+                assert!(!calls.contains(&"attach"));
+                assert!(!calls.contains(&"commit"));
+            }
+            assert_eq!(io.counts.get().fallbacks, 1);
+            assert_eq!(pane.hole(), Hole::Closed);
+            pane.layout();
+            assert!(io.take().is_empty());
+            pane.after_paint();
+            assert!(io.take().contains(&"destroy_buffers"));
+        });
+    }
+
+    #[test]
+    fn a_failed_opening_keeps_the_cover_and_retries_on_the_next_layout() {
+        with_pane(|pane, io| {
+            pane.map();
+            pane.globals_ready();
+            io.ready.set(true);
+            io.submission_failed.set(true);
+            io.take();
+            pane.layout();
+            assert_eq!(io.take(), ["set_sync", "render", "queue_draw"]);
+            assert_eq!(pane.hole(), Hole::Closed);
+            assert_eq!(io.counts.get().child_commits, 0);
+            assert!(pane.transaction.get());
+            io.submission_failed.set(false);
+            pane.layout();
+            assert_eq!(pane.hole(), Hole::Open);
+            assert_eq!(io.counts.get().child_commits, 1);
+        });
+    }
+
+    #[test]
+    fn a_lost_skia_context_falls_back_without_retrying_it() {
+        with_pane(|pane, io| {
+            open(&pane, &io);
+            io.submission_failed.set(true);
+            io.context_lost.set(true);
+            pane.geometry_changed();
+            pane.layout();
+            assert!(!pane.is_active());
+            assert_eq!(io.counts.get().fallbacks, 1);
+            assert_eq!(io.counts.get().child_commits, 1);
+            assert!(!io.take().contains(&"commit"));
+            pane.layout();
+            assert!(io.take().is_empty());
+        });
     }
 
     #[test]

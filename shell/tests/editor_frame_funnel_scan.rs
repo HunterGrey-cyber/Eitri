@@ -48,3 +48,53 @@ fn the_fail_variable_is_read_only_under_the_fault_injection_feature() {
         .text
         .contains("editor-fault-injection = [\"neovide-editor/fault-injection\"]"));
 }
+
+#[test]
+fn click_callbacks_get_the_area_from_the_gesture_without_capturing_it() {
+    use eitri_core::source_scan::{braced, code_only, read_required, word_ends};
+    let source = read_required("neovide-editor/src/lib.rs");
+    let code = code_only(&source.text);
+    for signal in ["connect_pressed", "connect_released"] {
+        let ends = word_ends(&code, signal);
+        assert_eq!(ends.len(), 1, "expected one {signal} callback");
+        let end = ends[0];
+        let open = end + code[end..].find('{').unwrap();
+        let body = braced(&code, open);
+        assert!(
+            word_ends(body, "gl_area").is_empty(),
+            "{signal} captures the area's strong reference"
+        );
+        assert!(body.split_whitespace().collect::<String>().contains("gesture.widget()"));
+    }
+}
+
+#[test]
+fn submission_errors_leave_the_render_before_the_tick_can_stop() {
+    use eitri_core::source_scan::{braced, code_only, read_required, word_ends};
+    let source = read_required("neovide-editor/src/lib.rs");
+    let code = code_only(&source.text);
+    let end = word_ends(&code, "flush_and_submit")[0];
+    let open = end + code[end..].find('{').unwrap();
+    let failure = braced(&code, open);
+    assert!(
+        !word_ends(failure, "return").is_empty(),
+        "a failed submission must leave the render"
+    );
+    assert!(
+        !word_ends(failure, "Err").is_empty(),
+        "a failed submission must report failure"
+    );
+    assert!(word_ends(&code[..end], "stop_after_render").is_empty());
+
+    let source = read_required("neovide-editor/src/subsurface/mod.rs");
+    let compact: String = code_only(&source.text).split_whitespace().collect();
+    let start = compact
+        .find("(self.render)(")
+        .expect("the subsurface must call the renderer");
+    let end = start + compact[start..].find(';').unwrap();
+    assert!(
+        compact[start..end].ends_with(")?"),
+        "propagate errors before submitting the buffer"
+    );
+    assert!(end < compact.find("resources.pool.submit(slot)").unwrap());
+}
