@@ -132,6 +132,11 @@ harness = false
 name = "followed_connect"
 harness = false
 
+# The binary's `started` line on a detached start's descriptor; a plain `main` that runs it on the test's own Xvfb.
+[[test]]
+name = "launch_started_line"
+harness = false
+
 # Guards the rule that every test opening a display starts its own
 # display (2026-09-29): reads `tests/` here and in `neovide-editor` as text, and fails on a file that
 # opens a display without `tests/support/own_x_server.rs`. A plain #[test] harness that opens nothing,

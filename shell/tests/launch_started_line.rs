@@ -1,7 +1,12 @@
 //! The binary says `started` on a detached start's descriptor before anything else it does, so the launcher can tell
 //! a window that ran from a start that never reached it (a scope the service manager refused).
+//!
+//! A plain `main` (`harness = false`): `own_display_scan` requires a test that starts the product binary to isolate its
+//! display first, so the binary runs against this test's own `Xvfb` and no session bus, even though `--version` opens
+//! neither.
 
-#![cfg(target_os = "linux")]
+#[path = "support/own_x_server.rs"]
+mod own_x_server;
 
 use std::io::Read;
 use std::os::fd::AsRawFd;
@@ -34,9 +39,14 @@ fn said_on_three(args: &[&str]) -> (std::process::Output, String) {
     (out, said)
 }
 
-#[test]
 fn the_binary_says_started_on_the_launchers_descriptor_first() {
     let (out, said) = said_on_three(&["--version"]);
     assert!(out.status.success(), "{out:?}");
     assert_eq!(said, "started\n");
+}
+
+fn main() {
+    let _server = own_x_server::isolate("launch_started_line", "640x480x24");
+    the_binary_says_started_on_the_launchers_descriptor_first();
+    println!("test the_binary_says_started_on_the_launchers_descriptor_first ... ok");
 }
