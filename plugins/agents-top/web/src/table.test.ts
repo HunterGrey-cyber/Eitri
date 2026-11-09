@@ -255,3 +255,26 @@ it("an_age_in_hours_redraws_once_a_minute", () => {
     vi.useRealTimers();
   }
 });
+
+it("a_new_tab_shows_no_age_keeps_no_timer_and_writes_nothing_while_a_used_one_ticks", () => {
+  vi.useFakeTimers();
+  try {
+    vi.setSystemTime(T0);
+    // The panel's empty tab is a `new` row: no prompt yet, so no age and nothing for the clock to move.
+    const page = idleSetup([row("n", { state: "new", since: T0 - 117_000 })]);
+    expect(ageOf(page.root, "n")).toBe("");
+    expect(vi.getTimerCount()).toBe(0);
+    page.writes();
+    vi.advanceTimersByTime(10_000);
+    expect(page.writes()).toBe(0);
+    // A used tab beside it still ticks each second.
+    page.apply("agents.row", row("a", { since: T0 + 10_000 - 5_400 }));
+    expect(ageOf(page.root, "a")).toBe("5s");
+    expect(vi.getTimerCount()).toBe(1);
+    vi.advanceTimersByTime(600);
+    expect(ageOf(page.root, "a")).toBe("6s");
+    expect(ageOf(page.root, "n")).toBe("");
+  } finally {
+    vi.useRealTimers();
+  }
+});

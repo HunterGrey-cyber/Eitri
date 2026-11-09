@@ -123,9 +123,14 @@ export function createTable(root: HTMLElement, kit: Kit, select?: (key: string) 
       tr.classList.toggle("visited", visited.has(row.key));
       setAttr(tr, "aria-label", `${row.label}${visited.has(row.key) ? ", visited" : ""}${round?.current === row.key ? ", current round stop" : ""}`);
       const marker = round?.current === row.key ? "▸" : visited.has(row.key) ? "✓" : " ";
-      const at = now + ageChangesIn(row.since, now);
-      if (next === null || at < next) next = at;
-      const values = [`${marker}${kit.glyph(row)} ${kit.word(row)}`, age(row.since, now), row.project.name,
+      // A tab with no prompt yet has no age worth showing (Strips shows none either), and it would keep the clock
+      // running with no agent at all.
+      const aged = row.state !== "new";
+      if (aged) {
+        const at = now + ageChangesIn(row.since, now);
+        if (next === null || at < next) next = at;
+      }
+      const values = [`${marker}${kit.glyph(row)} ${kit.word(row)}`, aged ? age(row.since, now) : "", row.project.name,
         row.window.name, String(row.number), row.agent, row.mode, row.tool ?? "", background(row), row.label];
       values.forEach((value, i) => {
         const cell = tr.cells[i];
