@@ -84,7 +84,30 @@ pub(crate) fn stop_linked_child(slot: &Mutex<Option<JsonRpcLink>>) {
     }
 }
 
-/// A child that ended on its own, whose notice waits a short while for the last of its stderr: the end of
+/// Ends a failed connection off the caller's thread. The ended link comes back with its stderr tail.
+pub(crate) fn stop_failed_link(slot: &Mutex<Option<JsonRpcLink>>) -> Option<std::thread::JoinHandle<JsonRpcLink>> {
+    let mut link = lock(slot).take()?;
+    Some(std::thread::spawn(move || {
+        link.finish(SIDECAR_EXIT_GRACE);
+        link
+    }))
+}
+
+/// Restores the ended link only after shutdown completes; polling never waits for the worker.
+pub(crate) fn finish_failed_stop(
+    worker: &mut Option<std::thread::JoinHandle<JsonRpcLink>>,
+    slot: &Mutex<Option<JsonRpcLink>>,
+) -> bool {
+    if worker.as_ref().is_some_and(|worker| !worker.is_finished()) {
+        return false;
+    }
+    if let Some(worker) = worker.take() {
+        *lock(slot) = worker.join().ok();
+    }
+    true
+}
+
+/// An ended output stream, whose notice waits a short while for the last of stderr: the end of
 /// the output stream can be read a moment before stderr says why the child went. The provider keeps it in
 /// its state and finishes it from `pump`, so nothing sleeps while holding that state.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -152,6 +175,81 @@ fn current_tail(link: &Mutex<Option<JsonRpcLink>>) -> String {
         .as_ref()
         .map(|l| notice_tail(&l.stderr_tail()))
         .unwrap_or_default()
+}
+
+#[cfg(test)]
+pub(crate) mod test_support {
+    use super::*;
+    use std::path::PathBuf;
+
+    pub struct Scratch(pub PathBuf);
+    impl Scratch {
+        pub fn new() -> Self {
+            let path = std::env::temp_dir().join(format!("eitri-process-test-{}", uuid::Uuid::new_v4()));
+            crate::private_fs::create_private_dir_all(&path, &path).unwrap();
+            Self(path)
+        }
+
+        pub fn script(&self, body: &str) -> PathBuf {
+            use std::os::unix::fs::PermissionsExt;
+            let path = self.0.join("stand-in");
+            std::fs::write(&path, format!("#!/bin/sh\n{body}\n")).unwrap();
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o700)).unwrap();
+            path
+        }
+
+        pub fn link(&self, script: &str) -> JsonRpcLink {
+            JsonRpcLink::spawn(crate::jsonrpc_link::LinkSpec {
+                program: PathBuf::from("/bin/sh"),
+                args: vec![
+                    "-c".into(),
+                    script.into(),
+                    "stand-in".into(),
+                    self.0.clone().into_os_string(),
+                ],
+                cwd: self.0.clone(),
+                framing: crate::jsonrpc_link::Framing::WithJsonrpcMember,
+                env: Vec::new(),
+                env_remove: Vec::new(),
+                over_cap: crate::providers::acp::provider::over_cap_reply,
+            })
+            .unwrap()
+        }
+    }
+    impl Drop for Scratch {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    pub fn wait_for(mut ready: impl FnMut() -> bool) {
+        let deadline = Instant::now() + Duration::from_secs(20);
+        while !ready() {
+            assert!(Instant::now() < deadline, "stand-in did not reach the expected state");
+            std::thread::sleep(Duration::from_millis(5));
+        }
+    }
+
+    pub fn read_pid(path: &std::path::Path) -> u32 {
+        let mut pid = None;
+        wait_for(|| {
+            pid = std::fs::read_to_string(path).ok().and_then(|s| s.trim().parse().ok());
+            pid.is_some()
+        });
+        pid.unwrap()
+    }
+
+    #[cfg(target_os = "linux")]
+    pub fn running(pid: u32) -> bool {
+        std::fs::read_to_string(format!("/proc/{pid}/stat"))
+            .ok()
+            .and_then(|s| {
+                s.rsplit(')')
+                    .next()
+                    .map(|s| !matches!(s.trim_start().chars().next(), Some('Z' | 'X')))
+            })
+            .unwrap_or(false)
+    }
 }
 
 #[cfg(test)]

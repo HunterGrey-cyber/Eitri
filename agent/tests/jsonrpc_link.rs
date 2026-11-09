@@ -91,7 +91,7 @@ fn bare_framing_omits_the_jsonrpc_member() {
         ]),
     );
     let ping = link.request("ping", json!({}));
-    link.notify("initialized", Value::Null);
+    let _ = link.notify("initialized", Value::Null);
     link.respond(json!("srv-1"), json!({"ok": true}));
     assert_eq!(ping.wait(soon()), Ok(json!({"pong": true})));
 }
@@ -391,7 +391,7 @@ fn writer_never_blocks_the_caller() {
         .expect("three calibration runs");
     let started = Instant::now();
     for _ in 0..1000 {
-        link.notify("noise", json!({"filler": filler}));
+        let _ = link.notify("noise", json!({"filler": filler}));
     }
     // The queue holds about 1000 lines and a pipe's worth: far more than that is refused, not waited on.
     let mut refused = 0;

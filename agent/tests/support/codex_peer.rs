@@ -334,7 +334,7 @@ impl Peer {
                 serde_json::to_value(InitializeParams::eitri(env!("CARGO_PKG_VERSION"))).expect("params"),
             )
             .expect("initialize");
-        self.link.notify(method::INITIALIZED, Value::Null);
+        let _ = self.link.notify(method::INITIALIZED, Value::Null);
         init
     }
 
@@ -358,7 +358,7 @@ impl Peer {
                             self.link.respond(req.id.clone(), answer);
                         }
                     } else {
-                        self.link.respond_error(req.id.clone(), -32601, "method not found");
+                        let _ = self.link.respond_error(req.id.clone(), -32601, "method not found");
                     }
                     self.requests.push(req);
                 }

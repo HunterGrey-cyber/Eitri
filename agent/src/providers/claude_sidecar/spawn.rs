@@ -263,6 +263,15 @@ impl Drain {
     }
 }
 
+impl Drop for Drain {
+    fn drop(&mut self) {
+        self.stop.raise();
+        if let Some(thread) = self.thread.take() {
+            let _ = thread.join();
+        }
+    }
+}
+
 fn drain(
     mut pipe: File,
     mut partial: Vec<u8>,
@@ -1685,8 +1694,7 @@ fn spawn_resolved(
     let mut child = command.spawn()?;
     let (Some(stdin), Some(stdout), Some(stderr)) = (child.stdin.take(), child.stdout.take(), child.stderr.take())
     else {
-        let _ = child.kill();
-        let _ = child.wait();
+        let _ = stop_child(&mut child, Duration::ZERO);
         return Err(std::io::Error::other("the sidecar's pipes were not created"));
     };
     let stdin_keepalive = Some(File::from(OwnedFd::from(stdin)));
@@ -1730,8 +1738,12 @@ fn spawn_resolved(
         // ever binds, so the process is simply gone -- waiting out the remaining retries would turn
         // an immediate, fully-explained failure into a multi-second silent timeout. This is exactly
         // how a real CLI-version refusal used to reach the UI as `did not bind ... within 1000ms`.
-        if let Ok(Some(status)) = child.try_wait() {
+        if matches!(
+            crate::jsonrpc_link::child_state(child.id()),
+            crate::jsonrpc_link::ChildState::Exited
+        ) {
             drop(stdin_keepalive);
+            let status = stop_child(&mut child, Duration::ZERO)?;
             // The drain threads may still be flushing the final lines the child wrote on its way
             // out; those lines are the entire diagnosis, so give them a moment to land rather than
             // reporting an empty cause.
@@ -1751,8 +1763,8 @@ fn spawn_resolved(
     // Still running but never bound -- clean up rather than leaking a half-started process, then
     // report the failure with whatever it managed to say for itself.
     drop(stdin_keepalive);
-    let _ = child.kill();
-    let _ = child.wait();
+    let _ = stop_child(&mut child, Duration::ZERO);
+    wait_for_stderr_end(&stderr_tail, STDERR_END_WAIT);
     Err(startup_failure(
         std::io::ErrorKind::TimedOut,
         &bind_timeout_summary(&socket_path, SIDECAR_BIND_BUDGET),
@@ -1928,6 +1940,62 @@ mod tests {
 
     /// An explicit artifact wins over everything, including an explicit checkout.
     ///
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn failed_starts_stop_descendants_whether_the_leader_hangs_or_exits() {
+        use crate::external_link::test_support::{read_pid, running, wait_for, Scratch};
+        // A fresh test process has no state-directory redirect installed by other unit tests.
+        const CHILD: &str = "EITRI_PROCESS_TEST_CHILD";
+        if std::env::var_os(CHILD).is_none() {
+            let test = "providers::claude_sidecar::spawn::tests::failed_starts_stop_descendants_whether_the_leader_hangs_or_exits";
+            let output = Command::new(std::env::current_exe().unwrap())
+                .args([test, "--exact", "--nocapture"])
+                .env(CHILD, "1")
+                .output()
+                .unwrap();
+            let stdout = String::from_utf8_lossy(&output.stdout);
+            assert!(
+                output.status.success() && stdout.contains("1 passed"),
+                "isolated startup test failed: {stdout}\n{}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            return;
+        }
+        for ending in ["wait", "exit 7"] {
+            let scratch = Scratch::new();
+            let program = scratch.script(&format!(
+                r#"cd "$(dirname "$0")"
+                sleep 30 & echo $! > helper
+                {ending}"#
+            ));
+            let result = spawn_resolved(
+                &uuid::Uuid::new_v4().to_string(),
+                "stand-in".into(),
+                Vec::new(),
+                Path::new("/bin/sh"),
+                &[program],
+            );
+            assert!(result.is_err(), "the stand-in never binds");
+            assert!(
+                scratch.0.join("helper").exists(),
+                "stand-in did not start: {:?}",
+                result.as_ref().err()
+            );
+            let helper = read_pid(&scratch.0.join("helper"));
+            let deadline = std::time::Instant::now() + Duration::from_secs(5);
+            while running(helper) && std::time::Instant::now() < deadline {
+                std::thread::sleep(Duration::from_millis(5));
+            }
+            let survived = running(helper);
+            if survived {
+                // SAFETY: this is the sleep process started by the test's wrapper.
+                unsafe { libc::kill(helper as libc::pid_t, libc::SIGKILL) };
+            }
+            assert!(!survived, "startup failure left its helper running ({ending})");
+            wait_for(|| !running(helper));
+        }
+    }
+
     /// The precedence matters more than it looks: these two overrides select DIFFERENT SHAPES, not
     /// two spellings of one, so a wrong order is not a tie-break -- it silently runs `node` out of a
     /// tree when someone asked for a binary, or the reverse. Resolution takes its inputs as

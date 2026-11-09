@@ -176,6 +176,11 @@ struct PendingSetting {
     deadline: Instant,
 }
 
+enum AutomaticReply {
+    Result(Value, Value),
+    MethodNotFound(Value),
+}
+
 #[derive(Default)]
 struct State {
     session_id: Option<String>,
@@ -197,6 +202,9 @@ struct State {
     /// Cards waiting for an answer, by permission id, in the order they were drawn.
     cards: Vec<(String, WaitingCard)>,
     next_card: u64,
+    pending_replies: VecDeque<AutomaticReply>,
+    pending_cancel: bool,
+    write_deadline: Option<Instant>,
     /// Rows Eitri added for requests it answered, for their ids.
     next_answered_row: u64,
     seen_unknown: HashSet<String>,
@@ -214,9 +222,11 @@ struct State {
     replaying: bool,
     /// The loaded session's history, until the host takes it. Never pumped.
     history: Vec<AgentDomainEvent>,
-    /// The child ended on its own and its notice waits for the last of its stderr: the reason the link
-    /// gave, and when to give up waiting. Finished by `pump`, so nothing sleeps while holding this state.
+    /// The output stream ended; its notice waits for shutdown and the last of stderr. Finished by
+    /// `pump`, so nothing sleeps while holding this state.
     closing_notice: Option<ClosingNotice>,
+    /// The failed link returns with its stderr tail once process-group shutdown completes.
+    failed_stop: Option<std::thread::JoinHandle<JsonRpcLink>>,
     closed: bool,
     dead: bool,
     /// A chat taken up from another process waits for its move's commit, and pumps nothing until then:
@@ -515,9 +525,54 @@ impl AcpProvider {
         Ok(())
     }
 
-    fn respond(&self, id: Value, result: Value) {
-        if let Some(link) = lock(&self.link).as_ref() {
-            link.respond(id, result);
+    fn respond(&self, st: &mut State, id: Value, result: Value) {
+        st.pending_replies.push_back(AutomaticReply::Result(id, result));
+        st.write_deadline.get_or_insert_with(|| Instant::now() + START_TIMEOUT);
+        self.retry_writes(st);
+    }
+
+    fn respond_unknown(&self, st: &mut State, id: Value) {
+        st.pending_replies.push_back(AutomaticReply::MethodNotFound(id));
+        st.write_deadline.get_or_insert_with(|| Instant::now() + START_TIMEOUT);
+        self.retry_writes(st);
+    }
+
+    /// Retries automatic answers and cancellation without waiting for room in the writer.
+    fn retry_writes(&self, st: &mut State) {
+        if st.dead || st.closed {
+            return;
+        }
+        if st.write_deadline.is_some_and(|end| Instant::now() >= end) {
+            self.on_closed(st, "the agent did not read cancellation or an answer in time");
+            return;
+        }
+        let sent = (|| {
+            let link = lock(&self.link);
+            let link = link.as_ref().ok_or(LinkError::Closed)?;
+            if st.pending_cancel {
+                if let Some(session) = &st.session_id {
+                    link.notify(method::SESSION_CANCEL, wire::session_only_params(session))?;
+                    if let Some(turn) = st.turn.as_mut() {
+                        turn.interrupting = true;
+                    }
+                }
+                st.pending_cancel = false;
+            }
+            while let Some(reply) = st.pending_replies.front() {
+                match reply {
+                    AutomaticReply::Result(id, result) => link.try_respond(id.clone(), result.clone())?,
+                    AutomaticReply::MethodNotFound(id) => {
+                        link.respond_error(id.clone(), METHOD_NOT_FOUND, "method not found")?
+                    }
+                }
+                st.pending_replies.pop_front();
+            }
+            Ok(())
+        })();
+        match sent {
+            Ok(()) => st.write_deadline = None,
+            Err(LinkError::Busy) => {}
+            Err(_) => self.on_closed(st, "an automatic answer could not be sent"),
         }
     }
 
@@ -562,6 +617,15 @@ impl AcpProvider {
                 self.fold_boot(message, boot);
                 true
             },
+            || {
+                let mut st = lock(&self.state);
+                self.retry_writes(&mut st);
+                if st.dead {
+                    Err(LinkError::Closed)
+                } else {
+                    Ok(())
+                }
+            },
             Instant::now() + within,
             Instant::now,
             || std::thread::sleep(POLL),
@@ -595,9 +659,9 @@ impl AcpProvider {
             Incoming::Request { id, method, .. } => {
                 // Nobody can decide a permission before the session exists.
                 if method == method::REQUEST_PERMISSION {
-                    self.respond(id, wire::cancelled_outcome());
-                } else if let Some(link) = lock(&self.link).as_ref() {
-                    link.respond_error(id, METHOD_NOT_FOUND, "method not found");
+                    self.respond(&mut lock(&self.state), id, wire::cancelled_outcome());
+                } else {
+                    self.respond_unknown(&mut lock(&self.state), id);
                 }
             }
             Incoming::Skipped(Skipped::AcpUpdateTooLarge { update_kind, .. }) => {
@@ -955,15 +1019,10 @@ impl AcpProvider {
     /// Tells the agent to cancel the running turn, then answers every open request `cancelled`. The turn
     /// ends when the agent answers its prompt.
     fn interrupt_running(&self, st: &mut State) {
-        let Some(session) = st.session_id.clone() else { return };
-        let already = match st.turn.as_mut() {
-            Some(turn) => std::mem::replace(&mut turn.interrupting, true),
-            None => false,
-        };
-        if !already && st.turn.is_some() {
-            if let Some(link) = lock(&self.link).as_ref() {
-                link.notify(method::SESSION_CANCEL, wire::session_only_params(&session));
-            }
+        if st.turn.as_ref().is_some_and(|turn| !turn.interrupting) {
+            st.pending_cancel = true;
+            st.write_deadline.get_or_insert_with(|| Instant::now() + START_TIMEOUT);
+            self.retry_writes(st);
         }
         self.drop_cards(st, PermissionOutcome::CancelledByInterrupt, true);
     }
@@ -972,7 +1031,7 @@ impl AcpProvider {
     fn drop_cards(&self, st: &mut State, outcome: PermissionOutcome, answer: bool) {
         for (permission_id, card) in std::mem::take(&mut st.cards) {
             if answer {
-                self.respond(card.request_id, wire::cancelled_outcome());
+                self.respond(st, card.request_id, wire::cancelled_outcome());
             }
             st.events
                 .push_back(AgentDomainEvent::PermissionResolved { permission_id, outcome });
@@ -1009,9 +1068,7 @@ impl AcpProvider {
                     self.on_permission(st, id, params);
                 } else {
                     note_unknown(st, "a request", &method);
-                    if let Some(link) = lock(&self.link).as_ref() {
-                        link.respond_error(id, METHOD_NOT_FOUND, "method not found");
-                    }
+                    self.respond_unknown(st, id);
                 }
             }
             Incoming::Skipped(skipped) => self.on_skipped(st, skipped),
@@ -1024,6 +1081,9 @@ impl AcpProvider {
             return;
         }
         st.dead = true;
+        st.pending_replies.clear();
+        st.pending_cancel = false;
+        st.write_deadline = None;
         // Nothing can answer what waited any more.
         self.drop_cards(st, PermissionOutcome::ProviderFailed, false);
         for waiting in std::mem::take(&mut st.settings) {
@@ -1035,11 +1095,15 @@ impl AcpProvider {
         // short while for it so it says why the child went. `pump` finishes it: waiting here would hold this
         // state, which the UI thread's calls (a card's answer, Esc, a send, the gauge) take.
         st.closing_notice = Some(ClosingNotice::after(reason, Instant::now(), &self.link));
+        st.failed_stop = external_link::stop_failed_link(&self.link);
         self.finish_closing_notice(st);
     }
 
     /// Sends the child's end once its stderr says why, or once the wait is over without it.
     fn finish_closing_notice(&self, st: &mut State) {
+        if !external_link::finish_failed_stop(&mut st.failed_stop, &self.link) {
+            return;
+        }
         if let Some(reason) = external_link::finish_closing_notice(&mut st.closing_notice, &self.agent, &self.link) {
             st.events.push_back(AgentDomainEvent::SessionUnavailable { reason });
         }
@@ -1092,16 +1156,16 @@ impl AcpProvider {
                 "agent: {} sent a permission request Eitri cannot read; cancelled",
                 self.agent
             );
-            self.respond(id, wire::cancelled_outcome());
+            self.respond(st, id, wire::cancelled_outcome());
             return;
         };
-        let asking = st.turn.as_ref().is_some_and(|t| !t.interrupting);
+        let asking = !st.pending_cancel && st.turn.as_ref().is_some_and(|t| !t.interrupting);
         if st.session_id.as_deref() != Some(request.session_id.as_str()) || st.blocked.is_some() || !asking {
             eprintln!(
                 "agent: {} asked for a decision Eitri cannot take now ({}); cancelled",
                 self.agent, request.tool_call.id
             );
-            self.respond(id, wire::cancelled_outcome());
+            self.respond(st, id, wire::cancelled_outcome());
             return;
         }
         // A card for a call whose row is not open yet gets one, or the card and its answer would sit on
@@ -1295,6 +1359,7 @@ impl AcpProvider {
     /// Ends the turn with the agent's answer to its prompt.
     fn finish_turn(&self, st: &mut State) {
         let Some(turn) = st.turn.take() else { return };
+        st.pending_cancel = false;
         let (outcome, detail, stop_reason, usage) = match turn.response {
             Some(Ok(value)) => {
                 let response = wire::PromptResponse::parse(&value);
@@ -1435,6 +1500,10 @@ impl AcpProvider {
         } else if st.loading && st.replaying {
             // A replay can run far past the start's short wait, so it is refused at once.
             Some(MoveRefusedWhy::HistoryLoading)
+        } else if st.write_deadline.is_some() {
+            Some(MoveRefusedWhy::Link(
+                "cancellation or an automatic answer is waiting to be sent".to_string(),
+            ))
         } else if !st.settings.is_empty() {
             // A change of the model or the effort waits for its answer on this link, which the move would stop, and
             // only `pump` takes the answer, so waiting here would not help: refused at once.
@@ -1530,6 +1599,9 @@ impl AcpProvider {
             turn_seq,
             cards,
             next_card,
+            pending_replies: _,
+            pending_cancel: _,
+            write_deadline: _,
             next_answered_row,
             seen_unknown,
             context,
@@ -1544,6 +1616,7 @@ impl AcpProvider {
             dead: _,
             // Set only once the child is gone, which refuses a freeze, so it is `None`.
             closing_notice: _,
+            failed_stop: _,
             // A freeze is refused until an adopted chat's move is committed, so it is false.
             awaiting_commit: _,
         } = state;
@@ -1685,6 +1758,9 @@ impl AcpProvider {
             turn_seq,
             cards,
             next_card,
+            pending_replies: VecDeque::new(),
+            pending_cancel: false,
+            write_deadline: None,
             next_answered_row,
             seen_unknown,
             context: context.map(|(used, size)| ContextGauge { used, size }),
@@ -1694,6 +1770,7 @@ impl AcpProvider {
             replaying: false,
             history,
             closing_notice: None,
+            failed_stop: None,
             closed: false,
             dead: false,
             awaiting_commit: true,
@@ -1857,6 +1934,14 @@ impl AgentProvider for AcpProvider {
                 let _ = pending.wait(Instant::now() + CLOSE_WAIT);
             }
         }
+        loop {
+            let mut st = lock(&self.state);
+            if external_link::finish_failed_stop(&mut st.failed_stop, &self.link) {
+                break;
+            }
+            drop(st);
+            std::thread::sleep(Duration::from_millis(10));
+        }
         external_link::stop_linked_child(&self.link);
         Ok(())
     }
@@ -1881,6 +1966,7 @@ impl AgentProvider for AcpProvider {
                 }
             }
             let read_to_end = self.drain(&mut st);
+            self.retry_writes(&mut st);
             // After the queue: a list the agent sent ahead of its answer is in by now.
             self.collect_settings(&mut st);
             self.collect_listing(&mut st);
@@ -1997,6 +2083,7 @@ impl ExternalProvider for AcpProvider {
 fn serve_replay(
     mut take_answer: impl FnMut() -> Option<Result<Value, LinkError>>,
     mut fold_one: impl FnMut() -> bool,
+    mut between: impl FnMut() -> Result<(), LinkError>,
     deadline: Instant,
     mut now: impl FnMut() -> Instant,
     mut pause: impl FnMut(),
@@ -2013,6 +2100,8 @@ fn serve_replay(
                 break;
             }
         }
+        // Pending cancels and automatic answers are retried between batches; a session that died ends the wait.
+        between()?;
         if empty {
             if let Some(answer) = answer {
                 return answer;
@@ -2047,6 +2136,7 @@ mod tests {
                 // Finite fallback lets the regression fail without hanging on an unbounded drain.
                 messages.get() < 100_000
             },
+            || Ok(()),
             start + Duration::from_millis(300),
             || start + Duration::from_millis(messages.get()),
             || panic!("a full queue needs no sleep"),
@@ -2067,6 +2157,7 @@ mod tests {
                 messages.set(messages.get() + 1);
                 messages.get() < 100_000
             },
+            || Ok(()),
             start + Duration::from_millis(300),
             || start + Duration::from_millis(messages.get()),
             || panic!("a full queue needs no sleep"),
@@ -2087,6 +2178,7 @@ mod tests {
                 remaining.set(before.saturating_sub(1));
                 before > 0
             },
+            || Ok(()),
             start + Duration::from_secs(1),
             || start,
             || panic!("the captured answer should return without a sleep"),
@@ -2094,5 +2186,137 @@ mod tests {
         .unwrap();
         assert_eq!(remaining.get(), 0);
         assert_eq!(result["sessionId"], "saved");
+    }
+}
+
+#[cfg(all(test, target_os = "linux"))]
+mod process_tests {
+    use super::*;
+    use crate::external_link::test_support::{read_pid, running, wait_for, Scratch};
+
+    fn provider(link: JsonRpcLink) -> AcpProvider {
+        let pid = link.pid();
+        AcpProvider {
+            name: "acp:stand-in",
+            agent: "stand-in".into(),
+            auto_mode: None,
+            link: Mutex::new(Some(link)),
+            state: Mutex::new(State::default()),
+            pid,
+            load_session: false,
+            close_session: false,
+            list_sessions: false,
+            label: None,
+        }
+    }
+
+    #[test]
+    fn a_closed_stream_stops_the_acp_process_group() {
+        let scratch = Scratch::new();
+        let provider = provider(scratch.link("sleep 30 >/dev/null & echo $! > child; exec 1>&-; wait"));
+        let child = read_pid(&scratch.0.join("child"));
+        assert!(running(child));
+        wait_for(|| {
+            provider
+                .pump()
+                .iter()
+                .any(|e| matches!(e, AgentDomainEvent::SessionUnavailable { .. }))
+        });
+        wait_for(|| !running(child));
+        assert!(!running(provider.pid));
+    }
+
+    fn blocked(scratch: &Scratch) -> AcpProvider {
+        let provider = provider(scratch.link("while [ ! -f go ]; do sleep 0.01; done; cat > received"));
+        {
+            let mut st = lock(&provider.state);
+            st.session_id = Some("s1".into());
+            st.turn = Some(ActiveTurn {
+                id: "turn".into(),
+                pending: None,
+                response: None,
+                fold: Fold::default(),
+                interrupting: false,
+            });
+            st.cards.push((
+                "card".into(),
+                WaitingCard {
+                    request_id: json!(77),
+                    tool_call_id: "call".into(),
+                    allow: None,
+                    reject: None,
+                    allow_held_back: false,
+                },
+            ));
+        }
+        {
+            let link = lock(&provider.link);
+            let link = link.as_ref().unwrap();
+            let filler = Value::String("x".repeat(4096));
+            let mut full = false;
+            for _ in 0..8192 {
+                if matches!(link.try_respond(json!(0), filler.clone()), Err(LinkError::Busy)) {
+                    full = true;
+                    break;
+                }
+            }
+            assert!(full, "writer queue never filled");
+        }
+        provider
+    }
+
+    #[test]
+    fn a_full_writer_retries_cancel_and_automatic_card_answers() {
+        let scratch = Scratch::new();
+        let provider = blocked(&scratch);
+        {
+            let mut st = lock(&provider.state);
+            provider.interrupt_running(&mut st);
+            assert!(
+                !st.turn.as_ref().unwrap().interrupting,
+                "cancel has not been queued yet"
+            );
+            // A second interrupt must not duplicate a pending cancellation.
+            provider.interrupt_running(&mut st);
+            assert!(matches!(provider.move_blocker(&st), Some(MoveRefusedWhy::Link(_))));
+            provider.on_permission(&mut st, json!(88), Value::Null);
+            provider.fold(
+                &mut st,
+                Incoming::Request {
+                    id: json!(99),
+                    method: "unknown".into(),
+                    params: Value::Null,
+                },
+            );
+        }
+        std::fs::write(scratch.0.join("go"), "").unwrap();
+        let mut received = String::new();
+        wait_for(|| {
+            provider.pump();
+            received = std::fs::read_to_string(scratch.0.join("received")).unwrap_or_default();
+            received.contains(r#""id":77,"result":{"outcome":{"outcome":"cancelled"}}"#)
+                && received.contains(r#""id":88,"result":{"outcome":{"outcome":"cancelled"}}"#)
+                && received.contains(r#""id":99,"error":{"code":-32601,"message":"method not found"}"#)
+        });
+        assert_eq!(received.matches("session/cancel").count(), 1);
+        assert!(lock(&provider.state).turn.as_ref().unwrap().interrupting);
+    }
+
+    #[test]
+    fn a_writer_that_stays_full_ends_the_connection_at_the_deadline() {
+        let scratch = Scratch::new();
+        let provider = blocked(&scratch);
+        {
+            let mut st = lock(&provider.state);
+            provider.interrupt_running(&mut st);
+            st.write_deadline = Some(Instant::now());
+        }
+        wait_for(|| {
+            provider
+                .pump()
+                .iter()
+                .any(|e| matches!(e, AgentDomainEvent::SessionUnavailable { .. }))
+        });
+        assert!(!running(provider.pid));
     }
 }

@@ -405,12 +405,14 @@ struct State {
     /// (refused, or the turn or session ended first: Codex forgets a message it had not read when the turn
     /// is interrupted, measured on 0.162.1).
     steers: SteerOrder<SentSteer>,
-    /// The child ended on its own and its notice waits for the last of its stderr: the reason the link
-    /// gave, and when to give up waiting. Finished by `pump`, so nothing sleeps while holding this state.
+    /// The output stream ended; its notice waits for shutdown and the last of stderr. Finished by
+    /// `pump`, so nothing sleeps while holding this state.
     closing_notice: Option<ClosingNotice>,
+    /// The failed link returns with its stderr tail once process-group shutdown completes.
+    failed_stop: Option<std::thread::JoinHandle<JsonRpcLink>>,
     /// Closed by the host.
     closed: bool,
-    /// The child ended on its own, or was stopped.
+    /// The connection cannot be used, even while its shutdown worker is still running.
     dead: bool,
     /// Whether the projection's thinking block is open after the events queued so far
     /// (`thinking_open_after`), followed through `events` up to `thought_scanned`.
@@ -1099,7 +1101,7 @@ impl CodexProvider {
                 ),
             ));
         }
-        link.notify(method::INITIALIZED, Value::Null);
+        let _ = link.notify(method::INITIALIZED, Value::Null);
 
         // The answer carries the account's email; it is read for one fact and never kept or logged.
         let answer = link
@@ -1481,7 +1483,7 @@ impl CodexProvider {
             Handling::NotHandled => {
                 note_unknown(st, "a request", &method);
                 if let Some(link) = lock(&self.link).as_ref() {
-                    link.respond_error(id, METHOD_NOT_FOUND, "method not found");
+                    let _ = link.respond_error(id, METHOD_NOT_FOUND, "method not found");
                 }
             }
             // A request about a thread outside the family, after a tripwire, or from a turn that is not running
@@ -1804,7 +1806,6 @@ impl CodexProvider {
             return;
         }
         st.dead = true;
-        end_background_rows(st, "Codex ended while it ran");
         // Nothing can answer what waited any more.
         self.drop_cards(st, PermissionOutcome::ProviderFailed);
         self.drop_steers(st, "Codex ended before it read it");
@@ -1812,11 +1813,15 @@ impl CodexProvider {
         // short while for it so it says why the child went. `pump` finishes it: waiting here would hold this
         // state, which the UI thread's calls take.
         st.closing_notice = Some(ClosingNotice::after(reason, Instant::now(), &self.link));
+        st.failed_stop = external_link::stop_failed_link(&self.link);
         self.finish_closing_notice(st);
     }
 
     /// Sends the child's end once its stderr says why, or once the wait is over without it.
     fn finish_closing_notice(&self, st: &mut State) {
+        if !external_link::finish_failed_stop(&mut st.failed_stop, &self.link) {
+            return;
+        }
         if let Some(reason) = external_link::finish_closing_notice(&mut st.closing_notice, "Codex", &self.link) {
             st.events.push_back(AgentDomainEvent::SessionUnavailable { reason });
         }
@@ -2734,7 +2739,7 @@ fn report_background(st: &mut State) {
     let running = &st.running;
     st.background.retain(|key| running.contains_key(key));
     st.background_rows.retain(|key, _| st.background.contains(key));
-    if st.dead || st.closed {
+    if (st.dead || st.closed) && st.failed_stop.is_none() && st.stopping.is_none() {
         st.background.clear();
         // A session being stopped is dead before its child is gone, and no completion is read after that.
         end_background_rows(st, "stopped with the session");
@@ -3024,6 +3029,7 @@ impl CodexProvider {
             user_reviewed,
             steers,
             closing_notice,
+            failed_stop: _,
             // A freeze is refused once the session is closed or its child gone, so both are false.
             closed: _,
             dead: _,
@@ -3253,6 +3259,7 @@ impl CodexProvider {
                 until: at_offset(ms, now),
                 stderr_at_close: String::new(),
             }),
+            failed_stop: None,
             closed: false,
             dead: false,
             thought_open,
@@ -3510,7 +3517,9 @@ impl AgentProvider for CodexProvider {
             self.drop_cards(&mut st, PermissionOutcome::CancelledBySessionClose);
             self.drop_steers(&mut st, "the session was closed before Codex read it");
             st.closed = true;
-            end_background_rows(&mut st, "the session was closed while it ran");
+            if st.failed_stop.is_none() {
+                end_background_rows(&mut st, "the session was closed while it ran");
+            }
             st.events.push_back(AgentDomainEvent::SessionClosed {
                 reason: "closed_by_host".to_string(),
             });
@@ -3531,7 +3540,16 @@ impl AgentProvider for CodexProvider {
                 }
             }
         }
+        loop {
+            let mut st = lock(&self.state);
+            if external_link::finish_failed_stop(&mut st.failed_stop, &self.link) {
+                break;
+            }
+            drop(st);
+            std::thread::sleep(Duration::from_millis(10));
+        }
         external_link::stop_linked_child(&self.link);
+        end_background_rows(&mut lock(&self.state), "the session was closed while it ran");
         Ok(())
     }
 
@@ -3988,5 +4006,54 @@ impl ExternalProvider for CodexProvider {
             self.interrupt_running(&mut st);
         }
         Ok(turn_id)
+    }
+}
+
+#[cfg(all(test, target_os = "linux"))]
+mod process_tests {
+    use super::*;
+    use crate::external_link::test_support::{read_pid, running, wait_for, Scratch};
+
+    #[test]
+    fn a_closed_stream_stops_codex_before_ending_background_rows() {
+        let scratch = Scratch::new();
+        let link = scratch.link("sleep 30 >/dev/null & echo $! > child; exec 1>&-; wait");
+        let pid = link.pid();
+        let provider = CodexProvider {
+            link: Mutex::new(Some(link)),
+            state: Mutex::new(State::default()),
+            pid,
+            version: (0, 0, 0),
+            state_home: scratch.0.clone(),
+            codex_home: scratch.0.clone(),
+            steer_unsupported: AtomicBool::new(false),
+            editor_server_lever: false,
+            editor_note_due: AtomicBool::new(false),
+        };
+        let key = ("thread".into(), "command".into());
+        {
+            let mut st = lock(&provider.state);
+            st.running.insert(key.clone(), Running::Command);
+            st.background.insert(key.clone());
+            st.background_rows.insert(key, ("turn".into(), "command".into()));
+            st.background_reported = 1;
+        }
+        let child = read_pid(&scratch.0.join("child"));
+        let mut completed = false;
+        let mut unavailable = false;
+        wait_for(|| {
+            for event in provider.pump() {
+                match event {
+                    AgentDomainEvent::ToolCallCompleted { .. } | AgentDomainEvent::BackgroundCalls { running: 0 } => {
+                        assert!(!running(pid), "background work ended before shutdown");
+                        completed = true;
+                    }
+                    AgentDomainEvent::SessionUnavailable { .. } => unavailable = true,
+                    _ => {}
+                }
+            }
+            completed && unavailable
+        });
+        wait_for(|| !running(child));
     }
 }

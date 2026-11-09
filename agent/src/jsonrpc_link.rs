@@ -1138,14 +1138,12 @@ impl JsonRpcLink {
         self.shared.queue_closed(&self.incoming_tx, reason.to_string());
     }
 
-    pub fn notify(&self, method: &str, params: Value) {
+    pub fn notify(&self, method: &str, params: Value) -> Result<(), LinkError> {
         let mut members = vec![("method", json_text(&Value::from(method)))];
         if !params.is_null() {
             members.push(("params", json_text(&params)));
         }
-        if let Err(e) = self.shared.send_line(self.shared.line(&members)) {
-            link_log!("a notification to the agent was not sent: {e}");
-        }
+        self.shared.send_line(self.shared.line(&members))
     }
 
     /// Answers a request the agent made, by its own id.
@@ -1163,10 +1161,8 @@ impl JsonRpcLink {
         self.shared.respond(&id, &result)
     }
 
-    pub fn respond_error(&self, id: Value, code: i64, message: &str) {
-        if let Err(e) = self.shared.respond_error(&id, code, message) {
-            link_log!("an error answer to the agent was not sent: {e}");
-        }
+    pub fn respond_error(&self, id: Value, code: i64, message: &str) -> Result<(), LinkError> {
+        self.shared.respond_error(&id, code, message)
     }
 
     /// The next message from the agent, if one is waiting.
@@ -1196,7 +1192,7 @@ impl JsonRpcLink {
         self.finish(grace);
     }
 
-    fn finish(&mut self, grace: Duration) {
+    pub(crate) fn finish(&mut self, grace: Duration) {
         // Dropping the sender ends the writer thread, which drops stdin: the child sees EOF.
         lock(&self.shared.writer).take();
         // A child handed over for a move is the taker's to end.
@@ -2488,7 +2484,7 @@ mod tests {
         assert_eq!(held, head.to_vec(), "the half line is carried, as read so far");
         assert!(handoff.incoming.is_empty());
         let adopted = adopt(handoff, fds);
-        adopted.notify("go", Value::Null);
+        let _ = adopted.notify("go", Value::Null);
         let mut got = None;
         wait_until("the rest of the line", || {
             got = adopted.try_recv();
@@ -2541,7 +2537,7 @@ mod tests {
             .expect("the request is open in the link that took it up");
         assert!(adopted.rebind(1).is_none(), "one request was rebound twice");
         assert!(adopted.rebind(9).is_none(), "an id never sent was rebound");
-        adopted.notify("go", Value::Null);
+        let _ = adopted.notify("go", Value::Null);
         assert_eq!(rebound.wait(Instant::now() + PATIENCE), Ok(Value::from("ok")));
         assert_eq!(asked.try_take(), None, "the stopped link's copy saw the answer");
         assert_eq!(
@@ -2557,7 +2553,7 @@ mod tests {
         let mut asked = link.request("ask", Value::Null);
         // The owner's last look: the agent holds its answer until told.
         assert_eq!(asked.try_take(), None);
-        link.notify("now", Value::Null);
+        let _ = link.notify("now", Value::Null);
         wait_until("the answer to arrive", || asked.answered_record().is_some());
         let (handoff, fds) = stop(link);
         assert!(
@@ -2589,10 +2585,10 @@ mod tests {
     fn adopt_writes_nothing_to_the_agent() {
         let link = stand_in(r#"while read -r l; do printf '%s\n' "$l" >&2; done"#);
         let _asked = link.request("ask", Value::Null);
-        link.notify("told", Value::Null);
+        let _ = link.notify("told", Value::Null);
         let (handoff, fds) = stop(link);
         let adopted = adopt(handoff, fds);
-        adopted.notify("marker", Value::Null);
+        let _ = adopted.notify("marker", Value::Null);
         wait_until("the agent to echo the marker", || {
             adopted.stderr_tail().contains("marker")
         });
@@ -2640,7 +2636,7 @@ mod tests {
             one * LINES
         ));
         for _ in 0..LINES {
-            link.notify("big", payload.clone());
+            let _ = link.notify("big", payload.clone());
         }
         let (handoff, fds) = stop(link);
         let resumed = JsonRpcLink::resume_after_move(handoff, fds, refuse_over_cap).expect("the link resumes");
@@ -2656,7 +2652,7 @@ mod tests {
         ));
         let payload = big_line_payload();
         for _ in 0..20 {
-            link.notify("big", payload.clone());
+            let _ = link.notify("big", payload.clone());
         }
         let mut asked = link.request("ask", Value::Null);
         until_armed(&link);
@@ -2748,7 +2744,7 @@ mod tests {
         let _second = link.request("second", Value::Null);
         let (handoff, fds) = stop(link);
         let adopted = adopt(handoff, fds);
-        adopted.notify("go", Value::Null);
+        let _ = adopted.notify("go", Value::Null);
         wait_until("the end of the conversation", || {
             matches!(adopted.try_recv(), Some(Incoming::Closed { .. }))
         });
@@ -2764,7 +2760,7 @@ mod tests {
         let _asked = link.request("ask", Value::Null);
         let (handoff, fds) = stop(link);
         let adopted = adopt(handoff, fds);
-        adopted.notify("go", Value::Null);
+        let _ = adopted.notify("go", Value::Null);
         let shared = Arc::clone(&adopted.shared);
         wait_until("the answer to arrive", || {
             lock(&shared.pending)
@@ -2812,7 +2808,7 @@ mod tests {
             adopted.reader.is_none() && adopted.stderr_drain.is_none() && adopted.parked.is_some(),
             "a thread runs on the agent before the commit"
         );
-        adopted.notify("queued", Value::Null);
+        let _ = adopted.notify("queued", Value::Null);
         assert!(
             readable(&probe, Duration::ZERO),
             "the end of the request was read before the commit"
@@ -2856,7 +2852,7 @@ mod tests {
             assert!(running(&carried), "dropping a link before its commit ended the agent");
         }
         let resumed = JsonRpcLink::resume_after_move(carried, kept, refuse_over_cap).expect("the link resumes");
-        resumed.notify("still-here", Value::Null);
+        let _ = resumed.notify("still-here", Value::Null);
         wait_until("the agent to read on", || resumed.stderr_tail().contains("still-here"));
     }
 

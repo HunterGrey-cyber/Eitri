@@ -51,6 +51,7 @@ use std::fs::File;
 use std::io::Read;
 use std::os::unix::fs::DirBuilderExt;
 use std::os::unix::io::AsRawFd;
+use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -277,6 +278,7 @@ fn probe_version(program: &Path) -> Result<String, String> {
             .stdin(Stdio::null())
             .stdout(Stdio::piped())
             .stderr(Stdio::null())
+            .process_group(0)
             .spawn();
         match spawned {
             Err(e) if e.raw_os_error() == Some(libc::ETXTBSY) && attempts < 50 => {
@@ -287,20 +289,50 @@ fn probe_version(program: &Path) -> Result<String, String> {
         }
     };
     let end = Instant::now() + VERSION_BUDGET;
-    let status = loop {
-        match child.try_wait() {
-            Ok(Some(status)) => break status,
-            Ok(None) if Instant::now() < end => std::thread::sleep(Duration::from_millis(10)),
-            _ => {
-                let _ = child.kill();
-                let _ = child.wait();
-                return Err(format!("{} --version did not finish", program.display()));
+    let mut out = child.stdout.take().expect("stdout was piped");
+    let reader = std::thread::spawn(move || {
+        let mut bytes = Vec::new();
+        while bytes.len() < 4096 && Instant::now() < end {
+            let mut fd = libc::pollfd {
+                fd: out.as_raw_fd(),
+                events: libc::POLLIN,
+                revents: 0,
+            };
+            // One reader owns this pipe; a readable byte cannot be consumed by another thread.
+            // SAFETY: fd is a valid pollfd, writable for the duration of the call.
+            if unsafe { libc::poll(&mut fd, 1, 10) } <= 0 {
+                continue;
+            }
+            let mut buf = [0; 4096];
+            match out.read(&mut buf[..4096 - bytes.len()]) {
+                Ok(0) | Err(_) => break,
+                Ok(n) => bytes.extend_from_slice(&buf[..n]),
             }
         }
-    };
-    let mut text = String::new();
-    if let Some(mut out) = child.stdout.take() {
-        let _ = out.by_ref().take(4096).read_to_string(&mut text);
+        String::from_utf8(bytes).unwrap_or_default()
+    });
+    // Leave the leader waitable until its group has been signalled, reserving its pid even after exit.
+    while matches!(
+        crate::jsonrpc_link::child_state(child.id()),
+        crate::jsonrpc_link::ChildState::Running
+    ) && Instant::now() < end
+    {
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    let timed_out = Instant::now() >= end;
+    if !matches!(
+        crate::jsonrpc_link::child_state(child.id()),
+        crate::jsonrpc_link::ChildState::Gone
+    ) {
+        // SAFETY: the unreaped child leads the process group created above.
+        unsafe { libc::kill(-(child.id() as libc::pid_t), libc::SIGKILL) };
+    }
+    let status = child
+        .wait()
+        .map_err(|_| format!("{} --version did not finish", program.display()))?;
+    let text = reader.join().unwrap_or_default();
+    if timed_out {
+        return Err(format!("{} --version did not finish", program.display()));
     }
     if !status.success() {
         return Err(format!("{} --version failed", program.display()));
@@ -932,7 +964,7 @@ impl Peer {
                         let answer = serde_json::to_value(ElicitationResponse::decline()).unwrap_or(Value::Null);
                         self.link.respond(id, answer);
                     } else {
-                        self.link.respond_error(id, -32601, "method not found");
+                        let _ = self.link.respond_error(id, -32601, "method not found");
                     }
                     self.asked.push(Asked {
                         method,
@@ -1001,7 +1033,7 @@ impl Peer {
         let answer = self.call(method::INITIALIZE, params)?;
         let init: InitializeResponse =
             serde_json::from_value(answer).map_err(|e| format!("the handshake answer could not be read: {e}"))?;
-        self.link.notify(method::INITIALIZED, Value::Null);
+        let _ = self.link.notify(method::INITIALIZED, Value::Null);
         let reported = init
             .codex_home
             .as_deref()
@@ -1741,6 +1773,36 @@ mod tests {
     use super::*;
     use std::cell::Cell;
     use std::os::unix::fs::PermissionsExt;
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_version_wrapper_cannot_leave_stdout_held_by_a_helper() {
+        use crate::external_link::test_support::{read_pid, running, Scratch};
+        let scratch = Scratch::new();
+        let program = scratch.script(
+            r#"cd "$(dirname "$0")"
+        sleep 30 & echo $! > helper
+        echo 'codex 0.163.0'
+        exit 0"#,
+        );
+        let (tx, rx) = std::sync::mpsc::channel();
+        let probe = std::thread::spawn(move || {
+            let _ = tx.send(probe_version(&program));
+        });
+        let helper = read_pid(&scratch.0.join("helper"));
+        let answer = rx.recv_timeout(Duration::from_secs(20));
+        let was_running = running(helper);
+        if was_running {
+            // SAFETY: this is the sleep process started by the test's wrapper.
+            unsafe { libc::kill(helper as libc::pid_t, libc::SIGKILL) };
+        }
+        probe.join().unwrap();
+        assert_eq!(
+            answer.expect("version probe hung on inherited stdout").unwrap(),
+            "0.163.0"
+        );
+        assert!(!was_running, "the version probe left its helper running");
+    }
 
     #[test]
     fn forbidden_files_never_go_where_the_sandbox_always_lets_commands_write() {
