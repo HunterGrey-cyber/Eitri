@@ -141,6 +141,8 @@ fn interned_name(agent: &str) -> &'static str {
 struct WaitingCard {
     /// The agent's id of the request, which the answer goes back under.
     request_id: Value,
+    /// The call whose content this card approves; a skipped update revokes its approval option.
+    tool_call_id: String,
     /// The agent's first `allow_once` option, if it offered one. Never shown.
     allow: Option<String>,
     /// The agent's first `reject_once` option, if it offered one. Never shown.
@@ -225,6 +227,7 @@ struct State {
 /// What a wait during the start collects: the mode the agent last reported, and the replay.
 #[derive(Default)]
 struct Boot {
+    skipped_mode: bool,
     mode: Option<ModeReport>,
     /// The latest option list the agent sent before the session was open.
     options: Option<Vec<ConfigOption>>,
@@ -234,6 +237,26 @@ struct Boot {
     /// The link's end, read while the start was still being served. The link says it only once, so a
     /// start that went on to succeed hands it to the open session, which then ends at once.
     closed: Option<String>,
+}
+
+const SKIPPED_PREVIEW: &str = "The tool content could not be shown because an update was larger than 16 MiB.";
+const SKIPPED_MODE: &str = "an update that could report the mode was larger than 16 MiB";
+
+fn skipped_may_report_mode(kind: Option<&str>) -> bool {
+    !matches!(
+        kind,
+        Some(
+            "tool_call"
+                | "tool_call_update"
+                | "agent_message_chunk"
+                | "agent_thought_chunk"
+                | "user_message_chunk"
+                | "usage_update"
+                | "plan"
+                | "available_commands_update"
+                | "session_info_update"
+        )
+    )
 }
 
 pub struct AcpProvider {
@@ -577,6 +600,9 @@ impl AcpProvider {
                     link.respond_error(id, METHOD_NOT_FOUND, "method not found");
                 }
             }
+            Incoming::Skipped(Skipped::AcpUpdateTooLarge { update_kind, .. }) => {
+                boot.skipped_mode |= skipped_may_report_mode(update_kind.as_deref());
+            }
             Incoming::Closed { reason } => boot.closed = Some(reason),
             _ => {}
         }
@@ -606,6 +632,7 @@ impl AcpProvider {
             return Ok(self.resume_refused(&req, &saved, format!("{} cannot load a saved session", self.agent)));
         }
         let mut boot = Boot {
+            skipped_mode: false,
             mode: None,
             options: None,
             commands: None,
@@ -670,6 +697,11 @@ impl AcpProvider {
                     }
                     Err(e) => return Err(self.failure(e, "the mode change")),
                 }
+            }
+        }
+        if boot.skipped_mode {
+            if let Some(want) = &self.auto_mode {
+                mismatch = Some((mode_words(want), SKIPPED_MODE.to_string()));
             }
         }
         let history = boot.history.take().map(History::finish).unwrap_or_default();
@@ -1074,7 +1106,11 @@ impl AcpProvider {
         }
         // A card for a call whose row is not open yet gets one, or the card and its answer would sit on
         // nothing. What the card shows is what the row and the earlier updates know of the call.
-        let tool = match st.turn.as_mut() {
+        let skipped = st
+            .turn
+            .as_ref()
+            .is_some_and(|turn| turn.fold.preview_missing(&request.tool_call.id));
+        let mut tool = match st.turn.as_mut() {
             Some(turn) => {
                 let turn_id = turn.id.clone();
                 let events = &mut st.events;
@@ -1085,7 +1121,12 @@ impl AcpProvider {
         };
         // An input or a diff the card cannot show whole cannot be approved: the card would not show all of
         // what an approval lets through. It can still be refused, and the interrupt ends it.
-        let unshowable = translate::input_is_cut(&tool);
+        if skipped {
+            tool.content.clear();
+            tool.raw_input = None;
+            tool.title = Some(SKIPPED_PREVIEW.to_string());
+        }
+        let unshowable = skipped || translate::input_is_cut(&tool);
         let first = |kind: OptionKind| request.options.iter().find(|o| o.kind == kind).map(|o| o.id.clone());
         let offered_allow = first(OptionKind::AllowOnce);
         let allow_held_back = unshowable && offered_allow.is_some();
@@ -1115,6 +1156,7 @@ impl AcpProvider {
             permission_id.clone(),
             WaitingCard {
                 request_id: id,
+                tool_call_id: tool.id.clone(),
                 allow,
                 reject,
                 allow_held_back,
@@ -1132,6 +1174,37 @@ impl AcpProvider {
     fn on_skipped(&self, st: &mut State, skipped: Skipped) {
         let agent = &self.agent;
         match skipped {
+            Skipped::AcpUpdateTooLarge {
+                session_id,
+                tool_call_id,
+                update_kind,
+            } => {
+                if session_id.as_ref().is_some_and(|id| st.session_id.as_ref() != Some(id)) {
+                    return;
+                }
+                let may_report_mode = skipped_may_report_mode(update_kind.as_deref());
+                if may_report_mode {
+                    if let Some(want) = &self.auto_mode {
+                        self.trip(st, mode_words(want), SKIPPED_MODE.to_string());
+                    }
+                }
+                let may_update_tool = match update_kind.as_deref() {
+                    Some("current_mode_update" | "config_option_update") => false,
+                    Some("tool_call" | "tool_call_update") => true,
+                    _ => may_report_mode,
+                };
+                if may_update_tool {
+                    if let Some(turn) = st.turn.as_mut() {
+                        turn.fold.invalidate_preview(tool_call_id.as_deref());
+                    }
+                    for (_, card) in &mut st.cards {
+                        if tool_call_id.as_ref().is_none_or(|id| *id == card.tool_call_id) {
+                            card.allow = None;
+                            card.allow_held_back = true;
+                        }
+                    }
+                }
+            }
             Skipped::TurnTooLarge { method: name, .. } | Skipped::ItemTooLarge { method: name, .. } => {
                 eprintln!("agent: a {name} message from {agent} was larger than 16 MiB; not shown");
             }

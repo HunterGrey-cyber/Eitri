@@ -144,6 +144,12 @@ pub enum Skipped {
         /// `params.itemId` (Codex) or `params.toolCall.toolCallId` (ACP).
         item_id: Option<String>,
     },
+    /// An ACP update whose missing fields cannot be used to confirm a preview or mode.
+    AcpUpdateTooLarge {
+        session_id: Option<String>,
+        tool_call_id: Option<String>,
+        update_kind: Option<String>,
+    },
     /// A response; only the request with this id failed.
     ResponseFailed { id: u64 },
     /// A notification about one item that is too large to show.
@@ -1678,12 +1684,23 @@ fn deliver_response(shared: &Shared, id: &Value, map: &mut serde_json::Map<Strin
     let Some(id) = id.as_u64() else {
         return;
     };
-    let result = match map.remove("error") {
-        Some(error) => Err(LinkError::Rpc {
-            code: error.get("code").and_then(Value::as_i64).unwrap_or(0),
-            message: error.get("message").and_then(Value::as_str).unwrap_or("").to_string(),
-        }),
-        None => Ok(map.remove("result").unwrap_or(Value::Null)),
+    let valid_version =
+        shared.framing != Framing::WithJsonrpcMember || map.get("jsonrpc").and_then(Value::as_str) == Some("2.0");
+    let valid_error = map.get("error").is_none_or(|error| {
+        error.get("code").and_then(Value::as_i64).is_some() && error.get("message").and_then(Value::as_str).is_some()
+    });
+    let result = if !valid_version || map.contains_key("result") == map.contains_key("error") || !valid_error {
+        Err(LinkError::Rpc {
+            code: -32600,
+            message: "invalid JSON-RPC response envelope".to_string(),
+        })
+    } else if let Some(error) = map.remove("error") {
+        Err(LinkError::Rpc {
+            code: error["code"].as_i64().unwrap(),
+            message: error["message"].as_str().unwrap().to_string(),
+        })
+    } else {
+        Ok(map.remove("result").unwrap())
     };
     shared.resolve(id, result);
 }
@@ -1718,7 +1735,7 @@ fn handle_over_cap(prefix: &[u8], shared: &Shared, tx: &SyncSender<Incoming>, st
                 shared,
             )
         }
-        (false, true) => match found.id.as_ref().and_then(Value::as_u64) {
+        (false, true) if found.has_response => match found.id.as_ref().and_then(Value::as_u64) {
             Some(id) => {
                 shared.resolve(id, Err(LinkError::TooLarge));
                 push(tx, Incoming::Skipped(Skipped::ResponseFailed { id }), stop, shared)
@@ -1738,6 +1755,17 @@ fn handle_over_cap(prefix: &[u8], shared: &Shared, tx: &SyncSender<Incoming>, st
                     stop,
                     shared,
                 )
+            } else if method == "session/update" && shared.framing == Framing::WithJsonrpcMember {
+                push(
+                    tx,
+                    Incoming::Skipped(Skipped::AcpUpdateTooLarge {
+                        session_id: found.session_id,
+                        tool_call_id: found.item_id,
+                        update_kind: found.update_kind,
+                    }),
+                    stop,
+                    shared,
+                )
             } else if method.starts_with("item/") {
                 push(
                     tx,
@@ -1754,7 +1782,7 @@ fn handle_over_cap(prefix: &[u8], shared: &Shared, tx: &SyncSender<Incoming>, st
                 Ok(())
             }
         }
-        (false, false) => Err(Halt::Failed(
+        (false, _) => Err(Halt::Failed(
             "a message from the agent was too large and could not be classified".to_string(),
         )),
     }
@@ -1763,6 +1791,8 @@ fn handle_over_cap(prefix: &[u8], shared: &Shared, tx: &SyncSender<Incoming>, st
 /// What the first bytes of a line say about it.
 #[derive(Default, Debug)]
 struct Prefix {
+    has_response: bool,
+    update_kind: Option<String>,
     has_method: bool,
     method: Option<String>,
     has_id: bool,
@@ -1863,6 +1893,7 @@ impl Scan<'_> {
                         match key.as_str() {
                             "method" => self.found.has_method = true,
                             "id" => self.found.has_id = true,
+                            "result" | "error" => self.found.has_response = true,
                             _ => {}
                         }
                     }
@@ -1942,6 +1973,8 @@ impl Scan<'_> {
             ["id"] => self.found.id = Some(Value::String(text)),
             ["params", "threadId"] => self.found.thread_id = Some(text),
             ["params", "sessionId"] => self.found.session_id = Some(text),
+            ["params", "update", "sessionUpdate"] => self.found.update_kind = Some(text),
+            ["params", "update", "toolCallId"] => self.found.item_id = Some(text),
             ["params", "itemId"] | ["params", "item", "id"] | ["params", "toolCall", "toolCallId"] => {
                 self.found.item_id = Some(text)
             }
@@ -2090,6 +2123,120 @@ mod tests {
             id,
             slot,
             shared: Arc::clone(shared),
+        }
+    }
+
+    #[test]
+    fn oversized_acp_updates_keep_the_session_kind_and_tool_id_when_readable() {
+        for (prefix, expected) in [
+            (&br#"{"method":"session/update","params":{"sessionId":"s1","update":{"sessionUpdate":"tool_call_update","toolCallId":"c1","padding":""#[..],
+                (Some("s1"), Some("c1"), Some("tool_call_update"))),
+            (&br#"{"method":"session/update","params":{"sessionId":"s1","update":{"sessionUpdate":"tool_call_update","padding":""#[..],
+                (Some("s1"), None, Some("tool_call_update"))),
+            (&br#"{"method":"session/update","params":{"update":{"padding":""#[..], (None, None, None)),
+        ] {
+            let shared = Arc::new(Shared::new(Framing::WithJsonrpcMember, refuse_over_cap, 1, None));
+            let (tx, rx) = sync_channel(4);
+            assert!(handle_over_cap(prefix, &shared, &tx, &StopSignal::new().unwrap()).is_ok());
+            assert_eq!(rx.try_recv().unwrap(), Incoming::Skipped(Skipped::AcpUpdateTooLarge {
+                session_id: expected.0.map(str::to_string), tool_call_id: expected.1.map(str::to_string),
+                update_kind: expected.2.map(str::to_string),
+            }));
+        }
+    }
+
+    #[test]
+    fn oversized_requests_need_positive_response_evidence() {
+        for prefix in [
+            &br#"{"id":7,"params":{"padding":""#[..],
+            br#"{"params":{"padding":""#,
+            br#"{"id":7,"params":{"result":"nested"},"padding":""#,
+        ] {
+            let shared = shared_for_test();
+            let mut pending = pending_in(&shared, 7);
+            let (tx, _rx) = sync_channel(4);
+            let stop = StopSignal::new().unwrap();
+            assert!(
+                matches!(handle_over_cap(prefix, &shared, &tx, &stop), Err(Halt::Failed(reason))
+                if reason.contains("could not be classified"))
+            );
+            assert!(pending.try_take().is_none(), "a request consumed our pending response");
+        }
+        for prefix in [
+            &br#"{"id":7,"method":"session/request_permission","params":{"padding":""#[..],
+            br#"{"method":"session/request_permission","id":7,"params":{"padding":""#,
+        ] {
+            let shared = shared_for_test();
+            let mut pending = pending_in(&shared, 7);
+            let (tx, rx) = sync_channel(4);
+            assert!(handle_over_cap(prefix, &shared, &tx, &StopSignal::new().unwrap()).is_ok());
+            assert!(matches!(
+                rx.try_recv().unwrap(),
+                Incoming::Skipped(Skipped::RequestAnswered { .. })
+            ));
+            assert!(pending.try_take().is_none());
+        }
+        for prefix in [
+            &br#"{"id":7,"result":{"padding":""#[..],
+            br#"{"result":null,"id":7,"padding":""#,
+            br#"{"id":7,"error":{"message":""#,
+        ] {
+            let shared = shared_for_test();
+            let mut pending = pending_in(&shared, 7);
+            let (tx, rx) = sync_channel(4);
+            assert!(handle_over_cap(prefix, &shared, &tx, &StopSignal::new().unwrap()).is_ok());
+            assert_eq!(pending.try_take(), Some(Err(LinkError::TooLarge)));
+            assert_eq!(
+                rx.try_recv().unwrap(),
+                Incoming::Skipped(Skipped::ResponseFailed { id: 7 })
+            );
+        }
+    }
+
+    #[test]
+    fn invalid_response_envelopes_fail_the_pending_call() {
+        for message in [
+            serde_json::json!({"jsonrpc":"2.0","id":7}),
+            serde_json::json!({"jsonrpc":"2.0","id":7,"result":null,"error":{"code":1,"message":"no"}}),
+            serde_json::json!({"jsonrpc":"1.0","id":7,"result":null}),
+            serde_json::json!({"id":7,"result":null}),
+            serde_json::json!({"jsonrpc":"2.0","id":7,"error":{"code":"1","message":"no"}}),
+            serde_json::json!({"jsonrpc":"2.0","id":7,"error":{"code":1.5,"message":"no"}}),
+            serde_json::json!({"jsonrpc":"2.0","id":7,"error":null}),
+        ] {
+            let shared = Arc::new(Shared::new(Framing::WithJsonrpcMember, refuse_over_cap, 1, None));
+            let mut pending = pending_in(&shared, 7);
+            let (tx, _rx) = sync_channel(4);
+            assert!(handle_line(
+                message.to_string().as_bytes(),
+                &shared,
+                &tx,
+                &StopSignal::new().unwrap()
+            )
+            .is_ok());
+            assert!(
+                matches!(pending.try_take(), Some(Err(LinkError::Rpc { code: -32600, .. }))),
+                "{message}"
+            );
+        }
+        for (framing, message) in [
+            (Framing::Bare, serde_json::json!({"id":7,"result":null})),
+            (
+                Framing::WithJsonrpcMember,
+                serde_json::json!({"jsonrpc":"2.0","id":7,"result":null}),
+            ),
+        ] {
+            let shared = Arc::new(Shared::new(framing, refuse_over_cap, 1, None));
+            let mut pending = pending_in(&shared, 7);
+            let (tx, _rx) = sync_channel(4);
+            assert!(handle_line(
+                message.to_string().as_bytes(),
+                &shared,
+                &tx,
+                &StopSignal::new().unwrap()
+            )
+            .is_ok());
+            assert_eq!(pending.try_take(), Some(Ok(Value::Null)));
         }
     }
 

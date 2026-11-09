@@ -1933,3 +1933,238 @@ echo "stand-in: gone" >&2
         notices[0]
     );
 }
+
+#[test]
+fn skipped_tool_updates_withhold_cached_preview_and_approval() {
+    for (prefix, suffix) in [
+        (
+            r#"{"jsonrpc":"2.0","method":"session/update","params":{"sessionId":"s1","update":{"sessionUpdate":"tool_call_update","toolCallId":"c1","padding":""#,
+            r#""}}}"#,
+        ),
+        (
+            r#"{"jsonrpc":"2.0","method":"session/update","params":{"sessionId":"s1","update":{"sessionUpdate":"tool_call_update","padding":""#,
+            r#"","toolCallId":"c1"}}}"#,
+        ),
+        (
+            r#"{"jsonrpc":"2.0","method":"session/update","params":{"update":{"sessionUpdate":"tool_call_update","toolCallId":"c1","padding":""#,
+            r#""},"sessionId":"s1"}}"#,
+        ),
+    ] {
+        let mut script = boot("agent");
+        script.extend([
+            expect_prompt(3, "edit"),
+            update(
+                "s1",
+                json!({"sessionUpdate":"tool_call", "toolCallId":"c1", "kind":"edit",
+                "rawInput":{"old":"stale"},
+                "content":[{"type":"diff","path":"/work/a","oldText":"old","newText":"stale"}]}),
+            ),
+            json!({"write_big":{"prefix":prefix,"bytes":agent::jsonrpc_link::MAX_LINE + 1,"suffix":suffix}}),
+            agent_request(
+                7,
+                "session/request_permission",
+                json!({"sessionId":"s1",
+                "toolCall":{"toolCallId":"c1"}, "options":options_with_always()}),
+            ),
+            expect_answer(7, json!({"outcome":{"outcome":"selected","optionId":"r-1"}})),
+            reply(3, json!({"stopReason":"end_turn"})),
+        ]);
+        let provider = started(script, None);
+        send(&provider, "edit").unwrap();
+        let (id, events) = until_permission(&provider);
+        let input = events
+            .iter()
+            .find_map(|event| match event {
+                AgentDomainEvent::PermissionRequested { input, .. } => Some(input),
+                _ => None,
+            })
+            .unwrap();
+        assert_eq!(input["inputCut"], true, "{input}");
+        assert_eq!(input["diffs"], json!([]));
+        assert!(input["rawInput"].is_null());
+        assert!(!input.to_string().contains("stale"));
+        assert!(input["title"].as_str().unwrap().contains("could not be shown"));
+        assert!(input["options"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|o| o["kind"] != "allow_once"));
+        assert!(matches!(
+            allow(&provider, &id),
+            Err(ProviderError::Provider {
+                code: ProviderErrorCode::PermissionNotFound,
+                ..
+            })
+        ));
+        deny(&provider, &id).unwrap();
+        assert_eq!(turn_end(&until_completed(&provider)).0, TurnOutcome::Completed);
+    }
+}
+
+#[test]
+fn skipped_mode_updates_preserve_tool_approvals_without_auto_mode() {
+    for kind in ["current_mode_update", "config_option_update"] {
+        let mut script = boot("agent");
+        script.extend([
+            expect_prompt(3, "edit"),
+            update("s1", tool_call("c1", "execute", "Cached command")),
+            json!({"write_big":{
+                "prefix":format!(r#"{{"jsonrpc":"2.0","method":"session/update","params":{{"sessionId":"s1","update":{{"sessionUpdate":"{kind}","padding":""#),
+                "bytes":agent::jsonrpc_link::MAX_LINE + 1, "suffix":r#""}}}"#}}),
+            agent_request(7, "session/request_permission", json!({
+                "sessionId":"s1", "toolCall":{"toolCallId":"c1"}, "options":options_with_always()
+            })),
+            expect_answer(7, json!({"outcome":{"outcome":"selected","optionId":"a-1"}})),
+            reply(3, json!({"stopReason":"end_turn"})),
+        ]);
+        let provider = started(script, None);
+        send(&provider, "edit").unwrap();
+        let (id, events) = until_permission(&provider);
+        let input = events
+            .iter()
+            .find_map(|event| match event {
+                AgentDomainEvent::PermissionRequested { input, .. } => Some(input),
+                _ => None,
+            })
+            .unwrap();
+        assert_ne!(input["inputCut"], true, "{kind}: {input}");
+        assert_eq!(input["rawInput"]["command"], "ls");
+        allow(&provider, &id).unwrap();
+        assert_eq!(turn_end(&until_completed(&provider)).0, TurnOutcome::Completed);
+    }
+}
+
+#[test]
+fn skipped_tool_updates_withhold_waiting_card_approvals() {
+    for kind in [Some("tool_call"), Some("tool_call_update"), Some("future_update"), None] {
+        for call in [Some("c1"), None] {
+            let kind_field = kind
+                .map(|kind| format!(r#""sessionUpdate":"{kind}","#))
+                .unwrap_or_default();
+            let call_field = call
+                .map(|call| format!(r#""toolCallId":"{call}","#))
+                .unwrap_or_default();
+            let mut script = boot("agent");
+            script.push(expect_prompt(3, "edit"));
+            for (request, call) in [(7, "c1"), (8, "c2"), (9, "c1")] {
+                script.push(agent_request(
+                    request,
+                    "session/request_permission",
+                    permission_params(call, options_with_always()),
+                ));
+            }
+            script.extend([
+                json!({"write_big":{
+                    "prefix":format!(r#"{{"jsonrpc":"2.0","method":"session/update","params":{{"sessionId":"s1","update":{{{kind_field}{call_field}"padding":""#),
+                    "bytes":agent::jsonrpc_link::MAX_LINE + 1, "suffix":r#""}}}"#}}),
+                update("s1", json!({"sessionUpdate":"available_commands_update", "availableCommands":[{"name":"ready","description":"Updates sent"}]})),
+                expect_answer(7, json!({"outcome":{"outcome":"selected","optionId":"r-1"}})),
+                expect_answer(8, json!({"outcome":{"outcome":"selected","optionId":if call.is_some() { "a-1" } else { "r-1" }}})),
+                expect_answer(9, json!({"outcome":{"outcome":"selected","optionId":"r-1"}})),
+                reply(3, json!({"stopReason":"end_turn"})),
+            ]);
+            let provider = started(script, None);
+            send(&provider, "edit").unwrap();
+            let events = pump_until(&provider, "updates sent", |event| {
+                matches!(event, AgentDomainEvent::CommandsAvailable { .. })
+            });
+            let cards: Vec<_> = events
+                .iter()
+                .filter_map(|event| match event {
+                    AgentDomainEvent::PermissionRequested {
+                        permission_id,
+                        tool_use_id,
+                        ..
+                    } => Some((permission_id, tool_use_id)),
+                    _ => None,
+                })
+                .collect();
+            assert_eq!(cards.len(), 3);
+            for (id, tool) in cards {
+                if call.is_none() || tool.as_deref() == call {
+                    let err = allow(&provider, id).expect_err("skipped content must block an existing card");
+                    assert!(matches!(
+                        err,
+                        ProviderError::Provider {
+                            code: ProviderErrorCode::PermissionNotFound,
+                            ..
+                        }
+                    ));
+                    assert!(err.to_string().contains("held back"), "{err}");
+                    deny(&provider, id).unwrap();
+                } else {
+                    allow(&provider, id).unwrap();
+                }
+            }
+            assert_eq!(turn_end(&until_completed(&provider)).0, TurnOutcome::Completed);
+        }
+    }
+}
+
+#[test]
+fn skipped_mode_updates_fail_closed_during_setup_and_turns() {
+    for kind in [Some("current_mode_update"), Some("config_option_update"), None] {
+        for during_setup in [false, true] {
+            let kind_field = kind
+                .map(|kind| format!(r#""sessionUpdate":"{kind}","#))
+                .unwrap_or_default();
+            let oversized = json!({"write_big":{
+                "prefix":format!(r#"{{"jsonrpc":"2.0","method":"session/update","params":{{"sessionId":"s1","update":{{{kind_field}"padding":""#),
+                "bytes":agent::jsonrpc_link::MAX_LINE + 1, "suffix":r#""}}}"#}});
+            let mut script = if during_setup { boot("agent") } else { boot("auto") };
+            if during_setup {
+                script.push(expect_request(
+                    3,
+                    "session/set_mode",
+                    json!({"sessionId":"s1","modeId":"auto"}),
+                ));
+            } else {
+                script.push(expect_prompt(3, "x"));
+            }
+            script.push(oversized);
+            if during_setup {
+                script.push(update(
+                    "s1",
+                    json!({"sessionUpdate":"current_mode_update", "currentModeId":"auto"}),
+                ));
+                script.push(reply(3, json!({})));
+            }
+            script.push(json!({"expect":".*"}));
+            let provider = started(script, Some("auto"));
+            if !during_setup {
+                send(&provider, "x").unwrap();
+            }
+            let events = pump_until(&provider, "mode failure", |e| {
+                matches!(e, AgentDomainEvent::PolicyMismatch { .. })
+            });
+            assert!(events
+                .iter()
+                .any(|e| matches!(e, AgentDomainEvent::PolicyMismatch { reported, .. }
+                if reported.contains("larger than 16 MiB"))));
+            assert!(send(&provider, "after").is_err());
+        }
+    }
+}
+
+#[test]
+fn invalid_set_mode_responses_cannot_confirm_the_mode() {
+    for response in [
+        json!({"jsonrpc":"2.0","id":3}),
+        json!({"jsonrpc":"2.0","id":3,"result":{},"error":{"code":1,"message":"bad"}}),
+        json!({"jsonrpc":"1.0","id":3,"result":{}}),
+        json!({"jsonrpc":"2.0","id":3,"error":{"code":"bad","message":"bad"}}),
+    ] {
+        let mut script = boot("agent");
+        script.extend([
+            expect_request(3, "session/set_mode", json!({"sessionId":"s1","modeId":"auto"})),
+            write(response),
+            json!({"expect":".*"}),
+        ]);
+        let provider = started(script, Some("auto"));
+        assert!(provider
+            .pump()
+            .iter()
+            .any(|e| matches!(e, AgentDomainEvent::PolicyMismatch { .. })));
+        assert!(send(&provider, "x").is_err());
+    }
+}

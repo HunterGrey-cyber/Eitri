@@ -1824,6 +1824,8 @@ impl CodexProvider {
 
     fn on_skipped(&self, st: &mut State, skipped: Skipped) {
         match skipped {
+            // Only ACP framing emits this notification class.
+            Skipped::AcpUpdateTooLarge { .. } => {}
             Skipped::TurnTooLarge {
                 method: name,
                 thread_id,

@@ -179,6 +179,11 @@ pub struct Fold {
     /// What the updates so far said about each call that has not ended, merged. A row's input is fixed
     /// when it starts and its result is made when the call ends, so both read this.
     calls: HashMap<String, ToolCallFields>,
+    /// A discarded update leaves this turn's affected previews incomplete, also after a move.
+    #[serde(default)]
+    missed: HashSet<String>,
+    #[serde(default)]
+    missed_any: bool,
     /// The text of the last whole message, which is the turn's result.
     pub last_message: String,
     message_open: bool,
@@ -189,6 +194,25 @@ impl Fold {
     /// Forgets the turn's calls, as its end does.
     pub fn clear(&mut self) {
         *self = Fold::default();
+    }
+
+    /// Drops cached content that a discarded update may have replaced. Partial later updates cannot
+    /// establish what the missing fields said, so the mark lasts for the turn.
+    pub fn invalidate_preview(&mut self, id: Option<&str>) {
+        match id {
+            Some(id) => {
+                self.calls.remove(id);
+                self.missed.insert(id.to_string());
+            }
+            None => {
+                self.calls.clear();
+                self.missed_any = true;
+            }
+        }
+    }
+
+    pub fn preview_missing(&self, id: &str) -> bool {
+        self.missed_any || self.missed.contains(id)
     }
 
     /// Whether a call's row is open.
@@ -268,8 +292,16 @@ impl Fold {
         fields: &ToolCallFields,
         out: &mut dyn FnMut(AgentDomainEvent),
     ) -> ToolCallFields {
-        let Some(whole) = self.merge(fields).map(|kept| kept.clone()) else {
+        if self.done.contains(&fields.id) {
             return fields.clone();
+        }
+        let whole = if self.preview_missing(&fields.id) {
+            fields.clone()
+        } else {
+            let Some(whole) = self.merge(fields).cloned() else {
+                return fields.clone();
+            };
+            whole
         };
         self.start(turn_id, &whole, out);
         whole
@@ -317,6 +349,38 @@ impl Fold {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn skipped_previews_stay_incomplete_across_updates_and_handoff() {
+        let call = |id: &str| {
+            ToolCallFields::parse(&json!({
+                "toolCallId": id, "kind": "edit", "rawInput": {"old": "stale"},
+                "content": [{"type": "diff", "path": "/work/a", "newText": "stale"}]
+            }))
+            .unwrap()
+        };
+        for id in [Some("c1"), None] {
+            let mut fold = Fold::default();
+            fold.apply("t", &Update::ToolCall(call("c1")), &mut |_| {});
+            fold.apply("t", &Update::ToolCall(call("c2")), &mut |_| {});
+            fold.invalidate_preview(id);
+            assert!(!fold.calls.contains_key("c1"));
+            assert_eq!(fold.calls.contains_key("c2"), id.is_some());
+            // A later partial update cannot restore the fields that were lost.
+            fold.apply("t", &Update::ToolCallUpdate(call("c1")), &mut |_| {});
+            let mut moved: Fold = serde_json::from_value(serde_json::to_value(&fold).unwrap()).unwrap();
+            assert!(moved.preview_missing("c1"));
+            assert_eq!(moved.preview_missing("c2"), id.is_none());
+            assert_eq!(moved.preview_missing("future"), id.is_none());
+            let request = ToolCallFields::parse(&json!({"toolCallId":"c1"})).unwrap();
+            let shown = moved.ensure_started("t", &request, &mut |_| {});
+            assert!(shown.diffs().is_empty());
+            assert!(shown.raw_input.is_none());
+            let ended = ToolCallFields::parse(&json!({"toolCallId":"c1", "status":"completed"})).unwrap();
+            moved.apply("t", &Update::ToolCallUpdate(ended), &mut |_| {});
+            moved.ensure_started("t", &request, &mut |_| panic!("an ended call got another row"));
+        }
+    }
 
     #[test]
     fn stop_reasons_have_one_outcome_each() {
