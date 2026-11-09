@@ -1266,10 +1266,10 @@ pub(crate) fn build(app: &Application, start: &Start) -> Rc<CompanionWindow> {
             if let Some(feed) = &keys_feed {
                 feed.cleanup();
             }
-            if let Some(path) = &scratch_path {
-                let _ = std::fs::remove_dir_all(path);
-            }
             agent_panel::hold_until_done(&app, agent.shutdown());
+            if let Some(path) = &scratch_path {
+                eitri_core::scratch::cleanup_detached(path.clone());
+            }
             // Held for the window's life: GTK does not reliably free this closure before the
             // process ends, and both must outlive the panel's teardown.
             let _ = (&lua, &theme_css);

@@ -1,4 +1,4 @@
-//! Bounded suffix searches. Listing and checking real paths happen only on the request's worker.
+//! Exact opens and bounded suffix searches. Listing and checking real paths happen only on the request's worker.
 use super::*;
 use eitri_core::path_complete::{find_by_suffix, Stopped, SuffixLimits, SuffixLookup};
 use std::sync::{
@@ -205,7 +205,17 @@ pub(super) fn start(
         wanted: path.clone(),
         started: Instant::now(),
     };
-    start_worker(state, request, move || lookup(&root, &path, limits))
+    start_worker(state, request, move || {
+        match super::links::open_path_exact(&root, &path) {
+            Ok(resolved) => Ok(Answer::Ready(resolved)),
+            Err(super::links::OpenPathRefusal::Missing)
+                if eitri_core::path_complete::suffix_wanted(&path).is_some() =>
+            {
+                lookup(&root, &path, limits)
+            }
+            Err(why) => Err(why.message(&path)),
+        }
+    })
 }
 
 /// An offered name retains its checked identity until chosen or expired. Choosing one consumes the
@@ -413,6 +423,31 @@ mod tests {
             .find(|v| v["requestId"] == "find")
     }
     #[test]
+    fn path_lookup_exact_open_uses_worker_and_missing_falls_back() {
+        let root = Project::new();
+        root.write("exact.rs");
+        root.write("src/fallback.rs");
+        for (wanted, expected) in [
+            ("exact.rs", "exact.rs"),
+            ("src", "src"),
+            ("fallback.rs", "src/fallback.rs"),
+        ] {
+            let (handle, page, _) = handle_with_recording_page();
+            handle.state.borrow_mut().project_dir = root.0.clone();
+            let opened = record_opens(&handle);
+            ask(&handle, wanted);
+            assert_eq!(handle.state.borrow().path_lookup.running.len(), 1);
+            assert!(opened.borrow().is_empty(), "only the tick delivers worker results");
+            assert!(response(&page).is_none());
+            tick_handle_until(&handle, "worker open", || response(&page).is_some());
+            assert_eq!(response(&page).unwrap()["ok"], true);
+            assert_eq!(
+                *opened.borrow(),
+                vec![eitri_core::scratch::open_request(&root.0.join(expected), Some(12))]
+            );
+        }
+    }
+    #[test]
     fn path_lookup_opens_a_single_suffix_with_its_project_name_and_line() {
         let root = Project::new();
         root.write("src/deep/a.rs");
@@ -485,22 +520,26 @@ mod tests {
         );
     }
     #[test]
-    fn path_lookup_invalid_requests_never_start_a_worker() {
+    fn path_lookup_invalid_requests_refuse_controls_before_worker_check() {
         let root = Project::new();
         for path in ["../x.rs", "a/../b.rs", "bad\nname.rs", "bad\u{85}.rs", "bad\u{202e}.rs"] {
             let (handle, page, _) = handle_with_recording_page();
             handle.state.borrow_mut().project_dir = root.0.clone();
             ask(&handle, path);
-            assert!(handle.state.borrow().path_lookup.running.is_empty());
-            let answer = response(&page).expect("immediate refusal");
+            let control = eitri_core::agent_bridge::path_holds_control(path);
+            if control {
+                assert!(handle.state.borrow().path_lookup.running.is_empty());
+                assert!(response(&page).is_some(), "controls are refused synchronously");
+            } else {
+                tick_handle_until(&handle, "missing exact path", || response(&page).is_some());
+            }
+            let answer = response(&page).unwrap();
             assert_eq!(answer["ok"], false);
-            assert!(answer["error"].as_str().unwrap().contains(
-                if eitri_core::agent_bridge::path_holds_control(path) {
-                    "control character"
-                } else {
-                    "no such file"
-                }
-            ));
+            assert!(answer["error"].as_str().unwrap().contains(if control {
+                "control character"
+            } else {
+                "no such file"
+            }));
         }
     }
     #[test]

@@ -1227,7 +1227,7 @@ impl ServiceSet for Services {
             }
             CleanupOp::ScratchDir => {
                 if let Some(path) = &teardown.scratch_path {
-                    let _ = std::fs::remove_dir_all(path);
+                    eitri_core::scratch::cleanup_detached(path.clone());
                 }
             }
             // Explicitly, not by `Drop`: GTK does not reliably free what held the channel before the process exits,

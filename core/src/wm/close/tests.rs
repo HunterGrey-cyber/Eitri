@@ -140,11 +140,11 @@ fn teardown_ops_with(written: bool, record: Option<CleanupOp>) -> Vec<HostOp> {
     ops.extend(record.map(HostOp::Cleanup));
     ops.extend([
         HostOp::Terminal(TermOp::ShutdownAll { win: WIN }),
-        HostOp::Cleanup(CleanupOp::ScratchDir),
         HostOp::Cleanup(CleanupOp::PaneSwitchDir),
         HostOp::Cleanup(CleanupOp::Feeds),
         HostOp::Plugin(PluginOp::ShutdownAll { win: WIN }),
         HostOp::Chat(ChatOp::ShutdownAll { win: WIN, hold: true }),
+        HostOp::Cleanup(CleanupOp::ScratchDir),
         HostOp::CloseWindow { win: WIN },
     ]);
     ops

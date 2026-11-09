@@ -1387,25 +1387,14 @@ pub(super) fn handle_inbound_message(
                 };
                 tab
             };
-            if let Some(result) = super::path_lookup::pick(state, &path, line, view, &request_id, tab) {
+            if eitri_core::agent_bridge::path_holds_control(&path) {
+                refuse(&mut out, &super::links::OpenPathRefusal::ControlChar.message(&path));
+            } else if let Some(result) = super::path_lookup::pick(state, &path, line, view, &request_id, tab) {
                 if let Err(why) = result {
                     refuse(&mut out, &why);
                 }
-            } else {
-                match super::links::open_path_exact(&state.project_dir, &path) {
-                    Ok(resolved) => out.effect(Effect::AskEditor {
-                        request: eitri_core::scratch::open_request(&resolved, line),
-                        then: EditorThen::Answer { view, request_id },
-                    }),
-                    Err(super::links::OpenPathRefusal::Missing)
-                        if eitri_core::path_complete::suffix_wanted(&path).is_some() =>
-                    {
-                        if let Err(why) = super::path_lookup::start(state, path, line, view, request_id.clone(), tab) {
-                            refuse(&mut out, &why);
-                        }
-                    }
-                    Err(why) => refuse(&mut out, &why.message(&path)),
-                }
+            } else if let Err(why) = super::path_lookup::start(state, path, line, view, request_id.clone(), tab) {
+                refuse(&mut out, &why);
             }
         }
         // `c` in BROWSE: the jobs are built here, from this tab's own session and edit calls, and run

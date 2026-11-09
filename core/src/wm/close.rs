@@ -938,11 +938,11 @@ pub fn teardown(w: &mut Window, win: WinId, batch: &mut Batch) {
         .chain(record)
         .chain([
             HostOp::Terminal(TermOp::ShutdownAll { win }),
-            HostOp::Cleanup(CleanupOp::ScratchDir),
             HostOp::Cleanup(CleanupOp::PaneSwitchDir),
             HostOp::Cleanup(CleanupOp::Feeds),
             HostOp::Plugin(PluginOp::ShutdownAll { win }),
             HostOp::Chat(ChatOp::ShutdownAll { win, hold: true }),
+            HostOp::Cleanup(CleanupOp::ScratchDir),
             HostOp::CloseWindow { win },
         ])
     {

@@ -4,10 +4,15 @@
 //! Lua; bodies travel as files in a per-window 0700 directory; an
 //! edit's result comes back as a marker file the agent panel's 33 ms tick polls.
 
-use std::io;
+use std::io::{self, Read};
 use std::path::{Path, PathBuf};
 
 use crate::agent_bridge::{ProposedChange, ProposedEdit};
+
+const MARKER_MAX_BYTES: u64 = 4 * 1024;
+// Drafts return locally without the proposal limit, or through a 16 MiB JSON link body. Leave
+// headroom above that body limit so drafts just past it reach the normal hand-back refusal.
+const DRAFT_MAX_BYTES: u64 = 32 * 1024 * 1024;
 
 const DIR_PREFIX: &str = "nv-sc-";
 /// No socket lives here; the sweep's socket probe finds nothing and the pid alone decides. The
@@ -324,19 +329,53 @@ pub struct PendingEdit {
     pub done: PathBuf,
 }
 
+fn read_scratch_text(path: &Path, cap: u64) -> io::Result<Option<String>> {
+    let mut bytes = Vec::new();
+    std::fs::File::open(path)?.take(cap + 1).read_to_end(&mut bytes)?;
+    if bytes.len() as u64 > cap {
+        eprintln!("[scratch] refused {}: exceeds {cap} bytes", path.display());
+        return Ok(None);
+    }
+    String::from_utf8(bytes)
+        .map(Some)
+        .map_err(|why| io::Error::new(io::ErrorKind::InvalidData, why))
+}
+
+/// Hands a closed window's scratch directory to a detached worker. Startup sweeps leftovers whose
+/// process has exited, so neither a failed spawn nor process exit during removal needs a close hold.
+pub fn cleanup_detached(path: PathBuf) {
+    if let Err(why) = cleanup_with(path, |path| {
+        let _ = std::fs::remove_dir_all(path);
+    }) {
+        eprintln!("[scratch] could not start cleanup: {why}");
+    }
+}
+
+fn cleanup_with(path: PathBuf, remove: impl FnOnce(PathBuf) + Send + 'static) -> io::Result<()> {
+    std::thread::Builder::new()
+        .name("scratch-cleanup".into())
+        .spawn(move || remove(path))
+        .map(|_| ())
+}
+
 impl PendingEdit {
     /// `None` until nvim wrote the marker. An empty marker is still being written, not a failure:
     /// the snippet renames a finished file into place, but reading one mid-write as `Failed("")`
     /// would delete the text the user just `:wq`'d, so this side does not rely on that alone.
     pub fn poll(&self) -> Option<EditDone> {
-        let marker = std::fs::read_to_string(&self.done).ok()?;
+        let Some(marker) = read_scratch_text(&self.done, MARKER_MAX_BYTES).ok()? else {
+            return Some(EditDone::Failed(format!(
+                "scratch marker exceeds {MARKER_MAX_BYTES} bytes"
+            )));
+        };
         let marker = marker.trim_end();
         if marker.is_empty() {
             return None;
         }
         Some(if marker == "written" {
-            match std::fs::read_to_string(&self.body) {
-                Ok(text) => EditDone::Written(text.strip_suffix('\n').unwrap_or(&text).to_string()),
+            match read_scratch_text(&self.body, DRAFT_MAX_BYTES) {
+                Ok(Some(text)) => EditDone::Written(text.strip_suffix('\n').unwrap_or(&text).to_string()),
+                Ok(None) => EditDone::Failed(format!("edited draft exceeds {DRAFT_MAX_BYTES} bytes")),
                 Err(e) => EditDone::Failed(format!("could not read the edited draft back: {e}")),
             }
         } else if marker == "discarded" {
@@ -495,7 +534,7 @@ impl ScratchDir {
         Ok((request, edit))
     }
 
-    /// Called from the window's close handler (GTK does not reliably run `Drop` before exit).
+    /// Removes the directory synchronously; GTK window close uses [`cleanup_detached`].
     pub fn cleanup(&self) {
         let _ = std::fs::remove_dir_all(&self.dir);
     }
@@ -597,6 +636,83 @@ mod tests {
         let file = dir.reserve_view("gone");
         dir.cleanup();
         assert!(file.write("x").is_err(), "the directory is gone");
+    }
+
+    #[test]
+    fn scratch_cleanup_returns_while_removal_is_held_on_its_worker() {
+        use std::sync::mpsc;
+        use std::time::Duration;
+        let path = PathBuf::from("/unused/scratch-cleanup");
+        let expected = path.clone();
+        let (entered, entry) = mpsc::channel();
+        let (release, held) = mpsc::channel::<()>();
+        let (returned, result) = mpsc::channel();
+        let caller = std::thread::spawn(move || {
+            cleanup_with(path, move |path| {
+                entered
+                    .send((path, std::thread::current().name().unwrap_or("unnamed").to_owned()))
+                    .unwrap();
+                let _ = held.recv();
+            })
+            .unwrap();
+            returned.send(()).unwrap();
+        });
+        assert_eq!(
+            entry.recv_timeout(Duration::from_secs(60)).unwrap(),
+            (expected, "scratch-cleanup".into())
+        );
+        result
+            .recv_timeout(Duration::from_secs(60))
+            .expect("cleanup must return while removal is still held");
+        release.send(()).unwrap();
+        caller.join().unwrap();
+    }
+
+    #[test]
+    fn scratch_cleanup_detached_removes_the_directory() {
+        let dir = ScratchDir::in_dir(&tmp()).unwrap();
+        let path = dir.path().to_owned();
+        cleanup_detached(path.clone());
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
+        while path.exists() {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "cleanup worker did not remove the directory"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
+    }
+
+    #[test]
+    fn scratch_draft_read_accepts_the_cap_and_refuses_one_byte_more() {
+        let mut dir = ScratchDir::in_dir(&tmp()).unwrap();
+        let (_, edit) = dir.prepare_edit("draft").unwrap();
+        std::fs::write(&edit.done, "written").unwrap();
+        let text = "x".repeat(DRAFT_MAX_BYTES as usize);
+        std::fs::write(&edit.body, &text).unwrap();
+        assert_eq!(edit.poll(), Some(EditDone::Written(text)));
+        std::fs::write(&edit.body, vec![b'x'; DRAFT_MAX_BYTES as usize + 1]).unwrap();
+        let result = edit.poll();
+        dir.cleanup();
+        assert_eq!(
+            result,
+            Some(EditDone::Failed(format!(
+                "edited draft exceeds {DRAFT_MAX_BYTES} bytes"
+            )))
+        );
+    }
+
+    #[test]
+    fn scratch_marker_read_accepts_the_cap_and_refuses_one_byte_more() {
+        let mut dir = ScratchDir::in_dir(&tmp()).unwrap();
+        let (_, edit) = dir.prepare_edit("draft").unwrap();
+        let marker = format!("discarded{}", " ".repeat(4096 - "discarded".len()));
+        std::fs::write(&edit.done, &marker).unwrap();
+        assert_eq!(edit.poll(), Some(EditDone::Discarded));
+        std::fs::write(&edit.done, format!("{marker} ")).unwrap();
+        let result = edit.poll();
+        dir.cleanup();
+        assert!(matches!(result, Some(EditDone::Failed(why)) if why.contains("exceeds")));
     }
 
     #[test]

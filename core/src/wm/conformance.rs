@@ -67,11 +67,11 @@ pub fn teardown_script_for(win: WinId, record: Option<CleanupOp>) -> Script {
     ops.extend(record.map(HostOp::Cleanup));
     ops.extend([
         HostOp::Terminal(TermOp::ShutdownAll { win }),
-        HostOp::Cleanup(CleanupOp::ScratchDir),
         HostOp::Cleanup(CleanupOp::PaneSwitchDir),
         HostOp::Cleanup(CleanupOp::Feeds),
         HostOp::Plugin(PluginOp::ShutdownAll { win }),
         HostOp::Chat(ChatOp::ShutdownAll { win, hold: true }),
+        HostOp::Cleanup(CleanupOp::ScratchDir),
         HostOp::CloseWindow { win },
     ]);
     let mut expect: Vec<_> = (0..ops.len())

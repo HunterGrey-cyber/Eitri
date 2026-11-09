@@ -574,11 +574,11 @@ fn the_signal_close_detaches_an_attached_editor() {
             HostOp::Cleanup(CleanupOp::PairOnClose { layout_written: false }),
             HostOp::Editor(EditorCall::Detach { win: WIN }),
             HostOp::Terminal(TermOp::ShutdownAll { win: WIN }),
-            HostOp::Cleanup(CleanupOp::ScratchDir),
             HostOp::Cleanup(CleanupOp::PaneSwitchDir),
             HostOp::Cleanup(CleanupOp::Feeds),
             HostOp::Plugin(PluginOp::ShutdownAll { win: WIN }),
             HostOp::Chat(ChatOp::ShutdownAll { win: WIN, hold: true }),
+            HostOp::Cleanup(CleanupOp::ScratchDir),
             HostOp::CloseWindow { win: WIN },
         ],
         "the owned editor's teardown, with `Editor(Detach)` in place of `Editor(Shutdown)` and no record"
