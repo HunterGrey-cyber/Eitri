@@ -173,6 +173,7 @@ OPT_ALLOW_VERDANDI_REV_MISMATCH=0
 OPT_INSECURE_SKIP_SIGNATURE=0
 
 LOCK_HELD=0
+TAKEOVER_HELD=0
 NV_LOCK=
 NV_NEW_CREATED=0
 NV_CACHE_CREATED=0
@@ -1899,20 +1900,17 @@ acquire_lock() {
 				# its pid has not been checked yet, so the message must cover live locks too.
 				die "another Eitri installer (pid $_al_tk_pid) is already checking the lock $NV_LOCK: wait a moment and re-run"
 			fi
-			if ! rm -rf -- "$_al_takeover" 2>/dev/null || ! mkdir -- "$_al_takeover" 2>/dev/null; then
-				die "another Eitri installer is already checking the lock $NV_LOCK: wait a moment and re-run"
-			fi
+			# Recovering this sub-lock by removal would let two contenders replace each other's lock.
+			die "$_al_takeover has a dead pid ($_al_tk_pid), so no installer is using it: if none is running, remove $_al_takeover by hand and re-run"
 		fi
 		printf '%s\n' "$$" >"$_al_takeover/pid" 2>/dev/null || :
-		# Recovery of the takeover sub-lock has no lower lock to serialize it: two runs can both
-		# find its holder dead, remove it and mkdir it again. Read our pid back to reject a run
-		# whose write lost before it touches NV_LOCK. This is provisional: it narrows the race
-		# but cannot catch a read that precedes the competing write, so does not make recovery atomic.
+		# Confirm the pid was written before touching the main lock.
 		_al_tk_owner=$(cat -- "$_al_takeover/pid" 2>/dev/null) || _al_tk_owner=
 		if [ "$_al_tk_owner" != "$$" ]; then
-			# NV_LOCK's pid is still unread here, so report contention without claiming it is stale.
-			die "another Eitri installer is also checking the lock $NV_LOCK right now: wait a moment and re-run"
+			rm -rf -- "$_al_takeover" || :
+			die "cannot write $_al_takeover/pid: check that $NV_CACHE_NV is writable and re-run"
 		fi
+		TAKEOVER_HELD=1
 		# From here to the fresh mkdir below runs under that sub-lock: the pid is read fresh (never
 		# an outer read a concurrent run's own takeover might have raced against) and NV_LOCK is
 		# never moved back onto a path anything else could since have claimed -- a lock found to
@@ -1926,11 +1924,13 @@ acquire_lock() {
 		fi
 		if [ -z "$_al_pid" ]; then
 			rm -rf -- "$_al_takeover" || :
+			TAKEOVER_HELD=0
 			die "the lock $NV_LOCK holds no pid, so whether another Eitri installer is using it cannot be told: if none is running, remove $NV_LOCK and re-run"
 		fi
 		_al_live=$(pid_alive "$_al_pid")
 		if [ "$_al_live" = 1 ]; then
 			rm -rf -- "$_al_takeover" || :
+			TAKEOVER_HELD=0
 			die "another Eitri installer (pid $_al_pid) is running: wait for it to finish and re-run. If none is running, remove $NV_LOCK and re-run"
 		fi
 		warn "taking over a lock left by an installer that is no longer running (pid $_al_pid)"
@@ -1938,16 +1938,22 @@ acquire_lock() {
 		# this run holds the takeover sub-lock (every other path that would touch a stale-looking
 		# NV_LOCK needs that same sub-lock first), so there is nothing left to protect a rename
 		# against.
-		rm -rf -- "$NV_LOCK" || die "cannot remove the stale lock $NV_LOCK: remove it by hand and re-run"
+		if ! rm -rf -- "$NV_LOCK"; then
+			rm -rf -- "$_al_takeover" || :
+			TAKEOVER_HELD=0
+			die "cannot remove the stale lock $NV_LOCK: remove it by hand and re-run"
+		fi
 		if ! mkdir -- "$NV_LOCK" 2>/dev/null; then
 			# The one race this cannot close: an entirely separate, fresh run's own very first
 			# `mkdir NV_LOCK` (which needs no sub-lock at all, since to it NV_LOCK simply did not
 			# exist) landing in the instant between the rm -rf above and this mkdir. Reported the
 			# same way an ordinary lock collision always is, never treated as corruption.
 			rm -rf -- "$_al_takeover" || :
+			TAKEOVER_HELD=0
 			die "another Eitri installer took the lock $NV_LOCK just now: wait for it to finish and re-run"
 		fi
 		rm -rf -- "$_al_takeover" || :
+		TAKEOVER_HELD=0
 	fi
 	# Mark the lock held only after writing its pid. If the write fails after creating the
 	# pid file (for example, a full filesystem), remove the file before rmdir; otherwise the
@@ -1960,11 +1966,17 @@ acquire_lock() {
 	LOCK_HELD=1
 }
 
-# on_exit: runs on every exit once the lock is held. A failed run puts back whatever it had moved
-# (the same recovery a later run would do) and never leaves its downloads or lock behind. A sidecar
-# check holds no lock, so its own directory goes in a branch of its own.
+# on_exit: releases this run's takeover sub-lock even before the main lock is held.
+# A failed run puts back whatever it had moved (the same recovery a later run would do) and never
+# leaves its downloads or lock behind. A sidecar check holds no lock, so its own directory goes in
+# a branch of its own.
 on_exit() {
 	_oe_rc=$?
+	if [ "$TAKEOVER_HELD" = 1 ]; then
+		_oe_tk_owner=$(cat -- "$NV_LOCK.takeover/pid" 2>/dev/null) || _oe_tk_owner=
+		if [ "$_oe_tk_owner" = "$$" ]; then rm -rf -- "$NV_LOCK.takeover" 2>/dev/null || :; fi
+		TAKEOVER_HELD=0
+	fi
 	if [ -n "$NV_SIDECAR_CHECK_DIR" ]; then
 		rm -rf -- "$NV_SIDECAR_CHECK_DIR" 2>/dev/null || :
 		if [ "$NV_CACHE_NV_CREATED" = 1 ]; then rmdir -- "$NV_CACHE_NV" 2>/dev/null || :; fi

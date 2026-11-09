@@ -118,28 +118,25 @@ t_lock_takeover_blocked_while_live() {
 	expect_eq "$(cat "$TH/.cache/eitri/lock.takeover/pid" 2>/dev/null)" "$holder" "the other run's takeover sub-lock, untouched"
 }
 
-TESTS="$TESTS t_lock_takeover_self_heals_abandoned_sub_lock"
-t_lock_takeover_self_heals_abandoned_sub_lock() {
-	# The takeover sub-lock is recoverable by the same
-	# dead-pid check as the main lock -- a run that died mid-takeover (SIGKILL, say) must not
-	# permanently block every later run from ever recovering the stale lock behind it.
+TESTS="$TESTS t_lock_takeover_dead_requires_manual_removal"
+t_lock_takeover_dead_requires_manual_removal() {
 	serve 1.0.0
 	sh -c 'exit 0' &
-	dead1=$!
-	wait "$dead1"
-	sh -c 'exit 0' &
-	dead2=$!
-	wait "$dead2"
-	mkdir -p "$TH/.cache/eitri/lock"
-	echo "$dead1" >"$TH/.cache/eitri/lock/pid"
-	mkdir -p "$TH/.cache/eitri/lock.takeover"
-	echo "$dead2" >"$TH/.cache/eitri/lock.takeover/pid"
+	dead=$!
+	wait "$dead"
+	mkdir -p "$TH/.cache/eitri/lock" "$TH/.cache/eitri/lock.takeover"
+	echo "$dead" >"$TH/.cache/eitri/lock/pid"
+	echo "$dead" >"$TH/.cache/eitri/lock.takeover/pid"
+	echo untouched >"$TH/.cache/eitri/lock/sentinel"
+	before=$(snap "$TH/.cache/eitri/lock")
 	inst_net
-	expect_rc 0
-	expect_out "taking over a lock left by an installer that is no longer running (pid $dead1)"
-	expect_eq "$(installed_version)" 1.0.0 "the version installed after self-healing both locks"
-	expect_absent "$TH/.cache/eitri/lock"
-	expect_absent "$TH/.cache/eitri/lock.takeover"
+	expect_fail "a takeover sub-lock whose holder died"
+	expect_out "$TH/.cache/eitri/lock.takeover"
+	expect_out "no installer is using it"
+	expect_out "if none is running, remove $TH/.cache/eitri/lock.takeover by hand and re-run"
+	expect_eq "$(snap "$TH/.cache/eitri/lock")" "$before" "the main lock is untouched"
+	expect_eq "$(cat "$TH/.cache/eitri/lock.takeover/pid" 2>/dev/null)" "$dead" "the takeover lock is untouched"
+	expect_absent "$TH/.local/lib/eitri"
 }
 
 TESTS="$TESTS t_lock_takeover_sub_lock_without_pid_refused"

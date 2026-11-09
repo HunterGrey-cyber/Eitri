@@ -20,6 +20,7 @@ import pathlib
 import re
 import shutil
 import subprocess
+import sys
 import tempfile
 
 import pytest
@@ -646,3 +647,73 @@ selected_update_found
         reason = "not yours" if foreign else "writable by others"
         assert proc.stdout.strip() == f"refused: {reason}", report(proc)
     assert target.stat().st_mode & 0o777 == mode
+def test_dead_takeover_lock_requires_manual_removal():
+    """Exercise lock recovery without downloads or a fixture server."""
+    root = fresh_scratch("guard-dead-takeover")
+    lock = root / "lock"
+    takeover = root / "lock.takeover"
+    holder = subprocess.Popen(["sh", "-c", "exit 0"])
+    holder.wait()
+    for directory in (lock, takeover):
+        directory.mkdir()
+        (directory / "pid").write_text(str(holder.pid) + "\n")
+    (lock / "sentinel").write_text("untouched\n")
+    before = {p.name: (p.read_bytes(), p.stat().st_ino) for p in lock.iterdir()}
+    text = INSTALLER.read_text()
+    functions = "\n".join(re.search(r"^" + name + r"\(\) \{\n.*?^\}", text, re.M | re.S)[0]
+                          for name in ("pid_alive", "acquire_lock"))
+    script = ("set -eu\n" + functions + '\ncheck_cache_root() { :; }\n'
+              'die() { echo "$*" >&2; exit 1; }\nwarn() { :; }\n'
+              'OPT_DRY_RUN=0; NV_LOCK=$1; NV_CACHE_NV=$2; acquire_lock\n')
+    proc = subprocess.run(["sh", "-c", script, "_", str(lock), str(root)],
+                          capture_output=True, text=True)
+    assert proc.returncode != 0, report(proc)
+    assert "no installer is using it" in proc.stderr, report(proc)
+    assert f"if none is running, remove {takeover} by hand and re-run" in proc.stderr, report(proc)
+    assert {p.name: (p.read_bytes(), p.stat().st_ino) for p in lock.iterdir()} == before
+    assert (takeover / "pid").read_text() == str(holder.pid) + "\n"
+
+
+@pytest.mark.parametrize("failure", ["pid-write", "remove-main", "INT", "TERM"])
+def test_failed_takeover_removes_its_sublock(failure):
+    """Inject failures at the write, removal and wait boundaries without a fixture server."""
+    root = fresh_scratch("guard-takeover-" + failure)
+    lock = root / "lock"
+    takeover = root / "lock.takeover"
+    lock.mkdir()
+    (lock / "sentinel").write_text("untouched\n")
+    if failure == "remove-main":
+        holder = subprocess.Popen(["sh", "-c", "exit 0"])
+        holder.wait()
+        (lock / "pid").write_text(str(holder.pid) + "\n")
+    before = {p.name: (p.read_bytes(), p.stat().st_ino) for p in lock.iterdir()}
+    text = INSTALLER.read_text()
+    functions = "\n".join(re.search(r"^" + name + r"\(\) \{\n.*?^\}", text, re.M | re.S)[0]
+                          for name in ("pid_alive", "acquire_lock", "on_exit"))
+    traps = "\n".join(re.findall(r"^\ttrap .*", text, re.M))
+    inject = {
+        "pid-write": "printf() { return 1; }\n",
+        "remove-main": 'rm() { [ "$3" != "$NV_LOCK" ] || return 1; command rm "$@"; }\n',
+        "INT": 'sleep() { kill -s INT "$$"; }\n',
+        "TERM": 'sleep() { kill -s TERM "$$"; }\n',
+    }[failure]
+    script = ("set -eu\n" + functions + "\n" + traps + '\ncheck_cache_root() { :; }\n'
+              'die() { echo "$*" >&2; exit 1; }\nwarn() { :; }\n'
+              'OPT_DRY_RUN=0; LOCK_HELD=0; TAKEOVER_HELD=0; NV_SIDECAR_CHECK_DIR=\n'
+              'NV_LOCK=$1; NV_CACHE_NV=$2\n' + inject + 'acquire_lock\n')
+    # A background runner may ignore SIGINT. Noninteractive shells cannot trap a signal
+    # ignored on entry, so restore the child's dispositions before exec, leaving pytest's alone.
+    launch = ("import os, signal, sys; "
+              "signal.signal(signal.SIGINT, signal.SIG_DFL); "
+              "signal.signal(signal.SIGTERM, signal.SIG_DFL); "
+              "os.execvp(sys.argv[1], sys.argv[1:])")
+    proc = subprocess.run([sys.executable, "-c", launch, "sh", "-c", script, "_", str(lock), str(root)],
+                          capture_output=True, text=True, timeout=10)
+    assert proc.returncode == {"INT": 130, "TERM": 143}.get(failure, 1), report(proc)
+    assert not takeover.exists(), report(proc)
+    assert {p.name: (p.read_bytes(), p.stat().st_ino) for p in lock.iterdir()} == before
+    if failure == "pid-write":
+        assert f"cannot write {takeover}/pid" in proc.stderr, report(proc)
+        assert "another Eitri installer" not in proc.stderr, report(proc)
+    elif failure == "remove-main":
+        assert "cannot remove the stale lock" in proc.stderr, report(proc)

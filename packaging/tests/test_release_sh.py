@@ -15,6 +15,7 @@ import importlib.util
 import os
 import re
 import shutil
+import shlex
 import subprocess
 import tempfile
 import textwrap
@@ -218,7 +219,8 @@ def _build_template(env, dest):
     # a real clone's release.sh would ("run the copy the clone carries", same as release.sh itself).
     shutil.copy2(_RELEASE_CHECK_PY, os.path.join(dest, "packaging", "release_check.py"))
     subprocess.run(["git", "init", "-q", dest], check=True, env=env.vars)
-    env.git(dest, "submodule", "add", "-q", fork, "neovide")
+    # Keep the committed URL independent of the host's private scratch path.
+    env.git(dest, "submodule", "add", "-q", os.path.relpath(fork, dest), "neovide")
     env.git(dest, "add", "-A")
     env.git(dest, "commit", "-q", "-m", "fixture")
 
@@ -297,13 +299,22 @@ class ReleaseShTestCase(unittest.TestCase):
         self.assertEqual(self.docker_calls(), [], "a refusal must come before any docker call")
 
     def assertReachedDocker(self, proc):
-        self.assertEqual(proc.returncode, _DOCKER_EXIT, f"expected to reach docker:\n{proc.stderr}")
+        self.assertEqual(proc.returncode, _DOCKER_EXIT,
+                         f"expected to reach docker:\n{proc.stdout}\n{proc.stderr}")
         calls = self.docker_calls()
         self.assertTrue(calls and calls[0].startswith("build "), calls)
         return calls
 
 
 class PositiveControls(ReleaseShTestCase):
+    def test_the_committed_submodule_url_is_portable_and_initialises(self):
+        modules = subprocess.run(["git", "-C", self.clone, "show", "HEAD:.gitmodules"],
+                                 check=True, capture_output=True, text=True, env=self.env.vars).stdout
+        self.assertNotIn(self.scratch, modules)
+        self.env.git(self.clone, "submodule", "deinit", "-q", "-f", "neovide")
+        self.env.git(self.clone, "submodule", "update", "--init", "neovide")
+        self.assertReachedDocker(self.run_release("--unsigned"))
+
     def test_the_unbroken_fixture_reaches_the_image_build_without_pull(self):
         calls = self.assertReachedDocker(self.run_release("--unsigned"))
         build = calls[0].split()
@@ -759,6 +770,25 @@ class LeakScanRecord(unittest.TestCase):
         self.assertLess(mark, body.index("\tbuild_image\n"))
 
 
+class PrintedPublishCommands(unittest.TestCase):
+    def test_paths_are_shell_quoted(self):
+        with open(_RELEASE_SH, encoding="utf-8") as f:
+            text = f.read()
+        start = text.index('\n', text.index('echo "The rest is by hand')) + 1
+        end = text.index('\n\techo "  $gh_line"', start)
+        source = "/public clone/$(x)"
+        output = "/release output/$(x)"
+        proc = subprocess.run(["bash", "-c", 'RS_SOURCE=$1; RS_REL=$2; RS_VERSION=1.2.3; print_commands() {\n'
+                               + text[start:end] + "\n}; print_commands", "_", source, output],
+                              capture_output=True, text=True, check=True)
+        self.assertTrue(all(line == line.rstrip() for line in proc.stdout.splitlines()), proc.stdout)
+        self.assertEqual([shlex.split(line) for line in proc.stdout.splitlines()], [
+            ["publish/tag.sh", source, output],
+            ["git", "-C", source, "push", "origin", "HEAD:main"],
+            ["git", "-C", source, "push", "origin", "v1.2.3"],
+        ])
+
+
 class PublicCommitsRule(ReleaseShTestCase):
     """The `git push origin HEAD:main` a run prints
     publishes the released commit with every commit behind it the public repo lacks, and nothing looked
@@ -781,7 +811,7 @@ class PublicCommitsRule(ReleaseShTestCase):
         if committer:
             env.update(GIT_COMMITTER_NAME=committer[0], GIT_COMMITTER_EMAIL=committer[1])
         with open(os.path.join(self.clone, "CHANGES"), "a", encoding="utf-8") as f:
-            f.write(message + "\n")
+            f.write("change\n")
         for argv in (["add", "-A"], ["commit", "-q", "-m", message]):
             subprocess.run(["git", "-C", self.clone, *argv], check=True, capture_output=True, env=env)
 
@@ -789,6 +819,19 @@ class PublicCommitsRule(ReleaseShTestCase):
         """The public repo's main becomes the clone's HEAD, as a push would leave it."""
         self.env.git(self.clone, "push", "-q", self.env.public, "HEAD:refs/heads/main")
         self.env.git(self.clone, "update-ref", "refs/remotes/origin/main", "HEAD")
+
+    def test_deleted_content_in_an_unpublished_commit_is_refused(self):
+        path = os.path.join(self.clone, "shell", "debug.txt")
+        _write(path, self.LEAK + "\n")
+        self.commit_as("Add debug output")
+        leaky = subprocess.check_output(["git", "-C", self.clone, "rev-parse", "HEAD"],
+                                       env=self.env.vars, text=True).strip()
+        os.unlink(path)
+        self.commit_as("Remove debug output")
+        proc = self.run_release("--unsigned")
+        self.assertRefused(proc, "does not pass publish/scan.sh")
+        self.assertIn(leaky, proc.stdout + proc.stderr)
+        self.assertIn("shell/debug.txt", proc.stdout + proc.stderr)
 
     def test_a_release_commit_with_a_foreign_author_is_refused(self):
         self.commit_as("Release candidate 1.0.0-rc.1", author=self.SOMEONE)
@@ -903,7 +946,7 @@ class ForkHistoryRule(ReleaseShTestCase):
         if author:
             env.update(GIT_AUTHOR_NAME=author[0], GIT_AUTHOR_EMAIL=author[1])
         with open(os.path.join(sub, "CHANGES"), "a", encoding="utf-8") as f:
-            f.write(message + "\n")
+            f.write("change\n")
         for argv in (["add", "-A"], ["commit", "-q", "-m", message]):
             subprocess.run(["git", "-C", sub, *argv], check=True, capture_output=True, env=env)
         self.commit("Update the fork")

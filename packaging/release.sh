@@ -254,12 +254,12 @@ source_asset_url() {
 # public_commits_check CLONE: HEAD is the commit this run releases. The printed
 # git push origin HEAD:main publishes it and its unpublished ancestors.
 # HEAD must use RS_PUBLIC_NAME/EMAIL for both author and committer. Its raw object
-# must pass RS_SCAN --message even when already public, as must every unpublished
-# commit reachable from HEAD or main. publish/tag.sh makes the same checks.
-# Read public branches with git ls-remote against the public repository, since local
-# origin refs can already contain unpublished commits when cloning a local clone.
+# must pass RS_SCAN --message and its full tree must pass the content scan, even
+# when already public. Check unpublished commits reachable from HEAD or main too,
+# as publish/tag.sh does. Read public branches with git ls-remote against the public
+# repository, since local origin refs can already contain unpublished commits.
 # A public tip missing locally excludes nothing, so missing tips only widen the scan.
-# The public repository URL can be overridden for tests, with a warning.
+# EITRI_PUBLIC_REPO_URL reads the public branches from another URL, for tests, with a warning.
 # Replacement objects change what git log, rev-list and cat-file read, but a push
 # still sends the originals. Ignore replacements for all reads and reject clones
 # with refs/replace/ entries, which would also affect git archive in the build container.
@@ -299,8 +299,8 @@ public_commits_check() {
 		rm -f -- "$dump"
 		die "cannot read the commits $1 would publish"
 	fi
-	"$RS_SCAN" --message "$dump" \
-		|| die "a commit 'git push origin HEAD:main' would publish from $1 does not pass publish/scan.sh (the line numbers above are in $dump, kept)"
+	"$RS_SCAN" --commit-trees "$1" --message "$dump" \
+		|| die "a commit 'git push origin HEAD:main' would publish from $1 does not pass publish/scan.sh (tree hits name commit:path; metadata line numbers are in $dump, kept)"
 	rm -f -- "$dump"
 }
 
@@ -889,9 +889,13 @@ host_main() {
 	fi
 	echo "Eitri $RS_VERSION is in $RS_REL ($(( (SECONDS - started) / 60 )) min); logs in $RS_LOGS."
 	echo "The rest is by hand, in this order -- this script runs none of it:"
-	echo "  publish/tag.sh $RS_SOURCE $RS_REL"
-	echo "  git -C $RS_SOURCE push origin HEAD:main"
-	echo "  git -C $RS_SOURCE push origin v$RS_VERSION"
+	local tag_command=(publish/tag.sh "$RS_SOURCE" "$RS_REL")
+	local main_command=(git -C "$RS_SOURCE" push origin HEAD:main)
+	local version_command=(git -C "$RS_SOURCE" push origin "v$RS_VERSION")
+	local command_line
+	printf -v command_line '%q ' "${tag_command[@]}"; printf '  %s\n' "${command_line% }"
+	printf -v command_line '%q ' "${main_command[@]}"; printf '  %s\n' "${command_line% }"
+	printf -v command_line '%q ' "${version_command[@]}"; printf '  %s\n' "${command_line% }"
 	echo "  $gh_line"
 }
 
