@@ -55,6 +55,17 @@ export function assignLabels(count: number): string[] {
  *  `open_url` sends, never the spelling the reply wrote -- or `null`. The host rules are Rust's, restated:
  *  the parser alone keeps `eitri.invalid.`, `a$b.com`, `my_host.x`, `[::1]` and a backslash in a query, and
  *  Rust refuses all of them, so a letter offered for one could only fail. */
+/** The part of a held link's address a person must see before a second click opens it: a web address's host (with
+ *  its port), where a long name's own domain is at its end; a mail address after `mailto:`. */
+export function linkLook(url: string): string {
+  if (url.startsWith("mailto:")) return url.slice("mailto:".length).split("?")[0];
+  try {
+    return new URL(url).host || url;
+  } catch {
+    return url;
+  }
+}
+
 export function webUrl(href: string | null): string | null {
   let url: URL;
   try {

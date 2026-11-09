@@ -156,6 +156,22 @@ function asked(over: Record<string, unknown> = {}, options: { tabs?: readonly Re
 }
 
 describe("the trust question", () => {
+  /* A notification is not the question's: it gets the band's one row beside the prompt and goes when it expires,
+     and the prompt's own text never changes under it. */
+  it("a notification under the open question keeps to one row and leaves the prompt's text alone", () => {
+    const { container } = asked();
+    const notice = "Saved the session to /home/u/p/.claude/sessions/2026-11-09-a-rather-long-file-name.json";
+    dispatch({ kind: "events", tab: 1, fromRevision: 0, throughRevision: 1, events: [
+      { type: "session_notice", kind: "notification", level: "notice", content: notice, scalars: {} },
+    ] });
+    expect(bandPrompt(container)).toBe("trust? y/n");
+    expect(container.querySelector(".band-message")?.textContent).toBe(notice);
+    wait(2100);
+    expect(bandPrompt(container)).toBe("trust? y/n");
+    expect(container.querySelector(".band-message")).toBeNull();
+    expect(prompt(container)).not.toBeNull();
+  });
+
   it("draws the overlay over the conversation and the band's prompt", () => {
     const { container } = asked();
     expect(prompt(container)).not.toBeNull();

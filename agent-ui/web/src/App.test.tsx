@@ -10486,6 +10486,27 @@ describe("gx: web links on a row", () => {
   /* A click (or Enter, which clicks) is WebKit's own navigation, which Rust opens with no look at the address:
      a reply link whose text is not where it goes shows that address first, and only a second click on it opens. */
   describe("a click on a reply link", () => {
+    /** jsdom lays nothing out, so the band's look measurement (`lookOnScreen`) finds no boxes and arms nothing; this
+     *  gives every range a box on screen and puts the band's flash on top of it, as a real engine would. */
+    let onScreen = true;
+    function stubOnScreen(): () => void {
+      onScreen = true;
+      const proto = Range.prototype as unknown as { getClientRects?: () => DOMRect[] };
+      const saved = proto.getClientRects;
+      const savedHit = (document as unknown as { elementFromPoint?: unknown }).elementFromPoint;
+      // Off screen (`onScreen` false): the boxes lie past the viewport's left edge, as a reflow or a resize leaves them.
+      proto.getClientRects = () => [
+        (onScreen
+          ? { left: 0, top: 0, right: 10, bottom: 10, width: 10, height: 10, x: 0, y: 0 }
+          : { left: -40, top: 0, right: -30, bottom: 10, width: 10, height: 10, x: -40, y: 0 }) as DOMRect,
+      ];
+      (document as unknown as { elementFromPoint: () => Element | null }).elementFromPoint = () =>
+        document.querySelector(".band-message");
+      return () => {
+        proto.getClientRects = saved;
+        (document as unknown as { elementFromPoint?: unknown }).elementFromPoint = savedHit;
+      };
+    }
     function clickAt(anchor: Element, at: number): boolean {
       const now = vi.spyOn(Date, "now").mockReturnValue(at);
       try {
@@ -10497,6 +10518,7 @@ describe("gx: web links on a row", () => {
 
     it("shows the real address of a link whose text says another, and opens on the second click", () => {
       const widen = stubBandWidth();
+      const unstub = stubOnScreen();
       try {
         const { container } = withReply("see [https://good.example/](https://evil.example/)");
         act(() => widen(container));
@@ -10510,6 +10532,127 @@ describe("gx: web links on a row", () => {
         expect(clickAt(anchor, 11_000)).toBe(true);
         expect(opened()).toEqual([]); // the panel posts nothing: the browser's own click goes on to Rust
       } finally {
+        unstub();
+        vi.unstubAllGlobals();
+      }
+    });
+
+    /* Armed, the click is checked again at the moment it would open: an address no longer on screen opens nothing,
+       is shown again, and its look starts over when it is next seen. */
+    it("opens nothing once the address has left the screen, and starts the look over when it is back", () => {
+      const widen = stubBandWidth();
+      const unstub = stubOnScreen();
+      try {
+        const { container } = withReply("see [https://good.example/](https://evil.example/)");
+        act(() => widen(container));
+        boxLinks(container);
+        const anchor = container.querySelector(".row a[href]")!;
+        expect(clickAt(anchor, 10_000)).toBe(false); // shown and measured on screen: armed
+        onScreen = false; // a resize or an overlay moved it out of sight
+        expect(clickAt(anchor, 11_000)).toBe(false);
+        expect(container.querySelector(".band-message")!.textContent).toBe("https://evil.example/ — click again to open");
+        onScreen = true;
+        expect(clickAt(anchor, 11_100)).toBe(false); // seen again: the look starts now
+        expect(clickAt(anchor, 11_300)).toBe(false); // 1.3 s after the first, 0.2 s after it came back
+        expect(clickAt(anchor, 11_800)).toBe(true);
+      } finally {
+        unstub();
+        vi.unstubAllGlobals();
+      }
+    });
+
+    it("a measurement that finds the address hidden disarms the link before any click", () => {
+      const widen = stubBandWidth();
+      const unstub = stubOnScreen();
+      try {
+        const { container } = withReply("see [https://good.example/](https://evil.example/)");
+        act(() => widen(container));
+        boxLinks(container);
+        const anchor = container.querySelector(".row a[href]")!;
+        expect(clickAt(anchor, 10_000)).toBe(false);
+        onScreen = false;
+        dispatch({ kind: "pane_focus", focused: true }); // a re-render, as a resize brings, measures it hidden
+        onScreen = true; // and back in view at once, with no new measurement yet
+        expect(clickAt(anchor, 11_000)).toBe(false);
+      } finally {
+        unstub();
+        vi.unstubAllGlobals();
+      }
+    });
+
+    it("opens nothing once another flash has replaced the address", () => {
+      const widen = stubBandWidth();
+      const unstub = stubOnScreen();
+      try {
+        const { container } = withReply("see [https://good.example/](https://evil.example/)");
+        act(() => widen(container));
+        boxLinks(container);
+        const anchor = container.querySelector(".row a[href]")!;
+        expect(clickAt(anchor, 10_000)).toBe(false);
+        fireEvent.keyDown(rootOf(container), { key: "a" }); // no card: the band says so instead
+        expect(container.querySelector(".band-message")!.textContent).not.toContain("evil.example");
+        expect(clickAt(anchor, 11_000)).toBe(false);
+        expect(container.querySelector(".band-message")!.textContent).toBe("https://evil.example/ — click again to open");
+      } finally {
+        unstub();
+        vi.unstubAllGlobals();
+      }
+    });
+
+    it("opens nothing once the address has expired from the band", () => {
+      vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout"] });
+      const widen = stubBandWidth();
+      const unstub = stubOnScreen();
+      try {
+        const { container } = withReply("see [https://good.example/](https://evil.example/)");
+        act(() => widen(container));
+        boxLinks(container);
+        const anchor = container.querySelector(".row a[href]")!;
+        expect(clickAt(anchor, 10_000)).toBe(false);
+        act(() => vi.advanceTimersByTime(navModule.LINK_LOOK_MAX_MS + 1));
+        expect(container.querySelector(".band-message")).toBeNull();
+        expect(clickAt(anchor, 11_000)).toBe(false);
+      } finally {
+        unstub();
+        vi.unstubAllGlobals();
+        vi.useRealTimers();
+      }
+    });
+
+    /* The second click opens only what the band was measured showing: an address nobody could read (clipped,
+       covered, squeezed to nothing) arms nothing, however long the look. */
+    it("arms nothing while the address has not been measured on screen", () => {
+      const widen = stubBandWidth();
+      try {
+        const { container } = withReply("see [https://good.example/](https://evil.example/)");
+        act(() => widen(container));
+        boxLinks(container);
+        const anchor = container.querySelector(".row a[href]")!;
+        expect(clickAt(anchor, 10_000)).toBe(false);
+        expect(container.querySelector(".band-message")!.textContent).toBe("https://evil.example/ — click again to open");
+        expect(clickAt(anchor, 11_000)).toBe(false);
+        expect(clickAt(anchor, 12_000)).toBe(false);
+      } finally {
+        vi.unstubAllGlobals();
+      }
+    });
+
+    it("shows a long address whole on its own lines above the band's row, never cut: its own domain is at the end", () => {
+      const widen = stubBandWidth();
+      const unstub = stubOnScreen();
+      try {
+        const host = `github.com-${"sign-in-".repeat(16)}verify.example.net`;
+        const { container } = withReply(`see [https://github.com/](https://${host}/)`);
+        act(() => widen(container));
+        boxLinks(container);
+        const anchor = container.querySelector(".row a[href]")!;
+        clickAt(anchor, 10_000);
+        const message = container.querySelector(".status-band-above .band-message")!;
+        expect(message.textContent).toBe(`https://${host}/ — click again to open`);
+        expect(container.querySelector(".status-band .band-message")).toBeNull();
+        expect(clickAt(anchor, 11_000)).toBe(true);
+      } finally {
+        unstub();
         vi.unstubAllGlobals();
       }
     });

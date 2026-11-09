@@ -2,7 +2,7 @@ import type { PanelMode } from "./keymap";
 import type { RemoteConnectedDevice } from "./bridge";
 import type { BackgroundTaskRecord, EditorLink, TurnEnding, UsageInfo } from "./types";
 import { turnEndingBandText } from "./turnEnding";
-import { escapeText, isHiddenChar, revealedText } from "./revealHidden";
+import { escapeText, isHiddenChar, revealedPathText, revealedText } from "./revealHidden";
 import { SHORT_FLASH } from "./app/flashes";
 
 /** One segment's identity, in priority order (used only for lookups here --
@@ -17,17 +17,21 @@ export type Seg = {
   id: SegId;
   text: string;
   side: "left" | "right";
-  /** Set only on `"prompt"`/`"message"` when their full text does not fit the measured row.
-   *  `StatusBand` wraps it at auto height so a prompt keeps its trailing `(y/n)` and a flash keeps
-   *  its explanation. Absent on every other segment, which still degrades by priority. */
+  /** Set only on `"prompt"`, and on a `"message"` with a `messageLook`, when its full text does not fit the measured
+   *  row. `StatusBand` then draws it whole on its own lines above the row: a y/n question says what `y` does (a move
+   *  into bypass, the cards it approves), such a flash what the next click opens, and neither is cut. Every other
+   *  flash is cut to the row (`cut`). Absent on every other segment, which degrades by priority. */
   wraps?: boolean;
   /** The width this segment keeps, in cells, when its text is narrower: a figure (`position`, `usage`, `unread`)
    *  given a `reserve` by `bandLayoutSteady`, so its text changing does not move the segments beside it. Counted
    *  in place of the text's own width when it is wider. Absent everywhere else. */
   cells?: number;
-  /** Set only on `"message"` while it shows its short form (`SHORT_FLASH`): the whole sentence, which the short
-   *  form leaves words out of, for `StatusBand` to carry as the segment's title. */
+  /** Set only on `"message"` while it shows its short form (`SHORT_FLASH`) or is cut (`cut`): the whole
+   *  sentence, which the shown text leaves words out of, for `StatusBand` to carry as the segment's title. */
   full?: string;
+  /** Set only on a `"message"` too wide for the row even so: `StatusBand` draws it on the row, ending in an ellipsis
+   *  where the row ends (`.band-message`); a flash ending in a path is already cut in its middle (`cutFlash`). */
+  cut?: boolean;
 };
 
 /** What the band has to say this render, gathered by `App.tsx` from state that already exists
@@ -39,6 +43,14 @@ export type BandFacts = {
   pill: string;
   showcmd: string | null;
   message: string | null;
+  /** The part of the flash that must be on screen whole before the action it names may follow: a link's host, shown
+   *  before the click that opens it. The band never cuts such a flash: too wide for the row, it is drawn whole on its
+   *  own lines above the row, as a long y/n prompt is, and `StatusBand` reports when this part is measured visible
+   *  (`onLookShown`). Absent: an ordinary flash, cut to the row. */
+  messageLook?: string;
+  /** The path the flash ends with, as it is drawn (`revealedPathText`), so a cut keeps its file name: given where the
+   *  flash is built from a path (`gf`'s file list). Without it, a flash's last word holding a `/` is taken for one. */
+  messagePath?: string;
   prompt: string | null;
   warn: string | null;
   unread: string | null;
@@ -297,10 +309,65 @@ export function textWidth(text: string): number {
   return n;
 }
 
-/** Prompts and messages wrap rather than truncate: at WebKit zoom 1.5 a 47-column band must still
- *  show a prompt's `(y/n)` and the flash explaining what `y` does. `wraps: true` lets `StatusBand`
- *  and `.status-band--wrap` grow upward until the prompt or flash ends, then return to one editor row.
- *  Ordinary segments still degrade by priority. */
+/** A y/n prompt never truncates: at WebKit zoom 1.5 a 47-column band must still show what `y` does and the prompt's
+ *  `(y/n)`. Too wide for the row, it is marked `wraps` and `StatusBand` draws it whole on its own lines above the band's
+ *  row (`.status-band-above`) until the question is answered; so is a flash with a `messageLook`. The band's own row is
+ *  one editor row always: every other flash that does not fit it is cut (`Seg.cut`), so a flash coming or going never
+ *  moves the conversation or the composer. Ordinary segments degrade by priority. */
+
+/** Where a flash's closing path starts and the flash with that path made visible: `path` when the caller names it
+ *  (the text ends with it, already drawn visible), else the flash's last run of non-space text holding a `/`, with the
+ *  spaces after it, which `revealedPathText` writes as escapes. `null` when it ends in no path. */
+function closingPath(text: string, path?: string): { text: string; start: number } | null {
+  if (path !== undefined && path !== "" && text.endsWith(path)) return { text, start: text.length - path.length };
+  const m = /\S*\/\S*\s*$/u.exec(text);
+  if (m === null || !m[0].includes("/")) return null;
+  const start = m.index;
+  return { text: text.slice(0, start) + revealedPathText(m[0]), start };
+}
+
+/** A flash that ends in a path (`path`, or its last word holding a `/`), with the spaces that end the path made visible,
+ *  and cut to at most `cells` cells so that the path's end -- the whole file name, spaces and all, where that leaves
+ *  4 cells of the start -- stays and its middle goes: `gf: 2 of 5: src/co…ry/StatusBand.tsx`. A file name too long for
+ *  that keeps as much of its end as leaves those 4 cells. Any other flash comes back unchanged, left for the engine to
+ *  end in an ellipsis at the row's edge (`.band-message`, `text-overflow`), which uses the room to the pixel where this
+ *  cell count is conservative; so does one that fits, or a room under 8 cells. */
+export function cutFlash(text: string, cells: number, path?: string): string {
+  const closing = closingPath(text, path);
+  if (closing === null) return text;
+  const shown = closing.text;
+  if (textWidth(shown) <= cells) return shown;
+  const room = cells - 1;
+  if (room < 8) return shown;
+  const chars = [...shown];
+  // The longest prefix (by code point) at most `n` cells wide; and the longest suffix.
+  const head = (n: number) => {
+    let w = 0;
+    let i = 0;
+    while (i < chars.length && w + textWidth(chars[i]) <= n) w += textWidth(chars[i++]);
+    return chars.slice(0, i).join("");
+  };
+  const tail = (n: number) => {
+    let w = 0;
+    let i = chars.length;
+    while (i > 0 && w + textWidth(chars[i - 1]) <= n) w += textWidth(chars[--i]);
+    return chars.slice(i).join("");
+  };
+  const pathText = shown.slice(closing.start);
+  // The file name with its `/` (the whole path when it has none: a file at the project's root), measured on the path
+  // as shown: its spaces, end ones written as escapes, included.
+  const slash = pathText.lastIndexOf("/");
+  const name = textWidth(slash < 0 ? pathText : pathText.slice(slash));
+  const half = Math.min(textWidth(pathText), Math.floor(room / 2));
+  // Neither side keeps part of an escape (`⟨U+0020⟩`): a half escape reads as neither the character nor the text.
+  let end = tail(name + 4 <= room ? Math.max(name, half) : room - 4);
+  const open = end.indexOf("⟨");
+  const close = end.indexOf("⟩");
+  if (close >= 0 && (open < 0 || close < open)) end = end.slice(close + 1);
+  let start = head(room - textWidth(end));
+  if (start.lastIndexOf("⟨") > start.lastIndexOf("⟩")) start = start.slice(0, start.lastIndexOf("⟨"));
+  return `${start.trimEnd()}…${end}`;
+}
 
 const PAD = 2; // one character of padding each side
 /** The mode block's separator arrow, one cell after it (`index.css`, `.band-mode::after`). */
@@ -349,9 +416,25 @@ export function bandLayoutSteady(
   if (widthPx <= 0 || charPx <= 0) return unchanged([mode, pill, ...phone]);
   const budget = Math.floor(widthPx / charPx);
   if (f.prompt !== null) {
+    // The question is the band's whole business; a flash that comes while it is up (a notification) is not part of
+    // it, and has the row's one-row place beside it: cut when it does not fit, never joining the question's lines.
     const taken = phone.reduce((n, x) => n + textWidth(x.text) + PAD, 0);
     const roomForPrompt = budget - textWidth(mode.text) - MODE_ARROW - 2 * PAD - taken;
-    return unchanged([mode, { id: "prompt", text: f.prompt, side: "left", wraps: textWidth(f.prompt) > roomForPrompt }, ...phone]);
+    const prompt: Seg = { id: "prompt", text: f.prompt, side: "left", wraps: textWidth(f.prompt) > roomForPrompt };
+    if (f.message === null) return unchanged([mode, prompt, ...phone]);
+    const look = f.messageLook !== undefined;
+    const onRow = (m: Seg) => [mode, ...(prompt.wraps ? [] : [prompt]), m, ...phone];
+    const rowWidth = (s: Seg[]) => s.reduce((n, x) => n + textWidth(x.text) + PAD + (x.id === "mode" ? MODE_ARROW : 0), 0);
+    let message: Seg = { id: "message", text: f.message, side: "left" };
+    const over = rowWidth(onRow(message)) - budget;
+    if (over > 0 && look) message = { ...message, wraps: true };
+    else if (over > 0) {
+      const room = Math.max(1, textWidth(message.text) - over);
+      message = { ...message, text: cutFlash(message.text, room, f.messagePath), full: message.text, cut: true };
+    } else {
+      message = { ...message, text: closingPath(message.text, f.messagePath)?.text ?? message.text };
+    }
+    return unchanged([mode, prompt, message, ...phone]);
   }
   const ctxFull = f.context && (f.context.lines ? `⧉ ${f.context.file}:${f.context.lines[0]}-${f.context.lines[1]}` : `⧉ ${f.context.file}`);
   const link = f.link && f.link.state !== "attached" && f.link.text !== "" ? f.link : null;
@@ -470,29 +553,36 @@ export function bandLayoutSteady(
   );
   const droppedAt = fresh ? now : hold === null ? -Infinity : hold.droppedAt;
   segs = levels[level];
-  // A flash too wide for the row gives way to its short form, if it has one (`SHORT_FLASH`), before it wraps: a
-  // wrapped flash grows the band over the composer, and in a narrow chat a sentence takes six rows. Only where it
-  // helps: the whole sentence beside the mode's letter comes first, and a short form that does not fit either leaves
-  // the whole sentence to wrap.
+  // A flash too wide for the row gives way to its short form, if it has one (`SHORT_FLASH`), before it is cut: the
+  // short form keeps what to do, where a cut keeps only the sentence's start. Only where it helps: the whole sentence
+  // beside the mode's letter comes first.
   const short = f.message === null ? undefined : SHORT_FLASH.get(f.message);
   const letter = (s: Seg[]) => s.map((x) => (x.id === "mode" ? { ...x, text: MODE_LETTER[f.mode] } : x));
   if (width(segs) > budget && short !== undefined && width(letter(segs)) > budget) {
-    const shortened = segs.map((x) => (x.id === "message" ? { ...x, text: short, full: x.text } : x));
-    if (width(shortened) <= budget || width(letter(shortened)) <= budget) segs = shortened;
+    segs = segs.map((x) => (x.id === "message" ? { ...x, text: short, full: x.text } : x));
   }
-  // The mode shrinks to its letter last. Not for a flash that wraps anyway: five characters of mode
-  // word would not make it fit, and the row it wraps onto would then lead with a bare letter ("B");
-  // the mode keeps its word unless the letter is what lets everything fit.
+  // The mode shrinks to its letter last, and beside a flash only when the letter is what lets everything fit: a flash
+  // cut anyway keeps the mode its word, so the mode block does not change width with every long flash.
   if (width(segs) > budget) {
-    const shortened = segs.map((x) => (x.id === "mode" ? { ...x, text: MODE_LETTER[f.mode] } : x));
+    const shortened = letter(segs);
     if (!segs.some((x) => x.id === "message") || width(shortened) <= budget) segs = shortened;
   }
-  // `message` is never cut either (`over > 0` here means every droppable segment is
-  // already gone and the message's own full text is still wider than the row) -- it is marked
-  // `wraps` instead of being shortened, so `StatusBand` grows the band rather than hiding the end
-  // of a flash like the explanation of what `y` does.
+  // Still too wide: the flash is cut to the row, so the band stays one editor row and nothing above it moves -- by the
+  // engine's ellipsis at the row's edge, or, for a flash ending in a path, here in its middle (`cutFlash`). The whole
+  // sentence stays the segment's title.
   const over = width(segs) - budget;
-  if (over > 0) segs = segs.map((x) => (x.id === "message" ? { ...x, wraps: true } : x));
+  if (over > 0 && f.messageLook !== undefined) {
+    segs = segs.map((x) => (x.id === "message" ? { ...x, wraps: true } : x));
+  } else if (over > 0) {
+    segs = segs.map((x) => {
+      if (x.id !== "message") return x;
+      const room = Math.max(1, textWidth(x.text) - over);
+      return { ...x, text: cutFlash(x.text, room, f.messagePath), full: x.full ?? x.text, cut: true };
+    });
+  } else {
+    // It fits: a closing path's end spaces are still drawn visible.
+    segs = segs.map((x) => (x.id === "message" ? { ...x, text: closingPath(x.text, f.messagePath)?.text ?? x.text } : x));
+  }
   return { segs, hold: { dropped, droppedAt }, due };
 }
 

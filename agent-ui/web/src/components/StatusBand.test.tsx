@@ -183,7 +183,7 @@ it("carries no data-nav-stop -- j/k never land here, only click/leader/prefix re
 /** A WebKit zoom of 1.5 measured the panel at
  *  520 logical px = 346 CSS px -- a 47-column budget at this suite's own 7.2px character width
  *  (47 * 7.2 = 338.4). `bandLayout` no longer truncates a prompt/flash that does not fit there; this
- *  is the render-level half of that fix: `StatusBand` must add `.status-band--wrap` exactly when
+ *  is the render-level half of that fix: `StatusBand` must draw the prompt above the row exactly when
  *  that happens, and leave it off when the text already fits (`ids`/`bandLayout`'s own case in
  *  `band.test.ts` covers the pure logic; this covers what the component does with it). */
 function renderNarrow(facts: BandFacts) {
@@ -198,28 +198,30 @@ function renderNarrow(facts: BandFacts) {
   return rendered;
 }
 
-it("a bypass prompt too wide for the band wraps instead of truncating, (y/n) intact", () => {
+it("a bypass prompt too wide for the band goes whole onto its own lines above the row, (y/n) intact", () => {
   const R06_PROMPT = "Switch to bypass and approve the 1 waiting card? (y/n)";
   const { container } = renderNarrow({ ...RUNNING, prompt: R06_PROMPT, message: null });
-  expect(container.querySelector(".status-band")!.classList.contains("status-band--wrap")).toBe(true);
-  const prompt = container.querySelector(".band-prompt")!;
+  expect(container.querySelector(".status-band .band-prompt")).toBeNull();
+  expect(container.querySelector(".status-band .band-mode")).not.toBeNull();
+  const prompt = container.querySelector(".status-band-above .band-prompt")!;
   expect(prompt.textContent).toBe(R06_PROMPT);
   expect(prompt.textContent).not.toContain("…");
 });
 
-it("the flash that explains y is not truncated either, and wraps the band", () => {
+it("a flash too wide for the band never wraps it: one row, cut, the whole sentence as its title", () => {
   const D11_FLASH = "y must be pressed on its own to enter bypass — Shift+Tab to ask again";
   const { container } = renderNarrow({ ...RUNNING, prompt: null, message: D11_FLASH });
-  expect(container.querySelector(".status-band")!.classList.contains("status-band--wrap")).toBe(true);
-  const message = container.querySelector(".band-message")!;
+  expect(container.querySelector(".status-band-above")).toBeNull();
+  const message = container.querySelector<HTMLElement>(".status-band .band-message")!;
+  // Whole in the markup: `.band-message`'s ellipsis ends it where the row ends.
   expect(message.textContent).toBe(D11_FLASH);
-  expect(message.textContent).not.toContain("…");
+  expect(message.title).toBe(D11_FLASH);
 });
 
 it("a short prompt does not switch the band into wrap mode -- it still fits one row", () => {
   const { container } = renderNarrow({ ...RUNNING, prompt: 'close 1 "docs"? (y/n)', message: null });
-  expect(container.querySelector(".status-band")!.classList.contains("status-band--wrap")).toBe(false);
-  expect(container.querySelector(".band-prompt")!.textContent).toBe('close 1 "docs"? (y/n)');
+  expect(container.querySelector(".status-band-above")).toBeNull();
+  expect(container.querySelector(".status-band .band-prompt")!.textContent).toBe('close 1 "docs"? (y/n)');
 });
 
 it("before any measurement, only mode and pill show -- no crash on an unmounted ref", () => {

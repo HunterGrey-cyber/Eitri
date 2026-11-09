@@ -1,4 +1,6 @@
 import { useLayoutEffect, useRef, useState } from "react";
+import { afterPaint } from "../afterPaint";
+import { lookOnScreen } from "../lookOnScreen";
 import type { CSSProperties } from "react";
 import { bandLayoutSteady, phoneTitle } from "../band";
 import type { BandFacts, LayoutHold, Seg } from "../band";
@@ -23,6 +25,11 @@ type Props = {
   onOpenDetail?: () => void;
   /** The `↓N`/`↓ ⚑` button's own click. */
   onJump?: () => void;
+  /** Called after each paint of a flash with a `messageLook`, with the flash's text and whether that part was measured
+   *  whole on screen (`lookOnScreen`): `false` for one cut, covered, clipped or not drawn. */
+  onLookMeasured?: (message: string, visible: boolean) => void;
+  /** Set to the element the flash is drawn in, on the row or above it, `null` while there is none. */
+  messageElRef?: { current: HTMLElement | null };
   onOpenTasks?: () => void;
   /** A click on the model or the effort: asks the agent for its choices, which open the `/model` or `/effort`
    *  picker. Absent where there is nothing to choose (a Codex or ACP tab): the segment stays plain text. */
@@ -50,6 +57,7 @@ function renderLeftSeg(
   paneFocused: boolean,
   glyphMode: string | undefined,
   entryKey: string | null | undefined,
+  messageRef: (el: HTMLElement | null) => void,
 ) {
   if (seg.id === "mode") {
     return (
@@ -87,7 +95,7 @@ function renderLeftSeg(
     );
   }
   return (
-    <span key={seg.id} className={`band-seg band-${seg.id}`} title={seg.id === "phone" ? phoneTitle(facts.remoteSandbox, facts.phoneDevices) : seg.id === "cards" && facts.questions ? `${facts.cards} permissions · ${facts.questions} questions` : seg.full}>
+    <span key={seg.id} ref={seg.id === "message" ? messageRef : undefined} className={`band-seg band-${seg.id}`} title={seg.id === "phone" ? phoneTitle(facts.remoteSandbox, facts.phoneDevices) : seg.id === "cards" && facts.questions ? `${facts.cards} permissions · ${facts.questions} questions` : seg.full}>
       {seg.text}
     </span>
   );
@@ -96,7 +104,7 @@ function renderLeftSeg(
 /** One bottom statusline, rendered from `bandLayout`'s segments. Measure its content-box width
  *  and the mono character width to decide what fits. Re-measure the hidden `.band-measure` span
  *  when its box changes, including font or theme pushes, then turn each segment into markup. */
-export function StatusBand({ facts, paneFocused, entryKey, onOpenDetail, onJump, onOpenTasks, onPickModel, onPickEffort }: Props) {
+export function StatusBand({ facts, paneFocused, entryKey, onOpenDetail, onJump, onOpenTasks, onPickModel, onPickEffort, onLookMeasured, messageElRef }: Props) {
   const bandRef = useRef<HTMLDivElement>(null);
   const measureRef = useRef<HTMLSpanElement>(null);
   const [widthPx, setWidthPx] = useState(0);
@@ -143,28 +151,50 @@ export function StatusBand({ facts, paneFocused, entryKey, onOpenDetail, onJump,
     return () => clearTimeout(timer);
   });
   facts = steady.facts;
-  const segs = laid.segs;
+  // What does not fit the row and may not be cut (a long y/n question, a flash with a `messageLook`) is drawn whole on
+  // its own lines above it; the row itself is one editor row always.
+  const above = laid.segs.filter((seg) => seg.wraps === true);
+  const segs = laid.segs.filter((seg) => seg.wraps !== true);
   const left = segs.filter((seg) => seg.side === "left");
   const right = segs.filter((seg) => seg.side === "right");
   const glyphMode = pillGlyphMode(facts.pill);
-  // `bandLayout` marks a `"prompt"`/`"message"` segment
-  // `wraps` instead of truncating it (its own doc comment, `../band`) exactly when the full text does
-  // not fit the one-row budget -- `index.css`'s `.status-band--wrap` is what actually lets the band
-  // grow upward and wrap that text onto more rows, for as long as this render still carries one; an
-  // ordinary short prompt/flash never sets it, so the band stays the fixed one-editor-row height it
-  // always was.
   // The count opens the background tasks list only where the agent reports its tasks (a roster in
   // `facts.backgroundTasks`); elsewhere (Codex, ACP) it stays plain text in its place inside the
   // band's details button, since that list would have nothing to show.
   const tasksButton = facts.backgroundTasks !== undefined && onOpenTasks !== undefined;
   const background = tasksButton ? left.find((seg) => seg.id === "background") : undefined;
   const detailLeft = tasksButton ? left.filter((seg) => seg.id !== "background") : left;
-  const wrapping = segs.some((seg) => seg.wraps === true);
+  // The element drawing the flash, on the row or above it, for the look measurement.
+  const messageEl = useRef<HTMLElement | null>(null);
+  const messageRef = (el: HTMLElement | null) => {
+    messageEl.current = el;
+    if (messageElRef !== undefined) messageElRef.current = el;
+  };
+  const look = facts.messageLook;
+  const message = facts.message;
+  useLayoutEffect(() => {
+    if (look === undefined || message === null || onLookMeasured === undefined) return;
+    return afterPaint(() => {
+      const el = messageEl.current;
+      onLookMeasured(message, el !== null && lookOnScreen(el, look));
+    });
+  });
 
   return (
-    // The band is outside j/k stops: reaching the last stop flashes how to type instead.
-    // Details remain reachable by <leader>i, prefix i or a click, outside the stop list.
-    <div className={wrapping ? "status-band status-band--wrap" : "status-band"} ref={bandRef}>
+    <>
+    {above.length > 0 && (
+      // Not a control and not a stop: lines of text, each segment's whole text, as wide as the band.
+      <div className="status-band-above">
+        {above.map((seg) => (
+          <div key={seg.id} ref={seg.id === "message" ? messageRef : undefined} className={`band-above-line band-${seg.id}`}>
+            {seg.text}
+          </div>
+        ))}
+      </div>
+    )}
+    {/* The band is outside j/k stops: reaching the last stop flashes how to type instead.
+        Details remain reachable by <leader>i, prefix i or a click, outside the stop list. */}
+    <div className="status-band" ref={bandRef}>
       {/* `aria-hidden`: not content, just this render's ruler. One character, at the band's own
           `--fs-sm`/mono font, so its rendered width IS one mono character's width. */}
       <span className="band-measure" aria-hidden="true" ref={measureRef}>
@@ -177,10 +207,10 @@ export function StatusBand({ facts, paneFocused, entryKey, onOpenDetail, onJump,
           classes, no click handling and no place in `controlsOf`'s selector. */}
       {onOpenDetail !== undefined ? (
         <button type="button" className="band-open" onClick={onOpenDetail}>
-          {detailLeft.map((seg) => renderLeftSeg(seg, facts, paneFocused, glyphMode, entryKey))}
+          {detailLeft.map((seg) => renderLeftSeg(seg, facts, paneFocused, glyphMode, entryKey, messageRef))}
         </button>
       ) : (
-        <div className="band-open">{detailLeft.map((seg) => renderLeftSeg(seg, facts, paneFocused, glyphMode, entryKey))}</div>
+        <div className="band-open">{detailLeft.map((seg) => renderLeftSeg(seg, facts, paneFocused, glyphMode, entryKey, messageRef))}</div>
       )}
       {background && <button type="button" className="band-seg band-background" onClick={onOpenTasks}>{background.text}</button>}
       <span className="band-spacer" />
@@ -225,5 +255,6 @@ export function StatusBand({ facts, paneFocused, entryKey, onOpenDetail, onJump,
         })}
       </div>
     </div>
+    </>
   );
 }

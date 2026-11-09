@@ -7,15 +7,6 @@ export const TYPING_FLASH = "a / d answer a card only on their own — pause, th
 /** What the band says when `Esc` is pressed while a turn runs: it never interrupts, and this is the reminder. */
 export const ESC_DOES_NOT_INTERRUPT_FLASH = "Esc does not interrupt — ctrl+c does";
 
-/** The short form the band shows of a flash too wide for its one row (`bandLayout`), tried once every segment that
- *  can go has gone and the whole sentence does not fit beside the mode's letter either: a narrow chat (a column of a
- *  split window, a laptop at zoom 1.5) keeps one row and its composer uncovered, and still says what to do. The whole
- *  sentence stays the segment's title. A flash without a short form, or whose short form does not fit either, wraps
- *  whole. */
-export const SHORT_FLASH: ReadonlyMap<string, string> = new Map([
-  [TYPING_FLASH, "pause, press again"],
-  [ESC_DOES_NOT_INTERRUPT_FLASH, "ctrl+c interrupts"],
-]);
 /** What the band says when `a`/`d`/`D`, or Enter/Space on a card's own button,
  *  came after a count (`3a`) -- a card answer takes no count, so the key answers nothing. */
 export const COUNT_ANSWER_FLASH = "a / d / D take no count — press it on its own";
@@ -38,6 +29,17 @@ export const NO_CARD_FLASH = "no card here — i, o, A or Ctrl+j to type";
 /** The same refusal while a card IS waiting, just not under the cursor -- it
  *  points back to the card, as the activity line's "j to it" does, instead of only suggesting typing. */
 export const CARD_ELSEWHERE_FLASH = "a / d answer the card under the cursor — j / k onto it, then a / d";
+/** The short form the band shows of a flash too wide for its one row (`bandLayout`), tried once every segment that
+ *  can go has gone and the whole sentence does not fit beside the mode's letter either: a narrow chat (a column of a
+ *  split window, a laptop at zoom 1.5) still says what to do, where a cut (`cutFlash`) would keep only the sentence's
+ *  start. The whole sentence stays the segment's title. A flash without a short form is cut, and so is a short form
+ *  that does not fit either. */
+export const SHORT_FLASH: ReadonlyMap<string, string> = new Map([
+  [TYPING_FLASH, "pause, press again"],
+  [ESC_DOES_NOT_INTERRUPT_FLASH, "ctrl+c interrupts"],
+  [NO_CARD_FLASH, "no card — i to type"],
+  [CARD_ELSEWHERE_FLASH, "j / k to the card first"],
+]);
 /** What the band says when `]p` / `[p` found no card waiting for an answer in this
  *  tab -- none at all, every one already answered from this panel, or a session that ended (its cards are
  *  inert) -- instead of doing nothing silently. */

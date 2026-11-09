@@ -1,7 +1,8 @@
 import { describe, expect, it } from "vitest";
-import { phoneTitle, backgroundSegment, bandLayout, bandLayoutSteady, cardSummary, liveTasks, taskWords, tasksLine, textWidth, usageSegment, RETURN_COOLDOWN_MS, RETURN_MARGIN, type BandFacts, type LayoutHold } from "./band";
+import { phoneTitle, backgroundSegment, bandLayout, cutFlash, bandLayoutSteady, cardSummary, liveTasks, taskWords, tasksLine, textWidth, usageSegment, RETURN_COOLDOWN_MS, RETURN_MARGIN, type BandFacts, type LayoutHold } from "./band";
 import { applyEvent, initialState } from "./reducer";
-import { ESC_DOES_NOT_INTERRUPT_FLASH, SHORT_FLASH, TYPING_FLASH } from "./app/flashes";
+import { revealedPathText } from "./revealHidden";
+import { ESC_DOES_NOT_INTERRUPT_FLASH, NO_CARD_FLASH, SHORT_FLASH, TYPING_FLASH } from "./app/flashes";
 import type { BackgroundTask, BackgroundTaskRecord, TaskKind, TokenUsage } from "./types";
 
 const running: BandFacts = { mode: "input", pill: "⏵⏵ auto", showcmd: null, message: null, prompt: null, warn: null,
@@ -210,12 +211,15 @@ describe("the band degrades by priority", () => {
 });
 
 /** A WebKit zoom of 1.5 measures 520 logical px as 346 CSS px: a 47-column budget at 7.2 px per
- *  character. A y/n prompt must keep its own `(y/n)`, and a typing-guard flash its explanation. */
-describe("a y/n prompt or a flash is never truncated", () => {
+ *  character. A y/n prompt must keep what `y` does and its own `(y/n)`, so it wraps; a flash is one row, cut. */
+describe("a y/n prompt is never truncated; a flash is one row", () => {
   const NARROW_BUDGET_WIDTH = 340; // floor(340 / 7.2) === 47
   const R06_PROMPT = "Switch to bypass and approve the 1 waiting card? (y/n)";
   const EMPTY_TAB_PROMPT = "Switch to bypass? New sessions in this window start in bypass too (y/n)";
   const D11_FLASH = "y must be pressed on its own to enter bypass — Shift+Tab to ask again";
+  /** Cells the laid-out band takes, as `bandLayout` counts them (text, one cell of padding each side, the mode's arrow). */
+  const cellsOf = (segs: ReturnType<typeof bandLayout>) =>
+    segs.reduce((n, x) => n + Math.max(textWidth(x.text), x.cells ?? 0) + 2 + (x.id === "mode" ? 1 : 0), 0);
 
   it("keeps the bypass prompt whole, (y/n) included, at a 47-column budget", () => {
     const segs = bandLayout({ ...idle, prompt: R06_PROMPT }, NARROW_BUDGET_WIDTH, 7.2);
@@ -234,31 +238,88 @@ describe("a y/n prompt or a flash is never truncated", () => {
     expect(prompt.text).toContain("(y/n)");
   });
 
-  it("keeps the flash that explains y whole -- it explains what y does, not just a status word", () => {
+  it("no flash ever wraps: too wide for the row, it is cut at the row's end, its start kept", () => {
     const segs = bandLayout({ ...idle, message: D11_FLASH }, NARROW_BUDGET_WIDTH, 7.2);
     const message = segs.find((s) => s.id === "message")!;
-    expect(message.text).toBe(D11_FLASH);
-    expect(message.text).not.toContain("…");
+    expect(message.wraps).toBeFalsy();
+    expect(message.cut).toBe(true);
+    expect(message.text).toBe(D11_FLASH); // the engine's ellipsis ends it where the row ends
+    expect(message.full).toBe(D11_FLASH);
+    // Nothing else had to give way to it: mode and pill keep their words.
+    expect(segs.map((s) => s.id)).toEqual(["mode", "pill", "message"]);
+  });
+
+  /* At about 50 cells wide, BROWSE, `⏵⏵ auto`, `↓`, and a no-card flash must fit on one row.
+     A wrapping flash would push the unread indicator onto another row. */
+  it("the 'no card here' flash at 50 cells wide: one row, its short form, the ↓ kept", () => {
+    const facts: BandFacts = { ...idle, pill: "⏵⏵ auto", unread: "↓", message: NO_CARD_FLASH };
+    const segs = bandLayout(facts, 50 * 7.2, 7.2);
+    const message = segs.find((s) => s.id === "message")!;
+    expect(message.wraps).toBeFalsy();
+    expect(message.cut).toBeFalsy();
+    expect(message.text).toBe(SHORT_FLASH.get(NO_CARD_FLASH));
+    expect(message.full).toBe(NO_CARD_FLASH);
+    expect(segs.find((s) => s.id === "unread")!.text).toBe("↓");
+    expect(segs.find((s) => s.id === "mode")!.text).toBe("BROWSE");
+    expect(cellsOf(segs)).toBeLessThanOrEqual(50);
+    // With room, the whole sentence.
+    expect(bandLayout(facts, 80 * 7.2, 7.2).find((s) => s.id === "message")!.text).toBe(NO_CARD_FLASH);
+  });
+
+  it("every width from 12 to 120 columns keeps every flash on one row: it fits, or it is marked cut", () => {
+    const path = "gf: 2 of 5: src/components/very/deep/directory/StatusBand.tsx";
+    for (let cols = 12; cols <= 120; cols++) {
+      for (const message of [D11_FLASH, NO_CARD_FLASH, TYPING_FLASH, path]) {
+        const segs = bandLayout({ ...idle, pill: "⏵⏵ manual", unread: "↓3", message }, cols * 7.2, 7.2);
+        const shown = segs.find((s) => s.id === "message")!;
+        expect(segs.some((s) => s.wraps === true), `${cols} columns: ${message}`).toBe(false);
+        expect(shown.cut === true || cellsOf(segs) <= cols, `${cols} columns: ${message}`).toBe(true);
+        expect(segs.find((s) => s.id === "unread")!.text).toBe("↓3");
+        // A path keeps its file's name wherever the cut leaves room for one.
+        if (message === path && shown.cut && shown.text !== path && textWidth(shown.text) >= 20) {
+          expect(shown.text.endsWith("/StatusBand.tsx"), `${cols} columns: ${shown.text}`).toBe(true);
+        }
+      }
+    }
+  });
+
+  /* A link's address before the click that opens it: a long host's own domain is at its end, so the flash is shown
+     whole (`messageLook`), on its own lines above the row as a long y/n prompt is, instead of being cut. */
+  it("a flash with a look is never cut: too wide, it wraps, the address entire", () => {
+    const host = "github.com-sign-in-verify-your-account-now.example.net";
+    const url = `https://${host}/login — click again to open`;
+    const segs = bandLayout({ ...idle, unread: "↓", message: url, messageLook: host }, NARROW_BUDGET_WIDTH, 7.2);
+    const message = segs.find((s) => s.id === "message")!;
+    expect(message.text).toBe(url);
     expect(message.wraps).toBe(true);
+    expect(segs.find((s) => s.id === "unread")!.text).toBe("↓");
+    // The same text unmarked is cut.
+    const cut = bandLayout({ ...idle, message: url }, NARROW_BUDGET_WIDTH, 7.2).find((s) => s.id === "message")!;
+    expect(cut.wraps).toBeFalsy();
+    expect(cut.cut).toBe(true);
+    // Marked whole but short enough: one row, no wrap.
+    const fits = bandLayout({ ...idle, message: "https://a.example — click again to open", messageLook: "a.example" }, 80 * 7.2, 7.2);
+    expect(fits.find((s) => s.id === "message")!.wraps).toBeFalsy();
   });
 
   /* The sentence Rust says when a tab's agent has no manual mode (`TabSet::mode_offered_to`): it arrives as a
      notice, which the band shows as its flash. At the panel's 480px it is about 100 columns of text. */
-  it("keeps the 'has no manual mode' sentence whole beside a manual pill, wrapping at 480px", () => {
+  it("cuts the 'has no manual mode' sentence beside a manual pill at 480px, keeping mode and pill", () => {
     const note =
       "gemini tabs have no manual mode (the agent's own mode is set once, at its start): tab 2 is in auto";
     const segs = bandLayout({ ...idle, pill: "⏵⏵ manual", message: note }, 480, 7.2);
     const message = segs.find((s) => s.id === "message")!;
     expect(message.text).toBe(note);
-    expect(message.wraps).toBe(true);
+    expect(message.cut).toBe(true);
+    expect(message.wraps).toBeFalsy();
+    expect(message.full).toBe(note);
     expect(segs.find((s) => s.id === "pill")!.text).toBe("⏵⏵ manual");
     expect(segs.find((s) => s.id === "mode")!.text).toBe("BROWSE");
   });
 
-  it("a flash that wraps leaves the mode its word: the letter would not make it fit", () => {
+  it("a flash that is cut leaves the mode its word: the letter would not make it fit", () => {
     const segs = bandLayout({ ...idle, message: D11_FLASH }, NARROW_BUDGET_WIDTH, 7.2);
     expect(segs.find((s) => s.id === "mode")!.text).toBe("BROWSE");
-    expect(segs.find((s) => s.id === "message")!.wraps).toBe(true);
     // ...while a band with no message still shortens the mode when nothing else is left to drop.
     expect(bandLayout({ ...idle, warn: "skew" }, 120, 7.2).find((s) => s.id === "mode")!.text).toBe("B");
   });
@@ -268,18 +329,17 @@ describe("a y/n prompt or a flash is never truncated", () => {
     const message = "x".repeat(28);
     const segs = bandLayout({ ...idle, message }, 44 * 7.2, 7.2);
     expect(segs.find((s) => s.id === "mode")!.text).toBe("B");
-    expect(segs.find((s) => s.id === "message")!.wraps).toBeFalsy();
+    expect(segs.find((s) => s.id === "message")!.text).toBe(message);
   });
 
   /* The card guard's refusal in a narrow chat (the films' 1280 px window at zoom 1.5: a band of about 37 columns beside
      a manual pill) wrapped over six rows and covered the composer. Too wide for the row, it gives way to its short
      form, and the mode its letter, which is what lets that fit; a wide band keeps the whole sentence. */
-  it("the card guard's refusal keeps one row in a narrow chat: its short form, not six wrapped rows", () => {
+  it("the card guard's refusal keeps one row in a narrow chat: its short form", () => {
     const narrow = { ...idle, pill: "⏵⏵ manual", cards: 3, message: TYPING_FLASH };
     const segs = bandLayout(narrow, 37 * 7.2, 7.2);
     const message = segs.find((s) => s.id === "message")!;
     expect(message.text).toBe(SHORT_FLASH.get(TYPING_FLASH));
-    expect(message.wraps).toBeFalsy();
     expect(segs.find((s) => s.id === "pill")!.text).toBe("⏵⏵ manual");
     expect(segs.find((s) => s.id === "mode")!.text).toBe("B");
     const wide = bandLayout(narrow, 160 * 7.2, 7.2);
@@ -287,37 +347,33 @@ describe("a y/n prompt or a flash is never truncated", () => {
     expect(wide.find((s) => s.id === "mode")!.text).toBe("BROWSE");
   });
 
-  /* A short form drops words a person may want (the guard's "i or Ctrl+j to type"), so the shown segment keeps the
-     whole sentence for `StatusBand`'s title; a flash shown whole carries none. */
-  it("a flash shown in its short form keeps its whole text for the title, a whole one carries none", () => {
+  /* A short form or a cut drops words a person may want (the guard's "i or Ctrl+j to type"), so the shown segment
+     keeps the whole sentence for `StatusBand`'s title; a flash shown whole carries none. */
+  it("a flash shown short or cut keeps its whole text for the title, a whole one carries none", () => {
     const narrow = { ...idle, pill: "⏵⏵ manual", cards: 3, message: TYPING_FLASH };
     const short = bandLayout(narrow, 37 * 7.2, 7.2).find((s) => s.id === "message")!;
     expect(short.text).toBe(SHORT_FLASH.get(TYPING_FLASH));
     expect(short.full).toBe(TYPING_FLASH);
     expect(bandLayout(narrow, 160 * 7.2, 7.2).find((s) => s.id === "message")!.full).toBeUndefined();
-    // Wrapped whole (not even the short form fits): the text is the whole sentence already.
-    const wrapped = bandLayout(narrow, 12 * 7.2, 7.2).find((s) => s.id === "message")!;
-    expect(wrapped.text).toBe(TYPING_FLASH);
-    expect(wrapped.full).toBeUndefined();
+    // Not even the short form fits: the short form is cut, and the title is still the whole sentence.
+    const cut = bandLayout(narrow, 26 * 7.2, 7.2).find((s) => s.id === "message")!;
+    expect(cut.text).toBe(SHORT_FLASH.get(TYPING_FLASH));
+    expect(cut.cut).toBe(true);
+    expect(cut.full).toBe(TYPING_FLASH);
   });
 
   it("Esc's reminder keeps one row in a narrow chat too", () => {
     const segs = bandLayout({ ...idle, pill: "⏵⏵ manual", message: ESC_DOES_NOT_INTERRUPT_FLASH }, 36 * 7.2, 7.2);
     const message = segs.find((s) => s.id === "message")!;
     expect(message.text).toBe("ctrl+c interrupts");
-    expect(message.wraps).toBeFalsy();
   });
 
-  it("the short form only where it helps: the whole sentence beside the letter first, else the whole one wraps", () => {
+  it("the short form only where it helps: the whole sentence beside the letter first", () => {
     // `B ⏵⏵ manual Esc does not interrupt — ctrl+c does`: 4 + 11 + 38 = 53 columns fit whole with the letter.
     const esc = { ...idle, pill: "⏵⏵ manual", message: ESC_DOES_NOT_INTERRUPT_FLASH };
     const fits = bandLayout(esc, 53 * 7.2, 7.2);
     expect(fits.find((s) => s.id === "message")!.text).toBe(ESC_DOES_NOT_INTERRUPT_FLASH);
     expect(fits.find((s) => s.id === "mode")!.text).toBe("B");
-    // 20 columns: not even `B ⏵⏵ manual ctrl+c interrupts` (34) fits, so the whole sentence wraps.
-    const wraps = bandLayout(esc, 20 * 7.2, 7.2).find((s) => s.id === "message")!;
-    expect(wraps.text).toBe(ESC_DOES_NOT_INTERRUPT_FLASH);
-    expect(wraps.wraps).toBe(true);
   });
 
   it("every short form fits one row beside a manual pill at 40 columns", () => {
@@ -325,8 +381,25 @@ describe("a y/n prompt or a flash is never truncated", () => {
     for (const [full, short] of SHORT_FLASH) {
       expect(textWidth(short)).toBeLessThan(textWidth(full));
       const segs = bandLayout({ ...idle, pill: "⏵⏵ manual", cards: 1, message: full }, 40 * 7.2, 7.2);
-      expect(segs.find((s) => s.id === "message")!.wraps).toBeFalsy();
+      expect(segs.find((s) => s.id === "message")!.text).toBe(short);
     }
+  });
+
+  /* A notification that arrives while a question is up is not part of the question: it takes the row's one-row place
+     beside the prompt, cut when it does not fit, and the prompt's text and lines never change for it. */
+  it("a flash beside a prompt is cut to the row and never joins the prompt", () => {
+    const notice = "Saved the session to /home/u/p/.claude/sessions/2026-11-09-a-rather-long-file-name.json";
+    const short = bandLayout({ ...idle, prompt: "trust? y/n", message: notice }, NARROW_BUDGET_WIDTH, 7.2);
+    expect(short.find((s) => s.id === "prompt")).toMatchObject({ text: "trust? y/n" });
+    expect(short.find((s) => s.id === "prompt")!.wraps).toBeFalsy();
+    const message = short.find((s) => s.id === "message")!;
+    expect(message.wraps).toBeFalsy();
+    expect(message.cut).toBe(true);
+    expect(message.full).toBe(notice);
+    // A question too long for the row goes above it; the flash stays on the row, still one row.
+    const long = bandLayout({ ...idle, prompt: R06_PROMPT, message: notice }, NARROW_BUDGET_WIDTH, 7.2);
+    expect(long.find((s) => s.id === "prompt")).toMatchObject({ text: R06_PROMPT, wraps: true });
+    expect(long.find((s) => s.id === "message")!.wraps).toBeFalsy();
   });
 
   it("a short prompt still fits the row whole -- no wraps flag", () => {
@@ -337,11 +410,70 @@ describe("a y/n prompt or a flash is never truncated", () => {
     expect(prompt.wraps).toBeFalsy();
   });
 
-  it("a short flash still fits the row whole -- no wraps flag", () => {
+  it("a short flash still fits the row whole, uncut", () => {
     const segs = bandLayout({ ...idle, message: "copied 12 chars" }, NARROW_BUDGET_WIDTH, 7.2);
     const message = segs.find((s) => s.id === "message")!;
     expect(message.text).toBe("copied 12 chars");
-    expect(message.wraps).toBeFalsy();
+    expect(message.full).toBeUndefined();
+    expect(message.cut).toBeUndefined();
+  });
+});
+
+/** Where a flash ending in a path is cut; every other flash is left for the engine's ellipsis. */
+describe("cutFlash", () => {
+  it("returns a flash that fits unchanged", () => {
+    expect(cutFlash("copied 12 chars", 15)).toBe("copied 12 chars");
+    expect(cutFlash("copied 12 chars", 40)).toBe("copied 12 chars");
+  });
+  it("leaves a flash with no path at its end whole: the engine ends it at the row's edge", () => {
+    expect(cutFlash("no card here — i, o, A or Ctrl+j to type", 24)).toBe("no card here — i, o, A or Ctrl+j to type");
+  });
+  it("keeps a path's end and loses its middle when the flash ends in a path", () => {
+    const cut = cutFlash("gf: 2 of 5: src/components/very/deep/directory/StatusBand.tsx", 36);
+    expect(cut).toBe("gf: 2 of 5: src/co…ry/StatusBand.tsx");
+    expect(textWidth(cut)).toBeLessThanOrEqual(36);
+  });
+  it("counts wide characters twice and never splits a code point", () => {
+    const cut = cutFlash("打开失败：src/说明文档/非常长的文件名称.md", 21);
+    expect(textWidth(cut)).toBeLessThanOrEqual(21);
+    expect(cut.startsWith("打开")).toBe(true);
+    expect(cut.endsWith(".md")).toBe(true);
+    // The name (`/` and 8 emoji, 9 cells) does not leave 4 cells of the start in a room of 9: the end keeps 5.
+    expect(cutFlash("😀😀😀😀 a/😀😀😀😀😀😀😀😀", 10)).toBe("😀😀😀😀…😀😀😀😀😀");
+  });
+  it("budgets the whole file name when the path ends in spaces, and shows those spaces", () => {
+    const spaces = "⟨U+0020⟩".repeat(5);
+    const text = "gf: src/very/deep/directory/StatusBand.tsx     ";
+    // Room for the name and its five spaces, drawn as escapes: all of it is kept.
+    const roomy = cutFlash(text, 72);
+    expect(roomy.endsWith(`/StatusBand.tsx${spaces}`)).toBe(true);
+    expect(textWidth(roomy)).toBeLessThanOrEqual(72);
+    // Too little room for the name: as much of the end as fits, the spaces still shown.
+    const tight = cutFlash(text, 32);
+    expect(tight.endsWith("⟨U+0020⟩")).toBe(true);
+    expect(textWidth(tight)).toBeLessThanOrEqual(32);
+    // A cut never splits an escape: after the `…` the next one starts whole.
+    expect(tight.slice(tight.indexOf("…") + 1).startsWith("⟨")).toBe(true);
+    // Fits whole: unchanged but for the spaces, which are shown.
+    expect(cutFlash("gf: src/a.rs  ", 80)).toBe("gf: src/a.rs⟨U+0020⟩⟨U+0020⟩");
+  });
+  it("keeps a file name with spaces in it whole when the flash names its path", () => {
+    const path = "src/my very long directory name/Status Band.tsx";
+    const cut = cutFlash(`gf: 2 of 5: ${path}`, 34, path);
+    expect(cut.endsWith("/Status Band.tsx")).toBe(true);
+    expect(cut.startsWith("gf: 2 of 5:")).toBe(true);
+    expect(textWidth(cut)).toBeLessThanOrEqual(34);
+  });
+  it("budgets the whole name of a path with no slash (a file at the project's root)", () => {
+    const name = "StatusBandWithLongName.tsx";
+    expect(cutFlash(`1 of 2: ${name}`, 31, name)).toBe(`1 of…${name}`);
+    const spaced = revealedPathText("Status Band Long Name.tsx  ");
+    const cut = cutFlash(`1 of 2: ${spaced}`, 48, spaced);
+    expect(cut.endsWith(spaced)).toBe(true);
+    expect(textWidth(cut)).toBeLessThanOrEqual(48);
+  });
+  it("leaves the text whole when the room is too small to keep a name", () => {
+    expect(cutFlash("gf: src/a/b/c/StatusBand.tsx", 8)).toBe("gf: src/a/b/c/StatusBand.tsx");
   });
 });
 

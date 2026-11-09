@@ -103,6 +103,8 @@ import {
   hintTargets,
   isActivatableControl,
   linkClickNeedsLook,
+  linkLook,
+  LINK_LOOK_MAX_MS,
   linkOpensAtOnce,
   nextControl,
   permissionTarget,
@@ -135,7 +137,8 @@ import { TabBar } from "./components/TabBar";
 import { MessageList } from "./components/MessageList";
 import { cardApprovable, PermissionCardContext } from "./components/PermissionCard";
 import { classify } from "./problems";
-import { revealedText } from "./revealHidden";
+import { revealedPathText, revealedText } from "./revealHidden";
+import { lookOnScreen } from "./lookOnScreen";
 import { cliPhaseText } from "./turnPhase";
 import { ActivityLine } from "./components/ActivityLine";
 import { StatusBand } from "./components/StatusBand";
@@ -187,6 +190,9 @@ import type { DetailRow, TabId, TabsEnvelope } from "./types";
 import { applyTheme } from "./theme";
 import { applyEditorTyping } from "./typingCadence";
 import { copyToPrimary } from "./primaryCopy";
+
+/** The band's transient line (`showFlash`). */
+type FlashLine = { text: string; seq: number; look?: string; path?: string; toPrompt?: boolean };
 
 export default function App() {
   /** Everything the envelope router decides (`./page_model`). `pageRef` is the latest model, written
@@ -575,15 +581,45 @@ export default function App() {
   } | null>(null);
   const [emptyEditReturnRequest, setEmptyEditReturnRequest] = useState(0);
   const stopTasksSignature = useRef("");
-  /** The footer's transient line. `seq` so the same text twice is two flashes. */
-  const [flash, setFlash] = useState<{ text: string; seq: number } | null>(null);
+  /** The footer's transient line. `seq` so the same text twice is two flashes. `look`: the part the band must show
+   *  whole before the action it names may follow (`BandFacts.messageLook`); `path`: the path it ends with, as drawn
+   *  (`BandFacts.messagePath`); `toPrompt`: the trust question's own answer to a key, drawn after its prompt. */
+  const [flash, setFlash] = useState<FlashLine | null>(null);
   const flashSeq = useRef(0);
-  /** The reply link whose address the last click showed instead of opening (`linkClickNeedsLook`). */
+  /** The reply link whose address the last click showed instead of opening (`linkClickNeedsLook`), armed: set only
+   *  while the band measures its host on screen in the flash `heldLinkRef` names, its look starting when it last
+   *  came into view; cleared the moment it is measured hidden or that flash changes or goes. */
   const shownLinkRef = useRef<ShownLink | null>(null);
-  function showFlash(text: string) {
+  /** The link whose address the band is showing: the link, the flash's text and instance (`seq`), and the part that
+   *  must be seen (`look`, the host). Set by the first click, kept while that flash is up, armed or not. */
+  const heldLinkRef = useRef<{ link: Omit<ShownLink, "at">; text: string; seq: number; look: string } | null>(null);
+  /** The flash on screen now, for the measurement callbacks and the click, which run outside a render. */
+  const flashRef = useRef<FlashLine | null>(null);
+  flashRef.current = flash;
+  /** The element the band draws its flash in (on its row or above it), for the check at the moment of opening. */
+  const bandMessageRef = useRef<HTMLElement | null>(null);
+  function showFlash(text: string, opts: { look?: string; path?: string; toPrompt?: boolean } = {}): number {
     flashSeq.current += 1;
-    setFlash({ text, seq: flashSeq.current });
+    setFlash({ text, seq: flashSeq.current, ...opts });
+    return flashSeq.current;
   }
+  /** `StatusBand` measured the link flash: on screen, the second click on that link may open it, from a look that
+   *  starts now if it was not armed already; hidden (resized, covered, scrolled, clipped), it is disarmed, and the look
+   *  starts over when it is next measured on screen. Any other flash arms nothing. */
+  const onLookMeasured = (text: string, visible: boolean) => {
+    const held = heldLinkRef.current;
+    if (held === null || held.text !== text || flashRef.current?.seq !== held.seq) return;
+    if (!visible) shownLinkRef.current = null;
+    else if (shownLinkRef.current === null) shownLinkRef.current = { ...held.link, at: Date.now() };
+  };
+  // A link is armed only by the flash instance that showed its address: that flash replaced or gone disarms it.
+  useEffect(() => {
+    const held = heldLinkRef.current;
+    if (held !== null && (flash === null || flash.seq !== held.seq)) {
+      heldLinkRef.current = null;
+      shownLinkRef.current = null;
+    }
+  }, [flash]);
   useEffect(() => {
     if (state.notification?.content) showFlash(revealedText(state.notification.content));
   }, [activeTab?.id, state.notification]);
@@ -608,7 +644,9 @@ export default function App() {
   useEffect(() => {
     if (flash === null) return;
     const seq = flash.seq;
-    const timer = setTimeout(() => setFlash((f) => (f?.seq === seq ? null : f)), 2000);
+    // A link's address stays as long as its second click may come (`LINK_LOOK_MAX_MS`): the click opens only while
+    // the flash that showed the address is still up.
+    const timer = setTimeout(() => setFlash((f) => (f?.seq === seq ? null : f)), flash.look !== undefined ? LINK_LOOK_MAX_MS : 2000);
     return () => clearTimeout(timer);
   }, [flash]);
   // Where the envelopes above are read: `queue`, `history`, `scratchEditing` and `queueTaken` by the
@@ -3872,7 +3910,7 @@ export default function App() {
         // Escape alone works from inside a text field: it starts nothing. Every other key typed there is the
         // field's text, so it is taken and never answers.
         if (event.key !== "Escape" && isEditableElement(event.target)) {
-          showFlash(trustFooter(confirm.view.remember, confirm.view.needsYes === true, confirm.view.state));
+          showFlash(trustFooter(confirm.view.remember, confirm.view.needsYes === true, confirm.view.state), { toPrompt: true });
           return true;
         }
         const pendingG = trustPendingGRef.current;
@@ -3908,9 +3946,9 @@ export default function App() {
         } else if (action.kind === "pending_g") {
           trustPendingGRef.current = true;
         } else if (action.kind === "wait") {
-          showFlash(TRUST_WAIT_FLASH);
+          showFlash(TRUST_WAIT_FLASH, { toPrompt: true });
         } else {
-          showFlash(trustFooter(confirm.view.remember, confirm.view.needsYes === true, confirm.view.state));
+          showFlash(trustFooter(confirm.view.remember, confirm.view.needsYes === true, confirm.view.state), { toPrompt: true });
         }
         return true;
       }
@@ -4042,12 +4080,11 @@ export default function App() {
 
   /** The band's prompt segment. A prompt takes the whole band, so a flash made while the trust question is up
    *  (a `y` that came too soon, a key it does not take) is drawn after the prompt, where it can be read. */
+  const promptFlash = confirm !== null && confirm.kind === "trust" && flash !== null && flash.toPrompt === true && flash.seq > confirm.flashAfter;
   const confirmBandPrompt =
-    confirm === null
-      ? null
-      : confirm.kind === "trust" && flash !== null && flash.seq > confirm.flashAfter
-        ? `${confirm.lines.join(" · ")} · ${flash.text}`
-        : confirm.lines.join(" · ");
+    confirm === null ? null : promptFlash ? `${confirm.lines.join(" · ")} · ${flash!.text}` : confirm.lines.join(" · ");
+  /** The flash the band draws in its own one-row place: any but the trust question's answer drawn after its prompt. */
+  const bandFlash = promptFlash ? null : flash;
 
   const trustOverlay = (
     <TrustOverlay
@@ -4273,7 +4310,7 @@ export default function App() {
             mode: emptyMode,
             pill: modePill(activeTab?.mode ?? "auto", true, true),
             showcmd: null,
-            message: flash?.text ?? null,
+            message: bandFlash?.text ?? null,
             prompt: confirmBandPrompt,
             warn: null,
             unread: null,
@@ -6176,7 +6213,10 @@ export default function App() {
           const { files } = stored;
           const shown = (cardViews.current.get(item.request.permissionId) ?? 0) % files.length;
           cardViews.current.set(item.request.permissionId, shown + 1);
-          if (files.length > 1) showFlash(revealedText(`${shown + 1} of ${files.length}: ${files[shown]}`));
+          if (files.length > 1) {
+            const path = revealedPathText(files[shown]);
+            showFlash(`${shown + 1} of ${files.length}: ${path}`, { path });
+          }
           postToRust({ type: "editor_card_view", request_id: requestId, tab, proposal: stored.id, file: shown });
           break;
         }
@@ -6292,14 +6332,30 @@ export default function App() {
         const root = containerRef.current;
         if (anchor === null || root === null) return;
         const now = Date.now();
+        // Armed, it is checked again now: the flash that showed the address must still be the one up, and its host
+        // whole on screen at this moment. If not, this click opens nothing and shows the address again.
+        const held = heldLinkRef.current;
+        const message = bandMessageRef.current;
+        if (
+          shownLinkRef.current !== null &&
+          (held === null || flashRef.current?.seq !== held.seq || message === null || !lookOnScreen(message, held.look))
+        ) {
+          shownLinkRef.current = null;
+        }
         const url = linkClickNeedsLook(anchor, root, shownLinkRef.current, now);
         if (url === null) {
           shownLinkRef.current = null;
+          heldLinkRef.current = null;
           return;
         }
         event.preventDefault();
-        shownLinkRef.current = { el: anchor, row: rowOf(root, anchor), url, at: now };
-        showFlash(`${url} — click again to open`);
+        // Not armed yet: the band shows the address whole (never cut: a long host's own domain is at its end) and
+        // arms the second click only while it measures the host on screen (`onLookMeasured`).
+        const text = `${url} — click again to open`;
+        const look = linkLook(url);
+        shownLinkRef.current = null;
+        const seq = showFlash(text, { look });
+        heldLinkRef.current = { link: { el: anchor, row: rowOf(root, anchor), url }, text, seq, look };
       }}
       onFocus={(event) => {
         // The focus move a plain Tab just made is a landing, at that Tab's count --
@@ -6701,7 +6757,9 @@ export default function App() {
           // comment) -- the capability this used to read is gone.
           pill: modePill(activeTab?.mode ?? "auto", true, true),
           showcmd: box !== null ? `${box.title}…` : null,
-          message: flash?.text ?? null,
+          message: bandFlash?.text ?? null,
+          messageLook: bandFlash?.look,
+          messagePath: bandFlash?.path,
           prompt: confirmBandPrompt,
           warn: statusWarning(state.provider, activeTab?.failure ?? null)
             ?? (state.apiRetry ? revealedText(cliPhaseText(state) ?? "API retry") : null)
@@ -6743,6 +6801,8 @@ export default function App() {
         paneFocused={paneFocused}
         entryKey={panelEntryKey(keymapHelp.window, editorLink !== null)}
         onOpenDetail={() => post({ type: "open_detail" })}
+        onLookMeasured={onLookMeasured}
+        messageElRef={bandMessageRef}
         onOpenTasks={() => openTasksOverlay()}
         onJump={() => unreadJumpRef.current()}
         // `/model` and `/effort` are Claude's and an ACP agent's own list. A Codex tab shows what it reports and offers no choice.

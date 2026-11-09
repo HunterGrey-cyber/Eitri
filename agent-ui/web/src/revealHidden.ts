@@ -82,6 +82,18 @@ export function revealPath(text: string): RevealedPiece[] {
   return pieces;
 }
 
+/** A path as one line of plain text for the band: `revealPath`'s escapes, and the spaces at either end of it -- which
+ *  a line drops from sight -- written as escapes too, so `a.rs   ` never reads as `a.rs`. */
+export function revealedPathText(path: string): string {
+  const text = revealPath(path)
+    .map((piece) => ("escape" in piece ? piece.escape : piece.text))
+    .join("");
+  const lead = /^ */.exec(text)![0].length;
+  const trail = text.length === lead ? 0 : /[ ]*$/.exec(text)![0].length;
+  const space = escapeOf(" ");
+  return `${space.repeat(lead)}${text.slice(lead, text.length - trail)}${space.repeat(trail)}`;
+}
+
 export function countEscapes(pieces: RevealedPiece[]): number {
   return pieces.filter((piece) => "escape" in piece).length;
 }

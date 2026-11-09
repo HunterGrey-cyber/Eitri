@@ -65,15 +65,58 @@ it("copies nothing on the detail popover's trailing action", () => {
   expect(posted.filter((msg) => msg.type === "copy_primary")).toEqual([]);
 });
 
-it("holds a disguised mailto click and lets its second click through", () => {
+/** jsdom lays nothing out: a band 900 px wide at 7.2 px a character, every range a box on screen and the band's flash
+ *  on top of it, so the band's look measurement (`lookOnScreen`) finds the address shown, as a real engine would. */
+function stubLaidOut(): () => void {
+  const width = Object.getOwnPropertyDescriptor(HTMLElement.prototype, "clientWidth");
+  const box = HTMLElement.prototype.getBoundingClientRect;
+  const proto = Range.prototype as unknown as { getClientRects?: () => DOMRect[] };
+  const rects = proto.getClientRects;
+  const doc = document as unknown as { elementFromPoint?: unknown };
+  const hit = doc.elementFromPoint;
+  Object.defineProperty(HTMLElement.prototype, "clientWidth", { configurable: true, get: () => 900 });
+  // The band's ruler is one 7.2 px character; every other element keeps jsdom's empty box.
+  HTMLElement.prototype.getBoundingClientRect = function (this: HTMLElement) {
+    return this.classList.contains("band-measure")
+      ? ({ left: 0, top: 0, right: 7.2, bottom: 10, width: 7.2, height: 10, x: 0, y: 0 } as DOMRect)
+      : box.call(this);
+  };
+  proto.getClientRects = () => [{ left: 0, top: 0, right: 10, bottom: 10, width: 10, height: 10, x: 0, y: 0 } as DOMRect];
+  doc.elementFromPoint = () => document.querySelector(".band-message");
+  return () => {
+    if (width) Object.defineProperty(HTMLElement.prototype, "clientWidth", width);
+    else delete (HTMLElement.prototype as unknown as { clientWidth?: number }).clientWidth;
+    HTMLElement.prototype.getBoundingClientRect = box;
+    proto.getClientRects = rects;
+    doc.elementFromPoint = hit;
+  };
+}
+
+it("holds a disguised mailto click and lets its second click through once the address is on screen", () => {
+  const unstub = stubLaidOut();
+  try {
+    const { container } = started("[support@example.org](mailto:attacker@example.net?subject=hi)");
+    const anchor = container.querySelector(".row a[href]")!;
+    vi.setSystemTime(10000);
+    expect(fireEvent.click(anchor)).toBe(false);
+    expect(container.querySelector(".band-message")?.textContent).toContain("attacker@example.net");
+    vi.setSystemTime(10100);
+    expect(fireEvent.click(anchor)).toBe(false);
+    vi.setSystemTime(11000);
+    expect(fireEvent.click(anchor)).toBe(true);
+  } finally {
+    unstub();
+  }
+});
+
+it("never lets a disguised mailto click through while the band has not shown its address", () => {
+  // No layout at all: the band has no width yet, so it draws only its mode and pill and the address is nowhere.
   const { container } = started("[support@example.org](mailto:attacker@example.net?subject=hi)");
   const anchor = container.querySelector(".row a[href]")!;
   vi.setSystemTime(10000);
   expect(fireEvent.click(anchor)).toBe(false);
-  vi.setSystemTime(10100);
-  expect(fireEvent.click(anchor)).toBe(false);
   vi.setSystemTime(11000);
-  expect(fireEvent.click(anchor)).toBe(true);
+  expect(fireEvent.click(anchor)).toBe(false);
 });
 
 it("lets a mailto click through when its text shows the address", () => {

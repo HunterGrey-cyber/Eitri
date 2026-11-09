@@ -2049,6 +2049,8 @@ input::placeholder {
   display: flex;
   align-items: center;
   gap: 8px;
+  /* Never squeezed: `bandLayout` already dropped what does not fit, and a flash too wide is the one that gives way. */
+  flex-shrink: 0;
   margin-left: auto;
   overflow: hidden;
   white-space: nowrap;
@@ -2087,31 +2089,31 @@ input::placeholder {
   unicode-bidi: bidi-override;
   unicode-bidi: isolate-override;
 }
-/* At WebKit zoom 1.5 a 47-column band clips the bypass prompts' trailing (y/n) and a flash's
-   explanation in a fixed-height row. `Seg.wraps` lets those segments grow instead of truncating.
-   `StatusBand` adds this class only when `bandLayout` marks a segment as wrapping, so short text
-   keeps the editor's fixed row height. Ending the prompt/flash or widening the band removes the
-   class and restores that height. Pin the mode block to the first line while text grows beneath it. */
-.status-band--wrap {
-  height: auto;
-  min-height: var(--nv-editor-row, 24px);
-  overflow: visible;
-  align-items: flex-start;
-  flex-wrap: wrap;
-}
-.status-band--wrap .band-open {
-  overflow: visible;
-  white-space: normal;
-  flex: 1 1 auto;
+/* A flash is one row: one too wide for it (`Seg.cut`) shrinks first (`min-width: 0`) and ends in an ellipsis where the
+   row ends, to the pixel, instead of being clipped at the band's edge or wrapping. A flash ending in a path comes
+   already cut in its middle (`cutFlash`). */
+.status-band .band-message {
+  flex: 0 1 auto;
   min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
 }
-.status-band--wrap .band-prompt,
-.status-band--wrap .band-message {
-  white-space: normal;
+/* What may not be cut and does not fit the row -- a y/n question (it says what `y` does: a move into bypass, the
+   cards it approves), a link's address before the click that opens it (a long host's own domain is at its end) --
+   is drawn whole on its own lines right above the band's row, as wide as the band, on the band's own fill: the one
+   time the foot grows, for as long as that text is up. The row under it keeps its one editor row and its place on
+   the editor's status line. Its text breaks anywhere, so no word is ever wider than the panel; it is never clipped
+   (no overflow rule, no fixed height), so it can be measured whole on screen before a second click opens a link. */
+.status-band-above {
+  flex: none;
+  padding: 0 var(--page-pad) 0 1ch;
+  font-family: var(--nv-font-mono);
+  font-size: var(--fs-base);
+  line-height: var(--nv-editor-row, 24px);
+  background: var(--nv-chrome);
+  color: var(--nv-chrome-fg);
+  white-space: pre-wrap;
   overflow-wrap: anywhere;
-  /* The band's content sits in a <button>, whose own text is centred; a sentence of several lines reads from
-     its left edge, beside the mode block. */
-  text-align: left;
 }
 /* Draw the mode like the editor's lualine section: its own mode pair (`--nv-status-*`), bold,
    one cell of air on each side, full row height from the left edge, and a one-cell solid arrow.
@@ -2124,7 +2126,7 @@ input::placeholder {
   align-self: stretch;
 }
 .band-mode {
-  /* Never squeezed by a long flash beside it: the flash wraps, the mode keeps its width. */
+  /* Never squeezed by a long flash or question beside it: the flash is cut, the question wraps, the mode keeps its width. */
   flex-shrink: 0;
   align-self: stretch;
   display: flex;

@@ -10,6 +10,7 @@ import tokensRs from "../../../core/src/theme/tokens.rs?raw";
 // number lives in both languages, so this file holds them equal (see the typing-cadence test below).
 import panelCadenceRs from "../../../core/src/panel_cadence.rs?raw";
 import { NATURAL_METER_STEP_MS } from "./typingCadence";
+import { PASS_THROUGH_LAYERS } from "./lookOnScreen";
 // The sideways guard renders the panel's real `<pre>`s.
 import { createElement } from "react";
 import { renderToStaticMarkup } from "react-dom/server";
@@ -1846,6 +1847,42 @@ describe("index.css cascade (which rule actually wins)", () => {
     expect(winningDeclaration(row, ".dash-key", "font-style")).toBe("normal");
     // Under the cursor the keycap keeps an edge in the muted ink, which a light scheme's cursorline cannot swallow.
     expect(winningDeclaration(row, ".dash-key", "border-color")).toBe("var(--nv-muted)");
+  });
+
+  /* A flash is one row: neither `.status-band` nor its message may wrap, and a message the layout under-counted (a
+     fallback glyph wider than a cell) ends in an ellipsis instead of being clipped. Only a y/n prompt has a wrap rule. */
+  it("keeps a flash on the band's one row: fixed height, no wrap, an ellipsis at the message's end", () => {
+    const band = `<div class="status-band"><button class="band-open"><span class="band-seg band-message">x</span></button></div>`;
+    expect(winningDeclaration(band, ".status-band", "height")).toBe("var(--nv-editor-row, 24px)");
+    expect(winningDeclaration(band, ".status-band", "overflow")).toBe("hidden");
+    expect(winningDeclaration(band, ".status-band", "flex-wrap")).toBeNull();
+    expect(winningDeclaration(band, ".band-message", "white-space")).toBe("nowrap");
+    expect(winningDeclaration(band, ".band-message", "text-overflow")).toBe("ellipsis");
+    expect(winningDeclaration(band, ".band-message", "overflow")).toBe("hidden");
+    expect(winningDeclaration(band, ".band-message", "min-width")).toBe("0px");
+    // Nothing on the band's row ever wraps; what may not be cut goes on its own lines above it, never clipped.
+    expect(withoutComments).not.toMatch(/status-band--wrap|band-wraps/);
+    const above = `<div class="status-band-above"><div class="band-above-line band-message">x</div></div>`;
+    expect(winningDeclaration(above, ".status-band-above", "white-space")).toBe("pre-wrap");
+    expect(winningDeclaration(above, ".status-band-above", "overflow-wrap")).toBe("anywhere");
+    expect(winningDeclaration(above, ".status-band-above", "overflow")).toBeNull();
+    expect(winningDeclaration(above, ".status-band-above", "height")).toBeNull();
+    expect(winningDeclaration(above, ".band-above-line", "overflow")).toBeNull();
+    expect(winningDeclaration(above, ".band-above-line", "text-overflow")).toBeNull();
+  });
+
+  /* A layer that takes no pointer is invisible to the hit test the band's look measurement makes, so the
+     measurement lists every such layer by name (`PASS_THROUGH_LAYERS`); a new one must join that list. */
+  it("names every pointer-events: none layer in PASS_THROUGH_LAYERS, but the band's never-painted ruler", () => {
+    const selectors: string[] = [];
+    for (const m of withoutComments.matchAll(/([^{}]+)\{[^}]*pointer-events:\s*none[^}]*\}/g)) {
+      for (const sel of m[1].split(",")) selectors.push(sel.trim());
+    }
+    expect(selectors.length).toBeGreaterThan(0);
+    for (const sel of selectors) {
+      if (sel === ".band-measure") continue;
+      expect(PASS_THROUGH_LAYERS.some((layer) => sel === layer || sel.endsWith(` ${layer}`)), sel).toBe(true);
+    }
   });
 
   /* The band continues the editor's statusline across the divider: the same fill, lifted
