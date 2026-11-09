@@ -24,6 +24,7 @@ import { parsePath } from "../paths";
 import type { PathRef } from "../paths";
 import { CursorBand, type BandBox } from "../cursorBand";
 import { conversationRows, stopOf } from "../nav";
+import { captureAnchor, restoreAnchor, type ViewAnchor } from "../viewAnchor";
 
 type Props = {
   /** The conversation's identity: row keys can be shared by different tabs. */
@@ -222,6 +223,27 @@ function listTakesUpward(list: HTMLElement, target: EventTarget | null): boolean
   return true;
 }
 
+/** Whether a downward wheel or key at `target` is the list's own: no box between it and the list can still scroll
+ *  down to take it (a tool output's own box, a wide table's), so at the list's end it asks for the end. */
+function listTakesDownward(list: HTMLElement, target: EventTarget | null): boolean {
+  for (let el = target instanceof Element ? target : null; el !== null && el !== list; el = el.parentElement) {
+    if (el.scrollHeight - el.scrollTop - el.clientHeight > AT_BOTTOM_PX) {
+      const { overflowY } = getComputedStyle(el);
+      if (overflowY === "auto" || overflowY === "scroll" || overflowY === "overlay") return false;
+    }
+  }
+  return true;
+}
+
+/** A focused control acts on the keys it gets (Space and Enter press a button) instead of scrolling the list. */
+function isControl(target: EventTarget | null): boolean {
+  return (
+    isTextEntry(target) ||
+    (target instanceof HTMLElement &&
+      (target.closest("button, a[href], select, summary, [role=button], [role=link], [role=checkbox], [role=radio]") !== null))
+  );
+}
+
 /** How far the cursor's band reaches past the column's text on each side, where the margin allows it. */
 export const BAND_BLEED_PX = 16;
 
@@ -300,12 +322,16 @@ export function MessageList({
      waits or a turn is over. Row-only restyles change content height without changing the list box;
      watching just the list misses those. Snap after layout and before paint, leaving parked readers
      and provisional stops alone. Rows use viewport margins, without a measured width or size query
-     container: on WebKitGTK 2.52.6 a row size container resets scrollTop on status-clock ticks. */
+     container: on WebKitGTK 2.52.6 a row size container resets scrollTop on status-clock ticks.
+     A reader who is not following gets the place they were reading back when the list's width changes (a zoom, a
+     divider drag): see `../viewAnchor` and `reconcileWidth`. That runs first, so the rest of this callback reads the
+     restored view. */
   useLayoutEffect(() => {
     const list = listRef.current;
     if (list === null) return;
     if (typeof ResizeObserver === "undefined") return;
     const observer = new ResizeObserver(() => {
+      reconcileWidthRef.current(list);
       // As the follow effect does, read the position first: a scroll whose event has not arrived yet
       // still decides whether this is a view that is following. Through the ref: see `onScrollRef`.
       // A row changed size, or the list did: the cursor's band follows its row at once, before the end is
@@ -395,6 +421,24 @@ export function MessageList({
 
   const followingRef = useRef(true);
   const lastScrollTopRef = useRef(0);
+  /** Where a reader who is not following is looking (`../viewAnchor`), for a change of the list's width; `null`
+   *  while following, on the phone, or with no row on screen. Taken when the view moves, the cursor moves or the
+   *  tab changes -- never per streamed batch: rows growing below the reader leave the point where it was. */
+  const anchorRef = useRef<ViewAnchor | null>(null);
+  /** The list's `clientWidth` at the observer's last callback; `null` before the first. */
+  const listWidthRef = useRef<number | null>(null);
+  /** The `scrollTop` a width change's restore left. Until the list really moves from there, or the reader asks for
+   *  the end outright (`resumeAtEnd`, a resume), its scroll events and reads are that restore's: they neither take a
+   *  new anchor (so zooming back returns to the same place, not a line off) nor re-arm following when the restore
+   *  was clamped at the end (a wide view of a reader near the end). Input that moves nothing -- a click, a text
+   *  selection, a wheel whose movement has not arrived yet -- does not end it. */
+  const restoredTopRef = useRef<number | null>(null);
+  /** Where a wheel or key up that the list can take found it, while following was already off; `null` once the list
+   *  has moved up from there or the gesture is over. Until then, being at the true end is not the reader reaching it:
+   *  the gesture's movement is still on its way (the same protection `provisionalStopRef` gives a following view). */
+  const upwardFromRef = useRef<number | null>(null);
+  const cursorRef = useRef(cursor);
+  cursorRef.current = cursor;
   const steerUntilRef = useRef(0);
   const pointerSteeringRef = useRef(false);
   /** Where predicted upward scrolling provisionally stopped following; `null` without a pending
@@ -411,6 +455,15 @@ export function MessageList({
       // that position, or it can go unnoticed and be undone by the next delta.
       lastScrollTopRef.current = list.scrollTop;
     }
+  };
+  const recordAnchor = () => {
+    const list = listRef.current;
+    if (list === null || touchRef.current || followingRef.current) {
+      anchorRef.current = null;
+      return;
+    }
+    const rows = conversationRows(list);
+    anchorRef.current = captureAnchor(list, rows, rows[cursorRef.current]);
   };
   /** Largest `seq` when following stops; `null` while following. An array cutoff misses cards
    *  anchored beside older calls: arrival order and display order differ. A tab switch reuses this
@@ -486,9 +539,35 @@ export function MessageList({
     provisionalStopRef.current = { from: list.scrollTop };
     scheduleSettle();
   };
+  /** The width change is handled wherever the list is read first after it: the observer's callback, but also a
+   *  streamed batch's commit or a scroll event (the engine's clamp), either of which can come between the page's new
+   *  width and the observer's callback, and would otherwise read the clamp at the end as the reader reaching it. */
+  const reconcileWidth = (list: HTMLElement) => {
+    const width = list.clientWidth;
+    const changed = listWidthRef.current !== null && width !== listWidthRef.current;
+    listWidthRef.current = width;
+    if (!changed || followingRef.current || anchorRef.current === null) return;
+    const top = restoreAnchor(list, anchorRef.current);
+    if (top === null) return;
+    lastScrollTopRef.current = top;
+    restoredTopRef.current = top;
+  };
+  const reconcileWidthRef = useRef(reconcileWidth);
+  reconcileWidthRef.current = reconcileWidth;
+  /** A reader at the true end (a restore can leave one there, not following) who asks for the end -- a wheel down the
+   *  list itself takes, `End` -- is asking to follow: the engine moves nothing and sends no scroll event there, so this
+   *  is the only place it is heard. Not a wheel a nested box takes, nor a key a focused control acts on. */
+  const resumeAtEnd = (list: HTMLElement) => {
+    if (followingRef.current || provisionalStopRef.current !== null) return;
+    if (list.scrollHeight - list.scrollTop - list.clientHeight > AT_BOTTOM_PX) return;
+    followingRef.current = true;
+    restoredTopRef.current = null;
+    anchorRef.current = null;
+  };
   const onScroll = () => {
     const list = listRef.current;
     if (list === null) return;
+    reconcileWidth(list);
     // Check upward movement before the near-bottom threshold: a short k must stop following
     // even inside that threshold, unless it ends at the TRUE bottom (also where content shrinkage
     // clamps the view). The threshold re-arms only on downward scrolling, never this function's
@@ -501,8 +580,15 @@ export function MessageList({
     const distance = list.scrollHeight - list.scrollTop - list.clientHeight;
     const stop = provisionalStopRef.current;
     const gestureNotYetMoved = stop !== null && Math.abs(list.scrollTop - stop.from) <= AT_BOTTOM_PX;
+    const restored = restoredTopRef.current;
+    const holding = restored !== null && Math.abs(list.scrollTop - restored) <= AT_BOTTOM_PX;
+    const upward = upwardFromRef.current;
+    if (upward !== null && (!steering() || list.scrollTop < upward - AT_BOTTOM_PX)) upwardFromRef.current = null;
+    const upwardNotYetMoved = upwardFromRef.current !== null;
+    if (!holding) restoredTopRef.current = null;
+    const moved = list.scrollTop !== lastScrollTopRef.current;
     if (distance <= AT_BOTTOM_PX) {
-      if (!gestureNotYetMoved) {
+      if (!gestureNotYetMoved && !upwardNotYetMoved && !holding) {
         followingRef.current = true;
         provisionalStopRef.current = null;
       }
@@ -517,6 +603,8 @@ export function MessageList({
       }
     }
     lastScrollTopRef.current = list.scrollTop;
+    if (followingRef.current) anchorRef.current = null;
+    else if (moved && !holding) recordAnchor();
     updatePill();
   };
   onScrollRef.current = onScroll;
@@ -528,13 +616,21 @@ export function MessageList({
     const steer = () => {
       steerUntilRef.current = performance.now() + STEER_WINDOW_MS;
     };
+    /** An upward wheel or key the list can take: provisionally stops a following view, and protects a view that
+     *  already was not following from reading the end as reached before the gesture's movement arrives. */
+    const goingUp = () => {
+      if (followingRef.current) stopProvisionally(list);
+      else upwardFromRef.current = list.scrollTop;
+    };
     // Only a mostly vertical wheel up that the list itself can take stops following, and only
     // provisionally. A sideways swipe's jitter, a wheel an inner box takes and a wheel with nothing
     // above only steer: if the list does move, its scroll event says so.
     const onWheel = (event: WheelEvent) => {
       steer();
       if (event.deltaY < 0 && Math.abs(event.deltaY) > Math.abs(event.deltaX) && listTakesUpward(list, event.target)) {
-        stopProvisionally(list);
+        goingUp();
+      } else if (event.deltaY > 0 && Math.abs(event.deltaY) > Math.abs(event.deltaX) && listTakesDownward(list, event.target)) {
+        resumeAtEnd(list);
       }
     };
     // The browser's own scroll keys, from a control inside the list. In a text box they move the
@@ -544,7 +640,9 @@ export function MessageList({
       if (direction === null) return;
       steer();
       if (direction === "up" && !isTextEntry(event.target) && listTakesUpward(list, event.target)) {
-        stopProvisionally(list);
+        goingUp();
+      } else if (event.key === "End" && !isControl(event.target) && listTakesDownward(list, event.target)) {
+        resumeAtEnd(list);
       }
     };
     const onPointerDown = () => {
@@ -572,6 +670,8 @@ export function MessageList({
     const onResume = () => {
       followingRef.current = true;
       provisionalStopRef.current = null;
+      restoredTopRef.current = null;
+      upwardFromRef.current = null;
       if (settleTimerRef.current !== null) clearTimeout(settleTimerRef.current);
       settleTimerRef.current = null;
       follow(list);
@@ -717,6 +817,12 @@ export function MessageList({
     const row = conversationRows(list)[cursor];
     band.place(row === undefined ? null : bandBox(row, list.clientWidth), glide);
   };
+  // The reader's point follows the cursor (its row is the anchor while on screen), and a tab's rows are its own.
+  useLayoutEffect(() => {
+    restoredTopRef.current = null;
+    recordAnchor();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [cursor, tab]);
   useLayoutEffect(() => {
     if (bandTabRef.current !== tab) {
       bandTabRef.current = tab;

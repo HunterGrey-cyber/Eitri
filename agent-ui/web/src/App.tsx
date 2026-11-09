@@ -6028,6 +6028,9 @@ export default function App() {
         setCursor(target);
         const list = root?.querySelector<HTMLElement>(".message-list") ?? null;
         if (list !== null && count === null) list.scrollTop = action.to === "first" ? 0 : list.scrollHeight;
+        // A bare `G` asks for the end outright: following resumes even where the view is there already and the
+        // write moves nothing (no scroll event would say so), as after a zoom left a reader at the end.
+        if (list !== null && count === null && action.to === "last") resumeFollowing(list);
         root?.focus({ preventScroll: true });
         break;
       }

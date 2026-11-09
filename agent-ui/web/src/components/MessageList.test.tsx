@@ -2473,3 +2473,291 @@ it("footer_names_the_phone_that_stopped", () => {
  const view = render(<MessageList state={state({turnEndings: [{seq: 2, turnId: "t1", kind: "interrupted", reason: null, apiErrorStatus: null, message: null}], stoppedFrom: {t1: {deviceId: "d1", name: "Pixel 8"}}})} sessionEnded={false} expanded={{}} cursor={-1} onAnswerPermission={() => {}} />);
  expect(view.container.textContent).toContain("stopped from Pixel 8");
 });
+
+/* A zoom or a divider drag changes the list's width and every row reflows; `scrollTop` kept in pixels put a reader
+   deep in a long conversation pages away from where they were reading (measured in the sandbox, 2026-11-09). The
+   reader's row is put back at its height in the view, following is not re-armed by a restore the engine clamped at
+   the end, and zooming back returns to the same `scrollTop`. Fake layout: each reply's height is its characters over
+   the width; the list's top is the viewport's top. */
+describe("MessageList keeps a parked reader's place across a width change", () => {
+  const replies = Array.from({ length: 12 }, (_, i) => `reply ${i} ` + "x".repeat(i % 2 === 0 ? 2400 : 40));
+  const conversation = state({ transcript: texts(...replies) });
+  let now = 10_000;
+
+  afterEach(() => {
+    vi.unstubAllGlobals();
+    vi.restoreAllMocks();
+  });
+
+  function mount(cursor: number) {
+    const observers = stubResizeObserver();
+    vi.spyOn(performance, "now").mockImplementation(() => now);
+    const view = render(<MessageList state={conversation} sessionEnded={false} expanded={{}} cursor={cursor} onAnswerPermission={() => {}} />);
+    const list = view.container.querySelector<HTMLElement>(".message-list")!;
+    const rows = Array.from(list.querySelectorAll<HTMLElement>('[data-nav-stop="row"]'));
+    // Live: a commit can mount rows after this.
+    const live = () => Array.from(list.querySelectorAll<HTMLElement>('[data-nav-stop="row"]'));
+    const geo = { width: 400, scrollTop: 0, height: 400 };
+    const heights = () => live().map((row) => Math.ceil((row.textContent ?? "").length / (geo.width / 8)) * 20 + 16);
+    const top = (i: number) => heights().slice(0, i).reduce((a, b) => a + b, 0);
+    const total = () => heights().reduce((a, b) => a + b, 0);
+    Object.defineProperty(list, "clientWidth", { configurable: true, get: () => geo.width });
+    Object.defineProperty(list, "clientHeight", { configurable: true, get: () => geo.height });
+    Object.defineProperty(list, "scrollHeight", { configurable: true, get: () => total() });
+    // The engine clamps the position whenever layout shortens the list, and the clamped value is what stays.
+    const clamp = () => (geo.scrollTop = Math.max(0, Math.min(geo.scrollTop, total() - geo.height)));
+    Object.defineProperty(list, "scrollTop", {
+      configurable: true,
+      get: () => clamp(),
+      set: (v: number) => {
+        geo.scrollTop = v;
+        clamp();
+      },
+    });
+    const original = Element.prototype.getBoundingClientRect;
+    vi.spyOn(Element.prototype, "getBoundingClientRect").mockImplementation(function (this: Element) {
+      if (this === list) return { top: 0, bottom: geo.height, left: 0, height: geo.height } as DOMRect;
+      const i = live().indexOf(this as HTMLElement);
+      if (i === -1) return original.call(this);
+      const t = top(i) - clamp();
+      return { top: t, bottom: t + heights()[i], left: 0, height: heights()[i] } as DOMRect;
+    });
+    const observer = observers[0];
+    // The engine's first observation, at the starting width.
+    act(() => resize(observer, list, geo.width));
+    /** A streamed batch's commit: a new `state`, so the list's `[state]` layout effect runs. */
+    const commit = (transcript = replies) =>
+      view.rerender(
+        <MessageList state={state({ transcript: texts(...transcript) })} sessionEnded={false} expanded={{}} cursor={cursor} onAnswerPermission={() => {}} />,
+      );
+    return { list, rows, geo, top, observer, commit };
+  }
+
+  /** The reader scrolls the view to `scrollTop`, then waits long enough that nothing counts as steering. */
+  function park(list: HTMLElement, scrollTop: number) {
+    act(() => {
+      noteUserScroll(list, "up");
+      list.scrollTop = scrollTop;
+      fireEvent.scroll(list);
+    });
+    now += 1000;
+  }
+
+  function widen(list: HTMLElement, geo: { width: number }, observer: FakeObserver, width: number) {
+    geo.width = width;
+    act(() => {
+      resize(observer, list, width);
+      fireEvent.scroll(list); // the restore's own scroll event, a frame later
+    });
+    now += 1000;
+  }
+
+  it("puts the cursor's row back at its height after a zoom, and the same scrollTop after the unzoom", () => {
+    const { list, rows, geo, top, observer } = mount(8);
+    park(list, top(8) - 120);
+    const before = geo.scrollTop;
+    widen(list, geo, observer, 1000);
+    expect(rows[8].getBoundingClientRect().top).toBe(120);
+    widen(list, geo, observer, 400);
+    expect(geo.scrollTop).toBe(before);
+  });
+
+  it("does not take a restore clamped at the end for following, so the unzoom returns", () => {
+    const { list, rows, geo, top, observer } = mount(10);
+    park(list, top(10) - 50);
+    const before = geo.scrollTop;
+    widen(list, geo, observer, 1600);
+    // Clamped: the wide conversation cannot put row 10 that far down, so the view is at its end.
+    expect(geo.scrollTop).toBe(list.scrollHeight - geo.height);
+    expect(rows[10].getBoundingClientRect().top).toBeGreaterThan(0);
+    widen(list, geo, observer, 400);
+    expect(geo.scrollTop).toBe(before);
+  });
+
+  it("restores before a streamed batch's commit, which can run between the width change and the observer", () => {
+    const { list, geo, top, observer, commit } = mount(10);
+    park(list, top(10) - 50);
+    const before = geo.scrollTop;
+    geo.width = 1600; // the page has the new width; the engine clamps at the next layout
+    act(() => commit());
+    widen(list, geo, observer, 1600);
+    widen(list, geo, observer, 400);
+    expect(geo.scrollTop).toBe(before);
+  });
+
+  it("restores before a scroll event that arrives ahead of the observer", () => {
+    const { list, geo, top, observer } = mount(10);
+    park(list, top(10) - 50);
+    const before = geo.scrollTop;
+    geo.width = 1600;
+    act(() => {
+      fireEvent.scroll(list); // the clamp's own scroll event, dispatched before the observations
+    });
+    widen(list, geo, observer, 1600);
+    widen(list, geo, observer, 400);
+    expect(geo.scrollTop).toBe(before);
+  });
+
+  it("keeps the place when the zoom comes right after the reader's own scroll", () => {
+    const { list, geo, top, observer } = mount(10);
+    act(() => {
+      noteUserScroll(list, "up");
+      list.scrollTop = top(10) - 50;
+      fireEvent.scroll(list);
+    });
+    const before = geo.scrollTop;
+    // No time passes: the zoom key lands inside the scroll's steering window.
+    geo.width = 1600;
+    act(() => {
+      resize(observer, list, 1600);
+      fireEvent.scroll(list);
+    });
+    geo.width = 400;
+    act(() => {
+      resize(observer, list, 400);
+      fireEvent.scroll(list);
+    });
+    expect(geo.scrollTop).toBe(before);
+  });
+
+  it("follows again after a wheel down at an end the restore left it at, with no scroll event", () => {
+    const { list, geo, top, observer, commit } = mount(10);
+    park(list, top(10) - 50);
+    widen(list, geo, observer, 1600);
+    expect(geo.scrollTop).toBe(list.scrollHeight - geo.height);
+    act(() => {
+      fireEvent.wheel(list, { deltaY: 120 }); // nothing below: the engine moves nothing and sends no scroll event
+    });
+    now += 1000;
+    act(() => commit([...replies, "a new reply " + "y".repeat(800)]));
+    expect(geo.scrollTop).toBe(list.scrollHeight - geo.height);
+  });
+
+  /** A reader parked one view above row 10's top, zoomed so the restore is clamped at the end, the observer done. */
+  function heldAtEnd() {
+    const m = mount(10);
+    park(m.list, m.top(10) - 50);
+    widen(m.list, m.geo, m.observer, 1600);
+    expect(m.geo.scrollTop).toBe(m.list.scrollHeight - m.geo.height);
+    return m;
+  }
+  const grown = [...replies, "a new reply " + "y".repeat(800)];
+  const atEnd = (list: HTMLElement, geo: { scrollTop: number; height: number }) => geo.scrollTop === list.scrollHeight - geo.height;
+
+  it("keeps the hold through a wheel up whose movement has not arrived when a batch commits", () => {
+    const { list, geo, commit } = heldAtEnd();
+    act(() => {
+      fireEvent.wheel(list, { deltaY: -120 }); // the engine animates it; its first scroll event comes later
+    });
+    act(() => commit()); // a batch that changes nothing in height, before the wheel's movement
+    act(() => commit(grown));
+    expect(atEnd(list, geo)).toBe(false);
+  });
+
+  it("keeps the hold through a click (a text selection) that moves nothing", () => {
+    const { list, geo, commit } = heldAtEnd();
+    act(() => {
+      fireEvent.pointerDown(list);
+      fireEvent.pointerUp(window);
+    });
+    now += 1000;
+    act(() => commit());
+    act(() => commit(grown));
+    expect(atEnd(list, geo)).toBe(false);
+  });
+
+  it("protects a wheel up at the end whose movement has not arrived, when following had already stopped", () => {
+    const { list, geo, commit } = mount(11);
+    act(() => {
+      list.scrollTop = list.scrollHeight;
+      fireEvent.scroll(list);
+    });
+    now += 1000;
+    act(() => noteUserScroll(list, "up")); // `k` from the last row onto one on screen: nothing scrolls
+    now += 1000;
+    act(() => {
+      fireEvent.wheel(list, { deltaY: -120 });
+    });
+    act(() => commit()); // before the wheel's movement
+    act(() => commit(grown));
+    expect(atEnd(list, geo)).toBe(false);
+  });
+
+  it("does not resume for a wheel down that a nested scroller takes (a tool output's own box)", () => {
+    const { list, rows, geo, commit } = heldAtEnd();
+    const box = rows[11];
+    box.style.overflowY = "auto";
+    Object.defineProperty(box, "scrollHeight", { configurable: true, value: 600 });
+    Object.defineProperty(box, "clientHeight", { configurable: true, value: 200 });
+    act(() => {
+      fireEvent.wheel(box, { deltaY: 120 });
+    });
+    now += 1000;
+    act(() => commit(grown));
+    expect(atEnd(list, geo)).toBe(false);
+  });
+
+  it("does not resume for Space on a focused button, which presses it", () => {
+    const { list, rows, geo, commit } = heldAtEnd();
+    const button = document.createElement("button");
+    rows[11].appendChild(button);
+    act(() => {
+      fireEvent.keyDown(button, { key: " " });
+    });
+    now += 1000;
+    act(() => commit(grown));
+    expect(atEnd(list, geo)).toBe(false);
+  });
+
+  it("does not resume for a panel key's downward move (a `j` stepping inside a box)", () => {
+    const { list, geo, commit } = heldAtEnd();
+    act(() => noteUserScroll(list, "down"));
+    now += 1000;
+    act(() => commit(grown));
+    expect(atEnd(list, geo)).toBe(false);
+  });
+
+  it("resumes for End on the list and for an explicit resume (G, a send)", () => {
+    const first = heldAtEnd();
+    act(() => {
+      fireEvent.keyDown(first.list, { key: "End" });
+    });
+    now += 1000;
+    act(() => first.commit(grown));
+    expect(atEnd(first.list, first.geo)).toBe(true);
+    cleanup();
+    vi.restoreAllMocks();
+    const second = heldAtEnd();
+    act(() => resumeFollowing(second.list));
+    now += 1000;
+    act(() => second.commit(grown));
+    expect(atEnd(second.list, second.geo)).toBe(true);
+  });
+
+  /* Why the anchor keeps a character offset in its row, not only a text node: the streaming reply's open end is
+     removed and drawn again on every batch, so a node the reader's point was found in is gone by the next zoom. */
+  it("a streaming reply's open end is drawn anew on each batch: its text nodes do not survive", () => {
+    const streamingState = (text: string) =>
+      state({ activeTurnId: "t1", userPrompts: [{ seq: 1, text: "go" }], transcript: [{ seq: 2, text }] });
+    const props = { sessionEnded: false, expanded: {}, cursor: -1, onAnswerPermission: () => {} };
+    const view = render(<MessageList state={streamingState("First paragraph.\n\nThe second one, still being")} {...props} />);
+    const walker = document.createTreeWalker(view.container, NodeFilter.SHOW_TEXT);
+    let tail: Node | null = null;
+    for (let n = walker.nextNode(); n !== null; n = walker.nextNode()) if (n.textContent?.includes("still being")) tail = n;
+    expect(tail).not.toBeNull();
+    act(() => view.rerender(<MessageList state={streamingState("First paragraph.\n\nThe second one, still being written")} {...props} />));
+    expect(view.container.textContent).toContain("still being written");
+    expect(tail!.isConnected).toBe(false);
+  });
+
+  it("still snaps a following view to the end", () => {
+    const { list, geo, observer } = mount(11);
+    act(() => {
+      list.scrollTop = list.scrollHeight;
+      fireEvent.scroll(list);
+    });
+    widen(list, geo, observer, 1000);
+    widen(list, geo, observer, 400);
+    expect(geo.scrollTop).toBe(list.scrollHeight - geo.height);
+  });
+});
