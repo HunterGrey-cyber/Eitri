@@ -401,7 +401,7 @@ pub(crate) fn build_chat_page(
             if eitri_core::agent_bridge::is_primary_copy(&raw) {
                 if let Some(text) = eitri_core::agent_bridge::primary_copy(&raw) {
                     if let Some(widget) = page_widget.upgrade() {
-                        widget.primary_clipboard().set_text(&text);
+                        crate::host_clipboard::write_text(&widget.primary_clipboard(), text);
                     }
                 }
                 return;

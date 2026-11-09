@@ -138,6 +138,13 @@ fn copy_text(bytes: Vec<u8>) -> String {
     }
 }
 
+/// Publishes plain UTF-8 bytes so embedded NULs survive every host clipboard write.
+pub(crate) fn write_text(clipboard: &gdk::Clipboard, text: String) {
+    if let Err(e) = clipboard.set_content(Some(&text_provider(text))) {
+        eprintln!("[clipboard] could not set the clipboard: {e}");
+    }
+}
+
 /// The clipboard's content for a copy: the text's bytes as offered under both text types, never as
 /// a C string, so a NUL nvim hands over (a `^@` in the buffer) stays in the text instead of ending
 /// it there.
@@ -260,6 +267,29 @@ mod tests {
                 .expect("written");
             out.close(gio::Cancellable::NONE).expect("closed");
             assert_eq!(out.steal_as_bytes().as_ref(), b"a\0b\n", "{mime}");
+        }
+    }
+
+    #[test]
+    fn terminal_and_panel_clipboard_writes_use_the_byte_provider() {
+        for (path, anchors) in [
+            ("shell/src/terminal/pane.rs", &["pump", "copy_selection"][..]),
+            ("shell/src/agent_panel.rs", &["build_chat_page"][..]),
+        ] {
+            let source = eitri_core::source_scan::read_required(path);
+            let code = eitri_core::source_scan::code_only(&source.text);
+            let production = eitri_core::source_scan::without(&code, &eitri_core::source_scan::modules(&code, "tests"));
+            let compact: String = production.chars().filter(|c| !c.is_whitespace()).collect();
+            assert!(
+                !compact.contains(".set_text("),
+                "{path}: clipboard text must preserve NULs"
+            );
+            for anchor in anchors {
+                let bodies = eitri_core::source_scan::functions(&production, anchor);
+                assert_eq!(bodies.len(), 1, "{path}: missing {anchor}");
+                let compact: String = bodies[0].chars().filter(|c| !c.is_whitespace()).collect();
+                assert!(compact.contains("host_clipboard::write_text("), "{path}: {anchor}");
+            }
         }
     }
 

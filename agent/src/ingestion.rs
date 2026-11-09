@@ -431,6 +431,7 @@ impl IngestState {
                 events: Vec::new(),
             });
         }
+        let dropped_child = crate::projection::subagent_frame_exceeds_limits(&self.projection, &event);
         self.projection.apply(&event);
         #[cfg(feature = "test-support")]
         if let Some(log) = &mut self.fold_log {
@@ -482,6 +483,13 @@ impl IngestState {
             self.history_dirty = true;
         }
 
+        if dropped_child {
+            // The page must receive the bounded tree and its notice instead of rebuilding rejected activity.
+            self.pending_ui.clear();
+            self.resync_pending = true;
+            self.stats.resyncs += 1;
+            self.stats.ui_backlog = 0;
+        }
         if self.resync_pending {
             // Already owed a snapshot; queueing more events would be holding raw data the UI is
             // never going to read.
@@ -3024,6 +3032,32 @@ pub(crate) mod tests {
             kind: ContentKind::Text,
             text: t.into(),
         }
+    }
+
+    #[test]
+    fn rejected_subagent_activity_resyncs_the_page_to_the_capped_tree_and_notice() {
+        let mut state = state();
+        for i in 0..=33 {
+            let mut event = AgentDomainEvent::ToolCallStarted {
+                turn_id: "t1".into(),
+                tool_use_id: format!("p{i}"),
+                name: "Agent".into(),
+                input: serde_json::json!({}),
+            };
+            if i > 0 {
+                event = AgentDomainEvent::SubagentFrame {
+                    parent_tool_use_id: format!("p{}", i - 1),
+                    frame: Box::new(event),
+                };
+            }
+            state.fold(event);
+            if i < 33 {
+                assert!(matches!(state.take_delivery(), UiDelivery::Events(_)));
+            }
+        }
+        assert!(matches!(state.take_delivery(), UiDelivery::Resync));
+        assert_eq!(state.projection.notices.len(), 1);
+        assert_eq!(state.stats.ui_backlog, 0);
     }
 
     #[test]

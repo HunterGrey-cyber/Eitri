@@ -763,7 +763,7 @@ pub fn parse_tree(value: &Value) -> Result<LuaTree, String> {
     let Value::Table(table) = value else {
         return Err(format!("expected a table, got {}", value.type_name()));
     };
-    let root = parse_node(table, "the tree")?;
+    let root = parse_node(table, "the tree", 1)?;
     let node = spec::build(&root, &|name| ModuleId::parse(name).map_err(|e| e.to_string()))?.tiled;
     let floats = parse_floats(table.raw_get::<Value>("floating").map_err(|e| e.to_string())?)?;
     let leaves = node.leaves();
@@ -890,7 +890,10 @@ fn parse_float_rect(table: &Table, at: &str, id: Option<&ModuleId>) -> Result<Fl
 }
 
 /// Reads Lua's representation without deciding container shares or module uniqueness.
-fn parse_node(table: &Table, at: &str) -> Result<SpecNode, String> {
+fn parse_node(table: &Table, at: &str, depth: usize) -> Result<SpecNode, String> {
+    if depth > 64 {
+        return Err("layout nests deeper than 64 levels".to_string());
+    }
     let head: Value = table.raw_get(1).map_err(|e| e.to_string())?;
     let Value::String(head) = head else {
         return Err(format!(
@@ -915,7 +918,7 @@ fn parse_node(table: &Table, at: &str) -> Result<SpecNode, String> {
     };
     let children = (2..=len)
         .map(|i| match table.raw_get::<Value>(i) {
-            Ok(Value::Table(child)) => parse_node(&child, &format!("item {} of the {head}", i - 1)),
+            Ok(Value::Table(child)) => parse_node(&child, &format!("item {} of the {head}", i - 1), depth + 1),
             Ok(other) => Err(format!(
                 "item {} of the {head}: expected a table, got {}",
                 i - 1,
@@ -983,6 +986,38 @@ fn share_of(value: Value, at: &str) -> Result<f64, String> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn a_layout_at_the_depth_limit_is_accepted_at_both_entry_points() {
+        for call in ["eitri.layout.default(t)", "eitri.layout.workspace('review', t)"] {
+            let (lua, _) = engine();
+            lua.load(format!(
+                "local t = {{'row', {{'editor'}}, {{'agent'}}}}; for i = 1, 62 do t = {{'tabbed', t}} end; {call}"
+            ))
+            .exec()
+            .unwrap();
+        }
+    }
+
+    #[test]
+    fn cyclic_and_overdeep_layouts_are_lua_errors_at_both_entry_points() {
+        for call in ["eitri.layout.default(t)", "eitri.layout.workspace('review', t)"] {
+            for setup in [
+                "local t = {'editor'}; for i = 1, 64 do t = {'row', t} end; ",
+                "local t = {'row'}; t[2] = t; ",
+            ] {
+                let (lua, store) = engine();
+                let error = lua.load(format!("{setup}{call}")).exec().unwrap_err().to_string();
+                assert!(error.contains("layout nests deeper than 64 levels"), "{call}: {error}");
+                assert!(error.contains(call.split('(').next().unwrap()), "{error}");
+                if call.contains("workspace") {
+                    assert!(store.borrow().defined_workspaces()[0].1.is_err());
+                } else {
+                    assert!(store.borrow().default_tree().unwrap().is_err());
+                }
+            }
+        }
+    }
+
     #[test]
     fn workspace_defines_a_template_in_init_lua_only() {
         let (lua, store) = engine();

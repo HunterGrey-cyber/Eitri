@@ -28,8 +28,8 @@ mod reset;
 mod roster;
 pub use roster::{BackgroundTaskRecord, TaskRoster};
 mod subagents;
-pub(crate) use subagents::restore_children;
 pub use subagents::SubagentStream;
+pub(crate) use subagents::{restore_children, subagent_frame_exceeds_limits};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]

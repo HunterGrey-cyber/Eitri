@@ -1215,14 +1215,14 @@ fn pump(state: &RefCell<State>, area: &GLArea, im: &IMMulticontext, on_screen: b
     // A copy lands whether the pane is shown or not; a read of either clipboard never gets this far
     // (`Term` refuses it, `Osc52::OnlyCopy`).
     if let Some(text) = update.events.clipboard {
-        area.clipboard().set_text(&text);
+        crate::host_clipboard::write_text(&area.clipboard(), text.clone());
         println!(
             "[terminal] a program copied {} characters to the clipboard (OSC 52)",
             text.chars().count()
         );
     }
     if let Some(text) = update.events.primary {
-        area.primary_clipboard().set_text(&text);
+        crate::host_clipboard::write_text(&area.primary_clipboard(), text.clone());
         println!(
             "[terminal] a program copied {} characters to the primary selection (OSC 52)",
             text.chars().count()
@@ -1234,8 +1234,8 @@ fn pump(state: &RefCell<State>, area: &GLArea, im: &IMMulticontext, on_screen: b
     // is also kept (`State::last_selection`) for `Ctrl+Shift+C` to copy again with no session round
     // trip (`copy_selection`'s own doc).
     if let Some(text) = update.events.selection {
-        area.clipboard().set_text(&text);
-        area.primary_clipboard().set_text(&text);
+        crate::host_clipboard::write_text(&area.clipboard(), text.clone());
+        crate::host_clipboard::write_text(&area.primary_clipboard(), text.clone());
         println!(
             "[terminal] a selection finished: copied {} characters to the clipboard and the primary selection",
             text.chars().count()
@@ -1701,7 +1701,7 @@ fn copy_selection(state: &Rc<RefCell<State>>, area: &GLArea) {
         println!("[terminal] Ctrl+Shift+C: nothing is selected");
         return;
     };
-    area.clipboard().set_text(&text);
+    crate::host_clipboard::write_text(&area.clipboard(), text.clone());
     println!(
         "[terminal] Ctrl+Shift+C: copied {} characters to the clipboard",
         text.chars().count()
