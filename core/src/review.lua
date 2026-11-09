@@ -385,14 +385,30 @@ local function kept_hunks(path, meta)
   return turns and turns[meta.session .. ':' .. meta.turn_id]
 end
 
--- What a removed line looks like in a virtual line: control characters made printable, so a raw
--- carriage return never reaches the grid.
-local function display(text)
-  local ok, shown = pcall(vim.fn.strtrans, text)
-  if ok and type(shown) == 'string' then
-    return shown
+-- What a piece of a removed line looks like in a virtual line, `col` display columns in: control
+-- characters made printable, so a raw carriage return never reaches the grid, and each Tab spread
+-- over blanks to the next tab stop of the buffer (`strtrans` would show it as `^I`). The virtual line
+-- starts at the text area's column 0 like the buffer's own line, so the stops line up with the
+-- buffer's indentation. Runs with `buf` current: `strdisplaywidth` reads that buffer's 'tabstop' and
+-- 'vartabstop'. Returns the text to show and the column after it.
+local function display(text, col)
+  local shown, at = {}, 1
+  while at <= #text + 1 do
+    local tab = text:find('\t', at, true)
+    local piece = text:sub(at, (tab or #text + 1) - 1)
+    if piece ~= '' then
+      local ok, printable = pcall(vim.fn.strtrans, piece)
+      if not (ok and type(printable) == 'string') then printable = piece end
+      local wok, width = pcall(vim.fn.strdisplaywidth, printable, col)
+      shown[#shown + 1], col = printable, wok and (type(width) == 'number') and col + width or col + #printable
+    end
+    if not tab then break end
+    local wok, width = pcall(vim.fn.strdisplaywidth, '\t', col)
+    if not (wok and type(width) == 'number' and width > 0) then width = 1 end
+    shown[#shown + 1], col = string.rep(' ', width), col + width
+    at = tab + 1
   end
-  return text
+  return table.concat(shown), col
 end
 
 -- The byte ranges that differ between two paired lines, found by diffing their words (a run of word
@@ -434,13 +450,26 @@ local function word_ranges(old, new)
 end
 
 -- A removed line as virtual-line chunks: the changed byte ranges in `DiffText`, the rest in `DiffDelete`.
-local function old_chunks(old, ranges)
-  local chunks, at = {}, 0
-  for _, r in ipairs(ranges or {}) do
-    if r[1] > at then chunks[#chunks + 1] = { display(old:sub(at + 1, r[1])), 'DiffDelete' } end
-    chunks[#chunks + 1], at = { display(old:sub(r[1] + 1, r[2])), 'DiffText' }, r[2]
+-- The display column runs on across chunks, because a tab's width depends on where it starts.
+local function old_chunks(buf, old, ranges)
+  local chunks, at, col = {}, 0, 0
+  local function add(from, to, group)
+    local shown
+    shown, col = display(old:sub(from, to), col)
+    chunks[#chunks + 1] = { shown, group }
   end
-  if at < #old or #chunks == 0 then chunks[#chunks + 1] = { display(old:sub(at + 1)), 'DiffDelete' } end
+  local function build()
+    for _, r in ipairs(ranges or {}) do
+      if r[1] > at then add(at + 1, r[1], 'DiffDelete') end
+      add(r[1] + 1, r[2], 'DiffText')
+      at = r[2]
+    end
+    if at < #old or #chunks == 0 then add(at + 1, #old, 'DiffDelete') end
+  end
+  if not pcall(api.nvim_buf_call, buf, build) then
+    chunks, at, col = {}, 0, 0
+    build()
+  end
   return chunks
 end
 
@@ -497,7 +526,7 @@ local function draw_hunk(buf, row, h)
     if ca > 0 then
       local virt = {}
       for i = sa, sa + ca - 1 do
-        virt[#virt + 1] = old_chunks(h.old_lines[i], olds[i - sa])
+        virt[#virt + 1] = old_chunks(buf, h.old_lines[i], olds[i - sa])
       end
       if anchor >= count then
         mark(count - 1, { virt_lines = virt, virt_lines_above = false })

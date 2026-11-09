@@ -462,6 +462,129 @@ fn multibyte_words_use_byte_columns() {
     fx.nvim.quit();
 }
 
+/// Draws one whole-file hunk in a buffer whose tab settings are `setup` (Lua run in that buffer
+/// before the draw), so the removed line's tab expansion can be read back.
+fn tab_hunk(fx: &mut Fx, setup: &str, old: &[&str], new: &[&str]) {
+    let end = numbered(new);
+    let path = fx.file("tabs.txt", &end);
+    fx.open(&path);
+    fx.nvim.lua(setup, vec![]);
+    let hunk = hunk_of(1, &numbered(old), &end, (1, old.len() as u32), (1, new.len() as u32));
+    assert_eq!(count(&fx.show(&path, &meta(2), &[hunk]), "drawn"), 1);
+}
+
+/// The chunks of the one removed line as plain strings.
+fn shown_chunks(fx: &mut Fx) -> Vec<(String, String)> {
+    let marks = fx.marks();
+    assert_eq!(marks.chunks.len(), 1, "{:?}", marks.chunks);
+    marks.chunks[0].clone()
+}
+
+fn chunk(text: &str, group: &str) -> (String, String) {
+    (text.to_owned(), group.to_owned())
+}
+
+#[test]
+#[ignore = "needs a real nvim on PATH; spends no tokens and needs no display"]
+fn tab_indentation_of_a_removed_line_is_spaces_that_line_up_with_the_buffer() {
+    for ts in [4, 8] {
+        let mut fx = Fx::new(&format!("tabs-indent-{ts}"));
+        tab_hunk(
+            &mut fx,
+            &format!("vim.bo.tabstop = {ts}"),
+            &["\t\treturn \"proof\""],
+            &["\t\treturn \"done\""],
+        );
+        let marks = fx.marks();
+        let expected = format!("{}return \"proof\"", " ".repeat(2 * ts));
+        assert_eq!(marks.virt, vec![(0, true, vec![expected])], "tabstop {ts}");
+        // The buffer's own `return` starts at the same display column as the removed line's.
+        assert_eq!(int(&fx.nvim.eval("virtcol([1, 3])")), 2 * ts as i64 + 1, "tabstop {ts}");
+        fx.nvim.quit();
+    }
+}
+
+#[test]
+#[ignore = "needs a real nvim on PATH; spends no tokens and needs no display"]
+fn a_tab_after_text_goes_to_the_next_tab_stop() {
+    let mut fx = Fx::new("tabs-mid");
+    tab_hunk(&mut fx, "vim.bo.tabstop = 4", &["ab\tcd"], &["ab\tXY"]);
+    // `ab` is two columns in, so the tab is two wide.
+    assert_eq!(
+        shown_chunks(&mut fx),
+        vec![chunk("ab  ", "DiffDelete"), chunk("cd", "DiffText")]
+    );
+    fx.nvim.quit();
+}
+
+#[test]
+#[ignore = "needs a real nvim on PATH; spends no tokens and needs no display"]
+fn tab_width_carries_across_word_diff_chunk_boundaries() {
+    let mut fx = Fx::new("tabs-chunks");
+    tab_hunk(&mut fx, "vim.bo.tabstop = 4", &["x\ty\tz"], &["x\tQ\tz"]);
+    // `x\t` ends at column 4, the changed `y` is column 4, and the next tab starts at column 5.
+    assert_eq!(
+        shown_chunks(&mut fx),
+        vec![
+            chunk("x   ", "DiffDelete"),
+            chunk("y", "DiffText"),
+            chunk("   z", "DiffDelete")
+        ]
+    );
+    fx.nvim.quit();
+
+    // A chunk that starts with a tab: the tab's width depends on the chunk before it.
+    let mut fx = Fx::new("tabs-chunks-lead");
+    tab_hunk(&mut fx, "vim.bo.tabstop = 4", &["a\tb\tc"], &["Z\tb\tc"]);
+    assert_eq!(
+        shown_chunks(&mut fx),
+        vec![chunk("a", "DiffText"), chunk("   b   c", "DiffDelete")]
+    );
+    fx.nvim.quit();
+}
+
+#[test]
+#[ignore = "needs a real nvim on PATH; spends no tokens and needs no display"]
+fn variable_tab_stops_and_wide_characters_are_counted() {
+    let mut fx = Fx::new("tabs-vts");
+    tab_hunk(&mut fx, "vim.bo.vartabstop = '2,3'", &["\t\tx"], &["\t\ty"]);
+    // Stops at columns 2 and 5, like the buffer's own line.
+    assert_eq!(
+        shown_chunks(&mut fx),
+        vec![chunk("     ", "DiffDelete"), chunk("x", "DiffText")]
+    );
+    assert_eq!(int(&fx.nvim.eval("virtcol([1, 3])")), 6);
+    fx.nvim.quit();
+
+    let mut fx = Fx::new("tabs-wide");
+    tab_hunk(&mut fx, "vim.bo.tabstop = 4", &["茶\tx"], &["茶\ty"]);
+    // The wide character fills two columns, so the tab is two wide.
+    assert_eq!(
+        shown_chunks(&mut fx),
+        vec![chunk("茶  ", "DiffDelete"), chunk("x", "DiffText")]
+    );
+    fx.nvim.quit();
+}
+
+#[test]
+#[ignore = "needs a real nvim on PATH; spends no tokens and needs no display"]
+fn other_control_characters_in_a_removed_line_stay_printable() {
+    let mut fx = Fx::new("tabs-control");
+    tab_hunk(
+        &mut fx,
+        "vim.bo.tabstop = 4",
+        &["a\rb\x1bc", "\x1b\tz"],
+        &["whole", "other"],
+    );
+    let marks = fx.marks();
+    // `^[` is two columns wide, so the tab after it is two wide.
+    assert_eq!(
+        marks.virt,
+        vec![(0, true, vec!["a^Mb^[c".to_owned(), "^[  z".to_owned()])]
+    );
+    fx.nvim.quit();
+}
+
 #[test]
 #[ignore = "needs a real nvim on PATH; spends no tokens and needs no display"]
 fn a_whole_line_rewrite_has_only_line_colours() {
