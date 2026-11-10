@@ -2070,7 +2070,7 @@ fn the_strips_sidebar_starts_hidden_and_its_default_key_shows_then_hides_it() {
     let (module_keys, refused, unused) =
         ModuleKeys::build_with_defaults(&[(strips.clone(), None)], &[(strips.clone(), default)], &keymap);
     assert!(refused.is_empty() && unused.is_empty(), "{refused:?} {unused:?}");
-    assert_eq!(module_keys.module(default), Some(&strips));
+    assert_eq!(module_keys.module(default), Some(strips.clone()));
 
     let layout = three(editor());
     let host = FakeHost::new();

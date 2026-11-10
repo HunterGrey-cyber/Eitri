@@ -40,6 +40,12 @@ if vim.v.vim_did_enter == 0 then
   return { ok = false, early = true }
 end
 
+local previous = rawget(_G, "__eitri_window")
+if type(previous) == "table" and type(previous.refresh) == "function" then
+  local refreshed = previous.refresh(o)
+  if refreshed then return refreshed end
+end
+
 local socket = o.socket
 local first_words = o.words
 local module_words = o.modules
@@ -213,6 +219,7 @@ local function raw(lhs)
   return vim.api.nvim_replace_termcodes(expand(lhs), true, true, true)
 end
 
+local refresh_group
 local function install_group(group)
   local mapped = {} -- raw lhs -> the lhs and callback this snippet installed
   local installed = false
@@ -305,6 +312,12 @@ local function install_group(group)
     end
   end
 
+  refresh_group = function(next_group)
+    remove_ours()
+    group = next_group
+    installed = false
+    check()
+  end
   check()
   -- LazyVim maps its own `<leader>` keys at `User VeryLazy`, and plugins load their keys at `User LazyLoad`: either
   -- can come after the install, so the group is checked again there, scheduled so that every handler of the event
@@ -324,6 +337,15 @@ if type(o.group) == "table" and type(o.group.lhs) == "string" and type(o.group.k
 end
 
 local window = { run = run_words, edge = edge }
+window.refresh = function(next_options)
+  if next_options.socket ~= socket then return nil end
+  first_words = next_options.words
+  module_words = next_options.modules
+  known = {}
+  for _, name in ipairs(next_options.names) do known[name] = true end
+  if refresh_group and type(next_options.group) == "table" then refresh_group(next_options.group) end
+  return { ok = true, skipped = skipped }
+end
 _G.__eitri_window = window
 local first = vim.g.eitri ~= 1
 vim.g.eitri = 1

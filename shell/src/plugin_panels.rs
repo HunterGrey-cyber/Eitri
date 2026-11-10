@@ -11,7 +11,7 @@ use std::time::{Duration, Instant};
 
 use eitri_core::editor_rpc::EditorRpc;
 use eitri_core::keymap::Keymap;
-use eitri_core::layout::{ModuleId, OpenRule};
+use eitri_core::layout::{ModuleId, ModuleKeys, OpenRule};
 use eitri_core::lua::panel::PanelSlot;
 use eitri_core::lua::plugin::PluginRegistration;
 use eitri_core::plugin::doc_route::DocSlot;
@@ -1032,7 +1032,14 @@ impl WindowFacts {
     }
 }
 
+struct ModuleKeyBinding {
+    keys: Rc<ModuleKeys>,
+    keymap: Rc<Keymap>,
+    changed: Rc<dyn Fn()>,
+}
+
 pub(crate) struct PluginPanels {
+    module_keys: RefCell<Option<Rc<ModuleKeyBinding>>>,
     panels: RefCell<Vec<Rc<Panel>>>,
     facts: RefCell<WindowFacts>,
     follow_totals: RefCell<FollowTotals>,
@@ -1056,6 +1063,7 @@ impl PluginPanels {
             panels.push(Self::make_panel(engine, keymap, theme, &registration, &keys_settings)?);
         }
         Ok(PluginPanels {
+            module_keys: RefCell::default(),
             panels: RefCell::new(panels),
             facts: RefCell::new(WindowFacts::new(theme.clone())),
             follow_totals: RefCell::default(),
@@ -1231,6 +1239,21 @@ impl PluginPanels {
             return Err(format!("plugin {} is already loaded", registration.plugin.manifest.id));
         }
         let panel = make()?;
+        let module_keys = self.module_keys.borrow().clone();
+        if let Some(binding) = &module_keys {
+            if let Some(default) = panel.default_key {
+                if let Err(error) = binding.keys.add_default(&panel.module, default, &binding.keymap) {
+                    eprintln!(
+                        "[plugin {}] no module key: its manifest's default {}; a key in its init.lua load options gives it one",
+                        error.panel(), error.why()
+                    );
+                }
+            }
+            if let Some(pump) = &panel.pump {
+                let key = binding.keys.key_of(&panel.module).map(|key| key.to_string());
+                pump.host.set_module_key(key.as_deref());
+            }
+        }
         let facts = self.facts.borrow().clone();
         for fact in &facts.order {
             self.apply_fact(&panel, &facts, *fact, true);
@@ -1243,6 +1266,9 @@ impl PluginPanels {
             if let Some(pump) = &panel.pump {
                 pump.host.editor_session(Instant::now());
             }
+        }
+        if let Some(binding) = module_keys {
+            (binding.changed)();
         }
         Ok(panel)
     }
@@ -1564,7 +1590,13 @@ impl PluginPanels {
 
     /// Tells each host the key its module ended up with once the window's keys are built (a written key the window
     /// refused, or a default that yielded, is none), so a page never shows a key the prefix does not answer.
-    pub(crate) fn settle_module_keys(&self, keys: &eitri_core::layout::ModuleKeys) {
+    /// Keeps the same table and refresh hook for pages that join after startup.
+    pub(crate) fn settle_module_keys(&self, keys: Rc<ModuleKeys>, keymap: Rc<Keymap>, changed: Rc<dyn Fn()>) {
+        *self.module_keys.borrow_mut() = Some(Rc::new(ModuleKeyBinding {
+            keys: keys.clone(),
+            keymap,
+            changed,
+        }));
         for panel in self.snapshot() {
             if let Some(pump) = &panel.pump {
                 let key = keys.key_of(&panel.module).map(|key| key.to_string());
@@ -2034,6 +2066,46 @@ mod tests {
         fn show(&self, _: &ModuleId) {}
         fn hide(&self, _: &ModuleId) {}
         fn command(&self, _: &ModuleId, _: FollowCmd) {}
+    }
+
+    #[test]
+    fn a_joined_pages_default_is_live_and_its_host_gets_only_the_settled_key() {
+        for taken in [false, true] {
+            let scratch = Scratch::new("panels-join-key");
+            let registration = registered_with(&scratch, "late", true, None, |text| {
+                text.replace("[module]", "[module]\nkey = \"U\"")
+            });
+            let keymap = Rc::new(Keymap::defaults());
+            let written = taken.then(|| (ModuleId::lua("notes"), Some("U".to_string())));
+            let keys = Rc::new(ModuleKeys::build(&written.into_iter().collect::<Vec<_>>(), &keymap).unwrap());
+            let panels = Rc::new(plugin_panels(Vec::new()));
+            let changed = Rc::new(Cell::new(0));
+            panels.settle_module_keys(keys.clone(), keymap, {
+                let panels = Rc::downgrade(&panels);
+                let changed = changed.clone();
+                Rc::new(move || {
+                    assert_eq!(panels.upgrade().unwrap().modules(), [ModuleId::lua("late")]);
+                    changed.set(changed.get() + 1);
+                })
+            });
+            let recorded = Rc::new(Recorded::default());
+            let port = Rc::new(LazyPort::default());
+            *port.0.borrow_mut() = Some(recorded.clone());
+            let joined = panels
+                .join_with(&registration, || Ok(Rc::new(panel(&registration, port, None))))
+                .unwrap();
+            let expected = (!taken).then_some('U');
+            assert_eq!(keys.key_of(&joined.module), expected);
+            joined.pump.as_ref().unwrap().host.page_message(
+                &serde_json::json!({"v": 1, "id": 1, "verb": "host.hello", "args": {}}).to_string(),
+                Instant::now(),
+            );
+            assert_eq!(
+                recorded.1.borrow().last().unwrap()["result"]["module_key"],
+                serde_json::json!(expected.map(|c| c.to_string()))
+            );
+            assert_eq!(changed.get(), 1);
+        }
     }
 
     #[test]
@@ -2589,6 +2661,7 @@ mod tests {
 
     fn plugin_panels(panels: Vec<Panel>) -> PluginPanels {
         PluginPanels {
+            module_keys: RefCell::default(),
             panels: RefCell::new(panels.into_iter().map(Rc::new).collect()),
             facts: RefCell::new(WindowFacts::new(PageTheme::fallback())),
             follow_totals: RefCell::default(),

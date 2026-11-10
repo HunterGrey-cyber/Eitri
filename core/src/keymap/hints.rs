@@ -159,7 +159,7 @@ impl Keymap {
                     .collect(),
             })
             .collect();
-        for (key, id) in keys.entries() {
+        for (key, id) in keys.entries().iter() {
             if id.kind() == ModuleKind::LuaWebview && keep(&Action::Module(id.clone())) {
                 groups[MODULES].rows.push(HintRow {
                     keys: key.to_string(),

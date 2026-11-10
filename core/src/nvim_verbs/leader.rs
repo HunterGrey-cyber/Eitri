@@ -78,7 +78,7 @@ pub fn leader_group(keymap: &Keymap, keys: &ModuleKeys, lua_panels: &[String]) -
                     Axis::Row => "right",
                     Axis::Column => "below",
                 };
-                for (key, id) in keys.entries() {
+                for (key, id) in keys.entries().iter() {
                     let words: Vec<String> = ["split", side, id.as_str()].map(str::to_string).into();
                     if runs(&words) {
                         out.push(LeaderKey {

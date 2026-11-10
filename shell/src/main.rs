@@ -1494,28 +1494,41 @@ fn build_ui(
                 error.why()
             );
         }
-        plugin_panels.settle_module_keys(&keys);
         Rc::new(keys)
     };
     // `:Eitri`, for window 1's nvim only: it sends its words to the pane-switch socket, and what it completes and
     // the group of keys under `keymap.nvim_prefix` come from this window's keymap and module keys.
-    let nvim_verbs = nvim_verbs::NvimVerbs::for_window(WinId::MAIN, owns_editor, || {
-        let socket = pane_switch.as_ref()?.socket_path().to_path_buf();
-        let actions: Vec<String> = keymap.bindings().iter().map(|binding| binding.action.name()).collect();
-        let keyed: Vec<ModuleId> = module_keys.entries().iter().map(|(_, id)| id.clone()).collect();
-        let panels: Vec<ModuleId> = lua_keys.iter().map(|(id, _)| id.clone()).collect();
-        let words = nvim_verbs::completion_words(&actions, &keyed, &panels);
-        let panel_ids: Vec<String> = panels
-            .iter()
-            .filter_map(|id| id.as_str().strip_prefix("lua:").map(str::to_string))
-            .collect();
-        let keys = eitri_core::nvim_verbs::leader::leader_group(&keymap, &module_keys, &panel_ids);
-        let group = config.nvim_prefix.as_deref().map(|lhs| (lhs, keys.as_slice()));
-        Some(eitri_core::nvim_verbs::install::install_args(&socket, &words, group))
-    });
+    let nvim_args = {
+        let socket = pane_switch.as_ref().map(|switch| switch.socket_path().to_path_buf());
+        let keymap = keymap.clone();
+        let module_keys = module_keys.clone();
+        let engine = lua_engine.clone();
+        let nvim_prefix = config.nvim_prefix.clone();
+        Rc::new(move || {
+            let socket = socket.as_ref()?;
+            let actions: Vec<String> = keymap.bindings().iter().map(|binding| binding.action.name()).collect();
+            let keyed: Vec<ModuleId> = module_keys.entries().iter().map(|(_, id)| id.clone()).collect();
+            let panels: Vec<ModuleId> = engine
+                .panels
+                .borrow()
+                .entries()
+                .iter()
+                .map(|entry| entry.module.clone())
+                .chain(engine.other_page_keys().into_iter().map(|(id, _)| id))
+                .collect();
+            let words = nvim_verbs::completion_words(&actions, &keyed, &panels);
+            let panel_ids: Vec<String> = panels
+                .iter()
+                .filter_map(|id| id.as_str().strip_prefix("lua:").map(str::to_string))
+                .collect();
+            let keys = eitri_core::nvim_verbs::leader::leader_group(&keymap, &module_keys, &panel_ids);
+            let group = nvim_prefix.as_deref().map(|lhs| (lhs, keys.as_slice()));
+            Some(eitri_core::nvim_verbs::install::install_args(socket, &words, group))
+        })
+    };
+    let nvim_verbs = nvim_verbs::NvimVerbs::for_window(WinId::MAIN, owns_editor, || nvim_args());
     // The `?` overlay's window and prefix sections, generated from the keymap;
-    // see `keys_help`. It is re-sent, only when the merged panel table changed, every time nvim's
-    // own keys report changes (`FeedPump::listen_keys` below).
+    // It is re-sent when the panel table or module keys change, including a page joining this window.
     let keys_help = eitri_panel::keys_help::KeysHelp::new(
         keymap.clone(),
         module_keys.clone(),
@@ -1528,6 +1541,20 @@ fn build_ui(
         },
     );
     keys_help.send();
+    plugin_panels.settle_module_keys(module_keys.clone(), keymap.clone(), {
+        let help = Rc::downgrade(&keys_help);
+        let verbs = nvim_verbs.as_ref().map(Rc::downgrade);
+        Rc::new(move || {
+            if let Some(help) = help.upgrade() {
+                help.send();
+            }
+            if let Some(verbs) = verbs.as_ref().and_then(|verbs| verbs.upgrade()) {
+                if let Some(args) = nvim_args() {
+                    verbs.refresh(args);
+                }
+            }
+        })
+    });
     // The first-start screen's host, filled in where the window's overlay and driver exist: each report of the editor's
     // mappings reaches it, and it keeps the last for a screen that opens later.
     let onboarding_slot: Rc<RefCell<Option<Rc<onboarding_host::OnboardingHost>>>> = Rc::default();

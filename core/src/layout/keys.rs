@@ -16,6 +16,7 @@
 //! keyed `A` would take that slip. Two Lua panels keyed `g`
 //! and `G` are allowed.
 
+use std::cell::{Ref, RefCell};
 use std::fmt;
 
 use super::module::{ModuleId, ModuleKind};
@@ -63,7 +64,7 @@ pub fn never_a_panel_key(key: char) -> Option<String> {
 /// then each Lua panel's in registration order.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ModuleKeys {
-    keys: Vec<(char, ModuleId)>,
+    keys: RefCell<Vec<(char, ModuleId)>>,
 }
 
 /// A Lua panel's `key` that cannot be one (`ModuleKeys::build`). `panel` is the panel's own `id`.
@@ -159,7 +160,7 @@ impl ModuleKeys {
     /// The built-in keys alone: a window with no Lua panel keys.
     pub fn built_in() -> ModuleKeys {
         ModuleKeys {
-            keys: BUILT_IN.iter().map(|(key, id)| (*key, id())).collect(),
+            keys: RefCell::new(BUILT_IN.iter().map(|(key, id)| (*key, id())).collect()),
         }
     }
 
@@ -167,7 +168,7 @@ impl ModuleKeys {
     /// registration order; a panel without one has `None`. `keymap` is the effective table after
     /// `init.lua`. The first key that cannot be one is the error.
     pub fn build(lua: &[(ModuleId, Option<String>)], keymap: &Keymap) -> Result<ModuleKeys, KeyError> {
-        let mut keys = ModuleKeys::built_in();
+        let keys = ModuleKeys::built_in();
         for (id, key) in lua {
             keys.add_lua(id, key.as_deref(), keymap)?;
         }
@@ -177,7 +178,7 @@ impl ModuleKeys {
     /// [`ModuleKeys::build`] for a window that opens whatever `init.lua` did: a panel whose key cannot be one has no
     /// key, and its error is returned beside the keys, in the order of the panels.
     pub fn build_settled(lua: &[(ModuleId, Option<String>)], keymap: &Keymap) -> (ModuleKeys, Vec<KeyError>) {
-        let mut keys = ModuleKeys::built_in();
+        let keys = ModuleKeys::built_in();
         let mut refused = Vec::new();
         for (id, key) in lua {
             if let Err(error) = keys.add_lua(id, key.as_deref(), keymap) {
@@ -198,7 +199,7 @@ impl ModuleKeys {
         keymap: &Keymap,
     ) -> (ModuleKeys, Vec<KeyError>, Vec<KeyError>) {
         let (written, _) = ModuleKeys::build_settled(lua, keymap);
-        let mut keys = ModuleKeys::built_in();
+        let keys = ModuleKeys::built_in();
         let mut refused = Vec::new();
         let mut unused = Vec::new();
         for (id, key) in lua {
@@ -212,7 +213,7 @@ impl ModuleKeys {
                 continue;
             };
             let panel = id.as_str().trim_start_matches("lua:").to_string();
-            if let Some(by) = written.module(default).filter(|by| *by != id) {
+            if let Some(by) = written.module(default).filter(|by| by != id) {
                 unused.push(KeyError::Taken {
                     panel,
                     key: default,
@@ -228,7 +229,7 @@ impl ModuleKeys {
     }
 
     /// Adds the Lua panel `id`'s key `text`, if it has one and can have it.
-    fn add_lua(&mut self, id: &ModuleId, text: Option<&str>, keymap: &Keymap) -> Result<(), KeyError> {
+    fn add_lua(&self, id: &ModuleId, text: Option<&str>, keymap: &Keymap) -> Result<(), KeyError> {
         let Some(text) = text else { return Ok(()) };
         let panel = id.as_str().trim_start_matches("lua:").to_string();
         let mut chars = text.chars();
@@ -267,31 +268,48 @@ impl ModuleKeys {
                 by: by.as_str().trim_start_matches("lua:").to_string(),
             });
         }
-        self.keys.push((key, id.clone()));
+        self.keys.borrow_mut().push((key, id.clone()));
         Ok(())
     }
 
     /// The module `key` names.
-    pub fn module(&self, key: char) -> Option<&ModuleId> {
-        self.keys.iter().find(|(k, _)| *k == key).map(|(_, id)| id)
+    pub fn module(&self, key: char) -> Option<ModuleId> {
+        self.keys
+            .borrow()
+            .iter()
+            .find(|(k, _)| *k == key)
+            .map(|(_, id)| id.clone())
     }
 
     /// The key that names `id`.
     pub fn key_of(&self, id: &ModuleId) -> Option<char> {
-        self.keys.iter().find(|(_, m)| m == id).map(|(k, _)| *k)
+        self.keys.borrow().iter().find(|(_, m)| m == id).map(|(k, _)| *k)
     }
 
     /// The Lua panels' keys, which the prefix answers to beyond its own table.
     pub fn lua_keys(&self) -> Vec<char> {
         self.keys
+            .borrow()
             .iter()
             .filter(|(_, id)| id.kind() == super::module::ModuleKind::LuaWebview)
             .map(|(k, _)| *k)
             .collect()
     }
 
-    pub fn entries(&self) -> &[(char, ModuleId)] {
-        &self.keys
+    pub fn entries(&self) -> Ref<'_, [(char, ModuleId)]> {
+        Ref::map(self.keys.borrow(), Vec::as_slice)
+    }
+
+    /// Adds a late page's manifest default, using the same checks as startup.
+    pub fn add_default(&self, id: &ModuleId, key: char, keymap: &Keymap) -> Result<(), KeyError> {
+        self.add_lua(id, Some(&key.to_string()), keymap)
+    }
+
+    /// Releases a departing Lua module's key; built-in keys stay reserved.
+    pub fn remove(&self, id: &ModuleId) {
+        if id.kind() == ModuleKind::LuaWebview {
+            self.keys.borrow_mut().retain(|(_, module)| module != id);
+        }
     }
 }
 
@@ -481,6 +499,105 @@ mod tests {
     }
 
     #[test]
+    fn late_default_takes_a_free_key_and_removal_releases_it() {
+        let map = Keymap::defaults();
+        let keys = std::rc::Rc::new(ModuleKeys::built_in());
+        let live = keys.clone();
+        let strips = ModuleId::lua("strips");
+        keys.add_default(&strips, 'U', &map).unwrap();
+        assert_eq!(live.module('U'), Some(strips.clone()));
+        assert_eq!(live.key_of(&strips), Some('U'));
+        assert!(live.entries().contains(&('U', strips.clone())));
+        assert!(map.help(&live).iter().any(|row| row.keys.ends_with(" U")));
+        keys.remove(&strips);
+        assert_eq!(live.module('U'), None);
+        assert_eq!(live.key_of(&strips), None);
+        assert!(!map.help(&live).iter().any(|row| row.keys.ends_with(" U")));
+        let next = ModuleId::lua("next");
+        live.add_default(&next, 'U', &map).unwrap();
+        assert_eq!(keys.module('U'), Some(next));
+        keys.remove(&ModuleId::editor());
+        assert_eq!(keys.module('e'), Some(ModuleId::editor()));
+    }
+
+    #[test]
+    fn late_default_yields_to_written_keys_and_earlier_defaults() {
+        let map = Keymap::defaults();
+        let keys = ModuleKeys::build(&[lua("notes", Some("U"))], &map).unwrap();
+        let late = ModuleId::lua("late");
+        assert!(matches!(
+            keys.add_default(&late, 'U', &map),
+            Err(KeyError::Taken { .. })
+        ));
+        assert_eq!(keys.module('U'), Some(ModuleId::lua("notes")));
+        assert_eq!(keys.key_of(&late), None);
+        keys.add_default(&late, 'g', &map).unwrap();
+        let other = ModuleId::lua("other");
+        assert!(matches!(
+            keys.add_default(&other, 'g', &map),
+            Err(KeyError::Taken { .. })
+        ));
+        assert_eq!(keys.key_of(&other), None);
+    }
+
+    #[test]
+    fn a_prefix_and_strips_created_before_a_join_read_the_live_keys() {
+        use crate::keymap::prefix::{Outcome, Prefix, PrefixCommand, Press};
+        use std::rc::Rc;
+        use std::time::Instant;
+        let map = Rc::new(Keymap::defaults());
+        let keys = Rc::new(ModuleKeys::built_in());
+        let mut prefix = Prefix::new(map.clone(), keys.clone());
+        let late = ModuleId::lua("late");
+        let layout = Layout::initial(&[ModuleDecl {
+            id: late.clone(),
+            placement: Placement::RightOfRoot,
+        }])
+        .unwrap();
+        keys.add_default(&late, 'U', &map).unwrap();
+        for entries in [
+            strip(&keys, &layout),
+            strip_for_hide(&keys, &layout),
+            strip_direct(&keys, &map, &layout),
+        ] {
+            assert!(entries.iter().any(|entry| entry.key == "U" && entry.module == late));
+        }
+        let now = Instant::now();
+        let mut press = |key: KeySpec, code| {
+            let outcome = prefix.press(Press::Key(key), code, now);
+            prefix.release(code);
+            outcome
+        };
+        press(*map.prefix(), 1);
+        assert_eq!(
+            press(KeySpec::char('U', false, false), 2),
+            Outcome::Run(PrefixCommand::Run(Action::Module(late.clone())))
+        );
+        press(*map.prefix(), 1);
+        press(KeySpec::char('d', false, false), 2);
+        assert_eq!(
+            press(KeySpec::char('U', false, false), 3),
+            Outcome::Run(PrefixCommand::Hide { module: late.clone() })
+        );
+        keys.remove(&late);
+        press(*map.prefix(), 1);
+        assert_eq!(press(KeySpec::char('U', false, false), 2), Outcome::Swallow);
+        assert!(!strip_for_hide(&keys, &layout).iter().any(|entry| entry.module == late));
+    }
+
+    #[test]
+    fn late_default_uses_every_startup_keymap_refusal() {
+        let map = Keymap::defaults();
+        for key in ['F', 'O', 'e', 'E', 'v', '!', ' '] {
+            let keys = ModuleKeys::built_in();
+            let id = ModuleId::lua("late");
+            let error = build_one(&key.to_string(), &map).unwrap_err();
+            assert_eq!(keys.add_default(&ModuleId::lua("notes"), key, &map), Err(error));
+            assert_eq!(keys.key_of(&id), None);
+        }
+    }
+
+    #[test]
     fn plain_float_scratchpad_and_window_keys_are_refused_naming_the_action() {
         let map = Keymap::defaults();
         for (key, action) in [
@@ -510,9 +627,9 @@ mod tests {
     #[test]
     fn the_built_ins_answer_to_e_a_and_t() {
         let keys = ModuleKeys::built_in();
-        assert_eq!(keys.module('e'), Some(&ModuleId::editor()));
-        assert_eq!(keys.module('a'), Some(&ModuleId::agent()));
-        assert_eq!(keys.module('t'), Some(&ModuleId::terminal()));
+        assert_eq!(keys.module('e'), Some(ModuleId::editor()));
+        assert_eq!(keys.module('a'), Some(ModuleId::agent()));
+        assert_eq!(keys.module('t'), Some(ModuleId::terminal()));
         assert_eq!(keys.module('v'), None, "the canvas's key arrives with the canvas");
         assert!(keys.lua_keys().is_empty());
     }
@@ -598,7 +715,7 @@ mod tests {
             &Keymap::defaults(),
         )
         .unwrap();
-        assert_eq!(keys.module('N'), Some(&ModuleId::lua("notes")));
+        assert_eq!(keys.module('N'), Some(ModuleId::lua("notes")));
         assert_eq!(keys.key_of(&ModuleId::lua("todo")), Some('g'));
         assert_eq!(keys.key_of(&ModuleId::lua("plain")), None);
         assert_eq!(keys.lua_keys(), ['N', 'g']);
@@ -640,13 +757,13 @@ mod tests {
         let defaults = [(strips.clone(), 'U')];
 
         let (keys, refused, unused) = ModuleKeys::build_with_defaults(&[lua("strips", None)], &defaults, &map);
-        assert_eq!(keys.module('U'), Some(&strips));
+        assert_eq!(keys.module('U'), Some(strips.clone()));
         assert!(refused.is_empty() && unused.is_empty(), "{refused:?} {unused:?}");
 
         // A panel registered later that wrote the same key keeps it; the order stays the registration's.
         let panels = [lua("strips", None), lua("first", Some("g")), lua("notes", Some("U"))];
         let (keys, refused, unused) = ModuleKeys::build_with_defaults(&panels, &defaults, &map);
-        assert_eq!(keys.module('U'), Some(&ModuleId::lua("notes")));
+        assert_eq!(keys.module('U'), Some(ModuleId::lua("notes")));
         assert_eq!(keys.key_of(&strips), None);
         assert!(refused.is_empty(), "{refused:?}");
         assert_eq!(
@@ -685,7 +802,7 @@ mod tests {
             &[(strips.clone(), 'U'), (ModuleId::lua("other"), 'U')],
             &map,
         );
-        assert_eq!(keys.module('U'), Some(&strips));
+        assert_eq!(keys.module('U'), Some(strips.clone()));
         assert!(matches!(&unused[..], [KeyError::Taken { panel, by, .. }] if panel == "other" && by == "strips"));
 
         // A written key is never replaced by the default, even when it is refused; a refused one is reported as

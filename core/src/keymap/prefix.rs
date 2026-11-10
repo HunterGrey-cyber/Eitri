@@ -274,7 +274,6 @@ impl Prefix {
         self.module_keys
             .module(c)
             .or_else(|| self.module_keys.module(c.to_ascii_lowercase()))
-            .cloned()
     }
 
     fn repeatable(&self, press: Press) -> Option<Action> {

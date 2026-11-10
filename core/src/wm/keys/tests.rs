@@ -636,7 +636,7 @@ fn a_split_key_places_here_and_a_chooser_pick_is_answered_here() {
     let module_keys = ModuleKeys::build(&[], &keymap).unwrap();
     assert_eq!(
         module_keys.module('t'),
-        Some(&terminal()),
+        Some(terminal()),
         "the premise: t is the terminal's key"
     );
 

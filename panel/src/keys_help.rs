@@ -2,14 +2,14 @@
 //! panel.
 //!
 //! The panel table (the merge of the user's panel keys and what nvim reports) and the new-tab chord
-//! travel in the same envelope, and the panel table is recomputed -- and only re-sent when it
-//! actually changed -- every time nvim's own keys report changes.
+//! travel in the same envelope. Help is recomputed when nvim reports its keys or a page joins,
+//! and only re-sent when the panel table or module keys changed.
 
 use std::cell::RefCell;
 use std::rc::Rc;
 
 use eitri_core::keymap::{Action, HelpRow, Keymap, PanelKeymap, TabAction};
-use eitri_core::layout::{Direction, ModuleKeys};
+use eitri_core::layout::{Direction, ModuleId, ModuleKeys};
 use eitri_core::nvim_keys::NvimReport;
 
 use eitri_core::keymap::companion::CompanionVerb;
@@ -135,8 +135,9 @@ fn panel_beside_editor_rows(keymap: &Keymap, module_keys: &ModuleKeys) -> Vec<He
 pub struct KeysHelp {
     /// `.0` is the last nvim report seen (`None` until the feed's first line, or forever if the feed
     /// could not start); `.1` is the last `PanelKeymap` actually sent, so a report that leaves the
-    /// merged table unchanged costs no dispatch and no repeated log line.
+    /// merged table and module keys unchanged costs no dispatch and no repeated log line.
     latest: RefCell<(Option<NvimReport>, Option<PanelKeymap>)>,
+    sent_modules: RefCell<Vec<(char, ModuleId)>>,
     keymap: Rc<Keymap>,
     module_keys: Rc<ModuleKeys>,
     panel: AgentPanelHandle,
@@ -162,6 +163,7 @@ impl KeysHelp {
             .unwrap_or_default();
         Rc::new(Self {
             latest: RefCell::new((None, None)),
+            sent_modules: RefCell::default(),
             keymap,
             module_keys,
             panel,
@@ -171,7 +173,7 @@ impl KeysHelp {
         })
     }
 
-    /// Recomputes the panel table from the last nvim report and sends the help when it changed.
+    /// Recomputes help from the last nvim report and live module keys, sending only when either changed.
     pub fn send(&self) {
         let mut latest = self.latest.borrow_mut();
         let report = latest.0.clone();
@@ -179,7 +181,8 @@ impl KeysHelp {
         for line in log {
             println!("{line}");
         }
-        if latest.1.as_ref() != Some(&panel_keymap) {
+        let modules = self.module_keys.entries().to_vec();
+        if latest.1.as_ref() != Some(&panel_keymap) || *self.sent_modules.borrow() != modules {
             let (root_rows, prefix_rows) = help_tables(self.scope, &self.keymap, &self.module_keys);
             self.panel
                 .set_keymap_help(eitri_core::agent_bridge::serialize_keymap_for_js(
@@ -191,6 +194,7 @@ impl KeysHelp {
                     &self.skipped,
                 ));
             latest.1 = Some(panel_keymap);
+            *self.sent_modules.borrow_mut() = modules;
         }
     }
 
@@ -204,6 +208,53 @@ impl KeysHelp {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn help_resends_when_only_module_keys_change() {
+        #[derive(Default)]
+        struct Page(RefCell<Vec<String>>);
+        impl crate::panel_page::PageSurface for Page {
+            fn send(&self, payload: &str) {
+                self.0.borrow_mut().push(payload.to_string());
+            }
+            fn is_visible(&self) -> bool {
+                true
+            }
+            fn load_document(&self, _: &str, _: &str) {}
+            fn set_background(&self, _: [u8; 3]) {}
+        }
+        let page = Rc::new(Page::default());
+        let keymap = Rc::new(Keymap::defaults());
+        let keys = Rc::new(ModuleKeys::built_in());
+        let help = KeysHelp::new(
+            keymap.clone(),
+            keys.clone(),
+            AgentPanelHandle::for_host_test(page.clone()),
+            vec![],
+            HelpScope::Window,
+        );
+        help.send();
+        page.0.borrow_mut().clear();
+        let late = eitri_core::layout::ModuleId::lua("late");
+        keys.add_default(&late, 'U', &keymap).unwrap();
+        help.send();
+        assert!(page
+            .0
+            .borrow()
+            .iter()
+            .any(|payload| payload.contains(r#""keys":"Ctrl+b U""#)));
+        page.0.borrow_mut().clear();
+        help.send();
+        assert!(page.0.borrow().is_empty(), "unchanged keys send nothing");
+        keys.remove(&late);
+        help.send();
+        assert!(!page.0.borrow().is_empty(), "removal refreshes help too");
+        assert!(!page
+            .0
+            .borrow()
+            .iter()
+            .any(|payload| payload.contains(r#""keys":"Ctrl+b U""#)));
+    }
 
     #[test]
     fn companion_scope_keeps_only_tab_and_panel_rows() {

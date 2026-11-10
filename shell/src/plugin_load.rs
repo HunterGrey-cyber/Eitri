@@ -1,5 +1,5 @@
 //! A plugin page loaded into the running window (`plugin.load`, `:Eitri plugin load <name>`, the empty tab's Pages
-//! row), for this run and with its default settings: no `init.lua` line is written and the page has no module key.
+//! row), for this run and with its default settings: no `init.lua` line is written and its manifest default becomes its module key when free.
 //!
 //! The controller decides whether a load may start and asks for it with `PluginOp::Load`; this carries it out. The
 //! plugin is found, its manifest read and its private directories made on a worker (`load_named`), together with the
@@ -92,7 +92,7 @@ pub(crate) fn wants_follow(manifest: &Manifest) -> bool {
     manifest.has(Capability::EditorFollow) || manifest.has(Capability::EditorCommands)
 }
 
-/// A loaded page's registration: its defaults, no module key, placed where a page with no `position` goes.
+/// A loaded page's registration: its defaults, no written key, placed where a page with no `position` goes.
 pub(crate) fn registration_of(plugin: Rc<LoadedPlugin>) -> PluginRegistration {
     PluginRegistration {
         plugin,

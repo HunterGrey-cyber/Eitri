@@ -2,9 +2,9 @@
 //!
 //! The chunk ([`EITRI_COMMANDS_LUA`]) takes one table, [`install_args`], and never reads the environment: an nvim
 //! started inside another Eitri window inherits that window's variables, and reading them would send the words to
-//! the wrong one. It is sent once per nvim session, after `VimEnter` (before it the user's own commands are not
+//! the wrong one. It is sent after `VimEnter` (before it the user's own commands are not
 //! defined yet, and one defined here first would make theirs fail or replace this one), the way `core::tutor`
-//! sends `:EitriTutor`.
+//! sends `:EitriTutor`. Changed module arguments refresh the same session.
 
 use std::path::Path;
 use std::rc::Rc;
@@ -76,7 +76,7 @@ struct Out {
     since: Instant,
 }
 
-/// One window's `:Eitri`, installed once per nvim session and polled only while a call is out. Toolkit-free: the
+/// One window's `:Eitri`, installed per nvim session and refreshed for changed arguments. Toolkit-free: the
 /// caller runs [`VerbsInstaller::poll`] at the time each call returns.
 #[derive(Default)]
 pub struct VerbsInstaller {
@@ -99,7 +99,11 @@ impl VerbsInstaller {
 
     /// The snippet's argument ([`install_args`]); nothing is sent before it is set.
     pub fn set_args(&mut self, args: serde_json::Value) {
-        self.args = Some(args);
+        if self.args.as_ref() != Some(&args) {
+            self.installed_for = None;
+            self.out = None;
+            self.args = Some(args);
+        }
     }
 
     /// The editor may have a new nvim session ready: installs there unless that session already has it or a call
@@ -312,6 +316,103 @@ mod tests {
                 Value::Array(vec![Value::from(1), Value::from(true), Value::from("x"), Value::Nil])
             )])
         );
+    }
+
+    #[test]
+    fn changed_module_arguments_refresh_an_installed_or_pending_session() {
+        for pending in [false, true] {
+            let editor = Rc::new(FakeEditor::default());
+            let mut installer = installer(&editor);
+            let now = Instant::now();
+            editor.target.set(Some(7));
+            installer.editor_session(now);
+            let (_, reply) = editor.calls.borrow_mut().remove(0);
+            if !pending {
+                reply.send(answer(true, false, &[]));
+                installer.poll(now);
+            }
+            let args = serde_json::json!({"socket": "/run/eitri/s", "modules": ["editor", "lua:late"]});
+            installer.set_args(args.clone());
+            installer.editor_session(now);
+            assert_eq!(
+                editor.calls.borrow().len(),
+                1,
+                "changed arguments must reach this session"
+            );
+            assert_eq!(editor.calls.borrow()[0].0, to_msgpack(&args));
+            installer.set_args(args);
+            installer.editor_session(now);
+            assert_eq!(
+                editor.calls.borrow().len(),
+                1,
+                "unchanged arguments do not repeat a call"
+            );
+        }
+    }
+
+    #[test]
+    fn module_refresh_updates_nvim_completion_and_only_its_own_group_keys() {
+        let lua = mlua::Lua::new();
+        lua.load(
+            r#"
+            maps = {}; commands = {}
+            vim = {
+                v = {vim_did_enter = 1}, g = {}, log = {levels = {WARN = 1, ERROR = 2}},
+                notify = function(message) error(message) end,
+                schedule_wrap = function(f) return f end,
+                fn = {maparg = function(lhs) return maps[lhs] or {} end, keytrans = function(lhs) return lhs end},
+                api = {
+                    nvim_get_commands = function() return commands end,
+                    nvim_buf_get_commands = function() return {} end,
+                    nvim_create_user_command = function(name, callback, options)
+                        commands[name] = {callback = callback, definition = options.desc, complete = options.complete}
+                    end,
+                    nvim_get_keymap = function()
+                        local out = {}; for _, map in pairs(maps) do out[#out + 1] = map end; return out
+                    end,
+                    nvim_buf_get_keymap = function() return {} end,
+                    nvim_replace_termcodes = function(lhs) return lhs end,
+                    nvim_del_keymap = function(_, lhs) maps[lhs] = nil end,
+                    nvim_create_augroup = function() return 1 end,
+                    nvim_create_autocmd = function() end,
+                    nvim_exec_autocmds = function() end,
+                },
+                keymap = {set = function(_, lhs, callback, options)
+                    maps[lhs] = {lhs = lhs, callback = callback, desc = options.desc}
+                end},
+            }
+        "#,
+        )
+        .exec()
+        .unwrap();
+        lua.globals()
+            .set("install", lua.load(EITRI_COMMANDS_LUA).into_function().unwrap())
+            .unwrap();
+        lua.load(
+            r#"
+            local args = {socket = '/s', words = {'show'}, names = {'show'}, modules = {'editor'},
+                group = {lhs = 'W', keys = {{suffix = 'e', words = {'show', 'editor'}, desc = 'editor'}}}}
+            assert(install(args).ok)
+            local original = maps.We.callback
+            args.modules[2] = 'lua:late'
+            args.group.keys[2] = {suffix = 'U', words = {'show', 'lua:late'}, desc = 'late'}
+            assert(install(args).ok)
+            assert(maps.WU and maps.We)
+            local line = 'Eitri show '
+            local words = commands.Eitri.complete('', line, #line)
+            assert(words[2] == 'lua:late')
+            local user = function() end
+            maps.We.callback = user
+            args.modules[2] = nil
+            args.group.keys[2] = nil
+            assert(install(args).ok)
+            assert(maps.WU == nil and maps.We.callback == user)
+            words = commands.Eitri.complete('', line, #line)
+            assert(#words == 1 and words[1] == 'editor')
+        "#,
+        )
+        .exec()
+        .unwrap();
     }
 
     #[test]

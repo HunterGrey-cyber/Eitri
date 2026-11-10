@@ -85,6 +85,12 @@ impl NvimVerbs {
         self.installer.borrow_mut().set_editor(editor);
     }
 
+    /// The module list changed: refresh this session's completion and generated keys.
+    pub(crate) fn refresh(self: &Rc<Self>, args: serde_json::Value) {
+        self.installer.borrow_mut().set_args(args);
+        self.editor_session();
+    }
+
     /// The feeds reported: the editor may have a new nvim session ready.
     pub(crate) fn editor_session(self: &Rc<Self>) {
         let next = self.installer.borrow_mut().editor_session(Instant::now());

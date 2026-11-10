@@ -1123,7 +1123,7 @@ impl Keymap {
                 _ => rows.push((vec![key], what)),
             }
         }
-        for (key, id) in keys.entries() {
+        for (key, id) in keys.entries().iter() {
             if id.kind() == ModuleKind::LuaWebview && keep(&Action::Module(id.clone())) {
                 rows.push((
                     vec![key.to_string()],
