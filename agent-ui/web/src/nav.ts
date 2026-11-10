@@ -24,6 +24,7 @@
 
 import { pathTargetPass } from "./pathTargets";
 import type { PathTarget } from "./pathTargets";
+import { effectiveTop, headerInset } from "./promptHeader";
 
 export const STOP_ATTR = "data-nav-stop";
 
@@ -125,11 +126,9 @@ function whollyVisible(el: HTMLElement, root: HTMLElement): boolean {
     if (clips(a)) {
       const bounds = a.getBoundingClientRect();
       const left = bounds.left + a.clientLeft;
-      const top = bounds.top + a.clientTop;
-      clip = overlap(clip, {
-        left, top, right: left + a.clientWidth, bottom: top + a.clientHeight,
-        width: a.clientWidth, height: a.clientHeight,
-      });
+      const top = bounds.top + a.clientTop + (a.matches(".message-list") ? headerInset(a) : 0);
+      const bottom = bounds.top + a.clientTop + a.clientHeight;
+      clip = overlap(clip, { left, top, right: left + a.clientWidth, bottom, width: a.clientWidth, height: bottom - top });
     }
     if (a === root) break;
   }
@@ -552,13 +551,22 @@ function boxOf(r: DOMRect): Box {
   return { top: r.top, bottom: r.bottom, left: r.left, right: r.right, width: r.right - r.left, height: r.bottom - r.top };
 }
 
+/** A clipping ancestor's box. The conversation's list shows nothing under its pinned prompt header, so its box
+ *  starts below it (`effectiveTop`) while the header is shown. */
+function clipRectOf(a: HTMLElement): Box {
+  const box = boxOf(a.getBoundingClientRect());
+  if (!a.matches(".message-list")) return box;
+  const top = Math.min(box.bottom, effectiveTop(a));
+  return { ...box, top, height: box.bottom - top };
+}
+
 /** Where anything inside `root` can show, for `el`: the root's box, cut down by every ancestor of
- *  `el` between them that clips its overflow (the list, or a tool result's own capped box inside it).
- *  `null` when those leave nothing. */
+ *  `el` between them that clips its overflow (the list, less its pinned prompt header, or a tool result's own
+ *  capped box inside it). `null` when those leave nothing. */
 export function clipBox(el: HTMLElement, root: HTMLElement): Box | null {
   let clip: Box | null = boxOf(root.getBoundingClientRect());
   for (let a = el.parentElement; a !== null && a !== root && clip !== null; a = a.parentElement) {
-    if (clips(a)) clip = overlap(clip, a.getBoundingClientRect());
+    if (clips(a)) clip = overlap(clip, clipRectOf(a));
   }
   return clip;
 }

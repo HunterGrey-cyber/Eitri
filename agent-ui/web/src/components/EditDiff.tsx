@@ -1,3 +1,4 @@
+import { hunksOf } from "../hunks";
 import { MAX_DIFF_LINES, type DiffLine, type EditPreview } from "../diff";
 import { useProjectRelative } from "../projectPath";
 import { countEscapes, revealHidden, type RevealedPiece } from "../revealHidden";
@@ -109,10 +110,11 @@ export function DiffRows({ lines, pieces = lines.map((line) => revealHidden(line
   lines: DiffLine[];
   pieces?: RevealedPiece[][];
 }) {
+  const starts = new Map(hunksOf(lines).map(({ start }, index) => [start, index]));
   return (
     <pre className="permission-card-diff">
       {lines.map((line, i) => (
-        <div key={i} className={`diff-line diff-${line.kind}`}>
+        <div key={i} className={`diff-line diff-${line.kind}`} data-hunk={starts.get(i)}>
           <span className="diff-gutter" aria-hidden="true">
             {line.kind === "added" ? "+" : line.kind === "removed" ? "-" : " "}
           </span>

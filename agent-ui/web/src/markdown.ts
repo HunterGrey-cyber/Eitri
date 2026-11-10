@@ -61,9 +61,10 @@ let linkDepth = 0;
    fence's own text on the element, so a copy takes the token's text and not whatever the DOM under
    the element happens to hold by then. `fencedTexts` is the per-parse list the markers index into. */
 export const CODE_TEXT_ATTR = "data-code-text";
+export const CODE_LANGUAGE_ATTR = "data-code-language";
 const CODE_NONCE = Array.from(crypto.getRandomValues(new Uint8Array(16)), (b) => b.toString(16).padStart(2, "0")).join("");
 const CODE_MARKER = new RegExp(`^cb-${CODE_NONCE}-(\\d+)$`);
-let fencedTexts: string[] = [];
+let fencedTexts: { text: string; lang: string | null }[] = [];
 
 /* marked's own `cleanUrl` (not exported; `marked.esm.js`, used by its default `link` and `image`
    renderers): `encodeURI`, then un-double the `%` it encoded, and `null` for a destination
@@ -108,7 +109,7 @@ marked.use({
         language && hljs.getLanguage(language)
           ? hljs.highlight(text, { language, ignoreIllegals: true }).value
           : escapeHtml(text);
-      fencedTexts.push(text);
+      fencedTexts.push({ text, lang: language || null });
       return `<pre class="cb-${CODE_NONCE}-${fencedTexts.length - 1}"><code>${markHiddenInCode(body)}</code></pre>`;
     },
     link(token: Tokens.Link) {
@@ -203,10 +204,11 @@ function installSanitizeHooks(): void {
       if (token.length === 0) continue;
       const marker = CODE_MARKER.exec(token);
       if (marker !== null) {
-        const text = fencedTexts[Number(marker[1])];
-        if (text !== undefined && node instanceof Element && node.tagName === "PRE") {
+        const block = fencedTexts[Number(marker[1])];
+        if (block !== undefined && node instanceof Element && node.tagName === "PRE") {
           kept.push("code-block");
-          node.setAttribute(CODE_TEXT_ATTR, JSON.stringify(text));
+          node.setAttribute(CODE_TEXT_ATTR, JSON.stringify(block.text));
+          node.setAttribute(CODE_LANGUAGE_ATTR, JSON.stringify(block.lang));
         }
       } else if (token === "code-escape") {
         if (node instanceof Element && node.tagName === "SPAN" && ESCAPE_TEXT.test(node.textContent ?? "")) {
@@ -523,4 +525,14 @@ export function codeBlockText(block: HTMLElement): string {
   }
   const code = block.querySelector<HTMLElement>("code");
   return renderedText(code ?? block);
+}
+
+/** The language recorded with this rendered fence, independent of other source tokens. */
+export function codeBlockLanguage(block: HTMLElement): string | null {
+  try {
+    const lang: unknown = JSON.parse(block.getAttribute(CODE_LANGUAGE_ATTR) ?? "null");
+    return typeof lang === "string" ? lang : null;
+  } catch {
+    return null;
+  }
 }

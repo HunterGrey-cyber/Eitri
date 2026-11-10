@@ -1,5 +1,5 @@
 import { describe, expect, it, vi } from "vitest";
-import { allCards, buildTimeline, oldestPendingPermission, promptIndex, questionLines, waitingCardAfter, waitingCardIndex } from "./timeline";
+import { allCards, buildTimeline, oldestPendingPermission, nextStop, promptIndex, questionLines, waitingCardAfter, waitingCardIndex } from "./timeline";
 import type { TimelineItem } from "./timeline";
 import { primaryText } from "./copyText";
 import { editorCardRecord, initialState } from "./reducer";
@@ -769,3 +769,59 @@ describe("a shell line's output", () => {
   });
 });
 
+
+
+describe("structural stops", () => {
+  const call = (seq: number, name = "Read", extra: Partial<ToolCallRecord> = {}): TimelineItem => ({
+    kind: "tool", key: `t-${seq}`, seq,
+    call: { ...tool(seq, `call-${seq}`), name, result: { content: "ok", isError: false }, ...extra },
+  });
+  const notice = (seq: number, kind: AgentUiState["notices"][number]["kind"]): TimelineItem => ({
+    kind: "notice", key: `n-${seq}`, seq,
+    notice: { seq, kind, level: "warning", content: null, scalars: {}, taskId: null, toolUseId: null, taskStatus: null },
+  });
+  const ending = (seq: number, kind: TurnEnding["kind"]): TimelineItem => ({
+    kind: "ending", key: `e-${seq}`, seq,
+    ending: { seq, turnId: "turn", kind, reason: null, apiErrorStatus: null, message: null },
+  });
+  function stops(rows: TimelineItem[], what: "tool" | "error" | "edit", expected: number[]) {
+    for (const delta of [1, -1] as const) {
+      let from = delta === 1 ? -1 : rows.length;
+      const found: number[] = [];
+      for (;;) {
+        const next = nextStop(rows, from, delta, what);
+        if (next === null) break;
+        found.push(next); from = next;
+      }
+      expect(found).toEqual(delta === 1 ? expected : [...expected].reverse());
+      expect(nextStop(rows, from, delta, what)).toBeNull();
+    }
+  }
+  it("visits tools and collapsed runs once, excluding the starting row", () => {
+    const first = call(1);
+    const rows: TimelineItem[] = [first, { kind: "message", key: "m-2", seq: 2, text: "hi" },
+      { kind: "run", key: "r-3", seq: 3, calls: [tool(3, "a"), tool(4, "b")] }, call(5)];
+    stops(rows, "tool", [0, 2, 3]);
+    expect(nextStop(rows, 0, 1, "tool")).toBe(2);
+    expect(nextStop([], -1, 1, "tool")).toBeNull();
+  });
+  it("visits failed and denied calls, error notices and failed or lost endings", () => {
+    stops([call(1), call(2, "Bash", { result: { content: "bad", isError: true } }),
+      call(3, "Bash", { result: null, denied: { reasonType: "classifier", reason: "no" } }),
+      notice(4, "hook_block"), notice(5, "model_refusal"), notice(6, "informational"),
+      ending(7, "failed"), ending(8, "lost"), ending(9, "interrupted"), ending(10, "limit_reached")], "error", [1, 2, 3, 4, 6, 7]);
+  });
+  it.each(["Write", "Edit", "MultiEdit", "NotebookEdit", "acp:edit", "acp:delete", "acp:move", "fileChange"])(
+    "visits a successful %s both ways, but never a pending or failed call", (name) => {
+      stops([call(1, name, { result: null }), call(2, name, { result: { content: "applied", isError: true } }),
+        call(3, name, { result: { content: "applied", isError: false } })], "edit", [2]);
+    },
+  );
+  it("requires the exact applied string for Codex file changes", () => {
+    stops(["failed", "not applied", "applied\n", { status: "applied" }, [{ text: "applied" }], "applied"].map((content, i) =>
+      call(i, "fileChange", { result: { content, isError: false } })), "edit", [5]);
+  });
+  it("MultiEdit is an edit stop even without a preview or hunk", () => {
+    stops([call(1, "MultiEdit", { input: { file_path: "a.rs", edits: [] } })], "edit", [0]);
+  });
+});

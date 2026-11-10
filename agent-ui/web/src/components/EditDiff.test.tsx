@@ -46,3 +46,13 @@ it("shows counts, not every line, for an expanded row past the row limit, and ev
   expect(card.container.querySelectorAll(".diff-added")).toHaveLength(1000);
   expect(card.container.textContent).not.toContain("Too large to show here");
 });
+
+
+it("marks only each hunk's first changed line, keeping indices when folded", () => {
+  const preview = editPreview("Edit", { file_path: "a.rs", old_string: "a\nx\nb\n", new_string: "A\nx\nB\n" })!;
+  const { container, rerender } = render(<EditDiff preview={preview} />);
+  const heads = () => Array.from(container.querySelectorAll<HTMLElement>("[data-hunk]"), (el) => [el.dataset.hunk, el.textContent]);
+  expect(heads()).toEqual([["0", "-a"], ["1", "-b"]]);
+  rerender(<EditDiff preview={preview} maxLines={3} />);
+  expect(heads()).toEqual([["0", "-a"]]);
+});

@@ -1,3 +1,5 @@
+import type { YankObject } from "./yank";
+import { accumulateMotionCount } from "./app/motion";
 import { superHeld } from "./heldSuper";
 import { isModifierKey } from "./typingGuard";
 
@@ -45,12 +47,42 @@ export type CardKeyGone = "a" | "d" | "D" | "]p" | "[p";
 /** Where `Ctrl+w h/j/k/l` sends the keys: a side of the panel, by geometry. */
 export type PaneDirection = "left" | "down" | "up" | "right";
 
+/** Named BROWSE actions resolved directly, with the built-in motion's count and repeat behaviour. */
+export type PanelMotionName =
+  | "row.down"
+  | "row.up"
+  | "item.next"
+  | "item.prev"
+  | "line.down"
+  | "line.up"
+  | "top"
+  | "bottom"
+  | "prompt.next"
+  | "prompt.prev"
+  | "tool.next"
+  | "tool.prev"
+  | "error.next"
+  | "error.prev"
+  | "edit.next"
+  | "edit.prev"
+  | "hunk.next"
+  | "hunk.prev"
+  | "search.forward"
+  | "search.backward"
+  | "search.next"
+  | "search.prev"
+  | "jump.older"
+  | "jump.newer"
+  | "detailed.toggle"
+  | "help";
+
 /** The panel's own which-key actions (`core::keymap::panel`'s
  *  `PanelAction::name()`), the ones a leader/table sequence can run. `tab.close-others` is
  *  LazyVim's `<leader>bo`, "Delete Other Buffers". Distinct from this file's own
  *  `PanelAction` union below -- that one is `resolveKey`'s single-key result, this one is a row in
  *  the table `resolveKey`/`leader.ts` look sequences up in. */
 export type PanelActionName =
+  | PanelMotionName
   | "tab.new"
   | "tab.next"
   | "tab.prev"
@@ -73,6 +105,46 @@ export type PanelActionName =
  *  `keys` is vim notation split into tokens (`["<leader>", "b", "d"]`, `["H"]`), `source` says which
  *  layer of `defaults < nvim < init.lua` produced it. */
 export type PanelBinding = { keys: string[]; action: PanelActionName; desc: string; source: "default" | "nvim" | "init.lua" };
+
+/** Leader/table commands are separate from motions handled directly by resolveKey. */
+export type PanelCommandBinding = PanelBinding & { action: Exclude<PanelActionName, PanelMotionName> };
+
+export function isPanelCommand(binding: PanelBinding): binding is PanelCommandBinding {
+  return !isPanelMotion(binding.action);
+}
+
+export function isPanelMotion(name: PanelActionName): name is PanelMotionName {
+  return Object.prototype.hasOwnProperty.call(MOTION_ACTIONS, name);
+}
+
+const MOTION_ACTIONS = {
+  "row.down": { kind: "move", delta: 1 },
+  "row.up": { kind: "move", delta: -1 },
+  "item.next": { kind: "item-move", delta: 1 },
+  "item.prev": { kind: "item-move", delta: -1 },
+  "line.down": { kind: "scroll-line", delta: 1 },
+  "line.up": { kind: "scroll-line", delta: -1 },
+  "top": { kind: "jump", to: "first" },
+  "bottom": { kind: "jump", to: "last" },
+  "prompt.next": { kind: "prompt-jump", delta: 1 },
+  "prompt.prev": { kind: "prompt-jump", delta: -1 },
+  "tool.next": { kind: "structure-jump", what: "tool", delta: 1 },
+  "tool.prev": { kind: "structure-jump", what: "tool", delta: -1 },
+  "error.next": { kind: "structure-jump", what: "error", delta: 1 },
+  "error.prev": { kind: "structure-jump", what: "error", delta: -1 },
+  "edit.next": { kind: "structure-jump", what: "edit", delta: 1 },
+  "edit.prev": { kind: "structure-jump", what: "edit", delta: -1 },
+  "hunk.next": { kind: "structure-jump", what: "hunk", delta: 1 },
+  "hunk.prev": { kind: "structure-jump", what: "hunk", delta: -1 },
+  "search.forward": { kind: "search", dir: 1 },
+  "search.backward": { kind: "search", dir: -1 },
+  "search.next": { kind: "search-next", delta: 1 },
+  "search.prev": { kind: "search-next", delta: -1 },
+  "jump.older": { kind: "jump-older" },
+  "jump.newer": { kind: "jump-newer" },
+  "detailed.toggle": { kind: "detailed" },
+  "help": { kind: "keymap" },
+} as const satisfies Record<PanelMotionName, NonNullable<PanelAction>>;
 
 /** The panel's whole which-key table, as `serialize_keymap_for_js` sends it on `keymap`.
  *  `leader`/`leaderLabel`/`leaderSource` come from nvim's `g:mapleader` through
@@ -127,9 +199,11 @@ export type PanelAction =
    *  Ahead of every pending prefix and count, which entering drops. */
   | { kind: "card-mode"; delta: 1 | -1 }
   | { kind: "toggle-expand" }
-  | { kind: "copy" }
-  /** `Shift+Y`: a tool row's whole result, uncut, never anything else's. */
-  | { kind: "copy-output" }
+  | { kind: "operator"; op: YankOperator }
+  | { kind: "yank"; what: "rows"; count: number }
+  | { kind: "yank"; what: "object"; scope: "i" | "a"; object: YankObject }
+  | { kind: "yank"; what: "motion"; motion: YankMotion; count: number | null }
+  | { kind: "yank-refused"; flash: string }
   | { kind: "restart" }
   /** `Ctrl+d` (+1) / `Ctrl+u` (-1): scroll the conversation by half its visible height. `App.tsx`
    *  measures the list and re-homes the cursor if the scroll carried its row out of sight. */
@@ -177,6 +251,8 @@ export type PanelAction =
   | { kind: "count"; digit: number }
   /** `[[`/`]]`: the cursor to the previous/next prompt of yours. */
   | { kind: "prompt-jump"; delta: 1 | -1 }
+  | { kind: "structure-jump"; what: "tool" | "error" | "edit" | "hunk"; delta: 1 | -1 }
+  | { kind: "item-move"; delta: 1 | -1 }
   /** `Ctrl+c` while a turn runs: interrupt it. Never claimed idle (native copy) and
    *  never claimed in INPUT (the composer's own `Ctrl+c`). */
   | { kind: "interrupt" }
@@ -220,7 +296,7 @@ export type PanelAction =
    *  fixed row above. Reached today only as the second key of a two-key BROWSE prefix (`[b`); the
    *  leader itself and longer sequences run through `./leader`'s `startSequence`/`advanceSequence`,
    *  not this function. */
-  | { kind: "panel"; binding: PanelBinding }
+  | { kind: "panel"; binding: PanelCommandBinding }
   /** `v` in BROWSE: start CARET, a moving block caret. `App.tsx` itself
    *  decides whether there is anywhere to start from (a row under the cursor, not a banner or Stop)
    *  -- this table has no DOM to check that with. */
@@ -367,10 +443,14 @@ export function cardModeDelta(event: KeyLike): 1 | -1 | null {
   return letter === "n" ? 1 : letter === "p" ? -1 : null;
 }
 
+export type YankOperator = { op: "y"; count: number | null; scope: "i" | "a" | null; prefix: "g" | "[" | "]" | null };
+export type YankMotion = "j" | "k" | "ArrowDown" | "ArrowUp" | "{" | "}" | "G" | "gg" | "[[" | "]]";
+
 /** `sessionEnded` gates two rows in opposite directions: it is what OFFERS `r` (return to the start
  *  screen) and what REFUSES `i` (a dead session's composer is disabled, so INPUT has no box). The
  *  rule both serve is that no on-screen hint may promise a key the current mode drops. */
 export type KeyContext = {
+  operator?: YankOperator | null;
   sessionEnded: boolean;
   /** The previous key was the first of a two-key BROWSE sequence and nothing has come since. Held
    *  by the caller (`App.tsx`), never by this table, so `resolveKey` stays a function of its three
@@ -588,6 +668,7 @@ export const FIXED_PAIRS: Record<PendingPrefix, Readonly<Record<string, NonNulla
     f: { kind: "open-path" },
     x: { kind: "open-link" },
     "?": { kind: "keymap" },
+    y: { kind: "yank", what: "object", scope: "i", object: "`" },
     d: { kind: "go-definition" },
   },
 
@@ -610,11 +691,19 @@ export const FIXED_PAIRS: Record<PendingPrefix, Readonly<Record<string, NonNulla
   "[": {
     "[": { kind: "prompt-jump", delta: -1 },
     p: { kind: "card-key-gone", key: "[p" },
+    t: { kind: "structure-jump", what: "tool", delta: -1 },
+    c: { kind: "structure-jump", what: "hunk", delta: -1 },
+    d: { kind: "structure-jump", what: "error", delta: -1 },
+    m: { kind: "structure-jump", what: "edit", delta: -1 },
   },
 
   "]": {
     "]": { kind: "prompt-jump", delta: 1 },
     p: { kind: "card-key-gone", key: "]p" },
+    t: { kind: "structure-jump", what: "tool", delta: 1 },
+    c: { kind: "structure-jump", what: "hunk", delta: 1 },
+    d: { kind: "structure-jump", what: "error", delta: 1 },
+    m: { kind: "structure-jump", what: "edit", delta: 1 },
   },
 
   // vim's `CTRL-W h/j/k/l`, the module that way. `Ctrl+w w/p/o/q` and `Ctrl+w
@@ -681,6 +770,31 @@ export function resolveKey(mode: PanelMode, event: KeyLike, ctx: KeyContext): Pa
     const cardDelta = cardModeDelta(event);
     if (cardDelta !== null) return { kind: "card-mode", delta: cardDelta };
   }
+  if (mode === "browse" && ctx.operator) {
+    const op = ctx.operator;
+    const cancel: PanelAction = { kind: "cancel", why: "unbound" };
+    if (isModifierKey(event.key)) return { kind: "operator", op };
+    if (event.ctrlKey && !event.shiftKey && event.key === "c") return ctx.turnRunning === true ? { kind: "interrupt" } : cancel;
+    // Brackets may need Option/Meta or AltGr on the user's layout, including the
+    // second bracket of a pair. Ctrl alone and Super/Hyper still cancel.
+    const layoutBracket = op.scope === null && ["[", "]", "{", "}"].includes(event.key)
+      && (!event.ctrlKey || hasAltGraph(event)) && !hasSuperOrHyper(event);
+    if (!layoutBracket && !isPlainAnswerKey(event)) return cancel;
+    if (op.scope !== null) {
+      if (["m", "o", "c", "`", "f", "h"].includes(event.key)) return { kind: "yank", what: "object", scope: op.scope, object: event.key as YankObject };
+      if (["w", "W", "s", "p"].includes(event.key)) return { kind: "yank-refused", flash: `${op.scope}${event.key}: needs the caret — v, then move, then y` };
+      return cancel;
+    }
+    if (op.prefix !== null) return event.key === op.prefix
+      ? { kind: "yank", what: "motion", motion: `${op.prefix}${op.prefix}` as YankMotion, count: op.count } : cancel;
+    if (/^[0-9]$/.test(event.key)) return event.key === "0" && op.count === null ? cancel
+      : { kind: "operator", op: { ...op, count: accumulateMotionCount(op.count, Number(event.key)) } };
+    if (event.key === "y" && !event.shiftKey) return { kind: "yank", what: "rows", count: op.count ?? 1 };
+    if (event.key === "i" || event.key === "a") return { kind: "operator", op: { ...op, scope: event.key } };
+    if (event.key === "g" || event.key === "[" || event.key === "]") return { kind: "operator", op: { ...op, prefix: event.key } };
+    if (["j", "k", "ArrowDown", "ArrowUp", "{", "}", "G"].includes(event.key)) return { kind: "yank", what: "motion", motion: event.key as YankMotion, count: op.count };
+    return cancel;
+  }
   // The key after a pending prefix, outside INPUT (INPUT never reads one: a `g` left over from
   // BROWSE is simply dropped there). First, a second key completing a panel-table two-key sequence
   // whose first half is one of the four prefixes (`[b` -- a reserved prefix may start
@@ -693,7 +807,8 @@ export function resolveKey(mode: PanelMode, event: KeyLike, ctx: KeyContext): Pa
   if (mode !== "input" && ctx.pending) {
     if (!event.ctrlKey) {
       const tableHit = ctx.table?.bindings.find((b) => b.keys.length === 2 && b.keys[0] === ctx.pending && b.keys[1] === event.key);
-      if (tableHit) return { kind: "panel", binding: tableHit };
+      if (tableHit && isPanelMotion(tableHit.action)) return MOTION_ACTIONS[tableHit.action];
+      if (tableHit && isPanelCommand(tableHit)) return { kind: "panel", binding: tableHit };
     }
     return resolvePendingSecond(ctx.pending, event, ctx);
   }
@@ -748,7 +863,17 @@ export function resolveKey(mode: PanelMode, event: KeyLike, ctx: KeyContext): Pa
     // anything. Idle, it is left to the browser (a text selection's native copy); `Ctrl+c` in INPUT
     // is the composer's own, so it is deliberately not named here at all.
     if (event.ctrlKey && !event.shiftKey && event.key === "c") return ctx.turnRunning === true ? { kind: "interrupt" } : null;
+    // Table motions take the built-in's key before named Shift keys, braces and plain keys.
+    // Ctrl chords stay above; produced keys may carry Shift, Option or AltGr.
+    if (!event.ctrlKey && !hasSuperOrHyper(event)) {
+      const motion = ctx.table?.bindings.find((b) => b.keys.length === 1 && b.keys[0] === event.key && isPanelMotion(b.action));
+      if (motion && isPanelMotion(motion.action)) return MOTION_ACTIONS[motion.action];
+    }
     if (event.shiftKey && !event.ctrlKey && event.key === "G") return { kind: "jump", to: "last" };
+    // Braces reach row starts directly, including layouts that type them with Option or AltGr.
+    if (!event.ctrlKey && !hasSuperOrHyper(event) && !event.isComposing && event.keyCode !== 229 && (event.key === "{" || event.key === "}")) {
+      return { kind: "item-move", delta: event.key === "}" ? 1 : -1 };
+    }
     // `?` arrives with Shift held on most layouts (Shift+/), so it must be named before the blanket
     // modifier refusal below, the same reason `G` is; matched on `key`, never on the physical key.
     if (event.key === "?" && !event.ctrlKey) return { kind: "search", dir: -1 };
@@ -760,8 +885,8 @@ export function resolveKey(mode: PanelMode, event: KeyLike, ctx: KeyContext): Pa
     // most layouts deliver capital `N` with Shift held.
     if (event.shiftKey && !event.ctrlKey && event.key === "N") return { kind: "search-next", delta: -1 };
     // `Shift+Y`/`Shift+D`, named here ahead of the blanket modifier refusal for the same
-    // reason as `G`/`N`/`?` -- most layouts deliver both with Shift held.
-    if (event.shiftKey && !event.ctrlKey && event.key === "Y") return { kind: "copy-output" };
+    // reason as `G`/`N`/`?` -- most layouts deliver both with Shift held. `Y` is `yy`, as in vim.
+    if (isPlainAnswerKey(event) && event.key === "Y") return { kind: "yank", what: "rows", count: ctx.count ?? 1 };
     // `D` answers no card (card mode's Tab opens the reason field): claimed and refused, with or without a count.
     // Alt/Meta/Super/Hyper/AltGraph held is some other chord (`isPlainAnswerKey`), which falls through unclaimed.
     if (event.shiftKey && isPlainAnswerKey(event) && event.key === "D") return { kind: "card-key-gone", key: "D" };
@@ -896,7 +1021,7 @@ export function resolveKey(mode: PanelMode, event: KeyLike, ctx: KeyContext): Pa
     case "Enter":
       return { kind: "toggle-expand" };
     case "y":
-      return { kind: "copy" };
+      return isPlainAnswerKey(event) ? { kind: "operator", op: { op: "y", count: ctx.count ?? null, scope: null, prefix: null } } : null;
     case "r":
       // Only on the disconnected/error row, where a restart means something. Otherwise `r` is otherwise free.
       return ctx.sessionEnded ? { kind: "restart" } : null;
@@ -922,7 +1047,7 @@ export function resolveKey(mode: PanelMode, event: KeyLike, ctx: KeyContext): Pa
 }
 
 /** One line of the keymap: the key as a person types it, and what it does. */
-export type KeyHelp = { keys: string; what: string };
+export type KeyHelp = { keys: string; what: string; motion?: PanelMotionName };
 
 /** The `?` sheet's section for the plugin page that held the keys when `prefix ?` was pressed: the plugin's
  *  title, whether the page has declared its keys, and its effective keys (`eitri_core::plugin::keys::plugin_help`).
@@ -978,36 +1103,54 @@ export function browseKeys(prefix: string): KeyHelp[] {
  *  it both ways by `keymap.test.ts`, so this list can neither promise a key that does nothing nor
  *  leave out one that does. */
 export const BROWSE_KEYS: KeyHelp[] = [
-  { keys: "j / k", what: "Next / previous row; a long row scrolls first; j alone on the last row goes to the box" },
-  { keys: "↓ / ↑", what: "The same as j / k" },
+  { keys: "j / ↓", motion: "row.down", what: "Next row; a long row scrolls first; alone on the last row goes to the box" },
+  { keys: "k / ↑", motion: "row.up", what: "Previous row; a long row scrolls first" },
   { keys: "h / l", what: "Previous / next button in the row" },
-  { keys: "gg / G", what: "First / last row" },
+  { keys: "gg", motion: "top", what: "First row" },
+  { keys: "G", motion: "bottom", what: "Last row" },
   { keys: "1-9", what: "A count: 3j three rows, 3G or 3gg row 3, 2]] two prompts, 2gt tab 2" },
-  { keys: "[[ / ]]", what: "Previous / next prompt of yours" },
+  { keys: "{", motion: "item.prev", what: "Previous row start (counts repeat)" },
+  { keys: "}", motion: "item.next", what: "Next row start (counts repeat)" },
+  { keys: "]t", motion: "tool.next", what: "Next tool call" },
+  { keys: "[t", motion: "tool.prev", what: "Previous tool call" },
+  { keys: "]d", motion: "error.next", what: "Next error" },
+  { keys: "[d", motion: "error.prev", what: "Previous error" },
+  { keys: "]m", motion: "edit.next", what: "Next applied edit" },
+  { keys: "[m", motion: "edit.prev", what: "Previous applied edit" },
+  { keys: "]c", motion: "hunk.next", what: "Next diff hunk (opens the inline diff)" },
+  { keys: "[c", motion: "hunk.prev", what: "Previous diff hunk (opens the inline diff)" },
+  { keys: "[[", motion: "prompt.prev", what: "Previous prompt of yours" },
+  { keys: "]]", motion: "prompt.next", what: "Next prompt of yours" },
   { keys: "]p / [p", what: "Nothing: cards are on Alt-n / Alt-p now (the band says so)" },
   { keys: "Alt-n / Alt-p", what: "The next / previous waiting card, in card mode (then 1-3 answers it)" },
   { keys: "Ctrl+d / Ctrl+u", what: "Half a page down / up" },
-  { keys: "Ctrl+e / Ctrl+y", what: "One line down / up (a count repeats it, e.g. 5 Ctrl+e)" },
+  { keys: "Ctrl+e", motion: "line.down", what: "One line down (a count repeats it, e.g. 5 Ctrl+e)" },
+  { keys: "Ctrl+y", motion: "line.up", what: "One line up (a count repeats it)" },
   { keys: "Ctrl+f / PageDown", what: "A view down, keeping two lines (a count repeats it)" },
   { keys: "PageUp", what: pageUpHelp("Ctrl+b") },
   { keys: "Ctrl+c", what: "Interrupt the running turn (never closes anything)" },
   { keys: "a / d / D", what: "Nothing: cards are answered in card mode (Enter on the card, or Alt-n, then 1-3)" },
   { keys: "Enter", what: "Show or hide a tool's result or a collapsed run; on a card row, or a tool row a card gates, card mode for that card" },
   {
-    keys: "y / Y",
-    what: "Copy the row (message, command, path), or the code block HINT landed on / its whole output",
+    keys: "yy / Y",
+    what: "copy the row",
   },
+  { keys: "y{object}", what: "im am io ao ic ac i` a` if af ih ah" },
+  { keys: "y{motion}", what: "rows through j k { } G gg [[ ]]" },
+  { keys: "gy", what: "the row's code block" },
   { keys: "v / V", what: "A caret to move with h j k l, w b e, 0 $, gg G; V selects lines at once" },
   { keys: "i / o", what: "Start typing, caret where you left it (C1a: o is an exact alias of i)" },
   { keys: "A", what: "Start typing at the end of the draft" },
   { keys: "f", what: "HINT: jump anywhere in the window (links too; Enter opens one)" },
   { keys: "r", what: "Once this session has ended: resume it, or start a new one (its last row says which)" },
   { keys: "c", what: "Review: the files that changed on disk during this tab's latest turn (read-only)" },
-  { keys: "/", what: "Search forward; n repeats, N reverses (Enter keeps the match, Esc goes back)" },
+  { keys: "/", motion: "search.forward", what: "Search forward; n repeats, N reverses (Enter keeps the match, Esc goes back)" },
   { keys: ":", what: "A command line, as in vim: :tabnew, :trust, :untrust, :scratch and :%scratch" },
-  { keys: "n / N", what: "Next / previous match, wrapping" },
-  { keys: "Ctrl+o / Ctrl+i", what: "Back / forward through the jumps in this tab" },
-  { keys: "zi", what: "The detailed view: every result, longer excerpts, no collapsed runs" },
+  { keys: "n", motion: "search.next", what: "Next match, wrapping" },
+  { keys: "N", motion: "search.prev", what: "Previous match, wrapping" },
+  { keys: "Ctrl+o", motion: "jump.older", what: "Back through the jumps in this tab" },
+  { keys: "Ctrl+i", motion: "jump.newer", what: "Forward through the jumps in this tab" },
+  { keys: "zi", motion: "detailed.toggle", what: "The detailed view: every result, longer excerpts, no collapsed runs" },
   { keys: "zh / zl", what: "Scroll this row's table left / right" },
   { keys: "zt / zz / zb", what: "This row to the top / middle / bottom of the view (3zt: row 3)" },
   { keys: "za / zo / zc", what: "Fold: toggle as Enter / open / close a result or a collapsed run" },
@@ -1019,8 +1162,8 @@ export const BROWSE_KEYS: KeyHelp[] = [
     what: "The keys to the module that way, as Ctrl+h/j/k/l; Ctrl+w j is the module below, never the box",
   },
   { keys: "Ctrl+g", what: "This row's whole text in an nvim scratch buffer" },
-  { keys: "?", what: "Search backward; n repeats, N reverses" },
-  { keys: "F1 / g?", what: "This list" },
+  { keys: "?", motion: "search.backward", what: "Search backward; n repeats, N reverses" },
+  { keys: "F1 / g?", motion: "help", what: "This list" },
 ];
 
 /** CARET, i.e. everything `resolveCaretKey` claims. Tied to `resolveKey`'s

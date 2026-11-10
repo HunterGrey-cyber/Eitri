@@ -142,6 +142,13 @@ eitri.keymap.del("panel", "<leader>M")
 eitri.keymap.set("panel", "<leader>p", "model.pick")
 ```
 
+The panel table also accepts named BROWSE motions, for example `eitri.keymap.set("panel", "j", "line.down")`
+or `eitri.keymap.set("panel", "]t", "tool.prev")`. A motion takes one literal key or a pair beginning with
+`g z [ ]`. It refuses a leading digit, `<leader>`, single `i o A : y Y` (input, command line or copy operator),
+and single `g z [ ]` (they start pairs; bind a pair instead). A motion cannot take the effective panel leader
+or a key that starts another surviving binding: Eitri drops it and logs why. `y{motion}` still uses the built-in
+motion keys even when these bindings change.
+
 The defaults are stock tmux's, with `Ctrl+b` as the prefix. Eitri then reads your tmux configuration (the same
 files tmux reads, and what they `source-file` by an absolute path; a relative path is skipped, because Eitri
 does not know the directory tmux would resolve it against), and finally applies your `eitri.keymap` calls, so your own

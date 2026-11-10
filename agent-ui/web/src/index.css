@@ -161,6 +161,49 @@ pre {
   scrollbar-width: thin;
   scrollbar-color: var(--rule-frame) var(--nv-bg);
 }
+/* The prompt the reader is under, pinned over the top of the list while it is scrolled up (`promptHeader.ts`): one
+   dim line on the page's own ground, the prompt cut with an ellipsis and its `prompt 4/9` at the right, a hairline
+   under it and no shadow, one editor row high (the band's `--nv-editor-row`, 24px before the editor reports; the
+   border is inside that height). The list's sibling inside `.agent-ui-scroller`, positioned over it and never in its
+   flow, so the list's height and every row stay where they are; drawn after the list, so it paints over the rows
+   without a z-index, and the overlays that follow it in the scroller still cover it. `right` is set inline to the
+   list's scrollbar width. Muted text on `--nv-bg`, the pair the page's own dim text uses: the band's dim colour is
+   guarded only against the band's fill. */
+.prompt-header {
+  position: absolute;
+  top: 0;
+  left: 0;
+  right: 0;
+  display: flex;
+  align-items: center;
+  gap: 2ch;
+  box-sizing: border-box;
+  height: var(--nv-editor-row, 24px);
+  line-height: calc(var(--nv-editor-row, 24px) - 1px);
+  padding: 0 var(--page-pad);
+  overflow: hidden;
+  white-space: nowrap;
+  font-size: var(--fs-sm);
+  background: var(--nv-bg);
+  color: var(--nv-muted);
+  border-bottom: 1px solid var(--rule-soft);
+  cursor: pointer;
+}
+.prompt-header:hover {
+  color: var(--nv-fg);
+}
+/* Isolated, so a prompt's own right-to-left text cannot reorder the count beside it. */
+.prompt-header-text {
+  flex: 1 1 auto;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  unicode-bidi: isolate;
+}
+.prompt-header-count {
+  flex: none;
+  font-variant-numeric: tabular-nums;
+}
 .row {
   border-left: 0;
   display: grid;

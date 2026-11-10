@@ -1643,11 +1643,13 @@ describe("App keyboard: BROWSE/INPUT and the cursor", () => {
 
     fireEvent.keyDown(conversationRoot(container), { key: "j" });
     fireEvent.keyDown(conversationRoot(container), { key: "y" });
+    fireEvent.keyDown(conversationRoot(container), { key: "y" });
     expect(clipboard.writeText).toHaveBeenCalledWith("second prompt");
 
-    // Any key within `TYPING_GUARD_MS` of a `y` is typing (inside the copy burst): the walk pauses after it.
+    // A completed yank leaves ordinary row motions available.
     keyGap();
     fireEvent.keyDown(conversationRoot(container), { key: "k" });
+    fireEvent.keyDown(conversationRoot(container), { key: "y" });
     fireEvent.keyDown(conversationRoot(container), { key: "y" });
     expect(clipboard.writeText).toHaveBeenCalledWith("first prompt");
   });
@@ -2197,6 +2199,7 @@ describe("App keyboard: BROWSE/INPUT and the cursor", () => {
     // No prompts/messages/tools/permissions at all -- timeline.length === 0, cursor stays 0.
     const clipboard = stubClipboard();
     fireEvent.keyDown(conversationRoot(container), { key: "y" });
+    fireEvent.keyDown(conversationRoot(container), { key: "y" });
     expect(clipboard.writeText).not.toHaveBeenCalled();
   });
 
@@ -2210,6 +2213,7 @@ describe("App keyboard: BROWSE/INPUT and the cursor", () => {
     fireEvent.keyDown(conversationRoot(container), { key: "j" }); // cursor -> 1, on perm-2
     events({ type: "permission_resolved", permission_id: "perm-2", outcome: "allowed" }); // timeline shrinks to 1
 
+    fireEvent.keyDown(conversationRoot(container), { key: "y" });
     fireEvent.keyDown(conversationRoot(container), { key: "y" });
     // A cursor left at the old index 1 would find nothing (or, with the old handler, silently write "").
     // Clamped to the new last row, it copies the one item that is still there.
@@ -2280,6 +2284,7 @@ describe("App keyboard: BROWSE/INPUT and the cursor", () => {
 
     const clipboard = stubClipboard();
     fireEvent.keyDown(document.activeElement!, { key: "j" });
+    fireEvent.keyDown(document.activeElement!, { key: "y" });
     fireEvent.keyDown(document.activeElement!, { key: "y" });
     expect(clipboard.writeText).toHaveBeenCalledWith("second");
   });
@@ -4977,7 +4982,7 @@ describe("typing never answers a card", () => {
       act(() => vi.advanceTimersByTime(WHICH_KEY_DELAY_MS));
       const box = container.querySelector(".which-key-box")!;
       expect(box.querySelector(".wk-title")!.textContent).toBe("]");
-      expect(Array.from(box.querySelectorAll(".wk-entry")).map((e) => e.textContent)).toEqual(["]➜next prompt", "p➜cards: Alt-n now"]);
+      expect(Array.from(box.querySelectorAll(".wk-entry")).map((e) => e.textContent)).toEqual(["]➜next prompt", "p➜cards: Alt-n now", "t➜next tool call", "c➜next hunk", "d➜next error", "m➜next edit"]);
     });
 
     it("the box after [ says the same for Alt-p", () => {
@@ -4985,7 +4990,7 @@ describe("typing never answers a card", () => {
       press("[");
       act(() => vi.advanceTimersByTime(WHICH_KEY_DELAY_MS));
       const box = container.querySelector(".which-key-box")!;
-      expect(Array.from(box.querySelectorAll(".wk-entry")).map((e) => e.textContent)).toEqual(["[➜previous prompt", "p➜cards: Alt-p now"]);
+      expect(Array.from(box.querySelectorAll(".wk-entry")).map((e) => e.textContent)).toEqual(["[➜previous prompt", "p➜cards: Alt-p now", "t➜previous tool call", "c➜previous hunk", "d➜previous error", "m➜previous edit"]);
     });
 
     it("gives a composing p to the input method: ], then p mid-composition says nothing and spends the prefix", () => {
@@ -5930,10 +5935,11 @@ describe("App global HINT: the panel's half", () => {
     dispatch({ kind: "hint_land", sessionId: 1, index: AT.code });
     expect(container.querySelector(".row-current")!.classList.contains("row-assistant")).toBe(true);
     press("y");
+    press("y");
     expect(clipboard.writeText).toHaveBeenLastCalledWith("ls -la");
-    // Only the next y: the one after copies the whole message again (a pause later: any key within
-    // `TYPING_GUARD_MS` of a `y` is typing).
+    // The next yy copies the whole message again.
     keyGap();
+    press("y");
     press("y");
     expect(clipboard.writeText).toHaveBeenLastCalledWith(expect.stringContaining("then look."));
   });
@@ -5944,7 +5950,9 @@ describe("App global HINT: the panel's half", () => {
     show(1, collect(1));
     dispatch({ kind: "hint_land", sessionId: 1, index: AT.code });
     press("y");
+    press("y");
     keyGap();
+    press("y");
     press("y");
     const copied = clipboard.writeText.mock.calls.map((call) => call[0]);
     expect(copied).toHaveLength(2);
@@ -5962,6 +5970,7 @@ describe("App global HINT: the panel's half", () => {
     dispatch({ kind: "hint_land", sessionId: 1, index: AT.code });
     press("j");
     press("k");
+    press("y");
     press("y");
     expect(clipboard.writeText).toHaveBeenLastCalledWith(expect.stringContaining("then look."));
   });
@@ -6358,6 +6367,7 @@ describe("App global HINT: the panel's half", () => {
       ["j", (c: HTMLElement) => fireEvent.keyDown(root(c), { key: "j" })],
       ["y, after copying the block", (c: HTMLElement) => {
         const clipboard = stubClipboard();
+        fireEvent.keyDown(root(c), { key: "y" });
         fireEvent.keyDown(root(c), { key: "y" });
         expect(clipboard.writeText).toHaveBeenCalledWith("ls -la");
       }],
@@ -9741,7 +9751,7 @@ describe("copying with y and Y, and answering through the card, in the conversat
     return rendered;
   }
 
-  it("y copies the command and flashes the row; Y copies the output", () => {
+  it("yy copies the command and flashes the row; yio copies the output", () => {
     fakeClock();
     const widen = stubBandWidth();
     try {
@@ -9750,12 +9760,13 @@ describe("copying with y and Y, and answering through the card, in the conversat
       act(() => widen(container));
       const root = container.querySelector(".agent-ui-conversation")!;
       fireEvent.keyDown(root, { key: "y" });
+      fireEvent.keyDown(root, { key: "y" });
       expect(clipboard.writeText).toHaveBeenLastCalledWith("cargo test");
       expect(container.querySelector(".row-current")!.classList.contains("row-yanked")).toBe(true);
       expect(container.querySelector(".band-message")!.textContent).toBe("copied 10 chars");
       act(() => vi.advanceTimersByTime(400));
       expect(container.querySelector(".row-yanked")).toBeNull();
-      fireEvent.keyDown(root, { key: "Y", shiftKey: true });
+      for (const key of "yio") fireEvent.keyDown(root, { key });
       expect(clipboard.writeText).toHaveBeenLastCalledWith("test result: ok");
     } finally {
       vi.useRealTimers();
@@ -9763,16 +9774,16 @@ describe("copying with y and Y, and answering through the card, in the conversat
     }
   });
 
-  it("Y on a row with no output copies nothing and says so", () => {
+  it("yio on a reply copies nothing and explains the object", () => {
     const widen = stubBandWidth();
     const clipboard = stubClipboard();
     const { container } = render(<App />);
     dispatch({ kind: "hello", ...HELLO });
     dispatchLiveTab(snapshotState({ transcript: [{ seq: 1, text: "hello" }] }), 2);
     act(() => widen(container));
-    fireEvent.keyDown(container.querySelector(".agent-ui-conversation")!, { key: "Y", shiftKey: true });
+    for (const key of "yio") fireEvent.keyDown(container.querySelector(".agent-ui-conversation")!, { key });
     expect(clipboard.writeText).not.toHaveBeenCalled();
-    expect(container.querySelector(".band-message")!.textContent).toBe("this row has no output");
+    expect(container.querySelector(".band-message")!.textContent).toBe("io: the cursor is on a reply, not a tool call — try im");
     vi.unstubAllGlobals();
   });
 
@@ -13003,7 +13014,8 @@ describe("BROWSE visual mode", () => {
     fireEvent.keyDown(root, { key: "y", repeat: true });
     expect(clipboard.writeText).toHaveBeenCalledTimes(1);
     fireEvent.keyUp(root, { key: "y" });
-    // Released and pressed again: an ordinary BROWSE `y` now, copying the row.
+    // Released and pressed twice: BROWSE yy copies the row.
+    fireEvent.keyDown(root, { key: "y" });
     fireEvent.keyDown(root, { key: "y" });
     expect(clipboard.writeText).toHaveBeenCalledTimes(2);
     expect(clipboard.writeText).toHaveBeenLastCalledWith("hello world");
@@ -15347,24 +15359,24 @@ describe("typing in BROWSE never starts INPUT mid-word", () => {
     expect(modeOf(container)).toBe("input");
   });
 
-  it("y, then i and w within 250 ms: the copy happened, nothing else does, and the band says how to type", () => {
+  it("y, then i and w within 250 ms refuses the caret object and copies nothing", () => {
     const clipboard = stubClipboard();
     const { container } = startedWithRows();
     wait(1000);
     press("y");
-    expect(clipboard.writeText).toHaveBeenCalledTimes(1);
+    expect(clipboard.writeText).toHaveBeenCalledTimes(0);
     wait(60);
     press("i");
     wait(60);
     press("w");
     expect(modeOf(container)).toBe("browse");
     expect(container.querySelector("textarea")).toBeNull();
-    expect(clipboard.writeText).toHaveBeenCalledTimes(1);
-    expect(band(container)).toBe(HINT);
+    expect(clipboard.writeText).toHaveBeenCalledTimes(0);
+    expect(band(container)).toBe("iw: needs the caret — v, then move, then y");
   });
 
-  it("y, then any other key within 250 ms does nothing: j does not move the cursor", () => {
-    stubClipboard();
+  it("yk copies through the previous row within 250 ms without moving the cursor", () => {
+    const clipboard = stubClipboard();
     const { container } = startedWithRows();
     wait(1000);
     press("k");
@@ -15374,37 +15386,35 @@ describe("typing in BROWSE never starts INPUT mid-word", () => {
     wait(80);
     press("k");
     expect(container.querySelector(".row-current")!.textContent).toBe(before);
-    expect(band(container)).toBe(HINT);
+    expect(clipboard.writeText).toHaveBeenCalledTimes(1);
     // Past the window the same key moves again.
     wait(400);
     press("k");
     expect(container.querySelector(".row-current")!.textContent).not.toBe(before);
   });
 
-  it("a lone i 300 ms after a y enters INPUT", () => {
+  it("a lone i after yy enters INPUT", () => {
     stubClipboard();
     const { container } = startedWithRows();
     wait(1000);
+    press("y");
     press("y");
     wait(300);
     press("i");
     expect(modeOf(container)).toBe("input");
   });
 
-  // The post-`y` window has to hold ahead of the handlers that used
-  // to run before it -- the document-capture Shift+Tab router and the focused-control early return.
-  it("y then Shift+Tab within 250 ms cycles nothing and says how to type; after a pause it cycles", () => {
+  // Shift+Tab cancels the operator in capture; focused controls claim its pending Enter/Space.
+  it("y then Shift+Tab drops the operator and cycles the mode", () => {
     stubClipboard();
     const { container } = startedWithRows();
     wait(1000);
     press("y");
     wait(60);
     press("Tab", { shiftKey: true });
-    expect(posted.filter((m) => m.type === "cycle_mode")).toHaveLength(0);
-    expect(band(container)).toBe(HINT);
-    wait(TYPING_GUARD_MS + 50);
-    press("Tab", { shiftKey: true });
     expect(posted.filter((m) => m.type === "cycle_mode")).toHaveLength(1);
+    press("y");
+    expect(container.querySelector("textarea")).toBeNull();
   });
 
   it.each(["Enter", " "])(
@@ -15420,14 +15430,14 @@ describe("typing in BROWSE never starts INPUT mid-word", () => {
       wait(60);
       // `fireEvent` returns false when the handler called preventDefault, which is what stops a real
       // browser from clicking the button.
-      expect(fireEvent.keyDown(tabButton, { key }), "claimed inside the burst").toBe(false);
-      expect(band(container)).toBe(HINT);
+      expect(fireEvent.keyDown(tabButton, { key }), "claimed by the operator").toBe(false);
+      expect(band(container)).not.toBe(HINT);
       wait(TYPING_GUARD_MS + 50);
       expect(fireEvent.keyDown(tabButton, { key }), "left native after the pause").toBe(true);
     },
   );
 
-  it("a bare Shift after y is not a key: y, Shift, A is swallowed as one burst, not skipped past", () => {
+  it("a bare Shift preserves y; the unbound A then cancels the operator", () => {
     stubClipboard();
     const { container } = startedWithRows();
     wait(1000);

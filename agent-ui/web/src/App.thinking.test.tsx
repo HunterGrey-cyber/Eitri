@@ -146,6 +146,8 @@ describe("thinking in the conversation", () => {
     key("j");
     expect(current(container)!.classList.contains("row-thinking")).toBe(true);
     key("y");
+    expect(clipboard.writeText).not.toHaveBeenCalled();
+    key("y");
     expect(clipboard.writeText).toHaveBeenCalledWith(THOUGHT);
   });
 

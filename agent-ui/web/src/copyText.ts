@@ -5,7 +5,7 @@ import { formatResultContent } from "./toolRegistry";
 
 const PATH_TOOLS = new Set(["Read", "Edit", "Write", "NotebookEdit"]);
 
-function toolPrimary(name: string, input: unknown): string {
+export function toolPrimary(name: string, input: unknown): string {
   const fields = input && typeof input === "object" ? (input as Record<string, unknown>) : {};
   if (name === "Bash" && typeof fields.command === "string") return fields.command;
   if (PATH_TOOLS.has(name) && typeof fields.file_path === "string") return fields.file_path;

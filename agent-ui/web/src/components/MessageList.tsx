@@ -27,6 +27,7 @@ import type { PathRef } from "../paths";
 import { CursorBand, type BandBox } from "../cursorBand";
 import { conversationRows, stopOf } from "../nav";
 import { captureAnchor, restoreAnchor, type ViewAnchor } from "../viewAnchor";
+import { firstRowBelow, headerBand, headerCount, headerPrompt, headerText, PROMPT_HEADER_CLASS, type HeaderPrompt } from "../promptHeader";
 
 type Props = {
   /** The conversation's identity: row keys can be shared by different tabs. */
@@ -102,6 +103,9 @@ type Props = {
    *  caller (the band's `unread` fact) is expected to just hold the latest value, the same way
    *  `pill`/`setPill` already do internally. */
   onUnreadChange?: (label: string | null, jump: () => void, afterSeq: number | null) => void;
+  /** A click on the pinned prompt header (`../promptHeader`): go to the prompt row it names, by its key. Absent, the
+   *  header is drawn and a click on it does nothing. */
+  onPromptJump?: (key: string) => void;
   /** Seeds the unread threshold back in on a tab switch: a tab switch reuses this
    *  component, so without this the first `updatePill` after a restore falls back to counting from
    *  the CURRENT timeline length, and a row that arrived while the tab was away is never counted --
@@ -289,6 +293,7 @@ export function MessageList({
   cardMode = null,
   onOpenPath,
   onUnreadChange,
+  onPromptJump,
   unseenSeed,
   visual = null,
   touch = false,
@@ -511,6 +516,23 @@ export function MessageList({
     noteUserScroll(list, "down");
     list.scrollTop = list.scrollHeight;
   };
+  /** The pinned prompt header (`../promptHeader`), and the width of the list's scrollbar it stops short of, so the
+   *  scrollbar's top stays where a pointer can take it. `null` while no prompt is named. */
+  const [header, setHeader] = useState<{ prompt: HeaderPrompt; gutter: number } | null>(null);
+  /** Re-decides the header from the first row on screen; beside every `updatePill`, and on its own after the rows
+   *  change. Nothing is measured while the view follows the newest row, nor on the phone's page. */
+  const updateHeader = () => {
+    const list = listRef.current;
+    const following = followingRef.current;
+    const prompt = list === null || touchRef.current || following ? null : headerPrompt(timeline, firstRowOnScreen(list), following);
+    const gutter = list === null || prompt === null ? 0 : Math.max(0, list.offsetWidth - list.clientWidth);
+    setHeader((held) => {
+      if (prompt === null) return null;
+      if (held !== null && held.gutter === gutter && held.prompt.index === prompt.index &&
+        held.prompt.ordinal === prompt.ordinal && held.prompt.total === prompt.total) return held;
+      return { prompt, gutter };
+    });
+  };
   /** Run before each follow decision, and when a gesture's window runs out: a provisional stop whose
    *  gesture is over, with the list no higher than where the gesture found it, is taken back.
    *  Returns the stop it took back, `null` if none. */
@@ -616,6 +638,7 @@ export function MessageList({
     if (followingRef.current) anchorRef.current = null;
     else if (moved && !holding) recordAnchor();
     updatePill();
+    updateHeader();
   };
   onScrollRef.current = onScroll;
 
@@ -770,6 +793,7 @@ export function MessageList({
     observeChildren(list);
     if (followingRef.current) follow(list);
     updatePill();
+    updateHeader();
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [state]);
   // After the follow: a list that does not fill the view has reached its top already.
@@ -785,6 +809,8 @@ export function MessageList({
   useLayoutEffect(() => {
     const list = listRef.current;
     if (list !== null) observeChildren(list);
+    // The header names its prompt by index: a run opened or closed above it moves every index.
+    updateHeader();
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [timeline]);
 
@@ -810,6 +836,7 @@ export function MessageList({
     followingRef.current = false;
     unseenAfterSeqRef.current = unseenSeed.afterSeq;
     updatePill();
+    updateHeader();
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [unseenSeed?.tick]);
 
@@ -892,6 +919,7 @@ export function MessageList({
   /** Each row's element, kept with the values it was made from: the same element back tells React the row has not
    *  changed, so a batch does not look at a finished row's props. By item, which outlives no row. */
   const heldRows = useRef(new WeakMap<TimelineItem, HeldRow>()).current;
+  const headerItem = header === null ? undefined : timeline[header.prompt.index];
 
   return (
     <>
@@ -1013,8 +1041,38 @@ export function MessageList({
         {/* VISUAL and V-LINE's selection (`../visualPaint`), over the rows. */}
         {!touch && <div className="visual-paint" aria-hidden="true" ref={paintElRef} />}
       </div>
+      {/* The prompt the reader is under, over the top of the list while it is scrolled up (`../promptHeader`).
+          The list's sibling, never one of its children: it takes no room in the list, so nothing moves when it
+          comes or goes, and no row walk, copy or HINT ever sees it. Pointer only: it takes no focus (the
+          mousedown that would move focus or start a selection is cancelled), and the keys reach that prompt
+          by `[[`. Chrome, so hidden from assistive technology like the cursor band: the row it names is read
+          there. */}
+      {headerItem !== undefined && headerItem.kind === "prompt" && header !== null && (
+        <div
+          className={PROMPT_HEADER_CLASS}
+          aria-hidden="true"
+          style={header.gutter > 0 ? { right: header.gutter } : undefined}
+          onMouseDown={(event) => event.preventDefault()}
+          onClick={() => onPromptJump?.(headerItem.key)}
+        >
+          <span className="prompt-header-text">{headerText(headerItem.text)}</span>
+          <span className="prompt-header-count">{headerCount(header.prompt)}</span>
+        </div>
+      )}
     </>
   );
+}
+
+/** The index of the first conversation row on screen in `list` -- the first whose bottom is below the top of what
+ *  shows and whose top is above the list's bottom -- or `-1` with none, or no layout to judge (jsdom, a list not
+ *  laid out yet). The top of what shows is the list's top plus the header's height, whether or not the header is
+ *  drawn at the moment (`headerBand`): were it measured from where the header happens to be, a row ending inside
+ *  the band would be the top row while the header is hidden and a different one once it is shown, and the header
+ *  would flip with every scroll event. */
+function firstRowOnScreen(list: HTMLElement): number {
+  const l = list.getBoundingClientRect();
+  if (!(l.bottom - l.top > 0)) return -1;
+  return firstRowBelow(conversationRows(list), l.top + headerBand(list), l.bottom);
 }
 
 type RowHandlers = {

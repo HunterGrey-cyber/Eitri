@@ -298,6 +298,8 @@ describe.each([
     dispatch({ kind: "hint_land", sessionId: 1, index });
     expect(cursorRow(container)?.contains(code)).toBe(true);
     press("y");
+    expect(clipboard.writeText).not.toHaveBeenCalled();
+    press("y");
     expect(clipboard.writeText).toHaveBeenLastCalledWith("ls -la");
   });
 });
@@ -365,6 +367,8 @@ describe("y copies what is shown", () => {
     dispatch({ kind: "hint_collect", sessionId: 1 });
     dispatch({ kind: "hint_land", sessionId: 1, index });
     press("y");
+    expect(clipboard.writeText).not.toHaveBeenCalled();
+    press("y");
     expect(clipboard.writeText).toHaveBeenLastCalledWith("pip install requests");
   });
 
@@ -385,6 +389,8 @@ describe("y copies what is shown", () => {
     const target = hintTargets(root(container)).findIndex((t) => t.el === row);
     expect(index).toBeGreaterThanOrEqual(0);
     dispatch({ kind: "hint_land", sessionId: 1, index: target });
+    press("y");
+    expect(clipboard.writeText).not.toHaveBeenCalled();
     press("y");
     const copiedText = clipboard.writeText.mock.calls.at(-1)![0] as string;
     expect(copiedText).toContain("visible words");

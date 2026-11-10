@@ -98,3 +98,56 @@ it("walks a visible row once per placement pass for all its targets, and skips o
   expect(walker).not.toHaveBeenCalled();
   expect(view.container.querySelectorAll(".hint-path")).toHaveLength(0);
 });
+
+/* The pinned prompt header covers the list's top 24px (`../promptHeader`): a target under it is not on screen, so it
+   gets no label (a `gf` path then goes to the picker's footer, `PathPick`, through `onPlaced`), and a label on a
+   target partly under it is clamped below it. */
+describe("labels and the pinned prompt header", () => {
+  function covered(header: boolean, pathRect: DOMRect) {
+    const root = document.createElement("div");
+    root.innerHTML =
+      '<div class="message-list"><div data-nav-stop="row" data-row-key="m-1">see a/b.rs <pre class="code-block">x</pre></div></div>' +
+      (header ? '<div class="prompt-header"></div>' : "");
+    document.body.append(root);
+    const list = root.querySelector<HTMLElement>(".message-list")!;
+    const row = list.firstElementChild as HTMLElement;
+    const block = row.querySelector<HTMLElement>("pre")!;
+    root.getBoundingClientRect = () => rect(0, 0, 200, 200);
+    list.getBoundingClientRect = () => rect(30, 10, 100, 100);
+    row.getBoundingClientRect = () => rect(0, 10, 100, 200);
+    block.getBoundingClientRect = () => rect(34, 10, 100, 16);
+    const bar = root.querySelector<HTMLElement>(".prompt-header");
+    if (bar !== null) bar.getBoundingClientRect = () => rect(30, 10, 100, 24);
+    const createRange = document.createRange.bind(document);
+    vi.spyOn(document, "createRange").mockImplementation(() => {
+      const range = createRange();
+      range.getClientRects = () => [pathRect] as unknown as DOMRectList;
+      return range;
+    });
+    const hints: ShownHint[] = [
+      { target: { kind: "path", rowKey: "m-1", start: 4, end: 10, text: "a/b.rs" }, label: "a" },
+      { target: { kind: "code", el: block, rowIndex: 0 }, label: "s" },
+    ];
+    const onPlaced = vi.fn();
+    const view = render(<HintLayer root={root} hints={hints} typed="" onPlaced={onPlaced} />);
+    return { ...view, onPlaced };
+  }
+
+  it("labels a path and a code block on the list's top lines while no header is shown", () => {
+    const { container, onPlaced } = covered(false, rect(32, 20, 60, 20));
+    expect(container.querySelector<HTMLElement>(".hint-path")?.style.top).toBe("32px");
+    expect(container.querySelector(".hint-code")).not.toBeNull();
+    expect(onPlaced).toHaveBeenLastCalledWith(["a", "s"]);
+  });
+
+  it("gives no label to targets wholly under the header, and reports them unplaced for the gf footer", () => {
+    const { container, onPlaced } = covered(true, rect(32, 20, 60, 20));
+    expect(container.querySelector(".hint-label")).toBeNull();
+    expect(onPlaced).toHaveBeenLastCalledWith([]);
+  });
+
+  it("clamps the label of a path partly under the header to just below it", () => {
+    const { container } = covered(true, rect(44, 20, 60, 20));
+    expect(container.querySelector<HTMLElement>(".hint-path")?.style.top).toBe("54px");
+  });
+});

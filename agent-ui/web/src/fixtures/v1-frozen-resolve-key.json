@@ -129,13 +129,21 @@
   {
     "label": "y",
     "expected": {
-      "kind": "copy"
+      "kind": "operator",
+      "op": {
+        "op": "y",
+        "count": null,
+        "scope": null,
+        "prefix": null
+      }
     }
   },
   {
     "label": "Shift+Y",
     "expected": {
-      "kind": "copy-output"
+      "kind": "yank",
+      "what": "rows",
+      "count": 1
     }
   },
   {

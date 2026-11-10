@@ -64,7 +64,7 @@ const ARRIVAL = "\u0000arrival";
  *  tab's `j`/`k`, and Tab), so the leader or Enter/Space on Stop at the end of a run made only of
  *  them is a quick motion, not prose (`mayActAfterMotion`). Shift+Tab arrives as `Tab` (the caller
  *  normalizes WebKitGTK's `Unidentified`/`code: "Tab"` shape to it). */
-const MOTION_KEYS = new Set(["h", "j", "k", "l", "g", "G", "Tab", "ArrowUp", "ArrowDown"]);
+export const DEFAULT_MOTION_KEYS: ReadonlySet<string> = new Set(["h", "j", "k", "l", "g", "G", "Tab", "ArrowUp", "ArrowDown"]);
 
 /** Bare modifiers are not "a key": holding Shift or Ctrl is not typing. `key` values from the
  *  UI Events KeyboardEvent key list's modifier section. */
@@ -163,12 +163,19 @@ type Pending = {
 };
 
 export class TypingGuard {
+  private motionKeys: ReadonlySet<string> = DEFAULT_MOTION_KEYS;
+
+  /** Change the effective motion keys without resetting the run, arming or waiting action. */
+  setMotionKeys(keys: ReadonlySet<string>): void {
+    this.motionKeys = new Set(keys);
+  }
+
   /** The key `onKey` recorded last -- the one being handled right now. */
   private latest: Keydown | null = null;
   /** The key before it: what `mayAnswerNow`/`defer` judge the current key against. */
   private previous: Keydown | null = null;
   /** Whether every key of the unbroken run ending at `latest` -- going back while each key came
-   *  within the window of the next -- is a motion key (`MOTION_KEYS`). */
+   *  within the window of the next -- is a motion key (`motionKeys`). */
   private latestRunIsMotion = false;
   /** The same, for the run ending at `previous`: what `mayActAfterMotion` asks. */
   private previousRunIsMotion = false;
@@ -254,7 +261,7 @@ export class TypingGuard {
     this.recorded += 1;
     const continuesRun = this.latest !== null && t - this.latest.t < TYPING_GUARD_MS;
     this.previousRunIsMotion = this.latestRunIsMotion;
-    this.latestRunIsMotion = MOTION_KEYS.has(key) && (!continuesRun || this.previousRunIsMotion);
+    this.latestRunIsMotion = this.motionKeys.has(key) && (!continuesRun || this.previousRunIsMotion);
     this.previous = this.latest;
     this.latest = { key, t };
     return this.drop();

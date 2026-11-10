@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
 import { FIXED_PAIRS } from "./keymap";
-import { advanceSequence, boxEntries, FIXED_PENDING_ENTRIES, sequenceTitle, startSequence } from "./leader";
+import { advanceSequence, boxEntries, FIXED_PENDING_ENTRIES, pendingEntries, YANK_PENDING_ENTRIES, sequenceTitle, startSequence } from "./leader";
 import { binding as b, TABLE } from "./testFixtures";
 
 /* `resolveKey` completes a prefix from `FIXED_PAIRS`, and the which-key
@@ -40,20 +40,30 @@ describe("the box after g / z / [ / ] / Ctrl+w", () => {
       ["f", "open path"],
       ["x", "open link"],
       ["?", "this list"],
+      ["y", "copy code block"],
       ["d", "go to definition"],
     ]);
   });
 
   /* What the box says after a bracket -- the prompt pair, then the reserved `]p` / `[p`, drawn disabled and
-     pointing to card mode's chords. Listed in this order: the box shows a prefix's pairs in table order. */
-  it("names the ]p and [p pairs after the prompt pairs, as pointers to Alt-n / Alt-p", () => {
+     pointing to card mode's chords, then the structural jumps. Listed in this order: the box shows a prefix's pairs in
+     table order. */
+  it("names the ]p and [p pairs after the prompt pairs, as pointers to Alt-n / Alt-p, then the structural jumps", () => {
     expect(FIXED_PENDING_ENTRIES["]"].map((e) => [e.key, e.label, e.disabled])).toEqual([
       ["]", "next prompt", false],
       ["p", "cards: Alt-n now", true],
+      ["t", "next tool call", false],
+      ["c", "next hunk", false],
+      ["d", "next error", false],
+      ["m", "next edit", false],
     ]);
     expect(FIXED_PENDING_ENTRIES["["].map((e) => [e.key, e.label, e.disabled])).toEqual([
       ["[", "previous prompt", false],
       ["p", "cards: Alt-p now", true],
+      ["t", "previous tool call", false],
+      ["c", "previous hunk", false],
+      ["d", "previous error", false],
+      ["m", "previous edit", false],
     ]);
   });
 
@@ -112,5 +122,42 @@ describe("the sequence engine (modelled on which-key's state.lua)", () => {
     // over the NEW table must not run an old binding.
     const fresh = { ...TABLE, bindings: TABLE.bindings.filter((x) => x.action !== "tab.close") };
     expect(advanceSequence(fresh, ["<leader>", "b"], "d").kind).toBe("cancel");
+  });
+});
+
+it("the y box lists exactly the object and motion grammar", () => {
+  expect(YANK_PENDING_ENTRIES.map((e) => e.key)).toEqual(["y", "im", "am", "io", "ao", "ic", "ac", "i`", "a`", "if", "af", "ih", "ah", "j", "k", "ArrowDown", "ArrowUp", "{", "}", "G", "gg", "[[", "]]"]);
+  expect(YANK_PENDING_ENTRIES.every((e) => e.label && !e.group && !e.disabled)).toBe(true);
+});
+
+describe("motion rows belong to resolveKey", () => {
+  const motions = {
+    ...TABLE,
+    bindings: [
+      ...TABLE.bindings,
+      b(["j"], "line.down"), b(["]", "t"], "tool.prev"),
+      // Defensive filtering: even an invalid leader motion never becomes a sequence node.
+      b(["<leader>", "x"], "top"),
+    ],
+  };
+  it("never starts or advances a motion row and never shows one in which-key", () => {
+    expect(startSequence(motions, "j", false)).toEqual({ kind: "none" });
+    expect(startSequence(motions, "]", false)).toEqual({ kind: "none" });
+    expect(advanceSequence(motions, ["<leader>"], "x")).toEqual({ kind: "cancel" });
+    expect(boxEntries(motions, [], false).some((entry) => entry.key === "j")).toBe(false);
+    expect(boxEntries(motions, ["]"], false).some((entry) => entry.key === "t")).toBe(false);
+    expect(boxEntries(motions, ["<leader>"], false).some((entry) => entry.key === "x")).toBe(false);
+    expect(startSequence(motions, "L", false)).toEqual({ kind: "run", binding: TABLE.bindings[1] });
+  });
+  it("the effective table leaves the leader available alongside motions", () => {
+    // The host drops a motion on the effective leader before sending the table.
+    expect(startSequence(motions, " ", false)).toEqual({ kind: "pending", typed: ["<leader>"], ambiguous: null });
+  });
+  it("the pending box replaces rebound pairs and lists new motion pairs", () => {
+    const table = { ...motions, bindings: [...motions.bindings, b(["g", "j"], "row.down")] };
+    const tool = pendingEntries(table, "]", false).filter((entry) => entry.key === "t");
+    expect(tool).toEqual([{ key: "t", label: "tool.prev", group: false, disabled: false }]);
+    expect(pendingEntries(table, "g", false)).toContainEqual({ key: "j", label: "row.down", group: false, disabled: false });
+    expect(pendingEntries(TABLE, "]", false)).toEqual([...FIXED_PENDING_ENTRIES["]"], ...boxEntries(TABLE, ["]"], false)]);
   });
 });

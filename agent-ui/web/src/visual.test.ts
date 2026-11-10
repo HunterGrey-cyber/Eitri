@@ -14,6 +14,7 @@ import {
   runMotion,
   stepOnce,
   swapEnds,
+  visibleBand,
   VISUAL_CHROME,
   type Caret,
   type CharMotion,
@@ -876,6 +877,76 @@ describe("visual.ts: revealCaret, the least scroll", () => {
       scroll.box = 110; // caret at 40..50, inside the box (20..60) and the list
       expect(revealCaret(caret, list)).toBe(false);
       expect(scroll).toEqual({ list: 0, box: 110 });
+    } finally {
+      restore();
+    }
+  });
+});
+
+describe("visual.ts: the pinned prompt header covers the top of the list", () => {
+  /** A list at 0..100 with a header sibling over its first 24px, and a caret 10..20px from the top. */
+  function underHeader(headerShown = true) {
+    const parent = document.createElement("div");
+    const list = document.createElement("div");
+    const text = document.createTextNode("line");
+    list.appendChild(text);
+    parent.appendChild(list);
+    document.body.appendChild(parent);
+    list.style.overflowY = "auto";
+    Object.defineProperty(list, "scrollHeight", { value: 1000 });
+    Object.defineProperty(list, "clientHeight", { value: 100 });
+    let scrollTop = 50;
+    Object.defineProperty(list, "scrollTop", { get: () => scrollTop, set: (v: number) => (scrollTop = v) });
+    list.getBoundingClientRect = () => ({ top: 0, bottom: 100, left: 0, right: 100 }) as DOMRect;
+    if (headerShown) {
+      const header = document.createElement("div");
+      header.className = "prompt-header";
+      header.getBoundingClientRect = () => ({ top: 0, bottom: 24 }) as DOMRect;
+      parent.appendChild(header);
+    }
+    const proto = Range.prototype as unknown as { getClientRects?: () => DOMRect[] };
+    const original = proto.getClientRects;
+    proto.getClientRects = () => {
+      const top = 60 - scrollTop; // the caret sits 60px down the content
+      return [{ top, bottom: top + 10, left: 5, right: 5, width: 0, height: 10, x: 5, y: top, toJSON() {} } as DOMRect];
+    };
+    return {
+      list,
+      caret: textCaret(text, 0),
+      scroll: () => scrollTop,
+      restore() {
+        if (original === undefined) delete proto.getClientRects;
+        else proto.getClientRects = original;
+        parent.remove();
+      },
+    };
+  }
+
+  it("revealCaret brings a caret under the header out from under it", () => {
+    const { list, caret, scroll, restore } = underHeader();
+    try {
+      // Caret at 10..20, under the 24px header though inside the list: it goes to the header's bottom edge.
+      expect(revealCaret(caret, list)).toBe(true);
+      expect(scroll()).toBe(36);
+    } finally {
+      restore();
+    }
+  });
+
+  it("revealCaret leaves that caret alone while no header is drawn", () => {
+    const { list, caret, scroll, restore } = underHeader(false);
+    try {
+      expect(revealCaret(caret, list)).toBe(false);
+      expect(scroll()).toBe(50);
+    } finally {
+      restore();
+    }
+  });
+
+  it("the band the line probe stays inside starts below the header", () => {
+    const { list, restore } = underHeader();
+    try {
+      expect(visibleBand(list).top).toBe(24);
     } finally {
       restore();
     }

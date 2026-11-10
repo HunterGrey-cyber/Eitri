@@ -325,3 +325,47 @@ describe("a late frame", () => {
     expect(m.state.scrollTop - before.scrollTop).toBeLessThanOrEqual(speed * 34 + 1);
   });
 });
+
+describe("under the pinned prompt header", () => {
+  const INSET = 24;
+  const insetMotion = (input: { rows: Span[]; cursor: number; scrollTop: number; direction: Direction }) =>
+    new HoldMotion({
+      direction: input.direction,
+      rows: input.rows,
+      cursor: input.cursor,
+      view: { scrollTop: input.scrollTop, height: HEIGHT, maxScrollTop: total(input.rows) - HEIGHT, inset: INSET },
+      line: LINE,
+      speed: holdSpeed(LINE, DEFAULT_REPEAT_MS),
+      now: 0,
+    });
+
+  it("puts the reading line within the part of the view below the header", () => {
+    const rows = stack(MIXED);
+    const down = insetMotion({ rows, cursor: 2, scrollTop: 0, direction: 1 });
+    expect(down.state.y).toBeCloseTo(INSET + (HEIGHT - INSET) * READING_LINE, 6);
+    const up = insetMotion({ rows, cursor: 2, scrollTop: 1000, direction: -1 });
+    expect(up.state.y).toBeCloseTo(1000 + INSET + (HEIGHT - INSET) * (1 - READING_LINE), 6);
+  });
+
+  it("keeps a line gliding up out from under the header's band", () => {
+    const rows = stack(MIXED);
+    const m = insetMotion({ rows, cursor: 2, scrollTop: 1000, direction: -1 });
+    // A line that has been left near the top of the view (a late frame) is brought back below header and margin.
+    m.rebase(rows, { scrollTop: 1500, height: HEIGHT, maxScrollTop: total(rows) - HEIGHT, inset: INSET }, 2);
+    for (let t = 16; t <= 400; t += 16) {
+      m.advance(t);
+      expect(m.state.y).toBeGreaterThanOrEqual(m.state.scrollTop + INSET + 2 * LINE - 1e-6);
+    }
+  });
+
+  it("comes to rest with the cursor's row below the header's margin, not the list's", () => {
+    // A 40px row whose top sits 10px below the view's top: under the header. Released going up, it is brought
+    // in with a margin below the header (scrollTop 46), where the list's own top would have said 70.
+    const rows: Span[] = [{ top: 0, bottom: 110 }, { top: 110, bottom: 150 }, { top: 150, bottom: 2000 }];
+    const view = { scrollTop: 100, height: HEIGHT, maxScrollTop: 2000 - HEIGHT };
+    const withHeader = new HoldMotion({ direction: -1, rows, cursor: 1, view: { ...view, inset: INSET }, line: LINE, speed: 1, now: 0 });
+    const without = new HoldMotion({ direction: -1, rows, cursor: 1, view, line: LINE, speed: 1, now: 0 });
+    expect(withHeader.release().target).toBe(46);
+    expect(without.release().target).toBe(70);
+  });
+});

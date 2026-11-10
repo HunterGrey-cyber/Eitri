@@ -1,6 +1,6 @@
 import { forwardRef, useLayoutEffect, useRef } from "react";
 import type { Ref } from "react";
-import { browseKeys, CARD_KEYS, CARET_KEYS, INPUT_KEYS, QUESTION_KEYS, REVIEW_KEYS, TASKS_KEYS, VISUAL_KEYS } from "../keymap";
+import { isPanelCommand, browseKeys, CARD_KEYS, CARET_KEYS, INPUT_KEYS, QUESTION_KEYS, REVIEW_KEYS, TASKS_KEYS, VISUAL_KEYS } from "../keymap";
 import type { KeyHelp, PanelBinding, PanelTable, PluginKeysHelp } from "../keymap";
 import { sequenceTitle } from "../leader";
 import { listedSlashCommands } from "../slashCommands";
@@ -127,6 +127,23 @@ function Section({ title, rows, note, headingRef }: { title: string; rows: KeyHe
   );
 }
 
+/** Keep unclaimed built-in keys and add the user bindings for a named motion. */
+function effectiveRow(row: KeyHelp, panel: PanelTable): KeyHelp {
+  if (row.motion === undefined) return row;
+  const keys = row.keys.split(" / ").filter((key) => {
+    const tokens = key.length === 2 ? Array.from(key) : [key];
+    return !panel.bindings.some((b) => b.action !== row.motion && b.keys.length === tokens.length
+      && b.keys.every((token, i) => token === tokens[i]));
+  });
+  for (const binding of panel.bindings) {
+    if (binding.action !== row.motion) continue;
+    const key = binding.keys.length === 2 && ["g", "z", "[", "]"].includes(binding.keys[0])
+      ? binding.keys.join("") : sequenceTitle(panel, binding.keys);
+    if (!keys.some((existing) => existing === key || existing === binding.keys.join(""))) keys.push(key);
+  }
+  return { ...row, keys: keys.join(" / ") || "Unbound" };
+}
+
 /** What the first line says about the panel's leader, by `PanelTable.leaderSource`: the fallback to Space is a fact
  *  worth a person reading, not a silent default. */
 function leaderSourceNote(source: PanelTable["leaderSource"]): string {
@@ -164,7 +181,7 @@ function LeaderAndTabKeys({ panel }: { panel: PanelTable }) {
       </p>
       <table>
         <tbody>
-          {panel.bindings.map((binding) => (
+          {panel.bindings.filter(isPanelCommand).map((binding) => (
             <tr key={binding.keys.join(" ")}>
               <td>
                 <kbd className="keycap">{sequenceTitle(panel, binding.keys)}</kbd>
@@ -327,7 +344,7 @@ export const KeymapOverlay = forwardRef<HTMLDivElement, Props>(function KeymapOv
       <Section
         title="This panel"
         headingRef={browseHeading}
-        rows={[...browseKeys(prefixLabel), { keys: "Ctrl+j", what: "Type (the box below)" }]}
+        rows={[...browseKeys(prefixLabel).map((row) => effectiveRow(row, panel)), { keys: "Ctrl+j", what: "Type (the box below)" }]}
         note={`Ctrl+[ is Esc everywhere in this panel. Modes (Shift+Tab): ${modes
           .map((mode) => `${mode} — ${modeConsequence(mode, agent, prefixLabel)}`)
           .join(" ")}`}

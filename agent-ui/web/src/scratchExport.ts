@@ -3,6 +3,7 @@ import { outputText } from "./copyText";
 import { fenced, pathsIn } from "./paths";
 import { noticeText, wakeText, type TimelineItem } from "./timeline";
 import { turnEndingText } from "./turnEnding";
+import { toolInput } from "./yank";
 import type { HistoryNotice, SubagentStream, ToolCallRecord } from "./types";
 
 const MAX_CHARACTERS = 1_000_000;
@@ -13,17 +14,6 @@ type ExportOptions = {
   /** Answered cards remain drawn until the host resolves them; the timeline itself holds only requests. */
   cardStates?: ReadonlyMap<string, CardState>;
 };
-
-function toolInput(name: string, input: unknown): string {
-  const fields = input && typeof input === "object" ? input as Record<string, unknown> : {};
-  const field = name === "Bash" ? "command"
-    : ["Read", "Edit", "Write"].includes(name) ? "file_path"
-    : name === "NotebookEdit" ? "notebook_path"
-    : ["Grep", "Glob"].includes(name) ? "pattern"
-    : name === "WebFetch" ? "url"
-    : name === "WebSearch" ? "query" : null;
-  return field !== null && typeof fields[field] === "string" ? fields[field] as string : JSON.stringify(input) ?? "";
-}
 
 /** Only headings written by the exporter carry a literal prompt marker in the editor buffer.
  *  Encode every occurrence in supplied text, regardless of its Markdown context. */

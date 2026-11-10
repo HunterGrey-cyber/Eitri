@@ -1,6 +1,7 @@
 import { classify as classifyGd, expectedName, validName, wordAt } from "./gdTarget";
 import type { Cited, GdTarget } from "./gdTarget";
 import type { EditorSymbolResult } from "./bridge";
+import { editDiffOf, editPreviewsOf, hunksOf } from "./hunks";
 import { back, emptyJumplist, forward, landingIndex, recordJump } from "./jumplist";
 import type { JumpPos, Jumplist } from "./jumplist";
 import { SessionEndedBanner } from "./components/SessionEndedBanner";
@@ -61,6 +62,7 @@ import {
   applyViewScroll,
 } from "./app/rowScroll";
 import type { FrozenSnapshot, ArrivalPark } from "./app/rowScroll";
+import { landingInset } from "./promptHeader";
 import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState, useSyncExternalStore } from "react";
 import type { KeyboardEvent, SetStateAction } from "react";
 import { ProjectDirContext } from "./projectPath";
@@ -77,9 +79,9 @@ import {
   settleListScroll,
 } from "./jkScroll";
 import { cancelHold, isHolding, keepHoldAlive, releaseHold, startHold } from "./jkHold";
-import { cardModeDelta, isPlainAnswerKey, panelEntryKey, pluginKeysHelp, resolveKey } from "./keymap";
-import type { KeyLike, PanelBinding, PanelMode, PendingPrefix, PluginKeysHelp } from "./keymap";
-import { advanceSequence, boxEntries, FIXED_PENDING_ENTRIES, sequenceTitle, startSequence, WHICH_KEY_DELAY_MS } from "./leader";
+import { cardModeDelta, isPanelCommand, isPanelMotion, isPlainAnswerKey, panelEntryKey, pluginKeysHelp, resolveKey } from "./keymap";
+import type { KeyLike, PanelCommandBinding, PanelMode, PendingPrefix, PluginKeysHelp, YankOperator } from "./keymap";
+import { advanceSequence, boxEntries, pendingEntries, YANK_PENDING_ENTRIES, sequenceTitle, startSequence, WHICH_KEY_DELAY_MS } from "./leader";
 import type { BoxEntry, SeqStep } from "./leader";
 import { isImeKey } from "./composerKeys";
 import { afterPaint } from "./afterPaint";
@@ -98,7 +100,7 @@ import {
 } from "./cardMode";
 import type { CardKey, CardModeState, CardOffer, CardOrigin, CardRef, KeyAnswerProof, PointerAnswerProof } from "./cardMode";
 import { bypassYesCounts, isModeCycleKey, isShiftTab, KeyClock, modeFixedMessage, modeKeyRoute } from "./modeKey";
-import { heldKeyName, hintTypingFlash, isModifierKey, leaderTypingFlash, tableKeyTypingFlash, TYPE_HINT_FLASH, TYPING_GUARD_MS, TypingGuard } from "./typingGuard";
+import { DEFAULT_MOTION_KEYS, heldKeyName, hintTypingFlash, isModifierKey, leaderTypingFlash, tableKeyTypingFlash, TYPE_HINT_FLASH, TYPING_GUARD_MS, TypingGuard } from "./typingGuard";
 import {
   caretModelOf,
   compareCarets,
@@ -117,10 +119,11 @@ import { installCtrlBracketAsEscape } from "./ctrlBracket";
 import { installHeldSuperTracking } from "./heldSuper";
 import { WhichKeyBox } from "./components/WhichKeyBox";
 import { TurnChanges } from "./components/TurnChanges";
-import { allCards, buildTimeline, oldestPendingPermission, promptIndex, waitingCardAfter } from "./timeline";
+import { allCards, buildTimeline, oldestPendingPermission, nextStop, promptIndex, waitingCardAfter } from "./timeline";
 import { buildDisplay, indexOfKey, runKeyOf } from "./display";
-import { outputText, primaryText } from "./copyText";
-import { codeBlockText, renderedText } from "./markdown";
+import { toolInput, yankObject, yankRows } from "./yank";
+import { primaryText } from "./copyText";
+import { codeBlockLanguage, codeBlockText, renderedText } from "./markdown";
 import { countCodePoints } from "./toolRegistry";
 import { findMatch } from "./search";
 import { SearchBar } from "./components/SearchBar";
@@ -216,7 +219,7 @@ import { DRAFT_MIRROR_DELAY_MS, modePill, REFUSED_ECHO_MS, showTabBar } from "./
 import { liveTasks, shortModel, usageSegment } from "./band";
 import { NOTHING_TO_STOP, STOP_TURN_QUESTION, stopAskFor, stopTurnAnswer, workToStop, type StopWork } from "./stopAsk";
 import { latestTurnEnding } from "./turnEnding";
-import type { DetailRow, PermissionRequestRecord, TabId, TabsEnvelope } from "./types";
+import type { AgentUiState, DetailRow, PermissionRequestRecord, TabId, TabsEnvelope } from "./types";
 import { applyTheme } from "./theme";
 import { applyEditorTyping } from "./typingCadence";
 import { copyToPrimary } from "./primaryCopy";
@@ -713,6 +716,10 @@ export default function App() {
     return () => clearTimeout(timer);
   }, [yanked]);
   function copied(text: string, key: string | undefined) {
+    if (text === "") {
+      showFlash("nothing to copy");
+      return;
+    }
     void navigator.clipboard?.writeText(text);
     copyToPrimary(text);
     showFlash(`copied ${countCodePoints(text)} chars`);
@@ -841,6 +848,26 @@ export default function App() {
    *  in its context so the key table itself keeps no memory. (Formerly `pendingGRef`, a plain
    *  boolean, before `[[`/`]]` gave BROWSE a second prefix.) */
   const pendingRef = useRef<PendingPrefix | null>(null);
+  const operatorRef = useRef<YankOperator | null>(null);
+  // Row sequence keys repeat across sessions, so hunk choices belong to a tab and its current session.
+  const currentHunksRef = useRef(new Map<TabId, Map<string, number>>());
+  const currentHunkSessionsRef = useRef(new Map<TabId, AgentUiState["sessionId"]>());
+  const currentHunks = () => activeTabRef.current === null ? undefined : currentHunksRef.current.get(activeTabRef.current);
+  const [hunkLanding, setHunkLanding] = useState<{ key: string; hunk: number } | null>(null);
+  // Expansion renders the hunk anchors before the landing measures them. Multiple file previews
+  // number their own hunks; their DOM order matches the combined diff's hunk order.
+  useLayoutEffect(() => {
+    if (hunkLanding === null) return;
+    const root = containerRef.current;
+    const index = timelineRef.current.findIndex((item) => item.key === hunkLanding.key);
+    const row = root === null ? undefined : conversationRows(root)[index];
+    const anchor = row?.querySelectorAll<HTMLElement>("[data-hunk]")[hunkLanding.hunk];
+    const list = row?.closest<HTMLElement>(".message-list");
+    if (anchor && list) revealRow(list, anchor, 0, false, true);
+    setHunkLanding(null);
+  }, [hunkLanding]);
+
+  const [yankPick, setYankPick] = useState<{ entries: { label: string; text: string }[]; labels: string[]; typed: string; rowKey: string; targets: (HintTarget | null)[] } | null>(null);
   /** The count accumulated from `1`-`9` then `0`-`9`, applied to the next `j`/`k`/`[[`/`]]` --
    *  and to `G`, `gg`, `gt` and `gT` (a prefix hands it on to its second
    *  key) -- and reset by it (or by anything else that runs). `null` when no digit has been pressed
@@ -851,8 +878,8 @@ export default function App() {
    *  which is `resolveKey`'s five reserved two-key prefixes (`g`/`z`/`[`/`]`/`Ctrl+w`) and predates this
    *  plan. A ref for `onKeyDown` to read synchronously (the same reason `pendingRef` is one) mirrored
    *  into `seq` (state) so the box can render what it names. */
-  const seqRef = useRef<{ typed: string[]; ambiguous: PanelBinding | null } | null>(null);
-  const [seq, setSeq] = useState<{ typed: string[]; ambiguous: PanelBinding | null } | null>(null);
+  const seqRef = useRef<{ typed: string[]; ambiguous: PanelCommandBinding | null } | null>(null);
+  const [seq, setSeq] = useState<{ typed: string[]; ambiguous: PanelCommandBinding | null } | null>(null);
   /** Whether the which-key box is actually drawn, `WHICH_KEY_DELAY_MS` after whichever became
    *  pending first -- a leader/table sequence (`seqRef`) or one of `resolveKey`'s own reserved
    *  prefixes (`pendingRef`). A ref alongside the state for the same reason `boxShown`'s own timer
@@ -913,6 +940,8 @@ export default function App() {
    *  once, with the first render's closure, may call it. */
   function dropPendingKeys() {
     pendingRef.current = null;
+    operatorRef.current = null;
+    setYankPick(null);
     countRef.current = null;
     clearSequence();
     setEmptyDropKeys((n) => n + 1);
@@ -957,8 +986,9 @@ export default function App() {
    *  Tab navigation posts the window-level `tab_verb` through `postToRust` directly
    *  (never `post()`, which would add a `tab` this message has no field for -- Rust's own
    *  `InboundMessage::TabVerb` names none, since whichever tab is under the keys decides). */
-  function runPanelAction(binding: PanelBinding) {
-    switch (binding.action) {
+  function runPanelAction(binding: PanelCommandBinding) {
+    const action = binding.action;
+    switch (action) {
       case "tab.new":
         postToRust({ type: "tab_verb", request_id: nextRequestId(), verb: "new" });
         break;
@@ -1061,6 +1091,10 @@ export default function App() {
             break;
         }
         break;
+      default: {
+        const unhandled: never = action;
+        throw new Error(`Unknown panel action: ${unhandled}`);
+      }
     }
   }
   /** Whether the `?` keymap overlay is open. Toggled by `resolveKey`'s `{kind:"keymap"}`
@@ -1183,6 +1217,30 @@ export default function App() {
    *  away (`dropPendingKeys`, the tab switch): a pick left up would open a link on a later letter, over a
    *  conversation that no longer holds it. */
   const [linkPick, setLinkPick] = useState<string[] | null>(null);
+  /** A click on the pinned prompt header (`MessageList`, `./promptHeader`): the cursor goes to the prompt row it
+   *  names and the view puts that row's top at the top of the list, as `zt` does -- where the prompt is the top row,
+   *  so the header has nothing left to name and goes. The scroll is announced as the reader's (it goes up: following
+   *  stops). While VISUAL or the caret is on, the list on screen is the frozen one and the click does nothing. */
+  function jumpToPrompt(key: string) {
+    if (frozenSnapshotRef.current !== null) return;
+    const root = containerRef.current;
+    const list = root?.querySelector<HTMLElement>(".message-list") ?? null;
+    const index = indexOfKey(timeline, key);
+    if (list === null || index === null) return;
+    const row = conversationRows(list)[index];
+    if (row === undefined) return;
+    const top = row.getBoundingClientRect().top;
+    const l = list.getBoundingClientRect();
+    const inset = landingInset(list, conversationRows(list), timeline, (at) => top - (l.top + at));
+    const offset = top - (l.top + inset);
+    noteUserScroll(list, offset < 0 ? "up" : "down");
+    list.scrollTop += offset;
+    if (index !== cursorRef.current) {
+      landingRef.current = "keep";
+      setCursor(index);
+    }
+    root?.focus({ preventScroll: true });
+  }
   /** `open_path` and `view_in_editor` share `"editor"` in-flight bookkeeping with
    *  `edit_draft` (see `inFlight`'s own doc comment). A suffix lookup may answer with `path_choices`;
    *  direct opens answer with a command result, whose refusal flashes in the band. */
@@ -1759,6 +1817,21 @@ export default function App() {
    *  waits its after-half (`TYPING_GUARD_MS`) through it. One per panel, kept
    *  across renders (the dispatch below is installed once and reads this same instance). */
   const [typingGuard] = useState(() => new TypingGuard());
+  useEffect(() => {
+    const keys = new Set(DEFAULT_MOTION_KEYS);
+    for (const binding of panelTable.bindings) {
+      const moves = isPanelMotion(binding.action) && binding.action !== "help"
+        && !binding.action.startsWith("search.") && binding.action !== "detailed.toggle";
+      if (!moves && binding.keys.length === 1) keys.delete(binding.keys[0]);
+    }
+    for (const binding of panelTable.bindings) {
+      if (isPanelMotion(binding.action) && binding.action !== "help"
+          && !binding.action.startsWith("search.") && binding.action !== "detailed.toggle") {
+        for (const key of binding.keys) keys.add(key);
+      }
+    }
+    typingGuard.setMotionKeys(keys);
+  }, [panelTable, typingGuard]);
   /* An overlay drawn over the conversation takes the keys from the card a waiting answer was aimed
      at, whichever route opened it -- a key, an envelope, a click. */
   useEffect(() => {
@@ -1837,6 +1910,12 @@ export default function App() {
       setLinkPick(null);
     }
   }, [linkPick, mode, keymapOpen, detail, handoffOpen, pathPick, confirm, overlayOpen]);
+  useEffect(() => {
+    if (mode !== "browse" || keymapOpen || detail !== null || handoffOpen || pathPick !== null || linkPick !== null || confirm !== null || overlayOpen) {
+      operatorRef.current = null;
+      setYankPick(null);
+    }
+  }, [mode, keymapOpen, detail, handoffOpen, pathPick, linkPick, confirm, overlayOpen]);
   /* `slashReply` becomes the picker only with no other overlay open
      (see `slashReply`'s own doc); either way it is used up here.
      The region (CARET/VISUAL/V-LINE) is exactly this
@@ -2009,13 +2088,9 @@ export default function App() {
         tabMode: activeInfo?.mode ?? null,
       });
       if (route === "overlay") return;
-      // Any key within `TYPING_GUARD_MS` of a BROWSE `y` is
-      // typing -- and this capture-phase router runs ahead of `onKeyDown`'s own check of that, so
-      // `y` then Shift+Tab used to post `cycle_mode` (flipping auto and bypass) right after a copy. The
-      // key is claimed and recorded like any other (so a wait it cancels says so), and only a Shift+Tab
-      // after a pause cycles the mode.
+      // The dashboard keeps its single-key copy burst, including this capture-phase route.
       const modeKeyAt = typingGuard.timeOf(event);
-      if (modeRef.current === "browse" && typingGuard.afterCopy(modeKeyAt)) {
+      if (event.target instanceof Element && event.target.closest(".empty-tab") && modeRef.current === "browse" && typingGuard.afterCopy(modeKeyAt)) {
         event.stopPropagation();
         showFlash(typingGuard.onKey("Tab", modeKeyAt) ?? TYPE_HINT_FLASH);
         return;
@@ -2510,8 +2585,8 @@ export default function App() {
     collectHintTargets(sessionId);
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [frozenSnapshot]);
-  /** A code block HINT landed on: the next `y` copies exactly that block's code rather than the
-   *  whole message. Cleared by that copy and by any other key the table resolves. */
+  /** A code block HINT landed on: a lone `yy`, code object or `gy` takes this block.
+   *  The operator and `g` prefix retain it until completion; other resolved keys clear it. */
   const copyCodeRef = useRef<HTMLElement | null>(null);
   /** The one way `copyCodeRef` is written. Keeps the ref (the dispatch handler and `enterRegion`
    *  read it synchronously) and draws the landing: `data-hint-landed` on the block itself -- it lives in
@@ -2686,6 +2761,14 @@ export default function App() {
       const receivedAt = performance.now();
       const previousPage = pageRef.current;
       const nextPage = pageModel(previousPage, { ...payload, receivedAt: Date.now(), monotonicAt: receivedAt });
+      // A tab switch clears the page until its snapshot; only session state can replace its hunk choices.
+      if (payload.kind !== "tabs" && nextPage.state !== previousPage.state && activeTabRef.current !== null) {
+        const tab = activeTabRef.current;
+        if (currentHunkSessionsRef.current.has(tab) && currentHunkSessionsRef.current.get(tab) !== nextPage.state.sessionId) {
+          currentHunksRef.current.delete(tab);
+        }
+        currentHunkSessionsRef.current.set(tab, nextPage.state.sessionId);
+      }
       if (nextPage.tabs !== null && (payload.kind === "tabs" || payload.kind === "snapshot" ||
           nextPage.state.editorCards !== previousPage.state.editorCards)) {
         const live = new Set(nextPage.tabs.tabs.map((tab) => tab.id));
@@ -2858,7 +2941,7 @@ export default function App() {
         }
         case "keymap": {
           // A table that changed while a sequence was pending must never let the old table's binding run against
-          // the new one. A deferred single-key binding was cancelled above for the same reason.
+          // the new one. Only a deferred table binding is cancelled above; unrelated waits survive.
           clearSequence();
           break;
         }
@@ -3036,6 +3119,12 @@ export default function App() {
             unseenAfterSeqRef.current = null;
           }
           activeTabRef.current = payload.active;
+          for (const tab of currentHunksRef.current.keys()) {
+            if (!payload.tabs.some((entry) => entry.id === tab)) currentHunksRef.current.delete(tab);
+          }
+          for (const tab of currentHunkSessionsRef.current.keys()) {
+            if (!payload.tabs.some((entry) => entry.id === tab)) currentHunkSessionsRef.current.delete(tab);
+          }
           forgetClosed(
             viewStore.current,
             payload.tabs.map((t) => t.id),
@@ -4989,7 +5078,9 @@ export default function App() {
               // separately from the live conversation's), reusing only the pure table and the same
               // `runPanelAction` the live conversation's `onKeyDown` calls.
               panelTable={panelTable}
-              onPanelAction={runPanelAction}
+              onPanelAction={(binding) => {
+                if (isPanelCommand(binding)) runPanelAction(binding);
+              }}
               typingGuard={typingGuard}
               onExLine={openExLine}
               onFlash={showFlash}
@@ -5821,6 +5912,25 @@ export default function App() {
     // handler `stopPropagation`s every key it claims, so this only ever runs for a key it does
     // not -- exactly the chooser's own reasoning just above).
     if (slashPicker !== null) return;
+    if (yankPick !== null) {
+      event.preventDefault();
+      if (event.repeat) return;
+      if (event.key === "Backspace" && isPlainAnswerKey(event.nativeEvent as unknown as KeyLike)) {
+        setYankPick({ ...yankPick, typed: yankPick.typed.slice(0, -1) });
+        return;
+      }
+      if (isPlainAnswerKey(event.nativeEvent as unknown as KeyLike) && !event.shiftKey) {
+        const typed = yankPick.typed + event.key;
+        const index = yankPick.labels.indexOf(typed);
+        if (index !== -1) copied(yankPick.entries[index].text, yankPick.rowKey);
+        else if (yankPick.labels.some((label) => label.startsWith(typed))) {
+          setYankPick({ ...yankPick, typed });
+          return;
+        }
+      }
+      setYankPick(null);
+      return;
+    }
     // A path pick owns each key until its full label is typed. Cancelling keys never fall
     // through to the conversation underneath it, and auto-repeat never adds another letter.
     if (pathPick !== null) {
@@ -5876,10 +5986,12 @@ export default function App() {
     // "5 Ctrl+e" reached the unconditional `countRef.current = null` below on `Control`'s own keydown (`pendingRef`
     // is null with no `g`/`z`/`[`/`]` prefix armed) and `e` read the count back as gone, scrolling once instead of
     // five times.
-    if ((pendingRef.current !== null || countRef.current !== null) && isModifierKey(event.key)) return;
+    if ((pendingRef.current !== null || operatorRef.current !== null || countRef.current !== null) && isModifierKey(event.key)) return;
     const root = containerRef.current;
     const pending = pendingRef.current;
     pendingRef.current = null;
+    const operator = operatorRef.current;
+    operatorRef.current = null;
     const count = countRef.current;
     countRef.current = null;
     // The box `pendingRef`'s own reserved prefix (`g`/`z`/`[`/`]`) armed is hidden here, ahead of
@@ -6004,9 +6116,10 @@ export default function App() {
     // them are claimed here, so the browser's activation never reaches them. Space there does nothing (one inside a
     // pending leader sequence is the sequence's, below). A plain Enter there is card mode for that card, nothing
     // highlighted -- such a button holds DOM focus only after a mouse press dragged off it -- and answers nothing;
-    // a modified one does nothing. A pending prefix owns the next key, so Enter/Space on a focused control never
-    // activates it. (`onAnswerButton` is computed at the top, ahead of the two modal overlays' early returns.)
-    if (isActivatableControl(event.target) && (event.key === "Enter" || event.key === " ") && pending !== null) {
+    // a modified one does nothing. A pending prefix or a waiting `y` owns the next key, so Enter/Space on a focused
+    // control never activates it. (`onAnswerButton` is computed at the top, ahead of the two modal overlays' early
+    // returns.)
+    if (isActivatableControl(event.target) && (event.key === "Enter" || event.key === " ") && (pending !== null || operator !== null)) {
       event.preventDefault();
       return;
     }
@@ -6045,25 +6158,6 @@ export default function App() {
       showFlash(STOP_TYPING_FLASH);
       return;
     }
-    // Any key within `TYPING_GUARD_MS` of a BROWSE `y` is typing -- vim's
-    // `y i w` copied the row, opened INPUT on the `i` and typed the `w`. The copy is frozen and already
-    // happened; what follows it inside the burst is swallowed and says how to type. A bare modifier is
-    // not a key (the Shift of a capital), and a key an input method composes is not this panel's.
-    // This sits AHEAD of the focused-control early return just
-    // below, so `y` then Enter (or Space) on a focused button -- another tab's, Dismiss -- within the
-    // burst is claimed too instead of activating it; a lone Enter after a pause is left to the button.
-    if (
-      mode === "browse" &&
-      !isModifierKey(event.key) &&
-      !isImeKey({ isComposing: event.nativeEvent.isComposing, keyCode: event.keyCode }) &&
-      typingGuard.afterCopy(typedAt)
-    ) {
-      event.preventDefault();
-      // The wait this very key cancelled already said what did not happen, in its own words (and ends
-      // with this hint): that message stays.
-      if (cancelled === null) showFlash(TYPE_HINT_FLASH);
-      return;
-    }
     if (isActivatableControl(event.target) && (event.key === "Enter" || (event.key === " " && !onAnswerButton))) return;
     // The leader engine (`./leader`): a pending sequence owns
     // the next key, and only BROWSE ever starts one. An IME key is never a sequence key (the IME
@@ -6073,7 +6167,7 @@ export default function App() {
     // `g`/`z`/`[`/`]` to `resolveKey`'s own reserved two-key prefixes (`./leader`'s own doc comment).
     // A leader sequence dropped by entering card mode, for the band.
     let droppedSequence: string[] | null = null;
-    if (mode === "browse" && !isImeKey({ isComposing: event.nativeEvent.isComposing, keyCode: event.keyCode })) {
+    if (mode === "browse" && operator === null && !isImeKey({ isComposing: event.nativeEvent.isComposing, keyCode: event.keyCode })) {
       if (seqRef.current !== null && cardModeDelta(event.nativeEvent as unknown as KeyLike) !== null) {
         // Card mode's chord drops the sequence and enters, as it drops a pending prefix (`resolveKey` below).
         droppedSequence = seqRef.current.typed;
@@ -6142,6 +6236,7 @@ export default function App() {
     const action = resolveKey(mode, event.nativeEvent as unknown as KeyLike, {
       sessionEnded,
       pending,
+      operator,
       count,
       turnRunning: turnInProgress || shellRunning,
       table: panelTable,
@@ -6248,9 +6343,9 @@ export default function App() {
     // A press that arrives while the last one is still easing starts from where that one was going,
     // never from a frame in between: every decision below reads the list's geometry.
     if (messageList !== null) settleListScroll(messageList);
-    // A code block HINT landed on is "the item" for exactly the next `y`; any other key moves on.
+    // A HINT-landed code block survives operator keys and the prefix of gy.
     const landedCode = copyCodeRef.current;
-    markLandedCode(null);
+    if (action.kind !== "operator" && !(action.kind === "pending" && action.prefix === "g")) markLandedCode(null);
     // The row the cursor is on, found by structure (`conversationRows`), never as the first
     // `.row-current` or the `cursor`-th `[data-nav-stop="row"]` in the subtree: a model reply's own
     // HTML can carry either. Read only by the keys that need it.
@@ -6452,31 +6547,87 @@ export default function App() {
         // `V` from BROWSE still starts V-LINE directly.
         enterRegion(action.line, landedCode);
         break;
-      case "copy": {
-        // A `y` opens a burst in which every other key is typing (above).
-        typingGuard.noteCopy(typedAt);
-        // After HINT landed on a code block: that block's code, not the whole message. Only while it
-        // is still in the DOM and still inside the row under the cursor -- anything else and the
-        // user is looking at something else now.
-        if (landedCode !== null && landedCode.isConnected && cursorRow()?.contains(landedCode)) {
-          copied(codeBlockText(landedCode), timeline[cursor]?.key);
-          break;
-        }
-        // No item at the cursor (an empty timeline) writes NOTHING, rather than clobbering
-        // whatever the user already had on the clipboard with "" -- found in review.
+      case "operator":
+        operatorRef.current = action.op;
+        scheduleBoxTimer();
+        break;
+      case "yank-refused":
+        showFlash(action.flash);
+        break;
+      case "yank": {
         const item = timeline[cursor];
         if (item === undefined) break;
-        // A reply's row copies what is drawn, not the markdown it came from: the source can hold
-        // comments, raw HTML the sanitizer removed, and text that never reaches the screen.
-        const body = item.kind === "message" ? (cursorRow()?.querySelector<HTMLElement>(".row-body") ?? null) : null;
-        copied(body !== null ? renderedText(body) : primaryText(item), item.key);
-        break;
-      }
-      case "copy-output": {
-        const item = timeline[cursor];
-        const text = item === undefined ? null : outputText(item);
-        if (text === null) showFlash("this row has no output");
-        else copied(text, item.key);
+        if (action.what === "object") {
+          const row = cursorRow();
+          let codeElements = Array.from(row?.querySelectorAll<HTMLElement>("pre.code-block") ?? []);
+          if (landedCode !== null && codeElements.includes(landedCode)) codeElements = [landedCode];
+          const blocks = codeElements.map((block) => ({ code: codeBlockText(block), lang: codeBlockLanguage(block) }));
+          const links = row === null ? [] : webLinks(row);
+          const refs = pathsIn(item);
+          let result = yankObject(item, action.scope, action.object, {
+            agentLabel: isExternalAgent(activeTab?.agent) ? agentTitle(activeTab?.agent) : "Claude", codeBlocks: blocks,
+            links: links.map((link) => link.url),
+            currentHunk: currentHunks()?.get(item.key) ?? null,
+          });
+          // A link whose address isn't already readable waits in a pick that shows it.
+          if (action.object === "f" && refs.length === 0 && links.length === 1 && "text" in result
+            && (root === null || !linkOpensAtOnce(links[0], root))) {
+            result = { pick: [{ label: links[0].url, text: links[0].url }] };
+          }
+          if ("text" in result) copied(result.text, item.key);
+          else if ("refuse" in result) showFlash(result.refuse);
+          else {
+            let targets: (HintTarget | null)[] = [];
+            if (action.object === "`") targets = codeElements.map((el) => ({ kind: "code", el, rowIndex: cursor }));
+            else if (action.object === "h") {
+              const previews = editPreviewsOf(item);
+              const files = cursorRow()?.querySelectorAll<HTMLElement>(".permission-card-edit");
+              targets = (previews ?? []).flatMap((preview, i) => {
+                const lines = files?.[i]?.querySelectorAll<HTMLElement>(".diff-line:not(.diff-noeol)");
+                return hunksOf(preview.diff!).map(({ start }) => {
+                  const el = lines?.[start];
+                  return el ? { kind: "code" as const, el, rowIndex: cursor } : null;
+                });
+              });
+            } else if (action.object === "f") {
+              const ranges = row === null ? [] : pathRanges(row, refs);
+              targets = result.pick.map((entry, i) => {
+                const offsets = ranges[i];
+                if (offsets) return { kind: "path", rowKey: item.key, ...offsets, text: entry.label };
+                const link = refs.length === 0 ? links[i] : null;
+                return link ? { kind: "link", el: link.el, rowIndex: cursor } : null;
+              });
+            }
+            setYankPick({ entries: result.pick, labels: assignLabels(result.pick.length), typed: "", rowKey: item.key, targets });
+          }
+          break;
+        }
+        let target = cursor;
+        const motion = action.what === "motion" ? action.motion : null;
+        const n = Math.max(1, action.count ?? 1);
+        if (motion === "G" || motion === "gg") target = jumpTarget(motion === "G" ? "last" : "first", action.count, timeline.length);
+        else if (motion === "[[" || motion === "]]") {
+          for (let i = 0; i < n; i++) {
+            const next = promptIndex(timeline, target, motion === "[[" ? -1 : 1);
+            if (next === null || next === target) {
+              if (i === 0) showFlash(`no ${motion === "[[" ? "earlier" : "later"} prompt`);
+              break;
+            }
+            target = next;
+          }
+          if (target === cursor) break;
+        } else if (motion !== null) target = Math.max(0, Math.min(timeline.length - 1, cursor + n * (["k", "{", "ArrowUp"].includes(motion) ? -1 : 1)));
+        else target = Math.min(timeline.length - 1, cursor + n - 1);
+        if (motion === null && n === 1 && operator?.count == null && count === null && landedCode !== null && landedCode.isConnected && cursorRow()?.contains(landedCode)) {
+          copied(codeBlockText(landedCode), item.key);
+          break;
+        }
+        const rows = root === null ? [] : conversationRows(root);
+        const texts = timeline.slice(Math.min(cursor, target), Math.max(cursor, target) + 1).map((row, offset) => {
+          const body = row.kind === "message" ? rows[Math.min(cursor, target) + offset]?.querySelector<HTMLElement>(".row-body") : null;
+          return body ? renderedText(body) : primaryText(row);
+        });
+        copied(yankRows(texts), item.key);
         break;
       }
       case "restart":
@@ -6713,14 +6864,18 @@ export default function App() {
         const target = count === null ? cursor : jumpTarget("first", count, timeline.length);
         const row = conversationRows(list)[target];
         if (row === undefined) break;
+        // The row goes below the pinned prompt header when the move will leave it showing (`landingInset`: decided
+        // for the row that is then at the top, not for the list as it stands), so `zt` puts the row right under it,
+        // never beneath it, and `zz` centres on what shows.
         const l = list.getBoundingClientRect();
         const r = row.getBoundingClientRect();
-        const offset =
+        const offsetAt = (inset: number) =>
           action.where === "top"
-            ? r.top - l.top
+            ? r.top - (l.top + inset)
             : action.where === "bottom"
               ? r.bottom - l.bottom
-              : (r.top + r.bottom - l.top - l.bottom) / 2;
+              : (r.top + r.bottom - (l.top + inset) - l.bottom) / 2;
+        const offset = offsetAt(action.where === "bottom" ? 0 : landingInset(list, conversationRows(list), timeline, offsetAt));
         noteUserScroll(list, offset < 0 ? "up" : "down");
         list.scrollTop += offset;
         if (target !== cursor) {
@@ -6728,6 +6883,80 @@ export default function App() {
           setCursor(target);
         }
         root.focus({ preventScroll: true });
+        break;
+      }
+      case "item-move": {
+        const target = Math.max(0, Math.min(timeline.length - 1, cursor + action.delta * times));
+        if (target < 0 || target === cursor) break;
+        noteUserScroll(messageList, action.delta > 0 ? "down" : "up");
+        landingRef.current = action.delta;
+        landingHeadRef.current = true;
+        setCursor(target);
+        root?.focus({ preventScroll: true });
+        break;
+      }
+      case "structure-jump": {
+        let target = cursor;
+        let hunk = currentHunks()?.get(timeline[target]?.key) ?? null;
+        let moved = false;
+        let exhausted = false;
+        for (let step = 0; step < times; step++) {
+          if (action.what === "hunk") {
+            let nextHunk: number | null = null;
+            let nextRow = target;
+            // Only successful edits have hunks to visit; permission previews are not edits yet.
+            if (nextStop(timeline, target - 1, 1, "edit") === target) {
+              const diff = editDiffOf(timeline[target]);
+              const total = diff === null ? 0 : hunksOf(diff).length;
+              const candidate = (hunk ?? (action.delta > 0 ? -1 : total)) + action.delta;
+              if (candidate >= 0 && candidate < total) nextHunk = candidate;
+            }
+            while (nextHunk === null) {
+              const next = nextStop(timeline, nextRow, action.delta, "edit");
+              if (next === null) break;
+              nextRow = next;
+              const diff = editDiffOf(timeline[nextRow]);
+              const total = diff === null ? 0 : hunksOf(diff).length;
+              if (total > 0) nextHunk = action.delta > 0 ? 0 : total - 1;
+            }
+            if (nextHunk === null) { exhausted = true; break; }
+            target = nextRow;
+            hunk = nextHunk;
+          } else {
+            const next = nextStop(timeline, target, action.delta, action.what);
+            if (next === null) { exhausted = true; break; }
+            target = next;
+          }
+          moved = true;
+        }
+        if (moved) {
+          noteJump();
+          // A hunk targets a fixed place: stop following before expanding, even when moving down.
+          noteUserScroll(messageList, action.what === "hunk" || action.delta < 0 ? "up" : "down");
+          if (action.what === "hunk" && hunk !== null) {
+            const key = timeline[target].key;
+            const tab = activeTabRef.current;
+            if (tab !== null) {
+              if (!currentHunksRef.current.has(tab)) currentHunksRef.current.set(tab, new Map());
+              currentHunksRef.current.get(tab)!.set(key, hunk);
+            }
+            setExpanded((prev) => ({ ...prev, [key]: true }));
+            if (target !== cursor) landingRef.current = "keep";
+            setHunkLanding({ key, hunk });
+          } else if (target !== cursor) landingRef.current = action.delta;
+          setCursor(target);
+          const item = timeline[target];
+          if (item.kind === "run") {
+            const call = item.calls[0];
+            const summary = revealedText(`${call.name}: ${toolInput(call.name, call.input)}`.replace(/[ \t\n]+/g, " "));
+            showFlash(`first call here: ${Array.from(summary).slice(0, 60).join("")}`);
+          }
+        }
+        if (exhausted) {
+          const name = { tool: "tool calls", error: "errors", edit: "edits", hunk: "hunks" }[action.what];
+          showFlash(`no more ${name} ${action.delta > 0 ? "below" : "above"}`);
+        }
+        root?.focus({ preventScroll: true });
         break;
       }
       case "prompt-jump": {
@@ -6850,11 +7079,19 @@ export default function App() {
   const box: { title: string; entries: BoxEntry[] } | null =
     seq !== null
       ? { title: sequenceTitle(panelTable, seq.typed), entries: boxEntries(panelTable, seq.typed, modeFixed) }
+      : operatorRef.current !== null
+        ? {
+            title: `y${operatorRef.current.scope ?? operatorRef.current.prefix ?? ""}`,
+            entries: operatorRef.current.scope !== null || operatorRef.current.prefix !== null
+              ? YANK_PENDING_ENTRIES.filter((entry) => entry.key.startsWith(operatorRef.current!.scope ?? operatorRef.current!.prefix!))
+                  .map((entry) => ({ ...entry, key: entry.key.slice(1) }))
+              : YANK_PENDING_ENTRIES,
+          }
       : pendingRef.current !== null
         ? {
             // `Ctrl+w`'s own spelling, not tmux's `"C-w"` (`PendingPrefix`'s): the other four are one character.
             title: pendingRef.current === "C-w" ? "Ctrl+w" : pendingRef.current,
-            entries: [...FIXED_PENDING_ENTRIES[pendingRef.current], ...boxEntries(panelTable, [pendingRef.current], modeFixed)],
+            entries: pendingEntries(panelTable, pendingRef.current, modeFixed),
           }
         : null;
 
@@ -6885,7 +7122,7 @@ export default function App() {
         if (onCardModeKey(event)) return;
 
         const target = event.target instanceof Element ? event.target : null;
-        const questionCovered = overlayOpen || keymapOpen || detail !== null || handoffOpen || pathPick !== null || linkPick !== null;
+        const questionCovered = overlayOpen || keymapOpen || detail !== null || handoffOpen || pathPick !== null || linkPick !== null || yankPick !== null;
         if (waitingQuestion && target?.closest(".question-dock") && questionCovered) {
           onKeyDown(event);
           event.stopPropagation();
@@ -7013,6 +7250,7 @@ export default function App() {
             answeredPermissions={frozenSnapshot?.answeredPermissions ?? answeredPermissions}
             cardMode={cardModeShown}
             onOpenPath={openPath}
+            onPromptJump={jumpToPrompt}
             onUnreadChange={(label, jump, afterSeq) => {
               setUnreadLabel(label);
               unreadJumpRef.current = jump;
@@ -7144,7 +7382,8 @@ export default function App() {
               // which a click can never reach since the leader is only ever `typed[0]`).
               const root = containerRef.current;
               root?.focus({ preventScroll: true });
-              root?.dispatchEvent(new KeyboardEvent("keydown", { key, bubbles: true, cancelable: true }));
+              const keys = operatorRef.current !== null && key.length <= 2 ? [...key] : [key];
+              for (const part of keys) root?.dispatchEvent(new KeyboardEvent("keydown", { key: part, bubbles: true, cancelable: true }));
             }}
           />
         )}
@@ -7280,6 +7519,19 @@ export default function App() {
             onPlaced={pathLabelsPlaced}
           />
         </PanelErrorBoundary>
+      )}
+      {yankPick !== null && (
+        <>
+        <div className="path-pick" role="status">
+          {yankPick.entries.map((entry, i) => yankPick.labels[i].startsWith(yankPick.typed)
+            ? <span key={i}>{i > 0 ? " · " : ""}{yankPick.labels[i]} {revealedText(entry.label)}</span> : null)}
+        </div>
+        <HintLayer
+          root={containerRef.current}
+          hints={yankPick.targets.flatMap((target, i) => target === null ? [] : [{ target, label: yankPick.labels[i] }])}
+          typed={yankPick.typed}
+        />
+        </>
       )}
       {linkPick !== null && (
         <PanelErrorBoundary name="link picker" onError={() => overlayFailed("link picker", () => setLinkPick(null))}>

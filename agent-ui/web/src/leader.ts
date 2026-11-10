@@ -8,7 +8,8 @@
  * result falls through to `resolveKey`, never the other way around), since the table's own
  * reserved-pair rule means the two can never both claim the same key.
  */
-import type { PanelBinding, PanelTable, PendingPrefix } from "./keymap";
+import { isPanelCommand } from "./keymap";
+import type { PanelCommandBinding, PanelTable, PendingPrefix } from "./keymap";
 
 /** which-key's default `delay` (which-key.nvim lua/which-key/config.lua:13-15). */
 export const WHICH_KEY_DELAY_MS = 200;
@@ -25,14 +26,14 @@ const PENDING_FIRST = new Set(["g", "z", "[", "]"]);
  *  typed so far, `"<leader>"` standing for the leader itself). */
 export type SeqStep =
   | { kind: "none" } // not a sequence start: fall through to resolveKey
-  | { kind: "pending"; typed: string[]; ambiguous: PanelBinding | null }
-  | { kind: "run"; binding: PanelBinding }
+  | { kind: "pending"; typed: string[]; ambiguous: PanelCommandBinding | null }
+  | { kind: "run"; binding: PanelCommandBinding }
   | { kind: "cancel" }; // swallowed, nothing runs
 
 /** The bindings whose `keys` start with `typed`, split into the one that matches it exactly (if
  *  any) and whether some binding continues past it (making the node a prefix, not just a leaf). */
 function matching(table: PanelTable, typed: string[]) {
-  const starts = table.bindings.filter((b) => b.keys.length >= typed.length && typed.every((k, i) => b.keys[i] === k));
+  const starts = table.bindings.filter(isPanelCommand).filter((b) => b.keys.length >= typed.length && typed.every((k, i) => b.keys[i] === k));
   return { exact: starts.find((b) => b.keys.length === typed.length) ?? null, longer: starts.some((b) => b.keys.length > typed.length) };
 }
 
@@ -53,6 +54,7 @@ function step(table: PanelTable, typed: string[], atStart: boolean): SeqStep {
  *  longer sequence starting with one of them (`[b`) -- that longer sequence is instead reached through `resolveKey`'s
  *  own pending switch (`tableHit`), not through this function. */
 export function startSequence(table: PanelTable, key: string, onControl: boolean): SeqStep {
+  if (table.bindings.some((b) => !isPanelCommand(b) && b.keys.length === 1 && b.keys[0] === key)) return { kind: "none" };
   if (PENDING_FIRST.has(key)) return { kind: "none" }; // resolveKey's own two-key prefixes
   if (key === table.leader) return onControl ? { kind: "none" } : step(table, ["<leader>"], true);
   return step(table, [key], true);
@@ -67,8 +69,8 @@ export function isPendingFirst(key: string): boolean {
 
 /** The table binding a reserved prefix plus one more key completes (`[` then `b`), the same lookup
  *  `resolveKey`'s own `tableHit` does; `null` when the pair is not in the table. */
-export function pendingPairBinding(table: PanelTable, prefix: string, key: string): PanelBinding | null {
-  return table.bindings.find((b) => b.keys.length === 2 && b.keys[0] === prefix && b.keys[1] === key) ?? null;
+export function pendingPairBinding(table: PanelTable, prefix: string, key: string): PanelCommandBinding | null {
+  return table.bindings.filter(isPanelCommand).find((b) => b.keys.length === 2 && b.keys[0] === prefix && b.keys[1] === key) ?? null;
 }
 
 /** The next key of a sequence already pending at `typed`. `Escape` cancels outright; `Backspace`
@@ -105,7 +107,7 @@ function humanKey(table: PanelTable, k: string): string {
  *  can still cycle (`modeKey.ts`'s `modeKeyRoute`). */
 export function boxEntries(table: PanelTable, typed: string[], modeFixed: boolean): BoxEntry[] {
   const depth = typed.length;
-  const atDepth = table.bindings.filter((b) => b.keys.length > depth && typed.every((k, i) => b.keys[i] === k));
+  const atDepth = table.bindings.filter(isPanelCommand).filter((b) => b.keys.length > depth && typed.every((k, i) => b.keys[i] === k));
   const nextKeys: string[] = [];
   for (const b of atDepth) {
     const nextKey = b.keys[depth];
@@ -133,10 +135,7 @@ export function sequenceTitle(table: PanelTable, typed: string[]): string {
   return typed.map((k) => humanKey(table, k)).join(" ");
 }
 
-/** `resolveKey`'s reserved two-key prefixes (the four of them, and `Ctrl+w`) have
- *  no `PanelBinding` of their own (they are fixed rows, not table entries, so no config can rebind
- *  them), so a which-key box opened on one of them (`g`/`z`/`[`/`]`/`Ctrl+w`, held past
- *  `WHICH_KEY_DELAY_MS`) is filled in by hand rather than from `table.bindings`. */
+/** Built-in continuations under each reserved prefix, before the effective table overlays them. */
 export const FIXED_PENDING_ENTRIES: Record<PendingPrefix, BoxEntry[]> = {
   g: [
     { key: "g", label: "first row", group: false, disabled: false },
@@ -145,6 +144,7 @@ export const FIXED_PENDING_ENTRIES: Record<PendingPrefix, BoxEntry[]> = {
     // same keys).
     { key: "x", label: "open link", group: false, disabled: false },
     { key: "?", label: "this list", group: false, disabled: false },
+    { key: "y", label: "copy code block", group: false, disabled: false },
     { key: "d", label: "go to definition", group: false, disabled: false },
   ],
 
@@ -167,12 +167,20 @@ export const FIXED_PENDING_ENTRIES: Record<PendingPrefix, BoxEntry[]> = {
     // `FIXED_PAIRS["["].p`, reserved: it says that card mode's `Alt-p` walks the waiting cards now. Drawn disabled,
     // since it does nothing else.
     { key: "p", label: "cards: Alt-p now", group: false, disabled: true },
+    { key: "t", label: "previous tool call", group: false, disabled: false },
+    { key: "c", label: "previous hunk", group: false, disabled: false },
+    { key: "d", label: "previous error", group: false, disabled: false },
+    { key: "m", label: "previous edit", group: false, disabled: false },
   ],
 
   "]": [
     { key: "]", label: "next prompt", group: false, disabled: false },
     // `FIXED_PAIRS["]"].p`, reserved the same way: card mode's `Alt-n`.
     { key: "p", label: "cards: Alt-n now", group: false, disabled: true },
+    { key: "t", label: "next tool call", group: false, disabled: false },
+    { key: "c", label: "next hunk", group: false, disabled: false },
+    { key: "d", label: "next error", group: false, disabled: false },
+    { key: "m", label: "next edit", group: false, disabled: false },
   ],
 
   // `Ctrl+w`'s four pairs, the module the keys go to. The box's title for it is
@@ -184,3 +192,26 @@ export const FIXED_PENDING_ENTRIES: Record<PendingPrefix, BoxEntry[]> = {
     { key: "l", label: "module right", group: false, disabled: false },
   ],
 };
+
+/** A reserved prefix lists the actions its next key actually runs, including rebound motion pairs. */
+export function pendingEntries(table: PanelTable, prefix: PendingPrefix, modeFixed: boolean): BoxEntry[] {
+  const motions = table.bindings.filter((b) => !isPanelCommand(b) && b.keys.length === 2 && b.keys[0] === prefix);
+  const overrides = new Set(motions.map((b) => b.keys[1]));
+  return [
+    ...FIXED_PENDING_ENTRIES[prefix].filter((entry) => !overrides.has(entry.key)),
+    ...boxEntries(table, [prefix], modeFixed),
+    ...motions.map((b) => ({ key: humanKey(table, b.keys[1]), label: b.desc, group: false, disabled: false })),
+  ];
+}
+
+/** Complete continuations of the yank operator, shown without running any of them. */
+export const YANK_PENDING_ENTRIES: BoxEntry[] = [
+  ["y", "copy row"],
+  ["im", "message source"], ["am", "message with author"],
+  ["io", "tool output"], ["ao", "output with command and status"],
+  ["ic", "tool input"], ["ac", "input with tool name"],
+  ["i`", "code"], ["a`", "fenced code"],
+  ["if", "path or URL"], ["af", "path with line"],
+  ["ih", "hunk"], ["ah", "hunk with file headers"],
+  ...["j", "k", "ArrowDown", "ArrowUp", "{", "}", "G", "gg", "[[", "]]"].map((key) => [key, "rows through motion"]),
+].map(([key, label]) => ({ key, label, group: false, disabled: false }));

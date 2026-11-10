@@ -226,3 +226,68 @@ describe("viewAnchor: a redraw that changes the text before the reader's point",
     expect(sentenceAt(after, topChars + perLine - 1)).toBe(reading);
   });
 });
+
+describe("viewAnchor with the pinned prompt header shown", () => {
+  it("anchors the first row below the header, not one under it, and keeps its line across a width change", () => {
+    const { list, rows, view, geometry, tops } = layout(CONVERSATION, 400);
+    // Row 15 (a short one, 36px) shows its last 16px at the list's top; row 16, a long reply, starts 16px down.
+    view.scrollTop = tops()[15] + 20;
+    const plain = captureAnchor(list, rows, rows[15], geometry)!;
+    expect(plain.row).toBe(rows[15]);
+    expect(plain.inset).toBe(0);
+    // The header is the list's sibling, over the list's top 24px: row 15 is wholly under it, row 16's top too.
+    const header = document.createElement("div");
+    header.className = "prompt-header";
+    list.after(header);
+    const covered: AnchorGeometry = {
+      ...geometry,
+      rect: (el) => (el === header ? { top: 0, bottom: 24, left: 0, height: 24 } : geometry.rect(el)),
+    };
+    try {
+      const anchor = captureAnchor(list, rows, rows[15], covered)!;
+      expect(anchor.row).toBe(rows[16]);
+      expect(anchor.inset).toBe(24);
+      // The reader's line is the first one below the header.
+      expect(anchor.text).not.toBeNull();
+      expect(anchor.y).toBeGreaterThanOrEqual(24);
+      const y = anchor.y;
+
+      view.width = 1000;
+      restoreAnchor(list, anchor, covered);
+      expect(anchorDrift(list, anchor, covered)).toBe(0);
+      expect(covered.caretTop(anchor.text!.node, anchor.text!.offset)).toBe(y);
+      view.width = 400;
+      restoreAnchor(list, anchor, covered);
+      expect(view.scrollTop).toBe(tops()[15] + 20);
+
+      // The header going away moves nothing: heights are kept from the list's own top.
+      header.remove();
+      expect(anchorDrift(list, anchor, geometry)).toBe(0);
+    } finally {
+      header.remove();
+    }
+  });
+
+  it("a row starting under the header with no text to hit-test keeps its fraction from below the header", () => {
+    const { list, rows, view, geometry, tops } = layout(CONVERSATION, 400);
+    const header = document.createElement("div");
+    header.className = "prompt-header";
+    list.after(header);
+    const covered: AnchorGeometry = {
+      ...geometry,
+      caretAt: () => null,
+      rect: (el) => (el === header ? { top: 0, bottom: 24, left: 0, height: 24 } : geometry.rect(el)),
+    };
+    try {
+      view.scrollTop = tops()[16] + 600;
+      const anchor = captureAnchor(list, rows, rows[16], covered)!;
+      expect(anchor.text).toBeNull();
+      expect(anchor.inset).toBe(24);
+      // The point is the view's top below the header: 624px into the row.
+      expect(anchor.fraction! * geometry.rect(rows[16]).height).toBeCloseTo(624, 6);
+      expect(anchorDrift(list, anchor, covered)).toBeCloseTo(0, 6);
+    } finally {
+      header.remove();
+    }
+  });
+});

@@ -649,3 +649,25 @@ it("lists Pages with their load verb as text, without controls, and hides an emp
   rendered.rerender(<KeymapOverlay {...props} pages={[]} />);
   expect(sectionTitled(rendered.container, "Pages")).toBeUndefined();
 });
+
+it("shows each motion's effective keys, dropping keys taken by another action", () => {
+  const panel: PanelTable = { ...TABLE, bindings: [
+    ...TABLE.bindings, binding(["j"], "line.down"), binding(["x"], "row.down"),
+    binding(["}"], "row.down"), binding(["]", "t"], "tool.prev"), binding(["G"], "top"),
+    binding(["n"], "help"), binding(["g", "g"], "top"), binding(["f"], "row.down"), binding(["h"], "row.up"),
+  ] };
+  const { container } = overlay(() => {}, panel);
+  const rows = Array.from(sectionTitled(container, "This panel").querySelectorAll("tr"));
+  const keys = (what: string) => rows.find((row) => row.querySelectorAll("td")[1].textContent === what)?.querySelector("kbd")?.textContent;
+  expect(keys("Next row; a long row scrolls first; alone on the last row goes to the box")).toBe("↓ / x / } / f");
+  expect(keys("One line down (a count repeats it, e.g. 5 Ctrl+e)")).toBe("Ctrl+e / j");
+  expect(keys("Previous tool call")).toBe("[t / ]t");
+  expect(keys("Next tool call")).toBe("Unbound");
+  expect(keys("First row")).toBe("gg / G");
+  expect(keys("Last row")).toBe("Unbound");
+  expect(keys("This list")).toBe("F1 / g? / n");
+  expect(keys("HINT: jump anywhere in the window (links too; Enter opens one)")).toBe("f");
+  expect(keys("Previous / next button in the row")).toBe("h / l");
+  expect(keys("Next match, wrapping")).toBe("Unbound");
+  expect(sectionTitled(container, "Leader and tab keys").textContent).not.toContain("line.down");
+});

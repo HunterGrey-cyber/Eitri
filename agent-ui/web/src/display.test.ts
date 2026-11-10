@@ -89,9 +89,9 @@ describe("run summaries", () => {
     expect(shown.map((i) => (i as Extract<TimelineItem, { kind: "tool" }>).call.toolUseId)).toEqual(["t1", "t2", "t3", "t4", "t5"]);
   });
 
-  it("Write and NotebookEdit stop a fold the same way Edit does", () => {
-    const items = [tool(call(1, "Read")), tool(call(2, "Write")), tool(call(3, "Read")), tool(call(4, "NotebookEdit")), tool(call(5, "Read"))];
-    expect(buildDisplay(items, opts).map((i) => i.kind)).toEqual(["tool", "tool", "tool", "tool", "tool"]);
+  it.each(["Write", "NotebookEdit", "MultiEdit"])("%s stops a fold the same way Edit does", (name) => {
+    const items = [tool(call(1, "Read")), tool(call(2, name)), tool(call(3, "Read")), tool(call(4, "Read")), tool(call(5, name))];
+    expect(buildDisplay(items, opts).map((i) => i.kind)).toEqual(["tool", "tool", "run", "tool"]);
   });
 
   it("finds a row by key, inside a run too", () => {

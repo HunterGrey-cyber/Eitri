@@ -50,7 +50,8 @@ const ctx = { sessionEnded: false };
  *  anything else is the key on its own.
  *  Shared by both directions of the table <-> `resolveKey` correspondence below, so the two can
  *  never silently parse a token two different ways. */
-function parseKeyToken(token: string): { ev: KeyLike; pending?: PendingPrefix } {
+function parseKeyToken(token: string): { ev: KeyLike; pending?: PendingPrefix; operator?: KeyContext["operator"] } {
+  if (token === "yy" || token === "y{object}" || token === "y{motion}") return { ev: key(token === "yy" ? "y" : token === "y{object}" ? "i" : "j"), operator: { op: "y", count: null, scope: null, prefix: null } };
   // `Ctrl+w h` is `h` with the `Ctrl+w` prefix waiting -- this must come ahead of the
   // `Ctrl+` branch below, which would otherwise read it as Ctrl held with a key named "w h".
   if (token === "F1") return { ev: key("F1") };
@@ -225,7 +226,7 @@ describe("resolveKey", () => {
   it("names Ctrl+e and Ctrl+y as one-line scrolls, and a Ctrl+y is never a copy", () => {
     expect(resolveKey("browse", key("e", { ctrlKey: true }), ctx)).toEqual({ kind: "scroll-line", delta: 1 });
     expect(resolveKey("browse", key("y", { ctrlKey: true }), ctx)).toEqual({ kind: "scroll-line", delta: -1 });
-    expect(resolveKey("browse", key("y"), ctx)).toEqual({ kind: "copy" });
+    expect(resolveKey("browse", key("y"), ctx)).toEqual({ kind: "operator", op: { op: "y", count: null, scope: null, prefix: null } });
     // Scrolling a dead session's transcript is still reading it, the same as Ctrl+d/Ctrl+u.
     expect(resolveKey("browse", key("e", { ctrlKey: true }), { sessionEnded: true })).toEqual({ kind: "scroll-line", delta: 1 });
     // BROWSE only: INPUT's own Ctrl+e (end of line) is the composer's. INPUT's Ctrl+y is claimed and answers
@@ -325,7 +326,7 @@ describe("resolveKey", () => {
   });
 
   it("names Shift+Y and Shift+D ahead of the modifier refusal", () => {
-    expect(resolveKey("browse", key("Y", { shiftKey: true }), ctx)).toEqual({ kind: "copy-output" });
+    expect(resolveKey("browse", key("Y", { shiftKey: true }), ctx)).toEqual({ kind: "yank", what: "rows", count: 1 });
     expect(resolveKey("browse", key("D", { shiftKey: true }), ctx)).toEqual({ kind: "card-key-gone", key: "D" });
     expect(resolveKey("browse", key("D", { shiftKey: true }), { sessionEnded: true })).toEqual({ kind: "card-key-gone", key: "D" });
   });
@@ -827,8 +828,8 @@ describe("]p / [p: reserved, pointing to Alt-n / Alt-p", () => {
     for (const prefix of ["g", "z", "C-w"] as const)
       expect(resolveKey("browse", key("p"), { ...ctx, pending: prefix }), `${prefix} p`).toEqual({ kind: "cancel", why: "unbound" });
     expect(resolveKey("browse", key("p"), ctx)).toBeNull();
-    expect(Object.keys(FIXED_PAIRS["["]).sort()).toEqual(["[", "p"]);
-    expect(Object.keys(FIXED_PAIRS["]"]).sort()).toEqual(["]", "p"]);
+    expect(Object.keys(FIXED_PAIRS["["]).sort()).toEqual(["[", "c", "d", "m", "p", "t"]);
+    expect(Object.keys(FIXED_PAIRS["]"]).sort()).toEqual(["]", "c", "d", "m", "p", "t"]);
     // The mismatched bracket pair stays nothing, as before.
     expect(resolveKey("browse", key("]"), { ...ctx, pending: "[" })).toBeNull();
   });
@@ -877,7 +878,7 @@ describe("gx: open this row's web link", () => {
     for (const prefix of ["z", "[", "]", "C-w"] as const)
       expect(resolveKey("browse", key("x"), { ...ctx, pending: prefix }), `${prefix} x`).toEqual({ kind: "cancel", why: "unbound" });
     expect(resolveKey("browse", key("x"), ctx)).toBeNull();
-    expect(Object.keys(FIXED_PAIRS.g).sort()).toEqual(["?", "d", "f", "g", "x"]);
+    expect(Object.keys(FIXED_PAIRS.g).sort()).toEqual(["?", "d", "f", "g", "x", "y"]);
   });
 
   it("is BROWSE's: INPUT never reads a prefix, and CARET/VISUAL end the region on the x", () => {
@@ -907,10 +908,10 @@ describe("BROWSE_KEYS <-> resolveKey", () => {
   it("every key BROWSE_KEYS lists actually does something in resolveKey", () => {
     for (const { keys } of BROWSE_KEYS) {
       for (const token of keys.split(" / ")) {
-        const { ev, pending } = parseKeyToken(token);
+        const { ev, pending, operator } = parseKeyToken(token);
         // `turnRunning: true` so `Ctrl+c`'s own row -- idle it resolves to nothing at all -- still
         // proves it does something, the same reason `sessionEnded` is set for `r`'s row below.
-        const localCtx: KeyContext = { sessionEnded: token === "r", pending, turnRunning: true };
+        const localCtx: KeyContext = { sessionEnded: token === "r", pending, operator, turnRunning: true };
         const result = resolveKey("browse", ev, localCtx);
         expect(result, `"${token}" (from "${keys}")`).not.toBeNull();
         // A key after a pending prefix that completes no pair resolves to `cancel` -- claimed, so
@@ -996,7 +997,7 @@ describe("BROWSE_KEYS <-> resolveKey", () => {
         // A candidate the table spells explicitly (`1-9`, `[[`, `]]`) is checked like everything
         // else; a bare letter or digit that merely STARTS one of those (a lone `g`, `[`, `]`, `3`)
         // is skipped, the same as `gg`'s own first `g` always was.
-        if ((result.kind === "pending" || result.kind === "count") && !known.has(token)) continue;
+        if ((result.kind === "pending" || result.kind === "operator" || result.kind === "count") && !known.has(token)) continue;
         // A table-resolved key is listed by the overlay's own panel section, never here.
         if (result.kind === "panel") continue;
         // `Esc` while a turn runs is a transient reminder, not a discoverable key -- the ?
@@ -1524,5 +1525,128 @@ describe("directional search, help and jump keys", () => {
     expect(resolveKey("browse", key("?", { shiftKey: true }), { ...ctx, pending: "g" })).toEqual({ kind: "keymap" });
     expect(resolveKey("browse", key("i"), { ...ctx, pending: "z" })).toEqual({ kind: "detailed" });
     expect(resolveKey("browse", key("i", { altKey: true }), { ...ctx, pending: "z" })).toEqual({ kind: "detailed" });
+  });
+});
+
+
+describe("the yank operator grammar", () => {
+  function sequence(keys: string) {
+    let context: KeyContext = { sessionEnded: false };
+    let action: ReturnType<typeof resolveKey> = null;
+    for (const letter of keys) {
+      action = resolveKey("browse", key(letter, { shiftKey: /[A-Z{}]/.test(letter) }), context);
+      context = { sessionEnded: false, operator: action?.kind === "operator" ? action.op : null,
+        pending: action?.kind === "pending" ? action.prefix : null,
+        count: action?.kind === "count" ? (context.count ?? 0) * 10 + action.digit : null };
+    }
+    return action;
+  }
+  it("arms y without copying", () => expect(sequence("y")).toEqual({ kind: "operator", op: { op: "y", count: null, scope: null, prefix: null } }));
+  it.each([["yy", 1], ["3yy", 3], ["y3y", 3], ["Y", 1]] as const)("%s copies rows", (keys, count) => expect(sequence(keys)).toEqual({ kind: "yank", what: "rows", count }));
+  it.each([["y3j", "j", 3], ["ygg", "gg", null], ["y[[", "[[", null], ["y]]", "]]", null], ["yG", "G", null], ["y}", "}", null], ["yk", "k", null]] as const)("%s copies through its motion", (keys, motion, count) => expect(sequence(keys)).toEqual({ kind: "yank", what: "motion", motion, count }));
+  it.each([["yio", "i", "o"], ["ya`", "a", "`"], ["gy", "i", "`"]] as const)("%s copies an object", (keys, scope, object) => expect(sequence(keys)).toEqual({ kind: "yank", what: "object", scope, object }));
+  it.each(["w", "W", "s", "p"])("yi%s requires the caret", (object) => expect(sequence(`yi${object}`)).toEqual({ kind: "yank-refused", flash: `i${object}: needs the caret — v, then move, then y` }));
+  it("an unknown key cancels silently", () => expect(sequence("yx")).toEqual({ kind: "cancel", why: "unbound" }));
+  it.each([null, "i"] as const)("Ctrl+c keeps interrupting with y pending (scope %s)", (scope) => {
+    const operator = { op: "y" as const, count: null, scope, prefix: null };
+    expect(resolveKey("browse", key("c", { ctrlKey: true }), { ...ctx, operator, turnRunning: true })).toEqual({ kind: "interrupt" });
+    expect(resolveKey("browse", key("c", { ctrlKey: true }), { ...ctx, operator, turnRunning: false })).toEqual({ kind: "cancel", why: "unbound" });
+  });
+  it.each([{ altKey: true }, { metaKey: true }, { altKey: true, ctrlKey: true, getModifierState: (name: string) => name === "AltGraph" }])("layout brackets complete y motions with %j", (modifiers) => {
+    for (const bracket of ["[", "]"] as const) {
+      const op = { op: "y" as const, count: 2, scope: null, prefix: null };
+      expect(resolveKey("browse", { ...key(bracket), ...modifiers }, { ...ctx, operator: op })).toEqual({ kind: "operator", op: { ...op, prefix: bracket } });
+      expect(resolveKey("browse", { ...key(bracket), ...modifiers }, { ...ctx, operator: { ...op, prefix: bracket } })).toEqual({ kind: "yank", what: "motion", motion: bracket + bracket, count: 2 });
+    }
+    for (const brace of ["{", "}"]) expect(resolveKey("browse", { ...key(brace, { shiftKey: true }), ...modifiers }, { ...ctx, operator: { op: "y", count: null, scope: null, prefix: null } })).toEqual({ kind: "yank", what: "motion", motion: brace, count: null });
+  });
+  it.each([key("Escape"), key("Tab", { shiftKey: true }), key("Enter"), key(" "), key("a", { ctrlKey: true })])("cancels on %j", (ev) => {
+    expect(resolveKey("browse", ev, { sessionEnded: false, operator: { op: "y", count: null, scope: null, prefix: null } })).toEqual({ kind: "cancel", why: "unbound" });
+  });
+  it.each(["n", "p"])("Alt+%s drops the operator and resolves as idle", (letter) => {
+    const ev = key(letter, { altKey: true });
+    expect(resolveKey("browse", ev, { sessionEnded: false, operator: { op: "y", count: null, scope: null, prefix: null } })).toEqual(resolveKey("browse", ev, { sessionEnded: false }));
+  });
+});
+
+
+describe("structural jumps and item motions", () => {
+  for (const [prefix, delta] of [["]", 1], ["[", -1]] as const) {
+    it.each([["t", "tool"], ["c", "hunk"], ["d", "error"], ["m", "edit"]])(
+      `${prefix}%s resolves with and without a count`, (letter, what) => {
+        for (const count of [null, 3]) {
+          expect(resolveKey("browse", key(prefix), { ...ctx, count })).toEqual({ kind: "pending", prefix });
+          expect(resolveKey("browse", key(letter), { ...ctx, pending: prefix, count })).toEqual({ kind: "structure-jump", what, delta });
+        }
+        expect(resolveKey("browse", key(letter, { ctrlKey: true }), { ...ctx, pending: prefix })).toEqual(letter === "c" ? null : { kind: "cancel", why: "unbound" });
+        expect(resolveKey("browse", key(letter.toUpperCase(), { shiftKey: true }), { ...ctx, pending: prefix })).toEqual({ kind: "cancel", why: "unbound" });
+      },
+    );
+  }
+  it.each([["}", 1], ["{", -1]] as const)("%s moves to a row start, including Shift and counts", (letter, delta) => {
+    for (const shiftKey of [false, true]) for (const count of [null, 3]) {
+      expect(resolveKey("browse", key(letter, { shiftKey }), { ...ctx, count })).toEqual({ kind: "item-move", delta });
+      expect(resolveKey("input", key(letter, { shiftKey }), ctx)).toBeNull();
+    }
+    for (const mods of [{ altKey: true }, { metaKey: true }, { getModifierState: (name: string) => name === "AltGraph" }]) {
+      expect(resolveKey("browse", { ...key(letter), ...mods }, ctx)).toEqual({ kind: "item-move", delta });
+    }
+    for (const mods of [{ ctrlKey: true }, { isComposing: true }, { keyCode: 229 },
+      { getModifierState: (name: string) => name === "Super" }, { getModifierState: (name: string) => name === "Hyper" },
+      { ctrlKey: true, altKey: true, getModifierState: (name: string) => name === "AltGraph" }]) {
+      expect(resolveKey("browse", { ...key(letter), ...mods }, ctx)).toBeNull();
+    }
+  });
+});
+
+describe("named motion bindings", () => {
+  const table: PanelTable = {
+    leader: " ", leaderLabel: "Space", leaderSource: "default", timeout: true, timeoutlen: 1000, groups: [],
+    bindings: [
+      { keys: ["j"], action: "line.down", desc: "one line down", source: "init.lua" },
+      { keys: ["]", "t"], action: "tool.prev", desc: "previous tool", source: "init.lua" },
+      { keys: ["}"], action: "row.down", desc: "next row", source: "init.lua" },
+      { keys: ["G"], action: "top", desc: "first row", source: "init.lua" },
+    ],
+  };
+  it("replaces built-in plain, shifted and pair keys with the built-in action shape", () => {
+    for (const count of [null, 3]) {
+      expect(resolveKey("browse", key("j"), { ...ctx, table, count })).toEqual({ kind: "scroll-line", delta: 1 });
+      expect(resolveKey("browse", key("]"), { ...ctx, table, count })).toEqual({ kind: "pending", prefix: "]" });
+      expect(resolveKey("browse", key("t"), { ...ctx, table, count, pending: "]" })).toEqual({ kind: "structure-jump", what: "tool", delta: -1 });
+      expect(resolveKey("browse", key("}", { shiftKey: true }), { ...ctx, table, count })).toEqual({ kind: "move", delta: 1 });
+      expect(resolveKey("browse", key("G", { shiftKey: true }), { ...ctx, table, count })).toEqual({ kind: "jump", to: "first" });
+    }
+  });
+  it("keeps chords, composition and other modes ahead of motion bindings", () => {
+    expect(resolveKey("browse", key("j", { ctrlKey: true }), { ...ctx, table })).toBeNull();
+    expect(resolveKey("browse", key("j", { isComposing: true }), { ...ctx, table })).toBeNull();
+    expect(resolveKey("input", key("j"), { ...ctx, table })).toBeNull();
+    expect(resolveKey("caret", key("j"), { ...ctx, table })).not.toEqual({ kind: "scroll-line", delta: 1 });
+  });
+  it.each([
+    ["N", "row.down", true, { kind: "move", delta: 1 }],
+    ["?", "row.down", true, { kind: "move", delta: 1 }],
+    ["D", "top", true, { kind: "jump", to: "first" }],
+    ["V", "row.up", true, { kind: "move", delta: -1 }],
+    ["v", "row.up", false, { kind: "move", delta: -1 }],
+  ] as const)("%s takes precedence over its built-in action", (pressed, action, shiftKey, expected) => {
+    const custom: PanelTable = { ...table, bindings: [{ keys: [pressed], action, desc: "motion", source: "init.lua" }] };
+    expect(resolveKey("browse", key(pressed, { shiftKey }), { ...ctx, table: custom })).toEqual(expected);
+  });
+  it("uses the produced motion key with Alt/Option held", () => {
+    expect(resolveKey("browse", key("j", { altKey: true }), { ...ctx, table })).toEqual({ kind: "scroll-line", delta: 1 });
+  });
+  it("every tagged motion has the same action as its original key", () => {
+    const named = new Set<string>();
+    for (const row of BROWSE_KEYS) {
+      if (!row.motion) continue;
+      named.add(row.motion);
+      const { ev, pending } = parseKeyToken(row.keys.split(" / ")[0]);
+      const custom: PanelTable = { ...table, bindings: [{ keys: ["q"], action: row.motion, desc: row.what, source: "init.lua" }] };
+      expect(resolveKey("browse", key("q"), { ...ctx, table: custom }), row.motion)
+        .toEqual(resolveKey("browse", ev, { ...ctx, pending }));
+    }
+    expect(named.size).toBe(26);
   });
 });

@@ -869,3 +869,37 @@ describe("TypingGuard.clockNow: the present on the keydowns' clock", () => {
     expect(guard.mayAnswerNow(alone, false)).toBe(true);
   });
 });
+
+describe("effective motion keys", () => {
+  it("keeps today's motion set for a guard never given an override", () => {
+    for (const motion of ["h", "j", "k", "l", "g", "G", "Tab", "ArrowUp", "ArrowDown"]) {
+      const fresh = new TypingGuard();
+      fresh.onKey(motion, 1000);
+      fresh.onKey(" ", 1010);
+      expect(fresh.mayActAfterMotion(1010, false), motion).toBe(true);
+    }
+  });
+  it("uses a custom motion set per guard without changing another guard", () => {
+    const fresh = new TypingGuard();
+    guard.setMotionKeys(new Set(["x"]));
+    guard.onKey("x", 1000); guard.onKey(" ", 1010);
+    expect(guard.mayActAfterMotion(1010, false)).toBe(true);
+    guard.onKey("j", 2000); guard.onKey(" ", 2010);
+    expect(guard.mayActAfterMotion(2010, false)).toBe(false);
+    fresh.onKey("j", 2000); fresh.onKey(" ", 2010);
+    expect(fresh.mayActAfterMotion(2010, false)).toBe(true);
+  });
+  it("preserves the run and pending wait when the key set changes", () => {
+    const run = vi.fn();
+    guard.onKey("a", Date.now());
+    expect(guard.defer(Date.now(), false, run, "cancelled")).toBe(true);
+    guard.setMotionKeys(new Set(["x"]));
+    vi.advanceTimersByTime(TYPING_GUARD_MS);
+    expect(run).toHaveBeenCalledTimes(1);
+    const later = Date.now() + TYPING_GUARD_MS;
+    guard.onKey("x", later);
+    guard.setMotionKeys(new Set(["x", "z"]));
+    guard.onKey(" ", later + 10);
+    expect(guard.mayActAfterMotion(later + 10, false)).toBe(true);
+  });
+});

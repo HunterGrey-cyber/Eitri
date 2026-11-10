@@ -18,7 +18,14 @@
  *  the old offset is used. Only where the engine cannot hit-test text, or the row is now shorter than that offset, is
  *  the same fraction of the row's height used instead.
  *
+ *  "The view's top" is the top of what a reader sees: below the pinned prompt header while it is shown
+ *  (`effectiveTop`), so a row under the header is not the one anchored. Heights are kept from the list's own top,
+ *  which the header does not move, so the header appearing or going between the capture and the restore moves
+ *  nothing.
+ *
  *  Pure DOM reads and one `scrollTop` write; nothing here runs unless the list calls it. */
+
+import { headerInset } from "./promptHeader";
 
 /** The geometry this reads, so a test can supply a layout. Defaults to the DOM's own. */
 export type AnchorGeometry = {
@@ -35,6 +42,9 @@ export type ViewAnchor = {
   y: number;
   /** For a row that starts above the view: the point as a fraction of the row's height. */
   fraction: number | null;
+  /** How far below the list's top the view's top was (the pinned prompt header's height, `0` without it): where the
+   *  `fraction` point sat in the view. */
+  inset: number;
   /** For a row that starts above the view: the character at the view's top, when the engine found one, and its
    *  offset in the row's text (`chars`), for when the node itself has been replaced. */
   text: { node: Node; offset: number; chars: number; context: string } | null;
@@ -131,33 +141,35 @@ export function captureAnchor(
 ): ViewAnchor | null {
   const l = geometry.rect(list);
   const bottom = l.top + list.clientHeight;
+  const inset = headerInset(list, geometry.rect);
+  const top = l.top + inset;
   let row: Element | undefined;
   if (cursorRow !== undefined) {
     const r = geometry.rect(cursorRow);
-    if (r.bottom > l.top && r.top < bottom) row = cursorRow;
+    if (r.bottom > top && r.top < bottom) row = cursorRow;
   }
   if (row === undefined) {
-    const index = firstOnScreen(rows, l.top, geometry);
+    const index = firstOnScreen(rows, top, geometry);
     if (index >= rows.length || geometry.rect(rows[index]).top >= bottom) return null;
     row = rows[index];
   }
   const r = geometry.rect(row);
-  if (r.top >= l.top) return { row, y: r.top - l.top, fraction: null, text: null };
+  if (r.top >= top) return { row, y: r.top - l.top, fraction: null, inset, text: null };
   // The row starts above the view: the character at the view's top, a little inside the row's left edge.
-  const probe = l.top + 1;
+  const probe = top + 1;
   const caret = geometry.caretAt(r.left + 8, probe);
   let text: ViewAnchor["text"] = null;
   let y = 0;
   if (caret !== null && row.contains(caret.node)) {
-    const top = geometry.caretTop(caret.node, caret.offset);
-    const found = top === null ? null : charsBefore(row, caret.node, caret.offset);
-    if (top !== null && found !== null) {
+    const lineTop = geometry.caretTop(caret.node, caret.offset);
+    const found = lineTop === null ? null : charsBefore(row, caret.node, caret.offset);
+    if (lineTop !== null && found !== null) {
       text = { node: caret.node, offset: caret.offset, chars: found.chars, context: found.context };
-      y = top - l.top;
+      y = lineTop - l.top;
     }
   }
-  const fraction = r.height > 0 ? (l.top - r.top) / r.height : 0;
-  return { row, y, fraction, text };
+  const fraction = r.height > 0 ? (top - r.top) / r.height : 0;
+  return { row, y, fraction, inset, text };
 }
 
 /** How far the anchored point now sits from where it was, in the view; `null` when its row is gone. */
@@ -172,7 +184,7 @@ export function anchorDrift(list: HTMLElement, anchor: ViewAnchor, geometry: Anc
     const top = at === null ? null : geometry.caretTop(at.node, at.offset);
     if (top !== null) return top - l.top - anchor.y;
   }
-  if (anchor.fraction !== null) return r.top + anchor.fraction * r.height - l.top;
+  if (anchor.fraction !== null) return r.top + anchor.fraction * r.height - l.top - anchor.inset;
   return r.top - l.top - anchor.y;
 }
 

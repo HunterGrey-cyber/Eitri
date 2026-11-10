@@ -140,4 +140,32 @@ describe("the glide's driver", () => {
     }
     releaseHold(el, now);
   });
+  it("measures the view below the pinned prompt header: the line starts on the reading line of what shows", () => {
+    const el = list(Array.from({ length: 80 }, () => 60));
+    const header = document.createElement("div");
+    header.className = "prompt-header";
+    header.getBoundingClientRect = () => ({ top: 0, bottom: 24 }) as DOMRect;
+    document.body.appendChild(header);
+    const frames_: { scrollTop: number; y: number }[] = [];
+    (globalThis as { __eitriHoldTrace?: unknown }).__eitriHoldTrace = (f: { scrollTop: number; y: number }) => frames_.push(f);
+    try {
+      const started = startHold({
+        list: el,
+        rows: () => conversationRows(el),
+        cursor: 2,
+        direction: 1,
+        code: "KeyJ",
+        now,
+        onCursor: () => {},
+        onRelease: () => {},
+      });
+      expect(started).toBe(true);
+      frames(16);
+      releaseHold(el, now);
+      // A third of the way down the 376px below the header, plus the header: 149px (133px from the list's top).
+      expect(frames_[0].y - frames_[0].scrollTop).toBeGreaterThan(142);
+    } finally {
+      delete (globalThis as { __eitriHoldTrace?: unknown }).__eitriHoldTrace;
+    }
+  });
 });

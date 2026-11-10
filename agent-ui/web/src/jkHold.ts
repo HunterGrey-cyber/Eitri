@@ -23,6 +23,7 @@ import {
   STEP_LINES,
 } from "./jkScroll";
 import type { Direction, Span, View } from "./jkScroll";
+import { headerInset } from "./promptHeader";
 
 /** How far the view moves per key-repeat interval while held: the scroll distance of one repeat inside a tall
  *  row. So the glide covers what the repeats covered, at the same rate, without the jumps; and the speed
@@ -136,6 +137,9 @@ export class HoldMotion {
   readonly direction: Direction;
   private rows: readonly Span[];
   private height: number;
+  /** How much of the view's top something drawn over the list covers (the pinned prompt header): the reading
+   *  line, the margins and the rows that count as in view are all judged below it. */
+  private inset: number;
   private maxScrollTop: number;
   private readonly line: number;
   private speed: number;
@@ -151,6 +155,7 @@ export class HoldMotion {
     this.direction = input.direction;
     this.rows = input.rows;
     this.height = input.view.height;
+    this.inset = input.view.inset ?? 0;
     this.maxScrollTop = input.view.maxScrollTop;
     this.line = input.line;
     this.speed = input.speed;
@@ -164,9 +169,10 @@ export class HoldMotion {
     this.y = row === undefined ? reading : Math.min(row.bottom - 1, Math.max(row.top, reading));
   }
 
-  /** The reading line's place in the view, from its top. */
+  /** The reading line's place in the view, from its top: within the part of the view below the inset. */
   private anchor(): number {
-    return this.direction > 0 ? this.height * READING_LINE : this.height * (1 - READING_LINE);
+    const shown = this.height - this.inset;
+    return this.inset + (this.direction > 0 ? shown * READING_LINE : shown * (1 - READING_LINE));
   }
 
   private yMin(): number {
@@ -208,6 +214,7 @@ export class HoldMotion {
     }
     this.rows = rows;
     this.height = view.height;
+    this.inset = view.inset ?? 0;
     this.maxScrollTop = view.maxScrollTop;
     this.s = view.scrollTop;
     this.current = rowAtLine(rows, this.y, this.direction);
@@ -236,9 +243,9 @@ export class HoldMotion {
     this.viewSpeed = midRamp * Math.max(0, this.speed + ahead / HOLD_CATCH_UP_MS);
     let s = this.s + d * this.viewSpeed * dt;
     // A view too short for the line to drift in keeps the line inside its margins outright.
-    const margin = marginFor(this.height, this.line);
+    const margin = marginFor(this.height - this.inset, this.line);
     if (d > 0 && this.y > s + this.height - margin) s = this.y - (this.height - margin);
-    if (d < 0 && this.y < s + margin) s = this.y - margin;
+    if (d < 0 && this.y < s + this.inset + margin) s = this.y - this.inset - margin;
     const clamped = Math.max(0, Math.min(this.maxScrollTop, s));
     if (clamped !== s) this.viewSpeed = 0;
     this.s = clamped;
@@ -254,15 +261,15 @@ export class HoldMotion {
   release(): HoldSettle {
     const d = this.direction;
     const row = this.rows[this.current];
-    const margin = marginFor(this.height, this.line);
-    const room = d > 0 ? this.y - this.s - margin : this.s + this.height - this.y - margin;
+    const margin = marginFor(this.height - this.inset, this.line);
+    const room = d > 0 ? this.y - (this.s + this.inset) - margin : this.s + this.height - this.y - margin;
     const coast = Math.min((this.viewSpeed * HOLD_SETTLE_MS) / 3, Math.max(0, room));
     const coasted = Math.max(0, Math.min(this.maxScrollTop, this.s + d * coast));
     let target = coasted;
     if (row !== undefined) {
       const landing = decideLanding({
         direction: d,
-        view: { scrollTop: coasted, height: this.height, maxScrollTop: this.maxScrollTop },
+        view: { scrollTop: coasted, height: this.height, maxScrollTop: this.maxScrollTop, ...(this.inset > 0 ? { inset: this.inset } : {}) },
         row,
         line: this.line,
       });
@@ -316,6 +323,8 @@ type Hold = {
   intervals: number[];
   scrollHeight: number;
   clientHeight: number;
+  /** What the header covered when the glide last measured: it comes and goes as the glide scrolls. */
+  inset: number;
   end: (how: "release" | "cancel", at: number) => void;
 };
 
@@ -330,13 +339,15 @@ function trace(): HoldTrace | null {
   return typeof hook === "function" ? (hook as HoldTrace) : null;
 }
 
-/** The list's view and every row's extent, in content space, whole pixels; `null` with no layout. */
+/** The list's view and every row's extent, in content space, whole pixels; `null` with no layout. The view's
+ *  `inset` is what the pinned prompt header covers of its top (`./promptHeader`). */
 function measure(list: HTMLElement, rows: readonly HTMLElement[]): { view: View; spans: Span[] } | null {
   const l = list.getBoundingClientRect();
   const rectHeight = l.bottom - l.top;
   if (!(rectHeight > 0)) return null;
   const height = list.clientHeight > 0 ? list.clientHeight : Math.round(rectHeight);
   const scrollTop = list.scrollTop;
+  const inset = Math.min(headerInset(list), height);
   const spans = rows.map((row) => {
     const r = row.getBoundingClientRect();
     return { top: Math.round(r.top - l.top + scrollTop), bottom: Math.round(r.bottom - l.top + scrollTop) };
@@ -346,6 +357,7 @@ function measure(list: HTMLElement, rows: readonly HTMLElement[]): { view: View;
       scrollTop,
       height,
       maxScrollTop: list.scrollHeight > 0 ? Math.max(0, list.scrollHeight - height) : Number.POSITIVE_INFINITY,
+      ...(inset > 0 ? { inset } : {}),
     },
     spans,
   };
@@ -404,6 +416,7 @@ export function startHold(options: HoldOptions): boolean {
     intervals: [],
     scrollHeight: list.scrollHeight,
     clientHeight: list.clientHeight,
+    inset: headerInset(list),
     end: (how, at) => {
       if (holds.get(list) !== hold) return;
       holds.delete(list);
@@ -426,7 +439,12 @@ export function startHold(options: HoldOptions): boolean {
     if (holds.get(list) !== hold) return;
     if (Math.abs(list.scrollTop - hold.lastWritten) > SLACK_PX) motion.adopt(list.scrollTop);
     const rowsNow = options.rows();
-    if (rowsNow !== hold.rowEls || list.scrollHeight !== hold.scrollHeight || list.clientHeight !== hold.clientHeight) {
+    if (
+      rowsNow !== hold.rowEls ||
+      list.scrollHeight !== hold.scrollHeight ||
+      list.clientHeight !== hold.clientHeight ||
+      headerInset(list) !== hold.inset
+    ) {
       // The cursor's row is followed as an element, not an index: rows above it can fold or go away.
       const at = rowsNow.indexOf(hold.rowEls[hold.cursor]);
       const again = measure(list, rowsNow);
@@ -438,6 +456,7 @@ export function startHold(options: HoldOptions): boolean {
       hold.cursor = at;
       hold.scrollHeight = list.scrollHeight;
       hold.clientHeight = list.clientHeight;
+      hold.inset = headerInset(list);
       motion.rebase(again.spans, again.view, at);
     }
     // A missing repeat is judged only on a frame that came on time: after a frame the page was too busy

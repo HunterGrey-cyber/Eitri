@@ -17,6 +17,7 @@ pub struct PanelSeq(pub Vec<PanelKey>);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PanelAction {
+    Motion(PanelMotion),
     Tab(TabAction),
     Search,
     Keymap,
@@ -30,6 +31,37 @@ pub enum PanelAction {
     Follow,
     /// The remote-control device list (only offered while remote control is on in the window).
     RemoteDevices,
+}
+
+/// BROWSE actions resolved as built-in motions, preserving counts and key repeat.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PanelMotion {
+    RowDown,
+    RowUp,
+    ItemNext,
+    ItemPrev,
+    LineDown,
+    LineUp,
+    Top,
+    Bottom,
+    PromptNext,
+    PromptPrev,
+    ToolNext,
+    ToolPrev,
+    ErrorNext,
+    ErrorPrev,
+    EditNext,
+    EditPrev,
+    HunkNext,
+    HunkPrev,
+    SearchForward,
+    SearchBackward,
+    SearchNext,
+    SearchPrev,
+    JumpOlder,
+    JumpNewer,
+    DetailedToggle,
+    Help,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -87,6 +119,32 @@ pub fn parse_seq(text: &str) -> Result<PanelSeq, String> {
 
 pub fn parse_action(name: &str) -> Result<PanelAction, String> {
     Ok(match name {
+        "row.down" => PanelAction::Motion(PanelMotion::RowDown),
+        "row.up" => PanelAction::Motion(PanelMotion::RowUp),
+        "item.next" => PanelAction::Motion(PanelMotion::ItemNext),
+        "item.prev" => PanelAction::Motion(PanelMotion::ItemPrev),
+        "line.down" => PanelAction::Motion(PanelMotion::LineDown),
+        "line.up" => PanelAction::Motion(PanelMotion::LineUp),
+        "top" => PanelAction::Motion(PanelMotion::Top),
+        "bottom" => PanelAction::Motion(PanelMotion::Bottom),
+        "prompt.next" => PanelAction::Motion(PanelMotion::PromptNext),
+        "prompt.prev" => PanelAction::Motion(PanelMotion::PromptPrev),
+        "tool.next" => PanelAction::Motion(PanelMotion::ToolNext),
+        "tool.prev" => PanelAction::Motion(PanelMotion::ToolPrev),
+        "error.next" => PanelAction::Motion(PanelMotion::ErrorNext),
+        "error.prev" => PanelAction::Motion(PanelMotion::ErrorPrev),
+        "edit.next" => PanelAction::Motion(PanelMotion::EditNext),
+        "edit.prev" => PanelAction::Motion(PanelMotion::EditPrev),
+        "hunk.next" => PanelAction::Motion(PanelMotion::HunkNext),
+        "hunk.prev" => PanelAction::Motion(PanelMotion::HunkPrev),
+        "search.forward" => PanelAction::Motion(PanelMotion::SearchForward),
+        "search.backward" => PanelAction::Motion(PanelMotion::SearchBackward),
+        "search.next" => PanelAction::Motion(PanelMotion::SearchNext),
+        "search.prev" => PanelAction::Motion(PanelMotion::SearchPrev),
+        "jump.older" => PanelAction::Motion(PanelMotion::JumpOlder),
+        "jump.newer" => PanelAction::Motion(PanelMotion::JumpNewer),
+        "detailed.toggle" => PanelAction::Motion(PanelMotion::DetailedToggle),
+        "help" => PanelAction::Motion(PanelMotion::Help),
         "tab.new" => PanelAction::Tab(TabAction::New),
         "tab.next" => PanelAction::Tab(TabAction::Next),
         "tab.prev" => PanelAction::Tab(TabAction::Prev),
@@ -115,6 +173,34 @@ pub fn parse_action(name: &str) -> Result<PanelAction, String> {
 impl PanelAction {
     pub fn name(&self) -> &'static str {
         match self {
+            PanelAction::Motion(motion) => match motion {
+                PanelMotion::RowDown => "row.down",
+                PanelMotion::RowUp => "row.up",
+                PanelMotion::ItemNext => "item.next",
+                PanelMotion::ItemPrev => "item.prev",
+                PanelMotion::LineDown => "line.down",
+                PanelMotion::LineUp => "line.up",
+                PanelMotion::Top => "top",
+                PanelMotion::Bottom => "bottom",
+                PanelMotion::PromptNext => "prompt.next",
+                PanelMotion::PromptPrev => "prompt.prev",
+                PanelMotion::ToolNext => "tool.next",
+                PanelMotion::ToolPrev => "tool.prev",
+                PanelMotion::ErrorNext => "error.next",
+                PanelMotion::ErrorPrev => "error.prev",
+                PanelMotion::EditNext => "edit.next",
+                PanelMotion::EditPrev => "edit.prev",
+                PanelMotion::HunkNext => "hunk.next",
+                PanelMotion::HunkPrev => "hunk.prev",
+                PanelMotion::SearchForward => "search.forward",
+                PanelMotion::SearchBackward => "search.backward",
+                PanelMotion::SearchNext => "search.next",
+                PanelMotion::SearchPrev => "search.prev",
+                PanelMotion::JumpOlder => "jump.older",
+                PanelMotion::JumpNewer => "jump.newer",
+                PanelMotion::DetailedToggle => "detailed.toggle",
+                PanelMotion::Help => "help",
+            },
             PanelAction::Tab(action) => match action {
                 TabAction::New => "tab.new",
                 TabAction::Next => "tab.next",
@@ -142,6 +228,34 @@ impl PanelAction {
 
     pub fn desc(&self) -> &'static str {
         match self {
+            PanelAction::Motion(motion) => match motion {
+                PanelMotion::RowDown => "next row",
+                PanelMotion::RowUp => "previous row",
+                PanelMotion::ItemNext => "next row start",
+                PanelMotion::ItemPrev => "previous row start",
+                PanelMotion::LineDown => "one line down",
+                PanelMotion::LineUp => "one line up",
+                PanelMotion::Top => "first row",
+                PanelMotion::Bottom => "last row",
+                PanelMotion::PromptNext => "next prompt",
+                PanelMotion::PromptPrev => "previous prompt",
+                PanelMotion::ToolNext => "next tool call",
+                PanelMotion::ToolPrev => "previous tool call",
+                PanelMotion::ErrorNext => "next error",
+                PanelMotion::ErrorPrev => "previous error",
+                PanelMotion::EditNext => "next edit",
+                PanelMotion::EditPrev => "previous edit",
+                PanelMotion::HunkNext => "next hunk",
+                PanelMotion::HunkPrev => "previous hunk",
+                PanelMotion::SearchForward => "search forward",
+                PanelMotion::SearchBackward => "search backward",
+                PanelMotion::SearchNext => "next search match",
+                PanelMotion::SearchPrev => "previous search match",
+                PanelMotion::JumpOlder => "older jump",
+                PanelMotion::JumpNewer => "newer jump",
+                PanelMotion::DetailedToggle => "detailed view",
+                PanelMotion::Help => "all keys",
+            },
             PanelAction::Tab(action) => match action {
                 TabAction::Prev => "previous tab",
                 TabAction::Next => "next tab",
@@ -193,7 +307,7 @@ impl PanelSeq {
     }
 }
 
-/// Alone in BROWSE these already mean something (keymap.ts `resolveKey`). `o` and `A` enter INPUT
+/// For non-motion bindings, alone in BROWSE these already mean something (keymap.ts `resolveKey`). `o` and `A` enter INPUT
 /// like `i`, so a panel binding or nvim `mapleader`/mapping must not shadow them. `:` opens the
 /// panel's own command line and is protected the same way. `{` and `}` are reserved ahead of
 /// their BROWSE bindings so a user mapping cannot claim them first.
@@ -208,7 +322,7 @@ const TAKEN_PAIRS: &[&str] = &[
     "gy", "zi", "]t", "[t", "]c", "[c", "]d", "[d", "]m", "[m",
 ];
 
-/// Why `seq` may never be a panel binding, or `None` when it is free.
+/// Why `seq` may never be a non-motion panel binding, or `None` when it is free.
 pub fn reserved(seq: &PanelSeq) -> Option<String> {
     let PanelKey::Char(first) = seq.0[0] else { return None };
     if FIXED.contains(first) {
@@ -394,11 +508,32 @@ impl PanelUserTable {
     /// binds is the call's: the last `set` wins, as vim's maps do, and a default it takes over is
     /// recorded in `overrides`.
     pub fn set(&mut self, key: &str, action: &str) -> Result<(), String> {
+        let action = parse_action(action)?;
         let seq = parse_seq(key)?;
-        if let Some(why) = reserved(&seq) {
+        if matches!(action, PanelAction::Motion(_)) {
+            if matches!(seq.0[0], PanelKey::Char(c) if c.is_ascii_digit()) {
+                return Err("a motion sequence must not start with a digit (BROWSE counts)".into());
+            }
+            if !matches!(seq.0.as_slice(), [PanelKey::Char(_)] | [PanelKey::Space])
+                && !matches!(
+                    seq.0.as_slice(),
+                    [
+                        PanelKey::Char('g' | 'z' | '[' | ']'),
+                        PanelKey::Char(_) | PanelKey::Space
+                    ]
+                )
+            {
+                return Err("a motion requires one key or a two-key sequence starting with g z [ ]".into());
+            }
+            if matches!(seq.0.as_slice(), [PanelKey::Char('i' | 'o' | 'A' | ':' | 'y' | 'Y')]) {
+                return Err("a motion must not take i o A : y Y (input, command line or copy operator)".into());
+            }
+            if matches!(seq.0.as_slice(), [PanelKey::Char('g' | 'z' | '[' | ']')]) {
+                return Err("a motion must not take g z [ ] (they start pairs; bind a pair instead)".into());
+            }
+        } else if let Some(why) = reserved(&seq) {
             return Err(why);
         }
-        let action = parse_action(action)?;
         self.sets.retain(|b| b.seq != seq);
         self.overrides
             .retain(|(taken, _)| parse_seq(taken).ok() != Some(seq.clone()));
@@ -536,11 +671,42 @@ pub fn effective(user: &PanelUserTable, report: Option<&NvimReport>) -> (PanelKe
             }
         }
     }
-    // An `init.lua` `set` replaces whatever is left on its keys (a default, or nvim's): `set` itself
-    // refuses a live default, but a table built another way must not end up with two rows for one
-    // sequence, the first of which would win in the panel.
+    // An `init.lua` `set` replaces whatever is left on its keys (a default, or nvim's). Keep one
+    // row per sequence even when the table was built without `set`, since the panel uses the first match.
     bindings.retain(|b| !user.sets.iter().any(|s| s.seq == b.seq));
     bindings.extend(user.sets.iter().cloned());
+    // The leader is known only after nvim reports. A motion must leave its commands reachable.
+    bindings.retain(|b| {
+        if matches!(b.action, PanelAction::Motion(_)) && b.seq.0.as_slice() == [leader] {
+            log.push(format!(
+                "[keys] {}: the panel leader; a motion cannot take it",
+                b.seq.human(&leader_label)
+            ));
+            return false;
+        }
+        true
+    });
+    // A single-key motion runs immediately, so it cannot also start another surviving binding.
+    let motion_prefixes: Vec<PanelSeq> = bindings
+        .iter()
+        .filter(|b| matches!(b.action, PanelAction::Motion(_)) && b.seq.0.len() == 1)
+        .filter(|b| {
+            bindings
+                .iter()
+                .any(|other| other.seq.0.len() > 1 && other.seq.0.starts_with(&b.seq.0))
+        })
+        .map(|b| b.seq.clone())
+        .collect();
+    bindings.retain(|b| {
+        if motion_prefixes.contains(&b.seq) {
+            log.push(format!(
+                "[keys] {}: starts another binding; a motion cannot take it (bind a pair instead)",
+                b.seq.human(&leader_label)
+            ));
+            return false;
+        }
+        true
+    });
     let (timeoutlen_ms, timeout) = report.map_or((1000, true), |r| (r.timeoutlen, r.timeout));
     (
         PanelKeymap {
@@ -676,6 +842,76 @@ mod tests {
         assert!(parse_action("tab.rename").is_err());
     }
 
+    #[test]
+    fn motions_parse_round_trip_and_have_descriptions() {
+        for name in [
+            "row.down",
+            "row.up",
+            "item.next",
+            "item.prev",
+            "line.down",
+            "line.up",
+            "top",
+            "bottom",
+            "prompt.next",
+            "prompt.prev",
+            "tool.next",
+            "tool.prev",
+            "error.next",
+            "error.prev",
+            "edit.next",
+            "edit.prev",
+            "hunk.next",
+            "hunk.prev",
+            "search.forward",
+            "search.backward",
+            "search.next",
+            "search.prev",
+            "jump.older",
+            "jump.newer",
+            "detailed.toggle",
+            "help",
+        ] {
+            let action = parse_action(name).unwrap();
+            assert!(matches!(action, PanelAction::Motion(_)));
+            assert_eq!(action.name(), name);
+            assert!(!action.desc().is_empty());
+        }
+    }
+
+    #[test]
+    fn motion_bindings_relax_reservations_only_for_resolvable_sequences() {
+        let mut table = PanelUserTable::default();
+        for (key, action) in [("j", "line.down"), ("]t", "tool.prev"), ("}", "row.down"), ("G", "top")] {
+            table.set(key, action).unwrap();
+        }
+        for (key, rule) in [
+            ("1", "digit"),
+            ("1j", "digit"),
+            ("<leader>j", "one key"),
+            ("jj", "one key"),
+            ("gjt", "one key"),
+            ("<leader>", "one key"),
+            ("g<leader>", "one key"),
+            ("i", "input, command line or copy operator"),
+            ("o", "input, command line or copy operator"),
+            ("A", "input, command line or copy operator"),
+            (":", "input, command line or copy operator"),
+            ("y", "input, command line or copy operator"),
+            ("Y", "input, command line or copy operator"),
+            ("g", "they start pairs"),
+            ("z", "they start pairs"),
+            ("[", "they start pairs"),
+            ("]", "they start pairs"),
+        ] {
+            let error = table.set(key, "row.down").unwrap_err();
+            assert!(error.contains(rule), "{key}: {error}");
+        }
+        assert!(table.set("y", "top").unwrap_err().contains("copy operator"));
+        assert!(table.set("j", "tab.next").unwrap_err().contains("BROWSE"));
+        assert!(table.set("j", "unknown").unwrap_err().contains("not a panel action"));
+    }
+
     fn report(leader: Option<&str>, maps: &[(&str, Option<&str>, Option<&str>)]) -> NvimReport {
         NvimReport {
             v: 1,
@@ -706,6 +942,60 @@ mod tests {
             (PanelKey::Space, LeaderSource::Default, 1000, true)
         );
         assert_eq!(k.bindings.len(), default_bindings().len());
+    }
+
+    #[test]
+    fn effective_refuses_a_motion_on_the_effective_leader() {
+        for (key, report) in [
+            ("<Space>", None),
+            ("<Space>", Some(report(Some("jk"), &[]))),
+            ("x", Some(report(Some("x"), &[]))),
+        ] {
+            let mut user = PanelUserTable::default();
+            user.set(key, "row.down").unwrap();
+            let (map, log) = effective(&user, report.as_ref());
+            assert!(!map.bindings.iter().any(|b| b.seq == parse_seq(key).unwrap()));
+            assert_eq!(map.bindings, default_bindings());
+            assert!(log.contains(&format!(
+                "[keys] {}: the panel leader; a motion cannot take it",
+                map.leader_label
+            )));
+        }
+        let mut user = PanelUserTable::default();
+        user.set("<Space>", "row.down").unwrap();
+        let (map, log) = effective(&user, Some(&report(Some("x"), &[])));
+        assert!(find(&map, "Space").is_some());
+        assert!(log.is_empty());
+    }
+
+    #[test]
+    fn effective_refuses_motion_prefixes_of_surviving_user_or_nvim_bindings() {
+        for motion_first in [false, true] {
+            let mut user = PanelUserTable::default();
+            if motion_first {
+                user.set("x", "row.down").unwrap();
+            }
+            user.set("xa", "tab.next").unwrap();
+            if !motion_first {
+                user.set("x", "row.down").unwrap();
+            }
+            let (map, log) = effective(&user, None);
+            assert!(find(&map, "x").is_none());
+            assert!(find(&map, "x a").is_some());
+            assert!(log
+                .iter()
+                .any(|line| line.starts_with("[keys] x: starts another binding")));
+        }
+        let mut user = PanelUserTable::default();
+        user.set("x", "row.down").unwrap();
+        let report = report(None, &[("xa", Some(":bn<CR>"), None)]);
+        let (map, _) = effective(&user, Some(&report));
+        assert!(find(&map, "x").is_none());
+        assert_eq!(find(&map, "x a").unwrap().source, PanelSource::Nvim);
+        user.dels.push(parse_seq("xa").unwrap());
+        let (map, log) = effective(&user, Some(&report));
+        assert!(find(&map, "x").is_some());
+        assert!(log.is_empty());
     }
 
     #[test]

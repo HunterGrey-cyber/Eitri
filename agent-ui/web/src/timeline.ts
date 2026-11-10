@@ -593,3 +593,29 @@ export function waitingCardAfter(
   for (let step = 0; step < steps; step++) target = waitingCardIndex(timeline, target, delta, answered) ?? target;
   return target;
 }
+
+/** Structural stops are exclusive of the starting row and never wrap. */
+export function nextStop(
+  timeline: TimelineItem[],
+  from: number,
+  delta: 1 | -1,
+  what: "tool" | "error" | "edit",
+): number | null {
+  for (let i = from + delta; i >= 0 && i < timeline.length; i += delta) {
+    const item = timeline[i];
+    if (what === "tool") {
+      if (item.kind === "tool" || item.kind === "run") return i;
+    } else if (what === "error") {
+      if (item.kind === "tool" && (item.call.result?.isError || item.call.denied)) return i;
+      if (item.kind === "notice" && ["hook_block", "model_refusal"].includes(item.notice.kind)) return i;
+      if (item.kind === "ending" && (item.ending.kind === "failed" || item.ending.kind === "lost")) return i;
+    } else if (item.kind === "tool") {
+      const { name, result } = item.call;
+      if (result && !result.isError && (
+        ["Write", "Edit", "MultiEdit", "NotebookEdit", "acp:edit", "acp:delete", "acp:move"].includes(name) ||
+        (name === "fileChange" && result.content === "applied")
+      )) return i;
+    }
+  }
+  return null;
+}

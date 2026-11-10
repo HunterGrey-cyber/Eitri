@@ -31,13 +31,13 @@ export function runSummary(calls: ToolCallRecord[]): string {
     : text;
 }
 
-/** With the acceptEdits fast path, a `Write`/`Edit`/`NotebookEdit` can now
+/** With the acceptEdits fast path, a `Write`/`Edit`/`MultiEdit`/`NotebookEdit` can
  *  finish with no card at all, exactly as an ordinary read does -- so without this exclusion the
  *  loop below would fold it into a `Read 4 files, Edit ×1`-shaped run and the change it made would
- *  never be its own row. A run of other tools now stops at one of these three, on both sides, the
+ *  never be its own row. A run of other tools stops at a file change, on both sides, the
  *  same way a failed or still-gated call already does; reads and searches keep folding as before. */
 const NEVER_FOLDED_TOOLS = new Set([
-  "Write", "Edit", "NotebookEdit", "fileChange", "Monitor", "Agent", "Task", "TaskStop", "TaskOutput",
+  "Write", "Edit", "MultiEdit", "NotebookEdit", "fileChange", "Monitor", "Agent", "Task", "TaskStop", "TaskOutput",
   "Workflow", "RunWorkflow", "ScheduleWakeup", "CronCreate", "CronDelete", "CronList", "SendMessage", "ListAgents",
 ]);
 

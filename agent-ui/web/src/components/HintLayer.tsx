@@ -11,7 +11,9 @@
  *  addresses them by index. A target that is still on the page but has moved OUT of view -- the
  *  list following a streamed reply to its end scrolls it past the list's edge -- gets no label
  *  either, by the same `hintVisible` test `hint_collect` froze it with: measured where it now is,
- *  its tag would be drawn over the winbar, the status line or the composer.
+ *  its tag would be drawn over the winbar, the status line or the composer. A target wholly under the pinned
+ *  prompt header is out of view the same way (`../nav`'s clip box for the list starts below the header), and one
+ *  partly under it has its label clamped below it.
  *  Its letter still lands on it, and landing reveals the row. A user's own wheel scroll does not
  *  come here: it cancels the whole HINT (`shell/src/hint.rs`'s window-level scroll controller).
  *  A row whose sign cell has no width or has scrolled away is labelled like a link, small, at the

@@ -1,5 +1,5 @@
 [English](configuration.md) | 简体中文
-<!-- translated-from: configuration.md sha256=491c4ae84163d671c8420638061a77c906f7c0fbd58ac84559a2909061792b95 -->
+<!-- translated-from: configuration.md sha256=b779c27914770471eead3db067eb3b205e26745b505c109b051b07a0b9f8d5c2 -->
 
 # 配置
 
@@ -110,6 +110,12 @@ k.set("root", "M-z", "zoom")                  -- a key that works without the pr
 eitri.keymap.del("panel", "<leader>M")
 eitri.keymap.set("panel", "<leader>p", "model.pick")
 ```
+
+面板表也接受有名字的 BROWSE 移动动作，例如 `eitri.keymap.set("panel", "j", "line.down")`
+或 `eitri.keymap.set("panel", "]t", "tool.prev")`。移动绑定只能是一个字面键，或以 `g z [ ]` 开头的双键。
+它拒绝以数字开头、`<leader>`、单键 `i o A : y Y`（输入、命令行或复制操作符），以及单键 `g z [ ]`
+（它们是双键前缀，请绑定双键）。移动绑定不能占用面板实际使用的 leader，也不能占用其他仍有效的绑定的前缀键：
+Eitri 会丢弃它并在日志中说明原因。即使改了这些绑定，`y{motion}` 仍使用内置移动键。
 
 默认值是原版 tmux 的，以 `Ctrl+b` 为前缀。然后 Eitri 读取你的 tmux 配置（tmux 读的那些文件，以及它们用绝对路径 `source-file` 进来的文件；相对路径会被跳过，因为 Eitri 不知道 tmux 会拿哪个目录去解析它），最后应用你的 `eitri.keymap` 调用，所以你自己的调用优先。Eitri 只读 tmux 的文件；从不启动或询问 tmux。把 `keymap.from_tmux` 设为 `"off"` 可以跳过 tmux 这一步。
 

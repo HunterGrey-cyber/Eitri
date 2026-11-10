@@ -12,6 +12,7 @@
  */
 import type { VisualMotion } from "./keymap";
 import { conversationRows, rowOf } from "./nav";
+import { effectiveTop } from "./promptHeader";
 
 /** One boundary point: a DOM position "before" `offset` inside `node`, the same shape
  *  `Selection.collapse`/`setBaseAndExtent` take. Plain data, not a live `Range` -- the DOM selection is rebuilt FROM this on every key, never carried forward as a `Range`. */
@@ -561,9 +562,11 @@ export function revealCaret(caret: Caret, list: Element): boolean {
       const rect = rectOfCaret(caret);
       if (rect === null) return moved;
       const box = el.getBoundingClientRect();
+      // The list's own top is where the pinned prompt header ends: a caret under it is not on screen.
+      const boxTop = el === list ? effectiveTop(list) : box.top;
       if (scrolls.y) {
-        if (rect.top < box.top) {
-          el.scrollTop -= box.top - rect.top;
+        if (rect.top < boxTop) {
+          el.scrollTop -= boxTop - rect.top;
           moved = true;
         } else if (rect.bottom > box.bottom) {
           el.scrollTop += rect.bottom - box.bottom;
@@ -586,11 +589,12 @@ export function revealCaret(caret: Caret, list: Element): boolean {
   return moved;
 }
 
-/** The part of `list` actually on screen, in client coordinates. */
-function visibleBand(list: Element): { top: number; bottom: number } {
+/** The part of `list` actually on screen, in client coordinates: below the pinned prompt header (`effectiveTop`)
+ *  while it is shown. */
+export function visibleBand(list: Element): { top: number; bottom: number } {
   const rect = list.getBoundingClientRect();
   const viewport = window.innerHeight || document.documentElement.clientHeight || rect.bottom;
-  return { top: Math.max(rect.top, 0), bottom: Math.min(rect.bottom, viewport) };
+  return { top: Math.max(effectiveTop(list), 0), bottom: Math.min(rect.bottom, viewport) };
 }
 
 /** Seen in real WebKitGTK:

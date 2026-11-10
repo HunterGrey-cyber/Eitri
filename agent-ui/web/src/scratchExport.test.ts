@@ -148,7 +148,7 @@ describe("exportConversation", () => {
     ["Edit", { file_path: "a.rs" }, "a.rs"], ["Write", { file_path: "b.rs" }, "b.rs"],
     ["NotebookEdit", { notebook_path: "n.ipynb" }, "n.ipynb"], ["Grep", { pattern: "foo" }, "foo"],
     ["Glob", { pattern: "*.rs" }, "*.rs"], ["WebFetch", { url: "https://example.org" }, "https://example.org"],
-    ["WebSearch", { query: "docs" }, "docs"], ["Other", { a: 1 }, '{"a":1}'],
+    ["WebSearch", { query: "docs" }, "docs"], ["Other", { a: 1 }, '{\n  "a": 1\n}'],
   ])("exports %s's input", (name, input, expected) => {
     expect(exportConversation([tool(call(0, name, input, null))], options)).toContain(`${name}: ${expected}\n`);
   });

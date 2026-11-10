@@ -482,3 +482,75 @@ describe("a view too short for the margins (a squeezed panel)", () => {
     expect(trace).not.toContain("reveal");
   });
 });
+
+/* The pinned prompt header covers the top `inset` px of the view (`../promptHeader`): every decision judges the part
+   below it as the view, and gives back the list's own `scrollTop`. 400px view, 24px inset, 20px line. */
+describe("a view whose top is covered by the pinned prompt header", () => {
+  const INSET = 24;
+  const covered = (scrollTop: number): View => ({ scrollTop, height: 400, maxScrollTop: 100_000, inset: INSET });
+
+  it("an inset of 0 decides exactly what no inset does", () => {
+    const rows = [span(1010, 1100), span(1300, 1500), span(1500, 3000), span(200, 260), span(990, 1030)];
+    for (const row of rows) {
+      for (const direction of [1, -1, 0] as const) {
+        const plain = decideLanding({ direction, view: view(1000), row, line: LINE });
+        const zero = decideLanding({ direction, view: { ...view(1000), inset: 0 }, row, line: LINE });
+        expect(zero).toEqual(plain);
+      }
+    }
+  });
+
+  it("a row landed on goes below the header with its margin, never under it", () => {
+    // Without the header the row's top at 1010 is brought to the margin line at 1000 + 40.
+    expect(decideLanding({ direction: 0, view: view(1000), row: span(1010, 1100), line: LINE }).scrollTop).toBe(970);
+    const landing = decideLanding({ direction: 0, view: covered(1000), row: span(1010, 1100), line: LINE });
+    expect(landing).toEqual({ scrollTop: 946, how: "nearest" });
+    expect(1010 - landing.scrollTop).toBe(INSET + MARGIN);
+  });
+
+  it("a row inside the margins of the whole view but under the header's moves; one below it stays", () => {
+    expect(decideLanding({ direction: 0, view: view(1000), row: span(1050, 1100), line: LINE }).how).toBe("stay");
+    expect(decideLanding({ direction: 0, view: covered(1000), row: span(1050, 1100), line: LINE })).toEqual({
+      scrollTop: 986,
+      how: "nearest",
+    });
+    expect(decideLanding({ direction: 0, view: covered(1000), row: span(1070, 1100), line: LINE }).how).toBe("stay");
+  });
+
+  it("a tall row is entered at the reading line of the part that shows", () => {
+    const landing = decideLanding({ direction: 1, view: covered(1000), row: span(1500, 3000), line: LINE });
+    expect(landing.how).toBe("head");
+    expect(landing.scrollTop).toBe(Math.round(1500 - (400 - INSET) * READING_LINE - INSET));
+  });
+
+  it("j/k on a row wholly under the header brings it back below the header first", () => {
+    // Without the header the row is on screen and has nothing to scroll: the press moves the cursor on.
+    const plain = decidePress({ direction: 1, view: view(1000), row: span(1000, 1020), line: LINE, box: null, boxLine: LINE });
+    expect(plain.kind).toBe("move");
+    const press = decidePress({ direction: 1, view: covered(1000), row: span(1000, 1020), line: LINE, box: null, boxLine: LINE });
+    expect(press).toEqual({ kind: "reveal", scrollTop: 1000 - INSET - MARGIN });
+  });
+
+  it("k inside a tall row steps until its head is below the header's margin, not the list's", () => {
+    const tall = span(1050, 3000);
+    const plain = decidePress({ direction: -1, view: view(1000), row: tall, line: LINE, box: null, boxLine: LINE });
+    expect(plain.kind).toBe("move");
+    const press = decidePress({ direction: -1, view: covered(1000), row: tall, line: LINE, box: null, boxLine: LINE });
+    expect(press).toEqual({ kind: "row", scrollTop: 1050 - MARGIN - INSET });
+    // From there the head sits on the margin line below the header: the next k moves on.
+    expect(decidePress({ direction: -1, view: covered(986), row: tall, line: LINE, box: null, boxLine: LINE }).kind).toBe("move");
+  });
+
+  it("a tool result's box wholly under the header is not stepped", () => {
+    const box: BoxState = { top: 1000, bottom: 1020, scrollTop: 0, clientHeight: 20, scrollHeight: 200 };
+    const row = span(990, 1300);
+    const plain = decidePress({ direction: 1, view: view(1000), row, line: LINE, box, boxLine: LINE });
+    expect(plain.kind).toBe("box");
+    expect(decidePress({ direction: 1, view: covered(1000), row, line: LINE, box, boxLine: LINE }).kind).not.toBe("box");
+  });
+
+  it("STEP is unchanged by the header", () => {
+    const press = decidePress({ direction: 1, view: covered(1000), row: span(1000, 5000), line: LINE, box: null, boxLine: LINE });
+    expect(press).toEqual({ kind: "row", scrollTop: 1000 + STEP });
+  });
+});

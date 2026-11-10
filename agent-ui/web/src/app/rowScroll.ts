@@ -11,6 +11,7 @@ import {
   STEP_LINES,
 } from "../jkScroll";
 import { conversationRows } from "../nav";
+import { effectiveTop } from "../promptHeader";
 import { allCards } from "../timeline";
 import type { TabViewState } from "../tabs";
 import type { TurnDurations } from "../turnTimes";
@@ -43,7 +44,7 @@ export function scrollVisibleRowBox(row: HTMLElement | null, direction: 1 | -1):
   if (box === null || list === null) return false;
   const b = box.getBoundingClientRect();
   const l = list.getBoundingClientRect();
-  if (b.bottom <= l.top || b.top >= l.bottom) return false;
+  if (b.bottom <= effectiveTop(list) || b.top >= l.bottom) return false;
   return scrollBoxOneStep(box, direction);
 }
 
@@ -146,27 +147,30 @@ export function stepWithinRow(row: HTMLElement | null, direction: 1 | -1, times:
   return spent;
 }
 
-/** The conversation rows inside `list` that are at least partly on screen. */
+/** The conversation rows inside `list` that are at least partly on screen: below the top of what shows
+ *  (`effectiveTop`: a row wholly under the pinned prompt header is not on screen) and above the list's bottom. */
 function visibleRows(list: HTMLElement): HTMLElement[] {
   const l = list.getBoundingClientRect();
+  const top = effectiveTop(list);
   return conversationRows(list).filter((row) => {
     const r = row.getBoundingClientRect();
-    return r.bottom > l.top && r.top < l.bottom;
+    return r.bottom > top && r.top < l.bottom;
   });
 }
 
 /** Vim's scrolloff rule: after a scroll the panel did not make by moving the cursor, a cursor
- *  whose row is entirely off screen goes to the nearest visible row. `null`: leave it. Reads
- *  geometry only; never writes `scrollTop`. */
+ *  whose row is entirely off screen -- above the list, under the pinned prompt header, or below the
+ *  list -- goes to the nearest visible row. `null`: leave it. Reads geometry only; never writes `scrollTop`. */
 export function clampCursorToView(list: HTMLElement, rows: HTMLElement[], cursor: number): number | null {
   const current = rows[cursor];
   if (current === undefined) return null;
   const l = list.getBoundingClientRect();
+  const top = effectiveTop(list);
   const r = current.getBoundingClientRect();
-  if (r.bottom > l.top && r.top < l.bottom) return null;
+  if (r.bottom > top && r.top < l.bottom) return null;
   const onScreen = visibleRows(list);
   if (onScreen.length === 0) return null;
-  const target = r.bottom <= l.top ? onScreen[0] : onScreen[onScreen.length - 1];
+  const target = r.bottom <= top ? onScreen[0] : onScreen[onScreen.length - 1];
   const index = rows.indexOf(target);
   return index === -1 ? null : index;
 }

@@ -17,6 +17,8 @@
  *  Every coordinate is in the list's content space (a rect's top, less the list's top, plus its
  *  `scrollTop`), in CSS pixels, so a zoomed WebView and an unzoomed one give the same numbers. */
 
+import { headerInset } from "./promptHeader";
+
 /** A press inside a row (or a tool result's box) scrolls this many lines of that row's own text. */
 export const STEP_LINES = 3;
 
@@ -41,8 +43,16 @@ export const SCROLL_ANIMATION_MS = 150;
 export type Direction = 1 | -1;
 
 /** The visible part of the list: where its top is in content space, how tall it is, and how far it can
- *  scroll at most (`Infinity` where the engine reports no scroll height, as jsdom does). */
-export type View = { scrollTop: number; height: number; maxScrollTop: number };
+ *  scroll at most (`Infinity` where the engine reports no scroll height, as jsdom does). `inset`: how many pixels
+ *  at its top something drawn over the list covers (the pinned prompt header, `./promptHeader`); absent or `0`,
+ *  none. A row under it is not on screen, and every landing and step below keeps rows below it. */
+export type View = { scrollTop: number; height: number; maxScrollTop: number; inset?: number };
+
+/** The part of `view` a reader can see, in content space: from below the inset to the bottom. */
+function shownPart(view: View): { top: number; bottom: number; height: number; inset: number } {
+  const inset = view.inset ?? 0;
+  return { top: view.scrollTop + inset, bottom: view.scrollTop + view.height, height: view.height - inset, inset };
+}
 
 /** A vertical extent in content space. */
 export type Span = { top: number; bottom: number };
@@ -56,8 +66,8 @@ const clampTo = (view: View, scrollTop: number) => Math.max(0, Math.min(view.max
  *  view. A panel squeezed to a few lines has no room for two lines at each edge -- the margin lines would
  *  cross, every row would count as "taller than the view", and a press would step the view past a row only to
  *  bring it back again. */
-function marginFor(view: View, line: number): number {
-  return Math.min(MARGIN_LINES * line, view.height / 4);
+function marginFor(height: number, line: number): number {
+  return Math.min(MARGIN_LINES * line, height / 4);
 }
 
 export type Landing = {
@@ -99,24 +109,28 @@ export function decideLanding(input: {
   head?: boolean;
 }): Landing {
   const { direction, view, row, line, head = false } = input;
-  const margin = marginFor(view, line);
-  const top = view.scrollTop;
-  const bottom = top + view.height;
-  const stay: Landing = { scrollTop: top, how: "stay" };
-  const to = (want: number, how: Landing["how"]): Landing => ({ scrollTop: clampTo(view, Math.round(want)), how });
+  // Judged on the part of the view a reader sees (below the inset); `to` takes where that part's top should go.
+  const shown = shownPart(view);
+  const { top, bottom } = shown;
+  const margin = marginFor(shown.height, line);
+  const stay: Landing = { scrollTop: view.scrollTop, how: "stay" };
+  const to = (want: number, how: Landing["how"]): Landing => ({
+    scrollTop: clampTo(view, Math.round(want - shown.inset)),
+    how,
+  });
 
   if (row.top >= top + margin - SLACK_PX && row.bottom <= bottom - margin + SLACK_PX) return stay;
 
   const height = row.bottom - row.top;
-  if (height <= view.height - 2 * margin + SLACK_PX) {
-    const nearest = to(row.bottom > bottom - margin ? row.bottom - view.height + margin : row.top - margin, "nearest");
-    const move = nearest.scrollTop - top;
+  if (height <= shown.height - 2 * margin + SLACK_PX) {
+    const nearest = to(row.bottom > bottom - margin ? row.bottom - shown.height + margin : row.top - margin, "nearest");
+    const move = nearest.scrollTop - view.scrollTop;
     const enterAsTall =
       direction !== 0 &&
       !head &&
       Math.sign(move) === direction &&
-      Math.abs(move) > view.height * (1 - READING_LINE) + SLACK_PX &&
-      height > view.height * (1 - READING_LINE) - margin;
+      Math.abs(move) > shown.height * (1 - READING_LINE) + SLACK_PX &&
+      height > shown.height * (1 - READING_LINE) - margin;
     if (!enterAsTall) return nearest;
   }
 
@@ -125,8 +139,8 @@ export function decideLanding(input: {
   const toward = direction !== 0 ? direction : row.top >= bottom ? 1 : row.bottom <= top ? -1 : 0;
   if (toward === 0) return stay;
   return toward > 0
-    ? to(Math.max(top, row.top - view.height * READING_LINE), "head")
-    : to(Math.min(top, row.bottom - view.height * (1 - READING_LINE)), "tail");
+    ? to(Math.max(top, row.top - shown.height * READING_LINE), "head")
+    : to(Math.min(top, row.bottom - shown.height * (1 - READING_LINE)), "tail");
 }
 
 /** The next `scrollTop` for a tool result's own box one press in `direction`, or `null` when it has
@@ -149,20 +163,21 @@ export function boxStepTarget(box: BoxState, direction: Direction, boxLine: numb
  *  and the next press moves on. */
 function rowStepTarget(input: { direction: Direction; view: View; row: Span; line: number }): number | null {
   const { direction, view, row, line } = input;
-  const margin = marginFor(view, line);
+  const shown = shownPart(view);
+  const { top, bottom } = shown;
+  const margin = marginFor(shown.height, line);
   const step = STEP_LINES * line;
-  const top = view.scrollTop;
-  const bottom = top + view.height;
+  // `want` is where the shown part's top should go.
   let want: number;
   if (direction > 0) {
     if (row.bottom <= bottom - margin + SLACK_PX) return null;
-    want = Math.min(top + step, row.bottom - view.height + margin);
+    want = Math.min(top + step, row.bottom - shown.height + margin);
   } else {
     if (row.top >= top + margin - SLACK_PX) return null;
     want = Math.max(top - step, row.top - margin);
   }
-  const target = clampTo(view, Math.round(want));
-  return Math.abs(target - top) >= SLACK_PX ? target : null;
+  const target = clampTo(view, Math.round(want - shown.inset));
+  return Math.abs(target - view.scrollTop) >= SLACK_PX ? target : null;
 }
 
 export type Press =
@@ -188,14 +203,14 @@ export function decidePress(input: {
   boxLine: number;
 }): Press {
   const { direction, view, row, line, box, boxLine } = input;
-  const top = view.scrollTop;
-  const bottom = top + view.height;
+  // A row (or box) wholly under the inset is out of view, as one above the list's top is.
+  const { top, bottom } = shownPart(view);
 
   if (row.bottom <= top || row.top >= bottom) {
     // Judged from where the row lies, not from the key: a tall row above the view comes back at its tail
     // whichever way the press was going, since that is the end nearest the reader.
     const back = decideLanding({ direction: 0, view, row, line }).scrollTop;
-    return Math.abs(back - top) >= SLACK_PX ? { kind: "reveal", scrollTop: back } : { kind: "move" };
+    return Math.abs(back - view.scrollTop) >= SLACK_PX ? { kind: "reveal", scrollTop: back } : { kind: "move" };
   }
   if (box !== null && box.bottom > top && box.top < bottom) {
     const next = boxStepTarget(box, direction, boxLine);
@@ -233,7 +248,8 @@ export function rowTextElement(row: HTMLElement): HTMLElement {
 export type RowGeometry = { view: View; row: Span; line: number };
 
 /** The list's view and `row`'s extent, in whole pixels, or `null` when there is no layout to judge (the
- *  list has no height: jsdom, or a panel that is not laid out yet).
+ *  list has no height: jsdom, or a panel that is not laid out yet). The view's `inset` is the pinned prompt
+ *  header's height while it is shown (`headerInset`), and left out while it is not.
  *
  *  The view is `clientHeight`, the integer the engine clamps `scrollTop` against; its rect is a
  *  fraction taller (900.391px against 900) and measuring against that is what made one press at one
@@ -246,11 +262,13 @@ export function readRowGeometry(list: HTMLElement, row: HTMLElement): RowGeometr
   const height = list.clientHeight > 0 ? list.clientHeight : Math.round(rectHeight);
   const scrollTop = list.scrollTop;
   const r = row.getBoundingClientRect();
+  const inset = headerInset(list);
   return {
     view: {
       scrollTop,
       height,
       maxScrollTop: list.scrollHeight > 0 ? Math.max(0, list.scrollHeight - height) : Number.POSITIVE_INFINITY,
+      ...(inset > 0 ? { inset: Math.min(inset, height) } : {}),
     },
     row: { top: Math.round(r.top - l.top + scrollTop), bottom: Math.round(r.bottom - l.top + scrollTop) },
     line: computedLineHeight(rowTextElement(row)),
