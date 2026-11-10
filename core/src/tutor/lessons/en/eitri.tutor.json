@@ -3,9 +3,9 @@
     "29": "Press the prefix, then this key, to list every key: {prefix} ?",
     "86": "Zoom this module, or restore it: {prefix} z",
     "121": "Go back to the module that had the keys before: {prefix} ;",
-    "163": "Open a new tab in the agent panel: {prefix} c",
-    "199": "Clear the terminal's screen: {prefix} Ctrl+l",
-    "236": "Float this module, or put a float back: {prefix} F",
-    "265": "eitri.keymap.prefix(\"C-a\")"
+    "164": "Open a new tab in the agent panel: {prefix} c",
+    "200": "Clear the terminal's screen: {prefix} Ctrl+l",
+    "237": "Float this module, or put a float back: {prefix} F",
+    "266": "eitri.keymap.prefix(\"C-a\")"
   }
 }

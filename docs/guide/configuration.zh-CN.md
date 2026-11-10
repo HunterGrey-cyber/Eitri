@@ -1,5 +1,5 @@
 [English](configuration.md) | 简体中文
-<!-- translated-from: configuration.md sha256=b779c27914770471eead3db067eb3b205e26745b505c109b051b07a0b9f8d5c2 -->
+<!-- translated-from: configuration.md sha256=8facbe20e25fed6c62833753fc4f37e8d0e63b7b3c07b4ced1f0f21ded6f5f8f -->
 
 # 配置
 
@@ -59,7 +59,7 @@ API 定义保存在 `$XDG_DATA_HOME/eitri/lua/meta/eitri.lua`；`XDG_DATA_HOME` 
 | `agent.codex.command` | 绝对路径，或裸命令名 | 未设置 | Codex 标签页运行的 `codex`。`EITRI_CODEX` 优先于它；两者都没有时用 `PATH` 上的 `codex`，再去 Codex 的安装程序放它的地方找（[Agent](agents.zh-CN.md)）。带目录部分的相对路径会被拒绝，这个设置保持未设置。 |
 | `agent.default_mode` | `"manual"`、`"auto"` 或 `"bypass"` | `"auto"` | 新标签页开始时所处的模式。见[一次启动怎样开始](#how-a-launch-starts)。 |
 | `agent.restore` | `"offer"`、`"auto"`、`"off"` 或 `false` | `"offer"` | 对这个项目上一个窗口里开着的标签页怎么办。见[一次启动怎样开始](#how-a-launch-starts)。 |
-| `agent.thinking` | `"collapsed"`、`"preview"`、`"expanded"` 或 `"hidden"` | `"collapsed"` | agent 面板怎样显示 agent 的思考过程。`"collapsed"` 每段思考画成一行不显眼的行，像工具输出一样用 `Enter` 展开；`"preview"` 在一段思考还在写的时候，另外在一个不会变高的框里显示它最新的几行；`"expanded"` 完整显示每段思考；`"hidden"` 一段也不显示。无论这里怎么设，`Ctrl+o` 都会完整显示每段思考。 |
+| `agent.thinking` | `"collapsed"`、`"preview"`、`"expanded"` 或 `"hidden"` | `"collapsed"` | agent 面板怎样显示 agent 的思考过程。`"collapsed"` 每段思考画成一行不显眼的行，像工具输出一样用 `Enter` 展开；`"preview"` 在一段思考还在写的时候，另外在一个不会变高的框里显示它最新的几行；`"expanded"` 完整显示每段思考；`"hidden"` 一段也不显示。无论这里怎么设，`zi`（输入框里是 `Ctrl+o`）都会完整显示每段思考。 |
 | `agent.user_settings` | `true` / `"on"` 或 `false` / `"off"` | `true` | agent 会话是否加载你自己的 Claude Code 配置（你的 hook、插件、skill、`CLAUDE.md` 和权限规则），和终端里的 `claude` 一样。`false` 把你自己的配置排除在外；项目自己的配置由[信任](permissions.zh-CN.md)管，不由这个键管。 |
 | `agent.editor.tools` | `true` / `"on"` 或 `false` / `"off"` | `true` | 任何标签页里的 agent 是否得到[编辑器工具](editor-tools.zh-CN.md)。`false` 一个都不声明；已经在运行的会话沿用它开始时的工具。 |
 | `agent.editor.tool.<name>` | `true` / `"on"` 或 `false` / `"off"` | `true`，`nvim_exec` 是 `false` | 按名字指定其中一个工具：`open_file`、`read_buffer`、`editor_state`、`diagnostics`、`usages`、`hover`、`symbols`、`lsp_rename`、`format`、`lsp_code_actions`、`apply_code_action`、`apply_proposal` 或 `nvim_exec`。每个工具都是开着的，除非你关掉；[`nvim_exec`](editor-tools.zh-CN.md#nvim-exec) 相反，你打开之前一直是关的。Eitri 不认识的名字会在启动时被列出并指出是哪个键，那个开关保持默认。 |
@@ -111,11 +111,29 @@ eitri.keymap.del("panel", "<leader>M")
 eitri.keymap.set("panel", "<leader>p", "model.pick")
 ```
 
-面板表也接受有名字的 BROWSE 移动动作，例如 `eitri.keymap.set("panel", "j", "line.down")`
-或 `eitri.keymap.set("panel", "]t", "tool.prev")`。移动绑定只能是一个字面键，或以 `g z [ ]` 开头的双键。
-它拒绝以数字开头、`<leader>`、单键 `i o A : y Y`（输入、命令行或复制操作符），以及单键 `g z [ ]`
-（它们是双键前缀，请绑定双键）。移动绑定不能占用面板实际使用的 leader，也不能占用其他仍有效的绑定的前缀键：
-Eitri 会丢弃它并在日志中说明原因。即使改了这些绑定，`y{motion}` 仍使用内置移动键。
+**命名的动作。** `"panel"` 表也接受对话里各个移动动作的名字作为动作，所以你自己的键可以做内置键做的事：
+
+```lua
+eitri.keymap.set("panel", "J", "row.down")
+```
+
+| 名字 | 对应的内置键 |
+|---|---|
+| `row.down` `row.up` | `j` `k` |
+| `item.next` `item.prev` | `}` `{` |
+| `line.down` `line.up` | `Ctrl+e` `Ctrl+y`，滚动一行 |
+| `top` `bottom` | `gg` `G` |
+| `prompt.next` `prompt.prev` | `]]` `[[` |
+| `tool.next` `tool.prev` | `]t` `[t` |
+| `error.next` `error.prev` | `]d` `[d` |
+| `edit.next` `edit.prev` | `]m` `[m` |
+| `hunk.next` `hunk.prev` | `]c` `[c` |
+| `search.forward` `search.backward` `search.next` `search.prev` | `/` `?` `n` `N` |
+| `jump.older` `jump.newer` | `Ctrl+o` `Ctrl+i` |
+| `detailed.toggle` | `zi` |
+| `help` | 按键列表 |
+
+绑定到这些名字之一的键，按下就立刻生效，没有等待，数字前缀和按住不放的重复也和内置键一样。这是仅有的、可以占用内置键已经占着的键（`j`、`}`、`]t`）的面板绑定：在那个键上，内置键对你来说就不再有原来的作用，按键列表里显示的是你的键。一个名字只能绑一个键，或以 `g`、`z`、`[`、`]` 开头的两个键；以数字开头的序列（那是计数）、更长的或带 `<leader>` 的序列，以及 `i`、`o`、`A`（进入输入框）、`:`（命令行）、`y`、`Y`（复制），启动时会和其他错误调用一起被拒绝并列出。面板表里放不下带 `Ctrl`、`Alt`、`Enter`、`Tab` 或功能键的组合，所以内置的 `Alt+n`、`Alt+p`、`Ctrl+o` 和 `F1` 不能重新绑定也不能去掉；`jump.older` 和 `help` 可以让你自己的键拥有后两者的作用。另有两张表优先：`"root"` 表里的绑定会在面板看到之前先拿走它的 Ctrl 或 Alt 组合键（包括 `M-n`、`M-p` 和 `C-o`）；窗口前缀如果是 `C-x`，会先于输入框的 `Ctrl+x Enter` 拿走 `Ctrl+x`。
 
 默认值是原版 tmux 的，以 `Ctrl+b` 为前缀。然后 Eitri 读取你的 tmux 配置（tmux 读的那些文件，以及它们用绝对路径 `source-file` 进来的文件；相对路径会被跳过，因为 Eitri 不知道 tmux 会拿哪个目录去解析它），最后应用你的 `eitri.keymap` 调用，所以你自己的调用优先。Eitri 只读 tmux 的文件；从不启动或询问 tmux。把 `keymap.from_tmux` 设为 `"off"` 可以跳过 tmux 这一步。
 

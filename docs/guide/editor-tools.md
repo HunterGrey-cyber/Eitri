@@ -45,7 +45,7 @@ happened, for example "showed `b.py:42` in the editor".
 In a Claude Code or Codex tab, a folded editor-tool row shows the first lines of its answer; expand it with `Enter`,
 `za` or `zo` in BROWSE to read all of it:
 buffer lines, diagnostics, symbol locations, hover text or a proposal's paths and hunks. Unsaved buffers and omitted
-items are marked. `Ctrl+o` opens the detailed view with the original answer; press it again to return. Tool text is
+items are marked. `zi` in BROWSE (`Ctrl+o` in the box) opens the detailed view with the original answer; press it again to return. Tool text is
 shown literally, including any Markdown or HTML in it. Other agents keep their own tool titles and bodies.
 
 <a id="when-the-editor-is-out-of-sight"></a>
@@ -82,10 +82,9 @@ Claude Code's auto mode and a Codex tab's reviewer do not judge them.
 
 These cards differ from the other cards in a tab:
 
-- **Answer one on the card.** `a` approves it and `d` denies it, in browsing; `]p` and `[p` reach it, and its buttons
-  work as usual. `Ctrl+y` does not answer one: from the box, press `Esc` first. If a provider's card waits behind it,
-  `Ctrl+y` approves that one, and the band says which.
-- **`D` takes no reason**, and a card never offers "always".
+- **It has two answers.** Card mode takes it as it takes any card (`Alt-n`, or `Enter` on the card), but only `1` approves
+  and `2` denies: it takes no reason (`Tab` says so) and never offers "always". `Ctrl+y` answers nothing any more; if a
+  provider's card waits in the same tab, `Alt-n` walks between them.
 - **Entering Bypass does not answer one.** A card raised before you switched stays waiting in the Bypass tab, and it is
   not counted in the question `Shift+Tab` asks. A call made after you switched has no card, unless it is `nvim_exec`.
 - **A card approves the place it names.** If the path is a link and it leads somewhere else by the time you answer,
@@ -99,7 +98,7 @@ These cards differ from the other cards in a tab:
 
 `lsp_rename`, `format` and `apply_code_action` change nothing, on disk or in a buffer. Each answers with a proposal: an
 id, the files it would touch and the change to each. Only `apply_proposal` writes, and in a Manual or an Auto tab it
-raises a card first, with the files and their changes. `a` writes them and `d` leaves them as they are; the proposal
+raises a card first, with the files and their changes. `1` writes them and `2` leaves them as they are (card mode, `Alt-n`); the proposal
 stays and the agent is told.
 
 In browsing, `Ctrl+g` on that card shows one file of the proposal as it is on disk beside the file as the proposal would

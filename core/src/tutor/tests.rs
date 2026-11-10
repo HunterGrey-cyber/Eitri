@@ -50,8 +50,9 @@ const PREFIX_KEYS: &[(&str, &str)] = &[
     ("Alt+w", "container.tabbed"),
 ];
 
-/// Chords the lessons name on their own that are not the window's: the agent panel's own keys in its message box.
-const PANEL_CHORDS: &[&str] = &["Ctrl+u", "Ctrl+y"];
+/// Chords the lessons name on their own that are not the window's: the agent panel's own keys (`Ctrl+u` in its
+/// message box, `Alt+n` and `Alt+p` for card mode).
+const PANEL_CHORDS: &[&str] = &["Ctrl+u", "Alt+n", "Alt+p"];
 
 /// Prefixes the window may have: the stock one, a tmux user's, the two ten-column presets, and two whose spelling
 /// holds a character JSON has to escape.

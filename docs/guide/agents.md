@@ -106,7 +106,7 @@ stops the turn. `Ctrl+k` goes back to the conversation with the
 question still waiting, and `i` returns to it. A half-written answer survives a switch to another tab and a reload of
 the page.
 
-Only you answer a question: bypass, `Ctrl+y`, the card keys, saved rules and Claude Code's classifier never do (see
+Only you answer a question: bypass, the card keys, saved rules and Claude Code's classifier never do (see
 [Permissions](permissions.md#claudes-questions-to-you)). Closing the tab while a question waits asks first and says
 that closing cancels it. All the keys are in [Keys](keys.md#claudes-questions).
 
@@ -270,8 +270,8 @@ A mode change takes effect in Eitri at once and in Codex's reviewer at the next 
 reviewer it started with (a turn started in Manual or Bypass keeps asking about everything outside the sandbox; a
 turn started in Auto keeps its reviewer). `<prefix> i` says so in the `mode lag` row.
 
-**Approve and deny on a card.** `a` approves once and nothing is remembered; there is no "always allow". `d`
-denies and the turn goes on. `D` flashes that Codex takes no reason with a denial. `Ctrl+c` interrupts the
+**Approve and deny on a card.** In card mode `1` approves once and nothing is remembered; there is no "always allow", so
+no `3`. `2` denies and the turn goes on. `Tab` flashes that Codex takes no reason with a denial. `Ctrl+c` interrupts the
 turn, which also cancels the waiting request. A card shows what it approves: the command and its folder, each
 changed file with its diff in full, or the tool server, tool and arguments. A command card says it "runs outside the
 sandbox with your full rights", and a network card that it may.
@@ -429,7 +429,7 @@ classifier never apply.
   answered that way, and the card stays.
 - A card that cannot show the whole call has no approve option: a call input over 256 KiB, diffs that together
   exceed it, or a diff whose path or text is not a string. The card says Eitri held the option back and names
-  the files. `a` and `Ctrl+y` then flash "this card cannot be approved". You can still deny it or interrupt.
+  the files. `1` then flashes "this card cannot be approved". You can still deny it (`2`) or interrupt.
 - A card draws every line of each diff.
 - `Ctrl+c` interrupts: Eitri cancels the turn and answers every open request as cancelled. There is no local
   timeout; an agent that never ends the turn keeps the tab busy until you close it.
@@ -490,7 +490,7 @@ for an agent is this:
   "agent" }`, `eitri.layout.open("agent")`, or a split key then `a` from a chat); its first message asks the
   [trust question](permissions.md#trusting-a-project) in that view like any first session.
 - **A card is answered only from the page that shows its tab.** The base view shows a tab until you break it out,
-  and an extra view shows its tab; an answer (`a`, `d`, `D`, `Ctrl+y`, a button, the bypass `y` or the trust `y` and
+  and an extra view shows its tab; an answer (a card-mode key, a button, the bypass `y` or the trust `y` and
   `n`) sent from any other page is refused and the card keeps waiting. The case this is for: you press an answer
   in the base view in the moment `<prefix> !` moves that tab into a view of its own; the answer does not reach the
   tab, and the card is there to answer from its new view.
@@ -517,7 +517,7 @@ say). A chat that a float covers by any amount is still running, and it is treat
 
 - **Its chip is back in the top bar.** While a card waits it reads `agent ⚑N`, as it does when the chat is hidden.
   A turn that finishes while it is covered leaves `agent •`, which goes once the float is off the chat.
-- **A card cannot be answered from it.** A card answer from the covered page (`a`, `d`, `D`, `Ctrl+y`, a button),
+- **A card cannot be answered from it.** A card answer from the covered page (a card-mode key, a button),
   or the `y` that enters bypass mode, is refused and the card stays waiting. The app name flashes, and the toast and
   the page say which float covers it and the key that clears it, pressed with the keys in that float:
   `agent is under terminal 2: <prefix> S from terminal 2 stows it` for a scratch float, `agent is under

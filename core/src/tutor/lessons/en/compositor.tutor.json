@@ -3,8 +3,8 @@
     "29": "Press the prefix, then this key, to list every key: {prefix} ?",
     "95": "Raise or start a chat window: {prefix} a",
     "135": "Give the keys to the editor in window 1: {prefix} e",
-    "178": "Open a new tab in the agent panel: {prefix} c",
-    "214": "Clear the terminal's screen: {prefix} Ctrl+l",
-    "260": "eitri.keymap.prefix(\"C-a\")"
+    "179": "Open a new tab in the agent panel: {prefix} c",
+    "215": "Clear the terminal's screen: {prefix} Ctrl+l",
+    "261": "eitri.keymap.prefix(\"C-a\")"
   }
 }

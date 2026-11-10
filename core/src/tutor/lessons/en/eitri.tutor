@@ -136,7 +136,7 @@ nvim's.
     start a turn.
 
  3. Press `<Esc>`. The band says BROWSE. Here `j` and `k` move over the rows of
-    the conversation, `?` lists the panel's keys (`q` closes the list), and
+    the conversation, `F1` lists the panel's keys (`q` closes the list), and
     `i` goes back to the box.
 
  4. Each conversation is a tab. Press `{prefix} c`: a new, empty tab opens
@@ -148,13 +148,14 @@ nvim's.
 
  5. When an agent wants to run a tool that needs your approval, a card waits
     in the conversation. There is none now, so read this one:
-    In BROWSE, `a` approves the card under the cursor, `d` denies it and `D`
-    denies with a reason you type (in Claude tabs; Codex and ACP agents take
-    no reason, and `D` says so). `]p` and `[p` move to the next and the
-    previous waiting card. In INSERT, `Ctrl+y` approves the oldest card;
-    right after `Ctrl+u`, a first `Ctrl+y` answers nothing and says why, and
-    a second one answers. These keys answer only when you press them on their
-    own, so a word you are typing cannot answer a card by accident.
+    `Alt+n` takes the next waiting card into card mode (from the box too),
+    and so does `<Enter>` on the card's row in BROWSE. Then `1` approves, `2`
+    denies, and `3` approves and saves a rule where the card offers one.
+    `Tab` opens a box for a reason (in Claude tabs; Codex and ACP agents take
+    no reason). `<Esc>` leaves card mode with the card still waiting, and
+    `Alt+p` goes to the previous card. Letters never answer a card, and a
+    digit answers only once card mode has settled and no other key follows
+    it, so a word you are typing cannot answer a card by accident.
 
  6. Press `Ctrl+h` to come back here.
 

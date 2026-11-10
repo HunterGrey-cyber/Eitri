@@ -1,5 +1,5 @@
 [English](permissions.md) | 简体中文
-<!-- translated-from: permissions.md sha256=feecc7bda85d9262e3846c6f3322e38afc55f50bac503073545d065b7c044248 -->
+<!-- translated-from: permissions.md sha256=5a07dd1ffce00c57ac816c6b0705cd63e7b85f91c92fa591598a0be2dc875e58 -->
 
 # 权限与信任
 
@@ -80,7 +80,7 @@ Eitri 自己的规则拿路径去对照项目目录来判断。有些文件夹�
 <a id="saved-rules"></a>
 ## 保存的规则
 
-一个普通 shell 命令的权限卡片可以带一个第三个按钮，“Always allow `git log *` in this project”。按下它会保存一条规则并回答这张卡片。这个按钮属于 Eitri 自己的检查所画的卡片。Claude Code 运行它的 auto 模式时（这是通常的情况），Auto 标签页会把大多数调用交给那个模式，而不是画卡片，所以你在那里可能很少看到这个按钮；规则这时主要来自 Manual 标签页、Claude Code 运行在默认模式下的会话，或者来自手工编辑规则文件。
+一个普通 shell 命令的权限卡片可以带一个第三个按钮，“Always allow `git log *` in this project”。按下它，或在卡片模式里按 `3`，会保存一条规则并回答这张卡片。这个按钮属于 Eitri 自己的检查所画的卡片。Claude Code 运行它的 auto 模式时（这是通常的情况），Auto 标签页会把大多数调用交给那个模式，而不是画卡片，所以你在那里可能很少看到这个按钮；规则这时主要来自 Manual 标签页、Claude Code 运行在默认模式下的会话，或者来自手工编辑规则文件。
 
 - **规则长什么样。** 它按 Claude Code 的写法来写，`Bash(git log *)`，并且匹配完整的开头单词：`cargo test *` 允许 `cargo test --release`，但不允许 `cargo testx`。只有 `Bash` 有规则；其他任何工具都没有。
 - **按钮提供什么。** 命令的第一个单词，再加上第二个单词（当它是个普通单词时），所以 `git log --oneline` 提供 `git log *`，`uname -a` 提供 `uname *`。当一个选项出现在后面的普通单词之前（`git -C sub log`）时，什么都不提供，因为只用第一个单词会覆盖每一个子命令。按钮只出现在规则能起作用的地方：对于只因为它的第一个单词（或它的 `git` 子命令）不是已知只读的才询问的命令。因为其他任何原因而询问的命令没有第三个按钮。
@@ -121,7 +121,7 @@ Claude Code 的 `Workflow` 工具的卡片写着 `Run a dynamic workflow?`。它
 <a id="claudes-questions-to-you"></a>
 ## Claude 问你的问题
 
-除了请求权限，Claude 还可以用选择题问你（Claude Code 的 `AskUserQuestion` 工具）。这种提问从来不是权限卡片，只有你能回答它，用的是你在提问框里按的键（[按键](keys.zh-CN.md#claudes-questions)）。bypass 不会回答它，进入 bypass 也不会；`Ctrl+y`、卡片按键 `a` 和 `d`、保存的规则以及 Claude Code 的分类器同样不会。卡片和提问同时在等时，这些键只回答卡片。
+除了请求权限，Claude 还可以用选择题问你（Claude Code 的 `AskUserQuestion` 工具）。这种提问从来不是权限卡片，只有你能回答它，用的是你在提问框里按的键（[按键](keys.zh-CN.md#claudes-questions)）。bypass 不会回答它，进入 bypass 也不会；卡片按键、保存的规则以及 Claude Code 的分类器同样不会。卡片和提问同时在等时，这些键只回答卡片。
 
 - 被[浮动窗口](agents.zh-CN.md#a-chat-under-a-float)盖住的提问框不会发出回答，和被盖住的卡片一样，你已经选的内容会保留；浮动窗口移开之后就能发出。
 - 问题、选项和预览都以纯文本显示，隐藏字符和改变文字方向的字符会显示成可见的转义。预览里的 Markdown 不会显示图片、运行脚本或出现可点的控件。

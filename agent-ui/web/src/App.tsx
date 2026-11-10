@@ -4069,7 +4069,14 @@ export default function App() {
   }
 
   /** What an entry dropped, for the band: a pending prefix or leader sequence, or a count. */
-  function droppedFlash(pending: PendingPrefix | null, count: number | null, sequence: string[] | null): string | null {
+  function droppedFlash(
+    pending: PendingPrefix | null,
+    count: number | null,
+    sequence: string[] | null,
+    operator: YankOperator | null = null,
+  ): string | null {
+    // A waiting `y` (with its count, `i`/`a` or bracket) is one pending key: the operator is what was dropped.
+    if (operator !== null) return pendingDroppedFlash("y");
     if (pending !== null) return pendingDroppedFlash(pending === "C-w" ? "Ctrl+w" : pending);
     if (sequence !== null) return pendingDroppedFlash(sequenceTitle(panelTable, sequence));
     if (count !== null) return COUNT_DROPPED_FLASH;
@@ -6254,7 +6261,7 @@ export default function App() {
     if (action.kind === "card-mode") {
       event.preventDefault();
       const from = mode === "input" ? (waitingQuestion ? "dock" : "input") : "browse";
-      enterCardByChord(action.delta, typedAt, from, droppedFlash(pending, count, droppedSequence), event.repeat);
+      enterCardByChord(action.delta, typedAt, from, droppedFlash(pending, count, droppedSequence, operator), event.repeat);
       return;
     }
     // A digit accumulates into the count the NEXT `j`/`k`/`[[`/`]]` repeats -- read back out of

@@ -85,7 +85,7 @@ definition to match the Eitri version you run, changing the file only when its c
 | `agent.codex.command` | an absolute path, or a bare command name | unset | The `codex` a Codex tab runs. `EITRI_CODEX` outranks it; without either, `codex` on `PATH`, then where Codex's installers put it ([Agents](agents.md)). A relative path with a directory part is refused and the setting stays unset. |
 | `agent.default_mode` | `"manual"`, `"auto"` or `"bypass"` | `"auto"` | The mode a new tab starts in. See [How a launch starts](#how-a-launch-starts). |
 | `agent.restore` | `"offer"`, `"auto"`, `"off"` or `false` | `"offer"` | What happens to the tabs the last window on this project had open. See [How a launch starts](#how-a-launch-starts). |
-| `agent.thinking` | `"collapsed"`, `"preview"`, `"expanded"` or `"hidden"` | `"collapsed"` | How the agent panel shows the agent's thinking. `"collapsed"` draws one quiet row per thought, opened with `Enter` like a tool's output; `"preview"` also shows the newest lines of a thought while it is being written, in a box that does not grow; `"expanded"` shows every thought in full; `"hidden"` shows none. `Ctrl+o` shows every thought in full whatever this says. |
+| `agent.thinking` | `"collapsed"`, `"preview"`, `"expanded"` or `"hidden"` | `"collapsed"` | How the agent panel shows the agent's thinking. `"collapsed"` draws one quiet row per thought, opened with `Enter` like a tool's output; `"preview"` also shows the newest lines of a thought while it is being written, in a box that does not grow; `"expanded"` shows every thought in full; `"hidden"` shows none. `zi` (`Ctrl+o` in the box) shows every thought in full whatever this says. |
 | `agent.user_settings` | `true` / `"on"` or `false` / `"off"` | `true` | Whether agent sessions load your own Claude Code configuration (your hooks, plugins, skills, `CLAUDE.md` and permission rules), as `claude` does in a terminal. `false` leaves your own configuration out; a project's own configuration is governed by [trust](permissions.md), not by this key. |
 | `agent.editor.tools` | `true` / `"on"` or `false` / `"off"` | `true` | Whether an agent gets the [editor tools](editor-tools.md) in any tab. `false` declares none of them; a session already running keeps what it began with. |
 | `agent.editor.tool.<name>` | `true` / `"on"` or `false` / `"off"` | `true`, except `false` for `nvim_exec` | One of those tools by name: `open_file`, `read_buffer`, `editor_state`, `diagnostics`, `usages`, `hover`, `symbols`, `lsp_rename`, `format`, `lsp_code_actions`, `apply_code_action`, `apply_proposal` or `nvim_exec`. Every tool is on unless you turn it off, except [`nvim_exec`](editor-tools.md#nvim-exec), which is off unless you turn it on. A name Eitri does not know is listed at startup, naming the key, and that switch is left at its default. |
@@ -142,12 +142,38 @@ eitri.keymap.del("panel", "<leader>M")
 eitri.keymap.set("panel", "<leader>p", "model.pick")
 ```
 
-The panel table also accepts named BROWSE motions, for example `eitri.keymap.set("panel", "j", "line.down")`
-or `eitri.keymap.set("panel", "]t", "tool.prev")`. A motion takes one literal key or a pair beginning with
-`g z [ ]`. It refuses a leading digit, `<leader>`, single `i o A : y Y` (input, command line or copy operator),
-and single `g z [ ]` (they start pairs; bind a pair instead). A motion cannot take the effective panel leader
-or a key that starts another surviving binding: Eitri drops it and logs why. `y{motion}` still uses the built-in
-motion keys even when these bindings change.
+**Named motions.** The `"panel"` table also takes the names of the conversation's motions as actions, so a key of yours
+can do what a built-in key does:
+
+```lua
+eitri.keymap.set("panel", "J", "row.down")
+```
+
+| names | the built-in keys |
+|---|---|
+| `row.down` `row.up` | `j` `k` |
+| `item.next` `item.prev` | `}` `{` |
+| `line.down` `line.up` | `Ctrl+e` `Ctrl+y`, one line of scroll |
+| `top` `bottom` | `gg` `G` |
+| `prompt.next` `prompt.prev` | `]]` `[[` |
+| `tool.next` `tool.prev` | `]t` `[t` |
+| `error.next` `error.prev` | `]d` `[d` |
+| `edit.next` `edit.prev` | `]m` `[m` |
+| `hunk.next` `hunk.prev` | `]c` `[c` |
+| `search.forward` `search.backward` `search.next` `search.prev` | `/` `?` `n` `N` |
+| `jump.older` `jump.newer` | `Ctrl+o` `Ctrl+i` |
+| `detailed.toggle` | `zi` |
+| `help` | the list of keys |
+
+A key bound to one of these acts as soon as it is pressed, with no wait, and a count or a held key repeats it as it does
+the built-in. These are the only panel bindings that may take a key a built-in already holds (`j`, `}`, `]t`): on that
+key the built-in's meaning goes for you, and the list of keys shows your key. A name takes one key, or two keys starting
+with `g`, `z`, `[` or `]`; it is refused at startup, with the other bad calls, on a sequence that starts with a digit
+(that is a count), on a longer or `<leader>` sequence, and on `i`, `o` and `A` (they open the box), `:` (the command
+line) and `y` or `Y` (copy). The panel table holds no chord with `Ctrl`, `Alt`, `Enter`, `Tab` or a function key, so
+the built-in `Alt+n`, `Alt+p`, `Ctrl+o` and `F1` cannot be rebound or removed; `jump.older` and `help` give a key of
+your own the last two. Two other tables come first: a `"root"` binding takes its Ctrl or Alt chord before the panel
+sees it (`M-n`, `M-p` and `C-o` included), and a `C-x` window prefix takes `Ctrl+x` before the box's `Ctrl+x Enter`.
 
 The defaults are stock tmux's, with `Ctrl+b` as the prefix. Eitri then reads your tmux configuration (the same
 files tmux reads, and what they `source-file` by an absolute path; a relative path is skipped, because Eitri

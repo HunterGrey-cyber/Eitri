@@ -18,7 +18,7 @@ tab's failure row say so, name the places it looked, and give the address to get
 
 Keys are written for the default setup: the prefix is `Ctrl+b`, and "the leader" is `Space` unless your
 Neovim configuration sets another `mapleader` of a single key the panel can use (a longer or reserved one falls
-back to `Space`). The full list is in [Keys](keys.md); `?` in the panel shows it
+back to `Space`). The full list is in [Keys](keys.md); `F1` in the panel shows it
 too.
 
 ## The first launch
@@ -202,8 +202,8 @@ quiet line of its own, with a mark in front saying whether it finished (`✓`), 
 and removes, with the diff inside it.
 
 - `Esc` leaves the box and goes back to browsing the conversation. In browsing, `j` and `k` step from row to
-  row, `Enter` shows or hides a tool's result, `Ctrl+o` shows the detailed view (every result, with longer excerpts), `y` copies the row (to the
-  clipboard and the primary selection, so a middle-click pastes it too) and `?` lists all the keys.
+  row, `Enter` shows or hides a tool's result, `zi` shows the detailed view (every result, with longer excerpts), `yy` copies the row (to the
+  clipboard and the primary selection, so a middle-click pastes it too; `y` with an object copies part of a row) and `F1` lists all the keys.
 - `Ctrl+c` interrupts the turn that is running.
 - `Enter` on a message you type while a turn is running puts it into that turn without stopping it, as in
   Claude Code and Codex: the agent reads it at its next step, and it shows above the box as `↪ <message>` until
@@ -211,7 +211,8 @@ and removes, with the diff inside it.
   mid-turn holds it instead, as `⧗ <message>`, and sends it when the turn ends; the empty box says which one
   Enter does in that tab. Claude and Codex tabs take messages mid-turn; ACP tabs hold them. A message the
   agent did not read before the turn ended (an interrupt, for one) is held again with a line saying why.
-  `Ctrl+Enter` sends now: it interrupts the running turn, then sends what is held and this message.
+  `Ctrl+Enter` sends now: it interrupts the running turn, then sends what is held and this message. `Ctrl+x`, then
+  `Enter`, sends after the turn instead: the message waits until the turn ends and is not put into it.
 - `Ctrl+g` in the box edits your draft in Neovim; `:wq` brings it back.
 
 After a turn that edited files, `c` in browsing shows what changed on disk during it; see
@@ -253,18 +254,19 @@ project", which saves a rule that approves such commands without a card from the
 the questions Claude Code raises itself, so a command it still asks about gets a card even then; see
 [When Claude Code itself asks](permissions.md#when-claude-code-itself-asks).
 
-In browsing:
+You answer a card in **card mode**, which the card holds until you answer or leave. Press `Alt-n` (from the box too) to
+take the next waiting card in this tab, or `Enter` on the card's own row; when a card arrives, the band says so.
 
-- `a` approves the card under the cursor and `d` denies it. `]p` and `[p` jump to the next and the previous
-  waiting card without answering anything.
-- `D` denies and lets you type a reason first; `Enter` then sends the denial with that reason.
-- `h`, `l` and `Enter` work the buttons for you if you prefer to walk to one.
-- From the box, `Ctrl+y` approves the oldest card waiting in this tab, leaving out a card from an agent's
-  [editor tools](editor-tools.md#cards), which takes `a` or `d`. There is no key to deny from the box.
+- `1` approves, `2` denies, and `3` approves and saves the "Always allow" rule on a card that offers one.
+- `h` and `l`, then `Enter`, work the buttons for you if you prefer to walk to one.
+- `Tab` opens a box for a reason on a Claude card; `Enter` in it sends the denial with that reason.
+- `Esc` leaves card mode with the card still waiting, and you are back where you were. It never moves on to the next
+  card by itself.
 
-A key answers a card only when it is pressed on its own: `a`, `d` and `D` do nothing if another key was
-pressed within about a quarter of a second before or after, and none of them takes a count. That is so the
-first letters of a sentence you are typing cannot answer a card by accident.
+No letter answers a card: `a`, `d` and `D` do nothing, and neither does anything in the box. A digit answers only once
+card mode has settled (the digits turn from dim to bright after about a third of a second), and not if another key
+follows it within about a quarter of a second, so the first letters of a sentence you are typing cannot answer a card by
+accident. [Keys](keys.md#answering-a-card) has the whole list.
 
 **Manual, auto and bypass.** Every tab is in one of three modes, and `Shift+Tab` (or `<leader>m`) cycles them
 in Claude Code's order: manual, auto, bypass, then manual again.
@@ -403,7 +405,7 @@ prompt:
 
 The text after a colon on a row is Claude Code's own message, shown as it came, so a limit's reset time appears
 only if Claude Code wrote one. A row stays in the conversation, survives a panel reload (`<prefix> r`) and a
-tab switch, and can be copied with `y` like any other row.
+tab switch, and can be copied with `yy` like any other row.
 
 When the session itself is gone, the conversation says so. A red `This session was lost` banner means the
 connection broke and what is shown above may be incomplete; a quiet `This session has ended (<reason>)` means

@@ -104,8 +104,8 @@ its own: its module key (`<prefix> g` above) hides it again.
 
 - **Answering stays in the chat.** No page has a key that answers a card or a question or the trust question. When the
   round's current agent stops needing you (you answered in its chat), the round moves to the next one by itself, and
-  the next chat's answer keys wait for a quarter of a second after it arrives, so a key you were still pressing
-  cannot answer a card you have not read. The same wait applies whenever any page, `prefix u` or `prefix a` brings a
+  a card in the next chat is answered only in card mode, which you enter yourself (`Alt-n`), so a key you were
+  still pressing cannot answer a card you have not read. The same wait applies whenever any page, `prefix u` or `prefix a` brings a
   chat forward.
 - **Stopping is asked in the chat.** `x` brings the chat forward and it draws its own `Stop this turn? (y/n)` (also
   when Claude Code works on something the chat cannot show, which the row calls `running`), or

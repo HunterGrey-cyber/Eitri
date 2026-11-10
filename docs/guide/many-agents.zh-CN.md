@@ -1,5 +1,5 @@
 [English](many-agents.md) | 简体中文
-<!-- translated-from: many-agents.md sha256=7b3b8106f80e38e330e0dc7f6e681021c6c2cf4f5877fe3a2e384f05338c6a92 -->
+<!-- translated-from: many-agents.md sha256=f47bf21c2efb6018ebca4b1eb3c867a5365976ee2d5385d3fde372d24e26fa19 -->
 
 # 同时用很多 agent
 
@@ -73,7 +73,7 @@ eitri.layout.rule("lua:agents-strips", { at = "left-edge", size = "62px" })
 
 Strips 另有 `m` 标记一行。表格另有 `s` 循环切换排序（状态、时间、项目、标签），`S` 反向，并且它是唯一会重新排序的页面，因为你是打开它、读、再关上它，就像用 `top` 一样。它自己没有关闭键：再按它的模块键（上面的 `<prefix> g`）就会把它隐藏。
 
-- **回答仍然在聊天里。** 没有任何页面有回答卡片、提问或信任问题的键。当这一轮当前的那个 agent 不再需要你（你在它的聊天里回答了），这一轮会自己移到下一个，而下一个聊天的回答键在它到达后要等四分之一秒，所以你还在按的键，不会去回答一张你没读过的卡片。任何页面、`prefix u` 或 `prefix a` 把一个聊天带到前面时，同样要等这四分之一秒。
+- **回答仍然在聊天里。** 没有任何页面有回答卡片、提问或信任问题的键。当这一轮当前的那个 agent 不再需要你（你在它的聊天里回答了），这一轮会自己移到下一个，而下一个聊天里的卡片只能在卡片模式里回答，卡片模式要你自己进入（`Alt-n`），所以你还在按的键，不会去回答一张你没读过的卡片。任何页面、`prefix u` 或 `prefix a` 把一个聊天带到前面时，同样要等这四分之一秒。
 - **停止在聊天里问。** `x` 把聊天带到前面，它自己画出 `Stop this turn? (y/n)`（Claude Code 在做聊天里显示不出来的事、行显示为 `running` 时也是这样），只有后台任务在运行时画出 `Stop the background work? (y/n)`。`y` 停止；`n` 或 `Esc` 什么也不做。什么都没在运行的 agent 会被拒绝（`idle`），在伴随面板里也一样，而且什么都不会被带到前面。
 
 <a id="keys-without-a-page"></a>
