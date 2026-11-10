@@ -2,10 +2,6 @@
 -- without sharing a global with the embedded editor's unconditional reload timer.
 local opts = ...
 opts = opts or {}
-local always = opts.always == true
-local torn = false
-local timer
-local group = vim.api.nvim_create_augroup("EitriBufferReload", { clear = true })
 
 -- What this part knows about each buffer it has met: the name it had, and whether its file has been seen
 -- since the buffer last looked like one opened on a missing file. A buffer number is never reused.
@@ -39,7 +35,7 @@ local function reread(b)
     vim.go.eventignore = (ignore == "" and "" or ignore .. ",") .. "BufEnter,BufLeave,WinEnter,WinLeave"
     flag("autochdir", false)
     vim.api.nvim_buf_call(b, function()
-      vim.cmd("silent keepalt keepjumps edit")
+      vim.api.nvim_cmd({ cmd = "edit", mods = { silent = true, keepalt = true, keepjumps = true } }, {})
     end)
   end)
   pcall(put, "shortmess", short)
@@ -103,6 +99,27 @@ local function checkable(b)
   return "check"
 end
 
+-- A caller that already knows which buffer is shown can use the same guard without a timer or hooks.
+local function check_buffer(b)
+  if not vim.api.nvim_buf_is_valid(b) or vim.bo[b].modified then return end
+  local ar = vim.api.nvim_get_option_value("autoread", { buf = b })
+  if ar == nil or ar == -1 then ar = vim.go.autoread end
+  if ar ~= true and ar ~= 1 then return end
+  local how = checkable(b)
+  if how == "reread" then
+    if reread(b) then files[b].seen = true end
+  elseif how then
+    vim.api.nvim_cmd({ cmd = "checktime", args = { tostring(b) } }, {})
+  end
+end
+
+if opts.guard_only then return check_buffer end
+
+local always = opts.always == true
+local torn = false
+local timer
+local group = vim.api.nvim_create_augroup("EitriBufferReload", { clear = true })
+
 -- Checks only buffers shown in a window, as a bare checktime does, and leaves alone a modified buffer
 -- and one with autoread off: in the person's own nvim a UI is attached, and checktime on those
 -- raises W12 or W11 as a dialog that takes the next keys typed. `checkable` keeps out the two cases
@@ -124,24 +141,7 @@ local function check_shown()
         return
       end
       seen[b] = true
-      if vim.bo[b].modified then
-        return
-      end
-      local ar = vim.api.nvim_get_option_value("autoread", { buf = b })
-      if ar == nil or ar == -1 then
-        ar = vim.go.autoread
-      end
-      if ar ~= true and ar ~= 1 then
-        return
-      end
-      local how = checkable(b)
-      if how == "reread" then
-        if reread(b) then
-          files[b].seen = true
-        end
-      elseif how then
-        vim.cmd("checktime " .. b)
-      end
+      check_buffer(b)
     end)
   end
 end

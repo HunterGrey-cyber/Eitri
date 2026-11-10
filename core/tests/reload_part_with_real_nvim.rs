@@ -53,17 +53,17 @@ impl FileBuffer {
         nvim.exec_lua(
             r#"
 vim.api.nvim_cmd({cmd='edit', args={...}, magic={file=false}}, {})
-local cmd = vim.cmd
+local cmd = vim.api.nvim_cmd
 _G.reload_checks = 0
 _G.reload_after_torn = 0
-vim.cmd = function(c)
-  if type(c) == 'string' and c:match('^checktime') then
+vim.api.nvim_cmd = function(c, options)
+  if c.cmd == 'checktime' then
     _G.reload_checks = _G.reload_checks + 1
     if _G.saved_reload_slot and _G.saved_reload_slot.torn then
       _G.reload_after_torn = _G.reload_after_torn + 1
     end
   end
-  return cmd(c)
+  return cmd(c, options)
 end
 "#,
             vec![Value::from(file.to_str().unwrap())],

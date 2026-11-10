@@ -1202,7 +1202,7 @@ fn the_module_is_installed_once() {
     fx.open(&path);
     fx.show(&path, &meta(2), &t.hunks);
     let shown = fx.nvim.footprint_of(&["eitri_review"], &["__eitri_review"]);
-    assert_eq!(shown.autocmds, 6, "{shown:?}");
+    assert_eq!(shown.autocmds, 7, "{shown:?}");
     fx.show(&path, &meta(2), &t.hunks);
     assert_eq!(fx.nvim.footprint_of(&["eitri_review"], &["__eitri_review"]), shown);
     let other = fx.file("other.txt", &t.end);
@@ -2069,7 +2069,7 @@ fn closing_the_last_overlay_removes_the_autocommands() {
     // `<localleader>q`.
     fx.open(&path);
     assert_eq!(count(&fx.show(&path, &meta(2), &t.hunks), "drawn"), 2);
-    assert_eq!(leftovers(&mut fx).0, 6);
+    assert_eq!(leftovers(&mut fx).0, 7);
     fx.feed(",q");
     assert_eq!(leftovers(&mut fx).0, 0, "closing the overlay leaves no autocommand");
     assert_eq!(fx.marks().count, 0);
@@ -2082,7 +2082,7 @@ fn closing_the_last_overlay_removes_the_autocommands() {
 
     // The next show brings the autocommands back, and they work.
     assert_eq!(count(&fx.show(&path, &meta(2), &t.hunks), "drawn"), 2);
-    assert_eq!(leftovers(&mut fx).0, 6);
+    assert_eq!(leftovers(&mut fx).0, 7);
     fx.cursor(5);
     fx.feed("A!<Esc>");
     fx.wait_for_marks(5);
@@ -2092,7 +2092,7 @@ fn closing_the_last_overlay_removes_the_autocommands() {
     fx.open(&second);
     assert_eq!(count(&fx.show(&second, &meta(2), &t.hunks), "drawn"), 2);
     fx.feed(",q");
-    assert_eq!(leftovers(&mut fx).0, 6);
+    assert_eq!(leftovers(&mut fx).0, 7);
     fx.open(&path);
     fx.feed(",q");
     assert_eq!(leftovers(&mut fx).0, 0);
@@ -2163,7 +2163,7 @@ fn a_fully_reverted_file_is_still_followed_after_it_is_shown_again() {
     assert_eq!(count(&again, "drawn"), 0, "{again:?}");
     assert_eq!(count(&again, "kept"), 1, "{again:?}");
     assert_eq!(count(&again, "active"), 1, "{again:?}");
-    assert_eq!(leftovers(&mut fx).0, 6);
+    assert_eq!(leftovers(&mut fx).0, 7);
     assert_eq!(fx.review_maps().len(), 4);
     assert!(fx.events().is_empty(), "no event: the host asked");
 
@@ -2245,6 +2245,11 @@ fn follow_edits_cost_does_not_grow_with_reverted_hunks() {
     const TIME_FOLLOW_LUA: &str = r#"
 local best = math.huge
 for _ = 1, 5 do
+  -- A formatter replaces every line, creating a new tick whose changed range spans the ghosts.
+  local lines = vim.api.nvim_buf_get_lines(0, 0, -1, true)
+  vim.api.nvim_buf_set_lines(0, 0, -1, true, lines)
+  vim.api.nvim_buf_set_mark(0, '[', 1, 0, {})
+  vim.api.nvim_buf_set_mark(0, ']', #lines, 0, {})
   collectgarbage('collect')
   local start = vim.uv.hrtime()
   vim.api.nvim_exec_autocmds('TextChanged', { buffer = 0 })
@@ -2522,6 +2527,164 @@ fn live_show_reloads_an_unmodified_buffer_first() {
 
 #[test]
 #[ignore = "needs nvim"]
+fn review_open_refuses_a_fifo_and_the_editor_stays_responsive() {
+    use std::ffi::CString;
+    use std::os::unix::ffi::OsStrExt;
+
+    let mut fx = Fx::new("open-fifo");
+    let two = two_hunks();
+    let path = fx.file("fifo.txt", &two.end);
+    std::fs::remove_file(&path).unwrap();
+    let name = CString::new(path.as_os_str().as_bytes()).unwrap();
+    // SAFETY: name is a terminated path in this test's private scratch directory.
+    assert_eq!(unsafe { libc::mkfifo(name.as_ptr(), 0o600) }, 0);
+    let answer = fx.nvim.lua(
+        OPEN_AND_SHOW_LUA,
+        open_and_show_args(&path, Some(5), &meta(2), Some(&two.hunks)),
+    );
+    assert_eq!(get(&answer, "opened"), &Value::from(false));
+    assert!(text(get(&answer, "error")).contains("regular file"), "{answer:?}");
+    assert_eq!(fx.nvim.eval("1 + 1"), Value::from(2));
+}
+
+#[test]
+#[ignore = "needs nvim"]
+fn live_show_rereads_a_new_file_without_a_prompt() {
+    let mut fx = Fx::new("live-new-file");
+    let path = fx.scratch.0.join("files/new.txt");
+    fx.open(&path);
+    fx.nvim.command("setlocal autoread");
+    fx.nvim.request(
+        "nvim_ui_attach",
+        vec![
+            Value::from(80),
+            Value::from(24),
+            opts_map(&[("rgb", Value::from(true))]),
+        ],
+    );
+    std::fs::write(&path, b"created\n").unwrap();
+    let hunk = hunk_of(1, b"", b"created\n", (1, 0), (1, 1));
+    let answer = live_show(&mut fx, &path, "t1", 1, &[hunk]);
+    assert_eq!(text(&fx.nvim.eval("mode(1)")), "n", "no reload prompt");
+    assert_eq!(fx.lines(), vec![b"created".to_vec()]);
+    assert_eq!(count(&answer, "drawn"), 1);
+    assert!(!fx.modified());
+}
+
+#[test]
+#[ignore = "needs nvim"]
+fn renaming_a_reviewed_buffer_clears_its_actions() {
+    for live in [false, true] {
+        let mut fx = Fx::new("rename");
+        let (path, two) = live_two(&mut fx);
+        if live {
+            live_show(&mut fx, &path, "t1", 32, &two.hunks);
+        } else {
+            fx.show(&path, &meta(2), &two.hunks);
+        }
+        fx.nvim.lua(
+            "for _, m in ipairs(vim.api.nvim_buf_get_keymap(0, 'n')) do \
+             if m.lhs == ',r' then _G.__revert = m.callback end end",
+            vec![],
+        );
+        let renamed = fx.scratch.0.join("files/b.txt");
+        fx.nvim.lua(
+            "local path = ... vim.api.nvim_cmd({ cmd = 'file', args = { path }, magic = { file = false } }, {})",
+            vec![Value::from(renamed.to_str().unwrap())],
+        );
+        assert_eq!(fx.marks().count, 0);
+        assert!(fx.review_maps().is_empty());
+        fx.nvim.lua("_G.__revert() _G.__eitri_review.undo_current()", vec![]);
+        assert_eq!(
+            fx.nvim.lua(
+                "return _G.__eitri_review.overlays[vim.api.nvim_get_current_buf()] == nil",
+                vec![]
+            ),
+            Value::from(true),
+            "no overlay remains for either action"
+        );
+        assert_eq!(fx.lines(), as_lines(&two.end));
+        fx.write();
+        assert_eq!(std::fs::read(&renamed).unwrap(), two.end);
+        assert_eq!(fx.event_kinds(), vec!["off"]);
+    }
+}
+
+fn check_ghost_search_bound(case: &str) {
+    let mut fx = Fx::new("ghost-search-bound");
+    let mut base = b"OLD\n".to_vec();
+    let mut end = b"NEW\n".to_vec();
+    let padding = if case == "bytes" {
+        "x".repeat(5 * 1024 * 1024)
+    } else {
+        "padding".repeat(50)
+    };
+    for _ in 0..100 {
+        base.extend_from_slice(b"tail\n");
+        end.extend_from_slice(b"tail\n");
+    }
+    base.extend_from_slice(padding.as_bytes());
+    end.extend_from_slice(padding.as_bytes());
+    let path = fx.file("f.txt", &end);
+    fx.open(&path);
+    let hunk = hunk_of(1, &base, &end, (1, 1), (1, 1));
+    fx.show(&path, &meta(2), &[hunk]);
+    fx.cursor(1);
+    fx.feed(",r");
+    assert_eq!(fx.event_kinds(), vec!["revert"]);
+    fx.nvim.lua(
+        "_G.__full = 0 local orig = vim.api.nvim_buf_get_lines \
+         vim.api.nvim_buf_get_lines = function(b, s, e, strict) \
+           if s == 0 and e == -1 then _G.__full = _G.__full + 1 end \
+           return orig(b, s, e, strict) end",
+        vec![],
+    );
+    if case == "distant" {
+        fx.cursor(102);
+        for _ in 0..20 {
+            fx.feed("x");
+            fx.nvim
+                .lua("vim.api.nvim_exec_autocmds('TextChanged', { buffer = 0 })", vec![]);
+        }
+    } else {
+        if case == "bytes" {
+            fx.feed("x");
+        }
+        if case == "tick" {
+            fx.nvim.lua(
+                "vim.api.nvim_exec_autocmds('TextChanged', { buffer = 0 }) _G.__full = 0",
+                vec![],
+            );
+        }
+        for _ in 0..20 {
+            fx.nvim
+                .lua("vim.api.nvim_exec_autocmds('TextChanged', { buffer = 0 })", vec![]);
+        }
+    }
+    assert_eq!(int(&fx.nvim.lua("return _G.__full", vec![])), 0, "{case}");
+    assert!(fx.events().is_empty());
+}
+
+#[test]
+#[ignore = "needs nvim"]
+fn ghost_search_skips_distant_normal_edits() {
+    check_ghost_search_bound("distant");
+}
+
+#[test]
+#[ignore = "needs nvim"]
+fn ghost_search_runs_once_per_changedtick() {
+    check_ghost_search_bound("tick");
+}
+
+#[test]
+#[ignore = "needs nvim"]
+fn ghost_search_refuses_buffers_over_the_byte_limit() {
+    check_ghost_search_bound("bytes");
+}
+
+#[test]
+#[ignore = "needs nvim"]
 fn live_show_leaves_a_modified_buffer_and_its_overlay_alone() {
     let mut fx = Fx::new("live-modified");
     let (path, two) = live_two(&mut fx);
@@ -2771,9 +2934,15 @@ fn typing_in_a_big_buffer_reads_it_whole_only_when_a_search_is_due() {
     fx.cursor(5);
     fx.feed(",r");
     full_reads(&mut fx);
+    fx.nvim.lua(
+        "vim.api.nvim_buf_set_lines(0, 0, 1, true, { 'edited near the ghost' }) \
+         vim.api.nvim_exec_autocmds('TextChanged', { buffer = 0 })",
+        vec![],
+    );
+    assert_eq!(full_reads(&mut fx), 1);
     fx.nvim
         .lua("vim.api.nvim_exec_autocmds('TextChanged', { buffer = 0 })", vec![]);
-    assert_eq!(full_reads(&mut fx), 1);
+    assert_eq!(full_reads(&mut fx), 0, "the same tick is not searched again");
 }
 
 #[test]

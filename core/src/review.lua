@@ -959,6 +959,7 @@ state.undo_current = undo_all
 -- and a hunk reverted here whose own text is back (an undo, or typing it again) is drawn again and
 -- reported, so that the revert recorded for it can be dropped.
 local MAX_SEARCH_LINES = 20000
+local MAX_SEARCH_BYTES = 4 * 1024 * 1024
 
 -- The one row where `h`'s new side is in the snapshot and its old side is not, or nil when there is none
 -- or more than one place (an edit that moved whole text, such as a formatter or `:%!`, left both
@@ -1000,6 +1001,26 @@ local function find_new_side(lines, ff, h)
   return found
 end
 
+-- Change marks bound the fallback; direct checks at each tracked row still run on every event.
+local function changed_near_ghost(buf, ov)
+  local first = api.nvim_buf_get_mark(buf, '[')[1] - 1
+  local last = api.nvim_buf_get_mark(buf, ']')[1] - 1
+  if first < 0 or last < first then return true end
+  for _, d in ipairs(ov.hunks) do
+    if d.ghost then
+      local places = ghost_rows(buf, d)
+      -- The last intact row also covers a whole-buffer replacement that stranded both marks.
+      if d.row then places[#places + 1] = d.row end
+      for _, row in ipairs(places) do
+        if first <= row + math.max(d.hunk.old_len, d.hunk.new_len) + 8 and last >= row - 8 then
+          return true
+        end
+      end
+    end
+  end
+  return false
+end
+
 -- `search` also looks the whole buffer over for a reverted hunk's text when no mark points to it;
 -- typing in insert mode does not, since it would do that on every key.
 local function follow_edits(buf, search)
@@ -1007,6 +1028,8 @@ local function follow_edits(buf, search)
   if not ov then
     return
   end
+  local tick = api.nvim_buf_get_changedtick(buf)
+  search = search and ov.search_tick ~= tick and changed_near_ghost(buf, ov)
   -- The buffer's bytes are read whole only once a search needs them (and then once for the call);
   -- until then each comparison reads just its own rows, so typing costs nothing that grows with the file.
   local snapshot
@@ -1027,7 +1050,10 @@ local function follow_edits(buf, search)
       if back == nil and search then
         if not searched then
           searched = true
-          if api.nvim_buf_line_count(buf) <= MAX_SEARCH_LINES then
+          ov.search_tick = tick
+          local count = api.nvim_buf_line_count(buf)
+          local size = api.nvim_buf_get_offset(buf, count)
+          if count <= MAX_SEARCH_LINES and size >= 0 and size <= MAX_SEARCH_BYTES then
             -- All searches in this call share the buffer bytes, options and first-line index.
             lines = api.nvim_buf_get_lines(buf, 0, -1, true)
             ff = vim.bo[buf].fileformat
@@ -1233,7 +1259,11 @@ function state.open_and_show(path, line, meta, hunks)
     check_hunks(hunks)
   end
   local buf = find_buf(path)
-  if buf == nil and not vim.uv.fs_stat(path) then
+  local stat = vim.uv.fs_stat(path)
+  if stat and stat.type ~= 'file' then
+    return status({ opened = false, error = 'the path is not a regular file' })
+  end
+  if buf == nil and not stat then
     return status({ opened = false, error = 'the file does not exist' })
   end
   -- Editing the current file again would read it again and clear its overlay as "reloaded".
@@ -1311,7 +1341,7 @@ function state.live_show(path, meta, hunks)
   local before = state.overlays[buf]
   if autoread then
     state.reloading[buf] = true
-    pcall(api.nvim_cmd, { cmd = 'checktime', args = { tostring(buf) } }, {})
+    pcall(reload_buffer, buf)
     state.reloading[buf] = nil
   end
   -- Reload autocommands belong to the person's configuration and can change either buffer state.
@@ -1426,7 +1456,7 @@ watch = function()
     end,
   })
 
-  api.nvim_create_autocmd({ 'BufDelete', 'BufWipeout' }, {
+  api.nvim_create_autocmd({ 'BufDelete', 'BufWipeout', 'BufFilePost' }, {
     group = group,
     callback = function(args)
       if state.torn or not state.overlays[args.buf] then

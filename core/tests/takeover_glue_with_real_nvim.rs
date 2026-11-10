@@ -385,9 +385,36 @@ fn the_cursor_part_restores_only_its_own_value() {
 fn the_reload_part_runs_always_in_a_takeover() {
     let nvim = ready();
     let chan = nvim.helper_channel();
-    nvim.exec_lua("_G.takeover_checks=0; vim.api.nvim_buf_set_name(0, vim.env.HOME..'/reload'); vim.fn.writefile({'one'}, vim.api.nvim_buf_get_name(0)); vim.cmd('edit'); vim.o.autoread=true; vim.cmd=function() takeover_checks=takeover_checks+1 end", vec![]);
+    nvim.exec_lua(
+        r#"
+_G.takeover_checks = 0
+vim.api.nvim_buf_set_name(0, vim.env.HOME .. '/reload')
+vim.fn.writefile({'one'}, vim.api.nvim_buf_get_name(0))
+vim.cmd('edit')
+vim.o.autoread = true
+local cmd = vim.api.nvim_cmd
+vim.api.nvim_cmd = function(command, opts)
+  if command.cmd == 'checktime' then takeover_checks = takeover_checks + 1 end
+  return cmd(command, opts)
+end
+"#,
+        vec![],
+    );
     install(&nvim, chan);
-    nvim.exec_lua("assert(vim.wait(1500, function() return takeover_checks > 0 end, 10)); __eitri_companion.calls.busy(false); local n=takeover_checks; assert(vim.wait(1500, function() return takeover_checks > n end, 10))", vec![]);
+    nvim.exec_lua(
+        r#"
+local n = takeover_checks
+vim.fn.writefile({'two', 'three'}, vim.api.nvim_buf_get_name(0))
+assert(vim.wait(1500, function() return takeover_checks > n end, 10))
+assert(vim.deep_equal(vim.api.nvim_buf_get_lines(0, 0, -1, false), {'two', 'three'}))
+__eitri_companion.calls.busy(false)
+n = takeover_checks
+vim.fn.writefile({'four'}, vim.api.nvim_buf_get_name(0))
+assert(vim.wait(1500, function() return takeover_checks > n end, 10))
+assert(vim.deep_equal(vim.api.nvim_buf_get_lines(0, 0, -1, false), {'four'}))
+"#,
+        vec![],
+    );
 }
 
 #[test]

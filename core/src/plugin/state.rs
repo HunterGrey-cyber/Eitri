@@ -135,8 +135,15 @@ fn own_regular(file: &File, path: &Path) -> Result<(), StoreError> {
 const LOCK_RETRY: Duration = Duration::from_millis(10);
 
 /// An `flock` held until dropped.
-// The open descriptor is the lock: closing it releases the `flock`, so it is held and never read.
-struct Locked(#[allow(dead_code)] File);
+struct Locked(File);
+
+impl Drop for Locked {
+    fn drop(&mut self) {
+        // Unlock before closing: a concurrent fork may retain this open file description until exec.
+        // SAFETY: the descriptor is our own and stays open for the call; flock takes no pointers.
+        unsafe { libc::flock(self.0.as_raw_fd(), libc::LOCK_UN) };
+    }
+}
 
 impl Locked {
     /// Waits for the lock: for as long as it takes with no `until`, else until then. A window whose process
@@ -930,6 +937,24 @@ mod tests {
         }
         assert_eq!(got, [(7, Ok(json!({}))), (8, Ok(json!({"value": 1})))]);
         assert!(wakes.load(Ordering::SeqCst) >= 1);
+    }
+
+    #[test]
+    fn dropping_a_lock_releases_it_while_a_duplicate_descriptor_is_still_open() {
+        let s = Scratch::new("lock-duplicate");
+        let st = store(&s, Limits::DEFAULT);
+        st.write("k", &json!(1)).unwrap();
+        let lock_path = s.0.join("eitri/plugins/demo/state/.write.lock");
+        let held = Locked::take(&lock_path, libc::LOCK_EX, None).unwrap();
+        // A child between fork and exec retains the same open file description, even with CLOEXEC.
+        // A duplicate keeps it alive deterministically without starting a child or racing a spawn.
+        let duplicate = held.0.try_clone().unwrap();
+        assert!(st.write_until("k", &json!(2), Some(Instant::now())).is_err());
+        assert_eq!(st.read("k").unwrap(), Some(json!(1)));
+        drop(held);
+        st.write_until("k", &json!(3), Some(Instant::now())).unwrap();
+        assert_eq!(st.read("k").unwrap(), Some(json!(3)));
+        drop(duplicate);
     }
 
     #[test]
