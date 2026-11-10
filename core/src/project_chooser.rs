@@ -237,6 +237,8 @@ struct Browse {
     classifying: Option<OsString>,
     /// The link whose kind that read answered; it is not asked about again until a fresh listing.
     classified: Option<OsString>,
+    /// An explicitly chosen unknown link may prove to be a file when its folder read answers.
+    open_if_file: bool,
 }
 
 impl Browse {
@@ -466,6 +468,7 @@ impl Chooser {
         self.held_enter = false;
         if let Place::Folder(b) = &mut self.place {
             b.held_enters = 0;
+            b.open_if_file = false;
         }
     }
 
@@ -558,6 +561,7 @@ impl Chooser {
                             held_enters: 0,
                             classifying: None,
                             classified: None,
+                            open_if_file: false,
                         }));
                         self.line = last.typed;
                     }
@@ -649,6 +653,7 @@ impl Chooser {
                 held_enters: 0,
                 classifying: None,
                 classified: None,
+                open_if_file: false,
             }));
             self.rebuild();
             return vec![];
@@ -695,6 +700,7 @@ impl Chooser {
             held_enters: 0,
             classifying: None,
             classified: None,
+            open_if_file: false,
         }));
         self.selected = Some(0);
         self.message = None;
@@ -899,7 +905,18 @@ impl Chooser {
                 } else {
                     format!("{}{}/", b.typed, display_name(&e.raw.to_string_lossy()))
                 };
-                self.navigate(dir, typed, None)
+                let unknown = matches!(
+                    e.kind,
+                    EntryKind::Link {
+                        kind: LinkKind::Unknown,
+                        ..
+                    }
+                );
+                let effects = self.navigate(dir, typed, None);
+                if let Place::Folder(b) = &mut self.place {
+                    b.open_if_file = unknown;
+                }
+                effects
             }
             _ => vec![],
         }
@@ -1031,7 +1048,14 @@ impl Chooser {
         if b.serial != Some(serial) || b.dir != dir {
             return vec![];
         }
+        let open_file = std::mem::take(&mut b.open_if_file) && matches!(listing, Listing::NotAFolder);
         let held = std::mem::take(&mut b.held_enters);
+        if open_file {
+            b.serial = None;
+            b.shown = Shown::Done;
+            b.listing = Some(listing);
+            return vec![Effect::Open(dir)];
+        }
         if let Some(name) = b.classifying.take() {
             b.serial = None;
             // Asking cancelled the marks of the listing shown; this read's marks cover every row the filter shows.

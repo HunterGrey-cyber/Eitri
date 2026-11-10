@@ -2999,3 +2999,60 @@ fn a_filter_that_matches_nothing_offers_no_enter() {
         }
     }
 }
+
+#[test]
+fn an_unknown_link_that_is_not_a_folder_opens_as_the_chosen_file() {
+    for mode in modes() {
+        let mut c = chooser(mode);
+        let effects = line(&mut c, "~/link.md");
+        deliver(
+            &mut c,
+            &effects,
+            read_of(vec![link_entry("link.md", LinkKind::Unknown)], None),
+        );
+        let effects = enter(&mut c);
+        let link = link_entry("link.md", LinkKind::Unknown);
+        let effects = deliver(&mut c, &effects, read_of(vec![link.clone()], Some(link)));
+        assert_eq!(
+            deliver(&mut c, &effects, Listing::NotAFolder),
+            vec![Effect::Open("/home/me/link.md".into())]
+        );
+    }
+}
+
+#[test]
+fn an_unknown_link_read_failure_does_not_open_a_file() {
+    for reply in [Listing::Missing, Listing::Stuck, Listing::Loop] {
+        let mut c = window();
+        let effects = line(&mut c, "~/link.md");
+        deliver(
+            &mut c,
+            &effects,
+            read_of(vec![link_entry("link.md", LinkKind::Unknown)], None),
+        );
+        let effects = enter(&mut c);
+        let link = link_entry("link.md", LinkKind::Unknown);
+        let effects = deliver(&mut c, &effects, read_of(vec![link.clone()], Some(link)));
+        assert!(!deliver(&mut c, &effects, reply)
+            .iter()
+            .any(|e| matches!(e, Effect::Open(_))));
+    }
+}
+
+#[test]
+fn moving_selection_cancels_a_pending_unknown_link_file_choice() {
+    let mut c = window();
+    let effects = line(&mut c, "~/link.md");
+    deliver(
+        &mut c,
+        &effects,
+        read_of(vec![link_entry("link.md", LinkKind::Unknown)], None),
+    );
+    let effects = enter(&mut c);
+    let link = link_entry("link.md", LinkKind::Unknown);
+    let effects = deliver(&mut c, &effects, read_of(vec![link.clone()], Some(link)));
+    c.event(Ev::Line(LineEv::Step(1)));
+    assert!(!deliver(&mut c, &effects, Listing::NotAFolder)
+        .iter()
+        .any(|e| matches!(e, Effect::Open(_))));
+}

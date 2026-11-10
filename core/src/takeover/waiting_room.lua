@@ -8,6 +8,7 @@ local ns = api.nvim_create_namespace('eitri_takeover_room')
 local group = api.nvim_create_augroup('EitriTakeoverRoom', { clear = true })
 local timer = vim.uv.new_timer()
 local origin_chan = vim.fn.sockconnect('pipe', origin, { rpc = true })
+local origin_stat = vim.uv.fs_stat(origin)
 if origin_chan == 0 then
   timer:close()
   api.nvim_del_augroup_by_id(group)
@@ -80,7 +81,11 @@ function state.return_tui()
   if not guarded() then return false end
   if #api.nvim_list_uis() == 0 then return false end
   if returning then return true end
-  local ok, probe = pcall(vim.fn.sockconnect, 'pipe', origin, { rpc = true })
+  -- Filesystem identity needs no request that an origin waiting for a key would defer.
+  local current = vim.uv.fs_stat(origin)
+  local same_origin = origin_stat and current and origin_stat.dev == current.dev and origin_stat.ino == current.ino
+  local ok, probe = false, 0
+  if same_origin then ok, probe = pcall(vim.fn.sockconnect, 'pipe', origin, { rpc = true }) end
   if not ok or probe == 0 then
     show({ 'nvim is no longer reachable at ' .. origin })
     if not unreachable then notify('origin_unreachable') end
@@ -198,5 +203,12 @@ else
     if torn then return end
     setup()
   end })
+end
+-- The installed channel watch now owns the room's lifetime.
+local bootstrap = _G.__eitri_room_bootstrap
+if bootstrap then
+  bootstrap:stop()
+  if not bootstrap:is_closing() then bootstrap:close() end
+  _G.__eitri_room_bootstrap = nil
 end
 return true

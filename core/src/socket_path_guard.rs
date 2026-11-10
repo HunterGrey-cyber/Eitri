@@ -24,6 +24,8 @@ const NEVER_BOUND: &[(&str, &str)] = &[
         "src/instance_dir.rs",
         "sweep_entries_owned_by(&root, BIND_PREFIX, \"s.sock\"",
     ),
+    // The injected probe receives a derived path but never binds or connects to it.
+    ("src/instance_dir.rs", "sweep_with_probe(&root, PREFIX, \"s.sock\""),
     // The full-backlog test runs the sweep on its own thread so a hang shows up
     // as `recv_timeout` expiring rather than wedging the whole test process; the thread's clone of
     // `root` is named differently so the closure can move it while the original stays usable after

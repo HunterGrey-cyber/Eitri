@@ -87,6 +87,14 @@ pub(crate) const ROOM_OP_LUA: &str =
     "local room = _G.__eitri_room; if not room then error('no takeover room') end; return room[(...)]()";
 const ANSWER_WITHIN: Duration = Duration::from_secs(2);
 const START_WITHIN: Duration = Duration::from_secs(5);
+const INSTALL_WITHIN: Duration = Duration::from_secs(10);
+
+fn bootstrap_command() -> String {
+    format!(
+        "lua _G.__eitri_room_bootstrap = vim.defer_fn(function() if _G.__eitri_room_bootstrap then vim.cmd('qall!') end end, {})",
+        INSTALL_WITHIN.as_millis()
+    )
+}
 
 /// A private directory belonging to one waiting room. It is removed after the room exits.
 pub struct RoomDir {
@@ -189,6 +197,8 @@ impl RoomLink {
         command
             .args(["--clean", "--headless", "-n", "-i", "NONE", "--listen"])
             .arg(dir.socket())
+            .arg("--cmd")
+            .arg(bootstrap_command())
             .stdin(Stdio::null())
             .stdout(Stdio::null())
             .stderr(Stdio::null());
@@ -360,6 +370,55 @@ mod tests {
     use std::os::unix::fs::PermissionsExt;
     use std::path::Path;
 
+    #[test]
+    #[ignore = "needs real nvim; uses stdio and no display"]
+    fn the_bootstrap_exits_an_uninstalled_nvim_without_a_host() {
+        use std::io::{BufRead, BufReader};
+        let scratch = crate::test_scratch_dir::ScratchDir::new("room", "bootstrap");
+        let mut child = Command::new("nvim")
+            .args(["--clean", "--headless", "--embed", "-n", "-i", "NONE", "--cmd"])
+            .arg(bootstrap_command())
+            .current_dir(scratch.as_ref())
+            .env("HOME", scratch.as_ref())
+            .env("NVIM_LOG_FILE", scratch.as_ref().join("nvim.log"))
+            .env("XDG_CONFIG_HOME", scratch.as_ref().join("config"))
+            .env("XDG_DATA_HOME", scratch.as_ref().join("data"))
+            .env("XDG_STATE_HOME", scratch.as_ref().join("state"))
+            .env("XDG_CACHE_HOME", scratch.as_ref().join("cache"))
+            .env_remove("TMUX")
+            .env_remove("TMUX_PANE")
+            .env_remove("NVIM")
+            .env_remove("NVIM_LISTEN_ADDRESS")
+            .stdin(Stdio::piped())
+            .stdout(Stdio::null())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap();
+        // Keep stdin open: EOF would make an unguarded embedded nvim exit too.
+        let _input = child.stdin.take().unwrap();
+        let stderr = child.stderr.take().unwrap();
+        let reader = std::thread::spawn(move || BufReader::new(stderr).lines().collect::<Vec<_>>());
+        let deadline = Instant::now() + Duration::from_secs(60);
+        let status = loop {
+            if let Some(status) = child.try_wait().unwrap() {
+                break Some(status);
+            }
+            if Instant::now() >= deadline {
+                break None;
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        };
+        if status.is_none() {
+            child.kill().unwrap();
+            child.wait().unwrap();
+        }
+        let errors = reader.join().unwrap();
+        assert!(
+            status.is_some_and(|s| s.success()),
+            "bootstrap did not exit cleanly: {errors:?}"
+        );
+    }
+
     const VIM: &str = r#"
         callbacks, scheduled, deferred, notices = {}, {}, {}, {}
         uis, channels, buffers = {}, {[9] = true, [2] = true}, {1}
@@ -373,6 +432,8 @@ mod tests {
           },
           keymap = {}, uv = {}, cmd = {},
         }
+        origin_stat = {dev = 1, ino = 2}
+        vim.uv.fs_stat = function() return origin_stat end
         local api = vim.api
         api.nvim_create_namespace = function() return 1 end
         api.nvim_create_augroup = function() return 1 end
@@ -426,6 +487,41 @@ mod tests {
           fast = true; tick_callback(); fast = false; flush()
         end
     "#;
+
+    #[test]
+    fn installing_glue_cancels_even_a_queued_bootstrap_expiry() {
+        for installed in [false, true] {
+            let lua = mlua::Lua::new();
+            lua.load(VIM).exec().unwrap();
+            lua.load(
+                r#"
+                setmetatable(vim.cmd, { __call = function(_, cmd)
+                  assert(cmd == 'qall!'); quit_count = quit_count + 1
+                end })
+                stopped, closed = false, false
+                vim.defer_fn = function(f, ms)
+                  assert(ms == 10000)
+                  expiry = f
+                  return { stop = function() stopped = true end,
+                    close = function() closed = true end, is_closing = function() return closed end }
+                end
+            "#,
+            )
+            .exec()
+            .unwrap();
+            lua.load(bootstrap_command().strip_prefix("lua ").unwrap())
+                .exec()
+                .unwrap();
+            if installed {
+                assert!(lua.load(ROOM_LUA).call::<bool>(("/origin", 9)).unwrap());
+                lua.load("assert(stopped and closed and _G.__eitri_room_bootstrap == nil)")
+                    .exec()
+                    .unwrap();
+            }
+            lua.load("expiry()").exec().unwrap();
+            assert_eq!(lua.globals().get::<u32>("quit_count").unwrap(), u32::from(!installed));
+        }
+    }
 
     fn room_lua() -> mlua::Lua {
         let lua = mlua::Lua::new();
@@ -547,6 +643,26 @@ mod tests {
             )
             .exec()
             .unwrap();
+    }
+
+    #[test]
+    fn takeover_a_missing_or_replaced_origin_keeps_its_ui_and_notifies_once() {
+        for stat in ["nil", "{dev = 9, ino = 2}", "{dev = 1, ino = 9}"] {
+            let lua = room_lua();
+            lua.load(format!("origin_stat = {stat}")).exec().unwrap();
+            lua.load(
+                r#"
+                uis = {{chan = 1}}
+                assert(_G.__eitri_room.let_go() == 'refused')
+                assert(_G.__eitri_room.let_go() == 'refused')
+                flush()
+                assert(connected == 0 and #notices == 1)
+                assert(notices[1][2] == 'origin_unreachable')
+                "#,
+            )
+            .exec()
+            .unwrap();
+        }
     }
 
     #[test]

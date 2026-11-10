@@ -10,9 +10,10 @@
 //! a blocking connect would sleep until that queue has room. Two checks are needed:
 //! [`sweep_entries_owned_by`] skips directories with group- or other-write bits, without probing
 //! or removing them, including a stranger's directory renamed to look like ours. The probe
-//! ([`socket_has_a_listener`]) uses a non-blocking connect, so even a socket that passes those
+//! ([`socket_probe`]) uses a non-blocking connect, so even a socket that passes those
 //! checks cannot hang startup. `EAGAIN`, `EWOULDBLOCK` and `EINPROGRESS` mean a listener is there
-//! (its queue is full or the connection is completing); other errors mean it is not.
+//! (its queue is full or the connection is completing). Only `ECONNREFUSED` and `ENOENT` prove
+//! no listener; other errors leave its liveness unknown and keep the directory.
 
 use std::io;
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
@@ -150,8 +151,8 @@ const PRIVATE_SOCKET_MODE: u32 = 0o600;
 ///
 /// A directory is removed only when all six hold: its name has one of those two shapes, the entry
 /// is a real directory rather than a symlink to one, it is owned by this user, it has no group- or
-/// other-write bit, its pid is not alive (`agent::process_probe::pid_is_alive`), and nothing
-/// answers a non-blocking `connect()` on its `socket_name`.
+/// other-write bit, its pid is not alive (`agent::process_probe::pid_is_alive`), and its socket check
+/// proves no listener.
 ///
 /// **Type, owner and mode all come before anything is probed.** An entry that is not ours, or is
 /// ours but still has
@@ -161,14 +162,14 @@ const PRIVATE_SOCKET_MODE: u32 = 0o600;
 /// `0755` is deliberately accepted, not just `0700`: its entries can still be renamed by nobody but
 /// us, and refusing anything wider than exactly `0700` would leave every directory a pre-hardening
 /// build ever created (all of them `0755`) permanently unreclaimable. A socket inside a directory
-/// that does pass is probed only when it is itself a real socket we own -- one that is not is
-/// "nothing answers".
+/// that does pass is probed only when it is itself a real socket we own; a regular file at that
+/// name counts as no listener. Other entries and inconclusive errors keep the directory.
 ///
 /// **Neither liveness check is enough alone.** The pid check answers about this process's own pid
 /// namespace, and `TMPDIR` is not necessarily shared with only that namespace -- observed in this
 /// project's sandbox, where `/tmp` held host pids while `/proc` showed namespace-local ones -- so a
 /// live window's directory can look pid-dead from here. The socket probe closes that hole: a live
-/// instance holds a bound listener, so the connect finds it (see [`socket_has_a_listener`] for what
+/// instance holds a bound listener, so the connect finds it (see [`socket_probe`] for what
 /// "finds it" means now). It cannot stand alone either, because a directory whose creation failed
 /// before `bind` has no socket at all.
 ///
@@ -186,6 +187,17 @@ pub(crate) fn sweep_stale_instance_dirs(tmp: &Path, prefix: &str, socket_name: &
 /// [`sweep_stale_instance_dirs`] for the entries owned by `uid` -- a parameter only so a test can
 /// stand in for another user's directory, which it cannot create.
 fn sweep_entries_owned_by(tmp: &Path, prefix: &str, socket_name: &str, log_tag: &str, uid: u32) {
+    sweep_with_probe(tmp, prefix, socket_name, log_tag, uid, socket_probe);
+}
+
+fn sweep_with_probe(
+    tmp: &Path,
+    prefix: &str,
+    socket_name: &str,
+    log_tag: &str,
+    uid: u32,
+    probe: impl Fn(&Path, u32) -> ConnectOutcome,
+) {
     let Ok(entries) = std::fs::read_dir(tmp) else { return };
     for entry in entries.flatten() {
         let name = entry.file_name();
@@ -205,7 +217,7 @@ fn sweep_entries_owned_by(tmp: &Path, prefix: &str, socket_name: &str, log_tag: 
         if meta.mode() & 0o022 != 0 {
             continue;
         }
-        if pid_is_running(pid) || socket_has_a_listener(&path.join(socket_name), uid) {
+        if pid_is_running(pid) || probe(&path.join(socket_name), uid) != ConnectOutcome::NoListener {
             continue;
         }
         if std::fs::remove_dir_all(&path).is_ok() {
@@ -237,27 +249,16 @@ pub(crate) fn stale_instance_dir_pid(name: &str, prefix: &str) -> Option<u32> {
     }
 }
 
-/// `true` for a socket `uid` owns that a listener answers -- including one whose accept queue is
-/// merely full. Every other outcome answers `false`, because the caller pairs this with a pid check.
-///
-/// A blocking `AF_UNIX` connect waits while the listener's accept queue is full, potentially
-/// forever if nobody services it. The non-blocking probe ([`nonblocking_connect_finds_a_listener`])
-/// treats a full queue as a live listener without hanging the caller.
-fn socket_has_a_listener(socket: &Path, uid: u32) -> bool {
-    let ours = matches!(socket.symlink_metadata(), Ok(meta) if meta.file_type().is_socket() && meta.uid() == uid);
-    ours && nonblocking_connect_finds_a_listener(socket)
-}
-
-/// One non-blocking `AF_UNIX`/`SOCK_STREAM` `connect()` to `path`. `true` for the three outcomes
-/// that mean a listener is really there: `connect()` succeeding outright, `EAGAIN`/`EWOULDBLOCK`
-/// (Linux: the listener's accept queue is full), and `EINPROGRESS` (the connection is still being
-/// established). Every other outcome -- `ECONNREFUSED` (a dead socket file nothing is listening on),
-/// `ENOENT`, a `path` too long for `sockaddr_un`, `socket()` itself failing -- answers `false`. The
-/// socket fd is closed before returning in every case. (macOS never blocks here in the first place:
-/// its `connect()` to a full queue fails at once with `ECONNREFUSED`, which reads as no listener --
-/// harmless, since the pid check before this has no pid namespaces there to be fooled by.)
-pub(crate) fn nonblocking_connect_finds_a_listener(path: &Path) -> bool {
-    nonblocking_connect_outcome(path) == ConnectOutcome::Listener
+/// A missing socket or a refused connection proves no listener; inconclusive probes and metadata
+/// errors keep the directory. Only a real socket owned by `uid` is connected to.
+fn socket_probe(socket: &Path, uid: u32) -> ConnectOutcome {
+    match socket.symlink_metadata() {
+        Ok(meta) if meta.file_type().is_socket() && meta.uid() == uid => nonblocking_connect_outcome(socket),
+        Ok(meta) if meta.file_type().is_file() => ConnectOutcome::NoListener,
+        Ok(_) => ConnectOutcome::Unknown,
+        Err(e) if e.kind() == io::ErrorKind::NotFound => ConnectOutcome::NoListener,
+        Err(_) => ConnectOutcome::Unknown,
+    }
 }
 
 /// What one non-blocking `connect()` to a socket path established.
@@ -272,8 +273,10 @@ pub(crate) enum ConnectOutcome {
     Unknown,
 }
 
-/// [`nonblocking_connect_finds_a_listener`] with the "no" split in two: a refusal that proves nothing
-/// listens, and every other failure, which proves nothing.
+/// One non-blocking Unix connect, treating a full accept queue as a listener without waiting.
+/// A refusal proves nothing listens; every other error proves nothing either way. The socket fd is
+/// closed before returning in every case. On macOS a full queue can return `ECONNREFUSED`; the pid
+/// check protects a live instance there, where no pid namespaces can hide it.
 pub(crate) fn nonblocking_connect_outcome(path: &Path) -> ConnectOutcome {
     let Some(addr) = sockaddr_for(path) else {
         return ConnectOutcome::Unknown;
@@ -646,6 +649,44 @@ pub(crate) mod tests {
                 Some(4321)
             );
         }
+    }
+
+    #[test]
+    fn an_inconclusive_probe_keeps_the_directory_but_a_dead_socket_is_swept() {
+        let root = std::env::temp_dir().join(format!("nv-probe-{}", uuid::Uuid::new_v4()));
+        let dead = root.join(format!("{PREFIX}0"));
+        std::fs::create_dir_all(&dead).unwrap();
+        std::fs::set_permissions(&dead, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let uid = agent::private_fs::current_uid();
+        for outcome in [ConnectOutcome::Unknown, ConnectOutcome::Listener] {
+            sweep_with_probe(&root, PREFIX, "s.sock", "test", uid, |_, _| outcome);
+            assert!(dead.exists(), "{outcome:?} cannot authorize deletion");
+        }
+        sweep_with_probe(&root, PREFIX, "s.sock", "test", uid, |_, _| ConnectOutcome::NoListener);
+        assert!(!dead.exists());
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn socket_probe_keeps_a_directory_but_treats_a_regular_file_as_no_listener() {
+        let root = crate::test_scratch_dir::ScratchDir::new("instance", "probe-types");
+        let path = agent::socket_path::in_dir(root.as_ref(), "s.sock").unwrap();
+        let uid = agent::private_fs::current_uid();
+        std::fs::create_dir(&path).unwrap();
+        assert_eq!(socket_probe(&path, uid), ConnectOutcome::Unknown);
+        std::fs::remove_dir(&path).unwrap();
+        std::fs::write(&path, "not a socket").unwrap();
+        assert_eq!(socket_probe(&path, uid), ConnectOutcome::NoListener);
+    }
+
+    #[test]
+    fn socket_metadata_errors_are_inconclusive() {
+        let path = std::env::temp_dir().join("x".repeat(300));
+        assert!(path.symlink_metadata().is_err());
+        assert_eq!(
+            socket_probe(&path, agent::private_fs::current_uid()),
+            ConnectOutcome::Unknown
+        );
     }
 
     #[test]

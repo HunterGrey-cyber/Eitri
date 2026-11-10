@@ -7,6 +7,7 @@
 
 use std::io;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use serde::{Deserialize, Serialize};
 
@@ -83,7 +84,10 @@ fn unusable(path: &Path, why: &dyn std::fmt::Display) -> String {
 
 /// Counts one "not now" on `today`. Blocks on the file system, so it runs on a worker.
 pub fn not_now(path: &Path, today: &str) -> io::Result<()> {
+    let _lock = lock(path)?;
     let (marker, _) = read(path);
+    #[cfg(test)]
+    crate::state_paths::test_hooks::after_read();
     write(
         path,
         &Marker {
@@ -96,7 +100,10 @@ pub fn not_now(path: &Path, today: &str) -> io::Result<()> {
 
 /// Records "don't ask again" on `today`, keeping the "not now" count. Blocks on the file system.
 pub fn decline(path: &Path, today: &str) -> io::Result<()> {
+    let _lock = lock(path)?;
     let (marker, _) = read(path);
+    #[cfg(test)]
+    crate::state_paths::test_hooks::after_read();
     write(
         path,
         &Marker {
@@ -107,8 +114,16 @@ pub fn decline(path: &Path, today: &str) -> io::Result<()> {
     )
 }
 
-/// Writes `marker` 0600 in a 0700 directory. The directory is made with itself as the root of what is
-/// judged and tightened, so the state home above it is never changed.
+/// The directory itself is the root of what is judged and tightened, so the state home above it
+/// is never changed. The sibling lock covers the following read through publication.
+fn lock(path: &Path) -> io::Result<agent::private_fs::PrivateLock> {
+    if let Some(dir) = path.parent() {
+        agent::private_fs::create_private_dir_all(dir, dir)?;
+    }
+    crate::state_paths::lock_store(path, crate::state_paths::ON_A_WRITER_THREAD)
+}
+
+/// Publishes a whole private marker while its sibling lock is held; failed writes leave the old file intact.
 fn write(path: &Path, marker: &Marker) -> io::Result<()> {
     let wire = Wire {
         v: VERSION,
@@ -118,10 +133,23 @@ fn write(path: &Path, marker: &Marker) -> io::Result<()> {
     };
     let mut text = serde_json::to_string(&wire).map_err(io::Error::other)?;
     text.push('\n');
-    if let Some(dir) = path.parent() {
-        agent::private_fs::create_private_dir_all(dir, dir)?;
+    // NFS locks can admit two threads in one process, so each publication owns its temporary name.
+    static NEXT_TEMPORARY: AtomicU64 = AtomicU64::new(0);
+    let serial = NEXT_TEMPORARY.fetch_add(1, Ordering::Relaxed);
+    let temporary = path.with_extension(format!("json.{}.{serial}.tmp", std::process::id()));
+    let result = agent::private_fs::write_private(&temporary, text.as_bytes()).and_then(|()| {
+        #[cfg(test)]
+        tests::BEFORE_PUBLISH.with(|hook| {
+            if let Some(hook) = hook.borrow_mut().take() {
+                hook();
+            }
+        });
+        std::fs::rename(&temporary, path)
+    });
+    if result.is_err() {
+        let _ = std::fs::remove_file(&temporary);
     }
-    agent::private_fs::write_private(path, text.as_bytes())
+    result
 }
 
 #[cfg(test)]
@@ -136,6 +164,156 @@ mod tests {
         std::fs::create_dir_all(&dir).unwrap();
         std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700)).unwrap();
         dir
+    }
+
+    thread_local! {
+        pub(super) static BEFORE_PUBLISH: std::cell::RefCell<Option<Box<dyn FnOnce()>>> = const { std::cell::RefCell::new(None) };
+    }
+
+    #[test]
+    fn overlapping_publications_use_distinct_temporary_files() {
+        use std::sync::mpsc::channel;
+        use std::time::Duration;
+        let dir = scratch("overlapping-publish");
+        let path = dir.join(FILE_NAME);
+        let first = Marker {
+            not_now: 1,
+            ..Marker::default()
+        };
+        let second = Marker {
+            not_now: 2,
+            ..Marker::default()
+        };
+        let (ready_tx, ready_rx) = channel();
+        let (resume_tx, resume_rx) = channel();
+        // Bypass flock to reproduce two threads admitted by a process-scoped lock.
+        std::thread::scope(|scope| {
+            let path = &path;
+            let first = &first;
+            let writer = scope.spawn(move || {
+                BEFORE_PUBLISH.with(|hook| {
+                    *hook.borrow_mut() = Some(Box::new(move || {
+                        ready_tx.send(()).unwrap();
+                        resume_rx.recv_timeout(Duration::from_secs(60)).unwrap();
+                    }))
+                });
+                write(path, first)
+            });
+            ready_rx.recv_timeout(Duration::from_secs(60)).unwrap();
+            let published = write(path, &second);
+            let intermediate = read(path);
+            resume_tx.send(()).unwrap();
+            let completed = writer.join().unwrap();
+            published.unwrap();
+            assert_eq!(intermediate, (second, None));
+            completed.expect("each publication must keep its own temporary file");
+        });
+        assert_eq!(read(&path), (first, None));
+        assert_eq!(std::fs::read_dir(&dir).unwrap().count(), 1);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn concurrent_choices_keep_the_decline_and_all_counts() {
+        let dir = scratch("concurrent");
+        let path = dir.join(FILE_NAME);
+        let barrier = std::sync::Barrier::new(2);
+        std::thread::scope(|scope| {
+            for decline_choice in [false, true] {
+                let path = &path;
+                let barrier = &barrier;
+                scope.spawn(move || {
+                    barrier.wait();
+                    for _ in 0..100 {
+                        if decline_choice {
+                            decline(path, "2026-11-10").unwrap();
+                        } else {
+                            not_now(path, "2026-11-10").unwrap();
+                        }
+                    }
+                });
+            }
+        });
+        let (marker, note) = read(&path);
+        assert_eq!(note, None);
+        assert_eq!(marker.not_now, 100);
+        assert_eq!(marker.declined.as_deref(), Some("2026-11-10"));
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn a_choice_cannot_read_until_the_previous_choice_is_published() {
+        use crate::state_paths::test_hooks::{set_after_read, set_on_busy};
+        use std::sync::mpsc::channel;
+        use std::time::Duration;
+        let dir = scratch("interleaved");
+        let path = dir.join(FILE_NAME);
+        let (read_tx, read_rx) = channel();
+        let (resume_tx, resume_rx) = channel();
+        let (second_tx, second_rx) = channel();
+        std::thread::scope(|scope| {
+            let path = &path;
+            scope.spawn(move || {
+                set_after_read(move || {
+                    read_tx.send(()).unwrap();
+                    resume_rx.recv_timeout(Duration::from_secs(60)).unwrap();
+                });
+                not_now(path, "2026-11-10").unwrap();
+            });
+            read_rx.recv_timeout(Duration::from_secs(60)).unwrap();
+            scope.spawn(move || {
+                let busy_tx = second_tx.clone();
+                set_on_busy(move || {
+                    let _ = busy_tx.send("locked");
+                });
+                set_after_read(move || {
+                    let _ = second_tx.send("read");
+                });
+                decline(path, "2026-11-10").unwrap();
+            });
+            let state = second_rx.recv_timeout(Duration::from_secs(60)).unwrap();
+            resume_tx.send(()).unwrap();
+            assert_eq!(state, "locked", "the second choice must not read stale state");
+        });
+        assert_eq!(read(&path).0.not_now, 1);
+        assert_eq!(read(&path).0.declined.as_deref(), Some("2026-11-10"));
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn a_failed_publish_in_a_read_only_directory_keeps_the_previous_marker() {
+        let dir = scratch("read-only");
+        let path = dir.join(FILE_NAME);
+        not_now(&path, "2026-11-09").unwrap();
+        let before = read(&path);
+        let protected = dir.clone();
+        crate::state_paths::test_hooks::set_after_read(move || {
+            std::fs::set_permissions(protected, std::fs::Permissions::from_mode(0o500)).unwrap();
+        });
+        let result = decline(&path, "2026-11-10");
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700)).unwrap();
+        assert!(
+            result.is_err(),
+            "a directory without write permission must refuse publication"
+        );
+        assert_eq!(read(&path), before);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn publishing_replaces_the_file_without_truncating_an_existing_reader() {
+        use std::io::Read;
+        let dir = scratch("reader");
+        let path = dir.join(FILE_NAME);
+        not_now(&path, "2026-11-09").unwrap();
+        let old = std::fs::read_to_string(&path).unwrap();
+        let mut reader = std::fs::File::open(&path).unwrap();
+        decline(&path, "2026-11-10").unwrap();
+        let mut text = String::new();
+        reader.read_to_string(&mut text).unwrap();
+        assert_eq!(text, old);
+        assert_eq!(read(&path).0.declined.as_deref(), Some("2026-11-10"));
+        std::fs::remove_dir_all(dir).unwrap();
     }
 
     #[test]

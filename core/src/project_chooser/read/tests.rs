@@ -854,3 +854,39 @@ fn readlink_registers_its_source_mount_before_crossing_to_the_target() {
         .windows(2)
         .any(|pair| pair == ["touch:/srv/data", "lstat:/srv/data"]));
 }
+
+#[test]
+fn choosing_an_unknown_file_link_on_a_nonlocal_mount_opens_the_file() {
+    use crate::project_chooser::{Chooser, Effect, Ev, Lang, LineEv, Mode};
+    let mut fs = Fake::new();
+    fs.link("link.md", "file.md");
+    fs.node("file.md", DType::File, Kind::File);
+    let mounts = Mounts::parse("1 0 0:1 / / rw - nfs4 server rw\n");
+    let mut chooser = Chooser::new(Mode::Launch, None, Lang::En, 1);
+    let mut effects = chooser.event(Ev::Line(LineEv::Changed("/work/link.md".into())));
+    for round in 0..3 {
+        let (serial, dir, filter) = effects
+            .iter()
+            .find_map(|e| match e {
+                Effect::Read {
+                    serial, dir, filter, ..
+                } => Some((*serial, dir.clone(), filter.clone())),
+                _ => None,
+            })
+            .expect("the choice must be read");
+        let listing = read(&fs, &dir, filter.as_deref(), &mounts, &mut |_| true);
+        if round < 2 {
+            assert!(
+                !fs.calls().iter().any(|call| call == "lstat:/work/file.md"),
+                "classification must keep the mount allowlist"
+            );
+        } else {
+            assert_eq!(listing, Listing::NotAFolder);
+        }
+        effects = chooser.event(Ev::Listing { serial, dir, listing });
+        if round == 0 {
+            effects = chooser.event(Ev::Line(LineEv::Enter));
+        }
+    }
+    assert_eq!(effects, vec![Effect::Open("/work/link.md".into())]);
+}

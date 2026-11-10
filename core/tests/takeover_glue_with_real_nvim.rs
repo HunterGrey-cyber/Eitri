@@ -1235,3 +1235,144 @@ fn mention_commands_are_registered_without_replacing_personal_commands() {
     detach(&nvim, chan);
     assert_same(&before, &snapshot(&nvim));
 }
+
+struct UninstalledRoom {
+    room: eitri_core::takeover::room::RoomLink,
+    dir: Option<eitri_core::takeover::room::RoomDir>,
+    pid: u32,
+    start: Option<u64>,
+    scratch: PathBuf,
+}
+
+impl UninstalledRoom {
+    fn start() -> Self {
+        let scratch = std::env::temp_dir().join(format!("er-{}", &uuid::Uuid::new_v4().simple().to_string()[..12]));
+        agent::private_fs::create_private_dir_all(&scratch, &scratch).unwrap();
+        let dir = eitri_core::takeover::room::RoomDir::create(&scratch).unwrap();
+        let binary = std::env::split_paths(&std::env::var_os("PATH").unwrap())
+            .find_map(|dir| eitri_core::takeover::room::room_binary(dir.join("nvim").to_str()?))
+            .expect("nvim must be on PATH");
+        let (room, pid) = eitri_core::takeover::room::RoomLink::start(&binary, &dir, (0, 12)).unwrap();
+        Self {
+            room,
+            dir: Some(dir),
+            pid,
+            start: eitri_core::split::proc_start_time(pid),
+            scratch,
+        }
+    }
+}
+
+impl Drop for UninstalledRoom {
+    fn drop(&mut self) {
+        if self.start.is_some() && eitri_core::split::proc_start_time(self.pid) == self.start {
+            // This is the child started by this test, never a user's nvim.
+            unsafe {
+                libc::kill(self.pid as libc::pid_t, libc::SIGKILL);
+            }
+        }
+        if let Some(dir) = self.dir.take() {
+            let _ = dir.remove();
+        }
+        let _ = std::fs::remove_dir_all(&self.scratch);
+    }
+}
+
+#[test]
+#[ignore = "needs real nvim 0.12 and private Unix sockets; no display"]
+fn a_room_without_installed_glue_exits_by_itself() {
+    let room = UninstalledRoom::start();
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
+    while eitri_core::split::proc_start_time(room.pid) == room.start {
+        assert!(std::time::Instant::now() < deadline, "uninstalled room never exited");
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+}
+
+#[test]
+#[ignore = "needs real nvim 0.12 and private Unix sockets; no display"]
+fn installing_the_room_cancels_its_bootstrap_timer() {
+    use std::time::Duration;
+    let origin = EmbedNvim::start();
+    let room = UninstalledRoom::start();
+    let socket = agent::socket_path::in_dir(&room.scratch, "origin.sock").unwrap();
+    origin.exec_lua("return vim.fn.serverstart(...)", vec![socket.to_str().unwrap().into()]);
+    let (link, _) =
+        eitri_core::nvim_rpc::NvimLink::connect(room.dir.as_ref().unwrap().socket(), Duration::from_secs(2)).unwrap();
+    assert_eq!(
+        link.exec_lua(
+            "_G.saved_bootstrap = _G.__eitri_room_bootstrap; return saved_bootstrap ~= nil",
+            vec![]
+        )
+        .wait(Duration::from_secs(2))
+        .unwrap()
+        .unwrap(),
+        Value::from(true)
+    );
+    room.room.install(socket.to_str().unwrap(), room.room.chan()).unwrap();
+    assert_eq!(
+        link.exec_lua(
+            "return _G.__eitri_room_bootstrap == nil and saved_bootstrap:is_closing()",
+            vec![]
+        )
+        .wait(Duration::from_secs(2))
+        .unwrap()
+        .unwrap(),
+        Value::from(true)
+    );
+}
+
+#[test]
+#[ignore = "needs real nvim 0.12 and private Unix sockets; no display"]
+fn closing_refuses_another_nvim_listening_at_the_origins_address() {
+    use eitri_core::nvim_rpc::NvimLink;
+    use eitri_core::takeover::room::RoomEvent;
+    use std::time::Duration;
+    let origin = EmbedNvim::start();
+    let replacement = EmbedNvim::start();
+    let room = UninstalledRoom::start();
+    let socket = agent::socket_path::in_dir(&room.scratch, "origin.sock").unwrap();
+    let address = socket.to_str().unwrap();
+    origin.exec_lua("return vim.fn.serverstart(...)", vec![address.into()]);
+    room.room.install(address, room.room.chan()).unwrap();
+    let events = room.room.events();
+    let (ui, _) = NvimLink::connect(room.dir.as_ref().unwrap().socket(), Duration::from_secs(2)).unwrap();
+    answer(ui.call(
+        "nvim_ui_attach",
+        vec![80.into(), 24.into(), Value::Map(vec![("rgb".into(), true.into())])],
+    ));
+    assert_eq!(
+        events.recv_timeout(Duration::from_secs(2)).unwrap(),
+        RoomEvent::Ui(true)
+    );
+    let identity = origin.exec_lua(
+        "local s = vim.uv.fs_stat(...); return {s.dev, s.ino}",
+        vec![address.into()],
+    );
+    // Keep the old inode allocated so the fixture cannot recycle it for the replacement socket.
+    let retained = agent::socket_path::in_dir(&room.scratch, "retained.sock").unwrap();
+    std::fs::hard_link(&socket, retained).unwrap();
+    origin.exec_lua("vim.fn.serverstop(...)", vec![address.into()]);
+    replacement.exec_lua("return vim.fn.serverstart(...)", vec![address.into()]);
+    assert_ne!(
+        replacement.exec_lua(
+            "local s = vim.uv.fs_stat(...); return {s.dev, s.ino}",
+            vec![address.into()]
+        ),
+        identity
+    );
+    assert!(room.room.let_go().is_err(), "a replacement must refuse hand-back");
+    assert_eq!(
+        events.recv_timeout(Duration::from_secs(2)).unwrap(),
+        RoomEvent::OriginUnreachable
+    );
+    assert_eq!(
+        replacement.exec_lua("return #vim.api.nvim_list_uis()", vec![]),
+        Value::from(0)
+    );
+    assert_eq!(
+        answer(ui.exec_lua("return #vim.api.nvim_list_uis()", vec![])),
+        Value::from(1)
+    );
+    ui.close();
+}
