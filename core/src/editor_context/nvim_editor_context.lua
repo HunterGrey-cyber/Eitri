@@ -262,6 +262,9 @@ local function send()
   if not ok or not payload then
     return
   end
+  if type(opts) == "table" and opts.generation then
+    payload = "G " .. opts.generation .. " " .. payload
+  end
   -- Connect/write/close are asynchronous. The host may accept before this connect callback writes
   -- any bytes; it retains incomplete lines across polls instead of waiting on the GTK thread.
   local pipe = vim.uv.new_pipe(false)

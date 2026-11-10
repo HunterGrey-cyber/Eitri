@@ -17,11 +17,14 @@
 
 use std::cell::{Cell, RefCell};
 use std::collections::{HashMap, HashSet};
-use std::process::Command;
+use std::io::Read;
+use std::os::fd::AsRawFd;
+use std::process::{Command, Stdio};
 use std::rc::Rc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::thread;
+use std::time::{Duration, Instant};
 
 use eitri_core::compositor::{self, HyprForm, WindowRef, Wm};
 use eitri_core::layout::Direction;
@@ -42,6 +45,7 @@ pub(crate) struct WmRunner {
     notice_shown: Cell<bool>,
     /// The commands, shared with the worker threads that run them.
     commands: Commands,
+    focus: Option<FocusWorker>,
     read_stat: ReadStat,
     /// Present only for a module window: the focused window just before its first map, when known. The first
     /// placement takes it; a later one, long after the map, has no pre-map window to compare with.
@@ -52,6 +56,50 @@ pub(crate) struct WmRunner {
     gnome: Option<Rc<dyn GnomeCalls>>,
     /// What the extension was last told about its partner.
     partner: Rc<Partner>,
+}
+
+struct FocusWorker {
+    pending: Arc<Mutex<Option<Direction>>>,
+    wake: std::sync::mpsc::SyncSender<()>,
+    disconnected: Cell<bool>,
+    #[cfg(test)]
+    join: thread::JoinHandle<()>,
+}
+
+impl FocusWorker {
+    fn start(commands: Commands) -> std::io::Result<Self> {
+        let pending = Arc::new(Mutex::new(None));
+        let slot = pending.clone();
+        let (wake, rx) = std::sync::mpsc::sync_channel(1);
+        let join = thread::Builder::new().name("eitri-focus".into()).spawn(move || {
+            while rx.recv().is_ok() {
+                let next = slot.lock().unwrap().take();
+                if let Some(dir) = next {
+                    commands.move_focus_blocking(dir, &|line| println!("{line}"));
+                }
+            }
+        })?;
+        #[cfg(not(test))]
+        drop(join);
+        Ok(Self {
+            pending,
+            wake,
+            disconnected: Cell::new(false),
+            #[cfg(test)]
+            join,
+        })
+    }
+
+    fn request(&self, dir: Direction) {
+        *self.pending.lock().unwrap() = Some(dir);
+        if matches!(
+            self.wake.try_send(()),
+            Err(std::sync::mpsc::TrySendError::Disconnected(()))
+        ) && !self.disconnected.replace(true)
+        {
+            eprintln!("[companion] focus worker disconnected");
+        }
+    }
 }
 
 /// The partner the extension was last asked to hold. Shared with the callbacks of calls that are
@@ -137,10 +185,21 @@ impl WmRunner {
     }
 
     fn with_adapters(wm: Wm, exec: Exec, read_stat: ReadStat, gnome: Option<Rc<dyn GnomeCalls>>) -> Self {
+        let commands = Commands::new(wm, exec);
+        let focus = matches!(wm, Wm::Hyprland | Wm::Sway | Wm::Niri)
+            .then(|| {
+                FocusWorker::start(commands.clone())
+                    .map_err(|e| {
+                        eprintln!("[companion] could not start focus worker: {e}");
+                    })
+                    .ok()
+            })
+            .flatten();
         WmRunner {
             wm,
             notice_shown: Cell::new(false),
-            commands: Commands::new(wm, exec),
+            commands,
+            focus,
             read_stat,
             module_before: RefCell::default(),
             last_placement: RefCell::default(),
@@ -190,9 +249,18 @@ impl WmRunner {
             gnome.focus_direction(dir, Box::new(|_| {}));
             return true;
         }
-        let commands = self.commands.clone();
-        thread::spawn(move || commands.move_focus_blocking(dir, &|line| println!("{line}")));
-        true
+        if let Some(worker) = &self.focus {
+            worker.request(dir);
+            true
+        } else {
+            false
+        }
+    }
+
+    pub(crate) fn cancel_pending_focus(&self) {
+        if let Some(worker) = &self.focus {
+            worker.pending.lock().unwrap().take();
+        }
     }
 
     /// An edge letter from nvim's own navigator: the cursor was at nvim's last window and the user
@@ -413,11 +481,11 @@ fn wm_name(wm: Wm) -> &'static str {
 /// The real commands. A program that cannot be started is logged once per window: a compositor's
 /// tool that is missing is missing for every key, and a line per key press would bury the log.
 fn real_exec(wm: Wm) -> Exec {
-    let logged = Arc::new(AtomicBool::new(false));
+    let errors = Mutex::new(HashSet::new());
     let exits: Arc<Mutex<HashSet<(String, String)>>> = Arc::default();
     Arc::new(move |argv: Vec<String>| {
         let (program, args) = argv.split_first().ok_or_else(|| "empty command".to_string())?;
-        match Command::new(program).args(args).output() {
+        match command_output(Command::new(program).args(args), Duration::from_secs(2)) {
             Ok(output) => {
                 if let Some(line) = exit_note(wm, &exits, program, &output) {
                     println!("{line}");
@@ -425,13 +493,119 @@ fn real_exec(wm: Wm) -> Exec {
                 Ok(String::from_utf8_lossy(&output.stdout).into_owned())
             }
             Err(err) => {
-                if !logged.swap(true, Ordering::Relaxed) {
-                    println!("[companion] {} adapter: could not run {program}: {err}", wm_name(wm));
+                if let Some(line) = command_error_note(wm, &errors, program, &err) {
+                    println!("{line}");
                 }
                 Err(err.to_string())
             }
         }
     })
+}
+
+fn command_error_note(
+    wm: Wm,
+    seen: &Mutex<HashSet<(String, bool)>>,
+    program: &str,
+    error: &std::io::Error,
+) -> Option<String> {
+    let timeout = error.kind() == std::io::ErrorKind::TimedOut;
+    if !locked(seen).insert((program.to_owned(), timeout)) {
+        return None;
+    }
+    let reason = if timeout { "timed out running" } else { "could not run" };
+    Some(format!(
+        "[companion] {} adapter: {reason} {program}: {error}",
+        wm_name(wm)
+    ))
+}
+
+fn command_output(command: &mut Command, budget: Duration) -> std::io::Result<std::process::Output> {
+    let child = command
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()?;
+    command_output_child(child, budget)
+}
+
+fn command_output_child(mut child: std::process::Child, budget: Duration) -> std::io::Result<std::process::Output> {
+    let deadline = Instant::now() + budget;
+    let mut stdout = child.stdout.take().unwrap();
+    let mut stderr = child.stderr.take().unwrap();
+    let result = (|| {
+        for fd in [stdout.as_raw_fd(), stderr.as_raw_fd()] {
+            // SAFETY: these are live pipe descriptors; only their nonblocking flag is changed.
+            if unsafe { libc::fcntl(fd, libc::F_SETFL, libc::O_NONBLOCK) } < 0 {
+                return Err(std::io::Error::last_os_error());
+            }
+        }
+        let (mut out, mut err) = (Vec::new(), Vec::new());
+        let mut pipes = [stdout.as_raw_fd(), stderr.as_raw_fd()].map(|fd| libc::pollfd {
+            fd,
+            events: libc::POLLIN,
+            revents: 0,
+        });
+        loop {
+            for ((pipe, bytes), poll) in [(&mut stdout as &mut dyn Read, &mut out), (&mut stderr, &mut err)]
+                .into_iter()
+                .zip(&mut pipes)
+            {
+                if poll.fd < 0 {
+                    continue;
+                }
+                match pipe.take(65536).read_to_end(bytes) {
+                    Ok(n) if n < 65536 => poll.fd = -1,
+                    Ok(_) => {}
+                    Err(e)
+                        if matches!(
+                            e.kind(),
+                            std::io::ErrorKind::WouldBlock | std::io::ErrorKind::Interrupted
+                        ) => {}
+                    Err(e) => return Err(e),
+                }
+            }
+            let eof = pipes.iter().all(|p| p.fd < 0);
+            if eof {
+                if let Some(status) = child.try_wait()? {
+                    return Ok(std::process::Output {
+                        status,
+                        stdout: out,
+                        stderr: err,
+                    });
+                }
+            }
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            if remaining.is_zero() {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::TimedOut,
+                    "compositor command timed out",
+                ));
+            }
+            // Pipes wake us as soon as output or EOF arrives. A child can close both pipes before
+            // exiting; only that case needs a short recheck of its status, still within the deadline.
+            let wait = if eof {
+                remaining.min(Duration::from_millis(1))
+            } else {
+                remaining
+            };
+            let millis = wait
+                .as_millis()
+                .saturating_add(u128::from(wait.subsec_nanos() % 1_000_000 != 0))
+                .min(i32::MAX as u128) as i32;
+            // SAFETY: the array contains two live pipe descriptors or -1 for an EOF pipe.
+            if unsafe { libc::poll(pipes.as_mut_ptr(), pipes.len() as libc::nfds_t, millis) } < 0 {
+                let error = std::io::Error::last_os_error();
+                if error.kind() != std::io::ErrorKind::Interrupted {
+                    return Err(error);
+                }
+            }
+        }
+    })();
+    if result.is_err() {
+        let _ = child.kill();
+        let _ = child.wait();
+    }
+    result
 }
 
 /// The log line for a command that exited non-zero, or `None` when it needs none. `hyprctl` exits non-zero
@@ -748,6 +922,158 @@ impl Commands {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn only_command_adapters_start_a_focus_worker() {
+        for wm in [Wm::None, Wm::Gnome, Wm::Sway, Wm::Hyprland, Wm::Niri] {
+            let runner = WmRunner::with_exec(wm, |_| panic!("no command requested"));
+            assert_eq!(runner.focus.is_some(), matches!(wm, Wm::Sway | Wm::Hyprland | Wm::Niri));
+        }
+    }
+
+    #[test]
+    fn a_disconnected_focus_worker_is_noted_once() {
+        let (wake, receiver) = std::sync::mpsc::sync_channel(1);
+        let worker = FocusWorker {
+            pending: Arc::default(),
+            wake,
+            disconnected: Cell::new(false),
+            join: thread::spawn(|| {}),
+        };
+        drop(receiver);
+        worker.request(Direction::Left);
+        assert!(worker.disconnected.get());
+        worker.request(Direction::Right);
+        assert!(worker.disconnected.get());
+        worker.join.join().unwrap();
+    }
+
+    #[test]
+    fn timeouts_and_launch_errors_each_log_once_per_program() {
+        let seen = Mutex::new(HashSet::new());
+        let timeout = std::io::Error::from(std::io::ErrorKind::TimedOut);
+        let missing = std::io::Error::from(std::io::ErrorKind::NotFound);
+        for program in ["swaymsg", "another-tool"] {
+            assert!(command_error_note(Wm::Sway, &seen, program, &timeout)
+                .unwrap()
+                .contains("timed out running"));
+            assert!(command_error_note(Wm::Sway, &seen, program, &missing)
+                .unwrap()
+                .contains("could not run"));
+            assert!(command_error_note(Wm::Sway, &seen, program, &timeout).is_none());
+            assert!(command_error_note(Wm::Sway, &seen, program, &missing).is_none());
+        }
+    }
+
+    #[test]
+    fn command_output_waits_for_pipe_readiness_without_a_fixed_sleep() {
+        use eitri_core::source_scan::{braced, code_only, read_required};
+        let text = read_required("shell/src/companion/wm_runner.rs").text;
+        let code = code_only(&text);
+        let at = code.find("fn command_output_child(").expect("command reader");
+        let body = braced(&code, at + code[at..].find('{').unwrap());
+        let compact: String = body.chars().filter(|c| !c.is_whitespace()).collect();
+        assert!(compact.contains("libc::poll("), "wait for pipe readiness");
+        assert!(!compact.contains("thread::sleep("), "no fixed sleep per command");
+    }
+
+    #[test]
+    fn command_output_drains_large_pipes_and_bounds_a_child_with_closed_pipes() {
+        let output = command_output(
+            Command::new("sh").args(["-c", "head -c 131072 /dev/zero; head -c 131072 /dev/zero >&2"]),
+            Duration::from_secs(60),
+        )
+        .unwrap();
+        assert!(output.status.success());
+        assert_eq!(output.stdout.len(), 131072);
+        assert_eq!(output.stderr.len(), 131072);
+        let error = command_output(
+            Command::new("sh").args(["-c", "exec 1>&- 2>&-; exec sleep 30"]),
+            Duration::from_millis(20),
+        )
+        .unwrap_err();
+        assert_eq!(error.kind(), std::io::ErrorKind::TimedOut);
+    }
+
+    #[test]
+    fn a_stalled_focus_keeps_only_the_latest_of_100_requests() {
+        let (started, seen) = std::sync::mpsc::channel();
+        let (release, held) = std::sync::mpsc::channel();
+        let held = std::sync::Mutex::new(held);
+        let runner = WmRunner::with_exec(Wm::Niri, move |argv| {
+            started.send((std::thread::current().id(), argv)).unwrap();
+            held.lock().unwrap().recv().unwrap();
+            Ok(String::new())
+        });
+        runner.move_focus(Direction::Left, &|_| {});
+        let first = seen.recv_timeout(Duration::from_secs(60)).unwrap();
+        for _ in 0..99 {
+            runner.move_focus(Direction::Up, &|_| {});
+        }
+        runner.move_focus(Direction::Right, &|_| {});
+        release.send(()).unwrap();
+        let last = seen.recv_timeout(Duration::from_secs(60)).unwrap();
+        for _ in 0..101 {
+            release.send(()).unwrap();
+        }
+        assert_eq!(first.0, last.0, "one worker serves every direction");
+        assert!(last.1.last().unwrap().contains("right"));
+        let runner = Rc::try_unwrap(runner).ok().unwrap();
+        let worker = runner.focus.unwrap();
+        drop(worker.wake);
+        worker.join.join().unwrap();
+        assert!(seen.try_recv().is_err(), "only the running and latest requests ran");
+    }
+
+    #[test]
+    fn detaching_discards_focus_already_waiting_on_the_worker() {
+        let (started, seen) = std::sync::mpsc::channel();
+        let (release, held) = std::sync::mpsc::channel();
+        let held = std::sync::Mutex::new(held);
+        let runner = WmRunner::with_exec(Wm::Niri, move |_| {
+            started.send(()).unwrap();
+            held.lock().unwrap().recv().unwrap();
+            Ok(String::new())
+        });
+        runner.move_focus(Direction::Left, &|_| {});
+        seen.recv_timeout(Duration::from_secs(60)).unwrap();
+        runner.move_focus(Direction::Right, &|_| {});
+        runner.cancel_pending_focus();
+        release.send(()).unwrap();
+        release.send(()).unwrap();
+        let worker = Rc::try_unwrap(runner).ok().unwrap().focus.unwrap();
+        drop(worker.wake);
+        worker.join.join().unwrap();
+        assert!(seen.try_recv().is_err());
+    }
+
+    #[test]
+    fn command_output_collects_both_pipes_without_truncating_a_finished_child() {
+        let output = command_output(
+            Command::new("sh").args(["-c", "printf out; printf err >&2"]),
+            Duration::from_secs(60),
+        )
+        .unwrap();
+        assert!(output.status.success());
+        assert_eq!(output.stdout, b"out");
+        assert_eq!(output.stderr, b"err");
+    }
+
+    #[test]
+    fn a_stalled_command_is_killed_and_reaped_at_its_deadline() {
+        let child = Command::new("sleep")
+            .arg("30")
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap();
+        let pid = child.id() as libc::pid_t;
+        let error = command_output_child(child, Duration::ZERO).unwrap_err();
+        assert_eq!(error.kind(), std::io::ErrorKind::TimedOut);
+        // SAFETY: checking our child's status without a status pointer is supported.
+        assert_eq!(unsafe { libc::waitpid(pid, std::ptr::null_mut(), libc::WNOHANG) }, -1);
+        assert_eq!(std::io::Error::last_os_error().raw_os_error(), Some(libc::ECHILD));
+    }
+
     use super::*;
     use std::cell::RefCell;
     use std::sync::Mutex;
@@ -1462,7 +1788,7 @@ mod tests {
     }
 
     /// The runner's own methods run on the GTK thread. They reach Hyprland's probe and its dispatches only
-    /// through the two worker functions, and only from inside a spawned thread.
+    /// through the three worker functions, and only from inside a spawned thread.
     #[test]
     fn the_probe_and_every_dispatch_run_on_a_worker_thread() {
         use eitri_core::source_scan::{braced, code_only, modules, read_required, without};
@@ -1482,18 +1808,29 @@ mod tests {
                 "the runner calls `commands.{method}` on its own thread"
             );
         }
+        let compact: String = code.chars().filter(|c| !c.is_whitespace()).collect();
+        let mut bodies = Vec::new();
+        for (at, _) in compact.match_indices("spawn(move||{") {
+            let before = &compact[..at];
+            assert!(
+                before.ends_with("thread::") || before.rsplit(';').next().unwrap().contains("thread::Builder::new()")
+            );
+            bodies.push(braced(&compact, at + "spawn(move||".len()));
+        }
         let mut workers = 0;
         for name in [".move_focus_blocking(", ".raise_blocking(", ".place_blocking("] {
-            for (at, _) in runner.match_indices(name) {
+            for (at, _) in compact.match_indices(name) {
                 workers += 1;
-                let before = &runner[at.saturating_sub(160)..at];
                 assert!(
-                    before.contains("thread::spawn(move ||"),
-                    "`{name}` is called outside a spawned thread: {before}"
+                    bodies.iter().any(|body| {
+                        let start = body.as_ptr() as usize - compact.as_ptr() as usize;
+                        (start..start + body.len()).contains(&at)
+                    }),
+                    "`{name}` is called outside a spawned thread"
                 );
             }
         }
-        assert_eq!(workers, 3, "the scan saw the three worker calls");
+        assert_eq!(workers, 3, "the scan saw the focus, raise and placement worker calls");
     }
 
     /// sway and niri have one form and no reply rule: nothing is probed, nothing judged.

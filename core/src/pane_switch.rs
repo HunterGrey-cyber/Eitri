@@ -659,6 +659,7 @@ pub fn letter_direction(letter: char) -> Option<crate::layout::Direction> {
 /// with a log. A dropped message costs one focus switch or one stuck kill flag the user can retry,
 /// not a security boundary.
 pub struct PaneSwitchReader {
+    generation: Option<crate::companion::FeedGeneration>,
     listener: UnixListener,
     pending: VecDeque<PendingConnection>,
     /// [`MAX_POLL_DURATION`] in production. A field rather than the constant read inline only so
@@ -719,10 +720,16 @@ impl PendingConnection {
 impl PaneSwitchReader {
     /// Takes a channel's already-bound, non-blocking listener.
     pub fn new(listener: UnixListener) -> Self {
+        Self::with_generation(listener, None)
+    }
+
+    /// Takes the attachment guard at construction, before any line can be read.
+    pub fn with_generation(listener: UnixListener, generation: Option<crate::companion::FeedGeneration>) -> Self {
         Self {
             listener,
             pending: VecDeque::new(),
             read_time_budget: MAX_POLL_DURATION,
+            generation,
         }
     }
 
@@ -822,9 +829,11 @@ impl PaneSwitchReader {
                 ReadOutcome::Complete(bytes) => {
                     self.pending.pop_front();
                     let text = String::from_utf8_lossy(&bytes);
-                    match parse_message(&text) {
-                        Some(message) => messages.push(message),
-                        None => eprintln!("[pane_switch] ignoring an unrecognized message of {} bytes", text.len()),
+                    if let Some(text) = crate::companion::feed_line(&text, self.generation.as_ref()) {
+                        match parse_message(text) {
+                            Some(message) => messages.push(message),
+                            None => eprintln!("[pane_switch] ignoring an unrecognized message of {} bytes", text.len()),
+                        }
                     }
                 }
             }
@@ -1529,6 +1538,24 @@ mod tests {
             "nvim_get_keymap(",
         ] {
             assert!(NAV_FALLBACK_LUA.contains(needle), "missing {needle:?}");
+        }
+    }
+
+    #[test]
+    fn companion_direction_reader_requires_its_generation_on_the_socket() {
+        let mut channel = PaneSwitchChannel::bind_without_shim().expect("channel");
+        let generation = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(4));
+        let mut reader = PaneSwitchReader::with_generation(channel.take_listener().unwrap(), Some(generation));
+        reader.read_time_budget = UNHURRIED;
+        for (line, expected) in [
+            ("G 2 R", vec![]),
+            ("R", vec![]),
+            ("G 4 R", vec![PaneMessage::Direction('R')]),
+        ] {
+            let mut stream = UnixStream::connect(channel.socket_path()).unwrap();
+            writeln!(stream, "{line}").unwrap();
+            drop(stream);
+            assert_eq!(reader.poll(), expected, "{line}");
         }
     }
 

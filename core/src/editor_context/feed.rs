@@ -185,7 +185,7 @@ impl Drop for EditorContextFeed {
 /// polling with this wire's parser as its acceptance test. A malformed newer update does not
 /// discard the last valid context; the bounds and freshness rules are documented, and tested,
 /// in `line_feed`.
-pub struct EditorContextReader(NewestLineReader);
+pub struct EditorContextReader(NewestLineReader, Option<crate::companion::FeedGeneration>);
 
 impl EditorContextReader {
     /// The bounded reader underneath, for a host deciding whether there is anything to read.
@@ -194,7 +194,12 @@ impl EditorContextReader {
     }
 
     pub fn new(listener: UnixListener) -> Self {
-        Self(NewestLineReader::new(listener, "editor-context"))
+        Self::with_generation(listener, None)
+    }
+
+    /// Takes the attachment guard at construction, before any line can be read.
+    pub fn with_generation(listener: UnixListener, generation: Option<crate::companion::FeedGeneration>) -> Self {
+        Self(NewestLineReader::new(listener, "editor-context"), generation)
     }
 
     /// Forgets every update not yet returned (see [`NewestLineReader::discard`]).
@@ -209,11 +214,15 @@ impl EditorContextReader {
 
     /// Returns the newest valid context together with its optional push facts, without waiting.
     pub fn poll_update(&mut self) -> Option<FeedUpdate> {
-        self.0.poll_parsed(|line| match parse_bytes(line) {
-            Ok(parsed) => Some(parsed),
-            Err(e) => {
-                eprintln!("[editor-context] ignoring an update: {e}");
-                None
+        self.0.poll_parsed(|line| {
+            let text = String::from_utf8_lossy(line);
+            let line = crate::companion::feed_line(&text, self.1.as_ref())?;
+            match parse_bytes(line.as_bytes()) {
+                Ok(parsed) => Some(parsed),
+                Err(e) => {
+                    eprintln!("[editor-context] ignoring an update: {e}");
+                    None
+                }
             }
         })
     }
@@ -563,6 +572,24 @@ mod tests {
             path.as_os_str().len() <= agent::socket_path::MAX_SOCKET_PATH_BYTES,
             "{path:?}"
         );
+    }
+
+    #[test]
+    fn companion_context_reader_requires_its_generation_on_the_socket() {
+        use std::io::Write;
+        let mut feed = EditorContextFeed::new().expect("feed");
+        let generation = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(4));
+        let mut reader = EditorContextReader::with_generation(feed.take_listener().unwrap(), Some(generation));
+        for (prefix, accepted) in [("G 2 ", false), ("", false), ("G 4 ", true)] {
+            let mut client = std::os::unix::net::UnixStream::connect(feed.socket_path()).unwrap();
+            writeln!(client, "{prefix}{{\"v\":1,\"file\":\"/p/current.rs\"}}").unwrap();
+            drop(client);
+            let context = reader.poll();
+            assert_eq!(context.is_some(), accepted, "{prefix:?}");
+            if let Some(context) = context {
+                assert_eq!(context.file, "/p/current.rs");
+            }
+        }
     }
 
     #[test]

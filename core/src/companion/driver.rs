@@ -475,6 +475,15 @@ impl LinkDriver {
             .map(|live| live.gen)
     }
 
+    /// Context may arrive during INSTALL, before its answer makes the link attached.
+    pub fn feed_generation(&self) -> Option<u64> {
+        let detached = !matches!(
+            self.state(),
+            LinkState::Connecting { .. } | LinkState::Attaching { .. } | LinkState::Attached { .. }
+        );
+        (!self.shut && self.attacher.gen() != 0).then_some(self.attacher.gen() * 2 + u64::from(detached))
+    }
+
     /// Lets go of the editor: the teardown is queued, then the connection closes once it is
     /// written. Never waits: an nvim sitting in a prompt answers when the user does, and the
     /// glue's own liveness timer removes what a dropped teardown leaves.
@@ -729,7 +738,7 @@ fn worker(gen: u64, addr: PathBuf, tx: ToDriver, current: Arc<AtomicU64>, socket
         link.close();
         return;
     }
-    let install = queue_install(&link, &sockets, &kind);
+    let install = queue_install(&link, &sockets, &kind, gen);
     if tx.send(WorkerMsg::Linked { gen, link, install }).is_err() {
         return;
     }
@@ -752,9 +761,11 @@ fn worker(gen: u64, addr: PathBuf, tx: ToDriver, current: Arc<AtomicU64>, socket
     }
 }
 
-fn queue_install(link: &NvimLink, sockets: &Sockets, kind: &InstallKind) -> Pending {
+fn queue_install(link: &NvimLink, sockets: &Sockets, kind: &InstallKind, generation: u64) -> Pending {
     drop(link.call("nvim_set_client_info", client_info_params(kind)));
-    link.exec_lua(INSTALL_LUA, install_args(link.channel_id(), sockets, kind))
+    let mut args = install_args(link.channel_id(), sockets, kind);
+    super::stamp_install(&mut args, generation * 2);
+    link.exec_lua(INSTALL_LUA, args)
 }
 
 #[cfg(test)]
@@ -774,17 +785,16 @@ mod tests {
     #[test]
     fn a_page_link_installs_the_page_slot_and_names_itself_eitri_page() {
         let (link, _fake, mut reader) = fake_link();
-        let _install = queue_install(&link, &Sockets::default(), &page_kind());
+        let _install = queue_install(&link, &Sockets::default(), &page_kind(), 1);
         let (_, method, params) = read_request(&mut reader);
         assert_eq!(method, "nvim_set_client_info");
         assert_eq!(params[0], Value::from("eitri-page"));
         let (_, method, params) = read_request(&mut reader);
         assert_eq!(method, "nvim_exec_lua");
         assert_eq!(params[0], Value::from(INSTALL_LUA));
-        assert_eq!(
-            params[1],
-            Value::Array(install_args(3, &Sockets::default(), &page_kind()))
-        );
+        let mut expected = install_args(3, &Sockets::default(), &page_kind());
+        super::super::stamp_install(&mut expected, 2);
+        assert_eq!(params[1], Value::Array(expected));
     }
 
     #[test]
@@ -1473,6 +1483,28 @@ mod tests {
         driver.own_channels.push_back(own("/r/a", 6, Some(9)));
         assert!(driver.is_own_earlier_channel(5));
         assert!(!driver.is_own_earlier_channel(6));
+    }
+
+    #[test]
+    fn feed_generation_advances_on_connect_detach_and_retarget() {
+        let mut driver = LinkDriver::new(Some(PathBuf::from("/r/a")), Sockets::default(), InstallKind::Agent);
+        assert_eq!(driver.feed_generation(), Some(2));
+        driver.attacher.handle(Ev::Connected { gen: 1, channel: 4 });
+        driver.attacher.handle(Ev::Installed {
+            gen: 1,
+            report: report(),
+        });
+        assert_eq!(
+            driver.feed_generation(),
+            Some(2),
+            "INSTALL's first context keeps its stamp"
+        );
+        driver.attacher.handle(Ev::Closed { gen: 1 });
+        assert_eq!(driver.feed_generation(), Some(3));
+        driver.attacher.handle(Ev::Attach(PathBuf::from("/r/b")));
+        assert_eq!(driver.feed_generation(), Some(4));
+        driver.shutdown();
+        assert_eq!(driver.feed_generation(), None);
     }
 
     #[test]

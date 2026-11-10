@@ -4232,7 +4232,7 @@ fn build_ui(
     if let Some(ps) = pane_switch.as_mut() {
         let driver = Rc::downgrade(&driver);
         let lua_engine = lua_engine.clone();
-        feed_pump.listen_pane_switch(ps, move |message| match message {
+        feed_pump.listen_pane_switch(ps, None, move |message| match message {
             // Where the keys go from the editor's edge is the controller's.
             pane_switch::PaneMessage::Direction(letter) => match pane_switch::letter_direction(letter) {
                 Some(direction) => {

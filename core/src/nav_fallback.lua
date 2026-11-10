@@ -48,7 +48,8 @@ local function send(letter)
   if not ok or chan == 0 then
     return
   end
-  pcall(vim.fn.chansend, chan, letter .. "\n")
+  local prefix = type(opts) == "table" and opts.generation and ("G " .. opts.generation .. " ") or ""
+  pcall(vim.fn.chansend, chan, prefix .. letter .. "\n")
   pcall(vim.fn.chanclose, chan)
 end
 

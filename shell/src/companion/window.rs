@@ -526,6 +526,8 @@ pub(crate) fn build(app: &Application, start: &Start) -> Rc<CompanionWindow> {
     // construction. Each sweeps its own stale directories. They carry no child environment: the
     // editor is the user's own, already running, and gets its sockets through the install.
     let feed_pump = crate::editor_feeds::FeedPump::start();
+    let page_link: Rc<RefCell<Option<Weak<CompanionLink>>>> = Rc::default();
+    let feed_generation = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
     let mut theme_feed = crate::theme::feed::ThemeFeed::new();
     let mut context_feed = eitri_core::editor_context::feed::EditorContextFeed::new();
     let mut keys_feed = eitri_core::nvim_keys::feed::NvimKeysFeed::new();
@@ -551,7 +553,7 @@ pub(crate) fn build(app: &Application, start: &Start) -> Rc<CompanionWindow> {
     let attached = Rc::new(Cell::new(false));
     let (context_source, reset_context) = match context_feed.as_mut() {
         Some(feed) => {
-            let (source, reset) = feed_pump.listen_context(feed, scratch_path.clone());
+            let (source, reset) = feed_pump.listen_context(feed, scratch_path.clone(), Some(feed_generation.clone()));
             (source, reset)
         }
         None => (
@@ -766,7 +768,6 @@ pub(crate) fn build(app: &Application, start: &Start) -> Rc<CompanionWindow> {
             agent.set_theme(&panel_tokens);
         });
     }
-    let page_link: Rc<RefCell<Option<Weak<CompanionLink>>>> = Rc::default();
     {
         let keymap = config.keymap.clone();
         let agent = agent.clone();
@@ -966,11 +967,14 @@ pub(crate) fn build(app: &Application, start: &Start) -> Rc<CompanionWindow> {
         let agent_for_change = agent.clone();
         let agent_for_cancel = agent.clone();
         let runner_for_change = runner.clone();
+        let feed_generation = feed_generation.clone();
         link::start(
             start.nvim.clone(),
             sockets,
             eitri_core::companion::InstallKind::Agent,
-            move |state, band, peer_pid, connect_began| {
+            move |link, state, band, peer_pid, connect_began| {
+                let generation = link.feed_generation().unwrap_or(0);
+                feed_generation.store(generation, std::sync::atomic::Ordering::Relaxed);
                 let was = attached.get();
                 let now = matches!(state, LinkState::Attached { .. });
                 attached.set(now);
@@ -981,6 +985,7 @@ pub(crate) fn build(app: &Application, start: &Start) -> Rc<CompanionWindow> {
                 // first context costs a cursor move, keeping the old editor's would send it with a turn.
                 if connect_began || matches!(state, LinkState::Connecting { .. }) || (was && !now) {
                     reset_context();
+                    runner_for_change.cancel_pending_focus();
                 }
                 // GNOME's extension is told which window the editor is once it is known, and that
                 // there is none once it is gone. A link still connecting or installing leaves the
@@ -1040,14 +1045,10 @@ pub(crate) fn build(app: &Application, start: &Start) -> Rc<CompanionWindow> {
     if let Some(channel) = pane_switch.borrow_mut().as_mut() {
         let runner = runner.clone();
         let agent = agent.clone();
-        feed_pump.listen_pane_switch(channel, move |message| {
-            if let crate::pane_switch::PaneMessage::Direction(letter) = message {
-                match crate::pane_switch::letter_direction(letter) {
-                    Some(direction) => {
-                        runner.editor_edge(direction, &|text| agent.show_notice(text));
-                    }
-                    None => println!("[pane_switch] unknown direction {letter:?}, ignoring"),
-                }
+        let attached = attached.clone();
+        feed_pump.listen_pane_switch(channel, Some(feed_generation.clone()), move |message| {
+            if let Some(direction) = editor_direction(message, attached.get()) {
+                runner.editor_edge(direction, &|text| agent.show_notice(text));
             }
         });
     }
@@ -1141,7 +1142,7 @@ pub(crate) fn build(app: &Application, start: &Start) -> Rc<CompanionWindow> {
             let mut attach = None;
             let mut partner = None;
             let mut present = false;
-            for received in server.requests().try_iter() {
+            for received in server.requests().try_iter().take(32) {
                 taken.set(taken.get() + 1);
                 // Taken before the request is taken apart; only the last attach counts, partner included.
                 let chain = super::requests::partner_chain(&received).map(<[u32]>::to_vec);
@@ -1213,7 +1214,8 @@ pub(crate) fn build(app: &Application, start: &Start) -> Rc<CompanionWindow> {
         gtk4::glib::timeout_add_local(std::time::Duration::from_millis(100), move || {
             let _keeps = &close_watcher;
             if drain_requests() {
-                if let Some(generation) = waiting_exit.get() {
+                let exited = close_watcher.borrow_mut().take_exit().or(waiting_exit.get());
+                if let Some(generation) = exited {
                     settle_exit(generation);
                 }
                 gtk4::glib::ControlFlow::Continue
@@ -1230,6 +1232,7 @@ pub(crate) fn build(app: &Application, start: &Start) -> Rc<CompanionWindow> {
         let close_prompt = close_prompt.clone();
         let link = link.clone();
         let pane_switch = pane_switch.clone();
+        let runner = runner.clone();
         window.connect_close_request(move |_| {
             // A running or queued turn is worth one y/n; `y` closes the window again and this sees
             // the confirmation.
@@ -1247,6 +1250,9 @@ pub(crate) fn build(app: &Application, start: &Start) -> Rc<CompanionWindow> {
             // it is written. Everything is explicit and safe to run twice, because GTK does not
             // reliably free this closure (and so run any `Drop`) before the process ends, and the
             // `y` answer comes back through here.
+            attached.set(false);
+            feed_generation.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            runner.cancel_pending_focus();
             link.shutdown();
             if let Some(agents) = &agents {
                 agents.stop();
@@ -1299,10 +1305,31 @@ pub(crate) fn build(app: &Application, start: &Start) -> Rc<CompanionWindow> {
     })
 }
 
+fn editor_direction(message: crate::pane_switch::PaneMessage, attached: bool) -> Option<Direction> {
+    if !attached {
+        return None;
+    }
+    if let crate::pane_switch::PaneMessage::Direction(letter) = message {
+        crate::pane_switch::letter_direction(letter)
+    } else {
+        None
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use std::path::PathBuf;
+
+    #[test]
+    fn direction_while_detached_does_nothing() {
+        use crate::pane_switch::PaneMessage;
+        assert_eq!(editor_direction(PaneMessage::Direction('R'), false), None);
+        assert_eq!(
+            editor_direction(PaneMessage::Direction('R'), true),
+            Some(Direction::Right)
+        );
+    }
 
     #[test]
     fn a_stop_of_a_companion_tab_with_nothing_running_is_refused_before_anything_is_shown() {

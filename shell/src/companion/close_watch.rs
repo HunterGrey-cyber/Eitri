@@ -69,7 +69,7 @@ impl CloseSlot {
         }
     }
 
-    /// There is no watch after all (the process was already gone).
+    /// The watch facility is unavailable; there is no exit to report.
     pub(crate) fn clear(&mut self) {
         self.addr = None;
         self.generation += 1;
@@ -106,32 +106,46 @@ impl CloseSlot {
 /// A pidfd on the editor process. Linux only: elsewhere there is nothing to open.
 struct Pidfd(OwnedFd);
 
+#[derive(Debug)]
+enum OpenError {
+    Gone,
+    Unavailable(String),
+}
+
 impl Pidfd {
     /// Opens a pidfd on `pid`, then checks that the process started when `start` says. The check is
     /// after the open on purpose: the sender verified the pair a moment ago, and a pid that was
     /// reused since must name nothing. `Err` says why, for the log.
     #[cfg(target_os = "linux")]
-    fn open(pid: u32, start: u64) -> Result<Pidfd, String> {
+    fn open(pid: u32, start: u64) -> Result<Pidfd, OpenError> {
         // SAFETY: `pidfd_open` takes a pid and flags and returns a new descriptor or -1; no pointer
         // is involved.
         let fd = unsafe { libc::syscall(libc::SYS_pidfd_open, pid as libc::pid_t, 0 as libc::c_uint) };
         if fd < 0 {
-            return Err(format!("pidfd_open({pid}): {}", std::io::Error::last_os_error()));
+            let error = std::io::Error::last_os_error();
+            return Err(if error.raw_os_error() == Some(libc::ESRCH) {
+                OpenError::Gone
+            } else {
+                OpenError::Unavailable(format!("pidfd_open({pid}): {error}"))
+            });
         }
         // SAFETY: `fd` is a descriptor `pidfd_open` just returned, owned by nobody else.
         let owned = unsafe { OwnedFd::from_raw_fd(fd as std::os::fd::RawFd) };
         match eitri_core::split::proc_start_time(pid) {
             Some(now) if now == start => Ok(Pidfd(owned)),
-            Some(_) => Err(format!(
-                "pid {pid} is not the process that was named (its start time changed)"
-            )),
-            None => Err(format!("pid {pid} is already gone")),
+            Some(_) => Err(OpenError::Gone),
+            None => match std::fs::metadata(format!("/proc/{pid}")) {
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => Err(OpenError::Gone),
+                _ => Err(OpenError::Unavailable(format!("cannot read pid {pid}'s start time"))),
+            },
         }
     }
 
     #[cfg(not(target_os = "linux"))]
-    fn open(pid: u32, _start: u64) -> Result<Pidfd, String> {
-        Err(format!("no pidfd on this platform to watch pid {pid} with"))
+    fn open(pid: u32, _start: u64) -> Result<Pidfd, OpenError> {
+        Err(OpenError::Unavailable(format!(
+            "no pidfd on this platform to watch pid {pid} with"
+        )))
     }
 
     /// Whether the process has exited, by polling the descriptor without waiting.
@@ -160,21 +174,14 @@ pub(crate) struct CloseWatch {
 }
 
 impl CloseWatch {
-    /// Watches `close_with` and calls `on_exit` once when that process exits. `None` (the reason is
-    /// logged) when the process is gone or is no longer the one named. Must run on the GTK thread.
-    pub(crate) fn open(
+    /// Watches `close_with` and calls `on_exit` once when that process exits.
+    /// An already gone process is distinct from an unavailable watch. Runs on the GTK thread.
+    fn open(
         close_with: CloseWith,
-        addr: &Path,
         child: Option<Child>,
         on_exit: impl FnOnce() + 'static,
-    ) -> Option<CloseWatch> {
-        let pidfd = match Pidfd::open(close_with.pid, close_with.start) {
-            Ok(pidfd) => pidfd,
-            Err(why) => {
-                println!("[companion] no close watch for {}: {why}", addr.display());
-                return None;
-            }
-        };
+    ) -> Result<CloseWatch, OpenError> {
+        let pidfd = Pidfd::open(close_with.pid, close_with.start)?;
         let fired = Rc::new(std::cell::Cell::new(false));
         let child = Rc::new(std::cell::RefCell::new(child));
         let mut on_exit = Some(on_exit);
@@ -200,19 +207,13 @@ impl CloseWatch {
             )
         };
         match source {
-            Ok(source) => Some(CloseWatch {
+            Ok(source) => Ok(CloseWatch {
                 source: Some(source),
                 fired,
                 child,
                 _fd: pidfd,
             }),
-            Err(neovide_editor::fd_watch::NotOwner) => {
-                println!(
-                    "[companion] no close watch for {}: not on the main thread",
-                    addr.display()
-                );
-                None
-            }
+            Err(neovide_editor::fd_watch::NotOwner) => Err(OpenError::Unavailable("not on the main thread".into())),
         }
     }
 }
@@ -240,6 +241,7 @@ impl Drop for CloseWatch {
 pub(crate) struct CloseWatcher {
     slot: CloseSlot,
     watch: Option<CloseWatch>,
+    pending_exit: Option<u64>,
     /// Called with the generation of the watch whose editor exited. It decides what that means:
     /// requests the control thread already accepted may still be waiting to be taken, and one of
     /// them can have replaced the watch that fired.
@@ -251,6 +253,7 @@ impl CloseWatcher {
         CloseWatcher {
             slot: CloseSlot::default(),
             watch: None,
+            pending_exit: None,
             on_exit: None,
         }
     }
@@ -265,10 +268,12 @@ impl CloseWatcher {
     /// not yet taken is the one case where the answer is not known: the editor that sent it may
     /// have been the panel's new one, and it was told `ok`.
     pub(crate) fn exit_decision(&self, generation: u64, accepted: u64, taken: u64) -> ExitDecision {
-        if self.watch.is_none() {
-            return ExitDecision::Ignore;
-        }
         self.slot.exit_decision(generation, accepted, taken)
+    }
+
+    /// An editor already gone when opened is settled after the control requests are drained.
+    pub(crate) fn take_exit(&mut self) -> Option<u64> {
+        self.pending_exit.take()
     }
 
     /// The editor this process started: watched for the address it was told to listen on.
@@ -288,17 +293,22 @@ impl CloseWatcher {
     fn replace(&mut self, addr: &Path, close_with: CloseWith, child: Option<Child>) {
         // The old watch goes first, so a pid that appears in both is never watched twice.
         self.watch = None;
-        // The slot is told only now: a watch that could not be opened is not a watch.
+        // The slot also owns an exit discovered while opening the watch.
         self.slot.on_request(addr, Some(close_with));
         let generation = self.slot.generation();
         let on_exit = self.on_exit.clone();
-        self.watch = CloseWatch::open(close_with, addr, child, move || {
+        let exited = move || {
             if let Some(on_exit) = on_exit {
                 on_exit(generation);
             }
-        });
-        if self.watch.is_none() {
-            self.slot.clear();
+        };
+        match CloseWatch::open(close_with, child, exited) {
+            Ok(watch) => self.watch = Some(watch),
+            Err(OpenError::Gone) => self.pending_exit = Some(generation),
+            Err(OpenError::Unavailable(why)) => {
+                println!("[companion] no close watch for {}: {why}", addr.display());
+                self.slot.clear();
+            }
         }
     }
 }
@@ -306,6 +316,23 @@ impl CloseWatcher {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn opening_a_watch_leaves_the_single_failure_log_to_its_caller() {
+        use eitri_core::source_scan::{braced, code_only, read_required};
+        let text = read_required("shell/src/companion/close_watch.rs").text;
+        let code = code_only(&text);
+        let at = code.find("impl CloseWatch {").expect("close watch");
+        let body = braced(&code, at + "impl CloseWatch ".len());
+        assert!(
+            !body.contains("println!"),
+            "open returns its failure without also logging it"
+        );
+        let at = code.find("fn replace(").expect("watch replacement");
+        let body = braced(&code, at + code[at..].find('{').unwrap());
+        assert_eq!(body.matches("println!").count(), 1);
+    }
+
     use std::process::Command;
 
     const A: &str = "/run/user/1000/eitri/a";
@@ -313,6 +340,23 @@ mod tests {
 
     fn with(pid: u32) -> Option<CloseWith> {
         Some(CloseWith { pid, start: 1 })
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn an_editor_reaped_before_watch_install_reports_its_generation() {
+        let mut child = Command::new("sleep").arg("30").spawn().unwrap();
+        let pid = child.id();
+        let start = eitri_core::split::proc_start_time(pid).unwrap();
+        child.kill().unwrap();
+        child.wait().unwrap();
+        let mut watcher = CloseWatcher::new();
+        watcher.install(A.into(), CloseWith { pid, start }, None);
+        let generation = watcher.take_exit().expect("already gone is an exit");
+        assert_eq!(watcher.exit_decision(generation, 2, 1), ExitDecision::Wait);
+        assert_eq!(watcher.exit_decision(generation, 2, 2), ExitDecision::Close);
+        watcher.on_request(Path::new(B), None);
+        assert_eq!(watcher.exit_decision(generation, 2, 2), ExitDecision::Ignore);
     }
 
     #[test]
@@ -425,7 +469,7 @@ mod tests {
         let pid = child.id();
         let start = eitri_core::split::proc_start_time(pid).unwrap();
         let err = Pidfd::open(pid, start + 1).err().expect("a different start time");
-        assert!(err.contains("start time"), "{err}");
+        assert!(matches!(err, OpenError::Gone), "{err:?}");
         child.kill().unwrap();
         child.wait().unwrap();
         assert!(Pidfd::open(pid, start).is_err());

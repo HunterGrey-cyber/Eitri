@@ -54,7 +54,7 @@ use std::os::unix::fs::{DirBuilderExt, FileTypeExt, MetadataExt, OpenOptionsExt,
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::mpsc::{self, Receiver, Sender};
+use std::sync::mpsc::{self, Receiver, SyncSender};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -905,7 +905,12 @@ fn serve(listener: UnixListener, sock: PathBuf, pid_file: PathBuf, page: bool) -
                 format!("could not write {}: {e}", pid_file.display())
             })?;
         let stop = Arc::new(AtomicBool::new(false));
-        let (requests_tx, requests) = mpsc::channel();
+        let (requests_tx, requests) = mpsc::sync_channel(64);
+        let raise_queued = Arc::new(AtomicBool::new(false));
+        let requests = ControlRequests {
+            receiver: requests,
+            raise_queued: raise_queued.clone(),
+        };
         let (done_tx, done) = mpsc::channel();
         let accepted = Arc::new(AtomicU64::new(0));
         let thread_stop = Arc::clone(&stop);
@@ -913,7 +918,14 @@ fn serve(listener: UnixListener, sock: PathBuf, pid_file: PathBuf, page: bool) -
         std::thread::Builder::new()
             .name("eitri-panel-control".into())
             .spawn(move || {
-                run(listener, &thread_stop, &requests_tx, &thread_accepted, page);
+                run(
+                    listener,
+                    &thread_stop,
+                    &requests_tx,
+                    &thread_accepted,
+                    &raise_queued,
+                    page,
+                );
                 let _ = done_tx.send(());
             })
             .map_err(|e| {
@@ -939,11 +951,18 @@ fn serve(listener: UnixListener, sock: PathBuf, pid_file: PathBuf, page: bool) -
 
 /// The server thread: accept, serve one connection at a time, stop when told to. It never waits for
 /// the GTK side and never touches the files.
-fn run(listener: UnixListener, stop: &AtomicBool, requests: &Sender<Received>, accepted: &AtomicU64, page: bool) {
+fn run(
+    listener: UnixListener,
+    stop: &AtomicBool,
+    requests: &SyncSender<Received>,
+    accepted: &AtomicU64,
+    raise_queued: &AtomicBool,
+    page: bool,
+) {
     let me = euid();
     while !stop.load(Ordering::Acquire) {
         match listener.accept() {
-            Ok((stream, _)) => serve_one(stream, requests, accepted, me, page),
+            Ok((stream, _)) => serve_one(stream, requests, accepted, raise_queued, me, page),
             // Nothing waiting, or a transient failure (descriptors exhausted, a connection that
             // went away): either way, never spin.
             Err(_) => std::thread::sleep(IDLE_SLEEP),
@@ -956,7 +975,14 @@ pub(crate) fn reply_line(stream: &UnixStream, line: &str) -> io::Result<()> {
     writer.write_all(format!("{line}\n").as_bytes())
 }
 
-fn serve_one(stream: UnixStream, requests: &Sender<Received>, accepted: &AtomicU64, me: u32, page: bool) {
+fn serve_one(
+    stream: UnixStream,
+    requests: &SyncSender<Received>,
+    accepted: &AtomicU64,
+    raise_queued: &AtomicBool,
+    me: u32,
+    page: bool,
+) {
     // A socket accepted from a non-blocking listener inherits that flag on macOS and the BSDs, and
     // every read below would then fail at once.
     if stream.set_nonblocking(false).is_err() || stream.set_write_timeout(Some(Duration::from_secs(1))).is_err() {
@@ -1035,17 +1061,64 @@ fn serve_one(stream: UnixStream, requests: &Sender<Received>, accepted: &AtomicU
             }
         }
     };
-    // Deliver only what the caller was told succeeded, so both sides agree on whether it happened.
-    // The receiver may already be gone; that is not this thread's problem.
-    //
-    // Counted before the reply is written: the sender may read `ok` and act on it (exit, start an
-    // editor) before this thread gets to the send, and the GTK side must be able to tell from the
-    // count alone that a request is on its way. A reply that fails to write takes the count back.
+    let reply = admit(requests, accepted, raise_queued, Received { request, sender_chain });
+    let _ = reply_line(&stream, reply);
+}
+
+fn admit(
+    requests: &SyncSender<Received>,
+    accepted: &AtomicU64,
+    raise_queued: &AtomicBool,
+    received: Received,
+) -> &'static str {
+    let raise = matches!(received.request, Request::Raise);
+    if raise && raise_queued.swap(true, Ordering::SeqCst) {
+        return "ok";
+    }
+    // Count before publishing: the consumer must see every admitted request in the count.
+    // Once published it may be acted on, even if the caller disconnects before reading its reply.
     accepted.fetch_add(1, Ordering::SeqCst);
-    if reply_line(&stream, "ok").is_ok() {
-        let _ = requests.send(Received { request, sender_chain });
+    if requests.try_send(received).is_ok() {
+        "ok"
     } else {
         accepted.fetch_sub(1, Ordering::SeqCst);
+        if raise {
+            raise_queued.store(false, Ordering::SeqCst);
+        }
+        "refused: busy"
+    }
+}
+
+/// Admitted work. Taking a raise lets the producer queue the next presentation.
+pub struct ControlRequests {
+    receiver: Receiver<Received>,
+    raise_queued: Arc<AtomicBool>,
+}
+
+impl Drop for ControlRequests {
+    fn drop(&mut self) {
+        self.raise_queued.store(false, Ordering::SeqCst);
+    }
+}
+
+impl ControlRequests {
+    fn taken(&self, received: Received) -> Received {
+        if matches!(received.request, Request::Raise) {
+            self.raise_queued.store(false, Ordering::SeqCst);
+        }
+        received
+    }
+
+    pub fn try_recv(&self) -> Result<Received, mpsc::TryRecvError> {
+        self.receiver.try_recv().map(|received| self.taken(received))
+    }
+
+    pub fn recv_timeout(&self, timeout: Duration) -> Result<Received, mpsc::RecvTimeoutError> {
+        self.receiver.recv_timeout(timeout).map(|received| self.taken(received))
+    }
+
+    pub fn try_iter(&self) -> impl Iterator<Item = Received> + '_ {
+        std::iter::from_fn(|| self.try_recv().ok())
     }
 }
 
@@ -1054,7 +1127,7 @@ fn serve_one(stream: UnixStream, requests: &Sender<Received>, accepted: &AtomicU
 pub struct ControlServer {
     stop: Arc<AtomicBool>,
     done: Receiver<()>,
-    requests: Receiver<Received>,
+    requests: ControlRequests,
     accepted: Arc<AtomicU64>,
     socket: PathBuf,
     pid_file: PathBuf,
@@ -1063,16 +1136,15 @@ pub struct ControlServer {
 }
 
 impl ControlServer {
-    /// The requests that were answered `ok`, in order. Poll it from the GTK thread; the server
+    /// The requests admitted for an `ok` reply, in order. Poll it from the GTK thread; the server
     /// thread never waits on it.
-    pub fn requests(&self) -> &Receiver<Received> {
+    pub fn requests(&self) -> &ControlRequests {
         &self.requests
     }
 
-    /// How many requests have been answered `ok` (or are being: the count goes up just before the
-    /// reply is written and comes back down if that write fails). A request is counted before its
-    /// sender can read `ok`, and delivered on [`requests`](Self::requests) after, so a reader that
-    /// has taken fewer than this many has one still on its way, or about to be withdrawn.
+    /// How many requests were admitted, including one being published before its reply is written.
+    /// A full queue rolls the count back; a caller disconnecting after admission cannot withdraw work
+    /// the consumer may already have taken. A consumer behind this count must defer its exit decision.
     pub fn accepted(&self) -> u64 {
         self.accepted.load(Ordering::SeqCst)
     }
@@ -1116,6 +1188,102 @@ impl fmt::Debug for ControlServer {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn a_raise_burst_leaves_room_for_attach_and_counts_only_queued_work() {
+        let (tx, receiver) = mpsc::sync_channel(64);
+        let raise_queued = Arc::new(AtomicBool::new(false));
+        let rx = ControlRequests {
+            receiver,
+            raise_queued: raise_queued.clone(),
+        };
+        let accepted = AtomicU64::new(0);
+        let raise = || Received {
+            request: Request::Raise,
+            sender_chain: vec![],
+        };
+        for _ in 0..1000 {
+            assert_eq!(admit(&tx, &accepted, &raise_queued, raise()), "ok");
+        }
+        let attach = Received {
+            request: Request::Attach {
+                addr: "/nvim".into(),
+                close_with: None,
+            },
+            sender_chain: vec![],
+        };
+        assert_eq!(admit(&tx, &accepted, &raise_queued, attach), "ok");
+        assert_eq!(accepted.load(Ordering::SeqCst), 2);
+        assert_eq!(rx.try_recv().unwrap().request, Request::Raise);
+        assert_eq!(admit(&tx, &accepted, &raise_queued, raise()), "ok");
+        assert!(matches!(rx.try_recv().unwrap().request, Request::Attach { .. }));
+        assert_eq!(rx.try_recv().unwrap().request, Request::Raise);
+        assert!(rx.try_recv().is_err());
+        assert_eq!(accepted.load(Ordering::SeqCst), 3);
+        assert_eq!(admit(&tx, &accepted, &raise_queued, raise()), "ok");
+        drop(rx);
+        assert_eq!(admit(&tx, &accepted, &raise_queued, raise()), "refused: busy");
+        assert!(!raise_queued.load(Ordering::SeqCst));
+        assert_eq!(accepted.load(Ordering::SeqCst), 4);
+    }
+
+    #[test]
+    fn the_65th_queued_request_is_refused_without_counting_or_acknowledging_it() {
+        let (tx, rx) = std::sync::mpsc::sync_channel(64);
+        let accepted = std::sync::atomic::AtomicU64::new(0);
+        let raise_queued = AtomicBool::new(false);
+        for _ in 0..64 {
+            assert_eq!(
+                super::admit(
+                    &tx,
+                    &accepted,
+                    &raise_queued,
+                    super::Received {
+                        request: super::Request::Attach {
+                            addr: "/nvim".into(),
+                            close_with: None
+                        },
+                        sender_chain: vec![],
+                    }
+                ),
+                "ok"
+            );
+        }
+        assert_eq!(
+            super::admit(
+                &tx,
+                &accepted,
+                &raise_queued,
+                super::Received {
+                    request: super::Request::Attach {
+                        addr: "/nvim".into(),
+                        close_with: None
+                    },
+                    sender_chain: vec![],
+                }
+            ),
+            "refused: busy"
+        );
+        assert_eq!(accepted.load(std::sync::atomic::Ordering::SeqCst), 64);
+        assert_eq!(rx.try_iter().count(), 64);
+        drop(rx);
+        assert_eq!(
+            super::admit(
+                &tx,
+                &accepted,
+                &raise_queued,
+                super::Received {
+                    request: super::Request::Attach {
+                        addr: "/nvim".into(),
+                        close_with: None
+                    },
+                    sender_chain: vec![],
+                }
+            ),
+            "refused: busy"
+        );
+        assert_eq!(accepted.load(std::sync::atomic::Ordering::SeqCst), 64);
+    }
+
     use super::*;
     use crate::test_scratch_dir::ScratchDir;
     use std::io::BufRead;

@@ -16,6 +16,9 @@ local agent = rawget(_G, "__eitri_companion")
 if type(agent) == "table" and agent.mode == "takeover" then
   return { refused = "takeover" }
 end
+if type(rawget(_G, "__eitri_window")) == "table" then
+  return { refused = "eitri_window" }
+end
 local takeover = extra.mode == "takeover"
 
 -- Each slot has one holder. Tell its previous holder before removing the glue,
@@ -26,9 +29,6 @@ if extra.slot ~= nil then
   page_id = extra.slot.id
   assert(type(page_id) == "string" and #page_id >= 1 and #page_id <= 40
     and page_id:match("^[a-z0-9][a-z0-9%-]*$") and page_id:sub(-1) ~= "-", "invalid page id")
-  if type(rawget(_G, "__eitri_window")) == "table" then
-    return { refused = "eitri_window" }
-  end
 end
 local pages = rawget(_G, "__eitri_pages")
 if takeover and pages then
@@ -117,7 +117,9 @@ for _, part in ipairs(parts) do
   if not fn then
     state.failed[#state.failed + 1] = { part.name, tostring(err) }
   else
-    local ok, td = pcall(fn, part.opts or {})
+    local opts = part.opts or {}
+    opts.generation = extra.generation
+    local ok, td = pcall(fn, opts)
     if ok then
       state.installed[#state.installed + 1] = part.name
       if type(td) == "function" then
@@ -149,7 +151,8 @@ if not page_id then
     if not ok or c == 0 then
       return false
     end
-    pcall(vim.fn.chansend, c, letter .. "\n")
+    local prefix = extra.generation and ("G " .. extra.generation .. " ") or ""
+    pcall(vim.fn.chansend, c, prefix .. letter .. "\n")
     pcall(vim.fn.chanclose, c)
     return true
   end

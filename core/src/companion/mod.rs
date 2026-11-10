@@ -199,6 +199,34 @@ pub fn install_args(channel_id: u64, sockets: &Sockets, kind: &InstallKind) -> V
     vec![Value::from(channel_id), Value::Array(parts), extra]
 }
 
+/// A feed's current attachment stamp. Active installs use even numbers; detach advances to the next odd number.
+pub type FeedGeneration = std::sync::Arc<std::sync::atomic::AtomicU64>;
+
+/// Removes an attachment stamp only when it belongs to the reader's current editor.
+pub fn feed_line<'a>(line: &'a str, current: Option<&FeedGeneration>) -> Option<&'a str> {
+    let stamped = line.strip_prefix("G ").and_then(|s| s.split_once(' '));
+    match (stamped, current) {
+        (Some((stamp, body)), current) => {
+            let generation = stamp.parse::<u64>().ok()?;
+            if current.is_some_and(|current| {
+                current.load(std::sync::atomic::Ordering::Relaxed) != generation || generation == 0
+            }) {
+                None
+            } else {
+                Some(body)
+            }
+        }
+        (None, None) => Some(line),
+        (None, Some(_)) => None,
+    }
+}
+
+pub(crate) fn stamp_install(args: &mut [Value], generation: u64) {
+    if let Value::Map(extra) = &mut args[2] {
+        extra.push(("generation".into(), generation.into()));
+    }
+}
+
 /// The takeover uses the companion parts with a reload timer that stays on for the whole attach.
 /// All addresses and environment values travel as arguments to the snippets.
 pub fn takeover_install_args(channel_id: u64, parts: &crate::takeover::glue::TakeoverParts) -> Vec<Value> {
@@ -307,7 +335,7 @@ impl std::fmt::Display for InstallError {
         match self {
             Self::Malformed(why) => f.write_str(why),
             Self::Refused(InstallRefusal::EitriWindow) => {
-                f.write_str("this window opens pages itself: press the prefix and the page's key")
+                f.write_str("this nvim is open in an Eitri window: use its panel and page keys")
             }
             Self::Refused(InstallRefusal::Takeover) => {
                 f.write_str("this nvim is open in an Eitri window: its pages open there")
@@ -618,7 +646,7 @@ mod tests {
     fn a_refusal_reads_as_the_sentence_for_its_own_editor() {
         assert_eq!(
             InstallError::Refused(InstallRefusal::EitriWindow).to_string(),
-            "this window opens pages itself: press the prefix and the page's key"
+            "this nvim is open in an Eitri window: use its panel and page keys"
         );
         assert_eq!(
             InstallError::Refused(InstallRefusal::Takeover).to_string(),
@@ -749,6 +777,82 @@ mod tests {
             !env!("CARGO_PKG_VERSION_PRE").is_empty()
         );
         assert_eq!(get(&info[4], "website").as_str(), Some("https://eitri.cc"));
+    }
+
+    #[test]
+    fn old_context_and_direction_generations_are_dropped_even_after_reattach() {
+        use std::sync::atomic::Ordering::Relaxed;
+        let current: FeedGeneration = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(1));
+        for payload in [r#"{"v":1,"file":"old.rs"}"#, "R"] {
+            let old = format!("G 1 {payload}");
+            assert_eq!(feed_line(&old, Some(&current)), Some(payload));
+            current.store(0, Relaxed);
+            assert_eq!(feed_line(&old, Some(&current)), None);
+            current.store(2, Relaxed);
+            assert_eq!(feed_line(&old, Some(&current)), None);
+            assert_eq!(feed_line(payload, Some(&current)), None);
+            assert_eq!(feed_line(&format!("G 2 {payload}"), Some(&current)), Some(payload));
+            current.store(1, Relaxed);
+        }
+    }
+
+    #[test]
+    fn the_install_stamps_every_part_and_the_edge_hook_with_its_generation() {
+        let mut args = install_args(3, &all_sockets(), &InstallKind::Agent);
+        stamp_install(&mut args, 42);
+        let lua = mlua::Lua::new();
+        lua.load(
+            r#"
+            captured = {}; loadstring = load
+            vim = { env = {}, fn = { getpid = function() return 1 end },
+                uv = { new_timer = function() return { start = function() end } end },
+                schedule_wrap = function(f) return f end }
+        "#,
+        )
+        .exec()
+        .unwrap();
+        let parts = lua.create_table().unwrap();
+        for (i, part) in args[1].as_array().unwrap().iter().enumerate() {
+            let table = lua.create_table().unwrap();
+            table.set("name", get(part, "name").as_str().unwrap()).unwrap();
+            table
+                .set("src", "local opts = ...; captured[#captured + 1] = opts.generation")
+                .unwrap();
+            parts.set(i + 1, table).unwrap();
+        }
+        let extra = lua.create_table_from([("generation", 42)]).unwrap();
+        let _: mlua::Value = lua.load(INSTALL_LUA).call((3, parts, extra)).unwrap();
+        let captured: mlua::Table = lua.globals().get("captured").unwrap();
+        assert_eq!(captured.raw_len(), args[1].as_array().unwrap().len());
+        for generation in captured.sequence_values::<u64>() {
+            assert_eq!(generation.unwrap(), 42);
+        }
+        assert_eq!(get(&args[2], "generation").as_u64(), Some(42));
+    }
+
+    #[test]
+    fn an_agent_install_refuses_an_embedded_editor_before_running_parts() {
+        let lua = mlua::Lua::new();
+        lua.load("__eitri_window = {}; __eitri_companion = { teardown = function() touched = true end }")
+            .exec()
+            .unwrap();
+        let parts = lua
+            .create_sequence_from([lua
+                .create_table_from([
+                    ("name", "editor_context"),
+                    (
+                        "src",
+                        "touched = true; vim.api.nvim_create_augroup('eitri_editor_watch', { clear = true })",
+                    ),
+                ])
+                .unwrap()])
+            .unwrap();
+        let reply: mlua::Table = lua
+            .load(INSTALL_LUA)
+            .call((7, parts, lua.create_table().unwrap()))
+            .unwrap();
+        assert_eq!(reply.get::<String>("refused").unwrap(), "eitri_window");
+        assert!(lua.globals().get::<Option<bool>>("touched").unwrap().is_none());
     }
 
     #[test]

@@ -284,15 +284,14 @@ impl FeedPump {
         &self,
         feed: &mut EditorContextFeed,
         scratch_dir: Option<std::path::PathBuf>,
+        generation: Option<eitri_core::companion::FeedGeneration>,
     ) -> (ContextSource, Rc<dyn Fn()>) {
         let Some(listener) = feed.take_listener() else {
             eprintln!("[editor-context] listen() called twice -- turns will carry no editor context");
             return (Rc::new(|| None), Rc::new(|| {}));
         };
-        let added =
-            self.feeds
-                .borrow_mut()
-                .add_context(EditorContextReader::new(listener), scratch_dir, Instant::now());
+        let reader = EditorContextReader::with_generation(listener, generation);
+        let added = self.feeds.borrow_mut().add_context(reader, scratch_dir, Instant::now());
         self.rearm();
         added
     }
@@ -304,7 +303,7 @@ impl FeedPump {
         feed: &mut EditorContextFeed,
         scratch_dir: Option<std::path::PathBuf>,
     ) -> OwnContext {
-        let (source, reset) = self.listen_context(feed, scratch_dir);
+        let (source, reset) = self.listen_context(feed, scratch_dir, None);
         OwnContext {
             source,
             facts: self.push_source(),
@@ -319,6 +318,7 @@ impl FeedPump {
     pub(crate) fn listen_pane_switch(
         &self,
         channel: &mut PaneSwitchChannel,
+        generation: Option<eitri_core::companion::FeedGeneration>,
         on_message: impl Fn(PaneMessage) + 'static,
     ) {
         let Some(listener) = channel.take_listener() else {
@@ -326,9 +326,8 @@ impl FeedPump {
             return;
         };
         *self.pane.borrow_mut() = Some(Rc::new(on_message));
-        self.feeds
-            .borrow_mut()
-            .add_pane_switch(PaneSwitchReader::new(listener), Instant::now());
+        let reader = PaneSwitchReader::with_generation(listener, generation);
+        self.feeds.borrow_mut().add_pane_switch(reader, Instant::now());
         self.rearm();
     }
 
@@ -442,7 +441,7 @@ mod tests {
             });
         }
         pump.listen_keys(&mut keys, |_| {});
-        let (context_source, _) = pump.listen_context(&mut context_feed, None);
+        let (context_source, _) = pump.listen_context(&mut context_feed, None, None);
         let contexts = Rc::new(std::cell::Cell::new(0));
         {
             let contexts = contexts.clone();
@@ -450,7 +449,7 @@ mod tests {
         }
         {
             let panes = panes.clone();
-            pump.listen_pane_switch(&mut pane, move |message| panes.borrow_mut().push(message));
+            pump.listen_pane_switch(&mut pane, None, move |message| panes.borrow_mut().push(message));
         }
         let mut follow = FollowSocket::bind().unwrap();
         let follows = Rc::new(RefCell::new(Vec::new()));
@@ -537,7 +536,7 @@ mod tests {
             let weak = Rc::downgrade(&pump);
             let theme = theme.clone();
             let themes = themes.clone();
-            pump.listen_pane_switch(&mut pane, move |_| {
+            pump.listen_pane_switch(&mut pane, None, move |_| {
                 let Some(pump) = weak.upgrade() else { return };
                 let themes = themes.clone();
                 pump.listen_theme(&mut theme.borrow_mut(), move |payload| {
@@ -579,7 +578,7 @@ mod tests {
         let _owner = context.acquire().expect("glib's default main context");
         let pump = FeedPump::start();
         let mut feed = EditorContextFeed::new().unwrap();
-        let (source, _) = pump.listen_context(&mut feed, None);
+        let (source, _) = pump.listen_context(&mut feed, None, None);
         let panel = eitri_panel::agent_panel::AgentPanelHandle::for_host_test(Rc::new(NoPage));
         wake_panel_on_context(&pump, &panel);
         iterate_until(200, || false);
@@ -625,7 +624,7 @@ mod tests {
         let pump = FeedPump::start();
         let mut feed = EditorContextFeed::new().unwrap();
         // No panel listens: the stamp does not depend on one.
-        let _ = pump.listen_context(&mut feed, Some(std::path::PathBuf::from("/p/scratch")));
+        let _ = pump.listen_context(&mut feed, Some(std::path::PathBuf::from("/p/scratch")), None);
         iterate_until(200, || false);
         // A file, then a draft in Eitri's scratch directory, which never becomes the context.
         for file in ["/p/b.rs", "/p/scratch/1-draft.md"] {

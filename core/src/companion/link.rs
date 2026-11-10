@@ -77,6 +77,10 @@ impl CompanionLink {
         self.driver.borrow().attach(addr);
     }
 
+    pub fn feed_generation(&self) -> Option<u64> {
+        self.driver.borrow().feed_generation()
+    }
+
     /// Run Lua that needs the install's part `part` in the attached nvim, without waiting for its
     /// answer. `Err` says why not.
     pub fn exec_lua_for(&self, part: &str, code: &str, args: Vec<Value>) -> Result<(), String> {
