@@ -1216,7 +1216,7 @@ impl Worker<'_> {
     }
 
     /// Merge title, bell, clipboard and selection events into the pending update: latest title
-    /// and copy win, bells fold into one. Titles and bells ride the render clock so an event on
+    /// and copy win, byte totals add up, bells fold into one. Titles and bells ride the render clock so an event on
     /// every read cannot wake the host per read or while hidden. Clipboard, primary selection and
     /// finished host selections ring at once, even hidden: a completed gesture must not wait for
     /// a render clock the hidden host never polls.
@@ -1227,21 +1227,7 @@ impl Worker<'_> {
         }
         // All three clipboard events are delivered at once, even while hidden.
         let has_clipboard = events.clipboard.is_some() || events.primary.is_some() || events.selection.is_some();
-        self.apply_pending(|update| {
-            if events.title.is_some() {
-                update.events.title = events.title;
-            }
-            update.events.bell |= events.bell;
-            if events.clipboard.is_some() {
-                update.events.clipboard = events.clipboard;
-            }
-            if events.primary.is_some() {
-                update.events.primary = events.primary;
-            }
-            if events.selection.is_some() {
-                update.events.selection = events.selection;
-            }
-        });
+        self.apply_pending(|update| update.events.merge(events));
         if !self.visible {
             if has_clipboard {
                 self.ring();

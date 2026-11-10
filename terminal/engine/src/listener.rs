@@ -21,7 +21,7 @@ pub(crate) enum Reply {
     TextAreaSize(Arc<dyn Fn(WindowSize) -> String + Sync + Send + 'static>),
 }
 
-/// What the host should hear about. Bounded by construction: one slot each, latest wins.
+/// What the host should hear about. One slot per payload, latest wins; byte totals accumulate.
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
 pub struct HostEvents {
     /// `Some(Some(t))` a new title, `Some(None)` a reset, `None` nothing new.
@@ -34,6 +34,9 @@ pub struct HostEvents {
     /// as the same thing): what a middle click pastes. Kept apart from `clipboard` so an nvim
     /// `"*y` inside the terminal does not overwrite what `Ctrl+V` pastes.
     pub primary: Option<String>,
+    /// Decoded UTF-8 byte totals for every OSC 52 write, including overwritten pending copies.
+    pub clipboard_bytes: Option<usize>,
+    pub primary_bytes: Option<usize>,
     /// Text a HOST selection gesture (a drag release) just finished. Not an OSC 52 event --
     /// selecting text never runs through `Term`'s own event stream -- so unlike the three fields
     /// above this is never populated by [`Listener`]; `crate::screen::Screen::take_events` merges it
@@ -41,6 +44,32 @@ pub struct HostEvents {
     /// release, as foot and alacritty do: the clipboard for `Ctrl+Shift+V` elsewhere, the primary
     /// selection for a middle click, as in every X/Wayland terminal.
     pub selection: Option<String>,
+}
+
+impl HostEvents {
+    pub(crate) fn merge(&mut self, events: Self) {
+        if events.title.is_some() {
+            self.title = events.title;
+        }
+        self.bell |= events.bell;
+        for (kept, incoming) in [
+            (&mut self.clipboard, events.clipboard),
+            (&mut self.primary, events.primary),
+            (&mut self.selection, events.selection),
+        ] {
+            if incoming.is_some() {
+                *kept = incoming;
+            }
+        }
+        for (total, bytes) in [
+            (&mut self.clipboard_bytes, events.clipboard_bytes),
+            (&mut self.primary_bytes, events.primary_bytes),
+        ] {
+            if let Some(bytes) = bytes {
+                *total = Some(total.unwrap_or(0).saturating_add(bytes));
+            }
+        }
+    }
 }
 
 #[derive(Default)]
@@ -80,8 +109,16 @@ impl EventListener for Listener {
             Event::Title(title) => pending.events.title = Some(Some(title)),
             Event::ResetTitle => pending.events.title = Some(None),
             Event::Bell => pending.events.bell = true,
-            Event::ClipboardStore(ClipboardType::Clipboard, text) => pending.events.clipboard = Some(text),
-            Event::ClipboardStore(ClipboardType::Selection, text) => pending.events.primary = Some(text),
+            Event::ClipboardStore(ClipboardType::Clipboard, text) => {
+                pending.events.clipboard_bytes =
+                    Some(pending.events.clipboard_bytes.unwrap_or(0).saturating_add(text.len()));
+                pending.events.clipboard = Some(text);
+            }
+            Event::ClipboardStore(ClipboardType::Selection, text) => {
+                pending.events.primary_bytes =
+                    Some(pending.events.primary_bytes.unwrap_or(0).saturating_add(text.len()));
+                pending.events.primary = Some(text);
+            }
             // Refused inside `Term` by `Osc52::OnlyCopy` before it could get here. Should a later
             // alacritty_terminal send one anyway, answering nothing IS the refusal: a program in the
             // terminal reading the user's clipboard is a data leak.
@@ -92,5 +129,46 @@ impl EventListener for Listener {
             | Event::Exit
             | Event::ChildExit(_) => {}
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn osc52_byte_totals_include_overwritten_copies_and_empty_writes() {
+        let listener = Listener::default();
+        for _ in 0..10 {
+            listener.send_event(Event::ClipboardStore(ClipboardType::Clipboard, "é\0secret".into()));
+        }
+        listener.send_event(Event::ClipboardStore(ClipboardType::Selection, String::new()));
+        let pending = listener.0.lock().unwrap();
+        assert_eq!(pending.events.clipboard_bytes, Some(90));
+        assert_eq!(pending.events.primary_bytes, Some(0));
+        assert_eq!(pending.events.clipboard.as_deref(), Some("é\0secret"));
+    }
+
+    #[test]
+    fn osc52_byte_totals_survive_coalescing_across_parser_reads() {
+        let mut screen = crate::Screen::new(
+            crate::PtySize {
+                cols: 80,
+                rows: 4,
+                cell_width_px: 8,
+                cell_height_px: 16,
+            },
+            crate::TerminalColors::default(),
+        );
+        let mut pending = HostEvents::default();
+        for _ in 0..10 {
+            screen.feed(b"\x1b]52;c;aGk=\x07\x1b]52;p;w6k=\x07");
+            pending.merge(screen.take_events());
+        }
+        assert_eq!(pending.clipboard_bytes, Some(20));
+        assert_eq!(pending.primary_bytes, Some(20));
+        assert_eq!(pending.clipboard.as_deref(), Some("hi"));
+        assert_eq!(pending.primary.as_deref(), Some("é"));
+        assert_eq!(screen.take_events(), HostEvents::default());
     }
 }

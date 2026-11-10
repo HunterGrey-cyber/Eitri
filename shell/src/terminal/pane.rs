@@ -62,8 +62,9 @@
 //!
 //! **A program's copy lands on the desktop, and its bell flashes the pane** (bottom-terminal phase
 //! 2). An OSC 52 copy goes to GTK's clipboard (`c`) or primary selection (`p`/`s`), hidden or not; a
-//! read is still refused, by `Term` itself. A bell tints the pane for a moment (`bell.rs`), and a
-//! bell rung while the terminal was hidden is not flashed when it comes back. The title a program
+//! read is still refused, by `Term` itself. Copies show a byte-only notice with this pane's number
+//! and target, coalesced for one second. Hidden copies show when mapped. A bell tints the pane for
+//! a moment (`bell.rs`), and a bell rung while the terminal was hidden is not flashed when it comes back. The title a program
 //! sets has nowhere to go: the terminal's title rule sends it to the pane's header "when one exists", and none does.
 //!
 //! **The font metrics are lazy too, and never panic.** A
@@ -105,6 +106,7 @@ use terminal_input::NormalizedInput;
 use terminal_render::PaintList;
 
 use super::bell::{self, BellFlash};
+use super::clipboard_notice::ClipboardNotice;
 use super::gl::SkiaState;
 use super::ime::{im_cursor_rect, Commit, FocusChange, GtkFocus, ImeGate};
 use super::input_queue::{InputQueue, PaneInput, PasteTicket};
@@ -176,6 +178,8 @@ struct State {
     paste_reads: Vec<(PasteTicket, gio::Cancellable)>,
     /// The bell's flash (phase 2).
     bell: BellFlash,
+    clipboard_notice: ClipboardNotice,
+    number: u8,
     /// The last selection a drag finished: kept host-side so `Ctrl+Shift+C`
     /// can copy it again without a round trip through the session (`copy_selection`'s own doc).
     /// Cleared on a restart, the same as `cursor`.
@@ -268,6 +272,8 @@ impl State {
             queue: InputQueue::new(),
             paste_reads: Vec::new(),
             bell: BellFlash::new(),
+            clipboard_notice: ClipboardNotice::default(),
+            number: 1,
             last_selection: None,
             mouse: MouseModes::default(),
             reports: pointer::ReportTracker::default(),
@@ -491,6 +497,7 @@ impl State {
         }
         self.cursor = None;
         self.last_selection = None;
+        self.clipboard_notice = ClipboardNotice::default();
         self.mouse = MouseModes::default();
         self.reports = pointer::ReportTracker::default();
         // Leaving copy mode on exit/restart too -- a gone or about-to-be-replaced
@@ -701,6 +708,10 @@ impl TerminalPane {
     /// which refuses hidden modules, rather than through the pane's own focus call.
     pub(crate) fn widget(&self) -> &GLArea {
         &self.area
+    }
+
+    pub(crate) fn set_number(&self, number: u8) {
+        self.state.borrow_mut().number = number;
     }
 
     /// A shell is wanted: spawn it now if the pane has been laid out, else at its first allocation.
@@ -1170,6 +1181,10 @@ fn connect_visibility(area: &GLArea, state: &Rc<RefCell<State>>, im: &IMMulticon
         let im = im.clone();
         area.connect_map(move |area| {
             pump(&state, area, &im, false);
+            let until = state.borrow_mut().clipboard_notice.show(Instant::now());
+            if let Some(until) = until {
+                repaint_at(area, until);
+            }
             state.borrow().send_command(SessionCommand::Visible(true));
         });
     }
@@ -1191,7 +1206,7 @@ fn pump(state: &RefCell<State>, area: &GLArea, im: &IMMulticontext, on_screen: b
     let Some(update) = state.borrow().session.as_ref().map(TerminalSession::take_update) else {
         return;
     };
-    let (repoint, flash_until, closed_by_exit) = {
+    let (repoint, flash_until, notice_until, closed_by_exit) = {
         let mut s = state.borrow_mut();
         let mut repoint = false;
         let mut closed_by_exit = None;
@@ -1214,12 +1229,16 @@ fn pump(state: &RefCell<State>, area: &GLArea, im: &IMMulticontext, on_screen: b
                 closed_by_exit = s.on_shell_exit.clone().map(|callback| (callback, s.generation));
             }
         }
+        let notice_until = s.clipboard_notice.record(&update.events, on_screen, Instant::now());
+        if update.events.clipboard_bytes.is_some() || update.events.primary_bytes.is_some() {
+            area.queue_render();
+        }
         let flash_until = if update.events.bell {
             s.bell(on_screen, Instant::now())
         } else {
             None
         };
-        (repoint, flash_until, closed_by_exit)
+        (repoint, flash_until, notice_until, closed_by_exit)
     };
     if repoint {
         point_input_method(im, state, area);
@@ -1227,18 +1246,10 @@ fn pump(state: &RefCell<State>, area: &GLArea, im: &IMMulticontext, on_screen: b
     // A copy lands whether the pane is shown or not; a read of either clipboard never gets this far
     // (`Term` refuses it, `Osc52::OnlyCopy`).
     if let Some(text) = update.events.clipboard {
-        crate::host_clipboard::write_text(&area.clipboard(), text.clone());
-        println!(
-            "[terminal] a program copied {} characters to the clipboard (OSC 52)",
-            text.chars().count()
-        );
+        crate::host_clipboard::write_text(&area.clipboard(), text);
     }
     if let Some(text) = update.events.primary {
-        crate::host_clipboard::write_text(&area.primary_clipboard(), text.clone());
-        println!(
-            "[terminal] a program copied {} characters to the primary selection (OSC 52)",
-            text.chars().count()
-        );
+        crate::host_clipboard::write_text(&area.primary_clipboard(), text);
     }
     // A finished host selection copies on release to the clipboard AND the primary selection
     // (foot's own `selection-target=clipboard` plus every X/Wayland
@@ -1254,17 +1265,8 @@ fn pump(state: &RefCell<State>, area: &GLArea, im: &IMMulticontext, on_screen: b
         );
         state.borrow_mut().last_selection = Some(text);
     }
-    if let Some(until) = flash_until {
-        area.queue_render();
-        let area = area.downgrade();
-        // `bell::repaint_delay`, not the raw `until - now`: glib truncates a `Duration` to whole
-        // milliseconds, so the raw remainder fires up to 1 ms before `until` while the flash is
-        // still active, and nothing else would then repaint the pane to clear it.
-        glib::timeout_add_local_once(bell::repaint_delay(until, Instant::now()), move || {
-            if let Some(area) = area.upgrade() {
-                area.queue_render();
-            }
-        });
+    for until in flash_until.into_iter().chain(notice_until) {
+        repaint_at(area, until);
     }
     // `update.events.title` has nowhere to go: the title rule gives it to the pane's header "when one
     // exists", and the terminal has no header yet.
@@ -1278,6 +1280,19 @@ fn pump(state: &RefCell<State>, area: &GLArea, im: &IMMulticontext, on_screen: b
             area.queue_render();
         }
     }
+}
+
+/// Both transient overlays expire through the same nonblocking repaint mechanism.
+fn repaint_at(area: &GLArea, until: Instant) {
+    area.queue_render();
+    let area = area.downgrade();
+    // Round up to a whole millisecond: glib truncation could repaint while an overlay is still
+    // active and then leave it visible until the next unrelated frame.
+    glib::timeout_add_local_once(bell::repaint_delay(until, Instant::now()), move || {
+        if let Some(area) = area.upgrade() {
+            area.queue_render();
+        }
+    });
 }
 
 /// Enter after the shell exited: a fresh session on a fresh PTY, in the same place.
@@ -1344,7 +1359,12 @@ fn connect_render(area: &GLArea, state: &Rc<RefCell<State>>) {
         // Laid out before the fields are borrowed apart: it reads the frame, the cursor and the
         // colours together.
         let preedit = s.preedit_layout();
-        let flashing = s.bell.active(Instant::now());
+        let now = Instant::now();
+        let flashing = s.bell.active(now);
+        let clipboard_notice = s.metrics.as_ref().map(|metrics| {
+            s.clipboard_notice
+                .ops(now, s.number, metrics.cols(), metrics.rows(), s.colors)
+        });
         let State {
             skia,
             metrics,
@@ -1371,6 +1391,9 @@ fn connect_render(area: &GLArea, state: &Rc<RefCell<State>>) {
                 // Over everything, for a moment: the bell (phase 2).
                 if flashing {
                     bell::tint(surface.canvas(), colors.foreground);
+                }
+                if let Some(ops) = &clipboard_notice {
+                    eitri_terminal::paint_ops(surface.canvas(), ops, metrics);
                 }
             }
             // No frame yet (or no metrics: the terminal has never been started), the theme's

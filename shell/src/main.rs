@@ -4040,6 +4040,7 @@ fn build_ui(
         // Weak: the registry holds the panes, and the controller's host holds the registry.
         let driver = Rc::downgrade(&driver);
         Rc::new(move |id, pane| {
+            pane.set_number(id.number());
             {
                 let id = id.clone();
                 let driver = driver.clone();

@@ -15,6 +15,7 @@
 //! own.
 
 mod bell;
+mod clipboard_notice;
 mod gl;
 mod ime;
 mod input_queue;
