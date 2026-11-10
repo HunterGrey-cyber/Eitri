@@ -25,7 +25,8 @@
 //!
 //! Each snapshot is a root commit under `refs/eitri/<session>/<turn>/<base|end|warm>`, its
 //! message the [`SnapshotLabel`] as `key: value` lines, then when it finished and the files it left
-//! out for their size. What a turn's review must say about its precision is a commit of the empty
+//! out for their size. A sibling `<kind>-ignored` ref retains its ignored-path blob for deletion
+//! checks. What a turn's review must say about its precision is a commit of the empty
 //! tree under `refs/eitri/<session>/<turn>/marks` ([`TurnMarks`]). There is no other state: the refs are the
 //! index of what exists, and deleting a ref really frees its snapshot, since no parent chain keeps
 //! it alive.
@@ -48,6 +49,34 @@ pub const ATTRIBUTES: &str = "* -text -filter -ident -working-tree-encoding\n";
 
 /// How long a blob read, a lock wait outside a snapshot, or opening the store may take.
 pub const READ_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// Larger ignored-path lists leave deletion unavailable, without losing the snapshot's view.
+const MAX_IGNORED_BYTES: usize = 4 * 1024 * 1024;
+
+/// Ignored paths retained with a snapshot, including collapsed excluded directories.
+pub(super) struct RecordedIgnored(Vec<u8>);
+
+impl RecordedIgnored {
+    /// ASCII folding can only add refusals on filesystems that fold path names.
+    pub(super) fn contains(&self, path: &Path) -> bool {
+        let path = path.as_os_str().as_bytes();
+        nul_separated(&self.0).any(|entry| {
+            entry.eq_ignore_ascii_case(path)
+                || (entry.ends_with(b"/")
+                    && path
+                        .get(..entry.len())
+                        .is_some_and(|prefix| prefix.eq_ignore_ascii_case(entry)))
+        })
+    }
+
+    /// A listed child proves its ancestors were directories, even without any tracked files.
+    /// Positive evidence uses exact bytes: case folding must never authorize deletion.
+    pub(super) fn contains_directory(&self, path: &Path) -> bool {
+        let mut prefix = path.as_os_str().as_bytes().to_vec();
+        prefix.push(b'/');
+        nul_separated(&self.0).any(|entry| entry.len() > prefix.len() && entry.starts_with(&prefix))
+    }
+}
 
 /// The limits one snapshot works within. A snapshot that cannot stay inside them says so instead
 /// of presenting a partial tree as complete.
@@ -521,6 +550,7 @@ pub struct Shadow {
     git_dir: PathBuf,
     work_tree: PathBuf,
     excludes_file: Option<PathBuf>,
+    user_excludes: bool,
 }
 
 /// The most of a project's `info/exclude` a snapshot copies; a larger one fails the snapshot.
@@ -558,7 +588,9 @@ impl Shadow {
     /// Opens (creating on first use) the store in `review_dir` for the project at `work_tree`,
     /// honouring the user's global excludes file.
     pub fn open(review_dir: &Path, work_tree: &Path) -> Result<Shadow, ShadowError> {
-        Self::open_with_excludes(review_dir, work_tree, git::user_excludes_file())
+        let mut shadow = Self::open_with_excludes(review_dir, work_tree, git::user_excludes_file())?;
+        shadow.user_excludes = true;
+        Ok(shadow)
     }
 
     /// [`open`](Self::open) with the global excludes file given rather than read from the user's
@@ -581,6 +613,7 @@ impl Shadow {
             git_dir: review_dir.join("git"),
             work_tree: work_tree.to_path_buf(),
             excludes_file,
+            user_excludes: false,
         };
         let attributes = shadow.git_dir.join("info/attributes");
         if std::fs::read(&attributes).ok().as_deref() != Some(ATTRIBUTES.as_bytes()) {
@@ -729,6 +762,183 @@ impl Shadow {
         Ok(())
     }
 
+    /// Fingerprints the external ignore sources git reads, including absence and the global path.
+    pub(super) fn exclude_digest(&self) -> Result<String, ShadowError> {
+        use sha2::{Digest, Sha256};
+        let mut digest = Sha256::new();
+        let global = self
+            .excludes_file
+            .clone()
+            .or_else(|| std::env::var_os("HOME").map(|home| PathBuf::from(home).join(".config/git/ignore")));
+        for path in [Some(self.git_dir.join("info/exclude")), global] {
+            if let Some(path) = path {
+                let name = path.as_os_str().as_bytes();
+                digest.update((name.len() as u64).to_le_bytes());
+                digest.update(name);
+                match read_project_exclude(&self.work_tree.join(path)) {
+                    Ok(bytes) => {
+                        digest.update([1]);
+                        digest.update((bytes.len() as u64).to_le_bytes());
+                        digest.update(bytes);
+                    }
+                    Err(e) if e.kind() == std::io::ErrorKind::NotFound => digest.update([0]),
+                    Err(e) => return Err(e.into()),
+                }
+            } else {
+                digest.update([2]);
+            }
+        }
+        Ok(hex_encode(&digest.finalize()))
+    }
+
+    /// The saved deletion evidence; older snapshots deliberately have none.
+    pub(super) fn deletion_provenance(&self, commit: &str) -> Result<Option<(u128, String)>, ShadowError> {
+        let mut cmd = self.git(None);
+        cmd.args(["show", "-s", "--format=%B", commit]);
+        let output = self.run_ok("show", cmd, None, Instant::now() + READ_TIMEOUT)?;
+        Ok(String::from_utf8_lossy(&output.stdout).lines().find_map(|line| {
+            let (time, digest) = line.strip_prefix("delete-provenance: ")?.split_once(' ')?;
+            (digest.len() == 64 && digest.bytes().all(|b| b.is_ascii_hexdigit()))
+                .then(|| Some((time.parse().ok()?, digest.to_owned())))?
+        }))
+    }
+
+    /// The recorded ignored set includes rules that were themselves ignored or too large to keep.
+    /// Missing evidence refuses deletion; a directory entry covers every path below it.
+    pub(super) fn recorded_ignored(&self, commit: &str) -> Result<Option<RecordedIgnored>, ShadowError> {
+        let mut cmd = self.git(None);
+        cmd.args(["show", "-s", "--format=%B", commit]);
+        let output = self.run_ok("show", cmd, None, Instant::now() + READ_TIMEOUT)?;
+        let message = String::from_utf8_lossy(&output.stdout);
+        let Some(blob) = message.lines().find_map(|line| line.strip_prefix("delete-ignored: ")) else {
+            return Ok(None);
+        };
+        if !is_full_id(blob) || !matches!(self.stored_len(blob)?, Some(len) if len <= MAX_IGNORED_BYTES as u64) {
+            return Ok(None);
+        }
+        let Some(bytes) = self.read_stored(blob)? else {
+            return Ok(None);
+        };
+        if !bytes.is_empty() && !bytes.ends_with(b"\0") {
+            return Ok(None);
+        }
+        Ok(Some(RecordedIgnored(bytes)))
+    }
+
+    fn list_ignored(&self, index: &Path, deadline: Instant) -> Result<BTreeSet<Vec<u8>>, ShadowError> {
+        let mut cmd = self.git(Some(index));
+        cmd.args([
+            "ls-files",
+            "-z",
+            "--others",
+            "--ignored",
+            "--exclude-standard",
+            "--directory",
+        ]);
+        let output = self.run_ok("ls-files", cmd, None, deadline)?;
+        let mut entries: Vec<_> = nul_separated(&output.stdout).collect();
+        entries.sort_unstable();
+        entries.dedup();
+        // Git also emits dir/ for a directory holding only ignored contents. Those contents
+        // follow it in this same listing; a truly excluded directory is collapsed without them.
+        // Checking a later check-ignore result instead could race a changed in-tree ignore rule.
+        Ok(entries
+            .iter()
+            .enumerate()
+            .filter_map(|(i, entry)| {
+                let has_children = entries.get(i + 1).is_some_and(|next| next.starts_with(entry));
+                (!entry.ends_with(b"/") || !has_children).then(|| entry.to_vec())
+            })
+            .collect())
+    }
+
+    fn store_ignored(&self, bytes: &[u8], deadline: Instant) -> Result<Option<String>, ShadowError> {
+        if bytes.len() > MAX_IGNORED_BYTES {
+            return Ok(None);
+        }
+        let mut hash = self.git(None);
+        hash.args(["hash-object", "-w", "--no-filters", "--stdin"]);
+        let output = self.run_ok("hash-object", hash, Some(bytes), deadline)?;
+        Ok(Some(
+            String::from_utf8_lossy(git::trim_newline(&output.stdout)).into_owned(),
+        ))
+    }
+
+    /// One name-only diff of every ignore file above the candidate deletion.
+    pub(super) fn ancestor_ignores_changed(&self, from: &str, to: &str, path: &Path) -> Result<bool, ShadowError> {
+        let mut cmd = self.git(None);
+        cmd.args([
+            "diff",
+            "--name-only",
+            "--no-renames",
+            "--no-ext-diff",
+            "--no-textconv",
+            "-z",
+            from,
+            to,
+            "--",
+        ]);
+        for dir in path.ancestors().skip(1) {
+            let mut spec = OsString::from(":(top,literal)");
+            spec.push(dir.join(".gitignore"));
+            cmd.arg(spec);
+        }
+        Ok(!self
+            .run_ok("diff", cmd, None, Instant::now() + READ_TIMEOUT)?
+            .stdout
+            .is_empty())
+    }
+
+    /// Evaluates the base's ancestor rules without consulting the live work tree's ignore files.
+    /// The caller resolves external excludes once and checks their digest before using this instance.
+    pub(super) fn ignored_in_base(&self, base: &str, path: &Path) -> Result<bool, ShadowError> {
+        struct Scratch(PathBuf);
+        impl Drop for Scratch {
+            fn drop(&mut self) {
+                let _ = std::fs::remove_dir_all(&self.0);
+            }
+        }
+        let scratch = Scratch(
+            self.review_dir
+                .join(format!("ignore-{}", uuid::Uuid::new_v4().simple())),
+        );
+        agent::private_fs::create_private_dir_all(&scratch.0, private_root(&self.review_dir))?;
+        for dir in path.ancestors().skip(1) {
+            agent::private_fs::create_private_dir_all(&scratch.0.join(dir), &scratch.0)?;
+            let ignore = dir.join(".gitignore");
+            if let Some(entry) = self.read_entry(base, &ignore)? {
+                if entry.kind != EntryKind::Blob {
+                    return Err(ShadowError::InvalidPath(ignore));
+                }
+                agent::private_fs::write_private(&scratch.0.join(ignore), &entry.bytes)?;
+            }
+        }
+        let deadline = Instant::now() + READ_TIMEOUT;
+        let mut cmd = git::command(&self.git_dir, &scratch.0, None, self.excludes_file.as_deref());
+        cmd.args(["check-ignore", "--no-index", "-q", "--"]).arg(path);
+        let output = git::run(cmd, remaining(deadline)?)?;
+        match output.status.code() {
+            Some(0) => Ok(true),
+            Some(1) => Ok(false),
+            _ => {
+                GitError::check("check-ignore", output)?;
+                Ok(false)
+            }
+        }
+    }
+
+    /// Only a tree proves that an ancestor was a directory, rather than a link or gitlink.
+    pub(super) fn tree_contains(&self, commit: &str, path: &Path) -> Result<bool, ShadowError> {
+        let mut spec = OsString::from(":(top,literal)");
+        spec.push(path);
+        let mut cmd = self.git(None);
+        cmd.args(["ls-tree", "-z", "--full-name", commit, "--"]).arg(spec);
+        Ok(self
+            .run_ok("ls-tree", cmd, None, Instant::now() + READ_TIMEOUT)?
+            .stdout
+            .starts_with(b"040000 "))
+    }
+
     /// The project's `info/exclude`, when the work tree is the top of a git work tree.
     fn project_exclude_file(&self, deadline: Instant) -> Result<Option<PathBuf>, ShadowError> {
         let mut cmd = git::user_read_only(&self.work_tree);
@@ -753,10 +963,25 @@ impl Shadow {
     /// with the reason.
     pub fn snapshot(&self, session: &str, label: &SnapshotLabel, limits: &Limits) -> SnapshotOutcome {
         let deadline = Instant::now() + limits.timeout;
-        match self.snapshot_until(session, label, limits, deadline) {
+        match self
+            .for_listing(deadline)
+            .and_then(|snapshot| snapshot.snapshot_until(session, label, limits, deadline))
+        {
             Ok(snapshot) => SnapshotOutcome::Taken(snapshot),
             Err(e) => SnapshotOutcome::Unavailable(e.to_string()),
         }
+    }
+
+    pub(super) fn for_listing(&self, deadline: Instant) -> Result<Self, ShadowError> {
+        let mut listing = self.clone();
+        if listing.user_excludes {
+            listing.excludes_file = git::resolve_excludes_file_with_timeout(
+                std::env::var_os("HOME").as_deref(),
+                std::env::var_os("XDG_CONFIG_HOME").as_deref(),
+                remaining(deadline)?,
+            )?;
+        }
+        Ok(listing)
     }
 
     fn snapshot_until(
@@ -774,6 +999,8 @@ impl Shadow {
         // left; left in place, it would fail every later snapshot of the session.
         remove_if_present(&lock_file_of(&index))?;
         self.sync_excludes_until(deadline)?;
+        let excludes = self.exclude_digest().ok();
+        let mut ignored = self.list_ignored(&index, deadline)?;
         let (tree, skipped) = match self.write_tree(&index, limits, deadline) {
             Ok(done) => done,
             // An index can point at objects a collection has since removed (a snapshot that never
@@ -784,18 +1011,47 @@ impl Shadow {
             }
             Err(e) => return Err(e),
         };
+        // The updated index has had ignored cached entries removed. Keep both observations:
+        // an in-tree ignore rule changing during write_tree must not erase earlier evidence.
+        ignored.extend(self.list_ignored(&index, deadline)?);
+        let ignored: Vec<u8> = ignored
+            .into_iter()
+            .flat_map(|entry| entry.into_iter().chain([0]))
+            .collect();
+        let ignored = self.store_ignored(&ignored, deadline)?;
         let mut commit = self.git(None);
         commit.args(["commit-tree", &tree, "-F", "-"]);
-        let message = snapshot_message(label, wall_clock_ms(), &skipped);
+        let mut message = snapshot_message(label, wall_clock_ms(), &skipped);
+        if let Some(blob) = &ignored {
+            message.push_str(&format!("delete-ignored: {blob}\n"));
+        }
+        // A rule changing while git lists files leaves no safe deletion provenance.
+        if let Some(excludes) = excludes.filter(|before| self.exclude_digest().ok().as_ref() == Some(before)) {
+            let taken_ns = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_nanos();
+            message.push_str(&format!("delete-provenance: {taken_ns} {excludes}\n"));
+        }
         let commit = self.run_ok("commit-tree", commit, Some(message.as_bytes()), deadline)?;
         let commit = String::from_utf8_lossy(git::trim_newline(&commit.stdout)).into_owned();
         let reference = format!("refs/eitri/{session}/{}/{}", label.turn, label.kind.as_str());
         // Only this session's snapshots, under its guard, and a collection, under the exclusive
         // store lock, write this ref, so a lock on it now is stale too.
         remove_if_present(&lock_file_of(&self.git_dir.join(&reference)))?;
+        // A hash in the commit message alone does not retain the blob through garbage collection.
+        // This sibling ref is removed with the turn, and published atomically with the snapshot.
+        let ignored_ref = format!("{reference}-ignored");
+        remove_if_present(&lock_file_of(&self.git_dir.join(&ignored_ref)))?;
+        let mut updates = format!("update {reference} {commit}\n");
+        if let Some(blob) = ignored {
+            updates.push_str(&format!("update {ignored_ref} {blob}\n"));
+        } else {
+            updates.push_str(&format!("delete {ignored_ref}\n"));
+        }
         let mut update = self.git(None);
-        update.args(["update-ref", &reference, &commit]);
-        self.run_ok("update-ref", update, None, deadline)?;
+        update.args(["update-ref", "--stdin"]);
+        self.run_ok("update-ref", update, Some(updates.as_bytes()), deadline)?;
         Ok(Snapshot {
             commit,
             tree,
@@ -842,6 +1098,14 @@ impl Shadow {
     /// read of the tree is safe from that.
     pub fn scratch_tree(&self, limits: &Limits) -> Result<(String, Vec<(PathBuf, Option<FilePrint>)>), ShadowError> {
         let deadline = Instant::now() + limits.timeout;
+        self.for_listing(deadline)?.scratch_tree_until(limits, deadline)
+    }
+
+    fn scratch_tree_until(
+        &self,
+        limits: &Limits,
+        deadline: Instant,
+    ) -> Result<(String, Vec<(PathBuf, Option<FilePrint>)>), ShadowError> {
         let session = format!("scratch-{}", uuid::Uuid::new_v4().simple());
         let index = self.index_path(&session)?;
         let _lock = self.lock_shared_until(deadline)?;
@@ -1131,6 +1395,18 @@ impl Shadow {
         Ok(Some(self.run_ok("cat-file", cat, None, deadline)?.stdout))
     }
 
+    /// The stored object's length, without loading its contents; missing objects have no length.
+    pub(super) fn stored_len(&self, blob: &str) -> Result<Option<u64>, ShadowError> {
+        if !is_full_id(blob) {
+            return Err(ShadowError::InvalidName(blob.to_owned()));
+        }
+        let mut cmd = self.git(None);
+        cmd.args(["cat-file", "--batch-check=%(objectsize)"]);
+        let input = format!("{blob}\n");
+        let output = self.run_ok("cat-file", cmd, Some(input.as_bytes()), Instant::now() + READ_TIMEOUT)?;
+        Ok(String::from_utf8_lossy(git::trim_newline(&output.stdout)).parse().ok())
+    }
+
     /// What `path` (relative to the work tree) is in snapshot `commit`: its kind, its mode and its
     /// bytes. `None` when the snapshot has nothing there, or only a directory.
     pub fn read_entry(&self, commit: &str, path: &Path) -> Result<Option<Entry>, ShadowError> {
@@ -1285,7 +1561,11 @@ impl Shadow {
     /// Every snapshot ref, with its label (`None` when its message is not a label).
     pub fn snapshot_refs(&self) -> Result<Vec<(String, Option<SnapshotLabel>)>, ShadowError> {
         let _lock = self.lock_shared_until(Instant::now() + READ_TIMEOUT)?;
-        self.snapshot_refs_locked(Instant::now() + READ_TIMEOUT)
+        Ok(self
+            .snapshot_refs_locked(Instant::now() + READ_TIMEOUT)?
+            .into_iter()
+            .filter(|(name, _)| !name.ends_with("-ignored"))
+            .collect())
     }
 
     fn snapshot_refs_locked(&self, deadline: Instant) -> Result<Vec<(String, Option<SnapshotLabel>)>, ShadowError> {
@@ -1324,6 +1604,9 @@ impl Shadow {
                 break;
             }
             let message = String::from_utf8_lossy(message);
+            if name.ends_with("-ignored") {
+                continue;
+            }
             refs.push(SnapshotRef {
                 name,
                 commit: String::from_utf8_lossy(commit).into_owned(),
@@ -1829,6 +2112,133 @@ fn write_atomically(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn recorded_ignored_paths_are_bounded_and_retained_with_the_snapshot() {
+        let dir = crate::test_scratch_dir::ScratchDir::new("eitri-review-ignored", "retention");
+        let project = dir.join("project");
+        std::fs::create_dir_all(project.join("hidden/nested")).unwrap();
+        std::fs::write(project.join(".gitignore"), "hidden/\n*.local\n").unwrap();
+        std::fs::write(project.join("hidden/nested/x"), "private").unwrap();
+        std::fs::write(project.join("config.local"), "private").unwrap();
+        let shadow = Shadow::open_with_excludes(&dir.join("review"), &project, None).unwrap();
+        let deadline = Instant::now() + READ_TIMEOUT;
+        let at_cap = vec![0; MAX_IGNORED_BYTES];
+        assert!(shadow.store_ignored(&at_cap, deadline).unwrap().is_some());
+        assert!(shadow
+            .store_ignored(&vec![0; MAX_IGNORED_BYTES + 1], deadline)
+            .unwrap()
+            .is_none());
+        let label = SnapshotLabel {
+            turn: 1,
+            kind: SnapshotKind::End,
+            turn_id: "t1".into(),
+            tab: 1,
+            time_ms: 1,
+        };
+        let SnapshotOutcome::Taken(snapshot) = shadow.snapshot("s1", &label, &Limits::default()) else {
+            panic!("snapshot unavailable");
+        };
+        shadow.trim(1, Duration::from_secs(3600), 2, "now").unwrap();
+        for (path, ignored) in [
+            ("config.local", true),
+            ("CONFIG.LOCAL", true),
+            ("HIDDEN/new", true),
+            ("hidden/nested/x", true),
+            ("hidden/new", true),
+            ("config.local/new", false),
+            ("hidden-other/x", false),
+            ("new", false),
+        ] {
+            assert_eq!(
+                shadow
+                    .recorded_ignored(&snapshot.commit)
+                    .unwrap()
+                    .map(|list| list.contains(Path::new(path))),
+                Some(ignored),
+                "{path}"
+            );
+        }
+        assert_eq!(shadow.snapshot_refs().unwrap().len(), 1);
+        assert_eq!(shadow.snapshot_ref_ids().unwrap().len(), 1);
+        let ignored_ref = format!("{}-ignored", snapshot.reference);
+        let refs = shadow.snapshot_refs_locked(Instant::now() + READ_TIMEOUT).unwrap();
+        assert!(refs.iter().any(|(name, label)| name == &ignored_ref && label.is_none()));
+        shadow.trim(0, Duration::from_secs(3600), 2, "now").unwrap();
+        assert!(shadow
+            .snapshot_refs_locked(Instant::now() + READ_TIMEOUT)
+            .unwrap()
+            .is_empty());
+    }
+
+    #[test]
+    fn ignored_paths_survive_rule_changes_during_snapshot() {
+        let dir = crate::test_scratch_dir::ScratchDir::new("eitri-review-ignored", "rule-change");
+        let project = dir.join("project");
+        std::fs::create_dir_all(&project).unwrap();
+        std::fs::write(project.join(".gitignore"), "before\n").unwrap();
+        std::fs::write(project.join("before"), "old").unwrap();
+        std::fs::write(project.join("after"), "old").unwrap();
+        let shadow = Shadow::open_with_excludes(&dir.join("review"), &project, None).unwrap();
+        let ignore = project.join(".gitignore");
+        AFTER_LISTING.with(|hook| {
+            *hook.borrow_mut() = Some(Box::new(move || std::fs::write(ignore, "after\n").unwrap()));
+        });
+        let label = SnapshotLabel {
+            turn: 1,
+            kind: SnapshotKind::Base,
+            turn_id: "t1".into(),
+            tab: 1,
+            time_ms: 1,
+        };
+        let SnapshotOutcome::Taken(snapshot) = shadow.snapshot("s1", &label, &Limits::default()) else {
+            panic!("snapshot unavailable");
+        };
+        assert!(AFTER_LISTING.with(|hook| hook.borrow().is_none()));
+        for path in ["before", "after"] {
+            assert_eq!(
+                shadow
+                    .recorded_ignored(&snapshot.commit)
+                    .unwrap()
+                    .map(|list| list.contains(Path::new(path))),
+                Some(true),
+                "{path}"
+            );
+        }
+    }
+
+    #[test]
+    fn only_tree_entries_prove_ancestor_directories() {
+        let dir = crate::test_scratch_dir::ScratchDir::new("eitri-review-tree-mode", "entries");
+        let project = dir.join("project");
+        std::fs::create_dir_all(project.join("directory")).unwrap();
+        std::fs::write(project.join("directory/file"), "text").unwrap();
+        std::os::unix::fs::symlink("directory", project.join("link")).unwrap();
+        let shadow = Shadow::open_with_excludes(&dir.join("review"), &project, None).unwrap();
+        let label = SnapshotLabel {
+            turn: 1,
+            kind: SnapshotKind::Base,
+            turn_id: "t1".into(),
+            tab: 1,
+            time_ms: 1,
+        };
+        let SnapshotOutcome::Taken(snapshot) = shadow.snapshot("s1", &label, &Limits::default()) else {
+            panic!("snapshot unavailable");
+        };
+        assert!(shadow.tree_contains(&snapshot.commit, Path::new("directory")).unwrap());
+        assert!(!shadow.tree_contains(&snapshot.commit, Path::new("link")).unwrap());
+        assert!(!shadow
+            .tree_contains(&snapshot.commit, Path::new("directory/file"))
+            .unwrap());
+        let mut tree = shadow.git(None);
+        tree.arg("mktree");
+        let input = format!("160000 commit {}\tsubmodule\n", snapshot.commit);
+        let tree = shadow
+            .run_ok("mktree", tree, Some(input.as_bytes()), Instant::now() + READ_TIMEOUT)
+            .unwrap();
+        let tree = String::from_utf8(tree.stdout).unwrap();
+        assert!(!shadow.tree_contains(tree.trim(), Path::new("submodule")).unwrap());
+    }
 
     #[test]
     fn trim_reports_deleted_turns_even_when_collection_later_fails() {

@@ -3099,8 +3099,8 @@ pub(crate) fn resolve_compare(
     }
 }
 
-/// Refuses a path that cannot be told apart from another changed file's name. The wire carries a
-/// path as text, so a file whose name is not valid UTF-8 is listed with replacement characters,
+/// Refuses a path that cannot be told apart from another changed name.
+/// The wire carries a path as text, so a file whose name is not valid UTF-8 is listed with replacement characters,
 /// and the same text names a different file that really has them. A name with one is served only
 /// when exactly one changed file reads that way and its bytes are the ones asked for.
 pub(crate) fn check_unambiguous(shadow: &Shadow, from: &str, to: &Side, path: &Path) -> Result<(), ReviewError> {
@@ -3646,6 +3646,18 @@ mod tests {
             std::fs::write(dir.join("project/a"), text).unwrap();
             assert_eq!(review.first_change_job("s1").run(Path::new("a")), Some(line));
         }
+    }
+
+    #[test]
+    fn an_oversized_first_change_is_none() {
+        let (dir, review) = first_change_fixture("oversized");
+        std::fs::OpenOptions::new()
+            .write(true)
+            .open(dir.join("project/a"))
+            .unwrap()
+            .set_len(super::super::write::MAX_FILE_BYTES + 1)
+            .unwrap();
+        assert_eq!(review.first_change_job("s1").run(Path::new("a")), None);
     }
 
     #[test]

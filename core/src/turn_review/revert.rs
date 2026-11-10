@@ -48,7 +48,10 @@ use super::lifecycle::{
 };
 use super::presence::{Blocked, PresenceGuard};
 use super::shadow::{validate_session, Entry, EntryKind, Shadow, ShadowError, READ_TIMEOUT};
-use super::write::{holds_durably, read_current, replace, Content, Current, FsHooks, ProjectDir, Target, WriteError};
+use super::write::{
+    holds_durably, read_current, read_current_capped, read_current_within, replace, Content, Current, FsHooks,
+    ProjectDir, Target, WriteError, MAX_FILE_BYTES,
+};
 use super::write_slot::SlotBusy;
 
 /// The Lua that asks the editor about one file's buffers. Its arguments are
@@ -789,7 +792,11 @@ impl RevertJob {
                 rel.display()
             )));
         }
-        let current = read_current(&target).map_err(|e| read_failed(&rel, e))?;
+        let limit = match self.target {
+            RevertTarget::File => end.as_ref().map_or(0, |entry| entry.bytes.len() as u64),
+            RevertTarget::Hunk { .. } => MAX_FILE_BYTES,
+        };
+        let current = read_for_compare(&target, &rel, limit, Refusal::ChangedSinceEnd)?;
         if current == Current::Other {
             return Err(Refusal::NotRegular);
         }
@@ -799,6 +806,9 @@ impl RevertJob {
             }
             RevertTarget::File => plan_file(&rel, base, end, &current)?,
         };
+        if planned.kind == RevertKind::Delete {
+            refuse_uncertain_delete(&shadow, &resolved.from, &end_commit, &rel, &root, &target)?;
+        }
         let pre = save_current(&shadow, &current)?;
         let post = save_content(&shadow, &planned.content)?;
         let at_ms = wall_clock_ms();
@@ -859,7 +869,17 @@ impl UndoJob {
             shadow.read_stored(blob).map_err(store_failed)?.ok_or(Refusal::Retained)
         };
 
-        let current = read_current(&target).map_err(|e| read_failed(&rel, e))?;
+        let limit = self
+            .post
+            .blob()
+            .map(|blob| shadow.stored_len(blob))
+            .transpose()
+            .map_err(store_failed)?
+            .flatten();
+        let current = match limit {
+            Some(limit) => read_for_compare(&target, &rel, limit, Refusal::ChangedSinceRevert)?,
+            None => read_current_within(&target, 0).map_err(|e| read_failed(&rel, e))?,
+        };
         // The kind and the bytes must be what the revert wrote; the mode may have changed since,
         // which is not a change of content.
         let as_written = match (&self.post, &current) {
@@ -944,7 +964,13 @@ impl AnchorJob {
                 let target = root
                     .target(&self.path, false)
                     .map_err(|e| ReviewError::Unavailable(e.to_string()))?;
-                match read_current(&target).map_err(|e| ReviewError::Unavailable(format!("{shown}: {e}")))? {
+                match read_current(&target).map_err(|e| {
+                    if e.kind() == std::io::ErrorKind::InvalidData {
+                        ReviewError::TooLarge(self.path.clone())
+                    } else {
+                        ReviewError::Unavailable(format!("{shown}: {e}"))
+                    }
+                })? {
                     Current::Regular { bytes, .. } => bytes,
                     _ => return Err(not_a_file()),
                 }
@@ -1027,7 +1053,12 @@ fn restore_entry(
 ) -> Result<Recovered, Refusal> {
     let rel = entry.path.clone();
     let (root, target) = locate(clear, &spec.root, &rel, &entry.session)?;
-    let current = read_current(&target).map_err(|e| read_failed(&rel, e))?;
+    let current = read_for_compare(
+        &target,
+        &rel,
+        MAX_FILE_BYTES,
+        Refusal::Unavailable("too large to restore here".into()),
+    )?;
     if current == Current::Other {
         return Err(Refusal::NotRegular);
     }
@@ -1162,7 +1193,12 @@ fn final_checks(
     still_clear(clear, Instant::now())?;
     let create_missing = *expected == Current::Absent && writes_something;
     let target = root.target(rel, create_missing).map_err(write_refusal)?;
-    if read_current(&target).map_err(|e| read_failed(rel, e))? != *expected {
+    let limit = match expected {
+        Current::Regular { bytes, .. } => bytes.len() as u64,
+        Current::Symlink { target } => target.len() as u64,
+        _ => 0,
+    };
+    if read_for_compare(&target, rel, limit, changed())? != *expected {
         return Err(changed());
     }
     still_wanted(wanted)?;
@@ -1209,6 +1245,16 @@ fn read_failed(rel: &Path, e: std::io::Error) -> Refusal {
     Refusal::Unavailable(format!("{} could not be read: {e}", rel.display()))
 }
 
+fn read_for_compare(target: &Target, rel: &Path, limit: u64, changed: Refusal) -> Result<Current, Refusal> {
+    read_current_capped(target, limit).map_err(|e| {
+        if e.kind() == std::io::ErrorKind::InvalidData {
+            changed
+        } else {
+            read_failed(rel, e)
+        }
+    })
+}
+
 /// The comparison, resolved now, with this module's refusals.
 fn resolve(
     shadow: &Shadow,
@@ -1243,6 +1289,67 @@ fn refuse_unrevertable(shadow: &Shadow, resolved: &Resolved, rel: &Path) -> Resu
         )));
     }
     check_unambiguous(shadow, &resolved.from, &resolved.to, rel).map_err(|e| Refusal::Unavailable(e.to_string()))
+}
+
+/// Missing from the base alone is not evidence that the turn created this file.
+fn refuse_uncertain_delete(
+    shadow: &Shadow,
+    base: &str,
+    end: &str,
+    rel: &Path,
+    root: &ProjectDir,
+    target: &Target,
+) -> Result<(), Refusal> {
+    let uncertain = || {
+        Refusal::Unavailable(
+            "this file may have existed before the turn; its ignore rules or creation time do not prove it is new"
+                .into(),
+        )
+    };
+    let ignored = shadow
+        .recorded_ignored(base)
+        .map_err(store_failed)?
+        .ok_or_else(uncertain)?;
+    if ignored.contains(rel) {
+        return Err(uncertain());
+    }
+    let (taken, before) = shadow
+        .deletion_provenance(base)
+        .map_err(store_failed)?
+        .ok_or_else(uncertain)?;
+    let (_, after) = shadow
+        .deletion_provenance(end)
+        .map_err(store_failed)?
+        .ok_or_else(uncertain)?;
+    if before != after {
+        return Err(uncertain());
+    }
+    let changed = shadow.ancestor_ignores_changed(base, end, rel).map_err(store_failed)?;
+    if changed {
+        let listing = shadow
+            .for_listing(Instant::now() + READ_TIMEOUT)
+            .map_err(store_failed)?;
+        if listing.exclude_digest().map_err(store_failed)? != before
+            || listing.ignored_in_base(base, rel).map_err(store_failed)?
+        {
+            return Err(uncertain());
+        }
+    }
+    // Replacing a file by rename changes its birth time, but leaves its directories' inodes intact.
+    for dir in rel.ancestors().skip(1).filter(|dir| !dir.as_os_str().is_empty()) {
+        if !ignored.contains_directory(dir) && !shadow.tree_contains(base, dir).map_err(store_failed)? {
+            let ancestor = root.target(dir, false).map_err(write_refusal)?;
+            let (origin, birth) = super::write::file_origin_ns(&ancestor).map_err(|e| read_failed(dir, e))?;
+            if !birth || origin <= taken {
+                return Err(uncertain());
+            }
+        }
+    }
+    let (origin, birth) = super::write::file_origin_ns(target).map_err(|e| read_failed(rel, e))?;
+    if origin <= taken || (changed && !birth) {
+        return Err(uncertain());
+    }
+    Ok(())
 }
 
 /// What a revert will write, and what it records about it.
@@ -1428,8 +1535,8 @@ struct Spliced {
 }
 
 /// Puts `base`'s lines `old` (a header's `(start, len)`) where `end`'s lines `new` are in `cur`,
-/// after checking that `cur` holds exactly those end lines at exactly that place: a region that
-/// changed or moved is refused, never searched for.
+/// only when a line diff maps every end line to one unchanged, contiguous region in `cur`.
+/// Multiple optimal alignments are uncertainty, even when the text at the old offset matches.
 fn splice_hunk(
     base: &[Vec<u8>],
     end: &[Vec<u8>],
@@ -1439,15 +1546,29 @@ fn splice_hunk(
 ) -> Result<Spliced, Refusal> {
     let base_region = region(base, old).ok_or(Refusal::OutOfDate)?;
     let end_region = region(end, new).ok_or(Refusal::OutOfDate)?;
-    let at = range_index(new.0, new.1);
+    let mut at = range_index(new.0, new.1);
     if new.1 == 0 {
         // An empty end region says nothing about where it is; with three lines of context it
         // happens only when the turn left the file empty, which the file must still be.
         if cur != end {
             return Err(Refusal::ChangedSinceEnd);
         }
-    } else if region(cur, new) != Some(end_region) {
-        return Err(Refusal::ChangedSinceEnd);
+    } else {
+        at = if end != cur && (end.len() + 1).saturating_mul(cur.len() + 1) > MAX_CELLS {
+            let unique = |lines: &[Vec<u8>]| {
+                let mut matches = lines
+                    .windows(end_region.len())
+                    .enumerate()
+                    .filter_map(|(i, region)| (region == end_region).then_some(i));
+                let first = matches.next()?;
+                matches.next().is_none().then_some(first)
+            };
+            unique(end)
+                .and_then(|_| unique(cur))
+                .ok_or_else(|| Refusal::Unavailable("too large to locate the change; revert the whole file".into()))?
+        } else {
+            unchanged_region(end, cur, at, end_region.len()).ok_or(Refusal::ChangedSinceEnd)?
+        };
     }
     let (before, rest) = cur.split_at(at);
     let after = &rest[end_region.len()..];
@@ -1467,6 +1588,79 @@ fn splice_hunk(
         replaced: end_region.concat(),
         at_line: u32::try_from(at).unwrap_or(u32::MAX).saturating_add(1),
     })
+}
+
+const MAX_CELLS: usize = 4_000_000;
+
+/// Finds the region only if every longest common subsequence keeps each of its lines at the
+/// same destination. A deletion or a second possible match in any optimal alignment refuses it.
+fn unchanged_region(end: &[Vec<u8>], cur: &[Vec<u8>], at: usize, len: usize) -> Option<usize> {
+    if end == cur {
+        return Some(at);
+    }
+    // Bound both memory and work; an uncomputed correspondence must never authorize a write.
+    let width = cur.len().checked_add(1)?;
+    let cells = end.len().checked_add(1)?.checked_mul(width)?;
+    if cells > MAX_CELLS {
+        return None;
+    }
+    // Intern exact lines so long common prefixes do not multiply the diff's byte comparisons.
+    let mut ids = std::collections::HashMap::new();
+    let mut intern = |lines: &[Vec<u8>]| {
+        lines
+            .iter()
+            .map(|line| {
+                let next = ids.len();
+                *ids.entry(line.clone()).or_insert(next)
+            })
+            .collect::<Vec<_>>()
+    };
+    let end = intern(end);
+    let cur = intern(cur);
+    let mut suffix = vec![0u32; cells];
+    for i in (0..end.len()).rev() {
+        for j in (0..cur.len()).rev() {
+            suffix[i * width + j] = if end[i] == cur[j] {
+                1 + suffix[(i + 1) * width + j + 1]
+            } else {
+                suffix[(i + 1) * width + j].max(suffix[i * width + j + 1])
+            };
+        }
+    }
+    let longest = suffix[0];
+    let mut prefix = vec![0u32; width];
+    let mut first = None;
+    for i in 0..at.checked_add(len)? {
+        if i >= at {
+            let mut mapped = None;
+            for j in 0..width {
+                if prefix[j] + suffix[(i + 1) * width + j] == longest {
+                    return None; // An optimal alignment deletes this line.
+                }
+                if j < cur.len() && end[i] == cur[j] && prefix[j] + 1 + suffix[(i + 1) * width + j + 1] == longest {
+                    if mapped.replace(j).is_some() {
+                        return None;
+                    }
+                }
+            }
+            let mapped = mapped?;
+            let start = *first.get_or_insert(mapped);
+            if mapped != start + i - at {
+                return None;
+            }
+        }
+        let mut diagonal = 0;
+        for j in 0..cur.len() {
+            let above = prefix[j + 1];
+            prefix[j + 1] = if end[i] == cur[j] {
+                diagonal + 1
+            } else {
+                above.max(prefix[j])
+            };
+            diagonal = above;
+        }
+    }
+    first
 }
 
 /// Where a header's range `(start, len)` begins as an index into the file's lines. A zero-length
@@ -1635,14 +1829,180 @@ mod tests {
         assert_eq!(spliced.replaced, b"2\nTHREE\r\n4\n");
         assert_eq!(spliced.at_line, 2);
 
-        // The same region one line further down is not found by searching.
+        // An insertion above the region shifts its location without changing it.
         let moved = lines(&["0\n", "1\n", "2\n", "THREE\r\n", "4\n", "5\n"]);
-        assert_eq!(
-            splice_hunk(&base, &end, &moved, (2, 3), (2, 3)),
-            Err(Refusal::ChangedSinceEnd)
-        );
+        let shifted = splice_hunk(&base, &end, &moved, (2, 3), (2, 3)).unwrap();
+        assert_eq!(shifted.bytes, b"0\n1\n2\n3\n4\n5\n");
+        assert_eq!(shifted.at_line, 3);
         // A header past either side's end is out of date.
         assert_eq!(splice_hunk(&base, &end, &cur, (4, 3), (2, 3)), Err(Refusal::OutOfDate));
+    }
+
+    #[test]
+    fn a_deleted_duplicate_hunk_is_not_relocated_to_its_survivor() {
+        let base = lines_of(b"a\nb\nc\nOLD\nd\ne\nf\na\nb\nc\nNEW\nd\ne\nf\n");
+        let block = b"a\nb\nc\nNEW\nd\ne\nf\n";
+        let end = lines_of(&block.repeat(2));
+        let cur = lines_of(block);
+        assert_eq!(
+            splice_hunk(&base, &end, &cur, (1, 7), (1, 7)),
+            Err(Refusal::ChangedSinceEnd)
+        );
+    }
+
+    #[test]
+    fn a_hunk_with_multiple_destinations_or_inserted_context_is_refused() {
+        let base = lines(&["old\n", "tail\n"]);
+        let end = lines(&["new\n", "tail\n"]);
+        for cur in [
+            lines(&["new\n", "new\n", "tail\n"]),
+            lines(&["new\n", "inserted\n", "tail\n"]),
+        ] {
+            assert_eq!(
+                splice_hunk(&base, &end, &cur, (1, 2), (1, 2)),
+                Err(Refusal::ChangedSinceEnd)
+            );
+        }
+    }
+
+    #[test]
+    fn revert_undo_and_final_recheck_read_only_limit_plus_one_even_after_growth() {
+        use super::super::shadow::{Limits, SnapshotKind, SnapshotLabel, SnapshotOutcome};
+        use super::super::test_hooks::{self, BEFORE_CURRENT_READ};
+        use super::super::write::CURRENT_READS;
+        let scratch = crate::test_scratch_dir::ScratchDir::new("review", "read-count");
+        let project = scratch.join("project");
+        std::fs::create_dir(&project).unwrap();
+        let store = scratch.join("store");
+        let file = project.join("a.txt");
+        let shadow = Shadow::open_with_excludes(&store, &project, None).unwrap();
+        for (kind, bytes) in [(SnapshotKind::Base, b"before\n"), (SnapshotKind::End, b"after!\n")] {
+            std::fs::write(&file, bytes).unwrap();
+            assert!(matches!(
+                shadow.snapshot(
+                    "s1",
+                    &SnapshotLabel {
+                        turn: 1,
+                        kind,
+                        turn_id: "t1".into(),
+                        tab: 1,
+                        time_ms: wall_clock_ms()
+                    },
+                    &Limits::default()
+                ),
+                SnapshotOutcome::Taken(_)
+            ));
+        }
+        let spec = ShadowSpec {
+            review_dir: Some(store.clone()),
+            root: project.clone(),
+            excludes: Some(None),
+        };
+        let job = || RevertJob {
+            spec: spec.clone(),
+            guard: PresenceGuard::for_tests(&store, std::process::id(), 0),
+            wanted: Arc::new(AtomicBool::new(true)),
+            session: "s1".into(),
+            records: vec![],
+            turn: 1,
+            scope: Scope::Turn,
+            path: "a.txt".into(),
+            target: RevertTarget::File,
+            clear: EditorClear::for_tests(&file),
+            final_hook: None,
+            fs_hooks: FsHooks::default(),
+        };
+        let grow_after_stat = || {
+            let file = file.clone();
+            test_hooks::set(&BEFORE_CURRENT_READ, move || {
+                std::fs::OpenOptions::new()
+                    .write(true)
+                    .open(file)
+                    .unwrap()
+                    .set_len(1 << 30)
+                    .unwrap();
+            });
+        };
+        let reads = || CURRENT_READS.with(|reads| std::mem::take(&mut *reads.borrow_mut()));
+        reads();
+        for (target, limit) in [
+            (RevertTarget::File, 7),
+            (
+                RevertTarget::Hunk {
+                    id: 0,
+                    header: String::new(),
+                },
+                MAX_FILE_BYTES,
+            ),
+        ] {
+            std::fs::write(&file, b"after!\n").unwrap();
+            grow_after_stat();
+            let mut revert = job();
+            revert.target = target;
+            assert!(matches!(revert.run(), Err(Refusal::ChangedSinceEnd)));
+            let counted = reads();
+            assert_eq!(counted, vec![(limit, limit + 1)]);
+        }
+        std::fs::write(&file, b"after!\n").unwrap();
+        let applied = job().run().unwrap();
+        reads();
+        grow_after_stat();
+        let undo = UndoJob {
+            spec: spec.clone(),
+            guard: PresenceGuard::for_tests(&store, std::process::id(), 0),
+            wanted: Arc::new(AtomicBool::new(true)),
+            session: "s1".into(),
+            path: "a.txt".into(),
+            pre: applied.pre,
+            post: applied.post,
+            clear: EditorClear::for_tests(&file),
+            final_hook: None,
+            fs_hooks: FsHooks::default(),
+        };
+        assert!(matches!(undo.run(), Err(Refusal::ChangedSinceRevert)));
+        assert_eq!(reads(), vec![(7, 8)]);
+        std::fs::write(&file, b"after!\n").unwrap();
+        let file_for_hook = file.clone();
+        let revert = job().on_final_check(Arc::new(move || {
+            let file = file_for_hook.clone();
+            test_hooks::set(&BEFORE_CURRENT_READ, move || {
+                std::fs::OpenOptions::new()
+                    .write(true)
+                    .open(file)
+                    .unwrap()
+                    .set_len(1 << 30)
+                    .unwrap();
+            });
+        }));
+        assert!(matches!(revert.run(), Err(Refusal::ChangedSinceEnd)));
+        assert_eq!(reads(), vec![(7, 7), (7, 8)]);
+    }
+
+    #[test]
+    fn over_budget_hunks_use_only_a_unique_region_in_both_files() {
+        let end: Vec<Vec<u8>> = (0..2000).map(|n| format!("line {n}\n").into_bytes()).collect();
+        let mut base = end.clone();
+        base[3] = b"old\n".to_vec();
+        let mut cur = end.clone();
+        cur.insert(0, b"user insertion\n".to_vec());
+        let spliced = splice_hunk(&base, &end, &cur, (1, 7), (1, 7)).unwrap();
+        let mut expected = cur.clone();
+        expected[4] = base[3].clone();
+        assert_eq!(spliced.bytes, expected.concat());
+        assert_eq!(spliced.at_line, 2);
+        let refusal = Err(Refusal::Unavailable(
+            "too large to locate the change; revert the whole file".into(),
+        ));
+        let mut duplicate = end.clone();
+        duplicate.extend_from_slice(&end[..7]);
+        assert_eq!(splice_hunk(&base, &end, &duplicate, (1, 7), (1, 7)), refusal);
+        assert_eq!(splice_hunk(&base, &duplicate, &cur, (1, 7), (1, 7)), refusal);
+        cur[4] = b"user changed region\n".to_vec();
+        assert_eq!(splice_hunk(&base, &end, &cur, (1, 7), (1, 7)), refusal);
+        assert_eq!(
+            splice_hunk(&base, &end, &end, (1, 7), (1, 7)).unwrap().bytes,
+            base.concat()
+        );
     }
 
     #[test]

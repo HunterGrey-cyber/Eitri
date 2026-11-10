@@ -322,6 +322,17 @@ pub fn user_excludes_file() -> Option<PathBuf> {
 /// `$XDG_CONFIG_HOME/git/ignore`, else `$HOME/.config/git/ignore`. `None` when neither variable
 /// gives an absolute directory. The file need not exist.
 pub fn resolve_excludes_file(home: Option<&OsStr>, xdg_config_home: Option<&OsStr>) -> Option<PathBuf> {
+    resolve_excludes_file_with_timeout(home, xdg_config_home, Duration::from_secs(5))
+        .ok()
+        .flatten()
+}
+
+/// Resolves excludes within the calling listing's remaining budget.
+pub(super) fn resolve_excludes_file_with_timeout(
+    home: Option<&OsStr>,
+    xdg_config_home: Option<&OsStr>,
+    timeout: Duration,
+) -> Result<Option<PathBuf>, GitError> {
     let mut cmd = user_read_only(Path::new("/"));
     for (name, value) in [("HOME", home), ("XDG_CONFIG_HOME", xdg_config_home)] {
         match value {
@@ -330,22 +341,21 @@ pub fn resolve_excludes_file(home: Option<&OsStr>, xdg_config_home: Option<&OsSt
         };
     }
     cmd.args(["config", "--global", "--type=path", "--get", "core.excludesFile"]);
-    if let Ok(output) = run(cmd, Duration::from_secs(5)) {
-        if output.status.success() {
-            let value = trim_newline(&output.stdout);
-            if !value.is_empty() {
-                let path = PathBuf::from(OsStr::from_bytes(value));
-                if path.is_absolute() {
-                    return Some(path);
-                }
+    let output = run(cmd, timeout)?;
+    if output.status.success() {
+        let value = trim_newline(&output.stdout);
+        if !value.is_empty() {
+            let path = PathBuf::from(OsStr::from_bytes(value));
+            if path.is_absolute() {
+                return Ok(Some(path));
             }
         }
     }
     let absolute = |v: Option<&OsStr>| v.map(PathBuf::from).filter(|p| p.is_absolute());
     if let Some(xdg) = absolute(xdg_config_home) {
-        return Some(xdg.join("git/ignore"));
+        return Ok(Some(xdg.join("git/ignore")));
     }
-    absolute(home).map(|h| h.join(".config/git/ignore"))
+    Ok(absolute(home).map(|h| h.join(".config/git/ignore")))
 }
 
 /// `bytes` without one trailing `\n` (git ends single-value output with one).
@@ -368,6 +378,14 @@ mod tests {
         for name in REPOSITORY_SELECTION_VARS {
             assert!(removed.iter().any(|r| r == name), "{name} reaches the user's git");
         }
+    }
+
+    #[test]
+    fn excludes_resolution_obeys_the_remaining_budget() {
+        assert!(matches!(
+            resolve_excludes_file_with_timeout(None, None, Duration::ZERO),
+            Err(GitError::TimedOut)
+        ));
     }
 
     #[test]

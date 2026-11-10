@@ -572,7 +572,7 @@ fn closing_a_tab_ends_its_turn_in_the_review() {
     let refs = std::fs::read_dir(scratch.join("state/review/git/refs/eitri/sess-close/1")).unwrap();
     let mut kinds: Vec<String> = refs.map(|e| e.unwrap().file_name().into_string().unwrap()).collect();
     kinds.sort();
-    assert_eq!(kinds, vec!["base".to_string(), "end".to_string()]);
+    assert_eq!(kinds, ["base", "base-ignored", "end", "end-ignored"]);
     shut_down_all(&mut set);
     let _ = std::fs::remove_dir_all(&scratch);
 }

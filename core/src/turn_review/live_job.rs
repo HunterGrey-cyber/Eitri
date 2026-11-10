@@ -11,9 +11,7 @@ use super::lifecycle::{
 };
 use super::revert::{exact_hunks, lines_of, ExactHunk, ExactHunks, ExactHunksJob};
 use super::shadow::{remaining, EntryKind, Shadow, ShadowError, READ_TIMEOUT};
-use super::write::{self, Current, ProjectDir, WriteError};
-
-const MAX_FILE_BYTES: u64 = 8 * 1024 * 1024;
+use super::write::{self, Current, ProjectDir, WriteError, MAX_FILE_BYTES};
 
 /// The in-memory facts a live drawing needs about one turn.
 #[derive(Debug, Clone, PartialEq, Eq)]

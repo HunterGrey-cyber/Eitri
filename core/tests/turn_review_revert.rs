@@ -115,13 +115,17 @@ impl World {
     }
 
     fn with_limits(name: &str, limits: Limits) -> World {
+        Self::with_excludes(name, limits, Some(None))
+    }
+
+    fn with_excludes(name: &str, limits: Limits, excludes: Option<Option<PathBuf>>) -> World {
         let scratch = Scratch::new(name);
         let project = project_of(&scratch.0);
         std::fs::create_dir_all(&project).unwrap();
         let review_dir = review_dir_of(&scratch.0);
         let options = ReviewOptions {
             limits,
-            excludes: Some(None),
+            excludes,
             trim_every: Duration::MAX,
             ..ReviewOptions::default()
         };
@@ -412,6 +416,555 @@ fn noise(len: usize, seed: u64) -> Vec<u8> {
         .collect()
 }
 
+#[test]
+fn a_file_exposed_by_changed_ignore_rules_is_not_deleted_but_keeps_its_view() {
+    for ignore in [".gitignore", "sub/.gitignore"] {
+        let mut w = World::new("ignore-change");
+        w.write(ignore, b"config.local\n", 0o644);
+        w.write("sub/config.local", b"pre-existing secret\n", 0o600);
+        let n = w.turn(|w| w.write(ignore, b"", 0o644));
+        // Restoring the live rules must not hide the change between the two snapshots.
+        w.write(ignore, b"config.local\n", 0o644);
+        for scope in [Scope::Turn, Scope::Session] {
+            let result = w.revert_in(n, scope, "sub/config.local", RevertTarget::File);
+            assert!(
+                matches!(result, Err(Refusal::Unavailable(ref why)) if why.contains("ignore rules")),
+                "{result:?}"
+            );
+            assert_eq!(w.read("sub/config.local"), b"pre-existing secret\n");
+            let diff = w.review.diff_job(SESSION, n, scope, "sub/config.local").run();
+            assert!(diff.is_ok(), "{diff:?}");
+        }
+    }
+}
+
+#[test]
+fn an_info_exclude_change_never_authorizes_deletion() {
+    let mut w = World::new("info-exclude");
+    tgit(&w.project, &["init", "-q"]);
+    w.write(".git/info/exclude", b"config.local\nuntouched.local\n", 0o644);
+    w.write("config.local", b"pre-existing\n", 0o600);
+    w.write("untouched.local", b"untouched\n", 0o600);
+    let n = w.turn(|w| {
+        w.write(".git/info/exclude", b"", 0o644);
+        // Even a replacement inode cannot bypass the exclude-source guard.
+        w.write("config.local", b"rewritten pre-existing\n", 0o600);
+        w.write("new.txt", b"created\n", 0o644);
+    });
+    for rel in ["config.local", "untouched.local", "new.txt"] {
+        for scope in [Scope::Turn, Scope::Session] {
+            assert!(matches!(
+                w.revert_in(n, scope, rel, RevertTarget::File),
+                Err(Refusal::Unavailable(_))
+            ));
+            assert!(w.file(rel).exists());
+            assert!(w.review.diff_job(SESSION, n, scope, rel).run().is_ok());
+        }
+    }
+}
+
+#[test]
+fn changed_global_excludes_are_recorded_per_snapshot() {
+    for mode in ["default", "configured", "switch", "after-switch"] {
+        let scratch = Scratch::new("global-excludes");
+        let output = Command::new(std::env::current_exe().unwrap())
+            .args(["--ignored", "--exact", "global_excludes_child"])
+            .env("EITRI_EXCLUDES_CHILD", mode)
+            .env("HOME", &scratch.0)
+            .env("XDG_CONFIG_HOME", scratch.0.join(".config"))
+            .env("GIT_CONFIG_GLOBAL", scratch.0.join(".gitconfig"))
+            .env("GIT_CONFIG_NOSYSTEM", "1")
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{mode}: {} {}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+}
+
+#[test]
+#[ignore = "child with private HOME, launched by changed_global_excludes_are_recorded_per_snapshot"]
+fn global_excludes_child() {
+    let Ok(mode) = std::env::var("EITRI_EXCLUDES_CHILD") else {
+        return;
+    };
+    let home = PathBuf::from(std::env::var_os("HOME").unwrap());
+    let global = if mode == "default" {
+        home.join(".config/git/ignore")
+    } else {
+        home.join("ignore")
+    };
+    write_file(&global, b"old.txt\n", 0o600);
+    let config = home.join(".gitconfig");
+    if mode != "default" {
+        std::fs::write(&config, format!("[core]\nexcludesFile = {}\n", global.display())).unwrap();
+    }
+    let mut w = World::with_excludes("global-excludes-child", Limits::default(), None);
+    if mode == "after-switch" {
+        w.write(".gitignore", b"ignored\n", 0o644);
+        let n = w.turn(|w| {
+            w.write(".gitignore", b"other\n", 0o644);
+            w.write("new.txt", b"created\n", 0o644);
+        });
+        let replacement = home.join("other-ignore");
+        // Identical bytes still leave the check using a different external source.
+        std::fs::write(&replacement, b"old.txt\n").unwrap();
+        std::fs::write(&config, format!("[core]\nexcludesFile = {}\n", replacement.display())).unwrap();
+        assert!(matches!(w.revert_file(n, "new.txt"), Err(Refusal::Unavailable(_))));
+        assert_eq!(w.read("new.txt"), b"created\n");
+        return;
+    }
+    w.write("old.txt", b"old\n", 0o600);
+    let n = w.turn(|w| {
+        if mode == "switch" {
+            let replacement = home.join("other-ignore");
+            std::fs::write(&replacement, b"").unwrap();
+            std::fs::write(&config, format!("[core]\nexcludesFile = {}\n", replacement.display())).unwrap();
+        } else {
+            std::fs::write(&global, b"").unwrap();
+        }
+        w.write("old.txt", b"rewritten old\n", 0o600);
+        assert!(
+            w.review
+                .diff_job(SESSION, 1, Scope::Turn, "old.txt")
+                .run()
+                .unwrap()
+                .new_file
+        );
+    });
+    assert!(
+        w.review
+            .diff_job(SESSION, n, Scope::Turn, "old.txt")
+            .run()
+            .unwrap()
+            .new_file
+    );
+    assert!(matches!(w.revert_file(n, "old.txt"), Err(Refusal::Unavailable(_))));
+    assert_eq!(w.read("old.txt"), b"rewritten old\n");
+}
+
+#[test]
+fn oversized_recovery_is_unavailable_and_keeps_the_journal() {
+    let w = World::new("large-recovery");
+    w.write("a.txt", b"before\n", 0o644);
+    let entry = crash_mid_write(&w, "a.txt");
+    std::fs::OpenOptions::new()
+        .write(true)
+        .open(w.file("a.txt"))
+        .unwrap()
+        .set_len(1 << 30)
+        .unwrap();
+    assert_refused(
+        w.recover(&entry),
+        &Refusal::Unavailable("too large to restore here".into()),
+    );
+    assert_eq!(w.pending_of(1).len(), 1);
+    assert_eq!(meta(&w.file("a.txt")).len(), 1 << 30);
+}
+
+fn has_birth_time(path: &Path) -> bool {
+    #[cfg(target_os = "linux")]
+    let supported = {
+        use std::os::unix::ffi::OsStrExt;
+        let path = std::ffi::CString::new(path.as_os_str().as_bytes()).unwrap();
+        let mut st = std::mem::MaybeUninit::<libc::statx>::zeroed();
+        // SAFETY: path is a valid C string and st is writable statx storage.
+        unsafe {
+            libc::statx(
+                libc::AT_FDCWD,
+                path.as_ptr(),
+                libc::AT_SYMLINK_NOFOLLOW,
+                libc::STATX_BTIME,
+                st.as_mut_ptr(),
+            ) == 0
+                && st.assume_init().stx_mask & libc::STATX_BTIME != 0
+        }
+    };
+    #[cfg(not(target_os = "linux"))]
+    let supported = std::fs::symlink_metadata(path).unwrap().created().is_ok();
+    if !supported {
+        eprintln!("skipping birth-time-dependent test: scratch filesystem has no birth time (STATX_BTIME on Linux)");
+    }
+    supported
+}
+
+#[test]
+fn rename_rewritten_file_exposed_by_root_ignore_is_not_deleted() {
+    let mut w = World::new("rename-root-ignore");
+    w.write(".gitignore", b".env\n", 0o644);
+    w.write(".env", b"old\n", 0o600);
+    let n = w.turn(|w| {
+        w.write(".gitignore", b"", 0o644);
+        w.write("temp", b"rewritten\n", 0o600);
+        std::fs::rename(w.file("temp"), w.file(".env")).unwrap();
+    });
+    for scope in [Scope::Turn, Scope::Session] {
+        assert!(matches!(
+            w.revert_in(n, scope, ".env", RevertTarget::File),
+            Err(Refusal::Unavailable(_))
+        ));
+        assert_eq!(w.read(".env"), b"rewritten\n");
+    }
+}
+
+#[test]
+fn rename_rewritten_file_exposed_by_self_ignore_is_not_deleted() {
+    let mut w = World::new("rename-self-ignore");
+    w.write(".venv/.gitignore", b"*\n", 0o644);
+    w.write(".venv/x", b"old\n", 0o600);
+    let n = w.turn(|w| {
+        std::fs::remove_file(w.file(".venv/.gitignore")).unwrap();
+        w.write(".venv/temp", b"rewritten\n", 0o600);
+        std::fs::rename(w.file(".venv/temp"), w.file(".venv/x")).unwrap();
+    });
+    assert!(matches!(w.revert_file(n, ".venv/x"), Err(Refusal::Unavailable(_))));
+    assert_eq!(w.read(".venv/x"), b"rewritten\n");
+}
+
+fn assert_omitted_ignore_refuses_dataset_deletion(mode: &str) {
+    let limits = if mode == "large" {
+        Limits {
+            max_file_bytes: 64,
+            ..Limits::default()
+        }
+    } else {
+        Limits::default()
+    };
+    let mut w = World::with_excludes("omitted-ignore", limits, Some(None));
+    tgit(&w.project, &["init", "-q"]);
+    let ignore = if mode == "root" {
+        ".gitignore"
+    } else {
+        "data/.gitignore"
+    };
+    let dataset = if mode == "root" { "train.csv" } else { "data/train.csv" };
+    let readme = if mode == "root" { "README.md" } else { "data/README.md" };
+    let rules = if mode == "large" {
+        format!("train.csv\n#{}\n", "padding".repeat(20))
+    } else {
+        "*\n!README.md\n".to_owned()
+    };
+    if mode == "parent" {
+        w.write(".gitignore", b"data/.gitignore\n", 0o644);
+    }
+    w.write(ignore, rules.as_bytes(), 0o644);
+    w.write(readme, b"tracked\n", 0o644);
+    w.write(dataset, b"old dataset\n", 0o600);
+    tgit(&w.project, &["add", "-f", ignore, readme]);
+    let n = w.turn(|w| {
+        if mode == "rewrite" {
+            w.write(ignore, b"", 0o644);
+        } else {
+            std::fs::remove_file(w.file(ignore)).unwrap();
+        }
+        w.write("temp", b"edited dataset\n", 0o600);
+        std::fs::rename(w.file("temp"), w.file(dataset)).unwrap();
+    });
+    for scope in [Scope::Turn, Scope::Session] {
+        let result = w.revert_in(n, scope, dataset, RevertTarget::File);
+        assert!(matches!(result, Err(Refusal::Unavailable(_))), "{mode}: {result:?}");
+        assert_eq!(w.read(dataset), b"edited dataset\n");
+        assert!(w.review.diff_job(SESSION, n, scope, dataset).run().unwrap().new_file);
+    }
+}
+
+#[test]
+fn omitted_ignore_remove_does_not_authorize_dataset_deletion() {
+    assert_omitted_ignore_refuses_dataset_deletion("remove");
+}
+
+#[test]
+fn omitted_ignore_rewrite_does_not_authorize_dataset_deletion() {
+    assert_omitted_ignore_refuses_dataset_deletion("rewrite");
+}
+
+#[test]
+fn omitted_ignore_root_does_not_authorize_dataset_deletion() {
+    assert_omitted_ignore_refuses_dataset_deletion("root");
+}
+
+#[test]
+fn omitted_ignore_parent_does_not_authorize_dataset_deletion() {
+    assert_omitted_ignore_refuses_dataset_deletion("parent");
+}
+
+#[test]
+fn omitted_ignore_large_does_not_authorize_dataset_deletion() {
+    assert_omitted_ignore_refuses_dataset_deletion("large");
+}
+
+#[test]
+fn an_old_directory_moved_over_a_base_symlink_does_not_authorize_deletion() {
+    let mut w = World::new("symlink-ancestor");
+    w.write(".gitignore", b".cache/\n", 0o644);
+    w.write(".cache/real/x", b"old\n", 0o644);
+    std::os::unix::fs::symlink(".cache/real", w.file("link")).unwrap();
+    let n = w.turn(|w| {
+        std::fs::remove_file(w.file("link")).unwrap();
+        std::fs::rename(w.file(".cache/real"), w.file("link")).unwrap();
+        w.write("temp", b"rewritten\n", 0o644);
+        std::fs::rename(w.file("temp"), w.file("link/x")).unwrap();
+    });
+    let result = w.revert_file(n, "link/x");
+    assert!(matches!(result, Err(Refusal::Unavailable(_))), "{result:?}");
+    assert_eq!(w.read("link/x"), b"rewritten\n");
+}
+
+#[test]
+fn excludes_changed_after_the_end_refuse_deletion_with_changed_ancestor_rules() {
+    for source in ["info", "global"] {
+        let external = Scratch::new("later-excludes");
+        let global = external.0.join("ignore");
+        std::fs::write(&global, b"").unwrap();
+        let mut w = World::with_excludes("later-excludes", Limits::default(), Some(Some(global.clone())));
+        tgit(&w.project, &["init", "-q"]);
+        w.write(".gitignore", b"ignored\n", 0o644);
+        let n = w.turn(|w| {
+            w.write(".gitignore", b"other\n", 0o644);
+            w.write("new.txt", b"created\n", 0o644);
+        });
+        if source == "info" {
+            w.write(".git/info/exclude", b"different\n", 0o644);
+            w.shadow().sync_excludes().unwrap();
+        } else {
+            std::fs::write(&global, b"different\n").unwrap();
+        }
+        let result = w.revert_file(n, "new.txt");
+        assert!(matches!(result, Err(Refusal::Unavailable(_))), "{source}: {result:?}");
+        assert_eq!(w.read("new.txt"), b"created\n");
+    }
+}
+
+#[test]
+fn new_files_beside_ignored_files_are_deleted() {
+    for (old, new, rule) in [
+        ("logs/a.log", "logs/new.txt", "*.log\n"),
+        ("pkg/__pycache__/stale.pyc", "pkg/__init__.py", "__pycache__/\n"),
+    ] {
+        let mut w = World::new("new-beside-ignored");
+        w.write(".gitignore", rule.as_bytes(), 0o644);
+        w.write(old, b"old\n", 0o644);
+        let n = w.turn(|w| w.write(new, b"created\n", 0o644));
+        assert_eq!(w.revert_file(n, new).unwrap().kind, RevertKind::Delete);
+        assert!(!w.file(new).exists());
+        assert_eq!(w.read(old), b"old\n");
+    }
+}
+
+#[test]
+fn new_files_in_new_and_tracked_directories_are_deleted() {
+    let mut w = World::new("new-directories");
+    if !has_birth_time(&w.project) {
+        return;
+    }
+    w.write("tracked/kept", b"base\n", 0o644);
+    let n = w.turn(|w| {
+        w.write("new/nested/x", b"created\n", 0o644);
+        w.write("tracked/x", b"created\n", 0o644);
+    });
+    for rel in ["new/nested/x", "tracked/x"] {
+        assert_eq!(w.revert_file(n, rel).unwrap().kind, RevertKind::Delete);
+        assert!(!w.file(rel).exists());
+    }
+    assert_eq!(w.read("tracked/kept"), b"base\n");
+}
+
+#[test]
+fn undo_with_a_pruned_post_blob_and_changed_kind_is_changed() {
+    let mut w = World::new("pruned-undo-kind");
+    w.write("a", b"base\n", 0o644);
+    let n = w.turn(|w| w.write("a", b"end\n", 0o644));
+    let mut applied = w.revert_file(n, "a").unwrap();
+    // A missing object stands for a blob retention has pruned.
+    applied.post = Saved::Regular {
+        blob: "0".repeat(40),
+        mode: 0o644,
+    };
+    std::fs::remove_file(w.file("a")).unwrap();
+    assert_refused(w.undo(&applied), &Refusal::ChangedSinceRevert);
+    std::os::unix::fs::symlink("elsewhere", w.file("a")).unwrap();
+    assert_refused(w.undo(&applied), &Refusal::ChangedSinceRevert);
+    applied.post = Saved::Symlink { blob: "0".repeat(40) };
+    std::fs::remove_file(w.file("a")).unwrap();
+    w.write("a", b"new regular\n", 0o644);
+    assert_refused(w.undo(&applied), &Refusal::ChangedSinceRevert);
+}
+
+#[test]
+fn oversized_live_anchor_is_too_large() {
+    let mut w = World::new("large-live-anchor");
+    w.write("a", b"base\n", 0o644);
+    let n = w.start_turn();
+    std::fs::OpenOptions::new()
+        .write(true)
+        .open(w.file("a"))
+        .unwrap()
+        .set_len(1 << 30)
+        .unwrap();
+    assert!(matches!(w.review.anchor_job(SESSION, n, Scope::Turn, "a", 1, 1).run(),
+        Err(eitri_core::turn_review::ReviewError::TooLarge(path)) if path == Path::new("a")));
+    w.end_turn();
+}
+
+#[test]
+fn deleting_a_self_ignoring_gitignore_does_not_delete_the_old_file() {
+    let mut w = World::new("self-ignore");
+    if !has_birth_time(&w.project) {
+        return;
+    }
+    w.write(".venv/.gitignore", b"*\n", 0o644);
+    w.write(".venv/x", b"old bytes\n", 0o644);
+    let n = w.turn(|w| {
+        std::fs::remove_file(w.file(".venv/.gitignore")).unwrap();
+        // Modification time is new, but birth time still identifies the old file.
+        std::fs::write(w.file(".venv/x"), b"edited old bytes\n").unwrap();
+    });
+    assert!(matches!(w.revert_file(n, ".venv/x"), Err(Refusal::Unavailable(_))));
+    assert_eq!(w.read(".venv/x"), b"edited old bytes\n");
+    assert!(
+        w.review
+            .diff_job(SESSION, n, Scope::Turn, ".venv/x")
+            .run()
+            .unwrap()
+            .new_file
+    );
+}
+
+#[test]
+fn a_new_file_keeps_diff_hunks_anchors_and_revert_after_ignore_edits() {
+    let mut w = World::new("new-with-ignore");
+    if !has_birth_time(&w.project) {
+        return;
+    }
+    w.write(".gitignore", b"ignored\n", 0o644);
+    let n = w.turn(|w| {
+        w.write(".gitignore", b"other\n", 0o644);
+        w.write("new.txt", b"created\n", 0o644);
+    });
+    for scope in [Scope::Turn, Scope::Session] {
+        assert!(w.review.diff_job(SESSION, n, scope, "new.txt").run().unwrap().new_file);
+        assert!(!w
+            .review
+            .exact_hunks_job(SESSION, n, scope, "new.txt")
+            .run()
+            .unwrap()
+            .hunks
+            .unwrap()
+            .is_empty());
+        assert_eq!(
+            w.review.anchor_job(SESSION, n, scope, "new.txt", 1, 1).run().unwrap(),
+            vec!["created"]
+        );
+    }
+    assert_eq!(w.revert_file(n, "new.txt").unwrap().kind, RevertKind::Delete);
+    assert!(!w.file("new.txt").exists());
+}
+
+#[test]
+fn old_snapshot_without_exclude_provenance_refuses_only_deletion() {
+    for field in ["delete-provenance:", "delete-ignored:"] {
+        let mut w = World::new("old-provenance");
+        let n = w.turn(|w| w.write("new.txt", b"new\n", 0o644));
+        let shadow = w.shadow();
+        let reference = format!("refs/eitri/{SESSION}/{n}/base");
+        let gitdir = format!("--git-dir={}", shadow.git_dir().display());
+        let message = tgit(&w.project, &[&gitdir, "show", "-s", "--format=%B", &reference]);
+        let message: String = String::from_utf8(message.stdout)
+            .unwrap()
+            .lines()
+            .filter(|l| !l.starts_with(field))
+            .map(|l| format!("{l}\n"))
+            .collect();
+        let tree = tgit(&w.project, &[&gitdir, "rev-parse", &format!("{reference}^{{tree}}")]);
+        let tree = String::from_utf8(tree.stdout).unwrap();
+        let commit = tgit(&w.project, &[&gitdir, "commit-tree", tree.trim(), "-m", &message]);
+        let commit = String::from_utf8(commit.stdout).unwrap();
+        tgit(&w.project, &[&gitdir, "update-ref", &reference, commit.trim()]);
+        // Reopen so no in-memory record keeps the newer base commit.
+        let review = TurnReview::with_options(
+            Some(w.review_dir.clone()),
+            &w.project,
+            ReviewOptions {
+                excludes: Some(None),
+                ..ReviewOptions::default()
+            },
+        );
+        let result = review
+            .revert_job(
+                w.guard(),
+                wanted(),
+                SESSION,
+                n,
+                Scope::Turn,
+                "new.txt",
+                RevertTarget::File,
+                w.clear("new.txt"),
+            )
+            .run();
+        assert!(matches!(result, Err(Refusal::Unavailable(_))), "{result:?}");
+        assert!(review.diff_job(SESSION, n, Scope::Turn, "new.txt").run().is_ok());
+        assert_eq!(w.read("new.txt"), b"new\n");
+    }
+}
+
+#[test]
+fn a_deleted_duplicate_block_is_not_reverted_in_the_surviving_block() {
+    let mut w = World::new("duplicate-block");
+    let block = b"a\nb\nc\nNEW\nd\ne\nf\n";
+    w.write("a.txt", &[b"a\nb\nc\nOLD\nd\ne\nf\n".as_slice(), block].concat(), 0o644);
+    let n = w.turn(|w| w.write("a.txt", &block.repeat(2), 0o644));
+    let target = w.hunk(n, "a.txt", 0);
+    w.write("a.txt", block, 0o644);
+    assert_refused(w.revert(n, "a.txt", target), &Refusal::ChangedSinceEnd);
+    assert_eq!(w.read("a.txt"), block);
+}
+
+#[test]
+fn a_sparse_current_file_refuses_revert_undo_and_the_final_recheck() {
+    let mut w = World::new("sparse-current");
+    w.write("a.txt", b"before\n", 0o644);
+    let n = w.turn(|w| w.write("a.txt", b"after\n", 0o644));
+    let hunk = w.hunk(n, "a.txt", 0);
+    let grow = |path: &Path| {
+        std::fs::OpenOptions::new()
+            .write(true)
+            .open(path)
+            .unwrap()
+            .set_len(1 << 30)
+            .unwrap();
+    };
+    grow(&w.file("a.txt"));
+    for target in [RevertTarget::File, hunk] {
+        assert_refused(w.revert(n, "a.txt", target), &Refusal::ChangedSinceEnd);
+        assert_eq!(meta(&w.file("a.txt")).len(), 1 << 30);
+    }
+    w.write("a.txt", b"after\n", 0o644);
+    let applied = w.revert_file(n, "a.txt").unwrap();
+    grow(&w.file("a.txt"));
+    assert_refused(w.undo(&applied), &Refusal::ChangedSinceRevert);
+    assert_eq!(meta(&w.file("a.txt")).len(), 1 << 30);
+    w.write("a.txt", b"after\n", 0o644);
+    let path = w.file("a.txt");
+    let job = w
+        .review
+        .revert_job(
+            w.guard(),
+            wanted(),
+            SESSION,
+            n,
+            Scope::Turn,
+            "a.txt",
+            RevertTarget::File,
+            w.clear("a.txt"),
+        )
+        .on_final_check(Arc::new(move || grow(&path)));
+    assert_refused(job.run(), &Refusal::ChangedSinceEnd);
+    assert_eq!(meta(&w.file("a.txt")).len(), 1 << 30);
+}
+
 // ---- hunks -----------------------------------------------------------------------------------------
 
 #[test]
@@ -552,7 +1105,7 @@ fn a_hunk_whose_region_changed_is_refused() {
 }
 
 #[test]
-fn a_hunk_that_moved_is_refused() {
+fn a_hunk_shifted_by_an_insertion_reverts_at_its_new_line() {
     let mut w = World::new("moved");
     w.write("a.txt", &numbered(20).concat(), 0o644);
     let mut end = numbered(20);
@@ -562,8 +1115,12 @@ fn a_hunk_that_moved_is_refused() {
     // The region's bytes are all still there, one line further down.
     let cur = [b"a new first line\n".to_vec(), end.concat()].concat();
     w.write("a.txt", &cur, 0o644);
-    assert_refused(w.revert(n, "a.txt", target), &Refusal::ChangedSinceEnd);
-    assert_eq!(w.read("a.txt"), cur);
+    let applied = w.revert(n, "a.txt", target).unwrap();
+    assert_eq!(applied.at_line, 13);
+    assert_eq!(
+        w.read("a.txt"),
+        [b"a new first line\n".to_vec(), numbered(20).concat()].concat()
+    );
 }
 
 #[test]

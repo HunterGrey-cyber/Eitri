@@ -355,9 +355,32 @@ impl ProjectDir {
 }
 
 /// What `target` is on disk now, read through its parent's descriptor without following a link.
-/// This is the only way a revert, an undo or a recovery reads a project file.
+/// Files above the review cap are refused before reading; growth during the read is bounded too.
 pub fn read_current(target: &Target) -> io::Result<Current> {
-    read_current_within(target, u64::MAX)
+    read_current_capped(target, MAX_FILE_BYTES)
+}
+
+pub(super) const MAX_FILE_BYTES: u64 = 8 * 1024 * 1024;
+
+/// A complete current file, or an error when it exceeds the caller's comparison budget.
+pub(super) fn read_current_capped(target: &Target, limit: u64) -> io::Result<Current> {
+    let too_large = || io::Error::new(io::ErrorKind::InvalidData, "file exceeds the review read limit");
+    if let Some(parent) = &target.parent {
+        match stat_at(parent, &target.leaf) {
+            Ok(st) if st.st_mode & libc::S_IFMT == libc::S_IFREG && st.st_size as u64 > limit => {
+                return Err(too_large())
+            }
+            Err(e) if e.raw_os_error() != Some(libc::ENOENT) => return Err(e),
+            _ => {}
+        }
+    }
+    #[cfg(test)]
+    super::test_hooks::run(&super::test_hooks::BEFORE_CURRENT_READ);
+    let current = read_current_within(target, limit)?;
+    if matches!(&current, Current::Regular { bytes, .. } if bytes.len() as u64 > limit) {
+        return Err(too_large());
+    }
+    Ok(current)
 }
 
 /// [`read_current`], reading a regular file only up to one byte past `limit`: enough for the caller
@@ -381,6 +404,8 @@ pub fn read_current_within(target: &Target, limit: u64) -> io::Result<Current> {
             let (file, fst) = open_leaf(parent, &target.leaf, libc::O_RDONLY, &st)?;
             let mut bytes = Vec::new();
             file.take(limit.saturating_add(1)).read_to_end(&mut bytes)?;
+            #[cfg(test)]
+            CURRENT_READS.with(|reads| reads.borrow_mut().push((limit, bytes.len() as u64)));
             Ok(Current::Regular {
                 bytes,
                 // `st_mode` is `u16` on macOS, `u32` on Linux; widen so `Current::Regular::mode`
@@ -390,6 +415,51 @@ pub fn read_current_within(target: &Target, limit: u64) -> io::Result<Current> {
         }
         _ => Ok(Current::Other),
     }
+}
+
+#[cfg(test)]
+thread_local! {
+    pub(super) static CURRENT_READS: std::cell::RefCell<Vec<(u64, u64)>> = const { std::cell::RefCell::new(Vec::new()) };
+}
+
+/// Birth time if the filesystem supplies it, otherwise modification time; no link is followed.
+/// The flag distinguishes proof of creation from a modification that could expose an old file.
+pub(super) fn file_origin_ns(target: &Target) -> io::Result<(u128, bool)> {
+    let parent = target
+        .parent
+        .as_ref()
+        .ok_or_else(|| io::Error::from_raw_os_error(libc::ENOENT))?;
+    let st = stat_at(parent, &target.leaf)?;
+    #[cfg(target_os = "linux")]
+    {
+        let mut sx = std::mem::MaybeUninit::<libc::statx>::zeroed();
+        // SAFETY: the parent descriptor and leaf are valid, and sx is writable statx storage.
+        if unsafe {
+            libc::statx(
+                parent.as_raw_fd(),
+                target.leaf.as_ptr(),
+                libc::AT_SYMLINK_NOFOLLOW,
+                libc::STATX_BTIME,
+                sx.as_mut_ptr(),
+            )
+        } == 0
+        {
+            // SAFETY: statx succeeded and initialized sx.
+            let sx = unsafe { sx.assume_init() };
+            if sx.stx_mask & libc::STATX_BTIME != 0 {
+                return Ok((timestamp_ns(sx.stx_btime.tv_sec, sx.stx_btime.tv_nsec as i64), true));
+            }
+        }
+    }
+    #[cfg(target_os = "macos")]
+    if st.st_birthtime > 0 {
+        return Ok((timestamp_ns(st.st_birthtime, st.st_birthtime_nsec), true));
+    }
+    Ok((timestamp_ns(st.st_mtime, st.st_mtime_nsec), false))
+}
+
+fn timestamp_ns(seconds: i64, nanos: i64) -> u128 {
+    (seconds as i128 * 1_000_000_000 + nanos as i128).max(0) as u128
 }
 
 /// `target`'s size in bytes without following a link; `None` when nothing is there. Opens nothing,
@@ -1378,6 +1448,32 @@ mod tests {
         /// A permission bit lost despite a successful chmod.
         pub(super) static AFTER_CHMOD: std::cell::RefCell<Option<Box<dyn FnOnce()>>> =
             const { std::cell::RefCell::new(None) };
+    }
+
+    #[test]
+    fn a_directory_is_other_even_when_its_size_exceeds_the_read_limit() {
+        let scratch = ScratchDir::new("review", "directory-cap");
+        std::fs::create_dir(scratch.join("directory")).unwrap();
+        let root = ProjectDir::open(&scratch).unwrap();
+        let target = root.target(Path::new("directory"), false).unwrap();
+        assert_eq!(read_current_capped(&target, 0).unwrap(), Current::Other);
+    }
+
+    #[test]
+    fn a_current_file_over_the_review_cap_is_refused() {
+        let dir = ScratchDir::new("review", "read-cap");
+        let file = std::fs::File::create(dir.join("large")).unwrap();
+        file.set_len(8 * 1024 * 1024 + 1).unwrap();
+        let root = ProjectDir::open(&dir).unwrap();
+        let target = root.target(Path::new("large"), false).unwrap();
+        assert!(
+            read_current(&target).is_err(),
+            "an oversized file must not be returned as usable bytes"
+        );
+        let Current::Regular { bytes, .. } = read_current_within(&target, 3).unwrap() else {
+            panic!("regular file")
+        };
+        assert_eq!(bytes.len(), 4, "bounded comparisons need only one excess byte");
     }
 
     #[test]

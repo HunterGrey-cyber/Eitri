@@ -7,7 +7,7 @@
 use std::collections::BTreeMap;
 use std::path::Path;
 
-use super::write::{read_current, Current, ProjectDir};
+use super::write::{read_current_capped, Current, ProjectDir, MAX_FILE_BYTES};
 
 /// The longest comment, in characters.
 pub const MAX_COMMENT_CHARS: usize = 4000;
@@ -294,9 +294,13 @@ fn status_of(
         return RevertStatus::Undone;
     }
     let new = &record.new;
+    let limit = match new.shape {
+        RevertShape::Lines { .. } => MAX_FILE_BYTES,
+        _ => new.reverted_to.len().max(new.replaced.len()) as u64,
+    };
     let current = project
         .and_then(|project| project.target(Path::new(&new.path), false).ok())
-        .and_then(|target| read_current(&target).ok());
+        .and_then(|target| read_current_capped(&target, limit).ok());
     let Some(current) = current else {
         return RevertStatus::ChangedSince;
     };
@@ -366,4 +370,41 @@ pub fn check_reverts(
         .iter()
         .map(|record| (record.id, status_of(project.as_ref(), record, editor_bytes)))
         .collect()
+}
+
+#[cfg(test)]
+mod bounded_read_tests {
+    use super::*;
+
+    #[test]
+    fn an_oversized_current_file_cannot_confirm_a_reverted_prefix() {
+        let dir = crate::test_scratch_dir::ScratchDir::new("review", "draft-cap");
+        std::fs::write(dir.join("a"), b"reverted\n").unwrap();
+        std::fs::OpenOptions::new()
+            .write(true)
+            .open(dir.join("a"))
+            .unwrap()
+            .set_len(MAX_FILE_BYTES + 1)
+            .unwrap();
+        let project = ProjectDir::open(&dir).unwrap();
+        let record = RevertRecord {
+            id: 1,
+            undone: false,
+            new: NewRevert {
+                turn: 1,
+                path: "a".into(),
+                hunk: None,
+                shape: RevertShape::Lines { from: 1, to: 1 },
+                source: RevertSource::Panel,
+                at_line: 1,
+                reverted_to: b"reverted\n".to_vec(),
+                replaced: b"original\n".to_vec(),
+                undo: None,
+            },
+        };
+        assert_eq!(
+            status_of(Some(&project), &record, &BTreeMap::new()),
+            RevertStatus::ChangedSince
+        );
+    }
 }
