@@ -1049,6 +1049,7 @@ ctr_phase_f() {
 	git -C /build/verdandi show "$RS_VERDANDI_REV:package-lock.json" > /build/check/protoc/package-lock.json
 	python3 packaging/release_check.py check-protoc-pin /build/check/protoc/package-lock.json packaging/pins.env /build/check/protoc \
 		|| ctr_die "the pinned Verdandi compiler differs from pins.env"
+	rm -rf /build/check/protoc
 	step "phase F done"
 }
 

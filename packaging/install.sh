@@ -2342,6 +2342,7 @@ sidecar_place_protoc() {
 # (TOLERANT=1) and --sidecar-only (TOLERANT=0). NV_SIDECAR_WORKDIR is read by on_exit, which removes
 # it unless --keep-build.
 install_sidecar_for_rev() {
+	check_bundled_protoc_pin
 	_isr_rev7=$1
 	_isr_tolerant=$2
 	_isr_dest=$NV_SIDECAR_ROOT/$_isr_rev7
@@ -2440,6 +2441,7 @@ setup_dir() {
 do_sidecar_only() {
 	resolve_setup_release
 	if [ "$OPT_DRY_RUN" = 1 ]; then
+		check_bundled_protoc_pin
 		say "would build the sidecar for verdandi $REL_REV7 into $NV_SIDECAR_ROOT/$REL_REV7 (from $NV_RELEASE_PATH)"
 		return 0
 	fi
@@ -2513,6 +2515,7 @@ do_nvim_offer() {
 # before using either, the same discipline as every other input this installer trusts.
 do_build_sidecar_into() {
 	resolve_setup_release
+	check_bundled_protoc_pin
 	if [ "$OPT_DRY_RUN" = 1 ]; then
 		say "would build the sidecar for verdandi $REL_REV7 into $OPT_BUILD_SIDECAR_INTO (from $NV_RELEASE_PATH)"
 		return 0
@@ -3552,6 +3555,11 @@ synthesize_release_from_checkout() {
 	# Read out to plain statements before the group below (rule 2): kv_get can die, and a
 	# command substitution inside a `{ ...; } >file || die` group has its own errexit suspended
 	# under a non-POSIX-mode bash.
+	# Keep absent keys absent for older checkouts; even one empty key must retain pin validation.
+	_src_pins_grpc_present=0
+	if grep -Eq '^GRPC_TOOLS_(VERSION|SHA256_linux_(x64|arm64))=' "$_src_pins"; then
+		_src_pins_grpc_present=1
+	fi
 	_src_pins_grpc_version=$(kv_get "$_src_pins" GRPC_TOOLS_VERSION)
 	_src_pins_grpc_x64=$(kv_get "$_src_pins" GRPC_TOOLS_SHA256_linux_x64)
 	_src_pins_grpc_arm64=$(kv_get "$_src_pins" GRPC_TOOLS_SHA256_linux_arm64)
@@ -3580,9 +3588,11 @@ synthesize_release_from_checkout() {
 			printf 'SIDECAR_PROTOCOL_MAJOR=%s\n' "$_src_sidecar_major"
 			printf 'SIDECAR_REQUIRED_CAPABILITIES=%s\n' "$_src_sidecar_caps"
 		fi
-		printf 'GRPC_TOOLS_VERSION=%s\n' "$_src_pins_grpc_version"
-		printf 'GRPC_TOOLS_SHA256_linux_x64=%s\n' "$_src_pins_grpc_x64"
-		printf 'GRPC_TOOLS_SHA256_linux_arm64=%s\n' "$_src_pins_grpc_arm64"
+		if [ "$_src_pins_grpc_present" = 1 ]; then
+			printf 'GRPC_TOOLS_VERSION=%s\n' "$_src_pins_grpc_version"
+			printf 'GRPC_TOOLS_SHA256_linux_x64=%s\n' "$_src_pins_grpc_x64"
+			printf 'GRPC_TOOLS_SHA256_linux_arm64=%s\n' "$_src_pins_grpc_arm64"
+		fi
 		printf 'NODE_VERSION=%s\n' "$_src_pins_node_version"
 		printf 'NODE_SHA256_linux_x64=%s\n' "$_src_pins_node_x64"
 		printf 'NODE_SHA256_linux_arm64=%s\n' "$_src_pins_node_arm64"

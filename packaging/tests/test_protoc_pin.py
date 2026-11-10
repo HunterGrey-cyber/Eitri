@@ -326,28 +326,65 @@ def test_release_checks_locked_version_and_downloads_against_pins(tmp_path, mism
     ('0.3.0', 'GRPC_TOOLS_VERSION=\n', False), ('0.3.1', pin('bad'), False),
     ('0.3.1', pin('a' * 64).replace('1.13.1', 'v1.13.1'), False),
 ])
-def test_dry_run_checks_compiler_metadata_without_download(build, version, fields, allowed):
+@pytest.mark.parametrize('route', ['install', 'setup', 'aur'])
+def test_dry_run_checks_compiler_metadata_without_download(build, version, fields, allowed, route):
     root, sha, script = build
     (root / 'RELEASE').write_text(release(version, fields))
-    proc = run(script + '''
+    script += '''
 parse_release "$HOME/RELEASE"
+OPT_RELEASE_FILE=$HOME/RELEASE
 NV_NEW_REV7=ccccccc
 NV_SIDECAR_ROOT=$HOME/sidecar
+OPT_BUILD_SIDECAR_INTO=$HOME/out
 OPT_DRY_RUN=1
 sidecar_state() { NV_SIDECAR_PRESENT=0; }
 curl_get() { echo unexpected-download >&2; exit 99; }
-ensure_sidecar
-''', root)
+'''
+    entry = {'install': 'ensure_sidecar', 'setup': 'do_sidecar_only', 'aur': 'do_build_sidecar_into'}[route]
+    proc = run(script + entry + '\n', root)
     assert (proc.returncode == 0) == allowed, proc.stderr
     assert 'unexpected-download' not in proc.stderr
     if not fields:
         assert ('warning:' if allowed else 'refusing') in proc.stderr
     if not allowed:
+        assert 'GRPC_TOOLS' in proc.stderr
         assert 'would build' not in proc.stdout
 
 
-@pytest.mark.parametrize('route', ['checkout', 'eitri-git'])
-def test_synthesized_release_copies_checked_in_compiler_pin(build, route):
+@pytest.mark.parametrize('route', ['install', 'setup', 'aur'])
+@pytest.mark.parametrize('fields', ['', 'GRPC_TOOLS_VERSION=\n', pin('bad')])
+def test_real_build_refuses_invalid_pin_before_acquiring_inputs(build, route, fields):
+    root, sha, script = build
+    (root / 'RELEASE').write_text(release(pin=fields))
+    script += '''
+parse_release "$HOME/RELEASE"
+OPT_RELEASE_FILE=$HOME/RELEASE
+NV_CACHE_NV=$HOME/cache
+NV_SIDECAR_ROOT=$HOME/sidecar
+sidecar_state() { NV_SIDECAR_PRESENT=0; }
+require_curl() { :; }
+check_base_url() { NV_BASE=https://example.invalid; }
+acquire_lock() { :; }
+check_sidecar_build_space() { :; }
+sidecar_download_node() { echo unexpected-download >&2; exit 99; }
+sidecar_download_verdandi_source() { echo unexpected-download >&2; exit 99; }
+OPT_NODE_TARBALL=$HOME/missing-node.tgz
+OPT_VERDANDI_SOURCE_TARBALL=$HOME/missing-source.tgz
+OPT_BUILD_SIDECAR_INTO=$HOME/out
+'''
+    entry = {'install': 'install_sidecar_for_rev ccccccc 1', 'setup': 'do_sidecar_only',
+             'aur': 'do_build_sidecar_into'}[route]
+    proc = run(script + entry + '\n', root)
+    assert proc.returncode != 0
+    assert 'GRPC_TOOLS' in proc.stderr
+    assert 'unexpected-download' not in proc.stderr
+    assert 'no such file' not in proc.stderr
+    assert not (root / 'cache').exists()
+
+
+@pytest.mark.parametrize('route,shape', [('eitri-git', 'complete')] + [
+    ('checkout', shape) for shape in ('complete', 'absent', 'version', 'x64', 'arm64', 'blank')])
+def test_synthesized_release_copies_checked_in_compiler_pin(build, route, shape):
     root, sha, script = build
     tree = root / 'eitri-git'
     (tree / 'packaging').mkdir(parents=True)
@@ -357,8 +394,16 @@ def test_synthesized_release_copies_checked_in_compiler_pin(build, route):
     (tree / '.git').mkdir()
     (root / 'verdandi').mkdir()
     fields = pin(sha)
+    if shape == 'absent':
+        fields = ''
+    elif shape == 'blank':
+        fields = 'GRPC_TOOLS_VERSION=\n'
+    elif shape != 'complete':
+        key = 'GRPC_TOOLS_VERSION' if shape == 'version' else f'GRPC_TOOLS_SHA256_linux_{shape}'
+        fields = next(line + '\n' for line in fields.splitlines() if line.startswith(key + '='))
     (tree / 'packaging/pins.env').write_text(release(pin=fields))
-    (tree / 'Cargo.toml').write_text('[workspace.package]\nversion = "0.3.1"\n')
+    version = '0.3.1' if shape == 'complete' else '0.3.0'
+    (tree / 'Cargo.toml').write_text(f'[workspace.package]\nversion = "{version}"\n')
     (tree / 'agent/Cargo.toml').write_text('claude-runtime-protocol = { git = "https://github.com/HunterGrey-cyber/verdandi", rev = "' + 'c' * 40 + '" }\n')
     git_stub = '''
 git() {
@@ -375,7 +420,6 @@ resolve_verdandi_source() { NV_VERDANDI_SOURCE_TARBALL_OVERRIDE=$HOME/source.tgz
 NV_CACHE_NV=$HOME/cache
 synthesize_release_from_checkout "$HOME/eitri-git"
 cp "$NV_RELEASE_PATH" "$HOME/synthesized"
-check_bundled_protoc_pin
 '''
     else:
         script = f'set -euo pipefail\nsource {shlex.quote(str(PACKAGING / "aur/eitri-git/PKGBUILD"))}\n' + git_stub + '''
@@ -393,10 +437,20 @@ cp "$srcdir/release-for-sidecar.env" "$HOME/synthesized"
     synthesized = (root / 'synthesized').read_text()
     for line in fields.splitlines():
         assert line in synthesized.splitlines()
+    if shape == 'absent':
+        assert 'GRPC_TOOLS_' not in synthesized
     # Both the build and a later setup consume this same RELEASE.
     (root / 'RELEASE').write_text(synthesized)
     proc = run(installer() + 'parse_release "$HOME/RELEASE"\ncheck_bundled_protoc_pin\n', root)
-    assert proc.returncode == 0, proc.stderr
+    if shape in ('complete', 'absent'):
+        assert proc.returncode == 0, proc.stderr
+        assert ('warning:' in proc.stderr) == (shape == 'absent')
+        if shape == 'absent':
+            assert 'unverified compiler download' in proc.stderr
+    else:
+        assert proc.returncode != 0
+        assert 'incomplete or malformed GRPC_TOOLS' in proc.stderr
+        assert 'warning:' not in proc.stderr
 
 
 def test_harness_releases_pin_fixture_compilers_and_keep_legacy_cases(tmp_path):
