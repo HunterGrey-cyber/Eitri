@@ -187,13 +187,13 @@ describe("thinking in the conversation", () => {
     expect(current(container)!.classList.contains("row-assistant")).toBe(true);
   });
 
-  it("the detailed view shows every block whole, under hidden too, and Ctrl+o again puts the level back", () => {
+  it("the detailed view shows every block whole, under hidden too, and zi again puts the level back", () => {
     for (const level of ["hidden", "collapsed", "preview"] as const) {
       const { container, key, unmount } = started(thinkingState(), level);
-      key("o", { ctrlKey: true });
+      key("z"); key("i");
       expect(wholeTexts(container), level).toEqual([THOUGHT, "One line.", LONG_THOUGHT]);
       expect(container.querySelector(".thinking-preview"), level).toBeNull();
-      key("o", { ctrlKey: true });
+      key("z"); key("i");
       expect(wholeTexts(container), level).toEqual(level === "hidden" ? [] : [null, null, null]);
       unmount();
     }
@@ -398,7 +398,7 @@ describe("subagent navigation and folds", () => {
     key("g"); key("g");
     key("Enter");
     key("z"); key("o");
-    key("o", { ctrlKey: true });
+    key("z"); key("i");
     expect(container.querySelector(".subagent-child")).toBeNull();
     expect(container.querySelector(".row-subagent .fold-marker")).toBeNull();
   });

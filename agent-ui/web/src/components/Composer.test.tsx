@@ -763,6 +763,13 @@ describe("every chord COMPOSER_CHORDS names does what INPUT_KEYS says", () => {
       expect(fireEvent.keyDown(textarea, { key: "Escape" })).toBe(true);
       expect(resolveKey("input", keyLike("Escape"), { sessionEnded: false })).toEqual({ kind: "mode", to: "browse" });
     },
+    "F1": () => {
+      const onOpenKeymap = vi.fn();
+      const { textarea } = renderComposer({ onOpenKeymap });
+      fireEvent.change(textarea, { target: { value: "draft" } });
+      fireEvent.keyDown(textarea, { key: "F1" });
+      expect(onOpenKeymap).toHaveBeenCalledOnce();
+    },
     "?": () => {
       const onOpenKeymap = vi.fn();
       const { textarea } = renderComposer({ onOpenKeymap });
@@ -770,15 +777,33 @@ describe("every chord COMPOSER_CHORDS names does what INPUT_KEYS says", () => {
       expect(onOpenKeymap).toHaveBeenCalledTimes(1);
     },
     "Ctrl+y": () => {
-      // `Composer` must leave it to bubble (its text untouched), and `App`'s
-      // INPUT branch approves the oldest waiting card on it (`App.inputCtrlY.test.tsx`).
+      // `Composer` leaves it to bubble with the draft and caret untouched, and `App`'s INPUT branch claims it
+      // (`ctrl-y-gone`): it answers no card and flashes `CTRL_Y_GONE_FLASH` (`App.inputCtrlY.test.tsx`).
       const { textarea } = renderComposer();
       typed(textarea, "keep");
+      textarea.setSelectionRange(2, 2);
       expect(fireEvent.keyDown(textarea, { key: "y", ctrlKey: true })).toBe(true);
       expect(textarea.value).toBe("keep");
+      expect([textarea.selectionStart, textarea.selectionEnd]).toEqual([2, 2]);
       expect(resolveKey("input", keyLike("y", { ctrlKey: true }), { sessionEnded: false })).toEqual({
-        kind: "approve-oldest",
+        kind: "ctrl-y-gone",
       });
+    },
+    "Alt-n / Alt-p": () => {
+      // `Composer` leaves both to bubble with the draft and caret untouched, and `App`'s INPUT branch enters card
+      // mode on them (`App.cardMode.test.tsx`).
+      const { textarea } = renderComposer();
+      typed(textarea, "keep");
+      textarea.setSelectionRange(2, 2);
+      for (const [letter, delta] of [["n", 1], ["p", -1]] as const) {
+        expect(fireEvent.keyDown(textarea, { key: letter, altKey: true }), letter).toBe(true);
+        expect(textarea.value).toBe("keep");
+        expect([textarea.selectionStart, textarea.selectionEnd]).toEqual([2, 2]);
+        expect(resolveKey("input", keyLike(letter, { altKey: true }), { sessionEnded: false })).toEqual({
+          kind: "card-mode",
+          delta,
+        });
+      }
     },
   };
 
@@ -795,7 +820,7 @@ describe("every chord COMPOSER_CHORDS names does what INPUT_KEYS says", () => {
   }
 });
 
-function keyLike(key: string, over: Partial<{ ctrlKey: boolean; shiftKey: boolean }> = {}) {
+function keyLike(key: string, over: Partial<{ ctrlKey: boolean; shiftKey: boolean; altKey: boolean }> = {}) {
   return { key, ctrlKey: false, shiftKey: false, isComposing: false, ...over };
 }
 

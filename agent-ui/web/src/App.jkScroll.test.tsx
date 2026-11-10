@@ -18,6 +18,7 @@ import { initialState } from "./reducer";
 import type { AgentUiState, Hello } from "./types";
 import { decideLanding, READING_LINE, SCROLL_ANIMATION_MS } from "./jkScroll";
 import { TYPING_GUARD_MS } from "./typingGuard";
+import { CARD_ARM_MS } from "./cardMode";
 
 afterEach(cleanup);
 
@@ -935,7 +936,7 @@ describe("a held j or k glides", () => {
     expect(current(container)).toBe("r1");
   });
 
-  it("a/d wait the typing guard through a hold and after letting go, then answer the card the cursor is on", () => {
+  it("Enter takes card mode only on its own, through a hold and after letting go; card mode then answers the card the cursor is on", () => {
     vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout"] });
     const rendered = started();
     const { container } = rendered;
@@ -959,12 +960,13 @@ describe("a held j or k glides", () => {
     let guard = 0;
     while (!container.querySelector(".row-current.row-permission") && guard++ < 200) holdFor(container, list, "j", 33);
     expect(container.querySelector(".row-current.row-permission")).not.toBeNull();
-    // An `a` while held answers nothing, and ends the hold.
-    fireEvent.keyDown(document.activeElement ?? document.body, { key: "a" });
+    // An Enter while held takes no card mode and answers nothing, and ends the hold.
+    fireEvent.keyDown(document.activeElement ?? document.body, { key: "Enter" });
+    expect(container.querySelector(".permission-card-mode")).toBeNull();
     act(() => vi.advanceTimersByTime(TYPING_GUARD_MS + 50));
     expect(posted.filter((m) => m.type === "permission_response")).toHaveLength(0);
 
-    // Hold again; let go 30ms after the last repeat; an `a` 240ms after letting go -- 270ms after the last
+    // Hold again; let go 30ms after the last repeat; an Enter 240ms after letting go -- 270ms after the last
     // repeat -- is still inside the window, which runs from the release.
     advance(400);
     act(() => vi.advanceTimersByTime(400));
@@ -974,11 +976,13 @@ describe("a held j or k glides", () => {
     advance(30);
     letGo("k");
     advance(240);
-    fireEvent.keyDown(document.activeElement ?? document.body, { key: "a" });
+    fireEvent.keyDown(document.activeElement ?? document.body, { key: "Enter" });
+    expect(container.querySelector(".permission-card-mode")).toBeNull();
     act(() => vi.advanceTimersByTime(TYPING_GUARD_MS + 50));
     expect(posted.filter((m) => m.type === "permission_response")).toHaveLength(0);
 
-    // Back on the card by single presses; a lone `a` past the window answers the card the cursor shows.
+    // Back on the card by single presses; a lone Enter past the window is card mode on the card the cursor shows,
+    // and an armed 1 answers it.
     advance(400);
     act(() => vi.advanceTimersByTime(400));
     while (!container.querySelector(".row-current.row-permission") && guard++ < 400) {
@@ -987,7 +991,12 @@ describe("a held j or k glides", () => {
     }
     advance(400);
     act(() => vi.advanceTimersByTime(400));
-    fireEvent.keyDown(document.activeElement ?? document.body, { key: "a" });
+    fireEvent.keyDown(document.activeElement ?? document.body, { key: "Enter" });
+    expect(container.querySelector(".permission-card-mode")).not.toBeNull();
+    advance(CARD_ARM_MS + 100);
+    act(() => vi.advanceTimersByTime(CARD_ARM_MS + 100));
+    fireEvent.keyDown(document.activeElement ?? document.body, { key: "1" });
+    advance(TYPING_GUARD_MS + 50);
     act(() => vi.advanceTimersByTime(TYPING_GUARD_MS + 50));
     const answers = posted.filter((m) => m.type === "permission_response");
     expect(answers).toHaveLength(1);

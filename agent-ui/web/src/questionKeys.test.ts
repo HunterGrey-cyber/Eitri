@@ -77,3 +77,9 @@ describe("question keys", () => {
     }
   });
 });
+
+it.each(["option", "custom", "input", "other"] as const)("F1 opens help in the %s zone", (zone) => {
+  expect(key("F1", {}, zone)).toEqual({ type: "help" });
+  expect(key("F1", { shiftKey: true }, zone)).toEqual({ type: "none" });
+  expect(key("F1", { isComposing: true }, zone)).toEqual({ type: "none" });
+});

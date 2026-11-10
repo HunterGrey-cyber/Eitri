@@ -329,7 +329,7 @@ describe("an overlay that throws closes itself and leaves the panel drawn", () =
       expect(container.querySelector(".band-message")?.textContent).toBe("the chooser failed and closed");
       const root = container.querySelector<HTMLElement>(".agent-ui-conversation")!;
       expect(document.activeElement, "the keys are on the panel again").toBe(root);
-      fireEvent.keyDown(root, { key: "?", shiftKey: true });
+      fireEvent.keyDown(root, { key: "F1" });
       expect(container.querySelector(".keymap-overlay"), "and a key does what it does there").not.toBeNull();
     });
 
@@ -360,7 +360,7 @@ describe("an overlay that throws closes itself and leaves the panel drawn", () =
       expect(container.querySelector(".band-message")?.textContent).toBe(flash);
       const root = rootOf(container);
       expect(document.activeElement, "the keys are on the panel again").toBe(root);
-      fireEvent.keyDown(root, { key: "?", shiftKey: true });
+      fireEvent.keyDown(root, { key: "F1" });
       expect(container.querySelector(".keymap-overlay"), "and a key does what it does there").not.toBeNull();
     });
 

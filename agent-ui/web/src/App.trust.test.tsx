@@ -626,7 +626,7 @@ describe("the : line's trust commands", () => {
     for (const line of ["trust x", "trusted", "Trust", "ls"]) {
       typed(container, line);
       expect(container.querySelector(".band-message")!.textContent).toBe(
-        `:${line} — no ex commands here; ? lists this panel's keys`,
+        `:${line} — not a command here; F1 lists this panel's keys`,
       );
     }
     expect(requests("trust_command")).toHaveLength(2);

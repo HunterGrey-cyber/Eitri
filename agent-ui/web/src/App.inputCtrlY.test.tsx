@@ -1,19 +1,21 @@
 // @vitest-environment jsdom
 /**
- * In INPUT, a single `Ctrl+y` approves the active tab's oldest waiting card without leaving INPUT.
- * BROWSE's `Ctrl+y` still scrolls one line up. Denying stays on the card, where a reason can be typed.
- *
- * These tests cover the target across card counts and tabs, the exact chord, composing input,
- * the typing guard, and readline yanks after Ctrl+u or Ctrl+w. They also check the permission id,
- * the band and `?` overlay, the unchanged composer, and BROWSE scrolling without answering.
+ * INPUT's `Ctrl+y` answers nothing. Cards are answered in card mode; the chord is still claimed, so the box never
+ * acts on it (the composer has no kill ring for it to yank from), and the band says where cards are. Every way a
+ * `Ctrl+y` could still reach a card has a case here: each card kind (a provider card, an ACP card, a card of
+ * Eitri's own tool broker) and none, from the composer and from the question dock, a lone press after a pause,
+ * one right after a kill, one held down, and two in a row. BROWSE's `Ctrl+y` is still the one-line scroll and
+ * answers nothing either.
  */
 import { afterEach, beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
 import { act, cleanup, fireEvent, render } from "@testing-library/react";
 import App from "./App";
 import { applyEvent, initialState } from "./reducer";
-import type { AgentDomainEvent, AgentUiState, EditorCardWire, Hello } from "./types";
+import type { AgentDomainEvent, AgentUiState, EditorCardWire, Hello, QuestionRecord } from "./types";
 import { EMPTY_PANEL_TABLE } from "./keymap";
-import { RELEASE_WAIT_MAX_MS, TYPING_GUARD_MS } from "./typingGuard";
+import { TYPING_GUARD_MS } from "./typingGuard";
+import { CARD_ARM_MS } from "./cardMode";
+import { CTRL_Y_GONE_FLASH } from "./app/flashes";
 
 afterEach(cleanup);
 
@@ -123,11 +125,12 @@ function started(
   tabs: readonly Record<string, unknown>[] = [TAB1],
   events: AgentDomainEvent[] = cardEvents(cards),
   brokerCards: readonly EditorCardWire[] = [],
+  snapshot: Partial<AgentUiState> = {},
 ) {
   const rendered = render(<App />);
   dispatch({ kind: "hello", ...HELLO });
   dispatch({ kind: "tabs", active: 1, tabs });
-  dispatch({ kind: "snapshot", tab: 1, throughRevision: 0, state: snapshotState() });
+  dispatch({ kind: "snapshot", tab: 1, throughRevision: 0, state: snapshotState(snapshot) });
   const list = events;
   dispatch({ kind: "events", tab: 1, fromRevision: 0, throughRevision: list.length, events: list });
   if (brokerCards.length > 0) dispatch({ kind: "editor_cards", tab: 1, cards: brokerCards });
@@ -164,32 +167,118 @@ function inInput(
 /** Ctrl+y pressed on the composer and held: only its keydown, as a real keyboard delivers the `y`
  *  (the bare Control keydown before it is a modifier, which the guard ignores). Returns whether its
  *  default survived. */
-const ctrlYDown = (box: HTMLElement, init: Record<string, unknown> = {}) =>
+const yDown = (box: HTMLElement, init: Record<string, unknown> = {}) =>
   fireEvent.keyDown(box, { key: "y", code: "KeyY", ctrlKey: true, ...init });
 
 /** The `y` of a Ctrl+y let go. */
-const ctrlYUp = (box: HTMLElement) => fireEvent.keyUp(box, { key: "y", code: "KeyY", ctrlKey: true });
+const yUp = (box: HTMLElement) => fireEvent.keyUp(box, { key: "y", code: "KeyY", ctrlKey: true });
 
 /** Ctrl+y tapped on the composer: pressed and let go at once. Returns whether the keydown's default
  *  survived. */
-const ctrlY = (box: HTMLElement, init: Record<string, unknown> = {}) => {
-  const kept = ctrlYDown(box, init);
-  ctrlYUp(box);
+const tapY = (box: HTMLElement, init: Record<string, unknown> = {}) => {
+  const kept = yDown(box, init);
+  yUp(box);
   return kept;
 };
 
-const TYPING_FLASH = "Ctrl+y approves only on its own — pause, then press it again";
-const HELD_FLASH = "Ctrl+y held down approves nothing — tap it to approve";
+const brokerAnswers = () => posted.filter((m) => m.type === "editor_card_answer");
+const questionAnswers = () => posted.filter((m) => m.type === "question_answer" || m.type === "question_decline");
+const modeOf = (c: HTMLElement) => c.querySelector('[data-testid="mode-block"]')?.getAttribute("data-mode") ?? null;
 
-/** A key event for `y` with `Ctrl` whose `timeStamp` is `stamp`, as a page handling it late still sees
- *  the time it happened. */
-function stampedCtrlY(type: "keydown" | "keyup", stamp: number): KeyboardEvent {
-  const event = new KeyboardEvent(type, { key: "y", code: "KeyY", ctrlKey: true, bubbles: true, cancelable: true });
-  Object.defineProperty(event, "timeStamp", { value: stamp });
-  return event;
+/** A card Eitri's own tool broker raised, as Rust serialises it. `seq` is where it sits among the conversation's rows. */
+function brokerCard(id: string, seq: number, toolUseId: string | null = null): EditorCardWire {
+  return {
+    id, seq, tool: "open_file", toolUseId, title: "Show /etc/hosts in your editor?",
+    body: [{ kind: "code", text: "/etc/hosts" }],
+  };
 }
 
-describe("INPUT Ctrl+y approves the active tab's oldest waiting card", () => {
+/** An ACP agent's card, `allowed` saying whether it offered an allow-once option (without one Approve is off). */
+function acpCard(allowed: boolean): AgentDomainEvent[] {
+  const input = {
+    title: "Edit notes.txt",
+    options: allowed ? [{ kind: "allow_once", name: "Allow" }, { kind: "reject_once", name: "Reject" }] : [{ kind: "reject_once", name: "Reject" }],
+    diffs: [],
+    locations: [{ path: "/work/notes.txt" }],
+    ...(allowed ? {} : { inputCut: true }),
+  };
+  return [
+    { type: "user_prompt_submitted", text: "edit it" },
+    { type: "turn_started", turn_id: "t1" },
+    { type: "tool_call_started", turn_id: "t1", tool_use_id: "c1", name: "acp:edit", input },
+    { type: "permission_requested", permission_id: "acp-1", tool_use_id: "c1", tool_name: "acp:edit", input },
+  ];
+}
+
+const question: QuestionRecord = { seq: 1, interactionId: "q1", toolUseId: null, turnId: "t1", unsupportedReason: null, state: { kind: "waiting" }, questions: [{
+  question: "Which database?", header: "Database", multiSelect: false,
+  options: [{ label: "Postgres", description: "Relational", preview: null }, { label: "SQLite", description: "One file", preview: null }],
+}] };
+
+type Waiting = "a provider card" | "an ACP card" | "a broker card" | "no card";
+type From = "the composer" | "the question dock";
+
+/** Tab 1 with `waiting`, `i` into INPUT -- the composer, or the question dock when a question waits too -- and a
+ *  pause past the guard. Returns the element that has the keys. */
+function placed(waiting: Waiting, from: From) {
+  const snapshot: Partial<AgentUiState> = from === "the question dock" ? { questions: [question] } : {};
+  const rendered =
+    waiting === "a provider card" ? started(1, [TAB1], cardEvents(1), [], snapshot)
+    : waiting === "an ACP card" ? started(0, [TAB1], acpCard(true), [], snapshot)
+    : waiting === "a broker card" ? started(0, [TAB1], cardEvents(0), [brokerCard("ec-0123456789abcdef-1", 1)], snapshot)
+    : started(0, [TAB1], cardEvents(0), [], snapshot);
+  const { container } = rendered;
+  wait(TYPING_GUARD_MS + 50);
+  fireEvent.keyDown(root(container), { key: "i" });
+  wait(TYPING_GUARD_MS + 50);
+  const target = document.activeElement as HTMLElement | null;
+  expect(target).not.toBeNull();
+  if (from === "the composer") {
+    expect(target).toBe(textarea(container));
+    const box = target as HTMLTextAreaElement;
+    fireEvent.change(box, { target: { value: "draft text" } });
+    box.setSelectionRange(3, 3);
+    wait(TYPING_GUARD_MS + 50);
+  } else {
+    expect(target!.closest(".question-dock")).not.toBeNull();
+  }
+  return { ...rendered, target: target! };
+}
+
+/** What a key must leave as it was: the composer's text and caret (hidden behind the dock or not), and where the
+ *  keys are. */
+function draftOf(container: HTMLElement) {
+  const box = textarea(container);
+  return { text: box?.value ?? null, caret: box ? [box.selectionStart, box.selectionEnd] : null, focus: document.activeElement };
+}
+
+/** How `Ctrl+y` is pressed: what comes before it (judged as part of the draft it must leave alone), and the presses,
+ *  returning whether any keydown's default survived. */
+const PRESSES: Array<[string, (target: HTMLElement) => void, (target: HTMLElement) => boolean]> = [
+  ["a lone Ctrl+y after a pause", () => {}, (target) => tapY(target)],
+  // The kill acts on the draft first; the Ctrl+y right after it must change nothing more.
+  ["Ctrl+y right after Ctrl+u", (target) => {
+    fireEvent.keyDown(target, { key: "u", ctrlKey: true });
+    wait(100);
+  }, (target) => tapY(target)],
+  ["a Ctrl+y held down, repeating", () => {}, (target) => {
+    let kept = yDown(target);
+    for (let i = 0; i < 3; i++) {
+      wait(40);
+      kept = yDown(target, { repeat: true }) || kept;
+    }
+    wait(600);
+    yUp(target);
+    return kept;
+  }],
+  ["two Ctrl+y in a row", () => {}, (target) => {
+    const first = tapY(target);
+    wait(TYPING_GUARD_MS + 50);
+    return tapY(target) || first;
+  }],
+];
+
+describe("INPUT Ctrl+y answers nothing", () => {
   beforeEach(() => {
     vi.useFakeTimers();
     widen = stubBandWidth();
@@ -199,9 +288,137 @@ describe("INPUT Ctrl+y approves the active tab's oldest waiting card", () => {
     vi.unstubAllGlobals();
   });
 
+  const waitings: Waiting[] = ["a provider card", "an ACP card", "a broker card", "no card"];
+  const froms: From[] = ["the composer", "the question dock"];
+  for (const waiting of waitings) {
+    for (const from of froms) {
+      for (const [how, before, press] of PRESSES) {
+        it(`with ${waiting} waiting, from ${from}: ${how} is claimed, answers nothing and says cards are on Alt-n`, () => {
+          const { container, target } = placed(waiting, from);
+          before(target);
+          const draft = draftOf(container);
+          expect(press(target), "claimed").toBe(false);
+          wait(1000);
+          expect(draftOf(container)).toEqual(draft);
+          expect(answered()).toEqual([]);
+          expect(brokerAnswers()).toEqual([]);
+          expect(questionAnswers()).toEqual([]);
+          expect(bandMessage(container)).toBe(CTRL_Y_GONE_FLASH);
+          expect(modeOf(container)).toBe("input");
+        });
+      }
+    }
+  }
+
+  /* The dock's own text field ("Type something") is a text field outside the composer: the page claims Ctrl+y there
+     too, so the field never acts on it, and nothing is answered. */
+  it.each([[1], [0]] as const)("with %i cards waiting, Ctrl+y in the question's Type something field is claimed and answers nothing", (cards) => {
+    // The question's own draft already holds typed text, so the dock draws its field.
+    const draft = { q1: { page: 0, focus: 2, answers: [{ options: [], other: true, text: "pg" }] } };
+    const { container } = started(cards, [{ ...TAB1, questionDraft: draft }], cardEvents(cards), [], { questions: [question] });
+    wait(TYPING_GUARD_MS + 50);
+    fireEvent.keyDown(root(container), { key: "i" });
+    wait(TYPING_GUARD_MS + 50);
+    const field = container.querySelector<HTMLTextAreaElement>('.question-dock textarea[aria-label="Type something"]');
+    expect(field).not.toBeNull();
+    act(() => field!.focus());
+    expect(field!.value).toBe("pg");
+    wait(TYPING_GUARD_MS + 50);
+    expect(tapY(field!), "claimed").toBe(false);
+    wait(1000);
+    expect(field!.value).toBe("pg");
+    expect(document.activeElement).toBe(field);
+    expect(answered()).toEqual([]);
+    expect(brokerAnswers()).toEqual([]);
+    expect(questionAnswers()).toEqual([]);
+    expect(bandMessage(container)).toBe(CTRL_Y_GONE_FLASH);
+  });
+
+  it("Caps Lock's Ctrl+y, arriving as key Y with no Shift, is the same chord: claimed, nothing answered", () => {
+    const { container, box } = inInput(1);
+    expect(tapY(box, { key: "Y" })).toBe(false);
+    wait(1000);
+    expect(answered()).toEqual([]);
+    expect(bandMessage(container)).toBe(CTRL_Y_GONE_FLASH);
+  });
+
+  it("a card Approve cannot answer gets the same flash, not its own", () => {
+    const { container } = started(0, [TAB1], acpCard(false));
+    wait(TYPING_GUARD_MS + 50);
+    fireEvent.keyDown(root(container), { key: "i" });
+    wait(TYPING_GUARD_MS + 50);
+    expect(tapY(textarea(container)!)).toBe(false);
+    wait(1000);
+    expect(answered()).toEqual([]);
+    expect(bandMessage(container)).toBe(CTRL_Y_GONE_FLASH);
+  });
+
+  it.each([
+    ["Shift", { key: "Y", shiftKey: true }],
+    ["Shift, reported as a lowercase y", { shiftKey: true }],
+    ["Alt", { altKey: true }],
+    ["AltGraph", { modifierAltGraph: true }],
+    ["Meta", { metaKey: true }],
+    ["Super", { modifierSuper: true }],
+    ["Hyper", { modifierHyper: true }],
+    ["an input method composing", { isComposing: true }],
+    ["an input method's keyCode 229", { keyCode: 229 }],
+  ])("Ctrl+y with %s is another chord: not claimed by the panel, and nothing answered", (_name, init) => {
+    const { container, box } = inInput(1);
+    tapY(box, init);
+    wait(1000);
+    expect(answered()).toEqual([]);
+    expect(bandMessage(container)).not.toBe(CTRL_Y_GONE_FLASH);
+  });
+
+  it("Ctrl+y in the Ctrl+r history search is claimed the same way and answers nothing", () => {
+    const { container, box } = inInput(1);
+    fireEvent.keyDown(box, { key: "r", ctrlKey: true });
+    const search = container.querySelector<HTMLInputElement>(".history-search input");
+    expect(search).not.toBeNull();
+    act(() => search!.focus());
+    wait(TYPING_GUARD_MS + 50);
+    expect(fireEvent.keyDown(search!, { key: "y", ctrlKey: true })).toBe(false);
+    wait(1000);
+    expect(answered()).toEqual([]);
+    expect(bandMessage(container)).toBe(CTRL_Y_GONE_FLASH);
+  });
+
+  it("the band names no Ctrl+y while cards wait in INPUT, and none in BROWSE", () => {
+    const { container } = started(2);
+    expect(bandText(container)).not.toContain("Ctrl+y");
+    wait(TYPING_GUARD_MS + 50);
+    fireEvent.keyDown(root(container), { key: "i" });
+    expect(bandText(container)).not.toContain("Ctrl+y");
+  });
+
+  it("the ? overlay's Typing section says Ctrl+y does nothing and where cards are", () => {
+    const { container, box } = inInput(1);
+    fireEvent.keyDown(box, { key: "?", shiftKey: true });
+    const overlay = container.querySelector<HTMLElement>(".keymap-overlay");
+    expect(overlay).not.toBeNull();
+    const typing = Array.from(overlay!.querySelectorAll("section")).find(
+      (s) => s.querySelector("h2")?.textContent === "Typing",
+    )!;
+    const rows = Array.from(typing.querySelectorAll("tr")).map((tr) => tr.textContent ?? "");
+    expect(rows.some((r) => r.startsWith("Ctrl+y") && r.includes("nothing") && r.includes("Alt-n"))).toBe(true);
+    expect(rows.some((r) => /oldest/.test(r))).toBe(false);
+  });
+
+  it("on the card itself, BROWSE Ctrl+y is still the scroll and answers nothing", () => {
+    const { container } = started(1);
+    expect(container.querySelector(".row-current")!.classList.contains("row-permission")).toBe(true);
+    wait(TYPING_GUARD_MS + 50);
+    expect(fireEvent.keyDown(root(container), { key: "y", ctrlKey: true })).toBe(false);
+    wait(1000);
+    expect(answered()).toEqual([]);
+    expect(bandMessage(container)).not.toBe(CTRL_Y_GONE_FLASH);
+    expect(container.querySelector('[data-testid="mode-block"]')!.textContent).toBe("BROWSE");
+  });
+
   it("keeps an in-flight card inert across a tab switch and restores it on failure", () => {
     const { container } = started(1, [TAB1, TAB2]);
-    fireEvent.click(container.querySelector<HTMLButtonElement>('[data-nav-action="allow"]')!);
+    fireEvent.click(container.querySelector<HTMLButtonElement>('[data-nav-action="allow"]')!, { detail: 1 });
     const request = answered()[0];
     expect(request).toBeDefined();
     dispatch({ kind: "tabs", active: 2, tabs: [TAB1, TAB2] });
@@ -214,544 +431,17 @@ describe("INPUT Ctrl+y approves the active tab's oldest waiting card", () => {
     expect(container.textContent).not.toContain("Sending answer…");
     expect(container.querySelector<HTMLButtonElement>('[data-nav-action="allow"]')!.disabled).toBe(false);
   });
-
-  describe("rule 1: the target", () => {
-    it("with no card waiting, Ctrl+y does nothing and leaves the key to the box", () => {
-      const { container, box } = inInput(0);
-      expect(ctrlY(box)).toBe(true);
-      wait(1000);
-      expect(answered()).toEqual([]);
-      expect(bandMessage(container)).toBeNull();
-      expect(document.activeElement).toBe(box);
-    });
-
-    it("one card: approved TYPING_GUARD_MS later, by its own id, in its own tab, and INPUT stays", () => {
-      const { container, box } = inInput(1);
-      expect(ctrlY(box)).toBe(false);
-      wait(TYPING_GUARD_MS - 1);
-      expect(answered()).toEqual([]);
-      wait(1);
-      expect(answered()).toEqual([
-        expect.objectContaining({ type: "permission_response", tab: 1, permission_id: "perm-1", decision: "allow" }),
-      ]);
-      expect(document.activeElement).toBe(textarea(container));
-      expect(container.querySelector('[data-testid="mode-block"]')!.textContent).toBe("INSERT");
-    });
-
-    it("a held Ctrl+y approves nothing: still down when the wait ends, then its first repeat refuses it", () => {
-      const { container, box } = inInput(1);
-      expect(ctrlYDown(box)).toBe(false);
-      // GTK's first repeat comes after its delay (600 ms on sway, 500 on GNOME), well past the wait.
-      wait(600);
-      expect(answered()).toEqual([]);
-      ctrlYDown(box, { repeat: true });
-      wait(40);
-      ctrlYDown(box, { repeat: true });
-      ctrlYUp(box);
-      wait(1000);
-      expect(answered()).toEqual([]);
-      expect(bandMessage(container)).toBe(TYPING_FLASH);
-    });
-
-    it("a slow press let go after the wait, with no repeat, approves at its release", () => {
-      const { box } = inInput(1);
-      ctrlYDown(box);
-      wait(400);
-      expect(answered()).toEqual([]);
-      ctrlYUp(box);
-      expect(answered()).toEqual([
-        expect.objectContaining({ type: "permission_response", tab: 1, permission_id: "perm-1", decision: "allow" }),
-      ]);
-    });
-
-    it("with key repeat off, a Ctrl+y held past RELEASE_WAIT_MAX_MS approves nothing at its release, and says why", () => {
-      const { container, box } = inInput(1);
-      ctrlYDown(box);
-      // No repeat ever comes (GNOME's "Repeat Keys" off): only the release.
-      wait(2000);
-      expect(answered()).toEqual([]);
-      ctrlYUp(box);
-      wait(1000);
-      expect(answered()).toEqual([]);
-      expect(bandMessage(container)).toBe(HELD_FLASH);
-    });
-
-    it("a quick press whose release the page handles late, after a stall, still approves: the hold is read from the events' own times", () => {
-      const { box } = inInput(1);
-      // The events' clock, whatever it counts from.
-      const pressedAt = new Event("probe").timeStamp;
-      fireEvent(box, stampedCtrlY("keydown", pressedAt));
-      // The page's main thread stalls well past RELEASE_WAIT_MAX_MS; the keyup it then handles happened
-      // 100 ms after the press.
-      wait(RELEASE_WAIT_MAX_MS * 3);
-      expect(answered()).toEqual([]);
-      fireEvent(box, stampedCtrlY("keyup", pressedAt + 100));
-      expect(answered()).toEqual([
-        expect.objectContaining({ type: "permission_response", tab: 1, permission_id: "perm-1", decision: "allow" }),
-      ]);
-    });
-
-    it("a held Ctrl+y whose release the page handles at once is refused by the events' times too", () => {
-      const { container, box } = inInput(1);
-      const pressedAt = new Event("probe").timeStamp;
-      fireEvent(box, stampedCtrlY("keydown", pressedAt));
-      wait(TYPING_GUARD_MS + 10);
-      fireEvent(box, stampedCtrlY("keyup", pressedAt + RELEASE_WAIT_MAX_MS + 1));
-      wait(1000);
-      expect(answered()).toEqual([]);
-      expect(bandMessage(container)).toBe(HELD_FLASH);
-    });
-
-    it("a press let go just inside RELEASE_WAIT_MAX_MS still approves at its release", () => {
-      const { box } = inInput(1);
-      ctrlYDown(box);
-      wait(RELEASE_WAIT_MAX_MS - 1);
-      ctrlYUp(box);
-      expect(answered()).toEqual([
-        expect.objectContaining({ type: "permission_response", tab: 1, permission_id: "perm-1", decision: "allow" }),
-      ]);
-    });
-
-    it("two cards: the OLDEST, even with the row cursor left on the newer one; the next Ctrl+y the other", () => {
-      const rendered = started(2);
-      const { container } = rendered;
-      // The landing took the oldest card; `G` moves the row cursor off it, onto the last row.
-      wait(TYPING_GUARD_MS + 50);
-      fireEvent.keyDown(root(container), { key: "G", shiftKey: true });
-      expect(container.querySelector(".row-current")!.textContent).not.toContain("rm build");
-      wait(TYPING_GUARD_MS + 50);
-      fireEvent.keyDown(root(container), { key: "i" });
-      wait(TYPING_GUARD_MS + 50);
-      const box = textarea(container)!;
-      ctrlY(box);
-      wait(TYPING_GUARD_MS);
-      expect(answered()).toEqual([expect.objectContaining({ permission_id: "perm-1", decision: "allow" })]);
-      wait(TYPING_GUARD_MS + 50);
-      ctrlY(box);
-      wait(TYPING_GUARD_MS);
-      expect(answered().map((m) => m.permission_id)).toEqual(["perm-1", "perm-2"]);
-    });
-
-    it("two tabs: a card waiting only in the OTHER tab is never Ctrl+y's", () => {
-      const { box } = inInput(0, [TAB1, { ...TAB2, pending: 1, marker: "needs_input" }]);
-      expect(ctrlY(box)).toBe(true);
-      wait(1000);
-      expect(answered()).toEqual([]);
-    });
-
-    it("two tabs: a switch while the approval waits cancels it; the new tab's card is not answered", () => {
-      const { box } = inInput(1, [TAB1, TAB2]);
-      ctrlY(box);
-      wait(100);
-      dispatch({ kind: "tabs", active: 2, tabs: [TAB1, TAB2] });
-      const list: AgentDomainEvent[] = [
-        { type: "turn_started", turn_id: "t9" },
-        { type: "permission_requested", permission_id: "perm-9", tool_use_id: null, tool_name: "Bash", input: { command: "ls" } },
-      ];
-      dispatch({ kind: "snapshot", tab: 2, throughRevision: 0, state: snapshotState() });
-      dispatch({ kind: "events", tab: 2, fromRevision: 0, throughRevision: list.length, events: list });
-      wait(1000);
-      expect(answered()).toEqual([]);
-    });
-  });
-
-  describe("rule 2: exactly Ctrl+y", () => {
-    it.each([
-      ["Shift", { key: "Y", shiftKey: true }],
-      ["Shift, reported as a lowercase y", { shiftKey: true }],
-      ["Alt", { altKey: true }],
-      ["AltGraph", { modifierAltGraph: true }],
-      ["Meta", { metaKey: true }],
-      ["Super", { modifierSuper: true }],
-      ["Hyper", { modifierHyper: true }],
-      ["an input method composing", { isComposing: true }],
-      ["an input method's keyCode 229", { keyCode: 229 }],
-    ])("Ctrl+y with %s approves nothing", (_name, init) => {
-      const { box } = inInput(1);
-      ctrlY(box, init);
-      wait(1000);
-      expect(answered()).toEqual([]);
-    });
-
-    it("Ctrl+y while Super is held, as WebKitGTK reports it (Super's own keydown only), approves nothing", () => {
-      const { box } = inInput(1);
-      fireEvent.keyDown(box, { key: "Super", code: "OSLeft" });
-      wait(TYPING_GUARD_MS + 50);
-      ctrlY(box);
-      wait(1000);
-      expect(answered()).toEqual([]);
-      fireEvent.keyUp(box, { key: "Super", code: "OSLeft" });
-    });
-  });
-
-  describe("only the composer's own box", () => {
-    it("Ctrl+y in the Ctrl+r history search -- a query, not the draft -- approves nothing", () => {
-      const { container, box } = inInput(1);
-      fireEvent.keyDown(box, { key: "r", ctrlKey: true });
-      const search = container.querySelector<HTMLInputElement>(".history-search input");
-      expect(search).not.toBeNull();
-      act(() => search!.focus());
-      wait(TYPING_GUARD_MS + 50);
-      fireEvent.keyDown(search!, { key: "y", ctrlKey: true });
-      wait(1000);
-      expect(answered()).toEqual([]);
-    });
-  });
-
-  describe("the typing guard", () => {
-    it.each([
-      ["Ctrl+u", "u"],
-      ["Ctrl+w", "w"],
-    ])("%s then Ctrl+y at 100 ms -- readline's yank -- approves nothing, and the band says why", (_name, letter) => {
-      const { container, box } = inInput(1);
-      fireEvent.change(box, { target: { value: "some words here" } });
-      box.setSelectionRange(15, 15);
-      fireEvent.keyDown(box, { key: letter, ctrlKey: true });
-      wait(100);
-      ctrlY(box);
-      wait(1000);
-      expect(answered()).toEqual([]);
-      expect(bandMessage(container)).toBe(TYPING_FLASH);
-    });
-
-    it("a letter typed right after Ctrl+y cancels the approval, and says so", () => {
-      const { container, box } = inInput(1);
-      ctrlY(box);
-      wait(100);
-      fireEvent.keyDown(box, { key: "x" });
-      wait(1000);
-      expect(answered()).toEqual([]);
-      expect(bandMessage(container)).toBe(TYPING_FLASH);
-    });
-
-    it("a held Ctrl+y's repeat approves nothing", () => {
-      const { box } = inInput(1);
-      ctrlY(box, { repeat: true });
-      wait(1000);
-      expect(answered()).toEqual([]);
-    });
-
-    it("Esc then a at once answers nothing: the Esc that left INPUT gives card answers no exception", () => {
-      const { container, box } = inInput(1);
-      fireEvent.keyDown(box, { key: "Escape" });
-      fireEvent.keyDown(root(container), { key: "a" });
-      wait(1000);
-      expect(answered()).toEqual([]);
-      // The same a after a pause answers the card, so the refusal above was the guard's.
-      fireEvent.keyDown(root(container), { key: "a" });
-      wait(1000);
-      expect(answered()).toEqual([expect.objectContaining({ permission_id: "perm-1", decision: "allow" })]);
-    });
-
-    it("Esc, i and Ctrl+y at once approve nothing: Ctrl+y keeps its own pause after the fast re-entry", () => {
-      const { container, box } = inInput(1);
-      fireEvent.keyDown(box, { key: "Escape" });
-      fireEvent.keyDown(root(container), { key: "i" });
-      const again = textarea(container);
-      expect(again).not.toBeNull();
-      ctrlY(again!);
-      wait(1000);
-      expect(answered()).toEqual([]);
-      expect(bandMessage(container)).toBe(TYPING_FLASH);
-    });
-
-    it("the bare Control keydown before the y is not a key: a lone Ctrl+y still approves", () => {
-      const { box } = inInput(1);
-      fireEvent.keyDown(box, { key: "Control", ctrlKey: true });
-      ctrlY(box);
-      wait(TYPING_GUARD_MS);
-      expect(answered()).toEqual([expect.objectContaining({ permission_id: "perm-1", decision: "allow" })]);
-    });
-  });
-
-  describe("rule 5: the band, the overlay, and the composer", () => {
-    it("the band names the card Ctrl+y would approve while the box has the keys, and only then", () => {
-      const rendered = started(2);
-      const { container } = rendered;
-      // BROWSE: `a`/`d` are the keys there; the band does not advertise Ctrl+y.
-      expect(bandText(container)).not.toContain("Ctrl+y");
-      wait(TYPING_GUARD_MS + 50);
-      fireEvent.keyDown(root(container), { key: "i" });
-      expect(bandText(container)).toContain("Ctrl+y approves Bash: rm build");
-      const box = textarea(container)!;
-      wait(TYPING_GUARD_MS + 50);
-      ctrlY(box);
-      wait(TYPING_GUARD_MS);
-      // The first is answered; the band now names the next one waiting.
-      expect(bandText(container)).toContain("Ctrl+y approves Bash: git push");
-      // Focus leaving the pane: the box no longer has the keys.
-      dispatch({ kind: "pane_focus", focused: false });
-      expect(bandText(container)).not.toContain("Ctrl+y");
-    });
-
-    it("with no card waiting the band says nothing about Ctrl+y", () => {
-      const { container } = inInput(0);
-      expect(bandText(container)).not.toContain("Ctrl+y");
-    });
-
-    it("the ? overlay's Typing section lists Ctrl+y", () => {
-      const { container, box } = inInput(1);
-      fireEvent.keyDown(box, { key: "?", shiftKey: true });
-      const overlay = container.querySelector<HTMLElement>(".keymap-overlay");
-      expect(overlay).not.toBeNull();
-      const typing = Array.from(overlay!.querySelectorAll("section")).find(
-        (s) => s.querySelector("h2")?.textContent === "Typing",
-      )!;
-      const rows = Array.from(typing.querySelectorAll("tr")).map((tr) => tr.textContent ?? "");
-      expect(rows.some((r) => r.startsWith("Ctrl+y") && /oldest/.test(r))).toBe(true);
-    });
-
-    it("an answer leaves the composer's text, caret and history exactly as they were", () => {
-      const { container, box } = inInput(1);
-      fireEvent.change(box, { target: { value: "draft text" } });
-      box.setSelectionRange(3, 3);
-      wait(TYPING_GUARD_MS + 50);
-      ctrlY(box);
-      wait(TYPING_GUARD_MS);
-      expect(answered()).toHaveLength(1);
-      const after = textarea(container)!;
-      expect(after.value).toBe("draft text");
-      expect(after.selectionStart).toBe(3);
-      expect(after.selectionEnd).toBe(3);
-      expect(posted.filter((m) => m.type === "history_push")).toEqual([]);
-    });
-  });
-
-  describe("BROWSE's Ctrl+y is untouched", () => {
-    it("on the card itself, BROWSE Ctrl+y answers nothing", () => {
-      const { container } = started(1);
-      expect(container.querySelector(".row-current")!.classList.contains("row-permission")).toBe(true);
-      wait(TYPING_GUARD_MS + 50);
-      expect(fireEvent.keyDown(root(container), { key: "y", ctrlKey: true })).toBe(false);
-      wait(1000);
-      expect(answered()).toEqual([]);
-      expect(container.querySelector('[data-testid="mode-block"]')!.textContent).toBe("BROWSE");
-    });
-  });
-
-  /* Cases where a delayed approval must refuse a changed target or preserve a yank were seen
-     failing before the fix that added them. */
-  describe("the answer window and the yank guard", () => {
-    const TARGET_FLASH = "Ctrl+y: the waiting card just changed — read it, then press again";
-    const YANK_FLASH = "Ctrl+y right after Ctrl+u, Ctrl+w or Ctrl+k is a yank, not an answer — press it again";
-
-    /** The band moves on to the next card the moment the first is approved; a
-     *  second Ctrl+y 10 ms after that must not approve a card that has been the target for 10 ms. */
-    it("a second Ctrl+y 260 ms after the first approves only the first card", () => {
-      const { container, box } = inInput(2);
-      ctrlY(box);
-      wait(TYPING_GUARD_MS + 10);
-      ctrlY(box);
-      wait(1000);
-      expect(answered().map((m) => m.permission_id)).toEqual(["perm-1"]);
-      expect(bandMessage(container)).toBe(TARGET_FLASH);
-      // Once the second card has been the target for the guard window, a lone Ctrl+y approves it.
-      ctrlY(box);
-      wait(TYPING_GUARD_MS);
-      expect(answered().map((m) => m.permission_id)).toEqual(["perm-1", "perm-2"]);
-    });
-
-    /** The card the band named is withdrawn and another takes its place. */
-    it("a card replaced 30 ms before Ctrl+y is not approved", () => {
-      const { container, box } = inInput(1);
-      dispatch({
-        kind: "events", tab: 1, fromRevision: 5, throughRevision: 7,
-        events: [
-          { type: "permission_resolved", permission_id: "perm-1", outcome: "expired" },
-          { type: "permission_requested", permission_id: "perm-3", tool_use_id: null, tool_name: "Bash", input: { command: "rm -rf ~/work" } },
-        ],
-      });
-      wait(30);
-      ctrlY(box);
-      wait(1000);
-      expect(answered()).toEqual([]);
-      expect(bandMessage(container)).toBe(TARGET_FLASH);
-    });
-
-    /** No card; one arrives 30 ms before a Ctrl+y meant as something else. */
-    it("a card that arrived 30 ms before Ctrl+y is not approved", () => {
-      const { box } = inInput(0);
-      dispatch({
-        kind: "events", tab: 1, fromRevision: 3, throughRevision: 5,
-        events: [
-          { type: "tool_call_started", turn_id: "t1", tool_use_id: "toolu_5", name: "Bash", input: { command: "git push --force" } },
-          { type: "permission_requested", permission_id: "perm-5", tool_use_id: "toolu_5", tool_name: "Bash", input: { command: "git push --force" } },
-        ],
-      });
-      wait(30);
-      ctrlY(box);
-      wait(1000);
-      expect(answered()).toEqual([]);
-    });
-
-    /** A tab that arrives in the page -- another view's tab joined back, or a switch -- brings its
-     *  waiting card with it: that is a change of target like any other, so a Ctrl+y right after the
-     *  arrival is refused, and the arrived card is approved once it has been the target long enough. */
-    it("a tab arriving in the page counts as a change of waiting card: Ctrl+y right after it is refused", () => {
-      const { container } = inInput(0, [TAB1]);
-      const TAB3 = { ...TAB1, id: 3, number: 3, label: "3 new", pending: 1, marker: "needs_input" } as const;
-      dispatch({ kind: "tabs", active: 3, tabs: [TAB3] });
-      dispatch({ kind: "snapshot", tab: 3, throughRevision: 0, state: snapshotState() });
-      const list = cardEvents(1);
-      dispatch({ kind: "events", tab: 3, fromRevision: 0, throughRevision: list.length, events: list });
-      // The switch lands BROWSE; the window hands the composer the keys again, with no key pressed.
-      dispatch({ kind: "enter_input" });
-      wait(30);
-      const box = textarea(container);
-      expect(box).not.toBeNull();
-      expect(document.activeElement).toBe(box);
-      ctrlY(box!);
-      wait(TYPING_GUARD_MS + 50);
-      expect(answered()).toEqual([]);
-      expect(bandMessage(container)).toBe(TARGET_FLASH);
-      ctrlY(textarea(container)!);
-      wait(TYPING_GUARD_MS);
-      expect(answered()).toEqual([
-        expect.objectContaining({ type: "permission_response", tab: 3, permission_id: "perm-1", decision: "allow" }),
-      ]);
-    });
-
-    /** The Ctrl+r search stops its own Enter/Tab/Escape, so the typing
-     *  guard never saw them. */
-    it.each(["Enter", "Tab", "Escape"])("the Ctrl+r search's %s counts as a key: Ctrl+y 20 ms after it approves nothing", (exit) => {
-      const { container, box } = inInput(1);
-      dispatch({ kind: "history", entries: ["fix parser"] });
-      fireEvent.keyDown(box, { key: "r", ctrlKey: true });
-      const search = container.querySelector<HTMLInputElement>(".history-search input")!;
-      act(() => search.focus());
-      fireEvent.change(search, { target: { value: "f" } });
-      wait(TYPING_GUARD_MS + 50);
-      fireEvent.keyDown(search, { key: exit });
-      wait(20);
-      const after = textarea(container)!;
-      expect(document.activeElement).toBe(after);
-      ctrlY(after);
-      wait(1000);
-      expect(answered()).toEqual([]);
-      expect(bandMessage(container)).toBe(TYPING_FLASH);
-    });
-
-    /** Focus can move to the search field with a click, which is no key. */
-    it("the approval waits for a box that still has the keys: a click into the Ctrl+r search inside the window cancels it", () => {
-      const { container, box } = inInput(1);
-      fireEvent.keyDown(box, { key: "r", ctrlKey: true });
-      const search = container.querySelector<HTMLInputElement>(".history-search input")!;
-      act(() => box.focus());
-      wait(TYPING_GUARD_MS + 50);
-      ctrlY(box);
-      wait(100);
-      act(() => search.focus());
-      wait(1000);
-      expect(answered()).toEqual([]);
-    });
-
-    /** The band names a Ctrl+y that does nothing while the search has the keys. */
-    it("the band does not advertise Ctrl+y while the Ctrl+r search has the keys", () => {
-      const { container, box } = inInput(1);
-      expect(bandText(container)).toContain("Ctrl+y approves");
-      fireEvent.keyDown(box, { key: "r", ctrlKey: true });
-      const search = container.querySelector<HTMLInputElement>(".history-search input")!;
-      act(() => search.focus());
-      expect(bandText(container)).not.toContain("Ctrl+y");
-      act(() => box.focus());
-      expect(bandText(container)).toContain("Ctrl+y approves");
-    });
-
-    /** "Yank never approves" must not depend on typing fast. */
-    it.each(["u", "w", "k"])("Ctrl+%s, a 300 ms pause, then Ctrl+y is a yank: nothing approved; a second Ctrl+y approves", (letter) => {
-      const { container, box } = inInput(1);
-      fireEvent.change(box, { target: { value: "some words here" } });
-      box.setSelectionRange(15, 15);
-      fireEvent.keyDown(box, { key: letter, ctrlKey: true });
-      wait(300);
-      ctrlY(box);
-      wait(1000);
-      expect(answered()).toEqual([]);
-      expect(bandMessage(container)).toBe(YANK_FLASH);
-      ctrlY(box);
-      wait(TYPING_GUARD_MS);
-      expect(answered().map((m) => m.permission_id)).toEqual(["perm-1"]);
-    });
-
-    it("a kill, then another key, then a pause and Ctrl+y approves (only the key right before counts)", () => {
-      const { box } = inInput(1);
-      fireEvent.keyDown(box, { key: "u", ctrlKey: true });
-      wait(300);
-      fireEvent.keyDown(box, { key: "x" });
-      wait(300);
-      ctrlY(box);
-      wait(TYPING_GUARD_MS);
-      expect(answered().map((m) => m.permission_id)).toEqual(["perm-1"]);
-    });
-
-    /** Under Caps Lock GTK/WebKitGTK deliver Ctrl+y as key "Y" with Shift not held. */
-    it("Caps Lock: Ctrl+y arriving as key Y, no Shift, approves", () => {
-      const { box } = inInput(1);
-      ctrlY(box, { key: "Y" });
-      wait(TYPING_GUARD_MS);
-      expect(answered().map((m) => m.permission_id)).toEqual(["perm-1"]);
-    });
-
-    /** Re-check the target and context when the deferred answer fires. */
-    it("the session closing inside the window approves nothing", () => {
-      const { box } = inInput(1);
-      ctrlY(box);
-      wait(100);
-      dispatch({ kind: "events", tab: 1, fromRevision: 5, throughRevision: 6, events: [{ type: "session_closed", reason: "x" }] });
-      wait(1000);
-      expect(answered()).toEqual([]);
-    });
-
-    it("the card resolved by the provider and a new one arriving inside the window approves nothing", () => {
-      const { box } = inInput(1);
-      ctrlY(box);
-      wait(100);
-      dispatch({
-        kind: "events", tab: 1, fromRevision: 5, throughRevision: 7,
-        events: [
-          { type: "permission_resolved", permission_id: "perm-1", outcome: "denied" },
-          { type: "permission_requested", permission_id: "perm-3", tool_use_id: null, tool_name: "Bash", input: { command: "rm -rf /" } },
-        ],
-      });
-      wait(1000);
-      expect(answered()).toEqual([]);
-    });
-
-    it("leaving INPUT with a click inside the window approves nothing", () => {
-      const { container, box } = inInput(1);
-      ctrlY(box);
-      wait(100);
-      const row = container.querySelector<HTMLElement>(".row")!;
-      fireEvent.mouseDown(row);
-      act(() => root(container).focus());
-      fireEvent.click(row);
-      wait(1000);
-      expect(answered()).toEqual([]);
-    });
-  });
 });
 
-/** An ACP card Approve cannot answer: the agent offered an allow-once option, but the call was too large for the
- *  card to show whole, so Rust held it back (`inputCut`) and left only the reject. */
-function unapprovableAcpCard(): AgentDomainEvent[] {
-  const input = {
-    title: "Edit notes.txt",
-    inputCut: true,
-    options: [{ kind: "reject_once", name: "Reject" }],
-    diffs: [],
-    locations: [{ path: "/work/notes.txt" }],
-  };
-  return [
-    { type: "user_prompt_submitted", text: "edit it" },
-    { type: "turn_started", turn_id: "t1" },
-    { type: "tool_call_started", turn_id: "t1", tool_use_id: "c1", name: "acp:edit", input },
-    { type: "permission_requested", permission_id: "acp-1", tool_use_id: "c1", tool_name: "acp:edit", input },
-  ];
-}
-
-describe("a card Approve cannot answer: neither Ctrl+y nor a sends an approval", () => {
+/** A card Approve cannot answer, in card mode: its 1 says why and sends nothing; 2 still denies. */
+describe("a card Approve cannot answer", () => {
   beforeEach(() => {
-    vi.useFakeTimers();
+    vi.useFakeTimers({
+      toFake: [
+        "setTimeout", "clearTimeout", "setInterval", "clearInterval", "setImmediate", "clearImmediate", "Date", "performance",
+        "requestAnimationFrame", "cancelAnimationFrame",
+      ],
+    });
     widen = stubBandWidth();
   });
   afterEach(() => {
@@ -759,88 +449,21 @@ describe("a card Approve cannot answer: neither Ctrl+y nor a sends an approval",
     vi.unstubAllGlobals();
   });
 
-  it("the band does not offer Ctrl+y for it, and Ctrl+y flashes why and sends nothing", () => {
-    const { container } = started(1, [TAB1], unapprovableAcpCard());
-    wait(TYPING_GUARD_MS + 50);
-    fireEvent.keyDown(root(container), { key: "i" });
-    wait(TYPING_GUARD_MS + 50);
-    const box = textarea(container)!;
-    expect(bandText(container)).not.toContain("Ctrl+y approves");
-    expect(ctrlY(box)).toBe(false);
-    wait(1000);
-    expect(answered()).toEqual([]);
-    expect(bandMessage(container)).toContain("cannot be approved");
-  });
-
-  it("a on it flashes why and sends nothing; d still denies", () => {
-    const { container } = started(1, [TAB1], unapprovableAcpCard());
+  it("1 on it in card mode flashes why and sends nothing; 2 still denies; a answers nothing", () => {
+    const { container } = started(1, [TAB1], acpCard(false));
     wait(TYPING_GUARD_MS + 50);
     fireEvent.keyDown(root(container), { key: "a" });
     wait(1000);
     expect(answered()).toEqual([]);
+    fireEvent.keyDown(root(container), { key: "Enter" });
+    expect(container.querySelector(".permission-card-mode")).not.toBeNull();
+    wait(CARD_ARM_MS + 100);
+    fireEvent.keyDown(root(container), { key: "1" });
     expect(bandMessage(container)).toContain("cannot be approved");
-    wait(TYPING_GUARD_MS + 50);
-    fireEvent.keyDown(root(container), { key: "d" });
+    wait(1000);
+    expect(answered()).toEqual([]);
+    fireEvent.keyDown(root(container), { key: "2" });
     wait(1000);
     expect(answered()).toEqual([expect.objectContaining({ permission_id: "acp-1", decision: "deny" })]);
-  });
-});
-
-/** A card Eitri's own tool broker raised, as Rust serialises it. `seq` is where it sits among the conversation's rows. */
-function brokerCard(id: string, seq: number, toolUseId: string | null = null): EditorCardWire {
-  return {
-    id, seq, tool: "open_file", toolUseId, title: "Show /etc/hosts in your editor?",
-    body: [{ kind: "code", text: "/etc/hosts" }],
-  };
-}
-const EDITOR_CARD_FLASH = "Ctrl+y does not answer an editor card: Esc, then a or d on the card";
-const brokerAnswers = () => posted.filter((m) => m.type === "editor_card_answer");
-
-describe("a card of Eitri's own tool broker is never Ctrl+y's", () => {
-  beforeEach(() => {
-    vi.useFakeTimers();
-    widen = stubBandWidth();
-  });
-  afterEach(() => {
-    vi.useRealTimers();
-    vi.unstubAllGlobals();
-  });
-
-  it("ctrl_y_never_answers_an_editor_card", () => {
-    const { box } = inInput(0, [TAB1], [brokerCard("ec-0123456789abcdef-1", 1)]);
-    ctrlY(box);
-    wait(TYPING_GUARD_MS + 1000);
-    expect(brokerAnswers()).toEqual([]);
-    expect(answered()).toEqual([]);
-    // Neither does a second, after a pause.
-    ctrlY(box);
-    wait(TYPING_GUARD_MS + 1000);
-    expect(brokerAnswers()).toEqual([]);
-    expect(answered()).toEqual([]);
-  });
-
-  it("ctrl_y_skips_it_for_a_provider_card_behind_it", () => {
-    // The broker card is the older row (the lowest `seq`); the provider's card behind it is the one named.
-    const { container, box } = inInput(1, [TAB1], [brokerCard("ec-0123456789abcdef-1", 0)]);
-    expect(bandText(container)).toContain("Ctrl+y approves Bash: rm build");
-    ctrlY(box);
-    wait(TYPING_GUARD_MS);
-    expect(answered()).toEqual([expect.objectContaining({ permission_id: "perm-1", decision: "allow" })]);
-    expect(brokerAnswers()).toEqual([]);
-  });
-
-  it("ctrl_y_alone_with_an_editor_card_flashes", () => {
-    const { container, box } = inInput(0, [TAB1], [brokerCard("ec-0123456789abcdef-1", 1)]);
-    // The key is claimed: it neither yanks into the box nor answers anything.
-    expect(ctrlY(box)).toBe(false);
-    expect(bandMessage(container)).toBe(EDITOR_CARD_FLASH);
-    wait(TYPING_GUARD_MS + 1000);
-    expect(brokerAnswers()).toEqual([]);
-    expect(answered()).toEqual([]);
-  });
-
-  it("the_band_names_no_ctrl_y_for_an_editor_card", () => {
-    const { container } = inInput(0, [TAB1], [brokerCard("ec-0123456789abcdef-1", 1)]);
-    expect(bandText(container)).not.toContain("Ctrl+y");
   });
 });

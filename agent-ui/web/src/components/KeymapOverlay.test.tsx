@@ -3,7 +3,7 @@ import { StrictMode } from "react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { cleanup, fireEvent, render } from "@testing-library/react";
 import { KeymapOverlay } from "./KeymapOverlay";
-import { BROWSE_KEYS, CARET_KEYS, EMPTY_PANEL_TABLE, INPUT_KEYS, QUESTION_KEYS, REVIEW_KEYS, TASKS_KEYS, VISUAL_KEYS } from "../keymap";
+import { BROWSE_KEYS, CARD_KEYS, CARET_KEYS, EMPTY_PANEL_TABLE, INPUT_KEYS, QUESTION_KEYS, REVIEW_KEYS, TASKS_KEYS, VISUAL_KEYS } from "../keymap";
 import type { KeyHelp, PanelTable, PluginKeysHelp } from "../keymap";
 import { binding, TABLE } from "../testFixtures";
 import { listedSlashCommands } from "../slashCommands";
@@ -51,6 +51,7 @@ describe("KeymapOverlay", () => {
     const titles = Array.from(container.querySelectorAll("h2")).map((h) => h.textContent);
     expect(titles).toEqual([
       "This panel",
+      "Answering a card",
       "Selecting (v)",
       "Review (c)",
       "Leader and tab keys",
@@ -100,7 +101,7 @@ describe("KeymapOverlay", () => {
   it("lists every row it was given and every local row, none dropped", () => {
     const { container } = overlay();
     const text = container.textContent!;
-    for (const row of [...BROWSE_KEYS, ...CARET_KEYS, ...VISUAL_KEYS, ...REVIEW_KEYS, ...INPUT_KEYS, ...TASKS_KEYS, ...QUESTION_KEYS, ...WINDOW, ...PREFIX]) {
+    for (const row of [...BROWSE_KEYS, ...CARD_KEYS, ...CARET_KEYS, ...VISUAL_KEYS, ...REVIEW_KEYS, ...INPUT_KEYS, ...TASKS_KEYS, ...QUESTION_KEYS, ...WINDOW, ...PREFIX]) {
       expect(text).toContain(row.keys);
       expect(text).toContain(row.what);
     }
@@ -115,7 +116,7 @@ describe("KeymapOverlay", () => {
     // GTK-decided extra, since the region never reaches `shell`. "Review (c)" adds `REVIEW_KEYS.length`, and the
     // Claude tab's tasks list and question sections add theirs.
     expect(container.querySelectorAll("tr").length).toBe(
-      BROWSE_KEYS.length + 1 + CARET_KEYS.length + VISUAL_KEYS.length + REVIEW_KEYS.length + INPUT_KEYS.length + 4 +
+      BROWSE_KEYS.length + 1 + CARD_KEYS.length + CARET_KEYS.length + VISUAL_KEYS.length + REVIEW_KEYS.length + INPUT_KEYS.length + 4 +
         TASKS_KEYS.length + QUESTION_KEYS.length + WINDOW.length + PREFIX.length,
     );
   });
@@ -598,6 +599,27 @@ describe("KeymapOverlay opening position", () => {
     expect(scrollIntoView.mock.instances[0]).toBe(sectionTitled(container, "After Ctrl+b").querySelector("h2"));
     rerender(<KeymapOverlay {...props} startAt="prefix" startRequest={1} />);
     expect(scrollIntoView, "a re-render of the same request leaves the scroll alone").toHaveBeenCalledTimes(1);
+  });
+
+  it("F1 in card mode opens at the card-mode keys", () => {
+    const props = { onClose: () => {}, windowKeys: WINDOW, prefixKeys: PREFIX, prefixLabel: "Ctrl+b", panel: EMPTY_PANEL_TABLE };
+    const { container } = render(<KeymapOverlay {...props} openAt="card" startRequest={1} />, { wrapper: StrictMode });
+    expect(scrollIntoView).toHaveBeenCalledTimes(1);
+    expect(scrollIntoView.mock.instances[0]).toBe(sectionTitled(container, "Answering a card").querySelector("h2"));
+    expect(sectionTitled(container, "Answering a card").querySelectorAll("tr")).toHaveLength(CARD_KEYS.length);
+  });
+
+  it.each([
+    ["browse", "This panel"], ["input", "Typing"], ["selecting", "Selecting (v)"], ["question", "Claude's question"], ["card", "Answering a card"],
+  ] as const)("openAt=%s positions its heading once per request", (openAt, title) => {
+    const props = { onClose: () => {}, windowKeys: WINDOW, prefixKeys: PREFIX, prefixLabel: "Ctrl+b", panel: EMPTY_PANEL_TABLE };
+    const { container, rerender } = render(<KeymapOverlay {...props} openAt={openAt} startRequest={1} />, { wrapper: StrictMode });
+    expect(scrollIntoView).toHaveBeenCalledTimes(1);
+    expect(scrollIntoView.mock.instances[0]).toBe(sectionTitled(container, title).querySelector("h2"));
+    rerender(<KeymapOverlay {...props} openAt={openAt} startRequest={1} />);
+    expect(scrollIntoView).toHaveBeenCalledTimes(1);
+    rerender(<KeymapOverlay {...props} openAt={openAt} startRequest={2} />);
+    expect(scrollIntoView).toHaveBeenCalledTimes(2);
   });
 
   it("the_chats_own_question_opens_on_this_panel", () => {

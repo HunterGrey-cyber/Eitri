@@ -62,17 +62,17 @@ it("counts the queue, names the interrupt key, and names a card that waits", () 
   rerender(
     <ActivityLine state={running({ activeTurnId: "t1" })} turnClock={null} canInterrupt onInterrupt={onInterrupt} queued={0} pendingTool="Bash" mode="input" />,
   );
-  expect(container.querySelector(".activity-card")!.textContent).toBe("⚑ Bash needs approval — Esc, j to it, a / d alone");
+  expect(container.querySelector(".activity-card")!.textContent).toBe("⚑ Bash needs approval — Alt-n");
   expect(container.textContent).not.toContain("queued");
 });
 
-/** BROWSE answers `a`/`d` on the card; INPUT must leave the composer with `Esc` first. Defaults to BROWSE. */
-it("the card row says a / d alone in BROWSE, and defaults to it", () => {
+/** BROWSE points to Enter on the card; INPUT points to Alt-n. Defaults to BROWSE. */
+it("the card row names Enter in BROWSE, and defaults to it", () => {
   const onInterrupt = vi.fn();
   const { container } = render(
     <ActivityLine state={running({ activeTurnId: "t1" })} turnClock={null} canInterrupt onInterrupt={onInterrupt} pendingTool="Bash" />,
   );
-  expect(container.querySelector(".activity-card")!.textContent).toBe("⚑ Bash needs approval — j to it, a / d alone");
+  expect(container.querySelector(".activity-card")!.textContent).toBe("⚑ Bash needs approval — j to it, Enter");
 });
 
 /** A phase word beside a waiting card cuts off its approval keys at 520px, so the card owns the line. */
@@ -81,25 +81,24 @@ it("with a card waiting, the card is the line: no phase word or clock beside it"
     <ActivityLine state={running({ activeTurnId: "t1" })} turnClock={null} canInterrupt onInterrupt={vi.fn()} pendingTool="Write" />,
   );
   expect(container.querySelector(".turn-activity")).toBeNull();
-  expect(container.querySelector(".activity-card")!.textContent).toBe("⚑ Write needs approval — j to it, a / d alone");
+  expect(container.querySelector(".activity-card")!.textContent).toBe("⚑ Write needs approval — j to it, Enter");
   expect(container.querySelector("button.stop")).not.toBeNull();
 });
 
-/** The hint must name the cursor target and the `TYPING_GUARD_MS` pause: `a`/`d` only answer the card
- *  under the cursor, and a key too soon after `Esc` is still typing. */
-it("the hint names both the navigation key and the typing pause, in both modes", () => {
+/** Each hint names the card-mode entry available from its mode. */
+it("the hint names Enter on the card in BROWSE and Alt-n in INPUT", () => {
   const { container, rerender } = render(
     <ActivityLine state={running({ activeTurnId: "t1" })} turnClock={null} canInterrupt onInterrupt={vi.fn()} pendingTool="Bash" />,
   );
   const text = () => container.querySelector(".activity-card")!.textContent!;
   expect(text()).toContain("j to it");
-  expect(text()).toContain("alone");
+  expect(text()).toContain("Enter");
   rerender(
     <ActivityLine state={running({ activeTurnId: "t1" })} turnClock={null} canInterrupt onInterrupt={vi.fn()} pendingTool="Bash" mode="input" />,
   );
-  expect(text()).toContain("Esc");
-  expect(text()).toContain("j to it");
-  expect(text()).toContain("alone");
+  expect(text()).toContain("Alt-n");
+  expect(text()).not.toContain("Esc");
+  expect(text()).not.toContain("a / d");
 });
 
 /** The Stop button keeps its own interrupt text while a card owns the rest of the line. */
@@ -116,7 +115,7 @@ it("draws a hidden character in the waiting card's tool name as an escape", () =
   const { container } = render(
     <ActivityLine state={running({ activeTurnId: "t1" })} turnClock={null} canInterrupt onInterrupt={vi.fn()} pendingTool={"mcp__x__‮evil"} />,
   );
-  expect(container.querySelector(".activity-card")!.textContent).toBe("⚑ mcp__x__⟨U+202E⟩evil needs approval — j to it, a / d alone");
+  expect(container.querySelector(".activity-card")!.textContent).toBe("⚑ mcp__x__⟨U+202E⟩evil needs approval — j to it, Enter");
 });
 
 it("names a folded CLI turn's cause in the activity slot", () => {

@@ -10,6 +10,7 @@ import App from "./App";
 import { initialState } from "./reducer";
 import { EMPTY_PANEL_TABLE } from "./keymap";
 import { TYPING_GUARD_MS } from "./typingGuard";
+import { CARD_ARM_MS } from "./cardMode";
 import type { AgentDomainEvent, AgentUiState, Hello } from "./types";
 
 afterEach(cleanup);
@@ -25,7 +26,10 @@ beforeEach(() => {
   (window as unknown as { webkit: unknown }).webkit = {
     messageHandlers: { eitriAgent: { postMessage: (msg: string) => posted.push(JSON.parse(msg)) } },
   };
-  vi.useFakeTimers();
+  // Card mode arms from its paint, which the animation frames bring.
+  vi.useFakeTimers({
+    toFake: ["setTimeout", "clearTimeout", "setInterval", "clearInterval", "setImmediate", "clearImmediate", "Date", "performance", "requestAnimationFrame", "cancelAnimationFrame"],
+  });
   widen = stubBandWidth();
   Object.defineProperty(navigator, "clipboard", { value: { writeText: vi.fn() }, configurable: true });
 });
@@ -272,12 +276,15 @@ describe("while it is open it owns every key", () => {
     expect(container.querySelector('[data-testid="mode-block"]')!.textContent).toBe("BROWSE");
   });
 
-  it("the card is answered by a again once it is closed (the control for the test above)", () => {
+  it("the card is answered in card mode again once it is closed (the control for the test above)", () => {
     const rendered = started({ withCard: true });
     opened(rendered);
     press(rendered.container, "q");
     wait(TYPING_GUARD_MS + 50);
-    press(rendered.container, "a");
+    press(rendered.container, "n", { altKey: true, code: "KeyN" });
+    expect(rendered.container.querySelector(".permission-card-mode")).not.toBeNull();
+    wait(CARD_ARM_MS + 100);
+    press(rendered.container, "1");
     wait(TYPING_GUARD_MS + 50);
     expect(answered()).toEqual([expect.objectContaining({ permission_id: "perm-1", decision: "allow" })]);
   });

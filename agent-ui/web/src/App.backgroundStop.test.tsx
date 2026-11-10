@@ -328,9 +328,9 @@ describe("commands left running in the background", () => {
     expect(stops()).toEqual([]);
   });
 
-  it("the ? overlay lists the key", () => {
+  it("the F1 overlay lists the key", () => {
     const { container } = started(0);
-    fireEvent.keyDown(root(container), { key: "?", shiftKey: true });
+    fireEvent.keyDown(root(container), { key: "F1" });
     const overlay = container.querySelector(".keymap-overlay")!;
     expect(overlay.textContent).toContain("Space k");
     expect(overlay.textContent).toContain("stop background work");

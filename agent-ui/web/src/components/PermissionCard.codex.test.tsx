@@ -265,8 +265,11 @@ describe("the reason box", () => {
     const onAnswer = vi.fn();
     const { container } = card(requestOf("command"), onAnswer);
     const deny = Array.from(container.querySelectorAll("button")).find((b) => b.textContent === "Deny")!;
+    // `click()` is a click with `detail` 0, the kind Enter or Space synthesises on a focused button: it answers nothing.
     deny.click();
-    expect(onAnswer).toHaveBeenCalledWith("perm-command", "deny", undefined);
+    expect(onAnswer).not.toHaveBeenCalled();
+    deny.dispatchEvent(new MouseEvent("click", { bubbles: true, detail: 1 }));
+    expect(onAnswer).toHaveBeenCalledWith("perm-command", "deny", undefined, undefined, expect.anything());
   });
 });
 

@@ -1,6 +1,6 @@
 // @vitest-environment jsdom
 /**
- * The ? overlay's Shift+Tab row in the whole panel: it names the modes the active tab cycles through, so an
+ * The F1 overlay's Shift+Tab row in the whole panel: it names the modes the active tab cycles through, so an
  * ACP tab, which has no manual mode, is not told about one. `tabs.test.ts` covers the filter and
  * `KeymapOverlay.test.tsx` covers the prop; this is the wiring between them, at both places `App` draws the
  * overlay (over a conversation, and over a tab whose session has not started).
@@ -52,7 +52,7 @@ function cycleRow(agent: string, layout: Layout): string {
     dispatch({ kind: "tabs", active: 1, tabs: [tab(agent, "not_started")] });
   }
   if (layout === "conversation") {
-    fireEvent.keyDown(container.querySelector<HTMLElement>(".agent-ui-conversation")!, { key: "?", shiftKey: true });
+    fireEvent.keyDown(container.querySelector<HTMLElement>(".agent-ui-conversation")!, { key: "F1" });
   } else {
     // The start screen has no `?` binding of its own; Rust's `open_keymap` envelope is what opens it there.
     dispatch({ kind: "open_keymap" });
@@ -66,7 +66,7 @@ function cycleRow(agent: string, layout: Layout): string {
   return row!.textContent ?? "";
 }
 
-describe.each<Layout>(["conversation", "start screen"])("the ? overlay over a %s", (layout) => {
+describe.each<Layout>(["conversation", "start screen"])("the F1 overlay over a %s", (layout) => {
   it("does not mention manual on an ACP tab: it cycles auto → bypass", () => {
     const overlay = cycleRow("acp:x", layout);
     expect(overlay).toContain("Cycle auto → bypass");

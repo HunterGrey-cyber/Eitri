@@ -3102,23 +3102,9 @@ describe("the start screen's stage", () => {
   });
 });
 
-describe("the band's Ctrl+y segment", () => {
-  /* It names what the agent asked to run, in the agent's own text: right-to-left letters in it must not
-     reorder its words (`cp א ב` read as `cp ב א`) or the segments beside it. */
-  it("is drawn in storage order, left to right, and isolated", () => {
-    const rules = rulesMatching(withoutComments, ".band-approve").filter((rule) => rule.selector.trim() === ".band-approve");
-    expect(rules.length).toBe(1);
-    const body = rules[0].body;
-    expect(body).toMatch(/direction:\s*ltr\s*;/);
-    // The fallback first, the isolating override last, so an engine that knows it uses it.
-    const fallback = body.search(/unicode-bidi:\s*bidi-override\s*;/);
-    const isolating = body.search(/unicode-bidi:\s*isolate-override\s*;/);
-    expect(fallback).toBeGreaterThanOrEqual(0);
-    expect(isolating).toBeGreaterThan(fallback);
-    expect(body).not.toMatch(/unicode-bidi:\s*isolate\s*;/);
-  });
-
-  /* Task descriptions are the agent's commands: drawn in storage order like the band's approval segment. */
+describe("the agent's text in the band and its detail", () => {
+  /* Task descriptions are the agent's commands: drawn in storage order, so right-to-left letters in them cannot
+     reorder their words (`cp א ב` read as `cp ב א`). */
   it("draws the background-task rows in storage order with the override fallback first", () => {
     const rule = rulesMatching(withoutComments, ".tasks-detail").find((r) => r.selector.includes(".tasks-row"))!;
     expect(rule.body).toMatch(/direction:\s*ltr\s*;/);
@@ -3193,4 +3179,73 @@ it("isolates revealed question and subagent text and preserves their line breaks
     expect(block).toMatch(/unicode-bidi:\s*isolate\s*;/);
     expect(block).toMatch(/white-space:\s*pre-wrap\s*;/);
   }
+});
+
+/* Card mode's look: the accent ring on the card holding the keys, the digits on its answer buttons dim until card
+   mode is armed and lit once it is, and the highlight drawn as a focused control's ring. It changes colours, opacity
+   and outlines only, so it reads the same in every look that shares the panel's variables. */
+describe("card mode's look", () => {
+  const CARD = (cardClass: string, button = "") =>
+    `<div class="agent-ui-root"><div class="message-list"><div class="row-current"><div class="${cardClass}">` +
+    `<div class="permission-card-buttons">` +
+    `<button type="button" class="${button}"><kbd class="card-digit armed">1</kbd> Approve</button>` +
+    `<button type="button" class="${button}"><kbd class="card-digit">2</kbd> Deny</button>` +
+    `<button type="button" disabled><kbd class="card-digit armed">3</kbd> Always allow</button>` +
+    `</div></div></div></div></div>`;
+  const cardModeRules = () =>
+    splitRules(withoutComments).filter((r) => /permission-card-mode|card-digit|card-highlight/.test(r.selector));
+
+  it("draws no data-key badge: out of card mode the buttons show no key", () => {
+    expect(withoutComments).not.toMatch(/\[data-key\]/);
+    expect(withoutComments).not.toMatch(/attr\(data-key\)/);
+  });
+
+  it("changes no size: any radius or height in its rules is a shared variable with a fallback", () => {
+    const rules = cardModeRules();
+    expect(rules.length).toBeGreaterThanOrEqual(3);
+    for (const rule of rules) {
+      for (const raw of rule.declarations.split(";")) {
+        const m = raw.trim().match(/^([a-z-]+)\s*:\s*(.*)$/is);
+        if (m === null) continue;
+        expect(m[1], `${rule.selector}: ${m[1]}`).not.toMatch(/^(?:width|min-width|max-width|padding(?:-[a-z]+)?|margin(?:-[a-z]+)?|border-width)$/);
+        if (/radius|height/.test(m[1])) expect(m[2].trim(), `${rule.selector}: ${m[1]}`).toMatch(/^var\(--nv-[a-z-]+,\s*[^)]+\)$/);
+      }
+    }
+  });
+
+  it("rings the card holding the keys in the accent, over the current card's warning frame", () => {
+    const held = CARD("permission-card permission-card-mode");
+    expect(winningDeclaration(held, ".permission-card", "box-shadow")).toBe("0 0 0 1px var(--nv-focus-ring)");
+    expect(winningDeclaration(held, ".permission-card", "border-color")).toBe("var(--nv-focus-ring)");
+    expect(winningDeclaration(CARD("permission-card"), ".permission-card", "box-shadow")).toBe("0 0 0 1px var(--nv-warn)");
+  });
+
+  it("draws the digits dim until armed and lit once armed; a disabled button's digit stays dim", () => {
+    document.head.innerHTML = `<style>${css}</style>`;
+    document.body.innerHTML = CARD("permission-card permission-card-mode");
+    const [armed, unarmed, disabled] = Array.from(document.body.querySelectorAll(".card-digit"));
+    expect(winningDeclarationOn(armed, "opacity")).toBe("1");
+    expect(winningDeclarationOn(unarmed, "opacity")).toBe("0.45");
+    expect(winningDeclarationOn(disabled, "opacity")).toBe("0.45");
+    expect(winningDeclarationOn(armed, "font-family")).toBe("var(--nv-font-mono)");
+  });
+
+  it("rings the highlighted button as a focused control is ringed, Approve's solid face included", () => {
+    document.head.innerHTML = `<style>${css}</style>`;
+    document.body.innerHTML = CARD("permission-card permission-card-mode", "card-highlight");
+    const [approve, deny] = Array.from(document.body.querySelectorAll<HTMLButtonElement>(".permission-card-buttons button"));
+    for (const button of [approve, deny]) {
+      expect(winningDeclarationOn(button, "outline")).toBe("2px solid var(--nv-focus-ring)");
+      expect(winningDeclarationOn(button, "outline-offset")).toBe("3px");
+    }
+    // The highlight is a class, not focus: even a focused highlighted button keeps the ring over the global
+    // `button:focus` rule that turns outlines off.
+    deny.focus();
+    expect(winningDeclarationOn(deny, "outline")).toBe("2px solid var(--nv-focus-ring)");
+    // Without the class nothing is ringed.
+    document.body.innerHTML = CARD("permission-card permission-card-mode");
+    expect(winningDeclarationOn(document.body.querySelectorAll(".permission-card-buttons button")[1], "outline")).not.toBe(
+      "2px solid var(--nv-focus-ring)",
+    );
+  });
 });

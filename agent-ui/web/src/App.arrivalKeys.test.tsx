@@ -19,6 +19,7 @@ import App from "./App";
 import { initialState } from "./reducer";
 import type { AgentDomainEvent, AgentUiState, Hello, QuestionRecord } from "./types";
 import { TYPING_GUARD_MS } from "./typingGuard";
+import { CARD_ARM_MS } from "./cardMode";
 import { TABLE } from "./testFixtures";
 
 afterEach(cleanup);
@@ -232,8 +233,11 @@ describe("an arrival counts as a key for every answer path", () => {
     (window as unknown as { webkit: unknown }).webkit = {
       messageHandlers: { eitriAgent: { postMessage: (msg: string) => posted.push(JSON.parse(msg)) } },
     };
-    // `performance` moves with `Date`: the guards read both, as a page's do.
-    vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout", "setInterval", "clearInterval", "Date", "performance"] });
+    // `performance` moves with `Date`: the guards read both, as a page's do. Card mode arms from its paint, which
+    // the animation frames bring.
+    vi.useFakeTimers({
+      toFake: ["setTimeout", "clearTimeout", "setInterval", "clearInterval", "Date", "performance", "requestAnimationFrame", "cancelAnimationFrame"],
+    });
   });
   afterEach(() => {
     vi.useRealTimers();
@@ -312,6 +316,14 @@ describe("an arrival counts as a key for every answer path", () => {
 
   const onCard = (c: HTMLElement) => c.querySelector(".row-current")?.classList.contains("row-permission") === true;
   const answeredCards = () => posts("permission_response");
+  const inCardMode = (c: HTMLElement) => c.querySelector(".permission-card-mode") !== null;
+  /** Card mode on the cursor's card by a lone Enter, then, once armed, `1` and its after-half. */
+  function answerInCardMode() {
+    press("Enter");
+    wait(CARD_ARM_MS + 100);
+    press("1");
+    wait(TYPING_GUARD_MS + 20);
+  }
 
   describe.each(VIAS)("after %s", (via) => {
     it("an_answer_key_within_250ms_of_an_arrival_is_refused: a", () => {
@@ -325,12 +337,25 @@ describe("an arrival counts as a key for every answer path", () => {
       expect(answeredCards()).toEqual([]);
     });
 
+    it("an_answer_key_within_250ms_of_an_arrival_is_refused: Enter on the card row takes no card mode", () => {
+      const { container } = live();
+      away();
+      reveal(via);
+      expect(onCard(container)).toBe(true);
+      wait(100);
+      press("Enter");
+      expect(inCardMode(container)).toBe(false);
+      wait(1000);
+      expect(answeredCards()).toEqual([]);
+    });
+
     it("an_answer_key_within_250ms_of_an_arrival_is_refused: Enter on a card button", () => {
       const { container } = live();
       away();
       reveal(via);
       expect(onCard(container)).toBe(true);
-      press("l");
+      // A card button holds DOM focus only after a mouse press dragged off it; no key walks onto one.
+      act(() => container.querySelector<HTMLButtonElement>('.row-current [data-nav-action="allow"]')!.focus());
       wait(80);
       expect(here().textContent).toBe("Approve");
       press("Enter");
@@ -364,7 +389,7 @@ describe("an arrival counts as a key for every answer path", () => {
       expect(posts("trust_answer")).toEqual([]);
     });
 
-    it("an_answer_key_within_250ms_of_an_arrival_is_refused: Ctrl+y", () => {
+    it("Ctrl+y answers nothing, at an arrival or on its own a moment later", () => {
       const { container } = live();
       press("i", {}, root(container));
       wait(TYPING_GUARD_MS + 50);
@@ -373,10 +398,11 @@ describe("an arrival counts as a key for every answer path", () => {
       revealWithKeyFirst(via, () => press("y", { ctrlKey: true, code: "KeyY" }, here()));
       wait(1000);
       expect(answeredCards()).toEqual([]);
-      // A Ctrl+y on its own a moment later is taken: the arrival refused one key, it did not wedge the box.
-      press("y", { ctrlKey: true, code: "KeyY" }, here());
+      // Claimed on its own a moment later too (its flash is `App.inputCtrlY.test.tsx`'s), and still nothing answered.
+      expect(fireEvent.keyDown(here(), { key: "y", ctrlKey: true, code: "KeyY" })).toBe(false);
+      fireEvent.keyUp(here(), { key: "y", ctrlKey: true, code: "KeyY" });
       wait(1000);
-      expect(answeredCards()).toEqual([expect.objectContaining({ permission_id: "perm-1", decision: "allow" })]);
+      expect(answeredCards()).toEqual([]);
     });
 
     it("an_answer_key_within_250ms_of_an_arrival_is_refused: <leader>m", () => {
@@ -395,8 +421,7 @@ describe("an arrival counts as a key for every answer path", () => {
       away();
       reveal(via);
       wait(TYPING_GUARD_MS);
-      press("a");
-      wait(TYPING_GUARD_MS);
+      answerInCardMode();
       expect(answeredCards()).toEqual([expect.objectContaining({ permission_id: "perm-1", decision: "allow" })]);
       cleanup();
       posted = [];
@@ -457,8 +482,7 @@ describe("an arrival counts as a key for every answer path", () => {
     wait(1000);
     expect(answeredCards()).toEqual([]);
     wait(TYPING_GUARD_MS);
-    press("a");
-    wait(TYPING_GUARD_MS);
+    answerInCardMode();
     expect(answeredCards()).toHaveLength(1);
   });
 });

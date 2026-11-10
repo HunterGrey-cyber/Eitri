@@ -1,3 +1,5 @@
+import { back, emptyJumplist, forward, landingIndex, recordJump } from "./jumplist";
+import type { JumpPos, Jumplist } from "./jumplist";
 import { SessionEndedBanner } from "./components/SessionEndedBanner";
 import { TrustOverlay } from "./components/TrustOverlay";
 import {
@@ -6,35 +8,43 @@ import {
   useRevealCursorRow,
   useClampCursorOnScroll,
   useRideLastRow,
-  useWaitForCtrlYTarget,
   useEnterInput,
   useWatchFrozenSelection,
 } from "./app/panelEffects";
 import { statusWarning, contextFact } from "./app/status";
 import { TOOL_RESULT_SCROLL_STEP_PX, HINT_PENDING_TIMEOUT_MS, accumulateMotionCount, jumpTarget } from "./app/motion";
 import {
-  TYPING_FLASH,
-  COUNT_ANSWER_FLASH,
-  MODIFIED_ENTER_FLASH,
-  ENTER_LANDING_FLASH,
-  ENTER_ELSEWHERE_FLASH,
-  NO_CARD_FLASH,
-  CARD_ELSEWHERE_FLASH,
-  NO_WAITING_CARD_FLASH,
+  cardKeyGoneFlash,
+  cardJumpGoneFlash,
+  SHIFT_TAB_IN_CARD_FLASH,
+  cardArmingFlash,
+  heldCardChordFlash,
+  NO_OLDER_JUMP_FLASH,
+  NO_NEWER_JUMP_FLASH,
+  notAKeyHereFlash,
   STOP_TYPING_FLASH,
-  CTRL_Y_TYPING_FLASH,
-  CTRL_Y_TARGET_FLASH,
-  CTRL_Y_YANK_FLASH,
-  CTRL_Y_HELD_FLASH,
-  CTRL_Y_EDITOR_CARD_FLASH,
-  NOT_APPROVABLE_FLASH,
+  CTRL_Y_GONE_FLASH,
+  ANSWER_CANCELLED_FLASH,
+  NO_CARD_WAITING_FLASH,
+  QUESTION_WAITS_FLASH,
+  ENTER_ALONE_FLASH,
+  CARD_ANSWERED_ELSEWHERE_FLASH,
+  CARD_WITHDRAWN_FLASH,
+  COUNT_DROPPED_FLASH,
+  BROKER_NO_REASON_FLASH,
+  agentNoReasonFlash,
+  moreWaitingFlash,
+  pendingDroppedFlash,
   ESC_DOES_NOT_INTERRUPT_FLASH,
   NOTHING_IN_THE_BACKGROUND,
   CLAUDE_REPORTS_NO_BACKGROUND,
   nothingToStopWords,
   stopBackgroundQuestion,
+  REASON_ENTER_OUTSIDE_FLASH,
+  ANSWER_INTERRUPTED_FLASH,
+  CARD_CHANGED_FLASH,
 } from "./app/flashes";
-import { isEditableElement, isComposerBox, isKillKey, CANCELS_WAITING_ANSWER, caretRectMissing } from "./app/elements";
+import { isEditableElement, CANCELS_WAITING_ANSWER, caretRectMissing } from "./app/elements";
 import type { SlashPickerState, SettingsRequest, SettingsAnswer } from "./app/elements";
 import {
   scrollVisibleRowBox,
@@ -63,12 +73,26 @@ import {
   settleListScroll,
 } from "./jkScroll";
 import { cancelHold, isHolding, keepHoldAlive, releaseHold, startHold } from "./jkHold";
-import { isPlainAnswerKey, panelEntryKey, pluginKeysHelp, resolveKey } from "./keymap";
+import { cardModeDelta, isPlainAnswerKey, panelEntryKey, pluginKeysHelp, resolveKey } from "./keymap";
 import type { KeyLike, PanelBinding, PanelMode, PendingPrefix, PluginKeysHelp } from "./keymap";
 import { advanceSequence, boxEntries, FIXED_PENDING_ENTRIES, sequenceTitle, startSequence, WHICH_KEY_DELAY_MS } from "./leader";
 import type { BoxEntry, SeqStep } from "./leader";
 import { isImeKey } from "./composerKeys";
 import { afterPaint } from "./afterPaint";
+import {
+  ANSWERS_PLAIN,
+  ANSWERS_WITH_RULE,
+  CARD_ARM_MS,
+  cardKey,
+  enterCardMode,
+  isArmed,
+  keyAnswerProof,
+  proofAnswers,
+  keyCancelsAnswer,
+  noteArrival as noteCardArrival,
+  notePaint,
+} from "./cardMode";
+import type { CardKey, CardModeState, CardOffer, CardOrigin, CardRef, KeyAnswerProof, PointerAnswerProof } from "./cardMode";
 import { bypassYesCounts, isModeCycleKey, isShiftTab, KeyClock, modeFixedMessage, modeKeyRoute } from "./modeKey";
 import { heldKeyName, hintTypingFlash, isModifierKey, leaderTypingFlash, tableKeyTypingFlash, TYPE_HINT_FLASH, TYPING_GUARD_MS, TypingGuard } from "./typingGuard";
 import {
@@ -89,7 +113,7 @@ import { installCtrlBracketAsEscape } from "./ctrlBracket";
 import { installHeldSuperTracking } from "./heldSuper";
 import { WhichKeyBox } from "./components/WhichKeyBox";
 import { TurnChanges } from "./components/TurnChanges";
-import { allCards, buildTimeline, oldestPendingPermission, oldestWaitingPermission, promptIndex, waitingCardAfter } from "./timeline";
+import { allCards, buildTimeline, oldestPendingPermission, promptIndex, waitingCardAfter } from "./timeline";
 import { buildDisplay, indexOfKey, runKeyOf } from "./display";
 import { outputText, primaryText } from "./copyText";
 import { codeBlockText, renderedText } from "./markdown";
@@ -184,17 +208,35 @@ import type { SlashAction } from "./slashCommands";
 import { barePickerCommand, completionSource, settingCommand } from "./slashCommands";
 import { EFFORT_FROM_SETTINGS, effortPicker, modelPicker, parseEffortReply, parseModelReply, settingsChangedWords } from "./slashPicker";
 import { DRAFT_MIRROR_DELAY_MS, modePill, REFUSED_ECHO_MS, showTabBar } from "./tabs";
-import { cardSummary, liveTasks, shortModel, usageSegment } from "./band";
+import { liveTasks, shortModel, usageSegment } from "./band";
 import { NOTHING_TO_STOP, STOP_TURN_QUESTION, stopAskFor, stopTurnAnswer, workToStop, type StopWork } from "./stopAsk";
 import { latestTurnEnding } from "./turnEnding";
-import type { ApproveFact } from "./band";
-import type { DetailRow, TabId, TabsEnvelope } from "./types";
+import type { DetailRow, PermissionRequestRecord, TabId, TabsEnvelope } from "./types";
 import { applyTheme } from "./theme";
 import { applyEditorTyping } from "./typingCadence";
 import { copyToPrimary } from "./primaryCopy";
 
 /** The band's transient line (`showFlash`). */
 type FlashLine = { text: string; seq: number; look?: string; path?: string; toPrompt?: boolean };
+
+/** The keydowns the document listener replayed on the root after a focus loss (`onDocumentKeyDown`): card mode
+ *  refuses them, since a key stamped at its replay is not a fresh press. */
+const REPLAYED_KEYS = new WeakSet<Event>();
+/** The keydowns card mode let through into its open reason field as text: the root's own `onKeyDown` leaves them
+ *  alone, so they are neither recorded twice nor read as panel keys (`Ctrl+c` there interrupts nothing). */
+const TYPED_IN_CARD_MODE = new WeakSet<Event>();
+
+/** Whether two offers of the same card answer alike: the same answers in the same places, approvable alike, a reason
+ *  alike, and the same saved rule word for word (a rule Rust replaced is not the one the person read). */
+function sameOffer(a: CardOffer, b: CardOffer): boolean {
+  return (
+    a.answers.length === b.answers.length &&
+    a.answers.every((answer, i) => answer.kind === b.answers[i].kind) &&
+    a.approvable === b.approvable &&
+    a.takesReason === b.takesReason &&
+    (a.rule ?? null) === (b.rule ?? null)
+  );
+}
 
 export default function App() {
   /** Everything the envelope router decides (`./page_model`). `pageRef` is the latest model, written
@@ -492,40 +534,33 @@ export default function App() {
    *  with `""` after a send. */
   const draftRef = useRef("");
   /** The cards this tab has answered from this panel, by `permissionId`,
-   *  whichever way -- a card's own button or `a`/`d`. This is the card's old `answered` guard lifted
-   *  out of `PermissionCard`, because `a`/`d` no longer press the card's button (a DOM query for it
-   *  could find a button a model reply drew): they call `answerPermission` with the card's id, and
+   *  whichever way -- a card's own button or card mode's keys. This is the card's `answered` guard lifted
+   *  out of `PermissionCard`, because card mode never presses the card's button (a DOM query for it
+   *  could find a button a model reply drew): it calls `answerPermission` with the card's id, and
    *  the double-answer protection has to hold on that path too. `answeredRef` is the same set,
-   *  current between renders, for the check `answerPermission` makes and for a wait `a`/`d` are
-   *  still in. Tab-scoped like `ruleOffers`: reset on a switch, and an id leaves it once its card
+   *  current between renders, for the check `answerPermission` makes and for an answer still in its
+   *  after-half. Tab-scoped like `ruleOffers`: reset on a switch, and an id leaves it once its card
    *  is no longer pending (the effect after `answerableItems`). */
   const [answeredPermissions, setAnsweredPermissions] = useState<ReadonlySet<string>>(() => new Set());
   const answeredRef = useRef<ReadonlySet<string>>(answeredPermissions);
-  /** The card INPUT's `Ctrl+y` would approve, as `<tab>:<permission id>`,
-   *  and whether it has been that card for `TYPING_GUARD_MS` (the layout effect after
-   *  `ctrlYTargetKey`). */
-  const ctrlYTargetRef = useRef<{ key: string | null; settled: boolean }>({ key: null, settled: false });
-  /** Whether the last non-modifier key the panel saw was a kill in the
-   *  composer (`isKillKey`), so a `Ctrl+y` after it is readline's yank whatever the pause. */
-  const lastKeyWasKillRef = useRef(false);
-  /** Whether the composer's own textarea has focus -- what the band's
-   *  `Ctrl+y` segment and `approveOldestByKey` both require. Followed through `focusin`/`focusout`. */
-  const [composerBoxFocused, setComposerBoxFocused] = useState(false);
-  useEffect(() => {
-    const onIn = (event: FocusEvent) => setComposerBoxFocused(isComposerBox(event.target) || (event.target instanceof Element && event.target.closest(".question-dock") !== null));
-    const onOut = (event: FocusEvent) => setComposerBoxFocused(isComposerBox(event.relatedTarget) || (event.relatedTarget instanceof Element && event.relatedTarget.closest(".question-dock") !== null));
-    document.addEventListener("focusin", onIn);
-    document.addEventListener("focusout", onOut);
-    setComposerBoxFocused(isComposerBox(document.activeElement));
-    return () => {
-      document.removeEventListener("focusin", onIn);
-      document.removeEventListener("focusout", onOut);
-    };
-  }, []);
-  /** The reason typed so far into each pending card's box, reported by the card as it changes, so
-   *  `d` sends it exactly as the card's own Deny does. A ref, not state: typing in the
-   *  box must not re-render the whole panel. */
-  const permissionReasons = useRef(new Map<string, string>());
+  /** Card mode (`./cardMode`): the one state in which a key answers a card. `cardModeRef` is the machine's state now,
+   *  written with the render state in one call (`setCardMode`), so the listeners installed once and the answer's own
+   *  timer read what the last key left; `cardMode` is what the page draws. `null` while no card holds it. */
+  const cardModeRef = useRef<CardModeState | null>(null);
+  const [cardMode, setCardModeState] = useState<CardModeState | null>(null);
+  function setCardMode(next: CardModeState | null) {
+    cardModeRef.current = next;
+    setCardModeState(next);
+  }
+  /** Counts entries into card mode (a change of card is one too), so the paint that drew an entry is the one
+   *  reported for it (`notePaint`) and no later one. */
+  const cardEntrySeqRef = useRef(0);
+  const [cardEntry, setCardEntry] = useState(0);
+  /** The cursor's row index when card mode was entered, for going back to a row that is gone by then. */
+  const cardOriginIndexRef = useRef(0);
+  /** How the card holding card mode was resolved by the host, when an `events` envelope said so: answered (allowed
+   *  or denied, from another device or a click) or withdrawn (an interrupt, the session closing, an expiry). */
+  const cardResolvedRef = useRef<{ permissionId: string; answered: boolean } | null>(null);
   // Companion mode: where the panel stands with the editor beside it. `null` is the one-window mode,
   // where Rust never sends one.
   /** The unread pill, reported up by `MessageList` rather than floated over
@@ -627,7 +662,7 @@ export default function App() {
   }, [activeTab?.id, state.notification]);
   useEffect(() => { setTasksOpen(false); }, [activeTab?.id]);
   // Whether Super is held, from its own keydown/keyup: WebKitGTK reports it on no other key's event,
-  // and `isPlainAnswerKey` reads this for `a`/`d`/`D` and the bypass `y` (heldSuper.ts). The first
+  // and `isPlainAnswerKey` reads this for the plain-key checks and the bypass `y` (heldSuper.ts). The first
   // effect in this component, so its window-capture listener runs before HINT's, which stops keys.
   // `Ctrl+[` is Esc everywhere in the panel (ctrlBracket.ts). Its document-capture listener is
   // registered here too, so it runs ahead of `onModeKey`'s below and every handler reads a plain
@@ -738,9 +773,38 @@ export default function App() {
   /** Whether the last `j` moved, so the first repeat of a held `j` that then stops at the last
    *  stop still flashes once (seen in a GUI pass, 2026-09-27) -- see the move branch of `onKeyDown`. */
   const heldMoveRef = useRef(false);
-  /** The open `/` prompt and where the cursor was when it opened; `lastSearchRef` is what `n`/`N` repeat. */
-  const [search, setSearch] = useState<{ query: string; origin: number } | null>(null);
-  const lastSearchRef = useRef("");
+  /** The open `/` or `?` prompt and where the cursor was when it opened; `lastSearchRef` is what `n`/`N` repeat. */
+  const [search, setSearch] = useState<{ query: string; origin: number; dir: 1 | -1 } | null>(null);
+  const lastSearchRef = useRef<{ query: string; dir: 1 | -1 }>({ query: "", dir: 1 });
+  const jumplistsRef = useRef(new Map<TabId, Jumplist>());
+  const searchOriginRef = useRef<JumpPos | null>(null);
+
+  function jumpPosition(index = cursorRef.current): JumpPos | null {
+    const item = timelineRef.current[index];
+    if (item === undefined) return null;
+    const list = containerRef.current?.querySelector<HTMLElement>(".message-list");
+    const row = list ? conversationRows(list)[index] : undefined;
+    return {
+      key: item.key,
+      index,
+      offset: list && row ? list.getBoundingClientRect().top - row.getBoundingClientRect().top : 0,
+    };
+  }
+
+  /** Record the departure before a jump; previews pass the position captured when their prompt opened. */
+  function noteJump(from = jumpPosition()) {
+    const tab = activeTabRef.current;
+    if (tab !== null && from !== null) {
+      jumplistsRef.current.set(tab, recordJump(jumplistsRef.current.get(tab) ?? emptyJumplist(), from));
+    }
+  }
+
+  function openSearch(origin: number, dir: 1 | -1) {
+    searchOriginRef.current = jumpPosition(origin);
+    setExLine(null);
+    setSearch({ query: "", origin, dir });
+    setLineFocusRequest((n) => n + 1);
+  }
   /** The open `:` command line's text, or `null` while it is closed. It runs no
    *  command: it exists so `:ls⏎`-style keys land in a box instead of on a card. Closed wherever the
    *  `/` prompt is, and for the same reasons -- an overlay that hands the keys to the root when it
@@ -909,14 +973,10 @@ export default function App() {
         break;
       case "panel.search":
         // One command line, as in vim -- the `/` prompt replaces an open `:` line.
-        setExLine(null);
-        setSearch({ query: "", origin: cursor });
-        setLineFocusRequest((n) => n + 1);
+        openSearch(cursor, 1);
         break;
       case "panel.keymap":
-        keymapOpening.current = null;
-        keymapClosedByKey.current = false;
-        setKeymapOpen(true);
+        openKeymap("browse");
         break;
       case "panel.handoff": {
         // Only a Claude session can be taken into a terminal `claude`; another agent's tab says so
@@ -996,6 +1056,15 @@ export default function App() {
    *  `resolveKey` at all) and by the handful of places that must force it shut: the session ending,
    *  the start screen coming back, and a HINT starting elsewhere in the window. */
   const [keymapOpen, setKeymapOpen] = useState(false);
+  const [keymapSection, setKeymapSection] = useState<"browse" | "input" | "selecting" | "question" | "card">("browse");
+  function openKeymap(section: typeof keymapSection) {
+    keymapOpening.current = null;
+    keymapClosedByKey.current = false;
+    setKeymapPlugin(null);
+    setKeymapSection(section);
+    setKeymapRequest((n) => n + 1);
+    setKeymapOpen(true);
+  }
   /** The number `prefix ?` gave the opening that is showing (`open_keymap`'s `opening`), or `null` when the
    *  panel's own `?` opened it: only the former reports its close to Rust, which may give the keys back. */
   const keymapOpening = useRef<number | null>(null);
@@ -1116,9 +1185,7 @@ export default function App() {
         openTasksOverlay(action.workflows);
         break;
       case "keymap":
-        keymapOpening.current = null;
-        keymapClosedByKey.current = false;
-        setKeymapOpen(true);
+        openKeymap("input");
         break;
       case "tab-info":
         postToRust({ type: "tab_verb", request_id: nextRequestId(), verb: "info" });
@@ -1433,13 +1500,21 @@ export default function App() {
   const keyClockRef = useRef(new KeyClock());
   /** A reveal gave this page the keys (`arrive`, `focus_permission`), from a key or click made somewhere else
    *  while the person may still be typing: the arrival counts as a key, now, for every guard that answers. The
-   *  typing guard records it on the keydowns' clock (card keys, `Ctrl+y`, the leader, INPUT entry); the y/n
+   *  typing guard records it on the keydowns' clock (card keys, the leader, INPUT entry); the y/n
    *  questions' guard (`bypassYesCounts`) takes it as the last key; the question dock starts a run from it
    *  (`arrivalRunRef`). It only refuses: whatever waits keeps waiting for a key on its own. */
   function noteArrival() {
-    typingGuard.noteArrival(typingGuard.clockNow());
+    const at = typingGuard.clockNow();
+    typingGuard.noteArrival(at);
     currentKeyAtRef.current = Math.max(currentKeyAtRef.current, performance.now());
     arrivalRunRef.current = true;
+    // Card mode stays through an arrival on its own tab and arms again from it, so a digit the person was still
+    // pressing as the page came forward answers nothing, and one in its after-half loses its proof.
+    const held = cardModeRef.current;
+    if (held !== null && held.card.tab === activeTabRef.current) {
+      setCardMode(noteCardArrival(held, at));
+      if (held.answering !== null) cancelCardAnswer(at, ANSWER_INTERRUPTED_FLASH);
+    }
   }
   /** The key `answerConfirm` last consumed from a y/n
    *  prompt -- answered or cancelled, either way -- so its own auto-repeats can be swallowed rather
@@ -1569,14 +1644,13 @@ export default function App() {
       ),
     [timeline],
   );
-  /* An answered card leaves `answeredPermissions` (and its typed reason `permissionReasons`) once it
+  /* An answered card leaves `answeredPermissions` once it
      is no longer pending: nothing can answer it any more, and an id the provider hands out again
-     later names a new card. `state` is always the active tab's (a switch resets it, and both of
-     these, in the same dispatch), so this never drops another tab's entry. */
+     later names a new card. `state` is always the active tab's (a switch resets it, and this
+     set, in the same dispatch), so this never drops another tab's entry. */
   const { pendingPermissions: heldCards, editorCards: heldEditorCards } = state;
   useEffect(() => {
     const pending = new Set(allCards({ pendingPermissions: heldCards, editorCards: heldEditorCards }).map((p) => p.permissionId));
-    for (const id of permissionReasons.current.keys()) if (!pending.has(id)) permissionReasons.current.delete(id);
     const kept = new Set([...answeredRef.current].filter((id) => pending.has(id)));
     for (const record of pageRef.current.inFlight.values()) {
       if (record.kind === "permission" && record.tab === activeTabRef.current && record.permissionId && pending.has(record.permissionId)) kept.add(record.permissionId);
@@ -1585,8 +1659,8 @@ export default function App() {
     answeredRef.current = kept;
     setAnsweredPermissions(answeredRef.current);
   }, [heldCards, heldEditorCards]);
-  /** The typing guard (`./typingGuard`): every keydown `onKeyDown` sees is fed to it first; `a`/`d`/
-   *  `D` wait `TYPING_GUARD_MS` through it, and Enter on a card button asks it. One per panel, kept
+  /** The typing guard (`./typingGuard`): every keydown `onKeyDown` sees is fed to it first; a card-mode answer
+   *  waits its after-half (`TYPING_GUARD_MS`) through it. One per panel, kept
    *  across renders (the dispatch below is installed once and reads this same instance). */
   const [typingGuard] = useState(() => new TypingGuard());
   /* An overlay drawn over the conversation takes the keys from the card a waiting answer was aimed
@@ -1610,7 +1684,7 @@ export default function App() {
   }, [remoteDesk]);
   const remoteCovered =
     overlayOpen || keymapOpen || detail !== null || handoffOpen || pathPick !== null || linkPick !== null || confirm !== null;
-  // Releases, for an answer that waits for its key to be let go (`approveOldestByKey`). Capture
+  // Releases, for a key that waits for its own release (`TypingGuard.deferUntilReleased`: `j` into the box). Capture
   // phase on the window, so a keyup another handler stops from bubbling still arrives.
   useEffect(() => {
     function released(event: globalThis.KeyboardEvent) {
@@ -1709,7 +1783,7 @@ export default function App() {
    *  into INPUT and back.
    *
    *  Gated on the same condition as `onKeyDown` below: if something else in this subtree -- a
-   *  permission card's deny-reason box, today -- legitimately holds focus, this must NOT yank it
+   *  permission card's reason box, today -- legitimately holds focus, this must NOT yank it
    *  back. Found in review: clicking that box blurs the composer's textarea, `onModeChange`
    *  reports BROWSE, and an ungated version of this effect then stole focus away from the box the
    *  click had just placed it in, so the click landed nowhere. */
@@ -1757,7 +1831,7 @@ export default function App() {
     if (containerRef.current !== null) {
       // A `pane_focus true` that follows a click on Approve, or a HINT landing on a control, must
       // not steal the keys back from it -- `document.activeElement` already being inside the root
-      // (a permission card's own deny-reason box included) means somewhere in here legitimately
+      // (a permission card's own reason box included) means somewhere in here legitimately
       // holds them already (regression guard, test h).
       const root = containerRef.current;
       const active = document.activeElement;
@@ -1802,6 +1876,18 @@ export default function App() {
         arrivalRunRef.current = arrivalRunRef.current && currentKeyAtRef.current - lastKeyAtRef.current < TYPING_GUARD_MS;
       }
       if (!isModeCycleKey(event)) return;
+      // Card mode refuses Shift+Tab before the mode cycle: a mode switch would answer cards of its own (bypass
+      // approves every card waiting). Claimed, recorded as a key, and card mode arms again from it.
+      const heldCard = cardModeRef.current;
+      if (heldCard !== null) {
+        event.preventDefault();
+        event.stopPropagation();
+        const at = typingGuard.timeOf(event);
+        const cancelledByTab = typingGuard.onKey("Tab", at);
+        setCardMode(keyCancelsAnswer(heldCard, at));
+        showFlash(cancelledByTab ?? SHIFT_TAB_IN_CARD_FLASH);
+        return;
+      }
       if (event.target instanceof Element && event.target.closest(".question-dock")) return;
       event.preventDefault();
       // Shift+Tab does nothing while CARET/VISUAL/V-LINE is on -- its y/n
@@ -1918,6 +2004,8 @@ export default function App() {
         bubbles: true,
         cancelable: true,
       });
+      // Marked, so card mode refuses it: its stamp is now, not when the key was pressed.
+      REPLAYED_KEYS.add(replay);
       if (!root.dispatchEvent(replay)) event.preventDefault();
     }
     document.addEventListener("keydown", onDocumentKeyDown);
@@ -2016,35 +2104,6 @@ export default function App() {
     }
   }, [scratchEditing, paneFocused, overlayOpen, keymapOpen, detail, handoffOpen, confirm,
     sessionStarted, sessionEnded, activeTab?.state, questionIdentity]);
-  /** The card INPUT's `Ctrl+y` would approve right now -- the active tab's oldest
-   *  waiting card (`approveOldestByKey` picks the same one) -- for the band to name, only while the
-   *  composer has the keys (INPUT, this pane focused) on a live session. `null` otherwise. */
-  const ctrlYCard: ApproveFact | null = (() => {
-    // Only while the composer's own box holds the keys -- the same
-    // condition `approveOldestByKey` answers under, so the band never names a Ctrl+y that does
-    // nothing (the `Ctrl+r` search field).
-    if (mode !== "input" || !paneFocused || sessionEnded || !composerBoxFocused) return null;
-    const index = oldestWaitingPermission(timeline, answeredPermissions);
-    const item = index === null ? undefined : timeline[index];
-    // A card Approve cannot answer is not named: `Ctrl+y` would only flash that it cannot.
-    return item?.kind === "permission" && cardApprovable(item.request)
-      ? { tool: item.request.toolName, summary: cardSummary(item.request.input) }
-      : null;
-  })();
-  /** Which card INPUT's `Ctrl+y` would approve (its tab and id), and
-   *  whether it has been that card for `TYPING_GUARD_MS` yet. Without this a `Ctrl+y` approved
-   *  whatever was oldest at keydown however recently it had become the target: a second `Ctrl+y`
-   *  10 ms after the band moved on to the next card, a card that replaced a withdrawn one, one that
-   *  arrived 30 ms before a `Ctrl+y` meant as something else. Every change of target -- an arrival,
-   *  a withdrawal, a tab switch, this panel's own approval moving it on -- starts the wait again. A
-   *  timer, as `TypingGuard.defer` uses; no new clock. */
-  const ctrlYTargetKey: string | null = (() => {
-    if (sessionEnded) return null;
-    const index = oldestWaitingPermission(timeline, answeredPermissions);
-    const item = index === null ? undefined : timeline[index];
-    return item?.kind === "permission" ? `${activeTabRef.current}:${item.request.permissionId}` : null;
-  })();
-  useWaitForCtrlYTarget(ctrlYTargetRef, ctrlYTargetKey);
   /* INPUT on a dead session was a one-way trap, and the panel's own banners promised otherwise.
      The composer's textarea is `disabled` once the session ends, so `autoFocus` does nothing and
      focus stays on the root -- keys still ARRIVE, they are just dropped: `resolveKey`'s "input"
@@ -2107,6 +2166,9 @@ export default function App() {
     const atKey = landingAtKeyRef.current;
     landingAtKeyRef.current = null;
     if (atKey !== null && atKey !== typingGuard.keyCount()) return;
+    // Card mode keeps the keys through an arrival on its tab (it armed again from it, `noteArrival`): no landing
+    // takes them, or moves the cursor under it.
+    if (cardModeRef.current !== null) return;
     // An arrival (a tab switch,
     // `Ctrl+h`/`Ctrl+l`) used to write `mode`/`cursor` directly below without ever calling
     // `exitRegion`, so `frozenSnapshot` -- and the row VISUAL was looking at in the OLD tab -- stayed
@@ -2178,7 +2240,7 @@ export default function App() {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [stopAskRequest]);
   /* `focus_permission`: BROWSE, with the cursor on the oldest pending card, so
-     `a`/`d` answer it at once. `shell` sends it only when it counts a card; if the card was answered
+     Enter there is card mode for it. `shell` sends it only when it counts a card; if the card was answered
      in between, there is nothing to land on, and the arrival is an ordinary keyboard one -- the
      composer, as `enter_input` gives it. Keyed on the request alone, like `inputRequest`. */
   useEffect(() => {
@@ -2189,6 +2251,8 @@ export default function App() {
     const atKey = landingAtKeyRef.current;
     landingAtKeyRef.current = null;
     if (atKey !== null && atKey !== typingGuard.keyCount()) return;
+    // As in the `arrive` effect: card mode keeps the keys, and never moves on to another card.
+    if (cardModeRef.current !== null) return;
     // Same reasoning as `arrive`'s
     // own `exitRegion` call just above -- this lands the cursor on a specific card below, directly,
     // and a frozen VISUAL snapshot from a moment ago must not keep showing something else while that
@@ -2383,23 +2447,6 @@ export default function App() {
   useEffect(() => {
     landedControlRef.current = null;
   });
-  /** Where focus was actually put by a key -- an `h`/`l` that moved it, a plain Tab
-   *  -- or by a HINT landing, and the `typingGuard.keyCount()` it happened at (a key's own count; a
-   *  HINT's labels never reach this page, so the count at the landing). Enter on a card's own button
-   *  presses it only when this names that very button at the key right before Enter. Written where
-   *  focus moves (`onKeyDown`'s `control` branch, the root's `onFocus`, `landOnHint`), never inferred
-   *  from a key's name, and never cleared: any later key makes it stale by its count alone. A ref,
-   *  not `landedControlRef` (which every commit clears): `landOnHint` runs from the dispatch
-   *  installed once. */
-  const placedRef = useRef<{ el: HTMLElement; atKey: number } | null>(null);
-  /** The plain Tab `onKeyDown` saw last -- its `keyCount()` and its native event -- until the
-   *  focus move it makes, else `null`. The root's `onFocus` records that move as a landing, and
-   *  consumes this either way. Only if the Tab's default is still alive when the
-   *  focus arrives, read off the event then rather than at the top of `onKeyDown` -- by then every
-   *  handler has run, so a Tab one of them swallowed (the `/` or `:` line's, the cancel after a
-   *  waiting prefix, a key the leader's sequence does not bind, an overlay's) moved nothing, and the
-   *  next focus no key made is not its landing. */
-  const tabAtKeyRef = useRef<{ atKey: number; event: globalThis.KeyboardEvent } | null>(null);
 
   /** Set from this panel posting `hint_request` until the HINT it asked for ends here (`endHint`,
    *  which every `hint_end` and `hint_land` reaches), or the timer that gives up waiting fires.
@@ -2484,7 +2531,7 @@ export default function App() {
         pageRef.current.state.pendingPermissions.length === 0 && pageRef.current.state.editorCards.length === 0;
       if (((payload.kind === "arrive" && payload.intent !== "stop") || questionReturn) && edit?.finished && edit.tab === activeTabRef.current) {
         // The landing is the edit's own and is not drawn, but it is still an arrival: a key the person was still
-        // pressing as the keys came back answers nothing (INPUT's `Ctrl+y`, the question dock), as after any other.
+        // pressing as the keys came back answers nothing (the question dock, a card key), as after any other.
         noteArrival();
         edit.landingHandled = true;
         if (edit.resumed) editReturnRef.current = null;
@@ -2547,10 +2594,18 @@ export default function App() {
           payload.kind === "hint_collect" || payload.kind === "enter_input" || payload.kind === "focus_permission") {
         pathChoicesCoveredRef.current = true;
       }
-      // A waiting `a`/`d`/`D` was aimed at a card these envelopes take the keys or the view from. Cancelled here,
+      // A waiting action (a card-mode answer in its after-half among them) was aimed at what these envelopes take the
+      // keys or the view from. Cancelled here,
       // in the same task as the envelope, so its timer can never come due in between and answer a card that is
       // no longer the one in front of the user.
-      if (nextPage.answerEpoch !== previousPage.answerEpoch) typingGuard.cancel();
+      if (nextPage.answerEpoch !== previousPage.answerEpoch) {
+        typingGuard.cancel();
+        const held = cardModeRef.current;
+        // A switch away from the card's tab ends card mode quietly: the cancelled answer belongs to the tab left
+        // behind, and the new tab's band has nothing to say about it.
+        if (held !== null && held.card.tab !== (nextPage.tabs?.active ?? null)) endCardMode();
+        else if (held?.answering != null) cancelCardAnswer(typingGuard.clockNow(), ANSWER_INTERRUPTED_FLASH);
+      }
       if (CANCELS_WAITING_ANSWER.has(payload.kind)) {
         // A held `j`/`k`'s glide stops where it is: the keys, or the view, are someone else's now.
         const list = containerRef.current?.querySelector<HTMLElement>(".message-list") ?? null;
@@ -2598,15 +2653,13 @@ export default function App() {
           // The `/` prompt and the `:` line are this panel's own, like the keys overlay.
           setSearch(null);
           setExLine(null);
-          // A Tab whose focus move never landed inside this page (it left for another widget) must not make
-          // whatever this page focuses on the way back a landing.
-          tabAtKeyRef.current = null;
           // Losing focus is a route away from whatever this panel was showing, the bypass prompt included;
           // regaining it is not (this pane's own keydowns are the only thing that answers the prompt, and those
           // never fire while it is unfocused anyway).
           if (!payload.focused) cancelBypassConfirm();
-          // Losing focus ends VISUAL; nothing else here sets `mode`.
+          // Losing focus ends VISUAL; nothing else here sets `mode`. It ends card mode too, the card unanswered.
           if (!payload.focused) exitRegion();
+          if (!payload.focused) endCardMode();
           // The keys leave: park where the reader is, after `exitRegion` so a VISUAL mode is never what is
           // parked. Only over a conversation: the empty tab lands its own way.
           if (!payload.focused) {
@@ -2631,6 +2684,8 @@ export default function App() {
         }
         case "enter_input": {
           editReturnRef.current = null;
+          // A landing in the box takes the keys from card mode.
+          endCardMode();
           // This puts the caret in the composer, so no overlay may be left covering it and eating what gets
           // typed. Its only sender is a brand-new tab, so there is never a card waiting to land on instead.
           closeTransientOverlays();
@@ -2677,6 +2732,8 @@ export default function App() {
           // `nav_fallthrough` is decided in an effect against the current render.
           endKeyPrompts();
           dropPendingKeys();
+          // GTK took the key (`Ctrl+j`/`Ctrl+k`), which takes the keys from card mode.
+          endCardMode();
           break;
         }
         case "keymap": {
@@ -2691,6 +2748,11 @@ export default function App() {
           // `isEditableElement`: this needs "has a text selection", which is exactly these two types. A key GTK
           // claimed, so the y/n cancel is applied here, as for `nav_key`.
           endKeyPrompts();
+          // A key GTK claimed is a key: card mode arms again from it, and an answer in its after-half is cancelled.
+          if (cardModeRef.current !== null) {
+            if (cardModeRef.current.answering !== null) typingGuard.cancel();
+            cancelCardAnswer(typingGuard.clockNow(), ANSWER_CANCELLED_FLASH);
+          }
           if (payload.key !== "C-a") return;
           const el = document.activeElement;
           if (el instanceof HTMLTextAreaElement || (el instanceof HTMLInputElement && el.type === "text")) {
@@ -2704,6 +2766,7 @@ export default function App() {
           endKeyPrompts();
           exitRegion();
           setMode("browse");
+          setKeymapSection("browse");
           setKeymapPlugin(pluginKeysHelp(payload.plugin));
           keymapOpening.current = typeof payload.opening === "number" ? payload.opening : null;
           keymapClosedByKey.current = false;
@@ -2736,6 +2799,8 @@ export default function App() {
           // swallow. The `/model`/`/effort` picker too, open or on its way: a reply landing under the labels used
           // to open it there, and landing on the composer then left the keys on the picker.
           exitRegion();
+          // HINT takes the keys from card mode as it does from everything else.
+          endCardMode();
           closeTransientOverlays();
           setSlashPicker(null);
           setSlashReply(null);
@@ -2786,6 +2851,8 @@ export default function App() {
             setTasksOpen(false);
             taskScratchTab.current = null;
             switchedRef.current = true;
+            // Card mode holds a card of the tab left; it ends there, the card unanswered.
+            endCardMode();
             // A switch ends VISUAL, and first: `saveView` below reads `modeRef.current` to park the old tab's
             // mode, and `exitRegion` sets that ref synchronously, so a mode this page cannot re-enter is never
             // what gets saved.
@@ -2841,7 +2908,6 @@ export default function App() {
             setExLine(null);
             answeredRef.current = new Set();
             setAnsweredPermissions(answeredRef.current);
-            permissionReasons.current.clear();
             // The old tab's unread pill means nothing over a fresh, empty timeline. The `snapshot` arm's restore
             // seeds a real threshold back only for a tab whose saved view was actually parked.
             setUnreadLabel(null);
@@ -2907,6 +2973,18 @@ export default function App() {
           break;
         }
         case "events": {
+          // How the host resolved the card holding card mode, for what the band says when card mode ends on it.
+          const heldCard = cardModeRef.current;
+          if (heldCard !== null) {
+            for (const e of payload.events) {
+              if (e.type === "permission_resolved" && e.permission_id === heldCard.card.permissionId) {
+                cardResolvedRef.current = {
+                  permissionId: e.permission_id,
+                  answered: e.outcome === "allowed" || e.outcome === "denied",
+                };
+              }
+            }
+          }
           const wakes = payload.events.filter((e) => e.type === "cli_cycle_started").length;
           if (wakes) tasksRef.current?.wake(wakes);
           // A new turn resets the render trace: each turn reports its own first text, once.
@@ -2985,7 +3063,7 @@ export default function App() {
               // A footer nicety, not the banner reserved for conversation-breaking errors.
               showFlash(payload.error);
             } else {
-              // Refused, so not answered: Rust leaves the card waiting, and so must this panel -- otherwise `a`/`d`
+              // Refused, so not answered: Rust leaves the card waiting, and so must this panel -- otherwise card mode
               // and the card's own buttons stay dead until a reset.
               if (record?.kind === "permission" && record.permissionId !== undefined && record.tab === activeTabRef.current) {
                 const permissionId = record.permissionId;
@@ -3008,6 +3086,7 @@ export default function App() {
           // tab refused Shift+Tab as "Esc first" with no VISUAL handler left to take that Esc. After a handoff the
           // session really is closed, so there is nothing left to confirm either.
           exitRegion();
+          endCardMode();
           setKeymapOpen(false);
           setHandoffOpen(false);
           break;
@@ -3223,12 +3302,27 @@ export default function App() {
     setHintTyped("");
   }
 
+  /** Whether `el` is an answer button (Approve, Deny, Always allow) of the card at timeline `index`, and that card
+   *  still waits: in a live session, not answered from this panel. With `orReason`, the card's reason box counts
+   *  too (a HINT label on it). Refs only: the HINT dispatch is installed once. */
+  function waitingCardButton(el: HTMLElement, index: number, orReason = false): boolean {
+    const item = timelineRef.current[index];
+    if (item?.kind !== "permission" || el.closest(".permission-card") === null) return false;
+    const button = isActivatableControl(el) && el.closest("[data-nav-action]") !== null;
+    const reasonBox = orReason && el instanceof HTMLInputElement && el.matches("[data-card-control]");
+    if (!button && !reasonBox) return false;
+    const now = stateRef.current;
+    if (now.status.kind === "unavailable" || now.status.kind === "closed") return false;
+    return !answeredRef.current.has(item.request.permissionId);
+  }
+
   /** Moves the keys to `target` and does nothing else -- HINT never acts:
    *  a button is focused, never clicked, and `Enter` is what presses it afterwards. A target whose
    *  element has left the DOM since it was frozen lands nowhere rather than somewhere else. */
   function landOnHint(target: HintTarget | undefined) {
     markLandedCode(null);
     if (target === undefined || target.kind === "path" || !target.el.isConnected) return;
+    noteJump();
     const root = containerRef.current;
     // Landing can scroll the conversation (a focused control, the cursor's row revealed), and that
     // scroll is the user's -- see the note on `noteUserScroll` in `onKeyDown`.
@@ -3240,23 +3334,30 @@ export default function App() {
       return;
     }
     if (target.kind === "control" || target.kind === "link") {
+      const row = root === null ? null : rowOf(root, target.el);
+      const rowIndex = root === null || row === null ? null : rowIndexOf(root, row);
+      // A label on a waiting card's answer button or its reason box is card mode for that card: nothing highlighted,
+      // the keys on the root, the control never focused (so nothing can press it, and the box opens by card mode's
+      // Tab).
+      if (target.kind === "control" && rowIndex !== null && waitingCardButton(target.el, rowIndex, true)) {
+        enterCard(
+          rowIndex,
+          typingGuard.clockNow(),
+          { mode: "browse", cursorKey: timelineRef.current[cursorRef.current]?.key ?? null, caret: null },
+          null,
+        );
+        return;
+      }
       // An input (a permission card's reason box) takes the keys by being focused; a button is
       // selected by being focused, drawn as the solid cursor block. A web link is
       // the same landing: focused, never clicked, its row current -- and Enter on it is then the browser's
       // own activation (`LinkClicked`), not a key this panel claims.
-      // A control inside a conversation row (a card's Approve) also brings the row cursor to that
-      // row, the same place `l` would have reached it from: otherwise `h` from it would hand the
-      // keys back to some other row, and `a`/`d` would answer a different card.
-      const row = root === null ? null : rowOf(root, target.el);
-      const rowIndex = root === null || row === null ? null : rowIndexOf(root, row);
+      // A control inside a conversation row also brings the row cursor to that row, the same place `l` would have
+      // reached it from: otherwise `h` from it would hand the keys back to some other row.
       if (rowIndex !== null) setCursor(rowIndex);
       landedControlRef.current = target.el;
       setMode("browse");
       target.el.focus();
-      // A landing -- the Enter right after it may press a card's button. Only if
-      // focus took (a disabled control takes none); the labels never reach this page, so the count
-      // now is the count the next key reads as "the key before".
-      if (document.activeElement === target.el) placedRef.current = { el: target.el, atKey: typingGuard.keyCount() };
       return;
     }
     // A row or a code block: the row cursor goes there and the panel is back in BROWSE. The row's
@@ -3599,17 +3700,24 @@ export default function App() {
     postToRust({ type: "reset_tab", request_id: requestId, tab });
   }
 
-  /** Every answer to a card goes through here -- its own buttons, Enter in its reason box, and
-   *  `a`/`d` -- so one card is answered once, whichever of them gets there first. */
+  /** Every answer to a card goes through here -- its own buttons and card mode's keys (`answerByKey`) -- so one card
+   *  is answered once, whichever of them gets there first. Each answer carries its proof (`./cardMode`, the only
+   *  constructors): a key's, built once in `answerByKey`, which names the card and the answer itself, so an answer that
+   *  disagrees with its own proof is sent nowhere; or a pointer's, which only a real click on a card button makes. How
+   *  it was answered goes to Rust from the proof, never from a caller's word. */
   function answerPermission(
     permissionId: string,
     decision: PermissionDecision,
-    reason?: string,
-    remember?: boolean,
-    origin: "key" | "click" = "click",
+    reason: string | undefined,
+    remember: boolean | undefined,
+    proof: KeyAnswerProof | PointerAnswerProof,
   ) {
     const tab = activeTabRef.current;
     if (answeredRef.current.has(permissionId) || tab === null) return;
+    const byKey = "card" in proof;
+    const offeredRule = pageRef.current.ruleOffers[permissionId] ?? null;
+    if (byKey && !proofAnswers(proof, permissionId, tab, decision, remember === true, offeredRule)) return;
+    const origin = byKey ? "key" : "click";
     answeredRef.current = new Set(answeredRef.current).add(permissionId);
     setAnsweredPermissions(answeredRef.current);
     // Recorded, so a refusal gives the card back (`inFlight`'s doc).
@@ -3631,6 +3739,430 @@ export default function App() {
       ...(remember ? { remember: true } : {}),
     });
   }
+
+  // ---- Card mode ----
+  //
+  // `./cardMode` decides every key while a card holds card mode; this is where its intents are applied. A card takes
+  // card mode only from a person: `Alt+n`/`Alt+p` (BROWSE, INPUT, the question dock, CARET/VISUAL after the region
+  // ends), or a lone Enter on the card's row or the tool row it gates. It ends when anything else takes the keys or
+  // the card changes, and it never moves on to another card by itself.
+
+  /** Ends card mode, the card unanswered, leaving the keys and the cursor where they are: for whatever took the keys
+   *  (a tab switch, an overlay, the pane losing focus, a landing). Only refs, setters and the guard, so the listeners
+   *  installed once may call it. */
+  function endCardMode() {
+    const held = cardModeRef.current;
+    if (held === null) return;
+    // An answer still in its after-half belongs to this card mode; it must never fire after it.
+    if (held.answering !== null) typingGuard.cancel();
+    setCardMode(null);
+    // The open reason field must not keep the keys once card mode is gone: outside card mode it is no place for
+    // them. A focus something else just took (the reason card mode ended) is left alone.
+    const box = cardReasonInput(held.card.permissionId);
+    if (box !== null && document.activeElement === box) containerRef.current?.focus({ preventScroll: true });
+  }
+
+  /** Something other than a key card mode read -- an arrival, an envelope that took the keys or the view, a key GTK
+   *  took -- cancelled the typing guard's wait: an answer card mode had in its after-half goes with it and says so,
+   *  and card mode arms again from `at`, with nothing in flight. */
+  function cancelCardAnswer(at: number, flash: string) {
+    const held = cardModeRef.current;
+    if (held === null) return;
+    if (held.answering !== null) showFlash(flash);
+    setCardMode(keyCancelsAnswer(held, at));
+  }
+
+  /** Leaves card mode back to where it was entered from: the box with its caret where it was, the question dock, or
+   *  BROWSE on the origin row (the nearest one left if it is gone). Never on to another card: the band says how many
+   *  more wait. `flash` says why it ended, when something other than the person ended it. */
+  function leaveCardMode(flash: string | null = null) {
+    const held = cardModeRef.current;
+    if (held === null) return;
+    endCardMode();
+    const items = timelineRef.current;
+    const back =
+      (held.origin.cursorKey === null ? null : indexOfKey(items, held.origin.cursorKey)) ??
+      Math.min(Math.max(cardOriginIndexRef.current, 0), Math.max(items.length - 1, 0));
+    if (back !== cursorRef.current) {
+      noteUserScroll(containerRef.current?.querySelector(".message-list"), "unknown");
+      landingRef.current = 0;
+      setCursor(back);
+    }
+    if (held.origin.mode === "browse") {
+      modeRef.current = "browse";
+      setMode("browse");
+      containerRef.current?.focus({ preventScroll: true });
+    } else {
+      setMode("input");
+      // The box keeps its own caret (`Composer`'s), so "kept" puts it back where it was; the dock takes the keys
+      // back by its own effect once INPUT is on.
+      if (held.origin.mode === "input") {
+        setComposerCaret("kept");
+        setComposerFocusRequest((n) => n + 1);
+      }
+    }
+    const more = allCards(stateRef.current).filter(
+      (p) => p.permissionId !== held.card.permissionId && !answeredRef.current.has(p.permissionId),
+    ).length;
+    if (flash !== null) showFlash(flash);
+    else if (more > 0) showFlash(moreWaitingFlash(more));
+  }
+
+  /** What a card offers card mode, read off the card as `PermissionCard` draws it, so the digits and the buttons
+   *  agree: Approve, Deny, and Always allow where Rust offered a rule for a provider's card; a reason only on a
+   *  provider's card (a broker's and another agent's deny carries none). */
+  function cardOfferOf(request: PermissionRequestRecord): CardOffer {
+    const broker = request.editorCard !== undefined;
+    const external = !broker && isExternalTool(request.toolName);
+    const ruleText = broker ? null : (pageRef.current.ruleOffers[request.permissionId] ?? null);
+    const rule = Boolean(ruleText);
+    return {
+      answers: rule ? ANSWERS_WITH_RULE : ANSWERS_PLAIN,
+      rule: rule ? ruleText : null,
+      approvable: cardApprovable(request),
+      takesReason: !broker && !external,
+      noReasonFlash: broker
+        ? BROKER_NO_REASON_FLASH
+        : external
+          ? agentNoReasonFlash(agentTitle(activeTabInfo(tabsRef.current)?.agent))
+          : "",
+    };
+  }
+
+  /** The timeline index of the card `permissionId`, as the list draws it now, or `null` once it is gone. */
+  function cardRowIndex(permissionId: string): number | null {
+    const index = timelineRef.current.findIndex(
+      (item) => item.kind === "permission" && item.request.permissionId === permissionId,
+    );
+    return index === -1 ? null : index;
+  }
+
+  /** The reason field of the card `permissionId`, found by the card's own row (a row holds no model HTML inside a
+   *  card), or `null` for a card that has none. */
+  function cardReasonInput(permissionId: string): HTMLInputElement | null {
+    const root = containerRef.current;
+    const index = cardRowIndex(permissionId);
+    if (root === null || index === null) return null;
+    return conversationRows(root)[index]?.querySelector<HTMLInputElement>(".permission-card input") ?? null;
+  }
+
+  /** What an entry dropped, for the band: a pending prefix or leader sequence, or a count. */
+  function droppedFlash(pending: PendingPrefix | null, count: number | null, sequence: string[] | null): string | null {
+    if (pending !== null) return pendingDroppedFlash(pending === "C-w" ? "Ctrl+w" : pending);
+    if (sequence !== null) return pendingDroppedFlash(sequenceTitle(panelTable, sequence));
+    if (count !== null) return COUNT_DROPPED_FLASH;
+    return null;
+  }
+
+  /** Card mode on the card at timeline `index`, from a key pressed at `pressedAt`: whatever was pending dropped, the
+   *  cursor on the card, the keys on the root, nothing highlighted. Entered again on another card (`Alt+n` in card
+   *  mode), `origin` is the first entry's, so leaving goes back where the person started. */
+  function enterCard(index: number, pressedAt: number, origin: CardOrigin, dropped: string | null) {
+    const item = timelineRef.current[index];
+    const tab = activeTabRef.current;
+    if (item?.kind !== "permission" || tab === null) return;
+    dropPendingKeys();
+    if (cardModeRef.current === null) cardOriginIndexRef.current = cursorRef.current;
+    cardEntrySeqRef.current += 1;
+    setCardMode(enterCardMode({ permissionId: item.request.permissionId, tab }, origin, cardOfferOf(item.request), pressedAt));
+    setCardEntry(cardEntrySeqRef.current);
+    modeRef.current = "browse";
+    setMode("browse");
+    if (index !== cursorRef.current) {
+      // A landing on the card's head, as `focus_permission`'s: a card taller than the view shows its question.
+      noteUserScroll(containerRef.current?.querySelector(".message-list"), "unknown");
+      landingRef.current = 0;
+      landingHeadRef.current = true;
+      setCursor(index);
+    }
+    containerRef.current?.focus({ preventScroll: true });
+    if (dropped !== null) showFlash(dropped);
+  }
+
+  /** `Alt+n` (+1) / `Alt+p` (-1) outside card mode: the next / previous card waiting in this tab, after (before) the
+   *  cursor row from BROWSE, from the transcript's end from the box or the dock, wrapping. Questions are not in it. */
+  function enterCardByChord(
+    delta: 1 | -1,
+    pressedAt: number,
+    from: CardOrigin["mode"],
+    dropped: string | null,
+    repeat: boolean,
+  ) {
+    // A held chord's repeats would spin through the waiting cards: only a fresh press enters.
+    if (repeat) {
+      showFlash(heldCardChordFlash(delta === 1 ? "Alt-n" : "Alt-p"));
+      return;
+    }
+    const items = timelineRef.current;
+    const now = stateRef.current;
+    const ended = now.status.kind === "unavailable" || now.status.kind === "closed";
+    const start = from === "browse" ? cursorRef.current : delta === 1 ? -1 : items.length;
+    const index = ended ? null : waitingCardAfter(items, start, delta, 1, answeredRef.current);
+    if (index === null) {
+      dropPendingKeys();
+      const asking = now.questions.some((q) => q.state.kind !== "settled");
+      showFlash(asking ? QUESTION_WAITS_FLASH : NO_CARD_WAITING_FLASH);
+      return;
+    }
+    const box = containerRef.current?.querySelector<HTMLTextAreaElement>(".composer textarea") ?? null;
+    // The row card mode is entered from is a jump: `Ctrl+o` comes back to it once card mode has ended where it stood
+    // (the sheet, a Ctrl+g view). Moving on to another card inside card mode is no new jump: the row stays the one
+    // first left.
+    if (cardModeRef.current === null) noteJump();
+    enterCard(
+      index,
+      pressedAt,
+      { mode: from, cursorKey: items[cursorRef.current]?.key ?? null, caret: from === "input" ? (box?.selectionStart ?? null) : null },
+      dropped,
+    );
+  }
+
+  /** The one way a key answers a card: run at the end of the answer's after-half (`TypingGuard.defer`). The card
+   *  must still wait, in its tab, unanswered, its session alive, and card mode must still hold that very answer
+   *  (`keyAnswerProof`: its card, its press, armed then, nothing since). The answer is the proof's; a deny's reason is
+   *  the field's own text, whether the field is open or was shut with its text kept. Digits and Enter never press a
+   *  button. */
+  function answerByKey(card: CardRef, pressedAt: number) {
+    const held = cardModeRef.current;
+    if (held === null || held.card.permissionId !== card.permissionId || held.card.tab !== card.tab) return;
+    const now = stateRef.current;
+    const answeredHere = answeredRef.current.has(card.permissionId);
+    const request = allCards(now).find((p) => p.permissionId === card.permissionId);
+    const stillWaiting =
+      activeTabRef.current === card.tab &&
+      !answeredHere &&
+      now.status.kind !== "unavailable" &&
+      now.status.kind !== "closed" &&
+      request !== undefined;
+    if (!stillWaiting) {
+      leaveCardMode(answeredHere ? CARD_ANSWERED_ELSEWHERE_FLASH : CARD_WITHDRAWN_FLASH);
+      return;
+    }
+    // The card's offer read now, not at the last render: a rule Rust replaced in the same task as this timer must not
+    // be saved under the digit the person pressed for the old one.
+    if (!sameOffer(held.offer, cardOfferOf(request))) {
+      leaveCardMode(CARD_CHANGED_FLASH);
+      return;
+    }
+    // The field's own text, open or shut: a deny by key sends what a click on Deny would.
+    const reason = cardReasonInput(card.permissionId)?.value ?? "";
+    const proof = keyAnswerProof(held, card, pressedAt, stillWaiting, typingGuard.clockNow(), reason);
+    if (proof === null) {
+      // Something re-armed card mode since the press (an arrival): nothing is answered, and it arms again.
+      setCardMode(keyCancelsAnswer(held, typingGuard.clockNow()));
+      return;
+    }
+    answerPermission(card.permissionId, proof.decision, proof.reason || undefined, proof.remember, proof);
+    leaveCardMode();
+  }
+
+  /** A keydown while card mode holds a card, from the root's capture phase (ahead of the dock, the region and every
+   *  control under the root). Returns whether card mode took it -- every key, while it holds a card. Each is dated and
+   *  recorded by the typing guard first, as `onKeyDown` does, so a key in an answer's after-half cancels it. Only a
+   *  key typed into the open reason field (`type`) goes on to the field, neither prevented nor stopped, so the field
+   *  gets its text and an input method keeps its composition. */
+  function onCardModeKey(event: KeyboardEvent<HTMLElement>): boolean {
+    const held = cardModeRef.current;
+    if (held === null) return false;
+    const native = event.nativeEvent;
+    const pressedAt = typingGuard.timeOf(event);
+    const recordedBefore = typingGuard.keyCount();
+    const cancelled = typingGuard.onKey(isShiftTab(event) ? "Tab" : event.key, pressedAt);
+    if (cancelled !== null) showFlash(cancelled);
+    const key: CardKey = {
+      key: native.key,
+      code: native.code,
+      ctrlKey: native.ctrlKey,
+      shiftKey: native.shiftKey,
+      altKey: native.altKey,
+      metaKey: native.metaKey,
+      isComposing: native.isComposing,
+      keyCode: native.keyCode,
+      getModifierState: (name: string) => native.getModifierState(name),
+      repeat: native.repeat,
+      replayed: REPLAYED_KEYS.has(native),
+      pressedAt,
+    };
+    const result = cardKey(held, key);
+    // Super and Hyper are keys to the typing guard and nothing to `cardKey`: card mode arms again from them too.
+    const next =
+      result.intent.kind === "ignore" && typingGuard.keyCount() > recordedBefore ? keyCancelsAnswer(held, pressedAt) : result.state;
+    const intent = result.intent;
+    // `type` is text for the open reason field; on anything that is not a text field (a card button a mouse press
+    // left focused) the key is claimed all the same, so it never reaches a button's own activation.
+    if (intent.kind === "type") {
+      TYPED_IN_CARD_MODE.add(native);
+      if (!isEditableElement(event.target)) event.preventDefault();
+    } else {
+      event.preventDefault();
+      event.stopPropagation();
+    }
+    setCardMode(next);
+    const root = containerRef.current;
+    switch (intent.kind) {
+      case "answer": {
+        const card = next.card;
+        const waiting = typingGuard.defer(pressedAt, native.repeat, () => answerByKey(card, pressedAt), ANSWER_CANCELLED_FLASH);
+        if (!waiting) {
+          setCardMode(keyCancelsAnswer(next, pressedAt));
+          showFlash(cardArmingFlash(native.key));
+        }
+        break;
+      }
+      case "reason": {
+        if (!intent.open) {
+          root?.focus({ preventScroll: true });
+          break;
+        }
+        const field = cardReasonInput(next.card.permissionId);
+        if (field === null) {
+          setCardMode({ ...next, reasonOpen: false });
+          break;
+        }
+        field.focus({ preventScroll: true });
+        break;
+      }
+      case "leave":
+        // Its repeats are swallowed until it is let go (`answerConfirm`'s held-key check): a held Ctrl+c that left
+        // card mode must not go on to interrupt the turn, nor a held Esc reach whatever the keys went back to.
+        promptSwallowKeyRef.current = native.key;
+        leaveCardMode();
+        break;
+      case "other-card": {
+        const from = cardRowIndex(next.card.permissionId) ?? cursorRef.current;
+        const index = waitingCardAfter(timelineRef.current, from, intent.delta, 1, answeredRef.current);
+        if (index !== null) enterCard(index, pressedAt, next.origin, null);
+        break;
+      }
+      case "scroll": {
+        const list = root?.querySelector<HTMLElement>(".message-list") ?? null;
+        if (list === null) break;
+        noteUserScroll(list, intent.delta > 0 ? "down" : "up");
+        if (intent.by === "row") {
+          const index = cardRowIndex(next.card.permissionId);
+          const row = index === null || root === null ? null : (conversationRows(root)[index] ?? null);
+          stepWithinRow(row, intent.delta, 1, !native.repeat);
+        } else {
+          list.scrollTop += intent.delta * Math.max(1, Math.floor(list.clientHeight / 2));
+        }
+        break;
+      }
+      case "help":
+        endCardMode();
+        openKeymap("card");
+        break;
+      case "refuse":
+        // The flash of an answer this key cancelled says more than the key's own refusal.
+        if (intent.flash !== "" && cancelled === null) showFlash(intent.flash);
+        break;
+      case "type":
+      case "moved":
+      case "ignore":
+        break;
+    }
+    return true;
+  }
+
+  /* The paint that drew card mode -- its entry, or a change of card -- arms it (`notePaint`): a view that gets no
+     frames is never armed, so a digit queued in a stall before anything was drawn answers nothing. Only that paint:
+     a later one would move the arming past an answer in flight. */
+  useLayoutEffect(() => {
+    if (cardEntry === 0) return;
+    const entry = cardEntry;
+    return afterPaint(() => {
+      const held = cardModeRef.current;
+      if (held === null || cardEntrySeqRef.current !== entry) return;
+      setCardMode(notePaint(held, typingGuard.clockNow()));
+    });
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [cardEntry]);
+  /* The digits light up when card mode arms: a render at that moment, since nothing else changes then. */
+  const [, setCardArmTick] = useState(0);
+  useEffect(() => {
+    if (cardMode === null || !cardMode.painted) return;
+    const wait = cardMode.armFrom + CARD_ARM_MS - typingGuard.clockNow();
+    if (wait <= 0) return;
+    const timer = setTimeout(() => setCardArmTick((n) => n + 1), Math.ceil(wait) + 1);
+    return () => clearTimeout(timer);
+  }, [cardMode, typingGuard]);
+  const cardArmed = cardMode !== null && isArmed(cardMode, typingGuard.clockNow());
+  /** What `MessageList` draws for the card holding card mode; the same object while nothing in it changes. */
+  const cardModeId = cardMode?.card.permissionId ?? null;
+  const cardHighlight = cardMode?.highlight ?? null;
+  const cardReasonOpen = cardMode?.reasonOpen ?? false;
+  const cardModeShown = useMemo(
+    () =>
+      cardModeId === null
+        ? null
+        : { permissionId: cardModeId, view: { highlight: cardHighlight, armed: cardArmed, reasonOpen: cardReasonOpen } },
+    [cardModeId, cardHighlight, cardArmed, cardReasonOpen],
+  );
+  /** What the band says of card mode: the held card's place among this tab's waiting cards and its answer count, and
+   *  whether the cursor is on a waiting card (or the tool row it gates), where BROWSE's Enter enters card mode. */
+  const bandCard = useMemo(() => {
+    const waiting = timeline.filter((item) => item.kind === "permission" && !answeredPermissions.has(item.request.permissionId));
+    const held = cardMode === null ? -1 : waiting.findIndex((item) => item.kind === "permission" && item.request.permissionId === cardMode.card.permissionId);
+    const target = sessionEnded ? null : permissionTarget(answerableItems, cursor);
+    const targetItem = target === null ? undefined : timeline[target];
+    return {
+      cardMode:
+        cardMode !== null && held !== -1
+          ? {
+              index: held + 1,
+              total: waiting.length,
+              answers: cardMode.offer.answers.length,
+              reason: cardMode.offer.takesReason,
+              reasonOpen: cardMode.reasonOpen,
+            }
+          : null,
+      onCard: targetItem?.kind === "permission" && !answeredPermissions.has(targetItem.request.permissionId),
+    };
+  }, [timeline, answeredPermissions, cardMode, sessionEnded, answerableItems, cursor]);
+  /* Card mode ends, the card unanswered, whenever something else takes the keys over the page: an overlay or a
+     prompt (the chooser, the slash picker, the tasks list, the review, the sheet, the detail popover, a y/n
+     question, a pick), the remote desk's own questions and list, or another mode (a click into the box). */
+  const remoteOwnsKeys = useSyncExternalStore(remoteDesk.subscribe, () => {
+    const remote = remoteDesk.snapshot();
+    return remote.listOpen || remote.pairing !== null || remote.questions.length > 0 || remote.flagged.length > 0;
+  });
+  const cardModeCovered =
+    overlayOpen ||
+    keymapOpen ||
+    detail !== null ||
+    handoffOpen ||
+    pathPick !== null ||
+    linkPick !== null ||
+    confirm !== null ||
+    remoteOwnsKeys ||
+    mode !== "browse";
+  useEffect(() => {
+    if (cardModeCovered) endCardMode();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [cardModeCovered, cardEntry]);
+  /* And when its card stops waiting: answered here by a click, resolved by the host (another device, the agent), or
+     gone with its session. The keys go back where card mode was entered from. */
+  useEffect(() => {
+    const held = cardModeRef.current;
+    if (held === null) return;
+    const id = held.card.permissionId;
+    const resolved = cardResolvedRef.current?.permissionId === id ? cardResolvedRef.current : null;
+    if (answeredRef.current.has(id)) {
+      cardResolvedRef.current = null;
+      leaveCardMode(CARD_ANSWERED_ELSEWHERE_FLASH);
+      return;
+    }
+    const request = allCards(state).find((p) => p.permissionId === id);
+    if (activeTabRef.current === held.card.tab && !sessionEnded && request !== undefined) {
+      // What the card offers changed under card mode (Rust's rule offer came or went, the card cannot be approved
+      // any more): the digits would no longer match the buttons drawn, so card mode ends and never answers with
+      // the offer it entered with.
+      if (!sameOffer(held.offer, cardOfferOf(request))) leaveCardMode(CARD_CHANGED_FLASH);
+      return;
+    }
+    cardResolvedRef.current = null;
+    leaveCardMode(resolved?.answered ? CARD_ANSWERED_ELSEWHERE_FLASH : CARD_WITHDRAWN_FLASH);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [state, answeredPermissions, sessionEnded, ruleOffers]);
 
   /** Commits (or cancels) an inline rename. Both return the keys to the root, the same
    *  as every other overlay closing does. Sends `renaming.tab`, not the active tab: the field can
@@ -3676,8 +4208,6 @@ export default function App() {
    *  answered the cursor's card as a key standing alone. Each line's callback hands its key over
    *  here first, on `onKeyDown`'s own clock (`event.timeStamp` is what a test's faked `Date` moves). */
   function noteLineKey(event: KeyboardEvent<HTMLInputElement | HTMLTextAreaElement>) {
-    // A key, and not a kill -- so a `Ctrl+y` after it is judged on its own.
-    lastKeyWasKillRef.current = false;
     const cancelled = typingGuard.onKey(event.key, typingGuard.timeOf(event));
     if (cancelled !== null) showFlash(cancelled);
   }
@@ -4166,7 +4696,7 @@ export default function App() {
               const agent = activeTabInfo(tabsRef.current)?.agent ?? "claude";
               postToRust({ type: "trust_command", request_id: commandId, action: command.command, agent });
             } else {
-              showFlash(`:${exLine} — no ex commands here; ? lists this panel's keys`);
+              showFlash(`:${exLine} — not a command here; F1 lists this panel's keys`);
             }
             setExLine(null);
             returnKeysToRoot();
@@ -4315,9 +4845,9 @@ export default function App() {
               onHistoryPush={(t) => postToRust({ type: "history_push", request_id: nextRequestId(), text: t })}
               onEditInNvim={(t) => post({ type: "edit_draft", text: t })}
               editingInNvim={scratchEditing}
-              onOpenKeymap={() => {
+              onOpenKeymap={(section = "browse") => {
                 setMode("browse");
-                setKeymapOpen(true);
+                openKeymap(section);
               }}
             />
           )}
@@ -4420,6 +4950,7 @@ export default function App() {
               plugin={keymapPlugin ?? undefined}
               phones={connectedPhones}
               deviceList={remoteOn}
+              openAt={keymapSection}
               startAt={keymapOpening.current !== null && keymapPlugin === null ? "prefix" : undefined}
               startRequest={keymapRequest}
               claudeSlashCommands={!isExternalAgent(activeTab?.agent)}
@@ -4447,161 +4978,6 @@ export default function App() {
   const handingOff = tabs !== null && handoffRequests.has(tabs.active);
   const bandPicks = (!isExternalAgent(activeTab?.agent) || isAcpAgent(activeTab?.agent)) && !sessionEnded && !handingOff;
 
-  /** `a`/`d`/`D` on a card, and Enter on a card's own button. `stillThere` says whether the card the key was aimed at
-   *  can still take it, or is `null` when there is no card for the cursor (the "no card here" flash). The answer runs
-   *  `TYPING_GUARD_MS` later, only if the key stood alone before and nothing cancels the wait; by then the card must
-   *  still be there (`stillThere`) and the panel still in BROWSE. `key` is what the guard judges the key before
-   *  against: only Enter passes it, for the guard's walk exception (`TypingGuard.defer`). */
-  function waitThenAnswer(
-    event: KeyboardEvent<HTMLDivElement>,
-    typedAt: number,
-    stillThere: (() => boolean) | null,
-    run: () => void,
-    key = "",
-  ) {
-    if (stillThere === null) {
-      const waitingElsewhere = allCards(stateRef.current).some((p) => !answeredRef.current.has(p.permissionId));
-      showFlash(waitingElsewhere ? CARD_ELSEWHERE_FLASH : NO_CARD_FLASH);
-      return;
-    }
-    const waiting = typingGuard.defer(
-      typedAt,
-      event.repeat,
-      () => {
-        if (stillThere() && modeRef.current === "browse") run();
-      },
-      TYPING_FLASH,
-      key,
-    );
-    if (!waiting) showFlash(TYPING_FLASH);
-  }
-
-  /** `a`/`d` answer the card at timeline index `target` by its own
-   *  `permissionId`, through `answerPermission` -- the path the card's buttons take -- never by
-   *  clicking a button a DOM query found. The query this replaced indexed every
-   *  `[data-nav-stop="row"]` in the subtree with a TIMELINE index, so rows a model reply drew shifted
-   *  it, and `a` on the card the cursor showed approved the one above it. The timeline item
-   *  is the card the cursor is drawn on, by construction (`MessageList` draws `.row-current` on
-   *  `timeline[cursor]`). `d` sends the reason already typed into the card's box, as its Deny does. */
-  function answerCardByKey(
-    event: KeyboardEvent<HTMLDivElement>,
-    typedAt: number,
-    target: number | null,
-    decision: "allow" | "deny",
-  ) {
-    const item = target === null ? undefined : timeline[target];
-    if (decision === "allow" && item?.kind === "permission" && !cardApprovable(item.request)) {
-      showFlash(NOT_APPROVABLE_FLASH);
-      return;
-    }
-    const permissionId = item?.kind === "permission" ? item.request.permissionId : null;
-    const tab = activeTabRef.current;
-    const stillThere =
-      permissionId === null
-        ? null
-        : () => {
-            // The same card, in the same tab, still pending and not yet answered; a card whose
-            // session ended is inert (its buttons are disabled), so the key is too.
-            const now = stateRef.current;
-            return (
-              activeTabRef.current === tab &&
-              !answeredRef.current.has(permissionId) &&
-              now.status.kind !== "unavailable" &&
-              now.status.kind !== "closed" &&
-              allCards(now).some((p) => p.permissionId === permissionId)
-            );
-          };
-    waitThenAnswer(event, typedAt, stillThere, () => {
-      if (permissionId === null) return;
-      const reason = decision === "deny" ? permissionReasons.current.get(permissionId) || undefined : undefined;
-      answerPermission(permissionId, decision, reason, undefined, "key");
-    });
-  }
-
-  /** One key, not two steps: INPUT's `Ctrl+y` approves the
-   *  ACTIVE tab's OLDEST waiting card (`oldestWaitingPermission`, the card a card landing takes)
-   *  without leaving INPUT. Only from the composer's own box -- not the `Ctrl+r` search field,
-   *  whose text is a query. With no card waiting it does nothing and leaves the key to the box.
-   *  Otherwise the key is claimed (so the box never acts on it: its text, caret and history stay as
-   *  they were) and runs the typing guard's rule as `a` does (`TypingGuard.defer`, no new clock): only a Ctrl+y
-   *  with no key within `TYPING_GUARD_MS` before it -- so readline's `Ctrl+u`/`Ctrl+w` then `Ctrl+y`
-   *  yank never approves -- and none within it after, and never a held key: it also waits for the `y`
-   *  to be let go (`TypingGuard.deferUntilReleased`), so a Ctrl+y still down when the window ends
-   *  approves only at its release, and its first repeat refuses it. At fire time the
-   *  same card must still wait in the same tab, the session still live and the panel still in INPUT;
-   *  it is answered by its own `permissionId` through `answerPermission`, the path its buttons and
-   *  `a` take, never by pressing a button a DOM query found. */
-  function approveOldestByKey(event: KeyboardEvent<HTMLDivElement>, typedAt: number, afterKill: boolean) {
-    const box = event.target;
-    if (!isComposerBox(box) && !(box instanceof HTMLElement && box.closest(".question-dock"))) return;
-    const index = sessionEnded ? null : oldestWaitingPermission(timeline, answeredRef.current);
-    const item = index === null ? undefined : timeline[index];
-    if (item?.kind !== "permission") {
-      // Nothing a `Ctrl+y` may answer waits. A broker card does, though: only a key on its own row answers it, so
-      // the key is claimed and says so, rather than yanking text as if nothing were waiting.
-      const brokerWaiting = !sessionEnded && timeline.some(
-        (row) => row.kind === "permission" && row.request.editorCard !== undefined && !answeredRef.current.has(row.request.permissionId),
-      );
-      if (brokerWaiting) {
-        event.preventDefault();
-        showFlash(CTRL_Y_EDITOR_CARD_FLASH);
-      }
-      return;
-    }
-    event.preventDefault();
-    if (!cardApprovable(item.request)) {
-      showFlash(NOT_APPROVABLE_FLASH);
-      return;
-    }
-    const permissionId = item.request.permissionId;
-    const tab = activeTabRef.current;
-    const targetKey = `${tab}:${permissionId}`;
-    // Three refusals ahead of the wait, each saying why. The typing guard's before-half first (the
-    // flash the fast `Ctrl+u` `Ctrl+y` already gave); then a kill right before it, whatever the pause;
-    // then a card that has not been the one the band names for `TYPING_GUARD_MS`
-    // -- which also refuses while this panel's own approval is still moving the band on.
-    if (!typingGuard.mayAnswerNow("", typedAt, event.repeat)) {
-      showFlash(CTRL_Y_TYPING_FLASH);
-      return;
-    }
-    if (afterKill) {
-      showFlash(CTRL_Y_YANK_FLASH);
-      return;
-    }
-    const target = ctrlYTargetRef.current;
-    if (target.key !== targetKey || !target.settled) {
-      showFlash(CTRL_Y_TARGET_FLASH);
-      return;
-    }
-    const waiting = typingGuard.deferUntilReleased(
-      typedAt,
-      event.repeat,
-      () => {
-        const now = stateRef.current;
-        if (
-          activeTabRef.current !== tab ||
-          modeRef.current !== "input" ||
-          // The box still has the keys -- a click into the `Ctrl+r` search, or
-          // anywhere else, is no key and cancels nothing on its own.
-          document.activeElement !== box ||
-          !box.isConnected ||
-          // Still the card the band named when the key was pressed.
-          ctrlYTargetRef.current.key !== targetKey ||
-          answeredRef.current.has(permissionId) ||
-          now.status.kind === "unavailable" ||
-          now.status.kind === "closed" ||
-          !allCards(now).some((p) => p.permissionId === permissionId)
-        ) {
-          return;
-        }
-        answerPermission(permissionId, "allow");
-      },
-      CTRL_Y_TYPING_FLASH,
-      heldKeyName(event.nativeEvent),
-      CTRL_Y_HELD_FLASH,
-    );
-    if (!waiting) showFlash(CTRL_Y_TYPING_FLASH);
-  }
   // ---- BROWSE visual mode ----
   //
   // Handled entirely in the root's `onKeyDownCapture`, never in `onKeyDown` below: every
@@ -4880,6 +5256,18 @@ export default function App() {
       exitRegion();
     }
     switch (action.kind) {
+      case "card-mode":
+        // The region ends first, as Esc would end it, and card mode is entered as from BROWSE, dropping the
+        // region's own count or pending `g`.
+        endRegionFromKey();
+        enterCardByChord(
+          action.delta,
+          typedAt,
+          "browse",
+          pendingG !== null ? pendingDroppedFlash("g") : count !== null ? COUNT_DROPPED_FLASH : null,
+          event.repeat,
+        );
+        return;
       case "count":
         visualCountRef.current = accumulateMotionCount(count, action.digit);
         return;
@@ -5124,12 +5512,18 @@ export default function App() {
         return;
       }
       case "keymap":
-        // `?` ends the region and opens the keymap -- the which-key box, the panel's only
-        // discovery route.
         landCursorOnRowKey(rowKeyOfCaret(model.cursor));
         endRegionFromKey();
-        setKeymapOpen(true);
+        openKeymap("selecting");
         return;
+      case "vsearch": {
+        const key = rowKeyOfCaret(model.cursor);
+        const origin = timeline.findIndex((row) => row.key === key);
+        landCursorOnRowKey(key);
+        exitRegion();
+        openSearch(origin < 0 ? cursor : origin, action.dir);
+        return;
+      }
       case "interrupt":
         // The one Ctrl chord the region keeps its BROWSE meaning for -- the region itself
         // stays on.
@@ -5147,7 +5541,7 @@ export default function App() {
    *  in the capture phase and this handler must not fight it for a chord it does not own.
    *
    *  Also stays out of any OTHER editable control in this subtree -- a permission card's
-   *  deny-reason box, today. Found in review: with no guard, `j` typed there never reached the
+   *  reason box, today. Found in review: with no guard, `j` typed there never reached the
    *  input (claimed and `preventDefault`ed as a cursor move) and `i` stole focus into the composer
    *  mid-word. The composer's own textarea is the one exception: while INPUT is active it lives
    *  inside `.composer`, and letting its keydowns reach here is exactly the path that lets `Escape`
@@ -5158,6 +5552,8 @@ export default function App() {
    *  only keyboard route to Approve/Deny/Stop/Dismiss/Cancel. That was a real, reported regression,
    *  not a hypothetical. */
   const onKeyDown = (event: KeyboardEvent<HTMLDivElement>) => {
+    // A key card mode let through into its card's reason field is that field's text, already recorded.
+    if (TYPED_IN_CARD_MODE.has(event.nativeEvent)) return;
     // The window-close confirmation prompt owns every key, first of all, ahead of the `?` keymap
     // overlay and everything else below: tmux's own `confirm-before` prompt takes the
     // keys the same way.
@@ -5191,28 +5587,9 @@ export default function App() {
     if (keepsGliding) {
       holdClockRef.current = { typed: typedAt, perf: performance.now() };
       noteUserScroll(glidingList, holdDirectionRef.current > 0 ? "down" : "up");
-      lastKeyWasKillRef.current = false;
-      tabAtKeyRef.current = null;
       event.preventDefault();
       return;
     }
-    // Whether the key before this one was a kill in the composer, and
-    // whether this one is (a bare modifier is neither, and leaves it alone).
-    const afterKill = lastKeyWasKillRef.current;
-    if (!isModifierKey(event.key)) lastKeyWasKillRef.current = isKillKey(event);
-    // A plain Tab's own focus move -- the browser's, right after this keydown -- is
-    // a landing, which the root's `onFocus` records against this key's count. Any other key ends it.
-    // Only a Tab whose default is still alive moves focus. One that is claimed moves
-    // nothing, and the next focus no key made -- a mouse pressed on Approve and dragged off it -- must
-    // not become its landing. A box claims some before this handler runs (the
-    // `/` and `:` lines take every Tab), but this handler swallows others further down (the cancel
-    // after `g`/`z`/`[`/`]`, the leader's sequence, `gf`'s pick, the `?` overlay, the detail
-    // popover), so the default is known only once every handler has run: the native event is kept,
-    // and `onFocus` reads it when the focus arrives.
-    tabAtKeyRef.current =
-      event.key === "Tab" && !event.shiftKey && !event.ctrlKey && !event.altKey && !event.metaKey
-        ? { atKey: typingGuard.keyCount(), event: event.nativeEvent }
-        : null;
     // A card's own answer buttons (Approve, Deny, Always allow): see the Enter/Space rules below.
     const onAnswerButton =
       isActivatableControl(event.target) && (event.target as HTMLElement).closest("[data-nav-action]") !== null;
@@ -5365,7 +5742,33 @@ export default function App() {
       }
       return;
     }
+    // Card mode from the question dock, whose typed answer is a text field the branch below would leave alone; the
+    // dock leaves Alt chords to the page. INPUT's `Ctrl+y` is claimed there as in the box: it answers nothing, and the
+    // band says where cards are answered.
+    if (mode === "input" && event.target instanceof Element && event.target.closest(".question-dock") !== null) {
+      const delta = cardModeDelta(event.nativeEvent as unknown as KeyLike);
+      if (delta !== null) {
+        event.preventDefault();
+        enterCardByChord(delta, typedAt, "dock", droppedFlash(pending, count, null), event.repeat);
+        return;
+      }
+      if (resolveKey("input", event.nativeEvent as unknown as KeyLike, { sessionEnded })?.kind === "ctrl-y-gone") {
+        event.preventDefault();
+        showFlash(CTRL_Y_GONE_FLASH);
+        return;
+      }
+    }
     if (isEditableElement(event.target) && !(event.target as HTMLElement).closest(".composer")) {
+      // A card's reason box outside card mode (a click put the caret there) takes `Alt+n`/`Alt+p` as card mode, as
+      // the band there tells people to; card mode takes the keys back to the root.
+      if ((event.target as HTMLElement).closest(".permission-card [data-card-control]") !== null) {
+        const delta = cardModeDelta(event.nativeEvent as unknown as KeyLike);
+        if (delta !== null) {
+          event.preventDefault();
+          enterCardByChord(delta, typedAt, "browse", droppedFlash(pending, count, null), event.repeat);
+          return;
+        }
+      }
       // A text box inside a row (a permission card's reason) takes every key as text, except Esc,
       // which hands the keys back to the row it sits in. Esc mid-composition still belongs to the
       // input method, as it does in the composer.
@@ -5373,77 +5776,48 @@ export default function App() {
         event.preventDefault();
         root.focus({ preventScroll: true });
       }
+      // A card's reason box answers nothing outside card mode (a click put the caret there): its Enter is refused
+      // and says how the box denies. An input method's Enter is its own.
+      if (
+        event.key === "Enter" &&
+        !isImeKey(event.nativeEvent) &&
+        (event.target as HTMLElement).closest(".permission-card [data-card-control]") !== null
+      ) {
+        event.preventDefault();
+        if (!event.repeat) showFlash(REASON_ENTER_OUTSIDE_FLASH);
+      }
       return;
     }
-    // A focused button activates on Enter and Space natively; claiming those would swallow the only
-    // keyboard route to Approve (seen on an installed build). Every OTHER key still
-    // reaches the table, which is what lets `h`/`j`/`k`/`l` carry on from a focused button.
-    // On a card's own answer buttons (Approve, Deny, Always allow) Space is
-    // claimed and does nothing -- not the button, not the leader. Claude Code's permission prompt
-    // confirms with Enter; HTML's Space-activates is the default this overrides, only where a
-    // button answers a permission.
-    // Enter on those three is claimed too, and never activates them natively: this
-    // handler presses the button itself, `TYPING_GUARD_MS` later and only after a landing on it (the
-    // block below). The route a keyboard user relies on stays open -- `l`/`h`/Tab/HINT onto
-    // Approve, then Enter -- only deferred, as `a`/`d` are.
-    // Every other button (Stop, Dismiss, a tab, the chooser's rows) keeps both natively. A Space
-    // that arrives inside a pending leader sequence is the sequence's, so it falls
-    // through to the engine below -- claimed here first either way, so it never reaches the button.
-    // (`onAnswerButton` is computed at the top, ahead of the two modal overlays' early returns.)
-    // A pending prefix owns the next key, so Enter/Space on a focused control never activates
-    // it; a pending count refuses a card's own buttons only.
-    if (isActivatableControl(event.target) && (event.key === "Enter" || event.key === " ") && (pending !== null || (count !== null && onAnswerButton))) {
+    // A focused button activates on Enter and Space natively, and keeps doing so (Stop, Dismiss, a tab, the chooser's
+    // rows); every other key still reaches the table, which is what lets `h`/`j`/`k`/`l` carry on from a focused
+    // button. A card's own answer buttons (Approve, Deny, Always allow) never activate from a key: Enter and Space on
+    // them are claimed here, so the browser's activation never reaches them. Space there does nothing (one inside a
+    // pending leader sequence is the sequence's, below). A plain Enter there is card mode for that card, nothing
+    // highlighted -- such a button holds DOM focus only after a mouse press dragged off it -- and answers nothing;
+    // a modified one does nothing. A pending prefix owns the next key, so Enter/Space on a focused control never
+    // activates it. (`onAnswerButton` is computed at the top, ahead of the two modal overlays' early returns.)
+    if (isActivatableControl(event.target) && (event.key === "Enter" || event.key === " ") && pending !== null) {
       event.preventDefault();
-      if (pending === null) showFlash(COUNT_ANSWER_FLASH);
       return;
     }
     if (onAnswerButton && event.key === " ") {
       event.preventDefault();
       if (seqRef.current === null) return;
     }
-    // `:ls⏎` once approved `rm -rf important` (2026-09-29): a card's own button
-    // decides only the way `a`/`d` do. Enter is claimed first, so no path below leaves the native
-    // activation in place, and the button is pressed through `waitThenAnswer` -- `TYPING_GUARD_MS`
-    // later, any key in between cancelling it -- only with all three of: the typing guard's before-half
-    // (`mayAnswerNow`, whose walk exception keeps a quick `l⏎`); no modifier at all (Shift included,
-    // which `isPlainAnswerKey` lets through for `D`); and a landing, focus put on this very button by
-    // the key right before this one (`placedRef`: an `h`/`l` that moved it, a Tab, or a HINT with no
-    // key since). So `l`, `s`, Enter and `l`, `g`, `h`, Enter (a cancelled pair moves nothing) answer
-    // nothing however slowly they are typed. And only on the card `a`/`d` would
-    // answer from the cursor (`permissionTarget`) -- a Tab walks on from one card's buttons into
-    // the next card's, and `l`/`h` then walk that card's (`currentStop` follows focus), while the row
-    // cursor stays put, so a landing alone can sit on a card the cursor is not on.
     if (onAnswerButton && event.key === "Enter") {
       event.preventDefault();
-      const button = event.target as HTMLButtonElement;
-      const placed = placedRef.current;
-      if (!typingGuard.mayAnswerNow("Enter", typedAt, event.repeat)) {
-        showFlash(TYPING_FLASH);
-        return;
+      if (event.shiftKey || !isPlainAnswerKey(event.nativeEvent as unknown as KeyLike)) return;
+      const button = event.target as HTMLElement;
+      const row = root === null ? null : rowOf(root, button);
+      const index = root === null || row === null ? null : rowIndexOf(root, row);
+      if (index !== null && waitingCardButton(button, index)) {
+        enterCard(
+          index,
+          typedAt,
+          { mode: "browse", cursorKey: timeline[cursor]?.key ?? null, caret: null },
+          droppedFlash(null, count, seqRef.current?.typed ?? null),
+        );
       }
-      if (event.shiftKey || !isPlainAnswerKey(event.nativeEvent as unknown as KeyLike)) {
-        showFlash(MODIFIED_ENTER_FLASH);
-        return;
-      }
-      if (placed === null || placed.el !== button || placed.atKey !== typingGuard.keyCount() - 1) {
-        showFlash(ENTER_LANDING_FLASH);
-        return;
-      }
-      const buttonRow = root === null ? null : rowOf(root, button);
-      const buttonRowIndex = root === null || buttonRow === null ? null : rowIndexOf(root, buttonRow);
-      if (buttonRowIndex === null || buttonRowIndex !== permissionTarget(answerableItems, cursor)) {
-        showFlash(ENTER_ELSEWHERE_FLASH);
-        return;
-      }
-      // The same card, in the same tab, still takes it at fire time -- as `answerCardByKey` checks.
-      const tab = activeTabRef.current;
-      waitThenAnswer(
-        event,
-        typedAt,
-        () => activeTabRef.current === tab && button.isConnected && !button.disabled && document.activeElement === button,
-        () => button.click(),
-        "Enter",
-      );
       return;
     }
     // A GUI pass (2026-09-27): the activity line's Stop keeps Enter and Space,
@@ -5487,7 +5861,14 @@ export default function App() {
     // themselves, since neither of those takes an event to read `isComposing` off. A `{kind:"none"}`
     // start falls through to `resolveKey` below, never the other way; `startSequence` itself leaves
     // `g`/`z`/`[`/`]` to `resolveKey`'s own reserved two-key prefixes (`./leader`'s own doc comment).
+    // A leader sequence dropped by entering card mode, for the band.
+    let droppedSequence: string[] | null = null;
     if (mode === "browse" && !isImeKey({ isComposing: event.nativeEvent.isComposing, keyCode: event.keyCode })) {
+      if (seqRef.current !== null && cardModeDelta(event.nativeEvent as unknown as KeyLike) !== null) {
+        // Card mode's chord drops the sequence and enters, as it drops a pending prefix (`resolveKey` below).
+        droppedSequence = seqRef.current.typed;
+        clearSequence();
+      }
       if (seqRef.current !== null) {
         // A bare modifier's own keydown (the Control of a
         // Ctrl+c combo) is not "the next key" -- it must not cancel a pending sequence, the same way
@@ -5556,10 +5937,19 @@ export default function App() {
       table: panelTable,
     });
     if (action === null) return;
-    // INPUT's Ctrl+y. Handled here, ahead of the unconditional `preventDefault`
-    // further down, because with no card waiting the key stays the box's.
-    if (action.kind === "approve-oldest") {
-      approveOldestByKey(event, typedAt, afterKill);
+    // INPUT's Ctrl+y answers no card. Claimed, so the box does nothing with it, and the band says where cards are
+    // answered; nothing else happens, whatever waits.
+    if (action.kind === "ctrl-y-gone") {
+      event.preventDefault();
+      showFlash(CTRL_Y_GONE_FLASH);
+      return;
+    }
+    // `Alt+n`/`Alt+p`: card mode on the next / previous waiting card, whatever was pending dropped. From the box with a
+    // question waiting, the keys are the dock's and go back there.
+    if (action.kind === "card-mode") {
+      event.preventDefault();
+      const from = mode === "input" ? (waitingQuestion ? "dock" : "input") : "browse";
+      enterCardByChord(action.delta, typedAt, from, droppedFlash(pending, count, droppedSequence), event.repeat);
       return;
     }
     // A digit accumulates into the count the NEXT `j`/`k`/`[[`/`]]` repeats -- read back out of
@@ -5677,7 +6067,7 @@ export default function App() {
         if (spentInRow >= times) return;
       }
     }
-    if (action.kind === "move" || action.kind === "control" || action.kind === "answer") {
+    if (action.kind === "move" || action.kind === "control") {
       event.preventDefault();
       if (root === null) return;
       if (action.kind === "move") {
@@ -5742,22 +6132,7 @@ export default function App() {
         const stop = currentStop(root, cursor);
         const target = stop === null ? null : nextControl(stop, action.delta);
         if (target === "stop") root.focus({ preventScroll: true });
-        else if (target !== null) {
-          // A landing, recorded only where this key actually moved focus onto the
-          // control -- a clamped `l` on the last one moves nothing and lands nothing.
-          const moved = document.activeElement !== target;
-          target.focus();
-          if (moved && document.activeElement === target) placedRef.current = { el: target, atKey: typingGuard.keyCount() };
-        }
-      } else {
-        // `a`/`d` answer the card by its id (`answerCardByKey`), through the same
-        // `answerPermission` its buttons use, so one guard against a second answer covers both.
-        // Not from a banner's button: the row cursor is hollow there, and not what keys act on,
-        // so there is no card for it (a flash says so). Only the cursor's card or the
-        // card gating its tool call (`permissionTarget`) -- the old "the only card, from any row"
-        // is gone, since a key must answer the card the reader is looking at.
-        const target = edgeFocused ? null : permissionTarget(answerableItems, cursor);
-        answerCardByKey(event, typedAt, target, action.decision);
+        else if (target !== null) target.focus();
       }
       return;
     }
@@ -5790,6 +6165,23 @@ export default function App() {
         showFlash(ESC_DOES_NOT_INTERRUPT_FLASH);
         break;
       case "toggle-expand": {
+        // Enter on a card row, or on a tool row a card gates (`permissionTarget`): card mode for that card, only on
+        // an Enter that stands alone (as `i` needs), and in place of the tasks list for a task on that tool.
+        const cardAt = event.key === "Enter" && !edgeFocused && !sessionEnded ? permissionTarget(answerableItems, cursor) : null;
+        const cardItem = cardAt === null ? undefined : timeline[cardAt];
+        if (cardAt !== null && cardItem?.kind === "permission" && !answeredRef.current.has(cardItem.request.permissionId)) {
+          if (!typingGuard.mayAnswerNow(typedAt, event.repeat)) {
+            showFlash(ENTER_ALONE_FLASH);
+            break;
+          }
+          enterCard(
+            cardAt,
+            typedAt,
+            { mode: "browse", cursorKey: timeline[cursor]?.key ?? null, caret: null },
+            droppedFlash(pending, count, null),
+          );
+          break;
+        }
         const item = timeline[cursor];
         if (waitingQuestion && item?.kind === "message" && item.question?.interactionId === waitingQuestion.interactionId) {
           setMode("input");
@@ -5828,7 +6220,7 @@ export default function App() {
         break;
       }
       case "detailed":
-        // `Ctrl+o`. A per-tab toggle, mirrored to Rust in `saveView`/restored on a switch --
+        // `zi` / INPUT `Ctrl+o`. A per-tab toggle, mirrored to Rust in `saveView`/restored on a switch --
         // see `detailed`'s own doc comment.
         setDetailed((d) => !d);
         break;
@@ -5877,38 +6269,6 @@ export default function App() {
         else copied(text, item.key);
         break;
       }
-      case "deny-reason": {
-        if (root === null) break;
-        // The same card `a`/`d` would answer, and the same wait.
-        const target = edgeFocused ? null : permissionTarget(answerableItems, cursor);
-        // Another agent's card has no reason box: its deny carries no reason, so `D` says what happens
-        // instead of waiting for a box that is not there.
-        const targetItem = target === null ? undefined : timeline[target];
-        if (targetItem?.kind === "permission" && targetItem.request.editorCard !== undefined) {
-          showFlash("an editor card takes no reason with a deny; d denies");
-          break;
-        }
-        if (targetItem?.kind === "permission" && isExternalTool(targetItem.request.toolName)) {
-          showFlash(`${agentTitle(activeTabInfo(tabsRef.current)?.agent)} takes no reason with a deny; d denies`);
-          break;
-        }
-        // The card's row by structure: `conversationRows(root)[target]` is timeline item
-        // `target`, which a card row holds no model HTML inside.
-        const box =
-          target === null
-            ? null
-            : (conversationRows(root)[target]?.querySelector<HTMLInputElement>(".permission-card input") ?? null);
-        waitThenAnswer(event, typedAt, box === null ? null : () => box.isConnected, () => {
-          if (box === null) return;
-          // Re-read where the card is now: rows may have arrived above it during the wait.
-          const row = rowOf(root, box);
-          const index = row === null ? null : rowIndexOf(root, row);
-          if (index !== null && index !== cursorRef.current) setCursor(index);
-          landedControlRef.current = box;
-          box.focus();
-        });
-        break;
-      }
       case "restart":
         // `r` on an ended tab resets it to `NotStarted` IN PLACE: the tab keeps its
         // number and its rename, and the `tabs` envelope that follows is what actually drops this
@@ -5926,7 +6286,7 @@ export default function App() {
         // Only ever reached with the overlay closed -- the `keymapOpen` branch above returns
         // before `resolveKey` runs at all once it is open, `?`/`Escape`/`q` included, so this is
         // opening only, never a toggle-closed here.
-        setKeymapOpen(true);
+        openKeymap(mode === "input" ? "input" : "browse");
         break;
       case "hint": {
         // `f` is always the first key of whatever typed it ("fix the dashboard
@@ -5979,8 +6339,14 @@ export default function App() {
       }
       case "cancel":
         // Swallowed (`preventDefault` above), nothing runs. A key that merely ended a prefix
-        // says nothing, as vim's `clearopbeep` only beeps; a count before a card answer says why.
-        if (action.why === "count-on-answer") showFlash(COUNT_ANSWER_FLASH);
+        // says nothing, as vim's `clearopbeep` only beeps.
+        break;
+      case "card-key-gone":
+        // `a`/`d`/`D`/`]p`/`[p` answer and walk no card: they say where cards are answered now. On a card's row, or a
+        // tool row a card gates, `a`/`d`/`D` name card mode's way in; elsewhere they are no key at all.
+        if (action.key === "]p" || action.key === "[p") showFlash(cardJumpGoneFlash(action.key));
+        else if (!edgeFocused && permissionTarget(answerableItems, cursor) !== null) showFlash(cardKeyGoneFlash(action.key));
+        else showFlash(notAKeyHereFlash(action.key));
         break;
       case "pane":
         // `Ctrl+w h/j/k/l`, the keys to the module that way. shell runs the move
@@ -6086,6 +6452,7 @@ export default function App() {
         // cursor effect, which shows a tall row's near edge -- so the list is not scrolled to either
         // end. The landing is set only for a cursor that really moves: an unchanged cursor runs no
         // effect, and a value left behind would misplace some later, unrelated move.
+        noteJump();
         const target = jumpTarget(action.to, count, timeline.length);
         if (target !== cursor) landingRef.current = count === null ? "keep" : target > cursor ? 1 : -1;
         setCursor(target);
@@ -6094,6 +6461,32 @@ export default function App() {
         // A bare `G` asks for the end outright: following resumes even where the view is there already and the
         // write moves nothing (no scroll event would say so), as after a zoom left a reader at the end.
         if (list !== null && count === null && action.to === "last") resumeFollowing(list);
+        root?.focus({ preventScroll: true });
+        break;
+      }
+      case "jump-older":
+      case "jump-newer": {
+        const tab = activeTabRef.current;
+        const here = jumpPosition();
+        const list = tab === null ? emptyJumplist() : jumplistsRef.current.get(tab) ?? emptyJumplist();
+        const trip = action.kind === "jump-older"
+          ? here === null ? null : back(list, here)
+          : forward(list);
+        if (trip === null) {
+          showFlash(action.kind === "jump-older" ? NO_OLDER_JUMP_FLASH : NO_NEWER_JUMP_FLASH);
+          break;
+        }
+        if (tab !== null) jumplistsRef.current.set(tab, trip.list);
+        const target = landingIndex(trip.to, timeline.map((row) => row.key));
+        const row = messageList === null ? undefined : conversationRows(messageList)[target];
+        if (messageList !== null && row !== undefined) {
+          const delta = row.getBoundingClientRect().top - messageList.getBoundingClientRect().top + trip.to.offset;
+          noteUserScroll(messageList, delta < 0 ? "up" : "down");
+          const maxScroll = Math.max(0, messageList.scrollHeight - messageList.clientHeight);
+          messageList.scrollTop = Math.max(0, Math.min(messageList.scrollTop + delta, maxScroll));
+        }
+        if (target !== cursor) landingRef.current = "keep";
+        setCursor(target);
         root?.focus({ preventScroll: true });
         break;
       }
@@ -6133,37 +6526,11 @@ export default function App() {
         let target: number | null = cursor;
         for (let n = 0; n < times && target !== null; n++) target = promptIndex(timeline, target, action.delta) ?? null;
         if (target !== null && target !== cursor) {
+          noteJump();
           noteUserScroll(messageList, action.delta > 0 ? "down" : "up");
           landingRef.current = action.delta;
           setCursor(target);
         }
-        root?.focus({ preventScroll: true });
-        break;
-      }
-      case "card-jump": {
-        // `]p`/`[p` move the CURSOR to the next/previous card waiting for an answer,
-        // wrapping as nvim's `]d` does, `times` cards on -- and do nothing else. No `answerPermission`, no
-        // `waitThenAnswer`, no button pressed: a lone `a`/`d` afterwards answers the card this landed on
-        // (`permissionTarget`) and an `a` typed hard on the heels of the jump is refused like any other.
-        // A card waits when this panel has not answered it and its session lives -- a dead session's
-        // cards stay drawn but inert, and `a` on one does nothing -- the test `answerCardByKey`'s
-        // `stillThere` makes at fire time, made here so the cursor never lands on a card that cannot answer.
-        const target = sessionEnded ? null : waitingCardAfter(timeline, cursor, action.delta, times, answeredRef.current);
-        if (target === null) {
-          showFlash(NO_WAITING_CARD_FLASH);
-          break;
-        }
-        if (target !== cursor) {
-          // The way the cursor really travels, not the key's: a wrap from the last card to the first goes UP
-          // the list, and only a scroll up stops the list following. `landingRef` is the key's own -- which
-          // edge of a row taller than the view to show (`revealRow`), the top after `]p`, the bottom after `[p`.
-          noteUserScroll(messageList, target < cursor ? "up" : "down");
-          landingRef.current = action.delta;
-          setCursor(target);
-        }
-        // Even with the cursor staying (the one card waiting is the one it is on): the keys come back to the
-        // row from a focused control -- Approve after `l`, Stop -- as every other cursor move does, so the
-        // next `a` acts on the card the cursor shows and Enter cannot press a button it has left.
         root?.focus({ preventScroll: true });
         break;
       }
@@ -6176,9 +6543,7 @@ export default function App() {
         // The `/` prompt and the `:` line are one command line, as vim's are, so
         // opening either closes the other. Two boxes drawn, one without the keys, was a state a click
         // back on the conversation could reach, and `takeKeys` then focused the `/` one, newer or not.
-        setExLine(null);
-        setSearch({ query: "", origin: cursor });
-        setLineFocusRequest((n) => n + 1);
+        openSearch(cursor, action.dir);
         break;
       case "ex-line":
         // The box takes the keys (`SearchBar` focuses itself), runs nothing. A line already open -- the keys
@@ -6187,10 +6552,14 @@ export default function App() {
         openExLine();
         break;
       case "search-next": {
-        const found = findMatch(timeline, lastSearchRef.current, cursor, action.delta, false);
+        const { query, dir } = lastSearchRef.current;
+        const found = findMatch(timeline, query, cursor, (dir * action.delta) as 1 | -1, false);
         if (found === null) {
-          if (lastSearchRef.current !== "") showFlash(`pattern not found: ${lastSearchRef.current}`);
-        } else moveCursorTo(found);
+          if (query !== "") showFlash(`pattern not found: ${query}`);
+        } else {
+          noteJump();
+          moveCursorTo(found);
+        }
         // Same reason `move`/`jump`/`prompt-jump` and the Ctrl+d/Ctrl+u re-home all do this: a
         // cursor move must take the keys back from a focused control (e.g. a permission card's
         // Approve after `l`), or a stale `document.activeElement` keeps answering Enter/Space for a
@@ -6325,6 +6694,9 @@ export default function App() {
           onTasksKey(event);
           return;
         }
+        // Card mode takes every key while it holds a card, ahead of the dock, the region and everything under the
+        // root -- a card's own buttons and reason field included.
+        if (onCardModeKey(event)) return;
 
         const target = event.target instanceof Element ? event.target : null;
         const questionCovered = overlayOpen || keymapOpen || detail !== null || handoffOpen || pathPick !== null || linkPick !== null;
@@ -6384,15 +6756,6 @@ export default function App() {
         heldLinkRef.current = { link: { el: anchor, row: rowOf(root, anchor), url }, text, seq, look };
       }}
       onFocus={(event) => {
-        // The focus move a plain Tab just made is a landing, at that Tab's count --
-        // consumed by the first focus event after it, so a focus nothing typed (an effect, a later
-        // envelope) is never one. And only while that Tab's default is still
-        // alive, read now that every handler has run -- a Tab one of them claimed moved nothing.
-        const lastTab = tabAtKeyRef.current;
-        if (lastTab !== null && lastTab.atKey === typingGuard.keyCount() && !lastTab.event.defaultPrevented) {
-          placedRef.current = { el: event.target as HTMLElement, atKey: lastTab.atKey };
-        }
-        tabAtKeyRef.current = null;
         // The outermost stop (`stopOf`): a link inside a reply is in the reply's row, whatever the
         // reply's own HTML claims to be.
         const stop = containerRef.current === null ? null : stopOf(containerRef.current, event.target as HTMLElement);
@@ -6401,6 +6764,16 @@ export default function App() {
         // anything but its own root -- a click into a card's reason box, a button, the composer, the
         // tab bar.
         if (containerRef.current !== null && event.target !== containerRef.current) exitRegion();
+        // Card mode holds the keys on the root, or in its card's open reason field; focus landing anywhere else in
+        // the panel (a click into the box, onto a button) takes them, and card mode ends.
+        const heldCard = cardModeRef.current;
+        if (
+          heldCard !== null &&
+          event.target !== containerRef.current &&
+          !(heldCard.reasonOpen && event.target === cardReasonInput(heldCard.card.permissionId))
+        ) {
+          endCardMode();
+        }
       }}
     >
       {tabs !== null && showTabBar(tabs.tabs.length, renaming !== null) && (
@@ -6452,10 +6825,7 @@ export default function App() {
             yankedKey={yanked?.key ?? null}
             onAnswerPermission={answerPermission}
             answeredPermissions={frozenSnapshot?.answeredPermissions ?? answeredPermissions}
-            onPermissionReason={(permissionId, reason) => {
-              if (reason === "") permissionReasons.current.delete(permissionId);
-              else permissionReasons.current.set(permissionId, reason);
-            }}
+            cardMode={cardModeShown}
             onOpenPath={openPath}
             onUnreadChange={(label, jump, afterSeq) => {
               setUnreadLabel(label);
@@ -6481,6 +6851,7 @@ export default function App() {
               plugin={keymapPlugin ?? undefined}
               phones={connectedPhones}
               deviceList={remoteOn}
+              openAt={keymapSection}
               startAt={keymapOpening.current !== null && keymapPlugin === null ? "prefix" : undefined}
               startRequest={keymapRequest}
               claudeSlashCommands={!isExternalAgent(activeTab?.agent)}
@@ -6634,6 +7005,7 @@ export default function App() {
           editReturnRef.current = { tab: activeTab.id, requestId,
             question: { identity: questionIdentity!, index }, started: false, finished: false };
         }}
+        onHelp={() => openKeymap("question")}
         stillWaiting={questionStillWaiting(activeTab.id, waitingQuestion.interactionId)}
       />}
       <Composer
@@ -6693,7 +7065,7 @@ export default function App() {
         editingInNvim={scratchEditing}
         onOpenKeymap={() => {
           setMode("browse");
-          setKeymapOpen(true);
+          openKeymap("input");
         }}
         // The `Ctrl+r` search's Enter/Tab/Escape reach the typing guard.
         onLineKey={noteLineKey}
@@ -6738,19 +7110,22 @@ export default function App() {
           }
         >
           <SearchBar
+            lead={search.dir === 1 ? "/" : "?"}
             query={search.query}
             focusRequest={lineFocusRequest}
             onChange={(query) => {
-              setSearch({ query, origin: search.origin });
-              const found = findMatch(timeline, query, search.origin, 1, true);
+              setSearch({ ...search, query });
+              const found = findMatch(timeline, query, search.origin, search.dir, true);
               setCursor(found ?? search.origin);
             }}
             onAccept={(event) => {
               noteLineKey(event);
-              lastSearchRef.current = search.query;
-              if (search.query !== "" && findMatch(timeline, search.query, search.origin, 1, true) === null) {
+              lastSearchRef.current = { query: search.query, dir: search.dir };
+              if (search.query !== "" && findMatch(timeline, search.query, search.origin, search.dir, true) === null) {
                 showFlash(`pattern not found: ${search.query}`);
                 setCursor(search.origin);
+              } else if (search.query !== "") {
+                noteJump(searchOriginRef.current);
               }
               setSearch(null);
               containerRef.current?.focus({ preventScroll: true });
@@ -6792,6 +7167,8 @@ export default function App() {
             ?? (state.rateLimitWarning ? `Usage limit warning${typeof state.rateLimitWarning.scalars.resets_at_ms === "number" ? ` · limit resets ${new Date(state.rateLimitWarning.scalars.resets_at_ms).toLocaleTimeString("en-GB", { hour: "2-digit", minute: "2-digit", hour12: false })}` : ""}` : null),
           unread: unreadLabel,
           cards: allCards(state).length,
+          cardMode: bandCard.cardMode,
+          onCard: bandCard.onCard,
           questions: waitingQuestions.length,
           queued: queue.length,
           context: sessionEnded ? null : contextFact(editorContext),
@@ -6808,8 +7185,6 @@ export default function App() {
           usage: usageSegment(state.usage),
           // How the latest turn ended when it did not complete, until the next turn starts.
           ending: latestTurnEnding(state),
-          // The card INPUT's Ctrl+y would approve, while the box has the keys.
-          approve: ctrlYCard,
           // A finished turn of this tab changed files on disk; `c` shows them.
           review: activeTab !== null && reviewHints[activeTab.id] !== undefined
             ? { files: reviewHints[activeTab.id].files, keyOnly: reviewSettings.hint === "key" } : null,

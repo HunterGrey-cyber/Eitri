@@ -95,24 +95,30 @@
   {
     "label": "a, a live session",
     "expected": {
-      "kind": "answer",
-      "decision": "allow"
+      "kind": "card-key-gone",
+      "key": "a"
     }
   },
   {
     "label": "a, a session that ended",
-    "expected": null
+    "expected": {
+      "kind": "card-key-gone",
+      "key": "a"
+    }
   },
   {
     "label": "d, a live session",
     "expected": {
-      "kind": "answer",
-      "decision": "deny"
+      "kind": "card-key-gone",
+      "key": "d"
     }
   },
   {
     "label": "d, a session that ended",
-    "expected": null
+    "expected": {
+      "kind": "card-key-gone",
+      "key": "d"
+    }
   },
   {
     "label": "Enter",
@@ -135,12 +141,16 @@
   {
     "label": "Shift+D, a live session",
     "expected": {
-      "kind": "deny-reason"
+      "kind": "card-key-gone",
+      "key": "D"
     }
   },
   {
     "label": "Shift+D, a session that ended",
-    "expected": null
+    "expected": {
+      "kind": "card-key-gone",
+      "key": "D"
+    }
   },
   {
     "label": "i, a live session",
@@ -197,7 +207,8 @@
   {
     "label": "/",
     "expected": {
-      "kind": "search"
+      "kind": "search",
+      "dir": 1
     }
   },
   {
@@ -217,7 +228,7 @@
   {
     "label": "Ctrl+o, browse",
     "expected": {
-      "kind": "detailed"
+      "kind": "jump-older"
     }
   },
   {
@@ -249,7 +260,8 @@
   {
     "label": "?",
     "expected": {
-      "kind": "keymap"
+      "kind": "search",
+      "dir": -1
     }
   },
   {
@@ -458,7 +470,21 @@
     }
   },
   {
+    "label": "visual: /",
+    "expected": {
+      "kind": "vsearch",
+      "dir": 1
+    }
+  },
+  {
     "label": "visual: ?",
+    "expected": {
+      "kind": "vsearch",
+      "dir": -1
+    }
+  },
+  {
+    "label": "visual: F1",
     "expected": {
       "kind": "keymap"
     }
@@ -605,7 +631,21 @@
     }
   },
   {
+    "label": "vline: /",
+    "expected": {
+      "kind": "vsearch",
+      "dir": 1
+    }
+  },
+  {
     "label": "vline: ?",
+    "expected": {
+      "kind": "vsearch",
+      "dir": -1
+    }
+  },
+  {
+    "label": "vline: F1",
     "expected": {
       "kind": "keymap"
     }
@@ -763,7 +803,21 @@
     }
   },
   {
+    "label": "caret: /",
+    "expected": {
+      "kind": "vsearch",
+      "dir": 1
+    }
+  },
+  {
     "label": "caret: ?",
+    "expected": {
+      "kind": "vsearch",
+      "dir": -1
+    }
+  },
+  {
+    "label": "caret: F1",
     "expected": {
       "kind": "keymap"
     }
@@ -809,9 +863,39 @@
     }
   },
   {
+    "label": "F1, browse",
+    "expected": {
+      "kind": "keymap"
+    }
+  },
+  {
+    "label": "F1, input",
+    "expected": {
+      "kind": "keymap"
+    }
+  },
+  {
+    "label": "g?",
+    "expected": {
+      "kind": "keymap"
+    }
+  },
+  {
+    "label": "zi",
+    "expected": {
+      "kind": "detailed"
+    }
+  },
+  {
+    "label": "Ctrl+i, browse",
+    "expected": {
+      "kind": "jump-newer"
+    }
+  },
+  {
     "label": "Ctrl+y, input",
     "expected": {
-      "kind": "approve-oldest"
+      "kind": "ctrl-y-gone"
     }
   },
   {

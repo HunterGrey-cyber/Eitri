@@ -8,8 +8,8 @@ type Props = {
   onAccept: (text: string) => void;
   onCancel: () => void;
   /** The keys this line claims and stops (Enter, Tab,
-   *  Escape) never bubble to `App`'s own `onKeyDown`, so its typing guard never saw them and a
-   *  `Ctrl+y` right after one approved a card. Each is handed over here first, as the `/` and `:`
+   *  Escape) never bubble to `App`'s own `onKeyDown`, so its typing guard would not see them and a
+   *  card key right after one would count as standing alone. Each is handed over here first, as the `/` and `:`
    *  lines hand theirs over (`App.tsx`'s `noteLineKey`). */
   onLineKey?: (event: React.KeyboardEvent<HTMLInputElement | HTMLTextAreaElement>) => void;
 };

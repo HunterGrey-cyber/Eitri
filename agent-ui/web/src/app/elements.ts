@@ -1,4 +1,3 @@
-import type { KeyboardEvent } from "react";
 import type { SlashPickerKind } from "../components/SlashPicker";
 import type { AppliedSettings, EffortChoice, ModelOption, TabId } from "../types";
 import type { Caret } from "../visual";
@@ -7,31 +6,13 @@ import type { Caret } from "../visual";
  *  `contenteditable`. Used to decide what the panel's own keydown handlers must stay out of: this
  *  panel does not own every keystroke inside its own subtree, only the ones outside a text field
  *  someone is actually typing into. Not scoped to any one component on purpose -- a permission
- *  card's deny-reason box is the one that exists today, but the rule is general and must hold for
+ *  card's reason box is the one that exists today, but the rule is general and must hold for
  *  whatever text field a later card adds too. */
 export function isEditableElement(el: EventTarget | null): el is HTMLElement {
   if (!(el instanceof HTMLElement)) return false;
   return el.tagName === "INPUT" || el.tagName === "TEXTAREA" || el.isContentEditable;
 }
 
-/** The composer's own textarea (never the `Ctrl+r` search field, nor a card's
- *  reason box), the one place INPUT's `Ctrl+y` answers from. */
-export function isComposerBox(el: EventTarget | null): el is HTMLTextAreaElement {
-  return el instanceof HTMLTextAreaElement && el.closest(".composer") !== null;
-}
-
-/** A readline kill in the composer -- `Ctrl+u`, `Ctrl+w`, `Ctrl+k` with
- *  nothing else held -- after which `Ctrl+y` is a yank. */
-export function isKillKey(event: KeyboardEvent<HTMLElement>): boolean {
-  return (
-    isComposerBox(event.target) &&
-    event.ctrlKey &&
-    !event.shiftKey &&
-    !event.altKey &&
-    !event.metaKey &&
-    ["u", "w", "k"].includes(event.key.toLowerCase())
-  );
-}
 /** What an open `/model`/`/effort` picker shows. */
 export type SlashPickerState = { kind: SlashPickerKind; options: string[]; current: string | null; labels?: Record<string, string>; direct?: boolean };
 /** A request of the direct route for the model and the effort, until its answer: the list a picker opens from, or a

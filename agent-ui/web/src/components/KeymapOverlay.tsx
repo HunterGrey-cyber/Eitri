@@ -1,6 +1,6 @@
 import { forwardRef, useLayoutEffect, useRef } from "react";
 import type { Ref } from "react";
-import { browseKeys, CARET_KEYS, INPUT_KEYS, QUESTION_KEYS, REVIEW_KEYS, TASKS_KEYS, VISUAL_KEYS } from "../keymap";
+import { browseKeys, CARD_KEYS, CARET_KEYS, INPUT_KEYS, QUESTION_KEYS, REVIEW_KEYS, TASKS_KEYS, VISUAL_KEYS } from "../keymap";
 import type { KeyHelp, PanelBinding, PanelTable, PluginKeysHelp } from "../keymap";
 import { sequenceTitle } from "../leader";
 import { listedSlashCommands } from "../slashCommands";
@@ -48,6 +48,8 @@ type Props = {
   deviceList?: boolean;
   /** Open at the window prefix keys when no plugin section takes precedence. */
   startAt?: "prefix";
+  /** Otherwise open at the section of the mode `F1` was pressed in (`card`: card mode's own keys). */
+  openAt?: "browse" | "input" | "selecting" | "question" | "card";
   /** Which opening request `startAt` belongs to. A different number while the sheet is up positions it again;
    *  the same number never does, so ordinary re-renders leave the reader's scroll alone. */
   startRequest?: number;
@@ -240,10 +242,10 @@ function KeyTable({ heading, rows }: { heading: string; rows: KeyHelp[] }) {
 
 /** Selecting shows CARET then VISUAL under separate headings. Shared keys such as gg and Esc
  *  have different meanings in the two modes, so one merged table is ambiguous. */
-function Selecting({ panel }: { panel: PanelTable }) {
+function Selecting({ panel, headingRef }: { panel: PanelTable; headingRef?: Ref<HTMLHeadingElement> }) {
   return (
     <section>
-      <h2>Selecting (v)</h2>
+      <h2 ref={headingRef}>Selecting (v)</h2>
       <KeyTable heading="CARET" rows={CARET_KEYS} />
       <KeyTable heading="VISUAL" rows={VISUAL_KEYS} />
       <p>{visualEntryNote(panel)}</p>
@@ -274,10 +276,15 @@ function SlashCommands() {
  *  so reading the sheet never acts on a card underneath. Only a click on the backdrop closes it here:
  *  a click inside a table must still allow reading a row or selecting its text. */
 export const KeymapOverlay = forwardRef<HTMLDivElement, Props>(function KeymapOverlay(
-  { pages = [], onClose, windowKeys, prefixKeys, prefixLabel, panel, tmuxSkipped, companion = false, claudeSlashCommands = true, agent = null, modes = ALL_MODES, plugin, phones, deviceList = false, startAt, startRequest = 0 },
+  { pages = [], onClose, windowKeys, prefixKeys, prefixLabel, panel, tmuxSkipped, companion = false, claudeSlashCommands = true, agent = null, modes = ALL_MODES, plugin, phones, deviceList = false, startAt, openAt, startRequest = 0 },
   ref,
 ) {
   const prefixHeading = useRef<HTMLHeadingElement>(null);
+  const cardHeading = useRef<HTMLHeadingElement>(null);
+  const browseHeading = useRef<HTMLHeadingElement>(null);
+  const inputHeading = useRef<HTMLHeadingElement>(null);
+  const selectingHeading = useRef<HTMLHeadingElement>(null);
+  const questionHeading = useRef<HTMLHeadingElement>(null);
   // Positioned once per request, not per render: a re-render must not undo the reader's own scrolling,
   // but a new request that arrives while the sheet is up (prefix ? over the chat's ?) moves it.
   const positionedFor = useRef<number | null>(null);
@@ -286,6 +293,9 @@ export const KeymapOverlay = forwardRef<HTMLDivElement, Props>(function KeymapOv
     positionedFor.current = startRequest;
     if (startAt === "prefix" && plugin === undefined) {
       prefixHeading.current?.scrollIntoView({ block: "start" });
+    } else if (openAt !== undefined && plugin === undefined) {
+      const heading = { browse: browseHeading, input: inputHeading, selecting: selectingHeading, question: questionHeading, card: cardHeading }[openAt];
+      heading.current?.scrollIntoView({ block: "start" });
     }
   }, [startRequest]);
   return (
@@ -316,10 +326,18 @@ export const KeymapOverlay = forwardRef<HTMLDivElement, Props>(function KeymapOv
       )}
       <Section
         title="This panel"
+        headingRef={browseHeading}
         rows={[...browseKeys(prefixLabel), { keys: "Ctrl+j", what: "Type (the box below)" }]}
         note={`Ctrl+[ is Esc everywhere in this panel. Modes (Shift+Tab): ${modes
           .map((mode) => `${mode} — ${modeConsequence(mode, agent, prefixLabel)}`)
           .join(" ")}`}
+      />
+      {/* Card mode's keys, `cardKey`'s (`../cardMode`), tied to it by `keymap.test.ts`. */}
+      <Section
+        title="Answering a card"
+        headingRef={cardHeading}
+        rows={CARD_KEYS}
+        note="Card mode: Alt-n / Alt-p from browsing or typing, or Enter on a card's row (on its own). A digit answers only once the card has been on screen in card mode for a moment, and any other key in between makes it wait again. A card never takes card mode by itself."
       />
       {pages.length > 0 && (
         <section>
@@ -331,7 +349,7 @@ export const KeymapOverlay = forwardRef<HTMLDivElement, Props>(function KeymapOv
           </ul>
         </section>
       )}
-      <Selecting panel={panel} />
+      <Selecting panel={panel} headingRef={selectingHeading} />
       {/* The review overlay (`c`): its keys are `./review`'s, not `resolveKey`'s, so they are a section of
           their own, tied to that table both ways by `review.test.ts`. */}
       <Section
@@ -359,6 +377,7 @@ export const KeymapOverlay = forwardRef<HTMLDivElement, Props>(function KeymapOv
           says it. */}
       <Section
         title="Typing"
+        headingRef={inputHeading}
         note="Enter also sends the editor's file name — not its text or cursor — or the lines selected there in Visual mode (up to 400 lines and 2000 characters). /model, /effort and the CLI's other local commands go without it."
         rows={[
           ...INPUT_KEYS.map((row) => cycleRow(row, modes)),
@@ -389,6 +408,7 @@ export const KeymapOverlay = forwardRef<HTMLDivElement, Props>(function KeymapOv
       {claudeSlashCommands && (
         <Section
           title="Claude's question"
+          headingRef={questionHeading}
           rows={QUESTION_KEYS}
           note="While Claude asks, the question takes the box's place; only keys you press answer it."
         />

@@ -3,8 +3,8 @@
  * A model reply that carries navigation markers must never impersonate the panel's rows.
  * Elements marked `data-nav-stop="row"` must not move which
  * row a key acts on. The rows are found by structure -- a stop is never inside another stop -- and
- * `a`/`d` answer the card under the cursor by its `permissionId`, never by clicking a button that a
- * DOM query found.
+ * card mode, entered by Enter on the cursor's row, answers that card by its `permissionId`, never by
+ * clicking a button that a DOM query found. `a`/`d` answer nothing.
  *
  * Every case runs twice: once through the real sanitizer (`renderMarkdown`), and once with it
  * bypassed, rendering the reply's raw HTML, so the structural rule stands on its own
@@ -39,7 +39,10 @@ beforeEach(() => {
   (window as unknown as { webkit: unknown }).webkit = {
     messageHandlers: { eitriAgent: { postMessage: (msg: string) => posted.push(JSON.parse(msg)) } },
   };
-  vi.useFakeTimers();
+  // Card mode arms from its paint, which the animation frames bring.
+  vi.useFakeTimers({
+    toFake: ["setTimeout", "clearTimeout", "setInterval", "clearInterval", "setImmediate", "clearImmediate", "Date", "performance", "requestAnimationFrame", "cancelAnimationFrame"],
+  });
 });
 afterEach(() => {
   vi.useRealTimers();
@@ -71,6 +74,16 @@ const wait = (ms = 300) => act(() => vi.advanceTimersByTime(ms));
 const press = (key: string, init: Record<string, unknown> = {}) =>
   fireEvent.keyDown(document.activeElement ?? document.body, { key, ...init });
 const answered = () => posted.filter((m) => m.type === "permission_response");
+/** Card mode on the cursor's card (a lone Enter), armed. */
+function cardModeHere() {
+  press("Enter");
+  wait(400);
+}
+/** `digit` in armed card mode, then past its after-half. */
+function answerWith(digit: string) {
+  press(digit);
+  wait();
+}
 const text = (el: Element | null | undefined) => (el?.textContent ?? "").replace(/\s+/g, " ");
 const root = (c: HTMLElement) => c.querySelector<HTMLElement>(".agent-ui-conversation")!;
 
@@ -124,52 +137,64 @@ describe.each([
     markdown.raw = raw;
   });
 
-  it("the probe: arrive, j, j, a approves the echo card the cursor is on, never rm", () => {
+  it("the probe: arrive, j, j, then card mode and 1 approve the echo card the cursor is on, never rm; a answers nothing", () => {
     const { container } = setup(TWO_HIDDEN_ROWS);
     arriveThenTwoJ(container);
     expect(isEchoCard(cursorRow(container))).toBe(true);
     press("a");
     wait();
+    expect(answered()).toEqual([]);
+    cardModeHere();
+    expect(isEchoCard(container.querySelector(".permission-card-mode")!.closest(".row"))).toBe(true);
+    answerWith("1");
     expect(answered()).toEqual([expect.objectContaining({ permission_id: "perm-echo", decision: "allow" })]);
   });
 
-  it("d on the echo card denies the echo card", () => {
+  it("card mode on the echo card, then 2, denies the echo card", () => {
     const { container } = setup(TWO_HIDDEN_ROWS);
     arriveThenTwoJ(container);
-    press("d");
-    wait();
+    cardModeHere();
+    answerWith("2");
     expect(answered()).toEqual([expect.objectContaining({ permission_id: "perm-echo", decision: "deny" })]);
   });
 
-  it("d on the rm card itself denies rm (the probe's realism case answered nothing)", () => {
+  it("card mode on the rm card itself, then 2, denies rm (the probe's realism case answered nothing)", () => {
     const { container } = setup(TWO_HIDDEN_ROWS);
     dispatch({ kind: "arrive" });
     wait();
     expect(isRmCard(cursorRow(container))).toBe(true);
-    press("d");
-    wait();
+    cardModeHere();
+    answerWith("2");
     expect(answered()).toEqual([expect.objectContaining({ permission_id: "perm-rm", decision: "deny" })]);
   });
 
-  it("D puts the keys in the echo card's own reason box", () => {
+  it("Tab in card mode puts the keys in the echo card's own reason box, and Enter there denies with it", () => {
     const { container } = setup(TWO_HIDDEN_ROWS);
     arriveThenTwoJ(container);
     press("D", { shiftKey: true });
     wait();
+    expect((document.activeElement as HTMLElement).tagName).not.toBe("INPUT");
+    cardModeHere();
+    press("Tab");
     const box = document.activeElement as HTMLInputElement;
     expect(box.tagName).toBe("INPUT");
     expect(isEchoCard(box.closest(".row"))).toBe(true);
     fireEvent.change(box, { target: { value: "not now" } });
+    wait(400);
     fireEvent.keyDown(box, { key: "Enter" });
+    wait();
     expect(answered()).toEqual([expect.objectContaining({ permission_id: "perm-echo", decision: "deny", reason: "not now" })]);
   });
 
-  it("l on the echo card selects the echo card's own Approve", () => {
+  /* A card's answer buttons are off the walk: `l` on the echo card lands on none of them (injected or its own), and
+     the keys stay on the echo card's row. */
+  it("l on the echo card walks onto no card button, and the echo card stays current", () => {
     const { container } = setup(TWO_HIDDEN_ROWS);
     arriveThenTwoJ(container);
     press("l");
-    expect(document.activeElement?.textContent).toBe("Approve");
-    expect(isEchoCard(document.activeElement!.closest(".row"))).toBe(true);
+    expect(document.activeElement?.closest("[data-card-control]") ?? null).toBeNull();
+    expect(document.activeElement).toBe(root(container));
+    expect(isEchoCard(cursorRow(container))).toBe(true);
   });
 
   it("j and k walk the conversation's own rows, one per press, never an injected one", () => {
@@ -197,10 +222,15 @@ describe.each([
   it("j and k from a card's own button step to the rows next to that card", () => {
     const { container } = setup(TWO_HIDDEN_ROWS);
     const rows = () => Array.from(container.querySelectorAll('.message-list > [data-nav-stop="row"]'));
-    // arrive: the rm card (timeline 3); l: its Approve has the keys; j: the echo call (timeline 4).
+    // A card button holds DOM focus only after a mouse press dragged off it.
+    const focusRmApprove = () => {
+      const card = rows().find((row) => isRmCard(row))!;
+      act(() => card.querySelector<HTMLButtonElement>('[data-nav-action="allow"]')!.focus());
+    };
+    // arrive: the rm card (timeline 3); its Approve has the keys; j: the echo call (timeline 4).
     dispatch({ kind: "arrive" });
     wait();
-    press("l");
+    focusRmApprove();
     expect(isRmCard(document.activeElement!.closest(".row"))).toBe(true);
     press("j");
     wait();
@@ -208,14 +238,14 @@ describe.each([
     // Back on the rm card's Approve, k: the rm call (timeline 2).
     press("k");
     wait();
-    press("l");
+    focusRmApprove();
     expect(isRmCard(document.activeElement!.closest(".row"))).toBe(true);
     press("k");
     wait();
     expect(rows().indexOf(cursorRow(container)!)).toBe(2);
   });
 
-  it("a HINT landing on the echo card puts the cursor on it, and a answers it", () => {
+  it("a HINT landing on the echo card puts the cursor on it, and card mode there answers it", () => {
     const { container } = setup(TWO_HIDDEN_ROWS);
     // jsdom lays nothing out: give every stop, control and code block its own 10px box.
     const box = (el: Element, top: number, height = 10) => {
@@ -236,8 +266,8 @@ describe.each([
     dispatch({ kind: "hint_land", sessionId: 1, index });
     expect(cursorRow(container)).toBe(echoCard);
     wait();
-    press("a");
-    wait();
+    cardModeHere();
+    answerWith("1");
     expect(answered()).toEqual([expect.objectContaining({ permission_id: "perm-echo", decision: "allow" })]);
   });
 
@@ -365,55 +395,63 @@ describe("y copies what is shown", () => {
 });
 
 describe("a key answers a card by its id, and only once", () => {
-  it("a disables the card it answered, and neither a second a nor a click sends another answer", () => {
+  it("card mode's 1 disables the card it answered, and neither a second answer nor a click sends another", () => {
     const { container } = setup("(nothing)");
     dispatch({ kind: "arrive" });
     wait();
-    press("a");
-    wait();
+    cardModeHere();
+    answerWith("1");
     expect(answered()).toEqual([expect.objectContaining({ permission_id: "perm-rm", decision: "allow" })]);
     const card = cursorRow(container)!;
     const approve = Array.from(card.querySelectorAll("button")).find((b) => b.textContent === "Approve")!;
     expect(approve.disabled).toBe(true);
     press("a");
     wait();
+    cardModeHere();
+    answerWith("1");
     fireEvent.click(approve);
     expect(answered()).toHaveLength(1);
   });
 
-  it("d sends the reason already typed into the card's box, as the card's own Deny does", () => {
+  it("the reason typed into the card's box is kept when the field closes, and its Enter sends it", () => {
     const { container } = setup("(nothing)");
     dispatch({ kind: "arrive" });
     wait();
-    press("D", { shiftKey: true });
-    wait();
+    cardModeHere();
+    press("Tab");
     const box = document.activeElement as HTMLInputElement;
     expect(box.tagName).toBe("INPUT");
     fireEvent.change(box, { target: { value: "keep it" } });
     fireEvent.keyDown(box, { key: "Escape" });
     expect(document.activeElement).toBe(root(container));
-    wait();
-    press("d");
+    expect(container.querySelector(".permission-card-mode")).not.toBeNull();
+    wait(400);
+    press("Tab");
+    expect(document.activeElement).toBe(box);
+    expect(box.value).toBe("keep it");
+    wait(400);
+    fireEvent.keyDown(box, { key: "Enter" });
     wait();
     expect(answered()).toEqual([expect.objectContaining({ permission_id: "perm-rm", decision: "deny", reason: "keep it" })]);
   });
 
-  it("a waiting a does nothing once the card was answered by a click in the meantime", () => {
+  it("an answer in its after-half does nothing once the card was answered by a click in the meantime", () => {
     const { container } = setup("(nothing)");
     dispatch({ kind: "arrive" });
     wait();
-    press("a");
-    const card = cursorRow(container)!;
-    fireEvent.click(Array.from(card.querySelectorAll("button")).find((b) => b.textContent === "Deny")!);
+    cardModeHere();
+    press("1");
+    fireEvent.click(container.querySelector<HTMLButtonElement>('.row-permission [data-nav-action="deny"]')!, { detail: 1 });
     wait();
     expect(answered()).toEqual([expect.objectContaining({ permission_id: "perm-rm", decision: "deny" })]);
   });
 
-  it("a waiting a does nothing once the card was resolved in the meantime", () => {
+  it("an answer in its after-half does nothing once the card was resolved in the meantime", () => {
     setup("(nothing)");
     dispatch({ kind: "arrive" });
     wait();
-    press("a");
+    cardModeHere();
+    press("1");
     dispatch({
       kind: "events",
       tab: 1,

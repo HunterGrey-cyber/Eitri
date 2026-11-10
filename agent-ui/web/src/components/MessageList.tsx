@@ -13,11 +13,13 @@ import type { TurnDurations } from "../turnTimes";
 import { HistoryNotice } from "./HistoryNotice";
 import { historyNoticeText } from "../history";
 import { PermissionCard } from "./PermissionCard";
+import type { CardModeView } from "./PermissionCard";
 import { Row } from "./Row";
 import { Revealed } from "./Revealed";
 import { revealHidden } from "../revealHidden";
 import { followSelection } from "../visualPaint";
 import type { PermissionDecision } from "../bridge";
+import type { PointerAnswerProof } from "../answerProof";
 import { noteUserScroll, RESUME_FOLLOW_EVENT, USER_SCROLL_EVENT, type UserScrollDirection } from "../follow";
 import { pillLabel, pillShown } from "../pill";
 import { parsePath } from "../paths";
@@ -68,13 +70,21 @@ type Props = {
   /** The row just yanked, so it can flash (`.row-yanked`). `App.tsx` owns the timer; this only
    *  reads the current key. */
   yankedKey?: string | null;
-  onAnswerPermission: (permissionId: string, decision: PermissionDecision, reason?: string, remember?: boolean) => void;
+  /** A card button's answer, carrying the proof a real pointer click made (`PermissionCard`'s `onAnswer`). */
+  onAnswerPermission: (
+    permissionId: string,
+    decision: PermissionDecision,
+    reason: string | undefined,
+    remember: boolean | undefined,
+    proof: PointerAnswerProof,
+  ) => void;
   /** The cards already answered from this panel, by `permissionId` --
-   *  `App.tsx` owns the set, since `a`/`d` answer a card by its id rather than through its buttons.
+   *  `App.tsx` owns the set, since card mode's keys answer a card by its id rather than through its buttons.
    *  Absent: none. */
   answeredPermissions?: ReadonlySet<string>;
-  /** Each card's reason box as it is typed into, so `App.tsx`'s `d` can send it as the Deny button would. */
-  onPermissionReason?: (permissionId: string, reason: string) => void;
+  /** The card that holds card mode (`App.tsx`), and how it is drawn; `null` or absent when no card does. The view
+   *  object is kept the same while nothing in it changes, so the other rows are not drawn again. */
+  cardMode?: { permissionId: string; view: CardModeView } | null;
   /** A click on a path link or an inline code span that parses as a path opens it -- the same
    *  target `gf` reaches from the keyboard (`App.tsx`'s `open-path` action). Absent, clicks inside
    *  the list do nothing beyond React's own defaults (a permission card's buttons, say). */
@@ -276,7 +286,7 @@ export function MessageList({
   yankedKey = null,
   onAnswerPermission,
   answeredPermissions,
-  onPermissionReason,
+  cardMode = null,
   onOpenPath,
   onUnreadChange,
   unseenSeed,
@@ -848,8 +858,8 @@ export function MessageList({
 
   /** The card callbacks a row calls, through one ref that never changes, so a new callback from the
    *  parent (they are made on every render) does not make every row render again. */
-  const rowHandlersRef = useRef<RowHandlers>({ onAnswerPermission, onPermissionReason });
-  rowHandlersRef.current = { onAnswerPermission, onPermissionReason };
+  const rowHandlersRef = useRef<RowHandlers>({ onAnswerPermission });
+  rowHandlersRef.current = { onAnswerPermission };
 
   // By the transcript's length and newest row, not by the list: a streamed batch replaces the list on every delta and
   // changes which rows there are on none of them.
@@ -943,6 +953,7 @@ export function MessageList({
             gated: call !== null && awaitingPermission.has(call.toolUseId),
             ruleOffer: permissionId === null ? null : (ruleOffers?.[permissionId] ?? null),
             alreadyAnswered: permissionId !== null && (answeredPermissions?.has(permissionId) ?? false),
+            cardMode: permissionId !== null && cardMode?.permissionId === permissionId ? cardMode.view : null,
             handlers: rowHandlersRef,
             ranFor: item.kind === "ending" ? endingDuration(turnDurations, item.ending.turnId) : null,
             streaming: item.key === streamingKey && !item.depth,
@@ -1008,7 +1019,6 @@ export function MessageList({
 
 type RowHandlers = {
   onAnswerPermission: Props["onAnswerPermission"];
-  onPermissionReason: Props["onPermissionReason"];
 };
 
 /** What decides which elements are the list's direct children: its rows in order, the rows a turn's time stands under
@@ -1031,7 +1041,7 @@ function sameRowProps(a: TimelineRowProps, b: TimelineRowProps): boolean {
   if (a.sentFrom !== b.sentFrom || a.sentHere !== b.sentHere || a.atDesk !== b.atDesk) return false;
   const {
     sentFrom, sentHere, atDesk, item, current, yanked, expanded, detailed, thinkingDisplay, sessionEnded, abandoned, cardLine, agent, gated,
-    ruleOffer, alreadyAnswered, ranFor, handlers, streaming, selecting, ...none
+    ruleOffer, alreadyAnswered, cardMode, ranFor, handlers, streaming, selecting, ...none
   } = a;
   const _exhaustive: Record<string, never> = none;
   void _exhaustive;
@@ -1039,7 +1049,7 @@ function sameRowProps(a: TimelineRowProps, b: TimelineRowProps): boolean {
     item === b.item && current === b.current && yanked === b.yanked && expanded === b.expanded &&
     detailed === b.detailed && thinkingDisplay === b.thinkingDisplay && sessionEnded === b.sessionEnded &&
     abandoned === b.abandoned && cardLine === b.cardLine && agent === b.agent && gated === b.gated &&
-    ruleOffer === b.ruleOffer && alreadyAnswered === b.alreadyAnswered && ranFor === b.ranFor &&
+    ruleOffer === b.ruleOffer && alreadyAnswered === b.alreadyAnswered && cardMode === b.cardMode && ranFor === b.ranFor &&
     handlers === b.handlers && streaming === b.streaming && selecting === b.selecting
   );
 }
@@ -1066,6 +1076,8 @@ type TimelineRowProps = {
   /** A card's offered rule, exactly as Rust offered it. */
   ruleOffer: string | null;
   alreadyAnswered: boolean;
+  /** A card row holding card mode: how its card is drawn there (`PermissionCard`'s `cardMode`). */
+  cardMode: CardModeView | null;
   /** For a turn-ending row: how long the turn ran, worded (`formatDuration`), or `null` when unknown. */
   ranFor: string | null;
   handlers: { current: RowHandlers };
@@ -1104,6 +1116,7 @@ const TimelineRow = memo(function TimelineRow({
   gated,
   ruleOffer,
   alreadyAnswered,
+  cardMode,
   ranFor,
   handlers,
   streaming,
@@ -1188,8 +1201,8 @@ const TimelineRow = memo(function TimelineRow({
             sessionEnded={sessionEnded}
             ruleOffer={ruleOffer}
             alreadyAnswered={alreadyAnswered}
+            cardMode={cardMode}
             onAnswer={(...args) => handlers.current.onAnswerPermission(...args)}
-            onReasonChange={(id, reason) => handlers.current.onPermissionReason?.(id, reason)}
           />
         </Row>
       );

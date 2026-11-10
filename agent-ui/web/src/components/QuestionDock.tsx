@@ -29,6 +29,7 @@ type Props = {
   active: boolean;
   blocked: () => boolean;
   onActivate: () => void;
+  onHelp?: () => void;
   onEditStart?: (requestId: string, index: number) => void;
   /** Whether this question still waits for an answer in its tab, read from the page as it is now rather than
    *  from this dock's last render: a dock unmounts after its question settled or its tab closed as well as when a
@@ -55,7 +56,7 @@ function restored(record: QuestionRecord, raw: unknown): QuestionDraft {
   };
 }
 
-export const QuestionDock = forwardRef<QuestionDockHandle, Props>(function QuestionDock({ tab, record, draft: initialDraft, active, blocked, onActivate, onEditStart, stillWaiting }, ref) {
+export const QuestionDock = forwardRef<QuestionDockHandle, Props>(function QuestionDock({ tab, record, draft: initialDraft, active, blocked, onActivate, onHelp, onEditStart, stillWaiting }, ref) {
   // A request restored from the mirror was sent by an earlier mount of this dock, and its reply may have come
   // while none was mounted to read it. The host marks a set answering as it takes an answer and puts it back to
   // waiting when the answer is refused, so a restored request on a set that waits has already had its reply.
@@ -222,6 +223,7 @@ export const QuestionDock = forwardRef<QuestionDockHandle, Props>(function Quest
       if (field.value.slice(0, field.selectionStart).includes("\n")) return;
     }
     event.preventDefault();
+    if (intent.type === "help") { onHelp?.(); return; }
     if (blocked() || busy || event.nativeEvent.isComposing || event.keyCode === 229) return;
     if (intent.type === "leave") { root.current?.focus(); return; }
     if (intent.type === "dismiss") { send("cancel"); return; }

@@ -34,9 +34,9 @@ function shown() {
   return container;
 }
 
-/** The panel's own `?` (no envelope from Rust). */
+/** The panel's own `F1` (no envelope from Rust). */
 function openOwn(container: HTMLElement) {
-  fireEvent.keyDown(container.querySelector<HTMLElement>(".agent-ui-conversation")!, { key: "?", shiftKey: true });
+  fireEvent.keyDown(container.querySelector<HTMLElement>(".agent-ui-conversation")!, { key: "F1" });
   return sheetOf(container);
 }
 
@@ -119,14 +119,14 @@ describe("closing the sheet prefix ? opened", () => {
     expect(closes()).toEqual([]);
   });
 
-  it("the panel's own ? posts nothing on close", () => {
+  it("the panel's own F1 posts nothing on close", () => {
     const container = shown();
     fireEvent.keyDown(openOwn(container), { key: "Escape" });
     expect(container.querySelector(".keymap-overlay")).toBeNull();
     expect(closes()).toEqual([]);
   });
 
-  it("a key close of the panel's own ?, then prefix ? forced shut, posts only the latter, as not returned", () => {
+  it("a key close of the panel's own F1, then prefix ? forced shut, posts only the latter, as not returned", () => {
     const container = shown();
     fireEvent.keyDown(openOwn(container), { key: "Escape" });
     expect(closes()).toEqual([]);
@@ -136,13 +136,15 @@ describe("closing the sheet prefix ? opened", () => {
   });
 });
 
-describe("prefix ? over the sheet the chat's ? opened", () => {
+describe("prefix ? over the sheet the chat's F1 opened", () => {
   it("moves the open sheet to the prefix table", () => {
     const container = shown();
     const scroll = vi.fn();
     Element.prototype.scrollIntoView = scroll;
     const sheet = openOwn(container);
-    expect(scroll).not.toHaveBeenCalled();
+    expect(scroll).toHaveBeenCalledTimes(1);
+    expect((scroll.mock.instances[0] as unknown as HTMLElement).textContent).toBe("This panel");
+    scroll.mockClear();
     dispatch({ kind: "open_keymap", opening: 7 });
     expect(container.querySelector(".keymap-overlay"), "the same sheet stays up").toBe(sheet);
     expect(scroll).toHaveBeenCalledTimes(1);

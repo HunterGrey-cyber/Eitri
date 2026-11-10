@@ -144,8 +144,11 @@ export const FIXED_PENDING_ENTRIES: Record<PendingPrefix, BoxEntry[]> = {
     // `FIXED_PAIRS.g.x`, the row's web link (`leader.test.ts` holds the two lists to the
     // same keys).
     { key: "x", label: "open link", group: false, disabled: false },
+    { key: "?", label: "this list", group: false, disabled: false },
   ],
+
   z: [
+    { key: "i", label: "detailed view", group: false, disabled: false },
     { key: "h", label: "scroll table left", group: false, disabled: false },
     { key: "l", label: "scroll table right", group: false, disabled: false },
     // The six fold and row-scroll pairs in `FIXED_PAIRS.z` (`leader.test.ts` holds the two lists to
@@ -157,16 +160,20 @@ export const FIXED_PENDING_ENTRIES: Record<PendingPrefix, BoxEntry[]> = {
     { key: "o", label: "open fold", group: false, disabled: false },
     { key: "c", label: "close fold", group: false, disabled: false },
   ],
+
   "[": [
     { key: "[", label: "previous prompt", group: false, disabled: false },
-    // `FIXED_PAIRS["["].p`, the card waiting for an answer before the cursor.
-    { key: "p", label: "previous waiting card", group: false, disabled: false },
+    // `FIXED_PAIRS["["].p`, reserved: it says that card mode's `Alt-p` walks the waiting cards now. Drawn disabled,
+    // since it does nothing else.
+    { key: "p", label: "cards: Alt-p now", group: false, disabled: true },
   ],
+
   "]": [
     { key: "]", label: "next prompt", group: false, disabled: false },
-    // `FIXED_PAIRS["]"].p`, the card waiting for an answer after the cursor.
-    { key: "p", label: "next waiting card", group: false, disabled: false },
+    // `FIXED_PAIRS["]"].p`, reserved the same way: card mode's `Alt-n`.
+    { key: "p", label: "cards: Alt-n now", group: false, disabled: true },
   ],
+
   // `Ctrl+w`'s four pairs, the module the keys go to. The box's title for it is
   // `Ctrl+w` (`App.tsx`), the prefix's own spelling `"C-w"` being tmux's, not a person's.
   "C-w": [

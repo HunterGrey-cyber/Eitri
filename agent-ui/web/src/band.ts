@@ -2,12 +2,12 @@ import type { PanelMode } from "./keymap";
 import type { RemoteConnectedDevice } from "./bridge";
 import type { BackgroundTaskRecord, EditorLink, TurnEnding, UsageInfo } from "./types";
 import { turnEndingBandText } from "./turnEnding";
-import { escapeText, isHiddenChar, revealedPathText, revealedText } from "./revealHidden";
+import { revealedPathText, revealedText } from "./revealHidden";
 import { SHORT_FLASH } from "./app/flashes";
 
 /** One segment's identity, in priority order (used only for lookups here --
  *  `bandLayout`'s own construction order, not this list, decides degrade order and render order). */
-export type SegId = "mode" | "pill" | "showcmd" | "message" | "prompt" | "warn" | "unread" | "cards" | "approve" | "queue" | "context" | "link" | "position" | "model" | "effort" | "usage" | "review" | "recovery" | "ending" | "background" | "following" | "phone";
+export type SegId = "mode" | "pill" | "showcmd" | "message" | "prompt" | "warn" | "unread" | "cards" | "card" | "queue" | "context" | "link" | "position" | "model" | "effort" | "usage" | "review" | "recovery" | "ending" | "background" | "following" | "phone";
 
 /** One piece of the band: the text to show and which side of the gap it belongs on (left of the
  *  gap is mode, pill, `⚑N`, `⧗N`, message; right of it is showcmd, `⚠`, context,
@@ -55,6 +55,11 @@ export type BandFacts = {
   warn: string | null;
   unread: string | null;
   cards: number;
+  /** The card holding the keys: its one-based place among this tab's waiting cards, its own answer count, whether
+   *  its deny takes a reason (Tab opens the field), and whether that field is open now (digits are text there). */
+  cardMode?: { index: number; total: number; answers: number; reason: boolean; reasonOpen?: boolean } | null;
+  /** The cursor is on a waiting card or the tool row it gates; Enter can enter card mode there in BROWSE. */
+  onCard?: boolean;
   questions?: number;
   queued: number;
   context: { file: string; lines: [number, number] | null } | null;
@@ -67,11 +72,6 @@ export type BandFacts = {
    *  segment, `title` its tooltip. `null` until a turn has reported one, and always `null` on the
    *  empty tab. */
   usage: UsageFact | null;
-  /** The card INPUT's `Ctrl+y` would approve -- the active tab's
-   *  oldest waiting card -- set by `App.tsx` only while one waits and the composer has the keys, so
-   *  the band says which card that one key answers. Optional: absent (or `null`) is "nothing to
-   *  name". */
-  approve?: ApproveFact | null;
   /** Companion mode: where the panel stands with the editor beside it. `null`, or absent, is the
    *  one-window mode, which has no such thing and never sends one. While it is set and not
    *  `attached`, its text takes the place of the context segment: with no editor attached no file
@@ -190,104 +190,6 @@ export function reviewSegment(files: number, keyOnly = false): string {
 /** The band's notice for an interrupted revert: which file, and that `c` opens the overlay that restores it. */
 export function recoverySegment(path: string, more: number): string {
   return `an interrupted revert left ${path}${more > 0 ? ` and ${more} more` : ""} · c to review`;
-}
-
-/** The `Ctrl+y` segment: the card's tool name and a one-line summary of its input (`cardSummary`). */
-export type ApproveFact = { tool: string; summary: string };
-
-/** How long `cardSummary` lets a card's summary run on the band, the `…` included. */
-const CARD_SUMMARY_MAX = 40;
-
-/** A card in one short line for the band -- what the call acts on (its command,
- *  file, path or URL, the fields a person checks before approving), else `summarizeInput`'s own
- *  order's remaining fields, else compact JSON; spaces, tabs and line breaks collapsed, and every
- *  character the card escapes drawn as its escape; cut to `CARD_SUMMARY_MAX` characters in the
- *  middle, head … tail, never inside an escape. A `Bash` card's `description` is the
- *  model's own words about the command, so the command itself comes first. An ACP agent's card is
- *  read inside its `rawInput` by the fields that name the call alone, then as that `rawInput` in compact
- *  JSON, then by its first location, and by its title only when it sent none of those. */
-export function cardSummary(input: unknown): string {
-  let text: string | null = null;
-  if (input !== null && typeof input === "object") {
-    const fields = input as Record<string, unknown>;
-    text = actsOn(fields);
-    // An ACP agent's card (`AcpCardInput`) wraps the call: what it acts on is in the agent's own
-    // `rawInput`, read only by the fields that name the call, else the raw input itself as compact JSON,
-    // else its first location. A `description`, `prompt` or `name` in an ACP raw input is the agent's
-    // account of the call, which could stand in front of the key that does the work (`{description:
-    // "Read notes", script: "rm -rf ~"}`), so it is shown only inside the JSON. The `title` and the
-    // locations are the agent's words about the call too, so they are named only when it sent no input.
-    if (text === null && "rawInput" in fields) {
-      const raw = fields.rawInput;
-      const locations = Array.isArray(fields.locations) ? fields.locations : [];
-      const first = locations[0] as { path?: unknown } | undefined;
-      text =
-        (raw !== null && typeof raw === "object" && !Array.isArray(raw) ? actsOn(raw as Record<string, unknown>, CALL_KEYS) : null) ??
-        rawAsJson(raw) ??
-        (typeof first?.path === "string" ? first.path : null) ??
-        (typeof fields.title === "string" && fields.title !== "" ? fields.title : null);
-    }
-  }
-  // Only the whitespace the card keeps as text collapses: a no-break or other unusual space is not one the
-  // shell splits at, and is drawn as its escape below, as the card draws it.
-  const line = (text ?? JSON.stringify(input) ?? "").replace(/[ \t\n]+/g, " ").replace(/^ | $/g, "");
-  // One unit per character, a character the card escapes as its whole escape: the band says what the card
-  // says (a direction override drawn raw reorders the command after it), and a cut never splits an escape.
-  const units = Array.from(line, (ch) => (isHiddenChar(ch) ? escapeText(ch) : ch));
-  const size = (unit: string) => Array.from(unit).length;
-  if (units.reduce((n, unit) => n + size(unit), 0) <= CARD_SUMMARY_MAX) return units.join("");
-  // Cut in the middle, not at the end -- the tail of a long command is often
-  // the part that matters (`| sudo bash`, `--force`), and it is what a person approving must see.
-  const tailRoom = Math.floor((CARD_SUMMARY_MAX - 1) / 2) + 4;
-  const headRoom = CARD_SUMMARY_MAX - 1 - tailRoom;
-  const head: string[] = [];
-  for (let i = 0, used = 0; i < units.length && used + size(units[i]) <= headRoom; i++) {
-    head.push(units[i]);
-    used += size(units[i]);
-  }
-  const tail: string[] = [];
-  for (let i = units.length - 1, used = 0; i >= head.length && used + size(units[i]) <= tailRoom; i--) {
-    tail.unshift(units[i]);
-    used += size(units[i]);
-  }
-  return `${head.join("")}…${tail.join("")}`;
-}
-
-/** The fields that name what a call acts on: its command, file, path, URL or search. */
-const CALL_KEYS = ["command", "file_path", "notebook_path", "path", "url", "pattern", "query"] as const;
-
-/** `CALL_KEYS`, then the fields a Claude tool's own input names a call by when it has none of those (a
- *  `Task`'s `description` and `prompt`, an MCP tool's `name`). */
-const SUMMARY_KEYS = [...CALL_KEYS, "description", "prompt", "name"] as const;
-
-/** The first of `keys` a call's fields hold, a person checks before approving it, or `null`. A command
- *  given as an argument list (ACP and Codex agents send one) reads as its words joined by spaces, a word
- *  that holds a space quoted (`argvWord`). */
-function actsOn(fields: Record<string, unknown>, keys: readonly string[] = SUMMARY_KEYS): string | null {
-  for (const key of keys) {
-    const value = fields[key];
-    if (typeof value === "string") return value;
-    if (key === "command" && Array.isArray(value) && value.length > 0 && value.every((v) => typeof v === "string")) {
-      return value.map(argvWord).join(" ");
-    }
-  }
-  return null;
-}
-
-/** One element of an argument list as a shell would have to be given it: as it is, or in single quotes
- *  when it is empty or holds whitespace or a quote. Joined bare, `["rm", "a b"]` and `["rm", "a", "b"]`
- *  both read `rm a b`, which are a different number of files. */
-function argvWord(word: string): string {
-  if (word !== "" && !/[\s'"\\]/u.test(word)) return word;
-  return `'${word.replace(/'/g, "'\\''")}'`;
-}
-
-/** An ACP agent's raw input as compact JSON, or `null` when it carries nothing (absent, `null`, an empty
- *  object or list). */
-function rawAsJson(raw: unknown): string | null {
-  if (raw === undefined || raw === null) return null;
-  if (typeof raw === "object" && Object.keys(raw as object).length === 0) return null;
-  return JSON.stringify(raw) ?? null;
 }
 
 /** The band's usage segment as `usageSegment` words it: the text drawn, and the tooltip carrying
@@ -445,11 +347,16 @@ export function bandLayoutSteady(
   const link = f.link && f.link.state !== "attached" && f.link.text !== "" ? f.link : null;
   const tasks = f.backgroundTasks === undefined ? null : liveTasks(f.backgroundTasks);
   const background = tasks === null ? (f.background ? backgroundSegment(f.background) : "") : taskWords(tasks);
+  const cardForms = f.cardMode ? cardModeSegment(f.cardMode) : null;
+  const cardText = cardForms
+    ? cardForms.long
+    : f.cards > 0 ? `${f.mode === "browse" && f.onCard ? "Enter or Alt-n" : "Alt-n"}: card mode, then 1-3` : null;
+  const cardAs = (text: string) => (s: Seg[]) => s.map((x) => (x.id === "card" ? { ...x, text } : x));
   let segs: Seg[] = [
     mode,
     pill,
+    ...(cardText ? [{ id: "card", text: cardText, side: "left" } as Seg] : []),
     ...(f.cards + (f.questions ?? 0) > 0 ? [{ id: "cards", text: `⚑${f.cards + (f.questions ?? 0)}`, side: "left" } as Seg] : []),
-    ...(f.approve ? [{ id: "approve", text: `Ctrl+y approves ${revealedText(f.approve.tool)}: ${f.approve.summary}`, side: "left" } as Seg] : []),
     ...(f.queued > 0 ? [{ id: "queue", text: `⧗${f.queued}`, side: "left" } as Seg] : []),
     ...phone,
     ...(background ? [{ id: "background", text: background, side: "left" } as Seg] : []),
@@ -473,6 +380,8 @@ export function bandLayoutSteady(
   const cellsOf = (x: Seg) => Math.max(textWidth(x.text), x.cells ?? 0);
   const width = (s: Seg[]) => s.reduce((n, x) => n + cellsOf(x) + PAD + (x.id === "mode" ? MODE_ARROW : 0), 0);
   const steps: ((s: Seg[]) => Seg[])[] = [
+    // An entry hint gives way before figures; while card mode holds, its key instructions stay.
+    (s) => f.cardMode ? s : s.filter((x) => x.id !== "card"),
     (s) => tasks === null ? s : s.map((x) => x.id === "background" ? { ...x, text: backgroundFallback(tasks.length) } : x),
     // The usage figure is the least urgent thing on the band -- it goes before even the context
     // is shortened, so a narrow panel never trades the file it is showing for a running total.
@@ -490,11 +399,9 @@ export function bandLayoutSteady(
     (s) => s.filter((x) => x.id !== "context" && x.id !== "link"),
     (s) => s.filter((x) => x.id !== "queue"),
     (s) => s.filter((x) => x.id !== "following"),
-    // The Ctrl+y segment keeps the tool it names before it goes, and goes before the card
-    // count -- `⚑N` is shorter, and still says a card waits.
-    (s) => s.map((x) => (x.id === "approve" && f.approve ? { ...x, text: `Ctrl+y approves ${revealedText(f.approve.tool)}` } : x)),
-    (s) => s.filter((x) => x.id !== "approve"),
     (s) => s.filter((x) => x.id !== "cards"),
+    // Card mode's instructions keep what each key does, in fewer words, once the figures and counts have gone.
+    (s) => (cardForms ? cardAs(cardForms.short)(s) : s),
     // Something still runs and may change files: it outlasts the figures and pointers, and the card count.
     (s) => s.filter((x) => x.id !== "background"),
     // A turn that ended badly is short and it explains why the panel went quiet, so it outlasts every
@@ -505,6 +412,9 @@ export function bandLayoutSteady(
     // goes, and goes last, with only the mode left.
     (s) => s.map((x) => (x.id === "recovery" && f.recovery ? { ...x, text: recoverySegment(f.recovery.path.split("/").pop() ?? f.recovery.path, f.recovery.more) } : x)),
     (s) => s.filter((x) => x.id !== "recovery"),
+    // Last, the card's place alone: before the mode shrinks to its letter, and before a flash is shortened
+    // or cut, since a flash in card mode says why the key just pressed did nothing.
+    (s) => (cardForms ? cardAs(cardForms.least)(s) : s),
   ];
   // How many steps it takes to fit `room`; then the band at that many steps.
   const all = segs;
@@ -589,6 +499,23 @@ export function bandLayoutSteady(
     segs = segs.map((x) => (x.id === "message" ? { ...x, text: closingPath(x.text, f.messagePath)?.text ?? x.text } : x));
   }
   return { segs, hold: { dropped, droppedAt }, due };
+}
+
+/** Card mode's band segment, in its three widths: everything (`card 1/2 · 1-3 answer · h/l Enter · Tab reason · Esc
+ *  leaves`), the keys by name alone (`card 1/2 · 1-3 · Tab · Esc`, which fits a 360 px panel beside the mode, the
+ *  pill and the unread mark), and the card's place alone (the digits are on the buttons). With the reason field open the digits are text,
+ *  so it says what Enter and Esc (or Tab) do there instead. Tab is named only on a card whose deny takes a reason. */
+export function cardModeSegment(c: NonNullable<BandFacts["cardMode"]>): { long: string; short: string; least: string } {
+  const place = `card ${c.index}/${c.total}`;
+  if (c.reasonOpen) {
+    return { long: `${place} · Enter denies with this reason · Esc back, text kept`, short: `${place} · Enter denies`, least: place };
+  }
+  const digits = `1-${c.answers}`;
+  return {
+    long: `${place} · ${digits} answer · h/l Enter${c.reason ? " · Tab reason" : ""} · Esc leaves`,
+    short: `${place} · ${digits}${c.reason ? " · Tab" : ""} · Esc`,
+    least: place,
+  };
 }
 
 /** The model without its leading `claude-`, which every Claude model carries: `"claude-sonnet-5"` ->

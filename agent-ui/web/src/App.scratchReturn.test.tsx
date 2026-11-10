@@ -128,7 +128,7 @@ describe("composer scratch return", () => {
     expect(sends()).toEqual([expect.objectContaining({ tab: 1, text: "a draft, edited" })]);
   });
 
-  it("the return is an arrival: a Ctrl+y right as the keys come back approves nothing", () => {
+  it("a Ctrl+y right as the keys come back answers nothing and leaves the returned draft as it is", () => {
     const container = setup();
     leaveForEdit(composer(container)!);
     finishEdit("edited draft");
@@ -142,6 +142,7 @@ describe("composer scratch return", () => {
     fireEvent.keyUp(field, { key: "y", code: "KeyY", ctrlKey: true });
     act(() => vi.advanceTimersByTime(1000));
     expect(posted.filter((m) => m.type === "permission_response")).toHaveLength(0);
+    expect(composer(container)!.value).toBe("edited draft");
   });
 
   it("a composer edit returning while a permission card waits lands on the card in BROWSE and sends nothing", () => {

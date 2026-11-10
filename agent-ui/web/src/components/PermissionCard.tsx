@@ -1,4 +1,4 @@
-import { createContext, useContext, useEffect, useRef, useState } from "react";
+import { createContext, useContext, useEffect, useState } from "react";
 import type {
   AcpCardInput,
   AgentUiState,
@@ -12,6 +12,7 @@ import type {
   ProviderPrompt,
 } from "../types";
 import type { PermissionDecision } from "../bridge";
+import { pointerAnswerProof, type PointerAnswerProof } from "../answerProof";
 import { codexChangePreview, editPreview, lineDiff, wholeReplacement } from "../diff";
 import type { EditPreview } from "../diff";
 import { isExternalTool, subagentOf } from "../externalTools";
@@ -28,6 +29,10 @@ export const PermissionCardContext = createContext<{
   onViewScript: (script: string) => void;
 } | null>(null);
 
+/** How a card in card mode is drawn (`App.tsx`'s card mode, `../cardMode`): which answer button is highlighted (by its
+ *  place, never by DOM focus; `null` on entry), whether a digit may answer yet, and whether the reason field is open. */
+export type CardModeView = { highlight: number | null; armed: boolean; reasonOpen: boolean };
+
 type Props = {
   request: PermissionRequestRecord;
   /** The session this request belongs to has ended. */
@@ -37,25 +42,33 @@ type Props = {
    *  own suggestion -- the words shown here are Rust's, byte for byte, so `remember: true` can only
    *  ever be sent for a request Rust itself is prepared to answer with a rule. */
   ruleOffer?: string | null;
-  /** The panel already answered this card -- by `a`/`d`, which answer by
-   *  the card's id and never press these buttons, or by a click it has already sent. The panel's
-   *  own guard (`App.tsx`'s `answerPermission`) refuses a second answer either way; this is what
-   *  draws the card inert once it did. */
+  /** The panel already answered this card -- by card mode's keys, which answer by the card's id and never press
+   *  these buttons, or by a click it has already sent. The panel's own guard (`App.tsx`'s `answerPermission`)
+   *  refuses a second answer either way; this is what draws the card inert once it did. */
   alreadyAnswered?: boolean;
-  onAnswer: (permissionId: string, decision: PermissionDecision, reason?: string, remember?: boolean) => void;
-  /** The reason box as it is typed into, and `""` when the card goes away: `d` sends the same
-   *  reason this card's Deny would, so the two ways of denying never disagree. */
-  onReasonChange?: (permissionId: string, reason: string) => void;
+  /** A button's answer, with the proof that a real pointer click made it (`pointerAnswerProof`). A click that Enter
+   *  or Space synthesised on a focused button proves nothing and never gets here. */
+  onAnswer: (
+    permissionId: string,
+    decision: PermissionDecision,
+    reason: string | undefined,
+    remember: boolean | undefined,
+    proof: PointerAnswerProof,
+  ) => void;
   /** `false` on a page that may not answer (the phone's transcript): the card shows what it asks, and in place of
    *  the reason box and the buttons one line saying where it is answered. Defaults to `true`. */
   controls?: boolean;
   /** Where the card is answered, as the phone's top bar names the tab (`project · window N · tab M`); read only
    *  without controls. */
   deskLocation?: string;
+  /** This card holds card mode: each answer button shows its digit (dim until card mode is armed), and the highlighted
+   *  one is marked. `null` or absent: the card is drawn as it always is. */
+  cardMode?: CardModeView | null;
 };
 
 export function PermissionCard({
-  request, sessionEnded, ruleOffer, alreadyAnswered = false, onAnswer, onReasonChange, controls = true, deskLocation = "",
+  request, sessionEnded, ruleOffer, alreadyAnswered = false, onAnswer, controls = true, deskLocation = "",
+  cardMode = null,
 }: Props) {
   const view = useContext(PermissionCardContext);
   const [reason, setReason] = useState("");
@@ -68,18 +81,13 @@ export function PermissionCard({
   useEffect(() => {
     if (!alreadyAnswered) setClicked(false);
   }, [alreadyAnswered]);
-  // A card that goes away takes its typed reason with it, so `d` never sends a reason from a box
-  // that is no longer on screen. The latest callback, read at unmount, without re-running on it.
-  const reasonChangeRef = useRef(onReasonChange);
-  reasonChangeRef.current = onReasonChange;
-  useEffect(() => () => reasonChangeRef.current?.(request.permissionId, ""), [request.permissionId]);
 
   /* A card belonging to a dead session must not be able to submit into it. The card is not removed
      when the session ends -- an unanswered request is real history, and making it vanish would read
      as a resolution nobody made -- so it is made inert and says why instead. `answered` covers the
      other direction: the SAME decision must not be sendable twice while the real PermissionResolved
      event is still in flight -- set here the moment a button is used (`clicked`), and by the panel
-     (`alreadyAnswered`) when `a`/`d` answered it. Neither of these clears the card; only a provider
+     (`alreadyAnswered`) when card mode's keys answered it. Neither of these clears the card; only a provider
      event does that. */
   const inert = answered || sessionEnded;
   const broker = request.editorCard;
@@ -90,19 +98,35 @@ export function PermissionCard({
     toolUseId: request.toolUseId, toolCalls: view.state.toolCalls, backgroundTasks: view.state.backgroundTasks.rows,
   }) : null;
 
-  function handleAnswer(decision: PermissionDecision, remember = false) {
+  // The buttons answer a real pointer click and nothing else: a click with `detail` 0 is one Enter or Space
+  // synthesised on a focused button, and answers nothing. Keys answer through card mode, by the card's id.
+  function handleAnswer(decision: PermissionDecision, remember: boolean, proof: PointerAnswerProof) {
     if (inert) return;
     setClicked(true);
     onAnswer(
       request.permissionId,
       decision,
       decision === "deny" ? reason || undefined : undefined,
-      ...(remember ? [true] : []),
+      remember ? true : undefined,
+      proof,
     );
   }
 
+  // In card mode a button shows the digit that answers with it, its place among the card's buttons (Approve, Deny,
+  // then Always allow where the card offers a rule); the page reads the same order.
+  const digit = (place: number) =>
+    cardMode === null ? null : (
+      <>
+        <kbd className={cardMode.armed ? "card-digit armed" : "card-digit"}>{place + 1}</kbd>{" "}
+      </>
+    );
+  const highlighted = (place: number) => (cardMode !== null && cardMode.highlight === place ? "card-highlight" : undefined);
+
   return (
-    <div className="permission-card">
+    <div
+      className={cardMode === null ? "permission-card" : "permission-card permission-card-mode"}
+      data-reason-open={cardMode?.reasonOpen ? "" : undefined}
+    >
       {/* Which call, not just which tool: a turn can have several Bash calls in flight, and this is
           the same id `MessageList` keys that call's own block on. It is a
           tooltip, not a line: "for tool call toolu_01…" was noise to read on every card, and the
@@ -122,52 +146,74 @@ export function PermissionCard({
         request.toolName === "Workflow" ? <WorkflowInput input={request.input} onViewScript={view?.onViewScript} /> :
         <ToolInput toolName={request.toolName} input={request.input} createsFile={request.createsFile} />}
       {/* A deny from another agent carries no reason (Codex's decline has no field for one), so there is
-          no box to type into; `D` says so (`App.tsx`). */}
+          no box to type into; card mode's Tab says so (`App.tsx`). The box and the answer buttons are
+          `data-card-control` with `tabIndex -1`: no walk (`h`/`l`, a native Tab, `currentStop`) lands on
+          them; a click focuses the box, card mode's Tab opens it, and a HINT label on either enters card
+          mode. Its Enter answers nothing here: in card mode the page reads it first, and outside card
+          mode the page refuses it (`App.tsx`). */}
       {!controls && <AnswerAtDesk location={deskLocation} stop="Stop on this phone ends the turn and denies this card." />}
       {controls && !external && (
         <input
           type="text"
           {...NO_TEXT_ASSIST}
           data-nav-order={ruleOffer ? 4 : 3}
-          placeholder="Reason (shown to the agent if you deny) — Enter denies"
+          data-card-control=""
+          tabIndex={-1}
+          placeholder="Reason (shown to the agent if you deny)"
           value={reason}
-          onChange={(e) => {
-            setReason(e.target.value);
-            onReasonChange?.(request.permissionId, e.target.value);
-          }}
-          onKeyDown={(e) => {
-            // Enter here denies with the reason; an IME's Enter is its own.
-            if (e.key !== "Enter" || e.nativeEvent.isComposing || e.keyCode === 229) return;
-            e.preventDefault();
-            if (e.repeat) return;
-            handleAnswer("deny");
-          }}
+          onChange={(e) => setReason(e.target.value)}
           disabled={inert}
         />
       )}
       {controls && <div className="permission-card-buttons">
-        {/* `data-nav-order` puts Approve first for `l`, one keypress away, then Deny, then the third
-            (Always allow) button when Rust offered one, then the reason box above them.
-            `a`/`d` do NOT press these buttons: they answer this card by
-            its `permissionId` through the panel's `answerPermission`, which holds the one guard
-            against a second answer, and `alreadyAnswered` draws the card inert after them.
-            `data-nav-action` stays: it is how the Enter/Space guard (`App.tsx`'s `onKeyDown`)
-            knows a focused button answers a card. Nothing looks a button up through it any more. */}
+        {/* `data-nav-order` is the buttons' order for a HINT label: Approve, Deny, then the third
+            (Always allow) button when Rust offered one, then the reason box above them. Card mode's
+            keys do NOT press these buttons: they answer this card by its `permissionId` through the
+            panel's `answerPermission`, which holds the one guard against a second answer, and
+            `alreadyAnswered` draws the card inert after them. `data-nav-action` is how the root's
+            Enter/Space claim (`App.tsx`'s `onKeyDown`) knows a focused button answers a card. */}
         <button
           data-nav-order={1}
           data-nav-action="allow"
-          data-key="a"
-          onClick={() => handleAnswer("allow")}
+          data-card-control=""
+          tabIndex={-1}
+          className={highlighted(0)}
+          onClick={(e) => {
+            const proof = pointerAnswerProof(e);
+            if (proof !== null) handleAnswer("allow", false, proof);
+          }}
           disabled={inert || !approvable}
         >
-          Approve
+          {digit(0)}Approve
         </button>
-        <button data-nav-order={2} data-nav-action="deny" data-key="d" onClick={() => handleAnswer("deny")} disabled={inert}>
-          Deny
+        <button
+          data-nav-order={2}
+          data-nav-action="deny"
+          data-card-control=""
+          tabIndex={-1}
+          className={highlighted(1)}
+          onClick={(e) => {
+            const proof = pointerAnswerProof(e);
+            if (proof !== null) handleAnswer("deny", false, proof);
+          }}
+          disabled={inert}
+        >
+          {digit(1)}Deny
         </button>
         {ruleOffer && broker === undefined && (
-          <button data-nav-order={3} data-nav-action="always" onClick={() => handleAnswer("allow", true)} disabled={inert}>
-            Always allow <ShownInline text={ruleOffer} /> in this project
+          <button
+            data-nav-order={3}
+            data-nav-action="always"
+            data-card-control=""
+            tabIndex={-1}
+            className={highlighted(2)}
+            onClick={(e) => {
+              const proof = pointerAnswerProof(e);
+              if (proof !== null) handleAnswer("allow", true, proof);
+            }}
+            disabled={inert}
+          >
+            {digit(2)}Always allow <ShownInline text={ruleOffer} /> in this project
           </button>
         )}
       </div>}
@@ -502,8 +548,8 @@ export function acpPreview(diff: NonNullable<AcpCardInput["diffs"]>[number]): Ed
 }
 
 /** Whether Approve has anything to answer with. An ACP card whose agent offered no allow-once option, or whose
- *  option Rust held back, has not; every other card has. INPUT's `Ctrl+y` asks the same question, so it never
- *  offers or sends an approval the card's own button would refuse. */
+ *  option Rust held back, has not; every other card has. Card mode asks the same question
+ *  (`CardOffer.approvable`), so a key never sends an approval the card's own button would refuse. */
 export function cardApprovable(request: Pick<PermissionRequestRecord, "toolName" | "input">): boolean {
   return !request.toolName.startsWith("acp:") || acpApprovable(request.input);
 }

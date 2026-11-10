@@ -18,6 +18,8 @@
  *     `resolveKey`'s own reserved two-key prefixes -- `[b`, `]b`, `gt`, `gT` -- through `resolveKey`
  *     itself, the same two-step a real keypress takes).
  *
+ *  The directional search and BROWSE jumplist bindings are deliberate exceptions to the original meanings.
+ *
  *  Regenerate fixture 1 only (fixture 2 is Rust's to regenerate, see `keymap_v1_freeze.rs`'s own
  *  header -- this file only reads it): `REGENERATE_V1_RESOLVE_KEY_FIXTURE=1 npx vitest run -u
  *  src/keymap.v1Freeze.test.ts` (both are needed: the variable selects the regenerating case, `-u` lets
@@ -174,6 +176,11 @@ const RESOLVE_KEY_CASES: ResolveKeyCase[] = [
   // INPUT's Ctrl+y is appended so the
   // regenerated fixture diffs as additions only. BROWSE's own "Ctrl+y" row above is unchanged; the
   // Shift pin says only the exact chord approves.
+  { label: "F1, browse", mode: "browse", event: key("F1"), ctx: { sessionEnded: false } },
+  { label: "F1, input", mode: "input", event: key("F1"), ctx: { sessionEnded: false } },
+  { label: "g?", mode: "browse", event: key("?", { shiftKey: true }), ctx: { sessionEnded: false, pending: "g" } },
+  { label: "zi", mode: "browse", event: key("i"), ctx: { sessionEnded: false, pending: "z" } },
+  { label: "Ctrl+i, browse", mode: "browse", event: key("i", { ctrlKey: true }), ctx: { sessionEnded: false } },
   { label: "Ctrl+y, input", mode: "input", event: key("y", { ctrlKey: true }), ctx: { sessionEnded: false } },
   { label: "Ctrl+Shift+y, input", mode: "input", event: key("y", { ctrlKey: true, shiftKey: true }), ctx: { sessionEnded: false } },
 ];

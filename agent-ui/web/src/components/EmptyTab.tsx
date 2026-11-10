@@ -146,7 +146,7 @@ export type EmptyTabProps = {
   onHistoryPush?: (text: string) => void;
   onEditInNvim?: (text: string) => void;
   editingInNvim?: boolean;
-  onOpenKeymap?: () => void;
+  onOpenKeymap?: (section?: "browse" | "input") => void;
   /** The panel's leader/which-key table (`keymapHelp.panel` in `App.tsx`, itself `keymap` envelope's
    *  `panel`), and where a completed sequence's binding goes. The dashboard's own root once never ran
    *  the leader engine that `App.tsx`'s `onKeyDown` already had for the live conversation, so Space
@@ -817,7 +817,7 @@ export function EmptyTab(props: EmptyTabProps) {
         flash,
       );
       if (!waiting && !event.repeat) props.onFlash?.(flash);
-    } else if (event.key === "?") {
+    } else if (event.key === "?" || event.key === "F1") {
       event.preventDefault();
       runItem("keys");
     }
@@ -895,7 +895,7 @@ export function EmptyTab(props: EmptyTabProps) {
             onHistoryPush={props.onHistoryPush}
             onEditInNvim={props.onEditInNvim}
             editingInNvim={props.editingInNvim}
-            onOpenKeymap={props.onOpenKeymap}
+            onOpenKeymap={() => props.onOpenKeymap?.("input")}
             // A tab that has not started has no reported list yet: Claude's built-ins, nothing for another agent.
             slashCommands={completionSource(props.tab.agent, null)}
             // The window's own key for the module to the right, which is where the panel sits.

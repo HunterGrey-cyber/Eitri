@@ -5,7 +5,7 @@ import { isShiftTab } from "./modeKey";
 
 export type QuestionKeyZone = "option" | "custom" | "input" | "other";
 export type QuestionKeyIntent =
-  | { type: "none" | "swallow" | "dismiss" | "advance" | "activate" | "commit" | "type" | "edit" | "notes" | "leave" }
+  | { type: "help" | "none" | "swallow" | "dismiss" | "advance" | "activate" | "commit" | "type" | "edit" | "notes" | "leave" }
   | { type: "question" | "move"; step: 1 | -1 }
   | { type: "edge"; to: "first" | "last" }
   | { type: "number"; index: number };
@@ -28,6 +28,7 @@ export function questionKey(event: Key, context: { zone: QuestionKeyZone; count:
     if (event.key.toLowerCase() === "g" && (context.zone === "custom" || context.zone === "input")) return { type: "edit" };
     return { type: "none" };
   }
+  if (event.key === "F1" && !event.shiftKey) return { type: "help" };
   if (event.key === "Escape") return { type: context.zone === "input" ? "leave" : "dismiss" };
   if (event.key === "Tab" || isShiftTab(event)) return { type: "question", step: event.shiftKey ? -1 : 1 };
   if (context.zone === "input") {

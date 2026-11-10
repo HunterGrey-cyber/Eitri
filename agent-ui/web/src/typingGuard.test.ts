@@ -1,10 +1,11 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { isModifierKey, RELEASE_WAIT_MAX_MS, TYPING_GUARD_MS, TypingGuard } from "./typingGuard";
 
-/* Every keydown reaches `onKey` first. `a`/`d`/`D` ask `defer`; Enter on a card button asks
-   `mayAnswerNow`, then waits in `defer` and requires a focus landing. These rows model only the guard;
-   button landing is covered by the key-count tests below and `App.test.tsx`.
-   `answers` records the answer and its time. Fake timers make test gaps match the time between keys. */
+/* Every
+   keydown goes through `onKey` first. `a`, `d` and `D` stand here for any deferred key (`defer`: `f`, a single-key
+   table binding, a card-mode answer's after-half), and Enter for a key that must stand alone at once (`mayAnswerNow`:
+   BROWSE Enter on a card row entering card mode). `answers` records what would have run, and when. Time is vitest's
+   fake clock, so a gap in a test is exactly the gap between two keys. */
 
 let guard: TypingGuard;
 let answers: Array<{ key: string; at: number }>;
@@ -21,21 +22,21 @@ afterEach(() => {
 const ANSWER_KEYS = new Set(["a", "d", "D"]);
 
 /** One keydown at the fake clock's current time, handled as the panel handles it. */
-function key(k: string, options: { repeat?: boolean; onButton?: boolean } = {}) {
+function key(k: string, options: { repeat?: boolean; alone?: boolean } = {}) {
   const t = Date.now();
   guard.onKey(k, t);
   if (ANSWER_KEYS.has(k)) {
     guard.defer(t, options.repeat ?? false, () => answers.push({ key: k, at: Date.now() }), "cancelled");
-  } else if (k === "Enter" && options.onButton === true) {
-    if (guard.mayAnswerNow("Enter", t, options.repeat ?? false)) answers.push({ key: k, at: t });
+  } else if (k === "Enter" && options.alone === true) {
+    if (guard.mayAnswerNow(t, options.repeat ?? false)) answers.push({ key: k, at: t });
   }
 }
 
 /** `text` typed a character at a time, `gap` ms apart (prose at 60 wpm is ~200 ms a key), then the
  *  clock runs on long enough for any deferred answer to fire. */
-function type(text: string, gap: number, options: { enterOnButton?: boolean } = {}) {
+function type(text: string, gap: number, options: { enterAlone?: boolean } = {}) {
   for (const ch of text) {
-    key(ch === "\n" ? "Enter" : ch, { onButton: ch === "\n" && options.enterOnButton === true });
+    key(ch === "\n" ? "Enter" : ch, { alone: ch === "\n" && options.enterAlone === true });
     vi.advanceTimersByTime(gap);
   }
   vi.advanceTimersByTime(TYPING_GUARD_MS * 4);
@@ -94,8 +95,8 @@ describe("TypingGuard: typed prose never answers", () => {
     expect(answers).toEqual([]);
   });
 
-  it('"fix the data" and its Enter on a card button answer nothing', () => {
-    type("fix the data\n", 200, { enterOnButton: true });
+  it('"fix the data" and its Enter on a card row act on nothing', () => {
+    type("fix the data\n", 200, { enterAlone: true });
     expect(answers).toEqual([]);
   });
 
@@ -129,7 +130,7 @@ describe("TypingGuard: typed prose never answers", () => {
     key("a", { repeat: true });
     vi.advanceTimersByTime(TYPING_GUARD_MS * 4);
     expect(answers).toEqual([]);
-    expect(guard.mayAnswerNow("Enter", Date.now(), true)).toBe(false);
+    expect(guard.mayAnswerNow(Date.now(), true)).toBe(false);
   });
 
   it("defer says whether it waits: false when a key came inside the window before", () => {
@@ -142,104 +143,50 @@ describe("TypingGuard: typed prose never answers", () => {
   });
 });
 
-describe("TypingGuard: Enter on a card button", () => {
-  it("Enter with nothing before it answers at once", () => {
-    key("Enter", { onButton: true });
+/* No key walks onto a card's button any more (cards are answered in card mode), so Enter has no walk exception:
+   like every other key that must stand alone, it needs a quiet `TYPING_GUARD_MS` before it. */
+describe("TypingGuard: Enter standing alone has no walk exception", () => {
+  it("Enter with nothing before it stands alone", () => {
+    key("Enter", { alone: true });
     expect(answers.map((a) => a.key)).toEqual(["Enter"]);
   });
 
-  it("l then Enter at 100 ms answers: l is the walk onto Approve", () => {
-    key("l");
+  it.each([["l"], ["h"], ["Tab"], ["e"], ["j"]])("%s then Enter at 100 ms: Enter does not stand alone", (before) => {
+    key(before);
     vi.advanceTimersByTime(100);
-    key("Enter", { onButton: true });
-    expect(answers.map((a) => a.key)).toEqual(["Enter"]);
+    key("Enter", { alone: true });
+    expect(answers).toEqual([]);
   });
 
-  it("h, Tab and Shift+Tab (key Tab) are walks too", () => {
-    for (const walk of ["h", "Tab"]) {
-      vi.advanceTimersByTime(TYPING_GUARD_MS * 4);
-      answers = [];
-      key(walk);
-      vi.advanceTimersByTime(50);
-      key("Enter", { onButton: true });
-      expect(answers.map((a) => a.key), walk).toEqual(["Enter"]);
-    }
+  it.each([["cancel\n"], ["al\n"], ["deal\n"], ["ll\n"], ["jl\n"]])("%j typed at 80 ms a key: its Enter does not stand alone", (text) => {
+    type(text, 80, { enterAlone: true });
+    expect(answers).toEqual([]);
   });
 
-  it("e then Enter at 100 ms does not answer: a sentence ending on a card button", () => {
+  it("a run of h, l and Tab back to a key that stood alone is no exception either", () => {
     key("e");
-    vi.advanceTimersByTime(100);
-    key("Enter", { onButton: true });
-    expect(answers).toEqual([]);
-  });
-
-  it("the walk exception is only the key right before Enter: l, then e, then Enter", () => {
-    key("l");
-    vi.advanceTimersByTime(50);
-    key("e");
-    vi.advanceTimersByTime(50);
-    key("Enter", { onButton: true });
-    expect(answers).toEqual([]);
-  });
-
-  /* The walk exception once asked only about the key right before Enter, so a sentence
-     ending in `l` walked onto Approve (the first control, `PermissionCard.tsx`'s `data-nav-order`)
-     and its Enter approved. The expectation that "…al⏎" lands on Deny was false against the code. Now every
-     key of the unbroken run before Enter must be a walk. */
-  it('"cancel" then Enter at 80 ms a key does not answer: the l walked onto Approve, but the run began with typing', () => {
-    type("cancel\n", 80, { enterOnButton: true });
-    expect(answers).toEqual([]);
-  });
-
-  it('"al" then Enter (a sentence ending "…al⏎" right after an arrival) does not answer', () => {
-    type("al\n", 80, { enterOnButton: true });
-    expect(answers).toEqual([]);
-    answers = [];
-    type("deal\n", 80, { enterOnButton: true });
-    expect(answers).toEqual([]);
-  });
-
-  it("l l then Enter, each inside the window, still answers: a run of walks back to a key that stood alone", () => {
-    type("ll\n", 80, { enterOnButton: true });
-    expect(answers.map((a) => a.key)).toEqual(["Enter"]);
-    answers = [];
-    vi.advanceTimersByTime(TYPING_GUARD_MS * 4);
+    vi.advanceTimersByTime(TYPING_GUARD_MS);
     for (const k of ["l", "Tab", "h", "l"]) {
       key(k);
       vi.advanceTimersByTime(60);
     }
-    key("Enter", { onButton: true });
-    expect(answers.map((a) => a.key)).toEqual(["Enter"]);
-  });
-
-  it("a key that stood alone ends the run: e, a pause, then l and Enter fast, answers", () => {
-    key("e");
-    vi.advanceTimersByTime(TYPING_GUARD_MS);
-    key("l");
-    vi.advanceTimersByTime(100);
-    key("Enter", { onButton: true });
-    expect(answers.map((a) => a.key)).toEqual(["Enter"]);
-  });
-
-  it("the stated residual: prose paused for the window right before a final l, then Enter at once, answers", () => {
-    type("cance", 80);
-    key("l");
-    vi.advanceTimersByTime(80);
-    key("Enter", { onButton: true });
-    expect(answers.map((a) => a.key)).toEqual(["Enter"]);
-  });
-
-  it("j then l then Enter, all fast, does not answer: only h/l/Tab walk onto a button", () => {
-    type("jl\n", 80, { enterOnButton: true });
+    key("Enter", { alone: true });
     expect(answers).toEqual([]);
   });
 
-  it("a then Enter: the Enter cancels the waiting a and is itself refused", () => {
+  it("a then Enter: the Enter cancels the waiting a and does not stand alone itself", () => {
     key("a");
     vi.advanceTimersByTime(100);
-    key("Enter", { onButton: true });
+    key("Enter", { alone: true });
     vi.advanceTimersByTime(TYPING_GUARD_MS * 4);
     expect(answers).toEqual([]);
+  });
+
+  it("Enter a whole window after the last key stands alone", () => {
+    key("l");
+    vi.advanceTimersByTime(TYPING_GUARD_MS);
+    key("Enter", { alone: true });
+    expect(answers.map((a) => a.key)).toEqual(["Enter"]);
   });
 });
 
@@ -338,19 +285,16 @@ describe("TypingGuard.mayActAfterMotion: the leader and Stop", () => {
     expect(lastMayAct(" ", 0, true)).toBe(false);
   });
 
-  it("leaves a card's Enter exactly as it was: j then Enter at 80 ms is still refused there", () => {
+  it("leaves mayAnswerNow exactly as it was: j then Enter at 80 ms does not stand alone there", () => {
     vi.advanceTimersByTime(1000);
     guard.onKey("j", Date.now());
     vi.advanceTimersByTime(80);
     guard.onKey("Enter", Date.now());
-    expect(guard.mayAnswerNow("Enter", Date.now(), false)).toBe(false);
+    expect(guard.mayAnswerNow(Date.now(), false)).toBe(false);
   });
 });
 
-/* Enter on a card's own button now
-   answers the way `a`/`d` do -- deferred through `defer`, and only when `App.tsx` saw focus put on
-   that very button by the key right before it. The guard itself decides no landing: it counts the
-   keys it recorded, so `App.tsx` can tie the landing it saw to the key that made it. */
+/* The guard counts the keys it recorded, so `App.tsx` can tie what it saw to the key that made it. */
 describe("keyCount", () => {
   it("counts every recorded key, a cancelling Super included, and no bare Shift", () => {
     const g = new TypingGuard();
@@ -362,19 +306,16 @@ describe("keyCount", () => {
     expect(g.keyCount()).toBe(3);
   });
 
-  it("defer takes Enter's walk exception only when told the key", () => {
+  it("defer takes no walk exception: Enter 100 ms after l waits for nothing", () => {
     let ran = 0;
     guard.onKey("l", 0);
     guard.onKey("Enter", 100);
-    // `a`/`d`'s own call, with no key named: `l` 100 ms before is typing.
     expect(guard.defer(100, false, () => ran++, "x")).toBe(false);
-    // Enter's: `l` is the walk onto the button, so it waits and then runs once.
-    expect(guard.defer(100, false, () => ran++, "x", "Enter")).toBe(true);
-    vi.advanceTimersByTime(TYPING_GUARD_MS - 1);
-    expect(ran).toBe(0);
-    vi.advanceTimersByTime(1);
-    expect(ran).toBe(1);
     vi.advanceTimersByTime(TYPING_GUARD_MS * 4);
+    expect(ran).toBe(0);
+    guard.onKey("Enter", 1000);
+    expect(guard.defer(1000, false, () => ran++, "x")).toBe(true);
+    vi.advanceTimersByTime(TYPING_GUARD_MS);
     expect(ran).toBe(1);
   });
 });
@@ -527,7 +468,7 @@ describe("TypingGuard.mayStartInput: Esc then i at once", () => {
     key("a");
     vi.advanceTimersByTime(TYPING_GUARD_MS * 4);
     expect(answers).toEqual([]);
-    expect(guard.mayAnswerNow("a", 100, false)).toBe(false);
+    expect(guard.mayAnswerNow(100, false)).toBe(false);
     expect(guard.mayActAfterMotion(100, false)).toBe(false);
   });
 });
@@ -539,9 +480,9 @@ describe("TypingGuard.onRelease: a held key counts until it is let go", () => {
     guard.onKey("j", 30);
     guard.onRelease("j", 200);
     guard.onKey("a", 400);
-    expect(guard.mayAnswerNow("a", 400, false)).toBe(false);
+    expect(guard.mayAnswerNow(400, false)).toBe(false);
     guard.onKey("a", 700);
-    expect(guard.mayAnswerNow("a", 700, false)).toBe(true);
+    expect(guard.mayAnswerNow(700, false)).toBe(true);
   });
 
   it("changes nothing when another key came after the held one, or for an earlier time", () => {
@@ -550,12 +491,12 @@ describe("TypingGuard.onRelease: a held key counts until it is let go", () => {
     guard.onKey("x", 10);
     guard.onRelease("j", 500);
     guard.onKey("a", 300);
-    expect(guard.mayAnswerNow("a", 300, false)).toBe(true);
+    expect(guard.mayAnswerNow(300, false)).toBe(true);
     const other = new TypingGuard();
     other.onKey("j", 100);
     other.onRelease("j", 50);
     other.onKey("a", 360);
-    expect(other.mayAnswerNow("a", 360, false)).toBe(true);
+    expect(other.mayAnswerNow(360, false)).toBe(true);
   });
 
   it("records no key of its own", () => {
@@ -597,11 +538,11 @@ describe("TypingGuard: an answer that waits for its key's release (deferUntilRel
   });
 
   it("a key down longer than RELEASE_WAIT_MAX_MS, with no repeat to cancel it, is refused at its release with the wait's flash", () => {
-    press("y", "Ctrl+y approves only on its own");
+    press("y", "pause, then press it again");
     vi.advanceTimersByTime(RELEASE_WAIT_MAX_MS - 1);
     expect(answers).toEqual([]);
     vi.advanceTimersByTime(5000);
-    expect(guard.onKeyUp("y", Date.now())).toBe("Ctrl+y approves only on its own");
+    expect(guard.onKeyUp("y", Date.now())).toBe("pause, then press it again");
     vi.advanceTimersByTime(TYPING_GUARD_MS * 4);
     expect(answers).toEqual([]);
     // Nothing is left waiting: the next press is judged afresh.
@@ -654,9 +595,9 @@ describe("TypingGuard: an answer that waits for its key's release (deferUntilRel
   });
 
   it("a held key's first repeat, before any release, cancels it and says the wait's own flash", () => {
-    press("y", "Ctrl+y approves only on its own");
+    press("y", "pause, then press it again");
     vi.advanceTimersByTime(600);
-    expect(guard.onKey("y", Date.now())).toBe("Ctrl+y approves only on its own");
+    expect(guard.onKey("y", Date.now())).toBe("pause, then press it again");
     guard.onKeyUp("y", Date.now());
     vi.advanceTimersByTime(TYPING_GUARD_MS * 4);
     expect(answers).toEqual([]);
@@ -750,14 +691,15 @@ describe("TypingGuard: an arrival counts as a key", () => {
   function arrive() {
     guard.noteArrival(Date.now());
   }
-  const enterOnButton = () => key("Enter", { onButton: true });
-  /** INPUT's `Ctrl+y`: the guard's before-half, then a wait for the window and the release. */
-  function ctrlY() {
+  const enterAlone = () => key("Enter", { alone: true });
+  /** A key that must also be let go (`j` into the box): the guard's before-half, then a wait for the window and
+   *  the release. */
+  function releaseWait() {
     const t = Date.now();
-    guard.onKey("y", t);
-    if (!guard.mayAnswerNow("", t, false)) return;
-    guard.deferUntilReleased(t, false, () => answers.push({ key: "Ctrl+y", at: Date.now() }), "cancelled", "KeyY");
-    guard.onKeyUp("KeyY", t + 50);
+    guard.onKey("j", t);
+    if (!guard.mayAnswerNow(t, false)) return;
+    guard.deferUntilReleased(t, false, () => answers.push({ key: "j", at: Date.now() }), "cancelled", "KeyJ");
+    guard.onKeyUp("KeyJ", t + 50);
   }
   /** The leader: acts at once when the guard lets it. */
   function leader() {
@@ -774,8 +716,8 @@ describe("TypingGuard: an arrival counts as a key", () => {
   it("an_answer_key_within_250ms_of_an_arrival_is_refused", () => {
     const cases: Array<[string, () => void]> = [
       ["a", () => key("a")],
-      ["Enter on a card button", enterOnButton],
-      ["Ctrl+y", ctrlY],
+      ["Enter on a card row", enterAlone],
+      ["a key let go (j into the box)", releaseWait],
       ["the leader", leader],
       ["i", startInput],
     ];
@@ -795,8 +737,8 @@ describe("TypingGuard: an arrival counts as a key", () => {
   it("an_answer_key_after_250ms_is_taken", () => {
     const cases: Array<[string, () => void]> = [
       ["a", () => key("a")],
-      ["Enter on a card button", enterOnButton],
-      ["Ctrl+y", ctrlY],
+      ["Enter on a card row", enterAlone],
+      ["a key let go (j into the box)", releaseWait],
       ["the leader", leader],
       ["i", startInput],
     ];
@@ -818,7 +760,7 @@ describe("TypingGuard: an arrival counts as a key", () => {
     vi.advanceTimersByTime(200);
     key("a");
     vi.advanceTimersByTime(200);
-    enterOnButton();
+    enterAlone();
     vi.advanceTimersByTime(TYPING_GUARD_MS * 4);
     expect(answers).toEqual([]);
     key("a");
@@ -826,12 +768,12 @@ describe("TypingGuard: an arrival counts as a key", () => {
     expect(answers.map((a) => a.key)).toEqual(["a"]);
   });
 
-  it("a walk or a motion run that starts inside the arrival's window is no exception", () => {
+  it("an h/l run or a motion run that starts inside the arrival's window is no exception", () => {
     arrive();
     vi.advanceTimersByTime(100);
     key("l");
     vi.advanceTimersByTime(100);
-    enterOnButton();
+    enterAlone();
     vi.advanceTimersByTime(TYPING_GUARD_MS * 4);
     arrive();
     vi.advanceTimersByTime(100);
@@ -902,10 +844,10 @@ describe("TypingGuard.clockNow: the present on the keydowns' clock", () => {
     // 100 ms after the arrival, handled at once.
     const t = guard.timeOf({ repeat: false, timeStamp: 1100 }, 1100);
     guard.onKey("a", t);
-    expect(guard.mayAnswerNow("a", t, false)).toBe(false);
+    expect(guard.mayAnswerNow(t, false)).toBe(false);
     const alone = guard.timeOf({ repeat: false, timeStamp: 1600 }, 1600);
     guard.onKey("a", alone);
-    expect(guard.mayAnswerNow("a", alone, false)).toBe(true);
+    expect(guard.mayAnswerNow(alone, false)).toBe(true);
   });
 
   it("a stamp never ahead of its handling reads as performance.now()'s clock, however late the keys were handled", () => {
@@ -918,12 +860,12 @@ describe("TypingGuard.clockNow: the present on the keydowns' clock", () => {
     guard.noteArrival(guard.clockNow(2000));
     const t = guard.timeOf({ repeat: false, timeStamp: 7000 }, 2100);
     guard.onKey("a", t);
-    expect(guard.mayAnswerNow("a", t, false)).toBe(false);
+    expect(guard.mayAnswerNow(t, false)).toBe(false);
     const later = guard.timeOf({ repeat: false, timeStamp: 7200 }, 2300);
     guard.onKey("a", later);
-    expect(guard.mayAnswerNow("a", later, false)).toBe(false);
+    expect(guard.mayAnswerNow(later, false)).toBe(false);
     const alone = guard.timeOf({ repeat: false, timeStamp: 7500 }, 2600);
     guard.onKey("a", alone);
-    expect(guard.mayAnswerNow("a", alone, false)).toBe(true);
+    expect(guard.mayAnswerNow(alone, false)).toBe(true);
   });
 });

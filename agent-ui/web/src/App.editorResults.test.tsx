@@ -61,12 +61,12 @@ describe("editor tool expanded answers in App", () => {
     expect(preview?.textContent).not.toContain("{");
   });
 
-  it("Ctrl+o shows the raw answer, and returning restores the readable body", () => {
+  it("zi shows the raw answer, and returning restores the readable body", () => {
     const { body, press } = mount();
     press("Enter");
-    press("o", true);
+    press("z"); press("i");
     expect(body()?.textContent).toBe(raw);
-    press("o", true);
+    press("z"); press("i");
     expect(body()?.textContent).toBe("a.py:4-5 (unsaved)\none\ntwo\n");
   });
 
@@ -75,7 +75,7 @@ describe("editor tool expanded answers in App", () => {
       { content: [{ type: "text", text: raw }] });
     press("Enter");
     expect(body()?.textContent).toBe("a.py:4-5 (unsaved)\none\ntwo\n");
-    press("o", true);
+    press("z"); press("i");
     expect(body()?.textContent).toContain('"type": "text"');
     expect(body()?.textContent).toContain('\\"modified\\":true');
   });
@@ -86,7 +86,7 @@ describe("editor tool expanded answers in App", () => {
     press("Enter");
     expect(body()?.textContent).toBe("**hover** <img src=x> [link](https://example.test)⟨U+202E⟩⟨U+200B⟩");
     expect(body()?.querySelector("img, a, strong")).toBeNull();
-    press("o", true);
+    press("z"); press("i");
     expect(body()?.textContent).toContain('"text":"**hover**');
     expect(body()?.textContent).toContain("⟨U+202E⟩⟨U+200B⟩");
     expect(body()?.querySelector("img, a, strong")).toBeNull();
@@ -108,7 +108,7 @@ describe("editor tool expanded answers in App", () => {
     // The page receives results for display; the host owns delivery to the model.
     const { press, posted } = mount();
     posted.length = 0;
-    press("Enter"); press("o", true); press("o", true);
+    press("Enter"); press("z"); press("i"); press("z"); press("i");
     expect(posted).toEqual([]);
   });
 });

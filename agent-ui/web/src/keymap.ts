@@ -39,6 +39,8 @@ export type PanelMode = "browse" | "input" | "hint" | "caret" | "visual" | "vlin
  *  the two presses. See `KeyContext.pending`. `"C-w"` is `Ctrl+w` (vim's window prefix), spelled the way tmux spells
  *  a chord (`literal_key`'s own `"C-a"`), since a chord is not one character. */
 export type PendingPrefix = "g" | "z" | "[" | "]" | "C-w";
+/** The BROWSE keys that once answered or walked cards (`card-key-gone`). */
+export type CardKeyGone = "a" | "d" | "D" | "]p" | "[p";
 
 /** Where `Ctrl+w h/j/k/l` sends the keys: a side of the panel, by geometry. */
 export type PaneDirection = "left" | "down" | "up" | "right";
@@ -113,22 +115,22 @@ export type PanelAction =
   | { kind: "move"; delta: 1 | -1 }
   /** `h`/`l`: to the previous or next control inside the current stop (`./nav`'s `nextControl`). */
   | { kind: "control"; delta: 1 | -1 }
-  /** `a`/`d`: answer the permission card under the cursor, or the one gating the tool call under it
-   *  -- nothing else (an earlier "the only card, from any row" rule is gone).
-   *  `App.tsx` answers only a key that stands alone (`./typingGuard`). */
-  | { kind: "answer"; decision: "allow" | "deny" }
-  /** INPUT's `Ctrl+y`: approve the ACTIVE tab's OLDEST waiting card
-   *  -- the one a card landing takes -- without leaving INPUT. `App.tsx` answers it by that
-   *  card's own `permissionId`, `TYPING_GUARD_MS` later and only when the key stood alone, and
-   *  leaves the composer as it was. No deny counterpart: deny stays where a reason can be typed. */
-  | { kind: "approve-oldest" }
+  /** BROWSE `a`, `d`, `D`, `]p`, `[p`: keys that once answered or walked cards and now answer nothing. Cards are
+   *  answered in card mode only (`card-mode`, and Enter on a card row); `App.tsx` says so, naming the key. Claimed,
+   *  with or without a count, so none of them can be given a meaning that a habit would reach by accident. */
+  | { kind: "card-key-gone"; key: CardKeyGone }
+  /** INPUT's `Ctrl+y`: claimed and answers nothing. `App.tsx` keeps it from the box (the composer has no
+   *  kill ring for it to yank from) and says where cards are answered now. */
+  | { kind: "ctrl-y-gone" }
+  /** `Alt+n` (+1) / `Alt+p` (-1), from BROWSE, INPUT, CARET or VISUAL: card mode on the next / previous card waiting in
+   *  this tab (`./cardMode`). Which card that is, and whether one waits at all, is `App.tsx`'s: it has the timeline.
+   *  Ahead of every pending prefix and count, which entering drops. */
+  | { kind: "card-mode"; delta: 1 | -1 }
   | { kind: "toggle-expand" }
   | { kind: "copy" }
   /** `Shift+Y`: a tool row's whole result, uncut, never anything else's. */
   | { kind: "copy-output" }
   | { kind: "restart" }
-  /** `Shift+D`: the keys go to the target card's reason box; `Enter` there denies with it. */
-  | { kind: "deny-reason" }
   /** `Ctrl+d` (+1) / `Ctrl+u` (-1): scroll the conversation by half its visible height. `App.tsx`
    *  measures the list and re-homes the cursor if the scroll carried its row out of sight. */
   | { kind: "half-page"; delta: 1 | -1 }
@@ -167,42 +169,37 @@ export type PanelAction =
   | { kind: "pane"; direction: PaneDirection }
   /** A key that ran nothing on purpose, and `App.tsx` swallows it.
    *  `"unbound"`: the key after a reserved prefix completed none of its pairs (`FIXED_PAIRS`, or a
-   *  table pair such as `[b`) -- vim's `clearopbeep`, so `g`, a pause, `d` can never deny a card.
-   *  `"count-on-answer"`: `a`/`d`/`D` typed after a count (`3a`) -- a card answer takes no count, and
-   *  `App.tsx` says so in the band (`COUNT_ANSWER_FLASH`) rather than answering. */
-  | { kind: "cancel"; why: "unbound" | "count-on-answer" }
+   *  table pair such as `[b`) -- vim's `clearopbeep`, so a prefix never runs its next key as that key's own action. */
+  | { kind: "cancel"; why: "unbound" }
   /** A digit `App.tsx` accumulates into a count for `j`/`k`/`[[`/`]]` and for `G`/`gg`/`zt`/`zz`/`zb` (row N) and `gt`/`gT` (tab N) -- a prefix hands it on to its
    *  second key. `Ctrl+f`/`PageDown`/`PageUp` repeat by it as well, and the arrow keys as
-   *  `j`/`k` do, and `]p`/`[p` go that many cards on. */
+   *  `j`/`k` do. */
   | { kind: "count"; digit: number }
   /** `[[`/`]]`: the cursor to the previous/next prompt of yours. */
   | { kind: "prompt-jump"; delta: 1 | -1 }
-  /** `]p` (+1) / `[p` (-1) (nvim's `]d`/`[d` are the model): the cursor to the
-   *  next / previous card waiting for an answer in this tab, wrapping where `[[`/`]]` stop; a count repeats
-   *  it. It only moves the cursor: `a`/`d` afterwards answer the card it landed on, through the typing guard as ever. Which
-   *  cards wait (not answered from this panel, and the session alive) is `App.tsx`'s call -- it has the
-   *  timeline, and this table has none -- so the pair resolves the same on an ended session. */
-  | { kind: "card-jump"; delta: 1 | -1 }
   /** `Ctrl+c` while a turn runs: interrupt it. Never claimed idle (native copy) and
    *  never claimed in INPUT (the composer's own `Ctrl+c`). */
   | { kind: "interrupt" }
   /** `f` in BROWSE: start a global HINT. */
   | { kind: "hint" }
-  /** `?` in BROWSE: open or close the full keymap. */
+  /** `F1` / `g?`: open the full keymap. */
   | { kind: "keymap" }
   /** `c` in BROWSE (turn review): open the overlay over what changed on disk during this tab's latest
-   *  turn. It decides nothing about the overlay's own keys -- those are `./review`'s -- and, like `?`, only
+   *  turn. It decides nothing about the overlay's own keys -- those are `./review`'s -- and, like `F1`, only
    *  opens: closing is the overlay's. */
   | { kind: "review" }
-  /** `/` in BROWSE: open the incremental search, as vim's `/` does. */
-  | { kind: "search" }
+  /** `/` / `?` in BROWSE: open incremental search in the given direction. */
+  | { kind: "search"; dir: 1 | -1 }
+  | { kind: "vsearch"; dir: 1 | -1 }
+  | { kind: "jump-older" }
+  | { kind: "jump-newer" }
   /** `:` in BROWSE: open a vim-style command line in the
    *  footer that runs only `:trust` and `:untrust` -- any other line closes it with a flash, Esc
    *  silently -- so `:ls⏎`, `:l⏎` and `:d⏎` land in it and never reach a card. */
   | { kind: "ex-line" }
-  /** `n` (+1) / `Shift+N` (-1) in BROWSE: repeat the last `/` search, wrapping as vim's `wrapscan` does. */
+  /** `n` (+1) / `Shift+N` (-1) in BROWSE: repeat the last `/` or `?` search, wrapping as vim's `wrapscan` does. */
   | { kind: "search-next"; delta: 1 | -1 }
-  /** `Ctrl+o`, either mode: toggle the detailed view -- every result, wider cuts, no
+  /** `zi` in BROWSE, `Ctrl+o` in INPUT: toggle the detailed view -- every result, wider cuts, no
    *  collapsed runs. */
   | { kind: "detailed" }
   /** `zh` (-1) / `zl` (+1): scroll the current row's own table sideways. */
@@ -279,8 +276,8 @@ export type VisualMotion = "h" | "l" | "j" | "k" | "w" | "e" | "b" | "0" | "$" |
  *  IME commit as `keyCode === 229` rather than `isComposing`); absent it is simply not that.
  *  `altKey`/`metaKey`: optional, absent meaning "not held" for every existing
  *  caller and test that never mentions them -- the real `KeyboardEvent` App.tsx casts through this
- *  type always carries both at runtime; this type just used to drop them on the floor. Read only by
- *  the card-answer keys (`a`/`d`/`D`): the two-key sequence pair lookup above (`gT` etc.)
+ *  type always carries both at runtime; this type just used to drop them on the floor. Read by
+ *  the plain-key checks (`isPlainAnswerKey`): the two-key sequence pair lookup above (`gT` etc.)
  *  is deliberately untouched, a previously accepted exception scoped to that lookup alone (2026-09-27), not to permission answers. (A `FIXED_PAIRS` second key does
  *  not read them either, as the `g`/`z`/`[`/`]` that armed it never did; `resolvePendingSecond`.)
  *  `getModifierState`: Super and Hyper are a
@@ -342,8 +339,8 @@ function hasAltGraph(event: KeyLike): boolean {
  *  duplicating `composerKeys.ts`'s `isImeKey` rather than importing it, the same reason
  *  `resolveKey`'s own top-of-function check does (`KeyLike` stays a plain object with no dependency
  *  of its own). AltGraph joined this list the same day, closing a gap neither surface had checked. Shift is deliberately
- *  absent: it is not a "modifier" for this predicate's purposes -- `D` answers with Shift held, and
- *  the bypass `y`'s own `Y` still counts, both decided by their own callers. */
+ *  absent: it is not a "modifier" for this predicate's purposes -- `D`, `V` and card mode's `$` are read with
+ *  Shift held, and the bypass `y`'s own `Y` still counts, each decided by its own caller. */
 export function isPlainAnswerKey(event: KeyLike): boolean {
   return (
     !event.ctrlKey &&
@@ -354,6 +351,18 @@ export function isPlainAnswerKey(event: KeyLike): boolean {
     !event.isComposing &&
     event.keyCode !== 229
   );
+}
+
+/** `Alt+n` (+1) or `Alt+p` (-1) with Alt alone held -- no Ctrl, Shift, Meta, Super/Hyper or AltGraph -- and no input
+ *  method composing, else `null`. The letter is compared case-blind: under Caps Lock the chord arrives as `N` with
+ *  Shift not held, and Shift itself still refuses it. Card mode's way in, and inside card mode its way to the next or
+ *  previous card (`./cardMode` reads the same chord). */
+export function cardModeDelta(event: KeyLike): 1 | -1 | null {
+  if (event.isComposing || event.keyCode === 229) return null;
+  if (event.altKey !== true || event.ctrlKey || event.shiftKey || event.metaKey) return null;
+  if (hasSuperOrHyper(event) || hasAltGraph(event)) return null;
+  const letter = event.key.toLowerCase();
+  return letter === "n" ? 1 : letter === "p" ? -1 : null;
 }
 
 /** `sessionEnded` gates two rows in opposite directions: it is what OFFERS `r` (return to the start
@@ -370,9 +379,9 @@ export type KeyContext = {
   /** The count `App.tsx` has accumulated from `1`-`9` then `0`-`9`, or `null`/absent before any
    *  digit has been pressed. This table only ever reads it to decide whether a lone `0` starts a
    *  count (it does not) or continues one (it does); applying the count to `j`/`k`/`[[`/`]]`, to
-   *  `G`/`gg`/`zt`/`zz`/`zb` (row N), to `gt`/`gT` (tab N) and to `]p`/`[p` (that many cards on) is
+   *  `G`/`gg`/`zt`/`zz`/`zb` (row N) and to `gt`/`gT` (tab N) is
    *  `App.tsx`'s job, since it is the one that knows how many times to repeat a move, how many rows there
-   *  are, which tabs and which cards wait. */
+   *  are and which tabs. */
   count?: number | null;
   /** Whether a turn is running in the active tab, for `Ctrl+c`. `undefined`/`false` both
    *  mean "not running" -- idle is the common case and every existing caller that never mentions
@@ -451,13 +460,16 @@ function resolveRegionModifierKey(event: KeyLike, ctx: KeyContext, idleCtrlC: Pa
  * fallthrough to BROWSE/INPUT or to `resolveVisualKey` below it.
  */
 function resolveCaretKey(event: KeyLike, ctx: KeyContext): PanelAction {
+  // Card mode, ahead of the modifier swallow below: `App.tsx` ends the region first.
+  const cardDelta = cardModeDelta(event);
+  if (cardDelta !== null) return { kind: "card-mode", delta: cardDelta };
   // Idle `Ctrl+c` is CLAIMED in CARET (the block caret's consequence: the engine would otherwise
   // copy the one character the caret sits on) -- `App.tsx` reads `vswallow` plus `mode === "caret"`
   // to flash "nothing selected — v, then y", rather than a dedicated action kind.
   const modifierResult = resolveRegionModifierKey(event, ctx, { kind: "vswallow" });
   if (modifierResult !== "fallthrough") return modifierResult;
-  // `?` ends CARET and opens the full keymap.
-  if (event.key === "?") return { kind: "keymap" };
+  if (event.key === "F1" && !event.shiftKey) return { kind: "keymap" };
+  if (event.key === "?" || event.key === "/") return { kind: "vsearch", dir: event.key === "/" ? 1 : -1 };
   const pendingResult = resolveRegionPendingG(event, ctx);
   if (pendingResult !== "fallthrough") return pendingResult;
   // `1`-`9` starts a count, `0`-`9` continues one; a LONE `0` (no count running) is the `0`
@@ -505,14 +517,16 @@ function resolveCaretKey(event: KeyLike, ctx: KeyContext): PanelAction {
  * two this is.
  */
 function resolveVisualKey(mode: "visual" | "vline", event: KeyLike, ctx: KeyContext): PanelAction {
+  // Card mode, ahead of the modifier swallow below, as in CARET.
+  const cardDelta = cardModeDelta(event);
+  if (cardDelta !== null) return { kind: "card-mode", delta: cardDelta };
   // `Ctrl+c` keeps its BROWSE meaning in VISUAL/V-LINE -- idle, unclaimed (the engine's own
   // native copy of the visible selection runs and the mode stays, exactly as an unclaimed key
   // always leaves it). Bare modifiers (Shift on the way to `$`/`V`) are exempted the same way.
   const modifierResult = resolveRegionModifierKey(event, ctx, null);
   if (modifierResult !== "fallthrough") return modifierResult;
-  // `?` ends VISUAL/V-LINE and opens the full keymap -- `App.tsx` ends the region itself on
-  // this action, the same as every other route into the overlay.
-  if (event.key === "?") return { kind: "keymap" };
+  if (event.key === "F1" && !event.shiftKey) return { kind: "keymap" };
+  if (event.key === "?" || event.key === "/") return { kind: "vsearch", dir: event.key === "/" ? 1 : -1 };
   const pendingResult = resolveRegionPendingG(event, ctx);
   if (pendingResult !== "fallthrough") return pendingResult;
   // `1`-`9` starts a count, `0`-`9` continues one; a LONE `0` (no count running) is the `0`
@@ -566,8 +580,15 @@ function resolveVisualKey(mode: "visual" | "vline", event: KeyLike, ctx: KeyCont
  *  prefix (`leader.test.ts` holds the two to the same keys). */
 export const FIXED_PAIRS: Record<PendingPrefix, Readonly<Record<string, NonNullable<PanelAction>>>> = {
   // `gx`, vim's "open the link", beside `gf`'s "open the path".
-  g: { g: { kind: "jump", to: "first" }, f: { kind: "open-path" }, x: { kind: "open-link" } },
+  g: {
+    g: { kind: "jump", to: "first" },
+    f: { kind: "open-path" },
+    x: { kind: "open-link" },
+    "?": { kind: "keymap" },
+  },
+
   z: {
+    i: { kind: "detailed" },
     h: { kind: "table-scroll", delta: -1 },
     l: { kind: "table-scroll", delta: 1 },
     // vim's `zt`/`zz`/`zb` (the row to the top/middle/bottom of the view) and
@@ -579,9 +600,19 @@ export const FIXED_PAIRS: Record<PendingPrefix, Readonly<Record<string, NonNulla
     o: { kind: "fold", open: true },
     c: { kind: "fold", open: false },
   },
-  // `[p`/`]p`, the previous/next card waiting for an answer, beside the prompt pair.
-  "[": { "[": { kind: "prompt-jump", delta: -1 }, p: { kind: "card-jump", delta: -1 } },
-  "]": { "]": { kind: "prompt-jump", delta: 1 }, p: { kind: "card-jump", delta: 1 } },
+
+  // `[p`/`]p` stay reserved beside the prompt pair: they once walked the waiting cards, and now say that card mode's
+  // `Alt-p`/`Alt-n` do.
+  "[": {
+    "[": { kind: "prompt-jump", delta: -1 },
+    p: { kind: "card-key-gone", key: "[p" },
+  },
+
+  "]": {
+    "]": { kind: "prompt-jump", delta: 1 },
+    p: { kind: "card-key-gone", key: "]p" },
+  },
+
   // vim's `CTRL-W h/j/k/l`, the module that way. `Ctrl+w w/p/o/q` and `Ctrl+w
   // Ctrl+h` are not here: they cancel, like every other key after this prefix.
   "C-w": {
@@ -595,8 +626,10 @@ export const FIXED_PAIRS: Record<PendingPrefix, Readonly<Record<string, NonNulla
 /** The key after a pending prefix. A bare modifier is not a key yet. `Ctrl+c` keeps its
  *  meaning; `gv` stays reserved and `[]`/`][` stay nothing, exactly as before.
  *  The second key reads the modifiers the way `[`/`]` themselves are read
- *  (`resolveKey`'s blanket refusal: Ctrl and Shift, never Alt or Meta), so the two halves of a
- *  bracket pair agree. A pair typed with Alt or Meta held completes, as it always did -- on a
+ *  (`resolveKey`'s blanket refusal: Ctrl and Shift, never Alt or Meta), except `?` may complete
+ *  a fixed pair with Shift held and no Ctrl, since most layouts type it with Shift. Every other
+ *  shifted key cancels, including `gv` and `[]`/`][` rather than swallowing them.
+ *  A pair typed with Alt or Meta held completes, as it always did -- on a
  *  layout that types a bracket with Option (macOS German, French, Swiss), that is how `[[` and `]]`
  *  are typed at all -- and a key completing no pair still cancels, whatever it holds.
  *  `g` and `z` no longer ARM with Alt or Meta held (no layout types them that way),
@@ -604,10 +637,12 @@ export const FIXED_PAIRS: Record<PendingPrefix, Readonly<Record<string, NonNulla
 function resolvePendingSecond(prefix: PendingPrefix, event: KeyLike, ctx: KeyContext): PanelAction {
   if (isModifierKey(event.key)) return null;
   if (event.ctrlKey && !event.shiftKey && event.key === "c") return ctx.turnRunning === true ? { kind: "interrupt" } : null;
-  if (!event.ctrlKey && !event.shiftKey) {
+  if (!event.ctrlKey && (!event.shiftKey || event.key === "?")) {
     // `hasOwn`, not a bare index: a key spelled like an `Object.prototype` member (`constructor`)
     // must be looked up in this table alone, never inherited into a pair.
     if (Object.prototype.hasOwnProperty.call(FIXED_PAIRS[prefix], event.key)) return FIXED_PAIRS[prefix][event.key];
+  }
+  if (!event.ctrlKey && !event.shiftKey) {
     if (prefix === "g" && event.key === "v") return null;
     if ((prefix === "[" && event.key === "]") || (prefix === "]" && event.key === "[")) return null;
   }
@@ -636,6 +671,12 @@ export function resolveKey(mode: PanelMode, event: KeyLike, ctx: KeyContext): Pa
   // fall through to anything below them; every region key is decided in one of the two or nowhere.
   if (mode === "caret") return resolveCaretKey(event, ctx);
   if (mode === "visual" || mode === "vline") return resolveVisualKey(mode, event, ctx);
+  // Card mode, in BROWSE and INPUT alike, ahead of the pending prefix just below: `g` then `Alt+n`, or `3` then
+  // `Alt+n`, enters card mode, and `App.tsx` drops the prefix or the count and says so.
+  if (mode === "browse" || mode === "input") {
+    const cardDelta = cardModeDelta(event);
+    if (cardDelta !== null) return { kind: "card-mode", delta: cardDelta };
+  }
   // The key after a pending prefix, outside INPUT (INPUT never reads one: a `g` left over from
   // BROWSE is simply dropped there). First, a second key completing a panel-table two-key sequence
   // whose first half is one of the four prefixes (`[b` -- a reserved prefix may start
@@ -652,11 +693,11 @@ export function resolveKey(mode: PanelMode, event: KeyLike, ctx: KeyContext): Pa
     }
     return resolvePendingSecond(ctx.pending, event, ctx);
   }
-  // `Ctrl+o` toggles the detailed view in EITHER mode -- named here, ahead of the `mode !==
-  // "input"` block below (whose chords are BROWSE/HINT-only) and ahead of the blanket modifier
-  // refusal further down, the same reason `?`/`G`/`N` are. It works while typing because a reader deciding whether a fold is hiding something they need does
-  // not want to leave the box first.
-  if (event.ctrlKey && !event.shiftKey && event.key === "o") return { kind: "detailed" };
+  if (event.key === "F1" && !event.shiftKey && isPlainAnswerKey(event)) return { kind: "keymap" };
+  if (event.ctrlKey && !event.shiftKey && event.key === "o") {
+    return { kind: mode === "input" ? "detailed" : "jump-older" };
+  }
+  if (mode !== "input" && event.ctrlKey && !event.shiftKey && event.key === "i") return { kind: "jump-newer" };
   // The chords this table names outside INPUT, checked BEFORE the blanket modifier refusal below and
   // before the plain-key switch. The order is load-bearing: a browser reports `key === "d"` for
   // Ctrl+d just as for a bare `d` (Ctrl does not remap `key` the way Shift does), so a Ctrl+d that
@@ -706,7 +747,7 @@ export function resolveKey(mode: PanelMode, event: KeyLike, ctx: KeyContext): Pa
     if (event.shiftKey && !event.ctrlKey && event.key === "G") return { kind: "jump", to: "last" };
     // `?` arrives with Shift held on most layouts (Shift+/), so it must be named before the blanket
     // modifier refusal below, the same reason `G` is; matched on `key`, never on the physical key.
-    if (event.key === "?" && !event.ctrlKey) return { kind: "keymap" };
+    if (event.key === "?" && !event.ctrlKey) return { kind: "search", dir: -1 };
     // `:` opens the command line, named here for the same reason as `?` -- Shift+;
     // on most layouts, unshifted on others (AZERTY). Held with Ctrl, Alt or Meta it is some other
     // chord and falls through. After a pending prefix it never gets here (a pending prefix cancels it above).
@@ -715,19 +756,11 @@ export function resolveKey(mode: PanelMode, event: KeyLike, ctx: KeyContext): Pa
     // most layouts deliver capital `N` with Shift held.
     if (event.shiftKey && !event.ctrlKey && event.key === "N") return { kind: "search-next", delta: -1 };
     // `Shift+Y`/`Shift+D`, named here ahead of the blanket modifier refusal for the same
-    // reason as `G`/`N`/`?` -- most layouts deliver both with Shift held. `D` needs a live session
-    // to have anywhere to put the keys (its own row is refused the same way `i`'s and `r`'s are).
+    // reason as `G`/`N`/`?` -- most layouts deliver both with Shift held.
     if (event.shiftKey && !event.ctrlKey && event.key === "Y") return { kind: "copy-output" };
-    // Alt/Meta/Super held alongside Shift+D must not reach a card-answer key
-    // -- checked here, ahead of the blanket ctrl/shift-only refusal below, since that refusal never
-    // looks at altKey/metaKey (or Super/Hyper/AltGraph) at all. `isPlainAnswerKey` is what actually reads all of Ctrl/Alt/Meta/Super/Hyper/AltGraph here -- there is
-    // no separate `!event.ctrlKey` in this condition any more, only the predicate.
-    if (event.shiftKey && isPlainAnswerKey(event) && event.key === "D") {
-      // A card answer takes no count (a count on a yes/no is a typo, never intent) -- `3D` is refused and says so,
-      // never answered.
-      if ((ctx.count ?? null) !== null) return { kind: "cancel", why: "count-on-answer" };
-      return ctx.sessionEnded ? null : { kind: "deny-reason" };
-    }
+    // `D` answers no card (card mode's Tab opens the reason field): claimed and refused, with or without a count.
+    // Alt/Meta/Super/Hyper/AltGraph held is some other chord (`isPlainAnswerKey`), which falls through unclaimed.
+    if (event.shiftKey && isPlainAnswerKey(event) && event.key === "D") return { kind: "card-key-gone", key: "D" };
     // C1a: `A` (`:h A`), named ahead of the blanket refusal the same reason G/N/Y/D are -- most
     // layouts deliver it with Shift held. Refused on an ended session for the same reason `i`/`o`
     // are just below: INPUT there has no box to place a caret in.
@@ -761,15 +794,14 @@ export function resolveKey(mode: PanelMode, event: KeyLike, ctx: KeyContext): Pa
   // `KeyLike` has carried these two fields since the table was first written; this is what makes
   // reading them, rather than deleting them, the correct fix once something actually checked whether
   // they were used.
-  // One `Ctrl+y` approves from INPUT, not two steps (leave INPUT, then answer): INPUT's one added chord, ahead
-  // of the blanket refusal just below. Exactly Ctrl+y -- Shift, Alt, Meta, Super/Hyper (held on the
-  // event or by its own keydown, `hasSuperOrHyper`) or AltGraph held is nothing, the same modifier set
-  // `isPlainAnswerKey` refuses for `a`/`d`, with Ctrl required instead of refused; a composing input
-  // method already returned at the top of this function. `App.tsx` picks the card (the active tab's
-  // oldest waiting one) and runs the typing guard; this table only names the chord. BROWSE's own Ctrl+y
-  // (the one-line scroll) is the `mode !== "input"` block above and never reaches here. Under
-  // Caps Lock GTK/WebKitGTK report the chord as key "Y" with Shift not held, so the
-  // letter is compared case-blind -- Shift itself is still refused just below.
+  // INPUT's `Ctrl+y` answers no card: it is claimed so the box does nothing with it, and `App.tsx` says where
+  // cards are answered (card mode). Checked ahead of the blanket refusal just below. Exactly Ctrl+y -- Shift,
+  // Alt, Meta, Super/Hyper (held on the event or by its own keydown, `hasSuperOrHyper`) or AltGraph held is
+  // nothing, the same modifier set `isPlainAnswerKey` refuses, with Ctrl required instead of refused; a
+  // composing input method already returned at the top of this function. BROWSE's own Ctrl+y (the one-line
+  // scroll) is the `mode !== "input"` block above and never reaches here. Under Caps Lock GTK/WebKitGTK
+  // report the chord as key "Y" with Shift not held, so the letter is compared case-blind -- Shift itself is
+  // still refused just below.
   if (
     mode === "input" &&
     event.key.toLowerCase() === "y" &&
@@ -780,7 +812,7 @@ export function resolveKey(mode: PanelMode, event: KeyLike, ctx: KeyContext): Pa
     !hasSuperOrHyper(event) &&
     !hasAltGraph(event)
   ) {
-    return { kind: "approve-oldest" };
+    return { kind: "ctrl-y-gone" };
   }
   if (event.ctrlKey || event.shiftKey) return null;
   if (mode === "input") {
@@ -853,22 +885,10 @@ export function resolveKey(mode: PanelMode, event: KeyLike, ctx: KeyContext): Pa
       return { kind: "page", delta: -1 };
     case "a":
     case "d":
-      // Alt+a/Meta+a must not authorize or deny a card -- a common OS chord
-      // (e.g. "select all" muscle memory) held with `a` used to reach here unchecked, since the
-      // blanket ctrl/shift-only refusal above never looks at altKey/metaKey and this switch is keyed
-      // on `event.key` alone.
-      // Super/Hyper is a THIRD, separate GDK
-      // modifier -- it does not "arrive as metaKey", the claim an earlier version of this comment
-      // made and this project's own shell-side code (`SUPER_MASK`/`HYPER_MASK`/`META_MASK` as three
-      // distinct masks, `shell/src/gtk_host/keys.rs`) disproves. `isPlainAnswerKey` is the shared check for
-      // this (2026-09-28); see `KeyLike`'s own doc comment for the honest caveat that
-      // Super may be a no-op on WebKitGTK if it never surfaces as a DOM modifier at all, in which case
-      // a real fix needs a shell-side key controller (not built here).
-      if (!isPlainAnswerKey(event)) return null;
-      // A card answer takes no count -- `3a` is refused and says so, never answered.
-      if ((ctx.count ?? null) !== null) return { kind: "cancel", why: "count-on-answer" };
-      // A dead session's cards are inert: there is nobody left to answer.
-      return ctx.sessionEnded ? null : { kind: "answer", decision: event.key === "a" ? "allow" : "deny" };
+      // `a`/`d` answer no card: claimed and refused, with or without a count, so the habit teaches card mode instead
+      // of doing something else. Alt, Meta, Super/Hyper or AltGraph held is some other chord (`isPlainAnswerKey`),
+      // which falls through unclaimed.
+      return isPlainAnswerKey(event) ? { kind: "card-key-gone", key: event.key } : null;
     case "Enter":
       return { kind: "toggle-expand" };
     case "y":
@@ -885,7 +905,7 @@ export function resolveKey(mode: PanelMode, event: KeyLike, ctx: KeyContext): Pa
       // on an ended session too: what changed on disk is still there to read, and the overlay is read-only.
       return isPlainAnswerKey(event) ? { kind: "review" } : null;
     case "/":
-      return { kind: "search" };
+      return { kind: "search", dir: 1 };
     case "n":
       return { kind: "search-next", delta: 1 };
     case "Escape":
@@ -897,7 +917,7 @@ export function resolveKey(mode: PanelMode, event: KeyLike, ctx: KeyContext): Pa
   }
 }
 
-/** One line of the `?` keymap: the key as a person types it, and what it does. */
+/** One line of the keymap: the key as a person types it, and what it does. */
 export type KeyHelp = { keys: string; what: string };
 
 /** The `?` sheet's section for the plugin page that held the keys when `prefix ?` was pressed: the plugin's
@@ -960,29 +980,30 @@ export const BROWSE_KEYS: KeyHelp[] = [
   { keys: "gg / G", what: "First / last row" },
   { keys: "1-9", what: "A count: 3j three rows, 3G or 3gg row 3, 2]] two prompts, 2gt tab 2" },
   { keys: "[[ / ]]", what: "Previous / next prompt of yours" },
-  { keys: "]p / [p", what: "Next / previous card waiting for an answer (wraps; the cursor moves, nothing is answered)" },
+  { keys: "]p / [p", what: "Nothing: cards are on Alt-n / Alt-p now (the band says so)" },
+  { keys: "Alt-n / Alt-p", what: "The next / previous waiting card, in card mode (then 1-3 answers it)" },
   { keys: "Ctrl+d / Ctrl+u", what: "Half a page down / up" },
   { keys: "Ctrl+e / Ctrl+y", what: "One line down / up (a count repeats it, e.g. 5 Ctrl+e)" },
   { keys: "Ctrl+f / PageDown", what: "A view down, keeping two lines (a count repeats it)" },
   { keys: "PageUp", what: pageUpHelp("Ctrl+b") },
   { keys: "Ctrl+c", what: "Interrupt the running turn (never closes anything)" },
-  { keys: "a / d", what: "Allow / deny the card under the cursor or gating its tool call; only a lone key answers" },
-  { keys: "Enter", what: "Show or hide a tool's result or a collapsed run" },
+  { keys: "a / d / D", what: "Nothing: cards are answered in card mode (Enter on the card, or Alt-n, then 1-3)" },
+  { keys: "Enter", what: "Show or hide a tool's result or a collapsed run; on a card row, or a tool row a card gates, card mode for that card" },
   {
     keys: "y / Y",
     what: "Copy the row (message, command, path), or the code block HINT landed on / its whole output",
   },
   { keys: "v / V", what: "A caret to move with h j k l, w b e, 0 $, gg G; V selects lines at once" },
-  { keys: "D", what: "Deny with a reason: into the card's reason box, Enter denies (a Codex or ACP card has none: d denies)" },
   { keys: "i / o", what: "Start typing, caret where you left it (C1a: o is an exact alias of i)" },
   { keys: "A", what: "Start typing at the end of the draft" },
   { keys: "f", what: "HINT: jump anywhere in the window (links too; Enter opens one)" },
   { keys: "r", what: "Once this session has ended: resume it, or start a new one (its last row says which)" },
   { keys: "c", what: "Review: the files that changed on disk during this tab's latest turn (read-only)" },
-  { keys: "/", what: "Search the conversation (Enter keeps the match, Esc goes back)" },
+  { keys: "/", what: "Search forward; n repeats, N reverses (Enter keeps the match, Esc goes back)" },
   { keys: ":", what: "A command line, as in vim: :tabnew, :trust and :untrust" },
   { keys: "n / N", what: "Next / previous match, wrapping" },
-  { keys: "Ctrl+o", what: "Detailed view: every result, longer cuts, no collapsed runs" },
+  { keys: "Ctrl+o / Ctrl+i", what: "Back / forward through the jumps in this tab" },
+  { keys: "zi", what: "The detailed view: every result, longer excerpts, no collapsed runs" },
   { keys: "zh / zl", what: "Scroll this row's table left / right" },
   { keys: "zt / zz / zb", what: "This row to the top / middle / bottom of the view (3zt: row 3)" },
   { keys: "za / zo / zc", what: "Fold: toggle as Enter / open / close a result or a collapsed run" },
@@ -993,7 +1014,8 @@ export const BROWSE_KEYS: KeyHelp[] = [
     what: "The keys to the module that way, as Ctrl+h/j/k/l; Ctrl+w j is the module below, never the box",
   },
   { keys: "Ctrl+g", what: "This row's whole text in an nvim scratch buffer" },
-  { keys: "?", what: "This list (?, Esc or q closes it)" },
+  { keys: "?", what: "Search backward; n repeats, N reverses" },
+  { keys: "F1 / g?", what: "This list" },
 ];
 
 /** CARET, i.e. everything `resolveCaretKey` claims. Tied to `resolveKey`'s
@@ -1010,7 +1032,8 @@ export const CARET_KEYS: KeyHelp[] = [
   { keys: "v / V", what: "Select from here: VISUAL by character, V-LINE by line" },
   { keys: "Ctrl+e / Ctrl+y", what: "Scroll the list one line down / up (a count repeats it); the caret stays put" },
   { keys: "Esc", what: "Back to BROWSE, cursor on this row" },
-  { keys: "?", what: "This list (any other key ends the caret too, except Ctrl+e/Ctrl+y, which scroll instead)" },
+  { keys: "/ / ?", what: "End the selection and search forward / backward" },
+  { keys: "F1", what: "This list" },
 ];
 
 /** VISUAL/V-LINE, i.e. everything `resolveVisualKey` claims. Tied to
@@ -1031,12 +1054,29 @@ export const VISUAL_KEYS: KeyHelp[] = [
   { keys: ">", what: "Quote into the message below, then type" },
   { keys: "Esc", what: "Back to the caret, at the moving end" },
   { keys: "Ctrl+e / Ctrl+y", what: "Scroll the list one line down / up (a count repeats it); the selection stays put" },
-  { keys: "?", what: "This list (any other key ends the region too, except Ctrl+e/Ctrl+y, which scroll instead)" },
+  { keys: "/ / ?", what: "End the selection and search forward / backward" },
+  { keys: "F1", what: "This list" },
+];
+
+/** Card mode's keys (`./cardMode`'s `cardKey`), the "Answering a card" section of the `?` sheet. Tied to `cardKey`
+ *  both ways by `keymap.test.ts`: every key here is one card mode acts on, never one it refuses. The digits are the
+ *  card's own buttons: a card without a saved-rule offer has two. */
+export const CARD_KEYS: KeyHelp[] = [
+  { keys: "1 / 2 / 3", what: "Answer with that button: 1 Approve, 2 Deny, 3 Always allow (where the card offers a rule); only a fresh press once card mode is armed, and only if no key follows within a quarter second" },
+  { keys: "h / l", what: "Highlight the previous / next button (← / → too); nothing is highlighted on entry" },
+  { keys: "0 / ^ / $", what: "Highlight the first / first / last button" },
+  { keys: "Enter", what: "Answer with the highlighted button, as a digit does" },
+  { keys: "Tab", what: "Open the reason field (Claude's cards); Enter there denies with the reason, Esc or Tab closes it and keeps the text, which 2 then sends as a click on Deny does" },
+  { keys: "Esc / Ctrl+c", what: "Leave card mode, the card still waiting, back where you were (Ctrl+c interrupts nothing here)" },
+  { keys: "Alt-n / Alt-p", what: "The next / previous waiting card; this one keeps waiting" },
+  { keys: "j / k", what: "Scroll a card taller than the view (↓ / ↑ too)" },
+  { keys: "Ctrl+d / Ctrl+u", what: "Half a page down / up" },
+  { keys: "F1", what: "This list (leaves card mode)" },
 ];
 
 /** The turn review overlay's keys (`c` opens it), everything `./review`'s `resolveReviewKey` claims. Tied to
  *  that function both ways by `review.test.ts`, the discipline `BROWSE_KEYS` is held to. The overlay owns
- *  every key while it is open, so `a`/`d` and the rest of BROWSE's table never reach a card underneath.
+ *  every key while it is open, so no key of BROWSE's table reaches the conversation underneath.
  *  While a one-line prompt is open it owns them instead: `y`/`n`/`Escape` on a question, and the comment
  *  input's own text -- those are answers to the prompt, not rows of this table. */
 export const REVIEW_KEYS: KeyHelp[] = [
@@ -1069,6 +1109,7 @@ export const TASKS_KEYS: KeyHelp[] = [
 
 /** The question dock's keys, while Claude's question replaces the box (`questionKey`). */
 export const QUESTION_KEYS: KeyHelp[] = [
+  { keys: "F1", what: "This list" },
   { keys: "1-9", what: "Pick that option" },
   { keys: "j / k", what: "Move between options (↓ / ↑ too)" },
   { keys: "Enter / Space", what: "Choose the option under the cursor" },
@@ -1096,12 +1137,14 @@ export const INPUT_KEYS: KeyHelp[] = [
   { keys: "Ctrl+a / Ctrl+e", what: "Caret to the line's start / end" },
   { keys: "Ctrl+c", what: "Interrupt a running turn; idle, clear the box into history" },
   // An added key. The band names the card it would approve.
-  { keys: "Ctrl+y", what: "Approve the oldest card waiting in this tab (the band names it); only a lone Ctrl+y answers" },
+  { keys: "Ctrl+y", what: "nothing (cards are answered in card mode: Alt-n)" },
+  { keys: "Alt-n / Alt-p", what: "The next / previous waiting card, in card mode (then 1-3 answers it)" },
   { keys: "Ctrl+g", what: "Edit this in nvim (:wq brings it back, :q! changes nothing)" },
   { keys: "Ctrl+o", what: "Detailed view" },
   { keys: "Shift+Tab", what: "Cycle manual → auto → bypass (entering bypass asks first)" },
   { keys: "Esc", what: "Stop typing (back to browsing); with the command menu open, close it first" },
   { keys: "?", what: "This list, from an empty box" },
+  { keys: "F1", what: "This list" },
 ];
 
 /** `shell`'s own keys, which nothing on this page can read: sent by `shell` in a `keymap` envelope

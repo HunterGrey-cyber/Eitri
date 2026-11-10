@@ -98,12 +98,15 @@ export const COMPOSER_CHORDS: string[] = [
   "Ctrl+w / Ctrl+u",
   "Ctrl+a / Ctrl+e",
   "Ctrl+c",
-  // Like `Ctrl+o`, left to bubble to `App`'s INPUT branch, which approves the
-  // oldest waiting card on it.
+  // Like `Ctrl+o`, left to bubble to `App`'s INPUT branch, which claims it and does nothing else (no card is
+  // answered, the box keeps its text and caret) but say that cards are on Alt-n.
   "Ctrl+y",
+  // Card mode, left to bubble to `App`'s INPUT branch like `Ctrl+o`: the composer claims neither chord.
+  "Alt-n / Alt-p",
   "Ctrl+g",
   "Ctrl+o",
   "Shift+Tab",
   "Esc",
   "?",
+  "F1",
 ];

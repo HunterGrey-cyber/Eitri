@@ -1,24 +1,14 @@
-/** A permission card is answered only by a key that stands alone. This is a rule of Eitri's own: no
- *  tool the panel copies has an exact precedent. Claude Code answers a prompt only by an explicit
- *  choice, and vim tells a sequence from a lone key by time (`:h 'timeoutlen'`). Arrivals land in
- *  BROWSE on a waiting card, so immediately typed prose must not turn its first letters into answers.
- *  `a`/`d`/`D` require a quiet `TYPING_GUARD_MS` before and after; another keydown cancels the wait.
- *  Both sides matter: the first letter has no predecessor, but a letter inside or ending a word has.
- *  Enter also permits an unbroken run of `h`/`l`/Tab/Shift+Tab beginning after a pause. Checking
- *  only the preceding key would let `cancel` or `deal` walk onto Approve with their final `l`:
- *  `l` from the card's row lands on its first control, Approve (`PermissionCard.tsx`'s
- *  `data-nav-order`), so it is not the safe side.
- *  What is left, stated rather than hidden: a word made only of walk keys, or prose paused for the
- *  window before a final `l` whose Enter follows at once, still approves (`l` then Enter approves,
- *  `ll` then Enter denies). Enter on a card button is claimed and deferred too: native activation
- *  would let `:ls` then Enter approve after `l` moved focus and `s` arrived after a pause.
- *  `App.tsx` requires focus to have landed on that button from the immediately preceding key or a
- *  HINT with no key since. This guard counts keys and decides no landing; the landing is recorded
- *  where focus moves, never guessed from a key's name, so `App.tsx` can tie it to the key that made it.
+/** A key that acts on the panel from BROWSE acts only when it stands alone, so typed prose that lands there (an
+ *  arrival puts the page in BROWSE on a waiting card) never turns its letters into commands. This is a rule of
+ *  Eitri's own: no tool the panel copies has an exact precedent; vim tells a sequence from a lone key by time
+ *  (`:h 'timeoutlen'`). A deferred key (`defer`) needs a quiet `TYPING_GUARD_MS` before it and after it; another
+ *  keydown cancels the wait. Both sides matter: the first letter has no predecessor, but a letter inside or ending
+ *  a word has. A card's answer goes through this wait too, as the after-half of card mode's arming
+ *  (`./cardMode`), the only way a key answers a card (a card button answers only a pointer's click).
  *
- *  Repeats never answer. INPUT's `Ctrl+y` also waits for release: it acts `TYPING_GUARD_MS` after the
- *  press if the key is up by then, else at its release, and any key, including its own repeat,
- *  cancels it. Compositor repeat begins after 500-600 ms by default, too late for the 250 ms window;
+ *  Repeats never answer. A key that must also be let go (`deferUntilReleased`: `j` into the box) acts
+ *  `TYPING_GUARD_MS` after the press if the key is up by then, else at its release, and any key, including its
+ *  own repeat, cancels it. Compositor repeat begins after 500-600 ms by default, too late for the 250 ms window;
  *  with repeat off it never comes. A press longer than `RELEASE_WAIT_MAX_MS` is refused on release.
  *  Measure duration using the events' times: a timer would count a main-thread stall as holding and
  *  refuse a quick press during one.
@@ -49,8 +39,8 @@
  *
  *  An arrival is a key (`noteArrival`). The host reveals a tab here (`arrive`, `focus_permission`) from a key or
  *  click made somewhere else, a face in another window, `prefix a`, `prefix u`, and the person may still be
- *  typing. Recorded as a key at the moment the envelope came, it puts every rule above in force from there: an
- *  answer key within `TYPING_GUARD_MS` after it is refused, a run that began inside that window is no walk or
+ *  typing. Recorded as a key at the moment the envelope came, it puts every rule above in force from there: a
+ *  deferred key within `TYPING_GUARD_MS` after it is refused, a run that began inside that window is no
  *  motion run, and the keys it refused count as typing, so a run typed on through the arrival stays refused.
  *
  *  Pure: no DOM reads. Callers supply event timestamps; injectable timers default to globals looked
@@ -70,15 +60,10 @@ export const RELEASE_WAIT_MAX_MS = 450;
 /** What an arrival is recorded as: no key a keydown can name, so nothing is ever its release or its repeat. */
 const ARRIVAL = "\u0000arrival";
 
-/** The keys that walk onto a card button, so Enter at the end of a run made only of them is not
- *  typing. Shift+Tab arrives as `Tab` (the caller normalizes WebKitGTK's `Unidentified`/
- *  `code: "Tab"` shape to it). */
-const WALK_KEYS = new Set(["h", "l", "Tab"]);
-
 /** The keys that move the cursor without typing anything (`keymap.ts`'s BROWSE motions, the empty
  *  tab's `j`/`k`, and Tab), so the leader or Enter/Space on Stop at the end of a run made only of
- *  them is a quick motion, not prose (`mayActAfterMotion`). Wider than `WALK_KEYS` on purpose: that
- *  set stays the narrower rule for a card's Approve/Deny, which is untouched. */
+ *  them is a quick motion, not prose (`mayActAfterMotion`). Shift+Tab arrives as `Tab` (the caller
+ *  normalizes WebKitGTK's `Unidentified`/`code: "Tab"` shape to it). */
 const MOTION_KEYS = new Set(["h", "j", "k", "l", "g", "G", "Tab", "ArrowUp", "ArrowDown"]);
 
 /** Bare modifiers are not "a key": holding Shift or Ctrl is not typing. `key` values from the
@@ -114,7 +99,7 @@ export function leaderTypingFlash(leaderLabel: string): string {
 }
 
 /** What the band says when `f` did not ask `shell` for a HINT because another
- *  key came within `TYPING_GUARD_MS` of it (`TypingGuard.defer`, the same wait `a`/`d` use -- `f` is
+ *  key came within `TYPING_GUARD_MS` of it (`TypingGuard.defer`, the same wait a card-mode answer uses -- `f` is
  *  always the first key of whatever typed it, so `mayActAfterMotion`'s backward-only check cannot
  *  cover it). */
 export function hintTypingFlash(): string {
@@ -183,11 +168,7 @@ export class TypingGuard {
   /** The key before it: what `mayAnswerNow`/`defer` judge the current key against. */
   private previous: Keydown | null = null;
   /** Whether every key of the unbroken run ending at `latest` -- going back while each key came
-   *  within the window of the next -- is a walk key. */
-  private latestRunIsWalk = false;
-  /** The same, for the run ending at `previous`: what Enter's walk exception asks. */
-  private previousRunIsWalk = false;
-  /** Whether every key of the unbroken run ending at `latest` is a motion key (`MOTION_KEYS`). */
+   *  within the window of the next -- is a motion key (`MOTION_KEYS`). */
   private latestRunIsMotion = false;
   /** The same, for the run ending at `previous`: what `mayActAfterMotion` asks. */
   private previousRunIsMotion = false;
@@ -243,14 +224,12 @@ export class TypingGuard {
   }
 
   /** The host revealed a tab in this page at `at` on the keydowns' clock (`clockNow`): recorded as a key that
-   *  is neither a walk nor a motion, so every answer key, the leader and INPUT entry wait `TYPING_GUARD_MS`
+   *  is not a motion, so every deferred key, the leader and INPUT entry wait `TYPING_GUARD_MS`
    *  after it, a run begun inside that window is typing, and a waiting action is cancelled as by any key. Never
    *  before the last key recorded. It is not counted in `keyCount`: that ties a landing to the key the page saw
    *  make it, and the arrival's own landing is tied to the keys after it. */
   noteArrival(at: number): void {
     const t = this.latest === null ? at : Math.max(at, this.latest.t);
-    this.previousRunIsWalk = this.latestRunIsWalk;
-    this.latestRunIsWalk = false;
     this.previousRunIsMotion = this.latestRunIsMotion;
     this.latestRunIsMotion = false;
     this.previous = this.latest;
@@ -268,14 +247,12 @@ export class TypingGuard {
   /** Every keydown the panel sees, FIRST, before anything acts on it. A bare modifier is ignored.
    *  Any other key cancels a waiting action ("the key that cancelled it still does whatever it
    *  does"), and returns what the band should say about the one it cancelled -- the flash its own
-   *  `defer` named, so a cancelled `f` or `L` says what did not happen instead of talking about
-   *  `a`/`d` -- or `null` when nothing was waiting. */
+   *  `defer` named, so a cancelled `f` or `L` says what did not happen, in its
+   *  own words -- or `null` when nothing was waiting. */
   onKey(key: string, t: number): string | null {
     if (isModifierKey(key) && !CANCELLING_MODIFIERS.has(key)) return null;
     this.recorded += 1;
     const continuesRun = this.latest !== null && t - this.latest.t < TYPING_GUARD_MS;
-    this.previousRunIsWalk = this.latestRunIsWalk;
-    this.latestRunIsWalk = WALK_KEYS.has(key) && (!continuesRun || this.previousRunIsWalk);
     this.previousRunIsMotion = this.latestRunIsMotion;
     this.latestRunIsMotion = MOTION_KEYS.has(key) && (!continuesRun || this.previousRunIsMotion);
     this.previous = this.latest;
@@ -318,15 +295,12 @@ export class TypingGuard {
     return this.copiedAt !== null && t >= this.copiedAt && t - this.copiedAt < TYPING_GUARD_MS;
   }
 
-  /** Whether the key `onKey` just recorded (at `t`) may answer now: with nothing within the window
-   *  before it, or, for Enter, when the whole unbroken run before it is a walk onto the button
-   *  (`h`/`l`/Tab/Shift+Tab) back to a key that stood alone -- `l`⏎ and `l l`⏎ answer, `e`⏎,
-   *  `al`⏎ and `jl`⏎ do not. A repeat never may. */
-  mayAnswerNow(key: string, t: number, repeat: boolean): boolean {
+  /** Whether the key `onKey` just recorded (at `t`) stands alone: nothing within the window before it, and not a
+   *  repeat. */
+  mayAnswerNow(t: number, repeat: boolean): boolean {
     if (repeat) return false;
     const before = this.previous;
-    if (before === null || t - before.t >= TYPING_GUARD_MS) return true;
-    return key === "Enter" && this.previousRunIsWalk;
+    return before === null || t - before.t >= TYPING_GUARD_MS;
   }
 
   /** The leader, and Enter/Space on the activity line's Stop (see this
@@ -343,32 +317,29 @@ export class TypingGuard {
 
   /** BROWSE's `i`/`o`/`A` enter INPUT only on a pure
    *  pause -- nothing pressed within `TYPING_GUARD_MS` before the key `onKey` just recorded, exactly
-   *  `mayAnswerNow`'s rule with none of its Enter exception, and **none of `mayActAfterMotion`'s motion
-   *  exception either**. A lone `h`/`j`/`k`/`l`/`G` is as much the first letter of a word as a motion, so
+   *  `mayAnswerNow`'s rule, and **none of `mayActAfterMotion`'s motion exception**. A lone `h`/`j`/`k`/`l`/`G` is as much the first letter of a word as a motion, so
    *  with that exception "look at" walked with `l` and opened INPUT with `o` ("ok at"), and "how", "hi",
    *  "like", "join" and "Good" did the same. The price, stated: a fast `ji` chord now needs a pause. A
    *  repeat never may.
    *
    *  The exception is the key right after the Esc that left INPUT (`noteLeftInput`; vim's `Esc i`, `Esc A`),
    *  however fast and wherever that Esc fell, an arrival's window included: no word holds an Esc, and the key only
-   *  takes the page back to the INPUT it was just in, where every key that answers (INPUT's `Ctrl+y`, the
-   *  question dock's) was already live and keeps its own guard. A key or an arrival between the Esc and this key
+   *  takes the page back to the INPUT it was just in, where every key that answers (the question dock's) was
+   *  already live and keeps its own guard. A key or an arrival between the Esc and this key
    *  ends the exception. Any other Esc, BROWSE's own or a region's, gets none, so no sequence that starts in
    *  BROWSE reaches INPUT sooner than before. */
   mayStartInput(t: number, repeat: boolean): boolean {
     if (repeat) return false;
     if (this.previous !== null && this.previous === this.leftInput) return true;
-    return this.mayAnswerNow("", t, repeat);
+    return this.mayAnswerNow(t, repeat);
   }
 
-  /** `a`/`d`/`D`, `f`, a single-key table binding, and Enter on a card's own button: when the
-   *  key `onKey` just recorded stands alone before, runs `run` after `TYPING_GUARD_MS` unless another
-   *  key (`onKey`) or `cancel` comes first, and returns true. Otherwise runs nothing and returns
-   *  false -- the caller flashes. `cancelledFlash` is what `onKey` hands back should a key cancel
-   *  this wait. `key` is what `mayAnswerNow` judges: only `"Enter"` takes its walk exception, so
-   *  every caller but Enter's leaves it out. */
-  defer(t: number, repeat: boolean, run: () => void, cancelledFlash: string, key = ""): boolean {
-    return this.wait(t, repeat, run, cancelledFlash, key, null);
+  /** `f`, a single-key table binding, and a card-mode answer's after-half: when the key `onKey` just recorded
+   *  stands alone before, runs `run` after `TYPING_GUARD_MS` unless another key (`onKey`) or `cancel` comes first,
+   *  and returns true. Otherwise runs nothing and returns false -- the caller flashes. `cancelledFlash` is what
+   *  `onKey` hands back should a key cancel this wait. */
+  defer(t: number, repeat: boolean, run: () => void, cancelledFlash: string): boolean {
+    return this.wait(t, repeat, run, cancelledFlash, null);
   }
 
   /** `defer`, for a key that must also have been let go: `run` runs `TYPING_GUARD_MS` after the
@@ -384,7 +355,7 @@ export class TypingGuard {
     heldKey: string,
     heldFlash: string = cancelledFlash,
   ): boolean {
-    return this.wait(t, repeat, run, cancelledFlash, "", heldKey, heldFlash);
+    return this.wait(t, repeat, run, cancelledFlash, heldKey, heldFlash);
   }
 
   /** `j`/Down that can move no further: `enter` runs as for `deferUntilReleased`, so only a press that stood alone
@@ -414,12 +385,11 @@ export class TypingGuard {
     repeat: boolean,
     run: () => void,
     cancelledFlash: string,
-    key: string,
     heldKey: string | null,
     heldFlash: string = cancelledFlash,
   ): boolean {
     this.cancel();
-    if (!this.mayAnswerNow(key, t, repeat)) return false;
+    if (!this.mayAnswerNow(t, repeat)) return false;
     const waiting: Pending = {
       handle: null,
       flash: cancelledFlash,

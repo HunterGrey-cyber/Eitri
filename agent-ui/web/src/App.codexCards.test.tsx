@@ -10,6 +10,7 @@ import App from "./App";
 import { initialState } from "./reducer";
 import { EMPTY_PANEL_TABLE } from "./keymap";
 import { TYPING_GUARD_MS } from "./typingGuard";
+import { cardKeyGoneFlash } from "./app/flashes";
 import type { AgentUiState, Hello } from "./types";
 import fixture from "./fixtures/codex-cards.json";
 
@@ -106,7 +107,7 @@ const caseOf = (name: string) => fixture.cases.find((c) => c.name === name)!;
 const root = (c: HTMLElement) => c.querySelector<HTMLElement>(".agent-ui-conversation")!;
 
 describe("a Codex tab", () => {
-  it("reason box absent and D flashes", () => {
+  it("reason box absent: D is refused with the card-mode pointer, and Tab in card mode says 2 denies", () => {
     const { container } = started();
     dispatch({ ...caseOf("command").snapshot, tab: 1 });
     fireEvent.keyDown(root(container), { key: "j" });
@@ -115,8 +116,12 @@ describe("a Codex tab", () => {
     wait(TYPING_GUARD_MS + 50);
     posted.length = 0;
     fireEvent.keyDown(root(container), { key: "D", shiftKey: true });
+    expect(container.querySelector(".band-message")!.textContent).toBe(cardKeyGoneFlash("D"));
     wait(TYPING_GUARD_MS + 50);
-    expect(container.querySelector(".band-message")!.textContent).toBe("Codex takes no reason with a deny; d denies");
+    fireEvent.keyDown(root(container), { key: "Enter" });
+    expect(container.querySelector(".permission-card-mode")).not.toBeNull();
+    fireEvent.keyDown(document.activeElement!, { key: "Tab" });
+    expect(container.querySelector(".band-message")!.textContent).toBe("Codex takes no reason with a deny; 2 denies");
     // Nothing was answered, and nothing took the keys into a box.
     expect(posted.filter((m) => m.type === "permission_response")).toEqual([]);
     expect(document.activeElement?.tagName).not.toBe("INPUT");

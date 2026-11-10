@@ -26,7 +26,7 @@ type Props = {
    *  set, this line names the card rather than the queue count -- a card already means the queue
    *  cannot flush, so the two are never both worth reading. */
   pendingTool?: string | null;
-  /** BROWSE answers on the card; INPUT must leave the composer with `Esc` first. Defaults to `"browse"`. */
+  /** BROWSE can enter card mode on the cursor's card; INPUT enters it with Alt-n. Defaults to `"browse"`. */
   mode?: PanelMode;
   /** A `!` line of the person's is running. A turn of the agent's has this line first. */
   shellRunning?: boolean;
@@ -91,9 +91,8 @@ export function ActivityLine({ state, turnClock = null, canInterrupt, onInterrup
       ) : <TurnActivity phase={phase} clock={turnClock} />)}
       {pendingTool !== null ? (
         <span className="activity-card">
-          {/* `a`/`d` answer only the card under the cursor, after `TYPING_GUARD_MS` without typing.
-              "j to it" names the route to that target; "alone" names the pause that prevents accidental answers. */}
-          ⚑ {revealedText(pendingTool)} needs approval — {mode === "input" ? "Esc, j to it, a / d alone" : "j to it, a / d alone"}
+          {/* Enter on the cursor's card or Alt-n enters card mode; neither answers by itself. */}
+          ⚑ {revealedText(pendingTool)} needs approval — {mode === "input" ? "Alt-n" : "j to it, Enter"}
         </span>
       ) : (
         special === null && !start && queued > 0 && <span className="activity-keys">{queued} queued · </span>

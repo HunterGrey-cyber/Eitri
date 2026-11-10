@@ -46,8 +46,9 @@ export type OutboundMessage =
    *  a permission id it itself offered a rule for; the panel's own text is never trusted. */
   | { type: "permission_response"; request_id: string; tab: TabId; permission_id: string; decision: PermissionDecision; reason?: string; remember?: boolean }
   /** The answer to a card Eitri's own tool broker raised (`editor_cards`), by the card's own id. It carries no
-   *  reason and no `remember`: a broker card offers neither. `origin` is how the person answered -- `"key"` from
-   *  `a`/`d`, `"click"` from the card's button -- and Rust takes no other word. */
+   *  reason and no `remember`: a broker card offers neither. `origin` is how the person answered, read from the
+   *  answer's proof: `"key"` for a card-mode answer (`KeyAnswerProof`), `"click"` for a real pointer click on the card's
+   *  button (`PointerAnswerProof`). Rust takes no other word. */
   | { type: "editor_card_answer"; request_id: string; tab: TabId; card_id: string; decision: PermissionDecision; origin: "key" | "click" }
   /** How long this WebView took to draw a turn's first assistant text, from its own receipt of the
    *  payload to the animation frame that rendered it. A SPAN, not an instant: `performance.now()`

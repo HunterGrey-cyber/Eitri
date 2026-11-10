@@ -1,5 +1,5 @@
 import { describe, expect, it, vi } from "vitest";
-import { allCards, buildTimeline, oldestPendingPermission, oldestWaitingPermission, promptIndex, questionLines, waitingCardAfter, waitingCardIndex } from "./timeline";
+import { allCards, buildTimeline, oldestPendingPermission, promptIndex, questionLines, waitingCardAfter, waitingCardIndex } from "./timeline";
 import type { TimelineItem } from "./timeline";
 import { primaryText } from "./copyText";
 import { editorCardRecord, initialState } from "./reducer";
@@ -367,10 +367,10 @@ describe("promptIndex ([[ / ]])", () => {
   });
 });
 
-/* `]p` / `[p`, the next / previous card waiting for an answer in this tab. Wraps as
+/* Card mode's ring: `Alt-n` / `Alt-p`, the next / previous card waiting for an answer in this tab only. Wraps as
    nvim's `]d` does (`vim.diagnostic.jump`'s default) where `[[`/`]]` (`promptIndex` above) never do; a card
    this panel has already answered is not waiting, though it stays on screen until the provider resolves it. */
-describe("waitingCardIndex (]p / [p)", () => {
+describe("waitingCardIndex (Alt-n / Alt-p)", () => {
   /** Prompt 0, card p1 1, a message 2, card p2 3. */
   const fixture = () =>
     buildTimeline(
@@ -459,9 +459,9 @@ describe("waitingCardIndex (]p / [p)", () => {
   });
 });
 
-/* `{N}]p` / `{N}[p`: a count repeats the jump. It is the single step taken N times, but costs one lap of the
-   waiting cards at most, however large N is (the panel caps a count at 9999). */
-describe("waitingCardAfter (a count before ]p / [p)", () => {
+/* `waitingCardAfter`: the single step taken N times (card mode takes it once), costing one lap of the waiting
+   cards at most, however large N is. */
+describe("waitingCardAfter (Alt-n / Alt-p take one step)", () => {
   /** Prompt 0, card p1 1, a message 2, card p2 3. */
   const fixture = () =>
     buildTimeline(
@@ -750,15 +750,13 @@ describe("a broker card in the timeline", () => {
     expect(new Set(items.map((i) => i.key)).size).toBe(items.length);
   });
 
-  it("is_one_card_among_the_pending_ones_for_the_landing_and_never_for_ctrl_y", () => {
+  it("is_one_card_among_the_pending_ones_for_the_landing", () => {
     const provider = perm(8, "perm-1", null);
     const s = state({ pendingPermissions: [provider], editorCards: [brokerCard(3, 1, null)] });
     expect(allCards(s).map((c) => c.permissionId)).toEqual(["perm-1", "ec-0123456789abcdef-1"]);
     const timeline = buildTimeline(s);
-    // The landing takes the lowest `seq` of any card; `Ctrl+y` skips the broker card for the provider's.
+    // The landing takes the lowest `seq` of any card, a broker card's included.
     expect(oldestPendingPermission(timeline)).toBe(0);
-    expect(oldestWaitingPermission(timeline, new Set())).toBe(1);
-    expect(oldestWaitingPermission(buildTimeline(state({ editorCards: [brokerCard(3, 1, null)] })), new Set())).toBeNull();
   });
 });
 

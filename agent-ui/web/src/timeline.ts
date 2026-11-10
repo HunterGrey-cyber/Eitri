@@ -324,9 +324,8 @@ function toolItem(call: ToolCallRecord): TimelineItem {
 }
 
 /** Every card waiting on this tab: the provider's (`pendingPermissions`) and the ones Eitri's own tool broker raised
- *  (`editorCards`). Anything that asks "is a card pending" reads this, so a broker card is never missed; the one
- *  reader that leaves broker cards out says so (`oldestWaitingPermission`). Provider cards first, each list in its own
- *  order. With no broker card it is `pendingPermissions` itself, so a memo keyed on that list keeps its identity. */
+ *  (`editorCards`). Anything that asks "is a card pending" reads this, so a broker card is never missed. Provider
+ *  cards first, each list in its own order. With no broker card it is `pendingPermissions` itself, so a memo keyed on that list keeps its identity. */
 export function allCards(
   state: Pick<AgentUiState, "pendingPermissions"> & Partial<Pick<AgentUiState, "editorCards">>,
 ): PermissionRequestRecord[] {
@@ -548,30 +547,14 @@ export function promptIndex(timeline: TimelineItem[], from: number, delta: 1 | -
 }
 
 /** Whether `item` is a card waiting for an answer from this panel: a permission item whose id is not in
- *  `answered` -- the ids this tab has answered, by a card's button or by `a`/`d`, which stay drawn (inert)
+ *  `answered` -- the ids this tab has answered, by a card's button or in card mode, which stay drawn (inert)
  *  until the provider resolves them. The one condition a timeline cannot know is whether the session still
  *  lives (a dead session's cards are inert, `PermissionCard`): that is the caller's. */
 function isWaitingCard(item: TimelineItem, answered: ReadonlySet<string>): boolean {
   return item.kind === "permission" && !answered.has(item.request.permissionId);
 }
 
-/** The card INPUT's `Ctrl+y` approves -- the timeline index of the OLDEST card
- *  still waiting (lowest `seq`), the same rule a card landing uses (`oldestPendingPermission`)
- *  with the cards this panel has already answered left out, since those wait only for the provider.
- *  A card Eitri's own tool broker raised is never one: only a key on that card's own row answers it, so a provider
- *  card behind it may be the one named. `null` when none waits. `timeline` is the active tab's, so another tab's
- *  card is never a candidate. */
-export function oldestWaitingPermission(timeline: TimelineItem[], answered: ReadonlySet<string>): number | null {
-  let best: number | null = null;
-  timeline.forEach((item, index) => {
-    if (!isWaitingCard(item, answered) || (item.kind === "permission" && item.request.editorCard !== undefined)) return;
-    const current = best === null ? null : timeline[best];
-    if (current === null || (current.kind === "permission" && item.seq < current.seq)) best = index;
-  });
-  return best;
-}
-
-/** `]p` (+1) / `[p` (-1): the next waiting card after (before) `from`, wrapping as nvim's `]d`
+/** Card mode's `Alt-n` (+1) / `Alt-p` (-1): the next waiting card after (before) `from`, wrapping as nvim's `]d`
  *  does (`vim.diagnostic.jump`'s default) -- unlike `[[`/`]]` (`promptIndex`), which stop at either end. A card
  *  this panel already answered is not waiting. With one card waiting, and `from` on it, the answer is `from`
  *  itself (a lone diagnostic is its own next); `null` when none waits at all. `from` may lie outside the
@@ -590,8 +573,7 @@ export function waitingCardIndex(
   return null;
 }
 
-/** `{N}]p` / `{N}[p`: `waitingCardIndex` taken `times` times, each step from the card the last one landed on
- *  (a count repeats it). The first step reaches a waiting card and every step after it only goes round the
+/** `waitingCardIndex` taken `times` times, each step from the card the last one landed on (card mode steps once). The first step reaches a waiting card and every step after it only goes round the
  *  ring of them, so a count is at most as many steps as there are waiting cards -- `times - 1` modulo that,
  *  plus the first -- however large it is: it costs O(waiting x rows), where repeating the single step `times`
  *  times cost O(times x rows), which for the panel's cap of 9999 over a long conversation with one card waiting

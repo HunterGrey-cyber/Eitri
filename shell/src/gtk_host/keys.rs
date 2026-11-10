@@ -605,6 +605,22 @@ mod tests {
         }
     }
 
+    #[test]
+    fn f1_alt_n_and_alt_p_pass_through_an_unarmed_default_prefix() {
+        let t = Instant::now();
+        for (native, state, name) in [
+            (Key::F1, ModifierType::empty(), "F1"),
+            (Key::n, ModifierType::ALT_MASK, "M-n"),
+            (Key::p, ModifierType::ALT_MASK, "M-p"),
+        ] {
+            let mut p = defaults();
+            let press = classify(native, state);
+            assert_eq!(press, key(name));
+            assert_eq!(p.press(press, K1, t), Outcome::Pass, "{name}");
+            assert!(!p.is_armed(), "{name}");
+        }
+    }
+
     /// These non-repeating bindings become ordinary keys again after their first command.
     #[test]
     fn semicolon_and_o_classify_from_gdk_and_run_without_repeating() {

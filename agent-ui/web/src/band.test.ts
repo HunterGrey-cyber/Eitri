@@ -1,14 +1,124 @@
 import { describe, expect, it } from "vitest";
-import { phoneTitle, backgroundSegment, bandLayout, closingPath, cutFlash, bandLayoutSteady, cardSummary, liveTasks, taskWords, tasksLine, textWidth, usageSegment, RETURN_COOLDOWN_MS, RETURN_MARGIN, type BandFacts, type LayoutHold } from "./band";
+import { phoneTitle, backgroundSegment, bandLayout, closingPath, cutFlash, bandLayoutSteady, liveTasks, taskWords, tasksLine, textWidth, usageSegment, RETURN_COOLDOWN_MS, RETURN_MARGIN, type BandFacts, type LayoutHold } from "./band";
 import { applyEvent, initialState } from "./reducer";
 import { revealedPathText } from "./revealHidden";
-import { ESC_DOES_NOT_INTERRUPT_FLASH, NO_CARD_FLASH, SHORT_FLASH, TYPING_FLASH } from "./app/flashes";
+import {
+  ANSWER_CANCELLED_FLASH,
+  ANSWER_INTERRUPTED_FLASH,
+  BROKER_NO_REASON_FLASH,
+  CARD_CHANGED_FLASH,
+  CTRL_G_IN_CARD_FLASH,
+  CTRL_Y_GONE_FLASH,
+  ENTER_ALONE_FLASH,
+  ESC_DOES_NOT_INTERRUPT_FLASH,
+  QUESTION_WAITS_FLASH,
+  REASON_ENTER_OUTSIDE_FLASH,
+  REPLAYED_KEY_FLASH,
+  SHIFT_TAB_IN_CARD_FLASH,
+  SHORT_FLASH,
+  agentNoReasonFlash,
+  cardArmingFlash,
+  cardJumpGoneFlash,
+  cardKeyGoneFlash,
+  heldAnswerFlash,
+  heldCardChordFlash,
+  lettersNeverAnswerFlash,
+  modifiedReasonEnterFlash,
+  noButtonPickedFlash,
+  noSuchAnswerFlash,
+  notAKeyHereFlash,
+  notApprovableFlash,
+  shiftedDigitFlash,
+} from "./app/flashes";
+
+/* Two long flashes with short forms: `a` where no card is, and `a` on a card (card mode's pointer). */
+const A_ELSEWHERE_FLASH = notAKeyHereFlash("a");
+const A_ON_CARD_FLASH = cardKeyGoneFlash("a");
 import type { BackgroundTask, BackgroundTaskRecord, TaskKind, TokenUsage } from "./types";
 
 const running: BandFacts = { mode: "input", pill: "⏵⏵ auto", showcmd: null, message: null, prompt: null, warn: null,
   unread: "↓3", cards: 1, queued: 1, context: { file: "eitri.zsh", lines: [3, 9] }, position: "14/30", model: "sonnet-5", usage: null };
 const idle: BandFacts = { ...running, mode: "browse", unread: null, cards: 0, queued: 0, context: null };
 const ids = (w: number, f: BandFacts) => bandLayout(f, w, 7.2).map((s) => s.id);
+
+describe("card mode's band", () => {
+  const card = (facts: BandFacts, width = 2000) => bandLayout(facts, width, 7.2).find((s) => s.id === "card");
+  /** BROWSE in card mode on the first of two cards, with the running band's figures, counts and unread mark. */
+  const holding = (over: Partial<NonNullable<BandFacts["cardMode"]>> = {}, more: Partial<BandFacts> = {}): BandFacts => ({
+    ...running, mode: "browse", cards: 2, cardMode: { index: 1, total: 2, answers: 3, reason: true, ...over }, ...more,
+  });
+
+  it.each([2, 3, 9])("names the held card and its own %i answers", (answers) => {
+    expect(card({ ...running, cards: 4, cardMode: { index: 2, total: 4, answers, reason: true } })).toEqual({
+      id: "card", text: `card 2/4 · 1-${answers} answer · h/l Enter · Tab reason · Esc leaves`, side: "left",
+    });
+  });
+
+  it("names Tab only on a card whose deny takes a reason", () => {
+    expect(card(holding({ answers: 2, reason: false }))?.text).toBe("card 1/2 · 1-2 answer · h/l Enter · Esc leaves");
+    expect(card(holding({ answers: 2, reason: false }), 360)?.text).toBe("card 1/2 · 1-2 · Esc");
+  });
+
+  it("with the reason field open, says what Enter and Esc do there (the digits are text in it)", () => {
+    expect(card(holding({ reasonOpen: true }))?.text).toBe("card 1/2 · Enter denies with this reason · Esc back, text kept");
+    expect(card(holding({ reasonOpen: true }), 360)?.text).toBe("card 1/2 · Enter denies");
+  });
+
+  it("whole on a wide panel; the keys by name at 520 and 360 px, beside the mode's word, the pill and the unread mark", () => {
+    expect(card(holding(), 900)?.text).toBe("card 1/2 · 1-3 answer · h/l Enter · Tab reason · Esc leaves");
+    for (const width of [520, 360]) {
+      const segs = bandLayout(holding(), width, 7.2);
+      expect(segs.map((s) => s.id), `${width}`).toEqual(["mode", "pill", "card", "unread"]);
+      expect(segs.find((s) => s.id === "card")!.text, `${width}`).toBe("card 1/2 · 1-3 · Tab · Esc");
+      expect(segs.find((s) => s.id === "mode")!.text, `${width}`).toBe("BROWSE");
+    }
+  });
+
+  it("gives way to the card's place alone beside a flash, so the flash says why at 360 px", () => {
+    const refusal = cardArmingFlash("1");
+    const wide = bandLayout(holding({}, { message: refusal }), 2000, 7.2);
+    expect(wide.find((s) => s.id === "card")!.text).toBe("card 1/2 · 1-3 answer · h/l Enter · Tab reason · Esc leaves");
+    expect(wide.find((s) => s.id === "message")!.text).toBe(refusal);
+    const narrow = bandLayout(holding({}, { message: refusal }), 360, 7.2);
+    expect(narrow.map((s) => s.id)).toEqual(["mode", "pill", "card", "message", "unread"]);
+    expect(narrow.find((s) => s.id === "card")!.text).toBe("card 1/2");
+    expect(narrow.find((s) => s.id === "message")).toMatchObject({ text: "1: not armed yet", full: refusal });
+    expect(narrow.find((s) => s.id === "message")!.cut).toBeFalsy();
+  });
+
+  it("offers Enter on the cursor's card in BROWSE, and Alt-n from elsewhere", () => {
+    expect(card({ ...running, mode: "browse", onCard: true })?.text).toBe("Enter or Alt-n: card mode, then 1-3");
+    for (const mode of ["input", "caret", "visual", "vline", "hint"] as const) {
+      expect(card({ ...running, mode, onCard: true })?.text).toBe("Alt-n: card mode, then 1-3");
+    }
+    expect(card({ ...running, mode: "browse", onCard: false })?.text).toBe("Alt-n: card mode, then 1-3");
+  });
+
+  it("offers no card key with only questions waiting, or under a confirmation", () => {
+    expect(card({ ...idle, questions: 2 })).toBeUndefined();
+    expect(card({ ...running, cardMode: { index: 1, total: 1, answers: 2, reason: true }, prompt: "close? (y/n)" })).toBeUndefined();
+  });
+
+  it("keeps the held card's instructions when figures give way, and returns to the entry hint on leaving", () => {
+    const held = { ...running, cardMode: { index: 1, total: 1, answers: 2, reason: true } };
+    expect(bandLayout(held, 600, 7.2).find((s) => s.id === "card")?.text).toBe(card(held)?.text);
+    expect(card({ ...held, cardMode: null })?.text).toBe("Alt-n: card mode, then 1-3");
+    expect(card({ ...idle, cardMode: null })).toBeUndefined();
+  });
+});
+
+/* Every card-mode flash, as card mode and the page build them, so each has registered its short form before the
+   40-column check below reads the whole table. */
+const CARD_MODE_FLASHES = [
+  REPLAYED_KEY_FLASH, SHIFT_TAB_IN_CARD_FLASH, CTRL_G_IN_CARD_FLASH, ANSWER_CANCELLED_FLASH, ANSWER_INTERRUPTED_FLASH,
+  CARD_CHANGED_FLASH, QUESTION_WAITS_FLASH, ENTER_ALONE_FLASH, REASON_ENTER_OUTSIDE_FLASH, BROKER_NO_REASON_FLASH,
+  CTRL_Y_GONE_FLASH, agentNoReasonFlash("Codex"), agentNoReasonFlash("goose"), cardJumpGoneFlash("]p"), cardJumpGoneFlash("[p"),
+  ...["1", "3", "9"].map(shiftedDigitFlash), ...["1", "Enter"].map(heldAnswerFlash), ...["1", "Enter"].map(cardArmingFlash),
+  noSuchAnswerFlash("4", 3), noSuchAnswerFlash("3", 2), noButtonPickedFlash(2), noButtonPickedFlash(3),
+  ...["Shift+Enter", "Ctrl+Enter", "Alt+Enter"].map(modifiedReasonEnterFlash), heldCardChordFlash("Alt-n"), heldCardChordFlash("Alt-p"),
+  ...["a", "D", "?", "Space", "Ctrl+x", "F5"].map((key) => lettersNeverAnswerFlash(key, 3)),
+  ...["1", "3", "Enter"].map(notApprovableFlash),
+];
 
 describe("the phone mark", () => {
   it("names a partial sandbox in the phone tooltip", () => {
@@ -84,7 +194,7 @@ describe("the band degrades by priority", () => {
   it("a link that is not attached replaces the context segment with its text", () => {
     const link = { state: "detached" as const, text: "editor detached: run :EitriPanel to attach again" };
     const segs = bandLayout({ ...running, link }, 900, 7.2);
-    expect(segs.map((s) => s.id)).toEqual(["mode", "pill", "cards", "queue", "link", "model", "position", "unread"]);
+    expect(segs.map((s) => s.id)).toEqual(["mode", "pill", "card", "cards", "queue", "link", "model", "position", "unread"]);
     expect(segs.find((s) => s.id === "link")).toEqual({ id: "link", text: link.text, side: "right" });
   });
   it("shows the context when the editor is attached, and nothing changes without a link", () => {
@@ -251,25 +361,25 @@ describe("a y/n prompt is never truncated; a flash is one row", () => {
 
   /* At about 50 cells wide, BROWSE, `⏵⏵ auto`, `↓`, and a no-card flash must fit on one row.
      A wrapping flash would push the unread indicator onto another row. */
-  it("the 'no card here' flash at 50 cells wide: one row, its short form, the ↓ kept", () => {
-    const facts: BandFacts = { ...idle, pill: "⏵⏵ auto", unread: "↓", message: NO_CARD_FLASH };
+  it("the 'not a key here' flash at 50 cells wide: one row, its short form, the ↓ kept", () => {
+    const facts: BandFacts = { ...idle, pill: "⏵⏵ auto", unread: "↓", message: A_ELSEWHERE_FLASH };
     const segs = bandLayout(facts, 50 * 7.2, 7.2);
     const message = segs.find((s) => s.id === "message")!;
     expect(message.wraps).toBeFalsy();
     expect(message.cut).toBeFalsy();
-    expect(message.text).toBe(SHORT_FLASH.get(NO_CARD_FLASH));
-    expect(message.full).toBe(NO_CARD_FLASH);
+    expect(message.text).toBe(SHORT_FLASH.get(A_ELSEWHERE_FLASH));
+    expect(message.full).toBe(A_ELSEWHERE_FLASH);
     expect(segs.find((s) => s.id === "unread")!.text).toBe("↓");
     expect(segs.find((s) => s.id === "mode")!.text).toBe("BROWSE");
     expect(cellsOf(segs)).toBeLessThanOrEqual(50);
     // With room, the whole sentence.
-    expect(bandLayout(facts, 80 * 7.2, 7.2).find((s) => s.id === "message")!.text).toBe(NO_CARD_FLASH);
+    expect(bandLayout(facts, 80 * 7.2, 7.2).find((s) => s.id === "message")!.text).toBe(A_ELSEWHERE_FLASH);
   });
 
   it("every width from 12 to 120 columns keeps every flash on one row: it fits, or it is marked cut", () => {
     const path = "gf: 2 of 5: src/components/very/deep/directory/StatusBand.tsx";
     for (let cols = 12; cols <= 120; cols++) {
-      for (const message of [D11_FLASH, NO_CARD_FLASH, TYPING_FLASH, path]) {
+      for (const message of [D11_FLASH, A_ELSEWHERE_FLASH, A_ON_CARD_FLASH, path]) {
         const segs = bandLayout({ ...idle, pill: "⏵⏵ manual", unread: "↓3", message }, cols * 7.2, 7.2);
         const shown = segs.find((s) => s.id === "message")!;
         expect(segs.some((s) => s.wraps === true), `${cols} columns: ${message}`).toBe(false);
@@ -332,34 +442,34 @@ describe("a y/n prompt is never truncated; a flash is one row", () => {
     expect(segs.find((s) => s.id === "message")!.text).toBe(message);
   });
 
-  /* The card guard's refusal in a narrow chat (the films' 1280 px window at zoom 1.5: a band of about 37 columns beside
-     a manual pill) wrapped over six rows and covered the composer. Too wide for the row, it gives way to its short
+  /* A long refusal in a narrow chat (the films' 1280 px window at zoom 1.5: a band of about 37 columns beside
+     a manual pill) once wrapped over six rows and covered the composer. Too wide for the row, it gives way to its short
      form, and the mode its letter, which is what lets that fit; a wide band keeps the whole sentence. */
-  it("the card guard's refusal keeps one row in a narrow chat: its short form", () => {
-    const narrow = { ...idle, pill: "⏵⏵ manual", cards: 3, message: TYPING_FLASH };
+  it("a's card-mode pointer keeps one row in a narrow chat: its short form", () => {
+    const narrow = { ...idle, pill: "⏵⏵ manual", cards: 3, message: A_ON_CARD_FLASH };
     const segs = bandLayout(narrow, 37 * 7.2, 7.2);
     const message = segs.find((s) => s.id === "message")!;
-    expect(message.text).toBe(SHORT_FLASH.get(TYPING_FLASH));
+    expect(message.text).toBe(SHORT_FLASH.get(A_ON_CARD_FLASH));
     expect(segs.find((s) => s.id === "pill")!.text).toBe("⏵⏵ manual");
     expect(segs.find((s) => s.id === "mode")!.text).toBe("B");
     const wide = bandLayout(narrow, 160 * 7.2, 7.2);
-    expect(wide.find((s) => s.id === "message")!.text).toBe(TYPING_FLASH);
+    expect(wide.find((s) => s.id === "message")!.text).toBe(A_ON_CARD_FLASH);
     expect(wide.find((s) => s.id === "mode")!.text).toBe("BROWSE");
   });
 
-  /* A short form or a cut drops words a person may want (the guard's "i or Ctrl+j to type"), so the shown segment
+  /* A short form or a cut drops words a person may want (the pointer's "in card mode"), so the shown segment
      keeps the whole sentence for `StatusBand`'s title; a flash shown whole carries none. */
   it("a flash shown short or cut keeps its whole text for the title, a whole one carries none", () => {
-    const narrow = { ...idle, pill: "⏵⏵ manual", cards: 3, message: TYPING_FLASH };
+    const narrow = { ...idle, pill: "⏵⏵ manual", cards: 3, message: A_ON_CARD_FLASH };
     const short = bandLayout(narrow, 37 * 7.2, 7.2).find((s) => s.id === "message")!;
-    expect(short.text).toBe(SHORT_FLASH.get(TYPING_FLASH));
-    expect(short.full).toBe(TYPING_FLASH);
+    expect(short.text).toBe(SHORT_FLASH.get(A_ON_CARD_FLASH));
+    expect(short.full).toBe(A_ON_CARD_FLASH);
     expect(bandLayout(narrow, 160 * 7.2, 7.2).find((s) => s.id === "message")!.full).toBeUndefined();
     // Not even the short form fits: the short form is cut, and the title is still the whole sentence.
     const cut = bandLayout(narrow, 26 * 7.2, 7.2).find((s) => s.id === "message")!;
-    expect(cut.text).toBe(SHORT_FLASH.get(TYPING_FLASH));
+    expect(cut.text).toBe(SHORT_FLASH.get(A_ON_CARD_FLASH));
     expect(cut.cut).toBe(true);
-    expect(cut.full).toBe(TYPING_FLASH);
+    expect(cut.full).toBe(A_ON_CARD_FLASH);
   });
 
   it("Esc's reminder keeps one row in a narrow chat too", () => {
@@ -378,6 +488,8 @@ describe("a y/n prompt is never truncated; a flash is one row", () => {
 
   it("every short form fits one row beside a manual pill at 40 columns", () => {
     // 40 columns: about the narrowest chat column a split 1280 px window gives at zoom 1.5.
+    for (const full of CARD_MODE_FLASHES) expect(SHORT_FLASH.has(full), full).toBe(true);
+    expect(SHORT_FLASH.size).toBeGreaterThan(CARD_MODE_FLASHES.length);
     for (const [full, short] of SHORT_FLASH) {
       expect(textWidth(short)).toBeLessThan(textWidth(full));
       const segs = bandLayout({ ...idle, pill: "⏵⏵ manual", cards: 1, message: full }, 40 * 7.2, 7.2);
@@ -488,9 +600,9 @@ describe("the usage segment", () => {
     expect(usageSegment(u(1.5, null))!.text).toBe("$1.50");
     expect(usageSegment(u(0.4213, { input: 10, output: 20, cache_creation: 300, cache_read: 4000 }))!.title).toContain("since this tab started or resumed");
   });
-  it("sits right of the model and is the first thing dropped", () => {
+  it("sits right of the model and drops after the card-entry hint", () => {
     const withUsage: BandFacts = { ...running, usage: { text: "1.2M tok $0.42", title: "" } };
-    expect(ids(900, withUsage)).toEqual(["mode", "pill", "cards", "queue", "context", "model", "usage", "position", "unread"]);
+    expect(ids(900, withUsage)).toEqual(["mode", "pill", "card", "cards", "queue", "context", "model", "usage", "position", "unread"]);
     expect(ids(520, withUsage)).toEqual(["mode", "pill", "cards", "queue", "context", "model", "position", "unread"]);
     expect(bandLayout(withUsage, 520, 7.2).find((s) => s.id === "context")!.text).toBe("⧉ eitri.zsh:3-9");
   });
@@ -555,155 +667,16 @@ describe("the usage segment", () => {
   });
 });
 
-/** While a card waits and the composer has the keys, the band names
- *  the card INPUT's Ctrl+y would approve -- the tool and a short summary -- and drops it by the same
- *  priority order as everything else: shortened to the tool, then gone, after the context, model,
- *  position and queue and before the `⚑N` count. */
-describe("the Ctrl+y segment", () => {
-  const approving: BandFacts = { ...running, approve: { tool: "Bash", summary: "rm build" } };
-
-  it("names the tool and the summary, right after the card count, on the left", () => {
-    const segs = bandLayout(approving, 1400, 7.2);
-    expect(segs.map((s) => s.id).slice(0, 4)).toEqual(["mode", "pill", "cards", "approve"]);
-    const seg = segs.find((s) => s.id === "approve")!;
-    expect(seg.text).toBe("Ctrl+y approves Bash: rm build");
-    expect(seg.side).toBe("left");
-  });
-
-  it("is absent with nothing to approve, and under a y/n prompt", () => {
-    expect(ids(1400, running)).not.toContain("approve");
-    expect(ids(1400, { ...approving, approve: null })).not.toContain("approve");
-    expect(ids(1400, { ...approving, prompt: "close 2? (y/n)" })).toEqual(["mode", "prompt"]);
-  });
-
-  it("goes after context, model, position and queue, is shortened to the tool first, and goes before the card count", () => {
-    let sawShort = false;
+/** INPUT's `Ctrl+y` answers no card: with a card waiting, in INPUT, at any
+ *  width, no segment advertises `Ctrl+y`. */
+describe("no Ctrl+y segment", () => {
+  it("is drawn in no layout, with a card waiting in INPUT", () => {
+    const waiting: BandFacts = { ...running, mode: "input", cards: 2 };
     for (let w = 1400; w >= 60; w -= 5) {
-      const segs = bandLayout(approving, w, 7.2);
-      const idsNow = segs.map((s) => s.id);
-      const seg = segs.find((s) => s.id === "approve");
-      if (seg === undefined || seg.text !== "Ctrl+y approves Bash: rm build") {
-        for (const gone of ["usage", "model", "position", "context", "queue"]) expect(idsNow, `width ${w}`).not.toContain(gone);
-      }
-      if (seg?.text === "Ctrl+y approves Bash") sawShort = true;
-      if (!idsNow.includes("cards")) expect(idsNow, `width ${w}`).not.toContain("approve");
+      const segs = bandLayout(waiting, w, 7.2);
+      expect(segs.map((s) => s.id as string), `width ${w}`).not.toContain("approve");
+      for (const seg of segs) expect(seg.text, `width ${w}`).not.toContain("Ctrl+y");
     }
-    expect(sawShort).toBe(true);
-  });
-
-  it("summarizes a card in one short line: the command or path first, whitespace collapsed, long input cut", () => {
-    expect(cardSummary({ command: "rm   build\n&& ls", description: "Remove the build dir" })).toBe("rm build && ls");
-    expect(cardSummary({ file_path: "/p/src/a.ts", content: "x" })).toBe("/p/src/a.ts");
-    expect(cardSummary({ url: "https://example.com/x" })).toBe("https://example.com/x");
-    const long = cardSummary({ command: "x".repeat(200) });
-    expect(long.length).toBe(40);
-    expect(long).toContain("…");
-    expect(cardSummary({ other: 1 })).toBe('{"other":1}');
-    expect(cardSummary(null)).toBe("null");
-  });
-});
-
-describe("cardSummary on an ACP agent's card (`{title, rawInput, locations, diffs}`)", () => {
-  it("names what the call acts on from the agent's raw input, as for a Claude card", () => {
-    expect(cardSummary({ title: "Run `touch card-marker`", rawInput: { command: ["touch", "card-marker"] }, locations: [], diffs: [] })).toBe(
-      "touch card-marker",
-    );
-    expect(cardSummary({ title: "Run a script", rawInput: { command: "make   test" }, locations: [], diffs: [] })).toBe("make test");
-    expect(cardSummary({ title: "Edit a.ts", rawInput: { path: "/p/a.ts", newText: "x" }, locations: [{ path: "/p/a.ts" }], diffs: [] })).toBe(
-      "/p/a.ts",
-    );
-  });
-
-  it("falls back to the raw input as JSON, then to the first location, then to the agent's own title, never to the whole card as JSON", () => {
-    // The title and the locations are the agent's words about the call; a raw input with no key the band
-    // knows is still the call.
-    expect(cardSummary({ title: "Read it", rawInput: { odd: 1 }, locations: [{ path: "/p/b.md" }], diffs: [] })).toBe('{"odd":1}');
-    expect(cardSummary({ title: "Read notes", rawInput: { argv: ["rm", "-rf", "x"] }, locations: [], diffs: [] })).toBe('{"argv":["rm","-rf","x"]}');
-    expect(cardSummary({ title: "Read it", rawInput: {}, locations: [{ path: "/p/b.md" }], diffs: [] })).toBe("/p/b.md");
-    expect(cardSummary({ title: "Read it", rawInput: null, locations: [{ path: "/p/b.md" }], diffs: [] })).toBe("/p/b.md");
-    expect(cardSummary({ title: "Fetch the page", rawInput: null, locations: [], diffs: [] })).toBe("Fetch the page");
-    expect(cardSummary({ title: "Fetch the page", rawInput: {}, locations: [], diffs: [] })).toBe("Fetch the page");
-  });
-
-  it("never lets the agent's prose in the raw input, or a location, stand in front of the key that does the work", () => {
-    // `description`, `prompt` and `name` name a Claude tool's call; in an ACP raw input they are the
-    // agent's account of it, shown only inside the JSON.
-    expect(cardSummary({ title: "t", rawInput: { description: "x", script: "rm -rf ~" }, locations: [], diffs: [] })).toBe(
-      '{"description":"x","script":"rm -rf ~"}',
-    );
-    // Too long for the band, the JSON is cut in the middle and its tail, the script, still shows.
-    expect(cardSummary({ title: "t", rawInput: { description: "Read notes", script: "rm -rf ~" }, locations: [], diffs: [] })).toBe(
-      '{"description":"…s","script":"rm -rf ~"}',
-    );
-    expect(cardSummary({ title: "t", rawInput: { prompt: "look", name: "notes" }, locations: [], diffs: [] })).toBe(
-      '{"prompt":"look","name":"notes"}',
-    );
-    expect(cardSummary({ title: "t", rawInput: { script: "rm -rf ~" }, locations: [{ path: "/p/notes.md" }], diffs: [] })).toBe(
-      '{"script":"rm -rf ~"}',
-    );
-    // A key that names the call still wins over the prose next to it.
-    expect(cardSummary({ title: "t", rawInput: { description: "Read notes", command: "rm -rf ~" }, locations: [], diffs: [] })).toBe("rm -rf ~");
-    // A Claude tool's own `description` (a `Task`) still names its call.
-    expect(cardSummary({ description: "Find the bug", prompt: "look at a.ts" })).toBe("Find the bug");
-  });
-
-  it("quotes an argument-list word that holds a space, so the words read as the call has them", () => {
-    expect(cardSummary({ title: "t", rawInput: { command: ["rm", "my notes.txt"] }, locations: [], diffs: [] })).toBe("rm 'my notes.txt'");
-    expect(cardSummary({ title: "t", rawInput: { command: ["bash", "-lc", "ls -la"] }, locations: [], diffs: [] })).toBe("bash -lc 'ls -la'");
-    expect(cardSummary({ title: "t", rawInput: { command: ["echo", "it's", ""] }, locations: [], diffs: [] })).toBe("echo 'it'\\''s' ''");
-    // A no-break space is whitespace to a reader: the word is quoted, and the space drawn as its escape.
-    expect(cardSummary({ title: "t", rawInput: { command: ["rm", "a b"] }, locations: [], diffs: [] })).toBe("rm 'a⟨U+00A0⟩b'");
-  });
-});
-
-/** A long command is cut in the middle, not at the end, so its tail -- often
- *  the dangerous part (`| sudo bash`, `--force`) -- still shows on the band. */
-describe("cardSummary keeps the tail", () => {
-  it("cuts a long command in the middle, keeping its head and its end", () => {
-    const s = cardSummary({ command: "curl -fsSL https://example.com/some/long/path/install.sh | sudo bash -s -- --force" });
-    expect(Array.from(s).length).toBe(40);
-    expect(s.startsWith("curl -fsSL")).toBe(true);
-    expect(s.endsWith("sudo bash -s -- --force")).toBe(true);
-    expect(s).toContain("…");
-  });
-});
-
-/** The band's `Ctrl+y` segment names the call that key approves, often while the card itself is out of view,
- *  so it must show what the card shows: no character that reorders, hides or fakes text gets through raw. */
-describe("cardSummary shows the card's hidden characters as the card does", () => {
-  it("draws a direction override, a zero-width space and a no-break space as escapes", () => {
-    // U+202E reverses what follows it: drawn raw, `echo ok \u202Efr- mr` reads as `echo ok rm -rf`.
-    expect(cardSummary({ command: "echo ok \u202Efr- mr" })).toBe("echo ok ⟨U+202E⟩fr- mr");
-    expect(cardSummary({ command: "r\u200Bm x" })).toBe("r⟨U+200B⟩m x");
-    // A no-break space is not one the shell splits at, so it is not collapsed into a plain one.
-    expect(cardSummary({ command: "rm\u00A0-rf x" })).toBe("rm⟨U+00A0⟩-rf x");
-    // Plain spaces, tabs and line breaks still collapse to one space.
-    expect(cardSummary({ command: "a \t\n b" })).toBe("a b");
-  });
-  it("never cuts an escape in half, and keeps the cut within the same length", () => {
-    const s = cardSummary({ command: `${"a".repeat(14)}\u202E${"b".repeat(60)}\u202Ezz` });
-    expect(Array.from(s).length).toBeLessThanOrEqual(40);
-    expect(s).not.toMatch(/⟨U\+[0-9A-F]*…|…[0-9A-F]*⟩/);
-    expect(s.endsWith("⟨U+202E⟩zz")).toBe(true);
-  });
-  it("draws a direction override as its escape on the band, from an ACP card and from a Claude Bash card", () => {
-    // Drawn raw, `notes‮fdp.exe` reads as `notesexe.pdf`.
-    const acp = cardSummary({ title: "Read notes", rawInput: { command: ["cat", "notes‮fdp.exe"] }, locations: [], diffs: [] });
-    expect(acp).toBe("cat notes⟨U+202E⟩fdp.exe");
-    const bash = cardSummary({ command: "cat notes‮fdp.exe", description: "Read notes" });
-    expect(bash).toBe("cat notes⟨U+202E⟩fdp.exe");
-    for (const [tool, summary] of [
-      ["shell", acp],
-      ["Bash", bash],
-    ]) {
-      const seg = bandLayout({ ...idle, cards: 1, approve: { tool, summary } }, 2000, 7.2).find((s) => s.id === "approve");
-      expect(seg?.text).toBe(`Ctrl+y approves ${tool}: cat notes⟨U+202E⟩fdp.exe`);
-      expect(seg?.text).not.toContain("‮");
-    }
-  });
-  it("draws the tool name's hidden characters as escapes too", () => {
-    const seg = bandLayout({ ...idle, approve: { tool: "mcp__x__\u202Eevil", summary: "ok" } }, 2000, 7.2).find((s) => s.id === "approve");
-    expect(seg?.text).toBe("Ctrl+y approves mcp__x__⟨U+202E⟩evil: ok");
   });
 });
 
@@ -728,7 +701,7 @@ describe("turn ending", () => {
   });
   it("sits after the card and queue counts, before a flash", () => {
     const facts: BandFacts = { ...running, ending: end("failed"), message: "copied" };
-    expect(ids(900, facts)).toEqual(["mode", "pill", "cards", "queue", "ending", "message", "context", "model", "position", "unread"]);
+    expect(ids(900, facts)).toEqual(["mode", "pill", "card", "cards", "queue", "ending", "message", "context", "model", "position", "unread"]);
   });
   it("outlasts the model, usage and context, the cards and the queue, and is never in a y/n prompt's band", () => {
     const facts: BandFacts = { ...running, ending: end("failed"), usage: { text: "1k tok $0.01", title: "" } };
@@ -758,15 +731,6 @@ describe("the commands an agent left running", () => {
     expect(ids(400, { ...running, background: 2 })).toContain("background");
     expect(ids(400, { ...running, background: 2 })).not.toContain("model");
   });
-});
-
-it.each([
-  ["\u00A0rm file", "⟨U+00A0⟩rm file"],
-  ["rm file\r", "rm file⟨U+000D⟩"],
-  ["\uFEFFrm file\u2028", "⟨U+FEFF⟩rm file⟨U+2028⟩"],
-  [" \t\n rm file \n\t ", "rm file"],
-])("preserves escaped whitespace at the edge of a command %j", (command, summary) => {
-  expect(cardSummary({ command })).toBe(summary);
 });
 
 function roster(...kinds: TaskKind[]): BackgroundTaskRecord[] {

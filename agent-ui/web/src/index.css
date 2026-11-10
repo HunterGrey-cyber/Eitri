@@ -827,14 +827,27 @@ pre {
   outline: 2px solid var(--nv-fg);
   outline-offset: 3px;
 }
-.permission-card-buttons [data-key]::after {
-  content: attr(data-key) / "";
-  display: none;
-  font-size: var(--fs-xs);
-  padding-left: 12px;
+/* Card mode. The card holding the keys wears the accent ring, the colour of every focus ring here, over the warning
+   frame the current card has; each answer button shows the digit that answers with it, dim until card mode is armed
+   and lit once a press would count (a disabled button's stays dim); and the button Enter would press is ringed as a
+   focused control is, though focus stays on the panel. Only colours, opacity and outlines change, never a size, a
+   radius or a height, so the card keeps its shape and its place in every look. */
+.permission-card.permission-card-mode {
+  border-color: var(--nv-focus-ring);
+  box-shadow: 0 0 0 1px var(--nv-focus-ring);
 }
-[data-panel-mode="browse"] .message-list[data-focused="true"] .row-current .permission-card-buttons [data-key]:not(:disabled)::after {
-  display: inline;
+.permission-card-buttons .card-digit {
+  font-family: var(--nv-font-mono);
+  font-size: var(--fs-prose);
+  opacity: 0.45;
+}
+.permission-card-buttons button:not(:disabled) .card-digit.armed {
+  opacity: 1;
+}
+.agent-ui-root .permission-card-buttons button.card-highlight,
+.agent-ui-root .permission-card-buttons button.card-highlight:focus {
+  outline: 2px solid var(--nv-focus-ring);
+  outline-offset: 3px;
 }
 .permission-card-warning {
   margin: 8px 0;
@@ -2082,16 +2095,6 @@ input::placeholder {
   font: inherit;
   color: var(--nv-chrome-fg);
   cursor: pointer;
-}
-/* The `Ctrl+y approves <tool>: <summary>` segment carries the agent's text. Its hidden characters are drawn
-   as escapes (`band.ts`), but right-to-left letters are ordinary text and stay. Drawn by the bidi algorithm,
-   `cp א ב` reads `cp ב א` -- source and destination swapped -- where Ctrl+y approves without the card in
-   view; so it is drawn in storage order, as the permission card draws the command, and isolated from the
-   segments beside it. `bidi-override` first for an engine without `isolate-override`, which then keeps it. */
-.band-approve {
-  direction: ltr;
-  unicode-bidi: bidi-override;
-  unicode-bidi: isolate-override;
 }
 /* A flash is one row: one too wide for it (`Seg.cut`) shrinks first (`min-width: 0`) and ends in an ellipsis where the
    row ends, to the pixel, instead of being clipped at the band's edge or wrapping. A flash ending in a path comes

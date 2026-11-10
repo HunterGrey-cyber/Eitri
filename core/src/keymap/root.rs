@@ -464,6 +464,21 @@ mod tests {
     }
 
     #[test]
+    fn alt_n_alt_p_f1_ctrl_i_ctrl_o_stay_the_agent_panels() {
+        let prefix = Chord::of(&KeySpec::parse(super::super::stock::STOCK_PREFIX).unwrap());
+        for name in ["M-n", "M-p", "F1", "C-i", "C-o"] {
+            let panel_chord = Chord::of(&KeySpec::parse(name).unwrap());
+            for (chord, what) in chords() {
+                assert_ne!(chord, panel_chord, "{what} would take the agent panel's {name}");
+            }
+            assert_ne!(
+                prefix, panel_chord,
+                "the default prefix would take the agent panel's {name}"
+            );
+        }
+    }
+
+    #[test]
     fn spell_chord_reads_a_root_chord_as_a_person_types_it() {
         let spelled = |action: &str| chords_of(action).iter().map(spell_chord).collect::<Vec<_>>();
         assert_eq!(spelled("fullscreen"), ["F11"]);

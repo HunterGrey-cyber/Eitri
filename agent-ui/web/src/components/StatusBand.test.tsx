@@ -4,7 +4,9 @@ import { act, cleanup, fireEvent, render } from "@testing-library/react";
 import { StatusBand } from "./StatusBand";
 import { bandLayout, type BandFacts } from "../band";
 import { UNREAD_SHOW_MS } from "../steadyBand";
-import { SHORT_FLASH, TYPING_FLASH } from "../app/flashes";
+import { SHORT_FLASH, cardKeyGoneFlash } from "../app/flashes";
+
+const A_ON_CARD_FLASH = cardKeyGoneFlash("a");
 
 afterEach(cleanup);
 
@@ -271,16 +273,10 @@ it("names the panel-entry key in the dim mode block's title, and leaves the clau
   expect(title({ entryKey: "Ctrl+l", paneFocused: true })).toBeNull();
 });
 
-it("draws the Ctrl+y segment in its own `.band-approve` element, the one `index.css` draws in storage order", () => {
-  // `index.css` gives `.band-approve` its direction rule; the class comes from the segment's id, so a
-  // renamed id would leave the agent's right-to-left text drawn by the bidi algorithm.
-  const { container } = renderWide({ ...RUNNING, warn: null, approve: { tool: "shell", summary: "cp א ב" } });
-  const segs = Array.from(container.querySelectorAll<HTMLElement>(".band-seg")).filter((el) =>
-    (el.textContent ?? "").startsWith("Ctrl+y approves"),
-  );
-  expect(segs.length).toBe(1);
-  expect(segs[0].classList.contains("band-approve")).toBe(true);
-  expect(segs[0].textContent).toBe("Ctrl+y approves shell: cp א ב");
+it("draws no Ctrl+y segment while a card waits in INPUT", () => {
+  const { container } = renderWide({ ...RUNNING, mode: "input", warn: null, cards: 1 });
+  expect(container.querySelector(".band-approve")).toBeNull();
+  expect(container.querySelector(".status-band")!.textContent).not.toContain("Ctrl+y");
 });
 
 function renderPicks(facts: BandFacts, picks: { onPickModel?: () => void; onPickEffort?: () => void }, onOpenDetail = vi.fn()) {
@@ -415,14 +411,14 @@ it("a tab switch starts the band's layout afresh: nothing dropped on the last ta
 
 it("a flash drawn in its short form carries the whole sentence as its title", () => {
   const observers = stubResizeObserver();
-  const facts: BandFacts = { ...RUNNING, mode: "browse", unread: null, showcmd: null, warn: null, cards: 3, queued: 0, context: null, pill: "⏵⏵ manual", message: TYPING_FLASH };
+  const facts: BandFacts = { ...RUNNING, mode: "browse", unread: null, showcmd: null, warn: null, cards: 3, queued: 0, context: null, pill: "⏵⏵ manual", message: A_ON_CARD_FLASH };
   const rendered = render(<StatusBand facts={facts} paneFocused={true} onOpenDetail={vi.fn()} onJump={vi.fn()} />);
   act(() => {
     resize(observers[0], rendered.container.querySelector(".band-measure")!, 7.2);
     resize(observers[0], rendered.container.querySelector(".status-band")!, 37 * 7.2);
   });
   const message = rendered.container.querySelector<HTMLElement>(".band-message")!;
-  expect(message.textContent).toBe(SHORT_FLASH.get(TYPING_FLASH));
-  expect(message.title).toBe(TYPING_FLASH);
+  expect(message.textContent).toBe(SHORT_FLASH.get(A_ON_CARD_FLASH));
+  expect(message.title).toBe(A_ON_CARD_FLASH);
   vi.unstubAllGlobals();
 });

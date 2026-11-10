@@ -195,14 +195,17 @@ impl PanelSeq {
 
 /// Alone in BROWSE these already mean something (keymap.ts `resolveKey`). `o` and `A` enter INPUT
 /// like `i`, so a panel binding or nvim `mapleader`/mapping must not shadow them. `:` opens the
-/// panel's own command line and is protected the same way.
-const FIXED: &str = "jkhladioAyYDfrnNG/?:0123456789";
+/// panel's own command line and is protected the same way. `{` and `}` are reserved ahead of
+/// their BROWSE bindings so a user mapping cannot claim them first.
+const FIXED: &str = "jkhladioAyYDfrnNG/?:0123456789{}";
 const PENDING: &str = "gz[]";
 /// The BROWSE pairs a reserved prefix already completes, or will (the web side's `FIXED_PAIRS`):
-/// `gx`, `zz`/`zt`/`zb`, `za`/`zo`/`zc` and `[p`/`]p` are reserved ahead of the keys that bind them,
+/// `gx`, `zz`/`zt`/`zb`, `za`/`zo`/`zc`, `[p`/`]p`, `g?`/`gd`/`gy`, `zi`,
+/// `[t`/`]t`, `[c`/`]c`, `[d`/`]d` and `[m`/`]m` are reserved ahead of the keys that bind them,
 /// so a table binding can never claim one first and change its meaning later.
 const TAKEN_PAIRS: &[&str] = &[
-    "gg", "gf", "gx", "zh", "zl", "zz", "zt", "zb", "za", "zo", "zc", "[[", "]]", "[]", "][", "[p", "]p",
+    "gg", "gf", "gx", "zh", "zl", "zz", "zt", "zb", "za", "zo", "zc", "[[", "]]", "[]", "][", "[p", "]p", "g?", "gd",
+    "gy", "zi", "]t", "[t", "]c", "[c", "]d", "[d", "]m", "[m",
 ];
 
 /// Why `seq` may never be a panel binding, or `None` when it is free.
@@ -583,12 +586,14 @@ mod tests {
         // and must be protected the same way.
         for key in [
             "j", "k", "h", "l", "a", "d", "i", "o", "A", "y", "Y", "D", "f", "r", "n", "N", "G", "/", "?", ":", "5",
+            "{", "}",
         ] {
             assert!(reserved(&parse_seq(key).unwrap()).is_some(), "{key} alone");
             assert!(reserved(&parse_seq(&format!("{key}x")).unwrap()).is_some(), "{key}x");
         }
         for taken in [
-            "gg", "gf", "zh", "zl", "[[", "]]", "[]", "][", "gx", "zz", "zt", "zb", "za", "zo", "zc", "[p", "]p",
+            "gg", "gf", "zh", "zl", "[[", "]]", "[]", "][", "gx", "zz", "zt", "zb", "za", "zo", "zc", "[p", "]p", "g?",
+            "gd", "gy", "zi", "]t", "[t", "]c", "[c", "]d", "[d", "]m", "[m",
         ] {
             assert!(reserved(&parse_seq(taken).unwrap()).is_some(), "{taken}");
         }
@@ -790,6 +795,20 @@ mod tests {
         let (k, log) = effective(&PanelUserTable::default(), Some(&r));
         assert_eq!(k.bindings.len(), default_bindings().len());
         assert_eq!(log.len(), 2, "{log:?}");
+    }
+
+    #[test]
+    fn an_nvim_mapping_on_a_new_pair_is_dropped_and_logged() {
+        let r = report(
+            Some("<Space>"),
+            &[("]d", Some(":bn<CR>"), None), ("gd", Some(":bn<CR>"), None)],
+        );
+        let (k, log) = effective(&PanelUserTable::default(), Some(&r));
+        assert_eq!(k.bindings, default_bindings());
+        assert_eq!(log.len(), 2, "{log:?}");
+        for pair in ["]d", "gd"] {
+            assert!(log.iter().any(|line| line.contains(pair)), "{pair}: {log:?}");
+        }
     }
 
     #[test]

@@ -14,7 +14,10 @@ const tab = { id: 1, number: 1, label: "1 new", name: null, state: "live", mode:
 let messages: Record<string, unknown>[];
 let now: number;
 beforeEach(() => {
-  vi.useFakeTimers();
+  // Card mode arms from its paint, which the animation frames bring.
+  vi.useFakeTimers({
+    toFake: ["setTimeout", "clearTimeout", "setInterval", "clearInterval", "setImmediate", "clearImmediate", "Date", "requestAnimationFrame", "cancelAnimationFrame"],
+  });
   messages = []; now = 1000;
   vi.spyOn(performance, "now").mockImplementation(() => now);
   window.webkit = { messageHandlers: { eitriAgent: { postMessage: (m) => messages.push(JSON.parse(m)) } } };
@@ -175,20 +178,31 @@ describe("questions in the page", () => {
     const segments = bandLayout({ mode: "browse", pill: "auto", showcmd: null, message: null, prompt: null, warn: null, unread: null, cards: 1, questions: 2, queued: 0, context: null, position: null, model: null, usage: null }, 2000, 8);
     expect(segments.find((s) => s.id === "cards")?.text).toBe("⚑3");
   });
-  it.each(["a", "d"])("BROWSE %s answers only a card with a question waiting", async (key) => {
+  it.each([["a", "1", "allow"], ["d", "2", "deny"]])("BROWSE %s answers nothing with a question waiting; Alt-n then %s answers only the card", (key, digit, decision) => {
     const { root, press, container } = setup({ questions: [question], pendingPermissions: [{ seq: 4, permissionId: "p1", toolUseId: null, toolName: "Bash", input: { command: "ls" } }] });
     dispatch({ kind: "focus_permission", tab: 1 }); pause(1000);
     press(key, {}, root);
     pause(350);
     expect(answers()).toHaveLength(0);
-    expect(container.querySelector(".question-dock")).toBeTruthy();
-    expect(messages.some((m) => m.type === "permission_response")).toBe(true);
-  });
-  it("Ctrl+y in INPUT approves only the card while the dock holds the keys", () => {
-    const { press, root } = setup({ questions: [question], pendingPermissions: [{ seq: 4, permissionId: "p1", toolUseId: null, toolName: "Bash", input: { command: "ls" } }] });
-    pause(1000); press("i", {}, root); pause(1000); press("y", { ctrlKey: true }); pause(350);
+    expect(messages.some((m) => m.type === "permission_response")).toBe(false);
+    press("n", { altKey: true, code: "KeyN" }, root);
+    expect(container.querySelector(".permission-card-mode")).toBeTruthy();
+    pause(400);
+    press(digit);
+    pause(300);
     expect(answers()).toHaveLength(0);
-    expect(messages.some((m) => m.type === "permission_response")).toBe(true);
+    expect(container.querySelector(".question-dock")).toBeTruthy();
+    expect(messages.filter((m) => m.type === "permission_response")).toEqual([expect.objectContaining({ permission_id: "p1", decision })]);
+  });
+  it("Ctrl+y in INPUT answers nothing while the dock holds the keys: neither the question nor the card", () => {
+    const { press, root } = setup({ questions: [question], pendingPermissions: [{ seq: 4, permissionId: "p1", toolUseId: null, toolName: "Bash", input: { command: "ls" } }] });
+    pause(1000); press("i", {}, root); pause(1000);
+    // Claimed (its flash is `App.inputCtrlY.test.tsx`'s, where the band is measured), and nothing is answered.
+    expect(fireEvent.keyDown(document.activeElement!, { key: "y", ctrlKey: true })).toBe(false);
+    fireEvent.keyUp(document.activeElement!, { key: "y", ctrlKey: true });
+    pause(350);
+    expect(answers()).toHaveLength(0);
+    expect(messages.some((m) => m.type === "permission_response")).toBe(false);
   });
   it("Shift+Tab into Bypass never sends a question answer", () => {
     const { press, root, container } = setup({ questions: [question], pendingPermissions: [{ seq: 4, permissionId: "p1", toolUseId: null, toolName: "Bash", input: { command: "ls" } }] });

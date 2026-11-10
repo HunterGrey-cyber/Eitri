@@ -253,10 +253,11 @@ describe("DeviceList", () => {
       for (const key of ["d", "D", "i", "A", " ", "1", "c", "ISO_Left_Tab"]) expect(down(key), key).toBe(false);
       expect(down("Tab", { shiftKey: true })).toBe(false);
       expect(reached).toEqual([]);
-      // `?` still opens the keys sheet, which lists the list's own keys; a key with Ctrl held is not the list's.
-      expect(down("?")).toBe(true);
+      // F1 opens the keys sheet; ? is swallowed. A key with Ctrl held is not the list's.
+      expect(down("?")).toBe(false);
+      expect(down("F1")).toBe(true);
       expect(down("c", { ctrlKey: true })).toBe(true);
-      expect(reached).toEqual(["?", "c"]);
+      expect(reached).toEqual(["F1", "c"]);
       reached.length = 0;
       // While the window's question waits, its keys are its own and the rest still reach nothing.
       fromRust({ kind: "remote_revoke_ask", nonce: 7, device: "d1f2", name: "Pixel", expiresInMs: 180_000 });

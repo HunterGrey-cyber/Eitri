@@ -207,9 +207,19 @@ export function clampStep(length: number, index: number, delta: number, min = 0)
   return Math.max(min, Math.min(length - 1, index + delta));
 }
 
-/** The enabled controls inside `stop`, left to right. A stop that is itself a control (a start
- *  screen mode button, a choice row) is its own only control. */
+/** A permission card's answer buttons and reason box carry this: no walk lands on them (`controlsOf`), only a HINT
+ *  label (`hintTargets`), which enters card mode rather than focusing them. */
+export const CARD_CONTROL_ATTR = "data-card-control";
+
+/** The enabled controls inside `stop`, left to right, that a walk may land on: BROWSE `h`/`l`, `currentStop`'s
+ *  lookups and the stops list all read this, so a card's answer controls (`CARD_CONTROL_ATTR`) are never among them.
+ *  A stop that is itself a control (a start screen mode button, a choice row) is its own only control. */
 export function controlsOf(stop: HTMLElement): HTMLElement[] {
+  return orderedControls(stop).filter((el) => !el.hasAttribute(CARD_CONTROL_ATTR));
+}
+
+/** Every enabled control inside `stop`, a card's answer controls included, in `controlsOf`'s order. */
+function orderedControls(stop: HTMLElement): HTMLElement[] {
   if (stop.matches(CONTROL_SELECTOR)) return [stop];
   const found = Array.from(stop.querySelectorAll<HTMLElement>(CONTROL_SELECTOR));
   const order = (el: HTMLElement) => Number(el.dataset.navOrder ?? Number.POSITIVE_INFINITY);
@@ -443,10 +453,15 @@ export function countedStop(
  */
 export function nextControl(stop: HTMLElement, delta: 1 | -1): HTMLElement | "stop" | null {
   const controls = controlsOf(stop);
-  if (controls.length === 0) return null;
   const active = document.activeElement;
-  const index = active instanceof HTMLElement ? controls.indexOf(active) : -1;
   const isRow = stop.getAttribute(STOP_ATTR) === "row";
+  // A card's answer control holds DOM focus only after a mouse press dragged off it; it is no place on the walk, so
+  // either key hands the keys back to its row (and off the control).
+  if (isRow && active instanceof HTMLElement && stop.contains(active) && active.closest(`[${CARD_CONTROL_ATTR}]`) !== null) {
+    return "stop";
+  }
+  if (controls.length === 0) return null;
+  const index = active instanceof HTMLElement ? controls.indexOf(active) : -1;
   if (index === -1) return delta === 1 ? controls[0] : isRow ? null : controls[0];
   if (index === 0 && delta === -1) return isRow ? "stop" : controls[0];
   return controls[clampStep(controls.length, index, delta)];
@@ -635,6 +650,14 @@ export function hintTargets(root: HTMLElement): Exclude<HintTarget, PathTarget>[
     }
     for (const control of controlsOf(stop)) {
       if (hintVisible(control, root)) targets.push({ kind: "control", el: control });
+    }
+    // A card's answer controls are off the walk but still labelled: landing on one enters card mode (`App.tsx`).
+    // Only controls inside a permission card count.
+    if (rowIndex !== null) {
+      for (const control of orderedControls(stop)) {
+        if (!control.hasAttribute(CARD_CONTROL_ATTR) || control.closest(".permission-card") === null) continue;
+        if (hintVisible(control, root)) targets.push({ kind: "control", el: control });
+      }
     }
   }
   // A link a problem row carries on a start screen sits in no conversation row, so the loop above never reaches

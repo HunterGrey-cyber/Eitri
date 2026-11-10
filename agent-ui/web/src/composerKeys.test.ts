@@ -77,3 +77,8 @@ describe("composer keys", () => {
     expect(new Set(INPUT_KEYS.map((row) => row.keys))).toEqual(new Set(COMPOSER_CHORDS));
   });
 });
+
+it("the composer advertises F1 beside the empty-box question shortcut", () => {
+  expect(COMPOSER_CHORDS).toContain("F1");
+  expect(INPUT_KEYS).toContainEqual({ keys: "F1", what: "This list" });
+});

@@ -5,7 +5,6 @@ import { isListScrollAnimating, settleListScroll } from "../jkScroll";
 import type { PanelMode } from "../keymap";
 import { conversationRows } from "../nav";
 import type { TimelineItem } from "../timeline";
-import { TYPING_GUARD_MS } from "../typingGuard";
 import type { BuiltSelection } from "../visual";
 import { clampCursorToView, enterBoxAtNearEnd, revealRow } from "./rowScroll";
 import type { ArrivalPark, FrozenSnapshot } from "./rowScroll";
@@ -240,20 +239,6 @@ export function useRideLastRow(
     }
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [timeline]);
-}
-
-export function useWaitForCtrlYTarget(
-  ctrlYTargetRef: MutableRefObject<{ key: string | null; settled: boolean }>,
-  ctrlYTargetKey: string | null,
-) {
-  useLayoutEffect(() => {
-    ctrlYTargetRef.current = { key: ctrlYTargetKey, settled: false };
-    if (ctrlYTargetKey === null) return;
-    const handle = setTimeout(() => {
-      if (ctrlYTargetRef.current.key === ctrlYTargetKey) ctrlYTargetRef.current = { key: ctrlYTargetKey, settled: true };
-    }, TYPING_GUARD_MS);
-    return () => clearTimeout(handle);
-  }, [ctrlYTargetKey]);
 }
 
 /* A brand-new tab's own arrival (`enter_input`'s only sender now), or a HINT landing on the composer: INPUT with a

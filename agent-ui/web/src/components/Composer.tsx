@@ -1,4 +1,5 @@
 import { useEffect, useLayoutEffect, useRef, useState } from "react";
+import { isPlainAnswerKey } from "../keymap";
 import type { PanelMode } from "../keymap";
 import { HINT_COMPOSER_ATTR } from "../nav";
 import {
@@ -558,7 +559,7 @@ export function Composer({
         return;
       }
     }
-    if (e.key === "?" && text === "") {
+    if ((e.key === "?" && text === "") || (e.key === "F1" && !e.shiftKey && isPlainAnswerKey(e.nativeEvent))) {
       e.preventDefault();
       onOpenKeymap();
       return;

@@ -433,8 +433,12 @@ describe("MessageList tool calls and permissions", () => {
     );
     const cards = Array.from(container.querySelectorAll(".permission-card"));
     expect(cards).toHaveLength(2);
-    fireEvent.click(Array.from(cards[1].querySelectorAll("button")).find((b) => b.textContent === "Approve")!);
-    expect(onAnswerPermission).toHaveBeenCalledWith("perm-2", "allow", undefined);
+    const approve = Array.from(cards[1].querySelectorAll("button")).find((b) => b.textContent === "Approve")!;
+    // A click Enter or Space synthesised on a focused button (`detail` 0) answers nothing; a real one does.
+    fireEvent.click(approve, { detail: 0 });
+    expect(onAnswerPermission).not.toHaveBeenCalled();
+    fireEvent.click(approve, { detail: 1 });
+    expect(onAnswerPermission).toHaveBeenCalledWith("perm-2", "allow", undefined, undefined, expect.anything());
   });
 
   it("passes a dead session through to every card, so none can submit into it", () => {
@@ -2357,20 +2361,17 @@ describe("rows are children of one list", () => {
   describe("a card keeps what was typed into it, whatever else arrives", () => {
     const anchored = (seq: number, call: number) => ({ ...card(seq), toolUseId: `use-${call}` });
     const running = (over: Partial<AgentUiState>) => ({ ...initialState(), status: { kind: "running" }, activeTurnId: "t1", ...over }) as AgentUiState;
-    /** Mounts `first`, types into its last card (the one at `seq`), shows `then`, and checks the box is the same one, still holding it. */
-    const typedThrough = (first: AgentUiState, seq: number, then: AgentUiState) => {
-      const onPermissionReason = vi.fn();
+    /** Mounts `first`, types into its last card (the one at `_seq`), shows `then`, and checks the box is the same one, still holding it. */
+    const typedThrough = (first: AgentUiState, _seq: number, then: AgentUiState) => {
       const view = (state: AgentUiState) => (
-        <MessageList state={state} sessionEnded={false} expanded={{}} cursor={0} onAnswerPermission={() => {}} onPermissionReason={onPermissionReason} />
+        <MessageList state={state} sessionEnded={false} expanded={{}} cursor={0} onAnswerPermission={() => {}} />
       );
       const { container, rerender } = render(view(first));
       const reason = Array.from(container.querySelectorAll<HTMLInputElement>(".permission-card input")).at(-1)!;
       fireEvent.change(reason, { target: { value: "not that one" } });
-      onPermissionReason.mockClear();
       rerender(view(then));
       expect(reason.isConnected, "the same box").toBe(true);
       expect(reason.value).toBe("not that one");
-      expect(onPermissionReason, "the panel's saved reason stands").not.toHaveBeenCalledWith(`perm-${seq}`, "");
       return container;
     };
 

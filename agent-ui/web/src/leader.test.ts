@@ -22,6 +22,7 @@ describe("the box after g / z / [ / ] / Ctrl+w", () => {
   it("names the six z pairs the fold and row-scroll keys add", () => {
     const labels = Object.fromEntries(FIXED_PENDING_ENTRIES.z.map((e) => [e.key, e.label]));
     expect(labels).toMatchObject({
+      i: "detailed view",
       t: "row to top",
       z: "row to middle",
       b: "row to bottom",
@@ -38,19 +39,20 @@ describe("the box after g / z / [ / ] / Ctrl+w", () => {
       ["g", "first row"],
       ["f", "open path"],
       ["x", "open link"],
+      ["?", "this list"],
     ]);
   });
 
-  /* What the box says after a bracket -- the prompt pair, then the
-     card pair `]p` / `[p`. Listed in this order: the box shows a prefix's pairs in table order. */
-  it("names the ]p and [p pairs after the prompt pairs", () => {
-    expect(FIXED_PENDING_ENTRIES["]"].map((e) => [e.key, e.label])).toEqual([
-      ["]", "next prompt"],
-      ["p", "next waiting card"],
+  /* What the box says after a bracket -- the prompt pair, then the reserved `]p` / `[p`, drawn disabled and
+     pointing to card mode's chords. Listed in this order: the box shows a prefix's pairs in table order. */
+  it("names the ]p and [p pairs after the prompt pairs, as pointers to Alt-n / Alt-p", () => {
+    expect(FIXED_PENDING_ENTRIES["]"].map((e) => [e.key, e.label, e.disabled])).toEqual([
+      ["]", "next prompt", false],
+      ["p", "cards: Alt-n now", true],
     ]);
-    expect(FIXED_PENDING_ENTRIES["["].map((e) => [e.key, e.label])).toEqual([
-      ["[", "previous prompt"],
-      ["p", "previous waiting card"],
+    expect(FIXED_PENDING_ENTRIES["["].map((e) => [e.key, e.label, e.disabled])).toEqual([
+      ["[", "previous prompt", false],
+      ["p", "cards: Alt-p now", true],
     ]);
   });
 

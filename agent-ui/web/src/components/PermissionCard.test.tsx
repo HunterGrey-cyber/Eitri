@@ -21,6 +21,9 @@ const REQUEST: PermissionRequestRecord = {
   input: { command: "rm -rf /" },
 };
 
+/** A pointer's proof, as a card button hands it on: made by `pointerAnswerProof`, never a value a test builds. */
+const POINTER = expect.anything();
+
 function buttons(container: HTMLElement) {
   const all = Array.from(container.querySelectorAll("button"));
   return {
@@ -35,7 +38,7 @@ describe("PermissionCard decisions", () => {
     const { container, rerender } = render(<PermissionCard request={REQUEST} sessionEnded={false} alreadyAnswered onAnswer={onAnswer} />);
     expect(container.textContent).toContain("Sending answer…");
     expect(buttons(container).approve.disabled).toBe(true);
-    fireEvent.click(buttons(container).approve);
+    fireEvent.click(buttons(container).approve, { detail: 1 });
     expect(onAnswer).not.toHaveBeenCalled();
     rerender(<PermissionCard request={REQUEST} sessionEnded={false} alreadyAnswered={false} onAnswer={onAnswer} />);
     expect(container.textContent).not.toContain("Sending answer…");
@@ -48,10 +51,10 @@ describe("PermissionCard decisions", () => {
       <PermissionCard request={REQUEST} sessionEnded={false} onAnswer={onAnswer} />,
     );
     fireEvent.change(container.querySelector("input")!, { target: { value: "typed but irrelevant" } });
-    fireEvent.click(buttons(container).approve);
+    fireEvent.click(buttons(container).approve, { detail: 1 });
     // An approval never carries a reason: nothing downstream has a field to show it in, so sending
     // one would be inventing a channel that does not exist.
-    expect(onAnswer).toHaveBeenCalledWith("perm-1", "allow", undefined);
+    expect(onAnswer).toHaveBeenCalledWith("perm-1", "allow", undefined, undefined, POINTER);
   });
 
   it("sends a typed deny carrying the reason the model will be shown", () => {
@@ -60,8 +63,8 @@ describe("PermissionCard decisions", () => {
       <PermissionCard request={REQUEST} sessionEnded={false} onAnswer={onAnswer} />,
     );
     fireEvent.change(container.querySelector("input")!, { target: { value: "not in this repo" } });
-    fireEvent.click(buttons(container).deny);
-    expect(onAnswer).toHaveBeenCalledWith("perm-1", "deny", "not in this repo");
+    fireEvent.click(buttons(container).deny, { detail: 1 });
+    expect(onAnswer).toHaveBeenCalledWith("perm-1", "deny", "not in this repo", undefined, POINTER);
   });
 
   it("does not send the same decision twice while the real resolution is still in flight", () => {
@@ -69,9 +72,9 @@ describe("PermissionCard decisions", () => {
     const { container } = render(
       <PermissionCard request={REQUEST} sessionEnded={false} onAnswer={onAnswer} />,
     );
-    fireEvent.click(buttons(container).approve);
-    fireEvent.click(buttons(container).approve);
-    fireEvent.click(buttons(container).deny);
+    fireEvent.click(buttons(container).approve, { detail: 1 });
+    fireEvent.click(buttons(container).approve, { detail: 1 });
+    fireEvent.click(buttons(container).deny, { detail: 1 });
     expect(onAnswer).toHaveBeenCalledTimes(1);
     // The card is still on screen. Only a real PermissionResolved event removes it -- this component
     // never decides that its own request is finished.
@@ -89,12 +92,12 @@ describe("PermissionCard when the panel withdraws its answer", () => {
     const { container, rerender } = render(
       <PermissionCard request={REQUEST} sessionEnded={false} onAnswer={onAnswer} />,
     );
-    fireEvent.click(buttons(container).approve);
+    fireEvent.click(buttons(container).approve, { detail: 1 });
     rerender(<PermissionCard request={REQUEST} sessionEnded={false} alreadyAnswered onAnswer={onAnswer} />);
     expect(buttons(container).approve.disabled).toBe(true);
     rerender(<PermissionCard request={REQUEST} sessionEnded={false} alreadyAnswered={false} onAnswer={onAnswer} />);
     expect(buttons(container).approve.disabled).toBe(false);
-    fireEvent.click(buttons(container).approve);
+    fireEvent.click(buttons(container).approve, { detail: 1 });
     expect(onAnswer).toHaveBeenCalledTimes(2);
   });
 });
@@ -147,8 +150,8 @@ describe("PermissionCard on a session that has ended", () => {
     const { approve, deny } = buttons(container);
     expect(approve.disabled).toBe(true);
     expect(deny.disabled).toBe(true);
-    fireEvent.click(approve);
-    fireEvent.click(deny);
+    fireEvent.click(approve, { detail: 1 });
+    fireEvent.click(deny, { detail: 1 });
     expect(onAnswer).not.toHaveBeenCalled();
   });
 
@@ -214,24 +217,19 @@ describe("the Bash card", () => {
 });
 
 describe("the reason box and the remember button", () => {
-  it("repeated Enter in the reason box is prevented without denying", () => {
+  /** The box answers nothing from a key: card mode (the page) reads its Enter, and outside card mode the page refuses
+   *  it. Only the Deny button's real click sends what was typed. */
+  it("Enter in the reason box, held or fresh, denies nothing; Deny's click sends the reason", () => {
     const onAnswer = vi.fn();
     const { container } = render(<PermissionCard request={REQUEST} sessionEnded={false} onAnswer={onAnswer} />);
     const reason = container.querySelector<HTMLInputElement>("input")!;
     fireEvent.change(reason, { target: { value: "keep this reason" } });
-    expect(fireEvent.keyDown(reason, { key: "Enter", repeat: true })).toBe(false);
+    fireEvent.keyDown(reason, { key: "Enter", repeat: true });
+    fireEvent.keyDown(reason, { key: "Enter" });
+    fireEvent.keyUp(reason, { key: "Enter" });
     expect(onAnswer).not.toHaveBeenCalled();
-    fireEvent.keyDown(reason, { key: "Enter" });
-    expect(onAnswer).toHaveBeenCalledWith("perm-1", "deny", "keep this reason");
-  });
-
-  it("denies with the reason on Enter in the reason box", () => {
-    const onAnswer = vi.fn();
-    const { container } = render(<PermissionCard request={REQUEST} sessionEnded={false} onAnswer={onAnswer} />);
-    const reason = container.querySelector<HTMLInputElement>("input")!;
-    fireEvent.change(reason, { target: { value: "not the whole disk" } });
-    fireEvent.keyDown(reason, { key: "Enter" });
-    expect(onAnswer).toHaveBeenCalledWith("perm-1", "deny", "not the whole disk");
+    fireEvent.click(buttons(container).deny, { detail: 1 });
+    expect(onAnswer).toHaveBeenCalledWith("perm-1", "deny", "keep this reason", undefined, POINTER);
   });
 
   /** An input method's Enter commits a reason without denying. */
@@ -254,8 +252,8 @@ describe("the reason box and the remember button", () => {
     expect(always.textContent).toBe("Always allow git push * in this project");
     expect(always.getAttribute("data-nav-order")).toBe("3");
     expect(container.querySelector("input")!.getAttribute("data-nav-order")).toBe("4");
-    fireEvent.click(always);
-    expect(onAnswer).toHaveBeenCalledWith("perm-1", "allow", undefined, true);
+    fireEvent.click(always, { detail: 1 });
+    expect(onAnswer).toHaveBeenCalledWith("perm-1", "allow", undefined, true, POINTER);
   });
 });
 
@@ -384,8 +382,8 @@ describe("PermissionCard for the CLI's own prompt", () => {
     const approve = container.querySelector('button[data-nav-action="allow"]') as HTMLButtonElement;
     expect(approve.textContent).toBe("Approve");
     expect(container.querySelector('button[data-nav-action="deny"]')).not.toBeNull();
-    fireEvent.click(approve);
-    expect(onAnswer).toHaveBeenCalledWith("perm-cli", "allow", undefined);
+    fireEvent.click(approve, { detail: 1 });
+    expect(onAnswer).toHaveBeenCalledWith("perm-cli", "allow", undefined, undefined, POINTER);
   });
 
   it("draws nothing extra on the gate's own card", () => {
@@ -483,13 +481,39 @@ describe("PermissionCard shows everything it asks to approve", () => {
   });
 });
 
-it("names the key that answers it on Approve and Deny, as data the stylesheet draws", () => {
+/** Out of card mode the answer controls show no key and take no walk: each is `data-card-control` with
+ *  `tabIndex -1`, and none carries a `data-key` badge. */
+it("out of card mode, the answer buttons and the reason box show no key and are off the tab walk", () => {
   const { container } = render(
-    <PermissionCard request={REQUEST} sessionEnded={false} onAnswer={() => {}} />,
+    <PermissionCard request={REQUEST} sessionEnded={false} ruleOffer="git push *" onAnswer={() => {}} />,
   );
-  expect(container.querySelector('[data-nav-action="allow"]')!.getAttribute("data-key")).toBe("a");
-  expect(container.querySelector('[data-nav-action="deny"]')!.getAttribute("data-key")).toBe("d");
+  const controls = Array.from(container.querySelectorAll<HTMLElement>(".permission-card-buttons button, .permission-card input"));
+  expect(controls).toHaveLength(4);
+  for (const el of controls) {
+    expect(el.hasAttribute("data-card-control")).toBe(true);
+    expect(el.tabIndex).toBe(-1);
+    expect(el.hasAttribute("data-key")).toBe(false);
+  }
+  expect(container.querySelector("[data-key]")).toBeNull();
+  expect(container.querySelector(".card-digit")).toBeNull();
   expect(container.querySelector('[data-nav-action="allow"]')!.textContent).toBe("Approve");
+});
+
+/** A click Enter or Space synthesised on a focused button has `detail` 0; only a real press answers. */
+it.each(["Approve", "Deny", "Always allow"])("a click with detail 0 on %s answers nothing; detail 1 answers", (label) => {
+  const onAnswer = vi.fn();
+  const { container } = render(
+    <PermissionCard request={REQUEST} sessionEnded={false} ruleOffer="git push *" onAnswer={onAnswer} />,
+  );
+  const button = Array.from(container.querySelectorAll("button")).find((b) => b.textContent?.startsWith(label))!;
+  fireEvent.click(button);
+  fireEvent.click(button, { detail: 0 });
+  button.click();
+  expect(onAnswer).not.toHaveBeenCalled();
+  fireEvent.click(button, { detail: 1 });
+  expect(onAnswer).toHaveBeenCalledTimes(1);
+  expect(onAnswer.mock.calls[0][1]).toBe(label === "Deny" ? "deny" : "allow");
+  expect(onAnswer.mock.calls[0][3]).toBe(label === "Always allow" ? true : undefined);
 });
 
 it("shows the last line of a Write above the diff cap", () => {
@@ -543,11 +567,11 @@ describe("Workflow permission view", () => {
     expect(view.container.querySelector("b, img")).toBeNull();
     expect(view.queryByRole("button", { name: "View raw script" })).toBeNull();
     expect(view.queryByText(/don't ask again|Always allow/i)).toBeNull();
-    expect(view.container.querySelector('[data-nav-action="allow"]')!.getAttribute("data-key")).toBe("a");
-    expect(view.container.querySelector('[data-nav-action="deny"]')!.getAttribute("data-key")).toBe("d");
-    fireEvent.click(view.getByRole("button", { name: "Approve" }));
+    expect(view.container.querySelector('[data-nav-action="allow"]')!.hasAttribute("data-card-control")).toBe(true);
+    expect(view.container.querySelector('[data-nav-action="deny"]')!.hasAttribute("data-card-control")).toBe(true);
+    fireEvent.click(view.getByRole("button", { name: "Approve" }), { detail: 1 });
     expect(view.onAnswer).toHaveBeenCalledTimes(1);
-    expect(view.onAnswer).toHaveBeenCalledWith("perm-1", "allow", undefined);
+    expect(view.onAnswer).toHaveBeenCalledWith("perm-1", "allow", undefined, undefined, POINTER);
   });
 
   it.each(["resolvedScript", "resolved_script"])("shows and opens the supplied %s in preference to the original", (key) => {
@@ -561,8 +585,8 @@ describe("Workflow permission view", () => {
     const view = workflow({ script: "run()", option: "<b>flag</b>\u202e" });
     expect(view.container.textContent).toContain('"option": "<b>flag</b>⟨U+202E⟩"');
     fireEvent.change(view.container.querySelector("input")!, { target: { value: "inspect first" } });
-    fireEvent.click(view.getByRole("button", { name: "Deny" }));
-    expect(view.onAnswer).toHaveBeenCalledWith("perm-1", "deny", "inspect first");
+    fireEvent.click(view.getByRole("button", { name: "Deny" }), { detail: 1 });
+    expect(view.onAnswer).toHaveBeenCalledWith("perm-1", "deny", "inspect first", undefined, POINTER);
   });
 
   it("uses the read-only editor route and returns to the waiting card without editing or answering", async () => {
@@ -767,7 +791,7 @@ describe("a broker card", () => {
     expect(container.querySelector(".permission-card input")).toBeNull();
     expect(Array.from(container.querySelectorAll("button")).map((b) => b.textContent)).toEqual(["Approve", "Deny"]);
     expect(container.textContent).not.toContain("Always allow");
-    fireEvent.click(buttons(container).approve);
-    expect(onAnswer).toHaveBeenCalledWith("ec-0123456789abcdef-1", "allow", undefined);
+    fireEvent.click(buttons(container).approve, { detail: 1 });
+    expect(onAnswer).toHaveBeenCalledWith("ec-0123456789abcdef-1", "allow", undefined, undefined, POINTER);
   });
 });

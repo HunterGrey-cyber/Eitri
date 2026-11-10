@@ -221,7 +221,7 @@ export function DeviceList({
           take();
           desk.closeList();
           return;
-        case "?":
+        case "F1":
           // The keys sheet, which covers the list while it is open.
           return;
         default:

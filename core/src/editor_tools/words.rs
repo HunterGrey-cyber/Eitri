@@ -41,6 +41,3 @@ pub const NO_EDITOR: &str = "the editor is not running";
 
 /// A tool's answer over the cap, past its own cutting.
 pub const TOO_LARGE: &str = "the answer was too large; ask for less";
-
-/// What INPUT's `Ctrl+y` flashes with only a broker card waiting.
-pub const CTRL_Y_NOT_A_CARD: &str = "Ctrl+y does not answer an editor card: Esc, then a or d on the card";
