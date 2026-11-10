@@ -91,7 +91,7 @@ const INSTALL_WITHIN: Duration = Duration::from_secs(10);
 
 fn bootstrap_command() -> String {
     format!(
-        "lua _G.__eitri_room_bootstrap = vim.defer_fn(function() if _G.__eitri_room_bootstrap then vim.cmd('qall!') end end, {})",
+        "lua _G.__eitri_room_bootstrap = vim.defer_fn(function() if _G.__eitri_room_bootstrap then pcall(vim.cmd, 'qall') end end, {})",
         INSTALL_WITHIN.as_millis()
     )
 }
@@ -496,7 +496,7 @@ mod tests {
             lua.load(
                 r#"
                 setmetatable(vim.cmd, { __call = function(_, cmd)
-                  assert(cmd == 'qall!'); quit_count = quit_count + 1
+                  assert(cmd == 'qall'); quit_count = quit_count + 1
                 end })
                 stopped, closed = false, false
                 vim.defer_fn = function(f, ms)

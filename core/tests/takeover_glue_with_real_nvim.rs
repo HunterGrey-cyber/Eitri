@@ -1291,6 +1291,44 @@ fn a_room_without_installed_glue_exits_by_itself() {
 
 #[test]
 #[ignore = "needs real nvim 0.12 and private Unix sockets; no display"]
+fn bootstrap_expiry_preserves_a_modified_room_and_its_buffer() {
+    use std::time::Duration;
+    let room = UninstalledRoom::start();
+    let (link, _) =
+        eitri_core::nvim_rpc::NvimLink::connect(room.dir.as_ref().unwrap().socket(), Duration::from_secs(2)).unwrap();
+    assert_eq!(
+        link.exec_lua(
+            r#"
+            local bootstrap = assert(_G.__eitri_room_bootstrap)
+            vim.api.nvim_buf_set_lines(0, 0, -1, false, {'unsaved room edit', 'keep this too'})
+            assert(vim.bo.modified)
+            assert(vim.wait(60000, function() return bootstrap:is_closing() end, 10))
+            return true
+            "#,
+            vec![],
+        )
+        .wait(Duration::from_secs(60))
+        .expect("the modified room still answers after bootstrap expiry")
+        .unwrap(),
+        Value::from(true)
+    );
+    assert_eq!(
+        link.exec_lua(
+            "return {vim.bo.modified, vim.api.nvim_buf_get_lines(0, 0, -1, false)}",
+            vec![],
+        )
+        .wait(Duration::from_secs(2))
+        .expect("the room remains responsive")
+        .unwrap(),
+        Value::Array(vec![
+            Value::from(true),
+            Value::Array(vec!["unsaved room edit".into(), "keep this too".into()]),
+        ])
+    );
+}
+
+#[test]
+#[ignore = "needs real nvim 0.12 and private Unix sockets; no display"]
 fn installing_the_room_cancels_its_bootstrap_timer() {
     use std::time::Duration;
     let origin = EmbedNvim::start();
