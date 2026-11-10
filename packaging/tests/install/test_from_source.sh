@@ -44,6 +44,9 @@ fs_scaffold() {
 		printf 'source = "git+https://example.invalid/neovide.git?rev=%s#%s"\n' "$FS_FORK_REV" "$FS_FORK_REV"
 	} >"$_fs_dir/Cargo.lock"
 	{
+		printf 'GRPC_TOOLS_VERSION=%s\n' "$GRPC_FIXTURE_VERSION"
+		printf 'GRPC_TOOLS_SHA256_linux_x64=%s\n' "$GRPC_FIXTURE_SHA256_X64"
+		printf 'GRPC_TOOLS_SHA256_linux_arm64=%s\n' "$GRPC_FIXTURE_SHA256_ARM64"
 		printf 'NODE_VERSION=%s\n' "$NODE_FIXTURE_VERSION"
 		printf 'NODE_SHA256_linux_x64=%s\n' "$NODE_FIXTURE_SHA256_X64"
 		printf 'NODE_SHA256_linux_arm64=%s\n' "$NODE_FIXTURE_SHA256_ARM64"

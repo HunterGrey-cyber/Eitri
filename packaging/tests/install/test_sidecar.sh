@@ -632,3 +632,38 @@ t_build_sidecar_into_ignores_xdg_data_home_outside_home() {
 	expect_exec "$dest/verdandi-claude-sidecar"
 	expect_absent "$T/outside-data"
 }
+
+TESTS="$TESTS t_bundled_protoc_legacy_warning t_bundled_protoc_missing_refuses t_bundled_protoc_download_fatal"
+t_bundled_protoc_legacy_warning() {
+	serve 0.3.0
+	sc_inst_net --set "EITRI_INSTALL_TEST_NPM_LOG=$T/npm.log"
+	expect_rc 0
+	expect_out "warning:"
+	expect_out "unverified compiler download"
+	if grep -q -- --ignore-scripts "$T/npm.log"; then fail "legacy build disabled scripts"; fi
+	sc_setup_release 0.3.0 "$REV_A"
+	rm -rf "$TH/.local/share/eitri/sidecar"
+	sc_inst_setup -- --sidecar-only
+	expect_rc 0
+	expect_out "unverified compiler download"
+}
+
+t_bundled_protoc_missing_refuses() {
+	serve 0.3.1
+	sc_inst_net
+	expect_fail
+	expect_out "has no protoc pin: refusing"
+	expect_absent "$TH/.local/lib/eitri/shell"
+	sc_setup_release 0.3.1 "$REV_A"
+	sc_inst_setup -- --sidecar-only
+	expect_fail
+	expect_out "has no protoc pin: refusing"
+}
+
+t_bundled_protoc_download_fatal() {
+	serve 1.0.0
+	sc_inst_net --set "EITRI_INSTALL_TEST_GRPC_BASE_URL=http://127.0.0.1:$PORT/missing-grpc"
+	expect_fail
+	expect_out "protoc"
+	expect_absent "$TH/.local/lib/eitri/shell"
+}

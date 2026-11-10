@@ -1911,6 +1911,9 @@ class WriteRelease(unittest.TestCase):
         "RS_FORK_COMMIT": "2" * 40,
         "RS_VERDANDI_REV": _VERDANDI_REV,
         "RS_VERDANDI_SOURCE_SHA256": "3" * 64,
+        "RS_GRPC_TOOLS_VERSION": "1.13.1",
+        "RS_GRPC_TOOLS_SHA256_X64": "9" * 64,
+        "RS_GRPC_TOOLS_SHA256_ARM64": "a" * 64,
         "RS_NODE_VERSION": "v22.23.2",
         "RS_NODE_SHA256_X64": "4" * 64,
         "RS_NODE_SHA256_ARM64": "5" * 64,
@@ -1937,6 +1940,33 @@ class WriteRelease(unittest.TestCase):
         rc.validate_release_text(text)
         self.assertNotIn("REHEARSAL", text)
         self.assertIn("VERDANDI_SOURCE=verdandi-0123456-source.tar.gz\n", text)
+
+    def test_compiler_pin_is_complete_or_absent_for_older_metadata(self):
+        text = self.write(RS_NVIM_VERSION="0.11.4", RS_NVIM_SHA256="8" * 64, RS_REHEARSAL="0")
+        fields = rc.parse_release_text(text)
+        rc.validate_release(fields)
+        keys = ("GRPC_TOOLS_VERSION", "GRPC_TOOLS_SHA256_linux_x64", "GRPC_TOOLS_SHA256_linux_arm64")
+        for key in keys:
+            partial = dict(fields)
+            del partial[key]
+            with self.assertRaisesRegex(rc.ReleaseCheckError, key):
+                rc.validate_release(partial)
+            malformed = dict(fields, **{key: "bad"})
+            with self.assertRaisesRegex(rc.ReleaseCheckError, key):
+                rc.validate_release(malformed)
+        rc.validate_release({key: value for key, value in fields.items() if key not in keys})
+        old = {key: value for key, value in fields.items() if key not in keys}
+        with self.assertRaisesRegex(rc.ReleaseCheckError, "GRPC_TOOLS_VERSION"):
+            rc.validate_release(old, require_protoc_pin=True)
+        rc.validate_release(fields, require_protoc_pin=True)
+        path = os.path.join(self.scratch, "old-RELEASE")
+        with open(path, "w") as output:
+            output.write("\n".join(f"{key}={value}" for key, value in old.items()))
+        proc = subprocess.run(["python3", _RELEASE_CHECK_PY, "validate-release-file", path,
+                               "--require-protoc-pin"], capture_output=True, text=True)
+        self.assertNotEqual(proc.returncode, 0)
+        self.assertIn("GRPC_TOOLS_VERSION", proc.stderr)
+
 
     def test_a_rehearsal_without_the_nvim_pin_is_marked_and_leaves_the_nvim_fields_out(self):
         text = self.write(RS_NVIM_VERSION="", RS_NVIM_SHA256="", RS_REHEARSAL="1")

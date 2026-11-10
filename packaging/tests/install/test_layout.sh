@@ -321,7 +321,7 @@ t_upgrade_bad_layout() {
 TESTS="$TESTS t_release_before_notice_still_installs"
 t_release_before_notice_still_installs() {
 	# Through 0.3.0 the acknowledgement sits inside LICENSE and the tarball has no NOTICE; --version reaches them.
-	mk_release 0.3.0 "$REV_A"
+	mk_release 0.3.0 "$REV_A" unpinned
 	serve 1.0.0 0.3.0
 	inst_net --version 0.3.0
 	expect_rc 0

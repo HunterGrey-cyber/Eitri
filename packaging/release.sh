@@ -162,6 +162,34 @@ write_sums() {
 	mv -- "$dir/SHA256SUMS.tmp" "$dir/SHA256SUMS"
 }
 
+# Phase F checks the locked compiler version and both archives against pins.env.
+# Phase B copies that checked-in pin into the signed RELEASE.
+protoc_version() {
+	git -C "$1" show "$2:package-lock.json" | python3 -c '
+import json, re, sys
+version = json.load(sys.stdin)["packages"]["node_modules/grpc-tools"]["version"]
+if not re.fullmatch(r"[0-9]+\.[0-9]+\.[0-9]+", version):
+    sys.exit("invalid grpc-tools version in the pinned lockfile")
+print(version)
+'
+}
+
+fetch_protoc_pin() {
+	local version arch members
+	version="$(protoc_version "$1" "$2")" || die "cannot read the pinned grpc-tools version"
+	mkdir -p -- "$3"
+	for arch in x64 arm64; do
+		curl -qfsS --location --proto '=https' --proto-redir '=https' --tlsv1.2 \
+			--connect-timeout 30 --max-time 300 --speed-limit 1024 --speed-time 30 --max-filesize 104857600 \
+			--output "$3/linux-$arch.tar.gz" \
+			"https://node-precompiled-binaries.grpc.io/grpc-tools/v$version/linux-$arch.tar.gz" \
+			|| die "cannot fetch protoc for linux-$arch"
+		members="$(tar -tzf "$3/linux-$arch.tar.gz")" || die "cannot list protoc for linux-$arch"
+		[[ "$(printf '%s\n' "$members" | LC_ALL=C sort)" == $'bin/\nbin/grpc_node_plugin\nbin/protoc' ]] \
+			|| die "unexpected protoc archive members for linux-$arch"
+	done
+}
+
 # write_release FILE: RELEASE from the RS_* values. The nvim pair is written only
 # when known; a rehearsal carries REHEARSAL=1.
 write_release() {
@@ -183,6 +211,9 @@ write_release() {
 			printf 'SIDECAR_PROTOCOL_MAJOR=%s\n' "$sidecar_major"
 			printf 'SIDECAR_REQUIRED_CAPABILITIES=%s\n' "$sidecar_caps"
 		fi
+		echo "GRPC_TOOLS_VERSION=$RS_GRPC_TOOLS_VERSION"
+		echo "GRPC_TOOLS_SHA256_linux_x64=$RS_GRPC_TOOLS_SHA256_X64"
+		echo "GRPC_TOOLS_SHA256_linux_arm64=$RS_GRPC_TOOLS_SHA256_ARM64"
 		echo "NODE_VERSION=$RS_NODE_VERSION"
 		echo "NODE_SHA256_linux_x64=$RS_NODE_SHA256_X64"
 		echo "NODE_SHA256_linux_arm64=$RS_NODE_SHA256_ARM64"
@@ -200,6 +231,9 @@ write_release() {
 
 # read_pins PINS_ENV: the RS_* values pins.env holds.
 read_pins() {
+	RS_GRPC_TOOLS_VERSION="$(kv_get "$1" GRPC_TOOLS_VERSION)"
+	RS_GRPC_TOOLS_SHA256_X64="$(kv_get "$1" GRPC_TOOLS_SHA256_linux_x64)"
+	RS_GRPC_TOOLS_SHA256_ARM64="$(kv_get "$1" GRPC_TOOLS_SHA256_linux_arm64)"
 	RS_NODE_VERSION="$(kv_get "$1" NODE_VERSION)"
 	RS_NODE_SHA256_X64="$(kv_get "$1" NODE_SHA256_linux_x64)"
 	RS_NODE_SHA256_ARM64="$(kv_get "$1" NODE_SHA256_linux_arm64)"
@@ -1011,6 +1045,10 @@ ctr_phase_f() {
 	python3 packaging/release_check.py check-node-pin /build/check/node-pin.json packaging/pins.env \
 		|| ctr_die "the pinned Verdandi's Node pin differs from pins.env"
 	rm -f /build/check/node-pin.json
+	fetch_protoc_pin /build/verdandi "$RS_VERDANDI_REV" /build/check/protoc
+	git -C /build/verdandi show "$RS_VERDANDI_REV:package-lock.json" > /build/check/protoc/package-lock.json
+	python3 packaging/release_check.py check-protoc-pin /build/check/protoc/package-lock.json packaging/pins.env /build/check/protoc \
+		|| ctr_die "the pinned Verdandi compiler differs from pins.env"
 	step "phase F done"
 }
 
@@ -1176,7 +1214,7 @@ ctr_phase_b() {
 	write_release /build/stage/dist/RELEASE
 	local vflag=()
 	[ "$RS_REHEARSAL" = 0 ] || vflag=(--rehearsal)
-	python3 packaging/release_check.py validate-release-file /build/stage/dist/RELEASE "${vflag[@]}"
+	python3 packaging/release_check.py validate-release-file /build/stage/dist/RELEASE --require-protoc-pin "${vflag[@]}"
 
 	step "the staging dir (M6), the .deb and .rpm, and the tarball from the same bytes"
 	local st=/build/stage

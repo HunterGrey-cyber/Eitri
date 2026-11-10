@@ -193,8 +193,8 @@ NV_SIDECAR_TMP=
 NV_NVIM_TMP_DEST=
 NV_VERDANDI_SOURCE_TARBALL_OVERRIDE=
 NV_SIDECAR_ACTUAL_VERDANDI_REV=
-# Set by a sidecar update: only sidecar_build_core reads the first two, and with both empty it is the
-# build `eitri setup` has always run.
+# Build inputs from either RELEASE or SIDECAR-RELEASE. Only legacy RELEASE files may
+# leave both empty and let npm fetch the compiler itself.
 SB_NPM_CI_FLAGS=
 SB_PROTOC_TARBALL=
 # A sidecar update leaves $NV_LIB and what surrounds it alone: on a .deb that path is not this
@@ -737,6 +737,14 @@ parse_release_text() {
 	# its git-archive hash so a separate setup run can explain why it cannot fetch an equivalent
 	# release asset, rather than report an expected byte difference as checksum tampering.
 	REL_BUILT_FROM_CHECKOUT=$(kv_value "$1" EITRI_BUILT_FROM_CHECKOUT)
+	# Additive fields: old installers ignore them; builds validate the complete pin before npm.
+	REL_GRPC_TOOLS_PRESENT=0
+	if printf '%s\n' "$1" | grep -Eq '^GRPC_TOOLS_(VERSION|SHA256_linux_(x64|arm64))='; then
+		REL_GRPC_TOOLS_PRESENT=1
+	fi
+	REL_GRPC_TOOLS_VERSION=$(kv_value "$1" GRPC_TOOLS_VERSION)
+	REL_GRPC_TOOLS_SHA256_LINUX_X64=$(kv_value "$1" GRPC_TOOLS_SHA256_linux_x64)
+	REL_GRPC_TOOLS_SHA256_LINUX_ARM64=$(kv_value "$1" GRPC_TOOLS_SHA256_linux_arm64)
 	# Optional too: what this tree expects of a sidecar. A RELEASE from before sidecar updates has
 	# none and still installs; only the commands that take an update require them
 	# (require_sidecar_contract).
@@ -2217,6 +2225,37 @@ accept_sidecar_artifact() {
 	AA_VERSION_LINE=$_aa_l1
 }
 
+# check_bundled_protoc_pin: validate metadata without downloading, including in a dry run.
+# Published releases through 0.3.0 have none; keep those installable with an explicit warning.
+check_bundled_protoc_pin() {
+	if [ "$REL_GRPC_TOOLS_PRESENT" = 0 ]; then
+		_pbp_cmp=$(semver_cmp "$REL_VERSION" 0.3.0)
+		if [ "$_pbp_cmp" -le 0 ]; then
+			warn "RELEASE $REL_VERSION has no protoc pin: using legacy npm install scripts and an unverified compiler download; upgrade to a release carrying GRPC_TOOLS_VERSION and GRPC_TOOLS_SHA256 fields for a verified build"
+			return 0
+		fi
+		die "RELEASE $REL_VERSION has no protoc pin: refusing to build the sidecar; upgrade to a release carrying GRPC_TOOLS_VERSION and GRPC_TOOLS_SHA256 fields"
+	fi
+	if ! printf '%s\n' "$REL_GRPC_TOOLS_VERSION" | grep -Eqx '[0-9]+\.[0-9]+\.[0-9]+' ||
+		! printf '%s\n' "$REL_GRPC_TOOLS_SHA256_LINUX_X64" | grep -Eqx '[0-9a-f]{64}' ||
+		! printf '%s\n' "$REL_GRPC_TOOLS_SHA256_LINUX_ARM64" | grep -Eqx '[0-9a-f]{64}'; then
+		die "RELEASE has an incomplete or malformed GRPC_TOOLS protoc pin: refusing to build the sidecar; upgrade to a release carrying a complete pin"
+	fi
+}
+
+prepare_bundled_protoc() {
+	SB_NPM_CI_FLAGS=
+	SB_PROTOC_TARBALL=
+	check_bundled_protoc_pin
+	if [ "$REL_GRPC_TOOLS_PRESENT" = 0 ]; then return 0; fi
+	SR_GRPC_TOOLS_VERSION=$REL_GRPC_TOOLS_VERSION
+	SR_GRPC_TOOLS_SHA256_LINUX_X64=$REL_GRPC_TOOLS_SHA256_LINUX_X64
+	SR_GRPC_TOOLS_SHA256_LINUX_ARM64=$REL_GRPC_TOOLS_SHA256_LINUX_ARM64
+	sidecar_download_protoc "$1"
+	SB_NPM_CI_FLAGS=--ignore-scripts
+	SB_PROTOC_TARBALL=$SDP_TARBALL
+}
+
 # sidecar_build_core WORKDIR NODE_TARBALL VERDANDI_SOURCE_TARBALL: the work-directory layout, the
 # node-cache placement, npm ci, the SDK notice, npm run build:binary, and the artifact pick +
 # acceptance. Both callers below hand it already-downloaded-and-verified tarballs, whether fetched
@@ -2227,6 +2266,7 @@ sidecar_build_core() {
 	_sbc_workdir=$1
 	_sbc_node_tar=$2
 	_sbc_src_tar=$3
+	if [ -z "$SB_PROTOC_TARBALL" ]; then prepare_bundled_protoc "$_sbc_workdir"; fi
 	_sbc_node_dir=$_sbc_workdir/node
 	_sbc_repo=$_sbc_workdir/repo
 	mkdir -p -- "$_sbc_node_dir" "$_sbc_repo" || die "cannot create $_sbc_workdir's build layout"
@@ -2351,6 +2391,7 @@ ensure_sidecar() {
 		return 0
 	fi
 	if [ "$OPT_DRY_RUN" = 1 ]; then
+		check_bundled_protoc_pin
 		say "would build the sidecar for verdandi $NV_NEW_REV7 into $NV_SIDECAR_ROOT/$NV_NEW_REV7 (needs network access to nodejs.org and the release server; run \"eitri setup\" later if it cannot)"
 		return 0
 	fi
@@ -3511,6 +3552,9 @@ synthesize_release_from_checkout() {
 	# Read out to plain statements before the group below (rule 2): kv_get can die, and a
 	# command substitution inside a `{ ...; } >file || die` group has its own errexit suspended
 	# under a non-POSIX-mode bash.
+	_src_pins_grpc_version=$(kv_get "$_src_pins" GRPC_TOOLS_VERSION)
+	_src_pins_grpc_x64=$(kv_get "$_src_pins" GRPC_TOOLS_SHA256_linux_x64)
+	_src_pins_grpc_arm64=$(kv_get "$_src_pins" GRPC_TOOLS_SHA256_linux_arm64)
 	_src_pins_node_version=$(kv_get "$_src_pins" NODE_VERSION)
 	_src_pins_node_x64=$(kv_get "$_src_pins" NODE_SHA256_linux_x64)
 	_src_pins_node_arm64=$(kv_get "$_src_pins" NODE_SHA256_linux_arm64)
@@ -3536,6 +3580,9 @@ synthesize_release_from_checkout() {
 			printf 'SIDECAR_PROTOCOL_MAJOR=%s\n' "$_src_sidecar_major"
 			printf 'SIDECAR_REQUIRED_CAPABILITIES=%s\n' "$_src_sidecar_caps"
 		fi
+		printf 'GRPC_TOOLS_VERSION=%s\n' "$_src_pins_grpc_version"
+		printf 'GRPC_TOOLS_SHA256_linux_x64=%s\n' "$_src_pins_grpc_x64"
+		printf 'GRPC_TOOLS_SHA256_linux_arm64=%s\n' "$_src_pins_grpc_arm64"
 		printf 'NODE_VERSION=%s\n' "$_src_pins_node_version"
 		printf 'NODE_SHA256_linux_x64=%s\n' "$_src_pins_node_x64"
 		printf 'NODE_SHA256_linux_arm64=%s\n' "$_src_pins_node_arm64"

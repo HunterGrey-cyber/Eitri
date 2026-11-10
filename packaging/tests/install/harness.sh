@@ -5,6 +5,8 @@
 #
 #   harness.sh --sh INTERPRETER --scratch DIR [--real-home DIR]
 #              [--server-port PORT --server-log FILE] [--only NAME]...
+#   With no arguments, run bash in a fresh ~/.cache/nv-v1dist-t9 directory,
+#   guard the real HOME, and remove the scratch directory only on success.
 #
 #   --sh           the shell every installer run uses (`bash`, or `/bin/sh` = dash in the image)
 #   --scratch      an empty or absent directory under ~/.cache (never /tmp); kept on failure
@@ -23,6 +25,20 @@ set -u
 
 HERE=$(cd "$(dirname "$0")" && pwd)
 PKG=$(cd "$HERE/../.." && pwd)
+if [ "$#" -eq 0 ]; then
+	SCRATCH_PARENT=$HOME/.cache/nv-v1dist-t9
+	mkdir -p "$SCRATCH_PARENT" || exit 2
+	SCRATCH=$(mktemp -d "$SCRATCH_PARENT/run-XXXXXXXX") || exit 2
+	printf '# harness scratch: %s\n' "$SCRATCH"
+	sh "$HERE/harness.sh" --sh bash --scratch "$SCRATCH" --real-home "$HOME"
+	RESULT=$?
+	if [ "$RESULT" -eq 0 ]; then
+		rm -rf -- "$SCRATCH"
+	else
+		printf 'harness: failed; scratch kept at %s\n' "$SCRATCH" >&2
+	fi
+	exit "$RESULT"
+fi
 # REAL_INSTALLER is packaging/install.sh as committed, with the maintainer's release key embedded. Tests
 # that read the source (the embedded block, the pinned verify line) and the one test of the real
 # key's own behaviour use it. INSTALLER, which every other test runs, copies into a fixture release
@@ -390,6 +406,11 @@ mk_release() {
 		echo "VERDANDI_REV=$rev"
 		echo "VERDANDI_SOURCE=verdandi-$rev7-source.tar.gz"
 		echo "VERDANDI_SOURCE_SHA256=$MVS_SHA256"
+		if [ "${3:-pinned}" = pinned ]; then
+			echo "GRPC_TOOLS_VERSION=$GRPC_FIXTURE_VERSION"
+			echo "GRPC_TOOLS_SHA256_linux_x64=$GRPC_FIXTURE_SHA256_X64"
+			echo "GRPC_TOOLS_SHA256_linux_arm64=$GRPC_FIXTURE_SHA256_ARM64"
+		fi
 		echo "NODE_VERSION=$NODE_FIXTURE_VERSION"
 		echo "NODE_SHA256_linux_x64=$NODE_FIXTURE_SHA256_X64"
 		echo "NODE_SHA256_linux_arm64=$NODE_FIXTURE_SHA256_ARM64"
@@ -517,6 +538,8 @@ setup_releases() {
 	mk_release 1.1.0 "$REV_B"
 	mk_release 1.2.0 "$REV_C"
 	mk_release 1.0.0-rc.1 "$REV_A"
+	mk_release 0.3.0 "$REV_A" unpinned
+	mk_release 0.3.1 "$REV_A" unpinned
 	mkdir -p "$S/srv"
 }
 
@@ -605,6 +628,7 @@ inst() {
 	if [ -n "${PRE_STUBS:-}" ]; then
 		"$WRAP" --home "$TH" --cwd "$T/cwd" --stubs "$PRE_STUBS" --stubs "$S/stubs" \
 			--set EITRI_INSTALL_TEST=1 \
+			--set "EITRI_INSTALL_TEST_GRPC_BASE_URL=http://127.0.0.1:$PORT/grpc" \
 			--set "EITRI_INSTALL_TEST_LIBDIRS=$S/libs/ok" \
 			--set "EITRI_INSTALL_TEST_SYSTEM_RELEASE=$S/system/RELEASE" \
 			--set "EITRI_INSTALL_TEST_OS_RELEASE=$S/osrel/ubuntu-24.04" \
@@ -612,6 +636,7 @@ inst() {
 	else
 		"$WRAP" --home "$TH" --cwd "$T/cwd" --stubs "$S/stubs" \
 			--set EITRI_INSTALL_TEST=1 \
+			--set "EITRI_INSTALL_TEST_GRPC_BASE_URL=http://127.0.0.1:$PORT/grpc" \
 			--set "EITRI_INSTALL_TEST_LIBDIRS=$S/libs/ok" \
 			--set "EITRI_INSTALL_TEST_SYSTEM_RELEASE=$S/system/RELEASE" \
 			--set "EITRI_INSTALL_TEST_OS_RELEASE=$S/osrel/ubuntu-24.04" \

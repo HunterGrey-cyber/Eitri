@@ -496,6 +496,7 @@ t_upd_grpc_unset_goes_nowhere() {
 	upd_state
 	mk_sidecar_release 0.3.1
 	inst --set "EITRI_INSTALL_TEST_NODE_BASE_URL=http://127.0.0.1:$PORT/dist" \
+		--unset EITRI_INSTALL_TEST_GRPC_BASE_URL \
 		-- --sidecar-update --base-url "http://127.0.0.1:$PORT/sc" --release-signers "$SIGNERS"
 	upd_refused "no grpc override in test mode" 'http://127.0.0.1:1/grpc-tools/'
 }
@@ -513,16 +514,18 @@ t_upd_npm_ci_ignores_scripts() {
 	expect_eq "$(sed -n 2p "$T/npm.log")" 'build protoc=yes' "protoc before the build"
 }
 
-TESTS="$TESTS t_upd_plain_setup_keeps_plain_npm_ci"
-t_upd_plain_setup_keeps_plain_npm_ci() {
+TESTS="$TESTS t_upd_pinned_setup_ignores_scripts"
+t_upd_pinned_setup_ignores_scripts() {
 	serve 1.0.0
 	sc_setup_release 1.0.0 "$REV_A"
 	srv_mark
 	sc_inst_setup --set "EITRI_INSTALL_TEST_NPM_LOG=$T/npm.log" -- --sidecar-only
 	expect_rc 0
-	expect_eq "$(sed -n 1p "$T/npm.log")" 'ci --no-audit --no-fund' "the npm ci line of a plain setup"
-	expect_eq "$(sed -n 2p "$T/npm.log")" 'build protoc=no' "protoc is not placed on a plain setup"
-	if srv_paths | grep -F grpc >/dev/null; then fail "a plain setup fetched protoc: $(srv_paths)"; fi
+	expect_eq "$(sed -n 1p "$T/npm.log")" 'ci --no-audit --no-fund --ignore-scripts' "the npm ci line of a pinned setup"
+	expect_eq "$(sed -n 2p "$T/npm.log")" 'build protoc=yes' "protoc before the setup build"
+	if ! srv_paths | grep -Fx "/grpc/grpc-tools/v$GRPC_FIXTURE_VERSION/linux-x64.tar.gz" >/dev/null; then
+		fail "a pinned setup did not fetch its compiler: $(srv_paths)"
+	fi
 }
 
 TESTS="$TESTS t_upd_npm_failing"

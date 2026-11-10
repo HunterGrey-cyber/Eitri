@@ -5,7 +5,7 @@ failing fixture and a passing fixture in packaging/tests/test_release_layout.py 
 no network -- the pattern packaging/collect-licenses.py and packaging/test_collect_licenses.py follow.
 
 Usage (release.sh calls these):
-    python3 release_check.py validate-release-file RELEASE [--rehearsal]
+    python3 release_check.py validate-release-file RELEASE [--rehearsal] [--require-protoc-pin]
     python3 release_check.py asset-names 0.2.0-rc.1 a2f194a
     python3 release_check.py gh-release-command 0.2.0-rc.1 --repo OWNER/NAME --title T --notes-file F asset1 ...
     python3 release_check.py check-legacy-symbols NM_C_OUTPUT_FILE
@@ -17,6 +17,7 @@ Usage (release.sh calls these):
     python3 release_check.py rebuild-env SOURCE
     python3 release_check.py lock-package-sources CARGO_LOCK NAME
     python3 release_check.py make-scan-view SRC_DIR DEST_DIR
+    python3 release_check.py check-protoc-pin PACKAGE_LOCK_JSON PINS_ENV DOWNLOAD_DIR
     python3 release_check.py check-node-pin NODE_PIN_JSON PINS_ENV
     python3 release_check.py check-assets OUT_DIR CHECK_DIR VERSION VERDANDI_REV SRC_REPO VERDANDI_REPO \
         SKIA_ARCHIVE SKIA_SHA256
@@ -80,6 +81,9 @@ RELEASE_FIELDS: dict[str, re.Pattern] = {
     "SIDECAR_VERSION": VERSION_RE,
     "SIDECAR_PROTOCOL_MAJOR": re.compile(r"^[0-9]+$"),
     "SIDECAR_REQUIRED_CAPABILITIES": re.compile(r"^[a-z][a-z0-9_]*( [a-z][a-z0-9_]*)*$"),
+    "GRPC_TOOLS_VERSION": _NVIM_VERSION_RE,
+    "GRPC_TOOLS_SHA256_linux_x64": _HEX64,
+    "GRPC_TOOLS_SHA256_linux_arm64": _HEX64,
     "NODE_VERSION": _NODE_VERSION_RE,
     "NODE_SHA256_linux_x64": _HEX64,
     "NODE_SHA256_linux_arm64": _HEX64,
@@ -116,21 +120,26 @@ REHEARSAL_FIELD = "REHEARSAL"
 
 # Trees from before the sidecar contract write none of these keys; newer trees carry the whole group.
 SIDECAR_FIELDS = ("SIDECAR_VERSION", "SIDECAR_PROTOCOL_MAJOR", "SIDECAR_REQUIRED_CAPABILITIES")
+PROTOC_FIELDS = ("GRPC_TOOLS_VERSION", "GRPC_TOOLS_SHA256_linux_x64", "GRPC_TOOLS_SHA256_linux_arm64")
 
 
-def validate_release(fields: dict[str, str], rehearsal: bool = False) -> None:
+def validate_release(fields: dict[str, str], rehearsal: bool = False, require_protoc_pin: bool = False) -> None:
     """Raises ReleaseCheckError naming every problem at once (missing/extra keys, and any value
     that fails its own field's pattern) -- not just the first one found, so a broken RELEASE is
     fixed in a single pass rather than one failure at a time.
 
     rehearsal=True: REHEARSAL=1 is required, and the two nvim fields may be absent -- both or
     neither, never one of them. A real release (the default) may carry no REHEARSAL field at all.
-    The sidecar contract fields must be present together or all absent for an older tree."""
+    Each of the sidecar contract and compiler pin groups is complete or absent for an older tree.
+    require_protoc_pin=True refuses an absent compiler pin when producing a new release."""
     problems = []
     required = set(RELEASE_FIELDS)
     allowed = set(RELEASE_FIELDS)
-    if not any(key in fields for key in SIDECAR_FIELDS):
-        required -= set(SIDECAR_FIELDS)
+    for group in (SIDECAR_FIELDS, PROTOC_FIELDS):
+        if not any(key in fields for key in group):
+            required -= set(group)
+    if require_protoc_pin:
+        required.update(PROTOC_FIELDS)
     if rehearsal:
         allowed.add(REHEARSAL_FIELD)
         required.add(REHEARSAL_FIELD)
@@ -154,10 +163,10 @@ def validate_release(fields: dict[str, str], rehearsal: bool = False) -> None:
         raise ReleaseCheckError("; ".join(problems))
 
 
-def validate_release_text(text: str, rehearsal: bool = False) -> dict[str, str]:
+def validate_release_text(text: str, rehearsal: bool = False, require_protoc_pin: bool = False) -> dict[str, str]:
     """parse_release_text then validate_release; returns the parsed fields on success."""
     fields = parse_release_text(text)
-    validate_release(fields, rehearsal=rehearsal)
+    validate_release(fields, rehearsal=rehearsal, require_protoc_pin=require_protoc_pin)
     return fields
 
 
@@ -1160,6 +1169,27 @@ _NODE_PIN_PLATFORMS = ("linux-x64", "linux-arm64")
 _SHA256_RE = re.compile(r"^[0-9a-f]{64}$")
 
 
+def check_protoc_pin(lock_text: str, pins: dict[str, str], downloads: str) -> None:
+    """The locked compiler and both downloaded archives must match the checked-in pin."""
+    problems = []
+    try:
+        version = json.loads(lock_text)["packages"]["node_modules/grpc-tools"]["version"]
+    except (ValueError, KeyError, TypeError) as exc:
+        raise ReleaseCheckError(f"cannot read grpc-tools version from package-lock.json: {exc}") from exc
+    for key in PROTOC_FIELDS:
+        if not RELEASE_FIELDS[key].fullmatch(pins.get(key, "")):
+            problems.append(f"pins.env has no valid {key}")
+    if version != pins.get("GRPC_TOOLS_VERSION"):
+        problems.append(f"package-lock.json pins grpc-tools {version!r}, pins.env {pins.get('GRPC_TOOLS_VERSION')!r}")
+    for arch in ("x64", "arm64"):
+        with open(os.path.join(downloads, f"linux-{arch}.tar.gz"), "rb") as archive:
+            digest = hashlib.file_digest(archive, "sha256").hexdigest()
+        if digest != pins.get(f"GRPC_TOOLS_SHA256_linux_{arch}"):
+            problems.append(f"linux-{arch} protoc sha256 {digest} differs from pins.env")
+    if problems:
+        raise ReleaseCheckError("; ".join(problems))
+
+
 def check_node_pin(node_pin_text: str, pins: dict[str, str]) -> None:
     """The pinned Verdandi's node-pin.json (its sidecar build's only Node pin) names the same version
     and linux tarball sha256s as pins.env: the release's RELEASE hands users pins.env's pair, and the
@@ -1512,7 +1542,8 @@ def main(argv: list[str]) -> int:
     cmd, rest = argv[0], argv[1:]
     try:
         if cmd == "validate-release-file":
-            fields = validate_release_text(_read(rest[0]), rehearsal="--rehearsal" in rest[1:])
+            fields = validate_release_text(_read(rest[0]), rehearsal="--rehearsal" in rest[1:],
+                                           require_protoc_pin="--require-protoc-pin" in rest[1:])
             print(f"release_check: {rest[0]} is a valid RELEASE ({len(fields)} fields)", file=sys.stderr)
             return 0
         if cmd == "asset-names":
@@ -1598,6 +1629,10 @@ def main(argv: list[str]) -> int:
         if cmd == "make-scan-view":
             count = make_scan_view(rest[0], rest[1])
             print(f"release_check: {count} files linked into {rest[1]}", file=sys.stderr)
+            return 0
+        if cmd == "check-protoc-pin":
+            check_protoc_pin(_read(rest[0]), parse_release_text(_read(rest[1])), rest[2])
+            print("release_check: locked compiler and archives match pins.env", file=sys.stderr)
             return 0
         if cmd == "check-node-pin":
             check_node_pin(_read(rest[0]), parse_release_text(_read(rest[1])))
