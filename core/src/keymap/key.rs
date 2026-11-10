@@ -312,6 +312,9 @@ impl Chord {
                 None => rest.to_string(),
             },
         };
+        if chord.key == " " {
+            chord.key = "space".to_string();
+        }
         Ok(chord)
     }
 

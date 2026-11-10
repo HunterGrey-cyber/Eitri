@@ -19,6 +19,27 @@ pub(crate) fn env_for(home: &Path) -> TmuxEnv {
     }
 }
 
+#[test]
+fn regression_relative_xdg_config_home_is_ignored_for_tmux_discovery() {
+    let home = ScratchDir::new("eitri-tmux", "relative-xdg");
+    let mut env = env_for(&home);
+    for value in [".", "", "project/config"] {
+        env.env.insert("XDG_CONFIG_HOME".into(), value.into());
+        let files = env.config_files();
+        assert_eq!(
+            files,
+            vec![
+                env.system_file.clone(),
+                home.join(".tmux.conf"),
+                home.join(".config/tmux/tmux.conf")
+            ]
+        );
+    }
+    env.env
+        .insert("XDG_CONFIG_HOME".into(), home.join("custom").display().to_string());
+    assert!(env.config_files().contains(&home.join("custom/tmux/tmux.conf")));
+}
+
 fn write(path: &Path, text: &str) {
     std::fs::create_dir_all(path.parent().unwrap()).unwrap();
     std::fs::write(path, text).unwrap();

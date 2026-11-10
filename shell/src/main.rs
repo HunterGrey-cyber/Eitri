@@ -4521,9 +4521,12 @@ fn build_ui(
     // own error is. Every request goes whole to the controller, its gate and log line included;
     // `run` meets the runner's rules as a key does.
     let apply_layout_requests: Rc<dyn Fn()> = {
-        let lua_engine = lua_engine.clone();
-        let driver = driver.clone();
+        let lua_engine = Rc::downgrade(&lua_engine);
+        let driver = Rc::downgrade(&driver);
         Rc::new(move || {
+            let (Some(lua_engine), Some(driver)) = (lua_engine.upgrade(), driver.upgrade()) else {
+                return;
+            };
             let requests = lua_engine.layout.borrow_mut().take_requests();
             if !requests.is_empty() {
                 driver.post(HostEvent::Lua(eitri_core::wm::LuaEvent::LayoutRequests {
@@ -4534,27 +4537,35 @@ fn build_ui(
         })
     };
 
-    // Wire every Lua-registered command to a real GTK action, right before the window is shown:
-    // GTK actions can be added before or after `present()`, so placement here is only for
-    // clarity. Each command gets a `gio::SimpleAction` named `cmd-<id>` on `app`, whose
-    // `activate` signal invokes the command back through the Lua engine; commands that declared
-    // a `keybinding` also get a real accelerator bound via `set_accels_for_action`.
-    for (id, entry) in lua_engine.commands.borrow().iter() {
-        let action_name = format!("cmd-{id}");
-        let action = gtk4::gio::SimpleAction::new(&action_name, None);
-        let id_owned = id.clone();
-        let lua_engine_for_action = lua_engine.clone();
+    // Startup entries and later registrations use the same UI-thread installer. Weak references
+    // keep the registry's observer from owning its kernel or the application through the actions.
+    let install_command: eitri_core::lua::command::CommandObserver = {
+        let app = app.downgrade();
+        let lua_engine = Rc::downgrade(&lua_engine);
         let apply_layout_requests = apply_layout_requests.clone();
-        action.connect_activate(move |_, _| {
-            lua_engine_for_action.invoke_command(&id_owned);
-            apply_layout_requests();
-        });
-        app.add_action(&action);
-        if let Some(keybinding) = &entry.keybinding {
-            let accel = gtk_host::keys::registered_accel(keybinding);
-            app.set_accels_for_action(&format!("app.{action_name}"), &[&accel]);
-        }
+        Rc::new(move |id, keybinding| {
+            let Some(app) = app.upgrade() else { return };
+            let action_name = format!("cmd-{id}");
+            let action = gtk4::gio::SimpleAction::new(&action_name, None);
+            let id_owned = id.to_string();
+            let lua_engine = lua_engine.clone();
+            let apply_layout_requests = apply_layout_requests.clone();
+            action.connect_activate(move |_, _| {
+                if let Some(lua_engine) = lua_engine.upgrade() {
+                    lua_engine.invoke_command(&id_owned);
+                    apply_layout_requests();
+                }
+            });
+            app.add_action(&action);
+            let accel = keybinding.map(gtk_host::keys::registered_accel);
+            let accels: Vec<&str> = accel.iter().map(String::as_str).collect();
+            app.set_accels_for_action(&format!("app.{action_name}"), &accels);
+        })
+    };
+    for (id, entry) in lua_engine.commands.borrow().iter() {
+        install_command(id, entry.keybinding.as_deref());
     }
+    lua_engine.commands.borrow_mut().set_observer(install_command);
 
     // The layout's first focus: where the keys were when this project's last arrangement change was
     // written, from

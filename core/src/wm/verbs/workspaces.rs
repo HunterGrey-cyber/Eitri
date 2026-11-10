@@ -389,6 +389,12 @@ fn new_workspace_layout(
     let mut layout = reconciled.layout;
     let mut notes = reconciled.notes;
     notes.extend(crate::layout::fit_to_with(&mut layout, &live.modules(), lua));
+    for id in live.away() {
+        if layout.contains(&id) {
+            // Refused only when nothing else could be shown; the workspace switch can still proceed.
+            let _ = layout.set_away(&id, true);
+        }
+    }
     Ok((layout, notes))
 }
 
@@ -399,6 +405,85 @@ mod tests {
     use crate::layout::{Axis, ModuleId, WorkspaceError};
     use crate::wm::verbs::rig::{self, allocate, map, moves, ops, unmap};
     use crate::wm::{Decide, EditorPresence, EntryEv, FocusTo, HostEvent, HostOp, WindowParts, WindowRole, WindowSpec};
+
+    #[test]
+    fn regression_template_switch_with_the_only_other_module_away_succeeds() {
+        let editor = ModuleId::editor();
+        let agent = ModuleId::agent();
+        let template = crate::lua::layout::LuaTree {
+            tiled: crate::layout::Node::split(
+                Axis::Row,
+                0.5,
+                crate::layout::Node::Leaf(editor.clone()),
+                crate::layout::Node::Leaf(agent.clone()),
+            ),
+            floats: vec![],
+        };
+        let mut live = Layout::new(template.tiled.clone(), editor.clone()).unwrap();
+        assert_eq!(live.modules(), vec![editor.clone(), agent.clone()]);
+        live.set_away(&agent, true).unwrap();
+        let mut r = rig::rig(live);
+        r.controller.set_module_setup(
+            rig::WIN,
+            crate::wm::verbs::modules::ModuleSetup {
+                workspaces: vec![("study".into(), Ok(template))],
+                ..Default::default()
+            },
+        );
+        r.run(Action::WorkspaceSwitch { name: "study".into() });
+        assert_eq!(
+            r.controller.chrome(rig::WIN).top_bar.workspace.as_deref(),
+            Some("study")
+        );
+        assert!(r.layout.borrow().is_away(&agent));
+        assert_eq!(r.layout.borrow().visible_modules(), vec![editor]);
+        r.run(Action::WorkspaceSwitch { name: "main".into() });
+        assert_eq!(r.controller.chrome(rig::WIN).top_bar.workspace.as_deref(), Some("main"));
+        r.controller.workspace_pick(rig::WIN, WorkspacePick::Delete(1), 7);
+        r.run(Action::WorkspaceSwitch { name: "study".into() });
+        assert_eq!(
+            r.controller.chrome(rig::WIN).top_bar.workspace.as_deref(),
+            Some("study")
+        );
+        assert!(r.layout.borrow().is_away(&agent));
+    }
+
+    #[test]
+    fn regression_recreated_template_keeps_away_modules() {
+        let two = ModuleId::parse("terminal#2").unwrap();
+        let template = crate::lua::layout::LuaTree {
+            tiled: crate::layout::Node::split(
+                Axis::Row,
+                0.5,
+                crate::layout::Node::Leaf(ModuleId::editor()),
+                crate::layout::Node::split(
+                    Axis::Column,
+                    0.5,
+                    crate::layout::Node::Leaf(ModuleId::agent()),
+                    crate::layout::Node::Leaf(two.clone()),
+                ),
+            ),
+            floats: vec![],
+        };
+        let live = crate::layout::reconcile_default_floating(template.tiled.clone(), vec![], &[])
+            .unwrap()
+            .layout;
+        let mut r = rig::rig(live);
+        r.controller.set_module_setup(
+            rig::WIN,
+            crate::wm::verbs::modules::ModuleSetup {
+                workspaces: vec![("study".into(), Ok(template))],
+                ..Default::default()
+            },
+        );
+        r.run(Action::WorkspaceSwitch { name: "study".into() });
+        r.run(Action::WorkspaceSwitch { name: "main".into() });
+        r.layout.borrow_mut().set_away(&two, true).unwrap();
+        r.controller.workspace_pick(rig::WIN, WorkspacePick::Delete(1), 7);
+        r.run(Action::WorkspaceSwitch { name: "study".into() });
+        assert!(r.layout.borrow().away().contains(&two));
+        assert!(!r.layout.borrow().is_visible(&two));
+    }
 
     #[test]
     fn workspace_picks_resolve_against_the_order() {

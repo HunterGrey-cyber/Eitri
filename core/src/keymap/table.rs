@@ -1374,6 +1374,14 @@ mod tests {
     }
 
     #[test]
+    fn regression_space_accelerator_collides_with_the_space_prefix() {
+        let map = Keymap::apply_user(&[KeymapOp::Prefix { key: "C-Space".into() }], &[]).unwrap();
+        assert_eq!(Chord::from_accel("<Control>space").unwrap(), Chord::of(map.prefix()));
+        assert_eq!(Chord::from_accel("<Control> ").unwrap(), Chord::of(map.prefix()));
+        assert!(check_command_keybinding("space-command", "<Control>space", &map).is_err());
+    }
+
+    #[test]
     fn bang_breaks_a_tab_out_as_stock_tmux_breaks_a_pane() {
         let map = Keymap::defaults();
         let binding = map.lookup(&k("!")).expect("! is bound");

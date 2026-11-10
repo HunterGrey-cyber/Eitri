@@ -25,15 +25,24 @@ pub struct CommandEntry {
     pub action: Rc<RegistryKey>,
 }
 
+/// Registration notification on the caller's UI thread, after the registry borrow is released.
+pub type CommandObserver = Rc<dyn Fn(&str, Option<&str>)>;
+
 /// `pub`: `Kernel` holds one behind an `Rc<RefCell<_>>` field and calls `install`.
 #[derive(Default)]
 pub struct CommandRegistry {
     commands: HashMap<String, CommandEntry>,
+    observer: Option<CommandObserver>,
     /// Shares the startup decision with the other Lua APIs.
     init_refusals: Option<Rc<RefCell<super::kernel::InitRefusals>>>,
 }
 
 impl CommandRegistry {
+    /// Installs the host's listener after it has wired the existing entries.
+    pub fn set_observer(&mut self, observer: CommandObserver) {
+        self.observer = Some(observer);
+    }
+
     /// `pub(crate)`: only `install`'s own closure below calls this; nothing in `shell` registers
     /// a command directly.
     pub(crate) fn register(&mut self, id: String, entry: CommandEntry) {
@@ -107,13 +116,17 @@ pub fn install(lua: &Lua, eitri: &Table, registry: Rc<RefCell<CommandRegistry>>)
         let action: mlua::Function = spec.get("action")?;
         let action_key = lua.create_registry_value(action)?;
         registry.borrow_mut().register(
-            id,
+            id.clone(),
             CommandEntry {
                 title,
-                keybinding,
+                keybinding: keybinding.clone(),
                 action: Rc::new(action_key),
             },
         );
+        let observer = registry.borrow().observer.clone();
+        if let Some(observer) = observer {
+            observer(&id, keybinding.as_deref());
+        }
         Ok(())
     })?;
     command_table.set("register", register_fn)?;
@@ -124,6 +137,46 @@ pub fn install(lua: &Lua, eitri: &Table, registry: Rc<RefCell<CommandRegistry>>)
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn regression_runtime_command_registrations_notify_after_releasing_the_registry() {
+        let lua = Lua::new();
+        let eitri = lua.create_table().unwrap();
+        let registry = Rc::new(RefCell::new(CommandRegistry::default()));
+        install(&lua, &eitri, registry.clone()).unwrap();
+        lua.globals().set("eitri", eitri).unwrap();
+        lua.load("eitri.command.register {id='first', title='First', keybinding='<Control>a', action=function() end}")
+            .exec()
+            .unwrap();
+        let notifications = Rc::new(RefCell::new(Vec::new()));
+        let seen = notifications.clone();
+        let weak = Rc::downgrade(&registry);
+        let thread = std::thread::current().id();
+        registry.borrow_mut().set_observer(Rc::new(move |id, keybinding| {
+            assert_eq!(std::thread::current().id(), thread);
+            let registry = weak.upgrade().unwrap();
+            assert_eq!(registry.borrow().get(id).unwrap().keybinding.as_deref(), keybinding);
+            seen.borrow_mut().push((id.to_string(), keybinding.map(str::to_owned)));
+        }));
+        lua.load(
+            r#"
+            eitri.command.register {id='second', title='Second', keybinding='<Control>b', action=function() end}
+            eitri.command.register {id='first', title='First', keybinding='<Control>c', action=function() end}
+            eitri.command.register {id='first', title='First', action=function() end}
+            assert(not pcall(eitri.command.register, {id='bad id', title='Bad', action=function() end}))
+        "#,
+        )
+        .exec()
+        .unwrap();
+        assert_eq!(
+            *notifications.borrow(),
+            vec![
+                ("second".to_string(), Some("<Control>b".to_string())),
+                ("first".to_string(), Some("<Control>c".to_string())),
+                ("first".to_string(), None),
+            ]
+        );
+    }
 
     #[test]
     fn registers_a_command_and_the_action_is_callable() {

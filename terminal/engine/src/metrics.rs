@@ -148,11 +148,12 @@ impl TerminalMetrics {
     ///
     /// Clamped to at least 1x1 because a PTY with zero columns is not a smaller terminal, it is an
     /// invalid one -- and a pane briefly measures 0x0 during GTK's own layout, which would otherwise
-    /// send `TIOCSWINSZ` a size no child can cope with.
+    /// send `TIOCSWINSZ` a size no child can cope with. The upper bounds keep tiny cells or huge
+    /// surfaces from allocating an enormous grid.
     fn grid_for(width_px: f32, height_px: f32, cell_width: f32, cell_height: f32) -> (u16, u16) {
         let cols = (width_px / cell_width).floor().max(1.0);
         let rows = (height_px / cell_height).floor().max(1.0);
-        (cols.min(u16::MAX as f32) as u16, rows.min(u16::MAX as f32) as u16)
+        (cols.min(4096.0) as u16, rows.min(2048.0) as u16)
     }
 
     /// Recomputes the grid for a new pane size, keeping the same font. Returns whether the grid's
@@ -428,6 +429,17 @@ mod tests {
                 metrics.cell_width()
             );
         }
+    }
+
+    #[test]
+    fn regression_grid_dimensions_are_bounded_independently_of_font_and_pane() {
+        assert_eq!(TerminalMetrics::grid_for(800.0, 600.0, 0.001, 0.001), (4096, 2048));
+        assert_eq!(
+            TerminalMetrics::grid_for(f32::INFINITY, f32::INFINITY, 1.0, 1.0),
+            (4096, 2048)
+        );
+        assert_eq!(TerminalMetrics::grid_for(80.0, 24.0, 1.0, 1.0), (80, 24));
+        assert_eq!(TerminalMetrics::grid_for(0.0, 0.0, 1.0, 1.0), (1, 1));
     }
 
     #[test]

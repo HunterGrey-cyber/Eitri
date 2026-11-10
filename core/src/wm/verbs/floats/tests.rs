@@ -140,6 +140,23 @@ fn restack(ids: &[ModuleId]) -> HostOp {
 }
 
 #[test]
+fn regression_unnamed_scratch_show_ends_zoom_and_focuses_the_float() {
+    let editor = ModuleId::editor();
+    let terminal = ModuleId::terminal();
+    let mut l = floating(&editor, true);
+    l.toggle_zoom(&editor);
+    let r = driven(l, ModuleSetup::default());
+    let batch = r.run(Action::ScratchpadShow { module: None });
+    assert!(!r.layout.borrow().is_zoomed());
+    assert!(r.layout.borrow().is_visible(&terminal));
+    assert_eq!(r.layout.borrow().focus(), &terminal);
+    let ops = moves(&batch);
+    let mapped = ops.iter().position(|op| op == &map(&terminal)).unwrap();
+    let focused = ops.iter().position(|op| op == &focus(&terminal, true)).unwrap();
+    assert!(mapped < focused);
+}
+
+#[test]
 fn stowing_the_float_with_the_keys_gives_them_away_before_it_unmaps() {
     let terminal = ModuleId::terminal();
     for last in [ModuleId::agent(), ModuleId::editor()] {

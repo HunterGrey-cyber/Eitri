@@ -174,7 +174,7 @@ impl TmuxEnv {
     /// doc), whether or not they exist.
     pub fn config_files(&self) -> Vec<PathBuf> {
         let home = self.home.as_ref().map(|h| h.display().to_string());
-        let xdg = self.env.get("XDG_CONFIG_HOME");
+        let xdg = self.env.get("XDG_CONFIG_HOME").filter(|x| Path::new(x).is_absolute());
         let candidates = [
             Some(self.system_file.display().to_string()),
             home.as_ref().map(|h| format!("{h}/.tmux.conf")),

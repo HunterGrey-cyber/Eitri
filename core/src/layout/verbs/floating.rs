@@ -306,6 +306,9 @@ pub fn scratchpad_show(
         .map(|f| f.id.clone())
     {
         layout.raise(&id);
+        if layout.zoom_hides(&id) {
+            layout.unzoom();
+        }
         return Ok(ScratchShow::Raised(id));
     }
     if let Some(id) = layout

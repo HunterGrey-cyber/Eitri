@@ -159,7 +159,17 @@ pub fn resolve_panel_url(config_dir: &std::path::Path, raw: &str) -> String {
         raw.to_string()
     } else {
         let path = config_dir.join("panels").join(raw);
-        format!("file://{}", path.display())
+        use std::os::unix::ffi::OsStrExt;
+        let mut uri = String::from("file://");
+        for &byte in path.as_os_str().as_bytes() {
+            if byte.is_ascii_alphanumeric() || matches!(byte, b'/' | b'-' | b'.' | b'_' | b'~') {
+                uri.push(char::from(byte));
+            } else {
+                use std::fmt::Write;
+                write!(uri, "%{byte:02X}").expect("writing to a String");
+            }
+        }
+        uri
     }
 }
 
@@ -177,6 +187,29 @@ mod tests {
             key: None,
             url: format!("file:///{id}.html"),
         }
+    }
+
+    #[test]
+    fn regression_panel_file_urls_escape_path_bytes() {
+        use std::os::unix::ffi::OsStrExt;
+        let config = std::path::Path::new("/tmp/config dir");
+        assert_eq!(
+            resolve_panel_url(config, "notes#2.html"),
+            "file:///tmp/config%20dir/panels/notes%232.html"
+        );
+        assert_eq!(
+            resolve_panel_url(config, "a?b%é.html"),
+            "file:///tmp/config%20dir/panels/a%3Fb%25%C3%A9.html"
+        );
+        let bytes = std::ffi::OsStr::from_bytes(b"/tmp/config\xff");
+        assert_eq!(
+            resolve_panel_url(std::path::Path::new(bytes), "notes.html"),
+            "file:///tmp/config%FF/panels/notes.html"
+        );
+        assert_eq!(
+            resolve_panel_url(config, "https://example.com/a#b"),
+            "https://example.com/a#b"
+        );
     }
 
     #[test]

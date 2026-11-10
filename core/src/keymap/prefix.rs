@@ -324,6 +324,10 @@ impl Prefix {
     fn run_root(&mut self, action: Action, keycode: u32) -> Outcome {
         self.held = Some(keycode);
         match action {
+            Action::ModuleHideByKey if self.waits != ModuleWaits::Neither => {
+                self.state = State::AwaitHide;
+                Outcome::Swallow
+            }
             Action::Split { axis, cwd } => {
                 self.state = State::AwaitModule { axis, cwd };
                 Outcome::Swallow
@@ -1333,6 +1337,30 @@ mod tests {
     }
     fn with_root(ops: &[KeymapOp]) -> Prefix {
         with(Keymap::apply_user(ops, &[]).unwrap(), &[])
+    }
+
+    #[test]
+    fn regression_root_hide_by_key_waits_under_the_same_policy_as_prefix() {
+        for waits in [ModuleWaits::SplitAndHide, ModuleWaits::Hide, ModuleWaits::Neither] {
+            let mut p = with_root(&[root_op("M-F9", "module.hide-by-key")]);
+            p.set_module_waits(waits);
+            let t = Instant::now();
+            let result = p.press(key("M-F9"), K1, t);
+            if waits == ModuleWaits::Neither {
+                assert_eq!(result, run(Action::ModuleHideByKey));
+                assert_eq!(p.waiting(), Waiting::No);
+            } else {
+                assert_eq!(result, Outcome::Swallow);
+                assert_eq!(p.waiting(), Waiting::Hide);
+                p.release(K1);
+                assert_eq!(
+                    p.press(key("t"), K2, t),
+                    Outcome::Run(PrefixCommand::Hide {
+                        module: ModuleId::terminal()
+                    })
+                );
+            }
+        }
     }
 
     #[test]

@@ -64,6 +64,9 @@ pub const V1: u32 = 1;
 /// The version this build reads and writes, `<hash>.v2.json`. A file of any other version is not read.
 pub const V2: u32 = 2;
 
+/// Bounds state-file allocation before parsing, including whitespace and unknown fields.
+const MAX_LAYOUT_BYTES: u64 = 4 * 1024 * 1024;
+
 /// How long after the last change the file is written. In the window controller (`wm::persist::Saver`) only
 /// a change of the arrangement arms the timer, not a move of the keys; a change while it waits pushes
 /// back when it fires, and a timer that fires early is armed again for what is left rather than
@@ -1165,7 +1168,10 @@ pub fn read_v2_text(dir: &Path, project_root: &Path) -> std::io::Result<Option<S
 
 /// [`read_v2_text`] of the file of a window in `role`.
 pub fn read_v2_text_as(dir: &Path, project_root: &Path, role: Role) -> std::io::Result<Option<String>> {
-    match agent::private_fs::read_private_to_string(&dir.join(file_name_v2_as(project_root, role))) {
+    match agent::private_fs::read_private_to_string_capped(
+        &dir.join(file_name_v2_as(project_root, role)),
+        MAX_LAYOUT_BYTES,
+    ) {
         Ok(text) => Ok(Some(text)),
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
         Err(e) => Err(e),
@@ -1204,7 +1210,7 @@ pub fn load_as(dir: &Path, project_root: &Path, role: Role, lua: &[ModuleDecl], 
         };
     }
     let v1_path = dir.join(file_name(project_root));
-    let v1_why = match agent::private_fs::read_private_to_string(&v1_path) {
+    let v1_why = match agent::private_fs::read_private_to_string_capped(&v1_path, MAX_LAYOUT_BYTES) {
         Ok(text) => match decode_v1(&text, project_root, lua) {
             Ok(reconciled) => {
                 let mut notes = reconciled.notes;
@@ -1832,6 +1838,40 @@ mod tests {
         assert!(layout.zoomed().is_some());
         let back = decode_v2(&one(&layout), &root(), &lua).unwrap();
         assert_eq!(back.current.zoomed(), None);
+    }
+
+    #[test]
+    fn regression_oversized_layout_files_follow_the_unreadable_fallback() {
+        let dir = a_dir("layout-byte-cap");
+        let v2 = dir.join(file_name_v2(&root()));
+        let v1 = dir.join(file_name(&root()));
+        let pad = |mut text: String| {
+            text.push_str(&" ".repeat(5 * 1024 * 1024));
+            text
+        };
+        let legacy = serde_json::json!({
+            "version": 1, "project_root": root(), "focus": "editor", "hidden": [],
+            "root": {"type": "split", "axis": "row", "ratio": 0.5,
+                "first": {"type": "leaf", "module": "editor"},
+                "second": {"type": "leaf", "module": "agent"}}
+        })
+        .to_string();
+        assert!(decode_v1(&legacy, &root(), &[]).is_ok());
+        crate::test_scratch_dir::write_private(&v1, &legacy).unwrap();
+        crate::test_scratch_dir::write_private(&v2, pad(one(&plain()))).unwrap();
+        assert!(read_v2_text(&dir, &root()).is_err());
+        let Loaded::Migrated(back) = load(&dir, &root(), &[]) else {
+            panic!("must try v1")
+        };
+        assert!(back
+            .notes
+            .iter()
+            .any(|n| n.contains("byte cap") && n.contains(".v2.json")));
+        crate::test_scratch_dir::write_private(&v1, pad(legacy)).unwrap();
+        let Loaded::Unusable(why) = load(&dir, &root(), &[]) else {
+            panic!("both files exceed the cap")
+        };
+        assert!(why.contains("byte cap"), "{why}");
     }
 
     /// Every way a whole file can be unusable degrades to an `Err` that says why -- never a panic,

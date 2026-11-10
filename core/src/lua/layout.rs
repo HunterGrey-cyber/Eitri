@@ -763,9 +763,13 @@ pub fn parse_tree(value: &Value) -> Result<LuaTree, String> {
     let Value::Table(table) = value else {
         return Err(format!("expected a table, got {}", value.type_name()));
     };
-    let root = parse_node(table, "the tree", 1)?;
+    let mut tables = BTreeSet::new();
+    let root = parse_node(table, "the tree", 1, &mut tables)?;
     let node = spec::build(&root, &|name| ModuleId::parse(name).map_err(|e| e.to_string()))?.tiled;
-    let floats = parse_floats(table.raw_get::<Value>("floating").map_err(|e| e.to_string())?)?;
+    let floats = parse_floats(
+        table.raw_get::<Value>("floating").map_err(|e| e.to_string())?,
+        &mut tables,
+    )?;
     let leaves = node.leaves();
     let mut seen = BTreeSet::new();
     for id in leaves.iter().chain(floats.iter().map(|f| &f.id)) {
@@ -789,7 +793,7 @@ fn float_type_name(value: &Value) -> &str {
     }
 }
 
-fn parse_floats(value: Value) -> Result<Vec<Float>, String> {
+fn parse_floats(value: Value, tables: &mut BTreeSet<usize>) -> Result<Vec<Float>, String> {
     let table = match value {
         Value::Nil => return Ok(Vec::new()),
         Value::Table(table) => table,
@@ -800,6 +804,7 @@ fn parse_floats(value: Value) -> Result<Vec<Float>, String> {
             ))
         }
     };
+    visit_layout_table(&table, tables)?;
     let len = table.raw_len();
     for pair in table.clone().pairs::<Value, Value>() {
         let (key, _) = pair.map_err(|e| e.to_string())?;
@@ -814,6 +819,7 @@ fn parse_floats(value: Value) -> Result<Vec<Float>, String> {
             let Value::Table(entry) = value else {
                 return Err(format!("{at}: expected a table, got {}", float_type_name(&value)));
             };
+            visit_layout_table(&entry, tables)?;
             let head: Value = entry.raw_get(1).map_err(|e| e.to_string())?;
             let Value::String(head) = head else {
                 return Err(format!("{at}: the first item must be a module id"));
@@ -889,11 +895,24 @@ fn parse_float_rect(table: &Table, at: &str, id: Option<&ModuleId>) -> Result<Fl
     })
 }
 
+/// A layout is a tree, so each table is visited once and the total allocation is bounded.
+fn visit_layout_table(table: &Table, tables: &mut BTreeSet<usize>) -> Result<(), String> {
+    if tables.contains(&(table.to_pointer() as usize)) {
+        return Err("layout reuses a table; shared children and cycles are not allowed".into());
+    }
+    if tables.len() >= 4096 {
+        return Err("layout exceeds 4096 nodes".into());
+    }
+    tables.insert(table.to_pointer() as usize);
+    Ok(())
+}
+
 /// Reads Lua's representation without deciding container shares or module uniqueness.
-fn parse_node(table: &Table, at: &str, depth: usize) -> Result<SpecNode, String> {
+fn parse_node(table: &Table, at: &str, depth: usize, tables: &mut BTreeSet<usize>) -> Result<SpecNode, String> {
     if depth > 64 {
         return Err("layout nests deeper than 64 levels".to_string());
     }
+    visit_layout_table(table, tables)?;
     let head: Value = table.raw_get(1).map_err(|e| e.to_string())?;
     let Value::String(head) = head else {
         return Err(format!(
@@ -918,7 +937,7 @@ fn parse_node(table: &Table, at: &str, depth: usize) -> Result<SpecNode, String>
     };
     let children = (2..=len)
         .map(|i| match table.raw_get::<Value>(i) {
-            Ok(Value::Table(child)) => parse_node(&child, &format!("item {} of the {head}", i - 1), depth + 1),
+            Ok(Value::Table(child)) => parse_node(&child, &format!("item {} of the {head}", i - 1), depth + 1, tables),
             Ok(other) => Err(format!(
                 "item {} of the {head}: expected a table, got {}",
                 i - 1,
@@ -987,6 +1006,38 @@ fn share_of(value: Value, at: &str) -> Result<f64, String> {
 #[cfg(test)]
 mod tests {
     #[test]
+    fn regression_shared_layout_tables_are_refused_before_expansion() {
+        for call in ["eitri.layout.default(t)", "eitri.layout.workspace('review', t)"] {
+            for levels in [10, 40] {
+                let (lua, _) = engine();
+                let error = lua
+                    .load(format!(
+                        "local t = {{'editor'}}; for i = 1, {levels} do t = {{'row', t, t}} end; t = {{'row', t, {{'agent'}}}}; {call}"
+                    ))
+                    .exec()
+                    .unwrap_err()
+                    .to_string();
+                assert!(error.contains("layout reuses a table"), "{error}");
+            }
+        }
+    }
+
+    #[test]
+    fn regression_layout_node_budget_is_enforced_during_parsing() {
+        for call in ["eitri.layout.default(t)", "eitri.layout.workspace('review', t)"] {
+            let (lua, _) = engine();
+            let error = lua
+                .load(format!(
+                    "local t = {{'row'}}; for i = 1, 4096 do t[i+1] = {{'editor'}} end; {call}"
+                ))
+                .exec()
+                .unwrap_err()
+                .to_string();
+            assert!(error.contains("layout exceeds 4096 nodes"), "{error}");
+        }
+    }
+
+    #[test]
     fn a_layout_at_the_depth_limit_is_accepted_at_both_entry_points() {
         for call in ["eitri.layout.default(t)", "eitri.layout.workspace('review', t)"] {
             let (lua, _) = engine();
@@ -1001,13 +1052,16 @@ mod tests {
     #[test]
     fn cyclic_and_overdeep_layouts_are_lua_errors_at_both_entry_points() {
         for call in ["eitri.layout.default(t)", "eitri.layout.workspace('review', t)"] {
-            for setup in [
-                "local t = {'editor'}; for i = 1, 64 do t = {'row', t} end; ",
-                "local t = {'row'}; t[2] = t; ",
+            for (setup, why) in [
+                (
+                    "local t = {'editor'}; for i = 1, 64 do t = {'row', t} end; ",
+                    "layout nests deeper than 64 levels",
+                ),
+                ("local t = {'row'}; t[2] = t; ", "layout reuses a table"),
             ] {
                 let (lua, store) = engine();
                 let error = lua.load(format!("{setup}{call}")).exec().unwrap_err().to_string();
-                assert!(error.contains("layout nests deeper than 64 levels"), "{call}: {error}");
+                assert!(error.contains(why), "{call}: {error}");
                 assert!(error.contains(call.split('(').next().unwrap()), "{error}");
                 if call.contains("workspace") {
                     assert!(store.borrow().defined_workspaces()[0].1.is_err());

@@ -378,7 +378,7 @@ pub fn parse_terminal_font(value: Option<&str>) -> Result<Option<TerminalFontSet
         return Ok(None);
     };
     let invalid =
-        || format!("{TERMINAL_FONT_KEY:?} must name font families or a height in (0, 100] points (got {value:?})");
+        || format!("{TERMINAL_FONT_KEY:?} must name font families or a height in [4, 100] points (got {value:?})");
     let families = crate::theme::guifont_families(value);
     let height = value
         .split(':')
@@ -388,7 +388,7 @@ pub fn parse_terminal_font(value: Option<&str>) -> Result<Option<TerminalFontSet
     let size_px = match height {
         Some(height) => {
             let points = height.parse::<f32>().map_err(|_| invalid())?;
-            if !points.is_finite() || points <= 0.0 || points > 100.0 {
+            if !points.is_finite() || !(4.0..=100.0).contains(&points) {
                 return Err(invalid());
             }
             Some(if families.is_empty() {
@@ -677,6 +677,15 @@ mod tests {
             entries,
             [("a.number", "200"), ("m.switch", "false"), ("z.text", "word")]
         );
+    }
+
+    #[test]
+    fn regression_terminal_font_requires_at_least_four_points() {
+        for value in [":h0.001", "monospace:h3.99"] {
+            let error = parse_terminal_font(Some(value)).unwrap_err();
+            assert!(error.contains("4"), "{error}");
+        }
+        assert!(parse_terminal_font(Some(":h4")).is_ok());
     }
 
     #[test]
