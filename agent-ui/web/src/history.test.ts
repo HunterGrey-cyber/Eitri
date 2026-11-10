@@ -20,7 +20,7 @@ function notice(overrides: Partial<HistoryNotice> = {}): HistoryNotice {
 describe("historyNoticeText", () => {
   it("counts omitted ACP turns without describing them as records or a Claude transcript", () => {
     expect(historyNoticeText(notice({ source: "acp_replay", omittedTurns: 400, sourcePath: "" }))).toBe(
-      "Earlier messages in this session, replayed by the ACP agent. 400 earlier turns not loaded.",
+      "Earlier messages in this session, replayed by the agent. 400 earlier turns not loaded.",
     );
     expect(historyNoticeText(notice({ source: "acp_replay", omittedTurns: 1 }))).toContain("1 earlier turn not loaded.");
     expect(historyNoticeText(notice({ source: "acp_replay", omittedTurns: 0 }))).not.toContain("not loaded");

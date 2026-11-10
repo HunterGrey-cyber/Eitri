@@ -1841,14 +1841,14 @@ pub struct AgentSessionProjection {
     /// `throughRevision` reports, and what a later `events{fromRevision, throughRevision, ...}`
     /// batch continues from.
     pub last_revision: u64,
-    /// Set once, before any live event is folded, when a resumed conversation was seeded with what
-    /// it already said (`history::load`). `None` on every fresh session and on a resume that found
-    /// nothing to restore.
+    /// Describes history seeded before live ingestion: a file restore (`history::load`) or a bounded
+    /// ACP replay. ACP sets it only when turns were omitted. `None` on every fresh session, on a
+    /// resume that found nothing to restore, and on a complete ACP replay.
     ///
     /// **Not an item and not ordered.** It occupies no `seq`, is never produced by `apply`, and is
-    /// not part of the four collections -- it is one statement ABOUT them: how many of them came
-    /// off a disk, which disk, and where the live part starts (`upto_seq`). `apply` leaves it
-    /// exactly as it found it, which is what makes "the history notice describes the seed" true for
+    /// not part of the four collections -- it is one statement ABOUT them: how many were restored,
+    /// from which source, what was omitted, and where the live part starts (`upto_seq`). `apply` leaves
+    /// it exactly as it found it, which is what makes "the history notice describes the seed" true for
     /// the whole life of the projection rather than only at the moment of loading. The one fold
     /// that sets it is a move's [`AgentDomainEvent::MoveSeeded`], which carries the same notice the
     /// projection it was taken from had, about the same records.
@@ -1989,12 +1989,13 @@ fn push_bounded<T>(queue: &mut VecDeque<(String, T)>, id: &str, value: T) {
 /// How many refusals that arrived ahead of their call a projection holds at once.
 pub const MAX_HELD_DENIALS: usize = 64;
 
-/// Where a restored history was read from.
+/// Where a restored history came from.
 ///
-/// The distinction is user-facing on purpose: the two can genuinely differ -- Claude's
+/// The distinction is user-facing on purpose: the file sources can differ -- Claude's
 /// own transcript is what the CLI maintains and what a `claude --resume` in a terminal shows, while
 /// Eitri's copy is this side's unilateral record. A user with both open must be able to see at a
-/// glance which one the panel is showing, so this is never silently degraded.
+/// glance which one the panel is showing, so this is never silently degraded. ACP history comes
+/// from updates replayed by the agent, without a source file path.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum HistorySource {
@@ -2010,8 +2011,8 @@ pub enum HistorySource {
 ///
 /// Every field here answers a question a user can actually ask -- which conversation
 /// is this, where did it come from, is anything missing, and why am I looking at the fallback --
-/// and nothing here is decoration: this struct is the sole input to the notice row, which is
-/// rendered whenever history was restored at all, not only when it was truncated.
+/// and nothing here is decoration: this struct is the sole input to the notice row. File restores
+/// always carry a notice, including complete ones; ACP replay carries one only when turns were omitted.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct HistoryNotice {
     pub source: HistorySource,

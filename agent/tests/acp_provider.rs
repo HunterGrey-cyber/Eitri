@@ -1341,8 +1341,14 @@ fn load_replays_then_checks_mode() {
     );
     assert_eq!(seed.tool_calls.len(), 1);
     assert_eq!(seed.tool_calls[0].tool_use_id, "t1");
+    assert_eq!(seed.tool_calls[0].turn_id, "acp-history-1");
     assert_eq!(seed.tool_calls[0].name, "acp:read");
-    assert!(seed.tool_calls[0].result.is_some());
+    let result = seed.tool_calls[0].result.as_ref().expect("replayed tool result");
+    assert!(!result.is_error);
+    assert!(seed.user_prompts[0].seq < seed.transcript[0].seq);
+    assert!(seed.transcript[0].seq < seed.tool_calls[0].seq);
+    assert!(seed.tool_calls[0].seq < seed.user_prompts[1].seq);
+    assert!(seed.user_prompts[1].seq < seed.transcript[1].seq);
     assert!(seed.history.is_none());
     // Handed over once.
     assert!(provider.take_history().is_empty());

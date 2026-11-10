@@ -12,7 +12,8 @@ use crate::projection::{
 };
 use std::collections::VecDeque;
 
-/// Settled turns retained from a session replay, in addition to the turn being assembled.
+/// Settled turns retained from a session replay, in addition to the turn being assembled;
+/// the closed final turn counts toward it.
 pub const HISTORY_TURN_LIMIT: usize = 200;
 
 #[derive(Default)]
@@ -133,7 +134,9 @@ impl History {
                 writer_version: None,
             });
         }
-        vec![AgentDomainEvent::MoveSeeded(Box::new(self.projection.export_settled()))]
+        let seed = self.projection.export_settled();
+        debug_assert!(AgentSessionProjection::default().seed_fits(&seed).is_ok());
+        vec![AgentDomainEvent::MoveSeeded(Box::new(seed))]
     }
 }
 
@@ -221,7 +224,8 @@ mod tests {
             }
             history.apply(&Update::ToolCall(
                 ToolCallFields::parse(&json!({
-                    "toolCallId": format!("tool-{n}"), "kind": "read", "status": "completed"
+                    "toolCallId": format!("tool-{n}"), "kind": "read", "status": "completed",
+                    "rawOutput": format!("result {n}")
                 }))
                 .unwrap(),
             ));
@@ -237,6 +241,26 @@ mod tests {
             seed.tool_calls[0].tool_use_id,
             format!("tool-{}", 2 * HISTORY_TURN_LIMIT)
         );
+        assert_eq!(
+            seed.tool_calls[0].turn_id,
+            format!("acp-history-{}", 2 * HISTORY_TURN_LIMIT + 1)
+        );
+        let result = seed.tool_calls[0].result.as_ref().expect("retained tool result");
+        assert!(!result.is_error);
+        assert_eq!(result.content, json!(format!("result {}", 2 * HISTORY_TURN_LIMIT)));
+        let first = seed.user_prompts[0].seq;
+        assert!(seed
+            .user_prompts
+            .iter()
+            .map(|r| r.seq)
+            .chain(seed.transcript.iter().map(|r| r.seq))
+            .chain(seed.thinking.iter().map(|r| r.seq))
+            .chain(seed.tool_calls.iter().map(|r| r.seq))
+            .chain(seed.turn_endings.iter().map(|r| r.seq))
+            .chain(seed.turn_starts.iter().map(|r| r.seq))
+            .chain(seed.notices.iter().map(|r| r.seq))
+            .chain(seed.questions.iter().map(|r| r.seq))
+            .all(|seq| seq >= first));
     }
 
     #[test]

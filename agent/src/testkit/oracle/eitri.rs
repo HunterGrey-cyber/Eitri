@@ -233,6 +233,8 @@ pub fn read_e(events: &[AgentDomainEvent], projection: &AgentSessionProjection) 
         );
     }
 
+    // This oracle counts omitted items. ACP replay's exact omitted_turns uses a different unit;
+    // its omitted_items is None, so AcpReplay records an omission with no item count here.
     let omission = match &projection.history {
         None => Omission::None,
         Some(notice) => match notice.omitted_items {

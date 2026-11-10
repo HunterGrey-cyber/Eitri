@@ -29,7 +29,7 @@ function records(value: number): string {
 export function historyNoticeText(notice: HistoryNotice): string {
   if (notice.source === "acp_replay") {
     const omitted = notice.omittedTurns ?? 0;
-    return "Earlier messages in this session, replayed by the ACP agent." +
+    return "Earlier messages in this session, replayed by the agent." +
       (omitted > 0 ? ` ${count(omitted)} earlier ${omitted === 1 ? "turn" : "turns"} not loaded.` : "");
   }
   // `null` means "certainly omitted, not countable" (the scan started partway into a file too large
