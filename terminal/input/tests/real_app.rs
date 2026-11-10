@@ -27,6 +27,7 @@
 
 mod support;
 
+use std::ops::{Deref, DerefMut};
 use std::time::Duration;
 
 use alacritty_terminal::term::TermMode;
@@ -38,13 +39,71 @@ const SIZE: Size = Size { cols: 80, rows: 24 };
 const QUIET: Duration = Duration::from_millis(250);
 const DEADLINE: Duration = Duration::from_secs(8);
 
-fn base_env() -> Vec<(&'static str, &'static str)> {
-    vec![
-        ("TERM", "xterm-256color"),
-        ("PATH", "/usr/bin:/bin"),
-        ("HOME", "/tmp"),
-        ("LANG", "C.UTF-8"),
-    ]
+struct Fixture {
+    dir: tempfile::TempDir,
+    inputrc: String,
+    histfile: String,
+}
+
+impl Fixture {
+    fn new() -> Self {
+        // Spaces and shell metacharacters also exercise the positional output argument.
+        let dir = tempfile::Builder::new().prefix("terminal input '$ ").tempdir().unwrap();
+        let inputrc = dir.path().join("inputrc").to_str().unwrap().to_owned();
+        let histfile = dir.path().join("history").to_str().unwrap().to_owned();
+        std::fs::write(&inputrc, "").unwrap();
+        Self { dir, inputrc, histfile }
+    }
+
+    fn output(&self) -> String {
+        self.dir.path().join("selected.txt").to_str().unwrap().to_owned()
+    }
+
+    fn env(&self) -> Vec<(&str, &str)> {
+        vec![
+            ("TERM", "xterm-256color"),
+            ("PATH", "/usr/bin:/bin"),
+            ("HOME", self.dir.path().to_str().unwrap()),
+            ("LANG", "C.UTF-8"),
+            ("INPUTRC", &self.inputrc),
+            ("HISTFILE", &self.histfile),
+        ]
+    }
+}
+
+#[test]
+fn fixtures_isolate_home_readline_history_and_output() {
+    let one = Fixture::new();
+    let two = Fixture::new();
+    assert_ne!(one.output(), two.output());
+    for fixture in [&one, &two] {
+        let env = fixture.env();
+        let value = |key| env.iter().find(|(name, _)| *name == key).unwrap().1;
+        let home = std::path::Path::new(value("HOME"));
+        assert_eq!(home, fixture.dir.path());
+        assert!(std::path::Path::new(value("INPUTRC")).starts_with(home));
+        assert!(std::path::Path::new(value("HISTFILE")).starts_with(home));
+        assert_eq!(std::fs::read(value("INPUTRC")).unwrap(), b"");
+        assert!(!std::path::Path::new(value("HISTFILE")).exists());
+    }
+}
+
+struct FixtureApp {
+    app: App,
+    _fixture: Fixture,
+}
+
+impl Deref for FixtureApp {
+    type Target = App;
+    fn deref(&self) -> &App {
+        &self.app
+    }
+}
+
+impl DerefMut for FixtureApp {
+    fn deref_mut(&mut self) -> &mut App {
+        &mut self.app
+    }
 }
 
 fn down(key: Key<String>, mods: M) -> NormalizedInput {
@@ -75,20 +134,21 @@ fn type_str(app: &mut App, s: &str) {
     }
 }
 
-fn nvim(scratch: &str) -> App {
+fn nvim(scratch: &str) -> FixtureApp {
     nvim_with_kitty(scratch, true)
 }
 
 /// `kitty = false` makes the harness terminal refuse the kitty keyboard query, so
 /// nvim falls back to legacy keys.
-fn nvim_with_kitty(scratch: &str, kitty: bool) -> App {
-    let mut env = base_env();
+fn nvim_with_kitty(scratch: &str, kitty: bool) -> FixtureApp {
+    let fixture = Fixture::new();
+    let mut env = fixture.env();
     env.push(("NVIM_APPNAME", "terminal-input-test"));
     let _ = scratch;
     let mut app =
         App::launch_with_kitty("nvim", &["--clean", "-n", "-i", "NONE"], &env, SIZE, kitty).expect("spawn nvim");
     app.settle(QUIET, DEADLINE);
-    app
+    FixtureApp { app, _fixture: fixture }
 }
 
 // ===========================================================================
@@ -385,12 +445,13 @@ fn nvim_app_cursor_arrows_navigate() {
 // bash
 // ===========================================================================
 
-fn bash() -> App {
-    let mut env = base_env();
+fn bash() -> FixtureApp {
+    let fixture = Fixture::new();
+    let mut env = fixture.env();
     env.push(("PS1", "PROMPT> "));
     let mut app = App::launch("bash", &["--norc", "--noprofile", "-i"], &env, SIZE).expect("spawn bash");
     app.settle(QUIET, DEADLINE);
-    app
+    FixtureApp { app, _fixture: fixture }
 }
 
 #[test]
@@ -609,26 +670,32 @@ fn bracketed_paste_filtering_stops_a_paste_from_escaping_its_brackets() {
 // fzf
 // ===========================================================================
 
-fn scratch_path(name: &str) -> String {
-    let dir = std::env::var("TMPDIR").unwrap_or_else(|_| "/tmp".into());
-    format!("{dir}/terminal-input-{name}.txt")
-}
-
-fn fzf(out: &str) -> App {
-    let cmd = format!("printf 'alpha\\nbeta\\ngamma\\ndelta\\n' | fzf --no-mouse > {out}");
-    let mut env = base_env();
+fn fzf(fixture: Fixture) -> FixtureApp {
+    let out = fixture.output();
+    let mut env = fixture.env();
     env.push(("SHELL", "/bin/bash"));
-    let mut app = App::launch("bash", &["-c", &cmd], &env, SIZE).expect("spawn fzf");
+    let mut app = App::launch(
+        "sh",
+        &[
+            "-c",
+            "printf 'alpha\\nbeta\\ngamma\\ndelta\\n' | fzf --no-mouse > \"$1\"",
+            "sh",
+            &out,
+        ],
+        &env,
+        SIZE,
+    )
+    .expect("spawn fzf");
     app.settle(Duration::from_millis(400), DEADLINE);
-    app
+    FixtureApp { app, _fixture: fixture }
 }
 
 #[test]
 #[ignore = "drives real fzf on a real PTY"]
 fn fzf_arrows_move_the_selection_with_app_cursor_off() {
-    let out = scratch_path("fzf-csi");
-    let _ = std::fs::remove_file(&out);
-    let mut app = fzf(&out);
+    let fixture = Fixture::new();
+    let out = fixture.output();
+    let mut app = fzf(fixture);
     assert!(
         !app.screen.mode().contains(TermMode::APP_CURSOR),
         "fzf set DECCKM; the APP_CURSOR-off half of this test is void"
@@ -646,9 +713,9 @@ fn fzf_arrows_move_the_selection_with_app_cursor_off() {
     }
     keystroke(&mut app, Key::Named(N::Enter), M::empty());
     app.settle(Duration::from_millis(400), DEADLINE);
-    std::thread::sleep(Duration::from_millis(300));
+    assert_eq!(app.pty.wait_exit(Duration::from_secs(60)).code(), Some(0));
 
-    let selected = std::fs::read_to_string(&out).unwrap_or_default();
+    let selected = std::fs::read_to_string(&out).expect("read fzf output");
     eprintln!("fzf (CSI arrows) selected {selected:?}");
     assert_eq!(
         selected.trim(),
@@ -661,9 +728,9 @@ fn fzf_arrows_move_the_selection_with_app_cursor_off() {
 #[test]
 #[ignore = "drives real fzf on a real PTY"]
 fn fzf_arrows_move_the_selection_with_app_cursor_on() {
-    let out = scratch_path("fzf-ss3");
-    let _ = std::fs::remove_file(&out);
-    let mut app = fzf(&out);
+    let fixture = Fixture::new();
+    let out = fixture.output();
+    let mut app = fzf(fixture);
 
     // fzf does not set DECCKM, so force it: the claim under test is that the
     // bytes the encoder emits under DECCKM are bytes a real full-screen
@@ -680,9 +747,9 @@ fn fzf_arrows_move_the_selection_with_app_cursor_on() {
     }
     keystroke(&mut app, Key::Named(N::Enter), M::empty());
     app.settle(Duration::from_millis(400), DEADLINE);
-    std::thread::sleep(Duration::from_millis(300));
+    assert_eq!(app.pty.wait_exit(Duration::from_secs(60)).code(), Some(0));
 
-    let selected = std::fs::read_to_string(&out).unwrap_or_default();
+    let selected = std::fs::read_to_string(&out).expect("read fzf output");
     eprintln!("fzf (SS3 arrows) selected {selected:?}");
     assert_eq!(
         selected.trim(),
@@ -694,9 +761,9 @@ fn fzf_arrows_move_the_selection_with_app_cursor_on() {
 #[test]
 #[ignore = "drives real fzf on a real PTY"]
 fn fzf_ctrl_c_aborts_without_selecting() {
-    let out = scratch_path("fzf-ctrlc");
-    let _ = std::fs::remove_file(&out);
-    let mut app = fzf(&out);
+    let fixture = Fixture::new();
+    let out = fixture.output();
+    let mut app = fzf(fixture);
     assert!(app.screen.visible_lines().iter().any(|l| l.contains("alpha")));
 
     let bytes = app.send(&NormalizedInput::Key {
@@ -705,9 +772,9 @@ fn fzf_ctrl_c_aborts_without_selecting() {
     });
     assert_eq!(bytes, b"\x03");
     app.settle(Duration::from_millis(400), DEADLINE);
-    std::thread::sleep(Duration::from_millis(300));
+    assert_eq!(app.pty.wait_exit(Duration::from_secs(60)).code(), Some(130));
 
-    let selected = std::fs::read_to_string(&out).unwrap_or_default();
+    let selected = std::fs::read_to_string(&out).expect("read fzf output");
     eprintln!("fzf after Ctrl-C wrote {selected:?}");
     assert!(
         selected.trim().is_empty(),

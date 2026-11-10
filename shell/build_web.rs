@@ -31,6 +31,10 @@
 // `build.rs` and `tests/web_bundle_freshness.rs`, and each already imports all three at its own top
 // -- importing them a second time here would be a duplicate-import error (E0252), not merely dead
 // code, since `include!` splices this text into the very same module scope.
+mod node_cache {
+    include!("node_cache.rs");
+}
+
 use sha2::{Digest, Sha256};
 use std::fs;
 use std::io;
@@ -265,7 +269,7 @@ fn run(dir: &Path, program: &str, args: &[&str], override_dir: Option<&Path>) {
         Some(bin_dir) => bin_dir.join(program),
         None => PathBuf::from(program),
     };
-    let status = Command::new(&resolved)
+    let status = node_cache::command(&resolved, &node_cache::out_dir())
         .args(args)
         .current_dir(dir)
         .status()

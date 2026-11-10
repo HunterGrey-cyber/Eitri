@@ -184,61 +184,6 @@ fn hangup_ends_an_interactive_shell() {
     assert!(!status.success());
 }
 
-/// Reads the child's output until `needle` has appeared.
-#[cfg(target_os = "linux")]
-fn read_until(child: &mut PtyChild, needle: &str) {
-    let deadline = Instant::now() + common::WAIT;
-    let mut out = Vec::new();
-    let mut buf = [0u8; 4096];
-    while !String::from_utf8_lossy(&out).contains(needle) {
-        assert!(
-            Instant::now() < deadline,
-            "no {needle:?}; so far: {:?}",
-            String::from_utf8_lossy(&out)
-        );
-        match child.read(&mut buf) {
-            Ok(n) if n > 0 => out.extend_from_slice(&buf[..n]),
-            _ => std::thread::sleep(Duration::from_millis(5)),
-        }
-    }
-}
-
-/// Whether `pid` has disappeared from `/proc`: reaped. A zombie is still listed, so unlike
-/// `is_reaped` this never reaps anything itself -- it cannot mistake its own reaping for the code
-/// under test's.
-#[cfg(target_os = "linux")]
-fn gone(pid: u32) -> bool {
-    !std::path::Path::new(&format!("/proc/{pid}")).exists()
-}
-
-/// Dropping a `PtyChild` whose child still runs -- an early return after the spawn, a session
-/// thread that panicked -- must not leave a live shell or a zombie. `Drop` hangs it up and returns
-/// at once; a reaper kills it by its pid after the grace period (this child ignores SIGHUP) and
-/// reaps it.
-#[cfg(target_os = "linux")]
-#[test]
-fn dropping_a_running_child_hangs_it_up_and_reaps_it_off_thread() {
-    let mut child = PtyChild::spawn(
-        &spec("/bin/sh", &["-c", "trap '' HUP; printf ready; exec sleep 30"]),
-        size(80, 24),
-    )
-    .unwrap();
-    let pid = child.pid();
-    read_until(&mut child, "ready");
-    let started = Instant::now();
-    drop(child);
-    assert!(
-        started.elapsed() < Duration::from_millis(100),
-        "Drop waited: {:?}",
-        started.elapsed()
-    );
-    let deadline = Instant::now() + Duration::from_secs(2);
-    while !gone(pid) {
-        assert!(Instant::now() < deadline, "pid {pid} still exists 2 s after the drop");
-        std::thread::sleep(Duration::from_millis(20));
-    }
-}
-
 /// The shell inherits its terminal and nothing else: a descriptor this process opened without
 /// `O_CLOEXEC` -- a library's leak -- is closed when the shell execs.
 #[cfg(target_os = "linux")]

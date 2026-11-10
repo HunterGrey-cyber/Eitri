@@ -1676,43 +1676,17 @@ mod tests {
         }
     }
 
-    /// Snapshotting a full O(rows x cols) projection on every `FrameComplete` or end-of-read
-    /// `Wakeup` makes a plain flood pay one projection per PTY read even without synchronized
-    /// updates. Measured overhead was 2.6-7.6x. Feed 50,000 small (64-byte) chunks to mimic a
-    /// fast PTY reader's small reads (16-17 bytes per real read): `feed` must only do per-byte
-    /// bookkeeping, leaving projection to rendering instead of producing 50,000 full screens.
-    /// Ignored like `delta_equals_full` because a timing-sensitive test that takes several
-    /// seconds when broken costs too much in every debug workspace run. Run with
-    /// `cargo test -p eitri-terminal --lib -- --ignored`.
+    /// Plain output only parses bytes; full-grid projection belongs to rendering.
     #[test]
-    #[ignore = "timing-sensitive; run with --ignored to confirm no per-read projection cost"]
     fn feeding_a_plain_flood_pays_no_per_read_projection_cost() {
-        let mut screen = Screen::new(
-            PtySize {
-                cols: 200,
-                rows: 50,
-                cell_width_px: 9,
-                cell_height_px: 18,
-            },
-            TerminalColors::default(),
-        );
-        let chunk: Vec<u8> = b"the quick brown fox jumps over the lazy dog!!\r\n"
-            .iter()
-            .cycle()
-            .take(64)
-            .copied()
-            .collect();
-        let start = std::time::Instant::now();
-        for _ in 0..50_000 {
-            screen.feed(&chunk);
+        for chunks in [100, 400] {
+            let mut screen = Screen::new(SIZE, TerminalColors::default());
+            let before = screen.snapshots();
+            for _ in 0..chunks {
+                screen.feed(b"the quick brown fox jumps over the lazy dog!!\r\n");
+            }
+            assert_eq!(screen.snapshots(), before, "{chunks} reads projected a screen");
         }
-        let elapsed = start.elapsed();
-        assert!(
-            elapsed < std::time::Duration::from_millis(1500),
-            "feeding 50,000 plain 64-byte chunks (3.2 MB, no synchronized update at all) took \
-             {elapsed:?}; a per-read full-screen projection (the round-1 regression this guards \
-             against) would make this far slower"
-        );
     }
 
     #[test]

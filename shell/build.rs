@@ -24,6 +24,8 @@ include!("build_web.rs");
 fn main() {
     let workspace_root = Path::new(env!("CARGO_MANIFEST_DIR")).join("..");
     emit_build_info(&workspace_root);
+    println!("cargo:rerun-if-env-changed=NODE_COMPILE_CACHE");
+    println!("cargo:rerun-if-env-changed=NODE_DISABLE_COMPILE_CACHE");
 
     let web_dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("../agent-ui/web");
     // `CARGO_MANIFEST_DIR` is baked into THIS binary when the build script itself is compiled, so a

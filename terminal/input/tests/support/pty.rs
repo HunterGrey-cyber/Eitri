@@ -165,6 +165,17 @@ impl Pty {
         out
     }
 
+    pub fn wait_exit(&mut self, timeout: Duration) -> std::process::ExitStatus {
+        let deadline = Instant::now() + timeout;
+        loop {
+            if let Some(status) = self.child.try_wait().expect("wait for application") {
+                return status;
+            }
+            assert!(Instant::now() < deadline, "application did not exit");
+            std::thread::sleep(Duration::from_millis(5));
+        }
+    }
+
     pub fn kill(&mut self) {
         let _ = self.child.kill();
         let _ = self.child.wait();

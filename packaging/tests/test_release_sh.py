@@ -10,10 +10,13 @@ first container step -- which is the positive control: the same fixture, unbroke
 build. Scratch lives under ~/.cache, never /tmp.
 """
 
+import errno
 import hashlib
 import importlib.util
 import os
 import re
+import select
+import signal
 import shutil
 import shlex
 import subprocess
@@ -1478,22 +1481,7 @@ class PassphraseKeySigning(unittest.TestCase):
         pid, fd = pty.fork()
         if pid == 0:
             os.execvpe("ssh-add", ["ssh-add", self.key], dict(self.vars, SSH_AUTH_SOCK=sock))
-        seen = b""
-        deadline = time.time() + 30
-        sent = False
-        while time.time() < deadline:
-            try:
-                data = os.read(fd, 4096)
-            except OSError:
-                break
-            if not data:
-                break
-            seen += data
-            if not sent and b"passphrase" in seen:
-                time.sleep(0.2)
-                os.write(fd, b"testpass\n")
-                sent = True
-        _, status = os.waitpid(pid, 0)
+        status, seen = _answer_ssh_add(pid, fd, b"testpass\n")
         self.assertEqual(os.waitstatus_to_exitcode(status), 0, seen)
         proc = subprocess.run(["setsid", "-w", "bash", "-c", f'set -euo pipefail; source "{_RELEASE_SH}"; '
                                                             f'sign_sums "{self.key}" "{self.rel}"'],
@@ -1501,6 +1489,74 @@ class PassphraseKeySigning(unittest.TestCase):
                               cwd=self.scratch, stdin=subprocess.DEVNULL, timeout=60)
         self.assertEqual(proc.returncode, 0, proc.stderr)
         self.assertEqual(self.verify().returncode, 0)
+
+
+def _answer_ssh_add(pid, fd, answer, timeout=30):
+    """Read only when ready, and own both the child and PTY until completion or failure."""
+    seen = b""
+    deadline = time.monotonic() + timeout
+    sent = False
+    reaped = False
+    try:
+        while True:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise AssertionError("ssh-add timed out waiting for its prompt or exit")
+            if select.select([fd], [], [], remaining)[0]:
+                try:
+                    data = os.read(fd, 4096)
+                except OSError as error:
+                    if error.errno != errno.EIO:  # Linux PTY EOF is EIO.
+                        raise
+                    data = b""
+                seen += data
+                if not sent and b"passphrase" in seen:
+                    os.write(fd, answer)
+                    sent = True
+                if not data:
+                    time.sleep(min(0.01, remaining))
+            ended, status = os.waitpid(pid, os.WNOHANG)
+            if ended == pid:
+                reaped = True
+                return status, seen
+    finally:
+        try:
+            if not reaped:
+                try:
+                    os.kill(pid, signal.SIGKILL)
+                except ProcessLookupError:
+                    pass
+                os.waitpid(pid, 0)
+        finally:
+            os.close(fd)
+
+
+class SshAddReader(unittest.TestCase):
+    def test_a_silent_child_times_out_without_a_blocking_read_and_is_reaped(self):
+        from unittest.mock import patch
+        with patch("select.select", return_value=([], [], [])) as ready, \
+             patch("time.monotonic", side_effect=[0, 0, 31]), \
+             patch("os.read", side_effect=AssertionError("read without readiness")) as read, \
+             patch("os.waitpid", return_value=(0, 0)) as wait, \
+             patch("os.kill") as kill, patch("os.close") as close:
+            with self.assertRaisesRegex(AssertionError, "ssh-add timed out"):
+                _answer_ssh_add(123, 45, b"secret\n")
+            ready.assert_called_once_with([45], [], [], 30)
+            read.assert_not_called()
+            kill.assert_called_once_with(123, signal.SIGKILL)
+            self.assertEqual(wait.call_args_list[-1].args, (123, 0))
+            close.assert_called_once_with(45)
+
+    def test_a_prompt_is_answered_and_the_exit_status_is_returned(self):
+        from unittest.mock import patch
+        with patch("select.select", return_value=([45], [], [])), \
+             patch("os.read", return_value=b"passphrase: "), \
+             patch("os.write") as write, patch("os.waitpid", return_value=(123, 0)), \
+             patch("os.kill") as kill, patch("os.close") as close:
+            self.assertEqual(_answer_ssh_add(123, 45, b"secret\n"), (0, b"passphrase: "))
+            write.assert_called_once_with(45, b"secret\n")
+            kill.assert_not_called()
+            close.assert_called_once_with(45)
 
 
 class SignSumsRetries(unittest.TestCase):

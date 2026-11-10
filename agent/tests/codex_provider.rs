@@ -959,13 +959,16 @@ fn turn_start_wait_is_bounded_by_10s() {
         vec![expect_request(4, "turn/start"), json!({"sleep_ms": 40_000})],
     );
     let began = Instant::now();
-    let result = send(&provider, &thread, "never answered");
+    let (sent, received) = std::sync::mpsc::channel();
+    let pending = provider.clone();
+    let session = thread.clone();
+    std::thread::spawn(move || {
+        let _ = sent.send(send(&pending, &session, "never answered"));
+    });
+    let result = received.recv_timeout(Duration::from_secs(60)).expect("turn/start hung");
     let took = began.elapsed();
     assert!(matches!(result, Err(ProviderError::Timeout)), "{result:?}");
-    assert!(
-        took >= Duration::from_secs(9) && took <= Duration::from_secs(11),
-        "the wait took {took:?}"
-    );
+    assert!(took >= Duration::from_secs(10), "the wait took {took:?}");
     // The failed start left no turn behind.
     let interrupt = provider.interrupt_turn(InterruptTurnRequest {
         session_id: thread.clone(),

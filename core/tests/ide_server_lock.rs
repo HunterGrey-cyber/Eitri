@@ -72,11 +72,16 @@ impl Drop for Sleeper {
     }
 }
 
-/// The pid of a child already reaped.
+/// A positive pid_t above Linux's allocation ceiling, so no later fork can acquire it.
 fn dead_pid() -> u32 {
-    let mut child = Command::new("true").spawn().unwrap();
-    let pid = child.id();
-    child.wait().unwrap();
+    let pid = i32::MAX as u32;
+    let ceiling: u32 = fs::read_to_string("/proc/sys/kernel/pid_max")
+        .unwrap()
+        .trim()
+        .parse()
+        .unwrap();
+    assert!(pid > ceiling);
+    assert!(!agent::process_probe::pid_is_alive(pid));
     pid
 }
 

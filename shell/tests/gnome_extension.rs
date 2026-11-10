@@ -10,7 +10,9 @@
 
 use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
-use std::process::Command;
+mod node_cache {
+    include!("../node_cache.rs");
+}
 
 /// The four files the shell loads, in the order the installer lists them.
 const SHIPPED: [&str; 4] = ["metadata.json", "extension.js", "direction.js", "policy.js"];
@@ -110,7 +112,7 @@ fn release_check_files() -> BTreeSet<String> {
 fn the_extension_unit_tests_pass() {
     let dir = root().join("gnome-extension").join("test");
     assert!(dir.is_dir(), "{} is missing", dir.display());
-    let mut cmd = Command::new("node");
+    let mut cmd = node_cache::command("node", std::path::Path::new(env!("OUT_DIR")));
     cmd.args(["--test", "gnome-extension/test"]).current_dir(root());
     match cmd.output() {
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {

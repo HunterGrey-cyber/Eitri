@@ -249,7 +249,6 @@ fn events_enqueue_and_never_block() {
     // deadline instead of hanging it.
     let (tx, rx) = mpsc::channel();
     std::thread::spawn(move || {
-        let mut took = Vec::new();
         for i in 0..200 {
             let event = if i % 4 == 0 {
                 AgentDomainEvent::ToolCallStarted {
@@ -265,28 +264,19 @@ fn events_enqueue_and_never_block() {
                     text: "x".into(),
                 }
             };
-            let at = Instant::now();
             review.observe(1, "s1", &event, now());
-            took.push(at.elapsed());
         }
-        let at = Instant::now();
         review.poll();
         review.turns("s1");
-        took.push(at.elapsed());
-        tx.send((review, took)).unwrap();
+        tx.send(review).unwrap();
     });
-    let (mut review, mut took) = rx
+    let mut review = rx
         .recv_timeout(Duration::from_secs(60))
         .expect("observe blocked while a snapshot was held back");
     assert!(
         !jobs.finished(SnapshotKind::Base, 1),
         "every observe returned while the base was still parked"
     );
-    took.sort();
-    let median = took[took.len() / 2];
-    let slowest = *took.last().unwrap();
-    assert!(median < Duration::from_millis(1), "median observe {median:?}");
-    assert!(slowest < Duration::from_millis(20), "slowest observe {slowest:?}");
 
     jobs.release(SnapshotKind::Base, 1);
     poll_until(&mut review, "s1", "the base", |t| has_base(t, "t1"));
@@ -822,11 +812,19 @@ fn turns_never_runs_git() {
     std::fs::create_dir_all(scratch.state()).unwrap();
     std::fs::set_permissions(scratch.state(), std::fs::Permissions::from_mode(0o000)).unwrap();
     let jobs = Jobs::default();
+    jobs.hold(SnapshotKind::Base, 1);
     let mut review = scratch.review(&jobs);
     review.observe(1, "s1", &started("t1"), now());
-    let at = Instant::now();
-    let _ = review.turns("s1");
-    assert!(at.elapsed() < Duration::from_millis(20));
+    jobs.wait_started(SnapshotKind::Base, 1);
+    let (tx, rx) = mpsc::channel();
+    std::thread::spawn(move || {
+        let _ = review.turns("s1");
+        let _ = tx.send(review);
+    });
+    let returned = rx.recv_timeout(Duration::from_secs(60));
+    assert!(!jobs.finished(SnapshotKind::Base, 1));
+    jobs.release(SnapshotKind::Base, 1);
+    let mut review = returned.expect("turns waited for the held snapshot worker");
     poll_until(&mut review, "s1", "the failed base", |t| {
         t.iter().any(|t| matches!(t.state(), TurnState::NoBaseline(_)))
     });

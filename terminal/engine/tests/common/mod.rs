@@ -141,6 +141,13 @@ impl Harness {
         }
     }
 
+    /// Wait for a real host wake; the timeout only guards against a lost notification.
+    pub fn wait_for_wake(&self, timeout: Duration) {
+        self.woken
+            .recv_timeout(timeout)
+            .expect("the session did not wake the host");
+    }
+
     /// Wake-ups the session has rung since the last time this (or [`Harness::wait_for`]) drained
     /// the channel, counted without blocking. `wakes` only grows inside `wait_for`'s own
     /// `recv_timeout`, so a caller that wants a real host-wake measurement over a span with no

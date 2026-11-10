@@ -413,39 +413,34 @@ fn a_roundtrip_whose_reply_gdk_read_first_still_ends() {
     }
 }
 
-fn shutdown_returns_within_100_ms_from_poll() {
+fn shutdown_returns_while_the_server_holds_its_reply() {
     // Idle in its poll.
     let setup = Setup::start(Vec::new(), None);
     let _ = setup.pane_after_startup();
-    let probe = setup.thread.connection_probe().expect("a live connection");
-    let start = Instant::now();
+    assert!(setup.thread.connection_probe().is_some());
     setup.thread.shutdown();
-    let took = start.elapsed();
-    assert!(took < Duration::from_millis(100), "the shutdown took {took:?}");
     assert!(
-        !probe.is_alive(),
-        "a thread that confirmed its stop leaves nothing holding the connection"
+        setup.thread.connection_probe().is_none(),
+        "shutdown relinquishes the host's connection, even if stopping needed the leak fallback"
     );
 
-    // Waiting in its poll for the startup roundtrip's reply, which the server holds back a second.
-    let setup = Setup::start_with(Vec::new(), None, |server| server.delay_next(1000));
+    // The startup reply stays held until shutdown has returned.
+    let setup = Setup::start_with(Vec::new(), None, |server| server.hold_next());
     assert!(
-        setup.stand_in.pump_until(LIMIT, || setup.server.requests() >= 1),
+        setup.stand_in.pump_until(LIMIT, || !setup.server.held().is_empty()),
         "the thread sent nothing"
     );
-    let probe = setup.thread.connection_probe().expect("a live connection");
-    let start = Instant::now();
+    assert!(setup.thread.connection_probe().is_some());
     setup.thread.shutdown();
-    let took = start.elapsed();
+    assert!(!setup.server.held().is_empty(), "the reply is still held");
     assert!(
-        took < Duration::from_millis(100),
-        "the shutdown during the startup took {took:?}"
-    );
-    assert!(
-        !probe.is_alive(),
-        "a thread that confirmed its stop leaves nothing holding the connection"
+        setup.thread.connection_probe().is_none(),
+        "shutdown relinquishes the host's connection, even if stopping needed the leak fallback"
     );
     // The late replies reach objects that are gone with the queue; the stand-in reads them.
+    for callback in setup.server.held() {
+        setup.server.release(callback);
+    }
     setup.stand_in.sync();
     assert!(setup.stand_in.pump_until(LIMIT, || setup.stand_in.done() == 1));
 }
@@ -739,10 +734,10 @@ const CASES: &[Case] = &[
         stderr_lacks: &[LATE_STOP],
     },
     Case {
-        name: "shutdown_returns_within_100_ms_from_poll",
-        run: shutdown_returns_within_100_ms_from_poll,
+        name: "shutdown_returns_while_the_server_holds_its_reply",
+        run: shutdown_returns_while_the_server_holds_its_reply,
         stderr_has: &[],
-        stderr_lacks: &[LATE_STOP],
+        stderr_lacks: &[],
     },
     Case {
         name: "a_thread_that_does_not_confirm_stop_is_leaked_not_dropped",

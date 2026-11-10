@@ -698,6 +698,9 @@ pub(crate) fn install_reload_action(app: &Application, handle: &AgentPanelHandle
 
 #[cfg(test)]
 mod tests {
+    mod node_cache {
+        include!("../node_cache.rs");
+    }
     use super::*;
 
     #[test]
@@ -806,7 +809,7 @@ mod tests {
     #[test]
     fn a_throwing_dispatch_still_delivers_the_rest_and_reports_the_first_error() {
         let script = dispatch_script(&["first", "second", "third"]);
-        let result = std::process::Command::new("node")
+        let result = node_cache::command("node", std::path::Path::new(env!("OUT_DIR")))
             .arg("-e")
             .arg(
                 r#"

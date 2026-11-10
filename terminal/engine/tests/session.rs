@@ -2,6 +2,9 @@
 //! keys the other way; the answers a program waits for; and what idle costs.
 
 mod common;
+#[cfg(target_os = "linux")]
+#[path = "common/process_identity.rs"]
+mod process_identity;
 
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -174,19 +177,35 @@ fn an_osc52_selection_copy_reaches_the_host_apart_from_the_clipboard() {
 /// rings only for `clipboard`, a hidden terminal's `"*y` waits unseen until the next show.
 #[test]
 fn a_hidden_selection_copy_rings_the_host_like_a_clipboard_copy() {
-    let script = r#"stty -echo; printf ready; read _; printf '\033]52;s;aGk=\007'; exec sleep 5"#;
-    let mut h = Harness::start(spec("/bin/sh", &["-c", script]), size(40, 5));
+    let script = r#"stty -echo; printf ready; read _; printf '\033]52;s;aGk=\007'; read _"#;
+    let (arrived, arrival) = std::sync::mpsc::channel();
+    let (release, released) = std::sync::mpsc::channel();
+    let armed = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let tap_armed = armed.clone();
+    let mut h = Harness::start_with(SessionConfig {
+        spawn: spec("/bin/sh", &["-c", script]),
+        size: size(40, 5),
+        colors: TerminalColors::default(),
+        focused: true,
+        tap: Some(Box::new(move |_| {
+            if tap_armed.swap(false, std::sync::atomic::Ordering::SeqCst) {
+                let _ = arrived.send(());
+                released
+                    .recv_timeout(Duration::from_secs(60))
+                    .expect("release the copy read");
+            }
+        })),
+    });
     h.wait_for(WAIT, |h| h.text().first().is_some_and(|l| l.starts_with("ready")));
     h.session.send(SessionCommand::Visible(false));
-    std::thread::sleep(Duration::from_millis(50));
-    h.wait_for(WAIT, |_| true);
-    h.pending_wakes();
+    armed.store(true, std::sync::atomic::Ordering::SeqCst);
     h.type_str("\n");
-    std::thread::sleep(Duration::from_millis(400));
-    assert!(
-        h.pending_wakes() > 0,
-        "a hidden terminal's selection copy must ring the host"
-    );
+    arrival
+        .recv_timeout(Duration::from_secs(60))
+        .expect("the copy read arrived");
+    h.pending_wakes();
+    release.send(()).unwrap();
+    h.wait_for_wake(Duration::from_secs(60));
     h.wait_for(WAIT, |h| h.events.primary.is_some());
     assert_eq!(h.events.primary.as_deref(), Some("hi"));
 }
@@ -556,23 +575,28 @@ fn a_detached_childs_own_exit_reaches_the_host() {
 #[cfg(target_os = "linux")]
 #[test]
 fn a_panic_on_the_session_thread_ends_the_session_and_reaps_the_child() {
+    let (release, released) = std::sync::mpsc::channel();
     let mut h = Harness::start_with(SessionConfig {
         spawn: spec("/bin/sh", &["-c", "trap '' HUP; printf x; exec sleep 30"]),
         size: size(80, 5),
         colors: TerminalColors::default(),
         focused: true,
-        tap: Some(Box::new(|_: &[u8]| panic!("a tap that panics"))),
+        tap: Some(Box::new(move |_: &[u8]| {
+            released.recv_timeout(Duration::from_secs(60)).expect("release the tap");
+            panic!("a tap that panics");
+        })),
     });
-    let pid = h.session.pid();
+    let identity = process_identity::ProcessIdentity::capture(h.session.pid());
+    release.send(()).unwrap();
     h.wait_for(WAIT, |h| h.exited.is_some());
     assert!(
         h.text().iter().any(|l| l.contains("the terminal failed")),
         "{:?}",
         h.text()
     );
-    let deadline = Instant::now() + Duration::from_secs(2);
-    while std::path::Path::new(&format!("/proc/{pid}")).exists() {
-        assert!(Instant::now() < deadline, "pid {pid} still exists 2 s after the panic");
+    let deadline = Instant::now() + Duration::from_secs(60);
+    while !identity.is_reaped() {
+        assert!(Instant::now() < deadline, "the child was not reaped after the panic");
         std::thread::sleep(Duration::from_millis(20));
     }
 }
@@ -599,14 +623,17 @@ fn answers_to_a_program_that_never_reads_them_are_capped() {
 /// latest screen at once.
 #[test]
 fn a_hidden_terminal_renders_nothing_until_it_is_shown() {
-    let script = "stty -echo; printf ready; read _; seq 1 2000; exec sleep 30";
+    let script = "stty -echo; printf ready; read _; seq 1 2000; printf '\\033]0;consumed\\007'; read _";
     let mut h = Harness::start(spec("/bin/sh", &["-c", script]), size(40, 5));
     h.wait_for(WAIT, |h| h.text().first().is_some_and(|l| l.starts_with("ready")));
-    h.session.send(SessionCommand::Visible(false));
-    std::thread::sleep(Duration::from_millis(50));
     let before = h.session.renders();
+    h.session.send(SessionCommand::Visible(false));
     h.type_str("\n");
-    std::thread::sleep(Duration::from_millis(500));
+    let deadline = Instant::now() + Duration::from_secs(60);
+    while h.session.take_update().events.title.flatten().as_deref() != Some("consumed") {
+        assert!(Instant::now() < deadline, "the hidden session never consumed the flood");
+        std::thread::sleep(Duration::from_millis(5));
+    }
     assert_eq!(h.session.renders(), before, "2000 lines went by while hidden");
     h.session.send(SessionCommand::Visible(true));
     h.wait_for(WAIT, |h| h.has_line("2000"));

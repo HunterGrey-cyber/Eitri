@@ -510,6 +510,11 @@ impl Adopted {
     }
 }
 
+#[cfg(test)]
+thread_local! {
+    static REAPER_HOLD: std::cell::RefCell<Option<Box<dyn FnOnce() + Send>>> = Default::default();
+}
+
 impl Drop for PtyChild {
     /// A child nobody reaped: hang it up, and reap it off this thread -- killing it by its pid if it
     /// outlives [`HANGUP_GRACE`]. Already reaped (std keeps the status), or adopted for a move not
@@ -541,9 +546,17 @@ impl Drop for PtyChild {
             return;
         }
         let pid = self.pid() as libc::pid_t;
+        #[cfg(test)]
+        let hold = REAPER_HOLD.with(|hold| hold.borrow_mut().take());
         let reaper = std::thread::Builder::new()
             .name(format!("terminal-reap-{pid}"))
-            .spawn(move || reap_after_grace(pid));
+            .spawn(move || {
+                #[cfg(test)]
+                if let Some(hold) = hold {
+                    hold();
+                }
+                reap_after_grace(pid);
+            });
         if let Err(err) = reaper {
             eprintln!("[terminal] could not start a reaper for pid {pid}: {err}; it stays a zombie");
         }
@@ -657,6 +670,67 @@ pub(crate) fn set_nonblocking(fd: BorrowedFd<'_>) -> io::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(target_os = "linux")]
+    mod process_identity {
+        include!(concat!(env!("CARGO_MANIFEST_DIR"), "/tests/common/process_identity.rs"));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn dropping_a_running_child_hangs_it_up_and_reaps_it_off_thread() {
+        use std::sync::mpsc;
+        let mut spec = SpawnSpec::shell("/bin/sh".into(), std::env::temp_dir());
+        spec.args = vec!["-c".into(), "trap '' HUP; printf ready; read _".into()];
+        let mut child = PtyChild::spawn(
+            &spec,
+            PtySize {
+                cols: 80,
+                rows: 24,
+                cell_width_px: 9,
+                cell_height_px: 18,
+            },
+        )
+        .unwrap();
+        let identity = process_identity::ProcessIdentity::capture(child.pid());
+        let deadline = Instant::now() + Duration::from_secs(60);
+        let mut bytes = Vec::new();
+        while !bytes.windows(5).any(|w| w == b"ready") {
+            let mut buf = [0; 128];
+            if let Ok(n) = child.read(&mut buf) {
+                bytes.extend_from_slice(&buf[..n]);
+            }
+            assert!(Instant::now() < deadline, "the child never became ready");
+            std::thread::yield_now();
+        }
+        let (parked, parking) = mpsc::channel();
+        let (release, released) = mpsc::channel();
+        let (returned, returning) = mpsc::channel();
+        std::thread::spawn(move || {
+            REAPER_HOLD.with(|hold| {
+                *hold.borrow_mut() = Some(Box::new(move || {
+                    let _ = parked.send(());
+                    released
+                        .recv_timeout(Duration::from_secs(60))
+                        .expect("release the reaper");
+                }))
+            });
+            drop(child);
+            let _ = returned.send(());
+        });
+        parking
+            .recv_timeout(Duration::from_secs(60))
+            .expect("the reaper parked");
+        let result = returning.recv_timeout(Duration::from_secs(60));
+        assert!(!identity.is_reaped(), "the held reaper has not reaped the child");
+        let _ = release.send(());
+        result.expect("Drop waited for the held reaper");
+        let deadline = Instant::now() + Duration::from_secs(60);
+        while !identity.is_reaped() {
+            assert!(Instant::now() < deadline, "the child was not reaped");
+            std::thread::sleep(Duration::from_millis(5));
+        }
+    }
 
     fn os(pairs: &[(&str, &str)]) -> Vec<(OsString, OsString)> {
         pairs

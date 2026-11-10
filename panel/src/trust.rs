@@ -1392,16 +1392,19 @@ mod tests {
         fx.write(PROJECT_SETTINGS, &session_start_hook("touch /tmp/never"));
         std::fs::create_dir_all(fx.state.join("eitri")).unwrap();
         std::fs::write(fx.state.join("eitri/trust"), b"not a directory\n").unwrap();
+        let hold = crate::trust_gate::WorkerHold::default();
+        let home = fx.root.parent().unwrap().to_path_buf();
+        let store = eitri_core::project_trust::TrustStore::new(Some(fx.state.as_os_str()), Some(home.as_os_str()));
+        state.borrow_mut().trust = TrustGate::new_held(store, fx.root.clone(), Some(home), hold.clone());
         let tab = state.borrow().tabs.active();
         gate_start(&mut state.borrow_mut(), tab, first_send("r1", "hello")).unwrap();
         let prompt = next_prompt(&state);
 
-        let began = std::time::Instant::now();
+        hold.close();
         let out = answer_prompt(&state, "a1", &prompt, true);
-        assert!(
-            began.elapsed() < std::time::Duration::from_millis(50),
-            "the handler only queues"
-        );
+        assert!(!hold.timed_out(), "the handler waited for the held worker");
+        assert!(fx.spawned.borrow().is_empty());
+        hold.open();
         assert_eq!(result_for(&out.payloads(), "a1"), Some(Ok(())));
 
         let seen = tick_until(&state, |seen| !prompts(&all_payloads(seen)).is_empty());

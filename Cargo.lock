@@ -4616,6 +4616,7 @@ dependencies = [
  "alacritty_terminal",
  "bitflags 2.13.1",
  "libc",
+ "tempfile",
 ]
 
 [[package]]
