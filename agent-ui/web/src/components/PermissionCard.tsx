@@ -171,6 +171,7 @@ export function PermissionCard({
           </button>
         )}
       </div>}
+      {controls && answered && !sessionEnded && <div className="permission-card-stale">Sending answer…</div>}
       {sessionEnded && !answered && (
         <div className="permission-card-stale">
           This session ended before the request was answered, so it can no longer be allowed or denied.

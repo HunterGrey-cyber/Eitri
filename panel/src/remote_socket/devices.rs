@@ -202,6 +202,24 @@ fn refusal_word(why: &str) -> &'static str {
 struct Listing {
     running: bool,
     again: bool,
+    generation: u64,
+    shown: u64,
+}
+
+impl Listing {
+    fn take_generation(&mut self, generation: u64) -> bool {
+        if generation < self.shown {
+            return false;
+        }
+        self.shown = generation;
+        true
+    }
+}
+
+fn show_listed(listing: &Mutex<Listing>, handle: &AgentPanelHandle, generation: u64, rows: &[DeviceRow]) {
+    if lock(listing).take_generation(generation) {
+        handle.run(|state, out| show_devices(state, rows, out));
+    }
 }
 
 /// What the errands share across the accepting, reading and writing threads.
@@ -277,7 +295,7 @@ pub(super) enum DevicesInbound {
     /// The device whose token was checked names its push endpoint, already checked.
     SetPushEndpoint { device: String, url: Secret },
     /// The device list, read for the base page.
-    Listed(Vec<DeviceRow>),
+    Listed(u64, Vec<DeviceRow>),
     /// The base page is to be asked whether to revoke a device.
     AskRevoke(RevokeAsk),
     /// `serve`'s report was written: the devices with no desk's yes not shown before in this process (`(id, name)`),
@@ -476,7 +494,7 @@ pub(super) fn device_rows(store: &Path) -> DevicesInbound {
             records: records.remove(&d.id).unwrap_or_default(),
         })
         .collect();
-    DevicesInbound::Listed(rows)
+    DevicesInbound::Listed(0, rows)
 }
 
 /// The newest records about each of `devices` in the log at `dir`, each as the page draws it, from one read of the
@@ -677,7 +695,9 @@ struct ListingReset<'a>(&'a Mutex<Listing>);
 impl Drop for ListingReset<'_> {
     fn drop(&mut self) {
         if std::thread::panicking() {
-            *lock(self.0) = Listing::default();
+            let mut listing = lock(self.0);
+            listing.running = false;
+            listing.again = false;
         }
     }
 }
@@ -698,7 +718,15 @@ fn list_off_the_tick(shared: Arc<Shared>) {
     let started = started_off_the_tick(shared, DESK, |shared| loop {
         let _reset = ListingReset(&shared.devices.listing);
         let read = Arc::clone(&*lock(&shared.devices.list_reader));
-        let line = read(&shared.store);
+        let generation = {
+            let mut listing = lock(&shared.devices.listing);
+            listing.generation += 1;
+            listing.generation
+        };
+        let line = match read(&shared.store) {
+            DevicesInbound::Listed(_, rows) => DevicesInbound::Listed(generation, rows),
+            other => other,
+        };
         let mut listing = lock(&shared.devices.listing);
         if std::mem::take(&mut listing.again) {
             continue;
@@ -707,7 +735,9 @@ fn list_off_the_tick(shared: Arc<Shared>) {
         return line;
     });
     if !started {
-        *lock(&mine.devices.listing) = Listing::default();
+        let mut listing = lock(&mine.devices.listing);
+        listing.running = false;
+        listing.again = false;
     }
 }
 
@@ -976,7 +1006,9 @@ impl RemoteSocket {
             }
             DevicesInbound::Refused(why) => self.answer(conn, refused_line(None, why)),
             DevicesInbound::Done(outcome) => self.answer(conn, result_line(None, outcome)),
-            DevicesInbound::Listed(rows) => handle.run(|state, out| show_devices(state, &rows, out)),
+            DevicesInbound::Listed(generation, rows) => {
+                show_listed(&self.shared.devices.listing, handle, generation, &rows);
+            }
             DevicesInbound::AskRevoke(ask) => {
                 let shared = Arc::clone(&self.shared);
                 let asked = ask.clone();

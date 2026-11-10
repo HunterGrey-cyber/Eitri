@@ -2131,6 +2131,24 @@ impl AgentProvider for ClaudeSidecarProvider {
         Ok(())
     }
 
+    fn resolve_permission_async(
+        &self,
+        request: ResolvePermissionRequest,
+    ) -> Result<crate::InteractionSend, ProviderError> {
+        self.require_driving()?;
+        let mut client = self.client.clone();
+        let request = resolve_request_for(&self.capabilities, request)?;
+        let answering = Answering::begin(&self.events);
+        let send = permission_send(self.runtime.handle(), UNARY_RPC_TIMEOUT, async move {
+            client
+                .resolve_permission(request)
+                .await
+                .map(|_| None)
+                .map_err(map_status)
+        });
+        Ok(send.with_guard(answering))
+    }
+
     /// One `ResolveInteraction`, spawned on the provider's runtime and bounded by `UNARY_RPC_TIMEOUT`;
     /// the caller is never kept waiting for the sidecar (the person's answer comes from the GTK
     /// thread). Refused here, with nothing sent, on a sidecar that does not offer questions. Until
@@ -2937,6 +2955,29 @@ fn answer_request_for(
     request
 }
 
+/// Sends a permission answer on the runtime and cancels the RPC before reporting a timeout.
+fn permission_send(
+    runtime: &tokio::runtime::Handle,
+    timeout: Duration,
+    future: impl std::future::Future<Output = crate::InteractionReply> + Send + 'static,
+) -> crate::InteractionSend {
+    let (tx, send) = crate::InteractionSend::channel();
+    let mut call = runtime.spawn(future);
+    runtime.spawn(async move {
+        let reply = match tokio::time::timeout(timeout, &mut call).await {
+            Ok(Ok(reply)) => reply,
+            Ok(Err(error)) => Err(ProviderError::Transport(error.to_string())),
+            Err(_) => {
+                call.abort();
+                let _ = call.await;
+                Err(ProviderError::Timeout)
+            }
+        };
+        let _ = tx.send(reply);
+    });
+    send
+}
+
 /// Whether a failed answer is one the host has nothing to learn from: a first answer won, the call
 /// settled some other way, or the session closed, each of which ended the call the answer was for.
 fn answer_refusal_is_ordinary(failure: &ProviderError) -> bool {
@@ -3178,6 +3219,28 @@ pub fn replay_frames(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn permission_timeout_aborts_the_call_before_reporting_failure() {
+        struct Dropped(std::sync::mpsc::Sender<()>);
+        impl Drop for Dropped {
+            fn drop(&mut self) {
+                let _ = self.0.send(());
+            }
+        }
+        let runtime = RuntimeThread::spawn();
+        let (dropped, was_dropped) = std::sync::mpsc::channel();
+        let (release, held) = tokio::sync::oneshot::channel::<()>();
+        let guard = Dropped(dropped);
+        let send = permission_send(runtime.handle(), Duration::ZERO, async move {
+            let _guard = guard;
+            let _ = held.await;
+            Ok(None)
+        });
+        assert!(matches!(send.wait(Duration::from_secs(5)), Err(ProviderError::Timeout)));
+        assert!(was_dropped.try_recv().is_ok(), "cancelled before reporting timeout");
+        assert!(release.send(()).is_err(), "a late reply cannot resume the call");
+    }
 
     #[test]
     fn question_readiness_override_replaces_only_the_host_side() {

@@ -531,14 +531,15 @@ pub struct SessionState {
     /// The calls the user approved on a card in this tab, this turn, each with the tool and input the
     /// card showed: the CLI's own prompt for exactly such a call, which follows the gate's request
     /// for it, is answered `allow` without a second card, once, as the real CLI asks once. Written
-    /// only by `TabSet::answer_card` on an Approve that reached the provider; emptied when the turn
+    /// only when a card's Approve acknowledgement is read; emptied when the turn
     /// ends (the CLI asks within the turn that made the call), on every `Resync` (one can swallow a
     /// turn boundary), on a start-over and with the backend. Private for the reason `host_answered`
     /// is.
     human_allowed: crate::agent_backend::HumanApprovals,
-    /// Permission ids the user answered on a card here (any decision) that the projection still lists
-    /// as pending, on the sidecar path until the provider's own `PermissionResolved` arrives. A rule
-    /// is never offered for one again and [`Tab::card_is_waiting`] says no, so a second response for
+    /// Permission ids the user answered on a card here (any decision), including sends awaiting an
+    /// acknowledgement, that the projection still lists as pending. A failed send removes its id;
+    /// a successful one stays until the provider's own `PermissionResolved` arrives. A rule
+    /// is not offered while an id is here and [`Tab::card_is_waiting`] says no, so a second response for
     /// the same id (a replay after a tab switch or a page reload) can never save a rule; removing the
     /// offer once was not enough, as the next pump that saw another id arrive put it back. Pruned
     /// with `host_answered` once the id leaves the projection. Private for the reason
@@ -3102,6 +3103,30 @@ impl TabSet {
         permission_id: &str,
         decision: agent::PermissionDecision,
     ) -> Result<(), BackendError> {
+        let send = self.start_card_answer(id, page, permission_id, decision, false)?;
+        self.finish_card_answer(id, &send)
+            .expect("synchronous answer has replied")
+    }
+
+    /// Starts an answer and keeps its card inert until the tick reads the acknowledgement.
+    pub fn answer_card_async(
+        &mut self,
+        id: TabId,
+        page: ViewId,
+        permission_id: &str,
+        decision: agent::PermissionDecision,
+    ) -> Result<PermissionSend, BackendError> {
+        self.start_card_answer(id, page, permission_id, decision, true)
+    }
+
+    fn start_card_answer(
+        &mut self,
+        id: TabId,
+        page: ViewId,
+        permission_id: &str,
+        decision: agent::PermissionDecision,
+        asynchronous: bool,
+    ) -> Result<PermissionSend, BackendError> {
         let no_session = || BackendError {
             message: "no active session".to_string(),
             benign: true,
@@ -3123,6 +3148,13 @@ impl TabSet {
             }
         }
         let tab = self.get_mut(id).ok_or_else(no_session)?;
+        if tab.session.user_answered.contains(permission_id) {
+            return Err(BackendError {
+                message: "this request was already answered".into(),
+                benign: true,
+            });
+        }
+        let generation = tab.backend_generation;
         let backend = tab.live_mut().ok_or_else(no_session)?;
         // The call exactly as the card showed it: id, tool and input, so the approval answers that call only.
         let call: Option<(String, String, serde_json::Value)> = backend
@@ -3134,18 +3166,52 @@ impl TabSet {
                 Some((id, p.tool_name.clone(), p.input.clone()))
             });
         let approves = decision.allows();
-        backend.respond_permission(permission_id, decision)?;
-        if approves {
-            if let Some((tool_use_id, tool_name, input)) = call {
-                tab.session.human_allowed.record(&tool_use_id, &tool_name, &input);
+        let turn_id = backend.projection().active_turn_id.clone();
+        let send = if asynchronous {
+            backend.respond_permission_async(permission_id, decision)?
+        } else {
+            backend.respond_permission(permission_id, decision)?;
+            agent::InteractionSend::ready(Ok(None))
+        };
+        let offer = tab.session.rule_offers.remove(permission_id);
+        tab.session.user_answered.insert(permission_id.to_string());
+        Ok(PermissionSend {
+            permission_id: permission_id.into(),
+            generation,
+            turn_id,
+            send,
+            call: call.filter(|_| approves),
+            offer,
+        })
+    }
+
+    /// Applies a reply only to the session that sent it. Failures leave the card answerable again.
+    pub fn finish_card_answer(&mut self, id: TabId, send: &PermissionSend) -> Option<Result<(), BackendError>> {
+        let reply = send.send.try_reply()?.map(|_| ()).map_err(|error| BackendError {
+            message: match error {
+                agent::ProviderError::Provider { message, .. } => message,
+                other => format!("the answer may not have reached the agent ({other}); the request is waiting again"),
+            },
+            benign: true,
+        });
+        if let Some(tab) = self.get_mut(id).filter(|tab| tab.backend_generation == send.generation) {
+            if reply.is_ok() {
+                if let Some((tool_use_id, tool_name, input)) = send.call.as_ref().filter(|_| {
+                    tab.live()
+                        .is_some_and(|b| b.projection().active_turn_id == send.turn_id)
+                }) {
+                    tab.session.human_allowed.record(tool_use_id, tool_name, input);
+                }
+            } else {
+                tab.session.user_answered.remove(&send.permission_id);
+                if let Some(offer) = &send.offer {
+                    tab.session
+                        .rule_offers
+                        .insert(send.permission_id.clone(), offer.clone());
+                }
             }
         }
-        // The card is answered, whatever the decision, so its rule
-        // offer goes now and is never made again (`user_answered`'s doc). Only on success: a refused
-        // answer leaves the card open and its offer with it.
-        tab.session.rule_offers.remove(permission_id);
-        tab.session.user_answered.insert(permission_id.to_string());
-        Ok(())
+        Some(reply)
     }
 
     /// Answers Claude's question set `interaction_id` in tab `id` from `page`
@@ -3836,7 +3902,9 @@ impl TabSet {
                 if live.mode == SessionModeChoice::Bypass {
                     let sweep: Vec<String> = pending
                         .iter()
-                        .filter(|id| !live.session.host_answered.contains(*id))
+                        .filter(|id| {
+                            !live.session.host_answered.contains(*id) && !live.session.user_answered.contains(*id)
+                        })
                         .cloned()
                         .collect();
                     // The events (legacy's own resolutions) are not needed here: the snapshot is read
@@ -6596,7 +6664,8 @@ fn note_new_files(
 /// Only `projection()` is read, once, and released before anything else is touched.
 /// The delivered cards this tab could approve right now: its own attention
 /// tray, intersected with the projection's still-pending ids and with anything it has not already
-/// host-answered, `seq`-ordered (the order the panel shows them in). The CLI's own prompts are among
+/// host- or human-answered (including answers in flight), `seq`-ordered (the order the panel shows
+/// them in). The CLI's own prompts are among
 /// them whatever they say about why they asked: bypass approves every card. Empty unless the tab is
 /// `Live` -- a `NotStarted`/`Starting`/`Failed` tab has no session to hold a pending request at all.
 ///
@@ -6615,7 +6684,11 @@ fn waiting_cards(tab: &Tab) -> Vec<String> {
         projection
             .pending_permissions
             .values()
-            .filter(|p| cards.contains(&p.permission_id) && !tab.session.host_answered.contains(&p.permission_id))
+            .filter(|p| {
+                cards.contains(&p.permission_id)
+                    && !tab.session.host_answered.contains(&p.permission_id)
+                    && !tab.session.user_answered.contains(&p.permission_id)
+            })
             .map(|p| (p.seq, p.permission_id.clone()))
             .collect()
     };
@@ -6864,4 +6937,15 @@ fn wall_clock_ms() -> u64 {
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_millis() as u64)
         .unwrap_or(0)
+}
+
+/// A permission answer and the card facts held until its acknowledgement is read.
+#[derive(Debug)]
+pub struct PermissionSend {
+    permission_id: String,
+    generation: u64,
+    turn_id: Option<String>,
+    send: agent::InteractionSend,
+    call: Option<(String, String, serde_json::Value)>,
+    offer: Option<agent::PrefixRule>,
 }

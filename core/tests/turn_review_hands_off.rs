@@ -288,7 +288,10 @@ fn the_permission_and_send_paths_never_read_review_state() {
 
     let tabs = read("src/tab_set.rs");
     for (name, anchor) in [
-        ("answer_card", "respond_permission"),
+        ("answer_card", "start_card_answer"),
+        ("answer_card_async", "start_card_answer"),
+        ("start_card_answer", "respond_permission"),
+        ("finish_card_answer", "human_allowed"),
         ("confirm_bypass", "approve_pending"),
         ("flush_queue", "send_when_allowed"),
         // The one function every turn goes out through, and the one message it sends on its own.
@@ -323,7 +326,12 @@ fn the_permission_and_send_paths_never_read_review_state() {
     check(
         "agent_panel's answer_permission_response",
         &functions(&panel, "answer_permission_response"),
-        "answer_card",
+        "answer_card_async",
+    );
+    check(
+        "agent_panel's poll_permission_sends",
+        &functions(&panel, "poll_permission_sends"),
+        "finish_card_answer",
     );
     check(
         "agent_panel's apply_confirm_bypass",

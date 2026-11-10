@@ -262,6 +262,7 @@ pub(super) fn panel_tab_handoff(state: &AgentPanelState, tab: TabId) -> Result<P
         toast_hook: _,
         warning_hook: _,
         startup_problems: _,
+        permission_sends: _,
         trust: _,
         spawner: _,
         // The window's own questions about remote control, asked in its base page.

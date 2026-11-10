@@ -1577,9 +1577,12 @@ export default function App() {
   useEffect(() => {
     const pending = new Set(allCards({ pendingPermissions: heldCards, editorCards: heldEditorCards }).map((p) => p.permissionId));
     for (const id of permissionReasons.current.keys()) if (!pending.has(id)) permissionReasons.current.delete(id);
-    const kept = [...answeredRef.current].filter((id) => pending.has(id));
-    if (kept.length === answeredRef.current.size) return;
-    answeredRef.current = new Set(kept);
+    const kept = new Set([...answeredRef.current].filter((id) => pending.has(id)));
+    for (const record of pageRef.current.inFlight.values()) {
+      if (record.kind === "permission" && record.tab === activeTabRef.current && record.permissionId && pending.has(record.permissionId)) kept.add(record.permissionId);
+    }
+    if (kept.size === answeredRef.current.size && [...kept].every((id) => answeredRef.current.has(id))) return;
+    answeredRef.current = kept;
     setAnsweredPermissions(answeredRef.current);
   }, [heldCards, heldEditorCards]);
   /** The typing guard (`./typingGuard`): every keydown `onKeyDown` sees is fed to it first; `a`/`d`/

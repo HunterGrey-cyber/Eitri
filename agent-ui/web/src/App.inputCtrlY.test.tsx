@@ -10,7 +10,7 @@
 import { afterEach, beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
 import { act, cleanup, fireEvent, render } from "@testing-library/react";
 import App from "./App";
-import { initialState } from "./reducer";
+import { applyEvent, initialState } from "./reducer";
 import type { AgentDomainEvent, AgentUiState, EditorCardWire, Hello } from "./types";
 import { EMPTY_PANEL_TABLE } from "./keymap";
 import { RELEASE_WAIT_MAX_MS, TYPING_GUARD_MS } from "./typingGuard";
@@ -197,6 +197,22 @@ describe("INPUT Ctrl+y approves the active tab's oldest waiting card", () => {
   afterEach(() => {
     vi.useRealTimers();
     vi.unstubAllGlobals();
+  });
+
+  it("keeps an in-flight card inert across a tab switch and restores it on failure", () => {
+    const { container } = started(1, [TAB1, TAB2]);
+    fireEvent.click(container.querySelector<HTMLButtonElement>('[data-nav-action="allow"]')!);
+    const request = answered()[0];
+    expect(request).toBeDefined();
+    dispatch({ kind: "tabs", active: 2, tabs: [TAB1, TAB2] });
+    dispatch({ kind: "snapshot", tab: 2, throughRevision: 0, state: snapshotState() });
+    dispatch({ kind: "tabs", active: 1, tabs: [TAB1, TAB2] });
+    dispatch({ kind: "snapshot", tab: 1, throughRevision: 0, state: cardEvents(1).reduce(applyEvent, snapshotState()) });
+    expect(container.textContent).toContain("Sending answer…");
+    expect(container.querySelector<HTMLButtonElement>('[data-nav-action="allow"]')!.disabled).toBe(true);
+    dispatch({ kind: "command_result", requestId: request.request_id, ok: false, error: "answer failed" });
+    expect(container.textContent).not.toContain("Sending answer…");
+    expect(container.querySelector<HTMLButtonElement>('[data-nav-action="allow"]')!.disabled).toBe(false);
   });
 
   describe("rule 1: the target", () => {

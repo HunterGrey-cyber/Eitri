@@ -27,6 +27,8 @@ pub struct RecordingProvider {
     /// While on, every `resolve_permission` is refused as a provider error. Covers
     /// `AgentBackend::approve_pending`'s failed-allow path ("fail toward a card").
     refusing_resolutions: AtomicBool,
+    holding_permission_replies: AtomicBool,
+    held_permission_replies: std::sync::Mutex<Vec<std::sync::mpsc::Sender<agent::InteractionReply>>>,
     interrupt_capable: bool,
     /// Every `close_session` that reached the provider: what a backend's shutdown does.
     closes: AtomicUsize,
@@ -76,6 +78,25 @@ pub struct RecordingProvider {
 type ClientReadReply = std::sync::mpsc::Sender<Result<agent::ClientToolCallState, agent::ProviderError>>;
 
 impl RecordingProvider {
+    pub fn hold_permission_replies(&self) {
+        self.holding_permission_replies.store(true, Ordering::SeqCst);
+    }
+
+    /// Lets later permission calls reply normally while existing held replies stay pending.
+    pub fn resume_permission_replies(&self) {
+        self.holding_permission_replies.store(false, Ordering::SeqCst);
+    }
+
+    pub fn reply_to_held_permissions(&self, reply: agent::InteractionReply) {
+        let mut held = self.held_permission_replies.lock().unwrap();
+        assert_eq!(held.len(), 1);
+        held.pop().unwrap().send(reply).unwrap();
+    }
+
+    pub fn held_permissions(&self) -> usize {
+        self.held_permission_replies.lock().unwrap().len()
+    }
+
     /// A provider that serves tools the host declares, as a Claude sidecar of protocol 3.23 does.
     pub fn client_tooling() -> Self {
         Self {
@@ -486,6 +507,11 @@ impl agent::AgentProvider for RecordingProvider {
         Ok(())
     }
     fn resolve_permission(&self, request: agent::ResolvePermissionRequest) -> Result<(), agent::ProviderError> {
+        if self.holding_permission_replies.load(Ordering::SeqCst) {
+            let (tx, send) = agent::InteractionSend::channel();
+            self.held_permission_replies.lock().unwrap().push(tx);
+            return send.wait(std::time::Duration::from_secs(5)).map(|_| ());
+        }
         if self.refusing_resolutions.load(Ordering::SeqCst) {
             return Err(agent::ProviderError::Provider {
                 code: agent::ProviderErrorCode::PermissionAlreadyResolved,
@@ -514,6 +540,18 @@ impl agent::AgentProvider for RecordingProvider {
             }
         }
         Ok(())
+    }
+    fn resolve_permission_async(
+        &self,
+        request: agent::ResolvePermissionRequest,
+    ) -> Result<agent::InteractionSend, agent::ProviderError> {
+        if self.holding_permission_replies.load(Ordering::SeqCst) {
+            let (tx, send) = agent::InteractionSend::channel();
+            self.held_permission_replies.lock().unwrap().push(tx);
+            return Ok(send);
+        }
+        self.resolve_permission(request)?;
+        Ok(agent::InteractionSend::ready(Ok(None)))
     }
     fn resolve_interaction(
         &self,

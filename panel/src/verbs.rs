@@ -31,12 +31,13 @@ pub(super) fn default_mode_said(configured: SessionModeChoice, remembered: Optio
 /// `Changed` on a live tab too, so whether the tab was empty is read before the call. Only a mode the
 /// user moved to on a tab that offers every mode is remembered: a tab whose agent has no manual takes
 /// auto in its place when it leaves bypass, which nobody chose, and remembered it would beat
-/// `init.lua`'s default on every later launch. A failure to write is logged, not refused: the mode
+/// `init.lua`'s default on every later launch. A failure to write is logged and shown, not refused: the mode
 /// itself did change.
 pub(super) fn cycle_tab_mode(
     state: &mut AgentPanelState,
     tab: TabId,
     page: ViewId,
+    out: &mut Outbox,
 ) -> Result<eitri_core::tab_set::ModeCycle, String> {
     let remembered_if_moved = state
         .tabs
@@ -48,6 +49,12 @@ pub(super) fn cycle_tab_mode(
             if let Some(dir) = &state.prefs_dir {
                 if let Err(e) = eitri_core::agent_prefs::save_mode(dir, &state.project_dir, *mode) {
                     eprintln!("[agent_panel] could not remember the permission mode: {e}");
+                    out.send(
+                        page,
+                        eitri_core::agent_bridge::serialize_notice_for_js(&format!(
+                            "permission mode changed for this window; it could not be saved: {e}"
+                        )),
+                    );
                 }
             }
         }
@@ -58,15 +65,25 @@ pub(super) fn cycle_tab_mode(
 /// `cycle_default_mode`: `TabSet::cycle_default_mode` plus remembering the new default on
 /// `Changed(mode)`, which is manual or auto -- bypass is never written, and a `Confirm` is not persisted here
 /// either (only actually entering bypass, via `apply_confirm_bypass` below, ever could -- and that is
-/// forbidden too). A failure to write is logged, not refused, since the mode itself did change.
+/// forbidden too). A failure to write is logged and shown, not refused, since the mode itself did change.
 /// Never touches the WebView, so it is tested directly; the arm above owns `send_tabs` and
 /// dispatching the prompt.
-pub(super) fn cycle_default_mode(state: &mut AgentPanelState, page: ViewId) -> eitri_core::tab_set::ModeCycle {
+pub(super) fn cycle_default_mode(
+    state: &mut AgentPanelState,
+    page: ViewId,
+    out: &mut Outbox,
+) -> eitri_core::tab_set::ModeCycle {
     let outcome = state.tabs.cycle_default_mode(page);
     if let eitri_core::tab_set::ModeCycle::Changed(mode) = outcome {
         if let Some(dir) = &state.prefs_dir {
             if let Err(e) = eitri_core::agent_prefs::save_mode(dir, &state.project_dir, mode) {
                 eprintln!("[agent_panel] could not remember the permission mode: {e}");
+                out.send(
+                    page,
+                    eitri_core::agent_bridge::serialize_notice_for_js(&format!(
+                        "permission mode changed for this window; it could not be saved: {e}"
+                    )),
+                );
             }
         }
     }
@@ -199,6 +216,37 @@ pub(super) fn claims(mirror: PanelKeys, dir: Direction) -> bool {
 mod tests {
     use super::*;
     use crate::agent_panel::tests::*;
+
+    #[test]
+    fn failed_permission_mode_saves_keep_the_change_and_show_a_notice() {
+        for default in [false, true] {
+            let dir = agent::state_dirs::test_workspace_dir("mode-save-notice");
+            let (handle, page, _) = handle_with_two_pages();
+            let tab = handle.state.borrow().tabs.active();
+            let prefs = dir.join("not-a-directory");
+            std::fs::write(&prefs, b"blocked").unwrap();
+            {
+                let mut state = handle.state.borrow_mut();
+                state.prefs_dir = Some(prefs);
+                state.project_dir = dir.clone();
+                state.tabs = TabSet::new(BackendKind::Sidecar, SessionModeChoice::Manual);
+            }
+            let message = if default {
+                serde_json::json!({"type": "cycle_default_mode", "request_id": "mode"})
+            } else {
+                serde_json::json!({"type": "cycle_mode", "request_id": "mode", "tab": tab.0})
+            };
+            handle.page_message(ViewId::BASE, &message.to_string());
+            assert_eq!(handle.state.borrow().tabs.default_mode(), SessionModeChoice::Auto);
+            assert_eq!(result_for(&page.sent.borrow(), "mode"), Some(Ok(())));
+            assert!(page.sent.borrow().iter().any(|p| {
+                let v = json_of(p);
+                v["kind"] == "notice"
+                    && v.to_string()
+                        .contains("permission mode changed for this window; it could not be saved:")
+            }));
+        }
+    }
 
     /// The full decision table: the two claimed cells (`Down`+`Browse`, `Up`+`Input`) and every other
     /// combination, which must fall through to the host's focus move unclaimed.
@@ -508,7 +556,7 @@ mod tests {
         state.borrow_mut().prefs_dir = Some(prefs_dir.clone());
         state.borrow_mut().project_dir = project_dir.clone();
 
-        let cycled = cycle_default_mode(&mut state.borrow_mut(), ViewId::BASE);
+        let cycled = cycle_default_mode(&mut state.borrow_mut(), ViewId::BASE, &mut Outbox::default());
         let plan = match cycled {
             eitri_core::tab_set::ModeCycle::Confirm(plan) => plan,
             other => panic!("auto -> bypass must ask first: {other:?}"),
@@ -542,7 +590,7 @@ mod tests {
 
         // Leaving bypass moves at once, to manual, and IS remembered -- manual is allowed.
         assert_eq!(
-            cycle_default_mode(&mut state.borrow_mut(), ViewId::BASE),
+            cycle_default_mode(&mut state.borrow_mut(), ViewId::BASE, &mut Outbox::default()),
             eitri_core::tab_set::ModeCycle::Changed(SessionModeChoice::Manual)
         );
         assert_eq!(state.borrow().tabs.default_mode(), SessionModeChoice::Manual);
@@ -552,7 +600,7 @@ mod tests {
         );
         // Manual -> auto moves at once and is remembered too.
         assert_eq!(
-            cycle_default_mode(&mut state.borrow_mut(), ViewId::BASE),
+            cycle_default_mode(&mut state.borrow_mut(), ViewId::BASE, &mut Outbox::default()),
             eitri_core::tab_set::ModeCycle::Changed(SessionModeChoice::Auto)
         );
         assert_eq!(
@@ -589,7 +637,7 @@ mod tests {
         state.borrow_mut().project_dir = project_dir.clone();
         assert_eq!(set_mode(&state, acp), SessionModeChoice::Auto);
 
-        let cycled = cycle_tab_mode(&mut state.borrow_mut(), acp, ViewId::BASE);
+        let cycled = cycle_tab_mode(&mut state.borrow_mut(), acp, ViewId::BASE, &mut Outbox::default());
         let plan = match cycled {
             Ok(eitri_core::tab_set::ModeCycle::Confirm(plan)) => plan,
             other => panic!("auto -> bypass asks: {other:?}"),
@@ -597,7 +645,7 @@ mod tests {
         apply_confirm_bypass(&mut state.borrow_mut(), plan.scope, plan.nonce, ViewId::BASE).unwrap();
         assert_eq!(set_mode(&state, acp), SessionModeChoice::Bypass);
         assert_eq!(
-            cycle_tab_mode(&mut state.borrow_mut(), acp, ViewId::BASE),
+            cycle_tab_mode(&mut state.borrow_mut(), acp, ViewId::BASE, &mut Outbox::default()),
             Ok(eitri_core::tab_set::ModeCycle::Changed(SessionModeChoice::Auto))
         );
         assert_eq!(state.borrow().tabs.default_mode(), SessionModeChoice::Manual);
@@ -610,7 +658,7 @@ mod tests {
         // The same move on an empty Claude tab is remembered, as before.
         state.borrow_mut().tabs.select(claude);
         assert_eq!(
-            cycle_tab_mode(&mut state.borrow_mut(), claude, ViewId::BASE),
+            cycle_tab_mode(&mut state.borrow_mut(), claude, ViewId::BASE, &mut Outbox::default()),
             Ok(eitri_core::tab_set::ModeCycle::Changed(SessionModeChoice::Auto))
         );
         assert_eq!(

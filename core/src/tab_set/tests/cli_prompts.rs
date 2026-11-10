@@ -45,6 +45,90 @@ fn approving_the_card_for_a_call_answers_the_clis_own_prompt_that_follows() {
     shut_down_all(&mut set);
 }
 
+#[test]
+fn async_permission_refusals_keep_provider_words_and_transport_uncertainty() {
+    for (error, expected) in [
+        (
+            agent::ProviderError::Provider {
+                code: agent::ProviderErrorCode::PermissionAlreadyResolved,
+                message: "This request was already resolved.".into(),
+            },
+            "This request was already resolved.".to_string(),
+        ),
+        (agent::ProviderError::Timeout, String::new()),
+        (agent::ProviderError::Transport("connection lost".into()), String::new()),
+    ] {
+        let dir = workspace("async-permission-refusal");
+        let mut set = set();
+        let tab = set.active();
+        let (provider, backend) = live(&dir);
+        set.get_mut(tab).unwrap().set_backend(TabBackend::Live(backend));
+        provider.queue(write("permission"));
+        until("the card", || {
+            set.pump(&dir, true);
+            set.get(tab).unwrap().card_is_waiting("permission")
+        });
+        provider.hold_permission_replies();
+        let send = set
+            .answer_card_async(tab, ViewId::BASE, "permission", agent::PermissionDecision::Allow)
+            .unwrap();
+        assert!(!set.get(tab).unwrap().card_is_waiting("permission"));
+        let expected = if expected.is_empty() {
+            format!("the answer may not have reached the agent ({error}); the request is waiting again")
+        } else {
+            expected
+        };
+        provider.reply_to_held_permissions(Err(error));
+        let refusal = set.finish_card_answer(tab, &send).unwrap().unwrap_err();
+        assert_eq!(refusal.message, expected);
+        assert!(refusal.benign);
+        assert!(set.get(tab).unwrap().card_is_waiting("permission"));
+        shut_down_all(&mut set);
+    }
+}
+
+#[test]
+fn an_async_approval_is_recorded_only_after_success_in_its_original_turn() {
+    let dir = workspace("async-human-approval");
+    let mut set = set();
+    let tab = set.active();
+    let (provider, backend) = live(&dir);
+    set.get_mut(tab).unwrap().set_backend(TabBackend::Live(backend));
+    for (permission, turn, newer) in [("first", "t1", false), ("second", "t2", true)] {
+        provider.queue(started(turn));
+        provider.queue(gate_write(permission, "call"));
+        until("the card", || {
+            set.pump(&dir, true);
+            set.get(tab).unwrap().card_is_waiting(permission)
+        });
+        provider.hold_permission_replies();
+        let send = set
+            .answer_card_async(tab, ViewId::BASE, permission, agent::PermissionDecision::Allow)
+            .unwrap();
+        assert!(set.finish_card_answer(tab, &send).is_none());
+        assert!(set.get(tab).unwrap().session.human_allowed.is_empty());
+        if newer {
+            provider.queue(started("t3"));
+            until("the newer turn", || {
+                set.pump(&dir, true);
+                set.get(tab)
+                    .unwrap()
+                    .live()
+                    .unwrap()
+                    .projection()
+                    .active_turn_id
+                    .as_deref()
+                    == Some("t3")
+            });
+        }
+        provider.reply_to_held_permissions(Ok(None));
+        set.finish_card_answer(tab, &send).unwrap().unwrap();
+        assert_eq!(set.get(tab).unwrap().session.human_allowed.is_empty(), newer);
+        set.get_mut(tab).unwrap().session.human_allowed.clear();
+    }
+    shut_down_all(&mut set);
+}
+
 /// Only an Approve counts: a denied card, and a card answered behind the tab set's back (not
 /// through `answer_card`), leave the CLI's own prompt for that call a card.
 #[test]

@@ -96,10 +96,10 @@ impl PermissionAnswer {
 }
 
 /// Everything a `permission_response` does, with no WebView, so its route is tested whole: the rule the card offered is saved first when the user chose "Always allow" (never taken
-/// from the panel), then the answer goes through `TabSet::answer_card` -- the one route
+/// from the panel), then the answer goes through `TabSet::answer_card_async` -- the route
 /// that records a human approval, which is what lets the CLI's own prompt for the same call through
 /// without a second card. `Err` is a refusal the panel shows (the card stays and `a`
-/// still works); `Ok` is the answer's own outcome.
+/// still works); `Ok` carries the send whose acknowledgement the tick reads.
 pub(super) fn answer_permission_response(
     tabs: &mut eitri_core::tab_set::TabSet,
     rules_dir: Option<&Path>,
@@ -107,7 +107,7 @@ pub(super) fn answer_permission_response(
     tab: TabId,
     page: ViewId,
     answer: PermissionAnswer,
-) -> Result<Result<(), BackendError>, String> {
+) -> Result<Result<eitri_core::tab_set::PermissionSend, BackendError>, String> {
     if tabs.is_moving(tab) {
         return Err(eitri_core::tab_set::MOVING.into());
     }
@@ -143,7 +143,7 @@ pub(super) fn answer_permission_response(
         }
     }
     let decision = answer.decision.into_decision(answer.reason);
-    Ok(tabs.answer_card(tab, page, &answer.permission_id, decision))
+    Ok(tabs.answer_card_async(tab, page, &answer.permission_id, decision))
 }
 
 /// The `remember` choice: the rule Rust offered for `permission_id`, only with an allow, and
@@ -187,6 +187,40 @@ pub(super) fn now_ms() -> u64 {
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_millis() as u64)
         .unwrap_or(0)
+}
+
+/// A permission answer in flight and the page request awaiting its result.
+pub(super) struct PendingPermissionSend {
+    tab: TabId,
+    view: ViewId,
+    request_id: String,
+    send: eitri_core::tab_set::PermissionSend,
+}
+
+/// Completes pending permission replies on their original pages and restores refused cards.
+pub(super) fn poll_permission_sends(state: &mut AgentPanelState, out: &mut Outbox) {
+    state.permission_sends.retain(|pending| {
+        let Some(reply) = state.tabs.finish_card_answer(pending.tab, &pending.send) else {
+            return true;
+        };
+        if let Err(error) = &reply {
+            eprintln!("[agent_panel] permission answer: {}", error.message);
+            if let Some(tab) = state.tabs.get(pending.tab) {
+                out.send(
+                    pending.view,
+                    eitri_core::agent_bridge::serialize_rule_offers_for_js(tab.id, &tab.session.rule_offers),
+                );
+            }
+        }
+        out.send(
+            pending.view,
+            serialize_command_result_for_js(
+                &pending.request_id,
+                reply.as_ref().map(|_| ()).map_err(|e| e.message.as_str()),
+            ),
+        );
+        false
+    });
 }
 
 /// Applies one command's outcome to its tab and the frontend, uniformly.
@@ -960,7 +994,16 @@ pub(super) fn handle_inbound_message(
             );
             match answered {
                 Err(why) => refuse(&mut out, &why),
-                Ok(outcome) => apply_command_outcome(state, screen, view, tab, &request_id, outcome, &mut out),
+                Ok(Ok(send)) => {
+                    state.permission_sends.push(PendingPermissionSend {
+                        tab,
+                        view,
+                        request_id: request_id.clone(),
+                        send,
+                    });
+                    poll_permission_sends(state, &mut out);
+                }
+                Ok(Err(error)) => apply_command_outcome(state, screen, view, tab, &request_id, Err(error), &mut out),
             }
         }
         // A broker card's answer goes to the broker, by the card's own id, past the same gates as any card
@@ -1235,7 +1278,7 @@ pub(super) fn handle_inbound_message(
         // `apply_confirm_bypass`, below, is what a later `confirm_bypass` message answers it with.
         InboundMessage::CycleMode { .. } => {
             let tab = tab_of(target);
-            match cycle_tab_mode(state, tab, view) {
+            match cycle_tab_mode(state, tab, view, &mut out) {
                 Ok(eitri_core::tab_set::ModeCycle::Changed(_)) => {
                     send_tabs(state, &mut out);
                     ok(&mut out);
@@ -1620,7 +1663,7 @@ pub(super) fn handle_inbound_message(
             // `Shift+Tab` on the chooser's `New session` row or a record: the window's
             // remembered default, exactly as `CycleMode` remembers a tab's own mode above. `Confirm`
             // dispatches the same y/n prompt, answered by a later `confirm_bypass` message.
-            match cycle_default_mode(state, view) {
+            match cycle_default_mode(state, view, &mut out) {
                 eitri_core::tab_set::ModeCycle::Changed(_) => {
                     send_tabs(state, &mut out);
                     ok(&mut out);
@@ -1840,6 +1883,96 @@ pub(super) fn no_session_error() -> eitri_core::agent_backend::BackendError {
 mod tests {
     use super::*;
     use crate::agent_panel::tests::*;
+
+    #[test]
+    fn permission_answer_returns_while_held_and_failure_restores_the_card() {
+        agent::state_dirs::redirect_state_to_a_test_root();
+        let dir = agent::state_dirs::test_repository_dir("panel-held-permission");
+        let (handle, page, _) = handle_with_two_pages();
+        let (tab, provider) = live_tab(&handle, &dir);
+        handle.state.borrow_mut().project_dir = dir.clone();
+        provider.queue(agent::AgentDomainEvent::PermissionRequested {
+            permission_id: "perm-held".into(),
+            tool_use_id: None,
+            tool_name: "Bash".into(),
+            input: serde_json::json!({"command": "git push origin main"}),
+            provider_prompt: None,
+        });
+        tick_handle_until(&handle, "the card", || {
+            handle
+                .state
+                .borrow()
+                .tabs
+                .get(tab)
+                .unwrap()
+                .session
+                .rule_offers
+                .contains_key("perm-held")
+        });
+        assert!(handle
+            .state
+            .borrow()
+            .tabs
+            .get(tab)
+            .unwrap()
+            .session
+            .rule_offers
+            .contains_key("perm-held"));
+        provider.hold_permission_replies();
+        let answer = |request: &str| {
+            serde_json::json!({
+                "type": "permission_response", "request_id": request, "tab": tab.0,
+                "permission_id": "perm-held", "decision": "allow"
+            })
+            .to_string()
+        };
+        handle.page_message(ViewId::BASE, &answer("first"));
+        assert_eq!(provider.held_permissions(), 1);
+        assert_eq!(result_for(&page.sent.borrow(), "first"), None, "reply is still held");
+        assert_eq!(handle.state.borrow().permission_sends.len(), 1);
+        assert!(super::super::tick::needs_polling(&handle.state.borrow()));
+        assert!(!handle
+            .state
+            .borrow()
+            .tabs
+            .get(tab)
+            .unwrap()
+            .card_is_waiting("perm-held"));
+        handle.page_message(ViewId::BASE, &answer("duplicate"));
+        assert!(matches!(result_for(&page.sent.borrow(), "duplicate"), Some(Err(_))));
+        assert_eq!(provider.held_permissions(), 1);
+        provider.reply_to_held_permissions(Err(agent::ProviderError::Transport("held failure".into())));
+        handle.tick();
+        assert!(matches!(result_for(&page.sent.borrow(), "first"), Some(Err(why)) if why.contains("held failure")));
+        assert!(handle
+            .state
+            .borrow()
+            .tabs
+            .get(tab)
+            .unwrap()
+            .card_is_waiting("perm-held"));
+        assert!(handle
+            .state
+            .borrow()
+            .tabs
+            .get(tab)
+            .unwrap()
+            .session
+            .rule_offers
+            .contains_key("perm-held"));
+        handle.page_message(ViewId::BASE, &answer("retry"));
+        provider.reply_to_held_permissions(Ok(None));
+        handle.tick();
+        assert_eq!(result_for(&page.sent.borrow(), "retry"), Some(Ok(())));
+        assert!(!handle
+            .state
+            .borrow()
+            .tabs
+            .get(tab)
+            .unwrap()
+            .card_is_waiting("perm-held"));
+        shut_down_every_tab(&handle);
+    }
 
     #[test]
     fn the_message_calls_the_hook_and_is_admitted_as_keymap_closed_is() {
@@ -2077,7 +2210,8 @@ mod tests {
             ViewId::BASE,
             PermissionAnswer::of(message).unwrap(),
         );
-        assert!(matches!(outcome, Ok(Ok(_))));
+        let send = outcome.unwrap().unwrap();
+        set.finish_card_answer(tab, &send).unwrap().unwrap();
 
         provider.queue(agent::AgentDomainEvent::PermissionResolved {
             permission_id: "perm-hook".into(),

@@ -1533,6 +1533,23 @@ impl AgentBackend {
         }
     }
 
+    /// Sends a card answer through the provider's asynchronous path; legacy replies synchronously.
+    pub fn respond_permission_async(
+        &mut self,
+        permission_id: &str,
+        decision: PermissionDecision,
+    ) -> Result<agent::InteractionSend, BackendError> {
+        match self {
+            Self::Legacy(_) => {
+                self.respond_permission(permission_id, decision)?;
+                Ok(agent::InteractionSend::ready(Ok(None)))
+            }
+            Self::Conversation { conversation, .. } => {
+                Ok(conversation.respond_permission_async(permission_id, decision)?)
+            }
+        }
+    }
+
     /// Answers Claude's question set `interaction_id` with the person's `answers`.
     ///
     /// Reached only from a page's `question_answer`, after the page and the window agreed to it, and

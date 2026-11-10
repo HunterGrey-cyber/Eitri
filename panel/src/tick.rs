@@ -36,6 +36,7 @@ pub(super) fn tick_collect(state: &mut AgentPanelState, screen: &Screen, out: &m
     // The project root travels in because the permission policy judges `Read`/`Grep`/`Glob`
     // paths against it -- see `AgentBackend::answer_what_needs_no_human`. A view counts as
     // mapped only while its page is live and on screen.
+    poll_permission_sends(state, out);
     let project_dir = state.project_dir.clone();
     let pumped = state.tabs.pump_views(&project_dir, &|view| screen.shows(view));
     // Whose first text each payload carries, kept with it: the cadence may release it after
@@ -403,6 +404,7 @@ pub(super) fn needs_polling(state: &AgentPanelState) -> bool {
         || !state.review_jobs.is_empty()
         || state.path_lookup.is_running()
         || !state.question_sends.is_empty()
+        || !state.permission_sends.is_empty()
         || state.remote.needs_polling()
         || !state.proposal_jobs.is_empty()
         || !state.view_jobs.is_empty()

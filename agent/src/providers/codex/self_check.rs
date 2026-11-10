@@ -1786,11 +1786,17 @@ mod tests {
         exit 0"#,
         );
         let (tx, rx) = std::sync::mpsc::channel();
+        let deadline = Instant::now() + Duration::from_secs(20);
         let probe = std::thread::spawn(move || {
             let _ = tx.send(probe_version(&program));
         });
         let helper = read_pid(&scratch.0.join("helper"));
-        let answer = rx.recv_timeout(Duration::from_secs(20));
+        let answer = rx.recv_timeout(deadline.saturating_duration_since(Instant::now()));
+        // Pipe EOF can precede the helper's zombie state, and waiting for its leader does not wait
+        // for the helper. Use the same hang guard for both observations, before sleep exits by itself.
+        while running(helper) && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(5));
+        }
         let was_running = running(helper);
         if was_running {
             // SAFETY: this is the sleep process started by the test's wrapper.

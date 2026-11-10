@@ -904,7 +904,7 @@ const EXEC_CHUNK: &str = "core/src/editor_tools/tools/nvim_exec.lua";
 const CARD_GLUE: &str = "panel/src/editor_glue.rs";
 /// The file of the one arm that calls [`CARD_GLUE`]'s function, on an `editor_card_answer` from the page.
 const CARD_ARM: &str = "panel/src/inbound.rs";
-/// The function of [`CARD_ARM`] holding the one call of `TabSet::answer_card`, on a provider's cards.
+/// The function of [`CARD_ARM`] holding the one call of `TabSet::answer_card_async`, on a provider's cards.
 const PROVIDER_ANSWER: &str = "answer_permission_response";
 /// A test module of `tab_set.rs` kept in a file of its own, whose calls are `TabSet::answer_card` on a local `set`
 /// (as are the files under `core/src/tab_set/tests/` and the `*_tests.rs` beside it).
@@ -1390,65 +1390,103 @@ fn arm_bodies(code: &str, pattern: &str) -> Vec<Range<usize>> {
         .collect()
 }
 
-/// Who calls an `answer_card`, on product code. `TabSet::answer_card`, on a provider's cards, has one call, through
-/// `tabs.` in [`PROVIDER_ANSWER`]: text cannot tell the type behind a name, so that one call is what is let through.
-/// The broker's goes through `editor_tools.` in [`CARD_GLUE`]'s own `answer_card`, whose one call stands in the
-/// `EditorCardAnswer` arm of [`CARD_ARM`]. Anything else that names the function, by a call or as a path, is refused.
+/// Card answers have fixed callers: the broker's glue and message arm, and the provider's async entry,
+/// shared start and completion. Text cannot infer receiver types, so each call is pinned to its receiver,
+/// file and enclosing function (or message arm). Passing a method as a value is refused too.
 fn card_path_wrong(sources: &[Source]) -> Vec<String> {
-    const NAME: &str = "answer_card";
     const ARM: &str = "InboundMessage::EditorCardAnswer";
+    const TAB_SET: &str = "core/src/tab_set.rs";
+    // Each route must occur exactly once. The synchronous wrapper remains available to tests.
+    let routes = [
+        ("answer_card", CARD_GLUE, "answer_card", "editor_tools."),
+        ("answer_card", CARD_ARM, ARM, "editor_glue::"),
+        ("answer_card_async", CARD_ARM, PROVIDER_ANSWER, "tabs."),
+        ("start_card_answer", TAB_SET, "answer_card", "self."),
+        ("start_card_answer", TAB_SET, "answer_card_async", "self."),
+        ("finish_card_answer", TAB_SET, "answer_card", "self."),
+        ("finish_card_answer", CARD_ARM, "poll_permission_sends", "state.tabs."),
+    ];
+    let mut counts = vec![0; routes.len()];
     let mut wrong = Vec::new();
-    let (mut broker_calls, mut arm_calls, mut provider_calls) = (0, 0, 0);
     for source in sources {
         let code = product_code(&source.text);
-        let bodies_of = |name: &str| -> Vec<Range<usize>> {
-            source_scan::functions(&code, name)
-                .into_iter()
-                .map(|body| span(&code, body))
-                .collect()
-        };
-        let glue = bodies_of(NAME);
-        let provider = bodies_of(PROVIDER_ANSWER);
-        let arms = arm_bodies(&code, ARM);
-        for end in word_ends(&code, NAME) {
-            let at = end - NAME.len();
-            let reversed: String = code[..at]
-                .chars()
-                .rev()
-                .filter(|c| !c.is_whitespace())
-                .take(16)
-                .collect();
-            let before: String = reversed.chars().rev().collect();
-            let called = code[end..].trim_start().starts_with('(');
-            let inside = |bodies: &[Range<usize>]| bodies.iter().any(|body| body.contains(&at));
-            if called && before.ends_with("fn") {
-                continue;
+        let bodies: Vec<Vec<Range<usize>>> = routes
+            .iter()
+            .map(|(_, _, enclosing, _)| {
+                if *enclosing == ARM {
+                    arm_bodies(&code, ARM)
+                } else {
+                    source_scan::functions(&code, enclosing)
+                        .into_iter()
+                        .map(|body| span(&code, body))
+                        .collect()
+                }
+            })
+            .collect();
+        for name in [
+            "answer_card",
+            "answer_card_async",
+            "start_card_answer",
+            "finish_card_answer",
+        ] {
+            for end in word_ends(&code, name) {
+                let at = end - name.len();
+                let reversed: String = code[..at]
+                    .chars()
+                    .rev()
+                    .filter(|c| !c.is_whitespace())
+                    .take(32)
+                    .collect();
+                let before: String = reversed.chars().rev().collect();
+                let called = code[end..].trim_start().starts_with('(');
+                if called && before.ends_with("fn") {
+                    continue;
+                }
+                let route = routes.iter().enumerate().position(|(i, (method, path, _, receiver))| {
+                    let receiver_matches = before.strip_suffix(receiver).is_some_and(|rest| {
+                        // The broker may be reached through a state field; `tabs` and `self` must be exact.
+                        *receiver == "editor_tools."
+                            || *receiver == "editor_glue::"
+                            || !rest.ends_with(|c: char| c.is_alphanumeric() || c == '_' || c == '.')
+                    });
+                    called
+                        && name == *method
+                        && source.path == *path
+                        && receiver_matches
+                        && bodies[i].iter().any(|body| body.contains(&at))
+                });
+                if let Some(i) = route {
+                    counts[i] += 1;
+                } else {
+                    let line = code[..at].matches('\n').count() + 1;
+                    wrong.push(format!("{}:{line}: `{name}` outside the card path", source.path));
+                }
             }
-            let tabs = before
-                .strip_suffix("tabs.")
-                .is_some_and(|rest| !rest.ends_with(|c: char| c.is_alphanumeric() || c == '_' || c == '.'));
-            if called && source.path == CARD_GLUE && before.ends_with("editor_tools.") && inside(&glue) {
-                broker_calls += 1;
-            } else if called && source.path == CARD_ARM && before.ends_with("editor_glue::") && inside(&arms) {
-                arm_calls += 1;
-            } else if called && source.path == CARD_ARM && tabs && inside(&provider) {
-                provider_calls += 1;
-            } else {
-                let line = code[..at].matches('\n').count() + 1;
-                wrong.push(format!("{}:{line}: `{NAME}` outside the card path", source.path));
+        }
+        // Neither the page's handler nor its completion poll may bypass the card entry to answer a provider.
+        for handler in [PROVIDER_ANSWER, "poll_permission_sends"] {
+            for body in source_scan::functions(&code, handler) {
+                for name in [
+                    "respond_permission",
+                    "respond_permission_async",
+                    "resolve_permission",
+                    "resolve_permission_async",
+                    "approve_pending",
+                    "approve_each",
+                    "answer_what_needs_no_human",
+                    "confirm_bypass",
+                ] {
+                    if !word_ends(body, name).is_empty() {
+                        wrong.push(format!("{}: `{handler}` directly names `{name}`", source.path));
+                    }
+                }
             }
         }
     }
-    if broker_calls != 1 {
-        wrong.push(format!("{CARD_GLUE} calls the broker's `{NAME}` {broker_calls} times"));
-    }
-    if arm_calls != 1 {
-        wrong.push(format!("the `{ARM}` arm of {CARD_ARM} calls it {arm_calls} times"));
-    }
-    if provider_calls != 1 {
-        wrong.push(format!(
-            "`{PROVIDER_ANSWER}` of {CARD_ARM} calls `TabSet::{NAME}` {provider_calls} times"
-        ));
+    for ((name, path, enclosing, _), count) in routes.iter().zip(counts) {
+        if count != 1 {
+            wrong.push(format!("`{enclosing}` of {path} calls `{name}` {count} times"));
+        }
     }
     wrong
 }
@@ -2054,7 +2092,7 @@ fn where_a_line_ends_changes_nothing() {
 }
 
 /// The panel's card path: the glue's one call of the broker, and the arm's one call of the glue.
-fn card_path() -> [Source; 2] {
+fn card_path() -> [Source; 3] {
     [
         file(
             CARD_GLUE,
@@ -2079,7 +2117,23 @@ fn handle(state: &mut State) {
 }
 
 fn answer_permission_response(tabs: &mut TabSet) {
-    Ok(tabs.answer_card(tab, page, id, decision))
+    Ok(tabs.answer_card_async(tab, page, id, decision))
+}
+
+fn poll_permission_sends(state: &mut State) {
+    state.tabs.finish_card_answer(tab, &send);
+}
+"#,
+        ),
+        file(
+            "core/src/tab_set.rs",
+            r#"
+fn answer_card(&mut self) {
+    let send = self.start_card_answer(id, page, permission_id, decision, false)?;
+    self.finish_card_answer(id, &send)
+}
+fn answer_card_async(&mut self) {
+    self.start_card_answer(id, page, permission_id, decision, true)
 }
 "#,
         ),
@@ -2159,7 +2213,7 @@ fn a_second_answer_card_caller_fails() {
     );
 
     // A card path that is gone is refused, not passed.
-    let [glue, arm] = card_path();
+    let [glue, arm, tabs] = card_path();
     assert!(!card_path_wrong(std::slice::from_ref(&glue)).is_empty());
     assert!(!card_path_wrong(std::slice::from_ref(&arm)).is_empty());
     let outside = file(
@@ -2167,18 +2221,107 @@ fn a_second_answer_card_caller_fails() {
         &arm.text
             .replace("InboundMessage::EditorCardAnswer", "InboundMessage::Sweep"),
     );
-    assert!(!card_path_wrong(&[glue.clone(), outside]).is_empty());
+    assert!(!card_path_wrong(&[glue.clone(), outside, tabs.clone()]).is_empty());
 
     // The provider's call is pinned too: a second one beside it, or none, is red.
-    const PROVIDER: &str = "Ok(tabs.answer_card(tab, page, id, decision))";
+    const PROVIDER: &str = "Ok(tabs.answer_card_async(tab, page, id, decision))";
     assert!(arm.text.contains(PROVIDER));
     for changed in [
-        format!("tabs.answer_card(t, c, Allow, Key, now);\n    {PROVIDER}"),
+        format!("tabs.answer_card_async(t, c, Allow, Key, now);\n    {PROVIDER}"),
         "Ok(())".to_owned(),
     ] {
-        let wrong = card_path_wrong(&[glue.clone(), file(CARD_ARM, &arm.text.replace(PROVIDER, &changed))]);
+        let wrong = card_path_wrong(&[
+            glue.clone(),
+            file(CARD_ARM, &arm.text.replace(PROVIDER, &changed)),
+            tabs.clone(),
+        ]);
         assert_eq!(wrong.len(), 1, "{changed}: {wrong:?}");
     }
+}
+
+#[test]
+fn async_card_entries_and_completions_are_pinned() {
+    for (index, call) in [
+        (1, "tabs.answer_card_async(tab, page, id, decision)"),
+        (1, "state.tabs.finish_card_answer(tab, &send)"),
+        (2, "self.start_card_answer(id, page, permission_id, decision, false)"),
+        (2, "self.start_card_answer(id, page, permission_id, decision, true)"),
+        (2, "self.finish_card_answer(id, &send)"),
+    ] {
+        for replacement in ["unrelated()".to_owned(), format!("{call}; {call}")] {
+            let mut sources = card_path();
+            assert!(sources[index].text.contains(call));
+            sources[index].text = sources[index].text.replacen(call, &replacement, 1);
+            assert!(
+                !card_path_wrong(&sources).is_empty(),
+                "accepted {call} -> {replacement}"
+            );
+        }
+        let mut sources = card_path();
+        sources[index].text = sources[index].text.replacen(call, "unrelated()", 1);
+        sources[index].text.push_str(&format!("\nfn sweep() {{ {call}; }}"));
+        assert!(!card_path_wrong(&sources).is_empty(), "accepted moved {call}");
+    }
+    for name in ["answer_card_async", "start_card_answer", "finish_card_answer"] {
+        for text in [
+            format!("fn sweep() {{ tabs.{name}(id); }}"),
+            format!("fn sweep() {{ let answer = TabSet::{name}; }}"),
+        ] {
+            for path in [CARD_ARM, "panel/src/sweep.rs", "core/src/tab_set.rs"] {
+                assert!(!with_card_path(path, &text).is_empty(), "accepted {path}: {text}");
+            }
+        }
+    }
+}
+
+#[test]
+fn permission_handlers_cannot_answer_around_the_card_path() {
+    for handler in ["answer_permission_response", "poll_permission_sends"] {
+        for name in [
+            "answer_card",
+            "answer_card_async",
+            "start_card_answer",
+            "finish_card_answer",
+            "respond_permission",
+            "respond_permission_async",
+            "resolve_permission",
+            "resolve_permission_async",
+            "approve_pending",
+            "approve_each",
+            "answer_what_needs_no_human",
+            "confirm_bypass",
+        ] {
+            for extra in [
+                format!("backend.\n{name}\n(id);"),
+                format!("let answer = Backend::{name};"),
+            ] {
+                let mut sources = card_path();
+                let body = source_scan::functions(&sources[1].text, handler)[0];
+                let at = span(&sources[1].text, body).start + 1;
+                sources[1].text.insert_str(at, &extra);
+                assert!(!card_path_wrong(&sources).is_empty(), "accepted {handler}: {extra}");
+            }
+        }
+    }
+}
+
+#[test]
+fn card_path_ignores_line_breaks_comments_literals_and_tests() {
+    let mut sources = card_path();
+    for source in &mut sources {
+        source.text = source.text.replace('.', "\n.\n").replace('(', "\n(\n");
+        source.text.push_str(
+            r#"
+// tabs.answer_card_async(); state.tabs.finish_card_answer();
+const TEXT: &str = "tabs.answer_card_async(); self.start_card_answer();";
+#[cfg(test)]
+mod tests {
+    fn test() { tabs.answer_card_async(); self.start_card_answer(); state.tabs.finish_card_answer(); }
+}
+"#,
+        );
+    }
+    assert_eq!(card_path_wrong(&sources), Vec::<String>::new());
 }
 
 #[test]

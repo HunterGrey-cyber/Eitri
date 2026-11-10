@@ -1410,6 +1410,25 @@ impl AgentConversation {
         Ok(())
     }
 
+    /// Starts a permission answer without waiting for its acknowledgement.
+    pub fn respond_permission_async(
+        &mut self,
+        permission_id: &str,
+        decision: PermissionDecision,
+    ) -> Result<crate::InteractionSend, ConversationError> {
+        if !self.projection().pending_permissions.contains_key(permission_id) {
+            return Err(ConversationError::Provider(ProviderError::Provider {
+                code: crate::ProviderErrorCode::PermissionNotFound,
+                message: format!("no pending permission request with id {permission_id}"),
+            }));
+        }
+        Ok(self.provider.resolve_permission_async(ResolvePermissionRequest {
+            session_id: self.require_session()?,
+            permission_id: permission_id.to_string(),
+            decision,
+        })?)
+    }
+
     /// Hands the person's answer to the question set `interaction_id` to the provider. Checked against
     /// the set first (`QuestionRecord::check_resolution`), so an answer to a set no longer waiting, or
     /// one breaking a rule of the set, is refused here and nothing is sent. The set is `Answering`

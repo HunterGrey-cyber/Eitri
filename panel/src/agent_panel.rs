@@ -309,6 +309,7 @@ struct AgentPanelState {
     /// Answers to Claude's questions on their way to the agent, polled by the tick: the GTK thread
     /// never waits for the agent's reply, and the page that answered is told once it came.
     question_sends: Vec<PendingQuestionSend>,
+    permission_sends: Vec<PendingPermissionSend>,
     /// A phone's calls out to the provider, polled by the tick, and their results for the socket to take.
     remote: RemoteCalls,
     /// Pending edits' proposals being read on worker threads, polled by the tick: the agent names the
@@ -647,6 +648,7 @@ impl AgentPanelState {
             task_commands: Vec::new(),
             review_jobs: Vec::new(),
             question_sends: Vec::new(),
+            permission_sends: Vec::new(),
             remote: RemoteCalls::default(),
             proposal_jobs: Vec::new(),
             view_jobs: Vec::new(),
@@ -689,6 +691,15 @@ impl AgentPanelState {
     }
 }
 
+fn startup_permission_mode(dir: Option<&Path>, project: &Path, problems: &mut Vec<String>) -> SessionModeChoice {
+    let (mode, notes) = eitri_core::agent_prefs::startup_mode(dir, project);
+    for note in &notes {
+        eprintln!("{note}");
+    }
+    problems.extend(notes);
+    mode
+}
+
 /// The panel's state, the same with a page or without one (`build_agent_panel`'s `unavailable`):
 /// the tab set in the project's remembered mode, its prompt history and saved permission rules.
 fn panel_state(init: PanelInit, host: Rc<dyn PanelHost>) -> AgentPanelState {
@@ -705,10 +716,8 @@ fn panel_state(init: PanelInit, host: Rc<dyn PanelHost>) -> AgentPanelState {
     let state_home = std::env::var_os("XDG_STATE_HOME");
     let home = std::env::var_os("HOME");
     let prefs_dir = eitri_core::agent_prefs::state_dir(state_home.as_deref(), home.as_deref());
-    let (mode, notes) = eitri_core::agent_prefs::startup_mode(prefs_dir.as_deref(), &project_dir);
-    for note in notes {
-        eprintln!("{note}");
-    }
+    let mut startup_problems = Vec::new();
+    let mode = startup_permission_mode(prefs_dir.as_deref(), &project_dir, &mut startup_problems);
     let mode_remembered = eitri_core::agent_prefs::remembers_a_choice(prefs_dir.as_deref(), &project_dir);
     let history_dir = eitri_core::prompt_history::state_dir(state_home.as_deref(), home.as_deref());
     let rules_dir = eitri_core::permission_store::state_dir(state_home.as_deref(), home.as_deref());
@@ -744,7 +753,7 @@ fn panel_state(init: PanelInit, host: Rc<dyn PanelHost>) -> AgentPanelState {
     let canonical_project_dir = canonical_root.to_string_lossy().into_owned();
     let tabs_dir = eitri_core::saved_tabs::state_dir(state_home.as_deref(), home.as_deref());
     let trust = trust_gate_for(state_home.as_deref(), home.as_deref(), &canonical_root);
-    AgentPanelState::new(StateParts {
+    let mut state = AgentPanelState::new(StateParts {
         document,
         theme,
         host,
@@ -766,7 +775,9 @@ fn panel_state(init: PanelInit, host: Rc<dyn PanelHost>) -> AgentPanelState {
         // Given once `init.lua` has run: which saved tabs the window offers depends on it.
         restore_source: None,
         root_note,
-    })
+    });
+    state.startup_problems = startup_problems;
+    state
 }
 
 /// A panel state with no disk, no trust worker and nothing installed: what the tests here,
@@ -929,6 +940,25 @@ mod tests {
                 (flat == header_flat).then(|| scan::braced(code, open))
             })
             .collect()
+    }
+
+    #[test]
+    fn unusable_permission_preferences_are_startup_problems() {
+        let dir = agent::state_dirs::test_workspace_dir("panel-mode-problem");
+        let project = dir.join("project");
+        let prefs = dir.join("prefs");
+        std::fs::create_dir_all(&project).unwrap();
+        let path = eitri_core::agent_prefs::save_mode(&prefs, &project, SessionModeChoice::Manual).unwrap();
+        std::fs::write(&path, b"unusable").unwrap();
+        let mut problems = Vec::new();
+        assert_eq!(
+            startup_permission_mode(Some(&prefs), &project, &mut problems),
+            SessionModeChoice::Auto
+        );
+        assert!(problems.iter().any(|note| note.contains("unusable")));
+        assert!(problems
+            .iter()
+            .any(|note| note.contains(path.file_stem().unwrap().to_str().unwrap())));
     }
 
     pub(super) fn live_backend(dir: &std::path::Path) -> (std::sync::Arc<RecordingProvider>, AgentBackend) {

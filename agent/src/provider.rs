@@ -765,6 +765,13 @@ pub trait AgentProvider {
     }
 
     fn resolve_permission(&self, request: ResolvePermissionRequest) -> Result<(), ProviderError>;
+
+    /// Starts a card answer; providers with a remote acknowledgement override this to avoid waiting.
+    fn resolve_permission_async(&self, request: ResolvePermissionRequest) -> Result<InteractionSend, ProviderError> {
+        self.resolve_permission(request)?;
+        Ok(InteractionSend::ready(Ok(None)))
+    }
+
     /// Hands the person's answer to one question set to the agent without waiting for it: `Err` is a
     /// refusal before anything was sent, `Ok` the send on its way, whose reply says whether the
     /// provider took it, with the outcome it reported when it reported one. The question ends only

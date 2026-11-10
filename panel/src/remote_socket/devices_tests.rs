@@ -1852,3 +1852,32 @@ fn a_device_shows_its_last_twenty_records_and_the_push_host_only() {
         .iter()
         .any(|f| f[1] == format!("Pixel {}", DEVICE_RECORDS + 4)));
 }
+
+#[test]
+fn device_refreshes_delivered_in_reverse_keep_the_newest() {
+    use crate::agent_panel::tests::{handle_with_two_pages, json_of};
+    let (handle, page, _) = handle_with_two_pages();
+    let listing = Mutex::new(Listing::default());
+    let row = |name: &str| DeviceRow {
+        id: "phone".into(),
+        name: name.into(),
+        grant: Grant::Watch,
+        recipe: "ssh",
+        enrolled_at: None,
+        last_seen: None,
+        last_host: None,
+        push_host: None,
+        records: Vec::new(),
+    };
+    show_listed(&listing, &handle, 2, &[row("new")]);
+    show_listed(&listing, &handle, 1, &[row("old")]);
+    let lists: Vec<_> = page
+        .sent
+        .borrow()
+        .iter()
+        .map(|p| json_of(p))
+        .filter(|p| p["kind"] == "remote_devices")
+        .collect();
+    assert_eq!(lists.len(), 1);
+    assert_eq!(lists[0]["devices"][0]["name"], "new");
+}

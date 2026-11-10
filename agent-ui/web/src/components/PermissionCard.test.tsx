@@ -30,6 +30,18 @@ function buttons(container: HTMLElement) {
 }
 
 describe("PermissionCard decisions", () => {
+  it("shows a pending answer and restores the controls after a failed send", () => {
+    const onAnswer = vi.fn();
+    const { container, rerender } = render(<PermissionCard request={REQUEST} sessionEnded={false} alreadyAnswered onAnswer={onAnswer} />);
+    expect(container.textContent).toContain("Sending answer…");
+    expect(buttons(container).approve.disabled).toBe(true);
+    fireEvent.click(buttons(container).approve);
+    expect(onAnswer).not.toHaveBeenCalled();
+    rerender(<PermissionCard request={REQUEST} sessionEnded={false} alreadyAnswered={false} onAnswer={onAnswer} />);
+    expect(container.textContent).not.toContain("Sending answer…");
+    expect(buttons(container).approve.disabled).toBe(false);
+  });
+
   it("sends a typed allow, with no reason attached", () => {
     const onAnswer = vi.fn();
     const { container } = render(

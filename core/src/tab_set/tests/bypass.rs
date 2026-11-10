@@ -132,6 +132,70 @@ fn confirming_approves_exactly_the_listed_cards_on_that_tab() {
 }
 
 #[test]
+fn bypass_never_counts_or_approves_a_deny_in_flight() {
+    let dir = workspace("bypass-deny-in-flight");
+    let mut set = set();
+    let tab = set.active();
+    let (provider, backend) = live(&dir);
+    set.get_mut(tab).unwrap().set_backend(TabBackend::Live(backend));
+    provider.queue(write("denied"));
+    provider.queue(write("waiting"));
+    until("both cards", || {
+        set.pump(&dir, true);
+        set.get(tab).unwrap().attention.attention().pending == 2
+    });
+    provider.hold_permission_replies();
+    let send = set
+        .answer_card_async(
+            tab,
+            ViewId::BASE,
+            "denied",
+            agent::PermissionDecision::Deny { reason: None },
+        )
+        .unwrap();
+    assert!(set.finish_card_answer(tab, &send).is_none());
+    provider.resume_permission_replies();
+    let plan = plan(set.cycle_mode(tab, ViewId::BASE));
+    assert_eq!(plan.approve, ["waiting"]);
+    assert!(plan.lines[0].contains("1 waiting card"), "{:?}", plan.lines);
+    assert_eq!(
+        set.confirm_bypass(plan.scope, plan.nonce, ViewId::BASE),
+        Ok(ConfirmOutcome::Entered { approved: 1 })
+    );
+    assert_eq!(provider.resolutions(), [("waiting".to_string(), true)]);
+
+    // Overflow the delivery queue so the bypass resync must sweep the pending projection.
+    for i in 0..300 {
+        provider.queue(AgentDomainEvent::ContentDelta {
+            turn_id: "t1".into(),
+            kind: agent::ContentKind::Text,
+            text: format!("chunk {i}"),
+        });
+    }
+    provider.queue(write("overflow"));
+    until("overflow folded", || {
+        set.get(tab)
+            .unwrap()
+            .live()
+            .unwrap()
+            .projection()
+            .pending_permissions
+            .contains_key("overflow")
+    });
+    let payload = set.pump(&dir, true).active_payload.unwrap();
+    let snapshot: serde_json::Value = serde_json::from_str(&payload).unwrap();
+    assert_eq!(snapshot["kind"], "snapshot");
+    assert_eq!(
+        provider.resolutions(),
+        [("waiting".to_string(), true), ("overflow".to_string(), true)]
+    );
+    assert!(set.finish_card_answer(tab, &send).is_none());
+    provider.reply_to_held_permissions(Ok(None));
+    set.finish_card_answer(tab, &send).unwrap().unwrap();
+    shut_down_all(&mut set);
+}
+
+#[test]
 fn a_card_arriving_while_the_prompt_is_up_reprompts() {
     let dir = workspace("bypass-reprompt-on-new-card");
     let mut set = set();

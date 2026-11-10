@@ -711,7 +711,7 @@ mod tests {
         // The mode key in page 2 asks first (a fresh press there takes page 2's own questions off,
         // so its tab's trust question is asked after it).
         let default_prompt = || {
-            let cycled = cycle_default_mode(&mut state.borrow_mut(), view(2));
+            let cycled = cycle_default_mode(&mut state.borrow_mut(), view(2), &mut Outbox::default());
             match cycled {
                 eitri_core::tab_set::ModeCycle::Confirm(plan) => plan,
                 other => panic!("auto -> bypass asks first: {other:?}"),
