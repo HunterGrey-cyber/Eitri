@@ -462,6 +462,24 @@ fn open_moves_the_cursor_by_characters_and_splits_over_a_modified_buffer() {
 
 #[test]
 #[ignore = "needs a real nvim on PATH; spends no tokens and needs no display"]
+fn open_returns_the_name_of_a_buffer_reused_through_a_symlink() {
+    let mut c = case("open-reused-alias");
+    let (a, b) = (c.a.clone(), c.b.clone());
+    let alias = c.root.join("alias.rs");
+    std::os::unix::fs::symlink(&a, &alias).unwrap();
+    c.nvim.lua(
+        "vim.api.nvim_cmd({cmd='edit', args={...}, magic={file=false}}, {}); vim.bo.filetype = 'rust'",
+        vec![s(&alias)],
+    );
+    c.nvim.lua(PLUGIN_OPEN_LUA, vec![opts_map(&[("path", s(&b))])]);
+    let opened = c.nvim.lua(PLUGIN_OPEN_LUA, vec![opts_map(&[("path", s(&a))])]);
+    assert_eq!(field(&opened, "how").as_str(), Some("edit"));
+    assert_eq!(field(&opened, "path"), &s(&alias));
+    assert_eq!(field(&opened, "filetype").as_str(), Some("rust"));
+}
+
+#[test]
+#[ignore = "needs a real nvim on PATH; spends no tokens and needs no display"]
 fn open_refuses_a_checked_file_replaced_by_a_symlink() {
     let mut c = case("open-symlink");
     let (a, b, outside) = (c.a.clone(), c.b.clone(), c.outside.clone());

@@ -239,12 +239,13 @@ export function jump(
 export function openLink(
   b: Bridge,
   a: { buf: number; target: string },
-): Promise<{ how: "edit" | "split" | "current"; line: number }> {
+): Promise<{ how: "edit" | "split" | "current"; line: number; path?: string }> {
   return verb(
     b,
     "editor.open_link",
     a,
-    (v): v is { how: "edit" | "split" | "current"; line: number } =>
-      isRecord(v) && (v.how === "edit" || v.how === "split" || v.how === "current") && isCount(v.line),
+    (v): v is { how: "edit" | "split" | "current"; line: number; path?: string } =>
+      isRecord(v) && (v.how === "edit" || v.how === "split" || v.how === "current") && isCount(v.line) &&
+      (v.path === undefined || typeof v.path === "string"),
   );
 }

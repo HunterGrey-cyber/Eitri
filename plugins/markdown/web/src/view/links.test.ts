@@ -35,11 +35,11 @@ beforeEach(() => {
 });
 afterEach(() => { remove(); preview.dispose(); layout.restore(); vi.useRealTimers(); vi.restoreAllMocks(); });
 
-function show(body: string, buf = 1, tick = 1): void {
-  const v: EditorView = { buf, name: `/p/${buf}.md`, filetype: "markdown", tick, current: true, line_count: 40, top: 1,
+function show(body: string, buf = 1, tick = 1, name = `/p/${buf}.md`): void {
+  const v: EditorView = { buf, name, filetype: "markdown", tick, current: true, line_count: 40, top: 1,
     top_fraction: 0, bottom: 20, cursor: { line: 1, col: 0 }, cause: "user", doc: DOC };
   preview.onView(v);
-  preview.onText({ buf, tick, name: `/p/${buf}.md`, text: body });
+  preview.onText({ buf, tick, name, text: body });
   vi.advanceTimersByTime(0);
 }
 const paras = (n: number) => Array.from({ length: n }, (_, i) => `p${i}`).join("\n\n");
@@ -64,7 +64,7 @@ describe("links in the preview", () => {
     expect(calls).toEqual([{ verb: "editor.open_link", args: { buf: 1, target: "docs/setup.md#install" } }]);
     await Promise.resolve();
     await Promise.resolve();
-    show(`${Array.from({ length: 12 }, (_, i) => `p${i}`).join("\n\n")}\n\n## Install`, 2);
+    show(`${Array.from({ length: 12 }, (_, i) => `p${i}`).join("\n\n")}\n\n## Install`, 2, 1, "/p/docs/setup.md");
     expect(window.scrollY).toBe(layout.boxOf(root.querySelector("#user-content-install")!)!.top - 44);
   });
 
@@ -93,8 +93,58 @@ describe("links in the preview", () => {
     expect(window.scrollY).toBe(0);
     show(`${body}\n\nmore`, 1, 2);
     expect(window.scrollY).toBe(0);
-    show(`${paras(14)}\n\n## Later`, 2);
+    show(`${paras(14)}\n\n## Later`, 2, 1, "/p/other.md");
     expect(window.scrollY).toBe(layout.boxOf(root.querySelector("#user-content-later")!)!.top - 44);
+  });
+
+
+  it("resolve project-relative fragments using the shown document route", async () => {
+    show("[root](/README.md#details)", 1, 1, "/p/sub/1.md");
+    preview.onView({ buf: 1, name: "/p/sub/1.md", filetype: "markdown", tick: 1, current: true, line_count: 40,
+      top: 1, top_fraction: 0, bottom: 20, cursor: { line: 1, col: 0 }, cause: "user",
+      doc: { root: DOC.root, base: `${DOC.root}sub/` } });
+    vi.advanceTimersByTime(0);
+    click("a");
+    await Promise.resolve();
+    await Promise.resolve();
+    show(`${paras(14)}\n\n## Details`, 2, 1, "/p/README.md");
+    expect(window.scrollY).toBe(layout.boxOf(root.querySelector("#user-content-details")!)!.top - 44);
+  });
+
+  it("discard a pending fragment on unrelated navigation, even if its destination renders later", async () => {
+    show("[code](src/main.rs#details)");
+    click("a");
+    await Promise.resolve();
+    await Promise.resolve();
+    const body = `${paras(14)}\n\n## Details`;
+    show(body, 2);
+    expect(window.scrollY).toBe(0);
+    show(body, 3, 1, "/p/src/main.rs");
+    expect(window.scrollY).toBe(0);
+  });
+
+  it("discard a late open reply after unrelated navigation", async () => {
+    show("[code](src/main.rs#details)");
+    const pending = Promise.withResolvers<unknown>();
+    reply = () => pending.promise;
+    click("a");
+    const body = `${paras(14)}\n\n## Details`;
+    show(body, 2);
+    pending.resolve({ how: "edit", line: 0 });
+    await Promise.resolve();
+    await Promise.resolve();
+    show(body, 3, 1, "/p/src/main.rs");
+    expect(window.scrollY).toBe(0);
+  });
+
+  it("reach the resolved destination when its render precedes the open reply", async () => {
+    show("[setup](../docs/set%20up.md#details)", 1, 1, "/p/sub/1.md");
+    const pending = Promise.withResolvers<unknown>();
+    reply = () => pending.promise;
+    click("a");
+    show(`${paras(14)}\n\n## Details`, 2, 1, "/p/docs/set up.md");
+    pending.resolve({ how: "edit", line: 0 });
+    await vi.waitFor(() => expect(window.scrollY).toBe(layout.boxOf(root.querySelector("#user-content-details")!)!.top - 44));
   });
 
   it("resolve a local link against the document shown, while another buffer's view waits for its text", async () => {
@@ -104,6 +154,34 @@ describe("links in the preview", () => {
     preview.onView(v);
     click('a[href="docs/setup.md"]');
     expect(calls).toEqual([{ verb: "editor.open_link", args: { buf: 1, target: "docs/setup.md" } }]);
+  });
+
+  it.each([false, true])("uses the opened path when it differs from the hint (render first: %s)", async (renderFirst) => {
+    show("[setup](alias/setup.md#details)");
+    const pending = Promise.withResolvers<unknown>();
+    reply = () => pending.promise;
+    click("a");
+    const destination = () => show(`${paras(14)}\n\n## Details`, 2, 1, "/p/real/setup.md");
+    if (renderFirst) destination();
+    pending.resolve({ how: "edit", line: 1, path: "/p/real/setup.md" });
+    await Promise.resolve();
+    await Promise.resolve();
+    if (!renderFirst) destination();
+    expect(window.scrollY).toBe(layout.boxOf(root.querySelector("#user-content-details")!)!.top - 44);
+  });
+
+  it("does not revive a differing reply path after intervening navigation", async () => {
+    show("[setup](alias/setup.md#details)");
+    const pending = Promise.withResolvers<unknown>();
+    reply = () => pending.promise;
+    click("a");
+    const body = `${paras(14)}\n\n## Details`;
+    show(body, 3, 1, "/p/unrelated.md");
+    show(body, 2, 1, "/p/real/setup.md");
+    pending.resolve({ how: "edit", line: 1, path: "/p/real/setup.md" });
+    await Promise.resolve();
+    await Promise.resolve();
+    expect(window.scrollY).toBe(0);
   });
 
   it("say why a link was refused", async () => {

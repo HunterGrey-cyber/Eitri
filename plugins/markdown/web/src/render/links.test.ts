@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { anchorId, classifyHref, lineFragment, namesDocument, splitFragment } from "./links";
+import { anchorId, classifyHref, lineFragment, namesDocument, resolveDocument, splitFragment } from "./links";
 
 describe("classifyHref", () => {
   it("sorts a link by what following it does", () => {
@@ -48,5 +48,21 @@ describe("namesDocument", () => {
       expect(namesDocument(path, doc), path).toBe(false);
     }
     expect(namesDocument("notes.md", "")).toBe(false);
+  });
+});
+
+
+describe("resolveDocument", () => {
+  it("resolves decoded relative paths and project-relative paths for matching renders", () => {
+    const root = "eitri-plugin://markdown/.eitri/doc/4/";
+    const doc = { root, base: `${root}docs/sub%20dir/` };
+    const name = "/p/docs/sub dir/notes.md";
+    expect(resolveDocument("../set%20up.md", name, doc)).toBe("/p/docs/set up.md");
+    expect(resolveDocument("/README.md", name, doc)).toBe("/p/README.md");
+    expect(resolveDocument("%2Fdocs/./setup.md", name, doc)).toBe("/p/docs/setup.md");
+    expect(resolveDocument("/README.md", "/p/notes.md", { root, base: root })).toBe("/p/README.md");
+    expect(resolveDocument("bad%XX.md", name, doc)).toBeNull();
+    expect(resolveDocument("/README.md", name)).toBeNull();
+    expect(resolveDocument("/README.md", name, { root, base: `${root}unrelated/` })).toBeNull();
   });
 });

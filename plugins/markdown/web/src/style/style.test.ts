@@ -2,6 +2,8 @@ import { readFileSync } from "node:fs";
 import { dirname, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import { describe, expect, it } from "vitest";
+import { createEngine } from "../render/engine";
+import { sanitizeDocument } from "../render/sanitize";
 
 const here = dirname(fileURLToPath(import.meta.url));
 const root = resolve(here, "../../../../..");
@@ -16,6 +18,15 @@ function rules(text: string): { selector: string; body: string }[] {
 }
 
 describe("the page's stylesheets", () => {
+  it.each(["p", "div"])("zeroes a trailing raw <%s> margin in an alert past its end marker", (tag) => {
+    const host = document.createElement("div");
+    const env = { nonce: "test", doc: null, remoteImages: "off" as const, blocked: [], counts: {} };
+    host.append(sanitizeDocument(createEngine().render(`> [!NOTE]\n> <${tag}>raw</${tag}>`, env), env));
+    const raw = host.querySelector(`.markdown-alert > ${tag}:not(.markdown-alert-title):not(.code-line)`)!;
+    expect(raw).not.toBeNull();
+    const matching = rules(css["alerts.css"]).filter(r => raw.matches(r.selector));
+    expect(matching.some(r => /margin-bottom:\s*0\s*[;} ]?/.test(r.body))).toBe(true);
+  });
   it("hide the page's scroll bar while the diagram viewer is open", () => {
     const rule = rules(css["chrome.css"]).find((r) => r.selector === "html.mdp-viewer-open");
     expect(rule?.body).toMatch(/overflow:\s*hidden/);

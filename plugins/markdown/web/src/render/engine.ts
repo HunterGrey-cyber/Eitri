@@ -3,7 +3,7 @@ import GithubSlugger from "github-slugger";
 import MarkdownIt from "markdown-it";
 import footnote from "markdown-it-footnote";
 import { alertsPlugin } from "./alerts";
-import { FENCE_ATTR, mark, NONCE_ATTR, RAW_HTML_END, type RenderEnv } from "./env";
+import { FENCE_ATTR, mark, NONCE_ATTR, RAW_HTML_ATTR, RAW_HTML_END, type RenderEnv } from "./env";
 import { frontMatterPlugin } from "./frontmatter";
 import { highlightCode } from "./highlight";
 import { boxHtml, resolveImage } from "./images";
@@ -107,14 +107,18 @@ function pageRules(md: MarkdownIt): void {
   };
 
   // Raw HTML is the document's, so no attribute of ours can go onto it: an empty marker in front of it carries its
-  // source lines instead. The HTML itself goes on to the sanitiser like any other, closed off so that it cannot run
-  // on into the tag the renderer writes next.
+  // source lines instead, and an end marker lets the index measure the rendered extent between them. The HTML
+  // goes on to the sanitiser closed off so that it cannot run into the tag the renderer writes next.
   rules.html_block = (tokens, idx, _options, env) => {
     const token = tokens[idx];
     if (!token.map) return token.content + RAW_HTML_END;
     const [line, end] = token.map;
-    return `<div class="code-line" data-line="${line}" data-line-end="${end}"${mark({ nonce: nonceOf(env) })}></div>` +
-      token.content + RAW_HTML_END;
+    const nonce = mark({ nonce: nonceOf(env) });
+    const e = env as RenderEnv;
+    const ordinal = e.rawHtmlBlocks ?? 0;
+    e.rawHtmlBlocks = ordinal + 1;
+    return `<div class="code-line" data-line="${line}" data-line-end="${end}" ${RAW_HTML_ATTR}="start:${ordinal}"${nonce}></div>` +
+      token.content + RAW_HTML_END + `<span ${RAW_HTML_ATTR}="end:${ordinal}"${nonce}></span>`;
   };
   rules.html_inline = (tokens, idx) => tokens[idx].content + RAW_HTML_END;
 
@@ -230,6 +234,7 @@ export function createEngine(extend?: (md: MarkdownIt) => void): Engine {
 
   return {
     render(text, env) {
+      env.rawHtmlBlocks = 0;
       const lines = text.split("\n");
       // The end sentinel stands for the line after the last, so a scroll position past every block still maps.
       const sentinel = `<div class="code-line" data-line="${lines.length}"${mark(env)}></div>\n`;

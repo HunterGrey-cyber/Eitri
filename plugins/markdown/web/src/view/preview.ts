@@ -192,7 +192,7 @@ export class Preview {
   private readonly visualBoxes: HTMLElement;
   /** What the visual band or boxes were last drawn for: the mode, the selection's ends and the layout. */
   private visualMemo: { kind: string; ends: [Node, number, Node, number]; index: Box[]; width: number } | null = null;
-  /** Images on the document route that failed to load, by URL, for the route they were seen under. */
+  /** Images that failed to load for the shown text and document route, by URL. */
   private failed = new Set<string>();
   private failedRoute = "";
   private readonly tokens = new OwnTokens();
@@ -412,6 +412,7 @@ export class Preview {
    *  jump to a line, a history entry) names the shown one. */
   shownBuf(): number | null { return this.rendered?.buf ?? null; }
   shownName(): string { return this.rendered?.name ?? ""; }
+  shownDoc(): DocPrefixes | null { return this.rendered?.route ?? null; }
   fileName(): string { return this.view?.name ?? this.rendered?.name ?? ""; }
   isCurrent(): boolean { return this.view?.current ?? true; }
   blockedCount(): number { return this.rendered?.blocked ?? 0; }
@@ -1144,6 +1145,7 @@ export class Preview {
     // The reader's line, read before the update moves anything.
     const before = !switched && this.lead() !== "editor" ? (this.anchor ?? yToLine(this.index(), window.scrollY)) : null;
     const doc = this.view?.buf === t.buf ? this.view.doc : null;
+    if (this.lastText?.buf !== t.buf || this.lastText.text !== t.text) this.failed.clear();
     const result = renderDocument(this.engine, t, doc, this.settings, this.mermaid);
     const blocked = result.blocked + this.boxFailed(result.fragment, doc);
     this.root.hidden = false;
@@ -1167,8 +1169,8 @@ export class Preview {
   }
 
   /* The document route answers a missing file and a file outside the project alike, so an image under it that fails
-     is shown as outside the project, and stays so on later renders of the same route rather than flashing a broken
-     image each time. Returns how many it boxed. */
+     is shown as outside the project, and stays so on re-renders of the same text and route rather than flashing a
+     broken image each time. A text change lets it load again. Returns how many it boxed. */
   private boxFailed(fragment: DocumentFragment, doc: DocPrefixes | null): number {
     const key = docKey(doc);
     if (key !== this.failedRoute) { this.failed.clear(); this.failedRoute = key; }

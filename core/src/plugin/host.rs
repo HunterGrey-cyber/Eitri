@@ -1701,10 +1701,27 @@ impl PluginHost {
                 answer_or_drop(self.id(), audience, call, answer, replies);
                 Done::Other
             }
-            FollowOp::OpenLink { .. } => {
+            FollowOp::OpenLink { path, .. } => {
                 let answer = |re| {
                     Some(match decode_open(value) {
-                        Ok(opened) => Reply::ok(re, json!({ "how": opened.how, "line": opened.line })),
+                        Ok(opened) => {
+                            let name = opened.path.filter(|name| {
+                                let st = self.state.borrow();
+                                opened.filetype.as_deref().is_some_and(|ft| self.follows_filetype(ft))
+                                    && !st
+                                        .scratch_dir
+                                        .as_deref()
+                                        .is_some_and(|dir| crate::scratch::holds(dir, name))
+                                    && !st.scratch_prefix.as_deref().is_some_and(|prefix| {
+                                        name.as_bytes().starts_with(prefix.as_os_str().as_encoded_bytes())
+                                    })
+                            });
+                            Reply::ok(
+                                re,
+                                json!({ "how": opened.how, "line": opened.line,
+                                    "path": name.unwrap_or_else(|| path.to_string_lossy().into_owned()) }),
+                            )
+                        }
                         Err(why) => Reply::err(re, ErrorCode::Io, &why),
                     })
                 };

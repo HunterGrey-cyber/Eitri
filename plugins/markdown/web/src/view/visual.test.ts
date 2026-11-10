@@ -162,6 +162,42 @@ describe("the source of a selection", () => {
     expect(time(32000) / time(2000)).toBeLessThan(64);
   });
 
+
+  it.each([
+    (n: number) => "![".repeat(n),
+    (n: number) => "![".repeat(n) + "]",
+    (n: number) => "![a".repeat(n) + "]",
+    (n: number) => "![]( (".repeat(n),
+    (n: number) => "]( (".repeat(n),
+  ])("reads repeated unmatched image and link markers in time proportional to the line length: %s", (input) => {
+    vi.useRealTimers();
+    const time = (n: number) => {
+      const line = input(n);
+      let best = Number.POSITIVE_INFINITY;
+      for (let i = 0; i < 3; i++) {
+        const start = performance.now();
+        expect(drawnPart(line)).toBe(line);
+        best = Math.min(best, performance.now() - start);
+      }
+      return Math.max(best, 0.05);
+    };
+    time(1000);
+    expect(time(32000) / time(2000)).toBeLessThan(64);
+    expect(drawnPart("![![open then ![closed](x.png)")).toBe("");
+    expect(drawnPart("![open `![code` rest")).toBe("![open ![code rest");
+  });
+
+  it("caps shortcut and collapsed image labels while keeping long inline and full-reference alt text", () => {
+    const capped = "a".repeat(999);
+    const over = capped + "a";
+    const refs = new Set([capped, over, "ok"]);
+    expect(drawnPart(`![${capped}] ![${capped}][]`, false, refs)).toBe(" ");
+    expect(drawnPart(`![${over}]`, false, refs)).toBe(`![${over}]`);
+    expect(drawnPart(`![${over}][]`, false, refs)).toBe(`![${over}]`);
+    expect(drawnPart(`![${over}](image.png) ![${over}][ok]`, false, refs)).toBe(" ");
+    expect(drawnPart(`![${capped}][missing]`, false, refs)).toBe(`![${capped}][missing]`);
+  });
+
   it("is linewise when the word's one written copy is not the one drawn (an entity, a link's target)", () => {
     show("caf&eacute; [x](caf\u00e9)\n");
     expect(sourceSelection(p, select("caf\u00e9", "caf\u00e9"), "char")).toEqual(

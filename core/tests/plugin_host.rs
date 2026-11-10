@@ -2035,7 +2035,7 @@ fn open_link_resolves_against_the_document_and_stays_in_the_project() {
         d.rig.host.pump(d.t0);
         assert_eq!(
             d.rig.page.replies_to(id)[0]["result"],
-            json!({"how": "edit", "line": line.unwrap_or(1)}),
+            json!({"how": "edit", "line": line.unwrap_or(1), "path": path}),
             "{target}"
         );
     };
@@ -2068,6 +2068,83 @@ fn open_link_resolves_against_the_document_and_stays_in_the_project() {
     assert_eq!(wrong["error"]["code"], "bad_request");
     assert_eq!(wrong["error"]["message"], "buf is not the followed buffer");
     assert_eq!(open_calls(&d.rig).len(), 5, "no refused link reached the editor");
+}
+
+#[test]
+fn open_link_returns_the_followed_editors_buffer_name_instead_of_the_checked_path() {
+    let d = shown("host-open-link-alias");
+    let (id, opts) = link_opened(&d, "other.md");
+    assert_eq!(opt(&opts, "path"), binary(&d.proj.join("docs/other.md")));
+    let alias = d.s.join("alias/other.md");
+    answer(
+        &d.rig,
+        map(&[
+            ("how", "edit".into()),
+            ("line", 1.into()),
+            ("col", 0.into()),
+            ("path", alias.to_str().unwrap().into()),
+            ("filetype", "markdown".into()),
+        ]),
+    );
+    d.rig.host.pump(d.t0);
+    assert_eq!(d.rig.page.replies_to(id)[0]["result"]["path"], json!(alias));
+}
+
+#[test]
+fn open_link_returns_the_checked_path_for_an_alias_with_a_non_followed_filetype() {
+    let d = shown("host-open-link-non-followed-alias");
+    let alias = d.s.join("alias/main.rs");
+    for filetype in [Some("rust"), Some(""), None] {
+        let (id, opts) = link_opened(&d, "/src/main.rs");
+        assert_eq!(opt(&opts, "path"), binary(&d.proj.join("src/main.rs")));
+        let mut fields = vec![
+            ("how", "edit".into()),
+            ("line", 1.into()),
+            ("col", 0.into()),
+            ("path", alias.to_str().unwrap().into()),
+        ];
+        if let Some(filetype) = filetype {
+            fields.push(("filetype", filetype.into()));
+        }
+        answer(&d.rig, map(&fields));
+        d.rig.host.pump(d.t0);
+        assert_eq!(
+            d.rig.page.replies_to(id)[0]["result"]["path"],
+            json!(d.proj.join("src/main.rs")),
+            "{filetype:?}"
+        );
+    }
+}
+
+#[test]
+fn open_link_returns_the_checked_path_for_a_scratch_alias() {
+    for prefix in [false, true] {
+        let d = shown("host-open-link-scratch-alias");
+        let scratch = d.s.join("nv-sc-window");
+        if prefix {
+            d.rig.host.set_scratch_prefix(Some(d.s.join("nv-sc-")));
+        } else {
+            d.rig
+                .host
+                .set_follow_feed(d.s.join("follow.sock"), Some(scratch.clone()));
+        }
+        let (id, _) = link_opened(&d, "other.md");
+        answer(
+            &d.rig,
+            map(&[
+                ("how", "edit".into()),
+                ("line", 1.into()),
+                ("col", 0.into()),
+                ("path", scratch.join("draft.md").to_str().unwrap().into()),
+                ("filetype", "markdown".into()),
+            ]),
+        );
+        d.rig.host.pump(d.t0);
+        assert_eq!(
+            d.rig.page.replies_to(id)[0]["result"]["path"],
+            json!(d.proj.join("docs/other.md"))
+        );
+    }
 }
 
 #[test]

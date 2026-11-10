@@ -156,7 +156,7 @@ export async function boot(doc: Document, win: Host, opts: BootOptions = {}): Pr
   let writes: Promise<void> = Promise.resolve();
   const mark = () => {
     const key = kit.store.selection();
-    if (key === null || !kit.store.byKey(key)) return;
+    if (key === null || !order().includes(key) || !kit.store.byKey(key)) return;
     const op = { key, add: !marks.has(key) };
     pending.push(op);
     made += 1;

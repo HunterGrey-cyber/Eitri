@@ -44,7 +44,7 @@ export async function bindKeys(opts: BindOptions, store: Store, bridge: Bridge, 
     run(action) {
       const order = opts.order();
       const selected = store.selection();
-      const row = selected === null ? undefined : store.byKey(selected);
+      const row = selected === null || !order.includes(selected) ? undefined : store.byKey(selected);
       switch (action) {
         case "agents.next":
         case "agents.prev": {

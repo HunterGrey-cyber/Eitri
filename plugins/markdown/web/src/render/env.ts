@@ -6,11 +6,14 @@ export type { DocPrefixes } from "../protocol";
 export const NONCE_ATTR = "data-eitri-n";
 /** On a fenced code block: how many lines of code it holds, the lines after its opening fence line. */
 export const FENCE_ATTR = "data-eitri-fence";
+/** Renderer-owned boundaries of a raw HTML block, kept only after the nonce check. */
+export const RAW_HTML_ATTR = "data-eitri-html";
 
 export type BlockReason = "http" | "remote_off" | "outside" | "unsaved";
 
 export interface RenderEnv {
   nonce: string;
+  rawHtmlBlocks?: number;
   doc: DocPrefixes | null;
   remoteImages: "https" | "off";
   blocked: { reason: BlockReason; alt: string }[];

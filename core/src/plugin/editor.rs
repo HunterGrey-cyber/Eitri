@@ -295,6 +295,8 @@ pub struct Opened {
     pub how: String,
     pub line: u64,
     pub col: u64,
+    pub path: Option<String>,
+    pub filetype: Option<String>,
 }
 
 fn field<'a>(answer: &'a Value, key: &str) -> Option<&'a Value> {
@@ -342,6 +344,8 @@ pub fn decode_open(answer: &Value) -> Result<Opened, String> {
         how,
         line: count(answer, "line")?,
         col: count(answer, "col")?,
+        path: field(answer, "path").and_then(lossy_text),
+        filetype: field(answer, "filetype").and_then(Value::as_str).map(str::to_owned),
     })
 }
 

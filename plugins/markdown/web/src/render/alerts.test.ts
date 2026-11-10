@@ -121,4 +121,21 @@ describe("alertsPlugin", () => {
     expect(box.getAttribute("data-line")).toBe("0");
     expect([...box.classList].sort()).toEqual(["code-line", "markdown-alert", "markdown-alert-note"]);
   });
+  it("searches alert bodies in time proportional to the number of alerts", () => {
+    const md = new MarkdownIt();
+    alertsPlugin(md);
+    const time = (n: number) => {
+      const source = "> [!NOTE]\n> body\n\n".repeat(n);
+      let best = Number.POSITIVE_INFINITY;
+      for (let i = 0; i < 3; i++) {
+        const start = performance.now();
+        md.parse(source, { nonce: "n1" });
+        best = Math.min(best, performance.now() - start);
+      }
+      return Math.max(best, 0.05);
+    };
+    time(500);
+    expect(time(16000) / time(1000)).toBeLessThan(64);
+  });
+
 });

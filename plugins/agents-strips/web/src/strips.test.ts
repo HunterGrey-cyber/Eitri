@@ -48,6 +48,7 @@ type OpenOpts = {
   marksEvery?: number;
   tick?: boolean;
   now?: () => number;
+  lookupRow?: ReturnType<typeof row>;
 };
 
 async function open(rows: unknown[], opts: OpenOpts = {}) {
@@ -92,6 +93,12 @@ async function open(rows: unknown[], opts: OpenOpts = {}) {
     },
   });
   await import("../../../../plugin-kit/agents/src/index");
+  if (opts.lookupRow) {
+    const kit = window.eitriAgents!;
+    window.eitriAgents = { ...kit, store: { ...kit.store,
+      byKey: key => key === opts.lookupRow!.key ? opts.lookupRow! : kit.store.byKey(key),
+    } };
+  }
   const { boot } = await import("./app");
   const page = await boot(document, window, {
     now: opts.now ?? (() => NOW), tick: opts.tick ?? false, marksEvery: opts.marksEvery,
@@ -212,6 +219,17 @@ it("m_marks_into_state", async () => {
 });
 
 const markRow = (page: Awaited<ReturnType<typeof open>>) => page.keys().rows.find(r => r.keys.includes("m"))!;
+
+it("m_cannot_mark_a_selection_outside_the_displayed_order", async () => {
+  const page = await open([row("k-b")], { lookupRow: row("k-a") });
+  page.emit("agents.selection", { key: "k-a", at: NOW, by: WINDOW.instance });
+  expect(page.at("k-a")).toBeNull();
+  page.call.mockClear();
+  page.keys().run(markRow(page).action, new KeyboardEvent("keydown"));
+  await Promise.resolve();
+  await Promise.resolve();
+  expect(page.call).not.toHaveBeenCalled();
+});
 
 it("a_mark_keeps_the_marks_another_window_wrote", async () => {
   const store: { value: unknown } = { value: null };

@@ -7,7 +7,8 @@
   color: var(--nv-fg);
 }
 
-.markdown-alert > :last-child {
+.markdown-alert > :last-child,
+.markdown-alert > :has(+ [data-eitri-html^="end:"]:last-child) {
   margin-bottom: 0;
 }
 

@@ -43,8 +43,7 @@ function shownBefore(block: Element, end: Place | null): string {
 }
 
 /** A link's or image's destination and optional title, as CommonMark writes it inline. */
-const DEST = String.raw`\((?:[^()\s]|\([^()]*\))*(?:\s+(?:"[^"]*"|'[^']*'|\([^)]*\)))?\s*\)`;
-const IMAGE = new RegExp(String.raw`!\[([^\]]*)\](?:(${DEST})|\[([^\]]*)\])?`, "y");
+const DEST = String.raw`\((?:[^()\s]|\([^()]*\))*(?:\s+(?:"[^"]*"|'[^']*'|\([^()]*\)))?\s*\)`;
 const TARGET = new RegExp(String.raw`\](?:(${DEST})|\[([^\]]*)\])`, "y");
 const COMMENT = /<!--[\s\S]*?(?:-->|$)/y;
 const AUTOLINK = /<([A-Za-z][A-Za-z0-9+.-]{1,31}:[^<>\s]*|[^<>\s@]+@[^<>\s@]+)>/y;
@@ -98,6 +97,25 @@ export function drawnPart(line: string, code = false, refs: ReadonlySet<string> 
     seen.set(runs[k].len, k);
   }
   const runAt = new Map(runs.map((r, k) => [r.at, k]));
+  // Image starts can share a closing bracket. Find it once, and read its suffix once, even for rejected images.
+  const nextClose = new Int32Array(text.length + 1);
+  let next = -1;
+  for (let j = text.length; j >= 0; j--) {
+    if (text[j] === "]") next = j;
+    nextClose[j] = next;
+  }
+  type Tail = { end: number; destination: boolean; full: boolean; defined: boolean };
+  const tails = new Map<number, Tail>();
+  const tail = (r: number): Tail => {
+    let cached = tails.get(r);
+    if (!cached) {
+      const m = stickyAt(TARGET, text, r);
+      cached = { end: m ? r + m[0].length : r + 1, destination: m?.[1] !== undefined,
+        full: m?.[2] !== undefined && m[2] !== "", defined: m?.[2] !== undefined && refs.has(label(m[2])) };
+      tails.set(r, cached);
+    }
+    return cached;
+  };
   let out = "";
   let plain = 0;
   let i = 0;
@@ -116,11 +134,18 @@ export function drawnPart(line: string, code = false, refs: ReadonlySet<string> 
     } else if (ch === "<" && (m = stickyAt(COMMENT, text, i))) take(i, "", i + m[0].length);
     else if (ch === "<" && (m = stickyAt(AUTOLINK, text, i))) take(i, m[1], i + m[0].length);
     else if (ch === "<" && (m = stickyAt(TAG, text, i))) take(i, "", i + m[0].length);
-    else if (ch === "!" && (m = stickyAt(IMAGE, text, i)) &&
-      (m[2] !== undefined || refs.has(label(m[3] !== undefined && m[3] !== "" ? m[3] : m[1])))) {
-      take(i, "", i + m[0].length);
-    } else if (ch === "]" && (m = stickyAt(TARGET, text, i)) && (m[1] !== undefined || m[2] === "" || refs.has(label(m[2])))) {
-      take(i, "]", i + m[0].length);
+    else if (ch === "!" && text[i + 1] === "[") {
+      const r = nextClose[i + 2];
+      if (r < 0) { i++; continue; }
+      const t = tail(r);
+      // Shortcut and collapsed references have a bounded label; an overlong rejected start never scans its suffix.
+      const image = t.destination || (t.full ? t.defined : r - i - 2 <= 999 && refs.has(label(text.slice(i + 2, r))));
+      if (image) take(i, "", t.end);
+      else i++;
+    } else if (ch === "]") {
+      const t = tail(i);
+      if (t.end > i + 1 && (t.destination || !t.full || t.defined)) take(i, "]", t.end);
+      else i++;
     } else i++;
   }
   return out + text.slice(plain);

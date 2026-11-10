@@ -227,7 +227,7 @@ describe("the preview", () => {
     expect((runner.fill as ReturnType<typeof vi.fn>).mock.calls.length).toBe(before + 1);
   });
 
-  it("turns a document-route image that fails to load into an outside-the-project box, counted, on every render", () => {
+  it("turns a document-route image that fails to load into an outside-the-project box, counted, until its text changes", () => {
     const p = make();
     p.onView(view(1, 1));
     show(p, 1, "![out](link-out.png)\n\n![x](x.png)");
@@ -240,9 +240,21 @@ describe("the preview", () => {
     expect(root.querySelectorAll("img")).toHaveLength(1);
     expect(p.blockedCount()).toBe(1);
     expect(seen).toContain("anchor");
-    show(p, 1, "![out](link-out.png)\n\n![x](x.png)\n\nmore");
+    p.rerender();
+    vi.advanceTimersByTime(0);
     expect(root.querySelector('img[alt="out"]')).toBeNull();
     expect(p.blockedCount()).toBe(1);
+    // A host update with unchanged text also keeps the failed URL boxed.
+    p.onText(text(1, "![out](link-out.png)\n\n![x](x.png)", 2));
+    vi.advanceTimersByTime(0);
+    expect(root.querySelector('img[alt="out"]')).toBeNull();
+    show(p, 1, "![out](link-out.png)\n\n![x](x.png)\n\nmore");
+    expect(root.querySelector('img[alt="out"]')).not.toBeNull();
+    expect(p.blockedCount()).toBe(0);
+    root.querySelector('img[alt="out"]')!.dispatchEvent(new Event("load"));
+    p.rerender();
+    vi.advanceTimersByTime(0);
+    expect(root.querySelector('img[alt="out"]')).not.toBeNull();
     // An image outside the document route (a data: URL) that fails is left to the engine as it is.
     show(p, 1, "![d](data:image/png;base64,AAAA)");
     root.querySelector('img[alt="d"]')!.dispatchEvent(new Event("error"));

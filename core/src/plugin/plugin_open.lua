@@ -133,4 +133,4 @@ if col < 1 then
 end
 local byte = byte_col(text, col - 1)
 vim.api.nvim_win_set_cursor(win, { line, byte })
-return { how = how, line = line, col = byte }
+return { how = how, line = line, col = byte, path = vim.api.nvim_buf_get_name(buf), filetype = vim.bo[buf].filetype }

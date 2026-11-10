@@ -65,7 +65,10 @@ export function alertsPlugin(md: MarkdownIt): void {
       }
       // A marker alone in its paragraph (a nested quote or a list follows it) leaves that paragraph empty, which
       // would draw as a blank line under the title.
-      const first = tokens.findIndex((t, j) => j > i && j < close && t.type === "inline");
+      let first = -1;
+      for (let j = i + 1; j < close; j++) {
+        if (tokens[j].type === "inline") { first = j; break; }
+      }
       if (first > 0 && tokens[first].content.trim() === "" && tokens[first - 1].type === "paragraph_open" &&
         tokens[first + 1]?.type === "paragraph_close") {
         tokens[first - 1].hidden = true;

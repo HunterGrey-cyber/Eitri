@@ -1,4 +1,4 @@
-import { FENCE_ATTR } from "../render/env";
+import { FENCE_ATTR, RAW_HTML_ATTR } from "../render/env";
 
 /** One block of the rendered document and the source lines it stands for, in document coordinates. */
 export interface Box { line: number; end: number; top: number; height: number; el: Element }
@@ -53,10 +53,34 @@ function inClosedDetails(el: Element, root: Element): boolean {
 export function measure(root: Element, scrollY: number): Measured[] {
   const out: Measured[] = [];
   const byEl = new Map<Element, Measured>();
+  // The sanitiser keeps these boundaries only when the renderer marked them with its nonce. The HTML between
+  // them supplies geometry alone; its attributes never supply source lines or a boundary.
+  const htmlBoxes = new Map<Element, { top: number; height: number }>();
+  const starts = new Map<string, Element>();
+  for (const el of root.querySelectorAll(`[${RAW_HTML_ATTR}]`)) {
+    const boundary = /^(start|end):(\d+)$/.exec(el.getAttribute(RAW_HTML_ATTR) ?? "");
+    if (!boundary) continue;
+    const [, kind, ordinal] = boundary;
+    if (kind === "start") { starts.set(ordinal, el); continue; }
+    const start = starts.get(ordinal);
+    if (!start) continue;
+    starts.delete(ordinal);
+    const range = root.ownerDocument.createRange();
+    range.setStartAfter(start);
+    range.setEndBefore(el);
+    let top = Number.POSITIVE_INFINITY;
+    let bottom = Number.NEGATIVE_INFINITY;
+    for (const rect of Array.from(range.getClientRects?.() ?? [])) {
+      if (rect.height <= 0) continue;
+      top = Math.min(top, rect.top);
+      bottom = Math.max(bottom, rect.bottom);
+    }
+    if (bottom > top) htmlBoxes.set(start, { top, height: bottom - top });
+  }
   for (const el of root.querySelectorAll(".code-line")) {
     const line = lineAttr(el.getAttribute("data-line"));
     if (line === null) continue;
-    const rect = el.getBoundingClientRect();
+    const rect = htmlBoxes.get(el) ?? el.getBoundingClientRect();
     let top = rect.top + scrollY;
     let height = rect.height;
     if (el.tagName === "PRE") {

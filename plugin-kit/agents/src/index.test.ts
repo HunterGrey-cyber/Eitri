@@ -215,3 +215,17 @@ it("a_face_cannot_mutate_the_stores_rows_or_round", async () => {
   expect(kit.store.rows()).toEqual([original]);
   expect(kit.store.round()).toEqual(watch.result.round);
 });
+
+
+it("filtered_out_selection_cannot_open_create_or_stop_an_agent", async () => {
+  const press = await bind(() => ["k-other"]);
+  emit("agents.row", row("k-other"));
+  expect(kit.store.selection()).toBe(original.key);
+  for (const cls of ["needs", "quiet"]) {
+    emit("agents.row", row(original.key, { class: cls }));
+    for (const key of ["<CR>", "c", "x"]) press(key);
+  }
+  expect(call).not.toHaveBeenCalled();
+  press("j");
+  expect(call).toHaveBeenLastCalledWith("agents.select", { key: "k-other" });
+});
