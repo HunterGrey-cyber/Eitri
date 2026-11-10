@@ -12,7 +12,7 @@ pub mod wire;
 
 use std::ffi::{OsStr, OsString};
 use std::io::{Read, Write};
-use std::os::fd::OwnedFd;
+use std::os::fd::{AsRawFd, OwnedFd};
 use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
@@ -73,6 +73,8 @@ pub struct Finished {
     /// Its output as text, whole, unless it went to `spooled`, when this is its first part.
     pub output: String,
     pub spooled: Option<Spooled>,
+    /// Why output collection or storage was incomplete.
+    pub output_loss: Option<String>,
     /// The directory the next line starts in, when this one moved and stayed in the project.
     pub cwd: Option<PathBuf>,
     /// It ended outside the project.
@@ -83,14 +85,17 @@ pub struct Finished {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Spooled {
     pub path: PathBuf,
-    /// How much it printed, which may be more than the file holds.
+    /// Bytes collected before the reader stopped, which may be more than the file holds.
     pub bytes: u64,
+    /// Bytes actually saved, always a prefix of the collected output.
+    pub stored_bytes: u64,
 }
 
 /// A line that is running. Dropping it kills what it started.
 pub struct Running {
     control: Arc<Control>,
     done: mpsc::Receiver<Finished>,
+    failure: std::cell::Cell<Option<Finished>>,
 }
 
 struct Control {
@@ -98,6 +103,8 @@ struct Control {
     /// is taken under this lock and nothing signals it after.
     group: Mutex<Option<i32>>,
     interrupted: AtomicBool,
+    #[cfg(test)]
+    readers: Arc<std::sync::atomic::AtomicUsize>,
 }
 
 impl Control {
@@ -120,7 +127,14 @@ impl Running {
 
     /// Its end, once it has one.
     pub fn finished(&self) -> Option<Finished> {
-        self.done.try_recv().ok()
+        match self.done.try_recv() {
+            Ok(finished) => {
+                self.failure.take();
+                Some(finished)
+            }
+            Err(mpsc::TryRecvError::Empty) => None,
+            Err(mpsc::TryRecvError::Disconnected) => self.failure.take(),
+        }
     }
 }
 
@@ -189,19 +203,16 @@ struct Gathered {
     held: Vec<u8>,
     total: u64,
     spool: Option<(PathBuf, std::fs::File, u64)>,
+    output_loss: Option<&'static str>,
 }
 
 impl Gathered {
     fn take(&mut self, bytes: &[u8], spool_dir: Option<&Path>) {
         self.total += bytes.len() as u64;
-        if self.spool.is_none() && self.held.len() + bytes.len() > MEMORY_BYTES {
+        if self.spool.is_none() && self.output_loss.is_none() && self.held.len() + bytes.len() > MEMORY_BYTES {
             self.open_spool(spool_dir);
         }
-        if let Some((_, file, written)) = &mut self.spool {
-            if *written < SPOOL_BYTES && file.write_all(bytes).is_ok() {
-                *written += bytes.len() as u64;
-            }
-        }
+        self.write_spool(bytes);
         // The first part stays in memory either way: it is what the row and the preview show.
         let room = MEMORY_BYTES.saturating_sub(self.held.len());
         self.held.extend_from_slice(&bytes[..bytes.len().min(room)]);
@@ -209,36 +220,134 @@ impl Gathered {
 
     fn open_spool(&mut self, spool_dir: Option<&Path>) {
         let Some(dir) = spool_dir else {
+            self.output_loss = Some("output file unavailable");
             return;
         };
         let path = dir.join(format!("{}.txt", uuid::Uuid::new_v4()));
-        if let Ok(mut file) = agent::private_fs::open_private(&path) {
-            if file.write_all(&self.held).is_ok() {
-                self.spool = Some((path, file, self.held.len() as u64));
+        match agent::private_fs::open_private(&path) {
+            Ok(file) => {
+                self.spool = Some((path, file, 0));
+                let held = std::mem::take(&mut self.held);
+                self.write_spool(&held);
+                self.held = held;
             }
+            Err(_) => self.output_loss = Some("spool write error"),
+        }
+    }
+
+    fn write_spool(&mut self, bytes: &[u8]) {
+        if self.output_loss.is_some() {
+            return;
+        }
+        let Some((_, file, written)) = &mut self.spool else {
+            return;
+        };
+        let keep = bytes.len().min((SPOOL_BYTES - *written) as usize);
+        let mut remaining = &bytes[..keep];
+        while !remaining.is_empty() {
+            match file.write(remaining) {
+                Ok(0) => {
+                    self.output_loss = Some("spool write error");
+                    return;
+                }
+                Ok(n) => {
+                    *written += n as u64;
+                    remaining = &remaining[n..];
+                }
+                Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
+                Err(_) => {
+                    self.output_loss = Some("spool write error");
+                    return;
+                }
+            }
+        }
+        if keep < bytes.len() {
+            self.output_loss = Some("64 MiB cap");
         }
     }
 }
 
-fn spawn_reader(pipe: OwnedFd, gathered: Arc<Mutex<Gathered>>, spool_dir: Option<PathBuf>) -> mpsc::Receiver<()> {
+struct OutputReader {
+    stop: Option<std::io::PipeWriter>,
+    ended: mpsc::Receiver<()>,
+    thread: Option<std::thread::JoinHandle<()>>,
+}
+
+impl Drop for OutputReader {
+    fn drop(&mut self) {
+        // Closing the stop pipe wakes poll even when a background job keeps stdout open.
+        self.stop.take();
+        if let Some(thread) = self.thread.take() {
+            let _ = thread.join();
+        }
+    }
+}
+
+fn spawn_reader(
+    pipe: OwnedFd,
+    gathered: Arc<Mutex<Gathered>>,
+    spool_dir: Option<PathBuf>,
+    _control: &Control,
+) -> std::io::Result<OutputReader> {
+    let (stop_read, stop) = std::io::pipe()?;
+    // SAFETY: the owned pipe is live; only its read end is made nonblocking.
+    unsafe {
+        let flags = libc::fcntl(pipe.as_raw_fd(), libc::F_GETFL);
+        if flags < 0 || libc::fcntl(pipe.as_raw_fd(), libc::F_SETFL, flags | libc::O_NONBLOCK) < 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+    }
     let (ended, read_end) = mpsc::channel();
-    let spawned = std::thread::Builder::new()
+    #[cfg(test)]
+    let count = tests::ReaderCount::new(Arc::clone(&_control.readers));
+    let thread = std::thread::Builder::new()
         .name("shell-line-output".into())
         .spawn(move || {
+            #[cfg(test)]
+            let _count = count;
             let mut pipe = std::fs::File::from(pipe);
+            let mut fds = [pipe.as_raw_fd(), stop_read.as_raw_fd()].map(|fd| libc::pollfd {
+                fd,
+                events: libc::POLLIN,
+                revents: 0,
+            });
             let mut buffer = [0u8; 64 * 1024];
             loop {
+                // SAFETY: both descriptors and the pollfd array live through this call.
+                if unsafe { libc::poll(fds.as_mut_ptr(), fds.len() as _, -1) } < 0 {
+                    if std::io::Error::last_os_error().kind() == std::io::ErrorKind::Interrupted {
+                        continue;
+                    }
+                    gathered.lock().unwrap().output_loss = Some("output poll error");
+                    break;
+                }
+                if fds[1].revents != 0 {
+                    break;
+                }
                 match pipe.read(&mut buffer) {
-                    Ok(0) | Err(_) => break,
+                    Ok(0) => break,
                     Ok(read) => gathered.lock().unwrap().take(&buffer[..read], spool_dir.as_deref()),
+                    Err(e)
+                        if matches!(
+                            e.kind(),
+                            std::io::ErrorKind::Interrupted | std::io::ErrorKind::WouldBlock
+                        ) =>
+                    {
+                        continue
+                    }
+                    Err(_) => {
+                        gathered.lock().unwrap().output_loss = Some("output read error");
+                        break;
+                    }
                 }
             }
             let _ = ended.send(());
-        });
-    if spawned.is_err() {
-        eprintln!("[shell_line] no thread to read a line's output");
-    }
-    read_end
+        })?;
+    Ok(OutputReader {
+        stop: Some(stop),
+        ended: read_end,
+        thread: Some(thread),
+    })
 }
 
 fn not_started(request: &Request, why: String) -> Finished {
@@ -247,6 +356,7 @@ fn not_started(request: &Request, why: String) -> Finished {
         ending: Ending::NotStarted,
         output: why,
         spooled: None,
+        output_loss: None,
         cwd: None,
         left_project: false,
     }
@@ -255,24 +365,45 @@ fn not_started(request: &Request, why: String) -> Finished {
 /// Starts `request` in a process group of its own, with `shell` or the one [`choose_shell`] finds. `wake` is
 /// called, from a worker, once [`Running::finished`] has its answer.
 pub fn start(request: Request, shell: Option<PathBuf>, wake: impl Fn() + Send + 'static) -> Running {
+    start_with_spawn(request, shell, wake, |job| {
+        std::thread::Builder::new()
+            .name("shell-line".into())
+            .spawn(job)
+            .map(|_| ())
+    })
+}
+
+fn start_with_spawn(
+    request: Request,
+    shell: Option<PathBuf>,
+    wake: impl Fn() + Send + 'static,
+    spawn: impl FnOnce(Box<dyn FnOnce() + Send>) -> std::io::Result<()>,
+) -> Running {
     let control = Arc::new(Control {
         group: Mutex::new(None),
         interrupted: AtomicBool::new(false),
+        #[cfg(test)]
+        readers: Arc::default(),
     });
     let (tx, done) = mpsc::channel();
+    let mut failure = not_started(&request, "shell worker disconnected before reporting its result".into());
     let worker = {
         let control = Arc::clone(&control);
-        std::thread::Builder::new().name("shell-line".into()).spawn(move || {
+        spawn(Box::new(move || {
             let finished =
                 run_child(&request, shell.as_deref(), &control).unwrap_or_else(|why| not_started(&request, why));
             let _ = tx.send(finished);
             wake();
-        })
+        }))
     };
     if let Err(error) = worker {
-        eprintln!("[shell_line] no thread to run a line: {error}");
+        failure.output = format!("no thread to run a line: {error}");
     }
-    Running { control, done }
+    Running {
+        control,
+        done,
+        failure: std::cell::Cell::new(Some(failure)),
+    }
 }
 
 fn run_child(request: &Request, shell: Option<&Path>, control: &Control) -> Result<Finished, String> {
@@ -284,6 +415,9 @@ fn run_child(request: &Request, shell: Option<&Path>, control: &Control) -> Resu
     let spool = request.spool_dir.clone().or_else(spool_dir);
     let (reader, writer) = std::io::pipe().map_err(|e| format!("no pipe for its output: {e}"))?;
     let writer_two = writer.try_clone().map_err(|e| format!("no pipe for its output: {e}"))?;
+    let gathered = Arc::new(Mutex::new(Gathered::default()));
+    let reader = spawn_reader(reader.into(), Arc::clone(&gathered), spool.clone(), control)
+        .map_err(|e| format!("no reader for its output: {e}"))?;
     let cwd_file = tempfile_near(spool.as_deref());
     let mut command = Command::new(shell);
     command
@@ -306,8 +440,6 @@ fn run_child(request: &Request, shell: Option<&Path>, control: &Control) -> Resu
     drop(command);
     let group = child.id() as i32;
     *control.group.lock().unwrap() = Some(group);
-    let gathered = Arc::new(Mutex::new(Gathered::default()));
-    let read_end = spawn_reader(reader.into(), Arc::clone(&gathered), spool.clone());
 
     let began = Instant::now();
     let mut asked_to_stop: Option<Instant> = None;
@@ -339,7 +471,8 @@ fn run_child(request: &Request, shell: Option<&Path>, control: &Control) -> Resu
         }
         std::thread::sleep(POLL);
     };
-    let _ = read_end.recv_timeout(DRAIN_GRACE);
+    let drain_cut = reader.ended.recv_timeout(DRAIN_GRACE).is_err();
+    drop(reader);
     let ending = if control.interrupted.load(Ordering::SeqCst) {
         Ending::Interrupted
     } else if timed_out {
@@ -359,16 +492,26 @@ fn run_child(request: &Request, shell: Option<&Path>, control: &Control) -> Resu
     }
     let mut gathered = gathered.lock().unwrap();
     let output = String::from_utf8_lossy(&gathered.held).into_owned();
-    if gathered.spool.is_none() && output.chars().count() > wire::INLINE_CHARS {
+    if gathered.spool.is_none() && gathered.output_loss.is_none() && output.chars().count() > wire::INLINE_CHARS {
         gathered.open_spool(spool.as_deref());
     }
     let total = gathered.total;
-    let spooled = gathered.spool.take().map(|(path, _, _)| Spooled { path, bytes: total });
+    let spooled = gathered.spool.take().map(|(path, _, stored_bytes)| Spooled {
+        path,
+        bytes: total,
+        stored_bytes,
+    });
+    let mut output_loss = gathered.output_loss.map(str::to_string);
+    if drain_cut {
+        let why = "background pipe still open at drain deadline; later output discarded";
+        output_loss = Some(output_loss.map_or_else(|| why.to_string(), |old| format!("{old}; {why}")));
+    }
     Ok(Finished {
         command: request.command.clone(),
         ending,
         output,
         spooled,
+        output_loss,
         cwd,
         left_project,
     })

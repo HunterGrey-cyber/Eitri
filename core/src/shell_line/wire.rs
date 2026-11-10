@@ -42,11 +42,25 @@ fn preview(text: &str) -> &str {
     }
 }
 
-fn persisted(spooled: &Spooled, output: &str) -> String {
+fn saved(spooled: &Spooled, loss: Option<&str>) -> String {
+    if spooled.stored_bytes == spooled.bytes && loss.is_none() {
+        format!("Full output saved to: {}", spooled.path.display())
+    } else {
+        format!(
+            "Output file holds the first {} bytes of {} collected bytes ({}): {}",
+            spooled.stored_bytes,
+            spooled.bytes,
+            loss.unwrap_or("output incomplete"),
+            spooled.path.display(),
+        )
+    }
+}
+
+fn persisted(spooled: &Spooled, output: &str, loss: Option<&str>) -> String {
     format!(
-        "<persisted-output>\nOutput too large ({}). Full output saved to: {}\n\nPreview (first 2KB):\n{}\n...\n</persisted-output>",
+        "<persisted-output>\nOutput too large ({}). {}\n\nPreview (first 2KB):\n{}\n...\n</persisted-output>",
         size_words(spooled.bytes),
-        spooled.path.display(),
+        saved(spooled, loss),
         escaped(preview(output)),
     )
 }
@@ -58,10 +72,14 @@ fn cut(output: &str) -> String {
 }
 
 fn body(line: &Finished) -> String {
-    match &line.spooled {
-        Some(spooled) => persisted(spooled, &line.output),
+    let text = match &line.spooled {
+        Some(spooled) => persisted(spooled, &line.output, line.output_loss.as_deref()),
         None if line.output.chars().count() > INLINE_CHARS => cut(&line.output),
         None => escaped(&line.output),
+    };
+    match (&line.spooled, &line.output_loss) {
+        (None, Some(why)) => format!("{text}\n[output incomplete: {}]", escaped(why)),
+        _ => text,
     }
 }
 
@@ -145,13 +163,20 @@ fn without_escapes(text: &str) -> String {
 /// What the line's row says. The text is a program's: the page draws it as text.
 pub fn row_text(line: &Finished) -> String {
     let output = without_escapes(&line.output);
-    let shown = if line.spooled.is_some() {
+    let mut shown = if line.spooled.is_some() {
         format!("{}\n...", preview(&output))
     } else if output.chars().count() > INLINE_CHARS {
         format!("{}\n...", output.chars().take(INLINE_CHARS).collect::<String>())
     } else {
         output.trim_end_matches('\n').to_string()
     };
+    if let Some(spooled) = &line.spooled {
+        if spooled.stored_bytes != spooled.bytes || line.output_loss.is_some() {
+            shown.push_str(&format!("\n{}", saved(spooled, line.output_loss.as_deref())));
+        }
+    } else if let Some(why) = &line.output_loss {
+        shown.push_str(&format!("\n[output incomplete: {why}]"));
+    }
     let word = match line.ending {
         Ending::Interrupted => Some("Interrupted".to_string()),
         Ending::TimedOut(limit) => Some(timeout_words(limit)),
@@ -178,6 +203,7 @@ mod tests {
             ending,
             output: output.to_string(),
             spooled: None,
+            output_loss: None,
             cwd: None,
             left_project: false,
         }
@@ -256,6 +282,7 @@ mod tests {
         line.spooled = Some(Spooled {
             path: PathBuf::from("/s/o.txt"),
             bytes: output.len() as u64,
+            stored_bytes: output.len() as u64,
         });
         let text = wire_text(&line, None);
         assert!(

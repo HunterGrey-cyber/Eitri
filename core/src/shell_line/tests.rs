@@ -1,6 +1,139 @@
 use super::*;
 use std::sync::mpsc::Receiver;
 
+pub(super) struct ReaderCount(Arc<std::sync::atomic::AtomicUsize>);
+
+impl ReaderCount {
+    pub(super) fn new(count: Arc<std::sync::atomic::AtomicUsize>) -> Self {
+        count.fetch_add(1, Ordering::SeqCst);
+        Self(count)
+    }
+}
+
+impl Drop for ReaderCount {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, Ordering::SeqCst);
+    }
+}
+
+fn wait_for_file(path: &Path) {
+    let deadline = Instant::now() + Duration::from_secs(30);
+    while !path.exists() {
+        assert!(Instant::now() < deadline, "missing {}", path.display());
+        std::thread::sleep(POLL);
+    }
+}
+
+#[test]
+fn a_background_writer_cannot_outlive_its_reader_or_create_a_late_spool() {
+    let scratch = Scratch::new("late-output");
+    // The background writer cannot print until the report has been taken.
+    let command = "(n=0; while [ ! -f release ] && [ $n -lt 1500 ]; do n=$((n+1)); sleep 0.02; done; seq 1 40000; touch attempted) & echo DONE";
+    let (running, wake) = run_with(request(&scratch, command), "/bin/sh");
+    let done = finish(&running, &wake);
+    let readers = running.control.readers.load(Ordering::SeqCst);
+    std::fs::write(scratch.0.join("release"), b"").unwrap();
+    wait_for_file(&scratch.0.join("attempted"));
+    assert_eq!(readers, 0, "the reader must be joined before reporting");
+    assert_eq!(done.output, "DONE\n");
+    assert_eq!(done.ending, Ending::Exited(0));
+    assert!(done.output_loss.as_deref().unwrap().contains("drain deadline"));
+    assert!(wire::wire_text(&done, None).contains("later output discarded"));
+    assert!(wire::row_text(&done).contains("later output discarded"));
+    assert!(!std::fs::read_dir(&scratch.0)
+        .unwrap()
+        .flatten()
+        .any(|e| e.path().extension().is_some_and(|x| x == "txt")));
+}
+
+#[test]
+fn a_worker_that_cannot_spawn_finishes_with_its_error() {
+    let scratch = Scratch::new("spawn-failure");
+    let running = start_with_spawn(
+        request(&scratch, "touch never"),
+        None,
+        || {},
+        |_job| Err(std::io::Error::other("forced worker spawn failure")),
+    );
+    let done = running.finished().expect("spawn failure is terminal");
+    assert_eq!(done.ending, Ending::NotStarted);
+    assert!(done.output.contains("forced worker spawn failure"));
+    assert!(running.finished().is_none(), "a result is delivered only once");
+    assert!(!scratch.0.join("never").exists());
+}
+
+#[test]
+fn a_disconnected_worker_finishes_instead_of_waiting_forever() {
+    let scratch = Scratch::new("disconnected");
+    let running = start_with_spawn(
+        request(&scratch, "true"),
+        None,
+        || {},
+        |job| {
+            drop(job);
+            Ok(())
+        },
+    );
+    let done = running.finished().expect("a lost worker is terminal");
+    assert_eq!(done.ending, Ending::NotStarted);
+    assert_eq!(done.command, "true");
+    assert!(done.output.contains("disconnected"));
+}
+
+#[test]
+fn output_past_the_spool_cap_is_reported_as_partial() {
+    let scratch = Scratch::new("spool-cap");
+    let done = line(&scratch, &format!("head -c {} /dev/zero", SPOOL_BYTES + 7));
+    let text = wire::wire_text(&done, None);
+    assert!(text.contains("first 67108864 bytes of 67108871"), "{}", &text[..200]);
+    assert!(!text.contains("Full output"));
+    assert!(wire::row_text(&done).contains("cap"));
+    assert_eq!(
+        std::fs::metadata(&done.spooled.unwrap().path).unwrap().len(),
+        SPOOL_BYTES
+    );
+}
+
+#[test]
+fn a_spool_write_error_is_reported_as_partial() {
+    let scratch = Scratch::new("spool-error");
+    let path = scratch.0.join("output.txt");
+    std::fs::write(&path, b"abc").unwrap();
+    let mut gathered = Gathered {
+        held: b"abc".to_vec(),
+        total: 3,
+        spool: Some((path, std::fs::File::open(scratch.0.join("output.txt")).unwrap(), 3)),
+        ..Gathered::default()
+    };
+    gathered.take(b"def", Some(&scratch.0));
+    // A later successful write must not leave a gap in the saved prefix.
+    gathered.spool.as_mut().unwrap().1 = std::fs::OpenOptions::new()
+        .append(true)
+        .open(scratch.0.join("output.txt"))
+        .unwrap();
+    gathered.take(b"ghi", Some(&scratch.0));
+    assert_eq!(std::fs::read(scratch.0.join("output.txt")).unwrap(), b"abc");
+    let total = gathered.total;
+    let done = Finished {
+        command: "cmd".into(),
+        ending: Ending::Exited(0),
+        output: String::from_utf8_lossy(&gathered.held).into_owned(),
+        spooled: gathered.spool.take().map(|(path, _, stored_bytes)| Spooled {
+            path,
+            bytes: total,
+            stored_bytes,
+        }),
+        output_loss: gathered.output_loss.map(str::to_string),
+        cwd: None,
+        left_project: false,
+    };
+    for text in [wire::wire_text(&done, None), wire::row_text(&done)] {
+        assert!(text.contains("first 3 bytes of 9"), "{text}");
+        assert!(text.contains("write error"));
+        assert!(!text.contains("Full output"));
+    }
+}
+
 /// A scratch directory holding a project and a home, removed at the end.
 struct Scratch(PathBuf);
 
@@ -38,7 +171,9 @@ fn run_with(request: Request, shell: &str) -> (Running, Receiver<()>) {
 
 fn finish(running: &Running, wake: &Receiver<()>) -> Finished {
     wake.recv_timeout(Duration::from_secs(30)).expect("the line ends");
-    running.finished().expect("the wake comes after the answer")
+    let done = running.finished().expect("the wake comes after the answer");
+    assert!(running.finished().is_none(), "a result is delivered only once");
+    done
 }
 
 fn line(scratch: &Scratch, command: &str) -> Finished {
@@ -218,7 +353,9 @@ fn a_background_job_does_not_hold_the_line_open() {
 fn a_long_output_goes_to_a_private_file_and_its_start_stays_in_memory() {
     let scratch = Scratch::new("spool");
     let done = line(&scratch, "seq 1 40000");
+    assert!(done.output_loss.is_none());
     let spooled = done.spooled.expect("it is past the limit");
+    assert_eq!(spooled.stored_bytes, spooled.bytes);
     assert_eq!(std::fs::metadata(&spooled.path).unwrap().len(), spooled.bytes);
     use std::os::unix::fs::PermissionsExt;
     assert_eq!(
