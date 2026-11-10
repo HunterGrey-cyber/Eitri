@@ -254,6 +254,7 @@ fn load_transcript(projection: &mut AgentSessionProjection, path: &Path, history
         source: HistorySource::ClaudeTranscript,
         restored_items,
         omitted_items: history.omitted_items,
+        omitted_turns: None,
         upto_seq: projection.last_revision,
         source_path: path.to_string_lossy().to_string(),
         // Would repeat `source_path`: the transcript is what was read.
@@ -332,6 +333,7 @@ fn load_stored(
         // why the two numbers in one sentence are in different units and why that is the honest
         // pair rather than a mistake.
         omitted_items: Some(before - kept),
+        omitted_turns: None,
         upto_seq: projection.last_revision,
         source_path: path.to_string_lossy().to_string(),
         attempted_transcript_path: attempted_transcript_path.map(|p| p.to_string_lossy().to_string()),

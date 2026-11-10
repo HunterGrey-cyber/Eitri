@@ -1989,7 +1989,7 @@ fn push_bounded<T>(queue: &mut VecDeque<(String, T)>, id: &str, value: T) {
 /// How many refusals that arrived ahead of their call a projection holds at once.
 pub const MAX_HELD_DENIALS: usize = 64;
 
-/// Which of the two records a restored history was read from.
+/// Where a restored history was read from.
 ///
 /// The distinction is user-facing on purpose: the two can genuinely differ -- Claude's
 /// own transcript is what the CLI maintains and what a `claude --resume` in a terminal shows, while
@@ -2002,6 +2002,8 @@ pub enum HistorySource {
     ClaudeTranscript,
     /// A: `history::store`, Eitri's own copy, used only when B could not be read.
     EitriCopy,
+    /// Updates replayed by an ACP agent during session/load.
+    AcpReplay,
 }
 
 /// Everything the panel needs to say one honest line about a restored history.
@@ -2022,13 +2024,15 @@ pub struct HistoryNotice {
     /// skipped line type (attachments, side records, unknown lines): those are not omitted
     /// conversation and go to the log instead.
     pub omitted_items: Option<usize>,
+    /// Exact synthetic turn count omitted by ACP replay; absent for item-bounded file readers.
+    #[serde(default)]
+    pub omitted_turns: Option<usize>,
     /// The `seq` bound (exclusive) of the restored part: every historical item sits below it and
     /// every live item at or above it. Present whenever history was restored, not only when it was
     /// truncated -- the panel needs it to tell a historical tool call with no result (which can
     /// never complete) from a live one that is still running.
     pub upto_seq: u64,
-    /// The file this history was actually read from. Always non-empty: a notice exists only when
-    /// history was restored, and history can only come from one file.
+    /// The file this history was read from; empty for an ACP replay, which supplies no file path.
     pub source_path: String,
     /// The Claude transcript that was looked for and not used. `None` when `source` is
     /// `ClaudeTranscript` (it would repeat `source_path`) and when no path could be built at all.

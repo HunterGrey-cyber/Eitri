@@ -2381,9 +2381,11 @@ pub fn serialize_snapshot_with_notes_for_js(
             "source": match notice.source {
                 agent::HistorySource::ClaudeTranscript => "claude_transcript",
                 agent::HistorySource::EitriCopy => "eitri_copy",
+                agent::HistorySource::AcpReplay => "acp_replay",
             },
             "restoredItems": notice.restored_items,
             "omittedItems": notice.omitted_items,
+            "omittedTurns": notice.omitted_turns,
             "uptoSeq": notice.upto_seq,
             "sourcePath": notice.source_path,
             "attemptedTranscriptPath": notice.attempted_transcript_path,

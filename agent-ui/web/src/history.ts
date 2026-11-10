@@ -27,6 +27,11 @@ function records(value: number): string {
  *  Rust's reason carries the detail. The absolute source path would wrap repeatedly in a narrow
  *  panel; the row has a Copy path button instead. */
 export function historyNoticeText(notice: HistoryNotice): string {
+  if (notice.source === "acp_replay") {
+    const omitted = notice.omittedTurns ?? 0;
+    return "Earlier messages in this session, replayed by the ACP agent." +
+      (omitted > 0 ? ` ${count(omitted)} earlier ${omitted === 1 ? "turn" : "turns"} not loaded.` : "");
+  }
   // `null` means "certainly omitted, not countable" (the scan started partway into a file too large
   // to read whole), so it is truncation just as much as a positive count is.
   const truncated = notice.omittedItems === null || notice.omittedItems > 0;

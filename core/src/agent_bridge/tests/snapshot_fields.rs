@@ -656,6 +656,7 @@ fn a_restored_history_reaches_the_frontend_as_one_notice_object() {
         source: agent::HistorySource::EitriCopy,
         restored_items: 314,
         omitted_items: Some(1431),
+        omitted_turns: None,
         upto_seq: projection.last_revision,
         source_path: "/state/eitri/history/conv/sess.json".into(),
         attempted_transcript_path: Some("/claude/projects/p/sess.jsonl".into()),
@@ -694,6 +695,53 @@ fn a_restored_history_reaches_the_frontend_as_one_notice_object() {
     // Every restored item sits below `uptoSeq`, which is what lets the panel tell a historical
     // tool call that can never complete from a live one that is still running.
     assert!(parsed["state"]["userPrompts"][0]["seq"].as_u64().unwrap() < history["uptoSeq"].as_u64().unwrap());
+}
+
+#[test]
+fn acp_replay_omitted_turns_reach_the_snapshot_with_the_original_sequence_boundary() {
+    use agent::providers::acp::history::{History, HISTORY_TURN_LIMIT};
+    use agent::providers::acp::wire::{ChunkKind, Update};
+
+    let mut history = History::default();
+    for n in 0..3 * HISTORY_TURN_LIMIT {
+        for (kind, text) in [
+            (ChunkKind::User, format!("prompt {n}")),
+            (ChunkKind::Agent, "reply".into()),
+        ] {
+            history.apply(&Update::Chunk {
+                kind,
+                text: Some(text),
+                message_id: None,
+            });
+        }
+    }
+    let mut projection = AgentSessionProjection::default();
+    for event in history.finish() {
+        projection.apply(&event);
+    }
+    let boundary = projection.history.as_ref().unwrap().upto_seq;
+    assert!(projection.user_prompts[0].seq > 0);
+    assert!(projection.transcript.last().unwrap().seq < boundary);
+    projection.apply(&AgentDomainEvent::UserPromptSubmitted { text: "live".into() });
+    assert!(projection.user_prompts.last().unwrap().seq >= boundary);
+    let view = SnapshotView {
+        backend: "external",
+        conversation_id: None,
+        session_id: None,
+        provider_session_id: None,
+        capabilities: agent::ProviderCapabilities::default(),
+        provider: None,
+        projection: crate::agent_backend::ProjectionRef::Borrowed(&projection),
+        hidden_pending: None,
+    };
+    let parsed: Value = serde_json::from_str(&serialize_snapshot_for_js(TabId(1), &view, None)).unwrap();
+    let notice = &parsed["state"]["history"];
+    assert_eq!(notice["source"], "acp_replay");
+    assert_eq!(notice["omittedTurns"], 2 * HISTORY_TURN_LIMIT);
+    assert!(notice["omittedItems"].is_null());
+    assert_eq!(notice["restoredItems"], 2 * HISTORY_TURN_LIMIT);
+    assert_eq!(notice["uptoSeq"], boundary);
+    assert_eq!(notice["sourcePath"], "");
 }
 
 /// A session that restored nothing -- every fresh one -- sends an explicit `null`. Omitting the

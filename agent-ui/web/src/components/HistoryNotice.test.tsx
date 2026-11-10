@@ -48,6 +48,11 @@ function renderInPanel(data: HistoryNoticeData = notice()) {
 }
 
 describe("HistoryNotice", () => {
+  it("shows ACP omissions without offering an empty source path", () => {
+    const { el } = renderInPanel(notice({ source: "acp_replay", omittedTurns: 400, sourcePath: "" }));
+    expect(el.textContent).toContain("400 earlier turns not loaded");
+    expect(el.querySelector("button")).toBeNull();
+  });
   it("says which source the history came from", () => {
     const { el } = renderInPanel();
     expect(el.textContent).toContain("read from Claude's own transcript");

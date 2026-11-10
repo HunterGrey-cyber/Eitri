@@ -419,10 +419,10 @@ export type ProviderInfo = {
   startupDiagnostics: string[];
 };
 
-/** Which of the two records a restored history came from. The panel says which, because the two
- * can genuinely differ: Claude's own transcript is what `claude --resume` in a terminal would show,
- * while Eitri's copy is this side's unilateral record of the same session. */
-export type HistorySource = "claude_transcript" | "eitri_copy";
+/** Where restored history came from. The file sources can differ: Claude's own transcript is what
+ * `claude --resume` in a terminal would show, while Eitri's copy is this side's record of the session.
+ * ACP history comes from the agent's session replay. */
+export type HistorySource = "claude_transcript" | "eitri_copy" | "acp_replay";
 
 /** One statement about the history a resumed session was seeded with.
  *
@@ -444,10 +444,11 @@ export type HistoryNotice = {
    * counted (the scan started partway into a file too large to read whole). Never counts skipped
    * line types: those are not omitted conversation and stay in the Rust log. */
   omittedItems: number | null;
+  /** Exact synthetic turns omitted by ACP replay; absent for file-based restores. */
+  omittedTurns?: number | null;
   /** Exclusive upper bound of the restored `seq` range. Every live item sits at or above it. */
   uptoSeq: Seq;
-  /** The file this history was read from. Always non-empty -- a notice exists only when history was
-   * restored, and history can only come from one file. */
+  /** The file this history was read from; empty for ACP replay, which supplies no file path. */
   sourcePath: string;
   /** The Claude transcript that was looked for and not used. `null` when `source` is
    * `claude_transcript`, and when no path could be built at all. */

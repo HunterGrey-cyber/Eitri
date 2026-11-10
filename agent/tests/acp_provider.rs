@@ -1326,21 +1326,24 @@ fn load_replays_then_checks_mode() {
         "{live:#?}"
     );
     let history = provider.take_history();
+    assert!(matches!(history.as_slice(), [AgentDomainEvent::MoveSeeded(_)]));
+    let mut seed = agent::AgentSessionProjection::default();
+    for event in history {
+        seed.apply(&event);
+    }
     assert_eq!(
-        shapes(&history),
-        vec![
-            "user Hello",
-            "started acp-history-1",
-            "text Hi",
-            "tool t1 acp:read",
-            "tool-done t1  false",
-            "completed acp-history-1 Completed Hi",
-            "user Second",
-            "started acp-history-2",
-            "text Ok",
-            "completed acp-history-2 Completed Ok",
-        ]
+        seed.user_prompts.iter().map(|p| p.text.as_str()).collect::<Vec<_>>(),
+        ["Hello", "Second"]
     );
+    assert_eq!(
+        seed.transcript.iter().map(|p| p.text.as_str()).collect::<Vec<_>>(),
+        ["Hi", "Ok"]
+    );
+    assert_eq!(seed.tool_calls.len(), 1);
+    assert_eq!(seed.tool_calls[0].tool_use_id, "t1");
+    assert_eq!(seed.tool_calls[0].name, "acp:read");
+    assert!(seed.tool_calls[0].result.is_some());
+    assert!(seed.history.is_none());
     // Handed over once.
     assert!(provider.take_history().is_empty());
     // The mode was set, so no mismatch: a turn can start (the script has nothing more, so only the send

@@ -671,6 +671,7 @@ mod tests {
             source: crate::projection::HistorySource::EitriCopy,
             restored_items: 0,
             omitted_items: Some(0),
+            omitted_turns: None,
             upto_seq: 0,
             source_path: "/state/history.json".into(),
             attempted_transcript_path: None,

@@ -10,8 +10,8 @@ import { copyToPrimary } from "../primaryCopy";
  *  cursor index, permission target and scroll helper below it.
  *
  *  Copy path both opens a route to the source file and makes the notice a j/k stop: `stopsIn`
- *  filters out non-row stops without enabled controls. `sourcePath` is non-empty because restored
- *  history comes from one file, so the button always exists. No Dismiss: the source must stay shown.
+ *  filters out non-row stops without enabled controls. A file restore has a `sourcePath`; ACP replay
+ *  supplies no file path and has no button. No Dismiss: the source must stay shown.
  */
 export function HistoryNotice({ notice }: { notice: HistoryNoticeData }) {
   return (
@@ -19,12 +19,12 @@ export function HistoryNotice({ notice }: { notice: HistoryNoticeData }) {
       <span>{historyNoticeText(notice)}</span>
       {/* `title` as well as the clipboard: the path is long and absolute, so it is reachable on
           hover without being pasted into the sentence and wrapping a narrow panel several times. */}
-      <button title={notice.sourcePath} onClick={() => {
+      {notice.sourcePath && <button title={notice.sourcePath} onClick={() => {
         void navigator.clipboard?.writeText(notice.sourcePath);
         copyToPrimary(notice.sourcePath);
       }}>
         Copy path
-      </button>
+      </button>}
     </div>
   );
 }
