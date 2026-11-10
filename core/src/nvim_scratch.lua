@@ -14,14 +14,24 @@ end
 
 -- Written beside and renamed into place: the panel polls `done` every tick, and an `io.open(done,
 -- 'w')` would let it read the file empty between the open and the close.
-local function mark(done, text)
+local function mark(done, text, body)
   if not done then return end
   local tmp = done .. '.tmp'
-  local f = io.open(tmp, 'w')
-  if not f then return end
-  f:write(text)
-  f:close()
-  if not os.rename(tmp, done) then os.remove(tmp) end
+  local f, err = io.open(tmp, 'w')
+  if f then
+    local wrote, write_err = f:write(text)
+    local closed, close_err = f:close()
+    if not wrote then err = write_err
+    elseif not closed then err = close_err
+    else
+      local renamed, rename_err = os.rename(tmp, done)
+      if renamed then return end
+      err = rename_err
+    end
+  end
+  os.remove(tmp)
+  vim.notify('draft could not be handed back: ' .. tostring(err) ..
+    '; saved body: ' .. tostring(body), vim.log.levels.ERROR)
 end
 
 -- Every file name reaches nvim as a structured argument, never spliced into an Ex command line: in
@@ -218,7 +228,7 @@ function M.call(hex)
       vim.api.nvim_create_autocmd('BufWipeout', {
         buffer = buf,
         once = true,
-        callback = function() if torn then return end; mark(req.done, written and 'written' or 'discarded') end,
+        callback = function() if torn then return end; mark(req.done, written and 'written' or 'discarded', req.path) end,
       })
     else
       error('unknown scratch op: ' .. tostring(req.op))
@@ -230,7 +240,7 @@ function M.call(hex)
   end
   -- Known limit: `open` and `view` carry no `done`, so a failure of theirs (E37 from `:edit` over a
   -- modified buffer with 'nohidden', say) reaches only nvim's message area; the panel said `ok`.
-  if not ran then mark(req.done, 'error: ' .. tostring(err)) end
+  if not ran then mark(req.done, 'error: ' .. tostring(err), req.path) end
 end
 
 EitriScratch = M

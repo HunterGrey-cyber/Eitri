@@ -553,3 +553,100 @@ fn q_in_the_last_tab_leaves_no_window_in_diff_mode() {
     );
     dir.cleanup();
 }
+
+#[test]
+#[ignore = "needs a real nvim on PATH; spends no tokens and needs no display"]
+fn a_read_only_marker_directory_reports_the_saved_draft() {
+    agent::state_dirs::redirect_state_to_a_test_root();
+    let mut dir = ScratchDir::new().unwrap();
+    let (request, edit) = dir.prepare_edit("saved draft").unwrap();
+    let probe = dir.path().join("notification.json");
+    let marker_dir = dir.path().join("markers");
+    std::fs::create_dir(&marker_dir).unwrap();
+    nvim(&dir, &[
+        format!("lua _G.notices = {{}}; vim.notify = function(text, level) table.insert(_G.notices, {{text, level}}) end; _G.req = vim.json.decode((('{}'):gsub('..', function(c) return string.char(tonumber(c, 16)) end)))", request.hex()),
+        format!("lua _G.req.done = {}; vim.fn.setfperm({}, 'r-x------')", serde_json::to_string(&marker_dir.join("done")).unwrap(), serde_json::to_string(&marker_dir).unwrap()),
+        "lua EitriScratch.call((vim.json.encode(_G.req):gsub('.', function(c) return string.format('%02x', string.byte(c)) end)))".into(),
+        "call setline(1, 'edited draft')".into(),
+        "wq".into(),
+        format!("lua vim.fn.writefile({{vim.json.encode(_G.notices)}}, {})", serde_json::to_string(&probe).unwrap()),
+    ]);
+    std::fs::set_permissions(&marker_dir, {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::Permissions::from_mode(0o700)
+    })
+    .unwrap();
+    let notices: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(probe).unwrap()).unwrap();
+    assert_eq!(notices.as_array().unwrap().len(), 1, "{notices}");
+    assert!(
+        notices[0][0]
+            .as_str()
+            .unwrap()
+            .contains("draft could not be handed back"),
+        "{notices}"
+    );
+    assert!(
+        notices[0][0].as_str().unwrap().contains(edit.body.to_str().unwrap()),
+        "{notices}"
+    );
+    assert_eq!(notices[0][1], 4, "ERROR level");
+    assert_eq!(std::fs::read_to_string(&edit.body).unwrap(), "edited draft\n");
+    assert!(!marker_dir.join("done.tmp").exists());
+    dir.cleanup();
+}
+
+#[test]
+#[ignore = "needs a real nvim on PATH; spends no tokens and needs no display"]
+fn marker_write_close_and_rename_failures_remove_the_partial_marker() {
+    agent::state_dirs::redirect_state_to_a_test_root();
+    for step in ["write", "close", "rename"] {
+        let mut dir = ScratchDir::new().unwrap();
+        let (request, edit) = dir.prepare_edit("saved draft").unwrap();
+        let probe = dir.path().join("notification.json");
+        let setup = format!(
+            r#"lua _G.notices = {{}}; vim.notify = function(text, level) table.insert(_G.notices, {{text, level}}) end;
+            local done, step = {}, {};
+            if step == 'rename' then
+              local rename = os.rename;
+              os.rename = function(from, to) if to == done then return nil, 'marker rename refused' end; return rename(from, to) end
+            else
+              local open = io.open;
+              io.open = function(path, mode)
+                local f, err = open(path, mode);
+                if path ~= done .. '.tmp' or not f then return f, err end;
+                return {{
+                  write = function(_, text) f:write(text); if step == 'write' then return nil, 'marker write refused' end; return true end,
+                  close = function() f:close(); if step == 'close' then return nil, 'marker close refused' end; return true end
+                }}
+              end
+            end"#,
+            serde_json::to_string(&edit.done).unwrap(),
+            serde_json::to_string(step).unwrap(),
+        );
+        nvim(
+            &dir,
+            &[
+                setup,
+                call(request.hex()),
+                "wq".into(),
+                format!(
+                    "lua vim.fn.writefile({{vim.json.encode(_G.notices)}}, {})",
+                    serde_json::to_string(&probe).unwrap()
+                ),
+            ],
+        );
+        let notices: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(probe).unwrap()).unwrap();
+        assert_eq!(notices.as_array().unwrap().len(), 1, "{step}: {notices}");
+        assert!(
+            notices[0][0]
+                .as_str()
+                .unwrap()
+                .contains(&format!("marker {step} refused")),
+            "{notices}"
+        );
+        assert_eq!(std::fs::read_to_string(&edit.body).unwrap(), "saved draft\n");
+        assert!(!edit.done.exists());
+        assert!(!edit.done.with_extension("done.tmp").exists());
+        dir.cleanup();
+    }
+}

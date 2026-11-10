@@ -211,6 +211,8 @@ pub struct HistoryWriter {
     handed: u64,
     /// The newest batch the thread has reported on.
     answered: u64,
+    failure: Option<String>,
+    warning: Option<String>,
     /// Rounds the thread found the lock held for every try, counted for a test that must wait for one.
     refused: std::sync::Arc<std::sync::atomic::AtomicU64>,
     /// Raised by the thread when a write succeeds after a failed one; `None` for a window that polls anyway.
@@ -229,6 +231,7 @@ struct Worker {
 struct Report {
     batch: u64,
     entries: Option<Vec<String>>,
+    error: Option<String>,
 }
 
 impl HistoryWriter {
@@ -240,6 +243,8 @@ impl HistoryWriter {
             worker: None,
             handed: 0,
             answered: 0,
+            failure: None,
+            warning: None,
             refused: std::sync::Arc::default(),
             wake: None,
         }
@@ -302,6 +307,7 @@ impl HistoryWriter {
         loop {
             match worker.reports.try_recv() {
                 Ok(report) => {
+                    record_health(&mut self.failure, &mut self.warning, report.error.as_deref());
                     self.answered = self.answered.max(report.batch);
                     newest = report.entries.filter(|_| report.batch == self.handed);
                 }
@@ -316,6 +322,11 @@ impl HistoryWriter {
             }
         }
         newest
+    }
+
+    /// A newly failing write, once until a successful write ends its failure streak.
+    pub fn take_warning(&mut self) -> Option<String> {
+        self.warning.take()
     }
 
     /// Whether a batch handed over has not been reported on yet -- not written yet, or kept out by a held
@@ -341,6 +352,7 @@ impl HistoryWriter {
             let Some(worker) = self.worker.as_ref() else { break };
             match worker.reports.recv() {
                 Ok(report) => {
+                    record_health(&mut self.failure, &mut self.warning, report.error.as_deref());
                     self.answered = self.answered.max(report.batch);
                     newest = report.entries.filter(|_| report.batch == self.handed);
                 }
@@ -468,6 +480,7 @@ fn write_loop(
                 let _ = reports.send(Report {
                     batch,
                     entries: Some(entries),
+                    error: None,
                 });
                 // After a failure other than a held lock the window was told and stopped polling; the
                 // wake has it take this report now.
@@ -488,7 +501,11 @@ fn write_loop(
             Err(e) => {
                 // Reported as failed, so the window does not poll through a failure that may last; the
                 // texts stay held and are tried again here.
-                let _ = reports.send(Report { batch, entries: None });
+                let _ = reports.send(Report {
+                    batch,
+                    entries: None,
+                    error: Some(e.to_string()),
+                });
                 pause = Some(failed_pause);
                 failed_pause = (failed_pause * 2).min(FAILED_RETRY_CAP);
                 Some(e)
@@ -507,6 +524,20 @@ fn write_loop(
         if closing {
             return;
         }
+    }
+}
+
+fn record_health(failure: &mut Option<String>, warning: &mut Option<String>, error: Option<&str>) {
+    if let Some(error) = error {
+        if failure.is_none() {
+            *warning = Some(format!(
+                "prompt history not saved: {error}; new prompts may be lost when this window closes"
+            ));
+        }
+        *failure = Some(error.to_string());
+    } else {
+        *failure = None;
+        *warning = None;
     }
 }
 
@@ -828,6 +859,7 @@ mod tests {
             .send(Report {
                 batch: 1,
                 entries: Some(texts(&["first"])),
+                error: None,
             })
             .unwrap();
         assert_eq!(writer.poll(), None, "batch 2 is still out");
@@ -836,6 +868,7 @@ mod tests {
             .send(Report {
                 batch: 2,
                 entries: Some(texts(&["first", "second"])),
+                error: None,
             })
             .unwrap();
         assert_eq!(writer.poll(), Some(texts(&["first", "second"])));
@@ -904,6 +937,11 @@ mod tests {
         writer.submit(&texts(&["while it failed"]));
         assert_eq!(writer.wait_answered(), None);
         assert!(!writer.is_busy(), "the failure was reported: the window stops polling");
+        assert!(writer.take_warning().unwrap().starts_with("prompt history not saved:"));
+        assert!(writer.take_warning().is_none(), "warned once");
+        writer.submit(&texts(&["while it failed"]));
+        assert_eq!(writer.wait_answered(), None);
+        assert!(writer.take_warning().is_none(), "same failure streak");
         assert_eq!(wakes.load(Ordering::SeqCst), 0);
         std::fs::remove_dir(&blocker).unwrap();
         // The thread tries again by itself; the guard only stops a retry that never comes.
@@ -916,6 +954,7 @@ mod tests {
             std::thread::sleep(std::time::Duration::from_millis(5));
         }
         assert_eq!(writer.poll(), Some(texts(&["while it failed"])));
+        assert!(writer.failure.is_none(), "successful retry clears the failure");
         writer.submit(&texts(&["after"]));
         assert_eq!(writer.wait_answered(), Some(texts(&["while it failed", "after"])));
         assert_eq!(

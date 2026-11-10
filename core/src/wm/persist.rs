@@ -726,8 +726,9 @@ enum SaveDone {
         kept: Option<Kept>,
         copy_taken: bool,
     },
-    /// Nothing was written; why is already logged. The next change, or the close, tries again.
-    NotWritten,
+    /// Nothing was written; the reason is logged and returned for the window's warning.
+    /// The next change, or the close, tries again.
+    NotWritten(String),
 }
 
 /// The read-decide-write of one save, away from any display: the bytes this window opened copied aside while
@@ -736,11 +737,12 @@ fn run_save(mut job: SaveJob) -> SaveDone {
     // Not flags set at startup: the file may have changed since -- a hand-edit, another window, another build
     // -- and what was true of it when this window opened says nothing of it now.
     let log = job.log.clone();
-    if !copy_what_was_opened(&log, &job.dir, &job.project_root, job.role, job.keep_copy.as_deref()) {
-        return SaveDone::NotWritten;
+    if let Err(why) = copy_what_was_opened(&log, &job.dir, &job.project_root, job.role, job.keep_copy.as_deref()) {
+        return SaveDone::NotWritten(why);
     }
-    let Some(kept) = make_way(&job) else {
-        return SaveDone::NotWritten;
+    let kept = match make_way(&job) {
+        Ok(kept) => kept,
+        Err(why) => return SaveDone::NotWritten(why),
     };
     if let Some(kept) = &kept {
         job.workspaces.retake_kept(kept.clone());
@@ -753,18 +755,25 @@ fn run_save(mut job: SaveJob) -> SaveDone {
             copy_taken: job.keep_copy.is_some(),
         },
         Err(err) => {
-            log.warn(format!("[layout] could not save {}: {err}", job.dir.display()));
-            SaveDone::NotWritten
+            let why = format!("could not save {}: {err}", job.dir.display());
+            log.warn(format!("[layout] {why}"));
+            SaveDone::NotWritten(why)
         }
     }
 }
 
 /// Before the first write after opening a file only in part: its bytes (`opened`) copied aside, if the file is
-/// still those bytes. `false` when that could not be done and nothing may be written yet; the copy is tried
+/// still those bytes. An error leaves the file unwritten; the copy is tried
 /// again at the next save.
-fn copy_what_was_opened(log: &Log, dir: &Path, project_root: &Path, role: Role, opened: Option<&str>) -> bool {
+fn copy_what_was_opened(
+    log: &Log,
+    dir: &Path,
+    project_root: &Path,
+    role: Role,
+    opened: Option<&str>,
+) -> Result<(), String> {
     let Some(opened) = opened else {
-        return true;
+        return Ok(());
     };
     match persist::read_v2_text_as(dir, project_root, role) {
         Ok(Some(text)) if text == opened => match persist::copy_aside_v2_as(dir, project_root, role, opened) {
@@ -774,35 +783,33 @@ fn copy_what_was_opened(log: &Log, dir: &Path, project_root: &Path, role: Role, 
                 aside.display()
             )),
             Err(err) => {
-                log.warn(format!(
-                    "[layout] could not copy aside the file this window opened ({err}); not saved"
-                ));
-                return false;
+                let why = format!("could not copy aside the file this window opened: {err}");
+                log.warn(format!("[layout] {why}; not saved"));
+                return Err(why);
             }
         },
         // Another window wrote since, or the file is gone: what is there is not the text this window
         // opened, and not this window's to keep.
         Ok(_) => {}
         Err(err) => {
-            log.warn(format!(
-                "[layout] could not read the file to copy it aside ({err}); not saved"
-            ));
-            return false;
+            let why = format!("could not read the file to copy it aside: {err}");
+            log.warn(format!("[layout] {why}; not saved"));
+            return Err(why);
         }
     }
-    true
+    Ok(())
 }
 
 /// The file as it is now, made safe to write over: wholly unusable, set aside; partly usable, its text copied
 /// aside; usable or partly, its kept keys returned to be taken. A kept key naming a module this window places
 /// -- in any of its workspaces now, not only in the file's trees -- is not taken: a later build may have
 /// floated a module this window has since tiled, and writing both would put it in two places; the file's text
-/// is copied aside instead, as for a partly usable file. `None` when that could not be done and nothing may be
-/// written; `Some(None)` when there is no file, or it was set aside, so there are no kept keys to take.
-fn make_way(job: &SaveJob) -> Option<Option<Kept>> {
+/// is copied aside instead, as for a partly usable file. An error leaves the file unwritten;
+/// `Ok(None)` means there is no file, or it was set aside, so there are no kept keys to take.
+fn make_way(job: &SaveJob) -> Result<Option<Kept>, String> {
     let (dir, project_root, role, log) = (job.dir.as_path(), job.project_root.as_path(), job.role, &job.log);
     let (text, mut kept, mut copy) = match persist::v2_state_as(dir, project_root, role, &job.lua, &job.deferred) {
-        V2State::Missing => return Some(None),
+        V2State::Missing => return Ok(None),
         V2State::Usable(text, kept) => (text, kept, false),
         V2State::Partly(text, kept) => (text, kept, true),
         V2State::Unusable(_) => {
@@ -812,14 +819,13 @@ fn make_way(job: &SaveJob) -> Option<Option<Kept>> {
                         "[layout] the file this build could not use is kept as {}",
                         aside.display()
                     ));
-                    Some(None)
+                    Ok(None)
                 }
-                Err(err) if err.kind() == std::io::ErrorKind::NotFound => Some(None),
+                Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(None),
                 Err(err) => {
-                    log.warn(format!(
-                        "[layout] could not set aside the file this build could not use ({err}); not saved"
-                    ));
-                    None
+                    let why = format!("could not set aside the file this build could not use: {err}");
+                    log.warn(format!("[layout] {why}; not saved"));
+                    Err(why)
                 }
             };
         }
@@ -833,17 +839,16 @@ fn make_way(job: &SaveJob) -> Option<Option<Kept>> {
                 aside.display()
             )),
             Err(err) => {
-                log.warn(format!(
-                    "[layout] could not copy aside the file this build can only partly use ({err}); not saved"
-                ));
-                return None;
+                let why = format!("could not copy aside the file this build can only partly use: {err}");
+                log.warn(format!("[layout] {why}; not saved"));
+                return Err(why);
             }
         }
     }
     for note in dropped {
         log.say(format!("[layout] {note}"));
     }
-    Some(Some(kept))
+    Ok(Some(kept))
 }
 
 /// What the writer thread and the window share.
@@ -937,7 +942,7 @@ impl LayoutWriter {
                 shared
                     .log
                     .warn("[layout] the layout writer failed while saving; not saved".to_string());
-                SaveDone::NotWritten
+                SaveDone::NotWritten("the layout writer failed while saving".into())
             });
             #[cfg(test)]
             if matches!(done, SaveDone::Written { .. }) {
@@ -1128,6 +1133,8 @@ pub struct Saver {
     submitted: Vec<Submitted>,
     /// The number the next submit's job carries.
     next_job: u64,
+    failing: bool,
+    notes: Vec<String>,
     writer: LayoutWriter,
     log: Log,
 }
@@ -1185,6 +1192,8 @@ impl Saver {
             base: Arrangement::of(workspaces, layout),
             submitted: Vec::new(),
             next_job: 0,
+            failing: false,
+            notes: Vec::new(),
             writer,
             log,
         }
@@ -1405,6 +1414,14 @@ impl Saver {
             done.extend(self.writer.take_done());
         }
         for result in done {
+            if let SaveDone::NotWritten(why) = &result {
+                if !self.failing {
+                    self.notes.push(format!("layout not saved: {why}"));
+                }
+                self.failing = true;
+                continue;
+            }
+            self.failing = false;
             let SaveDone::Written {
                 now,
                 job,
@@ -1431,6 +1448,11 @@ impl Saver {
         if idle {
             self.submitted.clear();
         }
+    }
+
+    /// Save failures not yet shown, once per streak of failed writes.
+    pub fn take_notes(&mut self) -> Vec<String> {
+        std::mem::take(&mut self.notes)
     }
 
     /// Every line this saver and its writer printed.
@@ -3055,6 +3077,45 @@ mod tests {
     }
 
     const WIN: crate::wm::WinId = crate::wm::WinId::MAIN;
+
+    #[test]
+    fn a_layout_write_failure_toasts_once_until_a_write_succeeds() {
+        let dir = agent::state_dirs::test_workspace_dir("layout-save-warning");
+        let blocked = dir.join("blocked");
+        std::fs::write(&blocked, b"not a directory").unwrap();
+        let window = Driven::open(&blocked, first_launch_layout(&[]).unwrap(), Workspaces::single());
+        let warnings = || {
+            window.driver.query(|c| {
+                c.notes(WIN)
+                    .iter()
+                    .filter(|text| text.starts_with("layout not saved:"))
+                    .count()
+            })
+        };
+        window.layout.borrow_mut().show(&ModuleId::terminal()).unwrap();
+        for _ in 0..2 {
+            window.changed();
+            window.advance(500);
+            assert!(window.finish_writes());
+        }
+        assert_eq!(warnings(), 1);
+        let toast = window.driver.query(|c| c.chrome(WIN).toast).unwrap();
+        assert!(toast.text.contains("Not a directory"), "{}", toast.text);
+        assert_eq!(toast.kind, crate::wm::toasts::ToastKind::Warning);
+        std::fs::remove_file(&blocked).unwrap();
+        window.changed();
+        window.advance(500);
+        assert!(window.finish_writes());
+        assert_eq!(window.writes(), 1);
+        assert_eq!(warnings(), 1);
+        std::fs::remove_dir_all(&blocked).unwrap();
+        std::fs::write(&blocked, b"blocked again").unwrap();
+        crate::layout::hide(&mut window.layout.borrow_mut(), &ModuleId::terminal(), &frame()).unwrap();
+        window.changed();
+        window.advance(500);
+        assert!(window.finish_writes());
+        assert_eq!(warnings(), 2, "a successful write ends the failure streak");
+    }
 
     /// A window opened in a controller as the shell opens one: the controller behind a driver, on a fake host
     /// and a scheduler whose clock moves only with `advance`, the saver given to the window at its opening.

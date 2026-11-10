@@ -977,6 +977,63 @@ mod tests {
         );
     }
 
+    #[test]
+    fn prompt_history_failure_warns_once_and_recovery_allows_a_new_warning() {
+        let (handle, _page) = settled_panel();
+        let dir = agent::state_dirs::test_workspace_dir("panel-history-warning");
+        let blocked = dir.join("blocked");
+        std::fs::write(&blocked, b"not a directory").unwrap();
+        handle.state.borrow_mut().history_writer =
+            eitri_core::prompt_history::HistoryWriter::new(Some(blocked.clone()), "/project".into());
+        let warnings = std::rc::Rc::new(std::cell::RefCell::new(Vec::new()));
+        let heard = warnings.clone();
+        handle.on_warning(move |text| heard.borrow_mut().push(text.to_string()));
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+        for _ in 0..2 {
+            handle.run(|state, out| remember_prompts(state, &["mine".into()], out));
+            while handle.state.borrow().history_writer.is_busy() {
+                assert!(std::time::Instant::now() < deadline, "history write did not report");
+                handle.run(|state, out| collect_history(state, out));
+                std::thread::yield_now();
+            }
+        }
+        assert_eq!(warnings.borrow().len(), 1);
+        assert!(warnings.borrow()[0].contains("prompt history not saved:"));
+        std::fs::remove_file(&blocked).unwrap();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+        while !matches!(
+            eitri_core::prompt_history::load(&blocked, std::path::Path::new("/project")),
+            eitri_core::prompt_history::Loaded::Entries(_)
+        ) {
+            assert!(std::time::Instant::now() < deadline, "history retry did not write");
+            std::thread::yield_now();
+        }
+        // Submit another batch so its report proves that the successful retry was collected.
+        handle.run(|state, out| remember_prompts(state, &["after".into()], out));
+        while handle.state.borrow().history_writer.is_busy() {
+            assert!(std::time::Instant::now() < deadline);
+            handle.run(|state, out| collect_history(state, out));
+            std::thread::yield_now();
+        }
+        std::fs::remove_dir_all(&blocked).unwrap();
+        std::fs::write(&blocked, b"blocked again").unwrap();
+        handle.run(|state, out| remember_prompts(state, &["again".into()], out));
+        while handle.state.borrow().history_writer.is_busy() {
+            assert!(std::time::Instant::now() < deadline);
+            handle.run(|state, out| collect_history(state, out));
+            std::thread::yield_now();
+        }
+        assert_eq!(warnings.borrow().len(), 2);
+        handle
+            .state
+            .borrow_mut()
+            .history_writer
+            .finish()
+            .unwrap()
+            .recv_timeout(std::time::Duration::from_secs(10))
+            .unwrap();
+    }
+
     /// The review flow's work (here: the recovery journal read it starts once a document is ready and a
     /// review exists) reports through a worker nobody is told about: the tick runs on its steady cadence
     /// until the flow is idle, and then waits.

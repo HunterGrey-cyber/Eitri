@@ -129,7 +129,7 @@ pub(super) fn send_context_if_changed(state: &mut AgentPanelState, out: &mut Out
 
 /// Appends `texts` to the window's copy of the project's history at once, hands them to the history's
 /// writer (the file is written off this thread), and tells every ready page (the history is the
-/// window's). Best-effort: a failed write is logged by the writer and the pages keep this window's copy.
+/// window's). A failed write keeps this window's copy and warns once until a write succeeds.
 pub(super) fn remember_prompts(state: &mut AgentPanelState, texts: &[String], out: &mut Outbox) {
     if !state.history_writer.is_enabled() {
         return;
@@ -142,7 +142,11 @@ pub(super) fn remember_prompts(state: &mut AgentPanelState, texts: &[String], ou
 /// What the history's writer read back after its newest write -- other windows' prompts among them --
 /// in place of the window's copy, told to every ready page when it differs.
 pub(super) fn collect_history(state: &mut AgentPanelState, out: &mut Outbox) {
-    let Some(entries) = state.history_writer.poll() else {
+    let entries = state.history_writer.poll();
+    if let Some(warning) = state.history_writer.take_warning() {
+        out.effect(Effect::Warning(warning));
+    }
+    let Some(entries) = entries else {
         return;
     };
     if entries != state.history {

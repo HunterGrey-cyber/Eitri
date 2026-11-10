@@ -1307,7 +1307,12 @@ fn crash_mid_write(f: &Fixture, rel: &str) -> String {
     let journal = Journal::open(&f.review_dir).unwrap();
     let mut found = None;
     until("the entry the crash left", || {
-        found = journal.pending().into_iter().find(|e| e.path == Path::new(rel));
+        found = journal
+            .pending()
+            .unwrap()
+            .entries
+            .into_iter()
+            .find(|e| e.path == Path::new(rel));
         found.is_some()
     });
     found.unwrap().id
@@ -1317,6 +1322,8 @@ fn pending_ids(f: &Fixture) -> Vec<String> {
     Journal::open(&f.review_dir)
         .unwrap()
         .pending()
+        .unwrap()
+        .entries
         .into_iter()
         .map(|e| e.id)
         .collect()
@@ -4032,4 +4039,89 @@ mod live_review {
         finish(&mut f, &mine, SESSION, "a1");
         f.shut_down();
     }
+}
+
+#[test]
+fn an_unreadable_recovery_entry_warns_and_offers_the_readable_entry_without_retry() {
+    recovery_entry_problem(false);
+}
+
+#[test]
+fn an_unrecognized_recovery_entry_warns_and_offers_the_readable_entry_without_retry() {
+    recovery_entry_problem(true);
+}
+
+fn recovery_entry_problem(malformed: bool) {
+    let mut f = Fixture::new("recover-entry-problem");
+    let journal = Journal::open(&f.review_dir).unwrap();
+    let good_id = "0123456789abcdef0123456789abcdef";
+    let bad_id = "fedcba9876543210fedcba9876543210";
+    for id in [good_id, bad_id] {
+        let entry = json!({
+            "v": 1, "id": id, "path_hex": "612e747874", "pre": null, "intended": null,
+            "mode": 0o600, "session": SESSION, "at_ms": 1, "pid": 1
+        });
+        std::fs::write(journal.dir().join(format!("{id}.json")), entry.to_string()).unwrap();
+    }
+    let bad = journal.dir().join(format!("{bad_id}.json"));
+    if malformed {
+        std::fs::write(&bad, b"{ not an entry").unwrap();
+    } else {
+        std::fs::set_permissions(&bad, std::fs::Permissions::from_mode(0o000)).unwrap();
+    }
+    let mut outs = f.flow.document_ready(&f.tabs);
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while !f.flow.is_idle() {
+        assert!(Instant::now() < deadline, "journal scan did not finish");
+        outs.extend(f.tick(None));
+        std::thread::yield_now();
+    }
+    std::fs::set_permissions(&bad, std::fs::Permissions::from_mode(0o600)).unwrap();
+    assert!(bad.exists(), "the problem entry is kept");
+    assert_eq!(offered(&outs), Some(vec![good_id.to_string()]));
+    let notices: Vec<_> = envelopes(&outs).into_iter().filter(|v| v["kind"] == "notice").collect();
+    assert_eq!(notices.len(), 1, "one warning for the scan's problems: {notices:?}");
+    assert!(
+        notices[0].to_string().contains(bad_id),
+        "the warning names the bad entry"
+    );
+    assert_eq!(f.flow.jobs_started(), 1);
+    let reload = f.flow.document_ready(&f.tabs);
+    assert_eq!(offered(&reload), Some(vec![good_id.to_string()]));
+    assert!(!envelopes(&reload).iter().any(|v| v["kind"] == "notice"));
+    assert_eq!(f.flow.jobs_started(), 1, "entry problems do not trigger another scan");
+    f.shut_down();
+}
+
+#[test]
+fn an_unreadable_recovery_journal_warns_and_the_next_page_load_retries() {
+    let mut f = Fixture::new("recover-retry");
+    let journal = f.review_dir.join("journal");
+    std::fs::create_dir_all(&f.review_dir).unwrap();
+    std::fs::write(&journal, b"blocks journal directory").unwrap();
+    let mut outs = f.flow.document_ready(&f.tabs);
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while !f.flow.is_idle() {
+        assert!(Instant::now() < deadline, "journal scan did not finish");
+        outs.extend(f.tick(None));
+        std::thread::yield_now();
+    }
+    assert!(
+        outs.iter().any(
+            |out| matches!(out, Out::Envelope(text) if text.contains("could not check for an interrupted revert:"))
+        ),
+        "no warning"
+    );
+    assert_eq!(f.flow.jobs_started(), 1);
+    std::fs::remove_file(&journal).unwrap();
+    assert!(f.flow.document_ready(&f.tabs).is_empty());
+    while !f.flow.is_idle() {
+        assert!(Instant::now() < deadline, "retry did not finish");
+        f.tick(None);
+        std::thread::yield_now();
+    }
+    assert_eq!(f.flow.jobs_started(), 2, "failed scan retried");
+    assert!(f.flow.document_ready(&f.tabs).is_empty());
+    assert_eq!(f.flow.jobs_started(), 2, "successful empty scan is remembered");
+    f.shut_down();
 }

@@ -61,7 +61,7 @@ use crate::wm::PeerId;
 use serde::{Deserialize, Serialize};
 
 use super::draft::{check_reverts, NewRevert, RevertShape, RevertSource, ReviewDraft, UndoData, UndoState};
-use super::journal::JournalEntry;
+use super::journal::{JournalEntry, Pending as JournalPending};
 use super::lifecycle::{ReviewError, Scope};
 use super::live_contest::{LiveContest, TurnKey};
 use super::live_draws::{LiveDraws, LiveRecords, LiveStep};
@@ -202,7 +202,7 @@ pub struct ReviewFlow {
     sends: Vec<SendWork>,
     /// The interrupted reverts last found, which a `review_recover` must name one of.
     recoveries: Vec<JournalEntry>,
-    recovery_job: Option<mpsc::Receiver<Vec<JournalEntry>>>,
+    recovery_job: Option<mpsc::Receiver<Result<JournalPending, String>>>,
     recovery_asked: bool,
     jobs_started: usize,
     /// The window's editor overlay, once the shell has said who owns the module in it, or window
@@ -666,18 +666,20 @@ impl ReviewFlow {
     }
 
     /// The panel's document is ready (the first time, or after a reload): offers the interrupted
-    /// reverts. The journal is read once per window, on a worker; a reload re-sends what was found
-    /// and reads nothing, because the page is only a view.
+    /// reverts. A successful scan is kept in memory; a failed scan retries at the next page load.
+    /// Only one scan runs at a time, on a worker.
     pub fn document_ready(&mut self, tabs: &TabSet) -> Vec<Out> {
-        if !self.recovery_asked {
+        if !self.recovery_asked && self.recovery_job.is_none() {
             // Asked for only once a review exists: a window whose review is not installed yet (or
             // is off) reads no journal, and asks at the first ready after one is.
             if let Some(review) = tabs.turn_review() {
-                self.recovery_asked = true;
                 let job = review.recoveries_job();
-                if let Ok(rx) = spawn("eitri-review-journal", move || job.run()) {
-                    self.jobs_started += 1;
-                    self.recovery_job = Some(rx);
+                match spawn("eitri-review-journal", move || job.run()) {
+                    Ok(rx) => {
+                        self.jobs_started += 1;
+                        self.recovery_job = Some(rx);
+                    }
+                    Err(why) => return vec![recovery_warning(&why)],
                 }
             }
             return Vec::new();
@@ -2226,10 +2228,24 @@ impl ReviewFlow {
         };
         match rx.try_recv() {
             Err(mpsc::TryRecvError::Empty) => {}
-            Err(mpsc::TryRecvError::Disconnected) => self.recovery_job = None,
-            Ok(entries) => {
+            Err(mpsc::TryRecvError::Disconnected) => {
                 self.recovery_job = None;
-                self.recoveries = entries;
+                out.push(recovery_warning("the journal worker ended without reporting"));
+            }
+            Ok(Err(why)) => {
+                self.recovery_job = None;
+                out.push(recovery_warning(&why));
+            }
+            Ok(Ok(pending)) => {
+                self.recovery_job = None;
+                self.recovery_asked = true;
+                self.recoveries = pending.entries;
+                if !pending.problems.is_empty() {
+                    out.push(Out::Envelope(crate::agent_bridge::serialize_notice_for_js(&format!(
+                        "could not read interrupted revert entries (kept on disk): {}",
+                        pending.problems.join("; ")
+                    ))));
+                }
                 // Whatever `review.hint` says: a write that did not finish is not a hint.
                 if !self.recoveries.is_empty() {
                     out.push(Out::Envelope(serialize_review_recovery_for_js(&self.recoveries)));
@@ -2399,6 +2415,12 @@ fn answer(request_id: &str, payload: String) -> Out {
         request_id: request_id.to_string(),
         payload,
     }
+}
+
+fn recovery_warning(why: &str) -> Out {
+    Out::Envelope(crate::agent_bridge::serialize_notice_for_js(&format!(
+        "could not check for an interrupted revert: {why}"
+    )))
 }
 
 fn failed(request_id: &str, why: &str) -> Out {
@@ -2755,6 +2777,44 @@ fn now_ms() -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn an_unlistable_journal_warns_and_leaves_retry_open() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = crate::test_scratch_dir::ScratchDir::new("eitri-journal", "flow-retry");
+        let journal = super::super::journal::Journal::open(&dir).unwrap();
+        std::fs::set_permissions(journal.dir(), std::fs::Permissions::from_mode(0o000)).unwrap();
+        let result = journal.pending().map_err(|e| e.to_string());
+        std::fs::set_permissions(journal.dir(), std::fs::Permissions::from_mode(0o700)).unwrap();
+        assert!(result.is_err());
+        let mut flow = ReviewFlow::new();
+        let (tx, rx) = mpsc::channel();
+        flow.recovery_job = Some(rx);
+        tx.send(result).unwrap();
+        let mut out = Vec::new();
+        flow.advance_recovery_job(&mut out);
+        assert!(
+            matches!(&out[..], [Out::Envelope(text)] if text.contains("could not check for an interrupted revert:"))
+        );
+        assert!(!flow.recovery_asked);
+        assert!(flow.recovery_job.is_none());
+    }
+
+    #[test]
+    fn a_recovery_worker_that_ends_without_reporting_warns_and_leaves_retry_open() {
+        let mut flow = ReviewFlow::new();
+        let (tx, rx) = mpsc::channel();
+        flow.recovery_job = Some(rx);
+        drop(tx);
+        let mut out = Vec::new();
+        flow.advance_recovery_job(&mut out);
+        assert!(
+            matches!(&out[..], [Out::Envelope(text)] if text.contains("could not check for an interrupted revert:"))
+        );
+        assert!(!flow.recovery_asked);
+        assert!(flow.recovery_job.is_none());
+    }
 
     /// A plain edit that comes while a `..` edit waits for the resolver's worker comes out after it.
     #[test]

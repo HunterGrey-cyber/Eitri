@@ -395,7 +395,7 @@ fn an_ordinary_file_is_replaced_atomically() {
     );
     assert_eq!(mode_of(&fx.file("bin/run")), 0o755);
     no_temp_left(&fx.file("bin"));
-    assert!(fx.journal.pending().is_empty());
+    assert!(fx.journal.pending().unwrap().entries.is_empty());
     assert_eq!(
         read_current(&target).unwrap(),
         Current::Regular {
@@ -445,7 +445,7 @@ fn a_hard_linked_file_is_never_written() {
     assert_eq!(std::fs::read(fx.file("a.txt")).unwrap(), pre);
     assert_eq!(std::fs::read(&other).unwrap(), pre, "the other link is untouched");
     assert_eq!(meta(&fx.file("a.txt")).ino(), inode);
-    assert!(fx.journal.pending().is_empty());
+    assert!(fx.journal.pending().unwrap().entries.is_empty());
     assert!(names(fx.journal.dir()).is_empty(), "{:?}", names(fx.journal.dir()));
     assert!(fx.refs("refs/eitri-journal/").is_empty());
     no_temp_left(&fx.project);
@@ -811,7 +811,7 @@ fn a_failed_in_place_write_puts_the_old_bytes_back() {
     assert_eq!(std::fs::read(fx.file("a.txt")).unwrap(), pre);
     assert_eq!(meta(&fx.file("a.txt")).ino(), inode);
     assert_eq!(mode_of(&fx.file("a.txt")), 0o644, "the mode is put back too");
-    assert!(fx.journal.pending().is_empty());
+    assert!(fx.journal.pending().unwrap().entries.is_empty());
     assert!(names(fx.journal.dir()).is_empty());
     assert!(fx.refs("refs/eitri-journal/").is_empty());
 }
@@ -843,7 +843,7 @@ fn an_unwritable_in_place_file_journals_nothing() {
         other => panic!("expected a plain failure, got {other:?}"),
     }
     assert_eq!(std::fs::read(fx.file("ro.txt")).unwrap(), pre);
-    assert!(fx.journal.pending().is_empty());
+    assert!(fx.journal.pending().unwrap().entries.is_empty());
     assert!(names(fx.journal.dir()).is_empty());
     assert!(fx.refs("refs/eitri-journal/").is_empty());
 }
@@ -983,7 +983,7 @@ fn a_real_short_write_rolls_back() {
     assert!(status.success(), "the child failed: {status:?}");
     assert_eq!(std::fs::read(fx.file("a.bin")).unwrap(), pre);
     assert_eq!(meta(&fx.file("a.bin")).ino(), inode);
-    assert!(fx.journal.pending().is_empty());
+    assert!(fx.journal.pending().unwrap().entries.is_empty());
     assert!(fx.refs("refs/eitri-journal/").is_empty());
 }
 
@@ -1049,7 +1049,7 @@ fn crashed(scratch: &Scratch) -> (Fixture, Vec<u8>) {
 fn a_crash_mid_write_leaves_a_journal_entry() {
     let scratch = Scratch::new("crash");
     let (fx, original) = crashed(&scratch);
-    let pending = fx.journal.pending();
+    let pending = fx.journal.pending().unwrap().entries;
     assert_eq!(pending.len(), 1, "{pending:?}");
     let entry = &pending[0];
     assert_eq!(entry.path, Path::new("src/a.txt"));
@@ -1076,7 +1076,7 @@ fn a_crash_mid_write_leaves_a_journal_entry() {
     assert_eq!(mode_of(fx.journal.dir()), 0o700);
     // Removing it takes its pins with it.
     fx.journal.remove(&entry.id, &fx.shadow).unwrap();
-    assert!(fx.journal.pending().is_empty());
+    assert!(fx.journal.pending().unwrap().entries.is_empty());
     assert!(fx.refs("refs/eitri-journal/").is_empty());
 }
 
@@ -1084,7 +1084,7 @@ fn a_crash_mid_write_leaves_a_journal_entry() {
 fn a_pending_journal_older_than_max_age_survives_trim_and_gc() {
     let scratch = Scratch::new("crashtrim");
     let (fx, original) = crashed(&scratch);
-    let entry = fx.journal.pending().remove(0);
+    let entry = fx.journal.pending().unwrap().entries.remove(0);
     let anchored = fx.shadow.store_blob(b"anchored as old as the entry\n").unwrap();
     fx.shadow
         .anchor_revert("s1", &format!("{}-0", entry.at_ms), Some(&anchored), None)
@@ -1110,14 +1110,14 @@ fn a_pending_journal_older_than_max_age_survives_trim_and_gc() {
         "the anchor of the same age is gone"
     );
     assert_eq!(fx.shadow.read_stored(&anchored).unwrap(), None);
-    assert_eq!(fx.journal.pending().len(), 1);
+    assert_eq!(fx.journal.pending().unwrap().entries.len(), 1);
 }
 
 #[test]
 fn an_orphaned_journal_pin_is_trimmed() {
     let scratch = Scratch::new("orphan");
     let (fx, _) = crashed(&scratch);
-    let entry = fx.journal.pending().remove(0);
+    let entry = fx.journal.pending().unwrap().entries.remove(0);
     // The entry goes as a crash between its removal and its unpinning would leave it.
     std::fs::remove_file(fx.journal.dir().join(format!("{}.json", entry.id))).unwrap();
     assert_eq!(fx.refs("refs/eitri-journal/").len(), 2);
@@ -1520,7 +1520,8 @@ fn a_write_in_progress_is_not_pending_and_a_bad_entry_is_kept() {
         fault: Some(Arc::new(move |stage| {
             if stage == Stage::JournalWritten {
                 // The entry exists, but its writer holds it: it is no crash to recover from.
-                *seen_in_hook.lock().unwrap() = Some((names(journal.dir()).len(), journal.pending().len()));
+                *seen_in_hook.lock().unwrap() =
+                    Some((names(journal.dir()).len(), journal.pending().unwrap().entries.len()));
             }
             Ok(())
         })),
@@ -1538,7 +1539,10 @@ fn a_write_in_progress_is_not_pending_and_a_bad_entry_is_kept() {
     // An entry this build cannot read is left alone, never deleted.
     let bad = fx.journal.dir().join("0123456789abcdef0123456789abcdef.json");
     std::fs::write(&bad, b"{ not an entry").unwrap();
-    assert!(fx.journal.pending().is_empty());
+    let pending = fx.journal.pending().unwrap();
+    assert!(pending.entries.is_empty());
+    assert_eq!(pending.problems.len(), 1);
+    assert!(pending.problems[0].contains(&bad.display().to_string()));
     assert!(bad.exists());
 }
 
@@ -1578,7 +1582,7 @@ fn an_in_place_write_leaves_bytes_that_appeared_before_the_truncate() {
         b"saved by a formatter\n",
         "the other writer's bytes are not lost"
     );
-    assert!(fx.journal.pending().is_empty());
+    assert!(fx.journal.pending().unwrap().entries.is_empty());
     assert!(names(fx.journal.dir()).is_empty());
     assert!(fx.refs("refs/eitri-journal/").is_empty());
 }

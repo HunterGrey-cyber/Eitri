@@ -41,7 +41,7 @@ use crate::nvim_rpc::{Pending, RpcError};
 use crate::window_link::EditorOp;
 
 use super::diff::{file_hunks, Hunk, Side};
-use super::journal::{Journal, JournalClaim, JournalEntry, JournalNote};
+use super::journal::{Journal, JournalClaim, JournalEntry, JournalNote, Pending as JournalPending};
 use super::lifecycle::{
     check_unambiguous, resolve_compare, Resolved, ReviewError, Scope, ShadowSpec, TurnRecord, TurnRef,
     MAX_OVERVIEW_DIFF_LINES,
@@ -966,17 +966,14 @@ impl AnchorJob {
 }
 
 impl RecoveriesJob {
-    pub fn run(self) -> Vec<JournalEntry> {
+    pub fn run(self) -> Result<JournalPending, String> {
         let Some(dir) = self.spec.review_dir.as_deref() else {
-            return Vec::new();
+            return Ok(JournalPending::default());
         };
-        match Journal::open(dir) {
-            Ok(journal) => journal.pending(),
-            Err(e) => {
-                eprintln!("[review] the revert journal could not be opened: {e}");
-                Vec::new()
-            }
-        }
+        Journal::open(dir)
+            .map_err(|e| e.to_string())?
+            .pending()
+            .map_err(|e| e.to_string())
     }
 }
 

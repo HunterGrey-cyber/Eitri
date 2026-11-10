@@ -1673,6 +1673,10 @@ impl Controller {
         for window in self.windows.values_mut() {
             if let Some(saver) = window.saver.as_mut() {
                 saver.collect(window.workspaces.try_borrow_mut().ok().as_deref_mut());
+                for note in saver.take_notes() {
+                    window.warn(note.clone());
+                    chrome::show_toast(window, note, super::toasts::ToastKind::Warning);
+                }
             }
         }
     }

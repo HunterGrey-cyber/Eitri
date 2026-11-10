@@ -70,6 +70,13 @@ pub struct JournalEntry {
     pub session: String,
 }
 
+/// Interrupted writes that can be offered, and entries kept on disk that could not be read.
+#[derive(Debug, Default)]
+pub struct Pending {
+    pub entries: Vec<JournalEntry>,
+    pub problems: Vec<String>,
+}
+
 /// The journal directory of one project's review store.
 #[derive(Debug, Clone)]
 pub struct Journal {
@@ -205,18 +212,13 @@ impl Journal {
 
     /// The entries of writes that did not finish, oldest first. An entry whose writer still holds
     /// its lock (a write running now, in this window or another) is skipped. An entry that cannot be
-    /// read or understood is logged and left where it is, never deleted: it may be all that is left
-    /// of a file's earlier bytes.
-    pub fn pending(&self) -> Vec<JournalEntry> {
-        let entries = match std::fs::read_dir(&self.dir) {
-            Ok(entries) => entries,
-            Err(e) => {
-                eprintln!("[review] the revert journal could not be read: {e}");
-                return Vec::new();
-            }
-        };
-        let mut found = Vec::new();
-        for entry in entries.flatten() {
+    /// read or understood is reported in `problems` and left where it is, never deleted: it may be
+    /// all that is left of a file's earlier bytes. Only a directory listing failure fails the scan.
+    pub fn pending(&self) -> std::io::Result<Pending> {
+        let entries = std::fs::read_dir(&self.dir)?;
+        let mut found = Pending::default();
+        for entry in entries {
+            let entry = entry?;
             let name = entry.file_name();
             let Some(stem) = name.as_bytes().strip_suffix(b".json") else {
                 continue;
@@ -225,28 +227,34 @@ impl Journal {
                 continue;
             }
             let path = entry.path();
-            if !path.symlink_metadata().is_ok_and(|m| m.is_file()) {
-                continue;
+            match path.symlink_metadata() {
+                Ok(m) if m.is_file() => {}
+                Ok(_) => continue,
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
+                Err(e) => {
+                    found.problems.push(format!("{}: {e}", path.display()));
+                    continue;
+                }
             }
             match read_unheld(&path) {
                 Ok(None) => {}
                 // Handled by another worker since the directory was listed.
                 Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
                 Ok(Some((_unlocked_on_drop, bytes))) => match parse_entry(stem, &bytes) {
-                    Some(parsed) => found.push(parsed),
-                    None => eprintln!(
-                        "[review] the revert journal entry {} is not one this build understands; it is kept",
+                    Some(parsed) => found.entries.push(parsed),
+                    None => found.problems.push(format!(
+                        "{}: not one this build understands; it is kept",
                         path.display()
-                    ),
+                    )),
                 },
-                Err(e) => eprintln!(
-                    "[review] the revert journal entry {} could not be read: {e}; it is kept",
-                    path.display()
-                ),
+                Err(e) => found.problems.push(format!("{}: {e}", path.display())),
             }
         }
-        found.sort_by(|a, b| a.at_ms.cmp(&b.at_ms).then_with(|| a.id.cmp(&b.id)));
         found
+            .entries
+            .sort_by(|a, b| a.at_ms.cmp(&b.at_ms).then_with(|| a.id.cmp(&b.id)));
+        found.problems.sort();
+        Ok(found)
     }
 
     /// Takes entry `id` for this window: its lock is taken and its bytes read on one descriptor,
@@ -414,6 +422,28 @@ fn wall_clock_ms() -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_journal_scan_failure_is_distinct_from_an_empty_journal() {
+        let dir = crate::test_scratch_dir::ScratchDir::new("eitri-journal", "scan-retry");
+        let journal = Journal::open(&dir).unwrap();
+        std::fs::set_permissions(journal.dir(), std::fs::Permissions::from_mode(0o000)).unwrap();
+        let failed = journal.pending();
+        std::fs::set_permissions(journal.dir(), std::fs::Permissions::from_mode(0o700)).unwrap();
+        assert!(failed.is_err(), "unreadable journal appeared empty");
+        let empty = journal.pending().unwrap();
+        assert!(empty.entries.is_empty());
+        assert!(empty.problems.is_empty());
+        let entry = journal.dir().join("0123456789abcdef0123456789abcdef.json");
+        std::fs::write(&entry, b"unreadable").unwrap();
+        std::fs::set_permissions(&entry, std::fs::Permissions::from_mode(0o000)).unwrap();
+        let pending = journal.pending().unwrap();
+        std::fs::set_permissions(&entry, std::fs::Permissions::from_mode(0o600)).unwrap();
+        assert!(pending.entries.is_empty());
+        assert_eq!(pending.problems.len(), 1);
+        assert!(pending.problems[0].contains(&entry.display().to_string()));
+        assert!(entry.exists());
+    }
 
     /// An exclusive `flock` on NFS needs a descriptor open for writing; this pins it on every file
     /// system, since a local one takes the lock either way and would not notice the difference.

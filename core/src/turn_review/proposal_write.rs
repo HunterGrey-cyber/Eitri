@@ -931,7 +931,7 @@ mod tests {
         let journal = world.journal();
         let until = Instant::now() + Duration::from_secs(60);
         let entry = loop {
-            match journal.pending().pop() {
+            match journal.pending().unwrap().entries.pop() {
                 Some(entry) => break entry,
                 None if Instant::now() < until => std::thread::sleep(Duration::from_millis(20)),
                 None => panic!("the interrupted write left no entry"),

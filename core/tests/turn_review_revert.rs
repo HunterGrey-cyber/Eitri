@@ -302,7 +302,7 @@ impl World {
         let journal = Journal::open(&self.review_dir).unwrap();
         let deadline = Instant::now() + Duration::from_secs(1);
         loop {
-            let pending = journal.pending();
+            let pending = journal.pending().unwrap().entries;
             if pending.len() >= expected || Instant::now() > deadline {
                 return pending;
             }
@@ -1722,7 +1722,7 @@ fn recover_restores_and_keeps_the_current_bytes() {
     // Asked again for a moment, for the same reason as `pending_of`.
     let deadline = Instant::now() + Duration::from_secs(1);
     let offered = loop {
-        let offered = w.review.recoveries_job().run();
+        let offered = w.review.recoveries_job().run().unwrap().entries;
         if !offered.is_empty() || Instant::now() > deadline {
             break offered;
         }
