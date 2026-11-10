@@ -3390,7 +3390,25 @@ mod live_review {
         live_until(&mut f, &editor, at, "the live drawing", |_, e| {
             e.count(LIVE_SHOW_LUA) == 1
         });
-        f.tabs.freeze_for_move(f.tab).expect("the chat can move");
+        let (inside, release) = f.provider.hold_next_pump();
+        inside.recv_timeout(Duration::from_secs(10)).expect("ingestion is held");
+        let mut release = Some(release);
+        let deadline = Instant::now() + Duration::from_secs(10);
+        let mut saw_folding = false;
+        loop {
+            match f.tabs.freeze_for_move(f.tab) {
+                Err(eitri_core::tab_set::MoveRefusedWhy::Folding) if Instant::now() < deadline => {
+                    saw_folding = true;
+                    drop(release.take());
+                    std::thread::sleep(Duration::from_millis(1));
+                }
+                other => {
+                    other.expect("the chat can move");
+                    break;
+                }
+            }
+        }
+        assert!(saw_folding, "the held ingestion batch refused the first freeze");
         live_until(&mut f, &editor, at, "the clear", |_, e| e.count(LIVE_CLEAR_LUA) == 1);
         assert_eq!(live_clears(&editor), vec![path_bytes(&f.file("a.txt"))]);
         f.tabs.unfreeze(f.tab);

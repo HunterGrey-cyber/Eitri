@@ -41,6 +41,7 @@ pub struct RecordingProvider {
     after_resolution: std::sync::Mutex<Option<Vec<AgentDomainEvent>>>,
     /// How many times ingestion has asked this provider for events.
     pumps: AtomicUsize,
+    held_pump: std::sync::Mutex<Option<(std::sync::mpsc::Sender<()>, std::sync::mpsc::Receiver<()>)>>,
     /// Advertises `steer` and takes messages into the running turn.
     steering: bool,
     /// Every message it was sent into a running turn, in order.
@@ -160,6 +161,15 @@ impl RecordingProvider {
     /// effect until the overflow later in the same batch has already happened too.
     pub fn queue_all(&self, events: Vec<AgentDomainEvent>) {
         self.queued.lock().unwrap().extend(events);
+    }
+
+    /// Holds the next ingestion batch until the returned sender sends or is dropped; the receiver
+    /// announces when ingestion is inside the provider's pump with its folding gate held.
+    pub fn hold_next_pump(&self) -> (std::sync::mpsc::Receiver<()>, std::sync::mpsc::Sender<()>) {
+        let (inside, entered) = std::sync::mpsc::channel();
+        let (release, held) = std::sync::mpsc::channel();
+        *self.held_pump.lock().unwrap() = Some((inside, held));
+        (entered, release)
     }
     pub fn resolutions(&self) -> Vec<(String, bool)> {
         self.resolved.lock().unwrap().clone()
@@ -532,6 +542,11 @@ impl agent::AgentProvider for RecordingProvider {
     }
     fn pump(&self) -> Vec<AgentDomainEvent> {
         self.pumps.fetch_add(1, Ordering::SeqCst);
+        let held = self.held_pump.lock().unwrap().take();
+        if let Some((inside, release)) = held {
+            let _ = inside.send(());
+            let _ = release.recv_timeout(std::time::Duration::from_secs(10));
+        }
         std::mem::take(&mut *self.queued.lock().unwrap())
     }
 }

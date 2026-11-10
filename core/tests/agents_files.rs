@@ -922,7 +922,19 @@ mod read {
         let scratch = Scratch::new("tr");
         let control = scratch.control();
         let mut one = watch(&control, |_| {});
-        let mut other = watch(&control, |_| {});
+        // Pause the second reader between metadata and the read, so it finds the file missing
+        // after the first reader cleans it, before it can process the writer's death.
+        type Gate = (std::sync::mpsc::Sender<()>, Receiver<()>);
+        static GATE: Mutex<Option<Gate>> = Mutex::new(None);
+        fn pause_read(_: &Path, uid: u32) -> u32 {
+            let gate = GATE.lock().unwrap().take();
+            if let Some((inside, resume)) = gate {
+                inside.send(()).unwrap();
+                resume.recv_timeout(PATIENCE).expect("the read is released");
+            }
+            uid
+        }
+        let mut other = watch(&control, |h| h.owner = pause_read);
         let instance = new_instance();
         let socket = agent::socket_path::in_dir(&control, &format!("ag-{instance}.sock")).unwrap();
         let listener = std::os::unix::net::UnixListener::bind(&socket).unwrap();
@@ -931,15 +943,35 @@ mod read {
         one.until(|f| f.rows.len() == 1);
         other.until(|f| f.rows.len() == 1);
 
+        let (inside_tx, inside) = channel();
+        let (resume, resume_rx) = channel();
+        *GATE.lock().unwrap() = Some((inside_tx, resume_rx));
+        let bytes = std::fs::read(file_path(&control, &format!("{instance}.json"))).unwrap();
+        put(&control, &format!("{instance}.json"), &bytes);
+        inside
+            .recv_timeout(PATIENCE)
+            .expect("the other reader is inside its read");
         child.kill();
+        assert_eq!(one.until(|f| f.rows.is_empty()), vec![gone(&rows[0], GoneWhy::Window)]);
+        let cleaned_first = one.batch_until(|b| b.cleaned.contains(&instance));
+        resume.send(()).unwrap();
+        assert_eq!(
+            other.until(|f| f.rows.is_empty()),
+            vec![gone(&rows[0], GoneWhy::Window)]
+        );
+        // Joining makes every completed batch available, including the batch after the last change.
         for w in [&mut one, &mut other] {
-            assert_eq!(w.until(|f| f.rows.is_empty()), vec![gone(&rows[0], GoneWhy::Window)]);
+            w.reader.take().unwrap().stop();
         }
-        let cleaned = [&one, &other]
-            .iter()
-            .map(|w| w.batch_until(|b| b.buried.contains(&instance)))
-            .filter(|b| b.cleaned.contains(&instance))
-            .count();
+        let other_batches: Vec<_> = other.batches.try_iter().collect();
+        assert!(other_batches.iter().all(|b| !b.buried.contains(&instance)));
+        let cleaned = cleaned_first.cleaned.iter().filter(|i| *i == &instance).count()
+            + one
+                .batches
+                .try_iter()
+                .chain(other_batches)
+                .filter(|b| b.cleaned.contains(&instance))
+                .count();
         assert_eq!(cleaned, 1, "exactly one reader removes a dead writer's files");
         assert_cleaned(&control, &instance);
         assert!(
@@ -1438,6 +1470,73 @@ mod read {
         ph.stop();
     }
 
+    /// A child keeps the probe's open file description after the probing thread closes its copy.
+    struct InheritedProbe {
+        release: Option<OwnedFd>,
+        pid: libc::pid_t,
+    }
+
+    impl Drop for InheritedProbe {
+        fn drop(&mut self) {
+            drop(self.release.take());
+            // SAFETY: the pid remains our unreaped child. Closing the pipe wakes it; its poll
+            // also has a hang guard, so collecting it cannot leave a child behind.
+            unsafe {
+                while libc::waitpid(self.pid, std::ptr::null_mut(), 0) < 0 {
+                    if std::io::Error::last_os_error().raw_os_error() != Some(libc::EINTR) {
+                        break;
+                    }
+                }
+            }
+        }
+    }
+
+    fn inherit_probe(control: &Path, instance: &str) -> InheritedProbe {
+        let held = held_lock(control, instance);
+        std::thread::spawn(move || {
+            let mut pipe = [-1; 2];
+            // SAFETY: the array has room for both descriptors. After fork the child only uses
+            // async-signal-safe syscalls and _exit, never Rust allocation or inherited locks.
+            let pid = unsafe {
+                assert_eq!(libc::pipe2(pipe.as_mut_ptr(), libc::O_CLOEXEC), 0);
+                let pid = libc::fork();
+                if pid == 0 {
+                    libc::close(pipe[1]);
+                    let mut fd = libc::pollfd {
+                        fd: pipe[0],
+                        events: libc::POLLIN,
+                        revents: 0,
+                    };
+                    libc::poll(&mut fd, 1, 10_000);
+                    libc::_exit(0);
+                }
+                libc::close(pipe[0]);
+                pid
+            };
+            assert!(pid > 0, "fork: {}", std::io::Error::last_os_error());
+            drop(held);
+            // SAFETY: the successful pipe call made this descriptor, owned only here.
+            InheritedProbe {
+                release: Some(unsafe { OwnedFd::from_raw_fd(pipe[1]) }),
+                pid,
+            }
+        })
+        .join()
+        .unwrap()
+    }
+
+    fn scan_until_dead(control: &Path, mut retained: impl FnMut()) {
+        let deadline = std::time::Instant::now() + PATIENCE;
+        while !scan_once(control, SCHEMA_V).unwrap().rows.is_empty() {
+            retained();
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the dead writer's row never disappeared"
+            );
+            std::thread::sleep(Duration::from_millis(5));
+        }
+    }
+
     #[test]
     fn a_killed_writer_not_yet_reaped_is_dead() {
         let scratch = Scratch::new("unreaped");
@@ -1455,7 +1554,16 @@ mod read {
             matches!(liveness::check(child.pid, start, &lock), Alive::No),
             "a process that has exited is dead before its parent collects it"
         );
-        assert!(scan_once(&control, SCHEMA_V).unwrap().rows.is_empty());
+        let mut inherited = Some(inherit_probe(&control, &instance));
+        let mut retries = 0;
+        scan_until_dead(&control, || {
+            retries += 1;
+            drop(inherited.take());
+        });
+        assert!(
+            retries > 0,
+            "the forked child retained the probe lock for the first scan"
+        );
         assert_cleaned(&control, &instance);
     }
 

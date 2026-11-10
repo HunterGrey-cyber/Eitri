@@ -54,6 +54,10 @@ fn main() {
             agents_feed_still_cleans_a_dead_writer_under_the_sandbox,
         ),
         ("wildcard_listen_is_refused", wildcard_listen_is_refused),
+        (
+            "probe_port_stays_reserved_without_listening",
+            probe_port_stays_reserved_without_listening,
+        ),
         ("unconfirmed_address_is_not_bound", unconfirmed_address_is_not_bound),
         (
             "serve_is_not_dumpable_and_status_says_how_it_runs",
@@ -447,9 +451,16 @@ fn unconfirmed_address_is_not_bound(shell: &str, dir: &Path) -> Result<(), Strin
         println!("    (no address but loopback here: nothing to refuse)");
         return Ok(());
     };
-    let probe = std::net::TcpListener::bind((addr, 0)).map_err(|e| e.to_string())?;
+    let std::net::IpAddr::V4(addr) = addr else {
+        unreachable!()
+    };
+    let probe = reserve_probe_port(addr).map_err(|e| e.to_string())?;
     let port = probe.local_addr().unwrap().port().to_string();
-    drop(probe);
+    // An unrelated listener cannot take this number while the refusal is checked.
+    let intrusion = std::net::TcpListener::bind((addr, port.parse::<u16>().unwrap()));
+    if !matches!(intrusion, Err(ref e) if e.raw_os_error() == Some(libc::EADDRINUSE)) {
+        return Err("the probe port was not reserved against another listener".into());
+    }
     let run = run(shell_remote(
         shell,
         &home,
@@ -460,6 +471,50 @@ fn unconfirmed_address_is_not_bound(shell: &str, dir: &Path) -> Result<(), Strin
     }
     if std::net::TcpStream::connect((addr, port.parse::<u16>().unwrap())).is_ok() {
         return Err(format!("something listens on {addr}:{port}"));
+    }
+    drop(probe);
+    Ok(())
+}
+
+/// Keeps a port assigned without accepting connections, so a refusal check cannot dial another test.
+fn reserve_probe_port(addr: std::net::Ipv4Addr) -> std::io::Result<std::net::TcpListener> {
+    use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
+    let address = libc::sockaddr_in {
+        sin_family: libc::AF_INET as libc::sa_family_t,
+        sin_port: 0,
+        sin_addr: libc::in_addr {
+            s_addr: u32::from(addr).to_be(),
+        },
+        sin_zero: [0; 8],
+    };
+    // SAFETY: the new descriptor is owned here, and the address is valid for the size passed.
+    unsafe {
+        let raw = libc::socket(libc::AF_INET, libc::SOCK_STREAM | libc::SOCK_CLOEXEC, 0);
+        if raw < 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+        let socket = OwnedFd::from_raw_fd(raw);
+        if libc::bind(
+            socket.as_raw_fd(),
+            (&address as *const libc::sockaddr_in).cast(),
+            std::mem::size_of_val(&address) as libc::socklen_t,
+        ) != 0
+        {
+            return Err(std::io::Error::last_os_error());
+        }
+        Ok(std::net::TcpListener::from(socket))
+    }
+}
+
+fn probe_port_stays_reserved_without_listening(_: &str, _: &Path) -> Result<(), String> {
+    let reservation = reserve_probe_port(std::net::Ipv4Addr::LOCALHOST).map_err(|e| e.to_string())?;
+    let address = reservation.local_addr().map_err(|e| e.to_string())?;
+    let competing = std::net::TcpListener::bind(address);
+    if !matches!(competing, Err(ref e) if e.raw_os_error() == Some(libc::EADDRINUSE)) {
+        return Err("another listener took the reserved port".into());
+    }
+    if std::net::TcpStream::connect(address).is_ok() {
+        return Err("the reservation accepted a connection".into());
     }
     Ok(())
 }

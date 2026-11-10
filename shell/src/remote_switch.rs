@@ -511,9 +511,41 @@ mod tests {
     }
 
     fn hold_serve(dirs: &Dirs) -> agent::private_fs::PrivateLock {
+        hold_serve_while(dirs, || {})
+    }
+
+    fn hold_serve_while(dirs: &Dirs, mut busy: impl FnMut()) -> agent::private_fs::PrivateLock {
         let lock = agent::private_fs::PrivateLock::open(&dirs.control.join(eitri_remote::serve::LOCK_FILE)).unwrap();
-        assert!(lock.try_lock().unwrap());
+        let until = Instant::now() + Duration::from_secs(5);
+        while !lock.try_lock().unwrap() {
+            busy();
+            assert!(Instant::now() < until, "the exclusive serve lock was never available");
+            std::thread::sleep(Duration::from_millis(5));
+        }
         lock
+    }
+
+    #[test]
+    fn hold_serve_waits_for_a_shared_probe_to_close() {
+        let dir = crate::linked_window::tests::Scratch::new("shared-probe");
+        let dirs = dirs_at(&dir.1);
+        let shared = agent::private_fs::PrivateLock::open(&dirs.control.join(eitri_remote::serve::LOCK_FILE)).unwrap();
+        assert!(shared.try_lock_shared().unwrap());
+        assert!(!eitri_remote::serve::is_running(&dirs).unwrap());
+        let (release, held) = std::sync::mpsc::channel();
+        let holder = std::thread::spawn(move || {
+            let _ = held.recv_timeout(Duration::from_secs(10));
+            drop(shared);
+        });
+        let mut retries = 0;
+        let exclusive = hold_serve_while(&dirs, || {
+            retries += 1;
+            let _ = release.send(());
+        });
+        holder.join().unwrap();
+        assert!(retries > 0, "the shared probe prevented the first exclusive take");
+        assert!(eitri_remote::serve::is_running(&dirs).unwrap());
+        drop(exclusive);
     }
 
     #[test]

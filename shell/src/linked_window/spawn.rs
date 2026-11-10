@@ -2711,45 +2711,54 @@ pub(crate) mod tests {
         assert_eq!(signal_of(status), Some(libc::SIGKILL), "{status:?}");
     }
 
+    /// The main loop keeps the hold while the ending thread is parked, then releases it after the join.
+    #[test]
+    fn a_finished_ending_is_released_without_waiting_for_a_timer() {
+        use std::cell::Cell;
+        use std::sync::mpsc;
+        let context = gtk4::glib::MainContext::new();
+        let released = Rc::new(Cell::new(false));
+        context
+            .with_thread_default(|| {
+                let (finish, held) = mpsc::channel();
+                let ending = std::thread::spawn(move || {
+                    held.recv_timeout(Duration::from_secs(10))
+                        .expect("the test releases the ending");
+                });
+                {
+                    let released = released.clone();
+                    release_when_finished(ending, move || released.set(true));
+                }
+                let (marked, marker_seen) = mpsc::channel();
+                let marker = gtk4::glib::idle_source_new(None, gtk4::glib::Priority::DEFAULT_IDLE, move || {
+                    marked.send(()).unwrap();
+                    gtk4::glib::ControlFlow::Break
+                });
+                marker.attach(Some(&context));
+                let deadline = Instant::now() + Duration::from_secs(10);
+                while marker_seen.try_recv().is_err() {
+                    assert!(Instant::now() < deadline, "the main loop never dispatched the marker");
+                    context.iteration(false);
+                    std::thread::yield_now();
+                }
+                assert!(!released.get(), "the hold cannot go before the ending finishes");
+                finish.send(()).unwrap();
+                while !released.get() {
+                    assert!(Instant::now() < deadline, "the finished ending never released its hold");
+                    context.iteration(false);
+                    std::thread::yield_now();
+                }
+            })
+            .unwrap();
+        assert!(released.get());
+    }
+
     /// An application whose last window has closed must not exit while a window 2 still waits for its SIGKILL: `run`
     /// returns only once the ending is done, on the thread and on the main-loop timer alike.
     ///
     /// Ignored because `g_application_run` iterates the default main context, which two tests in two threads would
     /// fight over. Run it alone:
-    /// `cargo test -p shell the_application_outlives_an_ending_in_its_grace -- --ignored --exact`.
-    /// The release follows the ending thread's end on the main loop, not a timer's next look: with a marker timer at
-    /// half the old polling period, the release must come first. Runs on a private main context, so it does not
-    /// fight the suite over the default one; the marker is attached to that context, and nothing blocks on it.
-    #[test]
-    fn a_finished_ending_is_released_without_waiting_for_a_timer() {
-        use std::sync::{Arc, Mutex};
-        let context = gtk4::glib::MainContext::new();
-        let order: Arc<Mutex<Vec<&str>>> = Arc::default();
-        context
-            .with_thread_default(|| {
-                let ending = std::thread::spawn(|| ());
-                {
-                    let order = order.clone();
-                    release_when_finished(ending, move || order.lock().unwrap().push("released"));
-                }
-                let marker = {
-                    let order = order.clone();
-                    gtk4::glib::timeout_source_new(REAP_RETRY / 2, None, gtk4::glib::Priority::DEFAULT, move || {
-                        order.lock().unwrap().push("marker");
-                        gtk4::glib::ControlFlow::Break
-                    })
-                };
-                marker.attach(Some(&context));
-                let deadline = Instant::now() + Duration::from_secs(10);
-                while order.lock().unwrap().len() < 2 && Instant::now() < deadline {
-                    context.iteration(false);
-                    std::thread::sleep(Duration::from_millis(1));
-                }
-            })
-            .unwrap();
-        assert_eq!(*order.lock().unwrap(), ["released", "marker"]);
-    }
-
+    /// `cargo test -p shell --bin shell linked_window::spawn::tests::the_application_outlives_an_ending_in_its_grace -- --ignored --exact`.
     #[test]
     #[ignore = "runs a real gio main loop on the default main context; must not race the rest of the suite"]
     fn the_application_outlives_an_ending_in_its_grace() {

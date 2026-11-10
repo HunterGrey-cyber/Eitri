@@ -68,24 +68,100 @@ mod tests {
         line.split_whitespace().nth(1).expect("a number").parse().expect("kB")
     }
 
-    /// The case the trim exists for: memory freed underneath a block that is still in use, which
-    /// glibc keeps resident by itself. 64 MiB in 4 KiB blocks (below malloc's mmap threshold, so
-    /// they come from an arena), one block kept after them, the rest freed: the trim must return
-    /// most of it. Other tests run in this process meanwhile, so the bar is half, not all.
+    /// The case the trim exists for: memory freed underneath a live block. Measurement runs
+    /// in a child with one arena and automatic trimming disabled, so its baseline stays resident.
     #[cfg(all(target_os = "linux", target_env = "gnu"))]
     #[test]
     fn the_trim_returns_pages_freed_below_a_live_block() {
-        let blocks: Vec<Box<[u8; 4096]>> = (0..16 * 1024).map(|i| Box::new([i as u8; 4096])).collect();
-        let keep = std::hint::black_box(Box::new([1u8; 4096]));
-        drop(blocks);
-        let before = rss_anon_kib();
-        trim_heap();
-        let after = rss_anon_kib();
-        assert_eq!(keep[0], 1);
+        use std::io::{BufRead, Write};
+        use std::process::{Command, Stdio};
+        const CHILD: &str = "EITRI_TRIM_TEST_CHILD";
+        if std::env::var_os(CHILD).is_some() {
+            let idle = rss_anon_kib();
+            let blocks: Vec<Box<[u8; 4096]>> = (0..16 * 1024).map(|i| Box::new([i as u8; 4096])).collect();
+            let keep = std::hint::black_box(Box::new([1u8; 4096]));
+            drop(blocks);
+            let before = rss_anon_kib();
+            assert!(
+                before >= idle + 60 * 1024,
+                "the freed allocation must still be resident"
+            );
+            trim_heap();
+            println!("trimmed {before}");
+            std::io::stdout().flush().unwrap();
+            let mut ack = String::new();
+            std::io::stdin().read_line(&mut ack).unwrap();
+            assert_eq!(ack, "measure\n");
+            let after = rss_anon_kib();
+            assert_eq!(keep[0], 1);
+            println!("rss {before} {after}");
+            assert!(
+                before.saturating_sub(after) >= 32 * 1024,
+                "RssAnon {before} kB before, {after} kB after"
+            );
+            return;
+        }
+        let mut child = Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "process_memory::tests::the_trim_returns_pages_freed_below_a_live_block",
+                "--nocapture",
+            ])
+            .env(CHILD, "1")
+            .env("MALLOC_ARENA_MAX", "1")
+            .env("MALLOC_TRIM_THRESHOLD_", "-1")
+            .env("MALLOC_MMAP_THRESHOLD_", "131072")
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap();
+        let stdout = child.stdout.take().unwrap();
+        let (lines_tx, lines) = std::sync::mpsc::channel();
+        let reader = std::thread::spawn(move || {
+            for line in std::io::BufReader::new(stdout).lines() {
+                if lines_tx.send(line.unwrap()).is_err() {
+                    break;
+                }
+            }
+        });
+        // Allocate between the child's trim and final read. In a shared process this hides all
+        // the pages returned by the trim; the isolated measurement must still see its own reduction.
+        let deadline = std::time::Instant::now() + Duration::from_secs(30);
+        let mut noise = None;
+        let mut measured = false;
+        let mut output = Vec::new();
+        let status = loop {
+            while let Ok(line) = lines.try_recv() {
+                if line.contains("trimmed ") {
+                    noise = Some(std::hint::black_box(vec![0x5au8; 96 * 1024 * 1024]));
+                    child.stdin.take().unwrap().write_all(b"measure\n").unwrap();
+                }
+                measured |= line.starts_with("rss ");
+                output.push(line);
+            }
+            if let Some(status) = child.try_wait().unwrap() {
+                break status;
+            }
+            if std::time::Instant::now() >= deadline {
+                let _ = child.kill();
+                let _ = child.wait();
+                panic!("the heap measurement child hung: {output:?}");
+            }
+            std::thread::sleep(Duration::from_millis(1));
+        };
+        reader.join().unwrap();
+        for line in lines.try_iter() {
+            measured |= line.starts_with("rss ");
+            output.push(line);
+        }
+        let mut stderr = String::new();
+        std::io::Read::read_to_string(&mut child.stderr.take().unwrap(), &mut stderr).unwrap();
         assert!(
-            before.saturating_sub(after) >= 32 * 1024,
-            "RssAnon {before} kB before the trim, {after} kB after"
+            status.success() && measured,
+            "heap measurement {status}: {output:?} {stderr}"
         );
+        assert_eq!(noise.unwrap()[0], 0x5a);
     }
 
     /// The option name is one this WebKit knows: a misspelt or retired name makes the setter return
