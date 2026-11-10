@@ -28,6 +28,7 @@ import {
   noSuchAnswerFlash,
   notAKeyHereFlash,
   notApprovableFlash,
+  pathPickInCardFlash,
   shiftedDigitFlash,
 } from "./app/flashes";
 
@@ -70,7 +71,7 @@ describe("card mode's band", () => {
       const segs = bandLayout(holding(), width, 7.2);
       expect(segs.map((s) => s.id), `${width}`).toEqual(["mode", "pill", "card", "unread"]);
       expect(segs.find((s) => s.id === "card")!.text, `${width}`).toBe("card 1/2 · 1-3 · Tab · Esc");
-      expect(segs.find((s) => s.id === "mode")!.text, `${width}`).toBe("BROWSE");
+      expect(segs.find((s) => s.id === "mode")!.text, `${width}`).toBe("CARD");
     }
   });
 
@@ -86,12 +87,27 @@ describe("card mode's band", () => {
     expect(narrow.find((s) => s.id === "message")!.cut).toBeFalsy();
   });
 
-  it("offers Enter on the cursor's card in BROWSE, and Alt-n from elsewhere", () => {
-    expect(card({ ...running, mode: "browse", onCard: true })?.text).toBe("Enter or Alt-n: card mode, then 1-3");
-    for (const mode of ["input", "caret", "visual", "vline", "hint"] as const) {
-      expect(card({ ...running, mode, onCard: true })?.text).toBe("Alt-n: card mode, then 1-3");
+  it("offers no way in out of card mode: the activity line says how card mode is entered", () => {
+    for (const mode of ["browse", "input", "caret", "visual", "vline", "hint"] as const) {
+      expect(card({ ...running, mode, cards: 2 }), mode).toBeUndefined();
     }
-    expect(card({ ...running, mode: "browse", onCard: false })?.text).toBe("Alt-n: card mode, then 1-3");
+  });
+
+  it("reads CARD in the mode block while card mode holds, whichever mode it came from", () => {
+    for (const mode of ["browse", "input"] as const) {
+      const segs = bandLayout(holding({}, { mode }), 2000, 7.2);
+      expect(segs.find((s) => s.id === "mode")!.text).toBe("CARD");
+    }
+    expect(bandLayout({ ...idle, cards: 1 }, 2000, 7.2).find((s) => s.id === "mode")!.text).toBe("BROWSE");
+  });
+
+  it.each([322, 360])("at %i px a refusal in card mode is shown whole: it takes the mode's word and the card's place first", (width) => {
+    for (const refusal of [lettersNeverAnswerFlash("x", 3), cardArmingFlash("1"), ANSWER_CANCELLED_FLASH, SHIFT_TAB_IN_CARD_FLASH, CTRL_Y_GONE_FLASH, A_ON_CARD_FLASH]) {
+      const segs = bandLayout(holding({}, { message: refusal }), width, 7.2);
+      const message = segs.find((s) => s.id === "message")!;
+      expect(message.cut, `${width}: ${refusal}`).toBeFalsy();
+      expect([refusal, SHORT_FLASH.get(refusal)], `${width}: ${refusal}`).toContain(message.text);
+    }
   });
 
   it("offers no card key with only questions waiting, or under a confirmation", () => {
@@ -99,10 +115,10 @@ describe("card mode's band", () => {
     expect(card({ ...running, cardMode: { index: 1, total: 1, answers: 2, reason: true }, prompt: "close? (y/n)" })).toBeUndefined();
   });
 
-  it("keeps the held card's instructions when figures give way, and returns to the entry hint on leaving", () => {
+  it("keeps the held card's instructions when figures give way, and offers nothing on leaving", () => {
     const held = { ...running, cardMode: { index: 1, total: 1, answers: 2, reason: true } };
     expect(bandLayout(held, 600, 7.2).find((s) => s.id === "card")?.text).toBe(card(held)?.text);
-    expect(card({ ...held, cardMode: null })?.text).toBe("Alt-n: card mode, then 1-3");
+    expect(card({ ...held, cardMode: null })).toBeUndefined();
     expect(card({ ...idle, cardMode: null })).toBeUndefined();
   });
 });
@@ -112,12 +128,13 @@ describe("card mode's band", () => {
 const CARD_MODE_FLASHES = [
   REPLAYED_KEY_FLASH, SHIFT_TAB_IN_CARD_FLASH, CTRL_G_IN_CARD_FLASH, ANSWER_CANCELLED_FLASH, ANSWER_INTERRUPTED_FLASH,
   CARD_CHANGED_FLASH, QUESTION_WAITS_FLASH, ENTER_ALONE_FLASH, REASON_ENTER_OUTSIDE_FLASH, BROKER_NO_REASON_FLASH,
-  CTRL_Y_GONE_FLASH, agentNoReasonFlash("Codex"), agentNoReasonFlash("goose"), cardJumpGoneFlash("]p"), cardJumpGoneFlash("[p"),
+  CTRL_Y_GONE_FLASH, agentNoReasonFlash("Codex", 2), agentNoReasonFlash("goose", 2), agentNoReasonFlash("Codex", 3), cardJumpGoneFlash("]p"), cardJumpGoneFlash("[p"),
   ...["1", "3", "9"].map(shiftedDigitFlash), ...["1", "Enter"].map(heldAnswerFlash), ...["1", "Enter"].map(cardArmingFlash),
   noSuchAnswerFlash("4", 3), noSuchAnswerFlash("3", 2), noButtonPickedFlash(2), noButtonPickedFlash(3),
   ...["Shift+Enter", "Ctrl+Enter", "Alt+Enter"].map(modifiedReasonEnterFlash), heldCardChordFlash("Alt-n"), heldCardChordFlash("Alt-p"),
   ...["a", "D", "?", "Space", "Ctrl+x", "F5"].map((key) => lettersNeverAnswerFlash(key, 3)),
-  ...["1", "3", "Enter"].map(notApprovableFlash),
+  ...["1", "3", "Enter"].flatMap((key) => [notApprovableFlash(key, 2), notApprovableFlash(key, 3)]),
+  pathPickInCardFlash("gd"), pathPickInCardFlash("gf"),
 ];
 
 describe("the phone mark", () => {
@@ -194,7 +211,7 @@ describe("the band degrades by priority", () => {
   it("a link that is not attached replaces the context segment with its text", () => {
     const link = { state: "detached" as const, text: "editor detached: run :EitriPanel to attach again" };
     const segs = bandLayout({ ...running, link }, 900, 7.2);
-    expect(segs.map((s) => s.id)).toEqual(["mode", "pill", "card", "cards", "queue", "link", "model", "position", "unread"]);
+    expect(segs.map((s) => s.id)).toEqual(["mode", "pill", "cards", "queue", "link", "model", "position", "unread"]);
     expect(segs.find((s) => s.id === "link")).toEqual({ id: "link", text: link.text, side: "right" });
   });
   it("shows the context when the editor is attached, and nothing changes without a link", () => {
@@ -600,9 +617,9 @@ describe("the usage segment", () => {
     expect(usageSegment(u(1.5, null))!.text).toBe("$1.50");
     expect(usageSegment(u(0.4213, { input: 10, output: 20, cache_creation: 300, cache_read: 4000 }))!.title).toContain("since this tab started or resumed");
   });
-  it("sits right of the model and drops after the card-entry hint", () => {
+  it("sits right of the model and drops first", () => {
     const withUsage: BandFacts = { ...running, usage: { text: "1.2M tok $0.42", title: "" } };
-    expect(ids(900, withUsage)).toEqual(["mode", "pill", "card", "cards", "queue", "context", "model", "usage", "position", "unread"]);
+    expect(ids(900, withUsage)).toEqual(["mode", "pill", "cards", "queue", "context", "model", "usage", "position", "unread"]);
     expect(ids(520, withUsage)).toEqual(["mode", "pill", "cards", "queue", "context", "model", "position", "unread"]);
     expect(bandLayout(withUsage, 520, 7.2).find((s) => s.id === "context")!.text).toBe("⧉ eitri.zsh:3-9");
   });
@@ -701,7 +718,7 @@ describe("turn ending", () => {
   });
   it("sits after the card and queue counts, before a flash", () => {
     const facts: BandFacts = { ...running, ending: end("failed"), message: "copied" };
-    expect(ids(900, facts)).toEqual(["mode", "pill", "card", "cards", "queue", "ending", "message", "context", "model", "position", "unread"]);
+    expect(ids(900, facts)).toEqual(["mode", "pill", "cards", "queue", "ending", "message", "context", "model", "position", "unread"]);
   });
   it("outlasts the model, usage and context, the cards and the queue, and is never in a y/n prompt's band", () => {
     const facts: BandFacts = { ...running, ending: end("failed"), usage: { text: "1k tok $0.01", title: "" } };

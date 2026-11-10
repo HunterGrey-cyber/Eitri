@@ -201,9 +201,24 @@ describe("exportConversation", () => {
     expect(text).toContain("c".repeat(450_000));
   });
 
-  it("drops even an oversized newest turn whole and counts every omitted turn", () => {
+  it("keeps an oversized newest turn, cut at a line boundary, and names the cut", () => {
+    const lines = Array.from({ length: 30_000 }, (_, i) => `line ${i} ${"y".repeat(40)}`).join("\n");
+    const text = exportConversation([prompt(0, "old"), prompt(1, "newest"), reply(2, lines)], options);
+    expect(text.length).toBeLessThanOrEqual(1_000_000);
+    const note = /^\(1 earlier turn left out, the newest turn cut after line (\d+) of (\d+): this view holds at most 1,000,000 characters\)\n\n## ▍You · prompt 2\/2\n\nnewest/.exec(text);
+    expect(note, text.slice(0, 200)).not.toBeNull();
+    const kept = text.slice(text.indexOf("\n\n") + 2);
+    expect(kept.split("\n").length).toBe(Number(note![1]));
+    expect(Number(note![2])).toBeGreaterThan(Number(note![1]));
+    // The cut falls between two lines: the last line kept is whole.
+    expect(kept.split("\n").at(-1)).toMatch(/^line \d+ y{40}$/);
+    expect(text).not.toContain("prompt 1/2");
+  });
+
+  it("cuts a newest turn inside its one long line when no line boundary fits", () => {
     const text = exportConversation([prompt(0, "old"), prompt(1, "x".repeat(1_000_001))], options);
-    expect(text).toBe("(2 earlier turns left out: this view holds at most 1,000,000 characters)");
+    expect(text.length).toBeLessThanOrEqual(1_000_000);
+    expect(text).toMatch(/^\(1 earlier turn left out, the newest turn cut inside line 3 of 3: this view holds at most 1,000,000 characters\)\n\n## ▍You · prompt 2\/2\n\nx+$/);
   });
 
   it("counts heading and omission-notice overhead at the boundary", () => {
@@ -211,7 +226,8 @@ describe("exportConversation", () => {
     const items = [prompt(0, "x".repeat(1_000_000 - heading.length))];
     expect(exportConversation(items, options).length).toBe(1_000_000);
     const text = exportConversation(items, { history: notice({ omittedItems: 4 }) });
-    expect(text).toBe("(4 earlier items were not restored into this tab)\n(1 earlier turn left out: this view holds at most 1,000,000 characters)");
+    expect(text.length).toBeLessThanOrEqual(1_000_000);
+    expect(text).toMatch(/^\(4 earlier items were not restored into this tab\)\n\(the newest turn cut inside line 3 of 3: this view holds at most 1,000,000 characters\)\n\n## ▍You · prompt 1\/1\n\nx+$/);
   });
 
   it("counts rows before the first prompt when they are left out", () => {
@@ -222,7 +238,7 @@ describe("exportConversation", () => {
       reply(5, "e".repeat(600_000))], options);
     expect(both).toMatch(/^\(2 earlier rows and 1 earlier turn left out: this view holds at most 1,000,000 characters\)\n\n## ▍You · prompt 2\/2/);
     expect(exportConversation([reply(0, "x".repeat(1_000_001))], options))
-      .toBe("(1 earlier row left out: this view holds at most 1,000,000 characters)");
+      .toMatch(/^\(the rows kept cut inside line 1 of 1: this view holds at most 1,000,000 characters\)\n\nx+$/);
   });
 
   it("names what the restore left out: items, turns, or records of unknown count", () => {

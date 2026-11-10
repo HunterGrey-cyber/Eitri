@@ -149,8 +149,8 @@ nvim's.
  5. When an agent wants to run a tool that needs your approval, a card waits
     in the conversation. There is none now, so read this one:
     `Alt+n` takes the next waiting card into card mode (from the box too),
-    and so does `<Enter>` on the card's row in BROWSE. Then `1` approves, `2`
-    denies, and `3` approves and saves a rule where the card offers one.
+    and so does `<Enter>` on the card's row in BROWSE. Then `1` approves and
+    `2` denies; a card offering a rule takes `2` to save it, `3` to deny.
     `Tab` opens a box for a reason (in Claude tabs; Codex and ACP agents take
     no reason). `<Esc>` leaves card mode with the card still waiting, and
     `Alt+p` goes to the previous card. Letters never answer a card, and a

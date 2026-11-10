@@ -1544,6 +1544,12 @@ describe("the yank operator grammar", () => {
   it("arms y without copying", () => expect(sequence("y")).toEqual({ kind: "operator", op: { op: "y", count: null, scope: null, prefix: null } }));
   it.each([["yy", 1], ["3yy", 3], ["y3y", 3], ["Y", 1]] as const)("%s copies rows", (keys, count) => expect(sequence(keys)).toEqual({ kind: "yank", what: "rows", count }));
   it.each([["y3j", "j", 3], ["ygg", "gg", null], ["y[[", "[[", null], ["y]]", "]]", null], ["yG", "G", null], ["y}", "}", null], ["yk", "k", null]] as const)("%s copies through its motion", (keys, motion, count) => expect(sequence(keys)).toEqual({ kind: "yank", what: "motion", motion, count }));
+  it.each([["2y3j", "j", 6], ["y10j", "j", 10], ["3y2k", "k", 6], ["2y3G", "G", 6], ["2yG", "G", 2], ["2y3gg", "gg", 6]] as const)(
+    "%s multiplies the counts before and after y", (keys, motion, count) => expect(sequence(keys)).toEqual({ kind: "yank", what: "motion", motion, count }));
+  it("2y3y copies six rows, and 2y0 cancels", () => {
+    expect(sequence("2y3y")).toEqual({ kind: "yank", what: "rows", count: 6 });
+    expect(sequence("2y0")).toEqual({ kind: "cancel", why: "unbound" });
+  });
   it.each([["yio", "i", "o"], ["ya`", "a", "`"], ["gy", "i", "`"]] as const)("%s copies an object", (keys, scope, object) => expect(sequence(keys)).toEqual({ kind: "yank", what: "object", scope, object }));
   it.each(["w", "W", "s", "p"])("yi%s requires the caret", (object) => expect(sequence(`yi${object}`)).toEqual({ kind: "yank-refused", flash: `i${object}: needs the caret — v, then move, then y` }));
   it("an unknown key cancels silently", () => expect(sequence("yx")).toEqual({ kind: "cancel", why: "unbound" }));

@@ -204,7 +204,8 @@ export function pendingEntries(table: PanelTable, prefix: PendingPrefix, modeFix
   ];
 }
 
-/** Complete continuations of the yank operator, shown without running any of them. */
+/** Complete continuations of the yank operator, shown without running any of them. The arrows are left out: `j` and `k`
+ *  stand for them, and the box spells keys as they are typed. */
 export const YANK_PENDING_ENTRIES: BoxEntry[] = [
   ["y", "copy row"],
   ["im", "message source"], ["am", "message with author"],
@@ -213,5 +214,6 @@ export const YANK_PENDING_ENTRIES: BoxEntry[] = [
   ["i`", "code"], ["a`", "fenced code"],
   ["if", "path or URL"], ["af", "path with line"],
   ["ih", "hunk"], ["ah", "hunk with file headers"],
-  ...["j", "k", "ArrowDown", "ArrowUp", "{", "}", "G", "gg", "[[", "]]"].map((key) => [key, "rows through motion"]),
+  ["j", "rows down"], ["k", "rows up"], ["{", "rows to the previous row start"], ["}", "rows to the next row start"],
+  ["G", "rows to the end"], ["gg", "rows to the top"], ["[[", "rows to the previous prompt"], ["]]", "rows to the next prompt"],
 ].map(([key, label]) => ({ key, label, group: false, disabled: false }));

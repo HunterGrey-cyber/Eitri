@@ -126,8 +126,11 @@ describe("the sequence engine (modelled on which-key's state.lua)", () => {
 });
 
 it("the y box lists exactly the object and motion grammar", () => {
-  expect(YANK_PENDING_ENTRIES.map((e) => e.key)).toEqual(["y", "im", "am", "io", "ao", "ic", "ac", "i`", "a`", "if", "af", "ih", "ah", "j", "k", "ArrowDown", "ArrowUp", "{", "}", "G", "gg", "[[", "]]"]);
+  expect(YANK_PENDING_ENTRIES.map((e) => e.key)).toEqual(["y", "im", "am", "io", "ao", "ic", "ac", "i`", "a`", "if", "af", "ih", "ah", "j", "k", "{", "}", "G", "gg", "[[", "]]"]);
   expect(YANK_PENDING_ENTRIES.every((e) => e.label && !e.group && !e.disabled)).toBe(true);
+  // Each motion says where it copies to: no two rows share a label.
+  const labels = YANK_PENDING_ENTRIES.map((e) => e.label);
+  expect(new Set(labels).size).toBe(labels.length);
 });
 
 describe("motion rows belong to resolveKey", () => {

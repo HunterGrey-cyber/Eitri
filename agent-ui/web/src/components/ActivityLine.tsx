@@ -26,8 +26,12 @@ type Props = {
    *  set, this line names the card rather than the queue count -- a card already means the queue
    *  cannot flush, so the two are never both worth reading. */
   pendingTool?: string | null;
-  /** BROWSE can enter card mode on the cursor's card; INPUT enters it with Alt-n. Defaults to `"browse"`. */
+  /** Which mode the panel is in: the question line offers `i` in BROWSE. Defaults to `"browse"`. */
   mode?: PanelMode;
+  /** How card mode is entered from here, said beside a waiting card: `"on-card"` (BROWSE on the card's row, or the
+   *  tool row it gates: Enter or Alt-n), `"elsewhere"` (Alt-n), or `"held"` while card mode holds a card, when the line
+   *  only names the card: j scrolls it and Enter answers it there. Defaults to `"elsewhere"`. */
+  cardEntry?: "on-card" | "elsewhere" | "held";
   /** A `!` line of the person's is running. A turn of the agent's has this line first. */
   shellRunning?: boolean;
 };
@@ -35,7 +39,7 @@ type Props = {
 /** One mono line above the composer while a turn runs: motion, elapsed time and interrupt. With no turn
  *  running it shows idle background work in the same slot. The interrupt words are the Stop button itself,
  *  keeping the mouse route available. */
-export function ActivityLine({ state, turnClock = null, canInterrupt, onInterrupt, queued = 0, pendingTool = null, shellRunning = false, mode = "browse", onOpenTasks }: Props) {
+export function ActivityLine({ state, turnClock = null, canInterrupt, onInterrupt, queued = 0, pendingTool = null, shellRunning = false, mode = "browse", cardEntry = "elsewhere", onOpenTasks }: Props) {
   // A terminal status wins over `activeTurnId`, so a dead session cannot read as working.
   // The reducer clears it on `session_unavailable`/`session_closed`; keep this guard for other endings.
   const working = state.status.kind === "running" && state.activeTurnId !== null;
@@ -92,7 +96,8 @@ export function ActivityLine({ state, turnClock = null, canInterrupt, onInterrup
       {pendingTool !== null ? (
         <span className="activity-card">
           {/* Enter on the cursor's card or Alt-n enters card mode; neither answers by itself. */}
-          ⚑ {revealedText(pendingTool)} needs approval — {mode === "input" ? "Alt-n" : "j to it, Enter"}
+          ⚑ {revealedText(pendingTool)} needs approval
+          {cardEntry === "held" ? "" : cardEntry === "on-card" ? " — Enter or Alt-n: card mode, then 1-3" : " — Alt-n: card mode, then 1-3"}
         </span>
       ) : (
         special === null && !start && queued > 0 && <span className="activity-keys">{queued} queued · </span>

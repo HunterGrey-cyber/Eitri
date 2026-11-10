@@ -112,8 +112,11 @@ export function PermissionCard({
     );
   }
 
-  // In card mode a button shows the digit that answers with it, its place among the card's buttons (Approve, Deny,
-  // then Always allow where the card offers a rule); the page reads the same order.
+  // In card mode a button shows the digit that answers with it, its place among the card's buttons in Claude Code's
+  // order: Approve, then Always allow where the card offers a rule, then Deny last (2, or 3 beside Always allow); the
+  // page reads the same order (`cardOfferOf` in `App.tsx`).
+  const always = Boolean(ruleOffer) && broker === undefined;
+  const denyPlace = always ? 2 : 1;
   const digit = (place: number) =>
     cardMode === null ? null : (
       <>
@@ -156,7 +159,7 @@ export function PermissionCard({
         <input
           type="text"
           {...NO_TEXT_ASSIST}
-          data-nav-order={ruleOffer ? 4 : 3}
+          data-nav-order={always ? 4 : 3}
           data-card-control=""
           tabIndex={-1}
           placeholder="Reason (shown to the agent if you deny)"
@@ -166,8 +169,8 @@ export function PermissionCard({
         />
       )}
       {controls && <div className="permission-card-buttons">
-        {/* `data-nav-order` is the buttons' order for a HINT label: Approve, Deny, then the third
-            (Always allow) button when Rust offered one, then the reason box above them. Card mode's
+        {/* `data-nav-order` is the buttons' order for a HINT label: Approve, the Always allow button
+            when Rust offered one, Deny, then the reason box above them. Card mode's
             keys do NOT press these buttons: they answer this card by its `permissionId` through the
             panel's `answerPermission`, which holds the one guard against a second answer, and
             `alreadyAnswered` draws the card inert after them. `data-nav-action` is how the root's
@@ -186,36 +189,36 @@ export function PermissionCard({
         >
           {digit(0)}Approve
         </button>
-        <button
-          data-nav-order={2}
-          data-nav-action="deny"
-          data-card-control=""
-          tabIndex={-1}
-          className={highlighted(1)}
-          onClick={(e) => {
-            const proof = pointerAnswerProof(e);
-            if (proof !== null) handleAnswer("deny", false, proof);
-          }}
-          disabled={inert}
-        >
-          {digit(1)}Deny
-        </button>
-        {ruleOffer && broker === undefined && (
+        {always && ruleOffer && (
           <button
-            data-nav-order={3}
+            data-nav-order={2}
             data-nav-action="always"
             data-card-control=""
             tabIndex={-1}
-            className={highlighted(2)}
+            className={highlighted(1)}
             onClick={(e) => {
               const proof = pointerAnswerProof(e);
               if (proof !== null) handleAnswer("allow", true, proof);
             }}
             disabled={inert}
           >
-            {digit(2)}Always allow <ShownInline text={ruleOffer} /> in this project
+            {digit(1)}Always allow <ShownInline text={ruleOffer} /> in this project
           </button>
         )}
+        <button
+          data-nav-order={denyPlace + 1}
+          data-nav-action="deny"
+          data-card-control=""
+          tabIndex={-1}
+          className={highlighted(denyPlace)}
+          onClick={(e) => {
+            const proof = pointerAnswerProof(e);
+            if (proof !== null) handleAnswer("deny", false, proof);
+          }}
+          disabled={inert}
+        >
+          {digit(denyPlace)}Deny
+        </button>
       </div>}
       {controls && answered && !sessionEnded && <div className="permission-card-stale">Sending answer…</div>}
       {sessionEnded && !answered && (

@@ -244,6 +244,17 @@ pub enum Msg {
     Editor {
         request: EditorRequest,
         token: Option<String>,
+        /// An id the asking window wants answered with [`Msg::EditorShown`] once the request is carried out (a view:
+        /// once its file is written and handed to the editor). Absent, nothing is answered.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        answer: Option<u64>,
+    },
+    /// The answer to an [`Msg::Editor`] that carried `answer: id`: `why` is absent when the editor took the request,
+    /// else why it did not.
+    EditorShown {
+        id: u64,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        why: Option<String>,
     },
     /// A draft edit window 1's nvim ended. `text` is the new draft when `end` is `Written`, and empty otherwise.
     DraftBack {
@@ -415,6 +426,7 @@ pub const KINDS: &[&str] = &[
     "presence",
     "presence_ack",
     "editor",
+    "editor_shown",
     "draft_back",
     "follow",
     "focus",
@@ -467,6 +479,7 @@ impl Msg {
             Msg::Presence { .. } => "presence",
             Msg::PresenceAck { .. } => "presence_ack",
             Msg::Editor { .. } => "editor",
+            Msg::EditorShown { .. } => "editor_shown",
             Msg::DraftBack { .. } => "draft_back",
             Msg::Follow { .. } => "follow",
             Msg::Focus { .. } => "focus",
@@ -812,6 +825,11 @@ mod tests {
                     col: None,
                 },
                 token: Some("t".into()),
+                answer: Some(4),
+            },
+            Msg::EditorShown {
+                id: 4,
+                why: Some("the editor is gone".into()),
             },
             Msg::DraftBack {
                 tab: 3,
@@ -952,6 +970,7 @@ mod tests {
             let msg = Msg::Editor {
                 request,
                 token: Some("t".into()),
+                answer: None,
             };
             assert_eq!(from_json(&to_json(&msg)).unwrap(), msg);
         }
@@ -967,12 +986,32 @@ mod tests {
                 tab: false,
             },
             token: None,
+            answer: None,
         };
         let json = to_json(&split);
         let text = String::from_utf8(json.clone()).unwrap();
         assert!(text.contains("\"view\""), "{text}");
         assert!(!text.contains("\"tab\""), "{text}");
         assert_eq!(from_json(&json).unwrap(), split);
+    }
+
+    /// A request that asks no answer writes no `answer`, one read without it asks none, and a taken request's answer
+    /// writes no `why`.
+    #[test]
+    fn an_editor_request_asks_an_answer_only_when_it_says_so() {
+        let quiet = Msg::Editor {
+            request: EditorRequest::Focus,
+            token: None,
+            answer: None,
+        };
+        let text = String::from_utf8(to_json(&quiet)).unwrap();
+        assert!(!text.contains("\"answer\""), "{text}");
+        let read = from_json(br#"{"v":1,"k":"editor","request":{"what":"focus"},"token":null}"#).unwrap();
+        assert_eq!(read, quiet);
+        let taken = Msg::EditorShown { id: 2, why: None };
+        let text = String::from_utf8(to_json(&taken)).unwrap();
+        assert!(!text.contains("\"why\""), "{text}");
+        assert_eq!(from_json(text.as_bytes()).unwrap(), taken);
     }
 
     #[test]
@@ -1102,6 +1141,7 @@ mod tests {
                 text: long.clone(),
             },
             token: None,
+            answer: None,
         };
         let back = Msg::DraftBack {
             tab: 1,

@@ -114,6 +114,54 @@ pub(super) fn editor_answered(state: &mut AgentPanelState, then: EditorThen, ans
     out
 }
 
+/// A request for nvim the window took with its outcome still to come: `then` runs when `later` answers.
+pub(super) struct EditorWait {
+    pub(super) then: EditorThen,
+    pub(super) later: mpsc::Receiver<Result<(), String>>,
+}
+
+/// What the window's answer to a request for nvim leaves to do: the step after it now, or (a page's request, or a
+/// view the window asked for itself without waiting, taken with the outcome still to come) a wait the tick finishes.
+/// A step whose caller reads the answer at once (`Report`), or that keeps an edit (`Draft`), goes ahead as taken.
+pub(super) fn editor_taken(state: &mut AgentPanelState, then: EditorThen, answer: super::EditorAnswer) -> Outbox {
+    match answer {
+        Ok(Some(later)) if matches!(then, EditorThen::Answer { .. } | EditorThen::Notify(_)) => {
+            state.editor_waits.push(EditorWait { then, later });
+            Outbox::default()
+        }
+        Ok(_) => editor_answered(state, then, Ok(())),
+        Err(why) => editor_answered(state, then, Err(why)),
+    }
+}
+
+/// Forgets what `view`'s page was waiting on the editor for: a page that went idle or was reloaded numbers its
+/// requests afresh, and an answer to the old document could settle a request of the new one that has the same id.
+/// Dropping the receiver leaves the window's answer with nowhere to go; a wait the window made for itself stays.
+pub(super) fn drop_view(state: &mut AgentPanelState, view: ViewId) {
+    state
+        .editor_waits
+        .retain(|wait| !matches!(&wait.then, EditorThen::Answer { view: asker, .. } if *asker == view));
+}
+
+/// The tick's half of a request taken with its outcome to come: each outcome that arrived runs its step, a window
+/// that dropped its end without answering refuses with why. Waits that have not arrived stay, in order.
+pub(super) fn poll_editor_waits(state: &mut AgentPanelState, out: &mut Outbox) {
+    let mut i = 0;
+    while i < state.editor_waits.len() {
+        let answer = match state.editor_waits[i].later.try_recv() {
+            Ok(answer) => answer,
+            Err(mpsc::TryRecvError::Empty) => {
+                i += 1;
+                continue;
+            }
+            Err(mpsc::TryRecvError::Disconnected) => Err("the editor's window did not say how the request went".into()),
+        };
+        let wait = state.editor_waits.remove(i);
+        let next = editor_answered(state, wait.then, answer);
+        out.extend(next);
+    }
+}
+
 /// The most reviews worked out at once. Each one runs git over the shadow repository, and a panel
 /// that asks again before an answer arrives is told to wait rather than queueing without bound.
 pub(super) const MAX_REVIEW_JOBS: usize = 4;
@@ -852,7 +900,7 @@ mod tests {
         let recorder = asked.clone();
         handle.on_editor_request(move |request| {
             recorder.borrow_mut().push(request.clone());
-            Ok(())
+            Ok(None)
         });
         handle.page_message(
             ViewId::BASE,
@@ -920,7 +968,7 @@ mod tests {
                 .map(|i| u8::from_str_radix(&hex[i..i + 2], 16).unwrap())
                 .collect();
             recorder.borrow_mut().push(serde_json::from_slice(&bytes).unwrap());
-            Ok(())
+            Ok(None)
         });
         (handle, page, root, asked)
     }
@@ -1230,7 +1278,7 @@ mod tests {
             let asked = asked.clone();
             move |_request| {
                 *asked.borrow_mut() += 1;
-                Ok(())
+                Ok(None)
             }
         });
         let mut senders = Vec::new();
@@ -1610,7 +1658,7 @@ mod tests {
             let asked = asked.clone();
             move |_request| {
                 *asked.borrow_mut() += 1;
-                Ok(())
+                Ok(None)
             }
         });
         let mut senders = Vec::new();

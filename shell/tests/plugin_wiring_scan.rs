@@ -386,12 +386,26 @@ fn no_panel_hook_decides_in_build_ui() {
         }
         if hook == "on_editor_request" {
             assert!(
-                body.contains("returntwo.request(request,&||activation_token(&asking));"),
+                body.contains("returntwo.request_answered(request,&||activation_token(&asking));"),
                 "a linked request uses its transport: {body}"
             );
             assert!(
-                body.ends_with("drive_editor(Some(request))}))"),
-                "a local request returns the editor drive's outcome: {body}"
+                body.ends_with("drive_editor(Some(request)).map(|()|None)}))"),
+                "a local request returns the editor drive's outcome, with no answer to come: {body}"
+            );
+            // The linked editor's `request_answered` is its link's own send: it asks window 1 over the link,
+            // and refuses when there is none.
+            let linked = linked_editor_fns("request_answered");
+            assert_eq!(linked.len(), 1, "linked editor request_answered");
+            assert!(linked[0].contains("{self.ask(request,token,true)}"), "{}", linked[0]);
+            let ask = linked_editor_fns("ask");
+            assert_eq!(ask.len(), 1, "linked editor ask");
+            assert!(
+                ask[0].contains(
+                    "letSome(link)=link.filter(LinkDriver::linked)else{returnErr(UNLINKED_NOTE.to_string());};"
+                ),
+                "{}",
+                ask[0]
             );
         } else if hook == "on_choose_project" {
             assert!(
@@ -404,6 +418,18 @@ fn no_panel_hook_decides_in_build_ui() {
     }
     let drive = let_block(&code, "letdrive_editor:Rc<dynFn(");
     assert!(editor_drive_returns_outcome(drive), "{drive}");
+}
+
+/// Every function named `name` in the linked editor (`shell/src/linked_window/editor.rs`, its tests cut), each from
+/// its name on, whitespace removed.
+fn linked_editor_fns(name: &str) -> Vec<String> {
+    let source = scan::read_required("shell/src/linked_window/editor.rs");
+    let code = scan::code_only(&source.text);
+    let code = scan::without(&code, &scan::modules(&code, "tests"));
+    scan::functions(&code, name)
+        .into_iter()
+        .map(|body| body.split_whitespace().collect())
+        .collect()
 }
 
 const PANEL_DECISIONS: [&str; 5] = [

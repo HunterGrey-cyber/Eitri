@@ -95,8 +95,9 @@ it("updates one guard's motion keys and cancels a pending HINT wait on a table c
     binding(["q"], "row.down"), binding(["]", "t"], "tool.prev"),
   ] });
   const keys = sets.mock.lastCall![0];
-  for (const key of ["j", "G", "x"]) expect(keys.has(key), key).toBe(false);
-  for (const key of ["q", "]", "t", "k", "Tab"]) expect(keys.has(key), key).toBe(true);
+  // A pair's keys are not motions on their own: `t` alone moves nothing, and `]` is a prefix.
+  for (const key of ["j", "G", "x", "]", "t"]) expect(keys.has(key), key).toBe(false);
+  for (const key of ["q", "k", "Tab"]) expect(keys.has(key), key).toBe(true);
   expect(new Set(sets.mock.contexts).size).toBe(1);
   act(() => vi.advanceTimersByTime(TYPING_GUARD_MS - 50));
   expect(posted.filter((msg) => msg.type === "hint_request")).toHaveLength(0);

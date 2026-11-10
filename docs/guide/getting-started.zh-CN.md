@@ -1,5 +1,5 @@
 [English](getting-started.md) | 简体中文
-<!-- translated-from: getting-started.md sha256=ddfa4ee90dadd1c12cc8c8c07861e28c40d5d0df6bb3cb3d3b16ae08a6617713 -->
+<!-- translated-from: getting-started.md sha256=98fb07f5730c38d9ce5a7cdad2898c2799337ccd5e2d5f7339408700096ea96b -->
 
 # 快速上手
 
@@ -124,11 +124,11 @@ Claude 回答时，回复会作为渲染好的 markdown 边流式输出边显示
 <a id="when-eitri-asks"></a>
 ## Eitri 什么时候会问你
 
-有些工具调用要等你。Eitri 会在对话里、紧挨着它所拦住的那次调用画出一张权限卡片，上面有 **Approve**（批准）和 **Deny**（拒绝）两个按钮，对许多命令还有第三个按钮 “Always allow ... in this project”，它会保存一条规则，之后这类命令不出卡片就被批准。规则不回答 Claude Code 自己提出的问题，所以 Claude Code 仍然要问的命令，即使有规则也还是会出卡片；见 [Claude Code 自己提问时](permissions.zh-CN.md#when-claude-code-itself-asks)。
+有些工具调用要等你。Eitri 会在对话里、紧挨着它所拦住的那次调用画出一张权限卡片，上面有 **Approve**（批准）和 **Deny**（拒绝）两个按钮，对许多命令还有第三个按钮 “Always allow ... in this project”，排在这两个按钮中间，它会保存一条规则，之后这类命令不出卡片就被批准。规则不回答 Claude Code 自己提出的问题，所以 Claude Code 仍然要问的命令，即使有规则也还是会出卡片；见 [Claude Code 自己提问时](permissions.zh-CN.md#when-claude-code-itself-asks)。
 
 你在**卡片模式**里回答卡片，卡片会一直拿着按键，直到你回答或离开。按 `Alt-n`（在输入框里也可以）接管这个标签页里下一张等待中的卡片，或者在卡片所在的行上按 `Enter`；卡片到达时，状态条会告诉你。
 
-- `1` 批准，`2` 拒绝，`3` 批准并保存 “Always allow” 规则（卡片提供时才有）。
+- 数字跟着按钮走，顺序和 Claude Code 一样：`1` 批准，`2` 拒绝；卡片提供 “Always allow” 规则时，`2` 批准并保存规则，`3` 拒绝。
 - 如果你更愿意走到某个按钮上，`h`、`l` 然后 `Enter` 可以操作按钮。
 - `Tab` 在 Claude 的卡片上打开理由输入框；在里面按 `Enter` 把拒绝连同理由一起发出。
 - `Esc` 离开卡片模式，卡片仍然等着，你回到原来的地方。它绝不会自己跳到下一张卡片。

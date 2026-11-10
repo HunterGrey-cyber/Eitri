@@ -96,6 +96,81 @@ export function revealRow(list: HTMLElement | null, row: HTMLElement, direction:
   if (landing.how !== "stay") scrollListTo(list, landing.scrollTop, animate);
 }
 
+/** After a search lands on `row`, brings the first drawn line of it holding `query` on screen: a match above the view
+ *  comes to just below the pinned header's bottom edge (`effectiveTop`), one below it to the view's bottom. Matched
+ *  as the search matches (any case, unless the query has a capital). Text that is not drawn (a folded part, no layout)
+ *  is passed over; with no drawn match nothing moves. Whether it scrolled. */
+export function revealMatchInRow(list: HTMLElement, row: HTMLElement, query: string): boolean {
+  if (query === "") return false;
+  try {
+    return revealMatch(list, row, query);
+  } catch {
+    // A scroll that only helps the reader see the hit must never take the panel down with it.
+    return false;
+  }
+}
+
+/** Lowercases `text` one code point at a time, so `origin[i]` says where in `text` the code point that produced
+ *  `folded[i]` starts: case folding can change a text's length (`İ` lowercases to two code units), and the
+ *  offsets a match is found at must be offsets into the text as it is drawn. `origin` has one more entry, the
+ *  text's length, for a match that ends at the very end. */
+function foldWithOrigins(text: string): { folded: string; origin: number[] } {
+  let folded = "";
+  const origin: number[] = [];
+  let from = 0;
+  for (const char of text) {
+    const lower = char.toLowerCase();
+    for (let i = 0; i < lower.length; i++) origin.push(from);
+    folded += lower;
+    from += char.length;
+  }
+  origin.push(from);
+  return { folded, origin };
+}
+
+/** Where `needle` first occurs in `text` as `[start, end)` offsets into `text` itself, in a case-insensitive match
+ *  (`needle` already lowercased) or an exact one. `null` for no match. */
+function findInText(text: string, needle: string, sensitive: boolean): [number, number] | null {
+  if (sensitive) {
+    const at = text.indexOf(needle);
+    return at === -1 ? null : [at, at + needle.length];
+  }
+  const { folded, origin } = foldWithOrigins(text);
+  const at = folded.indexOf(needle);
+  if (at === -1) return null;
+  // The match may begin or end inside what one drawn code point folded to: take that code point whole.
+  let end = at + needle.length;
+  while (end < origin.length - 1 && origin[end] === origin[end - 1]) end++;
+  return [origin[at], origin[end]];
+}
+
+function revealMatch(list: HTMLElement, row: HTMLElement, query: string): boolean {
+  const sensitive = query !== query.toLowerCase();
+  const needle = sensitive ? query : foldWithOrigins(query).folded;
+  const doc = row.ownerDocument;
+  const walker = doc.createTreeWalker(row, NodeFilter.SHOW_TEXT);
+  for (let node = walker.nextNode(); node !== null; node = walker.nextNode()) {
+    const text = node.textContent ?? "";
+    const found = findInText(text, needle, sensitive);
+    if (found === null) continue;
+    const [start, end] = found;
+    if (start < 0 || end > text.length || start > end) continue;
+    const range = doc.createRange();
+    range.setStart(node, start);
+    range.setEnd(node, end);
+    if (typeof range.getBoundingClientRect !== "function") return false;
+    const box = range.getBoundingClientRect();
+    if (box.width === 0 && box.height === 0) continue;
+    const top = effectiveTop(list);
+    const bottom = list.getBoundingClientRect().bottom;
+    const delta = box.top < top ? box.top - top : box.bottom > bottom ? Math.min(box.bottom - bottom, box.top - top) : 0;
+    if (delta === 0) return false;
+    scrollListTo(list, list.scrollTop + delta, false);
+    return true;
+  }
+  return false;
+}
+
 /** A tool result's box is entered at the end nearest the reader -- its start going down, its end going
  *  up -- so it never carries the position it was last read to. Called when `j`/`k` land on the row. */
 export function enterBoxAtNearEnd(row: HTMLElement, direction: 1 | -1) {

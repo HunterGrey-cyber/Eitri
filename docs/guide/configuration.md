@@ -170,10 +170,12 @@ the built-in. These are the only panel bindings that may take a key a built-in a
 key the built-in's meaning goes for you, and the list of keys shows your key. A name takes one key, or two keys starting
 with `g`, `z`, `[` or `]`; it is refused at startup, with the other bad calls, on a sequence that starts with a digit
 (that is a count), on a longer or `<leader>` sequence, and on `i`, `o` and `A` (they open the box), `:` (the command
-line) and `y` or `Y` (copy). The panel table holds no chord with `Ctrl`, `Alt`, `Enter`, `Tab` or a function key, so
-the built-in `Alt+n`, `Alt+p`, `Ctrl+o` and `F1` cannot be rebound or removed; `jump.older` and `help` give a key of
-your own the last two. Two other tables come first: a `"root"` binding takes its Ctrl or Alt chord before the panel
-sees it (`M-n`, `M-p` and `C-o` included), and a `C-x` window prefix takes `Ctrl+x` before the box's `Ctrl+x Enter`.
+line) and `y` or `Y` (copy). A name on the panel's leader key, or on `g`, `z`, `[` or `]` alone, is refused too: they
+start other bindings, so bind a pair instead. The panel table holds no chord with `Ctrl`, `Alt`, `Enter`, `Tab` or a
+function key, so the built-in `Alt+n`, `Alt+p`, `Ctrl+o` and `F1` cannot be rebound or removed; `jump.older` and `help`
+give a key of your own the last two. Two other tables come first: a `"root"` binding takes its Ctrl or Alt chord before
+the panel sees it (`M-n`, `M-p` and `C-o` included), and a `C-x` window prefix takes `Ctrl+x` before the box's
+`Ctrl+x Enter`.
 
 The defaults are stock tmux's, with `Ctrl+b` as the prefix. Eitri then reads your tmux configuration (the same
 files tmux reads, and what they `source-file` by an absolute path; a relative path is skipped, because Eitri

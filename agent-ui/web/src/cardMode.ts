@@ -33,10 +33,14 @@ import { isModifierKey, TYPING_GUARD_MS } from "./typingGuard";
  *  answers; nor does a key the page replayed on its root after a focus loss. No count exists here: a digit is a
  *  button, never the start of a number.
  *
- *  Each card brings its own list of answers (`CardOffer.answers`, digit = place in the list + 1, at most nine). One
- *  rule holds for every card: answer 2 is its deny-like answer, so the same digit refuses everywhere and the lasting
- *  grant is never the middle key. Today's cards: 1 Approve, 2 Deny, 3 Always allow (only where the card offers a saved
- *  rule); a broker or ACP card: 1 Approve, 2 Deny. `enterCardMode` refuses a list that breaks the rule.
+ *  Each card brings its own list of answers (`CardOffer.answers`, digit = place in the list + 1, at most nine), in
+ *  Claude Code's order: the allowing answers first, the one deny-like answer last. A card that offers a saved rule is
+ *  1 Approve (allow once), 2 Always allow (allow, and do not ask again), 3 Deny; every other card (no rule offer, a
+ *  broker's, Codex's, an ACP agent's) is 1 Approve, 2 Deny. So the deny digit is the card's last one, 2 or 3 by the
+ *  card, as the card draws it; every text that names it reads it off the card (`denyDigit`). `enterCardMode` refuses
+ *  a list without exactly one deny-like answer, or with it anywhere but last. A card kind whose answers do not end in
+ *  its refusal (a plan card whose 2 keeps planning, say) needs a rule of its own here before card mode may take it;
+ *  this check refuses it until then.
  *
  *  A proof is what an answer must carry: `keyAnswerProof` for a key, `pointerAnswerProof` for a click. They are its
  *  only constructors; the types are branded with symbols only they declare (this module, and `./answerProof` for a
@@ -48,9 +52,9 @@ export const CARD_ARM_MS = 300;
 
 export type CardRef = { permissionId: string; tab: number };
 /** One answer a card offers. `approve` and `always` allow (`always` with a saved rule, `remember`); `deny` is the
- *  deny-like answer, which every card has in place 2. */
+ *  deny-like answer, which every card has exactly once, last. */
 export type CardAnswer = { kind: "approve" | "deny" | "always" };
-/** What the card offers: its answers in button order (2 to 9 of them, the second deny-like), whether an allowing
+/** What the card offers: its answers in button order (2 to 9 of them, the last and only that one deny-like), whether an allowing
  *  answer may be used at all, whether a deny can carry a reason (with the text to show when it cannot), and the
  *  saved rule its `always` answer keeps, as the card draws it (absent or `null` where it offers none). */
 export type CardOffer = {
@@ -60,11 +64,12 @@ export type CardOffer = {
   noReasonFlash: string;
   rule?: string | null;
 };
-/** Today's answer lists: a provider card with a saved-rule offer, and every other card. */
+/** Today's answer lists, in Claude Code's order: a provider card with a saved-rule offer (allow once, allow always,
+ *  deny), and every other card (allow, deny). */
 export const ANSWERS_WITH_RULE: readonly CardAnswer[] = Object.freeze([
   { kind: "approve" },
-  { kind: "deny" },
   { kind: "always" },
+  { kind: "deny" },
 ] as const);
 export const ANSWERS_PLAIN: readonly CardAnswer[] = Object.freeze([{ kind: "approve" }, { kind: "deny" }] as const);
 
@@ -73,9 +78,22 @@ export function isDenyLike(answer: CardAnswer): boolean {
   return answer.kind === "deny";
 }
 
-/** Whether a card's answer list is one card mode takes: 2 to 9 answers, the second deny-like. */
+/** Whether a card's answer list is one card mode takes: 2 to 9 answers, exactly one of them deny-like, and that one
+ *  last. */
 export function answersValid(answers: readonly CardAnswer[]): boolean {
-  return answers.length >= 2 && answers.length <= 9 && isDenyLike(answers[1]);
+  if (answers.length < 2 || answers.length > 9) return false;
+  return answers.filter(isDenyLike).length === 1 && isDenyLike(answers[answers.length - 1]);
+}
+
+/** The place (0-based) of a valid list's deny-like answer: its last. */
+export function denyIndex(answers: readonly CardAnswer[]): number {
+  return answers.length - 1;
+}
+
+/** The digit that denies on a card with these answers, as its Deny button shows it: 2 on a card of two, 3 on a card
+ *  that offers a saved rule. */
+export function denyDigit(answers: readonly CardAnswer[]): number {
+  return denyIndex(answers) + 1;
 }
 /** Where card mode was entered from, so the page can go back there: the mode, the cursor row's key, and the
  *  composer's caret when entered from the box. */
@@ -114,7 +132,7 @@ export type CardIntent =
  *  the reason field closed, no answer in flight. */
 export function enterCardMode(card: CardRef, origin: CardOrigin, offer: CardOffer, pressedAt: number): CardModeState {
   if (!answersValid(offer.answers)) {
-    throw new Error("card mode takes 2 to 9 answers, the second deny-like");
+    throw new Error("card mode takes 2 to 9 answers, exactly one deny-like, and that one last");
   }
   return {
     card,
@@ -192,7 +210,7 @@ export function cardKey(s: CardModeState, ev: CardKey): { state: CardModeState; 
     if (ev.key === "Enter" && isPlainAnswerKey(ev) && !ev.shiftKey) {
       if (ev.repeat) return refuse(heldAnswerFlash("Enter"));
       if (!isArmed(base, ev.pressedAt)) return refuse(cardArmingFlash("Enter"));
-      return answer(base, ev, 1, true);
+      return answer(base, ev, denyIndex(answers), true);
     }
     // Shift, Ctrl, Alt or Meta with Enter is no answer and no text (the field holds one line): refused, so only the
     // plain Enter above denies.
@@ -212,7 +230,7 @@ export function cardKey(s: CardModeState, ev: CardKey): { state: CardModeState; 
     if (digit > n) return refuse(noSuchAnswerFlash(ev.key, n));
     if (ev.repeat) return refuse(heldAnswerFlash(ev.key));
     if (!isArmed(base, ev.pressedAt)) return refuse(cardArmingFlash(ev.key));
-    if (!isDenyLike(answers[digit - 1]) && !base.offer.approvable) return refuse(notApprovableFlash(ev.key));
+    if (!isDenyLike(answers[digit - 1]) && !base.offer.approvable) return refuse(notApprovableFlash(ev.key, denyDigit(answers)));
     return answer(base, ev, digit - 1, false);
   }
 
@@ -234,7 +252,7 @@ export function cardKey(s: CardModeState, ev: CardKey): { state: CardModeState; 
     if (base.highlight === null) return refuse(noButtonPickedFlash(n));
     if (ev.repeat) return refuse(heldAnswerFlash("Enter"));
     if (!isArmed(base, ev.pressedAt)) return refuse(cardArmingFlash("Enter"));
-    if (!isDenyLike(answers[base.highlight]) && !base.offer.approvable) return refuse(notApprovableFlash("Enter"));
+    if (!isDenyLike(answers[base.highlight]) && !base.offer.approvable) return refuse(notApprovableFlash("Enter", denyDigit(answers)));
     return answer(base, ev, base.highlight, false);
   }
 

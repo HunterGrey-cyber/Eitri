@@ -665,6 +665,9 @@ function cutLine(raw: string, chars: number): string {
 
 /** Whether rows open by a tap rather than by a key (the phone's transcript page): a fold then says so. */
 export const TouchRows = createContext(false);
+/** The key a fold names for the detailed view, which shows every fold open: `zi` in BROWSE (where `Ctrl+o` walks the
+ *  jumplist), `Ctrl+o` in the box. */
+export const FoldAllKey = createContext<"zi" | "Ctrl+o">("zi");
 
 /** What a folded, finished call shows under its invocation: the first `PREVIEW_LINES` of its result, then
  *  a muted count of the lines not shown and how to see them. A failure shows its first line only, in the same
@@ -691,6 +694,7 @@ const ToolResultPreview = memo(function ToolResultPreview({
   text?: string | null;
 }) {
   const touch = useContext(TouchRows);
+  const allKey = useContext(FoldAllKey);
   const { shown, total } = previewLines(text ?? formatResultContent(result.content), result.isError ? 1 : PREVIEW_LINES, wrapped ? WRAPPED_LINE_CHARS : PREVIEW_LINE_CHARS);
   if (total === 0) return null;
   const hidden = total - shown.length;
@@ -707,7 +711,7 @@ const ToolResultPreview = memo(function ToolResultPreview({
       ))}
       {hidden > 0 && (
         <div className="tool-result-preview-more">
-          {`… +${hidden.toLocaleString("en-US")} ${hidden === 1 ? "line" : "lines"} ${touch ? "· tap to show" : "(Enter to expand, Ctrl+o for all)"}`}
+          {`… +${hidden.toLocaleString("en-US")} ${hidden === 1 ? "line" : "lines"} ${touch ? "· tap to show" : `(Enter to expand, ${allKey} for all)`}`}
         </div>
       )}
     </div>

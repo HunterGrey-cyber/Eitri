@@ -93,7 +93,7 @@ function setup(kind: "provider" | "broker" = "provider") {
   return { ...view, root };
 }
 
-const LABELS = ["Approve", "Deny", "Always allow"] as const;
+const LABELS = ["Approve", "Always allow", "Deny"] as const;
 const ACTION: Record<string, string> = { Approve: "allow", Deny: "deny", "Always allow": "always" };
 /** By its place, not its text: in card mode each button's text starts with its digit. */
 function button(container: HTMLElement, label: string): HTMLButtonElement {

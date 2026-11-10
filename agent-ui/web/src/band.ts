@@ -58,8 +58,6 @@ export type BandFacts = {
   /** The card holding the keys: its one-based place among this tab's waiting cards, its own answer count, whether
    *  its deny takes a reason (Tab opens the field), and whether that field is open now (digits are text there). */
   cardMode?: { index: number; total: number; answers: number; reason: boolean; reasonOpen?: boolean } | null;
-  /** The cursor is on a waiting card or the tool row it gates; Enter can enter card mode there in BROWSE. */
-  onCard?: boolean;
   questions?: number;
   queued: number;
   context: { file: string; lines: [number, number] | null } | null;
@@ -286,6 +284,9 @@ const MODE_ARROW = 1;
 // the mode where typing lands is called what vim calls it there.
 const MODE_TEXT: Record<PanelMode, string> = { input: "INSERT", browse: "BROWSE", hint: "HINT", caret: "CARET", visual: "VISUAL", vline: "V-LINE" };
 const MODE_LETTER: Record<PanelMode, string> = { input: "I", browse: "B", hint: "H", caret: "C", visual: "V", vline: "VL" };
+/** The mode block while card mode holds a card: the keys go to the card, whichever mode it was entered from. */
+const CARD_MODE_TEXT = "CARD";
+const CARD_MODE_LETTER = "CD";
 
 /** The bottom band's degrade rule, a pure function of the facts and the measured
  *  width so it is testable without a browser. `widthPx <= 0` (before the first measurement)
@@ -317,7 +318,9 @@ export function bandLayoutSteady(
 ): { segs: Seg[]; hold: LayoutHold | null; due: number | null } {
   const { hold, now } = opts;
   const unchanged = (segs: Seg[]) => ({ segs, hold, due: null });
-  const mode: Seg = { id: "mode", text: MODE_TEXT[f.mode], side: "left" };
+  const modeWord = f.cardMode ? CARD_MODE_TEXT : MODE_TEXT[f.mode];
+  const modeLetter = f.cardMode ? CARD_MODE_LETTER : MODE_LETTER[f.mode];
+  const mode: Seg = { id: "mode", text: modeWord, side: "left" };
   const pill: Seg = { id: "pill", text: f.pill, side: "left" };
   const phone: Seg[] = f.phones && f.phones > 0 ? [{ id: "phone", text: phoneSegment(f.phones), side: "left" }] : [];
   if (widthPx <= 0 || charPx <= 0) return unchanged([mode, pill, ...phone]);
@@ -348,9 +351,9 @@ export function bandLayoutSteady(
   const tasks = f.backgroundTasks === undefined ? null : liveTasks(f.backgroundTasks);
   const background = tasks === null ? (f.background ? backgroundSegment(f.background) : "") : taskWords(tasks);
   const cardForms = f.cardMode ? cardModeSegment(f.cardMode) : null;
-  const cardText = cardForms
-    ? cardForms.long
-    : f.cards > 0 ? `${f.mode === "browse" && f.onCard ? "Enter or Alt-n" : "Alt-n"}: card mode, then 1-3` : null;
+  // How to enter card mode is the activity line's to say (`ActivityLine`): the band had no room for it beside the
+  // mode, the pill and the figures. The band names card mode only while it holds a card.
+  const cardText = cardForms ? cardForms.long : null;
   const cardAs = (text: string) => (s: Seg[]) => s.map((x) => (x.id === "card" ? { ...x, text } : x));
   let segs: Seg[] = [
     mode,
@@ -380,8 +383,6 @@ export function bandLayoutSteady(
   const cellsOf = (x: Seg) => Math.max(textWidth(x.text), x.cells ?? 0);
   const width = (s: Seg[]) => s.reduce((n, x) => n + cellsOf(x) + PAD + (x.id === "mode" ? MODE_ARROW : 0), 0);
   const steps: ((s: Seg[]) => Seg[])[] = [
-    // An entry hint gives way before figures; while card mode holds, its key instructions stay.
-    (s) => f.cardMode ? s : s.filter((x) => x.id !== "card"),
     (s) => tasks === null ? s : s.map((x) => x.id === "background" ? { ...x, text: backgroundFallback(tasks.length) } : x),
     // The usage figure is the least urgent thing on the band -- it goes before even the context
     // is shortened, so a narrow panel never trades the file it is showing for a running total.
@@ -472,9 +473,21 @@ export function bandLayoutSteady(
   // short form keeps what to do, where a cut keeps only the sentence's start. Only where it helps: the whole sentence
   // beside the mode's letter comes first.
   const short = f.message === null ? undefined : SHORT_FLASH.get(f.message);
-  const letter = (s: Seg[]) => s.map((x) => (x.id === "mode" ? { ...x, text: MODE_LETTER[f.mode] } : x));
+  const letter = (s: Seg[]) => s.map((x) => (x.id === "mode" ? { ...x, text: modeLetter } : x));
+  // In card mode a flash says why the key just pressed did nothing, and nothing else on the band says it: it takes
+  // the room of the mode's word, then gives way to its short form if that fits beside the card's place, then takes
+  // the card's place too, before it is cut.
+  if (cardForms && f.message !== null && width(segs) > budget) {
+    segs = letter(segs);
+    const shortForm = SHORT_FLASH.get(f.message);
+    if (width(segs) > budget && shortForm !== undefined) {
+      const shortened = segs.map((x) => (x.id === "message" ? { ...x, text: shortForm, full: x.text } : x));
+      if (width(shortened) <= budget) segs = shortened;
+    }
+    if (width(segs) > budget) segs = segs.filter((x) => x.id !== "card");
+  }
   if (width(segs) > budget && short !== undefined && width(letter(segs)) > budget) {
-    segs = segs.map((x) => (x.id === "message" ? { ...x, text: short, full: x.text } : x));
+    segs = segs.map((x) => (x.id === "message" ? { ...x, text: short, full: x.full ?? x.text } : x));
   }
   // The mode shrinks to its letter last, and beside a flash only when the letter is what lets everything fit: a flash
   // cut anyway keeps the mode its word, so the mode block does not change width with every long flash.

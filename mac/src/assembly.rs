@@ -463,7 +463,8 @@ fn install_hooks(shared: &Rc<Shared>) {
         panel.on_editor_request(move |request| {
             shared.editor.scratch_call(request)?;
             shared.actions.show_editor();
-            Ok(())
+            // Carried out here and now: no later answer to wait for.
+            Ok(None)
         });
     }
     {

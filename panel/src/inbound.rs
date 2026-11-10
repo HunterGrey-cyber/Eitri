@@ -598,6 +598,7 @@ pub(super) fn handle_inbound_message(
             // A held message of the document that was here answers a page that is gone.
             super::mentions::drop_view(state, view, &mut out);
             super::symbol_lookup::drop_view(state, view);
+            super::review_glue::drop_view(state, view);
             // A stream envelope the typing cadence still holds is already in the snapshot below
             // (it was drained from the queue and folded into the projection before it was held);
             // sent after that snapshot it would draw the same text twice.
@@ -1971,7 +1972,7 @@ mod tests {
                 .map(|i| u8::from_str_radix(&hex[i..i + 2], 16).unwrap())
                 .collect();
             seen.borrow_mut().push(serde_json::from_slice(&bytes).unwrap());
-            Ok(())
+            Ok(None)
         });
         for (id, tab) in [("tab", Some(true)), ("split", None)] {
             let mut msg = serde_json::json!({ "type": "view_in_editor", "request_id": id,
@@ -1989,6 +1990,110 @@ mod tests {
                 "## ▍You"
             );
         }
+        handle.state.borrow_mut().scratch.take().unwrap().cleanup();
+    }
+
+    /// A linked window's editor takes a view and says later how it went: the page hears the outcome, not the taking.
+    #[test]
+    fn a_view_taken_with_its_outcome_to_come_answers_the_page_only_when_it_comes() {
+        let (handle, page, _) = handle_with_recording_page();
+        handle.page_message(ViewId::BASE, READY);
+        let root = agent::state_dirs::test_workspace_dir("panel-view-later");
+        handle.state.borrow_mut().scratch = Some(eitri_core::scratch::ScratchDir::in_dir(&root).unwrap());
+        let outcomes: Rc<RefCell<Vec<std::sync::mpsc::Sender<Result<(), String>>>>> = Rc::default();
+        let senders = outcomes.clone();
+        handle.on_editor_request(move |_| {
+            let (tx, rx) = std::sync::mpsc::channel();
+            senders.borrow_mut().push(tx);
+            Ok(Some(rx))
+        });
+        let view = |id: &str| {
+            serde_json::json!({ "type": "view_in_editor", "request_id": id, "title": "Conversation", "text": "x" })
+                .to_string()
+        };
+        handle.page_message(ViewId::BASE, &view("failed"));
+        tick_handle_until(&handle, "the view handed over", || outcomes.borrow().len() == 1);
+        for _ in 0..3 {
+            handle.tick();
+        }
+        assert_eq!(
+            result_for(&page.sent.borrow(), "failed"),
+            None,
+            "taken is not shown yet"
+        );
+        outcomes.borrow()[0].send(Err("disk full".into())).unwrap();
+        tick_handle_until(&handle, "the failure", || {
+            result_for(&page.sent.borrow(), "failed").is_some()
+        });
+        assert_eq!(
+            result_for(&page.sent.borrow(), "failed"),
+            Some(Err("disk full".to_string()))
+        );
+        handle.page_message(ViewId::BASE, &view("shown"));
+        tick_handle_until(&handle, "the second view", || outcomes.borrow().len() == 2);
+        outcomes.borrow()[1].send(Ok(())).unwrap();
+        tick_handle_until(&handle, "the second outcome", || {
+            result_for(&page.sent.borrow(), "shown").is_some()
+        });
+        assert_eq!(result_for(&page.sent.borrow(), "shown"), Some(Ok(())));
+        // A window that drops its end without a word: the page hears that it did not say.
+        handle.page_message(ViewId::BASE, &view("dropped"));
+        tick_handle_until(&handle, "the third view", || outcomes.borrow().len() == 3);
+        outcomes.borrow_mut().pop();
+        tick_handle_until(&handle, "the dropped outcome", || {
+            result_for(&page.sent.borrow(), "dropped").is_some()
+        });
+        assert!(matches!(result_for(&page.sent.borrow(), "dropped"), Some(Err(_))));
+        assert!(handle.state.borrow().editor_waits.is_empty());
+        handle.state.borrow_mut().scratch.take().unwrap().cleanup();
+    }
+
+    /// A reloaded document numbers its requests afresh: the old document's request, still waiting on the editor,
+    /// is dropped with it, so its late answer settles nothing of the new document's request with the same id.
+    #[test]
+    fn a_reloaded_page_drops_the_editor_waits_of_its_old_document() {
+        let (handle, page, _) = handle_with_recording_page();
+        handle.page_message(ViewId::BASE, READY);
+        let root = agent::state_dirs::test_workspace_dir("panel-view-reload");
+        handle.state.borrow_mut().scratch = Some(eitri_core::scratch::ScratchDir::in_dir(&root).unwrap());
+        let outcomes: Rc<RefCell<Vec<std::sync::mpsc::Sender<Result<(), String>>>>> = Rc::default();
+        let senders = outcomes.clone();
+        handle.on_editor_request(move |_| {
+            let (tx, rx) = std::sync::mpsc::channel();
+            senders.borrow_mut().push(tx);
+            Ok(Some(rx))
+        });
+        let view =
+            serde_json::json!({ "type": "view_in_editor", "request_id": "same", "title": "Conversation", "text": "x" })
+                .to_string();
+        handle.page_message(ViewId::BASE, &view);
+        tick_handle_until(&handle, "the first view handed over", || outcomes.borrow().len() == 1);
+        for _ in 0..3 {
+            handle.tick();
+        }
+        assert_eq!(handle.state.borrow().editor_waits.len(), 1);
+        // The document reloads and its new page asks again under the same id.
+        handle.page_message(ViewId::BASE, READY);
+        assert!(
+            handle.state.borrow().editor_waits.is_empty(),
+            "the old document's wait went with it"
+        );
+        handle.page_message(ViewId::BASE, &view);
+        tick_handle_until(&handle, "the second view handed over", || outcomes.borrow().len() == 2);
+        outcomes.borrow()[0].send(Err("old answer".into())).ok();
+        for _ in 0..5 {
+            handle.tick();
+        }
+        assert_eq!(
+            result_for(&page.sent.borrow(), "same"),
+            None,
+            "the old answer settles nothing"
+        );
+        outcomes.borrow()[1].send(Ok(())).unwrap();
+        tick_handle_until(&handle, "the new answer", || {
+            result_for(&page.sent.borrow(), "same").is_some()
+        });
+        assert_eq!(result_for(&page.sent.borrow(), "same"), Some(Ok(())));
         handle.state.borrow_mut().scratch.take().unwrap().cleanup();
     }
 

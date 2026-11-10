@@ -25,6 +25,19 @@ describe("message, output and input objects", () => {
   });
 });
 
+it("reads an ACP call back as its command, else its title, never its raw JSON", () => {
+  const input = { diffs: [], locations: null, rawInput: { command: ["ls", "-la", "src"] }, title: "List files" };
+  const row: TimelineItem = { kind: "tool", seq: 5, key: "x", call: { seq: 5, toolUseId: "x", name: "acp:execute", input, result: { content: "a.rs\n", isError: false } } };
+  expect(yank(row, "a", "o")).toEqual({ text: "acp:execute: ls -la src\na.rs\n(ok)" });
+  expect(yank(row, "i", "c")).toEqual({ text: "ls -la src" });
+  expect(yank(row, "a", "c")).toEqual({ text: "acp:execute: ls -la src" });
+  expect(toolInput("acp:execute", { rawInput: { command: "make test" }, title: "Run" })).toBe("make test");
+  expect(toolInput("acp:read", { rawInput: { path: "a.rs" }, title: "Read a.rs" })).toBe("Read a.rs");
+  // Neither a command nor a title: the input as it came, as for any other tool.
+  expect(toolInput("acp:other", { rawInput: { x: 1 } })).toBe(JSON.stringify({ rawInput: { x: 1 } }, null, 2));
+  expect(toolInput("acp:execute", { rawInput: { command: ["ls", 3] }, title: "" })).toContain("rawInput");
+});
+
 it("copies code verbatim or fenced with language and a fence longer than any interior run", () => {
   const codeBlocks = [{ code: "let x = `foo`;\n````", lang: "rust" }];
   expect(yank(reply, "i", "`", { codeBlocks })).toEqual({ text: codeBlocks[0].code });

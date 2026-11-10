@@ -834,7 +834,7 @@ pub(super) mod tests {
             let recorder = asked.clone();
             panel.handle.on_editor_request(move |request| {
                 recorder.borrow_mut().push(request.clone());
-                Ok(())
+                Ok(None)
             });
             ProposalPanel { panel, asked, root, id }
         }

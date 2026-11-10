@@ -24,7 +24,7 @@ use eitri_core::layout::Direction;
 use eitri_core::review_editor::Owner;
 use eitri_core::scratch::ScratchRequest;
 
-use crate::agent_panel::{AgentPanelHandle, ChatMoveEvent, HintInbound, ViewId};
+use crate::agent_panel::{AgentPanelHandle, ChatMoveEvent, EditorAnswer, HintInbound, ViewId};
 
 /// Every hook registration on the panel handle, in the order `wire_panel` makes them. Read by the
 /// tests that hold each window to what it leaves out.
@@ -80,8 +80,9 @@ pub(crate) type AttentionHook = Box<dyn Fn(Attention, Attention, &[ViewId])>;
 pub(crate) type ToastHook = Box<dyn Fn(&str)>;
 /// Whether a card answer from a view is taken; `Err` refuses it with the reason.
 pub(crate) type AnswerGate = Rc<dyn Fn(ViewId) -> Result<(), String>>;
-/// Hands a scratch round trip (`Ctrl+g`, `gf`) to the editor; `Err` says why it could not.
-pub(crate) type EditorRequest = Box<dyn Fn(&ScratchRequest) -> Result<(), String>>;
+/// Hands a scratch round trip (`Ctrl+g`, `gf`) to the editor; what it answers is [`EditorAnswer`] (a linked window's
+/// view is taken with its outcome to come).
+pub(crate) type EditorRequest = Box<dyn Fn(&ScratchRequest) -> EditorAnswer>;
 /// Which editor holds the review overlay, if any.
 pub(crate) type ReviewOwner = Box<dyn Fn() -> Option<Owner>>;
 

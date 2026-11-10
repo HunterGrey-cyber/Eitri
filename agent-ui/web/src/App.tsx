@@ -45,6 +45,7 @@ import {
   nothingToStopWords,
   stopBackgroundQuestion,
   REASON_ENTER_OUTSIDE_FLASH,
+  pathPickInCardFlash,
   ANSWER_INTERRUPTED_FLASH,
   CARD_CHANGED_FLASH,
   SCRATCH_EXPORT_FAILED_FLASH,
@@ -60,6 +61,7 @@ import {
   clampCursorToView,
   oldestPendingTool,
   applyViewScroll,
+  revealMatchInRow,
 } from "./app/rowScroll";
 import type { FrozenSnapshot, ArrivalPark } from "./app/rowScroll";
 import { landingInset } from "./promptHeader";
@@ -79,7 +81,7 @@ import {
   settleListScroll,
 } from "./jkScroll";
 import { cancelHold, isHolding, keepHoldAlive, releaseHold, startHold } from "./jkHold";
-import { cardModeDelta, isPanelCommand, isPanelMotion, isPlainAnswerKey, panelEntryKey, pluginKeysHelp, resolveKey } from "./keymap";
+import { cardModeDelta, isPanelCommand, isPanelMotion, isPlainAnswerKey, operatorCount, panelEntryKey, pluginKeysHelp, resolveKey } from "./keymap";
 import type { KeyLike, PanelCommandBinding, PanelMode, PendingPrefix, PluginKeysHelp, YankOperator } from "./keymap";
 import { advanceSequence, boxEntries, pendingEntries, YANK_PENDING_ENTRIES, sequenceTitle, startSequence, WHICH_KEY_DELAY_MS } from "./leader";
 import type { BoxEntry, SeqStep } from "./leader";
@@ -88,6 +90,7 @@ import { afterPaint } from "./afterPaint";
 import {
   ANSWERS_PLAIN,
   ANSWERS_WITH_RULE,
+  denyDigit,
   CARD_ARM_MS,
   cardKey,
   enterCardMode,
@@ -124,7 +127,7 @@ import { buildDisplay, indexOfKey, runKeyOf } from "./display";
 import { toolInput, yankObject, yankRows } from "./yank";
 import { primaryText } from "./copyText";
 import { codeBlockLanguage, codeBlockText, renderedText } from "./markdown";
-import { countCodePoints } from "./toolRegistry";
+import { countCodePoints, FoldAllKey } from "./toolRegistry";
 import { findMatch } from "./search";
 import { SearchBar } from "./components/SearchBar";
 import {
@@ -181,6 +184,7 @@ import { heldCount } from "./queueLines";
 import { DetailPopover } from "./components/DetailPopover";
 import { ContinueInTerminal } from "./components/TerminalHandoff";
 import { HintLayer } from "./components/HintLayer";
+import { CopyPick } from "./components/CopyPick";
 import type { ShownHint } from "./components/HintLayer";
 import { KeymapOverlay } from "./components/KeymapOverlay";
 import { ReviewOverlay } from "./components/ReviewOverlay";
@@ -868,6 +872,8 @@ export default function App() {
   }, [hunkLanding]);
 
   const [yankPick, setYankPick] = useState<{ entries: { label: string; text: string }[]; labels: string[]; typed: string; rowKey: string; targets: (HintTarget | null)[] } | null>(null);
+  const yankPickRef = useRef(yankPick);
+  yankPickRef.current = yankPick;
   /** The count accumulated from `1`-`9` then `0`-`9`, applied to the next `j`/`k`/`[[`/`]]` --
    *  and to `G`, `gg`, `gt` and `gT` (a prefix hands it on to its second
    *  key) -- and reset by it (or by anything else that runs). `null` when no digit has been pressed
@@ -1286,6 +1292,23 @@ export default function App() {
     postToRust({ type: "editor_symbol", request_id: requestId, tab, name: target.name,
       ...(target.cited === null ? {} : { cited: target.cited }) });
   }
+  /** Whether the page is still where a name lookup's `gd` left it: BROWSE (a caret or Visual `gd` ends its region),
+   *  the pane focused, nothing editable focused, no card mode, no overlay, review or pick, no pending hint and no
+   *  remote desk holding the keys. A reply lands up to the lookup's whole budget after the key, by which time the
+   *  person may be typing somewhere else; opening the editor then would move the keys to it mid-word. */
+  function pageStillAtGd(): boolean {
+    const remote = remoteDesk.snapshot();
+    const remoteOwnsKeys = remote.listOpen || remote.pairing !== null || remote.questions.length > 0 || remote.flagged.length > 0;
+    return paneFocusedRef.current && cardModeRef.current === null && modeRef.current === "browse" &&
+      !pathChoicesCoveredRef.current && yankPickRef.current === null && !remoteOwnsKeys && hintPendingRef.current === null &&
+      !isEditableElement(document.activeElement);
+  }
+  /** A name lookup's single answer: opened while the page is still where `gd` was pressed, otherwise named in the
+   *  band so the same `gd` opens it. */
+  function openLateDefinition(ref: DefinitionPath) {
+    if (pageStillAtGd()) openPath(ref);
+    else showFlash(`gd: ${ref.path}${ref.line === null ? "" : `:${ref.line}`} — gd again to open`);
+  }
   function symbolResult(payload: EditorSymbolResult) {
     const pending = symbolRequests.current.get(payload.requestId);
     if (pending === undefined) return;
@@ -1297,18 +1320,17 @@ export default function App() {
       const inFile = cited === null ? [] : payload.matches.filter((m) => m.path === cited.path || m.path.endsWith(`/${cited.path}`))
         .sort((a, b) => Math.abs(a.line - cited.line) - Math.abs(b.line - cited.line));
       const chosen = payload.matches.length === 1 ? payload.matches[0] : inFile[0];
-      const remote = remoteDesk.snapshot();
-      const remoteOwnsKeys = remote.listOpen || remote.pairing !== null || remote.questions.length > 0 || remote.flagged.length > 0;
-      if (chosen !== undefined) openPath(chosen);
-      else if (modeRef.current === "browse" && !pathChoicesCoveredRef.current && !remoteOwnsKeys &&
-          hintPendingRef.current === null && !isEditableElement(document.activeElement)) {
+      if (chosen !== undefined) openLateDefinition(chosen);
+      // The pick would take the keys card mode holds: it is not opened, and card mode stays.
+      else if (cardModeRef.current !== null) showFlash(pathPickInCardFlash("gd"));
+      else if (pageStillAtGd()) {
         dropPendingKeys();
         beginPathPick(payload.matches);
         pathChoicesCoveredRef.current = true;
       } else showFlash(`gd: ${payload.matches.length} definitions match; gd again to choose`);
       return;
     }
-    if (cited !== null) { openPath({ ...cited, expect: name }); return; }
+    if (cited !== null) { openLateDefinition({ ...cited, expect: name }); return; }
     const server = payload.error?.server ?? "the language server";
     switch (payload.error?.kind ?? "no_symbol") {
       case "no_client": showFlash("gd: no language server attached for this project (open one of its files)"); break;
@@ -1824,10 +1846,12 @@ export default function App() {
         && !binding.action.startsWith("search.") && binding.action !== "detailed.toggle";
       if (!moves && binding.keys.length === 1) keys.delete(binding.keys[0]);
     }
+    // Only a one-key binding makes its key a motion: a pair's second key typed alone is not that motion (`t` of a
+    // `]t` binding moves nothing), and a pair's first key is already a default motion key or a reserved prefix.
     for (const binding of panelTable.bindings) {
-      if (isPanelMotion(binding.action) && binding.action !== "help"
+      if (isPanelMotion(binding.action) && binding.action !== "help" && binding.keys.length === 1
           && !binding.action.startsWith("search.") && binding.action !== "detailed.toggle") {
-        for (const key of binding.keys) keys.add(key);
+        keys.add(binding.keys[0]);
       }
     }
     typingGuard.setMotionKeys(keys);
@@ -2201,6 +2225,24 @@ export default function App() {
   const prevCursorRef = useRef(cursor);
   usePreserveCursorRow(prevTimelineRef, timeline, prevCursorRef, cursor, cursorKeyRef, landingRef, setCursor);
   useRevealCursorRow(landingRef, landingAnimateRef, landingHeadRef, frozenSnapshotRef, containerRef, cursor);
+  /* A search hit on a tall row: once the row is revealed (the effect above, declared first, so run first), the line
+     holding the match comes on screen below the pinned header. The view it leaves is what a jump from here records
+     (`jumpPosition` measures the row's offset when it is called). */
+  const matchRevealRef = useRef<{ index: number; query: string } | null>(null);
+  const [matchRevealTick, setMatchRevealTick] = useState(0);
+  function revealMatch(index: number, query: string) {
+    matchRevealRef.current = { index, query };
+    setMatchRevealTick((n) => n + 1);
+  }
+  useEffect(() => {
+    const want = matchRevealRef.current;
+    matchRevealRef.current = null;
+    if (want === null || want.index !== cursor || frozenSnapshotRef.current !== null) return;
+    const root = containerRef.current;
+    const row = root === null ? undefined : conversationRows(root)[cursor];
+    const list = row?.closest<HTMLElement>(".message-list") ?? null;
+    if (row !== undefined && list !== null) revealMatchInRow(list, row, want.query);
+  }, [cursor, matchRevealTick]);
   const cursorRefForScroll = useRef(cursor);
   cursorRefForScroll.current = cursor;
   useClampCursorOnScroll(
@@ -2703,7 +2745,10 @@ export default function App() {
         receive({ kind: "command_result", requestId: payload.requestId, ok: true });
         const remote = remoteDesk.snapshot();
         const remoteOwnsKeys = remote.listOpen || remote.pairing !== null || remote.questions.length > 0 || remote.flagged.length > 0;
-        if (payload.tab === activeTabRef.current && record.tab === payload.tab &&
+        if (payload.tab === activeTabRef.current && record.tab === payload.tab && cardModeRef.current !== null) {
+          // Card mode holds the keys the pick would take: the pick is not opened, and card mode stays.
+          showFlash(pathPickInCardFlash("gf"));
+        } else if (payload.tab === activeTabRef.current && record.tab === payload.tab &&
             modeRef.current === "browse" && !pathChoicesCoveredRef.current && !remoteOwnsKeys &&
             hintPendingRef.current === null && !isEditableElement(document.activeElement)) {
           dropPendingKeys();
@@ -3512,7 +3557,7 @@ export default function App() {
     setHintTyped("");
   }
 
-  /** Whether `el` is an answer button (Approve, Deny, Always allow) of the card at timeline `index`, and that card
+  /** Whether `el` is an answer button (Approve, Always allow, Deny) of the card at timeline `index`, and that card
    *  still waits: in a live session, not answered from this panel. With `orReason`, the card's reason box counts
    *  too (a HINT label on it). Refs only: the HINT dispatch is installed once. */
   function waitingCardButton(el: HTMLElement, index: number, orReason = false): boolean {
@@ -4031,22 +4076,23 @@ export default function App() {
   }
 
   /** What a card offers card mode, read off the card as `PermissionCard` draws it, so the digits and the buttons
-   *  agree: Approve, Deny, and Always allow where Rust offered a rule for a provider's card; a reason only on a
+   *  agree: Approve, Always allow where Rust offered a rule for a provider's card, then Deny; a reason only on a
    *  provider's card (a broker's and another agent's deny carries none). */
   function cardOfferOf(request: PermissionRequestRecord): CardOffer {
     const broker = request.editorCard !== undefined;
     const external = !broker && isExternalTool(request.toolName);
     const ruleText = broker ? null : (pageRef.current.ruleOffers[request.permissionId] ?? null);
     const rule = Boolean(ruleText);
+    const answers = rule ? ANSWERS_WITH_RULE : ANSWERS_PLAIN;
     return {
-      answers: rule ? ANSWERS_WITH_RULE : ANSWERS_PLAIN,
+      answers,
       rule: rule ? ruleText : null,
       approvable: cardApprovable(request),
       takesReason: !broker && !external,
       noReasonFlash: broker
         ? BROKER_NO_REASON_FLASH
         : external
-          ? agentNoReasonFlash(agentTitle(activeTabInfo(tabsRef.current)?.agent))
+          ? agentNoReasonFlash(agentTitle(activeTabInfo(tabsRef.current)?.agent), denyDigit(answers))
           : "",
     };
   }
@@ -4326,8 +4372,9 @@ export default function App() {
         : { permissionId: cardModeId, view: { highlight: cardHighlight, armed: cardArmed, reasonOpen: cardReasonOpen } },
     [cardModeId, cardHighlight, cardArmed, cardReasonOpen],
   );
-  /** What the band says of card mode: the held card's place among this tab's waiting cards and its answer count, and
-   *  whether the cursor is on a waiting card (or the tool row it gates), where BROWSE's Enter enters card mode. */
+  /** What the band says of card mode (the held card's place among this tab's waiting cards and its answer count), and
+   *  whether the cursor is on a waiting card (or the tool row it gates), where BROWSE's Enter enters card mode: the
+   *  activity line says so. */
   const bandCard = useMemo(() => {
     const waiting = timeline.filter((item) => item.kind === "permission" && !answeredPermissions.has(item.request.permissionId));
     const held = cardMode === null ? -1 : waiting.findIndex((item) => item.kind === "permission" && item.request.permissionId === cardMode.card.permissionId);
@@ -5898,7 +5945,7 @@ export default function App() {
       event.preventDefault();
       return;
     }
-    // A card's own answer buttons (Approve, Deny, Always allow): see the Enter/Space rules below.
+    // A card's own answer buttons (Approve, Always allow, Deny): see the Enter/Space rules below.
     const onAnswerButton =
       isActivatableControl(event.target) && (event.target as HTMLElement).closest("[data-nav-action]") !== null;
     // The two modal overlays just below return ahead of those rules, so a
@@ -6119,7 +6166,7 @@ export default function App() {
     }
     // A focused button activates on Enter and Space natively, and keeps doing so (Stop, Dismiss, a tab, the chooser's
     // rows); every other key still reaches the table, which is what lets `h`/`j`/`k`/`l` carry on from a focused
-    // button. A card's own answer buttons (Approve, Deny, Always allow) never activate from a key: Enter and Space on
+    // button. A card's own answer buttons (Approve, Always allow, Deny) never activate from a key: Enter and Space on
     // them are claimed here, so the browser's activation never reaches them. Space there does nothing (one inside a
     // pending leader sequence is the sequence's, below). A plain Enter there is card mode for that card, nothing
     // highlighted -- such a button holds DOM focus only after a mouse press dragged off it -- and answers nothing;
@@ -6625,7 +6672,7 @@ export default function App() {
           if (target === cursor) break;
         } else if (motion !== null) target = Math.max(0, Math.min(timeline.length - 1, cursor + n * (["k", "{", "ArrowUp"].includes(motion) ? -1 : 1)));
         else target = Math.min(timeline.length - 1, cursor + n - 1);
-        if (motion === null && n === 1 && operator?.count == null && count === null && landedCode !== null && landedCode.isConnected && cursorRow()?.contains(landedCode)) {
+        if (motion === null && n === 1 && (operator === null || operatorCount(operator) === null) && count === null && landedCode !== null && landedCode.isConnected && cursorRow()?.contains(landedCode)) {
           copied(codeBlockText(landedCode), item.key);
           break;
         }
@@ -7005,6 +7052,7 @@ export default function App() {
         } else {
           noteJump();
           moveCursorTo(found);
+          revealMatch(found, query);
         }
         // Same reason `move`/`jump`/`prompt-jump` and the Ctrl+d/Ctrl+u re-home all do this: a
         // cursor move must take the keys back from a focused control (e.g. a permission card's
@@ -7114,10 +7162,10 @@ export default function App() {
       // effect above `onKeyDown` that keeps focus here whenever `mode` is "browse".
       tabIndex={0}
       // A y/n prompt takes every key first, from wherever it was typed (the chooser and its inputs,
-      // the tab bar's rename, the `/` prompt, the composer): see `answerConfirm`'s own doc. VISUAL's
-      // own whole key table runs right after it, in the same capture-phase handler, ahead of
-      // `onKeyDown` and of every descendant's own keydown -- a card's reason box denies from its own
-      // handler before `onKeyDown` ever runs, so VISUAL has to beat it here.
+      // the tab bar's rename, the `/` prompt, the composer): see `answerConfirm`'s own doc. Card mode's
+      // capture comes next and reads a card's reason field before anything under the root does; VISUAL's
+      // own whole key table runs after it, in the same capture-phase handler, ahead of `onKeyDown` and of
+      // every descendant's own keydown. The reason field has no key handler of its own.
       onKeyDownCapture={(event) => {
         if (answerConfirm(event)) return;
         if (tasksOpen) {
@@ -7144,8 +7192,8 @@ export default function App() {
       onKeyDown={onKeyDown}
       // A pointer press anywhere in the panel is the user's explicit act and ends VISUAL
       // before the press's own handling runs (a click on Approve still approves; a click into a
-      // card's reason box shows BROWSE at once, and the Enter that follows it then denies as the box
-      // says, which is accepted). Capture phase, ahead of every descendant's
+      // card's reason box shows BROWSE at once, and outside card mode the Enter that follows it
+      // answers nothing and says how the box denies). Capture phase, ahead of every descendant's
       // own `onClick`/`onMouseDown`.
       onPointerDownCapture={() => {
         exitRegion();
@@ -7238,6 +7286,7 @@ export default function App() {
             the old fallback, the live index itself, marked whichever
             unrelated frozen row sat at that position as the cursor's. */}
         <PermissionCardContext.Provider value={cardContext}>
+          <FoldAllKey.Provider value={mode === "input" ? "Ctrl+o" : "zi"}>
           <MessageList
             tab={activeTabId}
             state={frozenSnapshot?.state ?? state}
@@ -7266,6 +7315,7 @@ export default function App() {
             unseenSeed={unseenSeed}
             visual={mode === "caret" ? "caret" : mode === "visual" ? "visual" : mode === "vline" ? "vline" : null}
           />
+          </FoldAllKey.Provider>
         </PermissionCardContext.Provider>
         {keymapOpen && (
           <PanelErrorBoundary name="keys overlay" onError={() => overlayFailed("keys overlay", () => setKeymapOpen(false))}>
@@ -7408,6 +7458,7 @@ export default function App() {
         queued={heldCount(queue)}
         pendingTool={oldestPendingTool(state)}
         mode={mode}
+        cardEntry={cardMode !== null ? "held" : mode === "browse" && bandCard.onCard ? "on-card" : "elsewhere"}
         shellRunning={shellRunning}
       />
       <TurnChanges state={state} review={reviewSettings} />
@@ -7507,8 +7558,8 @@ export default function App() {
       {/* `gf` with several paths, and the open `/` prompt, each still own every key
           (`onKeyDown`'s dedicated branches, above `resolveKey` entirely) -- only WHERE they draw
           moved, once `Footer`'s third slot stopped existing. */}
-      {/* These four overlays: each sits in its own `PanelErrorBoundary`, so a throw while it renders closes just
-          it and says so in the band rather than unmounting the panel. The two pickers hold no focus
+      {/* These five overlays: each sits in its own `PanelErrorBoundary`, so a throw while it renders closes just
+          it and says so in the band rather than unmounting the panel. The three pickers hold no focus
           (the root keeps the keys and reads the letter), so closing them is all it takes; the two
           lines are inputs that DO hold it, so they hand the keys back the way their own Esc does. */}
       {pathPick !== null && (
@@ -7528,17 +7579,14 @@ export default function App() {
         </PanelErrorBoundary>
       )}
       {yankPick !== null && (
-        <>
-        <div className="path-pick" role="status">
-          {yankPick.entries.map((entry, i) => yankPick.labels[i].startsWith(yankPick.typed)
-            ? <span key={i}>{i > 0 ? " · " : ""}{yankPick.labels[i]} {revealedText(entry.label)}</span> : null)}
-        </div>
-        <HintLayer
-          root={containerRef.current}
-          hints={yankPick.targets.flatMap((target, i) => target === null ? [] : [{ target, label: yankPick.labels[i] }])}
-          typed={yankPick.typed}
-        />
-        </>
+        <PanelErrorBoundary name="copy picker" onError={() => overlayFailed("copy picker", () => setYankPick(null))}>
+          <CopyPick entries={yankPick.entries} labels={yankPick.labels} typed={yankPick.typed} />
+          <HintLayer
+            root={containerRef.current}
+            hints={yankPick.targets.flatMap((target, i) => target === null ? [] : [{ target, label: yankPick.labels[i] }])}
+            typed={yankPick.typed}
+          />
+        </PanelErrorBoundary>
       )}
       {linkPick !== null && (
         <PanelErrorBoundary name="link picker" onError={() => overlayFailed("link picker", () => setLinkPick(null))}>
@@ -7565,6 +7613,7 @@ export default function App() {
               setSearch({ ...search, query });
               const found = findMatch(timeline, query, search.origin, search.dir, true);
               setCursor(found ?? search.origin);
+              if (found !== null) revealMatch(found, query);
             }}
             onAccept={(event) => {
               noteLineKey(event);
@@ -7574,6 +7623,8 @@ export default function App() {
                 setCursor(search.origin);
               } else if (search.query !== "") {
                 noteJump(searchOriginRef.current);
+                const found = findMatch(timeline, search.query, search.origin, search.dir, true);
+                if (found !== null) revealMatch(found, search.query);
               }
               setSearch(null);
               containerRef.current?.focus({ preventScroll: true });
@@ -7616,7 +7667,6 @@ export default function App() {
           unread: unreadLabel,
           cards: allCards(state).length,
           cardMode: bandCard.cardMode,
-          onCard: bandCard.onCard,
           questions: waitingQuestions.length,
           queued: queue.length,
           context: sessionEnded ? null : contextFact(editorContext),

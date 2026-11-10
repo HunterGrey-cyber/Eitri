@@ -9120,7 +9120,7 @@ describe("the keys land on a card that waits", () => {
       events: [{ type: "permission_requested", permission_id: "p", tool_use_id: null, tool_name: "Bash", input: { command: "rm x" } }],
     });
     expect(container.querySelector<HTMLElement>("[data-testid=mode-block]")!.dataset.mode).toBe("input");
-    expect(container.querySelector(".activity-card")!.textContent).toBe("⚑ Bash needs approval — Alt-n");
+    expect(container.querySelector(".activity-card")!.textContent).toBe("⚑ Bash needs approval — Alt-n: card mode, then 1-3");
   });
 
   it("a switch to a tab holding a card lands on it while the panel has the keys", () => {

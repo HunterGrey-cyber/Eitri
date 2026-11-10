@@ -28,6 +28,7 @@ const broken = vi.hoisted(() => ({
   linkPick: false,
   search: false,
   exLine: false,
+  yankPick: false,
 }));
 
 vi.mock("./components/Chooser", async (importOriginal) => {
@@ -93,6 +94,17 @@ vi.mock("./components/LinkPick", async (importOriginal) => {
     },
   };
 });
+vi.mock("./components/CopyPick", async (importOriginal) => {
+  const real = await importOriginal<typeof import("./components/CopyPick")>();
+  const { createElement } = await import("react");
+  return {
+    ...real,
+    CopyPick: (props: ComponentProps<typeof real.CopyPick>) => {
+      if (broken.yankPick) throw new Error("copy pick exploded");
+      return createElement(real.CopyPick, props);
+    },
+  };
+});
 // One component draws both the `/` search (lead "/") and the `:` command line (lead ":").
 vi.mock("./components/SearchBar", async (importOriginal) => {
   const real = await importOriginal<typeof import("./components/SearchBar")>();
@@ -125,7 +137,7 @@ afterEach(() => {
   vi.unstubAllGlobals();
   cleanup();
   broken.chooser = broken.picker = broken.keymap = broken.detail = false;
-  broken.pathPick = broken.linkPick = broken.search = broken.exLine = false;
+  broken.pathPick = broken.linkPick = broken.search = broken.exLine = broken.yankPick = false;
 });
 
 function dispatch(payload: unknown) {
@@ -240,6 +252,15 @@ function withReply(round: number) {
     }),
   });
 }
+/** A reply with two code blocks, so `yi\`` waits for a letter (the copy picker). */
+function withCode(round: number) {
+  dispatch({
+    kind: "snapshot",
+    tab: 1,
+    throughRevision: round,
+    state: snapshotState({ transcript: [{ seq: 1, text: "```js\nfirst\n```\n\n```rust\nsecond\n```" }] }),
+  });
+}
 const rootOf = (container: HTMLElement) => container.querySelector<HTMLElement>(".agent-ui-conversation")!;
 /** jsdom lays nothing out: give the list and each anchor a box, which is what `hintVisible` reads as "on screen". */
 function boxLinks(container: HTMLElement) {
@@ -279,6 +300,7 @@ const SITES: Site[] = [
   { name: "gf's path picker", layout: "conversation", flag: "pathPick", overlay: ".path-pick", flash: "the path picker failed and closed", open: (c, round) => { withReply(round); keys(c, "g", "f"); } },
   { name: "gx's link picker", layout: "conversation", flag: "linkPick", overlay: ".link-pick", flash: "the link picker failed and closed", open: (c, round) => { withReply(round); boxLinks(c); keys(c, "g", "x"); } },
   { name: "the / search line", layout: "conversation", flag: "search", overlay: ".search-bar", flash: "the search line failed and closed", open: (c) => keys(c, "/") },
+  { name: "y's copy picker", layout: "conversation", flag: "yankPick", overlay: ".path-pick", flash: "the copy picker failed and closed", open: (c, round) => { withCode(round); keys(c, "y", "i", "`"); } },
   { name: "the : command line", layout: "conversation", flag: "exLine", overlay: ".search-bar", flash: "the command line failed and closed", open: (c) => keys(c, ":") },
 ];
 

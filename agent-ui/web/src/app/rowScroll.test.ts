@@ -1,6 +1,6 @@
 // @vitest-environment jsdom
-import { afterEach, describe, expect, it } from "vitest";
-import { clampCursorToView, revealRow, scrollVisibleRowBox, stepWithinRow } from "./rowScroll";
+import { afterEach, describe, expect, it, vi } from "vitest";
+import { clampCursorToView, revealMatchInRow, revealRow, scrollVisibleRowBox, stepWithinRow } from "./rowScroll";
 import { PROMPT_HEADER_CLASS } from "../promptHeader";
 
 /* The DOM half of moving through the conversation, with the pinned prompt header shown over the list's top
@@ -12,6 +12,9 @@ const HEADER = 24;
 
 afterEach(() => {
   document.body.innerHTML = "";
+  vi.restoreAllMocks();
+  // jsdom's Range has no layout, hence no rect of its own; the tests below plant one.
+  delete (Range.prototype as { getBoundingClientRect?: unknown }).getBoundingClientRect;
 });
 
 function layout(spans: [number, number][], header: boolean) {
@@ -101,5 +104,58 @@ describe("scrollVisibleRowBox with the header shown", () => {
       expect(list.contains(box)).toBe(true);
       expect(scrollVisibleRowBox(rows[0], 1)).toBe(!header);
     }
+  });
+});
+
+describe("revealMatchInRow", () => {
+  /** A one-text-node row; the range's rect is planted below the view so a found hit scrolls. Returns what the range
+   *  was set to and whether the reveal moved the list. */
+  function reveal(text: string, query: string) {
+    const { list, rows } = layout([[1000, 1100]], false);
+    rows[0].firstElementChild!.textContent = text;
+    const seen: [number, number][] = [];
+    Object.defineProperty(Range.prototype, "getBoundingClientRect", {
+      configurable: true,
+      value(this: Range) {
+        seen.push([this.startOffset, this.endOffset]);
+        return { top: 450, bottom: 470, width: 20, height: 20 } as DOMRect;
+      },
+    });
+    const moved = revealMatchInRow(list, rows[0], query);
+    return { seen, moved };
+  }
+
+  it("finds a hit by the offsets of the text as drawn when case folding changes its length", () => {
+    // "İ" lowercases to two code units: a hit found in the lowered copy sat at offset 4 of a 3-unit node.
+    expect(reveal("İİx", "x")).toEqual({ seen: [[2, 3]], moved: true });
+    // A hit inside what one letter folded to takes that letter whole.
+    expect(reveal("aİb", "i").seen).toEqual([[1, 2]]);
+  });
+
+  it("matches in any case, an exact one when the query has a capital", () => {
+    expect(reveal("aẞb", "ß").seen).toEqual([[1, 2]]);
+    expect(reveal("Hello hello", "hello").seen).toEqual([[0, 5]]);
+    expect(reveal("Hello hello", "Hello").seen).toEqual([[0, 5]]);
+    expect(reveal("hello Hello", "Hello").seen).toEqual([[6, 11]]);
+  });
+
+  it("counts a code point outside the BMP as the two units it is", () => {
+    expect(reveal("😀 Hello", "hello").seen).toEqual([[3, 8]]);
+    expect(reveal("😀İx", "x").seen).toEqual([[3, 4]]);
+  });
+
+  it("moves nothing and throws nothing when the range cannot be made", () => {
+    const { list, rows } = layout([[1000, 1100]], false);
+    rows[0].firstElementChild!.textContent = "İİx";
+    vi.spyOn(Range.prototype, "setStart").mockImplementation(() => {
+      throw new DOMException("out of range", "IndexSizeError");
+    });
+    expect(revealMatchInRow(list, rows[0], "x")).toBe(false);
+    expect(list.scrollTop).toBe(1000);
+  });
+
+  it("has nothing to do with an empty query or no match", () => {
+    expect(reveal("abc", "").moved).toBe(false);
+    expect(reveal("abc", "z")).toEqual({ seen: [], moved: false });
   });
 });

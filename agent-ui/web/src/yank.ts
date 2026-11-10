@@ -8,8 +8,22 @@ export type YankResult = { text: string } | { refuse: string } | { pick: { label
 
 export function yankRows(texts: readonly string[]): string { return texts.join("\n\n"); }
 
+/** An ACP agent's call as a person would read it back: its raw input's `command` (an argv joined by spaces, or a
+ *  string), else the title the agent gave the call; `null` when it has neither. */
+function acpCommand(fields: Record<string, unknown>): string | null {
+  const raw = fields.rawInput && typeof fields.rawInput === "object" ? fields.rawInput as Record<string, unknown> : {};
+  const command = raw.command;
+  if (typeof command === "string" && command !== "") return command;
+  if (Array.isArray(command) && command.length > 0 && command.every((part) => typeof part === "string")) return command.join(" ");
+  return typeof fields.title === "string" && fields.title !== "" ? fields.title : null;
+}
+
 export function toolInput(name: string, input: unknown): string {
   const fields = input && typeof input === "object" ? input as Record<string, unknown> : {};
+  if (name.startsWith("acp:")) {
+    const command = acpCommand(fields);
+    if (command !== null) return command;
+  }
   const field = ({ NotebookEdit: "notebook_path", Grep: "pattern", Glob: "pattern", WebFetch: "url", WebSearch: "query" } as Record<string, string>)[name];
   if (field) return typeof fields[field] === "string" ? fields[field] as string : JSON.stringify(input, null, 2) ?? "null";
   return toolPrimary(name, input) ?? "null";

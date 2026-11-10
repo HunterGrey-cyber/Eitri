@@ -1646,7 +1646,7 @@ mod question_tests {
             let requests = requests.clone();
             move |request| {
                 requests.borrow_mut().push(request.clone());
-                Ok(())
+                Ok(None)
             }
         });
         let before = page.sent.borrow().len();

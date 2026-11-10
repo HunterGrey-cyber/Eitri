@@ -322,6 +322,9 @@ struct AgentPanelState {
     /// Views' scratch files being written on worker threads, in the order they were asked for, polled by the tick:
     /// a view's text is as long as the output it shows and is not written on the GTK thread.
     view_jobs: Vec<PendingView>,
+    /// Requests for nvim the window took with the outcome still to come (`EditorAnswer`'s `later`), in the order they
+    /// were taken, polled by the tick: each one's step runs when its outcome arrives.
+    editor_waits: Vec<review_glue::EditorWait>,
     /// Failed tabs whose `r` waits for the lookup of `claude`, polled by the tick: the lookup reads the disk, so it
     /// never runs on the GTK thread.
     reset_checks: Vec<inbound::PendingResetCheck>,
@@ -491,8 +494,13 @@ type ToastHook = Rc<dyn Fn(&str)>;
 /// it, and the views handed a card since the last call (`tabs::views_handed_a_card`).
 type AttentionHook = Rc<dyn Fn(eitri_core::attention::Attention, eitri_core::attention::Attention, &[ViewId])>;
 
-/// `AgentPanelHandle::on_editor_request`: the request to hand nvim; `Err` says why it could not.
-type EditorRequestHook = Rc<dyn Fn(&eitri_core::scratch::ScratchRequest) -> Result<(), String>>;
+/// What the window answers a request for nvim: `Err` says why it could not take it; `Ok(None)` is taken; `Ok(Some(later))`
+/// is taken for now, with the outcome still to come on `later` (a linked window's editor, which answers once its own
+/// window has carried the request out). A page waiting on a later answer hears it when it comes.
+pub type EditorAnswer = Result<Option<std::sync::mpsc::Receiver<Result<(), String>>>, String>;
+
+/// `AgentPanelHandle::on_editor_request`: the request to hand nvim, and what the window answers.
+type EditorRequestHook = Rc<dyn Fn(&eitri_core::scratch::ScratchRequest) -> EditorAnswer>;
 
 /// Holds this window's presence for every other window's reverts: its window file, and a file per
 /// running turn, kept by a thread of its own. It runs for every backend (the legacy one installs
@@ -657,6 +665,7 @@ impl AgentPanelState {
             remote: RemoteCalls::default(),
             proposal_jobs: Vec::new(),
             view_jobs: Vec::new(),
+            editor_waits: Vec::new(),
             reset_checks: Vec::new(),
             cli_missing: std::sync::Arc::new(agent::claude_problem_here),
             review_hints: Vec::new(),

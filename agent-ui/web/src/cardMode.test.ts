@@ -7,6 +7,7 @@ import {
   CARD_ARM_MS,
   answersValid,
   cardKey,
+  denyDigit,
   enterCardMode,
   isArmed,
   keyAnswerProof,
@@ -98,8 +99,8 @@ describe("cardKey: bare modifiers", () => {
 
 describe("cardKey: every key that does not answer re-arms and drops an answer in flight", () => {
   it("re-arms from its own press and clears answering", () => {
-    const answering = cardKey(entered(), key("2", ARMED)).state;
-    expect(answering.answering).toEqual({ button: 1, pressedAt: ARMED, withReason: false });
+    const answering = cardKey(entered(), key("3", ARMED)).state;
+    expect(answering.answering).toEqual({ button: 2, pressedAt: ARMED, withReason: false });
     for (const k of [key("j", ARMED + 100), key("x", ARMED + 100), key("Escape", ARMED + 100), key("Tab", ARMED + 100)]) {
       const r = cardKey(answering, k);
       expect(r.intent.kind).not.toBe("answer");
@@ -156,11 +157,11 @@ describe("cardKey: composing and replayed keys", () => {
 });
 
 describe("cardKey: digits", () => {
-  it("1 2 3 answer Approve, Deny, Always once armed, starting the after-half", () => {
+  it("1 2 3 answer Approve, Always, Deny (Claude Code's order) once armed, starting the after-half", () => {
     const want = [
       { button: 0, answer: { kind: "approve" }, decision: "allow", remember: false },
-      { button: 1, answer: { kind: "deny" }, decision: "deny", remember: false },
-      { button: 2, answer: { kind: "always" }, decision: "allow", remember: true },
+      { button: 1, answer: { kind: "always" }, decision: "allow", remember: true },
+      { button: 2, answer: { kind: "deny" }, decision: "deny", remember: false },
     ];
     ["1", "2", "3"].forEach((d, i) => {
       const r = cardKey(entered(), key(d, ARMED));
@@ -168,6 +169,15 @@ describe("cardKey: digits", () => {
       expect(r.state.answering).toEqual({ button: i, pressedAt: ARMED, withReason: false });
       expect(r.state.armFrom).toBe(T0);
     });
+  });
+
+  it("1 2 answer Approve, Deny on a card without a rule offer: 2 is Deny there, 3 is Deny beside Always", () => {
+    for (const offer of [PROVIDER_2, BROKER]) {
+      expect(cardKey(entered(offer), key("1", ARMED)).intent).toMatchObject({ kind: "answer", button: 0, decision: "allow", remember: false });
+      expect(cardKey(entered(offer), key("2", ARMED)).intent).toMatchObject({ kind: "answer", button: 1, answer: { kind: "deny" }, decision: "deny", remember: false });
+    }
+    expect(cardKey(entered(PROVIDER), key("2", ARMED)).intent).toMatchObject({ decision: "allow", remember: true });
+    expect(cardKey(entered(PROVIDER), key("3", ARMED)).intent).toMatchObject({ decision: "deny", remember: false });
   });
 
   it("a held digit answers nothing", () => {
@@ -192,15 +202,18 @@ describe("cardKey: digits", () => {
 
   it("1 on a card that cannot be approved is refused", () => {
     const r = cardKey(entered(ACP_NO_ALLOW), key("1", ARMED));
-    expect(r.intent).toEqual(refused(notApprovableFlash("1")));
-    expect(notApprovableFlash("1")).toBe("1: this card cannot be approved — 2 denies, Esc leaves");
+    expect(r.intent).toEqual(refused(notApprovableFlash("1", 2)));
+    expect(notApprovableFlash("1", 2)).toBe("1: this card cannot be approved — 2 denies, Esc leaves");
     expect(r.state.answering).toBeNull();
     expect(cardKey(entered(ACP_NO_ALLOW), key("2", ARMED)).intent).toMatchObject({ kind: "answer", decision: "deny" });
   });
 
-  it("3 is an allow too: refused on a card that cannot be approved", () => {
+  it("2 (Always) is an allow too on a rule card: refused on one that cannot be approved, naming 3 as its deny", () => {
     const odd: CardOffer = { ...PROVIDER, approvable: false };
-    expect(cardKey(entered(odd), key("3", ARMED)).intent).toEqual(refused(notApprovableFlash("3")));
+    expect(cardKey(entered(odd), key("2", ARMED)).intent).toEqual(refused(notApprovableFlash("2", 3)));
+    expect(notApprovableFlash("2", 3)).toBe("2: this card cannot be approved — 3 denies, Esc leaves");
+    expect(cardKey(entered(odd), key("1", ARMED)).intent).toEqual(refused(notApprovableFlash("1", 3)));
+    expect(cardKey(entered(odd), key("3", ARMED)).intent).toMatchObject({ kind: "answer", decision: "deny" });
   });
 
   it("a digit with Shift or any other modifier is not a digit", () => {
@@ -269,10 +282,10 @@ describe("cardKey: Enter", () => {
   it("Enter answers the highlighted button once armed after the move", () => {
     const lit = press(entered(), key("l", ARMED), key("l", ARMED + 10)).state;
     const r = cardKey(lit, key("Enter", ARMED + 10 + CARD_ARM_MS));
-    expect(r.intent).toEqual({ kind: "answer", button: 1, answer: { kind: "deny" }, decision: "deny", remember: false, withReason: false });
+    expect(r.intent).toEqual({ kind: "answer", button: 1, answer: { kind: "always" }, decision: "allow", remember: true, withReason: false });
     expect(r.state.answering).toEqual({ button: 1, pressedAt: ARMED + 10 + CARD_ARM_MS, withReason: false });
-    const always = press(entered(), key("$", ARMED, { shiftKey: true })).state;
-    expect(cardKey(always, key("Enter", ARMED + CARD_ARM_MS)).intent).toMatchObject({ button: 2, remember: true });
+    const deny = press(entered(), key("$", ARMED, { shiftKey: true })).state;
+    expect(cardKey(deny, key("Enter", ARMED + CARD_ARM_MS)).intent).toMatchObject({ button: 2, decision: "deny", remember: false });
   });
 
   it("Enter right after the move is unarmed", () => {
@@ -289,7 +302,7 @@ describe("cardKey: Enter", () => {
 
   it("Enter on Approve of a card that cannot be approved is refused", () => {
     const lit = press(entered(ACP_NO_ALLOW), key("l", ARMED)).state;
-    expect(cardKey(lit, key("Enter", ARMED + CARD_ARM_MS)).intent).toEqual(refused(notApprovableFlash("Enter")));
+    expect(cardKey(lit, key("Enter", ARMED + CARD_ARM_MS)).intent).toEqual(refused(notApprovableFlash("Enter", 2)));
   });
 
   it("Enter with Shift or Ctrl answers nothing", () => {
@@ -421,8 +434,11 @@ describe("cardKey: the open reason field", () => {
 
   it("Enter outside composition denies with the reason once armed, through the after-half", () => {
     const r = cardKey(open(), key("Enter", T0 + CARD_ARM_MS));
-    expect(r.intent).toEqual({ kind: "answer", button: 1, answer: { kind: "deny" }, decision: "deny", remember: false, withReason: true });
-    expect(r.state.answering).toEqual({ button: 1, pressedAt: T0 + CARD_ARM_MS, withReason: true });
+    expect(r.intent).toEqual({ kind: "answer", button: 2, answer: { kind: "deny" }, decision: "deny", remember: false, withReason: true });
+    expect(r.state.answering).toEqual({ button: 2, pressedAt: T0 + CARD_ARM_MS, withReason: true });
+    // On a card without a rule offer the deny is its second answer, and the field's Enter answers with that one.
+    const plain = cardKey(cardKey(entered(PROVIDER_2), key("Tab", T0)).state, key("Enter", T0 + CARD_ARM_MS));
+    expect(plain.intent).toEqual({ kind: "answer", button: 1, answer: { kind: "deny" }, decision: "deny", remember: false, withReason: true });
   });
 
   it("a second Enter in the field's after-half re-arms from its own press and answers nothing", () => {
@@ -643,36 +659,56 @@ describe("the after-half", () => {
 });
 
 describe("each card's answer list", () => {
-  it("answer 2 is the deny-like answer on every card kind today", () => {
+  it("the last answer is the one deny-like answer on every card kind today: 3 beside a rule offer, 2 elsewhere", () => {
+    expect(ANSWERS_WITH_RULE.map((a) => a.kind)).toEqual(["approve", "always", "deny"]);
+    expect(ANSWERS_PLAIN.map((a) => a.kind)).toEqual(["approve", "deny"]);
     for (const offer of [PROVIDER, PROVIDER_2, BROKER, ACP_NO_ALLOW]) {
       expect(answersValid(offer.answers)).toBe(true);
-      expect(offer.answers[1].kind).toBe("deny");
-      expect(cardKey(entered(offer), key("2", ARMED)).intent).toMatchObject({ kind: "answer", decision: "deny" });
+      const last = offer.answers.length;
+      expect(denyDigit(offer.answers)).toBe(last);
+      expect(offer.answers.filter((a) => a.kind === "deny")).toHaveLength(1);
+      expect(offer.answers[last - 1].kind).toBe("deny");
+      expect(cardKey(entered(offer), key(String(last), ARMED)).intent).toMatchObject({ kind: "answer", decision: "deny" });
     }
+    expect(denyDigit(PROVIDER.answers)).toBe(3);
+    expect(denyDigit(PROVIDER_2.answers)).toBe(2);
   });
 
-  it("card mode refuses a list without a deny-like answer 2, or with fewer than 2 or more than 9 answers", () => {
+  it("card mode refuses a list whose one deny-like answer is not last, with two of them, or with fewer than 2 or more than 9 answers", () => {
     const approve: CardAnswer = { kind: "approve" };
+    const always: CardAnswer = { kind: "always" };
     const deny: CardAnswer = { kind: "deny" };
-    const tooMany = [approve, deny, ...Array<CardAnswer>(8).fill(approve)];
-    for (const answers of [[deny, approve], [approve, approve, deny], [approve], [], tooMany]) {
+    const tooMany = [...Array<CardAnswer>(9).fill(approve), deny];
+    for (const answers of [
+      [deny, approve],
+      [approve, deny, always],
+      [approve, approve],
+      [approve, deny, deny],
+      [deny, deny],
+      [approve],
+      [deny],
+      [],
+      tooMany,
+    ]) {
       expect(answersValid(answers)).toBe(false);
       expect(() => enterCardMode(CARD, BROWSE, { ...PROVIDER, answers }, T0)).toThrow();
     }
-    expect(answersValid([approve, deny, ...Array<CardAnswer>(7).fill(approve)])).toBe(true);
+    expect(answersValid([approve, always, deny])).toBe(true);
+    expect(answersValid([...Array<CardAnswer>(8).fill(approve), deny])).toBe(true);
   });
 
   it("a longer list takes digits up to its length, each answer as its kind", () => {
     const four: CardOffer = {
       ...PROVIDER,
-      answers: [{ kind: "approve" }, { kind: "deny" }, { kind: "always" }, { kind: "approve" }],
+      answers: [{ kind: "approve" }, { kind: "always" }, { kind: "approve" }, { kind: "deny" }],
     };
-    expect(cardKey(entered(four), key("4", ARMED)).intent).toMatchObject({
+    expect(cardKey(entered(four), key("3", ARMED)).intent).toMatchObject({
       kind: "answer",
-      button: 3,
+      button: 2,
       decision: "allow",
       remember: false,
     });
+    expect(cardKey(entered(four), key("4", ARMED)).intent).toMatchObject({ kind: "answer", button: 3, decision: "deny" });
     expect(cardKey(entered(four), key("5", ARMED)).intent).toEqual(refused("5: this card has 4 answers"));
     expect(press(entered(four), key("$", ARMED, { shiftKey: true })).state.highlight).toBe(3);
   });
@@ -703,7 +739,7 @@ describe("card kinds", () => {
     expect(cardKey(s, key("Enter", last + CARD_ARM_MS - 1)).intent).toEqual(refused("Enter: card arming — press again"));
     expect(cardKey(s, key("Enter", last + CARD_ARM_MS)).intent).toEqual({
       kind: "answer",
-      button: 1,
+      button: 2,
       answer: { kind: "deny" },
       decision: "deny",
       remember: false,
@@ -754,17 +790,17 @@ describe("keyAnswerProof", () => {
       return keyAnswerProof(s, CARD, ARMED, true, LATE, "ignored");
     };
     expect(by("1")).toMatchObject({ button: 0, answer: { kind: "approve" }, decision: "allow", remember: false, withReason: false, reason: null });
-    expect(by("2")).toMatchObject({ button: 1, answer: { kind: "deny" }, decision: "deny", remember: false, withReason: false, reason: "ignored" });
-    const shut = cardKey(entered(), key("2", ARMED)).state;
+    expect(by("3")).toMatchObject({ button: 2, answer: { kind: "deny" }, decision: "deny", remember: false, withReason: false, reason: "ignored" });
+    const shut = cardKey(entered(), key("3", ARMED)).state;
     expect(keyAnswerProof(shut, CARD, ARMED, true, LATE)?.reason).toBe("");
-    expect(by("3")).toMatchObject({ button: 2, answer: { kind: "always" }, decision: "allow", remember: true, withReason: false, reason: null });
+    expect(by("2")).toMatchObject({ button: 1, answer: { kind: "always" }, decision: "allow", remember: true, withReason: false, reason: null });
   });
 
   it("carries the reason for a deny from the reason field", () => {
     const open = cardKey(entered(), key("Tab", T0)).state;
     const s = cardKey(open, key("Enter", ARMED)).state;
     expect(keyAnswerProof(s, CARD, ARMED, true, LATE, "too broad")).toMatchObject({
-      button: 1,
+      button: 2,
       decision: "deny",
       remember: false,
       withReason: true,
@@ -834,8 +870,8 @@ describe("proofAnswers: a call that disagrees with its key proof sends nothing",
 
   it("the proof's own card, tab, decision and remember answer", () => {
     expect(proofAnswers(proofOf("1"), "perm-1", 1, "allow", false, "Bash(git status *)")).toBe(true);
-    expect(proofAnswers(proofOf("2"), "perm-1", 1, "deny", false, null)).toBe(true);
-    expect(proofAnswers(proofOf("3"), "perm-1", 1, "allow", true, "Bash(git status *)")).toBe(true);
+    expect(proofAnswers(proofOf("3"), "perm-1", 1, "deny", false, null)).toBe(true);
+    expect(proofAnswers(proofOf("2"), "perm-1", 1, "allow", true, "Bash(git status *)")).toBe(true);
   });
 
   it("another card, another tab, another decision or another remember do not", () => {
@@ -844,18 +880,18 @@ describe("proofAnswers: a call that disagrees with its key proof sends nothing",
     expect(proofAnswers(approve, "perm-1", 2, "allow", false, null)).toBe(false);
     expect(proofAnswers(approve, "perm-1", 1, "deny", false, null)).toBe(false);
     expect(proofAnswers(approve, "perm-1", 1, "allow", true, "Bash(git status *)")).toBe(false);
-    expect(proofAnswers(proofOf("3"), "perm-1", 1, "allow", false, "Bash(git status *)")).toBe(false);
+    expect(proofAnswers(proofOf("2"), "perm-1", 1, "allow", false, "Bash(git status *)")).toBe(false);
   });
 
   it("a lasting grant answers only under the rule the card showed at the press", () => {
-    const always = proofOf("3");
+    const always = proofOf("2");
     expect(always.rule).toBe("Bash(git status *)");
     expect(proofAnswers(always, "perm-1", 1, "allow", true, "Bash(git *)")).toBe(false);
     expect(proofAnswers(always, "perm-1", 1, "allow", true, null)).toBe(false);
     // An offer that named no rule text proves no grant of any rule.
-    expect(proofAnswers(proofOf("3", PROVIDER), "perm-1", 1, "allow", true, "Bash(git status *)")).toBe(false);
+    expect(proofAnswers(proofOf("2", PROVIDER), "perm-1", 1, "allow", true, "Bash(git status *)")).toBe(false);
     // Other answers carry no rule and need none.
     expect(proofOf("1").rule).toBeNull();
-    expect(proofOf("2").rule).toBeNull();
+    expect(proofOf("3").rule).toBeNull();
   });
 });

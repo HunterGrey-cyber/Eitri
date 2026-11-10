@@ -445,7 +445,9 @@ pub(crate) fn companion_hooks(parts: CompanionHookParts) -> PanelHooks {
             move |text: &str| toast(text)
         })),
         on_warning: Some(Box::new(move |text: &str| toast(text))),
-        on_editor_request: Some(Box::new(move |request: &ScratchRequest| editor_request(request))),
+        on_editor_request: Some(Box::new(move |request: &ScratchRequest| {
+            editor_request(request).map(|()| None)
+        })),
         set_editor_rpc: Some(editor_rpc),
         set_review_owner: Some(Box::new(move || review_owner())),
         on_review_open: Some(Box::new(move || review_open())),

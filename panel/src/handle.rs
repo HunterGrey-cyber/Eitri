@@ -366,6 +366,8 @@ impl AgentPanelHandle {
             state.view_jobs.retain(|job| job.asker.page() != Some(view));
             // A name being looked up answers a page that is gone.
             super::symbol_lookup::drop_view(&mut state, view);
+            // So is a request the editor has not answered: its answer would settle the next document's.
+            super::review_glue::drop_view(&mut state, view);
             if !state.shutting_down {
                 state.tabs.drop_bypass_prompt_in(view);
             }
@@ -1836,10 +1838,11 @@ impl AgentPanelHandle {
     }
 
     /// Where the scratch round trips (`Ctrl+g`, `gf`) hand nvim their request. The hook shows and
-    /// focuses the editor, then sends its keys; `Err` says why it could not. `main.rs` installs this once.
+    /// focuses the editor, then sends its keys; what it answers is [`super::EditorAnswer`]. `main.rs` installs this
+    /// once.
     pub fn on_editor_request(
         &self,
-        hook: impl Fn(&eitri_core::scratch::ScratchRequest) -> Result<(), String> + 'static,
+        hook: impl Fn(&eitri_core::scratch::ScratchRequest) -> super::EditorAnswer + 'static,
     ) {
         self.wake();
         self.state.borrow_mut().editor_request_hook = Some(Rc::new(hook));
@@ -3047,7 +3050,7 @@ mod tests {
         let seen = asked.clone();
         handle.on_editor_request(move |_| {
             *seen.borrow_mut() += 1;
-            Ok(())
+            Ok(None)
         });
         let why = handle.view_in_editor("init.lua lines", "x").unwrap_err();
         assert!(why.contains("scratch directory"), "{why}");

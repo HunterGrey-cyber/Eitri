@@ -25,6 +25,18 @@ describe("jumplist", () => {
     expect(forward(changed)).toBeNull();
     expect(recordJump(list, pos("a", 8)).entries).toEqual([pos("b"), pos("a", 8)]);
   });
+  it("keeps two places in one row apart, and one place scrolled a few pixels is still one", () => {
+    // G inside a long reply, from its top: Ctrl+o comes back to the top of the same row.
+    const top = pos("reply", 3, 0);
+    const list = recordJump(emptyJumplist(), top);
+    const trip = back(list, pos("reply", 3, 2400))!;
+    expect(trip.to).toEqual(top);
+    expect(forward(trip.list)!.to).toEqual(pos("reply", 3, 2400));
+    // Hunks of one edit row, walked with ]c: each is its own place to come back to.
+    const hunks = [0, 300, 650].reduce((l, offset) => recordJump(l, pos("edit", 5, offset)), emptyJumplist());
+    expect(hunks.entries.map((e) => e.offset)).toEqual([0, 300, 650]);
+    expect(recordJump(hunks, pos("edit", 5, 302)).entries.map((e) => e.offset)).toEqual([0, 650, 302]);
+  });
   it("keeps the newest 100 records, including when starting a trip at capacity", () => {
     let list = emptyJumplist();
     for (let i = 0; i < 101; i++) list = recordJump(list, pos(String(i), i));

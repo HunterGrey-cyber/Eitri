@@ -130,24 +130,54 @@ export function exportConversation(timeline: readonly TimelineItem[], options: E
   let first = 0;
   let omitted = 0;
   let rows = 0;
+  // The newest group is never dropped: alone over the cap, it is cut instead, at a line boundary where one keeps at
+  // least half the room.
+  let cut: { line: number; of: number; inside: boolean } | null = null;
+  const newest = bodies.length - 1;
   const restored = notLoadedLine(options.history);
   const capLine = () => {
-    if (omitted === 0 && rows === 0) return "";
+    if (omitted === 0 && rows === 0 && cut === null) return "";
     const turnsOut = counted(omitted, "earlier turn", "earlier turns");
     const rowsOut = counted(rows, "earlier row", "earlier rows");
-    const what = rows === 0 ? turnsOut : omitted === 0 ? rowsOut : `${rowsOut} and ${turnsOut}`;
-    return `(${what} left out: this view holds at most 1,000,000 characters)`;
+    const parts: string[] = [];
+    if (omitted > 0 || rows > 0) parts.push(`${rows === 0 ? turnsOut : omitted === 0 ? rowsOut : `${rowsOut} and ${turnsOut}`} left out`);
+    if (cut !== null) {
+      const subject = turns[newest].prompts > 0 ? "the newest turn" : "the rows kept";
+      parts.push(`${subject} cut ${cut.inside ? "inside" : "after"} line ${cut.line} of ${cut.of}`);
+    }
+    return `(${parts.join(", ")}: this view holds at most 1,000,000 characters)`;
   };
   const prefix = () => [restored, capLine()].filter(Boolean).join("\n");
   const length = () => {
     const note = prefix();
     return Math.max(0, size - 2) + note.length + (note && first < bodies.length ? 2 : 0);
   };
-  while (first < bodies.length && length() > MAX_CHARACTERS) {
+  while (first < newest && length() > MAX_CHARACTERS) {
     size -= bodies[first].length + 2;
     if (turns[first].prompts > 0) omitted += turns[first].prompts;
     else rows += turns[first].parts.length;
     first++;
+  }
+  if (newest >= 0 && length() > MAX_CHARACTERS) {
+    const body = bodies[newest];
+    const lines = body.split("\n").length;
+    // The note's longest form (every line kept) bounds the room the body has; the note it ends with is no longer.
+    cut = { line: lines, of: lines, inside: true };
+    const room = Math.max(0, MAX_CHARACTERS - (length() - body.length));
+    // A line boundary that would keep less than half the room (a short heading before one huge line) is no cut
+    // worth having: the cut goes inside that line instead.
+    let end = body.lastIndexOf("\n", room);
+    const inside = end <= 0 || end < room / 2;
+    if (inside) {
+      end = room;
+      // Never half a surrogate pair.
+      const unit = body.charCodeAt(end - 1);
+      if (end > 0 && unit >= 0xd800 && unit <= 0xdbff) end--;
+    }
+    const kept = body.slice(0, end);
+    cut = { line: kept.split("\n").length, of: lines, inside };
+    size -= body.length - kept.length;
+    bodies[newest] = kept;
   }
   return [prefix(), bodies.slice(first).join("\n\n")].filter(Boolean).join("\n\n");
 }

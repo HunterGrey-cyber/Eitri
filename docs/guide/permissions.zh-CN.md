@@ -1,5 +1,5 @@
 [English](permissions.md) | 简体中文
-<!-- translated-from: permissions.md sha256=5a07dd1ffce00c57ac816c6b0705cd63e7b85f91c92fa591598a0be2dc875e58 -->
+<!-- translated-from: permissions.md sha256=53dcf4c88362dbb06cc15dde06e31a7997afcae5f6cc4e88a55e3879e978f86b -->
 
 # 权限与信任
 
@@ -80,7 +80,7 @@ Eitri 自己的规则拿路径去对照项目目录来判断。有些文件夹�
 <a id="saved-rules"></a>
 ## 保存的规则
 
-一个普通 shell 命令的权限卡片可以带一个第三个按钮，“Always allow `git log *` in this project”。按下它，或在卡片模式里按 `3`，会保存一条规则并回答这张卡片。这个按钮属于 Eitri 自己的检查所画的卡片。Claude Code 运行它的 auto 模式时（这是通常的情况），Auto 标签页会把大多数调用交给那个模式，而不是画卡片，所以你在那里可能很少看到这个按钮；规则这时主要来自 Manual 标签页、Claude Code 运行在默认模式下的会话，或者来自手工编辑规则文件。
+一个普通 shell 命令的权限卡片可以带一个第三个按钮，“Always allow `git log *` in this project”，排在 Approve 和 Deny 中间。按下它，或在卡片模式里按 `2`（这时拒绝是 `3`），会保存一条规则并回答这张卡片。这个按钮属于 Eitri 自己的检查所画的卡片。Claude Code 运行它的 auto 模式时（这是通常的情况），Auto 标签页会把大多数调用交给那个模式，而不是画卡片，所以你在那里可能很少看到这个按钮；规则这时主要来自 Manual 标签页、Claude Code 运行在默认模式下的会话，或者来自手工编辑规则文件。
 
 - **规则长什么样。** 它按 Claude Code 的写法来写，`Bash(git log *)`，并且匹配完整的开头单词：`cargo test *` 允许 `cargo test --release`，但不允许 `cargo testx`。只有 `Bash` 有规则；其他任何工具都没有。
 - **按钮提供什么。** 命令的第一个单词，再加上第二个单词（当它是个普通单词时），所以 `git log --oneline` 提供 `git log *`，`uname -a` 提供 `uname *`。当一个选项出现在后面的普通单词之前（`git -C sub log`）时，什么都不提供，因为只用第一个单词会覆盖每一个子命令。按钮只出现在规则能起作用的地方：对于只因为它的第一个单词（或它的 `git` 子命令）不是已知只读的才询问的命令。因为其他任何原因而询问的命令没有第三个按钮。

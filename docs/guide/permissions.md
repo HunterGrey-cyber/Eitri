@@ -147,7 +147,7 @@ own, such as `eitri ~/notes.md`. It applies to every window on such a folder, ho
 ## Saved rules
 
 A permission card for a plain shell command can carry a third button, "Always allow `git log *` in this
-project". Pressing it, or `3` in card mode, saves a rule and answers the card. The button belongs to the cards Eitri's own checks
+project", between Approve and Deny. Pressing it, or `2` in card mode (where Deny is then `3`), saves a rule and answers the card. The button belongs to the cards Eitri's own checks
 draw. Where Claude Code runs its auto mode, which is the usual case, an Auto tab hands most calls to that mode
 instead of drawing a card, so you may rarely see the button there; a rule then comes mainly from a Manual tab,
 a session where Claude Code runs in its default mode, or from editing the rules file by hand.

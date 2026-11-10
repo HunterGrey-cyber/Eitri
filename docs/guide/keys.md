@@ -225,7 +225,7 @@ bound to) is left out, and Eitri lists it at startup with the call as you wrote 
 |---|---|
 | `<prefix> f` | HINT: jump anywhere in the window (see [HINT](#hint)) |
 | `<prefix> r` | reload the agent panel; the session keeps running |
-| `<prefix> ?` | the full list of keys, in the panel, starting at "After <prefix>" (from a plugin page, its own keys come first); the chat's own `F1` starts at "This panel". Closing it with `?`, `Esc`, `q` or a click outside gives the keys back to the module that had them, and puts back a zoom or a hidden chat that opening it changed |
+| `<prefix> ?` | the full list of keys, in the panel, starting at "After <prefix>" (from a plugin page, its own keys come first); the chat's own `F1` starts at the section of the mode you pressed it in ("This panel" from BROWSE). Closing it with `?`, `Esc`, `q` or a click outside gives the keys back to the module that had them, and puts back a zoom or a hidden chat that opening it changed |
 | `<prefix> :` | the panel's `:` command line (see [The command line](#the-command-line)) |
 | `<prefix> Ctrl+h`, `Ctrl+j`, `Ctrl+k`, `Ctrl+l` | send that chord itself to whatever has the keys; the bare chords below are Eitri's |
 
@@ -792,7 +792,7 @@ of an agent you registered, `/model` and `/effort` choose from the options the a
 | `]c` / `[c` | the next / the previous hunk of an edit's diff (opens the diff) |
 | `Ctrl+o` / `Ctrl+i` | back / forward through the places you jumped from, in this tab |
 | `Alt-n` / `Alt-p` | card mode for the next / the previous card waiting in this tab (see [Answering a card](#answering-a-card)) |
-| `a`, `d`, `D`, `]p`, `[p` | nothing: each says that cards are answered in card mode, and where |
+| `a`, `d`, `D`, `]p`, `[p` | nothing: `]p` and `[p` say that cards are on `Alt-n` / `Alt-p` now; `a`, `d` and `D` on a card's row (or a tool row a card waits on) say that cards are answered in card mode, and elsewhere that they are not a key |
 | `Ctrl+d` / `Ctrl+u` | half a page down / up |
 | `Ctrl+e` / `Ctrl+y` | one line down / up |
 | `Ctrl+f` or `PageDown` / `PageUp` | a view down / up (`Ctrl+b` is the prefix, so `PageUp` is the way back) |
@@ -800,7 +800,7 @@ of an agent you registered, `/model` and `/effort` choose from the options the a
 | `Enter`, or `za` | show or hide a tool's result, or a collapsed run of calls; for the other effects of `Enter` see below |
 | `zo` / `zc` | open / close that fold only |
 | `zh` / `zl` | scroll this row's table left / right |
-| `zi` | the detailed view: every result, longer excerpts, no collapsed runs (per tab) |
+| `zi` | the detailed view: every result, longer excerpts, no collapsed runs (per tab); a folded output says `zi for all` (in the box, `Ctrl+o for all`) |
 | `yy`, `Y` | copy the row (the message, command or path), or the code block HINT landed on |
 | `y` and an object or motion, `gy` | copy part of a row, or several rows (see [Copying with `y`](#copying-with-y)) |
 | `Ctrl+g` | open this row's whole text in a scratch buffer in Neovim; on a pending edit card for one file (a Claude `Edit`, `MultiEdit` or `Write`, a Codex change that adds one file, an ACP agent's edit of one file), the file as it is on disk beside the file as the edit would leave it, read-only, in a new Neovim tab page (`q` closes it; see [Reviewing a turn](turn-review.md#before-you-approve)); on a card of an agent's [proposal](editor-tools.md#proposals), the same view of one of its files, the next file at each press; any other card shows its text, as before |
@@ -833,7 +833,7 @@ keys to the question box. On a tool row with a live background task it opens tha
 hides a result.
 
 **Searching.** `/` searches forward and `?` backward from the cursor, as in vim: the match follows what you type, and the
-search wraps. `n` goes on in the direction you searched, `N` the other way. In the caret and in Visual, `/` and `?`
+search wraps. On a row taller than the view, the line holding the match is brought on screen, below the pinned prompt. `n` goes on in the direction you searched, `N` the other way. In the caret and in Visual, `/` and `?`
 end the selection and search from the caret's row.
 
 **Jumping by structure.** `]t` and `[t` step between tool calls (a collapsed run is one stop; the note names its first
@@ -847,7 +847,8 @@ wrap. `]p` and `[p`, which used to walk the waiting cards, now say that cards ar
 **Jumps.** `gg`, `G`, accepting a search, `n`, `N`, `[[`, `]]`, the structure jumps, a HINT landing and `Alt-n` (from
 the place card mode was entered) each remember the row you left and its position in it. `Ctrl+o` goes back through them
 and `Ctrl+i` forward, as in vim: a tab keeps up to 100 while the panel runs, a new jump after going back drops the ones
-ahead, and a row that is gone lands on the nearest one. With nothing older or newer the band says `no older jump` or
+ahead, and a row that is gone lands on the nearest one. Two places in one long row (its top, and its end after `G`) are
+two jumps. With nothing older or newer the band says `no older jump` or
 `no newer jump`. `Tab` is not `Ctrl+i` here. In BROWSE `Ctrl+o` no longer shows the detailed view: that is `zi`; the
 box keeps `Ctrl+o` for it.
 
@@ -873,7 +874,7 @@ it, and the band says `copied N chars`. Nothing waits after a copy: the key you 
 | `` yi` `` / `` ya` ``, `gy` | the row's code block, code only / fenced with its language (`gy` is `` yi` ``) | a reply with a code block |
 | `yif` / `yaf` | the path or URL / with `:line` | a row with a path or link |
 | `yih` / `yah` | the edit's current hunk (the one `]c` last landed on) / with the file's path as a header line | an edit with a diff |
-| `y` then a motion | the rows from the cursor's through the motion's target, each as `yy` gives it, with a blank line between; the cursor does not move. The motions are `j`, `k`, `{`, `}`, `G`, `gg`, `[[`, `]]`, with a count (`y2j` is three rows, `y3]]`) | any |
+| `y` then a motion | the rows from the cursor's through the motion's target, each as `yy` gives it, with a blank line between; the cursor does not move. The motions are `j`, `k`, `{`, `}`, `G`, `gg`, `[[`, `]]`, with a count (`y2j` is three rows, `y3]]`; a count before `y` multiplies the one after it, so `2y3j` is `y6j`) | any |
 
 With several code blocks, paths or hunks on the row, labels appear on them as for `gf`: type a label's letters,
 `Backspace` deletes one, and any other key cancels. A copy on the wrong kind of row says what would work:
@@ -897,7 +898,9 @@ that name.
   nearest the cited line wins, else you pick by letter. With no match, the cited `path:line` opens, else the band says
   why: `gd: no language server attached for this project (open one of its files)`, `gd: gopls has no symbol
   TestMeshFieldsOmittedWhenZero` or `gd: rust-analyzer is still indexing — try again`. A server that has just started may
-  answer empty at first, so `gd` asks again for up to three seconds before it gives up.
+  answer empty at first, so `gd` asks again for up to three seconds before it gives up. An answer that comes once you
+  have moved on (you are typing in the box, card mode holds the keys, a float or a pick is open, another pane has the
+  keys) opens nothing: the band names the place, `gd: src/lib.rs:12 — gd again to open`.
 
 `gd` never opens a file to start a language server, so it needs one you have already used in this project. For
 rust-analyzer only, a name it cannot find is searched as a definition (`fn`, `struct`, `enum`, `trait` and the like) in
@@ -1015,8 +1018,9 @@ A permission card waits for you in the conversation, next to the tool call it ga
 the card holds the keys, and only a digit, or `Enter` on a button you chose, answers it. No letter answers a card, and
 nothing in the box does.
 
-**Entering card mode.** A card never takes it by itself. When one arrives the cursor goes to it, as before, and the band
-says `Enter or Alt-n: card mode, then 1-3`.
+**Entering card mode.** A card never takes it by itself. When one arrives the cursor goes to it, as before, and the
+activity line above the box says `⚑ Bash needs approval — Enter or Alt-n: card mode, then 1-3` (`Alt-n: card mode,
+then 1-3` when the cursor is elsewhere).
 
 | from | keys | which card |
 |---|---|---|
@@ -1028,15 +1032,17 @@ Entering highlights no button. With no card waiting, `Alt-n` says `no card waiti
 there (`a question waits — j to it, Enter`), because questions have their own box and are not in the ring. `Alt-n` and
 `Alt-p` cannot be rebound.
 
-**In card mode** the card takes an accent ring, and its buttons show their digits.
+**In card mode** the card takes an accent ring, its buttons show their digits, and the band's mode block reads `CARD`
+(`CD` when the panel is narrow). In a narrow panel a refused key's note takes the room of the mode's word and then of
+`card 1/2`, so it is never cut away.
 
 | keys | what they do |
 |---|---|
-| `1` `2` `3` | answer: **1 Approve, 2 Deny, 3 Always allow**. Deny is `2` on every card. `3` exists only where the card offers a saved rule, and it is the keyboard way to save one ([Saved rules](permissions.md#saved-rules)); an editor-tools, Codex or other agent's card has `1` and `2` only. A digit with no button says `4: this card has 2 answers` |
+| `1` `2` `3` | answer in Claude Code's order. Where the card offers a saved rule: **1 Approve, 2 Always allow, 3 Deny**; `2` is the keyboard way to save one ([Saved rules](permissions.md#saved-rules)). On every other card, an editor-tools, Codex or other agent's card included: **1 Approve, 2 Deny**. So Deny is always the last digit, as the buttons show it. A digit with no button says `4: this card has 2 answers` |
 | `h` `l`, `Left` `Right` | move the highlight between the buttons; nothing is highlighted when you enter |
 | `0` `^` / `$` | highlight the first / the last button |
 | `Enter` | answer with the highlighted button, as its digit does. With nothing highlighted: `Enter: no button picked — 1-3, or h/l then Enter` |
-| `Tab` | open the reason field (a Claude card only; the others say they take no reason, and `2` denies). `Enter` there denies with the reason; `Esc` or `Tab` closes it and keeps the text, which `2` then sends too |
+| `Tab` | open the reason field (a Claude card only; the others say they take no reason, and which digit denies). `Enter` there denies with the reason; `Esc` or `Tab` closes it and keeps the text, which the Deny digit then sends too |
 | `Esc`, `Ctrl+[`, `Ctrl+c` | leave card mode, the card still waiting. `Ctrl+c` interrupts nothing here |
 | `Alt-n` / `Alt-p` | go to the next / the previous waiting card; this one keeps waiting |
 | `j` `k`, `Ctrl+d` `Ctrl+u` | scroll a card taller than the view |
@@ -1056,11 +1062,14 @@ changed — Alt-n or Enter again`.
 **Leaving.** After an answer you are back where you came from: the box, with the caret where it was, or BROWSE on the
 row you left. It never moves on to the next card; when more wait, the band says `2 more waiting — Alt-n`. Card mode also
 ends, the card unanswered, when the card is answered somewhere else (a click, your phone) or withdrawn, when you switch
-tab, and when anything else takes the keys: a float over the panel, the list of keys, the review, a question or a pick.
+tab, and when anything else takes the keys: a float over the panel, the list of keys, the review, a `y/n` question or a
+pick. A `gd` or `gf` answer that arrives while card mode holds the keys opens nothing: the band says
+`gd: press Esc to leave the card first` (or names the one place found), and after `Esc` you press `gd` or `gf` again.
 A card of a session that has ended cannot be answered.
 
-**The old keys.** `a`, `d` and `D` in BROWSE, `]p` and `[p`, and `Ctrl+y` in the box answer nothing; each says where the
-card keys are now. A card from an agent's [editor tools](editor-tools.md#cards) goes the same way. The mouse works as it
+**The old keys.** `a`, `d` and `D` in BROWSE, `]p` and `[p`, and `Ctrl+y` in the box answer nothing. `]p`, `[p` and
+`Ctrl+y` say where the card keys are now; `a`, `d` and `D` say so on a card's row or a tool row a card waits on, and
+elsewhere say they are not a key. A card from an agent's [editor tools](editor-tools.md#cards) goes the same way. The mouse works as it
 always did: a click on a button with the pointer answers; `Enter` or `Space` on a focused button does not. The `y/n`
 questions Eitri asks (entering Bypass, stopping a turn, closing a tab) are not cards and keep `y` and `n`.
 

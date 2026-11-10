@@ -253,9 +253,88 @@ describe("gd on the page", () => {
     expect(container.textContent).not.toContain("gd: no answer in 3 s");
     answer([match("a.rs", 1)]); expect(last("open_path")).toBeUndefined();
   });
+  it("a late single match while typing in the box opens nothing and names the place", () => {
+    const { gd, press, container } = setup("Name"); press("v"); gd();
+    expect(last("editor_symbol")).toMatchObject({ name: "Name" });
+    act(() => vi.advanceTimersByTime(1000));
+    press("i");
+    const box = container.querySelector<HTMLTextAreaElement>("textarea")!;
+    expect(document.activeElement).toBe(box);
+    fireEvent.keyDown(box, { key: "x" }); fireEvent.keyUp(box, { key: "x" });
+    answer([match("src/a.rs", 7)]);
+    expect(last("open_path")).toBeUndefined();
+    expect(container.querySelector(".band-message")?.textContent).toBe("gd: src/a.rs:7 — gd again to open");
+    expect(document.activeElement).toBe(box);
+  });
+  it("a late cited fallback while typing in the box opens nothing either", () => {
+    const { gd, press, container } = setup("Name at mesh.go:142"); press("v"); gd();
+    act(() => vi.advanceTimersByTime(1000));
+    press("i");
+    expect(document.activeElement?.tagName).toBe("TEXTAREA");
+    answer([], { kind: "no_client" });
+    expect(last("open_path")).toBeUndefined();
+    expect(container.querySelector(".band-message")?.textContent).toBe("gd: mesh.go:142 — gd again to open");
+  });
+  it("a late single match after the pane lost the keys opens nothing", () => {
+    const { gd, press } = setup("Name"); press("v"); gd();
+    dispatch({ kind: "pane_focus", focused: false });
+    answer([match("src/a.rs", 7)]);
+    expect(last("open_path")).toBeUndefined();
+  });
   it("ignores symbol answers after switching tabs", () => {
     const { gd, press } = setup("Name"); press("v"); gd();
     dispatch({ kind: "tabs", tabs: [TAB, { ...TAB, id: 2, number: 2 }], active: 2 });
     answer([match("a.rs", 1)]); expect(last("open_path")).toBeUndefined();
+  });
+});
+
+describe("a lookup answered while card mode holds the keys", () => {
+  /** A card waiting in the same tab, then card mode on it by `Alt+n` from BROWSE. */
+  function cardMode(container: HTMLElement) {
+    const input = { command: "rm build" };
+    dispatch({ kind: "events", tab: 1, fromRevision: 2, throughRevision: 5, events: [
+      { type: "turn_started", turn_id: "t1" },
+      { type: "tool_call_started", turn_id: "t1", tool_use_id: "toolu_1", name: "Bash", input },
+      { type: "permission_requested", permission_id: "perm-1", tool_use_id: "toolu_1", tool_name: "Bash", input },
+    ] });
+    act(() => vi.advanceTimersByTime(1000));
+    const root = container.querySelector<HTMLElement>(".agent-ui-conversation")!;
+    if (document.activeElement !== root) act(() => root.focus());
+    fireEvent.keyDown(document.activeElement ?? root, { key: "n", altKey: true, code: "KeyN" });
+    expect(container.querySelector(".permission-card-mode"), "card mode holds the keys").not.toBeNull();
+  }
+  const bandText = (container: HTMLElement) => container.querySelector(".band-message")?.textContent ?? null;
+
+  it("a gd name with several definitions opens no pick over the card, and card mode stays", () => {
+    const { gd, press, container } = setup("Name"); press("v"); gd();
+    expect(last("editor_symbol")).toMatchObject({ name: "Name" });
+    cardMode(container);
+    const opens = posted.filter((p) => p.type === "open_path").length;
+    answer([match("src/a.rs", 3), match("src/b.rs", 9)]);
+    expect(container.querySelector(".path-pick")).toBeNull();
+    expect(container.querySelector(".permission-card-mode")).not.toBeNull();
+    expect(bandText(container)).toBe("gd: press Esc to leave the card first");
+    expect(posted.filter((p) => p.type === "open_path")).toHaveLength(opens);
+  });
+
+  it("a gd name with one definition opens nothing over the card, and card mode stays", () => {
+    const { gd, press, container } = setup("Name"); press("v"); gd();
+    cardMode(container);
+    answer([match("src/a.rs", 3)]);
+    expect(last("open_path")).toBeUndefined();
+    expect(container.querySelector(".permission-card-mode")).not.toBeNull();
+    expect(bandText(container)).toBe("gd: src/a.rs:3 — gd again to open");
+  });
+
+  it("gf's several matching files open no pick over the card, and card mode stays", () => {
+    const { press, container } = setup("see a.go", true); press("g"); press("f");
+    const request = last("open_path")!;
+    expect(request).toMatchObject({ path: "a.go" });
+    cardMode(container);
+    dispatch({ kind: "path_choices", requestId: request.request_id, tab: 1, paths: [{ path: "src/a.go", line: null }, { path: "test/a.go", line: null }] });
+    expect(container.querySelector(".path-pick")).toBeNull();
+    expect(container.querySelector(".permission-card-mode")).not.toBeNull();
+    expect(bandText(container)).toBe("gf: press Esc to leave the card first");
+    expect(posted.filter((p) => p.type === "open_path")).toHaveLength(1);
   });
 });

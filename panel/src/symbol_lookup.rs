@@ -51,6 +51,13 @@ const MAX_WORKERS: usize = 12;
 const CITED_FILE_MAX: u64 = 1_000_000;
 const GOPLS: &str = "gopls";
 const RUST_ANALYZER: &str = "rust-analyzer";
+/// What nvim-lspconfig (and `vim.lsp.config`) names the rust-analyzer client; rustaceanvim names it `rust-analyzer`.
+const RUST_ANALYZER_LSPCONFIG: &str = "rust_analyzer";
+
+/// Whether a client is rust-analyzer, under either spelling and in any case.
+fn is_rust_analyzer(client: &str) -> bool {
+    client.eq_ignore_ascii_case(RUST_ANALYZER) || client.eq_ignore_ascii_case(RUST_ANALYZER_LSPCONFIG)
+}
 
 /// A name as the page sent it, and what servers are asked and matched against.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -85,7 +92,8 @@ fn wanted(name: &str) -> Wanted {
 }
 
 /// The query every server is asked, and the servers worded otherwise: gopls takes a qualified name itself
-/// (`pkg.Name`, `Type.Method`); rust-analyzer's `name#` searches all its symbols, functions included.
+/// (`pkg.Name`, `Type.Method`); rust-analyzer's `name#` searches all its symbols, functions included, and goes under
+/// both of the names its client is given.
 fn queries(wanted: &Wanted) -> (String, Vec<(String, String)>) {
     let gopls = if wanted.name.contains("::") {
         wanted.last.clone()
@@ -97,6 +105,7 @@ fn queries(wanted: &Wanted) -> (String, Vec<(String, String)>) {
         vec![
             (GOPLS.to_owned(), gopls),
             (RUST_ANALYZER.to_owned(), format!("{}#", wanted.last)),
+            (RUST_ANALYZER_LSPCONFIG.to_owned(), format!("{}#", wanted.last)),
         ],
     )
 }
@@ -355,6 +364,14 @@ impl Lookup {
         self.clients.iter().any(|name| name == client)
     }
 
+    /// rust-analyzer's client among those asked, as the client names itself.
+    fn analyzer(&self) -> Option<&str> {
+        self.clients
+            .iter()
+            .map(String::as_str)
+            .find(|name| is_rust_analyzer(name))
+    }
+
     /// The one server a message names: none when several were asked, since an answer does not say whose it is.
     fn server(&self) -> Option<String> {
         match self.clients.as_slice() {
@@ -585,7 +602,7 @@ impl Lookup {
             self.clients = clients;
         }
         self.busy = busy;
-        if self.text.is_some() || self.text_found.is_some() || !self.has(RUST_ANALYZER) {
+        if self.text.is_some() || self.text_found.is_some() || self.analyzer().is_none() {
             return;
         }
         let (root, name) = (self.root.clone(), self.wanted.last.clone());
@@ -663,7 +680,7 @@ impl Lookup {
     /// would be every item of that name), else the servers are asked again while time is left.
     fn no_exact(&mut self, cx: &mut Cx<'_>) -> Flow {
         self.take_text();
-        if self.has(RUST_ANALYZER) && self.inexact && self.wanted.qualifier.is_none() {
+        if self.analyzer().is_some() && self.inexact && self.wanted.qualifier.is_none() {
             if let Some(found) = self.text_found.as_ref().filter(|found| !found.is_empty()) {
                 return Flow::Reply(Ok(found.clone()));
             }
@@ -678,7 +695,7 @@ impl Lookup {
     /// The servers have had their time. A text search still out is waited for until the reply's last moment.
     fn finish(&mut self, now: Instant) -> Flow {
         self.take_text();
-        if self.has(RUST_ANALYZER) && self.text.is_some() && now < self.end() + GRACE {
+        if self.analyzer().is_some() && self.text.is_some() && now < self.end() + GRACE {
             self.stage = Stage::Texting;
             return Flow::Wait;
         }
@@ -687,8 +704,11 @@ impl Lookup {
 
     /// The server a lookup reports as indexing: rust-analyzer when it is among those reporting work, else the first.
     fn busy_server(&self) -> Option<String> {
-        if self.has(RUST_ANALYZER) && self.busy.iter().any(|name| name == RUST_ANALYZER) {
-            return Some(RUST_ANALYZER.to_owned());
+        if let Some(analyzer) = self
+            .analyzer()
+            .filter(|analyzer| self.busy.iter().any(|name| name == analyzer))
+        {
+            return Some(analyzer.to_owned());
         }
         self.busy.first().cloned()
     }
@@ -698,13 +718,12 @@ impl Lookup {
     /// no answer held any item, `indexing`: servers answer empty while they index); a server still reporting work,
     /// `indexing`; nothing at all, `timeout`.
     fn verdict(&self) -> Reply {
-        let analyzer = self.has(RUST_ANALYZER);
-        if analyzer {
+        if let Some(analyzer) = self.analyzer() {
             if let Some(found) = self.text_found.as_ref().filter(|found| !found.is_empty()) {
                 return Ok(found.clone());
             }
             if self.held {
-                return Err(error("indexing", Some(RUST_ANALYZER.to_owned())));
+                return Err(error("indexing", Some(analyzer.to_owned())));
             }
         }
         if self.answered && (self.had_items || self.busy.is_empty()) {
@@ -1032,7 +1051,8 @@ mod tests {
                 worded,
                 [
                     (GOPLS.to_owned(), gopls.to_owned()),
-                    (RUST_ANALYZER.to_owned(), analyzer.to_owned())
+                    (RUST_ANALYZER.to_owned(), analyzer.to_owned()),
+                    (RUST_ANALYZER_LSPCONFIG.to_owned(), analyzer.to_owned())
                 ],
                 "{name}"
             );
@@ -1155,7 +1175,10 @@ mod tests {
         assert_eq!(run.rpc.last_arg("query").unwrap().as_str(), Some("Foo"));
         assert_eq!(run.rpc.last_arg("load").unwrap().as_bool(), Some(false));
         let per = run.rpc.last_arg("query_for").unwrap();
-        assert_eq!(per, json!({"gopls": "pkg.Foo", "rust-analyzer": "Foo#"}));
+        assert_eq!(
+            per,
+            json!({"gopls": "pkg.Foo", "rust-analyzer": "Foo#", "rust_analyzer": "Foo#"})
+        );
     }
 
     #[test]
@@ -1278,6 +1301,41 @@ mod tests {
         ));
         run.at(100);
         assert_eq!(run.matches(), [("src/lib.rs".to_owned(), 1, "text")]);
+    }
+
+    #[test]
+    fn rust_analyzer_under_lspconfigs_name_is_rust_analyzer() {
+        for name in ["rust_analyzer", "rust-analyzer", "Rust_Analyzer"] {
+            assert!(is_rust_analyzer(name), "{name}");
+        }
+        assert!(!is_rust_analyzer("rust") && !is_rust_analyzer("rust-analyzer-proxy"));
+        // Held past the budget: its text matches, as for the hyphenated name.
+        let root = project(
+            "gd-ra-underscore",
+            &[
+                ("src/lib.rs", "mod a;\n"),
+                ("src/a.rs", "pub(crate) fn effective() {}\n"),
+            ],
+        );
+        let mut run = Run::new(&root, "effective", None);
+        run.settle();
+        run.rpc.answer(started(&["rust_analyzer"], &["rust_analyzer"]));
+        run.at(0);
+        run.text_settles();
+        run.hold_to_the_end(done("workspace_symbols", vec![], &["workspace_symbols"]));
+        assert_eq!(run.matches(), [("src/a.rs".to_owned(), 1, "text")]);
+    }
+
+    #[test]
+    fn rust_analyzer_under_lspconfigs_name_held_with_no_text_match_is_indexing_by_its_own_name() {
+        let root = project("gd-ra-underscore-indexing", &[("src/lib.rs", "fn other() {}\n")]);
+        let mut run = Run::new(&root, "effective", None);
+        run.settle();
+        run.rpc.answer(started(&["rust_analyzer"], &[]));
+        run.at(0);
+        run.text_settles();
+        run.hold_to_the_end(done("workspace_symbols", vec![], &["workspace_symbols"]));
+        assert_eq!(run.error(), ("indexing", Some("rust_analyzer".to_owned())));
     }
 
     #[test]

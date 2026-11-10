@@ -641,6 +641,9 @@ pub struct Window1Editor {
 struct WritingView {
     rx: mpsc::Receiver<std::io::Result<ScratchRequest>>,
     token: Option<String>,
+    /// The window and the id to answer with [`Msg::EditorShown`] once the view is written and handed to the editor,
+    /// when the request asked for an answer.
+    answer: Option<(PeerId, u64)>,
 }
 
 impl Window1Editor {
@@ -840,9 +843,16 @@ impl Window1Editor {
         });
         let me = self.me.clone();
         link.on("editor", move |_, msg, _| {
-            if let (Some(me), Msg::Editor { request, token }) = (me.upgrade(), msg) {
-                if let Err(why) = me.request(peer, request, token) {
+            if let (Some(me), Msg::Editor { request, token, answer }) = (me.upgrade(), msg) {
+                // A view is answered once it is written and handed to the editor (`show_written_views`); every
+                // other request, and a view refused before its write began, here.
+                let view = matches!(request, EditorRequest::View { .. });
+                let result = me.request(peer, request, token, answer);
+                if let Err(why) = &result {
                     eprintln!("[link] {}'s editor request was refused: {why}", me.window_text(peer));
+                }
+                if let Some(id) = answer.filter(|_| !view || result.is_err()) {
+                    me.send(peer, Msg::EditorShown { id, why: result.err() });
                 }
             }
         });
@@ -949,7 +959,13 @@ impl Window1Editor {
         }
     }
 
-    fn request(&self, peer: PeerId, request: EditorRequest, token: Option<String>) -> Result<(), String> {
+    fn request(
+        &self,
+        peer: PeerId,
+        request: EditorRequest,
+        token: Option<String>,
+        answer: Option<u64>,
+    ) -> Result<(), String> {
         let drive = self
             .drive
             .borrow()
@@ -985,7 +1001,11 @@ impl Window1Editor {
                         let _ = tx.send(file.write(&text));
                     })
                     .map_err(|e| format!("could not write the scratch file: {e}"))?;
-                self.views.borrow_mut().push(WritingView { rx, token });
+                self.views.borrow_mut().push(WritingView {
+                    rx,
+                    token,
+                    answer: answer.map(|id| (peer, id)),
+                });
                 self.poll_soon();
                 Ok(())
             }
@@ -1108,7 +1128,8 @@ impl Window1Editor {
     }
 
     /// Hands the editor each view whose file is written, in the order the views came: one written early waits for
-    /// the one before it. A failed write, or a worker that stopped, is logged, as a refused request is.
+    /// the one before it. A failed write, or a worker that stopped, is logged, as a refused request is, and a view
+    /// that asked for an answer is answered with how it went.
     fn show_written_views(&self) {
         loop {
             let written = {
@@ -1128,8 +1149,11 @@ impl Window1Editor {
                 let drive = drive.ok_or("this window has no editor to drive")?;
                 drive(EditorAct::Request(&request), view.token)
             });
-            if let Err(why) = shown {
+            if let Err(why) = &shown {
                 eprintln!("[link] another window's view was not shown: {why}");
+            }
+            if let Some((peer, id)) = view.answer {
+                self.send(peer, Msg::EditorShown { id, why: shown.err() });
             }
         }
     }
@@ -1529,6 +1553,9 @@ pub struct Window2Editor {
     /// order they were asked for.
     views: RefCell<Vec<ReadingView>>,
     polling: Cell<bool>,
+    /// Views sent to window 1 whose outcome the panel waits for, by the id window 1 answers with.
+    answers: RefCell<BTreeMap<u64, mpsc::Sender<Result<(), String>>>>,
+    next_answer: Cell<u64>,
 }
 
 /// A view on its way to window 1: its file in this window's scratch directory is read on a worker thread, since
@@ -1538,6 +1565,8 @@ struct ReadingView {
     title: String,
     tab: bool,
     token: Option<String>,
+    /// Where the outcome goes when the panel waits for it: window 1's answer, or why the view never reached it.
+    answer: Option<mpsc::Sender<Result<(), String>>>,
 }
 
 impl Window2Editor {
@@ -1563,6 +1592,8 @@ impl Window2Editor {
             repeat,
             views: RefCell::default(),
             polling: Cell::new(false),
+            answers: RefCell::default(),
+            next_answer: Cell::new(1),
         })
     }
 
@@ -1665,6 +1696,15 @@ impl Window2Editor {
             }
         });
         let me = self.me.clone();
+        link.on("editor_shown", move |_, msg, _| {
+            if let (Some(me), Msg::EditorShown { id, why }) = (me.upgrade(), msg) {
+                let waiting = me.answers.borrow_mut().remove(&id);
+                if let Some(waiting) = waiting {
+                    let _ = waiting.send(why.map_or(Ok(()), Err));
+                }
+            }
+        });
+        let me = self.me.clone();
         link.on("follow", move |_, msg, _| {
             let (Some(me), Msg::Follow { owner, line }) = (me.upgrade(), msg) else {
                 return;
@@ -1685,6 +1725,10 @@ impl Window2Editor {
     pub fn unlinked(&self) {
         self.link.borrow_mut().take();
         self.ops.unlinked();
+        // A view window 1 had not answered for has no answer coming: the panel hears that the link ended.
+        for (_, waiting) in std::mem::take(&mut *self.answers.borrow_mut()) {
+            let _ = waiting.send(Err(UNLINKED_NOTE.to_string()));
+        }
         self.set_context(None);
         let drafts = std::mem::take(&mut *self.drafts.borrow_mut());
         for draft in drafts {
@@ -1720,6 +1764,26 @@ impl Window2Editor {
     /// The panel's request for nvim, sent to window 1 as an editor request with `token` (an activation token, so
     /// window 1 may come forward). `Err` says why it was not sent, for the panel to show.
     pub fn request(&self, request: &ScratchRequest, token: &dyn Fn() -> Option<String>) -> Result<(), String> {
+        self.ask(request, token, false).map(|_| ())
+    }
+
+    /// [`request`](Self::request), with a view's outcome to come: `Ok(Some(later))` hears window 1's answer once it
+    /// has written the view and handed it to its editor, or why the view never got there. Every other request is
+    /// `Ok(None)` once sent.
+    pub fn request_answered(
+        &self,
+        request: &ScratchRequest,
+        token: &dyn Fn() -> Option<String>,
+    ) -> Result<Option<mpsc::Receiver<Result<(), String>>>, String> {
+        self.ask(request, token, true)
+    }
+
+    fn ask(
+        &self,
+        request: &ScratchRequest,
+        token: &dyn Fn() -> Option<String>,
+        answered: bool,
+    ) -> Result<Option<mpsc::Receiver<Result<(), String>>>, String> {
         let link = self.link.borrow().clone();
         let Some(link) = link.filter(LinkDriver::linked) else {
             return Err(UNLINKED_NOTE.to_string());
@@ -1771,14 +1835,21 @@ impl Window2Editor {
                         let _ = tx.send(std::fs::read_to_string(&path));
                     })
                     .map_err(|e| format!("could not read {}: {e}", body.display()))?;
+                let (answer, later) = if answered {
+                    let (tx, rx) = mpsc::channel();
+                    (Some(tx), Some(rx))
+                } else {
+                    (None, None)
+                };
                 self.views.borrow_mut().push(ReadingView {
                     rx,
                     title: view_title(&body),
                     tab,
                     token: token(),
+                    answer,
                 });
                 self.poll_views_soon();
-                return Ok(());
+                return Ok(later);
             }
             ScratchAsk::Diff { base, proposed, name } => (
                 EditorRequest::Diff {
@@ -1793,6 +1864,7 @@ impl Window2Editor {
             Msg::Editor {
                 request,
                 token: token(),
+                answer: None,
             },
             Vec::new(),
         )
@@ -1800,7 +1872,7 @@ impl Window2Editor {
         if let Some(waiting) = waiting {
             self.drafts.borrow_mut().push(waiting);
         }
-        Ok(())
+        Ok(None)
     }
 
     /// The text of a file the panel wrote for the editor, read only from this window's own scratch directory: what
@@ -1841,9 +1913,9 @@ impl Window2Editor {
         );
     }
 
-    /// Sends window 1 each view whose text is read, in the order they were asked for. The page heard its request
-    /// was taken when it was; a read that failed, or a link that ended meanwhile, is logged. Whether any is still
-    /// being read.
+    /// Sends window 1 each view whose text is read, in the order they were asked for. A read that failed, or a link
+    /// that ended meanwhile, is logged, and told to a panel waiting for the view's outcome; one sent asks window 1
+    /// to answer how it went. Whether any is still being read.
     fn poll_views(&self) -> bool {
         loop {
             let read = {
@@ -1859,6 +1931,11 @@ impl Window2Editor {
             };
             let view = self.views.borrow_mut().remove(0);
             let link = self.link.borrow().clone().filter(LinkDriver::linked);
+            let id = view.answer.as_ref().map(|_| {
+                let id = self.next_answer.get();
+                self.next_answer.set(id + 1);
+                id
+            });
             let sent = read.and_then(|text| {
                 let link = link.ok_or_else(|| UNLINKED_NOTE.to_string())?;
                 link.send(
@@ -1869,13 +1946,23 @@ impl Window2Editor {
                             tab: view.tab,
                         },
                         token: view.token,
+                        answer: id,
                     },
                     Vec::new(),
                 )
                 .map_err(|e| format!("the editor window could not be asked: {e}"))
             });
-            if let Err(why) = sent {
-                eprintln!("[link] a view for the editor window was not sent: {why}");
+            match (sent, view.answer, id) {
+                (Ok(()), Some(waiting), Some(id)) => {
+                    self.answers.borrow_mut().insert(id, waiting);
+                }
+                (Ok(()), _, _) => {}
+                (Err(why), waiting, _) => {
+                    eprintln!("[link] a view for the editor window was not sent: {why}");
+                    if let Some(waiting) = waiting {
+                        let _ = waiting.send(Err(why));
+                    }
+                }
             }
         }
     }
@@ -1891,6 +1978,7 @@ impl Window2Editor {
             Msg::Editor {
                 request: EditorRequest::Focus,
                 token,
+                answer: None,
             },
             Vec::new(),
         )
@@ -3088,6 +3176,7 @@ mod tests {
                             col: None,
                         },
                         token: None,
+                        answer: None,
                     },
                     Vec::new(),
                 )
@@ -3103,6 +3192,7 @@ mod tests {
                             line: Some(1),
                         },
                         token: None,
+                        answer: None,
                     },
                     Vec::new(),
                 )
@@ -3130,6 +3220,7 @@ mod tests {
                 Msg::Editor {
                     request: EditorRequest::Focus,
                     token: Some("token-2".into()),
+                    answer: None,
                 },
                 Vec::new(),
             )
@@ -3139,6 +3230,72 @@ mod tests {
 
         w.two.unlinked();
         assert_eq!(w.two.request(&click, &|| None), Err(UNLINKED_NOTE.to_string()));
+    }
+
+    /// Window 2's panel hears how a view went only once window 1 has written it and handed it to its editor: a
+    /// drive that fails comes back as the failure, a shown view as shown, a link that ends first as the link's end.
+    #[test]
+    fn a_view_from_window_2_is_answered_once_window_1_has_shown_it() {
+        let w = windows("view-answers");
+        let mut scratch = ScratchDir::in_dir(w.two.scratch.as_deref().unwrap()).unwrap();
+        let fail = Rc::new(Cell::new(true));
+        let drives = Rc::new(Cell::new(0));
+        {
+            let (fail, drives) = (fail.clone(), drives.clone());
+            w.one.set_drive(Rc::new(move |_: EditorAct<'_>, _: Option<String>| {
+                drives.set(drives.get() + 1);
+                if fail.get() {
+                    Err("the editor is not ready".to_string())
+                } else {
+                    Ok(())
+                }
+            }));
+        }
+        let outcome = |later: &mpsc::Receiver<Result<(), String>>| {
+            let got: RefCell<Option<Result<(), String>>> = RefCell::default();
+            assert!(w.settle(|| {
+                if got.borrow().is_none() {
+                    *got.borrow_mut() = later.try_recv().ok();
+                }
+                got.borrow().is_some()
+            }));
+            got.into_inner().unwrap()
+        };
+
+        let view = scratch.prepare_view("Turn 3 notes", "a row").unwrap();
+        let later = w
+            .two
+            .request_answered(&view, &|| None)
+            .unwrap()
+            .expect("a view's outcome comes later");
+        assert_eq!(
+            later.try_recv(),
+            Err(mpsc::TryRecvError::Empty),
+            "nothing is known when it is sent"
+        );
+        assert_eq!(outcome(&later), Err("the editor is not ready".to_string()));
+        assert_eq!(drives.get(), 1, "the answer came after window 1 drove its editor");
+
+        fail.set(false);
+        let view = scratch.prepare_view("Turn 4 notes", "another row").unwrap();
+        let later = w.two.request_answered(&view, &|| None).unwrap().unwrap();
+        assert_eq!(outcome(&later), Ok(()));
+        assert_eq!(drives.get(), 2);
+
+        // Any other request is answered when it is sent, and the plain `request` asks no answer.
+        let open = eitri_core::scratch::open_request(&w.root.join("src/a.rs"), Some(1));
+        assert!(w.two.request_answered(&open, &|| None).unwrap().is_none());
+        let view = scratch.prepare_view("Turn 5 notes", "a third row").unwrap();
+        w.two.request(&view, &|| None).unwrap();
+        assert!(w.settle(|| drives.get() == 4));
+
+        // Sent, then the link ends before window 1 answers: the panel hears that the link ended.
+        w.one.set_drive(Rc::new(|_: EditorAct<'_>, _: Option<String>| Ok(())));
+        let view = scratch.prepare_view("Turn 6 notes", "a last row").unwrap();
+        let later = w.two.request_answered(&view, &|| None).unwrap().unwrap();
+        assert!(w.settle(|| !w.two.answers.borrow().is_empty()), "the view went out");
+        w.two.unlinked();
+        assert_eq!(later.try_recv(), Ok(Err(UNLINKED_NOTE.to_string())));
     }
 
     #[test]
@@ -3876,6 +4033,7 @@ mod tests {
                     text: "a draft".into(),
                 },
                 token: None,
+                answer: None,
             });
             assert!(g.settle(&[&a, &b], || driven.borrow().len() == at + 1));
         }

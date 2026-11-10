@@ -169,6 +169,7 @@ pub(super) fn tick_send(
     super::editor_glue::poll(state, out);
     poll_proposal_jobs(state, out);
     poll_view_jobs(state, out);
+    poll_editor_waits(state, out);
     super::inbound::poll_reset_checks(state, out);
     poll_review_flow(state, screen, out);
     // Before the tabs envelope, so a session the gate started this tick shows as starting at once.
@@ -410,6 +411,7 @@ pub(super) fn needs_polling(state: &AgentPanelState) -> bool {
         || state.remote.needs_polling()
         || !state.proposal_jobs.is_empty()
         || !state.view_jobs.is_empty()
+        || !state.editor_waits.is_empty()
         || !state.reset_checks.is_empty()
         || !state.review_flow.is_idle()
         || state.editor_tools.needs_polling()

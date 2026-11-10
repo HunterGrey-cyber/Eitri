@@ -3747,11 +3747,12 @@ fn build_ui(
         let two = window2_editor.clone();
         let asking = window.downgrade();
         panel_hooks.on_editor_request = Some(Box::new(move |request: &eitri_core::scratch::ScratchRequest| {
-            // A linked editor receives the request through its own transport and owns its layout there.
+            // A linked editor receives the request through its own transport and owns its layout there; a view
+            // is answered once window 1 has written it and handed it to its editor.
             if let Some(two) = &two {
-                return two.request(request, &|| activation_token(&asking));
+                return two.request_answered(request, &|| activation_token(&asking));
             }
-            drive_editor(Some(request))
+            drive_editor(Some(request)).map(|()| None)
         }));
     }
     // How either window of the pair comes forward from the other, the compositor's way.

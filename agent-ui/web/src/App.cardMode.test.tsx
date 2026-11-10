@@ -112,8 +112,10 @@ const TAB = {
 type Kind = "provider" | "provider with a rule" | "broker" | "ACP" | "Codex";
 const KINDS: Kind[] = ["provider", "provider with a rule", "broker", "ACP", "Codex"];
 
-/** The card's answer list as card mode reads it: a rule offer adds Always allow. */
+/** The card's answer list as card mode reads it: a rule offer adds Always allow, second, before Deny. */
 const answersOf = (kind: Kind) => (kind === "provider with a rule" ? 3 : 2);
+/** The digit that denies: the card's last, 3 beside Always allow and 2 elsewhere. */
+const denyDigitOf = (kind: Kind) => String(answersOf(kind));
 /** Whether the card has a tool row it gates (a broker card here names no tool call, a Codex card no tool row). */
 const gatesARow = (kind: Kind) => kind === "provider" || kind === "provider with a rule" || kind === "ACP";
 
@@ -323,7 +325,7 @@ describe.each(KINDS)("card mode on a %s card", (kind) => {
     expect(highlighted(container)).toBe(0);
     expect(document.activeElement).toBe(root(container));
     arm();
-    press("2");
+    press(denyDigitOf(kind));
     afterHalf();
     expect(answerOf(kind)).toMatchObject({ decision: "deny" });
   });
@@ -368,7 +370,7 @@ describe.each(KINDS)("card mode on a %s card", (kind) => {
     expect(modeOf(container)).toBe("browse");
   });
 
-  it("an armed 1 approves and 2 denies, each after its after-half", () => {
+  it("an armed 1 approves and the card's last digit denies (3 beside Always allow, 2 elsewhere), each after its after-half", () => {
     const { container } = armedCard({ kind });
     expect(container.querySelectorAll(".card-digit.armed").length).toBe(answersOf(kind));
     press("1");
@@ -380,19 +382,31 @@ describe.each(KINDS)("card mode on a %s card", (kind) => {
     cleanup();
     posted = [];
     const again = armedCard({ kind });
-    press("2");
+    const deny = again.container.querySelector('.permission-card-mode [data-nav-action="deny"]')!;
+    expect(deny.querySelector(".card-digit")!.textContent).toBe(denyDigitOf(kind));
+    press(denyDigitOf(kind));
     afterHalf();
     expect(answerOf(kind)).toMatchObject({ decision: "deny" });
     expect(inCardMode(again.container)).toBeNull();
   });
 
-  it("3 is Always allow only where the card offers a rule", () => {
+  it("2 is Always allow where the card offers a rule (Claude Code's order); elsewhere 2 denies and there is no 3", () => {
     const { container } = armedCard({ kind });
-    press("3");
-    afterHalf();
+    const digits = Array.from(container.querySelectorAll(".permission-card-mode .permission-card-buttons button")).map(
+      (b) => b.textContent,
+    );
     if (kind === "provider with a rule") {
+      expect(digits.map((t) => t?.slice(0, 1))).toEqual(["1", "2", "3"]);
+      expect(digits[1]).toContain("Always allow");
+      expect(digits[2]).toContain("Deny");
+      press("2");
+      afterHalf();
       expect(answerOf(kind)).toEqual({ decision: "allow", remember: true, reason: null });
     } else {
+      expect(digits.map((t) => t?.slice(0, 1))).toEqual(["1", "2"]);
+      expect(digits[1]).toContain("Deny");
+      press("3");
+      afterHalf();
       expect(answers()).toEqual([]);
       expect(band(container)).toBe(`3: this card has 2 answers`);
       expect(inCardMode(container)).not.toBeNull();
@@ -459,7 +473,7 @@ describe.each(KINDS)("card mode on a %s card", (kind) => {
       const { container } = armedCard({ kind });
       expect(press("Tab")).toBe(false);
       expect(band(container)).toBe(
-        kind === "broker" ? BROKER_NO_REASON_FLASH : agentNoReasonFlash(kind === "ACP" ? "goose" : "Codex"),
+        kind === "broker" ? BROKER_NO_REASON_FLASH : agentNoReasonFlash(kind === "ACP" ? "goose" : "Codex", 2),
       );
       expect(container.querySelector(".permission-card-mode input")).toBeNull();
       expect(inCardMode(container)).not.toBeNull();
@@ -599,7 +613,7 @@ describe("card mode answers only an armed, fresh press with nothing after it", (
     press("1");
     afterHalf();
     expect(answers()).toEqual([]);
-    expect(band(rendered.container)).toBe(notApprovableFlash("1"));
+    expect(band(rendered.container)).toBe(notApprovableFlash("1", 2));
     arm();
     press("2");
     afterHalf();
@@ -785,15 +799,21 @@ describe("card mode ends when something else takes the keys", () => {
 
 describe("the band names card mode", () => {
   const bandText = (c: HTMLElement) => c.querySelector(".status-band")?.textContent ?? "";
+  const activityText = (c: HTMLElement) => c.querySelector(".activity-card")?.textContent ?? "";
+  const modeText = (c: HTMLElement) => c.querySelector('[data-testid="mode-block"]')?.textContent ?? "";
 
-  it("offers the way in while a card waits, and names the held card and its answers in card mode", () => {
+  it("the activity line offers the way in while a card waits; the band names the held card, its answers and CARD", () => {
     const { container } = started({ kind: "provider with a rule", second: true });
-    expect(bandText(container)).toContain("card mode, then 1-3");
+    expect(activityText(container)).toContain("card mode, then 1-3");
+    expect(bandText(container)).not.toContain("card mode, then 1-3");
+    expect(modeText(container)).toBe("BROWSE");
     const held = () => /card (\d)\/2 · 1-(\d) answer · h\/l Enter · Tab reason · Esc leaves/.exec(bandText(container));
     altN();
     arm();
     const first = held();
     expect(first).not.toBeNull();
+    expect(modeText(container)).toBe("CARD");
+    expect(activityText(container)).toMatch(/needs approval$/);
     altN();
     arm();
     const second = held();
@@ -804,7 +824,8 @@ describe("the band names card mode", () => {
     expect(second![2]).toBe(second![1] === "1" ? "3" : "2");
     press("Escape");
     expect(bandText(container)).not.toContain("Esc leaves");
-    expect(bandText(container)).toContain("card mode, then 1-3");
+    expect(modeText(container)).toBe("BROWSE");
+    expect(activityText(container)).toContain("card mode, then 1-3");
   });
 
   it("counts a card's own two answers, and names Tab only where a deny takes a reason", () => {
@@ -823,13 +844,13 @@ describe("the band names card mode", () => {
     expect(bandText(container)).toContain("card 1/1 · 1-2 answer · h/l Enter · Tab reason · Esc leaves");
   });
 
-  it("names Enter when the cursor is on the card, and nothing without a card", () => {
+  it("the activity line names Enter when the cursor is on the card, and Alt-n elsewhere", () => {
     const { container } = started();
     // `started` lands on the card's row.
-    expect(bandText(container)).toContain("Enter or Alt-n: card mode, then 1-3");
+    expect(activityText(container)).toContain("Enter or Alt-n: card mode, then 1-3");
     press("g");
     press("g");
-    expect(bandText(container)).toContain("Alt-n: card mode, then 1-3");
-    expect(bandText(container)).not.toContain("Enter or Alt-n");
+    expect(activityText(container)).toContain("Alt-n: card mode, then 1-3");
+    expect(activityText(container)).not.toContain("Enter or Alt-n");
   });
 });

@@ -7,6 +7,7 @@ import {
   countCodePoints,
   DETAILED_HEAD_CHARS,
   DETAILED_TAIL_CHARS,
+  FoldAllKey,
   formatResultContent,
   lookupTool,
   renderToolCall,
@@ -603,8 +604,8 @@ describe("the registry: runs, edits, gated calls and the detailed view", () => {
 
 /* A folded tool row shows the first result lines and how many more there are, so a finished
    `Bash`/`Read` says how much output it produced and whether it failed. Claude Code's own fold: three lines, then a muted `… +N lines (Enter to expand,
-   Ctrl+o for all)`, and a failed call in the error colour with its first line. The preview never scrolls on
-   its own; `Enter` (the row's own expansion) and `Ctrl+o` (the detailed view) show the whole result. */
+   zi for all)` (`Ctrl+o` in the box, `FoldAllKey`), and a failed call in the error colour with its first line. The
+   preview never scrolls on its own; `Enter` (the row's own expansion) and the detailed view show the whole result. */
 describe("a folded result's preview", () => {
   const lines = (n: number, prefix = "line") => Array.from({ length: n }, (_, i) => `${prefix} ${i + 1}`).join("\n");
   const folded = (content: unknown, over: Partial<ToolCallRecord> = {}, isError = false) =>
@@ -617,9 +618,15 @@ describe("a folded result's preview", () => {
   it("shows the first three lines and says how many more there are", () => {
     const c = folded(lines(120));
     expect(shownLines(c)).toEqual(["line 1", "line 2", "line 3"]);
-    expect(more(c)).toBe("… +117 lines (Enter to expand, Ctrl+o for all)");
+    expect(more(c)).toBe("… +117 lines (Enter to expand, zi for all)");
     expect(c.querySelector('[data-folded="true"]')).not.toBeNull();
     expect(c.querySelector(".tool-result-body")).toBeNull();
+  });
+
+  it("names Ctrl+o for the detailed view in the box, and zi in BROWSE", () => {
+    const inBox = render(<FoldAllKey.Provider value="Ctrl+o">{renderToolCall(call({ result: { content: lines(10), isError: false } }), false)}</FoldAllKey.Provider>).container;
+    expect(more(inBox)).toBe("… +7 lines (Enter to expand, Ctrl+o for all)");
+    expect(more(folded(lines(10)))).toBe("… +7 lines (Enter to expand, zi for all)");
   });
 
   it("says nothing more when the whole result fits in three lines", () => {
@@ -632,7 +639,7 @@ describe("a folded result's preview", () => {
   });
 
   it("counts one line past the three in the singular", () => {
-    expect(more(folded(lines(4)))).toBe("… +1 line (Enter to expand, Ctrl+o for all)");
+    expect(more(folded(lines(4)))).toBe("… +1 line (Enter to expand, zi for all)");
   });
 
   it("does not count a trailing newline as a line", () => {
@@ -640,7 +647,7 @@ describe("a folded result's preview", () => {
     expect(shownLines(c)).toEqual(["a", "b", "c"]);
     expect(more(c)).toBeNull();
     cleanup();
-    expect(more(folded("a\nb\nc\nd\n"))).toBe("… +1 line (Enter to expand, Ctrl+o for all)");
+    expect(more(folded("a\nb\nc\nd\n"))).toBe("… +1 line (Enter to expand, zi for all)");
   });
 
   it("reads a Windows line ending as one line break", () => {
@@ -664,7 +671,7 @@ describe("a folded result's preview", () => {
     expect(preview(c)!.getAttribute("data-state")).toBe("error");
     expect(c.querySelector(".tool-failure-words")).toBeNull();
     expect(shownLines(c)).toEqual(["bash: nope: command not found"]);
-    expect(more(c)).toBe("… +3 lines (Enter to expand, Ctrl+o for all)");
+    expect(more(c)).toBe("… +3 lines (Enter to expand, zi for all)");
   });
 
   it("colours only the words that say a command failed, folded and expanded", () => {
@@ -749,7 +756,7 @@ describe("a folded result's preview", () => {
     cleanup();
     const huge = folded(Array.from({ length: 200_000 }, (_, i) => `l${i}`).join("\n"));
     expect(shownLines(huge)).toEqual(["l0", "l1", "l2"]);
-    expect(more(huge)).toBe("… +199,997 lines (Enter to expand, Ctrl+o for all)");
+    expect(more(huge)).toBe("… +199,997 lines (Enter to expand, zi for all)");
   });
 });
 

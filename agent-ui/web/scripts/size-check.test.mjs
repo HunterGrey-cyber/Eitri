@@ -9,7 +9,7 @@ import { test } from 'node:test';
 import { gzipSync } from 'node:zlib';
 
 const script = fileURLToPath(new URL('./size-check.mjs', import.meta.url));
-const LIMIT = 250000;
+const LIMIT = 275000;
 
 function check(bytes, args = [String(LIMIT)], file = 'dist/index.html') {
   const cwd = mkdtempSync(join(tmpdir(), 'eitri-size-'));

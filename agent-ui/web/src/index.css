@@ -887,6 +887,11 @@ pre {
 .permission-card-buttons button:not(:disabled) .card-digit.armed {
   opacity: 1;
 }
+/* Approve's solid face is light: at the dim of the dark buttons its unarmed digit all but vanishes, so it is dimmed
+   less there. */
+.permission-card-buttons button:first-child:not(:disabled) .card-digit:not(.armed) {
+  opacity: 0.6;
+}
 .agent-ui-root .permission-card-buttons button.card-highlight,
 .agent-ui-root .permission-card-buttons button.card-highlight:focus {
   outline: 2px solid var(--nv-focus-ring);

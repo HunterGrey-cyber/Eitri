@@ -74,24 +74,31 @@ export const COUNT_DROPPED_FLASH = "count dropped";
 export function moreWaitingFlash(n: number): string {
   return `${n} more waiting — Alt-n`;
 }
-/** Why a card's deny takes no reason (Tab in card mode): a broker card, and another agent's card. */
+/** Why a card's deny takes no reason (Tab in card mode): a broker card, and another agent's card. Each names the
+ *  card's deny digit: a broker card never offers a saved rule, so its Deny is 2; another agent's card says the digit
+ *  its own buttons show (`denyDigit`). */
 export const BROKER_NO_REASON_FLASH = withShort("an editor card takes no reason with a deny; 2 denies", "no reason — 2 denies");
-export function agentNoReasonFlash(agent: string): string {
-  return withShort(`${agent} takes no reason with a deny; 2 denies`, "no reason — 2 denies");
+export function agentNoReasonFlash(agent: string, deny: number): string {
+  return withShort(`${agent} takes no reason with a deny; ${deny} denies`, `no reason — ${deny} denies`);
 }
 
 /** What the band says when card mode's `key` (a digit, or Enter on a highlight) would allow on a card whose Approve
  *  is disabled: an ACP card whose agent offered no allow-once option, or one Eitri held back because the card cannot
  *  show the whole call. Nothing is sent; sending would only bring back the agent's refusal under a misleading reason.
  *  In card mode `Ctrl+c` leaves and interrupts nothing, so the way out named is Esc. */
-export function notApprovableFlash(key: string): string {
-  return withShort(`${key}: this card cannot be approved — 2 denies, Esc leaves`, `${key}: cannot approve`);
+export function notApprovableFlash(key: string, deny: number): string {
+  return withShort(`${key}: this card cannot be approved — ${deny} denies, Esc leaves`, `${key}: cannot approve`);
 }
 
 /* Card mode's refusals (`../cardMode`). Each names the key first, as the band reads it. */
 export const REPLAYED_KEY_FLASH = withShort("key replayed after a focus loss — press again", "replayed — press again");
 export const SHIFT_TAB_IN_CARD_FLASH = withShort("Shift+Tab: answer or leave the card first (Esc)", "Shift+Tab: Esc first");
 export const CTRL_G_IN_CARD_FLASH = withShort("Ctrl+g: leave card mode first — Esc", "Ctrl+g: Esc first");
+/** A `gd` or `gf` lookup answered with several places while card mode held the keys: the pick is not opened over the
+ *  card, and card mode stays. */
+export function pathPickInCardFlash(key: "gd" | "gf"): string {
+  return withShort(`${key}: press Esc to leave the card first`, `${key}: Esc first`);
+}
 /** A digit typed with Shift held (on AZERTY every digit is): never an answer, since the shifted key may be another
  *  character on another layout. */
 export function shiftedDigitFlash(digit: string): string {

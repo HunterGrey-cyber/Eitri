@@ -630,7 +630,7 @@ mod tests {
             let opened = opened.clone();
             state.editor_request_hook = Some(Rc::new(move |request| {
                 opened.borrow_mut().push(request.clone());
-                Ok(())
+                Ok(None)
             }));
         }
         ask(&handle, "a.rs");
@@ -1009,7 +1009,7 @@ mod tests {
         let sink = opened.clone();
         handle.state.borrow_mut().editor_request_hook = Some(Rc::new(move |value| {
             sink.borrow_mut().push(value.clone());
-            Ok(())
+            Ok(None)
         }));
         opened
     }

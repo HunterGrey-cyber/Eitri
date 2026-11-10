@@ -3230,6 +3230,20 @@ describe("card mode's look", () => {
     expect(winningDeclarationOn(armed, "font-family")).toBe("var(--nv-font-mono)");
   });
 
+  it("dims an unarmed digit less on Approve's solid face, so it still reads as a digit", () => {
+    document.head.innerHTML = `<style>${css}</style>`;
+    document.body.innerHTML =
+      `<div class="permission-card permission-card-mode"><div class="permission-card-buttons">` +
+      `<button type="button"><kbd class="card-digit">1</kbd> Approve</button>` +
+      `<button type="button"><kbd class="card-digit">2</kbd> Deny</button>` +
+      `</div></div>`;
+    const [approve, deny] = Array.from(document.body.querySelectorAll(".card-digit"));
+    expect(winningDeclarationOn(approve, "opacity")).toBe("0.6");
+    expect(winningDeclarationOn(deny, "opacity")).toBe("0.45");
+    approve.classList.add("armed");
+    expect(winningDeclarationOn(approve, "opacity")).toBe("1");
+  });
+
   it("rings the highlighted button as a focused control is ringed, Approve's solid face included", () => {
     document.head.innerHTML = `<style>${css}</style>`;
     document.body.innerHTML = CARD("permission-card permission-card-mode", "card-highlight");

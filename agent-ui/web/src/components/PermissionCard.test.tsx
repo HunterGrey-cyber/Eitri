@@ -242,7 +242,7 @@ describe("the reason box and the remember button", () => {
     expect(onAnswer).not.toHaveBeenCalled();
   });
 
-  it("offers Always allow only with a rule from Rust, third for l, and sends remember", () => {
+  it("offers Always allow only with a rule from Rust, second (between Approve and Deny), and sends remember", () => {
     const onAnswer = vi.fn();
     const without = render(<PermissionCard request={REQUEST} sessionEnded={false} onAnswer={onAnswer} />);
     expect(without.container.textContent).not.toContain("Always allow");
@@ -250,8 +250,19 @@ describe("the reason box and the remember button", () => {
     const { container } = render(<PermissionCard request={REQUEST} sessionEnded={false} onAnswer={onAnswer} ruleOffer="git push *" />);
     const always = Array.from(container.querySelectorAll("button")).find((b) => b.textContent?.startsWith("Always allow"))!;
     expect(always.textContent).toBe("Always allow git push * in this project");
-    expect(always.getAttribute("data-nav-order")).toBe("3");
+    expect(always.getAttribute("data-nav-order")).toBe("2");
     expect(container.querySelector("input")!.getAttribute("data-nav-order")).toBe("4");
+    // Claude Code's order: Approve, Always allow, then Deny last, in the markup and for a HINT label.
+    const buttons = Array.from(container.querySelectorAll(".permission-card-buttons button"));
+    expect(buttons.map((b) => b.getAttribute("data-nav-action"))).toEqual(["allow", "always", "deny"]);
+    expect(buttons.map((b) => b.getAttribute("data-nav-order"))).toEqual(["1", "2", "3"]);
+    const plain = render(<PermissionCard request={REQUEST} sessionEnded={false} onAnswer={vi.fn()} />);
+    const two = Array.from(plain.container.querySelectorAll(".permission-card-buttons button"));
+    expect(two.map((b) => [b.getAttribute("data-nav-action"), b.getAttribute("data-nav-order")])).toEqual([
+      ["allow", "1"],
+      ["deny", "2"],
+    ]);
+    plain.unmount();
     fireEvent.click(always, { detail: 1 });
     expect(onAnswer).toHaveBeenCalledWith("perm-1", "allow", undefined, true, POINTER);
   });

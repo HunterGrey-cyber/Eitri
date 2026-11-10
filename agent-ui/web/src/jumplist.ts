@@ -7,8 +7,17 @@ export function emptyJumplist(): Jumplist {
   return { entries: [], at: 0 };
 }
 
+/** How far apart, in pixels, two places in one row may be and still count as one place. */
+export const SAME_PLACE_PX = 4;
+
+/** Whether two places are one: the same row, scrolled to within `SAME_PLACE_PX`. Two places in one long row (the top
+ *  and the end of a reply, two hunks of one edit) are two entries. */
+function samePlace(a: JumpPos, b: JumpPos): boolean {
+  return a.key === b.key && Math.abs(a.offset - b.offset) <= SAME_PLACE_PX;
+}
+
 export function recordJump(list: Jumplist, from: JumpPos): Jumplist {
-  const entries = list.entries.slice(0, list.at + 1).filter((entry) => entry.key !== from.key);
+  const entries = list.entries.slice(0, list.at + 1).filter((entry) => !samePlace(entry, from));
   entries.push({ ...from });
   const kept = entries.slice(-JUMPLIST_MAX);
   return { entries: kept, at: kept.length };

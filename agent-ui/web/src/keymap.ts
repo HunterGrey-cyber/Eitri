@@ -443,7 +443,14 @@ export function cardModeDelta(event: KeyLike): 1 | -1 | null {
   return letter === "n" ? 1 : letter === "p" ? -1 : null;
 }
 
-export type YankOperator = { op: "y"; count: number | null; scope: "i" | "a" | null; prefix: "g" | "[" | "]" | null };
+/** A waiting `y`. `count` is the count typed before it, `motionCount` the digits typed after it (absent until one is);
+ *  the two multiply when the motion resolves, as vim's do (`2y3j` is six rows). */
+export type YankOperator = { op: "y"; count: number | null; motionCount?: number | null; scope: "i" | "a" | null; prefix: "g" | "[" | "]" | null };
+/** The count a waiting `y` resolves with: the counts before and after it multiplied, or none when neither was typed. */
+export function operatorCount(op: YankOperator): number | null {
+  const after = op.motionCount ?? null;
+  return op.count === null && after === null ? null : (op.count ?? 1) * (after ?? 1);
+}
 export type YankMotion = "j" | "k" | "ArrowDown" | "ArrowUp" | "{" | "}" | "G" | "gg" | "[[" | "]]";
 
 /** `sessionEnded` gates two rows in opposite directions: it is what OFFERS `r` (return to the start
@@ -786,13 +793,14 @@ export function resolveKey(mode: PanelMode, event: KeyLike, ctx: KeyContext): Pa
       return cancel;
     }
     if (op.prefix !== null) return event.key === op.prefix
-      ? { kind: "yank", what: "motion", motion: `${op.prefix}${op.prefix}` as YankMotion, count: op.count } : cancel;
-    if (/^[0-9]$/.test(event.key)) return event.key === "0" && op.count === null ? cancel
-      : { kind: "operator", op: { ...op, count: accumulateMotionCount(op.count, Number(event.key)) } };
-    if (event.key === "y" && !event.shiftKey) return { kind: "yank", what: "rows", count: op.count ?? 1 };
+      ? { kind: "yank", what: "motion", motion: `${op.prefix}${op.prefix}` as YankMotion, count: operatorCount(op) } : cancel;
+    // Digits after `y` are a count of their own, multiplied with one typed before `y`; `0` cannot start it.
+    if (/^[0-9]$/.test(event.key)) return event.key === "0" && (op.motionCount ?? null) === null ? cancel
+      : { kind: "operator", op: { ...op, motionCount: accumulateMotionCount(op.motionCount ?? null, Number(event.key)) } };
+    if (event.key === "y" && !event.shiftKey) return { kind: "yank", what: "rows", count: operatorCount(op) ?? 1 };
     if (event.key === "i" || event.key === "a") return { kind: "operator", op: { ...op, scope: event.key } };
     if (event.key === "g" || event.key === "[" || event.key === "]") return { kind: "operator", op: { ...op, prefix: event.key } };
-    if (["j", "k", "ArrowDown", "ArrowUp", "{", "}", "G"].includes(event.key)) return { kind: "yank", what: "motion", motion: event.key as YankMotion, count: op.count };
+    if (["j", "k", "ArrowDown", "ArrowUp", "{", "}", "G"].includes(event.key)) return { kind: "yank", what: "motion", motion: event.key as YankMotion, count: operatorCount(op) };
     return cancel;
   }
   // The key after a pending prefix, outside INPUT (INPUT never reads one: a `g` left over from
@@ -830,8 +838,8 @@ export function resolveKey(mode: PanelMode, event: KeyLike, ctx: KeyContext): Pa
     }
     // vim's own `Ctrl+e`/`Ctrl+y`, checked here for the same reason as Ctrl+d/
     // Ctrl+u just above -- `key` reports "e"/"y" the same under Ctrl as bare, and bare `y` (the
-    // plain-key switch below) copies the current row, so an unchecked Ctrl+y would copy instead
-    // of scrolling. INPUT's `Ctrl+e` (end of line, which the composer moves the caret for itself,
+    // plain-key switch below) starts the copy operator, so an unchecked Ctrl+y would wait for a
+    // motion instead of scrolling. INPUT's `Ctrl+e` (end of line, which the composer moves the caret for itself,
     // `Composer.tsx`) is untouched: this whole block is gated on `mode !== "input"` already.
     if (event.ctrlKey && !event.shiftKey && (event.key === "e" || event.key === "y")) {
       return { kind: "scroll-line", delta: event.key === "e" ? 1 : -1 };
@@ -956,8 +964,8 @@ export function resolveKey(mode: PanelMode, event: KeyLike, ctx: KeyContext): Pa
   // `FIXED_PAIRS`' own: `gg`, `gf` (vim's "go to file"), `gx` (open the row's web link),
   // `zh`/`zl` (a row's table
   // sideways), `zt`/`zz`/`zb` and `za`/`zo`/`zc` (the row to an edge of the view,
-  // a fold toggled/opened/closed), `[[`/`]]` and `[p`/`]p` (the previous/next prompt, the
-  // previous/next card waiting) -- is resolved above, ahead of `Ctrl+o`, the other
+  // a fold toggled/opened/closed), `[[`/`]]` (the previous/next prompt) and `[p`/`]p` (which only
+  // say that cards are on `Alt-n`/`Alt-p` now) -- is resolved above, ahead of `Ctrl+o`, the other
   // chords and the blanket modifier refusal. Nothing outside INPUT that follows a pending
   // prefix reaches this point: a key completing no pair cancels there (`resolvePendingSecond`), as
   // vim ends an unfinished `g`, rather than falling through here as an ordinary key. A mismatched
@@ -1210,11 +1218,11 @@ export const VISUAL_KEYS: KeyHelp[] = [
  *  both ways by `keymap.test.ts`: every key here is one card mode acts on, never one it refuses. The digits are the
  *  card's own buttons: a card without a saved-rule offer has two. */
 export const CARD_KEYS: KeyHelp[] = [
-  { keys: "1 / 2 / 3", what: "Answer with that button: 1 Approve, 2 Deny, 3 Always allow (where the card offers a rule); only a fresh press once card mode is armed, and only if no key follows within a quarter second" },
+  { keys: "1 / 2 / 3", what: "Answer with that button, in Claude Code's order: 1 Approve, 2 Always allow, 3 Deny where the card offers a rule; 1 Approve, 2 Deny on every other card; only a fresh press once card mode is armed, and only if no key follows within a quarter second" },
   { keys: "h / l", what: "Highlight the previous / next button (← / → too); nothing is highlighted on entry" },
   { keys: "0 / ^ / $", what: "Highlight the first / first / last button" },
   { keys: "Enter", what: "Answer with the highlighted button, as a digit does" },
-  { keys: "Tab", what: "Open the reason field (Claude's cards); Enter there denies with the reason, Esc or Tab closes it and keeps the text, which 2 then sends as a click on Deny does" },
+  { keys: "Tab", what: "Open the reason field (Claude's cards); Enter there denies with the reason, Esc or Tab closes it and keeps the text, which Deny's digit then sends as a click on Deny does" },
   { keys: "Esc / Ctrl+c", what: "Leave card mode, the card still waiting, back where you were (Ctrl+c interrupts nothing here)" },
   { keys: "Alt-n / Alt-p", what: "The next / previous waiting card; this one keeps waiting" },
   { keys: "j / k", what: "Scroll a card taller than the view (↓ / ↑ too)" },
@@ -1285,7 +1293,7 @@ export const INPUT_KEYS: KeyHelp[] = [
   { keys: "Ctrl+w / Ctrl+u", what: "Delete a word / to the line's start" },
   { keys: "Ctrl+a / Ctrl+e", what: "Caret to the line's start / end" },
   { keys: "Ctrl+c", what: "Interrupt a running turn; idle, clear the box into history" },
-  // An added key. The band names the card it would approve.
+  // Claimed so it never reaches the box, and answers nothing: cards are answered in card mode.
   { keys: "Ctrl+y", what: "nothing (cards are answered in card mode: Alt-n)" },
   { keys: "Alt-n / Alt-p", what: "The next / previous waiting card, in card mode (then 1-3 answers it)" },
   { keys: "Ctrl+g", what: "Edit this in nvim (:wq brings it back, :q! changes nothing)" },

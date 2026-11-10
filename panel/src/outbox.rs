@@ -404,7 +404,7 @@ impl Outbox {
                         Some(hook) => hook(&request),
                         None => Err("the editor is not connected to this panel".to_string()),
                     };
-                    let next = super::editor_answered(&mut state.borrow_mut(), then, answer);
+                    let next = super::editor_taken(&mut state.borrow_mut(), then, answer);
                     next.deliver(state, pages);
                 }
             }

@@ -298,7 +298,15 @@ fn the_permission_and_send_paths_never_read_review_state() {
         ("release_turn_send", "send_turn_in"),
         ("send_one", "send_turn_in"),
         ("send_now", "interrupt"),
-        ("queue_message", "queued_at_ms"),
+        // Enter's queue and `Ctrl+x Enter`'s (a message held for the turn's end) both push through
+        // `push_queued`, which is where the queued message is built.
+        ("queue_message", "push_queued"),
+        ("queue_after_turn", "push_queued"),
+        ("push_queued", "queued_at_ms"),
+        // What `queue_after_turn` and the release below ask before holding a message behind a card.
+        ("card_waits", "pending_permissions"),
+        // The messages held behind a card go out once no card waits, through the queue's flush.
+        ("release_after_card", "flush_queue"),
         ("steer_held", "steer"),
     ] {
         check(&format!("TabSet::{name}"), &functions(&tabs, name), anchor);
@@ -313,6 +321,8 @@ fn the_permission_and_send_paths_never_read_review_state() {
         ("send_first_turn", "begin_turn_send"),
         ("send_prompt", "begin_turn_send"),
         ("poll_turn_sends", "poll_at"),
+        // A composer's message refused while a card waits with no turn running is queued behind it.
+        ("hold_behind_card", "queue_message"),
     ] {
         check(&format!("TabSet::{name}"), &functions(&moving, name), anchor);
     }
@@ -354,6 +364,7 @@ fn the_permission_and_send_paths_never_read_review_state() {
         ("SendMessage", "note_sent"),
         ("SendNow", "send_now"),
         ("QueueMessage", "queue_message"),
+        ("QueueMessage", "queue_after_turn"),
         ("PermissionResponse", "answer_permission_response"),
         ("ConfirmBypass", "apply_confirm_bypass"),
     ] {

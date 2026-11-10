@@ -203,6 +203,8 @@ pub(super) fn panel_tab_handoff(state: &AgentPanelState, tab: TabId) -> Result<P
         scratch: _,
         proposal_jobs: _,
         view_jobs: _,
+        // A request a linked window's editor has not answered yet: its answer is the page's that asked, here.
+        editor_waits: _,
         // A failed tab's `r` waits for the window it was pressed in; the lookup is the window's.
         reset_checks: _,
         cli_missing: _,

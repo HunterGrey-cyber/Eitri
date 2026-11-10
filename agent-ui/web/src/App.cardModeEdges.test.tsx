@@ -231,14 +231,14 @@ describe("an answer cancelled by something that is not a key says so", () => {
 });
 
 describe("a deny by digit carries the field's kept text", () => {
-  it("Tab, a reason, Esc (kept), then an armed 2 denies with it", () => {
+  it("Tab, a reason, Esc (kept), then an armed 3 (Deny beside Always allow) denies with it", () => {
     const { container } = setup();
     const box = reasonOpen(container, "not now");
     fireEvent.keyDown(box, { key: "Escape" });
     expect(document.activeElement).toBe(root(container));
     wait(CARD_ARM_MS + 100);
-    fireEvent.keyDown(root(container), { key: "2", code: "Digit2" });
-    fireEvent.keyUp(root(container), { key: "2", code: "Digit2" });
+    fireEvent.keyDown(root(container), { key: "3", code: "Digit3" });
+    fireEvent.keyUp(root(container), { key: "3", code: "Digit3" });
     wait(TYPING_GUARD_MS + 50);
     expect(answers()).toEqual([expect.objectContaining({ permission_id: "p1", decision: "deny", reason: "not now" })]);
   });
@@ -256,33 +256,33 @@ describe("a deny by digit carries the field's kept text", () => {
 });
 
 describe("a change of the held card's offer ends card mode", () => {
-  it("the rule offer withdrawn under card mode: card mode ends with a flash, and 3 then sends nothing", () => {
+  it("the rule offer withdrawn under card mode: card mode ends with a flash, and 2 (Always allow) then sends nothing", () => {
     const { container } = setup();
     enterArmed(root(container));
     dispatch({ kind: "rule_offers", tab: 1, offers: {} });
     expect(inCardMode(container)).toBe(false);
     expect(band(container)).toBe(CARD_CHANGED_FLASH);
     wait(1000);
-    fireEvent.keyDown(root(container), { key: "3", code: "Digit3" });
+    fireEvent.keyDown(root(container), { key: "2", code: "Digit2" });
     wait(1000);
     expect(answers()).toEqual([]);
   });
 
-  it("the rule replaced by another during 3's after-half: card mode ends, nothing is saved, and the new rule answers", () => {
+  it("the rule replaced by another during 2's after-half: card mode ends, nothing is saved, and the new rule answers", () => {
     const { container } = setup();
     enterArmed(root(container));
-    fireEvent.keyDown(root(container), { key: "3", code: "Digit3" });
-    fireEvent.keyUp(root(container), { key: "3", code: "Digit3" });
+    fireEvent.keyDown(root(container), { key: "2", code: "Digit2" });
+    fireEvent.keyUp(root(container), { key: "2", code: "Digit2" });
     wait(100);
     dispatch({ kind: "rule_offers", tab: 1, offers: { p1: "rm -rf *" } });
     expect(inCardMode(container)).toBe(false);
     expect(band(container)).toBe(CARD_CHANGED_FLASH);
     wait(1000);
     expect(answers()).toEqual([]);
-    // Entered again, the card shows the new rule, and 3 grants that one.
+    // Entered again, the card shows the new rule, and 2 grants that one.
     fireEvent.keyDown(root(container), { key: "n", code: "KeyN", altKey: true });
     wait(CARD_ARM_MS + 100);
-    fireEvent.keyDown(root(container), { key: "3", code: "Digit3" });
+    fireEvent.keyDown(root(container), { key: "2", code: "Digit2" });
     wait(TYPING_GUARD_MS + 50);
     expect(answers()).toEqual([expect.objectContaining({ permission_id: "p1", decision: "allow", remember: true })]);
   });
@@ -290,8 +290,8 @@ describe("a change of the held card's offer ends card mode", () => {
   it("the rule replaced in the same task as the after-half's end: nothing is saved", () => {
     const { container } = setup();
     enterArmed(root(container));
-    fireEvent.keyDown(root(container), { key: "3", code: "Digit3" });
-    fireEvent.keyUp(root(container), { key: "3", code: "Digit3" });
+    fireEvent.keyDown(root(container), { key: "2", code: "Digit2" });
+    fireEvent.keyUp(root(container), { key: "2", code: "Digit2" });
     wait(100);
     // The envelope and the answer's timer in one task, with no render between them.
     act(() => {
@@ -303,13 +303,13 @@ describe("a change of the held card's offer ends card mode", () => {
     expect(inCardMode(container)).toBe(false);
   });
 
-  it("the same offer sent again changes nothing: card mode stays and 3 answers with remember", () => {
+  it("the same offer sent again changes nothing: card mode stays and 2 answers with remember", () => {
     const { container } = setup();
     enterArmed(root(container));
     dispatch({ kind: "rule_offers", tab: 1, offers: { p1: "rm *" } });
     expect(inCardMode(container)).toBe(true);
     wait(CARD_ARM_MS + 100);
-    fireEvent.keyDown(root(container), { key: "3", code: "Digit3" });
+    fireEvent.keyDown(root(container), { key: "2", code: "Digit2" });
     wait(TYPING_GUARD_MS + 50);
     expect(answers()).toEqual([expect.objectContaining({ permission_id: "p1", decision: "allow", remember: true })]);
   });
@@ -412,7 +412,7 @@ describe("what an arrival, a focus move and a tab switch do to card mode", () =>
     expect(document.activeElement).toBe(root(container));
     expect(box.value).toBe("");
     wait(CARD_ARM_MS + 100);
-    fireEvent.keyDown(root(container), { key: "2", code: "Digit2" });
+    fireEvent.keyDown(root(container), { key: "3", code: "Digit3" });
     wait(TYPING_GUARD_MS + 50);
     expect(answers()).toEqual([expect.objectContaining({ permission_id: "p1", decision: "deny" })]);
   });

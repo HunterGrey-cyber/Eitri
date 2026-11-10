@@ -17,8 +17,8 @@ import { fileURLToPath } from 'node:url';
 
 /** Text only `src/keymap.ts` holds (its help rows): any of it in the page means the key machinery was bundled. */
 export const KEYMAP_MARKERS = [
-  'Next / previous row; a long row scrolls first',
-  'Detailed view: every result, longer cuts, no collapsed runs',
+  'Previous row; a long row scrolls first',
+  'The detailed view: every result, longer excerpts, no collapsed runs',
   'A view up (Ctrl+b is the prefix)',
 ];
 

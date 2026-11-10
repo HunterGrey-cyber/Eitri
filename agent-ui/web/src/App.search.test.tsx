@@ -117,6 +117,41 @@ describe("directional transcript search", () => {
     key("n"); expect(current()?.textContent).toContain("apple below");
   });
 
+  it("a hit on a tall row brings the matched line on screen below the pinned header, for / and for n", () => {
+    const { key, prompt, current, container } = setup(state({
+      transcript: [{ seq: 1, text: "needle-alpha heads a tall reply" }, { seq: 2, text: "banana" }, { seq: 3, text: "needle-alpha again" }],
+    }));
+    const list = container.querySelector<HTMLElement>(".message-list")!;
+    const view = { top: 100, bottom: 400 };
+    list.getBoundingClientRect = () => ({ ...view, left: 0, right: 500, width: 500, height: 300, x: 0, y: 100, toJSON() {} }) as DOMRect;
+    // Each match is drawn 50 px into the conversation's content, the list scrolled far past it.
+    const proto = Range.prototype as unknown as { getBoundingClientRect?: () => DOMRect };
+    const had = Object.getOwnPropertyDescriptor(proto, "getBoundingClientRect");
+    Object.defineProperty(proto, "getBoundingClientRect", {
+      configurable: true,
+      value: function () {
+        const top = view.top + 50 - list.scrollTop;
+        return { top, bottom: top + 18, left: 10, right: 90, width: 80, height: 18, x: 10, y: top, toJSON() {} } as DOMRect;
+      },
+    });
+    try {
+      list.scrollTop = 2000;
+      key("/");
+      fireEvent.change(prompt(), { target: { value: "needle" } });
+      key("Enter", {}, prompt());
+      expect(current()?.textContent).toContain("heads a tall reply");
+      // The match's top now sits at the view's top (no header is drawn here): scrolled up by the 1950 px it was above.
+      expect(list.scrollTop).toBe(50);
+      list.scrollTop = 2000;
+      key("n");
+      expect(current()?.textContent).toContain("again");
+      expect(list.scrollTop).toBe(50);
+    } finally {
+      if (had) Object.defineProperty(proto, "getBoundingClientRect", had);
+      else delete proto.getBoundingClientRect;
+    }
+  });
+
   it("an accepted search records its origin once, despite many incremental matches", () => {
     const { key, prompt, current } = setup();
     key("?");

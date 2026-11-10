@@ -249,7 +249,7 @@ See [Keys](keys.md#the-prefix) for tabbed and stacked containers, resizing and t
 ## When Eitri asks
 
 Some tool calls wait for you. Eitri draws a permission card in the conversation, next to the call it gates,
-with an **Approve** and a **Deny** button, and for many commands a third button, "Always allow ... in this
+with an **Approve** and a **Deny** button, and for many commands a third button between them, "Always allow ... in this
 project", which saves a rule that approves such commands without a card from then on. A rule does not answer
 the questions Claude Code raises itself, so a command it still asks about gets a card even then; see
 [When Claude Code itself asks](permissions.md#when-claude-code-itself-asks).
@@ -257,7 +257,8 @@ the questions Claude Code raises itself, so a command it still asks about gets a
 You answer a card in **card mode**, which the card holds until you answer or leave. Press `Alt-n` (from the box too) to
 take the next waiting card in this tab, or `Enter` on the card's own row; when a card arrives, the band says so.
 
-- `1` approves, `2` denies, and `3` approves and saves the "Always allow" rule on a card that offers one.
+- The digits follow the buttons, in Claude Code's order: `1` approves and `2` denies; on a card that offers the
+  "Always allow" rule, `2` approves and saves it and `3` denies.
 - `h` and `l`, then `Enter`, work the buttons for you if you prefer to walk to one.
 - `Tab` opens a box for a reason on a Claude card; `Enter` in it sends the denial with that reason.
 - `Esc` leaves card mode with the card still waiting, and you are back where you were. It never moves on to the next

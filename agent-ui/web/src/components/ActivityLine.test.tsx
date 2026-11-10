@@ -62,17 +62,21 @@ it("counts the queue, names the interrupt key, and names a card that waits", () 
   rerender(
     <ActivityLine state={running({ activeTurnId: "t1" })} turnClock={null} canInterrupt onInterrupt={onInterrupt} queued={0} pendingTool="Bash" mode="input" />,
   );
-  expect(container.querySelector(".activity-card")!.textContent).toBe("⚑ Bash needs approval — Alt-n");
+  expect(container.querySelector(".activity-card")!.textContent).toBe("⚑ Bash needs approval — Alt-n: card mode, then 1-3");
   expect(container.textContent).not.toContain("queued");
 });
 
-/** BROWSE points to Enter on the card; INPUT points to Alt-n. Defaults to BROWSE. */
-it("the card row names Enter in BROWSE, and defaults to it", () => {
-  const onInterrupt = vi.fn();
-  const { container } = render(
-    <ActivityLine state={running({ activeTurnId: "t1" })} turnClock={null} canInterrupt onInterrupt={onInterrupt} pendingTool="Bash" />,
-  );
-  expect(container.querySelector(".activity-card")!.textContent).toBe("⚑ Bash needs approval — j to it, Enter");
+/** The line says how card mode is entered from where the keys are: Enter or Alt-n on the card's row, Alt-n elsewhere
+ *  (the default), and nothing of entering while card mode holds a card (j scrolls it there, Enter answers it). */
+it("the card names how card mode is entered from here, and nothing of it while card mode holds", () => {
+  const line = (cardEntry?: "on-card" | "elsewhere" | "held") => render(
+    <ActivityLine state={running({ activeTurnId: "t1" })} turnClock={null} canInterrupt onInterrupt={vi.fn()} pendingTool="Bash" cardEntry={cardEntry} />,
+  ).container.querySelector(".activity-card")!.textContent;
+  expect(line("on-card")).toBe("⚑ Bash needs approval — Enter or Alt-n: card mode, then 1-3");
+  expect(line("elsewhere")).toBe("⚑ Bash needs approval — Alt-n: card mode, then 1-3");
+  expect(line()).toBe("⚑ Bash needs approval — Alt-n: card mode, then 1-3");
+  expect(line("held")).toBe("⚑ Bash needs approval");
+  for (const entry of ["on-card", "elsewhere", "held"] as const) expect(line(entry)).not.toContain("j to it");
 });
 
 /** A phase word beside a waiting card cuts off its approval keys at 520px, so the card owns the line. */
@@ -81,18 +85,17 @@ it("with a card waiting, the card is the line: no phase word or clock beside it"
     <ActivityLine state={running({ activeTurnId: "t1" })} turnClock={null} canInterrupt onInterrupt={vi.fn()} pendingTool="Write" />,
   );
   expect(container.querySelector(".turn-activity")).toBeNull();
-  expect(container.querySelector(".activity-card")!.textContent).toBe("⚑ Write needs approval — j to it, Enter");
+  expect(container.querySelector(".activity-card")!.textContent).toBe("⚑ Write needs approval — Alt-n: card mode, then 1-3");
   expect(container.querySelector("button.stop")).not.toBeNull();
 });
 
-/** Each hint names the card-mode entry available from its mode. */
-it("the hint names Enter on the card in BROWSE and Alt-n in INPUT", () => {
+/** Each hint names the card-mode entry available from where the keys are, and no answer key of its own. */
+it("the hint names Enter on the card's row and Alt-n elsewhere, never an answer key", () => {
   const { container, rerender } = render(
-    <ActivityLine state={running({ activeTurnId: "t1" })} turnClock={null} canInterrupt onInterrupt={vi.fn()} pendingTool="Bash" />,
+    <ActivityLine state={running({ activeTurnId: "t1" })} turnClock={null} canInterrupt onInterrupt={vi.fn()} pendingTool="Bash" cardEntry="on-card" />,
   );
   const text = () => container.querySelector(".activity-card")!.textContent!;
-  expect(text()).toContain("j to it");
-  expect(text()).toContain("Enter");
+  expect(text()).toContain("Enter or Alt-n");
   rerender(
     <ActivityLine state={running({ activeTurnId: "t1" })} turnClock={null} canInterrupt onInterrupt={vi.fn()} pendingTool="Bash" mode="input" />,
   );
@@ -115,7 +118,7 @@ it("draws a hidden character in the waiting card's tool name as an escape", () =
   const { container } = render(
     <ActivityLine state={running({ activeTurnId: "t1" })} turnClock={null} canInterrupt onInterrupt={vi.fn()} pendingTool={"mcp__x__‮evil"} />,
   );
-  expect(container.querySelector(".activity-card")!.textContent).toBe("⚑ mcp__x__⟨U+202E⟩evil needs approval — j to it, Enter");
+  expect(container.querySelector(".activity-card")!.textContent).toBe("⚑ mcp__x__⟨U+202E⟩evil needs approval — Alt-n: card mode, then 1-3");
 });
 
 it("names a folded CLI turn's cause in the activity slot", () => {
