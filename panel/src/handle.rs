@@ -927,6 +927,7 @@ impl AgentPanelHandle {
         let after_now = |at: std::time::Instant| at.max(now + std::time::Duration::from_millis(1));
         // A card nobody answers ends at its limit, and nothing else would run a tick then.
         next = earliest(next, state.editor_tools.next_card_limit().map(after_now));
+        next = earliest(next, state.tabs.remote_poll_deadline(now));
         // Every live page's typing cadence, each against its own document.
         for (view, page) in self.pages.live_views() {
             let paced = page

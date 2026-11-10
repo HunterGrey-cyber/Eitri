@@ -95,7 +95,7 @@ impl RemoteSocket {
             name,
             kind,
         } = act;
-        let withdrawn = verdict.is_ok() && authority.is_none_or(|stamp| !stamp.is_current());
+        let withdrawn = verdict.is_ok() && authority.as_ref().is_none_or(|stamp| !stamp.is_current());
         let verdict = if withdrawn { Err(NOT_AUTHORIZED) } else { verdict };
         let refused = match (&verdict, RowKey::parse(&key)) {
             (Err(_), _) if withdrawn => Some(Reason::RevokedToken),
@@ -128,6 +128,7 @@ impl RemoteSocket {
                 .remote_message(
                     &RemoteOrigin {
                         device_id,
+                        authority,
                         device,
                         conn,
                     },
@@ -286,6 +287,159 @@ mod tests {
             assert_eq!(result["command_id"], "withdrawn");
             assert!(provider.turns().is_empty());
             assert_eq!(handle.state.borrow().tabs.remote_sends_out(), 0);
+        }
+    }
+
+    #[test]
+    fn withdrawn_queued_messages_leave_one_count_only_notice() {
+        use crate::agent_panel::tests::{handle_with_two_pages, live_tab, tick_handle_until};
+        use eitri_core::remote_devices::{token_hash_hex, update};
+        for revoke in [true, false] {
+            let dir = agent::state_dirs::test_workspace_dir("withdraw-notice");
+            let store = dir.join("devices.json");
+            let name = "<img src=x>\u{202e}phone";
+            agent::private_fs::write_private(
+                &store,
+                serde_json::json!({"v": 1, "devices": [
+                    {"id": "d1", "name": name, "token_sha256": token_hash_hex("tok"), "grant": "watch+steer"},
+                    {"id": "d2", "name": name, "token_sha256": token_hash_hex("tok2"), "grant": "watch+steer"}
+                ]})
+                .to_string()
+                .as_bytes(),
+            )
+            .unwrap();
+            let (handle, base, _) = handle_with_two_pages();
+            let (tab, provider) = live_tab(&handle, &dir);
+            let key = handle
+                .state
+                .borrow()
+                .tabs
+                .get(tab)
+                .unwrap()
+                .row_key()
+                .as_str()
+                .to_owned();
+            provider.queue(agent::AgentDomainEvent::TurnStarted { turn_id: "t1".into() });
+            tick_handle_until(&handle, "running", || {
+                handle.state.borrow().tabs.get(tab).unwrap().turn_running()
+            });
+            let (inbound, rx) = mpsc::sync_channel(INBOUND_LINES);
+            let wake: agent::UiWake = Arc::new(|| {});
+            let shared = Arc::new(Shared {
+                inbound,
+                wake: wake.clone(),
+                store: store.clone(),
+                deadlines: Deadlines::default(),
+                live: AtomicUsize::new(0),
+                next_conn: AtomicU64::new(1),
+                stopped: AtomicBool::new(false),
+                devices: devices::DevicesShared::new("b4e1c09a7d3f5e21"),
+                serve_probe: std::sync::Mutex::new(None),
+                audit: AuditSink::open(&dir, "b4e1c09a7d3f5e21", wake),
+            });
+            let (stream, _peer) = UnixStream::pair().unwrap();
+            let (out, answers) = mpsc::channel();
+            let socket = RemoteSocket {
+                listener: None,
+                shared,
+                inbound: rx,
+                conns: RefCell::new(BTreeMap::from([(
+                    1,
+                    Conn {
+                        stream,
+                        out,
+                        gauge: Arc::new(Gauge::default()),
+                        observers: BTreeMap::new(),
+                    },
+                )])),
+                reaper: RefCell::new(None),
+                feed: feed::FeedState::default(),
+                closes: RefCell::new(Vec::new()),
+            };
+
+            for (device, token, id, text) in [
+                ("d1", "tok", "q1", "SECRET ONE"),
+                ("d1", "tok", "q2", "SECRET TWO"),
+                ("d2", "tok2", "q3", "other phone"),
+            ] {
+                let act = ActInbound::read(
+                    RvInbound::Act {
+                        v: eitri_core::remote_rv::RV_PROTOCOL,
+                        device: device.into(),
+                        token: eitri_core::remote_rv::Secret::new(token),
+                        key: key.clone(),
+                        cmd: serde_json::json!({"type": "queue", "command_id": format!("{revoke}-{id}"), "text": text}),
+                    },
+                    &socket.shared,
+                )
+                .unwrap();
+                socket.take_act(&handle, 1, act);
+                let result: serde_json::Value = serde_json::from_str(&answers.try_recv().unwrap().line).unwrap();
+                assert_eq!(result["ok"], true);
+            }
+            base.sent.borrow_mut().clear();
+            update(&store, |s| {
+                if revoke {
+                    s.remove("d1");
+                } else {
+                    s.get_mut("d1").unwrap().grant = Grant::Watch;
+                }
+            })
+            .unwrap();
+            handle.tick();
+            let notices = handle
+                .state
+                .borrow()
+                .tabs
+                .get(tab)
+                .unwrap()
+                .live()
+                .unwrap()
+                .projection()
+                .notices
+                .clone();
+            assert_eq!(notices.len(), 1, "one withdrawal row per device and tab");
+            assert_eq!(
+                notices[0].content.as_deref(),
+                Some(format!("Withdrew 2 queued messages from {name}: device steering permission withdrawn").as_str())
+            );
+            assert_eq!(notices[0].level, agent::NoticeLevel::Notice);
+            assert!(!notices[0].content.as_ref().unwrap().contains("SECRET"));
+            assert_eq!(handle.state.borrow().tabs.queue_texts(tab), vec!["other phone"]);
+            base.sent.borrow_mut().clear();
+            handle.tick();
+            assert_eq!(
+                handle
+                    .state
+                    .borrow()
+                    .tabs
+                    .get(tab)
+                    .unwrap()
+                    .live()
+                    .unwrap()
+                    .projection()
+                    .notices
+                    .len(),
+                1
+            );
+            assert!(
+                base.sent
+                    .borrow()
+                    .iter()
+                    .any(|e| e.contains("device steering permission withdrawn")),
+                "the row reaches the page"
+            );
+            provider.queue(agent::AgentDomainEvent::TurnCompleted {
+                turn_id: "t1".into(),
+                outcome: agent::TurnOutcome::Completed,
+                result_text: String::new(),
+                stop_reason: None,
+                usage: None,
+                detail: Default::default(),
+            });
+            tick_handle_until(&handle, "other phone runs", || !provider.turns().is_empty());
+            assert_eq!(provider.turns(), vec!["other phone"]);
+            crate::agent_panel::tests::shut_down_every_tab(&handle);
         }
     }
 

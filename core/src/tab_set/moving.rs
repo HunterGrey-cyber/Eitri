@@ -283,8 +283,8 @@ pub(super) enum TurnSend {
 
 /// A prompt held until the presence says it may go out.
 pub(super) struct PendingSend {
-    gate: SendGate,
-    what: TurnSend,
+    pub(super) gate: SendGate,
+    pub(super) what: TurnSend,
 }
 
 impl PendingSend {

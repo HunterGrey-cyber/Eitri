@@ -12,6 +12,7 @@ fn asker() -> RemoteAsker {
         device: "Pixel 8".into(),
         command_id: "s1".into(),
         conn: Some(7),
+        authority: None,
     }
 }
 
@@ -257,4 +258,183 @@ fn every_phone_send_is_counted_as_a_call_out() {
     drop(release);
     f.sends_answered();
     assert_eq!(f.set.remote_sends_out(), 0);
+}
+
+fn stamped_phone(dir: &Path) -> (PathBuf, RemoteAsker) {
+    let store = dir.join("devices.json");
+    agent::private_fs::write_private(
+        &store,
+        serde_json::json!({"v": 1, "devices": [{
+            "id": "d1", "name": "Pixel 8", "token_sha256": crate::remote_devices::token_hash_hex("tok"),
+            "grant": "watch+steer"
+        }]})
+        .to_string()
+        .as_bytes(),
+    )
+    .unwrap();
+    let (_, _, stamp) = crate::remote_devices::authorize_act(&store, "d1", "tok")
+        .unwrap()
+        .unwrap();
+    (
+        store,
+        RemoteAsker {
+            authority: Some(stamp),
+            ..asker()
+        },
+    )
+}
+
+#[test]
+fn only_held_non_refused_stamps_keep_fast_polling() {
+    agent::state_dirs::redirect_state_to_a_test_root();
+    let dir = agent::state_dirs::test_workspace_dir("remote-polling");
+    let (_, phone) = stamped_phone(&dir);
+    let mut set = TabSet::new(BackendKind::Sidecar, SessionModeChoice::Auto);
+    let tab = set.active();
+    let now = Instant::now();
+    let mut item = Queued::held("phone", "phone".into(), 1);
+    item.from = QueuedFrom::Remote {
+        asker: phone,
+        accepted_mode: SessionModeChoice::Auto,
+    };
+    set.get_mut(tab).unwrap().session.queue.push(item);
+    assert!(set.needs_polling());
+    assert_eq!(set.remote_poll_deadline(now), None);
+
+    set.get_mut(tab).unwrap().session.queue[0].refused = true;
+    assert!(!set.needs_polling());
+    assert_eq!(set.remote_poll_deadline(now), Some(now + Duration::from_secs(1)));
+
+    let item = &mut set.get_mut(tab).unwrap().session.queue[0];
+    item.refused = false;
+    item.state = QueuedState::Steered {
+        client_id: "c1".into(),
+        sent_at_ms: 2,
+    };
+    assert!(!set.needs_polling());
+    assert_eq!(set.remote_poll_deadline(now), Some(now + Duration::from_secs(1)));
+
+    set.get_mut(tab).unwrap().session.queue[0].from = QueuedFrom::Desk;
+    assert!(!set.needs_polling());
+    assert_eq!(set.remote_poll_deadline(now), None);
+}
+
+#[test]
+fn withdrawn_phone_messages_never_leave_the_queue() {
+    for revoke in [true, false] {
+        for steer in [true, false] {
+            let mut f = Fixture::new("withdraw-held", SessionModeChoice::Auto);
+            f.start("t1");
+            let (store, phone) = stamped_phone(&f.dir);
+            f.set.queue_remote(f.tab, "secret one", phone.clone(), 1).unwrap();
+            f.set.queue_remote(f.tab, "secret two", phone, 2).unwrap();
+            let other = RemoteAsker {
+                device_id: "d2".into(),
+                ..asker()
+            };
+            f.set.queue_remote(f.tab, "other phone", other, 3).unwrap();
+            f.set
+                .queue_message(f.tab, "desk", "desk".into(), 4, true, PromptOrigin::Typed)
+                .unwrap();
+            crate::remote_devices::update(&store, |s| {
+                if revoke {
+                    s.remove("d1");
+                } else {
+                    s.get_mut("d1").unwrap().grant = crate::remote_devices::Grant::Watch;
+                }
+            })
+            .unwrap();
+            if steer {
+                f.set.steer_held(f.tab, 5, Some("t1"));
+            } else {
+                f.end("t1");
+                f.set.flush_queue(f.tab);
+            }
+            let tab = f.set.get(f.tab).unwrap();
+            assert!(tab
+                .session
+                .queue
+                .iter()
+                .all(|q| q.text != "secret one" && q.text != "secret two"));
+            assert!(f.provider.turns().iter().all(|text| !text.contains("secret")));
+            if steer {
+                assert_eq!(
+                    f.provider.steers().iter().map(|s| s.text.as_str()).collect::<Vec<_>>(),
+                    vec!["other phone", "desk"]
+                );
+            }
+            if !steer {
+                assert_eq!(f.provider.turns(), vec!["other phone"]);
+                assert_eq!(
+                    tab.session.queue.iter().map(|q| q.text.as_str()).collect::<Vec<_>>(),
+                    vec!["desk"]
+                );
+            }
+        }
+    }
+}
+
+#[test]
+fn moved_phone_messages_keep_their_withdrawal_stamp() {
+    for missing_counter in [false, true] {
+        let mut f = Fixture::new("withdraw-moved", SessionModeChoice::Auto);
+        f.start("t1");
+        let (store, phone) = stamped_phone(&f.dir);
+        f.set.queue_remote(f.tab, "secret", phone, 1).unwrap();
+        let wire = serde_json::to_string(&f.set.get(f.tab).unwrap().session.queue).unwrap();
+        if missing_counter {
+            std::fs::remove_file(
+                store.with_extension(format!("authority-{}", crate::remote_devices::token_hash_hex("d1"))),
+            )
+            .unwrap();
+        }
+        f.set.get_mut(f.tab).unwrap().session.queue = serde_json::from_str(&wire).unwrap();
+        if !missing_counter {
+            crate::remote_devices::update(&store, |s| s.remove("d1")).unwrap();
+        }
+        f.end("t1");
+        let deadline = Instant::now() + Duration::from_secs(60);
+        while !f.set.get(f.tab).unwrap().session.queue.is_empty() {
+            f.set.flush_queue(f.tab);
+            assert!(f.provider.turns().is_empty(), "a moved withdrawn message ran");
+            assert!(Instant::now() < deadline, "the moved authority never loaded");
+            std::thread::yield_now();
+        }
+        assert!(f.provider.turns().is_empty());
+    }
+}
+
+#[test]
+fn withdrawal_leaves_an_inflight_steer_but_prevents_its_retry() {
+    let mut f = Fixture::new("withdraw-steered", SessionModeChoice::Auto);
+    f.start("t1");
+    let (store, phone) = stamped_phone(&f.dir);
+    f.set.queue_remote(f.tab, "already sent", phone, 1).unwrap();
+    f.set.steer_held(f.tab, 2, Some("t1"));
+    assert_eq!(f.provider.steers().len(), 1);
+    crate::remote_devices::update(&store, |s| s.remove("d1")).unwrap();
+    f.set.pump(&f.dir, true);
+    assert_eq!(f.set.get(f.tab).unwrap().session.queue.len(), 1);
+    assert!(f.set.take_remote_withdrawn().is_empty());
+    f.end("t1");
+    f.set.flush_queue(f.tab);
+    assert!(f.provider.turns().is_empty());
+    assert_eq!(f.set.take_remote_withdrawn().len(), 1);
+}
+
+#[test]
+fn moved_authorized_phone_messages_resume_after_counter_loading() {
+    let mut f = Fixture::new("withdraw-move-valid", SessionModeChoice::Auto);
+    f.start("t1");
+    let (_, phone) = stamped_phone(&f.dir);
+    f.set.queue_remote(f.tab, "still allowed", phone, 1).unwrap();
+    let wire = serde_json::to_string(&f.set.get(f.tab).unwrap().session.queue).unwrap();
+    f.set.get_mut(f.tab).unwrap().session.queue = serde_json::from_str(&wire).unwrap();
+    f.end("t1");
+    let tab = f.tab;
+    f.wait("moved counter loaded", |set| {
+        set.flush_queue(tab);
+        set.queue_texts(tab).is_empty()
+    });
+    assert_eq!(f.provider.turns(), vec!["still allowed"]);
 }

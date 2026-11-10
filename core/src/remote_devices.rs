@@ -387,16 +387,78 @@ pub fn update<T>(path: &Path, f: impl FnOnce(&mut DeviceStore) -> T) -> io::Resu
     Ok(out)
 }
 
-/// The generation of the authority under which an act was read. Checking it touches only shared memory.
-/// A withdrawal in any process invalidates this device's pending acts; admitted tab messages are unaffected.
+/// The authority under which a remote message was accepted. Moved messages reopen the shared counter on a
+/// worker; until that finishes they stay held. No token travels with the message.
+#[derive(Clone, serde::Serialize, serde::Deserialize)]
+#[serde(from = "StoredAuthority", into = "StoredAuthority")]
 pub struct AuthorizationStamp {
-    generation: SharedGeneration,
+    saved: StoredAuthority,
+    generation: std::sync::Arc<std::sync::OnceLock<Option<SharedGeneration>>>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+struct StoredAuthority {
+    store: std::path::PathBuf,
+    device: String,
     read_at: u64,
 }
 
+impl From<AuthorizationStamp> for StoredAuthority {
+    fn from(stamp: AuthorizationStamp) -> Self {
+        stamp.saved
+    }
+}
+
+impl From<StoredAuthority> for AuthorizationStamp {
+    fn from(saved: StoredAuthority) -> Self {
+        Self::reopen(saved, |read| std::thread::Builder::new().spawn(read))
+    }
+}
+
+impl AuthorizationStamp {
+    fn reopen(
+        saved: StoredAuthority,
+        spawn: impl FnOnce(Box<dyn FnOnce() + Send>) -> std::io::Result<std::thread::JoinHandle<()>>,
+    ) -> Self {
+        let generation = std::sync::Arc::new(std::sync::OnceLock::new());
+        let answer = generation.clone();
+        let read = saved.clone();
+        if spawn(Box::new(move || {
+            let _ = answer.set(SharedGeneration::open(&read.store, &read.device, false).ok());
+        }))
+        .is_err()
+        {
+            let _ = generation.set(None);
+        }
+        Self { saved, generation }
+    }
+}
+
+impl std::fmt::Debug for AuthorizationStamp {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        self.saved.fmt(f)
+    }
+}
+
+impl PartialEq for AuthorizationStamp {
+    fn eq(&self, other: &Self) -> bool {
+        self.saved == other.saved
+    }
+}
+impl Eq for AuthorizationStamp {}
+
 impl AuthorizationStamp {
     pub fn is_current(&self) -> bool {
-        self.generation.value().load(Ordering::SeqCst) == self.read_at
+        self.current() == Some(true)
+    }
+
+    /// None while a moved message's counter is being opened; a failed open withdraws the message.
+    pub fn current(&self) -> Option<bool> {
+        self.generation.get().map(|generation| {
+            generation
+                .as_ref()
+                .is_some_and(|g| g.value().load(Ordering::SeqCst) == self.saved.read_at)
+        })
     }
 }
 
@@ -414,7 +476,13 @@ pub fn authorize_act(
     };
     let generation = SharedGeneration::open(path, device, true)?;
     let read_at = generation.value().load(Ordering::SeqCst);
-    Ok(Some((name, grant, AuthorizationStamp { generation, read_at })))
+    let saved = StoredAuthority {
+        store: path.to_owned(),
+        device: device.to_owned(),
+        read_at,
+    };
+    let generation = std::sync::Arc::new(std::sync::OnceLock::from(Some(generation)));
+    Ok(Some((name, grant, AuthorizationStamp { saved, generation })))
 }
 
 /// A per-device atomic counter shared by all processes using this store. Its file is never removed, replaced or
@@ -619,6 +687,20 @@ pub fn push_endpoint_ok(url: &str) -> Result<(), &'static str> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn a_stamp_whose_worker_cannot_start_is_withdrawn() {
+        let stamp = super::AuthorizationStamp::reopen(
+            super::StoredAuthority {
+                store: std::path::PathBuf::from("unused"),
+                device: "d1".into(),
+                read_at: 0,
+            },
+            |_| Err(std::io::Error::other("worker unavailable")),
+        );
+        assert_eq!(stamp.current(), Some(false));
+        assert!(!stamp.is_current());
+    }
+
     use super::*;
     use std::os::unix::fs::PermissionsExt;
     use std::path::PathBuf;

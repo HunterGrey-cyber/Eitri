@@ -1630,6 +1630,7 @@ pub struct TabSet {
     remote_sent: Vec<RemoteSent>,
     /// A phone's queued messages taken out unsent because their tab's mode widened ([`TabSet::take_remote_refused`]).
     remote_refused: Vec<RemoteRefused>,
+    remote_withdrawn: Vec<(TabId, RemoteAsker)>,
     /// Whether this window is linked to another one (`TabSet::set_partner`, `TabSet::add_partner`): then a
     /// prompt waits for its presence file before it goes out.
     linked: bool,
@@ -1742,6 +1743,7 @@ impl TabSet {
             remote_sends: BTreeMap::new(),
             remote_sent: Vec::new(),
             remote_refused: Vec::new(),
+            remote_withdrawn: Vec::new(),
             linked: false,
             partner_pids: BTreeSet::new(),
             untracked_turns: BTreeMap::new(),
@@ -3676,6 +3678,7 @@ impl TabSet {
             tab.session.client_calls.live_edits_on = self.live_edits;
             Self::pump_tab(tab, &mut tick, review.as_deref_mut(), place, &mut out);
         }
+        out.queue_changed.extend(self.withdraw_remote());
         for id in self.steer_waiting(wall_clock_ms()) {
             if !out.queue_changed.contains(&id) {
                 out.queue_changed.push(id);
@@ -4816,10 +4819,11 @@ impl TabSet {
             return false;
         }
         // A phone's message goes into a turn only while the tab's mode is no wider than when it was taken.
+        let withdrawn = self.withdraw_remote().contains(&id);
         let widened = self.refuse_widened_in(id);
         let mut next = self.next_steer;
         let Some(tab) = self.get_mut(id) else { return false };
-        let mut changed = tab.settle_steered() || widened;
+        let mut changed = tab.settle_steered() || widened || withdrawn;
         if tab.pending_handoff.is_some() || !tab.turn_running() || !tab.session.queue.iter().any(Queued::is_held) {
             return changed;
         }
@@ -4834,6 +4838,9 @@ impl TabSet {
             // follows it is steered as if it were not there.
             if item.refused {
                 continue;
+            }
+            if item.from.authorized() != Some(true) {
+                break;
             }
             // A provider that stopped waiting on a message reports it dropped although the agent may
             // still read it, and sent again under a new id it could run twice. It waits for the turn's
@@ -4965,10 +4972,17 @@ impl TabSet {
         // A phone's message goes only while the tab's mode is no wider than when it was taken. No turn runs, so
         // one put into the last turn that the agent never said it read would be sent again below: it is
         // refused as a held one is.
+        let withdrawn = tab.withdraw_unauthorized(true);
+        let waiting = tab.session.queue.iter().any(|q| q.from.authorized().is_none());
         let refused = tab.refuse_widened(true);
         // A message the CLI refused waits for the person; it is not a reason to send a turn.
-        let goes = tab.session.queue.iter().any(|item| !item.refused);
+        let goes = !waiting && tab.session.queue.iter().any(|item| !item.refused);
+        self.remote_withdrawn
+            .extend(withdrawn.into_iter().map(|asker| (id, asker)));
         self.remote_refused.extend(refused);
+        if waiting {
+            self.flush_owed.insert(id.0);
+        }
         goes
     }
 
@@ -5179,7 +5193,9 @@ impl TabSet {
             self.steer_held(id, now_ms, Some(&turn));
             if let Some(tab) = self.get_mut(id) {
                 for item in tab.session.queue.iter_mut() {
-                    item.steer_when_running = false;
+                    if item.from.authorized().is_some() {
+                        item.steer_when_running = false;
+                    }
                 }
             }
             changed.push(id);

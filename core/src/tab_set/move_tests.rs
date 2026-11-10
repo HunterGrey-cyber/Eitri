@@ -1154,6 +1154,7 @@ fn phone() -> RemoteAsker {
         device: "Pixel 8".into(),
         command_id: "s1".into(),
         conn: Some(7),
+        authority: None,
     }
 }
 
@@ -2801,4 +2802,48 @@ fn a_failed_restore_into_the_empty_tab_does_not_keep_the_records_key() {
     assert!(matches!(empty.backend, TabBackend::NotStarted), "an empty tab again");
     assert!(is_key_shaped(empty.row_key().as_str()), "{}", empty.row_key());
     assert_ne!(empty.row_key(), &key, "the record's key went back with the record");
+}
+
+#[test]
+fn a_withdrawn_phone_send_waiting_for_presence_never_runs() {
+    for revoke in [true, false] {
+        let (scratch, mut set, tab, provider, _parked) = linked_with_a_waiting_presence("move-remote-withdrawn", 4262);
+        let store = scratch.join("devices.json");
+        agent::private_fs::write_private(
+            &store,
+            serde_json::json!({"v": 1, "devices": [{
+                "id": "d1", "name": "Pixel 8", "token_sha256": crate::remote_devices::token_hash_hex("tok"),
+                "grant": "watch+steer"
+            }]})
+            .to_string()
+            .as_bytes(),
+        )
+        .unwrap();
+        let (_, _, stamp) = crate::remote_devices::authorize_act(&store, "d1", "tok")
+            .unwrap()
+            .unwrap();
+        set.send_remote(
+            tab,
+            "phone words",
+            RemoteAsker {
+                authority: Some(stamp),
+                ..phone()
+            },
+        )
+        .unwrap();
+        assert!(set.send_is_held(tab));
+        crate::remote_devices::update(&store, |s| {
+            if revoke {
+                s.remove("d1");
+            } else {
+                s.get_mut("d1").unwrap().grant = crate::remote_devices::Grant::Watch;
+            }
+        })
+        .unwrap();
+        let _ = set.set_partner(None);
+        assert!(!set.remote_send_waits(tab), "no provider call may start");
+        assert!(provider.turns().is_empty());
+        assert!(!set.send_is_held(tab) && !set.starting.contains(&tab.0));
+        shut_down(&mut set);
+    }
 }

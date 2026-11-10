@@ -1106,6 +1106,19 @@ impl AgentBackend {
         });
     }
 
+    /// A host notice that stays as a plain-text row in the conversation and its history.
+    pub fn fold_notice(&mut self, text: String) {
+        self.fold_row(AgentDomainEvent::SessionNotice {
+            kind: agent::SessionNoticeKind::Informational,
+            level: agent::NoticeLevel::Notice,
+            content: Some(text),
+            scalars: Default::default(),
+            task_id: None,
+            tool_use_id: None,
+            task_status: None,
+        });
+    }
+
     fn fold_row(&mut self, event: AgentDomainEvent) {
         match self {
             AgentBackend::Legacy(session) => {

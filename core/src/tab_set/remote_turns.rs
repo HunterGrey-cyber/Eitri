@@ -13,6 +13,9 @@ use crate::agent_backend::{SpawnedTurn, TurnRequest};
 pub struct RemoteAsker {
     /// The device's id in the device store: a device's own items are found by it, never by its name.
     pub device_id: String,
+    /// The authority accepted at the socket, retained across queueing and window moves.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub authority: Option<crate::remote_devices::AuthorizationStamp>,
     /// The device's name, which the desk is told.
     pub device: String,
     /// The id of the command the message came in.
@@ -23,6 +26,10 @@ pub struct RemoteAsker {
 }
 
 impl RemoteAsker {
+    pub(super) fn authorized(&self) -> Option<bool> {
+        self.authority.as_ref().map_or(Some(true), |stamp| stamp.current())
+    }
+
     pub(super) fn sent_from(&self) -> crate::agent_bridge::SentFrom {
         crate::agent_bridge::SentFrom {
             device_id: self.device_id.clone(),
@@ -46,6 +53,13 @@ pub enum QueuedFrom {
 }
 
 impl QueuedFrom {
+    pub(super) fn authorized(&self) -> Option<bool> {
+        match self {
+            Self::Desk => Some(true),
+            Self::Remote { asker, .. } => asker.authorized(),
+        }
+    }
+
     pub fn is_desk(&self) -> bool {
         matches!(self, QueuedFrom::Desk)
     }
@@ -130,6 +144,25 @@ pub struct RemoteSent {
 }
 
 impl Tab {
+    pub(super) fn withdraw_unauthorized(&mut self, steered_too: bool) -> Vec<RemoteAsker> {
+        let mut withdrawn = Vec::new();
+        self.session.queue.retain(|item| {
+            if (item.is_held() || steered_too) && item.from.authorized() == Some(false) {
+                if let QueuedFrom::Remote { asker, .. } = &item.from {
+                    withdrawn.push(asker.clone());
+                }
+                false
+            } else {
+                true
+            }
+        });
+        if !withdrawn.is_empty() && self.session.queue.is_empty() {
+            self.session.queue_error = None;
+            self.session.queue_note = None;
+        }
+        withdrawn
+    }
+
     pub fn note_remote_stop(&mut self, id: String, from: crate::agent_bridge::SentFrom) {
         self.notes.stopped_from.insert(id, from);
         self.notes.remote_notes_dirty = true;
@@ -178,6 +211,42 @@ impl Tab {
 }
 
 impl TabSet {
+    /// Withdraw held messages, including sends waiting for presence, without touching a provider call already out.
+    pub(super) fn withdraw_remote(&mut self) -> Vec<TabId> {
+        let mut changed = Vec::new();
+        for tab in &mut self.tabs {
+            if !self.moving.contains(&tab.id.0) {
+                let withdrawn = tab.withdraw_unauthorized(false);
+                if !withdrawn.is_empty() {
+                    changed.push(tab.id);
+                    self.remote_withdrawn
+                        .extend(withdrawn.into_iter().map(|asker| (tab.id, asker)));
+                }
+            }
+        }
+        let cancelled: Vec<_> = self
+            .pending_sends
+            .iter()
+            .filter_map(|(id, pending)| match &pending.what {
+                moving::TurnSend::Remote { asker, .. } if asker.authorized() == Some(false) => Some(*id),
+                _ => None,
+            })
+            .collect();
+        for id in cancelled {
+            let pending = self.pending_sends.remove(&id).unwrap();
+            self.end_start_of(&pending.gate);
+            if let moving::TurnSend::Remote { asker, .. } = pending.what {
+                self.remote_withdrawn.push((TabId(id), asker));
+            }
+        }
+        changed
+    }
+
+    /// Withdrawn messages' identities only: the panel counts these and never receives their text here.
+    pub fn take_remote_withdrawn(&mut self) -> Vec<(TabId, RemoteAsker)> {
+        std::mem::take(&mut self.remote_withdrawn)
+    }
+
     /// A phone's message, queued behind the turn running in `id` as a held item that remembers the device and the
     /// tab's mode now. Refused as [`TabSet::queue_message`] refuses; the caller checked the rest.
     pub fn queue_remote(&mut self, id: TabId, text: &str, asker: RemoteAsker, now_ms: u64) -> Result<usize, String> {
@@ -268,6 +337,28 @@ impl TabSet {
         accepted_mode: SessionModeChoice,
     ) {
         let id = gate.tab();
+        match asker.authorized() {
+            Some(true) => {}
+            Some(false) => {
+                self.end_start_of(&gate);
+                self.remote_withdrawn.push((id, asker));
+                return;
+            }
+            None => {
+                self.pending_sends.insert(
+                    id.0,
+                    moving::PendingSend {
+                        gate,
+                        what: moving::TurnSend::Remote {
+                            turn,
+                            asker,
+                            accepted_mode,
+                        },
+                    },
+                );
+                return;
+            }
+        }
         if self.card_waits(id) || self.shell_line_runs(id) {
             self.end_start_of(&gate);
             self.remote_not_sent(id, turn, asker, "the tab waits for the desk".to_string());
@@ -466,7 +557,30 @@ impl TabSet {
 
     /// Whether a phone's send of `id` is out, or something about the phone's messages waits to be told.
     pub(super) fn remote_needs_polling(&self) -> bool {
-        !self.remote_sends.is_empty() || !self.remote_sent.is_empty() || !self.remote_refused.is_empty()
+        !self.remote_sends.is_empty()
+            || !self.remote_sent.is_empty()
+            || !self.remote_refused.is_empty()
+            || !self.remote_withdrawn.is_empty()
+            || self.tabs.iter().any(|tab| {
+                tab.session.queue.iter().any(|q| {
+                    q.is_held()
+                        && !q.refused
+                        && matches!(&q.from, QueuedFrom::Remote { asker, .. } if asker.authority.is_some())
+                })
+            })
+    }
+
+    /// Refused or already steered messages need only a slow check for authority withdrawn in another process.
+    pub fn remote_poll_deadline(&self, now: std::time::Instant) -> Option<std::time::Instant> {
+        self.tabs
+            .iter()
+            .any(|tab| {
+                tab.session.queue.iter().any(|q| {
+                    (!q.is_held() || q.refused)
+                        && matches!(&q.from, QueuedFrom::Remote { asker, .. } if asker.authority.is_some())
+                })
+            })
+            .then_some(now + std::time::Duration::from_secs(1))
     }
 
     /// Whether a phone's send of `id` waits for its provider call.
@@ -501,6 +615,7 @@ mod tests {
             device: "Pixel 8".into(),
             command_id: "q1".into(),
             conn: Some(7),
+            authority: None,
         }
     }
 

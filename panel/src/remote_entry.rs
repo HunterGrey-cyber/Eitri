@@ -29,6 +29,7 @@ pub struct RemoteOrigin {
     /// The device's name, as the page that shows the tab is told it.
     pub device: String,
     pub conn: u64,
+    pub authority: Option<eitri_core::remote_devices::AuthorizationStamp>,
 }
 
 /// The work a stop was asked about, so a stop that arrives after that work has ended stops nothing: a turn by its id
@@ -273,6 +274,7 @@ pub(super) fn handle_remote_message(
         device: origin.device.clone(),
         command_id,
         conn: Some(origin.conn),
+        authority: origin.authority.clone(),
     };
     match message {
         RemoteInbound::Interrupt { command_id, .. } => {
@@ -642,6 +644,40 @@ pub(super) fn poll_remote(state: &mut AgentPanelState, screen: &Screen, out: &mu
     send_owed_notices(state, out);
     let results_before = state.remote.results.len();
     poll_remote_answers(state, screen, out);
+    let mut counts: Vec<(TabId, String, String, usize)> = Vec::new();
+    for (tab, asker) in state.tabs.take_remote_withdrawn() {
+        audit_refused(
+            state,
+            tab,
+            &asker.device_id,
+            &asker.device,
+            "queue",
+            Reason::RevokedToken,
+        );
+        if let Some((_, _, _, count)) = counts
+            .iter_mut()
+            .find(|(t, id, _, _)| *t == tab && *id == asker.device_id)
+        {
+            *count += 1;
+        } else {
+            counts.push((tab, asker.device_id, asker.device, 1));
+        }
+        state.remote.result(
+            asker.conn,
+            asker.command_id,
+            Err(RemoteRefusal::Agent("device steering permission withdrawn".into())),
+        );
+    }
+    for (tab, _, name, count) in counts {
+        let noun = if count == 1 { "message" } else { "messages" };
+        let told = format!("Withdrew {count} queued {noun} from {name}: device steering permission withdrawn");
+        if let Some(backend) = state.tabs.get_mut(tab).and_then(Tab::live_mut) {
+            backend.fold_notice(told);
+        } else {
+            tell_desk(state, tab, &told, out);
+        }
+        send_queue(state, tab, out);
+    }
     send_owed_notices(state, out);
     if state.remote.results.len() != results_before {
         if let Some(wake) = &state.wake {
@@ -739,8 +775,7 @@ fn poll_remote_answers(state: &mut AgentPanelState, screen: &Screen, out: &mut O
                 &origin.device_id,
                 &origin.device,
                 kind,
-                why,
-                RefusedAt::Send,
+                audit_reason(why, RefusedAt::Send),
             );
         }
         state.remote.result(Some(origin.conn), command_id, result);
@@ -786,8 +821,7 @@ fn poll_remote_answers(state: &mut AgentPanelState, screen: &Screen, out: &mut O
                 &asker.device_id,
                 &asker.device,
                 "send",
-                why,
-                RefusedAt::Send,
+                audit_reason(why, RefusedAt::Send),
             );
         }
         state.remote.result(asker.conn, asker.command_id, result);
@@ -820,8 +854,7 @@ fn poll_remote_answers(state: &mut AgentPanelState, screen: &Screen, out: &mut O
             &asker.device_id,
             &asker.device,
             "queue",
-            &RemoteRefusal::ModeNotAllowed,
-            RefusedAt::Flush,
+            audit_reason(&RemoteRefusal::ModeNotAllowed, RefusedAt::Flush),
         );
         state
             .remote
@@ -1022,12 +1055,11 @@ fn audit_refused(
     device_id: &str,
     device: &str,
     kind: &'static str,
-    why: &RemoteRefusal,
-    at: RefusedAt,
+    reason: Reason,
 ) {
     let Some(audit) = &state.remote.audit else { return };
     audit.record(AuditEvent::Refused {
-        reason: audit_reason(why, at),
+        reason,
         device: Some(device_ref(device_id, device)),
         listener: None,
         peer: None,
@@ -1413,6 +1445,7 @@ mod tests {
             device_id: "d1".into(),
             device: "Pixel 8".into(),
             conn: 1,
+            authority: None,
         }
     }
 
@@ -1973,6 +2006,7 @@ mod tests {
             device_id: "d2".into(),
             device: "Tablet".into(),
             conn: 3,
+            authority: None,
         };
         assert_eq!(
             settle(&handle, &other, &key, &stop),
@@ -2378,6 +2412,7 @@ mod tests {
             device_id: "d2".into(),
             device: "Pixel 8".into(),
             conn: 2,
+            authority: None,
         };
         assert_eq!(
             handle.remote_message(
@@ -3145,6 +3180,167 @@ mod tests {
         );
         assert_eq!(field(records.last().unwrap(), "key"), Some(key.as_str()));
         shut_down_every_tab(&handle);
+    }
+
+    fn stamped_queue(handle: &AgentPanelHandle, tab: TabId, count: usize) -> PathBuf {
+        use eitri_core::remote_devices::{authorize_act, token_hash_hex};
+        use eitri_core::tab_set::{Queued, QueuedFrom};
+        let dir = agent::state_dirs::test_workspace_dir("withdrawal-stamp");
+        let store = dir.join("devices.json");
+        agent::private_fs::write_private(
+            &store,
+            serde_json::json!({"v": 1, "devices": [{
+                "id": "d1", "name": "Pixel 8", "token_sha256": token_hash_hex("tok"),
+                "grant": "watch+steer"
+            }]})
+            .to_string()
+            .as_bytes(),
+        )
+        .unwrap();
+        let (_, _, stamp) = authorize_act(&store, "d1", "tok").unwrap().unwrap();
+        let mut state = handle.state.borrow_mut();
+        let tab = state.tabs.get_mut(tab).unwrap();
+        for n in 0..count {
+            let mut item = Queued::held("SECRET", "SECRET".into(), 1);
+            item.from = QueuedFrom::Remote {
+                asker: RemoteAsker {
+                    device_id: "d1".into(),
+                    device: "Pixel 8".into(),
+                    command_id: format!("q{n}"),
+                    conn: None,
+                    authority: Some(stamp.clone()),
+                },
+                accepted_mode: SessionModeChoice::Auto,
+            };
+            tab.session.queue.push(item);
+        }
+        store
+    }
+
+    #[test]
+    fn a_refused_stamped_item_uses_a_slow_tick() {
+        use crate::panel_wake::NextTick;
+        use std::time::{Duration, Instant};
+        let (handle, _) = settled_panel();
+        let tab = handle.state.borrow().tabs.active();
+        let store = stamped_queue(&handle, tab, 1);
+        let now = Instant::now();
+        assert_eq!(handle.run_tick(now), NextTick::At(now + AgentPanelHandle::TICK));
+        handle.state.borrow_mut().tabs.get_mut(tab).unwrap().session.queue[0].refused = true;
+        assert!(!handle.state.borrow().tabs.needs_polling());
+        assert_eq!(handle.run_tick(now), NextTick::At(now + Duration::from_secs(1)));
+        eitri_core::remote_devices::update(&store, |s| {
+            s.remove("d1");
+        })
+        .unwrap();
+        handle.run_tick(now + Duration::from_secs(1));
+        assert!(handle.state.borrow().tabs.queue_texts(tab).is_empty());
+        assert_eq!(handle.run_tick(now + Duration::from_secs(2)), NextTick::OnWake);
+    }
+
+    #[test]
+    fn withdrawn_messages_without_a_backend_are_told_or_owed() {
+        for hidden in [false, true] {
+            for count in [1, 2] {
+                let (handle, base, _) = handle_with_two_pages();
+                let tab = handle.state.borrow().tabs.active();
+                let store = stamped_queue(&handle, tab, count);
+                if hidden {
+                    handle.state.borrow_mut().tabs.open(AgentId::Claude);
+                }
+                clear(&[&base]);
+                eitri_core::remote_devices::update(&store, |s| {
+                    s.remove("d1");
+                })
+                .unwrap();
+                handle.tick();
+                if hidden {
+                    assert!(notices(&base.sent.borrow()).is_empty());
+                    assert_eq!(handle.state.borrow().remote.notices.len(), 1);
+                    assert!(handle.select_tab(tab));
+                    handle.tick();
+                }
+                let noun = if count == 1 { "message" } else { "messages" };
+                let expected =
+                    format!("Withdrew {count} queued {noun} from Pixel 8: device steering permission withdrawn");
+                assert_eq!(notices(&base.sent.borrow()), vec![expected]);
+                clear(&[&base]);
+                handle.tick();
+                assert!(notices(&base.sent.borrow()).is_empty());
+            }
+        }
+    }
+
+    #[test]
+    fn one_withdrawn_message_folds_a_singular_row() {
+        let dir = agent::state_dirs::test_workspace_dir("withdrawal-singular");
+        let (handle, _, _) = handle_with_two_pages();
+        let (tab, _) = live_tab(&handle, &dir);
+        let store = stamped_queue(&handle, tab, 1);
+        eitri_core::remote_devices::update(&store, |s| {
+            s.remove("d1");
+        })
+        .unwrap();
+        handle.tick();
+        let state = handle.state.borrow();
+        let notices = state
+            .tabs
+            .get(tab)
+            .unwrap()
+            .live()
+            .unwrap()
+            .projection()
+            .notices
+            .clone();
+        assert_eq!(notices.len(), 1);
+        assert_eq!(
+            notices[0].content.as_deref(),
+            Some("Withdrew 1 queued message from Pixel 8: device steering permission withdrawn")
+        );
+        drop(state);
+        shut_down_every_tab(&handle);
+    }
+
+    #[test]
+    fn each_withdrawn_message_is_audited_without_its_text() {
+        for revoke in [false, true] {
+            let (handle, _, _) = handle_with_two_pages();
+            let tab = handle.state.borrow().tabs.active();
+            let key = handle
+                .state
+                .borrow()
+                .tabs
+                .get(tab)
+                .unwrap()
+                .row_key()
+                .as_str()
+                .to_owned();
+            let store = stamped_queue(&handle, tab, 2);
+            let (sink, audit) = audited(&handle, "audit-withdrawal");
+            eitri_core::remote_devices::update(&store, |s| {
+                if revoke {
+                    s.remove("d1");
+                } else {
+                    s.get_mut("d1").unwrap().grant = eitri_core::remote_devices::Grant::Watch;
+                }
+            })
+            .unwrap();
+            handle.tick();
+            handle.tick();
+            let records = audit_records(&sink, &audit);
+            assert_eq!(
+                refusals(&records),
+                vec![("revoked_token".to_owned(), Some("queue".to_owned())); 2]
+            );
+            for record in &records {
+                assert_eq!(field(record, "key"), Some(key.as_str()));
+                assert_eq!(field(record, "device"), Some("d1"));
+                assert_eq!(field(record, "device_name"), Some("Pixel 8"));
+            }
+            assert!(!std::fs::read_to_string(audit.join("audit.jsonl"))
+                .unwrap()
+                .contains("SECRET"));
+        }
     }
 
     #[test]
