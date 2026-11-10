@@ -32,6 +32,13 @@ import { AtMenu } from "./AtMenu";
 import { SlashMenu } from "./SlashMenu";
 import { NO_TEXT_ASSIST } from "../textField";
 import { runningPlaceholder } from "../queueLines";
+import { isModifierKey } from "../typingGuard";
+import { CTRL_X_ONLY_ENTER_FLASH } from "../app/flashes";
+
+/** How long `Ctrl+x` waits for its second key. */
+export const CTRL_X_CHORD_MS = 2000;
+/** What the band's showcmd says while `Ctrl+x` waits for its second key. */
+export const CTRL_X_SHOWCMD = "Ctrl+x -";
 
 /** A draft the host is putting back into the box after a send was refused.
  *
@@ -96,7 +103,16 @@ type Props = {
   /** Whether Enter while the turn runs puts the message into it (the agent's capability `steer`): only
    *  what the empty box says changes. */
   enterSteers?: boolean;
-  onQueue?: (text: string) => void;
+  /** A message for the running turn (Enter while one runs), or, with `afterTurn`, one that waits for the turn's
+   *  end whatever Enter does with what is typed after it (`Ctrl+x Enter`, sent with or without a turn). */
+  onQueue?: (text: string, options?: { afterTurn: boolean }) => void;
+  /** The `Ctrl+x` chord's showcmd: `CTRL_X_SHOWCMD` while it waits for its second key, `null` when it ends.
+   *  Only a composer given this has the chord; without it (the start screen's) `Ctrl+x` is the box's own cut. */
+  onChord?: (showcmd: string | null) => void;
+  /** Filled by the box with a function for keys the page takes before the box sees them (the document-capture
+   *  Shift+Tab): while the `Ctrl+x` chord waits it ends the chord as any other key does, with the chord's flash,
+   *  and returns true, so the caller does nothing else with the key; false when no chord waits. */
+  chordEnd?: { current: (() => boolean) | null };
   onSendNow?: (text: string) => void;
   /** The shared prompt history, newest last. */
   history?: string[];
@@ -140,6 +156,11 @@ type Props = {
   idleHint?: string;
 };
 
+/** `Ctrl+x` itself, nothing else held (Caps Lock may make the letter upper case). */
+function isCtrlX(e: { key: string; ctrlKey: boolean; shiftKey: boolean; altKey: boolean; metaKey: boolean }): boolean {
+  return e.ctrlKey && !e.shiftKey && !e.altKey && !e.metaKey && (e.key === "x" || e.key === "X");
+}
+
 /** The BROWSE stand-in's own draft preview, cut to two lines so it reads like a hint rather
  *  than reproducing the whole unsent message. */
 function twoLines(text: string): string {
@@ -162,6 +183,8 @@ export function Composer({
   running,
   enterSteers = false,
   onQueue = () => {},
+  onChord,
+  chordEnd,
   onSendNow = () => {},
   history = [],
   queueCount = 0,
@@ -219,6 +242,41 @@ export function Composer({
     slashFlashSeq.current += 1;
     setSlashFlash({ text, seq: slashFlashSeq.current });
   }
+
+  /* `Ctrl+x` waiting for its second key: the timer that ends it, `null` when no chord waits. The host's
+     `onChord` is read through a ref so the timer's end reaches the current one. */
+  const chordTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const onChordRef = useRef(onChord);
+  onChordRef.current = onChord;
+  function startChord() {
+    if (chordTimer.current !== null) clearTimeout(chordTimer.current);
+    chordTimer.current = setTimeout(() => {
+      chordTimer.current = null;
+      onChordRef.current?.(null);
+    }, CTRL_X_CHORD_MS);
+    onChordRef.current?.(CTRL_X_SHOWCMD);
+  }
+  function endChord() {
+    if (chordTimer.current === null) return;
+    clearTimeout(chordTimer.current);
+    chordTimer.current = null;
+    onChordRef.current?.(null);
+  }
+  useEffect(() => endChord, []);
+  // Only refs and a state setter inside, so the first render's closure stays right.
+  useEffect(() => {
+    if (chordEnd === undefined) return;
+    chordEnd.current = () => {
+      if (chordTimer.current === null) return false;
+      endChord();
+      showSlashFlash(CTRL_X_ONLY_ENTER_FLASH);
+      return true;
+    };
+    return () => {
+      chordEnd.current = null;
+    };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [chordEnd]);
 
   /* The box is cleared optimistically on send, because a round trip's worth of latency in a text
      box reads as lag. That is only acceptable if a refused send puts the text back — otherwise the
@@ -401,7 +459,8 @@ export function Composer({
   /** What a `!` first turns the box into, as Claude Code's shell mode: Enter runs the line. */
   const shellMode = claudeSlashCommands === true && text.startsWith("!");
 
-  function submit(now: boolean) {
+  /** `how`: Enter's send, `Ctrl+Enter`'s send now, or `Ctrl+x Enter`'s send after the turn. */
+  function submit(how: "enter" | "now" | "after") {
     if (disabled || editingInNvim) return;
     const body = text;
     const action = claudeSlashCommands ? slashAction(body) : null;
@@ -429,8 +488,13 @@ export function Composer({
       showSlashFlash(slashCommandFlashText(held));
       return;
     }
-    if (running) {
-      if (now) onSendNow(body);
+    if (how === "after") {
+      // Always the queue, turn shown or not: the host holds it for the running turn's end, or sends it as the
+      // next turn when none runs, and nothing on its way can put it into a turn.
+      if (!body.trim()) return;
+      onQueue(body, { afterTurn: true });
+    } else if (running) {
+      if (how === "now") onSendNow(body);
       else if (body.trim()) onQueue(body);
       else return;
     } else {
@@ -442,8 +506,42 @@ export function Composer({
   }
 
   function onKeyDown(e: React.KeyboardEvent<HTMLTextAreaElement>) {
-    if (isImeKey({ isComposing: e.nativeEvent.isComposing, keyCode: e.keyCode })) return;
+    const ime = isImeKey({ isComposing: e.nativeEvent.isComposing, keyCode: e.keyCode });
+    /* The key after `Ctrl+x`, ahead of everything else (the open menus too). A bare modifier waits for the key
+       it modifies, and the held `Ctrl+x`'s own repeats wait too. A fresh, unmodified Enter sends the draft after
+       the turn; any other key ends the chord, says so, and does nothing else. An input method's key ends it
+       as well, but is left to the input method. */
+    if (chordTimer.current !== null) {
+      const plain = !e.ctrlKey && !e.shiftKey && !e.altKey && !e.metaKey;
+      if (!ime && isModifierKey(e.key)) return;
+      if (!ime && e.repeat && isCtrlX(e)) {
+        e.preventDefault();
+        e.stopPropagation();
+        return;
+      }
+      endChord();
+      if (ime) {
+        showSlashFlash(CTRL_X_ONLY_ENTER_FLASH);
+        return;
+      }
+      e.preventDefault();
+      e.stopPropagation();
+      onLineKey?.(e);
+      if (e.key === "Enter" && plain && !e.repeat) submit("after");
+      else showSlashFlash(CTRL_X_ONLY_ENTER_FLASH);
+      return;
+    }
+    if (ime) return;
     const el = e.currentTarget;
+    /* `Ctrl+x` with nothing selected starts the chord (only where the host takes it, `onChord`); with a
+       selection it is the box's own cut. */
+    if (onChord !== undefined && isCtrlX(e) && el.selectionStart === el.selectionEnd) {
+      e.preventDefault();
+      e.stopPropagation();
+      onLineKey?.(e);
+      if (!e.repeat) startChord();
+      return;
+    }
     /* The open `/` menu takes its keys ahead of everything below, so `↑`/`↓` never reach the prompt
        history or the queue while it shows. It is the textarea's own handler: an IME's key was returned
        above, so a composing Enter or Esc never completes or closes anything. */
@@ -519,7 +617,7 @@ export function Composer({
         setBox(newline.value, newline.caret);
         return;
       }
-      submit(e.ctrlKey);
+      submit(e.ctrlKey ? "now" : "enter");
       return;
     }
     if (e.ctrlKey && !e.shiftKey && !e.altKey) {
@@ -672,6 +770,8 @@ export function Composer({
             // history-search line takes real DOM focus of its own: a blur that
             // lands there must not report BROWSE, or opening `Ctrl+r` would itself leave INPUT.
             onBlur={(e) => {
+              // The keys are going elsewhere: the chord's second key could not reach this box.
+              endChord();
               if (!(e.relatedTarget instanceof HTMLElement && e.relatedTarget.closest(".history-search"))) {
                 onModeChange("browse");
               }

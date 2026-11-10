@@ -86,6 +86,8 @@ export function mergeTaken(texts: string[], current: string): string {
 export const COMPOSER_CHORDS: string[] = [
   "Enter",
   "Ctrl+Enter",
+  // Only in the conversation's box (`Composer`'s `onChord`); the start screen's keeps `Ctrl+x` as its cut.
+  "Ctrl+x Enter",
   "Shift+Enter",
   // Claude Code's own two newline keys.
   "Alt+Enter / \\ Enter",

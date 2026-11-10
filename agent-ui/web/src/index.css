@@ -1027,6 +1027,11 @@ pre {
   text-overflow: ellipsis;
   white-space: nowrap;
 }
+/* `after the turn:` stays whole; the message's text is what is cut. */
+.queue-after {
+  flex: none;
+  white-space: nowrap;
+}
 .queue-note, .queue-error {
   padding: 4px 0 4px 22px;
   line-height: 1.5;

@@ -145,6 +145,7 @@ export const FIXED_PENDING_ENTRIES: Record<PendingPrefix, BoxEntry[]> = {
     // same keys).
     { key: "x", label: "open link", group: false, disabled: false },
     { key: "?", label: "this list", group: false, disabled: false },
+    { key: "d", label: "go to definition", group: false, disabled: false },
   ],
 
   z: [

@@ -205,6 +205,11 @@ pub struct Queued {
     /// Typed while a card waited with no turn running: it goes out as a turn once the card is answered.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub behind_card: bool,
+    /// Sent to wait for the turn's end (`Ctrl+x Enter`): it is never put into a running turn, and what is typed
+    /// after it may go into the turn past it (`TabSet::steer_held`). Carried with the queue, so a move keeps
+    /// it.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub after_turn: bool,
     /// Kept in memory from keyboard admission; a restored queue is composed until the person resends it.
     #[serde(skip)]
     pub typed_by_person: bool,
@@ -237,6 +242,7 @@ impl Queued {
             dropped_as: Vec::new(),
             steer_when_running: false,
             behind_card: false,
+            after_turn: false,
             typed_by_person: false,
             refused: false,
             shell_line: false,
@@ -4769,6 +4775,42 @@ impl TabSet {
         steerable: bool,
         origin: PromptOrigin,
     ) -> Result<usize, String> {
+        self.push_queued(id, text, wire, now_ms, steerable, false, origin)
+    }
+
+    /// `Ctrl+x Enter`: [`TabSet::queue_message`] for a message that waits for the running turn's end whatever
+    /// Enter does later (`Queued::after_turn`). With no turn running it goes out as the next turn, as Enter's
+    /// would, and while a card waits with no turn running it waits for the card's answer first
+    /// (`Queued::behind_card`).
+    pub fn queue_after_turn(
+        &mut self,
+        id: TabId,
+        text: &str,
+        wire: String,
+        now_ms: u64,
+        origin: PromptOrigin,
+    ) -> Result<usize, String> {
+        let behind_card = self.card_waits(id) && !self.get(id).is_some_and(Tab::turn_running);
+        let len = self.push_queued(id, text, wire, now_ms, true, true, origin)?;
+        if behind_card {
+            if let Some(item) = self.get_mut(id).and_then(|t| t.session.queue.last_mut()) {
+                item.behind_card = true;
+            }
+        }
+        Ok(len)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn push_queued(
+        &mut self,
+        id: TabId,
+        text: &str,
+        wire: String,
+        now_ms: u64,
+        steerable: bool,
+        after_turn: bool,
+        origin: PromptOrigin,
+    ) -> Result<usize, String> {
         if self.moving.contains(&id.0) {
             return Err(MOVING.to_string());
         }
@@ -4792,6 +4834,7 @@ impl TabSet {
             dropped_as: Vec::new(),
             steer_when_running: false,
             behind_card: false,
+            after_turn,
             typed_by_person: origin == PromptOrigin::Typed,
             refused: false,
             shell_line: false,
@@ -4813,7 +4856,11 @@ impl TabSet {
     /// keeps its own keys. A command on an agent that reads commands (`reads_slash_commands`) is stepped over:
     /// only the command waits, in its place, and the messages behind it go in, as Claude Code does with what
     /// is typed during a turn. A message the CLI refused (`Queued::refused`) is stepped over too: it never
-    /// goes out on its own, so it holds nothing back. Whether the queue changed.
+    /// goes out on its own, so it holds nothing back. A message sent to wait for the turn's end
+    /// (`Queued::after_turn`) is stepped over the same way, and it is the one exception to the order above:
+    /// it keeps its place in the queue, and messages typed after it go into the turn ahead of it, which is
+    /// what the person asked for when sending it. A review and a message dropped once still stop the walk,
+    /// an after-turn one included. Whether the queue changed.
     pub fn steer_held(&mut self, id: TabId, now_ms: u64, shown_turn: Option<&str>) -> bool {
         if self.moving.contains(&id.0) {
             return false;
@@ -4844,13 +4891,19 @@ impl TabSet {
             }
             // A provider that stopped waiting on a message reports it dropped although the agent may
             // still read it, and sent again under a new id it could run twice. It waits for the turn's
-            // end instead, where a late delivery under its old id takes it out of the queue.
+            // end instead, where a late delivery under its old id takes it out of the queue. This holds
+            // for a message sent to wait for the turn's end too: the copy the agent may still read is
+            // ahead of anything typed later.
             if !item.dropped_as.is_empty() {
                 refusal = Some(
                     "it went into the turn once already, so it waits for the turn's end, and what follows it waits too"
                         .to_string(),
                 );
                 break;
+            }
+            // Sent to wait for the turn's end: it stays held in its place, and what follows it is steered.
+            if item.after_turn {
+                continue;
             }
             if !item.steerable {
                 refusal = Some("a review waits for the turn's end, and what follows it waits too".to_string());
@@ -5033,6 +5086,9 @@ impl TabSet {
                 } else {
                     prompt_origin(items().all(|item| item.typed_by_person))
                 };
+                // Handed back to the queue (dropped, or read as a turn of the CLI's own), the turn's message
+                // still waits for a turn's end if any of its parts was sent to.
+                let after_turn = items().any(|item| item.after_turn);
                 let trace = crate::turn_trace::TurnTrace::start();
                 let mode = tab.mode;
                 let outcome =
@@ -5053,6 +5109,7 @@ impl TabSet {
                         message.typed_by_person = origin == PromptOrigin::Typed;
                         message.shell_report = origin == PromptOrigin::ShellLine;
                         message.steerable = !message.shell_report;
+                        message.after_turn = after_turn;
                         tab.session.opening_prompt = Some(OpeningPrompt {
                             submitted: submitted.clone(),
                             typed_by_person: message.typed_by_person,
@@ -5154,7 +5211,10 @@ impl TabSet {
 
     /// A message the agent refused because a turn was open: kept at the end of `id`'s queue to go into
     /// that turn (`steer_waiting`), tried at once when the projection already shows it. False when the
-    /// tab cannot hold it (an external agent's tab keeps its refusal).
+    /// tab cannot hold it (an external agent's tab keeps its refusal). A message sent to wait for the turn's
+    /// end never comes here: it is queued through `queue_after_turn` only, and a refused queue flush leaves
+    /// its items in the queue as they were, so nothing marks one `steer_when_running`; the `steer_held` run
+    /// here steps over one already held.
     fn hold_as_steer(&mut self, id: TabId, turn: &FirstTurn) -> bool {
         let Some(tab) = self.get_mut(id) else { return false };
         if tab.agent.is_external() {

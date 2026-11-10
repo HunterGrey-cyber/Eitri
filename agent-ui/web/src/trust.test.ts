@@ -102,6 +102,12 @@ describe("groupItemsByFile", () => {
 });
 
 describe("parseExCommand", () => {
+  it("accepts only the two exact scratch commands", () => {
+    expect(parseExCommand("scratch")).toEqual({ command: "scratch", whole: false });
+    expect(parseExCommand(" %scratch ")).toEqual({ command: "scratch", whole: true });
+    for (const line of ["scratch x", "%scratch x", "Scratch", "% scratch"]) expect(parseExCommand(line)).toBeNull();
+  });
+
   it("takes the two trust words exactly, ignoring only surrounding space", () => {
     expect(parseExCommand("trust")).toEqual({ command: "trust" });
     expect(parseExCommand(" untrust ")).toEqual({ command: "untrust" });

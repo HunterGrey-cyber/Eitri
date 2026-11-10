@@ -1,3 +1,4 @@
+import type { Cited } from "./gdTarget";
 import type { PageLine, AppliedSettings, EffortChoice, ModelOption, AgentDomainEvent, AgentUiSnapshot, ChooserEnvelope, ContextSummary, DetailRow, EditorCardWire, EditorLinkState, HandoffCommand, Hello, QueueItem, ReviewDiffEnvelope, ReviewDraftEnvelope, ReviewEnvelope, ReviewHintEnvelope, ReviewHintLevel, ReviewRecoveryEnvelope, ReviewScope, ReviewSendPreviewEnvelope, TabId, TabsEnvelope, ThinkingDisplay, TurnTimeWire } from "./types";
 import type { KeymapHelp, PaneDirection, PluginKeysHelp } from "./keymap";
 import { isEditorCardWire } from "./editorCardWire";
@@ -11,6 +12,7 @@ import type { Transport } from "./transport";
 export type QuestionAnswerWire = { question_index: number; option_indexes: number[]; other_text?: string | null; notes?: string | null };
 
 export type OutboundMessage =
+  | { type: "editor_symbol"; request_id: string; tab: TabId; name: string; cited?: Cited }
   | { type: "ready"; request_id: string }
   /** The mounted page has produced its first frame. The host reveals its view and answers nothing. */
   | { type: "painted" }
@@ -79,8 +81,9 @@ export type OutboundMessage =
   /** Queue this text behind the tab's running turn. Rust answers with a
    *  `command_result`; a refusal never touches the box (the panel already sent it). */
   /** `turn_id`: the turn the page showed running when Enter was pressed; the message goes only into that
-   *  one, and is held for its end otherwise. */
-  | { type: "queue_message"; request_id: string; tab: TabId; text: string; turn_id: string | null }
+   *  one, and is held for its end otherwise. `after_turn` (`Ctrl+x Enter`): it is held for the turn's end
+   *  whatever, never put into it, and with no turn running it goes out as the next turn. */
+  | { type: "queue_message"; request_id: string; tab: TabId; text: string; turn_id: string | null; after_turn?: boolean }
   /** `↑`: empty the tab's queue and hand its texts back as `queue_taken`. */
   | { type: "take_back_queue"; request_id: string; tab: TabId }
   /** `Ctrl+Enter`: queue this text (if non-empty), then interrupt if a turn is
@@ -94,9 +97,9 @@ export type OutboundMessage =
   /** Append this typed text to the shared prompt history, e.g. `Ctrl+c`'s clear. */
   | { type: "history_push"; request_id: string; text: string }
   /** `gf` on a path: open it in the scratch split, at `line` when given. */
-  | { type: "open_path"; request_id: string; path: string; line?: number }
+  | { type: "open_path"; request_id: string; path: string; line?: number; expect?: string }
   /** `Ctrl+g` on a row: show this text read-only in the scratch split. */
-  | { type: "view_in_editor"; request_id: string; title: string; text: string }
+  | { type: "view_in_editor"; request_id: string; title: string; text: string; tab?: boolean }
   /** A copy's text for the primary selection too (`primaryCopy.ts`). The shell's page handler takes this
    *  one kind itself and answers nothing, so it carries no request id. */
   | { type: "copy_primary"; text: string }
@@ -276,11 +279,21 @@ export function postToRust(message: OutboundMessage): void {
   activeTransport().post(JSON.stringify(message));
 }
 
+export type EditorSymbolResult = {
+  kind: "editor_symbol_result"; requestId: string;
+  matches: { path: string; line: number; col: number; source: "lsp" | "text" }[];
+  error?: { kind: "no_client" | "no_symbol" | "indexing" | "timeout" | "refused"; server?: string; message?: string } | null;
+};
+
 type InboundHandler = (
   payload:
+    | EditorSymbolResult
     | { kind: "hello" } & Hello
     /** `message` is the shell's own one-line word on what it did (`sent`, `queued: ...`), where it has one. */
     | { kind: "command_result"; requestId: string; ok: true; message?: string }
+    /** An `open_path` with `expect` whose cited line no longer holds the name: a flash beside the open's own answer,
+     *  which still settles the request. Plain text. */
+    | { kind: "open_path_note"; requestId: string; note: string }
     | { kind: "command_result"; requestId: string; ok: false; error: string }
     /** Plain text: render through revealHidden, never as Markdown or HTML. */
     | { kind: "task_output_result"; requestId: string; tab: TabId; taskId: string; output: string; totalBytes: number; truncated: boolean; offset?: number }
@@ -720,6 +733,27 @@ export function installDispatch(handler: InboundHandler): void {
         console.warn("agent-ui: __eitriDispatch received a malformed editor_cards envelope", parsed);
         return;
       }
+      if (obj.kind === "editor_symbol_result") {
+        const value = parsed as EditorSymbolResult;
+        if (typeof value.requestId !== "string" || !Array.isArray(value.matches) ||
+            !value.matches.every((m) => m !== null && typeof m === "object" && typeof m.path === "string" &&
+              Number.isSafeInteger(m.line) && m.line > 0 && Number.isSafeInteger(m.col) && m.col >= 0 &&
+              (m.source === "lsp" || m.source === "text")) ||
+            (value.error != null && (typeof value.error !== "object" ||
+              !["no_client", "no_symbol", "indexing", "timeout", "refused"].includes(value.error.kind) ||
+              (value.error.server !== undefined && typeof value.error.server !== "string") ||
+              (value.error.message !== undefined && typeof value.error.message !== "string")))) {
+          console.warn("agent-ui: malformed editor_symbol_result envelope", parsed);
+          return;
+        }
+      }
+      if (obj.kind === "open_path_note") {
+        const value = parsed as Record<string, unknown>;
+        if (typeof value.requestId !== "string" || typeof value.note !== "string") {
+          console.warn("agent-ui: malformed open_path_note envelope", parsed);
+          return;
+        }
+      }
       if (obj.kind === "path_choices") {
         const value = parsed as Record<string, unknown>;
         if (typeof value.requestId !== "string" || !Number.isSafeInteger(value.tab) || !Array.isArray(value.paths) ||
@@ -742,6 +776,8 @@ export function installDispatch(handler: InboundHandler): void {
         }
       }
       if (
+        obj.kind === "editor_symbol_result" ||
+        obj.kind === "open_path_note" ||
         obj.kind === "path_choices" ||
         obj.kind === "path_completions" ||
         obj.kind === "hello" ||

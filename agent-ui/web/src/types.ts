@@ -465,7 +465,8 @@ export type HistoryNotice = {
  * read it yet (`steered`, a `↪` line) or waits for the turn's end (a `⧗` line). The wire text composed
  * against the editor context, and the id it was sent under, are Rust's own concern and never reach here.
  * `steered` is optional only for callers written before it existed; Rust always sends it. */
-export type QueueItem = { text: string; queuedAt: number; steered?: boolean };
+/** `afterTurn`: sent with `Ctrl+x Enter`, it waits for the turn's end and is never put into the turn. */
+export type QueueItem = { text: string; queuedAt: number; steered?: boolean; afterTurn?: boolean };
 /** V1's editor-context line the file relative to the project root (or
  * absolute outside it), and the selected line range when there is a selection. */
 /** Where the panel stands with the editor beside it, in a companion window (`editor_link`,

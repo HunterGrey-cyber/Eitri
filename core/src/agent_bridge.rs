@@ -320,6 +320,10 @@ pub enum InboundMessage {
         /// The turn the page showed running when Enter was pressed: the message goes only into that one.
         #[serde(default)]
         turn_id: Option<String>,
+        /// `Ctrl+x Enter`: the message waits for the turn's end and is never put into it
+        /// (`TabSet::queue_after_turn`); with no turn running it goes out as the next turn.
+        #[serde(default)]
+        after_turn: bool,
     },
     /// `↑` on the box's first line with a queue: the whole queue back, as `queue_taken`.
     TakeBackQueue {
@@ -376,6 +380,16 @@ pub enum InboundMessage {
         path: String,
         #[serde(default)]
         line: Option<u32>,
+        #[serde(default)]
+        expect: Option<String>,
+    },
+    /// A symbol name is data for the editor, never Lua or Vim source.
+    EditorSymbol {
+        request_id: String,
+        tab: u64,
+        name: String,
+        #[serde(default)]
+        cited: Option<SymbolCitation>,
     },
     /// `c` in BROWSE: the files that changed on disk during a turn of this tab's session, or during
     /// the whole session. Answered by a `review` envelope carrying `request_id`, or by a failing
@@ -466,6 +480,8 @@ pub enum InboundMessage {
         request_id: String,
         title: String,
         text: String,
+        #[serde(default)]
+        tab: bool,
     },
     /// `Ctrl+g` in BROWSE on a pending edit card whose change names one file: the file as it is on disk
     /// beside the file as the card would leave it, both read-only. `path` is the agent's own, relative to
@@ -793,8 +809,10 @@ impl InboundMessage {
             | InboundMessage::RemoteRevokeAsk { .. }
             | InboundMessage::RemoteRevoke { .. }
             | InboundMessage::OpenUrl { .. } => return TabRef::WindowLevel,
-            // These two name their tab as a plain number: a message without one does not parse.
-            InboundMessage::TrustAnswer { tab, .. } | InboundMessage::TrustCancel { tab, .. } => Some(*tab),
+            // These name their tab as a plain number: a message without one does not parse.
+            InboundMessage::TrustAnswer { tab, .. }
+            | InboundMessage::TrustCancel { tab, .. }
+            | InboundMessage::EditorSymbol { tab, .. } => Some(*tab),
             InboundMessage::SendMessage { tab, .. }
             | InboundMessage::RunShell { tab, .. }
             | InboundMessage::Interrupt { tab, .. }
@@ -1030,6 +1048,7 @@ impl InboundMessage {
             | InboundMessage::EditQuestionOther { request_id, .. }
             | InboundMessage::HistoryPush { request_id, .. }
             | InboundMessage::OpenPath { request_id, .. }
+            | InboundMessage::EditorSymbol { request_id, .. }
             | InboundMessage::ReviewRequest { request_id, .. }
             | InboundMessage::ReviewDiffRequest { request_id, .. }
             | InboundMessage::ReviewRevert { request_id, .. }
@@ -1129,6 +1148,52 @@ pub fn serialize_path_completions_for_js(tab: crate::tabs::TabId, seq: u64, item
     json!({"kind": "path_completions", "tab": tab.0, "seq": seq,
         "items": items.iter().take(50).collect::<Vec<_>>()})
     .to_string()
+}
+
+/// The reply's cited location, in the same path vocabulary as `open_path`.
+#[derive(Debug, Clone, serde::Deserialize, serde::Serialize)]
+pub struct SymbolCitation {
+    pub path: String,
+    pub line: u32,
+}
+
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct EditorSymbolMatch {
+    pub path: String,
+    pub line: u32,
+    pub col: u32,
+    pub source: &'static str,
+}
+
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct EditorSymbolError {
+    pub kind: &'static str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub server: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub message: Option<String>,
+}
+
+pub fn valid_symbol_name(name: &str) -> bool {
+    !name.is_empty()
+        && name.len() <= 200
+        && name
+            .chars()
+            .all(|c| c.is_alphanumeric() || matches!(c, '_' | '.' | ':' | '$' | '-'))
+}
+
+pub fn serialize_editor_symbol_result_for_js(
+    request_id: &str,
+    matches: &[EditorSymbolMatch],
+    error: Option<&EditorSymbolError>,
+) -> String {
+    json!({"kind": "editor_symbol_result", "requestId": request_id, "matches": matches, "error": error}).to_string()
+}
+
+/// The advisory beside an `open_path` whose cited line no longer holds the expected name: its own kind, so the
+/// request's one settling answer stays the editor's.
+pub fn serialize_open_path_note_for_js(request_id: &str, note: &str) -> String {
+    json!({"kind": "open_path_note", "requestId": request_id, "note": note}).to_string()
 }
 
 /// Suffix matches offered as ordinary project-relative `open_path` choices.
@@ -3091,7 +3156,7 @@ pub fn serialize_queue_for_js(
 ) -> String {
     let items: Vec<Value> = items
         .iter()
-        .map(|q| json!({ "text": q.text, "queuedAt": q.queued_at_ms, "steered": !q.is_held() }))
+        .map(|q| json!({ "text": q.text, "queuedAt": q.queued_at_ms, "steered": !q.is_held(), "afterTurn": q.after_turn }))
         .collect();
     json!({ "kind": "queue", "tab": tab.0, "items": items, "error": error, "note": note, "enterSteers": enter_steers })
         .to_string()
@@ -3274,5 +3339,34 @@ mod remote_note_tests {
         notes.forget_remote_notes_before(9);
         assert_eq!(notes.sent_from.keys().copied().collect::<Vec<_>>(), [9]);
         assert!(notes.stopped_from.is_empty());
+    }
+}
+
+#[cfg(test)]
+mod gd_tests {
+    use super::*;
+
+    #[test]
+    fn editor_symbol_parses_with_and_without_citation() {
+        for cited in [serde_json::Value::Null, json!({"path": "mesh.go", "line": 142})] {
+            let raw = json!({"type": "editor_symbol", "request_id": "gd1", "tab": 3,
+                "name": "pkg.Name", "cited": cited})
+            .to_string();
+            let message: InboundMessage = serde_json::from_str(&raw).unwrap();
+            assert_eq!(message.request_id(), "gd1");
+            assert_eq!(message.tab_ref(), TabRef::Named(crate::tabs::TabId(3)));
+            let InboundMessage::EditorSymbol {
+                name, cited: parsed, ..
+            } = message
+            else {
+                panic!()
+            };
+            assert_eq!(name, "pkg.Name");
+            assert_eq!(parsed.is_some(), !cited.is_null());
+        }
+        let message: InboundMessage = serde_json::from_value(json!({"type": "editor_symbol",
+            "request_id": "gd2", "tab": 1, "name": "M.call"}))
+        .unwrap();
+        assert!(matches!(message, InboundMessage::EditorSymbol { cited: None, .. }));
     }
 }

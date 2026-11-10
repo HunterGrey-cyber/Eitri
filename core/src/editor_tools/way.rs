@@ -526,6 +526,7 @@ mod tests {
             symbol: Some("frob".into()),
             include: vec![UsagePart::References, UsagePart::Implementations],
             query: None,
+            query_for: Vec::new(),
             new_name: None,
             action: None,
             budget_ms: 15000,

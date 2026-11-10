@@ -22,3 +22,19 @@ it("draws an unread message once as a steered line and reveals its hidden text",
   expect(container.querySelectorAll(".queue-line")).toHaveLength(1);
   expect(container.textContent).toBe("↪ follow⟨U+202E⟩up");
 });
+
+it("draws a message held for the turn's end with its words, and one handed back into a turn as steered", () => {
+  const { container } = render(
+    <QueueLines
+      items={[
+        { text: "commit\nthen push", queuedAt: 1, afterTurn: true },
+        { text: "plain", queuedAt: 2 },
+        { text: "read in a cycle", queuedAt: 3, steered: true, afterTurn: true },
+      ]}
+      error={null}
+    />,
+  );
+  const lines = Array.from(container.querySelectorAll(".queue-line")).map((l) => l.textContent);
+  expect(lines).toEqual(["⧗ after the turn: commit …", "⧗ plain", "↪ read in a cycle"]);
+  expect(container.querySelectorAll(".queue-line-after")).toHaveLength(1);
+});

@@ -34,14 +34,21 @@ fn hex(bytes: &[u8]) -> String {
 #[derive(Debug)]
 pub struct ViewFile {
     body: PathBuf,
+    tab: bool,
 }
 
 impl ViewFile {
+    /// Choose a new tab page instead of the reusable row-view split.
+    pub fn with_tab(mut self, tab: bool) -> Self {
+        self.tab = tab;
+        self
+    }
+
     /// Writes `text` and returns the request that has nvim show it read-only.
     pub fn write(self, text: &str) -> io::Result<ScratchRequest> {
         std::fs::write(&self.body, text)?;
         Ok(ScratchRequest::of(
-            serde_json::json!({ "op": "view", "path": self.body.to_string_lossy() }),
+            serde_json::json!({ "op": "view", "path": self.body.to_string_lossy(), "tab": self.tab }),
         ))
     }
 }
@@ -233,6 +240,19 @@ pub fn read_file_checked(
     check: impl FnOnce(&std::fs::File) -> bool,
 ) -> Result<Option<String>, ProposalRefused> {
     read_file_with(file, &file.display().to_string(), libc::O_NOFOLLOW, check)
+}
+
+/// `file` opened for reading only if it is a regular file, judged on the open handle; `None` for anything else, or
+/// when it cannot be opened. The open never waits: a FIFO swapped in for the file would otherwise block it until a
+/// writer came, and a tty gives no controlling terminal.
+pub fn open_regular_file(file: &Path) -> Option<std::fs::File> {
+    use std::os::unix::fs::OpenOptionsExt;
+    let handle = std::fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NONBLOCK | libc::O_NOCTTY | libc::O_CLOEXEC)
+        .open(file)
+        .ok()?;
+    handle.metadata().ok()?.file_type().is_file().then_some(handle)
 }
 
 fn read_file_with(
@@ -495,6 +515,7 @@ impl ScratchDir {
             .collect();
         ViewFile {
             body: self.dir.join(format!("{id}-{}.md", slug.trim_matches('-'))),
+            tab: false,
         }
     }
 
@@ -543,6 +564,32 @@ impl ScratchDir {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A FIFO with no writer would hold a plain open until one came: this open returns at once and refuses it, and a
+    /// regular file opens.
+    #[test]
+    fn open_regular_file_refuses_a_fifo_without_waiting() {
+        use std::os::unix::ffi::OsStrExt;
+        let dir = ScratchDir::in_dir(&tmp()).unwrap();
+        let fifo = dir.dir.join("fifo");
+        let c = std::ffi::CString::new(fifo.as_os_str().as_bytes()).unwrap();
+        // SAFETY: the C string stays alive for the call and names this test's own scratch file.
+        assert_eq!(unsafe { libc::mkfifo(c.as_ptr(), 0o600) }, 0);
+        let (tx, rx) = std::sync::mpsc::channel();
+        let path = fifo.clone();
+        std::thread::spawn(move || {
+            let _ = tx.send(open_regular_file(&path).is_some());
+        });
+        let opened = rx
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .expect("the open did not wait for a writer");
+        assert!(!opened, "a FIFO is no regular file");
+        let file = dir.dir.join("file");
+        std::fs::write(&file, "text").unwrap();
+        assert!(open_regular_file(&file).is_some());
+        assert!(open_regular_file(&dir.dir).is_none(), "nor is a directory");
+        dir.cleanup();
+    }
 
     /// The scratch directory itself is the unique per-test directory (`nv-sc-<pid>-<uuid>`), so
     /// `cleanup` leaves nothing behind in the shared `TMPDIR`.
@@ -628,6 +675,93 @@ mod tests {
         assert_eq!(decode(request.hex())["path"], body.to_string_lossy().as_ref());
         assert!(!second.body.exists());
         dir.cleanup();
+    }
+
+    #[test]
+    fn a_tab_view_request_carries_tab_and_uses_a_fresh_file_each_time() {
+        let mut dir = ScratchDir::in_dir(&tmp()).unwrap();
+        let first = decode(
+            dir.reserve_view("Conversation")
+                .with_tab(true)
+                .write("one")
+                .unwrap()
+                .hex(),
+        );
+        let second = decode(
+            dir.reserve_view("Conversation")
+                .with_tab(true)
+                .write("two")
+                .unwrap()
+                .hex(),
+        );
+        assert_eq!(first["op"], "view");
+        assert_eq!(first["tab"], true);
+        assert_eq!(second["tab"], true);
+        assert_ne!(first["path"], second["path"]);
+        assert_eq!(std::fs::read_to_string(first["path"].as_str().unwrap()).unwrap(), "one");
+        assert_eq!(
+            std::fs::read_to_string(second["path"].as_str().unwrap()).unwrap(),
+            "two"
+        );
+        let split = decode(dir.prepare_view("row", "text").unwrap().hex());
+        assert_eq!(split["tab"], false);
+        dir.cleanup();
+    }
+
+    #[test]
+    #[ignore = "needs a real nvim on PATH; spends no tokens and needs no display"]
+    fn a_tab_view_is_read_only_and_q_closes_only_its_tab() {
+        let mut dir = ScratchDir::in_dir(&tmp()).unwrap();
+        let request = dir
+            .reserve_view("Conversation")
+            .with_tab(true)
+            .write("## ▍You\nvim: set modifiable noreadonly:")
+            .unwrap();
+        let script = dir.path().join("probe.lua");
+        let setup = format!(
+            "dofile({})\nlocal request = '{}'\n",
+            serde_json::to_string(&dir.lua_path.to_string_lossy()).unwrap(),
+            request.hex()
+        );
+        std::fs::write(
+            &script,
+            setup
+                + r#"
+-- Keep filetype plugins out so only the scratch snippet's own mappings are counted.
+vim.cmd('filetype plugin off')
+local original = vim.api.nvim_get_current_tabpage()
+EitriScratch.call(request)
+assert(#vim.api.nvim_list_tabpages() == 2, 'view must open a tab')
+local first = vim.api.nvim_get_current_buf()
+assert(not vim.bo.modeline and vim.bo.readonly and not vim.bo.modifiable)
+assert(vim.bo.filetype == 'markdown')
+assert(vim.api.nvim_buf_get_lines(first, 0, 1, false)[1] == '## ▍You')
+local maps = vim.api.nvim_buf_get_keymap(first, 'n')
+assert(#maps == 1 and maps[1].lhs == 'q', 'only q is mapped')
+maps[1].callback()
+assert(#vim.api.nvim_list_tabpages() == 1)
+assert(vim.api.nvim_get_current_tabpage() == original)
+assert(not vim.api.nvim_buf_is_valid(first))
+EitriScratch.call(request)
+local last = vim.api.nvim_get_current_buf()
+vim.cmd('tabonly')
+assert(#vim.api.nvim_list_tabpages() == 1)
+vim.api.nvim_buf_get_keymap(last, 'n')[1].callback()
+assert(#vim.api.nvim_list_tabpages() == 1, 'q must leave nvim running')
+assert(not vim.api.nvim_buf_is_valid(last))
+assert(vim.api.nvim_get_current_buf() ~= last)
+vim.cmd('qa!')
+"#,
+        )
+        .unwrap();
+        let mut command = std::process::Command::new("nvim");
+        command.args(["--headless", "--clean", "-i", "NONE", "-l"]).arg(&script);
+        for key in ["XDG_CONFIG_HOME", "XDG_DATA_HOME", "XDG_STATE_HOME", "XDG_CACHE_HOME"] {
+            command.env(key, dir.path().join(key));
+        }
+        let output = command.output().expect("nvim on PATH");
+        dir.cleanup();
+        assert!(output.status.success(), "{}", String::from_utf8_lossy(&output.stderr));
     }
 
     #[test]

@@ -92,6 +92,8 @@ mod review_glue;
 mod routing;
 #[path = "starts.rs"]
 mod starts;
+#[path = "symbol_lookup.rs"]
+mod symbol_lookup;
 #[path = "teardown.rs"]
 mod teardown;
 #[path = "tick.rs"]
@@ -184,6 +186,8 @@ struct AgentPanelState {
     project_dir: PathBuf,
     path_menu: path_menu::PathMenu,
     path_lookup: path_lookup::PathLookup,
+    /// `gd`'s lookups of a name, asked of the language servers.
+    symbol_lookup: symbol_lookup::SymbolLookup,
     /// Messages that name the editor's own sources and wait for its answer.
     mentions: mentions::Desk,
     /// The window's questions about remote control waiting for the base page's answer.
@@ -603,6 +607,7 @@ impl AgentPanelState {
             project_dir,
             path_menu: path_menu::PathMenu::default(),
             path_lookup: path_lookup::PathLookup::default(),
+            symbol_lookup: symbol_lookup::SymbolLookup::default(),
             mentions: mentions::Desk::default(),
             remote_desk: remote_enroll::RemoteDesk::default(),
             mention_sections: None,

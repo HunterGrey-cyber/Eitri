@@ -414,6 +414,35 @@ mod tests {
         assert_eq!(r.provider.turns()[1], "second");
     }
 
+    /// A message sent to wait for the turn's end that names a source keeps the mark through the wait for the
+    /// editor: replayed, it is queued for the turn's end, not as an ordinary Enter.
+    #[test]
+    fn an_after_turn_message_keeps_its_mark_through_the_wait_for_its_sections() {
+        let r = ready("panel-mentions-after-turn");
+        r.handle
+            .page_message(ViewId::BASE, &send("send_message", "s0", r.tab, "plain"));
+        tick_handle_until(&r.handle, "the first turn", || r.provider.turns().len() == 1);
+        begin_turn(&r, "t1");
+        let after_turn = json!({
+            "type": "queue_message", "request_id": "q1", "tab": r.tab.0, "text": "later @diagnostics",
+            "turn_id": "t1", "after_turn": true,
+        });
+        r.handle.page_message(ViewId::BASE, &after_turn.to_string());
+        r.editor.answer_oldest(&diagnostics_reply());
+        tick_handle_until(&r.handle, "the answer", || {
+            !r.handle.state.borrow().mentions.is_waiting()
+        });
+        {
+            let state = r.handle.state.borrow();
+            let queue = &state.tabs.get(r.tab).unwrap().session.queue;
+            assert_eq!(queue.len(), 1);
+            assert!(queue[0].after_turn, "the replay queued it for the turn's end");
+            assert!(queue[0].wire.starts_with("later @diagnostics\n\n[@diagnostics: "));
+        }
+        end_turn(&r, "t1");
+        tick_handle_until(&r.handle, "the queue", || r.provider.turns().len() == 2);
+    }
+
     #[test]
     fn a_queued_message_and_a_send_now_go_with_their_sections() {
         let r = ready("panel-mentions-queue");

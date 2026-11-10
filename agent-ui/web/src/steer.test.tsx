@@ -16,6 +16,7 @@ import { QueueLines } from "./components/QueueLines";
 import { MessageList } from "./components/MessageList";
 import { heldCount, runningPlaceholder } from "./queueLines";
 import { INPUT_KEYS } from "./keymap";
+import { CTRL_X_ONLY_ENTER_FLASH } from "./app/flashes";
 import { phaseOf } from "./turnPhase";
 import type { AgentDomainEvent, AgentUiSnapshot, AgentUiState, Hello, QueueItem } from "./types";
 import fixture from "./fixtures/steered-messages.json";
@@ -133,7 +134,7 @@ describe("Enter while a turn runs", () => {
       expect(onSend).not.toHaveBeenCalled();
       cleanup();
     }
-    expect(runningPlaceholder(true)).toBe("Enter steers the running turn…");
+    expect(runningPlaceholder(true)).toBe("Enter steers the running turn, Ctrl+x Enter waits for its end…");
     expect(runningPlaceholder(false)).toBe("Enter holds it until the turn ends…");
   });
 
@@ -252,11 +253,115 @@ describe("the panel with a message in the turn", () => {
     fireEvent.keyDown(textarea, { key: "Enter" });
     const sent = posted.filter((m) => m.type === "queue_message");
     expect(sent[sent.length - 1]).toMatchObject({ text: "and the tests", turn_id: "t1" });
+    expect(sent[sent.length - 1]).not.toHaveProperty("after_turn");
   });
 
   it("follows the queue envelope when the agent stops taking messages mid-turn", () => {
     const container = running(true, [], false);
     expect(container.querySelector("textarea")!.placeholder).toBe("Enter holds it until the turn ends…");
+  });
+
+  /** jsdom lays nothing out: a band 900 px wide at 7.2 px a character, so the band draws its showcmd. */
+  function stubBandWidth(): () => void {
+    const width = Object.getOwnPropertyDescriptor(HTMLElement.prototype, "clientWidth");
+    const rect = HTMLElement.prototype.getBoundingClientRect;
+    Object.defineProperty(HTMLElement.prototype, "clientWidth", { configurable: true, get: () => 900 });
+    HTMLElement.prototype.getBoundingClientRect = function (this: HTMLElement) {
+      return this.classList.contains("band-measure")
+        ? ({ left: 0, top: 0, right: 7.2, bottom: 10, width: 7.2, height: 10, x: 0, y: 0 } as DOMRect)
+        : rect.call(this);
+    };
+    return () => {
+      if (width) Object.defineProperty(HTMLElement.prototype, "clientWidth", width);
+      else delete (HTMLElement.prototype as unknown as { clientWidth?: number }).clientWidth;
+      HTMLElement.prototype.getBoundingClientRect = rect;
+    };
+  }
+
+  it("Ctrl+x Enter posts the message for the turn's end, and the band shows the chord while it waits", () => {
+    const restore = stubBandWidth();
+    try {
+      const container = running(true, []);
+      const textarea = container.querySelector("textarea")!;
+      fireEvent.change(textarea, { target: { value: "then commit" } });
+      textarea.setSelectionRange(11, 11);
+      fireEvent.keyDown(textarea, { key: "x", ctrlKey: true });
+      expect(container.querySelector('[data-testid="showcmd"]')?.textContent).toBe("Ctrl+x -");
+      fireEvent.keyDown(textarea, { key: "Enter" });
+      expect(container.querySelector('[data-testid="showcmd"]')).toBeNull();
+      const sent = posted.filter((m) => m.type === "queue_message");
+      expect(sent).toHaveLength(1);
+      expect(sent[0]).toMatchObject({ text: "then commit", turn_id: "t1", after_turn: true });
+      expect(posted.filter((m) => m.type === "send_message")).toHaveLength(0);
+      expect(textarea.value).toBe("");
+    } finally {
+      restore();
+    }
+  });
+
+  it("Shift+Tab after Ctrl+x ends the chord with its flash and cycles no mode, and the next Enter is a plain one", () => {
+    const restore = stubBandWidth();
+    try {
+      const container = running(true, []);
+      const textarea = container.querySelector("textarea")!;
+      fireEvent.change(textarea, { target: { value: "then commit" } });
+      textarea.setSelectionRange(11, 11);
+      fireEvent.keyDown(textarea, { key: "x", ctrlKey: true });
+      expect(container.querySelector('[data-testid="showcmd"]')?.textContent).toBe("Ctrl+x -");
+      fireEvent.keyDown(textarea, { key: "Tab", shiftKey: true });
+      expect(posted.filter((m) => m.type === "cycle_mode")).toHaveLength(0);
+      expect(container.querySelector(".composer-slash-flash")?.textContent).toBe(CTRL_X_ONLY_ENTER_FLASH);
+      expect(container.querySelector('[data-testid="showcmd"]')).toBeNull();
+      expect(textarea.value).toBe("then commit");
+      fireEvent.keyDown(textarea, { key: "Enter" });
+      const sent = posted.filter((m) => m.type === "queue_message");
+      expect(sent).toHaveLength(1);
+      expect(sent[0]).toMatchObject({ text: "then commit", turn_id: "t1" });
+      expect(sent[0]).not.toHaveProperty("after_turn");
+      // With no chord waiting, Shift+Tab is the mode key again.
+      fireEvent.keyDown(textarea, { key: "Tab", shiftKey: true });
+      expect(posted.filter((m) => m.type === "cycle_mode")).toHaveLength(1);
+    } finally {
+      restore();
+    }
+  });
+
+  it("Ctrl+x Enter with no turn running still goes to the queue, never a plain send", () => {
+    const { container } = render(<App />);
+    dispatch({ kind: "hello", ...HELLO });
+    dispatch({ kind: "tabs", active: 1, tabs: [TAB] });
+    const state: AgentUiState = {
+      ...initialState(),
+      // The session is up and no turn runs.
+      status: { kind: "running" },
+      activeTurnId: null,
+      capabilities: { ...initialState().capabilities, interrupt: true, steer: true },
+    };
+    dispatch({ kind: "snapshot", tab: 1, throughRevision: 3, state });
+    dispatch({ kind: "pane_focus", focused: true });
+    dispatch({ kind: "enter_input" });
+    const textarea = container.querySelector("textarea")!;
+    fireEvent.change(textarea, { target: { value: "go" } });
+    textarea.setSelectionRange(2, 2);
+    fireEvent.keyDown(textarea, { key: "x", ctrlKey: true });
+    fireEvent.keyDown(textarea, { key: "Enter" });
+    expect(posted.filter((m) => m.type === "send_message")).toHaveLength(0);
+    expect(posted.filter((m) => m.type === "queue_message")).toEqual([
+      expect.objectContaining({ text: "go", turn_id: null, after_turn: true }),
+    ]);
+  });
+
+  it("draws a message held for the turn's end as such, and ↑ takes it back", () => {
+    const container = running(true, [
+      { text: "when done, commit", queuedAt: 1, steered: false, afterTurn: true },
+      { text: "in the turn", queuedAt: 2, steered: true },
+    ]);
+    expect([...container.querySelectorAll(".queue-line")].map((l) => l.textContent)).toEqual([
+      "⧗ after the turn: when done, commit",
+      "↪ in the turn",
+    ]);
+    fireEvent.keyDown(container.querySelector("textarea")!, { key: "ArrowUp" });
+    expect(posted.filter((m) => m.type === "take_back_queue")).toHaveLength(1);
   });
 });
 

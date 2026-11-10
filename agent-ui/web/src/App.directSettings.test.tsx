@@ -192,6 +192,24 @@ describe("the picker, on a session that changes directly", () => {
     expect(ofType("send_now")).toEqual([]);
   });
 
+  it("Ctrl+x Enter on a typed setting during a turn changes nothing now: it is held for the turn's end", () => {
+    for (const text of ["/model sonnet", "/effort low"]) {
+      posted.length = 0;
+      const { container, unmount } = live({ activeTurnId: "t1" });
+      fireEvent.keyDown(root(container), { key: "i" });
+      const box = container.querySelector("textarea")!;
+      fireEvent.change(box, { target: { value: text } });
+      box.setSelectionRange(text.length, text.length);
+      fireEvent.keyDown(box, { key: "x", ctrlKey: true });
+      fireEvent.keyDown(box, { key: "Enter" });
+      expect(ofType("set_model"), text).toEqual([]);
+      expect(ofType("list_models"), text).toEqual([]);
+      expect(ofType("history_push"), text).toEqual([]);
+      expect(ofType("queue_message"), text).toEqual([expect.objectContaining({ text, after_turn: true })]);
+      unmount();
+    }
+  });
+
   it("between turns /model <name> stays a message", () => {
     const { container } = live({ activeTurnId: null });
     typeIn(container, "/model sonnet");

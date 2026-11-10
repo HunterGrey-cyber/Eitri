@@ -30,6 +30,11 @@ export function cardJumpGoneFlash(key: string): string {
 /** BROWSE `Ctrl+o` / `Ctrl+i` with nothing older / newer in this tab's jumplist. */
 export const NO_OLDER_JUMP_FLASH = "no older jump";
 export const NO_NEWER_JUMP_FLASH = "no newer jump";
+/** What the composer says when the key after `Ctrl+x` was not Enter: the chord did nothing, and the key was
+ *  not typed either. */
+export const CTRL_X_ONLY_ENTER_FLASH = "Ctrl+x: only Ctrl+x Enter is bound (send after the turn)";
+/** What the band says when `:%scratch` could not build the conversation's text: nothing was sent to the editor. */
+export const SCRATCH_EXPORT_FAILED_FLASH = ":%scratch — the conversation could not be exported";
 /** What the band says when Enter or Space on the activity line's
  *  Stop did not interrupt because it came in the middle of typing (`TypingGuard.mayActAfterMotion`)
  *  -- "just do it" typed after an arrival reached Stop with its `j` and interrupted the turn. */

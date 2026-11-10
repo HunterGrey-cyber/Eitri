@@ -27,6 +27,7 @@ pub(super) fn tick_collect(state: &mut AgentPanelState, screen: &Screen, out: &m
     inbound::collect_task_commands(state, out);
     super::path_menu::poll(state, out);
     super::path_lookup::poll(state, out);
+    super::symbol_lookup::poll(state, out);
     report_sessions_that_never_opened(state, screen, out);
     for tab in state.retiring.poll() {
         state.tabs.retire_done(tab);
@@ -403,6 +404,7 @@ pub(super) fn needs_polling(state: &AgentPanelState) -> bool {
         || !state.task_commands.is_empty()
         || !state.review_jobs.is_empty()
         || state.path_lookup.is_running()
+        || state.symbol_lookup.is_running()
         || !state.question_sends.is_empty()
         || !state.permission_sends.is_empty()
         || state.remote.needs_polling()

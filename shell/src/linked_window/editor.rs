@@ -18,6 +18,7 @@ use std::cell::{Cell, RefCell};
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 use std::rc::{Rc, Weak};
+use std::sync::mpsc;
 use std::time::{Duration, Instant};
 
 use eitri_core::editor_context::{ContextSource, EditorContext};
@@ -447,8 +448,8 @@ pub enum ScratchAsk {
     Open { path: PathBuf, line: Option<u32> },
     /// `Ctrl+g` in INPUT: the draft in `body`, its end reported in `done`.
     Edit { body: PathBuf, done: PathBuf },
-    /// A read-only view of the text in `body`.
-    View { body: PathBuf },
+    /// A read-only view of the text in `body`; with `tab`, in a tab page of its own rather than the row-view split.
+    View { body: PathBuf, tab: bool },
     /// A pending edit's proposal: the file as it is in `base`, as the edit would leave it in `proposed`; `name` is
     /// the real file's name.
     Diff {
@@ -482,6 +483,7 @@ pub fn read_request(request: &ScratchRequest) -> Result<ScratchAsk, String> {
         }),
         Some("view") => Ok(ScratchAsk::View {
             body: text("path").ok_or("a view with no path")?,
+            tab: value.get("tab").and_then(Value::as_bool).unwrap_or(false),
         }),
         Some("diff") => Ok(ScratchAsk::Diff {
             base: text("base").ok_or("a diff with no file as it is")?,
@@ -628,7 +630,17 @@ pub struct Window1Editor {
     scratch_parent: Option<PathBuf>,
     scratch: RefCell<Option<ScratchDir>>,
     drafts: RefCell<Vec<OutDraft>>,
+    /// Views from another window being written on a worker, oldest first: each is handed to the editor once
+    /// written, in the order they came.
+    views: RefCell<Vec<WritingView>>,
     polling: Cell<bool>,
+}
+
+/// A view another window sent, its file being written on a worker thread: a view's text may be a megabyte, and
+/// the GTK thread never waits for a disk. `token` is the asking window's activation token, kept for the drive.
+struct WritingView {
+    rx: mpsc::Receiver<std::io::Result<ScratchRequest>>,
+    token: Option<String>,
 }
 
 impl Window1Editor {
@@ -655,6 +667,7 @@ impl Window1Editor {
             scratch_parent,
             scratch: RefCell::default(),
             drafts: RefCell::default(),
+            views: RefCell::default(),
             polling: Cell::new(false),
         })
     }
@@ -960,9 +973,21 @@ impl Window1Editor {
                 )
             }
             EditorRequest::Focus => drive(EditorAct::Focus, token),
-            EditorRequest::View { title, text } => {
-                let request = self.with_scratch(|dir| dir.prepare_view(&title, &text))?;
-                drive(EditorAct::Request(&request), token)
+            EditorRequest::View { title, text, tab } => {
+                // Only the file's name is chosen here; the text is written on a worker and `poll` hands nvim the
+                // view once it is.
+                let file = self.with_scratch(|dir| Ok(dir.reserve_view(&title).with_tab(tab)))?;
+                let (tx, rx) = mpsc::channel();
+                std::thread::Builder::new()
+                    .name("linked view write".into())
+                    .spawn(move || {
+                        // A window closed in the meantime has dropped the receiver; the answer has nowhere to go.
+                        let _ = tx.send(file.write(&text));
+                    })
+                    .map_err(|e| format!("could not write the scratch file: {e}"))?;
+                self.views.borrow_mut().push(WritingView { rx, token });
+                self.poll_soon();
+                Ok(())
             }
             EditorRequest::Diff { name, base, proposed } => {
                 let request = self.with_scratch(|dir| dir.prepare_proposal(&name, &base, &proposed))?;
@@ -1078,7 +1103,35 @@ impl Window1Editor {
             draft.edit.cleanup();
             self.draft_written(draft, result);
         }
-        !self.inflight.borrow().is_empty() || !self.drafts.borrow().is_empty()
+        self.show_written_views();
+        !self.inflight.borrow().is_empty() || !self.drafts.borrow().is_empty() || !self.views.borrow().is_empty()
+    }
+
+    /// Hands the editor each view whose file is written, in the order the views came: one written early waits for
+    /// the one before it. A failed write, or a worker that stopped, is logged, as a refused request is.
+    fn show_written_views(&self) {
+        loop {
+            let written = {
+                let views = self.views.borrow();
+                let Some(view) = views.first() else { return };
+                match view.rx.try_recv() {
+                    Ok(written) => written.map_err(|e| format!("could not write the scratch file: {e}")),
+                    Err(mpsc::TryRecvError::Empty) => return,
+                    Err(mpsc::TryRecvError::Disconnected) => {
+                        Err("could not write the scratch file: its worker stopped".to_string())
+                    }
+                }
+            };
+            let view = self.views.borrow_mut().remove(0);
+            let drive = self.drive.borrow().clone();
+            let shown = written.and_then(|request| {
+                let drive = drive.ok_or("this window has no editor to drive")?;
+                drive(EditorAct::Request(&request), view.token)
+            });
+            if let Err(why) = shown {
+                eprintln!("[link] another window's view was not shown: {why}");
+            }
+        }
     }
 
     /// A draft edit ended: the tab's holder now hears how, found by its session. A tab that came to this window
@@ -1471,6 +1524,20 @@ pub struct Window2Editor {
     drafts: RefCell<Vec<WaitingDraft>>,
     raise: RefCell<Option<Raise>>,
     ops: Rc<EditorOps>,
+    repeat: Repeat,
+    /// Views whose text is being read back on a worker, oldest first: each goes to window 1 once read, in the
+    /// order they were asked for.
+    views: RefCell<Vec<ReadingView>>,
+    polling: Cell<bool>,
+}
+
+/// A view on its way to window 1: its file in this window's scratch directory is read on a worker thread, since
+/// the text may be a megabyte and the GTK thread never waits for a disk.
+struct ReadingView {
+    rx: mpsc::Receiver<std::io::Result<String>>,
+    title: String,
+    tab: bool,
+    token: Option<String>,
 }
 
 impl Window2Editor {
@@ -1492,7 +1559,10 @@ impl Window2Editor {
             draft_tab: RefCell::default(),
             drafts: RefCell::default(),
             raise: RefCell::default(),
-            ops: EditorOps::new(repeat),
+            ops: EditorOps::new(repeat.clone()),
+            repeat,
+            views: RefCell::default(),
+            polling: Cell::new(false),
         })
     }
 
@@ -1690,15 +1760,25 @@ impl Window2Editor {
                     }),
                 )
             }
-            ScratchAsk::View { body } => {
-                let text = self.own_scratch_text(&body)?;
-                (
-                    EditorRequest::View {
-                        title: view_title(&body),
-                        text,
-                    },
-                    None,
-                )
+            ScratchAsk::View { body, tab } => {
+                // Checked here, read on a worker: `poll_views` sends the text once it is read.
+                self.own_scratch_file(&body)?;
+                let (tx, rx) = mpsc::channel();
+                let path = body.clone();
+                std::thread::Builder::new()
+                    .name("linked view read".into())
+                    .spawn(move || {
+                        let _ = tx.send(std::fs::read_to_string(&path));
+                    })
+                    .map_err(|e| format!("could not read {}: {e}", body.display()))?;
+                self.views.borrow_mut().push(ReadingView {
+                    rx,
+                    title: view_title(&body),
+                    tab,
+                    token: token(),
+                });
+                self.poll_views_soon();
+                return Ok(());
             }
             ScratchAsk::Diff { base, proposed, name } => (
                 EditorRequest::Diff {
@@ -1726,6 +1806,12 @@ impl Window2Editor {
     /// The text of a file the panel wrote for the editor, read only from this window's own scratch directory: what
     /// goes to window 1 is the text, never the file's name.
     fn own_scratch_text(&self, path: &Path) -> Result<String, String> {
+        self.own_scratch_file(path)?;
+        std::fs::read_to_string(path).map_err(|e| format!("could not read {}: {e}", path.display()))
+    }
+
+    /// Whether `path` is a file of this window's own scratch directory, reached by no way that climbs out of it.
+    fn own_scratch_file(&self, path: &Path) -> Result<(), String> {
         let ours = self
             .scratch
             .as_deref()
@@ -1734,7 +1820,64 @@ impl Window2Editor {
         if !ours || climbs {
             return Err("the file is not in this window's scratch directory".into());
         }
-        std::fs::read_to_string(path).map_err(|e| format!("could not read {}: {e}", path.display()))
+        Ok(())
+    }
+
+    fn poll_views_soon(&self) {
+        if self.polling.replace(true) {
+            return;
+        }
+        let me = self.me.clone();
+        (self.repeat)(
+            POLL_EVERY,
+            Box::new(move || {
+                let Some(me) = me.upgrade() else { return false };
+                let more = me.poll_views();
+                if !more {
+                    me.polling.set(false);
+                }
+                more
+            }),
+        );
+    }
+
+    /// Sends window 1 each view whose text is read, in the order they were asked for. The page heard its request
+    /// was taken when it was; a read that failed, or a link that ended meanwhile, is logged. Whether any is still
+    /// being read.
+    fn poll_views(&self) -> bool {
+        loop {
+            let read = {
+                let views = self.views.borrow();
+                let Some(view) = views.first() else { return false };
+                match view.rx.try_recv() {
+                    Ok(read) => read.map_err(|e| format!("could not read the view's file: {e}")),
+                    Err(mpsc::TryRecvError::Empty) => return true,
+                    Err(mpsc::TryRecvError::Disconnected) => {
+                        Err("could not read the view's file: its worker stopped".to_string())
+                    }
+                }
+            };
+            let view = self.views.borrow_mut().remove(0);
+            let link = self.link.borrow().clone().filter(LinkDriver::linked);
+            let sent = read.and_then(|text| {
+                let link = link.ok_or_else(|| UNLINKED_NOTE.to_string())?;
+                link.send(
+                    Msg::Editor {
+                        request: EditorRequest::View {
+                            title: view.title,
+                            text,
+                            tab: view.tab,
+                        },
+                        token: view.token,
+                    },
+                    Vec::new(),
+                )
+                .map_err(|e| format!("the editor window could not be asked: {e}"))
+            });
+            if let Err(why) = sent {
+                eprintln!("[link] a view for the editor window was not sent: {why}");
+            }
+        }
     }
 
     /// Asks window 1 to come forward and give its editor the keys, with `token` (an activation token): what this
@@ -3010,9 +3153,10 @@ mod tests {
         w.two.request(&view, &|| Some("token-v".into())).unwrap();
         assert!(w.settle(|| !driven.borrow().is_empty()));
         let (ask, token) = driven.borrow()[0].clone();
-        let Some(ScratchAsk::View { body }) = ask else {
+        let Some(ScratchAsk::View { body, tab }) = ask else {
             panic!("a view opens as a view: {ask:?}")
         };
+        assert!(!tab, "a row's view opens in the row-view split");
         assert_eq!(
             token,
             Some("token-v".into()),
@@ -3054,6 +3198,40 @@ mod tests {
         w.pump_a_while();
         assert_eq!(driven.borrow().len(), 2, "nothing more reached window 1's editor");
         elsewhere.cleanup();
+        scratch.cleanup();
+    }
+
+    /// `:%scratch` from window 2: the tab page it asked for is the one window 1 opens, and views asked for one after
+    /// another open in that order, each read and written again off the GTK thread.
+    #[test]
+    fn a_tab_view_from_window_2_keeps_its_tab_and_its_order() {
+        let w = windows("tab-views");
+        let driven = recording_drive(&w);
+        let ones = w.one.scratch_parent.clone().unwrap();
+        let mut scratch = ScratchDir::in_dir(w.two.scratch.as_deref().unwrap()).unwrap();
+        let big = "## ▍You · prompt 1/1\n\n".to_string() + &"x".repeat(2_000_000);
+        let whole = scratch.reserve_view("Conversation").with_tab(true).write(&big).unwrap();
+        let row = scratch.prepare_view("reply", "a row").unwrap();
+        w.two.request(&whole, &|| Some("token-t".into())).unwrap();
+        w.two.request(&row, &|| None).unwrap();
+        assert!(w.settle(|| driven.borrow().len() == 2));
+        let asks: Vec<_> = driven
+            .borrow()
+            .iter()
+            .map(|(ask, token)| (ask.clone(), token.clone()))
+            .collect();
+        let (Some(ScratchAsk::View { body, tab }), token) = &asks[0] else {
+            panic!("the conversation opens as a view: {asks:?}")
+        };
+        assert!(*tab, "the conversation keeps its tab page");
+        assert_eq!(token.as_deref(), Some("token-t"));
+        assert!(body.starts_with(&ones), "window 1's own copy: {body:?}");
+        assert_eq!(std::fs::read_to_string(body).unwrap(), big);
+        let (Some(ScratchAsk::View { body, tab }), _) = &asks[1] else {
+            panic!("the row opens as a view: {asks:?}")
+        };
+        assert!(!*tab, "the row after it keeps the split");
+        assert_eq!(std::fs::read_to_string(body).unwrap(), "a row");
         scratch.cleanup();
     }
 

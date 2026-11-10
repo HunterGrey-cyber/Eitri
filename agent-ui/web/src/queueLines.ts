@@ -6,7 +6,8 @@ export function heldCount(items: readonly QueueItem[]): number {
   return items.filter((item) => item.steered !== true).length;
 }
 
-/** The empty box's words while a turn runs: what Enter does with the message in this tab. */
+/** The empty box's words while a turn runs: what Enter does with the message in this tab, and, where Enter
+ *  steers, the key that holds one for the turn's end instead. */
 export function runningPlaceholder(steers: boolean): string {
-  return steers ? "Enter steers the running turn…" : "Enter holds it until the turn ends…";
+  return steers ? "Enter steers the running turn, Ctrl+x Enter waits for its end…" : "Enter holds it until the turn ends…";
 }

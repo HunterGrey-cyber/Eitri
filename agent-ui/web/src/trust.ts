@@ -170,7 +170,10 @@ export function scrollTarget(
 }
 
 /** An ex command the `:` line runs. `tabnew` carries the agent word typed after it, `null` for none. */
-export type ExCommand = { command: "trust" | "untrust" } | { command: "tabnew"; agent: string | null };
+export type ExCommand =
+  | { command: "trust" | "untrust" }
+  | { command: "tabnew"; agent: string | null }
+  | { command: "scratch"; whole: boolean };
 
 /** What the `:` line does with its text: the exact words only, so `:trust x` and `:trusted` stay a
  *  refusal. `:tabnew` takes at most one word, which is not checked here: Rust knows which agents `init.lua`
@@ -178,6 +181,7 @@ export type ExCommand = { command: "trust" | "untrust" } | { command: "tabnew"; 
 export function parseExCommand(line: string): ExCommand | null {
   const [head, argument, ...rest] = line.trim().split(/\s+/);
   if (head === "trust" || head === "untrust") return argument === undefined ? { command: head } : null;
+  if (head === "scratch" || head === "%scratch") return argument === undefined ? { command: "scratch", whole: head === "%scratch" } : null;
   if (head === "tabnew" && rest.length === 0) return { command: "tabnew", agent: argument ?? null };
   return null;
 }

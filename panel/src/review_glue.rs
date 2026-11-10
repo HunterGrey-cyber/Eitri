@@ -369,6 +369,16 @@ pub(super) fn start_view_job(
     title: &str,
     text: String,
 ) -> Result<(), String> {
+    start_view_job_with_tab(state, asker, title, text, false)
+}
+
+pub(super) fn start_view_job_with_tab(
+    state: &mut AgentPanelState,
+    asker: ViewAsker,
+    title: &str,
+    text: String,
+    tab: bool,
+) -> Result<(), String> {
     if state.view_jobs.len() >= MAX_VIEW_JOBS {
         return Err("views are still being written; try again in a moment".to_string());
     }
@@ -376,7 +386,8 @@ pub(super) fn start_view_job(
         .scratch
         .as_mut()
         .ok_or_else(|| "the scratch directory could not be created at startup".to_string())?
-        .reserve_view(title);
+        .reserve_view(title)
+        .with_tab(tab);
     let rx = spawn_view_write(file, text, |job| {
         std::thread::Builder::new()
             .name("view write".into())
@@ -934,7 +945,7 @@ mod tests {
     #[test]
     fn a_view_is_written_on_a_worker_and_the_editor_is_asked_after() {
         let (handle, page, root, asked) = panel_with_recording_editor();
-        let text = "line of output\n".repeat(70_000);
+        let text = "输出的一行\n".repeat(100_000);
         assert!(text.len() > 1 << 20);
         handle.page_message(ViewId::BASE, &view_message("v1", "Bash: ls", &text));
         assert!(

@@ -145,6 +145,28 @@ local function view(path)
   last_view = { win = win, buf = buf }
 end
 
+-- A conversation snapshot gets a fresh tab and no answer keys. Closing its last tab wipes only
+-- the snapshot buffer, leaving nvim running.
+local function view_tab(path)
+  path = absolute(path)
+  local buf = read_only_buffer(path, read_lines(path))
+  local previous = vim.api.nvim_get_current_tabpage()
+  vim.cmd(('tab sbuffer %d'):format(buf))
+  local tab = vim.api.nvim_get_current_tabpage()
+  if tab == previous then error('no tab page was opened for the view') end
+  windows[vim.api.nvim_get_current_win()] = buf
+  vim.bo[buf].filetype = 'markdown'
+  vim.keymap.set('n', 'q', function()
+    if not vim.api.nvim_tabpage_is_valid(tab) then return end
+    if #vim.api.nvim_list_tabpages() > 1 then
+      vim.api.nvim_set_current_tabpage(tab)
+      vim.cmd('tabclose')
+    elseif vim.api.nvim_buf_is_valid(buf) then
+      vim.api.nvim_buf_delete(buf, { force = true })
+    end
+  end, { buffer = buf, nowait = true, silent = true, desc = 'close the conversation view' })
+end
+
 -- A pending edit's proposal: the file as it is on disk (left) against the file as the edit would leave
 -- it (right), in a tab page of their own, both read-only, so nothing here can write the real file or
 -- touch a buffer the user has. `q` in either closes the tab page. The real name only picks the filetype.
@@ -218,7 +240,7 @@ function M.call(hex)
         pcall(vim.api.nvim_win_set_cursor, 0, { req.line, 0 })
       end
     elseif req.op == 'view' then
-      view(req.path)
+      if req.tab then view_tab(req.path) else view(req.path) end
     elseif req.op == 'diff' then
       diff(req)
     elseif req.op == 'edit' then

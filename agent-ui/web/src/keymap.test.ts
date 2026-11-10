@@ -460,8 +460,8 @@ describe("resolveKey: sequences, counts, search and the command line", () => {
     expect(resolveKey("visual", key(":", { shiftKey: true }), ctx)).toEqual({ kind: "vend", key: ":" });
   });
 
-  it("lists the : command line's three commands in the help", () => {
-    expect(BROWSE_KEYS.find((row) => row.keys === ":")?.what).toBe("A command line, as in vim: :tabnew, :trust and :untrust");
+  it("lists the : command line's commands in the help", () => {
+    expect(BROWSE_KEYS.find((row) => row.keys === ":")?.what).toBe("A command line, as in vim: :tabnew, :trust, :untrust, :scratch and :%scratch");
   });
 
   it("walks jumps on BROWSE Ctrl+o, toggles details in INPUT, and scrolls a table on zh / zl", () => {
@@ -646,7 +646,7 @@ describe("a pending prefix's second key", () => {
       expect(resolveKey("browse", key("v", over), { ...ctx, pending: "g" }), `g then ${held} v`).toBeNull();
       expect(resolveKey("browse", key("]", over), { ...ctx, pending: "[" }), `[ then ${held} ]`).toBeNull();
       expect(resolveKey("browse", key("[", over), { ...ctx, pending: "]" }), `] then ${held} [`).toBeNull();
-      for (const [prefix, k] of [["]", "a"], ["g", "d"], ["[", "j"], ["z", "q"]] as const)
+      for (const [prefix, k] of [["]", "a"], ["g", "u"], ["[", "j"], ["z", "q"]] as const)
         expect(resolveKey("browse", key(k, over), { ...ctx, pending: prefix }), `${prefix} then ${held} ${k}`).toEqual({
           kind: "cancel",
           why: "unbound",
@@ -877,7 +877,7 @@ describe("gx: open this row's web link", () => {
     for (const prefix of ["z", "[", "]", "C-w"] as const)
       expect(resolveKey("browse", key("x"), { ...ctx, pending: prefix }), `${prefix} x`).toEqual({ kind: "cancel", why: "unbound" });
     expect(resolveKey("browse", key("x"), ctx)).toBeNull();
-    expect(Object.keys(FIXED_PAIRS.g).sort()).toEqual(["?", "f", "g", "x"]);
+    expect(Object.keys(FIXED_PAIRS.g).sort()).toEqual(["?", "d", "f", "g", "x"]);
   });
 
   it("is BROWSE's: INPUT never reads a prefix, and CARET/VISUAL end the region on the x", () => {
@@ -1484,6 +1484,18 @@ describe("CARD_KEYS <-> cardKey", () => {
         expect(intent.kind, `"${token}" (from "${keys}")`).not.toBe("type");
       }
     }
+  });
+});
+
+describe("gd", () => {
+  it("opens the BROWSE row, including Alt+d after g", () => {
+    for (const altKey of [false, true]) {
+      expect(resolveKey("browse", key("d", { altKey }), { ...ctx, pending: "g" })).toEqual({ kind: "go-definition" });
+    }
+  });
+  it.each(["caret", "visual", "vline"] as const)("looks up the %s target", (mode) => {
+    expect(resolveKey(mode, key("g"), ctx)).toEqual({ kind: "pending", prefix: "g" });
+    expect(resolveKey(mode, key("d"), { ...ctx, pending: "g" })).toEqual({ kind: "vgo-definition" });
   });
 });
 

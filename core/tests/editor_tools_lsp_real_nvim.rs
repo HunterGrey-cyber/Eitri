@@ -828,6 +828,82 @@ fn workspace_symbols_ask_only_clients_of_the_project() {
 }
 #[test]
 #[ignore = "needs a real nvim on PATH; spends no tokens and needs no display"]
+fn a_query_is_worded_per_client_and_the_start_names_the_clients_and_the_busy() {
+    let mut t = Test::new();
+    t.start("gopls", "utf-16", t.buf.clone(), &t.root, None, 0);
+    t.start("lua_ls", "utf-16", t.buf.clone(), &t.root, None, 0);
+    // A client without workspace symbols (a linter, a spell checker) is attached too: it is not asked, so it is not
+    // named, and its unfinished work is no reason to say a server is indexing.
+    t.start(
+        "typos",
+        "utf-16",
+        t.buf.clone(),
+        &t.root,
+        Some(map(&[("definitionProvider", true.into())])),
+        0,
+    );
+    t.lua(
+        "for _, c in ipairs(vim.lsp.get_clients({name = 'gopls'})) do c.progress.pending['load'] = 'Loading' end \
+         for _, c in ipairs(vim.lsp.get_clients({name = 'typos'})) do c.progress.pending['scan'] = 'Scanning' end",
+        vec![],
+    );
+    t.answers(map(&[("workspace/symbol", Value::Array(vec![]))]), &[], 0);
+    let mut a = t.args();
+    a.kind = LspKind::WorkspaceSymbols;
+    a.path = None;
+    a.line = None;
+    a.symbol = None;
+    a.query = Some("call".into());
+    a.query_for = vec![
+        ("gopls".into(), "M.call".into()),
+        ("rust-analyzer".into(), "call#".into()),
+    ];
+    match t.ask(&a) {
+        Asked::Started { clients, busy, .. } => {
+            assert_eq!(clients, ["gopls", "lua_ls"]);
+            assert_eq!(busy, ["gopls"]);
+        }
+        v => panic!("{v:?}"),
+    }
+    t.parts();
+    let asked = t.lua(
+        "local q = {} for _, s in ipairs(_G.__fake_lsp.seen) do if s.method == 'workspace/symbol' then q[s.client] = s.params.query end end return q",
+        vec![],
+    );
+    let query_of = |client: &str| {
+        asked
+            .as_map()
+            .unwrap()
+            .iter()
+            .find(|(k, _)| k.as_str() == Some(client))
+            .and_then(|(_, v)| v.as_str().map(str::to_owned))
+    };
+    assert_eq!(query_of("gopls").as_deref(), Some("M.call"));
+    assert_eq!(
+        query_of("lua_ls").as_deref(),
+        Some("call"),
+        "a client not named gets the query"
+    );
+
+    // Without `query_for` every client is asked the one query, and nobody is busy once the work ends.
+    t.lua(
+        "for _, c in ipairs(vim.lsp.get_clients()) do c.progress.pending = {} end _G.__fake_lsp.seen = {}",
+        vec![],
+    );
+    a.id = "two".into();
+    a.query_for = Vec::new();
+    match t.ask(&a) {
+        Asked::Started { busy, .. } => assert!(busy.is_empty(), "{busy:?}"),
+        v => panic!("{v:?}"),
+    }
+    let all = t.lua(
+        "local n = 0 for _, s in ipairs(_G.__fake_lsp.seen) do if s.params.query == 'call' then n = n + 1 end end return n",
+        vec![],
+    );
+    assert_eq!(all.as_u64(), Some(2));
+}
+#[test]
+#[ignore = "needs a real nvim on PATH; spends no tokens and needs no display"]
 fn an_unsupported_part_is_named() {
     let mut t = Test::new();
     t.start(

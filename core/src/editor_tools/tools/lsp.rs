@@ -137,6 +137,8 @@ pub struct AskArgs {
     /// An empty list asks all three parts.
     pub include: Vec<UsagePart>,
     pub query: Option<String>,
+    /// A query per client name, asked of that client in place of `query`. Empty: every client gets `query`.
+    pub query_for: Vec<(String, String)>,
     pub new_name: Option<String>,
     pub action: Option<String>,
     /// Remaining budget plus `COLLECT_MARGIN`, in milliseconds.
@@ -148,6 +150,11 @@ pub enum Asked {
     Started {
         unsupported: Vec<String>,
         action: Option<ActionFacts>,
+        /// The names of the clients a request went to (one without the method was not asked), each at most 64 bytes, at
+        /// most 8.
+        clients: Vec<String>,
+        /// Those of `clients` with an unfinished work-done progress when the ask went out.
+        busy: Vec<String>,
     },
     ActionGone,
     NoEdit {
@@ -330,6 +337,17 @@ pub fn ask(rpc: &dyn EditorRpc, stamp: &Stamp, args: &AskArgs) -> Pending {
     if let Some(query) = &args.query {
         values.push(("query".into(), query.as_str().into()));
     }
+    if !args.query_for.is_empty() {
+        values.push((
+            "query_for".into(),
+            Value::Map(
+                args.query_for
+                    .iter()
+                    .map(|(client, query)| (client.as_str().into(), query.as_str().into()))
+                    .collect(),
+            ),
+        ));
+    }
     if let Some(name) = &args.new_name {
         values.push(("new_name".into(), name.as_str().into()));
     }
@@ -381,6 +399,15 @@ fn array(value: &Value) -> Result<&[Value], String> {
 }
 fn texts(value: &Value) -> Result<Vec<String>, String> {
     array(value)?.iter().map(text).collect()
+}
+/// A list of strings that may be absent, or empty as a map: what nvim sends for an empty table.
+fn optional_texts(value: &Value, name: &str) -> Result<Vec<String>, String> {
+    match field(value, name) {
+        Some(Value::Array(items)) => items.iter().map(text).collect(),
+        Some(Value::Map(entries)) if entries.is_empty() => Ok(Vec::new()),
+        Some(Value::Nil) | None => Ok(Vec::new()),
+        Some(_) => Err(format!("the LSP answer has an invalid {name}")),
+    }
 }
 fn yes(value: &Value, name: &str) -> bool {
     field(value, name).and_then(Value::as_bool) == Some(true)
@@ -443,6 +470,8 @@ pub fn parse_asked(value: &Value) -> Result<Asked, String> {
         return Ok(Asked::Started {
             unsupported: field(value, "unsupported").map(texts).transpose()?.unwrap_or_default(),
             action: action_facts(value)?,
+            clients: optional_texts(value, "clients")?,
+            busy: optional_texts(value, "busy")?,
         });
     }
     if yes(value, "action_gone") {
@@ -923,7 +952,9 @@ impl AskCollect {
             return failed(format!("the editor's buffer for {named} {}", words::NOT_TOLD));
         }
         match asked {
-            Asked::Started { unsupported, action } => {
+            Asked::Started {
+                unsupported, action, ..
+            } => {
                 self.unsupported = unsupported;
                 self.action = action;
                 self.stage = Stage::Waiting;
@@ -1443,6 +1474,35 @@ mod tests {
                 Asked::Started {
                     unsupported: vec!["references".into()],
                     action: None,
+                    clients: Vec::new(),
+                    busy: Vec::new(),
+                },
+            ),
+            (
+                map(&[
+                    ("started", true.into()),
+                    ("unsupported", Value::Array(vec![])),
+                    ("clients", Value::Array(vec!["rust-analyzer".into(), "lua_ls".into()])),
+                    ("busy", Value::Array(vec!["rust-analyzer".into()])),
+                ]),
+                Asked::Started {
+                    unsupported: Vec::new(),
+                    action: None,
+                    clients: vec!["rust-analyzer".into(), "lua_ls".into()],
+                    busy: vec!["rust-analyzer".into()],
+                },
+            ),
+            (
+                map(&[
+                    ("started", true.into()),
+                    ("clients", Value::Map(vec![])),
+                    ("busy", Value::Map(vec![])),
+                ]),
+                Asked::Started {
+                    unsupported: Vec::new(),
+                    action: None,
+                    clients: Vec::new(),
+                    busy: Vec::new(),
                 },
             ),
             (
@@ -1464,6 +1524,76 @@ mod tests {
             assert_eq!(parse_asked(&value).unwrap(), expected);
         }
         assert!(parse_asked(&map(&[])).is_err());
+        assert!(
+            parse_asked(&map(&[("started", true.into()), ("clients", "gopls".into())])).is_err(),
+            "a client list that is not a list is not believed"
+        );
+    }
+
+    /// An editor that keeps what each chunk was sent.
+    #[derive(Default)]
+    struct Kept(std::cell::RefCell<Vec<Vec<Value>>>);
+    impl EditorRpc for Kept {
+        fn exec_lua(&self, _code: &'static str, args: Vec<Value>) -> Pending {
+            self.0.borrow_mut().push(args);
+            Pending::failed(crate::nvim_rpc::RpcError::Closed)
+        }
+        fn target(&self) -> Option<u64> {
+            Some(1)
+        }
+    }
+
+    fn sent_args(args: &AskArgs) -> Value {
+        let kept = Kept::default();
+        let stamp = Stamp {
+            scope: "s".into(),
+            seq: 1,
+            deadline_ms: u64::MAX,
+        };
+        drop(ask(&kept, &stamp, args));
+        let sent = kept.0.borrow();
+        assert_eq!(sent.len(), 1);
+        assert_eq!(
+            sent[0].len(),
+            2,
+            "the stamp and one map: nothing takes a third argument's place"
+        );
+        sent[0][1].clone()
+    }
+
+    #[test]
+    fn ask_sends_a_query_per_client_only_when_given() {
+        let plain = AskArgs {
+            id: "a".into(),
+            kind: LspKind::WorkspaceSymbols,
+            query: Some("RegisterPreview".into()),
+            ..Default::default()
+        };
+        assert!(
+            field(&sent_args(&plain), "query_for").is_none(),
+            "absent, the tools ask as before"
+        );
+        let worded = AskArgs {
+            query_for: vec![
+                ("gopls".into(), "Server.RegisterPreview".into()),
+                ("rust-analyzer".into(), "RegisterPreview#".into()),
+            ],
+            ..plain
+        };
+        let value = sent_args(&worded);
+        assert_eq!(field(&value, "query").and_then(Value::as_str), Some("RegisterPreview"));
+        let per = field(&value, "query_for").and_then(Value::as_map).expect("a map");
+        let pairs: Vec<(&str, &str)> = per
+            .iter()
+            .map(|(k, v)| (k.as_str().unwrap(), v.as_str().unwrap()))
+            .collect();
+        assert_eq!(
+            pairs,
+            [
+                ("gopls", "Server.RegisterPreview"),
+                ("rust-analyzer", "RegisterPreview#")
+            ]
+        );
     }
 
     #[test]

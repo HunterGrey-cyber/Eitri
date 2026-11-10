@@ -100,9 +100,15 @@ pub enum EditorRequest {
     ReviewOpen { path: String, line: Option<u32> },
     /// The editor key pressed in window 2.
     Focus,
-    /// A read-only view (`Ctrl+g` on a chat row): `text` in a read-only buffer named after `title`. The text travels,
-    /// as a draft's does, so no file of the other window's scratch directory is ever named to the editor.
-    View { title: String, text: String },
+    /// A read-only view (`Ctrl+g` on a chat row, `:%scratch`): `text` in a read-only buffer named after `title`, in
+    /// the reusable row-view split, or in a tab page of its own with `tab`. The text travels, as a draft's does, so
+    /// no file of the other window's scratch directory is ever named to the editor.
+    View {
+        title: String,
+        text: String,
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        tab: bool,
+    },
     /// A pending edit's proposal as a read-only diff: the file as it is (`base`) and as the edit would leave it
     /// (`proposed`); `name` is the real file's name, which the buffers' filetype comes from.
     Diff {
@@ -930,6 +936,12 @@ mod tests {
             EditorRequest::View {
                 title: "notes".into(),
                 text: "a row\nof text".into(),
+                tab: false,
+            },
+            EditorRequest::View {
+                title: "Conversation".into(),
+                text: "## ▍You · prompt 1/1".into(),
+                tab: true,
             },
             EditorRequest::Diff {
                 name: "src/a.rs".into(),
@@ -943,6 +955,24 @@ mod tests {
             };
             assert_eq!(from_json(&to_json(&msg)).unwrap(), msg);
         }
+    }
+
+    /// A view for the row-view split goes as it always went, with no `tab`, and one without it reads as the split.
+    #[test]
+    fn a_view_without_tab_is_the_split_and_writes_no_tab() {
+        let split = Msg::Editor {
+            request: EditorRequest::View {
+                title: "notes".into(),
+                text: "a row".into(),
+                tab: false,
+            },
+            token: None,
+        };
+        let json = to_json(&split);
+        let text = String::from_utf8(json.clone()).unwrap();
+        assert!(text.contains("\"view\""), "{text}");
+        assert!(!text.contains("\"tab\""), "{text}");
+        assert_eq!(from_json(&json).unwrap(), split);
     }
 
     #[test]

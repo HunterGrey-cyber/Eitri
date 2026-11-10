@@ -291,6 +291,25 @@ fn a_typed_message_waits_behind_a_waiting_question() {
     shut_down_all(&mut set);
 }
 
+/// `Ctrl+x Enter` with no turn running goes out as Enter's message would: behind a waiting card or question,
+/// as soon as it settles.
+#[test]
+fn an_after_turn_send_waits_behind_a_waiting_question_then_goes() {
+    let (dir, mut set, tab, provider) = waiting("question-after-turn");
+    set.queue_after_turn(tab, "later", "later with context".into(), 1, agent::PromptOrigin::Typed)
+        .unwrap();
+    assert!(set.get(tab).unwrap().session.queue[0].behind_card);
+    assert!(set.flush_queue(tab).is_none());
+    assert!(set.release_after_card().is_empty());
+    settle(&provider);
+    pump_until(&mut set, &dir, "question settled", |s| {
+        s.get(tab).unwrap().attention.attention().pending == 0
+    });
+    assert_eq!(set.release_after_card().len(), 1);
+    assert_eq!(provider.turns(), vec!["later with context"]);
+    shut_down_all(&mut set);
+}
+
 #[test]
 fn a_companion_send_waits_behind_a_waiting_question() {
     let (dir, mut set, tab, provider) = waiting("question-companion");

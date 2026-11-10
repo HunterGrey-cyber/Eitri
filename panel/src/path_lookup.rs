@@ -18,6 +18,7 @@ const MAX_OFFERS: usize = 64;
 
 struct Request {
     line: Option<u32>,
+    expect: Option<String>,
     view: ViewId,
     request_id: String,
     tab: TabId,
@@ -31,7 +32,7 @@ struct FoundPath {
 }
 enum Answer {
     One(FoundPath),
-    Ready(PathBuf),
+    Ready(PathBuf, Option<String>),
     Choices(Vec<FoundPath>, Option<String>),
 }
 struct Offer {
@@ -190,6 +191,7 @@ pub(super) fn start(
     state: &mut AgentPanelState,
     path: String,
     line: Option<u32>,
+    expect: Option<String>,
     view: ViewId,
     request_id: String,
     tab: TabId,
@@ -199,6 +201,7 @@ pub(super) fn start(
     let limits = state.path_lookup.limits;
     let request = Request {
         line,
+        expect: expect.clone(),
         view,
         request_id,
         tab,
@@ -207,7 +210,10 @@ pub(super) fn start(
     };
     start_worker(state, request, move || {
         match super::links::open_path_exact(&root, &path) {
-            Ok(resolved) => Ok(Answer::Ready(resolved)),
+            Ok(resolved) => {
+                let note = line_note(&resolved, &path, line, expect.as_deref());
+                Ok(Answer::Ready(resolved, note))
+            }
             Err(super::links::OpenPathRefusal::Missing)
                 if eitri_core::path_complete::suffix_wanted(&path).is_some() =>
             {
@@ -218,12 +224,37 @@ pub(super) fn start(
     })
 }
 
+/// The one regular file inside the canonical project root that `path` names as `gf` resolves it: the path itself,
+/// else the only file whose name ends with it. A directory, a FIFO, a device, a path leading outside the project or a
+/// suffix several files share is none. Listing and resolving touch the file system: call it on a worker.
+pub(super) fn resolve_inside(root: &Path, path: &str) -> Option<PathBuf> {
+    let canonical_root = root.canonicalize().ok()?;
+    match super::links::open_path_exact(root, path) {
+        Ok(resolved) => {
+            let real = resolved.canonicalize().ok()?;
+            (real.starts_with(&canonical_root) && real.is_file()).then_some(real)
+        }
+        Err(super::links::OpenPathRefusal::Missing) if eitri_core::path_complete::suffix_wanted(path).is_some() => {
+            let limits = SuffixLimits {
+                max_files: MAX_FILES,
+                deadline: DEADLINE,
+            };
+            match lookup(root, path, limits) {
+                Ok(Answer::One(found)) => Some(found.canonical),
+                _ => None,
+            }
+        }
+        Err(_) => None,
+    }
+}
+
 /// An offered name retains its checked identity until chosen or expired. Choosing one consumes the
 /// request's whole offer so unused entries do not accumulate.
 pub(super) fn pick(
     state: &mut AgentPanelState,
     path: &str,
     line: Option<u32>,
+    expect: Option<String>,
     view: ViewId,
     request_id: &str,
     tab: TabId,
@@ -239,18 +270,53 @@ pub(super) fn pick(
     let found = offer.paths.into_iter().find(|found| found.name == path).unwrap();
     let request = Request {
         line,
+        expect: expect.clone(),
         view,
         request_id: request_id.to_owned(),
         tab,
         wanted: path.to_owned(),
         started: Instant::now(),
     };
-    Some(start_worker(state, request, move || final_check(&offer.root, found)))
+    Some(start_worker(state, request, move || {
+        final_check(&offer.root, found, line, expect.as_deref())
+    }))
 }
 
-fn final_check(root: &Path, found: FoundPath) -> Result<Answer, String> {
+fn final_check(root: &Path, found: FoundPath, line: Option<u32>, expect: Option<&str>) -> Result<Answer, String> {
     checked_path(root, &found.name, Some(&found.canonical))?;
-    Ok(Answer::Ready(root.join(found.name)))
+    let note = line_note(&found.canonical, &found.name, line, expect);
+    Ok(Answer::Ready(root.join(found.name), note))
+}
+
+/// Only a bounded regular disk file is evidence about a citation; loaded buffers may have unsaved edits.
+fn line_note(path: &Path, name: &str, line: Option<u32>, expect: Option<&str>) -> Option<String> {
+    use std::io::Read;
+    let line = line.filter(|line| *line > 0)?;
+    let expect = expect.filter(|name| eitri_core::agent_bridge::valid_symbol_name(name))?;
+    let canonical = path.canonicalize().ok()?;
+    if !std::fs::metadata(&canonical).ok()?.is_file() {
+        return None;
+    }
+    // Judged again on the handle, opened without waiting: a FIFO put in its place since the look above would
+    // otherwise hold this worker until a writer came.
+    let file = eitri_core::scratch::open_regular_file(&canonical)?;
+    let mut bytes = Vec::new();
+    file.take(1_000_000).read_to_end(&mut bytes).ok()?;
+    // The cap may cut the requested line before its name. That is no evidence it changed.
+    if bytes.len() == 1_000_000 && bytes.iter().filter(|byte| **byte == b'\n').count() < line as usize {
+        return None;
+    }
+    let text = String::from_utf8_lossy(&bytes);
+    if text
+        .lines()
+        .nth((line - 1) as usize)
+        .is_some_and(|text| text.contains(expect))
+    {
+        return None;
+    }
+    Some(format!(
+        "{name}:{line} no longer has {expect} (the file changed since the reply)"
+    ))
 }
 
 fn active(state: &AgentPanelState, request: &Request) -> bool {
@@ -307,17 +373,30 @@ pub(super) fn poll(state: &mut AgentPanelState, out: &mut Outbox) {
                 let root = state.project_dir.clone();
                 let view = request.view;
                 let id = request.request_id.clone();
-                if let Err(why) = start_worker(state, request, move || final_check(&root, found)) {
+                let line = request.line;
+                let expect = request.expect.clone();
+                if let Err(why) = start_worker(state, request, move || {
+                    final_check(&root, found, line, expect.as_deref())
+                }) {
                     out.send(view, serialize_command_result_for_js(&id, Err(&why)));
                 }
             }
-            Ok(Answer::Ready(path)) => out.effect(Effect::AskEditor {
-                request: eitri_core::scratch::open_request(&path, request.line),
-                then: EditorThen::Answer {
-                    view: request.view,
-                    request_id: request.request_id,
-                },
-            }),
+            Ok(Answer::Ready(path, note)) => {
+                if let Some(note) = note {
+                    // An envelope of its own, before the editor's answer, which alone settles the request.
+                    out.send(
+                        request.view,
+                        eitri_core::agent_bridge::serialize_open_path_note_for_js(&request.request_id, &note),
+                    );
+                }
+                out.effect(Effect::AskEditor {
+                    request: eitri_core::scratch::open_request(&path, request.line),
+                    then: EditorThen::Answer {
+                        view: request.view,
+                        request_id: request.request_id,
+                    },
+                });
+            }
             Ok(Answer::Choices(paths, stopped)) => {
                 let names = paths.iter().map(|path| path.name.clone()).collect::<Vec<_>>();
                 out.send(
@@ -362,6 +441,98 @@ mod tests {
     use crate::agent_panel::tests::*;
 
     #[test]
+    fn path_lookup_expect_checks_disk_on_exact_suffix_and_picked_paths() {
+        for mode in ["exact", "suffix", "pick"] {
+            for present in [false, true] {
+                let root = Project::new();
+                root.write("src/mesh.go");
+                std::fs::write(
+                    root.0.join("src/mesh.go"),
+                    if present {
+                        "header\nfn Name() {}\n"
+                    } else {
+                        "header\nchanged\n"
+                    },
+                )
+                .unwrap();
+                if mode == "pick" {
+                    root.write("test/mesh.go");
+                }
+                let (handle, page, _) = handle_with_recording_page();
+                handle.state.borrow_mut().project_dir = root.0.clone();
+                let opened = record_opens(&handle);
+                let wanted = if mode == "exact" { "src/mesh.go" } else { "mesh.go" };
+                handle.page_message(
+                    ViewId::BASE,
+                    &serde_json::json!({
+                        "type": "open_path", "request_id": "find", "path": wanted, "line": 2, "expect": "Name",
+                    })
+                    .to_string(),
+                );
+                if mode == "pick" {
+                    tick_handle_until(&handle, "choices before the expected-name check", || {
+                        response(&page).is_some()
+                    });
+                    assert_eq!(response(&page).unwrap()["kind"], "path_choices");
+                    page.sent.borrow_mut().clear();
+                    handle.page_message(ViewId::BASE, &serde_json::json!({
+                        "type": "open_path", "request_id": "find", "path": "src/mesh.go", "line": 2, "expect": "Name",
+                    }).to_string());
+                }
+                tick_handle_until(&handle, "expected-name open", || !opened.borrow().is_empty());
+                assert_eq!(opened.borrow().len(), 1, "a changed line still jumps");
+                let notes = page
+                    .sent
+                    .borrow()
+                    .iter()
+                    .map(|p| json_of(p))
+                    .filter(|p| p["kind"] == "open_path_note")
+                    .filter_map(|p| p["note"].as_str().map(str::to_owned))
+                    .collect::<Vec<_>>();
+                assert!(
+                    page.sent
+                        .borrow()
+                        .iter()
+                        .all(|p| json_of(p).get("note").is_none() || json_of(p)["kind"] == "open_path_note"),
+                    "no other answer carries the note"
+                );
+                if present {
+                    assert!(notes.is_empty());
+                } else {
+                    assert_eq!(
+                        notes,
+                        ["src/mesh.go:2 no longer has Name (the file changed since the reply)"]
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn path_lookup_expect_never_calls_a_line_changed_when_the_read_cap_cuts_it() {
+        let root = Project::new();
+        root.write("mesh.go");
+        let path = root.0.join("mesh.go");
+        std::fs::write(&path, format!("{}Name", "x".repeat(1_000_000))).unwrap();
+        assert_eq!(line_note(&path, "mesh.go", Some(1), Some("Name")), None);
+        std::fs::write(&path, format!("changed\n{}Name", "x".repeat(1_000_000))).unwrap();
+        assert!(line_note(&path, "mesh.go", Some(1), Some("Name")).is_some());
+        assert_eq!(line_note(&path, "mesh.go", Some(2), Some("Name")), None);
+    }
+
+    #[test]
+    fn path_lookup_expect_ignores_non_files_and_invalid_names() {
+        let root = Project::new();
+        assert_eq!(line_note(&root.0, "dir", Some(1), Some("Name")), None);
+        root.write("mesh.go");
+        assert_eq!(
+            line_note(&root.0.join("mesh.go"), "mesh.go", Some(1), Some("bad name")),
+            None
+        );
+        assert_eq!(line_note(&root.0.join("mesh.go"), "mesh.go", None, Some("Name")), None);
+    }
+
+    #[test]
     fn path_lookup_refuses_oversized_paths_before_starting_work() {
         for path in ["a".repeat(4097), "é".repeat(2049), format!("/{}", "a".repeat(4096))] {
             let (handle, page, _) = handle_with_recording_page();
@@ -372,7 +543,7 @@ mod tests {
             let mut state = handle.state.borrow_mut();
             let tab = state.tabs.active();
             assert_eq!(
-                start(&mut state, path, None, ViewId::BASE, "long".into(), tab),
+                start(&mut state, path, None, None, ViewId::BASE, "long".into(), tab),
                 Err("path is longer than 4096 bytes".into())
             );
             assert!(!state.path_lookup.is_running());
@@ -660,6 +831,7 @@ mod tests {
             handle.state.borrow_mut().path_lookup.running.push((
                 Request {
                     line: None,
+                    expect: None,
                     view: ViewId::BASE,
                     request_id: "held".into(),
                     tab: TabId(1),
@@ -703,6 +875,7 @@ mod tests {
     fn request(state: &AgentPanelState) -> Request {
         Request {
             line: Some(12),
+            expect: None,
             view: ViewId::BASE,
             request_id: "find".into(),
             tab: state.tabs.active(),
@@ -803,7 +976,7 @@ mod tests {
                 at: Instant::now(),
             });
             assert_eq!(
-                pick(&mut state, "src/a.rs", None, ViewId::BASE, "pick", tab),
+                pick(&mut state, "src/a.rs", None, None, ViewId::BASE, "pick", tab),
                 Some(Err(FULL.into()))
             );
             assert!(state.path_lookup.running.is_empty());
@@ -977,7 +1150,7 @@ mod tests {
                 }
                 drop(state);
                 tx.send(Ok(if ready {
-                    Answer::Ready(root.0.join("src/a.rs"))
+                    Answer::Ready(root.0.join("src/a.rs"), None)
                 } else {
                     Answer::One(checked_path(&root.0, "src/a.rs", None).unwrap())
                 }))
@@ -1069,7 +1242,7 @@ mod tests {
         assert_eq!(state.path_lookup.offers.len(), MAX_OFFERS - 1);
         assert_eq!(state.path_lookup.offers[0].request_id, "3");
         let tab = state.tabs.active();
-        assert!(pick(&mut state, "src/a.rs", None, view(2), "pick", tab).is_none());
+        assert!(pick(&mut state, "src/a.rs", None, None, view(2), "pick", tab).is_none());
     }
     #[test]
     fn path_lookup_unchanged_pick_opens_and_consumes_its_offer() {

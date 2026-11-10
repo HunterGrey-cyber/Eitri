@@ -548,6 +548,23 @@ pub(super) fn handle_inbound_message(
     let refuse = |out: &mut Outbox, why: &str| {
         out.send(view, serialize_command_result_for_js(&request_id, Err(why)));
     };
+    if let Some(why) = &refused {
+        if matches!(&message, InboundMessage::EditorSymbol { .. }) {
+            out.send(
+                view,
+                eitri_core::agent_bridge::serialize_editor_symbol_result_for_js(
+                    &request_id,
+                    &[],
+                    Some(&eitri_core::agent_bridge::EditorSymbolError {
+                        kind: "refused",
+                        server: None,
+                        message: Some(why.clone()),
+                    }),
+                ),
+            );
+            return out;
+        }
+    }
     if let Some(why) = refused {
         if matches!(
             &message,
@@ -580,6 +597,7 @@ pub(super) fn handle_inbound_message(
         InboundMessage::Ready { .. } => {
             // A held message of the document that was here answers a page that is gone.
             super::mentions::drop_view(state, view, &mut out);
+            super::symbol_lookup::drop_view(state, view);
             // A stream envelope the typing cadence still holds is already in the snapshot below
             // (it was drained from the queue and folded into the projection before it was held);
             // sent after that snapshot it would draw the same text twice.
@@ -1339,14 +1357,25 @@ pub(super) fn handle_inbound_message(
             out.send(view, detail_payload(state, tab));
             ok(&mut out);
         }
-        InboundMessage::QueueMessage { text, turn_id, .. } => {
+        InboundMessage::QueueMessage {
+            text,
+            turn_id,
+            after_turn,
+            ..
+        } => {
             let tab = tab_of(target);
             // Captured now: what the editor shows when Enter is pressed.
             let wire = super::mentions::compose(state, &text);
-            match state
-                .tabs
-                .queue_message(tab, &text, wire, now_ms(), true, agent::PromptOrigin::Typed)
-            {
+            let queued = if after_turn {
+                state
+                    .tabs
+                    .queue_after_turn(tab, &text, wire, now_ms(), agent::PromptOrigin::Typed)
+            } else {
+                state
+                    .tabs
+                    .queue_message(tab, &text, wire, now_ms(), true, agent::PromptOrigin::Typed)
+            };
+            match queued {
                 Ok(_) => {
                     remember_prompts(state, std::slice::from_ref(&text), &mut out);
                     // The turn may have ended between the panel's Enter and this handler.
@@ -1418,8 +1447,17 @@ pub(super) fn handle_inbound_message(
             remember_prompts(state, std::slice::from_ref(&text), &mut out);
             ok(&mut out);
         }
+        // `gd` on a name: answered from the tick once the language servers have, never waited on here.
+        InboundMessage::EditorSymbol { name, cited, .. } => {
+            if let Err(refusal) = super::symbol_lookup::start(state, view, request_id.clone(), &name, cited) {
+                out.send(
+                    view,
+                    eitri_core::agent_bridge::serialize_editor_symbol_result_for_js(&request_id, &[], Some(&refusal)),
+                );
+            }
+        }
         // `gf`: the window shows the editor and hands it the file; its answer is the page's.
-        InboundMessage::OpenPath { path, line, .. } => {
+        InboundMessage::OpenPath { path, line, expect, .. } => {
             if let Err(why) = super::path_lookup::check_path_length(&path) {
                 refuse(&mut out, &why);
                 return out;
@@ -1435,11 +1473,14 @@ pub(super) fn handle_inbound_message(
             };
             if eitri_core::agent_bridge::path_holds_control(&path) {
                 refuse(&mut out, &super::links::OpenPathRefusal::ControlChar.message(&path));
-            } else if let Some(result) = super::path_lookup::pick(state, &path, line, view, &request_id, tab) {
+            } else if let Some(result) =
+                super::path_lookup::pick(state, &path, line, expect.clone(), view, &request_id, tab)
+            {
                 if let Err(why) = result {
                     refuse(&mut out, &why);
                 }
-            } else if let Err(why) = super::path_lookup::start(state, path, line, view, request_id.clone(), tab) {
+            } else if let Err(why) = super::path_lookup::start(state, path, line, expect, view, request_id.clone(), tab)
+            {
                 refuse(&mut out, &why);
             }
         }
@@ -1497,12 +1538,12 @@ pub(super) fn handle_inbound_message(
         }
         // The text is written to the scratch file on a worker; the tick hands nvim the view, or tells the page why
         // it could not be written.
-        InboundMessage::ViewInEditor { title, text, .. } => {
+        InboundMessage::ViewInEditor { title, text, tab, .. } => {
             let asker = ViewAsker::Page {
                 view,
                 request_id: request_id.clone(),
             };
-            if let Err(why) = start_view_job(state, asker, &title, text) {
+            if let Err(why) = start_view_job_with_tab(state, asker, &title, text, tab) {
                 refuse(&mut out, &why);
             }
         }
@@ -1883,6 +1924,73 @@ pub(super) fn no_session_error() -> eitri_core::agent_backend::BackendError {
 mod tests {
     use super::*;
     use crate::agent_panel::tests::*;
+
+    #[test]
+    fn editor_symbol_refusals_use_the_symbol_reply_without_an_editor_request() {
+        let (handle, page, _) = handle_with_recording_page();
+        let tab = handle.state.borrow().tabs.active();
+        for (name, expected) in [
+            ("Name", "gd: the editor is not running"),
+            ("bad name", "gd: bad name is not a name gd can look up"),
+        ] {
+            page.sent.borrow_mut().clear();
+            handle.page_message(
+                ViewId::BASE,
+                &serde_json::json!({
+                    "type": "editor_symbol", "request_id": "gd", "tab": tab.0, "name": name,
+                })
+                .to_string(),
+            );
+            let reply = page
+                .sent
+                .borrow()
+                .iter()
+                .map(|payload| json_of(payload))
+                .find(|reply| reply["requestId"] == "gd")
+                .unwrap();
+            assert_eq!(reply["kind"], "editor_symbol_result");
+            assert_eq!(reply["matches"], serde_json::json!([]));
+            assert_eq!(reply["error"]["kind"], "refused");
+            assert_eq!(reply["error"]["message"], expected);
+            assert!(!handle.state.borrow().path_lookup.is_running());
+        }
+    }
+
+    #[test]
+    fn a_view_passes_tab_to_the_scratch_request_and_defaults_to_a_split() {
+        let (handle, page, _) = handle_with_recording_page();
+        handle.page_message(ViewId::BASE, READY);
+        let root = agent::state_dirs::test_workspace_dir("panel-view-tab");
+        handle.state.borrow_mut().scratch = Some(eitri_core::scratch::ScratchDir::in_dir(&root).unwrap());
+        let asked: Rc<RefCell<Vec<serde_json::Value>>> = Rc::default();
+        let seen = asked.clone();
+        handle.on_editor_request(move |request| {
+            let hex = request.hex();
+            let bytes: Vec<u8> = (0..hex.len())
+                .step_by(2)
+                .map(|i| u8::from_str_radix(&hex[i..i + 2], 16).unwrap())
+                .collect();
+            seen.borrow_mut().push(serde_json::from_slice(&bytes).unwrap());
+            Ok(())
+        });
+        for (id, tab) in [("tab", Some(true)), ("split", None)] {
+            let mut msg = serde_json::json!({ "type": "view_in_editor", "request_id": id,
+                "title": "Conversation", "text": "## ▍You" });
+            if let Some(tab) = tab {
+                msg["tab"] = tab.into();
+            }
+            handle.page_message(ViewId::BASE, &msg.to_string());
+            tick_handle_until(&handle, "view write", || result_for(&page.sent.borrow(), id).is_some());
+            assert_eq!(result_for(&page.sent.borrow(), id), Some(Ok(())));
+            let request = asked.borrow().last().unwrap().clone();
+            assert_eq!(request["tab"], tab.unwrap_or(false));
+            assert_eq!(
+                std::fs::read_to_string(request["path"].as_str().unwrap()).unwrap(),
+                "## ▍You"
+            );
+        }
+        handle.state.borrow_mut().scratch.take().unwrap().cleanup();
+    }
 
     #[test]
     fn permission_answer_returns_while_held_and_failure_restores_the_card() {
@@ -2327,6 +2435,70 @@ mod tests {
             handle.state.borrow_mut().tabs.take_back_queue(codex),
             ["in the turn"],
             "the message comes back to the box"
+        );
+    }
+
+    /// `Ctrl+x Enter` while a steerable turn runs: the message is held for the turn's end, not put into the
+    /// turn, and a plain Enter after it goes into the turn past it.
+    #[test]
+    fn queue_message_after_turn_is_held_not_steered() {
+        use eitri_core::test_providers::{empty_trust_plan, ExternalRecordingProvider};
+        agent::state_dirs::redirect_state_to_a_test_root();
+        let dir = agent::state_dirs::test_workspace_dir("panel-after-turn-held");
+        let (handle, _page, _host) = handle_with_recording_page();
+        let provider = std::sync::Arc::new(ExternalRecordingProvider::steering_codex());
+        let codex = {
+            let mut state_ref = handle.state.borrow_mut();
+            let tabs = &mut state_ref.tabs;
+            let codex = tabs.open(AgentId::Codex);
+            tabs.get_mut(codex).unwrap().set_backend(TabBackend::Live(
+                AgentBackend::start_external_with(
+                    AgentId::Codex,
+                    provider.clone(),
+                    &dir,
+                    empty_trust_plan(),
+                    SessionModeChoice::Auto,
+                    None,
+                )
+                .unwrap(),
+            ));
+            codex
+        };
+        handle.page_message(ViewId::BASE, r#"{"type":"ready","request_id":"r1"}"#);
+        provider.inner.queue(agent::AgentDomainEvent::TurnStarted {
+            turn_id: "turn-1".into(),
+        });
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while !handle.state.borrow().tabs.get(codex).unwrap().turn_running() {
+            assert!(std::time::Instant::now() < deadline, "the turn never started");
+            handle.tick();
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        let queue_message = |request_id: &str, text: &str, after_turn: bool| {
+            serde_json::json!({
+                "type": "queue_message",
+                "request_id": request_id,
+                "tab": codex.0,
+                "text": text,
+                "turn_id": "turn-1",
+                "after_turn": after_turn,
+            })
+            .to_string()
+        };
+        handle.page_message(ViewId::BASE, &queue_message("q1", "when done, commit", true));
+        assert!(provider.steers().is_empty(), "it is not put into the turn");
+        handle.page_message(ViewId::BASE, &queue_message("q2", "and the parser", false));
+        let steered: Vec<String> = provider.steers().into_iter().map(|s| s.as_typed).collect();
+        assert_eq!(steered, ["and the parser"]);
+        let state = handle.state.borrow();
+        let queue = &state.tabs.get(codex).unwrap().session.queue;
+        let items: Vec<(&str, bool, bool)> = queue
+            .iter()
+            .map(|q| (q.text.as_str(), q.is_held(), q.after_turn))
+            .collect();
+        assert_eq!(
+            items,
+            [("when done, commit", true, true), ("and the parser", false, false)]
         );
     }
 

@@ -206,6 +206,7 @@ export type PanelAction =
   | { kind: "table-scroll"; delta: 1 | -1 }
   /** `gf` (vim's "go to file"): open the path(s) on the current row in the editor. */
   | { kind: "open-path" }
+  | { kind: "go-definition" }
   /** `gx` (vim's `gx`, "open the URL under the cursor"): open the web link of
    *  the current row in the system browser. `App.tsx` reads the row's links off the DOM (this table has
    *  none): one whose visible text is its own address opens at once, several -- or a titled one, or one
@@ -239,6 +240,7 @@ export type PanelAction =
   | { kind: "vyank" }
   /** `gf`: open the caret's path, the VISUAL path, or V-LINE's paths, returning to BROWSE on success. */
   | { kind: "vopen-path" }
+  | { kind: "vgo-definition" }
   /** `>` inside VISUAL/V-LINE: quote the highlighted text into the tab's draft and end the
    *  region into INPUT. `App.tsx` does the whole thing (the copy check, `./quote`'s formatting, the
    *  draft/mode/caret side effects) -- this table only names the key. */
@@ -407,6 +409,7 @@ function resolveRegionPendingG(event: KeyLike, ctx: KeyContext): PanelAction | "
   if (ctx.pending === "g") {
     if (event.key === "g") return { kind: "vmove", motion: "gg" };
     if (event.key === "f") return { kind: "vopen-path" };
+    if (event.key === "d") return { kind: "vgo-definition" };
     // `gv` is reserved for vim's reselect, even unbuilt -- swallowed as "nothing" rather than
     // falling through to `vtoggle`'s own `v` handling.
     if (event.key === "v") return null;
@@ -585,6 +588,7 @@ export const FIXED_PAIRS: Record<PendingPrefix, Readonly<Record<string, NonNulla
     f: { kind: "open-path" },
     x: { kind: "open-link" },
     "?": { kind: "keymap" },
+    d: { kind: "go-definition" },
   },
 
   z: {
@@ -1000,13 +1004,14 @@ export const BROWSE_KEYS: KeyHelp[] = [
   { keys: "r", what: "Once this session has ended: resume it, or start a new one (its last row says which)" },
   { keys: "c", what: "Review: the files that changed on disk during this tab's latest turn (read-only)" },
   { keys: "/", what: "Search forward; n repeats, N reverses (Enter keeps the match, Esc goes back)" },
-  { keys: ":", what: "A command line, as in vim: :tabnew, :trust and :untrust" },
+  { keys: ":", what: "A command line, as in vim: :tabnew, :trust, :untrust, :scratch and :%scratch" },
   { keys: "n / N", what: "Next / previous match, wrapping" },
   { keys: "Ctrl+o / Ctrl+i", what: "Back / forward through the jumps in this tab" },
   { keys: "zi", what: "The detailed view: every result, longer excerpts, no collapsed runs" },
   { keys: "zh / zl", what: "Scroll this row's table left / right" },
   { keys: "zt / zz / zb", what: "This row to the top / middle / bottom of the view (3zt: row 3)" },
   { keys: "za / zo / zc", what: "Fold: toggle as Enter / open / close a result or a collapsed run" },
+  { keys: "gd", what: "Go to the path or definition (several: pick by letter)" },
   { keys: "gf", what: "Open the path on this row in the editor (several: pick by letter)" },
   { keys: "gx", what: "Open this row's web link (several, or a titled one: pick by letter, each shown in full)" },
   {
@@ -1027,7 +1032,7 @@ export const CARET_KEYS: KeyHelp[] = [
   { keys: "w / b / e", what: "Next word / previous word / end of this or the next word" },
   { keys: "0 / $", what: "Start / end of the line" },
   { keys: "gg / G", what: "First / last character of the conversation" },
-  { keys: "gf", what: "Open the path under the caret" },
+  { keys: "gf", what: "Open the path under the caret; gd also looks up its name" },
   { keys: "1-9", what: "A count for the next motion (3w moves three words)" },
   { keys: "v / V", what: "Select from here: VISUAL by character, V-LINE by line" },
   { keys: "Ctrl+e / Ctrl+y", what: "Scroll the list one line down / up (a count repeats it); the caret stays put" },
@@ -1046,7 +1051,7 @@ export const VISUAL_KEYS: KeyHelp[] = [
   { keys: "w / b / e", what: "Next word / previous word / end of this or the next word" },
   { keys: "0 / $", what: "Start / end of the line" },
   { keys: "gg / G", what: "Extend to the conversation's first / last character" },
-  { keys: "gf", what: "Open the selection as one path; in V-LINE, pick from the selected lines' paths" },
+  { keys: "gf", what: "Open the selection as one path; in V-LINE, pick from the selected lines' paths; gd also looks up a selected name" },
   { keys: "1-9", what: "A count for the next motion (3w moves three words)" },
   { keys: "o", what: "Swap which end of the selection moves" },
   { keys: "v / V", what: "Switch to VISUAL / V-LINE; the mode's own key goes back to the caret" },
@@ -1124,6 +1129,7 @@ export const QUESTION_KEYS: KeyHelp[] = [
 export const INPUT_KEYS: KeyHelp[] = [
   { keys: "Enter", what: "Send; while a turn runs, into that turn (the agent reads it at its next step), or held for its end when the agent cannot take it" },
   { keys: "Ctrl+Enter", what: "Send now: interrupts a running turn, then sends what is held and this" },
+  { keys: "Ctrl+x Enter", what: "Send after the turn: held, never steered into it (Ctrl+x with a selection cuts)" },
   { keys: "Shift+Enter", what: "New line" },
   // Claude Code's own two newline keys, which used to send the draft.
   { keys: "Alt+Enter / \\ Enter", what: "New line (a backslash right before the caret is replaced by it)" },

@@ -118,8 +118,14 @@ export function pathsIn(item: TimelineItem): PathRef[] {
 }
 
 /** `Ctrl+g` in BROWSE: the row's whole text, never the cut one, and a title for the buffer. */
-function fenced(text: string): string {
-  const longest = Math.max(0, ...(text.match(/`+/g) ?? []).map((run) => run.length));
+export function fenced(text: string): string {
+  // A loop, not a spread into `Math.max`: an output with a few hundred thousand backtick runs would overflow it.
+  let longest = 0;
+  let run = 0;
+  for (let at = 0; at < text.length; at++) {
+    run = text.charCodeAt(at) === 96 ? run + 1 : 0;
+    if (run > longest) longest = run;
+  }
   const fence = "`".repeat(Math.max(3, longest + 1));
   return `${fence}\n${text}\n${fence}`;
 }

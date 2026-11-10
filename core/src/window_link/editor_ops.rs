@@ -460,6 +460,8 @@ pub fn dispatch(id: u64, op: EditorOp, ctx: &dyn OpContext, rpc: &dyn EditorRpc)
                     symbol,
                     include: include.into_iter().map(Into::into).collect(),
                     query,
+                    // Only window 1's own callers word a query per server; none of them crosses the link.
+                    query_for: Vec::new(),
                     // The edits never cross the link, so the wire ask carries neither.
                     new_name: None,
                     action: None,
@@ -1680,6 +1682,7 @@ mod tests {
                 symbol: Some("frob".into()),
                 include: vec![UsagePart::Definitions, UsagePart::References],
                 query: None,
+                query_for: Vec::new(),
                 new_name: None,
                 action: None,
                 budget_ms: (LSP_BUDGET + COLLECT_MARGIN).as_millis() as u32,

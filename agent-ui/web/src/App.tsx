@@ -1,3 +1,6 @@
+import { classify as classifyGd, expectedName, validName, wordAt } from "./gdTarget";
+import type { Cited, GdTarget } from "./gdTarget";
+import type { EditorSymbolResult } from "./bridge";
 import { back, emptyJumplist, forward, landingIndex, recordJump } from "./jumplist";
 import type { JumpPos, Jumplist } from "./jumplist";
 import { SessionEndedBanner } from "./components/SessionEndedBanner";
@@ -43,6 +46,7 @@ import {
   REASON_ENTER_OUTSIDE_FLASH,
   ANSWER_INTERRUPTED_FLASH,
   CARD_CHANGED_FLASH,
+  SCRATCH_EXPORT_FAILED_FLASH,
 } from "./app/flashes";
 import { isEditableElement, CANCELS_WAITING_ANSWER, caretRectMissing } from "./app/elements";
 import type { SlashPickerState, SettingsRequest, SettingsAnswer } from "./app/elements";
@@ -143,6 +147,7 @@ import {
 import type { ShownLink } from "./nav";
 import type { AnswerableItem, HintTarget } from "./nav";
 import type { TimelineItem } from "./timeline";
+import { exportConversation } from "./scratchExport";
 import { parsePath, pathsIn, pathsInText, viewText } from "./paths";
 import { pathAtCaret, pathRanges, pathSelectionOffsets } from "./pathTargets";
 import type { PathTarget } from "./pathTargets";
@@ -237,6 +242,8 @@ function sameOffer(a: CardOffer, b: CardOffer): boolean {
     (a.rule ?? null) === (b.rule ?? null)
   );
 }
+
+type DefinitionPath = PathRef & { expect?: string; source?: "lsp" | "text"; col?: number };
 
 export default function App() {
   /** Everything the envelope router decides (`./page_model`). `pageRef` is the latest model, written
@@ -561,6 +568,7 @@ export default function App() {
   /** How the card holding card mode was resolved by the host, when an `events` envelope said so: answered (allowed
    *  or denied, from another device or a click) or withdrawn (an interrupt, the session closing, an expiry). */
   const cardResolvedRef = useRef<{ permissionId: string; answered: boolean } | null>(null);
+  const scratchCardStates = useRef(new Map<string, "approved" | "denied">());
   // Companion mode: where the panel stands with the editor beside it. `null` is the one-window mode,
   // where Rust never sends one.
   /** The unread pill, reported up by `MessageList` rather than floated over
@@ -622,6 +630,10 @@ export default function App() {
    *  whole before the action it names may follow (`BandFacts.messageLook`); `path`: the path it ends with, as drawn
    *  (`BandFacts.messagePath`); `toPrompt`: the trust question's own answer to a key, drawn after its prompt. */
   const [flash, setFlash] = useState<FlashLine | null>(null);
+  /** The conversation composer's `Ctrl+x` while it waits for its second key: the band's showcmd. */
+  const [composerChord, setComposerChord] = useState<string | null>(null);
+  /** Ends the composer's waiting `Ctrl+x` from a key the page takes first (`Composer`'s `chordEnd`). */
+  const composerChordEndRef = useRef<(() => boolean) | null>(null);
   const flashSeq = useRef(0);
   /** The reply link whose address the last click showed instead of opening (`linkClickNeedsLook`), armed: set only
    *  while the band measures its host on screen in the flash `heldLinkRef` names, its look starting when it last
@@ -1134,7 +1146,7 @@ export default function App() {
   /** A `gf` pick owns the keys until its full label is answered or it is cancelled.
    *  Row keys and text offsets survive DOM replacements; placement decides which paths need the footer. */
   const [pathPick, setPathPick] = useState<{
-    refs: PathRef[]; labels: string[]; targets: (PathTarget | null)[]; shown: string[]; typed: string;
+    refs: DefinitionPath[]; labels: string[]; targets: (PathTarget | null)[]; shown: string[]; typed: string;
   } | null>(null);
 
   const pathPickOpen = pathPick !== null;
@@ -1147,7 +1159,7 @@ export default function App() {
     });
   }, [pathPickOpen]);
 
-  function beginPathPick(refs: PathRef[], rows: HTMLElement[] = [], selection?: Range) {
+  function beginPathPick(refs: DefinitionPath[], rows: HTMLElement[] = [], selection?: Range) {
     const targets: (PathTarget | null)[] = refs.map(() => null);
     for (const row of rows) {
       const rowKey = row.getAttribute("data-row-key");
@@ -1174,10 +1186,93 @@ export default function App() {
   /** `open_path` and `view_in_editor` share `"editor"` in-flight bookkeeping with
    *  `edit_draft` (see `inFlight`'s own doc comment). A suffix lookup may answer with `path_choices`;
    *  direct opens answer with a command result, whose refusal flashes in the band. */
-  function openPath(ref: PathRef) {
+  const pathExpectations = useRef(new Map<string, string>());
+  const symbolRequests = useRef(new Map<string, { tab: TabId; name: string; cited: Cited | null; timer: ReturnType<typeof setTimeout> }>());
+  useEffect(() => () => {
+    for (const request of symbolRequests.current.values()) clearTimeout(request.timer);
+    symbolRequests.current.clear();
+    pathExpectations.current.clear();
+  }, [tabs?.active]);
+
+  function openPath(ref: DefinitionPath) {
     const requestId = nextRequestId();
     trackRequest(requestId, { kind: "editor", tab: activeTabRef.current ?? 0 });
-    postToRust({ type: "open_path", request_id: requestId, path: ref.path, ...(ref.line === null ? {} : { line: ref.line }) });
+    if (ref.expect !== undefined) pathExpectations.current.set(requestId, ref.expect);
+    postToRust({ type: "open_path", request_id: requestId, path: ref.path,
+      ...(ref.line === null ? {} : { line: ref.line }), ...(ref.expect === undefined ? {} : { expect: ref.expect }) });
+  }
+  function definitionPath(ref: PathRef, text: string): DefinitionPath {
+    if (ref.line === null) return ref;
+    const line = text.split("\n").find((line) => pathsInText(line).some((p) => p.path === ref.path && p.line === ref.line)) ?? "";
+    return { ...ref, expect: expectedName(line, ref.path) };
+  }
+  function goDefinition(target: GdTarget, line: string) {
+    if (target.kind === "none") { showFlash("gd: nothing under the caret"); return; }
+    if (target.kind === "path" || target.kind === "pathline") {
+      openPath(definitionPath({ path: target.path, line: target.kind === "pathline" ? target.line : null }, line));
+      return;
+    }
+    if (!validName(target.name)) {
+      showFlash(`gd: ${target.name} is not a name gd can look up`);
+      return;
+    }
+    const tab = activeTabRef.current;
+    if (tab === null) return;
+    const requestId = nextRequestId();
+    const timer = setTimeout(() => {
+      const pending = symbolRequests.current.get(requestId);
+      symbolRequests.current.delete(requestId);
+      if (pending?.tab === activeTabRef.current) showFlash("gd: no answer in 3 s");
+    }, 4000);
+    symbolRequests.current.set(requestId, { tab, name: target.name, cited: target.cited, timer });
+    postToRust({ type: "editor_symbol", request_id: requestId, tab, name: target.name,
+      ...(target.cited === null ? {} : { cited: target.cited }) });
+  }
+  function symbolResult(payload: EditorSymbolResult) {
+    const pending = symbolRequests.current.get(payload.requestId);
+    if (pending === undefined) return;
+    clearTimeout(pending.timer);
+    symbolRequests.current.delete(payload.requestId);
+    if (pending.tab !== activeTabRef.current) return;
+    const { cited, name } = pending;
+    if (!payload.error && payload.matches.length > 0) {
+      const inFile = cited === null ? [] : payload.matches.filter((m) => m.path === cited.path || m.path.endsWith(`/${cited.path}`))
+        .sort((a, b) => Math.abs(a.line - cited.line) - Math.abs(b.line - cited.line));
+      const chosen = payload.matches.length === 1 ? payload.matches[0] : inFile[0];
+      const remote = remoteDesk.snapshot();
+      const remoteOwnsKeys = remote.listOpen || remote.pairing !== null || remote.questions.length > 0 || remote.flagged.length > 0;
+      if (chosen !== undefined) openPath(chosen);
+      else if (modeRef.current === "browse" && !pathChoicesCoveredRef.current && !remoteOwnsKeys &&
+          hintPendingRef.current === null && !isEditableElement(document.activeElement)) {
+        dropPendingKeys();
+        beginPathPick(payload.matches);
+        pathChoicesCoveredRef.current = true;
+      } else showFlash(`gd: ${payload.matches.length} definitions match; gd again to choose`);
+      return;
+    }
+    if (cited !== null) { openPath({ ...cited, expect: name }); return; }
+    const server = payload.error?.server ?? "the language server";
+    switch (payload.error?.kind ?? "no_symbol") {
+      case "no_client": showFlash("gd: no language server attached for this project (open one of its files)"); break;
+      case "no_symbol": showFlash(`gd: ${server} has no symbol ${name}`); break;
+      case "indexing": showFlash(`gd: ${server} is still indexing — try again`); break;
+      case "timeout": showFlash("gd: no answer in 3 s"); break;
+      case "refused": showFlash(payload.error?.message ?? "gd: refused"); break;
+    }
+  }
+  /** Read one hard line, retaining code-span delimiters for the advisory name check. */
+  function definitionLine(row: HTMLElement, node: Node, offset: number): { text: string; word: string } {
+    const block = node.parentElement?.closest<HTMLElement>("p, li, td, th, pre, h1, h2, h3, h4, h5, h6, div") ?? row;
+    const before = document.createRange();
+    before.selectNodeContents(block);
+    before.setEnd(node, offset);
+    const prefix = before.toString();
+    const plain = block.textContent ?? "";
+    const lineIndex = prefix.split("\n").length - 1;
+    const word = wordAt(plain.split("\n")[lineIndex] ?? "", prefix.length - prefix.lastIndexOf("\n") - 1);
+    const copy = block.cloneNode(true) as HTMLElement;
+    for (const code of copy.querySelectorAll("code:not(pre code)")) code.replaceWith(`\`${code.textContent}\``);
+    return { text: (copy.textContent ?? "").split("\n")[lineIndex] ?? "", word };
   }
   function runSlashAction(action: SlashAction) {
     switch (action.kind) {
@@ -1652,6 +1747,7 @@ export default function App() {
   useEffect(() => {
     const pending = new Set(allCards({ pendingPermissions: heldCards, editorCards: heldEditorCards }).map((p) => p.permissionId));
     const kept = new Set([...answeredRef.current].filter((id) => pending.has(id)));
+    for (const id of scratchCardStates.current.keys()) if (!kept.has(id)) scratchCardStates.current.delete(id);
     for (const record of pageRef.current.inFlight.values()) {
       if (record.kind === "permission" && record.tab === activeTabRef.current && record.permissionId && pending.has(record.permissionId)) kept.add(record.permissionId);
     }
@@ -1890,6 +1986,12 @@ export default function App() {
       }
       if (event.target instanceof Element && event.target.closest(".question-dock")) return;
       event.preventDefault();
+      // The composer's `Ctrl+x` waiting for its second key: Shift+Tab is that key, so it ends the chord as any
+      // key but Enter does, and the mode stays as it is.
+      if (composerChordEndRef.current?.() === true) {
+        event.stopPropagation();
+        return;
+      }
       // Shift+Tab does nothing while CARET/VISUAL/V-LINE is on -- its y/n
       // bypass prompt would take the next `y`, meant as VISUAL's own copy. `Esc` first, same as
       // every other overlay this table would otherwise open over it.
@@ -2502,10 +2604,27 @@ export default function App() {
 
   useEffect(() => {
     installDispatch(function receive(payload) {
+      if (payload.kind === "editor_symbol_result") { symbolResult(payload); return; }
+      // A `gd` lookup refused before it reached its arm (its tab gone) is answered as a plain command: that answer
+      // ends it, so its four-second wait does not also flash.
+      if (payload.kind === "command_result" && symbolRequests.current.has(payload.requestId)) {
+        const pending = symbolRequests.current.get(payload.requestId)!;
+        clearTimeout(pending.timer);
+        symbolRequests.current.delete(payload.requestId);
+        if (!payload.ok && pending.tab === activeTabRef.current) showFlash(`gd: ${payload.error}`);
+        return;
+      }
+      // Advisory, beside the open's own answer, which still settles the request.
+      if (payload.kind === "open_path_note") {
+        const record = pageRef.current.inFlight.get(payload.requestId);
+        if (record?.kind === "editor" && record.tab === activeTabRef.current) showFlash(payload.note);
+        return;
+      }
       if (payload.kind === "path_choices") {
         const record = pageRef.current.inFlight.get(payload.requestId);
         if (record?.kind !== "editor") return;
         // A choices envelope is the successful answer to the original editor request.
+        const expect = pathExpectations.current.get(payload.requestId);
         receive({ kind: "command_result", requestId: payload.requestId, ok: true });
         const remote = remoteDesk.snapshot();
         const remoteOwnsKeys = remote.listOpen || remote.pairing !== null || remote.questions.length > 0 || remote.flagged.length > 0;
@@ -2513,7 +2632,7 @@ export default function App() {
             modeRef.current === "browse" && !pathChoicesCoveredRef.current && !remoteOwnsKeys &&
             hintPendingRef.current === null && !isEditableElement(document.activeElement)) {
           dropPendingKeys();
-          beginPathPick(payload.paths);
+          beginPathPick(payload.paths.map((ref) => ({ ...ref, expect })));
           if (payload.stopped != null) showFlash(`gf: ${payload.stopped}; the list may be incomplete`);
           pathChoicesCoveredRef.current = true;
         } else if (payload.tab === activeTabRef.current) {
@@ -2521,6 +2640,7 @@ export default function App() {
         }
         return;
       }
+      if (payload.kind === "command_result") pathExpectations.current.delete(payload.requestId);
       if (payload.kind === "command_result" && !payload.ok && payload.requestId === editReturnRef.current?.requestId) {
         editReturnRef.current = null;
       }
@@ -2906,6 +3026,7 @@ export default function App() {
             cancelBypassConfirm();
             setSearch(null);
             setExLine(null);
+            scratchCardStates.current.clear();
             answeredRef.current = new Set();
             setAnsweredPermissions(answeredRef.current);
             // The old tab's unread pill means nothing over a fresh, empty timeline. The `snapshot` arm's restore
@@ -3638,24 +3759,35 @@ export default function App() {
    *  `send_now` is deliberately NOT recorded this way: its refusal can come after its text was
    *  already queued (an interrupt the backend refused), where putting it back would show it
    *  twice. Rust saves a `send_now`'s text to history before either outcome, so `↑` recovers it. */
-  function queueMessage(text: string) {
+  /** `afterTurn` (`Ctrl+x Enter`): held for the running turn's end, never put into it, and sent as the next
+   *  turn when none runs -- the host decides which, so it is posted whether a turn shows or not. */
+  function queueMessage(text: string, options?: { afterTurn: boolean }) {
     // Enter during a turn lands here, and a bare command needs no turn at all: this is where it would queue.
     const bare = barePickerCommand(text);
     if (bare !== null && picksDirectly()) {
       askForPicker(bare);
       return;
     }
-    if (settingRunsNow(text)) return;
+    // A setting sent after the turn waits for the turn's end like any command, so it is not changed now.
+    const afterTurn = options?.afterTurn === true;
+    if (!afterTurn && settingRunsNow(text)) return;
     const tab = activeTabRef.current;
     if (tab === null) return;
-    queueInto(tab, text);
+    queueInto(tab, text, afterTurn);
   }
 
-  function queueInto(tab: TabId, text: string) {
+  function queueInto(tab: TabId, text: string, afterTurn = false) {
     const requestId = nextRequestId();
     trackRequest(requestId, { kind: "send", tab, text });
     setCommandNotice(null);
-    postToRust({ type: "queue_message", request_id: requestId, tab, text, turn_id: stateRef.current.activeTurnId });
+    postToRust({
+      type: "queue_message",
+      request_id: requestId,
+      tab,
+      text,
+      turn_id: stateRef.current.activeTurnId,
+      ...(afterTurn ? { after_turn: true } : {}),
+    });
   }
 
   function interrupt() {
@@ -3720,6 +3852,7 @@ export default function App() {
     const origin = byKey ? "key" : "click";
     answeredRef.current = new Set(answeredRef.current).add(permissionId);
     setAnsweredPermissions(answeredRef.current);
+    scratchCardStates.current.set(permissionId, decision === "allow" ? "approved" : "denied");
     // Recorded, so a refusal gives the card back (`inFlight`'s doc).
     const requestId = nextRequestId();
     trackRequest(requestId, { kind: "permission", tab, permissionId });
@@ -4652,7 +4785,38 @@ export default function App() {
     />
   );
 
-  /** The `:` command line, where vim draws it. It runs `:tabnew` and the trust commands and nothing else:
+  function viewCursorInEditor() {
+    // The row's whole text, uncut, in a read-only nvim scratch buffer. A pending edit card's row
+    // is its proposed change, so it is shown as that: the file on disk beside the file as the card
+    // would leave it, both read-only.
+    const item = timeline[cursor];
+    if (item === undefined) return;
+    const requestId = nextRequestId();
+    trackRequest(requestId, { kind: "editor", tab: activeTabRef.current ?? 0 });
+    const stored = item.kind === "permission" ? item.request.editorCard?.proposal : undefined;
+    const tab = activeTabRef.current;
+    if (item.kind === "permission" && stored !== undefined && tab !== null) {
+      // A proposal an editor tool computed: the shell holds both sides of each file, and one file shows per press.
+      const { files } = stored;
+      const shown = (cardViews.current.get(item.request.permissionId)?.shown ?? 0) % files.length;
+      cardViews.current.set(item.request.permissionId, { tab, shown: shown + 1 });
+      if (files.length > 1) {
+        const path = revealedPathText(files[shown]);
+        showFlash(`${shown + 1} of ${files.length}: ${path}`, { path });
+      }
+      postToRust({ type: "editor_card_view", request_id: requestId, tab, proposal: stored.id, file: shown });
+      return;
+    }
+    const proposal = proposalOf(item, answeredRef.current);
+    if (proposal !== null) {
+      postToRust({ type: "view_proposal", request_id: requestId, path: proposal.path, change: proposal.change });
+    } else {
+      const { title, text } = viewText(item);
+      postToRust({ type: "view_in_editor", request_id: requestId, title, text });
+    }
+  }
+
+  /** The `:` command line, where vim draws it. It runs `:tabnew`, the trust commands and scratch views:
    *  Enter on anything else says so, Esc (and `Ctrl+[`) closes it silently. Drawn over whichever layout is on
    *  screen: a fresh window has only the start screen, and `:tabnew codex` is how it gets a Codex tab. */
   const commandLineOverlay =
@@ -4689,6 +4853,27 @@ export default function App() {
                 verb: "new",
                 ...(command.agent !== null ? { agent: command.agent } : {}),
               });
+            } else if (command?.command === "scratch") {
+              if (command.whole) {
+                // Built before anything is tracked: a throw leaves no request waiting, and the line still closes.
+                let text: string | null = null;
+                try {
+                  text = exportConversation(buildTimeline(state), {
+                    history: state.history ?? null,
+                    cardStates: new Map([...scratchCardStates.current].filter(([id]) => answeredRef.current.has(id))),
+                  });
+                } catch (error) {
+                  console.warn("agent-ui: the conversation could not be exported", error);
+                  showFlash(SCRATCH_EXPORT_FAILED_FLASH);
+                }
+                if (text !== null) {
+                  const requestId = nextRequestId();
+                  trackRequest(requestId, { kind: "editor", tab: activeTabRef.current ?? 0 });
+                  postToRust({ type: "view_in_editor", request_id: requestId, title: "Conversation", text, tab: true });
+                }
+              } else {
+                viewCursorInEditor();
+              }
             } else if (command !== null) {
               const commandId = nextRequestId();
               trackRequest(commandId, { kind: "trust", tab: activeTabRef.current ?? 0 });
@@ -5325,6 +5510,31 @@ export default function App() {
         // end the whole region on its first auto-repeat (CARET's own `Esc`), dropping the caret and
         // the freeze the user only meant to keep.
         promptSwallowKeyRef.current = event.key;
+        return;
+      }
+      case "vgo-definition": {
+        if (event.repeat) return;
+        const row = rowElementOfCaret(model.cursor);
+        if (row === null || !listEl?.contains(row)) return;
+        const context = definitionLine(row, model.cursor.node, model.cursor.offset);
+        let text = context.word;
+        if (currentMode !== "caret") {
+          const built = visualBuiltRef.current;
+          if (sel === null || built === null || !selectionMatchesBuild(sel as unknown as SelectionLike, built, listEl)) {
+            showFlash("selection changed under it — nothing opened; v to start again");
+            endRegionFromKey();
+            return;
+          }
+          text = copySelectionText(sel as unknown as SelectionLike, root, model);
+        }
+        const target = classifyGd(text, context.text);
+        if (target.kind === "name" && !validName(target.name)) {
+          showFlash(`gd: ${target.name} is not a name gd can look up`);
+          return;
+        }
+        landCursorOnRowKey(rowKeyOfCaret(model.cursor));
+        endRegionFromKey();
+        goDefinition(target, context.text);
         return;
       }
       case "vopen-path": {
@@ -6567,12 +6777,16 @@ export default function App() {
         root?.focus({ preventScroll: true });
         break;
       }
+      case "go-definition":
       case "open-path": {
         // A tool's own path field, or a path found in prose -- never a guess at what
         // the model meant, only what `pathsIn` (`../paths.ts`) can actually read off the row.
         const item = timeline[cursor];
-        const paths = item === undefined ? [] : pathsIn(item);
-        if (paths.length === 0) showFlash("no path on this row");
+        const text = item !== undefined && (item.kind === "message" || item.kind === "prompt") ? item.text : "";
+        const paths = (item === undefined ? [] : pathsIn(item)).map((ref) =>
+          action.kind === "go-definition" ? definitionPath(ref, text) : ref);
+        if (paths.length === 0) showFlash(action.kind === "go-definition"
+          ? "gd: no path on this row — v, move to a name, gd" : "no path on this row");
         else if (paths.length === 1) openPath(paths[0]);
         else {
           const row = cursorRow();
@@ -6593,37 +6807,9 @@ export default function App() {
         else setLinkPick(links.map((link) => link.url));
         break;
       }
-      case "view-in-editor": {
-        // The row's whole text, uncut, in a read-only nvim scratch buffer. A pending edit card's row
-        // is its proposed change, so it is shown as that: the file on disk beside the file as the card
-        // would leave it, both read-only.
-        const item = timeline[cursor];
-        if (item === undefined) break;
-        const requestId = nextRequestId();
-        trackRequest(requestId, { kind: "editor", tab: activeTabRef.current ?? 0 });
-        const stored = item.kind === "permission" ? item.request.editorCard?.proposal : undefined;
-        const tab = activeTabRef.current;
-        if (item.kind === "permission" && stored !== undefined && tab !== null) {
-          // A proposal an editor tool computed: the shell holds both sides of each file, and one file shows per press.
-          const { files } = stored;
-          const shown = (cardViews.current.get(item.request.permissionId)?.shown ?? 0) % files.length;
-          cardViews.current.set(item.request.permissionId, { tab, shown: shown + 1 });
-          if (files.length > 1) {
-            const path = revealedPathText(files[shown]);
-            showFlash(`${shown + 1} of ${files.length}: ${path}`, { path });
-          }
-          postToRust({ type: "editor_card_view", request_id: requestId, tab, proposal: stored.id, file: shown });
-          break;
-        }
-        const proposal = proposalOf(item, answeredRef.current);
-        if (proposal !== null) {
-          postToRust({ type: "view_proposal", request_id: requestId, path: proposal.path, change: proposal.change });
-        } else {
-          const { title, text } = viewText(item);
-          postToRust({ type: "view_in_editor", request_id: requestId, title, text });
-        }
+      case "view-in-editor":
+        viewCursorInEditor();
         break;
-      }
     }
   };
 
@@ -7043,6 +7229,8 @@ export default function App() {
         running={turnInProgress || shellRunning}
         enterSteers={enterSteers && !shellRunning}
         onQueue={queueMessage}
+        onChord={setComposerChord}
+        chordEnd={composerChordEndRef}
         onSendNow={(t) => {
           // `Ctrl+Enter` would end the running turn for a question that needs no turn.
           const bare = barePickerCommand(t);
@@ -7080,7 +7268,8 @@ export default function App() {
       {pathPick !== null && (
         <PanelErrorBoundary name="path picker" onError={() => overlayFailed("path picker", () => setPathPick(null))}>
           <PathPick
-            refs={pathPick.refs.filter((_, i) => !pathPick.shown.includes(pathPick.labels[i]))}
+            refs={pathPick.refs.filter((_, i) => !pathPick.shown.includes(pathPick.labels[i])).map((ref) =>
+              ref.source === "text" ? { path: `${ref.path}:${ref.line} (text)`, line: null } : ref)}
             labels={pathPick.labels.filter((label) => !pathPick.shown.includes(label))}
             typed={pathPick.typed}
           />
@@ -7157,7 +7346,7 @@ export default function App() {
           // `true` for `cycleOffered`: ignored entirely in short form (`modePill`'s own doc
           // comment) -- the capability this used to read is gone.
           pill: modePill(activeTab?.mode ?? "auto", true, true),
-          showcmd: box !== null ? `${box.title}…` : null,
+          showcmd: box !== null ? `${box.title}…` : composerChord,
           message: bandFlash?.text ?? null,
           messageLook: bandFlash?.look,
           messagePath: bandFlash?.path,

@@ -364,6 +364,8 @@ impl AgentPanelHandle {
             // The same for a view still being written: the file is left in the scratch directory, which the
             // window's close removes, and the editor is not raised for a page that is gone.
             state.view_jobs.retain(|job| job.asker.page() != Some(view));
+            // A name being looked up answers a page that is gone.
+            super::symbol_lookup::drop_view(&mut state, view);
             if !state.shutting_down {
                 state.tabs.drop_bypass_prompt_in(view);
             }

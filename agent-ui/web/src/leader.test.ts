@@ -40,6 +40,7 @@ describe("the box after g / z / [ / ] / Ctrl+w", () => {
       ["f", "open path"],
       ["x", "open link"],
       ["?", "this list"],
+      ["d", "go to definition"],
     ]);
   });
 

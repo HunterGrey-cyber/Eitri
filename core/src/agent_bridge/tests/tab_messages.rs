@@ -375,6 +375,39 @@ fn the_phase_three_messages_parse_and_name_their_tab_or_none() {
     assert!(matches!(untabbed.tab_ref(), TabRef::Missing), "never the active one");
 }
 
+/// `Ctrl+x Enter` sends `after_turn: true`; every other queued message leaves it out and reads false, and
+/// the queue envelope says of each item whether it waits for the turn's end.
+#[test]
+fn queue_message_carries_after_turn_and_the_envelope_names_it() {
+    let after = |json: &str| match parse_inbound_message(json).unwrap_or_else(|| panic!("{json} did not parse")) {
+        InboundMessage::QueueMessage { after_turn, .. } => after_turn,
+        other => panic!("{json} parsed as {other:?}"),
+    };
+    assert!(!after(
+        r#"{"type":"queue_message","request_id":"a","tab":2,"text":"x"}"#
+    ));
+    assert!(!after(
+        r#"{"type":"queue_message","request_id":"a","tab":2,"text":"x","turn_id":"t1","after_turn":false}"#
+    ));
+    assert!(after(
+        r#"{"type":"queue_message","request_id":"a","tab":2,"text":"x","turn_id":null,"after_turn":true}"#
+    ));
+
+    use crate::tab_set::Queued;
+    let mut held = Queued::held("after it", "after it".into(), 3);
+    held.after_turn = true;
+    let value: Value = serde_json::from_str(&serialize_queue_for_js(
+        TabId(2),
+        &[held, Queued::held("b", "b".into(), 4)],
+        None,
+        None,
+        None,
+    ))
+    .unwrap();
+    assert_eq!(value["items"][0]["afterTurn"], true);
+    assert_eq!(value["items"][1]["afterTurn"], false);
+}
+
 /// A proposal crosses the bridge in either shape, its path kept byte for byte so the panel's refusal sees
 /// what the agent sent; a shape this build does not know does not parse, and a path holding a control
 /// character is one the panel refuses before looking at the disk.
@@ -507,8 +540,8 @@ fn the_phase_three_envelopes_have_their_exact_shapes() {
             Some(true)
         )),
         json!({ "kind": "queue", "tab": 4, "items": [
-            { "text": "look at the parser too", "queuedAt": 12, "steered": true },
-            { "text": "and the tests", "queuedAt": 17, "steered": false },
+            { "text": "look at the parser too", "queuedAt": 12, "steered": true, "afterTurn": false },
+            { "text": "and the tests", "queuedAt": 17, "steered": false, "afterTurn": false },
         ], "error": "refused", "note": "held until the turn ends: why", "enterSteers": true }),
         "the wire text (with its context) and the client id never go to the panel"
     );

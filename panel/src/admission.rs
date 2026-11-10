@@ -42,6 +42,20 @@ pub(super) fn admission(
         Err(why) => Admission::Refused(why),
     };
     match msg {
+        InboundMessage::EditorSymbol { name, .. } => {
+            if eitri_core::agent_bridge::valid_symbol_name(name) {
+                Admission::Ungated
+            } else {
+                Admission::Refused(format!("gd: {name} is not a name gd can look up"))
+            }
+        }
+        InboundMessage::ViewInEditor { text, .. } => {
+            if text.chars().count() > 1_000_000 {
+                Admission::Refused("this view is too large: at most 1,000,000 characters".into())
+            } else {
+                Admission::Ungated
+            }
+        }
         InboundMessage::LoadPage { id } | InboundMessage::PageLine { id } => {
             if view.is_base()
                 && state
@@ -226,7 +240,6 @@ pub(super) fn admission(
         | InboundMessage::ReviewSend { .. }
         | InboundMessage::ReviewRecover { .. }
         | InboundMessage::OpenInEditor { .. }
-        | InboundMessage::ViewInEditor { .. }
         | InboundMessage::ViewProposal { .. }
         | InboundMessage::EditorCardView { .. }
         | InboundMessage::HintRequest { .. }
@@ -426,6 +439,46 @@ mod tests {
             })
             .to_string(),
         );
+    }
+
+    #[test]
+    fn a_view_admits_one_million_characters_and_refuses_one_more() {
+        let (handle, _page, _) = handle_with_recording_page();
+        for tab in [false, true] {
+            for (count, expected) in [
+                (1_000_000, Admission::Ungated),
+                (
+                    1_000_001,
+                    Admission::Refused("this view is too large: at most 1,000,000 characters".into()),
+                ),
+            ] {
+                let msg = InboundMessage::ViewInEditor {
+                    request_id: "v".into(),
+                    title: "Conversation".into(),
+                    text: "界".repeat(count),
+                    tab,
+                };
+                assert_eq!(admission(&handle.state.borrow(), &msg, ViewId::BASE, None), expected);
+            }
+        }
+    }
+
+    /// A queued message is a send, whether it waits for the turn's end (`Ctrl+x Enter`) or not: neither
+    /// answers anything, so neither meets the window's gate.
+    #[test]
+    fn a_queued_message_is_ungated_with_or_without_after_turn() {
+        let (handle, _page, _) = handle_with_recording_page();
+        let tab = handle.state.borrow().tabs.active();
+        for raw in [
+            serde_json::json!({"type": "queue_message", "request_id": "q", "tab": tab.0, "text": "x"}),
+            serde_json::json!({"type": "queue_message", "request_id": "q", "tab": tab.0, "text": "x", "after_turn": true}),
+        ] {
+            let message = parse_inbound_message(&raw.to_string()).unwrap();
+            assert!(
+                admission(&handle.state.borrow(), &message, ViewId::BASE, Some(tab)) == Admission::Ungated,
+                "{raw}"
+            );
+        }
     }
 
     #[test]
@@ -1435,6 +1488,33 @@ mod tests {
                 "every message kind is named, none falls through `_`"
             );
         }
+    }
+    #[test]
+    fn admission_refuses_invalid_symbol_names_without_a_card() {
+        let (handle, _, _) = handle_with_recording_page();
+        let state = handle.state.borrow();
+        for name in ["a b".into(), "a'".into(), "é".repeat(101), "a".repeat(201), "".into()] {
+            let msg = InboundMessage::EditorSymbol {
+                request_id: "gd".into(),
+                tab: state.tabs.active().0,
+                name,
+                cited: None,
+            };
+            assert!(matches!(
+                admission(&state, &msg, ViewId::BASE, Some(state.tabs.active())),
+                Admission::Refused(_)
+            ));
+        }
+        let msg = InboundMessage::EditorSymbol {
+            request_id: "gd".into(),
+            tab: state.tabs.active().0,
+            name: "Type::name".into(),
+            cited: None,
+        };
+        assert_eq!(
+            admission(&state, &msg, ViewId::BASE, Some(state.tabs.active())),
+            Admission::Ungated
+        );
     }
 }
 

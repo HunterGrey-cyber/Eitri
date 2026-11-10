@@ -77,6 +77,7 @@ pub mod scratch;
 pub mod shell_line;
 pub mod split;
 pub mod state_paths;
+pub mod symbol_text;
 pub mod tab_restore;
 pub mod tab_set;
 pub mod tabs;

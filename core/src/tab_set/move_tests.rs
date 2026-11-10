@@ -426,6 +426,43 @@ fn adopt_moved_keeps_every_handed_over_field_through_the_first_tick_and_delivery
     let _ = source.hand_over(tab);
 }
 
+/// A message sent to wait for the turn's end still waits for it in the window the tab moved to.
+#[test]
+fn after_turn_survives_a_move() {
+    let dir = workspace("move-after-turn");
+    let mut source = set();
+    let (provider, tab) = live_tab(&mut source, &dir);
+    provider.queue_all(vec![opened(&dir), started("t1")]);
+    pump_until(&mut source, &dir, "the turn", |s| s.get(tab).unwrap().turn_running());
+    source
+        .queue_after_turn(
+            tab,
+            "after the move",
+            "after the move".into(),
+            1,
+            agent::PromptOrigin::Typed,
+        )
+        .unwrap();
+    source
+        .queue_message(tab, "plain", "plain".into(), 2, true, agent::PromptOrigin::Typed)
+        .unwrap();
+    let mut dest = set();
+    let arrived = moved(&mut source, tab, &mut dest, provider.clone(), ViewId::BASE);
+    let marks: Vec<(String, bool)> = dest
+        .get(arrived)
+        .unwrap()
+        .session
+        .queue
+        .iter()
+        .map(|q| (q.text.clone(), q.after_turn))
+        .collect();
+    assert_eq!(
+        marks,
+        [("after the move".to_string(), true), ("plain".to_string(), false)]
+    );
+    let _ = source.hand_over(tab);
+}
+
 #[test]
 fn a_card_approved_before_the_move_answers_the_clis_own_prompt_after_it() {
     let dir = workspace("move-approved-card");

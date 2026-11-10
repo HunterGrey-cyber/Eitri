@@ -1155,3 +1155,292 @@ fn ordering_base_tabs_keeps_the_numbers_of_tabs_already_here_and_numbers_arrival
         "an order missing a tab is refused"
     );
 }
+
+/// `Ctrl+x Enter` on `text` while the turn runs.
+fn after_turn(set: &mut TabSet, tab: TabId, text: &str) {
+    set.queue_after_turn(tab, text, format!("ctx\n\n{text}"), 1, PromptOrigin::Typed)
+        .unwrap();
+    set.steer_held(tab, 2, Some("turn-1"));
+}
+
+fn after_turn_marks(set: &TabSet, tab: TabId) -> Vec<bool> {
+    set.get(tab)
+        .unwrap()
+        .session
+        .queue
+        .iter()
+        .map(|q| q.after_turn)
+        .collect()
+}
+
+/// A message sent to wait for the turn's end is the one item a later message may pass: it stays held in its
+/// place, the message typed after it goes into the turn, and the queue keeps the order typed.
+#[test]
+fn after_turn_is_stepped_over_and_later_messages_steer() {
+    let (_dir, mut set, tab, provider) = running_codex("steer-after-turn-passed", true);
+    after_turn(&mut set, tab, "when you are done, commit");
+    assert!(provider.steers().is_empty(), "it is never put into the turn");
+    enter(&mut set, tab, "look at the parser too");
+    let texts: Vec<String> = provider.steers().into_iter().map(|s| s.as_typed).collect();
+    assert_eq!(texts, ["look at the parser too"]);
+    assert_eq!(
+        queue(&set, tab),
+        [
+            ("when you are done, commit".to_string(), false),
+            ("look at the parser too".to_string(), true)
+        ]
+    );
+    assert_eq!(after_turn_marks(&set, tab), [true, false]);
+    assert_eq!(
+        note(&set, tab),
+        None,
+        "nothing refused: it waits because it was sent to"
+    );
+    // Enter again does not put it in either.
+    assert!(!set.steer_held(tab, 3, Some("turn-1")));
+    assert_eq!(provider.steers().len(), 1);
+    shut_down(&mut set);
+}
+
+#[test]
+fn after_turn_goes_out_at_the_turn_end() {
+    let (dir, mut set, tab, provider) = running_codex("steer-after-turn-end", true);
+    after_turn(&mut set, tab, "then commit");
+    assert!(set.flush_queue(tab).is_none(), "the turn still runs");
+    turn_ends_and_flushes(&mut set, &dir, tab, &provider, "turn-1");
+    assert_eq!(provider.inner.turns(), ["ctx\n\nthen commit"]);
+    assert!(provider.steers().is_empty());
+    assert!(set.get(tab).unwrap().session.queue.is_empty());
+    shut_down(&mut set);
+}
+
+/// With no turn running there is nothing to wait for: it goes out as the next turn at once, as Enter's would.
+#[test]
+fn after_turn_with_no_turn_running_goes_out_at_once() {
+    let dir = workspace("steer-after-turn-idle");
+    let mut set = TabSet::new(BackendKind::Sidecar, SessionModeChoice::Auto);
+    let tab = set.open(AgentId::Codex);
+    let provider = Arc::new(ExternalRecordingProvider::steering_codex());
+    let backend = AgentBackend::start_external_with(
+        AgentId::Codex,
+        provider.clone(),
+        &dir,
+        empty_trust_plan(),
+        SessionModeChoice::Auto,
+        None,
+    )
+    .unwrap();
+    set.get_mut(tab).unwrap().backend = TabBackend::Live(backend);
+    set.queue_after_turn(tab, "now then", "now then".into(), 1, PromptOrigin::Typed)
+        .unwrap();
+    assert!(!set.get(tab).unwrap().session.queue[0].behind_card, "no card waits");
+    let flush = set.flush_queue(tab).expect("an idle tab sends it");
+    assert!(flush.outcome.is_ok());
+    assert_eq!(provider.inner.turns(), ["now then"]);
+    assert!(provider.steers().is_empty());
+    shut_down(&mut set);
+}
+
+#[test]
+fn a_review_still_stops_the_walk_after_an_after_turn_item() {
+    let (_dir, mut set, tab, provider) = running_codex("steer-after-turn-review", true);
+    after_turn(&mut set, tab, "after it");
+    assert!(set.send_review(tab, "the review", 1).unwrap().is_none(), "it waits");
+    enter(&mut set, tab, "typed after the review");
+    assert!(provider.steers().is_empty(), "nothing passes the review");
+    assert_eq!(
+        queue(&set, tab),
+        [
+            ("after it".to_string(), false),
+            ("the review".to_string(), false),
+            ("typed after the review".to_string(), false)
+        ]
+    );
+    assert_eq!(
+        note(&set, tab).as_deref(),
+        Some("held until the turn ends: a review waits for the turn's end, and what follows it waits too")
+    );
+    shut_down(&mut set);
+}
+
+/// `Ctrl+Enter` ends the turn, so the message waiting for its end goes out with the rest, ahead of what was
+/// typed with the key.
+#[test]
+fn send_now_flushes_after_turn_with_the_rest() {
+    let (dir, mut set, tab, provider) = running_codex("steer-after-turn-send-now", true);
+    after_turn(&mut set, tab, "first");
+    match set.send_now(tab, "now", "now".into(), 3).unwrap() {
+        SendNow::Interrupting(Ok(_)) => {}
+        _ => panic!("a running turn is interrupted"),
+    }
+    assert_eq!(
+        queue(&set, tab),
+        [("first".to_string(), false), ("now".to_string(), false)]
+    );
+    provider
+        .inner
+        .queue(turn_completed("turn-1", agent::TurnOutcome::Interrupted));
+    pump_until_running(&mut set, &dir, tab, false);
+    let flush = set.flush_queue(tab).expect("the queue goes out after the interrupt");
+    assert_eq!(flush.typed, "first\n\nnow");
+    assert_eq!(provider.inner.turns(), ["ctx\n\nfirst\n\nnow"]);
+    assert!(provider.steers().is_empty());
+    shut_down(&mut set);
+}
+
+#[test]
+fn take_back_returns_after_turn_text() {
+    let (_dir, mut set, tab, _provider) = running_codex("steer-after-turn-take-back", true);
+    after_turn(&mut set, tab, "held for the end");
+    enter(&mut set, tab, "sent in");
+    assert_eq!(set.take_back_queue(tab), ["held for the end"]);
+    assert_eq!(queue(&set, tab), [("sent in".to_string(), true)]);
+    shut_down(&mut set);
+}
+
+/// A saved queue keeps the mark, and one saved before the mark existed reads it as not set.
+#[test]
+fn after_turn_survives_serde_round_trip_and_defaults_false() {
+    let old: Queued = serde_json::from_str(
+        r#"{"text":"x","wire":"x","queued_at_ms":1,"state":"Held","steerable":true,"dropped_as":[]}"#,
+    )
+    .unwrap();
+    assert!(!old.after_turn);
+    assert!(
+        !serde_json::to_string(&old).unwrap().contains("after_turn"),
+        "an unmarked item saves as before"
+    );
+    let mut marked = Queued::held("later", "ctx\n\nlater".into(), 2);
+    marked.after_turn = true;
+    let back: Queued = serde_json::from_str(&serde_json::to_string(&marked).unwrap()).unwrap();
+    assert!(back.after_turn);
+    assert_eq!(back, marked);
+}
+
+/// A Claude tab on a scripted provider that steers, idle.
+fn claude_tab(label: &str) -> (PathBuf, TabSet, TabId, Arc<RecordingProvider>) {
+    let dir = workspace(label);
+    let provider = Arc::new(RecordingProvider::steering());
+    let conversation =
+        AgentConversation::create(provider.clone(), &dir, agent::setting_sources::ProjectTrust::Untrusted).unwrap();
+    let mut set = TabSet::new(BackendKind::Sidecar, SessionModeChoice::Auto);
+    let tab = set.active();
+    set.get_mut(tab).unwrap().backend = TabBackend::Live(AgentBackend::Conversation {
+        agent: AgentId::Claude,
+        conversation: Box::new(conversation),
+    });
+    (dir, set, tab, provider)
+}
+
+fn pump_until_tab(set: &mut TabSet, dir: &Path, tab: TabId, what: &str, mut done: impl FnMut(&Tab) -> bool) {
+    until(what, || {
+        set.pump(dir, true);
+        done(set.get(tab).unwrap())
+    });
+}
+
+/// A composer send refused because the agent had a turn open becomes a held steer (`hold_as_steer`): when the
+/// turn shows, it goes in, past a message already waiting for the turn's end, which stays held and unmarked
+/// for steering.
+#[test]
+fn hold_as_steer_keeps_after_turn_unsteered() {
+    let (dir, mut set, tab, provider) = claude_tab("steer-after-turn-hold-as-steer");
+    provider.refuse_sends(true);
+    set.queue_after_turn(tab, "after the turn", "after the turn".into(), 1, PromptOrigin::Typed)
+        .unwrap();
+    let flush = set.flush_queue(tab).expect("an idle tab tries to send it");
+    assert!(flush.outcome.is_err(), "the agent refused the turn");
+    let turn = FirstTurn {
+        wire: "into the turn".into(),
+        typed: "into the turn".into(),
+        typed_by_person: true,
+        shell_line: false,
+    };
+    assert!(matches!(
+        set.send_prompt(tab, "p1", ViewId::BASE, turn),
+        Some(Sent::Prompt { outcome: Ok(()), .. })
+    ));
+    {
+        let queue = &set.get(tab).unwrap().session.queue;
+        assert_eq!(queue.len(), 2);
+        assert!(queue[0].after_turn && !queue[0].steer_when_running);
+        assert!(!queue[1].after_turn && queue[1].steer_when_running);
+    }
+    provider.queue_all(vec![
+        AgentDomainEvent::TurnStarted {
+            turn_id: "turn-1".into(),
+        },
+        AgentDomainEvent::TurnAttributed {
+            turn_id: "turn-1".into(),
+            origin: agent::TurnOrigin::Cli,
+            cause: None,
+        },
+    ]);
+    pump_until_tab(&mut set, &dir, tab, "the held steer goes in", |t| {
+        t.steered_unconfirmed() == 1
+    });
+    until("the steer reaches the provider", || provider.steers().len() == 1);
+    let texts: Vec<String> = provider.steers().into_iter().map(|s| s.as_typed).collect();
+    assert_eq!(texts, ["into the turn"]);
+    assert_eq!(
+        queue(&set, tab),
+        [
+            ("after the turn".to_string(), false),
+            ("into the turn".to_string(), true)
+        ]
+    );
+    assert_eq!(after_turn_marks(&set, tab), [true, false]);
+    shut_down(&mut set);
+}
+
+/// Sent as a turn and then handed back to the queue by the CLI (read in a cycle of its own, then dropped), the
+/// message keeps its mark, and the drop stops the walk as it does for any message: the agent may still read
+/// the copy it was handed, so a later Enter waits behind it instead of going into the turn past it.
+#[test]
+fn an_after_turn_opening_prompt_handed_back_keeps_the_mark() {
+    const WAITS: &str = "held until the turn ends: it went into the turn once already, so it waits for the \
+             turn's end, and what follows it waits too";
+    let (dir, mut set, tab, provider) = claude_tab("steer-after-turn-opening");
+    set.queue_after_turn(tab, "fix it", "fix it".into(), 1, PromptOrigin::Typed)
+        .unwrap();
+    assert!(set.flush_queue(tab).expect("sent at once").outcome.is_ok());
+    provider.queue(AgentDomainEvent::TurnStarted {
+        turn_id: "turn-1".into(),
+    });
+    pump_until_tab(&mut set, &dir, tab, "the turn", Tab::turn_running);
+    let id = provider
+        .turn_stamps()
+        .last()
+        .unwrap()
+        .client_message_id
+        .clone()
+        .unwrap();
+    provider.queue(AgentDomainEvent::CliCycleStarted {
+        turn_id: "turn-1".into(),
+        cause: None,
+    });
+    pump_until_tab(&mut set, &dir, tab, "the prompt back in the queue", |t| {
+        t.session.queue.len() == 1
+    });
+    assert_eq!(after_turn_marks(&set, tab), [true]);
+    provider.queue(AgentDomainEvent::UserMessageDropped {
+        client_message_id: id,
+        reason: "Claude cancelled it".into(),
+    });
+    pump_until_tab(&mut set, &dir, tab, "held again", |t| t.session.queue[0].is_held());
+    assert_eq!(after_turn_marks(&set, tab), [true]);
+    set.queue_message(tab, "and this", "and this".into(), 2, true, PromptOrigin::Typed)
+        .unwrap();
+    set.steer_held(tab, 3, Some("turn-1"));
+    assert!(
+        provider.steers().is_empty(),
+        "nothing goes into the turn past the dropped copy"
+    );
+    assert_eq!(
+        queue(&set, tab),
+        [("fix it".to_string(), false), ("and this".to_string(), false)]
+    );
+    assert_eq!(after_turn_marks(&set, tab), [true, false]);
+    assert_eq!(note(&set, tab).as_deref(), Some(WAITS));
+    shut_down(&mut set);
+}

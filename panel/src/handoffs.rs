@@ -155,6 +155,8 @@ pub(super) fn panel_tab_handoff(state: &AgentPanelState, tab: TabId) -> Result<P
         // The window's, not the tab's.
         path_menu: _,
         path_lookup: _,
+        // The window's: a name's lookup answers the page that asked.
+        symbol_lookup: _,
         // The window's: a held message answers to the page that sent it.
         mentions: _,
         mention_sections: _,

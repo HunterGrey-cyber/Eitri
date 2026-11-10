@@ -617,6 +617,82 @@ describe("the : line's trust commands", () => {
     fireEvent.keyDown(input, { key: "Enter" });
   }
 
+  it(":%scratch posts the loaded conversation as a new editor tab", () => {
+    const { container } = started({ withCard: true });
+    typed(container, "%scratch");
+    expect(requests("view_in_editor")).toEqual([expect.objectContaining({
+      title: "Conversation", tab: true, text: expect.stringContaining("## ▍You · prompt 1/1\n\ntidy up"),
+    })]);
+    expect(requests("view_in_editor")[0].text).toContain("meanwhile");
+    expect(requests("trust_command")).toEqual([]);
+  });
+
+  it.each([
+    ["an agent's replay that left turns out", { source: "acp_replay", omittedItems: null, omittedTurns: 12, sourcePath: "" },
+      "(12 earlier turns were not loaded into this tab)"],
+    ["a transcript read from partway in", { source: "claude_transcript", omittedItems: null, sourcePath: "/s.jsonl" },
+      "(earlier records were not loaded into this tab; count unknown)"],
+  ] as const)(":%%scratch after %s says so first", (_, over, line) => {
+    const { container } = started();
+    dispatch({ kind: "snapshot", tab: 1, throughRevision: 1, state: snapshotState({ history: {
+      restoredItems: 3, uptoSeq: 3, attemptedTranscriptPath: null, fallbackReason: null, writerVersion: null, ...over,
+    } }) });
+    typed(container, "%scratch");
+    const sent = requests("view_in_editor");
+    expect(sent).toHaveLength(1);
+    expect(String(sent[0].text).split("\n")[0]).toBe(line);
+  });
+
+  it(":scratch posts the same row view as Ctrl+g", () => {
+    const { container } = started({ withCard: true });
+    press(container, "G", { shiftKey: true });
+    press(container, "g", { ctrlKey: true });
+    const first = requests("view_in_editor")[0];
+    expect(first).toMatchObject({ title: "reply", text: "meanwhile" });
+    typed(container, "scratch");
+    const second = requests("view_in_editor")[1];
+    expect(second).toEqual({ ...first, request_id: second.request_id });
+    expect(second).not.toHaveProperty("tab");
+  });
+
+  it(":scratch retains the pending-edit proposal branch", () => {
+    const { container } = started();
+    dispatch({ kind: "snapshot", tab: 1, throughRevision: 2, state: snapshotState({
+      pendingPermissions: [{ seq: 1, permissionId: "edit", toolUseId: null, toolName: "Edit",
+        input: { file_path: "src/a.rs", old_string: "a", new_string: "b" } }],
+    }) });
+    press(container, "g"); press(container, "g");
+    typed(container, "scratch");
+    expect(requests("view_proposal")).toEqual([expect.objectContaining({
+      path: "src/a.rs", change: { kind: "edits", edits: [{ oldText: "a", newText: "b", replaceAll: false }], crlfAsLf: true },
+    })]);
+    expect(requests("view_in_editor")).toEqual([]);
+  });
+
+  it(":scratch retains an editor card's stored-proposal branch", () => {
+    const { container } = started();
+    dispatch({ kind: "snapshot", tab: 1, throughRevision: 2, state: snapshotState({
+      editorCards: [{ seq: 1, permissionId: "ec", toolUseId: null, toolName: "apply_proposal", input: null,
+        editorCard: { title: "apply", body: [], proposal: { id: "p-3", files: ["src/a.rs"] } } }],
+    }) });
+    press(container, "g"); press(container, "g");
+    typed(container, "scratch");
+    expect(requests("editor_card_view")).toEqual([expect.objectContaining({ tab: 1, proposal: "p-3", file: 0 })]);
+    expect(requests("view_in_editor")).toEqual([]);
+  });
+
+  it.each([["Approve", "approved"], ["Deny", "denied"]])("exports a visible card's %s answer until it resolves", (button, state) => {
+    const { container, getByRole } = started({ withCard: true });
+    // A real pointer press (`detail` > 0): a card button answers nothing else.
+    fireEvent.click(getByRole("button", { name: button }), { detail: 1 });
+    typed(container, "%scratch");
+    expect(requests("view_in_editor")[0].text).toContain(`> card: Bash: rm build — ${state}`);
+    const sent = requests("permission_response")[0];
+    dispatch({ kind: "command_result", requestId: sent.request_id, ok: false, error: "try again" });
+    typed(container, "%scratch");
+    expect(requests("view_in_editor")[1].text).toContain("> card: Bash: rm build — waiting");
+  });
+
   it("the_ex_line_sends_trust_and_untrust_only_on_an_exact_match", () => {
     const { container } = started();
     typed(container, "trust");

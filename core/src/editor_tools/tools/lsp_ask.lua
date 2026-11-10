@@ -117,6 +117,27 @@ for _, method in ipairs(methods) do
   else parts[name] = part; order[#order + 1] = name end
 end
 if #jobs == 0 then return { no_client = true, loaded_now = loaded_now, buffer = about } end
+-- The clients a request went to, by name (a client without the method was not asked), and those still reporting
+-- unfinished work (a server loading its workspace holds or empties its answers meanwhile), so the caller can say
+-- which server it waited on.
+local client_names, busy, named = {}, {}, {}
+for _, job in ipairs(jobs) do
+  local client = job.target.client
+  local name = type(client.name) == 'string' and cut(client.name, 64) or ''
+  if #client_names < 8 and not named[name] then
+    named[name] = true
+    client_names[#client_names + 1] = name
+    local progress = type(client.progress) == 'table' and client.progress.pending
+    if type(progress) == 'table' and next(progress) ~= nil then busy[#busy + 1] = name end
+  end
+end
+-- A caller may word the query per server: a client named in `query_for` is asked its own string.
+local function query_of(client)
+  local per = args.query_for
+  local own = type(per) == 'table' and type(client.name) == 'string' and per[client.name] or nil
+  if type(own) == 'string' then return own end
+  return args.query or ''
+end
 -- An id is single-use until collected or expired: a second ask under it would drop the first's pending parts.
 if lsp.entries[key] then return { refused = 'the LSP id is already in use' } end
 lsp.order = (lsp.order or 0) + 1
@@ -134,7 +155,7 @@ for _, job in ipairs(jobs) do
   local target = job.target
   local params
   if stored then params = stored.action
-  elseif job.verb == 'workspace/symbol' then params = { query = args.query or '' }
+  elseif job.verb == 'workspace/symbol' then params = { query = query_of(target.client) }
   else
     params = { textDocument = { uri = vim.uri_from_bufnr(target.buf) } }
     if job.verb ~= 'textDocument/documentSymbol' and job.verb ~= 'textDocument/formatting' and job.verb ~= 'textDocument/codeAction' then
@@ -194,4 +215,5 @@ for _, job in ipairs(jobs) do
     if not ok or not sent then handler(true, nil) end
   end
 end
-return { started = true, unsupported = unsupported, action = entry.action, buffer = about }
+return { started = true, unsupported = unsupported, action = entry.action, buffer = about, clients = client_names,
+  busy = busy }

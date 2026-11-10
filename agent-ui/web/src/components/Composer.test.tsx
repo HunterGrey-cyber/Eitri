@@ -1,7 +1,8 @@
 // @vitest-environment jsdom
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { cleanup, fireEvent, getByRole, render } from "@testing-library/react";
-import { Composer } from "./Composer";
+import { Composer, CTRL_X_CHORD_MS, CTRL_X_SHOWCMD } from "./Composer";
+import { CTRL_X_ONLY_ENTER_FLASH } from "../app/flashes";
 import { COMPOSER_CHORDS } from "../composerKeys";
 import { resolveKey } from "../keymap";
 
@@ -642,6 +643,14 @@ describe("every chord COMPOSER_CHORDS names does what INPUT_KEYS says", () => {
       fireEvent.keyDown(textarea, { key: "Enter", ctrlKey: true });
       expect(onSendNow).toHaveBeenCalledWith("now");
     },
+    "Ctrl+x Enter": () => {
+      const onQueue = vi.fn();
+      const { textarea } = renderComposer({ running: true, onQueue, onChord: vi.fn() });
+      typed(textarea, "after it");
+      fireEvent.keyDown(textarea, { key: "x", ctrlKey: true });
+      fireEvent.keyDown(textarea, { key: "Enter" });
+      expect(onQueue).toHaveBeenCalledWith("after it", { afterTurn: true });
+    },
     "Shift+Enter": () => {
       const onQueue = vi.fn();
       const { textarea, onSend } = renderComposer({ onQueue });
@@ -1000,7 +1009,144 @@ it("names queue editing and immediate sending in an empty box only while message
   expect(textarea.placeholder).toBe("↑ to edit queued messages, Ctrl+Enter to send them now");
   // A message already sent into the turn cannot be taken back or sent again, so the running hint stays.
   rerender({ queueCount: 0, running: true, enterSteers: true });
-  expect(textarea.placeholder).toBe("Enter steers the running turn…");
+  expect(textarea.placeholder).toBe("Enter steers the running turn, Ctrl+x Enter waits for its end…");
   rerender({ queueCount: 0, running: false });
   expect(textarea.placeholder).toBe("");
+});
+
+/* `Ctrl+x Enter` sends the draft after the turn: held for the running turn's end and never put into it, or the
+   next turn when none runs. Only the conversation's box has the chord (`onChord`). */
+describe("Ctrl+x Enter: send after the turn", () => {
+  const typed = (textarea: HTMLTextAreaElement, value: string) => {
+    fireEvent.change(textarea, { target: { value } });
+    textarea.setSelectionRange(value.length, value.length);
+  };
+  function chord(overrides: Overrides = {}) {
+    const onQueue = vi.fn();
+    const onChord = vi.fn();
+    const rendered = renderComposer({ onQueue, onChord, ...overrides });
+    return { ...rendered, onQueue, onChord };
+  }
+  const flashOf = (container: HTMLElement) => container.querySelector(".composer-slash-flash")?.textContent ?? null;
+
+  it("posts the draft for the turn's end, whether a turn runs or not, and the band hears of the chord", () => {
+    for (const running of [true, false]) {
+      const { textarea, onQueue, onChord, onSend } = chord({ running });
+      typed(textarea, "then commit");
+      expect(fireEvent.keyDown(textarea, { key: "x", ctrlKey: true }), "Ctrl+x is claimed").toBe(false);
+      expect(onChord).toHaveBeenLastCalledWith(CTRL_X_SHOWCMD);
+      expect(textarea.value, "nothing was cut").toBe("then commit");
+      expect(fireEvent.keyDown(textarea, { key: "Enter" })).toBe(false);
+      expect(onQueue).toHaveBeenCalledWith("then commit", { afterTurn: true });
+      expect(onSend).not.toHaveBeenCalled();
+      expect(onChord).toHaveBeenLastCalledWith(null);
+      expect(textarea.value).toBe("");
+      cleanup();
+    }
+  });
+
+  it("a bare modifier between the two keys waits", () => {
+    const { textarea, onQueue } = chord({ running: true });
+    typed(textarea, "later");
+    fireEvent.keyDown(textarea, { key: "x", ctrlKey: true });
+    fireEvent.keyDown(textarea, { key: "x", ctrlKey: true, repeat: true });
+    fireEvent.keyDown(textarea, { key: "Control" });
+    fireEvent.keyDown(textarea, { key: "Shift", shiftKey: true });
+    fireEvent.keyDown(textarea, { key: "Enter" });
+    expect(onQueue).toHaveBeenCalledWith("later", { afterTurn: true });
+  });
+
+  it("with a selection, Ctrl+x is the box's own cut", () => {
+    const { textarea, onChord } = chord({ running: true });
+    fireEvent.change(textarea, { target: { value: "cut me" } });
+    textarea.setSelectionRange(0, 3);
+    expect(fireEvent.keyDown(textarea, { key: "x", ctrlKey: true }), "left to the textarea").toBe(true);
+    expect(onChord).not.toHaveBeenCalled();
+  });
+
+  it("any other key ends the chord, says so, and types nothing", () => {
+    const { container, textarea, onQueue, onChord } = chord({ running: true });
+    typed(textarea, "draft");
+    fireEvent.keyDown(textarea, { key: "x", ctrlKey: true });
+    expect(fireEvent.keyDown(textarea, { key: "a" }), "the key is taken").toBe(false);
+    expect(flashOf(container)).toBe(CTRL_X_ONLY_ENTER_FLASH);
+    expect(textarea.value).toBe("draft");
+    expect(onQueue).not.toHaveBeenCalled();
+    expect(onChord).toHaveBeenLastCalledWith(null);
+    // The chord is over: Enter is Enter again.
+    fireEvent.keyDown(textarea, { key: "Enter" });
+    expect(onQueue).toHaveBeenCalledWith("draft");
+  });
+
+  it("Esc and a modified Enter end it too, and do nothing else", () => {
+    for (const key of [{ key: "Escape" }, { key: "Enter", ctrlKey: true }, { key: "Enter", shiftKey: true }]) {
+      const onSendNow = vi.fn();
+      const { container, textarea, onQueue } = chord({ running: true, onSendNow });
+      typed(textarea, "draft");
+      fireEvent.keyDown(textarea, { key: "x", ctrlKey: true });
+      expect(fireEvent.keyDown(textarea, key)).toBe(false);
+      expect(flashOf(container)).toBe(CTRL_X_ONLY_ENTER_FLASH);
+      expect(onQueue).not.toHaveBeenCalled();
+      expect(onSendNow).not.toHaveBeenCalled();
+      expect(textarea.value).toBe("draft");
+      cleanup();
+    }
+  });
+
+  it("a repeated Enter sends nothing", () => {
+    const { container, textarea, onQueue } = chord({ running: true });
+    typed(textarea, "draft");
+    fireEvent.keyDown(textarea, { key: "x", ctrlKey: true });
+    fireEvent.keyDown(textarea, { key: "Enter", repeat: true });
+    expect(onQueue).not.toHaveBeenCalled();
+    expect(flashOf(container)).toBe(CTRL_X_ONLY_ENTER_FLASH);
+    expect(textarea.value).toBe("draft");
+  });
+
+  it("an empty draft sends nothing", () => {
+    const { textarea, onQueue, onSend } = chord({ running: true });
+    fireEvent.keyDown(textarea, { key: "x", ctrlKey: true });
+    fireEvent.keyDown(textarea, { key: "Enter" });
+    expect(onQueue).not.toHaveBeenCalled();
+    expect(onSend).not.toHaveBeenCalled();
+  });
+
+  it("ends silently after two seconds", () => {
+    vi.useFakeTimers();
+    try {
+      const { container, textarea, onQueue, onChord, onSend } = chord({ running: false });
+      typed(textarea, "draft");
+      fireEvent.keyDown(textarea, { key: "x", ctrlKey: true });
+      vi.advanceTimersByTime(CTRL_X_CHORD_MS - 1);
+      expect(onChord).toHaveBeenLastCalledWith(CTRL_X_SHOWCMD);
+      vi.advanceTimersByTime(1);
+      expect(onChord).toHaveBeenLastCalledWith(null);
+      fireEvent.keyDown(textarea, { key: "Enter" });
+      expect(onSend).toHaveBeenCalledWith("draft");
+      expect(onQueue).not.toHaveBeenCalled();
+      expect(flashOf(container)).toBeNull();
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("the start screen's box, given no onChord, leaves Ctrl+x alone", () => {
+    const onQueue = vi.fn();
+    const { textarea, onSend } = renderComposer({ onQueue });
+    typed(textarea, "draft");
+    expect(fireEvent.keyDown(textarea, { key: "x", ctrlKey: true })).toBe(true);
+    fireEvent.keyDown(textarea, { key: "Enter" });
+    expect(onSend).toHaveBeenCalledWith("draft");
+    expect(onQueue).not.toHaveBeenCalled();
+  });
+
+  it("leaving the box ends the chord", () => {
+    const { textarea, onChord, onQueue } = chord({ running: true });
+    typed(textarea, "draft");
+    fireEvent.keyDown(textarea, { key: "x", ctrlKey: true });
+    fireEvent.blur(textarea);
+    expect(onChord).toHaveBeenLastCalledWith(null);
+    fireEvent.keyDown(textarea, { key: "Enter" });
+    expect(onQueue).toHaveBeenCalledWith("draft");
+  });
 });
