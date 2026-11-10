@@ -124,7 +124,7 @@ export const QuestionDock = forwardRef<QuestionDockHandle, Props>(function Quest
     mirror();
   }, [record.state.kind]);
   useLayoutEffect(() => {
-    if (active) root.current?.focus({ preventScroll: true });
+    if (active && !root.current?.contains(document.activeElement)) root.current?.focus({ preventScroll: true });
   }, [active]);
   useLayoutEffect(() => {
     if (editFocus === null || editFocus.index !== page || !active || busy) return;

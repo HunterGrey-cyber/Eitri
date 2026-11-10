@@ -202,6 +202,17 @@ describe("the Bash card", () => {
 });
 
 describe("the reason box and the remember button", () => {
+  it("repeated Enter in the reason box is prevented without denying", () => {
+    const onAnswer = vi.fn();
+    const { container } = render(<PermissionCard request={REQUEST} sessionEnded={false} onAnswer={onAnswer} />);
+    const reason = container.querySelector<HTMLInputElement>("input")!;
+    fireEvent.change(reason, { target: { value: "keep this reason" } });
+    expect(fireEvent.keyDown(reason, { key: "Enter", repeat: true })).toBe(false);
+    expect(onAnswer).not.toHaveBeenCalled();
+    fireEvent.keyDown(reason, { key: "Enter" });
+    expect(onAnswer).toHaveBeenCalledWith("perm-1", "deny", "keep this reason");
+  });
+
   it("denies with the reason on Enter in the reason box", () => {
     const onAnswer = vi.fn();
     const { container } = render(<PermissionCard request={REQUEST} sessionEnded={false} onAnswer={onAnswer} />);

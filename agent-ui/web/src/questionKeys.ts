@@ -1,6 +1,7 @@
 /*! Question key mapping adapted from opencode, Copyright (c) 2025 opencode, MIT License. */
 
 import { isPlainAnswerKey } from "./keymap";
+import { isShiftTab } from "./modeKey";
 
 export type QuestionKeyZone = "option" | "custom" | "input" | "other";
 export type QuestionKeyIntent =
@@ -9,7 +10,7 @@ export type QuestionKeyIntent =
   | { type: "edge"; to: "first" | "last" }
   | { type: "number"; index: number };
 
-type Key = Pick<KeyboardEvent, "key" | "keyCode" | "repeat" | "metaKey" | "ctrlKey" | "altKey" | "shiftKey" | "isComposing"> & { getModifierState?: (key: string) => boolean };
+type Key = Pick<KeyboardEvent, "key" | "keyCode" | "repeat" | "metaKey" | "ctrlKey" | "altKey" | "shiftKey" | "isComposing"> & { code?: string; getModifierState?: (key: string) => boolean };
 
 /** Answering is a key-down action. Text fields retain their editing keys and IME composition. */
 export function questionKey(event: Key, context: { zone: QuestionKeyZone; count: number; preview?: boolean }): QuestionKeyIntent {
@@ -28,7 +29,7 @@ export function questionKey(event: Key, context: { zone: QuestionKeyZone; count:
     return { type: "none" };
   }
   if (event.key === "Escape") return { type: context.zone === "input" ? "leave" : "dismiss" };
-  if (event.key === "Tab") return { type: "question", step: event.shiftKey ? -1 : 1 };
+  if (event.key === "Tab" || isShiftTab(event)) return { type: "question", step: event.shiftKey ? -1 : 1 };
   if (context.zone === "input") {
     if (event.key === "ArrowUp" && !event.shiftKey) return { type: "leave" };
     if (event.key === "Enter" && !event.shiftKey) return { type: "commit" };

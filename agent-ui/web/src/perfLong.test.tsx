@@ -1,6 +1,6 @@
 // @vitest-environment jsdom
 import { Profiler } from "react";
-import { afterAll, afterEach, beforeAll, expect, it, vi } from "vitest";
+import { afterAll, afterEach, beforeAll, beforeEach, expect, it, vi } from "vitest";
 import { act, cleanup, fireEvent, render } from "@testing-library/react";
 import App from "./App";
 import { initialState } from "./reducer";
@@ -10,10 +10,18 @@ import { timelineBuildCount } from "./timeline";
 import { timelineRowRenderCount } from "./components/MessageList";
 
 /* The panel's cost over a long conversation, counted rather than timed: jsdom's timing is not
-   WebKitGTK's, and a count cannot be flaky. A conversation of more replies than the markdown cache
+   WebKitGTK's. A conversation of more replies than the markdown cache
    holds, with 100 finished 400-line Edit calls in it, must not make the per-key counts below grow. */
 
-afterEach(cleanup);
+beforeEach(() => {
+  // Count each batch's work without slow-draw rests depending on machine load.
+  // App.streaming.test.tsx controls elapsed time to exercise those rests separately.
+  vi.spyOn(performance, "now").mockReturnValue(1_000);
+});
+afterEach(() => {
+  cleanup();
+  vi.restoreAllMocks();
+});
 beforeAll(() => {
   Element.prototype.scrollIntoView = vi.fn();
   // Fewer characters than the replies below come to.

@@ -7,6 +7,15 @@ const key = (key: string, extra: Partial<KeyboardEvent> = {}, zone: QuestionKeyZ
 }, { zone, count: 4, preview });
 
 describe("question keys", () => {
+  it("WebKit Shift+Tab navigates to the previous question", () => {
+    const event = { code: "Tab", keyCode: 9, shiftKey: true };
+    for (const zone of ["option", "custom", "input", "other"] as const) {
+      expect(key("Unidentified", event, zone)).toEqual({ type: "question", step: -1 });
+    }
+    expect(key("Unidentified", { ...event, repeat: true })).toEqual({ type: "swallow" });
+    expect(key("Unidentified", { ...event, keyCode: 229 })).toEqual({ type: "none" });
+  });
+
   it.each(["Enter", "Escape", "1", " ", "j", "Tab"])("ignores %s during IME composition and repeats", (name) => {
     expect(key(name, { isComposing: true })).toEqual({ type: "none" });
     expect(key(name, { keyCode: 229 })).toEqual({ type: "none" });

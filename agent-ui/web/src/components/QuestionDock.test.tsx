@@ -1,5 +1,5 @@
 // @vitest-environment jsdom
-import { createRef } from "react";
+import { createRef, useState } from "react";
 import { act, cleanup, fireEvent, render } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { QuestionDock, type QuestionDockHandle } from "./QuestionDock";
@@ -28,6 +28,23 @@ function setup(questions = [spec], draft?: unknown, blocked = () => false) {
 const answers = () => messages.filter((m) => m.type === "question_answer" || m.type === "question_decline");
 
 describe("question dock", () => {
+  it("activating from BROWSE keeps focus in the clicked textarea", () => {
+    function Page() {
+      const [mode, setMode] = useState("browse");
+      return <QuestionDock tab={1} record={record()} active={mode === "input"} blocked={() => false}
+        onActivate={() => setMode("input")} stillWaiting={() => true}
+        draft={{ page: 0, focus: 2, answers: [{ options: [], other: true, text: "draft" }] }} />;
+    }
+    const { getByRole, getByLabelText } = render(<Page />);
+    const dock = getByRole("group");
+    const field = getByLabelText("Type something");
+    expect(dock.dataset.active).toBe("false");
+    act(() => field.focus());
+    expect(dock.dataset.active).toBe("true");
+    expect(document.activeElement).toBe(field);
+    expect(answers()).toEqual([]);
+  });
+
   it("shows the question, bold-ready labels, separate descriptions, first pointer and no initial selection", () => {
     const { container, getByText } = setup();
     expect(getByText("Which database?")).toBeTruthy();

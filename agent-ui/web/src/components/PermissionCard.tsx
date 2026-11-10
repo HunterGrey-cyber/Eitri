@@ -139,6 +139,7 @@ export function PermissionCard({
             // Enter here denies with the reason; an IME's Enter is its own.
             if (e.key !== "Enter" || e.nativeEvent.isComposing || e.keyCode === 229) return;
             e.preventDefault();
+            if (e.repeat) return;
             handleAnswer("deny");
           }}
           disabled={inert}

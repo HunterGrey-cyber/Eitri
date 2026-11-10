@@ -1875,8 +1875,9 @@ export default function App() {
      Approve that goes disabled once answered. A browser moves focus to <body> in both cases without
      reliably firing `blur` (a removed node fires nothing), and a disabled button receives no key
      events, so the next key would sail past `onKeyDown` and the panel would stop answering its own
-     keys. The key is REPLAYED on the root rather than dropped, so the keystroke that noticed the
-     problem still does what it says. The replay targets the root, so it never re-enters here.
+     keys. A fresh key is replayed on the root, so the keystroke that noticed the problem still does
+     what it says; a held key only restores focus. The replay is stamped now and targets the root,
+     so it never re-enters here.
      On the empty layout the root that handles keys is `.empty-tab`, not
      `.agent-ui-root` -- its parent, whose only handler is the `?`/confirm capture, so a key replayed
      there never reached `EmptyTab`'s own `onKeyDown` (a failed tab's `r` was dead), and focusing it
@@ -1897,9 +1898,16 @@ export default function App() {
         containerRef.current ?? start?.querySelector<HTMLElement>(".empty-tab[tabindex]") ?? start;
       if (root === null) return;
       root.focus({ preventScroll: true });
+      if (event.repeat) {
+        event.preventDefault();
+        return;
+      }
       const replay = new globalThis.KeyboardEvent("keydown", {
         key: event.key,
         code: event.code,
+        repeat: false,
+        isComposing: event.isComposing,
+        keyCode: event.keyCode,
         ctrlKey: event.ctrlKey,
         shiftKey: event.shiftKey,
         altKey: event.altKey,
@@ -5358,7 +5366,7 @@ export default function App() {
       // A text box inside a row (a permission card's reason) takes every key as text, except Esc,
       // which hands the keys back to the row it sits in. Esc mid-composition still belongs to the
       // input method, as it does in the composer.
-      if (event.key === "Escape" && !event.nativeEvent.isComposing && root !== null) {
+      if (event.key === "Escape" && !isImeKey(event.nativeEvent) && root !== null) {
         event.preventDefault();
         root.focus({ preventScroll: true });
       }

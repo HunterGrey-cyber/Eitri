@@ -65,6 +65,44 @@ async function start(run = vi.fn(() => true), initial: InstallOptions["initial"]
 }
 
 describe("installation", () => {
+  it("held hint keys neither start hints nor activate their targets", async () => {
+    const click = vi.fn();
+    for (let i = 0; i < 4; i++) {
+      const target = document.createElement("button");
+      document.body.append(target);
+      const rect = new DOMRect(10 + i * 50, 10, 30, 20);
+      vi.spyOn(target, "getBoundingClientRect").mockReturnValue(rect);
+      vi.spyOn(target, "getClientRects").mockReturnValue([rect] as unknown as DOMRectList);
+      vi.spyOn(target, "clientWidth", "get").mockReturnValue(30);
+      vi.spyOn(target, "clientHeight", "get").mockReturnValue(20);
+      target.addEventListener("click", click);
+    }
+    await start();
+    key("f");
+    expect(document.querySelectorAll(".eitri-hint")).toHaveLength(4);
+    expect(key("f", { ctrlKey: true, repeat: true }).defaultPrevented).toBe(false);
+    expect(click).not.toHaveBeenCalled();
+    expect(document.querySelectorAll(".eitri-hint")).toHaveLength(4);
+    expect(key("f", { repeat: true }).defaultPrevented).toBe(true);
+    expect(click).not.toHaveBeenCalled();
+    expect(document.querySelectorAll(".eitri-hint")).toHaveLength(4);
+    expect(key("Escape", { repeat: true }).defaultPrevented).toBe(true);
+    expect(document.querySelectorAll(".eitri-hint")).toHaveLength(4);
+    key("f");
+    expect(click).toHaveBeenCalledOnce();
+    expect(document.querySelectorAll(".eitri-hint")).toHaveLength(0);
+    (document.activeElement as HTMLElement).blur();
+    expect(key("f", { repeat: true }).defaultPrevented).toBe(true);
+    expect(document.querySelectorAll(".eitri-hint")).toHaveLength(0);
+  });
+
+  it("a repeated hint start key is swallowed without opening hints", async () => {
+    const targets = vi.fn(() => []);
+    cleanup = await install({ rows: pageRows, run: vi.fn(() => true), targets, initial: timing });
+    expect(key("f", { repeat: true }).defaultPrevented).toBe(true);
+    expect(targets).not.toHaveBeenCalled();
+  });
+
   it("tells the page's onJump before and after gg and G, not on a repeat, and takes G's place from bottom", async () => {
     Object.defineProperty(document.documentElement, "scrollHeight", { configurable: true, value: 5000 });
     Object.defineProperty(document.documentElement, "clientHeight", { configurable: true, value: 800 });

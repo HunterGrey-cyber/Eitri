@@ -258,6 +258,7 @@ export async function install(opts: InstallOptions): Promise<() => void> {
     }
     if (hints?.active) {
       if (!escape && (ev.ctrlKey || ev.altKey || ev.metaKey)) return;
+      if (ev.repeat) { ev.preventDefault(); return; }
       const target = hints.feed(escape ? "Escape" : ev.key);
       if (target) activate(target);
       renderMode();
@@ -383,6 +384,7 @@ export async function install(opts: InstallOptions): Promise<() => void> {
         break;
       }
       case "hint.start": {
+        if (ev.repeat) { handled = true; break; }
         endHold();
         clearPrefix();
         const rect = current?.getBoundingClientRect();
