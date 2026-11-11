@@ -99,8 +99,9 @@ use gtk4::{
 use eitri_terminal::mouse::{Button as MouseButton, MouseKind, MouseModes, MouseMods, WheelDir};
 use eitri_terminal::pty::{fallback_shell, passwd_shell};
 use eitri_terminal::{
-    layout_preedit, CursorCell, DetachRefused, Detached, PreeditLayout, PtySize, Screen, ScrollRequest, SelectCommand,
-    SessionCommand, SessionConfig, SpawnSpec, TerminalColors, TerminalMetrics, TerminalSession,
+    layout_preedit, CursorCell, DetachRefused, Detached, ExitInfo, HostEvents, PreeditLayout, PtySize, Screen,
+    ScrollRequest, SelectCommand, SessionCommand, SessionConfig, SpawnSpec, TerminalColors, TerminalMetrics,
+    TerminalSession,
 };
 use terminal_input::NormalizedInput;
 use terminal_render::PaintList;
@@ -210,6 +211,9 @@ struct State {
     /// Told when the shell ends in a way that closes the module (`super::closes_on_exit`); set by
     /// `main.rs` ([`TerminalPane::on_shell_exit`]). Called with no borrow of this state held.
     on_shell_exit: Option<Rc<dyn Fn(u64) -> bool>>,
+    /// Told the text of an OSC 52 notice the pane could not show because its shell ended and closed the module
+    /// first; set by `main.rs` ([`TerminalPane::on_clipboard_notice_lost`]). Called with no borrow of this state held.
+    on_notice_lost: Option<Rc<dyn Fn(String)>>,
     /// Told each time a shell is spawned, with its pid; set by `main.rs` ([`TerminalPane::on_shell_start`]).
     /// Called with no borrow of this state held.
     on_shell_start: Option<Rc<dyn Fn(u32)>>,
@@ -284,6 +288,7 @@ impl State {
             cwd,
             shell_env: None,
             on_shell_exit: None,
+            on_notice_lost: None,
             on_shell_start: None,
             frozen: false,
             prepared: None,
@@ -413,6 +418,26 @@ impl State {
         } else {
             None
         }
+    }
+
+    /// What an update's OSC 52 writes and exit owe the clipboard notice: the expiry of a notice that starts showing
+    /// now, and the notice's text when the exit closes the module (`super::closes_on_exit`), since the close forgets
+    /// the pane's notice. The writes are recorded first, so a copy made by the shell's last command in the same
+    /// update as its exit is still said. A detached or unknown exit keeps the module, and the notice stays here.
+    fn notice_on_update(
+        &mut self,
+        events: &HostEvents,
+        exit: Option<&ExitInfo>,
+        on_screen: bool,
+        now: Instant,
+    ) -> (Option<Instant>, Option<String>) {
+        let until = self.clipboard_notice.record(events, on_screen, now);
+        let lost = if exit.is_some_and(super::closes_on_exit) {
+            self.clipboard_notice.lost_on_close(now, self.number)
+        } else {
+            None
+        };
+        (until, lost)
     }
 
     /// Accepts input now, even when a paste holds it back from the session.
@@ -854,6 +879,13 @@ impl TerminalPane {
         self.state.borrow_mut().on_shell_exit = Some(Rc::new(f));
     }
 
+    /// `f` runs with the host-only text of an OSC 52 notice that the pane's closing would otherwise drop: the shell
+    /// ended by itself and closes the module while its writes were never shown (the pane was hidden) or are still on
+    /// screen. It runs just before the end is reported (see [`Self::on_shell_exit`]), with this pane's state released.
+    pub(crate) fn on_clipboard_notice_lost(&self, f: impl Fn(String) + 'static) {
+        self.state.borrow_mut().on_notice_lost = Some(Rc::new(f));
+    }
+
     /// `f` runs each time a shell is spawned in this pane -- at its first allocation after a start, or
     /// at once when the pane is laid out, and on the Enter that restarts an exited one -- with the
     /// shell's pid, with this pane's state released.
@@ -1201,12 +1233,12 @@ fn connect_visibility(area: &GLArea, state: &Rc<RefCell<State>>, im: &IMMulticon
 /// [`bell::repaint_delay`], not the raw remainder, so it never fires before the flash is actually
 /// over. **Known limit:** the clipboard calls, the input method and the timer's own firing are GTK's
 /// and are not tested without a display; the decisions are (`State::take_cursor`, `State::bell`,
-/// `BellFlash`, `bell::repaint_delay`, and the engine's OSC 52 tests).
+/// `State::notice_on_update`, `BellFlash`, `bell::repaint_delay`, and the engine's OSC 52 tests).
 fn pump(state: &RefCell<State>, area: &GLArea, im: &IMMulticontext, on_screen: bool) {
     let Some(update) = state.borrow().session.as_ref().map(TerminalSession::take_update) else {
         return;
     };
-    let (repoint, flash_until, notice_until, closed_by_exit) = {
+    let (repoint, flash_until, notice_until, closed_by_exit, lost_notice) = {
         let mut s = state.borrow_mut();
         let mut repoint = false;
         let mut closed_by_exit = None;
@@ -1229,7 +1261,10 @@ fn pump(state: &RefCell<State>, area: &GLArea, im: &IMMulticontext, on_screen: b
                 closed_by_exit = s.on_shell_exit.clone().map(|callback| (callback, s.generation));
             }
         }
-        let notice_until = s.clipboard_notice.record(&update.events, on_screen, Instant::now());
+        let (notice_until, lost) =
+            s.notice_on_update(&update.events, update.exited.as_ref(), on_screen, Instant::now());
+        // The close below forgets the pane's notice: what it holds goes to the window instead.
+        let lost_notice = closed_by_exit.as_ref().and(s.on_notice_lost.clone()).zip(lost);
         if update.events.clipboard_bytes.is_some() || update.events.primary_bytes.is_some() {
             area.queue_render();
         }
@@ -1238,7 +1273,7 @@ fn pump(state: &RefCell<State>, area: &GLArea, im: &IMMulticontext, on_screen: b
         } else {
             None
         };
-        (repoint, flash_until, notice_until, closed_by_exit)
+        (repoint, flash_until, notice_until, closed_by_exit, lost_notice)
     };
     if repoint {
         point_input_method(im, state, area);
@@ -1273,6 +1308,9 @@ fn pump(state: &RefCell<State>, area: &GLArea, im: &IMMulticontext, on_screen: b
 
     // Last, with nothing borrowed: the hook kills the module, unmapping this pane, whose handler
     // borrows the state. Then the pane forgets the shell, as `TerminalPane::close` does.
+    if let Some((say, text)) = lost_notice {
+        say(text);
+    }
     if let Some((closed_by_exit, generation)) = closed_by_exit {
         if closed_by_exit(generation) && super::exit_is_current(generation, state.borrow().generation) {
             state.borrow_mut().close();
@@ -2129,6 +2167,58 @@ fn paste_from(
 mod tests {
     use super::*;
     use gtk4::gdk::ScrollUnit;
+
+    fn osc52_write(bytes: usize) -> HostEvents {
+        HostEvents {
+            clipboard: Some("x".repeat(bytes)),
+            clipboard_bytes: Some(bytes),
+            ..HostEvents::default()
+        }
+    }
+
+    const EXITED: ExitInfo = ExitInfo {
+        code: Some(0),
+        signal: None,
+        detached: false,
+    };
+
+    #[test]
+    fn an_osc52_notice_owed_when_the_shell_exit_closes_the_pane_is_handed_on() {
+        let now = Instant::now();
+        // A hidden pane's write, never shown, then the exit in a later update.
+        let mut state = State::new(PathBuf::from("/work"));
+        assert_eq!(state.notice_on_update(&osc52_write(5), None, false, now), (None, None));
+        assert_eq!(
+            state.notice_on_update(&HostEvents::default(), Some(&EXITED), false, now),
+            (None, Some("Terminal 1: OSC 52 wrote clipboard: 5 bytes".to_string()))
+        );
+
+        // The last command's write and the exit in one update: the write is counted before the close takes it.
+        for on_screen in [false, true] {
+            let mut state = State::new(PathBuf::from("/work"));
+            let (until, lost) = state.notice_on_update(&osc52_write(7), Some(&EXITED), on_screen, now);
+            assert_eq!(until.is_some(), on_screen);
+            assert_eq!(lost.as_deref(), Some("Terminal 1: OSC 52 wrote clipboard: 7 bytes"));
+        }
+
+        // A detached or unknown exit keeps the module: nothing is handed on, and the notice stays with the pane.
+        let detached = ExitInfo {
+            code: None,
+            signal: None,
+            detached: true,
+        };
+        for exit in [detached, ExitInfo::UNKNOWN] {
+            let mut state = State::new(PathBuf::from("/work"));
+            assert_eq!(
+                state.notice_on_update(&osc52_write(3), Some(&exit), false, now),
+                (None, None)
+            );
+            assert!(
+                state.clipboard_notice.show(now).is_some(),
+                "shown once the pane is mapped"
+            );
+        }
+    }
 
     #[test]
     fn a_timed_out_paste_cancels_its_read_and_releases_typing() {

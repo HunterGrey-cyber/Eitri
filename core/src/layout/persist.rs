@@ -1321,8 +1321,9 @@ fn write_whole(dir: &Path, path: &Path, text: &str) -> std::io::Result<()> {
 /// a dead window's from a live one's would mean asking whether its process still runs, for a small
 /// file that `load` never reads.
 ///
-/// A text nested deeper than [`MAX_NESTING`] is not written (`InvalidData`): the next launch could not
-/// read it, and the file already there is a better one to open with.
+/// A text nested deeper than [`MAX_NESTING`], or longer than the read cap ([`MAX_LAYOUT_BYTES`], which kept keys a
+/// newer build or a hand edit put there can push it past), is not written (`InvalidData`): the next launch could
+/// not read it, and the file already there is a better one to open with.
 pub fn save(dir: &Path, project_root: &Path, workspaces: &Workspaces, current: &Layout) -> std::io::Result<PathBuf> {
     save_as(dir, project_root, Role::Main, workspaces, current)
 }
@@ -1342,6 +1343,15 @@ pub fn save_as(
         return Err(std::io::Error::new(
             std::io::ErrorKind::InvalidData,
             format!("the layout nests {deepest} levels deep; a file deeper than {MAX_NESTING} could not be read back"),
+        ));
+    }
+    if text.len() as u64 > MAX_LAYOUT_BYTES {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!(
+                "the layout is {} bytes; a file over {MAX_LAYOUT_BYTES} bytes could not be read back",
+                text.len()
+            ),
         ));
     }
     write_whole(dir, &path, &text)?;
@@ -2665,6 +2675,30 @@ mod tests {
         assert_eq!(nesting(&one(&deeper)), 514);
         let err = save(&dir, &root(), &Workspaces::single(), &deeper).unwrap_err();
         assert_eq!(err.kind(), std::io::ErrorKind::InvalidData);
+        assert_eq!(file_text_in(&dir), before, "the file already there stays");
+        assert_eq!(names_in(&dir), [file_name_v2(&root())], "and no temporary file is left");
+    }
+
+    /// The writer refuses a text the reader's byte cap would refuse: a big kept key leaves the file already there.
+    #[test]
+    fn a_layout_over_the_read_cap_is_not_written() {
+        let kept_of = |bytes: usize| {
+            let text = one(&plain());
+            let body = text.strip_suffix("\n}").unwrap();
+            let text = format!("{body},\n  \"later\": \"{}\"\n}}", "x".repeat(bytes));
+            decode_v2(&text, &root(), &[]).unwrap()
+        };
+        let dir = a_dir("layout-too-big");
+        let small = kept_of(1024);
+        save(&dir, &root(), &small.workspaces, &small.current).unwrap();
+        let before = file_text_in(&dir);
+        assert!(before.len() as u64 <= MAX_LAYOUT_BYTES);
+        assert!(read_v2_text(&dir, &root()).unwrap().is_some());
+
+        let big = kept_of(MAX_LAYOUT_BYTES as usize);
+        let err = save(&dir, &root(), &big.workspaces, &big.current).unwrap_err();
+        assert_eq!(err.kind(), std::io::ErrorKind::InvalidData);
+        assert!(err.to_string().contains("could not be read back"), "{err}");
         assert_eq!(file_text_in(&dir), before, "the file already there stays");
         assert_eq!(names_in(&dir), [file_name_v2(&root())], "and no temporary file is left");
     }

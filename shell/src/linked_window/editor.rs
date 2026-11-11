@@ -584,6 +584,9 @@ struct OutDraft {
     peer: PeerId,
     tab: u64,
     session: Option<String>,
+    /// The generation of `peer`'s link when the draft went out: the draft goes back only on that link, since a window
+    /// opened again under the same peer has tabs of its own under the same numbers.
+    asked_on: Option<u64>,
 }
 
 /// One linked window, as window 1's editor serves it.
@@ -592,6 +595,9 @@ struct LinkState {
     name: WindowName,
     /// What this link was last told.
     told: Told,
+    /// Which link to `peer` this is: a window that closes and is opened again is the same peer on a new link, and
+    /// what was asked on the old one is no business of the new.
+    generation: u64,
 }
 
 /// The roots of the plugin an id names, from this window's table; `None` when no plugin of that id is loaded here, as
@@ -633,6 +639,8 @@ pub struct Window1Editor {
     /// Views from another window being written on a worker, oldest first: each is handed to the editor once
     /// written, in the order they came.
     views: RefCell<Vec<WritingView>>,
+    /// The generation the next link gets (`LinkState::generation`).
+    link_generations: Cell<u64>,
     polling: Cell<bool>,
 }
 
@@ -644,6 +652,8 @@ struct WritingView {
     /// The window and the id to answer with [`Msg::EditorShown`] once the view is written and handed to the editor,
     /// when the request asked for an answer.
     answer: Option<(PeerId, u64)>,
+    /// The generation of `answer`'s link when the view came; the answer goes only to that link.
+    asked_on: Option<u64>,
 }
 
 impl Window1Editor {
@@ -671,6 +681,7 @@ impl Window1Editor {
             scratch: RefCell::default(),
             drafts: RefCell::default(),
             views: RefCell::default(),
+            link_generations: Cell::new(0),
             polling: Cell::new(false),
         })
     }
@@ -858,12 +869,15 @@ impl Window1Editor {
         });
         let mut told = Told::default();
         let heard = self.feeds.borrow().new_link(&mut told);
+        let generation = self.link_generations.get() + 1;
+        self.link_generations.set(generation);
         self.links.borrow_mut().insert(
             peer,
             LinkState {
                 link: link.clone(),
                 name,
                 told,
+                generation,
             },
         );
         for msg in heard {
@@ -872,8 +886,9 @@ impl Window1Editor {
     }
 
     /// The link to `peer` ended: what its window held is forgotten, and its operations still out have nowhere to be
-    /// answered. The other links carry on as they were. A draft still out in nvim stays: once written it goes to its
-    /// tab if that tab is here by then.
+    /// answered, and so is a view of it still being written (it opens, with no answer). The other links carry on as
+    /// they were. A draft still out in nvim stays: once written it goes to its tab if that tab is here by then, and
+    /// never to a window opened in this one's place.
     pub fn unlinked(&self, peer: PeerId) {
         self.links.borrow_mut().remove(&peer);
         self.plugins.borrow_mut().retain(|_, page| page.peer != peer);
@@ -1001,10 +1016,12 @@ impl Window1Editor {
                         let _ = tx.send(file.write(&text));
                     })
                     .map_err(|e| format!("could not write the scratch file: {e}"))?;
+                let asked_on = self.links.borrow().get(&peer).map(|state| state.generation);
                 self.views.borrow_mut().push(WritingView {
                     rx,
                     token,
                     answer: answer.map(|id| (peer, id)),
+                    asked_on,
                 });
                 self.poll_soon();
                 Ok(())
@@ -1024,11 +1041,13 @@ impl Window1Editor {
                 });
                 match started {
                     Ok(edit) => {
+                        let asked_on = self.links.borrow().get(&peer).map(|state| state.generation);
                         self.drafts.borrow_mut().push(OutDraft {
                             edit,
                             peer,
                             tab,
                             session,
+                            asked_on,
                         });
                         self.poll_soon();
                         Ok(())
@@ -1152,8 +1171,13 @@ impl Window1Editor {
             if let Err(why) = &shown {
                 eprintln!("[link] another window's view was not shown: {why}");
             }
+            // The view opened either way, as a draft still out does; only its answer is tied to the link it came on:
+            // a window opened again under the same peer has ids of its own.
             if let Some((peer, id)) = view.answer {
-                self.send(peer, Msg::EditorShown { id, why: shown.err() });
+                let now = self.links.borrow().get(&peer).map(|state| state.generation);
+                if now == view.asked_on {
+                    self.send(peer, Msg::EditorShown { id, why: shown.err() });
+                }
             }
         }
     }
@@ -1173,11 +1197,13 @@ impl Window1Editor {
             }
             return;
         }
+        // A window opened again under the same peer is not the one that asked: its tab of the same number holds
+        // another chat's draft.
         let gone = self
             .links
             .borrow()
             .get(&draft.peer)
-            .is_none_or(|state| !state.link.linked());
+            .is_none_or(|state| !state.link.linked() || Some(state.generation) != draft.asked_on);
         if gone {
             let window = self.window_text(draft.peer);
             eprintln!(
@@ -1986,14 +2012,16 @@ impl Window2Editor {
     }
 
     /// A draft edit ended in window 1: its end written into the files the panel polls, so its own end of the edit
-    /// takes it as it takes one from its own editor. Found by session first, since a tab's number is this window's.
+    /// takes it as it takes one from its own editor. Found by session; by the tab's number only when neither the
+    /// answer nor the waiting draft has a session, since a draft for one chat must never land in another's.
     fn draft_back(&self, tab: u64, session: Option<&str>, text: &str, end: &DraftEnd, token: Option<String>) {
         let waiting = {
             let mut drafts = self.drafts.borrow_mut();
-            let at = drafts
-                .iter()
-                .position(|d| session.is_some() && d.session.as_deref() == session)
-                .or_else(|| drafts.iter().position(|d| d.tab == tab));
+            let at = drafts.iter().position(|d| match (session, d.session.as_deref()) {
+                (Some(back), Some(out)) => back == out,
+                (None, None) => d.tab == tab,
+                _ => false,
+            });
             at.map(|at| drafts.remove(at))
         };
         let Some(waiting) = waiting else {
@@ -3234,6 +3262,85 @@ mod tests {
 
     /// Window 2's panel hears how a view went only once window 1 has written it and handed it to its editor: a
     /// drive that fails comes back as the failure, a shown view as shown, a link that ends first as the link's end.
+    /// A view of window 2's still being written when it closes opens in window 1's editor, but its answer is not
+    /// sent to the window opened in its place, whose own request may hold the same id.
+    #[test]
+    fn a_view_answer_for_a_window_that_went_does_not_reach_the_one_opened_in_its_place() {
+        let w = windows("view-stale-answer");
+        let drives = Rc::new(Cell::new(0));
+        {
+            let drives = drives.clone();
+            w.one.set_drive(Rc::new(move |_: EditorAct<'_>, _: Option<String>| {
+                drives.set(drives.get() + 1);
+                // The first drive is the old window's view; the replacement's own view is the one that fails.
+                if drives.get() == 1 {
+                    Ok(())
+                } else {
+                    Err("the editor is not ready".to_string())
+                }
+            }));
+        }
+        let mut scratch = ScratchDir::in_dir(w.two.scratch.as_deref().unwrap()).unwrap();
+        let old_view = scratch.prepare_view("Turn 1 notes", "old row").unwrap();
+        let _old_later = w.two.request_answered(&old_view, &|| None).unwrap().unwrap();
+        // Window 2 reads the view and sends it; window 1 takes it and has not yet polled, so the view waits in its list
+        // (the steps are only run while window 1 has registered none).
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while w.two.answers.borrow().is_empty() {
+            assert!(Instant::now() < deadline, "window 2 never sent the view");
+            w.two_link.pump();
+            w.steps.run();
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        let old_ids: Vec<u64> = w.two.answers.borrow().keys().copied().collect();
+        while w.one.views.borrow().is_empty() {
+            assert!(Instant::now() < deadline, "window 1 never took the view");
+            w.one_link.pump();
+            std::thread::sleep(Duration::from_millis(5));
+        }
+
+        // Window 2 closes and is opened again under the same peer, and sends a view of its own before window 1 polls.
+        w.two.unlinked();
+        w.one.unlinked(SECOND_PEER);
+        let (one_link, two_link) = linked_pair();
+        let again_steps = Steps::default();
+        let again = Window2Editor::new(&w.root, w.two.scratch.clone(), again_steps.repeat());
+        again.linked(&two_link);
+        w.one.linked(SECOND_PEER, WindowName::Second, &one_link);
+        let new_view = scratch.prepare_view("Turn 2 notes", "new row").unwrap();
+        let later = again.request_answered(&new_view, &|| None).unwrap().unwrap();
+        while again.answers.borrow().is_empty() {
+            assert!(Instant::now() < deadline, "the new window never sent its view");
+            two_link.pump();
+            again_steps.run();
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        let new_ids: Vec<u64> = again.answers.borrow().keys().copied().collect();
+        assert_eq!(
+            new_ids, old_ids,
+            "the case: the new window's request holds the old one's id"
+        );
+        one_link.pump();
+
+        let got: RefCell<Option<Result<(), String>>> = RefCell::default();
+        assert!(settle(&one_link, &two_link, &w.steps, || {
+            if got.borrow().is_none() {
+                *got.borrow_mut() = later.try_recv().ok();
+            }
+            got.borrow().is_some()
+        }));
+        assert_eq!(
+            got.into_inner(),
+            Some(Err("the editor is not ready".to_string())),
+            "the new window hears how its own view went"
+        );
+        assert_eq!(
+            drives.get(),
+            2,
+            "the old window's view still opened in window 1's editor"
+        );
+    }
+
     #[test]
     fn a_view_from_window_2_is_answered_once_window_1_has_shown_it() {
         let w = windows("view-answers");
@@ -3610,6 +3717,64 @@ mod tests {
         assert!(w.settle(|| driven.borrow().len() > before));
         let ask = driven.borrow()[before].0.clone().unwrap();
         (ask, edit)
+    }
+
+    /// A draft of window 2's still out in nvim when the window closes is not handed to the window opened in its
+    /// place: that window's tab of the same number, editing another chat's draft, keeps it, and its own draft still
+    /// comes back to it.
+    #[test]
+    fn a_draft_from_a_window_that_went_does_not_reach_the_one_opened_in_its_place() {
+        let w = windows("draft-stale");
+        let driven = recording_drive(&w);
+        let mut scratch = ScratchDir::in_dir(w.two.scratch.as_deref().unwrap()).unwrap();
+        let (old_ask, _old) = out_draft(&w, &driven, &mut scratch, "the old chat's draft", 4);
+
+        // Window 2 closes and is opened again under the same peer; its tab 4 holds another chat, whose draft goes out
+        // before the old one is written.
+        w.two.unlinked();
+        w.one.unlinked(SECOND_PEER);
+        let (one_link, two_link) = linked_pair();
+        let again = Window2Editor::new(&w.root, w.two.scratch.clone(), w.steps.repeat());
+        again.linked(&two_link);
+        w.one.linked(SECOND_PEER, WindowName::Second, &one_link);
+        let (request, edit) = scratch.prepare_edit("the new chat's draft").unwrap();
+        let id = edit.id;
+        again.set_draft_tab(Rc::new(move |edit: u64| {
+            (edit == id).then(|| (TabId(4), Some("s-new".to_string())))
+        }));
+        again.request(&request, &|| None).unwrap();
+        assert!(settle(&one_link, &two_link, &w.steps, || driven.borrow().len() == 2));
+        let new_ask = driven.borrow()[1].0.clone().unwrap();
+
+        nvim_writes(&old_ask, "edited for the old chat");
+        assert!(settle(&one_link, &two_link, &w.steps, || w.one.drafts.borrow().len() == 1));
+        pump_a_while(&one_link, &two_link, &w.steps);
+        assert_eq!(
+            edit.poll(),
+            None,
+            "the new window's draft is untouched by the old window's"
+        );
+
+        // An answer for another chat's session never takes this tab's draft by its number.
+        one_link
+            .send(
+                Msg::DraftBack {
+                    tab: 4,
+                    session: Some("s-4".into()),
+                    text: "a stray answer".into(),
+                    end: DraftEnd::Written,
+                    token: None,
+                },
+                Vec::new(),
+            )
+            .unwrap();
+        pump_a_while(&one_link, &two_link, &w.steps);
+        assert_eq!(edit.poll(), None, "a draft is found by its session");
+
+        nvim_writes(&new_ask, "edited for the new chat");
+        assert!(settle(&one_link, &two_link, &w.steps, || edit.poll().is_some()));
+        assert_eq!(edit.poll(), Some(EditDone::Written("edited for the new chat".into())));
+        scratch.cleanup();
     }
 
     #[test]

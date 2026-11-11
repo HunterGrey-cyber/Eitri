@@ -51,6 +51,32 @@ impl ClipboardNotice {
         Some(now + SHOW_FOR)
     }
 
+    /// The notice's text, from host identity, targets and byte totals only; `None` while nothing was written.
+    fn text(&self, pane: u8) -> Option<String> {
+        if self.clipboard.is_none() && self.primary.is_none() {
+            return None;
+        }
+        let targets = [("clipboard", self.clipboard), ("primary", self.primary)]
+            .into_iter()
+            .filter_map(|(target, bytes)| bytes.map(|bytes| format!("{target}: {bytes} bytes")))
+            .collect::<Vec<_>>()
+            .join(", ");
+        Some(format!("Terminal {pane}: OSC 52 wrote {targets}"))
+    }
+
+    /// The text to say elsewhere when the pane goes away with this notice still owed or still on screen: a
+    /// hidden pane's writes that no map ever showed, and a visible pane's notice inside its lifetime. A notice whose
+    /// lifetime is over has been seen and says nothing.
+    pub(super) fn lost_on_close(&self, now: Instant, pane: u8) -> Option<String> {
+        if self
+            .started
+            .is_some_and(|start| now.saturating_duration_since(start) >= SHOW_FOR)
+        {
+            return None;
+        }
+        self.text(pane)
+    }
+
     pub(super) fn ops(&self, now: Instant, pane: u8, cols: u16, rows: u16, colors: TerminalColors) -> Vec<PaintOp> {
         if cols == 0
             || rows == 0
@@ -60,12 +86,9 @@ impl ClipboardNotice {
         {
             return Vec::new();
         }
-        let targets = [("clipboard", self.clipboard), ("primary", self.primary)]
-            .into_iter()
-            .filter_map(|(target, bytes)| bytes.map(|bytes| format!("{target}: {bytes} bytes")))
-            .collect::<Vec<_>>()
-            .join(", ");
-        let text = format!("Terminal {pane}: OSC 52 wrote {targets}");
+        let Some(text) = self.text(pane) else {
+            return Vec::new();
+        };
         let lines = text.len().div_ceil(usize::from(cols)).min(usize::from(rows)) as u16;
         // All text is host-authored ASCII, so byte chunks are also character boundaries.
         text.as_bytes()
@@ -169,6 +192,30 @@ mod tests {
             "Terminal 3: OSC 52 wrote clipboard: 9 bytes, primary: 0 bytes"
         );
         assert_eq!(notice.show(mapped), None);
+    }
+
+    #[test]
+    fn a_notice_owed_when_the_pane_goes_away_is_handed_on_with_the_same_text() {
+        let now = Instant::now();
+        let mut hidden = ClipboardNotice::default();
+        assert_eq!(hidden.lost_on_close(now, 3), None);
+        hidden.record(&write_events(), false, now);
+        let later = now + Duration::from_secs(600);
+        assert_eq!(
+            hidden.lost_on_close(later, 3).as_deref(),
+            Some("Terminal 3: OSC 52 wrote clipboard: 9 bytes")
+        );
+        // A visible pane that wrote and exited in one update has its notice up, and it goes with the pane.
+        let mut visible = ClipboardNotice::default();
+        visible.record(&write_events(), true, now);
+        assert_eq!(
+            visible.lost_on_close(now, 3).as_deref(),
+            Some("Terminal 3: OSC 52 wrote clipboard: 9 bytes")
+        );
+        // One that ran its course was seen.
+        assert_eq!(visible.lost_on_close(now + SHOW_FOR, 3), None);
+        let handed = visible.lost_on_close(now, 3).unwrap();
+        assert!(!handed.contains("secret") && !handed.contains('\0'));
     }
 
     #[test]

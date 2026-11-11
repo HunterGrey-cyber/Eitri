@@ -4040,6 +4040,7 @@ fn build_ui(
         let terminals = Rc::downgrade(&terminals);
         // Weak: the registry holds the panes, and the controller's host holds the registry.
         let driver = Rc::downgrade(&driver);
+        let toast = toast.clone();
         Rc::new(move |id, pane| {
             pane.set_number(id.number());
             {
@@ -4054,6 +4055,10 @@ fn build_ui(
                         }));
                     }
                 });
+            }
+            {
+                let toast = toast.clone();
+                pane.on_clipboard_notice_lost(move |text| toast.show_notice_when_free(text));
             }
             {
                 let id = id.clone();
