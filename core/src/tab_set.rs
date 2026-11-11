@@ -2072,7 +2072,15 @@ impl TabSet {
             Some(backend) => {
                 // The projection's guard is dropped before anything else is read from the backend.
                 let projection = backend.projection();
-                crate::turn_review::named_paths(&projection.tool_calls, &turn_ids)
+                let mut named = crate::turn_review::named_paths(&projection.tool_calls, &turn_ids);
+                if let crate::agent_backend::ProjectionRef::Guarded(guard) = &projection {
+                    for call in guard.evicted_calls() {
+                        named
+                            .paths
+                            .extend(crate::turn_review::named_paths(std::slice::from_ref(call), &turn_ids).paths);
+                    }
+                }
+                named
             }
             None => crate::turn_review::NamedPaths::default(),
         };

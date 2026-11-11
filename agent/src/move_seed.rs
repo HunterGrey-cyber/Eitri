@@ -185,6 +185,10 @@ pub struct ConversationHandoff {
     pub eviction_due: bool,
     #[serde(default)]
     pub archive_id: Option<crate::history::archive::ArchiveId>,
+    #[serde(default)]
+    pub archive_readable_limit: Option<u64>,
+    #[serde(default)]
+    pub background_turns: BTreeSet<String>,
     /// The tools the session was given: wrong, the destination's gate would not know its own tools.
     /// Absent from a record of a build that had none.
     #[serde(default)]

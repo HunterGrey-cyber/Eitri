@@ -1697,6 +1697,8 @@ impl AgentConversation {
             history_tail,
             eviction_due,
             archive_id,
+            archive_readable_limit,
+            background_turns,
         } = ingest;
         let handoff = ConversationHandoff {
             conversation_id: conversation_id.clone(),
@@ -1717,6 +1719,8 @@ impl AgentConversation {
             history_tail,
             eviction_due,
             archive_id,
+            archive_readable_limit,
+            background_turns,
             declared_client_tools: declared_client_tools.clone(),
         };
         Ok((core, handoff))
@@ -1768,6 +1772,8 @@ impl AgentConversation {
             history_tail,
             eviction_due,
             archive_id,
+            archive_readable_limit,
+            background_turns,
             declared_client_tools,
         } = handoff;
         let MovedProvider { agent, external, lease } = provider;
@@ -1807,6 +1813,8 @@ impl AgentConversation {
                     history_tail,
                     eviction_due,
                     archive_id,
+                    archive_readable_limit,
+                    background_turns,
                 },
                 lease,
             },
@@ -3620,9 +3628,26 @@ mod tests {
             reported: "plan".into(),
         });
         wait_for_ingest(&source, 10);
+        // A call the turn leaves running is what makes the turn one whose calls the background count may keep.
+        source.fold_locally(AgentDomainEvent::ToolCallStarted {
+            turn_id: "t1".into(),
+            tool_use_id: "background-1".into(),
+            name: "Bash".into(),
+            input: serde_json::json!({}),
+        });
+        source.fold_locally(turn_completed("t1"));
 
         settled_freeze(&mut source);
         let (core, handoff) = source.freeze_for_move(deliver).unwrap();
+        assert!(handoff.background_turns.contains("t1"));
+        let mut wire = serde_json::to_value(&handoff).unwrap();
+        let handoff: ConversationHandoff = serde_json::from_value(wire.clone()).unwrap();
+        assert!(handoff.background_turns.contains("t1"));
+        wire.as_object_mut().unwrap().remove("background_turns");
+        assert!(serde_json::from_value::<ConversationHandoff>(wire)
+            .unwrap()
+            .background_turns
+            .is_empty());
         let adopted = AgentConversation::adopt_moved(core, handoff, moved_provider(None)).unwrap();
         let (moved, kept) = (adopted.projection(), source.projection());
         assert!(moved.cli_runs_auto(), "the CLI's own auto mode still decides there");

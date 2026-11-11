@@ -12,8 +12,8 @@ it("drops expansions of evicted rows and keeps surviving runs and folded childre
   const state = { ...initialState(), toolCalls: [call(20), call(21), { ...call(30), name: "Agent", children: {
     transcript: [], thinking: [], toolCalls: [call(31)], assistantMessageOpen: false, thinkingOpen: false,
   } }] };
-  expect(pruneExpanded(state, { "t-1": true, "r-2": true, "t-20": true, "r-20": true, "t-31": true }))
-    .toEqual({ "t-20": true, "r-20": true, "t-31": true });
+  expect(pruneExpanded(state, { "t-1": true, "r-2": true, "t-20": true, "r-20": true, "t-31": true, "h:r-2": true }))
+    .toEqual({ "t-20": true, "r-20": true, "t-31": true, "h:r-2": true });
 });
 
 it("clamps a dropped cursor to the first surviving row and follows a surviving key", () => {

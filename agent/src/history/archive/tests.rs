@@ -50,7 +50,7 @@ fn round_trip_every_kind_and_nested_tool_children() {
         json!({"kind":"question","record":{"seq":8,"interaction_id":"ask","questions":[{"question":"which?"}],"state":{"kind":"waiting"}}}),
     ].into_iter().map(|value| serde_json::from_value(value).unwrap()).collect();
     let turn = ArchivedTurn { turn: 42, records };
-    ArchiveWriter::open(&scratch.0, &id)
+    ArchiveWriter::open(&scratch.0, &id, true)
         .unwrap()
         .append(&[turn.clone()])
         .unwrap();
@@ -66,7 +66,7 @@ fn round_trip_every_kind_and_nested_tool_children() {
 fn rotation_retains_four_segments_and_newest_contiguous_turns() {
     let scratch = Scratch::new();
     let id = id();
-    let mut writer = ArchiveWriter::open(&scratch.0, &id).unwrap();
+    let mut writer = ArchiveWriter::open(&scratch.0, &id, true).unwrap();
     // Sparse, newline-filled padding exercises the actual rotation threshold without huge records.
     for n in 0..6 {
         writer.append(&[turn(n, "kept")]).unwrap();
@@ -85,12 +85,12 @@ fn rotation_retains_four_segments_and_newest_contiguous_turns() {
 fn torn_tail_is_truncated_and_next_append_is_a_separate_line() {
     let scratch = Scratch::new();
     let id = id();
-    let mut writer = ArchiveWriter::open(&scratch.0, &id).unwrap();
+    let mut writer = ArchiveWriter::open(&scratch.0, &id, true).unwrap();
     writer.append(&[turn(0, "first")]).unwrap();
     let good_len = writer.bytes;
     writer.file.write_all(b"{\"v\":1,\"turn\":").unwrap();
     drop(writer);
-    let mut writer = ArchiveWriter::open(&scratch.0, &id).unwrap();
+    let mut writer = ArchiveWriter::open(&scratch.0, &id, true).unwrap();
     assert_eq!(writer.bytes, good_len);
     writer.append(&[turn(1, "second")]).unwrap();
     assert_eq!(
@@ -99,10 +99,10 @@ fn torn_tail_is_truncated_and_next_append_is_a_separate_line() {
     );
     let mut other = id.clone();
     other.generation = "0123456789abcdef".into();
-    let mut empty = ArchiveWriter::open(&scratch.0, &other).unwrap();
+    let mut empty = ArchiveWriter::open(&scratch.0, &other, true).unwrap();
     empty.file.write_all(b"no newline").unwrap();
     drop(empty);
-    assert_eq!(ArchiveWriter::open(&scratch.0, &other).unwrap().bytes, 0);
+    assert_eq!(ArchiveWriter::open(&scratch.0, &other, true).unwrap().bytes, 0);
 }
 
 #[test]
@@ -110,7 +110,7 @@ fn oversized_text_is_cut_at_utf8_head_and_turn_survives() {
     let scratch = Scratch::new();
     let id = id();
     let huge = "界".repeat(super::super::HISTORY_MAX_LINE_BYTES);
-    let mut writer = ArchiveWriter::open(&scratch.0, &id).unwrap();
+    let mut writer = ArchiveWriter::open(&scratch.0, &id, true).unwrap();
     writer.append(&[turn(0, &huge)]).unwrap();
     let bytes = std::fs::read(id.path(&writer.dir, 0)).unwrap();
     assert!(bytes.len() <= super::super::HISTORY_MAX_LINE_BYTES + 1);
@@ -126,7 +126,7 @@ fn oversized_text_is_cut_at_utf8_head_and_turn_survives() {
 fn gaps_and_page_caps_keep_whole_newest_turns() {
     let scratch = Scratch::new();
     let id = id();
-    let mut writer = ArchiveWriter::open(&scratch.0, &id).unwrap();
+    let mut writer = ArchiveWriter::open(&scratch.0, &id, true).unwrap();
     writer
         .append(&[turn(0, "old"), turn(2, "界界界"), turn(3, "four"), turn(4, "five")])
         .unwrap();
@@ -144,7 +144,7 @@ fn gaps_and_page_caps_keep_whole_newest_turns() {
 fn retries_keep_last_record_and_skip_malformed_and_unknown_version_lines() {
     let scratch = Scratch::new();
     let id = id();
-    let mut writer = ArchiveWriter::open(&scratch.0, &id).unwrap();
+    let mut writer = ArchiveWriter::open(&scratch.0, &id, true).unwrap();
     writer
         .append(&[turn(0, "old"), turn(1, "next"), turn(0, "replacement")])
         .unwrap();
@@ -165,7 +165,7 @@ fn retries_keep_last_record_and_skip_malformed_and_unknown_version_lines() {
 fn opening_deletes_only_this_sessions_other_generations() {
     let scratch = Scratch::new();
     let id = id();
-    let writer = ArchiveWriter::open(&scratch.0, &id).unwrap();
+    let writer = ArchiveWriter::open(&scratch.0, &id, true).unwrap();
     let dir = writer.dir.clone();
     drop(writer);
     let names = [
@@ -180,7 +180,7 @@ fn opening_deletes_only_this_sessions_other_generations() {
     let old = id.path(&dir, 0);
     let mut new = id.clone();
     new.generation = "0123456789abcdef".into();
-    ArchiveWriter::open(&scratch.0, &new).unwrap();
+    ArchiveWriter::open(&scratch.0, &new, true).unwrap();
     assert!(!old.exists());
     for name in names {
         assert_eq!(std::fs::read(dir.join(name)).unwrap(), b"untouched");
@@ -191,7 +191,7 @@ fn opening_deletes_only_this_sessions_other_generations() {
 fn cancellation_discards_a_page_and_invalid_ids_never_create_files() {
     let scratch = Scratch::new();
     let id = id();
-    ArchiveWriter::open(&scratch.0, &id)
+    ArchiveWriter::open(&scratch.0, &id, true)
         .unwrap()
         .append(&[turn(0, "one")])
         .unwrap();
@@ -202,7 +202,7 @@ fn cancellation_discards_a_page_and_invalid_ids_never_create_files() {
     assert!(ArchiveId::new("c", "../escape").is_err());
     let mut bad = id.clone();
     bad.generation = "../escape".into();
-    assert!(ArchiveWriter::open(&scratch.0, &bad).is_err());
+    assert!(ArchiveWriter::open(&scratch.0, &bad, true).is_err());
     assert!(read_page(&scratch.0, &bad, 1, 10, 100, &AtomicBool::new(false)).is_err());
 }
 
@@ -210,7 +210,7 @@ fn cancellation_discards_a_page_and_invalid_ids_never_create_files() {
 fn write_errors_are_returned_for_the_caller_to_defer_eviction() {
     let scratch = Scratch::new();
     let id = id();
-    let mut writer = ArchiveWriter::open(&scratch.0, &id).unwrap();
+    let mut writer = ArchiveWriter::open(&scratch.0, &id, true).unwrap();
     writer.append(&[turn(0, "kept")]).unwrap();
     let before = std::fs::read(id.path(&writer.dir, 0)).unwrap();
     writer.write_fault = Some((2, false));
@@ -231,7 +231,7 @@ fn write_errors_are_returned_for_the_caller_to_defer_eviction() {
 fn cancellation_after_the_first_line_discards_partial_results() {
     let scratch = Scratch::new();
     let id = id();
-    ArchiveWriter::open(&scratch.0, &id)
+    ArchiveWriter::open(&scratch.0, &id, true)
         .unwrap()
         .append(&[turn(0, "one"), turn(1, "two")])
         .unwrap();
@@ -253,7 +253,7 @@ fn oversized_thinking_reply_and_tool_payloads_remain_readable() {
         serde_json::from_value(json!({"kind":"tool_call","record":{"seq":3,"turn_id":"t","tool_use_id":"call","name":"Read",
             "input":{"text":huge},"result":{"content":"y".repeat(super::super::HISTORY_MAX_LINE_BYTES+1),"is_error":false}}})).unwrap(),
     ];
-    let mut writer = ArchiveWriter::open(&scratch.0, &id).unwrap();
+    let mut writer = ArchiveWriter::open(&scratch.0, &id, true).unwrap();
     writer.append(&[ArchivedTurn { turn: 0, records }]).unwrap();
     let page = read(&scratch.0, &id, 1, 10, PAGE_MAX_CHARS).unwrap();
     assert_eq!(page.turns[0].records.len(), 3);
@@ -284,7 +284,7 @@ fn page_character_ceiling_and_tool_payload_cost_are_enforced() {
     let scratch = Scratch::new();
     let id = id();
     let text = "x".repeat(PAGE_MAX_CHARS / 2 + 1);
-    let mut writer = ArchiveWriter::open(&scratch.0, &id).unwrap();
+    let mut writer = ArchiveWriter::open(&scratch.0, &id, true).unwrap();
     writer.append(&[turn(0, &text), turn(1, &text)]).unwrap();
     assert_eq!(read(&scratch.0, &id, 2, 200, usize::MAX).unwrap().from_turn, 1);
     let record: ArchivedRecord = serde_json::from_value(json!({"kind":"tool_call","record":{
@@ -298,7 +298,7 @@ fn page_character_ceiling_and_tool_payload_cost_are_enforced() {
 fn rotation_keeps_a_line_whole_before_the_segment_boundary() {
     let scratch = Scratch::new();
     let id = id();
-    let mut writer = ArchiveWriter::open(&scratch.0, &id).unwrap();
+    let mut writer = ArchiveWriter::open(&scratch.0, &id, true).unwrap();
     writer.file.set_len(SEGMENT_BYTES - 10).unwrap();
     writer.bytes = SEGMENT_BYTES - 10;
     writer.append(&[turn(0, "whole")]).unwrap();
@@ -312,7 +312,7 @@ fn rotation_keeps_a_line_whole_before_the_segment_boundary() {
 fn an_older_turn_over_budget_is_measured_without_retaining_its_payload() {
     let scratch = Scratch::new();
     let id = id();
-    let mut writer = ArchiveWriter::open(&scratch.0, &id).unwrap();
+    let mut writer = ArchiveWriter::open(&scratch.0, &id, true).unwrap();
     writer
         .append(&[turn(0, &"x".repeat(PAGE_MAX_CHARS)), turn(1, "new")])
         .unwrap();
@@ -324,7 +324,7 @@ fn an_older_turn_over_budget_is_measured_without_retaining_its_payload() {
 fn a_many_turn_page_opens_each_segment_at_most_twice() {
     let scratch = Scratch::new();
     let id = id();
-    let writer = ArchiveWriter::open(&scratch.0, &id).unwrap();
+    let writer = ArchiveWriter::open(&scratch.0, &id, true).unwrap();
     let dir = writer.dir.clone();
     drop(writer);
     let mut expected = Vec::new();
@@ -361,7 +361,7 @@ fn a_many_turn_page_opens_each_segment_at_most_twice() {
 fn rotation_does_not_serve_a_turn_whose_first_segment_was_deleted() {
     let scratch = Scratch::new();
     let id = id();
-    let mut writer = ArchiveWriter::open(&scratch.0, &id).unwrap();
+    let mut writer = ArchiveWriter::open(&scratch.0, &id, true).unwrap();
     let mut large = turn(0, "short prompt");
     for seq in 1..=64 {
         large.records.push(ArchivedRecord::Transcript(TranscriptMessage {
@@ -385,7 +385,7 @@ fn rotation_does_not_serve_a_turn_whose_first_segment_was_deleted() {
 fn cut_children_are_reported_and_last_cut_flag_wins_per_record_key() {
     let scratch = Scratch::new();
     let id = id();
-    let mut writer = ArchiveWriter::open(&scratch.0, &id).unwrap();
+    let mut writer = ArchiveWriter::open(&scratch.0, &id, true).unwrap();
     let tool: ArchivedRecord = serde_json::from_value(json!({"kind":"tool_call","record":{
         "seq":1,"turn_id":"t","tool_use_id":"call","name":"Task","input":null,
         "children":{"transcript":[{"seq":2,"text":"x".repeat(super::super::HISTORY_MAX_LINE_BYTES)}],"thinking":[],"tool_calls":[],"assistant_message_open":false,"thinking_open":false}
@@ -430,7 +430,7 @@ fn cut_children_are_reported_and_last_cut_flag_wins_per_record_key() {
 fn failed_chunk_after_multiple_rotations_restores_start_and_keeps_old_segments() {
     let scratch = Scratch::new();
     let id = id();
-    let mut writer = ArchiveWriter::open(&scratch.0, &id).unwrap();
+    let mut writer = ArchiveWriter::open(&scratch.0, &id, true).unwrap();
     for n in 0..4 {
         writer.append(&[turn(n, "kept")]).unwrap();
         writer.file.set_len(SEGMENT_BYTES - 10).unwrap();
@@ -466,7 +466,7 @@ fn failed_rollback_preserves_original_error_and_repairs_before_next_append() {
     for rotate in [false, true] {
         let scratch = Scratch::new();
         let id = id();
-        let mut writer = ArchiveWriter::open(&scratch.0, &id).unwrap();
+        let mut writer = ArchiveWriter::open(&scratch.0, &id, true).unwrap();
         writer.append(&[turn(0, "kept")]).unwrap();
         if rotate {
             writer.file.set_len(SEGMENT_BYTES - 10).unwrap();
@@ -498,7 +498,7 @@ fn failed_rollback_preserves_original_error_and_repairs_before_next_append() {
 fn metadata_heavy_record_uses_minimal_cut_instead_of_failing_forever() {
     let scratch = Scratch::new();
     let id = id();
-    let mut writer = ArchiveWriter::open(&scratch.0, &id).unwrap();
+    let mut writer = ArchiveWriter::open(&scratch.0, &id, true).unwrap();
     let huge_key = "k".repeat(super::super::HISTORY_MAX_LINE_BYTES + 1);
     let record: ArchivedRecord = serde_json::from_value(json!({"kind":"tool_call","record":{
         "seq":1,"turn_id":"t","tool_use_id":"call","name":"Read","input":null,
@@ -525,4 +525,44 @@ fn metadata_heavy_record_uses_minimal_cut_instead_of_failing_forever() {
     assert!(tool.input.is_null());
     assert!(tool.result.is_none());
     assert!(writer.bytes < super::super::HISTORY_MAX_LINE_BYTES as u64);
+}
+
+#[test]
+fn opening_without_the_session_lease_preserves_other_generations() {
+    let scratch = Scratch::new();
+    let old = id();
+    ArchiveWriter::open(&scratch.0, &old, true)
+        .unwrap()
+        .append(&[turn(0, "original")])
+        .unwrap();
+    let new = id();
+    ArchiveWriter::open(&scratch.0, &new, false)
+        .unwrap()
+        .append(&[turn(1, "second")])
+        .unwrap();
+    assert_eq!(
+        read(&scratch.0, &old, 1, 10, usize::MAX).unwrap().turns,
+        vec![turn(0, "original")]
+    );
+    assert!(new.path(&scratch.0.join("conversation"), 0).exists());
+}
+
+#[test]
+fn vanished_segments_are_harmless_during_open_trim_and_rollback() {
+    let scratch = Scratch::new();
+    let old = id();
+    ArchiveWriter::open(&scratch.0, &old, true).unwrap();
+    BEFORE_REMOVE.with(|hook| *hook.borrow_mut() = Some(Box::new(|path| std::fs::remove_file(path).unwrap())));
+    let new = id();
+    let mut writer = ArchiveWriter::open(&scratch.0, &new, true).unwrap();
+    for k in 1..6 {
+        append_private(&new.path(&writer.dir, k)).unwrap();
+    }
+    BEFORE_REMOVE.with(|hook| *hook.borrow_mut() = Some(Box::new(|path| std::fs::remove_file(path).unwrap())));
+    writer.k = 5;
+    writer.file = append_private(&new.path(&writer.dir, 5)).unwrap();
+    writer.trim(None).unwrap();
+    BEFORE_REMOVE.with(|hook| *hook.borrow_mut() = Some(Box::new(|path| std::fs::remove_file(path).unwrap())));
+    writer.rollback((2, 0)).unwrap();
+    assert_eq!(segments(&writer.dir, &new).unwrap().len(), 1);
 }

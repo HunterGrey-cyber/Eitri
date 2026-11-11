@@ -50,9 +50,13 @@ fn production(text: &str, literals: bool) -> String {
     out
 }
 
-fn mutation(code: &str) -> bool {
+fn mutation(text: &str) -> bool {
+    let code = code_only(text);
     if [
         "write",
+        "copy",
+        "hard_link",
+        "set_len",
         "rename",
         "remove_file",
         "remove_dir",
@@ -64,11 +68,18 @@ fn mutation(code: &str) -> bool {
         "append_private",
     ]
     .iter()
-    .any(|name| calls(code, name) > 0)
+    .any(|name| calls(&code, name) > 0)
     {
         return true;
     }
-    let code = compact(code);
+    let raw = compact(text);
+    if ["rm", "mv", "truncate"]
+        .iter()
+        .any(|cmd| raw.contains(&format!("Command::new(\"{cmd}\")")))
+    {
+        return true;
+    }
+    let code = compact(&code);
     [
         "fs::write",
         "fs::rename",
@@ -76,6 +87,8 @@ fn mutation(code: &str) -> bool {
         "fs::remove_dir",
         "File::create(",
         "OpenOptions",
+        "File::options(",
+        ".append(true)",
         ".write_all(",
         ".write_fmt(",
         ".write_vectored(",
@@ -162,6 +175,24 @@ fn store_name(text: &str) -> bool {
     .any(|token| tokens.contains(token))
 }
 
+fn scan_readers(sources: &[Source]) -> Result<BTreeSet<&str>, String> {
+    let tests = test_only_files(sources);
+    let mut found = BTreeSet::new();
+    for source in sources.iter().filter(|s| !tests.contains(&s.path)) {
+        let code = production(&source.text, false);
+        if !word_ends(&code, "transcript_path").is_empty() || !word_ends(&code, "claude_projects_dir").is_empty() {
+            if !READERS.contains(&source.path.as_str()) {
+                return Err(format!("unreviewed CLI record reader: {}", source.path));
+            }
+            if mutation(&production(&source.text, true)) {
+                return Err(format!("CLI record reader can mutate files: {}", source.path));
+            }
+            found.insert(source.path.as_str());
+        }
+    }
+    Ok(found)
+}
+
 #[test]
 fn cli_record_paths_have_only_the_allowlisted_readers_and_no_mutators() {
     let sources = rust_sources(&[
@@ -178,7 +209,6 @@ fn cli_record_paths_have_only_the_allowlisted_readers_and_no_mutators() {
         "terminal/render/src",
         "terminal/sync/src",
     ]);
-    let tests = test_only_files(&sources);
     require_anchors(
         &sources,
         &[
@@ -188,19 +218,7 @@ fn cli_record_paths_have_only_the_allowlisted_readers_and_no_mutators() {
             "fn resume_external(",
         ],
     );
-    let mut found = BTreeSet::new();
-    for source in sources.iter().filter(|s| !tests.contains(&s.path)) {
-        let code = production(&source.text, false);
-        if !word_ends(&code, "transcript_path").is_empty() || !word_ends(&code, "claude_projects_dir").is_empty() {
-            assert!(
-                READERS.contains(&source.path.as_str()),
-                "unreviewed CLI record reader: {}",
-                source.path
-            );
-            assert!(!mutation(&code), "CLI record reader can mutate files: {}", source.path);
-            found.insert(source.path.as_str());
-        }
-    }
+    let found = scan_readers(&sources).unwrap();
     assert_eq!(
         found,
         READERS.iter().copied().collect(),
@@ -208,7 +226,7 @@ fn cli_record_paths_have_only_the_allowlisted_readers_and_no_mutators() {
     );
     // The parser receives a path rather than constructing it, but belongs to the same read-only surface.
     let parser = read_required("agent/src/history/transcript_jsonl.rs");
-    assert!(!mutation(&production(&parser.text, false)));
+    assert!(!mutation(&production(&parser.text, true)));
 }
 
 #[test]
@@ -305,5 +323,27 @@ fn scan_catches_mutations_and_store_paths_after_tests_and_across_line_breaks() {
         path: "panel/src/new_reader.rs".into(),
         text: "fn f(){agent::transcript::transcript_path(p,s);}".into(),
     };
-    assert!(calls(&production(&extra.text, false), "transcript_path") > 0 && !READERS.contains(&extra.path.as_str()));
+    let mut sources = rust_sources(&["agent/src", "core/src", "panel/src"]);
+    sources.push(extra);
+    assert!(scan_readers(&sources).unwrap_err().contains("panel/src/new_reader.rs"));
+    for operation in [
+        "fs::copy(a,b);",
+        "fs::hard_link(a,b);",
+        "f.append(true);",
+        "File::options();",
+        "set_len(0);",
+        "Command::new(\"rm\");",
+        "Command::new(\"mv\");",
+        "Command::new(\"truncate\");",
+    ] {
+        let text = format!("fn f() {{ transcript_path(p,s); {operation} }}");
+        let source = Source {
+            path: "agent/src/transcript.rs".into(),
+            text,
+        };
+        assert!(
+            scan_readers(&[source]).unwrap_err().contains("can mutate"),
+            "missed {operation}"
+        );
+    }
 }

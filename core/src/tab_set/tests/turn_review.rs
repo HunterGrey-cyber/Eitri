@@ -1044,6 +1044,21 @@ fn settled_attribution_survives_eviction(resync: bool, before_delivery: bool, la
         );
     }
     evict(&set);
+    // Build before the next pump has drained and stored the evicted calls.
+    let pending = set
+        .review_overview_job(tab, TurnRef::N(1), Scope::Turn)
+        .unwrap()
+        .run()
+        .unwrap();
+    assert_eq!(
+        pending
+            .files
+            .iter()
+            .find(|f| f.path == Path::new("old.rs"))
+            .unwrap()
+            .origin,
+        Origin::Agent
+    );
     {
         let p = set.get(tab).unwrap().live().unwrap().projection();
         assert_eq!(agent::projection::turns::Turns::of(&p).count(), 10);

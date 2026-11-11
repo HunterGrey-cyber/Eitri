@@ -8,6 +8,7 @@ use agent::ingestion::ReloadTicket;
 pub(super) struct HistoryReload {
     generation: u64,
     job: Option<Job>,
+    worker: Option<std::thread::JoinHandle<()>>,
     held: Option<(ReloadTicket, String, u64)>,
     cleared: bool,
     released: Option<u64>,
@@ -134,6 +135,18 @@ impl TabSet {
             tab.history.cleared = false;
             return Ok(Some(cleared(tab.id)));
         }
+        if let Some(job) = &tab.history.job {
+            if tab
+                .history_ingest()
+                .is_some_and(|i| i.finish_reload(&job.ticket, true, || {}))
+            {
+                return Ok(None);
+            }
+        }
+        if tab.history.worker.as_ref().is_some_and(|worker| !worker.is_finished()) {
+            return Ok(Some(empty(tab.id, request_id)));
+        }
+        tab.history.worker = None;
         let before = tab.history.held.as_ref().map(|h| h.2);
         let Some(ticket) = tab.history_ingest().and_then(|ingest| ingest.begin_reload(before)) else {
             return Ok(Some(empty(tab.id, request_id)));
@@ -174,11 +187,14 @@ impl TabSet {
                     });
                 }
             });
-        if let Err(error) = worker {
-            if tab.history.held.is_none() {
-                tab.clear_history();
+        match worker {
+            Ok(worker) => tab.history.worker = Some(worker),
+            Err(error) => {
+                if tab.history.held.is_none() {
+                    tab.clear_history();
+                }
+                return Err(error.to_string());
             }
-            return Err(error.to_string());
         }
         tab.history.cleared = false;
         tab.history.job = Some(Job {
@@ -214,13 +230,19 @@ impl TabSet {
                     .history_ingest()
                     .is_some_and(|i| i.finish_reload(ticket, true, || {}))
                 {
-                    let released = if tab.history.held.is_some() {
-                        tab.history_ingest().and_then(|i| i.reload_was_released(ticket))
-                    } else {
-                        None
-                    };
+                    let released = tab.history_ingest().and_then(|i| i.reload_was_released(ticket));
+                    let pending = tab
+                        .history
+                        .job
+                        .as_ref()
+                        .filter(|_| tab.history.held.is_none() && released.is_some())
+                        .map(|j| j.request_id.clone());
                     tab.clear_history();
-                    tab.history.released = released;
+                    tab.history.released = if pending.is_some() { None } else { released };
+                    if let Some(request) = pending {
+                        tab.history.cleared = false;
+                        out.push((tab.view, empty(tab.id, &request)));
+                    }
                 }
             }
             if let Some(job) = &tab.history.job {
@@ -259,13 +281,14 @@ impl TabSet {
                                 },
                             );
                             if !installed {
-                                let released = if history.held.is_some() {
-                                    ingest.reload_was_released(&job.ticket)
-                                } else {
-                                    None
-                                };
+                                let released = ingest.reload_was_released(&job.ticket);
+                                let first_page = history.held.is_none() && released.is_some();
                                 tab.clear_history();
-                                tab.history.released = released;
+                                tab.history.released = if first_page { None } else { released };
+                                if first_page {
+                                    tab.history.cleared = false;
+                                    out.push((tab.view, empty(tab.id, &job.request_id)));
+                                }
                             }
                         }
                     } else if tab.history.held.is_none() {
@@ -351,6 +374,7 @@ mod tests {
             tabs.poll_history();
             tabs.get(id).unwrap().history.held.is_some()
         });
+        until(|| tabs.get(id).unwrap().history.worker.as_ref().unwrap().is_finished());
         serde_json::from_str(&tabs.get(id).unwrap().history.held.as_ref().unwrap().1).unwrap()
     }
     fn hold(tabs: &mut TabSet, id: TabId) -> (mpsc::Receiver<()>, mpsc::Sender<()>) {
@@ -386,6 +410,11 @@ mod tests {
                 result = Some(serde_json::from_str(&payload).unwrap());
             }
             tabs.tabs.iter().all(|t| t.history.job.is_none())
+        });
+        until(|| {
+            tabs.tabs
+                .iter()
+                .all(|t| t.history.worker.as_ref().is_none_or(|w| w.is_finished()))
         });
         result.expect("worker finished without a history reply")
     }
@@ -470,16 +499,20 @@ mod tests {
         entered.recv_timeout(Duration::from_secs(30)).unwrap();
         let flag = tabs.get(id).unwrap().history.job.as_ref().unwrap().cancel.clone();
         tabs.request_history(id, "current", HistoryAction::Older).unwrap();
-        assert!(flag.load(Ordering::SeqCst));
+        assert!(
+            !flag.load(Ordering::SeqCst),
+            "a duplicate leaves the current read running"
+        );
         release.send(()).unwrap();
         let job = tabs.get_mut(id).unwrap().history.job.as_mut().unwrap();
         let mut old = job.rx.recv_timeout(Duration::from_secs(30)).unwrap();
-        old.request_id = "replaced".into();
+        old.request_id = "stale".into();
         let (tx, rx) = mpsc::sync_channel(1);
         tx.send(old).unwrap();
         job.rx = rx;
         assert!(tabs.poll_history().is_empty());
         assert_eq!(tabs.get(id).unwrap().history_payload().unwrap(), first.to_string());
+        until(|| tabs.get(id).unwrap().history.worker.as_ref().unwrap().is_finished());
         tabs.request_history(id, "retry", HistoryAction::Older).unwrap();
         assert_eq!(reply(&mut tabs)["requestId"], "retry");
     }
@@ -551,23 +584,33 @@ mod tests {
     }
 
     #[test]
-    fn newer_request_cancels_worker_and_stale_request_id_is_dropped() {
+    fn stalled_reader_is_unique_across_duplicates_and_latest() {
         let (mut tabs, id, _) = fixture();
         let (entered, release) = hold(&mut tabs, id);
         tabs.request_history(id, "first", HistoryAction::Older).unwrap();
         entered.recv_timeout(Duration::from_secs(30)).unwrap();
         let cancel = tabs.get(id).unwrap().history.job.as_ref().unwrap().cancel.clone();
-        tabs.request_history(id, "second", HistoryAction::Older).unwrap();
+        for _ in 0..20 {
+            assert!(tabs
+                .request_history(id, "duplicate", HistoryAction::Older)
+                .unwrap()
+                .is_none());
+            assert!(Arc::ptr_eq(
+                &cancel,
+                &tabs.get(id).unwrap().history.job.as_ref().unwrap().cancel
+            ));
+        }
+        assert!(!cancel.load(Ordering::SeqCst));
+        tabs.request_history(id, "latest", HistoryAction::Latest).unwrap();
         assert!(cancel.load(Ordering::SeqCst));
+        for _ in 0..20 {
+            let answer = tabs.request_history(id, "busy", HistoryAction::Older).unwrap().unwrap();
+            let wire: serde_json::Value = serde_json::from_str(&answer).unwrap();
+            assert_eq!(wire["empty"], true);
+            assert!(tabs.get(id).unwrap().history.job.is_none());
+        }
         release.send(()).unwrap();
-        let job = tabs.get_mut(id).unwrap().history.job.as_mut().unwrap();
-        let mut reply = job.rx.recv_timeout(Duration::from_secs(30)).unwrap();
-        reply.request_id = "first".into();
-        let (tx, rx) = mpsc::sync_channel(1);
-        tx.send(reply).unwrap();
-        job.rx = rx;
-        assert!(tabs.poll_history().iter().all(|(_, p)| !p.contains("records")));
-        assert!(tabs.get(id).unwrap().history.held.is_none());
+        until(|| tabs.get(id).unwrap().history.worker.as_ref().unwrap().is_finished());
         tabs.request_history(id, "third", HistoryAction::Older).unwrap();
         assert_eq!(loaded(&mut tabs, id)["requestId"], "third");
     }
@@ -698,6 +741,78 @@ mod tests {
             wire["cleared"] == true && wire["reason"] == "released" && wire["turns"] == base + n as u64
         }));
         assert!(tabs.get(id).unwrap().history.held.is_none());
+    }
+
+    #[test]
+    fn polling_during_ceiling_write_keeps_the_page_and_older_replies_until_the_cut_folds() {
+        for abandon in [false, true] {
+            let (mut tabs, id, provider) = fixture();
+            tabs.request_history(id, "held", HistoryAction::Older).unwrap();
+            let page = loaded(&mut tabs, id);
+            let base = tabs.get(id).unwrap().history.held.as_ref().unwrap().0.base;
+            let conversation = tabs.get(id).unwrap().live().unwrap().conversation_id().unwrap();
+            let (entered, release) = agent::ingestion::hold_eviction_write_for_test(conversation);
+            let n = agent::history::history_turns();
+            turns(&provider, n + n / 10 + 1, n);
+            entered.recv_timeout(Duration::from_secs(30)).unwrap();
+            // These are the same reads a window makes while the archive filesystem is stalled.
+            assert!(tabs.poll_history().is_empty());
+            assert_eq!(tabs.get(id).unwrap().history_payload().unwrap(), page.to_string());
+            let answer = tabs
+                .request_history(id, "during", HistoryAction::Older)
+                .unwrap()
+                .unwrap();
+            let answer: serde_json::Value = serde_json::from_str(&answer).unwrap();
+            assert_eq!(answer["empty"], true);
+            assert_eq!(answer["cleared"], serde_json::Value::Null);
+            let (next_pump, resume) = provider.hold_next_pump();
+            if abandon {
+                let AgentBackend::Conversation { conversation, .. } = tabs.get(id).unwrap().live().unwrap() else {
+                    panic!("conversation")
+                };
+                conversation.fold_locally(AgentDomainEvent::EffortReported { effort: None });
+            }
+            release.send(()).unwrap();
+            next_pump.recv_timeout(Duration::from_secs(30)).unwrap();
+            let replies = tabs.poll_history();
+            if abandon {
+                assert!(replies.is_empty());
+                assert_eq!(tabs.get(id).unwrap().history_payload().unwrap(), page.to_string());
+            } else {
+                let wire: serde_json::Value = serde_json::from_str(&replies[0].1).unwrap();
+                assert_eq!(wire["cleared"], true);
+                assert_eq!(wire["reason"], "released");
+                assert_eq!(wire["turns"], base + n as u64);
+            }
+            resume.send(()).unwrap();
+        }
+    }
+
+    #[test]
+    fn first_older_during_ceiling_write_answers_empty_after_the_cut() {
+        let (mut tabs, id, provider) = fixture();
+        let conversation = tabs.get(id).unwrap().live().unwrap().conversation_id().unwrap();
+        let (entered, release) = agent::ingestion::hold_eviction_write_for_test(conversation);
+        let n = agent::history::history_turns();
+        turns(&provider, n + n / 10 + 1, n);
+        entered.recv_timeout(Duration::from_secs(30)).unwrap();
+        let (reading, finish_read) = hold(&mut tabs, id);
+        assert!(tabs
+            .request_history(id, "first-during", HistoryAction::Older)
+            .unwrap()
+            .is_none());
+        reading.recv_timeout(Duration::from_secs(30)).unwrap();
+        let (next_pump, resume) = provider.hold_next_pump();
+        release.send(()).unwrap();
+        next_pump.recv_timeout(Duration::from_secs(30)).unwrap();
+        let replies = tabs.poll_history();
+        finish_read.send(()).unwrap();
+        resume.send(()).unwrap();
+        assert_eq!(replies.len(), 1);
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(&replies[0].1).unwrap(),
+            serde_json::json!({"kind":"history_page", "tab":id.0, "requestId":"first-during", "empty":true})
+        );
     }
 
     #[test]

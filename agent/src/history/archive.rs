@@ -122,28 +122,48 @@ fn segments(dir: &Path, id: &ArchiveId) -> io::Result<Vec<(u64, PathBuf)>> {
     Ok(found)
 }
 
+#[cfg(test)]
+thread_local! {
+    static BEFORE_REMOVE: std::cell::RefCell<Option<Box<dyn FnOnce(&Path)>>> = const { std::cell::RefCell::new(None) };
+}
+
+fn remove_if_present(path: &Path) -> io::Result<()> {
+    #[cfg(test)]
+    BEFORE_REMOVE.with(|hook| {
+        if let Some(hook) = hook.borrow_mut().take() {
+            hook(path);
+        }
+    });
+    match std::fs::remove_file(path) {
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
+        result => result,
+    }
+}
+
 pub struct ArchiveWriter {
     dir: PathBuf,
     id: ArchiveId,
     k: u64,
     file: File,
     bytes: u64,
-    rollback_to: Option<(u64, u64)>,
+    rollback_to: Option<(u64, u64, u64)>,
+    recovered_rollback: Option<u64>,
+    holds_lease: bool,
     #[cfg(test)]
-    write_fault: Option<(usize, bool)>,
+    pub(crate) write_fault: Option<(usize, bool)>,
     #[cfg(test)]
-    fail_rollback: bool,
+    pub(crate) fail_rollback: bool,
 }
 impl ArchiveWriter {
-    pub fn open(history_dir: &Path, id: &ArchiveId) -> io::Result<Self> {
+    pub fn open(history_dir: &Path, id: &ArchiveId, holds_lease: bool) -> io::Result<Self> {
         id.validate()?;
         let dir = history_dir.join(&id.conversation_id);
         crate::private_fs::create_private_dir_all(&dir, history_dir)?;
         for entry in std::fs::read_dir(&dir)? {
             let entry = entry?;
             if let Some((sid, generation, _)) = entry.file_name().to_str().and_then(archive_name) {
-                if sid == id.provider_session_id && generation != id.generation {
-                    std::fs::remove_file(entry.path())?;
+                if holds_lease && sid == id.provider_session_id && generation != id.generation {
+                    remove_if_present(&entry.path())?;
                 }
             }
         }
@@ -177,6 +197,8 @@ impl ArchiveWriter {
             file,
             bytes,
             rollback_to: None,
+            recovered_rollback: None,
+            holds_lease,
             #[cfg(test)]
             write_fault: None,
             #[cfg(test)]
@@ -186,25 +208,41 @@ impl ArchiveWriter {
         Ok(writer)
     }
 
+    /// A failed chunk may still have partial records on disk until rollback succeeds.
+    pub fn is_poisoned(&self) -> bool {
+        self.rollback_to.is_some()
+    }
+
+    /// Earliest turn whose poisoned chunk this writer removed, beyond merely repairing a torn final line.
+    pub(crate) fn recovered_rollback(&self) -> Option<u64> {
+        self.recovered_rollback
+    }
+
     fn trim(&self, rollback_segment: Option<u64>) -> io::Result<()> {
         let found = segments(&self.dir, &self.id)?;
         let mut obsolete: Vec<_> = found.iter().take(found.len().saturating_sub(MAX_SEGMENTS)).collect();
         // Keep the rollback segment until the last fallible removal, so an error can undo the chunk.
         obsolete.sort_by_key(|(k, _)| Some(*k) == rollback_segment);
         for (_, path) in obsolete {
-            std::fs::remove_file(path)?;
+            remove_if_present(&path)?;
         }
         Ok(())
     }
 
     /// Errors, including sync or rotation errors, reach the caller so it can defer unloading turns.
     pub fn append(&mut self, turns: &[ArchivedTurn]) -> io::Result<()> {
-        if let Some(start) = self.rollback_to {
-            self.rollback(start).map_err(|err| {
+        if let Some((k, bytes, turn)) = self.rollback_to {
+            self.rollback((k, bytes)).map_err(|err| {
                 io::Error::new(err.kind(), format!("archive rollback incomplete; reopen writer: {err}"))
             })?;
+            let recovered = self.recovered_rollback.map_or(turn, |old| old.min(turn));
             // Reopening also repairs any torn tail before a fresh chunk can append.
-            *self = Self::open(self.dir.parent().expect("history directory"), &self.id)?;
+            *self = Self::open(
+                self.dir.parent().expect("history directory"),
+                &self.id,
+                self.holds_lease,
+            )?;
+            self.recovered_rollback = Some(recovered);
         }
         let start = (self.k, self.bytes);
         let result = (|| {
@@ -239,7 +277,7 @@ impl ArchiveWriter {
         })();
         if result.is_err() && self.rollback(start).is_err() {
             // Preserve the write error and forbid appending until the whole failed chunk is removed.
-            self.rollback_to = Some(start);
+            self.rollback_to = Some((start.0, start.1, turns.first().map_or(u64::MAX, |turn| turn.turn)));
         }
         result
     }
@@ -253,7 +291,7 @@ impl ArchiveWriter {
         self.bytes = bytes;
         for (segment, path) in segments(&self.dir, &self.id)? {
             if segment > k {
-                std::fs::remove_file(path)?;
+                remove_if_present(&path)?;
             }
         }
         self.file.sync_data()

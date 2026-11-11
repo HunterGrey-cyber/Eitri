@@ -195,6 +195,15 @@ pub fn read_reload(
     )
 }
 
+/// Holds one archive write after disk I/O and before the final eviction check.
+#[cfg(feature = "test-support")]
+#[doc(hidden)]
+pub fn hold_eviction_write_for_test(
+    conversation: &str,
+) -> (std::sync::mpsc::Receiver<()>, std::sync::mpsc::Sender<()>) {
+    eviction::write_gate::arm(conversation)
+}
+
 struct IngestState {
     projection: AgentSessionProjection,
     /// Held for as long as this conversation drives the provider session. Taken on the ingestion
@@ -234,6 +243,9 @@ struct IngestState {
     reload_generation: u64,
     archive_id: Option<crate::history::archive::ArchiveId>,
     archive_writer: Option<crate::history::archive::ArchiveWriter>,
+    archive_readable_limit: Option<u64>,
+    background_turns: std::collections::BTreeSet<String>,
+    eviction_ceiling_logged: bool,
     /// Call trees paired with their eviction event's revision, awaiting a delivery that covers it.
     evicted_calls: VecDeque<(u64, Vec<crate::ToolCallRecord>)>,
     /// The last `SessionOpened` folded and every resume verdict, unavailability or close folded after
@@ -425,6 +437,8 @@ pub(crate) struct IngestHandoff {
     pub(crate) history_tail: crate::history::HistoryParts,
     pub(crate) eviction_due: bool,
     pub(crate) archive_id: Option<crate::history::archive::ArchiveId>,
+    pub(crate) archive_readable_limit: Option<u64>,
+    pub(crate) background_turns: std::collections::BTreeSet<String>,
 }
 
 /// What an adopted conversation's ingest starts from: the rebuilt projection, the move's records it
@@ -434,6 +448,16 @@ pub(crate) struct MovedIngest {
     pub(crate) core: ChatMoveCore,
     pub(crate) state: IngestHandoff,
     pub(crate) lease: Option<SessionLease>,
+}
+
+fn has_unfinished_call_in_turn(calls: &[crate::ToolCallRecord], turn_id: &str) -> bool {
+    calls.iter().any(|call| {
+        (call.turn_id == turn_id && call.result.is_none() && call.denied.is_none())
+            || call
+                .children
+                .as_ref()
+                .is_some_and(|children| has_unfinished_call_in_turn(&children.tool_calls, turn_id))
+    })
 }
 
 impl IngestState {
@@ -471,6 +495,9 @@ impl IngestState {
     fn fold_one(&mut self, event: AgentDomainEvent) {
         if matches!(&event, AgentDomainEvent::ConversationReset { .. }) {
             self.history_tail = Default::default();
+            self.archive_readable_limit = None;
+            self.background_turns.clear();
+            self.eviction_ceiling_logged = false;
             self.reload_held = false;
             self.reload_generation += 1;
         }
@@ -506,6 +533,16 @@ impl IngestState {
         }
         let dropped_child = crate::projection::subagent_frame_exceeds_limits(&self.projection, &event);
         self.projection.apply(&event);
+        match &event {
+            AgentDomainEvent::TurnCompleted { turn_id, .. }
+                if self.projection.background_calls > 0
+                    && has_unfinished_call_in_turn(&self.projection.tool_calls, turn_id) =>
+            {
+                self.background_turns.insert(turn_id.clone());
+            }
+            AgentDomainEvent::BackgroundCalls { running: 0 } => self.background_turns.clear(),
+            _ => {}
+        }
         #[cfg(feature = "test-support")]
         if let Some(log) = &mut self.fold_log {
             log.push((self.projection.last_revision, event.clone()));
@@ -623,6 +660,9 @@ impl IngestState {
             reload_generation: _,
             archive_id,
             archive_writer: _,
+            archive_readable_limit,
+            background_turns,
+            eviction_ceiling_logged: _,
             evicted_calls: _,
             lifecycle_since_open,
             running_turn,
@@ -668,6 +708,8 @@ impl IngestState {
             history_tail: history_tail.clone(),
             eviction_due: *eviction_due,
             archive_id: archive_id.clone(),
+            archive_readable_limit: *archive_readable_limit,
+            background_turns: background_turns.clone(),
         };
         Ok((core, handoff))
     }
@@ -708,6 +750,8 @@ impl IngestState {
             history_tail,
             eviction_due,
             archive_id,
+            archive_readable_limit,
+            background_turns,
         } = state;
         let state = IngestState {
             projection,
@@ -731,6 +775,9 @@ impl IngestState {
             reload_generation: 0,
             archive_id,
             archive_writer: None,
+            archive_readable_limit,
+            background_turns,
+            eviction_ceiling_logged: false,
             evicted_calls: VecDeque::new(),
             lifecycle_since_open,
             running_turn,
@@ -818,6 +865,13 @@ pub struct ConversationIngest {
 pub struct ProjectionGuard<'a> {
     state: MutexGuard<'a, IngestState>,
     holder: &'a GuardHolder,
+}
+
+impl ProjectionGuard<'_> {
+    /// Calls removed from the projection whose attribution delivery has not been handled yet.
+    pub fn evicted_calls(&self) -> impl Iterator<Item = &crate::ToolCallRecord> {
+        self.state.evicted_calls.iter().flat_map(|(_, calls)| calls)
+    }
 }
 
 impl std::ops::Deref for ProjectionGuard<'_> {
@@ -930,6 +984,9 @@ impl ConversationIngest {
             reload_generation: 0,
             archive_id: None,
             archive_writer: None,
+            archive_readable_limit: None,
+            background_turns: Default::default(),
+            eviction_ceiling_logged: false,
             evicted_calls: VecDeque::new(),
             lifecycle_since_open: Vec::new(),
             running_turn: None,
@@ -1051,7 +1108,9 @@ impl ConversationIngest {
     pub fn begin_reload(&self, before: Option<u64>) -> Option<ReloadTicket> {
         let mut st = self.lock_state("begin_reload");
         let base = st.projection.evicted.as_ref()?.turns;
-        let before = before.unwrap_or(base);
+        let before = before
+            .unwrap_or(base)
+            .min(st.archive_readable_limit.unwrap_or(u64::MAX));
         if before == 0 || before > base {
             return None;
         }
@@ -1594,6 +1653,9 @@ fn detach_for_reset(guard: &mut IngestState, session_id: &Mutex<Option<String>>)
     guard.reload_generation += 1;
     guard.archive_id = None;
     guard.archive_writer = None;
+    guard.archive_readable_limit = None;
+    guard.background_turns.clear();
+    guard.eviction_ceiling_logged = false;
     guard.evicted_calls.clear();
     let lease = guard.lease.take();
     let provider_session_id = old?;
@@ -3247,6 +3309,9 @@ pub(crate) mod tests {
             reload_generation: 0,
             archive_id: None,
             archive_writer: None,
+            archive_readable_limit: None,
+            background_turns: Default::default(),
+            eviction_ceiling_logged: false,
             evicted_calls: VecDeque::new(),
             lifecycle_since_open: Vec::new(),
             running_turn: None,
@@ -3276,7 +3341,7 @@ pub(crate) mod tests {
                 })],
             })
             .collect();
-        ArchiveWriter::open(&crate::state_dirs::history_dir().unwrap(), &id)
+        ArchiveWriter::open(&crate::state_dirs::history_dir().unwrap(), &id, true)
             .unwrap()
             .append(&turns)
             .unwrap();

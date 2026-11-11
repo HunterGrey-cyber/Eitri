@@ -888,6 +888,14 @@ impl WriterShared {
     }
 }
 
+struct WakeFinished<'a>(&'a WriterShared);
+impl Drop for WakeFinished<'_> {
+    fn drop(&mut self) {
+        self.0.lock().waking = false;
+        self.0.changed.notify_all();
+    }
+}
+
 /// One thread that runs the window's saves, in order, the newest pending job replacing an older pending one:
 /// the state file is read, decoded and written there, never on the UI thread, which only copies what a save
 /// needs. When a job finishes the thread tells the waker it was given, and the UI thread takes the result
@@ -958,11 +966,11 @@ impl LayoutWriter {
             }
             // Cloned out first, so the waker never runs with the lock held.
             let waker = shared.waker.lock().unwrap_or_else(|e| e.into_inner()).clone();
+            let wake_finished = WakeFinished(shared);
             if let Some(waker) = waker {
-                waker.wake();
+                let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| waker.wake()));
             }
-            shared.lock().waking = false;
-            shared.changed.notify_all();
+            drop(wake_finished);
         }
     }
 
@@ -3109,6 +3117,34 @@ mod tests {
         saver.collect(None);
         assert!(saver.holds(&layout, &workspaces));
         assert_eq!(saver.writes(), 1);
+    }
+
+    #[test]
+    fn a_panicking_completion_wake_releases_flush_and_allows_later_writes() {
+        struct PanicWake;
+        impl Waker for PanicWake {
+            fn wake(&self) {
+                panic!("injected wake failure");
+            }
+        }
+        let dir = agent::state_dirs::test_workspace_dir("layout-panic-wake");
+        let mut layout = first_launch_layout(&[]).unwrap();
+        let workspaces = Workspaces::single();
+        let mut saver = Saver::new(Some(dir), root(), Vec::new(), None, &layout, &workspaces);
+        saver.set_waker(Arc::new(PanicWake));
+        for visible in [true, false] {
+            if visible {
+                layout.show(&ModuleId::terminal()).unwrap();
+            } else {
+                crate::layout::hide(&mut layout, &ModuleId::terminal(), &frame()).unwrap();
+            }
+            assert!(saver.submit_now(&layout, &workspaces));
+            assert!(saver.writer.flush(Duration::from_secs(10)));
+            assert!(!saver.writer.shared.lock().waking);
+            saver.collect(None);
+            assert!(saver.holds(&layout, &workspaces));
+        }
+        assert_eq!(saver.writes(), 2);
     }
 
     #[test]

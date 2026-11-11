@@ -1,37 +1,75 @@
 use super::*;
 use crate::history::archive::{ArchiveId, ArchiveWriter, ArchivedRecord, ArchivedTurn};
 use crate::projection::{turns::Turns, QuestionState, TaskStatus, ToolCallRecord};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::Path;
 
-fn ready(state: &mut IngestState, budget: usize) -> bool {
-    if state.reload_held && Turns::of(&state.projection).count() as usize >= budget.saturating_mul(2) {
-        state.reload_held = false;
-        state.reload_generation += 1;
+fn ready(state: &mut IngestState, budget: usize) -> (bool, Option<String>) {
+    let mut warning = None;
+    let ceiling = Turns::of(&state.projection).count() as usize >= budget.saturating_mul(2);
+    let p = &state.projection;
+    let blockers = [
+        (p.opening_prompt.is_some(), "opening prompt"),
+        (!p.open_client_calls.is_empty(), "open client calls"),
+        (
+            p.questions
+                .iter()
+                .any(|q| !matches!(q.state, QuestionState::Settled { .. })),
+            "waiting/answering question",
+        ),
+    ];
+    if ceiling && !state.eviction_ceiling_logged && blockers.iter().any(|(blocked, _)| *blocked) {
+        let names: Vec<_> = blockers
+            .iter()
+            .filter(|(blocked, _)| *blocked)
+            .map(|(_, name)| *name)
+            .collect();
+        warning = Some(format!(
+            "agent: history at twice its turn budget; eviction deferred by {}",
+            names.join(", ")
+        ));
+        state.eviction_ceiling_logged = true;
+    } else if !ceiling {
+        state.eviction_ceiling_logged = false;
     }
     let p = &state.projection;
-    p.is_settled()
+    let eligible = p.is_settled()
         && state.running_turn.is_none()
         && p.opening_prompt.is_none()
         && p.open_client_calls.is_empty()
         && p.questions
             .iter()
             .all(|q| matches!(q.state, QuestionState::Settled { .. }))
-        && !state.reload_held
+        && (!state.reload_held || ceiling);
+    (eligible, warning)
 }
 
-fn running_background(call: &ToolCallRecord, roster: &BTreeMap<&str, bool>) -> bool {
+fn running_background(
+    call: &ToolCallRecord,
+    roster: &BTreeMap<&str, bool>,
+    background_turns: &BTreeSet<String>,
+) -> bool {
     // A roster outcome is authoritative even when a synthetic launcher never receives a result.
-    roster
-        .get(call.tool_use_id.as_str())
-        .copied()
-        .unwrap_or(call.background && call.result.is_none())
+    (background_turns.contains(&call.turn_id) && call.result.is_none() && call.denied.is_none())
+        || roster
+            .get(call.tool_use_id.as_str())
+            .copied()
+            .unwrap_or(call.background && call.result.is_none())
         || call.children.as_ref().is_some_and(|children| {
             children
                 .tool_calls
                 .iter()
-                .any(|child| running_background(child, roster))
+                .any(|child| running_background(child, roster, background_turns))
         })
+}
+
+fn collect_call_turns<'a>(calls: &'a [ToolCallRecord], turns: &mut BTreeSet<&'a str>) {
+    for call in calls {
+        turns.insert(&call.turn_id);
+        if let Some(children) = &call.children {
+            collect_call_turns(&children.tool_calls, turns);
+        }
+    }
 }
 
 pub(super) fn flush_eviction(
@@ -40,11 +78,18 @@ pub(super) fn flush_eviction(
     context: &AdoptionContext,
     budget: usize,
 ) -> bool {
-    {
+    let (eligible, warning) = {
         let mut st = state.lock().unwrap();
-        if !st.eviction_due || st.eviction_retry || !ready(&mut st, budget) {
+        if !st.eviction_due || st.eviction_retry {
             return false;
         }
+        ready(&mut st, budget)
+    };
+    if let Some(warning) = warning {
+        eprintln!("{warning}");
+    }
+    if !eligible {
+        return false;
     }
     // Resolving the directory can touch the filesystem, so it belongs outside the state lock too.
     flush_in(
@@ -65,21 +110,25 @@ pub(super) fn flush_in(
     directory: std::io::Result<std::path::PathBuf>,
     after_write: impl FnOnce(),
 ) -> bool {
-    let (revision, count, cut, through_seq, absolute, lifted, expired, records, id, mut writer) = {
+    let mut warning = None;
+    let copied = (|| {
         let mut st = state.lock().unwrap();
-        if !st.eviction_due || st.eviction_retry || !ready(&mut st, budget) {
-            return false;
+        if !st.eviction_due || st.eviction_retry {
+            return None;
+        }
+        let (eligible, message) = ready(&mut st, budget);
+        warning = message;
+        if !eligible {
+            return None;
         }
         let p = &st.projection;
         let turns = Turns::of(p);
         let count = turns.count() as usize;
         if count <= budget + (budget / 10).max(1) {
             st.eviction_due = false;
-            return false;
+            return None;
         }
-        let Some(sid) = read_session_id(session_id) else {
-            return false;
-        };
+        let sid = read_session_id(session_id)?;
         let cut = count - budget;
         let through_seq = turns.starts[cut];
         let mut roster = BTreeMap::new();
@@ -88,10 +137,16 @@ pub(super) fn flush_in(
                 *roster.entry(id).or_insert(false) |= row.status == TaskStatus::Running;
             }
         }
+        let empty_turns = BTreeSet::new();
+        let background_turns = if context.provider_name == "claude" {
+            &empty_turns
+        } else {
+            &st.background_turns
+        };
         let lifted: Vec<_> = p
             .tool_calls
             .iter()
-            .filter(|call| call.seq < through_seq && running_background(call, &roster))
+            .filter(|call| call.seq < through_seq && running_background(call, &roster, background_turns))
             .map(|call| call.seq)
             .collect();
         // Finished trees lifted by earlier cuts leave no archive row, but still carry edit attribution.
@@ -136,7 +191,7 @@ pub(super) fn flush_in(
             st.archive_id = ArchiveId::new(&context.conversation_id, &sid).ok();
         }
         st.eviction_retry = true;
-        (
+        Some((
             revision,
             count,
             cut,
@@ -146,8 +201,17 @@ pub(super) fn flush_in(
             expired,
             records,
             st.archive_id.clone(),
+            st.lease.is_some(),
             st.archive_writer.take(),
-        )
+        ))
+    })();
+    if let Some(warning) = warning {
+        eprintln!("{warning}");
+    }
+    let Some((revision, count, cut, through_seq, absolute, lifted, expired, records, id, holds_lease, mut writer)) =
+        copied
+    else {
+        return false;
     };
     let written = (|| -> std::io::Result<()> {
         let dir: &Path = directory.as_ref().map_err(|e| std::io::Error::other(e.to_string()))?;
@@ -155,31 +219,75 @@ pub(super) fn flush_in(
             .as_ref()
             .ok_or_else(|| std::io::Error::other("archive identity unavailable"))?;
         if writer.is_none() {
-            writer = Some(ArchiveWriter::open(dir, id)?);
+            writer = Some(ArchiveWriter::open(dir, id, holds_lease)?);
         }
         writer.as_mut().unwrap().append(&records)
     })();
+    let poisoned = writer.as_ref().is_some_and(ArchiveWriter::is_poisoned);
+    let recovered = writer.as_ref().and_then(ArchiveWriter::recovered_rollback);
     after_write();
+    #[cfg(feature = "test-support")]
+    write_gate::hold(&context.conversation_id);
     let mut st = state.lock().unwrap();
     // A reset owns a new archive generation; never put the old writer back into it.
     if st.archive_id == id {
         st.archive_writer = writer;
+        // Successful append completes any pending rollback before writing the new chunk.
+        if written.is_ok()
+            && !poisoned
+            && recovered
+                .zip(st.archive_readable_limit)
+                .is_some_and(|(from, limit)| from <= limit)
+        {
+            st.archive_readable_limit = None;
+        }
     }
-    if st.projection.last_revision != revision || !ready(&mut st, budget) {
+    if st.projection.last_revision != revision {
+        return false;
+    }
+    let (eligible, warning) = ready(&mut st, budget);
+    if !eligible {
+        drop(st);
+        if let Some(warning) = warning {
+            eprintln!("{warning}");
+        }
         return false;
     }
     let lost = written.err();
     if lost.is_some() {
         if count < budget.saturating_mul(2) {
+            drop(st);
+            if let Some(warning) = warning {
+                eprintln!("{warning}");
+            }
             return false;
         }
         st.stats.lost_history_turns += cut as u64;
+        if poisoned {
+            let limit = absolute - cut as u64;
+            st.archive_readable_limit = Some(st.archive_readable_limit.map_or(limit, |old| old.min(limit)));
+        }
+    }
+    if st.reload_held {
+        st.reload_held = false;
+        st.reload_generation += 1;
     }
     st.fold(AgentDomainEvent::HistoryEvicted {
         through_seq,
         turns: absolute,
         lifted,
     });
+    {
+        let IngestState {
+            projection,
+            background_turns,
+            ..
+        } = &mut *st;
+        // Only calls still held by the projection can need the count fallback after a cut.
+        let mut retained_turns = BTreeSet::new();
+        collect_call_turns(&projection.tool_calls, &mut retained_turns);
+        background_turns.retain(|turn| retained_turns.contains(turn.as_str()));
+    }
     let mut removed = crate::history::HistoryParts::default();
     removed.tool_calls.extend(expired);
     for record in records.into_iter().flat_map(|turn| turn.records) {
@@ -203,7 +311,11 @@ pub(super) fn flush_in(
     history_tail.trim(crate::history::store::HistoryView::of(projection));
     st.queue_evicted_calls(calls);
     st.eviction_due = false;
+    st.eviction_ceiling_logged = false;
     drop(st);
+    if let Some(warning) = warning {
+        eprintln!("{warning}");
+    }
     if let Some(error) = lost {
         eprintln!("agent: archive write failed; {cut} earlier turns lost: {error}");
     }
@@ -215,3 +327,29 @@ mod tests;
 
 #[cfg(test)]
 mod record_tests;
+
+#[cfg(feature = "test-support")]
+pub(super) mod write_gate {
+    use std::sync::{mpsc, Mutex, OnceLock};
+    type Gate = (mpsc::SyncSender<()>, mpsc::Receiver<()>);
+    static GATES: OnceLock<Mutex<std::collections::HashMap<String, Gate>>> = OnceLock::new();
+
+    pub fn arm(conversation: &str) -> (mpsc::Receiver<()>, mpsc::Sender<()>) {
+        let (entered, wait) = mpsc::sync_channel(1);
+        let (release, gate) = mpsc::channel();
+        GATES
+            .get_or_init(Mutex::default)
+            .lock()
+            .unwrap()
+            .insert(conversation.into(), (entered, gate));
+        (wait, release)
+    }
+
+    pub(super) fn hold(conversation: &str) {
+        let gate = GATES.get_or_init(Mutex::default).lock().unwrap().remove(conversation);
+        if let Some((entered, release)) = gate {
+            let _ = entered.send(());
+            let _ = release.recv_timeout(std::time::Duration::from_secs(30));
+        }
+    }
+}

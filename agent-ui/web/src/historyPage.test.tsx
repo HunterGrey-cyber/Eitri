@@ -225,6 +225,37 @@ it("expanding an archived run keeps the cursor on its first tool", () => {
   press(container, "Enter");
   expect(container.querySelector(".row-current")?.getAttribute("data-row-key")).toBe("h:t-2");
 });
+it("keeps an archived run expanded across snapshots and later eviction boundaries", () => {
+  const { container } = live();
+  toolPage(); press(container, "g"); press(container, "g"); press(container, "j"); press(container, "j"); pause();
+  press(container, "Enter");
+  expect(keys(container)).toContain("h:t-3");
+  for (const throughSeq of [40, 44]) {
+    dispatch({ kind: "snapshot", tab: 1, throughRevision: throughSeq, state: { ...initialState(), status: { kind: "running" },
+      evicted: { throughSeq, turns: 3 }, userPrompts: [{ seq: 44, text: "live prompt" }] } });
+    expect(keys(container)).toContain("h:t-3");
+    expect(keys(container)).not.toContain("h:r-2");
+  }
+});
+it.each(["cleared", "released", "reset", "switch", "batched clear"])("drops archived expansion keys after %s before reloading a colliding page", (how) => {
+  const { container } = live();
+  toolPage(); press(container, "g"); press(container, "g"); press(container, "j"); press(container, "j"); pause();
+  press(container, "Enter");
+  expect(keys(container)).toContain("h:t-3");
+  if (how === "cleared") clear();
+  if (how === "released") dispatch({ kind: "history_page", tab: 1, cleared: true, reason: "released", turns: 3 });
+  if (how === "reset") dispatch({ kind: "events", tab: 1, events: [{ type: "conversation_reset", new_conversation_id: "new", trigger: null }] });
+  if (how === "switch") {
+    for (const active of [2, 1]) dispatch({ kind: "tabs", active, tabs: [1, 2].map((id) => ({
+      id, number: id, label: `${id}`, state: "live", mode: "auto", pending: 0, resumable: true,
+    })) });
+    dispatch({ kind: "snapshot", tab: 1, throughRevision: 20, state: { ...initialState(), status: { kind: "running" } } });
+  }
+  if (how === "batched clear") act(() => { clear(); toolPage(); });
+  else toolPage();
+  expect(keys(container)).toContain("h:r-2");
+  expect(keys(container)).not.toContain("h:t-3");
+});
 it("zc on an archived tool closes its archived run and follows the cursor", () => {
   const { container } = live();
   toolPage(); press(container, "g"); press(container, "g"); press(container, "j"); press(container, "j"); pause();

@@ -501,7 +501,7 @@ export default function App() {
     return {
       cursor: cursorRef.current,
       mode: modeRef.current,
-      expanded: expandedRef.current,
+      expanded: Object.fromEntries(Object.entries(expandedRef.current).filter(([key]) => !key.startsWith("h:"))),
       scrollTop: list?.scrollTop ?? 0,
       atBottom,
       detailed: detailedRef.current,
@@ -529,6 +529,10 @@ export default function App() {
    *  the region never arms `"z"`/`"["`/`"]"`, which stay BROWSE-only. */
   const regionPendingGRef = useRef<PendingPrefix | null>(null);
   const [historyPage, setHistoryPage] = useState<HistoryPage | null>(null);
+  const clearHistoryPage = () => {
+    setHistoryPage(null);
+    setExpanded((held) => Object.fromEntries(Object.entries(held).filter(([key]) => !key.startsWith("h:"))));
+  };
   const requestHistory = (action: "older" | "latest") => {
     const tab = activeTabRef.current;
     if (tab === null) return;
@@ -1799,7 +1803,7 @@ export default function App() {
     if (state.evicted === null) return;
     setExpanded((held) => pruneExpanded(state, held, thinkingDisplay));
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [state.evicted]);
+  }, [state.evicted?.throughSeq]);
   /** For the dispatch handler (installed once), as `cursorRef`: the park names the cursor's row by key. */
   const timelineRef = useRef(timeline);
   timelineRef.current = timeline;
@@ -2817,7 +2821,7 @@ export default function App() {
         if ("empty" in payload) {
           showFlash("No older turns could be loaded.");
         } else if ("cleared" in payload) {
-          setHistoryPage(null);
+          clearHistoryPage();
           if (payload.reason === "released") {
             showFlash(`The loaded page was released to make room; ${payload.turns} earlier turn${payload.turns === 1 ? "" : "s"} not loaded.`);
           }
@@ -2826,8 +2830,8 @@ export default function App() {
         }
         return;
       }
-      if (payload.kind === "tabs" && payload.active !== activeTabRef.current) setHistoryPage(null);
-      if (payload.kind === "events" && payload.events.some((event) => event.type === "conversation_reset")) setHistoryPage(null);
+      if (payload.kind === "tabs" && payload.active !== activeTabRef.current) clearHistoryPage();
+      if (payload.kind === "events" && payload.events.some((event) => event.type === "conversation_reset")) clearHistoryPage();
       const receivedAt = performance.now();
       const previousPage = pageRef.current;
       const nextPage = pageModel(previousPage, { ...payload, receivedAt: Date.now(), monotonicAt: receivedAt });

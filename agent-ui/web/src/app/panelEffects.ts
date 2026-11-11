@@ -18,7 +18,7 @@ export function pruneExpanded(state: AgentUiState, expanded: Record<string, bool
     ...buildDisplay(raw, { expanded: {}, detailed: false, turnRunning: state.activeTurnId !== null, thinking }),
     ...buildDisplay(raw, { expanded, detailed: true, turnRunning: state.activeTurnId !== null, thinking }),
   ].map((row) => row.key));
-  return Object.fromEntries(Object.entries(expanded).filter(([key]) => keys.has(key)));
+  return Object.fromEntries(Object.entries(expanded).filter(([key]) => key.startsWith("h:") || keys.has(key)));
 }
 
 /* The cursor is an index into `timeline`, which shrinks on its own -- a permission card resolving
