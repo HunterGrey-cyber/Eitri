@@ -54,6 +54,6 @@ it("shows a single plain desk line below the restore notice, outside timeline in
   rerender(list({ ...state, evicted: { throughSeq: 4, turns: 0 } }));
   expect(container.querySelectorAll(".history-notice")).toHaveLength(1);
   rerender(list(state, true));
-  expect(container.textContent).not.toContain("1 earlier turn not loaded.");
+  expect(container.textContent).toContain("1 earlier turn not loaded.");
 });
 

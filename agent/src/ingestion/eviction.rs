@@ -180,18 +180,27 @@ pub(super) fn flush_in(
         turns: absolute,
         lifted,
     });
-    let calls = expired
-        .into_iter()
-        .chain(
-            records
-                .into_iter()
-                .flat_map(|turn| turn.records)
-                .filter_map(|record| match record {
-                    ArchivedRecord::ToolCall(call) => Some(call),
-                    _ => None,
-                }),
-        )
-        .collect();
+    let mut removed = crate::history::HistoryParts::default();
+    removed.tool_calls.extend(expired);
+    for record in records.into_iter().flat_map(|turn| turn.records) {
+        match record {
+            ArchivedRecord::UserPrompt(r) => removed.user_prompts.push(r),
+            ArchivedRecord::Transcript(r) => removed.transcript.push(r),
+            ArchivedRecord::ToolCall(r) => removed.tool_calls.push(r),
+            ArchivedRecord::TurnStart(r) => removed.turn_starts.push(r),
+            ArchivedRecord::Notice(r) => removed.notices.push(r),
+            ArchivedRecord::Question(r) => removed.questions.push(r),
+            ArchivedRecord::Thinking(_) | ArchivedRecord::TurnEnding(_) => {}
+        }
+    }
+    let calls = removed.tool_calls.clone();
+    st.history_tail.extend(removed);
+    let IngestState {
+        history_tail,
+        projection,
+        ..
+    } = &mut *st;
+    history_tail.trim(crate::history::store::HistoryView::of(projection));
     st.queue_evicted_calls(calls);
     st.eviction_due = false;
     drop(st);
@@ -203,3 +212,6 @@ pub(super) fn flush_in(
 
 #[cfg(test)]
 mod tests;
+
+#[cfg(test)]
+mod record_tests;

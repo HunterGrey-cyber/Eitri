@@ -54,6 +54,7 @@ type Props = {
    *  built here from the same three props. */
   timeline?: TimelineItem[];
   historyFromTurn?: number;
+  historyToTurn?: number;
   onHistoryOlder?: () => void;
   /** `Ctrl+o`: every result shown in full, at wider cuts, with no collapsed runs. Per tab
    *  (`App.tsx`'s `TabViewState.detailed`); defaults to `false`, the state every fresh tab starts
@@ -281,6 +282,7 @@ export function MessageList({
   tab = null,
   state,
   historyFromTurn,
+  historyToTurn,
   onHistoryOlder,
   turnDurations = NO_TURN_DURATIONS,
   sessionEnded,
@@ -959,13 +961,16 @@ export function MessageList({
           // The desk's notice copies the desk's file path to the desk's own selection; the phone only reads it.
           ? <div className="history-notice"><span>{historyNoticeText(state.history)}</span></div>
           : <DeskHistoryNotice notice={state.history} />)}
-        {!touch && import.meta.env.EITRI_PHONE_PAGE !== true && (historyFromTurn ?? state.evicted?.turns ?? 0) > 0 &&
-          <div className="history-notice" data-nav-stop="notice">
-            {onHistoryOlder
+        {(historyFromTurn ?? state.evicted?.turns ?? 0) > 0 &&
+          <div className="history-notice" data-nav-stop={!touch && import.meta.env.EITRI_PHONE_PAGE !== true ? "notice" : undefined}>
+            {!touch && import.meta.env.EITRI_PHONE_PAGE !== true && onHistoryOlder
               ? <button className="history-load" onClick={onHistoryOlder}>{earlierTurnsText(historyFromTurn ?? state.evicted!.turns)}</button>
               : <span>{earlierTurnsText(historyFromTurn ?? state.evicted!.turns)}</span>}
           </div>}
-        {timeline.map((item, index) => {
+        {timeline.flatMap((item, index) => {
+          const newer = Math.max(0, (state.evicted?.turns ?? 0) - (historyToTurn ?? state.evicted?.turns ?? 0));
+          const gap = newer > 0 && !item.key.startsWith("h:") && (index === 0 || timeline[index - 1].key.startsWith("h:"))
+            ? <div key="history-gap" className="history-notice history-gap">{newer} newer {newer === 1 ? "turn" : "turns"} not loaded.</div> : null;
           // Everything a row draws is in these props, each a value or the timeline's own item, so a
           // cursor move renders the two rows it changes and no other (`TimelineRow`).
           const historical = item.key.startsWith("h:");
@@ -1006,7 +1011,7 @@ export function MessageList({
           const held = heldRows.get(item);
           if (held !== undefined && held.footer === footer && held.cutBytes === cutBytes && held.waiting === waiting &&
             held.foldsRun === foldsRun && sameRowProps(held.props, props)) {
-            return held.element;
+            return [gap, held.element];
           }
           const row = <TimelineRow {...props} />;
           const element = (
@@ -1042,7 +1047,7 @@ export function MessageList({
             </Fragment>
           );
           heldRows.set(item, { props, footer, cutBytes, waiting, foldsRun, element });
-          return element;
+          return [gap, element];
         })}
         {after}
         </TouchRows.Provider>

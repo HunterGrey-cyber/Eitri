@@ -1694,6 +1694,7 @@ impl AgentConversation {
             pending_name,
             record_written,
             history_dirty,
+            history_tail,
             eviction_due,
             archive_id,
         } = ingest;
@@ -1713,6 +1714,7 @@ impl AgentConversation {
             pending_name: pending_name.map(|name| PendingName { name }),
             record_written,
             history_dirty,
+            history_tail,
             eviction_due,
             archive_id,
             declared_client_tools: declared_client_tools.clone(),
@@ -1763,6 +1765,7 @@ impl AgentConversation {
             pending_name,
             record_written,
             history_dirty,
+            history_tail,
             eviction_due,
             archive_id,
             declared_client_tools,
@@ -1801,6 +1804,7 @@ impl AgentConversation {
                     pending_name: pending_name.map(|pending| pending.name),
                     record_written,
                     history_dirty,
+                    history_tail,
                     eviction_due,
                     archive_id,
                 },
@@ -1954,6 +1958,130 @@ mod tests {
         }
         fn pumped_through(&self) -> Option<u64> {
             *self.wire_pumped.lock().unwrap()
+        }
+    }
+
+    #[test]
+    fn display_eviction_and_saves_preserve_cli_records_and_send_only_driven_turns() {
+        let root = crate::test_tmp::TmpDir::in_dir(
+            &crate::state_dirs::test_workspace_dir("cli-record-preservation"),
+            "cli",
+            "records",
+        );
+        let transcript = root.join("session.jsonl");
+        let mut bytes = Vec::new();
+        for n in 0..35 {
+            for line in [
+                serde_json::json!({"type":"user", "uuid":format!("u-{n}"), "version":"2.1.272",
+                    "promptSource":"typed", "message":{"role":"user", "content":format!("old prompt {n}")}}),
+                serde_json::json!({"type":"assistant", "uuid":format!("a-{n}"), "version":"2.1.272",
+                    "message":{"role":"assistant", "content":[{"type":"text", "text":format!("old reply {n}")}]}}),
+            ] {
+                bytes.extend(serde_json::to_vec(&line).unwrap());
+                bytes.push(b'\n');
+            }
+        }
+        std::fs::write(&transcript, &bytes).unwrap();
+        for name in ["claude", "codex", "acp-test"] {
+            let id = uuid::Uuid::new_v4().simple().to_string();
+            let seed = if name == "claude" {
+                let seed = crate::history::load::seed_from(Ok(transcript.clone()), &id, "session");
+                assert_eq!(seed.user_prompts.len(), 35);
+                assert_eq!(
+                    seed.history.as_ref().unwrap().source,
+                    crate::projection::HistorySource::ClaudeTranscript
+                );
+                seed
+            } else {
+                crate::AgentSessionProjection::default()
+            };
+            let fake = Arc::new(FakeProvider::new());
+            let mut ingest = ConversationIngest::start(
+                fake.clone(),
+                name,
+                id.clone(),
+                root.to_string_lossy().into_owned(),
+                true,
+                Some("session".into()),
+                None,
+                seed,
+            );
+            for n in 0..60 {
+                let text = format!("live {n}");
+                ingest.fold_locally(AgentDomainEvent::UserPromptSubmitted { text: text.clone() });
+                fake.send_turn(SendTurnRequest {
+                    session_id: "session".into(),
+                    text: text.clone(),
+                })
+                .unwrap();
+                fake.queue(AgentDomainEvent::TurnStarted {
+                    turn_id: format!("t{n}"),
+                });
+                fake.queue(AgentDomainEvent::ToolCallStarted {
+                    turn_id: format!("t{n}"),
+                    tool_use_id: format!("tool-{n}"),
+                    name: "Read".into(),
+                    input: serde_json::json!({}),
+                });
+                fake.queue(AgentDomainEvent::ToolCallCompleted {
+                    turn_id: format!("t{n}"),
+                    tool_use_id: format!("tool-{n}"),
+                    content: serde_json::json!("read"),
+                    is_error: false,
+                });
+                fake.queue(AgentDomainEvent::ContentDelta {
+                    turn_id: format!("t{n}"),
+                    kind: crate::projection::ContentKind::Text,
+                    text: text.clone(),
+                });
+                fake.queue(AgentDomainEvent::TurnCompleted {
+                    turn_id: format!("t{n}"),
+                    outcome: TurnOutcome::Completed,
+                    result_text: String::new(),
+                    stop_reason: None,
+                    usage: None,
+                    detail: Default::default(),
+                });
+                let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
+                loop {
+                    let p = ingest.projection();
+                    let done = p.is_settled() && p.transcript.last().is_some_and(|r| r.text == text);
+                    drop(p);
+                    if done {
+                        break;
+                    }
+                    assert!(
+                        std::time::Instant::now() < deadline,
+                        "ingestion hung at {name} turn {n}"
+                    );
+                    std::thread::yield_now();
+                }
+                ingest.evict_history_for_test(&id, &root, 10);
+                let revision = ingest.projection().last_revision;
+                ingest.take_evicted_calls_through(revision);
+                ingest.take_revised_delivery();
+            }
+            ingest.stop();
+            assert!(ingest.projection().evicted.as_ref().unwrap().turns > 0);
+            let a = crate::history::store::load(&id, "session").unwrap();
+            assert!(a.user_prompts.len() > 10);
+            let archive = crate::state_dirs::history_dir().unwrap().join(&id);
+            assert!(std::fs::read_dir(archive).unwrap().any(|entry| entry
+                .unwrap()
+                .file_name()
+                .to_string_lossy()
+                .contains(".evicted-")));
+            assert_eq!(
+                fake.calls(),
+                (0..60).map(|n| format!("send_turn(live {n})")).collect::<Vec<_>>()
+            );
+            assert_eq!(std::fs::metadata(&transcript).unwrap().len(), bytes.len() as u64);
+            assert_eq!(std::fs::read(&transcript).unwrap(), bytes);
+            let files: Vec<_> = std::fs::read_dir(&root)
+                .unwrap()
+                .map(|e| e.unwrap().file_name())
+                .collect();
+            assert_eq!(files, vec![std::ffi::OsString::from("session.jsonl")]);
         }
     }
 

@@ -110,30 +110,12 @@ impl std::error::Error for HistoryLoadError {}
 impl StoredHistory {
     /// Builds what should go on disk from the first three collections, TRUNCATED; the others empty.
     ///
-    /// **This doc used to say:** "Truncation on the write path is not belt-and-braces: A
-    /// accumulates ACROSS resumes. A resume loads history into the projection, the session then
-    /// adds to that same projection, and the next write stores both -- which is the property that
-    /// makes A survive a CLI transcript being rotated away, and is also what makes the file grow
-    /// without bound if nothing cuts it here."
+    /// A snapshots the history restored into this ingest plus its live activity. It does not merge
+    /// a previous A beyond the source selected for this resume: if B supplied only its read window,
+    /// the next write cannot recover records outside that window. Within an ingest, display eviction
+    /// retains saved-copy candidates separately, so a small live cap cannot shorten A.
     ///
-    /// **Both halves of that were wrong (found 2026-09-20),
-    /// and the sentence is kept above rather than deleted so the next reader can see which claim
-    /// was corrected.** `flush_history` (agent/src/ingestion.rs) writes the WHOLE projection; it
-    /// does not append. After a resume the projection holds whatever was just restored -- when B
-    /// (the CLI's own transcript) supplied it, that is B's view -- so one completed turn overwrites
-    /// A with "what B restored, plus this session's new part", and anything A held beyond B is
-    /// gone. The concrete bad case: a session whose transcript is past `HISTORY_SCAN_MAX_BYTES`
-    /// resumes from B's last 32 MiB, runs one turn, and A now holds only that tail's worth.
-    ///
-    /// So **A is a snapshot of the last projection, not an accumulating archive**, and the file
-    /// cannot grow without bound anyway: every write is a bounded projection. Making it really
-    /// accumulate would need a write-time merge of A with the projection (by `seq`, deduplicated,
-    /// then truncated), which carries its own correctness burden -- the same item can differ in
-    /// text between the two records, which is how compaction works -- and nobody asked for it.
-    /// Deliberately not done here.
-    ///
-    /// **Truncation on the write path stays, and its reason is the one below**, not the growth
-    /// argument above. The caps and the direction are the reader's, deliberately:
+    /// The write and read caps use the same direction and whole-item rule:
     /// `HISTORY_MAX_ITEMS` items and `HISTORY_MAX_CHARS` characters, whole items only, taken from
     /// the NEWEST backwards, with the newest item always kept even when it alone is over budget. A
     /// file cut by one rule and read by another would drop a different set of items on each pass.
@@ -222,7 +204,7 @@ impl StoredHistory {
 }
 
 /// Every collection a stored history keeps, owned: what it is built from and what a load refolds.
-#[derive(Debug, Clone, Default, PartialEq)]
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct HistoryParts {
     pub user_prompts: Vec<UserPromptRecord>,
     pub transcript: Vec<TranscriptMessage>,
@@ -233,7 +215,7 @@ pub struct HistoryParts {
 }
 
 impl HistoryParts {
-    fn view(&self) -> HistoryView<'_> {
+    pub(crate) fn view(&self) -> HistoryView<'_> {
         HistoryView {
             user_prompts: &self.user_prompts,
             transcript: &self.transcript,
@@ -398,10 +380,12 @@ fn truncate_to(mut parts: HistoryParts, max_items: usize, max_chars: usize) -> H
 /// far more than the caps keep. Collections in `seq` order (as the projection keeps them) are walked
 /// newest first from their ends and stop at the caps, so the work is what survives; anything else
 /// is copied whole and truncated as before.
+#[cfg(test)]
 pub(crate) fn newest_that_fit(view: HistoryView<'_>) -> HistoryParts {
     newest_that_fit_to(view, super::HISTORY_MAX_ITEMS, super::HISTORY_MAX_CHARS)
 }
 
+#[cfg(test)]
 fn newest_that_fit_to(view: HistoryView<'_>, max_items: usize, max_chars: usize) -> HistoryParts {
     let in_order = |which: Which| (1..view.len(which)).all(|i| view.seq(which, i - 1) <= view.seq(which, i));
     if !EVERY_WHICH.into_iter().all(in_order) {
@@ -434,6 +418,73 @@ fn newest_that_fit_to(view: HistoryView<'_>, max_items: usize, max_chars: usize)
         chars += cost;
     }
     view.tails(cursors)
+}
+
+/// Selects one bounded suffix across the saved eviction tail and the live projection.
+/// Each source is walked directly: trimming either first could lose the oversized item that
+/// stops the character-budget walk, admitting older rows that should not survive.
+pub(crate) fn newest_with_tail(tail: &HistoryParts, live: HistoryView<'_>) -> HistoryParts {
+    let views = [tail.view(), live];
+    if !views.iter().all(|v| {
+        EVERY_WHICH
+            .into_iter()
+            .all(|w| (1..v.len(w)).all(|i| v.seq(w, i - 1) <= v.seq(w, i)))
+    }) {
+        let mut parts = views[0].tails([0; WHICH_COUNT]);
+        parts.extend(views[1].tails([0; WHICH_COUNT]));
+        return truncate(parts);
+    }
+    let mut cursors = views.map(|v| EVERY_WHICH.map(|w| v.len(w)));
+    let mut kept = 0;
+    let mut chars = 0;
+    while kept < super::HISTORY_MAX_ITEMS {
+        let newest = views
+            .iter()
+            .enumerate()
+            .flat_map(|(source, view)| {
+                let cursors = &cursors;
+                EVERY_WHICH.into_iter().filter_map(move |which| {
+                    let index = cursors[source][which as usize].checked_sub(1)?;
+                    Some(((view.seq(which, index), which as u8, index), source, which, index))
+                })
+            })
+            .max_by_key(|(key, ..)| *key);
+        let Some((_, source, which, index)) = newest else { break };
+        let cost = views[source].cost(which, index);
+        if kept > 0 && chars + cost > super::HISTORY_MAX_CHARS {
+            break;
+        }
+        cursors[source][which as usize] = index;
+        kept += 1;
+        chars += cost;
+    }
+    let mut parts = views[0].tails(cursors[0]);
+    parts.extend(views[1].tails(cursors[1]));
+    parts
+}
+
+impl HistoryParts {
+    /// Merges disjoint records in sequence order, including calls that expired after being lifted.
+    pub(crate) fn extend(&mut self, other: Self) {
+        macro_rules! merge {
+            ($($field:ident),*) => {$(
+                self.$field.extend(other.$field);
+                self.$field.sort_by_key(|r| r.seq);
+            )*};
+        }
+        merge!(user_prompts, transcript, tool_calls, turn_starts, notices, questions);
+    }
+
+    pub(crate) fn trim(&mut self, live: HistoryView<'_>) {
+        let selected = newest_with_tail(self, live);
+        // Older unselected rows can only fall further behind as live history grows.
+        macro_rules! retain_selected {
+            ($($field:ident),*) => {$(
+                self.$field.retain(|r| selected.$field.iter().any(|kept| kept.seq == r.seq));
+            )*};
+        }
+        retain_selected!(user_prompts, transcript, tool_calls, turn_starts, notices, questions);
+    }
 }
 
 fn retain_by<T>(items: &mut Vec<T>, keep: &[bool]) {

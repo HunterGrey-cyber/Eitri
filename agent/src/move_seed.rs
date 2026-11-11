@@ -178,6 +178,9 @@ pub struct ConversationHandoff {
     /// call's start or its settle) was folded since the history was last written: lost, it would never
     /// be written.
     pub history_dirty: bool,
+    /// Saved-copy candidates, private to ingestion and never folded into the display seed.
+    #[serde(default)]
+    pub history_tail: crate::history::HistoryParts,
     #[serde(default)]
     pub eviction_due: bool,
     #[serde(default)]

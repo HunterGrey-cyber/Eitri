@@ -1,5 +1,5 @@
 // @vitest-environment jsdom
-import { afterEach, expect, it } from "vitest";
+import { afterEach, expect, it, vi } from "vitest";
 import { act, cleanup, renderHook } from "@testing-library/react";
 import { useRef, useState } from "react";
 import { initialState } from "../reducer";
@@ -17,6 +17,7 @@ it("drops expansions of evicted rows and keeps surviving runs and folded childre
 });
 
 it("clamps a dropped cursor to the first surviving row and follows a surviving key", () => {
+  const flash = vi.fn();
   const before = buildTimeline({ ...initialState(), userPrompts: [0, 2, 4, 6, 8].map((seq) => ({ seq, text: `${seq}` })) });
   const after = before.slice(3);
   const { result, rerender } = renderHook(({ rows, boundary }) => {
@@ -25,14 +26,16 @@ it("clamps a dropped cursor to the first surviving row and follows a surviving k
     const previousCursor = useRef(cursor);
     const key = useRef<string | null>(null);
     const landing = useRef<1 | -1 | 0 | "keep">(0);
-    usePreserveCursorRow(previous, rows, previousCursor, cursor, key, landing, setCursor, boundary);
+    usePreserveCursorRow(previous, rows, previousCursor, cursor, key, landing, setCursor, boundary, 1, null, flash);
     return { cursor, setCursor };
   }, { initialProps: { rows: before, boundary: 0 } });
   rerender({ rows: after, boundary: 6 });
   expect(result.current.cursor).toBe(0);
+  expect(flash).toHaveBeenCalledTimes(1);
   act(() => result.current.setCursor(1));
   rerender({ rows: after.slice(1), boundary: 8 });
   expect(result.current.cursor).toBe(0);
+  expect(flash).toHaveBeenCalledTimes(1);
 });
 
 it("keeps a restored cursor when switching to another tab with an eviction boundary", () => {

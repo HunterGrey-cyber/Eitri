@@ -3,9 +3,9 @@ use crate::projection::*;
 use serde_json::json;
 use std::os::unix::fs::{DirBuilderExt, PermissionsExt};
 
-struct Scratch(std::path::PathBuf);
+pub(super) struct Scratch(pub(super) std::path::PathBuf);
 impl Scratch {
-    fn new() -> Self {
+    pub(super) fn new() -> Self {
         let path = crate::state_dirs::test_workspace_dir("history-cap").join("archive");
         std::fs::DirBuilder::new().mode(0o700).create(&path).unwrap();
         Self(path)
@@ -16,7 +16,7 @@ impl Drop for Scratch {
         let _ = std::fs::remove_dir_all(self.0.parent().unwrap());
     }
 }
-fn context() -> AdoptionContext {
+pub(super) fn context() -> AdoptionContext {
     AdoptionContext {
         provider_name: "claude",
         conversation_id: "conversation".into(),
@@ -24,7 +24,7 @@ fn context() -> AdoptionContext {
         provider_advertises_resume: true,
     }
 }
-fn end(n: usize) -> AgentDomainEvent {
+pub(super) fn end(n: usize) -> AgentDomainEvent {
     AgentDomainEvent::TurnCompleted {
         turn_id: format!("t{n}"),
         outcome: TurnOutcome::Completed,
@@ -34,7 +34,7 @@ fn end(n: usize) -> AgentDomainEvent {
         detail: Default::default(),
     }
 }
-fn turn(st: &mut IngestState, n: usize) {
+pub(super) fn turn(st: &mut IngestState, n: usize) {
     st.fold(AgentDomainEvent::UserPromptSubmitted {
         text: format!("prompt {n}"),
     });
@@ -48,14 +48,14 @@ fn turn(st: &mut IngestState, n: usize) {
     });
     st.fold(end(n));
 }
-fn filled(n: usize) -> Mutex<IngestState> {
+pub(super) fn filled(n: usize) -> Mutex<IngestState> {
     let mut st = crate::ingestion::tests::state();
     for i in 0..n {
         turn(&mut st, i);
     }
     Mutex::new(st)
 }
-fn flush(state: &Mutex<IngestState>, dir: &Path) -> bool {
+pub(super) fn flush(state: &Mutex<IngestState>, dir: &Path) -> bool {
     flush_in(
         state,
         &Mutex::new(Some("session".into())),
@@ -70,7 +70,7 @@ fn page(dir: &Path, id: &ArchiveId, before: u64) -> crate::history::archive::Pag
         .unwrap()
         .unwrap()
 }
-fn background(st: &mut IngestState) {
+pub(super) fn background(st: &mut IngestState) {
     st.projection.tool_calls.push(serde_json::from_value(json!({
         "seq": 1, "turn_id":"t0", "tool_use_id":"bg", "name":"Agent", "input":{}, "result":null,"background":true,
         "children":{"transcript":[{"seq":1,"text":"child reply"}], "thinking":[],

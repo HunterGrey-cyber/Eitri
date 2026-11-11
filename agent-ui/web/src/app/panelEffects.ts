@@ -72,6 +72,7 @@ export function usePreserveCursorRow(
   evictionBoundary?: number,
   tab?: number | null,
   historyPage?: HistoryPage | null,
+  onEvictedCursor?: () => void,
 ) {
   const previousEviction = useRef({ boundary: evictionBoundary, tab, historyPage });
   useLayoutEffect(() => {
@@ -90,6 +91,7 @@ export function usePreserveCursorRow(
       if (found === null && (evicted || (want.startsWith("h:") && historyReplaced))) {
         landingRef.current = "keep";
         setCursor(0);
+        if (evicted && !historyReplaced) onEvictedCursor?.();
         cursorKeyRef.current = timeline[0]?.key ?? null;
         return;
       }

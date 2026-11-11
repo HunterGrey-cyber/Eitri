@@ -176,6 +176,7 @@ fn read_session_id(slot: &Mutex<Option<String>>) -> Option<String> {
 pub struct ReloadTicket {
     pub generation: u64,
     pub base: u64,
+    pub before: u64,
     pub id: crate::history::archive::ArchiveId,
 }
 
@@ -187,7 +188,7 @@ pub fn read_reload(
     crate::history::archive::read_page(
         &crate::state_dirs::history_dir()?,
         &ticket.id,
-        ticket.base,
+        ticket.before,
         crate::history::history_turns(),
         crate::history::archive::PAGE_MAX_CHARS,
         cancel,
@@ -224,6 +225,8 @@ struct IngestState {
     /// written. Set by `fold` at a turn's end, the session's end, and inside a turn at a question's
     /// ask, the start of its call and its settle (`fold_one`) -- see `flush_history`.
     history_dirty: bool,
+    /// Saved-history candidates removed from the display; bounded by the saved copy's own caps.
+    history_tail: crate::history::HistoryParts,
     eviction_due: bool,
     /// An attempted cut waits for another turn end before trying the archive again.
     eviction_retry: bool,
@@ -419,6 +422,7 @@ pub(crate) struct IngestHandoff {
     pub(crate) pending_name: Option<Option<String>>,
     pub(crate) record_written: bool,
     pub(crate) history_dirty: bool,
+    pub(crate) history_tail: crate::history::HistoryParts,
     pub(crate) eviction_due: bool,
     pub(crate) archive_id: Option<crate::history::archive::ArchiveId>,
 }
@@ -466,6 +470,7 @@ impl IngestState {
 
     fn fold_one(&mut self, event: AgentDomainEvent) {
         if matches!(&event, AgentDomainEvent::ConversationReset { .. }) {
+            self.history_tail = Default::default();
             self.reload_held = false;
             self.reload_generation += 1;
         }
@@ -611,6 +616,7 @@ impl IngestState {
             pending_name,
             record_written,
             history_dirty,
+            history_tail,
             eviction_due,
             eviction_retry: _,
             reload_held: _,
@@ -659,6 +665,7 @@ impl IngestState {
             // reply still open, so writing at once would store it half-written; that turn's own end marks
             // the history dirty, and its write carries the turn that failed too.
             history_dirty: *history_dirty || (*history_save_failed && running_turn.is_none()),
+            history_tail: history_tail.clone(),
             eviction_due: *eviction_due,
             archive_id: archive_id.clone(),
         };
@@ -698,6 +705,7 @@ impl IngestState {
             pending_name,
             record_written,
             history_dirty,
+            history_tail,
             eviction_due,
             archive_id,
         } = state;
@@ -716,6 +724,7 @@ impl IngestState {
             pending_name,
             record_written,
             history_dirty,
+            history_tail,
             eviction_due,
             eviction_retry: false,
             reload_held: false,
@@ -914,6 +923,7 @@ impl ConversationIngest {
             pending_name: None,
             record_written,
             history_dirty: false,
+            history_tail: Default::default(),
             eviction_due: false,
             eviction_retry: false,
             reload_held: false,
@@ -1038,13 +1048,11 @@ impl ConversationIngest {
     }
 
     /// Reserves the current eviction boundary before any archive I/O can begin.
-    pub fn begin_reload(&self) -> Option<ReloadTicket> {
+    pub fn begin_reload(&self, before: Option<u64>) -> Option<ReloadTicket> {
         let mut st = self.lock_state("begin_reload");
-        if st.reload_held {
-            return None;
-        }
         let base = st.projection.evicted.as_ref()?.turns;
-        if base == 0 {
+        let before = before.unwrap_or(base);
+        if before == 0 || before > base {
             return None;
         }
         let id = st.archive_id.clone()?;
@@ -1053,8 +1061,22 @@ impl ConversationIngest {
         Some(ReloadTicket {
             generation: st.reload_generation,
             base,
+            before,
             id,
         })
+    }
+
+    /// The current evicted count if eviction invalidated this reservation in the same conversation.
+    pub fn reload_was_released(&self, ticket: &ReloadTicket) -> Option<u64> {
+        let st = self.lock_state("reload_was_released");
+        if st.archive_id.as_ref() != Some(&ticket.id) {
+            return None;
+        }
+        st.projection
+            .evicted
+            .as_ref()
+            .filter(|e| e.turns > ticket.base)
+            .map(|e| e.turns)
     }
 
     /// Installs a page only while its reservation still names this exact conversation boundary.
@@ -1093,7 +1115,7 @@ impl ConversationIngest {
     }
 
     /// Runs an eviction under the worker's gate with a test's own budget and archive identity.
-    #[cfg(feature = "test-support")]
+    #[cfg(any(test, feature = "test-support"))]
     #[doc(hidden)]
     pub(crate) fn evict_history_for_test(&self, conversation_id: &str, cwd: &std::path::Path, budget: usize) -> bool {
         let _gate = self.pump_gate.lock().unwrap();
@@ -1557,6 +1579,8 @@ fn fold_stretch(
 /// write the cleared projection over the old conversation's history; the dirty flag waits for the new
 /// one's record. `None` when there was no session to detach.
 fn detach_for_reset(guard: &mut IngestState, session_id: &Mutex<Option<String>>) -> Option<ClearedSession> {
+    let history = guard.record_written.then(|| history_snapshot(guard));
+    guard.history_tail = Default::default();
     let old = session_id
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner)
@@ -1573,7 +1597,6 @@ fn detach_for_reset(guard: &mut IngestState, session_id: &Mutex<Option<String>>)
     guard.evicted_calls.clear();
     let lease = guard.lease.take();
     let provider_session_id = old?;
-    let history = had_record.then(|| history_snapshot(&guard.projection));
     // A title or name noted for the old conversation belongs in its record, not the new one's. With no
     // record yet (`adopt` had not run, or its write failed) the session is known here, so it gets one.
     let (title, name) = (guard.pending_title.take(), guard.pending_name.take());
@@ -1766,7 +1789,7 @@ fn flush_history(state: &Mutex<IngestState>, session_id: &Mutex<Option<String>>,
         // Cleared before the write, not after: a turn that completes while this one is writing must
         // mark the history dirty again rather than be swallowed by a later clear.
         guard.history_dirty = false;
-        (id, history_snapshot(&guard.projection), guard.folded_through)
+        (id, history_snapshot(&guard), guard.folded_through)
     };
     let saved = store_history(context, &provider_session_id, parts);
     let mut guard = state.lock().unwrap();
@@ -1808,12 +1831,18 @@ fn store_history(context: &AdoptionContext, provider_session_id: &str, parts: cr
     true
 }
 
-/// What the stored history keeps of the conversation, copied: only what the history's caps keep,
-/// since this runs under the lock every UI read of the conversation takes. Every collection the
-/// history keeps: prompts, replies, tool calls, the starts of turns the user did not send, notice
-/// rows and question sets.
-fn history_snapshot(projection: &AgentSessionProjection) -> crate::history::HistoryParts {
-    crate::history::store::newest_that_fit(crate::history::store::HistoryView::of(projection))
+#[cfg(test)]
+fn projection_history_snapshot(projection: &AgentSessionProjection) -> crate::history::HistoryParts {
+    crate::history::store::newest_with_tail(&Default::default(), crate::history::store::HistoryView::of(projection))
+}
+
+/// Copies only the newest saved-copy candidates within its own caps. The private tail preserves
+/// rows removed from the live display, including when no eviction archive could be written.
+fn history_snapshot(state: &IngestState) -> crate::history::HistoryParts {
+    crate::history::store::newest_with_tail(
+        &state.history_tail,
+        crate::history::store::HistoryView::of(&state.projection),
+    )
 }
 
 fn adopt_provider_session(
@@ -3211,6 +3240,7 @@ pub(crate) mod tests {
             pending_name: None,
             record_written: false,
             history_dirty: false,
+            history_tail: Default::default(),
             eviction_due: false,
             eviction_retry: false,
             reload_held: false,
@@ -3226,6 +3256,67 @@ pub(crate) mod tests {
             #[cfg(feature = "test-support")]
             fold_log: None,
         }
+    }
+
+    #[test]
+    fn reload_tickets_page_before_the_held_start_and_invalidate_prior_installs() {
+        use crate::history::archive::{ArchiveId, ArchiveWriter, ArchivedRecord, ArchivedTurn};
+        crate::state_dirs::redirect_state_to_a_test_root();
+        let conversation = uuid::Uuid::new_v4().to_string();
+        let id = ArchiveId::new(&conversation, "reload-tests").unwrap();
+        let n = crate::history::history_turns() as u64;
+        let count = n + 2;
+        let turns: Vec<_> = (0..count)
+            .map(|turn| ArchivedTurn {
+                turn,
+                records: vec![ArchivedRecord::UserPrompt(crate::UserPromptRecord {
+                    seq: turn,
+                    text: format!("prompt {turn}"),
+                    delivered: false,
+                })],
+            })
+            .collect();
+        ArchiveWriter::open(&crate::state_dirs::history_dir().unwrap(), &id)
+            .unwrap()
+            .append(&turns)
+            .unwrap();
+        let ingest = ConversationIngest::start(
+            Arc::new(super::idle_wakeups::Quiet::default()),
+            "claude",
+            conversation,
+            "/tmp/ws".into(),
+            false,
+            None,
+            None,
+            AgentSessionProjection::default(),
+        );
+        {
+            let mut st = ingest.lock_state("reload test setup");
+            st.archive_id = Some(id);
+            st.projection.evicted = Some(crate::projection::Evicted {
+                through_seq: count,
+                turns: count,
+                lifted: vec![],
+            });
+        }
+        let first = ingest.begin_reload(None).unwrap();
+        assert_eq!((first.base, first.before), (count, count));
+        let cancel = AtomicBool::new(false);
+        let page = read_reload(&first, &cancel).unwrap().unwrap();
+        assert_eq!(page.from_turn, 2);
+        assert_eq!(page.turns.len(), n as usize);
+        assert!(ingest.finish_reload(&first, true, || {}));
+        let second = ingest.begin_reload(Some(page.from_turn)).unwrap();
+        assert_eq!((second.base, second.before), (count, 2));
+        assert!(ingest.lock_state("reload reservation").reload_held);
+        assert!(!ingest.finish_reload(&first, true, || panic!("old reservation installed")));
+        let older = read_reload(&second, &cancel).unwrap().unwrap();
+        assert_eq!(older.from_turn, 0);
+        assert_eq!(older.turns.iter().map(|t| t.turn).collect::<Vec<_>>(), [0, 1]);
+        assert!(ingest.finish_reload(&second, true, || {}));
+        assert!(ingest.begin_reload(Some(0)).is_none());
+        ingest.clear_reload();
+        assert!(!ingest.finish_reload(&second, true, || panic!("released reservation installed")));
     }
 
     fn text(t: &str) -> AgentDomainEvent {
@@ -3431,7 +3522,7 @@ mod history_snapshot_cost {
 
     fn snapshot_time(p: &AgentSessionProjection) -> std::time::Duration {
         let started = std::time::Instant::now();
-        let kept = history_snapshot(p);
+        let kept = projection_history_snapshot(p);
         let elapsed = started.elapsed();
         assert!(kept.tool_calls.len() <= crate::history::HISTORY_MAX_ITEMS);
         elapsed
@@ -3455,7 +3546,7 @@ mod history_snapshot_cost {
         let small = session(500);
         let large = session(4_000);
 
-        let (small_kept, large_kept) = (history_snapshot(&small), history_snapshot(&large));
+        let (small_kept, large_kept) = (projection_history_snapshot(&small), projection_history_snapshot(&large));
         assert_eq!(
             (
                 small_kept.user_prompts.len(),

@@ -3,9 +3,12 @@ import { applySnapshot, initialState } from "./reducer";
 import { buildTimeline, type TimelineItem } from "./timeline";
 import { buildDisplay, runKeyOf } from "./display";
 
-export type HistoryPage = { fromTurn: number; records: AgentUiSnapshot[] };
+export type HistoryPage = { fromTurn: number; toTurn: number; records: AgentUiSnapshot[] };
 export type HistoryEnvelope = { kind: "history_page"; tab: number } &
-  ({ cleared: true } | (HistoryPage & { requestId: string }));
+  ({ cleared: true; reason?: never }
+    | { cleared: true; reason: "released"; turns: number }
+    | { requestId: string; empty: true }
+    | (HistoryPage & { requestId: string }));
 
 function historyState(snapshot: AgentUiSnapshot) {
   const state = applySnapshot(initialState(), snapshot, 0);
@@ -40,4 +43,15 @@ export function historyTimeline(page: HistoryPage | null, options: Parameters<ty
       .filter((row) => row.kind !== "permission")
       .map((row) => ({ ...row, key: `h:${row.key}` }));
   });
+}
+
+/** Count every missing turn, including a gap between the archived page and live rows. */
+export function unloadedTurns(evicted: number, page: HistoryPage | null): number {
+  return Math.max(0, evicted - (page === null ? 0 : page.toTurn - page.fromTurn));
+}
+export function searchMiss(query: string, evicted: number, page: HistoryPage | null): string {
+  const count = unloadedTurns(evicted, page);
+  return count > 0
+    ? `pattern not found in loaded turns: ${query} (${count} earlier turn${count === 1 ? "" : "s"} not loaded)`
+    : `pattern not found: ${query}`;
 }

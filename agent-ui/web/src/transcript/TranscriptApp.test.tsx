@@ -300,3 +300,17 @@ describe("the transcript page", () => {
     expect(new Set(t.kinds())).toEqual(new Set(["ready", "more", "open_link", "want_snapshot"]));
   });
 });
+
+it("shows the snapshot's unloaded turns above the phone list as plain text", () => {
+  const t = setup(snapshot({ evicted: { throughSeq: 10, turns: 3 } }, { first_turn: 3 }));
+  const line = t.container.querySelector(".history-notice")!;
+  expect(line?.textContent).toBe("3 earlier turns not loaded.");
+  expect(line?.compareDocumentPosition(t.list().querySelector("[data-row-key]")!) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy();
+  expect(line?.querySelector("button")).toBeNull(); expect(line?.hasAttribute("data-nav-stop")).toBe(false);
+  const posted = t.posted.length;
+  fireEvent.click(line);
+  expect(t.posted).toHaveLength(posted);
+  t.send(snapshot({ evicted: { throughSeq: 10, turns: 1 } }, { first_turn: 1 }));
+  expect(t.container.querySelector(".history-notice")?.textContent).toBe("1 earlier turn not loaded.");
+  t.send(snapshot()); expect(t.container.textContent).not.toContain("earlier turn");
+});

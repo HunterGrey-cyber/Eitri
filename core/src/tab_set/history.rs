@@ -8,8 +8,9 @@ use agent::ingestion::ReloadTicket;
 pub(super) struct HistoryReload {
     generation: u64,
     job: Option<Job>,
-    held: Option<(ReloadTicket, String)>,
+    held: Option<(ReloadTicket, String, u64)>,
     cleared: bool,
+    released: Option<u64>,
     #[cfg(test)]
     before_read: Option<Box<dyn FnOnce() + Send>>,
 }
@@ -26,7 +27,7 @@ struct Reply {
     generation: u64,
     request_id: String,
     base: u64,
-    page: Option<String>,
+    page: Option<(u64, String)>,
 }
 
 impl Drop for Job {
@@ -35,12 +36,17 @@ impl Drop for Job {
     }
 }
 
+fn empty(tab: TabId, request_id: &str) -> String {
+    serde_json::json!({"kind":"history_page", "tab":tab.0, "requestId":request_id, "empty":true}).to_string()
+}
+
 fn cleared(tab: TabId) -> String {
     serde_json::json!({"kind":"history_page", "tab":tab.0, "cleared":true}).to_string()
 }
 
 // Use the snapshot's conversions for every record type, without feeding any of them to the live projection.
 fn envelope(tab: TabId, request_id: &str, page: Page) -> String {
+    let to_turn = page.from_turn + page.turns.len() as u64;
     let records: Vec<_> = page
         .turns
         .into_iter()
@@ -74,7 +80,7 @@ fn envelope(tab: TabId, request_id: &str, page: Page) -> String {
         })
         .collect();
     serde_json::json!({"kind":"history_page", "tab":tab.0, "requestId":request_id,
-        "fromTurn":page.from_turn, "records":records})
+        "fromTurn":page.from_turn, "toTurn":to_turn, "records":records})
     .to_string()
 }
 
@@ -87,6 +93,7 @@ impl Tab {
         if let Some(ingest) = self.history_ingest() {
             ingest.clear_reload();
         }
+        self.history.released = None;
         self.history.cleared |= self.history.job.is_some() || self.history.held.is_some();
         self.history.generation += 1;
         self.history.job = None;
@@ -94,7 +101,7 @@ impl Tab {
     }
 
     pub(super) fn history_payload(&self) -> Option<String> {
-        let (ticket, payload) = self.history.held.as_ref()?;
+        let (ticket, payload, _) = self.history.held.as_ref()?;
         self.history_ingest()?
             .finish_reload(ticket, true, || {})
             .then(|| payload.clone())
@@ -127,16 +134,15 @@ impl TabSet {
             tab.history.cleared = false;
             return Ok(Some(cleared(tab.id)));
         }
-        if tab.history.held.is_some() {
-            return Ok(None);
-        }
-        // Repeated requests replace pending work, while a finished page stays until explicitly released.
-        if tab.history.job.is_some() {
-            tab.clear_history();
-        }
-        let Some(ticket) = tab.history_ingest().and_then(|ingest| ingest.begin_reload()) else {
-            return Ok(None);
+        let before = tab.history.held.as_ref().map(|h| h.2);
+        let Some(ticket) = tab.history_ingest().and_then(|ingest| ingest.begin_reload(before)) else {
+            return Ok(Some(empty(tab.id, request_id)));
         };
+        // Replace the reservation without releasing it: the visible page survives pending and empty reads.
+        tab.history.job = None;
+        if let Some(held) = &mut tab.history.held {
+            held.0 = ticket.clone();
+        }
         let cancel = Arc::new(AtomicBool::new(false));
         let (tx, rx) = mpsc::sync_channel(1);
         let worker_ticket = ticket.clone();
@@ -157,7 +163,9 @@ impl TabSet {
                     .ok()
                     .flatten();
                 if !worker_cancel.load(Ordering::SeqCst) {
-                    let page = page.map(|page| envelope(id, &request, page));
+                    let page = page
+                        .filter(|p| !p.turns.is_empty())
+                        .map(|page| (page.from_turn, envelope(id, &request, page)));
                     let _ = tx.send(Reply {
                         generation,
                         request_id: request,
@@ -167,7 +175,9 @@ impl TabSet {
                 }
             });
         if let Err(error) = worker {
-            tab.clear_history();
+            if tab.history.held.is_none() {
+                tab.clear_history();
+            }
             return Err(error.to_string());
         }
         tab.history.cleared = false;
@@ -204,7 +214,13 @@ impl TabSet {
                     .history_ingest()
                     .is_some_and(|i| i.finish_reload(ticket, true, || {}))
                 {
+                    let released = if tab.history.held.is_some() {
+                        tab.history_ingest().and_then(|i| i.reload_was_released(ticket))
+                    } else {
+                        None
+                    };
                     tab.clear_history();
+                    tab.history.released = released;
                 }
             }
             if let Some(job) = &tab.history.job {
@@ -230,21 +246,41 @@ impl TabSet {
                         };
                         let history = &mut tab.history;
                         if let Some(ingest) = ingest {
-                            let installed = ingest.finish_reload(&job.ticket, reply.page.is_some(), || {
-                                if let Some(payload) = reply.page {
-                                    out.push((tab.view, payload.clone()));
-                                    history.held = Some((job.ticket.clone(), payload));
-                                }
-                            });
-                            history.cleared |= !installed;
+                            let installed = ingest.finish_reload(
+                                &job.ticket,
+                                reply.page.is_some() || history.held.is_some(),
+                                || {
+                                    if let Some((from, payload)) = reply.page {
+                                        out.push((tab.view, payload.clone()));
+                                        history.held = Some((job.ticket.clone(), payload, from));
+                                    } else {
+                                        out.push((tab.view, empty(tab.id, &job.request_id)));
+                                    }
+                                },
+                            );
+                            if !installed {
+                                let released = if history.held.is_some() {
+                                    ingest.reload_was_released(&job.ticket)
+                                } else {
+                                    None
+                                };
+                                tab.clear_history();
+                                tab.history.released = released;
+                            }
                         }
-                    } else {
+                    } else if tab.history.held.is_none() {
                         tab.clear_history();
                     }
                 }
             }
             if std::mem::take(&mut tab.history.cleared) {
-                out.push((tab.view, cleared(tab.id)));
+                let payload = if let Some(turns) = tab.history.released.take() {
+                    serde_json::json!({"kind":"history_page", "tab":tab.id.0, "cleared":true, "reason":"released", "turns":turns})
+                        .to_string()
+                } else {
+                    cleared(tab.id)
+                };
+                out.push((tab.view, payload));
             }
         }
         out
@@ -325,6 +361,155 @@ mod tests {
             gate.recv_timeout(Duration::from_secs(30)).unwrap();
         }));
         (wait, release)
+    }
+
+    fn fixture_pages() -> (TabSet, TabId, Arc<RecordingProvider>) {
+        let (tabs, id, provider) = fixture();
+        let n = agent::history::history_turns();
+        let start = n + n / 10 + 1;
+        turns(&provider, start, n * 2);
+        until(|| {
+            let p = tabs.get(id).unwrap().live().unwrap().projection();
+            p.user_prompts
+                .last()
+                .is_some_and(|r| r.text == format!("prompt {}", start + n * 2 - 1))
+                && p.evicted.as_ref().is_some_and(|e| e.turns > n as u64)
+                && p.active_turn_id.is_none()
+        });
+        (tabs, id, provider)
+    }
+
+    fn reply(tabs: &mut TabSet) -> serde_json::Value {
+        let mut result = None;
+        until(|| {
+            for (_, payload) in tabs.poll_history() {
+                result = Some(serde_json::from_str(&payload).unwrap());
+            }
+            tabs.tabs.iter().all(|t| t.history.job.is_none())
+        });
+        result.expect("worker finished without a history reply")
+    }
+
+    #[test]
+    fn older_replaces_a_held_page_only_after_install_and_keeps_the_reservation() {
+        let (mut tabs, id, provider) = fixture_pages();
+        tabs.request_history(id, "first", HistoryAction::Older).unwrap();
+        let first = loaded(&mut tabs, id);
+        assert!(first["fromTurn"].as_u64().unwrap() > 0);
+        let base = tabs.get(id).unwrap().history.held.as_ref().unwrap().0.base;
+        assert_eq!(first["toTurn"], base);
+        let (entered, release) = hold(&mut tabs, id);
+        tabs.request_history(id, "second", HistoryAction::Older).unwrap();
+        assert!(
+            tabs.get(id).unwrap().history.job.is_some(),
+            "held pages must allow another older read"
+        );
+        entered.recv_timeout(Duration::from_secs(30)).unwrap();
+        let tab = tabs.get(id).unwrap();
+        let ticket = &tab.history.job.as_ref().unwrap().ticket;
+        assert_eq!(ticket.before, first["fromTurn"].as_u64().unwrap());
+        assert_eq!(ticket.base, base);
+        assert_eq!(tab.history_payload().unwrap(), first.to_string());
+        let live_count = tab.live().unwrap().projection().user_prompts.len();
+        let n = agent::history::history_turns();
+        turns(&provider, 3 * n + n / 10 + 1, n / 5);
+        until(|| tabs.get(id).unwrap().live().unwrap().projection().user_prompts.len() == live_count + n / 5);
+        assert_eq!(
+            tabs.get(id)
+                .unwrap()
+                .live()
+                .unwrap()
+                .projection()
+                .evicted
+                .as_ref()
+                .unwrap()
+                .turns,
+            base
+        );
+        assert!(tabs.poll_history().is_empty());
+        release.send(()).unwrap();
+        let second = reply(&mut tabs);
+        assert_eq!(second["requestId"], "second");
+        assert_eq!(second["toTurn"], first["fromTurn"]);
+        assert!(second["fromTurn"].as_u64().unwrap() < first["fromTurn"].as_u64().unwrap());
+        assert_eq!(tabs.get(id).unwrap().history_payload().unwrap(), second.to_string());
+    }
+
+    #[test]
+    fn an_empty_second_read_keeps_the_held_page_and_answers_empty() {
+        let (mut tabs, id, _) = fixture_pages();
+        tabs.request_history(id, "first", HistoryAction::Older).unwrap();
+        let first = loaded(&mut tabs, id);
+        let ticket = tabs.get(id).unwrap().history.held.as_ref().unwrap().0.clone();
+        std::fs::remove_dir_all(
+            agent::state_dirs::redirect_state_to_a_test_root()
+                .join("history")
+                .join(&ticket.id.conversation_id),
+        )
+        .unwrap();
+        tabs.request_history(id, "empty", HistoryAction::Older).unwrap();
+        assert_eq!(
+            reply(&mut tabs),
+            serde_json::json!({"kind":"history_page", "tab":id.0, "requestId":"empty", "empty":true})
+        );
+        assert_eq!(tabs.get(id).unwrap().history_payload().unwrap(), first.to_string());
+        assert!(tabs.poll_history().is_empty());
+    }
+
+    #[test]
+    fn stale_replacement_reply_is_dropped_without_releasing_the_visible_page() {
+        let (mut tabs, id, _) = fixture_pages();
+        tabs.request_history(id, "held", HistoryAction::Older).unwrap();
+        let first = loaded(&mut tabs, id);
+        let (entered, release) = hold(&mut tabs, id);
+        tabs.request_history(id, "replaced", HistoryAction::Older).unwrap();
+        assert!(
+            tabs.get(id).unwrap().history.job.is_some(),
+            "held pages must allow another older read"
+        );
+        entered.recv_timeout(Duration::from_secs(30)).unwrap();
+        let flag = tabs.get(id).unwrap().history.job.as_ref().unwrap().cancel.clone();
+        tabs.request_history(id, "current", HistoryAction::Older).unwrap();
+        assert!(flag.load(Ordering::SeqCst));
+        release.send(()).unwrap();
+        let job = tabs.get_mut(id).unwrap().history.job.as_mut().unwrap();
+        let mut old = job.rx.recv_timeout(Duration::from_secs(30)).unwrap();
+        old.request_id = "replaced".into();
+        let (tx, rx) = mpsc::sync_channel(1);
+        tx.send(old).unwrap();
+        job.rx = rx;
+        assert!(tabs.poll_history().is_empty());
+        assert_eq!(tabs.get(id).unwrap().history_payload().unwrap(), first.to_string());
+        tabs.request_history(id, "retry", HistoryAction::Older).unwrap();
+        assert_eq!(reply(&mut tabs)["requestId"], "retry");
+    }
+
+    #[test]
+    fn page_envelopes_report_exclusive_bounds_for_adjacent_and_gapped_pages() {
+        for before in [3, 8] {
+            let raw = envelope(
+                TabId(1),
+                "page",
+                Page {
+                    from_turn: before - 2,
+                    turns: vec![
+                        agent::history::archive::ArchivedTurn {
+                            turn: before - 2,
+                            records: vec![],
+                        },
+                        agent::history::archive::ArchivedTurn {
+                            turn: before - 1,
+                            records: vec![],
+                        },
+                    ],
+                    cut: Default::default(),
+                },
+            );
+            let wire: serde_json::Value = serde_json::from_str(&raw).unwrap();
+            assert_eq!(wire["toTurn"], before);
+            assert_eq!(wire["fromTurn"], before - 2);
+            assert_eq!(wire["records"].as_array().unwrap().len(), 2);
+        }
     }
 
     #[test]
@@ -507,14 +692,24 @@ mod tests {
                 .turns
                 > base
         });
-        assert!(tabs.poll_history().iter().any(|(_, p)| p.contains("\"cleared\":true")));
+        let released = tabs.poll_history();
+        assert!(released.iter().any(|(_, p)| {
+            let wire: serde_json::Value = serde_json::from_str(p).unwrap();
+            wire["cleared"] == true && wire["reason"] == "released" && wire["turns"] == base + n as u64
+        }));
         assert!(tabs.get(id).unwrap().history.held.is_none());
     }
 
     #[test]
     fn empty_archive_result_releases_reservation_without_a_page() {
         let (mut tabs, id, _) = fixture();
-        let ticket = tabs.get(id).unwrap().history_ingest().unwrap().begin_reload().unwrap();
+        let ticket = tabs
+            .get(id)
+            .unwrap()
+            .history_ingest()
+            .unwrap()
+            .begin_reload(None)
+            .unwrap();
         tabs.get(id).unwrap().history_ingest().unwrap().clear_reload();
         let dir = agent::state_dirs::redirect_state_to_a_test_root()
             .join("history")
@@ -522,12 +717,18 @@ mod tests {
         // The settled fixture has synced its archive and has no further turn ends to write.
         std::fs::remove_dir_all(dir).unwrap();
         tabs.request_history(id, "empty", HistoryAction::Older).unwrap();
-        until(|| {
-            tabs.poll_history();
-            tabs.get(id).unwrap().history.job.is_none()
-        });
+        assert_eq!(
+            reply(&mut tabs),
+            serde_json::json!({"kind":"history_page", "tab":id.0, "requestId":"empty", "empty":true})
+        );
         assert!(tabs.get(id).unwrap().history.held.is_none());
-        assert!(tabs.get(id).unwrap().history_ingest().unwrap().begin_reload().is_some());
+        assert!(tabs
+            .get(id)
+            .unwrap()
+            .history_ingest()
+            .unwrap()
+            .begin_reload(None)
+            .is_some());
     }
 
     #[test]

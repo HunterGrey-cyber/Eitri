@@ -123,7 +123,7 @@ import { installCtrlBracketAsEscape } from "./ctrlBracket";
 import { installHeldSuperTracking } from "./heldSuper";
 import { WhichKeyBox } from "./components/WhichKeyBox";
 import { TurnChanges } from "./components/TurnChanges";
-import { historyRunKeyOf, historyTimeline, type HistoryPage } from "./historyPage";
+import { historyRunKeyOf, historyTimeline, searchMiss, type HistoryPage } from "./historyPage";
 import { allCards, buildTimeline, oldestPendingPermission, nextStop, promptIndex, waitingCardAfter } from "./timeline";
 import { buildDisplay, indexOfKey, runKeyOf } from "./display";
 import { toolInput, yankObject, yankRows } from "./yank";
@@ -2233,7 +2233,7 @@ export default function App() {
   const cursorKeyRef = useRef<string | null>(null);
   const prevTimelineRef = useRef<TimelineItem[] | null>(null);
   const prevCursorRef = useRef(cursor);
-  usePreserveCursorRow(prevTimelineRef, timeline, prevCursorRef, cursor, cursorKeyRef, landingRef, setCursor, state.evicted?.throughSeq, activeTabId, historyPage);
+  usePreserveCursorRow(prevTimelineRef, timeline, prevCursorRef, cursor, cursorKeyRef, landingRef, setCursor, state.evicted?.throughSeq, activeTabId, historyPage, () => showFlash("Earlier turns were unloaded; the cursor moved to the first loaded row."));
   useRevealCursorRow(landingRef, landingAnimateRef, landingHeadRef, frozenSnapshotRef, containerRef, cursor);
   /* A search hit on a tall row: once the row is revealed (the effect above, declared first, so run first), the line
      holding the match comes on screen below the pinned header. The view it leaves is what a jump from here records
@@ -2814,7 +2814,16 @@ export default function App() {
       // can touch the page.
       if (!acceptsEnvelope(payload as { kind: string; tab?: number }, activeTabRef.current)) return;
       if (payload.kind === "history_page") {
-        setHistoryPage("cleared" in payload ? null : { fromTurn: payload.fromTurn, records: payload.records });
+        if ("empty" in payload) {
+          showFlash("No older turns could be loaded.");
+        } else if ("cleared" in payload) {
+          setHistoryPage(null);
+          if (payload.reason === "released") {
+            showFlash(`The loaded page was released to make room; ${payload.turns} earlier turn${payload.turns === 1 ? "" : "s"} not loaded.`);
+          }
+        } else {
+          setHistoryPage({ fromTurn: payload.fromTurn, toTurn: payload.toTurn, records: payload.records });
+        }
         return;
       }
       if (payload.kind === "tabs" && payload.active !== activeTabRef.current) setHistoryPage(null);
@@ -7068,7 +7077,7 @@ export default function App() {
         const { query, dir } = lastSearchRef.current;
         const found = findMatch(timeline, query, cursor, (dir * action.delta) as 1 | -1, false);
         if (found === null) {
-          if (query !== "") showFlash(`pattern not found: ${query}`);
+          if (query !== "") showFlash(searchMiss(query, state.evicted?.turns ?? 0, historyPage));
         } else {
           noteJump();
           moveCursorTo(found);
@@ -7316,6 +7325,7 @@ export default function App() {
             cursor={frozenTimeline === null ? cursor : (indexOfKey(frozenTimeline, timeline[cursor]?.key ?? "") ?? -1)}
             timeline={frozenTimeline ?? timeline}
             historyFromTurn={historyPage?.fromTurn}
+            historyToTurn={historyPage?.toTurn}
             onHistoryOlder={() => requestHistory("older")}
             detailed={frozenSnapshot?.detailed ?? detailed}
             thinkingDisplay={thinkingDisplay}
@@ -7641,7 +7651,7 @@ export default function App() {
               noteLineKey(event);
               lastSearchRef.current = { query: search.query, dir: search.dir };
               if (search.query !== "" && findMatch(timeline, search.query, search.origin, search.dir, true) === null) {
-                showFlash(`pattern not found: ${search.query}`);
+                showFlash(searchMiss(search.query, state.evicted?.turns ?? 0, historyPage));
                 setCursor(search.origin);
               } else if (search.query !== "") {
                 noteJump(searchOriginRef.current);

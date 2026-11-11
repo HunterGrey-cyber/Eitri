@@ -29,7 +29,7 @@ const pause = () => act(() => vi.advanceTimersByTime(TYPING_GUARD_MS + 50));
 const rows = (c: HTMLElement) => conversationRows(c);
 const keys = (c: HTMLElement) => rows(c).map((r) => r.getAttribute("data-row-key"));
 const old = { ...initialState(), userPrompts: [{ seq: 0, text: "archived prompt" }], transcript: [{ seq: 1, text: "archived reply <script>bad()</script>" }] };
-const page = (fromTurn = 2) => dispatch({ kind: "history_page", tab: 1, requestId: "load", fromTurn, records: [old] });
+const page = (fromTurn = 2) => dispatch({ kind: "history_page", tab: 1, requestId: "load", fromTurn, toTurn: fromTurn + 1, records: [old] });
 const clear = () => dispatch({ kind: "history_page", tab: 1, cleared: true });
 function live() {
   const rendered = render(<App />);
@@ -273,4 +273,112 @@ it("search and copy include the loaded rows and G still lands on the live tail",
   expect(container.querySelector(".row-current")!.getAttribute("data-row-key")).toBe("h:u-0");
   pause(); press(container, "y"); press(container, "y");
   expect(copy).toHaveBeenCalledWith("archived prompt");
+});
+
+const band = (c: HTMLElement) => c.querySelector(".band-message")?.textContent ?? "";
+it("keeps paging with the top control and draws a plain gap between historical and live rows", () => {
+  const { container } = live(); page(1);
+  const gap = container.querySelector(".history-gap")!;
+  expect(gap?.textContent).toBe("1 newer turn not loaded.");
+  expect(gap?.previousElementSibling?.getAttribute("data-row-key")).toBe("h:m-1");
+  expect(gap?.nextElementSibling?.getAttribute("data-row-key")).toBe("u-40");
+  expect(gap?.querySelector("button")).toBeNull();
+  expect(stopsIn(container)).not.toContain(gap);
+  expect(rows(container)).not.toContain(gap);
+  const button = container.querySelector<HTMLButtonElement>(".history-load")!;
+  act(() => button.focus());
+  expect(fireEvent.keyDown(button, { key: "Enter" })).toBe(true);
+  fireEvent.click(button);
+  expect(posted.at(-1)).toMatchObject({ type: "history_request", tab: 1, action: "older" });
+  page(0);
+  expect(container.querySelector(".history-load")).toBeNull();
+  expect(container.querySelector(".history-gap")?.textContent).toBe("2 newer turns not loaded.");
+  page(2); expect(container.querySelector(".history-gap")).toBeNull();
+  page(0); clear(); expect(container.querySelector(".history-gap")).toBeNull();
+});
+it.each(["latest", "reset", "switch"])("clears the gap silently on %s", (how) => {
+  const { container } = live(); page(0);
+  if (how === "latest") clear();
+  if (how === "reset") dispatch({ kind: "events", tab: 1, events: [{ type: "conversation_reset", new_conversation_id: "new", trigger: null }] });
+  if (how === "switch") dispatch({ kind: "tabs", active: 2, tabs: [{ id: 2, number: 2, label: "2", state: "live", mode: "auto", pending: 0, resumable: true }] });
+  expect(container.querySelector(".history-gap")).toBeNull();
+  expect(band(container)).not.toContain("unloaded"); expect(band(container)).not.toContain("released");
+});
+it.each([false, true])("flashes an empty read once with held=%s and ignores another tab's result", (heldPage) => {
+  const { container } = live(); if (heldPage) page(1); const held = keys(container);
+  dispatch({ kind: "history_page", tab: 2, requestId: "foreign", empty: true });
+  expect(band(container)).not.toContain("No older");
+  dispatch({ kind: "history_page", tab: 1, requestId: "empty", empty: true });
+  expect(band(container)).toBe("No older turns could be loaded."); expect(keys(container)).toEqual(held);
+  act(() => vi.advanceTimersByTime(10000)); expect(band(container)).not.toContain("No older");
+});
+it.each([1, 8])("flashes only an automatic page release using envelope count %s despite a stale page base", (turns) => {
+  const { container } = live(); page(1);
+  dispatch({ kind: "history_page", tab: 1, cleared: true, reason: "released", turns });
+  expect(band(container)).toBe(`The loaded page was released to make room; ${turns} earlier turn${turns === 1 ? "" : "s"} not loaded.`);
+  expect(keys(container).every((k) => !k?.startsWith("h:"))).toBe(true);
+  act(() => vi.advanceTimersByTime(10000)); page(1); page(0); clear();
+  expect(band(container)).not.toContain("released"); expect(band(container)).not.toContain("cursor moved");
+});
+it("flashes once when eviction removes the cursor's row, but not a surviving row", () => {
+  const { container } = live(); press(container, "g"); press(container, "g");
+  dispatch({ kind: "events", tab: 1, events: [{ type: "history_evicted", through_seq: 41, turns: 4, lifted: [] }] });
+  expect(band(container)).toBe("Earlier turns were unloaded; the cursor moved to the first loaded row.");
+  expect(container.querySelector(".row-current")?.getAttribute("data-row-key")).toBe("m-41");
+  act(() => vi.advanceTimersByTime(10000));
+  dispatch({ kind: "events", tab: 1, events: [{ type: "history_evicted", through_seq: 41, turns: 5, lifted: [] }] });
+  expect(band(container)).not.toContain("cursor moved");
+});
+it.each(["/", "?"])("%s and n/N explain search misses using all unloaded turns, including the gap", (key) => {
+  const { container } = live(); page(0); pause(); press(container, key);
+  const input = container.querySelector<HTMLInputElement>(".search-bar input")!;
+  fireEvent.change(input, { target: { value: "absent" } }); fireEvent.keyDown(input, { key: "Enter" });
+  const expected = "pattern not found in loaded turns: absent (2 earlier turns not loaded)";
+  expect(band(container)).toBe(expected);
+  for (const repeat of ["n", "N"]) { pause(); press(container, repeat); expect(band(container)).toBe(expected); }
+  dispatch({ kind: "history_page", tab: 1, requestId: "all", fromTurn: 0, toTurn: 3,
+    records: [old, ...[10, 20].map((seq) => ({ ...initialState(), userPrompts: [{ seq, text: `archived ${seq}` }] }))] });
+  pause(); press(container, "n"); expect(band(container)).toBe("pattern not found: absent");
+  clear(); pause(); press(container, "n");
+  expect(band(container)).toBe("pattern not found in loaded turns: absent (3 earlier turns not loaded)");
+  dispatch({ kind: "snapshot", tab: 1, throughRevision: 30, state: { ...old, status: { kind: "running" }, evicted: null } });
+  pause(); press(container, "n"); expect(band(container)).toBe("pattern not found: absent");
+});
+
+it.each(["/", "?"])("region %s misses explain which turns were searched", (direction) => {
+  const { container } = live();
+  const selection = window.getSelection()!;
+  Object.defineProperty(selection, "modify", { value: vi.fn(), configurable: true });
+  pause(); press(container, "v");
+  expect(container.querySelector('[data-testid="mode-block"]')?.getAttribute("data-mode")).toBe("caret");
+  pause(); press(container, direction);
+  const input = container.querySelector<HTMLInputElement>(".search-bar input")!;
+  fireEvent.change(input, { target: { value: "absent" } });
+  fireEvent.keyDown(input, { key: "Enter" });
+  expect(band(container)).toBe("pattern not found in loaded turns: absent (3 earlier turns not loaded)");
+  selection.removeAllRanges();
+});
+
+it("silently clamps a cursor on a page the user replaced or released", () => {
+  const { container } = live(); page(1);
+  press(container, "g"); press(container, "g");
+  expect(container.querySelector(".row-current")?.getAttribute("data-row-key")).toBe("h:u-0");
+  dispatch({ kind: "history_page", tab: 1, requestId: "older", fromTurn: 0, toTurn: 1,
+    records: [{ ...initialState(), userPrompts: [{ seq: 10, text: "different archived turn" }] }] });
+  expect(container.querySelector(".row-current")?.getAttribute("data-row-key")).toBe("h:u-10");
+  expect(band(container)).not.toContain("cursor moved");
+  clear();
+  expect(container.querySelector(".row-current")?.getAttribute("data-row-key")).toBe("u-40");
+  expect(band(container)).not.toContain("cursor moved"); expect(band(container)).not.toContain("released");
+});
+
+it("uses singular wording when a search misses with one earlier turn unloaded", () => {
+  const { container } = live();
+  dispatch({ kind: "history_page", tab: 1, requestId: "two", fromTurn: 1, toTurn: 3,
+    records: [old, { ...initialState(), userPrompts: [{ seq: 10, text: "another archived prompt" }] }] });
+  pause(); press(container, "/");
+  const input = container.querySelector<HTMLInputElement>(".search-bar input")!;
+  fireEvent.change(input, { target: { value: "absent" } });
+  fireEvent.keyDown(input, { key: "Enter" });
+  expect(band(container)).toBe("pattern not found in loaded turns: absent (1 earlier turn not loaded)");
 });
