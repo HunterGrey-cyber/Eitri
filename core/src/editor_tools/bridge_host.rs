@@ -384,16 +384,17 @@ fn in_the_way(why: String) -> io::Error {
 
 /// Binds `path`, taking a socket in the way only when nothing listens on it, and leaves the socket 0600.
 fn claim(dir: &Path, hex: &str, path: PathBuf) -> io::Result<(OwnedFd, BoundPath)> {
+    let handle = agent::private_fs::open_dir(dir)?;
     let busy = |error: &io::Error| error.kind() == io::ErrorKind::AddrInUse;
     match listen_at(&path) {
-        Ok(fd) => return own(fd, path),
+        Ok(fd) => return own(&handle, fd, path),
         Err(error) if busy(&error) => {}
         Err(error) => return Err(error),
     }
     // Held until the new socket is bound, so a reclaim and its bind are never split by another claim.
     let _lock = ReclaimLock::take(&lock_path(dir, hex))?;
     match listen_at(&path) {
-        Ok(fd) => return own(fd, path),
+        Ok(fd) => return own(&handle, fd, path),
         Err(error) if busy(&error) => {}
         Err(error) => return Err(error),
     }
@@ -416,20 +417,25 @@ fn claim(dir: &Path, hex: &str, path: PathBuf) -> io::Result<(OwnedFd, BoundPath
         )));
     }
     std::fs::remove_file(&path)?;
-    own(listen_at(&path)?, path)
+    own(&handle, listen_at(&path)?, path)
 }
 
-fn own(fd: OwnedFd, path: PathBuf) -> io::Result<(OwnedFd, BoundPath)> {
+/// Makes the socket just bound at `path` private through `handle`, the directory it is in, and only while the name is
+/// still that socket. When that fails, only that socket is removed, never what a link put at the name meanwhile
+/// points at.
+fn own(handle: &std::fs::File, fd: OwnedFd, path: PathBuf) -> io::Result<(OwnedFd, BoundPath)> {
+    let identity = identity(&path).ok_or_else(|| io::Error::other("the socket file went as it was bound"))?;
+    let bound = panel_control::file_identity(identity);
+    #[cfg(test)]
+    panel_control::before_socket_chmod::run();
     // `bind` leaves the umask's mode on the file.
-    let made = std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600))
-        .and_then(|()| identity(&path).ok_or_else(|| io::Error::other("the socket file went as it was bound")));
-    match made {
-        Ok(identity) => Ok((fd, BoundPath { path, identity })),
-        Err(error) => {
-            let _ = std::fs::remove_file(&path);
-            Err(error)
+    if let Err(error) = panel_control::make_control_socket_private(handle, &path, bound) {
+        if let Some(name) = path.file_name() {
+            let _ = agent::private_fs::remove_if_same(handle, name, bound);
         }
+        return Err(error);
     }
+    Ok((fd, BoundPath { path, identity }))
 }
 
 fn eventfd() -> io::Result<OwnedFd> {
@@ -1469,6 +1475,26 @@ mod tests {
         assert_eq!(error.kind(), io::ErrorKind::AddrInUse, "{error}");
         drop(lock);
         host.adopt(1, &name(), tools()).expect("reclaims");
+    }
+
+    #[test]
+    fn a_link_put_at_the_socket_between_bind_and_chmod_is_refused_and_its_target_keeps_its_mode() {
+        let scratch = Scratch::new();
+        let host = host(&scratch);
+        let path = file_name(&name().hex, &scratch.control());
+        let target = scratch.0.join("target");
+        std::fs::write(&target, "kept").expect("writes");
+        std::fs::set_permissions(&target, std::fs::Permissions::from_mode(0o640)).expect("sets it");
+        let (planted_path, planted_target) = (path.clone(), target.clone());
+        panel_control::before_socket_chmod::set(Box::new(move || {
+            std::fs::remove_file(&planted_path).expect("removes the socket");
+            std::os::unix::fs::symlink(&planted_target, &planted_path).expect("links");
+        }));
+        let adopted = host.adopt(1, &name(), tools());
+        assert_eq!(std::fs::metadata(&target).expect("still there").mode() & 0o777, 0o640);
+        assert!(adopted.is_err(), "{adopted:?}");
+        assert!(path.symlink_metadata().expect("still").file_type().is_symlink());
+        assert_eq!(std::fs::read_to_string(&target).expect("reads"), "kept");
     }
 
     /// The file outlives the claim, and a strict umask takes bits from the mode asked for when it is made: a later

@@ -36,7 +36,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::io;
 use std::os::fd::{AsFd, AsRawFd, FromRawFd, OwnedFd, RawFd};
-use std::os::unix::fs::{FileTypeExt, MetadataExt, OpenOptionsExt, PermissionsExt};
+use std::os::unix::fs::{FileTypeExt, MetadataExt, OpenOptionsExt};
 use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
@@ -252,6 +252,27 @@ impl ReclaimLock {
     }
 }
 
+/// A test's look at the moment between the orphan socket's bind and its chmod, when the name could be replaced.
+#[cfg(test)]
+mod before_socket_chmod {
+    use std::cell::RefCell;
+
+    thread_local! {
+        static HOOK: RefCell<Option<Box<dyn FnMut()>>> = RefCell::new(None);
+    }
+
+    pub(super) fn set(hook: Box<dyn FnMut()>) {
+        HOOK.with(|cell| *cell.borrow_mut() = Some(hook));
+    }
+
+    pub(super) fn run() {
+        let hook = HOOK.with(|cell| cell.borrow_mut().take());
+        if let Some(mut hook) = hook {
+            hook();
+        }
+    }
+}
+
 /// The orphan's listening socket. Removed when it is dropped, if the file there is still the one bound here.
 #[derive(Debug)]
 pub struct OrphanSocket {
@@ -272,16 +293,17 @@ impl OrphanSocket {
     pub fn bind_as(dir: &Path, project_root: &Path, name: &WindowName) -> Result<OrphanSocket, String> {
         eitri_core::panel_control::ensure_dir(dir)?;
         let path = socket_path_for(dir, project_root, name).map_err(|e| e.to_string())?;
+        let handle = agent::private_fs::open_dir(dir).map_err(|e| format!("could not open {}: {e}", dir.display()))?;
         let busy = |e: &io::Error| e.kind() == io::ErrorKind::AddrInUse;
         match listen_at(&path) {
-            Ok(fd) => return OrphanSocket::bound(fd, path),
+            Ok(fd) => return OrphanSocket::bound(&handle, fd, path),
             Err(e) if busy(&e) => {}
             Err(e) => return Err(format!("could not bind {}: {e}", path.display())),
         }
         // Held until the new socket is bound, so a reclaim and its bind are never split by another claim.
         let _lock = ReclaimLock::take(&lock_path_for(dir, project_root, name))?;
         match listen_at(&path) {
-            Ok(fd) => return OrphanSocket::bound(fd, path),
+            Ok(fd) => return OrphanSocket::bound(&handle, fd, path),
             Err(e) if busy(&e) => {}
             Err(e) => return Err(format!("could not bind {}: {e}", path.display())),
         }
@@ -300,21 +322,29 @@ impl OrphanSocket {
         }
         std::fs::remove_file(&path).map_err(|e| format!("could not remove the stale {}: {e}", path.display()))?;
         let fd = listen_at(&path).map_err(|e| format!("could not bind {}: {e}", path.display()))?;
-        OrphanSocket::bound(fd, path)
+        OrphanSocket::bound(&handle, fd, path)
     }
 
-    fn bound(listener: OwnedFd, path: PathBuf) -> Result<OrphanSocket, String> {
-        let remove = |why: String| {
-            let _ = std::fs::remove_file(&path);
-            Err(why)
-        };
-        // `bind` leaves the umask's mode on the file.
-        if let Err(e) = std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)) {
-            return remove(format!("could not set the mode of {}: {e}", path.display()));
-        }
+    /// Makes the socket just bound at `path` private through `dir`, the directory it is in, and only while the name
+    /// is still that socket. When that fails, only that socket is removed, never what a link put at the name
+    /// meanwhile points at.
+    fn bound(dir: &std::fs::File, listener: OwnedFd, path: PathBuf) -> Result<OrphanSocket, String> {
         let Some(bound) = identity(&path) else {
-            return remove(format!("could not read {}", path.display()));
+            return Err(format!("could not read {}", path.display()));
         };
+        let held = agent::private_fs::FileIdentity {
+            dev: bound.0,
+            ino: bound.1,
+        };
+        #[cfg(test)]
+        before_socket_chmod::run();
+        // `bind` leaves the umask's mode on the file.
+        if let Err(e) = eitri_core::panel_control::make_control_socket_private(dir, &path, held) {
+            if let Some(name) = path.file_name() {
+                let _ = agent::private_fs::remove_if_same(dir, name, held);
+            }
+            return Err(format!("could not set the mode of {}: {e}", path.display()));
+        }
         Ok(OrphanSocket { listener, path, bound })
     }
 

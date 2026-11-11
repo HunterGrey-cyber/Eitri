@@ -205,6 +205,26 @@ fn an_orphaned_window_2_binds_its_socket_with_panel_controls_posture() {
     assert_eq!(mode, 0o777);
 }
 
+#[test]
+fn a_link_put_at_window_2s_socket_between_bind_and_chmod_is_refused_and_its_target_keeps_its_mode() {
+    let run = RunDir::new();
+    let path = socket_path(&run.dir, &root()).unwrap();
+    let target = run.top.join("target");
+    std::fs::write(&target, b"kept").unwrap();
+    std::fs::set_permissions(&target, std::fs::Permissions::from_mode(0o640)).unwrap();
+    let (planted_path, planted_target) = (path.clone(), target.clone());
+    super::before_socket_chmod::set(Box::new(move || {
+        std::fs::remove_file(&planted_path).unwrap();
+        std::os::unix::fs::symlink(&planted_target, &planted_path).unwrap();
+    }));
+    let bound = OrphanSocket::bind(&run.dir, &root());
+    assert_eq!(std::fs::metadata(&target).unwrap().permissions().mode() & 0o7777, 0o640);
+    let err = bound.unwrap_err();
+    assert!(err.contains("could not set the mode"), "{err}");
+    assert!(path.symlink_metadata().unwrap().file_type().is_symlink());
+    assert_eq!(std::fs::read(&target).unwrap(), b"kept");
+}
+
 /// Window 2's pair over a socketpair whose other end the test plays as window 1, linked by a real `welcome` with
 /// the pair lock, its hooks those of a window: the end of the link starts the orphan's listener.
 struct LinkedSecond {

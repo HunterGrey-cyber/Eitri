@@ -671,8 +671,8 @@ fn read_pid_record(pid_file: &Path) -> Option<PidRecord> {
 /// link included (`EADDRINUSE`). macOS's follows a symbolic link at the name and makes the socket where the link
 /// points, so there a name that exists, whatever it is, is answered `AddrInUse` before `bind` is asked, and the
 /// caller's stale-socket check judges what is there (a link is never this user's socket). A link put at the name
-/// between that look and the bind would still be followed; the control directory is this user's own 0700 one, so
-/// only this user could put it there.
+/// between that look and the bind would still be followed. The 0700 control directory and its immediate parent
+/// are checked, but a replaceable ancestor above them still permits pathname substitution.
 pub(crate) fn bind_unfollowed(sock: &Path) -> io::Result<UnixListener> {
     #[cfg(target_os = "macos")]
     if sock.symlink_metadata().is_ok() {
@@ -682,6 +682,93 @@ pub(crate) fn bind_unfollowed(sock: &Path) -> io::Result<UnixListener> {
         ));
     }
     UnixListener::bind(sock)
+}
+
+/// Makes a newly bound control socket private through its held directory. The pathname and the entry in
+/// `dir` must both still be the socket the caller bound (`bound`, its device and inode) and this user's;
+/// anything else, a link included, is refused before the mode changes.
+///
+/// The mode is set with `fchmodat(AT_SYMLINK_NOFOLLOW)`, because `fchmod` on a socket descriptor cannot
+/// reach the node in the file system. glibc 2.32 and later, musl and macOS all implement that flag for a
+/// name that is not a link. A libc or kernel without it answers `ENOSYS` or `EOPNOTSUPP`; only then, and
+/// only when the entry is still the checked socket, the call is repeated without the flag (glibc also
+/// answers `EOPNOTSUPP` for a link put at the name meanwhile, which that second check refuses). The
+/// fallback leaves a change by this same user between its check and the chmod possible.
+pub fn make_control_socket_private(
+    dir: &std::fs::File,
+    path: &Path,
+    bound: agent::private_fs::FileIdentity,
+) -> io::Result<()> {
+    let meta = path.symlink_metadata()?;
+    if !meta.file_type().is_socket() || meta.uid() != euid() {
+        return Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            "not this user's socket",
+        ));
+    }
+    if (meta.dev(), meta.ino()) != (bound.dev, bound.ino) {
+        return Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            "not the socket that was bound",
+        ));
+    }
+    let name = path
+        .file_name()
+        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "socket has no file name"))?;
+    let name = std::ffi::CString::new(name.as_bytes())?;
+    entry_is_bound_socket(dir, &name, bound)?;
+    // SAFETY: the directory descriptor and the NUL-terminated entry name are valid for the call.
+    let chmod = |flags| unsafe { libc::fchmodat(dir.as_raw_fd(), name.as_ptr(), 0o600, flags) };
+    if chmod(libc::AT_SYMLINK_NOFOLLOW) == 0 {
+        return Ok(());
+    }
+    let refused = io::Error::last_os_error();
+    let code = refused.raw_os_error();
+    let unsupported = code == Some(libc::ENOSYS) || code == Some(libc::EOPNOTSUPP) || code == Some(libc::ENOTSUP);
+    if !unsupported {
+        return Err(refused);
+    }
+    entry_is_bound_socket(dir, &name, bound)?;
+    if chmod(0) != 0 {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(())
+}
+
+/// `Ok` when `name` in `dir`, looked at without following a link, is this user's socket `bound`.
+fn entry_is_bound_socket(
+    dir: &std::fs::File,
+    name: &std::ffi::CStr,
+    bound: agent::private_fs::FileIdentity,
+) -> io::Result<()> {
+    let mut stat = std::mem::MaybeUninit::<libc::stat>::uninit();
+    // SAFETY: the descriptor is `dir`'s own and open, `name` is NUL-terminated, and `stat` is a buffer of
+    // the size `fstatat` writes; all three outlive the call.
+    if unsafe {
+        libc::fstatat(
+            dir.as_raw_fd(),
+            name.as_ptr(),
+            stat.as_mut_ptr(),
+            libc::AT_SYMLINK_NOFOLLOW,
+        )
+    } != 0
+    {
+        return Err(io::Error::last_os_error());
+    }
+    // SAFETY: `fstatat` returned 0, so it filled the buffer.
+    let stat = unsafe { stat.assume_init() };
+    // The widths of these two fields differ from one unix to another.
+    #[allow(clippy::unnecessary_cast)]
+    let named = (stat.st_dev as u64, stat.st_ino as u64);
+    if stat.st_mode & libc::S_IFMT != libc::S_IFSOCK || stat.st_uid != euid() || named != (bound.dev, bound.ino) {
+        return Err(io::Error::new(io::ErrorKind::PermissionDenied, "socket name changed"));
+    }
+    Ok(())
+}
+
+/// The same pair as [`identity`] gives, in the form `agent::private_fs` takes.
+pub(crate) fn file_identity((dev, ino): (u64, u64)) -> agent::private_fs::FileIdentity {
+    agent::private_fs::FileIdentity { dev, ino }
 }
 
 /// `(device, inode)` of `path` itself, not of what a link there points at.
@@ -834,6 +921,7 @@ pub fn forward(dir: &Path, control_key: &ControlKey<'_>, request: &Request) -> R
 pub fn claim_for(dir: &Path, control_key: &ControlKey<'_>, request: Option<&Request>) -> Result<Claim, String> {
     ensure_dir(dir)?;
     let sock = socket_path_for(dir, control_key).map_err(|e| e.to_string())?;
+    let dir_handle = agent::private_fs::open_dir(dir).map_err(|e| format!("could not open {}: {e}", dir.display()))?;
     let pid_file = sock.with_extension("pid");
     let lock_file = sock.with_extension("lock");
     let page = matches!(control_key, ControlKey::Page { .. });
@@ -843,7 +931,7 @@ pub fn claim_for(dir: &Path, control_key: &ControlKey<'_>, request: Option<&Requ
     let mut reclaimed = false;
     for _ in 0..MAX_CLAIM_ROUNDS {
         match bind_unfollowed(&sock) {
-            Ok(listener) => return serve(listener, sock, pid_file, page).map(Claim::Ours),
+            Ok(listener) => return serve(&dir_handle, listener, sock, pid_file, page).map(Claim::Ours),
             Err(e) if e.kind() == io::ErrorKind::AddrInUse => {}
             Err(e) => return Err(format!("could not bind {}: {e}", sock.display())),
         }
@@ -883,6 +971,28 @@ pub fn claim_for(dir: &Path, control_key: &ControlKey<'_>, request: Option<&Requ
     ))
 }
 
+/// A test's look at the moment between a control socket's bind and its chmod, when the name could be
+/// replaced. Shared by every caller of [`make_control_socket_private`] that has one.
+#[cfg(test)]
+pub(crate) mod before_socket_chmod {
+    use std::cell::RefCell;
+
+    thread_local! {
+        static HOOK: RefCell<Option<Box<dyn FnMut()>>> = RefCell::new(None);
+    }
+
+    pub(crate) fn set(hook: Box<dyn FnMut()>) {
+        HOOK.with(|cell| *cell.borrow_mut() = Some(hook));
+    }
+
+    pub(crate) fn run() {
+        let hook = HOOK.with(|cell| cell.borrow_mut().take());
+        if let Some(mut hook) = hook {
+            hook();
+        }
+    }
+}
+
 /// A test's look at the moment between a reclaim's two removals, when another claimant could act.
 #[cfg(test)]
 mod between_removals {
@@ -905,14 +1015,22 @@ mod between_removals {
 }
 
 /// The bound socket's side of a won claim: finishes setting it up and starts the thread.
-fn serve(listener: UnixListener, sock: PathBuf, pid_file: PathBuf, page: bool) -> Result<ControlServer, String> {
+fn serve(
+    dir: &std::fs::File,
+    listener: UnixListener,
+    sock: PathBuf,
+    pid_file: PathBuf,
+    page: bool,
+) -> Result<ControlServer, String> {
     let bound = identity(&sock).ok_or_else(|| format!("could not read {}", sock.display()))?;
+    #[cfg(test)]
+    before_socket_chmod::run();
     let started = (|| -> Result<ControlServer, String> {
         listener
             .set_nonblocking(true)
             .map_err(|e| format!("could not make {} non-blocking: {e}", sock.display()))?;
         // `bind` leaves the umask's mode on the file.
-        std::fs::set_permissions(&sock, std::fs::Permissions::from_mode(0o600))
+        make_control_socket_private(dir, &sock, file_identity(bound))
             .map_err(|e| format!("could not set the mode of {}: {e}", sock.display()))?;
         let tmp = pid_file.with_extension("pid.tmp");
         agent::private_fs::write_private(&tmp, PidRecord::own().line().as_bytes())
@@ -1481,6 +1599,75 @@ mod tests {
         assert!(claim(&dir, &root(), None).is_err());
         assert!(sock.symlink_metadata().unwrap().file_type().is_symlink());
         assert!(target.symlink_metadata().is_err(), "the bind went through the link");
+    }
+
+    #[test]
+    fn a_link_planted_before_socket_chmod_is_refused_and_its_target_keeps_its_mode() {
+        let scratch = ScratchDir::new("eitri-pc", "chmod-link");
+        let dir = agent::private_fs::open_dir(&scratch).unwrap();
+        let target = scratch.join("target");
+        std::fs::write(&target, "kept").unwrap();
+        std::fs::set_permissions(&target, std::fs::Permissions::from_mode(0o640)).unwrap();
+        let sock = socket_path(&scratch, &root()).unwrap();
+        symlink(&target, &sock).unwrap();
+        let result = make_control_socket_private(&dir, &sock, file_identity(identity(&sock).unwrap()));
+        assert_eq!(target.metadata().unwrap().mode() & 0o777, 0o640);
+        assert_eq!(result.unwrap_err().kind(), io::ErrorKind::PermissionDenied);
+        assert!(sock.symlink_metadata().unwrap().file_type().is_symlink());
+    }
+
+    #[test]
+    fn a_regular_file_at_socket_chmod_is_refused_and_keeps_its_mode() {
+        let scratch = ScratchDir::new("eitri-pc", "chmod-file");
+        let dir = agent::private_fs::open_dir(&scratch).unwrap();
+        let sock = socket_path(&scratch, &root()).unwrap();
+        std::fs::write(&sock, "kept").unwrap();
+        std::fs::set_permissions(&sock, std::fs::Permissions::from_mode(0o640)).unwrap();
+        let result = make_control_socket_private(&dir, &sock, file_identity(identity(&sock).unwrap()));
+        assert_eq!(sock.metadata().unwrap().mode() & 0o777, 0o640);
+        assert_eq!(result.unwrap_err().kind(), io::ErrorKind::PermissionDenied);
+    }
+
+    #[test]
+    fn another_socket_at_the_name_than_the_one_bound_is_refused_and_keeps_its_mode() {
+        let scratch = ScratchDir::new("eitri-pc", "chmod-other");
+        let dir = agent::private_fs::open_dir(&scratch).unwrap();
+        let sock = socket_path(&scratch, &root()).unwrap();
+        let first = UnixListener::bind(&sock).unwrap();
+        let bound = identity(&sock).unwrap();
+        // A second name keeps the first inode from being reused for the socket that replaces it.
+        std::fs::hard_link(&sock, scratch.join("first-kept")).unwrap();
+        std::fs::remove_file(&sock).unwrap();
+        drop(first);
+        let _second = UnixListener::bind(&sock).unwrap();
+        assert_ne!(identity(&sock), Some(bound));
+        std::fs::set_permissions(&sock, std::fs::Permissions::from_mode(0o644)).unwrap();
+        let result = make_control_socket_private(&dir, &sock, file_identity(bound));
+        assert_eq!(result.unwrap_err().kind(), io::ErrorKind::PermissionDenied);
+        assert_eq!(sock.symlink_metadata().unwrap().mode() & 0o777, 0o644);
+        // The socket that is there is made private when it is the one named.
+        make_control_socket_private(&dir, &sock, file_identity(identity(&sock).unwrap())).unwrap();
+        assert_eq!(sock.symlink_metadata().unwrap().mode() & 0o777, 0o600);
+    }
+
+    #[test]
+    fn a_link_put_at_the_control_socket_between_bind_and_chmod_is_refused_and_its_target_keeps_its_mode() {
+        let scratch = ScratchDir::new("eitri-pc", "chmod-claim");
+        let dir = scratch.join("c");
+        ensure_dir(&dir).unwrap();
+        let sock = socket_path(&dir, &root()).unwrap();
+        let target = scratch.join("target");
+        std::fs::write(&target, "kept").unwrap();
+        std::fs::set_permissions(&target, std::fs::Permissions::from_mode(0o640)).unwrap();
+        let (planted_sock, planted_target) = (sock.clone(), target.clone());
+        before_socket_chmod::set(Box::new(move || {
+            std::fs::remove_file(&planted_sock).unwrap();
+            symlink(&planted_target, &planted_sock).unwrap();
+        }));
+        let claimed = claim(&dir, &root(), None);
+        assert_eq!(target.metadata().unwrap().mode() & 0o777, 0o640);
+        assert!(claimed.is_err(), "{:?}", claimed.map(|_| ()));
+        assert!(sock.symlink_metadata().unwrap().file_type().is_symlink());
     }
 
     #[test]

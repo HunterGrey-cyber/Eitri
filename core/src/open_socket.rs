@@ -36,23 +36,26 @@
 //!
 //! A socket in the way is reclaimed only under `open-<key>.lock`, only when a connect is refused twice
 //! a moment apart (a claimant between `bind` and `listen` refuses the first one), and only the very
-//! socket that was probed. A socket with a listener is another window's. This window then binds
+//! socket that was probed. Each server also holds its socket's `.alive` lock from before bind until
+//! close: a refused connect can mean a full accept queue, so reclaim must take that lock too.
+//! A socket with a listener or a held liveness lock is another window's. This window then binds
 //! `open-<key>-<pid>.sock`, which nobody looks up by root: only its own terminals are told the name.
 //! A crash leaves that file behind until the runtime directory goes, at logout.
 
 use crate::instance_dir::{nonblocking_connect_outcome, ConnectOutcome};
 use crate::panel_control::{
-    bind_unfollowed, ensure_dir, euid, identity, peer_uid, read_line, remove_own_socket, reply_line, take_reclaim_lock,
-    validate_nvim_addr, LineFail, MAX_LINE, REQUEST_DEADLINE,
+    bind_unfollowed, ensure_dir, euid, file_identity, identity, make_control_socket_private, peer_uid, read_line,
+    remove_own_socket, reply_line, take_reclaim_lock, validate_nvim_addr, LineFail, MAX_LINE, REQUEST_DEADLINE,
 };
 use crate::project_root::OpenTarget;
+use agent::private_fs::PrivateLock;
 use serde::{Deserialize, Serialize};
 use std::cell::Cell;
 use std::fmt;
 use std::io::{self, Read, Write};
 use std::os::fd::{AsRawFd, RawFd};
 use std::os::unix::ffi::OsStrExt;
-use std::os::unix::fs::{FileTypeExt, MetadataExt, PermissionsExt};
+use std::os::unix::fs::{FileTypeExt, MetadataExt};
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU8, Ordering};
@@ -479,6 +482,7 @@ mod test_hook {
 
     thread_local! {
         static HOOK: RefCell<Option<Box<dyn FnMut()>>> = RefCell::new(None);
+        pub(super) static REFUSED: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
     }
 
     pub(super) fn set(hook: Box<dyn FnMut()>) {
@@ -493,19 +497,46 @@ mod test_hook {
     }
 }
 
-/// Whether a connect to `sock` is refused, the one proof that nothing listens there.
+/// Whether a connect to `sock` is refused. A full accept queue can also refuse on macOS.
 fn refused(sock: &Path) -> bool {
+    #[cfg(test)]
+    if test_hook::REFUSED.with(|forced| forced.get()) {
+        return true;
+    }
     nonblocking_connect_outcome(sock) == ConnectOutcome::NoListener
+}
+
+struct BoundSocket {
+    listener: UnixListener,
+    alive: PrivateLock,
+}
+
+/// The root's file stays in place across owners, so every claimant locks the same inode. A pid-named
+/// one is removed by its holder's `close`; only this process ever claims that name, and its claims and
+/// closes run one after another on one thread, so no claim of it can lock the file being removed.
+fn liveness_lock(sock: &Path) -> Result<Option<PrivateLock>, String> {
+    let path = sock.with_extension("alive");
+    let lock = PrivateLock::open(&path).map_err(|e| format!("could not open {}: {e}", path.display()))?;
+    match lock.try_lock() {
+        Ok(true) => Ok(Some(lock)),
+        Ok(false) => Ok(None),
+        Err(e) => Err(format!("could not lock {}: {e}", path.display())),
+    }
 }
 
 /// Replaces `sock` if it is a leftover; `None` when something else holds it. A link or a file that is
 /// not this user's socket is an error: it is left, and a connect would go through the link. A socket
 /// that goes away meanwhile was a window closing, and its name is free to bind.
-fn reclaim(sock: &Path) -> Result<Option<UnixListener>, String> {
+fn reclaim(sock: &Path) -> Result<Option<BoundSocket>, String> {
     let probed = match sock.symlink_metadata() {
         Ok(meta) if meta.file_type().is_socket() && meta.uid() == euid() => (meta.dev(), meta.ino()),
         Err(e) if e.kind() == io::ErrorKind::NotFound => return try_bind(sock),
         _ => return Err(format!("{} is not this user's socket; not touching it", sock.display())),
+    };
+    // A missing file belongs to the older layout. Creating and holding it excludes new servers
+    // while the two probes below still decide whether that older socket is stale.
+    let Some(alive) = liveness_lock(sock)? else {
+        return Ok(None);
     };
     if !refused(sock) {
         return Ok(None);
@@ -521,21 +552,27 @@ fn reclaim(sock: &Path) -> Result<Option<UnixListener>, String> {
         Some(_) => return Ok(None),
         None => {}
     }
-    // A claimant needs no lock to bind a free name, so one may have got there first.
-    try_bind(sock)
+    bind_locked(sock, alive)
 }
 
 /// `bind`, never through a link at the name, with the name in use reported as `None`.
-fn try_bind(sock: &Path) -> Result<Option<UnixListener>, String> {
+fn try_bind(sock: &Path) -> Result<Option<BoundSocket>, String> {
+    let Some(alive) = liveness_lock(sock)? else {
+        return Ok(None);
+    };
+    bind_locked(sock, alive)
+}
+
+fn bind_locked(sock: &Path, alive: PrivateLock) -> Result<Option<BoundSocket>, String> {
     match bind_unfollowed(sock) {
-        Ok(listener) => Ok(Some(listener)),
+        Ok(listener) => Ok(Some(BoundSocket { listener, alive })),
         Err(e) if e.kind() == io::ErrorKind::AddrInUse => Ok(None),
         Err(e) => Err(format!("could not bind {}: {e}", sock.display())),
     }
 }
 
 /// Binds the root's socket, or this window's own when another window holds that one.
-fn bind(dir: &Path, root: &Path) -> Result<(UnixListener, PathBuf), String> {
+fn bind(dir: &Path, root: &Path) -> Result<(BoundSocket, PathBuf), String> {
     let sock = socket_path(dir, root).map_err(|e| e.to_string())?;
     if let Some(listener) = try_bind(&sock)? {
         return Ok((listener, sock));
@@ -563,6 +600,11 @@ fn bind(dir: &Path, root: &Path) -> Result<(UnixListener, PathBuf), String> {
 /// closes it.
 pub struct OpenServer {
     socket: PathBuf,
+    alive: Cell<Option<PrivateLock>>,
+    /// The control directory, for removing a pid-named socket's `.alive` file on close.
+    dir: std::fs::File,
+    /// Whether `socket` is this window's pid-named one rather than the root's.
+    pid_named: bool,
     /// `(device, inode)` of the socket this server bound, so a close leaves a newer window's alone.
     bound: (u64, u64),
     requests: Receiver<Incoming>,
@@ -586,9 +628,12 @@ impl OpenServer {
 
     fn claim_with(dir: &Path, root: &Path, waits: Waits) -> Result<OpenServer, String> {
         ensure_dir(dir)?;
-        let (listener, socket) = bind(dir, root)?;
+        let dir_handle =
+            agent::private_fs::open_dir(dir).map_err(|e| format!("could not open {}: {e}", dir.display()))?;
+        let (bound_socket, socket) = bind(dir, root)?;
         let bound = identity(&socket).ok_or_else(|| format!("could not read {}", socket.display()))?;
-        let started = OpenServer::start(listener, socket.clone(), bound, root, waits);
+        let pid_named = pid_socket_path(dir, root).is_ok_and(|own| own == socket);
+        let started = OpenServer::start(dir_handle, bound_socket, socket.clone(), bound, pid_named, root, waits);
         if started.is_err() && identity(&socket) == Some(bound) {
             remove_own_socket(&socket);
         }
@@ -596,19 +641,23 @@ impl OpenServer {
     }
 
     fn start(
-        listener: UnixListener,
+        dir: std::fs::File,
+        bound_socket: BoundSocket,
         socket: PathBuf,
         bound: (u64, u64),
+        pid_named: bool,
         root: &Path,
         waits: Waits,
     ) -> Result<OpenServer, String> {
+        let BoundSocket { listener, alive } = bound_socket;
         let failed = |what: &str, e: io::Error| format!("could not {what} for {}: {e}", socket.display());
         listener
             .set_nonblocking(true)
             .map_err(|e| failed("set up the listener", e))?;
+        #[cfg(test)]
+        crate::panel_control::before_socket_chmod::run();
         // `bind` leaves the umask's mode on the file.
-        std::fs::set_permissions(&socket, std::fs::Permissions::from_mode(0o600))
-            .map_err(|e| failed("set the mode", e))?;
+        make_control_socket_private(&dir, &socket, file_identity(bound)).map_err(|e| failed("set the mode", e))?;
         let (wake, wake_writer) = UnixStream::pair().map_err(|e| failed("make the wake socket", e))?;
         let (stop, thread_stop) = UnixStream::pair().map_err(|e| failed("make the stop socket", e))?;
         wake.set_nonblocking(true)
@@ -639,6 +688,9 @@ impl OpenServer {
             .map_err(|e| failed("start the thread", e))?;
         Ok(OpenServer {
             socket,
+            alive: Cell::new(Some(alive)),
+            dir,
+            pid_named,
             bound,
             requests,
             wake,
@@ -676,8 +728,10 @@ impl OpenServer {
 
     /// Removes the socket if it is still the one bound, then stops the thread. The socket goes first,
     /// while the listener can still answer: a claimant probing the path finds a listener or nothing,
-    /// never a refusal it would take for a leftover. Nothing waits for the thread, because this runs
-    /// on the GTK thread: it ends within its own bounds. Idempotent.
+    /// never a refusal it would take for a leftover. A pid-named socket's `.alive` file goes next, while
+    /// its lock is still held (only a window of this pid ever claims that name); the root's stays, the
+    /// one inode every claimant of the root locks. Nothing waits for the thread, because this runs on
+    /// the GTK thread: it ends within its own bounds. Idempotent.
     pub fn close(&self) {
         let Some(stop) = self.stop.take() else {
             return;
@@ -685,6 +739,14 @@ impl OpenServer {
         if identity(&self.socket) == Some(self.bound) {
             remove_own_socket(&self.socket);
         }
+        let alive = self.alive.take();
+        if let (true, Some(lock)) = (self.pid_named, &alive) {
+            let path = self.socket.with_extension("alive");
+            if let (Some(name), Ok(meta)) = (path.file_name(), lock.as_file().metadata()) {
+                let _ = agent::private_fs::remove_if_same(&self.dir, name, file_identity((meta.dev(), meta.ino())));
+            }
+        }
+        drop(alive);
         #[cfg(test)]
         test_hook::run();
         drop(stop);
@@ -1561,6 +1623,54 @@ mod tests {
     }
 
     #[test]
+    fn refused_probes_do_not_reclaim_a_live_servers_root_or_pid_socket() {
+        let fixture = fixture();
+        let first = fixture.server();
+        let first_bound = identity(first.socket());
+        // Force the refusal a full accept queue returns on macOS, independent of scheduling.
+        test_hook::REFUSED.with(|forced| forced.set(true));
+        let second = OpenServer::claim(&fixture.dir, &fixture.root);
+        test_hook::REFUSED.with(|forced| forced.set(false));
+        let second = second.unwrap();
+        assert_eq!(second.socket(), fixture.pid_socket());
+        assert_eq!(identity(first.socket()), first_bound);
+        let second_bound = identity(second.socket());
+        test_hook::REFUSED.with(|forced| forced.set(true));
+        let third = OpenServer::claim(&fixture.dir, &fixture.root);
+        test_hook::REFUSED.with(|forced| forced.set(false));
+        assert!(third.is_err());
+        assert_eq!(identity(first.socket()), first_bound);
+        assert_eq!(identity(second.socket()), second_bound);
+    }
+
+    #[test]
+    fn a_dead_holders_socket_with_a_released_liveness_lock_is_reclaimed() {
+        let fixture = fixture();
+        let sock = fixture.root_socket();
+        let alive = liveness_lock(&sock).unwrap().unwrap();
+        drop(UnixListener::bind(&sock).unwrap());
+        // A second name prevents the reclaimed inode from being reused for the new socket.
+        let kept = fixture.dir.join("dead-socket-kept");
+        std::fs::hard_link(&sock, &kept).unwrap();
+        let before = identity(&sock);
+        drop(alive);
+        let server = fixture.server();
+        assert_eq!(server.socket(), sock);
+        assert_ne!(identity(&sock), before);
+    }
+
+    #[test]
+    fn the_liveness_lock_is_private_exclusive_and_reusable_after_release() {
+        let fixture = fixture();
+        let sock = fixture.root_socket();
+        let alive = liveness_lock(&sock).unwrap().unwrap();
+        assert_eq!(sock.with_extension("alive").metadata().unwrap().mode() & 0o777, 0o600);
+        assert!(liveness_lock(&sock).unwrap().is_none());
+        drop(alive);
+        assert!(liveness_lock(&sock).unwrap().is_some());
+    }
+
+    #[test]
     fn a_leftover_pid_named_socket_is_reclaimed() {
         let fixture = fixture();
         let first = fixture.server();
@@ -1568,6 +1678,51 @@ mod tests {
         let second = fixture.server();
         assert_eq!(second.socket(), fixture.pid_socket());
         drop(first);
+    }
+
+    #[test]
+    fn a_link_put_at_the_name_between_bind_and_chmod_is_refused_and_its_target_keeps_its_mode() {
+        use std::os::unix::fs::PermissionsExt;
+        let fixture = fixture();
+        let target = fixture.outside("target");
+        std::fs::set_permissions(&target, std::fs::Permissions::from_mode(0o640)).unwrap();
+        let sock = fixture.root_socket();
+        let (planted_sock, planted_target) = (sock.clone(), target.clone());
+        crate::panel_control::before_socket_chmod::set(Box::new(move || {
+            std::fs::remove_file(&planted_sock).unwrap();
+            symlink(&planted_target, &planted_sock).unwrap();
+        }));
+        let claimed = OpenServer::claim(&fixture.dir, &fixture.root);
+        assert_eq!(target.metadata().unwrap().mode() & 0o777, 0o640);
+        assert!(claimed.is_err());
+        assert!(sock.symlink_metadata().unwrap().file_type().is_symlink());
+    }
+
+    #[test]
+    fn closing_a_pid_named_server_removes_its_alive_file_and_keeps_the_roots() {
+        let fixture = fixture();
+        let first = fixture.server();
+        let second = fixture.server();
+        assert_eq!(second.socket(), fixture.pid_socket());
+        let pid_alive = fixture.pid_socket().with_extension("alive");
+        let root_alive = fixture.root_socket().with_extension("alive");
+        assert!(pid_alive.exists());
+        drop(second);
+        assert!(
+            pid_alive.symlink_metadata().is_err(),
+            "the pid-named .alive file was left behind"
+        );
+        assert!(root_alive.exists());
+        drop(first);
+        assert!(
+            root_alive.exists(),
+            "the root's .alive file is shared by every claimant and stays"
+        );
+        // The name is free again for a later window of this pid.
+        let third = fixture.server();
+        let fourth = fixture.server();
+        assert_eq!(fourth.socket(), fixture.pid_socket());
+        drop((third, fourth));
     }
 
     #[test]

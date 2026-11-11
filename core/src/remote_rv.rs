@@ -27,7 +27,7 @@ use serde::{Deserialize, Serialize};
 use std::ffi::OsString;
 use std::io::{self, Read, Write};
 use std::os::fd::AsRawFd;
-use std::os::unix::fs::{MetadataExt, PermissionsExt};
+use std::os::unix::fs::MetadataExt;
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -724,9 +724,10 @@ where
         dev: meta.dev(),
         ino: meta.ino(),
     };
+    // `bind` leaves the umask's mode on the file.
+    let permissions = crate::panel_control::make_control_socket_private(&dir, &path, bound);
     let started = (move || -> io::Result<(UnixStream, Arc<AtomicBool>)> {
-        // `bind` leaves the umask's mode on the file.
-        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600))?;
+        permissions?;
         listener.set_nonblocking(true)?;
         let (stop_pair, stop_rx) = UnixStream::pair()?;
         let stop = Arc::new(AtomicBool::new(false));
