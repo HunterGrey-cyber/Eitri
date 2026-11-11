@@ -213,10 +213,12 @@ function runHolds(item: TimelineItem, seq: number): boolean {
 export function indexOfKey(items: TimelineItem[], key: string): number | null {
   const direct = items.findIndex((item) => item.key === key);
   if (direct !== -1) return direct;
-  const seq = memberSeq(key);
-  const inRun = items.findIndex((item) => runHolds(item, seq));
+  const historical = key.startsWith("h:");
+  const seq = memberSeq(historical ? key.slice(2) : key);
+  const sameSurface = (item: TimelineItem) => item.key.startsWith("h:") === historical;
+  const inRun = items.findIndex((item) => sameSurface(item) && runHolds(item, seq));
   if (inRun !== -1) return inRun;
-  const parent = items.findIndex((item) => item.kind === "tool" && holdsChild(item.call, seq));
+  const parent = items.findIndex((item) => sameSurface(item) && item.kind === "tool" && holdsChild(item.call, seq));
   return parent === -1 ? null : parent;
 }
 

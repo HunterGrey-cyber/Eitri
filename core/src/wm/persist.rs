@@ -859,6 +859,8 @@ struct WriterState {
     pending: Option<SaveJob>,
     /// Whether a job is being run now.
     running: bool,
+    /// A finished job's wake is still being posted; a flush must wait for it too.
+    waking: bool,
     /// Results the window has not taken yet, in the order their jobs ran.
     done: Vec<SaveDone>,
     /// The window is gone: the thread runs what is pending and ends.
@@ -952,13 +954,15 @@ impl LayoutWriter {
                 let mut state = shared.lock();
                 state.done.push(done);
                 state.running = false;
+                state.waking = true;
             }
-            shared.changed.notify_all();
             // Cloned out first, so the waker never runs with the lock held.
             let waker = shared.waker.lock().unwrap_or_else(|e| e.into_inner()).clone();
             if let Some(waker) = waker {
                 waker.wake();
             }
+            shared.lock().waking = false;
+            shared.changed.notify_all();
         }
     }
 
@@ -967,11 +971,11 @@ impl LayoutWriter {
         self.shared.changed.notify_all();
     }
 
-    /// Waits for every submitted job, at most `bound`; whether they all finished.
+    /// Waits for every submitted job and its completion wake, at most `bound`; whether they all finished.
     fn flush(&self, bound: Duration) -> bool {
         let deadline = Instant::now() + bound;
         let mut state = self.shared.lock();
-        while state.pending.is_some() || state.running {
+        while state.pending.is_some() || state.running || state.waking {
             let Some(left) = deadline
                 .checked_duration_since(Instant::now())
                 .filter(|left| !left.is_zero())
@@ -3077,6 +3081,35 @@ mod tests {
     }
 
     const WIN: crate::wm::WinId = crate::wm::WinId::MAIN;
+
+    #[test]
+    fn a_writer_flush_waits_until_its_completion_wake_is_posted() {
+        struct HeldWake(Arc<WriteGate>);
+        impl Waker for HeldWake {
+            fn wake(&self) {
+                self.0.hold();
+            }
+        }
+
+        let dir = agent::state_dirs::test_workspace_dir("layout-save-wake");
+        let mut layout = first_launch_layout(&[]).unwrap();
+        let workspaces = Workspaces::single();
+        let mut saver = Saver::new(Some(dir), root(), Vec::new(), None, &layout, &workspaces);
+        let wake = WriteGate::closed();
+        saver.set_waker(Arc::new(HeldWake(wake.clone())));
+        layout.show(&ModuleId::terminal()).unwrap();
+        assert!(saver.submit_now(&layout, &workspaces));
+        let reached_wake = wake.wait_held(1);
+        let flushed_before_wake = saver.writer.flush(Duration::ZERO);
+        // Release the worker even when an assertion below fails.
+        wake.open();
+        assert!(reached_wake);
+        assert!(!flushed_before_wake, "the write is complete but its wake is still held");
+        assert!(saver.writer.flush(Duration::from_secs(10)));
+        saver.collect(None);
+        assert!(saver.holds(&layout, &workspaces));
+        assert_eq!(saver.writes(), 1);
+    }
 
     #[test]
     fn a_layout_write_failure_toasts_once_until_a_write_succeeds() {

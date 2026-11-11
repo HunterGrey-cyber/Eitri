@@ -171,6 +171,7 @@ export function scrollTarget(
 
 /** An ex command the `:` line runs. `tabnew` carries the agent word typed after it, `null` for none. */
 export type ExCommand =
+  | { command: "history"; action: "older" | "latest" }
   | { command: "trust" | "untrust" }
   | { command: "tabnew"; agent: string | null }
   | { command: "scratch"; whole: boolean };
@@ -180,6 +181,7 @@ export type ExCommand =
  *  registered, and its refusal names every accepted word. */
 export function parseExCommand(line: string): ExCommand | null {
   const [head, argument, ...rest] = line.trim().split(/\s+/);
+  if (head === "history" && rest.length === 0 && (argument === "older" || argument === "latest")) return { command: "history", action: argument };
   if (head === "trust" || head === "untrust") return argument === undefined ? { command: head } : null;
   if (head === "scratch" || head === "%scratch") return argument === undefined ? { command: "scratch", whole: head === "%scratch" } : null;
   if (head === "tabnew" && rest.length === 0) return { command: "tabnew", agent: argument ?? null };

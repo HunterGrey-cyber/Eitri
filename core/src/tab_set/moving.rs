@@ -410,6 +410,7 @@ fn handoff_of(tab: &Tab, review: Option<ReviewHandoff>) -> TabHandoff {
         backend,
         // Counts this window's backends; the window it lands in counts its own.
         backend_generation: _,
+        history: _,
         // A stretch's number means something only in the window that counted it; the other window counts its own.
         unseen_stretch: _,
         session,
@@ -1203,6 +1204,7 @@ impl TabSet {
         let at = self.position(tab).ok_or(MoveRefusedWhy::NoTab)?;
         match &self.tabs[at].backend {
             TabBackend::NotStarted | TabBackend::AwaitingTrust(_) | TabBackend::Failed { .. } => {
+                self.release_history(tab);
                 self.moving.insert(tab.0);
                 self.observers.gone(tab, GoneWhy::Moved);
                 return Ok(FrozenTab {
@@ -1225,6 +1227,7 @@ impl TabSet {
                 agent::HandoffRefused::Folding => MoveRefusedWhy::Folding,
                 refused => MoveRefusedWhy::Conversation(refused.to_string()),
             })?;
+        self.release_history(tab);
         self.last_pump(tab, &project_root);
         // The last pump can end the session (its CLI reported a mode the gate cannot hold): there is then
         // nothing to move, and the session is retired with that pump's output.

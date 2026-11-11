@@ -164,6 +164,11 @@ pub(super) fn tick_send(
     send_context_if_changed(state, out);
     poll_scratch_edits(state, out);
     poll_review_jobs(state, out);
+    for (view, payload) in state.tabs.poll_history() {
+        if state.ready(view) {
+            out.send(view, payload);
+        }
+    }
     poll_question_sends(state, out);
     super::remote_entry::poll_remote(state, screen, out);
     super::editor_glue::poll(state, out);
@@ -400,6 +405,7 @@ pub(super) fn needs_polling(state: &AgentPanelState) -> bool {
         || state.chat_moves.is_waiting()
         || state.hand_overs.is_waiting()
         || state.tabs.needs_polling()
+        || state.tabs.history_pending()
         || !state.retiring.is_empty()
         || !state.pending_edits.is_empty()
         || !state.task_commands.is_empty()

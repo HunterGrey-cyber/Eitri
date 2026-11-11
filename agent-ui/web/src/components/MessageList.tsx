@@ -1,5 +1,5 @@
 /// <reference types="vite/client" />
-import { rowCardLine, rowAgentCard, isAgentCall } from "../display";
+import { rowCardLine, rowAgentCard, agentCard, isAgentCall } from "../display";
 import { Fragment, memo, useContext, useEffect, useLayoutEffect, useMemo, useRef, useState, type ReactElement, type ReactNode } from "react";
 import type { AgentUiState, ThinkingBlock, ThinkingDisplay, ToolCallRecord } from "../types";
 import { renderToolCall, TouchRows } from "../toolRegistry";
@@ -53,6 +53,8 @@ type Props = {
    *  the work of every streamed batch: a merge and sort of the whole conversation. Left out, it is
    *  built here from the same three props. */
   timeline?: TimelineItem[];
+  historyFromTurn?: number;
+  onHistoryOlder?: () => void;
   /** `Ctrl+o`: every result shown in full, at wider cuts, with no collapsed runs. Per tab
    *  (`App.tsx`'s `TabViewState.detailed`); defaults to `false`, the state every fresh tab starts
    *  in. */
@@ -278,6 +280,8 @@ export function bandBox(row: HTMLElement, listWidth: number): BandBox {
 export function MessageList({
   tab = null,
   state,
+  historyFromTurn,
+  onHistoryOlder,
   turnDurations = NO_TURN_DURATIONS,
   sessionEnded,
   expanded,
@@ -955,15 +959,20 @@ export function MessageList({
           // The desk's notice copies the desk's file path to the desk's own selection; the phone only reads it.
           ? <div className="history-notice"><span>{historyNoticeText(state.history)}</span></div>
           : <DeskHistoryNotice notice={state.history} />)}
-        {!touch && import.meta.env.EITRI_PHONE_PAGE !== true && (state.evicted?.turns ?? 0) > 0 &&
-          <div className="history-notice"><span>{earlierTurnsText(state.evicted!.turns)}</span></div>}
+        {!touch && import.meta.env.EITRI_PHONE_PAGE !== true && (historyFromTurn ?? state.evicted?.turns ?? 0) > 0 &&
+          <div className="history-notice" data-nav-stop="notice">
+            {onHistoryOlder
+              ? <button className="history-load" onClick={onHistoryOlder}>{earlierTurnsText(historyFromTurn ?? state.evicted!.turns)}</button>
+              : <span>{earlierTurnsText(historyFromTurn ?? state.evicted!.turns)}</span>}
+          </div>}
         {timeline.map((item, index) => {
           // Everything a row draws is in these props, each a value or the timeline's own item, so a
           // cursor move renders the two rows it changes and no other (`TimelineRow`).
+          const historical = item.key.startsWith("h:");
           const call = item.kind === "tool" ? item.call : null;
           const permissionId = item.kind === "permission" ? item.request.permissionId : null;
           const footer = placedFooters.get(item.key) ?? null;
-          const abandoned = call !== null && isAbandonedCall(call, state, sessionEnded);
+          const abandoned = call !== null && (historical ? call.result === null : isAbandonedCall(call, state, sessionEnded));
           const source = item.kind === "prompt" ? state.sentFrom?.[String(item.seq)] ?? null : null;
           const sentHere = touch && source !== null && thisDevice !== null && source.deviceId === thisDevice;
           const props: TimelineRowProps = {
@@ -977,10 +986,10 @@ export function MessageList({
             detailed,
             thinkingDisplay,
             sessionEnded,
-            cardLine: call === null ? null : rowCardLine(call, state),
-            agent: call !== null && isAgentCall(call) ? rowAgentCard(call, state, abandoned) : null,
+            cardLine: call === null || historical ? null : rowCardLine(call, state),
+            agent: call !== null && isAgentCall(call) ? (historical ? agentCard(call, undefined, abandoned) : rowAgentCard(call, state, abandoned)) : null,
             abandoned,
-            gated: call !== null && awaitingPermission.has(call.toolUseId),
+            gated: !historical && call !== null && awaitingPermission.has(call.toolUseId),
             ruleOffer: permissionId === null ? null : (ruleOffers?.[permissionId] ?? null),
             alreadyAnswered: permissionId !== null && (answeredPermissions?.has(permissionId) ?? false),
             cardMode: permissionId !== null && cardMode?.permissionId === permissionId ? cardMode.view : null,

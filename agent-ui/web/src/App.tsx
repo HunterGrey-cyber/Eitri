@@ -123,6 +123,7 @@ import { installCtrlBracketAsEscape } from "./ctrlBracket";
 import { installHeldSuperTracking } from "./heldSuper";
 import { WhichKeyBox } from "./components/WhichKeyBox";
 import { TurnChanges } from "./components/TurnChanges";
+import { historyRunKeyOf, historyTimeline, type HistoryPage } from "./historyPage";
 import { allCards, buildTimeline, oldestPendingPermission, nextStop, promptIndex, waitingCardAfter } from "./timeline";
 import { buildDisplay, indexOfKey, runKeyOf } from "./display";
 import { toolInput, yankObject, yankRows } from "./yank";
@@ -527,9 +528,17 @@ export default function App() {
    *  Reuses `PendingPrefix`'s `"g"` value purely as a carrier through `resolveKey`'s `ctx.pending`;
    *  the region never arms `"z"`/`"["`/`"]"`, which stay BROWSE-only. */
   const regionPendingGRef = useRef<PendingPrefix | null>(null);
+  const [historyPage, setHistoryPage] = useState<HistoryPage | null>(null);
+  const requestHistory = (action: "older" | "latest") => {
+    const tab = activeTabRef.current;
+    if (tab === null) return;
+    const requestId = nextRequestId();
+    trackRequest(requestId, { kind: "history", tab });
+    postToRust({ type: "history_request", request_id: requestId, tab, action });
+  };
   /** The props `MessageList` is frozen to while VISUAL is on -- see `FrozenSnapshot`'s own doc
    *  comment. State, not a ref: `MessageList`'s own render depends on it. */
-  const [frozenSnapshot, setFrozenSnapshot] = useState<FrozenSnapshot | null>(null);
+  const [frozenSnapshot, setFrozenSnapshot] = useState<(FrozenSnapshot & { rows: TimelineItem[] }) | null>(null);
   /** `frozenSnapshot` as of the last render, i.e. whether the DOM on screen right now is the frozen
    *  list. Read by the handlers and effects that turn the LIVE
    *  cursor into a DOM row -- the `[cursor]` reveal, the scroll clamp, `focus_permission`'s own
@@ -1762,19 +1771,29 @@ export default function App() {
   /** The overlay's own scrollable root, so `j`/`k` typed while it is open can scroll IT rather than
    *  the conversation underneath (`onKeyDown`'s `keymapOpen` branch). */
   const keymapOverlayRef = useRef<HTMLDivElement>(null);
+  const historyExpansionKey = JSON.stringify(Object.entries(expanded).filter(([key]) => key.startsWith("h:")));
+  /** Live deltas and live folds leave the loaded page and its row objects unchanged. */
+  const historyRows = useMemo(
+    () => historyTimeline(historyPage, {
+      expanded: Object.fromEntries(JSON.parse(historyExpansionKey)), detailed, turnRunning: false, thinking: thinkingDisplay,
+    }),
+    [historyPage, historyExpansionKey, detailed, thinkingDisplay],
+  );
   /** One ordered view of the conversation, kept in step with the cursor/expand keys below. See
    *  `MessageList`'s own copy of this memo for why it is keyed on `state` as a whole; `expanded` and
    *  `detailed` join it here for the same reason collapsed runs do -- `buildDisplay` folds or
    *  unfolds rows by both, so a change to either has to recompute what the cursor actually indexes. */
   const timeline = useMemo(
-    () =>
-      buildDisplay(buildTimeline(state), {
+    () => [
+      ...historyRows,
+      ...buildDisplay(buildTimeline(state), {
         expanded,
         detailed,
         turnRunning: state.activeTurnId !== null,
         thinking: thinkingDisplay,
       }),
-    [state, expanded, detailed, thinkingDisplay],
+    ],
+    [state, expanded, detailed, thinkingDisplay, historyRows],
   );
   useEffect(() => {
     if (state.evicted === null) return;
@@ -1784,23 +1803,8 @@ export default function App() {
   /** For the dispatch handler (installed once), as `cursorRef`: the park names the cursor's row by key. */
   const timelineRef = useRef(timeline);
   timelineRef.current = timeline;
-  /** The SAME pure computation as `timeline` above, over `frozenSnapshot` instead of the live
-   *  render -- functionally identical to what `MessageList` recomputes internally once it is handed
-   *  the frozen props, so a row found in the frozen DOM can be placed at this array's own index
-   *  (`rowIndexOf`) and its `key` read back out of it, without indexing the DOM by the live cursor
-   *  while VISUAL is on. `null` outside VISUAL/V-LINE. */
-  const frozenTimeline = useMemo(
-    () =>
-      frozenSnapshot === null
-        ? null
-        : buildDisplay(buildTimeline(frozenSnapshot.state), {
-            expanded: frozenSnapshot.expanded,
-            detailed: frozenSnapshot.detailed,
-            turnRunning: frozenSnapshot.state.activeTurnId !== null,
-            thinking: thinkingDisplay,
-          }),
-    [frozenSnapshot, thinkingDisplay],
-  );
+  /** VISUAL holds the rows it started with, including an archive page released while selecting. */
+  const frozenTimeline = frozenSnapshot?.rows ?? null;
   /** Held while what a card reads stands: a new value makes React walk every row of the conversation looking for the
    *  cards under this provider, on each streamed batch. */
   const viewScriptRef = useRef<(text: string) => void>(() => {});
@@ -1817,7 +1821,7 @@ export default function App() {
   const answerableItems = useMemo(
     (): AnswerableItem[] =>
       timeline.map((item) =>
-        item.kind === "permission"
+        item.key.startsWith("h:") ? { kind: "other" } : item.kind === "permission"
           ? { kind: "permission", toolUseId: item.request.toolUseId }
           : item.kind === "tool"
             ? { kind: "tool", toolUseId: item.call.toolUseId }
@@ -2229,7 +2233,7 @@ export default function App() {
   const cursorKeyRef = useRef<string | null>(null);
   const prevTimelineRef = useRef<TimelineItem[] | null>(null);
   const prevCursorRef = useRef(cursor);
-  usePreserveCursorRow(prevTimelineRef, timeline, prevCursorRef, cursor, cursorKeyRef, landingRef, setCursor, state.evicted?.throughSeq, activeTabId);
+  usePreserveCursorRow(prevTimelineRef, timeline, prevCursorRef, cursor, cursorKeyRef, landingRef, setCursor, state.evicted?.throughSeq, activeTabId, historyPage);
   useRevealCursorRow(landingRef, landingAnimateRef, landingHeadRef, frozenSnapshotRef, containerRef, cursor);
   /* A search hit on a tall row: once the row is revealed (the effect above, declared first, so run first), the line
      holding the match comes on screen below the pinned header. The view it leaves is what a jump from here records
@@ -2809,6 +2813,12 @@ export default function App() {
       // any other tab -- a batch still in flight when the user switched away -- is dropped before any arm below
       // can touch the page.
       if (!acceptsEnvelope(payload as { kind: string; tab?: number }, activeTabRef.current)) return;
+      if (payload.kind === "history_page") {
+        setHistoryPage("cleared" in payload ? null : { fromTurn: payload.fromTurn, records: payload.records });
+        return;
+      }
+      if (payload.kind === "tabs" && payload.active !== activeTabRef.current) setHistoryPage(null);
+      if (payload.kind === "events" && payload.events.some((event) => event.type === "conversation_reset")) setHistoryPage(null);
       const receivedAt = performance.now();
       const previousPage = pageRef.current;
       const nextPage = pageModel(previousPage, { ...payload, receivedAt: Date.now(), monotonicAt: receivedAt });
@@ -3320,7 +3330,7 @@ export default function App() {
                 mirrorDraft(recovered);
                 refusedEchoRef.current = { tab: record.tab, requestId: payload.requestId, at: performance.now() };
               }
-            } else if (record?.kind === "editor" || record?.kind === "link" || record?.kind === "tabnew" || record?.kind === "stop-background" || record?.kind === "follow" || record?.kind === "reset") {
+            } else if (record?.kind === "history" || record?.kind === "editor" || record?.kind === "link" || record?.kind === "tabnew" || record?.kind === "stop-background" || record?.kind === "follow" || record?.kind === "reset") {
               // A footer nicety, not the banner reserved for conversation-breaking errors.
               showFlash(payload.error);
             } else {
@@ -5002,6 +5012,8 @@ export default function App() {
                 verb: "new",
                 ...(command.agent !== null ? { agent: command.agent } : {}),
               });
+            } else if (command?.command === "history") {
+              requestHistory(command.action);
             } else if (command?.command === "scratch") {
               if (command.whole) {
                 // Built before anything is tracked: a throw leaves no request waiting, and the line still closes.
@@ -5457,7 +5469,7 @@ export default function App() {
     countRef.current = null;
     visualCountRef.current = null;
     regionPendingGRef.current = null;
-    setFrozenSnapshot({ state, expanded, detailed, ruleOffers, answeredPermissions, sessionEnded, turnDurations });
+    setFrozenSnapshot({ state, expanded, detailed, ruleOffers, answeredPermissions, sessionEnded, turnDurations, rows: timeline });
     modeRef.current = line ? "vline" : "caret";
     setMode(modeRef.current);
     root.focus({ preventScroll: true });
@@ -6548,13 +6560,13 @@ export default function App() {
           break;
         }
         const item = timeline[cursor];
-        if (waitingQuestion && item?.kind === "message" && item.question?.interactionId === waitingQuestion.interactionId) {
+        if (!item?.key.startsWith("h:") && waitingQuestion && item?.kind === "message" && item.question?.interactionId === waitingQuestion.interactionId) {
           setMode("input");
           questionDock.current?.focus();
           break;
         }
         const toolId = item?.kind === "tool" ? item.call.toolUseId : item?.kind === "permission" ? item.request.toolUseId : null;
-        const task = toolId ? liveTasks(state.backgroundTasks.rows).find((t) => t.tool_use_id === toolId) : null;
+        const task = toolId && !item?.key.startsWith("h:") ? liveTasks(state.backgroundTasks.rows).find((t) => t.tool_use_id === toolId) : null;
         if (task && event.key === "Enter") { openTasksOverlay(false, task.task_id); break; }
         // Keyed on the timeline KEY, not the cursor index -- see the doc comment on `expanded`
         // above for why an index would silently drift onto the wrong row. For a "run" key this
@@ -6576,11 +6588,13 @@ export default function App() {
         const run =
           action.open || expanded[key]
             ? null
-            : runKeyOf(
-                buildTimeline(state),
-                { expanded, detailed, turnRunning: state.activeTurnId !== null, thinking: thinkingDisplay },
-                key,
-              );
+            : key.startsWith("h:")
+              ? historyRunKeyOf(historyPage, { expanded, detailed, turnRunning: false, thinking: thinkingDisplay }, key)
+              : runKeyOf(
+                  buildTimeline(state),
+                  { expanded, detailed, turnRunning: state.activeTurnId !== null, thinking: thinkingDisplay },
+                  key,
+                );
         setExpanded((prev) => ({ ...prev, [run ?? key]: action.open }));
         break;
       }
@@ -7301,6 +7315,8 @@ export default function App() {
             expanded={frozenSnapshot?.expanded ?? expanded}
             cursor={frozenTimeline === null ? cursor : (indexOfKey(frozenTimeline, timeline[cursor]?.key ?? "") ?? -1)}
             timeline={frozenTimeline ?? timeline}
+            historyFromTurn={historyPage?.fromTurn}
+            onHistoryOlder={() => requestHistory("older")}
             detailed={frozenSnapshot?.detailed ?? detailed}
             thinkingDisplay={thinkingDisplay}
             // The band is drawn at full strength only while the list has the keys: in INPUT they are in

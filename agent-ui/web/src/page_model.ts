@@ -44,6 +44,7 @@ export type Envelope = InboundPayload & { receivedAt: number; monotonicAt?: numb
  *  - `"editor"`: `edit_draft`, `open_path`, `view_in_editor`. All three reach the scratch editor in Rust, and a
  *    refusal of any of them is a footer flash, not the banner: a scratch-editor round trip that failed to start is
  *    a nicety, not something that should fill the space a real conversation error gets.
+ *  - `"history"`: archive reading commands; a refusal flashes the host's reason in the footer.
  *  - `"link"`: `gx`'s `open_url`. Rust refuses an address that is not plain http(s); the same footer flash.
  *  - `"review"`: the review overlay's `review_request`/`review_diff_request`. Rust refuses one with a reason (no
  *    session, no such turn, git unavailable) and no envelope follows, so the overlay says it in its own header
@@ -64,7 +65,7 @@ export type Envelope = InboundPayload & { receivedAt: number; monotonicAt?: numb
  *  - `"follow"`: `<leader>e`. Rust refuses it for a tab a float covers, one that is moving, or one that is gone; the
  *    page has already said what it expects, so the refusal is the flash that follows it. */
 export type CommandRecord = {
-  kind: "send" | "handoff" | "editor" | "link" | "permission" | "picker-send" | "review" | "review-command" | "trust" | "tabnew" | "stop-background" | "follow" | "reset";
+  kind: "history" | "send" | "handoff" | "editor" | "link" | "permission" | "picker-send" | "review" | "review-command" | "trust" | "tabnew" | "stop-background" | "follow" | "reset";
   tab: TabId;
   text?: string;
   permissionId?: string;
@@ -478,7 +479,7 @@ function reduceEnvelope(model: PageModel, envelope: Envelope): PageModel {
           // nothing waited for it and the conversation is untouched, so it is not the user's error. The page's
           // log keeps it. Any other refusal of a mirror (a draft too large to keep) means the person's text will
           // not survive a switch, so it is said like any other refusal.
-        } else if (!record || !["trust", "picker-send", "editor", "link", "tabnew", "stop-background", "follow", "reset"].includes(record.kind)) {
+        } else if (!record || !["history", "trust", "picker-send", "editor", "link", "tabnew", "stop-background", "follow", "reset"].includes(record.kind)) {
           // The kinds left out are already said (trust) or are a footer flash the page shows; everything else,
           // a refused permission answer included, is the banner.
           next.commandNotice = envelope.error;

@@ -4,7 +4,11 @@ use crate::projection::{turns::Turns, QuestionState, TaskStatus, ToolCallRecord}
 use std::collections::BTreeMap;
 use std::path::Path;
 
-fn ready(state: &IngestState) -> bool {
+fn ready(state: &mut IngestState, budget: usize) -> bool {
+    if state.reload_held && Turns::of(&state.projection).count() as usize >= budget.saturating_mul(2) {
+        state.reload_held = false;
+        state.reload_generation += 1;
+    }
     let p = &state.projection;
     p.is_settled()
         && state.running_turn.is_none()
@@ -37,8 +41,8 @@ pub(super) fn flush_eviction(
     budget: usize,
 ) -> bool {
     {
-        let st = state.lock().unwrap();
-        if !st.eviction_due || st.eviction_retry || !ready(&st) {
+        let mut st = state.lock().unwrap();
+        if !st.eviction_due || st.eviction_retry || !ready(&mut st, budget) {
             return false;
         }
     }
@@ -53,7 +57,7 @@ pub(super) fn flush_eviction(
     )
 }
 
-fn flush_in(
+pub(super) fn flush_in(
     state: &Mutex<IngestState>,
     session_id: &Mutex<Option<String>>,
     context: &AdoptionContext,
@@ -61,9 +65,9 @@ fn flush_in(
     directory: std::io::Result<std::path::PathBuf>,
     after_write: impl FnOnce(),
 ) -> bool {
-    let (revision, count, cut, through_seq, absolute, lifted, records, id, mut writer) = {
+    let (revision, count, cut, through_seq, absolute, lifted, expired, records, id, mut writer) = {
         let mut st = state.lock().unwrap();
-        if !st.eviction_due || st.eviction_retry || !ready(&st) {
+        if !st.eviction_due || st.eviction_retry || !ready(&mut st, budget) {
             return false;
         }
         let p = &st.projection;
@@ -89,6 +93,17 @@ fn flush_in(
             .iter()
             .filter(|call| call.seq < through_seq && running_background(call, &roster))
             .map(|call| call.seq)
+            .collect();
+        // Finished trees lifted by earlier cuts leave no archive row, but still carry edit attribution.
+        let expired: Vec<_> = p
+            .tool_calls
+            .iter()
+            .filter(|call| {
+                call.seq < through_seq
+                    && p.evicted.as_ref().is_some_and(|e| e.lifted.contains(&call.seq))
+                    && !lifted.contains(&call.seq)
+            })
+            .cloned()
             .collect();
         let mut records: Vec<_> = (0..cut)
             .map(|i| ArchivedTurn {
@@ -128,6 +143,7 @@ fn flush_in(
             through_seq,
             absolute,
             lifted,
+            expired,
             records,
             st.archive_id.clone(),
             st.archive_writer.take(),
@@ -149,7 +165,7 @@ fn flush_in(
     if st.archive_id == id {
         st.archive_writer = writer;
     }
-    if st.projection.last_revision != revision || !ready(&st) {
+    if st.projection.last_revision != revision || !ready(&mut st, budget) {
         return false;
     }
     let lost = written.err();
@@ -164,6 +180,19 @@ fn flush_in(
         turns: absolute,
         lifted,
     });
+    let calls = expired
+        .into_iter()
+        .chain(
+            records
+                .into_iter()
+                .flat_map(|turn| turn.records)
+                .filter_map(|record| match record {
+                    ArchivedRecord::ToolCall(call) => Some(call),
+                    _ => None,
+                }),
+        )
+        .collect();
+    st.queue_evicted_calls(calls);
     st.eviction_due = false;
     drop(st);
     if let Some(error) = lost {

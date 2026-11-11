@@ -850,15 +850,35 @@ fn the_availability_question_names_the_reason_without_a_tab() {
 
 #[test]
 fn settled_attribution_survives_eviction_after_delivery() {
-    settled_attribution_survives_eviction(false);
+    settled_attribution_survives_eviction(false, false, false, false);
 }
 
 #[test]
 fn settled_attribution_survives_eviction_after_resync() {
-    settled_attribution_survives_eviction(true);
+    settled_attribution_survives_eviction(true, false, false, false);
 }
 
-fn settled_attribution_survives_eviction(resync: bool) {
+#[test]
+fn steered_attribution_survives_eviction_before_completing_delivery() {
+    settled_attribution_survives_eviction(false, true, false, false);
+}
+
+#[test]
+fn steered_attribution_survives_eviction_before_completing_resync() {
+    settled_attribution_survives_eviction(true, true, false, false);
+}
+
+#[test]
+fn late_success_attribution_survives_eviction_in_both_scopes() {
+    settled_attribution_survives_eviction(false, false, true, false);
+}
+
+#[test]
+fn expired_lifted_tree_keeps_foreground_edit_attribution() {
+    settled_attribution_survives_eviction(false, false, false, true);
+}
+
+fn settled_attribution_survives_eviction(resync: bool, before_delivery: bool, late_success: bool, lifted: bool) {
     use crate::turn_review::{Origin, Scope, Snap, TurnRef};
     use std::os::unix::fs::DirBuilderExt;
 
@@ -890,8 +910,14 @@ fn settled_attribution_survives_eviction(resync: bool) {
             conversation.fold_locally(event);
         }
     };
+    let evict = |set: &TabSet| {
+        let TabBackend::Live(AgentBackend::Conversation { conversation, .. }) = &set.get(tab).unwrap().backend else {
+            panic!("a conversation");
+        };
+        assert!(conversation.evict_history_for_test(10));
+    };
     let wait = |set: &mut TabSet, end: bool| {
-        let deadline = Instant::now() + Duration::from_secs(30);
+        let deadline = Instant::now() + Duration::from_secs(60);
         loop {
             set.pump(&dir, true);
             if set
@@ -924,7 +950,7 @@ fn settled_attribution_survives_eviction(resync: bool) {
         is_error: false,
     };
     provider.open_session("sess-evicted", &dir);
-    let deadline = Instant::now() + Duration::from_secs(30);
+    let deadline = Instant::now() + Duration::from_secs(60);
     while set.get(tab).unwrap().live().unwrap().provider_session_id().as_deref() != Some("sess-evicted") {
         assert!(Instant::now() < deadline, "session-open hang guard");
         std::thread::yield_now();
@@ -932,27 +958,98 @@ fn settled_attribution_survives_eviction(resync: bool) {
     fold(
         &set,
         vec![
-            started("t1"),
             AgentDomainEvent::UserPromptSubmitted { text: "first".into() },
+            started("t1"),
         ],
     );
     wait(&mut set, false);
     std::fs::write(dir.join("old.rs"), "after\n").unwrap();
     std::fs::write(dir.join("live.rs"), "after\n").unwrap();
+    let child = |frame| AgentDomainEvent::SubagentFrame {
+        parent_tool_use_id: "agent".into(),
+        frame: Box::new(frame),
+    };
+    if lifted {
+        fold(
+            &set,
+            vec![
+                AgentDomainEvent::ToolCallStarted {
+                    turn_id: "t1".into(),
+                    tool_use_id: "agent".into(),
+                    name: "Agent".into(),
+                    input: serde_json::json!({}),
+                },
+                child(edit("old", "old.rs")),
+                child(done("old")),
+                done("agent"),
+                edit("dead", "dead.rs"),
+            ],
+        );
+    } else {
+        fold(&set, vec![edit("old", "old.rs"), done("old"), edit("dead", "dead.rs")]);
+    }
+    for i in 1..=12 {
+        fold(
+            &set,
+            vec![AgentDomainEvent::UserPromptSubmitted {
+                text: format!("steered {i}"),
+            }],
+        );
+    }
     fold(
         &set,
-        vec![
-            edit("old", "old.rs"),
-            done("old"),
-            edit("dead", "dead.rs"),
-            AgentDomainEvent::UserPromptSubmitted { text: "steered".into() },
-            edit("live", "live.rs"),
-            done("live"),
-            edit("pending", "pending.rs"),
-        ],
+        vec![edit("live", "live.rs"), done("live"), edit("pending", "pending.rs")],
     );
-    // In the resync case the end is among dropped events, but the review already owns the start.
+    if late_success {
+        std::fs::write(dir.join("dead.rs"), "after\n").unwrap();
+    }
+    // The review owns the start; its completion may remain undelivered until after pruning.
     fold(&set, vec![completed("t1", agent::TurnOutcome::Completed)]);
+    if !before_delivery {
+        wait(&mut set, true);
+        let result = set
+            .review_overview_job(tab, TurnRef::N(1), Scope::Turn)
+            .unwrap()
+            .run()
+            .unwrap();
+        assert_eq!(result.pending_no_result, 2);
+    }
+    if late_success {
+        fold(&set, vec![done("dead")]);
+        set.pump(&dir, true);
+        let result = set
+            .review_overview_job(tab, TurnRef::N(1), Scope::Turn)
+            .unwrap()
+            .run()
+            .unwrap();
+        assert_eq!(
+            result
+                .files
+                .iter()
+                .find(|f| f.path == Path::new("dead.rs"))
+                .unwrap()
+                .origin,
+            Origin::Agent
+        );
+    }
+    if lifted {
+        fold(
+            &set,
+            vec![child(AgentDomainEvent::ToolCallStarted {
+                turn_id: "background".into(),
+                tool_use_id: "bg".into(),
+                name: "Bash".into(),
+                input: serde_json::json!({}),
+            })],
+        );
+    }
+    evict(&set);
+    {
+        let p = set.get(tab).unwrap().live().unwrap().projection();
+        assert_eq!(agent::projection::turns::Turns::of(&p).count(), 10);
+        assert!(!p.tool_calls.iter().any(|c| c.tool_use_id == "old"));
+        assert_eq!(p.tool_calls.iter().any(|c| c.tool_use_id == "agent"), lifted);
+    }
     if resync {
         fold(
             &set,
@@ -963,22 +1060,11 @@ fn settled_attribution_survives_eviction(resync: bool) {
     }
     wait(&mut set, true);
     let overview = |set: &TabSet, scope| {
-        set.review_overview_job(tab, TurnRef::Latest, scope)
+        set.review_overview_job(tab, TurnRef::N(1), scope)
             .unwrap()
             .run()
             .unwrap()
     };
-    assert_eq!(overview(&set, Scope::Turn).pending_no_result, 2);
-    let through_seq = set.get(tab).unwrap().live().unwrap().projection().user_prompts[1].seq;
-    fold(
-        &set,
-        vec![AgentDomainEvent::HistoryEvicted {
-            through_seq,
-            turns: 1,
-            lifted: vec![],
-        }],
-    );
-    set.pump(&dir, true);
     // A live successful call can arrive after settle; the overview must combine it with the cached half.
     std::fs::write(dir.join("later.rs"), "after\n").unwrap();
     fold(&set, vec![edit("later", "later.rs"), done("later")]);
@@ -1000,38 +1086,234 @@ fn settled_attribution_survives_eviction(resync: bool) {
                 .origin,
             Origin::AgentOnly
         );
-        assert_eq!(result.pending_no_result, 1, "only the live unanswered call remains");
+        assert_eq!(result.pending_no_result, 1, "background calls are excluded");
     }
     fold(
         &set,
-        vec![AgentDomainEvent::UserPromptSubmitted { text: "next".into() }],
+        vec![
+            AgentDomainEvent::UserPromptSubmitted { text: "next".into() },
+            started("t2"),
+        ],
     );
-    let through_seq = set.get(tab).unwrap().live().unwrap().projection().user_prompts[1].seq;
-    fold(
-        &set,
-        vec![AgentDomainEvent::HistoryEvicted {
-            through_seq,
-            turns: 2,
-            lifted: vec![],
-        }],
-    );
+    for i in 1..=12 {
+        fold(
+            &set,
+            vec![AgentDomainEvent::UserPromptSubmitted {
+                text: format!("next steer {i}"),
+            }],
+        );
+    }
+    if lifted {
+        fold(
+            &set,
+            vec![child(AgentDomainEvent::ToolCallCompleted {
+                turn_id: "background".into(),
+                tool_use_id: "bg".into(),
+                content: serde_json::json!("ok"),
+                is_error: false,
+            })],
+        );
+    }
+    fold(&set, vec![completed("t2", agent::TurnOutcome::Completed)]);
+    evict(&set);
     set.pump(&dir, true);
-    let result = overview(&set, Scope::Turn);
-    assert_eq!(result.pending_no_result, 0);
-    assert_eq!(
-        result
-            .files
-            .iter()
-            .find(|f| f.path == Path::new("old.rs"))
+    for scope in [Scope::Turn, Scope::Session] {
+        let result = overview(&set, scope);
+        assert_eq!(result.pending_no_result, 0);
+        let mut expected = vec!["old.rs", "live.rs"];
+        if late_success {
+            expected.push("dead.rs");
+        }
+        for path in expected {
+            assert_eq!(
+                result.files.iter().find(|f| f.path == Path::new(path)).unwrap().origin,
+                Origin::Agent,
+                "{path} ({scope:?})"
+            );
+        }
+        assert_eq!(
+            result
+                .files
+                .iter()
+                .find(|f| f.path == Path::new("later.rs"))
+                .unwrap()
+                .origin,
+            if scope == Scope::Session {
+                Origin::Agent
+            } else {
+                Origin::AgentOnly
+            }
+        );
+    }
+    shut_down_all(&mut set);
+    let _ = std::fs::remove_dir_all(scratch);
+}
+
+#[test]
+fn eviction_delivery_drops_queued_calls_when_review_is_off() {
+    let dir = workspace("evicted-review-off");
+    let mut set = set();
+    set.turn_review_off();
+    let tab = set.active();
+    let (provider, backend) = live(&dir);
+    set.get_mut(tab).unwrap().backend = TabBackend::Live(backend);
+    provider.open_session("sess-review-off", &dir);
+    let conversation = || {
+        let TabBackend::Live(AgentBackend::Conversation { conversation, .. }) = &set.get(tab).unwrap().backend else {
+            panic!("a conversation");
+        };
+        conversation
+    };
+    let deadline = Instant::now() + Duration::from_secs(60);
+    while conversation().provider_session_id().as_deref() != Some("sess-review-off") {
+        assert!(Instant::now() < deadline, "session-open hang guard");
+        std::thread::yield_now();
+    }
+    conversation().fold_locally(AgentDomainEvent::UserPromptSubmitted { text: "first".into() });
+    conversation().fold_locally(started("t1"));
+    conversation().fold_locally(AgentDomainEvent::ToolCallStarted {
+        turn_id: "t1".into(),
+        tool_use_id: "edit".into(),
+        name: "Write".into(),
+        input: serde_json::json!({"file_path":"a.rs"}),
+    });
+    for i in 1..=12 {
+        conversation().fold_locally(AgentDomainEvent::UserPromptSubmitted {
+            text: format!("steered {i}"),
+        });
+    }
+    conversation().fold_locally(completed("t1", agent::TurnOutcome::Completed));
+    assert!(conversation().evict_history_for_test(10));
+    set.pump(&dir, true);
+    let TabBackend::Live(AgentBackend::Conversation { conversation, .. }) = &set.get(tab).unwrap().backend else {
+        panic!("a conversation");
+    };
+    assert!(conversation.take_evicted_calls_through(u64::MAX).is_empty());
+    assert!(set.turn_review().is_none());
+    shut_down_all(&mut set);
+}
+
+#[test]
+fn eviction_after_delivery_drain_waits_for_its_review_record() {
+    eviction_after_drain_waits(false);
+}
+
+#[test]
+fn eviction_after_empty_delivery_waits_for_its_review_record() {
+    eviction_after_drain_waits(true);
+}
+
+fn eviction_after_drain_waits(empty_delivery: bool) {
+    use crate::turn_review::{Origin, Scope, Snap, TurnRef};
+
+    agent::state_dirs::redirect_state_to_a_test_root();
+    let scratch = target_scratch("eviction-after-drain");
+    let dir = scratch.join("project");
+    let mut set = set();
+    set.install_turn_review(crate::turn_review::TurnReview::with_options(
+        Some(scratch.join("review")),
+        &dir,
+        crate::turn_review::ReviewOptions {
+            excludes: Some(None),
+            trim_every: Duration::MAX,
+            ..Default::default()
+        },
+    ))
+    .unwrap();
+    let tab = set.active();
+    let (provider, backend) = live(&dir);
+    set.get_mut(tab).unwrap().backend = TabBackend::Live(backend);
+    provider.open_session("after-drain", &dir);
+    let deadline = Instant::now() + Duration::from_secs(60);
+    while set.get(tab).unwrap().live().unwrap().provider_session_id().as_deref() != Some("after-drain") {
+        assert!(Instant::now() < deadline, "session-open hang guard");
+        std::thread::yield_now();
+    }
+    let fold = |set: &TabSet, event| {
+        let AgentBackend::Conversation { conversation, .. } = set.get(tab).unwrap().live().unwrap() else {
+            panic!("conversation")
+        };
+        conversation.fold_locally(event);
+    };
+    fold(&set, started("first"));
+    loop {
+        set.pump(&dir, true);
+        if set
+            .turn_review()
             .unwrap()
-            .origin,
-        Origin::Agent
+            .turns("after-drain")
+            .first()
+            .is_some_and(|r| matches!(r.base, Snap::Taken { .. }))
+        {
+            break;
+        }
+        assert!(Instant::now() < deadline, "base hang guard");
+        std::thread::yield_now();
+    }
+    fold(&set, completed("first", agent::TurnOutcome::Completed));
+    if empty_delivery {
+        set.pump(&dir, true);
+    }
+    // This hook forces ingestion into the gap after the old delivery was taken.
+    let path = dir.join("raced.rs");
+    set.after_drain = Some(Box::new(move |backend| {
+        let AgentBackend::Conversation { conversation, .. } = backend else {
+            panic!("conversation")
+        };
+        conversation.fold_locally(AgentDomainEvent::UserPromptSubmitted {
+            text: "new turn".into(),
+        });
+        conversation.fold_locally(started("raced"));
+        std::fs::write(&path, "edited\n").unwrap();
+        conversation.fold_locally(AgentDomainEvent::ToolCallStarted {
+            turn_id: "raced".into(),
+            tool_use_id: "write".into(),
+            name: "Write".into(),
+            input: serde_json::json!({"file_path":path}),
+        });
+        conversation.fold_locally(AgentDomainEvent::ToolCallCompleted {
+            turn_id: "raced".into(),
+            tool_use_id: "write".into(),
+            content: serde_json::json!("ok"),
+            is_error: false,
+        });
+        for i in 0..12 {
+            conversation.fold_locally(AgentDomainEvent::UserPromptSubmitted {
+                text: format!("steer {i}"),
+            });
+        }
+        conversation.fold_locally(completed("raced", agent::TurnOutcome::Completed));
+        assert!(conversation.evict_history_for_test(10));
+        assert!(conversation.projection().tool_calls.is_empty());
+    }));
+    set.pump(&dir, true);
+    assert!(!set
+        .turn_review()
+        .unwrap()
+        .turns("after-drain")
+        .iter()
+        .any(|r| r.turn_id == "raced"));
+    assert!(set
+        .turn_review()
+        .unwrap()
+        .stored_paths("after-drain", &["raced"])
+        .is_empty());
+    set.pump(&dir, true);
+    let stored = set.turn_review().unwrap().stored_paths("after-drain", &["raced"]);
+    assert!(
+        stored.contains(&dir.join("raced.rs")),
+        "the covered cut must reach the new record: {stored:?}"
     );
+    let overview = set
+        .review_overview_job(tab, TurnRef::Latest, Scope::Session)
+        .unwrap()
+        .run()
+        .unwrap();
     assert_eq!(
-        result
+        overview
             .files
             .iter()
-            .find(|f| f.path == Path::new("live.rs"))
+            .find(|f| f.path == Path::new("raced.rs"))
             .unwrap()
             .origin,
         Origin::Agent

@@ -8,6 +8,8 @@
 //! `provider_session_id()` takes it again. Never call the second while holding the first's guard
 //! (the 2026-09-15 GTK freeze). Every method below reads them in separate statements.
 
+mod history;
+
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -416,6 +418,7 @@ pub struct Tab {
     /// Counts the live backends put in this tab in this window: an observer's position in one session's
     /// revisions means nothing in the next one's, which start over.
     backend_generation: u64,
+    history: history::HistoryReload,
     /// Numbers the stretches of work Claude Code did where this panel could not show it (`cli_unseen_busy`), in this
     /// window, so a stop asked about one stretch can tell it from the next ([`Tab::unseen_stretch`]).
     unseen_stretch: UnseenStretch,
@@ -765,6 +768,7 @@ impl Tab {
             view: ViewId::BASE,
             backend: TabBackend::NotStarted,
             backend_generation: 0,
+            history: history::HistoryReload::default(),
             unseen_stretch: UnseenStretch::default(),
             session: SessionState::default(),
             attention: AttentionTracker::default(),
@@ -1565,6 +1569,7 @@ pub enum RestoreStep {
 
 pub struct TabSet {
     tabs: Vec<Tab>,
+    history_clears: Vec<(ViewId, String)>,
     /// Whatever follows a tab from outside the desk ([`TabSet::observe`]), fed by the tick beside the pages.
     observers: observers::Observers,
     active: TabId,
@@ -1721,6 +1726,7 @@ impl TabSet {
         };
         let mut set = TabSet {
             tabs: Vec::new(),
+            history_clears: Vec::new(),
             observers: observers::Observers::default(),
             active: TabId(0),
             last_active: None,
@@ -2552,6 +2558,7 @@ impl TabSet {
         let at = self.tabs.iter().position(|t| t.id == id)?;
         let base_index = self.base_tabs().iter().position(|t| *t == id);
         let before = self.active;
+        self.release_history(id);
         let mut tab = self.tabs.remove(at);
         // First, before anything that can take time: a write that has not reached its last check
         // must see that its tab is gone.
@@ -2728,6 +2735,7 @@ impl TabSet {
             .position(|t| *t == moved)
             .expect("the active tab is a base-view tab");
         let at = self.position(moved).expect("the active tab exists");
+        self.release_history(moved);
         self.tabs[at].view = view;
         self.tabs[at].session.left_view = Some(ViewId::BASE);
         let fallback = self.base_fallback(base_index).expect("two base-view tabs were checked");
@@ -2745,6 +2753,7 @@ impl TabSet {
     pub fn join_back(&mut self, view: ViewId) -> Option<TabId> {
         let tab = self.tab_in(view)?;
         let at = self.position(tab).expect("tab_in names a tab it has");
+        self.release_history(tab);
         self.tabs[at].view = ViewId::BASE;
         self.tabs[at].session.left_view = Some(view);
         self.drop_prompts_about(tab);
@@ -3527,6 +3536,7 @@ impl TabSet {
         if !tab.session.draft.trim().is_empty() {
             parts.push(tab.draft().to_string());
         }
+        tab.clear_history();
         let old = std::mem::replace(&mut tab.backend, TabBackend::NotStarted);
         tab.session = SessionState::default();
         tab.replace_draft(parts.join("\n\n"));
@@ -3867,6 +3877,10 @@ impl TabSet {
         }
         let remote_notes_dirty = tab.notes.remote_notes_dirty;
         let resynced = matches!(delivery, RevisedDelivery::Resync);
+        let delivered_revision = match &delivery {
+            RevisedDelivery::Events(events) => events.last().map(|(revision, _)| *revision),
+            _ => None,
+        };
         // The tab's observers read this same drain, whether or not a page shows the tab, after its arm has folded
         // it: what the gate answered and what the batch settled are then what the desk has.
         let observed = tick.observers.watches(tab.id);
@@ -3946,7 +3960,7 @@ impl TabSet {
         if arm.untracked_start {
             tick.untracked_starts.insert(live.id.0);
         }
-        let still = Self::pump_after_match(live.backend, live.id, review, resynced);
+        let still = Self::pump_after_match(live.backend, live.id, review, resynced, delivered_revision);
         tab.session.note_turn_began();
         Self::pump_settle(tab, arm, place, &still, tick.project_root, out);
     }
@@ -4087,9 +4101,7 @@ impl TabSet {
             let session = live.backend.provider_session_id().unwrap_or_default();
             let now = wall_clock_ms();
             for event in &events {
-                let active = review.active_attribution(live.id.0);
                 review.observe(live.id.0, &session, event, now);
-                Self::store_review_paths(review, live.backend, live.id, active);
             }
         }
         let mut fresh_notes = CallNotes {
@@ -4283,49 +4295,46 @@ impl TabSet {
         tab: TabId,
         review: Option<&mut crate::turn_review::TurnReview>,
         resynced: bool,
+        delivered_revision: Option<u64>,
     ) -> std::collections::HashSet<String> {
-        let review = review.filter(|_| resynced);
+        let mut review = review;
         // Its own statement, before the read below: it takes the same lock.
         let session = review
             .as_ref()
             .map(|_| backend.provider_session_id().unwrap_or_default());
-        let (still, running, background, at_end) = {
+        let (still, running, background, at_end, snapshot_revision) = {
             let projection = backend.projection();
             (
                 projection.pending_permissions.keys().cloned().collect(),
                 projection.active_turn_id.clone(),
                 projection.background_calls,
                 projection.background_at_last_turn_end,
+                projection.last_revision,
             )
         };
-        if let (Some(review), Some(session)) = (review, session) {
+        if let (Some(review), Some(session)) = (review.as_deref_mut().filter(|_| resynced), session) {
             let now = wall_clock_ms();
             // A turn the resync ends ended with the count it had then, not with the one now: the
             // command may have finished among the dropped events.
             let count = |running| AgentDomainEvent::BackgroundCalls { running };
             review.observe(tab.0, &session, &count(at_end), now);
-            let active = review.active_attribution(tab.0);
             review.observe_resync(tab.0, &session, running.as_deref(), now);
-            Self::store_review_paths(review, backend, tab, active);
             review.observe(tab.0, &session, &count(background), now);
         }
+        // Ingestion can fold ahead of this delivery. Its calls must wait until review has seen
+        // the events that create their records, or the snapshot used by observe_resync above.
+        let through = if resynced {
+            Some(snapshot_revision)
+        } else {
+            delivered_revision
+        };
+        if let (AgentBackend::Conversation { conversation, .. }, Some(revision)) = (backend, through) {
+            let calls = conversation.take_evicted_calls_through(revision);
+            if let Some(review) = review {
+                review.store_evicted_paths(tab.0, &calls);
+            }
+        }
         still
-    }
-
-    fn store_review_paths(
-        review: &mut crate::turn_review::TurnReview,
-        backend: &AgentBackend,
-        tab: TabId,
-        active: Option<(String, String)>,
-    ) {
-        if active == review.active_attribution(tab.0) {
-            return;
-        }
-        if let Some((session, turn)) = active {
-            let projection = backend.projection();
-            let named = crate::turn_review::named_paths(&projection.tool_calls, &[&turn]);
-            review.set_ended_paths(tab.0, &session, &turn, named.paths);
-        }
     }
 
     /// The end of a tab's tick: hands its payload to the page that shows it, prints a trace nothing
@@ -4587,6 +4596,9 @@ impl TabSet {
             tab.id,
             tab.editing_draft.is_some(),
         ));
+        if let Some(page) = tab.history_payload() {
+            payloads.push(page);
+        }
         payloads
     }
 
@@ -5662,6 +5674,7 @@ impl TabSet {
     pub fn take_all(&mut self) -> Vec<RemovedTab> {
         self.closing = true;
         for tab in &mut self.tabs {
+            tab.clear_history();
             tab.cancel_review_watchers();
         }
         if let Some(review) = self.turn_review.as_mut() {

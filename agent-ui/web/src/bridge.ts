@@ -11,7 +11,10 @@ import type { Transport } from "./transport";
 
 export type QuestionAnswerWire = { question_index: number; option_indexes: number[]; other_text?: string | null; notes?: string | null };
 
+import type { HistoryEnvelope } from "./historyPage";
+
 export type OutboundMessage =
+  | { type: "history_request"; request_id: string; tab: TabId; action: "older" | "latest" }
   | { type: "editor_symbol"; request_id: string; tab: TabId; name: string; cited?: Cited }
   | { type: "ready"; request_id: string }
   /** The mounted page has produced its first frame. The host reveals its view and answers nothing. */
@@ -287,6 +290,7 @@ export type EditorSymbolResult = {
 
 type InboundHandler = (
   payload:
+    | HistoryEnvelope
     | EditorSymbolResult
     | { kind: "hello" } & Hello
     /** `message` is the shell's own one-line word on what it did (`sent`, `queued: ...`), where it has one. */
@@ -788,6 +792,7 @@ export function installDispatch(handler: InboundHandler): void {
         obj.kind === "question_other_edited" ||
         obj.kind === "events" ||
         obj.kind === "snapshot" ||
+        obj.kind === "history_page" ||
         obj.kind === "editor_cards" ||
         obj.kind === "handoff" ||
         obj.kind === "theme" ||

@@ -1485,6 +1485,16 @@ pub(super) fn handle_inbound_message(
                 refuse(&mut out, &why);
             }
         }
+        InboundMessage::HistoryRequest { action, .. } => {
+            let result = state.tabs.request_history(tab_of(target), &request_id, action);
+            out.send(
+                view,
+                serialize_command_result_for_js(&request_id, result.as_ref().map(|_| ()).map_err(String::as_str)),
+            );
+            if let Ok(Some(payload)) = result {
+                out.send(view, payload);
+            }
+        }
         // `c` in BROWSE: the jobs are built here, from this tab's own session and edit calls, and run
         // on a worker; the answer is an envelope carrying the request id, sent by the tick.
         InboundMessage::ReviewRequest { turn, scope, .. } => {
@@ -1925,6 +1935,20 @@ pub(super) fn no_session_error() -> eitri_core::agent_backend::BackendError {
 mod tests {
     use super::*;
     use crate::agent_panel::tests::*;
+
+    #[test]
+    fn history_requests_answer_the_sending_page_and_refuse_another_pages_tab() {
+        let (handle, base, extra) = handle_with_two_pages();
+        let tab = handle.state.borrow().tabs.active();
+        let raw = serde_json::json!({"type":"history_request", "request_id":"history", "tab":tab.0, "action":"latest"})
+            .to_string();
+        handle.page_message(ViewId::BASE, &raw);
+        assert_eq!(result_for(&base.sent.borrow(), "history"), Some(Ok(())));
+        assert!(base.sent.borrow().iter().any(|p| json_of(p)["kind"] == "history_page"));
+        handle.page_message(ViewId::new(2).unwrap(), &raw);
+        assert!(matches!(result_for(&extra.sent.borrow(), "history"), Some(Err(_))));
+        assert!(!extra.sent.borrow().iter().any(|p| json_of(p)["kind"] == "history_page"));
+    }
 
     #[test]
     fn editor_symbol_refusals_use_the_symbol_reply_without_an_editor_request() {

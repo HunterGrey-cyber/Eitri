@@ -462,7 +462,7 @@ describe("resolveKey: sequences, counts, search and the command line", () => {
   });
 
   it("lists the : command line's commands in the help", () => {
-    expect(BROWSE_KEYS.find((row) => row.keys === ":")?.what).toBe("A command line, as in vim: :tabnew, :trust, :untrust, :scratch and :%scratch");
+    expect(BROWSE_KEYS.find((row) => row.keys === ":")?.what).toBe("A command line, as in vim: :tabnew, :trust, :untrust, :scratch, :%scratch, :history older and :history latest");
   });
 
   it("walks jumps on BROWSE Ctrl+o, toggles details in INPUT, and scrolls a table on zh / zl", () => {

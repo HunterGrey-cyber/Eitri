@@ -201,6 +201,12 @@ pub enum InboundMessage {
         tab: Option<u64>,
         receive_to_frame_ms: f64,
     },
+    HistoryRequest {
+        request_id: String,
+        #[serde(default)]
+        tab: Option<u64>,
+        action: HistoryAction,
+    },
     /// "Continue this conversation in a real terminal." Carries nothing of its own: every input the
     /// rule needs already lives in canonical state on the Rust side, and a session id sent from the
     /// frontend would be a second, stale source for the one value that must not be wrong.
@@ -846,6 +852,7 @@ impl InboundMessage {
             | InboundMessage::EditDraft { tab, .. }
             | InboundMessage::QuestionDraft { tab, .. }
             | InboundMessage::EditQuestionOther { tab, .. }
+            | InboundMessage::HistoryRequest { tab, .. }
             | InboundMessage::ReviewRequest { tab, .. }
             | InboundMessage::ReviewDiffRequest { tab, .. }
             | InboundMessage::ReviewRevert { tab, .. }
@@ -1049,6 +1056,7 @@ impl InboundMessage {
             | InboundMessage::HistoryPush { request_id, .. }
             | InboundMessage::OpenPath { request_id, .. }
             | InboundMessage::EditorSymbol { request_id, .. }
+            | InboundMessage::HistoryRequest { request_id, .. }
             | InboundMessage::ReviewRequest { request_id, .. }
             | InboundMessage::ReviewDiffRequest { request_id, .. }
             | InboundMessage::ReviewRevert { request_id, .. }
@@ -2262,6 +2270,13 @@ fn add_remote_notes(value: &mut Value, notes: &CallNotes) {
     if !notes.stopped_from.is_empty() {
         value["stoppedFrom"] = json!(notes.stopped_from);
     }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum HistoryAction {
+    Older,
+    Latest,
 }
 
 /// Everything one snapshot needs, gathered from wherever it actually lives.

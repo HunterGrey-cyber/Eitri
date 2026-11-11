@@ -102,6 +102,15 @@ describe("run summaries", () => {
   });
 });
 
+it("folded cursor lookup keeps historical and live sequence numbers separate", () => {
+  const run = buildDisplay([tool(call(2, "Read")), tool(call(3, "Read"))], opts)[0];
+  const archived = { ...run, key: `h:${run.key}` };
+  expect(indexOfKey([run, archived], "h:t-3")).toBe(1);
+  expect(indexOfKey([archived, run], "t-3")).toBe(1);
+  expect(indexOfKey([run], "h:t-3")).toBeNull();
+  expect(indexOfKey([archived], "t-3")).toBeNull();
+});
+
 /* `zc`: closing the fold a `t-<seq>` row was unfolded from needs the run's own key,
    which `buildDisplay` derives from the run's FIRST call -- so it cannot be read off the row itself. */
 describe("runKeyOf (zc)", () => {

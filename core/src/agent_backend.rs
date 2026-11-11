@@ -2178,6 +2178,14 @@ impl AgentBackend {
         }
     }
 
+    /// Reservations and display-page installation share the conversation's ingest lock.
+    pub fn history_ingest(&self) -> Option<&agent::ingestion::ConversationIngest> {
+        match self {
+            Self::Conversation { conversation, .. } => Some(conversation.history_ingest()),
+            Self::Legacy(_) => None,
+        }
+    }
+
     /// A move begins: the conversation stops folding where its ingest stands
     /// (`AgentConversation::freeze_folding`), so the caller's last pump delivers everything there is.
     /// The legacy backend has no conversation to hand over and is refused.

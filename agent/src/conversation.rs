@@ -966,6 +966,11 @@ impl AgentConversation {
         self.ingest.projection()
     }
 
+    /// Archive page reservations share the ingestion state lock.
+    pub fn history_ingest(&self) -> &crate::ingestion::ConversationIngest {
+        &self.ingest
+    }
+
     /// What ingestion is costing right now -- see `IngestStats`.
     pub fn ingest_stats(&self) -> crate::ingestion::IngestStats {
         self.ingest.stats()
@@ -1507,6 +1512,19 @@ impl AgentConversation {
     /// snapshots and must not deliver an event one already carried (`crate::ingestion::RevisedDelivery`).
     pub fn take_revised_ui_delivery(&self) -> crate::ingestion::RevisedDelivery {
         self.ingest.take_revised_delivery()
+    }
+
+    /// Drains calls evicted through the revision this delivery handled, for review attribution.
+    pub fn take_evicted_calls_through(&self, revision: u64) -> Vec<crate::ToolCallRecord> {
+        self.ingest.take_evicted_calls_through(revision)
+    }
+
+    /// Forces the worker's eviction path between a test's fold and delivery.
+    #[cfg(feature = "test-support")]
+    #[doc(hidden)]
+    pub fn evict_history_for_test(&self, budget: usize) -> bool {
+        self.ingest
+            .evict_history_for_test(&self.conversation_id, &self.canonical_cwd, budget)
     }
 
     /// Records that the caller just handed its UI a snapshot of this conversation's projection,

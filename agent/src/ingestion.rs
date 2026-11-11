@@ -57,6 +57,9 @@ use std::time::{Duration, Instant};
 /// make anything more correct, it would only delay the switch and hold more raw events.
 pub const UI_EVENT_QUEUE_CAPACITY: usize = 256;
 
+/// Bounds call trees awaiting delivery independently of the conversation's length.
+const EVICTED_CALL_CHUNKS: usize = 4;
+
 /// How often the ingestion thread drains a provider that raises no [`EventSignal`]. Short enough that
 /// the provider's own internal queue stays near-empty between drains, which is what keeps the
 /// raw-event backlog bounded at BOTH layers rather than moving it one step upstream. A provider that
@@ -165,6 +168,28 @@ fn read_session_id(slot: &Mutex<Option<String>>) -> Option<String> {
     slot.lock().unwrap_or_else(std::sync::PoisonError::into_inner).clone()
 }
 
+#[derive(Clone, Debug)]
+pub struct ReloadTicket {
+    pub generation: u64,
+    pub base: u64,
+    pub id: crate::history::archive::ArchiveId,
+}
+
+/// Reads a reserved page on a worker, without holding conversation state.
+pub fn read_reload(
+    ticket: &ReloadTicket,
+    cancel: &AtomicBool,
+) -> std::io::Result<Option<crate::history::archive::Page>> {
+    crate::history::archive::read_page(
+        &crate::state_dirs::history_dir()?,
+        &ticket.id,
+        ticket.base,
+        crate::history::history_turns(),
+        crate::history::archive::PAGE_MAX_CHARS,
+        cancel,
+    )
+}
+
 struct IngestState {
     projection: AgentSessionProjection,
     /// Held for as long as this conversation drives the provider session. Taken on the ingestion
@@ -199,8 +224,11 @@ struct IngestState {
     /// An attempted cut waits for another turn end before trying the archive again.
     eviction_retry: bool,
     reload_held: bool,
+    reload_generation: u64,
     archive_id: Option<crate::history::archive::ArchiveId>,
     archive_writer: Option<crate::history::archive::ArchiveWriter>,
+    /// Call trees paired with their eviction event's revision, awaiting a delivery that covers it.
+    evicted_calls: VecDeque<(u64, Vec<crate::ToolCallRecord>)>,
     /// The last `SessionOpened` folded and every resume verdict, unavailability or close folded after
     /// it (all of them while none has opened the session), for the conversation's whole life: what
     /// sets the session's status when another window rebuilds this projection. A handful at most,
@@ -401,6 +429,25 @@ pub(crate) struct MovedIngest {
 }
 
 impl IngestState {
+    fn take_evicted_calls_through(&mut self, revision: u64) -> Vec<crate::ToolCallRecord> {
+        let mut calls = Vec::new();
+        while self.evicted_calls.front().is_some_and(|(at, _)| *at <= revision) {
+            calls.extend(self.evicted_calls.pop_front().unwrap().1);
+        }
+        calls
+    }
+
+    fn queue_evicted_calls(&mut self, calls: Vec<crate::ToolCallRecord>) {
+        if calls.is_empty() {
+            return;
+        }
+        if self.evicted_calls.len() == EVICTED_CALL_CHUNKS {
+            self.evicted_calls.pop_front();
+            eprintln!("agent: evicted-call queue full; dropping the oldest eviction chunk");
+        }
+        self.evicted_calls.push_back((self.projection.last_revision, calls));
+    }
+
     /// Folds `event`, then the events the projection derives from it (a changed tool input; the rows
     /// a turn's end leaves when the turn was not one this panel ran, or a hook stopped its prompt).
     /// Each judgement is made once, here, and the derived events are folded and delivered like any
@@ -414,6 +461,10 @@ impl IngestState {
     }
 
     fn fold_one(&mut self, event: AgentDomainEvent) {
+        if matches!(&event, AgentDomainEvent::ConversationReset { .. }) {
+            self.reload_held = false;
+            self.reload_generation += 1;
+        }
         // The reducer sees every event, in order, always. Coalescing happens strictly AFTER this --
         // collapsing "assistant partial / tool start / tool result / assistant partial" into one blob
         // before the reducer would destroy boundaries the projection is defined in terms of.
@@ -559,8 +610,10 @@ impl IngestState {
             eviction_due,
             eviction_retry: _,
             reload_held: _,
+            reload_generation: _,
             archive_id,
             archive_writer: _,
+            evicted_calls: _,
             lifecycle_since_open,
             running_turn,
             folded_through,
@@ -572,7 +625,7 @@ impl IngestState {
                 fold_log: _,
         } = self;
         // Emptied by the source's last pump; the destination's first delivery is a snapshot.
-        if !pending_ui.is_empty() || *resync_pending {
+        if !pending_ui.is_empty() || *resync_pending || !self.evicted_calls.is_empty() {
             return Err(HandoffRefused::Undelivered);
         }
         let core = match running_turn {
@@ -662,8 +715,10 @@ impl IngestState {
             eviction_due,
             eviction_retry: false,
             reload_held: false,
+            reload_generation: 0,
             archive_id,
             archive_writer: None,
+            evicted_calls: VecDeque::new(),
             lifecycle_since_open,
             running_turn,
             folded_through,
@@ -856,8 +911,10 @@ impl ConversationIngest {
             eviction_due: false,
             eviction_retry: false,
             reload_held: false,
+            reload_generation: 0,
             archive_id: None,
             archive_writer: None,
+            evicted_calls: VecDeque::new(),
             lifecycle_since_open: Vec::new(),
             running_turn: None,
             folded_through: 0,
@@ -974,9 +1031,85 @@ impl ConversationIngest {
         self.wake.raise();
     }
 
+    /// Reserves the current eviction boundary before any archive I/O can begin.
+    pub fn begin_reload(&self) -> Option<ReloadTicket> {
+        let mut st = self.lock_state("begin_reload");
+        if st.reload_held {
+            return None;
+        }
+        let base = st.projection.evicted.as_ref()?.turns;
+        if base == 0 {
+            return None;
+        }
+        let id = st.archive_id.clone()?;
+        st.reload_held = true;
+        st.reload_generation += 1;
+        Some(ReloadTicket {
+            generation: st.reload_generation,
+            base,
+            id,
+        })
+    }
+
+    /// Installs a page only while its reservation still names this exact conversation boundary.
+    pub fn finish_reload(&self, ticket: &ReloadTicket, keep: bool, install: impl FnOnce()) -> bool {
+        let mut st = self.lock_state("finish_reload");
+        if !st.reload_held
+            || st.reload_generation != ticket.generation
+            || st.archive_id.as_ref() != Some(&ticket.id)
+            || st.projection.evicted.as_ref().map(|e| e.turns) != Some(ticket.base)
+        {
+            return false;
+        }
+        install();
+        if !keep {
+            st.reload_held = false;
+        }
+        true
+    }
+
+    /// Releases requested and held pages and invalidates replies already in flight.
+    pub fn clear_reload(&self) {
+        let mut st = self.lock_state("clear_reload");
+        st.reload_held = false;
+        st.reload_generation += 1;
+    }
+
     /// Defers eviction while an archive page is requested or held for this conversation.
     pub fn set_reload_held(&self, held: bool) {
         self.lock_state("set_reload_held").reload_held = held;
+    }
+
+    /// Drains removed calls only after their eviction event is covered by a handled delivery.
+    pub fn take_evicted_calls_through(&self, revision: u64) -> Vec<crate::ToolCallRecord> {
+        self.lock_state("take_evicted_calls_through")
+            .take_evicted_calls_through(revision)
+    }
+
+    /// Runs an eviction under the worker's gate with a test's own budget and archive identity.
+    #[cfg(feature = "test-support")]
+    #[doc(hidden)]
+    pub(crate) fn evict_history_for_test(&self, conversation_id: &str, cwd: &std::path::Path, budget: usize) -> bool {
+        let _gate = self.pump_gate.lock().unwrap();
+        {
+            let mut st = self.lock_state("evict_history_for_test");
+            st.eviction_due = true;
+            st.eviction_retry = false;
+        }
+        let context = AdoptionContext {
+            provider_name: self.provider_name,
+            conversation_id: conversation_id.to_owned(),
+            canonical_cwd: cwd.to_string_lossy().into_owned(),
+            provider_advertises_resume: self.provider_advertises_resume,
+        };
+        eviction::flush_in(
+            &self.state,
+            &self.session_id,
+            &context,
+            budget,
+            crate::state_dirs::history_dir(),
+            || {},
+        )
     }
 
     /// The records a move carries and the ingest's own state, read under one lock.
@@ -1428,8 +1561,10 @@ fn detach_for_reset(guard: &mut IngestState, session_id: &Mutex<Option<String>>)
     guard.eviction_due = false;
     guard.eviction_retry = false;
     guard.reload_held = false;
+    guard.reload_generation += 1;
     guard.archive_id = None;
     guard.archive_writer = None;
+    guard.evicted_calls.clear();
     let lease = guard.lease.take();
     let provider_session_id = old?;
     let history = had_record.then(|| history_snapshot(&guard.projection));
@@ -3073,8 +3208,10 @@ pub(crate) mod tests {
             eviction_due: false,
             eviction_retry: false,
             reload_held: false,
+            reload_generation: 0,
             archive_id: None,
             archive_writer: None,
+            evicted_calls: VecDeque::new(),
             lifecycle_since_open: Vec::new(),
             running_turn: None,
             folded_through: 0,

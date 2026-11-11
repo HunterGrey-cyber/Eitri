@@ -1153,7 +1153,7 @@ export const BROWSE_KEYS: KeyHelp[] = [
   { keys: "r", what: "Once this session has ended: resume it, or start a new one (its last row says which)" },
   { keys: "c", what: "Review: the files that changed on disk during this tab's latest turn (read-only)" },
   { keys: "/", motion: "search.forward", what: "Search forward; n repeats, N reverses (Enter keeps the match, Esc goes back)" },
-  { keys: ":", what: "A command line, as in vim: :tabnew, :trust, :untrust, :scratch and :%scratch" },
+  { keys: ":", what: "A command line, as in vim: :tabnew, :trust, :untrust, :scratch, :%scratch, :history older and :history latest" },
   { keys: "n", motion: "search.next", what: "Next match, wrapping" },
   { keys: "N", motion: "search.prev", what: "Previous match, wrapping" },
   { keys: "Ctrl+o", motion: "jump.older", what: "Back through the jumps in this tab" },

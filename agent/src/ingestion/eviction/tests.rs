@@ -191,6 +191,38 @@ fn questions_client_calls_reload_and_opening_prompts_defer_eviction() {
 }
 
 #[test]
+fn reload_defers_below_ceiling_and_releases_at_ceiling_without_bypassing_other_guards() {
+    let state = filled(19);
+    let mut st = state.lock().unwrap();
+    st.reload_held = true;
+    let generation = st.reload_generation;
+    assert!(!ready(&mut st, 10));
+    assert!(st.reload_held);
+    assert_eq!(st.reload_generation, generation);
+    turn(&mut st, 19);
+    st.projection.opening_prompt = Some(80);
+    assert!(!ready(&mut st, 10));
+    assert!(!st.reload_held);
+    assert_eq!(st.reload_generation, generation + 1);
+    st.projection.opening_prompt = None;
+    assert!(ready(&mut st, 10));
+}
+
+#[test]
+fn reset_fold_releases_reload_and_invalidates_its_generation() {
+    let state = filled(12);
+    let mut st = state.lock().unwrap();
+    st.reload_held = true;
+    let generation = st.reload_generation;
+    st.fold(AgentDomainEvent::ConversationReset {
+        new_conversation_id: "next".into(),
+        trigger: None,
+    });
+    assert!(!st.reload_held);
+    assert!(st.reload_generation > generation);
+}
+
+#[test]
 fn prompt_between_archive_copy_and_fold_keeps_running_turn_and_retries_idempotently() {
     let scratch = Scratch::new();
     let state = filled(12);
@@ -207,6 +239,7 @@ fn prompt_between_archive_copy_and_fold_keeps_running_turn_and_retries_idempoten
     {
         let mut st = state.lock().unwrap();
         assert!(st.projection.evicted.is_none());
+        assert!(st.evicted_calls.is_empty(), "an abandoned cut queues no calls");
         assert!(st.running_turn.is_some());
         st.fold(AgentDomainEvent::TurnStarted { turn_id: "t12".into() });
         st.fold(end(12));
@@ -252,12 +285,14 @@ fn failed_archive_waits_for_next_turn_end_and_at_twice_budget_counts_loss() {
     let readonly = scratch.0.join("readonly");
     std::fs::DirBuilder::new().mode(0o000).create(&readonly).unwrap();
     let state = filled(12);
+    background(&mut state.lock().unwrap());
     assert!(!flush(&state, &readonly));
     {
         let st = state.lock().unwrap();
         assert_eq!(Turns::of(&st.projection).count(), 12);
         assert!(st.eviction_due);
         assert!(st.eviction_retry);
+        assert!(st.evicted_calls.is_empty(), "a deferred cut queues no calls");
     }
     // Even a repaired destination is not retried on every quiet pump.
     assert!(!flush(&state, &scratch.0));
@@ -270,6 +305,10 @@ fn failed_archive_waits_for_next_turn_end_and_at_twice_budget_counts_loss() {
     assert_eq!(Turns::of(&st.projection).count(), 10);
     assert_eq!(st.stats.lost_history_turns, 10);
     assert_eq!(st.projection.evicted.as_ref().unwrap().turns, 10);
+    assert_eq!(
+        st.evicted_calls[0].1[0].tool_use_id, "dead",
+        "a hard-ceiling cut retains attribution even without an archive"
+    );
     drop(st);
     std::fs::set_permissions(&readonly, std::fs::Permissions::from_mode(0o700)).unwrap();
 }
@@ -283,6 +322,11 @@ fn moved_tail_keeps_boundary_lifted_children_and_archive_identity() {
     let (core, handoff) = {
         let mut st = source.lock().unwrap();
         st.take_revised_delivery();
+        assert!(matches!(
+            st.take_move_record(Some("session".into())),
+            Err(HandoffRefused::Undelivered)
+        ));
+        assert_eq!(st.take_evicted_calls_through(u64::MAX).len(), 1);
         st.take_move_record(Some("session".into())).unwrap()
     };
     let id = handoff.archive_id.clone().unwrap();
@@ -446,4 +490,144 @@ fn synthetic_background_launcher_expires_when_its_roster_entry_completes() {
         .iter()
         .flat_map(|t| &t.records)
         .all(|r| !matches!(r, ArchivedRecord::ToolCall(c) if c.tool_use_id == "unknown")));
+}
+
+#[test]
+fn evicted_calls_keep_children_exclude_lifted_and_drain_once() {
+    let scratch = Scratch::new();
+    let state = filled(12);
+    {
+        let mut st = state.lock().unwrap();
+        background(&mut st);
+        let children = st.projection.tool_calls[0].children.clone();
+        st.projection.tool_calls[1].children = children;
+    }
+    assert!(flush(&state, &scratch.0));
+    let mut st = state.lock().unwrap();
+    let calls = st.take_evicted_calls_through(u64::MAX);
+    assert_eq!(
+        calls.iter().map(|c| c.tool_use_id.as_str()).collect::<Vec<_>>(),
+        ["dead"]
+    );
+    assert_eq!(calls[0].children.as_ref().unwrap().tool_calls[0].tool_use_id, "nested");
+    assert!(st.take_evicted_calls_through(u64::MAX).is_empty());
+    assert_eq!(st.projection.tool_calls[0].tool_use_id, "bg");
+}
+
+#[test]
+fn evicted_calls_keep_chunks_until_their_revision_is_delivered() {
+    let scratch = Scratch::new();
+    let state = filled(12);
+    background(&mut state.lock().unwrap());
+    assert!(flush(&state, &scratch.0));
+    {
+        let mut st = state.lock().unwrap();
+        assert_eq!(st.evicted_calls[0].1[0].tool_use_id, "dead");
+        let mut newer = st.evicted_calls[0].1[0].clone();
+        newer.seq = st.projection.user_prompts[0].seq;
+        newer.tool_use_id = "newer".into();
+        st.projection.tool_calls.push(newer);
+        turn(&mut st, 12);
+        turn(&mut st, 13);
+    }
+    assert!(flush(&state, &scratch.0));
+    let mut st = state.lock().unwrap();
+    let first = st.evicted_calls[0].0;
+    let second = st.evicted_calls[1].0;
+    let cuts: Vec<_> = st
+        .pending_ui
+        .iter()
+        .filter_map(|(revision, event)| matches!(event, AgentDomainEvent::HistoryEvicted { .. }).then_some(*revision))
+        .collect();
+    assert_eq!(
+        cuts,
+        [first, second],
+        "each chunk carries its own eviction fold revision"
+    );
+    assert!(first < second);
+    assert!(st.take_evicted_calls_through(first - 1).is_empty());
+    assert_eq!(
+        st.take_evicted_calls_through(first)
+            .iter()
+            .map(|c| c.tool_use_id.as_str())
+            .collect::<Vec<_>>(),
+        ["dead"]
+    );
+    assert!(st.take_evicted_calls_through(second - 1).is_empty());
+    assert_eq!(
+        st.take_evicted_calls_through(second)
+            .iter()
+            .map(|c| c.tool_use_id.as_str())
+            .collect::<Vec<_>>(),
+        ["newer"]
+    );
+    assert!(st.take_evicted_calls_through(u64::MAX).is_empty());
+}
+
+#[test]
+fn reset_discards_undelivered_evicted_calls() {
+    let scratch = Scratch::new();
+    let state = filled(12);
+    background(&mut state.lock().unwrap());
+    assert!(flush(&state, &scratch.0));
+    let mut st = state.lock().unwrap();
+    assert!(!st.evicted_calls.is_empty());
+    detach_for_reset(&mut st, &Mutex::new(Some("session".into())));
+    assert!(st.take_evicted_calls_through(u64::MAX).is_empty());
+}
+
+#[test]
+fn expired_lifted_calls_are_captured_without_archiving_them() {
+    let scratch = Scratch::new();
+    let state = filled(12);
+    background(&mut state.lock().unwrap());
+    assert!(flush(&state, &scratch.0));
+    let id = {
+        let mut st = state.lock().unwrap();
+        st.take_evicted_calls_through(u64::MAX);
+        st.projection.tool_calls[0].background = false;
+        st.projection.tool_calls[0].result =
+            Some(serde_json::from_value(json!({"content":"ok", "is_error":false})).unwrap());
+        turn(&mut st, 12);
+        turn(&mut st, 13);
+        st.archive_id.clone().unwrap()
+    };
+    assert!(flush(&state, &scratch.0));
+    let mut st = state.lock().unwrap();
+    assert!(st.projection.tool_calls.is_empty());
+    let calls = st.take_evicted_calls_through(u64::MAX);
+    assert_eq!(calls.iter().map(|c| c.tool_use_id.as_str()).collect::<Vec<_>>(), ["bg"]);
+    assert_eq!(calls[0].children.as_ref().unwrap().tool_calls[0].tool_use_id, "nested");
+    assert!(page(&scratch.0, &id, 4)
+        .turns
+        .iter()
+        .flat_map(|t| &t.records)
+        .all(|r| !matches!(r, ArchivedRecord::ToolCall(c) if c.tool_use_id == "bg")));
+}
+
+#[test]
+fn evicted_call_queue_keeps_the_newest_chunks_at_its_bound() {
+    let state = filled(0);
+    let mut st = state.lock().unwrap();
+    background(&mut st);
+    let mut call = st.projection.tool_calls[1].clone();
+    st.queue_evicted_calls(Vec::new());
+    assert!(st.evicted_calls.is_empty());
+    for i in 0..EVICTED_CALL_CHUNKS + 2 {
+        st.fold(AgentDomainEvent::EffortReported { effort: None });
+        call.tool_use_id = format!("call-{i}");
+        st.queue_evicted_calls(vec![call.clone()]);
+        assert!(st.evicted_calls.len() <= EVICTED_CALL_CHUNKS);
+    }
+    let through = st.projection.last_revision;
+    assert_eq!(
+        st.take_evicted_calls_through(through)
+            .iter()
+            .map(|c| c.tool_use_id.as_str())
+            .collect::<Vec<_>>(),
+        (2..EVICTED_CALL_CHUNKS + 2)
+            .map(|i| format!("call-{i}"))
+            .collect::<Vec<_>>()
+    );
+    assert!(st.evicted_calls.is_empty());
 }

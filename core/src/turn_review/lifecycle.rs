@@ -1970,25 +1970,34 @@ impl TurnReview {
         }
     }
 
-    /// The active record's identity, including an empty session while it is unbound.
-    pub(crate) fn active_attribution(&self, tab: u64) -> Option<(String, String)> {
-        let turn = self.active_turn_id(tab)?;
-        let session = match self.tabs.get(&tab)?.active.as_ref()? {
-            Active::Bound { session, .. } => session.clone(),
-            Active::Unbound(_) => String::new(),
-        };
-        Some((session, turn))
-    }
-
-    /// Keeps successful edit paths once a record ends, before its calls can leave the live projection.
-    pub(crate) fn set_ended_paths(&mut self, tab: u64, session: &str, turn: &str, paths: BTreeSet<PathBuf>) {
-        let records = if session.is_empty() {
-            self.tabs.get_mut(&tab).map(|t| &mut t.unbound)
-        } else {
-            self.sessions.get_mut(session).map(|s| &mut s.records)
-        };
-        if let Some(rec) = records.and_then(|rs| rs.iter_mut().find(|r| r.record.turn_id == turn && r.ended)) {
-            rec.named_paths.extend(paths);
+    /// Keeps successful paths from removed calls for every matching record, including late results.
+    pub(crate) fn store_evicted_paths(&mut self, tab: u64, calls: &[agent::ToolCallRecord]) {
+        fn turn_ids<'a>(calls: &'a [agent::ToolCallRecord], ids: &mut BTreeSet<&'a str>) {
+            for call in calls {
+                ids.insert(&call.turn_id);
+                if let Some(children) = &call.children {
+                    turn_ids(&children.tool_calls, ids);
+                }
+            }
+        }
+        let Some(track) = self.tabs.get_mut(&tab) else { return };
+        let mut ids = BTreeSet::new();
+        turn_ids(calls, &mut ids);
+        for turn in ids {
+            let named = super::named_paths(calls, &[turn]);
+            let bound = track
+                .session
+                .as_ref()
+                .and_then(|session| self.sessions.get_mut(session));
+            for rec in track
+                .unbound
+                .iter_mut()
+                .chain(bound.into_iter().flat_map(|s| &mut s.records))
+            {
+                if rec.record.turn_id == turn {
+                    rec.named_paths.extend(named.paths.iter().cloned());
+                }
+            }
         }
     }
 
@@ -3509,6 +3518,47 @@ mod tests {
             left_out: LeftOutSides::default(),
             earlier_run: false,
         }
+    }
+
+    #[test]
+    fn evicted_paths_reach_ended_and_active_unbound_records_and_their_bound_forms() {
+        let mut review = TurnReview::with_options(None, Path::new("/unused"), ReviewOptions::default());
+        review.start_turn(1, "parent", 1, false);
+        review.end_active(1, 2, false);
+        review.start_turn(1, "child", 3, false);
+        let calls: Vec<agent::ToolCallRecord> = serde_json::from_value(serde_json::json!([{
+            "seq":1, "turn_id":"parent", "tool_use_id":"p", "name":"Write",
+            "input":{"file_path":"parent.rs"}, "result":{"content":"ok", "is_error":false},
+            "children":{"transcript":[],"thinking":[],"tool_calls":[{
+                "seq":2,"turn_id":"child","tool_use_id":"c","name":"Edit",
+                "input":{"file_path":"child.rs"},"result":{"content":"ok","is_error":false}
+            }],"assistant_message_open":false,"thinking_open":false}
+        }]))
+        .unwrap();
+        review.store_evicted_paths(1, &calls);
+        let unbound = &review.tabs[&1].unbound;
+        assert!(unbound[0].ended);
+        assert!(!unbound[1].ended);
+        assert_eq!(unbound[0].named_paths, BTreeSet::from([PathBuf::from("parent.rs")]));
+        assert_eq!(unbound[1].named_paths, BTreeSet::from([PathBuf::from("child.rs")]));
+        review.bind(1, "s1", 4, false);
+        let mut late = calls[0].clone();
+        late.children = None;
+        late.input = serde_json::json!({"file_path":"late.rs"});
+        review.store_evicted_paths(1, &[late]);
+        assert_eq!(
+            review.stored_paths("s1", &["parent"]),
+            BTreeSet::from([PathBuf::from("parent.rs"), PathBuf::from("late.rs")])
+        );
+        assert_eq!(
+            review.stored_paths("s1", &["child"]),
+            BTreeSet::from([PathBuf::from("child.rs")])
+        );
+        let ended = &review.sessions["s1"].records[0];
+        let moved = HandedRecord::of(ended).into_rec(7, 1);
+        assert_eq!(moved.named_paths, ended.named_paths);
+        review.store_evicted_paths(99, &calls);
+        assert!(!review.tabs.contains_key(&99));
     }
 
     fn finish_jobs(review: &mut TurnReview) {

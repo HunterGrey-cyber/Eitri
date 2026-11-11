@@ -99,6 +99,14 @@ pub(super) fn admission(
         // page showing the tab, never on a tab that is moving, and only on a Claude or an ACP session (an ACP
         // agent offers what it lists itself). It widens nothing
         // by itself; the mode the CLI moves to arrives on the session's stream.
+        InboundMessage::HistoryRequest { .. } => match target {
+            Some(tab) if state.tabs.is_moving(tab) => Admission::Refused(eitri_core::tab_set::MOVING.into()),
+            Some(tab) => match page_may_answer(&state.tabs, tab, view) {
+                Ok(()) => Admission::Ungated,
+                Err(why) => Admission::Refused(why),
+            },
+            None => Admission::Refused("no active session".into()),
+        },
         InboundMessage::ListModels { .. } | InboundMessage::SetModel { .. } | InboundMessage::ApplyEffort { .. } => {
             let Some(tab) = target else {
                 return Admission::Refused("no active session".into());

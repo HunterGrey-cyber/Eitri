@@ -1117,6 +1117,16 @@ pre {
   text-underline-offset: 3px;
   color: var(--nv-muted);
 }
+.history-notice button.history-load {
+  margin-left: 0;
+  font: inherit;
+  color: var(--nv-muted);
+  text-align: inherit;
+  text-decoration: none;
+  background: transparent;
+  border: 0;
+  border-radius: 0;
+}
 .command-notice {
   margin: 10px var(--page-pad);
   padding: 12px;

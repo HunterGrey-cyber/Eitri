@@ -6,6 +6,7 @@ import type { PanelMode } from "../keymap";
 import { conversationRows } from "../nav";
 import { buildTimeline, type TimelineItem } from "../timeline";
 import type { AgentUiState, ThinkingDisplay } from "../types";
+import type { HistoryPage } from "../historyPage";
 import type { BuiltSelection } from "../visual";
 import { clampCursorToView, enterBoxAtNearEnd, revealRow } from "./rowScroll";
 import type { ArrivalPark, FrozenSnapshot } from "./rowScroll";
@@ -70,12 +71,15 @@ export function usePreserveCursorRow(
   setCursor: Dispatch<SetStateAction<number>>,
   evictionBoundary?: number,
   tab?: number | null,
+  historyPage?: HistoryPage | null,
 ) {
-  const previousEviction = useRef({ boundary: evictionBoundary, tab });
+  const previousEviction = useRef({ boundary: evictionBoundary, tab, historyPage });
   useLayoutEffect(() => {
     const evicted = evictionBoundary !== undefined && previousEviction.current.tab === tab
       && previousEviction.current.boundary !== evictionBoundary;
-    previousEviction.current = { boundary: evictionBoundary, tab };
+    const historyReplaced = previousEviction.current.tab === tab
+      && previousEviction.current.historyPage != null && previousEviction.current.historyPage !== historyPage;
+    previousEviction.current = { boundary: evictionBoundary, tab, historyPage };
     const timelineChanged = prevTimelineRef.current !== null && prevTimelineRef.current !== timeline;
     const cursorMoved = prevCursorRef.current !== cursor;
     prevTimelineRef.current = timeline;
@@ -83,7 +87,7 @@ export function usePreserveCursorRow(
     const want = cursorKeyRef.current;
     if (timelineChanged && !cursorMoved && want !== null && timeline[cursor]?.key !== want) {
       const found = indexOfKey(timeline, want);
-      if (found === null && evicted) {
+      if (found === null && (evicted || (want.startsWith("h:") && historyReplaced))) {
         landingRef.current = "keep";
         setCursor(0);
         cursorKeyRef.current = timeline[0]?.key ?? null;
@@ -97,7 +101,7 @@ export function usePreserveCursorRow(
     }
     cursorKeyRef.current = timeline[cursor]?.key ?? null;
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [timeline, cursor, evictionBoundary, tab]);
+  }, [timeline, cursor, evictionBoundary, tab, historyPage]);
 }
 
 /** Keeps the row the cursor sits on inside the viewport whenever the cursor moves. Before this,
@@ -230,8 +234,11 @@ export function useRideLastRow(
   setCursor: Dispatch<SetStateAction<number>>,
   containerRef: RefObject<HTMLDivElement>,
 ) {
+  const previousTail = useRef<string>();
   useLayoutEffect(() => {
     const previous = lastLengthRef.current;
+    const prepended = timeline.length > previous && timeline[0]?.key.startsWith("h:") && previousTail.current === timeline.at(-1)?.key;
+    previousTail.current = timeline.at(-1)?.key;
     lastLengthRef.current = timeline.length;
     if (landOnLastRef.current) {
       landOnLastRef.current = false;
@@ -253,7 +260,7 @@ export function useRideLastRow(
         }
       }
     }
-    if (timeline.length <= previous || cursor !== previous - 1) return;
+    if (timeline.length <= previous || cursor !== previous - 1 || prepended) return;
     const list = containerRef.current?.querySelector<HTMLElement>(".message-list");
     const atBottom = !list || list.scrollHeight - list.scrollTop - list.clientHeight <= 1;
     if (atBottom) {
