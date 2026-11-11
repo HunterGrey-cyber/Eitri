@@ -438,3 +438,59 @@ fn moved_authorized_phone_messages_resume_after_counter_loading() {
     });
     assert_eq!(f.provider.turns(), vec!["still allowed"]);
 }
+
+#[test]
+fn a_device_queues_at_most_its_cap_of_messages_in_a_tab() {
+    let mut f = Fixture::new("remote-queue-cap-items", SessionModeChoice::Manual);
+    f.start("turn-1");
+    for n in 0..REMOTE_QUEUED_MAX_ITEMS {
+        f.set
+            .queue_remote(f.tab, &format!("phone words {n}"), asker(), 1)
+            .unwrap();
+    }
+    assert_eq!(
+        f.set.queue_remote(f.tab, "one more", asker(), 1),
+        Err(REMOTE_QUEUE_FULL.to_string())
+    );
+    assert_eq!(f.set.queue_texts(f.tab).len(), REMOTE_QUEUED_MAX_ITEMS);
+    // Another device's room and the desk's queue are their own.
+    let other = RemoteAsker {
+        device_id: "d2".into(),
+        ..asker()
+    };
+    f.set.queue_remote(f.tab, "other phone", other, 1).unwrap();
+    for n in 0..REMOTE_QUEUED_MAX_ITEMS {
+        let text = format!("desk words {n}");
+        f.set
+            .queue_message(f.tab, &text, text.clone(), 1, true, PromptOrigin::Typed)
+            .unwrap();
+    }
+    assert_eq!(f.set.queue_texts(f.tab).len(), 2 * REMOTE_QUEUED_MAX_ITEMS + 1);
+    // Taking its messages back gives the device its room again.
+    assert_eq!(f.set.take_back_remote(f.tab, "d1").len(), REMOTE_QUEUED_MAX_ITEMS);
+    f.set.queue_remote(f.tab, "again", asker(), 1).unwrap();
+}
+
+#[test]
+fn a_device_queues_at_most_its_cap_of_text_in_a_tab() {
+    let mut f = Fixture::new("remote-queue-cap-bytes", SessionModeChoice::Manual);
+    f.start("turn-1");
+    let text = "x".repeat(64 * 1024);
+    let fit = REMOTE_QUEUED_MAX_BYTES / text.len();
+    assert!(
+        fit < REMOTE_QUEUED_MAX_ITEMS,
+        "the text cap, not the count, is what refuses here"
+    );
+    for _ in 0..fit {
+        f.set.queue_remote(f.tab, &text, asker(), 1).unwrap();
+    }
+    assert_eq!(
+        f.set.queue_remote(f.tab, "y", asker(), 1),
+        Err(REMOTE_QUEUE_FULL.to_string())
+    );
+    assert_eq!(f.set.queue_texts(f.tab).len(), fit);
+    let desk = "z".repeat(2 * REMOTE_QUEUED_MAX_BYTES);
+    f.set
+        .queue_message(f.tab, &desk, desk.clone(), 1, true, PromptOrigin::Typed)
+        .unwrap();
+}

@@ -135,7 +135,8 @@ pub enum RemoteRefusal {
     /// Nothing this device queued is waiting in the tab.
     NotYours,
     /// The tab cannot take it now, and why: a start or a send under way, a card or a `!` line holding it, its
-    /// queue waiting to go, too many of the phone's calls out.
+    /// queue waiting to go, too many of the phone's calls out, or this device's queued messages in the tab at their
+    /// cap (`eitri_core::tab_set::REMOTE_QUEUE_FULL`).
     Busy(String),
 }
 

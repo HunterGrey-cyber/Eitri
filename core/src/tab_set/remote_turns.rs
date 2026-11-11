@@ -109,6 +109,18 @@ fn width(mode: SessionModeChoice) -> u8 {
     }
 }
 
+/// The most messages one device may have in one tab's queue at once, sent into the running turn or held. Each holds
+/// its text and the device's authority until it is read, flushed, taken back or withdrawn, so a device that keeps
+/// queueing while a turn runs is refused past this rather than growing the window without end.
+pub const REMOTE_QUEUED_MAX_ITEMS: usize = 64;
+
+/// The most text, in UTF-8 bytes, one device's messages may hold in one tab's queue at once.
+pub const REMOTE_QUEUED_MAX_BYTES: usize = 1024 * 1024;
+
+/// Why a phone's `queue` was refused at [`REMOTE_QUEUED_MAX_ITEMS`] or [`REMOTE_QUEUED_MAX_BYTES`].
+pub const REMOTE_QUEUE_FULL: &str =
+    "queue full: this device's messages waiting in this tab are at the limit; take them back or wait for the turn to end";
+
 /// A phone's queued message the tab took out without sending: its mode had widened since the message was accepted.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RemoteRefused {
@@ -248,9 +260,21 @@ impl TabSet {
     }
 
     /// A phone's message, queued behind the turn running in `id` as a held item that remembers the device and the
-    /// tab's mode now. Refused as [`TabSet::queue_message`] refuses; the caller checked the rest.
+    /// tab's mode now. Refused as [`TabSet::queue_message`] refuses, and refused as [`REMOTE_QUEUE_FULL`] while the
+    /// device's own items in this tab number [`REMOTE_QUEUED_MAX_ITEMS`] or this text would take their text past
+    /// [`REMOTE_QUEUED_MAX_BYTES`]; the desk's items and other devices' never count. The caller checked the rest.
     pub fn queue_remote(&mut self, id: TabId, text: &str, asker: RemoteAsker, now_ms: u64) -> Result<usize, String> {
-        let accepted_mode = self.get(id).ok_or_else(|| format!("no tab {}", id.0))?.mode;
+        let tab = self.get(id).ok_or_else(|| format!("no tab {}", id.0))?;
+        let accepted_mode = tab.mode;
+        let (items, bytes) = tab
+            .session
+            .queue
+            .iter()
+            .filter(|item| matches!(&item.from, QueuedFrom::Remote { asker: a, .. } if a.device_id == asker.device_id))
+            .fold((0, 0), |(items, bytes), item| (items + 1, bytes + item.text.len()));
+        if items >= REMOTE_QUEUED_MAX_ITEMS || bytes + text.len() > REMOTE_QUEUED_MAX_BYTES {
+            return Err(REMOTE_QUEUE_FULL.to_string());
+        }
         let length = self.queue_message(id, text, text.to_owned(), now_ms, true, PromptOrigin::Composed)?;
         if let Some(item) = self.get_mut(id).and_then(|tab| tab.session.queue.last_mut()) {
             item.from = QueuedFrom::Remote { asker, accepted_mode };

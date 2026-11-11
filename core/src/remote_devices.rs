@@ -388,12 +388,14 @@ pub fn update<T>(path: &Path, f: impl FnOnce(&mut DeviceStore) -> T) -> io::Resu
 }
 
 /// The authority under which a remote message was accepted. Moved messages reopen the shared counter on a
-/// worker; until that finishes they stay held. No token travels with the message.
+/// worker; until that finishes they stay held. No token travels with the message. Every stamp of one device holds
+/// the same mapping of its counter (see [`SharedGeneration::open`]) and keeps its own `read_at`, so a device's
+/// queued messages cost one mapping between them, not one each.
 #[derive(Clone, serde::Serialize, serde::Deserialize)]
 #[serde(from = "StoredAuthority", into = "StoredAuthority")]
 pub struct AuthorizationStamp {
     saved: StoredAuthority,
-    generation: std::sync::Arc<std::sync::OnceLock<Option<SharedGeneration>>>,
+    generation: std::sync::Arc<std::sync::OnceLock<Option<std::sync::Arc<SharedGeneration>>>>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
@@ -489,14 +491,25 @@ pub fn authorize_act(
 /// truncated, even on revocation: a reused id must not revive an old stamp. The store lock excludes authority writes
 /// from credential reads and idempotent initialization. The mapping holds no flock, so dispatch never waits for a
 /// writer. Only a same-uid process can truncate this private file; doing so while mapped can SIGBUS the window.
+/// A process maps each counter file once while anything holds it: [`SharedGeneration::open`] hands out that mapping.
 struct SharedGeneration(*mut AtomicU64);
+
+/// The live mappings of this process, by the identity (device, inode) of the counter file each maps. An entry whose
+/// mapping is gone is dropped when another is added. A live mapping keeps its inode, so a key is never reused while
+/// its mapping can still be reached.
+static MAPPED: std::sync::LazyLock<
+    std::sync::Mutex<std::collections::HashMap<(u64, u64), std::sync::Weak<SharedGeneration>>>,
+> = std::sync::LazyLock::new(Default::default);
 
 // SAFETY: the mapping stays live until drop, and its counter is accessed only through atomic operations.
 unsafe impl Send for SharedGeneration {}
 unsafe impl Sync for SharedGeneration {}
 
 impl SharedGeneration {
-    fn open(store: &Path, device: &str, create: bool) -> io::Result<Self> {
+    /// The mapping of `device`'s counter beside `store`: the one this process already holds for that file, or a new
+    /// one. The file is opened and checked every time, so a counter file put in place of the mapped one is mapped
+    /// afresh instead of being read through the old mapping.
+    fn open(store: &Path, device: &str, create: bool) -> io::Result<std::sync::Arc<Self>> {
         let path = store.with_extension(format!("authority-{}", token_hash_hex(device)));
         let backing = if create {
             agent::private_fs::PrivateLock::open(&path)?
@@ -505,7 +518,8 @@ impl SharedGeneration {
         };
         let file = backing.as_file();
         let size = std::mem::size_of::<AtomicU64>();
-        match file.metadata()?.len() {
+        let meta = file.metadata()?;
+        match meta.len() {
             0 if create => file.set_len(size as u64)?,
             n if n == size as u64 => {}
             _ => {
@@ -515,9 +529,14 @@ impl SharedGeneration {
                 ))
             }
         }
+        let key = (meta.dev(), meta.ino());
+        let mut mapped = MAPPED.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        if let Some(live) = mapped.get(&key).and_then(std::sync::Weak::upgrade) {
+            return Ok(live);
+        }
         // SAFETY: the file is open for reading and writing, at least size bytes long, and remains that long.
         // mmap returns page-aligned storage, sufficient for AtomicU64. All accesses use the atomic type.
-        let mapped = unsafe {
+        let pointer = unsafe {
             libc::mmap(
                 std::ptr::null_mut(),
                 size,
@@ -527,10 +546,13 @@ impl SharedGeneration {
                 0,
             )
         };
-        if mapped == libc::MAP_FAILED {
+        if pointer == libc::MAP_FAILED {
             return Err(io::Error::last_os_error());
         }
-        Ok(Self(mapped.cast()))
+        let generation = std::sync::Arc::new(Self(pointer.cast()));
+        mapped.retain(|_, held| held.strong_count() > 0);
+        mapped.insert(key, std::sync::Arc::downgrade(&generation));
+        Ok(generation)
     }
 
     fn value(&self) -> &AtomicU64 {
@@ -881,6 +903,67 @@ mod tests {
             let (_, _, fresh) = authorize_act(&path, "d1", "tok").unwrap().unwrap();
             assert!(fresh.is_current());
         }
+    }
+
+    /// Where a stamp's counter is mapped: two stamps holding one mapping read it at one address.
+    fn mapping_of(stamp: &AuthorizationStamp) -> *mut AtomicU64 {
+        let generation = stamp.generation.get().and_then(|g| g.as_ref());
+        generation.expect("a stamp with its counter mapped").0
+    }
+
+    #[test]
+    fn a_devices_stamps_share_one_mapping_and_keep_their_own_reads() {
+        let path = store_file("shared-mapping", &one_device("watch+steer"), 0o600);
+        let (_, _, first) = authorize_act(&path, "d1", "tok").unwrap().unwrap();
+        let (_, _, second) = authorize_act(&path, "d1", "tok").unwrap().unwrap();
+        assert_eq!(
+            mapping_of(&first),
+            mapping_of(&second),
+            "one device's stamps hold one mapping"
+        );
+        // A moved stamp reopens its counter through the same mapping.
+        let moved = AuthorizationStamp::reopen(first.saved.clone(), |read| {
+            read();
+            std::thread::Builder::new().spawn(|| {})
+        });
+        assert_eq!(mapping_of(&first), mapping_of(&moved));
+        update(&path, |store| {
+            let mut other = store.get("d1").unwrap().clone();
+            other.id = "d2".into();
+            store.devices.push(other);
+        })
+        .unwrap();
+        let (_, _, other) = authorize_act(&path, "d2", "tok").unwrap().unwrap();
+        assert_ne!(mapping_of(&first), mapping_of(&other));
+
+        update(&path, |store| store.get_mut("d1").unwrap().grant = Grant::Watch).unwrap();
+        let (_, _, later) = authorize_act(&path, "d1", "tok").unwrap().unwrap();
+        assert_eq!(mapping_of(&first), mapping_of(&later));
+        assert!(!first.is_current() && !second.is_current() && !moved.is_current());
+        assert!(
+            later.is_current(),
+            "a stamp read after the change keeps its own read point"
+        );
+        assert!(other.is_current());
+
+        update(&path, |store| store.remove("d1")).unwrap();
+        assert!(
+            !later.is_current(),
+            "a revoke reaches every stamp of the shared mapping"
+        );
+        assert!(other.is_current());
+    }
+
+    #[test]
+    fn a_counter_file_put_in_place_is_mapped_afresh() {
+        let path = store_file("replaced-counter", &one_device("watch+steer"), 0o600);
+        let counter = path.with_extension(format!("authority-{}", token_hash_hex("d1")));
+        let (_, _, old) = authorize_act(&path, "d1", "tok").unwrap().unwrap();
+        std::fs::remove_file(&counter).unwrap();
+        let (_, _, fresh) = authorize_act(&path, "d1", "tok").unwrap().unwrap();
+        assert_ne!(mapping_of(&old), mapping_of(&fresh));
+        update(&path, |store| store.remove("d1")).unwrap();
+        assert!(!fresh.is_current(), "the revoke advanced the counter file now in place");
     }
 
     #[test]

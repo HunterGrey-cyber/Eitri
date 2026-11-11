@@ -42,7 +42,10 @@ pub use moving::{FrozenChat, FrozenTab, MoveRefusedWhy, SendGate, Sent, TabHando
 pub use observers::{
     GoneWhy, ObserveError, ObserverFrame, ObserverId, ObserverReaper, WorkMark, OBSERVER_QUEUE_CAP_BYTES,
 };
-pub use remote_turns::{QueuedFrom, RemoteAsker, RemoteRefused, RemoteSent};
+pub use remote_turns::{
+    QueuedFrom, RemoteAsker, RemoteRefused, RemoteSent, REMOTE_QUEUED_MAX_BYTES, REMOTE_QUEUED_MAX_ITEMS,
+    REMOTE_QUEUE_FULL,
+};
 pub use shell::{shell_command, ShellEnded};
 
 #[cfg(test)]
