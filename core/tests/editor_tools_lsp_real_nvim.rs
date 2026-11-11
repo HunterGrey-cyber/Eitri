@@ -828,6 +828,38 @@ fn workspace_symbols_ask_only_clients_of_the_project() {
 }
 #[test]
 #[ignore = "needs a real nvim on PATH; spends no tokens and needs no display"]
+fn a_request_still_out_when_its_entry_goes_is_cancelled_and_an_answered_one_is_not() {
+    let mut t = Test::new();
+    t.server();
+    let mut a = t.args();
+    a.kind = LspKind::WorkspaceSymbols;
+    (a.path, a.line, a.symbol, a.query) = (None, None, None, Some("needle".into()));
+    let cancelled = |t: &Test| t.lua("return #(_G.__fake_lsp.cancelled or {})", vec![]).as_u64();
+    // Answered, then collected: nothing to cancel.
+    t.answers(map(&[("workspace/symbol", Value::Array(vec![]))]), &[], 0);
+    t.ask(&a);
+    t.parts();
+    assert_eq!(cancelled(&t), Some(0));
+    // Never answered: the last collect gives up the entry and cancels its request.
+    t.answers(Value::Map(vec![]), &["workspace/symbol"], 0);
+    a.id = "two".into();
+    t.ask(&a);
+    assert!(matches!(t.collect("two", true), Collected::Done { .. }));
+    assert_eq!(cancelled(&t), Some(1));
+    // Never answered and expired: the next ask clears it out and cancels it too.
+    let mut b = a.clone();
+    b.id = "three".into();
+    b.budget_ms = 100;
+    t.ask(&b);
+    assert_eq!(cancelled(&t), Some(1));
+    std::thread::sleep(Duration::from_millis(300));
+    b.id = "four".into();
+    b.budget_ms = 15000;
+    t.ask(&b);
+    assert_eq!(cancelled(&t), Some(2));
+}
+#[test]
+#[ignore = "needs a real nvim on PATH; spends no tokens and needs no display"]
 fn a_query_is_worded_per_client_and_the_start_names_the_clients_and_the_busy() {
     let mut t = Test::new();
     t.start("gopls", "utf-16", t.buf.clone(), &t.root, None, 0);

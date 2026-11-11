@@ -1,5 +1,5 @@
 [English](keys.md) | 简体中文
-<!-- translated-from: keys.md sha256=14f3395cc9efa90de2be1a48e59a68eb29f4c2eb9288f94f13290d8921c98dd5 -->
+<!-- translated-from: keys.md sha256=b8b038c8f22cb66c30519e38c9aae5fc3f50e55d9ab131cda8b75aff6bd0b859 -->
 
 # 按键
 
@@ -577,7 +577,7 @@ end
 - **一个路径：** 像 `gf` 一样打开这个文件。
 - **一个名字**（`TestMeshFieldsOmittedWhenZero`）：Eitri 去问已经附着在项目已打开缓冲区上的语言服务器。如果同一条回复里引用了一个 `path:line`，而那一行里有这个名字，就从那里问它的定义；否则在工作区里查这个名字。只有一个匹配就直接跳过去；有多个时，引用的文件里离引用行最近的那个优先，否则按字母选。没有匹配时，如果有引用的 `path:line` 就打开它，否则状态条会说明原因：`gd: no language server attached for this project (open one of its files)`、`gd: gopls has no symbol TestMeshFieldsOmittedWhenZero` 或 `gd: rust-analyzer is still indexing — try again`。刚启动的服务器一开始可能回答为空，所以 `gd` 最多会重新问三秒，才放弃。结果到达时你已经去做别的了（在输入框里打字、卡片模式拿着按键、开着浮层或选择、另一个窗格拿着按键），它就什么也不打开：状态条会点出那个位置，`gd: src/lib.rs:12 — gd again to open`。
 
-`gd` 从不为了启动语言服务器而打开文件，所以需要一个你在这个项目里已经用过的服务器。只有 rust-analyzer 有一个后备：找不到的名字会在项目的 Rust 文件里按定义（`fn`、`struct`、`enum`、`trait` 之类）搜索。名字可以包含字母、数字和 `. : _ $ -`，最长 200 字节；其他的不会去查。
+`gd` 从不为了启动语言服务器而打开文件，所以需要一个你在这个项目里已经用过的服务器。只有 rust-analyzer 有一个后备：找不到的名字会在项目的 Rust 代码里按定义（`fn`、`struct`、`enum`、`trait` 之类）搜索，注释和字符串不算；带限定的名字（如 `Foo::new`）只取 `impl Foo`、`trait Foo` 或模块 `Foo` 里的 `new`（`Self::new`、`self::`、`super::` 和 `crate::` 保留所有的 `new`）。名字可以包含字母、数字和 `. : _ $ -`，最长 200 字节；其他的不会去查。
 
 <a id="tabs-and-the-leader"></a>
 ### 标签页和 leader

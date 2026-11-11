@@ -664,8 +664,17 @@ impl Lookup {
             return;
         }
         let (root, name) = (self.root.clone(), self.wanted.last.clone());
+        // A qualified name keeps only the definitions its qualifier contains: `Foo::wired` is not `Other::wired`.
+        // `Self`, `self`, `super` and `crate` name a place by where the reference stands, which the text search does
+        // not know, so they keep every definition of the name.
+        let within = self
+            .wanted
+            .qualifier
+            .clone()
+            .filter(|qualifier| !["Self", "self", "super", "crate"].contains(&qualifier.as_str()));
         self.text = counted_worker(cx.workers, move || {
-            let found = eitri_core::symbol_text::search(&root, &name, eitri_core::symbol_text::Limits::default());
+            let limits = eitri_core::symbol_text::Limits::default();
+            let found = eitri_core::symbol_text::search_within(&root, &name, within.as_deref(), limits);
             let places = found
                 .into_iter()
                 .map(|found| (root.join(&found.path), found.line, found.col))
@@ -734,8 +743,9 @@ impl Lookup {
     }
 
     /// A symbol search without an exact match inside the project: rust-analyzer's text matches when it answered with
-    /// other names (a qualified name waits for the end: the text search knows only its last segment, and the matches
-    /// would be every item of that name), else the servers are asked again while time is left.
+    /// other names (a qualified name waits for the end: its text matches are those whose enclosing `impl`, `trait` or
+    /// module bears the qualifier's name, a guess from the text that the server may still better), else the servers
+    /// are asked again while time is left.
     fn no_exact(&mut self, cx: &mut Cx<'_>) -> Flow {
         self.take_text();
         if self.analyzer().is_some() && self.inexact && self.wanted.qualifier.is_none() {
@@ -1714,6 +1724,56 @@ mod tests {
         assert!(run.reply.is_none(), "every `wired` is not what `Foo::wired` asked for");
         run.at(3500);
         assert_eq!(run.matches(), [("src/lib.rs".to_owned(), 2, "text")]);
+    }
+
+    #[test]
+    fn a_qualifier_naming_where_the_reference_stands_keeps_every_text_match() {
+        for (name, file, line) in [
+            ("Self::wired", "impl Foo {\n    fn wired() {}\n}\n", 2),
+            ("crate::wired", "pub fn wired() {}\n", 1),
+            ("self::wired", "pub fn wired() {}\n", 1),
+            ("super::wired", "mod inner {}\nfn wired() {}\n", 2),
+        ] {
+            let root = project("gd-qualified-relative", &[("src/lib.rs", file)]);
+            let mut run = Run::new(&root, name, None);
+            run.settle();
+            run.rpc.answer(started(&["rust-analyzer"], &[]));
+            run.at(0);
+            run.text_settles();
+            run.at(100);
+            run.rpc.answer(done(
+                "workspace_symbols",
+                vec![item(&root.join("src/lib.rs"), 1, 1, Some("wired"), Some("Other"))],
+                &[],
+            ));
+            run.at(100);
+            assert!(run.reply.is_none(), "{name}: a qualified name waits for the end");
+            run.at(3500);
+            assert_eq!(run.matches(), [("src/lib.rs".to_owned(), line, "text")], "{name}");
+        }
+    }
+
+    #[test]
+    fn a_qualified_name_takes_no_text_match_of_another_container() {
+        let root = project(
+            "gd-qualified-other",
+            &[("src/lib.rs", "impl Other {\n    fn wired() {}\n}\n")],
+        );
+        let mut run = Run::new(&root, "Foo::wired", None);
+        run.settle();
+        run.rpc.answer(started(&["rust-analyzer"], &[]));
+        run.at(0);
+        run.text_settles();
+        run.at(100);
+        run.rpc.answer(done(
+            "workspace_symbols",
+            vec![item(&root.join("src/lib.rs"), 2, 7, Some("wired"), Some("Other"))],
+            &[],
+        ));
+        run.at(100);
+        assert!(run.reply.is_none());
+        run.at(3500);
+        assert_eq!(run.error(), ("no_symbol", Some(RUST_ANALYZER.to_owned())));
     }
 
     #[test]

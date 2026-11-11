@@ -18,9 +18,10 @@
 //! nested repository out of the snapshot or makes the snapshot fail (git refuses to add a
 //! repository with no commit), never runs anything.
 //!
-//! Two read-only questions are asked of git in the user's own environment, because their answers
-//! live there: where the user's global excludes file is ([`user_excludes_file`]), and where a
-//! project's common git directory is ([`user_read_only`]). Neither writes anything.
+//! Two read-only questions of turn review are asked of git in the user's own environment, because
+//! their answers live there: where the user's global excludes file is ([`user_excludes_file`]), and
+//! where a project's common git directory is ([`user_read_only`]). Neither writes anything. Path
+//! completion lists a project's names through [`user_read_only`] too, for the same reason.
 
 use std::ffi::{OsStr, OsString};
 use std::io::{Read, Write};
@@ -248,12 +249,103 @@ pub fn run_with_input(mut cmd: Command, input: Option<&[u8]>, timeout: Duration)
     Ok(Output { status, stdout, stderr })
 }
 
+/// The most bytes of standard error [`run_capped`] keeps.
+const MAX_STDERR: u64 = 64 << 10;
+
+/// [`run`] for output that may be larger than the caller can use: at most `max_stdout` bytes of standard output are
+/// kept, and the second value says whether there was more. A run that writes past the cap is not waited for: its
+/// process group is killed as soon as the cap is reached, as at a timeout, and what was read is still the answer
+/// (its status is the kill's, and its standard error is not kept). Of standard error the first 64 KiB are kept and
+/// the rest is read and dropped, so git never waits on a full pipe and a flood of messages costs no memory.
+pub fn run_capped(mut cmd: Command, timeout: Duration, max_stdout: u64) -> Result<(Output, bool), GitError> {
+    if timeout.is_zero() {
+        return Err(GitError::TimedOut);
+    }
+    let deadline = Instant::now() + timeout;
+    let mut child = cmd.spawn().map_err(GitError::Spawn)?;
+    let pid = child.id();
+    // One byte past the cap tells a full answer from a longer one.
+    let mut reader = child
+        .stdout
+        .take()
+        .map(|out| drain(out.take(max_stdout.saturating_add(1))));
+    let stderr = child.stderr.take().map(|err| drain_keeping(err, MAX_STDERR));
+    let mut read = None;
+    let mut pause = Duration::from_micros(200);
+    // `Ok(None)`: the reader stopped at the cap while the child goes on.
+    let ended = loop {
+        match child.try_wait() {
+            Ok(Some(status)) => break Ok(Some(status)),
+            Ok(None) => {}
+            Err(e) => break Err(GitError::Io(e)),
+        }
+        if reader.as_ref().is_some_and(|r| r.is_finished()) {
+            match collect(reader.take()) {
+                Ok(bytes) => {
+                    let over = bytes.len() as u64 > max_stdout;
+                    read = Some(bytes);
+                    if over {
+                        break Ok(None);
+                    }
+                }
+                Err(e) => break Err(e),
+            }
+        }
+        let now = Instant::now();
+        if now >= deadline {
+            break Err(GitError::TimedOut);
+        }
+        std::thread::sleep(pause.min(deadline - now));
+        pause = (pause * 2).min(Duration::from_millis(10));
+    };
+    let status = match ended {
+        Ok(Some(status)) => status,
+        other => {
+            // The child has not been reaped, so its pid still names its group.
+            kill_group(pid);
+            let waited = child.wait();
+            join_quietly(None, reader, stderr);
+            other?;
+            let status = waited.map_err(GitError::Io)?;
+            return Ok((capped(status, read.unwrap_or_default(), max_stdout), true));
+        }
+    };
+    let bytes = match read {
+        Some(bytes) => bytes,
+        None => collect(reader)?,
+    };
+    let stderr = collect(stderr)?;
+    let cut = bytes.len() as u64 > max_stdout;
+    let mut output = capped(status, bytes, max_stdout);
+    output.stderr = stderr;
+    Ok((output, cut))
+}
+
+fn capped(status: ExitStatus, mut stdout: Vec<u8>, max: u64) -> Output {
+    stdout.truncate(usize::try_from(max).unwrap_or(usize::MAX));
+    Output {
+        status,
+        stdout,
+        stderr: Vec::new(),
+    }
+}
+
 type Drain = std::thread::JoinHandle<std::io::Result<Vec<u8>>>;
 
 fn drain(mut source: impl Read + Send + 'static) -> Drain {
     std::thread::spawn(move || {
         let mut buf = Vec::new();
         source.read_to_end(&mut buf).map(|_| buf)
+    })
+}
+
+/// Reads `source` to its end, keeping only the first `keep` bytes.
+fn drain_keeping(mut source: impl Read + Send + 'static, keep: u64) -> Drain {
+    std::thread::spawn(move || {
+        let mut buf = Vec::new();
+        (&mut source).take(keep).read_to_end(&mut buf)?;
+        std::io::copy(&mut source, &mut std::io::sink())?;
+        Ok(buf)
     })
 }
 
@@ -430,5 +522,42 @@ mod tests {
         assert_eq!(args[1], "--work-tree=/w");
         assert!(args.windows(2).any(|w| w == ["-c", "core.quotepath=false"]));
         assert!(args.windows(2).any(|w| w == ["-c", "core.excludesFile=/x"]));
+    }
+
+    /// A run that floods standard error keeps its start and still ends: the rest is read and dropped, never held. Run
+    /// in a child process, whose memory is capped far below the flood.
+    #[test]
+    fn a_capped_run_keeps_only_the_start_of_a_flood_on_stderr() {
+        const CHILD: &str = "EITRI_GIT_STDERR_FLOOD_CHILD";
+        if std::env::var_os(CHILD).is_none() {
+            let status = Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "turn_review::git::tests::a_capped_run_keeps_only_the_start_of_a_flood_on_stderr",
+                    "--nocapture",
+                ])
+                .env(CHILD, "1")
+                .status()
+                .unwrap();
+            assert!(status.success());
+            return;
+        }
+        // Holding the whole flood would need 1 GiB; allocation fails at 256 MiB instead.
+        let limit = libc::rlimit {
+            rlim_cur: 256 << 20,
+            rlim_max: 256 << 20,
+        };
+        // SAFETY: `limit` is a valid rlimit that outlives the call.
+        assert_eq!(unsafe { libc::setrlimit(libc::RLIMIT_DATA, &limit) }, 0);
+        let mut cmd = Command::new("dd");
+        cmd.args(["if=/dev/zero", "of=/dev/stderr", "bs=1M", "count=1024", "status=none"]);
+        cmd.stdin(Stdio::null()).stdout(Stdio::piped()).stderr(Stdio::piped());
+        cmd.process_group(0);
+        let (output, cut) = run_capped(cmd, Duration::from_secs(30), 1 << 20).unwrap();
+        assert!(output.status.success());
+        assert!(!cut);
+        assert!(output.stdout.is_empty());
+        assert_eq!(output.stderr.len(), 64 << 10);
+        assert!(output.stderr.iter().all(|b| *b == 0));
     }
 }

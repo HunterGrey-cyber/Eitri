@@ -23,9 +23,20 @@ fn add(paths: &mut BTreeSet<String>, name: &str) {
     }
 }
 
+/// The most names one listing takes from git, and the most bytes of git's output it reads: a project of millions of
+/// paths is listed in part, not held whole in memory. `@` completion and `gd`'s text search share the listing.
+const MAX_LISTED: usize = 200_000;
+const MAX_LISTING_BYTES: u64 = 32 << 20;
+
 /// Lists names using Git's ignore rules, falling back to a bounded walk without following symlinks.
-/// This may take seconds and belongs on a worker thread.
+/// This may take seconds and belongs on a worker thread. A listing that reached its cap is the first part of the
+/// project and says nothing of being cut.
 pub fn list_paths(root: &Path) -> Vec<String> {
+    listing_within(root, MAX_LISTED, MAX_LISTING_BYTES).0
+}
+
+/// The names, and whether the listing stopped at a cap before the end.
+fn listing_within(root: &Path, max_names: usize, max_bytes: u64) -> (Vec<String>, bool) {
     let mut paths = BTreeSet::new();
     // The person's own git, for their global ignores, with the one setting a repository could name a program
     // through for this command turned off: a folder someone sent must not run anything when `@` is typed.
@@ -38,21 +49,29 @@ pub fn list_paths(root: &Path) -> Vec<String> {
         "--exclude-standard",
         "-z",
     ]);
-    if let Ok(output) = crate::turn_review::git::run(git, GIT_LIMIT) {
-        if output.status.success() {
-            for bytes in output.stdout.split(|b| *b == 0) {
+    if let Ok((output, mut cut)) = crate::turn_review::git::run_capped(git, GIT_LIMIT, max_bytes) {
+        if output.status.success() || cut {
+            let mut stdout = &output.stdout[..];
+            // At the byte cap the piece after the last NUL may be the start of a longer name.
+            if cut {
+                stdout = &stdout[..stdout.iter().rposition(|b| *b == 0).unwrap_or(0)];
+            }
+            let mut pieces = stdout.split(|b| *b == 0).filter(|bytes| !bytes.is_empty());
+            for bytes in pieces.by_ref().take(max_names) {
                 if let Ok(name) = std::str::from_utf8(bytes) {
                     add(&mut paths, name);
                 }
             }
-            return paths.into_iter().collect();
+            cut |= pieces.next().is_some();
+            return (paths.into_iter().collect(), cut);
         }
     }
-    walk(root, &mut paths, 50_000, 32);
-    paths.into_iter().collect()
+    let cut = walk(root, &mut paths, 50_000, 32);
+    (paths.into_iter().collect(), cut)
 }
 
-fn walk(root: &Path, paths: &mut BTreeSet<String>, max_entries: usize, max_depth: usize) {
+/// Whether the walk stopped at `max_entries`.
+fn walk(root: &Path, paths: &mut BTreeSet<String>, max_entries: usize, max_depth: usize) -> bool {
     let mut pending = vec![(root.to_path_buf(), String::new(), 0)];
     let mut entries = 0;
     while let Some((dir, prefix, depth)) = pending.pop() {
@@ -60,7 +79,7 @@ fn walk(root: &Path, paths: &mut BTreeSet<String>, max_entries: usize, max_depth
         for entry in read.flatten() {
             entries += 1;
             if entries > max_entries {
-                return;
+                return true;
             }
             let Ok(name) = entry.file_name().into_string() else {
                 continue;
@@ -80,6 +99,7 @@ fn walk(root: &Path, paths: &mut BTreeSet<String>, max_entries: usize, max_depth
             }
         }
     }
+    false
 }
 
 /// Bounds a suffix listing on its worker thread.
@@ -638,6 +658,101 @@ mod tests {
                 assert!(suffix(dir.path(), name).matches.is_empty(), "{name}");
             }
         }
+    }
+
+    /// Runs the test `name` again in a child process whose only `git` is `script`, run in a scratch project; the
+    /// child calls `check` with that project's root. A child keeps the changed `PATH` from other tests.
+    fn with_fake_git(name: &str, script: &str, check: impl FnOnce(&Path)) {
+        const CHILD: &str = "EITRI_PATH_COMPLETE_FAKE_GIT";
+        if let Some(root) = std::env::var_os(CHILD) {
+            check(Path::new(&root));
+            return;
+        }
+        use std::os::unix::fs::PermissionsExt;
+        let dir = TempDir::new();
+        let bin = dir.path().join("bin");
+        std::fs::create_dir(&bin).unwrap();
+        std::fs::write(bin.join("git"), script).unwrap();
+        std::fs::set_permissions(bin.join("git"), std::fs::Permissions::from_mode(0o755)).unwrap();
+        let status = Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", &format!("path_complete::tests::{name}"), "--nocapture"])
+            .env(CHILD, dir.path())
+            .env("PATH", bin)
+            .status()
+            .unwrap();
+        assert!(status.success());
+    }
+
+    #[test]
+    fn a_long_git_listing_keeps_its_first_names() {
+        with_fake_git(
+            "a_long_git_listing_keeps_its_first_names",
+            "#!/bin/sh\n/usr/bin/seq -f 'n%06g' 1 200005 | /usr/bin/tr '\\n' '\\0'\n",
+            |root| {
+                let names = list_paths(root);
+                assert_eq!(names.len(), 200_000);
+                assert_eq!(names.first().map(String::as_str), Some("n000001"));
+                assert_eq!(names.last().map(String::as_str), Some("n200000"));
+            },
+        );
+    }
+
+    #[test]
+    fn an_endless_git_listing_is_read_to_its_byte_cap_and_git_is_stopped() {
+        with_fake_git(
+            "an_endless_git_listing_is_read_to_its_byte_cap_and_git_is_stopped",
+            "#!/bin/sh\necho $$ > pid\nexec /usr/bin/yes name\n",
+            |root| {
+                // A listing held whole would grow until memory ran out: here allocation fails at 1 GiB instead, far
+                // above what the capped listing holds.
+                let limit = libc::rlimit {
+                    rlim_cur: 1 << 30,
+                    rlim_max: 1 << 30,
+                };
+                // SAFETY: `limit` is a valid rlimit that outlives the call.
+                assert_eq!(unsafe { libc::setrlimit(libc::RLIMIT_DATA, &limit) }, 0);
+                // Git's listing, not the walk's (which would name `bin/` and `pid`): one name that never ends, which
+                // the cap cuts, so no name at all.
+                assert!(list_paths(root).is_empty());
+                let pid: libc::pid_t = std::fs::read_to_string(root.join("pid"))
+                    .unwrap()
+                    .trim()
+                    .parse()
+                    .unwrap();
+                // SAFETY: `kill` takes no pointers; the pid and group belong to the stand-in just run.
+                unsafe {
+                    assert_eq!(libc::kill(pid, 0), -1, "git still lives");
+                    assert_eq!(libc::kill(-pid, 0), -1, "git's process group still lives");
+                }
+            },
+        );
+    }
+
+    #[test]
+    fn a_listing_stops_at_its_caps() {
+        let dir = TempDir::new();
+        write_names(dir.path(), &["a", "b", "c"]);
+        assert!(!listing_within(dir.path(), 10, 1 << 20).1);
+        assert!(Command::new("git")
+            .args(["init", "-q"])
+            .arg(dir.path())
+            .status()
+            .unwrap()
+            .success());
+        assert_eq!(
+            listing_within(dir.path(), 10, 1 << 20),
+            (paths(&["a", "b", "c"]), false)
+        );
+        assert_eq!(listing_within(dir.path(), 3, 1 << 20), (paths(&["a", "b", "c"]), false));
+        assert_eq!(listing_within(dir.path(), 2, 1 << 20), (paths(&["a", "b"]), true));
+        // Three bytes hold `a\0b`: `b` may be the start of a longer name, so only `a` is taken.
+        assert_eq!(listing_within(dir.path(), 10, 3), (paths(&["a"]), true));
+        // Four hold `a\0b\0`: `b` ended, and `c` is not read.
+        assert_eq!(listing_within(dir.path(), 10, 4), (paths(&["a", "b"]), true));
+        // One holds no whole name.
+        assert_eq!(listing_within(dir.path(), 10, 1), (paths(&[]), true));
+        let mut names = BTreeSet::new();
+        assert!(walk(dir.path(), &mut names, 1, 32));
     }
 
     #[test]

@@ -4,11 +4,15 @@
 //! enough to find without it.
 //!
 //! The files are the project's own listing ([`crate::path_complete::list_paths`]: git's, else a bounded walk that
-//! follows no link), only `*.rs`, each checked to be a regular file before it is opened (without following a link or
-//! waiting on a FIFO) and read up to a cap. The name is compared as text, never compiled into a pattern. This lists
-//! and reads files and belongs on a worker thread: the reading stops 1 s after the search began, but the listing comes
-//! first and is not cut short (git's may take up to 10 s), and the deadline is checked between files.
+//! follows no link; either stops at its cap, and a cut listing is silently partial), only `*.rs`, each checked to be a regular file before it is opened
+//! (without following a link or waiting on a FIFO), under no directory that is a link, and read up to a cap. Only
+//! code is read: comments, strings and character literals are blanked over the whole file first
+//! ([`crate::rust_mask::code_only`]), so a definition line inside a block comment or a raw string is none. The name
+//! is compared as text, never compiled into a pattern. This lists and reads files and belongs on a worker thread: the
+//! reading stops 1 s after the search began, but the listing comes first and is not cut short by the deadline (git's
+//! may take up to 10 s), and the deadline is checked between files.
 
+use std::collections::HashMap;
 use std::io::Read;
 use std::path::Path;
 use std::time::{Duration, Instant};
@@ -58,16 +62,35 @@ const QUALIFIERS: &[&str] = &["async", "const", "unsafe", "default", "extern"];
 
 /// The definitions of `name` in the project's Rust files.
 pub fn search(root: &Path, name: &str, limits: Limits) -> Vec<Found> {
+    search_within(root, name, None, limits)
+}
+
+/// [`search`], keeping with `within` only the definitions whose container has that name: the innermost `impl`
+/// (its self type's last segment), `trait` or inline `mod` block around the line, else the file's own module
+/// (`a` for `a.rs` and `a/mod.rs`; none for `lib.rs` and `main.rs`). So `Foo::new` keeps `new` of `impl Foo`, and of
+/// `impl Trait for Foo`, and not `new` of another type.
+pub fn search_within(root: &Path, name: &str, within: Option<&str>, limits: Limits) -> Vec<Found> {
     let started = Instant::now();
     if name.is_empty() {
         return Vec::new();
     }
     let listing = crate::path_complete::list_paths(root);
-    search_in(root, &listing, name, limits, started)
+    scan(root, &listing, name, within, limits, started)
 }
 
 /// [`search`] over a listing already made, its time counted from `started`.
 pub fn search_in(root: &Path, listing: &[String], name: &str, limits: Limits, started: Instant) -> Vec<Found> {
+    scan(root, listing, name, None, limits, started)
+}
+
+fn scan(
+    root: &Path,
+    listing: &[String],
+    name: &str,
+    within: Option<&str>,
+    limits: Limits,
+    started: Instant,
+) -> Vec<Found> {
     let mut found = Vec::new();
     if name.is_empty() {
         return found;
@@ -75,29 +98,56 @@ pub fn search_in(root: &Path, listing: &[String], name: &str, limits: Limits, st
     let files = listing
         .iter()
         .filter(|entry| entry.ends_with(".rs") && !entry.ends_with('/'));
+    let mut judged = HashMap::new();
     for entry in files.take(limits.max_files) {
         if started.elapsed() >= limits.deadline || found.len() >= MAX_FOUND {
             break;
         }
+        if under_link(root, entry, &mut judged) {
+            continue;
+        }
         let Some(bytes) = read_capped(&root.join(entry), limits.max_bytes) else {
             continue;
         };
+        // A definition line names the item in ASCII words, so a quick look for the name's bytes skips most files.
+        if !contains(&bytes, name.as_bytes()) {
+            continue;
+        }
         let cut = bytes.len() as u64 >= limits.max_bytes;
-        let mut lines: Vec<&[u8]> = bytes.split(|byte| *byte == b'\n').collect();
+        let text = String::from_utf8_lossy(&bytes);
+        // The same text with comments and literals blanked: every character keeps its byte length, so a line's
+        // offsets in one are its offsets in the other.
+        let code = crate::rust_mask::code_only(&text);
+        if code.len() != text.len() {
+            continue;
+        }
+        let mut containers = None;
+        let mut lines = Vec::new();
+        let mut start = 0;
+        for line in text.split('\n') {
+            lines.push((start, line.strip_suffix('\r').unwrap_or(line).len()));
+            start += line.len() + 1;
+        }
         // The last piece has no end of line: at the cap it may be any part of a longer line.
         if cut {
             lines.pop();
         }
-        for (index, line) in lines.into_iter().enumerate() {
-            let line = line.strip_suffix(b"\r").unwrap_or(line);
-            // A definition line names the item in ASCII words, so a quick look for the name's bytes skips the rest.
-            if !contains(line, name.as_bytes()) {
+        for (index, (start, len)) in lines.into_iter().enumerate() {
+            let line = &code[start..start + len];
+            if !line.contains(name) {
                 continue;
             }
-            let text = String::from_utf8_lossy(line);
-            if let Some(at) = definition_at(&text, name) {
-                let (Ok(number), Ok(col)) = (u32::try_from(index + 1), u32::try_from(text[..at].chars().count() + 1))
-                else {
+            if let Some(at) = definition_at(line, name) {
+                if let Some(within) = within {
+                    let containers = containers.get_or_insert_with(|| Containers::of(&code, entry));
+                    if containers.at(start + at) != Some(within) {
+                        continue;
+                    }
+                }
+                let (Ok(number), Ok(col)) = (
+                    u32::try_from(index + 1),
+                    u32::try_from(text[start..start + at].chars().count() + 1),
+                ) else {
                     continue;
                 };
                 found.push(Found {
@@ -116,6 +166,138 @@ pub fn search_in(root: &Path, listing: &[String], name: &str, limits: Limits, st
 
 fn contains(haystack: &[u8], needle: &[u8]) -> bool {
     needle.is_empty() || haystack.windows(needle.len()).any(|window| window == needle)
+}
+
+/// Whether a directory between `root` and `entry` is a link, or no directory at all. A listing names paths as they
+/// were (git's index in particular), and a directory since replaced by a link would take the read outside the
+/// project; the file itself is judged when it is read. Each directory is judged once per search.
+fn under_link(root: &Path, entry: &str, judged: &mut HashMap<String, bool>) -> bool {
+    entry.match_indices('/').any(|(at, _)| {
+        let dir = &entry[..at];
+        if let Some(linked) = judged.get(dir) {
+            return *linked;
+        }
+        let linked = !std::fs::symlink_metadata(root.join(dir)).is_ok_and(|meta| meta.is_dir());
+        judged.insert(dir.to_owned(), linked);
+        linked
+    })
+}
+
+/// The blocks of one file's code that give what they hold a container name, and the file's own module name.
+struct Containers {
+    /// Where each block's `{` is, where its `}` is (the end of the text when it has none), and its name.
+    blocks: Vec<(usize, usize, String)>,
+    file: Option<String>,
+}
+
+impl Containers {
+    /// `code` is the file's text with comments and literals blanked, `path` its name in the listing.
+    fn of(code: &str, path: &str) -> Containers {
+        let mut blocks = Vec::new();
+        for keyword in ["impl", "trait", "mod"] {
+            for (at, _) in code.match_indices(keyword) {
+                let after = at + keyword.len();
+                // A keyword inside a word is none, and `impl` after `->`, `:` or `,` is a type, not a block.
+                let joined = code[..at].chars().next_back().is_some_and(is_word)
+                    || code[after..].chars().next().is_some_and(is_word);
+                let typed = code[..at]
+                    .trim_end()
+                    .chars()
+                    .next_back()
+                    .is_some_and(|c| ":,(<>&=+|".contains(c));
+                if joined || typed {
+                    continue;
+                }
+                let Some(open) = header_end(&code[after..]).map(|end| after + end) else {
+                    continue;
+                };
+                let header = &code[after..open];
+                let name = if keyword == "impl" {
+                    self_type(header)
+                } else {
+                    word(header.trim_start()).0.to_owned()
+                };
+                if !name.is_empty() {
+                    blocks.push((open, block_end(code, open), name));
+                }
+            }
+        }
+        let file = Path::new(path);
+        let file = match file.file_stem().and_then(|stem| stem.to_str()) {
+            Some("lib" | "main") => None,
+            Some("mod") => file.parent().and_then(Path::file_name).and_then(|dir| dir.to_str()),
+            stem => stem,
+        };
+        Containers {
+            blocks,
+            file: file.map(str::to_owned),
+        }
+    }
+
+    /// The container of what is defined at `offset`.
+    fn at(&self, offset: usize) -> Option<&str> {
+        self.blocks
+            .iter()
+            .filter(|(open, close, _)| *open < offset && offset < *close)
+            .max_by_key(|(open, ..)| *open)
+            .map(|(.., name)| name.as_str())
+            .or(self.file.as_deref())
+    }
+}
+
+/// Where the header after `impl`, `trait` or `mod` ends at its block's `{`; `None` when a `;` ends the item first.
+fn header_end(rest: &str) -> Option<usize> {
+    let mut depth = 0usize;
+    for (at, c) in rest.char_indices() {
+        match c {
+            '<' | '(' | '[' => depth += 1,
+            '>' if depth > 0 && !rest[..at].ends_with('-') => depth -= 1,
+            ')' | ']' if depth > 0 => depth -= 1,
+            '{' if depth == 0 => return Some(at),
+            ';' | '}' if depth == 0 => return None,
+            _ => {}
+        }
+    }
+    None
+}
+
+/// Where the block opened at `open` closes, or the end of `code`.
+fn block_end(code: &str, open: usize) -> usize {
+    let mut depth = 0usize;
+    for (at, c) in code[open..].char_indices() {
+        match c {
+            '{' => depth += 1,
+            '}' => {
+                depth -= 1;
+                if depth == 0 {
+                    return open + at;
+                }
+            }
+            _ => {}
+        }
+    }
+    code.len()
+}
+
+/// The last path segment of an `impl` header's self type: the last word before a `where` and after a `for`, read
+/// from the header with everything inside `<>`, `()` and `[]` left out (the impl's generics, the type's arguments).
+fn self_type(header: &str) -> String {
+    let mut top = String::new();
+    let mut depth = 0usize;
+    for (at, c) in header.char_indices() {
+        match c {
+            '<' | '(' | '[' => depth += 1,
+            '>' if depth > 0 && !header[..at].ends_with('-') => depth -= 1,
+            ')' | ']' => depth = depth.saturating_sub(1),
+            _ if depth == 0 => top.push(c),
+            _ => {}
+        }
+    }
+    let words: Vec<&str> = top.split_whitespace().take_while(|word| *word != "where").collect();
+    let after_for = words.iter().rposition(|word| *word == "for").map_or(0, |at| at + 1);
+    let ty = words[after_for..].last().copied().unwrap_or("");
+    let ty = ty.rsplit("::").next().unwrap_or("");
+    ty.trim_start_matches(|c: char| !is_word(c)).to_owned()
 }
 
 /// A file's first `max` bytes. A link is not followed, a FIFO or device is never opened or waited on: only a regular
@@ -345,7 +527,10 @@ mod tests {
     fn a_column_counts_characters() {
         let (dir, listing) = project(&[("a.rs", "/* é */ fn wanted() {}\n")]);
         let found = search_in(&dir, &listing, "wanted", Limits::default(), Instant::now());
-        assert!(found.is_empty(), "a comment first is no definition line");
+        assert_eq!(
+            found[0].col, 12,
+            "a closed comment before the item is blank, and é is one character"
+        );
         let (dir, listing) = project(&[("a.rs", "\u{3000}fn wanted() {}\n")]);
         let found = search_in(&dir, &listing, "wanted", Limits::default(), Instant::now());
         assert_eq!(found[0].col, 5, "an ideographic space is whitespace and one character");
@@ -430,6 +615,62 @@ mod tests {
         });
         assert_eq!(read.as_deref(), Some(&b"fn wanted() {}\n"[..]));
         assert!(opened.get());
+    }
+
+    #[test]
+    fn comments_strings_and_raw_strings_define_nothing() {
+        let (dir, listing) = project(&[(
+            "a.rs",
+            "/*\nfn wanted() {}\n*/\nconst S: &str = r#\"\nfn wanted() {}\n\"#;\n// macro_rules! wanted {\n\
+             let x = 1; // macro_rules! wanted {\nlet c = '\"'; fn real() {}\n\"\nstruct wanted;\n\"\nfn wanted() {}\n",
+        )]);
+        let found = search_in(&dir, &listing, "wanted", Limits::default(), Instant::now());
+        assert_eq!(found.iter().map(|f| f.line).collect::<Vec<_>>(), [13]);
+    }
+
+    #[test]
+    fn a_file_under_a_linked_directory_is_not_read() {
+        let (dir, mut listing) = project(&[("src/real.rs", "fn wanted() {}\n")]);
+        let outside = ScratchDir::new("symbol-text", "outside");
+        std::fs::create_dir(outside.join("src")).unwrap();
+        std::fs::write(outside.join("src/o.rs"), "fn wanted() {}\n").unwrap();
+        std::os::unix::fs::symlink(outside.join("src"), dir.join("linked")).unwrap();
+        listing.push("linked/o.rs".into());
+        let found = search_in(&dir, &listing, "wanted", Limits::default(), Instant::now());
+        assert_eq!(
+            found.iter().map(|f| f.path.as_str()).collect::<Vec<_>>(),
+            ["src/real.rs"]
+        );
+    }
+
+    #[test]
+    fn a_container_keeps_only_its_own_definitions() {
+        let (dir, listing) = project(&[
+            (
+                "src/lib.rs",
+                "impl Other {\n    fn wired() {}\n}\n\
+                 impl<T: Into<u8>> fmt::Display for crate::x::Foo<T> where T: Fn() -> u8 {\n    fn wired() {}\n}\n\
+                 fn f() -> impl Fn() { || () }\nfn wired() {}\ntrait Foo {\n    fn wired();\n}\n",
+            ),
+            ("src/foo.rs", "pub fn wired() {}\nmod Foo {\n    fn wired() {}\n}\n"),
+            ("src/bar/mod.rs", "fn wired() {}\n"),
+        ]);
+        let lines = |within: &str| {
+            scan(&dir, &listing, "wired", Some(within), Limits::default(), Instant::now())
+                .into_iter()
+                .map(|f| (f.path, f.line))
+                .collect::<Vec<_>>()
+        };
+        let at = |path: &str, line| (path.to_owned(), line);
+        assert_eq!(
+            lines("Foo"),
+            [at("src/lib.rs", 5), at("src/lib.rs", 10), at("src/foo.rs", 3)]
+        );
+        assert_eq!(lines("Other"), [at("src/lib.rs", 2)]);
+        assert_eq!(lines("foo"), [at("src/foo.rs", 1)]);
+        assert_eq!(lines("bar"), [at("src/bar/mod.rs", 1)]);
+        assert!(lines("Missing").is_empty());
+        assert!(lines("lib").is_empty(), "lib.rs names the crate, not a module");
     }
 
     #[test]

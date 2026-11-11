@@ -904,7 +904,8 @@ that name.
 
 `gd` never opens a file to start a language server, so it needs one you have already used in this project. For
 rust-analyzer only, a name it cannot find is searched as a definition (`fn`, `struct`, `enum`, `trait` and the like) in
-the project's Rust files. A name may hold letters, digits and `. : _ $ -`, up to 200 bytes; anything else is not looked up.
+the project's Rust code, comments and strings left out; a qualified name such as `Foo::new` takes only a `new` inside
+`impl Foo`, `trait Foo` or module `Foo` (`Self::new`, `self::`, `super::` and `crate::` keep every `new`). A name may hold letters, digits and `. : _ $ -`, up to 200 bytes; anything else is not looked up.
 
 ### Tabs and the leader
 

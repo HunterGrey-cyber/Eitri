@@ -9,10 +9,19 @@ end
 local function asked_now()
   return math.ceil(now_ms())
 end
+local modern = vim.fn.has('nvim-0.11') == 1
+-- An entry dropped with a request still out cancels it: a server that never answers keeps nothing waiting in nvim.
 local function remove_entry(key)
-  if lsp.entries[key] then
+  local entry = lsp.entries[key]
+  if entry then
     lsp.entries[key] = nil
     lsp.n = lsp.n - 1
+    for _, sent in ipairs(entry.sent or {}) do
+      if not sent.done then
+        if modern then pcall(sent.client.cancel_request, sent.client, sent.id)
+        else pcall(sent.client.cancel_request, sent.id) end
+      end
+    end
   end
 end
 local function clear_past(now)
@@ -41,7 +50,6 @@ local function cut(text, n)
   if #text <= n then return text, false end
   return text:sub(1, n + vim.str_utf_start(text, n + 1)), true
 end
-local modern = vim.fn.has('nvim-0.11') == 1
 local function supports(client, method, buf)
   if modern then return client:supports_method(method, buf) end
   return client.supports_method(method, { bufnr = buf })

@@ -26,7 +26,14 @@ return vim.lsp.start({
         end
         return true, serial
       end,
-      notify = function() return true end,
+      notify = function(method, params)
+        if method == '$/cancelRequest' then
+          local fake = _G.__fake_lsp
+          fake.cancelled = fake.cancelled or {}
+          fake.cancelled[#fake.cancelled + 1] = params.id
+        end
+        return true
+      end,
       is_closing = function() return closed end,
       terminate = function() closed = true dispatchers.on_exit(0, 0) end,
     }

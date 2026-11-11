@@ -72,6 +72,7 @@ pub mod remote_wire;
 pub mod review_editor;
 #[cfg(target_os = "linux")]
 pub mod run_guard;
+pub mod rust_mask;
 pub mod saved_tabs;
 pub mod scratch;
 pub mod shell_line;

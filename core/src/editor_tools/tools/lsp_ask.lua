@@ -147,6 +147,7 @@ local entry = {
   ticks = stored and stored.ticks or phase_c and ticks_at_ask(args.root) or {},
   asked_ms = stored and stored.asked_ms or asked_now(),
   asked_tick = buf and api.nvim_buf_get_changedtick(buf), action = stored and action_facts(stored.action) or nil,
+  sent = {},
 }
 lsp.entries[key] = entry
 lsp.n = lsp.n + 1
@@ -180,7 +181,9 @@ for _, job in ipairs(jobs) do
     end
   end
   local settled = false
+  local sent = { client = target.client }
   local function handler(err, result)
+    sent.done = true
     local current = lsp.entries[key]
     if settled or current ~= entry then return end
     settled = true
@@ -211,8 +214,12 @@ for _, job in ipairs(jobs) do
   end
   if stored and has_edit(stored.action) then handler(nil, stored.action)
   else
-    local ok, sent = pcall(request, target.client, job.verb, params, handler, target.buf)
-    if not ok or not sent then handler(true, nil) end
+    local ok, asked, id = pcall(request, target.client, job.verb, params, handler, target.buf)
+    if not ok or not asked then handler(true, nil)
+    elseif id ~= nil and not sent.done then
+      sent.id = id
+      entry.sent[#entry.sent + 1] = sent
+    end
   end
 end
 return { started = true, unsupported = unsupported, action = entry.action, buffer = about, clients = client_names,
