@@ -30,6 +30,7 @@ pub struct WindowConfig {
     /// (a companion window) has nothing to follow and keeps `panel_font_size`.
     pub panel_font_follows_editor: bool,
     pub typing_cadence: Option<u32>,
+    pub history_turns: usize,
     pub restore_policy: eitri_core::tab_restore::RestorePolicy,
     pub default_mode: Option<eitri_core::agent_bridge::SessionModeChoice>,
     /// `agent.default`: the agent a new tab runs. Claude when unset.
@@ -261,6 +262,11 @@ fn read_with_alt_mod(
         kernel.config.borrow().get(eitri_core::agent_prefs::USER_SETTINGS_KEY),
     )?;
     agent::setting_sources::configure(user_settings);
+    let history_turns = eitri_core::agent_prefs::parse_history_turns(
+        kernel.config.borrow().get(eitri_core::agent_prefs::HISTORY_TURNS_KEY),
+    )?;
+    agent::configure_history_turns(history_turns);
+    let history_turns = agent::history_turns();
     if !user_settings {
         eprintln!("[agent] sessions do not load the user's own settings (init.lua's agent.user_settings = false)");
     }
@@ -404,6 +410,7 @@ fn read_with_alt_mod(
         panel_font_size,
         panel_font_follows_editor,
         typing_cadence,
+        history_turns,
         restore_policy,
         default_mode,
         default_agent,
@@ -450,6 +457,15 @@ impl WindowConfig {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn later_window_reports_the_process_history_budget_in_force() {
+        load_from("", &[]).unwrap();
+        let kept = agent::history_turns();
+        let requested = if kept == 10 { 20 } else { 10 };
+        let config = load_from(&format!("eitri.config.set('agent.history_turns', {requested})"), &[]).unwrap();
+        assert_eq!(config.history_turns, kept);
+    }
 
     #[test]
     fn every_bad_value_keeps_its_startup_failure_text() {

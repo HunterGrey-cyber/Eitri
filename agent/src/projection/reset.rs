@@ -49,6 +49,7 @@ pub(super) fn fold(state: &mut AgentSessionProjection, event: &AgentDomainEvent)
         thinking_open,
         last_revision: _,
         history,
+        evicted,
         ungated_cli_mode: _,
         cli_mode_reported: _,
         policy_mismatch: _,
@@ -102,6 +103,7 @@ pub(super) fn fold(state: &mut AgentSessionProjection, event: &AgentDomainEvent)
     *thinking_open = false;
     // What was restored belonged to the old conversation.
     *history = None;
+    *evicted = None;
 }
 
 pub(super) fn snapshot_json(_state: &AgentSessionProjection, _snapshot: &mut serde_json::Value) {

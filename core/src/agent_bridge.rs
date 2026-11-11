@@ -1973,6 +1973,9 @@ pub fn serialize_events_for_js(
 /// a payload without notes is byte-identical to one from before they existed.
 #[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct CallNotes {
+    // A resync at the same boundary must keep notes for calls whose start has not folded yet.
+    #[serde(skip)]
+    pub(crate) evicted_through: Option<u64>,
     /// The phone behind each message id the provider may still name back with `UserMessageDelivered`
     /// (a steer, or a sent prompt the agent reads only after work of its own), newest last, at most
     /// [`REMOTE_SENDERS_KEPT`]: an id the provider never names back is not kept for the tab's life.
@@ -2011,8 +2014,8 @@ pub struct CallNotes {
     /// only source is `AgentBackend::answer_what_needs_no_human`'s `AnsweredForYou::creates_file`.
     /// The name (and the wire key `autoCreatesFile`) predate bypass joining it.
     pub auto_creates_file: BTreeSet<String>,
-    /// How long each finished turn ran, oldest first (`TurnTime`). The tab keeps every one it
-    /// stamped; a batch's notes hold only those that ended in it. The panel's "Worked for" line and
+    /// How long each finished turn ran, oldest first (`TurnTime`), while its anchor is loaded.
+    /// A batch's notes hold only those that ended in it. The panel's "Worked for" line and
     /// the duration on a turn-ending row read them, so a turn with no entry (history from a resume,
     /// a turn that began before this process) shows no time rather than a wrong one.
     pub turn_times: Vec<TurnTime>,
@@ -2054,6 +2057,53 @@ impl TurnTime {
 pub const REMOTE_SENDERS_KEPT: usize = 256;
 
 impl CallNotes {
+    /// Release badges and timing records whose owning rows have left the live projection.
+    pub fn prune_evicted(&mut self, projection: &agent::AgentSessionProjection) {
+        self.evicted_through = projection.evicted.as_ref().map(|e| e.through_seq);
+        let Some(evicted) = &projection.evicted else {
+            return;
+        };
+        let boundary = evicted.through_seq;
+        let remote_count = self.sent_from.len() + self.stopped_from.len();
+        let mut calls = BTreeSet::new();
+        fn collect(calls: &mut BTreeSet<String>, records: &[agent::ToolCallRecord]) {
+            for call in records {
+                calls.insert(call.tool_use_id.clone());
+                if let Some(children) = &call.children {
+                    collect(calls, &children.tool_calls);
+                }
+            }
+        }
+        collect(&mut calls, &projection.tool_calls);
+        self.turn_times
+            .retain(|r| r.anchor_seq.is_some_and(|seq| seq >= boundary));
+        let turns: BTreeSet<_> = projection
+            .thinking
+            .iter()
+            .map(|r| r.turn_id.as_str())
+            .chain(self.turn_times.iter().map(|r| r.turn_id.as_str()))
+            .chain(projection.turn_starts.iter().map(|r| r.turn_id.as_str()))
+            .chain(projection.turn_endings.iter().map(|r| r.turn_id.as_str()))
+            .chain(projection.tool_calls.iter().map(|r| r.turn_id.as_str()))
+            .collect();
+        self.sent_from
+            .retain(|seq, _| *seq >= boundary || evicted.lifted.contains(seq));
+        self.stopped_from.retain(|id, _| turns.contains(id.as_str()));
+        self.allowed_by_rule.retain(|id, _| calls.contains(id));
+        self.prompt_notes.retain(|id, _| calls.contains(id));
+        self.allowed_by_auto.retain(|id| calls.contains(id));
+        self.auto_creates_file.retain(|id| calls.contains(id));
+        self.creates_file
+            .retain(|_, id| id.as_ref().is_some_and(|id| calls.contains(id)));
+        self.remote_notes_dirty |= remote_count != self.sent_from.len() + self.stopped_from.len();
+    }
+
+    pub fn prune_evicted_if_moved(&mut self, projection: &agent::AgentSessionProjection) {
+        if self.evicted_through != projection.evicted.as_ref().map(|e| e.through_seq) {
+            self.prune_evicted(projection);
+        }
+    }
+
     /// Remembers which phone sent the message `id`, so its delivery is noted with that phone.
     pub fn note_remote_sender(&mut self, id: String, from: SentFrom) {
         self.remote_senders.retain(|(kept, _)| *kept != id);
@@ -2567,6 +2617,9 @@ pub fn serialize_snapshot_with_notes_for_js(
         if offered {
             state["capabilities"][name] = json!(true);
         }
+    }
+    if let Some(evicted) = &projection.evicted {
+        state["evicted"] = json!({ "throughSeq": evicted.through_seq, "turns": evicted.turns });
     }
     projection.snapshot_modules(&mut state);
     if !cards.is_empty() {

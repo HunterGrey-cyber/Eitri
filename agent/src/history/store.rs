@@ -448,7 +448,7 @@ fn retain_by<T>(items: &mut Vec<T>, keep: &[bool]) {
 /// What one tool call costs against the character budget: its name, its input, and its result if it
 /// has one. The result is weighed with the call rather than on its own because that is how it
 /// renders and how the reader budgets it -- a call and its result are one row.
-fn tool_call_chars(call: &ToolCallRecord) -> usize {
+pub(super) fn tool_call_chars(call: &ToolCallRecord) -> usize {
     let result = call
         .result
         .as_ref()
@@ -475,7 +475,7 @@ fn tool_call_chars(call: &ToolCallRecord) -> usize {
 }
 
 /// A turn start costs the text of its cause: what its row can show.
-fn turn_start_chars(start: &TurnStartRecord) -> usize {
+pub(super) fn turn_start_chars(start: &TurnStartRecord) -> usize {
     start
         .cause
         .as_ref()
@@ -484,7 +484,7 @@ fn turn_start_chars(start: &TurnStartRecord) -> usize {
 }
 
 /// A notice costs its words and the values it may be worded from.
-fn notice_chars(notice: &NoticeRecord) -> usize {
+pub(super) fn notice_chars(notice: &NoticeRecord) -> usize {
     let content = notice.content.as_deref().map(|c| c.chars().count()).unwrap_or(0);
     content
         + notice
@@ -496,7 +496,7 @@ fn notice_chars(notice: &NoticeRecord) -> usize {
 
 /// A question costs every text it holds: the questions, their choices and previews, and the
 /// answers and reasons it settled with.
-fn question_chars(question: &QuestionRecord) -> usize {
+pub(super) fn question_chars(question: &QuestionRecord) -> usize {
     let count = |text: &str| text.chars().count();
     let opt = |text: &Option<String>| text.as_deref().map(count).unwrap_or(0);
     let asked: usize = question
@@ -609,13 +609,16 @@ fn remove_orphans(conversation_id: &str) {
     let Ok(entries) = std::fs::read_dir(&dir) else { return };
     for entry in entries.flatten() {
         let path = entry.path();
-        // `.json` only. `write_record`'s temp files are `.tmp`, and deleting one would be deleting
-        // a write in flight.
-        if path.extension().and_then(|e| e.to_str()) != Some("json") {
+        let Some(name) = path.file_name().and_then(|s| s.to_str()) else {
             continue;
-        }
-        let Some(session_id) = path.file_stem().and_then(|s| s.to_str()) else {
-            continue;
+        };
+        // Temporary writes and unrelated files are never housekeeping candidates.
+        let session_id = match super::archive::archive_name(name) {
+            Some((sid, _, _)) => sid,
+            None => match name.strip_suffix(".json") {
+                Some(sid) => sid,
+                None => continue,
+            },
         };
         if !recorded.iter().any(|id| id == session_id) {
             let _ = std::fs::remove_file(&path);
@@ -804,6 +807,26 @@ mod tests {
             name: None,
         })
         .unwrap();
+    }
+
+    #[test]
+    fn orphan_cleanup_uses_the_archives_session_id_and_preserves_an_empty_record_list() {
+        let conversation_id = setup();
+        let dir = conversation_history_dir(&conversation_id).unwrap();
+        crate::persistence::create_private_state_dir(&dir, crate::state_dirs::history_dir().unwrap()).unwrap();
+        let kept = dir.join("recorded.evicted-0123456789abcdef.0.jsonl");
+        let gone = dir.join("orphan.evicted-0123456789abcdef.0.jsonl");
+        let unrelated = dir.join("orphan.evicted-not-an-archive.jsonl");
+        for path in [&kept, &gone, &unrelated] {
+            crate::private_fs::write_private(path, b"{}\n").unwrap();
+        }
+        remove_orphans(&conversation_id);
+        assert!(gone.exists(), "no records means no authority to sweep");
+        record_for(&conversation_id, "recorded");
+        remove_orphans(&conversation_id);
+        assert!(kept.exists());
+        assert!(!gone.exists());
+        assert!(unrelated.exists());
     }
 
     #[test]

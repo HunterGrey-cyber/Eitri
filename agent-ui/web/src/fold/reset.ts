@@ -24,6 +24,7 @@ const EMPTIED = {
   thinkingOpen: false,
   // What was restored belonged to the old conversation.
   history: null,
+  evicted: null,
   // Which phone sent or stopped what: notes on the old conversation's rows and turns.
   sentFrom: {},
   stoppedFrom: {},

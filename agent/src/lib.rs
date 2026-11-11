@@ -24,7 +24,7 @@ mod conversation;
 #[cfg(feature = "legacy-backend")]
 mod event;
 mod process;
-mod projection;
+pub mod projection;
 mod provider;
 mod runtime_thread;
 #[cfg(feature = "legacy-backend")]
@@ -56,6 +56,7 @@ pub mod external_link;
 pub mod external_writer;
 pub mod handoff;
 pub mod history;
+pub use history::{configure_history_turns, history_turns};
 #[cfg(feature = "legacy-backend")]
 pub mod hook_protocol;
 pub mod ingestion;
@@ -132,7 +133,7 @@ pub const LEGACY_NOT_IN_BUILD: &str =
 
 pub use projection::{
     describe_failed_resume, thinking_open_after, AccountLimitsRecord, AgentDomainEvent, AgentSessionProjection,
-    BackgroundTask, BackgroundTaskRecord, ContentKind, HistoryNotice, HistorySource, InitServer, InputChange,
+    BackgroundTask, BackgroundTaskRecord, ContentKind, Evicted, HistoryNotice, HistorySource, InitServer, InputChange,
     MatchedAskRule, NoticeLevel, NoticeRecord, OpenClientCall, PermissionOutcome, PermissionRequestRecord,
     ProjectionStatus, ProviderPrompt, QuestionOptionSpec, QuestionOutcome, QuestionRecord, QuestionSpec, QuestionState,
     ResumeStatus, SessionNoticeKind, ShownAnswer, SlashCommand, SteerOutcome, TaskEdge, TaskKind, TaskRoster,

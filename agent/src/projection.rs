@@ -26,6 +26,7 @@ mod notices;
 mod questions;
 mod reset;
 mod roster;
+pub mod turns;
 pub use roster::{BackgroundTaskRecord, TaskRoster};
 mod subagents;
 pub use subagents::SubagentStream;
@@ -240,6 +241,11 @@ pub enum ProjectionStatus {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum AgentDomainEvent {
+    HistoryEvicted {
+        through_seq: u64,
+        turns: u64,
+        lifted: Vec<u64>,
+    },
     SessionOpened {
         session_id: String,
         provider_session_id: String,
@@ -1715,6 +1721,14 @@ impl Default for UsageInfo {
     }
 }
 
+/// The absolute boundary of the live tail and the earlier records held by running background work.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Evicted {
+    pub through_seq: u64,
+    pub turns: u64,
+    pub lifted: Vec<u64>,
+}
+
 /// Eitri's sole product-state authority for one conversation. `pending_permissions`
 /// is a map (not the old `Vec`) so a caller can look up/remove one specific request by id in O(1)
 /// -- exactly what answering one permission card needs.
@@ -1730,6 +1744,7 @@ impl Default for UsageInfo {
 /// through `apply` ([`AgentSessionProjection::adopt`]).
 #[derive(Debug, Clone, Default, Serialize)]
 pub struct AgentSessionProjection {
+    pub evicted: Option<Evicted>,
     pub session_id: Option<String>,
     /// The real Claude CLI session UUID -- for the legacy backend this is identical to
     /// `session_id` above (the CLI never distinguishes them); for `ClaudeSidecarProvider` this is
@@ -2380,6 +2395,27 @@ impl AgentSessionProjection {
     fn apply_inner(&mut self, event: &AgentDomainEvent) {
         let seq = self.last_revision;
         match event {
+            AgentDomainEvent::HistoryEvicted {
+                through_seq,
+                turns,
+                lifted,
+            } => {
+                let keep = |seq: u64| seq >= *through_seq || lifted.contains(&seq);
+                self.user_prompts.retain(|r| keep(r.seq));
+                self.transcript.retain(|r| keep(r.seq));
+                self.thinking.retain(|r| keep(r.seq));
+                self.tool_calls.retain(|r| keep(r.seq));
+                self.turn_starts.retain(|r| keep(r.seq));
+                self.turn_endings.retain(|r| keep(r.seq));
+                self.notices.retain(|r| keep(r.seq));
+                self.questions.retain(|r| keep(r.seq));
+                self.call_index = CallIndex::default();
+                self.evicted = Some(Evicted {
+                    through_seq: *through_seq,
+                    turns: *turns,
+                    lifted: lifted.clone(),
+                });
+            }
             // The cause the turn's close named: it replaces what its start said. A turn with no start
             // row (one this host sent) keeps none, and an update that names no cause is no news.
             AgentDomainEvent::TurnCauseUpdated {
@@ -2967,6 +3003,7 @@ pub fn thinking_open_after(open: bool, event: &AgentDomainEvent) -> bool {
         | AgentDomainEvent::CliWorkUnseen
         | AgentDomainEvent::UserPromptWithdrawn
         // A seed sets records, never whether a block is open.
+        | AgentDomainEvent::HistoryEvicted { .. }
         | AgentDomainEvent::MoveSeeded(_)
         | AgentDomainEvent::TurnCauseUpdated { .. }
         | AgentDomainEvent::BackgroundTasksChanged { .. }

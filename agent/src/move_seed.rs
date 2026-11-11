@@ -53,6 +53,8 @@ pub struct MoveSeed {
     pub(crate) usage: Option<UsageInfo>,
     pub(crate) thinking: Vec<ThinkingBlock>,
     pub(crate) history: Option<HistoryNotice>,
+    #[serde(default)]
+    pub(crate) evicted: Option<crate::projection::Evicted>,
     pub(crate) ungated_cli_mode: Option<UngatedCliModeRecord>,
     pub(crate) cli_mode_reported: Option<String>,
     pub(crate) cli_left_auto: bool,
@@ -176,6 +178,10 @@ pub struct ConversationHandoff {
     /// call's start or its settle) was folded since the history was last written: lost, it would never
     /// be written.
     pub history_dirty: bool,
+    #[serde(default)]
+    pub eviction_due: bool,
+    #[serde(default)]
+    pub archive_id: Option<crate::history::archive::ArchiveId>,
     /// The tools the session was given: wrong, the destination's gate would not know its own tools.
     /// Absent from a record of a build that had none.
     #[serde(default)]
@@ -289,6 +295,7 @@ impl AgentSessionProjection {
             thinking_open: _,
             last_revision,
             history,
+            evicted,
             ungated_cli_mode,
             cli_mode_reported,
             cli_left_auto,
@@ -333,6 +340,7 @@ impl AgentSessionProjection {
             usage: usage.clone(),
             thinking: thinking.clone(),
             history: history.clone(),
+            evicted: evicted.clone(),
             ungated_cli_mode: ungated_cli_mode.clone(),
             cli_mode_reported: cli_mode_reported.clone(),
             cli_left_auto: *cli_left_auto,
@@ -419,7 +427,12 @@ impl AgentSessionProjection {
             .chain(seed.questions.iter().map(|r| r.seq))
             .chain(seed.thinking.iter().map(|r| r.seq))
             .chain(seed.rate_limit_warning.iter().map(|r| r.seq));
-        if seqs.into_iter().any(|seq| seq >= through) {
+        if seqs.into_iter().any(|seq| seq >= through)
+            || seed
+                .evicted
+                .as_ref()
+                .is_some_and(|e| e.through_seq >= through || e.lifted.iter().any(|s| *s >= e.through_seq))
+        {
             return Err(SeedRefused::SeqPastRevision);
         }
         Ok(())
@@ -439,6 +452,7 @@ impl AgentSessionProjection {
             && self.questions.is_empty()
             && self.thinking.is_empty()
             && self.history.is_none()
+            && self.evicted.is_none()
     }
 
     /// No live declaration is set: no turn runs, no card waits, no reply or thought is open. What
@@ -470,6 +484,7 @@ impl AgentSessionProjection {
             usage,
             thinking,
             history,
+            evicted,
             ungated_cli_mode,
             cli_mode_reported,
             cli_left_auto,
@@ -506,6 +521,7 @@ impl AgentSessionProjection {
         self.usage = usage.clone();
         self.thinking = thinking.clone();
         self.history = history.clone();
+        self.evicted = evicted.clone();
         self.ungated_cli_mode = ungated_cli_mode.clone();
         self.cli_mode_reported = cli_mode_reported.clone();
         self.cli_left_auto = *cli_left_auto;

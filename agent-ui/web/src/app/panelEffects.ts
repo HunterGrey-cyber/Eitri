@@ -1,13 +1,24 @@
-import { useEffect, useLayoutEffect } from "react";
+import { useEffect, useLayoutEffect, useRef } from "react";
 import type { Dispatch, MutableRefObject, RefObject, SetStateAction } from "react";
-import { indexOfKey } from "../display";
+import { buildDisplay, indexOfKey } from "../display";
 import { isListScrollAnimating, settleListScroll } from "../jkScroll";
 import type { PanelMode } from "../keymap";
 import { conversationRows } from "../nav";
-import type { TimelineItem } from "../timeline";
+import { buildTimeline, type TimelineItem } from "../timeline";
+import type { AgentUiState } from "../types";
 import type { BuiltSelection } from "../visual";
 import { clampCursorToView, enterBoxAtNearEnd, revealRow } from "./rowScroll";
 import type { ArrivalPark, FrozenSnapshot } from "./rowScroll";
+
+/** Keep expansions of surviving rows, including runs and children currently folded out of view. */
+export function pruneExpanded(state: AgentUiState, expanded: Record<string, boolean>): Record<string, boolean> {
+  const raw = buildTimeline(state);
+  const keys = new Set([
+    ...buildDisplay(raw, { expanded: {}, detailed: false, turnRunning: state.activeTurnId !== null }),
+    ...buildDisplay(raw, { expanded, detailed: true, turnRunning: state.activeTurnId !== null }),
+  ].map((row) => row.key));
+  return Object.fromEntries(Object.entries(expanded).filter(([key]) => keys.has(key)));
+}
 
 /* The cursor is an index into `timeline`, which shrinks on its own -- a permission card resolving
    removes one row without anything here asking for it. Without this, a cursor left pointing past
@@ -57,8 +68,14 @@ export function usePreserveCursorRow(
   cursorKeyRef: MutableRefObject<string | null>,
   landingRef: MutableRefObject<1 | -1 | 0 | "keep">,
   setCursor: Dispatch<SetStateAction<number>>,
+  evictionBoundary?: number,
+  tab?: number | null,
 ) {
+  const previousEviction = useRef({ boundary: evictionBoundary, tab });
   useLayoutEffect(() => {
+    const evicted = evictionBoundary !== undefined && previousEviction.current.tab === tab
+      && previousEviction.current.boundary !== evictionBoundary;
+    previousEviction.current = { boundary: evictionBoundary, tab };
     const timelineChanged = prevTimelineRef.current !== null && prevTimelineRef.current !== timeline;
     const cursorMoved = prevCursorRef.current !== cursor;
     prevTimelineRef.current = timeline;
@@ -66,6 +83,12 @@ export function usePreserveCursorRow(
     const want = cursorKeyRef.current;
     if (timelineChanged && !cursorMoved && want !== null && timeline[cursor]?.key !== want) {
       const found = indexOfKey(timeline, want);
+      if (found === null && evicted) {
+        landingRef.current = "keep";
+        setCursor(0);
+        cursorKeyRef.current = timeline[0]?.key ?? null;
+        return;
+      }
       if (found !== null && found !== cursor) {
         landingRef.current = "keep";
         setCursor(found);
@@ -74,7 +97,7 @@ export function usePreserveCursorRow(
     }
     cursorKeyRef.current = timeline[cursor]?.key ?? null;
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [timeline, cursor]);
+  }, [timeline, cursor, evictionBoundary, tab]);
 }
 
 /** Keeps the row the cursor sits on inside the viewport whenever the cursor moves. Before this,

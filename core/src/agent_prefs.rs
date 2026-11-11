@@ -12,6 +12,36 @@ use serde::{Deserialize, Serialize};
 use crate::agent_bridge::SessionModeChoice;
 use crate::state_paths::{file_name, state_subdir, temporary};
 
+/// The settled-turn budget shared by live tabs and ACP replay.
+pub const HISTORY_TURNS_KEY: &str = "agent.history_turns";
+
+pub fn parse_history_turns(raw: Option<&str>) -> Result<usize, String> {
+    let Some(raw) = raw else {
+        return Ok(agent::providers::acp::history::HISTORY_TURN_LIMIT);
+    };
+    raw.trim()
+        .parse::<usize>()
+        .ok()
+        .filter(|n| (10..=2000).contains(n))
+        .ok_or_else(|| format!("{HISTORY_TURNS_KEY}: expected a whole number in 10..=2000, got {raw:?}"))
+}
+
+#[cfg(test)]
+mod history_turns_tests {
+    use super::*;
+    #[test]
+    fn history_turns_has_bounded_whole_numbers_and_a_default() {
+        for (raw, want) in [(None, 200), (Some("10"), 10), (Some("2000"), 2000)] {
+            assert_eq!(parse_history_turns(raw).unwrap(), want);
+        }
+        for raw in ["9", "2001", "x", "0", "off", "10.5", "-10"] {
+            let err = parse_history_turns(Some(raw)).unwrap_err();
+            assert!(err.contains(HISTORY_TURNS_KEY));
+            assert!(err.contains("10..=2000"));
+        }
+    }
+}
+
 const VERSION: u32 = 1;
 
 #[derive(Serialize, Deserialize)]

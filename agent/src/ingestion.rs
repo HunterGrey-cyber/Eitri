@@ -31,11 +31,12 @@
 //!
 //! Bounded: the queue of events waiting to be handed to the UI (`UI_EVENT_QUEUE_CAPACITY`). When it
 //! overflows, the queue is dropped and the UI is told to resynchronise from a snapshot instead --
-//! complete by construction, since the projection holds the whole conversation.
+//! complete by construction, since the projection holds every loaded record.
 //!
-//! Not bounded, and correctly so: the projection itself. It grows with the CONVERSATION -- messages,
-//! tool calls, pending permissions -- which is the thing the user is actually looking at. That is
-//! the distinction this module is for: memory follows semantic state, not raw event count.
+//! Settled history is archived and unloaded in turn chunks; live work stays in memory.
+//! Neither pending provider events nor UI deliveries grow with the whole conversation.
+
+mod eviction;
 
 use crate::lease::SessionLease;
 use crate::move_seed::{ChatMoveCore, HandoffRefused, MoveSeed};
@@ -114,6 +115,9 @@ impl RevisedDelivery {
 pub struct IngestStats {
     /// Every provider event folded since this conversation started.
     pub events_ingested: u64,
+    #[serde(default)]
+    /// Turns unloaded at the hard ceiling after their archive write failed.
+    pub lost_history_turns: u64,
     /// Events currently waiting to be handed to the UI.
     pub ui_backlog: usize,
     /// The deepest that queue has ever been.
@@ -191,6 +195,12 @@ struct IngestState {
     /// written. Set by `fold` at a turn's end, the session's end, and inside a turn at a question's
     /// ask, the start of its call and its settle (`fold_one`) -- see `flush_history`.
     history_dirty: bool,
+    eviction_due: bool,
+    /// An attempted cut waits for another turn end before trying the archive again.
+    eviction_retry: bool,
+    reload_held: bool,
+    archive_id: Option<crate::history::archive::ArchiveId>,
+    archive_writer: Option<crate::history::archive::ArchiveWriter>,
     /// The last `SessionOpened` folded and every resume verdict, unavailability or close folded after
     /// it (all of them while none has opened the session), for the conversation's whole life: what
     /// sets the session's status when another window rebuilds this projection. A handful at most,
@@ -344,6 +354,7 @@ fn may_start_a_turn(event: &AgentDomainEvent) -> bool {
         // the session's open calls covers, and the servers are in the seed.
         | AgentDomainEvent::ClientToolCall { .. }
         | AgentDomainEvent::ClientToolCallSettled { .. }
+        | AgentDomainEvent::HistoryEvicted { .. }
         | AgentDomainEvent::SessionServers { .. } => false,
         // A subagent's frame starts what its inner event would.
         AgentDomainEvent::SubagentFrame { frame, .. } => may_start_a_turn(frame),
@@ -376,6 +387,8 @@ pub(crate) struct IngestHandoff {
     pub(crate) pending_name: Option<Option<String>>,
     pub(crate) record_written: bool,
     pub(crate) history_dirty: bool,
+    pub(crate) eviction_due: bool,
+    pub(crate) archive_id: Option<crate::history::archive::ArchiveId>,
 }
 
 /// What an adopted conversation's ingest starts from: the rebuilt projection, the move's records it
@@ -483,6 +496,16 @@ impl IngestState {
             self.history_dirty = true;
         }
 
+        if matches!(
+            event,
+            AgentDomainEvent::TurnCompleted { .. }
+                | AgentDomainEvent::SessionClosed { .. }
+                | AgentDomainEvent::SessionUnavailable { .. }
+        ) {
+            self.eviction_due = true;
+            self.eviction_retry = false;
+        }
+
         if dropped_child {
             // The page must receive the bounded tree and its notice instead of rebuilding rejected activity.
             self.pending_ui.clear();
@@ -533,6 +556,11 @@ impl IngestState {
             pending_name,
             record_written,
             history_dirty,
+            eviction_due,
+            eviction_retry: _,
+            reload_held: _,
+            archive_id,
+            archive_writer: _,
             lifecycle_since_open,
             running_turn,
             folded_through,
@@ -574,6 +602,8 @@ impl IngestState {
             // reply still open, so writing at once would store it half-written; that turn's own end marks
             // the history dirty, and its write carries the turn that failed too.
             history_dirty: *history_dirty || (*history_save_failed && running_turn.is_none()),
+            eviction_due: *eviction_due,
+            archive_id: archive_id.clone(),
         };
         Ok((core, handoff))
     }
@@ -611,6 +641,8 @@ impl IngestState {
             pending_name,
             record_written,
             history_dirty,
+            eviction_due,
+            archive_id,
         } = state;
         let state = IngestState {
             projection,
@@ -627,6 +659,11 @@ impl IngestState {
             pending_name,
             record_written,
             history_dirty,
+            eviction_due,
+            eviction_retry: false,
+            reload_held: false,
+            archive_id,
+            archive_writer: None,
             lifecycle_since_open,
             running_turn,
             folded_through,
@@ -816,6 +853,11 @@ impl ConversationIngest {
             pending_name: None,
             record_written,
             history_dirty: false,
+            eviction_due: false,
+            eviction_retry: false,
+            reload_held: false,
+            archive_id: None,
+            archive_writer: None,
             lifecycle_since_open: Vec::new(),
             running_turn: None,
             folded_through: 0,
@@ -932,8 +974,12 @@ impl ConversationIngest {
         self.wake.raise();
     }
 
-    /// The records a move carries and the ingest's own state, read under one lock (see
-    /// `IngestState::take_move_record`).
+    /// Defers eviction while an archive page is requested or held for this conversation.
+    pub fn set_reload_held(&self, held: bool) {
+        self.lock_state("set_reload_held").reload_held = held;
+    }
+
+    /// The records a move carries and the ingest's own state, read under one lock.
     pub(crate) fn take_move_record(&self) -> Result<(ChatMoveCore, IngestHandoff), HandoffRefused> {
         let state = self.lock_state("take_move_record");
         // Read with the state's lock held, so the id is the one that goes with this state.
@@ -1181,6 +1227,9 @@ fn ingest_loop(
         // Likewise: the turn whose completion marked the history dirty is usually the last event of
         // a quiet stretch, so waiting for the next non-empty pump would delay every write.
         flush_history(&state, &session_id, &context);
+        if eviction::flush_eviction(&state, &session_id, &context, crate::history_turns()) {
+            wake_ui(&ui_wake);
+        }
         if events.is_empty() {
             // A provider event can become no domain event, and the position still moves past it.
             if let Some(through) = through {
@@ -1376,6 +1425,11 @@ fn detach_for_reset(guard: &mut IngestState, session_id: &Mutex<Option<String>>)
     let had_record = std::mem::replace(&mut guard.record_written, false);
     // Written below from the pre-reset projection, so what was owed is covered.
     guard.history_dirty = false;
+    guard.eviction_due = false;
+    guard.eviction_retry = false;
+    guard.reload_held = false;
+    guard.archive_id = None;
+    guard.archive_writer = None;
     let lease = guard.lease.take();
     let provider_session_id = old?;
     let history = had_record.then(|| history_snapshot(&guard.projection));
@@ -3004,7 +3058,7 @@ pub(crate) mod tests {
         assert_eq!(new.title, None);
     }
 
-    fn state() -> IngestState {
+    pub(super) fn state() -> IngestState {
         IngestState {
             projection: AgentSessionProjection::default(),
             lease: None,
@@ -3016,6 +3070,11 @@ pub(crate) mod tests {
             pending_name: None,
             record_written: false,
             history_dirty: false,
+            eviction_due: false,
+            eviction_retry: false,
+            reload_held: false,
+            archive_id: None,
+            archive_writer: None,
             lifecycle_since_open: Vec::new(),
             running_turn: None,
             folded_through: 0,

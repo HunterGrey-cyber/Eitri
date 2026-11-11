@@ -532,6 +532,7 @@ export type AgentUiState = {
    * restored nothing -- which is every fresh session. On the wire, so it survives a resync and a
    * panel reload exactly as the four collections do. */
   history: HistoryNotice | null;
+  evicted: { throughSeq: Seq; turns: number } | null;
   /** True while the last folded event was assistant text, so the next chunk continues the same
    * message. See `reducer.ts`'s `content_delta` case.
    *
@@ -652,7 +653,9 @@ export type AgentUiSnapshot = Omit<
   | "openingPromptSeq"
   | "runningTurnCli"
   | "editorCards"
+  | "evicted"
 > & {
+  evicted?: AgentUiState["evicted"];
   /** Sent only while the tab holds any: a payload without it is a tab with none. Rust sends the wire shape; records
    *  are accepted too, so a caller holding a folded state can hand it to `applySnapshot` unchanged. */
   editorCards?: Array<EditorCardWire | PermissionRequestRecord>;
@@ -832,6 +835,7 @@ export type WorkflowProgress = {
 export type SubagentContent = Extract<AgentDomainEvent, { type: "tool_call_started" | "tool_call_completed" | "content_delta" | "assistant_message_boundary" | "subagent_frame" }>;
 
 export type AgentDomainEvent =
+  | { type: "history_evicted"; through_seq: Seq; turns: number; lifted: Seq[] }
   | { type: "turn_cause_updated"; turn_id: string; cause: WireTurnCause | null }
   | { type: "cli_cycle_started"; turn_id: string; cause: WireTurnCause | null }
   | { type: "background_tasks_changed"; occurred_at?: number; tasks: BackgroundTask[] }

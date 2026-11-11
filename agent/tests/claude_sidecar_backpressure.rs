@@ -69,6 +69,7 @@ fn summarize(label: &str, events: &[AgentDomainEvent]) {
     let mut counts: std::collections::BTreeMap<&str, usize> = Default::default();
     for event in events {
         let kind = match event {
+            AgentDomainEvent::HistoryEvicted { .. } => "HistoryEvicted",
             AgentDomainEvent::SessionOpened { .. } => "SessionOpened",
             AgentDomainEvent::EffortReported { .. } => "EffortReported",
             AgentDomainEvent::ModelReported { .. } => "ModelReported",

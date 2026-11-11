@@ -7,6 +7,7 @@ import type { JumpPos, Jumplist } from "./jumplist";
 import { SessionEndedBanner } from "./components/SessionEndedBanner";
 import { TrustOverlay } from "./components/TrustOverlay";
 import {
+  pruneExpanded,
   useClampCursorToTimeline,
   usePreserveCursorRow,
   useRevealCursorRow,
@@ -1775,6 +1776,11 @@ export default function App() {
       }),
     [state, expanded, detailed, thinkingDisplay],
   );
+  useEffect(() => {
+    if (state.evicted === null) return;
+    setExpanded((held) => pruneExpanded(state, held));
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [state.evicted]);
   /** For the dispatch handler (installed once), as `cursorRef`: the park names the cursor's row by key. */
   const timelineRef = useRef(timeline);
   timelineRef.current = timeline;
@@ -2223,7 +2229,7 @@ export default function App() {
   const cursorKeyRef = useRef<string | null>(null);
   const prevTimelineRef = useRef<TimelineItem[] | null>(null);
   const prevCursorRef = useRef(cursor);
-  usePreserveCursorRow(prevTimelineRef, timeline, prevCursorRef, cursor, cursorKeyRef, landingRef, setCursor);
+  usePreserveCursorRow(prevTimelineRef, timeline, prevCursorRef, cursor, cursorKeyRef, landingRef, setCursor, state.evicted?.throughSeq, activeTabId);
   useRevealCursorRow(landingRef, landingAnimateRef, landingHeadRef, frozenSnapshotRef, containerRef, cursor);
   /* A search hit on a tall row: once the row is revealed (the effect above, declared first, so run first), the line
      holding the match comes on screen below the pinned header. The view it leaves is what a jump from here records

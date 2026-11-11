@@ -14,6 +14,10 @@ function records(value: number): string {
   return `${count(value)} ${value === 1 ? "record" : "records"}`;
 }
 
+export function earlierTurnsText(turns: number): string {
+  return `${count(turns)} earlier ${turns === 1 ? "turn" : "turns"} not loaded.`;
+}
+
 /** The notice combines where history came from and whether it was cut. These are independent:
  *  even a truncated fallback needs both sentences, so a four-row table cannot cover every case.
  *  Every number belongs to this restore, never a build-wide ceiling: the character budget can
@@ -30,7 +34,7 @@ export function historyNoticeText(notice: HistoryNotice): string {
   if (notice.source === "acp_replay") {
     const omitted = notice.omittedTurns ?? 0;
     return "Earlier messages in this session, replayed by the agent." +
-      (omitted > 0 ? ` ${count(omitted)} earlier ${omitted === 1 ? "turn" : "turns"} not loaded.` : "");
+      (omitted > 0 ? ` ${earlierTurnsText(omitted)}` : "");
   }
   // `null` means "certainly omitted, not countable" (the scan started partway into a file too large
   // to read whole), so it is truncation just as much as a positive count is.

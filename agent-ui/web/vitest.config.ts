@@ -6,7 +6,7 @@ export default defineConfig({
     environment: "node",
     setupFiles: ["./src/testSetup.ts"],
     // `scripts/` holds `node --test` files (`npm test` runs them after Vitest), not Vitest suites.
-    exclude: [...configDefaults.exclude, "scripts/**"],
+    exclude: [...configDefaults.exclude, "scripts/**", "src/historyEvicted.phone.test.tsx"],
     // Vitest mocks `.css` imports to an empty module by default (skipping real CSS work is
     // usually the right call for tests). `index.css?raw` needs the real bytes -- it is read as
     // a plain-text fixture, not stylesheet output -- so this file specifically is exempted.

@@ -1565,3 +1565,62 @@ fn a_resync_before_the_call_finishes_keeps_its_rule_answer() {
     );
     shut_down_all(&mut set);
 }
+
+#[test]
+fn eviction_deliveries_and_overflow_resyncs_prune_notes_with_lifted_calls_kept() {
+    for overflow in [false, true] {
+        let dir = workspace("evicted-notes");
+        let mut set = set();
+        let tab = set.active();
+        let (provider, backend) = live(&dir);
+        set.get_mut(tab).unwrap().backend = TabBackend::Live(backend);
+        for id in ["gone", "bg", "live"] {
+            provider.queue(AgentDomainEvent::ToolCallStarted {
+                turn_id: "turn".into(),
+                tool_use_id: id.into(),
+                name: "Read".into(),
+                input: serde_json::json!({}),
+            });
+        }
+        until("the three calls to fold", || {
+            set.get(tab).unwrap().live().unwrap().projection().tool_calls.len() == 3
+        });
+        set.pump(&dir, true);
+        let (boundary, lifted, revision) = {
+            let p = set.get(tab).unwrap().live().unwrap().projection();
+            (p.tool_calls[2].seq, p.tool_calls[1].seq, p.last_revision)
+        };
+        for id in ["gone", "bg", "live"] {
+            set.get_mut(tab)
+                .unwrap()
+                .notes
+                .prompt_notes
+                .insert(id.into(), "answered".into());
+        }
+        provider.queue(AgentDomainEvent::HistoryEvicted {
+            through_seq: boundary,
+            turns: 2,
+            lifted: vec![lifted],
+        });
+        let extra = if overflow { 300 } else { 0 };
+        for _ in 0..extra {
+            provider.queue(AgentDomainEvent::EffortReported { effort: None });
+        }
+        until("eviction and the overflow to fold", || {
+            set.get(tab).unwrap().live().unwrap().projection().last_revision >= revision + 1 + extra
+        });
+        let out = set.pump(&dir, true);
+        let notes = &set.get(tab).unwrap().notes;
+        assert_eq!(
+            notes.prompt_notes.keys().map(String::as_str).collect::<Vec<_>>(),
+            vec!["bg", "live"]
+        );
+        if overflow {
+            assert!(out
+                .active_payload
+                .iter()
+                .any(|p| serde_json::from_str::<serde_json::Value>(p).unwrap()["kind"] == "snapshot"));
+        }
+        shut_down_all(&mut set);
+    }
+}

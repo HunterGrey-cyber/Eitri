@@ -52,6 +52,7 @@ export function initialState(): AgentUiState {
     turnEndings: [],
     lastTurnEnding: null,
     history: null,
+    evicted: null,
     assistantMessageOpen: false,
     thinking: [],
     thinkingOpen: false,
@@ -268,7 +269,7 @@ export function applyEvent(
   // `turnThinking` defaults to false here too, for every event: it is cleared by the ABSENCE of a
   // special case rather than by a maintained list of event types that ought to clear it.
   // Only the `content_delta`/`"thinking"` arm below sets it back to true.
-  const preservesActivity = event.type === "turn_cause_updated" || event.type === "cli_cycle_started" || event.type === "effort_reported"
+  const preservesActivity = event.type === "history_evicted" || event.type === "turn_cause_updated" || event.type === "cli_cycle_started" || event.type === "effort_reported"
     || event.type === "background_tasks_changed" || event.type === "task_event" || event.type === "conversation_reset"
     || event.type === "subagent_frame" || (event.type === "session_notice" && !notices.recordsRow(event));
   let state: AgentUiState = { ...incoming, nextSeq: seq + 1, turnThinking: preservesActivity ? incoming.turnThinking : false };
@@ -317,7 +318,7 @@ export function applyEvent(
 
 /** Every event type this build folds; the record's type makes the compiler keep it complete. */
 const knownEventTypes: ReadonlySet<string> = new Set(Object.keys({
-  account_limits: true, assistant_message_boundary: true, background_calls: true, background_tasks_changed: true,
+  history_evicted: true, account_limits: true, assistant_message_boundary: true, background_calls: true, background_tasks_changed: true,
   cli_cycle_started: true, client_tool_call: true, client_tool_call_settled: true, cli_permission_mode: true,
   cli_work_unseen: true, commands_available: true, content_delta: true, conversation_reset: true,
   effort_reported: true, model_reported: true, permission_mode_changed: true, permission_requested: true,
@@ -332,6 +333,17 @@ const knownEventTypes: ReadonlySet<string> = new Set(Object.keys({
 
 function foldEvent(state: AgentUiState, event: AgentDomainEvent, seq: Seq, onUnknown?: (event: AgentDomainEvent) => void): AgentUiState {
   switch (event.type) {
+    case "history_evicted": {
+      const lifted = new Set(event.lifted);
+      const keep = (r: { seq: Seq }) => r.seq >= event.through_seq || lifted.has(r.seq);
+      return { ...state,
+        userPrompts: state.userPrompts.filter(keep), transcript: state.transcript.filter(keep),
+        thinking: state.thinking.filter(keep), toolCalls: state.toolCalls.filter(keep),
+        turnStarts: state.turnStarts.filter(keep), turnEndings: state.turnEndings.filter(keep),
+        notices: state.notices.filter(keep), questions: state.questions.filter(keep),
+        evicted: { throughSeq: event.through_seq, turns: event.turns },
+      };
+    }
     case "turn_cause_updated": {
       // The cause the turn's close named replaces what its start said; a turn with no start row keeps
       // none, and an update naming no cause is no news. MUST stay identical to `AgentSessionProjection::apply`.
@@ -969,6 +981,7 @@ export function applySnapshot(previous: AgentUiState, snapshot: AgentUiSnapshot,
   let state: AgentUiState = {
     ...initialState(),
     ...snapshot,
+    evicted: snapshot.evicted ?? null,
     usage: snapshot.usage ?? null,
     accountLimits: snapshot.accountLimits ?? null,
     // A payload from a build that predates the count is a tab with none.

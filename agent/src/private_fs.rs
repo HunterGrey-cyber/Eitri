@@ -487,6 +487,90 @@ pub fn open_private(path: &Path) -> std::io::Result<std::fs::File> {
     Ok(file)
 }
 
+/// Opens a private regular file for append without following a link or changing existing bytes.
+pub fn append_private(path: &Path) -> std::io::Result<std::fs::File> {
+    let file = std::fs::OpenOptions::new()
+        .append(true)
+        .create(true)
+        .mode(PRIVATE_FILE_MODE)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK | libc::O_CLOEXEC)
+        .open(path)?;
+    require_private(&file, path)?;
+    fchmod(&file, PRIVATE_FILE_MODE)?;
+    Ok(file)
+}
+
+fn require_private(file: &std::fs::File, path: &Path) -> std::io::Result<()> {
+    let meta = file.metadata()?;
+    if !meta.is_file() || meta.uid() != euid() || meta.mode() & 0o077 != 0 {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::PermissionDenied,
+            format!("{} is not a private regular file of this user", path.display()),
+        ));
+    }
+    Ok(())
+}
+
+/// A streaming private-file reader. Oversized lines are drained without retaining their bytes.
+pub struct PrivateLines<'a> {
+    reader: std::io::BufReader<std::fs::File>,
+    cap: usize,
+    cancel: &'a std::sync::atomic::AtomicBool,
+}
+
+impl<'a> PrivateLines<'a> {
+    pub fn open(path: &Path, cap: usize, cancel: &'a std::sync::atomic::AtomicBool) -> std::io::Result<Self> {
+        let file = open_nofollow(path)?;
+        require_private(&file, path)?;
+        Ok(Self {
+            reader: std::io::BufReader::new(file),
+            cap,
+            cancel,
+        })
+    }
+
+    pub(crate) fn into_file(self) -> std::fs::File {
+        self.reader.into_inner()
+    }
+}
+
+impl Iterator for PrivateLines<'_> {
+    type Item = std::io::Result<Vec<u8>>;
+    fn next(&mut self) -> Option<Self::Item> {
+        use std::io::BufRead;
+        use std::sync::atomic::Ordering;
+        let mut line = Vec::new();
+        let mut oversized = false;
+        loop {
+            if self.cancel.load(Ordering::Acquire) {
+                return None;
+            }
+            let buf = match self.reader.fill_buf() {
+                Ok(buf) => buf,
+                Err(err) => return Some(Err(err)),
+            };
+            if buf.is_empty() {
+                return (!line.is_empty() && !oversized).then_some(Ok(line));
+            }
+            let end = buf.iter().position(|b| *b == b'\n');
+            let len = end.unwrap_or(buf.len());
+            if !oversized && len <= self.cap.saturating_sub(line.len()) {
+                line.extend_from_slice(&buf[..len]);
+            } else {
+                oversized = true;
+                line.clear();
+            }
+            self.reader.consume(len + usize::from(end.is_some()));
+            if end.is_some() {
+                if !oversized {
+                    return Some(Ok(line));
+                }
+                oversized = false;
+            }
+        }
+    }
+}
+
 /// Makes `name` in `dir` as a new file, set to exactly 0600 on the handle whatever the umask: a name that already exists,
 /// a link included, is refused (`O_CREAT | O_EXCL`). Takes the name as a C string and allocates nothing on the way, so
 /// a panic hook can call it.
@@ -1511,7 +1595,55 @@ mod tests {
         path.symlink_metadata().unwrap().mode() & 0o777
     }
 
-    /// A directory of its own under the temp dir, removed when the test ends however it ends.
+    #[test]
+    fn append_creates_private_and_preserves_bytes_but_refuses_unsafe_files() {
+        let dir = scratch("append");
+        let path = dir.join("log");
+        append_private(&path).unwrap().write_all(b"one\n").unwrap();
+        append_private(&path).unwrap().write_all(b"two\n").unwrap();
+        assert_eq!(mode(&path), 0o600);
+        assert_eq!(std::fs::read(&path).unwrap(), b"one\ntwo\n");
+        let link = dir.join("link");
+        std::os::unix::fs::symlink(&path, &link).unwrap();
+        assert!(append_private(&link).is_err());
+        for bits in [0o620, 0o640, 0o604] {
+            set_mode(&path, bits);
+            assert_eq!(
+                append_private(&path).unwrap_err().kind(),
+                std::io::ErrorKind::PermissionDenied
+            );
+            assert_eq!(mode(&path), bits, "refusal leaves the mode alone");
+        }
+        assert!(append_private(&dir).is_err());
+    }
+
+    #[test]
+    fn private_lines_skip_over_cap_and_stop_between_lines_on_cancel() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        let dir = scratch("lines");
+        let path = dir.join("log");
+        write_private(&path, b"longer-than-cap\n1234\nlast\n").unwrap();
+        let cancel = AtomicBool::new(false);
+        let mut lines = PrivateLines::open(&path, 4, &cancel).unwrap();
+        assert_eq!(lines.next().unwrap().unwrap(), b"1234");
+        cancel.store(true, Ordering::Release);
+        assert!(lines.next().is_none());
+        cancel.store(false, Ordering::Release);
+        assert_eq!(
+            PrivateLines::open(&path, 4, &cancel)
+                .unwrap()
+                .collect::<Result<Vec<_>, _>>()
+                .unwrap(),
+            vec![b"1234".to_vec(), b"last".to_vec()]
+        );
+        let link = dir.join("link");
+        std::os::unix::fs::symlink(&path, &link).unwrap();
+        assert!(PrivateLines::open(&link, 4, &cancel).is_err());
+        set_mode(&path, 0o620);
+        assert!(PrivateLines::open(&path, 4, &cancel).is_err());
+    }
+
+    /// A directory of its own under the temp dir, removed on drop.
     fn scratch(label: &str) -> TmpDir {
         TmpDir::new("nv-private-fs", label)
     }

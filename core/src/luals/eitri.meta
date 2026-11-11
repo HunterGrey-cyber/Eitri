@@ -1,6 +1,8 @@
 ---@meta
 
 ---The settings Eitri reads when a window starts.
+---agent.history_turns: whole number 10..2000, default 200; bounds settled turns kept in memory
+---(older turns are archived and reloadable) and ACP replay.
 ---@alias EitriSetting
 ---| "agent.account"
 ---| "agent.codex.command"
@@ -25,6 +27,7 @@
 ---| "agent.restore"
 ---| "agent.thinking"
 ---| "agent.typing_cadence_hz"
+---| "agent.history_turns"
 ---| "agent.user_settings"
 ---| "agents.enabled"
 ---| "companion.wm"

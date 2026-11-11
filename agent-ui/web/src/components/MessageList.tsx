@@ -11,7 +11,7 @@ import { turnEndingText } from "../turnEnding";
 import { endingDuration, NO_TURN_DURATIONS, placeFooters, workedFooters } from "../turnTimes";
 import type { TurnDurations } from "../turnTimes";
 import { HistoryNotice } from "./HistoryNotice";
-import { historyNoticeText } from "../history";
+import { earlierTurnsText, historyNoticeText } from "../history";
 import { PermissionCard } from "./PermissionCard";
 import type { CardModeView } from "./PermissionCard";
 import { Row } from "./Row";
@@ -955,6 +955,8 @@ export function MessageList({
           // The desk's notice copies the desk's file path to the desk's own selection; the phone only reads it.
           ? <div className="history-notice"><span>{historyNoticeText(state.history)}</span></div>
           : <DeskHistoryNotice notice={state.history} />)}
+        {!touch && import.meta.env.EITRI_PHONE_PAGE !== true && (state.evicted?.turns ?? 0) > 0 &&
+          <div className="history-notice"><span>{earlierTurnsText(state.evicted!.turns)}</span></div>}
         {timeline.map((item, index) => {
           // Everything a row draws is in these props, each a value or the timeline's own item, so a
           // cursor move renders the two rows it changes and no other (`TimelineRow`).

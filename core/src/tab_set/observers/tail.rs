@@ -85,45 +85,7 @@ struct Entry {
     bytes: usize,
 }
 
-/// Where each turn of a session starts.
-pub(super) struct Turns {
-    /// `starts[0]` is 0; each later one is a prompt's `seq`, strictly increasing. Never empty.
-    starts: Vec<u64>,
-}
-
-impl Turns {
-    pub(super) fn of(projection: &AgentSessionProjection) -> Turns {
-        let mut starts: Vec<u64> = projection
-            .user_prompts
-            .iter()
-            .map(|p| p.seq)
-            .chain(projection.turn_starts.iter().map(|s| s.seq))
-            .collect();
-        starts.sort_unstable();
-        starts.dedup();
-        match starts.first_mut() {
-            Some(first) => *first = 0,
-            None => starts.push(0),
-        }
-        Turns { starts }
-    }
-
-    /// How many turns the session has; always at least one.
-    pub(super) fn count(&self) -> u64 {
-        self.starts.len() as u64
-    }
-
-    /// The `seq` range of turns `from..to` (`to` excluded).
-    fn seqs(&self, from: usize, to: usize) -> (u64, u64) {
-        let lo = self.starts[from];
-        let hi = self.starts.get(to).copied().unwrap_or(u64::MAX);
-        (lo, hi)
-    }
-
-    fn turn_of(&self, seq: u64) -> usize {
-        self.starts.partition_point(|start| *start <= seq).saturating_sub(1)
-    }
-}
+pub(super) use agent::projection::turns::Turns;
 
 /// About how many bytes `value` takes as JSON, without serializing it.
 fn value_bytes(value: &Value) -> usize {
@@ -396,6 +358,7 @@ fn kept<T: Clone>(items: &[T], seq: impl Fn(&T) -> u64, lo: u64, hi: u64) -> Vec
 /// session's (cloned).
 fn copy_between(projection: &AgentSessionProjection, lo: u64, hi: u64, keep_cards: bool) -> AgentSessionProjection {
     let AgentSessionProjection {
+        evicted,
         session_id,
         provider_session_id,
         model,
@@ -450,6 +413,7 @@ fn copy_between(projection: &AgentSessionProjection, lo: u64, hi: u64, keep_card
         running_turn_cli,
     } = projection;
     AgentSessionProjection {
+        evicted: evicted.clone(),
         session_id: session_id.clone(),
         provider_session_id: provider_session_id.clone(),
         model: model.clone(),

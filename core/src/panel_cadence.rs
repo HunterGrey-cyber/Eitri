@@ -149,7 +149,7 @@ fn is_plain_stream_content(event: &AgentDomainEvent) -> bool {
         // the line above the box change together, so neither waits for a slot.
         AgentDomainEvent::UserMessageDelivered { .. } | AgentDomainEvent::UserMessageDropped { .. } => false,
         // A whole conversation's records arriving with a move: never a stream fragment.
-        AgentDomainEvent::MoveSeeded(_) => false,
+        AgentDomainEvent::HistoryEvicted { .. } | AgentDomainEvent::MoveSeeded(_) => false,
         // Why a turn started, a notice row, and a question the person has to answer: each is news
         // the user may act on or read at once.
         AgentDomainEvent::TurnAttributed { .. }
@@ -767,6 +767,11 @@ mod tests {
     #[test]
     fn any_event_that_is_not_plain_content_makes_the_whole_batch_immediate() {
         let others = vec![
+            AgentDomainEvent::HistoryEvicted {
+                through_seq: 12,
+                turns: 2,
+                lifted: Vec::new(),
+            },
             AgentDomainEvent::PermissionRequested {
                 permission_id: "p".into(),
                 tool_use_id: None,

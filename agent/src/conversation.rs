@@ -1676,6 +1676,8 @@ impl AgentConversation {
             pending_name,
             record_written,
             history_dirty,
+            eviction_due,
+            archive_id,
         } = ingest;
         let handoff = ConversationHandoff {
             conversation_id: conversation_id.clone(),
@@ -1693,6 +1695,8 @@ impl AgentConversation {
             pending_name: pending_name.map(|name| PendingName { name }),
             record_written,
             history_dirty,
+            eviction_due,
+            archive_id,
             declared_client_tools: declared_client_tools.clone(),
         };
         Ok((core, handoff))
@@ -1741,6 +1745,8 @@ impl AgentConversation {
             pending_name,
             record_written,
             history_dirty,
+            eviction_due,
+            archive_id,
             declared_client_tools,
         } = handoff;
         let MovedProvider { agent, external, lease } = provider;
@@ -1777,6 +1783,8 @@ impl AgentConversation {
                     pending_name: pending_name.map(|pending| pending.name),
                     record_written,
                     history_dirty,
+                    eviction_due,
+                    archive_id,
                 },
                 lease,
             },

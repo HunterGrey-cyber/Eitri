@@ -105,6 +105,6 @@ describe("historyNoticeText", () => {
      would be unused and could drift, so this module exports no ceiling. */
   it("exports no ceiling for anything to drift from", async () => {
     const module = await import("./history");
-    expect(Object.keys(module)).toEqual(["historyNoticeText"]);
+    expect(Object.keys(module)).toEqual(["earlierTurnsText", "historyNoticeText"]);
   });
 });

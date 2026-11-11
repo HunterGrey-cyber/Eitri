@@ -1034,3 +1034,99 @@ fn a_snapshot_hides_the_ids_it_is_given() {
     let ids: Vec<&str> = cards.iter().map(|p| p["permissionId"].as_str().unwrap()).collect();
     assert_eq!(ids, vec!["shown"], "{ids:?}");
 }
+
+#[test]
+fn eviction_boundary_reaches_snapshot_without_lifted_or_archive_identity() {
+    let mut p = AgentSessionProjection::default();
+    p.apply(&AgentDomainEvent::HistoryEvicted {
+        through_seq: 40,
+        turns: 10,
+        lifted: vec![2],
+    });
+    let view = SnapshotView {
+        backend: "sidecar",
+        conversation_id: None,
+        session_id: None,
+        provider_session_id: None,
+        capabilities: agent::ProviderCapabilities::default(),
+        provider: None,
+        projection: crate::agent_backend::ProjectionRef::Borrowed(&p),
+        hidden_pending: None,
+    };
+    let snapshot: Value = serde_json::from_str(&serialize_snapshot_for_js(TabId(1), &view, None)).unwrap();
+    assert_eq!(snapshot["state"]["evicted"], json!({"throughSeq":40,"turns":10}));
+    assert_eq!(snapshot["state"]["evicted"].as_object().unwrap().len(), 2);
+}
+
+#[test]
+fn eviction_prunes_call_notes_and_preserves_lifted_descendant_notes() {
+    let mut p = AgentSessionProjection::default();
+    p.tool_calls = serde_json::from_value(json!([
+        {"seq":2,"turn_id":"bg-turn","tool_use_id":"bg","name":"Agent","input":{},"result":null,
+            "children":{"transcript":[],"thinking":[],"tool_calls":[{"seq":3,"turn_id":"child","tool_use_id":"nested","name":"Read","input":{},"result":null}],"assistant_message_open":false,"thinking_open":false}},
+        {"seq":45,"turn_id":"live-turn","tool_use_id":"live","name":"Write","input":{},"result":null}
+    ])).unwrap();
+    p.evicted = Some(agent::projection::Evicted {
+        through_seq: 40,
+        turns: 10,
+        lifted: vec![2],
+    });
+    let sender = SentFrom {
+        device_id: "device".into(),
+        name: "phone".into(),
+    };
+    let mut notes = CallNotes::default();
+    for id in ["gone", "bg", "nested", "live"] {
+        notes.allowed_by_rule.insert(id.into(), "rule".into());
+        notes.prompt_notes.insert(id.into(), "prompt".into());
+        notes.allowed_by_auto.insert(id.into());
+        notes.auto_creates_file.insert(id.into());
+        notes.creates_file.insert(format!("perm-{id}"), Some(id.into()));
+    }
+    notes.creates_file.insert("unknown".into(), None);
+    for seq in [1, 2, 40] {
+        notes.sent_from.insert(seq, sender.clone());
+    }
+    for turn in ["gone-turn", "bg-turn", "live-turn"] {
+        notes.stopped_from.insert(turn.into(), sender.clone());
+    }
+    for (turn, seq) in [("gone-turn", Some(1)), ("live-turn", Some(45)), ("unknown", None)] {
+        notes.turn_times.push(TurnTime {
+            turn_id: turn.into(),
+            started_at_ms: 1,
+            ended_at_ms: 2,
+            anchor_seq: seq,
+        });
+    }
+    notes.note_remote_sender("pending".into(), sender);
+    notes.prune_evicted(&p);
+    let ids = vec!["bg", "live", "nested"];
+    assert_eq!(
+        notes.allowed_by_rule.keys().map(String::as_str).collect::<Vec<_>>(),
+        ids
+    );
+    assert_eq!(notes.prompt_notes.keys().map(String::as_str).collect::<Vec<_>>(), ids);
+    assert_eq!(
+        notes.allowed_by_auto.iter().map(String::as_str).collect::<Vec<_>>(),
+        ids
+    );
+    assert_eq!(
+        notes.auto_creates_file.iter().map(String::as_str).collect::<Vec<_>>(),
+        ids
+    );
+    assert_eq!(notes.creates_file.len(), 3);
+    assert_eq!(notes.sent_from.keys().copied().collect::<Vec<_>>(), vec![2, 40]);
+    assert_eq!(
+        notes.stopped_from.keys().map(String::as_str).collect::<Vec<_>>(),
+        vec!["bg-turn", "live-turn"]
+    );
+    assert_eq!(notes.turn_times.len(), 1);
+    assert_eq!(notes.turn_times[0].turn_id, "live-turn");
+    assert_eq!(notes.remote_senders.len(), 1);
+    notes.prompt_notes.insert("not-started-yet".into(), "pending".into());
+    notes.prune_evicted_if_moved(&p);
+    assert!(notes.prompt_notes.contains_key("not-started-yet"));
+    p.evicted.as_mut().unwrap().through_seq += 1;
+    notes.prune_evicted_if_moved(&p);
+    assert!(!notes.prompt_notes.contains_key("not-started-yet"));
+}

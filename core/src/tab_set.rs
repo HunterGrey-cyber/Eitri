@@ -4110,6 +4110,14 @@ impl TabSet {
         };
         live.notes.remote_notes_dirty = false;
         live.session.note_ledger.fold(&events, live.notes, &mut fresh_notes);
+        if events
+            .iter()
+            .any(|e| matches!(e, AgentDomainEvent::HistoryEvicted { .. }))
+        {
+            let projection = live.backend.projection();
+            live.notes.prune_evicted(&projection);
+            fresh_notes.prune_evicted(&projection);
+        }
         // Every card in the batch is counted, those the snapshot drew included: they are pending all
         // the same, and this tab has not counted them yet.
         live.attention.observe(&events, place.on_screen);
@@ -4248,6 +4256,7 @@ impl TabSet {
                 &view.projection,
                 wall_clock_ms(),
             );
+            live.notes.prune_evicted_if_moved(&view.projection);
             let payload = serialize_snapshot_with_notes_for_js(
                 live.id,
                 &view,

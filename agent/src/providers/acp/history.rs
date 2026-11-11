@@ -11,6 +11,7 @@ use crate::projection::{
     AgentDomainEvent, AgentSessionProjection, HistoryNotice, HistorySource, TurnEndDetail, TurnOutcome,
 };
 use std::collections::VecDeque;
+use std::sync::OnceLock;
 
 /// Settled turns retained from a session replay, in addition to the turn being assembled;
 /// the closed final turn counts toward it.
@@ -35,6 +36,10 @@ impl History {
     /// Folds one replayed update. Only messages and tool calls are past conversation; the rest of what an
     /// agent says while it loads (commands, titles, usage, modes) is not.
     pub fn apply(&mut self, update: &Update) {
+        self.apply_with_budget(update, &crate::history::HISTORY_TURNS);
+    }
+
+    fn apply_with_budget(&mut self, update: &Update, budget: &OnceLock<usize>) {
         match update {
             Update::Chunk {
                 kind: ChunkKind::User,
@@ -47,7 +52,7 @@ impl History {
                         pending.push_str(text);
                     }
                 } else {
-                    self.close_turn();
+                    self.close_turn(budget);
                     self.pending_user = Some(text.clone());
                     self.last_was_user = true;
                 }
@@ -83,7 +88,7 @@ impl History {
     }
 
     /// A past turn is over, whatever it last said.
-    fn close_turn(&mut self) {
+    fn close_turn(&mut self, budget: &OnceLock<usize>) {
         let Some(turn_id) = self.turn.take() else { return };
         self.projection.apply(&AgentDomainEvent::TurnCompleted {
             turn_id,
@@ -95,7 +100,8 @@ impl History {
         });
         self.fold.clear();
         self.settled.push_back(self.turn_start);
-        if self.settled.len() > HISTORY_TURN_LIMIT {
+        let limit = crate::history::turn_budget(budget);
+        if self.settled.len() > limit {
             self.settled.pop_front();
             self.omitted += 1;
             let first = *self.settled.front().expect("retained turns");
@@ -111,11 +117,15 @@ impl History {
 
     /// One assembled seed for the bounded replay, with no retained stream deltas.
     /// ACP supplies no terminal turn markers, so the final synthetic turn closes here too.
-    pub fn finish(mut self) -> Vec<AgentDomainEvent> {
+    pub fn finish(self) -> Vec<AgentDomainEvent> {
+        self.finish_with_budget(&crate::history::HISTORY_TURNS)
+    }
+
+    fn finish_with_budget(mut self, budget: &OnceLock<usize>) -> Vec<AgentDomainEvent> {
         if self.pending_user.is_some() {
             self.ensure_turn();
         }
-        self.close_turn();
+        self.close_turn(budget);
         if self.count == 0 {
             return Vec::new();
         }
@@ -169,6 +179,24 @@ mod tests {
             seed.apply(&event);
         }
         seed
+    }
+
+    #[test]
+    fn acp_replay_honours_the_configured_turn_budget() {
+        let budget = OnceLock::new();
+        budget.set(10).unwrap();
+        let mut history = History::default();
+        for n in 0..25 {
+            history.apply_with_budget(&chunk(ChunkKind::User, &format!("prompt {n}")), &budget);
+            history.apply_with_budget(&chunk(ChunkKind::Agent, "reply"), &budget);
+        }
+        let mut seed = AgentSessionProjection::default();
+        for event in history.finish_with_budget(&budget) {
+            seed.apply(&event);
+        }
+        assert_eq!(seed.user_prompts.len(), 10);
+        assert_eq!(seed.user_prompts.first().unwrap().text, "prompt 15");
+        assert_eq!(seed.history.unwrap().omitted_turns, Some(15));
     }
 
     #[test]

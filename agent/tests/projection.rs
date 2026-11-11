@@ -1370,6 +1370,11 @@ fn a_user_prompt_is_an_item_of_its_own_and_closes_an_open_assistant_message() {
 /// break a tool call forces).
 fn every_event_variant() -> Vec<AgentDomainEvent> {
     let mut events = vec![
+        AgentDomainEvent::HistoryEvicted {
+            through_seq: 0,
+            turns: 0,
+            lifted: Vec::new(),
+        },
         AgentDomainEvent::SessionOpened {
             session_id: "sess-1".into(),
             provider_session_id: "prov-1".into(),
@@ -1578,6 +1583,7 @@ fn every_event_variant() -> Vec<AgentDomainEvent> {
 /// cannot force the second half, so this comment is the reminder.
 fn label(event: &AgentDomainEvent) -> &'static str {
     match event {
+        AgentDomainEvent::HistoryEvicted { .. } => "HistoryEvicted",
         AgentDomainEvent::SessionOpened { .. } => "SessionOpened",
         AgentDomainEvent::TurnStarted { .. } => "TurnStarted",
         AgentDomainEvent::UserPromptSubmitted { .. } => "UserPromptSubmitted",

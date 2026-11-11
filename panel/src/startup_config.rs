@@ -52,6 +52,7 @@ fn checks<'a>(agents: &'a [&'a str]) -> Vec<(&'static str, Check<'a>)> {
         ),
         (prefs::CODEX_COMMAND_KEY, check(prefs::parse_codex_command)),
         (prefs::USER_SETTINGS_KEY, check(prefs::parse_user_settings)),
+        (prefs::HISTORY_TURNS_KEY, check(prefs::parse_history_turns)),
         (
             eitri_core::attention::ChatOnPermission::KEY,
             check(eitri_core::attention::ChatOnPermission::parse),
@@ -440,6 +441,28 @@ mod tests {
     fn review_live_unset_with_review_off_says_nothing() {
         let (_, problems) = settled("eitri.config.set('review.enabled', false)\n");
         assert!(problems.is_empty(), "{problems:?}");
+    }
+
+    #[test]
+    fn invalid_history_turns_reports_a_problem_and_falls_back_to_200() {
+        for raw in ["9", "2001", "x"] {
+            let (kernel, problems) = settled(&format!("eitri.config.set(\"agent.history_turns\", {raw:?})\n"));
+            assert_eq!(problems.len(), 1, "{problems:?}");
+            assert!(problems[0].contains("agent.history_turns"));
+            assert!(problems[0].contains("10..=2000"));
+            assert!(problems[0].contains("the default is used"));
+            assert_eq!(crate::window_config::load(&kernel, &[]).unwrap().history_turns, 200);
+        }
+        let (kernel, problems) = settled("eitri.config.set(\"agent.history_turns\", 10)\n");
+        assert!(problems.is_empty(), "{problems:?}");
+        assert_eq!(
+            eitri_core::agent_prefs::parse_history_turns(kernel.config.borrow().get("agent.history_turns")),
+            Ok(10)
+        );
+        assert_eq!(
+            crate::window_config::load(&kernel, &[]).unwrap().history_turns,
+            agent::history_turns()
+        );
     }
 
     #[test]
