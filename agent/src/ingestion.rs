@@ -98,7 +98,11 @@ pub enum RevisedDelivery {
     Nothing,
     /// In fold order, so the tags strictly increase.
     Events(Vec<(u64, AgentDomainEvent)>),
-    Resync,
+    /// The projection revision when the resync was taken, under the ingestion lock. Later folds
+    /// remain queued for the next delivery even if a snapshot read already contains them.
+    Resync {
+        revision: u64,
+    },
 }
 
 impl RevisedDelivery {
@@ -107,7 +111,7 @@ impl RevisedDelivery {
         match self {
             RevisedDelivery::Nothing => UiDelivery::Nothing,
             RevisedDelivery::Events(events) => UiDelivery::Events(events.into_iter().map(|(_, event)| event).collect()),
-            RevisedDelivery::Resync => UiDelivery::Resync,
+            RevisedDelivery::Resync { .. } => UiDelivery::Resync,
         }
     }
 }
@@ -736,7 +740,9 @@ impl IngestState {
     fn take_revised_delivery(&mut self) -> RevisedDelivery {
         if self.resync_pending {
             self.resync_pending = false;
-            return RevisedDelivery::Resync;
+            return RevisedDelivery::Resync {
+                revision: self.projection.last_revision,
+            };
         }
         if self.pending_ui.is_empty() {
             return RevisedDelivery::Nothing;
@@ -3313,6 +3319,32 @@ pub(crate) mod tests {
             UiDelivery::Events(events) => assert_eq!(events.len(), 1),
             other => panic!("expected deltas to resume, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn a_resync_carries_its_take_revision_and_later_folds_stay_queued() {
+        let mut state = state();
+        for _ in 0..=UI_EVENT_QUEUE_CAPACITY {
+            state.fold(text("before"));
+        }
+        let taken_revision = state.projection.last_revision;
+        let delivery = state.take_revised_delivery();
+        state.fold(text("after"));
+        let RevisedDelivery::Resync { revision } = delivery else {
+            panic!("overflow requires a resync")
+        };
+        assert_eq!(revision, taken_revision);
+        assert!(state.projection.last_revision > revision);
+        let RevisedDelivery::Events(events) = state.take_revised_delivery() else {
+            panic!("later folds must remain queued")
+        };
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].0, state.projection.last_revision);
+        assert!(events[0].0 > revision);
+        assert!(matches!(
+            (RevisedDelivery::Resync { revision }).without_revisions(),
+            UiDelivery::Resync
+        ));
     }
 
     /// A semantic transition that happens entirely inside an overflow must still be visible

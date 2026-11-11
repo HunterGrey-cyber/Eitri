@@ -169,6 +169,7 @@ fn print_event(event: &AgentDomainEvent) {
         AgentDomainEvent::ToolInputChanged { .. } => {}
         // Made only when a conversation moves between windows, which this demo never does.
         AgentDomainEvent::MoveSeeded(_) => {}
+        AgentDomainEvent::HistoryEvicted { turns, .. } => println!("[history] {turns} earlier turns unloaded"),
         AgentDomainEvent::TurnAttributed { origin, cause, .. } => {
             println!(
                 "[turn started by {origin:?}] cause={:?}",

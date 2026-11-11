@@ -3872,14 +3872,15 @@ impl TabSet {
                     _ => {}
                 }
             }
-        } else if matches!(delivery, RevisedDelivery::Resync) {
+        } else if matches!(delivery, RevisedDelivery::Resync { .. }) {
             tab.notes.recover_remote_senders(&backend.projection());
         }
         let remote_notes_dirty = tab.notes.remote_notes_dirty;
-        let resynced = matches!(delivery, RevisedDelivery::Resync);
+        let resynced = matches!(delivery, RevisedDelivery::Resync { .. });
         let delivered_revision = match &delivery {
             RevisedDelivery::Events(events) => events.last().map(|(revision, _)| *revision),
-            _ => None,
+            RevisedDelivery::Resync { revision } => Some(*revision),
+            RevisedDelivery::Nothing => None,
         };
         // The tab's observers read this same drain, whether or not a page shows the tab, after its arm has folded
         // it: what the gate answered and what the batch settled are then what the desk has.
@@ -3918,7 +3919,7 @@ impl TabSet {
                 place,
                 observed,
             ),
-            RevisedDelivery::Resync => {
+            RevisedDelivery::Resync { .. } => {
                 if observed {
                     tick.observers.owe_snapshot(live.id);
                 }
@@ -4302,14 +4303,13 @@ impl TabSet {
         let session = review
             .as_ref()
             .map(|_| backend.provider_session_id().unwrap_or_default());
-        let (still, running, background, at_end, snapshot_revision) = {
+        let (still, running, background, at_end) = {
             let projection = backend.projection();
             (
                 projection.pending_permissions.keys().cloned().collect(),
                 projection.active_turn_id.clone(),
                 projection.background_calls,
                 projection.background_at_last_turn_end,
-                projection.last_revision,
             )
         };
         if let (Some(review), Some(session)) = (review.as_deref_mut().filter(|_| resynced), session) {
@@ -4321,14 +4321,10 @@ impl TabSet {
             review.observe_resync(tab.0, &session, running.as_deref(), now);
             review.observe(tab.0, &session, &count(background), now);
         }
-        // Ingestion can fold ahead of this delivery. Its calls must wait until review has seen
-        // the events that create their records, or the snapshot used by observe_resync above.
-        let through = if resynced {
-            Some(snapshot_revision)
-        } else {
-            delivered_revision
-        };
-        if let (AgentBackend::Conversation { conversation, .. }, Some(revision)) = (backend, through) {
+        // Ingestion can fold ahead of this delivery. A resync only bounds calls through its take:
+        // a later snapshot cannot create records for turns that started and ended in between.
+        // Their calls wait for the queued events that create their review records.
+        if let (AgentBackend::Conversation { conversation, .. }, Some(revision)) = (backend, delivered_revision) {
             let calls = conversation.take_evicted_calls_through(revision);
             if let Some(review) = review {
                 review.store_evicted_paths(tab.0, &calls);

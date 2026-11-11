@@ -1102,7 +1102,7 @@ impl TabSet {
                 .iter()
                 .any(|(revision, event)| *revision > since && ends_a_start(event)),
             // The events were dropped: what they would have said is read off the projection.
-            RevisedDelivery::Resync => {
+            RevisedDelivery::Resync { .. } => {
                 let projection = backend.projection();
                 projection.turn_endings.last().is_some_and(|ending| ending.seq >= since)
                     || projection.last_turn_end_seq.is_some_and(|seq| seq >= since)

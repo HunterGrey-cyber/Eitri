@@ -1195,15 +1195,20 @@ fn eviction_delivery_drops_queued_calls_when_review_is_off() {
 
 #[test]
 fn eviction_after_delivery_drain_waits_for_its_review_record() {
-    eviction_after_drain_waits(false);
+    eviction_after_drain_waits(false, false);
 }
 
 #[test]
 fn eviction_after_empty_delivery_waits_for_its_review_record() {
-    eviction_after_drain_waits(true);
+    eviction_after_drain_waits(true, false);
 }
 
-fn eviction_after_drain_waits(empty_delivery: bool) {
+#[test]
+fn eviction_after_resync_drain_waits_for_its_review_record() {
+    eviction_after_drain_waits(false, true);
+}
+
+fn eviction_after_drain_waits(empty_delivery: bool, resync: bool) {
     use crate::turn_review::{Origin, Scope, Snap, TurnRef};
 
     agent::state_dirs::redirect_state_to_a_test_root();
@@ -1253,6 +1258,16 @@ fn eviction_after_drain_waits(empty_delivery: bool) {
     fold(&set, completed("first", agent::TurnOutcome::Completed));
     if empty_delivery {
         set.pump(&dir, true);
+    }
+    if resync {
+        for _ in 0..=agent::UI_EVENT_QUEUE_CAPACITY {
+            fold(&set, AgentDomainEvent::EffortReported { effort: None });
+        }
+        let AgentBackend::Conversation { conversation, .. } = set.get(tab).unwrap().live().unwrap() else {
+            panic!("conversation")
+        };
+        assert_eq!(conversation.ingest_stats().resyncs, 1);
+        assert_eq!(conversation.ingest_stats().ui_backlog, 0);
     }
     // This hook forces ingestion into the gap after the old delivery was taken.
     let path = dir.join("raced.rs");
