@@ -6622,6 +6622,24 @@ describe("App keyboard: scrolling through the conversation", () => {
     press("2"); press("]"); press("]");
     expect(current(container)).toBe("r4");
   });
+
+  it("an overshooting prompt count stops at the last available prompt in either direction", () => {
+    const widen = stubBandWidth();
+    const { container } = started();
+    act(() => widen(container));
+    prompts("r0", "r1", "r2");
+    press("g"); press("g");
+    press("5"); press("]"); press("]");
+    expect(current(container)).toBe("r2");
+    expect(container.querySelector(".band-message")?.textContent ?? "").not.toMatch(/no .*prompt/);
+    press("]"); press("]");
+    expect(container.querySelector(".band-message")?.textContent).toBe("no later prompt");
+    press("5"); press("["); press("[");
+    expect(current(container)).toBe("r0");
+    press("["); press("[");
+    expect(container.querySelector(".band-message")?.textContent).toBe("no earlier prompt");
+    vi.unstubAllGlobals();
+  });
   /* `[`/`]` arm with Alt or Meta held, so the second key accepts the same modifiers and
      `[[`/`]]` still jump. Layouts that type brackets with Option need the modifier on both
      keys. */

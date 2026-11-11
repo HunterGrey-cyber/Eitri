@@ -134,6 +134,58 @@ it("two code blocks open a plain-letter pick; repeats wait and modified keys can
   expect(writeText).toHaveBeenCalledTimes(2);
 });
 
+it.each(["yi`", "gf"])("%s yields to typing in a card's reason input", (command) => {
+  const { container, keys } = started({
+    transcript: [{ seq: 1, text: "src/a.rs src/b.rs\n\n```js\nfirst\n```\n\n```rust\nsecond\n```" }],
+    pendingPermissions: [{ seq: 2, permissionId: "p", toolUseId: null, toolName: "Bash", input: { command: "rm build" } }],
+  });
+  keys("gg" + command);
+  expect(container.querySelector(".path-pick")).not.toBeNull();
+  const reason = container.querySelector<HTMLInputElement>(".permission-card input")!;
+  act(() => reason.focus());
+  const allowed = fireEvent.keyDown(reason, { key: "a" });
+  // jsdom has no native text editing; perform it only if keydown left the default action available.
+  if (allowed) fireEvent.change(reason, { target: { value: reason.value + "a" } });
+  expect(allowed).toBe(true);
+  expect(reason.value).toBe("a");
+  expect(container.querySelector(".path-pick")).toBeNull();
+  expect(writeText).not.toHaveBeenCalled();
+  expect(posted.some((m) => m.type === "copy_primary" || m.type === "open_path")).toBe(false);
+});
+
+it.each(["acp:edit", "fileChange"])("%s hunk picks anchor on their own files after a count-only file", (name) => {
+  const input = name === "acp:edit" ? { diffs: [
+    { path: "large", oldText: "x\n".repeat(801), newText: "y" },
+    { path: "A", oldText: "a", newText: "A" },
+    { path: "B", oldText: "b", newText: "B" },
+  ] } : { changes: [
+    { path: "large", kind: "add", diff: "x\n".repeat(801) },
+    { path: "A", kind: "update", diff: "@@ -1 +1 @@\n-a\n+A\n" },
+    { path: "B", kind: "update", diff: "@@ -1 +1 @@\n-b\n+B\n" },
+  ] };
+  const { root, container, keys, key } = started({ toolCalls: [{ ...bash, name, input, result: { content: "applied", isError: false } }] });
+  key("Enter");
+  const rect = (top: number, height: number) => ({ top, bottom: top + height, left: 0, right: 500, width: 500, height, x: 0, y: top }) as DOMRect;
+  for (const el of [root, ...root.querySelectorAll<HTMLElement>(".message-list, .row")]) {
+    el.getBoundingClientRect = () => rect(0, 1000);
+    Object.defineProperties(el, { clientWidth: { configurable: true, value: 500 }, clientHeight: { configurable: true, value: 1000 } });
+  }
+  const files = [...container.querySelectorAll<HTMLElement>(".permission-card-edit")];
+  expect(files).toHaveLength(3);
+  files.forEach((file, i) => file.querySelectorAll<HTMLElement>(".diff-line").forEach((line) => {
+    line.getBoundingClientRect = () => rect(100 + i * 100, 20);
+  }));
+  keys("yih");
+  const labels = [...container.querySelectorAll<HTMLElement>(".hint-code")];
+  expect(labels.map((label) => [label.textContent, label.style.top])).toEqual([["a", "204px"], ["s", "304px"]]);
+  key("s");
+  expect(writeText).toHaveBeenLastCalledWith("-b\n+B");
+  keys("]cyih");
+  expect(writeText).toHaveBeenLastCalledWith("-a\n+A");
+  keys("]cyih");
+  expect(writeText).toHaveBeenLastCalledWith("-b\n+B");
+});
+
 it("the dashboard keeps its y copy burst, including Shift+Tab", () => {
   const { container, root, key } = started({}, true);
   dispatch({ kind: "handoff", tab: 1, command: "echo handoff", cwd: "/p", providerSessionId: "s" });

@@ -3931,9 +3931,10 @@ export default function App() {
       askForPicker(bare);
       return;
     }
-    // A setting sent after the turn waits for the turn's end like any command, so it is not changed now.
+    // ACP settings go through its direct route: the agent would read a queued slash command as a prompt.
+    // Claude settings sent after the turn wait for the CLI to apply them at the turn's end.
     const afterTurn = options?.afterTurn === true;
-    if (!afterTurn && settingRunsNow(text)) return;
+    if ((!afterTurn || isAcpAgent(activeTabInfo(tabsRef.current)?.agent)) && settingRunsNow(text)) return;
     const tab = activeTabRef.current;
     if (tab === null) return;
     queueInto(tab, text, afterTurn);
@@ -5997,7 +5998,8 @@ export default function App() {
     // handler `stopPropagation`s every key it claims, so this only ever runs for a key it does
     // not -- exactly the chooser's own reasoning just above).
     if (slashPicker !== null) return;
-    if (yankPick !== null) {
+    if (yankPick !== null && isEditableElement(event.target)) setYankPick(null);
+    else if (yankPick !== null) {
       event.preventDefault();
       if (event.repeat) return;
       if (event.key === "Backspace" && isPlainAnswerKey(event.nativeEvent as unknown as KeyLike)) {
@@ -6016,9 +6018,10 @@ export default function App() {
       setYankPick(null);
       return;
     }
-    // A path pick owns each key until its full label is typed. Cancelling keys never fall
-    // through to the conversation underneath it, and auto-repeat never adds another letter.
-    if (pathPick !== null) {
+    // Outside text fields, a path pick owns each key until its full label is typed. Cancelling keys
+    // never fall through to the conversation underneath it, and auto-repeat never adds another letter.
+    if (pathPick !== null && isEditableElement(event.target)) setPathPick(null);
+    else if (pathPick !== null) {
       event.preventDefault();
       if (event.repeat) return;
       if (event.key === "Backspace") {
@@ -6669,8 +6672,8 @@ export default function App() {
             else if (action.object === "h") {
               const previews = editPreviewsOf(item);
               const files = cursorRow()?.querySelectorAll<HTMLElement>(".permission-card-edit");
-              targets = (previews ?? []).flatMap((preview, i) => {
-                const lines = files?.[i]?.querySelectorAll<HTMLElement>(".diff-line:not(.diff-noeol)");
+              targets = (previews ?? []).flatMap((preview) => {
+                const lines = files?.[preview.fileIndex]?.querySelectorAll<HTMLElement>(".diff-line:not(.diff-noeol)");
                 return hunksOf(preview.diff!).map(({ start }) => {
                   const el = lines?.[start];
                   return el ? { kind: "code" as const, el, rowIndex: cursor } : null;
@@ -7049,14 +7052,18 @@ export default function App() {
       case "prompt-jump": {
         // `[[`/`]]`, repeated `times` times, each from the prompt the PREVIOUS step landed on --
         // stopping early (rather than wrapping) the moment there is no earlier/later prompt at all.
-        let target: number | null = cursor;
-        for (let n = 0; n < times && target !== null; n++) target = promptIndex(timeline, target, action.delta) ?? null;
-        if (target !== null && target !== cursor) {
+        let target = cursor;
+        for (let n = 0; n < times; n++) {
+          const next = promptIndex(timeline, target, action.delta);
+          if (next === null || next === target) break;
+          target = next;
+        }
+        if (target !== cursor) {
           noteJump();
           noteUserScroll(messageList, action.delta > 0 ? "down" : "up");
           landingRef.current = action.delta;
           setCursor(target);
-        }
+        } else showFlash(`no ${action.delta > 0 ? "later" : "earlier"} prompt`);
         root?.focus({ preventScroll: true });
         break;
       }

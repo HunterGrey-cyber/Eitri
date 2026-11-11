@@ -1149,4 +1149,20 @@ describe("Ctrl+x Enter: send after the turn", () => {
     fireEvent.keyDown(textarea, { key: "Enter" });
     expect(onQueue).toHaveBeenCalledWith("draft");
   });
+
+  it("leaving INPUT without a blur ends the chord silently before returning", () => {
+    const onQueue = vi.fn();
+    const onChord = vi.fn();
+    const { container, textarea, rerender, onSend } = renderComposerWithRerender({ onQueue, onChord });
+    typed(textarea, "draft");
+    fireEvent.keyDown(textarea, { key: "x", ctrlKey: true });
+    expect(onChord).toHaveBeenLastCalledWith(CTRL_X_SHOWCMD);
+    rerender({ mode: "browse" });
+    expect(onChord).toHaveBeenLastCalledWith(null);
+    rerender({ mode: "input" });
+    fireEvent.keyDown(container.querySelector("textarea")!, { key: "Enter" });
+    expect(onSend).toHaveBeenCalledWith("draft");
+    expect(onQueue).not.toHaveBeenCalled();
+    expect(flashOf(container)).toBeNull();
+  });
 });

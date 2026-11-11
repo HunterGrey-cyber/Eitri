@@ -263,6 +263,9 @@ export function Composer({
     onChordRef.current?.(null);
   }
   useEffect(() => endChord, []);
+  useEffect(() => {
+    if (mode !== "input") endChord();
+  }, [mode]);
   // Only refs and a state setter inside, so the first render's closure stays right.
   useEffect(() => {
     if (chordEnd === undefined) return;

@@ -217,6 +217,30 @@ describe("the picker, on a session that changes directly", () => {
     expect(ofType("send_message").map((m) => m.text)).toEqual(["/model sonnet"]);
   });
 
+  it.each(["t1", null])("ACP Ctrl+x Enter applies typed settings immediately with active turn %s", (activeTurnId) => {
+    for (const text of ["/model sonnet", "/effort low"]) {
+      posted.length = 0;
+      const { container, unmount } = live({ activeTurnId }, false, "acp:gem");
+      fireEvent.keyDown(root(container), { key: "i" });
+      const box = container.querySelector("textarea")!;
+      fireEvent.change(box, { target: { value: text } });
+      box.setSelectionRange(text.length, text.length);
+      fireEvent.keyDown(box, { key: "x", ctrlKey: true });
+      fireEvent.keyDown(box, { key: "Enter" });
+      if (text.startsWith("/effort")) {
+        expect(ofType("list_models")).toHaveLength(1);
+        dispatch({ kind: "models_result", requestId: last("list_models").request_id, tab: 1,
+          models: MODELS, applied: APPLIED, efforts: [{ value: "low", displayName: "Low", description: "" }] });
+        expect(last("apply_effort")).toMatchObject({ tab: 1, effort: "low" });
+      } else {
+        expect(last("set_model")).toMatchObject({ tab: 1, model: "sonnet" });
+      }
+      expect(ofType("queue_message")).toEqual([]);
+      expect(ofType("send_message")).toEqual([]);
+      unmount();
+    }
+  });
+
   it("a typed /effort <level> during a turn checks the session's list and changes it at once", () => {
     const { container } = live({ activeTurnId: "t1" });
     typeIn(container, "/effort low");

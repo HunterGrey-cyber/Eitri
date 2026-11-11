@@ -47,7 +47,17 @@ it("reads ACP diffs in rendered order, retaining file boundaries and skipping co
     { path: "second", oldText: null, newText: "new" },
   ] });
   expect(editPreviewsOf(row)?.map((preview) => [preview.filePath, preview.added, preview.removed])).toEqual([["first", 2, 2], ["second", 1, 0]]);
+  expect(editPreviewsOf(row)).toMatchObject([{ fileIndex: 1 }, { fileIndex: 2 }]);
   expect(hunksOf(editDiffOf(row)!)).toEqual([{ start: 0, end: 2 }, { start: 3, end: 5 }, { start: 6, end: 7 }]);
   expect(editPreviewsOf(tool("acp:edit", {}))).toBeNull();
   expect(editPreviewsOf(tool("acp:edit", { diffs: [] }))).toBeNull();
+});
+
+it("keeps a small Codex update navigable beside an oversized add with its rendered file index", () => {
+  const row = tool("fileChange", { changes: [
+    { path: "large", kind: "add", diff: "x\n".repeat(801) },
+    { path: "small", kind: "update", diff: "@@ -1 +1 @@\n-old\n+new\n" },
+  ] });
+  expect(editPreviewsOf(row)).toMatchObject([{ filePath: "small", fileIndex: 1 }]);
+  expect(hunksOf(editDiffOf(row)!)).toEqual([{ start: 1, end: 3 }]);
 });
