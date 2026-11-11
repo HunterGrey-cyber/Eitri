@@ -128,47 +128,107 @@ function foldWithOrigins(text: string): { folded: string; origin: number[] } {
   return { folded, origin };
 }
 
-/** Where `needle` first occurs in `text` as `[start, end)` offsets into `text` itself, in a case-insensitive match
- *  (`needle` already lowercased) or an exact one. `null` for no match. */
-function findInText(text: string, needle: string, sensitive: boolean): [number, number] | null {
-  if (sensitive) {
-    const at = text.indexOf(needle);
-    return at === -1 ? null : [at, at + needle.length];
+/** Matches as `[start, end)` offsets into the drawn text, folding it once even when undrawn hits are skipped. */
+function* matchesInText(text: string, needle: string, sensitive: boolean): Generator<[number, number]> {
+  const { folded, origin } = sensitive ? { folded: text, origin: null } : foldWithOrigins(text);
+  for (let from = 0; from < folded.length;) {
+    const at = folded.indexOf(needle, from);
+    if (at === -1) return;
+    // The match may begin or end inside what one drawn code point folded to: take that code point whole.
+    let end = at + needle.length;
+    while (origin !== null && end < origin.length - 1 && origin[end] === origin[end - 1]) end++;
+    from = end;
+    yield origin === null ? [at, end] : [origin[at], origin[end]];
   }
-  const { folded, origin } = foldWithOrigins(text);
-  const at = folded.indexOf(needle);
-  if (at === -1) return null;
-  // The match may begin or end inside what one drawn code point folded to: take that code point whole.
-  let end = at + needle.length;
-  while (end < origin.length - 1 && origin[end] === origin[end - 1]) end++;
-  return [origin[at], origin[end]];
+}
+
+/** Stands between the text of two blocks when a row's text is joined for matching. */
+const SEPARATOR = "\u0000";
+
+/** The nearest ancestor of a text node that lays out as a block (anything but `inline`, `contents` and
+ *  `inline-*`), or `row` itself; remembered per element because a row holds many text nodes. */
+function blockOf(element: Element | null, row: HTMLElement, memo: Map<Element, Element | null>): Element | null {
+  const walked: Element[] = [];
+  let found: Element | null = null;
+  for (let at = element; at !== null; at = at.parentElement) {
+    if (memo.has(at)) {
+      found = memo.get(at) ?? null;
+      break;
+    }
+    walked.push(at);
+    const display = getComputedStyle(at).display;
+    if (at === row || !(display === "" || display === "contents" || display.startsWith("inline"))) {
+      found = at;
+      break;
+    }
+  }
+  for (const at of walked) memo.set(at, found);
+  return found;
 }
 
 function revealMatch(list: HTMLElement, row: HTMLElement, query: string): boolean {
   const sensitive = query !== query.toLowerCase();
   const needle = sensitive ? query : foldWithOrigins(query).folded;
   const doc = row.ownerDocument;
-  const walker = doc.createTreeWalker(row, NodeFilter.SHOW_TEXT);
+  const walker = doc.createTreeWalker(row, NodeFilter.SHOW_TEXT | NodeFilter.SHOW_ELEMENT);
+  const nodes: { node: Node; start: number; end: number }[] = [];
+  const blocks = new Map<Element, Element | null>();
+  let text = "";
+  let block: Element | null | undefined;
   for (let node = walker.nextNode(); node !== null; node = walker.nextNode()) {
-    const text = node.textContent ?? "";
-    const found = findInText(text, needle, sensitive);
-    if (found === null) continue;
-    const [start, end] = found;
-    if (start < 0 || end > text.length || start > end) continue;
+    if (node.nodeType === Node.ELEMENT_NODE) {
+      // A line break ends a line: text on either side of it is not one run.
+      if ((node as Element).tagName === "BR") block = undefined;
+      continue;
+    }
+    // Text in separate blocks (two adjacent code blocks, two list items) is not one run, but spans, `em` and
+    // highlight marks inside one block are: the separator is a character the matcher refuses to match across.
+    const here = blockOf(node.parentElement, row, blocks);
+    if (nodes.length > 0 && here !== block) text += SEPARATOR;
+    block = here;
+    const start = text.length;
+    text += node.textContent ?? "";
+    nodes.push({ node, start, end: text.length });
+  }
+  for (const [start, end] of matchesInText(text, needle, sensitive)) {
+    if (start < 0 || end > text.length || start >= end) continue;
+    if (text.slice(start, end).includes(SEPARATOR)) continue;
+    const first = nodes.find((entry) => entry.end > start);
+    const last = nodes.find((entry) => entry.start < end && entry.end >= end);
+    if (first === undefined || last === undefined) continue;
     const range = doc.createRange();
-    range.setStart(node, start);
-    range.setEnd(node, end);
+    range.setStart(first.node, start - first.start);
+    range.setEnd(last.node, end - last.start);
     if (typeof range.getBoundingClientRect !== "function") return false;
-    const box = range.getBoundingClientRect();
+    let box = range.getBoundingClientRect();
     if (box.width === 0 && box.height === 0) continue;
-    const top = effectiveTop(list);
-    const bottom = list.getBoundingClientRect().bottom;
-    const delta = box.top < top ? box.top - top : box.bottom > bottom ? Math.min(box.bottom - bottom, box.top - top) : 0;
-    if (delta === 0) return false;
-    scrollListTo(list, list.scrollTop + delta, false);
-    return true;
+    let moved = false;
+    const common = range.commonAncestorContainer;
+    let ancestor = common.nodeType === Node.ELEMENT_NODE ? common as HTMLElement : common.parentElement;
+    // Inner scrolling changes the range's viewport rect; measure again before moving each enclosing view.
+    for (; ancestor !== null && ancestor !== list; ancestor = ancestor.parentElement) {
+      if (ancestor.scrollHeight <= ancestor.clientHeight || !/^(auto|scroll)$/.test(getComputedStyle(ancestor).overflowY)) continue;
+      const top = ancestor.getBoundingClientRect().top + ancestor.clientTop;
+      const delta = matchScrollDelta(box, top, top + ancestor.clientHeight);
+      if (delta === 0) continue;
+      noteUserScroll(list, delta < 0 ? "up" : "down");
+      ancestor.scrollTop += delta;
+      moved = true;
+      box = range.getBoundingClientRect();
+    }
+    const delta = matchScrollDelta(box, effectiveTop(list), list.getBoundingClientRect().bottom);
+    if (delta !== 0) {
+      noteUserScroll(list, delta < 0 ? "up" : "down");
+      scrollListTo(list, list.scrollTop + delta, false);
+      moved = true;
+    }
+    return moved;
   }
   return false;
+}
+
+function matchScrollDelta(box: DOMRect, top: number, bottom: number): number {
+  return box.top < top ? box.top - top : box.bottom > bottom ? Math.min(box.bottom - bottom, box.top - top) : 0;
 }
 
 /** A tool result's box is entered at the end nearest the reader -- its start going down, its end going

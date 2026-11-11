@@ -108,6 +108,103 @@ describe("scrollVisibleRowBox with the header shown", () => {
 });
 
 describe("revealMatchInRow", () => {
+  it("reveals a phrase spanning highlight nodes with folded offsets mapped to each node", () => {
+    const { list, rows } = layout([[1000, 2000]], true);
+    const body = rows[0].firstElementChild!;
+    body.innerHTML = "<span>İlet</span> wanted";
+    const seen: unknown[] = [];
+    Object.defineProperty(Range.prototype, "getBoundingClientRect", {
+      configurable: true,
+      value(this: Range) {
+        seen.push([this.startContainer, this.startOffset, this.endContainer, this.endOffset]);
+        return { top: -100, bottom: -80, width: 80, height: 20 } as DOMRect;
+      },
+    });
+    expect(revealMatchInRow(list, rows[0], "let wanted")).toBe(true);
+    expect(seen).toEqual([[body.firstChild!.firstChild, 1, body.lastChild, 7]]);
+    expect(list.scrollTop).toBe(876);
+  });
+
+  it.each([
+    ["adjacent code blocks", "<pre>foo</pre><pre>bar</pre><p>a <em>foo</em><b>bar</b></p>"],
+    ["list items", "<ul><li>foo</li><li>bar</li></ul><p>a <em>foo</em><b>bar</b></p>"],
+    ["a line break", "foo<br>bar<p>a <em>foo</em><b>bar</b></p>"],
+  ])("does not join text across blocks (%s), and reveals the real occurrence further down", (_name, html) => {
+    const { list, rows } = layout([[1000, 2000]], true);
+    const body = rows[0].firstElementChild!;
+    body.innerHTML = html;
+    const seen: Node[] = [];
+    Object.defineProperty(Range.prototype, "getBoundingClientRect", {
+      configurable: true,
+      value(this: Range) {
+        seen.push(this.startContainer);
+        return { top: 450, bottom: 470, width: 60, height: 20 } as DOMRect;
+      },
+    });
+    expect(revealMatchInRow(list, rows[0], "foobar")).toBe(true);
+    // `toBe`, not `toEqual`: equal text nodes of two places compare equal.
+    expect(seen).toHaveLength(1);
+    expect(seen[0]).toBe(body.querySelector("em")!.firstChild);
+  });
+
+  it.each(["above", "below"])("reveals a match %s nested scroll boxes, inner first, then below the header", (side) => {
+    const { list, rows } = layout([[1000, 2000]], true);
+    const outer = document.createElement("div");
+    const inner = document.createElement("div");
+    outer.style.overflowY = "scroll";
+    inner.style.overflowY = "auto";
+    inner.className = "tool-result-body";
+    inner.textContent = "needle";
+    rows[0].append(outer);
+    outer.append(inner);
+    for (const box of [outer, inner]) {
+      Object.defineProperties(box, { clientHeight: { value: 100 }, scrollHeight: { value: 1000 } });
+      box.scrollTop = side === "above" ? 800 : 0;
+    }
+    outer.getBoundingClientRect = () => ({ top: 980 - list.scrollTop, bottom: 1080 - list.scrollTop }) as DOMRect;
+    inner.getBoundingClientRect = () => ({ top: 1580 - list.scrollTop - outer.scrollTop,
+      bottom: 1680 - list.scrollTop - outer.scrollTop }) as DOMRect;
+    Object.defineProperty(Range.prototype, "getBoundingClientRect", {
+      configurable: true,
+      value() {
+        const top = inner.getBoundingClientRect().top + 600 - inner.scrollTop;
+        return { top, bottom: top + 20, width: 60, height: 20 } as DOMRect;
+      },
+    });
+    const order: HTMLElement[] = [];
+    for (const box of [inner, outer]) {
+      let top = box.scrollTop;
+      Object.defineProperty(box, "scrollTop", { get: () => top, set: (value: number) => { order.push(box); top = value; } });
+    }
+    expect(revealMatchInRow(list, rows[0], "needle")).toBe(true);
+    expect(order).toEqual([inner, outer]);
+    expect(inner.scrollTop).toBe(side === "above" ? 600 : 520);
+    expect(outer.scrollTop).toBe(600);
+    const range = document.createRange();
+    const rect = range.getBoundingClientRect();
+    expect(rect.top).toBeGreaterThanOrEqual(HEADER);
+    expect(rect.bottom).toBeLessThanOrEqual(400);
+    expect(rect.top).toBeGreaterThanOrEqual(inner.getBoundingClientRect().top);
+    expect(rect.bottom).toBeLessThanOrEqual(inner.getBoundingClientRect().bottom);
+    expect(rect.top).toBeGreaterThanOrEqual(outer.getBoundingClientRect().top);
+    expect(rect.bottom).toBeLessThanOrEqual(outer.getBoundingClientRect().bottom);
+  });
+
+  it("skips an undrawn match and reveals a later drawn one", () => {
+    const { list, rows } = layout([[1000, 2000]], false);
+    rows[0].innerHTML = "<span hidden>needle</span><span>needle</span>";
+    Object.defineProperty(Range.prototype, "getBoundingClientRect", {
+      configurable: true,
+      value(this: Range) {
+        return this.startContainer.parentElement!.hidden
+          ? { top: 0, bottom: 0, width: 0, height: 0 } as DOMRect
+          : { top: 450, bottom: 470, width: 60, height: 20 } as DOMRect;
+      },
+    });
+    expect(revealMatchInRow(list, rows[0], "needle")).toBe(true);
+    expect(list.scrollTop).toBe(1070);
+  });
+
   /** A one-text-node row; the range's rect is planted below the view so a found hit scrolls. Returns what the range
    *  was set to and whether the reveal moved the list. */
   function reveal(text: string, query: string) {

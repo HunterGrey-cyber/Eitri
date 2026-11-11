@@ -828,6 +828,20 @@ export default function App() {
     };
   }
 
+  function restoreJumpPosition(position: JumpPos) {
+    const target = landingIndex(position, timelineRef.current.map((row) => row.key));
+    const list = containerRef.current?.querySelector<HTMLElement>(".message-list") ?? null;
+    const row = list === null ? undefined : conversationRows(list)[target];
+    if (list !== null && row !== undefined) {
+      const delta = row.getBoundingClientRect().top - list.getBoundingClientRect().top + position.offset;
+      noteUserScroll(list, delta < 0 ? "up" : "down");
+      const maxScroll = Math.max(0, list.scrollHeight - list.clientHeight);
+      list.scrollTop = Math.max(0, Math.min(list.scrollTop + delta, maxScroll));
+    }
+    if (target !== cursorRef.current) landingRef.current = "keep";
+    setCursor(target);
+  }
+
   /** Record the departure before a jump; previews pass the position captured when their prompt opened. */
   function noteJump(from = jumpPosition()) {
     const tab = activeTabRef.current;
@@ -6928,16 +6942,7 @@ export default function App() {
           break;
         }
         if (tab !== null) jumplistsRef.current.set(tab, trip.list);
-        const target = landingIndex(trip.to, timeline.map((row) => row.key));
-        const row = messageList === null ? undefined : conversationRows(messageList)[target];
-        if (messageList !== null && row !== undefined) {
-          const delta = row.getBoundingClientRect().top - messageList.getBoundingClientRect().top + trip.to.offset;
-          noteUserScroll(messageList, delta < 0 ? "up" : "down");
-          const maxScroll = Math.max(0, messageList.scrollHeight - messageList.clientHeight);
-          messageList.scrollTop = Math.max(0, Math.min(messageList.scrollTop + delta, maxScroll));
-        }
-        if (target !== cursor) landingRef.current = "keep";
-        setCursor(target);
+        restoreJumpPosition(trip.to);
         root?.focus({ preventScroll: true });
         break;
       }
@@ -7655,7 +7660,7 @@ export default function App() {
             onChange={(query) => {
               setSearch({ ...search, query });
               const found = findMatch(timeline, query, search.origin, search.dir, true);
-              setCursor(found ?? search.origin);
+              moveCursorTo(found ?? search.origin);
               if (found !== null) revealMatch(found, query);
             }}
             onAccept={(event) => {
@@ -7667,14 +7672,18 @@ export default function App() {
               } else if (search.query !== "") {
                 noteJump(searchOriginRef.current);
                 const found = findMatch(timeline, search.query, search.origin, search.dir, true);
-                if (found !== null) revealMatch(found, search.query);
+                if (found !== null) {
+                  moveCursorTo(found);
+                  revealMatch(found, search.query);
+                }
               }
               setSearch(null);
               containerRef.current?.focus({ preventScroll: true });
             }}
             onCancel={(event) => {
               noteLineKey(event);
-              setCursor(search.origin);
+              if (searchOriginRef.current !== null) restoreJumpPosition(searchOriginRef.current);
+              else moveCursorTo(search.origin);
               setSearch(null);
               containerRef.current?.focus({ preventScroll: true });
             }}

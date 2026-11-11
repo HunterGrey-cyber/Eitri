@@ -5,6 +5,8 @@ import App from "./App";
 import { initialState } from "./reducer";
 import { EMPTY_PANEL_TABLE } from "./keymap";
 import { TYPING_GUARD_MS } from "./typingGuard";
+import { conversationRows } from "./nav";
+import { resumeFollowing, USER_SCROLL_EVENT } from "./follow";
 import type { AgentUiState } from "./types";
 
 const TAB = { id: 1, number: 1, label: "one", name: null, state: "live", mode: "auto", marker: null, pending: 0, resumable: true, failure: null, title: null };
@@ -20,7 +22,10 @@ beforeEach(() => {
   window.webkit = { messageHandlers: { eitriAgent: { postMessage: (message) => posted.push(JSON.parse(message)) } } };
   Element.prototype.scrollIntoView = vi.fn();
 });
-afterEach(() => { cleanup(); vi.restoreAllMocks(); vi.useRealTimers(); window.getSelection()?.removeAllRanges(); });
+afterEach(() => {
+  cleanup(); vi.restoreAllMocks(); vi.useRealTimers(); window.getSelection()?.removeAllRanges();
+  delete (Range.prototype as { getBoundingClientRect?: unknown }).getBoundingClientRect;
+});
 function setup(snapshot = state()) {
   const view = render(<App />);
   dispatch({ kind: "hello", backend: "legacy", projectDir: "/project", permissionModes: ["manual", "auto", "bypass"], resumableSessions: [], account: null });
@@ -94,7 +99,79 @@ function stubSelectionModify(): () => void {
   };
 }
 
+/** Tall rows with a match near each row's head and browser-like scroll clamping. */
+function searchLayout(container: HTMLElement) {
+  const list = container.querySelector<HTMLElement>(".message-list")!;
+  const rows = conversationRows(list);
+  let top = 0;
+  Object.defineProperties(list, {
+    clientHeight: { configurable: true, value: 300 },
+    scrollHeight: { configurable: true, value: rows.length * 1000 },
+    scrollTop: { configurable: true, get: () => top,
+      set: (value: number) => { top = Math.max(0, Math.min(value, list.scrollHeight - list.clientHeight)); } },
+  });
+  list.getBoundingClientRect = () => ({ top: 0, bottom: 300, height: 300 }) as DOMRect;
+  rows.forEach((row, index) => {
+    row.getBoundingClientRect = () => ({ top: index * 1000 - top, bottom: (index + 1) * 1000 - top, height: 1000 }) as DOMRect;
+  });
+  Object.defineProperty(Range.prototype, "getBoundingClientRect", {
+    configurable: true,
+    value(this: Range) {
+      const row = this.startContainer.parentElement!.closest<HTMLElement>("[data-row-key]")!;
+      const y = row.getBoundingClientRect().top + 50;
+      return { top: y, bottom: y + 20, width: 60, height: 20 } as DOMRect;
+    },
+  });
+  return list;
+}
+
 describe("directional transcript search", () => {
+  it.each([
+    ["earlier row", "needle earlier", false], ["current row", "needle streaming", false],
+    ["accepted earlier row", "needle earlier", true], ["accepted current row", "needle streaming", true],
+  ])("keeps a streaming search at the %s match after a chunk", (_where, query, accept) => {
+    const { key, prompt, current, container } = setup(state({ userPrompts: [{ seq: 0, text: "start" }],
+      transcript: [{ seq: 1, text: "needle earlier" }, { seq: 2, text: "needle streaming" }],
+      activeTurnId: "t1", nextSeq: 3, assistantMessageOpen: true }));
+    const list = searchLayout(container);
+    act(() => resumeFollowing(list));
+    const tail = list.scrollTop;
+    key("?");
+    fireEvent.change(prompt(), { target: { value: query } });
+    expect(current()?.textContent).toContain(query);
+    expect(list.scrollTop).toBeLessThan(tail);
+    if (accept) {
+      // Acceptance must announce its own reveal even if following resumed while the line was open.
+      act(() => resumeFollowing(list));
+      key("Enter", {}, prompt());
+      expect(list.scrollTop).toBeLessThan(tail);
+    }
+    const found = list.scrollTop;
+    dispatch({ kind: "events", tab: 1, fromRevision: 10, throughRevision: 11,
+      events: [{ type: "content_delta", kind: "text", turn_id: "t1", text: " next chunk" }] });
+    expect(list.textContent).toContain("needle streaming next chunk");
+    expect(list.scrollTop).toBe(found);
+  });
+
+  it.each(["last", "apple above"])("Esc restores the row and exact offset after a search for %s without a jump", (query) => {
+    const { key, prompt, current, container } = setup();
+    const list = searchLayout(container);
+    key("g"); key("g");
+    key("G", { shiftKey: true });
+    list.scrollTop = 5450;
+    const signals: unknown[] = [];
+    list.addEventListener(USER_SCROLL_EVENT, (event) => signals.push((event as CustomEvent).detail));
+    key("?");
+    fireEvent.change(prompt(), { target: { value: query } });
+    expect(list.scrollTop).not.toBe(5450);
+    key("Escape", {}, prompt());
+    expect(current()?.textContent).toContain("last");
+    expect(list.scrollTop).toBe(5450);
+    expect(signals.at(-1)).toBe("down");
+    key("o", { ctrlKey: true });
+    expect(current()?.textContent).toContain("start");
+  });
+
   it("narrows backward, wraps, accepts, repeats backward with n and reverses with N", () => {
     const { key, prompt, current, container } = setup();
     key("?", { shiftKey: true });
